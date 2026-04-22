@@ -306,3 +306,64 @@ Additionally, splitting is triggered *mid-execution* if any single task's sub-st
 Do not "defer" work by cramming it into vague tasks like "TODO: extend later" or by introducing incomplete stubs that differential tests can't exercise. Either the work is in this phase and gets tested, or it is in a split sub-phase with its own row in the roadmap. There is no third option.
 
 ---
+
+## 7. Differential Test Contract
+
+### 7.1 Harness architecture
+
+`test/differential/` hosts a Go test binary that orchestrates two proxies per fixture:
+
+- **Reference:** upstream Envoy, Docker image at the tag pinned in `docs/envoy-go/ENVOY_TARGET.md`, managed via `testcontainers-go`.
+- **Subject:** envoy-go built from the current tree, run as a subprocess.
+
+Each test case lives under `test/fixtures/NNNN-name/` and contains:
+
+- `envoy.yaml` — reference config for upstream Envoy.
+- `envoy-go.yaml` — equivalent config for envoy-go (initially identical; any divergence must be explained in an ADR referenced from the fixture's README).
+- `inputs/` — HTTP requests, raw TCP payloads, gRPC calls, or a small Go driver that exercises the fixture.
+- `expectations.yaml` — allow-lists, ignore-lists, stats-name mappings, and timing tolerances, derived from `BEHAVIOR_CONTRACT.md`.
+
+Per run: start both proxies; drive identical inputs at both; capture responses, access logs, and stats snapshots; diff under the contract rules.
+
+### 7.2 Equivalence matrix
+
+The authoritative version lives in `docs/envoy-go/BEHAVIOR_CONTRACT.md`. Summary:
+
+| Dimension | Required equivalence |
+|---|---|
+| Response status | Exact |
+| Response body | Byte-exact for deterministic handlers; semantically equal for filter-modified bodies |
+| Response headers | Set-equal modulo documented allow-list (`server`, `date`, timing/identity headers explicitly listed) |
+| Response trailers | Set-equal under the same allow-list discipline |
+| HTTP/2 & HTTP/3 framing | Structurally equivalent (same frame types/order on equivalent events); not byte-equal |
+| Access log records | Semantically equal after field-mapping |
+| Stats | Names match Envoy's documented stat tree; presence required; values exact on deterministic flows |
+| xDS wire behavior | ADS message sequences match the protocol state machine; effective-config diff on identical snapshots |
+| Timing | Not compared by default; a phase may opt in to latency bounds |
+
+### 7.3 Conformance suites (independent of real Envoy)
+
+Separate from the differential harness. These test absolute protocol correctness:
+
+- `test/conformance/h2spec/` — runs once HTTP/2 lands; pass threshold is a phase gate.
+- `test/conformance/h3spec/` — runs once HTTP/3 lands.
+- `test/conformance/grpc/` — gRPC interop client.
+- `test/conformance/proxy-wasm/` — proxy-wasm ABI conformance once the WASM host lands.
+
+### 7.4 Negative and fuzz testing
+
+Every phase that introduces a parser, codec, or filter ships a Go fuzz target under `test/`. Fuzzers run short-budget in CI and long-budget nightly. Malformed or adversarial inputs must produce the *same class* of response as upstream Envoy (matching status code and Envoy-style `x-envoy-local-reply` behavior) — identical error text is not required.
+
+### 7.5 Phase-done gate
+
+> A phase is not done until:
+> (a) all new/changed differential fixtures are green,
+> (b) all pre-existing differential fixtures are still green,
+> (c) the phase's conformance suites pass at the declared threshold,
+> (d) any new fuzzer has run clean for its short-budget CI run,
+> (e) `go vet`, `golangci-lint run`, `go test ./...` are all clean,
+> (f) `REVIEW.md` is approved.
+
+These six gates are what `superpowers:verification-before-completion` verifies. They are the complete definition of "done."
+
+---
