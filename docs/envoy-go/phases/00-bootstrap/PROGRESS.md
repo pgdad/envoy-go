@@ -87,3 +87,13 @@ envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd
 $ curl -fsS http://127.0.0.1:9901/ready
 LIVE
 ```
+
+## Task 5 — golangci-lint config (.golangci.yml)
+
+**Commits:** 1a57bd3
+**Notes:** Created .golangci.yml with SPEC §5.5 baseline linters (govet, errcheck, staticcheck, unused, ineffassign, gofmt, goimports, misspell, revive), plus linter settings for goimports local-prefixes (github.com/esalaine/envoy-go), misspell US locale, and revive rules (package-comments, exported). Note on golangci-lint version pin: PLAN's precondition pinned v1.55.2, which fails to install via `go install` on Go 1.22+ due to x/tools@v0.14.0 incompatibility (full root cause in this file's preamble). Local tooling is v1.64.8 (latest v1.x). ADR-0009 codifying the v1.64.8 pin is deferred to Task 15 (CI config — where the install command is codified). Task 5's YAML is version-agnostic across the v1.x series.
+**Outputs:**
+```
+$ golangci-lint run ./...
+<empty>
+```
