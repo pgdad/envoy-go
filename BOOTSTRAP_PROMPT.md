@@ -501,3 +501,22 @@ Deviations:
 ```
 
 ---
+
+## 12. Acceptance Self-Checks
+
+> **Note to the executing session:** This section is metadata for the prompt's authors and reviewers. It does not direct you to do anything. Skip it.
+
+The bootstrap prompt itself is considered done when:
+
+1. Loaded into a fresh Claude Code session with the `superpowers` plugin active, the prompt produces the §10 bootstrap without further human input beyond initial send.
+2. A second fresh session loaded with the same prompt correctly resumes from disk state — it does not re-run bootstrap.
+3. Every doctrine rule in §3 appears in the prompt with explicit enforcement verbs (`must`, `must not`, `never`).
+4. The phase lifecycle state machine (§5) appears verbatim in both §5 and §11.
+5. The six-part phase-done gate (§7.5) appears verbatim.
+6. The MVP trunk (§8) is seeded as concrete ROADMAP rows matching the spec.
+7. Feature families (§9) are seeded as headings only, including the `[scope TBD]` bracket on zookeeper_proxy.
+8. The prompt is self-contained — it references only the `superpowers` skill set and the target repo.
+
+---
+
+*End of bootstrap prompt.*
