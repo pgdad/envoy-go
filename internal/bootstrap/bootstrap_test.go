@@ -157,3 +157,86 @@ static_resources:
 		t.Errorf("prefix: %q", err.Error())
 	}
 }
+
+func TestFirstListenerSocket_HappyPath(t *testing.T) {
+	bs, err := Load(strings.NewReader(sampleBootstrap))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	host, port, err := FirstListenerSocket(bs)
+	if err != nil {
+		t.Fatalf("FirstListenerSocket: %v", err)
+	}
+	if host != "127.0.0.1" || port != 0 {
+		t.Errorf("got %s:%d, want 127.0.0.1:0", host, port)
+	}
+}
+
+func TestFirstListenerSocket_ZeroListeners(t *testing.T) {
+	yaml := `
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 0 } } }
+static_resources: { listeners: [], clusters: [] }
+`
+	bs, err := Load(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_, _, err = FirstListenerSocket(bs)
+	if err == nil || !strings.Contains(err.Error(), "expected exactly one listener") {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestFirstListenerSocket_TwoListeners(t *testing.T) {
+	// Two-listener YAML (add a second listener before the existing one).
+	yaml := strings.Replace(sampleBootstrap,
+		"  listeners:\n    - name: l_tcp",
+		"  listeners:\n    - name: l_a\n    - name: l_tcp", 1)
+	bs, err := Load(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_, _, err = FirstListenerSocket(bs)
+	if err == nil || !strings.Contains(err.Error(), "got 2") {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestFirstClusterEndpointSocket_HappyPath(t *testing.T) {
+	bs, err := Load(strings.NewReader(sampleBootstrap))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	host, port, err := FirstClusterEndpointSocket(bs)
+	if err != nil {
+		t.Fatalf("FirstClusterEndpointSocket: %v", err)
+	}
+	if host != "127.0.0.1" || port != 0 {
+		t.Errorf("got %s:%d, want 127.0.0.1:0", host, port)
+	}
+}
+
+func TestFirstClusterEndpointSocket_EmptyEndpoints(t *testing.T) {
+	yaml := `
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 127.0.0.1, port_value: 0 } }
+  clusters:
+    - name: c
+      type: STATIC
+      load_assignment: { cluster_name: c, endpoints: [] }
+`
+	bs, err := Load(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_, _, err = FirstClusterEndpointSocket(bs)
+	if err == nil {
+		t.Fatal("want error for empty endpoints, got nil")
+	}
+	if !strings.Contains(err.Error(), "endpoints entry") {
+		t.Errorf("error should name endpoints: %q", err.Error())
+	}
+}
