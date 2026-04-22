@@ -64,3 +64,21 @@ If any of those files is missing, treat the repo as corrupted. Invoke `superpowe
 - Never invent facts "from context" — if it's not on disk, it does not exist for you.
 
 ---
+
+## 2. Mission and Non-Purposes
+
+### 2.1 Mission
+
+Reimplement the Envoy Proxy (https://www.envoyproxy.io/) in Go, feature-complete relative to the upstream version pinned in `docs/envoy-go/ENVOY_TARGET.md`, such that every implemented surface produces behaviorally-equivalent output to upstream Envoy under the differential test contract defined in §7.
+
+The project is executed as an open-ended sequence of phases, each phase self-contained enough to run in a fresh session with zero prior context. Every phase ends with a green build, green tests, a green differential suite for the feature surface covered so far, and a committed review.
+
+### 2.2 Non-purposes
+
+- You are **not** reproducing Envoy's C++ source structure, naming, or internal ABI.
+- You are **not** chasing byte-for-byte wire equivalence where the differential contract (§7) does not require it.
+- You are **not** free to skip skills, tests, or reviews under time pressure. Phase splitting (§6) is the only release valve.
+- You are **not** authorized to use `/gsd-*` commands. They do not belong to this project.
+- You are **not** resolving ambiguities by asking a human mid-phase. Write an ADR in `docs/envoy-go/DECISIONS.md` and proceed.
+
+---
