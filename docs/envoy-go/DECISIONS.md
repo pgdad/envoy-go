@@ -550,3 +550,38 @@ Framing exception: upstream emits `transfer-encoding: chunked` with no `Content-
 **Rationale:** keeps cmd-level unit coverage lightweight without adding a subprocess-integration dimension that the differential suite already covers.
 
 ---
+
+## ADR-0021: Supersession of ADR-0007 by `internal/bootstrap`
+
+**Status:** Accepted
+**Date:** 2026-04-22
+**Doctrine:** D-3.5
+**Supersedes:** ADR-0007
+
+### Context
+
+ADR-0007 codified the phase-00 minimal YAML schema for `envoy-go.yaml` (top-level `listener` / `upstream` blocks with `address` + `port`, parsed by `cmd/envoy-go/config.go`). Phase 01 replaces that contract with the real Envoy v3 Bootstrap proto consumed through `internal/bootstrap.Load` (ADR-0012, ADR-0013, ADR-0016). Task 12 of phase 01 (`08e09a9`) rewired `cmd/envoy-go/main.go` to call `bootstrap.Load` + the `AdminSocket` / `FirstListenerSocket` / `FirstClusterEndpointSocket` extractors, leaving `cmd/envoy-go/config.go` and `config_test.go` as orphans (no caller, no importer). Phase 01 completion requires retiring the phase-00 schema so the subject consumes real Envoy bootstrap YAML and nothing else; the orphan files must be deleted.
+
+### Decision
+
+The phase-00 minimal YAML schema codified in ADR-0007 is retired. envoy-go configuration is now the Envoy v3 Bootstrap proto as consumed by `internal/bootstrap.Load`. `cmd/envoy-go/config.go` and `cmd/envoy-go/config_test.go` are deleted. ADR-0007 itself is NOT edited (append-only per doctrine D-3.5); this ADR explicitly names ADR-0007 as superseded per `BOOTSTRAP_PROMPT.md` §4.1 invariant 4, which mandates an explicit `**Supersedes:** ADR-XXXX` header on the retiring ADR.
+
+### Rationale
+
+Phase 01's charter (ROADMAP row 01) is to replace the phase-00 placeholder configuration contract with the real Envoy bootstrap. ADR-0012 (yaml.v3 → json → protojson pipeline) and ADR-0013 (`github.com/envoyproxy/go-control-plane/envoy` proto-types pin) codify the replacement parser and schema. ADR-0016 (`DiscardUnknown: false`) codifies the strict-parsing rule that preserves the phase-00 no-silent-typos guarantee at the proto layer. With the cutover landed and no callers remaining, keeping the phase-00 files would leave dead code that still compiles and still runs its own tests — a divergence between what the binary accepts and what the tree claims to accept. Deletion is the only end-state consistent with doctrine D-3.6 (green build) and with the single-contract principle.
+
+### Consequences
+
+- `cmd/envoy-go/` contains exactly `main.go` and `main_test.go` at phase 01 completion.
+- ADR-0007 remains in the ADR log, unedited, as historical record; its `Status` line stays `Accepted` because supersession is recorded here rather than mutating the original entry.
+- Any future phase that revives a non-bootstrap configuration contract must explicitly ADR around both ADR-0007 (historical) and ADR-0021 (this entry) — no silent revival.
+- The new contract is fully specified by ADR-0012 (pipeline), ADR-0013 (proto types pin), and ADR-0016 (unknown-field rejection + Any preservation exception).
+
+### Cross-references
+
+- **ADR-0012** — YAML-to-proto pipeline (yaml.v3 → json → protojson).
+- **ADR-0013** — `github.com/envoyproxy/go-control-plane/envoy` version pin (proto types only).
+- **ADR-0016** — unknown-field rejection (`DiscardUnknown: false`) in the bootstrap loader.
+- **ADR-0020** — `cmd/envoy-go/main_test.go` rewrite-vs-replacement decision that preceded this deletion.
+
+---
