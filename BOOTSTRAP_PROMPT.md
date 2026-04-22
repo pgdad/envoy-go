@@ -514,7 +514,7 @@ The bootstrap prompt itself is considered done when:
 4. The phase lifecycle state machine (§5) appears verbatim in both §5 and §11.
 5. The six-part phase-done gate (§7.5) appears verbatim.
 6. The MVP trunk (§8) is seeded as concrete ROADMAP rows matching the spec.
-7. Feature families (§9) are seeded as headings only, including the `[scope TBD]` bracket on zookeeper_proxy.
+7. Feature families (§9) are seeded as headings only, including the `[scope TBD]` bracket on zookeeper.
 8. The prompt is self-contained — it references only the `superpowers` skill set and the target repo.
 
 ---
