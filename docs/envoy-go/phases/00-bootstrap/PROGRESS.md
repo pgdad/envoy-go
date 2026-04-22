@@ -284,3 +284,49 @@ ok  	github.com/esalaine/envoy-go/test/differential	2.479s
 ```
 
 - Follow-up: changed StartReferenceProxy to use `pin.SHA256` as the container image reference (SPEC §11 "Pin by SHA256 from day one") and added `_ = c.Terminate(ctx)` to the two early error paths (Host lookup, admin-port MappedPort) that previously leaked containers on failure. Both changes surfaced by Task 10 code review. Commit: 33c5a2a.
+
+## Task 11 — Differential subject proxy (envoy-go subprocess)
+
+**Commits:** 90d1c30
+**Notes:** Extended `test/differential/harness.go` with `SubjectProxy` struct, `StartSubjectProxy` (builds binary via `go build ./cmd/envoy-go`, writes temp config, starts subprocess, waits for ready sentinel via `scanForLine`), `ListenerAddr`, `Stop`, and `readyAddr` helper. Merged `os`, `os/exec`, `path/filepath` into the existing import block. Removed `//nolint:unused` from `scanForLine` (now consumed by `StartSubjectProxy`). Extended `test/differential/harness_test.go` with `TestSubjectProxy_StartsAndReports`, `repoRoot`, and `freeTCPPort` helpers; added `fmt` to import block. Full suite PASS, lint clean.
+
+**RED output:**
+```
+$ go test ./test/differential/ -run TestSubjectProxy_Starts
+# github.com/esalaine/envoy-go/test/differential [github.com/esalaine/envoy-go/test/differential.test]
+test/differential/harness_test.go:106:15: undefined: StartSubjectProxy
+FAIL	github.com/esalaine/envoy-go/test/differential [build failed]
+FAIL
+```
+
+**GREEN output:**
+```
+$ go test ./test/differential/ -run TestSubjectProxy_Starts -v -timeout 30s
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.13s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	0.196s
+```
+
+**Full suite + lint:**
+```
+$ DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock go test ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	1.111s
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+
+$ golangci-lint run ./...
+(empty)
+```
