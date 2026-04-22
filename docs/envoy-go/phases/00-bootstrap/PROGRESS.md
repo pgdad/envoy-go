@@ -130,3 +130,5 @@ $ go test ./cmd/envoy-go/ -run TestLoadConfig -v
 PASS
 ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.001s
 ```
+
+**Follow-up:** ran `go mod tidy` post-Task 6 to reclassify gopkg.in/yaml.v3 as a direct dependency and add the missing `h1:` hash line for `gopkg.in/check.v1`. Commit: e335ce7.
