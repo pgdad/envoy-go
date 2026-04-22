@@ -95,7 +95,7 @@ func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, l
 		exposed = append(exposed, fmt.Sprintf("%d/tcp", p))
 	}
 	req := testcontainers.ContainerRequest{
-		Image:        pin.Tag,
+		Image:        pin.SHA256,
 		ExposedPorts: exposed,
 		Cmd:          []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn"},
 		WaitingFor:   wait.ForHTTP("/ready").WithPort("9901/tcp").WithStartupTimeout(readyTimeout),
@@ -109,10 +109,12 @@ func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, l
 	}
 	host, err := c.Host(ctx)
 	if err != nil {
+		_ = c.Terminate(ctx)
 		return nil, err
 	}
 	adminMapped, err := c.MappedPort(ctx, "9901/tcp")
 	if err != nil {
+		_ = c.Terminate(ctx)
 		return nil, err
 	}
 	tcp := map[int]string{}
