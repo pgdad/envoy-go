@@ -572,7 +572,7 @@ ok  	github.com/esalaine/envoy-go/test/differential	2.767s
 
 ## Task 13 — Delete phase-00 cmd/envoy-go/config.go + config_test.go [ADR-0021]
 
-**Commits:** `<SHA-TBD>`
+**Commits:** `739b1ba`
 
 **Notes:** Mechanical deletion of the two phase-00 orphan files left behind by Task 12's cutover (`08e09a9`). `cmd/envoy-go/config.go` (the minimal-schema `loadConfig` + `Config` struct parsing top-level `listener` / `upstream` blocks) and `cmd/envoy-go/config_test.go` (the `TestLoadConfig_*` happy-path + unknown-field-rejection cases) had no callers after Task 12 rewrote `main.go` to consume `internal/bootstrap.Load` directly — `grep -r loadConfig` across the tree returned only hits inside the two deleted files themselves, confirming no external importer. `cmd/envoy-go/` now contains exactly `main.go` and `main_test.go` per ADR-0021's consequence clause. ADR-0021 appended to `DECISIONS.md` with the mandatory `**Supersedes:** ADR-0007` header per `BOOTSTRAP_PROMPT.md` §4.1 invariant 4; ADR-0007 itself is NOT edited (verified via `git diff --numstat -- docs/envoy-go/DECISIONS.md` showing `35 insertions, 0 deletions` — additions-only, the ADR-0001..ADR-0011 range including ADR-0007 is byte-identical to the pre-commit tree). The new configuration contract is fully codified by ADR-0012 (yaml.v3 → json → protojson pipeline), ADR-0013 (`github.com/envoyproxy/go-control-plane/envoy` proto-types pin), and ADR-0016 (`DiscardUnknown: false` strict-unknown-field rejection + Any preservation exception). Doctrine D-3.6 (green build) satisfied: `go vet ./...` clean, `golangci-lint run ./...` clean, `go test ./... -timeout 10m` all packages green including the cmd-level `TestEnvoyGoBinary_EchoesThroughUpstream` that Task 12 rewrote in place.
 
