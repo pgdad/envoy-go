@@ -454,3 +454,8 @@ $ go vet ./test/conformance/
 $ golangci-lint run ./test/conformance/
 (empty)
 ```
+
+## Task 15 — GitHub Actions CI
+
+**Commits:** 35024ca
+**Notes:** Created .github/workflows/ci.yml with two jobs: `lint-vet-test` (go vet, golangci-lint v1.64.8 per ADR-0009, `go test -short`) and `differential` (depends on first; runs `go test ./test/differential/... -v -timeout 5m`). Both on ubuntu-latest with Go 1.23. Docker pre-installed on GitHub Actions runners. PLAN's verbatim v1.55.2 is superseded by ADR-0009 (bump to v1.64.8 for Go 1.22+ compat). Task 16 will run the local equivalent to prove the workflow is functionally valid pre-push.
