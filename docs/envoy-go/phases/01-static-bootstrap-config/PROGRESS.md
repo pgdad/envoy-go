@@ -674,3 +674,36 @@ ok  	github.com/esalaine/envoy-go/test/differential	2.631s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 ```
+
+## Task 15 — Extend 0000-tcp-echo expectations.yaml with admin dimensions (SPEC §5.4)
+
+**Commits:** `<TBD>`
+
+**Notes:** Rewrote the `dimensions:` block in `test/fixtures/0000-tcp-echo/expectations.yaml` per SPEC §5.4 to document the phase-01 equivalence surface. The fixture now spans three applicable dimensions: `response-status` (exact-match, scoped to `admin-/ready`), `response-body` (byte-exact, scoped to `tcp-echo + admin-/ready`), and `response-headers` (set-equal-modulo-allow-list, scoped to `admin-/ready`, with `allow-list` pointing at the BEHAVIOR_CONTRACT.md § "Admin API — /ready" subsection from Task 10). The remaining six dimensions (`response-trailers`, `http2-http3-framing`, `access-log`, `stats`, `xds`, `timing`) are marked not-applicable with phase-01-specific justifications (access-log and stats explicitly deferred to phase 06). The file is documentation-only — no code consumes `expectations.yaml` yet per ADR-0019, which anticipates dimension-aware diff in later phases; today's runner (Task 14) hardcodes the same three dimensions and allow-list in `compareAdminResponses` / `diffHeaders`, so this YAML is the human-readable source of truth that future dimension-aware tooling will read. The `allow-list` string is a Markdown-reference (not a YAML reference) — the em-dash U+2014 in `"Admin API — /ready"` matches the H2 heading in BEHAVIOR_CONTRACT.md byte-for-byte (UTF-8 `e2 80 94`, confirmed via xxd). Header/comment block above `dimensions:` preserved verbatim. Re-ran `go test ./test/differential/... -timeout 5m -v` as a sanity check: PASS (TestDifferential/0000-tcp-echo, 1.16s), confirming this doc-only change doesn't regress the harness.
+
+**Outputs:**
+
+```
+$ GOTOOLCHAIN=local go test ./test/differential/... -timeout 5m -v
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+--- PASS: TestReferenceProxy_Starts (0.93s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.52s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+--- PASS: TestDifferential (1.16s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.16s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.688s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+```

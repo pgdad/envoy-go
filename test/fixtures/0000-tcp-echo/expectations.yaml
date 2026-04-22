@@ -6,29 +6,33 @@
 
 dimensions:
   response-status:
-    applicable: false
-    reason: pure TCP fixture — no HTTP layer
+    applicable: true
+    rule: exact
+    scope: admin-/ready
   response-body:
     applicable: true
     rule: byte-exact
+    scope: tcp-echo + admin-/ready
   response-headers:
-    applicable: false
-    reason: pure TCP fixture — no HTTP layer
+    applicable: true
+    rule: set-equal-modulo-allow-list
+    scope: admin-/ready
+    allow-list: BEHAVIOR_CONTRACT.md § "Admin API — /ready"
   response-trailers:
     applicable: false
-    reason: pure TCP fixture — no HTTP layer
+    reason: no trailers on /ready; no HTTP layer on TCP path
   http2-http3-framing:
     applicable: false
-    reason: TCP only
+    reason: admin is HTTP/1.1; TCP has no framing
   access-log:
     applicable: false
-    reason: subject does not emit access logs in phase 00
+    reason: phase 01 does not emit access logs (phase 06)
   stats:
     applicable: false
-    reason: subject does not emit stats in phase 00
+    reason: phase 01 does not emit stats (phase 06)
   xds:
     applicable: false
-    reason: static config; no xDS in phase 00
+    reason: static config; no xDS
   timing:
     applicable: false
-    reason: timing not opt-in for echo fixture
+    reason: not opt-in
