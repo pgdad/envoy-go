@@ -526,3 +526,15 @@ Framing exception: upstream emits `transfer-encoding: chunked` with no `Content-
 - If a later phase distinguishes envoy-go from upstream via a user-agent-style identity header, it adds a new header (e.g., `X-Envoy-Go-Version`) rather than modifying `Server`; the `Server` contract remains pinned to upstream.
 
 ---
+
+## ADR-0019: Admin HTTP response parser location
+
+**Status:** Accepted
+**Date:** 2026-04-22
+**Doctrine:** D-3.5
+
+**Decision:** `test/helpers/http_response.go` + `_test.go`.
+
+**Rationale:** anticipated reuse by fixtures 0002+ that probe HTTP surfaces; colocated with `test/helpers/tcp.go` (phase-00 TCP round-tripper) establishes `test/helpers/` as the shared test-side protocol-primitives package.
+
+---

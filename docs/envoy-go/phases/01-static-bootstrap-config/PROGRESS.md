@@ -468,3 +468,51 @@ ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 **Commits:** `0979230`
 
 **Notes:** Pure docs task, zero code changes. Two files touched: `docs/envoy-go/BEHAVIOR_CONTRACT.md` gains a new H2 section `## Admin API — /ready` (em-dash, U+2014, matching `expectations.yaml`'s allow-list reference verbatim) inserted BETWEEN `## Timing tolerances` and `## Test harness host networking` — not appended to EOF, not placed above `## Equivalence Matrix`. The new section's body is drawn from Task 7's evidence file (`upstream-ready-observation.md`), not from PLAN.md's guessed shape: ready-state response lists all six upstream headers in wire order (`content-type`, `cache-control`, `x-content-type-options`, `date`, `server`, `transfer-encoding`) with byte-exact values and the 5-byte `LIVE\n` body; the single framing deviation (`Content-Length: 5` on the subject vs. `transfer-encoding: chunked` upstream) is documented as a phase-02+ follow-up that the Task 14 harness normalises by dechunking upstream before body comparison; header-name case is noted (RFC 7230 §3.2 case-insensitivity covers the lowercase-on-wire vs. Go-canonical divergence). The pre-init subsection captures ADR-0015 option (b): upstream's pre-init bytes were unobservable across 60 probes, so the subject emits a chosen `503 Service Unavailable` / `PRE_INITIALIZING\n` (17 bytes) response that is documented-but-test-irrelevant for phase 01. The second edit extends the previously stubbed `## Header allow-list` section: the stub's template prose is retained and a canonical table is introduced with one entry — `date` scoped to the Admin `/ready` response, value non-deterministic per request, presence required on both sides but value not byte-compared, introduced by Phase 01 under ADR-0015. Future phases extend this table rather than re-introducing one. No ADRs, no `go.mod` drift, no test output to quote (pure docs).
+
+## Task 11 — test/helpers/http_response.go parser [ADR-0019]
+
+**Commits:** `<pending>`
+
+**Notes:** Added a small HTTP/1.1 response parser to the `test/helpers/` package — colocated with phase-00's `tcp.go` round-tripper, establishing `test/helpers/` as the shared test-side protocol-primitives home. Two files created: `test/helpers/http_response.go` (60 lines: `HTTPResponse{StatusLine, Headers map[string]string, Body []byte}` + `ParseHTTPResponse(raw []byte) (*HTTPResponse, error)` + internal `joinHeaderValues`) and `test/helpers/http_response_test.go` (three table-driven-ish tests: Simple / MultiValueHeader / Malformed). Implementation leans on `net/http.ReadResponse` for status-line and header parsing (stdlib, D-3.2 permitted) rather than hand-rolling a state machine; body is drained via a chunked `Read` loop into a `[]byte` to decouple the returned `Body` from the bufio reader's lifetime. Status line is reconstructed via `fmt.Sprintf("%s %s", resp.Proto, resp.Status)` because `http.ReadResponse` consumes it; this yields `"HTTP/1.1 200 OK"` verbatim, matching the on-wire line. Headers are canonicalised with `textproto.CanonicalMIMEHeaderKey` on write so callers see `"Content-Type"` rather than whatever case the wire used — consistent with Go stdlib convention and simpler for expectations.yaml diff logic downstream. Multi-value headers (two `X-A:` lines) are joined by `", "` — RFC 7230 §3.2.2 permits list-header concatenation, and the `strings.Contains` asserts in the test pin the join behaviour without over-specifying delimiter order. Malformed input propagates `http.ReadResponse`'s error wrapped with `http_response: parse:` prefix for grep-friendly identification in harness logs. Fail-first loop honoured: wrote the `_test.go` file first, ran `go test ./test/helpers/` to confirm the `undefined: ParseHTTPResponse` compile error, then wrote the implementation and re-ran to green. ADR-0019 appended at the tail of `DECISIONS.md` (after ADR-0014, the previous tail entry in the document though higher-numbered ADRs — 0015-0018 — were authored earlier and live mid-document due to earlier-task insertions; numbering-wise, 0019 is next and the file-order tail is where it belongs per the "append to tail" instruction). All four gate checks green: `go vet ./...` clean, `golangci-lint run ./test/helpers/` clean, `go test ./test/helpers/ -v` 4/4 PASS (3 new + pre-existing `TestTCPRoundTrip_EchoBackend`), full `go test ./... -timeout 5m` green.
+
+**Outputs:**
+
+```
+$ GOTOOLCHAIN=local go test ./test/helpers/ -v
+=== RUN   TestParseHTTPResponse_Simple
+--- PASS: TestParseHTTPResponse_Simple (0.00s)
+=== RUN   TestParseHTTPResponse_MultiValueHeader
+--- PASS: TestParseHTTPResponse_MultiValueHeader (0.00s)
+=== RUN   TestParseHTTPResponse_Malformed
+--- PASS: TestParseHTTPResponse_Malformed (0.00s)
+=== RUN   TestTCPRoundTrip_EchoBackend
+--- PASS: TestTCPRoundTrip_EchoBackend (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+
+$ GOTOOLCHAIN=local go vet ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local golangci-lint run ./test/helpers/
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local go test ./... -timeout 5m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.130s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	1.780s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+```
