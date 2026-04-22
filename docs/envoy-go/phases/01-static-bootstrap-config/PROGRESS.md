@@ -114,7 +114,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 
 ## Task 3 — bootstrap.Load error-path tests (syntax, unknown field, empty)
 
-**Commits:** `<sha>`
+**Commits:** `f3ad272`
 **Notes:** locks behavior, no prod changes needed — `internal/bootstrap.Load` (landed Task 2, commit `d98c5fa`) already rejects YAML syntax errors with the `bootstrap: yaml parse:` prefix, unknown top-level fields via `protojson.UnmarshalOptions{DiscardUnknown: false}` producing the `bootstrap: protojson:` prefix, and empty documents via the `generic == nil` check producing `bootstrap: empty document`; these three tests append to `internal/bootstrap/bootstrap_test.go` to pin those contracts so future refactors cannot silently weaken the loader's error surface. The PLAN's exact YAML-syntax-error input `"not: valid: yaml: at all: :::"` was retained verbatim — `gopkg.in/yaml.v3` flags it as a parse error (not as a string scalar nor as protojson input), so no assertion adjustment was needed. No production code touched, no ADRs, no `go.mod` drift; `sampleBootstrap` const and the three Task 2 tests are unchanged.
 
 **Outputs:**
