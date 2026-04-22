@@ -97,3 +97,36 @@ LIVE
 $ golangci-lint run ./...
 <empty>
 ```
+
+## Task 6 — minimal config schema + parser
+
+**Commits:** 9756b78
+**Notes:** Created cmd/envoy-go/config.go + config_test.go implementing the minimal YAML schema per ADR-0007 (listener.{address,port}, upstream.{address,port}; unknown fields rejected). TDD: wrote tests first, confirmed RED (undefined: loadConfig), then implemented. Added gopkg.in/yaml.v3@v3.0.1 dependency. Appended ADR-0007 to DECISIONS.md (physical order: after ADR-0008 in the file; the ADR numbers are authoritative, not the file position — per the append-only doctrine in BOOTSTRAP_PROMPT §4.1 invariant 4). Lint fixes applied: added package comment to config.go (revive package-comments rule), ran gofmt on config_test.go (alignment in map literal).
+**Outputs:**
+```
+$ go test ./cmd/envoy-go/ -run TestLoadConfig
+# github.com/esalaine/envoy-go/cmd/envoy-go [github.com/esalaine/envoy-go/cmd/envoy-go.test]
+cmd/envoy-go/config_test.go:17:14: undefined: loadConfig
+cmd/envoy-go/config_test.go:40:17: undefined: loadConfig
+cmd/envoy-go/config_test.go:53:15: undefined: loadConfig
+FAIL	github.com/esalaine/envoy-go/cmd/envoy-go [build failed]
+FAIL
+
+$ go test ./cmd/envoy-go/ -run TestLoadConfig -v
+=== RUN   TestLoadConfig_Valid
+--- PASS: TestLoadConfig_Valid (0.00s)
+=== RUN   TestLoadConfig_RejectsMissingFields
+=== RUN   TestLoadConfig_RejectsMissingFields/missing_listener
+=== RUN   TestLoadConfig_RejectsMissingFields/missing_upstream
+=== RUN   TestLoadConfig_RejectsMissingFields/missing_listener_address
+=== RUN   TestLoadConfig_RejectsMissingFields/port_zero
+--- PASS: TestLoadConfig_RejectsMissingFields (0.00s)
+    --- PASS: TestLoadConfig_RejectsMissingFields/missing_listener (0.00s)
+    --- PASS: TestLoadConfig_RejectsMissingFields/missing_upstream (0.00s)
+    --- PASS: TestLoadConfig_RejectsMissingFields/missing_listener_address (0.00s)
+    --- PASS: TestLoadConfig_RejectsMissingFields/port_zero (0.00s)
+=== RUN   TestLoadConfig_RejectsUnknownFields
+--- PASS: TestLoadConfig_RejectsUnknownFields (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.001s
+```
