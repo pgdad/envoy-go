@@ -330,3 +330,47 @@ ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 $ golangci-lint run ./...
 (empty)
 ```
+
+## Task 12 — Differential runner (fixture discovery + per-fixture orchestration)
+
+**Commits:** Commit A: d16bd35
+
+**Notes:** Extended `test/differential/harness.go` with the `FixtureDriver` interface, `driverRegistry` map, and `RegisterFixture` constructor. Removed stale forward-reference comment `// (More to come in Task 11.)` opportunistically during this edit. Created `test/differential/runner_test.go` with `TestDifferential` (suite entry point), `runFixture`, `discoverFixtures`, `isNumeric`, and `acceptEcho`. Applied errcheck hygiene to both `defer backend.Close()` and `defer c.Close()` (wrapped as `defer func() { _ = x.Close() }()`). Replaced the PLAN's hardcoded `/var/run/docker.sock` probe with a call to the existing `ensureDocker` helper (already in harness_test.go, same package) — consistent with Task 10's two-path probe logic. Full suite PASS (zero subtests — no fixtures yet), lint clean.
+
+**Build output:**
+```
+$ go build ./test/differential/...
+(empty)
+```
+
+**TestDifferential output:**
+```
+$ DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock go test ./test/differential/ -run TestDifferential -v
+=== RUN   TestDifferential
+--- PASS: TestDifferential (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	0.082s
+```
+
+**Full suite + lint:**
+```
+$ DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock go test -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.136s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	0.080s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+
+$ golangci-lint run ./...
+(empty)
+```
