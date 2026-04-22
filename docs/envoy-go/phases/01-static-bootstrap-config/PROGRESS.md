@@ -413,7 +413,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 
 ## Task 9 — admin.Server pre-init + MarkReady atomicity + Close idempotency tests
 
-**Commits:** `TBD`
+**Commits:** `c2cb3fb`
 
 **Notes:** Three concurrency/state tests append to `internal/admin/admin_test.go`, closing phase-01 gate (c)'s admin-server surface: `TestServer_PreInit_BeforeMarkReady` pins the pre-init branch of `handleReady` (`Start` without `MarkReady` → non-200 status with body distinct from `LIVE\n`, per ADR-0015 option (b) / Task 8's chosen `503 Service Unavailable` + `PRE_INITIALIZING\n`); `TestServer_MarkReady_IsAtomic` fires 50 concurrent `GET /ready` probes against a goroutine while the main test races `s.MarkReady()` in parallel — the `sync/atomic.Bool` field introduced by Task 8 is the contract under test, and `-race` must see zero `DATA RACE` reports; `TestServer_Close_Idempotent` exercises three `Close` sequences — close-before-Start (no listener bound yet, relies on the `s.httpSrv == nil && s.ln == nil` nil-guard), first-Close after a successful `Start`, and second-Close on the same server. All three tests use `s.Start()` with `"127.0.0.1:0"` rather than pre-computing a free port; the `freeAddr` helper scaffolded by Task 8 has no consumer and is **deleted** per option (a) — dead code shouldn't persist past the task that needed it. The `//nolint:unused` directive is gone with it, and the `net` import is dropped from `admin_test.go` (the three new tests use only `io`, `net/http`, `testing`, `time`).
 
