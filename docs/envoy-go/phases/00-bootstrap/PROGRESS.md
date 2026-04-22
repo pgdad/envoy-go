@@ -238,3 +238,47 @@ ok  	github.com/esalaine/envoy-go/test/differential	0.001s
 ```
 
 **Follow-up:** added //nolint:unused markers to readyTimeout and scanForLine with references to Tasks 10/11 as their future consumers. Commit: 81ae9ee.
+
+## Task 10 — differential reference proxy (upstream Envoy via testcontainers)
+
+**Commits:** a789b18
+**Notes:** Added `github.com/testcontainers/testcontainers-go@v0.27.0` and `github.com/docker/go-connections@v0.4.0` as direct dependencies. Extended `test/differential/harness.go` with `ReferenceProxy` struct, `StartReferenceProxy`, `AdminAddr`, `ListenerAddr`, and `Stop`. Removed `//nolint:unused` from `readyTimeout` (now consumed by `StartReferenceProxy`); retained it on `scanForLine` (still unused until Task 11). Extended `test/differential/harness_test.go` with `TestReferenceProxy_Starts`, `ensureDocker`, and `loadPinFromRepo`. Full suite PASS, lint clean.
+
+**Docker-socket path note:** `/var/run/docker.sock` does not exist on this machine. Docker Desktop exposes the socket at `$HOME/.docker/desktop/docker.sock`. `ensureDocker` was extended (relative to the PLAN's verbatim code) to try both paths. testcontainers-go was invoked with `DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock`. The Envoy image was already cached from Task 4; no pull occurred.
+
+**Outputs:**
+```
+$ go test ./test/differential/ -run TestReferenceProxy_Starts   # RED
+# github.com/esalaine/envoy-go/test/differential [github.com/esalaine/envoy-go/test/differential.test]
+test/differential/harness_test.go:50:14: undefined: StartReferenceProxy
+FAIL	github.com/esalaine/envoy-go/test/differential [build failed]
+FAIL
+
+$ DOCKER_HOST="unix://${HOME}/.docker/desktop/docker.sock" go test ./test/differential/ -run TestReferenceProxy_Starts -v -timeout 120s   # GREEN
+=== RUN   TestReferenceProxy_Starts
+2026/04/22 08:08:49 github.com/testcontainers/testcontainers-go - Connected to docker:
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 22c89f611766a0b8ffeffb41428d4c8168f0b5c968faa79d055f4ec01437eaa9
+  Test ProcessID: 0e30a3ff-4980-4082-a800-9d1413671d55
+2026/04/22 08:08:49 Failed to get image auth for https://index.docker.io/v1/. Setting empty credentials for the image: testcontainers/ryuk:0.6.0. Setting empty credentials for the image: testcontainers/ryuk:0.6.0. Error is:credentials not found in native keychain
+2026/04/22 08:08:51 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/22 08:08:51 ✅ Container created: 4443a80226e2
+2026/04/22 08:08:51 🐳 Starting container: 4443a80226e2
+2026/04/22 08:08:51 ✅ Container started: 4443a80226e2
+2026/04/22 08:08:51 🚧 Waiting for container id 4443a80226e2 image: testcontainers/ryuk:0.6.0. Waiting for: &{Port:8080/tcp timeout:<nil> PollInterval:100ms}
+2026/04/22 08:08:51 🐳 Creating container for image envoyproxy/envoy:v1.37.2
+2026/04/22 08:08:51 ✅ Container created: 0f3ba6538a60
+2026/04/22 08:08:51 🐳 Starting container: 0f3ba6538a60
+2026/04/22 08:08:51 ✅ Container started: 0f3ba6538a60
+2026/04/22 08:08:51 🚧 Waiting for container id 0f3ba6538a60 image: envoyproxy/envoy:v1.37.2. Waiting for: &{timeout:0x28e5150747b0 Port:9901/tcp Path:/ready StatusCodeMatcher:0x85ffc0 ResponseMatcher:0x934f80 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 08:08:51 🐳 Terminating container: 0f3ba6538a60
+2026/04/22 08:08:52 🚫 Container terminated: 0f3ba6538a60
+--- PASS: TestReferenceProxy_Starts (2.41s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.479s
+```
