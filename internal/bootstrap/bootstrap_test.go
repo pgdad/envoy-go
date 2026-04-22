@@ -90,3 +90,34 @@ layered_runtime:
 		t.Errorf("error should name layered_runtime: %q", err.Error())
 	}
 }
+
+func TestLoad_YAMLSyntaxError(t *testing.T) {
+	_, err := Load(strings.NewReader("not: valid: yaml: at all: :::"))
+	if err == nil {
+		t.Fatal("Load: want yaml parse error, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap: yaml parse:") {
+		t.Errorf("error prefix: %q", err.Error())
+	}
+}
+
+func TestLoad_UnknownTopLevelField(t *testing.T) {
+	yaml := sampleBootstrap + "\nnot_a_real_field: 42\n"
+	_, err := Load(strings.NewReader(yaml))
+	if err == nil {
+		t.Fatal("Load: want unknown-field error, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap: protojson:") {
+		t.Errorf("error prefix: %q (expected protojson rejection)", err.Error())
+	}
+}
+
+func TestLoad_EmptyDocument(t *testing.T) {
+	_, err := Load(strings.NewReader(""))
+	if err == nil {
+		t.Fatal("Load: want empty-doc error, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty document") {
+		t.Errorf("error: %q", err.Error())
+	}
+}

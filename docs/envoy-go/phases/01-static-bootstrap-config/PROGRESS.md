@@ -111,3 +111,27 @@ ok  	github.com/esalaine/envoy-go/test/differential	(cached)
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 ```
+
+## Task 3 — bootstrap.Load error-path tests (syntax, unknown field, empty)
+
+**Commits:** `<sha>`
+**Notes:** locks behavior, no prod changes needed — `internal/bootstrap.Load` (landed Task 2, commit `d98c5fa`) already rejects YAML syntax errors with the `bootstrap: yaml parse:` prefix, unknown top-level fields via `protojson.UnmarshalOptions{DiscardUnknown: false}` producing the `bootstrap: protojson:` prefix, and empty documents via the `generic == nil` check producing `bootstrap: empty document`; these three tests append to `internal/bootstrap/bootstrap_test.go` to pin those contracts so future refactors cannot silently weaken the loader's error surface. The PLAN's exact YAML-syntax-error input `"not: valid: yaml: at all: :::"` was retained verbatim — `gopkg.in/yaml.v3` flags it as a parse error (not as a string scalar nor as protojson input), so no assertion adjustment was needed. No production code touched, no ADRs, no `go.mod` drift; `sampleBootstrap` const and the three Task 2 tests are unchanged.
+
+**Outputs:**
+```
+$ GOTOOLCHAIN=local go test ./internal/bootstrap/ -v
+=== RUN   TestLoad_HappyPath
+--- PASS: TestLoad_HappyPath (0.00s)
+=== RUN   TestLoad_RejectsDynamicResources
+--- PASS: TestLoad_RejectsDynamicResources (0.00s)
+=== RUN   TestLoad_RejectsLayeredRuntime
+--- PASS: TestLoad_RejectsLayeredRuntime (0.00s)
+=== RUN   TestLoad_YAMLSyntaxError
+--- PASS: TestLoad_YAMLSyntaxError (0.00s)
+=== RUN   TestLoad_UnknownTopLevelField
+--- PASS: TestLoad_UnknownTopLevelField (0.00s)
+=== RUN   TestLoad_EmptyDocument
+--- PASS: TestLoad_EmptyDocument (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.005s
+```
