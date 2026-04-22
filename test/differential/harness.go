@@ -44,8 +44,6 @@ func parseEnvoyTarget(r io.Reader) (*EnvoyPin, error) {
 	return &EnvoyPin{Tag: string(tagM[1]), SHA256: string(shaM[1])}, nil
 }
 
-// (More to come in Task 11.)
-
 // readyTimeout is the wall-clock budget the harness allows each proxy to
 // declare itself ready (admin /ready 200 for the reference, ready sentinel on
 // stdout for the subject). Generous on purpose; SPEC §11 mitigates flakiness
@@ -226,4 +224,34 @@ func readyAddr(line string) string {
 		return ""
 	}
 	return strings.TrimRight(line[i+len(prefix):], "\r\n")
+}
+
+// FixtureDriver is the contract a fixture under test/fixtures/NNNN-*/driver
+// implements. Drivers register themselves in init(); the runner discovers
+// them by name (which must match the fixture directory).
+type FixtureDriver interface {
+	// Drive sends fixture-specific traffic at refAddr and subjAddr (each is a
+	// host:port for the listener under test in each proxy). Returns the
+	// captured byte streams for diffing.
+	Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error)
+
+	// ReferenceBootstrap returns the YAML to feed upstream Envoy.
+	ReferenceBootstrap() string
+
+	// SubjectConfig returns the YAML to feed envoy-go.
+	SubjectConfig(refListenerPort, subjListenerPort, backendPort int) string
+
+	// ReferenceListenerPort is the in-container TCP port the reference proxy
+	// must expose (the listener the driver dials).
+	ReferenceListenerPort() int
+}
+
+var driverRegistry = map[string]FixtureDriver{}
+
+// RegisterFixture is called from a driver's init().
+func RegisterFixture(name string, d FixtureDriver) {
+	if _, dup := driverRegistry[name]; dup {
+		panic(fmt.Sprintf("duplicate fixture driver registration: %s", name))
+	}
+	driverRegistry[name] = d
 }
