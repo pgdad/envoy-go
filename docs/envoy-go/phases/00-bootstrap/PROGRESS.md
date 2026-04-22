@@ -433,3 +433,5 @@ $ golangci-lint run ./...
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	1.163s
 ```
+
+- **Follow-up (Task 13 code-review fixes):** Three deviations from the PLAN lacked ADRs (D-3.5 violation) and two revive violations caused `golangci-lint run ./...` to exit non-zero (D-3.6 violation). Fixed in commits 59978de (revive: rename `FixtureDriver`→`Driver` in `test/differential/fixture/fixture.go`, add doc comment on `DriverRegistry`, update type alias in `harness.go`), a1714cb (append ADR-0009, ADR-0010, ADR-0011 to DECISIONS.md), and 9a41b9e (remove stale PLAN-step-7 forward-reference comment in `runner_test.go`).
