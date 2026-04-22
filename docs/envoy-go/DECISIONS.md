@@ -160,3 +160,30 @@ The Go module path is `github.com/esalaine/envoy-go`, namespaced under the proje
 - The path is a `go.mod` identifier only — it does not need to resolve as a Git URL during phase 00 or any phase that does not publish modules. Publication, if ever pursued, is its own ADR.
 - Supersession (e.g. moving to a real published origin) is cheap: one ADR + `go mod edit -module …` + sed-rewrite of import paths.
 
+---
+
+## ADR-0008: pinned upstream Envoy image v1.37.2
+
+**Status:** Accepted
+**Date:** 2026-04-21
+**Doctrine:** D-3.3, D-3.7
+**Settles:** SPEC §10 #2 deferred decision
+
+### Context
+
+The differential test contract (BOOTSTRAP_PROMPT §7) requires every fixture to compare against a stable, byte-identifiable upstream Envoy image. Phase 00 is the first phase to need that pin.
+
+### Decision
+
+The upstream Envoy reference is pinned to `envoyproxy/envoy:v1.37.2` at SHA256 `envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`. Selection rationale per SPEC §5.6:
+
+- Stable release tag (not `-dev`).
+- Most recent stable as of 2026-04-21 within the 6-month window.
+- Exposes admin and `tcp_proxy` on the documented names for v3 proto.
+- Smoke-tested locally: admin `/ready` returns `LIVE` under a minimal bootstrap.
+
+### Consequences
+
+- All fixture configs (`envoy.yaml`) target this Envoy version's bootstrap and v3 protobuf.
+- `docs/envoy-go/ENVOY_TARGET.md` documents the refresh procedure (re-pull, re-baseline differential, ADR).
+- Pin changes happen only in a dedicated phase per D-3.7.
