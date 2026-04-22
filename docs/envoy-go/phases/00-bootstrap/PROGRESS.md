@@ -282,3 +282,5 @@ $ DOCKER_HOST="unix://${HOME}/.docker/desktop/docker.sock" go test ./test/differ
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	2.479s
 ```
+
+- Follow-up: changed StartReferenceProxy to use `pin.SHA256` as the container image reference (SPEC §11 "Pin by SHA256 from day one") and added `_ = c.Terminate(ctx)` to the two early error paths (Host lookup, admin-port MappedPort) that previously leaked containers on failure. Both changes surfaced by Task 10 code review. Commit: 33c5a2a.
