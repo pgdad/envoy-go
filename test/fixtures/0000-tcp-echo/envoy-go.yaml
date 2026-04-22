@@ -1,0 +1,8 @@
+# Sample envoy-go config for fixture 0000-tcp-echo. The runner overrides
+# listener.port and upstream.port at test time.
+listener:
+  address: 127.0.0.1
+  port: 16000
+upstream:
+  address: 127.0.0.1
+  port: 19000

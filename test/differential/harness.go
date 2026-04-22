@@ -12,9 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/esalaine/envoy-go/test/differential/fixture"
 )
 
 // EnvoyPin captures the upstream image identity from ENVOY_TARGET.md.
@@ -100,6 +103,9 @@ func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, l
 		ExposedPorts: exposed,
 		Cmd:          []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn"},
 		WaitingFor:   wait.ForHTTP("/ready").WithPort("9901/tcp").WithStartupTimeout(readyTimeout),
+		HostConfigModifier: func(hc *container.HostConfig) {
+			hc.ExtraHosts = []string{"host.docker.internal:host-gateway"}
+		},
 	}
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -226,32 +232,10 @@ func readyAddr(line string) string {
 	return strings.TrimRight(line[i+len(prefix):], "\r\n")
 }
 
-// FixtureDriver is the contract a fixture under test/fixtures/NNNN-*/driver
-// implements. Drivers register themselves in init(); the runner discovers
-// them by name (which must match the fixture directory).
-type FixtureDriver interface {
-	// Drive sends fixture-specific traffic at refAddr and subjAddr (each is a
-	// host:port for the listener under test in each proxy). Returns the
-	// captured byte streams for diffing.
-	Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error)
+// FixtureDriver is re-exported from the fixture sub-package for callers that
+// imported it from here before the refactor. New code should import
+// test/differential/fixture directly.
+type FixtureDriver = fixture.FixtureDriver
 
-	// ReferenceBootstrap returns the YAML to feed upstream Envoy.
-	ReferenceBootstrap() string
-
-	// SubjectConfig returns the YAML to feed envoy-go.
-	SubjectConfig(refListenerPort, subjListenerPort, backendPort int) string
-
-	// ReferenceListenerPort is the in-container TCP port the reference proxy
-	// must expose (the listener the driver dials).
-	ReferenceListenerPort() int
-}
-
-var driverRegistry = map[string]FixtureDriver{}
-
-// RegisterFixture is called from a driver's init().
-func RegisterFixture(name string, d FixtureDriver) {
-	if _, dup := driverRegistry[name]; dup {
-		panic(fmt.Sprintf("duplicate fixture driver registration: %s", name))
-	}
-	driverRegistry[name] = d
-}
+// RegisterFixture re-exports fixture.RegisterFixture for backward compat.
+func RegisterFixture(name string, d FixtureDriver) { fixture.RegisterFixture(name, d) }

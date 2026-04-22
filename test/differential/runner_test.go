@@ -3,13 +3,18 @@ package differential
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/esalaine/envoy-go/test/differential/fixture"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver"
 )
 
 // (Task 13 step 7 adds "fmt" and "strings" to this import block when it
@@ -32,7 +37,7 @@ func TestDifferential(t *testing.T) {
 	for _, fx := range fixtures {
 		fx := fx
 		t.Run(fx, func(t *testing.T) {
-			driver, ok := driverRegistry[fx]
+			driver, ok := fixture.DriverRegistry[fx]
 			if !ok {
 				t.Fatalf("no driver registered for fixture %q (did its driver package get imported?)", fx)
 			}
@@ -45,8 +50,10 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// 1. Backend echo on a random port.
-	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	// 1. Backend echo on a random port. Bind to 0.0.0.0 so the reference
+	// Envoy container can reach it via host.docker.internal (which resolves
+	// to the Docker Desktop gateway IP, not 127.0.0.1).
+	backend, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatalf("backend listen: %v", err)
 	}
@@ -55,7 +62,8 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	backendPort := backend.Addr().(*net.TCPAddr).Port
 
 	// 2. Reference proxy.
-	ref, err := StartReferenceProxy(ctx, pin, d.ReferenceBootstrap(), d.ReferenceListenerPort())
+	bootstrap := strings.Replace(d.ReferenceBootstrap(), "port_value: 0", fmt.Sprintf("port_value: %d", backendPort), 1)
+	ref, err := StartReferenceProxy(ctx, pin, bootstrap, d.ReferenceListenerPort())
 	if err != nil {
 		t.Fatalf("ref start: %v", err)
 	}

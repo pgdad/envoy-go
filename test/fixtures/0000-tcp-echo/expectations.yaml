@@ -1,0 +1,34 @@
+# Equivalence dimensions for fixture 0000-tcp-echo.
+# Every dimension from BOOTSTRAP_PROMPT.md §7.2 (also captured in
+# docs/envoy-go/BEHAVIOR_CONTRACT.md) is enumerated. Phase 00's diff is
+# byte-exact on response-body only; the rest are not-applicable for this
+# fixture and explicitly justified.
+
+dimensions:
+  response-status:
+    applicable: false
+    reason: pure TCP fixture — no HTTP layer
+  response-body:
+    applicable: true
+    rule: byte-exact
+  response-headers:
+    applicable: false
+    reason: pure TCP fixture — no HTTP layer
+  response-trailers:
+    applicable: false
+    reason: pure TCP fixture — no HTTP layer
+  http2-http3-framing:
+    applicable: false
+    reason: TCP only
+  access-log:
+    applicable: false
+    reason: subject does not emit access logs in phase 00
+  stats:
+    applicable: false
+    reason: subject does not emit stats in phase 00
+  xds:
+    applicable: false
+    reason: static config; no xDS in phase 00
+  timing:
+    applicable: false
+    reason: timing not opt-in for echo fixture
