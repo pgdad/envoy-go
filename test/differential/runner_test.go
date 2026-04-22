@@ -17,10 +17,6 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver"
 )
 
-// (Task 13 step 7 adds "fmt" and "strings" to this import block when it
-// introduces the bootstrap-template substitution. Do not pre-import them
-// here — `goimports` and `golangci-lint` reject unused imports.)
-
 // TestDifferential is the differential suite entry point. It discovers
 // fixture directories under test/fixtures/, runs each as a subtest, and fails
 // the suite if any fixture's diff verdict is not Equal.
