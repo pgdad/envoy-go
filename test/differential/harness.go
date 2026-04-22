@@ -43,11 +43,11 @@ func parseEnvoyTarget(r io.Reader) (*EnvoyPin, error) {
 // declare itself ready (admin /ready 200 for the reference, ready sentinel on
 // stdout for the subject). Generous on purpose; SPEC §11 mitigates flakiness
 // by surfacing failures, not retrying.
-const readyTimeout = 30 * time.Second
+const readyTimeout = 30 * time.Second //nolint:unused // consumed by Task 10 reference/subject proxy wiring
 
 // scanForLine reads lines from r until one of `needle` substrings appears or
 // ctx is done. Returns the matching full line.
-func scanForLine(ctx context.Context, r io.Reader, needle string) (string, error) {
+func scanForLine(ctx context.Context, r io.Reader, needle string) (string, error) { //nolint:unused // consumed by Task 10/11 for ready-sentinel detection
 	br := bufio.NewReader(r)
 	out := make(chan string, 1)
 	errCh := make(chan error, 1)
