@@ -236,3 +236,5 @@ $ go test ./test/differential/ -run TestParseEnvoyTarget -v # GREEN
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	0.001s
 ```
+
+**Follow-up:** added //nolint:unused markers to readyTimeout and scanForLine with references to Tasks 10/11 as their future consumers. Commit: 81ae9ee.
