@@ -1,0 +1,35 @@
+# Lint configuration for envoy-go.
+# Baseline derived verbatim from docs/envoy-go/phases/00-bootstrap/SPEC.md §5.5.
+# Removals from this baseline require an ADR; additions do not.
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/esalaine/envoy-go
+  misspell:
+    locale: US
+  revive:
+    rules:
+      - name: package-comments
+      - name: exported
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
