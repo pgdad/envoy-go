@@ -459,3 +459,141 @@ $ golangci-lint run ./test/conformance/
 
 **Commits:** 35024ca
 **Notes:** Created .github/workflows/ci.yml with two jobs: `lint-vet-test` (go vet, golangci-lint v1.64.8 per ADR-0009, `go test -short`) and `differential` (depends on first; runs `go test ./test/differential/... -v -timeout 5m`). Both on ubuntu-latest with Go 1.23. Docker pre-installed on GitHub Actions runners. PLAN's verbatim v1.55.2 is superseded by ADR-0009 (bump to v1.64.8 for Go 1.22+ compat). Task 16 will run the local equivalent to prove the workflow is functionally valid pre-push.
+
+## Task 16 — First green CI run (local equivalent)
+
+**Commits:** (see below after commit)
+**Notes:** CI workflow file exists at .github/workflows/ci.yml per Task 15. Push to origin git@github.com:pgdad/envoy-go.git: succeeded. Remote CI triggered (in_progress at time of capture). Local equivalent run mirrors the workflow's steps on the executor's machine, providing the §3 phase-done gate proof.
+
+### Push attempt
+
+```
+$ git push -u origin phase/00-bootstrap-impl
+remote: 
+remote: Create a pull request for 'phase/00-bootstrap-impl' on GitHub by visiting:
+remote:      https://github.com/pgdad/envoy-go/pull/new/phase/00-bootstrap-impl
+remote: 
+To github.com:pgdad/envoy-go.git
+ * [new branch]      phase/00-bootstrap-impl -> phase/00-bootstrap-impl
+branch 'phase/00-bootstrap-impl' set up to track 'origin/phase/00-bootstrap-impl'.
+EXIT_CODE: 0
+```
+
+Remote CI status immediately after push (`gh run list --branch phase/00-bootstrap-impl --repo pgdad/envoy-go`):
+```
+in_progress  phase 00: log Task 15 in PROGRESS.md  ci  phase/00-bootstrap-impl  push  24779628785  31s  2026-04-22T12:59:30Z
+```
+
+### Local equivalent — verbatim outputs
+
+#### `go vet ./...`
+```
+(empty — no output, exit 0)
+```
+
+#### `golangci-lint run ./...`
+```
+(empty — no output, exit 0)
+```
+
+#### `go test -short ./...`
+```
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+EXIT_CODE: 0
+```
+
+#### `DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock go test ./test/differential/... -timeout 5m -v`
+```
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+2026/04/22 08:59:48 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: b0a82627855632a4818e06902a68139e9dd1926e2802d0669dcf1d21f0a8ffc8
+  Test ProcessID: c7f3e8ec-904a-4196-99ba-9f281b7f24d2
+2026/04/22 08:59:48 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/22 08:59:48 ✅ Container created: e62a41341309
+2026/04/22 08:59:48 🐳 Starting container: e62a41341309
+2026/04/22 08:59:48 ✅ Container started: e62a41341309
+2026/04/22 08:59:48 🚧 Waiting for container id e62a41341309 image: testcontainers/ryuk:0.6.0. Waiting for: &{Port:8080/tcp timeout:<nil> PollInterval:100ms}
+2026/04/22 08:59:48 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 08:59:49 ✅ Container created: d14a5fe0c041
+2026/04/22 08:59:49 🐳 Starting container: d14a5fe0c041
+2026/04/22 08:59:49 ✅ Container started: d14a5fe0c041
+2026/04/22 08:59:49 🚧 Waiting for container id d14a5fe0c041 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x2673e68801a8 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x937a00 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 08:59:49 🐳 Terminating container: d14a5fe0c041
+2026/04/22 08:59:49 🚫 Container terminated: d14a5fe0c041
+--- PASS: TestReferenceProxy_Starts (0.85s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.14s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+2026/04/22 08:59:49 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 08:59:49 ✅ Container created: c8759a3e2145
+2026/04/22 08:59:49 🐳 Starting container: c8759a3e2145
+2026/04/22 08:59:49 ✅ Container started: c8759a3e2145
+2026/04/22 08:59:49 🚧 Waiting for container id c8759a3e2145 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x2673e67fc6c8 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x937a00 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 08:59:50 🐳 Terminating container: c8759a3e2145
+2026/04/22 08:59:50 🚫 Container terminated: c8759a3e2145
+--- PASS: TestDifferential (0.72s)
+    --- PASS: TestDifferential/0000-tcp-echo (0.72s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.785s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+EXIT_CODE: 0
+```
+
+#### `DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock go test ./... -timeout 10m`
+```
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	1.785s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+EXIT_CODE: 0
+```
+
+All commands exited 0; no FAIL lines; differential suite PASS including `--- PASS: TestDifferential/0000-tcp-echo (0.72s)`.
