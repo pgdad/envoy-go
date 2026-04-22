@@ -367,3 +367,25 @@ Every phase that introduces a parser, codec, or filter ships a Go fuzz target un
 These six gates are what `superpowers:verification-before-completion` verifies. They are the complete definition of "done."
 
 ---
+
+## 8. Seeded MVP Trunk — phases 00 through 08
+
+Phase 00 copies these rows verbatim into `docs/envoy-go/ROADMAP.md`. Subsequent phases brainstorm their own `SPEC.md` when entered, but the titles, IDs, and ordering below are fixed.
+
+| # | Title | Differential surface at phase end |
+|---|---|---|
+| 00 | Bootstrap: repo layout, CI, Docker reference Envoy, differential harness skeleton, `ENVOY_TARGET.md` pin, trivial echo fixture | harness boots; one TCP echo fixture green |
+| 01 | Static bootstrap config loader (node, admin, static_resources skeleton) | config parses; admin `/ready` behaves like Envoy |
+| 02 | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext) | TCP proxy fixture green |
+| 03 | Downstream TLS termination + upstream TLS origination + SNI | TLS TCP fixture green |
+| 04 | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response | HTTP/1.1 routing fixture green |
+| 05 | HTTP/2 downstream + upstream (low-level framer, own conn mgr) | HTTP/2 fixture green; `h2spec` above threshold |
+| 06 | Access log (file sink, Envoy default format) + stats + Prometheus admin endpoint | access log + Prometheus fixtures green |
+| 07 | Filter chain framework: iteration protocol, per-route config, extension registry | framework fixtures green; trivial pluggable filter covers all iteration states |
+| 08 | Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain | admin + drain fixtures green |
+
+**Invariant:** Phases 00–08 ship *in order*. Each depends on the previous one having landed green, because each adds a primitive the next relies on. Splitting (§6) is still permitted within any of these phases.
+
+After phase 08 lands, envoy-go is a minimal but real proxy. At that point you transition to feature-family expansion (§9).
+
+---
