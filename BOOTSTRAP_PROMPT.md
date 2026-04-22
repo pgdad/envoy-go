@@ -389,3 +389,21 @@ Phase 00 copies these rows verbatim into `docs/envoy-go/ROADMAP.md`. Subsequent 
 After phase 08 lands, envoy-go is a minimal but real proxy. At that point you transition to feature-family expansion (§9).
 
 ---
+
+## 9. Feature Families — phases 09 and onward (headings only)
+
+Phase 00 seeds these as headings in `docs/envoy-go/ROADMAP.md`. Do **not** expand them into per-phase rows now. Each family is brainstormed as its own phase when it enters `in-progress`, and split (§6) as reality demands.
+
+- HTTP filters family (header manipulation, cors, compression, fault, local+global rate limit, jwt_authn, rbac, ext_authz, ext_proc, oauth2, csrf, buffer, lua, wasm, adaptive concurrency, admission control, bandwidth limit).
+- Network filters family (redis, mongo, kafka_broker, thrift, zookeeper [scope TBD], echo, direct_response, sni_cluster, rbac network).
+- Load balancing family (least_request, random, ring_hash, maglev, subset LB, locality-weighted LB, priority load balancing, panic thresholds).
+- Upstream robustness family (active health checks HTTP/TCP/gRPC/custom, outlier detection variants, circuit breakers, retries + hedging, per-protocol connection pooling).
+- HTTP/3 + QUIC family (quic-go transport, downstream H3 listener, upstream H3 cluster, `h3spec` gate).
+- gRPC family (gRPC bridge, gRPC-Web, gRPC-JSON transcoding, interop conformance).
+- xDS / dynamic config family (ADS, delta xDS, LDS, CDS, RDS, EDS, SDS, RTDS, reconnection, initial-fetch timeout).
+- Observability family (gRPC ALS, OTLP access log, OTel/Zipkin/Jaeger/Datadog/XRay tracing, stats sinks, tap filter).
+- Runtime + hot restart family.
+- WASM host family (own multi-phase sub-project; ABI, engine binding, proxy-wasm conformance).
+- Deprecated / edge features (explicit out-of-scope ADRs unless later re-opened).
+
+---
