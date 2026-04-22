@@ -410,3 +410,55 @@ ok  	github.com/esalaine/envoy-go/test/differential	(cached)
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 ```
+
+## Task 9 — admin.Server pre-init + MarkReady atomicity + Close idempotency tests
+
+**Commits:** `TBD`
+
+**Notes:** Three concurrency/state tests append to `internal/admin/admin_test.go`, closing phase-01 gate (c)'s admin-server surface: `TestServer_PreInit_BeforeMarkReady` pins the pre-init branch of `handleReady` (`Start` without `MarkReady` → non-200 status with body distinct from `LIVE\n`, per ADR-0015 option (b) / Task 8's chosen `503 Service Unavailable` + `PRE_INITIALIZING\n`); `TestServer_MarkReady_IsAtomic` fires 50 concurrent `GET /ready` probes against a goroutine while the main test races `s.MarkReady()` in parallel — the `sync/atomic.Bool` field introduced by Task 8 is the contract under test, and `-race` must see zero `DATA RACE` reports; `TestServer_Close_Idempotent` exercises three `Close` sequences — close-before-Start (no listener bound yet, relies on the `s.httpSrv == nil && s.ln == nil` nil-guard), first-Close after a successful `Start`, and second-Close on the same server. All three tests use `s.Start()` with `"127.0.0.1:0"` rather than pre-computing a free port; the `freeAddr` helper scaffolded by Task 8 has no consumer and is **deleted** per option (a) — dead code shouldn't persist past the task that needed it. The `//nolint:unused` directive is gone with it, and the `net` import is dropped from `admin_test.go` (the three new tests use only `io`, `net/http`, `testing`, `time`).
+
+**admin.go was NOT modified.** The PLAN flagged a potential idempotency concern — "the second `Close` may return `http.ErrServerClosed`" — but this is incorrect for Go 1.23's stdlib: `http.Server.Close()` is already idempotent. Verified with a throw-away `go run` probe that called `srv.Close()` three times against a `Serve`-ing server and received `<nil>` on all three. The `http.ErrServerClosed` sentinel is returned by `Serve`/`ListenAndServe`, not by `Close`; subsequent `Close` calls short-circuit cleanly because the server's internal `inShutdown` atomic has already flipped. The nil-guards in `admin.go`'s Close (`if s.httpSrv != nil`, `if s.ln != nil`) handle the Close-before-Start case, and stdlib handles the double-Close case, so no `closed atomic.Bool` short-circuit flag is needed. All four tests (existing `TestServer_ReadyState` plus the three new ones) PASS under `-race` on first run and reliably across 5 repeated runs of `TestServer_Close_Idempotent` (`-count=5`).
+
+**Self-review:** 4 tests total in `admin_test.go` (`TestServer_ReadyState` + `TestServer_PreInit_BeforeMarkReady` + `TestServer_MarkReady_IsAtomic` + `TestServer_Close_Idempotent`). `freeAddr` deleted (option a). Zero `//nolint` directives remain in the admin package. `admin.go` untouched. Full gate sweep green.
+
+**Outputs:**
+
+```
+$ GOTOOLCHAIN=local go test -race ./internal/admin/ -v -count=1
+=== RUN   TestServer_ReadyState
+--- PASS: TestServer_ReadyState (0.01s)
+=== RUN   TestServer_PreInit_BeforeMarkReady
+--- PASS: TestServer_PreInit_BeforeMarkReady (0.01s)
+=== RUN   TestServer_MarkReady_IsAtomic
+--- PASS: TestServer_MarkReady_IsAtomic (0.02s)
+=== RUN   TestServer_Close_Idempotent
+--- PASS: TestServer_Close_Idempotent (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	1.051s
+
+$ GOTOOLCHAIN=local go vet ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local golangci-lint run ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local go test ./... -timeout 5m -count=1
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.182s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.043s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.007s
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	1.832s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+```

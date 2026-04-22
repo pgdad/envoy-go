@@ -2,7 +2,6 @@ package admin
 
 import (
 	"io"
-	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -52,17 +51,81 @@ func TestServer_ReadyState(t *testing.T) {
 	}
 }
 
-// freeAddr returns a host:port string for a port that is currently free. Used
-// by Task 9's concurrency tests; declared here per PLAN Step 3 so that Task 9
-// does not re-introduce the same helper.
-//
-//nolint:unused // consumed by TestServer_ConcurrentReady in Task 9.
-func freeAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+func TestServer_PreInit_BeforeMarkReady(t *testing.T) {
+	s := New("127.0.0.1:0")
+	addr, err := s.Start()
 	if err != nil {
-		t.Fatalf("free addr: %v", err)
+		t.Fatalf("Start: %v", err)
 	}
-	defer func() { _ = ln.Close() }()
-	return ln.Addr().String()
+	defer func() { _ = s.Close() }()
+	time.Sleep(10 * time.Millisecond)
+	// No MarkReady call. /ready should return the pre-init response per
+	// ADR-0015.
+	resp, err := http.Get("http://" + addr + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == 200 {
+		t.Errorf("pre-init status: got 200, want non-200 per ADR-0015")
+	}
+	// Body must match whatever ADR-0015 locks. Task 8 chose option (b):
+	// PRE_INITIALIZING\n with 503 Service Unavailable.
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) == "LIVE\n" {
+		t.Errorf("pre-init body must not be LIVE\\n (would collide with ready state)")
+	}
+}
+
+func TestServer_MarkReady_IsAtomic(t *testing.T) {
+	s := New("127.0.0.1:0")
+	addr, err := s.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	time.Sleep(10 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 50; i++ {
+			resp, _ := http.Get("http://" + addr + "/ready")
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+		}
+		close(done)
+	}()
+	s.MarkReady()
+	<-done
+	// Final probe should be 200/LIVE.
+	resp, _ := http.Get("http://" + addr + "/ready")
+	if resp == nil {
+		t.Fatal("final probe: nil response")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		t.Errorf("final status: got %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestServer_Close_Idempotent(t *testing.T) {
+	s := New("127.0.0.1:0")
+	// Close before Start.
+	if err := s.Close(); err != nil {
+		t.Errorf("Close before Start: %v", err)
+	}
+	// Close after Start.
+	s2 := New("127.0.0.1:0")
+	_, err := s2.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := s2.Close(); err != nil {
+		t.Errorf("first Close: %v", err)
+	}
+	// Second Close.
+	if err := s2.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
 }
