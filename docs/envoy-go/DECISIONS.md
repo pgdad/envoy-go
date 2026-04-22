@@ -187,3 +187,37 @@ The upstream Envoy reference is pinned to `envoyproxy/envoy:v1.37.2` at SHA256 `
 - All fixture configs (`envoy.yaml`) target this Envoy version's bootstrap and v3 protobuf.
 - `docs/envoy-go/ENVOY_TARGET.md` documents the refresh procedure (re-pull, re-baseline differential, ADR).
 - Pin changes happen only in a dedicated phase per D-3.7.
+
+---
+
+## ADR-0007: minimal YAML schema for `envoy-go.yaml` in phase 00
+
+**Status:** Accepted
+**Date:** 2026-04-21
+**Doctrine:** D-3.5
+**Settles:** SPEC §10 #6 deferred decision
+
+### Context
+
+Phase 00's subject binary needs to read its own configuration without yet implementing Envoy's bootstrap proto (that lands in phase 01). SPEC §5.2 sketched the field set; ADR-0007 codifies it for the phase-00 lifetime.
+
+### Decision
+
+The minimal phase-00 schema, parsed by `cmd/envoy-go/config.go`, is exactly:
+
+```yaml
+listener:
+  address: <string, required, non-empty>
+  port: <int, required, 1..65535>
+upstream:
+  address: <string, required, non-empty>
+  port: <int, required, 1..65535>
+```
+
+Unknown top-level fields are rejected (`yaml.Decoder.KnownFields(true)`). No defaults; both blocks must be present.
+
+### Consequences
+
+- Phase 01's bootstrap loader (`internal/bootstrap`) supersedes this schema entirely — phase 01's plan ADRs the cutover and the migration of `test/fixtures/0000-tcp-echo/envoy-go.yaml`.
+- The strict-unknown-fields rule prevents silent typo regressions.
+- The schema is intentionally not extensible. New fields require either (a) phase 01 landing, or (b) an explicit superseding ADR.
