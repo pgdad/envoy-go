@@ -5,6 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -51,7 +54,7 @@ const readyTimeout = 30 * time.Second
 
 // scanForLine reads lines from r until one of `needle` substrings appears or
 // ctx is done. Returns the matching full line.
-func scanForLine(ctx context.Context, r io.Reader, needle string) (string, error) { //nolint:unused // consumed by Task 11 for ready-sentinel detection
+func scanForLine(ctx context.Context, r io.Reader, needle string) (string, error) {
 	br := bufio.NewReader(r)
 	out := make(chan string, 1)
 	errCh := make(chan error, 1)
@@ -142,4 +145,85 @@ func (r *ReferenceProxy) ListenerAddr(containerPort int) string { return r.tcpAd
 // Stop terminates the container.
 func (r *ReferenceProxy) Stop(ctx context.Context) error {
 	return r.container.Terminate(ctx)
+}
+
+// SubjectProxy is the envoy-go subprocess managed by the harness.
+type SubjectProxy struct {
+	cmd          *exec.Cmd
+	listenerAddr string
+	tmpDir       string
+}
+
+// StartSubjectProxy builds cmd/envoy-go from repoRoot, writes cfg to a temp
+// file, starts the subject as a subprocess, waits for the ready sentinel, and
+// returns a handle. The harness owns the subprocess lifetime; callers must
+// call Stop to release.
+func StartSubjectProxy(ctx context.Context, repoRoot, cfg string) (*SubjectProxy, error) {
+	tmp, err := os.MkdirTemp("", "envoy-go-subject-*")
+	if err != nil {
+		return nil, err
+	}
+	bin := filepath.Join(tmp, "envoy-go")
+	build := exec.CommandContext(ctx, "go", "build", "-o", bin, "./cmd/envoy-go")
+	build.Dir = repoRoot
+	if out, err := build.CombinedOutput(); err != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, fmt.Errorf("build subject: %w\n%s", err, out)
+	}
+	cfgPath := filepath.Join(tmp, "envoy-go.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, fmt.Errorf("start subject: %w", err)
+	}
+
+	readyCtx, cancel := context.WithTimeout(ctx, readyTimeout)
+	defer cancel()
+	line, err := scanForLine(readyCtx, stdout, "envoy-go ready on ")
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		_ = os.RemoveAll(tmp)
+		return nil, fmt.Errorf("subject ready: %w", err)
+	}
+	addr := readyAddr(line)
+	if addr == "" {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		_ = os.RemoveAll(tmp)
+		return nil, fmt.Errorf("subject ready line malformed: %q", line)
+	}
+
+	return &SubjectProxy{cmd: cmd, listenerAddr: addr, tmpDir: tmp}, nil
+}
+
+// ListenerAddr returns the host:port the subject is listening on (parsed from
+// the ready sentinel).
+func (s *SubjectProxy) ListenerAddr() string { return s.listenerAddr }
+
+// Stop kills and reaps the subject and cleans up its temp directory.
+func (s *SubjectProxy) Stop() error {
+	_ = s.cmd.Process.Kill()
+	_, _ = s.cmd.Process.Wait()
+	return os.RemoveAll(s.tmpDir)
+}
+
+func readyAddr(line string) string {
+	const prefix = "envoy-go ready on "
+	i := strings.Index(line, prefix)
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimRight(line[i+len(prefix):], "\r\n")
 }

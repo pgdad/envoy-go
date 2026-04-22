@@ -2,6 +2,7 @@ package differential
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -88,4 +89,50 @@ func loadPinFromRepo(t *testing.T) *EnvoyPin {
 		t.Fatalf("parse pin: %v", err)
 	}
 	return pin
+}
+
+func TestSubjectProxy_StartsAndReports(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subject subprocess test; skipped under -short")
+	}
+	port := freeTCPPort(t) // helper from cmd/envoy-go/main_test.go-style
+	cfg := fmt.Sprintf(`
+listener: { address: 127.0.0.1, port: %d }
+upstream: { address: 127.0.0.1, port: 65535 }
+`, port)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	subj, err := StartSubjectProxy(ctx, repoRoot(t), cfg)
+	if err != nil {
+		t.Fatalf("StartSubjectProxy: %v", err)
+	}
+	defer func() { _ = subj.Stop() }()
+
+	if got, want := subj.ListenerAddr(), fmt.Sprintf("127.0.0.1:%d", port); got != want {
+		t.Errorf("ListenerAddr: got %q, want %q", got, want)
+	}
+}
+
+// repoRoot returns the absolute path to the repository root. Used by both the
+// subject-proxy starter (build.Dir) and the runner (loadPinFromRepo path
+// resolution).
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, _ := runtime.Caller(0)
+	abs, err := filepath.Abs(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	if err != nil {
+		t.Fatalf("repoRoot: %v", err)
+	}
+	return abs
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("free port: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	return ln.Addr().(*net.TCPAddr).Port
 }
