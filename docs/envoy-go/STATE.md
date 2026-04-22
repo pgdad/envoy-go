@@ -6,10 +6,10 @@ This file is the single source of truth for "what next" (see `BOOTSTRAP_PROMPT.m
 
 - **active-phase:** `00-bootstrap`
 - **phase-directory:** `docs/envoy-go/phases/00-bootstrap/`
-- **lifecycle-state:** `1` — phase row exists in ROADMAP, phase directory created, no SPEC.md yet
-- **next-skill:** `superpowers:brainstorming`
-- **next-skill-scope:** produce `docs/envoy-go/phases/00-bootstrap/SPEC.md` covering the bootstrap phase (see ROADMAP.md row `00` for phase-end differential surface)
-- **last-commit:** `<to-be-filled-by-scaffold-commit>` (the `bootstrap: envoy-go project scaffold` commit)
+- **lifecycle-state:** `2` — SPEC.md exists (approved by `spec-document-reviewer` subagent per ADR-0004), PLAN.md does not
+- **next-skill:** `superpowers:writing-plans`
+- **next-skill-scope:** produce `docs/envoy-go/phases/00-bootstrap/PLAN.md` implementing the SPEC. Apply §5 step 2 GATE: if PLAN.md exceeds ~25 tasks or ~1500 LoC net change, split phase 00 into sub-phases (§6) and exit.
+- **last-commit:** the phase-00 SPEC commit on branch `bootstrap` (and merged into `master` on the same session). Resolve via `git log -1 --format=%H docs/envoy-go/phases/00-bootstrap/SPEC.md` when needed.
 - **last-updated:** 2026-04-21
 
 ---
