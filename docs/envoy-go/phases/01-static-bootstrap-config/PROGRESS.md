@@ -57,3 +57,57 @@ ok  	github.com/esalaine/envoy-go/test/differential	1.816s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	0.001s
 ```
+
+## Task 2 — bootstrap.Load happy path + dynamic_resources/layered_runtime rejection
+
+**Commits:** `<sha>`
+**Notes:** `internal/bootstrap.Load` implements the three-stage pipeline codified by ADR-0012 — `gopkg.in/yaml.v3` decodes the input into `map[string]interface{}`, `encoding/json.Marshal` re-emits as JSON, and `google.golang.org/protobuf/encoding/protojson.Unmarshal` (with `DiscardUnknown: false` per ADR-0016) binds the JSON into an `envoy.config.bootstrap.v3.Bootstrap`. The pipeline was chosen over `sigs.k8s.io/yaml` (extra dep wrapping `yaml.v2`, no new capability) and over a direct YAML-to-proto `protoreflect` walker (non-canonical, duplicates `protojson`'s Any/well-known-type handling); `yaml.v3` was already a direct require from the phase-00 loader so no new module is introduced, and `protojson` is the canonical Go proto-JSON codec. Phase-01 unsupported surfaces (`dynamic_resources`, `layered_runtime`) are rejected at the `map[string]interface{}` stage — before `protojson` touches the bytes — so the error messages name the top-level key and reference SPEC §2 without requiring proto-reflection. The `typed_config` Any inside filter chains (phase-01 fixtures use only `envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy`) is preserved but not interpreted: `bootstrap.go` blank-imports `go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3` so `protoregistry.GlobalTypes` can resolve the `@type` URL for round-trip, while envoy-go code does not inspect or act on the Any contents (ADR-0016 consequences §3: later phases extend the blank-import list as fixtures introduce new filter types). Every error returned by `Load` begins with the sentinel `bootstrap: ` so callers can distinguish loader errors from other packages. `go mod tidy` promoted `google.golang.org/protobuf v1.36.11` from indirect to direct (as anticipated by ADR-0013 Consequences §3); `go 1.23.0` directive unchanged.
+
+**Outputs:**
+```
+$ GOTOOLCHAIN=local go test ./internal/bootstrap/ -run TestLoad -v
+=== RUN   TestLoad_HappyPath
+--- PASS: TestLoad_HappyPath (0.00s)
+=== RUN   TestLoad_RejectsDynamicResources
+--- PASS: TestLoad_RejectsDynamicResources (0.00s)
+=== RUN   TestLoad_RejectsLayeredRuntime
+--- PASS: TestLoad_RejectsLayeredRuntime (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.005s
+
+$ GOTOOLCHAIN=local go test ./internal/bootstrap/ -race -run TestLoad -v
+=== RUN   TestLoad_HappyPath
+--- PASS: TestLoad_HappyPath (0.01s)
+=== RUN   TestLoad_RejectsDynamicResources
+--- PASS: TestLoad_RejectsDynamicResources (0.00s)
+=== RUN   TestLoad_RejectsLayeredRuntime
+--- PASS: TestLoad_RejectsLayeredRuntime (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.019s
+
+$ GOTOOLCHAIN=local go vet ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local golangci-lint run ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local go test ./... -timeout 5m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+```
