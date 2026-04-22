@@ -133,7 +133,7 @@ These rules are non-negotiable. They are named by number so that ADRs and review
 
 ### D-3.3 Differential correctness beats internal fidelity
 
-A phase ships when its feature surface produces output behaviorally-equivalent to upstream Envoy on the same config and inputs, as mechanically defined by `docs/envoy-go/BEHAVIOR_CONTRACT.md` (§7). You do not read Envoy source to decide what "equivalent" means — the contract is the contract.
+A phase ships when its feature surface produces output behaviorally-equivalent to upstream Envoy on the same config and inputs, as mechanically defined by `docs/envoy-go/BEHAVIOR_CONTRACT.md` (§7). You must not read Envoy source to decide what "equivalent" means — the contract is the contract.
 
 ### D-3.4 Context isolation is the primary design constraint
 
@@ -256,7 +256,7 @@ Deviations:
 ### 5.1 How to read this state machine
 
 - Each numbered state has an unambiguous detection rule from the contents of the active phase directory (presence/absence of `SPEC.md`, `PLAN.md`, `PROGRESS.md`, `REVIEW.md` — and for `REVIEW.md`, its approval status).
-- You move exactly one state forward per session. Do not chain through multiple states in a single session; the value of context isolation is that each transition starts fresh.
+- You move exactly one state forward per session. Do not chain through multiple states in a single session; the value of context isolation is that each transition starts fresh. (The sole exception is §10's first-session bootstrap, which traverses states 0 and 1 in one session because it creates the scaffolding preconditions for the state machine; this exception is unavailable to any subsequent session.)
 - If state detection is ambiguous (e.g., file exists but is empty, or contains conflicting signals), invoke `superpowers:systematic-debugging` before advancing.
 
 ### 5.2 Review feedback re-entry point
