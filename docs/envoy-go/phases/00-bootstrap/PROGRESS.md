@@ -27,3 +27,8 @@ $ go mod tidy && go build ./...
 go: warning: "all" matched no packages
 go: warning: "./..." matched no packages
 ```
+
+## Task 2 — ADR-0005, ADR-0006
+
+**Commits:** 31172f1
+**Notes:** Appended ADR-0005 (autonomous-planning adaptation) and ADR-0006 (module path `github.com/esalaine/envoy-go`) to DECISIONS.md verbatim from PLAN.md Task 2. No command outputs to quote (pure Markdown append).
