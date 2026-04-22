@@ -29,7 +29,7 @@ These phases ship in order. Each depends on the previous being `done`, because e
 | id | title | depends-on | status | sub-phases | summary |
 |---|---|---|---|---|---|
 | 00 | bootstrap | — | done |  | Bootstrap: repo layout, CI, Docker reference Envoy, differential harness skeleton, `ENVOY_TARGET.md` pin, trivial echo fixture. Harness boots; one TCP echo fixture green. |
-| 01 | static-bootstrap-config | 00 | planned |  | Static bootstrap config loader (node, admin, static_resources skeleton). Config parses; admin `/ready` behaves like Envoy. |
+| 01 | static-bootstrap-config | 00 | in-progress |  | Static bootstrap config loader (node, admin, static_resources skeleton). Config parses; admin `/ready` behaves like Envoy. |
 | 02 | tcp-proxy | 01 | planned |  | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext). TCP proxy fixture green. |
 | 03 | tls | 02 | planned |  | Downstream TLS termination + upstream TLS origination + SNI. TLS TCP fixture green. |
 | 04 | http-1.1 | 03 | planned |  | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response. HTTP/1.1 routing fixture green. |
