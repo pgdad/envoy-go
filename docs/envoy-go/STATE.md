@@ -6,10 +6,10 @@ This file is the single source of truth for "what next" (see `BOOTSTRAP_PROMPT.m
 
 - **active-phase:** `00-bootstrap`
 - **phase-directory:** `docs/envoy-go/phases/00-bootstrap/`
-- **lifecycle-state:** `2` — SPEC.md exists (approved by `spec-document-reviewer` subagent per ADR-0004), PLAN.md does not
-- **next-skill:** `superpowers:writing-plans`
-- **next-skill-scope:** produce `docs/envoy-go/phases/00-bootstrap/PLAN.md` implementing the SPEC. Apply §5 step 2 GATE: if PLAN.md exceeds ~25 tasks or ~1500 LoC net change, split phase 00 into sub-phases (§6) and exit.
-- **last-commit:** the phase-00 SPEC commit on branch `bootstrap` (and merged into `master` on the same session). Resolve via `git log -1 --format=%H docs/envoy-go/phases/00-bootstrap/SPEC.md` when needed.
+- **lifecycle-state:** `3` — SPEC.md and PLAN.md exist (PLAN.md approved across six iterations of the `plan-document-reviewer` subagent loop per ADR-0005); implementation incomplete
+- **next-skill:** `superpowers:subagent-driven-development` (per ADR-0005, the user's standing preference for execution; the executing session may override only with an ADR)
+- **next-skill-scope:** execute the 16 tasks in `docs/envoy-go/phases/00-bootstrap/PLAN.md` task-by-task with `superpowers:test-driven-development` discipline per task. Follow PLAN's "Execution preconditions" section first: create worktree `.worktrees/phase-00-bootstrap-impl` on a new branch `phase/00-bootstrap-impl` off `master`, verify Docker / Go 1.23 / golangci-lint, then enter Task 1. Append to `docs/envoy-go/phases/00-bootstrap/PROGRESS.md` after every task. The plan's tasks 4 and 10–13 require Docker; task 16 wants a green CI run (or a documented local equivalent if no remote is configured).
+- **last-commit:** the phase-00 PLAN commit on branch `phase/00-bootstrap-plan` (fast-forwarded into `master` at session exit per ADR-0003). Resolve via `git log -1 --format=%H docs/envoy-go/phases/00-bootstrap/PLAN.md` when needed.
 - **last-updated:** 2026-04-21
 
 ---
