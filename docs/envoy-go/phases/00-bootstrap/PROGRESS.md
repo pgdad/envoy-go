@@ -41,3 +41,49 @@ go: warning: "./..." matched no packages
 ```
 $ go vet ./internal/...
 ```
+
+## Task 4 — Envoy pin, ENVOY_TARGET.md, ADR-0008
+
+**Commits:** 0819740
+**Notes:** Pinned upstream Envoy at `envoyproxy/envoy:v1.37.2` (SHA256 `c5e8a68e52f4d`). Smoke-tested admin `/ready` on the pulled image. Updated ENVOY_TARGET.md with tag, SHA, release-notes URL, and the refresh procedure. Appended ADR-0008. Note: ADR-0007 slot is intentionally left empty here; Task 6 lands ADR-0007 (minimal YAML schema) and the controller will address physical ordering inside DECISIONS.md at that point.
+**Outputs:**
+```
+$ docker pull envoyproxy/envoy:v1.37.2
+v1.37.2: Pulling from envoyproxy/envoy
+4f4fb700ef54: Pulling fs layer
+e2dbee44c34b: Pulling fs layer
+bd23ccda478c: Pulling fs layer
+b86abf6ed0de: Pulling fs layer
+342cd4258481: Pulling fs layer
+54bcd46fe54a: Pulling fs layer
+c547fb821bb9: Pulling fs layer
+de47083ed7d7: Pulling fs layer
+541e4430a844: Pulling fs layer
+4f4fb700ef54: Already exists
+4f4fb700ef54: Pull complete
+541e4430a844: Download complete
+e2dbee44c34b: Download complete
+c547fb821bb9: Download complete
+bd23ccda478c: Download complete
+b86abf6ed0de: Download complete
+54bcd46fe54a: Download complete
+de47083ed7d7: Download complete
+de47083ed7d7: Pull complete
+e2dbee44c34b: Pull complete
+bd23ccda478c: Pull complete
+54bcd46fe54a: Pull complete
+541e4430a844: Pull complete
+c547fb821bb9: Pull complete
+b86abf6ed0de: Pull complete
+342cd4258481: Download complete
+342cd4258481: Pull complete
+Digest: sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+Status: Downloaded newer image for envoyproxy/envoy:v1.37.2
+docker.io/envoyproxy/envoy:v1.37.2
+
+$ docker inspect --format='{{index .RepoDigests 0}}' envoyproxy/envoy:v1.37.2
+envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+
+$ curl -fsS http://127.0.0.1:9901/ready
+LIVE
+```
