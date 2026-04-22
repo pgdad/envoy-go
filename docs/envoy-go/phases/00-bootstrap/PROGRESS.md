@@ -374,3 +374,62 @@ ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 $ golangci-lint run ./...
 (empty)
 ```
+
+## Task 13 — Echo fixture (test/fixtures/0000-tcp-echo/)
+
+**Commit A:** 5e96def  `phase 00: 0000-tcp-echo fixture (configs, driver, expectations)`
+
+**Files created:**
+- `test/fixtures/0000-tcp-echo/README.md`
+- `test/fixtures/0000-tcp-echo/envoy.yaml`
+- `test/fixtures/0000-tcp-echo/envoy-go.yaml`
+- `test/fixtures/0000-tcp-echo/expectations.yaml`
+- `test/fixtures/0000-tcp-echo/driver/doc.go`
+- `test/fixtures/0000-tcp-echo/driver/driver.go`
+- `test/differential/fixture/fixture.go` (new sub-package — see deviations)
+
+**Files modified:** `test/differential/harness.go`, `test/differential/runner_test.go`, `go.mod`, `go.sum`
+
+**Deviations from PLAN:**
+
+1. **Import cycle — `test/differential/fixture` sub-package introduced.** The PLAN places `FixtureDriver`, `driverRegistry`, and `RegisterFixture` in `package differential` (harness.go, non-test file) and has `runner_test.go` (`package differential`) blank-import the driver which imports `package differential`. Go's toolchain rejects this as an import cycle even though the import appears in a test file. Resolution: extracted `FixtureDriver`, `DriverRegistry`, and `RegisterFixture` into a new leaf package `test/differential/fixture`. `harness.go` re-exports `FixtureDriver` as a type alias and `RegisterFixture` as a wrapper for backward compat. `runner_test.go` imports `fixture.DriverRegistry` directly. The driver imports `test/differential/fixture` (not `test/differential`). This breaks the cycle without changing any public API semantics.
+
+2. **`dns_lookup_family: V4_ONLY` added to cluster config.** Docker Desktop on Linux resolves `host.docker.internal` to both an IPv4 address (`192.168.65.2`) and an IPv6 address (`fdc4:f303:9324::254`). Envoy's STRICT_DNS cluster picked the IPv6 address first and got `Network is unreachable`. Fix: added `dns_lookup_family: V4_ONLY` to the `c_echo` cluster in `refBootstrap` (driver.go) and `envoy.yaml` (docs reference).
+
+3. **Backend bound to `0.0.0.0` instead of `127.0.0.1`.** The PLAN's `runFixture` binds the echo backend to `127.0.0.1:0`. The reference Envoy container reaches the host via `host.docker.internal` → `192.168.65.2` (the Docker Desktop gateway IP). A `127.0.0.1`-only backend is not reachable from that address; changed to `0.0.0.0:0`.
+
+4. **`go.mod` `go 1.23.0` (patch suffix).** `go mod tidy` with Go 1.26.2 toolchain upgraded the `go` directive to `1.25.0`. Used `go mod edit -go=1.23` then `GOTOOLCHAIN=local go mod tidy` to hold the directive at `1.23.0` (the `.0` patch suffix is semantically equivalent to `1.23` per the Go spec).
+
+5. **`docker/docker` held at `v24.0.7`.** Initial `go get github.com/docker/docker/api/types/container` pulled `v28.5.2`, which broke `testcontainers-go@v0.27.0` (the `types.ExecConfig` and `archive.Compression` symbols moved). Downgraded to `v24.0.7+incompatible` (the version testcontainers-go v0.27.0 requires).
+
+**`go test ./test/differential/ -run TestDifferential -v -timeout 180s` output:**
+
+```
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+2026/04/22 08:40:10 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 78fe718877fc703641df8f057a4c689392fa6c0ed72fe57c749639654044edde
+  Test ProcessID: e0c3e292-e4ad-4b6e-a2b7-077bec069027
+2026/04/22 08:40:10 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/22 08:40:10 ✅ Container created: b7c9891c4299
+2026/04/22 08:40:10 🐳 Starting container: b7c9891c4299
+2026/04/22 08:40:10 ✅ Container started: b7c9891c4299
+2026/04/22 08:40:10 🚧 Waiting for container id b7c9891c4299 image: testcontainers/ryuk:0.6.0. Waiting for: &{Port:8080/tcp timeout:<nil> PollInterval:100ms}
+2026/04/22 08:40:11 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 08:40:11 ✅ Container created: c8ecda4069a7
+2026/04/22 08:40:11 🐳 Starting container: c8ecda4069a7
+2026/04/22 08:40:11 ✅ Container started: c8ecda4069a7
+2026/04/22 08:40:11 🚧 Waiting for container id c8ecda4069a7 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0xdde6a14e2b0 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x937a00 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 08:40:11 🐳 Terminating container: c8ecda4069a7
+2026/04/22 08:40:11 🚫 Container terminated: c8ecda4069a7
+--- PASS: TestDifferential (1.09s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.09s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.163s
+```
