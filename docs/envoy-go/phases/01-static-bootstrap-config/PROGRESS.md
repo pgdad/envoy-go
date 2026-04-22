@@ -351,3 +351,62 @@ NON-2xx CAPTURED: none
 ```
 
 Outcome: pre-init unobservable from this bootstrap shape; ADR-0015 accepts option (b).
+
+## Task 8 — admin.Server + /ready ready-state byte-exact [ADR-0014]
+
+**Commits:** `<pending — filled by Step 10 follow-up>`
+
+**Notes:** First real `internal/admin` code lands — phase-00's `doc.go` placeholder is rewritten to a phase-01 package comment, and two new files (`admin.go`, `admin_test.go`) implement and pin the `/ready` ready-state response. `Server` is a four-field struct (`addr`, `ln`, `httpSrv`, `ready atomic.Bool`) with the three-method surface `New` / `Start` / `MarkReady` / `Close` plus the private `handleReady` — `atomic.Bool` (Go 1.19+ type) is the lock-free primitive used by Task 9's concurrency tests, chosen over `sync.RWMutex` because the ready bit is strictly monotonic (set-once, read-many) and the stdlib idiom is canonical. `Start` binds synchronously, spawns a goroutine that calls `s.httpSrv.Serve(ln)`, and returns the bound `ln.Addr().String()` so tests passing port `0` can discover the kernel-assigned port atomically. `Close` is best-effort and idempotent (nil-safe — `s.httpSrv` or `s.ln` may be nil if `Start` was never called or failed mid-way), using `http.Server.Close` rather than `Shutdown` because phase-01 does not gate on graceful drain (explicit phase-08 follow-up). `handleReady` sets five response headers unconditionally (`Content-Type`, `Cache-Control`, `X-Content-Type-Options`, `Server`, and `Content-Length` per branch), writes `LIVE\n` (5 bytes) + 200 when `ready.Load()` is true, and `PRE_INITIALIZING\n` (17 bytes) + 503 otherwise — the pre-init branch is covered by Task 9, not this task's test. The `Date` header is not set by envoy-go code; Go's `net/http` server auto-inserts RFC 7231 `Date` on every response, matching upstream's observed `date:` header and allow-listed in ADR-0015's harness rules. ADR-0014 pins the `Server: envoy` value (byte-exact with upstream v1.37.2, no version suffix, minimises differential allow-list entries).
+
+**Divergences from the PLAN Task 8 snippet** — enumerated per the "reality vs. PLAN guess" principle:
+
+1. **`Content-Type` value.** PLAN snippet used `text/plain`; Task 7 evidence observed `text/plain; charset=UTF-8`. Resolution: emit `text/plain; charset=UTF-8` (charset token exactly `UTF-8`, hyphenated, uppercase, per evidence §Observations). Pinned by the test assertion `resp.Header.Get("Content-Type") != "text/plain; charset=UTF-8"`.
+2. **`X-Content-Type-Options` header.** PLAN snippet omitted it; Task 7 evidence captured `x-content-type-options: nosniff` as the third header on the wire. Resolution: emit `X-Content-Type-Options: nosniff` and pin via the test. Without this, the subject would diverge from upstream on a security-relevant response header and the differential diff would flag a header-set mismatch.
+3. **`Cache-Control` value.** PLAN snippet's `no-cache, max-age=0` was a guess that Task 7 evidence confirmed verbatim (including the comma-plus-single-space separator). Resolution: kept as-is.
+4. **Response framing.** PLAN snippet was silent on framing; Task 7 evidence shows upstream emits `transfer-encoding: chunked` with no `Content-Length`. Per ADR-0015's option (b) and the evidence §"Framing" allow-list, the phase-01 subject emits `Content-Length: 5` (and `Content-Length: 17` for pre-init) as a documented BEHAVIOR_CONTRACT deviation; Task 14's differential harness dechunks upstream before byte-comparing the body, so the logical body bytes remain identical. Resolution: explicit `h.Set("Content-Length", strconv.Itoa(len(body)))` per branch rather than relying on Go's `net/http` implicit length inference — the explicit form is deterministic and documents intent. Phase-02+ may switch to chunked framing without an ADR if the harness normaliser remains in place.
+5. **Pre-init response body.** PLAN snippet's `PRE_INITIALIZING\n` (17 bytes) was a guess — Task 7 determined pre-init is unobservable across 60 probes against an empty-bootstrap v1.37.2 container. Resolution: kept `PRE_INITIALIZING\n` + `Content-Length: 17` + status 503 per ADR-0015 option (b), for unit-test determinism in Task 9. The phase-01 differential harness never observes the subject's pre-init window (`cmd/envoy-go` calls `MarkReady` before printing the ready sentinel that the harness waits on), so the chosen body is documented-but-test-irrelevant for the gate.
+6. **Header name casing on the wire.** Go's `net/http` server serves header names in canonical case (`Content-Type`), differing from upstream's observed lowercase (`content-type`). Resolution: accepted because HTTP/1.1 header names are case-insensitive per RFC 7230 §3.2; Task 14's `diffHeaders` helper performs case-insensitive comparison (BEHAVIOR_CONTRACT will codify this). The Task 8 unit-test uses `http.Header.Get` which normalises to canonical case on both sides, so the assertion casing matches — the lowercase-vs-title-case question is only visible on raw wire bytes, which Task 14 parses into a case-insensitive map before diffing.
+
+**`freeAddr` helper** — declared in `admin_test.go` per PLAN Step 3 but not yet consumed at this task. Task 9's concurrency tests use it. A `//nolint:unused` directive is applied with a Task-9 reference to prevent `golangci-lint` `unused` from flagging the dead code for one commit; the directive is removed in Task 9 when the first consumer lands.
+
+**Outputs:**
+
+```
+$ GOTOOLCHAIN=local go test ./internal/admin/ -run TestServer_ReadyState -v
+=== RUN   TestServer_ReadyState
+--- PASS: TestServer_ReadyState (0.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.012s
+
+$ GOTOOLCHAIN=local go test -race ./internal/admin/ -v
+=== RUN   TestServer_ReadyState
+--- PASS: TestServer_ReadyState (0.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	1.017s
+
+$ GOTOOLCHAIN=local go vet ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local golangci-lint run ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local go test ./... -timeout 5m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.012s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+```
