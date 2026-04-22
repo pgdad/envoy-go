@@ -707,3 +707,16 @@ PASS
 ok  	github.com/esalaine/envoy-go/test/differential	2.688s
 ?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
 ```
+
+## Task 16 — Refresh 0000-tcp-echo README for admin observation
+
+**Commits:** `<pending-sha>`
+
+**Notes:** Rewrote the body of `test/fixtures/0000-tcp-echo/README.md` to the SPEC §5.4 "two-paragraph update" shape while preserving the existing `# 0000-tcp-echo` top heading and the `## Driver` / `## Expectations` section structure. Paragraph 1 describes the two independent equivalence observations the fixture now drives (TCP echo byte-exact on the listener path; admin `/ready` byte-exact on the HTTP path via status-line exact + body `LIVE\n` byte-exact + headers set-equal modulo the allow-list) and explicitly states the fixture passes iff both byte-pair comparisons pass. Paragraph 2 enumerates the three benign divergences between `envoy.yaml` (reference) and `envoy-go.yaml` (subject) each with a one-line rationale linking SPEC §5.4 items 1–3 verbatim: cluster type `STATIC` vs `STRICT_DNS` (§5.4 #1, subject has no DNS resolver), missing `dns_lookup_family` (§5.4 #2, same rationale, reference keeps `V4_ONLY` per ADR-0010), and `127.0.0.1` vs `0.0.0.0` + `host.docker.internal` (§5.4 #3, subject runs as host subprocess with no docker bridge). Both paragraphs match the subject YAML's inline comment block wording so that the README, the YAML comments, and SPEC §5.4 tell one consistent story. The `## Driver` section was updated to also name the new `ProbeAdmin` method and the exact raw-TCP request line it writes (`GET /ready HTTP/1.1\r\nHost: <addr>\r\nConnection: close\r\n\r\n`) — matching Task 14's driver implementation verbatim so a reader grepping for the wire representation lands on the same bytes in three places (README, driver, harness comparator). The `## Expectations` section was rewritten to point at the new `expectations.yaml` dimensions: names the three applicable dimensions with their rules and scopes, names the six not-applicable dimensions each with a one-phrase phase-01 reason (matching `expectations.yaml`'s reason strings), and links the header allow-list to `docs/envoy-go/BEHAVIOR_CONTRACT.md § "Admin API — /ready"` (U+2014 em-dash, matches the H2 byte-for-byte). Doc-only change; no code touched, no tests re-run (Task 15 already re-ran the differential suite after the last doc change landed, and this commit touches zero Go files).
+
+**Outputs:**
+
+```
+$ git diff --stat HEAD test/fixtures/0000-tcp-echo/README.md docs/envoy-go/phases/01-static-bootstrap-config/PROGRESS.md
+<verbatim output captured at commit time>
+```
