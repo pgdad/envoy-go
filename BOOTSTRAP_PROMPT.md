@@ -279,3 +279,30 @@ Conformance: <what conformance suites were run and their pass rate>
 If no ADRs were added or referenced during the phase, the bracketed list is omitted.
 
 ---
+
+## 6. Phase Splitting Policy
+
+### 6.1 When to split
+
+Splitting is triggered at step 2 of the lifecycle (when `PLAN.md` is being written) if either threshold is crossed:
+
+- `PLAN.md` exceeds **~25 numbered tasks**, OR
+- `PLAN.md` estimates exceed **~1500 lines of code** of net change.
+
+Additionally, splitting is triggered *mid-execution* if any single task's sub-steps blow up past ~10 items once contact with reality reveals complexity.
+
+### 6.2 How to split
+
+1. Stop. Do not continue writing the oversize plan or implementing the oversize task.
+2. Create sibling phase directories `docs/envoy-go/phases/NN.1-subtitle/`, `NN.2-subtitle/`, …
+3. Redistribute spec content — each sub-phase gets its own `SPEC.md` covering a coherent slice of the original.
+4. Update `docs/envoy-go/ROADMAP.md`: the original row becomes a parent row with `status = in-progress` and its `sub-phases` column listing `NN.1, NN.2, …`. Each sub-phase gets its own row with `status = planned`.
+5. Update `docs/envoy-go/STATE.md` to point at `NN.1`.
+6. Append an ADR explaining the split ("ADR-NNNN: split phase NN into NN.1–NN.k because plan exceeded …").
+7. Exit. The next fresh session starts at NN.1's lifecycle at step 1.
+
+### 6.3 Anti-pattern
+
+Do not "defer" work by cramming it into vague tasks like "TODO: extend later" or by introducing incomplete stubs that differential tests can't exercise. Either the work is in this phase and gets tested, or it is in a split sub-phase with its own row in the roadmap. There is no third option.
+
+---
