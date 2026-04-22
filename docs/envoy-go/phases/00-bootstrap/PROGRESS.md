@@ -212,3 +212,27 @@ $ go test ./test/differential/ -run TestCompareBytes -v # GREEN
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	0.002s
 ```
+
+## Task 9 — differential pin loader + ready-line scanner
+
+**Commits:** 9b4e86f
+**Notes:** Implemented test/differential/harness.go (EnvoyPin struct, parseEnvoyTarget regex parser, readyTimeout constant, scanForLine helper) and harness_test.go (2 parser tests: valid pin, missing-tag rejection). TDD: RED then GREEN. Tasks 10 and 11 will extend harness.go with reference/subject proxy types.
+
+**DONE_WITH_CONCERNS:** The `unused` linter flags both `readyTimeout` and `scanForLine` as unused (they are forward-declared for Tasks 10/11 but not yet referenced within the package). Per Task 9 instructions, this is reported without a fix. The controller must decide: (a) add `//nolint:unused` markers on both declarations with a note "used by Task 10/11", or (b) add a forward-reference no-op call site. `golangci-lint run ./...` exits non-zero until one of these resolutions is applied.
+**Outputs:**
+```
+$ go test ./test/differential/ -run TestParseEnvoyTarget   # RED
+# github.com/esalaine/envoy-go/test/differential [github.com/esalaine/envoy-go/test/differential.test]
+test/differential/harness_test.go:14:14: undefined: parseEnvoyTarget
+test/differential/harness_test.go:28:15: undefined: parseEnvoyTarget
+FAIL	github.com/esalaine/envoy-go/test/differential [build failed]
+FAIL
+
+$ go test ./test/differential/ -run TestParseEnvoyTarget -v # GREEN
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	0.001s
+```
