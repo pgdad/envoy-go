@@ -132,3 +132,58 @@ ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.001s
 ```
 
 **Follow-up:** ran `go mod tidy` post-Task 6 to reclassify gopkg.in/yaml.v3 as a direct dependency and add the missing `h1:` hash line for `gopkg.in/check.v1`. Commit: e335ce7.
+
+## Task 7 — subject TCP-pump binary + TCP test helpers
+
+**Commits:** d733e08
+**Notes:** Implemented `cmd/envoy-go/main.go` (flag parse, config load, TCP listen+accept loop, per-conn io.Copy pump, ready-sentinel stdout contract) and `test/helpers/tcp.go` (TCPRoundTrip reusable helper). Full TDD: helpers test RED → GREEN; main test RED → GREEN. Full test suite PASS, lint clean.
+
+**Linux splice(2) deviation from PLAN verbatim:** The plan's `io.Copy(upstream, client)` / `io.Copy(client, upstream)` between two `*net.TCPConn` values triggers Go's `splice(2)` optimisation on Linux. `splice(fd, fd)` (same socket as both source and destination) returns 0 bytes, causing the echo backend's data to be silently dropped. Fix: introduce `netConn struct{ net.Conn }` wrapper in `main.go` (hiding the concrete `*net.TCPConn` type so `io.Copy` falls back to a 32 KiB heap-buffer loop) and `echoConn struct{ net.Conn }` in `main_test.go` for the same reason in `acceptEcho`. All other logic is verbatim from the PLAN.
+**Outputs:**
+```
+$ go test ./test/helpers/        # RED
+# github.com/esalaine/envoy-go/test/helpers [github.com/esalaine/envoy-go/test/helpers.test]
+test/helpers/tcp_test.go:29:15: undefined: TCPRoundTrip
+FAIL	github.com/esalaine/envoy-go/test/helpers [build failed]
+FAIL
+
+$ go test ./test/helpers/ -v     # GREEN
+=== RUN   TestTCPRoundTrip_EchoBackend
+--- PASS: TestTCPRoundTrip_EchoBackend (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+
+$ go test ./cmd/envoy-go/ -run TestEnvoyGoBinary    # RED
+--- FAIL: TestEnvoyGoBinary_EchoesThroughUpstream (0.08s)
+    main_test.go:44: build: exit status 1
+        # github.com/esalaine/envoy-go/cmd/envoy-go
+        runtime.main_main·f: function main is undeclared in the main package
+FAIL
+FAIL	github.com/esalaine/envoy-go/cmd/envoy-go	0.078s
+FAIL
+
+$ go test ./cmd/envoy-go/ -run TestEnvoyGoBinary -v # GREEN
+=== RUN   TestEnvoyGoBinary_EchoesThroughUpstream
+--- PASS: TestEnvoyGoBinary_EchoesThroughUpstream (0.13s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.129s
+
+$ go test ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.133s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+
+$ golangci-lint run ./...
+(empty)
+```
