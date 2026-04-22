@@ -187,3 +187,28 @@ ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 $ golangci-lint run ./...
 (empty)
 ```
+
+## Task 8 — differential byte-compare + hex-dump helper
+
+**Commits:** c5bb5c2
+**Notes:** Implemented test/differential/diff.go (CompareBytes + hexWindow) and diff_test.go (3 table cases: equal, diverge-at-first-byte, different-lengths). Phase-00's echo fixture uses byte-exact equivalence per expectations.yaml (later task). Doc.go establishes package-differential context. Verbatim plan code passed lint without adjustment — staticcheck did not flag the `eq` variable (the value is used in the `if eq` guard that follows the loop), and errcheck did not flag fmt.Fprintf on strings.Builder.
+**Outputs:**
+```
+$ go test ./test/differential/ -run TestCompareBytes   # RED
+# github.com/esalaine/envoy-go/test/differential [github.com/esalaine/envoy-go/test/differential.test]
+test/differential/diff_test.go:6:12: undefined: CompareBytes
+test/differential/diff_test.go:16:12: undefined: CompareBytes
+test/differential/diff_test.go:32:10: undefined: CompareBytes
+FAIL	github.com/esalaine/envoy-go/test/differential [build failed]
+FAIL
+
+$ go test ./test/differential/ -run TestCompareBytes -v # GREEN
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	0.002s
+```
