@@ -109,3 +109,54 @@ For every phase in the envoy-go project (starting with phase 00), `superpowers:b
 - If the subagent reviewer escalates, the project fails *safely*: the session exits blocked rather than shipping an unreviewed spec.
 - This ADR applies uniformly to phase 00 and every subsequent phase. It is a project-level operating rule, not a phase-local decision.
 
+---
+
+## ADR-0005: autonomous-planning adaptation for envoy-go phases
+
+**Status:** Accepted
+**Date:** 2026-04-21
+**Doctrine:** D-3.1, D-3.5
+
+### Context
+
+`superpowers:writing-plans` ends with an "Execution Handoff" prompt asking the user to choose between subagent-driven and inline execution. `BOOTSTRAP_PROMPT.md` §2.2 forbids asking humans mid-phase, and §5.1 requires that a session move exactly one state forward — execution always happens in a *fresh* session, by definition.
+
+### Decision
+
+For every phase in the envoy-go project, `superpowers:writing-plans` is invoked with the following adaptations:
+
+1. **No Execution Handoff question.** The plan-writing session writes `PLAN.md`, runs the plan-document-reviewer subagent loop (retained verbatim from the skill), updates `STATE.md` to lifecycle-state 3 with `next-skill = superpowers:subagent-driven-development`, commits, and exits. The next fresh session, per the state machine §5 step 3, picks the executor.
+2. **Plan location override.** `PLAN.md` is written to `docs/envoy-go/phases/NN-slug/PLAN.md` (the project layout per `BOOTSTRAP_PROMPT.md` §4), not the skill's default `docs/superpowers/plans/`. The skill explicitly permits this via its "user preferences override default location" clause.
+3. **Reviewer subagent escalation.** If the reviewer cannot approve after three iterations, the session sets `STATE.md` `lifecycle-state` to `blocked` with a `block-reason` and exits — same escalation policy as ADR-0004's spec-reviewer.
+4. **Default executor preference.** `next-skill` after a green plan is `superpowers:subagent-driven-development` (the user's standing preference for execution style); the executing session may override only with an ADR documenting why.
+
+### Consequences
+
+- Phase planning is deterministic in one session; no human interaction.
+- The reviewer subagent gate preserves plan quality.
+- Execution stance is set by ADR, not session-by-session improvisation.
+- This ADR applies uniformly to phase 00 and every subsequent phase.
+
+---
+
+## ADR-0006: module path `github.com/esalaine/envoy-go`
+
+**Status:** Accepted
+**Date:** 2026-04-21
+**Doctrine:** D-3.5
+**Settles:** SPEC §10 #1 deferred decision
+
+### Context
+
+`docs/envoy-go/phases/00-bootstrap/SPEC.md` §10 #1 proposed `github.com/envoyproxy/envoy-go` as the Go module path with the planner permitted to pick differently if the proposed path is unusable or the project owner prefers a different origin. `github.com/envoyproxy` is the upstream Envoy project's GitHub organization; squatting that path even in a `go.mod` declaration risks future name collision and is contrary to the spirit of D-3.2 (do not embed/wrap upstream).
+
+### Decision
+
+The Go module path is `github.com/esalaine/envoy-go`, namespaced under the project's git identity (`Esa Laine <pgdad1st@gmail.com>`).
+
+### Consequences
+
+- All package imports use `github.com/esalaine/envoy-go/...`.
+- The path is a `go.mod` identifier only — it does not need to resolve as a Git URL during phase 00 or any phase that does not publish modules. Publication, if ever pursued, is its own ADR.
+- Supersession (e.g. moving to a real published origin) is cheap: one ADR + `go mod edit -module …` + sed-rewrite of import paths.
+
