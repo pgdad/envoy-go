@@ -28,6 +28,11 @@ type Driver interface {
 	// ReferenceListenerPort is the in-container TCP port the reference proxy
 	// must expose (the listener the driver dials).
 	ReferenceListenerPort() int
+
+	// ProbeAdmin issues GET /ready against each proxy's admin endpoint and
+	// returns the raw response bytes (status line + headers + body) for the
+	// differential diff. Introduced in phase 01; see SPEC §5.6.
+	ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAddr string) (refBytes, subjBytes []byte, err error)
 }
 
 // DriverRegistry maps fixture names to their registered drivers. Drivers register

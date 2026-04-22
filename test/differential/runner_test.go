@@ -15,6 +15,7 @@ import (
 
 	"github.com/esalaine/envoy-go/test/differential/fixture"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver"
+	"github.com/esalaine/envoy-go/test/helpers"
 )
 
 // TestDifferential is the differential suite entry point. It discovers
@@ -88,6 +89,85 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	if !v.Equal {
 		t.Errorf("differential mismatch:\n%s", v.HexDump)
 	}
+
+	// 5. Admin /ready observation (phase 01 addition — SPEC §5.6).
+	refAdm, subjAdm, err := d.ProbeAdmin(ctx, ref.AdminAddr(), subj.AdminAddr())
+	if err != nil {
+		t.Fatalf("admin probe: %v", err)
+	}
+	vAdm, err := compareAdminResponses(refAdm, subjAdm, d)
+	if err != nil {
+		t.Fatalf("admin compare: %v", err)
+	}
+	if !vAdm.Equal {
+		t.Errorf("admin differential mismatch:\n%s", vAdm.HexDump)
+	}
+}
+
+func compareAdminResponses(refRaw, subjRaw []byte, _ fixture.Driver) (Verdict, error) {
+	refResp, err := helpers.ParseHTTPResponse(refRaw)
+	if err != nil {
+		return Verdict{}, fmt.Errorf("ref parse: %w", err)
+	}
+	subjResp, err := helpers.ParseHTTPResponse(subjRaw)
+	if err != nil {
+		return Verdict{}, fmt.Errorf("subj parse: %w", err)
+	}
+	// Status line: exact.
+	if refResp.StatusLine != subjResp.StatusLine {
+		return Verdict{Equal: false, HexDump: fmt.Sprintf("status: ref=%q subj=%q", refResp.StatusLine, subjResp.StatusLine)}, nil
+	}
+	// Body: byte-exact.
+	bv, err := CompareBytes(refResp.Body, subjResp.Body)
+	if err != nil {
+		return Verdict{}, err
+	}
+	if !bv.Equal {
+		return bv, nil
+	}
+	// Headers: set-equal modulo allow-list.
+	// Per BEHAVIOR_CONTRACT.md §Admin API — /ready, Task 7 evidence:
+	// - Date: value non-deterministic (always present on both, value allow-listed)
+	// - Content-Length / Transfer-Encoding: framing deviation (subject: Content-Length:5;
+	//   upstream: Transfer-Encoding:chunked). Both are dropped from the set-equal check.
+	allowList := map[string]struct{}{
+		"Date":              {},
+		"Content-Length":    {},
+		"Transfer-Encoding": {},
+	}
+	mismatch := diffHeaders(refResp.Headers, subjResp.Headers, allowList)
+	if mismatch != "" {
+		return Verdict{Equal: false, HexDump: mismatch}, nil
+	}
+	return Verdict{Equal: true}, nil
+}
+
+func diffHeaders(ref, subj map[string]string, allow map[string]struct{}) string {
+	// For each header in ref: if not in allow, require subj has it with equal value.
+	var sb strings.Builder
+	for k, v := range ref {
+		if _, a := allow[k]; a {
+			continue
+		}
+		sv, ok := subj[k]
+		if !ok {
+			fmt.Fprintf(&sb, "header %q: absent in subj (ref=%q)\n", k, v)
+			continue
+		}
+		if sv != v {
+			fmt.Fprintf(&sb, "header %q: ref=%q subj=%q\n", k, v, sv)
+		}
+	}
+	// Reverse: headers in subj but not ref (outside allow-list).
+	for k, v := range subj {
+		if _, a := allow[k]; a {
+			continue
+		}
+		if _, ok := ref[k]; !ok {
+			fmt.Fprintf(&sb, "header %q: absent in ref (subj=%q)\n", k, v)
+		}
+	}
+	return sb.String()
 }
 
 func discoverFixtures(t *testing.T, dir string) []string {

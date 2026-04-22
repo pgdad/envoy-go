@@ -613,3 +613,64 @@ ok  	github.com/esalaine/envoy-go/test/differential	(cached)
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 ```
+
+## Task 14 — Admin /ready differential observation wired through runner (SPEC §5.6)
+
+**Commits:** `<SHA-FILL>`
+
+**Notes:** Wires the admin-probe dimension into the phase-01 differential gate — before this task the harness only asserted TCP-echo byte-exactness (Task 12 landed `SubjectProxy.AdminAddr()` and threaded `subjAdminPort` through `runFixture`, but no call site consumed the admin address). Three surfaces touched: (1) `test/differential/fixture/fixture.go` — `Driver` interface grows a fourth method `ProbeAdmin(ctx, refAdminAddr, subjAdminAddr string) ([]byte, []byte, error)` that returns raw on-the-wire response bytes for both proxies; (2) `test/fixtures/0000-tcp-echo/driver/driver.go` — `echoDriver.ProbeAdmin` plus the private `probeReady` helper that dials a raw TCP socket, writes `GET /ready HTTP/1.1\r\nHost: <addr>\r\nConnection: close\r\n\r\n`, and reads the full response to EOF. The raw-socket approach (instead of `net/http.Client`) is deliberate per the PLAN rationale: `http.Client` discards wire-detail like header ordering and exact status-line casing that the diff's set-equal allow-list tolerates but that the body/status exact-match rule does not; the parser (`helpers.ParseHTTPResponse`) consumes the same raw bytes on the comparator side, so driver and diff share the wire representation verbatim. The 5-second fallback deadline matches `harness.readyTimeout`'s order of magnitude without coupling to it — `probeReady` prefers the ctx deadline when set (always set by `runFixture`'s 90s `context.WithTimeout`). (3) `test/differential/runner_test.go` — after the existing `CompareBytes(refBytes, subjBytes)` on TCP echo, `runFixture` calls `d.ProbeAdmin(ctx, ref.AdminAddr(), subj.AdminAddr())`, passes the two byte streams to `compareAdminResponses`, and reports the verdict via `t.Errorf` with hex-dump detail (parallel to the existing TCP diff error path). Two new helpers land in the same file's private section: `compareAdminResponses` (parses both responses via `helpers.ParseHTTPResponse`, asserts status-line exact, body byte-exact via `CompareBytes`, then delegates header set-equality to `diffHeaders`) and `diffHeaders` (bidirectional set-diff modulo the allow-list — reports headers present in ref but absent/different in subj, and headers present in subj but absent in ref, both excluding allow-listed names). The allow-list is hardcoded with three entries and documented inline: `Date` (non-deterministic per request, allow-listed per BEHAVIOR_CONTRACT.md §Admin API — /ready, ADR-0015), `Content-Length` + `Transfer-Encoding` (the explicit framing deviation: subject emits `Content-Length: 5` per Task 8's `handleReady`; upstream emits `Transfer-Encoding: chunked` per Task 7's evidence capture — both are dropped from the set-equal check because the harness-side body comparison already normalises across framing by dechunking via `net/http.ReadResponse`'s body reader, which is what `helpers.ParseHTTPResponse` uses). The allow-list's phase-01 entries match the BEHAVIOR_CONTRACT allow-list table verbatim plus the framing-deviation notes from the Task 10 subsection.
+
+**Zero header-iteration footguns encountered** — the differential suite passed on first run. `helpers.ParseHTTPResponse` canonicalises header keys via `textproto.CanonicalMIMEHeaderKey`, and Go's `net/http` server also emits canonical-case keys, so upstream's lowercase-on-wire headers (`content-type`, `cache-control`, etc. per Task 7 evidence) and envoy-go's title-case wire headers both land in the parsed map as `Content-Type`, `Cache-Control`, etc. — `diffHeaders`'s `ref[k] == subj[k]` value check then compares identical values byte-for-byte. The five non-allow-listed headers that survive the allow-list filter (`Content-Type: text/plain; charset=UTF-8`, `Cache-Control: no-cache, max-age=0`, `X-Content-Type-Options: nosniff`, `Server: envoy`) match byte-exact on both sides — this is precisely what ADR-0014 (the `Server: envoy` pin) and Task 8's divergences list (all five non-framing, non-date headers match upstream's capture verbatim) predicted, and the test output confirms no reconciliation iteration was required. The Date header is present on both sides (Go's `net/http` auto-inserts it; upstream emits it per Task 7 capture) and is allow-listed, so the set-equal check treats it as "present on both, value irrelevant".
+
+**Outputs:**
+
+```
+$ GOTOOLCHAIN=local go test ./test/differential/... -timeout 5m -v
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+--- PASS: TestReferenceProxy_Starts (1.07s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.54s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+--- PASS: TestDifferential (1.24s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.24s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.910s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+
+$ GOTOOLCHAIN=local go vet ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local golangci-lint run ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local go test ./... -timeout 10m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	2.631s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+```
