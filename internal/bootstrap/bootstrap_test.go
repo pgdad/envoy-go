@@ -121,3 +121,39 @@ func TestLoad_EmptyDocument(t *testing.T) {
 		t.Errorf("error: %q", err.Error())
 	}
 }
+
+func TestAdminSocket_HappyPath(t *testing.T) {
+	bs, err := Load(strings.NewReader(sampleBootstrap))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	host, port, err := AdminSocket(bs)
+	if err != nil {
+		t.Fatalf("AdminSocket: %v", err)
+	}
+	if host != "127.0.0.1" {
+		t.Errorf("host: got %q, want 127.0.0.1", host)
+	}
+	if port != 0 {
+		t.Errorf("port: got %d, want 0", port)
+	}
+}
+
+func TestAdminSocket_MissingAdmin(t *testing.T) {
+	yaml := `
+static_resources:
+  listeners: []
+  clusters: []
+`
+	bs, err := Load(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_, _, err = AdminSocket(bs)
+	if err == nil {
+		t.Fatal("want error for missing admin, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap: ") {
+		t.Errorf("prefix: %q", err.Error())
+	}
+}

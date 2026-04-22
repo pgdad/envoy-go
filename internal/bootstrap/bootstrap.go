@@ -52,3 +52,21 @@ func Load(r io.Reader) (*bootstrapv3.Bootstrap, error) {
 	}
 	return bs, nil
 }
+
+// AdminSocket returns host and port from admin.address.socket_address. Errors
+// if admin is missing or the address is not a socket_address.
+func AdminSocket(bs *bootstrapv3.Bootstrap) (host string, port uint32, err error) {
+	adm := bs.GetAdmin()
+	if adm == nil {
+		return "", 0, fmt.Errorf("bootstrap: missing admin")
+	}
+	addr := adm.GetAddress()
+	if addr == nil {
+		return "", 0, fmt.Errorf("bootstrap: missing admin.address")
+	}
+	sa := addr.GetSocketAddress()
+	if sa == nil {
+		return "", 0, fmt.Errorf("bootstrap: admin.address is not a socket_address")
+	}
+	return sa.GetAddress(), sa.GetPortValue(), nil
+}
