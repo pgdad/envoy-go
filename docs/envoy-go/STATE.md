@@ -6,10 +6,10 @@ This file is the single source of truth for "what next" (see `BOOTSTRAP_PROMPT.m
 
 - **active-phase:** `00-bootstrap`
 - **phase-directory:** `docs/envoy-go/phases/00-bootstrap/`
-- **lifecycle-state:** `4` — Implementation complete, not verified. Next session runs `superpowers:verification-before-completion`.
-- **next-skill:** `superpowers:verification-before-completion`
-- **next-skill-scope:** Run the full phase-done gate (SPEC §3 and §7.5) in verification mode: go build, go vet, golangci-lint run, go test ./... (green), differential fixture (green), quote all command outputs into PROGRESS.md. Reference already-captured Task 16 outputs. Then advance lifecycle-state to 5 and next-skill to `superpowers:requesting-code-review`.
-- **last-commit:** 496484b
+- **lifecycle-state:** `5` — Verified, not reviewed. Next session runs `superpowers:requesting-code-review`.
+- **next-skill:** `superpowers:requesting-code-review`
+- **next-skill-scope:** Request code review against PLAN.md, SPEC.md §12 acceptance checklist, doctrine D-3.1–D-3.7, and the phase-done gate (SPEC §3 / §7.5). Produce `docs/envoy-go/phases/00-bootstrap/REVIEW.md` with an explicit approval line or enumerated findings. If REVIEW.md approves, advance lifecycle-state to 6 and hand off to the final-commit step (ROADMAP row 00 → done, STATE advanced to phase 01). If REVIEW.md raises issues, re-enter at lifecycle-state 3 (not 4) per BOOTSTRAP_PROMPT §5.2, scoped to the specific findings.
+- **last-commit:** (set by verification commit)
 - **last-updated:** 2026-04-22
 
 ---

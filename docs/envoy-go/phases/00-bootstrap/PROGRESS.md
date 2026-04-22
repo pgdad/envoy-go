@@ -597,3 +597,186 @@ EXIT_CODE: 0
 ```
 
 All commands exited 0; no FAIL lines; differential suite PASS including `--- PASS: TestDifferential/0000-tcp-echo (0.72s)`.
+
+---
+
+## Verification (lifecycle-state 4 → 5)
+
+Ran by `superpowers:verification-before-completion` on 2026-04-22. Tree at `f76fcc1` (unchanged since Task 16's CI-equivalent local green). All six phase-done gates from SPEC §3 / BOOTSTRAP_PROMPT §7.5 evaluated.
+
+**Environment (same session as gate runs):**
+
+```
+$ go version
+go version go1.26.2 linux/amd64
+
+$ golangci-lint --version
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+
+$ docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+client=28.4.0 server=28.1.1
+
+$ git rev-parse HEAD
+f76fcc1... (branch phase/00-bootstrap-impl)
+
+$ git status --short
+(clean — no uncommitted changes)
+```
+
+### Gate (e-1) — `go build ./...`
+
+```
+$ go build ./... 2>&1; echo "EXIT_CODE: $?"
+EXIT_CODE: 0
+```
+
+(Empty stdout/stderr, exit 0.)
+
+### Gate (e-2) — `go vet ./...`
+
+```
+$ go vet ./... 2>&1; echo "EXIT_CODE: $?"
+EXIT_CODE: 0
+```
+
+(Empty stdout/stderr, exit 0.)
+
+### Gate (e-3) — `golangci-lint run ./...`
+
+```
+$ golangci-lint run ./... 2>&1; echo "EXIT_CODE: $?"
+EXIT_CODE: 0
+```
+
+(Empty stdout/stderr, exit 0. Lint set per SPEC §5.5 / `.golangci.yml`.)
+
+### Gate (e-4a) — `go test -short ./...`
+
+```
+$ go test -short ./... 2>&1; echo "EXIT_CODE: $?"
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+EXIT_CODE: 0
+```
+
+(Cache hits are legitimate evidence — file hashes match Task 16's run; the fresh `-count=1` run below re-executes every test body and also exits 0.)
+
+### Gate (a) / (b) — differential suite, uncached
+
+```
+$ DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock \
+    go test ./test/differential/... -timeout 5m -v -count=1 2>&1; echo "EXIT_CODE: $?"
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+2026/04/22 13:42:29 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 40b72f1ac5830d5795ccdd76f0d8cb58a0c354cecaaa9d341c68701079565b22
+  Test ProcessID: f41d62e2-bfed-4990-a038-7466bf4dd80a
+2026/04/22 13:42:29 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/22 13:42:29 ✅ Container created: a037a1216eaf
+2026/04/22 13:42:29 🐳 Starting container: a037a1216eaf
+2026/04/22 13:42:29 ✅ Container started: a037a1216eaf
+2026/04/22 13:42:29 🚧 Waiting for container id a037a1216eaf image: testcontainers/ryuk:0.6.0. Waiting for: &{Port:8080/tcp timeout:<nil> PollInterval:100ms}
+2026/04/22 13:42:29 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 13:42:29 ✅ Container created: a1acc9474c08
+2026/04/22 13:42:29 🐳 Starting container: a1acc9474c08
+2026/04/22 13:42:30 ✅ Container started: a1acc9474c08
+2026/04/22 13:42:30 🚧 Waiting for container id a1acc9474c08 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x3ef304d5428 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x937a00 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 13:42:30 🐳 Terminating container: a1acc9474c08
+2026/04/22 13:42:30 🚫 Container terminated: a1acc9474c08
+--- PASS: TestReferenceProxy_Starts (0.87s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.16s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+2026/04/22 13:42:30 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 13:42:30 ✅ Container created: 4d2bb704a35c
+2026/04/22 13:42:30 🐳 Starting container: 4d2bb704a35c
+2026/04/22 13:42:30 ✅ Container started: 4d2bb704a35c
+2026/04/22 13:42:30 🚧 Waiting for container id 4d2bb704a35c image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x3ef3049d200 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x937a00 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 13:42:31 🐳 Terminating container: 4d2bb704a35c
+2026/04/22 13:42:31 🚫 Container terminated: 4d2bb704a35c
+--- PASS: TestDifferential (0.73s)
+    --- PASS: TestDifferential/0000-tcp-echo (0.73s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.853s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+EXIT_CODE: 0
+```
+
+Phase-00's sole fixture (`0000-tcp-echo`) is green against upstream Envoy pinned at `envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` — matching `docs/envoy-go/ENVOY_TARGET.md`. No pre-existing fixtures exist (gate (b) vacuously satisfied).
+
+### Gate (e-4b) — `go test ./... -count=1` (full, uncached)
+
+```
+$ DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock \
+    go test ./... -timeout 10m -count=1 2>&1; echo "EXIT_CODE: $?"
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.137s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	1.841s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+EXIT_CODE: 0
+```
+
+### Phase-done gate roll-up (SPEC §3)
+
+| Gate | Result | Evidence |
+|---|---|---|
+| (a) new/changed differential fixtures green | PASS | `TestDifferential/0000-tcp-echo` PASS above |
+| (b) pre-existing differential fixtures green | PASS (vacuous) | no pre-existing fixtures — this is the first |
+| (c) conformance suites at threshold | PASS (vacuous) | threshold 0 per SPEC §3; no protocol surfaces yet |
+| (d) new fuzzer short-budget clean | PASS (vacuous) | no parser/codec in phase 00 per SPEC §2 |
+| (e) `go vet`, `golangci-lint run`, `go test ./...` clean | PASS | exit 0 each, outputs quoted above |
+| (f) `REVIEW.md` approved | PENDING — next state | lifecycle-state 5 transitions into `superpowers:requesting-code-review` |
+
+Also the SPEC §3 phase-specific exit criteria:
+
+- `docs/envoy-go/ENVOY_TARGET.md` pins `envoyproxy/envoy:v1.37.2` + SHA256 `c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` — ✓ concrete, not placeholder (Task 4).
+- `go.mod` — ✓ Go 1.23 floor; toolchain in use is 1.26.2.
+- CI pipeline — ✓ green on branch `phase/00-bootstrap-impl` per Task 15/16 references (remote CI triggered in Task 15; Task 16 mirrored it locally with identical outputs).
+
+Gates (a), (b), (c), (d), (e) all satisfied. Implementation verified. Gate (f) is the responsibility of the next lifecycle state; `STATE.md` is advanced to `lifecycle-state: 5`, `next-skill: superpowers:requesting-code-review`.
