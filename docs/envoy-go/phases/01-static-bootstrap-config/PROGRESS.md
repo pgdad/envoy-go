@@ -725,7 +725,7 @@ $ git diff --cached --stat
 
 ## Task 17 — Green local gate sweep (lint/vet/test/differential/fuzz)
 
-**Commits:** `<pending>`
+**Commits:** `f43f66f`
 
 **Notes:** All SPEC §3 phase-done gates a–e green on local run. Gate (f) REVIEW is deferred to the verification session per state machine step 5.
 
