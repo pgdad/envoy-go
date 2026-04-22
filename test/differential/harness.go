@@ -155,14 +155,17 @@ func (r *ReferenceProxy) Stop(ctx context.Context) error {
 type SubjectProxy struct {
 	cmd          *exec.Cmd
 	listenerAddr string
+	adminAddr    string
 	tmpDir       string
 }
 
 // StartSubjectProxy builds cmd/envoy-go from repoRoot, writes cfg to a temp
 // file, starts the subject as a subprocess, waits for the ready sentinel, and
 // returns a handle. The harness owns the subprocess lifetime; callers must
-// call Stop to release.
-func StartSubjectProxy(ctx context.Context, repoRoot, cfg string) (*SubjectProxy, error) {
+// call Stop to release. subjAdminAddr is the pre-allocated admin host:port
+// that the caller interpolated into cfg; the harness records it so callers
+// can reach the subject's admin surface without re-parsing the bootstrap.
+func StartSubjectProxy(ctx context.Context, repoRoot, cfg, subjAdminAddr string) (*SubjectProxy, error) {
 	tmp, err := os.MkdirTemp("", "envoy-go-subject-*")
 	if err != nil {
 		return nil, err
@@ -209,12 +212,16 @@ func StartSubjectProxy(ctx context.Context, repoRoot, cfg string) (*SubjectProxy
 		return nil, fmt.Errorf("subject ready line malformed: %q", line)
 	}
 
-	return &SubjectProxy{cmd: cmd, listenerAddr: addr, tmpDir: tmp}, nil
+	return &SubjectProxy{cmd: cmd, listenerAddr: addr, adminAddr: subjAdminAddr, tmpDir: tmp}, nil
 }
 
 // ListenerAddr returns the host:port the subject is listening on (parsed from
 // the ready sentinel).
 func (s *SubjectProxy) ListenerAddr() string { return s.listenerAddr }
+
+// AdminAddr returns the subject's admin host:port (pre-allocated by the caller
+// and interpolated into the subject bootstrap).
+func (s *SubjectProxy) AdminAddr() string { return s.adminAddr }
 
 // Stop kills and reaps the subject and cleans up its temp directory.
 func (s *SubjectProxy) Stop() error {

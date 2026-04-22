@@ -32,15 +32,37 @@ func (echoDriver) ReferenceBootstrap() string {
 	return refBootstrap
 }
 
-func (echoDriver) SubjectConfig(refListenerPort, subjListenerPort, backendPort int) string {
+func (echoDriver) SubjectConfig(refListenerPort, subjListenerPort, backendPort, subjAdminPort int) string {
+	_ = refListenerPort // phase 01 does not wire the reference listener port into the subject bootstrap
 	return fmt.Sprintf(`
-listener:
-  address: 127.0.0.1
-  port: %d
-upstream:
-  address: 127.0.0.1
-  port: %d
-`, subjListenerPort, backendPort)
+node: { id: envoy-go-subject-0000, cluster: envoy-go-differential }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_tcp
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+  clusters:
+    - name: c_echo
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`, subjAdminPort, subjListenerPort, backendPort)
 }
 
 func (echoDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error) {

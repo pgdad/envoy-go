@@ -96,14 +96,39 @@ func TestSubjectProxy_StartsAndReports(t *testing.T) {
 		t.Skip("subject subprocess test; skipped under -short")
 	}
 	port := freeTCPPort(t) // helper from cmd/envoy-go/main_test.go-style
+	adminPort := freeTCPPort(t)
 	cfg := fmt.Sprintf(`
-listener: { address: 127.0.0.1, port: %d }
-upstream: { address: 127.0.0.1, port: 65535 }
-`, port)
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_tcp
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+  clusters:
+    - name: c_echo
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 65535 }
+`, adminPort, port)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	subj, err := StartSubjectProxy(ctx, repoRoot(t), cfg)
+	subj, err := StartSubjectProxy(ctx, repoRoot(t), cfg, fmt.Sprintf("127.0.0.1:%d", adminPort))
 	if err != nil {
 		t.Fatalf("StartSubjectProxy: %v", err)
 	}
@@ -111,6 +136,9 @@ upstream: { address: 127.0.0.1, port: 65535 }
 
 	if got, want := subj.ListenerAddr(), fmt.Sprintf("127.0.0.1:%d", port); got != want {
 		t.Errorf("ListenerAddr: got %q, want %q", got, want)
+	}
+	if got, want := subj.AdminAddr(), fmt.Sprintf("127.0.0.1:%d", adminPort); got != want {
+		t.Errorf("AdminAddr: got %q, want %q", got, want)
 	}
 }
 

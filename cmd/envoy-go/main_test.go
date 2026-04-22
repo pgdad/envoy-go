@@ -34,6 +34,7 @@ func TestEnvoyGoBinary_EchoesThroughUpstream(t *testing.T) {
 
 	// 2. Pick a free port for the subject's listener.
 	listenerPort := freeTCPPort(t)
+	adminPort := freeTCPPort(t)
 
 	// 3. Build the subject binary into a temp file.
 	tmp := t.TempDir()
@@ -47,13 +48,33 @@ func TestEnvoyGoBinary_EchoesThroughUpstream(t *testing.T) {
 	// 4. Write the subject config.
 	cfgPath := filepath.Join(tmp, "envoy-go.yaml")
 	cfg := fmt.Sprintf(`
-listener:
-  address: 127.0.0.1
-  port: %d
-upstream:
-  address: 127.0.0.1
-  port: %d
-`, listenerPort, backendAddr.Port)
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_tcp
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+  clusters:
+    - name: c_echo
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`, adminPort, listenerPort, backendAddr.Port)
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

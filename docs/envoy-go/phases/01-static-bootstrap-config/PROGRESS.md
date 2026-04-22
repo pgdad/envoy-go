@@ -516,3 +516,54 @@ ok  	github.com/esalaine/envoy-go/test/differential	1.780s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 ```
+
+## Task 12 — Cutover — rewire cmd/envoy-go to bootstrap + admin [ADR-0020]
+
+**Notes:** The largest-in-phase single-commit cutover switches every caller of the phase-00 minimal-schema config contract to the phase-01 Envoy v3 Bootstrap contract simultaneously — no intermediate commits could stay green. `cmd/envoy-go/main.go` is rewritten to call `bootstrap.Load` + `bootstrap.AdminSocket` + `bootstrap.FirstListenerSocket` + `bootstrap.FirstClusterEndpointSocket`, stand up `admin.New(adminAddr)` with `Start()` + `MarkReady()` before the ready sentinel, and otherwise reuse the phase-00 `pump` / `halfClose` / `netConn` logic byte-for-byte (SPEC §5.3 requires the pump be untouched). The ready sentinel format is preserved byte-exact — `envoy-go ready on <listenerAddr>\n` — so `harness.readyAddr`'s `strings.TrimRight` parser continues to work without modification; the admin address flows through the new pre-allocated `subjAdminAddr` channel threaded through `StartSubjectProxy` rather than being scraped from stdout. `admSrv.Start()`'s bound-address return is discarded with `_` because the caller pre-allocates the admin port and interpolates it into the bootstrap before starting the subject, so the bound value is always identical to what the caller already knows. `cmd/envoy-go/main_test.go`'s `TestEnvoyGoBinary_EchoesThroughUpstream` is rewritten in place (per ADR-0020: same file, same test name) — the test now allocates `adminPort` in addition to `listenerPort`, emits bootstrap-shaped YAML with three port interpolations (admin, listener, backend), and uses the unchanged `waitForReady` helper against the unchanged sentinel format. `test/fixtures/0000-tcp-echo/envoy-go.yaml` is rewritten with bootstrap shape and three documented divergences from the reference `envoy.yaml` (STATIC vs STRICT_DNS cluster type, no `dns_lookup_family`, `127.0.0.1` addresses vs `0.0.0.0` + `host.docker.internal`). `test/fixtures/0000-tcp-echo/driver/driver.go`'s `SubjectConfig` is rewritten to the 4-port template (`refListenerPort` discarded via `_ =`, admin/listener/backend interpolated); the `echoDriver` receiver type and `RegisterFixture` init hook are unchanged. `test/differential/fixture/fixture.go`'s `Driver.SubjectConfig` interface method gains the fourth `subjAdminPort int` parameter. `test/differential/harness.go`'s `SubjectProxy` gains an `adminAddr string` field populated by the new `subjAdminAddr string` parameter on `StartSubjectProxy`, plus a public `AdminAddr() string` getter — both Task 14 and future phases consume this. `test/differential/runner_test.go`'s `runFixture` allocates `subjAdminPort := freeTCPPort(t)` alongside `subjPort`, threads it into both `d.SubjectConfig(...)` and `StartSubjectProxy(...)`. No `ProbeAdmin` wiring yet — Task 14 owns that surface. PLAN did not list `test/differential/harness_test.go` under modified files but `TestSubjectProxy_StartsAndReports` inside it referenced the phase-00 schema and called `StartSubjectProxy` with the 3-arg signature, so it would not compile; updated it in-place to the new bootstrap shape + 4-arg call and added a symmetric `AdminAddr()` assertion. The phase-00 `cmd/envoy-go/config.go` + `config_test.go` files are left untouched — they compile as orphan dead code (no `main.go` caller, no other importer) and their `TestLoadConfig_*` tests still pass because `loadConfig` is defined adjacent; Task 13 deletes them in a purely mechanical diff per the PLAN scope note. ADR-0020 appended to `DECISIONS.md` pinning the rewrite-vs-replacement choice for `main_test.go`.
+
+**Outputs:**
+
+```
+$ GOTOOLCHAIN=local go test ./... -timeout 10m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.577s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.038s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.008s
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	2.871s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+
+$ GOTOOLCHAIN=local go test ./test/differential/... -v -timeout 5m
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+--- PASS: TestReferenceProxy_Starts (0.99s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.48s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+--- PASS: TestDifferential (1.22s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.22s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.767s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+```

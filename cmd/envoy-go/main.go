@@ -1,8 +1,11 @@
-// envoy-go is the phase-00 subject binary. It is intentionally minimal: parse a
-// minimal YAML config (ADR-0007), bind a TCP listener, and bidirectionally
-// io.Copy bytes between each accepted connection and a single fixed upstream.
-// Phase 02 retires this binary and replaces it with a real listener manager +
-// TCP proxy filter + cluster manager.
+// envoy-go is the phase-01 subject binary. It loads an Envoy v3 Bootstrap
+// proto from YAML (internal/bootstrap), starts the admin /ready server
+// (internal/admin), binds a TCP listener at static_resources.listeners[0], and
+// bidirectionally io.Copy's bytes between each accepted connection and the
+// single endpoint of static_resources.clusters[0]. Phase 00's minimal YAML
+// schema is retired (see ADR-0021 superseding ADR-0007). Phase 02 retires
+// this binary and replaces it with a real listener manager + TCP proxy filter
+// + cluster manager.
 package main
 
 import (
@@ -13,10 +16,13 @@ import (
 	"net"
 	"os"
 	"sync"
+
+	"github.com/esalaine/envoy-go/internal/admin"
+	"github.com/esalaine/envoy-go/internal/bootstrap"
 )
 
 func main() {
-	cfgPath := flag.String("c", "", "path to envoy-go.yaml")
+	cfgPath := flag.String("c", "", "path to envoy-go.yaml (Envoy v3 Bootstrap)")
 	flag.Parse()
 	if *cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: envoy-go -c <config.yaml>")
@@ -26,14 +32,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("open config: %v", err)
 	}
-	cfg, err := loadConfig(f)
+	bs, err := bootstrap.Load(f)
 	_ = f.Close()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
 
-	listenAddr := fmt.Sprintf("%s:%d", cfg.Listener.Address, cfg.Listener.Port)
-	upstreamAddr := fmt.Sprintf("%s:%d", cfg.Upstream.Address, cfg.Upstream.Port)
+	adminHost, adminPort, err := bootstrap.AdminSocket(bs)
+	if err != nil {
+		log.Fatalf("extract admin: %v", err)
+	}
+	listenerHost, listenerPort, err := bootstrap.FirstListenerSocket(bs)
+	if err != nil {
+		log.Fatalf("extract listener: %v", err)
+	}
+	upstreamHost, upstreamPort, err := bootstrap.FirstClusterEndpointSocket(bs)
+	if err != nil {
+		log.Fatalf("extract cluster endpoint: %v", err)
+	}
+
+	adminAddr := fmt.Sprintf("%s:%d", adminHost, adminPort)
+	listenAddr := fmt.Sprintf("%s:%d", listenerHost, listenerPort)
+	upstreamAddr := fmt.Sprintf("%s:%d", upstreamHost, upstreamPort)
+
+	admSrv := admin.New(adminAddr)
+	// The harness records admin addr from the pre-allocated value threaded
+	// through SubjectProxy, so main.go discards Start's bound-addr return —
+	// preserving the phase-00 ready sentinel format verbatim keeps
+	// harness.readyAddr's parse logic unchanged.
+	if _, err := admSrv.Start(); err != nil {
+		log.Fatalf("admin start %s: %v", adminAddr, err)
+	}
+	defer func() { _ = admSrv.Close() }()
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -41,9 +71,11 @@ func main() {
 	}
 	defer func() { _ = ln.Close() }()
 
-	// Ready sentinel: harness consumes this line from stdout to know the
-	// listener is bound. Format is part of the harness contract; do not
-	// change without updating test/differential/harness.go.
+	admSrv.MarkReady()
+
+	// Ready sentinel — harness contract, byte-exact from phase 00. Format is
+	// part of the harness contract; do not change without also updating
+	// test/differential/harness.go:readyAddr parsing.
 	_, _ = fmt.Fprintf(os.Stdout, "envoy-go ready on %s\n", listenAddr)
 
 	for {
@@ -58,9 +90,10 @@ func main() {
 
 // netConn wraps net.Conn and hides the *net.TCPConn type, preventing
 // io.Copy from using the Linux splice(2) syscall optimisation. splice can
-// return 0 bytes when the source socket has data+FIN already queued,
-// causing silent data loss on loopback. Using a plain Read/Write loop via a
-// 32 KiB heap buffer is fast enough for the phase-00 test workload.
+// return 0 bytes when the source socket has data+FIN already queued, causing
+// silent data loss on loopback. Using a plain Read/Write loop via a 32 KiB
+// heap buffer is fast enough for the phase-01 test workload. (Preserved
+// verbatim from phase 00 — SPEC §5.3 requires the pump be untouched.)
 type netConn struct{ net.Conn }
 
 func pump(client net.Conn, upstreamAddr string) {

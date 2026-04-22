@@ -21,8 +21,9 @@ type Driver interface {
 	// ReferenceBootstrap returns the YAML to feed upstream Envoy.
 	ReferenceBootstrap() string
 
-	// SubjectConfig returns the YAML to feed envoy-go.
-	SubjectConfig(refListenerPort, subjListenerPort, backendPort int) string
+	// SubjectConfig now takes four ports: reference listener (in-container),
+	// subject listener (host), backend, subject admin (host).
+	SubjectConfig(refListenerPort, subjListenerPort, backendPort, subjAdminPort int) string
 
 	// ReferenceListenerPort is the in-container TCP port the reference proxy
 	// must expose (the listener the driver dials).

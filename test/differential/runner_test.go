@@ -68,8 +68,9 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 
 	// 3. Subject proxy.
 	subjPort := freeTCPPort(t)
-	subjCfg := d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPort)
-	subj, err := StartSubjectProxy(ctx, root, subjCfg)
+	subjAdminPort := freeTCPPort(t)
+	subjCfg := d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPort, subjAdminPort)
+	subj, err := StartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
 	if err != nil {
 		t.Fatalf("subj start: %v", err)
 	}

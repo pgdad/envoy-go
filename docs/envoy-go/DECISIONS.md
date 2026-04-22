@@ -538,3 +538,15 @@ Framing exception: upstream emits `transfer-encoding: chunked` with no `Content-
 **Rationale:** anticipated reuse by fixtures 0002+ that probe HTTP surfaces; colocated with `test/helpers/tcp.go` (phase-00 TCP round-tripper) establishes `test/helpers/` as the shared test-side protocol-primitives package.
 
 ---
+
+## ADR-0020: `cmd/envoy-go/main_test.go` rewrite vs replacement
+
+**Status:** Accepted
+**Date:** 2026-04-22
+**Doctrine:** D-3.5
+
+**Decision:** rewrite (same file, same test name, bootstrap-shaped YAML + adminPort allocation).
+
+**Rationale:** keeps cmd-level unit coverage lightweight without adding a subprocess-integration dimension that the differential suite already covers.
+
+---
