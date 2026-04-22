@@ -138,7 +138,7 @@ ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.005s
 
 ## Task 4 — bootstrap.AdminSocket extractor
 
-**Commits:** `<pending>`
+**Commits:** `0176329`
 **Notes:** `AdminSocket(bs *bootstrapv3.Bootstrap) (host string, port uint32, err error)` is the first of the phase-01 extractor family — a thin function that walks the proto tree with the generated `GetAdmin()/GetAddress()/GetSocketAddress()/GetAddress()/GetPortValue()` accessors and returns the admin listener's host+port, erroring if the admin block is missing or if its address is not a `socket_address`. The extractor pattern (vs. methods on the proto) is deliberate: the `Bootstrap` proto is owned by `go-control-plane` and doctrine D-3.2 forbids wrapping it in envoy-go types, so validation/projection logic lives as free functions in `internal/bootstrap` that take `*bootstrapv3.Bootstrap` and return primitive/error tuples. Proto getters safely handle nil receivers (returning zero values), so the three nil-guards are belt-and-suspenders for producing a specific error message at each level rather than a generic "missing" at the leaf — callers that want granular diagnostics get them. All errors begin with the sentinel `bootstrap: ` matching `Load`'s contract; the missing-admin path returns `bootstrap: missing admin`. The missing-admin test uses a minimal YAML with `static_resources: { listeners: [], clusters: [] }` — `Load` accepts this because admin is optional at the proto level and admin-presence validation is the extractor's job, not the loader's. No ADRs, no `go.mod` drift, no production changes beyond the new exported function.
 
 **Outputs:**
