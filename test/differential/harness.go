@@ -235,7 +235,7 @@ func readyAddr(line string) string {
 // FixtureDriver is re-exported from the fixture sub-package for callers that
 // imported it from here before the refactor. New code should import
 // test/differential/fixture directly.
-type FixtureDriver = fixture.FixtureDriver
+type FixtureDriver = fixture.Driver
 
 // RegisterFixture re-exports fixture.RegisterFixture for backward compat.
 func RegisterFixture(name string, d FixtureDriver) { fixture.RegisterFixture(name, d) }
