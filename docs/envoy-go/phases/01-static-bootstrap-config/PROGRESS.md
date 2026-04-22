@@ -722,3 +722,105 @@ $ git diff --cached --stat
  test/fixtures/0000-tcp-echo/README.md              | 64 +++++++++++++++-------
  2 files changed, 56 insertions(+), 21 deletions(-)
 ```
+
+## Task 17 — Green local gate sweep (lint/vet/test/differential/fuzz)
+
+**Commits:** `<pending>`
+
+**Notes:** All SPEC §3 phase-done gates a–e green on local run. Gate (f) REVIEW is deferred to the verification session per state machine step 5.
+
+**Outputs:**
+
+```
+$ go vet ./...
+
+$ golangci-lint run ./...
+
+$ go test ./... -timeout 10m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	2.608s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+
+$ go test ./test/differential/... -timeout 5m -v
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+2026/04/22 18:17:14 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 1e06cb4069e6420eb767d6d481dace663f6e77e103f2e6d578709bc0803e69d9
+  Test ProcessID: f9fa31c1-4ccb-42c5-9b9e-946f0f508bab
+2026/04/22 18:17:14 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/22 18:17:15 ✅ Container created: 098d32af96d9
+2026/04/22 18:17:15 🐳 Starting container: 098d32af96d9
+2026/04/22 18:17:15 ✅ Container started: 098d32af96d9
+2026/04/22 18:17:15 🚧 Waiting for container id 098d32af96d9 image: testcontainers/ryuk:0.6.0. Waiting for: &{Port:8080/tcp timeout:<nil> PollInterval:100ms}
+2026/04/22 18:17:15 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 18:17:15 ✅ Container created: 02227da31e1d
+2026/04/22 18:17:15 🐳 Starting container: 02227da31e1d
+2026/04/22 18:17:15 ✅ Container started: 02227da31e1d
+2026/04/22 18:17:15 🚧 Waiting for container id 02227da31e1d image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x3fb7e0c93478 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x94e740 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 18:17:15 🐳 Terminating container: 02227da31e1d
+2026/04/22 18:17:15 🚫 Container terminated: 02227da31e1d
+--- PASS: TestReferenceProxy_Starts (0.87s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.48s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+2026/04/22 18:17:16 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 18:17:16 ✅ Container created: ee3ca6040d33
+2026/04/22 18:17:16 🐳 Starting container: ee3ca6040d33
+2026/04/22 18:17:16 ✅ Container started: ee3ca6040d33
+2026/04/22 18:17:16 🚧 Waiting for container id ee3ca6040d33 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x3fb7e1099600 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x94e740 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 18:17:17 🐳 Terminating container: ee3ca6040d33
+2026/04/22 18:17:17 🚫 Container terminated: ee3ca6040d33
+--- PASS: TestDifferential (1.13s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.13s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.550s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+
+$ go test ./internal/bootstrap/ -fuzz=FuzzBootstrapLoad -fuzztime=30s -run=^$
+fuzz: elapsed: 0s, gathering baseline coverage: 0/356 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 356/356 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 79289 (26426/sec), new interesting: 37 (total: 393)
+fuzz: elapsed: 6s, execs: 290844 (70526/sec), new interesting: 135 (total: 491)
+fuzz: elapsed: 9s, execs: 417227 (42116/sec), new interesting: 150 (total: 506)
+fuzz: elapsed: 12s, execs: 470439 (17741/sec), new interesting: 159 (total: 515)
+fuzz: elapsed: 15s, execs: 470439 (0/sec), new interesting: 159 (total: 515)
+fuzz: elapsed: 18s, execs: 745216 (91623/sec), new interesting: 161 (total: 517)
+fuzz: elapsed: 21s, execs: 879372 (44730/sec), new interesting: 162 (total: 518)
+fuzz: elapsed: 24s, execs: 879372 (0/sec), new interesting: 162 (total: 518)
+fuzz: elapsed: 27s, execs: 1024405 (48366/sec), new interesting: 162 (total: 518)
+fuzz: elapsed: 30s, execs: 1024405 (0/sec), new interesting: 162 (total: 518)
+fuzz: elapsed: 31s, execs: 1024405 (0/sec), new interesting: 162 (total: 518)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.073s
+```
