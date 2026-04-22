@@ -32,3 +32,12 @@ go: warning: "./..." matched no packages
 
 **Commits:** 31172f1
 **Notes:** Appended ADR-0005 (autonomous-planning adaptation) and ADR-0006 (module path `github.com/esalaine/envoy-go`) to DECISIONS.md verbatim from PLAN.md Task 2. No command outputs to quote (pure Markdown append).
+
+## Task 3 — internal/ package placeholders
+
+**Commits:** f2e4576
+**Notes:** Created 12 placeholder doc.go files under internal/{bootstrap,listener,cluster,tcp,http,tls,filter,xds,admin,stats,accesslog,runtime}/ per SPEC §4 future-phase mapping. Each file contains only the package-doc comment and the `package <name>` line.
+**Outputs:**
+```
+$ go vet ./internal/...
+```
