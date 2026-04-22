@@ -39,3 +39,17 @@ jobs:
         run: go mod download
       - name: differential suite
         run: go test ./test/differential/... -timeout 5m -v
+
+  fuzz-bootstrap:
+    needs: lint-vet-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+      - name: go mod download
+        run: go mod download
+      - name: fuzz bootstrap loader (30s budget, ADR-0018)
+        run: go test ./internal/bootstrap/ -fuzz=FuzzBootstrapLoad -fuzztime=30s -run=^$

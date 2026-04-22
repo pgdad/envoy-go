@@ -457,3 +457,15 @@ Alternatives considered and rejected:
 - The phase-01 `sampleBootstrap` fixture continues to populate `node.{id,cluster}` — documenting by example that the fields are recognized — but no test asserts they are *required*. If a future refactor removes `node` from the fixture, the happy-path test's `GetId()` assertion updates accordingly; nothing else breaks.
 
 ---
+
+## ADR-0018: `FuzzBootstrapLoad` CI budget for gate (d)
+
+**Status:** Accepted
+**Date:** 2026-04-22
+**Doctrine:** D-3.5
+
+**Decision:** 30 seconds per CI run via `-fuzztime=30s`.
+
+**Rationale:** short enough to not dominate the 5-minute differential job wall-clock; long enough to exercise the seed corpus and a few thousand mutations. A longer nightly lane is out of scope (no scheduled phase introduces it).
+
+---

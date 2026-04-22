@@ -230,3 +230,76 @@ ok  	github.com/esalaine/envoy-go/test/differential	(cached)
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 ```
+
+## Task 6 — FuzzBootstrapLoad fuzz target + CI job [ADR-0018]
+
+**Commits:** (SHA-filled in follow-up)
+**Notes:** Closes phase-01 gate (d) — `FuzzBootstrapLoad` is a Go native fuzz target (`testing.F`) in `internal/bootstrap/fuzz_test.go` (same package as `bootstrap.go` / `bootstrap_test.go`, so it can read `sampleBootstrap` directly without re-declaring it). The seed corpus has 8 entries inlined via `f.Add` — no external `testdata/fuzz/` files: (1) `sampleBootstrap` (happy bootstrap from `bootstrap_test.go`), (2) the verbatim bytes of `test/fixtures/0000-tcp-echo/envoy.yaml` (captured as `const envoyYAMLSeed`, the reference-Envoy bootstrap used by the differential gate), (3) empty string, (4) single space, (5) three NULs, (6) partial `admin:`, (7) bootstrap-shaped empty-arrays `static_resources: { listeners: [], clusters: [] }`, (8) 400-byte deeply-nested YAML (`bytes.Repeat([]byte("- "), 200)`). The fixture's `envoy-go.yaml` is NOT seeded — it is still in the phase-00 shape at this point and only gets rewritten to bootstrap shape in Task 12, so seeding it now would feed the fuzzer an input that `Load` legitimately rejects under phase-01 rules and add no coverage over `sampleBootstrap` + `envoy.yaml`. The property asserted by `f.Fuzz` is minimal-but-strong: `Load(bytes.NewReader(data))` MUST NOT panic for any byte sequence — every output is either `(*Bootstrap, nil)` or `(nil, err)` where `err.Error()` starts with `bootstrap: `. No return-value inspection inside the fuzz body: asserting the `bootstrap: ` prefix inside the harness would double-count the unit-test layer and risk false positives from mutated-but-benign inputs. CI lane `fuzz-bootstrap` (`.github/workflows/ci.yml`) runs on `ubuntu-latest`, `needs: lint-vet-test`, standalone from `differential` (no Docker), single step `go test ./internal/bootstrap/ -fuzz=FuzzBootstrapLoad -fuzztime=30s -run=^$` — the 30s budget from ADR-0018 is deliberately shorter than the 5-minute differential job so the two run in parallel without CI wall-clock pressure. No new `testdata/fuzz/FuzzBootstrapLoad/` files were committed (Go only creates those when it finds a failing input; the 30s run found zero). Seed replay (`-run=FuzzBootstrapLoad` without `-fuzz`) passed all 8 seeds first, then the 30s engine run executed 2,848,963 inputs across 32 workers with 348 new interesting discoveries and zero crashes.
+
+**Outputs:**
+```
+$ GOTOOLCHAIN=local go test ./internal/bootstrap/ -run=FuzzBootstrapLoad -v
+=== RUN   FuzzBootstrapLoad
+=== RUN   FuzzBootstrapLoad/seed#0
+=== RUN   FuzzBootstrapLoad/seed#1
+=== RUN   FuzzBootstrapLoad/seed#2
+=== RUN   FuzzBootstrapLoad/seed#3
+=== RUN   FuzzBootstrapLoad/seed#4
+=== RUN   FuzzBootstrapLoad/seed#5
+=== RUN   FuzzBootstrapLoad/seed#6
+=== RUN   FuzzBootstrapLoad/seed#7
+--- PASS: FuzzBootstrapLoad (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#0 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#1 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#2 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#3 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#4 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#5 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#6 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#7 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.005s
+
+$ GOTOOLCHAIN=local go test ./internal/bootstrap/ -fuzz=FuzzBootstrapLoad -fuzztime=30s -run=^$
+fuzz: elapsed: 0s, gathering baseline coverage: 0/8 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 8/8 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 38075 (12677/sec), new interesting: 85 (total: 93)
+fuzz: elapsed: 6s, execs: 38075 (0/sec), new interesting: 85 (total: 93)
+fuzz: elapsed: 9s, execs: 38075 (0/sec), new interesting: 85 (total: 93)
+fuzz: elapsed: 12s, execs: 271609 (77949/sec), new interesting: 86 (total: 94)
+fuzz: elapsed: 15s, execs: 1323493 (350627/sec), new interesting: 160 (total: 168)
+fuzz: elapsed: 18s, execs: 1878344 (184921/sec), new interesting: 255 (total: 263)
+fuzz: elapsed: 21s, execs: 2108123 (76617/sec), new interesting: 293 (total: 301)
+fuzz: elapsed: 24s, execs: 2445813 (112551/sec), new interesting: 316 (total: 324)
+fuzz: elapsed: 27s, execs: 2845357 (133195/sec), new interesting: 346 (total: 354)
+fuzz: elapsed: 30s, execs: 2848963 (1202/sec), new interesting: 348 (total: 356)
+fuzz: elapsed: 31s, execs: 2848963 (0/sec), new interesting: 348 (total: 356)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.082s
+
+$ GOTOOLCHAIN=local go vet ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local golangci-lint run ./...
+(no output — exit 0)
+
+$ GOTOOLCHAIN=local go test ./... -timeout 5m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.006s
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+```
