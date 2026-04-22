@@ -24,9 +24,11 @@ func (echoDriver) ReferenceListenerPort() int { return refContainerListenerPort 
 
 func (echoDriver) ReferenceBootstrap() string {
 	// host.docker.internal resolves to the host gateway from inside the
-	// Envoy container; the harness sets the backend port via Cmd override
-	// indirection. We bake the bootstrap at registration; the runner
-	// substitutes the placeholder.
+	// Envoy container. We bake the bootstrap at registration with a literal
+	// `port_value: 0` placeholder; the runner replaces it with the actual
+	// backend port via strings.Replace before starting the container
+	// (test/differential/runner_test.go). Phase 01 replaces this with
+	// proper templating once a config loader exists.
 	return refBootstrap
 }
 

@@ -6,9 +6,11 @@
 #   9901  — admin (used by harness wait.ForHTTP("/ready")).
 #
 # The cluster's endpoint address is "host.docker.internal" so the in-container
-# Envoy can reach the host-side echo backend started by the runner. The driver
-# substitutes the backend port in via the runner's per-fixture template hook
-# (see runFixture / SubjectConfig in test/differential).
+# Envoy can reach the host-side echo backend started by the runner. The runner
+# substitutes the backend port into this bootstrap with a literal
+# `strings.Replace` of "port_value: 0" before starting the reference container
+# (see test/differential/runner_test.go). Phase 01 replaces the strings.Replace
+# with real templating once a config loader exists.
 #
 # The reference Envoy image must have host-gateway aliasing (modern Docker
 # Desktop and recent docker-ce on Linux both honor host.docker.internal via
@@ -43,4 +45,4 @@ static_resources:
                   address:
                     socket_address:
                       address: host.docker.internal
-                      port_value: 0   # placeholder; runner regenerates with backend port via Cmd override
+                      port_value: 0   # placeholder; runner replaces via strings.Replace("port_value: 0", ...) before start

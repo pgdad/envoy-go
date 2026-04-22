@@ -780,3 +780,148 @@ Also the SPEC §3 phase-specific exit criteria:
 - CI pipeline — ✓ green on branch `phase/00-bootstrap-impl` per Task 15/16 references (remote CI triggered in Task 15; Task 16 mirrored it locally with identical outputs).
 
 Gates (a), (b), (c), (d), (e) all satisfied. Implementation verified. Gate (f) is the responsibility of the next lifecycle state; `STATE.md` is advanced to `lifecycle-state: 5`, `next-skill: superpowers:requesting-code-review`.
+
+---
+
+## Review fix round (lifecycle-state 5 → 3 → 4 → 5)
+
+**Trigger.** `REVIEW.md` (commit landing this file and this section atomically) returned `APPROVED-WITH-FIXES`. The reviewer's approval line conditions advancement to lifecycle-state 6 on fixing Important findings 1 and 2; findings 3–4 and all Minor items are explicitly deferred per the reviewer. Per `SKILL_ROUTING.md` step 5 ("if issues → back to step 3 (NOT 4) until REVIEW.md approved"), this session re-entered state 3, scoped to Findings 1 and 2 only.
+
+**Finding 1 — ADR-0010 promised a `BEHAVIOR_CONTRACT.md` note that never landed.**
+
+- Verification: `grep -n "V4_ONLY\|host.docker.internal\|dns_lookup_family" docs/envoy-go/BEHAVIOR_CONTRACT.md` returned nothing at the REVIEW'd head (`b8571c7`). Confirmed.
+- Fix: added a new `## Test harness host networking` subsection to `BEHAVIOR_CONTRACT.md`. The subsection codifies the V4_ONLY rule for every fixture whose reference bootstrap uses `host.docker.internal`, cites ADR-0010, pins the scope to TCP/HTTP/1.1/HTTP/2 on the current Envoy pin, and flags HTTP/3 / QUIC as needing re-evaluation via a superseding ADR. Host-side `0.0.0.0` bind and the `HostConfigModifier`-set `extra_hosts` wiring are both captured as part of the rule so a future fixture author does not need to rediscover them.
+- ADR impact: none. ADR-0010 is not edited (append-only invariant — `BOOTSTRAP_PROMPT.md §4.1` invariant 4). Landing the promised note satisfies ADR-0010's own Consequences clause; no superseding ADR is required.
+
+**Finding 2 — `envoy.yaml` docstring (and a sibling docstring in `driver.go`) misrepresent the substitution mechanism.**
+
+- Verification: reviewer cited `test/fixtures/0000-tcp-echo/envoy.yaml:11` ("per-fixture template hook") and `:46` ("Cmd override"). The ground truth is `test/differential/runner_test.go:61`, which does a literal `strings.Replace(d.ReferenceBootstrap(), "port_value: 0", fmt.Sprintf("port_value: %d", backendPort), 1)`. Confirmed by reading the file. `driver/driver.go:102-105` already describes the mechanism correctly; `driver/driver.go:26-29`, however, said "harness sets the backend port via Cmd override indirection" — the same defect the reviewer flagged in `envoy.yaml`, not listed by the reviewer but in-scope for a doctrinally complete fix (doctrine D-3.4 context isolation — leaving one of three wrong comments would re-introduce the same trap for a reader of `ReferenceBootstrap()`).
+- Fix:
+  - `test/fixtures/0000-tcp-echo/envoy.yaml:8-12` (the `host.docker.internal` explanatory block): reworded to describe the `strings.Replace` substitution at the runner and to note phase 01 replaces it with real templating.
+  - `test/fixtures/0000-tcp-echo/envoy.yaml:46` (placeholder comment): reworded to `placeholder; runner replaces via strings.Replace("port_value: 0", ...) before start`.
+  - `test/fixtures/0000-tcp-echo/driver/driver.go:26-29` (the `ReferenceBootstrap()` godoc): reworded to describe the `strings.Replace` mechanism and the phase 01 templating plan, matching the already-correct prose at `driver.go:102-105`.
+- Code impact: zero. Go sources and YAML parse identically; only comments change.
+
+**Deferred (per reviewer approval line).** Findings 3 (`CompareBytes` unreachable `if eq` branch) and 4 (static `refContainerListenerPort = 15000`) remain open against phase 01/02 as the reviewer recommended. All Minor items are deferred. No new follow-up is required — the deferral is explicit in `REVIEW.md`.
+
+### Re-verification (lifecycle-state 4 after fix round)
+
+Because the diff is `BEHAVIOR_CONTRACT.md` + `envoy.yaml` + `driver.go` comments only (no Go source or YAML schema changed), the re-verification burden is limited to confirming no regression. `go build`, `go vet`, `golangci-lint`, `go test -short`, and the differential suite all re-ran clean from the fix-round head. Outputs quoted verbatim below; all invoked from repo root with `DOCKER_HOST=unix://$HOME/.docker/desktop/docker.sock` inherited from the shell.
+
+Diff stat at the fix-round head:
+
+```
+$ git diff --stat
+ docs/envoy-go/BEHAVIOR_CONTRACT.md           | 21 +++++++++++++++++++++
+ test/fixtures/0000-tcp-echo/driver/driver.go |  8 +++++---
+ test/fixtures/0000-tcp-echo/envoy.yaml       | 10 ++++++----
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+```
+
+#### Gate (e-1) — `go build ./...`
+
+```
+$ go build ./... 2>&1; echo "EXIT=$?"
+EXIT=0
+```
+
+#### Gate (e-2) — `go vet ./...`
+
+```
+$ go vet ./... 2>&1; echo "EXIT=$?"
+EXIT=0
+```
+
+#### Gate (e-3) — `golangci-lint run ./...`
+
+```
+$ golangci-lint --version
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+
+$ golangci-lint run ./... 2>&1; echo "EXIT=$?"
+EXIT=0
+```
+
+(No findings; identical to the verification commit `87869bb` — expected since only comments changed.)
+
+#### Gate (e-4) — `go test -short ./...`
+
+```
+$ go test -short ./... 2>&1 | tail -18; echo "EXIT=${PIPESTATUS[0]}"
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.139s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+?   	github.com/esalaine/envoy-go/internal/admin	[no test files]
+?   	github.com/esalaine/envoy-go/internal/bootstrap	[no test files]
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	0.086s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+EXIT=0
+```
+
+#### Gate (a) — differential suite, `-count=1` (uncached)
+
+```
+$ go test -count=1 ./test/differential/... -timeout 5m -v 2>&1 | tail -40; echo "EXIT=${PIPESTATUS[0]}"
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+2026/04/22 14:44:20 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 14:44:20 ✅ Container created: 65a16e4c58fb
+2026/04/22 14:44:20 🐳 Starting container: 65a16e4c58fb
+2026/04/22 14:44:20 ✅ Container started: 65a16e4c58fb
+2026/04/22 14:44:20 🚧 Waiting for container id 65a16e4c58fb image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:... Path:/ready StatusCodeMatcher:... Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 14:44:20 🐳 Terminating container: 65a16e4c58fb
+2026/04/22 14:44:20 🚫 Container terminated: 65a16e4c58fb
+--- PASS: TestReferenceProxy_Starts (1.02s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.15s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+2026/04/22 14:44:21 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/22 14:44:21 ✅ Container created: 4d296e4bcc21
+2026/04/22 14:44:21 🐳 Starting container: 4d296e4bcc21
+2026/04/22 14:44:21 ✅ Container started: 4d296e4bcc21
+2026/04/22 14:44:21 🚧 Waiting for container id 4d296e4bcc21 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:... Path:/ready StatusCodeMatcher:... Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/22 14:44:21 🐳 Terminating container: 4d296e4bcc21
+2026/04/22 14:44:21 🚫 Container terminated: 4d296e4bcc21
+--- PASS: TestDifferential (0.79s)
+    --- PASS: TestDifferential/0000-tcp-echo (0.79s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.038s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+EXIT=0
+```
+
+Same pin SHA256 as the verification commit (`c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`). Differential fixture `0000-tcp-echo` byte-exact equivalent to upstream.
+
+### Phase-done gate roll-up (post-fix-round)
+
+| Gate | Result | Evidence |
+|---|---|---|
+| (a) new/changed differential fixtures green | PASS | `TestDifferential/0000-tcp-echo` PASS above, `-count=1` |
+| (b) pre-existing differential fixtures green | PASS (vacuous) | same as before fix round |
+| (c) conformance suites at threshold | PASS (vacuous) | threshold 0; no protocol surfaces |
+| (d) new fuzzer short-budget clean | PASS (vacuous) | no parser/codec in phase 00 |
+| (e) `go build`, `go vet`, `golangci-lint`, `go test -short ./...` clean | PASS | all exit 0 above |
+| (f) `REVIEW.md` approved | PASS | `REVIEW.md` Resolution section below records F1/F2 resolved; reviewer's conditional approval line is now unconditional |
+
+Implementation re-verified. `STATE.md` advances to `lifecycle-state: 6`, ready for the final commit that flips `ROADMAP.md` row 00 to `done` and advances the active phase to `01-static-bootstrap-config`.
