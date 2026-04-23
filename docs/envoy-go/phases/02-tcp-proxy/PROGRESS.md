@@ -306,3 +306,93 @@ ok  	github.com/esalaine/envoy-go/test/differential	0.069s
 ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
 ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 ```
+
+## Task 10 — All-gates green run
+
+**Commits:** 40464d2 (differential-gate fix — deterministic payloads + `--concurrency 1` [ADR-0028]); <sha> (this Task-10 PROGRESS commit)
+**Notes:** All six SPEC §3 phase-done gates pass locally. Gate-run exposed two real bugs in the Task 7 cutover; fixed in commit 40464d2 under ADR-0028 before the final green run below. (a) Fixture `0001-tcp-proxy-rr` byte-exact response-body equivalence + per-proxy AssertDistribution exactly [3,3,3] (requires reference `--concurrency 1`). (b) Fixture `0000-tcp-echo` unchanged pass. (c) No conformance suites apply (vacuously green). (d) `FuzzBootstrapLoad` + `FuzzTcpProxyFilter` both clean at the ADR-0018 30s CI budget. (e) `go build`, `go vet`, `golangci-lint run`, `go test -short ./...` all clean. (f) deferred to review (state 5). The verification session (lifecycle state 4) will re-run these.
+**Outputs:**
+```
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.478s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.038s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.007s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.004s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.005s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	0.004s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	0.066s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+
+$ go test ./internal/bootstrap/ -run "^TestNothing$" -fuzz=FuzzBootstrapLoad -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/634 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 591/634 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 634/634 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 185649 (61723/sec), new interesting: 30 (total: 664)
+fuzz: elapsed: 9s, execs: 246341 (20195/sec), new interesting: 49 (total: 683)
+fuzz: elapsed: 12s, execs: 276015 (9866/sec), new interesting: 56 (total: 690)
+fuzz: elapsed: 15s, execs: 283713 (2577/sec), new interesting: 61 (total: 695)
+fuzz: elapsed: 18s, execs: 352210 (22834/sec), new interesting: 63 (total: 697)
+fuzz: elapsed: 21s, execs: 447889 (31900/sec), new interesting: 71 (total: 705)
+fuzz: elapsed: 24s, execs: 458440 (3517/sec), new interesting: 75 (total: 709)
+fuzz: elapsed: 27s, execs: 601935 (47832/sec), new interesting: 76 (total: 710)
+fuzz: elapsed: 30s, execs: 739357 (45794/sec), new interesting: 77 (total: 711)
+fuzz: elapsed: 31s, execs: 739357 (0/sec), new interesting: 77 (total: 711)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.121s
+
+$ go test ./internal/filter/tcpproxy/ -run "^TestNothing$" -fuzz=FuzzTcpProxyFilter -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/357 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 357/357 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 24677 (8219/sec), new interesting: 0 (total: 357)
+fuzz: elapsed: 6s, execs: 328266 (101276/sec), new interesting: 3 (total: 360)
+fuzz: elapsed: 9s, execs: 601005 (90912/sec), new interesting: 7 (total: 364)
+fuzz: elapsed: 12s, execs: 862716 (87141/sec), new interesting: 12 (total: 369)
+fuzz: elapsed: 15s, execs: 1047070 (61390/sec), new interesting: 17 (total: 374)
+fuzz: elapsed: 18s, execs: 1273589 (75665/sec), new interesting: 19 (total: 376)
+fuzz: elapsed: 21s, execs: 1455881 (60697/sec), new interesting: 23 (total: 380)
+fuzz: elapsed: 24s, execs: 1639630 (61308/sec), new interesting: 24 (total: 381)
+fuzz: elapsed: 27s, execs: 1981813 (114051/sec), new interesting: 30 (total: 387)
+fuzz: elapsed: 30s, execs: 2277737 (98638/sec), new interesting: 33 (total: 390)
+fuzz: elapsed: 31s, execs: 2277737 (0/sec), new interesting: 33 (total: 390)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.063s
+
+$ go test ./test/differential/ -v -timeout=10m
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+--- PASS: TestReferenceProxy_Starts (0.87s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.48s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+--- PASS: TestDifferential (2.22s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.09s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.12s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	3.648s
+```
