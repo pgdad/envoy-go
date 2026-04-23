@@ -50,7 +50,7 @@ github.com/envoyproxy/go-control-plane/envoy v1.32.4
 
 ## Task 2 — internal/cluster: Cluster + Endpoint + round-robin LB
 
-**Commits:** <sha — filled by SHA-fill commit>
+**Commits:** 24a66688c122c55cdc1e7b847513000ffb577f21
 **Notes:** Created `internal/cluster/{doc.go, cluster.go, loadbalancer.go, loadbalancer_test.go}` per PLAN §Task 2 verbatim. Appended ADR-0024 codifying per-cluster `atomic.Uint64` RR counter scope. TDD: tests written first (Step 1), FAILed as expected (Step 2, undefined types), PASS after implementation (Step 6, 4 tests). Lint + vet clean. Two comment spellings adjusted to US locale (`materialises`→`materializes`, `defence`→`defense`, `randomised`→`randomized`) and two `//nolint:unused` directives added for `defaultConnectTimeout` and `endpoints` field (both consumed by Task 3 NewManager).
 **Outputs:**
 ```
