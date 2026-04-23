@@ -111,3 +111,31 @@ ok  	github.com/esalaine/envoy-go/internal/cluster	0.003s
 $ go vet ./internal/cluster/
 $ golangci-lint run ./internal/cluster/
 ```
+
+## Task 4 — internal/filter/tcpproxy: Filter, NewFilter, Handle (pump verbatim from phase 00)
+
+**Commits:** <sha>
+**Notes:** Created internal/filter/tcpproxy/{doc.go, filter.go, filter_test.go} per PLAN §Task 4. Pump code (netConn, halfClose, bidirectional io.Copy) LIFTED VERBATIM from cmd/envoy-go/main.go:91-119 per ADR-0023 — byte-level identical aside from pump() function-body inlining into Filter.Handle. Appended ADR-0023. TDD: tests fail first (undefined), pass after implementation. 7 tests including TestHandle_BidirectionalEcho (real loopback round-trip). British→US spelling fixes applied to doc.go (`honouring`→`honoring`) and filter.go (`dialled`→`dialed`) per misspell lint.
+**Outputs:**
+```
+$ go test ./internal/filter/tcpproxy/ -v
+=== RUN   TestNewFilter_Happy
+--- PASS: TestNewFilter_Happy (0.00s)
+=== RUN   TestNewFilter_WrongTypeURL
+--- PASS: TestNewFilter_WrongTypeURL (0.00s)
+=== RUN   TestNewFilter_UnmarshalError
+--- PASS: TestNewFilter_UnmarshalError (0.00s)
+=== RUN   TestNewFilter_MissingCluster
+--- PASS: TestNewFilter_MissingCluster (0.00s)
+=== RUN   TestNewFilter_WeightedClustersUnsupported
+--- PASS: TestNewFilter_WeightedClustersUnsupported (0.00s)
+=== RUN   TestHandle_BidirectionalEcho
+--- PASS: TestHandle_BidirectionalEcho (0.00s)
+=== RUN   TestHandle_DialFailure_ClosesDownstream
+2026/04/23 15:49:19 tcpproxy: dial 127.0.0.1:44815: dial tcp 127.0.0.1:44815: connect: connection refused
+--- PASS: TestHandle_DialFailure_ClosesDownstream (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.004s
+$ go vet ./internal/filter/tcpproxy/
+$ golangci-lint run ./internal/filter/tcpproxy/
+```

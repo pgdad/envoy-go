@@ -623,3 +623,36 @@ Per-cluster scope matches Envoy's data model and prevents the two failure modes 
 - **BEHAVIOR_CONTRACT.md `## TCP proxy`** (added by phase-02 Task 8) — codifies that LB sequence is NOT a differential dimension.
 
 ---
+
+## ADR-0023: Lift phase-00 `netConn`/`pump`/`halfClose` trio verbatim from `cmd/envoy-go/main.go` into `internal/filter/tcpproxy/filter.go`
+
+**Status:** Accepted
+**Date:** 2026-04-23
+**Doctrine:** D-3.5
+
+### Context
+
+Phase 00 implemented an ad-hoc TCP pump directly in `cmd/envoy-go/main.go` to serve the `0000-tcp-echo` differential fixture (see phase-00 PLAN.md). The pump comprises three pieces: the `netConn` wrapper type (defeats Linux `splice(2)` loopback-data-loss behaviour; see the type's own doc-comment at `cmd/envoy-go/main.go:91-96`), the `pump` function body (bidirectional `io.Copy` + `halfClose` on each direction), and the `halfClose` helper (`CloseWrite` on `*net.TCPConn`). Phase 02 moves the dataplane from `main.go` into a proper `internal/filter/tcpproxy/` package (SPEC §5.5). The question: does the moved code deserve a redesign — tightening signatures, introducing a `pumper` type, adding metrics hooks, switching to an `io.CopyBuffer` variant — or is byte-for-byte fidelity the right choice?
+
+### Decision
+
+Byte-for-byte verbatim lift. The `netConn` type, the `halfClose` helper, and the pump body (now inlined into `Filter.Handle`'s method body rather than called as a free function) move with zero logic changes and zero comment edits beyond function-extraction mechanics (`pump(client, upstreamAddr)` becomes the contents of `Handle` after `net.DialTimeout` replaces the ad-hoc `net.Dial` — but the two goroutines doing the directional `io.Copy`+`halfClose` dance are character-identical). The splice-avoidance comment on `netConn` is preserved verbatim.
+
+### Rationale
+
+The phase-00 fixture is the baseline gate every subsequent phase must keep green. Any behaviour-affecting edit to the pump, no matter how well-intentioned, risks a differential regression whose bisect target is obscured by the simultaneous package move. A verbatim lift makes the lift itself reviewable by `git diff` — a reviewer can compare `cmd/envoy-go/main.go` at phase-01-tip against `internal/filter/tcpproxy/filter.go` at Task-4-tip and see the tokens are identical. The move is bureaucratic (package change, method-receiver change) rather than editorial (algorithm change, wrapper-shape change), and bureaucratic-only changes can land without re-validating the fixture. Task 7 removes the phase-00 original atomically with the `main.go` rewrite; the phase-00 fixture re-runs at that point to prove no regression.
+
+### Consequences
+
+- `internal/filter/tcpproxy/filter.go` is the authoritative location of the pump going forward. `cmd/envoy-go/main.go` retains its copy until Task 7's atomic cutover; Task 7 deletes the original so there is exactly one definition at phase-02 tip.
+- The `netConn` wrapper's exported name is lowercase (unexported) in both locations. The filter package does not export the wrapper; callers never wrap connections themselves.
+- Future pump optimisations (e.g., vectored I/O, `io.CopyBuffer` with a tuned buffer pool) land as their own phases or tasks, with their own fixture re-validation. Phase 02 does not touch the bytes.
+- ADR-0023 supersedes nothing — the phase-00 pump was never ADR'd (the phase-00 PLAN.md §5.3 discussed it prose-only). This is its first ADR entry.
+
+### Cross-references
+
+- **SPEC §5.5** — TCP proxy filter responsibility and pump semantics.
+- **phase-00 PLAN.md §5.3** — historical record of the pump's introduction and the splice-avoidance rationale.
+- **Task 7** — atomic cutover that deletes the phase-00 original from `cmd/envoy-go/main.go`.
+
+---
