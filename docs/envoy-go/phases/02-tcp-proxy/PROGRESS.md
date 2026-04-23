@@ -142,7 +142,7 @@ $ golangci-lint run ./internal/filter/tcpproxy/
 
 ## Task 5 — internal/filter/tcpproxy.FuzzTcpProxyFilter (gate (d), ADR-0018 budget)
 
-**Commits:** <sha>
+**Commits:** e01161e
 **Notes:** Created internal/filter/tcpproxy/fuzz_test.go. 3-entry seed corpus per SPEC §4.1: well-formed TcpProxy, wrong type_url, malformed bytes. Widened mkClusterMgr to testing.TB so *testing.F can call it. No new ADR (CI budget inherited from ADR-0018). Fuzz run at 30s CI budget clean.
 **Outputs:**
 ```
