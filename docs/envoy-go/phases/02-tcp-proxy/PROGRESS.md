@@ -8,7 +8,7 @@ None.
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** 0832c6df3ac1b6d562a8da952d7d9542dd07b8ef
+**Commits:** b6410ca83579538164a901a199e3b0e18976c15e
 **Notes:** Created PROGRESS.md; verified all preconditions per PLAN §"Execution preconditions".
 **Outputs:**
 ```
