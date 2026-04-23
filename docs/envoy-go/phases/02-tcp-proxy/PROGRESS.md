@@ -264,3 +264,45 @@ ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 
 **Commits:** de2f06e
 **Notes:** Appended new `## TCP proxy` top-level H2 subsection to BEHAVIOR_CONTRACT.md covering: response-body byte-equivalence (asserted), half-close propagation (asserted), LB endpoint-selection sequence (NOT asserted with rationale), listener-bind error semantics (asserted). References ADR-0023, ADR-0024, SPEC §5.4/5.5/5.8. No code change.
+
+## Task 9 — Fixture 0001-tcp-proxy-rr: bootstraps + driver + AssertDistribution [ADR-0027]
+
+**Commits:** <sha>
+**Notes:** Created test/fixtures/0001-tcp-proxy-rr/{envoy.yaml, envoy-go.yaml, expectations.yaml, README.md, driver/driver.go, driver/driver_test.go}. Driver declares BackendCount=3, SubjectListenerName=l_tcp, ReferenceListenerPort=15001, implements DistributionAsserter (per-proxy exact [3,3,3] over 9 requests). Extracted phase-01 probeReady into test/helpers.HTTPGetReadyRaw (shared by fixtures 0000 + 0001 — ADR-0027). Added blank import in test/differential/runner_test.go. ADR-0027 codifies STRICT_DNS (ref) / STATIC (subj) divergence. 4 driver_test.go cases pass; -short test suite all green.
+**Outputs:**
+```
+$ go test ./test/fixtures/0001-tcp-proxy-rr/driver/ -v
+=== RUN   TestAssertDistribution_Exact
+--- PASS: TestAssertDistribution_Exact (0.00s)
+=== RUN   TestAssertDistribution_Imbalanced
+--- PASS: TestAssertDistribution_Imbalanced (0.00s)
+=== RUN   TestAssertDistribution_AllZero
+--- PASS: TestAssertDistribution_AllZero (0.00s)
+=== RUN   TestAssertDistribution_WrongLength
+--- PASS: TestAssertDistribution_WrongLength (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.517s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+ok  	github.com/esalaine/envoy-go/internal/cluster	(cached)
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	(cached)
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	(cached)
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	0.069s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+```

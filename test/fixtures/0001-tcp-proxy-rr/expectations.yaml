@@ -1,0 +1,18 @@
+# Phase-02 fixture 0001-tcp-proxy-rr: differential expectations.
+#
+# response-body: byte-exact required (echo backend; each backend reflects bytes
+# verbatim, so concatenated 9-request response is byte-equivalent across the
+# two proxies regardless of which backend serves which request).
+#
+# response-status / response-headers / response-trailers: N/A (TCP, not HTTP).
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses
+# path (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Distribution assertion is the driver's AssertDistribution method (per-proxy
+# counts must equal exactly [3, 3, 3] when 9 requests are sent against a
+# 3-endpoint cluster). The runner invokes it via the DistributionAsserter
+# interface assertion in test/differential/runner_test.go.
+response-body:
+  applicable: true
+  scope: byte-exact

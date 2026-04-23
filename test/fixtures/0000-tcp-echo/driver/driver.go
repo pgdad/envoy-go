@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/esalaine/envoy-go/test/differential/fixture"
@@ -119,50 +118,15 @@ func (echoDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes
 }
 
 func (echoDriver) ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAddr string) (refBytes, subjBytes []byte, err error) {
-	refBytes, err = probeReady(ctx, refAdminAddr)
+	refBytes, err = helpers.HTTPGetReadyRaw(ctx, refAdminAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ref probe: %w", err)
 	}
-	subjBytes, err = probeReady(ctx, subjAdminAddr)
+	subjBytes, err = helpers.HTTPGetReadyRaw(ctx, subjAdminAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("subj probe: %w", err)
 	}
 	return refBytes, subjBytes, nil
-}
-
-// probeReady issues a raw-socket GET /ready and reads the full wire response.
-// Not using net/http.Client because the diff needs the status line and
-// headers as on-the-wire bytes (net/http's response object discards some wire
-// detail like header ordering that the diff's set-equal allow-list tolerates
-// but the body/status exact-match rule does not).
-func probeReady(ctx context.Context, addr string) ([]byte, error) {
-	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = conn.Close() }()
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	}
-	req := "GET /ready HTTP/1.1\r\nHost: " + addr + "\r\nConnection: close\r\n\r\n"
-	if _, err := conn.Write([]byte(req)); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, rerr := conn.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if rerr != nil {
-			break
-		}
-	}
-	return buf, nil
 }
 
 func randHex(nBytes int) string {

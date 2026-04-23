@@ -788,3 +788,42 @@ Per D-3.4, cross-session decisions must live on disk. The format change is a cro
 - **ADR-0025** — phase-02 filter-chain subset (upstream reason listeners need to be iterated at all).
 
 ---
+
+## ADR-0027: Fixture `0001-tcp-proxy-rr` reference uses STRICT_DNS, subject uses STATIC
+
+**Status:** Accepted
+**Date:** 2026-04-23
+**Doctrine:** D-3.5
+
+### Context
+
+Phase 02's new differential fixture `0001-tcp-proxy-rr` exercises round-robin load balancing across a 3-endpoint cluster. The two sides of the fixture (reference Envoy container, envoy-go subject subprocess) run in different network topologies: the reference lives inside a Docker container and reaches host-side test backends via `host.docker.internal`; the subject lives as a subprocess on the test host and dials literal loopback addresses. The fixture must declare a cluster on each side that resolves to the same three test backends. Two questions: (a) what Envoy cluster `type` supports `host.docker.internal` resolution inside the container, and (b) what cluster `type` should the subject side declare.
+
+### Decision
+
+- **Reference** (`test/fixtures/0001-tcp-proxy-rr/envoy.yaml` + the driver's `ReferenceBootstrap(backendPorts)`): `type: STRICT_DNS`, `dns_lookup_family: V4_ONLY` (ADR-0010), three `lb_endpoints` at `host.docker.internal` with three distinct runner-rendered `port_value`s.
+- **Subject** (`test/fixtures/0001-tcp-proxy-rr/envoy-go.yaml` + the driver's `SubjectConfig(...)`): `type: STATIC`, three `lb_endpoints` at literal `127.0.0.1` with three distinct runner-rendered `port_value`s.
+
+### Rationale
+
+STATIC is not a viable choice for the reference side because the container-internal DNS path (Docker Desktop's `host.docker.internal` → host-gateway) must be exercised to reach host backends, and STATIC endpoints are resolved at bootstrap-parse time with no DNS lookup. STRICT_DNS is the cluster type that actually consumes `host.docker.internal` with a V4-family lookup at cluster-init time (ADR-0010 codifies the V4_ONLY discipline).
+
+STATIC is the right choice for the subject because the subject is a host subprocess and can dial literal 127.0.0.1 endpoints; STATIC resolves endpoints once at bootstrap time with no runtime DNS dependency, and phase 02 explicitly defers STRICT_DNS on the subject side to a later phase (SPEC §2). No differential gate is lost — the new BEHAVIOR_CONTRACT `## TCP proxy` subsection (phase-02 Task 8) explicitly excludes LB endpoint-selection sequence from the differential dimensions, so sequence divergence caused by the two different cluster types is not a failure.
+
+### Consequences
+
+- `test/fixtures/0001-tcp-proxy-rr/envoy.yaml` and `envoy-go.yaml` carry visibly different cluster declarations; the README documents the divergence and cross-references this ADR.
+- The runner's multi-backend allocation produces a `backendPorts []int` slice that both sides template into their cluster's `lb_endpoints` list. No cross-side coupling beyond the port values.
+- Same pattern fixture `0000-tcp-echo` already carries for its single endpoint (historical — predates ADR-0027 but is the same discipline).
+- Any future fixture targeting the host-gateway from inside the Envoy container inherits this rule; any future fixture that has the subject resolve DNS at runtime requires its own ADR under the subject-side-DNS phase.
+- The subject side deliberately keeps the 3-endpoint sequence deterministic-starting-at-0 (per ADR-0024); the reference side's per-worker randomized offset is not coordinated, and that is the BEHAVIOR_CONTRACT-level reason cross-proxy sequence equivalence is not asserted.
+
+### Cross-references
+
+- **ADR-0010** — V4_ONLY DNS rule; applies to every reference-side STRICT_DNS cluster.
+- **ADR-0024** — per-cluster RR counter scope; subject-side sequence property.
+- **ADR-0026** — ready-sentinel format; unrelated to the cluster-type divergence but lands in the same phase.
+- **BEHAVIOR_CONTRACT.md `## TCP proxy`** — phase-02 Task 8 — documents the LB-sequence-not-asserted rule.
+- **SPEC §4.4 ADR-F** — this ADR's pre-assignment in the SPEC phase.
+
+---

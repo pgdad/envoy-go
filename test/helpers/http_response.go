@@ -3,9 +3,12 @@ package helpers
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/textproto"
+	"time"
 )
 
 // HTTPResponse is the structured form of an HTTP/1.1 response on the wire.
@@ -45,6 +48,41 @@ func ParseHTTPResponse(raw []byte) (*HTTPResponse, error) {
 		hdrs[textproto.CanonicalMIMEHeaderKey(k)] = joinHeaderValues(vs)
 	}
 	return &HTTPResponse{StatusLine: status, Headers: hdrs, Body: body}, nil
+}
+
+// HTTPGetReadyRaw issues a raw-socket GET /ready and reads the full wire
+// response. Not using net/http.Client because the diff needs the status line
+// and headers as on-the-wire bytes (net/http's response object discards some
+// wire detail like header ordering that the diff's set-equal allow-list
+// tolerates but the body/status exact-match rule does not).
+func HTTPGetReadyRaw(ctx context.Context, addr string) ([]byte, error) {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	}
+	req := "GET /ready HTTP/1.1\r\nHost: " + addr + "\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	for {
+		n, rerr := conn.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	return buf, nil
 }
 
 func joinHeaderValues(vs []string) string {
