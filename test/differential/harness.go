@@ -109,8 +109,13 @@ func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, l
 	req := testcontainers.ContainerRequest{
 		Image:        pin.SHA256,
 		ExposedPorts: exposed,
-		Cmd:          []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn"},
-		WaitingFor:   wait.ForHTTP("/ready").WithPort("9901/tcp").WithStartupTimeout(readyTimeout),
+		// --concurrency 1 forces a single worker thread so round-robin LB
+		// state is per-process-cluster (not per-worker). Over N connections
+		// with M endpoints where M | N the distribution is exactly N/M per
+		// backend — satisfying phase-02 SPEC §5.8's per-proxy distribution
+		// assertion. See ADR-0028.
+		Cmd:        []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn", "--concurrency", "1"},
+		WaitingFor: wait.ForHTTP("/ready").WithPort("9901/tcp").WithStartupTimeout(readyTimeout),
 		HostConfigModifier: func(hc *container.HostConfig) {
 			hc.ExtraHosts = []string{"host.docker.internal:host-gateway"}
 		},

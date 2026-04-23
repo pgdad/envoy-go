@@ -2,8 +2,6 @@ package driver
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -97,10 +95,14 @@ static_resources:
 }
 
 func (echoDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error) {
-	uid := randHex(6)
+	// Deterministic payload: both sides receive the same bytes so byte-exact
+	// echo comparison holds under the post-Task-7 runner pattern that calls
+	// Drive separately per side. An earlier variant used a per-call randHex
+	// uid, which diverged between the two calls; the static form has the same
+	// debugging value (line-numbered pings) with no run-time state.
 	var payload []byte
 	for n := 0; n < 10; n++ {
-		payload = append(payload, []byte(fmt.Sprintf("ping-%d-%s\n", n, uid))...)
+		payload = append(payload, []byte(fmt.Sprintf("ping-%d\n", n))...)
 	}
 	if refAddr != "" {
 		refBytes, err = helpers.TCPRoundTrip(ctx, refAddr, payload, time.Second)
@@ -127,10 +129,4 @@ func (echoDriver) ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAddr st
 		return nil, nil, fmt.Errorf("subj probe: %w", err)
 	}
 	return refBytes, subjBytes, nil
-}
-
-func randHex(nBytes int) string {
-	b := make([]byte, nBytes)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }

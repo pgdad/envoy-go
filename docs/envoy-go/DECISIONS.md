@@ -827,3 +827,50 @@ STATIC is the right choice for the subject because the subject is a host subproc
 - **SPEC §4.4 ADR-F** — this ADR's pre-assignment in the SPEC phase.
 
 ---
+
+## ADR-0028: Reference Envoy `--concurrency 1` for deterministic single-worker round-robin
+
+**Status:** Accepted
+**Date:** 2026-04-23
+**Doctrine:** D-3.5
+
+### Context
+
+Upstream Envoy's round-robin load balancer holds its RR counter per-worker-thread with a randomized starting offset. When the reference Envoy container runs with its default worker count (autodetected from CPU count, typically >1), each worker accepts a subset of the N connections from the test client and runs its own RR counter over those. Over N=9 connections to a 3-endpoint cluster, the aggregate per-backend distribution is therefore NOT guaranteed to be exactly [3, 3, 3] — two workers starting at different offsets and unevenly receiving accepts can produce skews like [5, 3, 1].
+
+Phase-02 SPEC §5.8 asserts "each proxy independently: forall i: counts[i] == 3 (exact, not tolerance). The N % 3 == 0 design makes the RR distribution exact." This assertion is satisfiable only when the reference proxy uses a single RR counter for all connections — i.e., single worker. Task 10's first differential run confirmed the skew empirically: reference-side distribution was `[5 3 1]`, failing the per-proxy assertion.
+
+Two options exist to reconcile SPEC and reality: (A) force single-worker operation on the reference via Envoy's `--concurrency 1` CLI flag, making the SPEC's assumption hold; (B) relax AssertDistribution to assert exactness on the subject only, acknowledging the per-worker reference asymmetry. Option (A) preserves SPEC and BEHAVIOR_CONTRACT without edit and is a one-flag change with no observable behavior change on the fixtures' other gates (response-body byte-exactness holds whatever the worker count).
+
+### Decision
+
+The reference Envoy container in `test/differential/harness.go`'s `StartReferenceProxy` is invoked with `--concurrency 1` appended to the existing `envoy --config-yaml ... --log-level warn` command line. Every differential fixture (phase-01 carryover `0000-tcp-echo` and phase-02's new `0001-tcp-proxy-rr`) inherits this setting.
+
+### Rationale
+
+`--concurrency 1` forces the reference to run a single worker thread. The single worker owns a single RR counter per cluster; all N connections are dispatched through that one counter; the mod-M distribution over N when `M | N` is exactly N/M per endpoint regardless of the counter's starting offset. This matches the subject side (ADR-0024's per-cluster `atomic.Uint64` deterministic RR) at the distribution level without making any claim about sequence — sequence equivalence remains NOT asserted per the BEHAVIOR_CONTRACT TCP proxy subsection.
+
+Option (B) — subject-only assertion — was rejected because:
+- It weakens SPEC §5.8's per-proxy guarantee with no observable benefit in subsequent phases.
+- The BEHAVIOR_CONTRACT explicitly mentions sequence as non-equivalent but frames distribution as a local correctness property of each proxy; dropping reference-side distribution asserts a double standard where the reference is held to weaker correctness than the subject.
+- `--concurrency 1` is a lower-effort, lower-ambiguity change than editing the SPEC or the assertion shape.
+
+### Consequences
+
+- `test/differential/harness.go`:112 carries the `--concurrency` flag. No other harness code changes.
+- Every fixture driver's `AssertDistribution` (optional per the `DistributionAsserter` interface) can assume single-worker reference semantics. Fixture 0001's `AssertDistribution` asserts exact [3, 3, 3] on both sides.
+- Reference Envoy's single-worker operation is an observable property under the `--concurrency` CLI flag; any future fixture that exercises concurrency-dependent phenomena (e.g., multi-worker stat aggregation, hot-restart worker-count assertions) requires either a per-fixture concurrency override or a successor ADR raising the baseline.
+- Response-body byte-equivalence and admin `/ready` byte-equivalence (phase-01 baseline) are unaffected — they are behavioral surfaces independent of worker count.
+- Fixture 0000-tcp-echo's historical gate is preserved: its single-endpoint cluster + single-connection echo has no distribution assertion; `--concurrency 1` changes the reference's internal scheduling but not any observable byte on the wire.
+- The flag is scoped to the differential harness's reference container. Envoy-go's subject is already per-cluster single-counter RR (ADR-0024) regardless of OS-thread count, so no subject-side change is needed.
+- Unrelated phase-02 fix: the `randHex(6)` per-call uid in both fixture drivers' `Drive` methods was removed at the same time. Under the post-Task-7 runner pattern that calls `Drive` once per side, the per-call uid produced different payloads on the two calls, which diverged at the byte-diff gate. Deterministic payloads (`ping-0\n...ping-9\n` for fixture 0000; `rr-0\n...rr-8\n` for fixture 0001) restore byte-equivalence with no loss of debuggability. This fix is a bug repair rather than a cross-session decision; the ADR is mentioned here rather than its own ADR because it is pure Task-7 fallout, not a doctrine-level change.
+
+### Cross-references
+
+- **ADR-0024** — per-cluster RR counter scope on the subject side.
+- **ADR-0026** — ready-sentinel format change (no LB relation; referenced only to cross-link the phase-02 ADR set).
+- **SPEC §5.8** — fixture 0001 distribution assertion.
+- **BEHAVIOR_CONTRACT.md `## TCP proxy`** (phase-02 Task 8) — codifies distribution as a local-per-proxy correctness property and sequence as non-asserted.
+- **Envoy CLI reference** — `--concurrency N` documented in Envoy's operations guide; N=1 is always valid.
+
+---

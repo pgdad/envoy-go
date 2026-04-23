@@ -5,8 +5,6 @@ package driver
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -101,11 +99,12 @@ static_resources:
 }
 
 // Drive sends 9 TCP round-trips against whichever side(s) are non-"".
+// Payload is deterministic so byte-exact echo comparison holds across the
+// post-Task-7 separate-per-side Drive calls (a randHex uid per call diverged).
 func (rrDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error) {
-	uid := randHex(6)
 	var payloads [][]byte
 	for n := 0; n < requestsPerSide; n++ {
-		payloads = append(payloads, []byte(fmt.Sprintf("rr-%d-%s\n", n, uid)))
+		payloads = append(payloads, []byte(fmt.Sprintf("rr-%d\n", n)))
 	}
 	if refAddr != "" {
 		var sb strings.Builder
@@ -162,12 +161,6 @@ func (rrDriver) ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAddr stri
 		return nil, nil, fmt.Errorf("subj probe: %w", err)
 	}
 	return refBytes, subjBytes, nil
-}
-
-func randHex(nBytes int) string {
-	b := make([]byte, nBytes)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // Compile-time check the driver implements both required and optional ifaces.
