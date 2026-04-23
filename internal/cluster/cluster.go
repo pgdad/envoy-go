@@ -8,7 +8,7 @@ import (
 
 // defaultConnectTimeout is used when a cluster's connect_timeout is unset.
 // Matches Envoy v1.37.2's documented default (SPEC §10 #2 settled).
-const defaultConnectTimeout = 5 * time.Second //nolint:unused // consumed by Task 3 NewManager
+const defaultConnectTimeout = 5 * time.Second
 
 // errNoEndpoints is returned by PickEndpoint when the cluster has no endpoints.
 // Build-time validation in NewManager prevents this in normal operation; the
@@ -30,7 +30,7 @@ func (e Endpoint) Addr() string {
 // supports only round-robin; future phases may grow the LB family.
 type Cluster struct {
 	name           string
-	endpoints      []Endpoint //nolint:unused // consumed by Task 3 NewManager
+	endpoints      []Endpoint
 	connectTimeout time.Duration
 	lb             loadBalancer
 }
