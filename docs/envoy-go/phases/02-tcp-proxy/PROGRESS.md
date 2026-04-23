@@ -140,6 +140,43 @@ $ go vet ./internal/filter/tcpproxy/
 $ golangci-lint run ./internal/filter/tcpproxy/
 ```
 
+## Task 6 — internal/listener.Manager: multi-listener build + Start/Stop + inline registry
+
+**Commits:** <sha>
+**Notes:** Created internal/listener/{doc.go, manager.go, manager_test.go} per PLAN §Task 6. ADR-0025 codifies phase-02 filter-chain subset. 12 tests: 2 happy + 10 error/unwind. Inline filter registry maps single URL (tcp_proxy.TypeURL) to its constructor. Divergence from verbatim PLAN: acceptLoop signature takes an explicit `net.Listener` argument (capturing `bl.socket` at launch time) to avoid a nil-pointer race when Stop() runs concurrently with goroutine startup; `ListenerInfo` renamed to `Info` (revive stutter lint); British spellings corrected to US (`materialises`→`materializes`, `behaviour`→`behavior`, `materialised`→`materialized`, `Cancelling`→`Canceling`, `cancelled`→`canceled`).
+**Outputs:**
+```
+$ go test ./internal/listener/ -v
+=== RUN   TestManager_HappyPath_Single
+--- PASS: TestManager_HappyPath_Single (0.00s)
+=== RUN   TestManager_HappyPath_Multi
+--- PASS: TestManager_HappyPath_Multi (0.00s)
+=== RUN   TestManager_Error_ZeroListeners
+--- PASS: TestManager_Error_ZeroListeners (0.00s)
+=== RUN   TestManager_Error_DuplicateName
+--- PASS: TestManager_Error_DuplicateName (0.00s)
+=== RUN   TestManager_Error_TwoFilterChains
+--- PASS: TestManager_Error_TwoFilterChains (0.00s)
+=== RUN   TestManager_Error_NonEmptyFilterChainMatch
+--- PASS: TestManager_Error_NonEmptyFilterChainMatch (0.00s)
+=== RUN   TestManager_Error_TwoFilters
+--- PASS: TestManager_Error_TwoFilters (0.00s)
+=== RUN   TestManager_Error_PopulatedTransportSocket
+--- PASS: TestManager_Error_PopulatedTransportSocket (0.00s)
+=== RUN   TestManager_Error_UnknownFilterTypeURL
+--- PASS: TestManager_Error_UnknownFilterTypeURL (0.00s)
+=== RUN   TestManager_Error_FilterConstructionPropagated
+--- PASS: TestManager_Error_FilterConstructionPropagated (0.00s)
+=== RUN   TestManager_Error_NonSocketAddressListener
+--- PASS: TestManager_Error_NonSocketAddressListener (0.00s)
+=== RUN   TestManager_BindUnwind
+--- PASS: TestManager_BindUnwind (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener	0.004s
+$ go vet ./internal/listener/
+$ golangci-lint run ./internal/listener/
+```
+
 ## Task 5 — internal/filter/tcpproxy.FuzzTcpProxyFilter (gate (d), ADR-0018 budget)
 
 **Commits:** e01161e

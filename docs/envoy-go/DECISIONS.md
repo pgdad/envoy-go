@@ -656,3 +656,49 @@ The phase-00 fixture is the baseline gate every subsequent phase must keep green
 - **Task 7** — atomic cutover that deletes the phase-00 original from `cmd/envoy-go/main.go`.
 
 ---
+
+## ADR-0025: Phase-02 filter-chain subset — exactly one filter_chain, empty filter_chain_match, exactly one terminal filter
+
+**Status:** Accepted
+**Date:** 2026-04-23
+**Doctrine:** D-3.5
+
+### Context
+
+The Envoy listener model supports a rich filter-chain protocol: multiple filter_chains per listener each with a `filter_chain_match` (destination port / prefix / SNI / transport protocol / server names) selecting at connection-accept time, each chain itself a sequence of filters following an iteration protocol (`Continue` / `StopIteration` / `StopIterationNoBuffer` etc.). Phase 02's job is to land the first real dataplane; the full filter-chain framework is phase 07's charter. This ADR codifies which strict subset of the listener proto phase 02 accepts, so a reviewer and a future maintainer both know where the line is drawn and why.
+
+### Decision
+
+`internal/listener.NewManager` build-errors on every violation of the following subset:
+
+1. `len(listener.filter_chains) == 1` — exactly one chain per listener.
+2. `filter_chain_match` — absent or `proto.Equal` to the zero-value `&listenerv3.FilterChainMatch{}`. Any populated match errors.
+3. `transport_socket` — must be nil. Non-nil errors with a message naming TLS and phase 03 for traceability.
+4. `len(filter_chain.filters) == 1` — exactly one terminal filter.
+5. `filter.typed_config.type_url` — must be registered in the inline filter registry. Phase 02 registers exactly one URL: `type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy`. Unknown URLs error.
+6. `listener.listener_filters` — silently skipped, NOT errored (SPEC §2 notes this; `tls_inspector`, `original_dst`, etc. are deferred to a later phase and a fixture that declares them today can stay declarative without breaking phase-02 acceptance).
+
+The inline filter registry lives inside `internal/listener/manager.go` as a package-private `var filterRegistry = map[string]filterConstructor{...}`. Phase 07 generalises it into an exported registry package (`internal/filter/registry/`) with external registration support.
+
+### Rationale
+
+The full `FilterChain` protocol (match rules + iteration + read vs write filter distinction + per-route config + continue/stop/stopBuffered state) is a non-trivial subsystem. Phase 02's claim — "envoy-go runs real Envoy dataplane primitives — listener + filter + cluster + LB — end-to-end and remains byte-equivalent to upstream Envoy on a deterministic TCP workload" (SPEC §1) — is satisfied by the simplest correct case: one filter_chain, one terminal filter, no match rules. Accepting anything more would invite fixtures that depend on match behaviour that phase 02 does not implement correctly, and the resulting differential regressions would not be bisectable to a single phase.
+
+Ignoring `listener_filters` (rather than erroring on it) is a deliberate asymmetry with the filter-chain rules above. Listener filters are a pre-filter-chain layer; fixtures that declare them do so for informational or future-use reasons and should continue to parse. By contrast, a populated `transport_socket` materially changes the bytes on the wire (TLS); silently ignoring it would diverge from upstream, so it errors.
+
+### Consequences
+
+- Phase-02 listeners have a single code path: one chain, one filter, no match. `internal/listener/manager.go` does not grow a chain-selection loop or an iteration-protocol state machine.
+- Phase 07 supersedes this ADR when it lands the full framework; the phase-07 ADR explicitly names ADR-0025 as superseded and replaces the inline registry + the six-rule gate with the full protocol.
+- Fixtures that currently carry `listener_filters` in their YAML continue to work unchanged (they are skipped at build time and the listener proceeds). Fixtures that want to test listener filters must land in a later phase.
+- The error-message discipline (`listener: <name>: <violation>`) is what `manager_test.go` asserts on. Changing any of those strings breaks tests — which is the intended behaviour for a contract-defining ADR.
+
+### Cross-references
+
+- **SPEC §5.2** — listener manager responsibility and build-time behaviour.
+- **SPEC §5.3** — inline filter registry spec.
+- **SPEC §2** — non-purposes bullet list, including the filter-chain framework deferral and the listener_filters skip rule.
+- **ADR-0023** — pump lift; provides the `Filter.Handle` method the registered filter exposes.
+- **Phase 07 — filter chain framework** — eventual superseder of this ADR.
+
+---
