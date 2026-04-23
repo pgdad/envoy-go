@@ -23,7 +23,7 @@ const tcpProxyTypeURL = "type.googleapis.com/envoy.extensions.filters.network.tc
 
 // mkClusterMgr builds a cluster manager from a bootstrap with one STATIC
 // cluster pointing at a single endpoint. Tests use this for happy-path setup.
-func mkClusterMgr(t *testing.T, name, host string, port uint32) *cluster.Manager {
+func mkClusterMgr(t testing.TB, name, host string, port uint32) *cluster.Manager {
 	t.Helper()
 	bs := &bootstrapv3.Bootstrap{
 		StaticResources: &bootstrapv3.Bootstrap_StaticResources{

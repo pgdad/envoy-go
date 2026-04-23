@@ -139,3 +139,55 @@ ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.004s
 $ go vet ./internal/filter/tcpproxy/
 $ golangci-lint run ./internal/filter/tcpproxy/
 ```
+
+## Task 5 — internal/filter/tcpproxy.FuzzTcpProxyFilter (gate (d), ADR-0018 budget)
+
+**Commits:** <sha>
+**Notes:** Created internal/filter/tcpproxy/fuzz_test.go. 3-entry seed corpus per SPEC §4.1: well-formed TcpProxy, wrong type_url, malformed bytes. Widened mkClusterMgr to testing.TB so *testing.F can call it. No new ADR (CI budget inherited from ADR-0018). Fuzz run at 30s CI budget clean.
+**Outputs:**
+```
+$ go test ./internal/filter/tcpproxy/ -run "^TestNothing$" -fuzz=FuzzTcpProxyFilter -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/34 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 34/34 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 200128 (66709/sec), new interesting: 57 (total: 91)
+fuzz: elapsed: 6s, execs: 710448 (170094/sec), new interesting: 135 (total: 169)
+fuzz: elapsed: 9s, execs: 1309046 (199496/sec), new interesting: 175 (total: 209)
+fuzz: elapsed: 12s, execs: 2038466 (243174/sec), new interesting: 212 (total: 246)
+fuzz: elapsed: 15s, execs: 2632610 (198026/sec), new interesting: 237 (total: 271)
+fuzz: elapsed: 18s, execs: 3216653 (194725/sec), new interesting: 259 (total: 293)
+fuzz: elapsed: 21s, execs: 3737253 (173523/sec), new interesting: 278 (total: 312)
+fuzz: elapsed: 24s, execs: 4441832 (234802/sec), new interesting: 297 (total: 331)
+fuzz: elapsed: 27s, execs: 4996273 (184826/sec), new interesting: 309 (total: 343)
+fuzz: elapsed: 30s, execs: 5468013 (157253/sec), new interesting: 323 (total: 357)
+fuzz: elapsed: 31s, execs: 5468013 (0/sec), new interesting: 323 (total: 357)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.039s
+$ go test ./internal/filter/tcpproxy/ -v
+=== RUN   TestNewFilter_Happy
+--- PASS: TestNewFilter_Happy (0.00s)
+=== RUN   TestNewFilter_WrongTypeURL
+--- PASS: TestNewFilter_WrongTypeURL (0.00s)
+=== RUN   TestNewFilter_UnmarshalError
+--- PASS: TestNewFilter_UnmarshalError (0.00s)
+=== RUN   TestNewFilter_MissingCluster
+--- PASS: TestNewFilter_MissingCluster (0.00s)
+=== RUN   TestNewFilter_WeightedClustersUnsupported
+--- PASS: TestNewFilter_WeightedClustersUnsupported (0.00s)
+=== RUN   TestHandle_BidirectionalEcho
+--- PASS: TestHandle_BidirectionalEcho (0.00s)
+=== RUN   TestHandle_DialFailure_ClosesDownstream
+2026/04/23 15:52:19 tcpproxy: dial 127.0.0.1:33277: dial tcp 127.0.0.1:33277: connect: connection refused
+--- PASS: TestHandle_DialFailure_ClosesDownstream (0.00s)
+=== RUN   FuzzTcpProxyFilter
+=== RUN   FuzzTcpProxyFilter/seed#0
+=== RUN   FuzzTcpProxyFilter/seed#1
+=== RUN   FuzzTcpProxyFilter/seed#2
+--- PASS: FuzzTcpProxyFilter (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#0 (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#1 (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.004s
+$ go vet ./internal/filter/tcpproxy/
+$ golangci-lint run ./internal/filter/tcpproxy/
+```
