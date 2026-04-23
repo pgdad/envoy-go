@@ -259,3 +259,8 @@ ok  	github.com/esalaine/envoy-go/test/differential	0.060s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 ```
+
+## Task 8 — BEHAVIOR_CONTRACT.md: TCP proxy subsection
+
+**Commits:** <sha — filled by SHA-fill commit>
+**Notes:** Appended new `## TCP proxy` top-level H2 subsection to BEHAVIOR_CONTRACT.md covering: response-body byte-equivalence (asserted), half-close propagation (asserted), LB endpoint-selection sequence (NOT asserted with rationale), listener-bind error semantics (asserted). References ADR-0023, ADR-0024, SPEC §5.4/5.5/5.8. No code change.
