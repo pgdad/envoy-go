@@ -47,3 +47,24 @@ ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 $ go list -m github.com/envoyproxy/go-control-plane/envoy
 github.com/envoyproxy/go-control-plane/envoy v1.32.4
 ```
+
+## Task 2 — internal/cluster: Cluster + Endpoint + round-robin LB
+
+**Commits:** <sha — filled by SHA-fill commit>
+**Notes:** Created `internal/cluster/{doc.go, cluster.go, loadbalancer.go, loadbalancer_test.go}` per PLAN §Task 2 verbatim. Appended ADR-0024 codifying per-cluster `atomic.Uint64` RR counter scope. TDD: tests written first (Step 1), FAILed as expected (Step 2, undefined types), PASS after implementation (Step 6, 4 tests). Lint + vet clean. Two comment spellings adjusted to US locale (`materialises`→`materializes`, `defence`→`defense`, `randomised`→`randomized`) and two `//nolint:unused` directives added for `defaultConnectTimeout` and `endpoints` field (both consumed by Task 3 NewManager).
+**Outputs:**
+```
+$ go test ./internal/cluster/ -run TestRoundRobin -v
+=== RUN   TestRoundRobin_DistributionExact
+--- PASS: TestRoundRobin_DistributionExact (0.00s)
+=== RUN   TestRoundRobin_FirstPickIsEndpoint0
+--- PASS: TestRoundRobin_FirstPickIsEndpoint0 (0.00s)
+=== RUN   TestRoundRobin_ConcurrentDistributionExact
+--- PASS: TestRoundRobin_ConcurrentDistributionExact (0.00s)
+=== RUN   TestRoundRobin_ZeroEndpoints
+--- PASS: TestRoundRobin_ZeroEndpoints (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.002s
+$ go vet ./internal/cluster/
+$ golangci-lint run ./internal/cluster/
+```

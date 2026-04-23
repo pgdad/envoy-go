@@ -585,3 +585,41 @@ Phase 01's charter (ROADMAP row 01) is to replace the phase-00 placeholder confi
 - **ADR-0020** — `cmd/envoy-go/main_test.go` rewrite-vs-replacement decision that preceded this deletion.
 
 ---
+
+## ADR-0024: Per-cluster `atomic.Uint64` counter as round-robin state scope
+
+**Status:** Accepted
+**Date:** 2026-04-23
+**Doctrine:** D-3.5
+
+### Context
+
+Phase 02 introduces a round-robin load balancer over a cluster's endpoints (SPEC §5.4). Envoy's data model places LB state at the cluster level — a cluster owns its endpoint pool and its load-balancer state. The implementation must choose the scope and primitive for the round-robin counter. The candidates are: (a) a process-global counter, (b) a per-listener counter, or (c) a per-cluster counter. Each has observable distribution consequences across multi-listener/multi-cluster configurations. The phase also imports `sync/atomic` for the first time in the project.
+
+### Decision
+
+Each `*Cluster` owns its own `atomic.Uint64` counter. The `roundRobin` LB consults only that cluster's counter. Endpoint selection uses `i := counter.Add(1) - 1; endpoints[int(i) % len(endpoints)]` — the subtract-one trick makes the first pick `endpoints[0]`, which unit tests pin as an internal correctness property but which is explicitly NOT promised to upstream Envoy (upstream's RR is per-worker with randomised starting offset; see ADR-0026 and the new BEHAVIOR_CONTRACT TCP proxy subsection added by phase-02 Task 8).
+
+### Rationale
+
+Per-cluster scope matches Envoy's data model and prevents the two failure modes of the alternatives:
+
+- **Per-listener counter:** a future fixture where two listeners proxy to the same cluster `c_echo` would observe each listener's counter restart from 0, double-loading `endpoints[0]` at each accept burst. Endpoint load would depend on which listener accepted each connection — unrelated to the cluster's true load-balancing intent.
+- **Process-global counter:** a multi-cluster bootstrap would conflate distribution across unrelated clusters. A burst of picks on cluster A would shift cluster B's starting index, making distribution non-stationary in a cross-cluster-coupled way that has no mapping to the cluster abstraction.
+
+`atomic.Uint64.Add(1)` guarantees every goroutine observes a unique `i`, and `i mod N` is exactly balanced when `N | total_picks`. Unit tests exercise 100 goroutines × 30 picks each = 3000 picks and assert exact 1000/1000/1000 distribution across 3 endpoints (no tolerance). The subtract-one formula is preferred over starting at 1 because it makes the first-pick invariant (`endpoints[0]`) easy to state and pin in tests.
+
+### Consequences
+
+- Phase 02 LB state lives on `*Cluster` in `internal/cluster/loadbalancer.go`. No shared state across clusters.
+- Sequence-level equivalence to upstream Envoy is NOT a differential dimension. The fixture-level assertion for phase-02's new fixture (`0001-tcp-proxy-rr`) is per-proxy distribution correctness (each proxy balances 3/3/3 over 9 requests), not cross-proxy sequence match.
+- Future LB policies (LEAST_REQUEST, RANDOM, RING_HASH, MAGLEV — all deferred to the load-balancing family, phase 09+) will be added alongside `roundRobin` as new types implementing the unexported `loadBalancer` interface; each owns its own state per-cluster. No existing code changes when they land.
+- The `sync/atomic` import becomes a project-level dependency; the phase-01 `internal/bootstrap` package does not use it. Lint and vet coverage is the same as any other stdlib import.
+
+### Cross-references
+
+- **SPEC §5.4** — cluster manager + LB interface specification.
+- **ADR-0026** — ready-sentinel format change (introduces the per-listener line format, referenced here only for the cross-ADR link to "per-worker LB state").
+- **BEHAVIOR_CONTRACT.md `## TCP proxy`** (added by phase-02 Task 8) — codifies that LB sequence is NOT a differential dimension.
+
+---
