@@ -267,7 +267,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 
 ## Task 9 — Fixture 0001-tcp-proxy-rr: bootstraps + driver + AssertDistribution [ADR-0027]
 
-**Commits:** <sha>
+**Commits:** 9fc9be8
 **Notes:** Created test/fixtures/0001-tcp-proxy-rr/{envoy.yaml, envoy-go.yaml, expectations.yaml, README.md, driver/driver.go, driver/driver_test.go}. Driver declares BackendCount=3, SubjectListenerName=l_tcp, ReferenceListenerPort=15001, implements DistributionAsserter (per-proxy exact [3,3,3] over 9 requests). Extracted phase-01 probeReady into test/helpers.HTTPGetReadyRaw (shared by fixtures 0000 + 0001 — ADR-0027). Added blank import in test/differential/runner_test.go. ADR-0027 codifies STRICT_DNS (ref) / STATIC (subj) divergence. 4 driver_test.go cases pass; -short test suite all green.
 **Outputs:**
 ```
