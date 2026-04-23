@@ -824,3 +824,139 @@ fuzz: elapsed: 31s, execs: 1024405 (0/sec), new interesting: 162 (total: 518)
 PASS
 ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.073s
 ```
+
+## Verification
+
+Re-runs SPEC §3 phase-done gates a–e AS IF on CI from a clean shell (`go clean -testcache` before gates 3 and 4; gate 5 drives its own fresh coverage gather). Local-run baseline is the Task 17 block immediately above (commit `f43f66f`); the outputs below are the verification-session evidence required by `STATE.md` `lifecycle-state: 4` → `5`. Gate (f) REVIEW is state-machine step 5 and is NOT run here.
+
+**Branch / worktree:** `phase/01-static-bootstrap-config-impl` in `.worktrees/phase-01-static-bootstrap-config-impl/` at parent commit `cb02d80`.
+
+**Toolchain:** `go version go1.26.2 linux/amd64`; `golangci-lint has version v1.64.8` (matches `.github/workflows/ci.yml` pin); Docker Server `28.1.1` (API `1.43`). Local Go is newer than CI's `go-version: '1.23'` — the PASS below is therefore a *local* re-prove, not a guarantee CI's 1.23 toolchain will agree. CI remains the authority; this session satisfies the exit contract's "re-run on a clean shell" requirement.
+
+**Outputs (verbatim):**
+
+```
+$ go clean -testcache && echo testcache cleaned
+testcache cleaned
+
+$ go vet ./...
+[exit=0]
+
+$ golangci-lint run ./...
+[exit=0]
+
+$ go test ./... -timeout 10m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.539s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.038s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.007s
+?   	github.com/esalaine/envoy-go/internal/cluster	[no test files]
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+?   	github.com/esalaine/envoy-go/internal/listener	[no test files]
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	2.564s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+[exit=0]
+
+$ go clean -testcache && go test ./test/differential/... -timeout 5m -v
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+2026/04/23 04:39:21 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: cf3baacfea97d0694554f25f2dc13317d8b0ba75c3dab43b0c5993c4d1b6b27b
+  Test ProcessID: ef4258af-e928-4c24-ac17-ae1fd7505faa
+2026/04/23 04:39:21 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/23 04:39:21 ✅ Container created: a9a6527950ac
+2026/04/23 04:39:21 🐳 Starting container: a9a6527950ac
+2026/04/23 04:39:21 ✅ Container started: a9a6527950ac
+2026/04/23 04:39:21 🚧 Waiting for container id a9a6527950ac image: testcontainers/ryuk:0.6.0. Waiting for: &{Port:8080/tcp timeout:<nil> PollInterval:100ms}
+2026/04/23 04:39:21 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/23 04:39:21 ✅ Container created: 2be5b00e343b
+2026/04/23 04:39:21 🐳 Starting container: 2be5b00e343b
+2026/04/23 04:39:21 ✅ Container started: 2be5b00e343b
+2026/04/23 04:39:21 🚧 Waiting for container id 2be5b00e343b image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0xdec7611d210 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x94e740 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/23 04:39:22 🐳 Terminating container: 2be5b00e343b
+2026/04/23 04:39:22 🚫 Container terminated: 2be5b00e343b
+--- PASS: TestReferenceProxy_Starts (0.87s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.48s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+2026/04/23 04:39:22 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/23 04:39:22 ✅ Container created: 134da30b3576
+2026/04/23 04:39:22 🐳 Starting container: 134da30b3576
+2026/04/23 04:39:22 ✅ Container started: 134da30b3576
+2026/04/23 04:39:22 🚧 Waiting for container id 134da30b3576 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0xdec75e97938 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862b20 ResponseMatcher:0x94e740 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/23 04:39:23 🐳 Terminating container: 134da30b3576
+2026/04/23 04:39:23 🚫 Container terminated: 134da30b3576
+--- PASS: TestDifferential (1.16s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.16s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.598s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+[exit=0]
+
+$ go test ./internal/bootstrap/ -fuzz=FuzzBootstrapLoad -fuzztime=30s -run=^$
+fuzz: elapsed: 0s, gathering baseline coverage: 0/518 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 518/518 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 53773 (17922/sec), new interesting: 10 (total: 528)
+fuzz: elapsed: 6s, execs: 297921 (81391/sec), new interesting: 56 (total: 574)
+fuzz: elapsed: 9s, execs: 437703 (46586/sec), new interesting: 81 (total: 599)
+fuzz: elapsed: 12s, execs: 547612 (36643/sec), new interesting: 98 (total: 616)
+fuzz: elapsed: 15s, execs: 600392 (17585/sec), new interesting: 99 (total: 617)
+fuzz: elapsed: 18s, execs: 887295 (95676/sec), new interesting: 106 (total: 624)
+fuzz: elapsed: 21s, execs: 1107850 (73515/sec), new interesting: 110 (total: 628)
+fuzz: elapsed: 24s, execs: 1306561 (66236/sec), new interesting: 115 (total: 633)
+fuzz: elapsed: 27s, execs: 1446175 (46534/sec), new interesting: 116 (total: 634)
+fuzz: elapsed: 30s, execs: 1446175 (0/sec), new interesting: 116 (total: 634)
+fuzz: elapsed: 31s, execs: 1446175 (0/sec), new interesting: 116 (total: 634)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.075s
+[exit=0]
+```
+
+**Gate-by-gate verdict:**
+
+| Gate | SPEC §3 requirement | This session | Verdict |
+|---|---|---|---|
+| (a) `go vet ./...` clean | exit 0, empty | exit 0, empty | green |
+| (b) `golangci-lint run ./...` clean | exit 0, empty | exit 0, empty | green |
+| (c) `go test ./... -timeout 10m` clean | all `ok`, zero `FAIL` | all `ok`, zero `FAIL` | green |
+| (d) differential `-v` includes `--- PASS: TestDifferential/0000-tcp-echo` | required | `--- PASS: TestDifferential/0000-tcp-echo (1.16s)` | green |
+| (e) fuzz 30s clean — no panics, zero new crashes, final `PASS` | required | final `PASS`, `ok … 31.075s`, no `new crashes`, no panics | green |
+
+**CI workflow validation** (`.github/workflows/ci.yml`, additional check per `STATE.md` scope):
+
+```
+$ python3 -c 'import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); jobs=list(d["jobs"].keys()); print("jobs:", jobs); [print(j, "needs:", d["jobs"][j].get("needs")) for j in jobs]' .github/workflows/ci.yml
+jobs: ['lint-vet-test', 'differential', 'fuzz-bootstrap']
+lint-vet-test needs: None
+differential needs: lint-vet-test
+fuzz-bootstrap needs: lint-vet-test
+```
+
+YAML parses (`yaml.safe_load` did not raise). The `fuzz-bootstrap` job's `needs: lint-vet-test` resolves to an existing job in the same file (as does `differential`'s). Both Task-6 check conditions — (a) YAML parses, (b) `needs:` dependency resolves — are satisfied.
+
+**Exit:** all five gates green, CI YAML valid. STATE.md advances to `lifecycle-state: 5` with `next-skill: superpowers:requesting-code-review` per the exit contract.
