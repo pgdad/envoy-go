@@ -396,3 +396,184 @@ $ go test ./test/differential/ -v -timeout=10m
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	3.648s
 ```
+
+## Verification
+
+Re-runs SPEC §3 phase-done gates a–e AS IF on CI from a clean shell
+(`go clean -testcache` before the combined run and again before the `-v`
+differential run; fuzz runs gather their own fresh coverage). Local-run
+baseline is the Task 10 block immediately above (commit `1a2cf90`, with
+the ADR-0028 determinism fix in `40464d2` preceding it); the outputs
+below are the verification-session evidence required by `STATE.md`
+`lifecycle-state: 4` → `5`. Gate (c) is vacuously green per SPEC §3 row
+(c) (no conformance suite applies to phase 02); gate (f) REVIEW is
+state-machine step 5 and is NOT run here.
+
+**Branch / worktree:** `phase/02-tcp-proxy-impl` in
+`.worktrees/phase-02-tcp-proxy-impl/` at parent commit `af59456`
+(STATE.md lifecycle-state-4 marker). No code, fixture, or ADR changes
+are made by this session — only `PROGRESS.md` (this Verification
+section) and `STATE.md` (lifecycle-state advance to 5) are written.
+
+**Toolchain:** `go version go1.26.2 linux/amd64`;
+`golangci-lint has version v1.64.8` (matches `.github/workflows/ci.yml`
+pin); Docker Engine `28.4.0` with `envoyproxy/envoy:v1.37.2` image
+(digest `sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`,
+per ADR-0008 and testcontainers). Local Go is newer than CI's pinned
+toolchain — the PASS below is therefore a *local* re-prove, not a
+guarantee CI's toolchain will agree. CI remains the authority; this
+session satisfies the BOOTSTRAP §5 state-4 exit contract's "quote all
+command outputs into PROGRESS.md" requirement.
+
+**Outputs (verbatim):**
+
+```
+$ git rev-parse HEAD
+af5945626a02739f8f38f2670077e7c2cca57f29
+
+$ go clean -testcache && echo testcache cleaned
+testcache cleaned
+
+$ go build ./...
+[exit=0]
+
+$ go vet ./...
+[exit=0]
+
+$ golangci-lint run ./...
+[exit=0]
+
+$ go test ./... -timeout 10m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.568s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.039s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.007s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.004s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.005s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	0.005s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	3.714s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.003s
+[exit=0]
+
+$ go test ./internal/bootstrap/ -run "^TestNothing$" -fuzz=FuzzBootstrapLoad -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/711 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 602/711 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 711/711 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 278061 (92561/sec), new interesting: 32 (total: 743)
+fuzz: elapsed: 9s, execs: 452004 (57993/sec), new interesting: 47 (total: 758)
+fuzz: elapsed: 12s, execs: 546755 (31585/sec), new interesting: 65 (total: 776)
+fuzz: elapsed: 15s, execs: 597971 (17069/sec), new interesting: 66 (total: 777)
+fuzz: elapsed: 18s, execs: 730645 (44226/sec), new interesting: 66 (total: 777)
+fuzz: elapsed: 21s, execs: 730645 (0/sec), new interesting: 66 (total: 777)
+fuzz: elapsed: 24s, execs: 865053 (44840/sec), new interesting: 68 (total: 779)
+fuzz: elapsed: 27s, execs: 876995 (3981/sec), new interesting: 68 (total: 779)
+fuzz: elapsed: 30s, execs: 1138604 (87164/sec), new interesting: 70 (total: 781)
+fuzz: elapsed: 31s, execs: 1138604 (0/sec), new interesting: 70 (total: 781)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.079s
+[exit=0]
+
+$ go test ./internal/filter/tcpproxy/ -run "^TestNothing$" -fuzz=FuzzTcpProxyFilter -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/390 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 390/390 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 109233 (36408/sec), new interesting: 0 (total: 390)
+fuzz: elapsed: 6s, execs: 753292 (214627/sec), new interesting: 6 (total: 396)
+fuzz: elapsed: 9s, execs: 1377183 (207906/sec), new interesting: 11 (total: 401)
+fuzz: elapsed: 12s, execs: 1962901 (195325/sec), new interesting: 18 (total: 408)
+fuzz: elapsed: 15s, execs: 2512935 (183328/sec), new interesting: 26 (total: 416)
+fuzz: elapsed: 18s, execs: 3114583 (200605/sec), new interesting: 34 (total: 424)
+fuzz: elapsed: 21s, execs: 3601728 (162361/sec), new interesting: 39 (total: 429)
+fuzz: elapsed: 24s, execs: 4198465 (198920/sec), new interesting: 48 (total: 438)
+fuzz: elapsed: 27s, execs: 4853716 (218187/sec), new interesting: 55 (total: 445)
+fuzz: elapsed: 30s, execs: 5494050 (213680/sec), new interesting: 60 (total: 450)
+fuzz: elapsed: 31s, execs: 5494050 (0/sec), new interesting: 60 (total: 450)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.051s
+[exit=0]
+
+$ go clean -testcache && go test ./test/differential/ -v -timeout=10m
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+2026/04/23 17:15:30 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 1a2de0e5f7955537d5f05703aa3278349e7f0dbe125f83d3a4123d88a3d5ce0c
+  Test ProcessID: 2e8001ea-f136-44a2-a2a1-ca4dfbf9e6a4
+2026/04/23 17:15:30 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/23 17:15:30 ✅ Container created: a27b57474a78
+2026/04/23 17:15:30 🐳 Starting container: a27b57474a78
+2026/04/23 17:15:31 ✅ Container started: a27b57474a78
+2026/04/23 17:15:31 🚧 Waiting for container id a27b57474a78 image: testcontainers/ryuk:0.6.0. Waiting for: &{Port:8080/tcp timeout:<nil> PollInterval:100ms}
+2026/04/23 17:15:31 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/23 17:15:31 ✅ Container created: 08ce5c05fd77
+2026/04/23 17:15:31 🐳 Starting container: 08ce5c05fd77
+2026/04/23 17:15:31 ✅ Container started: 08ce5c05fd77
+2026/04/23 17:15:31 🚧 Waiting for container id 08ce5c05fd77 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x36c238495480 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862c20 ResponseMatcher:0x950360 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/23 17:15:31 🐳 Terminating container: 08ce5c05fd77
+2026/04/23 17:15:31 🚫 Container terminated: 08ce5c05fd77
+--- PASS: TestReferenceProxy_Starts (0.88s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.52s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+2026/04/23 17:15:32 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/23 17:15:32 ✅ Container created: 3445b0577f54
+2026/04/23 17:15:32 🐳 Starting container: 3445b0577f54
+2026/04/23 17:15:32 ✅ Container started: 3445b0577f54
+2026/04/23 17:15:32 🚧 Waiting for container id 3445b0577f54 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x36c238494168 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862c20 ResponseMatcher:0x950360 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/23 17:15:33 🐳 Terminating container: 3445b0577f54
+2026/04/23 17:15:33 🚫 Container terminated: 3445b0577f54
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+2026/04/23 17:15:33 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/23 17:15:33 ✅ Container created: 78dba93d0f84
+2026/04/23 17:15:33 🐳 Starting container: 78dba93d0f84
+2026/04/23 17:15:33 ✅ Container started: 78dba93d0f84
+2026/04/23 17:15:33 🚧 Waiting for container id 78dba93d0f84 image: envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd. Waiting for: &{timeout:0x36c2380f7880 Port:9901/tcp Path:/ready StatusCodeMatcher:0x862c20 ResponseMatcher:0x950360 UseTLS:false AllowInsecure:false TLSConfig:<nil> Method:GET Body:<nil> PollInterval:100ms UserInfo:}
+2026/04/23 17:15:34 🐳 Terminating container: 78dba93d0f84
+2026/04/23 17:15:34 🚫 Container terminated: 78dba93d0f84
+--- PASS: TestDifferential (2.20s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.10s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.11s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	3.673s
+[exit=0]
+```
+
+**Gate-by-gate verdict:**
+
+| Gate | SPEC §3 requirement | This session | Verdict |
+|---|---|---|---|
+| (a) new fixture `0001-tcp-proxy-rr` green (byte-exact + distribution [3,3,3]) | required | `--- PASS: TestDifferential/0001-tcp-proxy-rr (1.11s)` within verbose `go test ./test/differential/` + embedded per-proxy AssertDistribution satisfied by fixture driver (enforced inside the test body, no failure reported) | green |
+| (b) pre-existing fixture `0000-tcp-echo` still green | required | `--- PASS: TestDifferential/0000-tcp-echo (1.10s)` within same run, no regression | green |
+| (c) conformance suites pass | N/A per SPEC §3 row (c) (h2spec/h3spec/grpc all later phases) | not executed — no suite applies | vacuously green |
+| (d) fuzz targets clean at 30s CI budget | `FuzzTcpProxyFilter` + `FuzzBootstrapLoad` both clean, no panics, no new crashes | both ended with `PASS`, `ok … 31.079s` / `ok … 31.051s`; no `new crashes`, no `--- FAIL` | green |
+| (e) `go vet`, `golangci-lint run`, `go test ./...` clean (+ `go build ./...` per Task-10 convention) | all exit 0, zero `FAIL` | build/vet/lint all `[exit=0]` empty; test run lists 10 `ok` packages and 11 `no test files` notices, zero `FAIL`, `[exit=0]` | green |
+| (f) `REVIEW.md` approved | deferred to state 5 per SKILL_ROUTING.md | not executed here | deferred |
+
+All executable phase-02 gates are green at `af59456`. Verification
+complete; advance STATE.md to lifecycle-state 5 and invoke
+`superpowers:requesting-code-review` next session.
