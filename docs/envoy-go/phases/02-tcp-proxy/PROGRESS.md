@@ -71,7 +71,7 @@ $ golangci-lint run ./internal/cluster/
 
 ## Task 3 — internal/cluster.Manager: build-time materialisation
 
-**Commits:** <sha — filled by SHA-fill commit>
+**Commits:** 958c059cf099e71db0d5114d7e40ebfa54fb7231
 **Notes:** Created `internal/cluster/manager.go` and `internal/cluster/manager_test.go` per PLAN §Task 3. TDD: 11 `TestManager_*` tests written first (Step 1), FAILed as expected (Step 2, undefined `NewManager`/`Manager`), PASS after implementation (Step 4, 15 tests total: 4 RR + 11 Manager). `manager.go` is verbatim from PLAN with two US-locale spelling corrections (`materialised`→`materialized`, `materialises`→`materializes`, matching Task 2 precedent). Removed both `//nolint:unused` directives from `cluster.go` (`defaultConnectTimeout` and `Cluster.endpoints`), which are now consumed by `buildCluster` in `manager.go`. Lint + vet + full build clean.
 **Outputs:**
 ```
