@@ -142,7 +142,7 @@ $ golangci-lint run ./internal/filter/tcpproxy/
 
 ## Task 6 — internal/listener.Manager: multi-listener build + Start/Stop + inline registry
 
-**Commits:** <sha>
+**Commits:** 4151926
 **Notes:** Created internal/listener/{doc.go, manager.go, manager_test.go} per PLAN §Task 6. ADR-0025 codifies phase-02 filter-chain subset. 12 tests: 2 happy + 10 error/unwind. Inline filter registry maps single URL (tcp_proxy.TypeURL) to its constructor. Divergence from verbatim PLAN: acceptLoop signature takes an explicit `net.Listener` argument (capturing `bl.socket` at launch time) to avoid a nil-pointer race when Stop() runs concurrently with goroutine startup; `ListenerInfo` renamed to `Info` (revive stutter lint); British spellings corrected to US (`materialises`→`materializes`, `behaviour`→`behavior`, `materialised`→`materialized`, `Cancelling`→`Canceling`, `cancelled`→`canceled`).
 **Outputs:**
 ```
