@@ -21,20 +21,50 @@ func init() {
 
 type echoDriver struct{}
 
-func (echoDriver) ReferenceListenerPort() int { return refContainerListenerPort }
+func (echoDriver) BackendCount() int           { return 1 }
+func (echoDriver) SubjectListenerName() string { return "l_tcp" }
+func (echoDriver) ReferenceListenerPort() int  { return refContainerListenerPort }
 
-func (echoDriver) ReferenceBootstrap() string {
-	// host.docker.internal resolves to the host gateway from inside the
-	// Envoy container. We bake the bootstrap at registration with a literal
-	// `port_value: 0` placeholder; the runner replaces it with the actual
-	// backend port via strings.Replace before starting the container
-	// (test/differential/runner_test.go). Phase 01 replaces this with
-	// proper templating once a config loader exists.
-	return refBootstrap
+func (echoDriver) ReferenceBootstrap(backendPorts []int) string {
+	if len(backendPorts) != 1 {
+		panic(fmt.Sprintf("0000-tcp-echo: expected 1 backend port, got %d", len(backendPorts)))
+	}
+	return fmt.Sprintf(`admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+static_resources:
+  listeners:
+    - name: l_tcp
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 15000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+  clusters:
+    - name: c_echo
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: host.docker.internal
+                      port_value: %d
+`, backendPorts[0])
 }
 
-func (echoDriver) SubjectConfig(refListenerPort, subjListenerPort, backendPort, subjAdminPort int) string {
-	_ = refListenerPort // phase 01 does not wire the reference listener port into the subject bootstrap
+func (echoDriver) SubjectConfig(_, subjListenerPort int, backendPorts []int, subjAdminPort int) string {
+	if len(backendPorts) != 1 {
+		panic(fmt.Sprintf("0000-tcp-echo: expected 1 backend port, got %d", len(backendPorts)))
+	}
 	return fmt.Sprintf(`
 node: { id: envoy-go-subject-0000, cluster: envoy-go-differential }
 admin:
@@ -56,6 +86,7 @@ static_resources:
     - name: c_echo
       type: STATIC
       connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
       load_assignment:
         cluster_name: c_echo
         endpoints:
@@ -63,7 +94,7 @@ static_resources:
               - endpoint:
                   address:
                     socket_address: { address: 127.0.0.1, port_value: %d }
-`, subjAdminPort, subjListenerPort, backendPort)
+`, subjAdminPort, subjListenerPort, backendPorts[0])
 }
 
 func (echoDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error) {
@@ -72,13 +103,17 @@ func (echoDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes
 	for n := 0; n < 10; n++ {
 		payload = append(payload, []byte(fmt.Sprintf("ping-%d-%s\n", n, uid))...)
 	}
-	refBytes, err = helpers.TCPRoundTrip(ctx, refAddr, payload, time.Second)
-	if err != nil {
-		return nil, nil, fmt.Errorf("ref drive: %w", err)
+	if refAddr != "" {
+		refBytes, err = helpers.TCPRoundTrip(ctx, refAddr, payload, time.Second)
+		if err != nil {
+			return nil, nil, fmt.Errorf("ref drive: %w", err)
+		}
 	}
-	subjBytes, err = helpers.TCPRoundTrip(ctx, subjAddr, payload, time.Second)
-	if err != nil {
-		return nil, nil, fmt.Errorf("subj drive: %w", err)
+	if subjAddr != "" {
+		subjBytes, err = helpers.TCPRoundTrip(ctx, subjAddr, payload, time.Second)
+		if err != nil {
+			return nil, nil, fmt.Errorf("subj drive: %w", err)
+		}
 	}
 	return refBytes, subjBytes, nil
 }
@@ -135,43 +170,3 @@ func randHex(nBytes int) string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
-
-// refBootstrap is the reference Envoy bootstrap with a placeholder
-// `port_value: 0` that the runner replaces with the backend port at test
-// time. The string-replacement is intentional and trivial; phase 01 replaces
-// this with proper templating once a config loader exists.
-const refBootstrap = `admin:
-  address:
-    socket_address: { address: 0.0.0.0, port_value: 9901 }
-static_resources:
-  listeners:
-    - name: l_tcp
-      address:
-        socket_address: { address: 0.0.0.0, port_value: 15000 }
-      filter_chains:
-        - filters:
-            - name: envoy.filters.network.tcp_proxy
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                stat_prefix: ingress_tcp
-                cluster: c_echo
-  clusters:
-    - name: c_echo
-      type: STRICT_DNS
-      connect_timeout: 1s
-      dns_lookup_family: V4_ONLY
-      load_assignment:
-        cluster_name: c_echo
-        endpoints:
-          - lb_endpoints:
-              - endpoint:
-                  address:
-                    socket_address:
-                      address: host.docker.internal
-                      port_value: 0
-`
-
-// The runner (test/differential/runner_test.go) performs a strings.Replace
-// on `port_value: 0` before passing the bootstrap to StartReferenceProxy.
-// The placeholder is the per-fixture contract; the substitution is trivial
-// today and will be replaced by proper templating in phase 01.

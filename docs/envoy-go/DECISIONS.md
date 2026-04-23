@@ -702,3 +702,89 @@ Ignoring `listener_filters` (rather than erroring on it) is a deliberate asymmet
 - **Phase 07 — filter chain framework** — eventual superseder of this ADR.
 
 ---
+
+## ADR-0022: Retire phase-01 first-only extractors; introduce listener and cluster managers
+
+**Status:** Accepted
+**Date:** 2026-04-23
+**Doctrine:** D-3.5
+
+### Context
+
+Phase 01 landed `internal/bootstrap.FirstListenerSocket` and `internal/bootstrap.FirstClusterEndpointSocket` as a minimal extractor pair so the phase-01 subject could run with exactly one listener pointing at exactly one upstream endpoint. This was never ADR'd — the "exactly one" shape was a phase-01 simplification documented only in the `First*` doc-comments (`internal/bootstrap/bootstrap.go:74-134`). Phase 02 ships the first real dataplane: N listeners, N clusters, each listener wired to a terminal filter, each cluster a pool of endpoints. The `First*` extractors cannot represent this; either they expand (into full iteration walkers) or they are retired.
+
+### Decision
+
+The `First*` extractors are retired and deleted. Bootstrap traversal moves into the managers that own the concepts:
+
+- `internal/listener.NewManager` walks `static_resources.listeners[]` (SPEC §5.2, ADR-0025).
+- `internal/cluster.NewManager` walks `static_resources.clusters[]` (SPEC §5.4, ADR-0024).
+
+`internal/bootstrap.AdminSocket` is NOT retired — admin remains a single global entity; there is exactly one `admin` in a bootstrap and a top-level extractor for it is still the right surface. `internal/bootstrap.Load` is also unchanged.
+
+The `_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"` blank import in `internal/bootstrap/bootstrap.go` stays — the filter package now also imports it via its direct typed import, but the bootstrap-side blank import costs nothing and keeps the bootstrap loader usable by tooling that does not pull in the filter package.
+
+### Rationale
+
+Phase 01's "exactly one X" discipline was implicit — callers were expected to read the `First*` doc-comments and not pass bootstraps with more than one listener or cluster. Phase 02 needs N-of-each and would have to either (a) add `AllListenerSockets(bs) []Socket` alongside `FirstListenerSocket` (growing the bootstrap package's surface without owning the cluster/listener abstractions), or (b) move walking into the managers that already own validation (filter-chain subset rules for listeners per ADR-0025; STATIC / ROUND_ROBIN rules for clusters per ADR-0024). Option (b) is the clean separation: `internal/bootstrap/` parses YAML→proto; `internal/listener/` + `internal/cluster/` impose phase-02 semantics and produce dataplane objects. No function in `internal/bootstrap/` owns domain validation after this ADR.
+
+### Consequences
+
+- `cmd/envoy-go/main.go` calls `cluster.NewManager(bs)` and `listener.NewManager(bs, cm)` directly; the bootstrap package is consulted only for `Load` (parse) and `AdminSocket` (admin-address lookup).
+- `internal/bootstrap/bootstrap_test.go` loses the `TestFirstListenerSocket_*` and `TestFirstClusterEndpointSocket_*` groups. Remaining coverage: `TestLoad_*`, `TestAdminSocket_*`.
+- No prior ADR is superseded — the first-only discipline was never ADR'd. This is the ADR that names and retires it.
+- Any tool or test that imported the `First*` symbols now fails to compile. The only pre-Task-7 caller was `cmd/envoy-go/main.go`; that file is rewritten in the same commit.
+
+### Cross-references
+
+- **SPEC §5.2** — listener manager responsibility.
+- **SPEC §5.4** — cluster manager responsibility.
+- **ADR-0024** — per-cluster atomic.Uint64 RR counter scope.
+- **ADR-0025** — phase-02 filter-chain subset.
+- **ADR-0026** — ready-sentinel format change (lands in same Task-7 commit).
+
+---
+
+## ADR-0026: Ready-sentinel format change — per-listener line + terminal line; clean break from phase 00/01 single-line format
+
+**Status:** Accepted
+**Date:** 2026-04-23
+**Doctrine:** D-3.5
+**Supersedes:** (informal) phase-00 sentinel contract encoded in cmd/envoy-go/main.go:79 comment and test/differential/harness.go:readyAddr
+
+### Context
+
+Phase 00 and 01 emitted a single ready sentinel line on stdout: `envoy-go ready on <host:port>\n`. The harness parsed it via `readyAddr(line) string` and `SubjectProxy` exposed a no-arg `ListenerAddr() string`. This shape assumes exactly one listener — fine for phase 00 / 01, broken for phase 02 where a fixture may declare N listeners and the harness needs to look each one up by name.
+
+### Decision
+
+`cmd/envoy-go/main.go` emits, after every listener has bound, one line per listener `envoy-go listener <name> ready on <host:port>\n` followed by exactly one terminal line `envoy-go ready\n`. The phase-00/01 single-line format is retired — no backward-compat parser, no transitional emission, no deprecation grace period.
+
+The harness's `readyAddr(line) string` parser is replaced by `readyListenerAddrs(ctx, reader) (map[string]string, error)` that walks lines until the terminal sentinel, collecting every `envoy-go listener <name> ready on <addr>` line into a name→addr map. `SubjectProxy.ListenerAddr() string` (no-arg) becomes `ListenerAddr(name string) string`.
+
+The `test/differential/fixture.Driver` interface gains `SubjectListenerName() string` so the runner knows which listener's address to look up per fixture.
+
+### Rationale
+
+Per SPEC §10 #5, the harness is the only known consumer of the sentinel format. Retaining a transitional dual-format emitter would couple `cmd/envoy-go/main.go` to its own retired contract for no benefit, and would force every subsequent phase's main to preserve both formats. A clean break is simpler code, simpler test setup, and simpler ADR surface.
+
+Per D-3.4, cross-session decisions must live on disk. The format change is a cross-session decision (the harness at session N consumes the subject's output at session N; any mismatch at session boundaries is a regression). Hence the ADR.
+
+### Consequences
+
+- `cmd/envoy-go/main.go` post-Task-7: after `lm.Start` succeeds and admin is marked ready, iterate `lm.Listeners()` and `Fprintf(os.Stdout, "envoy-go listener %s ready on %s\n", info.Name, info.Addr)` for each, then `Fprintln(os.Stdout, "envoy-go ready")`.
+- `test/differential/harness.go`: `readyListenerAddrs` replaces `readyAddr`; `SubjectProxy.listenerAddrs map[string]string` replaces `listenerAddr string`; `ListenerAddr(name string) string` replaces the no-arg form.
+- `test/differential/fixture.Driver`: `SubjectListenerName() string` added.
+- `test/differential/runner_test.go`: `subj.ListenerAddr(d.SubjectListenerName())` replaces `subj.ListenerAddr()`.
+- Fixture 0000 driver: `SubjectListenerName() string { return "l_tcp" }` declared in the Task-7 commit. Fixture 0001 (Task 9) declares the same.
+- `cmd/envoy-go/main_test.go`: new test `TestEnvoyGoBinary_TwoListenerCutover` uses a two-listener bootstrap and parses both per-listener sentinels. The old single-listener `TestEnvoyGoBinary_EchoesThroughUpstream` is retired.
+- The informal phase-00 sentinel contract (embedded only in a comment at `cmd/envoy-go/main.go:79` and the implementation of `readyAddr`) is superseded. Because that contract was never ADR'd, this ADR names the supersession under the informal `(informal)` qualifier rather than referencing an ADR number.
+
+### Cross-references
+
+- **SPEC §10 #5** — settled decision on clean-break vs transitional.
+- **SPEC §5.2 / §5.7** — listener manager and cmd/envoy-go rewire.
+- **ADR-0022** — first-only extractor retirement (lands same commit).
+- **ADR-0025** — phase-02 filter-chain subset (upstream reason listeners need to be iterated at all).
+
+---

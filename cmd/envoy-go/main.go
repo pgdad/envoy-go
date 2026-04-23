@@ -1,24 +1,26 @@
-// envoy-go is the phase-01 subject binary. It loads an Envoy v3 Bootstrap
-// proto from YAML (internal/bootstrap), starts the admin /ready server
-// (internal/admin), binds a TCP listener at static_resources.listeners[0], and
-// bidirectionally io.Copy's bytes between each accepted connection and the
-// single endpoint of static_resources.clusters[0]. Phase 00's minimal YAML
-// schema is retired (see ADR-0021 superseding ADR-0007). Phase 02 retires
-// this binary and replaces it with a real listener manager + TCP proxy filter
-// + cluster manager.
+// envoy-go is the phase-02 subject binary. It loads an Envoy v3 Bootstrap
+// proto from YAML (internal/bootstrap), builds the cluster manager
+// (internal/cluster) and the listener manager (internal/listener) which wires
+// each listener to its terminal TCP proxy filter (internal/filter/tcpproxy),
+// starts the admin /ready server (internal/admin), binds every listener, marks
+// admin ready, prints per-listener + terminal ready sentinels, and blocks on
+// SIGINT. The phase-00 ad-hoc TCP pump is gone — its byte-level logic now
+// lives in internal/filter/tcpproxy/filter.go (ADR-0023).
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"os"
-	"sync"
+	"os/signal"
+	"syscall"
 
 	"github.com/esalaine/envoy-go/internal/admin"
 	"github.com/esalaine/envoy-go/internal/bootstrap"
+	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/listener"
 )
 
 func main() {
@@ -42,78 +44,39 @@ func main() {
 	if err != nil {
 		log.Fatalf("extract admin: %v", err)
 	}
-	listenerHost, listenerPort, err := bootstrap.FirstListenerSocket(bs)
-	if err != nil {
-		log.Fatalf("extract listener: %v", err)
-	}
-	upstreamHost, upstreamPort, err := bootstrap.FirstClusterEndpointSocket(bs)
-	if err != nil {
-		log.Fatalf("extract cluster endpoint: %v", err)
-	}
-
 	adminAddr := fmt.Sprintf("%s:%d", adminHost, adminPort)
-	listenAddr := fmt.Sprintf("%s:%d", listenerHost, listenerPort)
-	upstreamAddr := fmt.Sprintf("%s:%d", upstreamHost, upstreamPort)
+
+	cm, err := cluster.NewManager(bs)
+	if err != nil {
+		log.Fatalf("cluster manager: %v", err)
+	}
 
 	admSrv := admin.New(adminAddr)
-	// The harness records admin addr from the pre-allocated value threaded
-	// through SubjectProxy, so main.go discards Start's bound-addr return —
-	// preserving the phase-00 ready sentinel format verbatim keeps
-	// harness.readyAddr's parse logic unchanged.
 	if _, err := admSrv.Start(); err != nil {
 		log.Fatalf("admin start %s: %v", adminAddr, err)
 	}
 	defer func() { _ = admSrv.Close() }()
 
-	ln, err := net.Listen("tcp", listenAddr)
+	lm, err := listener.NewManager(bs, cm)
 	if err != nil {
-		log.Fatalf("listen %s: %v", listenAddr, err)
+		log.Fatalf("listener manager: %v", err)
 	}
-	defer func() { _ = ln.Close() }()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if err := lm.Start(ctx); err != nil {
+		log.Fatalf("listener start: %v", err)
+	}
+	defer lm.Stop()
 
 	admSrv.MarkReady()
 
-	// Ready sentinel — harness contract, byte-exact from phase 00. Format is
-	// part of the harness contract; do not change without also updating
-	// test/differential/harness.go:readyAddr parsing.
-	_, _ = fmt.Fprintf(os.Stdout, "envoy-go ready on %s\n", listenAddr)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("accept: %v", err)
-			continue
-		}
-		go pump(conn, upstreamAddr)
+	// Per-listener ready sentinels + terminal sentinel (ADR-0026).
+	for _, info := range lm.Listeners() {
+		_, _ = fmt.Fprintf(os.Stdout, "envoy-go listener %s ready on %s\n", info.Name, info.Addr)
 	}
-}
+	_, _ = fmt.Fprintln(os.Stdout, "envoy-go ready")
 
-// netConn wraps net.Conn and hides the *net.TCPConn type, preventing
-// io.Copy from using the Linux splice(2) syscall optimisation. splice can
-// return 0 bytes when the source socket has data+FIN already queued, causing
-// silent data loss on loopback. Using a plain Read/Write loop via a 32 KiB
-// heap buffer is fast enough for the phase-01 test workload. (Preserved
-// verbatim from phase 00 — SPEC §5.3 requires the pump be untouched.)
-type netConn struct{ net.Conn }
-
-func pump(client net.Conn, upstreamAddr string) {
-	defer func() { _ = client.Close() }()
-	upstream, err := net.Dial("tcp", upstreamAddr)
-	if err != nil {
-		log.Printf("dial upstream %s: %v", upstreamAddr, err)
-		return
-	}
-	defer func() { _ = upstream.Close() }()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = io.Copy(netConn{upstream}, netConn{client}); halfClose(upstream) }()
-	go func() { defer wg.Done(); _, _ = io.Copy(netConn{client}, netConn{upstream}); halfClose(client) }()
-	wg.Wait()
-}
-
-func halfClose(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
-	}
+	<-ctx.Done()
 }

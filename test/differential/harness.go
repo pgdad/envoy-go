@@ -53,18 +53,26 @@ func parseEnvoyTarget(r io.Reader) (*EnvoyPin, error) {
 // by surfacing failures, not retrying.
 const readyTimeout = 30 * time.Second
 
-// scanForLine reads lines from r until one of `needle` substrings appears or
-// ctx is done. Returns the matching full line.
-func scanForLine(ctx context.Context, r io.Reader, needle string) (string, error) {
+// readyListenerAddrs reads lines from r until the terminal `envoy-go ready`
+// sentinel is observed, collecting every `envoy-go listener <name> ready on
+// <addr>` line into a name→addr map. ADR-0026 codifies the phase-02 sentinel
+// contract.
+func readyListenerAddrs(ctx context.Context, r io.Reader) (map[string]string, error) {
 	br := bufio.NewReader(r)
-	out := make(chan string, 1)
+	out := make(chan map[string]string, 1)
 	errCh := make(chan error, 1)
 	go func() {
+		addrs := map[string]string{}
+		re := regexp.MustCompile(`^envoy-go listener (\S+) ready on (\S+)$`)
 		for {
 			line, err := br.ReadString('\n')
-			if strings.Contains(line, needle) {
-				out <- line
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed == "envoy-go ready" {
+				out <- addrs
 				return
+			}
+			if m := re.FindStringSubmatch(trimmed); m != nil {
+				addrs[m[1]] = m[2]
 			}
 			if err != nil {
 				errCh <- err
@@ -73,12 +81,12 @@ func scanForLine(ctx context.Context, r io.Reader, needle string) (string, error
 		}
 	}()
 	select {
-	case line := <-out:
-		return line, nil
+	case a := <-out:
+		return a, nil
 	case err := <-errCh:
-		return "", err
+		return nil, err
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
@@ -153,10 +161,10 @@ func (r *ReferenceProxy) Stop(ctx context.Context) error {
 
 // SubjectProxy is the envoy-go subprocess managed by the harness.
 type SubjectProxy struct {
-	cmd          *exec.Cmd
-	listenerAddr string
-	adminAddr    string
-	tmpDir       string
+	cmd           *exec.Cmd
+	listenerAddrs map[string]string
+	adminAddr     string
+	tmpDir        string
 }
 
 // StartSubjectProxy builds cmd/envoy-go from repoRoot, writes cfg to a temp
@@ -197,27 +205,21 @@ func StartSubjectProxy(ctx context.Context, repoRoot, cfg, subjAdminAddr string)
 
 	readyCtx, cancel := context.WithTimeout(ctx, readyTimeout)
 	defer cancel()
-	line, err := scanForLine(readyCtx, stdout, "envoy-go ready on ")
+	addrs, err := readyListenerAddrs(readyCtx, stdout)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
 		_ = os.RemoveAll(tmp)
 		return nil, fmt.Errorf("subject ready: %w", err)
 	}
-	addr := readyAddr(line)
-	if addr == "" {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		_ = os.RemoveAll(tmp)
-		return nil, fmt.Errorf("subject ready line malformed: %q", line)
-	}
 
-	return &SubjectProxy{cmd: cmd, listenerAddr: addr, adminAddr: subjAdminAddr, tmpDir: tmp}, nil
+	return &SubjectProxy{cmd: cmd, listenerAddrs: addrs, adminAddr: subjAdminAddr, tmpDir: tmp}, nil
 }
 
-// ListenerAddr returns the host:port the subject is listening on (parsed from
-// the ready sentinel).
-func (s *SubjectProxy) ListenerAddr() string { return s.listenerAddr }
+// ListenerAddr returns the host:port the subject is listening on for the
+// named listener (parsed from the per-listener ready sentinel). Returns "" if
+// the name is unknown. ADR-0026.
+func (s *SubjectProxy) ListenerAddr(name string) string { return s.listenerAddrs[name] }
 
 // AdminAddr returns the subject's admin host:port (pre-allocated by the caller
 // and interpolated into the subject bootstrap).
@@ -228,15 +230,6 @@ func (s *SubjectProxy) Stop() error {
 	_ = s.cmd.Process.Kill()
 	_, _ = s.cmd.Process.Wait()
 	return os.RemoveAll(s.tmpDir)
-}
-
-func readyAddr(line string) string {
-	const prefix = "envoy-go ready on "
-	i := strings.Index(line, prefix)
-	if i < 0 {
-		return ""
-	}
-	return strings.TrimRight(line[i+len(prefix):], "\r\n")
 }
 
 // FixtureDriver is re-exported from the fixture sub-package for callers that

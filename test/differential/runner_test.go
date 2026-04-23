@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,19 +48,34 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// 1. Backend echo on a random port. Bind to 0.0.0.0 so the reference
-	// Envoy container can reach it via host.docker.internal (which resolves
-	// to the Docker Desktop gateway IP, not 127.0.0.1).
-	backend, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("backend listen: %v", err)
+	// 1. N backends, each with its own atomic.Uint64 accept counter.
+	n := d.BackendCount()
+	if n < 1 {
+		t.Fatalf("BackendCount() returned %d; must be >=1", n)
 	}
-	defer func() { _ = backend.Close() }()
-	go acceptEcho(backend)
-	backendPort := backend.Addr().(*net.TCPAddr).Port
+	type backend struct {
+		ln      net.Listener
+		port    int
+		accepts *atomic.Uint64
+	}
+	backends := make([]*backend, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp", "0.0.0.0:0")
+		if err != nil {
+			t.Fatalf("backend[%d] listen: %v", i, err)
+		}
+		defer func(ln net.Listener) { _ = ln.Close() }(ln)
+		bo := &backend{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, accepts: new(atomic.Uint64)}
+		backends[i] = bo
+		go acceptEchoCounting(ln, bo.accepts)
+	}
+	backendPorts := make([]int, n)
+	for i, b := range backends {
+		backendPorts[i] = b.port
+	}
 
 	// 2. Reference proxy.
-	bootstrap := strings.Replace(d.ReferenceBootstrap(), "port_value: 0", fmt.Sprintf("port_value: %d", backendPort), 1)
+	bootstrap := d.ReferenceBootstrap(backendPorts)
 	ref, err := StartReferenceProxy(ctx, pin, bootstrap, d.ReferenceListenerPort())
 	if err != nil {
 		t.Fatalf("ref start: %v", err)
@@ -70,18 +86,47 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	// 3. Subject proxy.
 	subjPort := freeTCPPort(t)
 	subjAdminPort := freeTCPPort(t)
-	subjCfg := d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPort, subjAdminPort)
+	subjCfg := d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPorts, subjAdminPort)
 	subj, err := StartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
 	if err != nil {
 		t.Fatalf("subj start: %v", err)
 	}
 	defer func() { _ = subj.Stop() }()
 
-	// 4. Drive both, diff, report.
-	refBytes, subjBytes, err := d.Drive(ctx, refAddr, subj.ListenerAddr())
-	if err != nil {
-		t.Fatalf("drive: %v", err)
+	// 4. Snapshot baseline accept counts before driving ref (the reference
+	// container's admin probe during StartReferenceProxy may have triggered
+	// accepts against host.docker.internal backends; we only credit the
+	// post-baseline delta).
+	refBaseline := make([]uint64, n)
+	for i, b := range backends {
+		refBaseline[i] = b.accepts.Load()
 	}
+
+	// 5. Drive ref.
+	refBytes, _, err := d.Drive(ctx, refAddr, "")
+	if err != nil {
+		t.Fatalf("ref drive: %v", err)
+	}
+	refCounts := make([]uint64, n)
+	for i, b := range backends {
+		refCounts[i] = b.accepts.Load() - refBaseline[i]
+	}
+	subjBaseline := make([]uint64, n)
+	for i, b := range backends {
+		subjBaseline[i] = b.accepts.Load()
+	}
+
+	// 6. Drive subj.
+	_, subjBytes, err := d.Drive(ctx, "", subj.ListenerAddr(d.SubjectListenerName()))
+	if err != nil {
+		t.Fatalf("subj drive: %v", err)
+	}
+	subjCounts := make([]uint64, n)
+	for i, b := range backends {
+		subjCounts[i] = b.accepts.Load() - subjBaseline[i]
+	}
+
+	// 7. Diff response bytes.
 	v, err := CompareBytes(refBytes, subjBytes)
 	if err != nil {
 		t.Fatalf("compare: %v", err)
@@ -90,7 +135,14 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 		t.Errorf("differential mismatch:\n%s", v.HexDump)
 	}
 
-	// 5. Admin /ready observation (phase 01 addition — SPEC §5.6).
+	// 8. Optional distribution assertion.
+	if da, ok := d.(fixture.DistributionAsserter); ok {
+		if err := da.AssertDistribution(refCounts, subjCounts); err != nil {
+			t.Errorf("distribution: %v", err)
+		}
+	}
+
+	// 9. Admin /ready observation (phase 01 addition — SPEC §5.6).
 	refAdm, subjAdm, err := d.ProbeAdmin(ctx, ref.AdminAddr(), subj.AdminAddr())
 	if err != nil {
 		t.Fatalf("admin probe: %v", err)
@@ -204,12 +256,13 @@ func isNumeric(s string) bool {
 	return len(s) > 0
 }
 
-func acceptEcho(ln net.Listener) {
+func acceptEchoCounting(ln net.Listener, counter *atomic.Uint64) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return
 		}
+		counter.Add(1)
 		go func(c net.Conn) {
 			defer func() { _ = c.Close() }()
 			buf := make([]byte, 4096)

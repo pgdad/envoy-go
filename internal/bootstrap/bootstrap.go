@@ -71,64 +71,7 @@ func AdminSocket(bs *bootstrapv3.Bootstrap) (host string, port uint32, err error
 	return sa.GetAddress(), sa.GetPortValue(), nil
 }
 
-// FirstListenerSocket returns host and port of static_resources.listeners[0]
-// .address.socket_address. Errors if there are zero or more than one listener,
-// or if the listener's address is not a socket_address.
-func FirstListenerSocket(bs *bootstrapv3.Bootstrap) (host string, port uint32, err error) {
-	sr := bs.GetStaticResources()
-	if sr == nil {
-		return "", 0, fmt.Errorf("bootstrap: missing static_resources")
-	}
-	ls := sr.GetListeners()
-	if len(ls) != 1 {
-		return "", 0, fmt.Errorf("bootstrap: phase 01: expected exactly one listener, got %d", len(ls))
-	}
-	addr := ls[0].GetAddress()
-	if addr == nil {
-		return "", 0, fmt.Errorf("bootstrap: missing listener[0].address")
-	}
-	sa := addr.GetSocketAddress()
-	if sa == nil {
-		return "", 0, fmt.Errorf("bootstrap: listener[0].address is not a socket_address")
-	}
-	return sa.GetAddress(), sa.GetPortValue(), nil
-}
-
-// FirstClusterEndpointSocket returns host and port of
-// static_resources.clusters[0].load_assignment.endpoints[0].lb_endpoints[0]
-// .endpoint.address.socket_address. Errors on any "exactly one" violation.
-func FirstClusterEndpointSocket(bs *bootstrapv3.Bootstrap) (host string, port uint32, err error) {
-	sr := bs.GetStaticResources()
-	if sr == nil {
-		return "", 0, fmt.Errorf("bootstrap: missing static_resources")
-	}
-	cs := sr.GetClusters()
-	if len(cs) != 1 {
-		return "", 0, fmt.Errorf("bootstrap: phase 01: expected exactly one cluster, got %d", len(cs))
-	}
-	la := cs[0].GetLoadAssignment()
-	if la == nil {
-		return "", 0, fmt.Errorf("bootstrap: missing cluster[0].load_assignment")
-	}
-	eps := la.GetEndpoints()
-	if len(eps) != 1 {
-		return "", 0, fmt.Errorf("bootstrap: phase 01: expected exactly one endpoints entry, got %d", len(eps))
-	}
-	lbs := eps[0].GetLbEndpoints()
-	if len(lbs) != 1 {
-		return "", 0, fmt.Errorf("bootstrap: phase 01: expected exactly one lb_endpoint, got %d", len(lbs))
-	}
-	ep := lbs[0].GetEndpoint()
-	if ep == nil {
-		return "", 0, fmt.Errorf("bootstrap: missing lb_endpoint[0].endpoint")
-	}
-	addr := ep.GetAddress()
-	if addr == nil {
-		return "", 0, fmt.Errorf("bootstrap: missing endpoint.address")
-	}
-	sa := addr.GetSocketAddress()
-	if sa == nil {
-		return "", 0, fmt.Errorf("bootstrap: endpoint.address is not a socket_address")
-	}
-	return sa.GetAddress(), sa.GetPortValue(), nil
-}
+// Phase-01 `FirstListenerSocket` and `FirstClusterEndpointSocket` helpers
+// retired in phase 02 — listener and cluster traversal moved into
+// `internal/listener.Manager` and `internal/cluster.Manager` respectively
+// (ADR-0022).

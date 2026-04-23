@@ -228,3 +228,34 @@ ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.004s
 $ go vet ./internal/filter/tcpproxy/
 $ golangci-lint run ./internal/filter/tcpproxy/
 ```
+
+## Task 7 — Cutover: cmd/envoy-go rewire + harness + fixture interface + bootstrap deletions
+
+**Commits:** <sha>
+**Notes:** Atomic cutover landing ADR-0022 (retire `internal/bootstrap.First{Listener,ClusterEndpoint}Socket`; listener/cluster traversal moves into `internal/listener.Manager` and `internal/cluster.Manager`) and ADR-0026 (per-listener ready-sentinel format: one `envoy-go listener <name> ready on <addr>` line per listener followed by a terminal `envoy-go ready`; no backward-compat). `cmd/envoy-go/main.go` rewired to build `cluster.NewManager` + `listener.NewManager(bs, cm)`, start admin, `lm.Start(ctx)`, emit per-listener + terminal sentinels, block on SIGINT. The phase-00 `pump`/`halfClose`/`netConn` copies in main.go were already lifted to `internal/filter/tcpproxy/` in Task 4; Task 7 deletes the redundant copies (main.go: 119 → 80 lines). `internal/bootstrap/bootstrap.go` loses `FirstListenerSocket` (22 lines) and `FirstClusterEndpointSocket` (38 lines); `bootstrap_test.go` loses the five corresponding `TestFirst*` tests. `test/differential/harness.go` swaps `scanForLine`+`readyAddr` for `readyListenerAddrs(ctx, r) (map[string]string, error)` and `SubjectProxy.ListenerAddr(name) string`; `test/differential/fixture.Driver` gains `BackendCount() int` + `SubjectListenerName() string` and an optional `DistributionAsserter` interface; `test/differential/runner_test.go` allocates N backends with per-backend `*atomic.Uint64` counters, drives ref and subj separately (empty-string sentinel), and optionally calls `AssertDistribution`. Fixture 0000 driver rewritten for the new interface; `refBootstrap` const deleted (template now rendered inline with `fmt.Sprintf`). Net diff: -377 / +297 lines across 9 files.
+**Outputs:**
+```
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.502s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.039s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.006s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.004s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.005s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	0.005s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tls	[no test files]
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	0.060s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+```

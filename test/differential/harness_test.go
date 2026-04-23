@@ -134,7 +134,7 @@ static_resources:
 	}
 	defer func() { _ = subj.Stop() }()
 
-	if got, want := subj.ListenerAddr(), fmt.Sprintf("127.0.0.1:%d", port); got != want {
+	if got, want := subj.ListenerAddr("l_tcp"), fmt.Sprintf("127.0.0.1:%d", port); got != want {
 		t.Errorf("ListenerAddr: got %q, want %q", got, want)
 	}
 	if got, want := subj.AdminAddr(), fmt.Sprintf("127.0.0.1:%d", adminPort); got != want {
