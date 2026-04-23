@@ -309,7 +309,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
 
 ## Task 10 — All-gates green run
 
-**Commits:** 40464d2 (differential-gate fix — deterministic payloads + `--concurrency 1` [ADR-0028]); <sha> (this Task-10 PROGRESS commit)
+**Commits:** 40464d2 (differential-gate fix — deterministic payloads + `--concurrency 1` [ADR-0028]); 1a2cf90 (this Task-10 PROGRESS commit)
 **Notes:** All six SPEC §3 phase-done gates pass locally. Gate-run exposed two real bugs in the Task 7 cutover; fixed in commit 40464d2 under ADR-0028 before the final green run below. (a) Fixture `0001-tcp-proxy-rr` byte-exact response-body equivalence + per-proxy AssertDistribution exactly [3,3,3] (requires reference `--concurrency 1`). (b) Fixture `0000-tcp-echo` unchanged pass. (c) No conformance suites apply (vacuously green). (d) `FuzzBootstrapLoad` + `FuzzTcpProxyFilter` both clean at the ADR-0018 30s CI budget. (e) `go build`, `go vet`, `golangci-lint run`, `go test -short ./...` all clean. (f) deferred to review (state 5). The verification session (lifecycle state 4) will re-run these.
 **Outputs:**
 ```
