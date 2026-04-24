@@ -17,6 +17,7 @@ import (
 	"github.com/esalaine/envoy-go/test/differential/fixture"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 

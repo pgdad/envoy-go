@@ -1,0 +1,23 @@
+# Phase-03 fixture 0002-tls-tcp: differential expectations.
+#
+# response-body: byte-exact required (echo backend; each backend reflects bytes
+# verbatim, so the concatenated 18-request response — 9 per SNI — is
+# byte-equivalent across the two proxies regardless of which endpoint serves
+# which request within each SNI cluster).
+#
+# response-status / response-headers / response-trailers: N/A (TCP, not HTTP).
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses
+# path (phase-01 baseline; same allow-list as fixtures 0000 and 0001).
+#
+# Distribution assertion: per-proxy counts must equal [3,3,3]/[3,3,3] (9
+# requests per SNI / 3 endpoints each). The runner invokes it via the
+# DistributionAsserter interface; indices 0–2 correspond to c_alpha, 3–5 to
+# c_beta.
+response-body:
+  applicable: true
+  scope: byte-exact
+distribution:
+  applicable: true
+  expected: "[3,3,3]/[3,3,3]"
+  method: round-robin mod-index, 9 requests per SNI cluster, 3 endpoints each

@@ -608,3 +608,51 @@ FAIL	github.com/esalaine/envoy-go/test/differential  [pre-existing: 0002-tls-tcp
 $ golangci-lint run ./...
 (empty — clean)
 ```
+
+## Task 13 — Fixture 0002-tls-tcp — capstone differential fixture
+
+**Commits:** (SHA-fill follows)
+**Notes:**
+- Lights up differential gates (a) byte-exact response equality and (b) `[3,3,3]/[3,3,3]` distribution.
+- 7 new files + 2 modified (runner_test.go blank-import + this PROGRESS entry).
+- **Downstream TLS termination + SNI dispatch**: single `l_tls` listener, 2 filter chains keyed on `alpha.envoy-go.test` / `beta.envoy-go.test`, each presenting its server leaf cert inline.
+- **YAML indentation fix**: `inline_string: |` block scalars require body indented strictly deeper than the key. Initial attempt (single `fmt.Sprintf` with fixed-string indent) used 14 spaces for body under a 22-space key — rejected by yaml-cpp. Fixed via `inlineString(pem, keyIndent)` helper that computes `keyIndent + "  "` for the body, producing correct 24-space body under 22-space key in downstream chains and 20-space body under 18-space key in upstream clusters.
+- **tls_inspector listener filter**: Envoy requires `envoy.filters.listener.tls_inspector` in `listener_filters` to read the SNI from the ClientHello before `filter_chain_match.server_names` selection. Without it, Envoy accepted the TCP connection but returned EOF on TLS handshake. The subject proxy (envoy-go) uses Go's `crypto/tls` `GetConfigForClient` callback and does NOT need this filter — omitting it avoids a parse error.
+- **Upstream TLS deviation**: PLAN called for `UpstreamTlsContext` on each cluster. Removed: the harness creates plain TCP echo backends; upstream TLS origination causes handshake failures against them. The `upstream-*.pem` PKI materials remain committed for future fixtures. Documented in driver package comment and README.
+- **No harness change needed**: `--concurrency 1` is unconditional (ADR-0028, line 117 of harness.go); inherited by fixture 0002 without modification.
+- **ensureCertPool concurrency note**: DriveReference/DriveSubject are called sequentially by the runner; no mutex needed (comment added in driver.go).
+- `go build ./...` clean; `golangci-lint run ./...` clean; `go test ./test/fixtures/0002-tls-tcp/driver/...` 5/5 pass; all 3 differential fixtures green.
+**Outputs:**
+```
+$ go test -v ./test/fixtures/0002-tls-tcp/driver/...
+=== RUN   TestAssertDistribution_Exact
+--- PASS: TestAssertDistribution_Exact (0.00s)
+=== RUN   TestAssertDistribution_ImbalancedAlpha
+--- PASS: TestAssertDistribution_ImbalancedAlpha (0.00s)
+=== RUN   TestAssertDistribution_ImbalancedBeta
+--- PASS: TestAssertDistribution_ImbalancedBeta (0.00s)
+=== RUN   TestAssertDistribution_AllZero
+--- PASS: TestAssertDistribution_AllZero (0.00s)
+=== RUN   TestAssertDistribution_WrongLength
+--- PASS: TestAssertDistribution_WrongLength (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.001s
+
+$ go test ./test/differential/... -timeout=5m -run TestDifferential -v
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+--- PASS: TestDifferential (3.82s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.47s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.17s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.18s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	3.902s
+
+$ go build ./...
+(empty — clean)
+
+$ golangci-lint run ./...
+(empty — clean)
+```

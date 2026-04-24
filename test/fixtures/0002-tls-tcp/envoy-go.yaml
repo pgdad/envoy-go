@@ -1,0 +1,108 @@
+# Subject: envoy-go configuration for fixture 0002-tls-tcp.
+#
+# This file is documentation only. The driver's SubjectConfig() method generates
+# the actual bootstrap YAML at runtime with runtime-allocated ports substituted
+# for {{BACKEND_PORT_N}}, {{SUBJECT_LISTENER_PORT}}, and {{ADMIN_PORT}}.
+#
+# Shape mirrors envoy.yaml with these divergences:
+#   - No listener_filters: envoy-go reads SNI natively via crypto/tls
+#     GetConfigForClient (no tls_inspector needed or parsed).
+#   - Cluster type: STATIC (ADR-0027) — subject uses 127.0.0.1 not host.docker.internal.
+#   - Admin address: 127.0.0.1:{{ADMIN_PORT}} (randomly-allocated per run).
+#   - Plaintext upstream clusters (same as reference).
+#
+# See also: ADR-0010 (V4_ONLY), ADR-0027 (STATIC vs STRICT_DNS), ADR-0028
+# (--concurrency 1 inheritance).
+
+node: { id: envoy-go-subject-0002, cluster: envoy-go-differential }
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }   # ADMIN_PORT — driver-rendered
+
+static_resources:
+  listeners:
+    - name: l_tls
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }   # subjListenerPort — driver-rendered
+      filter_chains:
+        # --- alpha chain ---
+        - filter_chain_match:
+            server_names: ["alpha.envoy-go.test"]
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+                        {{SERVER_ALPHA_CERT}}
+                    private_key:
+                      inline_string: |
+                        {{SERVER_ALPHA_KEY}}
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls_alpha
+                cluster: c_alpha
+        # --- beta chain ---
+        - filter_chain_match:
+            server_names: ["beta.envoy-go.test"]
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+                        {{SERVER_BETA_CERT}}
+                    private_key:
+                      inline_string: |
+                        {{SERVER_BETA_KEY}}
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls_beta
+                cluster: c_beta
+
+  clusters:
+    # --- c_alpha (plaintext upstream) ---
+    - name: c_alpha
+      type: STATIC
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_alpha
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }   # backend 0 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }   # backend 1 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }   # backend 2 — driver-rendered
+    # --- c_beta (plaintext upstream) ---
+    - name: c_beta
+      type: STATIC
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_beta
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }   # backend 3 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }   # backend 4 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }   # backend 5 — driver-rendered

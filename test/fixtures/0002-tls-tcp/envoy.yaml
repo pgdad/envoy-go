@@ -1,0 +1,120 @@
+# Reference: upstream Envoy configuration for fixture 0002-tls-tcp.
+#
+# This file is documentation only. The driver's ReferenceBootstrap() method
+# generates the actual bootstrap YAML at runtime with runtime-allocated backend
+# ports substituted for {{BACKEND_PORT_N}}.
+#
+# Shape:
+#   - 1 listener l_tls on 0.0.0.0:15002 with:
+#       * tls_inspector listener filter (required by Envoy for SNI detection)
+#       * 2 SNI-indexed downstream TLS filter chains
+#   - Chain alpha: server_names=[alpha.envoy-go.test] → c_alpha (STRICT_DNS).
+#   - Chain beta:  server_names=[beta.envoy-go.test]  → c_beta  (STRICT_DNS).
+#   - c_alpha / c_beta: 3 endpoints each, plaintext upstream TCP.
+#   - dns_lookup_family: V4_ONLY (ADR-0010).
+#   - Reference endpoints: host.docker.internal:{{BACKEND_PORT_N}}.
+#
+# Upstream TLS origination is omitted: the harness creates plain TCP echo
+# backends; adding UpstreamTlsContext would cause upstream TLS handshake
+# failures. The upstream-*.pem PKI materials are committed for future fixtures
+# that supply TLS-capable backends.
+#
+# Note: inline PEM content below is illustrative; the driver substitutes the
+# committed PKI bytes from test/fixtures/0002-tls-tcp/pki/ at runtime.
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: l_tls
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 15002 }
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+      filter_chains:
+        # --- alpha chain ---
+        - filter_chain_match:
+            server_names: ["alpha.envoy-go.test"]
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+                        {{SERVER_ALPHA_CERT}}
+                    private_key:
+                      inline_string: |
+                        {{SERVER_ALPHA_KEY}}
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls_alpha
+                cluster: c_alpha
+        # --- beta chain ---
+        - filter_chain_match:
+            server_names: ["beta.envoy-go.test"]
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+                        {{SERVER_BETA_CERT}}
+                    private_key:
+                      inline_string: |
+                        {{SERVER_BETA_KEY}}
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls_beta
+                cluster: c_beta
+
+  clusters:
+    # --- c_alpha (plaintext upstream) ---
+    - name: c_alpha
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY     # ADR-0010
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_alpha
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 0 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 1 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 2 — driver-rendered
+    # --- c_beta (plaintext upstream) ---
+    - name: c_beta
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY     # ADR-0010
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_beta
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 3 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 4 — driver-rendered
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 5 — driver-rendered
