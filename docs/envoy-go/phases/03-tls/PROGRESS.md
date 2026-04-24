@@ -396,3 +396,93 @@ ok  	github.com/esalaine/envoy-go/internal/cluster	0.006s
 $ golangci-lint run ./...
 (empty — clean)
 ```
+
+## Task 10 — internal/listener multi-chain + SNI routing + ADR-0033
+
+**Commits:** 1c7dc31 (main), SHA-fill below
+**Notes:**
+- ADR-0033 appended to DECISIONS.md in the same commit; supersedes ADR-0025.
+- Chain-propagation mechanism: pure-function dispatch on post-handshake `ConnectionState().ServerName` (not sync.Map). Worker goroutine re-runs the same match logic after `HandshakeContext` returns — deterministic because SNI is fixed from ClientHello through connection lifetime.
+- `NewManagerWithBaseDir` added (mirrors cluster package pattern); `NewManager` delegates with `""` baseDir.
+- `builtListener` replaced by `listenerRuntime`; `Manager.built` renamed to `Manager.runtimes`.
+- 15 new tests added + phase-02 regression tests updated (3 error-string assertions updated to match phase-03 behavior); all 29 tests pass.
+- `cmd/envoy-go/main.go` not touched — `NewManager` signature unchanged.
+- `acceptLoop` captures `netLn` locally to prevent nil-pointer race with `Stop()`.
+**Outputs:**
+```
+$ go test ./internal/listener/... -v -timeout 60s
+=== RUN   TestManager_HappyPath_Single
+--- PASS: TestManager_HappyPath_Single (0.00s)
+=== RUN   TestManager_HappyPath_Multi
+--- PASS: TestManager_HappyPath_Multi (0.00s)
+=== RUN   TestManager_Error_ZeroListeners
+--- PASS: TestManager_Error_ZeroListeners (0.00s)
+=== RUN   TestManager_Error_DuplicateName
+--- PASS: TestManager_Error_DuplicateName (0.00s)
+=== RUN   TestManager_Error_TwoFilterChains
+--- PASS: TestManager_Error_TwoFilterChains (0.00s)
+=== RUN   TestManager_Error_NonEmptyFilterChainMatch
+--- PASS: TestManager_Error_NonEmptyFilterChainMatch (0.00s)
+=== RUN   TestManager_Error_TwoFilters
+--- PASS: TestManager_Error_TwoFilters (0.00s)
+=== RUN   TestManager_Error_PopulatedTransportSocket
+--- PASS: TestManager_Error_PopulatedTransportSocket (0.00s)
+=== RUN   TestManager_Error_UnknownFilterTypeURL
+--- PASS: TestManager_Error_UnknownFilterTypeURL (0.00s)
+=== RUN   TestManager_Error_FilterConstructionPropagated
+--- PASS: TestManager_Error_FilterConstructionPropagated (0.00s)
+=== RUN   TestManager_Error_NonSocketAddressListener
+--- PASS: TestManager_Error_NonSocketAddressListener (0.00s)
+=== RUN   TestManager_BindUnwind
+--- PASS: TestManager_BindUnwind (0.00s)
+=== RUN   TestNewManager_SingleChain_Plaintext_Unchanged
+--- PASS: TestNewManager_SingleChain_Plaintext_Unchanged (0.00s)
+=== RUN   TestNewManager_MultiChain_SNIHappy
+--- PASS: TestNewManager_MultiChain_SNIHappy (0.00s)
+=== RUN   TestNewManager_MultiChain_SNIWildcard
+--- PASS: TestNewManager_MultiChain_SNIWildcard (0.00s)
+=== RUN   TestNewManager_MultiChain_Specificity
+--- PASS: TestNewManager_MultiChain_Specificity (0.00s)
+=== RUN   TestNewManager_MultiChain_CatchAll
+--- PASS: TestNewManager_MultiChain_CatchAll (0.00s)
+=== RUN   TestNewManager_MultiChain_NoSNIMatch
+--- PASS: TestNewManager_MultiChain_NoSNIMatch (0.00s)
+=== RUN   TestNewManager_MultiChain_MixedTLSPlaintext_Errors
+--- PASS: TestNewManager_MultiChain_MixedTLSPlaintext_Errors (0.00s)
+=== RUN   TestNewManager_MultiChain_DefaultFilterChain_Errors
+--- PASS: TestNewManager_MultiChain_DefaultFilterChain_Errors (0.00s)
+=== RUN   TestNewManager_MultiChain_NonSNIMatchField_Errors
+--- PASS: TestNewManager_MultiChain_NonSNIMatchField_Errors (0.00s)
+    --- PASS: TestNewManager_MultiChain_NonSNIMatchField_Errors/destination_port (0.00s)
+    --- PASS: TestNewManager_MultiChain_NonSNIMatchField_Errors/prefix_ranges (0.00s)
+    --- PASS: TestNewManager_MultiChain_NonSNIMatchField_Errors/source_ports (0.00s)
+    --- PASS: TestNewManager_MultiChain_NonSNIMatchField_Errors/source_prefix_ranges (0.00s)
+=== RUN   TestNewManager_MultiChain_ApplicationProtocols_Errors
+--- PASS: TestNewManager_MultiChain_ApplicationProtocols_Errors (0.00s)
+=== RUN   TestNewManager_MultiChain_TooManyCatchAlls_Errors
+--- PASS: TestNewManager_MultiChain_TooManyCatchAlls_Errors (0.00s)
+=== RUN   TestNewManager_MultiChain_RequireClientCert_Errors
+--- PASS: TestNewManager_MultiChain_RequireClientCert_Errors (0.00s)
+=== RUN   TestNewManager_MultiChain_UnknownTransportSocket_Errors
+--- PASS: TestNewManager_MultiChain_UnknownTransportSocket_Errors (0.00s)
+=== RUN   TestNewManager_PlaintextMultiChain_Errors
+--- PASS: TestNewManager_PlaintextMultiChain_Errors (0.00s)
+=== RUN   TestNewManager_ChainSelectionPropagation
+--- PASS: TestNewManager_ChainSelectionPropagation (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener	0.008s
+
+$ go test ./... (excluding pre-existing TestDifferential/0002-tls-tcp failure — Task 13 not yet landed)
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go
+ok  	github.com/esalaine/envoy-go/internal/admin
+ok  	github.com/esalaine/envoy-go/internal/bootstrap
+ok  	github.com/esalaine/envoy-go/internal/cluster
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy
+ok  	github.com/esalaine/envoy-go/internal/listener
+ok  	github.com/esalaine/envoy-go/internal/tls
+ok  	github.com/esalaine/envoy-go/test/helpers
+FAIL	github.com/esalaine/envoy-go/test/differential  [pre-existing: 0002-tls-tcp driver not yet registered]
+
+$ golangci-lint run ./...
+(empty — clean)
+```
