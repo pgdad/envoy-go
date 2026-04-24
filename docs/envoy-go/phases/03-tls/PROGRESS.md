@@ -669,7 +669,7 @@ $ golangci-lint run ./...
 
 ## Task 15 — Full verification gate sweep (SPEC §3 gates a/b/d/e)
 
-**Commits:** <sha> (gate sweep), <sha-fill> (SHA-fill)
+**Commits:** d9f29a9 (gate sweep), <sha-fill> (SHA-fill)
 **Notes:**
 - All 6 SPEC §3 gates run; gates (a)–(b) and (d)–(e) green; gate (c) is N/A (conformance suite not yet implemented — future phase work).
 - 15 tasks complete; all landed on `phase/03-tls-impl`.
