@@ -52,3 +52,13 @@ github.com/envoyproxy/go-control-plane/envoy v1.32.4
 $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0028: Reference Envoy `--concurrency 1` for deterministic single-worker round-robin
 ```
+
+## Task 2 — internal/tls — MatchServerName + doc.go
+
+**Commits:** a833d23
+**Notes:** Pure function; no stdtls import yet; table-driven test covers exact / suffix-wildcard / universal / case / no-match / empty-patterns; all combinations green.
+**Outputs:**
+```
+$ cd internal/tls && go test .
+ok  	github.com/esalaine/envoy-go/internal/tls	0.002s
+```
