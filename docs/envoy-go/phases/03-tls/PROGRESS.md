@@ -285,3 +285,33 @@ $ go vet ./...
 $ golangci-lint run ./...
 (empty — clean)
 ```
+
+## Task 8 — test/helpers — TLSRoundTrip helper + test
+
+**Commits:** 926d93a
+**Notes:**
+- Mirrors `TCPRoundTrip` shape (phase 02): dial → TLS wrap + handshake → write → `CloseWrite` → `io.ReadAll` → return bytes.
+- Uses committed PKI from Task 7 (`test/fixtures/0002-tls-tcp/pki/`) for all three subtests.
+- Three subtests: `Echo` (happy path, upstream-alpha cert + CA), `WrongSNI` (beta SNI against alpha cert → x509 error), `DialFailure` (refused port → dial error).
+- `t.Context()` replaced with `context.Background()` — module declares `go 1.23` and `stdversion` linter enforces it.
+- `WrongSNI` server goroutine calls `Handshake()` (discarding error) so the TLS exchange advances far enough for the client to receive the server certificate and fail on x509 verification; without this the client blocks indefinitely waiting for the server hello.
+- `errcheck` satisfied throughout: all `Close()` calls wrapped `_ = func(){}()` or `_ =` prefix.
+- `golangci-lint run ./test/helpers/...` → empty (clean).
+**Outputs:**
+```
+$ go test ./test/helpers -run TestTLSRoundTrip
+# compile error: TLSRoundTrip undefined  ← TDD red (before tls.go)
+
+$ go test -v ./test/helpers -run TestTLSRoundTrip
+=== RUN   TestTLSRoundTrip_Echo
+--- PASS: TestTLSRoundTrip_Echo (0.00s)
+=== RUN   TestTLSRoundTrip_WrongSNI
+--- PASS: TestTLSRoundTrip_WrongSNI (0.00s)
+=== RUN   TestTLSRoundTrip_DialFailure
+--- PASS: TestTLSRoundTrip_DialFailure (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/helpers	0.003s
+
+$ golangci-lint run ./test/helpers/...
+(empty — clean)
+```
