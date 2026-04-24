@@ -203,3 +203,37 @@ ok  	github.com/esalaine/envoy-go/internal/tls	0.014s	coverage: 87.4% of stateme
 $ golangci-lint run ./internal/tls/...
 (empty — clean)
 ```
+
+## Task 6 — internal/tls — FuzzTLSContextParse [ADR-0018]
+
+**Commits:** 38ee5f9
+**Notes:**
+- PLAN seed (c) had a latent panic: `proto.Marshal(&tlsv3.DownstreamTlsContext{})` returns 0 bytes, so `b[:len(b)/2+1]` = `b[:1]` would panic. Fixed by seeding a non-empty context (one inline_string cert field) so the marshal always produces ≥1 byte.
+- PLAN fuzz body used `TypedConfig: &anypb.Any{...}` as a direct struct field; the actual protobuf oneof requires `ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: ...}`. Corrected to match the idiom used everywhere in `config_test.go`.
+- `-fuzztime=30s` produced no crashers: 7,912,845 executions, 241 interesting corpus entries.
+- `golangci-lint run ./internal/tls/...` → empty (clean).
+**Outputs:**
+```
+$ go test -run=FuzzTLSContextParse -fuzz=FuzzTLSContextParse -fuzztime=30s ./internal/tls/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/4 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 4/4 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 177926 (59292/sec), new interesting: 52 (total: 56)
+fuzz: elapsed: 6s, execs: 376904 (66335/sec), new interesting: 96 (total: 100)
+fuzz: elapsed: 9s, execs: 453774 (25622/sec), new interesting: 109 (total: 113)
+fuzz: elapsed: 12s, execs: 718982 (88395/sec), new interesting: 115 (total: 119)
+fuzz: elapsed: 15s, execs: 2235464 (505590/sec), new interesting: 141 (total: 145)
+fuzz: elapsed: 18s, execs: 3638518 (467716/sec), new interesting: 174 (total: 178)
+fuzz: elapsed: 21s, execs: 3849574 (70349/sec), new interesting: 194 (total: 198)
+fuzz: elapsed: 24s, execs: 3960238 (36886/sec), new interesting: 206 (total: 210)
+fuzz: elapsed: 27s, execs: 4730750 (256820/sec), new interesting: 214 (total: 218)
+fuzz: elapsed: 30s, execs: 7912845 (1059979/sec), new interesting: 237 (total: 241)
+fuzz: elapsed: 31s, execs: 7912845 (0/sec), new interesting: 237 (total: 241)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.046s
+
+$ go test -run FuzzTLSContextParse ./internal/tls/
+ok  	github.com/esalaine/envoy-go/internal/tls	0.003s
+
+$ golangci-lint run ./internal/tls/...
+(empty — clean)
+```
