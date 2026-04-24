@@ -1142,3 +1142,33 @@ Option 1 minimizes churn, preserves the SPEC §3 gate wording, and documents the
 This ADR supersedes nothing — it documents a scope adjustment that became apparent only during Task 13 execution. PLAN.md is not amended (plans are frozen at landing per phase-02 precedent); this ADR is the authoritative rationale.
 
 ---
+
+## ADR-0036: BEHAVIOR_CONTRACT TLS subsection (phase 03) + TCP-proxy ADR-0028 cross-reference (Minor 8)
+
+**Status:** Accepted
+**Date:** 2026-04-24
+**Doctrine:** D-3.5, D-3.3
+
+### Context
+
+Phase 03 introduces envoy-go's first cryptographic surface. The differential contract must codify which TLS-related observables are asserted across reference and subject and which are permitted to differ — without this, a reviewer cannot say whether a cipher-level divergence is a gate failure or a permitted variance. Phase-02 REVIEW Minor 8 additionally flagged that the TCP-proxy subsection did not cross-reference ADR-0028's `--concurrency 1` reference-container pin, which is a precondition for the distribution assertions in fixtures 0001 and (inherited) 0002.
+
+### Decision
+
+A new `## TLS` subsection lands in `BEHAVIOR_CONTRACT.md`, phrased so that (a) every *asserted* rule has a fixture gate that witnesses it, (b) every *not-asserted* rule names the specific observable and the reason it's excluded, (c) the upstream-TLS scope reduction from ADR-0035 is reflected (upstream SNI + CA equivalence is listed as unit-tested only, not differentially asserted), (d) tradeoffs with Go's `crypto/tls` (ADR-0030) are noted so future reviewers don't read divergence as a gate regression.
+
+In the same commit, the existing `## TCP proxy` subsection's "LB endpoint-selection sequence (NOT asserted)" paragraph gains a one-sentence cross-reference to ADR-0028 (phase-02 REVIEW Minor 8 resolution).
+
+### Note on ADR numbering
+
+PLAN.md §"ADRs introduced by this plan" assigned ADR-0035 to this task. That number was consumed by the Task-13 deviation ADR (fixture-0002 differential scope reduction) landed in commit `ddbe63e` before this task. To preserve sequential file-order monotonicity in DECISIONS.md, this task's ADR takes the next available number: ADR-0036. The PLAN is not amended; this note is the authoritative pointer.
+
+### Consequences
+
+- Phase-03 gates are now fully traceable to written rules. Fixture 0002's byte-exact plaintext assertion is under "Plaintext-after-decryption byte equivalence"; its distribution assertion is under "Per-SNI chain-selection equivalence."
+- A future reviewer encountering a TLS 1.3 cipher divergence between Go and Envoy can point at "Encrypted-side byte equivalence: not asserted" and close the ticket without a gate investigation.
+- Phase-02 REVIEW Minor 8 is resolved. Minor 7 (prose-heavy `expectations.yaml`) remains deferred per ADR-0019.
+- Phase 04+ TLS-touching phases extend this subsection (or add siblings — e.g., a `## HTTP over TLS` subsection in phase 04) rather than rewriting it.
+- The upstream-TLS "unit-tested only" clause is expected to be superseded by a later phase that adds TLS-backend support to the harness (phase 04 HTTPS fixtures, or a dedicated harness-extension phase).
+
+---
