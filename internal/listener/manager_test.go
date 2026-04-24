@@ -826,10 +826,17 @@ func TestNewManager_MultiChain_NoSNIMatch(t *testing.T) {
 
 	cfg, err := gcfc(&stdtls.ClientHelloInfo{ServerName: "gamma.envoy-go.test"})
 	if err == nil {
-		t.Error("GetConfigForClient(gamma): expected error for unmatched SNI, got nil")
+		t.Fatal("GetConfigForClient(gamma): expected error for unmatched SNI, got nil")
 	}
 	if cfg != nil {
 		t.Error("GetConfigForClient(gamma): expected nil config for unmatched SNI")
+	}
+	// Project error-prefix discipline: every error crossing a package boundary
+	// begins with "<package>: ". `crypto/tls` propagates this error out of the
+	// listener package via the GetConfigForClient callback, so the prefix must
+	// be greppable as `^listener:`.
+	if !strings.HasPrefix(err.Error(), "listener:") {
+		t.Errorf("error %q does not start with %q (project error-prefix discipline)", err.Error(), "listener:")
 	}
 }
 

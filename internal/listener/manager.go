@@ -299,7 +299,7 @@ func makeGetConfigForClient(rt *listenerRuntime) func(*stdtls.ClientHelloInfo) (
 				return ci.tlsCfg.Clone(), nil
 			}
 		}
-		return nil, fmt.Errorf("listener %q: no filter_chain matches SNI %q", rt.name, sni)
+		return nil, fmt.Errorf("listener: %q: no filter_chain matches SNI %q", rt.name, sni)
 	}
 }
 

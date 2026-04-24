@@ -63,14 +63,14 @@ func mapTLSVersion(v tlsv3.TlsParameters_TlsProtocol) (uint16, error) {
 	switch v {
 	case tlsv3.TlsParameters_TLS_AUTO:
 		// TlsProtocol 0 = TLS_AUTO in the proto; at the zero value the field
-		// is treated as unset (no explicit version requested). The enum's
-		// zero is TLS_AUTO; we cannot distinguish "unset" from "TLS_AUTO
-		// explicitly chosen" at the proto level, so we adopt the strict
-		// interpretation: explicit TLS_AUTO errors. If the caller wants no
-		// bound, they omit the field entirely (which also yields the zero
-		// value — indistinguishable). In practice phase-03 fixtures always
-		// set TLSv1_2 min / TLSv1_3 max per Settled §10 #7.
-		return 0, nil // treat as "not set" — let caller's cfg carry its default.
+		// is treated as unset (no explicit version requested). Because the
+		// enum's zero is TLS_AUTO, we cannot distinguish "unset" from
+		// "TLS_AUTO explicitly chosen" at the proto level — so per ADR-0030
+		// we treat both identically: a no-op that lets the caller's
+		// *stdtls.Config carry its default (Min/MaxVersion stays 0). Phase-03
+		// fixtures always set TLSv1_2 min / TLSv1_3 max per Settled §10 #7,
+		// so this branch is reached only when the field is genuinely omitted.
+		return 0, nil // no-op — treat as "not set" per ADR-0030.
 	case tlsv3.TlsParameters_TLSv1_0, tlsv3.TlsParameters_TLSv1_1:
 		return 0, fmt.Errorf("%s is not supported in phase 03", v.String())
 	case tlsv3.TlsParameters_TLSv1_2:

@@ -100,16 +100,12 @@ func inlineString(pem, keyIndent string) string {
 //	certificate_chain:          18 spaces
 //	inline_string:              22 spaces  → body at 24 spaces ✓
 func downstreamChain(sni, serverCert, serverKey, clusterName string) string {
-	prefix := strings.TrimSuffix(strings.TrimSuffix(sni, ".envoy-go.test"), "alpha")
 	statPrefix := "ingress_tls_" + func() string {
 		if strings.HasPrefix(sni, "alpha") {
 			return "alpha"
 		}
 		return "beta"
 	}()
-
-	// Suppress unused variable warning — statPrefix computed above.
-	_ = prefix
 
 	// inline_string: key is at 22 spaces under the list item.
 	certIS := inlineString(serverCert, "                      ")

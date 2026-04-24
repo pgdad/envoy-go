@@ -220,7 +220,7 @@ This table is the phase-03 authority; any divergence found during implementation
 
 | Envoy field | Phase-03 behaviour |
 |---|---|
-| `tls_params.tls_minimum_protocol_version` | Honoured. `TLSv1_2`/`TLSv1_3` → `stdtls.VersionTLS12/TLS13`. `TLSv1_0`, `TLSv1_1`, `TLS_AUTO` → error. |
+| `tls_params.tls_minimum_protocol_version` | Honoured. `TLSv1_2`/`TLSv1_3` → `stdtls.VersionTLS12/TLS13`. `TLSv1_0`, `TLSv1_1` → error. `TLS_AUTO` → no-op (treat as unset, per ADR-0030 — the proto-zero ambiguity prevents distinguishing "unset" from "explicitly chosen"). |
 | `tls_params.tls_maximum_protocol_version` | Honoured. Same mapping. |
 | `tls_params.cipher_suites` | Honoured for TLS 1.2 suites (IANA name → `stdtls.CipherSuites()` ID; unknown name errors). TLS-1.3-only suites logged as diagnostic and dropped — `crypto/tls` does not allow TLS 1.3 cipher selection. |
 | `tls_params.ecdh_curves` | Honoured. Names `X25519`/`P-256`/`P-384`/`P-521` → `stdtls.CurveID`. Unknown error. |
