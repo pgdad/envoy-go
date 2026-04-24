@@ -1084,3 +1084,61 @@ All existing drivers (0000-tcp-echo, 0001-tcp-proxy-rr) are updated atomically i
 - The `DistributionAsserter` optional interface and `ProbeAdmin` method are unaffected.
 
 ---
+
+## ADR-0035: Fixture 0002 differential scope — downstream TLS + SNI only; upstream TLS unit-tested
+
+**Status:** Accepted
+**Date:** 2026-04-24
+**Doctrine:** D-3.5
+
+### Context
+
+Phase-03 PLAN.md §"File Structure" and §"Task 13" described fixture `0002-tls-tcp` as exercising both downstream TLS termination (2 SNI-indexed filter chains) and upstream TLS origination (2 STATIC/STRICT_DNS clusters each with an UpstreamTlsContext). During Task 13 execution, these two goals were not simultaneously achievable under the PLAN's other constraint that `test/differential/harness.go` stays unchanged this phase:
+
+- The harness's `runFixture` loop (`test/differential/runner_test.go`) allocates backends via `net.Listen("tcp", "0.0.0.0:0")` and serves them with `acceptEchoCounting`, a plain-TCP echo loop. There is no facility for TLS-wrapped backends.
+- The fixture driver receives those backend ports via `ReferenceBootstrap(backendPorts []int)` / `SubjectConfig(..., backendPorts []int, ...)` and must use them — the harness tracks per-backend accept counts there for the `[3,3,3]` distribution assertion.
+- Making the clusters TLS (UpstreamTlsContext with inline PEMs) would cause handshake failures against the plain-TCP backends, so the distribution gate would never fire.
+- Extending the harness to spawn TLS-wrapped backends would violate PLAN.md's explicit "harness unchanged this phase" directive.
+
+The PLAN's two requirements (fixture exercises upstream TLS; harness unchanged) were therefore structurally contradictory.
+
+### Decision
+
+Fixture `0002-tls-tcp` as landed in Task 13 exercises:
+
+- **Downstream TLS termination** with 2 SNI-indexed filter chains (`alpha.envoy-go.test` → `c_alpha`, `beta.envoy-go.test` → `c_beta`).
+- **SNI-based filter-chain dispatch** via the listener manager's `GetConfigForClient` callback (ADR-0033).
+- **Per-cluster round-robin distribution** assertion `[3,3,3]` per SNI per side.
+- **Byte-exact plaintext response-body equivalence** across 18 TLS round-trips per proxy.
+
+Upstream TLS origination is NOT exercised in the differential fixture. The upstream-TLS code paths are covered by:
+
+- `internal/cluster/cluster_test.go` — `TestCluster_Dial_TLS`, `TestCluster_Dial_TLS_HandshakeFailure`, `TestCluster_Dial_CtxCanceled` (Task 9).
+- `internal/tls/config_test.go` — `TestNewUpstreamConfig_Happy` + error subtests of `TestNewUpstreamConfig_Errors` (Task 5).
+- `internal/tls/fuzz_test.go` — `FuzzTLSContextParse` seed (b) stresses UpstreamTlsContext parsing (Task 6).
+
+### Rationale
+
+Three options considered:
+
+1. **Land fixture 0002 with downstream TLS + SNI only; document scope reduction in this ADR.** Preserves "harness unchanged" invariant; preserves SPEC §3 gate (a) wording ("byte-exact plaintext + per-cluster [3,3,3] distribution per side" — no explicit upstream-TLS requirement at gate level); relies on unit-test coverage for upstream TLS code paths. **Chosen.**
+
+2. Extend the harness with TLS-backend support. Would require per-fixture opt-in or protocol discovery; grow harness by ~80 LoC; violates PLAN's "harness unchanged" directive; expands phase-03 scope.
+
+3. Split phase 03 per §6.2 into 03.1 (downstream TLS + SNI, landed) and 03.2 (upstream TLS differential gate, needs harness work). Most honest, but the PLAN was already committed as a single phase; splitting retroactively adds ceremony without clear benefit — phase 04 or a later phase can drive upstream TLS differentially when HTTPS fixtures become natural (HTTP/1.1 upstream TLS, phase 04+; HTTP/2 upstream TLS, phase 05+).
+
+Option 1 minimizes churn, preserves the SPEC §3 gate wording, and documents the gap explicitly.
+
+### Consequences
+
+- **SPEC §1 scope claim** — "downstream TLS termination + upstream TLS origination + SNI" — is delivered in CODE but only two of three are exercised by the phase-03 differential fixture. Upstream TLS is demonstrably functional (unit-tested) but not differentially asserted.
+- **SPEC §3 gate (a)** remains satisfied as worded: fixture 0002 is green with byte-exact plaintext + per-cluster [3,3,3] distribution per side.
+- **BEHAVIOR_CONTRACT TLS subsection** (Task 14) must reflect the actual differential surface. Asserted dimensions are plaintext-after-decryption byte equivalence and per-SNI chain-selection equivalence (via distribution assertion). The Task-9/Task-5 upstream-TLS code paths are explicitly noted as *unit-tested only*, not differentially asserted. The subsection must NOT claim "upstream SNI + CA equivalence" as a differential assertion.
+- **Task 14's PLAN-assigned ADR number shifts.** PLAN.md assigned ADR-0035 to Task 14's BEHAVIOR_CONTRACT TLS subsection. This ADR (landing during Task 13 aftermath, before Task 14) takes the next sequential number 0035 to preserve file-order monotonicity. Task 14's ADR will land as **ADR-0036** with a PROGRESS note recording the shift.
+- **A future phase** that needs upstream-TLS differential coverage will either: (a) extend `test/differential/harness.go` with TLS-backend support (own ADR when that phase lands); or (b) drive upstream TLS through a naturally-TLS fixture such as phase 04's HTTPS HTTP/1.1 upstream.
+- **Committed PKI** (`test/fixtures/0002-tls-tcp/pki/upstream-*.pem`) remains as-committed — the upstream leaf PEMs are used by Task 9 unit tests and are forward-compatible with a later harness-extension phase.
+- **No rollback of landed code.** Task 9's `Cluster.Dial` TLS branch, Task 5's `NewUpstreamConfig`, Task 10's TLS listener path all remain in the production binary. The scope reduction affects only the differential-fixture coverage, not the runtime surface.
+
+This ADR supersedes nothing — it documents a scope adjustment that became apparent only during Task 13 execution. PLAN.md is not amended (plans are frozen at landing per phase-02 precedent); this ADR is the authoritative rationale.
+
+---
