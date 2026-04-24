@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,8 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -240,5 +243,148 @@ func TestManager_Error_NonSocketAddressEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "socket_address") {
 		t.Errorf("error %q does not contain socket_address", err.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-03 TLS cluster tests
+// ---------------------------------------------------------------------------
+
+// mkUpstreamTLSTransportSocket builds a corev3.TransportSocket carrying an
+// UpstreamTlsContext with the given SNI and inline CA PEM bytes.
+func mkUpstreamTLSTransportSocket(t *testing.T, sni string, caPEM []byte) *corev3.TransportSocket {
+	t.Helper()
+	ctx := &tlsv3.UpstreamTlsContext{
+		Sni: sni,
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: &corev3.DataSource{
+						Specifier: &corev3.DataSource_InlineBytes{InlineBytes: caPEM},
+					},
+				},
+			},
+		},
+	}
+	anyMsg, err := anypb.New(ctx)
+	if err != nil {
+		t.Fatalf("anypb.New(UpstreamTlsContext): %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+	}
+}
+
+func TestNewManager_TLSCluster(t *testing.T) {
+	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+
+	c := mkStaticCluster("c_tls", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = mkUpstreamTLSTransportSocket(t, "alpha.envoy-go.test", caPEM)
+
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v", err)
+	}
+
+	got, ok := m.Get("c_tls")
+	if !ok {
+		t.Fatal("cluster c_tls not found")
+	}
+	if got.upstreamCfg == nil {
+		t.Fatal("upstreamCfg is nil, want non-nil")
+	}
+	if got.upstreamCfg.ServerName != "alpha.envoy-go.test" {
+		t.Errorf("ServerName = %q, want %q", got.upstreamCfg.ServerName, "alpha.envoy-go.test")
+	}
+	if got.upstreamCfg.RootCAs == nil {
+		t.Error("RootCAs is nil, want non-nil")
+	}
+}
+
+func TestNewManager_TLSCluster_UnknownTransportSocket(t *testing.T) {
+	// Use a type_url that is not UpstreamTlsContext (raw_buffer).
+	anyMsg, err := anypb.New(&tlsv3.DownstreamTlsContext{})
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	c := mkStaticCluster("c_bad_ts", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.raw_buffer",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+	}
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported transport_socket type_url") {
+		t.Errorf("error %q does not contain expected substring", err.Error())
+	}
+}
+
+func TestNewManager_TLSCluster_MissingTrustedCA(t *testing.T) {
+	// UpstreamTlsContext without validation_context.trusted_ca — must error.
+	ctx := &tlsv3.UpstreamTlsContext{
+		Sni:              "alpha.envoy-go.test",
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			// No ValidationContext set — trusted_ca is missing.
+		},
+	}
+	anyMsg, err := anypb.New(ctx)
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	c := mkStaticCluster("c_no_ca", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+	}
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "trusted_ca") {
+		t.Errorf("error %q does not contain %q", err.Error(), "trusted_ca")
+	}
+}
+
+func TestNewManager_MixedPlaintextAndTLSClusters(t *testing.T) {
+	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+
+	// Plaintext cluster.
+	plain := mkStaticCluster("c_plain", mkLbEndpoint("10.0.0.1", 8080))
+
+	// TLS cluster.
+	tls := mkStaticCluster("c_tls", mkLbEndpoint("10.0.0.2", 443))
+	tls.TransportSocket = mkUpstreamTLSTransportSocket(t, "alpha.envoy-go.test", caPEM)
+
+	m, err := NewManagerWithBaseDir(mkBootstrap(plain, tls), "")
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v", err)
+	}
+
+	gotPlain, ok := m.Get("c_plain")
+	if !ok {
+		t.Fatal("cluster c_plain not found")
+	}
+	if gotPlain.upstreamCfg != nil {
+		t.Error("c_plain.upstreamCfg should be nil (plaintext)")
+	}
+
+	gotTLS, ok := m.Get("c_tls")
+	if !ok {
+		t.Fatal("cluster c_tls not found")
+	}
+	if gotTLS.upstreamCfg == nil {
+		t.Fatal("c_tls.upstreamCfg should be non-nil")
+	}
+	if gotTLS.upstreamCfg.ServerName != "alpha.envoy-go.test" {
+		t.Errorf("c_tls.upstreamCfg.ServerName = %q, want %q", gotTLS.upstreamCfg.ServerName, "alpha.envoy-go.test")
 	}
 }

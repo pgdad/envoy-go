@@ -15,6 +15,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/esalaine/envoy-go/internal/admin"
@@ -46,7 +47,7 @@ func main() {
 	}
 	adminAddr := fmt.Sprintf("%s:%d", adminHost, adminPort)
 
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManagerWithBaseDir(bs, filepath.Dir(*cfgPath))
 	if err != nil {
 		log.Fatalf("cluster manager: %v", err)
 	}
