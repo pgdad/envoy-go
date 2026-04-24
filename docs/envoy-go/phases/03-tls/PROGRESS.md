@@ -62,3 +62,13 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 $ cd internal/tls && go test .
 ok  	github.com/esalaine/envoy-go/internal/tls	0.002s
 ```
+
+## Task 3 — internal/tls — loadDataSource + ADR-0029
+
+**Commits:** f63119e
+**Notes:** ADR-0029 landed in same commit as the code. Error-prefix discipline (`tls: `) preserved. Eight subtests green.
+**Outputs:**
+```
+$ cd internal/tls && go test -run TestLoadDataSource .
+ok  	github.com/esalaine/envoy-go/internal/tls	0.013s
+```
