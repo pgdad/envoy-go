@@ -486,3 +486,70 @@ FAIL	github.com/esalaine/envoy-go/test/differential  [pre-existing: 0002-tls-tcp
 $ golangci-lint run ./...
 (empty — clean)
 ```
+
+## Task 11 — internal/filter/tcpproxy — consume ctx via cluster.Dial + halfClose TLS ext [Minor 4 resolved]
+
+**Commits:** e20ecc2 (code), SHA-fill follows
+**Notes:**
+- Phase-02 REVIEW Minor 4 resolved: `Handle` no longer calls `net.DialTimeout` directly; replaced with `f.cluster.Dial(ctx)` (ADR-0032).
+- Early ctx-cancellation guard (`if err := ctx.Err(); err != nil { return }`) added at top of `Handle`, before any dial attempt.
+- Error log message updated: `tcpproxy: dial cluster %q: %v` (cluster name now included).
+- `halfClose` type-switch extended with `case *stdtls.Conn: _ = t.CloseWrite()` (consequence of ADR-0033: upstream may now be `*stdtls.Conn`).
+- `stdtls "crypto/tls"` import added to `filter.go`.
+- Pump body (ADR-0023 verbatim: `netConn` wrapper + two-goroutine `io.Copy` + `halfClose`) left structurally unchanged.
+- Three new tests added (TDD red → green):
+  1. `TestFilter_Handle_CtxCanceledBeforeDial` — pre-canceled ctx; Handle returns without dialing.
+  2. `TestFilter_Handle_TLSUpstreamTransparent` — TLS echo server via `stdtls.Listen` + upstream-alpha PKI; filter proxies bytes transparently. TDD red: `got "", want "hello"` (old code used `net.DialTimeout`, bypassing TLS).
+  3. `TestFilter_Handle_HalfCloseOverTLS` — same TLS echo; downstream `CloseWrite` propagates through `halfClose(*stdtls.Conn)` to upstream; `io.ReadAll` returns `"hello"` + EOF. TDD red: same as above.
+- TLS cluster built via `cluster.NewManagerWithBaseDir` with inline-PEM `UpstreamTlsContext` bootstrap — no unexported fields touched.
+- Test count: 10 tests (7 phase-02 + 3 new) + 3 fuzz seeds = 13 pass entries.
+- `golangci-lint run ./...` → empty (clean).
+**Outputs:**
+```
+$ go test -v ./internal/filter/tcpproxy/...
+=== RUN   TestNewFilter_Happy
+--- PASS: TestNewFilter_Happy (0.00s)
+=== RUN   TestNewFilter_WrongTypeURL
+--- PASS: TestNewFilter_WrongTypeURL (0.00s)
+=== RUN   TestNewFilter_UnmarshalError
+--- PASS: TestNewFilter_UnmarshalError (0.00s)
+=== RUN   TestNewFilter_MissingCluster
+--- PASS: TestNewFilter_MissingCluster (0.00s)
+=== RUN   TestNewFilter_WeightedClustersUnsupported
+--- PASS: TestNewFilter_WeightedClustersUnsupported (0.00s)
+=== RUN   TestHandle_BidirectionalEcho
+--- PASS: TestHandle_BidirectionalEcho (0.00s)
+=== RUN   TestHandle_DialFailure_ClosesDownstream
+2026/04/24 05:28:42 tcpproxy: dial cluster "c_dead": cluster: dial: dial tcp 127.0.0.1:45993: connect: connection refused
+--- PASS: TestHandle_DialFailure_ClosesDownstream (0.00s)
+=== RUN   TestFilter_Handle_CtxCanceledBeforeDial
+--- PASS: TestFilter_Handle_CtxCanceledBeforeDial (0.00s)
+=== RUN   TestFilter_Handle_TLSUpstreamTransparent
+--- PASS: TestFilter_Handle_TLSUpstreamTransparent (0.00s)
+=== RUN   TestFilter_Handle_HalfCloseOverTLS
+--- PASS: TestFilter_Handle_HalfCloseOverTLS (0.00s)
+=== RUN   FuzzTcpProxyFilter
+=== RUN   FuzzTcpProxyFilter/seed#0
+=== RUN   FuzzTcpProxyFilter/seed#1
+=== RUN   FuzzTcpProxyFilter/seed#2
+--- PASS: FuzzTcpProxyFilter (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#0 (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#1 (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.007s
+
+$ go test ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go
+ok  	github.com/esalaine/envoy-go/internal/admin
+ok  	github.com/esalaine/envoy-go/internal/bootstrap
+ok  	github.com/esalaine/envoy-go/internal/cluster
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy
+ok  	github.com/esalaine/envoy-go/internal/listener
+ok  	github.com/esalaine/envoy-go/internal/tls
+ok  	github.com/esalaine/envoy-go/test/helpers
+FAIL	github.com/esalaine/envoy-go/test/differential  [pre-existing: 0002-tls-tcp driver not yet registered — Task 13]
+
+$ golangci-lint run ./...
+(empty — clean)
+```
