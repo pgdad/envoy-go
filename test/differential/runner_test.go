@@ -104,7 +104,7 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	}
 
 	// 5. Drive ref.
-	refBytes, _, err := d.Drive(ctx, refAddr, "")
+	refBytes, err := d.DriveReference(ctx, refAddr)
 	if err != nil {
 		t.Fatalf("ref drive: %v", err)
 	}
@@ -118,7 +118,7 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	}
 
 	// 6. Drive subj.
-	_, subjBytes, err := d.Drive(ctx, "", subj.ListenerAddr(d.SubjectListenerName()))
+	subjBytes, err := d.DriveSubject(ctx, subj.ListenerAddr(d.SubjectListenerName()))
 	if err != nil {
 		t.Fatalf("subj drive: %v", err)
 	}

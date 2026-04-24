@@ -16,12 +16,12 @@ type Driver interface {
 	// BackendCount is the number of host-side TCP echo backends the runner
 	// allocates per fixture run. Each backend gets its own random port and
 	// its own atomic.Uint64 accept counter that the runner snapshots after
-	// Drive completes.
+	// DriveReference/DriveSubject complete.
 	BackendCount() int
 
-	// SubjectListenerName is the listener name the driver's Drive targets.
-	// The runner uses subj.ListenerAddr(SubjectListenerName()) to look up
-	// the subject's bound address per the ADR-0026 sentinel format.
+	// SubjectListenerName is the listener name the driver's DriveSubject
+	// targets. The runner uses subj.ListenerAddr(SubjectListenerName()) to
+	// look up the subject's bound address per the ADR-0026 sentinel format.
 	SubjectListenerName() string
 
 	// ReferenceBootstrap returns the YAML to feed upstream Envoy. The
@@ -37,12 +37,13 @@ type Driver interface {
 	// proxy must expose (the listener the driver dials).
 	ReferenceListenerPort() int
 
-	// Drive sends fixture-specific traffic at refAddr and subjAddr (each is
-	// a host:port for the listener under test in each proxy). Returns the
-	// captured byte streams for diffing. Runners may pass "" for either
-	// side to signal "don't drive this side"; drivers must no-op the
-	// corresponding side in that case.
-	Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error)
+	// DriveReference runs the fixture's driver logic against the reference
+	// proxy's listener address. Returns all received bytes.
+	DriveReference(ctx context.Context, addr string) ([]byte, error)
+
+	// DriveSubject runs the fixture's driver logic against the subject
+	// proxy's listener address. Returns all received bytes.
+	DriveSubject(ctx context.Context, addr string) ([]byte, error)
 
 	// ProbeAdmin issues GET /ready against each proxy's admin endpoint and
 	// returns the raw response bytes (status line + headers + body) for the

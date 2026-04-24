@@ -94,29 +94,35 @@ static_resources:
 `, subjAdminPort, subjListenerPort, backendPorts[0])
 }
 
-func (echoDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error) {
-	// Deterministic payload: both sides receive the same bytes so byte-exact
-	// echo comparison holds under the post-Task-7 runner pattern that calls
-	// Drive separately per side. An earlier variant used a per-call randHex
-	// uid, which diverged between the two calls; the static form has the same
-	// debugging value (line-numbered pings) with no run-time state.
-	var payload []byte
+// echoPayload is the deterministic payload sent by both DriveReference and
+// DriveSubject. A static form (line-numbered pings) gives the same debugging
+// value as a per-call random uid without any per-call divergence.
+func echoPayload() []byte {
+	var p []byte
 	for n := 0; n < 10; n++ {
-		payload = append(payload, []byte(fmt.Sprintf("ping-%d\n", n))...)
+		p = append(p, []byte(fmt.Sprintf("ping-%d\n", n))...)
 	}
-	if refAddr != "" {
-		refBytes, err = helpers.TCPRoundTrip(ctx, refAddr, payload, time.Second)
-		if err != nil {
-			return nil, nil, fmt.Errorf("ref drive: %w", err)
-		}
+	return p
+}
+
+// DriveReference runs the fixture's driver logic against the reference
+// proxy's listener address. Returns all received bytes.
+func (echoDriver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
+	b, err := helpers.TCPRoundTrip(ctx, addr, echoPayload(), time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("ref drive: %w", err)
 	}
-	if subjAddr != "" {
-		subjBytes, err = helpers.TCPRoundTrip(ctx, subjAddr, payload, time.Second)
-		if err != nil {
-			return nil, nil, fmt.Errorf("subj drive: %w", err)
-		}
+	return b, nil
+}
+
+// DriveSubject runs the fixture's driver logic against the subject
+// proxy's listener address. Returns all received bytes.
+func (echoDriver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
+	b, err := helpers.TCPRoundTrip(ctx, addr, echoPayload(), time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("subj drive: %w", err)
 	}
-	return refBytes, subjBytes, nil
+	return b, nil
 }
 
 func (echoDriver) ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAddr string) (refBytes, subjBytes []byte, err error) {

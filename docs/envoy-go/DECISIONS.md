@@ -1041,3 +1041,46 @@ Dispatching to the correct filter after a successful handshake is a pure functio
 - `NewManagerWithBaseDir` is introduced (mirrors cluster package pattern) so filename-based DataSources in transport_socket can be resolved relative to the config file; `NewManager` delegates with `""` baseDir for phase-02 compat.
 
 ---
+
+## ADR-0034: Fixture driver interface — retire Drive, introduce DriveReference + DriveSubject
+
+**Supersedes (informal):** the phase-02 `fixture.Driver.Drive(ctx, refAddr, subjAddr)` interface method codified in `test/differential/fixture/fixture.go`. No prior formal ADR — hence the `(informal)` qualifier.
+**Status:** Accepted
+**Date:** 2026-04-24
+**Doctrine:** D-3.6
+
+### Context
+
+The phase-02 `fixture.Driver` interface exposed a single `Drive(ctx, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error)` method. The runner called it twice per fixture run — once as `Drive(ctx, refAddr, "")` to drive only the reference side, and once as `Drive(ctx, "", subjAddr)` to drive only the subject side. Drivers were required to no-op whichever address argument was empty.
+
+This design had three problems:
+
+1. **Implicit sentinel protocol.** The empty-string convention was undocumented at the call site and easy to misread. A driver author seeing `Drive(ctx, "", subjAddr)` had no indication that `refAddr == ""` was a caller-controlled no-op signal rather than a configuration error.
+2. **Unnecessary branching in every driver.** Each driver body contained two `if addr != "" { ... }` guards that existed purely to satisfy the interface contract, not to implement fixture logic.
+3. **Two return values per call, one always nil.** Each invocation allocated a `(refBytes, subjBytes)` pair but the caller only consumed one side; the other was always `nil`. This is a mild waste but more importantly a confusing signature.
+
+Phase 03 is the first phase to introduce a third fixture (0002-tls-tcp) whose driver needs to dial with a `*tls.Config`. The split interface makes the per-side method signatures simpler to extend (e.g., a future `DriveReferenceTLS` overload or context-carrying variant) and removes the no-op convention entirely.
+
+### Decision
+
+Retire `Drive(ctx, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error)` from the `fixture.Driver` interface. Replace it with two focused methods:
+
+```go
+DriveReference(ctx context.Context, addr string) ([]byte, error)
+DriveSubject(ctx context.Context, addr string)   ([]byte, error)
+```
+
+The runner calls `DriveReference` for the reference side and `DriveSubject` for the subject side, each with the correct address. No empty-string sentinel is passed; each method receives a valid `host:port` address unconditionally.
+
+All existing drivers (0000-tcp-echo, 0001-tcp-proxy-rr) are updated atomically in the same commit. The compile-time interface guard in 0001's driver (`var _ fixture.Driver = (*rrDriver)(nil)`) enforces completeness.
+
+### Consequences
+
+- The empty-string no-op convention is eliminated from all drivers and the runner.
+- Each driver method has a single responsibility: drive one side.
+- The shared payload helper (`echoPayload()`, `rrPayloads()`) is extracted as a package-level function so both `DriveReference` and `DriveSubject` remain deterministic and byte-identical across calls.
+- Phase-02 REVIEW Minor 6 is resolved.
+- Any future fixture driver must implement both methods; there is no default or wrapper. This is intentional — the interface is small (two methods) and forcing explicit implementation prevents accidental omission.
+- The `DistributionAsserter` optional interface and `ProbeAdmin` method are unaffected.
+
+---

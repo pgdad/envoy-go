@@ -98,37 +98,43 @@ static_resources:
 `, subjAdminPort, subjListenerPort, backendPorts[0], backendPorts[1], backendPorts[2])
 }
 
-// Drive sends 9 TCP round-trips against whichever side(s) are non-"".
-// Payload is deterministic so byte-exact echo comparison holds across the
-// post-Task-7 separate-per-side Drive calls (a randHex uid per call diverged).
-func (rrDriver) Drive(ctx context.Context, refAddr, subjAddr string) (refBytes, subjBytes []byte, err error) {
-	var payloads [][]byte
+// rrPayloads returns the deterministic per-request payloads for one side.
+// A static sequence gives the same debugging value as a per-call random uid
+// without diverging between DriveReference and DriveSubject calls.
+func rrPayloads() [][]byte {
+	p := make([][]byte, requestsPerSide)
 	for n := 0; n < requestsPerSide; n++ {
-		payloads = append(payloads, []byte(fmt.Sprintf("rr-%d\n", n)))
+		p[n] = []byte(fmt.Sprintf("rr-%d\n", n))
 	}
-	if refAddr != "" {
-		var sb strings.Builder
-		for i, p := range payloads {
-			b, err := helpers.TCPRoundTrip(ctx, refAddr, p, time.Second)
-			if err != nil {
-				return nil, nil, fmt.Errorf("ref drive[%d]: %w", i, err)
-			}
-			sb.Write(b)
+	return p
+}
+
+// DriveReference runs 9 TCP round-trips against the reference proxy's
+// listener address and returns the concatenated response bytes.
+func (rrDriver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
+	var sb strings.Builder
+	for i, p := range rrPayloads() {
+		b, err := helpers.TCPRoundTrip(ctx, addr, p, time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("ref drive[%d]: %w", i, err)
 		}
-		refBytes = []byte(sb.String())
+		sb.Write(b)
 	}
-	if subjAddr != "" {
-		var sb strings.Builder
-		for i, p := range payloads {
-			b, err := helpers.TCPRoundTrip(ctx, subjAddr, p, time.Second)
-			if err != nil {
-				return nil, nil, fmt.Errorf("subj drive[%d]: %w", i, err)
-			}
-			sb.Write(b)
+	return []byte(sb.String()), nil
+}
+
+// DriveSubject runs 9 TCP round-trips against the subject proxy's listener
+// address and returns the concatenated response bytes.
+func (rrDriver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
+	var sb strings.Builder
+	for i, p := range rrPayloads() {
+		b, err := helpers.TCPRoundTrip(ctx, addr, p, time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("subj drive[%d]: %w", i, err)
 		}
-		subjBytes = []byte(sb.String())
+		sb.Write(b)
 	}
-	return refBytes, subjBytes, nil
+	return []byte(sb.String()), nil
 }
 
 // AssertDistribution: each proxy's per-backend counts must be exactly [3,3,3]
