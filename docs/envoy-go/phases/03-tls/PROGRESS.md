@@ -118,3 +118,88 @@ $ go test -v -run TestApplyTLSParams ./internal/tls/...
 PASS
 ok  	github.com/esalaine/envoy-go/internal/tls	0.004s
 ```
+
+## Task 5 — internal/tls — NewDownstreamConfig + NewUpstreamConfig [ADR-0031]
+
+**Commits:** 85ceb0b
+**Notes:**
+- ADR-0031 (TLS stack selection: stdlib `crypto/tls`) landed in same commit as the code (first site composing a `*stdtls.Config` for production use).
+- `NewDownstreamConfig` and `NewUpstreamConfig` are both exported entry points; `commonTLSContextToConfig` is the unexported helper composing the three leaves (datasource/params/sni).
+- Plan's `anypb.UnmarshalTo(ts.GetTypedConfig(), ctx, proto.UnmarshalOptions{})` corrected to `ts.GetTypedConfig().UnmarshalTo(ctx)` — matching phase-02 `internal/filter/tcpproxy/filter.go` idiom; no `proto` or `anypb` import needed in `config.go`.
+- Plan's Step 1 `t.Skip` placeholders were fleshed out into full subtest bodies at implementation time (not in a separate Step 4): 3 downstream happy subtests + 11 downstream error subtests + 3 upstream happy subtests + 8 upstream error subtests + 1 `TestPKISanity` = 26 subtests total.
+- Upstream "SDS-bound secret" test deviation: the PLAN example omits a `trusted_ca` in the SDS test; without it, `NewUpstreamConfig` fires the `trusted_ca is required` check before `commonTLSContextToConfig` reaches the SDS check. Fixed by adding a valid `TrustedCa` to that specific test case so the SDS gate is actually exercised — the real code path is covered correctly.
+- British spellings ("honoured", "behaviour") converted to American in all Go comments per `.golangci.yml` `misspell.locale: US`.
+- 36 subtests green (26 new + 10 prior package subtests carried through); coverage 87.4%.
+- `golangci-lint run ./internal/tls/...` → empty (clean).
+**Outputs:**
+```
+$ go test -v ./internal/tls/... 2>&1 | grep -E "^(=== RUN|--- (PASS|FAIL)|PASS|FAIL|ok)"
+=== RUN   TestNewDownstreamConfig_Happy
+=== RUN   TestNewDownstreamConfig_Happy/inline_PEMs
+=== RUN   TestNewDownstreamConfig_Happy/tls_params_pulled_through
+=== RUN   TestNewDownstreamConfig_Happy/alpn_protocols_populated
+--- PASS: TestNewDownstreamConfig_Happy (0.00s)
+    --- PASS: TestNewDownstreamConfig_Happy/inline_PEMs (0.00s)
+    --- PASS: TestNewDownstreamConfig_Happy/tls_params_pulled_through (0.00s)
+    --- PASS: TestNewDownstreamConfig_Happy/alpn_protocols_populated (0.00s)
+=== RUN   TestNewDownstreamConfig_Errors
+=== RUN   TestNewDownstreamConfig_Errors/wrong_type_url
+=== RUN   TestNewDownstreamConfig_Errors/unmarshal_failure
+=== RUN   TestNewDownstreamConfig_Errors/missing_tls_certificates
+=== RUN   TestNewDownstreamConfig_Errors/malformed_PEM_in_certificate_chain
+=== RUN   TestNewDownstreamConfig_Errors/SDS-bound_secret
+=== RUN   TestNewDownstreamConfig_Errors/require_client_certificate
+=== RUN   TestNewDownstreamConfig_Errors/custom_validator_config
+=== RUN   TestNewDownstreamConfig_Errors/match_typed_subject_alt_names
+=== RUN   TestNewDownstreamConfig_Errors/verify_certificate_hash
+=== RUN   TestNewDownstreamConfig_Errors/password_on_key
+=== RUN   TestNewDownstreamConfig_Errors/invalid_tls_params_TLSv1_0
+--- PASS: TestNewDownstreamConfig_Errors (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/wrong_type_url (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/unmarshal_failure (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/missing_tls_certificates (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/malformed_PEM_in_certificate_chain (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/SDS-bound_secret (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/require_client_certificate (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/custom_validator_config (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/match_typed_subject_alt_names (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/verify_certificate_hash (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/password_on_key (0.00s)
+    --- PASS: TestNewDownstreamConfig_Errors/invalid_tls_params_TLSv1_0 (0.00s)
+=== RUN   TestNewUpstreamConfig_Happy
+=== RUN   TestNewUpstreamConfig_Happy/inline_CA_+_SNI_+_tls_params
+=== RUN   TestNewUpstreamConfig_Happy/alpn_protocols_populated
+=== RUN   TestNewUpstreamConfig_Happy/allow_renegotiation_false_default_no_error
+--- PASS: TestNewUpstreamConfig_Happy (0.00s)
+    --- PASS: TestNewUpstreamConfig_Happy/inline_CA_+_SNI_+_tls_params (0.00s)
+    --- PASS: TestNewUpstreamConfig_Happy/alpn_protocols_populated (0.00s)
+    --- PASS: TestNewUpstreamConfig_Happy/allow_renegotiation_false_default_no_error (0.00s)
+=== RUN   TestNewUpstreamConfig_Errors
+=== RUN   TestNewUpstreamConfig_Errors/wrong_type_url
+=== RUN   TestNewUpstreamConfig_Errors/missing_trusted_ca
+=== RUN   TestNewUpstreamConfig_Errors/malformed_CA_PEM
+=== RUN   TestNewUpstreamConfig_Errors/SDS-bound_secret
+=== RUN   TestNewUpstreamConfig_Errors/allow_renegotiation
+=== RUN   TestNewUpstreamConfig_Errors/custom_validator_config
+=== RUN   TestNewUpstreamConfig_Errors/match_typed_subject_alt_names
+=== RUN   TestNewUpstreamConfig_Errors/password_on_client-cert_key
+--- PASS: TestNewUpstreamConfig_Errors (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/wrong_type_url (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/missing_trusted_ca (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/malformed_CA_PEM (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/SDS-bound_secret (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/allow_renegotiation (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/custom_validator_config (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/match_typed_subject_alt_names (0.00s)
+    --- PASS: TestNewUpstreamConfig_Errors/password_on_client-cert_key (0.00s)
+=== RUN   TestPKISanity
+--- PASS: TestPKISanity (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	0.014s
+
+$ go test -cover ./internal/tls/...
+ok  	github.com/esalaine/envoy-go/internal/tls	0.014s	coverage: 87.4% of statements
+
+$ golangci-lint run ./internal/tls/...
+(empty — clean)
+```
