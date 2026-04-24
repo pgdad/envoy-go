@@ -2,6 +2,7 @@ package tcpproxy
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -64,14 +65,12 @@ func NewFilter(tc *anypb.Any, cm *cluster.Manager) (*Filter, error) {
 // the pump completes (or on dial failure). Logs but does not return errors.
 func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 	defer func() { _ = downstream.Close() }()
-	ep, err := f.cluster.PickEndpoint()
-	if err != nil {
-		log.Printf("tcpproxy: pick endpoint: %v", err)
+	if err := ctx.Err(); err != nil {
 		return
 	}
-	upstream, err := net.DialTimeout("tcp", ep.Addr(), f.cluster.ConnectTimeout())
+	upstream, err := f.cluster.Dial(ctx)
 	if err != nil {
-		log.Printf("tcpproxy: dial %s: %v", ep.Addr(), err)
+		log.Printf("tcpproxy: dial cluster %q: %v", f.cluster.Name(), err)
 		return
 	}
 	defer func() { _ = upstream.Close() }()
@@ -92,7 +91,10 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 type netConn struct{ net.Conn }
 
 func halfClose(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
+	switch t := c.(type) {
+	case *net.TCPConn:
+		_ = t.CloseWrite()
+	case *stdtls.Conn:
+		_ = t.CloseWrite()
 	}
 }

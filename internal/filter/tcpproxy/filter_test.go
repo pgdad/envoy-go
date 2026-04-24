@@ -2,8 +2,10 @@ package tcpproxy
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -316,4 +319,256 @@ func containsStr(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// mkTLSClusterMgr builds a cluster manager backed by a TLS cluster using the
+// committed PKI fixtures. The upstream server must present a cert signed by the
+// fixture CA with SNI "alpha.envoy-go.test" (upstream-alpha.pem).
+func mkTLSClusterMgr(t testing.TB, name, host string, port uint32) *cluster.Manager {
+	t.Helper()
+	caPEM, err := os.ReadFile("../../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+	ctx := &tlsv3.UpstreamTlsContext{
+		Sni: "alpha.envoy-go.test",
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: &corev3.DataSource{
+						Specifier: &corev3.DataSource_InlineBytes{InlineBytes: caPEM},
+					},
+				},
+			},
+		},
+	}
+	anyMsg, err := anypb.New(ctx)
+	if err != nil {
+		t.Fatalf("anypb.New(UpstreamTlsContext): %v", err)
+	}
+	ts := &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+	}
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{{
+				Name:                 name,
+				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+				ConnectTimeout:       durationpb.New(2 * time.Second),
+				TransportSocket:      ts,
+				LoadAssignment: &endpointv3.ClusterLoadAssignment{
+					ClusterName: name,
+					Endpoints: []*endpointv3.LocalityLbEndpoints{{
+						LbEndpoints: []*endpointv3.LbEndpoint{{
+							HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+									SocketAddress: &corev3.SocketAddress{
+										Address:       host,
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+									},
+								}},
+							}},
+						}},
+					}},
+				},
+			}},
+		},
+	}
+	cm, err := cluster.NewManagerWithBaseDir(bs, "")
+	if err != nil {
+		t.Fatalf("cluster.NewManagerWithBaseDir: %v", err)
+	}
+	return cm
+}
+
+// startTLSEchoServer starts a TLS echo server using the upstream-alpha PKI
+// fixture and returns the listener. Caller must close it.
+func startTLSEchoServer(t *testing.T) net.Listener {
+	t.Helper()
+	certPEM, err := os.ReadFile("../../../test/fixtures/0002-tls-tcp/pki/upstream-alpha.pem")
+	if err != nil {
+		t.Fatalf("read upstream-alpha.pem: %v", err)
+	}
+	keyPEM, err := os.ReadFile("../../../test/fixtures/0002-tls-tcp/pki/upstream-alpha.key.pem")
+	if err != nil {
+		t.Fatalf("read upstream-alpha.key.pem: %v", err)
+	}
+	pair, err := stdtls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", &stdtls.Config{
+		Certificates: []stdtls.Certificate{pair},
+		MinVersion:   stdtls.VersionTLS12,
+	})
+	if err != nil {
+		t.Fatalf("tls.Listen: %v", err)
+	}
+	go acceptEchoForTest(ln)
+	return ln
+}
+
+// TestFilter_Handle_CtxCanceledBeforeDial verifies that Handle returns
+// promptly when the context is already canceled before any dial attempt.
+func TestFilter_Handle_CtxCanceledBeforeDial(t *testing.T) {
+	// Grab a random port; the cluster will never be dialed.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := uint32(ln.Addr().(*net.TCPAddr).Port)
+	_ = ln.Close()
+
+	cm := mkClusterMgr(t, "c_cancel", "127.0.0.1", port)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "ingress_tcp",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_cancel"},
+	})
+	f, err := NewFilter(any, cm)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately before Handle is called
+
+	downstream, client, err := newConnPairForTest(t)
+	if err != nil {
+		t.Fatalf("newConnPairForTest: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		f.Handle(ctx, downstream)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handle did not return promptly with canceled context")
+	}
+}
+
+// TestFilter_Handle_TLSUpstreamTransparent verifies that Handle pumps bytes
+// through a TLS upstream without type-switching on the upstream transport.
+func TestFilter_Handle_TLSUpstreamTransparent(t *testing.T) {
+	backend := startTLSEchoServer(t)
+	defer func() { _ = backend.Close() }()
+	port := uint32(backend.Addr().(*net.TCPAddr).Port)
+
+	cm := mkTLSClusterMgr(t, "c_tls_echo", "127.0.0.1", port)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "ingress_tcp",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_tls_echo"},
+	})
+	f, err := NewFilter(any, cm)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("front listen: %v", err)
+	}
+	defer func() { _ = front.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		conn, e := front.Accept()
+		if e != nil {
+			return
+		}
+		f.Handle(ctx, conn)
+	}()
+
+	cli, err := net.Dial("tcp", front.Addr().String())
+	if err != nil {
+		t.Fatalf("dial front: %v", err)
+	}
+	defer func() { _ = cli.Close() }()
+
+	if _, err := cli.Write([]byte("hello")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = cli.(*net.TCPConn).CloseWrite()
+
+	var got []byte
+	buf := make([]byte, 4096)
+	_ = cli.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		n, readErr := cli.Read(buf)
+		if n > 0 {
+			got = append(got, buf[:n]...)
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	if string(got) != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
+}
+
+// TestFilter_Handle_HalfCloseOverTLS verifies that halfClose(*stdtls.Conn)
+// propagates a write-shutdown to the upstream after the downstream closes its
+// write side, allowing the upstream echo to complete and the downstream to read
+// back all data followed by EOF.
+func TestFilter_Handle_HalfCloseOverTLS(t *testing.T) {
+	backend := startTLSEchoServer(t)
+	defer func() { _ = backend.Close() }()
+	port := uint32(backend.Addr().(*net.TCPAddr).Port)
+
+	cm := mkTLSClusterMgr(t, "c_tls_half", "127.0.0.1", port)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "ingress_tcp",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_tls_half"},
+	})
+	f, err := NewFilter(any, cm)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("front listen: %v", err)
+	}
+	defer func() { _ = front.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		conn, e := front.Accept()
+		if e != nil {
+			return
+		}
+		f.Handle(ctx, conn)
+	}()
+
+	cli, err := net.Dial("tcp", front.Addr().String())
+	if err != nil {
+		t.Fatalf("dial front: %v", err)
+	}
+	defer func() { _ = cli.Close() }()
+
+	if _, err := cli.Write([]byte("hello")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Signal end-of-write so the echo server stops reading and echoes back.
+	_ = cli.(*net.TCPConn).CloseWrite()
+
+	_ = cli.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, readErr := io.ReadAll(cli)
+	if readErr != nil {
+		t.Fatalf("ReadAll: %v", readErr)
+	}
+	if string(got) != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
 }
