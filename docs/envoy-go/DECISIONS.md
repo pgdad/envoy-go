@@ -995,3 +995,49 @@ Phase 02's TCP proxy filter dialed endpoints directly via `net.DialTimeout` insi
 - `*stdtls.Conn.CloseWrite` sends a close_notify alert + TCP FIN, preserving the half-close propagation that ADR-0023's `netConn` wrapper relies on.
 
 ---
+
+## ADR-0033: Phase-03 filter-chain subset (supersedes ADR-0025)
+
+**Supersedes: ADR-0025**
+**Status:** Accepted
+**Date:** 2026-04-24
+**Doctrine:** D-3.5
+
+### Context
+
+ADR-0025 (phase 02) constrained `internal/listener.NewManager` to accept exactly one `filter_chain` per listener with empty `filter_chain_match` and no `transport_socket`. Phase 03 introduces SNI-based filter-chain dispatch — multiple chains per listener, each bound to a set of SNI patterns — as its core new surface. ADR-0025's one-chain constraint is obsolete.
+
+### Decision
+
+Phase-03 subset:
+
+1. `filter_chains` must be ≥ 1 (unchanged structural requirement).
+2. `filter_chain_match` may be nil/empty (catch-all, at most one per listener) OR populate only `server_names[]` and optionally `transport_protocol == "tls"`. Any other `FilterChainMatch` field populated (destination_port, prefix_ranges, source_type != ANY, source_ports, source_prefix_ranges, application_protocols) errors at build.
+3. `Listener.default_filter_chain` set → error.
+4. `transport_socket` on any chain may be nil (plaintext) or carry a `DownstreamTlsContext` (TLS).
+5. If any chain's `transport_socket` is non-nil, every chain on that listener must carry one — mixed TLS/plaintext listeners error.
+6. Plaintext listeners with more than one `filter_chain` error — SNI cannot match on plaintext connections, so multiple plaintext chains is almost always a misconfiguration.
+7. `require_client_certificate=true` on any chain errors (propagated from `tls.NewDownstreamConfig`).
+8. `listener_filters` is silently skipped (phase-02 carryover; phase 07 filter-chain framework revisits).
+9. Selection at handshake, in priority order: most-specific exact SNI match > suffix-wildcard match > universal wildcard match > catch-all (empty-match chain) > no match (handshake fails via `GetConfigForClient` returning `(nil, error)`; the connection closes).
+
+### Chain-selection propagation (implementation)
+
+Dispatching to the correct filter after a successful handshake is a pure function of the handshake-observed SNI. The worker goroutine, after `HandshakeContext` returns successfully, reads `tlsConn.ConnectionState().ServerName` and re-runs the same chain-match logic the `GetConfigForClient` callback ran, picking the first match. This is simpler than the `sync.Map` shuttle initially contemplated in SPEC §10 #2 approach (A) and avoids any per-connection state outside the `*stdtls.Conn` itself. Deterministic: SNI is fixed from the ClientHello through the connection's lifetime.
+
+### Rationale
+
+- SNI dispatch is the minimum complexity increment over ADR-0025 needed for phase 03. Full `FilterChainMatch` — including port ranges, source IP, ALPN, transport protocol beyond `"tls"` — remains deferred to phase 07 (filter chain framework).
+- Rejecting `Listener.default_filter_chain` (Envoy's alternate catch-all form) bounds phase-03's match-resolution surface. Phase 07 supports both forms.
+- Rejecting plaintext multi-chain catches a configuration class that's almost always a bug — SNI cannot match on plaintext connections, so the intent is ambiguous.
+- Single mechanism for chain selection (pure-function dispatch post-handshake) reduces the surface area of "how chain selection happens" from two places (callback + shuttle) to one (match logic reused in callback and worker).
+
+### Consequences
+
+- Fixture 0002 can build a 2-chain TLS listener with `alpha.envoy-go.test` → `c_alpha` and `beta.envoy-go.test` → `c_beta` — the phase's core demonstration.
+- A fixture later in phase 03 or after needing more than "exact + suffix wildcard + catch-all" must wait for phase 07.
+- `internal/listener.Manager.Stop` is unchanged (closes every bound listener socket; accept loops exit on `net.ErrClosed`).
+- `internal/listener/manager.go` grew by ~250 lines (build-time validation + chain-sort + `GetConfigForClient` + serveTLS worker + dispatch). The `sync.Map` shuttle from SPEC §10 #2 was not implemented; pure-function dispatch post-handshake is the locked mechanism.
+- `NewManagerWithBaseDir` is introduced (mirrors cluster package pattern) so filename-based DataSources in transport_socket can be resolved relative to the config file; `NewManager` delegates with `""` baseDir for phase-02 compat.
+
+---
