@@ -10,7 +10,7 @@ import (
 
 // loadDataSource resolves a DataSource envelope into raw bytes. See ADR-0029
 // for the phase-03 support matrix: inline_bytes, inline_string, filename are
-// honoured; environment_variable errors; zero value errors; SDS-bound secret
+// honored; environment_variable errors; zero value errors; SDS-bound secret
 // configs are handled at the caller layer (not reachable via this function).
 //
 // If filename is not absolute, it is resolved relative to baseDir. An empty
