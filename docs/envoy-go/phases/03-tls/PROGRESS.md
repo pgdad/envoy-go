@@ -489,7 +489,7 @@ $ golangci-lint run ./...
 
 ## Task 11 — internal/filter/tcpproxy — consume ctx via cluster.Dial + halfClose TLS ext [Minor 4 resolved]
 
-**Commits:** e20ecc2 (code), SHA-fill follows
+**Commits:** e20ecc2 (code), 715fa7e (SHA-fill)
 **Notes:**
 - Phase-02 REVIEW Minor 4 resolved: `Handle` no longer calls `net.DialTimeout` directly; replaced with `f.cluster.Dial(ctx)` (ADR-0032).
 - Early ctx-cancellation guard (`if err := ctx.Err(); err != nil { return }`) added at top of `Handle`, before any dial attempt.
