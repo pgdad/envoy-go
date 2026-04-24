@@ -315,3 +315,84 @@ ok  	github.com/esalaine/envoy-go/test/helpers	0.003s
 $ golangci-lint run ./test/helpers/...
 (empty — clean)
 ```
+
+## Task 9 — internal/cluster — Cluster.Dial(ctx) + upstream TLS [ADR-0032]
+
+**Commits:** e252dbe (code + ADR), SHA-fill follows
+**Notes:**
+- ADR-0032 (upstream TLS dialer model) landed in the same commit as the code.
+- `Cluster.Dial(ctx context.Context) (net.Conn, error)` added: plaintext path returns `*net.TCPConn`; TLS path returns `*stdtls.Conn` after `HandshakeContext(ctx)` completes. `connect_timeout` bounds TCP dial only; handshake bounded by `ctx`.
+- `NewManagerWithBaseDir(bs, baseDir)` added; existing `NewManager(bs)` delegates with `""`. Phase-02 callers (`internal/filter/tcpproxy`, `internal/listener` tests) are source-compatible. `cmd/envoy-go/main.go` updated to call `NewManagerWithBaseDir(bs, filepath.Dir(*cfgPath))`.
+- `buildCluster` gains transport_socket handling: checks type_url against `upstreamTLSContextTypeURL` (locally declared constant), delegates to `internaltls.NewUpstreamConfig`, stores result in `cl.upstreamCfg`.
+- `upstreamCfg` field kept unexported; same-package test access works from `package cluster` tests.
+- TDD red→green cycle confirmed: compile error on `Dial`/`upstreamCfg` before cluster.go changes; all 4 new Dial tests green after.
+- `io.Copy(c, c)` echo in test would deadlock on Linux via splice optimisation; replaced with explicit read/write loop `echoConn`.
+- `golangci-lint` clean (whole repo); `go test ./...` — only pre-existing `TestDifferential/0002-tls-tcp` failure (Task 13 not yet landed).
+- Test count: 23 tests in `internal/cluster` (19 phase-02 + 4 Dial + 4 TLS-manager = 27 total counting loadbalancer tests).
+**Outputs:**
+```
+$ go test ./internal/cluster -run TestCluster_Dial -v
+=== RUN   TestCluster_Dial_Plaintext
+--- PASS: TestCluster_Dial_Plaintext (0.00s)
+=== RUN   TestCluster_Dial_TLS
+--- PASS: TestCluster_Dial_TLS (0.00s)
+=== RUN   TestCluster_Dial_TLS_HandshakeFailure
+--- PASS: TestCluster_Dial_TLS_HandshakeFailure (0.00s)
+=== RUN   TestCluster_Dial_CtxCanceled
+--- PASS: TestCluster_Dial_CtxCanceled (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.004s
+
+$ go test ./internal/cluster/... -v 2>&1 | grep -E "^(=== RUN|--- (PASS|FAIL)|PASS|FAIL|ok)"
+=== RUN   TestCluster_Dial_Plaintext
+--- PASS: TestCluster_Dial_Plaintext (0.00s)
+=== RUN   TestCluster_Dial_TLS
+--- PASS: TestCluster_Dial_TLS (0.00s)
+=== RUN   TestCluster_Dial_TLS_HandshakeFailure
+--- PASS: TestCluster_Dial_TLS_HandshakeFailure (0.00s)
+=== RUN   TestCluster_Dial_CtxCanceled
+--- PASS: TestCluster_Dial_CtxCanceled (0.00s)
+=== RUN   TestRoundRobin_DistributionExact
+--- PASS: TestRoundRobin_DistributionExact (0.00s)
+=== RUN   TestRoundRobin_FirstPickIsEndpoint0
+--- PASS: TestRoundRobin_FirstPickIsEndpoint0 (0.00s)
+=== RUN   TestRoundRobin_ConcurrentDistributionExact
+--- PASS: TestRoundRobin_ConcurrentDistributionExact (0.00s)
+=== RUN   TestRoundRobin_ZeroEndpoints
+--- PASS: TestRoundRobin_ZeroEndpoints (0.00s)
+=== RUN   TestManager_HappyPath_Single
+--- PASS: TestManager_HappyPath_Single (0.00s)
+=== RUN   TestManager_HappyPath_Multi
+--- PASS: TestManager_HappyPath_Multi (0.00s)
+=== RUN   TestManager_Error_ZeroClusters
+--- PASS: TestManager_Error_ZeroClusters (0.00s)
+=== RUN   TestManager_Error_DuplicateName
+--- PASS: TestManager_Error_DuplicateName (0.00s)
+=== RUN   TestManager_Error_StrictDNS
+--- PASS: TestManager_Error_StrictDNS (0.00s)
+=== RUN   TestManager_Error_LogicalDNS
+--- PASS: TestManager_Error_LogicalDNS (0.00s)
+=== RUN   TestManager_Error_EDS
+--- PASS: TestManager_Error_EDS (0.00s)
+=== RUN   TestManager_Error_OriginalDST
+--- PASS: TestManager_Error_OriginalDST (0.00s)
+=== RUN   TestManager_Error_NonRoundRobinLB
+--- PASS: TestManager_Error_NonRoundRobinLB (0.00s)
+=== RUN   TestManager_Error_ZeroEndpoints
+--- PASS: TestManager_Error_ZeroEndpoints (0.00s)
+=== RUN   TestManager_Error_NonSocketAddressEndpoint
+--- PASS: TestManager_Error_NonSocketAddressEndpoint (0.00s)
+=== RUN   TestNewManager_TLSCluster
+--- PASS: TestNewManager_TLSCluster (0.00s)
+=== RUN   TestNewManager_TLSCluster_UnknownTransportSocket
+--- PASS: TestNewManager_TLSCluster_UnknownTransportSocket (0.00s)
+=== RUN   TestNewManager_TLSCluster_MissingTrustedCA
+--- PASS: TestNewManager_TLSCluster_MissingTrustedCA (0.00s)
+=== RUN   TestNewManager_MixedPlaintextAndTLSClusters
+--- PASS: TestNewManager_MixedPlaintextAndTLSClusters (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.006s
+
+$ golangci-lint run ./...
+(empty — clean)
+```
