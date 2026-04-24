@@ -659,7 +659,7 @@ $ golangci-lint run ./...
 
 ## Task 14 — BEHAVIOR_CONTRACT TLS subsection + TCP-proxy ADR-0028 cross-reference + ADR-0036
 
-**Commits:** 6ec3d0b (BEHAVIOR_CONTRACT.md + DECISIONS.md), SHA-FILL (this PROGRESS entry)
+**Commits:** 6ec3d0b (BEHAVIOR_CONTRACT.md + DECISIONS.md), e3a4f20 (this PROGRESS entry)
 **Notes:**
 - PLAN assigned ADR-0035 to this task; the number shifted to ADR-0036 because ADR-0035 was consumed by the Task-13 deviation ADR (fixture-0002 differential scope reduction, commit ddbe63e).
 - Upstream SNI + CA equivalence downgraded from "asserted" to "unit-tested only, not differentially asserted" per ADR-0035.
