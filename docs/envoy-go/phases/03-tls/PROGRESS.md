@@ -487,6 +487,61 @@ $ golangci-lint run ./...
 (empty — clean)
 ```
 
+## Task 12 — fixture.Driver interface split + ADR-0034 [Minor 6 resolved]
+
+**Commits:** 91bc8fa (atomic), SHA-fill follows
+**Notes:**
+- Atomic refactor: `Drive(ctx, refAddr, subjAddr)` retired from `fixture.Driver`; replaced by `DriveReference(ctx, addr)` + `DriveSubject(ctx, addr)` in the interface, both driver implementations (0000, 0001), and the runner — all in one commit alongside ADR-0034.
+- `echoPayload()` extracted as a package-level helper in 0000 so both methods share the deterministic payload without duplication.
+- `rrPayloads()` extracted similarly in 0001.
+- Compile-time interface guard in 0001 (`var _ fixture.Driver = (*rrDriver)(nil)`) enforces completeness.
+- ADR-0034 appended to `docs/envoy-go/DECISIONS.md` in the same commit.
+- `go build ./...` clean; `golangci-lint run ./...` clean.
+- Only pre-existing `TestDifferential/0002-tls-tcp` failure (Task 13 not yet landed).
+- Phase-02 REVIEW Minor 6 resolved.
+**Outputs:**
+```
+$ go build ./...
+(empty — clean)
+
+$ go test ./test/fixtures/0000-tcp-echo/driver/...
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+
+$ go test -v ./test/fixtures/0001-tcp-proxy-rr/driver/...
+=== RUN   TestAssertDistribution_Exact
+--- PASS: TestAssertDistribution_Exact (0.00s)
+=== RUN   TestAssertDistribution_Imbalanced
+--- PASS: TestAssertDistribution_Imbalanced (0.00s)
+=== RUN   TestAssertDistribution_AllZero
+--- PASS: TestAssertDistribution_AllZero (0.00s)
+=== RUN   TestAssertDistribution_WrongLength
+--- PASS: TestAssertDistribution_WrongLength (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+
+$ go vet ./test/differential/...
+(empty — clean)
+
+$ go test ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go
+ok  	github.com/esalaine/envoy-go/internal/admin
+ok  	github.com/esalaine/envoy-go/internal/bootstrap
+ok  	github.com/esalaine/envoy-go/internal/cluster
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy
+ok  	github.com/esalaine/envoy-go/internal/listener
+ok  	github.com/esalaine/envoy-go/internal/tls
+ok  	github.com/esalaine/envoy-go/test/helpers
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver
+FAIL	github.com/esalaine/envoy-go/test/differential  [pre-existing: 0002-tls-tcp driver not yet registered — Task 13]
+
+$ golangci-lint run ./...
+(empty — clean)
+
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -2
+## ADR-0033: Phase-03 filter-chain subset (supersedes ADR-0025)
+## ADR-0034: Fixture driver interface — retire Drive, introduce DriveReference + DriveSubject
+```
+
 ## Task 11 — internal/filter/tcpproxy — consume ctx via cluster.Dial + halfClose TLS ext [Minor 4 resolved]
 
 **Commits:** e20ecc2 (code), 715fa7e (SHA-fill)
