@@ -611,7 +611,7 @@ $ golangci-lint run ./...
 
 ## Task 13 — Fixture 0002-tls-tcp — capstone differential fixture
 
-**Commits:** (SHA-fill follows)
+**Commits:** 9b5baa4
 **Notes:**
 - Lights up differential gates (a) byte-exact response equality and (b) `[3,3,3]/[3,3,3]` distribution.
 - 7 new files + 2 modified (runner_test.go blank-import + this PROGRESS entry).
