@@ -1018,3 +1018,79 @@ All SPEC §3 / BOOTSTRAP §7.5 gates that are *in scope at lifecycle-state 4* ar
 | (f) `REVIEW.md` approved | DEFERRED | next session, lifecycle-state 5 → `superpowers:requesting-code-review` |
 
 No deviations. No new ADRs. STATE.md advances to `lifecycle-state: 5` with `next-skill: superpowers:requesting-code-review` in a follow-up commit.
+
+---
+
+## Task 16 — REVIEW.md follow-ups (state-3 re-entry per BOOTSTRAP §5.2)
+
+**Commits:** 98cc35b
+**Notes:** REVIEW.md (committed `d45c467` by the prior session) returned `APPROVED WITH FOLLOW-UPS` with 0 Critical, 4 Important (I-1..I-4), 8 Minor. The reviewer's own recommendation suggested deferring the four Important items to phase 04's first commit; this session chose Path A (strict §5.2 reading: any flagged issues re-enter at state 3) and landed all four inside phase 03.
+
+The four fixes shipped as a single commit (reviewer's preferred form: *"single follow-up commit"*). All are documentation / error-string / dead-code corrections — none touched runtime semantics.
+
+- **I-1** `internal/tls/params.go` `mapTLSVersion(TLS_AUTO)`: head-comment rewritten to match the actual return value `(0, nil)` and ADR-0030's "treat as unset" mapping. The stale "strict interpretation: explicit TLS_AUTO errors" sentence is gone; comment now explicitly cites ADR-0030 as authority.
+- **I-2** `internal/listener/manager.go:302`: `GetConfigForClient` SNI-no-match error string changed from `"listener %q: no filter_chain matches SNI %q"` to `"listener: %q: no filter_chain matches SNI %q"` (colon immediately after the package prefix), matching the project-wide `<package>: ...` discipline used by `cluster/`, `tls/`, etc. — making the error greppable as `^listener:` once `crypto/tls` propagates it out of the callback. TDD applied: `manager_test.go`'s existing `TestNewManager_MultiChain_NoSNIMatch` grew a `strings.HasPrefix(err.Error(), "listener:")` assertion that was red before the manager.go edit and green after.
+- **I-3** `docs/envoy-go/phases/03-tls/SPEC.md` §5.5 `tls_minimum_protocol_version` row: `TLS_AUTO → error` rewritten to `TLS_AUTO → no-op (treat as unset, per ADR-0030 — the proto-zero ambiguity prevents distinguishing "unset" from "explicitly chosen")`. The `tls_maximum_protocol_version` row already says "Same mapping" and inherits the fix automatically. ADR-0030 remains the single authoritative source.
+- **I-4** `test/fixtures/0002-tls-tcp/driver/driver.go:103-112`: deleted the orphaned `prefix := strings.TrimSuffix(strings.TrimSuffix(sni, ".envoy-go.test"), "alpha")` and its `_ = prefix` suppressor; the live `statPrefix` IIFE was the only consumer feeding the YAML template. `strings` is still imported (`strings.HasPrefix(sni, "alpha")` survives in the IIFE). Net `-4` LoC.
+
+**Outputs:**
+```
+$ git diff --stat HEAD~1..HEAD
+ docs/envoy-go/phases/03-tls/SPEC.md         |  2 +-
+ internal/listener/manager.go                |  2 +-
+ internal/listener/manager_test.go           |  9 ++++++++-
+ internal/tls/params.go                      | 16 ++++++++--------
+ test/fixtures/0002-tls-tcp/driver/driver.go |  4 ----
+ 5 files changed, 18 insertions(+), 15 deletions(-)
+
+$ go test -count=1 -run TestNewManager_MultiChain_NoSNIMatch ./internal/listener/
+# pre-fix run on the same test file (after the manager_test.go assertion was added but before the manager.go edit):
+--- FAIL: TestNewManager_MultiChain_NoSNIMatch (0.00s)
+    manager_test.go:839: error "listener \"l_nosni\": no filter_chain matches SNI \"gamma.envoy-go.test\"" does not start with "listener:" (project error-prefix discipline)
+FAIL
+FAIL    github.com/esalaine/envoy-go/internal/listener  0.003s
+
+# post-fix run:
+ok      github.com/esalaine/envoy-go/internal/listener  0.004s
+EXIT=0
+```
+
+Local state-3 gate sweep on the impl worktree (state-4 differential / fuzz / PKI determinism gates re-run fully under lifecycle-state 4 in the next session — `go test ./...` here happens to also exercise the differential package as a free incidental pass):
+
+```
+$ go build ./...
+(empty — clean, exit 0)
+
+$ go vet ./...
+(empty — clean, exit 0)
+
+$ golangci-lint run ./...
+(empty — clean, exit 0)
+
+$ go test -count=1 -timeout=10m ./...
+ok      github.com/esalaine/envoy-go/cmd/envoy-go       0.558s
+?       github.com/esalaine/envoy-go/internal/accesslog [no test files]
+ok      github.com/esalaine/envoy-go/internal/admin     0.039s
+ok      github.com/esalaine/envoy-go/internal/bootstrap 0.009s
+ok      github.com/esalaine/envoy-go/internal/cluster   0.008s
+?       github.com/esalaine/envoy-go/internal/filter    [no test files]
+ok      github.com/esalaine/envoy-go/internal/filter/tcpproxy   0.008s
+?       github.com/esalaine/envoy-go/internal/http      [no test files]
+ok      github.com/esalaine/envoy-go/internal/listener  0.008s
+?       github.com/esalaine/envoy-go/internal/runtime   [no test files]
+?       github.com/esalaine/envoy-go/internal/stats     [no test files]
+?       github.com/esalaine/envoy-go/internal/tcp       [no test files]
+ok      github.com/esalaine/envoy-go/internal/tls       0.016s
+?       github.com/esalaine/envoy-go/internal/xds       [no test files]
+?       github.com/esalaine/envoy-go/test/conformance   [no test files]
+ok      github.com/esalaine/envoy-go/test/differential  4.877s
+?       github.com/esalaine/envoy-go/test/differential/fixture  [no test files]
+?       github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver [no test files]
+ok      github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver     0.002s
+ok      github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver  0.002s
+?       github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen [no test files]
+ok      github.com/esalaine/envoy-go/test/helpers       0.004s
+EXIT=0
+```
+
+No deviations. No new ADRs. The 8 Minor REVIEW findings (M-1..M-8) carry forward to phase 04+ triage in the same way phase-02 REVIEW Minors 5/7 carried into phase 03 — they are not blocking and no fix is committed in this re-entry. STATE.md advances `lifecycle-state: 5 → 4` (re-entry: implementation now complete inclusive of REVIEW follow-ups; awaiting fresh state-4 verification by the next session) per BOOTSTRAP §5.1's "one forward state move per session" — the next session re-runs all six SPEC §3 / §7.5 gates from a fresh shell and quotes them verbatim.
