@@ -237,3 +237,51 @@ ok  	github.com/esalaine/envoy-go/internal/tls	0.003s
 $ golangci-lint run ./internal/tls/...
 (empty — clean)
 ```
+
+## Task 7 — test/fixtures/0002-tls-tcp/pki — deterministic CA + 4 leaves + gen tool
+
+**Commits:** 66af08e
+**Notes:**
+- Generator at `test/fixtures/0002-tls-tcp/pki/gen/main.go`; `package main`, not covered by `go test ./...`.
+- Default `outDir = "pki"` so `go run ./pki/gen` (run from `test/fixtures/0002-tls-tcp`) writes to `pki/`.
+- Plan fixes applied:
+  1. **Serial numbers**: replaced `new(big.Int).SetBytes([]byte(tag)[:8])` (panics on short tags) with a fixed `var serials = map[string]int64{...}` map.
+  2. **"9 PEMs" wording**: changed plan's incorrect "10 PEMs" to "9 PEMs" in the final `fmt.Println`.
+  3. **default outDir = "pki"**: plan's default `outDir = "."` would write PEMs to the fixture root; changed to `"pki"`.
+  4. **Go 1.26 determinism fix**: both `crypto/ecdsa.GenerateKey` (via `randutil.MaybeReadByte`) and `crypto/ecdh.P256().GenerateKey` (via `crypto/internal/rand.CustomReader` which silently replaces custom readers with the system DRBG unless `GODEBUG=cryptocustomrand=1`) are non-deterministic in Go 1.26. Fix: generate the raw 32-byte P-256 scalar from a per-tag `math/rand/v2.ChaCha8` stream and call `ecdh.P256().NewPrivateKey(scalar[:])` directly — this path bypasses all entropy injection. Signing uses `x509.CreateCertificate(nil, ...)` so `ecdsa.Sign` receives `nil` rand and uses RFC 6979 deterministic k-generation.
+- `go build ./...` clean; `go vet ./...` clean; `golangci-lint run ./...` clean.
+- Chain verified: `openssl verify -CAfile ca.pem server-alpha.pem upstream-beta.pem` → OK.
+- SANs verified: upstream leaves carry `DNS:alpha.envoy-go.test, DNS:localhost, IP Address:127.0.0.1`.
+**Outputs:**
+```
+$ cd test/fixtures/0002-tls-tcp && go run ./pki/gen
+ok: 9 PEMs written to pki
+
+$ ls pki/*.pem | sort
+pki/ca.pem
+pki/server-alpha.key.pem
+pki/server-alpha.pem
+pki/server-beta.key.pem
+pki/server-beta.pem
+pki/upstream-alpha.key.pem
+pki/upstream-alpha.pem
+pki/upstream-beta.key.pem
+pki/upstream-beta.pem
+
+$ ls pki/*.pem | wc -l
+9
+
+$ sha256sum pki/*.pem | sort > /tmp/first.sha && go run ./pki/gen && sha256sum pki/*.pem | sort > /tmp/second.sha && go run ./pki/gen && sha256sum pki/*.pem | sort > /tmp/third.sha && diff /tmp/first.sha /tmp/second.sha && diff /tmp/second.sha /tmp/third.sha && echo "determinism: PASS (all diffs empty)"
+ok: 9 PEMs written to pki
+ok: 9 PEMs written to pki
+determinism: PASS (all diffs empty)
+
+$ go build ./...
+(empty — clean)
+
+$ go vet ./...
+(empty — clean)
+
+$ golangci-lint run ./...
+(empty — clean)
+```
