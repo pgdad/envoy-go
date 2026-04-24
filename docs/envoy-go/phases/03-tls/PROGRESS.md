@@ -666,3 +666,91 @@ $ golangci-lint run ./...
 - Minor 8 resolved: TCP-proxy subsection "LB endpoint-selection sequence (NOT asserted)" paragraph now carries an explicit cross-reference to ADR-0028's `--concurrency 1` pin.
 - No code change; `go build ./...` and `golangci-lint run ./...` trivially clean (only markdown touched).
 - `go test ./...` still passes (pre-existing state from Task 13; no Go files modified).
+
+## Task 15 — Full verification gate sweep (SPEC §3 gates a/b/d/e)
+
+**Commits:** <sha> (gate sweep), <sha-fill> (SHA-fill)
+**Notes:**
+- All 6 SPEC §3 gates run; gates (a)–(b) and (d)–(e) green; gate (c) is N/A (conformance suite not yet implemented — future phase work).
+- 15 tasks complete; all landed on `phase/03-tls-impl`.
+- ADR numbering final: ADR-0029..0036. PLAN's originally-labelled ADR-0035 shifted to ADR-0036 when ADR-0035 was consumed in Task 13's deviation follow-up (fixture-0002 differential scope); this is documented in ADR-0035 itself.
+- No crashers in 30s × 3 fuzz targets (FuzzBootstrapLoad, FuzzTcpProxyFilter, FuzzTLSContextParse); no new `testdata/fuzz/` entries.
+- PKI determinism holds: `go run ./pki/gen` re-ran and `git diff --exit-code pki/` produced no diff.
+- Phase-02 regression intact: `go test ./cmd/envoy-go/...` PASS.
+- All 3 differential fixtures green: TestDifferential/0000-tcp-echo, TestDifferential/0001-tcp-proxy-rr, TestDifferential/0002-tls-tcp all PASS.
+- Gate (f) (release artefact / container image build) is next session's work (not a SPEC §3 local gate).
+**Outputs:**
+```
+$ go vet ./...
+(empty — clean, exit 0)
+
+$ golangci-lint run
+(empty — clean, exit 0)
+
+$ go test ./... -timeout=10m
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+ok  	github.com/esalaine/envoy-go/internal/cluster	(cached)
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	(cached)
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	(cached)
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	(cached)
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	5.278s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.002s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+
+$ go test ./internal/bootstrap -run=FuzzBootstrapLoad -fuzz=FuzzBootstrapLoad -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/781 completed
+…
+fuzz: elapsed: 30s, execs: 497057 (0/sec), new interesting: 41 (total: 822)
+fuzz: elapsed: 31s, execs: 497057 (0/sec), new interesting: 41 (total: 822)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.087s
+
+$ go test ./internal/filter/tcpproxy -run=FuzzTcpProxyFilter -fuzz=FuzzTcpProxyFilter -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/450 completed
+…
+fuzz: elapsed: 30s, execs: 4048279 (188602/sec), new interesting: 23 (total: 473)
+fuzz: elapsed: 31s, execs: 4048279 (0/sec), new interesting: 23 (total: 473)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.057s
+
+$ go test ./internal/tls -run=FuzzTLSContextParse -fuzz=FuzzTLSContextParse -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/241 completed
+…
+fuzz: elapsed: 30s, execs: 6214817 (415228/sec), new interesting: 70 (total: 311)
+fuzz: elapsed: 31s, execs: 6214817 (0/sec), new interesting: 70 (total: 311)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.046s
+
+$ cd test/fixtures/0002-tls-tcp && go run ./pki/gen
+ok: 9 PEMs written to pki
+$ git diff --exit-code pki/
+(empty — no diff, exit 0)
+
+$ go test ./cmd/envoy-go/...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(cached)
+
+$ go test ./test/fixtures/0000-tcp-echo/... ./test/fixtures/0001-tcp-proxy-rr/...
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	(cached)
+
+$ go test ./test/differential/... -timeout=5m -v (summary only)
+--- PASS: TestDifferential/0000-tcp-echo (1.11s)
+--- PASS: TestDifferential/0001-tcp-proxy-rr (1.11s)
+--- PASS: TestDifferential/0002-tls-tcp (1.16s)
+--- PASS: TestDifferential (3.39s)
+ok  	github.com/esalaine/envoy-go/test/differential	4.830s
+```
