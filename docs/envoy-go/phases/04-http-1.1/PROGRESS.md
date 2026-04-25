@@ -851,3 +851,106 @@ $ go test ./test/differential/ -v -timeout=12m
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	6.015s
 ```
+
+## Task 18 — REVIEW.md follow-ups (I-1..I-4 + M-1)
+
+**Commits:** 671a059
+**Notes:** State-3 re-entry per BOOTSTRAP §5.2. REVIEW.md (committed `04527eb`) flagged 4 Important (I-1..I-4) and 7 Minor (M-1..M-7) findings; verdict APPROVED WITH FOLLOW-UPS. Per project precedent (phase 03's `98cc35b`), the four Importants and the cleanest Minor (M-1) land inside this phase rather than deferring to phase 05. M-2..M-7 carry forward to future-phase REVIEW triage.
+
+I-1 (`internal/filter/hcm/`): `routerAction.do` now returns `errCloseAfterAction` when the upstream's response signals close (`resp.Close == true`); the connection loop's existing `closeAfterAction` handling at `connection.go:67-68` thus actually fires. New regression test `TestRunConnection_UpstreamConnectionCloseClosesDownstream` in `connection_test.go` asserts the close path under TDD (red→green captured). `TestRouterAction_DoHappy` was tightened to accept the sentinel return as non-failure (the `loopbackHTTPEcho` helper writes `Connection: close`, mirroring `TestRouterAction_DoDialFailureReturns503`'s pattern).
+
+I-2 (`internal/filter/hcm/actions_test.go:187`): `TestRouterAction_DoCtxCancel` now asserts `a.do` returns nil instead of silently discarding the return. Catches future regression where ctx-cancel propagates instead of mapping to a 503 local reply per SPEC §7. Test-only tightening; no production change.
+
+I-3 (`internal/filter/hcm/actions.go`): `routerAction.do` now propagates `ctx.Deadline` (if any) to the upstream socket via `SetDeadline` before `req.Write`. Closes the post-dial-stall window REVIEW I-3 named. Not TDD-able without flaky timing-based tests, per phase-03 `98cc35b` precedent for I-3-class changes.
+
+I-4 (`internal/cluster/manager.go` lines 83/86/89/140): stale "phase 02 …" qualifiers dropped per REVIEW prescription. The constraint is project-wide until a future phase relaxes it; the phase qualifier misled operators. Test assertions in `manager_test.go` updated to match. Line 115's "phase 03" qualifier is out of REVIEW scope and left unchanged. TDD discipline: test-side update first (red — four `_StrictDNS`/`_LogicalDNS`/`_EDS`/`_OriginalDST` cases), then production-side (green).
+
+M-1 (`docs/envoy-go/DECISIONS.md`): deleted orphan/duplicate "Lands in Task 13 …" tail line at file end. ADR-0043's body already documents the informal supersession in prose at line 1399. File now ends cleanly at line 1446 with ADR-0044's `Lands in Task 17. **Supersedes:** none — first phase to assert HTTP/1.1 equivalence.`.
+
+Local gates green from the impl worktree post-fix (state-3 work only; full state-4 verification — differential + fuzz — re-runs in the next session per BOOTSTRAP §5 state 4).
+
+**Outputs:**
+```
+$ go build ./...
+(empty — exit 0)
+
+$ go vet ./...
+(empty — exit 0)
+
+$ golangci-lint run ./...
+(empty — exit 0)
+
+$ go test -count=1 -timeout=5m ./internal/... ./test/helpers ./test/fixtures/... ./cmd/...
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.037s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.007s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.007s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.009s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.008s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	0.008s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	0.016s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.004s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.002s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.002s
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.098s
+```
+
+TDD red→green capture for I-1 (`TestRunConnection_UpstreamConnectionCloseClosesDownstream`):
+```
+# RED — pre-fix (resp.Close branch absent in routerAction.do)
+=== RUN   TestRunConnection_UpstreamConnectionCloseClosesDownstream
+    connection_test.go:241: expected EOF after first response (downstream should close per upstream Connection: close); got byte "H" + "TTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 7\r\nContent-Type: text/plain\r\n\r\necho:/y"
+    connection_test.go:250: runConnection did not return; expected close after upstream Connection: close
+--- FAIL: TestRunConnection_UpstreamConnectionCloseClosesDownstream (4.00s)
+FAIL
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm	4.007s
+FAIL
+
+# GREEN — post-fix
+=== RUN   TestRunConnection_UpstreamConnectionCloseClosesDownstream
+--- PASS: TestRunConnection_UpstreamConnectionCloseClosesDownstream (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+```
+
+TDD red→green capture for I-4 (`TestManager_Error_StrictDNS|LogicalDNS|EDS|OriginalDST`):
+```
+# RED — pre-fix (test assertions updated to "only STATIC clusters supported"
+# while production still emits "phase 02 supports only STATIC")
+=== RUN   TestManager_Error_StrictDNS
+    manager_test.go:157: error "cluster: \"c_dns\": phase 02 supports only STATIC clusters; got STRICT_DNS" does not contain "only STATIC clusters supported"
+--- FAIL: TestManager_Error_StrictDNS (0.00s)
+=== RUN   TestManager_Error_LogicalDNS
+    manager_test.go:172: error "cluster: \"c_dns\": phase 02 supports only STATIC clusters; got LOGICAL_DNS" does not contain "only STATIC clusters supported"
+--- FAIL: TestManager_Error_LogicalDNS (0.00s)
+=== RUN   TestManager_Error_EDS
+    manager_test.go:187: error "cluster: \"c_eds\": phase 02 supports only STATIC clusters; got EDS" does not contain "only STATIC clusters supported"
+--- FAIL: TestManager_Error_EDS (0.00s)
+=== RUN   TestManager_Error_OriginalDST
+    manager_test.go:202: error "cluster: \"c_orig\": phase 02 supports only STATIC clusters; got ORIGINAL_DST" does not contain "only STATIC clusters supported"
+--- FAIL: TestManager_Error_OriginalDST (0.00s)
+FAIL
+FAIL	github.com/esalaine/envoy-go/internal/cluster	0.003s
+FAIL
+
+# GREEN — post-fix
+=== RUN   TestManager_Error_StrictDNS
+--- PASS: TestManager_Error_StrictDNS (0.00s)
+=== RUN   TestManager_Error_LogicalDNS
+--- PASS: TestManager_Error_LogicalDNS (0.00s)
+=== RUN   TestManager_Error_EDS
+--- PASS: TestManager_Error_EDS (0.00s)
+=== RUN   TestManager_Error_OriginalDST
+--- PASS: TestManager_Error_OriginalDST (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.004s
+```
