@@ -1252,3 +1252,29 @@ Envoy's `match.prefix` is path-segment-aware: `prefix: "/api"` matches `/api`, `
 - Phase 07's filter-chain framework + HTTP-filter family supersede this ADR's "what predicates are supported" list (not the underlying ADR; phase 07's ADR records the expanded predicate set + tightened semantics).
 
 Lands in Task 4 (first use site of `routeTable.match`).
+
+---
+
+## ADR-0039: Per-request fresh upstream dial in phase-04 router
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.3, D-3.5
+**Settles:** SPEC ADR-L, phase-04 §4.1 actions.go
+
+### Context
+
+The router action in phase 04 must move bytes from the downstream request to a selected upstream endpoint and back. Two upstream-connection strategies are possible: (a) per-request fresh dial — every routed request opens a new TCP connection via `Cluster.Dial(ctx)` and closes it after the response is written; (b) connection pooling — keep a per-endpoint pool of upstream connections, idle-evict, max-streams, etc. Upstream Envoy uses (b). Implementing (b) faithfully is at least one phase of upstream-robustness work (timeouts, idle eviction, max-streams, idle-stream-cleanup, max-concurrent-streams-per-connection, draining-on-shutdown).
+
+### Decision
+
+Phase 04 picks (a) — per-request fresh dial. The router action calls `cluster.Dial(ctx)` on every request, defers `upstream.Close()`, and lets the connection close after the response is fully written.
+
+### Consequences
+
+- Performance is suboptimal vs upstream Envoy (extra TCP handshake per request, no upstream-side keep-alive). The differential gate does not assert connection-reuse, so the divergence is permitted.
+- Per-request `cluster.Dial` is what makes the round-robin distribution `[3,3,3]` deterministic on the subject side: every request takes one endpoint pick from the cluster's RR state, mod-3 partition over 9 requests. A pooled implementation would need different distribution-witness arithmetic.
+- Pool semantics land in the upstream-robustness family. That phase's ADR supersedes this one for the dial-strategy choice.
+- BEHAVIOR_CONTRACT's HTTP/1.1 subsection (ADR-0044) explicitly enumerates "upstream connection re-use" under "Not asserted" so future phases can change the strategy without breaking the contract.
+
+Lands in Task 5 (first use site of `routerAction.do`).
