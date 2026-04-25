@@ -436,7 +436,7 @@ $ go test ./internal/filter/hcm/ -v | grep -c "PASS"
 
 ## Task 11 — `--allow-h2c` CLI flag + listener-manager `listenerCtx` plumbing + ADR-0049
 
-**Commits:** (SHA-fill follows)
+**Commits:** beb9fe5 (SHA-fill: see next commit)
 **Notes:** Added `type listenerCtx struct { hasTLS bool; allowH2C bool }` to `internal/listener/manager.go`. Added `NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, allowH2C)` constructor; refactored `NewManager` and `NewManagerWithBaseDir` to delegate with `allowH2C=false`. Changed `filterConstructor` signature to include `lc listenerCtx`; updated both registry entries — tcpproxy ignores lc; hcm entry calls `hcm.NewFilterWithCtx(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C})`. Renamed `buildListenerRuntime` to `buildListenerRuntimeWithCtx` threading `allowH2C` into per-chain `listenerCtx` construction. Created `internal/filter/hcm/listener_ctx_stub.go` (TEMPORARY, deleted in Task 12) defining `ListenerCtx` struct and `NewFilterWithCtx` — stub remaps HTTP2→AUTO codec_type when `lc.HasTLS || lc.AllowH2C` to keep tests green. Added `--allow-h2c` flag to `cmd/envoy-go/main.go`; replaced `listener.NewManager` call with `listener.NewManagerWithBaseDirAndAllowH2C`. Added 3 new tests: `TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow` (PASS), `TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow` (t.Skip — validation lands Task 12), `TestNewManager_BackwardsCompat_DefaultsAllowH2CFalse` (PASS). ADR-0049 appended to DECISIONS.md. Stub judgment call: `NewFilterWithCtx` remaps HTTP2→AUTO (rather than calling NewFilter directly) so the with-allow and backwards-compat tests pass green in Task 11 without Task 12's real codec validation.
 **Outputs:**
 ```
