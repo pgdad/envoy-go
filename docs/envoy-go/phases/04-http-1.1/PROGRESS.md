@@ -552,3 +552,32 @@ $ go vet ./test/fixtures/0003-http11-routing/... ./test/differential/...
 $ golangci-lint run ./test/fixtures/0003-http11-routing/... ./test/differential/...
 <no output>
 ```
+
+## Task 16 — internal/filter/hcm — FuzzHCMConfigParse
+
+**Commits:** 56b29a8
+**Notes:** Short-budget fuzz target landed; 30s wall-time per ADR-0018. Three seed corpus entries (well-formed, truncated, wrong type_url). No crashers found in 30s session.
+**Outputs:**
+```
+$ cd internal/filter/hcm && go test -run=^$ -fuzz=FuzzHCMConfigParse -fuzztime=30s .
+fuzz: elapsed: 0s, gathering baseline coverage: 0/3 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 3/3 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 244102 (81353/sec), new interesting: 42 (total: 45)
+fuzz: elapsed: 6s, execs: 639869 (131906/sec), new interesting: 105 (total: 108)
+fuzz: elapsed: 9s, execs: 1057174 (139125/sec), new interesting: 142 (total: 145)
+fuzz: elapsed: 12s, execs: 1413065 (118622/sec), new interesting: 169 (total: 172)
+fuzz: elapsed: 15s, execs: 1847977 (144954/sec), new interesting: 195 (total: 198)
+fuzz: elapsed: 18s, execs: 2188299 (113470/sec), new interesting: 214 (total: 217)
+fuzz: elapsed: 21s, execs: 2825708 (212415/sec), new interesting: 230 (total: 233)
+fuzz: elapsed: 24s, execs: 3229342 (134576/sec), new interesting: 249 (total: 252)
+fuzz: elapsed: 27s, execs: 4229961 (333503/sec), new interesting: 259 (total: 262)
+fuzz: elapsed: 30s, execs: 4905149 (225094/sec), new interesting: 275 (total: 278)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.054s
+$ go test ./internal/filter/hcm/...
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.007s
+$ go vet ./internal/filter/hcm/...
+<no output>
+$ golangci-lint run ./internal/filter/hcm/...
+<no output>
+```
