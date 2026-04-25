@@ -114,3 +114,27 @@ $ go vet ./internal/filter/hcm/...
 $ golangci-lint run ./internal/filter/hcm/...
 <no output>
 ```
+## Task 4 — internal/filter/hcm — route.go + ADR-0038
+
+**Commits:** d57ae8b
+**Notes:** Route table + match engine landed; ADR-0038 records the prefix/path subset + the bytewise-vs-segment-aware divergence on prefix.
+**Outputs:**
+```
+$ cd internal/filter/hcm && go test -run 'TestMatch|TestRouteTable' -v .
+=== RUN   TestMatchPath
+--- PASS: TestMatchPath (0.00s)
+=== RUN   TestMatchPrefix
+--- PASS: TestMatchPrefix (0.00s)
+=== RUN   TestRouteTableMatch_FirstMatchWins
+--- PASS: TestRouteTableMatch_FirstMatchWins (0.00s)
+=== RUN   TestRouteTableMatch_QueryStringExcluded
+--- PASS: TestRouteTableMatch_QueryStringExcluded (0.00s)
+=== RUN   TestRouteTableMatch_NoMatch
+--- PASS: TestRouteTableMatch_NoMatch (0.00s)
+=== RUN   TestRouteTableMatch_EmptyTable
+--- PASS: TestRouteTableMatch_EmptyTable (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.002s
+$ go vet ./internal/filter/hcm/...
+$ golangci-lint run ./internal/filter/hcm/...
+```
