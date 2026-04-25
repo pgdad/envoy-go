@@ -131,6 +131,65 @@ func TestParseFilter_CodecTypeHTTP2(t *testing.T) {
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 }, "codec_type HTTP2")
 }
 
+// TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext verifies that
+// parseFilterWithCtx rejects codec_type=HTTP2 when both HasTLS and AllowH2C
+// are false (per ADR-0050 / phase-05.1 validation).
+func TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: false, AllowH2C: false})
+	if err == nil {
+		t.Fatal("expected error for HTTP2 + plaintext, got nil")
+	}
+	if !strings.Contains(err.Error(), "codec_type HTTP2 requires TLS") {
+		t.Errorf("error = %q, want substring 'codec_type HTTP2 requires TLS'", err.Error())
+	}
+}
+
+// TestParseFilter_CodecTypeHTTP2_AcceptsTLS verifies that HTTP2 is accepted
+// when HasTLS=true.
+func TestParseFilter_CodecTypeHTTP2_AcceptsTLS(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: true}); err != nil {
+		t.Errorf("HTTP2 + TLS should be accepted, got: %v", err)
+	}
+}
+
+// TestParseFilter_CodecTypeHTTP2_AcceptsAllowH2C verifies that HTTP2 is
+// accepted on a plaintext listener when AllowH2C=true.
+func TestParseFilter_CodecTypeHTTP2_AcceptsAllowH2C(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}); err != nil {
+		t.Errorf("HTTP2 + allowH2C should be accepted, got: %v", err)
+	}
+}
+
+// TestParseFilter_CodecTypeAUTO_Accepts_BothCases verifies that AUTO is
+// accepted with or without TLS context.
+func TestParseFilter_CodecTypeAUTO_Accepts_BothCases(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
+	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
+		if _, err := parseFilterWithCtx(any, cm, lc); err != nil {
+			t.Errorf("AUTO + lc=%+v should be accepted, got: %v", lc, err)
+		}
+	}
+}
+
+// TestParseFilter_CodecTypeHTTP1_Accepts_BothCases verifies that HTTP1 is
+// accepted regardless of TLS context.
+func TestParseFilter_CodecTypeHTTP1_Accepts_BothCases(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP1 })
+	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
+		if _, err := parseFilterWithCtx(any, cm, lc); err != nil {
+			t.Errorf("HTTP1 + lc=%+v should be accepted, got: %v", lc, err)
+		}
+	}
+}
+
 func TestParseFilter_CodecTypeHTTP3(t *testing.T) {
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP3 }, "codec_type HTTP3")
 }

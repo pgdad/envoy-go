@@ -26,6 +26,14 @@ const (
 	routerTypeURL = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
 )
 
+// ListenerCtx carries listener-side context the HCM filter constructor uses
+// at build time. Phase 05.1 added this for the --allow-h2c flag plumbing
+// (per ADR-0049 + ADR-0050). Future phases may extend.
+type ListenerCtx struct {
+	HasTLS   bool
+	AllowH2C bool
+}
+
 // Filter is the per-listener HTTP connection manager. It owns the resolved
 // route table, the cluster manager handle, and the configured stat_prefix
 // (forward-look for phase 06 stats per ADR-0041). NewFilter and Handle are
@@ -34,13 +42,27 @@ type Filter struct {
 	table      *routeTable
 	clusters   *cluster.Manager
 	statPrefix string
+	codecType  hcmv3.HttpConnectionManager_CodecType
 }
 
-// parseFilter decodes the typed_config Any into a *Filter. All errors begin
-// with "hcm: ". See ADR-0040 (HTTP-filter framework subset), ADR-0041
-// (stat_prefix + ignored-set), ADR-0042 (HTTP-filter chain shape), ADR-0038
-// (route match subset), and SPEC §2/§9.
+// NewFilterWithCtx is the phase-05.1 constructor variant. The existing
+// NewFilter delegates with the zero-value ListenerCtx (allowH2C=false,
+// hasTLS=false), preserving phase-04 semantics.
+func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx) (*Filter, error) {
+	return parseFilterWithCtx(tc, clusters, lc)
+}
+
+// parseFilter is the legacy entry point retained for existing tests.
+// It delegates to parseFilterWithCtx with a zero-value ListenerCtx.
 func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{})
+}
+
+// parseFilterWithCtx decodes the typed_config Any into a *Filter. All errors
+// begin with "hcm: ". See ADR-0040 (HTTP-filter framework subset), ADR-0041
+// (stat_prefix + ignored-set), ADR-0042 (HTTP-filter chain shape), ADR-0038
+// (route match subset), ADR-0050 (ALPN dispatch), and SPEC §2/§9.
+func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx) (*Filter, error) {
 	if got := tc.GetTypeUrl(); got != TypeURL {
 		return nil, fmt.Errorf("hcm: wrong type_url %q (want %q)", got, TypeURL)
 	}
@@ -49,11 +71,16 @@ func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
 		return nil, fmt.Errorf("hcm: unmarshal: %w", err)
 	}
 
-	switch msg.GetCodecType() {
+	codecType := msg.GetCodecType()
+	switch codecType {
 	case hcmv3.HttpConnectionManager_HTTP1, hcmv3.HttpConnectionManager_AUTO:
-		// ok
+		// ok — H1 or ALPN-driven
+	case hcmv3.HttpConnectionManager_HTTP2:
+		if !lc.HasTLS && !lc.AllowH2C {
+			return nil, fmt.Errorf("hcm: codec_type HTTP2 requires TLS transport_socket (or --allow-h2c for conformance testing)")
+		}
 	default:
-		return nil, fmt.Errorf("hcm: codec_type %s is not supported in phase 04 (HTTP/1.1 only)", msg.GetCodecType())
+		return nil, fmt.Errorf("hcm: codec_type %s is not supported in phase 05.1", codecType)
 	}
 
 	statPrefix := msg.GetStatPrefix()
@@ -83,7 +110,7 @@ func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
 		return nil, err
 	}
 
-	return &Filter{table: table, clusters: clusters, statPrefix: statPrefix}, nil
+	return &Filter{table: table, clusters: clusters, statPrefix: statPrefix, codecType: codecType}, nil
 }
 
 func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteConfiguration, error) {

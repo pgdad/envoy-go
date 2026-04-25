@@ -491,3 +491,31 @@ $ go test ./internal/filter/hcm/ -v | grep "PASS:" | wc -l
 $ go test ./internal/filter/hcm/h2/ -v | grep "PASS:" | wc -l
 45
 ```
+
+## Task 12 — HCM ALPN dispatch + codec_type=HTTP2 build-time validation [ADR-0050]
+
+**Commits:** TBD (SHA-fill in next commit)
+**Notes:** Deleted `listener_ctx_stub.go`. Moved `ListenerCtx` + `NewFilterWithCtx` into `config.go`. Renamed `parseFilter` → `parseFilterWithCtx(lc ListenerCtx)` with codec_type switch: HTTP1/AUTO accept; HTTP2 requires `lc.HasTLS || lc.AllowH2C` (else error); other codec_types reject. `Filter` struct gains `codecType` field. `Filter.Handle` replaced with codec-type dispatch switch: HTTP1→runConnection; HTTP2→runH2; AUTO→type-assert to `*tls.Conn`, HandshakeContext, NegotiatedProtocol=="h2" → runH2, else runConnection. Added `runH2` helper. Removed `t.Skip` from `TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow`; test passes via real validation rejection. Added 7 new codec_type validation tests in `config_test.go`; added 2 new Handle dispatch tests in `filter_test.go`. ADR-0050 appended to DECISIONS.md.
+**Outputs:**
+```
+$ go build ./...
+(clean)
+$ go vet ./...
+(clean)
+$ go test ./internal/filter/hcm/ -v | grep "--- PASS" | wc -l
+68
+$ go test ./internal/filter/hcm/h2/ -v | grep "--- PASS" | wc -l
+45
+$ go test ./internal/listener/ -v | grep "--- PASS" | wc -l
+32
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0050: ALPN-driven codec selection inside `Filter.Handle`
+$ go test ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2
+ok  	github.com/esalaine/envoy-go/internal/listener
+[all other packages PASS / no test files]
+$ ls internal/filter/hcm/listener_ctx_stub.go
+ls: cannot access 'internal/filter/hcm/listener_ctx_stub.go': No such file or directory
+```

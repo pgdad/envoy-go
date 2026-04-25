@@ -1655,4 +1655,41 @@ The flag is plumbed through:
 
 This ADR supersedes nothing.
 
+## ADR-0050: ALPN-driven codec selection inside `Filter.Handle`
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.5
+**Settles:** SPEC ADR-V; phase-05.1 §4.2 / §5.4.
+
+### Context
+
+Phase 05.1 introduces a second HTTP codec on the same listener side. The selection between H1 and H2 happens in one of two places:
+
+- **At the listener-side filter-chain match step**: ALPN becomes a `filter_chain_match.application_protocols[]` dimension. Each filter chain carries one codec; the listener manager picks the chain post-handshake based on the negotiated ALPN.
+- **Inside `Filter.Handle`**: HCM accepts both codecs (`codec_type: AUTO`) and dispatches at runtime by reading `*tls.Conn.ConnectionState().NegotiatedProtocol`.
+
+ADR-0033 (phase-03's filter-chain subset) explicitly limits filter-chain match to SNI; extending it to ALPN now would expand that subset and require a superseding ADR. Phase 07's filter-chain framework is the natural home for `application_protocols` chain matching.
+
+### Decision
+
+Phase 05.1 implements ALPN dispatch INSIDE `Filter.Handle`, not at the listener-side filter-chain match step. The dispatch logic:
+
+1. Switch on `f.codecType` (parsed at build time from the HCM proto):
+   - `HTTP1` → call phase-04's `runConnection` (H1 driver) unchanged.
+   - `HTTP2` → call `runH2` which constructs an `h2.ServerConn` and runs it. Build-time validation (in `parseFilterWithCtx`) ensures `HTTP2` is only accepted on TLS listeners OR when `listenerCtx.AllowH2C` is set.
+   - `AUTO` → if downstream is `*tls.Conn`, read `ConnectionState().NegotiatedProtocol`; on `"h2"` dispatch to `runH2`; otherwise (plaintext OR TLS-h1 OR TLS-empty-ALPN) dispatch to `runConnection`.
+
+2. Defensive `tlsConn.HandshakeContext(ctx)` no-op call before reading `NegotiatedProtocol`. Idempotent for already-completed handshakes; if a future refactor removes the listener-side handshake, the HCM still gets correct data. SPEC §11.6 mitigation.
+
+3. Listener-side `filter_chain_match.application_protocols[]` field — silently ignored (extends the phase-04 ignored set). ALPN is NOT a chain-match dimension at phase 05.1.
+
+### Consequences
+
+- ADR-0033's filter-chain subset is unchanged. Phase 07's filter-chain framework is the natural close for the `application_protocols` chain match.
+- The `Filter.Handle` switch is small and grep-verifiable: one type-assert + one `NegotiatedProtocol` read + one branch on `"h2"`. Easy to review; easy to test.
+- A misconfigured client speaking H1 against an `HTTP2`-only listener (rare; would require an h1 client and a server config explicitly forbidding h1) lands in the H2 driver and fails the preface check immediately, returning a connection-level error. Symmetrical to upstream Envoy's posture.
+- Per-listener `codec_type: AUTO` is the recommended config for production; `codec_type: HTTP2` is for h2-only listeners (and requires TLS or `--allow-h2c`).
+- Phase-05.2's `routerActionH2` will land on top of this same dispatch path; no changes to `Filter.Handle` are needed in 05.2.
+
 This ADR supersedes nothing.

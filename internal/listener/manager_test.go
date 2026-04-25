@@ -1312,7 +1312,6 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 // hcm.parseFilterWithCtx, which is Task 12's work. Remove this skip in Task 12
 // once parseFilterWithCtx enforces the constraint.
 func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testing.T) {
-	t.Skip("validation lands in Task 12")
 	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
