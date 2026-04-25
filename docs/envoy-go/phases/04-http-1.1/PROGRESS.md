@@ -429,3 +429,28 @@ $ go vet ./cmd/envoy-go/...
 $ golangci-lint run ./cmd/envoy-go/...
 <no output>
 ```
+
+## Task 11 — test/helpers — HTTPRoundTrip
+
+**Commits:** ab4520f
+**Notes:** HTTP/1.1 single-request round-trip helper landed; sets Connection: close by default for deterministic per-request RR partitioning per ADR-0039.
+**Outputs:**
+```
+$ cd test/helpers && go test -run TestHTTPRoundTrip -v .
+=== RUN   TestHTTPRoundTrip_Happy
+--- PASS: TestHTTPRoundTrip_Happy (0.00s)
+=== RUN   TestHTTPRoundTrip_CtxCanceledBeforeDial
+--- PASS: TestHTTPRoundTrip_CtxCanceledBeforeDial (0.00s)
+=== RUN   TestHTTPRoundTrip_ConnectionRefused
+--- PASS: TestHTTPRoundTrip_ConnectionRefused (0.00s)
+=== RUN   TestHTTPRoundTrip_BodyClosedAfterReturn
+--- PASS: TestHTTPRoundTrip_BodyClosedAfterReturn (0.00s)
+=== RUN   TestHTTPRoundTrip_SetHeaders
+--- PASS: TestHTTPRoundTrip_SetHeaders (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+$ go vet ./test/helpers/...
+<no output>
+$ golangci-lint run ./test/helpers/...
+<no output>
+```
