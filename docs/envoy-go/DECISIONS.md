@@ -1444,3 +1444,76 @@ Add a `## HTTP/1.1` subsection to `docs/envoy-go/BEHAVIOR_CONTRACT.md` enumerati
 - Phase 05 (HTTP/2) will reuse the same `## HTTP/1.1` subsection's structure for its `## HTTP/2` subsection. The header allow-list is shared across HTTP versions.
 
 Lands in Task 17. **Supersedes:** none — first phase to assert HTTP/1.1 equivalence.
+
+---
+
+## ADR-0045: Split phase 05 into 05.1 (downstream H2 + h2spec) + 05.2 (upstream H2 + fixture 0004)
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.5, D-3.6
+**Settles:** phase-05 SPEC §11.1 split-decision deferral; `BOOTSTRAP_PROMPT.md` §6.1 plan-size gate
+
+### Context
+
+Phase 05's `superpowers:writing-plans` session opened on the SPEC at `docs/envoy-go/phases/05-http-2/SPEC.md` (commit `612cdea`). Per `BOOTSTRAP_PROMPT.md` §5 state 2, the planner must apply the split gate ("if `PLAN.md` > ~25 tasks OR > ~1500 LoC estimated → split into NN.1, NN.2, …; update ROADMAP + STATE; stop") before writing the plan. Phase-05 SPEC §11.1 explicitly anticipated the gate would trip ("Phase 05 is the largest phase to date — the H2 codec alone is ~1500 LoC of state-machine plumbing, plus the cluster-side dial helper, plus the fixture, plus h2spec integration") and enumerated three plausible split axes with a recommended axis ("split by surface").
+
+The planner's own task-count + LoC estimate, derived from SPEC §4 + §11.1 + a TDD red/green/commit cycle per file, is:
+
+- **Codec sub-package** (`internal/filter/hcm/h2/`): 10 source files (`errors`, `preface`, `framer`, `hpack`, `settings`, `flow`, `stream`, `conn`, `client`, `h2_test` + `fuzz_test`); ~12–15 TDD tasks; ~1500 LoC per SPEC §11.1's own estimate.
+- **HCM integration**: `config.go` + `filter.go` (ALPN dispatch) + `actions.go` (`routerActionH2`) + `listener/manager.go` (listenerCtx) + `bootstrap.go` blank import; ~5 tasks; ~250 LoC.
+- **Cluster integration**: `cluster.go` (`UseH2()`) + `manager.go` (`HttpProtocolOptions` parsing + validation) + `dial_h2.go` (DialH2); ~3 tasks; ~150 LoC.
+- **Conformance suite**: `--allow-h2c` flag wiring + `test/conformance/h2spec/h2spec.go` + `h2spec_test.go` + `CONFORMANCE_PINS.md`; ~4 tasks; ~200 LoC.
+- **Fixture 0004**: PKI gen + backend + YAMLs + driver + helpers/h2 + runner wiring; ~6 tasks; ~850 LoC (PKI gen ~200, backend ~50, driver ~250, YAMLs ~250, expectations ~50, helpers ~100, runner glue ~50).
+- **Cross-cutting docs**: `BEHAVIOR_CONTRACT.md ## HTTP/2` subsection + 10 ADRs (ADR-P..ADR-Z); ~3–4 tasks; ~500 LoC.
+
+**Total: ~33–40 tasks (gate threshold 25); ~3450 LoC (gate threshold 1500). Both legs of the gate trip.** Per `BOOTSTRAP_PROMPT.md` §6.1 the planner must stop, split, and exit; per §6.3 the only release valve is splitting (not deferral via TODO/stub tasks).
+
+### Decision
+
+Phase 05 is split into two sequential sub-phases on the **split-by-surface axis** recommended by SPEC §11.1:
+
+- **Phase 05.1 — `downstream-h2`** — depends-on `04`; status `planned`. Scope: full server-side H2 codec sub-package under `internal/filter/hcm/h2/` (`errors.go`, `preface.go`, `framer.go`, `hpack.go`, `settings.go`, `flow.go`, `stream.go`, `conn.go` — but NOT `client.go`); HCM ALPN dispatch (`internal/filter/hcm/filter.go`); `codec_type: HTTP2` permitted (`internal/filter/hcm/config.go`); `listenerCtx` plumbing (`internal/listener/manager.go`); codec-neutral `directResponseAction.body()` + `writeH2` adapter (per phase-05 SPEC §5.5) — required in 05.1 because the h2spec gate exercises `direct_response`; `cmd/envoy-go --allow-h2c` test-only flag; `test/conformance/h2spec/`; NEW `docs/envoy-go/CONFORMANCE_PINS.md`; `BEHAVIOR_CONTRACT.md ## HTTP/2` SUBSECTION SCAFFOLD; fuzz targets `FuzzFrameStream` + `FuzzHPACKDecode`; phase-04 REVIEW Minor carry-forward triage (per phase-05 SPEC §12 + ADR-X). Differential surface at end of 05.1: gate (a) is vacuously green (no new fixture); gate (b) pre-existing fixtures still green; gate (c) **non-vacuous for the first time in the project** — h2spec runs against a `--allow-h2c` h2c listener and reports `failed == 0` over the threshold sections per ADR-U.
+
+- **Phase 05.2 — `upstream-h2`** — depends-on `05.1`; status `planned`. Scope: `internal/filter/hcm/h2/client.go` (from-scratch `ClientConn` + `RoundTrip`); `internal/cluster/dial_h2.go` (`Cluster.DialH2`); `Cluster.UseH2()` accessor; `internal/cluster/manager.go` `HttpProtocolOptions` parsing + validation (per phase-05 SPEC §5.8); blank import for `_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"`; `routerActionH2` variant in `internal/filter/hcm/actions.go`; full fixture `test/fixtures/0004-h2-routing/` (PKI gen + backends + driver + envoy.yaml + envoy-go.yaml + expectations.yaml + README); `test/helpers/h2.go`; `test/differential/runner_test.go` blank-import for the new fixture; extension of `BEHAVIOR_CONTRACT.md ## HTTP/2` with the upstream-H2 + fixture-0004 differential rules (header allow-list extensions for H2 pseudo-headers; closes ADR-0035 H2 leg). Differential surface at end of 05.2: NEW fixture `0004-h2-routing` differentially green (gate a); pre-existing fixtures still green (gate b); conformance still green (gate c).
+
+The two sub-phases are sequential because both touch the same Go package (`internal/filter/hcm/h2/`) — the server-side codec internals are 05.1's deliverable and 05.2's foundation, so 05.1 must reach `done` before 05.2 brainstorming opens.
+
+The phase-05 SPEC at `docs/envoy-go/phases/05-http-2/SPEC.md` (`612cdea`) **remains the master design document** for both sub-phases. Sub-phase SPECs (drafted by `superpowers:brainstorming` per ADR-0004 in the next two brainstorming sessions) carve coherent slices of the master SPEC's §4 deliverables; they do not replace or supersede it.
+
+### Rationale
+
+- **SPEC §11.1's authoring** already enumerated three split axes and recommended split-by-surface as the strongest. The planner concurs: split-by-surface keeps each sub-phase coherent (one codec direction per sub-phase), maintains an honest phase-done gate set per sub-phase (05.1 has gate (c) non-vacuous; 05.2 has gate (a) non-vacuous), and minimises cross-sub-phase coupling (the only coupling is at the codec sub-package's package boundary, which is type-only).
+- **Split-by-transport (option 2 in SPEC §11.1)** would put h2spec under 05.1 with no differential fixture (gate a vacuously green) — but so does split-by-surface. The transport split's downside is that it splits the codec by transport (TLS vs h2c) rather than by direction (server vs client), which means the same code paths land twice across sub-phases (once for h2c, once for HTTPS). Split-by-surface keeps each codec-direction file in exactly one sub-phase.
+- **Split-by-ends (option 3 in SPEC §11.1)** would put fixture 0004 under 05.1 with H1 upstream backends (h2 → h1 router), shipping a degenerate fixture that doesn't close ADR-0035. Strictly worse than split-by-surface.
+- **No-split** is unavailable: BOOTSTRAP §6.3 forbids cramming work into "TODO: extend later" tasks or incomplete stubs. The gate trip is structural, not optional.
+
+### Consequences
+
+- **ADR numbering shift.** Phase-05 SPEC §4.4 anticipated ADR-P..ADR-Z (10 ADRs) landing at numbers ADR-0045..ADR-0054. ADR-0045 is consumed by this split-decision ADR, so the lettered placeholders shift by one and land at **ADR-0046..ADR-0055** when their respective sub-phase planners write them. The mapping is (per the split-time scope assignment): ADR-P/Q/S/T/U/V/Z/X under 05.1 (8 ADRs); ADR-R/W/Y under 05.2 (3 ADRs). Total 11, not 10 — the split itself is the 11th ADR (ADR-0045). The SPEC's 10-ADR estimate stands; this ADR is the meta-decision wrapper.
+- **ROADMAP:** row `05` stays `in-progress` with `sub-phases = 05.1, 05.2`. Two new rows: `05.1` (depends-on `04`, planned) and `05.2` (depends-on `05.1`, planned). Per ROADMAP schema invariants, sub-phase rows are append-only and the parent row is never deleted; phase-05 reaches `done` when both 05.1 and 05.2 are `done`.
+- **Sub-phase directories:** `docs/envoy-go/phases/05.1-downstream-h2/` and `docs/envoy-go/phases/05.2-upstream-h2/` are created in this commit per `BOOTSTRAP_PROMPT.md` §6.2 step 2. Each holds a single `README.md` placeholder that names the master SPEC and enumerates the sub-phase's narrowed scope; the proper `SPEC.md` is drafted by `superpowers:brainstorming` per ADR-0004 in the next two sessions.
+- **Phase-05 directory:** `docs/envoy-go/phases/05-http-2/` retains its `SPEC.md` (`612cdea`) as the master design document. No `PLAN.md`, `PROGRESS.md`, or `REVIEW.md` will land under that directory — those land under the sub-phase directories. The phase-05 directory becomes closed read-only history at the parent level once both sub-phases reach `done`.
+- **Worktrees:** the closing `phase/05-http-2-plan` worktree (this session) leaves no PLAN.md per the §6.2 short-circuit. The next two brainstorming sessions branch fresh `phase/05.1-downstream-h2-spec` and (later, after 05.1 completes) `phase/05.2-upstream-h2-spec` worktrees from master tip per ADR-0003 + the project's per-phase-worktree convention.
+- **Scope of `--allow-h2c` flag (ADR-Z):** the flag lands in 05.1 because 05.1's h2spec gate requires it. 05.2 inherits the flag without re-deciding it; 05.2's fixture 0004 uses HTTPS h2 (real ALPN) and does not set `--allow-h2c`.
+- **Scope of `directResponseAction.body()` codec-neutral factoring (phase-05 SPEC §5.5):** lands in 05.1 because h2spec's threshold sections include section 8 (HTTP Message Exchanges) which exercises basic request-response shapes — `direct_response` is the simplest such shape and h2spec's conformance behaviour against it is sensitive to the response shape. The H1 adapter (`writeH1`) keeps its phase-04 behaviour; the H2 adapter (`writeH2`) is new in 05.1.
+- **Scope of phase-04 REVIEW carry-forward triage (phase-05 SPEC §12 + ADR-X):** lands in 05.1 because the dispositions (M-2/M-4/M-5/M-6/M-7) are textual / cosmetic + a forward-looking "phase-06-must-consume" tag; none of them touches upstream-H2 surface, so 05.1 is the natural landing point. 05.2's planner does not re-disposition.
+- **Per-cluster RR counter scope (phase-05 SPEC §10 #7):** the question only surfaces in 05.2 (the only sub-phase that introduces an H2-using cluster). 05.1's brainstorming need not address it; 05.2's brainstorming records the choice in its SPEC.
+- **Streaming-body-vs-wait-for-END_STREAM dispatch (phase-05 SPEC §10 #1):** decided in 05.1 (the dispatch decision lives in `serverStream.dispatch` per phase-05 SPEC §5.2 step 4). SPEC prescribes wait-for-END_STREAM; 05.1's planner records the choice.
+- **`H2Request`/`H2Response` shape vs stdlib re-use (phase-05 SPEC §10 #3):** decided per-direction. The SERVER-side request/response types live in 05.1 (used by `serverStream.dispatch` → action interface); the CLIENT-side request/response types live in 05.2 (used by `ClientConn.RoundTrip`). SPEC's recommendation (stdlib for action surface, internal types for codec) is followed in both sub-phases.
+- **`routerActionH2`/`routerAction` interface vs concrete switch (phase-05 SPEC §10 #6):** the question only surfaces in 05.2 (`routerActionH2` is 05.2's deliverable). 05.1 keeps the phase-04 small-interface shape unchanged; 05.2's brainstorming records whether to flatten or keep.
+- **`expectations.yaml` structured vs heredoc for fixture 0004 (phase-05 SPEC §10 #10):** 05.2 question; the SPEC prescribes heredoc (per phase-04 M-6 carry-forward); 05.2's planner may overrule.
+- **Phase-05 SPEC's gates (a)–(f) per §3** specialise per sub-phase: 05.1 inherits gates (b)/(c)/(d)/(e)/(f) with gate (a) vacuous; 05.2 inherits gates (a)/(b)/(c)/(d)/(e)/(f) all live (gate (c) inherits the threshold pinned by 05.1's `CONFORMANCE_PINS.md` + ADR-U; 05.2 does not move the threshold). The phase-05 §13 acceptance checklist is split across the two sub-phases' acceptance checklists (drafted at brainstorming time).
+
+This ADR supersedes nothing. It is the project's first plan-time-split ADR; future plan-time splits follow the same shape (estimate-driven gate trip + axis selection + sub-phase scope assignment + ADR-numbering-shift acknowledgement).
+
+### Cross-references
+
+- **`BOOTSTRAP_PROMPT.md` §5 state 2 GATE** — the source-of-truth for the planner's split mandate.
+- **`BOOTSTRAP_PROMPT.md` §6** — splitting policy (when, how, and the anti-pattern guard).
+- **`docs/envoy-go/phases/05-http-2/SPEC.md` §11.1** — the SPEC's own anticipation of the gate trip and its three split-axis enumeration with the split-by-surface recommendation.
+- **ADR-0004** — autonomous-brainstorming adaptation; the next two sub-phase brainstormings inherit this rule.
+- **ADR-0005** — autonomous-planning adaptation; the next two sub-phase planning sessions inherit this rule.
+- **ADR-0003** — worktree pattern; the next two brainstorming sessions follow this pattern.
+- **ADR-0035** — fixture-0002 differential scope; ADR-W (under 05.2) closes its H2 leg.
+- **`docs/envoy-go/phases/05.1-downstream-h2/README.md`** + **`docs/envoy-go/phases/05.2-upstream-h2/README.md`** — placeholder scope docs created by this commit; superseded by each sub-phase's `SPEC.md` when brainstorming next runs.
