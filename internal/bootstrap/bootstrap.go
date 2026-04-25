@@ -12,6 +12,14 @@ import (
 	// Phase 01 fixtures only use tcp_proxy; later phases register additional
 	// filters as fixtures introduce them.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	// Phase 04 (HTTP/1.1) registers the HCM network filter, the router HTTP
+	// filter, and the route-config proto so protojson round-trips fixtures
+	// 0003-* and any future HTTP fixtures without interpreting typed_config.
+	// Per ADR-0016 the addition is a registry-population mechanism, not a
+	// new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"gopkg.in/yaml.v3"
 )

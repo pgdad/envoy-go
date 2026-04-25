@@ -3,6 +3,8 @@ package bootstrap
 import (
 	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const sampleBootstrap = `
@@ -162,3 +164,47 @@ static_resources:
 // phase 02 — the `First*` helpers themselves are gone (ADR-0022). Listener and
 // cluster bootstrap traversal is now covered by `internal/listener` and
 // `internal/cluster` manager tests.
+
+func TestLoad_HCMRoundTrip(t *testing.T) {
+	yamlSrc := `
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+`
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.GetStaticResources().GetListeners()); got != 1 {
+		t.Fatalf("listeners: got %d, want 1", got)
+	}
+	if _, err := protojson.Marshal(bs); err != nil {
+		t.Fatalf("protojson.Marshal: %v", err)
+	}
+}
