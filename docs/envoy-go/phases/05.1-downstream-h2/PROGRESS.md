@@ -95,7 +95,7 @@ $ go vet ./internal/filter/hcm/h2/...
 
 ## Task 5 — h2 hpack state (per-connection HPACK encoder + decoder)
 
-**Commits:** <pending>
+**Commits:** 1d1b9d8
 **Notes:** Created `internal/filter/hcm/h2/hpack.go` with `hpackState` struct carrying `*hpack.Encoder`, `bytes.Buffer`, `*hpack.Decoder`, and `[]hpack.HeaderField`. `newHPACKState(maxTableSize uint32)` constructs both codec surfaces with the same initial table size; the decoder's emit-callback appends into the fields slice. `encodeHeaders` resets the buffer and calls `WriteField` for each header. `decodeBlock` resets fields, calls `dec.Write` and optionally `dec.Close`, returning `*Error{Code: ErrCompressionError}` on adversarial input. `updateMaxTableSize` propagates peer SETTINGS_HEADER_TABLE_SIZE changes to the encoder only. TDD red→green discipline followed: `hpack_test.go` was written first and confirmed to fail with `undefined: newHPACKState` (3 occurrences) before `hpack.go` was written. All 3 new HPACK tests plus all 14 prior tests (Tasks 2–4) pass green; `go vet` and `go build` are both clean.
 **Outputs:**
 ```
