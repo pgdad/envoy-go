@@ -38,7 +38,6 @@ func (m matchPrefix) matches(p string) bool { return strings.HasPrefix(p, string
 // routerAction (proxies via Cluster.Dial). Returning errCloseAfterAction
 // from do signals the connection loop to close after this iteration; other
 // non-nil errors propagate and trigger downstream close.
-// nolint:unused // Used in Task 6/7 (connection loop).
 type routeAction interface {
 	do(ctx context.Context, req *http.Request, bw *bufio.Writer) error
 }
@@ -48,7 +47,7 @@ type routeAction interface {
 // keep route.go free of any dependency on the cluster manager.
 type routeEntry struct {
 	match  routeMatch
-	action routeAction // nolint:unused // Used in Task 6/7 (connection loop).
+	action routeAction
 }
 
 // routeTable is the resolved route_config. Routes are evaluated in
