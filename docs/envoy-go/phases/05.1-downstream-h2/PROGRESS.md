@@ -87,3 +87,32 @@ PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.001s
 $ go vet ./internal/filter/hcm/h2/...
 ```
+
+## Task 3 — h2 connection preface read + check (RFC 9113 §3.4)
+
+**Commits:** <pending>
+**Notes:** Created `internal/filter/hcm/h2/preface.go` with the 24-byte `clientPrefaceBytes` constant and `readClientPreface(io.Reader) error` free function that uses `io.ReadFull` to read exactly 24 bytes and compares byte-by-byte against the canonical preface, returning `*Error{Code: ErrProtocolError}` on truncation or mismatch and nil on success. TDD red→green discipline followed: `preface_test.go` was written first and confirmed to fail with `undefined: readClientPreface` on all four test functions before `preface.go` was written. All four tests (`TestReadClientPreface_Good`, `TestReadClientPreface_BadByteAtEachPosition`, `TestReadClientPreface_Truncated`, `TestReadClientPreface_EmptyEOF`) pass green; `go vet` and `go build` are both clean.
+**Outputs:**
+```
+$ go test -v ./internal/filter/hcm/h2/...
+=== RUN   TestErrorCodeStrings
+--- PASS: TestErrorCodeStrings (0.00s)
+=== RUN   TestConnError_PrefixAndShape
+--- PASS: TestConnError_PrefixAndShape (0.00s)
+=== RUN   TestStreamError_PrefixAndShape
+--- PASS: TestStreamError_PrefixAndShape (0.00s)
+=== RUN   TestError_UnwrapsUnderlying
+--- PASS: TestError_UnwrapsUnderlying (0.00s)
+=== RUN   TestReadClientPreface_Good
+--- PASS: TestReadClientPreface_Good (0.00s)
+=== RUN   TestReadClientPreface_BadByteAtEachPosition
+--- PASS: TestReadClientPreface_BadByteAtEachPosition (0.00s)
+=== RUN   TestReadClientPreface_Truncated
+--- PASS: TestReadClientPreface_Truncated (0.00s)
+=== RUN   TestReadClientPreface_EmptyEOF
+--- PASS: TestReadClientPreface_EmptyEOF (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.001s
+$ go vet ./internal/filter/hcm/h2/...
+$ go build ./internal/filter/hcm/h2/...
+```
