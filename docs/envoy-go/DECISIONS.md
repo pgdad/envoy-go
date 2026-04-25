@@ -1278,3 +1278,97 @@ Phase 04 picks (a) — per-request fresh dial. The router action calls `cluster.
 - BEHAVIOR_CONTRACT's HTTP/1.1 subsection (ADR-0044) explicitly enumerates "upstream connection re-use" under "Not asserted" so future phases can change the strategy without breaking the contract.
 
 Lands in Task 5 (first use site of `routerAction.do`).
+
+---
+
+## ADR-0040: Phase-04 HTTP-filter framework subset
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.2, D-3.5
+**Settles:** SPEC ADR-I, phase-04 §4.1 config.go (http_filters validation)
+
+### Context
+
+Envoy's HCM consumes a chain of HTTP filters: each filter is a proto with a name + typed_config; at runtime each filter is invoked through the iteration protocol (decode-headers, decode-data, decode-trailers, encode-headers, encode-data, encode-trailers, with stop/continue/buffer iteration directives). Implementing the full filter framework is at least one phase of work and pulls in stream buffering, stop-iteration semantics, and a full HTTP-filter SDK surface.
+
+### Decision
+
+Phase 04 permits exactly one HTTP filter, named `envoy.filters.http.router` with `typed_config.type_url == "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"`. The Router proto's body is unmarshalled but every Router-proto field is silently ignored (`dynamic_stats`, `start_child_span`, `upstream_log[]`, `suppress_envoy_headers`, `strict_check_headers`, `respect_expected_rq_timeout`, `suppress_grpc_request_failure_code_stats`, `upstream_http_filters`).
+
+The filter-iteration protocol is NOT introduced. Instead, the router is invoked by direct function call inside the HCM connection loop: `entry.action.do(ctx, req, bw)` where `entry.action` is a `routerAction`. There is no `decode_headers`, no `Continue`/`StopIteration`, no per-filter buffering.
+
+### Consequences
+
+- The phase-04 HCM is a degenerate filter framework by construction: the chain has exactly one entry, the iteration protocol is absent, and the router is the only filter that can run.
+- Phase 07's filter-chain framework supersedes this ADR with the actual iteration protocol + multi-filter chain support. ADR-0040 records the chosen subset; the supersession is total (not partial).
+- Router-proto fields silently ignored at phase 04 may be moved to "honoured" by future ADRs; each such promotion lands in the phase that consumes the field, not in this ADR.
+- The router's "do everything in one call" shape is what makes the per-request fresh-dial in ADR-0039 expressible without a buffering layer between `decode_headers` and the upstream dial.
+
+Lands in Task 7 (first use site of `parseFilter`'s `requireRouterOnlyHTTPFilters` validation). **Supersedes:** none — phase 04 is the first HCM phase.
+
+---
+
+## ADR-0041: HCM `stat_prefix` + silently-ignored field set
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.5
+**Settles:** SPEC ADR-N, SPEC §10 #9, phase-04 §4.1 config.go
+
+### Context
+
+The `HttpConnectionManager` proto carries dozens of fields, only a small subset of which phase 04 exercises. Every field falls into exactly one of three categories: REQUIRED (must be set, validated), ERRORED (set means hard fail), or SILENTLY IGNORED (set is accepted but no behaviour change). The category for each field needs to be ADR'd because future phases may move members between categories.
+
+### Decision
+
+REQUIRED fields:
+
+- `codec_type` (must be `HTTP1` or `AUTO`).
+- `stat_prefix` (must be non-empty string; stored on `Filter` for forward use; phase 06 stats consumer; settles SPEC §10 #9 to `string` field).
+- `route_specifier` (must be `route_config`).
+- `http_filters` (must be exactly one `[router]` per ADR-0042).
+
+ERRORED fields:
+
+- `route_specifier=Rds`, `route_specifier=ScopedRoutes`, `route_specifier=ScopedRds`.
+- `codec_type=HTTP2`, `codec_type=HTTP3`.
+
+Every other top-level HCM proto field is SILENTLY IGNORED. The phase-04 ignored-set is enumerated at the proto-package field set in v1.32.4: `tracing`, `access_log[]`, `http_protocol_options`, `common_http_protocol_options`, `server_header_transformation`, `local_reply_config`, `internal_redirect_policy`, `request_id_extension`, `path_with_escaped_slashes_action`, `merge_slashes`, `xff_num_trusted_hops`, `via`, `proxy_100_continue`, `stream_idle_timeout`, `request_timeout`, `request_headers_timeout`, `drain_timeout`, `delayed_close_timeout`, `forward_client_cert_details`, `original_ip_detection_extensions`, `idle_timeout`, `max_request_headers_kb`, `request_headers_kb_limit`, `add_user_agent`, `set_current_client_cert_details`, `mutex_tracing`, `proxy_status_config`, `early_header_mutation_extensions`, `header_validation_config`, `append_local_overload`, `pass_through_is_optional`, `request_block_size`, `strip_matching_host_port`, `strip_any_host_port`, `strip_trailing_host_dot`, `add_proxy_protocol_connection_state`.
+
+Route-level silently-ignored: `request_headers_to_add`, `request_headers_to_remove`, `response_headers_to_add`, `response_headers_to_remove`, `metadata`, `decorator`, `tracing`, `per_request_buffer_limit_bytes`.
+
+### Consequences
+
+- Phase-04 fixtures may inherit upstream-Envoy bootstraps that include any of the above fields without scrubbing — config.go silently ignores them. Matches Envoy's forward-compatible posture on irrelevant-to-the-asserted-surface fields.
+- Phase 06+ may move members from "ignored" to "honoured" with a superseding ADR landed in the same commit as the new behaviour.
+- Phase 07's filter-chain framework partially supersedes the `http_filters` REQUIRED rule (allowing >1 entry); the remainder of ADR-0041 stays.
+
+Rationale for silent-ignore (vs error): the alternative — erroring on every unknown-but-present field — would force fixture authors to scrub upstream-Envoy bootstraps to phase-04's exact field set, which is brittle, high-friction, and surfaces no real misconfiguration.
+
+Lands in Task 7 alongside ADR-0040. **Supersedes:** none.
+
+---
+
+## ADR-0042: Phase-04 HTTP-filter chain shape — exactly `[router]`
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.5
+**Settles:** SPEC ADR-O, phase-04 §4.1 config.go (http_filters validation)
+
+### Context
+
+Envoy's HCM has an HTTP-filter chain (`http_filters[]` field) separate from the network-filter chain (which phase 02's ADR-0033 covers). Phase-04 exercises only the router action; no other HTTP filter is consumed.
+
+### Decision
+
+`http_filters[]` must be exactly one entry, named `envoy.filters.http.router` with the Router proto type_url. `http_filters` empty, `http_filters` with two entries (even if both router), or `http_filters[0]` named/typed differently — all error at build with `hcm: http_filters: ...`. `typed_per_filter_config` on routes (per-route filter override) errors at build (SPEC §2).
+
+### Consequences
+
+- Phase-04's filter sub-domain is degenerate by construction. The router-only constraint is the smallest shape that makes "the router action runs" expressible.
+- Phase 07's filter-chain framework supersedes this with the multi-filter shape + iteration protocol.
+- ADR-0033 (network-filter chains, phase 02) and ADR-0042 (HTTP-filter chains, phase 04) share a "minimal chain shape" theme but address disjoint protocol layers.
+
+Lands in Task 7 alongside ADR-0040 + ADR-0041. **Supersedes:** none — disjoint from ADR-0033's network-filter-chain coverage.
