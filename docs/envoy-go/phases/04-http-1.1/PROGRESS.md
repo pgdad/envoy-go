@@ -305,3 +305,78 @@ $ go vet ./internal/filter/hcm/...
 $ golangci-lint run ./internal/filter/hcm/...
 <no output>
 ```
+
+## Task 8 — internal/filter/hcm — filter.go + listener manager HCM registration
+
+**Commits:** c308cb8
+**Notes:** NewFilter + Handle landed on top of the Task-7 Filter struct; listener manager filterRegistry now registers HCM type_url alongside tcpproxy. Listener-wrap discipline (`listener: %q: filter_chains[%d]: hcm: ...`) verified end-to-end. One deviation from spec text: "cancelled" → "canceled" (US spelling) required by golangci-lint misspell linter.
+**Outputs:**
+```
+$ cd internal/filter/hcm && go test -v .
+=== RUN   TestParseFilter_RouteHeadersSet
+--- PASS: TestParseFilter_RouteHeadersSet (0.00s)
+=== RUN   TestParseFilter_RouteQueryParamsSet
+--- PASS: TestParseFilter_RouteQueryParamsSet (0.00s)
+=== RUN   TestParseFilter_RouteRuntimeFraction
+--- PASS: TestParseFilter_RouteRuntimeFraction (0.00s)
+=== RUN   TestParseFilter_DirectResponseStatusZero
+--- PASS: TestParseFilter_DirectResponseStatusZero (0.00s)
+=== RUN   TestParseFilter_DirectResponseStatus600
+--- PASS: TestParseFilter_DirectResponseStatus600 (0.00s)
+=== RUN   TestParseFilter_DirectResponseInlineBytes
+--- PASS: TestParseFilter_DirectResponseInlineBytes (0.00s)
+=== RUN   TestParseFilter_DirectResponseFilename
+--- PASS: TestParseFilter_DirectResponseFilename (0.00s)
+=== RUN   TestParseFilter_DirectResponseEmptyBody
+--- PASS: TestParseFilter_DirectResponseEmptyBody (0.00s)
+=== RUN   TestParseFilter_RouterActionWeightedClusters
+--- PASS: TestParseFilter_RouterActionWeightedClusters (0.00s)
+=== RUN   TestParseFilter_RouterActionClusterHeader
+--- PASS: TestParseFilter_RouterActionClusterHeader (0.00s)
+=== RUN   TestParseFilter_RouterActionUnknownCluster
+--- PASS: TestParseFilter_RouterActionUnknownCluster (0.00s)
+=== RUN   TestParseFilter_RouterActionHappy
+--- PASS: TestParseFilter_RouterActionHappy (0.00s)
+=== RUN   TestRunConnection_DirectResponseHappy
+--- PASS: TestRunConnection_DirectResponseHappy (0.00s)
+=== RUN   TestRunConnection_KeepAliveTwoRequests
+--- PASS: TestRunConnection_KeepAliveTwoRequests (0.00s)
+=== RUN   TestRunConnection_RouteNotFoundReturns404
+--- PASS: TestRunConnection_RouteNotFoundReturns404 (0.00s)
+=== RUN   TestRunConnection_ExpectHeaderReturns417
+--- PASS: TestRunConnection_ExpectHeaderReturns417 (0.00s)
+=== RUN   TestRunConnection_UpgradeReturns501
+--- PASS: TestRunConnection_UpgradeReturns501 (0.00s)
+=== RUN   TestRunConnection_BadRequestReturns400
+--- PASS: TestRunConnection_BadRequestReturns400 (0.00s)
+=== RUN   TestRunConnection_BodyDrainedBetweenRequests
+--- PASS: TestRunConnection_BodyDrainedBetweenRequests (0.00s)
+=== RUN   TestNewFilter_HappyPath
+--- PASS: TestNewFilter_HappyPath (0.00s)
+=== RUN   TestNewFilter_PreservesParseErrorPrefix
+--- PASS: TestNewFilter_PreservesParseErrorPrefix (0.00s)
+=== RUN   TestFilter_Handle_OneRequestThenEOF
+--- PASS: TestFilter_Handle_OneRequestThenEOF (0.00s)
+=== RUN   TestFilter_Handle_CtxAlreadyCancelledShortCircuits
+--- PASS: TestFilter_Handle_CtxAlreadyCancelledShortCircuits (0.00s)
+=== RUN   TestMatchPath
+--- PASS: TestMatchPath (0.00s)
+=== RUN   TestMatchPrefix
+--- PASS: TestMatchPrefix (0.00s)
+=== RUN   TestRouteTableMatch_FirstMatchWins
+--- PASS: TestRouteTableMatch_FirstMatchWins (0.00s)
+=== RUN   TestRouteTableMatch_QueryStringExcluded
+--- PASS: TestRouteTableMatch_QueryStringExcluded (0.00s)
+=== RUN   TestRouteTableMatch_NoMatch
+--- PASS: TestRouteTableMatch_NoMatch (0.00s)
+=== RUN   TestRouteTableMatch_EmptyTable
+--- PASS: TestRouteTableMatch_EmptyTable (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.007s
+$ go test -race ./internal/listener/...
+ok  	github.com/esalaine/envoy-go/internal/listener	1.025s
+$ go vet ./internal/listener/... ./internal/filter/hcm/...
+<no output>
+$ golangci-lint run ./internal/listener/... ./internal/filter/hcm/...
+<no output>
+```
