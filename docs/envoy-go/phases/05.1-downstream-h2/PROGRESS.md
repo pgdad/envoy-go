@@ -148,7 +148,7 @@ $ go build ./internal/filter/hcm/h2/...
 
 ## Task 6 — h2 flow-control window helpers (conn + per-stream)
 
-**Commits:** <!-- SHA-fill -->
+**Commits:** 75bdbd2
 **Notes:** Created `internal/filter/hcm/h2/flow.go` with `window` struct (mutex-guarded `int32` counter + buffered signal channel of capacity 1). `newWindow(initial int32)` constructs with pre-allocated channel. `available()` returns mu-locked read. `reserve(n int32)` atomically decrements up to n, returning taken amount (0 if window <=0); non-blocking. `replenish(delta int32)` increments under lock then does a non-blocking push to the signal channel. `waitFor(ctx, n)` spins on the signal channel until window >= n or ctx cancels. TDD red→green discipline followed: `flow_test.go` was written first and confirmed to fail with `undefined: newWindow` (4 occurrences) before `flow.go` was written. All 4 new Window tests plus all 17 prior h2 tests pass green; `go vet` and `go build` are both clean. SPEC §11.5 mitigation (TinyWindowStressDelivery: INITIAL_WINDOW_SIZE=1, 100 bytes in 1-byte chunks, 99 replenish ticks at 1ms each) completed in ~100ms wall time, well under 1s timeout.
 **Outputs:**
 ```
