@@ -494,7 +494,7 @@ $ go test ./internal/filter/hcm/h2/ -v | grep "PASS:" | wc -l
 
 ## Task 12 — HCM ALPN dispatch + codec_type=HTTP2 build-time validation [ADR-0050]
 
-**Commits:** TBD (SHA-fill in next commit)
+**Commits:** 892061f
 **Notes:** Deleted `listener_ctx_stub.go`. Moved `ListenerCtx` + `NewFilterWithCtx` into `config.go`. Renamed `parseFilter` → `parseFilterWithCtx(lc ListenerCtx)` with codec_type switch: HTTP1/AUTO accept; HTTP2 requires `lc.HasTLS || lc.AllowH2C` (else error); other codec_types reject. `Filter` struct gains `codecType` field. `Filter.Handle` replaced with codec-type dispatch switch: HTTP1→runConnection; HTTP2→runH2; AUTO→type-assert to `*tls.Conn`, HandshakeContext, NegotiatedProtocol=="h2" → runH2, else runConnection. Added `runH2` helper. Removed `t.Skip` from `TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow`; test passes via real validation rejection. Added 7 new codec_type validation tests in `config_test.go`; added 2 new Handle dispatch tests in `filter_test.go`. ADR-0050 appended to DECISIONS.md.
 **Outputs:**
 ```
