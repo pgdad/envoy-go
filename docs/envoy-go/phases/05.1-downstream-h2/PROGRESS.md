@@ -8,7 +8,7 @@ Minor deviation on precondition 1: STATE.md `last-commit` is `634bcb6` (the PLAN
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** <pending>
+**Commits:** e8989c0
 **Notes:** Created PROGRESS.md; verified all preconditions per PLAN §"Execution preconditions"; phase-04 I-1..I-4 fixes confirmed present in HEAD (commit 671a059 visible in log); SPEC at 4b45941; ADR tail at 0045 (next-free 0046).
 **Outputs:**
 ```
