@@ -95,7 +95,7 @@ $ go vet ./internal/filter/hcm/h2/...
 
 ## Task 4 — h2 framer (ctx-aware http2.Framer wrapper) + ADR-0046
 
-**Commits:** <pending>
+**Commits:** 291e061
 **Notes:** First use of `golang.org/x/net/http2` in envoy-go runtime. Promoted `golang.org/x/net v0.34.0` from indirect to direct dependency in `go.mod` (same version go-control-plane already pinned; no new module SHA). TDD red→green discipline followed: `framer_test.go` was written first (all 6 tests) and confirmed to fail with `undefined: newFramer` before `framer.go` was written. `framer.go` defines `type framer struct { *http2.Framer; conn net.Conn }` with `newFramer(conn net.Conn) *framer` constructor and `readFrameCtx(ctx context.Context) (http2.Frame, error)` method that bridges ctx cancellation via `conn.SetReadDeadline` with 50ms polling slices. ADR-0046 appended to `DECISIONS.md` codifying the codec-source decision (framer + hpack only; `http2.Server`/`http2.Transport` FORBIDDEN in runtime). All 6 framer tests pass; `go build ./...` and `go vet ./...` clean.
 **go.mod diff:**
 ```diff
