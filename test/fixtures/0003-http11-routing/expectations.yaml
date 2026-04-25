@@ -1,0 +1,51 @@
+# Phase 04 fixture 0003-http11-routing — expectations
+#
+# This file is prose, not machine-evaluated (per ADR-0019). The runner
+# enforces the assertions described below via test/differential/runner_test.go's
+# byte-comparison + DistributionAsserter + HTTPExpectations passes.
+#
+# Asserted equivalence (per ADR-0044):
+#   - response status code per request, across all 27 requests/side
+#   - decoded response body bytes for /health direct_response (200, "OK\n")
+#     — 9 x "OK\n" concatenated into the Drive byte stream, compared byte-for-byte
+#   - route-match selection witnessed by per-cluster RR distribution [3,3,3]
+#     over the 9 router-action requests (accept-count based, not per-body)
+#
+# Not asserted:
+#   - /api response body bytes per-request: ref (STRICT_DNS, Docker) and subj
+#     (STATIC, host) may start RR at different endpoints, so the per-body
+#     backend-<idx> prefix diverges. Routing correctness is covered by
+#     AssertDistribution [3,3,3] + HTTPExpectations status-200.
+#   - response-header set equality (only set-equality modulo allow-list)
+#   - 404 local-reply body bytes (envoy-go: "not found\n"; Envoy: HTML/JSON
+#     local reply — both produce 404 status, body relaxed)
+#   - Content-Length vs Transfer-Encoding: chunked framing per response
+#     (http.ReadResponse decodes both transparently)
+#   - upstream connection re-use (envoy-go does not pool — ADR-0039; Envoy does)
+#   - x-envoy-* / x-forwarded-* / x-request-id (envoy-go adds none; Envoy adds
+#     many — all in the phase-04 allow-list)
+#
+# Header allow-list (set-equality modulo this list — values not compared):
+#   date, server, content-length, transfer-encoding,
+#   x-envoy-*, x-forwarded-*, x-request-id
+#
+# Route table (declaration order; first-match-wins):
+#   1. match.path: "/health"   -> direct_response 200 "OK\n"
+#   2. match.prefix: "/api"    -> router -> cluster c_backend (3 endpoints, RR)
+#   3. match.prefix: "/"       -> direct_response 404 "not found\n" (catch-all)
+#
+# Driver request schedule (27 requests/side, deterministic ordering):
+#   9 x GET /health                  -> expect 200, body "OK\n" (concatenated)
+#   9 x GET /api/v1/<n>  n=0..8      -> expect 200 (body NOT concatenated;
+#                                        RR distribution [3,3,3] asserted)
+#   9 x GET /missing/<n> n=0..8      -> expect 404 (body NOT concatenated)
+#
+# Container concurrency:
+#   --concurrency 1 inherited from phase-02 ADR-0028 via test/differential/harness.go
+#   (verified at PLAN Task 1 step 1 - the unconditional flag).
+#
+# Backend body format:
+#   "backend-<idx>:<last-segment-of-path>" per response (ADR-0044, settled
+#   SPEC §10 #14). The "backend-<idx>:" prefix is what AssertDistribution
+#   counts on; the path-segment suffix makes responses distinguishable per
+#   request so per-backend routing is verifiable in logs.
