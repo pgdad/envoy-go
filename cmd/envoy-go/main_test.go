@@ -175,3 +175,104 @@ func freeTCPPort(t *testing.T) int {
 	defer func() { _ = ln.Close() }()
 	return ln.Addr().(*net.TCPAddr).Port
 }
+
+// TestEnvoyGoBinary_HCMSmoke exercises the phase-04 dataplane: a single HTTP/1.1
+// listener serving an HCM direct_response. Asserts the same per-listener
+// ready-sentinel format and that a direct_response is properly served with correct
+// status, body, and Server header.
+func TestEnvoyGoBinary_HCMSmoke(t *testing.T) {
+	listenerPort := freeTCPPort(t)
+	adminPort := freeTCPPort(t)
+
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "envoy-go")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	cfgPath := filepath.Join(tmp, "envoy-go.yaml")
+	cfg := fmt.Sprintf(`
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+`, adminPort, listenerPort)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+
+	addrs := waitForReadySentinels(t, stdout, []string{"l_http"}, 15*time.Second)
+
+	listenerAddr := addrs["l_http"]
+	conn, err := net.DialTimeout("tcp", listenerAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = conn.Write([]byte("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
+	body, _ := io.ReadAll(conn)
+	got := string(body)
+	if !strings.Contains(got, "HTTP/1.1 200 OK") {
+		t.Errorf("status line missing from response:\n%s", got)
+	}
+	if !strings.Contains(got, "OK\n") {
+		t.Errorf("expected body 'OK\\n' in response:\n%s", got)
+	}
+	if !strings.Contains(got, "Server: envoy") {
+		t.Errorf("expected 'Server: envoy' header in response:\n%s", got)
+	}
+}
