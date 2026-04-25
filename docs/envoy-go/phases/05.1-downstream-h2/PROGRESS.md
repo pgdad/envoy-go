@@ -269,3 +269,72 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.001s
 $ go vet ./internal/filter/hcm/h2/...
 $ go build ./internal/filter/hcm/h2/...
 ```
+
+## Task 7 — h2 SETTINGS handshake helpers + ADR-0047 (server settings defaults)
+
+**Commits:** SHA-PENDING (SHA-fill follows)
+**Notes:** Created `internal/filter/hcm/h2/settings.go` with exported `ServerSettings` struct (6 fields: MaxConcurrentStreams, InitialWindowSize, MaxFrameSize, EnablePush, NoRFC7540Priorities, HeaderTableSize), `DefaultServerSettings` global (100/65535/16384/0/1/4096), unexported `clientSettings` struct, `writeServerInitialSettings(fr, s)` writing 6 SETTINGS entries (5 standard http2.Setting* constants + SETTINGS_NO_RFC7540_PRIORITIES at numeric ID 0x9), and `readClientSettings(fr, applyTo)` returning *Error{PROTOCOL_ERROR} on read failure, non-SettingsFrame, or ACK-on-first-read. Appended ADR-0047 to DECISIONS.md (server settings defaults + ADR-0041 amendment adding http2_protocol_options to HCM silent-ignore set). TDD red→green discipline followed: `settings_test.go` was written first and confirmed to fail with 5 undefined symbols before `settings.go` was written. All 3 new tests plus all 21 prior h2 tests pass green (24 total); `go vet` and `go build` are both clean.
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/... -run "TestServerSettings|TestSettings|TestReadClientSettings" 2>&1 (before settings.go)
+# github.com/esalaine/envoy-go/internal/filter/hcm/h2 [github.com/esalaine/envoy-go/internal/filter/hcm/h2.test]
+internal/filter/hcm/h2/settings_test.go:11:7: undefined: DefaultServerSettings
+internal/filter/hcm/h2/settings_test.go:38:7: undefined: writeServerInitialSettings
+internal/filter/hcm/h2/settings_test.go:38:40: undefined: DefaultServerSettings
+internal/filter/hcm/h2/settings_test.go:63:9: undefined: clientSettings
+internal/filter/hcm/h2/settings_test.go:64:9: undefined: readClientSettings
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm/h2 [build failed]
+$ go test -v ./internal/filter/hcm/h2/... (after settings.go)
+=== RUN   TestErrorCodeStrings
+--- PASS: TestErrorCodeStrings (0.00s)
+=== RUN   TestConnError_PrefixAndShape
+--- PASS: TestConnError_PrefixAndShape (0.00s)
+=== RUN   TestStreamError_PrefixAndShape
+--- PASS: TestStreamError_PrefixAndShape (0.00s)
+=== RUN   TestError_UnwrapsUnderlying
+--- PASS: TestError_UnwrapsUnderlying (0.00s)
+=== RUN   TestWindow_ReserveAndReplenish
+--- PASS: TestWindow_ReserveAndReplenish (0.00s)
+=== RUN   TestWindow_BlockingWaitFor
+--- PASS: TestWindow_BlockingWaitFor (0.02s)
+=== RUN   TestWindow_CtxCancelDuringWait
+--- PASS: TestWindow_CtxCancelDuringWait (0.02s)
+=== RUN   TestWindow_TinyWindowStressDelivery
+--- PASS: TestWindow_TinyWindowStressDelivery (0.10s)
+=== RUN   TestFramer_SettingsRoundTrip
+--- PASS: TestFramer_SettingsRoundTrip (0.00s)
+=== RUN   TestFramer_PingRoundTrip
+--- PASS: TestFramer_PingRoundTrip (0.00s)
+=== RUN   TestFramer_HeadersRoundTrip
+--- PASS: TestFramer_HeadersRoundTrip (0.00s)
+=== RUN   TestFramer_DataRoundTrip
+--- PASS: TestFramer_DataRoundTrip (0.00s)
+=== RUN   TestFramer_RSTStreamWindowUpdateGoAway
+--- PASS: TestFramer_RSTStreamWindowUpdateGoAway (0.00s)
+=== RUN   TestFramer_ReadFrameCtxCancel
+--- PASS: TestFramer_ReadFrameCtxCancel (0.05s)
+=== RUN   TestHPACK_EncodeDecodeRoundTrip
+--- PASS: TestHPACK_EncodeDecodeRoundTrip (0.00s)
+=== RUN   TestHPACK_AdversarialDecode_NoPanicReturnsCompressionError
+--- PASS: TestHPACK_AdversarialDecode_NoPanicReturnsCompressionError (0.00s)
+=== RUN   TestHPACK_UpdateMaxTableSize_PropagatesToEncoder
+--- PASS: TestHPACK_UpdateMaxTableSize_PropagatesToEncoder (0.00s)
+=== RUN   TestReadClientPreface_Good
+--- PASS: TestReadClientPreface_Good (0.00s)
+=== RUN   TestReadClientPreface_BadByteAtEachPosition
+--- PASS: TestReadClientPreface_BadByteAtEachPosition (0.00s)
+=== RUN   TestReadClientPreface_Truncated
+--- PASS: TestReadClientPreface_Truncated (0.00s)
+=== RUN   TestReadClientPreface_EmptyEOF
+--- PASS: TestReadClientPreface_EmptyEOF (0.00s)
+=== RUN   TestServerSettings_DefaultsMatchADR0047
+--- PASS: TestServerSettings_DefaultsMatchADR0047 (0.00s)
+=== RUN   TestSettings_RoundTrip
+--- PASS: TestSettings_RoundTrip (0.00s)
+=== RUN   TestReadClientSettings_AckOnFirstReadIsProtocolError
+--- PASS: TestReadClientSettings_AckOnFirstReadIsProtocolError (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.198s
+$ go vet ./internal/filter/hcm/h2/...
+$ go build ./internal/filter/hcm/h2/...
+```

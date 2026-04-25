@@ -1548,3 +1548,38 @@ Driver-side test use of `x/net/http2.Transport` (in `cmd/envoy-go/main_test.go` 
 - The three FORBIDDEN runtime types do not carry through to test code; tests may use `http2.Transport` as a peer driver. The boundary is in the package import graph (test files vs production files) and in CI lint rules (the grep gate above).
 
 This ADR supersedes nothing.
+
+## ADR-0047: Phase-05.1 H2 server settings defaults
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.5
+**Settles:** SPEC ADR-S; phase-05.1 §4.1 / §5 / §11 (settings handshake).
+**Amends:** ADR-0041 (HCM silent-ignore set extended with `http2_protocol_options`).
+
+### Context
+
+Phase 05.1 needs concrete numeric values for every SETTINGS the server announces in its initial SETTINGS frame. RFC 9113 §6.5.2 defines defaults for the standard settings; envoy-go matches Envoy's documented `Http2ProtocolOptions` defaults where they diverge from RFC defaults, and matches RFC defaults where Envoy doesn't override.
+
+### Decision
+
+Phase 05.1 hardcodes the following ServerSettings (in `internal/filter/hcm/h2/settings.go`):
+
+- **MAX_CONCURRENT_STREAMS = 100.** Envoy's documented default for `max_concurrent_streams`. The 101st concurrent stream from the client → REFUSED_STREAM (RFC 9113 §5.1.2).
+- **INITIAL_WINDOW_SIZE = 65535.** RFC 9113 §6.9.2 protocol default. Envoy does not override.
+- **MAX_FRAME_SIZE = 16384.** RFC 9113 §6.5.2 protocol default. Envoy does not override.
+- **ENABLE_PUSH = 0.** Phase 05.1 disables server push entirely (SPEC §2.1). Disabling on our SETTINGS prevents the client from sending PUSH_PROMISE either.
+- **SETTINGS_NO_RFC7540_PRIORITIES = 1.** Informs the client we discard PRIORITY frames (RFC 9113 §6.3 / SPEC §2.1). RFC 9218 (`SETTINGS_NO_RFC7540_PRIORITIES`) numeric ID 0x9.
+- **HEADER_TABLE_SIZE = 4096.** RFC 9113 §6.5.2 protocol default + Envoy default. We do not advertise a different value; the encoder side at the peer is also 4096 unless the peer changes it via its own SETTINGS.
+
+### HCM `http2_protocol_options` silent-ignore amendment
+
+ADR-0041 (phase-04 HCM silent-ignore set) is amended to add the directly-on-HCM `http2_protocol_options` field. Phase 05.1 reads this field via the unmarshalled HCM proto but does NOT honour any sub-field — the values stay at the ADR-0047 defaults regardless of what the bootstrap declares. Future phases (06+) may move members from "ignored" to "honoured" via a superseding ADR. The cluster-side `HttpProtocolOptions` typed-extension is 05.2's surface and remains in the phase-04 silent-ignore set in 05.1.
+
+### Consequences
+
+- Differential equivalence: the gate does not assert SETTINGS values byte-for-byte (those are inside the structurally-equivalent framing rule per ADR-0052). h2spec section 6.5 only validates RFC 9113 compliance, not Envoy-specific values — the threshold accepts the values above.
+- The `ServerSettings` value type is exported so future phases (or test fixtures) can vary the values per construction; the `DefaultServerSettings` global is the project-wide canonical instance.
+- A future phase that needs configurable per-listener SETTINGS (e.g., to honour `http2_protocol_options.max_concurrent_streams`) supersedes ADR-0047 + ADR-0041's silent-ignore amendment with a new ADR.
+
+This ADR supersedes nothing on its own; ADR-0041 is amended (not superseded) per the additive shape of the silent-ignore set.
