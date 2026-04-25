@@ -90,7 +90,7 @@ $ go vet ./internal/filter/hcm/h2/...
 
 ## Task 3 — h2 connection preface read + check (RFC 9113 §3.4)
 
-**Commits:** <pending>
+**Commits:** 0313c3f
 **Notes:** Created `internal/filter/hcm/h2/preface.go` with the 24-byte `clientPrefaceBytes` constant and `readClientPreface(io.Reader) error` free function that uses `io.ReadFull` to read exactly 24 bytes and compares byte-by-byte against the canonical preface, returning `*Error{Code: ErrProtocolError}` on truncation or mismatch and nil on success. TDD red→green discipline followed: `preface_test.go` was written first and confirmed to fail with `undefined: readClientPreface` on all four test functions before `preface.go` was written. All four tests (`TestReadClientPreface_Good`, `TestReadClientPreface_BadByteAtEachPosition`, `TestReadClientPreface_Truncated`, `TestReadClientPreface_EmptyEOF`) pass green; `go vet` and `go build` are both clean.
 **Outputs:**
 ```
