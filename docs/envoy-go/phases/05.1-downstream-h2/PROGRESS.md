@@ -63,4 +63,6 @@ $ git log --oneline -- internal/filter/hcm/actions.go internal/filter/hcm/connec
 95ea7e8 phase 04: internal/filter/hcm — directResponseAction + routerAction [ADR-0039]
 e252dbe phase 03: internal/cluster — Cluster.Dial(ctx) + upstream TLS [ADR-0032]
 958c059 phase 02: internal/cluster.Manager — build-time materialisation
+$ go list -m golang.org/x/net
+golang.org/x/net v0.34.0
 ```
