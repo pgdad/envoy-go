@@ -1,12 +1,15 @@
 package differential
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -57,9 +60,14 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 		t.Fatalf("BackendCount() returned %d; must be >=1", n)
 	}
 	type backend struct {
+		idx     int
 		ln      net.Listener
 		port    int
 		accepts *atomic.Uint64
+	}
+	kind := fixture.TCPEcho
+	if bk, ok := d.(fixture.BackendKindAware); ok {
+		kind = bk.BackendKind()
 	}
 	backends := make([]*backend, n)
 	for i := 0; i < n; i++ {
@@ -68,9 +76,14 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			t.Fatalf("backend[%d] listen: %v", i, err)
 		}
 		defer func(ln net.Listener) { _ = ln.Close() }(ln)
-		bo := &backend{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, accepts: new(atomic.Uint64)}
+		bo := &backend{idx: i, ln: ln, port: ln.Addr().(*net.TCPAddr).Port, accepts: new(atomic.Uint64)}
 		backends[i] = bo
-		go acceptEchoCounting(ln, bo.accepts)
+		switch kind {
+		case fixture.TCPEcho:
+			go acceptEchoCounting(ln, bo.accepts)
+		case fixture.HTTPEcho:
+			go acceptHTTPEchoCounting(ln, bo.accepts, bo.idx)
+		}
 	}
 	backendPorts := make([]int, n)
 	for i, b := range backends {
@@ -310,6 +323,37 @@ func acceptEchoCounting(ln net.Listener, counter *atomic.Uint64) {
 					return
 				}
 			}
+		}(c)
+	}
+}
+
+// acceptHTTPEchoCounting accepts one HTTP/1.1 request per connection and writes
+// a canned response body of "backend-<idx>:<lastSegmentOfPath>". Increments
+// counter on every accept (mirrors acceptEchoCounting). Settles SPEC §10 #6
+// + SPEC §10 #14 (handcrafted bufio + body format).
+func acceptHTTPEchoCounting(ln net.Listener, counter *atomic.Uint64, idx int) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		counter.Add(1)
+		go func(c net.Conn) {
+			defer func() { _ = c.Close() }()
+			br := bufio.NewReader(c)
+			req, err := http.ReadRequest(br)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, req.Body)
+			_ = req.Body.Close()
+			seg := req.URL.Path
+			if i := strings.LastIndex(seg, "/"); i >= 0 && i+1 < len(seg) {
+				seg = seg[i+1:]
+			}
+			body := fmt.Sprintf("backend-%d:%s", idx, seg)
+			_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+				len(body), body)
 		}(c)
 	}
 }

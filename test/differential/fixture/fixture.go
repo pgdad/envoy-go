@@ -100,3 +100,22 @@ type HTTPRequestExpectation struct {
 type HTTPExpectations interface {
 	HTTPExpectations() []HTTPRequestExpectation
 }
+
+// BackendKind discriminates between TCP-echo and HTTP-echo backends for the
+// runner's per-fixture spawning code. Default (when a driver does NOT
+// implement BackendKindAware) is TCPEcho — matches phase-02/03 fixtures.
+type BackendKind int
+
+const (
+	// TCPEcho is the accept-loop that reads-until-FIN and echoes bytes back; phase-02/03 default.
+	TCPEcho BackendKind = 0
+	// HTTPEcho is the accept-loop that reads one http.Request and writes "backend-<idx>:<lastSeg>" canned body, then closes.
+	HTTPEcho BackendKind = 1
+)
+
+// BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
+// it select an alternative backend kind (e.g., HTTP-echo for phase-04 fixture
+// 0003). Drivers that do NOT implement it default to TCPEcho.
+type BackendKindAware interface {
+	BackendKind() BackendKind
+}
