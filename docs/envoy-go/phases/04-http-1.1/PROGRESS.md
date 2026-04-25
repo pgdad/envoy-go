@@ -75,3 +75,42 @@ $ go build ./internal/filter/hcm/... ./internal/http/...
 $ go vet ./internal/filter/hcm/... ./internal/http/...
 <no output>
 ```
+
+## Task 3 — internal/filter/hcm — codec.go + ADR-0037
+
+**Commits:** dcc6b40
+**Notes:** Wire-codec helpers landed; ADR-0037 documents the H2 (stdlib net/http) choice and the residual divergences from upstream Envoy.
+**Outputs:**
+```
+$ cd internal/filter/hcm && go test -run 'TestServerHeader|TestDateHeader|TestWriteStatusReply' -v .
+=== RUN   TestServerHeader
+--- PASS: TestServerHeader (0.00s)
+=== RUN   TestDateHeader
+--- PASS: TestDateHeader (0.00s)
+=== RUN   TestWriteStatusReply
+=== RUN   TestWriteStatusReply/200_OK_with_body
+=== RUN   TestWriteStatusReply/400_Bad_Request_empty_body
+=== RUN   TestWriteStatusReply/404_Not_Found
+=== RUN   TestWriteStatusReply/417_Expectation_Failed_empty
+=== RUN   TestWriteStatusReply/500_Internal_Server_Error_empty
+=== RUN   TestWriteStatusReply/502_Bad_Gateway_empty
+=== RUN   TestWriteStatusReply/503_Service_Unavailable_empty
+=== RUN   TestWriteStatusReply/501_Not_Implemented_empty
+--- PASS: TestWriteStatusReply (0.00s)
+    --- PASS: TestWriteStatusReply/200_OK_with_body (0.00s)
+    --- PASS: TestWriteStatusReply/400_Bad_Request_empty_body (0.00s)
+    --- PASS: TestWriteStatusReply/404_Not_Found (0.00s)
+    --- PASS: TestWriteStatusReply/417_Expectation_Failed_empty (0.00s)
+    --- PASS: TestWriteStatusReply/500_Internal_Server_Error_empty (0.00s)
+    --- PASS: TestWriteStatusReply/502_Bad_Gateway_empty (0.00s)
+    --- PASS: TestWriteStatusReply/503_Service_Unavailable_empty (0.00s)
+    --- PASS: TestWriteStatusReply/501_Not_Implemented_empty (0.00s)
+=== RUN   TestWriteStatusReply_UnknownStatusFallsBackToEmptyReason
+--- PASS: TestWriteStatusReply_UnknownStatusFallsBackToEmptyReason (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	(cached)
+$ go vet ./internal/filter/hcm/...
+<no output>
+$ golangci-lint run ./internal/filter/hcm/...
+<no output>
+```
