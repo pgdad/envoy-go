@@ -1372,3 +1372,30 @@ Envoy's HCM has an HTTP-filter chain (`http_filters[]` field) separate from the 
 - ADR-0033 (network-filter chains, phase 02) and ADR-0042 (HTTP-filter chains, phase 04) share a "minimal chain shape" theme but address disjoint protocol layers.
 
 Lands in Task 7 alongside ADR-0040 + ADR-0041. **Supersedes:** none — disjoint from ADR-0033's network-filter-chain coverage.
+
+---
+
+## ADR-0043: Fixture-driver `HTTPExpectations` extension
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.4, D-3.5
+**Settles:** SPEC ADR-M, SPEC §10 #4, phase-04 §4.1 fixture interface
+
+### Context
+
+The phase-04 differential gate must assert per-request equivalence dimensions (status code, decoded body, header set) on top of the existing byte-stream comparison the runner does after `Drive*`. Two design paths existed: (a) internalize per-request comparison logic inside each HTTP fixture's driver (so each future HTTP fixture re-implements its own status/body/header diff), or (b) extend the `Driver` interface with an optional `HTTPExpectations()` method that lets the runner own the per-request orchestration.
+
+### Decision
+
+(b). Add an OPTIONAL interface `type HTTPExpectations interface { HTTPExpectations() []HTTPRequestExpectation }` and a struct `type HTTPRequestExpectation struct { Method, Path string; ExpectStatus int; ExpectBodyEquivalent bool }` to `test/differential/fixture/fixture.go`. The `Driver` interface itself is unchanged; the new interface is type-asserted at the runner per phase-02's `DistributionAsserter` precedent.
+
+The runner's per-fixture orchestration loop gains a new branch: when `d.(fixture.HTTPExpectations)` succeeds, after byte-comparison and distribution assertion, the runner re-issues each expectation against ref and subject via `helpers.HTTPRoundTrip` and compares status + body (when `ExpectBodyEquivalent`) + header set (under `helpers.HTTPHeaderDiff` with `PhaseFourHTTPAllowList`).
+
+### Consequences
+
+- Existing TCP-only fixtures (0000, 0001, 0002) do NOT implement this interface; the runner's code path is gated on the type assertion, so they are unaffected. Backward compatibility is preserved by construction.
+- Phase 05 (HTTP/2) will reuse the same struct + interface shape — phase 05's helpers will issue HTTP/2 round-trips via a different helper while populating the same `HTTPRequestExpectation` struct. The amortization across phases 04 and 05 justifies the typed-extension cost over per-driver duplication.
+- The `HTTPExpectations` extension is informally superseding the implicit "byte-comparison is the only assertion" contract of the runner; that contract was never ADR'd, so the supersession header on this ADR is informal (mirroring ADR-0034's informal qualifier on the `Drive` split).
+
+Lands in Task 13 (first use site of the orchestration branch). **Supersedes (informal):** the implicit byte-comparison-only contract.

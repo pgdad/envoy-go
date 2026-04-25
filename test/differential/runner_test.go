@@ -1,6 +1,7 @@
 package differential
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -141,6 +142,38 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	if da, ok := d.(fixture.DistributionAsserter); ok {
 		if err := da.AssertDistribution(refCounts, subjCounts); err != nil {
 			t.Errorf("distribution: %v", err)
+		}
+	}
+
+	// 8b. Optional per-request HTTP round-trip + status/body/header
+	// orchestration (phase 04, ADR-0043). Only fires when the driver
+	// implements fixture.HTTPExpectations; phase-02/phase-03 fixtures
+	// do not, so this is a no-op for 0000, 0001, 0002.
+	if he, ok := d.(fixture.HTTPExpectations); ok {
+		for i, exp := range he.HTTPExpectations() {
+			refResp, refBody, err := helpers.HTTPRoundTrip(ctx, refAddr, exp.Method, exp.Path, nil, nil)
+			if err != nil {
+				t.Errorf("expectation[%d]: ref round-trip: %v", i, err)
+				continue
+			}
+			subjResp, subjBody, err := helpers.HTTPRoundTrip(ctx, subj.ListenerAddr(d.SubjectListenerName()), exp.Method, exp.Path, nil, nil)
+			if err != nil {
+				t.Errorf("expectation[%d]: subj round-trip: %v", i, err)
+				continue
+			}
+			if refResp.StatusCode != exp.ExpectStatus {
+				t.Errorf("expectation[%d]: ref status: got %d, want %d", i, refResp.StatusCode, exp.ExpectStatus)
+			}
+			if subjResp.StatusCode != exp.ExpectStatus {
+				t.Errorf("expectation[%d]: subj status: got %d, want %d", i, subjResp.StatusCode, exp.ExpectStatus)
+			}
+			if exp.ExpectBodyEquivalent && !bytes.Equal(refBody, subjBody) {
+				t.Errorf("expectation[%d]: body mismatch:\n ref:  %q\n subj: %q", i, string(refBody), string(subjBody))
+			}
+			refOnly, subjOnly := helpers.HTTPHeaderDiff(refResp.Header, subjResp.Header, helpers.PhaseFourHTTPAllowList)
+			if len(refOnly) > 0 || len(subjOnly) > 0 {
+				t.Errorf("expectation[%d]: header diff outside allow-list:\n  ref-only: %v\n  subj-only: %v", i, refOnly, subjOnly)
+			}
 		}
 	}
 

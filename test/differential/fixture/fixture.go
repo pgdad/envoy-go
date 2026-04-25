@@ -69,3 +69,34 @@ func RegisterFixture(name string, d Driver) {
 	}
 	DriverRegistry[name] = d
 }
+
+// HTTPRequestExpectation describes one HTTP/1.1 request the runner re-issues
+// against ref and subject after Drive completes, to assert per-request status
+// and body equivalence on top of the byte-stream comparison done by Drive.
+//
+// Phase 04 introduces this for fixture 0003-http11-routing. Phase 05 (HTTP/2)
+// will reuse the shape — the path's protocol-version dimension is ignored
+// here because phase 05's helpers will issue HTTP/2 round-trips via a
+// different helper while populating the same struct.
+//
+// See ADR-0043.
+type HTTPRequestExpectation struct {
+	Method               string
+	Path                 string
+	ExpectStatus         int
+	ExpectBodyEquivalent bool
+}
+
+// HTTPExpectations is an OPTIONAL fixture-driver interface. Drivers that
+// implement it cause the runner to issue per-request HTTP round-trips against
+// ref and subject after Drive completes, asserting status equivalence and
+// (when ExpectBodyEquivalent is set) body byte-equivalence. Header set
+// equality is checked via helpers.HTTPHeaderDiff under the phase-04 allow-list.
+//
+// Drivers that do NOT implement HTTPExpectations are unaffected (the runner's
+// type assertion fails-silently and the new branch does not fire).
+//
+// See ADR-0043.
+type HTTPExpectations interface {
+	HTTPExpectations() []HTTPRequestExpectation
+}
