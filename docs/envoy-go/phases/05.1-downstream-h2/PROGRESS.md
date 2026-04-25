@@ -66,3 +66,24 @@ e252dbe phase 03: internal/cluster — Cluster.Dial(ctx) + upstream TLS [ADR-003
 $ go list -m golang.org/x/net
 golang.org/x/net v0.34.0
 ```
+
+## Task 2 — h2 sub-package skeleton + errors enum
+
+**Commits:** <pending>
+**Notes:** Created `internal/filter/hcm/h2/` package with `doc.go` (package-level comment describing codec philosophy, ALPN/fuzz discipline, and the explicit "does NOT use http2.Server" constraint) and `errors.go` (14-constant `ErrCode` enum matching RFC 9113 §7 ordering 0x0..0xd, `String()` returning RFC mnemonics, `Error` struct with `"h2: "` prefix discipline, `Unwrap()` for error-chain support, and `connError`/`streamError` helpers). TDD red→green discipline followed: `errors_test.go` was written first and confirmed to fail with `undefined: ErrCode` before `errors.go` was written.
+**Outputs:**
+```
+$ go build ./internal/filter/hcm/h2/...
+$ go test -v ./internal/filter/hcm/h2/...
+=== RUN   TestErrorCodeStrings
+--- PASS: TestErrorCodeStrings (0.00s)
+=== RUN   TestConnError_PrefixAndShape
+--- PASS: TestConnError_PrefixAndShape (0.00s)
+=== RUN   TestStreamError_PrefixAndShape
+--- PASS: TestStreamError_PrefixAndShape (0.00s)
+=== RUN   TestError_UnwrapsUnderlying
+--- PASS: TestError_UnwrapsUnderlying (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.001s
+$ go vet ./internal/filter/hcm/h2/...
+```
