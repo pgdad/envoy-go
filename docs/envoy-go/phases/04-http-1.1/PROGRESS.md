@@ -8,7 +8,7 @@ None. All preconditions were satisfied at cold-start. Docker client and server b
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** <will be SHA-filled in a follow-up commit>
+**Commits:** ae52f36
 **Notes:** Created PROGRESS.md; verified all preconditions per PLAN §"Execution preconditions"; phase-03 I-1..I-4 fixes confirmed present in HEAD.
 **Outputs:**
 ```
