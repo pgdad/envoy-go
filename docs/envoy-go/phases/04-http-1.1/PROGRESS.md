@@ -63,3 +63,15 @@ $ grep -n -- '--concurrency' test/differential/harness.go
 112:		// --concurrency 1 forces a single worker thread so round-robin LB
 117:		Cmd:        []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn", "--concurrency", "1"},
 ```
+
+## Task 2 — internal/filter/hcm — package skeleton + internal/http amendment
+
+**Commits:** c33d3c8
+**Notes:** Doc-only kickoff; no symbols. Settles SPEC §10 #10 (kept the placeholder, amended the doc).
+**Outputs:**
+```
+$ go build ./internal/filter/hcm/... ./internal/http/...
+<no output>
+$ go vet ./internal/filter/hcm/... ./internal/http/...
+<no output>
+```
