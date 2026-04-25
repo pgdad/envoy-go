@@ -519,3 +519,37 @@ ok  	github.com/esalaine/envoy-go/internal/listener
 $ ls internal/filter/hcm/listener_ctx_stub.go
 ls: cannot access 'internal/filter/hcm/listener_ctx_stub.go': No such file or directory
 ```
+
+## Task 13 — `cmd/envoy-go/main_test.go` h2-over-TLS smoke variant
+
+**Commits:** (SHA-fill below)
+**Notes:** Added `TestEnvoyGoBinary_H2Smoke` to `cmd/envoy-go/main_test.go` mirroring the `TestEnvoyGoBinary_HCMSmoke` structure. Added two helpers: `buildBinaryOrSkip` (extracted build step, shared across HCMSmoke and H2Smoke) and `pkiFixture0002` (runtime.Caller-based absolute path to fixture-0002 pki/). The test: (1) reads fixture-0002 `server-alpha.pem`/`server-alpha.key.pem` and embeds them as YAML inline_string block scalars; (2) writes a bootstrap YAML with a single `l_h2` listener — TLS transport_socket (`alpn_protocols: ["h2"]`) + HCM filter (`codec_type: HTTP2`, direct_response 200 "OK\n" on prefix `/`); (3) waits for `waitForReadySentinels` on `["l_h2"]`; (4) issues a GET via `http2.Transport{TLSClientConfig: {InsecureSkipVerify: true, ServerName: "alpha.envoy-go.test", NextProtos: ["h2"]}}` and asserts status=200, body="OK\n", ProtoMajor=2. PKI approach: `server-alpha.pem` only has DNS SAN `alpha.envoy-go.test` (no 127.0.0.1 IP SAN); used `ServerName: "alpha.envoy-go.test"` with `InsecureSkipVerify: true` instead of generating a new cert — no `test/helpers/tls.go` creation needed. Test passes in ~0.55s. Whole-tree green.
+**Outputs:**
+```
+$ go test ./cmd/envoy-go/... -run TestEnvoyGoBinary_H2Smoke -v -timeout 60s
+=== RUN   TestEnvoyGoBinary_H2Smoke
+--- PASS: TestEnvoyGoBinary_H2Smoke (0.55s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.556s
+$ go test ./cmd/envoy-go/... -timeout 120s
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.573s
+$ go test ./... -timeout 180s
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.685s
+ok  	github.com/esalaine/envoy-go/internal/admin	0.039s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.008s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.008s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.010s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.300s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.009s
+ok  	github.com/esalaine/envoy-go/internal/listener	0.008s
+ok  	github.com/esalaine/envoy-go/internal/tls	0.014s
+ok  	github.com/esalaine/envoy-go/test/differential	6.280s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.004s
+$ go vet ./...
+(clean)
+$ go build ./...
+(clean)
+```

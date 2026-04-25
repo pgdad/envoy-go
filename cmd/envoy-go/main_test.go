@@ -3,16 +3,21 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/esalaine/envoy-go/test/helpers"
 )
@@ -176,6 +181,36 @@ func freeTCPPort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+// buildBinaryOrSkip compiles cmd/envoy-go into a temporary directory and
+// returns the path to the resulting binary. If the build fails the test is
+// fatally failed. The binary is placed in t.TempDir() so it is cleaned up
+// automatically when the test ends.
+func buildBinaryOrSkip(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "envoy-go")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// pkiFixture0002 returns the absolute path to the fixture-0002 pki/ directory,
+// resolved relative to this source file so the test works from any working
+// directory.
+func pkiFixture0002(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed — cannot locate pki directory")
+	}
+	// thisFile is .../cmd/envoy-go/main_test.go; pki/ is at
+	// ../../test/fixtures/0002-tls-tcp/pki relative to this file.
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "test", "fixtures", "0002-tls-tcp", "pki")
+}
+
 // TestEnvoyGoBinary_HCMSmoke exercises the phase-04 dataplane: a single HTTP/1.1
 // listener serving an HCM direct_response. Asserts the same per-listener
 // ready-sentinel format and that a direct_response is properly served with correct
@@ -274,5 +309,165 @@ static_resources:
 	}
 	if !strings.Contains(got, "Server: envoy") {
 		t.Errorf("expected 'Server: envoy' header in response:\n%s", got)
+	}
+}
+
+// TestEnvoyGoBinary_H2Smoke exercises the phase-05.1 dataplane: a single
+// HTTP/2-over-TLS listener with ALPN "h2", serving an HCM direct_response.
+// Asserts that:
+//   - the binary starts and emits the ready sentinel for listener "l_h2"
+//   - an http2.Transport GET / receives HTTP 200 with body "OK\n"
+//   - resp.ProtoMajor == 2 (confirming H2 framing end-to-end)
+//
+// PKI: uses fixture-0002 server-alpha cert/key (DNS SAN: alpha.envoy-go.test).
+// The client uses InsecureSkipVerify: true so no CA chain validation is needed;
+// ServerName is set to alpha.envoy-go.test to satisfy the SNI/cert match.
+func TestEnvoyGoBinary_H2Smoke(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping binary smoke test in -short mode")
+	}
+
+	pki := pkiFixture0002(t)
+	certPath := filepath.Join(pki, "server-alpha.pem")
+	keyPath := filepath.Join(pki, "server-alpha.key.pem")
+
+	// Read the cert and key bytes so we can embed them inline in the YAML,
+	// avoiding any relative-path resolution issues at binary runtime.
+	certBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read cert: %v", err)
+	}
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read key: %v", err)
+	}
+
+	listenerPort := freeTCPPort(t)
+	adminPort := freeTCPPort(t)
+
+	bin := buildBinaryOrSkip(t)
+
+	// Build the inline-string PEM blocks.  Each PEM line must be indented
+	// more deeply than the "inline_string:" key (which sits at 22 spaces of
+	// indentation) so YAML block-scalar rules are satisfied.
+	makeInline := func(pem []byte, keyIndent string) string {
+		bodyIndent := keyIndent + "  "
+		var sb strings.Builder
+		sb.WriteString("|\n")
+		for _, line := range strings.Split(strings.TrimRight(string(pem), "\n"), "\n") {
+			sb.WriteString(bodyIndent)
+			sb.WriteString(line)
+			sb.WriteByte('\n')
+		}
+		return sb.String()
+	}
+	// "inline_string:" key is at 22 spaces inside the bootstrap YAML below.
+	certIS := makeInline(certBytes, "                      ")
+	keyIS := makeInline(keyBytes, "                      ")
+
+	cfg := fmt.Sprintf(`
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_h2
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: %s                    private_key:
+                      inline_string: %s                alpn_protocols: ["h2"]
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP2
+                stat_prefix: ingress_h2
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+`, adminPort, listenerPort, certIS, keyIS)
+
+	cfgPath := filepath.Join(t.TempDir(), "envoy-go.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+
+	addrs := waitForReadySentinels(t, stdout, []string{"l_h2"}, 15*time.Second)
+	listenerAddr := addrs["l_h2"]
+
+	// Issue an HTTP/2 request via http2.Transport.
+	// InsecureSkipVerify skips CA validation; ServerName must match the cert's
+	// SAN (alpha.envoy-go.test) so the TLS handshake picks the right identity.
+	transport := &http2.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, //nolint:gosec // test-only; no CA chain needed
+			ServerName:         "alpha.envoy-go.test",
+			NextProtos:         []string{"h2"},
+		},
+	}
+	defer transport.CloseIdleConnections()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+listenerAddr+"/", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "OK\n" {
+		t.Errorf("body = %q, want %q", string(body), "OK\n")
+	}
+	if resp.ProtoMajor != 2 {
+		t.Errorf("ProtoMajor = %d, want 2 (HTTP/2)", resp.ProtoMajor)
 	}
 }
