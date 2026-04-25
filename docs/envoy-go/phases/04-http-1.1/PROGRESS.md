@@ -483,3 +483,17 @@ $ go vet ./test/helpers/...
 $ golangci-lint run ./test/helpers/...
 <no output>
 ```
+
+## Task 13 — test/differential — HTTPExpectations interface + runner orchestration
+
+**Commits:** 5bcce5f
+**Notes:** Additive optional interface; existing fixtures 0000/0001/0002 unaffected (type assertion fails-silently). ADR-0043 documents the typed-extension choice.
+**Outputs:**
+```
+$ go vet ./test/differential/...
+<no output>
+$ golangci-lint run ./test/differential/...
+<no output>
+$ go build ./test/differential/...
+<no output>
+```
