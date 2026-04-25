@@ -1517,3 +1517,34 @@ This ADR supersedes nothing. It is the project's first plan-time-split ADR; futu
 - **ADR-0003** — worktree pattern; the next two brainstorming sessions follow this pattern.
 - **ADR-0035** — fixture-0002 differential scope; ADR-W (under 05.2) closes its H2 leg.
 - **`docs/envoy-go/phases/05.1-downstream-h2/README.md`** + **`docs/envoy-go/phases/05.2-upstream-h2/README.md`** — placeholder scope docs created by this commit; superseded by each sub-phase's `SPEC.md` when brainstorming next runs.
+
+## ADR-0046: HTTP/2 codec source — `golang.org/x/net/http2.Framer` + `golang.org/x/net/http2/hpack`
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.2, D-3.5
+**Settles:** SPEC ADR-P, phase-05.1 §4.1 codec sub-package.
+
+### Context
+
+Phase 05.1 introduces envoy-go's downstream HTTP/2 codec. `BOOTSTRAP_PROMPT.md` D-3.2 permits `golang.org/x/net/http2` "as a low-level codec only — never as a server runtime." The phase-05.1 SPEC §4.1 names two specific entry points within that package: `http2.Framer` (frame byte-layout serialisation) and `http2/hpack` (HPACK encoder/decoder with dynamic-table state). The decision to use them — vs handcrafting from RFC 9113 — needs explicit codification because the HPACK dynamic-table state machine has CVE history that argues against re-implementation.
+
+### Decision
+
+Phase 05.1's `internal/filter/hcm/h2/` codec sub-package consumes:
+
+- `http2.Framer` for frame read/write — wrapped by `framer` in `framer.go` to add context-aware reads via `conn.SetReadDeadline` translation.
+- `http2/hpack.Encoder` + `hpack.Decoder` for header block encode/decode — held per-connection in `hpackState` (hpack.go) so the dynamic-table state is per-conn.
+
+Three runtime constructs in `golang.org/x/net/http2` are FORBIDDEN even at phase 05.1: `http2.Server`, `http2.Server.ServeConn`, `http2.ConfigureServer`, `http2.Transport`, `http2.Transport.NewClientConn`. They carry their own request-routing, header-canonicalization, response-header injection, and error policies that diverge from Envoy's; envoy-go's connection lifecycle (preface check, settings handshake, frame dispatch, GOAWAY emission, RST_STREAM/PING semantics) is owned by `ServerConn` (conn.go) and `serverStream` (stream.go) — both written from scratch. ADR-0048 codifies the from-scratch-server-connection-manager decision.
+
+Driver-side test use of `x/net/http2.Transport` (in `cmd/envoy-go/main_test.go` H2 smoke variant and `internal/filter/hcm/h2/conn_test.go` end-to-end tests) is permitted because that is fixture infrastructure, not envoy-go runtime — D-3.2 governs runtime, not test code.
+
+### Consequences
+
+- The boundary is grep-verifiable: `! grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go` (excluding `_test.go`) returns zero hits OUTSIDE `internal/filter/hcm/h2/framer.go`/`hpack.go`/`settings.go` — the three files that legitimately import the package. Task 16's gate-sweep verifies this.
+- `golang.org/x/net` is promoted from an indirect dependency (transitively held via go-control-plane) to a direct dependency. No new module SHA — the same version go-control-plane already pins.
+- A future codec-related ADR (e.g., a phase-09 HTTP/3 ADR for `quic-go`) follows this same shape: low-level codec only, with the runtime owned by envoy-go. ADR-0046 is the template for that pattern.
+- The three FORBIDDEN runtime types do not carry through to test code; tests may use `http2.Transport` as a peer driver. The boundary is in the package import graph (test files vs production files) and in CI lint rules (the grep gate above).
+
+This ADR supersedes nothing.

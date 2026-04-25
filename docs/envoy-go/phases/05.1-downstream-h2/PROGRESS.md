@@ -92,6 +92,44 @@ $ go vet ./internal/filter/hcm/h2/...
 
 **Commits:** 0313c3f
 **Notes:** Created `internal/filter/hcm/h2/preface.go` with the 24-byte `clientPrefaceBytes` constant and `readClientPreface(io.Reader) error` free function that uses `io.ReadFull` to read exactly 24 bytes and compares byte-by-byte against the canonical preface, returning `*Error{Code: ErrProtocolError}` on truncation or mismatch and nil on success. TDD red→green discipline followed: `preface_test.go` was written first and confirmed to fail with `undefined: readClientPreface` on all four test functions before `preface.go` was written. All four tests (`TestReadClientPreface_Good`, `TestReadClientPreface_BadByteAtEachPosition`, `TestReadClientPreface_Truncated`, `TestReadClientPreface_EmptyEOF`) pass green; `go vet` and `go build` are both clean.
+
+## Task 4 — h2 framer (ctx-aware http2.Framer wrapper) + ADR-0046
+
+**Commits:** <pending>
+**Notes:** First use of `golang.org/x/net/http2` in envoy-go runtime. Promoted `golang.org/x/net v0.34.0` from indirect to direct dependency in `go.mod` (same version go-control-plane already pinned; no new module SHA). TDD red→green discipline followed: `framer_test.go` was written first (all 6 tests) and confirmed to fail with `undefined: newFramer` before `framer.go` was written. `framer.go` defines `type framer struct { *http2.Framer; conn net.Conn }` with `newFramer(conn net.Conn) *framer` constructor and `readFrameCtx(ctx context.Context) (http2.Frame, error)` method that bridges ctx cancellation via `conn.SetReadDeadline` with 50ms polling slices. ADR-0046 appended to `DECISIONS.md` codifying the codec-source decision (framer + hpack only; `http2.Server`/`http2.Transport` FORBIDDEN in runtime). All 6 framer tests pass; `go build ./...` and `go vet ./...` clean.
+**go.mod diff:**
+```diff
+ require (
+ 	github.com/docker/go-connections v0.4.0
+ 	github.com/envoyproxy/go-control-plane/envoy v1.32.4
+ 	github.com/testcontainers/testcontainers-go v0.27.0
++	golang.org/x/net v0.34.0
+ 	google.golang.org/protobuf v1.36.11
+ 	gopkg.in/yaml.v3 v3.0.1
+ )
+ ...
+-	golang.org/x/net v0.34.0 // indirect
+```
+**Outputs:**
+```
+$ go test -v ./internal/filter/hcm/h2/... -run TestFramer
+=== RUN   TestFramer_SettingsRoundTrip
+--- PASS: TestFramer_SettingsRoundTrip (0.00s)
+=== RUN   TestFramer_PingRoundTrip
+--- PASS: TestFramer_PingRoundTrip (0.00s)
+=== RUN   TestFramer_HeadersRoundTrip
+--- PASS: TestFramer_HeadersRoundTrip (0.00s)
+=== RUN   TestFramer_DataRoundTrip
+--- PASS: TestFramer_DataRoundTrip (0.00s)
+=== RUN   TestFramer_RSTStreamWindowUpdateGoAway
+--- PASS: TestFramer_RSTStreamWindowUpdateGoAway (0.00s)
+=== RUN   TestFramer_ReadFrameCtxCancel
+--- PASS: TestFramer_ReadFrameCtxCancel (0.05s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.053s
+$ go build ./...
+$ go vet ./...
+```
 **Outputs:**
 ```
 $ go test -v ./internal/filter/hcm/h2/...
