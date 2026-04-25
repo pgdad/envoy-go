@@ -14,6 +14,9 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -1176,4 +1179,108 @@ func TestNewManager_ChainSelectionPropagation(t *testing.T) {
 
 	dialAndCheckCert("alpha.envoy-go.test", "alpha.envoy-go.test")
 	dialAndCheckCert("beta.envoy-go.test", "beta.envoy-go.test")
+}
+
+// ---------------------------------------------------------------------------
+// Phase-04 HCM registration tests
+// ---------------------------------------------------------------------------
+
+// mkRouterAny builds a google.protobuf.Any wrapping an empty Router proto.
+func mkRouterAny(t *testing.T) *anypb.Any {
+	t.Helper()
+	a, err := anypb.New(&routerv3.Router{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// mkHCMFilter builds a listenerv3.Filter carrying a minimal valid HCM
+// typed_config with a direct_response /health → 200 OK route.
+func mkHCMFilter(t *testing.T) *listenerv3.Filter {
+	t.Helper()
+	hcmProto := &hcmv3.HttpConnectionManager{
+		CodecType:  hcmv3.HttpConnectionManager_HTTP1,
+		StatPrefix: "ingress_http",
+		RouteSpecifier: &hcmv3.HttpConnectionManager_RouteConfig{
+			RouteConfig: &routev3.RouteConfiguration{
+				VirtualHosts: []*routev3.VirtualHost{{
+					Name:    "vh_default",
+					Domains: []string{"*"},
+					Routes: []*routev3.Route{{
+						Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Path{Path: "/health"}},
+						Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
+							Status: 200,
+							Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineString{InlineString: "OK\n"}},
+						}},
+					}},
+				}},
+			},
+		},
+		HttpFilters: []*hcmv3.HttpFilter{{
+			Name:       "envoy.filters.http.router",
+			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouterAny(t)},
+		}},
+	}
+	a, err := anypb.New(hcmProto)
+	if err != nil {
+		t.Fatalf("anypb.New HCM: %v", err)
+	}
+	return &listenerv3.Filter{
+		Name:       "envoy.filters.network.http_connection_manager",
+		ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: a},
+	}
+}
+
+// TestNewManager_HCMRegistration verifies that a listener using the
+// HCM type_url is accepted by NewManager after the hcm.TypeURL entry
+// was added to filterRegistry (Task 8).
+func TestNewManager_HCMRegistration(t *testing.T) {
+	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_http", "127.0.0.1", 0, mkHCMFilter(t)),
+	}, nil)
+	if _, err := NewManager(boot, cm); err != nil {
+		t.Fatalf("NewManager with HCM listener: %v", err)
+	}
+}
+
+// TestNewManager_HCMBuildErrorWrapsAsListenerFilter verifies that a parse
+// error from hcm.NewFilter is wrapped with the standard listener prefix:
+// listener: "<name>": filter_chains[<i>]: hcm: ...
+func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
+	// HTTP2 codec_type is the cheapest trigger for an hcm: error.
+	hcmProto := &hcmv3.HttpConnectionManager{
+		CodecType:  hcmv3.HttpConnectionManager_HTTP2,
+		StatPrefix: "x",
+	}
+	hcmAny, err := anypb.New(hcmProto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
+	bs := mkBoot(0, []*listenerv3.Listener{{
+		Name: "l_http",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{
+			Filters: []*listenerv3.Filter{{
+				Name:       "envoy.filters.network.http_connection_manager",
+				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: hcmAny},
+			}},
+		}},
+	}}, nil)
+	_, buildErr := NewManager(bs, cm)
+	if buildErr == nil {
+		t.Fatal("expected build error, got nil")
+	}
+	// The error must be wrapped: listener: "l_http": filter_chains[0]: hcm: codec_type HTTP2 ...
+	want := `listener: "l_http": filter_chains[0]: hcm: codec_type HTTP2`
+	if !strings.Contains(buildErr.Error(), want) {
+		t.Errorf("error %q does not contain %q", buildErr.Error(), want)
+	}
 }

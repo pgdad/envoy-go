@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/filter/hcm"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	internaltls "github.com/esalaine/envoy-go/internal/tls"
 )
@@ -43,6 +44,13 @@ type filterConstructor func(tc *anypb.Any, cm *cluster.Manager) (filterHandler, 
 var filterRegistry = map[string]filterConstructor{
 	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager) (filterHandler, error) {
 		f, err := tcpproxy.NewFilter(tc, cm)
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	},
+	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager) (filterHandler, error) {
+		f, err := hcm.NewFilter(tc, cm)
 		if err != nil {
 			return nil, err
 		}
