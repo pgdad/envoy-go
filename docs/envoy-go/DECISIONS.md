@@ -1398,4 +1398,51 @@ The runner's per-fixture orchestration loop gains a new branch: when `d.(fixture
 - Phase 05 (HTTP/2) will reuse the same struct + interface shape — phase 05's helpers will issue HTTP/2 round-trips via a different helper while populating the same `HTTPRequestExpectation` struct. The amortization across phases 04 and 05 justifies the typed-extension cost over per-driver duplication.
 - The `HTTPExpectations` extension is informally superseding the implicit "byte-comparison is the only assertion" contract of the runner; that contract was never ADR'd, so the supersession header on this ADR is informal (mirroring ADR-0034's informal qualifier on the `Drive` split).
 
+---
+
+## ADR-0044: BEHAVIOR_CONTRACT HTTP/1.1 subsection
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.4, D-3.5
+**Settles:** SPEC ADR-K, phase-04 §4.1 BEHAVIOR_CONTRACT.md
+
+### Context
+
+Phase 04 introduces HTTP/1.1 routing. The differential gate against upstream Envoy needs an explicit codification of which equivalence dimensions are asserted (and which are intentionally relaxed) so that future fixture authors and reviewers can reason about the gate's scope without re-deriving it from code.
+
+### Decision
+
+Add a `## HTTP/1.1` subsection to `docs/envoy-go/BEHAVIOR_CONTRACT.md` enumerating Asserted equivalence, Not asserted, Header allow-list extensions, Applies to, and Does not yet apply to. Extend the `## Header allow-list` table with six new rows: `Server`, `Content-Length`, `Transfer-Encoding`, `x-envoy-*`, `x-forwarded-*`, `x-request-id`.
+
+**Asserted equivalence:**
+
+- Response status code per request.
+- Decoded response body bytes for `direct_response` 2xx paths.
+- Route-match selection (same method + path → same matched route on both proxies), witnessed by per-cluster RR distribution `[3,3,3]` over the router-action subset.
+- Upstream-side request preservation (verbatim Host, method, path-with-query, body — modulo stdlib HTTP/1.1 parsing's documented normalisation per ADR-0037).
+
+**Not asserted:**
+
+- Decoded response body bytes for routed-to-upstream requests. The reference (STRICT_DNS) and subject (STATIC) round-robin LBs may start at different endpoint indices; both maintain `[3,3,3]` overall but request[i] may hit a different backend on each side. Status + distribution are the witnesses.
+- Local-reply body bytes for 4xx/5xx (envoy-go uses plain text; Envoy uses HTML/JSON).
+- Response-header **value** equality (set-equality modulo allow-list).
+- `Content-Length` vs `Transfer-Encoding: chunked` framing per response.
+- Upstream connection re-use (envoy-go does not pool — ADR-0039).
+- `x-envoy-*` / `x-forwarded-*` / `x-request-id` headers (allow-listed).
+
+**Header allow-list extensions:** `Server` (presence-only), `Content-Length` and `Transfer-Encoding` (framing-divergence-permitted), `x-envoy-*` / `x-forwarded-*` / `x-request-id` (presence-not-required on subject).
+
+**Applies to:** phase-04 envoy-go `internal/filter/hcm/` package, exercised via fixture `0003-http11-routing`. The phase-04 HCM-filter chain shape `[router]` (ADR-0042). `match.prefix` (bytewise) and `match.path` (case-sensitive exact) only.
+
+**Does not yet apply to:** HTTP/2 (phase 05); HTTP/3 (later); HCM filter chain beyond `[router]` (phase 07); upstream connection pooling (upstream-robustness family); HTTPS (phase 04.x or 05.x); `match.regex` / `match.path_separated_prefix` / `match.connect_matcher` / header-aware match / query-parameter-aware match (subset enforcement per ADR-0038); HTTP-filter iteration protocol (phase 07).
+
+### Consequences
+
+- Future HTTP fixtures inherit the equivalence dimensions enumerated above. New dimensions (e.g., per-request body equivalence under synchronised RR) need superseding ADRs landing in their phase.
+- The "decoded body bytes for routed-to-upstream" relaxation is a phase-04 limitation, not a permanent architectural choice. A future phase that synchronises RR start indices across STATIC and STRICT_DNS (e.g., by seeding both proxies' LBs from the same deterministic source) may tighten this back to "asserted" with a superseding ADR.
+- Phase 05 (HTTP/2) will reuse the same `## HTTP/1.1` subsection's structure for its `## HTTP/2` subsection. The header allow-list is shared across HTTP versions.
+
+Lands in Task 17. **Supersedes:** none — first phase to assert HTTP/1.1 equivalence.
+
 Lands in Task 13 (first use site of the orchestration branch). **Supersedes (informal):** the implicit byte-comparison-only contract.
