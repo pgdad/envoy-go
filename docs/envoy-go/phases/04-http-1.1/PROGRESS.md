@@ -402,3 +402,30 @@ $ go vet ./internal/bootstrap/...
 $ golangci-lint run ./internal/bootstrap/...
 <no output>
 ```
+
+## Task 10 — cmd/envoy-go — HCM smoke variant
+
+**Commits:** 951c90f
+**Notes:** End-to-end test confirms binary serves an HCM direct_response over HTTP/1.1. Minimal bootstrap includes a dummy cluster (required by cluster manager validation) but traffic routes to direct_response without cluster lookup.
+**Outputs:**
+```
+$ go test -run TestEnvoyGoBinary_HCMSmoke -v ./cmd/envoy-go/
+=== RUN   TestEnvoyGoBinary_HCMSmoke
+--- PASS: TestEnvoyGoBinary_HCMSmoke (0.57s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.576s
+
+$ go test ./cmd/envoy-go/...
+=== RUN   TestEnvoyGoBinary_TwoListenerCutover
+--- PASS: TestEnvoyGoBinary_TwoListenerCutover (0.54s)
+=== RUN   TestEnvoyGoBinary_HCMSmoke
+--- PASS: TestEnvoyGoBinary_HCMSmoke (0.51s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.048s
+
+$ go vet ./cmd/envoy-go/...
+<no output>
+
+$ golangci-lint run ./cmd/envoy-go/...
+<no output>
+```
