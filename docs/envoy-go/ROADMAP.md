@@ -32,7 +32,7 @@ These phases ship in order. Each depends on the previous being `done`, because e
 | 01 | static-bootstrap-config | 00 | done |  | Static bootstrap config loader (node, admin, static_resources skeleton). Config parses; admin `/ready` behaves like Envoy. |
 | 02 | tcp-proxy | 01 | done |  | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext). TCP proxy fixture green. |
 | 03 | tls | 02 | done |  | Downstream TLS termination + upstream TLS origination + SNI. TLS TCP fixture green. |
-| 04 | http-1.1 | 03 | planned |  | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response. HTTP/1.1 routing fixture green. |
+| 04 | http-1.1 | 03 | in-progress |  | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response. HTTP/1.1 routing fixture green. |
 | 05 | http-2 | 04 | planned |  | HTTP/2 downstream + upstream (low-level framer, own conn mgr). HTTP/2 fixture green; `h2spec` above threshold. |
 | 06 | observability-baseline | 05 | planned |  | Access log (file sink, Envoy default format) + stats + Prometheus admin endpoint. Access log + Prometheus fixtures green. |
 | 07 | filter-chain-framework | 06 | planned |  | Filter chain framework: iteration protocol, per-route config, extension registry. Framework fixtures green; trivial pluggable filter covers all iteration states. |
