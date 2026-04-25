@@ -1583,3 +1583,36 @@ ADR-0041 (phase-04 HCM silent-ignore set) is amended to add the directly-on-HCM 
 - A future phase that needs configurable per-listener SETTINGS (e.g., to honour `http2_protocol_options.max_concurrent_streams`) supersedes ADR-0047 + ADR-0041's silent-ignore amendment with a new ADR.
 
 This ADR supersedes nothing on its own; ADR-0041 is amended (not superseded) per the additive shape of the silent-ignore set.
+
+---
+
+## ADR-0048: HCM H2 server connection manager from scratch
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.2, D-3.5
+**Settles:** SPEC ADR-Q; phase-05.1 §4.1 / §5.2 / §10 #1.
+
+### Context
+
+`golang.org/x/net/http2` exposes `http2.Server`, `http2.Server.ServeConn`, `http2.ConfigureServer`, `http2.Transport`, and `http2.Transport.NewClientConn`. These types ostensibly fit the "low-level codec only" framing because they live in the same package as `Framer` and `hpack` — but they are RUNTIMES, not codecs. They carry per-request routing, header canonicalization, response-header injection, error policies, and timeout machinery that diverge from Envoy's behaviour. ADR-0046 explicitly forbids using them.
+
+But "don't use the runtimes" is one half of the decision. The other half: build the runtime ourselves. ADR-0048 codifies the from-scratch decision and the architectural shape.
+
+### Decision
+
+Phase 05.1's `internal/filter/hcm/h2/` sub-package implements:
+
+- **`ServerConn` (conn.go)** — per-downstream-conn state machine. One `ServerConn` value owns one downstream `net.Conn` after ALPN selects "h2" (or after the `--allow-h2c` h2c path bypasses TLS). `Run()` performs the connection preface read + server-initial SETTINGS + client-initial SETTINGS exchange, then enters the frame-dispatch loop. Connection-level errors (bad preface, malformed SETTINGS, HPACK COMPRESSION_ERROR, FRAME_SIZE_ERROR on a non-DATA frame, PUSH_PROMISE received from client, stream-id reuse, even-numbered client stream id) emit GOAWAY with the appropriate code and close.
+
+- **`serverStream` (stream.go)** — per-stream state machine implementing RFC 9113 §5.1: idle → open → half-closed (remote/local) → closed. Server-side stream IDs are odd-numbered client-initiated; even-numbered IDs from the client → PROTOCOL_ERROR. Stream-id reuse → PROTOCOL_ERROR. The dispatch helper waits for END_STREAM-on-headers OR END_STREAM-on-data before invoking the matched action (SPEC §10 #1 settled to wait-for-END_STREAM).
+
+- **No `client.go` in 05.1.** The from-scratch `ClientConn` + `RoundTrip` is 05.2's deliverable per ADR-0045. The h2 sub-package compiles and is unit-tested in 05.1 with server-side surfaces only.
+
+### Consequences
+
+- The discipline is grep-verifiable: `! ls internal/filter/hcm/h2/client.go` (the file does not exist) is part of the 05.1 acceptance check (SPEC §13). Task 16's gate sweep verifies.
+- A `routerAction` matched on the H2 path (theoretically possible via misconfiguration but unreachable in 05.1's production bootstraps per SPEC §5.2 step 4c) produces a per-stream INTERNAL_ERROR + RST_STREAM at runtime — the protective shape. Build-time enforcement of "no `routerAction` on H2 listener" is deferred to 05.2 because `Cluster.UseH2()` does not exist yet.
+- The H2 connection manager is the project's first multi-stream concurrent state machine. The flow-control window helper (flow.go) is the synchronization primitive; the stream + conn mutexes are minimal and per-instance. SPEC §11.5 + §11.4 mitigations (tiny-window stress, HPACK table-size update propagation) are exercised in `flow_test.go` and `hpack_test.go`.
+
+This ADR supersedes nothing.

@@ -338,3 +338,50 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.198s
 $ go vet ./internal/filter/hcm/h2/...
 $ go build ./internal/filter/hcm/h2/...
 ```
+
+## Task 8 — h2 serverStream state machine + dispatch + ADR-0048
+
+**Commits:** (SHA-fill pending)
+**Notes:** Created `internal/filter/hcm/h2/stream.go` (326 LoC / 238 substantive) and `internal/filter/hcm/h2/stream_test.go` (382 LoC / 10 tests). Implemented the full RFC 9113 §5.1 per-stream state machine: idle → open → halfClosedRemote → closed transitions via `recvHeaders`, `recvData`, `recvRSTStream`; `recvWindowUpdate` with zero-delta PROTOCOL_ERROR guard; `dispatch` with three-way action type-assertion (DirectResponseDispatcher / non-nil non-matching / nil→404); `buildRequest` constructing stdlib `*http.Request` from pseudo-headers + body pipe; `validateClientStreamID` helper for even-id and reuse PROTOCOL_ERROR; `notFound404` unexported 404 DirectResponseDispatcher. Exported `StreamWriter` interface and `DirectResponseDispatcher` interface as the seam to Task 10's codec-neutral `directResponseAction`. ADR-0048 appended to `DECISIONS.md`. TDD red→green discipline: stream_test.go written first (9 required tests + 1 additional `RecvWindowUpdate_ZeroDeltaIsProtocolError`); confirmed `undefined: newServerStream` on red run. Total h2 test count: 34 (24 prior + 10 new). LoC note: stream.go at 326 total (238 substantive) — above the PLAN's 300-LoC advisory but below the 350-LoC hard-stop; substantive lines land at 238 (within the ~250 budgeted). Controller notified in report.
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/... -run TestServerStream 2>&1 (before stream.go)
+# github.com/esalaine/envoy-go/internal/filter/hcm/h2 [...]
+stream_test.go:75:34: undefined: StreamWriter
+stream_test.go:95:7: undefined: newServerStream
+stream_test.go:103:14: undefined: streamHalfClosedRemote
+... (undefined: hcmAction, streamClosed, streamOpen, etc.)
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm/h2 [build failed]
+$ go test -v ./internal/filter/hcm/h2/... -run TestServerStream (after stream.go)
+=== RUN   TestServerStream_StateTransitions_HeadersOnlyEndStream
+--- PASS: TestServerStream_StateTransitions_HeadersOnlyEndStream (0.00s)
+=== RUN   TestServerStream_StateTransitions_HeadersThenData
+--- PASS: TestServerStream_StateTransitions_HeadersThenData (0.00s)
+=== RUN   TestServerStream_StateTransitions_RSTStream
+--- PASS: TestServerStream_StateTransitions_RSTStream (0.00s)
+=== RUN   TestServerStream_RecvWindowUpdate_ReplenishesSendWindow
+--- PASS: TestServerStream_RecvWindowUpdate_ReplenishesSendWindow (0.00s)
+=== RUN   TestServerStream_RecvWindowUpdate_ZeroDeltaIsProtocolError
+--- PASS: TestServerStream_RecvWindowUpdate_ZeroDeltaIsProtocolError (0.00s)
+=== RUN   TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData
+--- PASS: TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData (0.00s)
+=== RUN   TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError
+--- PASS: TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError (0.00s)
+=== RUN   TestServerStream_Dispatch_NoMatch_Returns404DirectResponse
+--- PASS: TestServerStream_Dispatch_NoMatch_Returns404DirectResponse (0.00s)
+=== RUN   TestServerStream_RejectsEvenClientStreamID
+--- PASS: TestServerStream_RejectsEvenClientStreamID (0.00s)
+=== RUN   TestServerStream_RejectsStreamIDReuse
+--- PASS: TestServerStream_RejectsStreamIDReuse (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.002s
+$ go test -v ./internal/filter/hcm/h2/... (full package — 34 tests)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.199s
+$ go vet ./internal/filter/hcm/h2/...
+$ go build ./internal/filter/hcm/h2/...
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0048: HCM H2 server connection manager from scratch
+$ wc -l internal/filter/hcm/h2/stream.go
+326 internal/filter/hcm/h2/stream.go
+```
