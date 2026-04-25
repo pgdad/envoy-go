@@ -522,7 +522,7 @@ ls: cannot access 'internal/filter/hcm/listener_ctx_stub.go': No such file or di
 
 ## Task 13 — `cmd/envoy-go/main_test.go` h2-over-TLS smoke variant
 
-**Commits:** (SHA-fill below)
+**Commits:** 51d8297
 **Notes:** Added `TestEnvoyGoBinary_H2Smoke` to `cmd/envoy-go/main_test.go` mirroring the `TestEnvoyGoBinary_HCMSmoke` structure. Added two helpers: `buildBinaryOrSkip` (extracted build step, shared across HCMSmoke and H2Smoke) and `pkiFixture0002` (runtime.Caller-based absolute path to fixture-0002 pki/). The test: (1) reads fixture-0002 `server-alpha.pem`/`server-alpha.key.pem` and embeds them as YAML inline_string block scalars; (2) writes a bootstrap YAML with a single `l_h2` listener — TLS transport_socket (`alpn_protocols: ["h2"]`) + HCM filter (`codec_type: HTTP2`, direct_response 200 "OK\n" on prefix `/`); (3) waits for `waitForReadySentinels` on `["l_h2"]`; (4) issues a GET via `http2.Transport{TLSClientConfig: {InsecureSkipVerify: true, ServerName: "alpha.envoy-go.test", NextProtos: ["h2"]}}` and asserts status=200, body="OK\n", ProtoMajor=2. PKI approach: `server-alpha.pem` only has DNS SAN `alpha.envoy-go.test` (no 127.0.0.1 IP SAN); used `ServerName: "alpha.envoy-go.test"` with `InsecureSkipVerify: true` instead of generating a new cert — no `test/helpers/tls.go` creation needed. Test passes in ~0.55s. Whole-tree green.
 **Outputs:**
 ```
