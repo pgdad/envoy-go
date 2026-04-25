@@ -581,3 +581,75 @@ $ go vet ./internal/filter/hcm/...
 $ golangci-lint run ./internal/filter/hcm/...
 <no output>
 ```
+
+## Task 17 — BEHAVIOR_CONTRACT update + ADR-0044 + all-gates green final sweep
+
+**Commits:** dc079c2
+**Notes:** Phase-04 closing task. BEHAVIOR_CONTRACT extended with `## HTTP/1.1` subsection + Header allow-list rows; ADR-0044 codifies the equivalence surface with the documented body-byte-equivalence relaxation for routed-to-upstream requests (rationale: RR start-index divergence between STATIC and STRICT_DNS).
+
+Gate (a) differential fixtures: PASS — every fixture (0000, 0001, 0002, 0003) green.
+Gate (b) unit tests + race: PASS — every package green, no data races.
+Gate (c): N/A — phase 04 introduces no new ready-sentinel format.
+Gate (d) fuzz targets: every fuzz target completed 30s budget with no crashers.
+Gate (e) vet + lint: clean across module.
+Gate (f): deferred to verification-before-completion session per BOOTSTRAP §5 step 6.
+
+**Outputs:**
+```
+$ go test ./test/differential/... -timeout=12m
+ok  	github.com/esalaine/envoy-go/test/differential	5.957s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+$ go test -race ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.148s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.062s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.036s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.028s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.029s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.026s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	(cached)
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.076s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/differential	7.203s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.008s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.008s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.007s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.014s
+$ go test ./internal/bootstrap -run=FuzzBootstrapLoad -fuzz=FuzzBootstrapLoad -fuzztime=30s
+fuzz: elapsed: 27s, execs: 792369 (0/sec), new interesting: 33 (total: 905)
+fuzz: elapsed: 30s, execs: 792369 (0/sec), new interesting: 33 (total: 905)
+fuzz: elapsed: 31s, execs: 792369 (0/sec), new interesting: 33 (total: 905)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.082s
+$ go test ./internal/filter/tcpproxy -run=FuzzTcpProxyFilter -fuzz=FuzzTcpProxyFilter -fuzztime=30s
+fuzz: elapsed: 27s, execs: 3086279 (113518/sec), new interesting: 8 (total: 508)
+fuzz: elapsed: 30s, execs: 3392708 (102135/sec), new interesting: 8 (total: 508)
+fuzz: elapsed: 31s, execs: 3392708 (0/sec), new interesting: 8 (total: 508)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.064s
+$ go test ./internal/tls -run=FuzzTLSContextParse -fuzz=FuzzTLSContextParse -fuzztime=30s
+fuzz: elapsed: 27s, execs: 5013301 (347826/sec), new interesting: 32 (total: 449)
+fuzz: elapsed: 30s, execs: 7271162 (752552/sec), new interesting: 39 (total: 456)
+fuzz: elapsed: 31s, execs: 7271162 (0/sec), new interesting: 39 (total: 456)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.045s
+$ go test ./internal/filter/hcm -run=FuzzHCMConfigParse -fuzz=FuzzHCMConfigParse -fuzztime=30s
+fuzz: elapsed: 27s, execs: 3916255 (129564/sec), new interesting: 114 (total: 392)
+fuzz: elapsed: 30s, execs: 4310890 (131539/sec), new interesting: 120 (total: 398)
+fuzz: elapsed: 31s, execs: 4310890 (0/sec), new interesting: 120 (total: 398)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.048s
+$ go vet ./...
+<no output>
+$ golangci-lint run ./...
+<no output>
+```
