@@ -556,7 +556,7 @@ $ go build ./...
 
 ## Task 14 — h2 fuzz targets — FuzzFrameStream + FuzzHPACKDecode
 
-**Commits:** TBD (SHA-fill follows)
+**Commits:** df07598
 **Notes:** Created `internal/filter/hcm/h2/fuzz_test.go` with two fuzz targets and all required helpers (replayConn, stubDispatcher/stubAction). Seeding: 3 seeds for FuzzFrameStream (preface-only, preface+SETTINGS, preface+SETTINGS+SETTINGS-ACK); 2 seeds for FuzzHPACKDecode (empty block, well-formed ":method: GET"). The 30s CI budget runs without crash.
 
 **Two production-code bugs discovered and fixed by the fuzzer (committed in same change):**
