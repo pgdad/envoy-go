@@ -341,7 +341,7 @@ $ go build ./internal/filter/hcm/h2/...
 
 ## Task 8 — h2 serverStream state machine + dispatch + ADR-0048
 
-**Commits:** (SHA-fill pending)
+**Commits:** 59f669d
 **Notes:** Created `internal/filter/hcm/h2/stream.go` (326 LoC / 238 substantive) and `internal/filter/hcm/h2/stream_test.go` (382 LoC / 10 tests). Implemented the full RFC 9113 §5.1 per-stream state machine: idle → open → halfClosedRemote → closed transitions via `recvHeaders`, `recvData`, `recvRSTStream`; `recvWindowUpdate` with zero-delta PROTOCOL_ERROR guard; `dispatch` with three-way action type-assertion (DirectResponseDispatcher / non-nil non-matching / nil→404); `buildRequest` constructing stdlib `*http.Request` from pseudo-headers + body pipe; `validateClientStreamID` helper for even-id and reuse PROTOCOL_ERROR; `notFound404` unexported 404 DirectResponseDispatcher. Exported `StreamWriter` interface and `DirectResponseDispatcher` interface as the seam to Task 10's codec-neutral `directResponseAction`. ADR-0048 appended to `DECISIONS.md`. TDD red→green discipline: stream_test.go written first (9 required tests + 1 additional `RecvWindowUpdate_ZeroDeltaIsProtocolError`); confirmed `undefined: newServerStream` on red run. Total h2 test count: 34 (24 prior + 10 new). LoC note: stream.go at 326 total (238 substantive) — above the PLAN's 300-LoC advisory but below the 350-LoC hard-stop; substantive lines land at 238 (within the ~250 budgeted). Controller notified in report.
 **Outputs:**
 ```
