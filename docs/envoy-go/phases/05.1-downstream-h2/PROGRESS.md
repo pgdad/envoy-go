@@ -272,7 +272,7 @@ $ go build ./internal/filter/hcm/h2/...
 
 ## Task 7 — h2 SETTINGS handshake helpers + ADR-0047 (server settings defaults)
 
-**Commits:** SHA-PENDING (SHA-fill follows)
+**Commits:** d035d60
 **Notes:** Created `internal/filter/hcm/h2/settings.go` with exported `ServerSettings` struct (6 fields: MaxConcurrentStreams, InitialWindowSize, MaxFrameSize, EnablePush, NoRFC7540Priorities, HeaderTableSize), `DefaultServerSettings` global (100/65535/16384/0/1/4096), unexported `clientSettings` struct, `writeServerInitialSettings(fr, s)` writing 6 SETTINGS entries (5 standard http2.Setting* constants + SETTINGS_NO_RFC7540_PRIORITIES at numeric ID 0x9), and `readClientSettings(fr, applyTo)` returning *Error{PROTOCOL_ERROR} on read failure, non-SettingsFrame, or ACK-on-first-read. Appended ADR-0047 to DECISIONS.md (server settings defaults + ADR-0041 amendment adding http2_protocol_options to HCM silent-ignore set). TDD red→green discipline followed: `settings_test.go` was written first and confirmed to fail with 5 undefined symbols before `settings.go` was written. All 3 new tests plus all 21 prior h2 tests pass green (24 total); `go vet` and `go build` are both clean.
 **Outputs:**
 ```
