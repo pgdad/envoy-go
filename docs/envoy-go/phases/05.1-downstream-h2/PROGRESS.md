@@ -146,6 +146,68 @@ $ go vet ./internal/filter/hcm/h2/...
 $ go build ./internal/filter/hcm/h2/...
 ```
 
+## Task 6 — h2 flow-control window helpers (conn + per-stream)
+
+**Commits:** <!-- SHA-fill -->
+**Notes:** Created `internal/filter/hcm/h2/flow.go` with `window` struct (mutex-guarded `int32` counter + buffered signal channel of capacity 1). `newWindow(initial int32)` constructs with pre-allocated channel. `available()` returns mu-locked read. `reserve(n int32)` atomically decrements up to n, returning taken amount (0 if window <=0); non-blocking. `replenish(delta int32)` increments under lock then does a non-blocking push to the signal channel. `waitFor(ctx, n)` spins on the signal channel until window >= n or ctx cancels. TDD red→green discipline followed: `flow_test.go` was written first and confirmed to fail with `undefined: newWindow` (4 occurrences) before `flow.go` was written. All 4 new Window tests plus all 17 prior h2 tests pass green; `go vet` and `go build` are both clean. SPEC §11.5 mitigation (TinyWindowStressDelivery: INITIAL_WINDOW_SIZE=1, 100 bytes in 1-byte chunks, 99 replenish ticks at 1ms each) completed in ~100ms wall time, well under 1s timeout.
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/... -run TestWindow 2>&1 (before flow.go)
+# github.com/esalaine/envoy-go/internal/filter/hcm/h2 [github.com/esalaine/envoy-go/internal/filter/hcm/h2.test]
+internal/filter/hcm/h2/flow_test.go:11:7: undefined: newWindow
+internal/filter/hcm/h2/flow_test.go:26:7: undefined: newWindow
+internal/filter/hcm/h2/flow_test.go:44:7: undefined: newWindow
+internal/filter/hcm/h2/flow_test.go:62:7: undefined: newWindow
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm/h2 [build failed]
+$ go test -v ./internal/filter/hcm/h2/... (after flow.go)
+=== RUN   TestErrorCodeStrings
+--- PASS: TestErrorCodeStrings (0.00s)
+=== RUN   TestConnError_PrefixAndShape
+--- PASS: TestConnError_PrefixAndShape (0.00s)
+=== RUN   TestStreamError_PrefixAndShape
+--- PASS: TestStreamError_PrefixAndShape (0.00s)
+=== RUN   TestError_UnwrapsUnderlying
+--- PASS: TestError_UnwrapsUnderlying (0.00s)
+=== RUN   TestWindow_ReserveAndReplenish
+--- PASS: TestWindow_ReserveAndReplenish (0.00s)
+=== RUN   TestWindow_BlockingWaitFor
+--- PASS: TestWindow_BlockingWaitFor (0.02s)
+=== RUN   TestWindow_CtxCancelDuringWait
+--- PASS: TestWindow_CtxCancelDuringWait (0.02s)
+=== RUN   TestWindow_TinyWindowStressDelivery
+--- PASS: TestWindow_TinyWindowStressDelivery (0.10s)
+=== RUN   TestFramer_SettingsRoundTrip
+--- PASS: TestFramer_SettingsRoundTrip (0.00s)
+=== RUN   TestFramer_PingRoundTrip
+--- PASS: TestFramer_PingRoundTrip (0.00s)
+=== RUN   TestFramer_HeadersRoundTrip
+--- PASS: TestFramer_HeadersRoundTrip (0.00s)
+=== RUN   TestFramer_DataRoundTrip
+--- PASS: TestFramer_DataRoundTrip (0.00s)
+=== RUN   TestFramer_RSTStreamWindowUpdateGoAway
+--- PASS: TestFramer_RSTStreamWindowUpdateGoAway (0.00s)
+=== RUN   TestFramer_ReadFrameCtxCancel
+--- PASS: TestFramer_ReadFrameCtxCancel (0.05s)
+=== RUN   TestHPACK_EncodeDecodeRoundTrip
+--- PASS: TestHPACK_EncodeDecodeRoundTrip (0.00s)
+=== RUN   TestHPACK_AdversarialDecode_NoPanicReturnsCompressionError
+--- PASS: TestHPACK_AdversarialDecode_NoPanicReturnsCompressionError (0.00s)
+=== RUN   TestHPACK_UpdateMaxTableSize_PropagatesToEncoder
+--- PASS: TestHPACK_UpdateMaxTableSize_PropagatesToEncoder (0.00s)
+=== RUN   TestReadClientPreface_Good
+--- PASS: TestReadClientPreface_Good (0.00s)
+=== RUN   TestReadClientPreface_BadByteAtEachPosition
+--- PASS: TestReadClientPreface_BadByteAtEachPosition (0.00s)
+=== RUN   TestReadClientPreface_Truncated
+--- PASS: TestReadClientPreface_Truncated (0.00s)
+=== RUN   TestReadClientPreface_EmptyEOF
+--- PASS: TestReadClientPreface_EmptyEOF (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.197s
+$ go vet ./internal/filter/hcm/h2/...
+$ go build ./internal/filter/hcm/h2/...
+```
+
 ## Task 4 — h2 framer (ctx-aware http2.Framer wrapper) + ADR-0046
 
 **Commits:** 291e061
