@@ -69,7 +69,7 @@ golang.org/x/net v0.34.0
 
 ## Task 2 — h2 sub-package skeleton + errors enum
 
-**Commits:** <pending>
+**Commits:** 58bbd20
 **Notes:** Created `internal/filter/hcm/h2/` package with `doc.go` (package-level comment describing codec philosophy, ALPN/fuzz discipline, and the explicit "does NOT use http2.Server" constraint) and `errors.go` (14-constant `ErrCode` enum matching RFC 9113 §7 ordering 0x0..0xd, `String()` returning RFC mnemonics, `Error` struct with `"h2: "` prefix discipline, `Unwrap()` for error-chain support, and `connError`/`streamError` helpers). TDD red→green discipline followed: `errors_test.go` was written first and confirmed to fail with `undefined: ErrCode` before `errors.go` was written.
 **Outputs:**
 ```
