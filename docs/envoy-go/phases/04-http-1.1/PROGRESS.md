@@ -454,3 +454,32 @@ $ go vet ./test/helpers/...
 $ golangci-lint run ./test/helpers/...
 <no output>
 ```
+
+## Task 12 — test/helpers — HTTPHeaderDiff
+
+**Commits:** d81b38b
+**Notes:** Symmetric-difference helper + phase-04 default allow-list. Settles SPEC §10 #7 to fixed in-code list.
+**Outputs:**
+```
+$ go test -run 'TestHTTPHeaderDiff|TestPhaseFourHTTPAllowList' -v ./test/helpers/
+=== RUN   TestHTTPHeaderDiff_Identical
+--- PASS: TestHTTPHeaderDiff_Identical (0.00s)
+=== RUN   TestHTTPHeaderDiff_RefOnlyAndSubjOnly
+--- PASS: TestHTTPHeaderDiff_RefOnlyAndSubjOnly (0.00s)
+=== RUN   TestHTTPHeaderDiff_AllowListExact
+--- PASS: TestHTTPHeaderDiff_AllowListExact (0.00s)
+=== RUN   TestHTTPHeaderDiff_AllowListPrefix
+--- PASS: TestHTTPHeaderDiff_AllowListPrefix (0.00s)
+=== RUN   TestHTTPHeaderDiff_CaseInsensitive
+--- PASS: TestHTTPHeaderDiff_CaseInsensitive (0.00s)
+=== RUN   TestHTTPHeaderDiff_AllowListCaseInsensitive
+--- PASS: TestHTTPHeaderDiff_AllowListCaseInsensitive (0.00s)
+=== RUN   TestPhaseFourHTTPAllowList_DefaultEntries
+--- PASS: TestPhaseFourHTTPAllowList_DefaultEntries (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/helpers	0.002s
+$ go vet ./test/helpers/...
+<no output>
+$ golangci-lint run ./test/helpers/...
+<no output>
+```
