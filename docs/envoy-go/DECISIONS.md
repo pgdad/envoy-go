@@ -1444,5 +1444,3 @@ Add a `## HTTP/1.1` subsection to `docs/envoy-go/BEHAVIOR_CONTRACT.md` enumerati
 - Phase 05 (HTTP/2) will reuse the same `## HTTP/1.1` subsection's structure for its `## HTTP/2` subsection. The header allow-list is shared across HTTP versions.
 
 Lands in Task 17. **Supersedes:** none — first phase to assert HTTP/1.1 equivalence.
-
-Lands in Task 13 (first use site of the orchestration branch). **Supersedes (informal):** the implicit byte-comparison-only contract.

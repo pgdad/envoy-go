@@ -153,8 +153,8 @@ func TestManager_Error_StrictDNS(t *testing.T) {
 	if !strings.Contains(err.Error(), "STRICT_DNS") {
 		t.Errorf("error %q does not contain STRICT_DNS", err.Error())
 	}
-	if !strings.Contains(err.Error(), "phase 02 supports only STATIC") {
-		t.Errorf("error %q does not contain %q", err.Error(), "phase 02 supports only STATIC")
+	if !strings.Contains(err.Error(), "only STATIC clusters supported") {
+		t.Errorf("error %q does not contain %q", err.Error(), "only STATIC clusters supported")
 	}
 }
 
@@ -168,8 +168,8 @@ func TestManager_Error_LogicalDNS(t *testing.T) {
 	if !strings.Contains(err.Error(), "LOGICAL_DNS") {
 		t.Errorf("error %q does not contain LOGICAL_DNS", err.Error())
 	}
-	if !strings.Contains(err.Error(), "phase 02 supports only STATIC") {
-		t.Errorf("error %q does not contain %q", err.Error(), "phase 02 supports only STATIC")
+	if !strings.Contains(err.Error(), "only STATIC clusters supported") {
+		t.Errorf("error %q does not contain %q", err.Error(), "only STATIC clusters supported")
 	}
 }
 
@@ -183,8 +183,8 @@ func TestManager_Error_EDS(t *testing.T) {
 	if !strings.Contains(err.Error(), "EDS") {
 		t.Errorf("error %q does not contain EDS", err.Error())
 	}
-	if !strings.Contains(err.Error(), "phase 02 supports only STATIC") {
-		t.Errorf("error %q does not contain %q", err.Error(), "phase 02 supports only STATIC")
+	if !strings.Contains(err.Error(), "only STATIC clusters supported") {
+		t.Errorf("error %q does not contain %q", err.Error(), "only STATIC clusters supported")
 	}
 }
 
@@ -198,8 +198,8 @@ func TestManager_Error_OriginalDST(t *testing.T) {
 	if !strings.Contains(err.Error(), "ORIGINAL_DST") {
 		t.Errorf("error %q does not contain ORIGINAL_DST", err.Error())
 	}
-	if !strings.Contains(err.Error(), "phase 02 supports only STATIC") {
-		t.Errorf("error %q does not contain %q", err.Error(), "phase 02 supports only STATIC")
+	if !strings.Contains(err.Error(), "only STATIC clusters supported") {
+		t.Errorf("error %q does not contain %q", err.Error(), "only STATIC clusters supported")
 	}
 }
 

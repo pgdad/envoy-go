@@ -80,13 +80,13 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	}
 	t, ok := c.GetClusterDiscoveryType().(*clusterv3.Cluster_Type)
 	if !ok {
-		return nil, fmt.Errorf("cluster: %q: cluster_discovery_type must be Type, got %T (phase 02 supports only STATIC)", name, c.GetClusterDiscoveryType())
+		return nil, fmt.Errorf("cluster: %q: cluster_discovery_type must be Type, got %T (only STATIC supported)", name, c.GetClusterDiscoveryType())
 	}
 	if t.Type != clusterv3.Cluster_STATIC {
-		return nil, fmt.Errorf("cluster: %q: phase 02 supports only STATIC clusters; got %s", name, t.Type)
+		return nil, fmt.Errorf("cluster: %q: only STATIC clusters supported; got %s", name, t.Type)
 	}
 	if c.GetLbPolicy() != clusterv3.Cluster_ROUND_ROBIN {
-		return nil, fmt.Errorf("cluster: %q: phase 02 supports only ROUND_ROBIN lb_policy; got %s", name, c.GetLbPolicy())
+		return nil, fmt.Errorf("cluster: %q: only ROUND_ROBIN lb_policy supported; got %s", name, c.GetLbPolicy())
 	}
 	la := c.GetLoadAssignment()
 	if la == nil {
@@ -137,7 +137,7 @@ func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) 
 			}
 			sa := addr.GetSocketAddress()
 			if sa == nil {
-				return nil, fmt.Errorf("cluster: %q: endpoints[%d].lb_endpoints[%d]: only socket_address endpoints supported in phase 02", clusterName, gi, ei)
+				return nil, fmt.Errorf("cluster: %q: endpoints[%d].lb_endpoints[%d]: only socket_address endpoints supported", clusterName, gi, ei)
 			}
 			out = append(out, Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue()})
 		}

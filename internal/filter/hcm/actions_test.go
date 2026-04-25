@@ -138,7 +138,10 @@ func TestRouterAction_DoHappy(t *testing.T) {
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	if err := a.do(req.Context(), req, bw); err != nil {
+	// loopbackHTTPEcho writes `Connection: close` in its response, so the
+	// router action correctly signals close via errCloseAfterAction (per
+	// SPEC §5.3 / SPEC §10 #3 settled). Any other error is a real failure.
+	if err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
 		t.Fatalf("do: %v", err)
 	}
 	_ = bw.Flush()
@@ -184,7 +187,9 @@ func TestRouterAction_DoCtxCancel(t *testing.T) {
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	_ = a.do(ctx, req, bw)
+	if err := a.do(ctx, req, bw); err != nil {
+		t.Errorf("ctx-cancel should map to 503 local reply, not propagate err: %v", err)
+	}
 	_ = bw.Flush()
 	if !strings.HasPrefix(buf.String(), "HTTP/1.1 503 ") {
 		t.Errorf("ctx cancel should produce 503 local reply, got: %q", buf.String())

@@ -55,6 +55,14 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	}
 	defer func() { _ = upstream.Close() }()
 
+	// Propagate the downstream ctx deadline (if any) to the upstream socket
+	// so a stalled upstream cannot hold the action past the ctx's deadline
+	// during req.Write or http.ReadResponse — both of which are otherwise
+	// ctx-unaware (REVIEW.md I-3 from REVIEW.md 04527eb).
+	if dl, ok := ctx.Deadline(); ok {
+		_ = upstream.SetDeadline(dl)
+	}
+
 	if err := req.Write(upstream); err != nil {
 		return writeStatusReply(bw, 502, "")
 	}
@@ -65,5 +73,16 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	return resp.Write(bw)
+	if err := resp.Write(bw); err != nil {
+		return err
+	}
+	// Honor the upstream's Connection: close (and HTTP/1.0 close-by-default)
+	// by signaling the connection loop via errCloseAfterAction. http.ReadResponse
+	// populates resp.Close from the wire-level signals (Connection: close on
+	// HTTP/1.1, default-close on HTTP/1.0). SPEC §5.3 / SPEC §10 #3 settled.
+	// REVIEW.md I-1 from REVIEW.md 04527eb.
+	if resp.Close {
+		return errCloseAfterAction
+	}
+	return nil
 }
