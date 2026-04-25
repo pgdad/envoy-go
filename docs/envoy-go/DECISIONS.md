@@ -1616,3 +1616,43 @@ Phase 05.1's `internal/filter/hcm/h2/` sub-package implements:
 - The H2 connection manager is the project's first multi-stream concurrent state machine. The flow-control window helper (flow.go) is the synchronization primitive; the stream + conn mutexes are minimal and per-instance. SPEC §11.5 + §11.4 mitigations (tiny-window stress, HPACK table-size update propagation) are exercised in `flow_test.go` and `hpack_test.go`.
 
 This ADR supersedes nothing.
+
+---
+
+## ADR-0049: Test-only `--allow-h2c` CLI flag on `cmd/envoy-go`
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.5
+**Settles:** SPEC ADR-Z; phase-05.1 §4.2 (cmd/envoy-go --allow-h2c) + §10 #5 (form decision).
+
+### Context
+
+Phase 05.1's gate (c) — `h2spec` conformance — must drive an HTTP/2 protocol-level test against the subject. h2spec's standard mode is h2c (cleartext HTTP/2 over plaintext TCP); h2spec's TLS mode requires a custom CA setup that complicates the conformance pin. envoy-go's HCM build-time validator otherwise rejects `codec_type: HTTP2` on plaintext listeners (no TLS handshake = no ALPN selection = no way to differentiate h2 from h1 at the listener level), so a runtime escape hatch is needed for the conformance suite to drive h2c against the subject.
+
+### Decision
+
+Add a test-only CLI flag `--allow-h2c` to `cmd/envoy-go/main.go`. Default OFF. When ON, the listener manager threads `listenerCtx{allowH2C: true}` into HCM filter construction; HCM's build-time validator accepts `codec_type: HTTP2` on plaintext listeners under this condition. The flag is documented in `--help` output as "test-only; not for production".
+
+**Form: CLI flag** (vs env var, vs build tag). Rationale:
+- The testcontainers driver (`test/conformance/h2spec/h2spec_test.go`) constructs the subject via `os/exec`; a CLI flag is the lowest-friction option for that driver. An env var would require setting + unsetting in the test's process environment; a build tag would require a separate test binary build.
+- The flag is boolean (no value form). A value-bearing form was considered (e.g., `--allow-h2c=ports:8080,8081`) and rejected as over-engineered for a single use site. If a future phase needs per-listener gating, that's a superseding ADR.
+
+The flag is plumbed through:
+
+1. `cmd/envoy-go/main.go`: `flag.Bool("allow-h2c", false, ...)`.
+2. `internal/listener/manager.NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, allowH2C bool)`: NEW constructor variant. Existing `NewManager` and `NewManagerWithBaseDir` delegate with `allowH2C=false`.
+3. `listenerCtx{hasTLS, allowH2C}` per-chain value passed into the `filterRegistry` constructors.
+4. `hcm.NewFilterWithCtx(tc, cm, hcm.ListenerCtx{HasTLS, AllowH2C})`: NEW HCM constructor variant. Existing `NewFilter` delegates with the zero-value `ListenerCtx{HasTLS:false, AllowH2C:false}`.
+5. `parseFilterWithCtx` consults `lc.HasTLS` and `lc.AllowH2C` to validate `codec_type: HTTP2` per Task 12.
+
+### Consequences
+
+- The flag's runtime cost is one boolean field on `Filter` and one branch in `Filter.Handle` (under the `codec_type=HTTP2` AND plaintext path). Negligible.
+- A future doctrine-cleanup phase MAY add a `//go:build !production` build tag to strip the flag entirely from production binaries. 05.1 does not pre-empt that decision — the flag's CI cost is low enough that the production strip is over-engineering at this stage.
+- The flag is NOT advertised in `README.md`, `MISSION.md`, or any operator-facing surface other than `--help`. The discipline relies on the documentation discipline; future phases may add a CI-time grep to catch stray references.
+- The h2-over-TLS production path is the default-supported configuration in 05.1; `--allow-h2c` does not change anything for that path. Phase 05.2's fixture 0004 uses HTTPS h2 (real ALPN) and does not set `--allow-h2c`.
+
+This ADR supersedes nothing.
+
+This ADR supersedes nothing.

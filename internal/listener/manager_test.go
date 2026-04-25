@@ -1245,6 +1245,106 @@ func TestNewManager_HCMRegistration(t *testing.T) {
 	}
 }
 
+// mkHCMHTTP2Filter builds a listenerv3.Filter carrying a minimal valid HCM
+// typed_config with codec_type=HTTP2 and a direct_response /health route.
+// Used by the Task-11 allowH2C plumbing tests.
+func mkHCMHTTP2Filter(t *testing.T) *listenerv3.Filter {
+	t.Helper()
+	hcmProto := &hcmv3.HttpConnectionManager{
+		CodecType:  hcmv3.HttpConnectionManager_HTTP2,
+		StatPrefix: "ingress_h2",
+		RouteSpecifier: &hcmv3.HttpConnectionManager_RouteConfig{
+			RouteConfig: &routev3.RouteConfiguration{
+				VirtualHosts: []*routev3.VirtualHost{{
+					Name:    "vh_default",
+					Domains: []string{"*"},
+					Routes: []*routev3.Route{{
+						Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Path{Path: "/health"}},
+						Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
+							Status: 200,
+							Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineString{InlineString: "OK\n"}},
+						}},
+					}},
+				}},
+			},
+		},
+		HttpFilters: []*hcmv3.HttpFilter{{
+			Name:       "envoy.filters.http.router",
+			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouterAny(t)},
+		}},
+	}
+	a, err := anypb.New(hcmProto)
+	if err != nil {
+		t.Fatalf("anypb.New HCM HTTP2: %v", err)
+	}
+	return &listenerv3.Filter{
+		Name:       "envoy.filters.network.http_connection_manager",
+		ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: a},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-05.1 Task 11: --allow-h2c plumbing tests
+// ---------------------------------------------------------------------------
+
+// TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow verifies that
+// NewManagerWithBaseDirAndAllowH2C with allowH2C=true accepts a plaintext
+// listener with HCM codec_type=HTTP2. The stub hcm.NewFilterWithCtx remaps
+// HTTP2→AUTO so the phase-04 validator passes; Task 12 replaces the stub.
+func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T) {
+	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
+	}, nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */)
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
+	}
+	_ = m
+}
+
+// TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow verifies
+// that NewManagerWithBaseDirAndAllowH2C with allowH2C=false rejects a plaintext
+// listener with HCM codec_type=HTTP2 with an error containing
+// "codec_type HTTP2 requires TLS".
+//
+// SKIP: The validation logic ("codec_type HTTP2 requires TLS") lives in
+// hcm.parseFilterWithCtx, which is Task 12's work. Remove this skip in Task 12
+// once parseFilterWithCtx enforces the constraint.
+func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testing.T) {
+	t.Skip("validation lands in Task 12")
+	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
+	}, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */)
+	if err == nil {
+		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
+	}
+	if !strings.Contains(err.Error(), "codec_type HTTP2 requires TLS") {
+		t.Errorf("error = %q, want substring 'codec_type HTTP2 requires TLS'", err.Error())
+	}
+}
+
+// TestNewManager_BackwardsCompat_DefaultsAllowH2CFalse verifies that the
+// existing NewManager + NewManagerWithBaseDir constructors delegate to
+// NewManagerWithBaseDirAndAllowH2C with allowH2C=false. A TLS+HTTP2 bootstrap
+// still builds correctly (TLS satisfies the requirement; allowH2C is
+// irrelevant on the TLS path).
+func TestNewManager_BackwardsCompat_DefaultsAllowH2CFalse(t *testing.T) {
+	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
+	tsAlpha := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
+	l := mkTLSListener("l_h2tls", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain(nil, tsAlpha, mkHCMHTTP2Filter(t)),
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	m, err := NewManager(boot, cm)
+	if err != nil {
+		t.Fatalf("NewManager = %v, want nil (TLS+HTTP2 path)", err)
+	}
+	_ = m
+}
+
 // TestNewManager_HCMBuildErrorWrapsAsListenerFilter verifies that a parse
 // error from hcm.NewFilter is wrapped with the standard listener prefix:
 // listener: "<name>": filter_chains[<i>]: hcm: ...

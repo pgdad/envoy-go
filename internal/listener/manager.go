@@ -35,22 +35,32 @@ type filterHandler interface {
 	Handle(ctx context.Context, downstream net.Conn)
 }
 
-// filterConstructor builds a filterHandler from a typed_config Any and the
-// resolved cluster manager. Phase 02 has exactly one entry: tcp_proxy.
-type filterConstructor func(tc *anypb.Any, cm *cluster.Manager) (filterHandler, error)
+// listenerCtx carries per-chain context that filter constructors consult at
+// build time. Phase 05.1 introduces this to plumb the --allow-h2c flag through
+// to hcm.NewFilterWithCtx (per ADR-0049). Future phases may extend.
+type listenerCtx struct {
+	hasTLS   bool
+	allowH2C bool
+}
+
+// filterConstructor builds a filterHandler from a typed_config Any, the
+// resolved cluster manager, and per-chain listenerCtx. Phase 05.1 adds lc.
+type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx) (filterHandler, error)
 
 // filterRegistry maps a filter typed_config.type_url to its constructor.
 // SPEC §5.3: inline; phase 07 generalises.
 var filterRegistry = map[string]filterConstructor{
-	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager) (filterHandler, error) {
+	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx) (filterHandler, error) {
 		f, err := tcpproxy.NewFilter(tc, cm)
 		if err != nil {
 			return nil, err
 		}
 		return f, nil
 	},
-	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager) (filterHandler, error) {
-		f, err := hcm.NewFilter(tc, cm)
+	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx) (filterHandler, error) {
+		// Bridge listenerCtx into hcm.ListenerCtx (the public shape exposed by
+		// hcm so that the listener manager doesn't import hcm-internal types).
+		f, err := hcm.NewFilterWithCtx(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C})
 		if err != nil {
 			return nil, err
 		}
@@ -91,7 +101,7 @@ type Manager struct {
 //
 // Every error begins with "listener: ".
 func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager) (*Manager, error) {
-	return NewManagerWithBaseDir(bs, cm, "")
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
@@ -100,6 +110,18 @@ func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager) (*Manager, error
 // location. Pass "" to resolve relative to the process working directory
 // (phase-02 compat).
 func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string) (*Manager, error) {
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false)
+}
+
+// NewManagerWithBaseDirAndAllowH2C is the phase-05.1 constructor variant. It
+// threads the --allow-h2c boolean from cmd/envoy-go/main into a per-chain
+// listenerCtx passed into the HCM filter constructor at build time. allowH2C
+// permits HCM codec_type=HTTP2 on plaintext listeners (for h2spec conformance);
+// default false.
+//
+// Existing callers NewManager and NewManagerWithBaseDir delegate here with
+// allowH2C=false.
+func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool) (*Manager, error) {
 	ls := bs.GetStaticResources().GetListeners()
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
@@ -107,7 +129,7 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls))}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntime(l, i, cm, baseDir)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C)
 		if err != nil {
 			return nil, err
 		}
@@ -120,9 +142,11 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 	return m, nil
 }
 
-// buildListenerRuntime validates one Listener proto and constructs its
-// listenerRuntime (including all chainInfo entries). No socket is bound here.
-func buildListenerRuntime(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string) (*listenerRuntime, error) {
+// buildListenerRuntimeWithCtx validates one Listener proto and constructs its
+// listenerRuntime (including all chainInfo entries). allowH2C is threaded into
+// each per-chain listenerCtx passed to the filter constructors. No socket is
+// bound here.
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -178,7 +202,8 @@ func buildListenerRuntime(l *listenerv3.Listener, idx int, cm *cluster.Manager, 
 		if !ok {
 			return nil, fmt.Errorf("listener: %q: filter_chains[%d]: unknown filter type_url %q", name, i, tc.GetTypeUrl())
 		}
-		fh, err := ctor(tc, cm)
+		lc := listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C}
+		fh, err := ctor(tc, cm, lc)
 		if err != nil {
 			return nil, fmt.Errorf("listener: %q: filter_chains[%d]: %w", name, i, err)
 		}

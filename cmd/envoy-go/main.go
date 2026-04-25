@@ -26,9 +26,11 @@ import (
 
 func main() {
 	cfgPath := flag.String("c", "", "path to envoy-go.yaml (Envoy v3 Bootstrap)")
+	allowH2C := flag.Bool("allow-h2c", false,
+		"test-only; not for production — permits HCM codec_type=HTTP2 on plaintext listeners for h2spec conformance only")
 	flag.Parse()
 	if *cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: envoy-go -c <config.yaml>")
+		fmt.Fprintln(os.Stderr, "usage: envoy-go -c <config.yaml> [--allow-h2c]")
 		os.Exit(2)
 	}
 	f, err := os.Open(*cfgPath)
@@ -58,7 +60,7 @@ func main() {
 	}
 	defer func() { _ = admSrv.Close() }()
 
-	lm, err := listener.NewManager(bs, cm)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs, cm, filepath.Dir(*cfgPath), *allowH2C)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}
