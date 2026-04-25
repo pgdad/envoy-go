@@ -232,5 +232,5 @@ func buildDirectResponseAction(d *routev3.DirectResponseAction) (*directResponse
 	if is.InlineString == "" {
 		return nil, fmt.Errorf("direct_response.body.inline_string is empty")
 	}
-	return &directResponseAction{status: int(d.Status), body: is.InlineString}, nil
+	return &directResponseAction{status: int(d.Status), bodyText: is.InlineString}, nil
 }

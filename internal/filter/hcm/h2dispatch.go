@@ -8,10 +8,6 @@ package hcm
 
 import (
 	"net/http"
-	"strconv"
-	"time"
-
-	"golang.org/x/net/http2/hpack"
 
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 )
@@ -41,7 +37,7 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 	entry, ok := d.table.match(req)
 	if !ok {
 		// No matching route — synthesise 404.
-		return &h2DirectResponseAdapter{a: &directResponseAction{status: 404, body: "not found\n"}}, true
+		return &h2DirectResponseAdapter{a: &directResponseAction{status: 404, bodyText: "not found\n"}}, true
 	}
 	if dr, ok := entry.action.(*directResponseAction); ok {
 		return &h2DirectResponseAdapter{a: dr}, true
@@ -53,25 +49,13 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 }
 
 // h2DirectResponseAdapter wraps a *directResponseAction as an h2.Action.
-// WriteH2 inlines the H2 wire-write logic until Task 10 factors it out.
+// WriteH2 delegates to a.a.writeH2(sw) which was factored out in Task 10.
 type h2DirectResponseAdapter struct {
 	a *directResponseAction
 }
 
 func (a *h2DirectResponseAdapter) WriteH2(sw h2.StreamWriter) error {
-	// TODO Task 10: replace with a.a.writeH2(sw) once actions.go factors writeH2 out.
-	body := []byte(a.a.body)
-	headers := []hpack.HeaderField{
-		{Name: ":status", Value: strconv.Itoa(a.a.status)},
-		{Name: "date", Value: time.Now().UTC().Format(http.TimeFormat)},
-		{Name: "server", Value: "envoy"},
-		{Name: "content-type", Value: "text/plain"},
-		{Name: "content-length", Value: strconv.Itoa(len(body))},
-	}
-	if err := sw.WriteHeaders(headers, false); err != nil {
-		return err
-	}
-	return sw.WriteData(body, true)
+	return a.a.writeH2(sw)
 }
 
 // h2RouterActionRejection is a sentinel h2.Action returned when the matched

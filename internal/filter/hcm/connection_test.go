@@ -66,7 +66,7 @@ func readResponseStatus(t *testing.T, r io.Reader) int {
 
 func TestRunConnection_DirectResponseHappy(t *testing.T) {
 	tt := &routeTable{routes: []routeEntry{
-		{match: matchPath("/health"), action: &directResponseAction{status: 200, body: "OK\n"}},
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
 	}}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
@@ -81,7 +81,7 @@ func TestRunConnection_DirectResponseHappy(t *testing.T) {
 
 func TestRunConnection_KeepAliveTwoRequests(t *testing.T) {
 	tt := &routeTable{routes: []routeEntry{
-		{match: matchPath("/health"), action: &directResponseAction{status: 200, body: "OK\n"}},
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
 	}}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
@@ -99,7 +99,7 @@ func TestRunConnection_KeepAliveTwoRequests(t *testing.T) {
 
 func TestRunConnection_RouteNotFoundReturns404(t *testing.T) {
 	tt := &routeTable{routes: []routeEntry{
-		{match: matchPath("/health"), action: &directResponseAction{status: 200, body: "OK\n"}},
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
 	}}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
@@ -253,7 +253,7 @@ func TestRunConnection_UpstreamConnectionCloseClosesDownstream(t *testing.T) {
 
 func TestRunConnection_BodyDrainedBetweenRequests(t *testing.T) {
 	tt := &routeTable{routes: []routeEntry{
-		{match: matchPath("/post"), action: &directResponseAction{status: 200, body: "ok\n"}},
+		{match: matchPath("/post"), action: &directResponseAction{status: 200, bodyText: "ok\n"}},
 	}}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
