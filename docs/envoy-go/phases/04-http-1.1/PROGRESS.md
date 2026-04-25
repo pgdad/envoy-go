@@ -196,3 +196,33 @@ $ go vet ./internal/filter/hcm/...
 $ golangci-lint run ./internal/filter/hcm/...
 <no output>
 ```
+## Task 6 — internal/filter/hcm — connection.go
+
+**Commits:** 7359397
+**Notes:** Per-conn HTTP/1.1 loop landed; out-of-scope guards (Expect→417, Upgrade→501) + 404 + 400 + bodydrain + keep-alive verified by table-driven loopback tests.
+**Outputs:**
+```
+$ cd internal/filter/hcm && go test -run 'TestRunConnection' -v .
+=== RUN   TestRunConnection_DirectResponseHappy
+--- PASS: TestRunConnection_DirectResponseHappy (0.00s)
+=== RUN   TestRunConnection_KeepAliveTwoRequests
+--- PASS: TestRunConnection_KeepAliveTwoRequests (0.00s)
+=== RUN   TestRunConnection_RouteNotFoundReturns404
+--- PASS: TestRunConnection_RouteNotFoundReturns404 (0.00s)
+=== RUN   TestRunConnection_ExpectHeaderReturns417
+--- PASS: TestRunConnection_ExpectHeaderReturns417 (0.00s)
+=== RUN   TestRunConnection_UpgradeReturns501
+--- PASS: TestRunConnection_UpgradeReturns501 (0.00s)
+=== RUN   TestRunConnection_BadRequestReturns400
+--- PASS: TestRunConnection_BadRequestReturns400 (0.00s)
+=== RUN   TestRunConnection_BodyDrainedBetweenRequests
+--- PASS: TestRunConnection_BodyDrainedBetweenRequests (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+$ cd internal/filter/hcm && go test -race -run 'TestRunConnection' .
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.013s
+$ go vet ./internal/filter/hcm/...
+<no output>
+$ golangci-lint run ./internal/filter/hcm/...
+<no output>
+```
