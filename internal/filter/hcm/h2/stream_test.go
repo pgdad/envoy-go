@@ -67,25 +67,41 @@ func minHeaders() []hpack.HeaderField {
 	}
 }
 
-// fakeDirect is a DirectResponseDispatcher that writes a fixed 200 response.
-type fakeDirect struct {
+// fakeAction is an Action that writes a fixed 200 response.
+type fakeAction struct {
 	statusCode string // e.g. "200"
 	body       string
 }
 
-func (fd *fakeDirect) WriteH2(sw StreamWriter) error {
+func (fa *fakeAction) WriteH2(sw StreamWriter) error {
 	respHeaders := []hpack.HeaderField{
-		{Name: ":status", Value: fd.statusCode},
+		{Name: ":status", Value: fa.statusCode},
 		{Name: "content-length", Value: "5"},
 	}
 	if err := sw.WriteHeaders(respHeaders, false); err != nil {
 		return err
 	}
-	return sw.WriteData([]byte(fd.body), true)
+	return sw.WriteData([]byte(fa.body), true)
 }
 
-// routerLike is a non-nil value that does NOT satisfy DirectResponseDispatcher.
-type routerLike struct{}
+// fakeDispatcher wraps a function as a Dispatcher.
+type fakeDispatcher struct {
+	fn func(req *http.Request) (Action, bool)
+}
+
+func (d *fakeDispatcher) Match(req *http.Request) (Action, bool) {
+	return d.fn(req)
+}
+
+// dispatchWith is a helper that creates a fakeDispatcher from an Action-returning function.
+func dispatchWith(fn func() Action) Dispatcher {
+	return &fakeDispatcher{fn: func(_ *http.Request) (Action, bool) { return fn(), true }}
+}
+
+// dispatchWithReq creates a fakeDispatcher that passes the request to the function.
+func dispatchWithReq(fn func(req *http.Request) Action) Dispatcher {
+	return &fakeDispatcher{fn: func(req *http.Request) (Action, bool) { return fn(req), true }}
+}
 
 // ---- Tests ----
 
@@ -106,9 +122,9 @@ func TestServerStream_StateTransitions_HeadersOnlyEndStream(t *testing.T) {
 	}
 
 	// dispatch with a direct response that writes 200 + body.
-	fd := &fakeDirect{statusCode: "200", body: "hello"}
+	fa := &fakeAction{statusCode: "200", body: "hello"}
 	ctx := context.Background()
-	s.dispatch(ctx, func(_ interface{}) hcmAction { return fd })
+	s.dispatch(ctx, dispatchWith(func() Action { return fa }))
 
 	// After dispatch, stream should be closed.
 	s.mu.Lock()
@@ -147,14 +163,14 @@ func TestServerStream_StateTransitions_HeadersThenData(t *testing.T) {
 	ctx := context.Background()
 	go func() {
 		var capturedBody string
-		s.dispatch(ctx, func(req interface{}) hcmAction {
+		s.dispatch(ctx, dispatchWithReq(func(req *http.Request) Action {
 			// req is *http.Request; read its Body to capture the request data.
-			if r, ok := req.(*http.Request); ok && r.Body != nil {
-				b, _ := io.ReadAll(r.Body)
+			if req.Body != nil {
+				b, _ := io.ReadAll(req.Body)
 				capturedBody = string(b)
 			}
-			return &fakeDirect{statusCode: "200", body: "ok"}
-		})
+			return &fakeAction{statusCode: "200", body: "ok"}
+		}))
 		dispatchDone <- capturedBody
 	}()
 
@@ -258,7 +274,7 @@ func TestServerStream_RecvWindowUpdate_ZeroDeltaIsProtocolError(t *testing.T) {
 }
 
 // TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData:
-// A DirectResponseDispatcher is invoked; observe writes via fakeConn.
+// An Action is invoked; observe writes via fakeConn.
 func TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData(t *testing.T) {
 	fc := &fakeConn{}
 	s := newServerStream(3, fc, 65535, 65535)
@@ -268,9 +284,9 @@ func TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData(t *testing.T)
 		t.Fatalf("recvHeaders: %v", err)
 	}
 
-	fd := &fakeDirect{statusCode: "200", body: "hello"}
+	fa := &fakeAction{statusCode: "200", body: "hello"}
 	ctx := context.Background()
-	s.dispatch(ctx, func(_ interface{}) hcmAction { return fd })
+	s.dispatch(ctx, dispatchWith(func() Action { return fa }))
 
 	if len(fc.headers) != 1 {
 		t.Fatalf("headers written = %d, want 1", len(fc.headers))
@@ -291,7 +307,8 @@ func TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData(t *testing.T)
 }
 
 // TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError:
-// A non-nil value that is NOT a DirectResponseDispatcher → RST_STREAM(INTERNAL_ERROR).
+// An Action whose WriteH2 returns *Error{Code: ErrInternalError} → RST_STREAM(INTERNAL_ERROR).
+// This models the h2RouterActionRejection adapter (SPEC §5.2 step 4c).
 func TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError(t *testing.T) {
 	fc := &fakeConn{}
 	s := newServerStream(5, fc, 65535, 65535)
@@ -300,8 +317,11 @@ func TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError(t *testi
 		t.Fatalf("recvHeaders: %v", err)
 	}
 
+	// Simulate the h2RouterActionRejection adapter: WriteH2 returns an INTERNAL_ERROR.
+	rejectionAction := &errorAction{err: NewStreamError(ErrInternalError, 5, "router action on h2 listener (SPEC §5.2 step 4c)")}
+
 	ctx := context.Background()
-	s.dispatch(ctx, func(_ interface{}) hcmAction { return routerLike{} })
+	s.dispatch(ctx, dispatchWith(func() Action { return rejectionAction }))
 
 	if len(fc.rsts) != 1 {
 		t.Fatalf("RST_STREAM calls = %d, want 1", len(fc.rsts))
@@ -314,9 +334,19 @@ func TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError(t *testi
 	}
 }
 
-// TestServerStream_Dispatch_NoMatch_Returns404DirectResponse:
-// lookup returns nil → synthesise 404; observe writes via fakeConn.
-func TestServerStream_Dispatch_NoMatch_Returns404DirectResponse(t *testing.T) {
+// errorAction is a test Action whose WriteH2 always returns a fixed error.
+type errorAction struct {
+	err error
+}
+
+func (a *errorAction) WriteH2(_ StreamWriter) error {
+	return a.err
+}
+
+// TestServerStream_Dispatch_404Adapter_WritesHeadersAndData:
+// A 404-synthesising Action writes HEADERS with :status 404 + DATA body.
+// This models the h2DirectResponseAdapter wrapping a 404 directResponseAction.
+func TestServerStream_Dispatch_404Adapter_WritesHeadersAndData(t *testing.T) {
 	fc := &fakeConn{}
 	s := newServerStream(7, fc, 65535, 65535)
 
@@ -324,8 +354,11 @@ func TestServerStream_Dispatch_NoMatch_Returns404DirectResponse(t *testing.T) {
 		t.Fatalf("recvHeaders: %v", err)
 	}
 
+	// Simulate the 404-synthesising adapter.
+	notFoundAction := &fakeAction{statusCode: "404", body: "not found\n"}
+
 	ctx := context.Background()
-	s.dispatch(ctx, func(_ interface{}) hcmAction { return nil })
+	s.dispatch(ctx, dispatchWith(func() Action { return notFoundAction }))
 
 	// Should see HEADERS (with :status 404) + DATA.
 	if len(fc.headers) != 1 {
@@ -343,8 +376,8 @@ func TestServerStream_Dispatch_NoMatch_Returns404DirectResponse(t *testing.T) {
 	if len(fc.data) != 1 {
 		t.Fatalf("data frames written = %d, want 1", len(fc.data))
 	}
-	if !strings.Contains(string(fc.data[0].b), "404") {
-		t.Errorf("404 body = %q, does not contain '404'", fc.data[0].b)
+	if !strings.Contains(string(fc.data[0].b), "not found") {
+		t.Errorf("404 body = %q, does not contain 'not found'", fc.data[0].b)
 	}
 }
 
@@ -379,4 +412,3 @@ func TestServerStream_RejectsStreamIDReuse(t *testing.T) {
 		t.Errorf("error code = %v, want PROTOCOL_ERROR", h2err.Code)
 	}
 }
-

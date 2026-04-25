@@ -29,47 +29,43 @@ func newFramer(conn net.Conn) *framer {
 	}
 }
 
-// readFrameCtx reads one frame, honouring ctx cancellation by setting a read
-// deadline on the underlying conn. http2.Framer.ReadFrame is otherwise blocking
-// and not ctx-aware; this method bridges the two. On ctx cancel mid-read,
-// returns ctx.Err() (context.Canceled or context.DeadlineExceeded).
+// readFrameCtx reads one frame, honouring ctx cancellation by setting a
+// short (50ms) read deadline on the underlying conn and re-checking ctx.Err()
+// after each timeout. http2.Framer.ReadFrame is otherwise blocking and not
+// ctx-aware; this method bridges the two via polling.
+//
+// Always uses 50ms slices so that context cancellation (including cancellation
+// of a context that also has a deadline) is observed within bounded latency.
+// If the context deadline has already passed, ctx.Err() is non-nil on the
+// first timeout check and the method returns immediately with ctx.Err().
 func (f *framer) readFrameCtx(ctx context.Context) (http2.Frame, error) {
-	if dl, ok := ctx.Deadline(); ok {
-		_ = f.conn.SetReadDeadline(dl)
-	} else {
-		// Short-poll: 50ms slices so ctx cancellation is observed within
-		// bounded latency. The slice is small enough to be a noisy non-issue
-		// in practice.
-		_ = f.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	}
 	for {
+		// Check ctx before arming a new read deadline.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		_ = f.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		frame, err := f.ReadFrame()
 		if err == nil {
 			_ = f.conn.SetReadDeadline(time.Time{})
 			return frame, nil
 		}
-		// Translate timeout-on-deadline into ctx.Err() when ctx is done.
+		// On any timeout (os.ErrDeadlineExceeded or net.Error.Timeout), re-check
+		// ctx and re-arm. Genuine network errors fall through to the return below.
 		var nerr net.Error
-		if errors.As(err, &nerr) && nerr.Timeout() {
+		isTimeout := errors.As(err, &nerr) && nerr.Timeout()
+		if !isTimeout {
+			isTimeout = errors.Is(err, os.ErrDeadlineExceeded)
+		}
+		if isTimeout {
 			if ctxErr := ctx.Err(); ctxErr != nil {
+				_ = f.conn.SetReadDeadline(time.Time{})
 				return nil, ctxErr
 			}
-			// No ctx deadline → re-arm and re-loop.
-			if _, hasDL := ctx.Deadline(); !hasDL {
-				_ = f.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-				continue
-			}
-			return nil, ctxErr(ctx, err)
+			// ctx still alive — re-loop and re-arm.
+			continue
 		}
-		// Non-timeout error: pass through. Also pass through os.ErrDeadlineExceeded
-		// where ctx has a deadline (the caller imposed it; ctx.Err returns
-		// DeadlineExceeded so the wrap is faithful).
 		_ = f.conn.SetReadDeadline(time.Time{})
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-		}
 		return nil, err
 	}
 }

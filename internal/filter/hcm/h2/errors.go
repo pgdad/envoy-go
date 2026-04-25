@@ -87,6 +87,13 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Underlying }
 
+// NewStreamError constructs a stream-scoped *Error. Used by the h2dispatch
+// adapter (in the hcm parent package) to signal per-stream rejections back
+// through the dispatch helper in stream.go.
+func NewStreamError(code ErrCode, stream uint32, msg string) *Error {
+	return &Error{Code: code, Stream: stream, Msg: msg}
+}
+
 func connError(code ErrCode, msg string) *Error {
 	return &Error{Code: code, Msg: msg}
 }

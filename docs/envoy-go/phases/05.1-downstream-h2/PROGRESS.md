@@ -385,3 +385,51 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 $ wc -l internal/filter/hcm/h2/stream.go
 326 internal/filter/hcm/h2/stream.go
 ```
+
+## Task 9 — h2 ServerConn orchestrator + h2dispatch adapter (one-way hcm→h2 import)
+
+**Commits:** (SHA filled by SHA-fill commit)
+**Notes:** Created `internal/filter/hcm/h2/conn.go` (411 LoC) implementing `ServerConn` with `NewServerConn(ctx, conn, dispatcher, settings)` constructor and `Run() error` lifecycle method. `Run()` performs: preface check → write server-initial SETTINGS → read client-initial SETTINGS → ACK → frame-dispatch loop (HEADERS/DATA/SETTINGS/PING/WINDOW_UPDATE/RST_STREAM/GOAWAY/PUSH_PROMISE-error/PRIORITY-discard/unknown-discard). Per-frame handlers: `onHeaders` validates stream ID + enforces `MaxConcurrentStreams` (RST_STREAM REFUSED_STREAM on overflow) + spawns dispatch goroutine; `onData` routes to stream.recvData and spawns dispatch on END_STREAM; `onSettings` applies peer settings + ACKs + propagates HEADER_TABLE_SIZE to HPACK encoder; `onPing` emits PING ACK; `onWindowUpdate` replenishes connection or stream send windows; `onRSTStream` closes stream; `onGoaway` emits GOAWAY NO_ERROR + exits gracefully. `emitGoaway` is once-only guarded. `ServerConn` implements `streamConn` interface (encodeAndWriteHeaders, writeData, writeRSTStream) — all frame writes serialised via `s.mu`. `writeData` uses `s.sendW.waitFor` for connection-level flow-control.
+
+Also fixed `framer.readFrameCtx`: the original code set the raw conn deadline to the ENTIRE ctx deadline, causing ctx-cancel to not be observed until the deadline. Changed to always use 50ms polling slices unconditionally (checking ctx.Err() after each timeout), so cancellation is observed within 50ms regardless of whether ctx has a deadline.
+
+Refactored `stream.go`: renamed `DirectResponseDispatcher` → `Action`, removed `hcmAction` opaque type, replaced three-branch dispatch (DirectResponseDispatcher/non-nil-non-DR/nil-404) with uniform Dispatcher.Match(req) → Action + action.WriteH2(s) contract. Added exported `Dispatcher` interface and `NewStreamError` to `errors.go`. Removed `notFound404` type (responsibility moved to hcm adapter).
+
+Reshaped stream_test.go: tests 5/6/7 rewritten to use `Action`/`Dispatcher` interfaces. Tests 1-4 + 8-9 unchanged.
+
+Created `internal/filter/hcm/h2dispatch.go` (88 LoC) in package hcm: `h2Dispatcher` delegates to `*routeTable.match`; `h2DirectResponseAdapter` inlines WriteH2 (TODO Task 10 comment); `h2RouterActionRejection` returns `NewStreamError(ErrInternalError, 0, ...)`.
+
+Created `internal/filter/hcm/h2/conn_test.go` (920 LoC, 11 tests). Import boundary: zero `internal/filter/hcm` import hits in `h2/` package files.
+
+LoC advisory note: conn.go at 411 LoC (advisory 350, hard-stop not hit); conn_test.go at 920 LoC (advisory 500). Both are over advisory but under hard-stop thresholds; complexity is appropriate for the 11-test integration coverage required.
+
+MaxConcurrentStreams test uses raw framer (not Transport) to avoid Transport's automatic REFUSED_STREAM retry which would loop until ctx timeout.
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/... -run TestServerStream (stream package after refactor)
+PASS (10 tests)
+$ go test ./internal/filter/hcm/h2/... -run TestServerConn (conn tests)
+PASS (11 tests)
+$ go test ./internal/filter/hcm/... (full hcm tree)
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.009s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.301s
+$ go test ./... (whole tree)
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.077s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.009s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.301s
+[all other packages PASS / no test files]
+$ go vet ./...
+(clean)
+$ go build ./...
+(clean)
+$ ! grep -nR '"github.com/esalaine/envoy-go/internal/filter/hcm"' internal/filter/hcm/h2/
+(zero hits — import boundary holds)
+$ wc -l internal/filter/hcm/h2/conn.go internal/filter/hcm/h2/conn_test.go internal/filter/hcm/h2dispatch.go
+  411 conn.go
+  920 conn_test.go
+   88 h2dispatch.go
+$ go test ./internal/filter/hcm/h2/... -v | grep -c "PASS"
+45
+$ go test ./internal/filter/hcm/ -v | grep -c "PASS"
+59
+```

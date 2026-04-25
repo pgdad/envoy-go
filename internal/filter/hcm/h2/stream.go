@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"sync"
 
 	"golang.org/x/net/http2/hpack"
@@ -23,26 +22,29 @@ const (
 	streamClosed           streamState = iota
 )
 
-// StreamWriter is the interface a DirectResponseDispatcher calls to emit
-// response frames back to the peer. The concrete implementation is
-// *serverStream itself (accessible to the action via the DirectResponseDispatcher
-// interface seam in stream.go).
+// StreamWriter is the interface an Action calls to emit response frames back
+// to the peer. The concrete implementation is *serverStream itself (accessible
+// to the action via the Action interface seam in stream.go).
 type StreamWriter interface {
 	WriteHeaders(headers []hpack.HeaderField, endStream bool) error
 	WriteData(b []byte, endStream bool) error
 }
 
-// DirectResponseDispatcher is the interface that a direct-response action
-// satisfies in order to be invoked on an H2 stream. Task 10 will implement
-// this in the hcm parent package; for now the tests provide a fake.
-type DirectResponseDispatcher interface {
+// Action is the interface that any route action satisfies in order to be
+// invoked on an H2 stream. The hcm parent package provides implementations
+// via h2dispatch.go; tests provide fakes.
+type Action interface {
 	WriteH2(sw StreamWriter) error
 }
 
-// hcmAction is the opaque type returned from the lookup function passed to
-// dispatch. Using interface{} keeps stream.go free of any import of the
-// parent hcm package.
-type hcmAction interface{}
+// Dispatcher is the interface ServerConn uses to resolve an incoming request
+// to an Action. The hcm parent package provides h2Dispatcher; tests provide
+// fakes. Match returns (action, true) on a successful lookup (even if the
+// action is a 404-synthesising adapter — that is still ok=true). ok=false
+// signals a genuine match-engine failure → INTERNAL_ERROR RST_STREAM.
+type Dispatcher interface {
+	Match(req *http.Request) (Action, bool)
+}
 
 // streamConn is the minimum surface serverStream needs from ServerConn.
 type streamConn interface {
@@ -182,7 +184,7 @@ func (s *serverStream) recvWindowUpdate(delta int32) error {
 }
 
 // WriteHeaders writes an HEADERS frame to the peer via the parent conn.
-// Called from the dispatch goroutine (via a DirectResponseDispatcher).
+// Called from the dispatch goroutine (via an Action).
 func (s *serverStream) WriteHeaders(headers []hpack.HeaderField, endStream bool) error {
 	if err := s.conn.encodeAndWriteHeaders(s.id, headers, endStream); err != nil {
 		return err
@@ -210,12 +212,11 @@ func (s *serverStream) WriteData(b []byte, endStream bool) error {
 // received (either on HEADERS or DATA), per SPEC §10 #1
 // (wait-for-END_STREAM before dispatching).
 //
-// lookup receives the built *http.Request and returns an hcmAction. dispatch
-// distinguishes three cases:
-//  1. DirectResponseDispatcher: invoke WriteH2(s).
-//  2. Non-nil, non-DirectResponseDispatcher: emit RST_STREAM(INTERNAL_ERROR).
-//  3. nil: synthesise a 404 DirectResponseDispatcher and invoke it.
-func (s *serverStream) dispatch(ctx context.Context, lookup func(interface{}) hcmAction) {
+// The dispatch contract is uniform: always call action.WriteH2(s), then handle
+// any stream-scoped error. The Dispatcher adapter (h2dispatch.go in hcm
+// package) is responsible for synthesising 404 adapters on no-match and
+// INTERNAL_ERROR sentinels on router-action-on-H2 (SPEC §5.2 step 4c).
+func (s *serverStream) dispatch(ctx context.Context, dispatcher Dispatcher) {
 	req, err := buildRequest(s.reqHeaders, s.reqBodyR)
 	if err != nil {
 		_ = s.conn.writeRSTStream(s.id, ErrProtocolError)
@@ -223,43 +224,23 @@ func (s *serverStream) dispatch(ctx context.Context, lookup func(interface{}) hc
 		return
 	}
 
-	action := lookup(req)
-
-	switch a := action.(type) {
-	case DirectResponseDispatcher:
-		if writeErr := a.WriteH2(s); writeErr != nil {
-			_ = s.conn.writeRSTStream(s.id, ErrInternalError)
-		}
-		s.transition(streamClosed)
-	case nil:
-		notFoundAction := notFound404{}
-		if writeErr := notFoundAction.WriteH2(s); writeErr != nil {
-			_ = s.conn.writeRSTStream(s.id, ErrInternalError)
-		}
-		s.transition(streamClosed)
-	default:
-		// Non-nil but not a DirectResponseDispatcher (e.g. routerAction):
-		// per SPEC §5.2 step 4c emit RST_STREAM(INTERNAL_ERROR).
+	action, ok := dispatcher.Match(req)
+	if !ok {
+		// ok=false is a genuine match-engine failure → INTERNAL_ERROR.
 		_ = s.conn.writeRSTStream(s.id, ErrInternalError)
 		s.transition(streamClosed)
+		return
 	}
-}
 
-// notFound404 is an unexported DirectResponseDispatcher that returns a
-// synthetic 404 Not Found response.
-type notFound404 struct{}
-
-func (notFound404) WriteH2(sw StreamWriter) error {
-	body := []byte("404 Not Found")
-	headers := []hpack.HeaderField{
-		{Name: ":status", Value: "404"},
-		{Name: "content-type", Value: "text/plain"},
-		{Name: "content-length", Value: strconv.Itoa(len(body))},
+	if writeErr := action.WriteH2(s); writeErr != nil {
+		// Stream-scoped errors → RST_STREAM with the carried code.
+		code := ErrInternalError
+		if hErr, isH2 := writeErr.(*Error); isH2 {
+			code = hErr.Code
+		}
+		_ = s.conn.writeRSTStream(s.id, code)
 	}
-	if err := sw.WriteHeaders(headers, false); err != nil {
-		return err
-	}
-	return sw.WriteData(body, true)
+	s.transition(streamClosed)
 }
 
 // buildRequest constructs an *http.Request from decoded pseudo-headers,
