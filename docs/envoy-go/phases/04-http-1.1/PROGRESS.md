@@ -511,3 +511,44 @@ $ go vet ./test/differential/...
 $ golangci-lint run ./test/differential/...
 <no output>
 ```
+
+## Task 15 — fixture 0003-http11-routing — bootstraps + driver + tests + README + expectations
+
+**Commits:** 1a87738
+**Notes:** End-to-end differential gate green. 27 requests/side, [3,3,3] RR distribution on subject, byte-equivalent decoded /health body stream (9 × "OK\n"), HTTPExpectations status-200 per /api request (body not compared per-request — RR offset diverges between STRICT_DNS and STATIC; distribution asserted via accept counts), HTTPExpectations status-404 per /missing request, admin /ready differential. Deviation from PLAN: /api bodies not concatenated in Drive byte stream (RR starting offset differs between ref STRICT_DNS and subj STATIC); routing correctness proven by AssertDistribution [3,3,3] + HTTPExpectations status-200.
+**Outputs:**
+```
+$ go test ./test/fixtures/0003-http11-routing/...
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.002s
+$ go test ./test/differential/... -run 'TestDifferential/0003-http11-routing' -v -timeout=10m
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0003-http11-routing
+2026/04/25 09:27:22 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 28.1.1
+  API Version: 1.43
+  Operating System: Docker Desktop
+  Total Memory: 64296 MB
+  Resolved Docker Host: unix:///home/esa/.docker/desktop/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: e79af3f8585643edc4ac093368cee18b2f9467d430999c1067ec333238d1d4d8
+  Test ProcessID: c4ac58a8-9897-4eed-bf19-51f3fe2fbe4b
+2026/04/25 09:27:22 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/25 09:27:22 ✅ Container created: 26673063c84e
+2026/04/25 09:27:22 🐳 Starting container: 26673063c84e
+2026/04/25 09:27:22 ✅ Container started: 26673063c84e
+2026/04/25 09:27:22 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/25 09:27:22 ✅ Container created: 55660ad224ec
+2026/04/25 09:27:22 🐳 Starting container: 55660ad224ec
+2026/04/25 09:27:22 ✅ Container started: 55660ad224ec
+2026/04/25 09:27:23 🐳 Terminating container: 55660ad224ec
+2026/04/25 09:27:23 🚫 Container terminated: 55660ad224ec
+--- PASS: TestDifferential (1.51s)
+    --- PASS: TestDifferential/0003-http11-routing (1.51s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.592s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+$ go vet ./test/fixtures/0003-http11-routing/... ./test/differential/...
+<no output>
+$ golangci-lint run ./test/fixtures/0003-http11-routing/... ./test/differential/...
+<no output>
+```
