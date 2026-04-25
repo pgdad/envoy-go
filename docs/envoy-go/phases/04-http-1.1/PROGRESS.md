@@ -226,3 +226,82 @@ $ go vet ./internal/filter/hcm/...
 $ golangci-lint run ./internal/filter/hcm/...
 <no output>
 ```
+
+## Task 7 — internal/filter/hcm — config.go + ADR-0040 + ADR-0041 + ADR-0042
+
+**Commits:** ab6dc50
+**Notes:** Typed_config parser landed; three ADRs in one commit (per phase-02 Task 7 precedent). Filter struct declared in config.go (deviation from PLAN's literal "filter.go declares Filter") to preserve the phased-commit compile-clean discipline; Task 8 will add NewFilter + Handle methods on top of this struct.
+**Outputs:**
+```
+$ cd internal/filter/hcm && go test -run 'TestParseFilter' -v .
+=== RUN   TestParseFilter_Happy
+--- PASS: TestParseFilter_Happy (0.00s)
+=== RUN   TestParseFilter_WrongTypeURL
+--- PASS: TestParseFilter_WrongTypeURL (0.00s)
+=== RUN   TestParseFilter_CodecTypeHTTP2
+--- PASS: TestParseFilter_CodecTypeHTTP2 (0.00s)
+=== RUN   TestParseFilter_CodecTypeHTTP3
+--- PASS: TestParseFilter_CodecTypeHTTP3 (0.00s)
+=== RUN   TestParseFilter_CodecTypeAUTO
+--- PASS: TestParseFilter_CodecTypeAUTO (0.00s)
+=== RUN   TestParseFilter_MissingStatPrefix
+--- PASS: TestParseFilter_MissingStatPrefix (0.00s)
+=== RUN   TestParseFilter_RDSRouteSpecifier
+--- PASS: TestParseFilter_RDSRouteSpecifier (0.00s)
+=== RUN   TestParseFilter_ScopedRoutes
+--- PASS: TestParseFilter_ScopedRoutes (0.00s)
+=== RUN   TestParseFilter_ZeroVirtualHosts
+--- PASS: TestParseFilter_ZeroVirtualHosts (0.00s)
+=== RUN   TestParseFilter_TwoVirtualHosts
+--- PASS: TestParseFilter_TwoVirtualHosts (0.00s)
+=== RUN   TestParseFilter_VHostDomainsEmpty
+--- PASS: TestParseFilter_VHostDomainsEmpty (0.00s)
+=== RUN   TestParseFilter_VHostDomainsNotStarOnly
+--- PASS: TestParseFilter_VHostDomainsNotStarOnly (0.00s)
+=== RUN   TestParseFilter_HTTPFiltersEmpty
+--- PASS: TestParseFilter_HTTPFiltersEmpty (0.00s)
+=== RUN   TestParseFilter_HTTPFiltersTwoEntries
+--- PASS: TestParseFilter_HTTPFiltersTwoEntries (0.00s)
+=== RUN   TestParseFilter_HTTPFiltersWrongName
+--- PASS: TestParseFilter_HTTPFiltersWrongName (0.00s)
+=== RUN   TestParseFilter_HTTPFiltersWrongTypeURL
+--- PASS: TestParseFilter_HTTPFiltersWrongTypeURL (0.00s)
+=== RUN   TestParseFilter_RouteUnknownAction
+--- PASS: TestParseFilter_RouteUnknownAction (0.00s)
+=== RUN   TestParseFilter_RouteSafeRegex
+--- PASS: TestParseFilter_RouteSafeRegex (0.00s)
+=== RUN   TestParseFilter_RoutePathSeparatedPrefix
+--- PASS: TestParseFilter_RoutePathSeparatedPrefix (0.00s)
+=== RUN   TestParseFilter_RouteCaseSensitiveFalse
+--- PASS: TestParseFilter_RouteCaseSensitiveFalse (0.00s)
+=== RUN   TestParseFilter_RouteHeadersSet
+--- PASS: TestParseFilter_RouteHeadersSet (0.00s)
+=== RUN   TestParseFilter_RouteQueryParamsSet
+--- PASS: TestParseFilter_RouteQueryParamsSet (0.00s)
+=== RUN   TestParseFilter_RouteRuntimeFraction
+--- PASS: TestParseFilter_RouteRuntimeFraction (0.00s)
+=== RUN   TestParseFilter_DirectResponseStatusZero
+--- PASS: TestParseFilter_DirectResponseStatusZero (0.00s)
+=== RUN   TestParseFilter_DirectResponseStatus600
+--- PASS: TestParseFilter_DirectResponseStatus600 (0.00s)
+=== RUN   TestParseFilter_DirectResponseInlineBytes
+--- PASS: TestParseFilter_DirectResponseInlineBytes (0.00s)
+=== RUN   TestParseFilter_DirectResponseFilename
+--- PASS: TestParseFilter_DirectResponseFilename (0.00s)
+=== RUN   TestParseFilter_DirectResponseEmptyBody
+--- PASS: TestParseFilter_DirectResponseEmptyBody (0.00s)
+=== RUN   TestParseFilter_RouterActionWeightedClusters
+--- PASS: TestParseFilter_RouterActionWeightedClusters (0.00s)
+=== RUN   TestParseFilter_RouterActionClusterHeader
+--- PASS: TestParseFilter_RouterActionClusterHeader (0.00s)
+=== RUN   TestParseFilter_RouterActionUnknownCluster
+--- PASS: TestParseFilter_RouterActionUnknownCluster (0.00s)
+=== RUN   TestParseFilter_RouterActionHappy
+--- PASS: TestParseFilter_RouterActionHappy (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.005s
+$ go vet ./internal/filter/hcm/...
+<no output>
+$ golangci-lint run ./internal/filter/hcm/...
+<no output>
+```
