@@ -133,8 +133,14 @@ func (s *serverStream) recvData(b []byte, endStream bool) error {
 
 	switch cur {
 	case streamOpen:
-		if _, err := s.reqBodyW.Write(b); err != nil {
-			return streamError(ErrStreamClosed, s.id, "body write error: "+err.Error())
+		// Only Write when there is actual payload. io.Pipe.Write with a
+		// zero-length slice still blocks waiting for the reader — skip it to
+		// avoid a deadlock when recvData is called with b==nil (e.g. from
+		// onHeaders for a trailing HEADERS+END_STREAM with no DATA frames).
+		if len(b) > 0 {
+			if _, err := s.reqBodyW.Write(b); err != nil {
+				return streamError(ErrStreamClosed, s.id, "body write error: "+err.Error())
+			}
 		}
 		if endStream {
 			_ = s.reqBodyW.Close()
@@ -142,8 +148,10 @@ func (s *serverStream) recvData(b []byte, endStream bool) error {
 		}
 		return nil
 	case streamHalfClosedLocal:
-		if _, err := s.reqBodyW.Write(b); err != nil {
-			return streamError(ErrStreamClosed, s.id, "body write error: "+err.Error())
+		if len(b) > 0 {
+			if _, err := s.reqBodyW.Write(b); err != nil {
+				return streamError(ErrStreamClosed, s.id, "body write error: "+err.Error())
+			}
 		}
 		if endStream {
 			_ = s.reqBodyW.Close()

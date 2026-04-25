@@ -66,6 +66,27 @@ func (f *framer) readFrameCtx(ctx context.Context) (http2.Frame, error) {
 			continue
 		}
 		_ = f.conn.SetReadDeadline(time.Time{})
+		// Translate http2.ConnectionError and http2.StreamError (emitted by the
+		// underlying framer on frame-level protocol violations) into our
+		// h2:-prefixed *Error type so callers and fuzz assertions can rely on
+		// the h2: prefix discipline.
+		var connErr http2.ConnectionError
+		if errors.As(err, &connErr) {
+			return nil, &Error{
+				Code:       ErrCode(connErr),
+				Msg:        "framer detected connection error",
+				Underlying: err,
+			}
+		}
+		var streamErr http2.StreamError
+		if errors.As(err, &streamErr) {
+			return nil, &Error{
+				Code:       ErrCode(streamErr.Code),
+				Stream:     streamErr.StreamID,
+				Msg:        "framer detected stream error",
+				Underlying: err,
+			}
+		}
 		return nil, err
 	}
 }

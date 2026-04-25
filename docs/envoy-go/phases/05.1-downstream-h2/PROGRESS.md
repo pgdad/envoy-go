@@ -553,3 +553,78 @@ $ go vet ./...
 $ go build ./...
 (clean)
 ```
+
+## Task 14 — h2 fuzz targets — FuzzFrameStream + FuzzHPACKDecode
+
+**Commits:** TBD (SHA-fill follows)
+**Notes:** Created `internal/filter/hcm/h2/fuzz_test.go` with two fuzz targets and all required helpers (replayConn, stubDispatcher/stubAction). Seeding: 3 seeds for FuzzFrameStream (preface-only, preface+SETTINGS, preface+SETTINGS+SETTINGS-ACK); 2 seeds for FuzzHPACKDecode (empty block, well-formed ":method: GET"). The 30s CI budget runs without crash.
+
+**Two production-code bugs discovered and fixed by the fuzzer (committed in same change):**
+
+1. `framer.go` — `readFrameCtx` was returning raw `http2.ConnectionError` / `http2.StreamError` values from x/net/http2's framer, which do NOT carry the `h2:` prefix. Fixed by wrapping both in `*Error{Code: ...}` before returning, maintaining the package-wide `h2:` error-prefix discipline.
+
+2. `stream.go` — `recvData(nil, true)` called from `onHeaders` (for trailing HEADERS+END_STREAM on existing streams) caused a **deadlock**: `io.Pipe.Write` with a zero-length slice blocks waiting for the reader, which had not yet started (dispatch goroutine is launched only after END_STREAM). Fixed by skipping the Write when `len(b) == 0`; the pipe is only closed (endStream branch) without an initial zero-byte write.
+
+**FuzzFrameStream 30s run:**
+```
+$ go test ./internal/filter/hcm/h2/ -run FuzzFrameStream -fuzz=FuzzFrameStream -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/180 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 180/180 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 523815 (174596/sec), new interesting: 6 (total: 186)
+fuzz: elapsed: 6s, execs: 1074019 (183394/sec), new interesting: 14 (total: 194)
+fuzz: elapsed: 9s, execs: 1613371 (179788/sec), new interesting: 19 (total: 199)
+fuzz: elapsed: 12s, execs: 2122349 (169656/sec), new interesting: 21 (total: 201)
+fuzz: elapsed: 15s, execs: 2629875 (169166/sec), new interesting: 27 (total: 207)
+fuzz: elapsed: 18s, execs: 3110708 (160249/sec), new interesting: 28 (total: 208)
+fuzz: elapsed: 21s, execs: 3607142 (165480/sec), new interesting: 29 (total: 209)
+fuzz: elapsed: 24s, execs: 4129124 (174028/sec), new interesting: 33 (total: 213)
+fuzz: elapsed: 27s, execs: 4679036 (183320/sec), new interesting: 33 (total: 213)
+fuzz: elapsed: 30s, execs: 5209576 (176852/sec), new interesting: 38 (total: 218)
+fuzz: elapsed: 31s, execs: 5209576 (0/sec), new interesting: 38 (total: 218)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.058s
+```
+
+**FuzzHPACKDecode 30s run:**
+```
+$ go test ./internal/filter/hcm/h2/ -run FuzzHPACKDecode -fuzz=FuzzHPACKDecode -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/97 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 97/97 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 388303 (129422/sec), new interesting: 8 (total: 105)
+fuzz: elapsed: 6s, execs: 592290 (67984/sec), new interesting: 9 (total: 106)
+fuzz: elapsed: 9s, execs: 952344 (120007/sec), new interesting: 12 (total: 109)
+fuzz: elapsed: 12s, execs: 952344 (0/sec), new interesting: 12 (total: 109)
+fuzz: elapsed: 15s, execs: 1176369 (74723/sec), new interesting: 12 (total: 109)
+fuzz: elapsed: 18s, execs: 1484934 (102823/sec), new interesting: 13 (total: 110)
+fuzz: elapsed: 21s, execs: 1909961 (141700/sec), new interesting: 14 (total: 111)
+fuzz: elapsed: 24s, execs: 1909961 (0/sec), new interesting: 14 (total: 111)
+fuzz: elapsed: 27s, execs: 1909961 (0/sec), new interesting: 14 (total: 111)
+fuzz: elapsed: 30s, execs: 1909961 (0/sec), new interesting: 14 (total: 111)
+fuzz: elapsed: 31s, execs: 1909961 (0/sec), new interesting: 14 (total: 111)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.088s
+```
+
+**git status --porcelain after fuzzing:** empty (no testdata/fuzz pollution)
+**Outputs:**
+```
+$ git status --porcelain
+ M internal/filter/hcm/h2/framer.go
+ M internal/filter/hcm/h2/stream.go
+?? internal/filter/hcm/h2/fuzz_test.go
+$ go test ./... -timeout 180s
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.608s
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+ok  	github.com/esalaine/envoy-go/internal/cluster	(cached)
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.009s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.301s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	(cached)
+ok  	github.com/esalaine/envoy-go/internal/listener	0.008s
+ok  	github.com/esalaine/envoy-go/internal/tls	(cached)
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+```
