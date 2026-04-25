@@ -380,3 +380,25 @@ $ go vet ./internal/listener/... ./internal/filter/hcm/...
 $ golangci-lint run ./internal/listener/... ./internal/filter/hcm/...
 <no output>
 ```
+
+## Task 9 — internal/bootstrap — HCM/router/route-config blank imports
+
+**Commits:** 6857383
+**Notes:** Three blank imports added per ADR-0016 (registry-population mechanism, not new ADR). HCM-bootstrap protojson round-trip test added.
+**Outputs:**
+```
+$ go test -run TestLoad_HCMRoundTrip -v ./internal/bootstrap/...
+=== RUN   TestLoad_HCMRoundTrip
+--- PASS: TestLoad_HCMRoundTrip (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.006s
+
+$ go test ./internal/bootstrap/...
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.007s
+
+$ go vet ./internal/bootstrap/...
+<no output>
+
+$ golangci-lint run ./internal/bootstrap/...
+<no output>
+```
