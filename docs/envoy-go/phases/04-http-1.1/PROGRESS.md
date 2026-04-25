@@ -138,3 +138,61 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.002s
 $ go vet ./internal/filter/hcm/...
 $ golangci-lint run ./internal/filter/hcm/...
 ```
+## Task 5 — internal/filter/hcm — actions.go + ADR-0039
+
+**Commits:** 95ea7e8
+**Notes:** directResponseAction + routerAction landed; ADR-0039 records the per-request fresh-dial choice.
+**Outputs:**
+```
+$ cd internal/filter/hcm && go test -v .
+=== RUN   TestDirectResponseAction_Do
+--- PASS: TestDirectResponseAction_Do (0.00s)
+=== RUN   TestRouterAction_DoHappy
+--- PASS: TestRouterAction_DoHappy (0.00s)
+=== RUN   TestRouterAction_DoDialFailureReturns503
+--- PASS: TestRouterAction_DoDialFailureReturns503 (0.00s)
+=== RUN   TestRouterAction_DoCtxCancel
+--- PASS: TestRouterAction_DoCtxCancel (0.00s)
+=== RUN   TestServerHeader
+--- PASS: TestServerHeader (0.00s)
+=== RUN   TestDateHeader
+--- PASS: TestDateHeader (0.00s)
+=== RUN   TestWriteStatusReply
+=== RUN   TestWriteStatusReply/200_OK_with_body
+=== RUN   TestWriteStatusReply/400_Bad_Request_empty_body
+=== RUN   TestWriteStatusReply/404_Not_Found
+=== RUN   TestWriteStatusReply/417_Expectation_Failed_empty
+=== RUN   TestWriteStatusReply/500_Internal_Server_Error_empty
+=== RUN   TestWriteStatusReply/502_Bad_Gateway_empty
+=== RUN   TestWriteStatusReply/503_Service_Unavailable_empty
+=== RUN   TestWriteStatusReply/501_Not_Implemented_empty
+--- PASS: TestWriteStatusReply (0.00s)
+    --- PASS: TestWriteStatusReply/200_OK_with_body (0.00s)
+    --- PASS: TestWriteStatusReply/400_Bad_Request_empty_body (0.00s)
+    --- PASS: TestWriteStatusReply/404_Not_Found (0.00s)
+    --- PASS: TestWriteStatusReply/417_Expectation_Failed_empty (0.00s)
+    --- PASS: TestWriteStatusReply/500_Internal_Server_Error_empty (0.00s)
+    --- PASS: TestWriteStatusReply/502_Bad_Gateway_empty (0.00s)
+    --- PASS: TestWriteStatusReply/503_Service_Unavailable_empty (0.00s)
+    --- PASS: TestWriteStatusReply/501_Not_Implemented_empty (0.00s)
+=== RUN   TestWriteStatusReply_UnknownStatusFallsBackToEmptyReason
+--- PASS: TestWriteStatusReply_UnknownStatusFallsBackToEmptyReason (0.00s)
+=== RUN   TestMatchPath
+--- PASS: TestMatchPath (0.00s)
+=== RUN   TestMatchPrefix
+--- PASS: TestMatchPrefix (0.00s)
+=== RUN   TestRouteTableMatch_FirstMatchWins
+--- PASS: TestRouteTableMatch_FirstMatchWins (0.00s)
+=== RUN   TestRouteTableMatch_QueryStringExcluded
+--- PASS: TestRouteTableMatch_QueryStringExcluded (0.00s)
+=== RUN   TestRouteTableMatch_NoMatch
+--- PASS: TestRouteTableMatch_NoMatch (0.00s)
+=== RUN   TestRouteTableMatch_EmptyTable
+--- PASS: TestRouteTableMatch_EmptyTable (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	(cached)
+$ go vet ./internal/filter/hcm/...
+<no output>
+$ golangci-lint run ./internal/filter/hcm/...
+<no output>
+```
