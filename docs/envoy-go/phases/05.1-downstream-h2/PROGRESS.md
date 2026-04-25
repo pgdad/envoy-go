@@ -388,7 +388,7 @@ $ wc -l internal/filter/hcm/h2/stream.go
 
 ## Task 9 — h2 ServerConn orchestrator + h2dispatch adapter (one-way hcm→h2 import)
 
-**Commits:** (SHA filled by SHA-fill commit)
+**Commits:** e760d92
 **Notes:** Created `internal/filter/hcm/h2/conn.go` (411 LoC) implementing `ServerConn` with `NewServerConn(ctx, conn, dispatcher, settings)` constructor and `Run() error` lifecycle method. `Run()` performs: preface check → write server-initial SETTINGS → read client-initial SETTINGS → ACK → frame-dispatch loop (HEADERS/DATA/SETTINGS/PING/WINDOW_UPDATE/RST_STREAM/GOAWAY/PUSH_PROMISE-error/PRIORITY-discard/unknown-discard). Per-frame handlers: `onHeaders` validates stream ID + enforces `MaxConcurrentStreams` (RST_STREAM REFUSED_STREAM on overflow) + spawns dispatch goroutine; `onData` routes to stream.recvData and spawns dispatch on END_STREAM; `onSettings` applies peer settings + ACKs + propagates HEADER_TABLE_SIZE to HPACK encoder; `onPing` emits PING ACK; `onWindowUpdate` replenishes connection or stream send windows; `onRSTStream` closes stream; `onGoaway` emits GOAWAY NO_ERROR + exits gracefully. `emitGoaway` is once-only guarded. `ServerConn` implements `streamConn` interface (encodeAndWriteHeaders, writeData, writeRSTStream) — all frame writes serialised via `s.mu`. `writeData` uses `s.sendW.waitFor` for connection-level flow-control.
 
 Also fixed `framer.readFrameCtx`: the original code set the raw conn deadline to the ENTIRE ctx deadline, causing ctx-cancel to not be observed until the deadline. Changed to always use 50ms polling slices unconditionally (checking ctx.Err() after each timeout), so cancellation is observed within 50ms regardless of whether ctx has a deadline.
