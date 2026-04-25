@@ -497,3 +497,17 @@ $ golangci-lint run ./test/differential/...
 $ go build ./test/differential/...
 <no output>
 ```
+
+## Task 14 — test/differential — HTTP-echo backend kind
+
+**Commits:** 0acb263
+**Notes:** BackendKindAware optional interface added; default TCPEcho preserves fixtures 0000/0001/0002. HTTPEcho branch handcrafts bufio per SPEC §10 #6 settled choice. backend-<idx>:<lastSegmentOfPath> body format settles SPEC §10 #14.
+**Outputs:**
+```
+$ go build ./test/differential/...
+<no output>
+$ go vet ./test/differential/...
+<no output>
+$ golangci-lint run ./test/differential/...
+<no output>
+```
