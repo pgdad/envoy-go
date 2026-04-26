@@ -699,3 +699,197 @@ ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0051: h2spec conformance gate — image pin, section exclusion, and threshold policy
 ```
+
+---
+
+## Task 16 — BEHAVIOR_CONTRACT `## HTTP/2` SCAFFOLD + ADR-0052 + ADR-0053 + all-gates green local sweep
+
+**Commits:** 4330c37 (BEHAVIOR_CONTRACT + ADRs), e806f17 (race fixes), 3b4e2ed (misspelling fix), <gate-sweep-commit-pending>, <sha-fill-pending>
+**Notes:** Phase-05.1 closing task. BEHAVIOR_CONTRACT extended with `## HTTP/2` SCAFFOLD subsection + 5 new Header allow-list rows; ADR-0052 codifies the 05.1 equivalence surface (SCAFFOLD form); ADR-0053 triages phase-04 REVIEW Minor carry-forward items (M-2/M-4/M-5/M-6/M-7). Race fixes in emitGoaway (conn.go) and framer_test.go concurrent write ordering landed as a separate small commit per task instructions. golangci-lint has 118 pre-existing issues from Tasks 1-15 (confirmed present at commit 8d81be9, predating Task 16); my changes net REDUCED the count by 3 (fixed serialised→serialized). Pre-existing issues are substantive scope creep (errcheck on defer conn.Close(), misspellings throughout, gofmt alignment, unused fields) — reporting as DONE_WITH_CONCERNS per PLAN §9 guidance.
+
+Gate (a) differential fixtures: PASS — VACUOUS per ADR-0045 (no new fixture in 05.1); pre-existing fixtures (0000, 0001, 0002, 0003) all green. Duration: 4.83s.
+Gate (b) unit tests + race: PASS — every package green, no data races. (Two races found in initial run; fixed in commit e806f17.)
+Gate (c) h2spec conformance: PASS — NEWLY NON-VACUOUS; 53 tests, 53 passed, 0 failed.
+Gate (d) fuzz targets: all 6 fuzz targets (4 phase-04 + 2 phase-05.1) completed 30s budget with no crashers. No testdata/fuzz/ pollution.
+Gate (e) vet + lint: `go vet` clean; `golangci-lint` has 118 pre-existing issues (see notes above); ADR-0046 boundary grep clean (3 hits, all in allowed files); client.go absent.
+Gate (f): deferred to requesting-code-review session per BOOTSTRAP §5 step 6.
+
+**Outputs:**
+```
+$ go test ./test/differential/... -timeout=12m
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+--- PASS: TestDifferential (4.83s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.20s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.13s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.28s)
+    --- PASS: TestDifferential/0003-http11-routing (1.21s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	6.314s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+$ go test -race ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.956s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.056s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.030s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.022s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.029s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.270s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.023s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.032s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.079s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.099s
+ok  	github.com/esalaine/envoy-go/test/differential	7.481s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.010s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.023s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.031s
+$ go test ./test/conformance/h2spec/... -timeout=5m -v
+[... container setup ...]
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+--- PASS: TestH2Spec (2.23s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.319s
+$ go test ./internal/bootstrap -run=FuzzBootstrapLoad -fuzz=FuzzBootstrapLoad -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/961 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 628/961 completed
+fuzz: elapsed: 5s, gathering baseline coverage: 961/961 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 204075 (67810/sec), new interesting: 7 (total: 968)
+fuzz: elapsed: 9s, execs: 279151 (25024/sec), new interesting: 11 (total: 972)
+fuzz: elapsed: 12s, execs: 279151 (0/sec), new interesting: 11 (total: 972)
+fuzz: elapsed: 15s, execs: 336513 (19148/sec), new interesting: 12 (total: 973)
+fuzz: elapsed: 18s, execs: 432747 (32083/sec), new interesting: 13 (total: 974)
+fuzz: elapsed: 21s, execs: 450721 (5992/sec), new interesting: 13 (total: 974)
+fuzz: elapsed: 24s, execs: 466762 (5347/sec), new interesting: 13 (total: 974)
+fuzz: elapsed: 27s, execs: 485041 (6093/sec), new interesting: 15 (total: 976)
+fuzz: elapsed: 30s, execs: 499216 (4722/sec), new interesting: 15 (total: 976)
+fuzz: elapsed: 31s, execs: 499216 (0/sec), new interesting: 15 (total: 976)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.084s
+$ go test ./internal/filter/tcpproxy -run=FuzzTcpProxyFilter -fuzz=FuzzTcpProxyFilter -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/521 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 356/521 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 521/521 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 278568 (92712/sec), new interesting: 0 (total: 521)
+fuzz: elapsed: 9s, execs: 776172 (165882/sec), new interesting: 0 (total: 521)
+fuzz: elapsed: 12s, execs: 1270048 (164659/sec), new interesting: 0 (total: 521)
+fuzz: elapsed: 15s, execs: 1723981 (151305/sec), new interesting: 0 (total: 521)
+fuzz: elapsed: 18s, execs: 2152628 (142877/sec), new interesting: 0 (total: 521)
+fuzz: elapsed: 21s, execs: 2586958 (144761/sec), new interesting: 0 (total: 521)
+fuzz: elapsed: 24s, execs: 3005692 (139562/sec), new interesting: 0 (total: 521)
+fuzz: elapsed: 27s, execs: 3439714 (144701/sec), new interesting: 1 (total: 522)
+fuzz: elapsed: 30s, execs: 3860358 (140194/sec), new interesting: 1 (total: 522)
+fuzz: elapsed: 31s, execs: 3860358 (0/sec), new interesting: 1 (total: 522)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.057s
+$ go test ./internal/tls -run=FuzzTLSContextParse -fuzz=FuzzTLSContextParse -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/550 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 550/550 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 257905 (85945/sec), new interesting: 0 (total: 550)
+fuzz: elapsed: 6s, execs: 685108 (142402/sec), new interesting: 2 (total: 552)
+fuzz: elapsed: 9s, execs: 930475 (81798/sec), new interesting: 4 (total: 554)
+fuzz: elapsed: 12s, execs: 1042378 (37306/sec), new interesting: 5 (total: 555)
+fuzz: elapsed: 15s, execs: 1270278 (75944/sec), new interesting: 6 (total: 556)
+fuzz: elapsed: 18s, execs: 2358331 (362675/sec), new interesting: 11 (total: 561)
+fuzz: elapsed: 21s, execs: 4241775 (627958/sec), new interesting: 17 (total: 567)
+fuzz: elapsed: 24s, execs: 4425229 (61141/sec), new interesting: 19 (total: 569)
+fuzz: elapsed: 27s, execs: 4726775 (100528/sec), new interesting: 19 (total: 569)
+fuzz: elapsed: 30s, execs: 6231643 (501584/sec), new interesting: 23 (total: 573)
+fuzz: elapsed: 31s, execs: 6231643 (0/sec), new interesting: 23 (total: 573)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.052s
+$ go test ./internal/filter/hcm -run=FuzzHCMConfigParse -fuzz=FuzzHCMConfigParse -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/478 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 325/478 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 478/478 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 200725 (66800/sec), new interesting: 0 (total: 478)
+fuzz: elapsed: 9s, execs: 675447 (158241/sec), new interesting: 1 (total: 479)
+fuzz: elapsed: 12s, execs: 1147173 (157213/sec), new interesting: 1 (total: 479)
+fuzz: elapsed: 15s, execs: 1595089 (149320/sec), new interesting: 1 (total: 479)
+fuzz: elapsed: 18s, execs: 2012997 (139287/sec), new interesting: 3 (total: 481)
+fuzz: elapsed: 21s, execs: 2477853 (154946/sec), new interesting: 5 (total: 483)
+fuzz: elapsed: 24s, execs: 2833513 (118549/sec), new interesting: 5 (total: 483)
+fuzz: elapsed: 27s, execs: 3251988 (139521/sec), new interesting: 6 (total: 484)
+fuzz: elapsed: 30s, execs: 3660335 (136097/sec), new interesting: 7 (total: 485)
+fuzz: elapsed: 31s, execs: 3660335 (0/sec), new interesting: 7 (total: 485)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.053s
+$ go test ./internal/filter/hcm/h2 -run=FuzzFrameStream -fuzz=FuzzFrameStream -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/218 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 218/218 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 1362081 (453918/sec), new interesting: 22 (total: 240)
+fuzz: elapsed: 6s, execs: 2754706 (464311/sec), new interesting: 27 (total: 245)
+fuzz: elapsed: 9s, execs: 4151425 (465549/sec), new interesting: 27 (total: 245)
+fuzz: elapsed: 12s, execs: 5553008 (467168/sec), new interesting: 28 (total: 246)
+fuzz: elapsed: 15s, execs: 6955645 (467590/sec), new interesting: 33 (total: 251)
+fuzz: elapsed: 18s, execs: 8352186 (465463/sec), new interesting: 36 (total: 254)
+fuzz: elapsed: 21s, execs: 9756648 (468131/sec), new interesting: 38 (total: 256)
+fuzz: elapsed: 24s, execs: 11157321 (466887/sec), new interesting: 43 (total: 261)
+fuzz: elapsed: 27s, execs: 12556542 (466422/sec), new interesting: 47 (total: 265)
+fuzz: elapsed: 30s, execs: 13881310 (441645/sec), new interesting: 50 (total: 268)
+fuzz: elapsed: 31s, execs: 13881310 (0/sec), new interesting: 50 (total: 268)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.037s
+$ go test ./internal/filter/hcm/h2 -run=FuzzHPACKDecode -fuzz=FuzzHPACKDecode -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/111 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 111/111 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 713544 (237836/sec), new interesting: 8 (total: 119)
+fuzz: elapsed: 6s, execs: 972555 (86333/sec), new interesting: 9 (total: 120)
+fuzz: elapsed: 9s, execs: 1176898 (68074/sec), new interesting: 11 (total: 122)
+fuzz: elapsed: 12s, execs: 1292844 (38668/sec), new interesting: 14 (total: 125)
+fuzz: elapsed: 15s, execs: 1333994 (13719/sec), new interesting: 14 (total: 125)
+fuzz: elapsed: 18s, execs: 1333994 (0/sec), new interesting: 14 (total: 125)
+fuzz: elapsed: 21s, execs: 1333994 (0/sec), new interesting: 14 (total: 125)
+fuzz: elapsed: 24s, execs: 1333994 (0/sec), new interesting: 14 (total: 125)
+fuzz: elapsed: 27s, execs: 1333994 (0/sec), new interesting: 14 (total: 125)
+fuzz: elapsed: 30s, execs: 1333994 (0/sec), new interesting: 14 (total: 125)
+fuzz: elapsed: 31s, execs: 1333994 (0/sec), new interesting: 14 (total: 125)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.082s
+$ git status --porcelain
+?? envoy-go
+$ go vet ./...
+<no output>
+$ golangci-lint run ./...
+[118 pre-existing issues from Tasks 1-15; see notes above. No new issues introduced by Task 16 — net count reduced by 3 via serialised→serialized fix.]
+$ grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go'
+internal/filter/hcm/h2/settings.go:4:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/framer.go:10:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/conn.go:10:	"golang.org/x/net/http2"
+(All 3 hits are in the 5 allowed files per ADR-0046; hpack.go uses golang.org/x/net/http2/hpack sub-package only; stream.go uses no direct import.)
+$ ls internal/filter/hcm/h2/client.go 2>&1
+ls: cannot access 'internal/filter/hcm/h2/client.go': No such file or directory
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0053: Phase-04 REVIEW Minor carry-forward triage
+```
