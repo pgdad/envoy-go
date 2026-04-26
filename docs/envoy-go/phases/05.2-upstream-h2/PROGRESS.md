@@ -646,7 +646,7 @@ $ # single import — ADR-0046 boundary preserved (no new file added; the import
 
 ## Task 9 — `Cluster.UseH2()` accessor + `internal/cluster/dial_h2.go` + ADR-0056
 
-**Commits:** TBD-task9 (SHA-fill: see next commit)
+**Commits:** 344c371 (SHA-fill: see next commit)
 **Files changed:**
 - `internal/cluster/cluster.go` — Added `useH2 bool` field on `Cluster` struct, `UseH2() bool` accessor (zero-value defaults false; Task 10 wires the actual setter from typed_extension_protocol_options), and a blank import of `github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3` (registry-population for protojson round-trip in Manager.buildCluster — Task 10; documented per ADR-0016, no separate ADR per the ADR-0016 amendment). +21 LoC.
 - `internal/cluster/dial_h2.go` — New file implementing `(*Cluster).DialH2(ctx) (*h2.ClientConn, error)`: calls `c.Dial(ctx)` and wraps errors as `cluster: dial h2: %w`; type-asserts `*stdtls.Conn` (else closes raw + returns `not a TLS conn`); defensively re-runs `HandshakeContext(ctx)` (idempotent on already-handshaken conns; SPEC §11.3 mitigation); validates `NegotiatedProtocol == "h2"` (else closes + returns `alpn negotiated %q, want %q`); calls `h2.NewClientConn(ctx, tlsConn)` (else closes + wraps); each error branch closes the underlying conn explicitly because successful return transfers ownership to the *h2.ClientConn (no defer-close on the error paths would leak file descriptors). 54 LoC.
