@@ -224,3 +224,27 @@ func TestCluster_Dial_CtxCanceled(t *testing.T) {
 		t.Error("want ctx error")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// UseH2 — accessor coverage (phase 05.2 Task 9)
+// ---------------------------------------------------------------------------
+
+// TestCluster_UseH2_DefaultsFalse verifies the zero-value Cluster reports
+// useH2 == false, matching every existing cluster build path that doesn't
+// set the field. Task 10 wires up the actual setter from HttpProtocolOptions.
+func TestCluster_UseH2_DefaultsFalse(t *testing.T) {
+	c := &Cluster{}
+	if c.UseH2() {
+		t.Errorf("zero-value Cluster.UseH2() = true, want false")
+	}
+}
+
+// TestCluster_UseH2_True verifies a Cluster constructed with useH2: true
+// reports UseH2() == true. This is the path Task 10's HttpProtocolOptions
+// parser will exercise.
+func TestCluster_UseH2_True(t *testing.T) {
+	c := &Cluster{useH2: true}
+	if !c.UseH2() {
+		t.Errorf("Cluster.UseH2() = false, want true (with useH2: true)")
+	}
+}

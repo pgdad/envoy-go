@@ -1927,3 +1927,39 @@ M-7 is not enumerated separately above because it is the consequence of I-3: the
 ### Lands-in-task
 
 Phase-05.2 Task 5 (the closing task of the ADR-0055 fix sequence at Tasks 2-5). The seven fixes individually land at the commits enumerated above; this ADR itself lands in the same commit as the M-11 fix (the final fix of the seven-fix sequence).
+
+## ADR-0056: Per-request fresh upstream H2 dial
+
+**Status:** Accepted
+**Date:** 2026-04-26
+**Doctrine:** D-3.5 (record cross-phase decisions).
+**Settles:** phase-05.2 SPEC §10 #2.3 (newly out-of-scope at 05.2 — upstream H2 stream pooling/multiplexing across requests is deferred to the upstream-robustness family). Closes the ADR-0056 anticipation in phase-05.2 SPEC §4.4. Mirrors phase-04 ADR-0039 (per-request fresh upstream H1 dial). Resolves the carry-forward note from phase-04 ADR-0053's "phase-05.2-will-repeat-the-pattern" forward-looking clause: 05.2 introduces the analogous prose-vs-mechanism shape (`defer cc.Close()` in `routerActionH2.do`) and ADR-0056 formally acknowledges the cosmetic gap that ADR-0053 deferred.
+**Supersedes:** nothing.
+
+### Context
+
+H2's defining benefit over H1 — multiplexing many streams onto a single conn — is fundamentally NOT realised when the upstream dial happens once per router-action invocation. The per-request fresh-conn pattern does not amortise the TLS handshake, the H2 preface + SETTINGS exchange, or the cwnd ramp; tail latency under the per-request pattern is dominated by handshake variance and the new-conn slow-start.
+
+Phase 05.2 SPEC §2.1 enumerates upstream H2 stream pooling / multiplexing across requests as deferred to the upstream-robustness family (the phase that lands per-cluster H2 conn pools, max-concurrent-streams enforcement, GOAWAY-driven conn rotation, and per-conn settings cache). That family's scope is broader than 05.2's "land routed-to-upstream H2 differentially" charter, so ADR-0056's per-request-fresh discipline is the right phase-05.2 shape.
+
+The phase-04 precedent (ADR-0039) made the same call for upstream H1: fresh conn per request, `defer conn.Close()` at the action site. ADR-0056 mirrors that discipline for H2, with the same "production guidance: pooling is required for production workloads" caveat.
+
+### Decision
+
+Every `routerActionH2.do` invocation (Task 11 — `internal/filter/hcm/actions.go`'s H2 router action) calls `r.cluster.DialH2(ctx)` (this task — `internal/cluster/dial_h2.go:DialH2`) to obtain a *fresh* `*h2.ClientConn`. Within a single invocation, exactly one stream is opened on the new conn via `cc.RoundTrip`. The conn is closed immediately after the response is consumed via `defer cc.Close()` at the action site. Cross-invocation pooling is the upstream-robustness family's deliverable, not phase-05.2's.
+
+`Cluster.DialH2` is structured so each error branch closes the underlying conn explicitly: on a successful return the caller takes ownership of the `*h2.ClientConn` (and its underlying `*tls.Conn`), but on error there is no caller-owned wrapper to defer-close, so the underlying conn would otherwise leak file descriptors. The `defer cc.Close()` mechanism at the call site (`routerActionH2.do`) is the per-request closure ADR-0053 anticipated.
+
+The phase-05.2 differential surface does NOT assert pool/non-pool: Envoy pools, envoy-go does not, but both produce the same per-request `:status` / response-body output and both produce the per-side `[3,3,3]` distribution under the sequential-request workload (fixture 0004's six listeners × N requests with round-robin LB across three endpoints per cluster). The cross-conn frame counts differ between Envoy and envoy-go but those frame-level counts are not in the equivalence matrix.
+
+### Consequences
+
+- Under load, per-request latency increases linearly with request rate; tail latency suffers from TLS handshake variance — intentional in 05.2, mitigated by this ADR's "production guidance: pooling is required for production workloads" clause. The fixture-0004 differential workload runs sequentially, so the per-request-fresh discipline does not introduce flakiness on the differential gate.
+- The upstream-robustness family, when it lands, brings H2 pooling and supersedes ADR-0056 with a pooling-discipline ADR. The pooling ADR will inherit the per-conn settings cache + max-concurrent-streams enforcement + GOAWAY-driven conn rotation as the load-bearing shape.
+- The carry-forward from phase-04 ADR-0053's "phase-05.2-will-repeat-the-pattern" note is now resolved. ADR-0053 deferred the prose-vs-mechanism formalisation of the per-request-fresh closure to "the next phase that introduces the same shape"; phase 05.2 is that phase, and ADR-0056's `defer cc.Close()` mechanism acknowledgement closes the carry-forward.
+- The `closedStreams` map's unbounded-growth concern (M-12 from the 05.1 REVIEW) is unaffected by ADR-0056. M-12 is a long-lived-conn hardening item; under ADR-0056's per-request-fresh discipline, every H2 conn is short-lived (one stream then closed), so `closedStreams` entries are reclaimed when the conn is closed. M-12 becomes load-bearing only in the upstream-robustness family's pooling phase (where conns are long-lived and `closedStreams` may grow without bound across many request lifetimes).
+- The H1 mirror (ADR-0039) continues to govern the H1-routed surface; ADR-0056 is the H2-specific symmetric ADR, not a generalisation. A future cross-codec consolidation may bundle both into a single "per-request-fresh-upstream-conn" ADR if the upstream-robustness family's pooling work makes the bundle natural; phase 05.2 keeps them separate per the per-codec-ADR precedent.
+
+### Lands-in-task
+
+Phase-05.2 Task 9 (first use of `Cluster.DialH2` in the production codepath — `internal/cluster/dial_h2.go:DialH2`). The ADR lands in the same commit as the dial helper itself; `routerActionH2.do`'s `defer cc.Close()` call site lands at Task 11 and carries no separate ADR (the discipline is governed by ADR-0056).

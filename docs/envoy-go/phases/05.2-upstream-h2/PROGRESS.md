@@ -643,3 +643,68 @@ $ grep -n '"golang.org/x/net/http2"' internal/filter/hcm/h2/client.go
 24:	"golang.org/x/net/http2"
 $ # single import — ADR-0046 boundary preserved (no new file added; the import was added in Task 7)
 ```
+
+## Task 9 — `Cluster.UseH2()` accessor + `internal/cluster/dial_h2.go` + ADR-0056
+
+**Commits:** TBD-task9 (SHA-fill: see next commit)
+**Files changed:**
+- `internal/cluster/cluster.go` — Added `useH2 bool` field on `Cluster` struct, `UseH2() bool` accessor (zero-value defaults false; Task 10 wires the actual setter from typed_extension_protocol_options), and a blank import of `github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3` (registry-population for protojson round-trip in Manager.buildCluster — Task 10; documented per ADR-0016, no separate ADR per the ADR-0016 amendment). +21 LoC.
+- `internal/cluster/dial_h2.go` — New file implementing `(*Cluster).DialH2(ctx) (*h2.ClientConn, error)`: calls `c.Dial(ctx)` and wraps errors as `cluster: dial h2: %w`; type-asserts `*stdtls.Conn` (else closes raw + returns `not a TLS conn`); defensively re-runs `HandshakeContext(ctx)` (idempotent on already-handshaken conns; SPEC §11.3 mitigation); validates `NegotiatedProtocol == "h2"` (else closes + returns `alpn negotiated %q, want %q`); calls `h2.NewClientConn(ctx, tlsConn)` (else closes + wraps); each error branch closes the underlying conn explicitly because successful return transfers ownership to the *h2.ClientConn (no defer-close on the error paths would leak file descriptors). 54 LoC.
+- `internal/cluster/dial_h2_test.go` — New file with five DialH2 tests + helpers: an in-memory P-256 CA + leaf PKI generated per test (`mkH2TestPKI`) — note: PKI lives in-memory via crypto/ecdsa, NOT committed PEM files (those are fixture-0004's deliverable in Task 13); a from-scratch `h2ServerPrefacePeer` driver that reads preface + client SETTINGS, writes server SETTINGS, exchanges SETTINGS_ACKs (mirrors h2/client_test.go's `runFakeServerPeerForClientHandshake`); and three listener helpers (`listenH2`, `listenALPN`, `listenTLSCloseOnAccept`) for the five test scenarios. Tests: HappyPath, ALPNMismatch (server NextProtos=["http/1.1"] → "alpn negotiated" + `want "h2"` substrings), NotTLS (plaintext cluster → "not a TLS conn"), CtxCancel (canceled ctx → context.Canceled propagates), TLSHandshakeFailure (TCP-only listener that closes immediately → handshake-error chain). 388 LoC.
+- `internal/cluster/cluster_test.go` — Two new accessor-coverage tests: `TestCluster_UseH2_DefaultsFalse` (zero-value Cluster reports false), `TestCluster_UseH2_True` (`&Cluster{useH2: true}` reports true). +24 LoC.
+- `docs/envoy-go/DECISIONS.md` — ADR-0056 appended at file tail (post-ADR-0055): "Per-request fresh upstream H2 dial". Status Accepted; Doctrine D-3.5; Settles SPEC §10 #2.3 + closes the SPEC §4.4 anticipation; mirrors phase-04 ADR-0039; resolves the carry-forward from ADR-0053's "phase-05.2-will-repeat-the-pattern" forward-looking clause; cross-references `internal/cluster/dial_h2.go:DialH2`, `routerActionH2.do` (Task 11 carry-forward), ADR-0039, ADR-0053, and explicitly notes M-12 (closedStreams unbounded) is unaffected by ADR-0056 because per-request-fresh discipline produces short-lived conns where `closedStreams` is reclaimed at conn close; M-12 becomes load-bearing only in the upstream-robustness family's pooling phase. +36 LoC.
+- `docs/envoy-go/phases/05.2-upstream-h2/PROGRESS.md` — this entry.
+
+**Notes:** TDD discipline observed: with `Cluster.UseH2` undefined and `Cluster.DialH2` undefined at Step 1 commit-prep, all 7 new tests FAILED with compile errors (`c.UseH2 undefined`, `unknown field useH2 in struct literal`, `c.DialH2 undefined`). After Steps 2-3 landed, all 7 PASS:
+
+```
+=== RUN   TestCluster_UseH2_DefaultsFalse
+--- PASS: TestCluster_UseH2_DefaultsFalse (0.00s)
+=== RUN   TestCluster_UseH2_True
+--- PASS: TestCluster_UseH2_True (0.00s)
+=== RUN   TestCluster_DialH2_HappyPath
+--- PASS: TestCluster_DialH2_HappyPath (0.00s)
+=== RUN   TestCluster_DialH2_ALPNMismatch
+--- PASS: TestCluster_DialH2_ALPNMismatch (0.00s)
+=== RUN   TestCluster_DialH2_NotTLS
+--- PASS: TestCluster_DialH2_NotTLS (0.00s)
+=== RUN   TestCluster_DialH2_CtxCancel
+--- PASS: TestCluster_DialH2_CtxCancel (0.00s)
+=== RUN   TestCluster_DialH2_TLSHandshakeFailure
+--- PASS: TestCluster_DialH2_TLSHandshakeFailure (0.00s)
+```
+
+Implementation divergence from PLAN snippets (substantive, none; symbol-rename, none): the dial_h2.go file matches the PLAN snippet at lines 1730-1779 exactly except for prose-only comment expansion. The PLAN snippet's comment about defer-close discipline is preserved verbatim and extended with a sentence about the "no caller-owned wrapper to defer-close on error paths" rationale.
+
+Test-fixture divergence from PLAN: the PLAN's Step 1 snippet for `TestCluster_DialH2_HappyPath` referenced "fixture-0002 driver_test.go's TLS pattern" as the model, but inspecting `test/fixtures/0002-tls-tcp/driver/driver_test.go` revealed it carries no in-memory PKI — it's a unit-test of `tlsDriver.AssertDistribution`. The actual in-memory PKI bootstrap pattern lives at `internal/tls/config_test.go` (the `pki = func() *testPKI { ... }()` package-level var). The Task 9 tests use the same `crypto/ecdsa` + `crypto/x509` + `pkix.Name` pattern, mirrored into `mkH2TestPKI(t)` per-test (P-256 keygen is cheap; per-test instead of package-level reduces parallel-test contention).
+
+Pitfall avoided: the initial happy-path implementation used `golang.org/x/net/http2.Server.ServeConn` as the in-process h2 server. That driver-side use is permitted in test code per D-3.2, but `http2.Server.ServeConn` immediately sent a GOAWAY in response to the from-scratch client preface (root cause not isolated; possibly an ALPN/preface-validation difference). Refactored to a from-scratch `h2ServerPrefacePeer` using `http2.NewFramer` directly — symmetric with the h2/client_test.go fixture, and proven against the production codec. The `golang.org/x/net/http2` import in the test file is for `http2.Framer` only; `http2.Server` and `http2.ConfigureServer` are not used.
+
+Idempotence verification: `(*tls.Conn).HandshakeContext` is documented as idempotent — calling it on an already-handshaken conn returns nil immediately. Verified by the happy-path test passing despite Cluster.Dial having already completed the handshake before DialH2 calls HandshakeContext a second time.
+
+**Outputs:**
+```
+$ go test ./internal/cluster/ -v -run "TestCluster_UseH2_|TestCluster_DialH2_"
+[... 7 PASS lines as above ...]
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.006s
+
+$ go test -race ./internal/cluster/ -v
+[... full suite ...]
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.029s
+
+$ go vet ./internal/cluster/
+$ # exit 0
+
+$ golangci-lint run ./internal/cluster/
+$ # exit 0
+
+$ go test ./...
+[... 26 packages, 0 FAIL ...]
+
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -2
+## ADR-0055: Flow-control discipline for the from-scratch H2 codec
+## ADR-0056: Per-request fresh upstream H2 dial
+$ # ADR tail advanced 0055 → 0056 as expected
+```

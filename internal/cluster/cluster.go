@@ -7,6 +7,13 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	// Phase 05.2 (ADR-0016 amendment, no separate ADR per ADR-0016): the
+	// cluster-side HttpProtocolOptions extension proto must be registered
+	// with protoregistry.GlobalTypes so protojson can round-trip the
+	// typed_extension_protocol_options entry in Manager.buildCluster
+	// (Task 10). The blank import is the load-it-and-register-it idiom.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 )
 
 // defaultConnectTimeout is used when a cluster's connect_timeout is unset.
@@ -38,10 +45,24 @@ type Cluster struct {
 	connectTimeout time.Duration
 	lb             loadBalancer
 	upstreamCfg    *stdtls.Config
+	// useH2 reports whether this cluster's HttpProtocolOptions selects H2
+	// upstream origination. Set by Manager.buildCluster (Task 10) from the
+	// typed_extension_protocol_options entry; defaults to false for every
+	// existing cluster build path. When true, the HCM filter-build path
+	// constructs routerActionH2 instead of routerAction (per ADR-0056;
+	// phase 05.2 SPEC §5.5).
+	useH2 bool
 }
 
 // Name returns the cluster's name.
 func (c *Cluster) Name() string { return c.name }
+
+// UseH2 reports whether this cluster's HttpProtocolOptions selects HTTP/2
+// upstream origination. When true, the HCM filter-build path constructs
+// routerActionH2 instead of routerAction (per ADR-0056; phase 05.2 SPEC §5.5).
+// Defaults to false for every existing cluster build path; Task 10 wires up
+// the actual setter from typed_extension_protocol_options parsing.
+func (c *Cluster) UseH2() bool { return c.useH2 }
 
 // PickEndpoint selects the next upstream endpoint per the cluster's LB policy.
 // Safe for concurrent use.
