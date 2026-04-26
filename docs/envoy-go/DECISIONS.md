@@ -1750,3 +1750,92 @@ PROTOCOL_ERROR and consider it a test pass, not a real conformance signal).
   beyond the base RFC that were not covered by the non-strict run.
 
 This ADR supersedes nothing.
+
+## ADR-0052: BEHAVIOR_CONTRACT `## HTTP/2` subsection (SCAFFOLD form for 05.1)
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.4, D-3.5
+**Settles:** SPEC ADR-T; phase-05.1 §5.7 (BEHAVIOR_CONTRACT scope).
+
+### Context
+
+Phase 05.1 delivers envoy-go's downstream HTTP/2 codec and the project's first non-vacuous conformance gate. The equivalence surface — what the project now asserts, and what it deliberately defers — must be codified in `BEHAVIOR_CONTRACT.md` so that subsequent phases, reviewers, and the verification-before-completion session can audit the boundary. Without this codification, the 05.1 gate sweep is a series of green lights without a documented contract; the gate would be correct but unauditable.
+
+SPEC §5.7 mandates this subsection land in Task 16 (the closing task) alongside the final all-gates green sweep — same commit so the contract and the evidence land atomically.
+
+This subsection is written in SCAFFOLD form: the 05.1 scope draws the equivalence boundary at locally-generated H2 responses via `direct_response` (h2spec-verified) and explicitly defers the routed-to-upstream H2 surface to phase 05.2.
+
+### Decision
+
+The `## HTTP/2` subsection is added to `docs/envoy-go/BEHAVIOR_CONTRACT.md` immediately after `## HTTP/1.1`. The subsection contains:
+
+1. **Asserted equivalence (05.1 scope):**
+   - `:status` per request: required + asserted by h2spec section 8 on every `direct_response` invocation.
+   - Decoded body bytes on `direct_response` 2xx paths: byte-equal to the configured `body` string (h2spec validates indirectly via response-length + END_STREAM checks; envoy-go's unit tests assert byte equality directly).
+   - Per-stream response header set-equality modulo allow-list: locally-generated H2 responses carry `:status`/`Server`/`Content-Type`/`Content-Length`/`Date`. Routed-to-upstream H2 surface NOT YET ASSERTED IN 05.1 (deferred to 05.2 + fixture 0004).
+
+2. **Not asserted (05.1 scope):**
+   - Wire-byte H2 framing; SETTINGS values byte-for-byte; WINDOW_UPDATE timing or count; stream id allocation pattern; trailers; 0-RTT TLS early data; routed-to-upstream H2 request preservation / decoded body / per-cluster RR / ALPN selection equivalence at the differential level — ALL DEFERRED TO 05.2.
+
+3. **Header allow-list extensions:**
+   - `:status` (active in 05.1; locally-generated H2 responses).
+   - `:method`/`:path`/`:scheme`/`:authority` (forward-looking, applies-to: 05.2 routed-to-upstream H2). The 05.1 scaffold inserts these rows so 05.2's brainstorming has nothing to add to the table itself; only the "applies-to" cells flip when fixture 0004 lands.
+
+4. **h2spec threshold:** Sections 3, 4, 5, 6 (excluding 6.6 PUSH_PROMISE), 7, 8 — all `failed == 0`. Pin via `CONFORMANCE_PINS.md` per ADR-0051.
+
+**Applies to (05.1):**
+- Phase-05.1 `internal/filter/hcm/h2/` package (server-side only).
+- The codec-neutral `directResponseAction` factoring in `internal/filter/hcm/actions.go`.
+- The conformance suite under `test/conformance/h2spec/`.
+
+**Does not yet apply to:**
+- Routed-to-upstream H2 (05.2 + fixture 0004 — closes ADR-0035 H2 leg).
+- HTTP/3, server push, gRPC framing, trailer forwarding, upstream H2 stream pooling, h2c production fixtures, mTLS over h2.
+
+**SCAFFOLD-pattern in-place-edit authorisation:** ADR-0052 explicitly authorises phase 05.2's brainstorming session to EDIT the `## HTTP/2` subsection IN PLACE (not replace via supersession ADR) to flip the deferred items to active rules when fixture 0004 lands. The rationale: the scaffold is intentionally incomplete; the shape is correct; the in-place edit is the lowest-friction path for 05.2's planner and keeps the history coherent without proliferating supersession ADRs for content fills.
+
+### Consequences
+
+- The BEHAVIOR_CONTRACT's `## HTTP/2` subsection is authoritative for 05.1's equivalence scope. Any deviation from the h2spec `failed == 0` threshold on the included sections is a regression.
+- Phase 05.2's brainstorming session may edit this subsection in place under the SCAFFOLD-pattern authorisation above. If it discovers that the asserted equivalence must be *relaxed* (not just extended), a superseding ADR is required.
+- The Header allow-list table grows by 5 rows. Rows for `:method`/`:path`/`:scheme`/`:authority` carry "applies-to: 05.2" annotations; when 05.2 fixture 0004 goes green, the annotation is the only thing that changes — the rows themselves are already correct.
+- Future phases that extend the H2 equivalence surface (e.g., trailers in phase 07, gRPC in a gRPC-family phase) add sub-sections here (or a subsection sibling) via a new ADR, not by editing 05.1's `### Not asserted` block silently.
+
+This ADR supersedes nothing.
+
+## ADR-0053: Phase-04 REVIEW Minor carry-forward triage
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.4, D-3.5
+**Settles:** SPEC ADR-X; phase-05.1 §12 (phase-04 REVIEW carry-forward disposition).
+
+### Context
+
+Phase 04's `REVIEW.md` (commit `04527eb`) records five Minor findings (M-2, M-4, M-5, M-6, M-7) that were not resolved before phase-04 reached `done`. Per phase-05.1 SPEC §12, these carry-forwards must be formally triaged in 05.1's closing task so that they do not silently accumulate. ADR-0045 (the phase-05 split decision) explicitly assigned phase-04 REVIEW carry-forward triage to 05.1 as a closing-task deliverable.
+
+### Decision
+
+Per-Minor disposition (each entry references the REVIEW.md finding by its identifier):
+
+- **M-2** (ADR-0043 "Doctrine: D-3.4, D-3.5" mismatched against informal supersession qualifier): **DEFERRED** — cosmetic. Phase 05.1 does not touch ADR-0043; the mismatch is a prose-level annotation inconsistency, not a behavioural gap. A future doctrine-cleanup ADR supersedes ADR-0043 with corrected attribution. Phase 05.1 adds no new obligations.
+
+- **M-4** (listener-manager `Stop()`/`Listeners()` race): **DEFERRED** to phase 08. Phase 05.1 does not touch the lock surface in `internal/listener/manager.go`. The race carries forward to phase 08's admin-api-and-drain phase as the natural close, where drain semantics require a correct `Listeners()` snapshot under concurrent `Stop()` calls. The phase-06-must-consume tag is NOT applied here (phase 06's scope is observability, not drain); phase 08's brainstorm is required to address M-4.
+
+- **M-5** (phase-04 SPEC §7 failure-mode prose vs `defer upstreamConn.Close()` mechanism): **DEFERRED**. Phase 05.1 does NOT introduce a parallel mechanism on the H2 path because `routerActionH2` is 05.2's surface. The same prose-vs-mechanism shape WILL reappear in 05.2's `routerActionH2.do` with `defer clientConn.Close()` — 05.2's brainstorming inherits this disposition rather than re-litigating. ADR-0053's forward-looking note: phase-05.2-will-repeat-the-pattern; a future SPEC-corrections ADR closes both the phase-04 M-5 gap and the analogous 05.2 gap in one pass.
+
+- **M-6** (fixture-0003 driver heredoc YAML pattern): **DEFERRED**. Phase 05.1 introduces no new fixture, so the structured-`expectations.yaml` plan from ADR-0019 (phase 03's fixture shape) remains unforced. The observability sweep in phase 06 is the natural close for fixture-shape standardisation. Phase 05.2's brainstorming may elect to use structured YAML for fixture 0004 (per the SPEC §10 #10 settlement note in ADR-0045), which would create organic pressure to retrofit 0003. Phase 05.1 defers without a must-consume tag on this item.
+
+- **M-7** (`Filter.statPrefix` stored but never consumed): **DEFERRED with phase-06-must-consume tag**. Phase 05.1 does not consume `Filter.statPrefix` either; the field sits un-consumed across the H1 and H2 paths both. Phase 06's brainstorm is REQUIRED to either: (a) honour `Filter.statPrefix` in the stats emission code — lifting M-7 to RESOLVED; or (b) supersede ADR-0041 with a stat-naming policy that obviates the `statPrefix` field entirely. The phase-06-must-consume tag is explicit: failure to address M-7 in phase 06 is a phase-06 REVIEW finding.
+
+**New H2 prose-vs-mechanism shape (05.1 scope):** Phase 05.1 introduces a new analogous shape on the H2 path — the `defer` cleanup in `serverStream.dispatch`'s action invocation (analogous to phase-04 M-5's H1 prose-vs-mechanism gap). The 05.1 SPEC §7 does not have a separate failure-mode prose section for the H2 path at the same granularity as phase-04 §7 (by design — the H2 codec's error handling is specified in §5.2's state machine, not a separate failure-mode list). The cosmetic gap between prose and mechanism on the H2 path is acknowledged and deferred to the same future SPEC-corrections ADR that resolves M-5 on the H1 path.
+
+### Consequences
+
+- M-2, M-4, M-5, M-6 carry forward with explicit disposition records. No phase closes them silently.
+- M-7 has a hard phase-06-must-consume tag: phase 06 MUST address it. Phase-06's brainstorming session reads this ADR and includes M-7 in its acceptance checklist.
+- Phase 05.2 inherits the M-5 disposition (H1 `defer upstreamConn.Close()` prose-vs-mechanism gap) without re-litigating; 05.2's brainstorming session notes the analogous `routerActionH2.do` pattern as pre-triaged under ADR-0053.
+- This ADR does not create any new code obligations in 05.1 — all five dispositions are textual/deferred.
+
+This ADR supersedes nothing.
