@@ -1048,3 +1048,352 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0057: Closes ADR-0035 H/2 leg via fixture 0004's full-stack HTTPS h2
 $ # Sequential file-order tail = ADR-0057 (Task 14 lands AFTER ADR-0058 — non-monotonic per PLAN's first-use commit-time ordering: 0055 → 0056 → 0058 → 0057).
 ```
+
+---
+
+## Task 15 — BEHAVIOR_CONTRACT `## HTTP/2` in-place edit (per ADR-0052) + all-gates green local sweep + STATE → lifecycle-state 4
+
+**Commits:** `<sha>` (this commit, BEHAVIOR_CONTRACT + STATE + PROGRESS + 1-line test deadline extension), follow-up SHA-fill commit per the phase-02/03/04/05.1 convention.
+
+**Notes:** Phase-05.2 closing task. This is the supersession-free in-place edit authorised by ADR-0052: the SCAFFOLD `## HTTP/2` subsection introduced in 05.1 is rewritten to its 05.1+05.2 unified form (the PLAN's authoritative prose at PLAN.md lines 2820-2877), and the four header-allow-list rows for `:method`/`:path`/`:scheme`/`:authority` have their applies-to cells flipped from "phase 05.2 routed-to-upstream H2 (forward-looking)" → "phase 05.2 routed-to-upstream H2 (active per ADR-0057)". No new ADR is added; ADR-0052's text is the standing authorisation. Five gates (a/b/c/d/e) green at this commit; gate (f) `REVIEW.md` is deferred to the REVIEW session at lifecycle-state 6 per BOOTSTRAP §5 step 6. Per PLAN Task 15's "Refinement" note, ROADMAP rows 05.2 + 05 stay `in-progress` at this commit; the phase-done commit (REVIEW session, lifecycle-state 6) will flip both rows on the same commit.
+
+**Race-detector flake fix:** Task 14 reported a pre-existing ~1-in-7 flake on `TestClientConn_RoundTrip_PeerDataAfterEndStream` under `-race`. Reproduced on run 5 of 5 in this session's initial -race sweep (the remaining 4 runs passed). Root cause: the test's 2s deadline waiting for `cc.ctx` cancellation was insufficient under -race load on a 32-core box (peer-side 100ms `time.Sleep` + scheduler jitter could push the rogue-frame write beyond 2s). Fix: extended deadline to 10s in `internal/filter/hcm/h2/client_test.go` lines 770-780 with an explanatory comment; under no-bug the loop exits within tens of milliseconds, so 10s is generous enough to absorb GC / scheduler hiccups without hiding genuine regressions. Verification: 10/10 PASS on `-count=1 -race -run TestClientConn_RoundTrip_PeerDataAfterEndStream` (one run took 6s, validating that 2s was indeed too tight). Additional one full uncached `-race ./...` sweep PASS post-fix.
+
+**Phase-05.1 REVIEW carry-forward resolution matrix (mirrors PLAN.md lines 167-194 — readers see at a glance which findings closed in 05.2):**
+
+| Finding | Disposition |
+|---|---|
+| I-1 (`writeData` ignores `MaxFrameSize`) | RESOLVED-IN-05.2 (ADR-0055, Task 3) |
+| I-2 (`writeData` ignores per-stream send window) | RESOLVED-IN-05.2 (ADR-0055, Task 3) |
+| I-3 (`recvW` allocated but never enforced) | RESOLVED-IN-05.2 (ADR-0055, Task 4) |
+| I-4 (`CONFORMANCE_PINS.md` missing `## Refresh procedure`) | RESOLVED-IN-05.1-FOLLOW-UP |
+| M-1 (`hpackBlocked` dead code) | RESOLVED-IN-05.1-FOLLOW-UP |
+| M-2 (`validateClientStreamID` dead code) | RESOLVED-IN-05.1-FOLLOW-UP |
+| M-3 (`writeData` dead branch + `waitFor`+`reserve` non-atomicity) | RESOLVED-IN-05.2 (ADR-0055, Task 2) |
+| M-4 (`readClientPreface` not ctx-aware) | DEFERRED to phase 06/07 (ADR-0058 carry-forward) |
+| M-5 (framer translation block duplication) | RESOLVED-IN-05.2 (ADR-0055, Task 2) |
+| M-6 (fuzzer `errors.Is`) | RESOLVED-IN-05.1-FOLLOW-UP |
+| M-7 (`recvW` fields dead) | RESOLVED-IN-05.2 (ADR-0055, Task 4 — kept-and-consumed under I-3) |
+| M-8 (`excludedSubsections` `//nolint:unused`) | RESOLVED-IN-05.2 (Task 6 step 4 — promoted to doc comment in `CONFORMANCE_PINS.md`) |
+| M-9 (WINDOW_UPDATE delta overflow not bounds-checked) | RESOLVED-IN-05.2 (ADR-0055, Task 4) |
+| M-10 (`SETTINGS_TIMEOUT` absent) | DEFERRED to phase 06/08 (ADR-0058 carry-forward) |
+| M-11 (`recvData` writes before checking state) | RESOLVED-IN-05.2 (ADR-0055, Task 5) |
+| M-12 (`closedStreams` map unbounded) | DEFERRED to long-lived-conn phase (free-standing carry-forward) |
+| M-13 (BEHAVIOR_CONTRACT prose tightening) | RESOLVED-IN-05.1-FOLLOW-UP |
+| M-14 (no-match 404 body alignment) | RESOLVED-IN-05.1-FOLLOW-UP |
+| M-15 (ADR-0046 prose correction via ADR-0054) | RESOLVED-IN-05.1-FOLLOW-UP (ADR-0054) |
+| M-16 (smoke-only docstring) | RESOLVED-IN-05.1-FOLLOW-UP |
+| M-17 (connection.go fall-through doc comment) | RESOLVED-IN-05.1-FOLLOW-UP |
+| Integration-test gap for monotonic-id-reuse rejection | RESOLVED-IN-05.2 (Task 6 step 2) |
+| FU-7 (elide empty trailing DATA frame) | CONFIRMED OUT-OF-SCOPE for 05.2 |
+
+Summary: 8 RESOLVED-IN-05.2 (under ADR-0055 + Tasks 6 step 2 + Task 6 step 4); 8 RESOLVED-IN-05.1-FOLLOW-UP (audit-only, no 05.2 code change); 3 DEFERRED with documented rationale (M-4 + M-10 via ADR-0058's carry-forward subsection; M-12 free-standing in PROGRESS.md); 1 OUT-OF-SCOPE (FU-7). No 05.1 finding rises to a 05.2 blocker. The phase-05.2 REVIEW (lifecycle-state 6) will additionally evaluate any new 05.2 findings; no Critical / Important findings are anticipated by the executor at this commit.
+
+**Phase-05.2 REVIEW Minor candidates (carry forward to REVIEW.md):**
+
+- The 1-in-7 race-detector flake on `TestClientConn_RoundTrip_PeerDataAfterEndStream` (Task 14 noted; this Task fixed in-test by extending the cancel-wait deadline 2s → 10s; the fix is conservative and the test logic is unchanged). REVIEW may either accept the deadline extension or recommend a more targeted fix (e.g., synchronisation channel from the peer goroutine indicating "rogue frame was written"). The current fix is sufficient for the verification gate; the REVIEW evaluates style.
+- ADR-numbering non-monotonicity (0055 → 0056 → 0058 → 0057 by file order) is documented in PLAN's "ADRs introduced by this plan" section and Task 14's PROGRESS entry. REVIEW may either accept or recommend a future audit-cleanup pass; not a blocker.
+
+**Gate (a) — fixture 0004 differential (NEW non-vacuous in 05.2 per ADR-0057):**
+
+```
+$ go test -count=1 -run TestDifferential/0004-h2-routing -v ./test/differential/
+[testcontainers ryuk + reference-Envoy lifecycle abbreviated; subject-side `hcm: h2: EOF` lines abbreviated — these are intentional EOF logs from h2spec-style probes during test-Envoy reachability checks, not failures.]
+2026/04/26 17:50:54 🐳 Terminating container: 0224021c795a
+2026/04/26 17:50:54 🚫 Container terminated: 0224021c795a
+--- PASS: TestDifferential (1.88s)
+    --- PASS: TestDifferential/0004-h2-routing (1.88s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.966s
+```
+
+**Gate (b) — all pre-existing differential fixtures (regression check):**
+
+```
+$ go test -count=1 -run TestDifferential -v ./test/differential/
+[testcontainers + container lifecycle abbreviated.]
+--- PASS: TestDifferential (6.96s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.47s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.24s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.25s)
+    --- PASS: TestDifferential/0003-http11-routing (1.25s)
+    --- PASS: TestDifferential/0004-h2-routing (1.76s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	7.039s
+```
+
+5/5 fixtures green.
+
+**Gate (c) — h2spec conformance (UNCHANGED from 05.1 baseline):**
+
+```
+$ go test -count=1 ./test/conformance/h2spec/ -v -timeout=300s
+[testcontainers + summerwind/h2spec lifecycle abbreviated.]
+        Finished in 0.5471 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+        
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+2026/04/26 17:51:13 🐳 Terminating container: 4ca7cddbc173
+2026/04/26 17:51:13 🚫 Container terminated: 4ca7cddbc173
+--- PASS: TestH2Spec (2.20s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.293s
+```
+
+53/53 PASS — covers sections 3, 4, 5, 6 ex-6.6, 7, 8 per the ADR-0051 threshold list at the pinned `summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0`.
+
+**Gate (d) — fuzzers (all 6 PLAN-enumerated fuzzers exist; 30s budget per ADR-0018):**
+
+`grep -r '^func Fuzz' --include='*.go' .` enumeration:
+```
+internal/filter/tcpproxy/fuzz_test.go:26:func FuzzTcpProxyFilter(f *testing.F) {
+internal/filter/hcm/fuzz_test.go:24:func FuzzHCMConfigParse(f *testing.F) {
+internal/filter/hcm/h2/fuzz_test.go:24:func FuzzFrameStream(f *testing.F) {
+internal/filter/hcm/h2/fuzz_test.go:96:func FuzzHPACKDecode(f *testing.F) {
+internal/bootstrap/fuzz_test.go:62:func FuzzBootstrapLoad(f *testing.F) {
+internal/tls/fuzz_test.go:24:func FuzzTLSContextParse(f *testing.F) {
+```
+
+All 6 PLAN-listed fuzzers present. Per-fuzzer 30s runs:
+
+```
+$ go test -fuzz=FuzzFrameStream -fuzztime=30s ./internal/filter/hcm/h2/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/348 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 348/348 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 1360090 (453272/sec), new interesting: 0 (total: 348)
+fuzz: elapsed: 6s, execs: 2779309 (472162/sec), new interesting: 0 (total: 348)
+fuzz: elapsed: 9s, execs: 4131940 (451772/sec), new interesting: 1 (total: 349)
+fuzz: elapsed: 12s, execs: 5458922 (442388/sec), new interesting: 1 (total: 349)
+fuzz: elapsed: 15s, execs: 6813470 (451452/sec), new interesting: 1 (total: 349)
+fuzz: elapsed: 18s, execs: 8186832 (457760/sec), new interesting: 2 (total: 350)
+fuzz: elapsed: 21s, execs: 9899590 (571028/sec), new interesting: 5 (total: 353)
+fuzz: elapsed: 24s, execs: 11317736 (472673/sec), new interesting: 5 (total: 353)
+fuzz: elapsed: 27s, execs: 12689397 (457182/sec), new interesting: 5 (total: 353)
+fuzz: elapsed: 30s, execs: 14093104 (467908/sec), new interesting: 5 (total: 353)
+fuzz: elapsed: 30s, execs: 14093104 (0/sec), new interesting: 5 (total: 353)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	32.614s
+
+$ go test -fuzz=FuzzHPACKDecode -fuzztime=30s ./internal/filter/hcm/h2/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/146 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 146/146 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 1038829 (346196/sec), new interesting: 0 (total: 146)
+fuzz: elapsed: 6s, execs: 1807973 (256363/sec), new interesting: 0 (total: 146)
+fuzz: elapsed: 9s, execs: 2167229 (119761/sec), new interesting: 0 (total: 146)
+fuzz: elapsed: 12s, execs: 2388206 (73657/sec), new interesting: 0 (total: 146)
+fuzz: elapsed: 15s, execs: 2532246 (48020/sec), new interesting: 1 (total: 147)
+fuzz: elapsed: 18s, execs: 2614876 (27546/sec), new interesting: 1 (total: 147)
+fuzz: elapsed: 21s, execs: 2614876 (0/sec), new interesting: 1 (total: 147)
+fuzz: elapsed: 24s, execs: 2614876 (0/sec), new interesting: 1 (total: 147)
+fuzz: elapsed: 27s, execs: 2614876 (0/sec), new interesting: 1 (total: 147)
+fuzz: elapsed: 30s, execs: 2614876 (0/sec), new interesting: 1 (total: 147)
+fuzz: elapsed: 31s, execs: 2614876 (0/sec), new interesting: 1 (total: 147)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	33.535s
+
+$ go test -fuzz=FuzzBootstrapLoad -fuzztime=30s ./internal/bootstrap/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/1019 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 569/1019 completed
+fuzz: elapsed: 5s, gathering baseline coverage: 1019/1019 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 115757 (38406/sec), new interesting: 3 (total: 1022)
+fuzz: elapsed: 9s, execs: 308612 (64273/sec), new interesting: 7 (total: 1026)
+fuzz: elapsed: 12s, execs: 385697 (25699/sec), new interesting: 8 (total: 1027)
+fuzz: elapsed: 15s, execs: 438691 (17668/sec), new interesting: 8 (total: 1027)
+fuzz: elapsed: 18s, execs: 441513 (940/sec), new interesting: 8 (total: 1027)
+fuzz: elapsed: 21s, execs: 441513 (0/sec), new interesting: 8 (total: 1027)
+fuzz: elapsed: 24s, execs: 441513 (0/sec), new interesting: 8 (total: 1027)
+fuzz: elapsed: 27s, execs: 441513 (0/sec), new interesting: 8 (total: 1027)
+fuzz: elapsed: 30s, execs: 441513 (0/sec), new interesting: 8 (total: 1027)
+fuzz: elapsed: 31s, execs: 441513 (0/sec), new interesting: 8 (total: 1027)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.092s
+
+$ go test -fuzz=FuzzTcpProxyFilter -fuzztime=30s ./internal/filter/tcpproxy/
+[expected runtime log: `tcpproxy: dial cluster "c_dead": ... connection refused` — fuzz seed exercises the dial-failure error path; not a fuzz failure.]
+fuzz: elapsed: 0s, gathering baseline coverage: 0/540 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 486/540 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 540/540 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 430935 (143481/sec), new interesting: 0 (total: 540)
+fuzz: elapsed: 9s, execs: 885852 (151670/sec), new interesting: 0 (total: 540)
+fuzz: elapsed: 12s, execs: 1332126 (148723/sec), new interesting: 1 (total: 541)
+fuzz: elapsed: 15s, execs: 1760163 (142718/sec), new interesting: 1 (total: 541)
+fuzz: elapsed: 18s, execs: 2175902 (138454/sec), new interesting: 1 (total: 541)
+fuzz: elapsed: 21s, execs: 2573117 (132521/sec), new interesting: 1 (total: 541)
+fuzz: elapsed: 24s, execs: 2979389 (135389/sec), new interesting: 1 (total: 541)
+fuzz: elapsed: 27s, execs: 3385996 (135552/sec), new interesting: 2 (total: 542)
+fuzz: elapsed: 30s, execs: 3762508 (125516/sec), new interesting: 3 (total: 543)
+fuzz: elapsed: 31s, execs: 3762508 (0/sec), new interesting: 3 (total: 543)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.057s
+
+$ go test -fuzz=FuzzTLSContextParse -fuzztime=30s ./internal/tls/
+[expected log: `tls: tls_params: TLS-1.3-only cipher "TLS_AES_128_GCM_SHA256" requested; crypto/tls does not allow selection, dropping` — diagnostic per ADR-0030; not a fuzz failure.]
+fuzz: elapsed: 0s, gathering baseline coverage: 0/653 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 653/653 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 131394 (43790/sec), new interesting: 0 (total: 653)
+fuzz: elapsed: 6s, execs: 649113 (172605/sec), new interesting: 2 (total: 655)
+fuzz: elapsed: 9s, execs: 903707 (84808/sec), new interesting: 2 (total: 655)
+fuzz: elapsed: 12s, execs: 1047213 (47853/sec), new interesting: 2 (total: 655)
+fuzz: elapsed: 15s, execs: 1133564 (28787/sec), new interesting: 2 (total: 655)
+fuzz: elapsed: 18s, execs: 1180744 (15727/sec), new interesting: 2 (total: 655)
+fuzz: elapsed: 21s, execs: 2607374 (475557/sec), new interesting: 5 (total: 658)
+fuzz: elapsed: 24s, execs: 3074409 (155670/sec), new interesting: 6 (total: 659)
+fuzz: elapsed: 27s, execs: 3315599 (80396/sec), new interesting: 6 (total: 659)
+fuzz: elapsed: 30s, execs: 3559942 (81460/sec), new interesting: 6 (total: 659)
+fuzz: elapsed: 31s, execs: 3559942 (0/sec), new interesting: 6 (total: 659)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.083s
+
+$ go test -fuzz=FuzzHCMConfigParse -fuzztime=30s ./internal/filter/hcm/
+[expected log: `hcm: h2: h2: PROTOCOL_ERROR: short preface: EOF` — diagnostic from ALPN-negotiated h2 path with empty preface; not a fuzz failure.]
+fuzz: elapsed: 0s, gathering baseline coverage: 0/506 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 388/506 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 506/506 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 294986 (98176/sec), new interesting: 0 (total: 506)
+fuzz: elapsed: 9s, execs: 686840 (130652/sec), new interesting: 0 (total: 506)
+fuzz: elapsed: 12s, execs: 1071479 (128174/sec), new interesting: 0 (total: 506)
+fuzz: elapsed: 15s, execs: 1443010 (123872/sec), new interesting: 0 (total: 506)
+fuzz: elapsed: 18s, execs: 1778660 (111861/sec), new interesting: 0 (total: 506)
+fuzz: elapsed: 21s, execs: 2088366 (103195/sec), new interesting: 0 (total: 506)
+fuzz: elapsed: 24s, execs: 2537246 (149693/sec), new interesting: 2 (total: 508)
+fuzz: elapsed: 27s, execs: 2845218 (102652/sec), new interesting: 2 (total: 508)
+fuzz: elapsed: 30s, execs: 3169605 (108158/sec), new interesting: 2 (total: 508)
+fuzz: elapsed: 31s, execs: 3169605 (0/sec), new interesting: 2 (total: 508)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.253s
+```
+
+All 6 fuzzers PASS. Per-fuzzer exec counts: `FuzzFrameStream` 14,093,104, `FuzzHPACKDecode` 2,614,876, `FuzzBootstrapLoad` 441,513, `FuzzTcpProxyFilter` 3,762,508, `FuzzTLSContextParse` 3,559,942, `FuzzHCMConfigParse` 3,169,605. Per ADR-0018 fuzz-corpus discipline: `git status --porcelain` reports only the deliberate `M internal/filter/hcm/h2/client_test.go` (the deadline-extension fix) — no `testdata/fuzz/` pollution from any of the six runs.
+
+**Gate (e) — vet + lint + race + boundary checks:**
+
+```
+$ go vet ./...
+$ # exit 0
+```
+
+```
+$ golangci-lint run ./...
+$ # exit 0
+```
+
+```
+$ go test -count=1 -race ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.948s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.058s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.038s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.043s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.253s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.502s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.030s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.038s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.087s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.145s
+ok  	github.com/esalaine/envoy-go/test/differential	9.240s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.017s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.017s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.010s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.017s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.029s
+```
+
+**Race-flake stability — focused 10x sweep on the formerly-flaky test (post-deadline-extension):**
+
+```
+$ for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== run $i ==="; go test -count=1 -race -timeout=120s -run TestClientConn_RoundTrip_PeerDataAfterEndStream ./internal/filter/hcm/h2/ 2>&1 | tail -2; done
+=== run 1 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.107s
+=== run 2 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.107s
+=== run 3 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.127s
+=== run 4 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.107s
+=== run 5 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.107s
+=== run 6 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.128s
+=== run 7 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.107s
+=== run 8 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.108s
+=== run 9 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	6.010s
+=== run 10 ===
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.108s
+```
+
+10/10 PASS. Run 9 used 6s (validating that the previous 2s deadline was indeed too tight under -race load — the rogue-frame write took ~6s here). The 10s deadline absorbs scheduler hiccups without hiding genuine regressions.
+
+**ADR-0046 boundary grep (production imports of `golang.org/x/net/http2` outside the 5 allowed files):**
+
+```
+$ grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go' | grep -v 'internal/filter/hcm/h2/framer.go\|internal/filter/hcm/h2/hpack.go\|internal/filter/hcm/h2/settings.go\|internal/filter/hcm/h2/conn.go\|internal/filter/hcm/h2/client.go'
+$ # empty
+```
+
+Empty — every production import is in the 5 allowed files (framer.go / hpack.go / settings.go / conn.go / client.go; the latter NEW in 05.2 per ADR-0048's forward-looking note).
+
+**ADR-0048 client.go presence (now landed in 05.2 per Tasks 7-8):**
+
+```
+$ ls internal/filter/hcm/h2/client.go
+internal/filter/hcm/h2/client.go
+```
+
+File present.
+
+**Forbidden-runtime-imports grep (no production code may use `http2.Server`/`http2.Transport`/`http2.ConfigureServer`):**
+
+```
+$ grep -nR 'http2\.Server\|http2\.Transport\|http2\.ConfigureServer' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go'
+internal/filter/hcm/h2/doc.go:22:// What this package does NOT do: it does NOT use http2.Server,
+internal/filter/hcm/h2/doc.go:23:// http2.Server.ServeConn, http2.ConfigureServer, http2.Transport, or
+internal/filter/hcm/h2/doc.go:24:// http2.Transport.NewClientConn. The connection lifecycle is driven explicitly
+```
+
+All 3 hits are doc.go text mentions in the package's prohibition statement (tolerable per the 05.1 REVIEW's existing acceptance). No production-code uses of these forbidden APIs.
+
+**Step 8 — STATE.md advanced to lifecycle-state 4** with `next-skill: superpowers:verification-before-completion` and `next-skill-scope` enumerating all six gates per BOOTSTRAP §7.5 / SPEC §3.
+
+**Step 9 — ROADMAP.md NOT modified at this commit** per BOOTSTRAP §5 step 6 (phase-done lives at lifecycle-state 6 — REVIEW session). Row 05.2 + parent row 05 stay `in-progress`; the phase-done commit at lifecycle-state 6 will flip both rows on the same commit per 05.2 SPEC §4.4 + PLAN Task 15's "Refinement" note.
+
+**Final ADR tail:**
+```
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0057: Closes ADR-0035 H/2 leg via fixture 0004's full-stack HTTPS h2
+```
+
+No new ADR added by Task 15 — the in-place edit of `## HTTP/2` is the supersession-free mechanism authorised by ADR-0052.

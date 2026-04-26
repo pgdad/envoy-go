@@ -38,10 +38,10 @@ The allow-list enumerates response headers whose values are permitted to differ 
 | `x-forwarded-*` | Routed-to-upstream HTTP/1.1 responses | Every header with this prefix; presence-not-required on subject. | Phase 04 | ADR-0044 |
 | `x-request-id` | Routed-to-upstream HTTP/1.1 responses | Presence-not-required on subject. | Phase 04 | ADR-0044 |
 | `:status` | HCM-locally-generated H2 responses; required + value-asserted | Phase 05.1 | ADR-0052 |
-| `:method` | Routed-to-upstream H2 requests; required + value-asserted (applies-to: 05.2 routed-to-upstream H2) | Phase 05.1 | ADR-0052 |
-| `:path` | Routed-to-upstream H2 requests (applies-to: 05.2) | Phase 05.1 | ADR-0052 |
-| `:scheme` | Routed-to-upstream H2 requests (applies-to: 05.2) | Phase 05.1 | ADR-0052 |
-| `:authority` | Routed-to-upstream H2 requests (applies-to: 05.2) | Phase 05.1 | ADR-0052 |
+| `:method` | Routed-to-upstream H2 requests; required + value-asserted (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
+| `:path` | Routed-to-upstream H2 requests (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
+| `:scheme` | Routed-to-upstream H2 requests (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
+| `:authority` | Routed-to-upstream H2 requests (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
 
 ---
 
@@ -266,50 +266,57 @@ See the `## Header allow-list` table above, rows added by ADR-0044: `Server`, `C
 
 ## HTTP/2
 
-*Introduced by phase 05.1. Justified by ADR-0046 (codec source: x/net/http2.Framer + hpack), ADR-0047 (server settings defaults), ADR-0048 (server connection manager from scratch), ADR-0050 (ALPN dispatch wiring), ADR-0051 (h2spec threshold + pin), ADR-0052 (this subsection — SCAFFOLD form for 05.1).*
+*Introduced by phase 05.1. Justified by ADR-0046 (codec source: x/net/http2.Framer + hpack), ADR-0047 (server settings defaults), ADR-0048 (server connection manager from scratch), ADR-0050 (ALPN dispatch wiring), ADR-0051 (h2spec threshold + pin), ADR-0052 (this subsection — SCAFFOLD form for 05.1, in-place edited for 05.2).*
 
-Phase 05.1 introduces envoy-go's downstream HTTP/2 dataplane: ALPN-driven codec dispatch inside HCM `Filter.Handle`, a from-scratch server-side codec under `internal/filter/hcm/h2/` (`ServerConn` + `serverStream` + framer + hpack + flow + settings + preface + errors), the project's first non-vacuous conformance gate via `summerwind/h2spec` (per ADR-0051), and a codec-neutral `directResponseAction.body()` factoring that supports both H1 and H2 wire emission.
+*Extended by phase 05.2. Justified by ADR-0055 (flow-control discipline), ADR-0056 (per-request fresh upstream H2 dial), ADR-0057 (closes ADR-0035 H2 leg via fixture 0004), ADR-0058 (trailers observed but not forwarded; carry-forwards M-4 + M-10).*
 
-This subsection is **SCAFFOLD form** — phase 05.2's brainstorming session edits this subsection IN PLACE (per ADR-0052's authorisation) to flip the deferred-to-05.2 items to active rules when fixture 0004 lands.
+Phase 05.1 introduced envoy-go's downstream HTTP/2 dataplane; phase 05.2 closes the dataplane on the upstream side: cluster-side HttpProtocolOptions parsing, Cluster.DialH2 + ClientConn + RoundTrip, routerActionH2 action variant, and the project's first full-stack HTTPS h2 differential fixture (0004-h2-routing) closing ADR-0035 H2 leg. The flow-control discipline tightening per ADR-0055 makes the codec primitives load-bearing for realistic H2 workloads.
 
-### Asserted equivalence (05.1 scope)
+### Asserted equivalence (05.1 + 05.2 scope)
 
-- **Conformance, not differential.** The 05.1 H2 surface is asserted via h2spec against the subject standalone, not via a side-by-side proxy-vs-proxy fixture. The differential equivalence of the `direct_response` H2 path (status, decoded body, header set-equality, framing structure) is exercised indirectly through h2spec section 8 (HTTP Message Exchanges).
-- **`:status` per request:** required + asserted by h2spec section 8 on every `direct_response` invocation.
-- **Decoded body bytes** on `direct_response` 2xx paths: byte-equal to the configured `body` string (h2spec validates indirectly via response-length and END_STREAM checks; envoy-go's hcm-package unit tests assert byte equality on the captured DATA payload via a fake StreamWriter — see `actions_test.go` `TestDirectResponseWriteH2_HEADERSThenDATAEndStream`).
-- **Per-stream response header set-equality modulo allow-list:** locally-generated H2 responses carry `:status` (required + asserted), `Server` (required, value `envoy` per ADR-0014, matched verbatim with upstream's value also `envoy`), `Content-Type`, `Content-Length`, `Date` (presence required; value not byte-compared — same as phase-01 admin/ready discipline). Routed-to-upstream H2 surface: NOT YET ASSERTED IN 05.1 (deferred to 05.2 + fixture 0004).
+- `:status` per request: required + asserted on every fixture-0004 request (h2spec section 8 covers indirect coverage on the codec; fixture-0004 covers the full proxy+upstream surface).
+- Decoded body bytes on `direct_response` 2xx paths: byte-equal to the configured body string. Witnessed by fixture 0004's 9 `/health` requests on both sides + envoy-go's hcm-package unit tests.
+- Per-stream response header set-equality modulo allow-list: `:status` (required + asserted), `Server` (matched verbatim with upstream's `envoy` per ADR-0014), `Content-Type`, `Content-Length`, `Date` (presence required; value not byte-compared). NEW (05.2): routed-to-upstream H2 responses now in scope — `:status` required + asserted; `Server`/`Content-Type`/`Content-Length`/`Date` headers from the upstream backend forwarded verbatim (no router-injected headers); the per-stream response header set-equality between sides asserted modulo the same allow-list.
+- NEW (05.2): routed-to-upstream H2 request preservation — `:method`/`:path`/`:scheme`/`:authority` forwarded verbatim from downstream to upstream (witnessed by the in-process backend in fixture 0004's tests asserting on received pseudo-headers). The path normalisation discussed in master phase-05 SPEC §5.7 is empty on the H2 side (the path is the bytes of the `:path` pseudo-header — there's no stdlib net/http parsing to inject normalisations).
+- NEW (05.2): route-match selection equivalence on H2 — same method + path → same matched route on both proxies (witnessed indirectly by per-side `[3,3,3]` distribution + `:status` per request).
+- NEW (05.2): per-cluster RR distribution `[3, 3, 3]` per side over the 9 router-action requests (local-correctness; cross-side sequence is NOT asserted, mirroring phase-04's relaxation per ADR-K extended to H2).
+- NEW (05.2): ALPN selection equivalence at the differential level — a downstream client advertising only `h2` reaches the H2 driver on both proxies (witnessed by fixture 0004's `:status 200` on every routed response).
 
-### Not asserted (05.1 scope)
+### Not asserted (05.1 + 05.2 scope)
 
-- Wire-byte H2 framing (frame headers, frame ordering at byte level, padding bytes, HPACK encoded-bytes representation). Frame *types* and *types-on-equivalent-events* are required to match (verified via h2spec section 6); frame *byte-equivalence* is not.
-- SETTINGS values byte-for-byte (h2spec section 6.5 only validates RFC 9113 compliance, not Envoy-specific values).
-- WINDOW_UPDATE timing or count.
-- Stream id allocation pattern.
-- Trailers (per phase-05.1 trailer rule + 05.2's deferred ADR).
-- 0-RTT TLS early-data behaviour.
-- **Routed-to-upstream H2 request preservation, decoded body equivalence on routed-to-upstream paths, per-cluster RR distribution on H2, ALPN selection equivalence at the differential level** — ALL DEFERRED TO 05.2.
+- Wire-byte H2 framing — unchanged from 05.1.
+- SETTINGS values byte-for-byte — unchanged from 05.1.
+- WINDOW_UPDATE timing or count — unchanged from 05.1; ADR-0055's tightening adds frame counts that depend on body size and peer window behaviour, which are inherently non-deterministic across the two proxies.
+- Stream id allocation pattern — unchanged from 05.1.
+- Trailers — observed but not forwarded per ADR-0058 (formalises the upstream-side discard rule; the 05.1 server-side rule was already trailers-not-forwarded).
+- 0-RTT TLS early-data behaviour — unchanged from 05.1.
+- NEW (05.2): connection re-use upstream (per ADR-0056) — Envoy pools, envoy-go does not; both produce the same per-request `:status`/body output; cross-conn frame counts differ.
+- NEW (05.2): cross-side request body bytes for routed-to-upstream requests (mirror of phase-04's ADR-K relaxation extended to H2) — fixture 0004's 9 `/api` request bodies are bodyless GETs, so this rule is unexercised in 05.2; carried forward as the rule for any future POST/PUT-bearing fixture.
 
 ### Header allow-list extensions
 
-See the `## Header allow-list` table above, rows added by ADR-0052: `:status` (active in 05.1; locally-generated H2 responses), `:method`/`:path`/`:scheme`/`:authority` (forward-looking, applies-to: 05.2 routed-to-upstream H2). The 05.1 scaffold inserts the rows so 05.2's brainstorming has nothing to add to the table itself; only the "applies-to" cells flip when fixture 0004 lands.
+See the `## Header allow-list` table above. Rows added by ADR-0052: `:status` (active in 05.1; locally-generated H2 responses), `:method`/`:path`/`:scheme`/`:authority` — phase 05.2 flips the latter four rows from "applies-to: phase 05.2 (forward-looking)" to **"applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)"**.
 
 ### h2spec threshold
 
 Sections 3, 4, 5, 6 (excluding 6.6 PUSH_PROMISE), 7, 8 — all `failed == 0`. Pin: `summerwind/h2spec` at the SHA recorded in `CONFORMANCE_PINS.md` per ADR-0051.
 
-### Applies to (05.1)
+**ADR-0055 prose extension (phase 05.2):** the from-scratch H2 codec respects `MaxFrameSize` chunking on outbound DATA, per-stream send-window enforcement, inbound WINDOW_UPDATE emission on a half-window high-water threshold, and overflow bounds-checks on WINDOW_UPDATE deltas. These properties are validated by the regression unit tests (per phase-05.2 PLAN Tasks 2-5) and by the existing h2spec section 5/6 coverage at the pinned SHA; no new section requirements are added.
 
-- Phase-05.1 envoy-go `internal/filter/hcm/h2/` package (server-side only).
-- The codec-neutral `directResponseAction` factoring in `internal/filter/hcm/actions.go` (per SPEC §5.5).
-- The conformance suite under `test/conformance/h2spec/`.
+### Applies to (05.1 + 05.2)
+
+- Phase-05.1: `internal/filter/hcm/h2/` server-side codec (unchanged); the codec-neutral `directResponseAction` factoring; the `--allow-h2c` test-only flag; the conformance suite under `test/conformance/h2spec/`.
+- Phase-05.2: `internal/filter/hcm/h2/client.go` (`ClientConn` + `RoundTrip` + `Close`); `internal/cluster/dial_h2.go`; `internal/cluster/manager.go HttpProtocolOptions` reader + validation; `Cluster.UseH2()` accessor; `routerActionH2` action variant in `internal/filter/hcm/actions.go`; fixture `0004-h2-routing` (full-stack HTTPS h2); `test/helpers/h2.go H2RoundTrip` helper.
 
 ### Does not yet apply to
 
-- Routed-to-upstream H2 (05.2 + fixture 0004 — closes ADR-0035 H2 leg).
 - HTTP/3 (later).
 - Server push (out of scope permanently in 05.1; potentially out of scope project-wide).
 - gRPC framing.
-- Trailer forwarding (deferred to phase 07 framework + gRPC family).
-- Upstream H2 stream pooling (upstream-robustness family).
-- h2c production fixtures (test-only path; production builds may strip the `--allow-h2c` flag in a future doctrine-cleanup phase).
+- Trailer forwarding (deferred to phase 07 framework + gRPC family per ADR-0058).
+- Upstream H2 stream pooling (upstream-robustness family per ADR-0056).
+- h2c production fixtures (test-only path).
 - mTLS over h2 (deferred).
+- Mixed-codec clusters (a single cluster used by both H1 and H2 listeners — load-balancing family or a future phase explicitly adding mixed-codec clusters).
+
+(REMOVED from this list — now active: routed-to-upstream H2 → active per ADR-0057; fixture 0004 → active per phase-05.2 Task 14.)

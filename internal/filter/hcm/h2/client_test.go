@@ -768,8 +768,15 @@ func TestClientConn_RoundTrip_PeerDataAfterEndStream(t *testing.T) {
 		t.Fatalf("peer: %v", err)
 	}
 	// After the rogue DATA frame the readLoop should cancel cc.ctx. Wait up
-	// to 2s for the cancellation to propagate.
-	deadline := time.Now().Add(2 * time.Second)
+	// to 10s for the cancellation to propagate. The previous 2s deadline
+	// occasionally flaked (~1-in-7) under -race on a 32-core box because
+	// the peer-side 100ms sleep + scheduler jitter under race-detector load
+	// could push the rogue-frame write past 2s. The cancel itself is fast
+	// (microseconds once the readLoop sees the frame); a 10s deadline is
+	// generous enough to absorb GC pauses + scheduler hiccups without
+	// hiding genuine regressions, since under no-bug the loop typically
+	// exits within tens of milliseconds.
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if cc.ctx.Err() != nil {
 			break
