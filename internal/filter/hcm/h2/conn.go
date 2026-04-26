@@ -34,7 +34,6 @@ type ServerConn struct {
 	clientS       clientSettings
 	goawaySent    bool
 	peerGoaway    bool // true after receiving GOAWAY from client; stop accepting new streams
-	hpackBlocked  bool // true when we're mid-header-block (between HEADERS and END_HEADERS)
 	// doneCh is used by dispatch goroutines to notify the frame loop when a
 	// stream has been fully handled.  The frame loop drains doneCh before each
 	// MAX_CONCURRENT_STREAMS admission check so that s.streams accurately
@@ -224,29 +223,13 @@ func (s *ServerConn) flushPendingDispatch() {
 
 // dispatchFrame routes a single frame to the appropriate handler.
 func (s *ServerConn) dispatchFrame(frame http2.Frame) error {
-	// RFC 9113 §4.3: once we are inside a header block (HEADERS without
-	// END_HEADERS), the only valid next frame is CONTINUATION on the same stream.
-	// Any other frame is a connection error of type PROTOCOL_ERROR.
-	// Note: golang.org/x/net/http2.Framer handles this internally when
-	// ReadMetaHeaders is used, but since we use ReadFrame we must enforce it.
-	// In practice, the x/net framer's ReadFrame raises a ConnectionError if a
-	// non-CONTINUATION frame arrives mid-block, which we translate to *Error in
-	// readFrameCtx. So this guard is belt-and-suspenders for frames the framer
-	// doesn't detect (e.g. PRIORITY during CONTINUATION sequence).
-	if s.hpackBlocked {
-		if _, ok := frame.(*http2.ContinuationFrame); !ok {
-			return connError(ErrProtocolError, "non-CONTINUATION frame while header block open")
-		}
-	}
-
 	switch f := frame.(type) {
 	case *http2.HeadersFrame:
 		return s.onHeaders(f)
 	case *http2.ContinuationFrame:
 		// Handled by framer as part of ReadMetaHeaders; reaching here means the
 		// framer gave us a raw ContinuationFrame (shouldn't happen in normal usage,
-		// but be safe and ignore / clear the block flag).
-		s.hpackBlocked = false
+		// but be safe and ignore).
 		return nil
 	case *http2.DataFrame:
 		return s.onData(f)
