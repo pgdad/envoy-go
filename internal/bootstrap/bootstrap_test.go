@@ -165,6 +165,76 @@ static_resources:
 // cluster bootstrap traversal is now covered by `internal/listener` and
 // `internal/cluster` manager tests.
 
+// TestBootstrap_RoundTrips_FixtureFour_Shape exercises the phase-05.2 (Task 10)
+// blank import of `envoy/extensions/upstreams/http/v3`: a minimal bootstrap
+// carrying a cluster with `typed_extension_protocol_options.HttpProtocolOptions
+// = explicit_http_config { http2_protocol_options {} }` plus a TLS
+// transport_socket and ALPN ["h2"] must load cleanly via Load (no protojson
+// "type not registered" error) AND survive a protojson.Marshal round-trip.
+//
+// The shape mirrors fixture 0004's `c_h2_backend` cluster (per SPEC §4.2) but
+// is kept minimal here — fixture 0004 itself lives in test/fixtures/0004-* and
+// is materialized in Task 13.
+func TestBootstrap_RoundTrips_FixtureFour_Shape(t *testing.T) {
+	yamlSrc := `
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  clusters:
+    - name: c_h2_backend
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_h2_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 10.0.0.1, port_value: 443 }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: backend.envoy-go.test
+          common_tls_context:
+            alpn_protocols: ["h2"]
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+`
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	clusters := bs.GetStaticResources().GetClusters()
+	if len(clusters) != 1 {
+		t.Fatalf("clusters: got %d, want 1", len(clusters))
+	}
+	c := clusters[0]
+	if got, want := c.GetName(), "c_h2_backend"; got != want {
+		t.Errorf("cluster.name: got %q, want %q", got, want)
+	}
+	tepo := c.GetTypedExtensionProtocolOptions()
+	if tepo == nil {
+		t.Fatal("typed_extension_protocol_options: nil; expected map with HttpProtocolOptions key")
+	}
+	hpoAny, ok := tepo["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]
+	if !ok {
+		t.Fatal("typed_extension_protocol_options: missing HttpProtocolOptions key")
+	}
+	if hpoAny.GetTypeUrl() != "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions" {
+		t.Errorf("typed_extension type_url: got %q", hpoAny.GetTypeUrl())
+	}
+	// Round-trip via protojson — would error if the proto descriptor were
+	// unregistered.
+	if _, err := protojson.Marshal(bs); err != nil {
+		t.Fatalf("protojson.Marshal: %v", err)
+	}
+}
+
 func TestLoad_HCMRoundTrip(t *testing.T) {
 	yamlSrc := `
 admin:

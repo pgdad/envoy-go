@@ -1,11 +1,13 @@
 package cluster
 
 import (
+	stdtls "crypto/tls"
 	"fmt"
 
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 
 	internaltls "github.com/esalaine/envoy-go/internal/tls"
 )
@@ -14,6 +16,12 @@ import (
 // UpstreamTlsContext. Declared locally to avoid adding an exported symbol to
 // internal/tls just for this comparison.
 const upstreamTLSContextTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext"
+
+// httpProtocolOptionsKey is the well-known key under which the cluster-side
+// HttpProtocolOptions extension lives in
+// cluster.typed_extension_protocol_options. The Envoy proto authoritatively
+// reserves this key on the v3 cluster surface; see SPEC §5.5.
+const httpProtocolOptionsKey = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions"
 
 // Manager owns every Cluster materialized from static_resources.clusters[].
 // Get is the dataplane-side lookup the TCP proxy filter uses to resolve a
@@ -120,7 +128,91 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 		}
 		cl.upstreamCfg = uc.TLSConfig
 	}
+	// Phase 05.2 (Task 10, SPEC §5.5): read typed_extension_protocol_options for
+	// HttpProtocolOptions and decide whether this cluster originates H2 upstream.
+	useH2, err := extractH2Mode(c, cl.upstreamCfg)
+	if err != nil {
+		return nil, err
+	}
+	cl.useH2 = useH2
 	return cl, nil
+}
+
+// extractH2Mode reads the cluster's typed_extension_protocol_options and
+// returns whether to enable H2 upstream origination. Per SPEC §5.5's behavior
+// matrix:
+//   - field absent → false (phase-04 baseline; no regression)
+//   - explicit_http_config.http2_protocol_options{} → true (validated; build-time TLS+ALPN check)
+//   - explicit_http_config.http_protocol_options{} → false (silent-ignore inner)
+//   - auto_config{} → false (the 05.2 narrowing of master SPEC §5.8)
+//   - nil/empty UpstreamProtocolOptions → false (defensive)
+//
+// When useH2==true: the cluster's transport_socket MUST be present, MUST be
+// type tls, and the parsed TLS config's alpn_protocols MUST include "h2".
+// Validation errors carry the diagnostics enumerated in SPEC §4.1.
+//
+// parsedTLS is the *stdtls.Config produced by internal/tls.NewUpstreamConfig
+// from the cluster's transport_socket; its NextProtos field is populated from
+// CommonTlsContext.alpn_protocols. Pass nil for plaintext clusters; the
+// transport_socket-required validation will surface the diagnostic.
+func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, err error) {
+	tepo := c.GetTypedExtensionProtocolOptions()
+	if tepo == nil {
+		return false, nil
+	}
+	any, ok := tepo[httpProtocolOptionsKey]
+	if !ok {
+		return false, nil
+	}
+	var hpo upstreamshttpv3.HttpProtocolOptions
+	if err := any.UnmarshalTo(&hpo); err != nil {
+		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions: unmarshal: %w", c.GetName(), err)
+	}
+	switch up := hpo.UpstreamProtocolOptions.(type) {
+	case *upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_:
+		switch up.ExplicitHttpConfig.GetProtocolConfig().(type) {
+		case *upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions:
+			useH2 = true
+		default:
+			useH2 = false // H1 discriminator: silent-ignore inner.
+		}
+	case *upstreamshttpv3.HttpProtocolOptions_AutoConfig:
+		useH2 = false // The 05.2 narrowing of master SPEC §5.8 (silent-ignore).
+	default:
+		useH2 = false // Defensive: nil / use_downstream_protocol_config / etc.
+	}
+	if !useH2 {
+		return false, nil
+	}
+	// Validate transport_socket + ALPN.
+	ts := c.GetTransportSocket()
+	if ts == nil {
+		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket", c.GetName())
+	}
+	if ts.GetTypedConfig() == nil {
+		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket of type tls, got transport_socket without typed_config", c.GetName())
+	}
+	if tu := ts.GetTypedConfig().GetTypeUrl(); tu != upstreamTLSContextTypeURL {
+		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket of type tls, got %q", c.GetName(), tu)
+	}
+	if parsedTLS == nil {
+		// transport_socket present but TLS parsing returned nil — internal
+		// invariant. The earlier transport_socket parse path always sets
+		// cl.upstreamCfg non-nil for the UpstreamTlsContext type_url, so this
+		// branch is defense-in-depth.
+		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options: TLS parse returned nil", c.GetName())
+	}
+	hasH2 := false
+	for _, alpn := range parsedTLS.NextProtos {
+		if alpn == "h2" {
+			hasH2 = true
+			break
+		}
+	}
+	if !hasH2 {
+		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires alpn_protocols to include %q, got %v", c.GetName(), "h2", parsedTLS.NextProtos)
+	}
+	return true, nil
 }
 
 func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) ([]Endpoint, error) {

@@ -11,6 +11,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -348,6 +349,238 @@ func TestNewManager_TLSCluster_MissingTrustedCA(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "trusted_ca") {
 		t.Errorf("error %q does not contain %q", err.Error(), "trusted_ca")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 05.2 — HttpProtocolOptions parsing (Task 10)
+// ---------------------------------------------------------------------------
+
+// mkHttpProtocolOptionsAny wraps an upstreamshttpv3.HttpProtocolOptions into
+// the anypb.Any that lives in cluster.typed_extension_protocol_options under
+// the well-known key.
+func mkHttpProtocolOptionsAny(t *testing.T, hpo *upstreamshttpv3.HttpProtocolOptions) *anypb.Any {
+	t.Helper()
+	a, err := anypb.New(hpo)
+	if err != nil {
+		t.Fatalf("anypb.New(HttpProtocolOptions): %v", err)
+	}
+	return a
+}
+
+// mkUpstreamTLSTransportSocketWithALPN is the variant of
+// mkUpstreamTLSTransportSocket that also sets alpn_protocols on the
+// CommonTlsContext.
+func mkUpstreamTLSTransportSocketWithALPN(t *testing.T, sni string, caPEM []byte, alpn []string) *corev3.TransportSocket {
+	t.Helper()
+	ctx := &tlsv3.UpstreamTlsContext{
+		Sni: sni,
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			AlpnProtocols: alpn,
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: &corev3.DataSource{
+						Specifier: &corev3.DataSource_InlineBytes{InlineBytes: caPEM},
+					},
+				},
+			},
+		},
+	}
+	anyMsg, err := anypb.New(ctx)
+	if err != nil {
+		t.Fatalf("anypb.New(UpstreamTlsContext): %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+	}
+}
+
+// hpoExplicitH2 returns an HttpProtocolOptions selecting the
+// explicit_http_config.http2_protocol_options{} discriminator (the active
+// 05.2 H2 path).
+func hpoExplicitH2() *upstreamshttpv3.HttpProtocolOptions {
+	return &upstreamshttpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{},
+			},
+		},
+	}
+}
+
+// hpoExplicitH1 returns an HttpProtocolOptions selecting the
+// explicit_http_config.http_protocol_options{} discriminator (the H1 path —
+// 05.2 silently honors the discriminator's H1 selection but ignores its
+// inner config).
+func hpoExplicitH1() *upstreamshttpv3.HttpProtocolOptions {
+	return &upstreamshttpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_HttpProtocolOptions{},
+			},
+		},
+	}
+}
+
+// hpoAutoConfig returns an HttpProtocolOptions selecting the auto_config
+// branch (which the 05.2 SPEC narrows to silent-ignore per §5.5).
+func hpoAutoConfig() *upstreamshttpv3.HttpProtocolOptions {
+	return &upstreamshttpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &upstreamshttpv3.HttpProtocolOptions_AutoConfig{
+			AutoConfig: &upstreamshttpv3.HttpProtocolOptions_AutoHttpConfig{},
+		},
+	}
+}
+
+func TestBuildCluster_H2Mode_Positive(t *testing.T) {
+	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+	c := mkStaticCluster("c_h2", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = mkUpstreamTLSTransportSocketWithALPN(t, "alpha.envoy-go.test", caPEM, []string{"h2"})
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+	}
+
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v", err)
+	}
+	got, ok := m.Get("c_h2")
+	if !ok {
+		t.Fatal("cluster c_h2 not found")
+	}
+	if !got.UseH2() {
+		t.Error("UseH2() = false, want true")
+	}
+}
+
+func TestBuildCluster_H2Mode_NoTLS(t *testing.T) {
+	c := mkStaticCluster("c_h2_no_tls", mkLbEndpoint("10.0.0.1", 443))
+	// No TransportSocket.
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+	}
+	_, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires transport_socket") {
+		t.Errorf("error %q does not contain %q", err.Error(), "requires transport_socket")
+	}
+}
+
+func TestBuildCluster_H2Mode_TLSWithoutALPNH2(t *testing.T) {
+	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+	c := mkStaticCluster("c_h2_alpn_mismatch", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = mkUpstreamTLSTransportSocketWithALPN(t, "alpha.envoy-go.test", caPEM, []string{"http/1.1"})
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+	}
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "alpn_protocols to include") {
+		t.Errorf("error %q does not contain %q", err.Error(), "alpn_protocols to include")
+	}
+	if !strings.Contains(err.Error(), `"h2"`) {
+		t.Errorf("error %q does not mention %q", err.Error(), `"h2"`)
+	}
+}
+
+func TestBuildCluster_H2Mode_TLSWithoutALPN(t *testing.T) {
+	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+	c := mkStaticCluster("c_h2_no_alpn", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = mkUpstreamTLSTransportSocketWithALPN(t, "alpha.envoy-go.test", caPEM, nil)
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+	}
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "alpn_protocols to include") {
+		t.Errorf("error %q does not contain %q", err.Error(), "alpn_protocols to include")
+	}
+}
+
+func TestBuildCluster_H1Discriminator_SilentIgnore(t *testing.T) {
+	c := mkStaticCluster("c_h1", mkLbEndpoint("10.0.0.1", 8080))
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH1()),
+	}
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v", err)
+	}
+	got, ok := m.Get("c_h1")
+	if !ok {
+		t.Fatal("cluster c_h1 not found")
+	}
+	if got.UseH2() {
+		t.Error("UseH2() = true, want false (H1 discriminator → silent-ignore)")
+	}
+}
+
+func TestBuildCluster_AutoConfig_SilentIgnore(t *testing.T) {
+	c := mkStaticCluster("c_auto", mkLbEndpoint("10.0.0.1", 8080))
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoAutoConfig()),
+	}
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v (auto_config must be silently ignored at 05.2)", err)
+	}
+	got, ok := m.Get("c_auto")
+	if !ok {
+		t.Fatal("cluster c_auto not found")
+	}
+	if got.UseH2() {
+		t.Error("UseH2() = true, want false (auto_config → 05.2 silent-ignore narrowing)")
+	}
+}
+
+func TestBuildCluster_NoTypedExtension_BaselineFalse(t *testing.T) {
+	c := mkStaticCluster("c_baseline", mkLbEndpoint("10.0.0.1", 8080))
+	// No TypedExtensionProtocolOptions map.
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v", err)
+	}
+	got, ok := m.Get("c_baseline")
+	if !ok {
+		t.Fatal("cluster c_baseline not found")
+	}
+	if got.UseH2() {
+		t.Error("UseH2() = true, want false (no typed_extension → phase-04 baseline)")
+	}
+}
+
+func TestBuildCluster_HttpProtocolOptions_NilUpstreamProtocolOptions(t *testing.T) {
+	c := mkStaticCluster("c_empty_hpo", mkLbEndpoint("10.0.0.1", 8080))
+	// Empty HttpProtocolOptions{} — no UpstreamProtocolOptions oneof set.
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, &upstreamshttpv3.HttpProtocolOptions{}),
+	}
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v (empty HttpProtocolOptions must build cleanly)", err)
+	}
+	got, ok := m.Get("c_empty_hpo")
+	if !ok {
+		t.Fatal("cluster c_empty_hpo not found")
+	}
+	if got.UseH2() {
+		t.Error("UseH2() = true, want false (nil UpstreamProtocolOptions → defensive false)")
 	}
 }
 

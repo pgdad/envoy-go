@@ -708,3 +708,74 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -2
 ## ADR-0056: Per-request fresh upstream H2 dial
 $ # ADR tail advanced 0055 → 0056 as expected
 ```
+
+## Task 10 — `internal/cluster/manager.go` HttpProtocolOptions parsing + `internal/bootstrap/bootstrap.go` blank import
+
+**Commits:** TBD (SHA-fill: see next commit)
+**Files changed:**
+- `internal/cluster/manager.go` — Added `extractH2Mode(c, parsedTLS)` helper that reads `c.GetTypedExtensionProtocolOptions()["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]`, unmarshals into `*upstreamshttpv3.HttpProtocolOptions`, and returns `(useH2 bool, err error)` per SPEC §5.5's behavior matrix: field absent → false; `*ExplicitHttpConfig_` with inner `*ExplicitHttpConfig_Http2ProtocolOptions` → true (validated); inner `*ExplicitHttpConfig_HttpProtocolOptions` (the H1 discriminator) → false (silent-ignore inner); `*HttpProtocolOptions_AutoConfig` → false (the 05.2 narrowing of master SPEC §5.8 per SPEC §5.5); nil/empty → false. When useH2==true, validates `c.TransportSocket` non-nil + `typed_config` non-nil + type_url == upstream TLS context + parsedTLS.NextProtos contains "h2". Wired into `buildCluster` after the existing transport_socket parse so `cl.upstreamCfg` is the `*stdtls.Config` passed to `extractH2Mode`. Added blank import path verified (already present in `cluster.go` from Task 9). Added `httpProtocolOptionsKey` const. New imports: `crypto/tls` (for the `*stdtls.Config` parameter type) and `upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"`. +94 LoC.
+- `internal/cluster/manager_test.go` — Added 8 tests covering the §5.5 behavior matrix + 3 helpers (`mkHttpProtocolOptionsAny`, `mkUpstreamTLSTransportSocketWithALPN`, `hpoExplicitH2`/`hpoExplicitH1`/`hpoAutoConfig`). The H2-mode positive test reuses `test/fixtures/0002-tls-tcp/pki/ca.pem` for the inline trusted_ca + sets `alpn_protocols: ["h2"]` on the CommonTlsContext. The TLSWithoutALPN variant passes `alpn=nil` (the TLS parser accepts an absent alpn_protocols). +203 LoC.
+- `internal/bootstrap/bootstrap.go` — Added blank import for `_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"` to the existing import-group section so protojson round-trip in `Load` resolves the `type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions` Any type_url without "type not registered" errors. Per ADR-0016 amendment policy, the addition is documented in this PROGRESS entry, NOT a new ADR. The bootstrap-package-side import is required because `internal/bootstrap` does not import `internal/cluster` — the cluster.go-side blank import (added in Task 9) is sufficient for cluster-package callers but not for `Load(reader)` callers that work with raw bootstraps before passing to the cluster manager. Verified by temporarily removing the import and observing `bootstrap: protojson: ... unable to resolve "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions": "not found"`. +6 LoC.
+- `internal/bootstrap/bootstrap_test.go` — Added `TestBootstrap_RoundTrips_FixtureFour_Shape` which loads a minimal fixture-0004-shaped bootstrap (1 cluster with `transport_socket: tls`, `alpn_protocols: ["h2"]`, and `typed_extension_protocol_options.HttpProtocolOptions = {explicit_http_config: {http2_protocol_options: {}}}`) via `Load`, asserts the cluster carries the typed-extension key with the expected type_url, and re-marshals via `protojson.Marshal` to verify the round-trip is symmetric. +66 LoC.
+- `docs/envoy-go/phases/05.2-upstream-h2/PROGRESS.md` — this entry.
+
+**Notes:** TDD discipline observed: with `useH2` always-false in Task 9's wiring, all 4 H2-mode-positive/negative tests FAILED at Step 1 (`UseH2() = false, want true` + `expected error, got nil` × 3). The 4 silent-ignore tests (`H1Discriminator`, `AutoConfig`, `NoTypedExtension`, `NilUpstreamProtocolOptions`) PASSED at Step 1 because UseH2's zero value is already false — the tests still validated that the new parser does NOT spuriously err on those inputs once it landed. After Step 2 wired `extractH2Mode` into `buildCluster`, all 8 PASS:
+
+```
+=== RUN   TestBuildCluster_H2Mode_Positive
+--- PASS: TestBuildCluster_H2Mode_Positive (0.00s)
+=== RUN   TestBuildCluster_H2Mode_NoTLS
+--- PASS: TestBuildCluster_H2Mode_NoTLS (0.00s)
+=== RUN   TestBuildCluster_H2Mode_TLSWithoutALPNH2
+--- PASS: TestBuildCluster_H2Mode_TLSWithoutALPNH2 (0.00s)
+=== RUN   TestBuildCluster_H2Mode_TLSWithoutALPN
+--- PASS: TestBuildCluster_H2Mode_TLSWithoutALPN (0.00s)
+=== RUN   TestBuildCluster_H1Discriminator_SilentIgnore
+--- PASS: TestBuildCluster_H1Discriminator_SilentIgnore (0.00s)
+=== RUN   TestBuildCluster_AutoConfig_SilentIgnore
+--- PASS: TestBuildCluster_AutoConfig_SilentIgnore (0.00s)
+=== RUN   TestBuildCluster_NoTypedExtension_BaselineFalse
+--- PASS: TestBuildCluster_NoTypedExtension_BaselineFalse (0.00s)
+=== RUN   TestBuildCluster_HttpProtocolOptions_NilUpstreamProtocolOptions
+--- PASS: TestBuildCluster_HttpProtocolOptions_NilUpstreamProtocolOptions (0.00s)
+```
+
+Symbol-rename divergence from the PLAN snippet (lines 1843-1917):
+- The PLAN's case wrapper `*upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig` is the inner *message* type, not the oneof *case wrapper*. The actual case-wrapper symbol is `*upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_` (trailing underscore) — verified via `go doc`. Implementation uses the trailing-underscore form.
+- The PLAN's `parsedTLS.ALPNProtocols` field is named `NextProtos` on `*crypto/tls.Config` (the standard library's ALPN field). The on-disk plumbing from `internal/tls.NewUpstreamConfig` populates `cfg.NextProtos = append(cfg.NextProtos, c.GetAlpnProtocols()...)` (config.go:174). Implementation reads `parsedTLS.NextProtos`.
+- The PLAN's `parseTransportSocket(c, baseDir)` is not yet a separate function on disk; the existing `buildCluster` inlines the transport_socket parse + sets `cl.upstreamCfg = uc.TLSConfig`. The implementation passes `cl.upstreamCfg` directly into `extractH2Mode` rather than refactor-extracting a `parseTransportSocket` helper — minimum-diff per D-3.6.
+
+Pitfall avoided: the bootstrap-package-side blank import is necessary even though cluster.go (Task 9) added the same import, because `internal/bootstrap` does not transitively import `internal/cluster` — `Load(reader)` callers need the registry populated for protojson to resolve the type_url, and protojson resolves via the *importing program's* registry, not the cluster-package's. Verified by the round-trip test failure when the bootstrap.go blank import was temporarily removed.
+
+The blank import addition follows ADR-0016's amendment policy — register-only blank imports are documented in PROGRESS, not as a new ADR. The phase-04 amendment shape (PROGRESS entry per fixture batch) is mirrored here. ADR tail is unchanged: still ADR-0056.
+
+**Outputs:**
+```
+$ go test ./internal/cluster/ -v -run TestBuildCluster_ -count=1
+[... 8 PASS lines as above ...]
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.005s
+
+$ go test ./internal/bootstrap/ -v -run TestBootstrap_RoundTrips_FixtureFour_Shape -count=1
+=== RUN   TestBootstrap_RoundTrips_FixtureFour_Shape
+--- PASS: TestBootstrap_RoundTrips_FixtureFour_Shape (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.006s
+
+$ go test -race ./internal/cluster/ ./internal/bootstrap/
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.030s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.030s
+
+$ go vet ./internal/cluster/ ./internal/bootstrap/
+$ # exit 0
+
+$ golangci-lint run ./internal/cluster/ ./internal/bootstrap/
+$ # exit 0
+
+$ go test -race ./...
+[... 26 packages, 0 FAIL ...]
+
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0056: Per-request fresh upstream H2 dial
+$ # ADR tail unchanged at 0056 (Task 10 lands no new ADR per ADR-0016 + SPEC §5.5)
+```

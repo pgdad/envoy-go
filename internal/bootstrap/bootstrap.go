@@ -20,6 +20,13 @@ import (
 	_ "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+
+	// Phase 05.2 (Task 10) registers the cluster-side HttpProtocolOptions
+	// extension proto so protojson round-trips fixture-0004's bootstraps
+	// (which carry typed_extension_protocol_options on the cluster) without
+	// interpreting typed_config. Per ADR-0016 amendment policy this addition
+	// is documented in PROGRESS, not as a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"gopkg.in/yaml.v3"
 )
