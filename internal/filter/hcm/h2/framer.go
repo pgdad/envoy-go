@@ -32,7 +32,7 @@ func newFramer(conn net.Conn, maxReadFrameSize uint32) *framer {
 	}
 }
 
-// readFrameCtx reads one frame, honouring ctx cancellation by setting a
+// readFrameCtx reads one frame, honoring ctx cancellation by setting a
 // short (50ms) read deadline on the underlying conn and re-checking ctx.Err()
 // after each timeout. http2.Framer.ReadFrame is otherwise blocking and not
 // ctx-aware; this method bridges the two via polling.

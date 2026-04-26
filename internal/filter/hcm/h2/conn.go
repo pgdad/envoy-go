@@ -27,20 +27,20 @@ type ServerConn struct {
 	hpack         *hpackState
 	sendW         *window
 	recvW         *window
-	mu              sync.Mutex
-	streams         map[uint32]*serverStream
-	closedStreams    map[uint32]struct{} // recently-closed stream IDs, for post-close validation
-	lastInID        uint32              // highest stream id seen from client (RFC 9113 §5.1.1 monotonic)
-	clientS         clientSettings
-	goawaySent      bool
-	peerGoaway      bool // true after receiving GOAWAY from client; stop accepting new streams
-	hpackBlocked    bool // true when we're mid-header-block (between HEADERS and END_HEADERS)
-	hpackBlockSID   uint32
+	mu            sync.Mutex
+	streams       map[uint32]*serverStream
+	closedStreams map[uint32]struct{} // recently-closed stream IDs, for post-close validation
+	lastInID      uint32              // highest stream id seen from client (RFC 9113 §5.1.1 monotonic)
+	clientS       clientSettings
+	goawaySent    bool
+	peerGoaway    bool // true after receiving GOAWAY from client; stop accepting new streams
+	hpackBlocked  bool // true when we're mid-header-block (between HEADERS and END_HEADERS)
+	hpackBlockSID uint32
 	// doneCh is used by dispatch goroutines to notify the frame loop when a
 	// stream has been fully handled.  The frame loop drains doneCh before each
 	// MAX_CONCURRENT_STREAMS admission check so that s.streams accurately
 	// reflects the number of in-flight streams at decision time.
-	doneCh          chan uint32
+	doneCh chan uint32
 	// pendingDispatch holds goroutine closures that should be launched after the
 	// current burst of frames is fully processed.  Deferring dispatch until the
 	// burst is drained guarantees that RST_STREAM(REFUSED_STREAM) for an
@@ -55,15 +55,15 @@ type ServerConn struct {
 // package provides the production implementation (h2dispatch.go).
 func NewServerConn(ctx context.Context, conn net.Conn, dispatcher Dispatcher, settings ServerSettings) *ServerConn {
 	return &ServerConn{
-		ctx:          ctx,
-		conn:         conn,
-		dispatcher:   dispatcher,
-		settings:     settings,
-		fr:           newFramer(conn, settings.MaxFrameSize),
-		hpack:        newHPACKState(settings.HeaderTableSize),
-		sendW:        newWindow(int32(settings.InitialWindowSize)),
-		recvW:        newWindow(int32(settings.InitialWindowSize)),
-		streams:      make(map[uint32]*serverStream),
+		ctx:           ctx,
+		conn:          conn,
+		dispatcher:    dispatcher,
+		settings:      settings,
+		fr:            newFramer(conn, settings.MaxFrameSize),
+		hpack:         newHPACKState(settings.HeaderTableSize),
+		sendW:         newWindow(int32(settings.InitialWindowSize)),
+		recvW:         newWindow(int32(settings.InitialWindowSize)),
+		streams:       make(map[uint32]*serverStream),
 		closedStreams: make(map[uint32]struct{}),
 		// Buffer size 256: at most MaxConcurrentStreams (default 100) goroutines
 		// can signal concurrently; extra headroom prevents blocking goroutines.
@@ -525,7 +525,7 @@ func (s *ServerConn) onRSTStream(f *http2.RSTStreamFrame) error {
 }
 
 // onGoaway handles an incoming GOAWAY frame from the client.
-// RFC 9113 §6.8: MUST NOT trigger special behaviour for unknown error codes.
+// RFC 9113 §6.8: MUST NOT trigger special behavior for unknown error codes.
 // We mark the connection so new streams are no longer accepted, but continue
 // processing existing frames (including PING ACKs) until the peer closes.
 // The frame loop will exit naturally on the subsequent EOF.
@@ -550,7 +550,7 @@ func (s *ServerConn) onPriority(f *http2.PriorityFrame) error {
 }
 
 // drainDone processes any pending goroutine-completion signals from doneCh.
-// It removes the signalled stream IDs from s.streams and adds them to
+// It removes the signaled stream IDs from s.streams and adds them to
 // s.closedStreams.  Must be called from the frame-loop goroutine only.
 //
 // Rationale: dispatch goroutines send to doneCh instead of directly
@@ -590,7 +590,7 @@ func (s *ServerConn) emitGoaway(code ErrCode) {
 
 // encodeAndWriteHeaders implements streamConn. Called from serverStream.WriteHeaders.
 func (s *ServerConn) encodeAndWriteHeaders(streamID uint32, headers []hpack.HeaderField, endStream bool) error {
-	// Serialise via the connection-level mutex to prevent interleaved frames.
+	// Serialize via the connection-level mutex to prevent interleaved frames.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	encoded := s.hpack.encodeHeaders(headers)
@@ -609,7 +609,7 @@ func (s *ServerConn) encodeAndWriteHeaders(streamID uint32, headers []hpack.Head
 // Respects the connection-level and stream-level send windows.
 func (s *ServerConn) writeData(streamID uint32, b []byte, endStream bool) error {
 	// For phase 05.1 we write the whole body in one or more DATA frames,
-	// waiting for send-window capacity before each write. We honour the
+	// waiting for send-window capacity before each write. We honor the
 	// connection-level window (s.sendW) but not per-stream windows for
 	// outgoing DATA (the stream's sendW is client-controlled; the per-stream
 	// window is replenished by incoming WINDOW_UPDATE for that stream ID).

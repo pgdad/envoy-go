@@ -43,7 +43,7 @@ type Action interface {
 // Dispatcher is the interface ServerConn uses to resolve an incoming request
 // to an Action. The hcm parent package provides h2Dispatcher; tests provide
 // fakes. Match returns (action, true) on a successful lookup (even if the
-// action is a 404-synthesising adapter — that is still ok=true). ok=false
+// action is a 404-synthesizing adapter — that is still ok=true). ok=false
 // signals a genuine match-engine failure → INTERNAL_ERROR RST_STREAM.
 type Dispatcher interface {
 	Match(req *http.Request) (Action, bool)
@@ -231,7 +231,7 @@ func (s *serverStream) WriteData(b []byte, endStream bool) error {
 //
 // The dispatch contract is uniform: always call action.WriteH2(s), then handle
 // any stream-scoped error. The Dispatcher adapter (h2dispatch.go in hcm
-// package) is responsible for synthesising 404 adapters on no-match and
+// package) is responsible for synthesizing 404 adapters on no-match and
 // INTERNAL_ERROR sentinels on router-action-on-H2 (SPEC §5.2 step 4c).
 func (s *serverStream) dispatch(ctx context.Context, dispatcher Dispatcher) {
 	// Snapshot the body buffer (dispatch happens after END_STREAM so the

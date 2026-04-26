@@ -7,6 +7,8 @@ import "fmt"
 // in error messages and (indirectly) in fuzz test assertions.
 type ErrCode uint32
 
+// ErrNoError and the other ErrCode constants are the HTTP/2 error codes
+// defined in RFC 9113 §7.
 const (
 	ErrNoError            ErrCode = 0x0
 	ErrProtocolError      ErrCode = 0x1

@@ -33,7 +33,7 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 		_ = downstream.Close()
 		return
 	}
-	defer downstream.Close()
+	defer func() { _ = downstream.Close() }()
 
 	switch f.codecType {
 	case hcmv3.HttpConnectionManager_HTTP1:

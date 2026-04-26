@@ -11,8 +11,8 @@ import (
 
 func TestFramer_SettingsRoundTrip(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	f1 := newFramer(c1, 16384)
 	f2 := newFramer(c2, 16384)
@@ -43,8 +43,8 @@ func TestFramer_SettingsRoundTrip(t *testing.T) {
 
 func TestFramer_PingRoundTrip(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	f1 := newFramer(c1, 16384)
 	f2 := newFramer(c2, 16384)
@@ -89,8 +89,8 @@ func TestFramer_PingRoundTrip(t *testing.T) {
 
 func TestFramer_HeadersRoundTrip(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	f1 := newFramer(c1, 16384)
 	f2 := newFramer(c2, 16384)
@@ -131,8 +131,8 @@ func TestFramer_HeadersRoundTrip(t *testing.T) {
 
 func TestFramer_DataRoundTrip(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	f1 := newFramer(c1, 16384)
 	f2 := newFramer(c2, 16384)
@@ -187,8 +187,8 @@ func TestFramer_DataRoundTrip(t *testing.T) {
 
 func TestFramer_RSTStreamWindowUpdateGoAway(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	f1 := newFramer(c1, 16384)
 	f2 := newFramer(c2, 16384)
@@ -267,8 +267,8 @@ func TestFramer_RSTStreamWindowUpdateGoAway(t *testing.T) {
 
 func TestFramer_ReadFrameCtxCancel(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 	f := newFramer(c1, 16384)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {

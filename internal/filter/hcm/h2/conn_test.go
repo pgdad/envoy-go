@@ -615,7 +615,7 @@ func TestServerConn_PriorityFrameSilentlyDiscarded(t *testing.T) {
 // TestServerConn_HPACKTableSizeUpdate_PropagatesToOutgoingHEADERS verifies
 // that after a client announces SETTINGS_HEADER_TABLE_SIZE=64, the server's
 // outgoing HEADERS for the next response is still correctly decodable on the
-// peer side (i.e., the table-size update was honoured).
+// peer side (i.e., the table-size update was honored).
 func TestServerConn_HPACKTableSizeUpdate_PropagatesToOutgoingHEADERS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -854,7 +854,7 @@ func TestServerConn_BadPrefaceClosesConnection(t *testing.T) {
 	}
 }
 
-// TestServerConn_CtxCancelEmitsGOAWAY verifies that cancelling the context
+// TestServerConn_CtxCancelEmitsGOAWAY verifies that canceling the context
 // causes the server to emit GOAWAY(NO_ERROR) to the peer.
 func TestServerConn_CtxCancelEmitsGOAWAY(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

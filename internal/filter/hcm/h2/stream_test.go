@@ -334,7 +334,7 @@ func (a *errorAction) WriteH2(_ StreamWriter) error {
 }
 
 // TestServerStream_Dispatch_404Adapter_WritesHeadersAndData:
-// A 404-synthesising Action writes HEADERS with :status 404 + DATA body.
+// A 404-synthesizing Action writes HEADERS with :status 404 + DATA body.
 // This models the h2DirectResponseAdapter wrapping a 404 directResponseAction.
 func TestServerStream_Dispatch_404Adapter_WritesHeadersAndData(t *testing.T) {
 	fc := &fakeConn{}
@@ -344,7 +344,7 @@ func TestServerStream_Dispatch_404Adapter_WritesHeadersAndData(t *testing.T) {
 		t.Fatalf("recvHeaders: %v", err)
 	}
 
-	// Simulate the 404-synthesising adapter.
+	// Simulate the 404-synthesizing adapter.
 	notFoundAction := &fakeAction{statusCode: "404", body: "not found\n"}
 
 	ctx := context.Background()

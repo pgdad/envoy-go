@@ -29,8 +29,8 @@ func FuzzFrameStream(f *testing.F) {
 	seed2 = append(seed2, clientPrefaceBytes...)
 	seed2 = append(seed2,
 		0x00, 0x00, 0x00, // length = 0
-		0x04,             // type = SETTINGS
-		0x00,             // flags = 0
+		0x04,                   // type = SETTINGS
+		0x00,                   // flags = 0
 		0x00, 0x00, 0x00, 0x00, // stream id = 0
 	)
 	f.Add(seed2)
@@ -41,15 +41,15 @@ func FuzzFrameStream(f *testing.F) {
 	// SETTINGS frame (empty payload)
 	seed3 = append(seed3,
 		0x00, 0x00, 0x00, // length = 0
-		0x04,             // type = SETTINGS
-		0x00,             // flags = 0
+		0x04,                   // type = SETTINGS
+		0x00,                   // flags = 0
 		0x00, 0x00, 0x00, 0x00, // stream id = 0
 	)
 	// SETTINGS ACK frame (flags=0x01)
 	seed3 = append(seed3,
 		0x00, 0x00, 0x00, // length = 0
-		0x04,             // type = SETTINGS
-		0x01,             // flags = ACK
+		0x04,                   // type = SETTINGS
+		0x01,                   // flags = ACK
 		0x00, 0x00, 0x00, 0x00, // stream id = 0
 	)
 	f.Add(seed3)
@@ -59,7 +59,7 @@ func FuzzFrameStream(f *testing.F) {
 		defer cancel()
 
 		conn := newReplayConn(input)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		disp := stubDispatcher{}
 		sc := NewServerConn(ctx, conn, disp, DefaultServerSettings)

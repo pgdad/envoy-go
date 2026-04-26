@@ -4,6 +4,7 @@
 // direction for the one-way import: hcm → h2 only. The h2 package MUST NOT
 // import internal/filter/hcm; this file is the seam that resolves the import
 // topology per PLAN "Settled SPEC §10 deferred decisions" #10.
+
 package hcm
 
 import (
@@ -36,7 +37,7 @@ func newH2Dispatcher(table *routeTable) *h2Dispatcher {
 func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 	entry, ok := d.table.match(req)
 	if !ok {
-		// No matching route — synthesise 404.
+		// No matching route — synthesize 404.
 		return &h2DirectResponseAdapter{a: &directResponseAction{status: 404, bodyText: "not found\n"}}, true
 	}
 	if dr, ok := entry.action.(*directResponseAction); ok {

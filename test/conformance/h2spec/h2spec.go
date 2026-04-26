@@ -19,14 +19,14 @@ func imageRef() string { return h2specImage + "@" + h2specDigest }
 // Per ADR-0051. Section 6 is represented as its individual subsections so that
 // 6.6 (PUSH_PROMISE) can be excluded without running a separate filter pass.
 var thresholdSections = []string{
-	"http2/3",    // Starting HTTP/2 (Connection Preface)
-	"http2/4",    // HTTP Frames (Frame Format, Frame Size, Header Compression)
-	"http2/5",    // Streams and Multiplexing
-	"http2/6/1",  // Frame Definitions: DATA
-	"http2/6/2",  // Frame Definitions: HEADERS
-	"http2/6/3",  // Frame Definitions: PRIORITY
-	"http2/6/4",  // Frame Definitions: RST_STREAM
-	"http2/6/5",  // Frame Definitions: SETTINGS
+	"http2/3",   // Starting HTTP/2 (Connection Preface)
+	"http2/4",   // HTTP Frames (Frame Format, Frame Size, Header Compression)
+	"http2/5",   // Streams and Multiplexing
+	"http2/6/1", // Frame Definitions: DATA
+	"http2/6/2", // Frame Definitions: HEADERS
+	"http2/6/3", // Frame Definitions: PRIORITY
+	"http2/6/4", // Frame Definitions: RST_STREAM
+	"http2/6/5", // Frame Definitions: SETTINGS
 	// http2/6/6 = PUSH_PROMISE — excluded per ADR-0051 (ENABLE_PUSH=0)
 	"http2/6/7",  // Frame Definitions: PING
 	"http2/6/8",  // Frame Definitions: GOAWAY

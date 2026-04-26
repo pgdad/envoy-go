@@ -269,8 +269,8 @@ type junitTestSuite struct {
 
 // junitTestCase represents a single <testcase> in a testsuite.
 type junitTestCase struct {
-	Name    string         `xml:"name,attr"`
-	Failure *junitFailure  `xml:"failure"`
+	Name    string        `xml:"name,attr"`
+	Failure *junitFailure `xml:"failure"`
 }
 
 // junitFailure is the <failure> element inside a test case.
