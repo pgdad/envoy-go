@@ -8,7 +8,7 @@ none — all 12 preconditions per PLAN §"Execution preconditions" satisfied at 
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** <sha>
+**Commits:** 9bda8f9 (SHA-fill: see next commit)
 **Notes:** Created PROGRESS.md; verified all preconditions per PLAN §"Execution preconditions"; phase-05.1 close + follow-up batch confirmed present in HEAD; SPEC at dacf4b7; ADR tail at 0054 (next-free 0055); client.go absent (will land at Task 7).
 **Outputs:**
 ```
