@@ -106,7 +106,7 @@ stream_test.go
 
 ## Task 2 — ADR-0055 prerequisites — `window.reserveBlocking` collapse (M-3) + `translateFramerErr` helper extraction (M-5)
 
-**Commits:** <sha> (SHA-fill: see next commit)
+**Commits:** 964df19
 **Files changed:**
 - `internal/filter/hcm/h2/flow.go` — replaced `reserve` + `waitFor` pair with single atomic `reserveBlocking(ctx, max) (int32, error)`; both deleted methods removed.
 - `internal/filter/hcm/h2/flow_test.go` — added `TestWindow_ReserveBlocking_AtomicityUnderConcurrency` (20 consumers × 50 bytes vs window=100 + 10×100 replenisher; asserts `taken <= 1100`); rewrote 4 prior tests to call `reserveBlocking`.
