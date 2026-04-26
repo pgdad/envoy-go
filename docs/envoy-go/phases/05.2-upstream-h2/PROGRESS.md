@@ -213,7 +213,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.025s
 
 ## Task 3 — ADR-0055 outbound DATA chunking — `MaxFrameSize` cap (I-1) + per-stream send-window (I-2)
 
-**Commits:** (SHA-fill: see next commit)
+**Commits:** d3de1f8
 **Files changed:**
 - `internal/filter/hcm/h2/conn.go` — rewrote `(*ServerConn).writeData` to apply the chunk = min(connSendWindow, streamSendWindow, peer.MaxFrameSize) algorithm: per-stream reservation first (smaller bound first reduces head-of-line blocking on the conn-level window), conn-level reservation second for the streamTaken amount, replenish per-stream over-reservation on conn-level under-reservation or ctx-cancel rollback. MaxFrameSize=0 default → 16384 per RFC 9113 §6.5.2. Use `translateFramerErr` (extracted by Task 2) on `framer.WriteData` errors. Also fixed `onHeaders` stream construction: per-stream **send** window initial size now reads `s.clientS.InitialWindowSize` (peer-announced — what governs how much WE can send) with a 65535 default; recv window initial size unchanged (still `s.settings.InitialWindowSize`, our own announced value).
 - `internal/filter/hcm/h2/conn_test.go` — added `TestServerConn_WriteData_RespectsMaxFrameSize` (32768-byte body, peer MaxFrameSize=16384 → ≥ 2 DATA frames, none > 16384) and `TestServerConn_WriteData_RespectsPerStreamSendWindow` (100-byte body, peer InitialWindowSize=16, drip WINDOW_UPDATE(1, 16) every 5ms → ≥ 7 DATA frames, none > 16). LoC delta: +322/-14.
