@@ -4,8 +4,18 @@ This file records the exact container image digests used in automated conformanc
 test gates.  Pinning by digest (not by tag) guarantees reproducibility: the same
 image runs in every CI invocation, local developer run, and review environment.
 
-All pins are append-only.  A new pin supersedes the old one for the same tool;
-the old pin is kept for audit purposes.
+## Refresh procedure
+
+Per doctrine D-3.7, pins are changed only via a dedicated phase. All pins are
+append-only: a new pin supersedes the old one for the same tool, and the old pin
+is kept for audit purposes. To execute a pin refresh:
+
+1. `docker pull <image>:<new-tag>`; capture the SHA256 with `docker inspect --format='{{index .RepoDigests 0}}'`.
+2. Append a new row to the pin table with the new tag and digest, preserving the prior row for audit.
+3. Run the conformance gate: `go test -run TestH2Spec ./test/conformance/h2spec/` (or equivalent for the tool).
+4. Confirm all tests PASS at the new digest.
+5. Mark the prior row with a "superseded by <digest>" annotation.
+6. Land the change as a single commit on a dedicated pin-refresh phase branch.
 
 ---
 
