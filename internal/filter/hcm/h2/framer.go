@@ -152,10 +152,3 @@ func (f *framer) tryReadFrame() (http2.Frame, error) {
 	}
 	return nil, err
 }
-
-func ctxErr(ctx context.Context, fallback error) error {
-	if e := ctx.Err(); e != nil {
-		return e
-	}
-	return fallback
-}

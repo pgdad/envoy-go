@@ -35,7 +35,6 @@ type ServerConn struct {
 	goawaySent    bool
 	peerGoaway    bool // true after receiving GOAWAY from client; stop accepting new streams
 	hpackBlocked  bool // true when we're mid-header-block (between HEADERS and END_HEADERS)
-	hpackBlockSID uint32
 	// doneCh is used by dispatch goroutines to notify the frame loop when a
 	// stream has been fully handled.  The frame loop drains doneCh before each
 	// MAX_CONCURRENT_STREAMS admission check so that s.streams accurately
