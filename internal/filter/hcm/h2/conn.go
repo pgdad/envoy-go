@@ -575,7 +575,7 @@ func (s *ServerConn) drainDone() {
 
 // emitGoaway sends a GOAWAY frame once. Subsequent calls are no-ops.
 // The mutex is held across the framer write so that the write is
-// serialised against encodeAndWriteHeaders / writeData.
+// serialized against encodeAndWriteHeaders / writeData.
 func (s *ServerConn) emitGoaway(code ErrCode) {
 	s.mu.Lock()
 	if s.goawaySent {
