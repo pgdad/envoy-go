@@ -437,6 +437,147 @@ func TestServerConn_GOAWAYOnProtocolError_EvenStreamID(t *testing.T) {
 	}
 }
 
+// TestServerConn_GOAWAYOnProtocolError_StreamIDReuse verifies that a peer
+// re-using a stream id below s.lastInID (i.e., a non-monotonic stream id)
+// triggers GOAWAY(PROTOCOL_ERROR) per RFC 9113 §5.1.1.
+//
+// This is the integration coverage for the monotonic-id rejection branch in
+// onHeaders (currently at conn.go:343-344, originally at the conn.go:308-319
+// range when the PLAN was authored). Closes the 05.1-REVIEW carry-forward
+// (per phase 05.2 SPEC §12.3 / §10 #10) — the rejection branch was previously
+// only unit-tested via the sibling even-id branch
+// (TestServerConn_GOAWAYOnProtocolError_EvenStreamID).
+//
+// Driver: open stream 3 (skipping 1) and complete it, then send HEADERS on
+// stream 1. The server has bumped lastInID to 3, so a HEADERS on stream 1 is
+// non-monotonic and must hit the PROTOCOL_ERROR branch.
+//
+// The assertion observes the GOAWAY frame on the wire via the framer (NOT
+// inferred from the conn close) so a regression that drops the rejection
+// branch would be caught.
+func TestServerConn_GOAWAYOnProtocolError_StreamIDReuse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	disp := &fixedDispatcher{action: &fixedAction{status: 200, body: "ok"}}
+	clientConn, serverDone := startServerConn(t, ctx, disp, DefaultServerSettings)
+
+	if err := writeClientPreface(clientConn); err != nil {
+		t.Fatalf("write preface: %v", err)
+	}
+
+	fr := http2.NewFramer(clientConn, clientConn)
+	if err := fr.WriteSettings(); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	// Read server's initial SETTINGS, then ACK it.
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("read server SETTINGS: %v", err)
+		}
+		if f.Header().Type == http2.FrameSettings {
+			sf := f.(*http2.SettingsFrame)
+			if !sf.IsAck() {
+				if err := fr.WriteSettingsAck(); err != nil {
+					t.Fatalf("write settings ack: %v", err)
+				}
+				break
+			}
+		}
+	}
+
+	// Build the HEADERS block once; reuse for both writes.
+	var encBuf bytes.Buffer
+	enc := hpack.NewEncoder(&encBuf)
+	_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "http"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: "test.local"})
+	headerBlock := append([]byte{}, encBuf.Bytes()...)
+
+	// Step 1: open stream 3 with HEADERS+END_STREAM.  This bumps lastInID to 3.
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      3,
+		BlockFragment: headerBlock,
+		EndHeaders:    true,
+		EndStream:     true,
+	}); err != nil {
+		t.Fatalf("write headers on stream 3: %v", err)
+	}
+
+	// Drain frames until we see the response END_STREAM on stream 3, ignoring
+	// settings ACKs and other server-side frames.  Once stream 3's response is
+	// fully received, lastInID has been advanced and the stream is considered
+	// closed, but more importantly the monotonic check uses lastInID (which
+	// was set when the HEADERS was processed, before the response ran).
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	gotResponse := false
+	for !gotResponse {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame waiting for stream 3 response: %v", err)
+		}
+		switch fr := f.(type) {
+		case *http2.HeadersFrame:
+			if fr.StreamID == 3 && fr.StreamEnded() {
+				gotResponse = true
+			}
+		case *http2.DataFrame:
+			if fr.StreamID == 3 && fr.StreamEnded() {
+				gotResponse = true
+			}
+		case *http2.GoAwayFrame:
+			t.Fatalf("unexpected early GOAWAY: code=%v", fr.ErrCode)
+		}
+	}
+
+	// Step 2: send HEADERS on stream 1.  lastInID is 3, so 1 <= 3 → the
+	// monotonic check at conn.go fires and returns PROTOCOL_ERROR.
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      1, // non-monotonic — must trip PROTOCOL_ERROR
+		BlockFragment: headerBlock,
+		EndHeaders:    true,
+		EndStream:     true,
+	}); err != nil {
+		t.Fatalf("write headers on stream 1 (reused id): %v", err)
+	}
+
+	// Wire-level assertion: read the GOAWAY frame from the framer and verify
+	// its error code is PROTOCOL_ERROR.  Don't accept conn close alone as
+	// evidence — that could come from any path.
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	sawGoAway := false
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			break // EOF / read error after server closes the conn
+		}
+		if gf, ok := f.(*http2.GoAwayFrame); ok {
+			if gf.ErrCode != http2.ErrCodeProtocol {
+				t.Errorf("GOAWAY code = %v, want PROTOCOL_ERROR", gf.ErrCode)
+			}
+			sawGoAway = true
+			break
+		}
+	}
+	if !sawGoAway {
+		t.Error("expected GOAWAY(PROTOCOL_ERROR) on wire after reusing stream id")
+	}
+
+	// Confirm the server-side Run() loop also exited with the matching error.
+	select {
+	case err := <-serverDone:
+		if h2Err, ok := err.(*Error); ok && h2Err.Code == ErrProtocolError {
+			return
+		}
+		t.Errorf("expected server to exit with PROTOCOL_ERROR, got: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Error("timed out waiting for server Run() to exit after GOAWAY")
+	}
+}
+
 // TestServerConn_PingPingAck verifies that a PING from the client triggers
 // a PING ACK from the server.
 func TestServerConn_PingPingAck(t *testing.T) {

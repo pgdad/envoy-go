@@ -56,8 +56,7 @@ is kept for audit purposes. To execute a pin refresh:
 | 8.2     | Server Push                             | 1     |
 | **Total** |                                       | **53** |
 
-Section 6.6 (PUSH_PROMISE) is explicitly excluded per ADR-0051 (server has
-`ENABLE_PUSH=0`).
+Section 6.6 (PUSH_PROMISE) is excluded because phase 05.1 disables server push per ADR-0047 / 05.1 SPEC §2.1; the section's tests are conformance-irrelevant for this surface. Per ADR-0055 (phase 05.2), the exclusion stays — the flow-control discipline tightening does not change the server-push posture.
 
 ### First run result (2026-04-25)
 

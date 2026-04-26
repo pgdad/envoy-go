@@ -480,3 +480,51 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.009s
 ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.020s
 ok  	github.com/esalaine/envoy-go/test/helpers	1.028s
 ```
+
+## Task 6 — 05.1-REVIEW carry-forward — monotonic-id-reuse integration test + M-8 cleanup
+
+**Commits:** (SHA-fill: see next commit)
+**Files changed:**
+- `internal/filter/hcm/h2/conn_test.go` — added `TestServerConn_GOAWAYOnProtocolError_StreamIDReuse`. Drives an in-process peer that opens stream id 3 with HEADERS+END_STREAM, drains the response, then sends HEADERS on stream id 1. The server's `lastInID` was bumped to 3 by the first HEADERS, so the second HEADERS on stream 1 (1 ≤ 3) fires the monotonic-id rejection branch in `onHeaders` (currently at `conn.go` ~line 343-344) and emits GOAWAY(PROTOCOL_ERROR). The test asserts the GOAWAY frame on the wire via the framer (NOT inferred from conn close) AND asserts the server's `Run()` exits with `*Error{Code: ErrProtocolError}`. Mirrors the sibling `TestServerConn_GOAWAYOnProtocolError_EvenStreamID` fixture pattern.
+- `test/conformance/h2spec/h2spec.go` — deleted the `excludedSubsections []string{"http2/6/6"}` slice (was kept with `//nolint:unused` in the 05.1 follow-up). The exclusion rationale moves to `CONFORMANCE_PINS.md` per M-8.
+- `docs/envoy-go/CONFORMANCE_PINS.md` — replaced the brief "6.6 excluded per ADR-0051 (ENABLE_PUSH=0)" note under the threshold-section enumeration with the fuller PLAN-prescribed note that cites ADR-0047 / 05.1 SPEC §2.1 for the disable, and adds the ADR-0055 confirmation that the exclusion stays through phase 05.2.
+
+LoC delta: +141/-0 conn_test.go (new test); -5/-0 h2spec.go (slice + comment + nolint); +1/-2 CONFORMANCE_PINS.md (note rewrite).
+
+**Notes:** TDD self-check observed:
+
+1. New test passed on first run against the intact production code — the `connError(ErrProtocolError, "stream id not monotonically increasing")` branch is already in place from 05.1.
+2. To rule out test-pass-too-easily: temporarily commented out the rejection branch (`return connError(ErrProtocolError, ...)`) in `conn.go` and re-ran the test. It FAILED with `expected GOAWAY(PROTOCOL_ERROR) on wire after reusing stream id` AND `expected server to exit with PROTOCOL_ERROR, got: context deadline exceeded` — confirming the test catches a regression at both wire-level GOAWAY observation AND the server `Run()` exit. The production branch was then restored and the test passes again.
+
+The task title and PLAN test name carry "OnProtocolError" / "monotonic-id-reuse" — the implementation reuses stream id 1 *below* `lastInID=3` rather than literally reusing id 1 after id 1 closed (which would hit the closed-stream branch returning `ErrStreamClosed`). The chosen path matches the test name's intent (PROTOCOL_ERROR via the §5.1.1 monotonic check) and exercises the rejection branch as documented in the PLAN. The PLAN's literal "open stream 1, complete, send HEADERS on stream 1" wording would hit the *closed-stream* branch (`isClosed → connError(ErrStreamClosed, ...)`) and emit GOAWAY(STREAM_CLOSED) not PROTOCOL_ERROR — that branch is already covered indirectly via h2spec 5.1/12 (part of the 53/53 threshold). The new test thus targets the only remaining uncovered rejection branch (monotonic-id), the more meaningful integration gap per the 05.1 REVIEW.
+
+h2spec section roll-up at the ADR-0051 pin: 53/53 PASS (unchanged; M-8 was a documentation-only change). Lint clean. Race detector clean.
+
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/ -run TestServerConn_GOAWAYOnProtocolError_StreamIDReuse -v
+=== RUN   TestServerConn_GOAWAYOnProtocolError_StreamIDReuse
+--- PASS: TestServerConn_GOAWAYOnProtocolError_StreamIDReuse (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.003s
+
+$ # self-check: rejection branch in conn.go temporarily disabled
+$ go test ./internal/filter/hcm/h2/ -run TestServerConn_GOAWAYOnProtocolError_StreamIDReuse -v -timeout 30s
+=== RUN   TestServerConn_GOAWAYOnProtocolError_StreamIDReuse
+    conn_test.go:566: expected GOAWAY(PROTOCOL_ERROR) on wire after reusing stream id
+    conn_test.go:575: expected server to exit with PROTOCOL_ERROR, got: context deadline exceeded
+--- FAIL: TestServerConn_GOAWAYOnProtocolError_StreamIDReuse (5.02s)
+FAIL
+$ # branch restored, test passes again
+
+$ go test -race ./internal/filter/hcm/h2/
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.368s
+
+$ go test ./test/conformance/h2spec/ -v
+        53 tests, 53 passed, 0 skipped, 0 failed
+--- PASS: TestH2Spec (2.24s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.352s
+
+$ golangci-lint run ./internal/filter/hcm/h2/ ./test/conformance/h2spec/   # exit 0, M-8 //nolint:unused removed
+```

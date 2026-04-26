@@ -35,8 +35,3 @@ var thresholdSections = []string{
 	"http2/7",    // Error Codes
 	"http2/8",    // HTTP Message Exchanges
 }
-
-// excludedSubsections documents the sections excluded from the threshold.
-// Per ADR-0051: section 6.6 (PUSH_PROMISE) — phase 05.1 disables push
-// (SETTINGS_ENABLE_PUSH=0 per ADR-0047). Kept for documentation purposes.
-var excludedSubsections = []string{"http2/6/6"} //nolint:unused
