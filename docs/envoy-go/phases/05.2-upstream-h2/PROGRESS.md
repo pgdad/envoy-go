@@ -413,3 +413,70 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.014s
 ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.012s
 ok  	github.com/esalaine/envoy-go/test/helpers	1.023s
 ```
+
+## Task 5 — ADR-0055 `recvData` state-before-append (M-11) + ADR-0055 lands in DECISIONS.md
+
+**Commits:** (SHA-fill: see next commit)
+**Files changed:**
+- `internal/filter/hcm/h2/stream.go` — `recvData` reordered to validate stream state BEFORE appending to `s.reqBody` per ADR-0055 M-11. The half-closed-remote and closed branches now return `streamError(ErrStreamClosed, ...)` BEFORE the body buffer is touched; the `streamOpen` and `streamHalfClosedLocal` branches fall through and append as before. The post-append state-transition switch is preserved (open → halfClosedRemote on END_STREAM; halfClosedLocal → closed on END_STREAM). The doc comment is updated to call out the state-first ordering.
+- `internal/filter/hcm/h2/stream_test.go` — added `TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream`. Drives the stream to halfClosedRemote via `recvHeaders(minHeaders(), true)`, captures `reqBody.Len()` pre-call, calls `recvData([]byte("late data"), false)`, asserts (a) the returned error is `*Error` with `Code == ErrStreamClosed` AND (b) `reqBody.Len()` is unchanged from the pre-call snapshot.
+- `docs/envoy-go/DECISIONS.md` — appended ADR-0055 at the file tail (next-free 0055; tail before append was ADR-0054, verified by `grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1`). The ADR enumerates the seven fixes individually (I-1, I-2, I-3, M-3, M-5, M-9, M-11) with file:line + commit SHA cross-references so a future supersession can target precisely. Lands-in-task: this Task (Task 5).
+
+LoC delta: +84/-11 across stream.go (+13 / -10 — the reorder is a small net add for the state-first switch + doc comment update) and stream_test.go (+44 / 0 — new test); plus +71 in DECISIONS.md (ADR-0055 prose).
+
+**Notes:** TDD red→green observed:
+
+1. New test failed first with `reqBody.Len() grew from 0 to 9 on a closed stream; want unchanged` — the pre-fix `recvData` appended `[]byte("late data")` (9 bytes) to `s.reqBody` BEFORE the state switch evaluated `streamHalfClosedRemote` and returned the error.
+2. After the reorder (state switch evaluates first, append happens only on `streamOpen`/`streamHalfClosedLocal`), the test passes; `reqBody.Len()` stays at 0 and the returned error is `*Error{Code: ErrStreamClosed}`.
+
+The reorder does NOT change observable wire behaviour for valid streams: open and halfClosedLocal streams still append + transition exactly as before. h2spec at the ADR-0051 pin remains 53/53 PASS. The full h2 race-detector run (60s timeout) is green; `go test -race ./...` across the repo is green.
+
+ADR-0055 is the closing artifact of the seven-fix sequence (Tasks 2-5). It lands at the DECISIONS.md tail (D-3.5 append-only); next-free was 0055 before the append, and the new tail is 0055.
+
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/ -run TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream -v -count=1   # before stream.go change
+=== RUN   TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream
+    stream_test.go:361: reqBody.Len() grew from 0 to 9 on a closed stream; want unchanged
+--- FAIL: TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream (0.00s)
+FAIL
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.002s
+FAIL
+
+$ go test ./internal/filter/hcm/h2/ -run TestServerStream_RecvData -v -count=1   # after stream.go change
+=== RUN   TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream
+--- PASS: TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.002s
+
+$ go test -race ./internal/filter/hcm/h2/ -timeout 60s -count=1
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.368s
+
+$ go test ./test/conformance/h2spec/ -v -count=1   # h2spec section roll-up (ADR-0051 pin)
+        53 tests, 53 passed, 0 skipped, 0 failed
+--- PASS: TestH2Spec (2.27s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.352s
+
+$ go vet ./internal/filter/hcm/h2/   # exit 0
+$ golangci-lint run ./internal/filter/hcm/h2/   # exit 0
+
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0055: Flow-control discipline for the from-scratch H2 codec
+
+$ go test -race ./... -count=1   # broader sanity check, all packages green
+ok  	github.com/esalaine/envoy-go/internal/admin	1.057s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.031s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.023s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.032s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.377s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.026s
+ok  	github.com/esalaine/envoy-go/internal/listener	1.031s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.081s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.097s
+ok  	github.com/esalaine/envoy-go/test/differential	7.562s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.020s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.028s
+```

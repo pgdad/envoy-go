@@ -160,11 +160,26 @@ func (s *serverStream) recvTrailingHeaders(headers []hpack.HeaderField, endStrea
 }
 
 // recvData processes an incoming DATA frame. Valid from open or
-// halfClosedLocal. Appends data to the body buffer; on endStream advances state.
-// The body buffer is fully populated before the dispatch goroutine starts.
+// halfClosedLocal. Validates state FIRST per ADR-0055 M-11 (do not grow
+// s.reqBody on a closed/half-closed-remote stream); then appends the body
+// bytes; on endStream advances state. The body buffer is fully populated
+// before the dispatch goroutine starts.
 func (s *serverStream) recvData(b []byte, endStream bool) error {
 	s.mu.Lock()
 	cur := s.state
+	// State validity check BEFORE appending (ADR-0055 M-11): a peer sending
+	// DATA on a closed or half-closed-remote stream is a stream error and
+	// MUST NOT cause server-side memory growth.
+	switch cur {
+	case streamOpen, streamHalfClosedLocal:
+		// valid; fall through to append
+	case streamHalfClosedRemote, streamClosed:
+		s.mu.Unlock()
+		return streamError(ErrStreamClosed, s.id, "DATA on half-closed/closed stream")
+	default:
+		s.mu.Unlock()
+		return streamError(ErrStreamClosed, s.id, fmt.Sprintf("DATA in state %v", cur))
+	}
 	if len(b) > 0 {
 		_, _ = s.reqBody.Write(b) // bytes.Buffer.Write never fails
 	}
@@ -175,17 +190,12 @@ func (s *serverStream) recvData(b []byte, endStream bool) error {
 		if endStream {
 			s.transition(streamHalfClosedRemote)
 		}
-		return nil
 	case streamHalfClosedLocal:
 		if endStream {
 			s.transition(streamClosed)
 		}
-		return nil
-	case streamHalfClosedRemote, streamClosed:
-		return streamError(ErrStreamClosed, s.id, "DATA on half-closed/closed stream")
-	default:
-		return streamError(ErrStreamClosed, s.id, fmt.Sprintf("DATA in state %v", cur))
 	}
+	return nil
 }
 
 // recvRSTStream handles a peer RST_STREAM. Transitions the stream to closed.

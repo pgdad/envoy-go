@@ -1876,3 +1876,54 @@ The grep-verifiability formulation of ADR-0046 stands (the gate runs against act
 - This ADR supersedes ADR-0046 in scope **only** for the file-list claim. The substantive D-3.2 codec-vs-runtime boundary, the FORBIDDEN runtime-types list, and the driver-side test exception in ADR-0046 all stand unchanged.
 
 This ADR is itself append-only. Future drift in the file list (e.g., if a new file imports root `http2`) is corrected by a further superseding ADR.
+
+## ADR-0055: Flow-control discipline for the from-scratch H2 codec
+
+**Status:** Accepted
+**Date:** 2026-04-26
+**Doctrine:** D-3.6 (every phase is a green build — and the from-scratch H2 codec must be RFC-correct under realistic peer settings, not just under the conformance-suite peer's defaults).
+**Settles:** phase-05.1 REVIEW Important findings I-1, I-2, I-3 and Minor findings M-3, M-5, M-7, M-9, M-11. Closes the ADR-0055 anticipation in phase-05.2 SPEC §4.4.
+**Supersedes:** nothing.
+
+### Context
+
+The phase-05.1 codec primitives implemented the RFC 9113 §5.2 baseline correctly enough to PASS h2spec at 53/53, but every shipped 05.1 path was a bodyless GET to a `direct_response` with a small body, which dormantly left three flow-control gaps the 05.1 REVIEW flagged as Important:
+
+- I-1 — `ServerConn.writeData` did not respect `SETTINGS_MAX_FRAME_SIZE`; an outbound DATA frame larger than the peer's advertised cap would have produced a peer-side `FRAME_SIZE_ERROR` against any peer advertising a non-default cap.
+- I-2 — `ServerConn.writeData` did not enforce the per-stream send window; a peer that throttled `INITIAL_WINDOW_SIZE` tightly would have observed a `FLOW_CONTROL_ERROR`.
+- I-3 — receive-side flow control was allocated (`recvW` field) but never decremented or replenished; a request body larger than the initial 65535 receive window would have stalled forever.
+
+Plus the related Minor findings M-3 (`waitFor`+`reserve` non-atomicity + a dead `if taken <= 0` recovery branch), M-5 (translation-block duplication between `framer.readFrameCtx` and `framer.tryReadFrame`), M-7 (`recvW` fields kept-but-dead), M-9 (WINDOW_UPDATE delta overflow not bounds-checked per RFC 9113 §6.9.1), and M-11 (`recvData` writes to `s.reqBody` *before* checking state-transition validity, growing memory on closed streams).
+
+Phase 05.2's routed-to-upstream H2 surface is the load-bearing context that activates these gaps in production: real upstream peers advertise non-default settings, real request/response bodies cross the 65535 boundary, and a memory-waste path under adversarial peers becomes a denial-of-service risk. The 05.2 SPEC §4.4 anticipated ADR-0055 as the prerequisite that closes the gaps before the routed-to-upstream surface lands.
+
+The 05.1 REVIEW recommended (`Recommendation` Path A) "a single dedicated ADR documenting flow-control discipline for the from-scratch H2 codec end-to-end" rather than per-fix ADRs. This ADR is that bundle.
+
+### Decision
+
+ADR-0055 enumerates seven specific code-level fixes, each landed in a discrete commit so a future supersession can target precisely:
+
+- **I-1 — Outbound `MaxFrameSize` chunking.** `internal/filter/hcm/h2/conn.go` `writeData` chunks outgoing DATA at `min(connWindow, streamWindow, peer.MaxFrameSize)`. Lands Task 3, commit `d3de1f8`.
+- **I-2 — Per-stream send-window enforcement.** Same `writeData` path enforces the per-stream send window via `serverStream.sendW.reserveBlocking(n)` before each chunk. Lands Task 3, commit `d3de1f8`.
+- **I-3 — Inbound `recvW` decrement + half-window WINDOW_UPDATE emission.** `internal/filter/hcm/h2/conn.go` `onData` debits both the conn-level and per-stream `recvW` on every inbound DATA chunk and emits `WINDOW_UPDATE` once the running counter crosses the half-window threshold (`32768 = 65535/2`). Lands Task 4, commit `b951c38`.
+- **M-3 — `reserveBlocking` collapse + dead-branch deletion.** `internal/filter/hcm/h2/flow.go` collapses `waitFor`+`reserve` into a single atomic `reserveBlocking(n)` and deletes the dead `if taken <= 0` recovery branch in `writeData`. Required for I-2 to be race-free under concurrent multi-stream writes. Lands Task 2, commit `964df19`.
+- **M-5 — `translateFramerErr` helper extraction.** `internal/filter/hcm/h2/framer.go` extracts the common framer-error translation block from `readFrameCtx` and `tryReadFrame` into a single helper; cosmetic prerequisite so the future `ClientConn`'s framer wrapper consumes the same translation. Lands Task 2, commit `964df19`.
+- **M-9 — Overflow bounds-check on WINDOW_UPDATE.** `internal/filter/hcm/h2/conn.go` `onWindowUpdate` (conn-level) and `internal/filter/hcm/h2/stream.go` `recvWindowUpdate` (stream-level) reject WINDOW_UPDATE deltas that would push the send window past `2³¹-1` per RFC 9113 §6.9.1, returning `connError(ErrFlowControlError)` → GOAWAY (conn-level) or `streamError(ErrFlowControlError)` → RST_STREAM (stream-level). Lands Task 4, commit `b951c38`.
+- **M-11 — `recvData` state-before-append reorder.** `internal/filter/hcm/h2/stream.go` `recvData` validates the stream state BEFORE appending to `s.reqBody`; DATA on a closed or half-closed-remote stream returns the `STREAM_CLOSED` error first and does NOT cause server-side memory growth. Lands this Task (Task 5), this commit.
+
+The seven fixes are interlinked: `reserveBlocking` (M-3) is required for per-stream send-window enforcement (I-2) to be race-free; the overflow bounds-check (M-9) is required for WINDOW_UPDATE emission (I-3) to be safe under adversarial peers; the `recvW` fields (M-7) become load-bearing under I-3. The bundle is the right shape because the cross-references between the fixes outweigh the per-fix isolation a separate-ADR shape would offer.
+
+M-7 is not enumerated separately above because it is the consequence of I-3: the `recvW` field allocations become non-dead the moment `onData` debits them; no separate code change is required for M-7 beyond the I-3 fix.
+
+### Consequences
+
+- The 05.1 codec primitives are now load-bearing for realistic upstream H2 workloads. Each of the seven fixes ships with a regression test (per phase-05.2 SPEC §1 #6 + this ADR's Settles list). Specifically: I-1 is regression-tested by a `>16384`-byte body chunked correctly (≥2 DATA frames; no peer-side `FRAME_SIZE_ERROR`); I-2 is regression-tested by `INITIAL_WINDOW_SIZE: 16` + 100-byte response body producing ~7 DATA frames + no `FLOW_CONTROL_ERROR`; I-3 is regression-tested by a 100KB inbound body completing without deadlock with WINDOW_UPDATE frames observed on the wire; M-3 is race-tested by concurrent multi-stream writes against a window primed at boundary values; M-9 is unit-tested at the boundary (`MaxInt32 - 1`, delta `2`); M-11 is unit-tested by DATA on a `halfClosedRemote` stream not growing `s.reqBody`.
+- `BEHAVIOR_CONTRACT.md ## HTTP/2`'s threshold-language paragraph is extended (in-place per ADR-0052 — the SCAFFOLD form's "in-place edit at the closing task" discipline) at phase 05.2's Task 15 with non-default `MaxFrameSize` and tight-window prose. Per-section pass counts at the ADR-0051 pin remain at the 05.1 baseline (53/53); ADR-0055 introduces no new conformance section requirements.
+- The bundled-vs-per-fix-ADR shape is intentional per the 05.1 REVIEW's Path A wording. Splitting into seven per-fix ADRs would create cross-references harder to read than the bundle. The seven-fix enumeration above is the precision affordance: a future supersession can name the specific fix it replaces (e.g. "supersedes ADR-0055 I-1 only").
+- M-7 (formerly "`recvW` fields dead") is closed-by-consequence of I-3; no separate fix or ADR.
+- The receive-side WINDOW_UPDATE emission policy (half-window threshold = 32768) is not RFC-mandated; RFC 9113 leaves the policy to the implementation. The half-window threshold is the standard implementation choice (matches `golang.org/x/net/http2` and Envoy's defaults). A future hardening ADR may re-tune this if production telemetry justifies a different threshold.
+- The `closedStreams` map remains unbounded in 05.2 (M-12 from the 05.1 REVIEW). That gap is bundled neither into ADR-0055 nor into ADR-0058 — it is a long-lived-conn hardening item carried forward in PROGRESS.md only, deferred to a future hardening phase per the phase-05.2 SPEC §12.2 per-finding-disposition.
+
+### Lands-in-task
+
+Phase-05.2 Task 5 (the closing task of the ADR-0055 fix sequence at Tasks 2-5). The seven fixes individually land at the commits enumerated above; this ADR itself lands in the same commit as the M-11 fix (the final fix of the seven-fix sequence).

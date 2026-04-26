@@ -317,6 +317,51 @@ func TestSafeAddInt32(t *testing.T) {
 	}
 }
 
+// TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream covers the
+// ADR-0055 M-11 fix: recvData MUST validate the stream state BEFORE appending
+// to s.reqBody. Without the reorder, a peer that sends DATA on a closed or
+// half-closed-remote stream would still grow s.reqBody — wasted memory plus a
+// surprise dispatch-time mismatch if the bytes were observed by a slow reader.
+// After the reorder, the state check rejects the frame first and reqBody is
+// untouched.
+func TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream(t *testing.T) {
+	fc := &fakeConn{}
+	s := newServerStream(1, fc, 65535, 65535)
+
+	// Drive the stream to halfClosedRemote via the legitimate transition path
+	// (HEADERS with END_STREAM). DATA frames are invalid in this state per
+	// RFC 9113 §5.1.
+	if err := s.recvHeaders(minHeaders(), true); err != nil {
+		t.Fatalf("recvHeaders: %v", err)
+	}
+	s.mu.Lock()
+	if s.state != streamHalfClosedRemote {
+		s.mu.Unlock()
+		t.Fatalf("precondition: state = %v, want halfClosedRemote", s.state)
+	}
+	preLen := s.reqBody.Len()
+	s.mu.Unlock()
+
+	err := s.recvData([]byte("late data"), false)
+	if err == nil {
+		t.Fatal("recvData on halfClosedRemote returned nil, want stream error")
+	}
+	h2err, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error is %T, want *Error", err)
+	}
+	if h2err.Code != ErrStreamClosed {
+		t.Errorf("error code = %v, want STREAM_CLOSED", h2err.Code)
+	}
+
+	s.mu.Lock()
+	postLen := s.reqBody.Len()
+	s.mu.Unlock()
+	if postLen != preLen {
+		t.Errorf("reqBody.Len() grew from %d to %d on a closed stream; want unchanged", preLen, postLen)
+	}
+}
+
 // TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData:
 // An Action is invoked; observe writes via fakeConn.
 func TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData(t *testing.T) {
