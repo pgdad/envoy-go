@@ -26,7 +26,7 @@ func newH2Dispatcher(table *routeTable) *h2Dispatcher {
 // Match resolves an incoming *http.Request to an h2.Action. Returns ok=true
 // in all cases:
 //   - direct_response route → h2DirectResponseAdapter wrapping the action.
-//   - no-match (table miss) → h2DirectResponseAdapter with a 404 synthesis.
+//   - no-match (table miss) → h2DirectResponseAdapter with a 404 synthesis (empty body, matching phase-04 H1 convention at connection.go).
 //   - non-direct_response route (e.g. routerAction) → h2RouterActionRejection,
 //     which returns ErrInternalError on WriteH2 (SPEC §5.2 step 4c).
 //
@@ -37,8 +37,8 @@ func newH2Dispatcher(table *routeTable) *h2Dispatcher {
 func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 	entry, ok := d.table.match(req)
 	if !ok {
-		// No matching route — synthesize 404.
-		return &h2DirectResponseAdapter{a: &directResponseAction{status: 404, bodyText: "not found\n"}}, true
+		// No matching route — synthesize 404 with empty body (matches phase-04 H1 convention; configured catch-all routes carry their own body).
+		return &h2DirectResponseAdapter{a: &directResponseAction{status: 404, bodyText: ""}}, true
 	}
 	if dr, ok := entry.action.(*directResponseAction); ok {
 		return &h2DirectResponseAdapter{a: dr}, true
