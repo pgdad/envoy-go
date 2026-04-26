@@ -483,7 +483,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.028s
 
 ## Task 6 — 05.1-REVIEW carry-forward — monotonic-id-reuse integration test + M-8 cleanup
 
-**Commits:** (SHA-fill: see next commit)
+**Commits:** 5b1e47c
 **Files changed:**
 - `internal/filter/hcm/h2/conn_test.go` — added `TestServerConn_GOAWAYOnProtocolError_StreamIDReuse`. Drives an in-process peer that opens stream id 3 with HEADERS+END_STREAM, drains the response, then sends HEADERS on stream id 1. The server's `lastInID` was bumped to 3 by the first HEADERS, so the second HEADERS on stream 1 (1 ≤ 3) fires the monotonic-id rejection branch in `onHeaders` (currently at `conn.go` ~line 343-344) and emits GOAWAY(PROTOCOL_ERROR). The test asserts the GOAWAY frame on the wire via the framer (NOT inferred from conn close) AND asserts the server's `Run()` exits with `*Error{Code: ErrProtocolError}`. Mirrors the sibling `TestServerConn_GOAWAYOnProtocolError_EvenStreamID` fixture pattern.
 - `test/conformance/h2spec/h2spec.go` — deleted the `excludedSubsections []string{"http2/6/6"}` slice (was kept with `//nolint:unused` in the 05.1 follow-up). The exclusion rationale moves to `CONFORMANCE_PINS.md` per M-8.
