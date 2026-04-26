@@ -416,7 +416,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.023s
 
 ## Task 5 — ADR-0055 `recvData` state-before-append (M-11) + ADR-0055 lands in DECISIONS.md
 
-**Commits:** (SHA-fill: see next commit)
+**Commits:** bef7a1e (SHA-fill: see next commit)
 **Files changed:**
 - `internal/filter/hcm/h2/stream.go` — `recvData` reordered to validate stream state BEFORE appending to `s.reqBody` per ADR-0055 M-11. The half-closed-remote and closed branches now return `streamError(ErrStreamClosed, ...)` BEFORE the body buffer is touched; the `streamOpen` and `streamHalfClosedLocal` branches fall through and append as before. The post-append state-transition switch is preserved (open → halfClosedRemote on END_STREAM; halfClosedLocal → closed on END_STREAM). The doc comment is updated to call out the state-first ordering.
 - `internal/filter/hcm/h2/stream_test.go` — added `TestServerStream_RecvData_DoesNotGrowReqBodyOnClosedStream`. Drives the stream to halfClosedRemote via `recvHeaders(minHeaders(), true)`, captures `reqBody.Len()` pre-call, calls `recvData([]byte("late data"), false)`, asserts (a) the returned error is `*Error` with `Code == ErrStreamClosed` AND (b) `reqBody.Len()` is unchanged from the pre-call snapshot.
