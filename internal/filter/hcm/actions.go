@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -238,10 +239,16 @@ func (r *routerActionH2) write502(w h2.StreamWriter) error {
 // well-formed bootstraps this is unreachable: variant selection at
 // filter-build time guarantees H2-clusters get *routerActionH2 and the
 // HCM-level codec dispatch picks the H2 driver for those listeners. If
-// somehow reached (invalid bootstrap shape), the stub writes a 500 status
-// line to surface the misconfiguration without crashing the connection.
-// Per the "Two interfaces, two separate decisions" note in PLAN Task 11.
+// somehow reached (invalid bootstrap shape — e.g. a codec_type=AUTO
+// listener with alpn_protocols=["h2","http/1.1"] that negotiates
+// "http/1.1" to a route pointing at an H2-only cluster), the stub
+// writes a 500 status line + logs the misconfiguration so an operator
+// debugging the resulting 500 sees the cause without having to grep
+// the codec-dispatch path. Per the "Two interfaces, two separate
+// decisions" note in PLAN Task 11; closes REVIEW I-2 (observability
+// gap on the unreachable defensive stub).
 func (r *routerActionH2) do(_ context.Context, _ *http.Request, bw *bufio.Writer) error {
+	log.Printf("hcm: routerActionH2.do reached on H1 path — bootstrap misconfiguration; route variant selection should have produced *routerAction, not *routerActionH2 (cluster=%q)", r.cluster.Name())
 	return writeStatusReply(bw, 500, "")
 }
 
