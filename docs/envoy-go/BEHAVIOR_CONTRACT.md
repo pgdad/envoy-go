@@ -37,11 +37,11 @@ The allow-list enumerates response headers whose values are permitted to differ 
 | `x-envoy-*` | Routed-to-upstream HTTP/1.1 responses | Every header with this prefix; presence-not-required on subject (envoy-go does not inject these in phase 04; Envoy does). | Phase 04 | ADR-0044 |
 | `x-forwarded-*` | Routed-to-upstream HTTP/1.1 responses | Every header with this prefix; presence-not-required on subject. | Phase 04 | ADR-0044 |
 | `x-request-id` | Routed-to-upstream HTTP/1.1 responses | Presence-not-required on subject. | Phase 04 | ADR-0044 |
-| `:status` | HCM-locally-generated H2 responses; required + value-asserted | Phase 05.1 | ADR-0052 |
-| `:method` | Routed-to-upstream H2 requests; required + value-asserted (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
-| `:path` | Routed-to-upstream H2 requests (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
-| `:scheme` | Routed-to-upstream H2 requests (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
-| `:authority` | Routed-to-upstream H2 requests (applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)) | Phase 05.1 | ADR-0052 |
+| `:status` | HCM-locally-generated H2 responses | Required + value-asserted | Phase 05.1 | ADR-0052 |
+| `:method` | Routed-to-upstream H2 requests | Required + value-asserted (active per ADR-0057; phase 05.2) | Phase 05.1 | ADR-0052 |
+| `:path` | Routed-to-upstream H2 requests | Required + value-asserted (active per ADR-0057; phase 05.2) | Phase 05.1 | ADR-0052 |
+| `:scheme` | Routed-to-upstream H2 requests | Required + value-asserted (active per ADR-0057; phase 05.2) | Phase 05.1 | ADR-0052 |
+| `:authority` | Routed-to-upstream H2 requests | Required + value-asserted (active per ADR-0057; phase 05.2) | Phase 05.1 | ADR-0052 |
 
 ---
 
