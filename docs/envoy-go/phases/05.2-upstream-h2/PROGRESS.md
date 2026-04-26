@@ -782,7 +782,7 @@ $ # ADR tail unchanged at 0056 (Task 10 lands no new ADR per ADR-0016 + SPEC §5
 
 ## Task 11 — HCM `routerActionH2` + variant selection + `h2.Action` widening + `h2RouterActionAdapter` + ADR-0058
 
-**Commit:** SHA-fill (the SHA is filled in the follow-up commit).
+**Commit:** dd30a4c (main); SHA-fill commit lands on top.
 
 **Files changed:**
 
