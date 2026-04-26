@@ -51,6 +51,48 @@ func TestSettings_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestClientInitialSettings_RoundTrip(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
+
+	cliF := newFramer(c1, 16384)
+	srvF := newFramer(c2, 16384)
+
+	go func() {
+		_ = writeClientInitialSettings(cliF, DefaultServerSettings)
+	}()
+	frame, err := srvF.ReadFrame()
+	if err != nil {
+		t.Fatalf("ReadFrame = %v, want nil", err)
+	}
+	sf, ok := frame.(*http2.SettingsFrame)
+	if !ok {
+		t.Fatalf("got %T, want *SettingsFrame", frame)
+	}
+	if sf.IsAck() {
+		t.Fatal("first frame is SETTINGS_ACK; want non-ACK SETTINGS")
+	}
+	if v, _ := sf.Value(http2.SettingMaxConcurrentStreams); v != DefaultServerSettings.MaxConcurrentStreams {
+		t.Errorf("MaxConcurrentStreams = %d, want %d", v, DefaultServerSettings.MaxConcurrentStreams)
+	}
+	if v, _ := sf.Value(http2.SettingInitialWindowSize); v != DefaultServerSettings.InitialWindowSize {
+		t.Errorf("InitialWindowSize = %d, want %d", v, DefaultServerSettings.InitialWindowSize)
+	}
+	if v, _ := sf.Value(http2.SettingMaxFrameSize); v != DefaultServerSettings.MaxFrameSize {
+		t.Errorf("MaxFrameSize = %d, want %d", v, DefaultServerSettings.MaxFrameSize)
+	}
+	if v, _ := sf.Value(http2.SettingEnablePush); v != DefaultServerSettings.EnablePush {
+		t.Errorf("EnablePush = %d, want %d", v, DefaultServerSettings.EnablePush)
+	}
+	if v, _ := sf.Value(http2.SettingHeaderTableSize); v != DefaultServerSettings.HeaderTableSize {
+		t.Errorf("HeaderTableSize = %d, want %d", v, DefaultServerSettings.HeaderTableSize)
+	}
+	if v, _ := sf.Value(http2.SettingID(0x9)); v != DefaultServerSettings.NoRFC7540Priorities {
+		t.Errorf("NoRFC7540Priorities = %d, want %d", v, DefaultServerSettings.NoRFC7540Priorities)
+	}
+}
+
 func TestReadClientSettings_AckOnFirstReadIsProtocolError(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer func() { _ = c1.Close() }()

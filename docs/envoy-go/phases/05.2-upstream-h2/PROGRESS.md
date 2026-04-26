@@ -528,3 +528,52 @@ ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.352s
 
 $ golangci-lint run ./internal/filter/hcm/h2/ ./test/conformance/h2spec/   # exit 0, M-8 //nolint:unused removed
 ```
+
+
+## Task 7 — H2 client codec — `client.go` skeleton (`H2Request`/`H2Response`, `ClientConn`, preface + SETTINGS exchange, `Close`)
+
+**Commits:** TBD
+**Files changed:**
+- `internal/filter/hcm/h2/client.go` — NEW. ONE new file in the h2 sub-package per ADR-0048's reservation. Contents: package doc comment locating the file as the fourth in the package permitted to import `golang.org/x/net/http2` directly (after framer.go, settings.go, conn.go); `H2Request` + `H2Response` value types per ADR-0048 (split-pseudoheader fields per RFC 9113 §8.3); `ClientConn` struct with framer/hpack/window/settings state + `closeOnce`/`goawayCh`/`settingsAckCh` synchronisation channels; `NewClientConn(ctx, upstream net.Conn) (*ClientConn, error)` running the 5-step connection setup (preface → write SETTINGS → read peer SETTINGS + ACK → spawn readLoop → synchronously wait on `settingsAckCh` per SPEC §10 #5); `readPeerSettingsAndAck` reusing the existing `readClientSettings` helper (which rejects ACK-on-first-read with PROTOCOL_ERROR per RFC 9113 §6.5); `readLoop` driving `cc.fr.readFrameCtx(cc.ctx)`; `dispatchFrame` skeleton handling SETTINGS_ACK (closes `settingsAckCh`) + GOAWAY (closes `goawayCh`) + drop everything else (Task 8 routes stream frames); `RoundTrip` STUB returning `errors.New("h2: client: RoundTrip not implemented (Task 8)")`; `Close()` idempotent via `sync.Once` emitting `WriteGoAway(lastID, http2.ErrCode(ErrNoError), []byte("client close"))` then `cc.cancel()` then `conn.Close()`. 232 LoC.
+- `internal/filter/hcm/h2/client_test.go` — NEW. Three tests: `TestNewClientConn_PrefaceAndSettingsExchange` (full handshake happy path through `runFakeServerPeerForClientHandshake` helper); `TestClientConn_Close_EmitsGracefulGoaway` (asserts GOAWAY frame on the wire with `ErrCodeNo` after Close); `TestNewClientConn_SettingsHandshakeFailureBubblesUp` (peer writes SETTINGS_ACK as its first frame → expects `*Error{Code: ErrProtocolError}` per RFC 9113 §6.5). Helper `runFakeServerPeerForClientHandshake` reads the client preface + client SETTINGS, writes server SETTINGS, reads client SETTINGS_ACK BEFORE writing its own SETTINGS_ACK to side-step a synchronous-`net.Pipe` deadlock (RFC 9113 §6.5 imposes no ordering between the two ACKs). 195 LoC.
+- `internal/filter/hcm/h2/settings.go` — `writeClientInitialSettings` added (parallel to `writeServerInitialSettings`; phase 05.2 uses byte-identical defaults per ADR-0047 + RFC 9113 §6.5.2 ENABLE_PUSH=0). +19 LoC.
+- `internal/filter/hcm/h2/settings_test.go` — `TestClientInitialSettings_RoundTrip` round-trips the SETTINGS through `net.Pipe` and asserts each of the six values, including the RFC 9218 `NoRFC7540Priorities` setting (raw ID 0x9). +42 LoC.
+
+**Notes:** TDD self-check observed:
+
+1. RED: with only `client_test.go` in place (and `client.go` absent), `go test ./internal/filter/hcm/h2/ -run TestNewClientConn -v` failed with `client_test.go:N: undefined: NewClientConn` ×3 — exactly the expected build failure for the three call sites.
+2. GREEN: after writing `client.go`, the same command passes all three tests in milliseconds. `TestClientInitialSettings_RoundTrip` (Step 2's settings unit test) was verified separately by temporarily moving `client_test.go` aside (so the package builds without `NewClientConn`); it passed in isolation, then re-built and passed when `client_test.go` was restored alongside `client.go`.
+
+Symbol-rename divergences from the PLAN's snippet:
+- The PLAN snippet at line 1336 uses `cc.fr.WriteGoAway(lastID, uint32(ErrNoError), …)`. The on-disk `framer.WriteGoAway` (embedded `*http2.Framer.WriteGoAway`) has signature `(maxStreamID uint32, code http2.ErrCode, debugData []byte)`. Cast adjusted to `http2.ErrCode(ErrNoError)` to match `emitGoaway` in `conn.go:658`.
+- The PLAN snippet at line 1261 took a `ctx` parameter on `readPeerSettingsAndAck`. `readClientSettings` is not ctx-aware (uses `fr.ReadFrame()` directly), so the parameter would be unused. Dropped to keep the call site honest; the wider `NewClientConn` ctx is honoured via the spawned readLoop's `readFrameCtx`.
+
+Lint annotations added:
+- `//nolint:revive` on `H2Request`/`H2Response` — ADR-0048 reserves these stuttering names; revive's `exported` rule otherwise flags `h2.H2Request` as a stutter.
+- `//nolint:unused` on `streams sync.Map` and `recvDebitSinceLastUpdate int32` — both fields populated by Task 8.
+
+Boundary-check confirmation: `grep -l 'golang.org/x/net/http2' internal/filter/hcm/h2/*.go | grep -v _test` now returns 4 non-`hpack` callers (framer.go, settings.go, conn.go, client.go) plus 3 hpack-only files (doc.go's reference is in a comment; hpack.go and stream.go import only `golang.org/x/net/http2/hpack`). The "exactly four" file claim from the SPEC's tech-stack section is satisfied; Task 15's boundary grep is the formal verification.
+
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/ -run "TestNewClientConn|TestClientConn_Close|TestClientInitialSettings" -v -timeout 15s
+=== RUN   TestNewClientConn_PrefaceAndSettingsExchange
+--- PASS: TestNewClientConn_PrefaceAndSettingsExchange (0.00s)
+=== RUN   TestClientConn_Close_EmitsGracefulGoaway
+--- PASS: TestClientConn_Close_EmitsGracefulGoaway (0.00s)
+=== RUN   TestNewClientConn_SettingsHandshakeFailureBubblesUp
+--- PASS: TestNewClientConn_SettingsHandshakeFailureBubblesUp (0.00s)
+=== RUN   TestClientInitialSettings_RoundTrip
+--- PASS: TestClientInitialSettings_RoundTrip (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.003s
+
+$ go test -race ./internal/filter/hcm/h2/ -timeout 120s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.372s
+
+$ go vet ./internal/filter/hcm/h2/
+$ # exit 0
+
+$ golangci-lint run ./internal/filter/hcm/h2/
+$ # exit 0
+```

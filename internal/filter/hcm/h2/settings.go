@@ -53,6 +53,25 @@ func writeServerInitialSettings(fr *framer, s ServerSettings) error {
 	)
 }
 
+// writeClientInitialSettings writes the client's initial SETTINGS frame.
+// In phase 05.2 the client and server settings are byte-identical (the same
+// DefaultServerSettings constants per ADR-0047 apply on both sides;
+// SETTINGS_ENABLE_PUSH=0 is correct for the client per RFC 9113 §6.5.2 because
+// clients can't accept PUSH — advertising it disabled is symmetric correctness).
+// A separate helper exists from writeServerInitialSettings for future divergence
+// (when client-only settings tuning lands in a future phase).
+func writeClientInitialSettings(fr *framer, s ServerSettings) error {
+	return fr.WriteSettings(
+		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: s.MaxConcurrentStreams},
+		http2.Setting{ID: http2.SettingInitialWindowSize, Val: s.InitialWindowSize},
+		http2.Setting{ID: http2.SettingMaxFrameSize, Val: s.MaxFrameSize},
+		http2.Setting{ID: http2.SettingEnablePush, Val: s.EnablePush},
+		http2.Setting{ID: http2.SettingHeaderTableSize, Val: s.HeaderTableSize},
+		// SETTINGS_NO_RFC7540_PRIORITIES is RFC 9218; not in stdlib's enum.
+		http2.Setting{ID: http2.SettingID(0x9), Val: s.NoRFC7540Priorities},
+	)
+}
+
 // readClientSettings reads one SETTINGS frame from fr and applies its values
 // to applyTo. Returns *Error{Code: PROTOCOL_ERROR} if the first frame is a
 // SETTINGS_ACK (RFC 9113 §6.5: server must read client's initial SETTINGS
