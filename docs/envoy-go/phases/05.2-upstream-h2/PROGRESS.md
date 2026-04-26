@@ -844,7 +844,7 @@ $ # ADR tail advanced 0056 → 0058 (Task 11 lands ADR-0058; ADR-0057 lands late
 
 ## Task 12 — `test/helpers/h2.go` H2RoundTrip helper
 
-**Commit:** {{SHA}} (main); SHA-fill commit lands on top.
+**Commit:** abbccae (main); SHA-fill commit lands on top.
 
 **Files changed:**
 
