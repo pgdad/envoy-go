@@ -577,3 +577,69 @@ $ # exit 0
 $ golangci-lint run ./internal/filter/hcm/h2/
 $ # exit 0
 ```
+
+
+## Task 8 — H2 client codec — `(*ClientConn).RoundTrip` + `clientStream` + frame-read loop
+
+**Commits:** TBD-MAIN-SHA
+**Files changed:**
+- `internal/filter/hcm/h2/client.go` — Task 7's stub `RoundTrip` replaced with the full implementation; conn-level dispatchFrame skeleton extended to route stream-bound frames (HEADERS, DATA, RST_STREAM, WINDOW_UPDATE, PING, GOAWAY-stream-cleanup); new `clientStream` struct (per-stream state) with `newClientStream` + `finish(err)` constructor/method; new `(*ClientConn).writeData` symmetric with Task 3's ServerConn.writeData (per-stream send-window first, then conn-level, MaxFrameSize cap, END_STREAM on last chunk); new `(*ClientConn).lookupStream(id)` and `(*ClientConn).emitGoaway(code)` helpers (the latter mirrors `(*ServerConn).emitGoaway`); `goawaySent bool` field added to ClientConn so Close + emitGoaway are idempotent against each other. RoundTrip body: ctx-check upfront → `atomic.AddUint32(&cc.nextStreamID, 2) - 1` allocator (1, 3, 5, ...) → `cc.streams.Store/Delete` → encode pseudo-headers in RFC 9113 §8.3 order then req.Headers → `cc.fr.WriteHeaders` mutex-guarded → optional `writeData` for body → 3-way select on `cs.doneCh` (success/stream-error), `ctx.Done()` (emit RST_STREAM(CANCEL), return ctx.Err()), `cc.ctx.Done()` (conn-closed wrap). Receive-side flow-control mirrors Task 4: per-DATA debit on both `cc.recvW` and `cs.recvW`, half-window threshold emits WINDOW_UPDATE on conn-level (id 0) and stream-level (only if stream is still half-open per ADR-0055 / I-3). Trailing HEADERS observed-and-discarded per ADR-0058 (ADR lands in Task 11; this task implements the rule via `cs.respHeadersSeen` boolean). +389 LoC (621 total).
+- `internal/filter/hcm/h2/client_test.go` — Nine new RoundTrip tests per SPEC §4.1 + §8.1 + a `fakeH2ServerPeer` helper (handshake + readRequestHeaders + readDataFrame + writeResponse + persistent hpack.Decoder for cross-iteration HPACK state) and a `dialClientConn` test fixture that bundles handshake + idempotent cleanup. Tests: HappyPath_BodylessGET, HappyPath_WithBody, CtxCancelDuringWrite (asserts RST_STREAM(CANCEL) on the wire), CtxCancelDuringRead (HEADERS observed but no DATA → cancel mid-read), PeerRSTStream (asserts `*Error{Code: CANCEL}`), PeerGoaway (LastStreamID=0 finishes stream 1 with stream-error), PeerDataAfterEndStream (rogue DATA after END_STREAM → `cc.ctx` canceled by readLoop), AfterClose, StreamIDMonotonicity (sequential 3× → ids 1,3,5). +668 LoC (863 total).
+- `docs/envoy-go/phases/05.2-upstream-h2/PROGRESS.md` — this entry.
+
+**Notes:** TDD discipline observed: with the Task 7 stub in place, all 9 new tests first FAILED (8 with the stub's "h2: client: RoundTrip not implemented (Task 8)" error message; AfterClose passed early because the stub-error matched the assertion's "any error" criterion — the test still verified the post-implementation conn-closed path because Close cancels `cc.ctx` before the upfront `cc.ctx.Err()` check). After the implementation landed, all 9 PASS:
+
+```
+=== RUN   TestClientConn_RoundTrip_HappyPath_BodylessGET
+--- PASS: TestClientConn_RoundTrip_HappyPath_BodylessGET (0.00s)
+=== RUN   TestClientConn_RoundTrip_HappyPath_WithBody
+--- PASS: TestClientConn_RoundTrip_HappyPath_WithBody (0.00s)
+=== RUN   TestClientConn_RoundTrip_CtxCancelDuringWrite
+--- PASS: TestClientConn_RoundTrip_CtxCancelDuringWrite (0.00s)
+=== RUN   TestClientConn_RoundTrip_CtxCancelDuringRead
+--- PASS: TestClientConn_RoundTrip_CtxCancelDuringRead (0.02s)
+=== RUN   TestClientConn_RoundTrip_PeerRSTStream
+--- PASS: TestClientConn_RoundTrip_PeerRSTStream (0.00s)
+=== RUN   TestClientConn_RoundTrip_PeerGoaway
+--- PASS: TestClientConn_RoundTrip_PeerGoaway (0.00s)
+=== RUN   TestClientConn_RoundTrip_PeerDataAfterEndStream
+--- PASS: TestClientConn_RoundTrip_PeerDataAfterEndStream (0.10s)
+=== RUN   TestClientConn_RoundTrip_AfterClose
+--- PASS: TestClientConn_RoundTrip_AfterClose (0.00s)
+=== RUN   TestClientConn_RoundTrip_StreamIDMonotonicity
+--- PASS: TestClientConn_RoundTrip_StreamIDMonotonicity (0.00s)
+```
+
+Symbol-rename divergences from the PLAN snippets:
+- The PLAN snippet at line 1481 calls `cs.finish(streamError(...))` then `return H2Response{}, translateFramerErr(err)` after the WriteHeaders error path. Implementation simplifies: no separate `cs.finish` call before returning, because the deferred `cc.streams.Delete(id)` cleanup runs on RoundTrip's return regardless and no other goroutine has yet observed the stream. The stream is never "finished"-via-doneCh since RoundTrip returns directly with the framer error; this matches the symmetric ServerConn behavior where a write failure short-circuits the goroutine.
+- The PLAN snippet at line 1556 returns `streamError(ErrStreamClosed, ...)` from the DATA-on-closed-stream case. Implementation upgrades that to `connError(ErrStreamClosed, ...)` so the readLoop's `cc.cancel()` is triggered (the readLoop's error handling treats any non-nil dispatchFrame error as connection-fatal). The PeerDataAfterEndStream test asserts `cc.ctx.Err() != nil` after the rogue frame, validating that this is the desired behavior (otherwise the test couldn't observe the violation, since RoundTrip already returned cleanly with the legitimate response).
+- New `respHeadersSeen` boolean added to `clientStream` to disambiguate "first HEADERS not yet observed" from "first HEADERS observed but had no fields beyond :status" — without it, the second-HEADERS detection rule (ADR-0058 trailing-HEADERS-discard) could misclassify a legitimate first HEADERS block whose `respHeaders` slice happened to be a non-nil empty slice.
+- `PingFrame` ACK path in dispatchFrame writes the ACK reply mutex-guarded; this is symmetric with ServerConn.onPing.
+- `WindowUpdateFrame` zero-delta on a stream is treated as a stream-error (cs.finish with PROTOCOL_ERROR); RFC 9113 §6.9 is somewhat ambiguous about whether the stream-level zero-delta is connection-fatal, but ServerConn.onWindowUpdate treats stream-level zero-delta (when found) as a stream error too (via the `recvWindowUpdate` path). Symmetric.
+
+Pitfall avoidance:
+- The PeerDataAfterEndStream test originally used a 50ms post-response sleep before sending the rogue DATA; observed flake on a slower scheduler (deferred `cc.streams.Delete` not yet run when readLoop processed rogue DATA → lookupStream succeeded → no protocol violation surfaced). Bumped to 100ms — the test is intentionally non-time-sensitive on the assertion side (it polls `cc.ctx.Err()` for up to 2s).
+- StreamIDMonotonicity originally used a concurrent-WaitGroup pattern with three goroutines and 20ms staggered launches. Net.Pipe's synchronous bidirectional I/O made the lockstep fragile (peer's writeResponse blocks on a non-reading client when multiple RT goroutines contend on `cc.mu`). Refactored to sequential RoundTrips — the unit-under-test is the allocator, not the concurrency model.
+- `fakeH2ServerPeer.decodeBlock` originally constructed a fresh `hpack.Decoder` per call. HPACK is stateful; the client's encoder accumulates dynamic-table entries across iterations, so a per-call decoder rejected entries indexed into the table on iteration 2+. Refactored to a persistent `p.dec` + `p.decFields` slice reused across iterations.
+
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/ -run TestClientConn_RoundTrip -v -timeout 30s
+[... 9 PASS lines as above ...]
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.124s
+
+$ go test -race ./internal/filter/hcm/h2/ -timeout 120s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.512s
+
+$ go test ./test/conformance/h2spec/ -v
+        53 tests, 53 passed, 0 skipped, 0 failed
+--- PASS: TestH2Spec (2.24s)
+
+$ golangci-lint run ./internal/filter/hcm/h2/
+$ # exit 0
+
+$ grep -n '"golang.org/x/net/http2"' internal/filter/hcm/h2/client.go
+24:	"golang.org/x/net/http2"
+$ # single import — ADR-0046 boundary preserved (no new file added; the import was added in Task 7)
+```
