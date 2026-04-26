@@ -886,7 +886,7 @@ $ # ADR tail unchanged at 0058 (Task 12 lands no new ADR — fixture infrastruct
 
 ## Task 13 — Fixture 0004 PKI + backends + bootstraps + expectations + README
 
-**Commit:** TBD (main); SHA-fill commit lands on top.
+**Commit:** 87cb26e (main); SHA-fill commit lands on top.
 
 **Files changed:**
 
