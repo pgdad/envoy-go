@@ -628,3 +628,74 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	(cached)
 ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	(cached)
 ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 ```
+
+## Task 15 — test/conformance/h2spec/ + CONFORMANCE_PINS.md + ADR-0051
+
+**Commits:** 18aa28f
+**Notes:** Implemented the project's first non-vacuous h2spec conformance gate. Fixed four codec bugs uncovered by the failing test cases, created `docs/envoy-go/CONFORMANCE_PINS.md` pinning the h2spec image digest, and appended ADR-0051 to DECISIONS.md.
+
+**Codec bugs fixed:**
+
+1. `framer.go` — `http2.ErrFrameTooLarge` was NOT wrapped as `http2.ConnectionError` by x/net/http2; it is a plain `errors.New` sentinel. The type assertion in `Run()` produced `hErr=nil` so no GOAWAY was sent. Fixed by adding explicit `errors.Is(err, http2.ErrFrameTooLarge)` check in `readFrameCtx` (and `tryReadFrame`), wrapping as `*Error{Code: ErrFrameSizeError}`. This fixed h2spec 4.2/2 and 4.2/3 (FRAME_SIZE_ERROR).
+
+2. `conn.go` — `Run()` framer error path called `conn.Close()` with unread bytes in the socket buffer, causing the OS to send a TCP RST that destroyed the already-written GOAWAY. Fixed by draining the socket (io.Copy to io.Discard with 500ms deadline) between `emitGoaway` and `conn.Close()`. This is required for GOAWAY delivery on FRAME_SIZE_ERROR.
+
+3. `conn.go` — `onHeaders()` `isClosed` branch was sending RST_STREAM instead of GOAWAY(STREAM_CLOSED). RFC 9113 §5.1 requires a connection error (GOAWAY) for HEADERS on a closed stream. Fixed by changing `streamError` → `connError(ErrStreamClosed, ...)`. Also moved `drainDone()` call to the very start of `onHeaders` (before the `s.streams` lookup) so that goroutines completing between frames are transferred to `closedStreams` before the state check. This fixed h2spec 5.1/12.
+
+4. `conn.go` — stream concurrency admission check (h2spec 5.1.2/1): the original `atomic.Int32 activeStreams` counter was decremented in dispatch goroutines. With `direct_response` completing nearly instantly, all 100 goroutines could decrement the counter before the 101st HEADERS arrived, admitting the overflow stream. Fixed with deferred dispatch: goroutine closures are queued in `pendingDispatch []func()` instead of launched immediately. After each frame, `tryReadFrame` checks for more frames in the same TCP burst. When the burst is exhausted, `flushPendingDispatch()` launches all pending goroutines. RST_STREAM for the overflow stream is thus written before any DATA responses. Removed `atomic.Int32`, added `doneCh chan uint32` for goroutine-to-frame-loop signalling, added `drainDone()` drain helper, added `pendingDispatch` queue.
+
+**Frame ownership note:** `processFrameAndMaybeDrain` processes each frame immediately after reading (before the next `ReadFrame` call) because `http2.Framer` reuses its internal buffer — storing frames then calling `ReadFrame` again causes a panic (`"Frame accessor called on non-owned Frame"`).
+
+**ADR-0051:** image pin rationale, section exclusion policy (§6.6 PUSH_PROMISE excluded; server has ENABLE_PUSH=0), threshold definition (failures==0, -S strict mode), testcontainers-go infrastructure choice.
+
+**CONFORMANCE_PINS.md:** image digest `sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0`, 53-case section table, first-run result.
+
+**Outputs:**
+```
+$ go test ./test/conformance/h2spec/... -v -timeout 60s
+=== RUN   TestH2Spec
+--- PASS: TestH2Spec (2.13s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.209s
+
+h2spec output:
+53 tests, 53 passed, 0 skipped, 0 failed
+
+[PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+[PASS] 4.1. Frame Format: 3/3 passed
+[PASS] 4.2. Frame Size: 3/3 passed
+[PASS] 4.3. Header Compression and Decompression: 3/3 passed
+[PASS] 5.1. Stream States: 13/13 passed
+[PASS] 5.1.1. Stream Identifiers: 2/2 passed
+[PASS] 5.1.2. Stream Concurrency: 1/1 passed
+[PASS] 5.3.1. Stream Dependencies: 2/2 passed
+[PASS] 5.4.1. Connection Error Handling: 2/2 passed
+[PASS] 5.5. Extending HTTP/2: 2/2 passed
+[PASS] 7. Error Codes: 2/2 passed
+[PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+[PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+[PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+[PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+[PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+[PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+[PASS] 8.2. Server Push: 1/1 passed
+
+$ go test ./... -timeout 180s
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.811s
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+ok  	github.com/esalaine/envoy-go/internal/cluster	(cached)
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.009s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.259s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	(cached)
+ok  	github.com/esalaine/envoy-go/internal/listener	0.009s
+ok  	github.com/esalaine/envoy-go/internal/tls	(cached)
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.395s
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0051: h2spec conformance gate — image pin, section exclusion, and threshold policy
+```
