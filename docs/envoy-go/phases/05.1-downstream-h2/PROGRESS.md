@@ -704,7 +704,7 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 
 ## Task 16 — BEHAVIOR_CONTRACT `## HTTP/2` SCAFFOLD + ADR-0052 + ADR-0053 + all-gates green local sweep
 
-**Commits:** 4330c37 (BEHAVIOR_CONTRACT + ADRs), e806f17 (race fixes), 3b4e2ed (misspelling fix), fb921ba (gate-sweep PROGRESS), <sha-fill-pending>
+**Commits:** 4330c37 (BEHAVIOR_CONTRACT + ADRs), e806f17 (race fixes), 3b4e2ed (misspelling fix), fb921ba (gate-sweep PROGRESS), 6c1099f (SHA-fill)
 **Notes:** Phase-05.1 closing task. BEHAVIOR_CONTRACT extended with `## HTTP/2` SCAFFOLD subsection + 5 new Header allow-list rows; ADR-0052 codifies the 05.1 equivalence surface (SCAFFOLD form); ADR-0053 triages phase-04 REVIEW Minor carry-forward items (M-2/M-4/M-5/M-6/M-7). Race fixes in emitGoaway (conn.go) and framer_test.go concurrent write ordering landed as a separate small commit per task instructions. golangci-lint has 118 pre-existing issues from Tasks 1-15 (confirmed present at commit 8d81be9, predating Task 16); my changes net REDUCED the count by 3 (fixed serialised→serialized). Pre-existing issues are substantive scope creep (errcheck on defer conn.Close(), misspellings throughout, gofmt alignment, unused fields) — reporting as DONE_WITH_CONCERNS per PLAN §9 guidance.
 
 Gate (a) differential fixtures: PASS — VACUOUS per ADR-0045 (no new fixture in 05.1); pre-existing fixtures (0000, 0001, 0002, 0003) all green. Duration: 4.83s.
