@@ -276,7 +276,7 @@ This subsection is **SCAFFOLD form** — phase 05.2's brainstorming session edit
 
 - **Conformance, not differential.** The 05.1 H2 surface is asserted via h2spec against the subject standalone, not via a side-by-side proxy-vs-proxy fixture. The differential equivalence of the `direct_response` H2 path (status, decoded body, header set-equality, framing structure) is exercised indirectly through h2spec section 8 (HTTP Message Exchanges).
 - **`:status` per request:** required + asserted by h2spec section 8 on every `direct_response` invocation.
-- **Decoded body bytes** on `direct_response` 2xx paths: byte-equal to the configured `body` string (h2spec validates indirectly via response-length and END_STREAM checks; envoy-go's unit tests assert byte equality directly).
+- **Decoded body bytes** on `direct_response` 2xx paths: byte-equal to the configured `body` string (h2spec validates indirectly via response-length and END_STREAM checks; envoy-go's hcm-package unit tests assert byte equality on the captured DATA payload via a fake StreamWriter — see `actions_test.go` `TestDirectResponseWriteH2_HEADERSThenDATAEndStream`).
 - **Per-stream response header set-equality modulo allow-list:** locally-generated H2 responses carry `:status` (required + asserted), `Server` (required, value `envoy` per ADR-0014, matched verbatim with upstream's value also `envoy`), `Content-Type`, `Content-Length`, `Date` (presence required; value not byte-compared — same as phase-01 admin/ready discipline). Routed-to-upstream H2 surface: NOT YET ASSERTED IN 05.1 (deferred to 05.2 + fixture 0004).
 
 ### Not asserted (05.1 scope)

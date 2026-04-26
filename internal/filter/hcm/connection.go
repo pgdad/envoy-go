@@ -22,6 +22,11 @@ import (
 //   - Connection: close on the request OR the response signaling
 //     errCloseAfterAction
 //
+// On TLS listeners with ALPN, this driver is reached via filter.Handle's
+// codec dispatch when the negotiated ALPN is "http/1.1" (or the codec
+// is set to HTTP1 explicitly); see ADR-0050 and SPEC §5.4 for the
+// dispatch contract.
+//
 // Per SPEC §5.3 / §5.6 / SPEC §10 #3 settled.
 func runConnection(ctx context.Context, downstream net.Conn, table *routeTable) {
 	defer func() { _ = downstream.Close() }()

@@ -322,6 +322,10 @@ static_resources:
 // PKI: uses fixture-0002 server-alpha cert/key (DNS SAN: alpha.envoy-go.test).
 // The client uses InsecureSkipVerify: true so no CA chain validation is needed;
 // ServerName is set to alpha.envoy-go.test to satisfy the SNI/cert match.
+//
+// Smoke-only: production tests must verify CA chain (this test uses
+// InsecureSkipVerify: true and is intended only as a binary-level
+// smoke check that the H2 dataplane wires up end-to-end).
 func TestEnvoyGoBinary_H2Smoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping binary smoke test in -short mode")
