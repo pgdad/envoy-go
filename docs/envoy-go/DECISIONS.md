@@ -1693,3 +1693,60 @@ Phase 05.1 implements ALPN dispatch INSIDE `Filter.Handle`, not at the listener-
 - Phase-05.2's `routerActionH2` will land on top of this same dispatch path; no changes to `Filter.Handle` are needed in 05.2.
 
 This ADR supersedes nothing.
+
+## ADR-0051: h2spec conformance gate — image pin + section exclusion policy
+
+**Status:** Accepted
+**Date:** 2026-04-25
+**Doctrine:** D-3.5
+**Settles:** SPEC §9 (conformance gate), SPEC §11.3 (PUSH_PROMISE exclusion).
+
+### Context
+
+Phase 05.1 requires a non-vacuous conformance gate (`gate c`) that runs
+`summerwind/h2spec` against the live envoy-go binary.  Two decisions must be
+made:
+
+1. **Which image version to pin**, and how to record the pin.
+2. **Which h2spec sections to include in the threshold**, given that some RFC
+   sections test behaviour envoy-go deliberately does not implement.
+
+The PUSH_PROMISE section (RFC 9113 §6.6) tests server push.  Our server
+unconditionally sets `SETTINGS_ENABLE_PUSH=0`; a client that subsequently sends
+a PUSH_PROMISE frame is violating the protocol.  h2spec 6.6 tests the client's
+reaction to server-push, which is irrelevant when the server has disabled push.
+Running 6.6 would produce vacuous passes (h2spec would receive a
+PROTOCOL_ERROR and consider it a test pass, not a real conformance signal).
+
+### Decision
+
+1. **Image pin**: The conformance gate uses
+   `summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0`
+   (pinned by digest, not by tag).  The pin is recorded in two places:
+   - `test/conformance/h2spec/h2spec.go` (`h2specDigest` constant) — machine-readable
+   - `docs/envoy-go/CONFORMANCE_PINS.md` — human-readable audit trail with pull date
+
+2. **Section inclusion**: The gate runs sections `http2/3`, `http2/4`, `http2/5`,
+   `http2/6/1–6/5`, `http2/6/7–6/10`, `http2/7`, `http2/8` (53 test cases).
+   Section `http2/6/6` (PUSH_PROMISE) is excluded because `SETTINGS_ENABLE_PUSH=0`
+   makes those test cases vacuous.
+
+3. **Threshold**: `failures == 0` across all included sections.  The gate uses
+   `-S` (strict mode) to include strict test cases.
+
+4. **Infrastructure**: The gate boots a real envoy-go binary from a synthetic h2c
+   bootstrap config, runs h2spec via `testcontainers-go`, and parses the JUnit XML
+   report.  The test skips under `-short` and when Docker is unavailable.
+
+### Consequences
+
+- The pin guarantees that CI and local runs use identical test tooling.
+- `CONFORMANCE_PINS.md` provides an audit trail; a future phase that upgrades
+  h2spec appends a new row rather than editing in-place.
+- Excluding 6.6 is a conscious choice, not an oversight.  Any future phase that
+  implements server push MUST add 6.6 to `thresholdSections` and append a new
+  ADR documenting the inclusion.
+- The `-S` (strict) flag is intentional: it exercises additional test cases
+  beyond the base RFC that were not covered by the non-strict run.
+
+This ADR supersedes nothing.

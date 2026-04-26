@@ -14,8 +14,8 @@ func TestFramer_SettingsRoundTrip(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	f1 := newFramer(c1)
-	f2 := newFramer(c2)
+	f1 := newFramer(c1, 16384)
+	f2 := newFramer(c2, 16384)
 
 	go func() {
 		_ = f1.WriteSettings(
@@ -46,8 +46,8 @@ func TestFramer_PingRoundTrip(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	f1 := newFramer(c1)
-	f2 := newFramer(c2)
+	f1 := newFramer(c1, 16384)
+	f2 := newFramer(c2, 16384)
 
 	pingData := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
 
@@ -92,8 +92,8 @@ func TestFramer_HeadersRoundTrip(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	f1 := newFramer(c1)
-	f2 := newFramer(c2)
+	f1 := newFramer(c1, 16384)
+	f2 := newFramer(c2, 16384)
 
 	// 0x88 is a valid HPACK-encoded :status: 200 indexed header field.
 	block := []byte{0x88}
@@ -134,8 +134,8 @@ func TestFramer_DataRoundTrip(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	f1 := newFramer(c1)
-	f2 := newFramer(c2)
+	f1 := newFramer(c1, 16384)
+	f2 := newFramer(c2, 16384)
 
 	// First DATA frame: endStream=false.
 	go func() {
@@ -181,8 +181,8 @@ func TestFramer_RSTStreamWindowUpdateGoAway(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	f1 := newFramer(c1)
-	f2 := newFramer(c2)
+	f1 := newFramer(c1, 16384)
+	f2 := newFramer(c2, 16384)
 
 	// RST_STREAM
 	go func() {
@@ -246,7 +246,7 @@ func TestFramer_ReadFrameCtxCancel(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
-	f := newFramer(c1)
+	f := newFramer(c1, 16384)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(20 * time.Millisecond)

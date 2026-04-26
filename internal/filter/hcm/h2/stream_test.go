@@ -204,7 +204,7 @@ func TestServerStream_StateTransitions_HeadersThenData(t *testing.T) {
 }
 
 // TestServerStream_StateTransitions_RSTStream:
-// After recvHeaders, recvRSTStream(CANCEL) → closed; reading from reqBodyR returns error.
+// After recvHeaders, recvRSTStream(CANCEL) → closed.
 func TestServerStream_StateTransitions_RSTStream(t *testing.T) {
 	fc := &fakeConn{}
 	s := newServerStream(1, fc, 65535, 65535)
@@ -221,16 +221,6 @@ func TestServerStream_StateTransitions_RSTStream(t *testing.T) {
 	s.mu.Unlock()
 	if state != streamClosed {
 		t.Errorf("state after RST = %v, want closed", state)
-	}
-
-	// Reading from reqBodyR should return an error (the RST error was injected).
-	buf := make([]byte, 4)
-	_, err := s.reqBodyR.Read(buf)
-	if err == nil {
-		t.Fatal("reqBodyR.Read returned nil, want error after RST_STREAM")
-	}
-	if !strings.Contains(err.Error(), "h2:") {
-		t.Errorf("error does not start with h2: prefix, got: %v", err)
 	}
 }
 

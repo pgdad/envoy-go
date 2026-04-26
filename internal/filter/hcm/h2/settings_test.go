@@ -31,8 +31,8 @@ func TestSettings_RoundTrip(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	srvF := newFramer(c1)
-	cliF := newFramer(c2)
+	srvF := newFramer(c1, 16384)
+	cliF := newFramer(c2, 16384)
 
 	go func() {
 		_ = writeServerInitialSettings(srvF, DefaultServerSettings)
@@ -55,8 +55,8 @@ func TestReadClientSettings_AckOnFirstReadIsProtocolError(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
-	srvF := newFramer(c1)
-	cliF := newFramer(c2)
+	srvF := newFramer(c1, 16384)
+	cliF := newFramer(c2, 16384)
 	go func() {
 		_ = cliF.WriteSettingsAck()
 	}()

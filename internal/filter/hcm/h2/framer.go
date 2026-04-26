@@ -21,10 +21,13 @@ type framer struct {
 // newFramer constructs a framer over conn for both reading and writing. The
 // returned value embeds *http2.Framer so callers can use WriteSettings,
 // WriteHeaders, WriteData, WriteRSTStream, WriteWindowUpdate, WritePing,
-// WriteGoAway, and ReadFrame directly.
-func newFramer(conn net.Conn) *framer {
+// WriteGoAway, and ReadFrame directly. maxReadFrameSize sets the read-side
+// limit: frames larger than this trigger a FRAME_SIZE_ERROR.
+func newFramer(conn net.Conn, maxReadFrameSize uint32) *framer {
+	fr := http2.NewFramer(conn, conn)
+	fr.SetMaxReadFrameSize(maxReadFrameSize)
 	return &framer{
-		Framer: http2.NewFramer(conn, conn),
+		Framer: fr,
 		conn:   conn,
 	}
 }
@@ -87,8 +90,67 @@ func (f *framer) readFrameCtx(ctx context.Context) (http2.Frame, error) {
 				Underlying: err,
 			}
 		}
+		// http2.ErrFrameTooLarge is returned by the framer (not wrapped as
+		// http2.ConnectionError) when a frame exceeds SetMaxReadFrameSize.
+		// RFC 9113 §4.2: this is a connection error of type FRAME_SIZE_ERROR.
+		if errors.Is(err, http2.ErrFrameTooLarge) {
+			return nil, &Error{
+				Code:       ErrFrameSizeError,
+				Msg:        "frame exceeds SETTINGS_MAX_FRAME_SIZE",
+				Underlying: err,
+			}
+		}
 		return nil, err
 	}
+}
+
+// tryReadFrame attempts to read one frame without blocking.  It sets a 1ms
+// read deadline; if no frame is available it returns (nil, nil).  This is
+// used by the frame loop to detect whether more frames are immediately
+// available after processing a batch, so that pending dispatch goroutines
+// can be deferred until the batch is exhausted (see ServerConn.Run).
+func (f *framer) tryReadFrame() (http2.Frame, error) {
+	_ = f.conn.SetReadDeadline(time.Now().Add(time.Millisecond))
+	frame, err := f.ReadFrame()
+	_ = f.conn.SetReadDeadline(time.Time{})
+	if err == nil {
+		return frame, nil
+	}
+	// Any timeout means "no data yet" — return (nil, nil).
+	var nerr net.Error
+	isTimeout := errors.As(err, &nerr) && nerr.Timeout()
+	if !isTimeout {
+		isTimeout = errors.Is(err, os.ErrDeadlineExceeded)
+	}
+	if isTimeout {
+		return nil, nil
+	}
+	// Translate framer errors same as readFrameCtx.
+	var connErr http2.ConnectionError
+	if errors.As(err, &connErr) {
+		return nil, &Error{
+			Code:       ErrCode(connErr),
+			Msg:        "framer detected connection error",
+			Underlying: err,
+		}
+	}
+	var streamErr http2.StreamError
+	if errors.As(err, &streamErr) {
+		return nil, &Error{
+			Code:       ErrCode(streamErr.Code),
+			Stream:     streamErr.StreamID,
+			Msg:        "framer detected stream error",
+			Underlying: err,
+		}
+	}
+	if errors.Is(err, http2.ErrFrameTooLarge) {
+		return nil, &Error{
+			Code:       ErrFrameSizeError,
+			Msg:        "frame exceeds SETTINGS_MAX_FRAME_SIZE",
+			Underlying: err,
+		}
+	}
+	return nil, err
 }
 
 func ctxErr(ctx context.Context, fallback error) error {
