@@ -3,6 +3,7 @@ package h2
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -69,7 +70,7 @@ func FuzzFrameStream(f *testing.F) {
 			return
 		}
 		// Context errors are acceptable.
-		if err == context.DeadlineExceeded || err == context.Canceled {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return
 		}
 		// io.EOF and io.ErrUnexpectedEOF are acceptable: fuzz inputs are often
