@@ -138,10 +138,16 @@ func TestFramer_DataRoundTrip(t *testing.T) {
 	f2 := newFramer(c2, 16384)
 
 	// First DATA frame: endStream=false.
+	// Write in goroutine (net.Pipe is unbuffered; writer must run concurrently
+	// with the reader). Use a done channel so the next write cannot start until
+	// this goroutine finishes, preventing data-races on the shared framer.
+	done1 := make(chan struct{})
 	go func() {
 		_ = f1.WriteData(1, false, []byte("hello"))
+		close(done1)
 	}()
 	frame, err := f2.ReadFrame()
+	<-done1 // wait for the writer goroutine to complete before next write
 	if err != nil {
 		t.Fatalf("ReadFrame (data 1) = %v, want nil", err)
 	}
@@ -157,8 +163,10 @@ func TestFramer_DataRoundTrip(t *testing.T) {
 	}
 
 	// Second DATA frame: endStream=true.
+	done2 := make(chan struct{})
 	go func() {
 		_ = f1.WriteData(1, true, []byte("world"))
+		close(done2)
 	}()
 	frame, err = f2.ReadFrame()
 	if err != nil {
@@ -171,6 +179,7 @@ func TestFramer_DataRoundTrip(t *testing.T) {
 	if string(df.Data()) != "world" {
 		t.Errorf("data = %q, want %q", df.Data(), "world")
 	}
+	<-done2 // wait for writer goroutine before test ends
 	if !df.StreamEnded() {
 		t.Errorf("EndStream should be true on second frame")
 	}
@@ -184,11 +193,19 @@ func TestFramer_RSTStreamWindowUpdateGoAway(t *testing.T) {
 	f1 := newFramer(c1, 16384)
 	f2 := newFramer(c2, 16384)
 
+	// Each write runs in its own goroutine (net.Pipe is unbuffered — writer must
+	// run concurrently with reader). A done channel ensures the previous writer
+	// goroutine finishes before the next one starts, preventing data-races on the
+	// shared f1 framer state.
+
 	// RST_STREAM
+	doneRST := make(chan struct{})
 	go func() {
 		_ = f1.WriteRSTStream(1, http2.ErrCodeProtocol)
+		close(doneRST)
 	}()
 	frame, err := f2.ReadFrame()
+	<-doneRST
 	if err != nil {
 		t.Fatalf("ReadFrame (rst) = %v, want nil", err)
 	}
@@ -204,10 +221,13 @@ func TestFramer_RSTStreamWindowUpdateGoAway(t *testing.T) {
 	}
 
 	// WINDOW_UPDATE (connection-scope, streamID=0)
+	doneWU := make(chan struct{})
 	go func() {
 		_ = f1.WriteWindowUpdate(0, 65535)
+		close(doneWU)
 	}()
 	frame, err = f2.ReadFrame()
+	<-doneWU
 	if err != nil {
 		t.Fatalf("ReadFrame (window_update) = %v, want nil", err)
 	}
@@ -223,10 +243,13 @@ func TestFramer_RSTStreamWindowUpdateGoAway(t *testing.T) {
 	}
 
 	// GOAWAY
+	doneGA := make(chan struct{})
 	go func() {
 		_ = f1.WriteGoAway(0, http2.ErrCodeNo, nil)
+		close(doneGA)
 	}()
 	frame, err = f2.ReadFrame()
+	<-doneGA
 	if err != nil {
 		t.Fatalf("ReadFrame (goaway) = %v, want nil", err)
 	}

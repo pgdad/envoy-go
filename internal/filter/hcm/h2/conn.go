@@ -574,6 +574,8 @@ func (s *ServerConn) drainDone() {
 }
 
 // emitGoaway sends a GOAWAY frame once. Subsequent calls are no-ops.
+// The mutex is held across the framer write so that the write is
+// serialised against encodeAndWriteHeaders / writeData.
 func (s *ServerConn) emitGoaway(code ErrCode) {
 	s.mu.Lock()
 	if s.goawaySent {
@@ -582,8 +584,8 @@ func (s *ServerConn) emitGoaway(code ErrCode) {
 	}
 	s.goawaySent = true
 	lastID := s.lastInID
-	s.mu.Unlock()
 	_ = s.fr.WriteGoAway(lastID, http2.ErrCode(code), nil)
+	s.mu.Unlock()
 }
 
 // encodeAndWriteHeaders implements streamConn. Called from serverStream.WriteHeaders.
