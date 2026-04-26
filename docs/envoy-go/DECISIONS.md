@@ -2010,3 +2010,53 @@ Cross-references to the implementation:
 ### Lands-in-task
 
 Phase-05.2 Task 11 (first use of `routerActionH2.doH2`'s observe-discard trailer rule, alongside the variant-selection wiring and the `h2.Action` interface widening). Lands the third of the four-ADR contiguous block (ADR-0055..ADR-0058) in commit-time order: 0055 (Task 5) → 0056 (Task 9) → 0058 (Task 11) → 0057 (Task 14). The non-monotonic order is documented in PLAN's "ADRs introduced by this plan" section and in this ADR's `Settles` field.
+
+---
+
+## ADR-0057: Closes ADR-0035 H/2 leg via fixture 0004's full-stack HTTPS h2
+
+**Status:** Accepted
+**Date:** 2026-04-26
+**Doctrine:** D-3.6 (every phase is a green build — and the H/2 surface is now under differential coverage), D-3.5 (durable design rationale).
+**Settles:** phase-05.2 SPEC §1 #9 + §2.3 + §11.6 (carry-forward of "fixture-0003 still does not differentially exercise upstream TLS" from phase-04 REVIEW, narrowed to the H/2 leg specifically); phase-05.2 SPEC §10 #1.7 (`BEHAVIOR_CONTRACT.md` flips deferred-to-05.2 entries to active per ADR-0057, edit-in-place performed at Task 15 per ADR-0052). Closes the H/2 leg of ADR-0035 (the H/1 + upstream-TLS leg remains open). Lands fourth of the four-ADR contiguous block (ADR-0055..ADR-0058) in commit-time order: 0055 (Task 5) → 0056 (Task 9) → 0058 (Task 11) → 0057 (Task 14) — non-monotonic per PLAN's "ADRs introduced by this plan" topical-vs-commit-order ordering.
+**Supersedes:** nothing — closes (settles) the H/2 leg of ADR-0035 without superseding ADR-0035 itself; the H/1 leg of ADR-0035 remains open and is carried forward under the `phase-05.2-follow-up` tag (see Consequences below).
+
+### Context
+
+ADR-0035 (phase 03 era) recorded that fixture 0002's plaintext upstream backends left the upstream-TLS code path (phase-03's `Cluster.Dial` TLS branch in `internal/cluster/cluster.go:84-105`) under unit-test coverage only, not differential. Three follow-up paths were enumerated in ADR-0035's Consequences: (a) extending `test/differential/harness.go` with TLS-backend support; (b) driving upstream TLS through a naturally-TLS fixture such as phase 04's HTTPS HTTP/1.1 upstream; (c) waiting for HTTP/2 (phase 05+).
+
+Phase 04's REVIEW carried this forward as the H/1 + upstream-TLS gap (option (b) was not pursued — phase 04's fixture 0003 stayed plaintext-upstream to keep the harness simple). Phase 05's parent SPEC anticipated 05.2 closing the H/2 leg via fixture 0004 (option (c)). Phase-05.2 SPEC §4.4 anticipated the closing ADR; this ADR is that closing.
+
+The closure is non-vacuous: fixture 0004's driver issues 27 H/2 round-trips per side over the full chain — driver → TLS+ALPN h2 → proxy listener (HCM AUTO → ALPN h2 dispatch) → router action H2 → `Cluster.DialH2` → `Cluster.Dial`'s TLS branch → ALPN h2 negotiation → `*h2.ClientConn` → `(*ClientConn).RoundTrip` → 3 backend H/2 servers — so every layer of the upstream-H/2-over-TLS stack is exercised by both sides of the differential gate.
+
+### Decision
+
+Fixture 0004 has full-stack HTTPS h2 between proxy and upstream backends:
+- **Subject** (`envoy-go.yaml`): cluster `c_h2_backend` is `STATIC` with 3 endpoints at `127.0.0.1:<bN>`. Cluster's `transport_socket` is `envoy.transport_sockets.tls.v3.UpstreamTlsContext` with `sni: localhost`, `alpn_protocols: ["h2"]`, and a `validation_context.trusted_ca` that inlines the fixture-local CA. Cluster's `typed_extension_protocol_options.HttpProtocolOptions.explicit_http_config.http2_protocol_options{}` pins the upstream codec to H/2 per ADR-0056.
+- **Reference** (`envoy.yaml`): cluster `c_h2_backend` is `STRICT_DNS` (per ADR-0027) with `dns_lookup_family: V4_ONLY` (per ADR-0010); 3 endpoints at `host.docker.internal:<bN>`. Same `UpstreamTlsContext` shape (`sni: localhost`, `alpn_protocols: ["h2"]`, inline trusted_ca) and the same `HttpProtocolOptions` discriminator. `--concurrency 1` (per ADR-0028) keeps RR distribution deterministic on the reference side.
+
+The driver issues 27 sequential H/2 round-trips per side (9 × `GET /health`, 9 × `GET /api/v1/<n>`, 9 × `GET /missing/<n>`) via `helpers.H2RoundTrip` (per Task 12 — `golang.org/x/net/http2.Transport` + driver-side fresh-Transport-per-call discipline). Per-side `[3,3,3]` distribution is asserted from response-body `"backend-<idx>:"` prefix counts (subprocess HTTPSH2 backends do not increment the runner's in-process accept counter; the driver counts in-band — settled SPEC §10 #14).
+
+The upstream-TLS code path (phase-03's `Cluster.Dial` TLS branch + phase-05.2's `DialH2`) is NOW under differential coverage on the H/2 leg.
+
+### Consequences
+
+- **`BEHAVIOR_CONTRACT.md ## HTTP/2`** flips its `:method`/`:path`/`:scheme`/`:authority` allow-list rows from `applies-to: phase 05.2 routed-to-upstream H2 (forward-looking)` to `applies-to: phase 05.2 routed-to-upstream H2 (active per ADR-0057)`. The "Does not yet apply to" subsection drops "routed-to-upstream H/2" + "fixture 0004" entries. The in-place edit per ADR-0052 happens at Task 15; ADR-0057 anticipates this edit but does not perform it (ADR-0057 lands at Task 14 alongside the driver).
+
+- **The H/1 + upstream-TLS gap remains open** as the surviving carry-forward from ADR-0035. It is tagged `phase-05.2-follow-up`; the closure path is one of:
+  1. A new fixture (e.g., `0005-https-h1-routing`) that mirrors fixture 0003 (`0003-http11-routing`) but with TLS upstream — most direct, minimal harness churn.
+  2. An extension of fixture 0003 to add a TLS-upstream variant — equally direct.
+  3. Folding the gap closure into a later phase (07's filter-chain framework, or an HTTP-filter-family phase) where TLS-upstream coverage is incidental to the broader scope.
+  Phase 05.2 does not pre-decide which; the tag is the carry-forward.
+
+- **The differential coverage of fixture 0004 is the FIRST non-vacuous gate (a) on the H/2 surface.** Gate (a) was vacuous in 05.1 per ADR-0045 (the 05.1 split deferred all H/2 fixtures to 05.2); 05.2's gate (a) is non-vacuous via fixture 0004. Phase 05's parent ROADMAP row flips to `done` at the phase-done commit per SPEC §4.4 (executed at Task 15).
+
+- **No new SPEC, no new BEHAVIOR_CONTRACT subsection.** The ADR-0052 SCAFFOLD subsection's in-place edit at Task 15 captures the contract surface. ADR-0057 is a closure ADR, not an introduction ADR.
+
+- **Test infrastructure side-effects landing alongside this ADR at Task 14:**
+  - `test/fixtures/0004-h2-routing/envoy.yaml` + `envoy-go.yaml` gain `sni: localhost` on the upstream `UpstreamTlsContext` (Go's `crypto/tls.Client` requires non-empty `ServerName` when `InsecureSkipVerify=false`; the backend leaves carry SAN `localhost`, so this is correctness-preserving). This is a Task-13 oversight observed during Task 14's first execution of the differential gate; correcting it within Task 14's commit keeps the fix local to the gate that surfaced it.
+  - `test/differential/runner_test.go`'s `startHTTPSH2Backend` gains `SysProcAttr{Setpgid: true}` and the deferred backend cleanup kills the process group via `syscall.Kill(-pid, SIGKILL)`. Without this, the `go run` parent is reaped but the orphaned backend binary holds onto the test process's stderr fd, causing `Cmd.WaitDelay` to fire on test exit and produce a spurious package-level `FAIL`. This is also a Task-13 carry-forward; the fix is local because Task 14 is the first task to actually run the gate end-to-end with subprocess backends.
+
+### Lands-in-task
+
+Phase-05.2 Task 14 (first invocation of fixture 0004's full-stack HTTPS h2 surface — the closing ADR before the BEHAVIOR_CONTRACT in-place edit at Task 15). The non-monotonic ADR-number-vs-commit-order sequence (0055 → 0056 → 0058 → 0057) is intentional per PLAN's `## ADRs introduced by this plan` topical-vs-commit-order rationale and per ADR-0058's own `Lands-in-task` cross-reference.

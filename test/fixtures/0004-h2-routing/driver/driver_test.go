@@ -1,0 +1,138 @@
+// Unit tests for the 0004-h2-routing driver. The differential gate
+// (TestDifferential/0004-h2-routing under test/differential/) covers the e2e
+// behavior; these tests cover the driver-internal AssertDistribution + body
+// parsing + bootstrap rendering so the e2e gate's diagnostics are easier to
+// read when something drifts.
+package driver
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestH2Driver_AssertDistribution covers the AssertDistribution branches:
+// happy [3,3,3] (both sides), subject skew, reference skew, length mismatch.
+//
+// Per the driver's design note: AssertDistribution consults the BODY-derived
+// counts the driver populated during Drive (because subprocess HTTPSH2
+// backends don't increment the runner's accept counter). The runner-supplied
+// refCounts/subjCounts arguments are length-checked but their values are
+// ignored — the test seeds d.refBodyCnt / d.subjBodyCnt directly to exercise
+// the assertion branches.
+func TestH2Driver_AssertDistribution(t *testing.T) {
+	cases := []struct {
+		name       string
+		refBody    [3]uint64
+		subjBody   [3]uint64
+		refCounts  []uint64
+		subjCounts []uint64
+		wantErr    bool
+	}{
+		{"both [3,3,3]", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, false},
+		{"subj [4,3,2]", [3]uint64{3, 3, 3}, [3]uint64{4, 3, 2}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, true},
+		{"ref [4,3,2]", [3]uint64{4, 3, 2}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, true},
+		{"subj count length mismatch", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{3, 3}, true},
+		{"ref count length mismatch", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{3, 3, 3, 3}, []uint64{0, 0, 0}, true},
+		{"both [9,0,0] (full skew)", [3]uint64{9, 0, 0}, [3]uint64{9, 0, 0}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			d := &h2Driver{}
+			d.refBodyCnt = tc.refBody
+			d.subjBodyCnt = tc.subjBody
+			err := d.AssertDistribution(tc.refCounts, tc.subjCounts)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("AssertDistribution: err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestRenderBootstrap_Subject and TestRenderBootstrap_Reference verify the
+// driver-side YAML rendering: every {{...}} placeholder is replaced; every
+// `port_value: 0` placeholder is replaced; the substituted ports appear in
+// the expected order. A regression here breaks the differential gate
+// silently (the subject would fail to parse the bootstrap), so guarding the
+// rendering with a unit test makes diagnostics fast.
+func TestRenderBootstrap_Subject(t *testing.T) {
+	d := &h2Driver{}
+	out := d.SubjectConfig(15004, 12345, []int{30000, 30001, 30002}, 19999)
+	if strings.Contains(out, "{{") {
+		t.Fatalf("subject contains leftover placeholder:\n%s", out)
+	}
+	if strings.Contains(out, "port_value: 0\n") {
+		t.Errorf("subject still has port_value: 0:\n%s", out)
+	}
+	for _, want := range []string{
+		"port_value: 19999",
+		"port_value: 12345",
+		"port_value: 30000",
+		"port_value: 30001",
+		"port_value: 30002",
+		"-----BEGIN CERTIFICATE-----",
+		"-----BEGIN PRIVATE KEY-----",
+		"alpn_protocols: [\"h2\", \"http/1.1\"]",
+		"alpn_protocols: [\"h2\"]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("subject missing %q", want)
+		}
+	}
+}
+
+func TestRenderBootstrap_Reference(t *testing.T) {
+	d := &h2Driver{}
+	out := d.ReferenceBootstrap([]int{30000, 30001, 30002})
+	if strings.Contains(out, "{{") {
+		t.Fatalf("reference contains leftover placeholder:\n%s", out)
+	}
+	if strings.Contains(out, "port_value: 0\n") {
+		t.Errorf("reference still has port_value: 0:\n%s", out)
+	}
+	for _, want := range []string{
+		"port_value: 9901",  // fixed admin
+		"port_value: 15004", // fixed listener
+		"port_value: 30000",
+		"port_value: 30001",
+		"port_value: 30002",
+		"host.docker.internal",
+		"dns_lookup_family: V4_ONLY",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("reference missing %q", want)
+		}
+	}
+}
+
+// TestParseBackendIdx covers the response-body parsing helper that drives
+// the per-side distribution counters.
+func TestParseBackendIdx(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    []byte
+		wantIdx int
+		wantErr bool
+	}{
+		{"backend-0", []byte("backend-0:v1/0"), 0, false},
+		{"backend-1", []byte("backend-1:v1/3"), 1, false},
+		{"backend-2", []byte("backend-2:v1/8"), 2, false},
+		{"missing prefix", []byte("0:v1/0"), 0, true},
+		{"missing colon", []byte("backend-0v1/0"), 0, true},
+		{"non-numeric idx", []byte("backend-x:v1/0"), 0, true},
+		{"empty", []byte(""), 0, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			idx, err := parseBackendIdx(tc.body)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("parseBackendIdx(%q): err=%v, wantErr=%v", string(tc.body), err, tc.wantErr)
+				return
+			}
+			if !tc.wantErr && idx != tc.wantIdx {
+				t.Errorf("parseBackendIdx(%q): got idx=%d, want %d", string(tc.body), idx, tc.wantIdx)
+			}
+		})
+	}
+}

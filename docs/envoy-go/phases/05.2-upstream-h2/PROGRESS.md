@@ -956,3 +956,95 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0058: Trailers observed but not forwarded — H2 router
 $ # ADR tail unchanged at 0058 (Task 13 lands no new ADR — content-only; ADR-0057 lands at Task 14 alongside the driver registration).
 ```
+
+## Task 14 — Fixture 0004 driver + runner blank-import + ADR-0057 (closes ADR-0035 H/2 leg)
+
+**Commit:** TBD (main); SHA-fill commit lands on top.
+
+**Files changed:**
+
+- `test/fixtures/0004-h2-routing/driver/driver.go` — NEW. The h2Driver implementing `fixture.Driver`, `fixture.DistributionAsserter`, and `fixture.BackendKindAware`. Reads `envoy.yaml` / `envoy-go.yaml` from the fixture root + `pki/{listener.pem,listener.key.pem,ca.pem}` at runtime; renders the bootstraps via `substitutePEM` (per-placeholder indent derived from the placeholder line itself; handles both 24-space listener-cert/key indent and 18-space CA indent) + sequential `port_value: 0` substitution (subject: admin/listener/3 backend ports; reference: 3 backend ports only — admin/listener fixed at 9901/15004). The `Drive*` methods issue 27 sequential H/2 round-trips via `helpers.H2RoundTrip` (9 × `/health` concatenated, 9 × `/api/v1/<n>` body-parsed for distribution, 9 × `/missing/<n>`); per-side body-derived `[3,3,3]` distribution counts populate driver-instance-local fields surfaced via `AssertDistribution` (subprocess HTTPSH2 backends don't increment the runner's accept counter — settled SPEC §10 #14). TLS config trusts the fixture-local CA, advertises `NextProtos=["h2"]`, ServerName="localhost". 269 LoC.
+- `test/fixtures/0004-h2-routing/driver/driver_test.go` — NEW. `TestH2Driver_AssertDistribution` (6 cases: happy, subj skew, ref skew, length mismatches, full skew); `TestRenderBootstrap_Subject` + `TestRenderBootstrap_Reference` (no leftover `{{...}}` placeholders, expected ports + PEM markers + ALPN strings present); `TestParseBackendIdx` (7 cases incl. error paths). 84 LoC.
+- `test/fixtures/0004-h2-routing/envoy.yaml` — Added `sni: localhost` to the upstream `UpstreamTlsContext`. Required because Go's `crypto/tls.Client` rejects empty `ServerName` when `InsecureSkipVerify=false` ("either ServerName or InsecureSkipVerify must be specified"). Backend leaves carry SAN `localhost`, so SNI=localhost validates correctly. Task-13 oversight surfaced on Task 14's first end-to-end run; the fix is local to Task 14's commit per ADR-0057 Consequences. +1 line.
+- `test/fixtures/0004-h2-routing/envoy-go.yaml` — Same `sni: localhost` addition as above. +1 line.
+- `test/differential/runner_test.go` — (1) Added blank import `_ "github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver"` so the driver registers itself in `init()`. The `t.Skipf` branch for "no driver registered" remains as-is — it correctly handles future fixture-content-without-driver intermediate states. (2) Added `syscall` import. (3) `startHTTPSH2Backend` sets `cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}` so the `go run` parent + actual backend binary share a process group. (4) The deferred backend cleanup now `syscall.Kill(-pid, SIGKILL)`s the process group so the orphaned backend binary doesn't keep the test's stderr fd open and trip Cmd.WaitDelay (Task-13 carry-forward; surfaced when Task 14 first ran the gate end-to-end with subprocess backends).
+- `docs/envoy-go/DECISIONS.md` — ADR-0057 appended at file tail (sequential first-use commit-time ordering: 0055 → 0056 → 0058 → 0057, non-monotonic per PLAN). The ADR records: closes ADR-0035 H/2 leg via fixture 0004's full-stack HTTPS h2 differential coverage; the H/1 + upstream-TLS gap remains open, tagged `phase-05.2-follow-up`; consequences include the BEHAVIOR_CONTRACT in-place edit anticipated for Task 15, the test-infrastructure side-effects (sni:localhost on upstream TLS contexts, Setpgid on backend subprocesses).
+- `docs/envoy-go/phases/05.2-upstream-h2/PROGRESS.md` — this entry.
+
+**TDD evidence (driver_test.go landed alongside driver.go; first run PASS):**
+```
+$ go test ./test/fixtures/0004-h2-routing/driver/ -v -short
+=== RUN   TestH2Driver_AssertDistribution
+=== RUN   TestH2Driver_AssertDistribution/both_[3,3,3]
+=== RUN   TestH2Driver_AssertDistribution/subj_[4,3,2]
+=== RUN   TestH2Driver_AssertDistribution/ref_[4,3,2]
+=== RUN   TestH2Driver_AssertDistribution/subj_count_length_mismatch
+=== RUN   TestH2Driver_AssertDistribution/ref_count_length_mismatch
+=== RUN   TestH2Driver_AssertDistribution/both_[9,0,0]_(full_skew)
+--- PASS: TestH2Driver_AssertDistribution (0.00s)
+=== RUN   TestRenderBootstrap_Subject
+--- PASS: TestRenderBootstrap_Subject (0.00s)
+=== RUN   TestRenderBootstrap_Reference
+--- PASS: TestRenderBootstrap_Reference (0.00s)
+=== RUN   TestParseBackendIdx
+--- PASS: TestParseBackendIdx (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	0.002s
+```
+
+**Differential gate (Task 14's load-bearing test — fixture 0004 differentially green for the FIRST time on the H/2 surface):**
+```
+$ go test -count=1 -run TestDifferential/0004-h2-routing -v -timeout=120s ./test/differential/
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0004-h2-routing
+--- PASS: TestDifferential (2.11s)
+    --- PASS: TestDifferential/0004-h2-routing (2.11s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.113s
+```
+
+**Full differential suite (all 5 fixtures GREEN):**
+```
+$ go test -count=1 -run TestDifferential -v -timeout=300s ./test/differential/
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+=== RUN   TestDifferential/0004-h2-routing
+--- PASS: TestDifferential (6.71s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	6.790s
+```
+
+**h2spec conformance gate (53/53 PASS — UNCHANGED from 05.1 baseline):**
+```
+$ go test ./test/conformance/h2spec/ -v -timeout=300s
+[ ... 53 sections, all PASS ... ]
+--- PASS: TestH2Spec (2.18s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.251s
+```
+
+**H2 unit tests + race-detector:**
+```
+$ go test -timeout=120s ./internal/filter/hcm/h2/
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	2.472s
+
+$ go test -race -timeout=120s ./internal/filter/hcm/h2/
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.493s
+```
+(Pre-existing 1-in-7 flake on `TestClientConn_RoundTrip_PeerDataAfterEndStream` under -race observed during Task 14's verification sweep — relies on a 100ms sleep + 2s deadline that occasionally is insufficient under race-detector load. NOT introduced by Task 14: the test exists at HEAD before any Task 14 file edit; Task 14 touches no h2-package code. Carry-forward as a Phase-05.2 REVIEW Minor candidate for the closing review.)
+
+**Lint:**
+```
+$ golangci-lint run ./...
+$ # exit 0
+```
+
+**ADR tail:**
+```
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0057: Closes ADR-0035 H/2 leg via fixture 0004's full-stack HTTPS h2
+$ # Sequential file-order tail = ADR-0057 (Task 14 lands AFTER ADR-0058 — non-monotonic per PLAN's first-use commit-time ordering: 0055 → 0056 → 0058 → 0057).
+```

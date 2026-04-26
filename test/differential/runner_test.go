@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -104,7 +106,19 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 				t.Fatalf("backend[%d] start: %v", i, err)
 			}
 			bo.proc = cmd
-			defer func(cmd *exec.Cmd) { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }(cmd)
+			defer func(cmd *exec.Cmd) {
+				// Kill the entire process group so the binary spawned by `go
+				// run` (the actual backend server, re-parented to PID 1 if
+				// only `go run` is killed) is reaped too. Without this the
+				// orphaned backend keeps the test process's stderr fd open
+				// and Cmd.WaitDelay times out causing a spurious package-
+				// level FAIL.
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
 			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
@@ -411,6 +425,11 @@ func startHTTPSH2Backend(ctx context.Context, repoRoot string, port, idx int) (*
 	cmd.Env = append(os.Environ(), fmt.Sprintf("BACKEND_IDX=%d", idx))
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
+	// Put the backend (and its `go run` parent) into its own process group so
+	// the deferred cleanup can kill the entire group atomically. Without this,
+	// killing `go run` leaves the actual backend binary orphaned and holding
+	// the test's stderr fd, causing Cmd.WaitDelay to fire on test exit.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start: %w", err)
 	}
