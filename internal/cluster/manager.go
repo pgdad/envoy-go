@@ -160,12 +160,12 @@ func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, 
 	if tepo == nil {
 		return false, nil
 	}
-	any, ok := tepo[httpProtocolOptionsKey]
+	tepoAny, ok := tepo[httpProtocolOptionsKey]
 	if !ok {
 		return false, nil
 	}
 	var hpo upstreamshttpv3.HttpProtocolOptions
-	if err := any.UnmarshalTo(&hpo); err != nil {
+	if err := tepoAny.UnmarshalTo(&hpo); err != nil {
 		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions: unmarshal: %w", c.GetName(), err)
 	}
 	switch up := hpo.UpstreamProtocolOptions.(type) {

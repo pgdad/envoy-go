@@ -13,10 +13,17 @@ import (
 // ALPN protocol is "h2", and wraps the conn in an *h2.ClientConn ready for
 // one RoundTrip.
 //
+// See phase-05.2 SPEC §5.3 step 2 for the full upstream H2 lifecycle:
+// dial → ALPN-h2 confirmation → preface + initial SETTINGS exchange (driven
+// by h2.NewClientConn below) → RoundTrip → Close. This helper covers the
+// dial + ALPN + ClientConn-construction (which performs the preface +
+// initial SETTINGS exchange synchronously, surfacing handshake errors
+// at constructor time per SPEC §10 #5).
+//
 // Per ADR-0056, the returned *h2.ClientConn is per-request fresh; the caller
-// (routerActionH2.do — landing in Task 11) closes it via defer after the
-// response is consumed. Cross-request stream pooling is the upstream-
-// robustness family's deliverable, not phase 05.2's.
+// (routerActionH2.doH2 in internal/filter/hcm/actions.go) closes it via
+// defer after the response is consumed. Cross-request stream pooling is the
+// upstream-robustness family's deliverable, not phase 05.2's.
 //
 // Each error branch closes the underlying conn explicitly because the function
 // returns the conn-owning *h2.ClientConn on success (caller takes ownership);

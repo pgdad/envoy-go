@@ -350,6 +350,7 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 			// ADR-0055 / I-3 (mirror of ServerConn.onData).
 			cc.recvW.replenish(-dataLen)
 			cs.recvW.replenish(-dataLen)
+			// Conn-level debit + WINDOW_UPDATE(0, delta). Mutates cc.recvDebitSinceLastUpdate.
 			cc.recvDebitSinceLastUpdate += dataLen
 			if cc.recvDebitSinceLastUpdate >= recvWindowUpdateThreshold {
 				delta := cc.recvDebitSinceLastUpdate
@@ -362,6 +363,11 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 					return translateFramerErr(werr)
 				}
 			}
+			// Stream-level debit + WINDOW_UPDATE(streamID, delta). Independent
+			// from the conn-level block above; mutates cs.recvDebitSinceLastUpdate
+			// (different field, same spelling). Skipped on END_STREAM since the
+			// stream is about to be finished and a stream-level WINDOW_UPDATE
+			// after END_STREAM would be wasted work.
 			cs.recvDebitSinceLastUpdate += dataLen
 			if !fr.StreamEnded() && cs.recvDebitSinceLastUpdate >= recvWindowUpdateThreshold {
 				delta := cs.recvDebitSinceLastUpdate

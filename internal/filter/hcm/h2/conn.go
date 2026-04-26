@@ -441,6 +441,8 @@ func (s *ServerConn) onData(f *http2.DataFrame) error {
 	// streams a body larger than 65535 bytes will stall once the initial
 	// window is exhausted.
 	if dataLen > 0 {
+		// Conn-level debit + WINDOW_UPDATE(0, delta). Mutates s.recvDebitSinceLastUpdate
+		// (the *ServerConn field).
 		s.recvW.replenish(-dataLen)
 		s.recvDebitSinceLastUpdate += dataLen
 		if s.recvDebitSinceLastUpdate >= recvWindowUpdateThreshold {
@@ -455,6 +457,9 @@ func (s *ServerConn) onData(f *http2.DataFrame) error {
 			}
 		}
 
+		// Stream-level debit + WINDOW_UPDATE(streamID, delta). Independent
+		// from the conn-level block above; mutates ss.recvDebitSinceLastUpdate
+		// (the *serverStream field — different field, same spelling).
 		ss.recvW.replenish(-dataLen)
 		ss.recvDebitSinceLastUpdate += dataLen
 		// Only emit a per-stream WINDOW_UPDATE while the stream is still
