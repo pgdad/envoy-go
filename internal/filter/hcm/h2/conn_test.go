@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -1168,4 +1169,375 @@ func TestServerConn_CtxCancelEmitsGOAWAY(t *testing.T) {
 			return
 		}
 	}
+}
+
+// bodyCaptureAction reads the entire request body and reports the byte count
+// on doneCh. Used by ADR-0055 I-3 receive-side flow-control tests.
+type bodyCaptureAction struct {
+	doneCh chan int
+}
+
+func (a *bodyCaptureAction) WriteH2(sw StreamWriter) error {
+	// We do not have direct access to the request body here (it's read by the
+	// dispatch goroutine before WriteH2 is called); the dispatcher captures the
+	// body length in its Match function and sends it on doneCh from there.
+	headers := []hpack.HeaderField{
+		{Name: ":status", Value: "200"},
+		{Name: "content-length", Value: "2"},
+	}
+	if err := sw.WriteHeaders(headers, false); err != nil {
+		return err
+	}
+	return sw.WriteData([]byte("OK"), true)
+}
+
+// bodyCaptureDispatcher captures req.Body length on Match and forwards
+// the action.
+type bodyCaptureDispatcher struct {
+	doneCh chan int
+}
+
+func (d *bodyCaptureDispatcher) Match(req *http.Request) (Action, bool) {
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		select {
+		case d.doneCh <- len(b):
+		default:
+		}
+	}
+	return &bodyCaptureAction{doneCh: d.doneCh}, true
+}
+
+// TestServerConn_ReceiveSide_FlowControl_LargeInboundBody verifies ADR-0055 I-3:
+// the server emits WINDOW_UPDATE on the half-window threshold so the peer can
+// keep sending past the initial 65535 receive-window. Without I-3 the peer
+// stalls after 65535 bytes and the request body never completes.
+func TestServerConn_ReceiveSide_FlowControl_LargeInboundBody(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	const totalBody = 100 * 1024 // 100 KB > 65535 default initial recv window
+	const chunkSize = 8 * 1024
+
+	doneCh := make(chan int, 1)
+	disp := &bodyCaptureDispatcher{doneCh: doneCh}
+	clientConn, _ := startServerConn(t, ctx, disp, DefaultServerSettings)
+
+	if err := writeClientPreface(clientConn); err != nil {
+		t.Fatalf("write preface: %v", err)
+	}
+
+	fr := http2.NewFramer(clientConn, clientConn)
+	if err := fr.WriteSettings(); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	// Synchronously complete the SETTINGS handshake before sending HEADERS so
+	// we observe a stable initial state on both sides (server-advertised
+	// SETTINGS read; our SETTINGS ACK'd by server).
+	settingsAcked := false
+	clientAcked := false
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for !settingsAcked || !clientAcked {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("handshake: %v", err)
+		}
+		if f.Header().Type == http2.FrameSettings {
+			sf := f.(*http2.SettingsFrame)
+			if !sf.IsAck() {
+				_ = fr.WriteSettingsAck()
+				settingsAcked = true
+			} else {
+				clientAcked = true
+			}
+		}
+	}
+
+	// Goroutine: continuously read frames from the server. We need to consume
+	// WINDOW_UPDATE / SETTINGS / HEADERS / DATA without blocking the server.
+	connWindowGrants := make(chan int32, 64)
+	streamWindowGrants := make(chan int32, 64)
+	respDone := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		_ = clientConn.SetReadDeadline(time.Now().Add(7 * time.Second))
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch ff := f.(type) {
+			case *http2.SettingsFrame:
+				if !ff.IsAck() {
+					_ = fr.WriteSettingsAck()
+				}
+			case *http2.WindowUpdateFrame:
+				if ff.Header().StreamID == 0 {
+					select {
+					case connWindowGrants <- int32(ff.Increment):
+					default:
+					}
+				} else {
+					select {
+					case streamWindowGrants <- int32(ff.Increment):
+					default:
+					}
+				}
+			case *http2.DataFrame:
+				if ff.StreamEnded() {
+					select {
+					case <-respDone:
+					default:
+						close(respDone)
+					}
+				}
+			}
+		}
+	}()
+
+	// Send the request HEADERS (no END_STREAM — body to follow).
+	var encBuf bytes.Buffer
+	enc := hpack.NewEncoder(&encBuf)
+	_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: "/upload"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "http"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: "test.local"})
+	_ = enc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(totalBody)})
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: encBuf.Bytes(),
+		EndHeaders:    true,
+		EndStream:     false,
+	}); err != nil {
+		t.Fatalf("write headers: %v", err)
+	}
+
+	// Send the body in 8KB chunks. Track conn-level + stream-level granted
+	// window so we never overrun the peer's receive window. Initial windows
+	// (server's recv side) are 65535 each.
+	connAvail := int32(65535)
+	streamAvail := int32(65535)
+	body := make([]byte, totalBody)
+	for i := range body {
+		body[i] = byte('a' + (i % 26))
+	}
+	sent := 0
+	for sent < totalBody {
+		// Wait until both windows have at least chunkSize available, draining
+		// any WINDOW_UPDATEs that have arrived.
+		for connAvail < 1 || streamAvail < 1 {
+			select {
+			case g := <-connWindowGrants:
+				connAvail += g
+			case g := <-streamWindowGrants:
+				streamAvail += g
+			case <-time.After(3 * time.Second):
+				t.Fatalf("timed out waiting for WINDOW_UPDATE; sent=%d/%d connAvail=%d streamAvail=%d",
+					sent, totalBody, connAvail, streamAvail)
+			}
+		}
+		// Drain any further pending grants without blocking.
+	drain:
+		for {
+			select {
+			case g := <-connWindowGrants:
+				connAvail += g
+			case g := <-streamWindowGrants:
+				streamAvail += g
+			default:
+				break drain
+			}
+		}
+
+		want := chunkSize
+		if want > totalBody-sent {
+			want = totalBody - sent
+		}
+		if int32(want) > connAvail {
+			want = int(connAvail)
+		}
+		if int32(want) > streamAvail {
+			want = int(streamAvail)
+		}
+		if want <= 0 {
+			continue
+		}
+		end := sent + want
+		isLast := end == totalBody
+		if err := fr.WriteData(1, isLast, body[sent:end]); err != nil {
+			t.Fatalf("write data: %v", err)
+		}
+		sent = end
+		connAvail -= int32(want)
+		streamAvail -= int32(want)
+	}
+
+	// Wait for the dispatcher to capture the body length.
+	select {
+	case got := <-doneCh:
+		if got != totalBody {
+			t.Errorf("captured body length = %d, want %d", got, totalBody)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for dispatcher body capture; sent=%d/%d", sent, totalBody)
+	}
+
+	cancel()
+	<-readerDone
+}
+
+// TestServerConn_WindowUpdate_OverflowBoundsCheck verifies ADR-0055 M-9: a
+// WINDOW_UPDATE that would push the send window past 2^31-1 must trigger
+// FLOW_CONTROL_ERROR per RFC 9113 §6.9.1 — RST_STREAM on a stream-level
+// overflow, GOAWAY on a connection-level overflow.
+func TestServerConn_WindowUpdate_OverflowBoundsCheck(t *testing.T) {
+	t.Run("stream-level overflow → RST_STREAM(FLOW_CONTROL_ERROR)", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		disp := &fixedDispatcher{action: &fixedAction{status: 200, body: "ok"}}
+		clientConn, _ := startServerConn(t, ctx, disp, DefaultServerSettings)
+
+		if err := writeClientPreface(clientConn); err != nil {
+			t.Fatalf("write preface: %v", err)
+		}
+		fr := http2.NewFramer(clientConn, clientConn)
+		if err := fr.WriteSettings(); err != nil {
+			t.Fatalf("write settings: %v", err)
+		}
+
+		// Handshake.
+		settingsAcked := false
+		clientAcked := false
+		_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for !settingsAcked || !clientAcked {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				t.Fatalf("handshake: %v", err)
+			}
+			if f.Header().Type == http2.FrameSettings {
+				sf := f.(*http2.SettingsFrame)
+				if !sf.IsAck() {
+					_ = fr.WriteSettingsAck()
+					settingsAcked = true
+				} else {
+					clientAcked = true
+				}
+			}
+		}
+
+		// Open a stream by sending HEADERS without END_STREAM (so the stream
+		// remains "open" and not yet dispatched/closed).
+		var encBuf bytes.Buffer
+		enc := hpack.NewEncoder(&encBuf)
+		_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
+		_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: "/x"})
+		_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "http"})
+		_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: "test.local"})
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: encBuf.Bytes(),
+			EndHeaders:    true,
+			EndStream:     false,
+		}); err != nil {
+			t.Fatalf("write headers: %v", err)
+		}
+
+		// First WINDOW_UPDATE pushes sendW close to MaxInt32 (initial window is
+		// 65535, so adding MaxInt32 - 65535 brings it exactly to MaxInt32).
+		if err := fr.WriteWindowUpdate(1, uint32(math.MaxInt32-65535)); err != nil {
+			t.Fatalf("write first WINDOW_UPDATE: %v", err)
+		}
+		// Second WINDOW_UPDATE with delta=1 → would push past MaxInt32 → FLOW_CONTROL_ERROR.
+		if err := fr.WriteWindowUpdate(1, 1); err != nil {
+			t.Fatalf("write overflow WINDOW_UPDATE: %v", err)
+		}
+
+		// Expect RST_STREAM(FLOW_CONTROL_ERROR) for stream 1.
+		_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		gotRST := false
+		for i := 0; i < 20; i++ {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				break
+			}
+			if rf, ok := f.(*http2.RSTStreamFrame); ok {
+				if rf.Header().StreamID == 1 && rf.ErrCode == http2.ErrCodeFlowControl {
+					gotRST = true
+					break
+				}
+			}
+		}
+		if !gotRST {
+			t.Error("expected RST_STREAM(FLOW_CONTROL_ERROR) for stream 1 on send-window overflow")
+		}
+	})
+
+	t.Run("connection-level overflow → GOAWAY(FLOW_CONTROL_ERROR)", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		disp := &fixedDispatcher{action: &fixedAction{status: 200, body: "ok"}}
+		clientConn, _ := startServerConn(t, ctx, disp, DefaultServerSettings)
+
+		if err := writeClientPreface(clientConn); err != nil {
+			t.Fatalf("write preface: %v", err)
+		}
+		fr := http2.NewFramer(clientConn, clientConn)
+		if err := fr.WriteSettings(); err != nil {
+			t.Fatalf("write settings: %v", err)
+		}
+
+		// Handshake.
+		settingsAcked := false
+		clientAcked := false
+		_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for !settingsAcked || !clientAcked {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				t.Fatalf("handshake: %v", err)
+			}
+			if f.Header().Type == http2.FrameSettings {
+				sf := f.(*http2.SettingsFrame)
+				if !sf.IsAck() {
+					_ = fr.WriteSettingsAck()
+					settingsAcked = true
+				} else {
+					clientAcked = true
+				}
+			}
+		}
+
+		// First conn-level WINDOW_UPDATE pushes sendW (conn) close to MaxInt32.
+		if err := fr.WriteWindowUpdate(0, uint32(math.MaxInt32-65535)); err != nil {
+			t.Fatalf("write first WINDOW_UPDATE: %v", err)
+		}
+		// Second conn-level WINDOW_UPDATE with delta=1 → overflow → FLOW_CONTROL_ERROR.
+		if err := fr.WriteWindowUpdate(0, 1); err != nil {
+			t.Fatalf("write overflow WINDOW_UPDATE: %v", err)
+		}
+
+		// Expect GOAWAY(FLOW_CONTROL_ERROR).
+		_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		gotGoaway := false
+		for i := 0; i < 20; i++ {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				break
+			}
+			if gf, ok := f.(*http2.GoAwayFrame); ok {
+				if gf.ErrCode == http2.ErrCodeFlowControl {
+					gotGoaway = true
+					break
+				}
+				t.Errorf("GOAWAY code = %v, want FLOW_CONTROL_ERROR", gf.ErrCode)
+				break
+			}
+		}
+		if !gotGoaway {
+			t.Error("expected GOAWAY(FLOW_CONTROL_ERROR) on conn-level send-window overflow")
+		}
+	})
 }

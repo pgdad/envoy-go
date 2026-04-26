@@ -3,6 +3,7 @@ package h2
 import (
 	"context"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -10,6 +11,24 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+// recvWindowUpdateThreshold is the high-water mark at which the receiver emits
+// a WINDOW_UPDATE to replenish its inbound flow-control window. Set to half the
+// default initial window (65535/2 ≈ 32768) per ADR-0055: small enough that the
+// peer is rarely stalled, large enough that we are not flooding the wire with
+// WINDOW_UPDATE frames.
+const recvWindowUpdateThreshold = int32(32768)
+
+// safeAddInt32 returns (a+b, true) iff the sum fits in int32 (i.e. is in the
+// inclusive range [math.MinInt32, math.MaxInt32]). On overflow returns
+// (0, false). Used by RFC 9113 §6.9.1 WINDOW_UPDATE bounds checks.
+func safeAddInt32(a, b int32) (int32, bool) {
+	sum := int64(a) + int64(b)
+	if sum > math.MaxInt32 || sum < math.MinInt32 {
+		return 0, false
+	}
+	return int32(sum), true
+}
 
 // ServerConn is one downstream HTTP/2 server connection. Construct with
 // NewServerConn; call Run to drive the connection lifecycle.
@@ -45,6 +64,13 @@ type ServerConn struct {
 	// overflow stream is written BEFORE any DATA response from earlier streams,
 	// which is required by h2spec 5.1.2/1.
 	pendingDispatch []func()
+	// recvDebitSinceLastUpdate accumulates inbound DATA bytes consumed against
+	// the connection-level recv window since the last conn-level WINDOW_UPDATE
+	// was emitted. When it crosses recvWindowUpdateThreshold we emit a
+	// WINDOW_UPDATE(0, recvDebitSinceLastUpdate), replenish the local recvW
+	// counter by the same amount, and reset to 0. Mutated only from the
+	// frame-loop goroutine (in onData), so no separate mutex.
+	recvDebitSinceLastUpdate int32
 }
 
 // NewServerConn constructs a ServerConn value. Run owns conn (closes on exit).
@@ -402,8 +428,50 @@ func (s *ServerConn) onData(f *http2.DataFrame) error {
 		return streamError(ErrStreamClosed, streamID, "DATA on unknown stream")
 	}
 
+	dataLen := int32(len(f.Data()))
+
 	if err := ss.recvData(f.Data(), f.StreamEnded()); err != nil {
 		return err
+	}
+
+	// ADR-0055 I-3: receive-side flow control. Debit both the conn-level and
+	// per-stream recv windows by the DATA payload length. When the running
+	// debit counter crosses the half-window high-water mark, emit a
+	// WINDOW_UPDATE so the peer can keep sending. Without this, a peer that
+	// streams a body larger than 65535 bytes will stall once the initial
+	// window is exhausted.
+	if dataLen > 0 {
+		s.recvW.replenish(-dataLen)
+		s.recvDebitSinceLastUpdate += dataLen
+		if s.recvDebitSinceLastUpdate >= recvWindowUpdateThreshold {
+			delta := s.recvDebitSinceLastUpdate
+			s.recvDebitSinceLastUpdate = 0
+			s.recvW.replenish(delta)
+			s.mu.Lock()
+			werr := s.fr.WriteWindowUpdate(0, uint32(delta))
+			s.mu.Unlock()
+			if werr != nil {
+				return translateFramerErr(werr)
+			}
+		}
+
+		ss.recvW.replenish(-dataLen)
+		ss.recvDebitSinceLastUpdate += dataLen
+		// Only emit a per-stream WINDOW_UPDATE while the stream is still
+		// half-open on the remote side (peer can still send DATA on this
+		// stream). Once we've seen END_STREAM, no further DATA can arrive on
+		// this stream and a WINDOW_UPDATE would be wasted.
+		if !f.StreamEnded() && ss.recvDebitSinceLastUpdate >= recvWindowUpdateThreshold {
+			delta := ss.recvDebitSinceLastUpdate
+			ss.recvDebitSinceLastUpdate = 0
+			ss.recvW.replenish(delta)
+			s.mu.Lock()
+			werr := s.fr.WriteWindowUpdate(streamID, uint32(delta))
+			s.mu.Unlock()
+			if werr != nil {
+				return translateFramerErr(werr)
+			}
+		}
 	}
 
 	if f.StreamEnded() {
@@ -464,12 +532,23 @@ func (s *ServerConn) onPing(f *http2.PingFrame) error {
 }
 
 // onWindowUpdate handles an incoming WINDOW_UPDATE frame.
+//
+// RFC 9113 §6.9.1: a WINDOW_UPDATE that would push the receiver's flow-control
+// window past 2^31-1 is treated as a flow-control error — connection-scoped
+// (GOAWAY) for stream id 0, stream-scoped (RST_STREAM) for a non-zero stream.
+// RFC 9113 §6.9 also forbids delta == 0: connection-level → connection error,
+// stream-level → stream error, both PROTOCOL_ERROR.
 func (s *ServerConn) onWindowUpdate(f *http2.WindowUpdateFrame) error {
 	delta := int32(f.Increment)
 	if f.StreamID == 0 {
 		// Connection-level WINDOW_UPDATE.
 		if delta == 0 {
 			return connError(ErrProtocolError, "WINDOW_UPDATE delta 0 on connection")
+		}
+		// Bounds check: the resulting window must fit in int32 per RFC 9113 §6.9.1.
+		cur := s.sendW.available()
+		if _, ok := safeAddInt32(cur, delta); !ok {
+			return connError(ErrFlowControlError, "WINDOW_UPDATE conn-level overflow")
 		}
 		s.sendW.replenish(delta)
 		return nil

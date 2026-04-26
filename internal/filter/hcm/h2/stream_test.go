@@ -3,6 +3,7 @@ package h2
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -260,6 +261,59 @@ func TestServerStream_RecvWindowUpdate_ZeroDeltaIsProtocolError(t *testing.T) {
 	}
 	if h2err.Code != ErrProtocolError {
 		t.Errorf("error code = %v, want PROTOCOL_ERROR", h2err.Code)
+	}
+}
+
+// TestServerStream_RecvWindowUpdate_OverflowIsFlowControlError:
+// ADR-0055 M-9 / RFC 9113 §6.9.1: a WINDOW_UPDATE that would push the send
+// window past 2^31-1 is a stream-scoped FLOW_CONTROL_ERROR.
+func TestServerStream_RecvWindowUpdate_OverflowIsFlowControlError(t *testing.T) {
+	fc := &fakeConn{}
+	// Start the send window very close to MaxInt32 so a small delta overflows.
+	s := newServerStream(7, fc, math.MaxInt32-1, 65535)
+
+	// delta=2 would push to MaxInt32+1 → overflow.
+	err := s.recvWindowUpdate(2)
+	if err == nil {
+		t.Fatal("recvWindowUpdate(overflow delta) returned nil, want FLOW_CONTROL_ERROR")
+	}
+	h2err, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error is %T, want *Error", err)
+	}
+	if h2err.Code != ErrFlowControlError {
+		t.Errorf("error code = %v, want FLOW_CONTROL_ERROR", h2err.Code)
+	}
+	if h2err.Stream != 7 {
+		t.Errorf("error stream id = %d, want 7 (stream-scoped)", h2err.Stream)
+	}
+}
+
+// TestSafeAddInt32 covers the ADR-0055 M-9 helper.
+func TestSafeAddInt32(t *testing.T) {
+	cases := []struct {
+		a, b   int32
+		wantOK bool
+		want   int32
+	}{
+		{0, 0, true, 0},
+		{1, 2, true, 3},
+		{math.MaxInt32, 0, true, math.MaxInt32},
+		{math.MaxInt32 - 1, 1, true, math.MaxInt32},
+		{math.MaxInt32, 1, false, 0},
+		{math.MaxInt32, math.MaxInt32, false, 0},
+		{math.MinInt32, -1, false, 0},
+		{math.MinInt32, 0, true, math.MinInt32},
+	}
+	for _, c := range cases {
+		got, ok := safeAddInt32(c.a, c.b)
+		if ok != c.wantOK {
+			t.Errorf("safeAddInt32(%d, %d) ok=%v, want %v", c.a, c.b, ok, c.wantOK)
+			continue
+		}
+		if ok && got != c.want {
+			t.Errorf("safeAddInt32(%d, %d) = %d, want %d", c.a, c.b, got, c.want)
+		}
 	}
 }
 

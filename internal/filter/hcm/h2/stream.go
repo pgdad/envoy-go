@@ -67,6 +67,12 @@ type serverStream struct {
 	sendW *window
 	recvW *window
 
+	// recvDebitSinceLastUpdate accumulates inbound DATA bytes consumed against
+	// this stream's recv window since the last per-stream WINDOW_UPDATE was
+	// emitted. Mutated only from the frame-loop goroutine (in ServerConn.onData,
+	// before dispatch is launched). No separate mutex needed.
+	recvDebitSinceLastUpdate int32
+
 	reqHeaders []hpack.HeaderField
 	reqBody    bytes.Buffer // accumulates body DATA frames; fully populated before dispatch starts
 
@@ -192,9 +198,15 @@ func (s *serverStream) recvRSTStream(code ErrCode) error {
 
 // recvWindowUpdate replenishes the stream's send-side flow-control window.
 // RFC 9113 §6.9: delta == 0 is a PROTOCOL_ERROR.
+// RFC 9113 §6.9.1: a WINDOW_UPDATE that would push the window past 2^31-1
+// is a stream error of type FLOW_CONTROL_ERROR.
 func (s *serverStream) recvWindowUpdate(delta int32) error {
 	if delta == 0 {
 		return streamError(ErrProtocolError, s.id, "WINDOW_UPDATE with delta 0")
+	}
+	cur := s.sendW.available()
+	if _, ok := safeAddInt32(cur, delta); !ok {
+		return streamError(ErrFlowControlError, s.id, "WINDOW_UPDATE stream-level overflow")
 	}
 	s.sendW.replenish(delta)
 	return nil
