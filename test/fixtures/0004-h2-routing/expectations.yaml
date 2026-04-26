@@ -1,0 +1,84 @@
+# Phase 05.2 fixture 0004-h2-routing — expectations
+#
+# This file is prose, not machine-evaluated (per ADR-0019). The runner enforces
+# the assertions described below via test/differential/runner_test.go's byte
+# comparison + DistributionAsserter + HTTPExpectations passes (the H2 variant
+# of the phase-04 carry-forward — same shape, different RoundTrip path; the
+# helper used is test/helpers.H2RoundTrip per Task 12).
+#
+# Asserted equivalence (per ADR-0044 carry-forward + ADR-0057):
+#   - response status code per request, across all 27 requests/side
+#   - decoded response body bytes for /health direct_response (200, "OK\n")
+#     — 9 x "OK\n" concatenated into the Drive byte stream, compared byte-for-byte
+#   - per-side per-cluster RR distribution for the 9 router-action requests:
+#     each side independently witnesses [3, 3, 3] (counted by the driver via
+#     parsing the response body's "backend-<idx>:..." prefix; subprocess
+#     backends do NOT increment the runner's in-process accept counters,
+#     so DistributionAsserter is driver-implemented from response bodies)
+#   - :status pseudo-header presence (the helper places :status as the first
+#     element of the returned []hpack.HeaderField — drivers that compare
+#     headers must accept that ordering)
+#
+# Not asserted:
+#   - /api response body bytes per-request: ref (STRICT_DNS, Docker) and subj
+#     (STATIC, host) may start RR at different endpoints, so the per-body
+#     "backend-<idx>:" prefix diverges. Routing correctness is covered by
+#     the per-side [3,3,3] distribution (driver-counted) + status-200 +
+#     suffix equivalence.
+#   - response-header set equality (only set-equality modulo allow-list)
+#   - 404 local-reply body bytes (envoy-go: "not found\n"; Envoy: HTML/JSON
+#     local-reply — both produce 404 status, body relaxed)
+#   - upstream connection re-use (envoy-go does not pool — ADR-0039 inherited;
+#     Envoy may pool H/2 streams differently)
+#   - x-envoy-* / x-forwarded-* / x-request-id (envoy-go adds none; Envoy adds
+#     many — all in the allow-list below)
+#   - HTTP/2 framing details (HEADERS / DATA / WINDOW_UPDATE counts, frame
+#     sizes): the helper round-trips at the http.Response level, not the
+#     frame level; conformance/h2spec covers framing
+#
+# Header allow-list (set-equality modulo this list — values not compared):
+#   date, server, content-type, content-length, transfer-encoding,
+#   x-envoy-*, x-forwarded-*, x-request-id
+#
+# H/2 pseudo-header presence rule:
+#   Each response carries a :status pseudo-header (RFC 9113 §8.3). The helper
+#   places it as the first element of []hpack.HeaderField; the runner does NOT
+#   compare pseudo-header values across sides as part of the header-set diff
+#   (the status check is exercised via ExpectStatus on HTTPRequestExpectation).
+#
+# Route table (declaration order; first-match-wins):
+#   1. match.path: "/health"   -> direct_response 200 "OK\n"
+#   2. match.prefix: "/api"    -> router -> cluster c_h2_backend (3 endpoints, RR)
+#   3. match.prefix: "/"       -> direct_response 404 "not found\n" (catch-all)
+#
+# Driver request schedule (27 requests/side, deterministic ordering; driver
+# issues them serially over fresh TLS+H/2 connections per call so RR slots are
+# consumed one-per-request):
+#   9 x GET /health                  -> expect 200, body "OK\n" (concatenated)
+#   9 x GET /api/v1/<n>  n=0..8      -> expect 200 (body NOT concatenated;
+#                                        per-side [3,3,3] RR distribution
+#                                        asserted from body "backend-<idx>:"
+#                                        prefix counts)
+#   9 x GET /missing/<n> n=0..8      -> expect 404 (body NOT concatenated)
+#
+# Container concurrency:
+#   --concurrency 1 inherited from phase-02 ADR-0028 via test/differential/harness.go
+#   (the unconditional flag in the testcontainers Cmd) — keeps reference RR
+#   distribution deterministic.
+#
+# Backend body format:
+#   "backend-<idx>:<path-suffix-after-/api/v1/>" per /api/v1/<n> response
+#   (ADR-0044 inherited, settled SPEC §10 #14). The "backend-<idx>:" prefix is
+#   what the driver-side distribution-counter parses; the suffix preserves the
+#   per-request distinguishability for log debugging.
+#
+# STATIC vs STRICT_DNS divergence (ADR-0027 inherited):
+#   subject is host-side STATIC (127.0.0.1:<port> per backend); reference is
+#   container-side STRICT_DNS (host.docker.internal:<port>) with V4_ONLY DNS
+#   per ADR-0010.
+#
+# ADR-0057 closure note:
+#   This fixture closes the H/2 leg of ADR-0035 (downstream H/2 settled by
+#   phase 05.1; upstream H/2 settled by 05.2's filter + H/2 client codec +
+#   this fixture's e2e exercise of HCM(AUTO) → router → c_h2_backend(H/2 TLS) →
+#   3 H/2 backends).

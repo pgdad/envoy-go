@@ -111,6 +111,15 @@ const (
 	TCPEcho BackendKind = 0
 	// HTTPEcho is the accept-loop that reads one http.Request and writes "backend-<idx>:<lastSeg>" canned body, then closes.
 	HTTPEcho BackendKind = 1
+	// HTTPSH2 is an out-of-process backend: the runner spawns
+	// test/fixtures/0004-h2-routing/backends/main.go (one process per backend
+	// index) on the pre-allocated port, with --cert / --key flags pointing at
+	// the fixture-local PKI and BACKEND_IDX env var supplying the per-instance
+	// numeric idx. The backend serves TLS+h2 with NextProtos=["h2"] +
+	// http2.ConfigureServer. Because the backend is a subprocess, the runner's
+	// in-process accept counter is NOT incremented by these requests; drivers
+	// that use HTTPSH2 must derive distribution from response bodies instead.
+	HTTPSH2 BackendKind = 2
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

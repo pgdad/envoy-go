@@ -883,3 +883,76 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0058: Trailers observed but not forwarded — H2 router
 $ # ADR tail unchanged at 0058 (Task 12 lands no new ADR — fixture infrastructure per PLAN line 2221).
 ```
+
+## Task 13 — Fixture 0004 PKI + backends + bootstraps + expectations + README
+
+**Commit:** TBD (main); SHA-fill commit lands on top.
+
+**Files changed:**
+
+- `test/fixtures/0004-h2-routing/pki/gen/main.go` — Deterministic PKI generator; mirrors fixture-0002's gen/main.go verbatim (ChaCha8 PRNG seeded from a constant, ecdh.P256().NewPrivateKey scalar path to avoid Go 1.26's CustomReader DRBG-replace, RFC 6979 deterministic ECDSA signing). Distinct seed bytes + serial map ("listener"=10, "backend-{0,1,2}"={20,21,22}). Emits 9 PEMs: `ca.pem`, `listener.{pem,key.pem}`, `backend-{0,1,2}.{pem,key.pem}`. Every leaf carries DNS SANs `localhost`, `host.docker.internal` + IP SAN `127.0.0.1` so subject (STATIC, dials 127.0.0.1) and reference (STRICT_DNS, dials host.docker.internal) validate the same cert. 173 LoC.
+- `test/fixtures/0004-h2-routing/pki/{ca.pem, listener.pem, listener.key.pem, backend-0.pem, backend-0.key.pem, backend-1.pem, backend-1.key.pem, backend-2.pem, backend-2.key.pem}` — Generated artefacts; committed (CI never runs the generator). Verified deterministic via `go run ./pki/gen` re-run + `md5sum` diff (no changes).
+- `test/fixtures/0004-h2-routing/backends/main.go` — H2 backend server: `flag.String("port"|"cert"|"key")` + `BACKEND_IDX` env var. Routes: `/health` → 200 "OK\n"; `/api/v1/<tail>` → 200 "backend-<idx>:v1/<tail>"; default → 404 "not found\n". TLS `NextProtos=["h2"]` + `http2.ConfigureServer` (driver-side; D-3.2 governs envoy-go runtime, not test backends). 71 LoC.
+- `test/fixtures/0004-h2-routing/envoy-go.yaml` — Subject bootstrap doc-template (driver renders at runtime per fixture-0002 precedent): STATIC `c_h2_backend` cluster with 3 TLS+h2 endpoints (127.0.0.1), `typed_extension_protocol_options.HttpProtocolOptions.explicit_http_config.http2_protocol_options{}`, listener with TLS+`alpn_protocols:["h2","http/1.1"]`, HCM `codec_type: AUTO` + 3 routes (/health direct_response, /api router, /missing 404). 103 LoC.
+- `test/fixtures/0004-h2-routing/envoy.yaml` — Reference bootstrap doc-template: STRICT_DNS `c_h2_backend` with `dns_lookup_family: V4_ONLY` + 3 endpoints `host.docker.internal`. Same listener + HCM + cluster transport-socket shape as subject. 104 LoC.
+- `test/fixtures/0004-h2-routing/expectations.yaml` — Prose form per fixture-0003 precedent. 27 sequential requests/side, per-side `[3,3,3]` distribution rule (driver-counted from response-body `"backend-<idx>:"` prefix because subprocess backends do not increment the runner's accept counter), allow-listed headers (date, server, content-type, content-length, transfer-encoding, x-envoy-*, x-forwarded-*, x-request-id), H/2 `:status` pseudo-header presence rule. 84 LoC.
+- `test/fixtures/0004-h2-routing/README.md` — Documents fixture purpose (HCM(AUTO) + ALPN h2 + upstream H/2 e2e), STATIC vs STRICT_DNS divergence (ADR-0027), ADR-0057 closure of ADR-0035 H/2 leg, `--concurrency 1` reference pin (ADR-0028), per-side `[3,3,3]` RR rule, PKI regen procedure. 65 LoC.
+- `test/fixtures/0004-h2-routing/doc.go` — Package stub with `//go:generate go run ./pki/gen`. 8 LoC.
+- `test/differential/fixture/fixture.go` — Added `HTTPSH2 BackendKind = 2` enum value; documented that subprocess backends do NOT increment the runner's accept counter, so HTTPSH2-using drivers must derive distribution from response bodies.
+- `test/differential/runner_test.go` — (1) Added `os/exec` import. (2) Backend-allocation switch now branches on kind: TCPEcho/HTTPEcho keep the in-process listener path; HTTPSH2 allocates a free port via `freeTCPPort` then spawns the fixture-0004 backend subprocess via `go run ./test/fixtures/0004-h2-routing/backends --port=N --cert=... --key=... BACKEND_IDX=I`. (3) `startHTTPSH2Backend(ctx, repoRoot, port, idx) (*exec.Cmd, error)` builds the subprocess invocation; `waitTCPDial(ctx, addr, 5s)` polls for backend readiness (50ms cadence). (4) The "no driver registered" branch is now `t.Skipf` (was `t.Fatalf`) — a fixture directory with no driver is a valid intermediate state (fixture-0004 content lands at Task 13; its driver lands at Task 14).
+- `docs/envoy-go/phases/05.2-upstream-h2/PROGRESS.md` — this entry.
+
+**Determinism evidence:**
+```
+$ cd test/fixtures/0004-h2-routing && go run ./pki/gen && md5sum pki/*.pem > /tmp/sums1.txt && go run ./pki/gen && md5sum pki/*.pem > /tmp/sums2.txt && diff /tmp/sums1.txt /tmp/sums2.txt && echo OK_DETERMINISTIC
+ok: 9 PEMs written to pki
+ok: 9 PEMs written to pki
+OK_DETERMINISTIC
+```
+
+**Backend smoke-test:**
+```
+$ BACKEND_IDX=2 go run ./test/fixtures/0004-h2-routing/backends --port=$PORT --cert=...backend-2.pem --key=...backend-2.key.pem &
+$ curl -ks --http2 "https://127.0.0.1:$PORT/api/v1/foo"   # → backend-2:v1/foo
+$ curl -ks --http2 "https://127.0.0.1:$PORT/health"       # → OK
+$ curl -ks --http2 -w "HTTP %{http_code}\n" "https://127.0.0.1:$PORT/missing"   # → HTTP 404 + "not found"
+```
+
+**Outputs:**
+```
+$ go build ./...
+$ # exit 0
+
+$ go vet ./...
+$ # exit 0
+
+$ go test -count=1 -short ./...    # all green
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.185s
+[...]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+
+$ go test -count=1 -run TestDifferential -v -timeout=10m ./test/differential/...
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+=== RUN   TestDifferential/0004-h2-routing
+    runner_test.go:52: no driver registered for fixture "0004-h2-routing" (driver package not yet blank-imported in runner_test.go)
+--- PASS: TestDifferential (5.54s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.64s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.26s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.34s)
+    --- PASS: TestDifferential/0003-http11-routing (1.31s)
+    --- SKIP: TestDifferential/0004-h2-routing (0.00s)
+PASS
+
+$ golangci-lint run ./...
+$ # exit 0
+
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0058: Trailers observed but not forwarded — H2 router
+$ # ADR tail unchanged at 0058 (Task 13 lands no new ADR — content-only; ADR-0057 lands at Task 14 alongside the driver registration).
+```
