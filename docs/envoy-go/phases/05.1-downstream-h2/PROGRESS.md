@@ -1542,3 +1542,191 @@ Gate (e) — `go build`/`go vet`/`go test ./...` clean (above); ADR-0046 boundar
 Gate (f) — `REVIEW.md` approved — DEFERRED to lifecycle-state 5 per BOOTSTRAP §5; not run by this Task 17 session.
 
 **All five non-deferred gates GREEN. golangci-lint count: 38 → 0.** STATE.md advances `lifecycle-state: 4` (impl complete; awaiting `superpowers:verification-before-completion` re-run at the new HEAD); the verification re-run is the state-4→state-5 promotion and is the responsibility of the next session, NOT this Task 17 session.
+
+## Verification (lifecycle-state 5)
+
+Fresh terminal in `.worktrees/phase-05.1-downstream-h2-verify-2` at HEAD `2cf3458a2f71604bca6a91d5c6632933d29b05b1` on branch `phase/05.1-downstream-h2-verify-2`, branched from STATE.md commit `2cf3458` (master tip) per ADR-0003 + the per-phase-worktree convention. The prior impl-followup worktree at `.worktrees/phase-05.1-downstream-h2-impl-followup` is closed-history (its work merged via `2cf3458`). This is the second mandatory verification per BOOTSTRAP §1 step E + §5 state-4, re-running every SPEC §3 phase-done gate at the new HEAD; verifier date `2026-04-26`. Per ADR-0018, fuzz-seed corpus discipline is enforced — `git status --porcelain` is captured after each fuzz target and remains empty (no `testdata/fuzz` pollution). `git status --porcelain` was empty before the run and remains empty after all gate commands (verified before this PROGRESS.md edit).
+
+```
+$ pwd
+/home/esa/git/envoy-go/.worktrees/phase-05.1-downstream-h2-verify-2
+$ git rev-parse --abbrev-ref HEAD
+phase/05.1-downstream-h2-verify-2
+$ git log -1 --format=%H
+2cf3458a2f71604bca6a91d5c6632933d29b05b1
+$ go version
+go version go1.26.2 linux/amd64
+$ golangci-lint version 2>&1 | head -1
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+$ go build ./...
+<no output>
+$ go vet ./...
+<no output>
+$ golangci-lint run ./...
+<no output; exit 0>
+$ ls internal/filter/hcm/h2/client.go 2>&1
+ls: cannot access 'internal/filter/hcm/h2/client.go': No such file or directory
+$ grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go'
+internal/filter/hcm/h2/conn.go:10:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/framer.go:10:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/settings.go:4:	"golang.org/x/net/http2"
+(All 3 hits in the 5 allowed files per ADR-0046; hpack.go uses the http2/hpack sub-package; stream.go has no direct import.)
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0053: Phase-04 REVIEW Minor carry-forward triage
+```
+
+Gate (a) — new differential fixture for the phase — VACUOUS per ADR-0045 (no new differential fixture in 05.1).
+
+Gate (b) — all four pre-existing differential fixtures green:
+
+```
+$ go test ./test/differential/ -v -timeout=12m -count=1
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+--- PASS: TestReferenceProxy_Starts (0.90s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.55s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+--- PASS: TestDifferential (4.65s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.14s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.13s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.20s)
+    --- PASS: TestDifferential/0003-http11-routing (1.19s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	6.181s
+(testcontainers ryuk + reference-Envoy lifecycle traces abbreviated for brevity, matching Task 17's `9aa557a` precedent.)
+```
+
+Auxiliary `go test ./...` and `go test -race ./...` clean (every package OK; no data races):
+
+```
+$ go test -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.898s
+ok  	github.com/esalaine/envoy-go/internal/admin	0.041s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.011s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.008s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.011s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.260s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.009s
+ok  	github.com/esalaine/envoy-go/internal/listener	0.009s
+ok  	github.com/esalaine/envoy-go/internal/tls	0.019s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.056s
+ok  	github.com/esalaine/envoy-go/test/differential	6.306s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.005s
+(no-test-files entries omitted for brevity.)
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.903s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.055s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.032s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.026s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.032s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.269s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.028s
+ok  	github.com/esalaine/envoy-go/internal/listener	1.032s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.081s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.138s
+ok  	github.com/esalaine/envoy-go/test/differential	7.641s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.016s
+```
+
+Gate (c) — h2spec conformance, 53/53 PASS at the ADR-0051 pinned image:
+
+```
+$ go test ./test/conformance/h2spec/ -count=1 -timeout=5m -v
+... (h2spec testcontainers lifecycle abbreviated)
+        Finished in 0.5479 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+--- PASS: TestH2Spec (2.16s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.240s
+```
+
+Gate (d) — six fuzz targets at the 30-second CI budget per ADR-0018; all PASS, no crashers, `git status --porcelain` empty after each (no testdata/fuzz pollution):
+
+```
+$ go test ./internal/bootstrap/ -run=^FuzzBootstrapLoad$ -fuzz=^FuzzBootstrapLoad$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 782549 (0/sec), new interesting: 11 (total: 1012)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.087s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/tcpproxy/ -run=^FuzzTcpProxyFilter$ -fuzz=^FuzzTcpProxyFilter$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 3694680 (129010/sec), new interesting: 7 (total: 536)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.052s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/tls/ -run=^FuzzTLSContextParse$ -fuzz=^FuzzTLSContextParse$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 5188444 (421491/sec), new interesting: 17 (total: 633)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.060s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/ -run=^FuzzHCMConfigParse$ -fuzz=^FuzzHCMConfigParse$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 3400923 (125656/sec), new interesting: 4 (total: 498)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.060s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/h2/ -run=^FuzzFrameStream$ -fuzz=^FuzzFrameStream$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 13432505 (395996/sec), new interesting: 15 (total: 338)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.045s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/h2/ -run=^FuzzHPACKDecode$ -fuzz=^FuzzHPACKDecode$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 2030062 (0/sec), new interesting: 1 (total: 143)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.070s
+$ git status --porcelain
+<no output>
+```
+
+Gate (e) — `go build`/`go vet`/`go test ./...` clean (above); ADR-0046 boundary grep clean (3 prod hits in the 5 allowed files); ADR-0048 `client.go` absence verified; **`golangci-lint run ./...` exits 0 with zero issues** — unchanged from Task 17's cleanup at HEAD `2cf3458`.
+
+Gate (f) — `REVIEW.md` is the responsibility of the next session per BOOTSTRAP §5 state 5 (this verification session is the state-4 → state-5 promotion; REVIEW.md authoring is the state-5 → state-6 transition).
+
+**All five non-deferred gates GREEN.** golangci-lint count: 0; h2spec count: 53/53; differential fixture count: 4/4 (0000-tcp-echo, 0001-tcp-proxy-rr, 0002-tls-tcp, 0003-http11-routing). STATE.md advances `lifecycle-state: 4 → 5` per BOOTSTRAP §5 state-4 (verification complete at the new HEAD `2cf3458`); the next session authors `REVIEW.md` (gate (f), state-5 → state-6 transition).
