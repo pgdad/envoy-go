@@ -324,7 +324,17 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 	}
 
 	// Construct the new stream before taking the lock.
-	ss := newServerStream(streamID, s, int32(s.settings.InitialWindowSize), int32(s.settings.InitialWindowSize))
+	//
+	// Per-stream send-window initial size is the PEER-announced
+	// SETTINGS_INITIAL_WINDOW_SIZE (RFC 9113 §6.9.2: this is the limit on data
+	// WE can send into a stream). Default to 65535 if the peer hasn't sent
+	// the setting. The recv window initial size is OUR own announced value
+	// (governs how much the peer can send us before WINDOW_UPDATE).
+	peerInitWindow := int32(s.clientS.InitialWindowSize)
+	if peerInitWindow <= 0 {
+		peerInitWindow = 65535
+	}
+	ss := newServerStream(streamID, s, peerInitWindow, int32(s.settings.InitialWindowSize))
 	if err := ss.recvHeaders(headers, f.StreamEnded()); err != nil {
 		return err
 	}
@@ -588,37 +598,84 @@ func (s *ServerConn) encodeAndWriteHeaders(streamID uint32, headers []hpack.Head
 }
 
 // writeData implements streamConn. Called from serverStream.WriteData.
-// Respects the connection-level and stream-level send windows.
+// ADR-0055 chunking: each DATA frame is bounded by min(connSendWindow,
+// streamSendWindow, peer.MaxFrameSize). The per-stream window is reserved
+// FIRST (smaller bound first reduces head-of-line blocking on the conn-level
+// window); the conn-level window is reserved second for the streamTaken
+// amount; on conn-level under-reservation we replenish the stream-level
+// over-reservation so per-stream window state stays consistent.
 func (s *ServerConn) writeData(streamID uint32, b []byte, endStream bool) error {
-	// For phase 05.1 we write the whole body in one or more DATA frames,
-	// waiting for send-window capacity before each write. We honor the
-	// connection-level window (s.sendW) but not per-stream windows for
-	// outgoing DATA (the stream's sendW is client-controlled; the per-stream
-	// window is replenished by incoming WINDOW_UPDATE for that stream ID).
-	// Full per-stream send-window enforcement is done in a simple loop.
 	ctx := s.ctx
+
+	// Resolve the per-stream send-window. RFC 9113 §5.1: a stream that has
+	// closed during dispatch may already be removed from s.streams; we treat a
+	// missing stream as a no-op since the caller's response is no longer
+	// deliverable. (This shouldn't happen in normal flow — dispatch holds the
+	// stream live — but the lookup keeps the function defensive.)
+	s.mu.Lock()
+	ss, ok := s.streams[streamID]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	// Peer SETTINGS_MAX_FRAME_SIZE cap. RFC 9113 §6.5.2 default is 16384 if
+	// the peer has not yet sent SETTINGS (s.clientS.MaxFrameSize == 0).
+	maxFrame := int32(s.clientS.MaxFrameSize)
+	if maxFrame <= 0 {
+		maxFrame = 16384
+	}
+
 	remaining := b
 	for len(remaining) > 0 {
-		// Atomically wait-and-take from the connection-level send window.
-		taken, err := s.sendW.reserveBlocking(ctx, int32(len(remaining)))
+		want := int32(len(remaining))
+		if want > maxFrame {
+			want = maxFrame
+		}
+
+		// Reserve per-stream first (smaller bound reduces head-of-line
+		// blocking on the conn-level window).
+		streamTaken, err := ss.sendW.reserveBlocking(ctx, want)
 		if err != nil {
 			return err
 		}
-		chunk := remaining[:taken]
-		remaining = remaining[taken:]
+
+		// Reserve conn-level for the streamTaken amount.
+		connTaken, err := s.sendW.reserveBlocking(ctx, streamTaken)
+		if err != nil {
+			// ctx canceled (or similar) — replenish the per-stream over-
+			// reservation so the window state stays accurate. Do NOT replenish
+			// more than streamTaken.
+			ss.sendW.replenish(streamTaken)
+			return err
+		}
+		// If conn-level returned less than streamTaken, replenish the
+		// difference back to the per-stream window so we only consume what we
+		// will actually write.
+		if connTaken < streamTaken {
+			ss.sendW.replenish(streamTaken - connTaken)
+		}
+
+		chunk := remaining[:connTaken]
+		remaining = remaining[connTaken:]
 		isLast := len(remaining) == 0 && endStream
+
 		s.mu.Lock()
 		werr := s.fr.WriteData(streamID, isLast, chunk)
 		s.mu.Unlock()
 		if werr != nil {
-			return werr
+			return translateFramerErr(werr)
 		}
 	}
+
+	// Empty body with endStream: emit a zero-length DATA frame with END_STREAM.
+	// The chunking loop above is skipped when len(b) == 0; the per-stream and
+	// conn-level send windows do not constrain a zero-length frame.
 	if len(b) == 0 && endStream {
 		s.mu.Lock()
 		err := s.fr.WriteData(streamID, true, nil)
 		s.mu.Unlock()
-		return err
+		return translateFramerErr(err)
 	}
 	return nil
 }

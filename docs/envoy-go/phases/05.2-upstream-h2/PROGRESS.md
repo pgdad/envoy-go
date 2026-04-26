@@ -210,3 +210,92 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.020s
 ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.008s
 ok  	github.com/esalaine/envoy-go/test/helpers	1.025s
 ```
+
+## Task 3 — ADR-0055 outbound DATA chunking — `MaxFrameSize` cap (I-1) + per-stream send-window (I-2)
+
+**Commits:** (SHA-fill: see next commit)
+**Files changed:**
+- `internal/filter/hcm/h2/conn.go` — rewrote `(*ServerConn).writeData` to apply the chunk = min(connSendWindow, streamSendWindow, peer.MaxFrameSize) algorithm: per-stream reservation first (smaller bound first reduces head-of-line blocking on the conn-level window), conn-level reservation second for the streamTaken amount, replenish per-stream over-reservation on conn-level under-reservation or ctx-cancel rollback. MaxFrameSize=0 default → 16384 per RFC 9113 §6.5.2. Use `translateFramerErr` (extracted by Task 2) on `framer.WriteData` errors. Also fixed `onHeaders` stream construction: per-stream **send** window initial size now reads `s.clientS.InitialWindowSize` (peer-announced — what governs how much WE can send) with a 65535 default; recv window initial size unchanged (still `s.settings.InitialWindowSize`, our own announced value).
+- `internal/filter/hcm/h2/conn_test.go` — added `TestServerConn_WriteData_RespectsMaxFrameSize` (32768-byte body, peer MaxFrameSize=16384 → ≥ 2 DATA frames, none > 16384) and `TestServerConn_WriteData_RespectsPerStreamSendWindow` (100-byte body, peer InitialWindowSize=16, drip WINDOW_UPDATE(1, 16) every 5ms → ≥ 7 DATA frames, none > 16). LoC delta: +322/-14.
+
+**Notes:** TWO red→green TDD cycles, both observed:
+1. `TestServerConn_WriteData_RespectsMaxFrameSize` first failed: server emitted a single 32768-byte DATA frame (exceeded peer MaxFrameSize=16384). After implementing the MaxFrameSize cap in `writeData`, the test passes (≥ 2 DATA frames, each ≤ 16384).
+2. `TestServerConn_WriteData_RespectsPerStreamSendWindow` first failed: server emitted a single 100-byte DATA frame (exceeded peer per-stream initial window=16). Root cause was twofold: (a) `writeData` only honored the conn-level window, never the per-stream window; (b) `onHeaders` initialized the per-stream send-window from `s.settings.InitialWindowSize` (the SERVER's own value, 65535) rather than `s.clientS.InitialWindowSize` (the PEER's announced value). Both fixes landed; the test passes.
+
+The replenish discipline on conn-level under-reservation matches PLAN's pitfall #1: if `connTaken < streamTaken`, replenish exactly `streamTaken - connTaken`; if conn-level reservation errors, replenish exactly `streamTaken`. Verified manually by reading the new `writeData` against PLAN.md:585-632 reference snippet.
+
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/h2/ -run TestServerConn_WriteData_Respects -v   # before conn.go change
+=== RUN   TestServerConn_WriteData_RespectsMaxFrameSize
+    conn_test.go:925: DATA frame #1 payload = 32768 bytes, exceeds peer MaxFrameSize=16384
+    conn_test.go:935: got 1 DATA frames, want >= 2 (32768 bytes / MaxFrameSize=16384)
+--- FAIL: TestServerConn_WriteData_RespectsMaxFrameSize (0.00s)
+=== RUN   TestServerConn_WriteData_RespectsPerStreamSendWindow
+    conn_test.go:1055: DATA frame #1 payload = 100 bytes, exceeds peer per-stream initial window=16
+    conn_test.go:1068: got 1 DATA frames, want >= 7 (ceil(100/16) = 7)
+--- FAIL: TestServerConn_WriteData_RespectsPerStreamSendWindow (0.00s)
+FAIL
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.005s
+FAIL
+
+$ go test ./internal/filter/hcm/h2/ -run TestServerConn_WriteData_Respects -v   # after conn.go change
+=== RUN   TestServerConn_WriteData_RespectsMaxFrameSize
+--- PASS: TestServerConn_WriteData_RespectsMaxFrameSize (0.00s)
+=== RUN   TestServerConn_WriteData_RespectsPerStreamSendWindow
+--- PASS: TestServerConn_WriteData_RespectsPerStreamSendWindow (0.03s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.035s
+
+$ go test -race ./internal/filter/hcm/h2/ -v   # last 20 lines (full output: every existing test + 2 new tests = all PASS)
+=== RUN   TestServerConn_WriteData_RespectsMaxFrameSize
+--- PASS: TestServerConn_WriteData_RespectsMaxFrameSize (0.00s)
+=== RUN   TestServerConn_WriteData_RespectsPerStreamSendWindow
+--- PASS: TestServerConn_WriteData_RespectsPerStreamSendWindow (0.03s)
+=== RUN   FuzzFrameStream
+=== RUN   FuzzFrameStream/seed#0
+=== RUN   FuzzFrameStream/seed#1
+=== RUN   FuzzFrameStream/seed#2
+--- PASS: FuzzFrameStream (0.00s)
+    --- PASS: FuzzFrameStream/seed#0 (0.00s)
+    --- PASS: FuzzFrameStream/seed#1 (0.00s)
+    --- PASS: FuzzFrameStream/seed#2 (0.00s)
+=== RUN   FuzzHPACKDecode
+=== RUN   FuzzHPACKDecode/seed#0
+=== RUN   FuzzHPACKDecode/seed#1
+--- PASS: FuzzHPACKDecode (0.00s)
+    --- PASS: FuzzHPACKDecode/seed#0 (0.00s)
+    --- PASS: FuzzHPACKDecode/seed#1 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.316s
+
+$ go test ./test/conformance/h2spec/ -v   # h2spec section roll-up (ADR-0051 pin)
+        Finished in 0.5493 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+--- PASS: TestH2Spec (2.24s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.321s
+
+$ golangci-lint run ./internal/filter/hcm/h2/
+$ echo $?
+0
+
+$ go test -race ./...   # broader sanity check, all packages green
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.687s
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+ok  	github.com/esalaine/envoy-go/internal/cluster	(cached)
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.031s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.317s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	(cached)
+ok  	github.com/esalaine/envoy-go/internal/listener	1.025s
+ok  	github.com/esalaine/envoy-go/internal/tls	(cached)
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	(cached)
+ok  	github.com/esalaine/envoy-go/test/differential	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	(cached)
+ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
+```

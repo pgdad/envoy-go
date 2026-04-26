@@ -821,6 +821,257 @@ func TestServerConn_TinyWindowDelivery(t *testing.T) {
 	_ = serverDone
 }
 
+// TestServerConn_WriteData_RespectsMaxFrameSize verifies ADR-0055 I-1: the
+// server's outbound DATA frames never exceed the peer-advertised
+// SETTINGS_MAX_FRAME_SIZE. Setup: peer announces MaxFrameSize=16384; server
+// sends a 32768-byte body. Expectation: at least 2 DATA frames are emitted,
+// every DATA frame's payload is <= 16384 bytes.
+func TestServerConn_WriteData_RespectsMaxFrameSize(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const bodySize = 32768
+	const peerMaxFrame = uint32(16384)
+	body := make([]byte, bodySize)
+	for i := range body {
+		body[i] = byte('a' + (i % 26))
+	}
+
+	disp := &fixedDispatcher{action: &fixedAction{status: 200, body: string(body)}}
+	clientConn, _ := startServerConn(t, ctx, disp, DefaultServerSettings)
+
+	if err := writeClientPreface(clientConn); err != nil {
+		t.Fatalf("write preface: %v", err)
+	}
+
+	fr := http2.NewFramer(clientConn, clientConn)
+	// Allow reading frames up to the server's advertised default.
+	fr.SetMaxReadFrameSize(65535)
+	// Announce MaxFrameSize=16384 so the server should chunk its 32768-byte body
+	// into at least two DATA frames.
+	if err := fr.WriteSettings(http2.Setting{
+		ID:  http2.SettingMaxFrameSize,
+		Val: peerMaxFrame,
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	// Handshake.
+	settingsAcked := false
+	clientAcked := false
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for !settingsAcked || !clientAcked {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("handshake: %v", err)
+		}
+		if f.Header().Type == http2.FrameSettings {
+			sf := f.(*http2.SettingsFrame)
+			if !sf.IsAck() {
+				_ = fr.WriteSettingsAck()
+				settingsAcked = true
+			} else {
+				clientAcked = true
+			}
+		}
+	}
+
+	// Open the connection-level send window beyond the body so the conn-window
+	// is never the constraint (we want to test the MaxFrameSize cap in
+	// isolation).
+	if err := fr.WriteWindowUpdate(0, 1<<20); err != nil {
+		t.Fatalf("conn window update: %v", err)
+	}
+
+	// Send the request.
+	var encBuf bytes.Buffer
+	enc := hpack.NewEncoder(&encBuf)
+	_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: "/big"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "http"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: "test.local"})
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: encBuf.Bytes(),
+		EndHeaders:    true,
+		EndStream:     true,
+	}); err != nil {
+		t.Fatalf("write headers: %v", err)
+	}
+
+	// Open per-stream window large enough for the entire body (we are NOT
+	// testing per-stream windowing here — that's I-2). Stream-level initial
+	// window from peer SETTINGS defaults to 65535 (we did not override).
+	if err := fr.WriteWindowUpdate(1, 1<<20); err != nil {
+		t.Fatalf("stream window update: %v", err)
+	}
+
+	// Collect DATA frames until END_STREAM.
+	var dataFrames int
+	var totalBytes int
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	done := false
+	for !done {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		switch ff := f.(type) {
+		case *http2.DataFrame:
+			dataFrames++
+			payloadLen := len(ff.Data())
+			totalBytes += payloadLen
+			if uint32(payloadLen) > peerMaxFrame {
+				t.Errorf("DATA frame #%d payload = %d bytes, exceeds peer MaxFrameSize=%d",
+					dataFrames, payloadLen, peerMaxFrame)
+			}
+			if ff.StreamEnded() {
+				done = true
+			}
+		}
+	}
+
+	if dataFrames < 2 {
+		t.Errorf("got %d DATA frames, want >= 2 (32768 bytes / MaxFrameSize=16384)", dataFrames)
+	}
+	if totalBytes != bodySize {
+		t.Errorf("total bytes received = %d, want %d", totalBytes, bodySize)
+	}
+}
+
+// TestServerConn_WriteData_RespectsPerStreamSendWindow verifies ADR-0055 I-2:
+// the server respects the peer-advertised per-stream INITIAL_WINDOW_SIZE.
+// Setup: peer announces InitialWindowSize=16; server sends a 100-byte body.
+// The peer drips WINDOW_UPDATE(streamID, 16) every ~5ms. Expectation: many
+// small DATA frames (no single frame exceeds 16 bytes), no peer-side
+// FLOW_CONTROL_ERROR (since the server never sends more than the per-stream
+// window allows).
+func TestServerConn_WriteData_RespectsPerStreamSendWindow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const bodySize = 100
+	const peerInitialWindow = uint32(16)
+	body := make([]byte, bodySize)
+	for i := range body {
+		body[i] = byte('A' + (i % 26))
+	}
+
+	disp := &fixedDispatcher{action: &fixedAction{status: 200, body: string(body)}}
+	clientConn, _ := startServerConn(t, ctx, disp, DefaultServerSettings)
+
+	if err := writeClientPreface(clientConn); err != nil {
+		t.Fatalf("write preface: %v", err)
+	}
+
+	fr := http2.NewFramer(clientConn, clientConn)
+	// Announce a tiny INITIAL_WINDOW_SIZE so each stream's send-window starts
+	// at 16. The connection-level window stays at the default 65535.
+	if err := fr.WriteSettings(http2.Setting{
+		ID:  http2.SettingInitialWindowSize,
+		Val: peerInitialWindow,
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	// Handshake.
+	settingsAcked := false
+	clientAcked := false
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for !settingsAcked || !clientAcked {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("handshake: %v", err)
+		}
+		if f.Header().Type == http2.FrameSettings {
+			sf := f.(*http2.SettingsFrame)
+			if !sf.IsAck() {
+				_ = fr.WriteSettingsAck()
+				settingsAcked = true
+			} else {
+				clientAcked = true
+			}
+		}
+	}
+
+	// Send the request.
+	var encBuf bytes.Buffer
+	enc := hpack.NewEncoder(&encBuf)
+	_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: "/streamwindow"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "http"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: "test.local"})
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: encBuf.Bytes(),
+		EndHeaders:    true,
+		EndStream:     true,
+	}); err != nil {
+		t.Fatalf("write headers: %v", err)
+	}
+
+	// Goroutine: drip WINDOW_UPDATE(1, 16) every ~5ms until ctx done.
+	dripDone := make(chan struct{})
+	dripperMu := &sync.Mutex{} // serialize WINDOW_UPDATE writes against fr's writer
+	go func() {
+		defer close(dripDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				dripperMu.Lock()
+				_ = fr.WriteWindowUpdate(1, peerInitialWindow)
+				dripperMu.Unlock()
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		<-dripDone
+	}()
+
+	// Collect DATA frames until END_STREAM. Assert no frame > 16 bytes and no
+	// GOAWAY arrived (a FLOW_CONTROL_ERROR would manifest as GOAWAY from the
+	// peer; from our side, since WE are the peer here, we'd never *send*
+	// GOAWAY — what we'd see is the server emit a too-large DATA frame).
+	var dataFrames int
+	var totalBytes int
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	done := false
+	for !done {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		switch ff := f.(type) {
+		case *http2.DataFrame:
+			dataFrames++
+			payloadLen := len(ff.Data())
+			totalBytes += payloadLen
+			if uint32(payloadLen) > peerInitialWindow {
+				t.Errorf("DATA frame #%d payload = %d bytes, exceeds peer per-stream initial window=%d",
+					dataFrames, payloadLen, peerInitialWindow)
+			}
+			if ff.StreamEnded() {
+				done = true
+			}
+		}
+	}
+
+	// 100 bytes / 16-byte chunks = at least 7 frames (ceil(100/16) = 7).
+	// Allow some slack: frames may be smaller than 16 if drip timing splits
+	// reservations, so require >= 7 frames as a lower bound.
+	if dataFrames < 7 {
+		t.Errorf("got %d DATA frames, want >= 7 (ceil(100/16) = 7)", dataFrames)
+	}
+	if totalBytes != bodySize {
+		t.Errorf("total bytes received = %d, want %d", totalBytes, bodySize)
+	}
+}
+
 // TestServerConn_BadPrefaceClosesConnection verifies that a non-preface
 // 24-byte write causes ServerConn.Run to return *Error{Code: ErrProtocolError}.
 func TestServerConn_BadPrefaceClosesConnection(t *testing.T) {
