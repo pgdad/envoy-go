@@ -302,7 +302,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	(cached)
 
 ## Task 4 — ADR-0055 receive-side flow control (I-3) + WINDOW_UPDATE delta-overflow bounds-check (M-9)
 
-**Commits:** (SHA-fill: see next commit)
+**Commits:** b951c38 (SHA-fill: see next commit)
 **Files changed:**
 - `internal/filter/hcm/h2/conn.go` — added `safeAddInt32(a, b int32) (int32, bool)` helper and `recvWindowUpdateThreshold = 32768` constant; added `recvDebitSinceLastUpdate int32` field to `ServerConn`; rewrote `onData` to debit conn-level + per-stream recv windows (`recvW.replenish(-dataLen)` — flow.go's `replenish` accepts negative deltas, no separate debit method needed) and emit `WriteWindowUpdate(0, n)` / `WriteWindowUpdate(streamID, n)` once the running counter crosses the half-window threshold (32768 = 65535/2). Per-stream WINDOW_UPDATE is suppressed when END_STREAM accompanies the DATA (no further DATA can arrive on that stream). `s.fr.WriteWindowUpdate` writes are serialised via `s.mu` against other framer writers (encodeAndWriteHeaders / writeData / RSTStream / GoAway). `onWindowUpdate` now bounds-checks the resulting send window against int32 overflow per RFC 9113 §6.9.1: conn-level overflow → `connError(ErrFlowControlError)` → GOAWAY; stream-level overflow handled inside `recvWindowUpdate`. The existing `delta == 0` PROTOCOL_ERROR path is preserved.
 - `internal/filter/hcm/h2/stream.go` — added `recvDebitSinceLastUpdate int32` field to `serverStream`; updated `recvWindowUpdate` to bounds-check via `safeAddInt32(cur, delta)` → `streamError(ErrFlowControlError)` (RST_STREAM) on overflow.
