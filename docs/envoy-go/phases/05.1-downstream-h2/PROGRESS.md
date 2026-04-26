@@ -1730,3 +1730,444 @@ Gate (e) — `go build`/`go vet`/`go test ./...` clean (above); ADR-0046 boundar
 Gate (f) — `REVIEW.md` is the responsibility of the next session per BOOTSTRAP §5 state 5 (this verification session is the state-4 → state-5 promotion; REVIEW.md authoring is the state-5 → state-6 transition).
 
 **All five non-deferred gates GREEN.** golangci-lint count: 0; h2spec count: 53/53; differential fixture count: 4/4 (0000-tcp-echo, 0001-tcp-proxy-rr, 0002-tls-tcp, 0003-http11-routing). STATE.md advances `lifecycle-state: 4 → 5` per BOOTSTRAP §5 state-4 (verification complete at the new HEAD `2cf3458`); the next session authors `REVIEW.md` (gate (f), state-5 → state-6 transition).
+
+## Follow-up batch verification (lifecycle-state 3 re-entry from REVIEW)
+
+Fresh terminal in `/home/esa/git/envoy-go/.worktrees/phase-05.1-downstream-h2-review-followup/` at HEAD `3fdc0a529a05dfe9f6b96de43cb70c40071edf62` on branch `phase/05.1-downstream-h2-review-followup`, branched from STATE.md commit `04cb344` (master tip). The follow-up batch is 7 commits: `4944719` (I-4 CONFORMANCE_PINS refresh procedure) → `38ff587` (M-1 dead `hpackBlocked` field+guard delete) → `851a260` (M-2 `validateClientStreamID` + tests delete) → `fd18c0d` (M-15 ADR-0054 supersedes ADR-0046 prose drift) → `3d00501` (M-6 `errors.Is` for ctx errors in fuzz_test.go) → `b825078` (M-13/M-16/M-17 BEHAVIOR_CONTRACT prose + smoke-only docstring tag + ADR-0050 cross-ref comment) → `3fdc0a5` (M-14 H2 no-match 404 body alignment with H1 phase-04 convention). Verifier date `2026-04-26`. This is the BOOTSTRAP §5.2 lifecycle-state 3 re-entry verification block — `REVIEW.md` APPROVED WITH FOLLOW-UPS at `d69446a` triggered the re-entry; this batch closes 9 of the REVIEW's 21 findings (I-4 + M-1/M-2/M-6/M-13/M-14/M-15/M-16/M-17), leaving the remaining 12 (I-1/I-2/I-3 + M-3/M-4/M-5/M-7/M-8/M-9/M-10/M-11/M-12) as carry-forward to phase 05.2 per REVIEW.md Recommendation Path A. Per ADR-0018, fuzz-seed corpus discipline is enforced — `git status --porcelain` is captured after each fuzz target and remains empty (no `testdata/fuzz` pollution).
+
+### Closed REVIEW items (this follow-up batch)
+
+- **I-4** → `CONFORMANCE_PINS.md` `## Refresh procedure` section added at `4944719`.
+- **M-1** → dead `hpackBlocked` field + guard deleted at `38ff587`.
+- **M-2** → deprecated `validateClientStreamID` + tests deleted at `851a260` (production validation lives inline at `internal/filter/hcm/h2/conn.go:308-319`).
+- **M-15** → ADR-0054 supersedes ADR-0046 prose drift (file-list claim only) at `fd18c0d`.
+- **M-6** → `errors.Is` for ctx errors in fuzz_test.go at `3d00501`.
+- **M-13 + M-16 + M-17** → `BEHAVIOR_CONTRACT.md` prose tightening + smoke-only docstring tag + ADR-0050 cross-ref comment at `b825078`.
+- **M-14** → H2 no-match 404 body aligned to phase-04 H1 empty-body convention at `3fdc0a5`.
+
+### Carry-forward (deferred to phase 05.2 per REVIEW.md Recommendation Path A)
+
+- **I-1 / I-2 / I-3** — flow-control discipline gaps: outbound MaxFrameSize chunking + per-stream send-window enforcement + inbound `WriteWindowUpdate` emission. Bundled into a dedicated 05.2 ADR (likely ADR-0055) at PLAN-write time per ADR-0004.
+- **M-3** — `writeData` dead recovery branch (bundles with I-1/I-2 — the branch becomes live once outbound chunking lands).
+- **M-4** — preface ctx-awareness (phase 06 or 07 — connection-lifecycle scope).
+- **M-5** — framer error-translation duplication (pure cosmetic — a small refactor pass).
+- **M-7** — `recvW` dead today (consumed by I-3 fix in 05.2 — inbound `WriteWindowUpdate` emission turns this live).
+- **M-8** — `excludedSubsections` noise (pure cosmetic — `h2spec_test.go` table cleanup).
+- **M-9** — window overflow bounds-check (bundles with I-1/I-2/I-3 — flow-control hardening).
+- **M-10** — `SETTINGS_TIMEOUT` (flag for 05.2 or 06 — depends on whether 05.2 expands SETTINGS surface).
+- **M-11** — `recvData` write-before-state-check (one-line reorder — low priority, no observable defect today).
+- **M-12** — `closedStreams` unbounded growth (phase 06 observability concern — long-lived connections).
+
+### Discovered during follow-up batch (carry-forward to 05.2 or as separate small follow-up)
+
+- **Coverage gap (test):** the inline production validation at `internal/filter/hcm/h2/conn.go:308-319` enforces both even-id rejection AND monotonic-id-reuse rejection, but `conn_test.go` only covers the even-id branch (`TestServerConn_GOAWAYOnProtocolError_EvenStreamID`). The monotonic-id branch has no dedicated integration test. Recommended: add `TestServerConn_GOAWAYOnProtocolError_NonMonotonicStreamID` mirroring the existing test pattern. Surfaced by the FU-3 (M-2 deletion) code-quality reviewer.
+
+### Environment fingerprint (Step 1)
+
+```
+$ pwd
+/home/esa/git/envoy-go/.worktrees/phase-05.1-downstream-h2-review-followup
+$ git rev-parse --abbrev-ref HEAD
+phase/05.1-downstream-h2-review-followup
+$ git log -1 --format=%H
+3fdc0a529a05dfe9f6b96de43cb70c40071edf62
+$ git log --oneline 04cb344..HEAD
+3fdc0a5 phase 05.1 follow-up: align H2 no-match 404 body with H1 (M-14)
+b825078 phase 05.1 follow-up: prose/comment cleanups (M-13, M-16, M-17)
+3d00501 phase 05.1 follow-up: errors.Is for ctx errors in fuzz_test (M-6)
+fd18c0d phase 05.1 follow-up: ADR-0054 supersedes ADR-0046 prose drift (M-15)
+851a260 phase 05.1 follow-up: delete deprecated validateClientStreamID (M-2)
+38ff587 phase 05.1 follow-up: delete dead hpackBlocked guard (M-1)
+4944719 phase 05.1 follow-up: CONFORMANCE_PINS.md refresh procedure (I-4)
+$ go version
+go version go1.26.2 linux/amd64
+$ golangci-lint version 2>&1 | head -1
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+$ git status --porcelain
+<no output>
+```
+
+### Gate (a) — new differential fixture for the phase
+
+VACUOUS per ADR-0045 (no new differential fixture in 05.1; H2 conformance is covered by gate (c) h2spec rather than differential parity, since the reference Envoy and the Go subject have different default H1/H2 negotiation surfaces and the reference's H2 frame ordering is implementation-defined for Envoy's HCM filter chain).
+
+### Gate (b) — pre-existing differential fixtures still green
+
+```
+$ go test ./test/differential/ -v -timeout=12m -count=1
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+... (testcontainers ryuk + reference-Envoy lifecycle traces abbreviated for brevity, matching prior verification convention.)
+--- PASS: TestReferenceProxy_Starts (1.11s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.56s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+--- PASS: TestDifferential (5.16s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.27s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.28s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.32s)
+    --- PASS: TestDifferential/0003-http11-routing (1.28s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	6.908s
+```
+
+Auxiliary `go test ./...` and `go test -race ./...` (all packages green):
+
+```
+$ go test -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	1.900s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	0.042s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.014s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.021s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.024s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.272s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.022s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	0.023s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	0.016s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.186s
+ok  	github.com/esalaine/envoy-go/test/differential	6.973s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.015s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.014s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.020s
+
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.901s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.056s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.035s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.025s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.028s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.270s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.026s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.032s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+?   	github.com/esalaine/envoy-go/internal/stats	[no test files]
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.088s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.125s
+ok  	github.com/esalaine/envoy-go/test/differential	7.446s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.010s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.010s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.017s
+```
+
+### Gate (c) — h2spec conformance (53/53 PASS at the ADR-0051 pinned digest)
+
+```
+$ go test ./test/conformance/h2spec/ -count=1 -timeout=5m -v
+=== RUN   TestH2Spec
+... (testcontainers ryuk + h2spec container lifecycle traces abbreviated for brevity, matching prior verification convention.)
+2026/04/26 09:31:45 🐳 Creating container for image summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0
+    h2spec_test.go:163: h2spec output:
+        Hypertext Transfer Protocol Version 2 (HTTP/2)
+          3. Starting HTTP/2
+            3.5. HTTP/2 Connection Preface
+                1: Sends client connection preface      ✔ 1: Sends client connection preface
+                2: Sends invalid connection preface      ✔ 2: Sends invalid connection preface
+
+          4. HTTP Frames
+            4.1. Frame Format
+                1: Sends a frame with unknown type      ✔ 1: Sends a frame with unknown type
+                2: Sends a frame with undefined flag      ✔ 2: Sends a frame with undefined flag
+                3: Sends a frame with reserved field bit      ✔ 3: Sends a frame with reserved field bit
+
+            4.2. Frame Size
+                1: Sends a DATA frame with 2^14 octets in length      ✔ 1: Sends a DATA frame with 2^14 octets in length
+                2: Sends a large size DATA frame that exceeds the SETTINGS_MAX_FRAME_SIZE      ✔ 2: Sends a large size DATA frame that exceeds the SETTINGS_MAX_FRAME_SIZE
+                3: Sends a large size HEADERS frame that exceeds the SETTINGS_MAX_FRAME_SIZE      ✔ 3: Sends a large size HEADERS frame that exceeds the SETTINGS_MAX_FRAME_SIZE
+
+            4.3. Header Compression and Decompression
+                1: Sends invalid header block fragment      ✔ 1: Sends invalid header block fragment
+                2: Sends a PRIORITY frame while sending the header blocks      ✔ 2: Sends a PRIORITY frame while sending the header blocks
+                3: Sends a HEADERS frame to another stream while sending the header blocks      ✔ 3: Sends a HEADERS frame to another stream while sending the header blocks
+
+          5. Streams and Multiplexing
+            5.1. Stream States
+                1: idle: Sends a DATA frame      ✔ 1: idle: Sends a DATA frame
+                2: idle: Sends a RST_STREAM frame      ✔ 2: idle: Sends a RST_STREAM frame
+                3: idle: Sends a WINDOW_UPDATE frame      ✔ 3: idle: Sends a WINDOW_UPDATE frame
+                4: idle: Sends a CONTINUATION frame      ✔ 4: idle: Sends a CONTINUATION frame
+                5: half closed (remote): Sends a DATA frame      ✔ 5: half closed (remote): Sends a DATA frame
+                6: half closed (remote): Sends a HEADERS frame      ✔ 6: half closed (remote): Sends a HEADERS frame
+                7: half closed (remote): Sends a CONTINUATION frame      ✔ 7: half closed (remote): Sends a CONTINUATION frame
+                8: closed: Sends a DATA frame after sending RST_STREAM frame      ✔ 8: closed: Sends a DATA frame after sending RST_STREAM frame
+                9: closed: Sends a HEADERS frame after sending RST_STREAM frame      ✔ 9: closed: Sends a HEADERS frame after sending RST_STREAM frame
+                10: closed: Sends a CONTINUATION frame after sending RST_STREAM frame      ✔ 10: closed: Sends a CONTINUATION frame after sending RST_STREAM frame
+                11: closed: Sends a DATA frame      ✔ 11: closed: Sends a DATA frame
+                12: closed: Sends a HEADERS frame      ✔ 12: closed: Sends a HEADERS frame
+                13: closed: Sends a CONTINUATION frame      ✔ 13: closed: Sends a CONTINUATION frame
+
+              5.1.1. Stream Identifiers
+                  1: Sends even-numbered stream identifier        ✔ 1: Sends even-numbered stream identifier
+                  2: Sends stream identifier that is numerically smaller than previous        ✔ 2: Sends stream identifier that is numerically smaller than previous
+
+              5.1.2. Stream Concurrency
+                  1: Sends HEADERS frames that causes their advertised concurrent stream limit to be exceeded        ✔ 1: Sends HEADERS frames that causes their advertised concurrent stream limit to be exceeded
+
+            5.3. Stream Priority
+              5.3.1. Stream Dependencies
+                  1: Sends HEADERS frame that depends on itself        ✔ 1: Sends HEADERS frame that depends on itself
+                  2: Sends PRIORITY frame that depend on itself        ✔ 2: Sends PRIORITY frame that depend on itself
+
+            5.4. Error Handling
+              5.4.1. Connection Error Handling
+                  1: Sends an invalid PING frame for connection close        ✔ 1: Sends an invalid PING frame for connection close
+                  2: Sends an invalid PING frame to receive GOAWAY frame        ✔ 2: Sends an invalid PING frame to receive GOAWAY frame
+
+            5.5. Extending HTTP/2
+                1: Sends an unknown extension frame      ✔ 1: Sends an unknown extension frame
+                2: Sends an unknown extension frame in the middle of a header block      ✔ 2: Sends an unknown extension frame in the middle of a header block
+
+          6. Frame Definitions
+          7. Error Codes
+              1: Sends a GOAWAY frame with unknown error code    ✔ 1: Sends a GOAWAY frame with unknown error code
+              2: Sends a RST_STREAM frame with unknown error code    ✔ 2: Sends a RST_STREAM frame with unknown error code
+
+          8. HTTP Message Exchanges
+            8.1. HTTP Request/Response Exchange
+                1: Sends a second HEADERS frame without the END_STREAM flag      ✔ 1: Sends a second HEADERS frame without the END_STREAM flag
+
+              8.1.2. HTTP Header Fields
+                  1: Sends a HEADERS frame that contains the header field name in uppercase letters        ✔ 1: Sends a HEADERS frame that contains the header field name in uppercase letters
+
+                8.1.2.1. Pseudo-Header Fields
+                    1: Sends a HEADERS frame that contains a unknown pseudo-header field          ✔ 1: Sends a HEADERS frame that contains a unknown pseudo-header field
+                    2: Sends a HEADERS frame that contains the pseudo-header field defined for response          ✔ 2: Sends a HEADERS frame that contains the pseudo-header field defined for response
+                    3: Sends a HEADERS frame that contains a pseudo-header field as trailers          ✔ 3: Sends a HEADERS frame that contains a pseudo-header field as trailers
+                    4: Sends a HEADERS frame that contains a pseudo-header field that appears in a header block after a regular header field          ✔ 4: Sends a HEADERS frame that contains a pseudo-header field that appears in a header block after a regular header field
+
+                8.1.2.2. Connection-Specific Header Fields
+                    1: Sends a HEADERS frame that contains the connection-specific header field          ✔ 1: Sends a HEADERS frame that contains the connection-specific header field
+                    2: Sends a HEADERS frame that contains the TE header field with any value other than "trailers"          ✔ 2: Sends a HEADERS frame that contains the TE header field with any value other than "trailers"
+
+                8.1.2.3. Request Pseudo-Header Fields
+                    1: Sends a HEADERS frame with empty ":path" pseudo-header field          ✔ 1: Sends a HEADERS frame with empty ":path" pseudo-header field
+                    2: Sends a HEADERS frame that omits ":method" pseudo-header field          ✔ 2: Sends a HEADERS frame that omits ":method" pseudo-header field
+                    3: Sends a HEADERS frame that omits ":scheme" pseudo-header field          ✔ 3: Sends a HEADERS frame that omits ":scheme" pseudo-header field
+                    4: Sends a HEADERS frame that omits ":path" pseudo-header field          ✔ 4: Sends a HEADERS frame that omits ":path" pseudo-header field
+                    5: Sends a HEADERS frame with duplicated ":method" pseudo-header field          ✔ 5: Sends a HEADERS frame with duplicated ":method" pseudo-header field
+                    6: Sends a HEADERS frame with duplicated ":scheme" pseudo-header field          ✔ 6: Sends a HEADERS frame with duplicated ":scheme" pseudo-header field
+                    7: Sends a HEADERS frame with duplicated ":path" pseudo-header field          ✔ 7: Sends a HEADERS frame with duplicated ":path" pseudo-header field
+
+                8.1.2.6. Malformed Requests and Responses
+                    1: Sends a HEADERS frame with the "content-length" header field which does not equal the DATA frame payload length          ✔ 1: Sends a HEADERS frame with the "content-length" header field which does not equal the DATA frame payload length
+                    2: Sends a HEADERS frame with the "content-length" header field which does not equal the sum of the multiple DATA frames payload length          ✔ 2: Sends a HEADERS frame with the "content-length" header field which does not equal the sum of the multiple DATA frames payload length
+
+            8.2. Server Push
+                1: Sends a PUSH_PROMISE frame      ✔ 1: Sends a PUSH_PROMISE frame
+
+        Finished in 0.5487 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+--- PASS: TestH2Spec (2.21s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.295s
+```
+
+### Gate (d) — six fuzzers at 30s budget per ADR-0018
+
+```
+$ go test ./internal/bootstrap/ -run=^FuzzBootstrapLoad$ -fuzz=^FuzzBootstrapLoad$ -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/1012 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 624/1012 completed
+fuzz: elapsed: 5s, gathering baseline coverage: 1012/1012 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 165814 (55138/sec), new interesting: 2 (total: 1014)
+fuzz: elapsed: 9s, execs: 248176 (27416/sec), new interesting: 5 (total: 1017)
+fuzz: elapsed: 12s, execs: 248176 (0/sec), new interesting: 5 (total: 1017)
+fuzz: elapsed: 15s, execs: 310037 (20630/sec), new interesting: 6 (total: 1018)
+fuzz: elapsed: 18s, execs: 326194 (5385/sec), new interesting: 7 (total: 1019)
+fuzz: elapsed: 21s, execs: 326194 (0/sec), new interesting: 7 (total: 1019)
+fuzz: elapsed: 24s, execs: 326194 (0/sec), new interesting: 7 (total: 1019)
+fuzz: elapsed: 27s, execs: 326194 (0/sec), new interesting: 7 (total: 1019)
+fuzz: elapsed: 30s, execs: 326194 (0/sec), new interesting: 7 (total: 1019)
+fuzz: elapsed: 31s, execs: 326194 (0/sec), new interesting: 7 (total: 1019)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.086s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/tcpproxy/ -run=^FuzzTcpProxyFilter$ -fuzz=^FuzzTcpProxyFilter$ -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/536 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 356/536 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 536/536 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 267043 (88905/sec), new interesting: 0 (total: 536)
+fuzz: elapsed: 9s, execs: 737601 (156813/sec), new interesting: 1 (total: 537)
+fuzz: elapsed: 12s, execs: 1202876 (155067/sec), new interesting: 4 (total: 540)
+fuzz: elapsed: 15s, execs: 1641143 (146155/sec), new interesting: 4 (total: 540)
+fuzz: elapsed: 18s, execs: 2066629 (141830/sec), new interesting: 4 (total: 540)
+fuzz: elapsed: 21s, execs: 2464808 (132710/sec), new interesting: 4 (total: 540)
+fuzz: elapsed: 24s, execs: 2827744 (120981/sec), new interesting: 4 (total: 540)
+fuzz: elapsed: 27s, execs: 3149183 (107150/sec), new interesting: 4 (total: 540)
+fuzz: elapsed: 30s, execs: 3498689 (116512/sec), new interesting: 4 (total: 540)
+fuzz: elapsed: 31s, execs: 3498689 (0/sec), new interesting: 4 (total: 540)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.050s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/tls/ -run=^FuzzTLSContextParse$ -fuzz=^FuzzTLSContextParse$ -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/633 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 633/633 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 163839 (54612/sec), new interesting: 0 (total: 633)
+fuzz: elapsed: 6s, execs: 728639 (188228/sec), new interesting: 1 (total: 634)
+fuzz: elapsed: 9s, execs: 985338 (85570/sec), new interesting: 2 (total: 635)
+fuzz: elapsed: 12s, execs: 1118469 (44378/sec), new interesting: 2 (total: 635)
+fuzz: elapsed: 15s, execs: 1694562 (192004/sec), new interesting: 5 (total: 638)
+fuzz: elapsed: 18s, execs: 2159048 (154847/sec), new interesting: 6 (total: 639)
+fuzz: elapsed: 21s, execs: 3664897 (501969/sec), new interesting: 13 (total: 646)
+fuzz: elapsed: 24s, execs: 3853989 (63038/sec), new interesting: 13 (total: 646)
+fuzz: elapsed: 27s, execs: 4870672 (338516/sec), new interesting: 15 (total: 648)
+fuzz: elapsed: 30s, execs: 6767759 (632802/sec), new interesting: 20 (total: 653)
+fuzz: elapsed: 31s, execs: 6767759 (0/sec), new interesting: 20 (total: 653)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.052s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/ -run=^FuzzHCMConfigParse$ -fuzz=^FuzzHCMConfigParse$ -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/498 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 320/498 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 498/498 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 198084 (65923/sec), new interesting: 0 (total: 498)
+fuzz: elapsed: 9s, execs: 633533 (145144/sec), new interesting: 0 (total: 498)
+fuzz: elapsed: 12s, execs: 1055038 (140471/sec), new interesting: 0 (total: 498)
+fuzz: elapsed: 15s, execs: 1534466 (159849/sec), new interesting: 2 (total: 500)
+fuzz: elapsed: 18s, execs: 1968392 (144653/sec), new interesting: 3 (total: 501)
+fuzz: elapsed: 21s, execs: 2422555 (151387/sec), new interesting: 4 (total: 502)
+fuzz: elapsed: 24s, execs: 2846032 (141142/sec), new interesting: 6 (total: 504)
+fuzz: elapsed: 27s, execs: 3298509 (150814/sec), new interesting: 8 (total: 506)
+fuzz: elapsed: 30s, execs: 3691736 (131094/sec), new interesting: 8 (total: 506)
+fuzz: elapsed: 31s, execs: 3691736 (0/sec), new interesting: 8 (total: 506)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.043s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/h2/ -run=^FuzzFrameStream$ -fuzz=^FuzzFrameStream$ -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/343 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 343/343 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 1275399 (425039/sec), new interesting: 1 (total: 344)
+fuzz: elapsed: 6s, execs: 2499036 (407891/sec), new interesting: 2 (total: 345)
+fuzz: elapsed: 9s, execs: 3611475 (370876/sec), new interesting: 2 (total: 345)
+fuzz: elapsed: 12s, execs: 4583186 (323822/sec), new interesting: 2 (total: 345)
+fuzz: elapsed: 15s, execs: 5826540 (414528/sec), new interesting: 3 (total: 346)
+fuzz: elapsed: 18s, execs: 7767179 (646843/sec), new interesting: 3 (total: 346)
+fuzz: elapsed: 21s, execs: 9393735 (542092/sec), new interesting: 5 (total: 348)
+fuzz: elapsed: 24s, execs: 11372976 (659795/sec), new interesting: 5 (total: 348)
+fuzz: elapsed: 27s, execs: 13142046 (589810/sec), new interesting: 5 (total: 348)
+fuzz: elapsed: 30s, execs: 14653844 (503911/sec), new interesting: 5 (total: 348)
+fuzz: elapsed: 31s, execs: 14653844 (0/sec), new interesting: 5 (total: 348)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.042s
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/h2/ -run=^FuzzHPACKDecode$ -fuzz=^FuzzHPACKDecode$ -fuzztime=30s
+fuzz: elapsed: 0s, gathering baseline coverage: 0/145 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 145/145 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 989149 (329678/sec), new interesting: 0 (total: 145)
+fuzz: elapsed: 6s, execs: 1548247 (186366/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 9s, execs: 1884278 (112014/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 12s, execs: 2082511 (66074/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 15s, execs: 2139010 (18835/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 18s, execs: 2165365 (8781/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 21s, execs: 2165365 (0/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 24s, execs: 2165365 (0/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 27s, execs: 2165365 (0/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 30s, execs: 2165365 (0/sec), new interesting: 1 (total: 146)
+fuzz: elapsed: 31s, execs: 2165365 (0/sec), new interesting: 1 (total: 146)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.078s
+$ git status --porcelain
+<no output>
+```
+
+### Gate (e) — sanity sweep + boundary verification
+
+`go build`, `go vet`, `golangci-lint run ./...` all clean (zero output / zero issues — captured in the environment fingerprint above and re-verified explicitly):
+
+```
+$ go build ./...
+<no output>
+$ go vet ./...
+<no output>
+$ golangci-lint run ./...
+<no output; exit 0>
+```
+
+ADR-0046 boundary grep clean (3 prod hits in the 3 allowed files per the ADR-0054 correction — `framer.go`, `settings.go`, `conn.go`):
+
+```
+$ ls internal/filter/hcm/h2/client.go 2>&1
+ls: cannot access 'internal/filter/hcm/h2/client.go': No such file or directory
+$ grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go'
+internal/filter/hcm/h2/settings.go:4:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/framer.go:10:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/conn.go:10:	"golang.org/x/net/http2"
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -3
+## ADR-0052: BEHAVIOR_CONTRACT `## HTTP/2` subsection (SCAFFOLD form for 05.1)
+## ADR-0053: Phase-04 REVIEW Minor carry-forward triage
+## ADR-0054: ADR-0046 prose correction — root-http2 import file list
+```
+
+ADR-0048 `client.go` absence verified above; ADR list ends with the new ADR-0054 added in FU-4.
+
+### Gate (f) — REVIEW.md
+
+Closed by `REVIEW.md` `d69446a` (the original APPROVED-WITH-FOLLOW-UPS review) PLUS this verification block (the executor's PROGRESS verification block per BOOTSTRAP §5.2 — the alternative to a formal REVIEW.md addendum, per REVIEW.md §Recommendation Path A wording).
+
+### Closing summary
+
+**All five non-deferred gates GREEN.** golangci-lint count: 0; h2spec count: 53/53; differential fixture count: 4/4 (0000-tcp-echo, 0001-tcp-proxy-rr, 0002-tls-tcp, 0003-http11-routing). The follow-up batch closes 9 of the REVIEW's 21 findings (I-4 + M-1/M-2/M-6/M-13/M-14/M-15/M-16/M-17); the remaining 12 (I-1/I-2/I-3 + M-3/M-4/M-5/M-7/M-8/M-9/M-10/M-11/M-12) carry forward to phase 05.2 per REVIEW.md Recommendation Path A. STATE.md advances `lifecycle-state: 3 → 4` per BOOTSTRAP §5.2 state-4 (verification complete at the new HEAD `<HEAD-SHA-after-this-commit>`); the next session re-runs only any gate it deems necessary or invokes superpowers:verification-before-completion to formally promote 4 → 5 → 6.
