@@ -1839,3 +1839,40 @@ Per-Minor disposition (each entry references the REVIEW.md finding by its identi
 - This ADR does not create any new code obligations in 05.1 — all five dispositions are textual/deferred.
 
 This ADR supersedes nothing.
+
+## ADR-0054: ADR-0046 prose correction — root-http2 import file list
+
+**Status:** Accepted
+**Date:** 2026-04-26
+**Doctrine:** D-3.5
+**Settles:** REVIEW.md (phase 05.1) finding M-15.
+**Supersedes:** ADR-0046 (textual drift on the 3-import file list only — the substantive decision in ADR-0046 stands; only the file-list claim in the Consequences section is corrected).
+
+### Context
+
+ADR-0046 (line 1545) names `framer.go`/`hpack.go`/`settings.go` as "the three files that legitimately import the package" `golang.org/x/net/http2`. This is incorrect: `hpack.go` imports `golang.org/x/net/http2/hpack` (the sub-package), not the root `http2` package. The actual production-code importers of root `http2` are `framer.go`, `settings.go`, `conn.go`.
+
+The phase-05.1 REVIEW (REVIEW.md M-15) flagged this as documentation drift. The grep gate that ADR-0046 invokes runs against the actual code, not the ADR prose, so the doctrine D-3.2 boundary holds in practice; only the prose is wrong.
+
+Per D-3.5, landed ADRs are append-only. The correction lands as this superseding ADR rather than an in-place edit of ADR-0046.
+
+### Decision
+
+The correct list of production files importing `golang.org/x/net/http2` (root package, not sub-packages) at HEAD of the phase 05.1 follow-up batch is:
+
+- `internal/filter/hcm/h2/framer.go`
+- `internal/filter/hcm/h2/settings.go`
+- `internal/filter/hcm/h2/conn.go`
+
+`internal/filter/hcm/h2/hpack.go` imports `golang.org/x/net/http2/hpack` only; it does NOT import the root `http2` package. (Compare: `stream.go` also imports `http2/hpack` for `hpack.HeaderField`; the boundary applies to root-`http2` imports.)
+
+The grep-verifiability formulation of ADR-0046 stands (the gate runs against actual code). Only the prose enumeration in ADR-0046's Consequences bullet (line 1545) is amended by this ADR.
+
+### Consequences
+
+- The grep boundary check is unchanged. Future executors running the gate verify against the actual code, not against this prose enumeration.
+- ADR-0046 remains the canonical decision on the codec source. This ADR does not change the codec source decision; it corrects only the file-list enumeration.
+- Future readers of ADR-0046 see the superseded marker and follow it here for the corrected file list.
+- This ADR supersedes ADR-0046 in scope **only** for the file-list claim. The substantive D-3.2 codec-vs-runtime boundary, the FORBIDDEN runtime-types list, and the driver-side test exception in ADR-0046 all stand unchanged.
+
+This ADR is itself append-only. Future drift in the file list (e.g., if a new file imports root `http2`) is corrected by a further superseding ADR.
