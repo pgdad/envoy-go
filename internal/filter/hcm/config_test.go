@@ -1,6 +1,7 @@
 package hcm
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,8 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -386,5 +389,128 @@ func TestParseFilter_RouterActionHappy(t *testing.T) {
 	})
 	if _, err := parseFilter(any, cm); err != nil {
 		t.Errorf("router-action happy: %v", err)
+	}
+}
+
+// mkH2ClusterManager builds a 2-cluster manager: c_h1 (no HttpProtocolOptions,
+// UseH2()==false) and c_h2 (HttpProtocolOptions.explicit_http_config.
+// http2_protocol_options{} + transport_socket+tls+alpn=["h2"], UseH2()==true).
+// Used by TestBuildRouterAction_PicksH2VariantByClusterUseH2 below.
+func mkH2ClusterManager(t *testing.T) *cluster.Manager {
+	t.Helper()
+	caPEM, err := os.ReadFile("../../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+	mkH2TS := func() *corev3.TransportSocket {
+		ctx := &tlsv3.UpstreamTlsContext{
+			Sni: "alpha.envoy-go.test",
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				AlpnProtocols: []string{"h2"},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+					ValidationContext: &tlsv3.CertificateValidationContext{
+						TrustedCa: &corev3.DataSource{
+							Specifier: &corev3.DataSource_InlineBytes{InlineBytes: caPEM},
+						},
+					},
+				},
+			},
+		}
+		anyMsg, err := anypb.New(ctx)
+		if err != nil {
+			t.Fatalf("anypb.New(UpstreamTlsContext): %v", err)
+		}
+		return &corev3.TransportSocket{
+			Name:       "envoy.transport_sockets.tls",
+			ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+		}
+	}
+	hpoH2 := &upstreamshttpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{},
+			},
+		},
+	}
+	hpoAny, err := anypb.New(hpoH2)
+	if err != nil {
+		t.Fatalf("anypb.New(HttpProtocolOptions): %v", err)
+	}
+
+	mkClusterPb := func(name string, port uint32, isH2 bool) *clusterv3.Cluster {
+		c := &clusterv3.Cluster{
+			Name:                 name,
+			ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+			LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+			ConnectTimeout:       durationpb.New(time.Second),
+			LoadAssignment: &endpointv3.ClusterLoadAssignment{
+				ClusterName: name,
+				Endpoints: []*endpointv3.LocalityLbEndpoints{{
+					LbEndpoints: []*endpointv3.LbEndpoint{{
+						HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+							Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+								SocketAddress: &corev3.SocketAddress{
+									Address:       "127.0.0.1",
+									PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+								},
+							}},
+						}},
+					}},
+				}},
+			},
+		}
+		if isH2 {
+			c.TransportSocket = mkH2TS()
+			c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+				"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": hpoAny,
+			}
+		}
+		return c
+	}
+
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{
+				mkClusterPb("c_h1", 1, false),
+				mkClusterPb("c_h2", 2, true),
+			},
+		},
+	}
+	cm, err := cluster.NewManager(bs)
+	if err != nil {
+		t.Fatalf("cluster.NewManager: %v", err)
+	}
+	return cm
+}
+
+// TestBuildRouterAction_PicksH2VariantByClusterUseH2 verifies the variant-
+// selection contract at filter-build time per SPEC §5.5 + §4.1: a route
+// whose cluster has UseH2()==true gets a *routerActionH2; UseH2()==false
+// gets the existing *routerAction.
+func TestBuildRouterAction_PicksH2VariantByClusterUseH2(t *testing.T) {
+	cm := mkH2ClusterManager(t)
+
+	// H1 cluster → *routerAction
+	{
+		ra := &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h1"}}
+		got, err := buildRouterAction(ra, cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction(c_h1): %v", err)
+		}
+		if _, ok := got.(*routerAction); !ok {
+			t.Errorf("c_h1 → %T; want *routerAction", got)
+		}
+	}
+
+	// H2 cluster → *routerActionH2
+	{
+		ra := &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h2"}}
+		got, err := buildRouterAction(ra, cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction(c_h2): %v", err)
+		}
+		if _, ok := got.(*routerActionH2); !ok {
+			t.Errorf("c_h2 → %T; want *routerActionH2", got)
+		}
 	}
 }

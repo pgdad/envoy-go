@@ -223,7 +223,14 @@ func buildAction(a interface{}, clusters *cluster.Manager) (routeAction, error) 
 	}
 }
 
-func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (*routerAction, error) {
+// buildRouterAction returns a routeAction satisfying the codec-neutral shape.
+// Phase 05.2: when the resolved cluster's UseH2() reports true, the action
+// variant is *routerActionH2 (per SPEC §5.5 + §4.1); otherwise the existing
+// *routerAction (H1). Both satisfy the routeAction interface — the H2 variant
+// via a defensive 500 stub (never reached on H1 path in well-formed bootstraps;
+// see actions.go:routerActionH2.do) so the route-table machinery stays
+// codec-neutral.
+func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (routeAction, error) {
 	if r == nil {
 		return nil, fmt.Errorf("route action is nil")
 	}
@@ -237,6 +244,9 @@ func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (*rout
 	c, ok := clusters.Get(cs.Cluster)
 	if !ok {
 		return nil, fmt.Errorf("route action: cluster %q not found", cs.Cluster)
+	}
+	if c.UseH2() {
+		return &routerActionH2{cluster: c}, nil
 	}
 	return &routerAction{cluster: c}, nil
 }

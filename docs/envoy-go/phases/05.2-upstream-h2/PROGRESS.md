@@ -779,3 +779,65 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0056: Per-request fresh upstream H2 dial
 $ # ADR tail unchanged at 0056 (Task 10 lands no new ADR per ADR-0016 + SPEC §5.5)
 ```
+
+## Task 11 — HCM `routerActionH2` + variant selection + `h2.Action` widening + `h2RouterActionAdapter` + ADR-0058
+
+**Commit:** SHA-fill (the SHA is filled in the follow-up commit).
+
+**Files changed:**
+
+- `internal/filter/hcm/h2/stream.go` — Widened the `Action` interface from `WriteH2(StreamWriter) error` to `WriteH2(ctx context.Context, req H2Request, sw StreamWriter) error` per PLAN Task 11 Step 1 + ## Settled SPEC §10 deferred decisions #11. Updated `serverStream.dispatch` to construct an `H2Request` (via the new `buildH2Request` helper) from the inbound HEADERS pseudo-headers + decoded regular headers + buffered request body, and pass it to `action.WriteH2(ctx, h2Req, s)`. The `buildH2Request` helper splits pseudo-headers out into the named fields (Method/Path/Scheme/Authority) and keeps regular headers on `.Headers` in wire order — the upstream encoder re-prepends pseudo-headers per RFC 9113 §8.3. +30 LoC (interface + buildH2Request helper + dispatch call-site update).
+- `internal/filter/hcm/h2/stream_test.go`, `internal/filter/hcm/h2/conn_test.go`, `internal/filter/hcm/h2/fuzz_test.go` — Updated all existing `Action` implementors (`fakeAction`, `errorAction`, `fixedAction`, `blockingAction`, `bodyCaptureAction`, `stubAction`) to the wider signature. The new args are ignored (each fake synthesizes the response from its own state, like `directResponseAction`). +6 LoC across three files.
+- `internal/filter/hcm/actions.go` — Added the shared `bad502Body = "bad gateway\n"` constant per SPEC §11.9. Added the `routerActionH2` struct with two methods: `doH2(ctx, h2.H2Request, h2.StreamWriter) error` (the H2 driver — invoked by `h2RouterActionAdapter.WriteH2`) and `do(ctx, *http.Request, *bufio.Writer) error` (a defensive 500 stub satisfying the routeAction interface so `*routerActionH2` is storable in `routeEntry.action`). Added the `write502` helper emitting `:status 502 + Date + Server + content-type + content-length + bad502Body` per SPEC §10 #4. Added a compile-time interface conformance assertion `var _ routeAction = (*routerActionH2)(nil)`. +98 LoC.
+- `internal/filter/hcm/config.go` — Updated `buildRouterAction` return type from `*routerAction` to the wider `routeAction` interface. Added the variant-selection branch: when `c.UseH2()` reports true, return a `*routerActionH2`; otherwise the existing `*routerAction`. Per SPEC §5.5 + §4.1. +6 LoC.
+- `internal/filter/hcm/h2dispatch.go` — Added the `h2RouterActionAdapter` wrapping `*routerActionH2` (delegates `WriteH2` → `a.a.doH2(ctx, req, sw)`). Updated `h2Dispatcher.Match` to recognize `*routerActionH2` (returning the new adapter) alongside `*directResponseAction` (returning `h2DirectResponseAdapter`); other action types fall through to `h2RouterActionRejection`. Updated `h2DirectResponseAdapter.WriteH2` and `h2RouterActionRejection.WriteH2` to the wider signature (both ignore ctx + req — direct_response synthesizes from its own state; rejection emits INTERNAL_ERROR regardless). +27 LoC.
+- `internal/filter/hcm/actions_test.go` — Added 5 routerActionH2 tests + a `captureH2Writer` fake h2.StreamWriter + an in-process H2 backend (`mkH2BackendPKI`, `runH2Backend`, `startH2Backend`, `h2EndpointCluster`) that listens on a fresh TLS port with NextProtos=["h2"], reads client preface + SETTINGS, and dispatches per a `h2BackendBehavior` selector (OK/503/Malformed/Hang). The malformed-bytes branch writes garbage HPACK so the client surfaces a COMPRESSION_ERROR and the action emits 502; the Hang branch never responds so the test cancels ctx mid-RoundTrip and verifies the action returns `*h2.Error{Code: ErrCancel}`. +400 LoC.
+- `internal/filter/hcm/config_test.go` — Added `TestBuildRouterAction_PicksH2VariantByClusterUseH2` + `mkH2ClusterManager` helper. Builds a 2-cluster manager (c_h1 without HttpProtocolOptions, c_h2 with `explicit_http_config.http2_protocol_options{}` + tls + alpn=["h2"]). Asserts `buildRouterAction` returns `*routerAction` for c_h1 and `*routerActionH2` for c_h2. +118 LoC.
+- `docs/envoy-go/DECISIONS.md` — Appended ADR-0058 (Trailers observed but not forwarded — H2 router) per PLAN line 121. Bundles the M-4 (`readClientPreface` ctx-unaware) and M-10 (`SETTINGS_TIMEOUT` absent) carry-forwards per SPEC §12.2's per-finding-disposition. Cross-references `internal/filter/hcm/h2/client.go:dispatchFrame` (upstream-side observe-discard) and `internal/filter/hcm/h2/stream.go:recvTrailingHeaders` (downstream-side observe-discard). +43 LoC.
+- `docs/envoy-go/phases/05.2-upstream-h2/PROGRESS.md` — this entry.
+
+**Decision: Option B for the H1-side handling of *routerActionH2.** *routerActionH2 satisfies the hcm-package routeAction interface via a defensive 500 stub `do(ctx, *http.Request, *bufio.Writer) error` rather than widening the `routeEntry.action` field type to `interface{}` and adding a runtime type-check in connection.go. Rationale: the stub is a single-method addition (~3 LoC including doc comment); widening the field type would require simultaneous edits to route.go's `routeAction` definition, route.go's `routeEntry` struct, connection.go's `entry.action.do(...)` site, and would surface a runtime-type-check at every H1 dispatch. The stub is unreachable in well-formed bootstraps (variant selection at filter-build time guarantees H2-clusters get *routerActionH2 routed via the H2 dispatch path; the H1 driver never sees them on H2-clusters); if reached defensively (invalid bootstrap shape), the 500 surfaces the misconfiguration without crashing the connection. PLAN line 2121's hint at Option B as the "simpler shape" is honored.
+
+**Method-namespace note:** Go disallows two methods with the same name on the same receiver, so the H2 driver method on *routerActionH2 is named `doH2(ctx, h2.H2Request, h2.StreamWriter) error` (consumed only by `h2RouterActionAdapter.WriteH2`); the routeAction-interface-satisfying method keeps the name `do(ctx, *http.Request, *bufio.Writer) error` (the defensive 500 stub). The rename is a small divergence from the PLAN's snippet at line 2059 (which used `do` for the H2 method); the rename is necessary for interface-satisfaction symmetry under Go's method-set rule.
+
+**TDD discipline:** The 5 routerActionH2 tests were added before the routerActionH2 + h2RouterActionAdapter wiring was complete; each FAILED at compile-time first (no `routerActionH2` symbol, no `doH2` method, no `bad502Body` constant), then PASSED after the wiring landed. The variant-selection test FAILED at compile-time (no variant-selection branch in buildRouterAction returning a non-routerAction type); PASSED after the buildRouterAction widening + variant branch landed.
+
+**Pitfall observed and resolved:** the initial `routerActionH2.doH2` ctx-cancel branch used `errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)` against the RoundTrip error directly. This mis-categorized the upstream-conn-broken case (where readLoop calls `cc.cancel()` after a malformed HEADERS frame and `RoundTrip` returns a wrapped `cc.ctx.Err()` which IS `context.Canceled`) as a caller-side ctx-cancel — the malformed-headers test failed because the action returned RST(CANCEL) instead of writing the 502 local-reply. Fixed by checking the CALLER's ctx specifically (`ctx.Err() != nil && (errors.Is(ctx.Err(), ...))`) instead of the RoundTrip-returned error. The distinction matters: caller-side ctx-cancel is "client gave up — emit RST(CANCEL)"; upstream-conn-broken is "couldn't reach upstream — emit 502 local-reply". The fix is a 2-line change in actions.go's `routerActionH2.doH2`.
+
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/ -count=1 -run "TestRouterActionH2_|TestBuildRouterAction_PicksH2" -v
+=== RUN   TestRouterActionH2_HappyPath
+--- PASS: TestRouterActionH2_HappyPath (0.00s)
+=== RUN   TestRouterActionH2_502OnDialFailure
+--- PASS: TestRouterActionH2_502OnDialFailure (0.00s)
+=== RUN   TestRouterActionH2_502OnRoundTripProtocolError
+--- PASS: TestRouterActionH2_502OnRoundTripProtocolError (0.00s)
+=== RUN   TestRouterActionH2_CtxCancelEmitsRSTStreamCancel
+--- PASS: TestRouterActionH2_CtxCancelEmitsRSTStreamCancel (0.20s)
+=== RUN   TestRouterActionH2_Upstream5xxForwardedVerbatim
+--- PASS: TestRouterActionH2_Upstream5xxForwardedVerbatim (0.00s)
+=== RUN   TestBuildRouterAction_PicksH2VariantByClusterUseH2
+--- PASS: TestBuildRouterAction_PicksH2VariantByClusterUseH2 (0.00s)
+PASS
+
+$ go test -race ./internal/filter/hcm/ ./internal/filter/hcm/h2/ ./internal/cluster/ -count=1
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.239s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.512s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.030s
+
+$ go test ./test/conformance/h2spec/ -v -count=1
+[... 53 tests ...]
+53 tests, 53 passed, 0 skipped, 0 failed
+PASS
+
+$ go vet ./...
+$ # exit 0
+
+$ golangci-lint run ./...
+$ # exit 0
+
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0058: Trailers observed but not forwarded — H2 router
+$ # ADR tail advanced 0056 → 0058 (Task 11 lands ADR-0058; ADR-0057 lands later at Task 14 — non-monotonic per topical-vs-commit-order).
+```

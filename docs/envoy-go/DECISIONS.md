@@ -1963,3 +1963,50 @@ The phase-05.2 differential surface does NOT assert pool/non-pool: Envoy pools, 
 ### Lands-in-task
 
 Phase-05.2 Task 9 (first use of `Cluster.DialH2` in the production codepath — `internal/cluster/dial_h2.go:DialH2`). The ADR lands in the same commit as the dial helper itself; `routerActionH2.do`'s `defer cc.Close()` call site lands at Task 11 and carries no separate ADR (the discipline is governed by ADR-0056).
+
+---
+
+## ADR-0058: Trailers observed but not forwarded — H2 router
+
+**Status:** Accepted
+**Date:** 2026-04-26
+**Doctrine:** D-3.4 (record durable design rationale where context-isolation requires it).
+**Settles:** phase-05.2 SPEC §2.1 (Trailer support — request and response — out-of-scope), SPEC §10 #1 (the trailer rule reaffirmed for the 05.2 client surface), and the 05.1 REVIEW Minor carry-forwards M-4 (`readClientPreface` not ctx-aware — bundled per SPEC §12.2's per-finding-disposition; deferred to phase 06 or 07 with the proper fix at the listener-manager level via uniform OS read deadlines) and M-10 (`SETTINGS_TIMEOUT` absent — bundled per SPEC §12.2's per-finding-disposition; deferred to phase 06 or 08 with the proper fix at the listener-manager's per-conn timeout policies). Closes the ADR-0058 anticipation in phase-05.2 SPEC §4.4 (third ADR landing of the four-ADR contiguous block 0055..0058, per the topical-vs-commit-order ordering — non-monotonic; 0058 lands at Task 11 before 0057 lands at Task 14).
+**Supersedes:** nothing.
+
+### Context
+
+The 05.1 H2 server-side codec correctly observes trailing HEADERS frames per RFC 9113 §8.1 (h2spec section 8 asserts this); see `internal/filter/hcm/h2/stream.go:recvTrailingHeaders` for the downstream-side observe-and-discard. Phase 05.2's H2 client-side codec also observes trailing HEADERS on the upstream conn; see `internal/filter/hcm/h2/client.go:dispatchFrame`'s HEADERS case where the second HEADERS block is observed via `cs.respHeadersSeen` and dropped on the floor (the comment explicitly references this ADR: "trailing HEADERS — observed-and-discarded per ADR-0058").
+
+The `routerActionH2` action (this task — `internal/filter/hcm/actions.go`) discards trailers in BOTH directions:
+- Downstream-from-client trailing HEADERS are observed by `ServerConn` and discarded by `serverStream`'s dispatch (the dispatcher hands a fully-buffered request body to the action; trailing HEADERS that arrive after END_STREAM on DATA never surface).
+- Upstream-from-server trailing HEADERS are observed by `ClientConn`'s readLoop and discarded by `RoundTrip` (the assembled `H2Response` carries only the FIRST HEADERS block; subsequent HEADERS arriving before END_STREAM on DATA are dropped).
+
+The router emits END_STREAM on the response HEADERS or final DATA, never via a trailing HEADERS frame on the downstream stream. The fixture-0004 driver does not exercise trailers (bodyless GETs only); the differential gate is unaffected by the asymmetry between envoy-go (discards) and Envoy reference (forwards trailers when configured).
+
+This ADR also bundles two 05.1 REVIEW Minor carry-forwards per SPEC §12.2's per-finding-disposition, because both items are phase-bookkeeping concerns rather than discrete design choices and folding them into a separate carry-forward ADR would create cross-references harder to read than the bundle:
+
+- **M-4 (`readClientPreface` not ctx-aware).** The 05.1 codec's `internal/filter/hcm/h2/preface.go:readClientPreface` does not honor the conn-lifetime ctx; a peer that opens a TCP connection without sending the preface bytes can hold the codec in a blocking read. The proper fix is at the listener-manager level via uniform OS read deadlines applied to every accepted conn (mirroring the H1 driver's `SetReadDeadline` discipline), which is a phase 06/07 concern (the listener-manager rewrite or the filter-chain framework). Phase 05.2 does NOT touch `preface.go`. The carry-forward is tagged "phase-06-or-07-must-consider".
+
+- **M-10 (`SETTINGS_TIMEOUT` absent).** RFC 9113 §6.5.3 recommends a SETTINGS_TIMEOUT-class bound on how long a peer may take to ACK our SETTINGS. The 05.1 codec does not implement this timeout (h2spec sends SETTINGS_ACK promptly so the absence does not surface in the conformance gate); the proper fix lands with the listener-manager's per-conn timeout policies in phase 06 or 08 (whichever introduces the broader timeout-policy framework). Phase 05.2 does NOT introduce a SETTINGS_TIMEOUT timer. The carry-forward is tagged "phase-06-or-08-must-consider".
+
+### Decision
+
+Trailers are observed-and-discarded in both directions at phase 05.2; the codec correctness (h2spec section 8 PASS at 53/53 — the trailer-ordering tests pass because observation-without-forwarding is correct framing) is unaffected. The router action `routerActionH2.doH2` emits the response in HEADERS + DATA(END_STREAM) shape only; no trailing HEADERS frame is generated downstream.
+
+Cross-references to the implementation:
+- `internal/filter/hcm/h2/client.go` — `dispatchFrame`'s HEADERS case (`if !cs.respHeadersSeen { ... } else: trailing HEADERS — observed-and-discarded per ADR-0058`). The upstream-side observe-discard.
+- `internal/filter/hcm/h2/stream.go:recvTrailingHeaders` — the downstream-side observe-discard, unchanged from 05.1. Validates that trailing HEADERS does NOT contain pseudo-headers (RFC 9113 §8.1.2.1) and advances state to half-closed-remote, but does not surface the trailers to the dispatcher.
+- `internal/filter/hcm/actions.go:routerActionH2.doH2` — emits the response in HEADERS + DATA(END_STREAM) shape; the upstream-side discard happens BELOW this layer (in RoundTrip's H2Response assembly), so the action sees an `H2Response` that already excludes trailers.
+
+### Consequences
+
+- The differential surface is asymmetric in principle (envoy-go discards trailers; Envoy reference forwards them when configured) but bounded in 05.2 because fixture 0004 doesn't exercise trailers. The divergence is unobservable on the differential gate. Phase 07's filter-chain framework + the gRPC family land trailer forwarding (where `grpc-status` is carried in trailers and forwarding is the load-bearing benefit).
+- `BEHAVIOR_CONTRACT.md ## HTTP/2`'s "Not asserted" subsection enumerates trailers per ADR-0058 (in-place edit at Task 15).
+- M-4 carry-forward: `readClientPreface`'s ctx-unaware shape stays in 05.2; the proper fix at the listener-manager level via uniform OS read deadlines is a phase 06/07 concern, tagged "phase-06-or-07-must-consider".
+- M-10 carry-forward: `SETTINGS_TIMEOUT` stays absent in 05.2; h2spec sends SETTINGS_ACK promptly per the 05.1 REVIEW; the proper fix lands with the listener-manager's per-conn timeout policies in phase 06 or 08, tagged "phase-06-or-08-must-consider".
+- The router's emission shape (HEADERS + DATA(END_STREAM); never trailing HEADERS) is the simplest correct discipline under SPEC §2.1's "trailers out-of-scope" charter; future trailer-forwarding work will widen `H2Response` with a `Trailers []hpack.HeaderField` field and the router will emit a trailing HEADERS frame conditionally when the upstream provided one. The widening is forward-compatible — no field renames; only an additive field. Phase 05.2 does not pre-implement this; the bundle remains: trailers observed, discarded, never forwarded.
+
+### Lands-in-task
+
+Phase-05.2 Task 11 (first use of `routerActionH2.doH2`'s observe-discard trailer rule, alongside the variant-selection wiring and the `h2.Action` interface widening). Lands the third of the four-ADR contiguous block (ADR-0055..ADR-0058) in commit-time order: 0055 (Task 5) → 0056 (Task 9) → 0058 (Task 11) → 0057 (Task 14). The non-monotonic order is documented in PLAN's "ADRs introduced by this plan" section and in this ADR's `Settles` field.

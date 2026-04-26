@@ -29,7 +29,7 @@ type fixedAction struct {
 	body   string
 }
 
-func (a *fixedAction) WriteH2(sw StreamWriter) error {
+func (a *fixedAction) WriteH2(_ context.Context, _ H2Request, sw StreamWriter) error {
 	body := []byte(a.body)
 	headers := []hpack.HeaderField{
 		{Name: ":status", Value: strconv.Itoa(a.status)},
@@ -67,7 +67,7 @@ func newBlockingAction(release <-chan struct{}) *blockingAction {
 	}
 }
 
-func (a *blockingAction) WriteH2(sw StreamWriter) error {
+func (a *blockingAction) WriteH2(_ context.Context, _ H2Request, sw StreamWriter) error {
 	<-a.release
 	body := []byte(a.body)
 	headers := []hpack.HeaderField{
@@ -1318,7 +1318,7 @@ type bodyCaptureAction struct {
 	doneCh chan int
 }
 
-func (a *bodyCaptureAction) WriteH2(sw StreamWriter) error {
+func (a *bodyCaptureAction) WriteH2(_ context.Context, _ H2Request, sw StreamWriter) error {
 	// We do not have direct access to the request body here (it's read by the
 	// dispatch goroutine before WriteH2 is called); the dispatcher captures the
 	// body length in its Match function and sends it on doneCh from there.

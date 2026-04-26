@@ -36,8 +36,14 @@ type StreamWriter interface {
 // Action is the interface that any route action satisfies in order to be
 // invoked on an H2 stream. The hcm parent package provides implementations
 // via h2dispatch.go; tests provide fakes.
+//
+// Phase 05.2: the interface is widened from the 05.1 single-arg shape to
+// (ctx, req, sw) so routerActionH2 can consume the upstream-bound request.
+// directResponseAction's adapter ignores ctx + req (synthesizes the reply
+// from the action's own state); routerActionH2's adapter passes both
+// through to its do method which forwards them to the upstream RoundTrip.
 type Action interface {
-	WriteH2(sw StreamWriter) error
+	WriteH2(ctx context.Context, req H2Request, sw StreamWriter) error
 }
 
 // Dispatcher is the interface ServerConn uses to resolve an incoming request
@@ -293,7 +299,13 @@ func (s *serverStream) dispatch(ctx context.Context, dispatcher Dispatcher) {
 		return
 	}
 
-	if writeErr := action.WriteH2(s); writeErr != nil {
+	// Build the codec-internal H2Request from the decoded request headers + body
+	// snapshot. Pseudo-headers are split out; regular headers are kept on
+	// .Headers (preserving wire order). The router (routerActionH2) re-prepends
+	// pseudo-headers on the upstream encode side per RFC 9113 §8.3.
+	h2Req := buildH2Request(s.reqHeaders, bodySnap)
+
+	if writeErr := action.WriteH2(ctx, h2Req, s); writeErr != nil {
 		// Stream-scoped errors → RST_STREAM with the carried code.
 		code := ErrInternalError
 		if hErr, isH2 := writeErr.(*Error); isH2 {
@@ -302,6 +314,39 @@ func (s *serverStream) dispatch(ctx context.Context, dispatcher Dispatcher) {
 		_ = s.conn.writeRSTStream(s.id, code)
 	}
 	s.transition(streamClosed)
+}
+
+// buildH2Request constructs the codec-internal H2Request shape from the
+// decoded inbound HEADERS pseudo-headers + regular headers + the buffered
+// request body. Pseudo-headers are split out into the named fields
+// (Method/Path/Scheme/Authority); regular headers are kept on .Headers
+// in wire order. The router (routerActionH2) re-prepends the pseudo-headers
+// on the upstream encode side per RFC 9113 §8.3.
+//
+// This is invoked from serverStream.dispatch AFTER buildRequest has already
+// validated the pseudo-header set (so duplicate/missing/malformed cases have
+// already returned PROTOCOL_ERROR). The function itself is best-effort: it
+// pulls whatever is present and ignores duplicates (the validation happens
+// up-stack in buildRequest).
+func buildH2Request(headers []hpack.HeaderField, body []byte) H2Request {
+	out := H2Request{Body: body}
+	for _, h := range headers {
+		switch h.Name {
+		case ":method":
+			out.Method = h.Value
+		case ":path":
+			out.Path = h.Value
+		case ":scheme":
+			out.Scheme = h.Value
+		case ":authority":
+			out.Authority = h.Value
+		default:
+			if len(h.Name) > 0 && h.Name[0] != ':' {
+				out.Headers = append(out.Headers, h)
+			}
+		}
+	}
+	return out
 }
 
 // buildRequest constructs an *http.Request from decoded pseudo-headers,

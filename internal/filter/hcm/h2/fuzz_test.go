@@ -158,7 +158,7 @@ func (stubDispatcher) Match(_ *http.Request) (Action, bool) {
 // stubAction writes a minimal HTTP/2 404 response and ends the stream.
 type stubAction struct{}
 
-func (stubAction) WriteH2(sw StreamWriter) error {
+func (stubAction) WriteH2(_ context.Context, _ H2Request, sw StreamWriter) error {
 	headers := []hpack.HeaderField{
 		{Name: ":status", Value: "404"},
 	}

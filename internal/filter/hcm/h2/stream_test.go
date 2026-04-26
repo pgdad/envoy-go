@@ -74,7 +74,7 @@ type fakeAction struct {
 	body       string
 }
 
-func (fa *fakeAction) WriteH2(sw StreamWriter) error {
+func (fa *fakeAction) WriteH2(_ context.Context, _ H2Request, sw StreamWriter) error {
 	respHeaders := []hpack.HeaderField{
 		{Name: ":status", Value: fa.statusCode},
 		{Name: "content-length", Value: "5"},
@@ -428,7 +428,7 @@ type errorAction struct {
 	err error
 }
 
-func (a *errorAction) WriteH2(_ StreamWriter) error {
+func (a *errorAction) WriteH2(_ context.Context, _ H2Request, _ StreamWriter) error {
 	return a.err
 }
 

@@ -14,6 +14,14 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 )
 
+// bad502Body is the local-reply body for upstream-failure 502 emissions per
+// SPEC §11.9. The constant is the single source of truth so the H2 router's
+// 502 prose cannot drift from any future H1 router 502 prose; phase-04's H1
+// 502 currently uses an empty body via writeStatusReply(bw, 502, "") and is
+// NOT touched by 05.2 (no regression). The shared-constant pattern future-
+// proofs the migration.
+const bad502Body = "bad gateway\n"
+
 // errCloseAfterAction is returned by routeAction.do when the action's
 // response carried Connection: close (or the equivalent semantic on the
 // upstream-routed response). The connection loop checks for this sentinel
@@ -137,3 +145,108 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	}
 	return nil
 }
+
+// routerActionH2 is the H2-flavored router action. Selected at filter-build
+// time when the resolved cluster's UseH2() reports true (per SPEC §5.5 +
+// §4.1). The struct mirrors routerAction in shape but consumes a fresh
+// upstream H2 conn via Cluster.DialH2 per ADR-0056.
+//
+// Failure-class mapping per SPEC §11.9:
+//
+//	Cluster.DialH2 error        → 502 local reply (downstream :status 502 + bad502Body)
+//	RoundTrip ctx-cancel        → RST_STREAM(CANCEL) on the downstream
+//	RoundTrip protocol error    → 502 local reply
+//	Upstream HTTP status (5xx)  → forwarded verbatim (NOT translated)
+//
+// Per ADR-0058: trailers are observed but NOT forwarded. The upstream-side
+// observe-discard is implemented in h2.RoundTrip (the second HEADERS block
+// is dropped on the floor); the downstream-side observe-discard is in
+// serverStream.recvTrailingHeaders. The router itself emits END_STREAM on
+// the response HEADERS or final DATA, never via a trailing HEADERS frame.
+//
+// Method namespace note: Go disallows two methods with the same name on the
+// same receiver, so the H2 driver method is named doH2 (consumed by
+// h2RouterActionAdapter.WriteH2 in h2dispatch.go); a separate do(...) method
+// exists with the routeAction-interface signature so *routerActionH2 also
+// satisfies routeAction (defensive — never reached in well-formed bootstraps;
+// see the do method's docstring for the rationale).
+type routerActionH2 struct {
+	cluster *cluster.Cluster
+}
+
+// doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip
+// per ADR-0056 (per-request fresh dial), writing the response back through
+// the H2 stream writer.
+func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.StreamWriter) error {
+	cc, err := r.cluster.DialH2(ctx)
+	if err != nil {
+		return r.write502(w)
+	}
+	defer func() { _ = cc.Close() }() // ADR-0056: per-request fresh conn close (analog of phase-04 H1's defer upstream.Close())
+
+	resp, err := cc.RoundTrip(ctx, req)
+	if err != nil {
+		// Distinguish: caller-side ctx-cancel/deadline → emit RST(CANCEL) on the
+		// downstream stream (the canonical "client gave up" signal); other
+		// errors (including upstream-conn-died wrapping cc.ctx.Err()) → 502
+		// local reply. We MUST check the caller's ctx specifically; a
+		// generic errors.Is(err, context.Canceled) would match cc.ctx.Err()
+		// too, mis-categorizing upstream-conn-broken errors as caller-cancel.
+		if ctx.Err() != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+			// Surface a stream-scoped CANCEL to serverStream.dispatch which
+			// emits RST_STREAM(CANCEL) per the dispatch carry-error contract.
+			return h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
+		}
+		return r.write502(w)
+	}
+
+	// Forward response: the codec preserves wire order, so resp.Headers already
+	// has :status (and any other pseudo-headers) first per RFC 9113 §8.3.
+	if err := w.WriteHeaders(resp.Headers, false); err != nil {
+		return err // surfaced to serverStream.dispatch which emits RST_STREAM(INTERNAL_ERROR)
+	}
+	if err := w.WriteData(resp.Body, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+// write502 emits a 502 Bad Gateway local-reply via the H2 stream writer.
+// The body is the shared bad502Body constant per SPEC §11.9. Date is
+// included per SPEC §10 #4. server is "envoy" per ADR-0014. Best-effort:
+// any error from the writer is swallowed (conn is broken; nothing useful
+// to surface). Always returns nil so dispatch does not RST after the 502.
+func (r *routerActionH2) write502(w h2.StreamWriter) error {
+	body := []byte(bad502Body)
+	hdrs := []hpack.HeaderField{
+		{Name: ":status", Value: "502"},
+		{Name: "date", Value: dateHeader()},
+		{Name: "server", Value: serverHeader()},
+		{Name: "content-type", Value: "text/plain"},
+		{Name: "content-length", Value: strconv.Itoa(len(body))},
+	}
+	if err := w.WriteHeaders(hdrs, false); err != nil {
+		return nil // best-effort
+	}
+	_ = w.WriteData(body, true)
+	return nil
+}
+
+// do (defensive) — *routerActionH2 satisfies the hcm-package routeAction
+// interface so the H1 driver's entry.action.do(...) call site does not
+// type-fault if an H2-cluster route is ever reached on an H1 path. In
+// well-formed bootstraps this is unreachable: variant selection at
+// filter-build time guarantees H2-clusters get *routerActionH2 and the
+// HCM-level codec dispatch picks the H2 driver for those listeners. If
+// somehow reached (invalid bootstrap shape), the stub writes a 500 status
+// line to surface the misconfiguration without crashing the connection.
+// Per the "Two interfaces, two separate decisions" note in PLAN Task 11.
+func (r *routerActionH2) do(_ context.Context, _ *http.Request, bw *bufio.Writer) error {
+	return writeStatusReply(bw, 500, "")
+}
+
+// Compile-time interface conformance assertion. *routerActionH2 must satisfy
+// routeAction so it can be stored in routeEntry.action and reachable via the
+// shared route-table machinery (defensive — never reached on H1 path in
+// well-formed bootstraps).
+var _ routeAction = (*routerActionH2)(nil)
