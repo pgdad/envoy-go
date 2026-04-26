@@ -103,3 +103,110 @@ settings_test.go
 stream.go
 stream_test.go
 ```
+
+## Task 2 — ADR-0055 prerequisites — `window.reserveBlocking` collapse (M-3) + `translateFramerErr` helper extraction (M-5)
+
+**Commits:** <sha> (SHA-fill: see next commit)
+**Files changed:**
+- `internal/filter/hcm/h2/flow.go` — replaced `reserve` + `waitFor` pair with single atomic `reserveBlocking(ctx, max) (int32, error)`; both deleted methods removed.
+- `internal/filter/hcm/h2/flow_test.go` — added `TestWindow_ReserveBlocking_AtomicityUnderConcurrency` (20 consumers × 50 bytes vs window=100 + 10×100 replenisher; asserts `taken <= 1100`); rewrote 4 prior tests to call `reserveBlocking`.
+- `internal/filter/hcm/h2/framer.go` — extracted `translateFramerErr(err) error` helper; `readFrameCtx` and `tryReadFrame` now both call it (was identical inline blocks before).
+- `internal/filter/hcm/h2/framer_test.go` — added `TestTranslateFramerErr` covering nil / `http2.ConnectionError` / `http2.StreamError` / `http2.ErrFrameTooLarge` branches.
+- `internal/filter/hcm/h2/conn.go` — `writeData` consumer site updated to call `reserveBlocking`; the dead `if taken <= 0` recovery branch (M-3 finding) is GONE.
+
+**Notes:** TWO red→green TDD cycles, both observed:
+1. `TestWindow_ReserveBlocking_AtomicityUnderConcurrency` failed with `w.reserveBlocking undefined` → implemented `reserveBlocking` per PLAN.md:388-406 → PASS under `-race`.
+2. `TestTranslateFramerErr` failed with `undefined: translateFramerErr` (4 occurrences) → implemented per PLAN.md:480-496 → PASS.
+
+Confirmed pre-extraction by grep that `readFrameCtx` and `tryReadFrame` had IDENTICAL translation blocks (3 branches × 2 sites = 6 cases collapsed to 1 helper). The `reserveBlocking` collapse (M-3) is a prerequisite for I-1/I-2 race-freedom in Task 3; the `translateFramerErr` extraction (M-5) is a prerequisite for the third call site in `client.go` at Task 7.
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/hcm/h2/ -run TestWindow_ReserveBlocking_AtomicityUnderConcurrency -v   # before flow.go change
+# github.com/esalaine/envoy-go/internal/filter/hcm/h2 [github.com/esalaine/envoy-go/internal/filter/hcm/h2.test]
+internal/filter/hcm/h2/flow_test.go:76:18: w.reserveBlocking undefined (type *window has no field or method reserveBlocking)
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm/h2 [build failed]
+FAIL
+
+$ go test -race ./internal/filter/hcm/h2/ -run TestWindow_ -v   # after flow.go + conn.go change
+=== RUN   TestWindow_ReserveAndReplenish
+--- PASS: TestWindow_ReserveAndReplenish (0.00s)
+=== RUN   TestWindow_BlockingWaitFor
+--- PASS: TestWindow_BlockingWaitFor (0.02s)
+=== RUN   TestWindow_CtxCancelDuringWait
+--- PASS: TestWindow_CtxCancelDuringWait (0.02s)
+=== RUN   TestWindow_ReserveBlocking_AtomicityUnderConcurrency
+--- PASS: TestWindow_ReserveBlocking_AtomicityUnderConcurrency (2.00s)
+=== RUN   TestWindow_TinyWindowStressDelivery
+--- PASS: TestWindow_TinyWindowStressDelivery (0.10s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.154s
+
+$ go test ./internal/filter/hcm/h2/ -run TestTranslateFramerErr -v   # before framer.go change
+# github.com/esalaine/envoy-go/internal/filter/hcm/h2 [github.com/esalaine/envoy-go/internal/filter/hcm/h2.test]
+internal/filter/hcm/h2/framer_test.go:271:12: undefined: translateFramerErr
+internal/filter/hcm/h2/framer_test.go:277:10: undefined: translateFramerErr
+internal/filter/hcm/h2/framer_test.go:292:10: undefined: translateFramerErr
+internal/filter/hcm/h2/framer_test.go:306:10: undefined: translateFramerErr
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm/h2 [build failed]
+FAIL
+
+$ go test ./internal/filter/hcm/h2/ -run TestTranslateFramerErr -v   # after framer.go change
+=== RUN   TestTranslateFramerErr
+--- PASS: TestTranslateFramerErr (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.002s
+
+$ go test -race ./internal/filter/hcm/h2/ -v   # last 30 lines
+=== RUN   TestServerStream_StateTransitions_HeadersThenData
+--- PASS: TestServerStream_StateTransitions_HeadersThenData (0.00s)
+=== RUN   TestServerStream_StateTransitions_RSTStream
+--- PASS: TestServerStream_StateTransitions_RSTStream (0.00s)
+=== RUN   TestServerStream_RecvWindowUpdate_ReplenishesSendWindow
+--- PASS: TestServerStream_RecvWindowUpdate_ReplenishesSendWindow (0.00s)
+=== RUN   TestServerStream_RecvWindowUpdate_ZeroDeltaIsProtocolError
+--- PASS: TestServerStream_RecvWindowUpdate_ZeroDeltaIsProtocolError (0.00s)
+=== RUN   TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData
+--- PASS: TestServerStream_Dispatch_DirectResponse_WritesHeadersAndData (0.00s)
+=== RUN   TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError
+--- PASS: TestServerStream_Dispatch_RouterAction_EmitsRSTStreamInternalError (0.00s)
+=== RUN   TestServerStream_Dispatch_404Adapter_WritesHeadersAndData
+--- PASS: TestServerStream_Dispatch_404Adapter_WritesHeadersAndData (0.00s)
+=== RUN   FuzzFrameStream
+=== RUN   FuzzFrameStream/seed#0
+=== RUN   FuzzFrameStream/seed#1
+=== RUN   FuzzFrameStream/seed#2
+--- PASS: FuzzFrameStream (0.00s)
+    --- PASS: FuzzFrameStream/seed#0 (0.00s)
+    --- PASS: FuzzFrameStream/seed#1 (0.00s)
+    --- PASS: FuzzFrameStream/seed#2 (0.00s)
+=== RUN   FuzzHPACKDecode
+=== RUN   FuzzHPACKDecode/seed#0
+=== RUN   FuzzHPACKDecode/seed#1
+--- PASS: FuzzHPACKDecode (0.00s)
+    --- PASS: FuzzHPACKDecode/seed#0 (0.00s)
+    --- PASS: FuzzHPACKDecode/seed#1 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.270s
+
+$ golangci-lint run ./internal/filter/hcm/h2/
+$ echo $?
+0
+
+$ go test -race ./...   # broader sanity check, all packages green
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	(...)
+ok  	github.com/esalaine/envoy-go/internal/admin	1.057s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.033s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.026s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.031s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.272s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.024s
+ok  	github.com/esalaine/envoy-go/internal/listener	1.029s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.076s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.141s
+ok  	github.com/esalaine/envoy-go/test/differential	7.607s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.020s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.008s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.025s
+```

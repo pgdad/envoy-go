@@ -3,6 +3,7 @@ package h2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"time"
@@ -30,6 +31,38 @@ func newFramer(conn net.Conn, maxReadFrameSize uint32) *framer {
 		Framer: fr,
 		conn:   conn,
 	}
+}
+
+// translateFramerErr maps errors emitted by *http2.Framer to our h2:-prefixed
+// *Error type so callers and fuzz assertions can rely on the h2: prefix
+// discipline. Returns nil for nil input. Unrecognized errors pass through
+// unchanged.
+//
+// Recognized classes:
+//   - http2.ConnectionError → connection-scoped *Error
+//   - http2.StreamError     → stream-scoped *Error (preserving StreamID)
+//   - http2.ErrFrameTooLarge (RFC 9113 §4.2 connection error of type
+//     FRAME_SIZE_ERROR; not wrapped as http2.ConnectionError by the
+//     underlying framer)
+//
+// Consumed by both readFrameCtx and tryReadFrame, and (post phase 05.2) by
+// the client-side codec read loop in client.go.
+func translateFramerErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var connErr http2.ConnectionError
+	if errors.As(err, &connErr) {
+		return connError(ErrCode(connErr), fmt.Sprintf("framer: connection-error code=%d", connErr))
+	}
+	var streamErr http2.StreamError
+	if errors.As(err, &streamErr) {
+		return streamError(ErrCode(streamErr.Code), streamErr.StreamID, fmt.Sprintf("framer: stream-error code=%d", streamErr.Code))
+	}
+	if errors.Is(err, http2.ErrFrameTooLarge) {
+		return connError(ErrFrameSizeError, "framer: frame too large")
+	}
+	return err
 }
 
 // readFrameCtx reads one frame, honoring ctx cancellation by setting a
@@ -69,38 +102,7 @@ func (f *framer) readFrameCtx(ctx context.Context) (http2.Frame, error) {
 			continue
 		}
 		_ = f.conn.SetReadDeadline(time.Time{})
-		// Translate http2.ConnectionError and http2.StreamError (emitted by the
-		// underlying framer on frame-level protocol violations) into our
-		// h2:-prefixed *Error type so callers and fuzz assertions can rely on
-		// the h2: prefix discipline.
-		var connErr http2.ConnectionError
-		if errors.As(err, &connErr) {
-			return nil, &Error{
-				Code:       ErrCode(connErr),
-				Msg:        "framer detected connection error",
-				Underlying: err,
-			}
-		}
-		var streamErr http2.StreamError
-		if errors.As(err, &streamErr) {
-			return nil, &Error{
-				Code:       ErrCode(streamErr.Code),
-				Stream:     streamErr.StreamID,
-				Msg:        "framer detected stream error",
-				Underlying: err,
-			}
-		}
-		// http2.ErrFrameTooLarge is returned by the framer (not wrapped as
-		// http2.ConnectionError) when a frame exceeds SetMaxReadFrameSize.
-		// RFC 9113 §4.2: this is a connection error of type FRAME_SIZE_ERROR.
-		if errors.Is(err, http2.ErrFrameTooLarge) {
-			return nil, &Error{
-				Code:       ErrFrameSizeError,
-				Msg:        "frame exceeds SETTINGS_MAX_FRAME_SIZE",
-				Underlying: err,
-			}
-		}
-		return nil, err
+		return nil, translateFramerErr(err)
 	}
 }
 
@@ -125,30 +127,5 @@ func (f *framer) tryReadFrame() (http2.Frame, error) {
 	if isTimeout {
 		return nil, nil
 	}
-	// Translate framer errors same as readFrameCtx.
-	var connErr http2.ConnectionError
-	if errors.As(err, &connErr) {
-		return nil, &Error{
-			Code:       ErrCode(connErr),
-			Msg:        "framer detected connection error",
-			Underlying: err,
-		}
-	}
-	var streamErr http2.StreamError
-	if errors.As(err, &streamErr) {
-		return nil, &Error{
-			Code:       ErrCode(streamErr.Code),
-			Stream:     streamErr.StreamID,
-			Msg:        "framer detected stream error",
-			Underlying: err,
-		}
-	}
-	if errors.Is(err, http2.ErrFrameTooLarge) {
-		return nil, &Error{
-			Code:       ErrFrameSizeError,
-			Msg:        "frame exceeds SETTINGS_MAX_FRAME_SIZE",
-			Underlying: err,
-		}
-	}
-	return nil, err
+	return nil, translateFramerErr(err)
 }

@@ -2,6 +2,7 @@ package h2
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -262,6 +263,57 @@ func TestFramer_RSTStreamWindowUpdateGoAway(t *testing.T) {
 	}
 	if gf.ErrCode != http2.ErrCodeNo {
 		t.Errorf("GOAWAY ErrCode = %v, want ErrCodeNo", gf.ErrCode)
+	}
+}
+
+func TestTranslateFramerErr(t *testing.T) {
+	// nil → nil
+	if got := translateFramerErr(nil); got != nil {
+		t.Errorf("translateFramerErr(nil) = %v, want nil", got)
+	}
+	// http2.ConnectionError → *Error{Code = mapped, Stream = 0}
+	{
+		err := http2.ConnectionError(http2.ErrCodeProtocol)
+		got := translateFramerErr(err)
+		var e *Error
+		if !errors.As(got, &e) {
+			t.Fatalf("translateFramerErr(ConnectionError) = %T %v, want *Error", got, got)
+		}
+		if e.Code != ErrProtocolError {
+			t.Errorf("Code = %v, want ErrProtocolError", e.Code)
+		}
+		if e.Stream != 0 {
+			t.Errorf("Stream = %d, want 0 (connection-scope)", e.Stream)
+		}
+	}
+	// http2.StreamError → *Error{Code = mapped, Stream = streamID}
+	{
+		err := http2.StreamError{StreamID: 7, Code: http2.ErrCodeFlowControl}
+		got := translateFramerErr(err)
+		var e *Error
+		if !errors.As(got, &e) {
+			t.Fatalf("translateFramerErr(StreamError) = %T %v, want *Error", got, got)
+		}
+		if e.Code != ErrFlowControlError {
+			t.Errorf("Code = %v, want ErrFlowControlError", e.Code)
+		}
+		if e.Stream != 7 {
+			t.Errorf("Stream = %d, want 7", e.Stream)
+		}
+	}
+	// http2.ErrFrameTooLarge → *Error{Code = ErrFrameSizeError, Stream = 0}
+	{
+		got := translateFramerErr(http2.ErrFrameTooLarge)
+		var e *Error
+		if !errors.As(got, &e) {
+			t.Fatalf("translateFramerErr(ErrFrameTooLarge) = %T %v, want *Error", got, got)
+		}
+		if e.Code != ErrFrameSizeError {
+			t.Errorf("Code = %v, want ErrFrameSizeError", e.Code)
+		}
+		if e.Stream != 0 {
+			t.Errorf("Stream = %d, want 0", e.Stream)
+		}
 	}
 }
 

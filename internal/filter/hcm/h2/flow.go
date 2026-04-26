@@ -26,24 +26,7 @@ func (w *window) available() int32 {
 	return w.n
 }
 
-// reserve atomically decrements up to n bytes, returning the actually-taken
-// amount (which may be less than n if the window has fewer bytes available,
-// or 0 if empty). Non-blocking. Callers that need >= n bytes call waitFor first.
-func (w *window) reserve(n int32) (int32, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.n <= 0 {
-		return 0, nil
-	}
-	taken := n
-	if w.n < n {
-		taken = w.n
-	}
-	w.n -= taken
-	return taken, nil
-}
-
-// replenish increments the window and signals any blocking waitFor.
+// replenish increments the window and signals any blocking reserveBlocking.
 func (w *window) replenish(delta int32) {
 	w.mu.Lock()
 	w.n += delta
@@ -54,21 +37,30 @@ func (w *window) replenish(delta int32) {
 	}
 }
 
-// waitFor blocks until the window has at least n bytes available or ctx
-// cancels. Returns nil on success, ctx.Err() on cancel.
-func (w *window) waitFor(ctx context.Context, n int32) error {
-	for {
-		w.mu.Lock()
-		if w.n >= n {
-			w.mu.Unlock()
-			return nil
-		}
+// reserveBlocking atomically waits for window > 0 and decrements up to max
+// bytes, returning the actually-taken amount (>= 1 on success). Blocks on the
+// internal signal channel until replenish notifies, returning ctx.Err() if
+// ctx cancels first.
+//
+// This collapses the previous waitFor + reserve pair so the wait-then-take
+// is a single critical section — no other goroutine can drain the window
+// between the wait and the take. (See M-3 of the phase-05.2 plan.)
+func (w *window) reserveBlocking(ctx context.Context, max int32) (int32, error) {
+	w.mu.Lock()
+	for w.n <= 0 {
 		w.mu.Unlock()
 		select {
 		case <-w.ch:
-			// loop and re-check
+			w.mu.Lock()
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
+	taken := max
+	if taken > w.n {
+		taken = w.n
+	}
+	w.n -= taken
+	w.mu.Unlock()
+	return taken, nil
 }

@@ -599,25 +599,19 @@ func (s *ServerConn) writeData(streamID uint32, b []byte, endStream bool) error 
 	ctx := s.ctx
 	remaining := b
 	for len(remaining) > 0 {
-		// Wait for connection-level send window.
-		if err := s.sendW.waitFor(ctx, 1); err != nil {
+		// Atomically wait-and-take from the connection-level send window.
+		taken, err := s.sendW.reserveBlocking(ctx, int32(len(remaining)))
+		if err != nil {
 			return err
-		}
-		taken, _ := s.sendW.reserve(int32(len(remaining)))
-		if taken <= 0 {
-			taken = 1
-			if _, err := s.sendW.reserve(1); err != nil {
-				_ = err
-			}
 		}
 		chunk := remaining[:taken]
 		remaining = remaining[taken:]
 		isLast := len(remaining) == 0 && endStream
 		s.mu.Lock()
-		err := s.fr.WriteData(streamID, isLast, chunk)
+		werr := s.fr.WriteData(streamID, isLast, chunk)
 		s.mu.Unlock()
-		if err != nil {
-			return err
+		if werr != nil {
+			return werr
 		}
 	}
 	if len(b) == 0 && endStream {

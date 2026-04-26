@@ -3,15 +3,17 @@ package h2
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestWindow_ReserveAndReplenish(t *testing.T) {
 	w := newWindow(1000)
-	got, err := w.reserve(100)
+	ctx := context.Background()
+	got, err := w.reserveBlocking(ctx, 100)
 	if err != nil || got != 100 {
-		t.Fatalf("reserve(100) = (%d, %v), want (100, nil)", got, err)
+		t.Fatalf("reserveBlocking(100) = (%d, %v), want (100, nil)", got, err)
 	}
 	if w.available() != 900 {
 		t.Errorf("available = %d, want 900", w.available())
@@ -28,7 +30,7 @@ func TestWindow_BlockingWaitFor(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
-		_ = w.waitFor(ctx, 50)
+		_, _ = w.reserveBlocking(ctx, 50)
 		close(done)
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -36,7 +38,7 @@ func TestWindow_BlockingWaitFor(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("waitFor did not return after replenish")
+		t.Fatal("reserveBlocking did not return after replenish")
 	}
 }
 
@@ -47,12 +49,55 @@ func TestWindow_CtxCancelDuringWait(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		cancel()
 	}()
-	err := w.waitFor(ctx, 50)
+	_, err := w.reserveBlocking(ctx, 50)
 	if err == nil {
-		t.Fatal("waitFor returned nil; want ctx.Err()")
+		t.Fatal("reserveBlocking returned nil; want ctx.Err()")
 	}
 	if ctx.Err() == nil {
 		t.Errorf("ctx.Err() = nil; want non-nil")
+	}
+}
+
+func TestWindow_ReserveBlocking_AtomicityUnderConcurrency(t *testing.T) {
+	// 20 goroutines each call reserveBlocking(ctx, 50) against a window
+	// primed at 100, with a replenisher goroutine adding 100 ten times.
+	// Verifies no over-reservation: total taken must be <= 100 (initial)
+	// + 10*100 (replenishments) = 1100.
+	w := newWindow(100)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var taken atomic.Int64
+	var wg sync.WaitGroup
+	const consumers = 20
+	for i := 0; i < consumers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := w.reserveBlocking(ctx, 50)
+			if err != nil {
+				return
+			}
+			taken.Add(int64(got))
+		}()
+	}
+
+	// Replenisher adds 100 ten times via a ticker.
+	replenishDone := make(chan struct{})
+	go func() {
+		defer close(replenishDone)
+		tk := time.NewTicker(5 * time.Millisecond)
+		defer tk.Stop()
+		for i := 0; i < 10; i++ {
+			<-tk.C
+			w.replenish(100)
+		}
+	}()
+
+	wg.Wait()
+	<-replenishDone
+	if taken.Load() > 1100 {
+		t.Fatalf("over-reservation: taken=%d, want <= 1100", taken.Load())
 	}
 }
 
@@ -67,12 +112,11 @@ func TestWindow_TinyWindowStressDelivery(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		for i := 0; i < 100; i++ {
-			if err := w.waitFor(ctx, 1); err != nil {
-				t.Errorf("waitFor at i=%d: %v", i, err)
+			if _, err := w.reserveBlocking(ctx, 1); err != nil {
+				t.Errorf("reserveBlocking at i=%d: %v", i, err)
 				close(done)
 				return
 			}
-			_, _ = w.reserve(1)
 			mu.Lock()
 			delivered++
 			mu.Unlock()
