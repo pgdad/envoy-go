@@ -370,35 +370,3 @@ func TestServerStream_Dispatch_404Adapter_WritesHeadersAndData(t *testing.T) {
 		t.Errorf("404 body = %q, does not contain 'not found'", fc.data[0].b)
 	}
 }
-
-// TestServerStream_RejectsEvenClientStreamID:
-// validateClientStreamID(2, empty) → *Error{Code: ErrProtocolError}.
-func TestServerStream_RejectsEvenClientStreamID(t *testing.T) {
-	err := validateClientStreamID(2, map[uint32]struct{}{})
-	if err == nil {
-		t.Fatal("expected error for even stream id, got nil")
-	}
-	h2err, ok := err.(*Error)
-	if !ok {
-		t.Fatalf("error is %T, want *Error", err)
-	}
-	if h2err.Code != ErrProtocolError {
-		t.Errorf("error code = %v, want PROTOCOL_ERROR", h2err.Code)
-	}
-}
-
-// TestServerStream_RejectsStreamIDReuse:
-// validateClientStreamID(3, {3:{}}) → *Error{Code: ErrProtocolError}.
-func TestServerStream_RejectsStreamIDReuse(t *testing.T) {
-	err := validateClientStreamID(3, map[uint32]struct{}{3: {}})
-	if err == nil {
-		t.Fatal("expected error for stream id reuse, got nil")
-	}
-	h2err, ok := err.(*Error)
-	if !ok {
-		t.Fatalf("error is %T, want *Error", err)
-	}
-	if h2err.Code != ErrProtocolError {
-		t.Errorf("error code = %v, want PROTOCOL_ERROR", h2err.Code)
-	}
-}

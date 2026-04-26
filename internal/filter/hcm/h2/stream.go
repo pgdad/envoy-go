@@ -389,22 +389,3 @@ func buildRequest(headers []hpack.HeaderField, body io.Reader) (*http.Request, e
 	}
 	return req, nil
 }
-
-// validateClientStreamID validates a client-initiated stream ID against the
-// H2 rules:
-//   - Even-numbered IDs are reserved for server-initiated streams; a client
-//     sending an even ID is a PROTOCOL_ERROR (RFC 9113 §5.1.1).
-//   - Reusing an existing stream ID is a PROTOCOL_ERROR.
-//
-// existing is the set of stream IDs already known to the ServerConn.
-// Deprecated: inline validation in conn.go onHeaders is preferred. Kept for
-// backward-compat with existing unit tests.
-func validateClientStreamID(id uint32, existing map[uint32]struct{}) error {
-	if id%2 == 0 {
-		return connError(ErrProtocolError, fmt.Sprintf("even client stream id %d", id))
-	}
-	if _, seen := existing[id]; seen {
-		return connError(ErrProtocolError, fmt.Sprintf("stream id %d reuse", id))
-	}
-	return nil
-}
