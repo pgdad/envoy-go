@@ -1345,3 +1345,200 @@ EXIT=1
 - 2 unused — confirm `hpackBlockSID uint32` (paired with `hpackBlocked bool`; bool is used, the SID field never read) and `func ctxErr` (defensive helper, never called) are truly dead before deletion. Cross-check against PLAN.md for any 05.2-forward-look hint and against SPEC §5.3 / §5.8 cluster-side H2 deferrals; if either symbol is intended for 05.2 wiring, add a `_ = symbol` use site or carry an explicit deferral note + `//nolint:unused` with ADR justification (ADR-0048-style boundary doc). Default disposition: deletion (h2dispatch / stream / conn paths handle CONTINUATION-frame mid-block tracking via the `hpackBlocked bool` alone, suggesting `hpackBlockSID` was speculative; `ctxErr` has no callers in the package).
 
 Doctrine pointers: per STATE.md ("rather than papering over with allow-lists"), do NOT introduce `//nolint` lines as a substitute for fixing the underlying issue. The two unused-symbol findings are the only judgement calls; the other 36 are mechanical.
+
+## Task 17 — Gate-(e) lint cleanup (state-3 follow-up; lifecycle 3 → 4)
+
+State-3 follow-up to the verification block above. Worktree: `.worktrees/phase-05.1-downstream-h2-impl-followup`, branched from `df85f85` (the verify branch's STATE.md commit, FF'd to master per ADR-0003). The verify worktree at `.worktrees/phase-05.1-downstream-h2-verify` is closed-history at this state transition. Two cleanup commits land all 38 `golangci-lint run ./...` findings → 0; all six SPEC §3 phase-done gates are re-verified green from a fresh terminal in this worktree. Executor date: 2026-04-26.
+
+The cleanup follows the fix-up plan in the verification block above to the letter — no `//nolint` paper, no scope creep, no extras. The mechanical sweep (`9e23e77`) closes 36 of 38; the unused-symbol triage (`65d2574`) closes the remaining 2 via deletion after code-reading confirms both are truly dead and not 05.2 forward-look.
+
+### Mechanical sweep — `9e23e77` (36 of 38)
+
+Single subagent dispatched per `superpowers:subagent-driven-development`; controller-side spec-compliance and code-quality reviews both passed. The commit closes:
+
+- **4 gofmt** — `gofmt -w` on `internal/filter/hcm/h2/conn.go`, `internal/filter/hcm/h2/fuzz_test.go`, `test/conformance/h2spec/h2spec.go`, `test/conformance/h2spec/h2spec_test.go`. Hand-aligned struct fields and byte-literal comments collapse to tab-only as gofmt prefers.
+- **12 misspell** (British → American) — production-source rewrites in `internal/filter/hcm/h2dispatch.go:39` (synthesise→synthesize), `internal/filter/hcm/h2/conn.go:528` (behaviour→behavior), `:553` (signalled→signaled), `:593` (Serialise→Serialize), `:612` (honour→honor), `internal/filter/hcm/h2/framer.go:35` (honouring→honoring), `internal/filter/hcm/h2/stream.go:46`/`:234` (synthesising→synthesizing); test-source rewrites in `internal/filter/hcm/h2/conn_test.go:618` (honoured→honored), `:857` (cancelling→canceling), `internal/filter/hcm/h2/stream_test.go:337`/`:347` (synthesising→synthesizing).
+- **17 errcheck (test files)** — wrap each `defer cN.Close()` with `defer func() { _ = cN.Close() }()`; applies to `framer_test.go` (12 sites: `:14`,`:15`,`:46`,`:47`,`:92`,`:93`,`:134`,`:135`,`:190`,`:191`,`:270`,`:271`), `settings_test.go` (4 sites: `:31`,`:32`,`:56`,`:57`), `fuzz_test.go` (1 site: `:62`).
+- **1 errcheck (production)** — `internal/filter/hcm/filter.go:36` `defer downstream.Close()` → `defer func() { _ = downstream.Close() }()`. Matches the existing connection-tear-down idiom at `internal/filter/hcm/connection.go:27`; the close error on tear-down is intentionally dropped.
+- **1 revive `exported`** — added a doc comment immediately above the `ErrNoError`-anchored const block in `internal/filter/hcm/h2/errors.go` whose first word is `ErrNoError` (matches Go's `revive` `exported` rule for typed-constant blocks): `// ErrNoError and the other ErrCode constants are the HTTP/2 error codes / defined in RFC 9113 §7.`
+- **1 revive `package-comments`** — `internal/filter/hcm/h2dispatch.go` had a leading file-header comment block immediately adjacent to `package hcm` which `revive` treated as the package doc-comment but which did not begin with `// Package hcm `. Inserted a blank line between the header block and the `package hcm` declaration to detach it from the package-comment slot. The canonical `// Package hcm ...` doc-comment for the package lives in `internal/filter/hcm/doc.go`.
+
+`git diff --stat df85f85..9e23e77`: 13 files changed, +68 / −65. golangci-lint count: 38 → 2 (the two `unused` findings remain by design, deferred to the triage commit).
+
+### Unused-symbol triage — `65d2574` (2 of 38)
+
+Subagent (opus) confirmed both symbols are truly dead and not 05.2 forward-look via repo-wide grep + cross-reference of `phases/05.1-downstream-h2/PLAN.md`, `phases/05.1-downstream-h2/SPEC.md` §5.3 (Stream state machine) and §5.8 (cluster-side H2 deferral), `phases/05.2-upstream-h2/README.md` (placeholder; no SPEC yet), and `DECISIONS.md` ADR-0046 / ADR-0048 (boundary docs). Disposition: deletion. Spec-compliance review and code-quality review (opus) both passed.
+
+- **`internal/filter/hcm/h2/conn.go:38` field `hpackBlockSID uint32`** — paired with `hpackBlocked bool` (line 37). Grep returns one hit (the declaration). The bool's reachability does not depend on the SID because RFC 9113 §6.10's same-stream rule for CONTINUATION is enforced at the codec layer by `golang.org/x/net/http2.Framer.checkFrameOrder`, which raises `http2.ConnectionError(ErrCodeProtocol)` on cross-stream CONTINUATION; our `readFrameCtx` (`framer.go:76-83`) translates that into the package's `*Error` type. Frame reads are sequential on a single per-conn goroutine, so no interleaving is possible at our layer. The SID was speculative.
+- **`internal/filter/hcm/h2/framer.go:156` func `ctxErr(ctx context.Context, fallback error) error`** — grep returns three hits: the deleted declaration plus two LOCAL-VARIABLE shadows in `readFrameCtx`'s timeout path (`if ctxErr := ctx.Err(); ctxErr != nil { ... }` at framer.go:64 and 66 of the original file). Those locals are unrelated to the package-level function and survive the deletion intact. The function is a planning-time sketch from `PLAN.md` lines 821-849 that did not survive implementation simplification (the implementation polls 50 ms slices regardless of whether ctx has a deadline; the planned `ctx.Deadline()` branch that called `ctxErr` never landed). Not 05.2 forward-look — 05.2 deliverables are upstream H2 client / cluster H2 dial / fixture 0004, none of which would naturally adopt a server-side framer helper.
+
+`git diff --stat 9e23e77..65d2574`: 2 files changed, +0 / −8. golangci-lint count: 2 → 0.
+
+### Carry-forward observation (out of scope for this cleanup)
+
+The code-quality review (opus) surfaced one **non-blocking** observation: the bool `hpackBlocked` (paired with the now-deleted `hpackBlockSID`) is also dead code. `grep -rn "hpackBlocked = " internal/filter/hcm/h2/` returns exactly one hit (line 249, an assignment to `false`); there is NO assignment to `true` anywhere in the repo. The read at `internal/filter/hcm/h2/conn.go:236` therefore always observes the zero value (`false`), and the belt-and-suspenders guard at `:236-240` plus the reset at `:243-250` is unreachable. The actual CONTINUATION ordering enforcement comes entirely from `golang.org/x/net/http2.Framer.checkFrameOrder` per the `hpackBlockSID` deletion rationale above. This is **not** introduced by Task 17 — it is a pre-existing condition surviving phase 05.1's implementation that the deletion of `hpackBlockSID` made more visible. The `golangci-lint unused` linter does not flag `hpackBlocked` because the read+write pair (line 236 read, line 249 write-to-false) satisfies the linter's heuristic, but reachability/value-flow analysis would show both unreachable. Recommended follow-up disposition (deferred): a future small commit removes `hpackBlocked` and the conn.go:227-250 guard block, with a one-line note that x/net `checkFrameOrder` per ADR-0046 is the actual owner. NOT done in this cleanup because (a) it is out of the 38 cited findings, (b) state-3 follow-up scope must remain bounded per BOOTSTRAP §6.3 (no opportunistic creep), and (c) gate-(f) `REVIEW.md` is the proper venue for surfacing this kind of observation when a phase requesting-code-review session lands. The note here is the durable record so the REVIEW.md author and any 05.2 stranger can see it.
+
+### Re-verification (all six SPEC §3 phase-done gates)
+
+Fresh terminal in `.worktrees/phase-05.1-downstream-h2-impl-followup` at HEAD `65d2574`. `git status --porcelain` empty before the run. Six gates rerun verbatim per BOOTSTRAP §1 step E and SPEC §3:
+
+```
+$ pwd
+/home/esa/git/envoy-go/.worktrees/phase-05.1-downstream-h2-impl-followup
+$ git rev-parse --abbrev-ref HEAD
+phase/05.1-downstream-h2-impl-followup
+$ git log -1 --format=%H
+65d2574798aa732f0fb6ee2b4a0f33de0e77c774
+$ go version
+go version go1.26.2 linux/amd64
+$ golangci-lint version 2>&1 | head -1
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+$ go build ./...
+<no output>
+$ go vet ./...
+<no output>
+$ golangci-lint run ./...
+<no output; exit 0>
+$ ls internal/filter/hcm/h2/client.go 2>&1
+ls: cannot access 'internal/filter/hcm/h2/client.go': No such file or directory
+$ grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go'
+internal/filter/hcm/h2/framer.go:10:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/conn.go:10:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/settings.go:4:	"golang.org/x/net/http2"
+(All 3 hits in the 5 allowed files per ADR-0046; hpack.go uses the http2/hpack sub-package; stream.go has no direct import.)
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0053: Phase-04 REVIEW Minor carry-forward triage
+```
+
+Gate (a) — VACUOUS per ADR-0045 (no new differential fixture in 05.1).
+Gate (b) — all four pre-existing differential fixtures green:
+
+```
+$ go test ./test/differential/ -v -timeout=12m -count=1
+=== RUN   TestCompareBytes_Equal
+--- PASS: TestCompareBytes_Equal (0.00s)
+=== RUN   TestCompareBytes_DivergesAtFirstByte
+--- PASS: TestCompareBytes_DivergesAtFirstByte (0.00s)
+=== RUN   TestCompareBytes_DifferentLengths
+--- PASS: TestCompareBytes_DifferentLengths (0.00s)
+=== RUN   TestParseEnvoyTarget_PullsTagAndDigest
+--- PASS: TestParseEnvoyTarget_PullsTagAndDigest (0.00s)
+=== RUN   TestParseEnvoyTarget_RejectsMissingTag
+--- PASS: TestParseEnvoyTarget_RejectsMissingTag (0.00s)
+=== RUN   TestReferenceProxy_Starts
+--- PASS: TestReferenceProxy_Starts (0.90s)
+=== RUN   TestSubjectProxy_StartsAndReports
+--- PASS: TestSubjectProxy_StartsAndReports (0.58s)
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+--- PASS: TestDifferential (4.78s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.14s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.20s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.24s)
+    --- PASS: TestDifferential/0003-http11-routing (1.21s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential
+(testcontainers ryuk + reference-Envoy lifecycle traces abbreviated for brevity, matching phase-04's `7649a19` precedent.)
+```
+
+Auxiliary `go test ./...` and `go test -race ./...` clean (every package OK; no data races):
+
+```
+$ go test -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.004s
+ok  	github.com/esalaine/envoy-go/internal/admin	0.039s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.008s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.007s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.010s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.259s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.008s
+ok  	github.com/esalaine/envoy-go/internal/listener	0.008s
+ok  	github.com/esalaine/envoy-go/internal/tls	0.018s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.038s
+ok  	github.com/esalaine/envoy-go/test/differential	6.277s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.004s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.004s
+(no-test-files entries omitted for brevity.)
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.928s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.055s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.034s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.028s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.033s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	1.270s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.026s
+ok  	github.com/esalaine/envoy-go/internal/listener	1.034s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.089s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.122s
+ok  	github.com/esalaine/envoy-go/test/differential	7.447s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.010s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.011s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.024s
+```
+
+Gate (c) — h2spec conformance, 53/53 PASS at the ADR-0051 pinned image:
+
+```
+$ go test ./test/conformance/h2spec/ -count=1 -timeout=5m -v
+... (h2spec testcontainers lifecycle abbreviated)
+        Finished in 0.5454 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+--- PASS: TestH2Spec (2.17s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec
+```
+
+(Per-section breakdown unchanged from the pre-cleanup verification block: 3.5/4.1/4.2/4.3/5.1/5.1.1/5.1.2/5.3.1/5.4.1/5.5/7/8.1/8.1.2/8.1.2.1/8.1.2.2/8.1.2.3/8.1.2.6/8.2 all green.)
+
+Gate (d) — six fuzz targets at the 30-second CI budget per ADR-0018; all PASS, no crashers, `git status --porcelain` empty after each (no testdata/fuzz pollution):
+
+```
+$ go test ./internal/bootstrap/ -run=^FuzzBootstrapLoad$ -fuzz=^FuzzBootstrapLoad$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 786306 (1168/sec), new interesting: 16 (total: 1001)
+PASS
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/tcpproxy/ -run=^FuzzTcpProxyFilter$ -fuzz=^FuzzTcpProxyFilter$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 3939064 (144884/sec), new interesting: 3 (total: 529)
+PASS
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/tls/ -run=^FuzzTLSContextParse$ -fuzz=^FuzzTLSContextParse$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 5774736 (571389/sec), new interesting: 24 (total: 616)
+PASS
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/ -run=^FuzzHCMConfigParse$ -fuzz=^FuzzHCMConfigParse$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 3146466 (97775/sec), new interesting: 3 (total: 494)
+PASS
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/h2/ -run=^FuzzFrameStream$ -fuzz=^FuzzFrameStream$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 14378504 (466453/sec), new interesting: 24 (total: 323)
+PASS
+$ git status --porcelain
+<no output>
+
+$ go test ./internal/filter/hcm/h2/ -run=^FuzzHPACKDecode$ -fuzz=^FuzzHPACKDecode$ -fuzztime=30s
+fuzz: elapsed: 30s, execs: 2292547 (0/sec), new interesting: 2 (total: 142)
+PASS
+$ git status --porcelain
+<no output>
+```
+
+Gate (e) — `go build`/`go vet`/`go test ./...` clean (above); ADR-0046 boundary grep clean (3 prod hits in the 5 allowed files); ADR-0048 `client.go` absence verified; **`golangci-lint run ./...` exits 0 with zero issues** — down from 38 at base `df85f85`.
+
+Gate (f) — `REVIEW.md` approved — DEFERRED to lifecycle-state 5 per BOOTSTRAP §5; not run by this Task 17 session.
+
+**All five non-deferred gates GREEN. golangci-lint count: 38 → 0.** STATE.md advances `lifecycle-state: 4` (impl complete; awaiting `superpowers:verification-before-completion` re-run at the new HEAD); the verification re-run is the state-4→state-5 promotion and is the responsibility of the next session, NOT this Task 17 session.
