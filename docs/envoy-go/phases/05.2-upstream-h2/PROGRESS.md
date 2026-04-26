@@ -1053,7 +1053,7 @@ $ # Sequential file-order tail = ADR-0057 (Task 14 lands AFTER ADR-0058 — non-
 
 ## Task 15 — BEHAVIOR_CONTRACT `## HTTP/2` in-place edit (per ADR-0052) + all-gates green local sweep + STATE → lifecycle-state 4
 
-**Commits:** `<sha>` (this commit, BEHAVIOR_CONTRACT + STATE + PROGRESS + 1-line test deadline extension), follow-up SHA-fill commit per the phase-02/03/04/05.1 convention.
+**Commits:** `bd75c88` (this commit, BEHAVIOR_CONTRACT + STATE + PROGRESS + 1-line test deadline extension), follow-up SHA-fill commit per the phase-02/03/04/05.1 convention.
 
 **Notes:** Phase-05.2 closing task. This is the supersession-free in-place edit authorised by ADR-0052: the SCAFFOLD `## HTTP/2` subsection introduced in 05.1 is rewritten to its 05.1+05.2 unified form (the PLAN's authoritative prose at PLAN.md lines 2820-2877), and the four header-allow-list rows for `:method`/`:path`/`:scheme`/`:authority` have their applies-to cells flipped from "phase 05.2 routed-to-upstream H2 (forward-looking)" → "phase 05.2 routed-to-upstream H2 (active per ADR-0057)". No new ADR is added; ADR-0052's text is the standing authorisation. Five gates (a/b/c/d/e) green at this commit; gate (f) `REVIEW.md` is deferred to the REVIEW session at lifecycle-state 6 per BOOTSTRAP §5 step 6. Per PLAN Task 15's "Refinement" note, ROADMAP rows 05.2 + 05 stay `in-progress` at this commit; the phase-done commit (REVIEW session, lifecycle-state 6) will flip both rows on the same commit.
 
