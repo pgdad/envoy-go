@@ -841,3 +841,45 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0058: Trailers observed but not forwarded — H2 router
 $ # ADR tail advanced 0056 → 0058 (Task 11 lands ADR-0058; ADR-0057 lands later at Task 14 — non-monotonic per topical-vs-commit-order).
 ```
+
+## Task 12 — `test/helpers/h2.go` H2RoundTrip helper
+
+**Commit:** {{SHA}} (main); SHA-fill commit lands on top.
+
+**Files changed:**
+
+- `test/helpers/h2.go` — New driver-side helper `H2RoundTrip(ctx, addr, *tls.Config, method, path, []hpack.HeaderField, body) (status, []hpack.HeaderField, []byte, error)` consumed by fixture-0004's driver (Task 14). Algorithm: TCP-dial → `tls.Client(rawConn, tlsConf).HandshakeContext` → ALPN-verify (must be "h2") → fresh `*http2.Transport{TLSClientConfig: tlsConf}` per call (no caching per ## Settled SPEC §10 deferred decisions #13) → `tr.NewClientConn(tlsConn)` → `cc.RoundTrip(*http.Request)` with `bytes.NewReader(body)` (zero-length reader when body==nil; cleaner than nil body) → `io.ReadAll(resp.Body)` → convert `resp.Header` to `[]hpack.HeaderField` and prepend `{Name: ":status", Value: strconv.Itoa(resp.StatusCode)}` per RFC 9113 §8.3 wire-order convention. Driver-side `golang.org/x/net/http2.Transport` import is permitted per D-3.2 — this file lives under `test/`, not `internal/`; the Task 15 boundary grep excludes test files. 87 LoC.
+- `test/helpers/h2_test.go` — `TestH2RoundTrip_HappyPath` stands up `httptest.NewUnstartedServer` with TLS + `http2.ConfigureServer` driver-side (handler returns "ok" status 200), builds a TLS config with the server's cert in RootCAs + `NextProtos=["h2"]` + `ServerName="127.0.0.1"`, calls `H2RoundTrip(ctx, addr, tlsConf, "GET", "/", nil, nil)`, asserts status==200 + body=="ok". 43 LoC.
+- `docs/envoy-go/phases/05.2-upstream-h2/PROGRESS.md` — this entry.
+
+**TDD discipline:** `TestH2RoundTrip_HappyPath` was added before `H2RoundTrip` was implemented — initial run FAILED at compile-time (`undefined: H2RoundTrip`); after the implementation landed, run PASSED.
+
+**Pitfall observed and resolved:** initial implementation had a blank line between the `// Package helpers ...` doc comment and the `package helpers` clause, which `revive`'s `package-comments` linter rejects ("package comment is detached"). Fixed by removing the blank line — Go's package-comment convention requires the comment to be directly attached to the `package` clause.
+
+**Outputs:**
+```
+$ go test ./test/helpers/ -v -run TestH2RoundTrip
+=== RUN   TestH2RoundTrip_HappyPath
+--- PASS: TestH2RoundTrip_HappyPath (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/helpers	0.004s
+
+$ go test ./test/helpers/ -v
+[... 20 tests, all PASS ...]
+PASS
+ok  	github.com/esalaine/envoy-go/test/helpers	0.006s
+
+$ go test -race ./...
+[... all packages green ...]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.025s
+
+$ golangci-lint run ./test/helpers/
+$ # exit 0
+
+$ golangci-lint run ./...
+$ # exit 0
+
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0058: Trailers observed but not forwarded — H2 router
+$ # ADR tail unchanged at 0058 (Task 12 lands no new ADR — fixture infrastructure per PLAN line 2221).
+```
