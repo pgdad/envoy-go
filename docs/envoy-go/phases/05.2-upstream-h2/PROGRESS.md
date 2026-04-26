@@ -959,7 +959,7 @@ $ # ADR tail unchanged at 0058 (Task 13 lands no new ADR — content-only; ADR-0
 
 ## Task 14 — Fixture 0004 driver + runner blank-import + ADR-0057 (closes ADR-0035 H/2 leg)
 
-**Commit:** TBD (main); SHA-fill commit lands on top.
+**Commit:** 75d311b (main); SHA-fill commit lands on top.
 
 **Files changed:**
 
