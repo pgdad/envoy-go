@@ -73,3 +73,59 @@ $ go vet ./...
 $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0060: Histograms deferred from 06.1
 ```
+
+## Task 3 — `internal/stats/gauge.go`
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Replaced the Task 2 minimal Gauge stub with the full body — `Inc`, `Dec`, `Set`, `Add`, `Load`, `Format` backed by `atomic.Int64`. Negative gauge values permitted per BRAINSTORM §5.2. Added `gauge_test.go` with 5 tests covering sequential Inc/Dec/Set, negative-value-allowed (3 Decs from zero → -3), Add with mixed-sign deltas, race-clean concurrent Inc/Dec/Set, and Format rendering of negative values. No new ADR.
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/stats/ -v
+=== RUN   TestCounter_Inc_Sequential
+--- PASS: TestCounter_Inc_Sequential (0.00s)
+=== RUN   TestCounter_Add_Sequential
+--- PASS: TestCounter_Add_Sequential (0.00s)
+=== RUN   TestCounter_Inc_RaceClean
+--- PASS: TestCounter_Inc_RaceClean (0.01s)
+=== RUN   TestGauge_IncDecSet_Sequential
+--- PASS: TestGauge_IncDecSet_Sequential (0.00s)
+=== RUN   TestGauge_NegativeValueAllowed
+--- PASS: TestGauge_NegativeValueAllowed (0.00s)
+=== RUN   TestGauge_Add_PositiveAndNegative
+--- PASS: TestGauge_Add_PositiveAndNegative (0.00s)
+=== RUN   TestGauge_RaceClean_ConcurrentIncDecSet
+--- PASS: TestGauge_RaceClean_ConcurrentIncDecSet (0.00s)
+=== RUN   TestGauge_Format_NegativeRendered
+--- PASS: TestGauge_Format_NegativeRendered (0.00s)
+=== RUN   TestRegistry_NewCounter_HappyPath
+--- PASS: TestRegistry_NewCounter_HappyPath (0.00s)
+=== RUN   TestRegistry_NewCounter_DuplicateNamePanics
+--- PASS: TestRegistry_NewCounter_DuplicateNamePanics (0.00s)
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/#00
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/1leading-digit
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with_space
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with-dash
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/trailing.
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with$char
+--- PASS: TestRegistry_NewCounter_InvalidNamePanics (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/#00 (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/1leading-digit (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with_space (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with-dash (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/trailing. (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with$char (0.00s)
+=== RUN   TestRegistry_Walk_RegistrationOrderInvariantNotPromised
+--- PASS: TestRegistry_Walk_RegistrationOrderInvariantNotPromised (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeRegisterPanics
+--- PASS: TestRegistry_Freeze_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeNewGaugePanics
+--- PASS: TestRegistry_Freeze_PostFreezeNewGaugePanics (0.00s)
+=== RUN   TestRegistry_Freeze_Idempotent
+--- PASS: TestRegistry_Freeze_Idempotent (0.00s)
+=== RUN   TestRegistry_Walk_ConcurrentWithIncs_RaceClean
+--- PASS: TestRegistry_Walk_ConcurrentWithIncs_RaceClean (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	1.023s
+$ go vet ./...
+```
