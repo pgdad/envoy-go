@@ -90,12 +90,12 @@ func (c *Cluster) statusClassCounter(code int) *stats.Counter {
 	}
 }
 
-// UpstreamRqTotalInc Inc's the cluster-scope upstream_rq_total counter once.
+// IncUpstreamRqTotal Inc's the cluster-scope upstream_rq_total counter once.
 // Phase 06.1 Task 11 hot path — called from internal/filter/hcm/actions.go's
 // routerAction.do and routerActionH2.doH2 at dispatch entry per SPEC §5.5
 // (Increment paths table). Exported so the hcm package can drive it without
 // reaching across the package boundary into unexported fields.
-func (c *Cluster) UpstreamRqTotalInc() { c.upstreamRqTotal.Inc() }
+func (c *Cluster) IncUpstreamRqTotal() { c.upstreamRqTotal.Inc() }
 
 // IncStatusClass Inc's the cluster-scope upstream_rq_<Nxx> counter for the
 // status-class implied by code (integer-divide code/100 per Rule SN4 of

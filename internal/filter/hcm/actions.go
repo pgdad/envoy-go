@@ -126,7 +126,7 @@ type routerAction struct {
 // err is the routeAction error (errCloseAfterAction sentinel or a real
 // write-side failure).
 func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	a.cluster.UpstreamRqTotalInc()
+	a.cluster.IncUpstreamRqTotal()
 
 	upstream, err := a.cluster.Dial(ctx)
 	if err != nil {
@@ -220,7 +220,7 @@ type routerActionH2 struct {
 // downstream_rq_<Nxx> counter on the H2 path per SPEC §5.5 "HCM response
 // hook" row.
 func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.StreamWriter) (int, error) {
-	r.cluster.UpstreamRqTotalInc()
+	r.cluster.IncUpstreamRqTotal()
 
 	cc, err := r.cluster.DialH2(ctx)
 	if err != nil {
