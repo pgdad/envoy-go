@@ -44,13 +44,13 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	adminHost, adminPort, err := bootstrap.AdminSocket(bs)
+	adminHost, adminPort, err := bootstrap.AdminSocket(bs.Proto)
 	if err != nil {
 		log.Fatalf("extract admin: %v", err)
 	}
 	adminAddr := fmt.Sprintf("%s:%d", adminHost, adminPort)
 
-	cm, err := cluster.NewManagerWithBaseDir(bs, filepath.Dir(*cfgPath))
+	cm, err := cluster.NewManagerWithBaseDir(bs.Proto, filepath.Dir(*cfgPath))
 	if err != nil {
 		log.Fatalf("cluster manager: %v", err)
 	}
@@ -63,7 +63,7 @@ func main() {
 	}
 	defer func() { _ = admSrv.Close() }()
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs, cm, filepath.Dir(*cfgPath), *allowH2C)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

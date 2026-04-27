@@ -29,16 +29,36 @@ import (
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"gopkg.in/yaml.v3"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
+
+// Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
+// boot-time *stats.Registry that downstream constructors (cluster/listener/HCM
+// managers in Tasks 8–11) register their metrics on. Per the settled SPEC
+// §12 #2 decision the Registry lives as a field on this wrapper rather than
+// being allocated free-standing in main.go, so future xDS phases that add a
+// dynamic config-reload path have a place to thread the Registry through a
+// config-update path.
+type Bootstrap struct {
+	// Proto is the unmarshalled Envoy v3 Bootstrap message.
+	Proto *bootstrapv3.Bootstrap
+	// Stats is the boot-time metrics Registry. It is allocated by Load and
+	// MUST NOT be Frozen at that point — downstream constructors register
+	// counters/gauges on it during boot. Task 12 owns the post-construction
+	// Freeze call per SPEC §5.4.
+	Stats *stats.Registry
+}
 
 // Load parses r as YAML (upstream Envoy's YAML shape), converts to JSON, and
 // unmarshals into an Envoy v3 Bootstrap proto. Unknown fields at any depth
 // cause an error (ADR-0016). The phase-01 unsupported surfaces
 // dynamic_resources and layered_runtime cause an error even though the proto
-// itself defines them.
+// itself defines them. The returned *Bootstrap also carries a freshly
+// allocated, non-Frozen *stats.Registry on its `Stats` field (SPEC §12 #2).
 //
 // Every error returned by Load begins with "bootstrap: ".
-func Load(r io.Reader) (*bootstrapv3.Bootstrap, error) {
+func Load(r io.Reader) (*Bootstrap, error) {
 	raw, err := io.ReadAll(r)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: read: %w", err)
@@ -65,7 +85,7 @@ func Load(r io.Reader) (*bootstrapv3.Bootstrap, error) {
 	if err := opts.Unmarshal(jsonBytes, bs); err != nil {
 		return nil, fmt.Errorf("bootstrap: protojson: %w", err)
 	}
-	return bs, nil
+	return &Bootstrap{Proto: bs, Stats: stats.NewRegistry()}, nil
 }
 
 // AdminSocket returns host and port from admin.address.socket_address. Errors

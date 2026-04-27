@@ -414,3 +414,69 @@ vet: cmd/envoy-go/main.go:57:31: not enough arguments in call to admin.New
 	have (string)
 	want (string, *stats.Registry)
 ```
+
+## Task 7 — Bootstrap.Stats field + Load allocates *stats.Registry
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Per the settled SPEC §12 #2 decision (`Bootstrap.Stats` factoring = field-on-Bootstrap shape), introduced a new exported `Bootstrap` wrapper struct in `internal/bootstrap/bootstrap.go` with two fields (`Proto *bootstrapv3.Bootstrap`, `Stats *stats.Registry`) and changed `Load` to return `*Bootstrap`; the Registry is freshly allocated via `stats.NewRegistry()` and is intentionally NOT yet Frozen — downstream cluster/listener/HCM constructors (Tasks 8–11) register on it during boot, and Task 12 owns the post-construction Freeze call per SPEC §5.4. Cascaded the wrapper change through the only non-test caller `cmd/envoy-go/main.go`: the three propagation sites (`bootstrap.AdminSocket(bs)`, `cluster.NewManagerWithBaseDir(bs, …)`, `listener.NewManagerWithBaseDirAndAllowH2C(bs, …)`) now pass `bs.Proto`; the `admin.New(adminAddr, stats.NewRegistry())` throwaway-Registry line is intentionally left in place because Task 12 owns the swap to `bs.Stats` per the dispatch instructions. Updated all eleven `bs.GetX()` / `AdminSocket(bs)` / `protojson.Marshal(bs)` call sites in `bootstrap_test.go` to the new `bs.Proto.X` form and added `TestLoad_AllocatesStatsRegistry` (asserts `bs.Stats` is non-nil AND non-Frozen by exercising `NewCounter`). The PLAN's example test name `test.field-not-frozen` was rewritten to `test.field_not_frozen` because the SN-name regex `^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$` (registry.go:98) rejects hyphens; the test still satisfies the PLAN's intent (NewCounter must succeed → Registry is not Frozen). `internal/bootstrap/fuzz_test.go` needed no changes — its `Load` call discards the return value. Anchored: SPEC §4.2 (bootstrap.go extension), §5.4 (boot wiring sequence), §12 #2 (settled).
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/bootstrap/ -run TestLoad_AllocatesStatsRegistry -v
+=== RUN   TestLoad_AllocatesStatsRegistry
+--- PASS: TestLoad_AllocatesStatsRegistry (0.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.018s
+$ go test -race -count=1 ./internal/bootstrap/ ./cmd/envoy-go/ -v
+=== RUN   TestLoad_HappyPath
+--- PASS: TestLoad_HappyPath (0.01s)
+=== RUN   TestLoad_RejectsDynamicResources
+--- PASS: TestLoad_RejectsDynamicResources (0.00s)
+=== RUN   TestLoad_RejectsLayeredRuntime
+--- PASS: TestLoad_RejectsLayeredRuntime (0.00s)
+=== RUN   TestLoad_YAMLSyntaxError
+--- PASS: TestLoad_YAMLSyntaxError (0.00s)
+=== RUN   TestLoad_UnknownTopLevelField
+--- PASS: TestLoad_UnknownTopLevelField (0.00s)
+=== RUN   TestLoad_EmptyDocument
+--- PASS: TestLoad_EmptyDocument (0.00s)
+=== RUN   TestAdminSocket_HappyPath
+--- PASS: TestAdminSocket_HappyPath (0.00s)
+=== RUN   TestAdminSocket_MissingAdmin
+--- PASS: TestAdminSocket_MissingAdmin (0.00s)
+=== RUN   TestBootstrap_RoundTrips_FixtureFour_Shape
+--- PASS: TestBootstrap_RoundTrips_FixtureFour_Shape (0.00s)
+=== RUN   TestLoad_AllocatesStatsRegistry
+--- PASS: TestLoad_AllocatesStatsRegistry (0.00s)
+=== RUN   TestLoad_HCMRoundTrip
+--- PASS: TestLoad_HCMRoundTrip (0.00s)
+=== RUN   FuzzBootstrapLoad
+=== RUN   FuzzBootstrapLoad/seed#0
+=== RUN   FuzzBootstrapLoad/seed#1
+=== RUN   FuzzBootstrapLoad/seed#2
+=== RUN   FuzzBootstrapLoad/seed#3
+=== RUN   FuzzBootstrapLoad/seed#4
+=== RUN   FuzzBootstrapLoad/seed#5
+=== RUN   FuzzBootstrapLoad/seed#6
+=== RUN   FuzzBootstrapLoad/seed#7
+--- PASS: FuzzBootstrapLoad (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#0 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#1 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#2 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#3 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#4 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#5 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#6 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#7 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.030s
+=== RUN   TestEnvoyGoBinary_TwoListenerCutover
+--- PASS: TestEnvoyGoBinary_TwoListenerCutover (0.57s)
+=== RUN   TestEnvoyGoBinary_HCMSmoke
+--- PASS: TestEnvoyGoBinary_HCMSmoke (0.53s)
+=== RUN   TestEnvoyGoBinary_H2Smoke
+--- PASS: TestEnvoyGoBinary_H2Smoke (0.52s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.626s
+$ go vet ./...
+$ go build ./...
+```

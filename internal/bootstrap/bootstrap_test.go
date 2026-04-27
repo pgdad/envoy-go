@@ -45,16 +45,16 @@ func TestLoad_HappyPath(t *testing.T) {
 	if bs == nil {
 		t.Fatal("Load returned nil bootstrap with nil error")
 	}
-	if got, want := bs.GetNode().GetId(), "test-node"; got != want {
+	if got, want := bs.Proto.GetNode().GetId(), "test-node"; got != want {
 		t.Errorf("node.id: got %q, want %q", got, want)
 	}
-	if got := bs.GetStaticResources(); got == nil {
+	if got := bs.Proto.GetStaticResources(); got == nil {
 		t.Fatal("static_resources missing")
 	}
-	if n := len(bs.GetStaticResources().GetListeners()); n != 1 {
+	if n := len(bs.Proto.GetStaticResources().GetListeners()); n != 1 {
 		t.Errorf("listeners: got %d, want 1", n)
 	}
-	if n := len(bs.GetStaticResources().GetClusters()); n != 1 {
+	if n := len(bs.Proto.GetStaticResources().GetClusters()); n != 1 {
 		t.Errorf("clusters: got %d, want 1", n)
 	}
 }
@@ -129,7 +129,7 @@ func TestAdminSocket_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	host, port, err := AdminSocket(bs)
+	host, port, err := AdminSocket(bs.Proto)
 	if err != nil {
 		t.Fatalf("AdminSocket: %v", err)
 	}
@@ -151,7 +151,7 @@ static_resources:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	_, _, err = AdminSocket(bs)
+	_, _, err = AdminSocket(bs.Proto)
 	if err == nil {
 		t.Fatal("want error for missing admin, got nil")
 	}
@@ -209,7 +209,7 @@ static_resources:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	clusters := bs.GetStaticResources().GetClusters()
+	clusters := bs.Proto.GetStaticResources().GetClusters()
 	if len(clusters) != 1 {
 		t.Fatalf("clusters: got %d, want 1", len(clusters))
 	}
@@ -230,8 +230,32 @@ static_resources:
 	}
 	// Round-trip via protojson — would error if the proto descriptor were
 	// unregistered.
-	if _, err := protojson.Marshal(bs); err != nil {
+	if _, err := protojson.Marshal(bs.Proto); err != nil {
 		t.Fatalf("protojson.Marshal: %v", err)
+	}
+}
+
+// TestLoad_AllocatesStatsRegistry asserts that Load returns a Bootstrap
+// wrapper carrying an allocated, non-Frozen *stats.Registry. Per the settled
+// SPEC §12 #2 decision the Registry lives as a field on the Bootstrap wrapper
+// (not as a free-standing alloc in main.go), so future xDS phases that add a
+// dynamic config-reload path have a place to thread the Registry through.
+// The Registry MUST NOT be Frozen yet — downstream cluster/listener/HCM
+// constructors (Tasks 8–11) register metrics on it before Task 12's
+// post-construction Freeze call.
+func TestLoad_AllocatesStatsRegistry(t *testing.T) {
+	bs, err := Load(strings.NewReader(sampleBootstrap))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if bs.Stats == nil {
+		t.Fatal("Bootstrap.Stats is nil; expected an allocated *stats.Registry")
+	}
+	// The Registry MUST NOT be Frozen yet (downstream constructors register).
+	// (Hyphens are not legal in SN-validated names — use dotted form.)
+	c := bs.Stats.NewCounter("test.field_not_frozen")
+	if c == nil {
+		t.Fatal("NewCounter on Bootstrap.Stats returned nil")
 	}
 }
 
@@ -271,10 +295,10 @@ static_resources:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := len(bs.GetStaticResources().GetListeners()); got != 1 {
+	if got := len(bs.Proto.GetStaticResources().GetListeners()); got != 1 {
 		t.Fatalf("listeners: got %d, want 1", got)
 	}
-	if _, err := protojson.Marshal(bs); err != nil {
+	if _, err := protojson.Marshal(bs.Proto); err != nil {
 		t.Fatalf("protojson.Marshal: %v", err)
 	}
 }
