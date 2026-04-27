@@ -161,16 +161,28 @@ func TestServer_LiveGaugeSetOnceFlippedAtFirstReady200(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer func() { _ = srv.Close() }()
+	// Give the accept goroutine a beat.
+	time.Sleep(10 * time.Millisecond)
 	// Initially: server.live == 0, /ready returns 503.
-	resp503, _ := http.Get("http://" + addr + "/ready")
-	_ = resp503.Body.Close()
+	resp503, err := http.Get("http://" + addr + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready (pre-MarkReady): %v", err)
+	}
+	if resp503 != nil {
+		_ = resp503.Body.Close()
+	}
 	if got := srv.liveGauge.Load(); got != 0 {
 		t.Errorf("server.live before MarkReady = %d, want 0", got)
 	}
 	srv.MarkReady()
 	for i := 0; i < 3; i++ {
-		resp, _ := http.Get("http://" + addr + "/ready")
-		_ = resp.Body.Close()
+		resp, err := http.Get("http://" + addr + "/ready")
+		if err != nil {
+			t.Fatalf("GET /ready (post-MarkReady, iter %d): %v", i, err)
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
 	}
 	if got := srv.liveGauge.Load(); got != 1 {
 		t.Errorf("server.live after MarkReady + 3× /ready = %d, want 1", got)
