@@ -1000,7 +1000,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.028s
 
 ## Task 14 — differential fixture `0005-prometheus-stats` + runner registration [ADR-0062]
 
-**Commits:** TBD (impl)
+**Commits:** `a32212b` (impl)
 
 Anchored: SPEC §6 (17-name allow-list — 12 counters + 5 gauges), §7.3 (expectations.yaml shape), §8 (ADR-0062 sketch), §12 #6 (in-band assertion discipline / `StatsAsserter` interface), §14 (fixture gate-(a) for task 14). Introduced `BackendKind=3` (`HTTPStatusHeader`) subprocess backend. Introduced `fixture.TB` and `fixture.StatsAsserter` optional interfaces. `driver.go` implements `Driver`, `BackendKindAware`, `StatsAsserter`; `AssertStatsEquivalence` exported for testability. Two-pass design: Drive pass saves listener addrs; `AssertStats` does scrape-before + fresh 5-request drive + 200ms drain + scrape-after per side. `Connection: close` in the backend forces Envoy to drain upstream keepalive connections between Drive and AssertStats passes.
 
