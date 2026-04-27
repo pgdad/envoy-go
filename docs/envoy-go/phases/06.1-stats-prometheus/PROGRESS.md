@@ -129,3 +129,82 @@ PASS
 ok  	github.com/esalaine/envoy-go/internal/stats	1.023s
 $ go vet ./...
 ```
+
+## Task 4 — `internal/stats/name.go` flattening rules SN1–SN8 + helpText map [ADR-0061, ADR-0064]
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Created `internal/stats/name.go` with `flattenToProm` (SN1-SN5 dispatch on top-level segment + SN4 status-class regex with verified form: digit stripped, base ends `_xx`, label value single digit), `escapeLabelValue` (Prometheus text-format spec compliance for `\`, `"`, `\n`), and the `helpText` map covering the 10 unique Prometheus names. Added `name_test.go` with happy-path tests for SN1/SN2/SN3/SN5, the SN4 HCM single-digit test, the SN4 cluster-side all-5-digits subtest, the unknown-top-segment error test, the escape-label-value table-driven test, and helpText coverage. ADR-0061 (SN1-SN8 with empirically-pinned Rule SN4 + verbatim Envoy-scrape evidence at server SHA `5afe27fb338b16d5bb06b3a7198bcd581b4e3dee`) + ADR-0064 (`stats_tags` not honored) appended to DECISIONS.md.
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/stats/ -v
+=== RUN   TestCounter_Inc_Sequential
+--- PASS: TestCounter_Inc_Sequential (0.00s)
+=== RUN   TestCounter_Add_Sequential
+--- PASS: TestCounter_Add_Sequential (0.00s)
+=== RUN   TestCounter_Inc_RaceClean
+--- PASS: TestCounter_Inc_RaceClean (0.01s)
+=== RUN   TestGauge_IncDecSet_Sequential
+--- PASS: TestGauge_IncDecSet_Sequential (0.00s)
+=== RUN   TestGauge_NegativeValueAllowed
+--- PASS: TestGauge_NegativeValueAllowed (0.00s)
+=== RUN   TestGauge_Add_PositiveAndNegative
+--- PASS: TestGauge_Add_PositiveAndNegative (0.00s)
+=== RUN   TestGauge_RaceClean_ConcurrentIncDecSet
+--- PASS: TestGauge_RaceClean_ConcurrentIncDecSet (0.00s)
+=== RUN   TestGauge_Format_NegativeRendered
+--- PASS: TestGauge_Format_NegativeRendered (0.00s)
+=== RUN   TestFlattenToProm_Listener
+--- PASS: TestFlattenToProm_Listener (0.00s)
+=== RUN   TestFlattenToProm_HCM
+--- PASS: TestFlattenToProm_HCM (0.00s)
+=== RUN   TestFlattenToProm_Cluster
+--- PASS: TestFlattenToProm_Cluster (0.00s)
+=== RUN   TestFlattenToProm_StatusClass_HCM
+--- PASS: TestFlattenToProm_StatusClass_HCM (0.00s)
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_1xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_2xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_3xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_4xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_5xx
+--- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_1xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_2xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_3xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_4xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_5xx (0.00s)
+=== RUN   TestFlattenToProm_Server
+--- PASS: TestFlattenToProm_Server (0.00s)
+=== RUN   TestFlattenToProm_Invalid_NoMatchingRule
+--- PASS: TestFlattenToProm_Invalid_NoMatchingRule (0.00s)
+=== RUN   TestEscapeLabelValue
+--- PASS: TestEscapeLabelValue (0.00s)
+    --- PASS: TestEscapeLabelValue/plain (0.00s)
+    --- PASS: TestEscapeLabelValue/with_"quotes" (0.00s)
+    --- PASS: TestEscapeLabelValue/with\backslash (0.00s)
+    --- PASS: TestEscapeLabelValue/with_newline (0.00s)
+    --- PASS: TestEscapeLabelValue/all_"\_together (0.00s)
+=== RUN   TestHelpText_Coverage
+--- PASS: TestHelpText_Coverage (0.00s)
+=== RUN   TestRegistry_NewCounter_HappyPath
+--- PASS: TestRegistry_NewCounter_HappyPath (0.00s)
+=== RUN   TestRegistry_NewCounter_DuplicateNamePanics
+--- PASS: TestRegistry_NewCounter_DuplicateNamePanics (0.00s)
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics
+--- PASS: TestRegistry_NewCounter_InvalidNamePanics (0.00s)
+=== RUN   TestRegistry_Walk_RegistrationOrderInvariantNotPromised
+--- PASS: TestRegistry_Walk_RegistrationOrderInvariantNotPromised (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeRegisterPanics
+--- PASS: TestRegistry_Freeze_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeNewGaugePanics
+--- PASS: TestRegistry_Freeze_PostFreezeNewGaugePanics (0.00s)
+=== RUN   TestRegistry_Freeze_Idempotent
+--- PASS: TestRegistry_Freeze_Idempotent (0.00s)
+=== RUN   TestRegistry_Walk_ConcurrentWithIncs_RaceClean
+--- PASS: TestRegistry_Walk_ConcurrentWithIncs_RaceClean (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	1.024s
+$ go vet ./...
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0064: `stats_config.stats_tags` config not honored; extraction hardcoded
+```

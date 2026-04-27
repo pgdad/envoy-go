@@ -2135,3 +2135,85 @@ The deferral is to a later 06.x sub-phase or to an upstream-robustness-family ph
 ### Lands-in-task
 
 Phase-06.1 Task 2 (alongside ADR-0059). The two ADRs are companions: ADR-0059 establishes the architectural "what we own" and ADR-0060 establishes the scoping "what's in vs what's deferred."
+
+## ADR-0061: Stat-name → Prometheus-name flattening rules SN1–SN8 (with empirically-pinned Rule SN4)
+
+**Status:** Accepted
+**Date:** 2026-04-27
+**Doctrine:** D-3.4 (record durable design rationale)
+
+### Decision
+
+The eight rules SN1–SN8 govern flattening from internal hierarchical-dotted names (e.g., `cluster.c0.upstream_rq_2xx`) to Prometheus-format `name{label="value"}` lines. Rules SN1, SN2, SN3, SN5, SN6, SN7, SN8 are settled at brainstorm-close (BRAINSTORM §7.1); Rule SN4 is empirically pinned at SPEC-drafting time per BRAINSTORM §2.3.1 against reference Envoy v1.37.2's default tag-extractor regex.
+
+Rule summary:
+- **SN1:** `cluster.<n>.<rest>` → `envoy_cluster_<rest>` + label `envoy_cluster_name=<n>`
+- **SN2:** `http.<stat_prefix>.<rest>` → `envoy_http_<rest>` + label `envoy_http_conn_manager_prefix=<stat_prefix>`
+- **SN3:** `listener.<addr>.<rest>` → `envoy_listener_<rest>` + label `envoy_listener_address=<addr>`
+- **SN4:** `<base>_Nxx` (N ∈ 1..5) → `<base>_xx` + label `envoy_response_code_class=<N>` (single class digit as string)
+- **SN5:** `server.<rest>` → `envoy_server_<rest>` + no labels
+- **SN6:** HELP text best-effort English (NOT byte-equal to Envoy's HELP text — differential equivalence is on values + label keys + types only)
+- **SN7:** Histograms not emitted by 06.1 (forward-looking; per ADR-0060)
+- **SN8:** Per-endpoint cluster stats not emitted (forward-looking)
+
+Rule SN4 verified form: trailing class digit STRIPPED from metric name (so `cluster.<n>.upstream_rq_2xx` flattens to `envoy_cluster_upstream_rq_xx`); label name `envoy_response_code_class`; label value the single class digit as a string (`"2"`, `"3"`, `"4"`, `"5"`).
+
+### Context — verbatim Envoy-scrape evidence
+
+```
+# TYPE envoy_cluster_upstream_rq_xx counter
+envoy_cluster_upstream_rq_xx{envoy_response_code_class="2",envoy_cluster_name="c_backend"} 3
+envoy_cluster_upstream_rq_xx{envoy_response_code_class="4",envoy_cluster_name="c_backend"} 1
+envoy_cluster_upstream_rq_xx{envoy_response_code_class="5",envoy_cluster_name="c_backend"} 1
+# TYPE envoy_http_downstream_rq_xx counter
+envoy_http_downstream_rq_xx{envoy_response_code_class="1",envoy_http_conn_manager_prefix="ingress_http"} 0
+envoy_http_downstream_rq_xx{envoy_response_code_class="2",envoy_http_conn_manager_prefix="ingress_http"} 3
+envoy_http_downstream_rq_xx{envoy_response_code_class="3",envoy_http_conn_manager_prefix="ingress_http"} 0
+envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="ingress_http"} 1
+envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="ingress_http"} 1
+```
+
+Negative-confirmation grep over the full 1181-line scrape: `grep -E 'envoy_[a-z_]*_(1xx|2xx|3xx|4xx|5xx)'` returns 0 matches — no metric ends in `_Nxx`.
+
+Tag-extractor regex source: Envoy v1.37.2 `source/common/config/well_known_names.cc`, the `RESPONSE_CODE_CLASS` tag entry. Source-tree commit pin = the v1.37.2 release tag, server-side version-string SHA `5afe27fb338b16d5bb06b3a7198bcd581b4e3dee` (matches `ENVOY_TARGET.md`).
+
+Counter-examples (NOT what Envoy emits):
+- `envoy_cluster_upstream_rq_2xx{...}` (digit suffix preserved)
+- `envoy_cluster_upstream_rq_xx{envoy_response_code_class="2xx",...}` (label value with literal "xx")
+- `envoy_cluster_upstream_rq{envoy_response_code_class="2",...}` (`_xx` stripped entirely)
+
+### Consequences
+
+- (a) `internal/stats/name.go`'s `flattenToProm` MUST implement Rule SN4 in this exact verified form (regex `^(.+)_([1-5])xx$`).
+- (b) `BEHAVIOR_CONTRACT.md ## Stat-name mapping`'s in-place edit at Task 15 carries Rule SN4 in the same form.
+- (c) Future phases adding new stat-name patterns extend SN1–SN8 with append-only rules.
+
+### Lands-in-task
+
+Phase-06.1 Task 4. Supersedes nothing.
+
+## ADR-0064: `stats_config.stats_tags` config not honored; extraction hardcoded
+
+**Status:** Accepted
+**Date:** 2026-04-27
+**Doctrine:** D-3.4 (record durable design rationale)
+
+### Decision
+
+Phase 06.1 hardcodes the stat-name → Prometheus-name extraction logic in `internal/stats/name.go` (per Rules SN1–SN5 of the SN1–SN8 set established by ADR-0061); the bootstrap proto's `stats_config.stats_tags[]` field is silently ignored if present.
+
+### Context
+
+Per BRAINSTORM §2.3 and §5.6, the regex-driven tag-extraction surface in Envoy is complex (~50 default regexes plus user-supplied overrides) and warrants its own phase. 06.1 ships fixed extraction that matches Envoy's default tag-extractor behavior on the 17 names in scope. The silent-ignore preserves bootstrap forward-compat — a fixture-0005 reference bootstrap with `stats_tags: []` round-trips without error.
+
+Carry-forward: a future stats-config phase, or an xDS-RTDS revisit, will introduce the dynamic tag-extractor surface and the per-stat regex-override path.
+
+### Consequences
+
+- (a) The silently-ignored field set is amended to include: `stats_config.stats_tags[]`, `stats_config.stats_matcher`, `stats_config.histogram_bucket_settings`, `stats_config.use_all_default_tags`, `stats_sinks[]`, HCM `stats_flush_interval`, Cluster `track_cluster_stats`, Listener `stat_prefix`.
+- (b) The original silent-ignore ADR (from phase 04) is amended (not superseded) per the 05.1 + 05.2 amendment shape.
+- (c) Future stats-config phases land their own ADR superseding ADR-0064.
+
+### Lands-in-task
+
+Phase-06.1 Task 4 (alongside ADR-0061). Supersedes nothing.

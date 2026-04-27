@@ -1,0 +1,133 @@
+package stats
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// Label is one Prometheus label key/value pair. Label-set ordering inside a
+// single metric line is determined by the writer (prom.go) — the contract is
+// stable within a Prometheus name group; the order is not asserted by tests
+// at the per-label level beyond set-equality.
+type Label struct {
+	Key   string
+	Value string
+}
+
+// statusClassRE matches the trailing _Nxx (N ∈ 1..5) per Rule SN4. Capture
+// group 1 is the base (without the _Nxx); capture group 2 is the single
+// class digit. The regex is anchored at end of string.
+var statusClassRE = regexp.MustCompile(`^(.+)_([1-5])xx$`)
+
+// flattenToProm transforms an internal hierarchical-dotted name to the
+// Prometheus exposition form per Rules SN1–SN8 (ADR-0061; SPEC §10.1).
+//
+//   SN1: cluster.<n>.<rest>     → envoy_cluster_<rest> + label envoy_cluster_name=<n>
+//   SN2: http.<stat_prefix>.<rest> → envoy_http_<rest> + label envoy_http_conn_manager_prefix=<stat_prefix>
+//   SN3: listener.<addr>.<rest> → envoy_listener_<rest> + label envoy_listener_address=<addr>
+//   SN4: <base>_Nxx             → <base>_xx + label envoy_response_code_class=N (N ∈ 1..5)
+//   SN5: server.<rest>          → envoy_server_<rest> + no labels
+//   SN6: HELP text best-effort English (handled by prom.go via helpText map)
+//   SN7: histograms not emitted (Task-2-time NewCounter/NewGauge are the only
+//        registry methods; absence is the contract)
+//   SN8: per-endpoint cluster stats not emitted (similarly absent)
+//
+// Returns the Prometheus base name + the extracted label set + nil on success.
+// Returns "", nil, error on names that match no top-level rule.
+func flattenToProm(internal string) (string, []Label, error) {
+	var labels []Label
+	var rest, base string
+	switch {
+	case strings.HasPrefix(internal, "cluster."):
+		// Rule SN1
+		tail := strings.TrimPrefix(internal, "cluster.")
+		dot := strings.Index(tail, ".")
+		if dot < 0 {
+			return "", nil, fmt.Errorf("stats: name %q matches cluster.* but has no <rest> segment", internal)
+		}
+		labels = append(labels, Label{Key: "envoy_cluster_name", Value: tail[:dot]})
+		rest = tail[dot+1:]
+		base = "envoy_cluster_" + rest
+	case strings.HasPrefix(internal, "http."):
+		// Rule SN2
+		tail := strings.TrimPrefix(internal, "http.")
+		dot := strings.Index(tail, ".")
+		if dot < 0 {
+			return "", nil, fmt.Errorf("stats: name %q matches http.* but has no <rest> segment", internal)
+		}
+		labels = append(labels, Label{Key: "envoy_http_conn_manager_prefix", Value: tail[:dot]})
+		rest = tail[dot+1:]
+		base = "envoy_http_" + rest
+	case strings.HasPrefix(internal, "listener."):
+		// Rule SN3
+		tail := strings.TrimPrefix(internal, "listener.")
+		dot := strings.Index(tail, ".")
+		if dot < 0 {
+			return "", nil, fmt.Errorf("stats: name %q matches listener.* but has no <rest> segment", internal)
+		}
+		labels = append(labels, Label{Key: "envoy_listener_address", Value: tail[:dot]})
+		rest = tail[dot+1:]
+		base = "envoy_listener_" + rest
+	case strings.HasPrefix(internal, "server."):
+		// Rule SN5
+		rest = strings.TrimPrefix(internal, "server.")
+		base = "envoy_server_" + rest
+	default:
+		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
+	}
+
+	// Rule SN4: detect the trailing _Nxx and split.
+	if m := statusClassRE.FindStringSubmatch(base); m != nil {
+		base = m[1] + "_xx"
+		labels = append([]Label{{Key: "envoy_response_code_class", Value: m[2]}}, labels...)
+	}
+
+	return base, labels, nil
+}
+
+// escapeLabelValue escapes a label value per the Prometheus text-format spec:
+//   \  → \\
+//   "  → \"
+//   \n → \n  (literal two-char backslash-n in the output)
+// Other characters pass through unchanged.
+func escapeLabelValue(s string) string {
+	if !strings.ContainsAny(s, `\"`+"\n") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// helpText maps each Prometheus name emitted by 06.1 to a static English
+// description per BRAINSTORM §4.5. Per Rule SN6, HELP text is NOT byte-equal
+// to Envoy's HELP text — the differential equivalence claim is on values +
+// label keys + types only. The 10 entries cover the 13 unique Prometheus
+// names emitted by 06.1 (the four _Nxx counters per HCM and per cluster
+// collapse to envoy_http_downstream_rq_xx and envoy_cluster_upstream_rq_xx
+// respectively per Rule SN4).
+var helpText = map[string]string{
+	"envoy_listener_downstream_cx_total":  "Total connections accepted on the listener.",
+	"envoy_listener_downstream_cx_active": "Active connections on the listener.",
+	"envoy_http_downstream_rq_total":      "Total requests received by the HTTP connection manager.",
+	"envoy_http_downstream_rq_xx":         "Requests received by the HTTP connection manager, by response code class.",
+	"envoy_cluster_upstream_rq_total":     "Total requests dispatched to upstream clusters.",
+	"envoy_cluster_upstream_rq_xx":        "Requests dispatched to upstream clusters, by response code class.",
+	"envoy_cluster_upstream_cx_total":     "Total connections established to upstream clusters.",
+	"envoy_cluster_upstream_cx_active":    "Active connections to upstream clusters.",
+	"envoy_cluster_membership_total":      "Number of endpoints in the cluster.",
+	"envoy_server_live":                   "1 if the server is live, 0 otherwise.",
+}
