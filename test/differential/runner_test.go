@@ -26,6 +26,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -113,6 +114,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 				// orphaned backend keeps the test process's stderr fd open
 				// and Cmd.WaitDelay times out causing a spurious package-
 				// level FAIL.
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPStatusHeader:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPStatusHeaderBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
 				if cmd.Process != nil {
 					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				}
@@ -241,6 +260,15 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	}
 	if !vAdm.Equal {
 		t.Errorf("admin differential mismatch:\n%s", vAdm.HexDump)
+	}
+
+	// 10. Optional stats equivalence assertion (phase 06.1, ADR-0062). Fires
+	// when the driver implements fixture.StatsAsserter. The runner passes both
+	// admin addrs it already holds; the driver performs the scrape-and-diff in-
+	// band (SPEC §12 #6 in-band discipline — no generic StatsExpectations data
+	// structure extension).
+	if sa, ok := d.(fixture.StatsAsserter); ok {
+		sa.AssertStats(t, ref.AdminAddr(), subj.AdminAddr())
 	}
 }
 
@@ -429,6 +457,24 @@ func startHTTPSH2Backend(ctx context.Context, repoRoot string, port, idx int) (*
 	// the deferred cleanup can kill the entire group atomically. Without this,
 	// killing `go run` leaves the actual backend binary orphaned and holding
 	// the test's stderr fd, causing Cmd.WaitDelay to fire on test exit.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	return cmd, nil
+}
+
+// startHTTPStatusHeaderBackend spawns the fixture-0005 HTTP/1.1 status-header
+// backend subprocess on port. The backend reads the X-Backend-Status request
+// header and returns that status code; absent or invalid → 200. No TLS.
+// Introduced for fixture 0005's controlled-502 path (ADR-0062).
+func startHTTPStatusHeaderBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0005-prometheus-stats/backends",
+		"--port", fmt.Sprintf("%d", port),
+	)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start: %w", err)

@@ -1,0 +1,39 @@
+# Phase 06.1 expectations: per-counter delta-equality, per-gauge snapshot-equality
+# under the 5-request workload [200, 200, 404, 200, 502].
+counters:
+  - name: http.ingress_http.downstream_rq_total
+    delta: 5
+  - name: http.ingress_http.downstream_rq_2xx
+    delta: 3
+  - name: http.ingress_http.downstream_rq_3xx
+    delta: 0
+  - name: http.ingress_http.downstream_rq_4xx
+    delta: 1
+  - name: http.ingress_http.downstream_rq_5xx
+    delta: 1
+  - name: cluster.c0.upstream_rq_total
+    delta: 4   # 404 is HCM-direct, never reaches cluster
+  - name: cluster.c0.upstream_rq_2xx
+    delta: 3
+  - name: cluster.c0.upstream_rq_3xx
+    delta: 0
+  - name: cluster.c0.upstream_rq_4xx
+    delta: 0
+  - name: cluster.c0.upstream_rq_5xx
+    delta: 1
+  - name: listener.<addr>.downstream_cx_total
+    delta_min: 1   # keepalive may collapse
+  - name: cluster.c0.upstream_cx_total
+    delta_min: 1
+gauges:
+  - name: listener.<addr>.downstream_cx_active
+    after: 0
+  - name: cluster.c0.upstream_cx_active
+    after: 0
+  - name: cluster.c0.membership_total
+    after: 1
+  - name: server.live
+    after: 1
+allow_list_discipline: |
+  Any Prometheus metric NAME not in this 17-name table is ignored by the
+  differential. HELP-text values are ignored (Rule SN6).

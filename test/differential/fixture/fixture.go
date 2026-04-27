@@ -58,6 +58,24 @@ type DistributionAsserter interface {
 	AssertDistribution(refCounts, subjCounts []uint64) error
 }
 
+// TB is the minimal testing interface that *testing.T satisfies. It is used by
+// StatsAsserter so that fixture.go avoids a direct import of the "testing"
+// package (which would leak into driver packages that register via init()).
+type TB interface {
+	Errorf(format string, args ...any)
+	Fatalf(format string, args ...any)
+	Helper()
+}
+
+// StatsAsserter is an optional driver-side interface the runner invokes after
+// ProbeAdmin when the driver implements it. Per SPEC §12 #6 (in-band
+// assertion, no generic StatsExpectations data structure): the runner passes
+// both admin addresses it already holds, and the driver performs the
+// scrape-and-diff assertion in-band. Introduced by ADR-0062.
+type StatsAsserter interface {
+	AssertStats(t TB, refAdminAddr, subjAdminAddr string)
+}
+
 // DriverRegistry maps fixture names to their registered drivers. Drivers register
 // themselves from init() via RegisterFixture.
 var DriverRegistry = map[string]Driver{}
@@ -120,6 +138,14 @@ const (
 	// in-process accept counter is NOT incremented by these requests; drivers
 	// that use HTTPSH2 must derive distribution from response bodies instead.
 	HTTPSH2 BackendKind = 2
+	// HTTPStatusHeader is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0005-prometheus-stats/backends/main.go on the pre-allocated
+	// port. The backend reads the X-Backend-Status request header and returns the
+	// requested status code; absent or invalid → 200. No TLS. Introduced by
+	// fixture 0005 for the controlled-502 path in the stats differential
+	// (ADR-0062). Because the backend is a subprocess, the runner's in-process
+	// accept counter is NOT incremented.
+	HTTPStatusHeader BackendKind = 3
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

@@ -2245,3 +2245,49 @@ This also matches Envoy's default tag-extraction behavior: `enable_per_endpoint_
 ### Lands-in-task
 
 Phase-06.1 Task 8 (the cluster-side metric-allocation loop in `internal/cluster/manager.go`; first use of the cluster-level-only metric set). Supersedes nothing.
+
+---
+
+## ADR-0062: Differential equivalence shape for stats output
+
+**Status:** Accepted
+**Date:** 2026-04-27
+**Doctrine:** D-3.4 (record durable design rationale where context-isolation requires it)
+
+### Context
+
+SPEC §6 defines 17 stat names (12 counters + 5 gauges) that fixture 0005-prometheus-stats must verify. The differential harness must assert equivalence between upstream Envoy and envoy-go on these names. Two semantic problems arise:
+
+1. **Counter semantics**: envoy-go (ADR-0056: per-request fresh upstream connection) and upstream Envoy (keepalive connection pooling) produce different absolute `upstream_cx_total` and `listener.downstream_cx_total` counts for the same workload. Absolute equality would produce false failures.
+
+2. **Gauge semantics**: Connection-activity gauges (`upstream_cx_active`, `downstream_cx_active`) must reach 0 after the workload drains; `server.live` and `membership_total` must be snapshot-equal after the workload because their values are not traffic-driven.
+
+3. **HELP-text noise**: Prometheus `/stats/prometheus` HELP text is documentation only — it is not a behavioral observable. Asserting HELP-text equality would produce spurious failures when upstream Envoy changes wording.
+
+### Decision
+
+The fixture 0005 stats differential asserts equivalence on the 17-name allow-list using three rules:
+
+1. **Per-counter delta-equality**: For each counter in the allow-list, compute `delta = after.value − before.value` on both sides. Assert `ref_delta == subj_delta`. An exception is granted for `cx_total`-class names (see rule 3).
+
+2. **Per-gauge snapshot-equality**: For each gauge in the allow-list, assert `ref_after == subj_after`. (Before-values are not compared because gauges can be non-zero before the drive run starts.)
+
+3. **`cx_total` delta-min `≥ 1` (no equality)**: `cluster.<n>.upstream_cx_total` and `listener.<addr>.downstream_cx_total` use `delta_min ≥ 1` on each side independently — no equality assertion between sides. This accommodates the structural difference: envoy-go opens a fresh connection per request (N connections for N requests), while upstream Envoy's keepalive pool may reuse a single connection across the entire workload, yielding `ref_delta = 1` vs `subj_delta = N`.
+
+4. **HELP-text values ignored (Rule SN6)**: HELP-text lines and TYPE-annotation lines in the Prometheus exposition are not compared. Only sample-line values are extracted and asserted.
+
+5. **Unknown names ignored**: Any metric name not in the 17-name allow-list is silently dropped by the parser. The assertion only fires on the allow-listed names.
+
+6. **In-band assertion discipline (SPEC §12 #6)**: The stats assertion is implemented as an optional `StatsAsserter` interface on the driver, analogous to `DistributionAsserter` and `HTTPExpectations`. The runner invokes it after ProbeAdmin. No generic `StatsExpectations` data structure is introduced.
+
+### Consequences
+
+- (a) Fixture 0005 (`test/fixtures/0005-prometheus-stats/`) implements this contract via `AssertStats` / `AssertStatsEquivalence` in `driver/driver.go`.
+- (b) Only the 17 names emitted within the allow-list are gated. Any additional stat names that either implementation happens to emit are silently ignored and do not affect the gate result.
+- (c) `BEHAVIOR_CONTRACT.md § Equivalence Matrix` row 19 (the placeholder "Stats output: TBD") is effectively superseded by this ADR's equivalence shape; the concrete row will be filled in at Task 15 (the BEHAVIOR_CONTRACT stats row update).
+- (d) The `fixture.StatsAsserter` interface and `fixture.TB` minimal-testing interface are introduced in `test/differential/fixture/fixture.go` at Task 14.
+- (e) Future phases that add new stat names to the allow-list must update both SPEC §6 and the `applyToSnapshot` dispatch table in `driver/driver.go`.
+
+### Lands-in-task
+
+Phase-06.1 Task 14 (fixture 0005-prometheus-stats + runner registration). Supersedes nothing.

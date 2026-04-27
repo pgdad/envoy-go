@@ -997,3 +997,87 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.014s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.028s
 ```
+
+## Task 14 — differential fixture `0005-prometheus-stats` + runner registration [ADR-0062]
+
+**Commits:** TBD (impl)
+
+Anchored: SPEC §6 (17-name allow-list — 12 counters + 5 gauges), §7.3 (expectations.yaml shape), §8 (ADR-0062 sketch), §12 #6 (in-band assertion discipline / `StatsAsserter` interface), §14 (fixture gate-(a) for task 14). Introduced `BackendKind=3` (`HTTPStatusHeader`) subprocess backend. Introduced `fixture.TB` and `fixture.StatsAsserter` optional interfaces. `driver.go` implements `Driver`, `BackendKindAware`, `StatsAsserter`; `AssertStatsEquivalence` exported for testability. Two-pass design: Drive pass saves listener addrs; `AssertStats` does scrape-before + fresh 5-request drive + 200ms drain + scrape-after per side. `Connection: close` in the backend forces Envoy to drain upstream keepalive connections between Drive and AssertStats passes.
+
+**Deviation #7 — path correction (test/differential/ vs test/fixtures/).** PLAN.md step text says `test/differential/0005-prometheus-stats/` for fixture files; the actual repository convention (established by fixtures 0001–0004) is `test/fixtures/NNNN-name/`. All new files landed under `test/fixtures/0005-prometheus-stats/` matching the established layout. No SPEC drift.
+
+**Deviation #8 — `delta_min` rows assert each-side `≥ 1` only (no equality).** Initial design had `delta_min=true` rows assert `ref_delta == subj_delta` in addition to `>= 1`. This failed because Envoy's keepalive pool produces `ref_delta=1` (one pooled connection) across the Drive pass while envoy-go (ADR-0056, no pooling) produces `subj_delta=5` (one per request). Fixed by removing equality assertion for `delta_min=true` rows — only `>= 1` is enforced on each side independently.
+
+**Deviation #9 — `DisableKeepAlives=true` on all drive HTTP clients.** PLAN sketch did not specify keepalive disposition for the Drive HTTP client. Without `DisableKeepAlives`, the downstream connection from the driver to the reference Envoy listener is held open between Drive and AssertStats passes, leaving `downstream_cx_active=1` on the ref side while envoy-go (per-request conn close, ADR-0056) reports 0. Fixed by setting `DisableKeepAlives: true` on all Drive-path HTTP clients in `DriveReference` and `DriveSubject`.
+
+**Deviation #10 — `Connection: close` in backend.** PLAN sketch did not specify upstream connection lifecycle in the HTTP backend. Without `Connection: close`, Envoy keeps its upstream connection to the backend alive indefinitely, leaving `upstream_cx_active=1` on the ref side after the Drive pass while envoy-go reports 0. Fixed by setting `w.Header().Set("Connection", "close")` in `handleRequest`.
+
+**Carry-forward Minors:**
+- M-1: `expectations.yaml` is parsed by `driver.go` at init time but could alternatively be read at AssertStats time to allow per-run parameterization. Current approach (hardcoded `Snapshot` deltas in `AssertStatsEquivalence`) is simpler and sufficient for Phase 06.1 scope.
+- M-2: `parsePromSnapshot` ignores unknown metric names silently with no debug-level log. If a future name is misspelled in the allow-list it will silently yield 0 without any diagnostic. Consider adding a `testing.Logf`-level dump of unrecognized names in debug builds.
+- M-3: `AssertStats` uses a hardcoded 200ms drain wait. This is sufficient for the current workload but could produce flaky failures under CI load spikes. A future hardening pass could replace the sleep with a poll-until-zero on the active-gauge endpoints.
+
+**Outputs:**
+```
+$ go test -race -count=1 -v ./test/fixtures/0005-prometheus-stats/...
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+=== RUN   TestScrapeAndParse_HappyPath
+--- PASS: TestScrapeAndParse_HappyPath (0.00s)
+=== RUN   TestScrapeAndParse_IgnoresUnknownNames
+--- PASS: TestScrapeAndParse_IgnoresUnknownNames (0.00s)
+=== RUN   TestScrapeAndParse_WrongClusterName
+--- PASS: TestScrapeAndParse_WrongClusterName (0.00s)
+=== RUN   TestScrapeAndParse_EmptyBody
+--- PASS: TestScrapeAndParse_EmptyBody (0.00s)
+=== RUN   TestAssertStatsEquivalence_Pass
+--- PASS: TestAssertStatsEquivalence_Pass (0.00s)
+=== RUN   TestAssertStatsEquivalence_CounterMismatch
+--- PASS: TestAssertStatsEquivalence_CounterMismatch (0.00s)
+=== RUN   TestAssertStatsEquivalence_GaugeMismatch
+--- PASS: TestAssertStatsEquivalence_GaugeMismatch (0.00s)
+=== RUN   TestAssertStatsEquivalence_DeltaMinViolation
+--- PASS: TestAssertStatsEquivalence_DeltaMinViolation (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.007s
+
+$ go test ./test/differential/ -run TestDifferential/0005 -v
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0005-prometheus-stats
+--- PASS: TestDifferential/0005-prometheus-stats (2.27s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.359s
+
+$ go vet ./... && go build ./... && go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.515s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.081s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.054s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.061s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.279s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.509s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.042s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.063s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.038s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.099s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.177s
+ok  	github.com/esalaine/envoy-go/test/differential	11.341s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.017s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.017s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.018s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.017s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.031s
+```
