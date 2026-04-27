@@ -282,3 +282,135 @@ PASS
 ok  	github.com/esalaine/envoy-go/internal/stats	1.024s
 $ go vet ./...
 ```
+
+## Task 6 — admin /stats/prometheus endpoint + server.live gauge with sync.Once
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Created `internal/admin/prometheus.go` (`handlePrometheus(*stats.Registry) http.HandlerFunc` — sets the `text/plain; version=0.0.4; charset=utf-8` Content-Type, writes 200, then `stats.WriteProm`s the Registry; write errors are log-and-ignore per BRAINSTORM §5.3). Created `internal/admin/prometheus_test.go` with three table-style tests (Content-Type, empty-registry → empty body / 200, and full round-trip exercising the listener-segment SN1 flatten + `server.live` rendering). Widened `admin.New(addr string)` to `admin.New(addr string, registry *stats.Registry)` and added the matching `liveGauge *stats.Gauge` + `liveOnce sync.Once` fields; allocation of `server.live` happens in `New` (per SPEC §5.4 + §12 #3, registry must be pre-Freeze) and the LIVE-path `Set(1)` is wrapped in `sync.Once` so only the first 200/LIVE flips it. `Start()` registers `/stats/prometheus` alongside `/ready`. Updated all six existing `New(addr)` call sites in `admin_test.go` and added `TestServer_StatsPrometheusRouteRegistered` (live HTTP probe sanity-check) plus `TestServer_LiveGaugeSetOnceFlippedAtFirstReady200` (asserts gauge==0 pre-MarkReady, ==1 after MarkReady + 3× /ready). Extended `doc.go`'s package preamble. No new ADR. **One concern surfaced (see report):** PLAN's Task-6 "Out of scope" block forbids touching `cmd/envoy-go/main.go`, but its `admin.New(adminAddr)` call (introduced in phase 02) is the cascade target of the `New` signature change — `go vet ./...` therefore reports `cmd/envoy-go/main.go:57: not enough arguments in call to admin.New` while `go vet ./internal/...` is clean. Per the dispatch instructions ("if compilation fails elsewhere, that means there IS a hidden call site you must surface as a CONCERN, not silently fix"), the `cmd/envoy-go/main.go` edit is left for Task 7+ (the integration tasks that thread the Registry through main).
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/admin/ ./internal/stats/ -v
+=== RUN   TestServer_ReadyState
+--- PASS: TestServer_ReadyState (0.01s)
+=== RUN   TestServer_PreInit_BeforeMarkReady
+--- PASS: TestServer_PreInit_BeforeMarkReady (0.01s)
+=== RUN   TestServer_MarkReady_IsAtomic
+--- PASS: TestServer_MarkReady_IsAtomic (0.02s)
+=== RUN   TestServer_Close_Idempotent
+--- PASS: TestServer_Close_Idempotent (0.00s)
+=== RUN   TestServer_StatsPrometheusRouteRegistered
+--- PASS: TestServer_StatsPrometheusRouteRegistered (0.00s)
+=== RUN   TestServer_LiveGaugeSetOnceFlippedAtFirstReady200
+--- PASS: TestServer_LiveGaugeSetOnceFlippedAtFirstReady200 (0.00s)
+=== RUN   TestHandlePrometheus_ContentType
+--- PASS: TestHandlePrometheus_ContentType (0.00s)
+=== RUN   TestHandlePrometheus_EmptyRegistry
+--- PASS: TestHandlePrometheus_EmptyRegistry (0.00s)
+=== RUN   TestHandlePrometheus_RoundTrip
+--- PASS: TestHandlePrometheus_RoundTrip (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	1.054s
+=== RUN   TestCounter_Inc_Sequential
+--- PASS: TestCounter_Inc_Sequential (0.00s)
+=== RUN   TestCounter_Add_Sequential
+--- PASS: TestCounter_Add_Sequential (0.00s)
+=== RUN   TestCounter_Inc_RaceClean
+--- PASS: TestCounter_Inc_RaceClean (0.01s)
+=== RUN   TestGauge_IncDecSet_Sequential
+--- PASS: TestGauge_IncDecSet_Sequential (0.00s)
+=== RUN   TestGauge_NegativeValueAllowed
+--- PASS: TestGauge_NegativeValueAllowed (0.00s)
+=== RUN   TestGauge_Add_PositiveAndNegative
+--- PASS: TestGauge_Add_PositiveAndNegative (0.00s)
+=== RUN   TestGauge_RaceClean_ConcurrentIncDecSet
+--- PASS: TestGauge_RaceClean_ConcurrentIncDecSet (0.00s)
+=== RUN   TestGauge_Format_NegativeRendered
+--- PASS: TestGauge_Format_NegativeRendered (0.00s)
+=== RUN   TestFlattenToProm_Listener
+--- PASS: TestFlattenToProm_Listener (0.00s)
+=== RUN   TestFlattenToProm_HCM
+--- PASS: TestFlattenToProm_HCM (0.00s)
+=== RUN   TestFlattenToProm_Cluster
+--- PASS: TestFlattenToProm_Cluster (0.00s)
+=== RUN   TestFlattenToProm_StatusClass_HCM
+--- PASS: TestFlattenToProm_StatusClass_HCM (0.00s)
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_1xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_2xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_3xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_4xx
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_5xx
+--- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_1xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_2xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_3xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_4xx (0.00s)
+    --- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits/cluster.c0.upstream_rq_5xx (0.00s)
+=== RUN   TestFlattenToProm_Server
+--- PASS: TestFlattenToProm_Server (0.00s)
+=== RUN   TestFlattenToProm_Invalid_NoMatchingRule
+--- PASS: TestFlattenToProm_Invalid_NoMatchingRule (0.00s)
+=== RUN   TestEscapeLabelValue
+=== RUN   TestEscapeLabelValue/plain
+=== RUN   TestEscapeLabelValue/with_"quotes"
+=== RUN   TestEscapeLabelValue/with\backslash
+=== RUN   TestEscapeLabelValue/with_newline
+=== RUN   TestEscapeLabelValue/all_"\_together
+--- PASS: TestEscapeLabelValue (0.00s)
+    --- PASS: TestEscapeLabelValue/plain (0.00s)
+    --- PASS: TestEscapeLabelValue/with_"quotes" (0.00s)
+    --- PASS: TestEscapeLabelValue/with\backslash (0.00s)
+    --- PASS: TestEscapeLabelValue/with_newline (0.00s)
+    --- PASS: TestEscapeLabelValue/all_"\_together (0.00s)
+=== RUN   TestHelpText_Coverage
+--- PASS: TestHelpText_Coverage (0.00s)
+=== RUN   TestWriteProm_EmptyRegistry
+--- PASS: TestWriteProm_EmptyRegistry (0.00s)
+=== RUN   TestWriteProm_SingleCounter
+--- PASS: TestWriteProm_SingleCounter (0.00s)
+=== RUN   TestWriteProm_StatusClassCollapse
+--- PASS: TestWriteProm_StatusClassCollapse (0.00s)
+=== RUN   TestWriteProm_AlphabeticallySortedGroups
+--- PASS: TestWriteProm_AlphabeticallySortedGroups (0.00s)
+=== RUN   TestWriteProm_GaugeRendersNegative
+--- PASS: TestWriteProm_GaugeRendersNegative (0.00s)
+=== RUN   TestWriteProm_EscapesLabelValues
+--- PASS: TestWriteProm_EscapesLabelValues (0.00s)
+=== RUN   TestRegistry_NewCounter_HappyPath
+--- PASS: TestRegistry_NewCounter_HappyPath (0.00s)
+=== RUN   TestRegistry_NewCounter_DuplicateNamePanics
+--- PASS: TestRegistry_NewCounter_DuplicateNamePanics (0.00s)
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/#00
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/1leading-digit
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with_space
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with-dash
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/trailing.
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with$char
+--- PASS: TestRegistry_NewCounter_InvalidNamePanics (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/#00 (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/1leading-digit (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with_space (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with-dash (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/trailing. (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with$char (0.00s)
+=== RUN   TestRegistry_Walk_RegistrationOrderInvariantNotPromised
+--- PASS: TestRegistry_Walk_RegistrationOrderInvariantNotPromised (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeRegisterPanics
+--- PASS: TestRegistry_Freeze_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeNewGaugePanics
+--- PASS: TestRegistry_Freeze_PostFreezeNewGaugePanics (0.00s)
+=== RUN   TestRegistry_Freeze_Idempotent
+--- PASS: TestRegistry_Freeze_Idempotent (0.00s)
+=== RUN   TestRegistry_Walk_ConcurrentWithIncs_RaceClean
+--- PASS: TestRegistry_Walk_ConcurrentWithIncs_RaceClean (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	1.023s
+$ go vet ./internal/...
+$ go vet ./...
+# github.com/esalaine/envoy-go/cmd/envoy-go
+# [github.com/esalaine/envoy-go/cmd/envoy-go]
+vet: cmd/envoy-go/main.go:57:31: not enough arguments in call to admin.New
+	have (string)
+	want (string, *stats.Registry)
+```

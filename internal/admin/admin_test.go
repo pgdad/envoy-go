@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func TestServer_ReadyState(t *testing.T) {
-	s := New("127.0.0.1:0")
+	s := New("127.0.0.1:0", stats.NewRegistry())
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -52,7 +54,7 @@ func TestServer_ReadyState(t *testing.T) {
 }
 
 func TestServer_PreInit_BeforeMarkReady(t *testing.T) {
-	s := New("127.0.0.1:0")
+	s := New("127.0.0.1:0", stats.NewRegistry())
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -78,7 +80,7 @@ func TestServer_PreInit_BeforeMarkReady(t *testing.T) {
 }
 
 func TestServer_MarkReady_IsAtomic(t *testing.T) {
-	s := New("127.0.0.1:0")
+	s := New("127.0.0.1:0", stats.NewRegistry())
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -110,13 +112,13 @@ func TestServer_MarkReady_IsAtomic(t *testing.T) {
 }
 
 func TestServer_Close_Idempotent(t *testing.T) {
-	s := New("127.0.0.1:0")
+	s := New("127.0.0.1:0", stats.NewRegistry())
 	// Close before Start.
 	if err := s.Close(); err != nil {
 		t.Errorf("Close before Start: %v", err)
 	}
 	// Close after Start.
-	s2 := New("127.0.0.1:0")
+	s2 := New("127.0.0.1:0", stats.NewRegistry())
 	_, err := s2.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -127,5 +129,50 @@ func TestServer_Close_Idempotent(t *testing.T) {
 	// Second Close.
 	if err := s2.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
+	}
+}
+
+func TestServer_StatsPrometheusRouteRegistered(t *testing.T) {
+	r := stats.NewRegistry()
+	srv := New("127.0.0.1:0", r)
+	addr, err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = srv.Close() }()
+	resp, err := http.Get("http://" + addr + "/stats/prometheus")
+	if err != nil {
+		t.Fatalf("GET /stats/prometheus: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/plain; version=0.0.4; charset=utf-8" {
+		t.Errorf("Content-Type = %q", got)
+	}
+}
+
+func TestServer_LiveGaugeSetOnceFlippedAtFirstReady200(t *testing.T) {
+	r := stats.NewRegistry()
+	srv := New("127.0.0.1:0", r)
+	addr, err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = srv.Close() }()
+	// Initially: server.live == 0, /ready returns 503.
+	resp503, _ := http.Get("http://" + addr + "/ready")
+	_ = resp503.Body.Close()
+	if got := srv.liveGauge.Load(); got != 0 {
+		t.Errorf("server.live before MarkReady = %d, want 0", got)
+	}
+	srv.MarkReady()
+	for i := 0; i < 3; i++ {
+		resp, _ := http.Get("http://" + addr + "/ready")
+		_ = resp.Body.Close()
+	}
+	if got := srv.liveGauge.Load(); got != 1 {
+		t.Errorf("server.live after MarkReady + 3× /ready = %d, want 1", got)
 	}
 }
