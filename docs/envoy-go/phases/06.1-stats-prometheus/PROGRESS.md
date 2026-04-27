@@ -25,3 +25,51 @@ ad469309eb673a738956f67c93a70bd70894c496
 $ ls internal/stats/
 doc.go
 ```
+
+## Task 2 — `internal/stats/registry.go` + `counter.go` + LBP-1 enforcement [ADR-0059, ADR-0060]
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Created `internal/stats/registry.go` (Registry + LBP-1 freeze), `counter.go` (atomic-Uint64 Counter), minimal `gauge.go` stub (Name/Type/Format placeholder; Inc/Dec/Set/Load + atomic.Int64 backing land at Task 3), `registry_test.go` (8 tests), `counter_test.go` (3 tests). Rewrote `doc.go` from phase-00 stub. ADR-0059 (Internal Stats Store architecture) + ADR-0060 (Histograms deferred) appended to DECISIONS.md. One PLAN deviation noted: PLAN's regex literal `^[a-zA-Z_][a-zA-Z0-9_.]*$` accepted the test fixture `"trailing."`, which the test list (`TestRegistry_NewCounter_InvalidNamePanics`) explicitly requires to be rejected; tightened the regex to `^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$` (alpha/underscore prefix, optional middle, must end in non-dot) and added a docstring comment explaining "dots are segment separators, not terminators." All 11 tests + race detector clean.
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/stats/ -v
+=== RUN   TestCounter_Inc_Sequential
+--- PASS: TestCounter_Inc_Sequential (0.00s)
+=== RUN   TestCounter_Add_Sequential
+--- PASS: TestCounter_Add_Sequential (0.00s)
+=== RUN   TestCounter_Inc_RaceClean
+--- PASS: TestCounter_Inc_RaceClean (0.01s)
+=== RUN   TestRegistry_NewCounter_HappyPath
+--- PASS: TestRegistry_NewCounter_HappyPath (0.00s)
+=== RUN   TestRegistry_NewCounter_DuplicateNamePanics
+--- PASS: TestRegistry_NewCounter_DuplicateNamePanics (0.00s)
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/#00
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/1leading-digit
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with_space
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with-dash
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/trailing.
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics/with$char
+--- PASS: TestRegistry_NewCounter_InvalidNamePanics (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/#00 (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/1leading-digit (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with_space (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with-dash (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/trailing. (0.00s)
+    --- PASS: TestRegistry_NewCounter_InvalidNamePanics/with$char (0.00s)
+=== RUN   TestRegistry_Walk_RegistrationOrderInvariantNotPromised
+--- PASS: TestRegistry_Walk_RegistrationOrderInvariantNotPromised (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeRegisterPanics
+--- PASS: TestRegistry_Freeze_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeNewGaugePanics
+--- PASS: TestRegistry_Freeze_PostFreezeNewGaugePanics (0.00s)
+=== RUN   TestRegistry_Freeze_Idempotent
+--- PASS: TestRegistry_Freeze_Idempotent (0.00s)
+=== RUN   TestRegistry_Walk_ConcurrentWithIncs_RaceClean
+--- PASS: TestRegistry_Walk_ConcurrentWithIncs_RaceClean (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	1.020s
+$ go vet ./...
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0060: Histograms deferred from 06.1
+```

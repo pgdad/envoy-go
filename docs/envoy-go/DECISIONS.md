@@ -2060,3 +2060,78 @@ The upstream-TLS code path (phase-03's `Cluster.Dial` TLS branch + phase-05.2's 
 ### Lands-in-task
 
 Phase-05.2 Task 14 (first invocation of fixture 0004's full-stack HTTPS h2 surface — the closing ADR before the BEHAVIOR_CONTRACT in-place edit at Task 15). The non-monotonic ADR-number-vs-commit-order sequence (0055 → 0056 → 0058 → 0057) is intentional per PLAN's `## ADRs introduced by this plan` topical-vs-commit-order rationale and per ADR-0058's own `Lands-in-task` cross-reference.
+
+## ADR-0059: Internal Stats Store architecture
+
+**Status:** Accepted
+**Date:** 2026-04-27
+**Doctrine:** D-3.2 (no third-party-runtime-import for runtime-critical surfaces) + D-3.3 (own the canonical observation surface).
+**Supersedes:** nothing.
+
+### Context
+
+Phase 06.1 introduces a `/stats/prometheus` admin endpoint (per phase-06.1 SPEC §1) that exposes the proxy's counters and gauges in the Prometheus exposition text format. The architectural question is whether to depend on `github.com/prometheus/client_golang` (the canonical Go Prometheus library, with its own `Registry`, `Counter`, `Gauge`, and exposition writer) or to build a thin in-tree atomic-counter Registry under `internal/stats` and emit Prometheus text via a hand-rolled writer.
+
+Phase-06.1 BRAINSTORM §2.1 anticipates that future Observability-family phases (gRPC ALS, OTLP push, statsd UDP emitter) will need to hook a *registry* (something they can iterate to extract metric values), not a Prometheus client. Investing in a Prometheus client now would either (a) couple every future sink to a Prometheus-shaped intermediate, requiring conversion shims, or (b) duplicate the registry abstraction in `internal/stats` anyway, in which case the Prometheus client adds dependency surface without architectural value. This is the same architectural choice Envoy made in `source/common/stats/` (an in-tree stats store with adapters per sink).
+
+Doctrine D-3.2 (no third-party-runtime-import for runtime-critical surfaces) and D-3.3 (own the canonical observation surface) jointly preclude option (a). Doctrine D-3.6 (every phase is a green build) precludes option (b) at this scale (the duplication would be a follow-up tech-debt entry).
+
+### Decision
+
+A thin in-tree atomic-counter `Registry` under `internal/stats`:
+- `Registry` holds a slice of `Metric` values (the interface satisfied by `*Counter` and `*Gauge`) and a name→Metric map for duplicate-detection at registration time.
+- `Counter` is backed by `sync/atomic.Uint64`; `Inc` and `Add(delta uint64)` are lock-free atomics. `Gauge` (Task 3) is backed by `sync/atomic.Int64`; `Inc`, `Dec`, `Set(int64)` are lock-free atomics.
+- The Prometheus exposition text format is emitted by a hand-rolled writer (`internal/stats/prom.go`, lands at Task 5) that walks the registry, sorts the result, and writes `# HELP` / `# TYPE` / metric-line triplets directly to an `io.Writer`. No `prometheus/client_golang` runtime dependency.
+- `Walk(fn func(Metric))` holds `r.mu.RLock` for the duration of the iteration; the slice is a stable snapshot under LBP-1 (see ADR-0060's companion concept the LBP-1 invariant, also introduced here for symmetry).
+- The LBP-1 invariant ("list before play") — `Registry.Freeze()` is called at boot-end (after admin server starts accepting, before listener manager begins accepting connections); subsequent `NewCounter` / `NewGauge` calls panic with `"stats: registry frozen: cannot register %q post-boot"`. This is what makes the Walk-under-RLock-plus-atomic-Load read path lock-free against hot-path increments — once the slice is frozen, the only contention on `r.mu` is RLock-vs-RLock among concurrent scrapes (which the `RWMutex` allows).
+
+Alternatives considered:
+- **(A) `prometheus/client_golang` directly.** Rejected per the future-sink-coupling argument above. Also: `client_golang`'s `Registry` is not iteration-friendly without using its `Gather()` method (which returns `[]*dto.MetricFamily` — a Prometheus protobuf shape that's awkward to bridge to gRPC ALS or OTLP).
+- **(B) `expvar` + custom serializer.** Rejected because `expvar` lacks a histogram primitive (and while ADR-0060 defers histograms from 06.1, it does not preclude them from later sub-phases — choosing `expvar` would make that future work harder).
+- **(C) Build the in-tree Registry as a thin wrapper around `prometheus/client_golang`'s primitives.** Rejected for the same reason as (A): the dependency is still there, just with a façade.
+
+### Consequences
+
+- (a) The `internal/stats` package's external dependencies are limited to the Go stdlib (`fmt`, `regexp`, `strconv`, `sync`, `sync/atomic`). No third-party Prometheus runtime import.
+- (b) The LBP-1 invariant (this ADR's companion concept) makes the read path lock-free against hot-path increments — the Walk holds RLock, the Inc holds nothing (atomic.Add), and the slice is immutable post-Freeze so the Walk's iteration is data-race-free against potential concurrent writes (there are none).
+- (c) Future xDS-CDS phases that introduce dynamic cluster registration will need a copy-on-write list shape that supersedes LBP-1. The carry-forward is recognized: 06.1 does not need it because all metrics are registered at static-bootstrap-load time. When CDS lands, the LBP-1 panic-on-post-Freeze-register discipline becomes a hindrance and will be replaced with a copy-on-write `metrics atomic.Pointer[[]Metric]` shape; that supersession is a future-phase ADR's job.
+- (d) The registration sites are concentrated at boot: `cluster.NewManager` and `listener.NewManager` (Tasks 8 + 10) take a `*stats.Registry` and register their per-instance metrics in their constructors. Once Freeze is called, a programming error (a stray `r.NewCounter` from a hot path) panics rather than silently corrupting the read snapshot — this is a feature, not a bug.
+
+### Lands-in-task
+
+Phase-06.1 Task 2 (alongside ADR-0060). The two ADRs are introduced in the same commit because they are companion architectural decisions: ADR-0059 establishes "we own the canonical observation surface" and ADR-0060 establishes "what's in 06.1's surface and what's deferred."
+
+## ADR-0060: Histograms deferred from 06.1
+
+**Status:** Accepted
+**Date:** 2026-04-27
+**Doctrine:** D-3.6 (every phase is a green build) + D-3.4 (record durable design rationale).
+**Supersedes:** nothing.
+
+### Context
+
+Envoy v1.37.2's `/stats/prometheus` exposes counters, gauges, AND histograms. The histograms include `cluster.<name>.upstream_rq_time` (request-to-upstream-response latency), `http.<stat_prefix>.downstream_rq_time` (full-request latency at the HCM boundary), and request/response size distributions. Envoy's internal histogram implementation is `circllhist` — a dynamic-bucket log-linear histogram — and the Prometheus exposition layer bridges circllhist's quantile-derived buckets to Prometheus's fixed-bucket `_bucket{le="..."}` shape. This bridging is non-trivial: the bucket boundaries Envoy emits depend on the configured Prometheus quantile set (`histogram_buckets` in `stats_config.histogram_bucket_settings`), the circllhist internal state, and the per-scrape `extractValuesFromHistogram` logic.
+
+Byte-equivalent matching of histogram output between envoy-go and Envoy v1.37.2 (the differential-gate criterion per phase-06.1 SPEC §3) requires either (a) replicating circllhist's storage and bucket-derivation algorithms, or (b) using a Prometheus-native histogram type and accepting that bucket boundaries may diverge from Envoy's. Both options are substantial design work and want their own brainstorm, distinct from 06.1's counter+gauge surface.
+
+Phase-06.1 BRAINSTORM §2.2 records the deferral decision: 06.1's scope is the counter+gauge surface (17 metric names enumerated in SPEC §6), and histograms are carried forward to a later sub-phase with its own brainstorm. The carry-forward also captures `server.uptime` (a gauge that depends on monotonic-clock + per-scrape recompute and pairs naturally with the histogram brainstorm because both are recompute-on-scrape rather than increment-on-event).
+
+### Decision
+
+Phase 06.1 emits counters + gauges only. Histograms are deferred:
+- `cluster.<name>.upstream_rq_time` — deferred.
+- `http.<stat_prefix>.downstream_rq_time` — deferred.
+- Request/response size distributions (`upstream_rq_body_size`, `downstream_rq_body_size`, etc., per Envoy's exposition) — deferred.
+
+The deferral is to a later 06.x sub-phase or to an upstream-robustness-family phase, with its own brainstorm covering circllhist→Prometheus bucket mapping and the byte-equivalent-vs-shape-equivalent design choice. `server.uptime` is co-deferred for the same brainstorm.
+
+### Consequences
+
+- (a) **Rule SN7** (in `internal/stats/name.go` and BEHAVIOR_CONTRACT.md §Stat-name mapping) reads "Histograms are not emitted by 06.1 (forward-looking)." The flattening rules SN1–SN8 stay counter+gauge-only.
+- (b) The 17-name catalog in phase-06.1 SPEC §6 is exhaustive for 06.1. The differential gate (Task 14, fixture 0005) compares envoy-go's `/stats/prometheus` output against a pre-recorded Envoy v1.37.2 output that has been pre-filtered to those 17 names; histogram lines from Envoy's output are filtered out before the diff (per SPEC §3).
+- (c) The future histogram-introducing sub-phase supersedes this ADR. That ADR will introduce Rule SN9 (or extend SN7) to enable histogram emission, will introduce the histogram primitive in `internal/stats`, and will widen SPEC §6's catalog.
+- (d) `server.uptime` is co-deferred to the same future sub-phase. 06.1's `server.live` gauge (always 1 once boot completes) is the only `server.*` metric in SPEC §6.
+
+### Lands-in-task
+
+Phase-06.1 Task 2 (alongside ADR-0059). The two ADRs are companions: ADR-0059 establishes the architectural "what we own" and ADR-0060 establishes the scoping "what's in vs what's deferred."
