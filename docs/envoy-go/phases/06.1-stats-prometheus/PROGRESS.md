@@ -704,7 +704,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.026s
 
 ## Task 11 — HCM per-instance metric alloc + dispatch hot path + M-9 carry-forward
 
-**Commits:** TBD
+**Commits:** `438bd4f`
 **Notes:** Widened `hcm.NewFilter(tc, cm)` and `hcm.NewFilterWithCtx(tc, cm, lc)` to accept a trailing `registry *stats.Registry` parameter; `parseFilterWithCtx` allocates the 5 HCM-scope per-instance metrics from SPEC §6 (`http.<stat_prefix>.downstream_rq_total`, `http.<stat_prefix>.downstream_rq_<2,3,4,5>xx`) on the supplied Registry at filter-build time (pre-Freeze; SPEC §5.4). Extended the `Filter` struct with 5 unexported metric-pointer fields (`downstreamRqTotal`, `downstreamRq2xx..5xx`) and added the unexported `(*Filter).downstreamStatusClassCounter(code int) *stats.Counter` helper that returns the matching `_Nxx` counter for codes in [200, 599] (nil otherwise; 1xx informationals are NOT bucketed per SPEC §2.1) — mirrors `(*Cluster).statusClassCounter` from Task 8.
 
 Hot-path edits per SPEC §5.5 + §12 #1 site (a):
