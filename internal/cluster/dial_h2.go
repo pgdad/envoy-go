@@ -34,9 +34,21 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: dial h2: %w", err)
 	}
-	tlsConn, ok := raw.(*stdtls.Conn)
+	// Phase 06.1 Task 9: Cluster.Dial now wraps every successful dial in a
+	// *connWithGauge whose Close Decs the upstream_cx_active gauge. Unwrap
+	// the wrapper to reach the inner *stdtls.Conn for the ALPN/handshake
+	// check, but pass the WRAPPER (not the inner *stdtls.Conn) into
+	// h2.NewClientConn so the *h2.ClientConn.Close path closes the wrapper
+	// and Decs the gauge — passing the inner *stdtls.Conn here would leak
+	// the active-cx counter on every H2 request.
+	wrapped, ok := raw.(*connWithGauge)
 	if !ok {
 		_ = raw.Close()
+		return nil, errors.New("cluster: dial h2: not a connWithGauge")
+	}
+	tlsConn, ok := wrapped.Conn.(*stdtls.Conn)
+	if !ok {
+		_ = wrapped.Close()
 		return nil, errors.New("cluster: dial h2: not a TLS conn")
 	}
 	// Defensive: ensure the handshake is complete so NegotiatedProtocol is
@@ -44,17 +56,17 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, error) {
 	// conns (returns nil immediately); SPEC §11.3 mitigation against a future
 	// Cluster.Dial refactor that might return a not-yet-handshaken *tls.Conn.
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = tlsConn.Close()
+		_ = wrapped.Close()
 		return nil, fmt.Errorf("cluster: dial h2: handshake: %w", err)
 	}
 	alpn := tlsConn.ConnectionState().NegotiatedProtocol
 	if alpn != "h2" {
-		_ = tlsConn.Close()
+		_ = wrapped.Close()
 		return nil, fmt.Errorf("cluster: dial h2: alpn negotiated %q, want %q", alpn, "h2")
 	}
-	cc, err := h2.NewClientConn(ctx, tlsConn)
+	cc, err := h2.NewClientConn(ctx, wrapped)
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = wrapped.Close()
 		return nil, fmt.Errorf("cluster: dial h2: client conn: %w", err)
 	}
 	return cc, nil

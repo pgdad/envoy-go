@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	// Phase 05.2 (ADR-0016 amendment, no separate ADR per ADR-0016): the
@@ -112,10 +113,20 @@ func (c *Cluster) ConnectTimeout() time.Duration {
 }
 
 // Dial opens a new connection to an endpoint picked from the cluster's LB
-// state. For plaintext clusters it returns the raw TCP connection. For TLS
-// clusters it returns a *stdtls.Conn whose HandshakeContext has already
-// completed. connect_timeout bounds the TCP dial only; the TLS handshake is
-// bounded by ctx.
+// state. For plaintext clusters it returns the raw TCP connection wrapped in
+// a *connWithGauge. For TLS clusters it returns a *connWithGauge wrapping a
+// *stdtls.Conn whose HandshakeContext has already completed. connect_timeout
+// bounds the TCP dial only; the TLS handshake is bounded by ctx.
+//
+// On every successful dial (post-TLS-handshake, when configured), Dial Incs
+// upstream_cx_total (monotonic counter) AND upstream_cx_active (gauge), and
+// wraps the returned conn in a *connWithGauge whose Close() Decs the active
+// gauge exactly once via sync.Once (per ADR-0063's Inc-then-wrap discipline;
+// SPEC §6 cluster.<n>.upstream_cx_{total,active} semantics). Caller-side
+// double-Close is safe (no Dec underflow). DialH2 unwraps the *connWithGauge
+// internally to reach the inner *stdtls.Conn for the ALPN check, but passes
+// the wrapper to h2.NewClientConn so the *h2.ClientConn.Close path Decs the
+// gauge through the wrapper.
 func (c *Cluster) Dial(ctx context.Context) (net.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -129,13 +140,58 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: dial: %w", err)
 	}
-	if c.upstreamCfg == nil {
-		return raw, nil
+	var final net.Conn = raw
+	if c.upstreamCfg != nil {
+		conn := stdtls.Client(raw, c.upstreamCfg)
+		if err := conn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("cluster: tls: handshake: %w", err)
+		}
+		final = conn
 	}
-	conn := stdtls.Client(raw, c.upstreamCfg)
-	if err := conn.HandshakeContext(ctx); err != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("cluster: tls: handshake: %w", err)
+	c.upstreamCxTotal.Inc()
+	c.upstreamCxActive.Inc()
+	return &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}, nil
+}
+
+// connWithGauge wraps a net.Conn so its Close decrements an upstream-cx-active
+// gauge exactly once (sync.Once-guarded) regardless of how many Close calls
+// the wrapper sees. Per the settled SPEC §12 deferred-decision #10 the type
+// lives in cluster.go (one-file rule) rather than its own file, because the
+// wrapper has no consumers outside (*Cluster).Dial / DialH2. The embedded
+// `Conn net.Conn` is anonymous so non-Close I/O (Read/Write/SetDeadline/etc.)
+// forwards to the underlying conn automatically; only Close is overridden.
+type connWithGauge struct {
+	net.Conn
+	dec  func()
+	once sync.Once
+}
+
+// Close decrements the cluster's upstream-cx-active gauge exactly once and
+// then closes the underlying conn. The sync.Once guard defends against
+// double-Close from layered callers (e.g., Go's net/http stack closing a
+// response body whose RoundTrip already closed the conn) — the active gauge
+// MUST never go negative from a paired Inc, even if Close is invoked twice.
+func (c *connWithGauge) Close() error {
+	c.once.Do(c.dec)
+	return c.Conn.Close()
+}
+
+// CloseWrite delegates the half-close to the underlying *net.TCPConn or
+// *stdtls.Conn (whichever the wrapper is carrying). tcpproxy's halfClose
+// half-closes the write side after each io.Copy direction completes; before
+// the connWithGauge wrapper landed (Task 9) tcpproxy did this via a
+// type-switch on the concrete conn type returned by Cluster.Dial. Now that
+// Dial returns *connWithGauge, the half-close needs an interface-shaped
+// shim — this method satisfies the `interface{ CloseWrite() error }` shape
+// tcpproxy uses post-Task-9. Returns nil if the underlying conn is neither
+// a *net.TCPConn nor a *stdtls.Conn (no-op for unsupported transports).
+func (c *connWithGauge) CloseWrite() error {
+	switch t := c.Conn.(type) {
+	case *net.TCPConn:
+		return t.CloseWrite()
+	case *stdtls.Conn:
+		return t.CloseWrite()
 	}
-	return conn, nil
+	return nil
 }

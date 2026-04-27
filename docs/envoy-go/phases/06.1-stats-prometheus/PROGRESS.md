@@ -552,3 +552,74 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.015s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.027s
 ```
+
+## Task 9 — cluster Dial + DialH2 upstream-cx metric wiring (connWithGauge wrapper)
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Wired the upstream-cx metric pair from Task 8 into `(*Cluster).Dial`'s hot path: on every successful dial (post-TLS-handshake when `c.upstreamCfg != nil`, post-TCP-dial otherwise) Dial now `Inc`s `upstream_cx_total` (Counter) AND `upstream_cx_active` (Gauge), then wraps the returned `net.Conn` in a `*connWithGauge` whose `Close()` `Dec`s the active gauge exactly once via a `sync.Once` guard (defensive against double-Close from layered callers — Go's net/http stack closes a response body whose RoundTrip already closed the conn, etc.). Per the settled SPEC §12 deferred-decision #10, `connWithGauge` lives in `cluster.go` (one-file rule) — no separate `connwithgauge.go` file. The wrapper embeds `net.Conn` anonymously so non-Close I/O (`Read`, `Write`, `SetDeadline`, …) forwards automatically. Reworked `DialH2` to handle the new wrapper: instead of `tlsConn, ok := raw.(*stdtls.Conn)`, the function now type-asserts `wrapped, ok := raw.(*connWithGauge)` then `tlsConn, ok := wrapped.Conn.(*stdtls.Conn)`. The critical invariant: `h2.NewClientConn(ctx, wrapped)` MUST receive the `*connWithGauge` (NOT the inner `*stdtls.Conn`), so that `*h2.ClientConn.Close()` propagates through the wrapper and `Dec`s the active gauge — passing the inner conn would leak `upstream_cx_active` on every H2 request. All error branches use `wrapped.Close()` consistently. Added two new tests in `cluster_test.go` (`TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose` — pre/post-Dial and post-Close metric assertions; `TestDial_CloseIdempotent` — `sync.Once` guard exercised by double-Close, gauge stays at 0) and one in `dial_h2_test.go` (`TestCluster_DialH2_IncsCxMetricsAndDecsOnClose` — same Inc/Dec assertions on the H2 round-trip path). Updated `mkTestCluster` to allocate the 8 metrics on a throwaway Registry (with a hyphen→underscore name sanitization for the metric prefix only — many existing tests use names like `"test-tls"` which the SN-name regex rejects; the cluster's own `name` field is preserved as-is for caller-side identity assertions). Updated the existing `TestCluster_Dial_TLS` type assertion from `conn.(*stdtls.Conn)` to `conn.(*connWithGauge)` then `wrapped.Conn.(*stdtls.Conn)` to reflect the new Dial contract — minimal change to a pre-existing test. **PLAN deviation (one extra file, surfaced as concern):** the `*connWithGauge` wrapper broke `internal/filter/tcpproxy`'s `halfClose` type-switch, which previously asserted `*net.TCPConn` or `*stdtls.Conn` directly — the wrapper matches neither, so half-close stopped firing and `TestFilter_Handle_HalfCloseOverTLS` timed out. The minimum-intrusive fix: (a) added `(*connWithGauge).CloseWrite() error` that delegates to the inner `*net.TCPConn` / `*stdtls.Conn` via type-switch (no-op for unsupported transports); (b) updated `tcpproxy.halfClose` from a concrete-type switch to an `interface{ CloseWrite() error }` interface check — `*net.TCPConn`, `*stdtls.Conn`, AND `*connWithGauge` all satisfy the shape, so the function is now wrapper-agnostic and forward-compatible. The PLAN scoped Task 9 to 5 files; this is the 6th, justified by the cross-package contract shift the wrapper introduces (Cluster.Dial used to return `*net.TCPConn` / `*stdtls.Conn`, now returns `*connWithGauge` wrapping one). No new ADR. Anchored: SPEC §6 (`upstream_cx_{total,active}` semantics), §12 #10 (connWithGauge file placement), ADR-0063 (cluster-scope metrics + Inc-then-wrap discipline).
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/cluster/ -run 'TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose|TestDial_CloseIdempotent|TestCluster_DialH2_IncsCxMetricsAndDecsOnClose' -v
+# pre-implementation (RED — counter/gauge sit at 0 because Dial doesn't Inc yet):
+=== RUN   TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose
+    cluster_test.go:357: post-Dial upstream_cx_total = 0, want 1
+    cluster_test.go:360: post-Dial upstream_cx_active = 0, want 1
+    cluster_test.go:371: post-Close upstream_cx_total = 0, want 1 (monotonic)
+--- FAIL: TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose (0.00s)
+=== RUN   TestDial_CloseIdempotent
+--- PASS: TestDial_CloseIdempotent (0.00s)
+=== RUN   TestCluster_DialH2_IncsCxMetricsAndDecsOnClose
+    dial_h2_test.go:394: post-DialH2 upstream_cx_total = 0, want 1
+    dial_h2_test.go:397: post-DialH2 upstream_cx_active = 0, want 1
+    dial_h2_test.go:408: post-Close upstream_cx_total = 0, want 1 (monotonic)
+--- FAIL: TestCluster_DialH2_IncsCxMetricsAndDecsOnClose (0.00s)
+FAIL
+FAIL	github.com/esalaine/envoy-go/internal/cluster	0.016s
+
+# post-implementation (GREEN):
+=== RUN   TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose
+--- PASS: TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose (0.00s)
+=== RUN   TestDial_CloseIdempotent
+--- PASS: TestDial_CloseIdempotent (0.00s)
+=== RUN   TestCluster_DialH2_IncsCxMetricsAndDecsOnClose
+--- PASS: TestCluster_DialH2_IncsCxMetricsAndDecsOnClose (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.018s
+
+$ go test -race -count=1 ./internal/cluster/
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.049s
+
+$ go vet ./...
+$ go build ./...
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.857s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.069s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.037s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.049s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.254s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.503s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.031s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.036s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.029s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.079s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.106s
+ok  	github.com/esalaine/envoy-go/test/differential	9.461s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.016s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.016s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.016s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.019s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.031s
+```

@@ -360,6 +360,55 @@ func TestCluster_DialH2_CtxCancel(t *testing.T) {
 // DialH2 — TLS handshake failure
 // ---------------------------------------------------------------------------
 
+// TestCluster_DialH2_IncsCxMetricsAndDecsOnClose verifies the upstream-cx
+// metric wiring is identical on the H2 path (phase 06.1 Task 9): a successful
+// DialH2 must Inc upstream_cx_total AND upstream_cx_active by 1, and the
+// returned *h2.ClientConn's Close() must Dec upstream_cx_active back to 0
+// (via the connWithGauge wrapper that Cluster.Dial inserted under the
+// *stdtls.Conn — h2.ClientConn.Close must propagate to the underlying
+// connWithGauge.Close per ADR-0063's Inc-then-wrap discipline).
+func TestCluster_DialH2_IncsCxMetricsAndDecsOnClose(t *testing.T) {
+	pki := mkH2TestPKI(t)
+	ln := listenH2(t, pki, []string{"h2"})
+	defer func() { _ = ln.Close() }()
+
+	upCfg := upstreamCfgForTest(pki, []string{"h2"})
+	ep := endpointFromAddr(ln.Addr())
+	c := mkTestCluster("test-h2-cx", upCfg, ep)
+
+	if got := c.upstreamCxTotal.Load(); got != 0 {
+		t.Errorf("pre-DialH2 upstream_cx_total = %d, want 0", got)
+	}
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Errorf("pre-DialH2 upstream_cx_active = %d, want 0", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cc, err := c.DialH2(ctx)
+	if err != nil {
+		t.Fatalf("DialH2: %v", err)
+	}
+
+	if got := c.upstreamCxTotal.Load(); got != 1 {
+		t.Errorf("post-DialH2 upstream_cx_total = %d, want 1", got)
+	}
+	if got := c.upstreamCxActive.Load(); got != 1 {
+		t.Errorf("post-DialH2 upstream_cx_active = %d, want 1", got)
+	}
+
+	if err := cc.Close(); err != nil {
+		t.Fatalf("ClientConn.Close: %v", err)
+	}
+
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Errorf("post-Close upstream_cx_active = %d, want 0", got)
+	}
+	if got := c.upstreamCxTotal.Load(); got != 1 {
+		t.Errorf("post-Close upstream_cx_total = %d, want 1 (monotonic)", got)
+	}
+}
+
 // TestCluster_DialH2_TLSHandshakeFailure verifies that a backend which
 // closes its TCP conn before completing the TLS handshake produces a
 // handshake error that bubbles through Cluster.Dial → DialH2.

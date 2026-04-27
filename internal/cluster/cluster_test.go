@@ -32,15 +32,36 @@ func echoConn(c net.Conn) {
 }
 
 // mkTestCluster builds a minimal Cluster for unit tests, bypassing manager
-// validation. eps must have at least one entry.
+// validation. eps must have at least one entry. Allocates the 8 cluster-scope
+// metrics on a throwaway Registry so the Dial / DialH2 hot paths (Task 9) can
+// Inc/Dec their upstream-cx counters without nil-deref. Each call gets its own
+// Registry — never Frozen, never observed via /stats/prometheus — matching
+// the per-test isolation pattern manager_test.go uses for the cluster manager
+// build path. Hyphens in `name` are normalized to underscores when forming the
+// metric prefix so tests may continue to use conceptual names like "test-tls"
+// (the SN-name regex in registry.go rejects hyphens; the cluster's `name`
+// field itself is preserved as-is for assertion purposes).
 func mkTestCluster(name string, upstreamCfg *stdtls.Config, eps ...Endpoint) *Cluster {
-	return &Cluster{
+	c := &Cluster{
 		name:           name,
 		connectTimeout: time.Second,
 		endpoints:      eps,
 		lb:             &roundRobin{endpoints: eps},
 		upstreamCfg:    upstreamCfg,
 	}
+	// Build a name-sanitized clone for metric registration only; the original
+	// `c` keeps its hyphenated name so callers' identity assertions hold.
+	tmp := &Cluster{name: strings.ReplaceAll(name, "-", "_"), endpoints: eps}
+	registerClusterMetrics(stats.NewRegistry(), tmp)
+	c.upstreamRqTotal = tmp.upstreamRqTotal
+	c.upstreamRq2xx = tmp.upstreamRq2xx
+	c.upstreamRq3xx = tmp.upstreamRq3xx
+	c.upstreamRq4xx = tmp.upstreamRq4xx
+	c.upstreamRq5xx = tmp.upstreamRq5xx
+	c.upstreamCxTotal = tmp.upstreamCxTotal
+	c.upstreamCxActive = tmp.upstreamCxActive
+	c.membershipTotal = tmp.membershipTotal
+	return c
 }
 
 // listenTCP starts a plaintext TCP echo server on a random loopback port and
@@ -167,8 +188,15 @@ func TestCluster_Dial_TLS(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	if _, ok := conn.(*stdtls.Conn); !ok {
-		t.Errorf("want *stdtls.Conn, got %T", conn)
+	// Phase 06.1 Task 9: Cluster.Dial wraps every successful conn in a
+	// *connWithGauge for upstream_cx_active gauge bookkeeping; the inner
+	// conn for a TLS cluster is *stdtls.Conn. Assert through the wrapper.
+	wrapped, ok := conn.(*connWithGauge)
+	if !ok {
+		t.Fatalf("want *connWithGauge, got %T", conn)
+	}
+	if _, ok := wrapped.Conn.(*stdtls.Conn); !ok {
+		t.Errorf("want *stdtls.Conn under *connWithGauge, got %T", wrapped.Conn)
 	}
 
 	_, _ = conn.Write([]byte("secret"))
@@ -297,5 +325,82 @@ func TestCluster_StatusClassCounter_Buckets(t *testing.T) {
 		if got := c.statusClassCounter(tc.code); got != tc.want {
 			t.Errorf("statusClassCounter(%d) = %p, want %p", tc.code, got, tc.want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Dial — upstream_cx metric wiring (phase 06.1 Task 9)
+// ---------------------------------------------------------------------------
+
+// TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose verifies the upstream-cx
+// metric wiring for plaintext Dial: pre-Dial both metrics are zero; a
+// successful Dial Incs upstream_cx_total AND upstream_cx_active by 1; the
+// returned conn's Close() Decs upstream_cx_active back to 0 (and leaves
+// upstream_cx_total monotonic at 1). Per ADR-0063: the connWithGauge wrapper
+// is Cluster.Dial's responsibility — every successful Dial must Inc the
+// counter once and Inc/Dec the gauge symmetrically.
+func TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose(t *testing.T) {
+	ln := listenTCP(t)
+	defer func() { _ = ln.Close() }()
+
+	ep := endpointFromAddr(ln.Addr())
+	c := mkTestCluster("test-cx", nil, ep)
+
+	// Pre-Dial: both zero.
+	if got := c.upstreamCxTotal.Load(); got != 0 {
+		t.Errorf("pre-Dial upstream_cx_total = %d, want 0", got)
+	}
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Errorf("pre-Dial upstream_cx_active = %d, want 0", got)
+	}
+
+	conn, err := c.Dial(context.Background())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	// Post-Dial: total=1, active=1.
+	if got := c.upstreamCxTotal.Load(); got != 1 {
+		t.Errorf("post-Dial upstream_cx_total = %d, want 1", got)
+	}
+	if got := c.upstreamCxActive.Load(); got != 1 {
+		t.Errorf("post-Dial upstream_cx_active = %d, want 1", got)
+	}
+
+	// Close: active back to 0; total still at 1 (counter is monotonic).
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Errorf("post-Close upstream_cx_active = %d, want 0", got)
+	}
+	if got := c.upstreamCxTotal.Load(); got != 1 {
+		t.Errorf("post-Close upstream_cx_total = %d, want 1 (monotonic)", got)
+	}
+}
+
+// TestDial_CloseIdempotent verifies the connWithGauge wrapper's sync.Once
+// guard: calling Close twice on the returned conn must Dec the active gauge
+// exactly once (so it lands at 0, never -1). Defends against a future
+// caller that double-closes through both an explicit Close and a defer
+// Close, or against the Go HTTP-stack pattern where (*http.Response).Body
+// closes the underlying conn after the caller has already done so.
+func TestDial_CloseIdempotent(t *testing.T) {
+	ln := listenTCP(t)
+	defer func() { _ = ln.Close() }()
+
+	ep := endpointFromAddr(ln.Addr())
+	c := mkTestCluster("test-cx-idem", nil, ep)
+
+	conn, err := c.Dial(context.Background())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	_ = conn.Close()
+	_ = conn.Close() // second Close MUST be a no-op for the gauge.
+
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Errorf("after double-Close upstream_cx_active = %d, want 0 (sync.Once must guard the Dec)", got)
 	}
 }

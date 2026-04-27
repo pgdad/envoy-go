@@ -2,7 +2,6 @@ package tcpproxy
 
 import (
 	"context"
-	stdtls "crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -90,11 +89,17 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 // from phase 00 cmd/envoy-go/main.go per ADR-0023.)
 type netConn struct{ net.Conn }
 
+// halfClose half-closes the write side of c when c supports CloseWrite.
+// As of phase 06.1 Task 9, Cluster.Dial wraps every successful conn in a
+// *cluster.connWithGauge; rather than enumerate every concrete type that
+// satisfies CloseWrite (which would re-couple this file to cluster's
+// internal wrapper), we use the interface shape directly. *net.TCPConn,
+// *stdtls.Conn, and *cluster.connWithGauge all satisfy
+// `interface{ CloseWrite() error }`; transports that do not (e.g., a plain
+// io.ReadWriteCloser pipe) are silently no-op'd.
 func halfClose(c net.Conn) {
-	switch t := c.(type) {
-	case *net.TCPConn:
-		_ = t.CloseWrite()
-	case *stdtls.Conn:
-		_ = t.CloseWrite()
+	type closeWriter interface{ CloseWrite() error }
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
 	}
 }
