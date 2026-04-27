@@ -76,7 +76,7 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 
 ## Task 3 — `internal/stats/gauge.go`
 
-**Commits:** TBD (SHA-fill follow-up)
+**Commits:** `474e8c7`
 **Notes:** Replaced the Task 2 minimal Gauge stub with the full body — `Inc`, `Dec`, `Set`, `Add`, `Load`, `Format` backed by `atomic.Int64`. Negative gauge values permitted per BRAINSTORM §5.2. Added `gauge_test.go` with 5 tests covering sequential Inc/Dec/Set, negative-value-allowed (3 Decs from zero → -3), Add with mixed-sign deltas, race-clean concurrent Inc/Dec/Set, and Format rendering of negative values. No new ADR.
 **Outputs:**
 ```
