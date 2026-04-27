@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -309,6 +310,115 @@ static_resources:
 	}
 	if !strings.Contains(got, "Server: envoy") {
 		t.Errorf("expected 'Server: envoy' header in response:\n%s", got)
+	}
+}
+
+// TestMain_StatsPrometheusEndpointResponds is the phase-06.1 Task 12 boot-wiring
+// smoke test: it boots the binary on a minimal HCM bootstrap (the smallest
+// existing variant), waits for ready sentinels, then GETs
+// /stats/prometheus on the admin port and asserts the body contains
+// `# HELP envoy_server_live` (admin's own metric, allocated on whichever
+// Registry the admin server holds) AND `# HELP envoy_listener_downstream_cx_total`
+// (listener-scope metric, allocated by the listener manager on `bs.Stats` at
+// Task 10).
+//
+// Pre-Task-12 the admin server held a throwaway Registry (not bs.Stats), so
+// /stats/prometheus walked the throwaway — server.live is there (admin
+// allocates it on whatever it gets) but the listener / cluster / HCM
+// metrics are invisible because they live on bs.Stats. The
+// envoy_listener_downstream_cx_total assertion is the unification signal:
+// post-Task-12 the admin walks bs.Stats and every metric the binary
+// allocates is observable (GREEN). Verifies SPEC §5.4 boot wiring +
+// §5.7 (server.live exposition).
+func TestMain_StatsPrometheusEndpointResponds(t *testing.T) {
+	listenerPort := freeTCPPort(t)
+	adminPort := freeTCPPort(t)
+
+	bin := buildBinaryOrSkip(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "envoy-go.yaml")
+	cfg := fmt.Sprintf(`
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+`, adminPort, listenerPort)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+
+	_ = waitForReadySentinels(t, stdout, []string{"l_http"}, 15*time.Second)
+
+	adminAddr := fmt.Sprintf("127.0.0.1:%d", adminPort)
+	resp, err := http.Get("http://" + adminAddr + "/stats/prometheus")
+	if err != nil {
+		t.Fatalf("GET /stats/prometheus: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("# HELP envoy_server_live")) {
+		t.Errorf("body missing # HELP envoy_server_live\n--- body ---\n%s", body)
+	}
+	// Unification signal: pre-Task-12 the listener metrics live on bs.Stats
+	// while admin walks a throwaway Registry. Post-Task-12 admin walks
+	// bs.Stats and the listener-scope metric is observable.
+	if !bytes.Contains(body, []byte("# HELP envoy_listener_downstream_cx_total")) {
+		t.Errorf("body missing # HELP envoy_listener_downstream_cx_total (Registry unification not complete)\n--- body ---\n%s", body)
 	}
 }
 

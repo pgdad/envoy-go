@@ -22,7 +22,6 @@ import (
 	"github.com/esalaine/envoy-go/internal/bootstrap"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/listener"
-	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func main() {
@@ -55,9 +54,7 @@ func main() {
 		log.Fatalf("cluster manager: %v", err)
 	}
 
-	// TODO(phase 06.1 Task 12): replace this throwaway Registry with the
-	// bootstrap-threaded Registry that flows from Bootstrap.Stats per SPEC §5.4.
-	admSrv := admin.New(adminAddr, stats.NewRegistry())
+	admSrv := admin.New(adminAddr, bs.Stats)
 	if _, err := admSrv.Start(); err != nil {
 		log.Fatalf("admin start %s: %v", adminAddr, err)
 	}
@@ -77,6 +74,15 @@ func main() {
 	defer lm.Stop()
 
 	admSrv.MarkReady()
+
+	// LBP-1 (SPEC §5.3 + §5.4): all NewCounter / NewGauge calls have completed
+	// — admin server.live (admin.New), cluster 8×N (cluster.NewManager…),
+	// listener 2×M (listener.NewManager… + Listener.Start post-bind), HCM 5×K
+	// (filter-chain build, eagerly executed inside listener.NewManager…).
+	// Post-Freeze any further NewCounter/NewGauge call panics; this is what
+	// makes the Walk-under-RLock-plus-atomic-Load read path lock-free against
+	// hot-path increments (SPEC §5.2).
+	bs.Stats.Freeze()
 
 	// Per-listener ready sentinels + terminal sentinel (ADR-0026).
 	for _, info := range lm.Listeners() {

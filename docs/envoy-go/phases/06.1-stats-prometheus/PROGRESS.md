@@ -818,3 +818,69 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.011s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.023s
 ```
+
+## Task 12 — `cmd/envoy-go/main.go` Registry threading + `Freeze()` boot ordering
+
+**Commits:** TBD
+**Notes:** Closed the last throwaway-Registry hold-out from Task 6: replaced `admin.New(adminAddr, stats.NewRegistry())` with `admin.New(adminAddr, bs.Stats)` so the admin server's `server.live` gauge AND the `/stats/prometheus` walk both happen on the unified `bs.Stats` Registry that Tasks 7–11 already wired into the cluster manager (8×N), listener manager (2×M), and HCM filter-build path (5×K). Removed the now-unused `internal/stats` import from `main.go` (`stats.NewRegistry()` was the only call site). Added `bs.Stats.Freeze()` AFTER `lm.Start(ctx)` returns and AFTER `admSrv.MarkReady()`, per SPEC §5.4 boot wiring sequence — by that point ALL `NewCounter` / `NewGauge` calls have completed: admin's `server.live` (at `admin.New`), cluster's 8×N (at `cluster.NewManagerWithBaseDir`), listener's 2×M (split between `listener.NewManager…` and `Listener.Start` per Task 10 deviation #1 — post-bind alloc is why Freeze MUST land post-`lm.Start`), and HCM's 5×K (at filter-chain build, eagerly executed inside `listener.NewManagerWithBaseDirAndAllowH2C`). Post-Freeze, any further `NewCounter` / `NewGauge` call panics with `stats: registry frozen: cannot register %q post-boot` — this is what makes the Walk-under-RLock-plus-atomic-Load read path lock-free against hot-path increments per SPEC §5.2 / §5.3 LBP-1.
+
+**Test surface.** Extended `cmd/envoy-go/main_test.go` with `TestMain_StatsPrometheusEndpointResponds` modeled on the smallest existing bootstrap variant (`TestEnvoyGoBinary_HCMSmoke`): boots the binary on a single-HCM-listener config, waits for ready sentinels, GETs `http://<adminAddr>/stats/prometheus`, asserts 200 + body contains `# HELP envoy_server_live` AND `# HELP envoy_listener_downstream_cx_total`. The double assertion is deliberate: pre-Task-12 the throwaway Registry had `server.live` (admin allocates it on whichever Registry it gets), but the listener-scope metric lived on `bs.Stats` and was invisible to the admin walk — so the `# HELP envoy_listener_downstream_cx_total` line is the unification signal that distinguishes pre-Task-12 from post-Task-12. Added `bytes` to the test file's imports.
+
+**RED→GREEN.** RED captured at `# HELP envoy_listener_downstream_cx_total` missing (body had ONLY `envoy_server_live` — proof the admin was walking the throwaway Registry, not bs.Stats); GREEN after the swap. Both transcripts in the Outputs section below.
+
+**No PLAN deviations.** Boot ordering followed PLAN's Step 2 sketch verbatim: `admin.New(adminAddr, bs.Stats)` → `lm, err := listener.NewManagerWithBaseDirAndAllowH2C(...)` → `lm.Start(ctx)` → `admSrv.MarkReady()` → `bs.Stats.Freeze()`. The Freeze landing AFTER `MarkReady()` is the SPEC-§5.4 idiom (admin starts accepting before Freeze) and LBP-1 still holds because admin's `server.live` is allocated at `admin.New` (line 57), which is well before `Freeze` at line 85. Filter-chain build inside `listener.NewManagerWithBaseDirAndAllowH2C` already allocates the HCM 5×K metrics eagerly (Task 11), so by `Freeze` time every metric the binary will ever emit is registered. No new ADR (PLAN explicitly annotates Task 12 as ADR-free).
+
+Anchored: SPEC §4.2 (`main.go` extension), §5.3 (LBP-1 — Late-Bind Pattern), §5.4 (boot wiring sequence — the ordering followed verbatim), §12 #4 (filter-build pre-Freeze verification — confirmed at PLAN write time, re-verified by the RED→GREEN test on a real-process boot).
+**Outputs:**
+```
+$ go build ./cmd/envoy-go && go test ./cmd/envoy-go/ -run TestMain_StatsPrometheusEndpointResponds -v -count=1
+# pre-implementation (RED — admin walks the throwaway Registry; only server.live is observable):
+=== RUN   TestMain_StatsPrometheusEndpointResponds
+    main_test.go:421: body missing # HELP envoy_listener_downstream_cx_total (Registry unification not complete)
+        --- body ---
+        # HELP envoy_server_live 1 if the server is live, 0 otherwise.
+        # TYPE envoy_server_live gauge
+        envoy_server_live 0
+--- FAIL: TestMain_StatsPrometheusEndpointResponds (0.60s)
+FAIL
+FAIL	github.com/esalaine/envoy-go/cmd/envoy-go	0.604s
+FAIL
+
+# post-implementation (GREEN):
+=== RUN   TestMain_StatsPrometheusEndpointResponds
+--- PASS: TestMain_StatsPrometheusEndpointResponds (0.53s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.535s
+
+$ go vet ./... && go build ./... && go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.547s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.073s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.046s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.055s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.277s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	8.405s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.036s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.057s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.035s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.095s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.089s
+ok  	github.com/esalaine/envoy-go/test/differential	9.215s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.016s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.016s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.030s
+```
