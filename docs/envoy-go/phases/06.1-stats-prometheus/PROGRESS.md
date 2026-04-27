@@ -208,3 +208,77 @@ $ go vet ./...
 $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
 ## ADR-0064: `stats_config.stats_tags` config not honored; extraction hardcoded
 ```
+
+## Task 5 — `internal/stats/prom.go` Prometheus text-format writer
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Created `internal/stats/prom.go` with `WriteProm(io.Writer, *Registry) error` that walks the Registry, flattens each metric via `flattenToProm`, groups by Prometheus name (status-class collapse per Rule SN4), sorts alphabetically by Prometheus name, and emits `# HELP` + `# TYPE` + metric-line triples with blank-line group separators. Helper `writeMetricLine` emits the per-line shape (with `{}` omitted on label-less metrics). Added `prom_test.go` with 6 tests: empty registry, single counter (full HELP/TYPE/line shape), status-class collapse (one HELP+TYPE for the four `_Nxx` lines), alphabetic group ordering, negative gauge rendering, and label-value escaping via a synthetic-Metric injection (bypasses `nameRE` to test the writer's escape path independently). No new ADR. The `internal/stats` package is now feature-complete; integration tasks (6+) consume `WriteProm` from `internal/admin`.
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/stats/ -v
+=== RUN   TestCounter_Inc_Sequential
+--- PASS: TestCounter_Inc_Sequential (0.00s)
+=== RUN   TestCounter_Add_Sequential
+--- PASS: TestCounter_Add_Sequential (0.00s)
+=== RUN   TestCounter_Inc_RaceClean
+--- PASS: TestCounter_Inc_RaceClean (0.01s)
+=== RUN   TestGauge_IncDecSet_Sequential
+--- PASS: TestGauge_IncDecSet_Sequential (0.00s)
+=== RUN   TestGauge_NegativeValueAllowed
+--- PASS: TestGauge_NegativeValueAllowed (0.00s)
+=== RUN   TestGauge_Add_PositiveAndNegative
+--- PASS: TestGauge_Add_PositiveAndNegative (0.00s)
+=== RUN   TestGauge_RaceClean_ConcurrentIncDecSet
+--- PASS: TestGauge_RaceClean_ConcurrentIncDecSet (0.00s)
+=== RUN   TestGauge_Format_NegativeRendered
+--- PASS: TestGauge_Format_NegativeRendered (0.00s)
+=== RUN   TestFlattenToProm_Listener
+--- PASS: TestFlattenToProm_Listener (0.00s)
+=== RUN   TestFlattenToProm_HCM
+--- PASS: TestFlattenToProm_HCM (0.00s)
+=== RUN   TestFlattenToProm_Cluster
+--- PASS: TestFlattenToProm_Cluster (0.00s)
+=== RUN   TestFlattenToProm_StatusClass_HCM
+--- PASS: TestFlattenToProm_StatusClass_HCM (0.00s)
+=== RUN   TestFlattenToProm_StatusClass_Cluster_AllDigits
+--- PASS: TestFlattenToProm_StatusClass_Cluster_AllDigits (0.00s)
+=== RUN   TestFlattenToProm_Server
+--- PASS: TestFlattenToProm_Server (0.00s)
+=== RUN   TestFlattenToProm_Invalid_NoMatchingRule
+--- PASS: TestFlattenToProm_Invalid_NoMatchingRule (0.00s)
+=== RUN   TestEscapeLabelValue
+--- PASS: TestEscapeLabelValue (0.00s)
+=== RUN   TestHelpText_Coverage
+--- PASS: TestHelpText_Coverage (0.00s)
+=== RUN   TestWriteProm_EmptyRegistry
+--- PASS: TestWriteProm_EmptyRegistry (0.00s)
+=== RUN   TestWriteProm_SingleCounter
+--- PASS: TestWriteProm_SingleCounter (0.00s)
+=== RUN   TestWriteProm_StatusClassCollapse
+--- PASS: TestWriteProm_StatusClassCollapse (0.00s)
+=== RUN   TestWriteProm_AlphabeticallySortedGroups
+--- PASS: TestWriteProm_AlphabeticallySortedGroups (0.00s)
+=== RUN   TestWriteProm_GaugeRendersNegative
+--- PASS: TestWriteProm_GaugeRendersNegative (0.00s)
+=== RUN   TestWriteProm_EscapesLabelValues
+--- PASS: TestWriteProm_EscapesLabelValues (0.00s)
+=== RUN   TestRegistry_NewCounter_HappyPath
+--- PASS: TestRegistry_NewCounter_HappyPath (0.00s)
+=== RUN   TestRegistry_NewCounter_DuplicateNamePanics
+--- PASS: TestRegistry_NewCounter_DuplicateNamePanics (0.00s)
+=== RUN   TestRegistry_NewCounter_InvalidNamePanics
+--- PASS: TestRegistry_NewCounter_InvalidNamePanics (0.00s)
+=== RUN   TestRegistry_Walk_RegistrationOrderInvariantNotPromised
+--- PASS: TestRegistry_Walk_RegistrationOrderInvariantNotPromised (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeRegisterPanics
+--- PASS: TestRegistry_Freeze_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_Freeze_PostFreezeNewGaugePanics
+--- PASS: TestRegistry_Freeze_PostFreezeNewGaugePanics (0.00s)
+=== RUN   TestRegistry_Freeze_Idempotent
+--- PASS: TestRegistry_Freeze_Idempotent (0.00s)
+=== RUN   TestRegistry_Walk_ConcurrentWithIncs_RaceClean
+--- PASS: TestRegistry_Walk_ConcurrentWithIncs_RaceClean (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	1.024s
+$ go vet ./...
+```
