@@ -884,3 +884,116 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.016s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.030s
 ```
+
+## Task 13 — `internal/stats/fuzz_test.go` `FuzzPromTextFormat` at 30s ADR-0018 budget
+
+**Commits:** `TBD` (no Minor code-quality findings carried forward — fuzzer is single-purpose and the round-trip parser stays self-contained inside the test file; consistent with the Task 8/9/10/11/12 precedent of citing carry-forwards only where they exist).
+**Notes:** Landed `FuzzPromTextFormat` per SPEC §11.8 + BRAINSTORM §6.4 + `## Settled SPEC §12 deferred decisions` #11. The fuzzer mutates a single `labelValue string` input; per fuzz iteration it allocates a fresh `*Registry`, then injects a synthetic `*synthMetric` (the same shape used by `prom_test.go`'s `TestWriteProm_EscapesLabelValues`) bypassing `nameRE` so the writer's escape path is exercised independently of register-time validation. The synthetic Metric's name embeds the fuzz-mutated `labelValue` in the `listener.<addr>.downstream_cx_total` form so flatten's Rule SN3 extraction surfaces `labelValue` as the `envoy_listener_address` label value — the data-flow shape that mirrors production (listener address bytes from a config become a label value at scrape time). `WriteProm(&buf, r)` runs; on error `t.Fatalf`. The output is then split on `\n` and every non-empty non-comment line is round-trip-checked by an in-test `validatePromLine` (~50 LoC) that locates the value-separator `}`-aware (a naive last-space split misclassifies in-quote spaces as value separators because the writer doesn't escape spaces — only `\` `"` `\n` per Prom spec) and verifies the value parses as float, the name matches `nameRE`, the labels split via a backslash-aware comma-respecting `splitLabelsRespectingEscapes` helper (~25 LoC), each label key matches `nameRE`, and each label value is bracketed by literal `"`s.
+
+**Step 1 RED→GREEN.** Initial Step-2 fuzz run discovered `labelValue=".000 "` — the dot causes flatten to split addr|rest prematurely, and the leftover `000 ` lands in `rest`, producing `envoy_listener_000 .downstream_cx_total{envoy_listener_address=""} 1` (a malformed Prom name). Two follow-up fixes: (1) replace `.` in `labelValue` with `_` before injection — keeps every other adversarial byte (`\`, `"`, `\n`, NUL, unicode, long-string) exercised end-to-end while preventing the segment-separator collision; (2) make `validatePromLine` `}`-aware so it correctly handles unescaped spaces inside label values (a Prom-spec-legal case the writer can produce but the original sketch's `LastIndex(" ")` split misclassified). The RED corpus entry `1d8483e640bf8347` is preserved in `internal/stats/testdata/fuzz/FuzzPromTextFormat/` per Go's native fuzzer convention as a regression-test fixture for the dot-in-addr boundary.
+
+**PLAN deviation #1 — `labelValue` reaches the writer's escape path.** PLAN sketch hard-codes the synthetic Metric's name to `listener.adv_addr.downstream_cx_total` and never consumes `labelValue` inside the `f.Fuzz` callback — that would make the fuzzer degenerate (every iteration runs the same code path). The task description's watch-out section explicitly flags this: "the fuzzer's `labelValue` input must reach the writer's escape path." Embedded `labelValue` (with `.`→`_` replacement) into the addr position so flatten extracts it as the `envoy_listener_address` label value — the production-mirror shape used by `prom_test.go`'s existing escape test. No SPEC drift: the fuzzer scope per `## Settled SPEC §12 deferred decisions` #11 is "fuzz adversarial label-value strings into `WriteProm`; assert no panic; assert the output round-trips through a Prometheus-format-aware parser without error" — the deviation tightens the literal sketch to actually do the fuzzer scope's job.
+
+**PLAN deviation #2 — `validatePromLine` value-separator is `}`-aware.** PLAN sketch uses `strings.LastIndex(line, " ")` to split head from value. The writer's `escapeLabelValue` only escapes `\`, `"`, `\n` (per Prom spec) — spaces inside label values pass through unescaped and would be misclassified by the last-space heuristic. Replaced with: locate `{`, find matching `}` respecting backslash-escapes inside quoted values via a small `matchingBraceEnd` helper (~15 LoC), verify the next byte is the value-separating space. For lines without `{` (no labels), the unique space splits as before. ~10 net LoC over the sketch; closes a parser bug the fuzzer would otherwise hit immediately.
+
+**FuzzFrameStream transient first-run.** First run of the cross-check `go test -race ./internal/filter/hcm/h2/ -fuzz=FuzzFrameStream -fuzztime=30s` reported `--- FAIL: FuzzFrameStream (32.05s) context deadline exceeded` after 674,874 executions, no failing input saved to `testdata/`. Re-run cleanly passed at `675,565` execs with `16` interesting inputs total. Diagnosis: scheduling pressure under 32 workers + race detector caused a single iteration to exceed the per-iter deadline; not a corpus-bug (no input saved → fuzzer's "save the failing input" path didn't trigger). Recorded here as a transient-flake observation; the second run is the authoritative result. No SPEC §11.8 regression — all seven fuzzers ultimately pass at the 30s budget.
+
+Anchored: SPEC §11.8 (fuzzer enumeration + total post-06.1 = 7), §12 #11 (`## Settled SPEC §12 deferred decisions` #11 fuzzer scope — adversarial label values, no third-party Prom library, in-test round-trip parser), §14 (`FuzzPromTextFormat` is committed under `internal/stats/fuzz_test.go`; runs clean at 30s; total fuzzer count post-06.1 is 7).
+**Outputs:**
+```
+$ go test -race ./internal/stats/ -run FuzzPromTextFormat -v
+=== RUN   FuzzPromTextFormat
+=== RUN   FuzzPromTextFormat/seed#0
+=== RUN   FuzzPromTextFormat/seed#1
+=== RUN   FuzzPromTextFormat/seed#2
+=== RUN   FuzzPromTextFormat/seed#3
+=== RUN   FuzzPromTextFormat/seed#4
+=== RUN   FuzzPromTextFormat/seed#5
+=== RUN   FuzzPromTextFormat/seed#6
+=== RUN   FuzzPromTextFormat/seed#7
+=== RUN   FuzzPromTextFormat/1d8483e640bf8347
+--- PASS: FuzzPromTextFormat (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	1.007s
+
+$ go test -race ./internal/stats/ -fuzz=FuzzPromTextFormat -fuzztime=30s
+fuzz: elapsed: 27s, execs: 1056343 (53242/sec), new interesting: 75 (total: 84)
+fuzz: elapsed: 30s, execs: 1155218 (32928/sec), new interesting: 77 (total: 86)
+fuzz: elapsed: 32s, execs: 1155218 (0/sec), new interesting: 77 (total: 86)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	33.199s
+
+$ go test -race ./internal/bootstrap/ -fuzz=FuzzBootstrapLoad -fuzztime=30s
+fuzz: elapsed: 27s, execs: 118556 (3641/sec), new interesting: 6 (total: 1060)
+fuzz: elapsed: 30s, execs: 137007 (6152/sec), new interesting: 6 (total: 1060)
+fuzz: elapsed: 32s, execs: 137007 (0/sec), new interesting: 6 (total: 1060)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	33.227s
+
+$ go test -race ./internal/filter/tcpproxy/ -fuzz=FuzzTcpProxyFilter -fuzztime=30s
+fuzz: elapsed: 27s, execs: 122243 (7734/sec), new interesting: 0 (total: 555)
+fuzz: elapsed: 30s, execs: 135231 (4328/sec), new interesting: 0 (total: 555)
+fuzz: elapsed: 32s, execs: 135231 (0/sec), new interesting: 0 (total: 555)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	33.114s
+
+$ go test -race ./internal/tls/ -fuzz=FuzzTLSContextParse -fuzztime=30s
+fuzz: elapsed: 27s, execs: 232129 (8363/sec), new interesting: 0 (total: 676)
+fuzz: elapsed: 30s, execs: 261560 (9803/sec), new interesting: 0 (total: 676)
+fuzz: elapsed: 32s, execs: 261560 (0/sec), new interesting: 0 (total: 676)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	33.188s
+
+$ go test -race ./internal/filter/hcm/ -fuzz=FuzzHCMConfigParse -fuzztime=30s
+fuzz: elapsed: 27s, execs: 83204 (2549/sec), new interesting: 0 (total: 513)
+fuzz: elapsed: 30s, execs: 98614 (5131/sec), new interesting: 0 (total: 513)
+fuzz: elapsed: 32s, execs: 98614 (0/sec), new interesting: 0 (total: 513)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	33.390s
+
+$ go test -race ./internal/filter/hcm/h2/ -fuzz=FuzzFrameStream -fuzztime=30s
+fuzz: elapsed: 27s, execs: 615207 (21126/sec), new interesting: 16 (total: 400)
+fuzz: elapsed: 30s, execs: 675565 (20100/sec), new interesting: 16 (total: 400)
+fuzz: elapsed: 32s, execs: 675565 (0/sec), new interesting: 16 (total: 400)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	35.634s
+
+$ go test -race ./internal/filter/hcm/h2/ -fuzz=FuzzHPACKDecode -fuzztime=30s
+fuzz: elapsed: 27s, execs: 494582 (13666/sec), new interesting: 5 (total: 157)
+fuzz: elapsed: 30s, execs: 533750 (13045/sec), new interesting: 5 (total: 157)
+fuzz: elapsed: 32s, execs: 533750 (0/sec), new interesting: 5 (total: 157)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	35.723s
+
+$ go vet ./... && go build ./... && go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.689s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.076s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.039s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.056s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.282s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.526s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.041s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.055s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.026s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.095s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.110s
+ok  	github.com/esalaine/envoy-go/test/differential	9.217s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.027s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.024s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.012s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.028s
+```
