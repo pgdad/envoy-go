@@ -1506,3 +1506,354 @@ Carry-forward Minors from Tasks 8–14 to L4 review-followup (26 total, all poli
 - Task 14 (T14 at `d030fb1`): 4 Minors → L4 (M-1 through M-7 listed in Task 14 entry; 4 reviewer Minors from the follow-up commit)
 
 Most impactful for the verifier: T14 M-3 (200ms hardcoded drain — potential CI flakiness), T13 M-1 (empty-`{}` over-acceptance in FuzzPromTextFormat seed). The L4 review-followup session will triage and either land or accept-as-is per the 05.2 review-followup precedent.
+
+## Verification (lifecycle-state 4) — FAILED
+
+Per `BOOTSTRAP_PROMPT.md` §5 state 4 and `STATE.md`'s `next-skill-scope`: a fresh-session re-run of every SPEC §3 / BOOTSTRAP §7.5 phase-done gate, with each command's verbatim output captured here. This session's HEAD on branch `phase/06.1-stats-prometheus-verify` is `42e2650f73d33c4895a2bd127dcce4efd6632d17` — the impl-branch tip (STATE.md SHA-fill follow-up to Task 15's all-gates-green local sweep at `58d4ec9`). Worktree: `.worktrees/phase-06.1-stats-prometheus-verify`, branched from impl-branch tip per ADR-0003 + per-phase-worktree convention; the impl worktree at `.worktrees/phase-06.1-stats-prometheus-impl` is closed-history at this state transition. Verifier date: 2026-04-27.
+
+**Outcome: gate (d) FAIL.** A fresh fuzz run of `FuzzHCMConfigParse` at the ADR-0018 30-second budget produced a crasher in 5 seconds. The HCM stat-name construction path at `internal/filter/hcm/config.go:164` builds `http.<stat_prefix>.downstream_rq_total` from a user-controlled `stat_prefix` without validation; when the prefix contains a space (or any character that violates the Prometheus name regex `^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$`), `stats.Registry.NewCounter` → `Registry.checkName` (`internal/stats/registry.go:97`) panics. The minimised 325-byte input — an `Any` with type-URL `type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager` and a value-payload encoding `stat_prefix = "0000000000 0"` (12 bytes including a literal space at index 10) — reproduces the panic deterministically. Gate (e) part 2 (`go test -race ./...`) inherits the failure on `internal/filter/hcm` because Go's fuzz testdata persistence saves the minimised seed under `internal/filter/hcm/testdata/fuzz/FuzzHCMConfigParse/9ba19570cf17f59f` and unit-test mode replays it as a regression case (the other 17 packages PASS clean under `-race`). Gates (a), (b), (c), (e) part 1 (build/vet/lint), the ADR-0059 boundary grep, and the 17-stat-emit call-site grep all PASS.
+
+**Discrepancy with Task 15's "all five executable gates green" claim** is attributable to fuzzing's non-deterministic 30-second budget: the impl run (Task 15's local sweep) sampled a different region of the input space and did not hit this corner; the verifier run did. This is not a bug in the verifier methodology — it is exactly what BOOTSTRAP §7.5 gate (d) ("any new fuzzer has run clean for its short-budget CI run") is designed to surface. An independent fresh-session re-run is the gate, and a single run that happens to clear 30 s without a crasher is necessary but not sufficient evidence; reproducibility across at least one independent run is the implicit acceptance bar.
+
+**Next action per BOOTSTRAP §5 deviation rule (`Unexpected state → superpowers:systematic-debugging FIRST`):** STATE advances back to lifecycle-state 3 (impl incomplete) with `next-skill: superpowers:systematic-debugging`. The fix branch is a new `.worktrees/phase-06.1-stats-prometheus-impl-followup-gate-d` (or equivalent name) branched from this verify branch's tip per ADR-0003 + per-phase-worktree convention. Two fix-shape candidates (the fix branch chooses; ADR if non-obvious):
+
+1. Reject configs with a non-Prometheus-safe `stat_prefix` at HCM parse time, returning an `hcm: invalid stat_prefix: <prefix>` error — matches the fuzz target's contract that every error must be `hcm:`-prefixed (`internal/filter/hcm/fuzz_test.go:38-40`).
+2. Sanitise `stat_prefix` per Rule SN1's invalid-character substitution before constructing the counter name — e.g., map non-`[a-zA-Z0-9_.]` to `_`. Trade-off: changes the observable stat name set vs upstream Envoy when the fixture-side `stat_prefix` happens to contain such chars; phase 06.1 SPEC §10.1 anchors Rule SN1 against a specific reference scrape, so a SN1-extension ADR would be appropriate.
+
+The fix branch should also consider whether `stats.Registry.NewCounter` should return an error rather than panic on invalid names (defense-in-depth per `superpowers:systematic-debugging`'s `defense-in-depth.md`): a panic on user-input-derived names is fundamentally a contract violation regardless of the HCM-side caller's input validation.
+
+**Seed file disposition (verifier role contract).** Go's fuzz framework persisted the minimised crasher input as `internal/filter/hcm/testdata/fuzz/FuzzHCMConfigParse/9ba19570cf17f59f`. The 05.2 verifier precedent (`b34bd99`) committed only `STATE.md` + `PROGRESS.md` — no production-code or test-corpus changes — and this verifier follows that role contract: the seed file is **deleted** before this verification commit. The seed bytes are quoted verbatim in the gate-(d) output below for the fix branch's reproduction. The fix branch can re-derive an equivalent seed by re-running the fuzzer (typically <30 s on a 32-worker host) OR construct a deterministic hand-crafted regression test in `internal/filter/hcm/config_test.go` covering the same path (the latter is preferred — easier to read and amend than a binary fuzz seed). Per `superpowers:test-driven-development`, the fix branch's first step is the regression test failing.
+
+**Outputs:**
+
+```
+$ pwd
+/home/esa/git/envoy-go/.worktrees/phase-06.1-stats-prometheus-verify
+$ git rev-parse --abbrev-ref HEAD
+phase/06.1-stats-prometheus-verify
+$ git log -1 --format=%H
+42e2650f73d33c4895a2bd127dcce4efd6632d17
+$ go version
+go version go1.26.2 linux/amd64
+$ golangci-lint version 2>&1 | head -1
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0062: Differential equivalence shape for stats output
+$ # ADR-0062 is the chronological-add tail; 06.1 ADRs in file-add order:
+$ # 0059, 0060, 0061, 0064, 0063, 0062 — non-monotonic per 05.2 precedent.
+```
+
+**Gate (a) — fixture-0005 differential (NEW in 06.1 per ADR-0062) — PASS:**
+
+```
+$ go test -count=1 -run 'TestDifferential/0005' -v ./test/differential/
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0005-prometheus-stats
+[testcontainers ryuk + reference-Envoy lifecycle abbreviated.]
+2026/04/27 17:17:31 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+[ ... ]
+2026/04/27 17:17:33 🐳 Terminating container: 109fedbff3aa
+2026/04/27 17:17:33 🚫 Container terminated: 109fedbff3aa
+--- PASS: TestDifferential (2.37s)
+    --- PASS: TestDifferential/0005-prometheus-stats (2.37s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.445s
+```
+
+The reference Envoy image SHA `envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` matches the `ENVOY_TARGET.md` pin; differential equivalence per ADR-0062's shape rules verified non-vacuously.
+
+**Gate (b) — all pre-existing differential fixtures (regression check) — PASS:**
+
+```
+$ go test -count=1 -run 'TestDifferential/(0000|0001|0002|0003|0004)' -v ./test/differential/
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+=== RUN   TestDifferential/0004-h2-routing
+[testcontainers + container lifecycle abbreviated; "hcm: h2: EOF" lines from H2 reachability probes during 0004 setup elided — same as 05.2 verification.]
+--- PASS: TestDifferential (7.07s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.58s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.16s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.22s)
+    --- PASS: TestDifferential/0003-http11-routing (1.24s)
+    --- PASS: TestDifferential/0004-h2-routing (1.86s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	7.148s
+```
+
+5/5 pre-existing fixtures green. The 06.1 stats-Registry threading through cluster/listener/HCM (Tasks 7-12) does not regress any pre-existing fixture.
+
+**Gate (c) — h2spec conformance (UNCHANGED from 05.1/05.2 baseline per SPEC §3) — PASS:**
+
+```
+$ go test -count=1 -v ./test/conformance/h2spec/
+[testcontainers + container lifecycle abbreviated.]
+2026/04/27 17:18:10 🐳 Creating container for image summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0
+[ ... ]
+        Finished in 0.5491 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+2026/04/27 17:18:11 🐳 Terminating container: dbd6076f3679
+2026/04/27 17:18:11 🚫 Container terminated: dbd6076f3679
+--- PASS: TestH2Spec (2.20s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.293s
+```
+
+53 of 53 PASS at the pinned `summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0`. Per-section breakdown matches the 05.1/05.2 baselines byte-for-byte; covers sections 3, 4, 5, 6 ex-6.6, 7, 8 per the ADR-0051 threshold list. Total: 2+3+3+3+13+2+1+2+2+2+2+1+1+4+2+7+2+1 = 53.
+
+**Gate (d) — 7 fuzz targets at 30 s ADR-0018 budget — FAIL on `FuzzHCMConfigParse`; the other six PASS:**
+
+```
+$ go test -fuzz='^FuzzBootstrapLoad$' -fuzztime=30s -count=1 -run='^$' ./internal/bootstrap/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/1064 completed
+fuzz: elapsed: 5s, gathering baseline coverage: 1064/1064 completed, now fuzzing with 32 workers
+[ ... ]
+fuzz: elapsed: 31s, execs: 381081 (0/sec), new interesting: 7 (total: 1071)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.088s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz='^FuzzPromTextFormat$' -fuzztime=30s -count=1 -run='^$' ./internal/stats/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/111 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 111/111 completed, now fuzzing with 32 workers
+[ ... ]
+fuzz: elapsed: 30s, execs: 25439532 (0/sec), new interesting: 3 (total: 114)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	30.115s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz='^FuzzTcpProxyFilter$' -fuzztime=30s -count=1 -run='^$' ./internal/filter/tcpproxy/
+[ ... ]
+fuzz: elapsed: 31s, execs: 3742957 (0/sec), new interesting: 5 (total: 560)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.053s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz='^FuzzHCMConfigParse$' -fuzztime=30s -count=1 -run='^$' ./internal/filter/hcm/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/513 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 513/513 completed, now fuzzing with 32 workers
+fuzz: minimizing 360-byte failing input file
+fuzz: elapsed: 5s, minimizing
+--- FAIL: FuzzHCMConfigParse (5.08s)
+    --- FAIL: FuzzHCMConfigParse (0.00s)
+        testing.go:1927: panic: stats: invalid metric name: "http.0000000000 0.downstream_rq_total" (must match ^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$)
+            goroutine 24825 [running]:
+            runtime/debug.Stack()
+            	runtime/debug/stack.go:26 +0x9b
+            testing.tRunner.func1()
+            	testing/testing.go:1927 +0x1d0
+            panic({0x11335c0?, 0x3218003ab690?})
+            	runtime/panic.go:860 +0x13a
+            github.com/esalaine/envoy-go/internal/stats.(*Registry).checkName(0x13?, {0x32180033b740, 0x25})
+            	internal/stats/registry.go:100 +0x168
+            github.com/esalaine/envoy-go/internal/stats.(*Registry).NewCounter(0x3218003dcdc0, {0x32180033b740, 0x25})
+            	internal/stats/registry.go:67 +0x72
+            github.com/esalaine/envoy-go/internal/filter/hcm.parseFilterWithCtx(0x3217fb278780, 0x3217fb16e590, {0x0?, 0x0?}, 0x3218003dcdc0)
+            	internal/filter/hcm/config.go:164 +0xcc6
+            github.com/esalaine/envoy-go/internal/filter/hcm.NewFilter(...)
+            	internal/filter/hcm/filter.go:24
+            github.com/esalaine/envoy-go/internal/filter/hcm.FuzzHCMConfigParse.func1(0x321800432488, {0x3218000b7811?, 0x0?}, {0x3217fb978a00?, 0x0?, 0x0?})
+            	internal/filter/hcm/fuzz_test.go:37 +0xe8
+            [ … reflect/testing scaffolding truncated … ]
+    Failing input written to testdata/fuzz/FuzzHCMConfigParse/9ba19570cf17f59f
+    To re-run:
+    go test -run=FuzzHCMConfigParse/9ba19570cf17f59f
+FAIL
+exit status 1
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm	5.086s
+$ git status --porcelain
+?? internal/filter/hcm/testdata/fuzz/
+
+$ # Minimised seed bytes (Go fuzz v1 corpus format, 325 bytes total file):
+$ cat internal/filter/hcm/testdata/fuzz/FuzzHCMConfigParse/9ba19570cf17f59f
+go test fuzz v1
+string("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager")
+[]byte("\x12\f0000000000 0*a\n\x19envoy.filters.http.router\"D\nBtype.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"*\x12(Z\n0000000000\x12\x01*002\t1000000002\n0\xc802\x0500000")
+
+$ # Wire-format decoding of the value-payload's leading bytes:
+$ #   \x12 = field 2 (HttpConnectionManager.stat_prefix), wire-type 2 (length-delimited)
+$ #   \f   = length 12
+$ #   "0000000000 0" = stat_prefix payload (12 bytes; literal SP at index 10)
+$ # The remaining bytes encode HttpConnectionManager.http_filters[0] = envoy.filters.http.router and
+$ # an inline RouteConfiguration; not relevant to the panic — the panic fires on the stat_prefix path
+$ # at config.go:164 before the RouteConfiguration is touched.
+
+$ go test -fuzz='^FuzzFrameStream$' -fuzztime=30s -count=1 -run='^$' ./internal/filter/hcm/h2/
+[ ... ]
+fuzz: elapsed: 30s, execs: 13367578 (0/sec), new interesting: 0 (total: 409)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	30.158s
+$ git status --porcelain
+?? internal/filter/hcm/testdata/fuzz/   # residual from FuzzHCMConfigParse run; NOT produced by this target
+
+$ go test -fuzz='^FuzzHPACKDecode$' -fuzztime=30s -count=1 -run='^$' ./internal/filter/hcm/h2/
+[ ... ]
+fuzz: elapsed: 31s, execs: 1749707 (0/sec), new interesting: 2 (total: 164)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.078s
+$ git status --porcelain
+?? internal/filter/hcm/testdata/fuzz/   # unchanged residual; NOT produced by this target
+
+$ go test -fuzz='^FuzzTLSContextParse$' -fuzztime=30s -count=1 -run='^$' ./internal/tls/
+[ ... ]
+fuzz: elapsed: 31s, execs: 4884272 (0/sec), new interesting: 8 (total: 684)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.058s
+$ git status --porcelain
+?? internal/filter/hcm/testdata/fuzz/   # unchanged residual
+```
+
+**Per-target summary (gate d):**
+
+| target                  | execs               | new-interesting | result |
+|-------------------------|---------------------|-----------------|--------|
+| `FuzzBootstrapLoad`     | 381,081             | 7               | PASS   |
+| `FuzzPromTextFormat`    | 25,439,532          | 3               | PASS (NEW in 06.1) |
+| `FuzzTcpProxyFilter`    | 3,742,957           | 5               | PASS   |
+| `FuzzHCMConfigParse`    | (n/a — crashed at 5 s) | n/a          | **FAIL** — crasher above |
+| `FuzzFrameStream`       | 13,367,578          | 0               | PASS   |
+| `FuzzHPACKDecode`       | 1,749,707           | 2               | PASS   |
+| `FuzzTLSContextParse`   | 4,884,272           | 8               | PASS   |
+
+**Gate (e) part 1 — go build / go vet / golangci-lint — PASS:**
+
+```
+$ go build ./...
+$ # exit 0; empty output
+
+$ go vet ./...
+$ # exit 0; empty output
+
+$ golangci-lint run ./...
+$ # exit 0; empty output — the six lint-fix-sweep fixes at 58d4ec9 are durable
+```
+
+**ADR-0059 boundary grep — PASS (zero third-party stats/prometheus deps; zero production third-party imports):**
+
+```
+$ grep -nE 'github.com/prometheus|github.com/[^/]+/prometheus' go.mod go.sum
+$ # empty
+
+$ grep -nR '"github.com/' internal/ cmd/envoy-go/ --include='*.go' \
+    | grep -v '_test.go' \
+    | grep -v 'github.com/esalaine/envoy-go' \
+    | grep -iE 'prometheus|stats|metrics|expvar' || true
+$ # empty
+```
+
+**17-stat-emit call-site grep — PASS:**
+
+```
+$ grep -n 'downstreamCxTotal\.Inc\|downstreamCxActive\.\(Inc\|Dec\)' internal/listener/manager.go
+505:		rt.downstreamCxTotal.Inc()
+506:		rt.downstreamCxActive.Inc()
+512:				defer rt.downstreamCxActive.Dec()
+518:			defer rt.downstreamCxActive.Dec()
+$ # 2 listener stats: downstream_cx_total + downstream_cx_active
+
+$ grep -n 'downstreamRqTotal\.Inc\|downstreamStatusClassCounter' \
+        internal/filter/hcm/connection.go internal/filter/hcm/h2dispatch.go
+internal/filter/hcm/connection.go:59:				f.downstreamRqTotal.Inc()
+internal/filter/hcm/connection.go:60:				if c := f.downstreamStatusClassCounter(400); c != nil {
+internal/filter/hcm/connection.go:70:		f.downstreamRqTotal.Inc()
+internal/filter/hcm/connection.go:75:			if c := f.downstreamStatusClassCounter(417); c != nil {
+internal/filter/hcm/connection.go:84:			if c := f.downstreamStatusClassCounter(501); c != nil {
+internal/filter/hcm/connection.go:111:				if c := f.downstreamStatusClassCounter(status); c != nil {
+internal/filter/hcm/connection.go:125:		if c := f.downstreamStatusClassCounter(status); c != nil {
+internal/filter/hcm/h2dispatch.go:50:	d.f.downstreamRqTotal.Inc()
+internal/filter/hcm/h2dispatch.go:90:	if c := a.f.downstreamStatusClassCounter(a.a.status); c != nil {
+internal/filter/hcm/h2dispatch.go:128:		if c := a.f.downstreamStatusClassCounter(status); c != nil {
+internal/filter/hcm/h2dispatch.go:159:	if c := r.f.downstreamStatusClassCounter(500); c != nil {
+$ # 5 HCM stats: downstream_rq_total + 4 status-class via downstreamStatusClassCounter()
+
+$ grep -n 'IncUpstreamRqTotal\|IncStatusClass\|upstreamCxTotal\.Inc\|upstreamCxActive\.\(Inc\|Dec\)\|membershipTotal\.Set' \
+        internal/cluster/cluster.go internal/cluster/manager.go
+internal/cluster/cluster.go:98:func (c *Cluster) IncUpstreamRqTotal() { c.upstreamRqTotal.Inc() }
+internal/cluster/cluster.go:106:func (c *Cluster) IncStatusClass(code int) {
+internal/cluster/cluster.go:171:	c.upstreamCxTotal.Inc()
+internal/cluster/cluster.go:172:	c.upstreamCxActive.Inc()
+internal/cluster/cluster.go:173:	return &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}, nil
+internal/cluster/manager.go:106:	c.membershipTotal.Set(int64(len(c.endpoints)))
+$ # 8 cluster stats: upstream_rq_total + 4 status-class + upstream_cx_total + upstream_cx_active + membership_total
+
+$ grep -n 'liveGauge\.Set\|liveOnce' internal/admin/admin.go
+23:	liveOnce  sync.Once
+102:	s.liveOnce.Do(func() { s.liveGauge.Set(1) })
+$ # 1 server.live (sync.Once-guarded liveGauge.Set(1))
+```
+
+Call-site total: 2 listener + 5 HCM + 8 cluster + 1 server.live = 16 distinct grep-match-points serving 17 internal stat names (the 4 `downstream_rq_<class>` and 4 `upstream_rq_<class>` are reached via the indirection helpers `downstreamStatusClassCounter(code)` and `IncStatusClass(code)`). Matches the impl Task 15 verification block at `58d4ec9` exactly.
+
+**Gate (e) part 2 — `go test -race ./...` — FAIL on `internal/filter/hcm` (replay of seed `9ba19570cf17f59f`); other 17 packages PASS:**
+
+```
+$ go test -race -count=1 ./...
+?   	github.com/esalaine/envoy-go/cmd/envoy-go	[no test files]
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.070s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.038s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.054s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+--- FAIL: FuzzHCMConfigParse (0.00s)
+    --- FAIL: FuzzHCMConfigParse/9ba19570cf17f59f (0.00s)
+panic: stats: invalid metric name: "http.0000000000 0.downstream_rq_total" (must match ^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$) [recovered, repanicked]
+[ … same panic stack as gate (d) above; same call site internal/filter/hcm/config.go:164 → internal/stats/registry.go:100 … ]
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm	0.272s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	8.406s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.035s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.056s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.028s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.089s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.145s
+ok  	github.com/esalaine/envoy-go/test/differential	11.351s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.011s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.012s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.030s
+FAIL
+```
+
+17 ok; 1 FAIL on `internal/filter/hcm`. The h2spec, differential (all 6 fixtures including 0005), listener, cluster, hcm/h2, stats, tls, admin, bootstrap, tcpproxy unit tests all pass clean under `-race`. The failure is the seed-replay regression, mechanically equivalent to gate (d)'s direct fuzz crasher; no race-detector warnings (no DATA RACE output anywhere in the 17 ok packages).
+
+**Gate (f) — `REVIEW.md` approved — deferred to lifecycle-state 6 per BOOTSTRAP §5.**
+
+**Verification result:** gates (a)/(b)/(c)/(e)-part-1 PASS, gate (d) FAIL on `FuzzHCMConfigParse`, gate (e)-part-2 FAIL on the same root-cause via seed replay, gate (f) deferred. **Phase 06.1 cannot advance to lifecycle-state 5.** STATE.md transitions back to lifecycle-state 3 with `next-skill: superpowers:systematic-debugging`. ROADMAP rows unchanged (06.1 stays `in-progress`; 06 stays `in-progress`; 06.2 stays `planned`). The auto-generated seed file `internal/filter/hcm/testdata/fuzz/FuzzHCMConfigParse/9ba19570cf17f59f` is deleted from this verifier's worktree before commit per the 05.2 verifier role contract — see "Seed file disposition" prose above.
