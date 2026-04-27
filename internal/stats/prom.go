@@ -37,7 +37,7 @@ func WriteProm(w io.Writer, r *Registry) error {
 	r.Walk(func(m Metric) {
 		base, labels, err := flattenToProm(m.Name())
 		if err != nil {
-			return // skip malformed names (defence-in-depth; should not occur)
+			return // skip malformed names (defense-in-depth; should not occur)
 		}
 		g, ok := groups[base]
 		if !ok {

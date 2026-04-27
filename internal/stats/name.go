@@ -23,15 +23,15 @@ var statusClassRE = regexp.MustCompile(`^(.+)_([1-5])xx$`)
 // flattenToProm transforms an internal hierarchical-dotted name to the
 // Prometheus exposition form per Rules SN1–SN8 (ADR-0061; SPEC §10.1).
 //
-//   SN1: cluster.<n>.<rest>     → envoy_cluster_<rest> + label envoy_cluster_name=<n>
-//   SN2: http.<stat_prefix>.<rest> → envoy_http_<rest> + label envoy_http_conn_manager_prefix=<stat_prefix>
-//   SN3: listener.<addr>.<rest> → envoy_listener_<rest> + label envoy_listener_address=<addr>
-//   SN4: <base>_Nxx             → <base>_xx + label envoy_response_code_class=N (N ∈ 1..5)
-//   SN5: server.<rest>          → envoy_server_<rest> + no labels
-//   SN6: HELP text best-effort English (handled by prom.go via helpText map)
-//   SN7: histograms not emitted (Task-2-time NewCounter/NewGauge are the only
-//        registry methods; absence is the contract)
-//   SN8: per-endpoint cluster stats not emitted (similarly absent)
+//	SN1: cluster.<n>.<rest>     → envoy_cluster_<rest> + label envoy_cluster_name=<n>
+//	SN2: http.<stat_prefix>.<rest> → envoy_http_<rest> + label envoy_http_conn_manager_prefix=<stat_prefix>
+//	SN3: listener.<addr>.<rest> → envoy_listener_<rest> + label envoy_listener_address=<addr>
+//	SN4: <base>_Nxx             → <base>_xx + label envoy_response_code_class=N (N ∈ 1..5)
+//	SN5: server.<rest>          → envoy_server_<rest> + no labels
+//	SN6: HELP text best-effort English (handled by prom.go via helpText map)
+//	SN7: histograms not emitted (Task-2-time NewCounter/NewGauge are the only
+//	     registry methods; absence is the contract)
+//	SN8: per-endpoint cluster stats not emitted (similarly absent)
 //
 // Returns the Prometheus base name + the extracted label set + nil on success.
 // Returns "", nil, error on names that match no top-level rule.
@@ -87,9 +87,11 @@ func flattenToProm(internal string) (string, []Label, error) {
 }
 
 // escapeLabelValue escapes a label value per the Prometheus text-format spec:
-//   \  → \\
-//   "  → \"
-//   \n → \n  (literal two-char backslash-n in the output)
+//
+//	\  → \\
+//	"  → \"
+//	\n → \n  (literal two-char backslash-n in the output)
+//
 // Other characters pass through unchanged.
 func escapeLabelValue(s string) string {
 	if !strings.ContainsAny(s, `\"`+"\n") {

@@ -18,7 +18,9 @@ import (
 type MetricType int
 
 const (
+	// MetricCounter identifies a monotonically increasing counter metric.
 	MetricCounter MetricType = iota + 1
+	// MetricGauge identifies a point-in-time signed integer metric.
 	MetricGauge
 )
 

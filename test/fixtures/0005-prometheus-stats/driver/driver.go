@@ -49,8 +49,8 @@ func init() {
 // statsDriver implements fixture.Driver, fixture.BackendKindAware, and
 // fixture.StatsAsserter.
 type statsDriver struct {
-	mu              sync.Mutex
-	refListenerAddr string
+	mu               sync.Mutex
+	refListenerAddr  string
 	subjListenerAddr string
 }
 
@@ -204,7 +204,7 @@ func httpGetRaw(ctx context.Context, url string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var buf strings.Builder
 	fmt.Fprintf(&buf, "HTTP/1.1 %s\r\n", resp.Status)
@@ -390,7 +390,7 @@ func scrapeAndParse(ctx context.Context, adminAddr string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("GET %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return Snapshot{}, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}

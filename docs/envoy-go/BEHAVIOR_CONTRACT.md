@@ -16,7 +16,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Response trailers | Set-equal under the same allow-list discipline |
 | HTTP/2 & HTTP/3 framing | Structurally equivalent (same frame types/order on equivalent events); not byte-equal |
 | Access log records | Semantically equal after field-mapping |
-| Stats | Names match Envoy's documented stat tree; presence required; values exact on deterministic flows |
+| Stats output | Per-stat behavioral delta after defined load is equal between envoy-go and reference Envoy. Gauges are snapshot-equal after drain. Names + label keys + types byte-equal; HELP text ignored. Allow-list: 17 stats listed in § Stat-name mapping. All other Envoy stat names in /stats/prometheus output are ignored by the differential. |
 | xDS wire behavior | ADS message sequences match the protocol state machine; effective-config diff on identical snapshots |
 | Timing | Not compared by default; a phase may opt in to latency bounds |
 
@@ -47,9 +47,123 @@ The allow-list enumerates response headers whose values are permitted to differ 
 
 ## Stat-name mapping
 
-_to be filled per-phase as needed._
-
 The mapping describes, for each emitted stat, the canonical Envoy stat name, the envoy-go internal name (if different), the tag set, and the flows under which values are required to be exact. When a phase introduces a new stat subsystem, it extends this table.
+
+### Flattening rules SN1–SN8 (per ADR-0061; introduced by phase 06.1)
+
+```
+Rule SN1: Name segments matching `cluster.<n>.<rest>` extract `<n>` as label
+          `envoy_cluster_name` and prefix `<rest>` with `envoy_cluster_`.
+
+Rule SN2: Name segments matching `http.<stat_prefix>.<rest>` extract <stat_prefix>
+          as label `envoy_http_conn_manager_prefix` and prefix <rest> with `envoy_http_`.
+
+Rule SN3: Name segments matching `listener.<addr>.<rest>` extract <addr> as label
+          `envoy_listener_address` and prefix <rest> with `envoy_listener_`.
+
+Rule SN4: Names ending `_Nxx` where N ∈ {1..5} flatten to a base name with the
+          trailing class digit STRIPPED (so the metric name ends in literal `_xx`),
+          plus a label `envoy_response_code_class` whose value is the single class
+          digit as a string (`"1"`, `"2"`, `"3"`, `"4"`, `"5"`). Empirically verified
+          against reference Envoy v1.37.2 at the `ENVOY_TARGET.md`-pinned image
+          (server SHA `5afe27fb338b16d5bb06b3a7198bcd581b4e3dee`) on 2026-04-27; see
+          empirical evidence block below.
+
+          Examples (canonical):
+              cluster.foo.upstream_rq_2xx
+                → envoy_cluster_upstream_rq_xx{envoy_response_code_class="2",envoy_cluster_name="foo"}
+              http.ingress_http.downstream_rq_5xx
+                → envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="ingress_http"}
+
+          Counter-examples (NOT what Envoy emits):
+              ✗ envoy_cluster_upstream_rq_2xx{...}            -- digit suffix preserved (wrong)
+              ✗ ...{envoy_response_code_class="2xx",...}       -- label value with literal "xx" (wrong)
+              ✗ envoy_cluster_upstream_rq{envoy_response_code_class="2",...}  -- _xx stripped entirely (wrong)
+
+          Empirical evidence (verbatim excerpt from reference-Envoy /stats/prometheus
+          scrape under a 5-request load with statuses [200,200,404,200,500] through
+          HCM stat_prefix=ingress_http to cluster c_backend):
+
+              # TYPE envoy_cluster_upstream_rq_xx counter
+              envoy_cluster_upstream_rq_xx{envoy_response_code_class="2",envoy_cluster_name="c_backend"} 3
+              envoy_cluster_upstream_rq_xx{envoy_response_code_class="4",envoy_cluster_name="c_backend"} 1
+              envoy_cluster_upstream_rq_xx{envoy_response_code_class="5",envoy_cluster_name="c_backend"} 1
+              # TYPE envoy_http_downstream_rq_xx counter
+              envoy_http_downstream_rq_xx{envoy_response_code_class="1",envoy_http_conn_manager_prefix="ingress_http"} 0
+              envoy_http_downstream_rq_xx{envoy_response_code_class="2",envoy_http_conn_manager_prefix="ingress_http"} 3
+              envoy_http_downstream_rq_xx{envoy_response_code_class="3",envoy_http_conn_manager_prefix="ingress_http"} 0
+              envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="ingress_http"} 1
+              envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="ingress_http"} 1
+
+          Negative-confirmation grep (entire 1181-line scrape, no matches):
+              grep -E 'envoy_[a-z_]*_(1xx|2xx|3xx|4xx|5xx)' /stats/prometheus  # -> 0 matches
+
+          Tag-extractor regex source: Envoy v1.37.2
+          source/common/config/well_known_names.cc, the `RESPONSE_CODE_CLASS`
+          tag entry. Source-tree commit pin = the v1.37.2 release tag, server-side
+          version-string SHA `5afe27fb338b16d5bb06b3a7198bcd581b4e3dee` (matches
+          ENVOY_TARGET.md). The regex captures the inner `\dxx` token from the
+          stat suffix `_<class>xx`, removes the entire `_<class>xx` from the stat
+          name (yielding the base name ending `_xx` after the standard rename), and
+          emits the captured digit as the `response_code_class` tag value.
+
+Rule SN5: Server-scope names (`server.<rest>`) flatten to `envoy_server_<rest>`
+          with no extracted labels.
+
+Rule SN6: HELP text is best-effort English, NOT byte-equal to Envoy's HELP. The
+          differential equivalence claim is on values + label keys + types only.
+
+Rule SN7: Histograms are not emitted by 06.1. (Forward-looking.)
+
+Rule SN8: Per-endpoint cluster stats are not emitted by 06.1. (Forward-looking.)
+```
+
+### 17-name table (introduced by phase 06.1)
+
+`<stat_prefix>` is read from HCM config (already plumbed from phase 04). `<addr>` is the listener bind address normalized like Envoy does (e.g., `0.0.0.0:10000` → `0.0.0.0_10000`). `<n>` is the cluster name as configured in the bootstrap.
+
+**Listener — 2 names:**
+
+| Internal name | Type | Approximate Prometheus name (verify) |
+|---|---|---|
+| `listener.<addr>.downstream_cx_total` | counter | `envoy_listener_downstream_cx_total{envoy_listener_address="<addr>"}` |
+| `listener.<addr>.downstream_cx_active` | gauge | `envoy_listener_downstream_cx_active{envoy_listener_address="<addr>"}` |
+
+**HCM — 5 names:**
+
+| Internal name | Type | Prometheus name |
+|---|---|---|
+| `http.<stat_prefix>.downstream_rq_total` | counter | `envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.downstream_rq_2xx` | counter | `envoy_http_downstream_rq_xx{envoy_response_code_class="2",envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.downstream_rq_3xx` | counter | `envoy_http_downstream_rq_xx{envoy_response_code_class="3",envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.downstream_rq_4xx` | counter | `envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.downstream_rq_5xx` | counter | `envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+
+**Cluster — 8 names:**
+
+| Internal name | Type | Prometheus name |
+|---|---|---|
+| `cluster.<n>.upstream_rq_total` | counter | `envoy_cluster_upstream_rq_total{envoy_cluster_name="<n>"}` |
+| `cluster.<n>.upstream_rq_2xx` | counter | `envoy_cluster_upstream_rq_xx{envoy_response_code_class="2",envoy_cluster_name="<n>"}` |
+| `cluster.<n>.upstream_rq_3xx` | counter | `envoy_cluster_upstream_rq_xx{envoy_response_code_class="3",envoy_cluster_name="<n>"}` |
+| `cluster.<n>.upstream_rq_4xx` | counter | `envoy_cluster_upstream_rq_xx{envoy_response_code_class="4",envoy_cluster_name="<n>"}` |
+| `cluster.<n>.upstream_rq_5xx` | counter | `envoy_cluster_upstream_rq_xx{envoy_response_code_class="5",envoy_cluster_name="<n>"}` |
+| `cluster.<n>.upstream_cx_total` | counter | `envoy_cluster_upstream_cx_total{envoy_cluster_name="<n>"}` |
+| `cluster.<n>.upstream_cx_active` | gauge | `envoy_cluster_upstream_cx_active{envoy_cluster_name="<n>"}` |
+| `cluster.<n>.membership_total` | gauge | `envoy_cluster_membership_total{envoy_cluster_name="<n>"}` (Set once at register, equals N endpoints) |
+
+**Server — 2 names (one EMITTED, one explicitly NOT-EMITTED):**
+
+| Internal name | Type | Approximate Prometheus name (verify) |
+|---|---|---|
+| `server.live` | gauge | `envoy_server_live` (Set to 1 once admin `/ready` returns 200; never reset by 06.1) |
+| `server.uptime` | — | **NOT EMITTED** — depends on monotonic-clock + per-scrape recompute; deferred with histograms (see SPEC §2.1) |
+
+**Total: 17 internal names.** The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
+
+### Twin-series filter discipline (per empirical-verification scrape)
+
+> **Twin-series filter discipline (per empirical-verification scrape):** Envoy v1.37.2 ALSO emits two twin metric families that envoy-go does NOT emit and the differential fixture (§7) MUST filter out before per-counter delta comparison: (a) `envoy_cluster_external_upstream_rq_xx` (the "external" upstream-rq twin Envoy uses to split internal vs external traffic via `internal_traffic` config); (b) `envoy_listener_http_downstream_rq_xx` (a listener-scoped HCM-rq twin keyed by both listener address and HCM stat_prefix); plus the per-exact-status family `envoy_cluster_upstream_rq{envoy_response_code="200"}` (a separate metric family with `envoy_response_code` label, distinct from `envoy_cluster_upstream_rq_xx`'s `envoy_response_code_class` label). The fixture's allow-list enumerates exactly the 13 unique Prometheus names this SPEC ships; everything else in the Envoy scrape is ignored.
 
 ---
 

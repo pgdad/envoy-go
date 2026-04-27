@@ -59,10 +59,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch status {
 	case 200:
-		fmt.Fprint(w, "OK\n")
+		_, _ = fmt.Fprint(w, "OK\n")
 	case 502:
-		fmt.Fprint(w, "bad gateway\n")
+		_, _ = fmt.Fprint(w, "bad gateway\n")
 	default:
-		fmt.Fprintf(w, "%d %s\n", status, http.StatusText(status))
+		_, _ = fmt.Fprintf(w, "%d %s\n", status, http.StatusText(status))
 	}
 }
