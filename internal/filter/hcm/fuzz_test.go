@@ -32,7 +32,9 @@ func FuzzHCMConfigParse(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, typeURL string, value []byte) {
 		any := &anypb.Any{TypeUrl: typeURL, Value: value}
-		_, err := NewFilter(any, cm)
+		// Fresh Registry per iteration so the 5 HCM-scope counters NewFilter
+		// allocates on the happy path don't collide across fuzz iterations.
+		_, err := NewFilter(any, cm, stats.NewRegistry())
 		if err != nil && !strings.HasPrefix(err.Error(), "hcm:") {
 			t.Errorf("error not hcm:-prefixed: %v", err)
 		}

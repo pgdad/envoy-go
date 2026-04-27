@@ -46,7 +46,7 @@ func TestDirectResponseAction_Do(t *testing.T) {
 	a := &directResponseAction{status: 200, bodyText: "OK\n"}
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	if err := a.do(context.Background(), &http.Request{}, bw); err != nil {
+	if _, err := a.do(context.Background(), &http.Request{}, bw); err != nil {
 		t.Fatalf("do: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
@@ -176,7 +176,23 @@ func loopbackHTTPEcho(t *testing.T) (string, func()) {
 // singleEndpointCluster builds a *cluster.Cluster pointing at addr by going
 // through cluster.NewManager with a minimal Bootstrap. Mirrors the
 // mkClusterMgr helper in internal/listener/manager_test.go:59-93.
+// singleEndpointClusterWithRegistry is the Task-11 variant that ALSO returns
+// the Registry the Manager registered the cluster's 8 metrics on, so test
+// code can read counter values across the package boundary (cluster fields
+// are unexported).
+func singleEndpointClusterWithRegistry(t *testing.T, addr string) (*cluster.Cluster, *stats.Registry) {
+	t.Helper()
+	c, reg := singleEndpointClusterAndReg(t, addr)
+	return c, reg
+}
+
 func singleEndpointCluster(t *testing.T, addr string) *cluster.Cluster {
+	t.Helper()
+	c, _ := singleEndpointClusterAndReg(t, addr)
+	return c
+}
+
+func singleEndpointClusterAndReg(t *testing.T, addr string) (*cluster.Cluster, *stats.Registry) {
 	t.Helper()
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -211,7 +227,8 @@ func singleEndpointCluster(t *testing.T, addr string) *cluster.Cluster {
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	reg := stats.NewRegistry()
+	cm, err := cluster.NewManager(bs, reg)
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}
@@ -219,7 +236,7 @@ func singleEndpointCluster(t *testing.T, addr string) *cluster.Cluster {
 	if !ok {
 		t.Fatal("cluster.Manager.Get(c_test) returned !ok")
 	}
-	return c
+	return c, reg
 }
 
 func TestRouterAction_DoHappy(t *testing.T) {
@@ -237,7 +254,7 @@ func TestRouterAction_DoHappy(t *testing.T) {
 	// loopbackHTTPEcho writes `Connection: close` in its response, so the
 	// router action correctly signals close via errCloseAfterAction (per
 	// SPEC §5.3 / SPEC §10 #3 settled). Any other error is a real failure.
-	if err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
+	if _, err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
 		t.Fatalf("do: %v", err)
 	}
 	_ = bw.Flush()
@@ -256,7 +273,7 @@ func TestRouterAction_DoDialFailureReturns503(t *testing.T) {
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	if err := a.do(req.Context(), req, bw); err != nil {
+	if _, err := a.do(req.Context(), req, bw); err != nil {
 		// dial-failure becomes a 503 LOCAL REPLY; do() should NOT error
 		// (it writes the local reply and returns nil).
 		if !errors.Is(err, errCloseAfterAction) {
@@ -283,7 +300,7 @@ func TestRouterAction_DoCtxCancel(t *testing.T) {
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	if err := a.do(ctx, req, bw); err != nil {
+	if _, err := a.do(ctx, req, bw); err != nil {
 		t.Errorf("ctx-cancel should map to 503 local reply, not propagate err: %v", err)
 	}
 	_ = bw.Flush()
@@ -549,7 +566,21 @@ func startH2Backend(t *testing.T, pki *h2BackendPKI, behavior h2BackendBehavior,
 // to use H2 (UseH2()==true) with the given pki for ALPN h2 verification.
 // Mirrors singleEndpointCluster but routes through the manager's
 // HttpProtocolOptions parser to set useH2.
+// h2EndpointClusterWithRegistry is the Task-11 variant that ALSO returns the
+// Registry the Manager registered the cluster's 8 metrics on. Same rationale
+// as singleEndpointClusterWithRegistry above.
+func h2EndpointClusterWithRegistry(t *testing.T, addr string, pki *h2BackendPKI) (*cluster.Cluster, *stats.Registry) {
+	t.Helper()
+	return h2EndpointClusterAndReg(t, addr, pki)
+}
+
 func h2EndpointCluster(t *testing.T, addr string, pki *h2BackendPKI) *cluster.Cluster {
+	t.Helper()
+	c, _ := h2EndpointClusterAndReg(t, addr, pki)
+	return c
+}
+
+func h2EndpointClusterAndReg(t *testing.T, addr string, pki *h2BackendPKI) (*cluster.Cluster, *stats.Registry) {
 	t.Helper()
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -619,7 +650,8 @@ func h2EndpointCluster(t *testing.T, addr string, pki *h2BackendPKI) *cluster.Cl
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	reg := stats.NewRegistry()
+	cm, err := cluster.NewManager(bs, reg)
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}
@@ -630,7 +662,7 @@ func h2EndpointCluster(t *testing.T, addr string, pki *h2BackendPKI) *cluster.Cl
 	if !c.UseH2() {
 		t.Fatal("c.UseH2()=false; expected true")
 	}
-	return c
+	return c, reg
 }
 
 // pemEncodeCAPool re-encodes the PKI's CA cert as PEM bytes for inline_bytes.
@@ -680,7 +712,7 @@ func TestRouterActionH2_HappyPath(t *testing.T) {
 	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
+	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
 		t.Fatalf("doH2: %v", err)
 	}
 	if got := w.statusOf(); got != "200" {
@@ -706,7 +738,7 @@ func TestRouterActionH2_502OnDialFailure(t *testing.T) {
 	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
+	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
 		t.Fatalf("doH2: %v", err)
 	}
 	if got := w.statusOf(); got != "502" {
@@ -731,7 +763,7 @@ func TestRouterActionH2_502OnRoundTripProtocolError(t *testing.T) {
 	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
+	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
 		t.Fatalf("doH2: %v", err)
 	}
 	if got := w.statusOf(); got != "502" {
@@ -758,7 +790,7 @@ func TestRouterActionH2_CtxCancelEmitsRSTStreamCancel(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		cancel()
 	}()
-	err := a.doH2(ctx, h2RequestForTest(), w)
+	_, err := a.doH2(ctx, h2RequestForTest(), w)
 	if err == nil {
 		t.Fatal("doH2 returned nil; want stream-scoped CANCEL error")
 	}
@@ -779,6 +811,104 @@ func TestRouterActionH2_CtxCancelEmitsRSTStreamCancel(t *testing.T) {
 	}
 }
 
+// counterValue walks the Registry and returns the Load() of the counter named
+// `name`, or -1 if no counter by that name is registered. Used by the Task 11
+// hot-path tests to read cluster-scope counters across the package boundary
+// (cluster's metric fields are unexported).
+func counterValue(t *testing.T, r *stats.Registry, name string) int64 {
+	t.Helper()
+	got := int64(-1)
+	r.Walk(func(m stats.Metric) {
+		if m.Name() == name {
+			if c, ok := m.(*stats.Counter); ok {
+				got = int64(c.Load())
+			}
+		}
+	})
+	return got
+}
+
+// TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass — Phase 06.1 Task 11
+// hot path (H1 router): driving routerAction.do against a backend returning
+// 200 Inc's c.upstreamRqTotal by 1 AND c.upstreamRq2xx by 1, per SPEC §5.5
+// (Increment paths table, "routerAction.do (H1)" row).
+func TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass(t *testing.T) {
+	addr, stop := loopbackHTTPEcho(t)
+	defer stop()
+
+	c, reg := singleEndpointClusterWithRegistry(t, addr)
+	a := &routerAction{cluster: c}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
+		t.Fatalf("do: %v", err)
+	}
+	_ = bw.Flush()
+
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_total"); got != 1 {
+		t.Errorf("upstream_rq_total = %d, want 1", got)
+	}
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_2xx"); got != 1 {
+		t.Errorf("upstream_rq_2xx = %d, want 1", got)
+	}
+}
+
+// TestRouterAction_Do_DialFailureInc5xx — Phase 06.1 Task 11: on a Dial
+// failure path the action emits a 503 local reply; the cluster-scope
+// status-class counter for the 5xx class Inc's once. This mirrors the
+// "5xx Inc lands on the dial-failure local-reply path too" annotation in
+// PLAN Task 11 Step 3.
+func TestRouterAction_Do_DialFailureInc5xx(t *testing.T) {
+	c, reg := singleEndpointClusterWithRegistry(t, "127.0.0.1:1") // unreachable
+	a := &routerAction{cluster: c}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	_, _ = a.do(req.Context(), req, bw)
+	_ = bw.Flush()
+
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_total"); got != 1 {
+		t.Errorf("upstream_rq_total on dial-failure = %d, want 1", got)
+	}
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_5xx"); got != 1 {
+		t.Errorf("upstream_rq_5xx on 503 local-reply = %d, want 1", got)
+	}
+}
+
+// TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass — Phase 06.1 Task 11
+// hot path (H2 router): driving routerActionH2.doH2 against a backend
+// returning 200 Inc's c.upstreamRqTotal by 1 AND c.upstreamRq2xx by 1, per
+// SPEC §5.5 (Increment paths table, "routerActionH2.do (H2)" row).
+func TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass(t *testing.T) {
+	pki := mkH2BackendPKI(t)
+	body := []byte("upstream-ok\n")
+	ln := startH2Backend(t, pki, h2BackendOK, body)
+	defer func() { _ = ln.Close() }()
+
+	c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)
+	a := &routerActionH2{cluster: c}
+
+	w := &captureH2Writer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
+		t.Fatalf("doH2: %v", err)
+	}
+	if got := counterValue(t, reg, "cluster.c_h2_backend.upstream_rq_total"); got != 1 {
+		t.Errorf("upstream_rq_total = %d, want 1", got)
+	}
+	if got := counterValue(t, reg, "cluster.c_h2_backend.upstream_rq_2xx"); got != 1 {
+		t.Errorf("upstream_rq_2xx = %d, want 1", got)
+	}
+}
+
 // TestRouterActionH2_Upstream5xxForwardedVerbatim verifies that an upstream
 // 503 status is forwarded verbatim to the downstream (not translated to 502).
 // Per the failure-class mapping: protocol errors become 502; upstream HTTP
@@ -795,7 +925,7 @@ func TestRouterActionH2_Upstream5xxForwardedVerbatim(t *testing.T) {
 	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
+	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
 		t.Fatalf("doH2: %v", err)
 	}
 	if got := w.statusOf(); got != "503" {
@@ -841,7 +971,7 @@ func TestRouterActionH2_DefensiveDoEmits500AndLogs(t *testing.T) {
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://x/", nil)
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	if err := a.do(req.Context(), req, bw); err != nil {
+	if _, err := a.do(req.Context(), req, bw); err != nil {
 		t.Fatalf("do: unexpected error %v", err)
 	}
 	_ = bw.Flush()

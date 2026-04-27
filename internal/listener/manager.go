@@ -63,14 +63,12 @@ var filterRegistry = map[string]filterConstructor{
 		}
 		return f, nil
 	},
-	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, _ *stats.Registry) (filterHandler, error) {
+	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry) (filterHandler, error) {
 		// Bridge listenerCtx into hcm.ListenerCtx (the public shape exposed by
 		// hcm so that the listener manager doesn't import hcm-internal types).
-		// The Registry is captured here for Task 11; hcm.NewFilterWithCtx will
-		// gain a Registry parameter at that task and this closure forwards it
-		// then. For Task 10 the parameter is plumbed but the HCM constructor
-		// does not yet consume it.
-		f, err := hcm.NewFilterWithCtx(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C})
+		// Phase 06.1 Task 11: the Registry is now consumed by NewFilterWithCtx
+		// to allocate the 5 HCM-scope per-instance metrics per SPEC §6.
+		f, err := hcm.NewFilterWithCtx(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C}, registry)
 		if err != nil {
 			return nil, err
 		}

@@ -38,8 +38,16 @@ func (m matchPrefix) matches(p string) bool { return strings.HasPrefix(p, string
 // routerAction (proxies via Cluster.Dial). Returning errCloseAfterAction
 // from do signals the connection loop to close after this iteration; other
 // non-nil errors propagate and trigger downstream close.
+//
+// Phase 06.1 Task 11 widened do's return to (status int, err error) so
+// runConnection can Inc the HCM downstream_rq_<Nxx> bucket per SPEC §5.5
+// without snooping bw. status is the HTTP status code finalized by the
+// action (e.g. 200 for a happy direct_response, 502/503 for a router
+// local-reply on dial/upstream failure, the upstream response code for
+// a successful proxy round-trip). status is meaningful even when err is
+// non-nil (the action populates it before the writer error).
 type routeAction interface {
-	do(ctx context.Context, req *http.Request, bw *bufio.Writer) error
+	do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error)
 }
 
 // routeEntry pairs a match predicate with the action to invoke on a hit. The

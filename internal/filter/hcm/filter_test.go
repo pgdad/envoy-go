@@ -8,11 +8,13 @@ import (
 	"time"
 
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func TestNewFilter_HappyPath(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilter(mkHCM(nil), cm)
+	f, err := NewFilter(mkHCM(nil), cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewFilter: %v", err)
 	}
@@ -28,8 +30,111 @@ func TestNewFilter_PreservesParseErrorPrefix(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
 	// NewFilter uses zero-value ListenerCtx (no TLS, no allowH2C); HTTP2 must be rejected.
-	if _, err := NewFilter(any, cm); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
+	if _, err := NewFilter(any, cm, stats.NewRegistry()); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
 		t.Errorf("expected hcm:-prefixed error, got: %v", err)
+	}
+}
+
+// TestNewFilter_Allocates5HCMMetrics — Phase 06.1 Task 11: NewFilter must
+// register the 5 HCM-scope per-instance counters per SPEC §6 ("HCM — 5 names")
+// on the supplied Registry, keyed by stat_prefix from the HCM config.
+func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
+	cm := mkClusterManager(t)
+	r := stats.NewRegistry()
+	if _, err := NewFilter(mkHCM(nil), cm, r); err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+	want := map[string]bool{
+		"http.ingress_http.downstream_rq_total": false,
+		"http.ingress_http.downstream_rq_2xx":   false,
+		"http.ingress_http.downstream_rq_3xx":   false,
+		"http.ingress_http.downstream_rq_4xx":   false,
+		"http.ingress_http.downstream_rq_5xx":   false,
+	}
+	r.Walk(func(m stats.Metric) {
+		if _, ok := want[m.Name()]; ok {
+			want[m.Name()] = true
+		}
+	})
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("missing HCM-scope metric %q in Registry after NewFilter", name)
+		}
+	}
+}
+
+// TestFilter_RequestEntry_IncsDownstreamRqTotal — Phase 06.1 Task 11 hot path:
+// driving a single HTTP/1.1 GET / through a Filter Inc's downstream_rq_total
+// by exactly 1. Per SPEC §12 #1 site (a): "first byte of request line/headers
+// in connection.go's read loop" — once-per-request, before route-match.
+func TestFilter_RequestEntry_IncsDownstreamRqTotal(t *testing.T) {
+	cm := mkClusterManager(t)
+	r := stats.NewRegistry()
+	f, err := NewFilter(mkHCM(nil), cm, r)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+	if got := f.downstreamRqTotal.Load(); got != 0 {
+		t.Fatalf("downstream_rq_total pre-request = %d, want 0", got)
+	}
+
+	client, server := connPair(t)
+	defer func() { _ = client.Close() }()
+	go f.Handle(context.Background(), server)
+
+	writeRequest(t, client, "GET", "/health", "Connection: close")
+	if got := readResponseStatus(t, client); got != 200 {
+		t.Errorf("status: got %d, want 200", got)
+	}
+	if got := f.downstreamRqTotal.Load(); got != 1 {
+		t.Errorf("downstream_rq_total post-request = %d, want 1", got)
+	}
+}
+
+// TestFilter_ResponseFinalization_IncsStatusClassCounter — Phase 06.1 Task 11
+// hot path: a 200 response Inc's downstream_rq_2xx; 404 Inc's downstream_rq_4xx.
+// Per SPEC §5.5 + §6: "switch on response status class → downstream_rq_<Nxx>.Inc()
+// once per response. Lives where the response status code is finalized, before
+// bytes hit the wire." 200 comes from the /health direct_response; 404 comes
+// from the no-route-matched catch-all (mkHCM defines only /health).
+func TestFilter_ResponseFinalization_IncsStatusClassCounter(t *testing.T) {
+	cm := mkClusterManager(t)
+	r := stats.NewRegistry()
+	f, err := NewFilter(mkHCM(nil), cm, r)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+
+	// 200 — /health direct_response.
+	client200, server200 := connPair(t)
+	defer func() { _ = client200.Close() }()
+	go f.Handle(context.Background(), server200)
+	writeRequest(t, client200, "GET", "/health", "Connection: close")
+	if got := readResponseStatus(t, client200); got != 200 {
+		t.Fatalf("/health status: got %d, want 200", got)
+	}
+	if got := f.downstreamRq2xx.Load(); got != 1 {
+		t.Errorf("downstream_rq_2xx after 200 = %d, want 1", got)
+	}
+
+	// 404 — no route match for /missing (mkHCM defines only /health).
+	client404, server404 := connPair(t)
+	defer func() { _ = client404.Close() }()
+	go f.Handle(context.Background(), server404)
+	writeRequest(t, client404, "GET", "/missing", "Connection: close")
+	if got := readResponseStatus(t, client404); got != 404 {
+		t.Fatalf("/missing status: got %d, want 404", got)
+	}
+	if got := f.downstreamRq4xx.Load(); got != 1 {
+		t.Errorf("downstream_rq_4xx after 404 = %d, want 1", got)
+	}
+
+	// 3xx and 5xx counters remain at 0 — no path produced those classes.
+	if got := f.downstreamRq3xx.Load(); got != 0 {
+		t.Errorf("downstream_rq_3xx unexpected = %d, want 0", got)
+	}
+	if got := f.downstreamRq5xx.Load(); got != 0 {
+		t.Errorf("downstream_rq_5xx unexpected = %d, want 0", got)
 	}
 }
 
@@ -41,7 +146,7 @@ func TestNewFilter_PreservesParseErrorPrefix(t *testing.T) {
 func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	f, err := NewFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true})
+	f, err := NewFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewFilterWithCtx: %v", err)
 	}
@@ -67,7 +172,7 @@ func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
-	f, err := NewFilterWithCtx(any, cm, ListenerCtx{})
+	f, err := NewFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewFilterWithCtx: %v", err)
 	}
@@ -84,7 +189,7 @@ func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 
 func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilter(mkHCM(nil), cm)
+	f, err := NewFilter(mkHCM(nil), cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +210,7 @@ func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 
 func TestFilter_Handle_CtxAlreadyCancelledShortCircuits(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilter(mkHCM(nil), cm)
+	f, err := NewFilter(mkHCM(nil), cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}

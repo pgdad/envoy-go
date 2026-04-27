@@ -11,7 +11,33 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
+
+// mkFilterForTable builds a minimal *Filter that wraps the given route table
+// with throwaway HCM-scope counters allocated on a fresh Registry. Used by
+// the H1-codec connection_test.go suite (which formerly drove runConnection
+// with a bare *routeTable). Phase 06.1 Task 11: runConnection now takes
+// *Filter so it can Inc the 5 HCM-scope counters per SPEC §5.5; legacy
+// tests are forwarded through this wrapper so the existing assertions
+// (status code, keep-alive shape) still drive the same code path.
+func mkFilterForTable(t *testing.T, tt *routeTable) *Filter {
+	t.Helper()
+	r := stats.NewRegistry()
+	// Each test gets its own Registry so the per-test name uses a fixed
+	// "ingress_http" stat_prefix without colliding across tests.
+	prefix := "http.ingress_http."
+	return &Filter{
+		table:             tt,
+		statPrefix:        "ingress_http",
+		downstreamRqTotal: r.NewCounter(prefix + "downstream_rq_total"),
+		downstreamRq2xx:   r.NewCounter(prefix + "downstream_rq_2xx"),
+		downstreamRq3xx:   r.NewCounter(prefix + "downstream_rq_3xx"),
+		downstreamRq4xx:   r.NewCounter(prefix + "downstream_rq_4xx"),
+		downstreamRq5xx:   r.NewCounter(prefix + "downstream_rq_5xx"),
+	}
+}
 
 // connPair returns a connected pair of net.Conn, both ends in-process.
 func connPair(t *testing.T) (clientSide, serverSide net.Conn) {
@@ -71,7 +97,7 @@ func TestRunConnection_DirectResponseHappy(t *testing.T) {
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
 
-	go runConnection(context.Background(), server, tt)
+	go runConnection(context.Background(), server, mkFilterForTable(t, tt))
 
 	writeRequest(t, client, "GET", "/health", "Connection: close")
 	if got := readResponseStatus(t, client); got != 200 {
@@ -85,7 +111,7 @@ func TestRunConnection_KeepAliveTwoRequests(t *testing.T) {
 	}}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
-	go runConnection(context.Background(), server, tt)
+	go runConnection(context.Background(), server, mkFilterForTable(t, tt))
 
 	writeRequest(t, client, "GET", "/health")
 	if got := readResponseStatus(t, client); got != 200 {
@@ -103,7 +129,7 @@ func TestRunConnection_RouteNotFoundReturns404(t *testing.T) {
 	}}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
-	go runConnection(context.Background(), server, tt)
+	go runConnection(context.Background(), server, mkFilterForTable(t, tt))
 
 	writeRequest(t, client, "GET", "/missing", "Connection: close")
 	if got := readResponseStatus(t, client); got != 404 {
@@ -115,7 +141,7 @@ func TestRunConnection_ExpectHeaderReturns417(t *testing.T) {
 	tt := &routeTable{}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
-	go runConnection(context.Background(), server, tt)
+	go runConnection(context.Background(), server, mkFilterForTable(t, tt))
 
 	writeRequest(t, client, "GET", "/x", "Expect: 100-continue", "Connection: close")
 	if got := readResponseStatus(t, client); got != 417 {
@@ -127,7 +153,7 @@ func TestRunConnection_UpgradeReturns501(t *testing.T) {
 	tt := &routeTable{}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
-	go runConnection(context.Background(), server, tt)
+	go runConnection(context.Background(), server, mkFilterForTable(t, tt))
 
 	writeRequest(t, client, "GET", "/x", "Upgrade: websocket", "Connection: Upgrade")
 	if got := readResponseStatus(t, client); got != 501 {
@@ -139,7 +165,7 @@ func TestRunConnection_BadRequestReturns400(t *testing.T) {
 	tt := &routeTable{}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
-	go runConnection(context.Background(), server, tt)
+	go runConnection(context.Background(), server, mkFilterForTable(t, tt))
 
 	if _, err := io.WriteString(client, "GARBAGE\r\n\r\n"); err != nil {
 		t.Fatal(err)
@@ -209,7 +235,7 @@ func TestRunConnection_UpstreamConnectionCloseClosesDownstream(t *testing.T) {
 
 	loopDone := make(chan struct{})
 	go func() {
-		runConnection(context.Background(), server, tt)
+		runConnection(context.Background(), server, mkFilterForTable(t, tt))
 		close(loopDone)
 	}()
 
@@ -257,7 +283,7 @@ func TestRunConnection_BodyDrainedBetweenRequests(t *testing.T) {
 	}}
 	client, server := connPair(t)
 	defer func() { _ = client.Close() }()
-	go runConnection(context.Background(), server, tt)
+	go runConnection(context.Background(), server, mkFilterForTable(t, tt))
 
 	body := strings.Repeat("x", 64)
 	if _, err := io.WriteString(client,

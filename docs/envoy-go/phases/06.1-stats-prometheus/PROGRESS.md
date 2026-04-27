@@ -701,3 +701,118 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.014s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.026s
 ```
+
+## Task 11 — HCM per-instance metric alloc + dispatch hot path + M-9 carry-forward
+
+**Commits:** TBD
+**Notes:** Widened `hcm.NewFilter(tc, cm)` and `hcm.NewFilterWithCtx(tc, cm, lc)` to accept a trailing `registry *stats.Registry` parameter; `parseFilterWithCtx` allocates the 5 HCM-scope per-instance metrics from SPEC §6 (`http.<stat_prefix>.downstream_rq_total`, `http.<stat_prefix>.downstream_rq_<2,3,4,5>xx`) on the supplied Registry at filter-build time (pre-Freeze; SPEC §5.4). Extended the `Filter` struct with 5 unexported metric-pointer fields (`downstreamRqTotal`, `downstreamRq2xx..5xx`) and added the unexported `(*Filter).downstreamStatusClassCounter(code int) *stats.Counter` helper that returns the matching `_Nxx` counter for codes in [200, 599] (nil otherwise; 1xx informationals are NOT bucketed per SPEC §2.1) — mirrors `(*Cluster).statusClassCounter` from Task 8.
+
+Hot-path edits per SPEC §5.5 + §12 #1 site (a):
+
+- **H1 path (connection.go, runConnection):** signature changed from `(ctx, downstream, *routeTable)` to `(ctx, downstream, *Filter)` so the read loop can Inc the HCM counters. Inc `f.downstreamRqTotal` once after `http.ReadRequest` returns successfully (the once-per-request dispatch-entry hook). On response status finalization (route-match → `entry.action.do` returns the status; no-match → 404 catch-all; parse-error → synthesized 400; Expect: → 417; Upgrade: → 501; action error → status from do's first return), Inc `f.downstreamStatusClassCounter(status)` BEFORE `bw.Flush` per SPEC §5.5 "before bytes hit the wire".
+
+- **H2 path (h2dispatch.go):** `h2Dispatcher` now holds `*Filter` (not `*routeTable`) so `Match` Inc's `f.downstreamRqTotal` once per request before route-table dispatch (the H2 analog of site (a)). The three adapters (`h2DirectResponseAdapter`, `h2RouterActionAdapter`, `h2RouterActionRejection`) carry the parent `*Filter` and Inc the matching HCM-scope downstream_rq_<Nxx> bucket on response status finalization.
+
+- **routeAction interface (route.go):** widened `do(ctx, req, bw) error` → `do(ctx, req, bw) (int, error)` so runConnection can read the finalized status without snooping the bufio.Writer. Status is meaningful even on error returns (the action populates it before the writer error). Cascade: `directResponseAction.do` returns `(a.status, nil)`; `routerAction.do` returns the upstream `resp.StatusCode` (or 503/502 on local-reply paths); `routerActionH2.do` defensive H1 stub returns `(500, nil)`.
+
+- **routerActionH2.doH2:** widened to return `(int, error)` so `h2RouterActionAdapter.WriteH2` knows the wire status for the HCM downstream_rq_<Nxx> Inc. status==0 on the ctx-cancel path (no terminating response) signals the adapter to skip the bucket Inc.
+
+- **actions.go (cluster-scope):** `routerAction.do` Inc's `r.cluster.UpstreamRqTotalInc()` at dispatch entry; on every status-finalization path (dial-failure 503, write-failure 502, read-failure 502, successful proxy `resp.StatusCode`) Inc's `r.cluster.IncStatusClass(code)`. Same pattern in `routerActionH2.doH2`. The cluster-side accessors `(*Cluster).UpstreamRqTotalInc()` and `(*Cluster).IncStatusClass(code int)` are new exported helpers on `*Cluster` (cluster.go) so the hcm package can drive them without reaching across the package boundary into unexported metric fields.
+
+- **M-9 carry-forward (SPEC §13.1):** `h2RouterActionAdapter.WriteH2` now logs `log.Printf("h2: doH2 error: %v", err)` on the `doH2` error path BEFORE propagating the error. To make the log line independently testable without mocking the upstream H2 dial, the adapter exposes a `doH2Fn` function-typed field default-bound at construction in `h2Dispatcher.Match` (`adapter.doH2Fn = a.doH2`). Tests substitute the field with a sentinel-failing function and capture the log via `log.SetOutput`. Closes the observability gap recorded in 05.2 REVIEW M-9 (`docs/envoy-go/phases/05.2-upstream-h2/REVIEW.md` line 175); SPEC §13.1 explicitly bundles M-9 with 06.1.
+
+**PLAN deviation #1 — M-9 test file location.** PLAN's "Step 4" + SPEC §11.4 + §12 #5 + §14 line 715 specify `internal/filter/hcm/h2/router_action_test.go` (a new file in the h2 sub-package). Reality: `h2RouterActionAdapter` lives in package `hcm` at `internal/filter/hcm/h2dispatch.go` (NOT in package `h2` and NOT in a file named `router_action.go` — never has been). Symbols are unexported in package `hcm`, so a test in package `h2` cannot reach them without exporting the adapter (a wider API change than the M-9 fix warrants). Per SPEC §11.4's "(new or appended to existing test file)" relaxation, the M-9 unit test landed at `internal/filter/hcm/h2dispatch_test.go` (new file) in package `hcm` alongside the symbol it tests. The acceptance-checklist line 715 "M-9 ... lands in `internal/filter/hcm/h2/router_action.go` + `router_action_test.go`" is updated factually to "lands in `internal/filter/hcm/h2dispatch.go` + `h2dispatch_test.go`" — the SHA-fill follow-up commit can update the checklist if the reviewer wants the on-disk evidence to match the SPEC literal.
+
+**PLAN deviation #2 — routeAction interface widened.** PLAN Step 2 sketched the response-finalization Inc as `if c := f.downstreamStatusClassCounter(resp.StatusCode); c != nil { c.Inc() }` inside the filter, but the H1 driver (`runConnection`) does not see the response — only the action does (the action writes directly to bw and returns error-only). Two options surfaced: (a) snoop the bufio.Writer for a `HTTP/1.1 NNN` line; (b) extend the routeAction interface to return status. Option (a) is fragile (writeStatusReply formatting drift, partial-write detection). Option (b) is one extra int return per implementation (3 sites: directResponseAction, routerAction, routerActionH2) and gives runConnection a clean status signal. Chose (b). Forced cascade: 5 existing test sites in `actions_test.go` + 1 in `connection_test.go` (the `actErr` shadowing pattern) updated mechanically to discard the new return — no behavior change in the existing assertions.
+
+**PLAN deviation #3 — h2.Action interface NOT widened.** PLAN sketched a similar status-return widening for `WriteH2`. Reality: `h2.Action` is defined in `internal/filter/hcm/h2/stream.go` (the codec sub-package) and widening it would ripple into the h2 package's serverStream.dispatch + every fake/stub in h2 + the fuzzer's stubAction. Settled instead by widening `routerActionH2.doH2` (a hcm-package internal method) and having `h2RouterActionAdapter.WriteH2` consume the status return locally before honoring the `error`-only public interface. Cleaner: the hcm-package status discipline stays inside the hcm package; the h2 sub-package is unchanged.
+
+**PLAN deviation #4 — file scope.** PLAN named `internal/filter/hcm/h2/router_action.go` for the M-9 fix (per SPEC §14 line 715) and `internal/filter/hcm/h2/router_action_test.go` for the test. Both files don't exist; the actual surface lives in `internal/filter/hcm/h2dispatch.go` (production) and the test lands at `internal/filter/hcm/h2dispatch_test.go` (new). See deviation #1 above.
+
+**PLAN deviation #5 — H2 happy-path HCM downstream_rq_<Nxx> bucketing.** Initial implementation per the literal SPEC §5.5 row "HCM response hook" left this gap: doH2 streams the upstream response directly to the downstream StreamWriter, so the wire status is buried inside `resp.Status`. Closed by widening `routerActionH2.doH2` to return `(status int, error)` and having `h2RouterActionAdapter.WriteH2` Inc the HCM bucket from that return — settled inside Task 11 because the status was needed anyway for the cluster-side Inc.
+
+**Cascade-fix surface.** The `NewFilter` / `parseFilterWithCtx` signature change cascaded into `internal/filter/hcm/{filter,config,fuzz,actions,h2dispatch}_test.go`'s pre-existing call sites (replaced bare 2-arg NewFilter / 3-arg parseFilterWithCtx with the new 3-arg / 4-arg shapes plus throwaway `stats.NewRegistry()`). The `routeAction.do` interface widening cascaded into 9 existing test sites in `actions_test.go` + `connection_test.go` (changed `if err := a.do(...)` to `if _, err := a.do(...)`). The `h2Dispatcher` constructor change required `runConnection` to take `*Filter` instead of `*routeTable`; the existing 8 `connection_test.go` callers got a thin `mkFilterForTable(t, tt)` wrapper that allocates throwaway HCM counters on a fresh Registry — no behavior change. The listener-manager closure (`internal/listener/manager.go`'s `filterRegistry[hcm.TypeURL]`) un-`_`'d the registry parameter and forwards it to `hcm.NewFilterWithCtx` — completes the threading begun at Task 10. No production caller (cmd/envoy-go/main.go) changed; the listener manager already received `bs.Stats` at Task 10 and now flows it through to NewFilterWithCtx via the closure. No new ADR (PLAN explicitly annotates Task 11 as ADR-free).
+
+Anchored: SPEC §1 #3, §1 #6 (M-9 carry-forward), §4.2 (`filter/hcm/{filter,config,connection,actions,h2dispatch,route}.go` extensions), §5.5 (Increment paths table — HCM dispatch entry, HCM response hook, routerAction.do H1, routerActionH2.do H2), §6 (5 HCM names + 4 of 8 cluster names), §11.3 (filter_test + actions_test extensions), §11.4 (M-9 unit test — landed at h2dispatch_test.go per deviation #1), §12 #1 site (a) (HCM Inc hook site decision — settled to the H1 read-loop and the H2 Match call), §12 #5 (M-9 test file — settled to h2dispatch_test.go per deviation #1), §13.1 (M-9 carry-forward bundle).
+**Outputs:**
+```
+$ go test ./internal/filter/hcm/ -count=1 -run 'TestNewFilter_Allocates5HCMMetrics|TestFilter_RequestEntry_IncsDownstreamRqTotal|TestFilter_ResponseFinalization_IncsStatusClassCounter|TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass|TestRouterAction_Do_DialFailureInc5xx|TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass|TestH2RouterActionAdapter_WriteH2_LogsOnDoH2Error|TestH2RouterActionAdapter_WriteH2_NoLogOnSuccess' -v
+# pre-implementation (RED — build failure: signatures and fields don't exist yet):
+# github.com/esalaine/envoy-go/internal/filter/hcm [github.com/esalaine/envoy-go/internal/filter/hcm.test]
+internal/filter/hcm/filter_test.go:17:38: too many arguments in call to NewFilter
+	have (*anypb.Any, *cluster.Manager, *stats.Registry)
+	want (*anypb.Any, *cluster.Manager)
+internal/filter/hcm/filter_test.go:33:34: too many arguments in call to NewFilter
+	have (*anypb.Any, *cluster.Manager, *stats.Registry)
+	want (*anypb.Any, *cluster.Manager)
+internal/filter/hcm/filter_test.go:44:41: too many arguments in call to NewFilter
+	have (*anypb.Any, *cluster.Manager, *stats.Registry)
+	want (*anypb.Any, *cluster.Manager)
+internal/filter/hcm/filter_test.go:73:38: too many arguments in call to NewFilter
+	have (*anypb.Any, *cluster.Manager, *stats.Registry)
+	want (*anypb.Any, *cluster.Manager)
+internal/filter/hcm/filter_test.go:77:14: f.downstreamRqTotal undefined (type *Filter has no field or method downstreamRqTotal)
+internal/filter/hcm/filter_test.go:89:14: f.downstreamRqTotal undefined (type *Filter has no field or method downstreamRqTotal)
+internal/filter/hcm/filter_test.go:103:38: too many arguments in call to NewFilter
+	have (*anypb.Any, *cluster.Manager, *stats.Registry)
+	want (*anypb.Any, *cluster.Manager)
+internal/filter/hcm/filter_test.go:116:14: f.downstreamRq2xx undefined (type *Filter has no field or method downstreamRq2xx)
+internal/filter/hcm/filter_test.go:128:14: f.downstreamRq4xx undefined (type *Filter has no field or method downstreamRq4xx)
+internal/filter/hcm/filter_test.go:133:14: f.downstreamRq3xx undefined (type *Filter has no field or method downstreamRq3xx)
+internal/filter/hcm/filter_test.go:133:14: too many errors
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm [build failed]
+FAIL
+
+# post-implementation (GREEN):
+$ go test -race ./internal/filter/hcm/ -count=1 -v -run 'TestNewFilter_Allocates5HCMMetrics|TestFilter_RequestEntry_IncsDownstreamRqTotal|TestFilter_ResponseFinalization_IncsStatusClassCounter|TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass|TestRouterAction_Do_DialFailureInc5xx|TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass|TestH2RouterActionAdapter_WriteH2_LogsOnDoH2Error|TestH2RouterActionAdapter_WriteH2_NoLogOnSuccess'
+=== RUN   TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass
+--- PASS: TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass (0.00s)
+=== RUN   TestRouterAction_Do_DialFailureInc5xx
+--- PASS: TestRouterAction_Do_DialFailureInc5xx (0.00s)
+=== RUN   TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass
+--- PASS: TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass (0.01s)
+=== RUN   TestNewFilter_Allocates5HCMMetrics
+--- PASS: TestNewFilter_Allocates5HCMMetrics (0.00s)
+=== RUN   TestFilter_RequestEntry_IncsDownstreamRqTotal
+--- PASS: TestFilter_RequestEntry_IncsDownstreamRqTotal (0.00s)
+=== RUN   TestFilter_ResponseFinalization_IncsStatusClassCounter
+--- PASS: TestFilter_ResponseFinalization_IncsStatusClassCounter (0.00s)
+=== RUN   TestH2RouterActionAdapter_WriteH2_LogsOnDoH2Error
+--- PASS: TestH2RouterActionAdapter_WriteH2_LogsOnDoH2Error (0.00s)
+=== RUN   TestH2RouterActionAdapter_WriteH2_NoLogOnSuccess
+--- PASS: TestH2RouterActionAdapter_WriteH2_NoLogOnSuccess (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.038s
+
+$ go vet ./... && go build ./... && go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.919s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.074s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.040s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.051s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.265s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.499s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.035s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.047s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.030s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.084s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.078s
+ok  	github.com/esalaine/envoy-go/test/differential	9.135s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.010s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.010s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.012s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.011s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.023s
+```

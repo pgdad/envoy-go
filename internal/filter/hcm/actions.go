@@ -88,8 +88,12 @@ func (a *directResponseAction) writeH2(sw h2.StreamWriter) error {
 
 // do (preserved for the routeAction interface — H1 connection.go calls this
 // unchanged). Behaviourally identical to phase-04 because writeH1 == old do.
-func (a *directResponseAction) do(_ context.Context, _ *http.Request, bw *bufio.Writer) error {
-	return a.writeH1(bw)
+//
+// Phase 06.1 Task 11: returns (a.status, error). The configured direct_response
+// status is the finalized response code; runConnection Inc's the matching
+// downstream_rq_<Nxx> bucket from this return.
+func (a *directResponseAction) do(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, error) {
+	return a.status, a.writeH1(bw)
 }
 
 // routerAction proxies the request to the named cluster's selected endpoint.
@@ -108,10 +112,26 @@ type routerAction struct {
 	cluster *cluster.Cluster
 }
 
-func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) error {
+// do drives one upstream H1 round-trip. Phase 06.1 Task 11 wires the cluster-
+// scope upstream_rq_total + upstream_rq_<Nxx> counters per SPEC §5.5: total
+// Inc's at dispatch entry (once per attempt, BEFORE Dial); the status-class
+// counter Inc's after the response code is finalized. On the dial-failure /
+// write-failure / read-failure local-reply paths, the synthesized 5xx status
+// (503 for dial, 502 for write/read) is the bucket the cluster-scope counter
+// reflects per the "5xx Inc lands on the dial-failure local-reply path too"
+// annotation in PLAN Task 11.
+//
+// Returns (statusCode, error). statusCode is the finalized HTTP response code
+// (503/502 on local-reply paths; resp.StatusCode on a successful proxy);
+// err is the routeAction error (errCloseAfterAction sentinel or a real
+// write-side failure).
+func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
+	a.cluster.UpstreamRqTotalInc()
+
 	upstream, err := a.cluster.Dial(ctx)
 	if err != nil {
-		return writeStatusReply(bw, 503, "")
+		a.cluster.IncStatusClass(503)
+		return 503, writeStatusReply(bw, 503, "")
 	}
 	defer func() { _ = upstream.Close() }()
 
@@ -124,17 +144,21 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	}
 
 	if err := req.Write(upstream); err != nil {
-		return writeStatusReply(bw, 502, "")
+		a.cluster.IncStatusClass(502)
+		return 502, writeStatusReply(bw, 502, "")
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
 	if err != nil {
-		return writeStatusReply(bw, 502, "")
+		a.cluster.IncStatusClass(502)
+		return 502, writeStatusReply(bw, 502, "")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	a.cluster.IncStatusClass(resp.StatusCode)
+
 	if err := resp.Write(bw); err != nil {
-		return err
+		return resp.StatusCode, err
 	}
 	// Honor the upstream's Connection: close (and HTTP/1.0 close-by-default)
 	// by signaling the connection loop via errCloseAfterAction. http.ReadResponse
@@ -142,9 +166,9 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	// HTTP/1.1, default-close on HTTP/1.0). SPEC §5.3 / SPEC §10 #3 settled.
 	// REVIEW.md I-1 from REVIEW.md 04527eb.
 	if resp.Close {
-		return errCloseAfterAction
+		return resp.StatusCode, errCloseAfterAction
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // routerActionH2 is the H2-flavored router action. Selected at filter-build
@@ -178,10 +202,30 @@ type routerActionH2 struct {
 // doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip
 // per ADR-0056 (per-request fresh dial), writing the response back through
 // the H2 stream writer.
-func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.StreamWriter) error {
+//
+// Phase 06.1 Task 11 wires the cluster-scope upstream_rq_total +
+// upstream_rq_<Nxx> counters per SPEC §5.5 (Increment paths table,
+// "routerActionH2.do (H2)" row): total Inc's at dispatch entry (once per
+// attempt, BEFORE DialH2); the status-class counter Inc's after the
+// upstream response status is finalized. Dial-failure / RoundTrip-failure
+// local-reply paths Inc the 5xx (502) bucket so the cluster-scope
+// counter reflects "what status-class came out of THIS cluster's dispatch".
+// The ctx-cancel path emits a stream-scoped CANCEL — no status is finalized,
+// so no class counter Inc (matches "request did not complete" semantics).
+//
+// Returns (statusForHCM, err). statusForHCM is the wire status the downstream
+// H2 client will observe (502 on local-reply paths; resp.Status on a
+// successful round-trip; 0 when no status is finalized — i.e. ctx-cancel).
+// h2RouterActionAdapter consumes this to Inc the parent Filter's HCM-scope
+// downstream_rq_<Nxx> counter on the H2 path per SPEC §5.5 "HCM response
+// hook" row.
+func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.StreamWriter) (int, error) {
+	r.cluster.UpstreamRqTotalInc()
+
 	cc, err := r.cluster.DialH2(ctx)
 	if err != nil {
-		return r.write502(w)
+		r.cluster.IncStatusClass(502)
+		return 502, r.write502(w)
 	}
 	defer func() { _ = cc.Close() }() // ADR-0056: per-request fresh conn close (analog of phase-04 H1's defer upstream.Close())
 
@@ -196,20 +240,26 @@ func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.Stream
 		if ctx.Err() != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
 			// Surface a stream-scoped CANCEL to serverStream.dispatch which
 			// emits RST_STREAM(CANCEL) per the dispatch carry-error contract.
-			return h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
+			// No upstream_rq_<Nxx> Inc — the request did not produce a
+			// terminating response status. Return 0 so the adapter skips
+			// the HCM-scope downstream_rq_<Nxx> Inc as well.
+			return 0, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
 		}
-		return r.write502(w)
+		r.cluster.IncStatusClass(502)
+		return 502, r.write502(w)
 	}
+
+	r.cluster.IncStatusClass(resp.Status)
 
 	// Forward response: the codec preserves wire order, so resp.Headers already
 	// has :status (and any other pseudo-headers) first per RFC 9113 §8.3.
 	if err := w.WriteHeaders(resp.Headers, false); err != nil {
-		return err // surfaced to serverStream.dispatch which emits RST_STREAM(INTERNAL_ERROR)
+		return resp.Status, err // surfaced to serverStream.dispatch which emits RST_STREAM(INTERNAL_ERROR)
 	}
 	if err := w.WriteData(resp.Body, true); err != nil {
-		return err
+		return resp.Status, err
 	}
-	return nil
+	return resp.Status, nil
 }
 
 // write502 emits a 502 Bad Gateway local-reply via the H2 stream writer.
@@ -247,9 +297,9 @@ func (r *routerActionH2) write502(w h2.StreamWriter) error {
 // the codec-dispatch path. Per the "Two interfaces, two separate
 // decisions" note in PLAN Task 11; closes REVIEW I-2 (observability
 // gap on the unreachable defensive stub).
-func (r *routerActionH2) do(_ context.Context, _ *http.Request, bw *bufio.Writer) error {
+func (r *routerActionH2) do(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, error) {
 	log.Printf("hcm: routerActionH2.do reached on H1 path — bootstrap misconfiguration; route variant selection should have produced *routerAction, not *routerActionH2 (cluster=%q)", r.cluster.Name())
-	return writeStatusReply(bw, 500, "")
+	return 500, writeStatusReply(bw, 500, "")
 }
 
 // Compile-time interface conformance assertion. *routerActionH2 must satisfy

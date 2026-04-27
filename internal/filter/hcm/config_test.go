@@ -141,7 +141,7 @@ func TestParseFilter_CodecTypeHTTP2(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	_, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: false, AllowH2C: false})
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: false, AllowH2C: false}, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for HTTP2 + plaintext, got nil")
 	}
@@ -155,7 +155,7 @@ func TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_AcceptsTLS(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: true}); err != nil {
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: true}, stats.NewRegistry()); err != nil {
 		t.Errorf("HTTP2 + TLS should be accepted, got: %v", err)
 	}
 }
@@ -165,7 +165,7 @@ func TestParseFilter_CodecTypeHTTP2_AcceptsTLS(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_AcceptsAllowH2C(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}); err != nil {
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry()); err != nil {
 		t.Errorf("HTTP2 + allowH2C should be accepted, got: %v", err)
 	}
 }
@@ -176,7 +176,7 @@ func TestParseFilter_CodecTypeAUTO_Accepts_BothCases(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
 	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
-		if _, err := parseFilterWithCtx(any, cm, lc); err != nil {
+		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry()); err != nil {
 			t.Errorf("AUTO + lc=%+v should be accepted, got: %v", lc, err)
 		}
 	}
@@ -188,7 +188,7 @@ func TestParseFilter_CodecTypeHTTP1_Accepts_BothCases(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP1 })
 	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
-		if _, err := parseFilterWithCtx(any, cm, lc); err != nil {
+		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry()); err != nil {
 			t.Errorf("HTTP1 + lc=%+v should be accepted, got: %v", lc, err)
 		}
 	}

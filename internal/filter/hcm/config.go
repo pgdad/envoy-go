@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 const (
@@ -38,31 +39,75 @@ type ListenerCtx struct {
 // route table, the cluster manager handle, and the configured stat_prefix
 // (forward-look for phase 06 stats per ADR-0041). NewFilter and Handle are
 // declared in filter.go (Task 8).
+//
+// 06.1 Task 11: Filter gains 5 HCM-scope per-instance metric pointers per
+// SPEC §6 ("HCM — 5 names"). Allocated by NewFilter from the supplied
+// *stats.Registry at filter-build time (pre-Freeze, per SPEC §5.4 boot
+// ordering); incremented from the H1 connection.go and H2 h2dispatch.go
+// hot paths per SPEC §5.5.
 type Filter struct {
 	table      *routeTable
 	clusters   *cluster.Manager
 	statPrefix string
 	codecType  hcmv3.HttpConnectionManager_CodecType
+
+	// 06.1 metric fields (per SPEC §6 — HCM-scope; 5 metrics per HCM
+	// instance). Allocated by NewFilter at build time; pre-Freeze.
+	downstreamRqTotal *stats.Counter
+	downstreamRq2xx   *stats.Counter
+	downstreamRq3xx   *stats.Counter
+	downstreamRq4xx   *stats.Counter
+	downstreamRq5xx   *stats.Counter
+}
+
+// downstreamStatusClassCounter returns the downstream_rq_<Nxx> counter for the
+// given HTTP status code per the integer-divide code/100 discipline (Rule SN4
+// of SPEC §10.1). Returns nil for codes outside [200, 599] (1xx informational
+// responses are NOT bucketed per SPEC §2.1; status-class counters cover only
+// the response-terminating range). Mirrors (*Cluster).statusClassCounter from
+// Task 8.
+func (f *Filter) downstreamStatusClassCounter(code int) *stats.Counter {
+	switch code / 100 {
+	case 2:
+		return f.downstreamRq2xx
+	case 3:
+		return f.downstreamRq3xx
+	case 4:
+		return f.downstreamRq4xx
+	case 5:
+		return f.downstreamRq5xx
+	default:
+		return nil
+	}
 }
 
 // NewFilterWithCtx is the phase-05.1 constructor variant. The existing
 // NewFilter delegates with the zero-value ListenerCtx (allowH2C=false,
 // hasTLS=false), preserving phase-04 semantics.
-func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc)
+//
+// Phase 06.1 Task 11 widened the signature with a trailing *stats.Registry;
+// the constructor allocates the 5 HCM-scope per-instance metrics on the
+// supplied Registry (pre-Freeze; SPEC §5.4 + §6).
+func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry) (*Filter, error) {
+	return parseFilterWithCtx(tc, clusters, lc, registry)
 }
 
 // parseFilter is the legacy entry point retained for existing tests.
-// It delegates to parseFilterWithCtx with a zero-value ListenerCtx.
+// It delegates to parseFilterWithCtx with a zero-value ListenerCtx and a
+// fresh throwaway Registry (legacy callers do not exercise the metric
+// pointers).
 func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{})
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry())
 }
 
 // parseFilterWithCtx decodes the typed_config Any into a *Filter. All errors
 // begin with "hcm: ". See ADR-0040 (HTTP-filter framework subset), ADR-0041
 // (stat_prefix + ignored-set), ADR-0042 (HTTP-filter chain shape), ADR-0038
 // (route match subset), ADR-0050 (ALPN dispatch), and SPEC §2/§9.
-func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx) (*Filter, error) {
+//
+// Task 11: registry is the *stats.Registry the 5 HCM-scope per-instance
+// metrics are allocated on. Must be non-nil and non-Frozen.
+func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry) (*Filter, error) {
 	if got := tc.GetTypeUrl(); got != TypeURL {
 		return nil, fmt.Errorf("hcm: wrong type_url %q (want %q)", got, TypeURL)
 	}
@@ -110,7 +155,18 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, err
 	}
 
-	return &Filter{table: table, clusters: clusters, statPrefix: statPrefix, codecType: codecType}, nil
+	prefix := "http." + statPrefix + "."
+	return &Filter{
+		table:             table,
+		clusters:          clusters,
+		statPrefix:        statPrefix,
+		codecType:         codecType,
+		downstreamRqTotal: registry.NewCounter(prefix + "downstream_rq_total"),
+		downstreamRq2xx:   registry.NewCounter(prefix + "downstream_rq_2xx"),
+		downstreamRq3xx:   registry.NewCounter(prefix + "downstream_rq_3xx"),
+		downstreamRq4xx:   registry.NewCounter(prefix + "downstream_rq_4xx"),
+		downstreamRq5xx:   registry.NewCounter(prefix + "downstream_rq_5xx"),
+	}, nil
 }
 
 func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteConfiguration, error) {

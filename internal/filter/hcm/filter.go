@@ -11,12 +11,17 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 // NewFilter parses the typed_config Any into a *Filter. Errors begin with
 // "hcm: "; the listener manager wraps them with "listener: %q: filter_chains[%d]: ".
-func NewFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{})
+//
+// Phase 06.1 Task 11 widened the signature with a trailing *stats.Registry —
+// see NewFilterWithCtx (config.go) for the contract. The 5 HCM-scope metrics
+// per SPEC §6 are allocated at filter-build time, pre-Freeze.
+func NewFilter(tc *anypb.Any, clusters *cluster.Manager, registry *stats.Registry) (*Filter, error) {
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, registry)
 }
 
 // Handle drives one downstream connection from acceptance to close. ALPN
@@ -37,7 +42,7 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 
 	switch f.codecType {
 	case hcmv3.HttpConnectionManager_HTTP1:
-		runConnection(ctx, downstream, f.table)
+		runConnection(ctx, downstream, f)
 		return
 	case hcmv3.HttpConnectionManager_HTTP2:
 		f.runH2(ctx, downstream)
@@ -53,7 +58,7 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 				return
 			}
 		}
-		runConnection(ctx, downstream, f.table)
+		runConnection(ctx, downstream, f)
 		return
 	}
 }
@@ -61,7 +66,7 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 // runH2 constructs an h2.ServerConn for the downstream conn and runs it to
 // completion. Connection-level errors are logged with "hcm: h2: " prefix.
 func (f *Filter) runH2(ctx context.Context, downstream net.Conn) {
-	disp := newH2Dispatcher(f.table)
+	disp := newH2Dispatcher(f)
 	sc := h2.NewServerConn(ctx, downstream, disp, h2.DefaultServerSettings)
 	if err := sc.Run(); err != nil {
 		log.Printf("hcm: h2: %v", err)
