@@ -1088,7 +1088,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.031s
 
 ## Task 15 — BEHAVIOR_CONTRACT in-place edit + all-gates green local sweep + STATE → lifecycle-state 4
 
-**Commits:** `TBD` (impl commit), follow-up SHA-fill commit per convention.
+**Commits:** `58d4ec9` (impl commit), follow-up SHA-fill commit per convention.
 
 **Anchored:** SPEC §1 #4 (BEHAVIOR_CONTRACT in-place edit), §3 (six-gate phase-done), §4.4 (ROADMAP/STATE/PROGRESS lifecycle), §10 (BEHAVIOR_CONTRACT additions), §14 (full acceptance checklist), and BOOTSTRAP §5.3 (commit-message-completeness), §7.5 (six-gate sweep). Per ADR-0052 the in-place edit replaces the placeholder text rather than a separate doc.
 
