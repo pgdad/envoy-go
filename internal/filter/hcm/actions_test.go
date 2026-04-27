@@ -39,6 +39,7 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func TestDirectResponseAction_Do(t *testing.T) {
@@ -210,7 +211,7 @@ func singleEndpointCluster(t *testing.T, addr string) *cluster.Cluster {
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}
@@ -618,7 +619,7 @@ func h2EndpointCluster(t *testing.T, addr string, pki *h2BackendPKI) *cluster.Cl
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}

@@ -21,6 +21,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func mkRouter() *anypb.Any {
@@ -90,7 +91,7 @@ func mkClusterManager(t *testing.T) *cluster.Manager {
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}
@@ -476,7 +477,7 @@ func mkH2ClusterManager(t *testing.T) *cluster.Manager {
 			},
 		},
 	}
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}

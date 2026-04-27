@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 // echoConn reads bytes from c and writes them back until the connection closes.
@@ -246,5 +248,54 @@ func TestCluster_UseH2_True(t *testing.T) {
 	c := &Cluster{useH2: true}
 	if !c.UseH2() {
 		t.Errorf("Cluster.UseH2() = false, want true (with useH2: true)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// statusClassCounter — Phase 06.1 Task 8 [ADR-0063]
+// ---------------------------------------------------------------------------
+
+// TestCluster_StatusClassCounter_Buckets verifies the integer-divide code/100
+// dispatch returns the matching counter for codes in [200, 599] and nil for
+// codes outside that range (per Rule SN4 of SPEC §10.1; 1xx informationals
+// are NOT bucketed in the upstream_rq_<Nxx> family).
+func TestCluster_StatusClassCounter_Buckets(t *testing.T) {
+	r := stats.NewRegistry()
+	bs := mkBootstrap(mkStaticCluster("c_status", mkLbEndpoint("127.0.0.1", 9001)))
+	m, err := NewManager(bs, r)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	c, ok := m.Get("c_status")
+	if !ok {
+		t.Fatal("cluster c_status not found")
+	}
+	cases := []struct {
+		code int
+		want *stats.Counter
+	}{
+		{200, c.upstreamRq2xx},
+		{204, c.upstreamRq2xx},
+		{299, c.upstreamRq2xx},
+		{301, c.upstreamRq3xx},
+		{304, c.upstreamRq3xx},
+		{400, c.upstreamRq4xx},
+		{404, c.upstreamRq4xx},
+		{499, c.upstreamRq4xx},
+		{500, c.upstreamRq5xx},
+		{502, c.upstreamRq5xx},
+		{599, c.upstreamRq5xx},
+		// Outside [200, 599] → nil.
+		{0, nil},
+		{99, nil},
+		{100, nil},
+		{199, nil},
+		{600, nil},
+		{999, nil},
+	}
+	for _, tc := range cases {
+		if got := c.statusClassCounter(tc.code); got != tc.want {
+			t.Errorf("statusClassCounter(%d) = %p, want %p", tc.code, got, tc.want)
+		}
 	}
 }

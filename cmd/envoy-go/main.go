@@ -50,7 +50,7 @@ func main() {
 	}
 	adminAddr := fmt.Sprintf("%s:%d", adminHost, adminPort)
 
-	cm, err := cluster.NewManagerWithBaseDir(bs.Proto, filepath.Dir(*cfgPath))
+	cm, err := cluster.NewManagerWithBaseDir(bs.Proto, filepath.Dir(*cfgPath), bs.Stats)
 	if err != nil {
 		log.Fatalf("cluster manager: %v", err)
 	}

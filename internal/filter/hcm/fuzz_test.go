@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 // FuzzHCMConfigParse exercises NewFilter against arbitrary Any byte streams.
@@ -68,7 +69,7 @@ func mkOneClusterManagerTB(t testing.TB) *cluster.Manager {
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}

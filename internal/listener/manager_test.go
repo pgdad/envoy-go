@@ -24,6 +24,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 // ---------------------------------------------------------------------------
@@ -88,7 +89,7 @@ func mkClusterMgr(t testing.TB, name, host string, port uint32) *cluster.Manager
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}

@@ -480,3 +480,75 @@ ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.626s
 $ go vet ./...
 $ go build ./...
 ```
+
+## Task 8 — cluster Registry threading + 8 metrics per cluster + Cluster fields [ADR-0063]
+
+**Commits:** TBD (SHA-fill follow-up)
+**Notes:** Widened `cluster.NewManager(bs)` and `cluster.NewManagerWithBaseDir(bs, baseDir)` to accept a third `registry *stats.Registry` parameter; the new `registerClusterMetrics(r, c)` helper allocates the 8 cluster-scope metrics from SPEC §6 (`cluster.<n>.upstream_rq_total`, `cluster.<n>.upstream_rq_<2,3,4,5>xx`, `cluster.<n>.upstream_cx_total`, `cluster.<n>.upstream_cx_active`, `cluster.<n>.membership_total`) per cluster at boot time and Sets `membership_total` to `len(c.endpoints)` once at register. Extended the `Cluster` struct with 8 unexported metric-pointer fields (`upstreamRqTotal`, `upstreamRq2xx..5xx`, `upstreamCxTotal`, `upstreamCxActive`, `membershipTotal`) and added the unexported `(*Cluster).statusClassCounter(code int) *stats.Counter` helper that returns the matching `_Nxx` counter for codes in [200, 599] (nil otherwise; 1xx informationals are NOT bucketed) — Task 10 will consume this from `actions.go` per the Rule SN4 integer-divide discipline. Per ADR-0063 the metric set is cluster-level only; per-endpoint expansion is deferred (xDS-EDS-shape concern carried to a future phase). Updated all 23 pre-existing call sites in `internal/cluster/manager_test.go` to pass `stats.NewRegistry()` as the third arg, and added `TestNewManager_AllocatesEightMetricsPerCluster` (manager_test.go) plus `TestCluster_StatusClassCounter_Buckets` (cluster_test.go) covering both the happy 8-metric register path and the status-class dispatch table for 17 codes spanning the [0, 999] range. Per dispatch doctrine D-3.6 ("every commit green"), the constructor signature change cascaded into 5 dependent test files outside the PLAN's narrow file scope (`internal/listener/manager_test.go`, `internal/filter/hcm/{config,fuzz,actions}_test.go`, `internal/filter/tcpproxy/filter_test.go`); each got a one-line `cluster.NewManager(bs, stats.NewRegistry())` mechanical update plus the matching `internal/stats` import — these are throwaway Registries scoped to each individual test function, never Frozen, never observed via `/stats/prometheus`. Per the dispatch's D-3.6 deviation block, `cmd/envoy-go/main.go` line 53 was updated as the proper threading: `cluster.NewManagerWithBaseDir(bs.Proto, filepath.Dir(*cfgPath))` → `cluster.NewManagerWithBaseDir(bs.Proto, filepath.Dir(*cfgPath), bs.Stats)` — the cluster manager now allocates its 8-per-cluster metrics on the same `bs.Stats` Registry that Task 7 introduced. The admin server STILL has its throwaway `admin.New(adminAddr, stats.NewRegistry())` from Task 6 (intentionally; Task 12 owns the swap to `bs.Stats` and the post-construction `bs.Stats.Freeze()` call per SPEC §5.4). Until Task 12 lands, the cluster's 8 metrics are registered on `bs.Stats` but invisible via `/stats/prometheus` (the admin handler walks its own throwaway Registry); Task 14's differential fixture is the integration that will verify cross-Registry consistency once Task 12 unifies them. Anchored: SPEC §1 #3, §4.2 (cluster.go/manager.go extensions), §5.4 (boot wiring), §6 (8 cluster names), §8 (ADR-0063), §11.3 (cluster_test extension).
+**Outputs:**
+```
+$ go test -race ./internal/cluster/ -run TestNewManager_AllocatesEightMetricsPerCluster -v
+# pre-implementation (RED):
+# github.com/esalaine/envoy-go/internal/cluster [github.com/esalaine/envoy-go/internal/cluster.test]
+internal/cluster/manager_test.go:640:27: too many arguments in call to NewManager
+	have (*bootstrapv3.Bootstrap, *stats.Registry)
+	want (*bootstrapv3.Bootstrap)
+internal/cluster/manager_test.go:649:7: c.upstreamRqTotal undefined (type *Cluster has no field or method upstreamRqTotal)
+internal/cluster/manager_test.go:650:5: c.upstreamRq2xx undefined (type *Cluster has no field or method upstreamRq2xx)
+internal/cluster/manager_test.go:650:31: c.upstreamRq3xx undefined (type *Cluster has no field or method upstreamRq3xx)
+internal/cluster/manager_test.go:651:5: c.upstreamRq4xx undefined (type *Cluster has no field or method upstreamRq4xx)
+internal/cluster/manager_test.go:651:31: c.upstreamRq5xx undefined (type *Cluster has no field or method upstreamRq5xx)
+internal/cluster/manager_test.go:652:5: c.upstreamCxTotal undefined (type *Cluster has no field or method upstreamCxTotal)
+internal/cluster/manager_test.go:653:5: c.upstreamCxActive undefined (type *Cluster has no field or method upstreamCxActive)
+internal/cluster/manager_test.go:654:5: c.membershipTotal undefined (type *Cluster has no field or method membershipTotal)
+internal/cluster/manager_test.go:658:14: c.membershipTotal undefined (type *Cluster has no field or method membershipTotal)
+internal/cluster/manager_test.go:658:14: too many errors
+FAIL	github.com/esalaine/envoy-go/internal/cluster [build failed]
+FAIL
+
+# post-implementation (GREEN):
+$ go test -race ./internal/cluster/ -run 'TestNewManager_AllocatesEightMetricsPerCluster|TestCluster_StatusClassCounter_Buckets' -v
+=== RUN   TestCluster_StatusClassCounter_Buckets
+--- PASS: TestCluster_StatusClassCounter_Buckets (0.00s)
+=== RUN   TestNewManager_AllocatesEightMetricsPerCluster
+--- PASS: TestNewManager_AllocatesEightMetricsPerCluster (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.013s
+
+$ go test -race -count=1 ./internal/cluster/
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.041s
+
+$ go vet ./...
+$ go build ./...
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.993s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.069s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.035s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.037s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.265s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.526s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.034s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.041s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.032s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.085s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.129s
+ok  	github.com/esalaine/envoy-go/test/differential	9.348s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.013s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.015s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.027s
+```

@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 const tcpProxyTypeURL = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy"
@@ -53,7 +54,7 @@ func mkClusterMgr(t testing.TB, name, host string, port uint32) *cluster.Manager
 			}},
 		},
 	}
-	cm, err := cluster.NewManager(bs)
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}
@@ -376,7 +377,7 @@ func mkTLSClusterMgr(t testing.TB, name, host string, port uint32) *cluster.Mana
 			}},
 		},
 	}
-	cm, err := cluster.NewManagerWithBaseDir(bs, "")
+	cm, err := cluster.NewManagerWithBaseDir(bs, "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("cluster.NewManagerWithBaseDir: %v", err)
 	}

@@ -9,6 +9,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 
+	"github.com/esalaine/envoy-go/internal/stats"
 	internaltls "github.com/esalaine/envoy-go/internal/tls"
 )
 
@@ -48,15 +49,24 @@ type Manager struct {
 // Phase-02 callers that do not need baseDir resolution should continue using
 // NewManager. Phase-03 callers that load filename-based DataSources should use
 // NewManagerWithBaseDir and pass filepath.Dir(configPath).
-func NewManager(bs *bootstrapv3.Bootstrap) (*Manager, error) {
-	return NewManagerWithBaseDir(bs, "")
+//
+// Phase 06.1 (Task 8) widened the signature to accept a *stats.Registry; for
+// each cluster the manager allocates the 8 cluster-scope metrics from SPEC §6
+// (per ADR-0063 — cluster-level only) on the supplied Registry at boot time.
+// The caller MUST pass a non-nil Registry; the Registry MUST not yet be
+// Frozen (cmd/envoy-go/main.go's boot sequence freezes only after the listener
+// manager and admin server are up — see SPEC §5.4).
+func NewManager(bs *bootstrapv3.Bootstrap, registry *stats.Registry) (*Manager, error) {
+	return NewManagerWithBaseDir(bs, "", registry)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
 // passed to internal/tls.NewUpstreamConfig so that filename-based DataSources
 // in transport_socket are resolved relative to the config file location. Pass
 // "" to resolve relative to the process working directory (phase-02 compat).
-func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, baseDir string) (*Manager, error) {
+//
+// Phase 06.1 (Task 8): see NewManager doc — same Registry contract applies.
+func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, baseDir string, registry *stats.Registry) (*Manager, error) {
 	cs := bs.GetStaticResources().GetClusters()
 	if len(cs) == 0 {
 		return nil, fmt.Errorf("cluster: zero clusters in bootstrap")
@@ -70,9 +80,30 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, baseDir string) (*Manager,
 		if _, dup := m.clusters[built.name]; dup {
 			return nil, fmt.Errorf("cluster: duplicate cluster name %q", built.name)
 		}
+		registerClusterMetrics(registry, built)
 		m.clusters[built.name] = built
 	}
 	return m, nil
+}
+
+// registerClusterMetrics allocates the 8 cluster-scope metrics per ADR-0063
+// and stores the pointers on c. Called once per cluster at Manager build time;
+// pre-Freeze (the listener manager and admin server precede the
+// registry.Freeze() call in cmd/envoy-go/main.go — see SPEC §5.4 for the boot
+// ordering invariant). The membership_total gauge is Set once at register
+// time to len(c.endpoints) per SPEC §6 (cluster-level only; per-endpoint
+// stats are deferred per ADR-0063).
+func registerClusterMetrics(r *stats.Registry, c *Cluster) {
+	prefix := "cluster." + c.name + "."
+	c.upstreamRqTotal = r.NewCounter(prefix + "upstream_rq_total")
+	c.upstreamRq2xx = r.NewCounter(prefix + "upstream_rq_2xx")
+	c.upstreamRq3xx = r.NewCounter(prefix + "upstream_rq_3xx")
+	c.upstreamRq4xx = r.NewCounter(prefix + "upstream_rq_4xx")
+	c.upstreamRq5xx = r.NewCounter(prefix + "upstream_rq_5xx")
+	c.upstreamCxTotal = r.NewCounter(prefix + "upstream_cx_total")
+	c.upstreamCxActive = r.NewGauge(prefix + "upstream_cx_active")
+	c.membershipTotal = r.NewGauge(prefix + "membership_total")
+	c.membershipTotal.Set(int64(len(c.endpoints))) // SPEC §6: Set once at register, equals N endpoints
 }
 
 // Get looks up a cluster by name. Returns (nil, false) if not found.

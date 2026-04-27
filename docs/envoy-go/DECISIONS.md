@@ -2217,3 +2217,31 @@ Carry-forward: a future stats-config phase, or an xDS-RTDS revisit, will introdu
 ### Lands-in-task
 
 Phase-06.1 Task 4 (alongside ADR-0061). Supersedes nothing.
+
+## ADR-0063: Per-endpoint cluster stats not emitted in 06.1
+
+**Status:** Accepted
+**Date:** 2026-04-27
+**Doctrine:** D-3.4 (record durable design rationale where context-isolation requires it)
+
+### Decision
+
+Phase 06.1 emits cluster-level metrics only — the 8 names enumerated in SPEC §6 (`cluster.<n>.upstream_rq_total`, `cluster.<n>.upstream_rq_<2,3,4,5>xx`, `cluster.<n>.upstream_cx_total`, `cluster.<n>.upstream_cx_active`, `cluster.<n>.membership_total`). Per-endpoint expansion (`cluster.<n>.endpoint.<addr>.upstream_rq_total`, `cluster.<n>.endpoint.<addr>.upstream_cx_total`, etc. — equivalent of Envoy's `enable_per_endpoint_stats=true` mode) is deferred to a later phase.
+
+### Context
+
+Per BRAINSTORM §2.3 + §9 the per-endpoint expansion is dynamic in shape: the endpoint set churns under xDS-EDS reconfiguration. Statically-allocated per-endpoint metrics break the LBP-1 invariant established by ADR-0059 (the post-Freeze panic discipline assumes the metric list is fixed at boot — endpoint churn would require dynamic registration, which would force a copy-on-write list shape that supersedes the lock-free Walk-under-RLock-plus-atomic-Load read path). Properly handling the dynamic-shape case wants xDS-EDS semantics that are out of scope for the 06.1 observability surface.
+
+This also matches Envoy's default tag-extraction behavior: `enable_per_endpoint_stats` defaults to `false` in upstream Envoy v1.37.2, so the omission preserves cross-implementation behavioral equivalence on the default static-cluster shape that fixture 0005 exercises.
+
+### Consequences
+
+- (a) Rule SN8 of the SN1–SN8 set (per ADR-0061) reads "Per-endpoint cluster stats are not emitted by 06.1 (forward-looking)".
+- (b) The cluster-side metric-allocation loop in `internal/cluster/manager.go` (`registerClusterMetrics`) allocates exactly 8 metrics per cluster (not 8×N for N endpoints).
+- (c) The `Cluster` struct carries 8 unexported metric-pointer fields; per-endpoint storage is not modeled.
+- (d) The fixture-0005 expectations table (Task 14) includes `cluster.c0.membership_total: 1` (the per-cluster gauge Set to len(endpoints)) but no per-endpoint rows; the differential gate-(a) assertion for stats does NOT verify per-endpoint stats.
+- (e) Carry-forward: the xDS-EDS phase revisits with a copy-on-write list shape that supersedes both LBP-1 and ADR-0063 jointly.
+
+### Lands-in-task
+
+Phase-06.1 Task 8 (the cluster-side metric-allocation loop in `internal/cluster/manager.go`; first use of the cluster-level-only metric set). Supersedes nothing.

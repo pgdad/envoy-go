@@ -14,6 +14,8 @@ import (
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 // ---------------------------------------------------------------------------
@@ -56,7 +58,7 @@ func TestManager_HappyPath_Single(t *testing.T) {
 	bs := mkBootstrap(
 		mkStaticCluster("c_echo", mkLbEndpoint("127.0.0.1", 8080)),
 	)
-	m, err := NewManager(bs)
+	m, err := NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -93,7 +95,7 @@ func TestManager_HappyPath_Multi(t *testing.T) {
 	c2.ConnectTimeout = durationpb.New(time.Second)
 
 	bs := mkBootstrap(c1, c2)
-	m, err := NewManager(bs)
+	m, err := NewManager(bs, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -121,7 +123,7 @@ func TestManager_HappyPath_Multi(t *testing.T) {
 
 func TestManager_Error_ZeroClusters(t *testing.T) {
 	bs := mkBootstrap() // no clusters
-	_, err := NewManager(bs)
+	_, err := NewManager(bs, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -135,7 +137,7 @@ func TestManager_Error_DuplicateName(t *testing.T) {
 		mkStaticCluster("c_echo", mkLbEndpoint("127.0.0.1", 8080)),
 		mkStaticCluster("c_echo", mkLbEndpoint("127.0.0.2", 8081)),
 	)
-	_, err := NewManager(bs)
+	_, err := NewManager(bs, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -147,7 +149,7 @@ func TestManager_Error_DuplicateName(t *testing.T) {
 func TestManager_Error_StrictDNS(t *testing.T) {
 	c := mkStaticCluster("c_dns", mkLbEndpoint("127.0.0.1", 8080))
 	c.ClusterDiscoveryType = &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STRICT_DNS}
-	_, err := NewManager(mkBootstrap(c))
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -162,7 +164,7 @@ func TestManager_Error_StrictDNS(t *testing.T) {
 func TestManager_Error_LogicalDNS(t *testing.T) {
 	c := mkStaticCluster("c_dns", mkLbEndpoint("127.0.0.1", 8080))
 	c.ClusterDiscoveryType = &clusterv3.Cluster_Type{Type: clusterv3.Cluster_LOGICAL_DNS}
-	_, err := NewManager(mkBootstrap(c))
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -177,7 +179,7 @@ func TestManager_Error_LogicalDNS(t *testing.T) {
 func TestManager_Error_EDS(t *testing.T) {
 	c := mkStaticCluster("c_eds", mkLbEndpoint("127.0.0.1", 8080))
 	c.ClusterDiscoveryType = &clusterv3.Cluster_Type{Type: clusterv3.Cluster_EDS}
-	_, err := NewManager(mkBootstrap(c))
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -192,7 +194,7 @@ func TestManager_Error_EDS(t *testing.T) {
 func TestManager_Error_OriginalDST(t *testing.T) {
 	c := mkStaticCluster("c_orig", mkLbEndpoint("127.0.0.1", 8080))
 	c.ClusterDiscoveryType = &clusterv3.Cluster_Type{Type: clusterv3.Cluster_ORIGINAL_DST}
-	_, err := NewManager(mkBootstrap(c))
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -207,7 +209,7 @@ func TestManager_Error_OriginalDST(t *testing.T) {
 func TestManager_Error_NonRoundRobinLB(t *testing.T) {
 	c := mkStaticCluster("c_lr", mkLbEndpoint("127.0.0.1", 8080))
 	c.LbPolicy = clusterv3.Cluster_LEAST_REQUEST
-	_, err := NewManager(mkBootstrap(c))
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -219,7 +221,7 @@ func TestManager_Error_NonRoundRobinLB(t *testing.T) {
 func TestManager_Error_ZeroEndpoints(t *testing.T) {
 	// One locality group with empty lb_endpoints.
 	c := mkStaticCluster("c_empty" /* no endpoints */)
-	_, err := NewManager(mkBootstrap(c))
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -238,7 +240,7 @@ func TestManager_Error_NonSocketAddressEndpoint(t *testing.T) {
 		}},
 	}
 	c := mkStaticCluster("c_pipe", pipeEp)
-	_, err := NewManager(mkBootstrap(c))
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -286,7 +288,7 @@ func TestNewManager_TLSCluster(t *testing.T) {
 	c := mkStaticCluster("c_tls", mkLbEndpoint("10.0.0.1", 443))
 	c.TransportSocket = mkUpstreamTLSTransportSocket(t, "alpha.envoy-go.test", caPEM)
 
-	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDir: %v", err)
 	}
@@ -317,7 +319,7 @@ func TestNewManager_TLSCluster_UnknownTransportSocket(t *testing.T) {
 		Name:       "envoy.transport_sockets.raw_buffer",
 		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
 	}
-	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -343,7 +345,7 @@ func TestNewManager_TLSCluster_MissingTrustedCA(t *testing.T) {
 		Name:       "envoy.transport_sockets.tls",
 		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
 	}
-	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -444,7 +446,7 @@ func TestBuildCluster_H2Mode_Positive(t *testing.T) {
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
 	}
 
-	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDir: %v", err)
 	}
@@ -463,7 +465,7 @@ func TestBuildCluster_H2Mode_NoTLS(t *testing.T) {
 	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
 	}
-	_, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	_, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -482,7 +484,7 @@ func TestBuildCluster_H2Mode_TLSWithoutALPNH2(t *testing.T) {
 	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
 	}
-	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -504,7 +506,7 @@ func TestBuildCluster_H2Mode_TLSWithoutALPN(t *testing.T) {
 	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
 	}
-	_, err = NewManagerWithBaseDir(mkBootstrap(c), "")
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -518,7 +520,7 @@ func TestBuildCluster_H1Discriminator_SilentIgnore(t *testing.T) {
 	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH1()),
 	}
-	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDir: %v", err)
 	}
@@ -536,7 +538,7 @@ func TestBuildCluster_AutoConfig_SilentIgnore(t *testing.T) {
 	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoAutoConfig()),
 	}
-	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDir: %v (auto_config must be silently ignored at 05.2)", err)
 	}
@@ -552,7 +554,7 @@ func TestBuildCluster_AutoConfig_SilentIgnore(t *testing.T) {
 func TestBuildCluster_NoTypedExtension_BaselineFalse(t *testing.T) {
 	c := mkStaticCluster("c_baseline", mkLbEndpoint("10.0.0.1", 8080))
 	// No TypedExtensionProtocolOptions map.
-	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDir: %v", err)
 	}
@@ -571,7 +573,7 @@ func TestBuildCluster_HttpProtocolOptions_NilUpstreamProtocolOptions(t *testing.
 	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, &upstreamshttpv3.HttpProtocolOptions{}),
 	}
-	m, err := NewManagerWithBaseDir(mkBootstrap(c), "")
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDir: %v (empty HttpProtocolOptions must build cleanly)", err)
 	}
@@ -597,7 +599,7 @@ func TestNewManager_MixedPlaintextAndTLSClusters(t *testing.T) {
 	tls := mkStaticCluster("c_tls", mkLbEndpoint("10.0.0.2", 443))
 	tls.TransportSocket = mkUpstreamTLSTransportSocket(t, "alpha.envoy-go.test", caPEM)
 
-	m, err := NewManagerWithBaseDir(mkBootstrap(plain, tls), "")
+	m, err := NewManagerWithBaseDir(mkBootstrap(plain, tls), "", stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDir: %v", err)
 	}
@@ -619,5 +621,62 @@ func TestNewManager_MixedPlaintextAndTLSClusters(t *testing.T) {
 	}
 	if gotTLS.upstreamCfg.ServerName != "alpha.envoy-go.test" {
 		t.Errorf("c_tls.upstreamCfg.ServerName = %q, want %q", gotTLS.upstreamCfg.ServerName, "alpha.envoy-go.test")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 06.1 Task 8 — 8-metric per-cluster allocation [ADR-0063]
+// ---------------------------------------------------------------------------
+
+// TestNewManager_AllocatesEightMetricsPerCluster verifies the cluster-side
+// per-cluster metric-allocation loop registers exactly the 8 cluster-scope
+// metrics from SPEC §6 on the supplied Registry, stores the metric pointers
+// on the Cluster struct, and Sets membership_total to len(endpoints) at
+// register time. Per ADR-0063 the metric set is cluster-level only;
+// per-endpoint expansion is deferred.
+func TestNewManager_AllocatesEightMetricsPerCluster(t *testing.T) {
+	bs := mkBootstrap(mkStaticCluster("c0", mkLbEndpoint("127.0.0.1", 9001)))
+	r := stats.NewRegistry()
+	m, err := NewManager(bs, r)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	c, ok := m.Get("c0")
+	if !ok {
+		t.Fatal("cluster c0 not found")
+	}
+	// Each metric pointer must be non-nil.
+	if c.upstreamRqTotal == nil ||
+		c.upstreamRq2xx == nil || c.upstreamRq3xx == nil ||
+		c.upstreamRq4xx == nil || c.upstreamRq5xx == nil ||
+		c.upstreamCxTotal == nil ||
+		c.upstreamCxActive == nil ||
+		c.membershipTotal == nil {
+		t.Errorf("expected all 8 metric pointers non-nil; got: %+v", c)
+	}
+	// membership_total Set to 1 at register time (single endpoint).
+	if got := c.membershipTotal.Load(); got != 1 {
+		t.Errorf("membershipTotal = %d, want 1", got)
+	}
+	// Walk: 8 metrics must be visible under cluster.c0.* names.
+	var seen []string
+	r.Walk(func(m stats.Metric) {
+		seen = append(seen, m.Name())
+	})
+	wantNames := map[string]bool{
+		"cluster.c0.upstream_rq_total":  true,
+		"cluster.c0.upstream_rq_2xx":    true,
+		"cluster.c0.upstream_rq_3xx":    true,
+		"cluster.c0.upstream_rq_4xx":    true,
+		"cluster.c0.upstream_rq_5xx":    true,
+		"cluster.c0.upstream_cx_total":  true,
+		"cluster.c0.upstream_cx_active": true,
+		"cluster.c0.membership_total":   true,
+	}
+	for _, n := range seen {
+		delete(wantNames, n)
+	}
+	if len(wantNames) != 0 {
+		t.Errorf("missing cluster metrics: %v", wantNames)
 	}
 }
