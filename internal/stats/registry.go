@@ -62,10 +62,11 @@ func NewRegistry() *Registry {
 // dotted name. Panics if frozen, on invalid name (per nameRE), or on
 // duplicate registration. The returned Counter is safe for concurrent Inc.
 func (r *Registry) NewCounter(name string) *Counter {
-	r.checkRegister(name)
+	r.checkName(name)
 	c := &Counter{name: name}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.checkFrozenLocked(name)
 	if _, dup := r.byName[name]; dup {
 		panic(fmt.Sprintf("stats: duplicate metric registration: %q", name))
 	}
@@ -77,10 +78,11 @@ func (r *Registry) NewCounter(name string) *Counter {
 // NewGauge registers and returns a gauge under the given name. Same panic
 // discipline as NewCounter.
 func (r *Registry) NewGauge(name string) *Gauge {
-	r.checkRegister(name)
+	r.checkName(name)
 	g := &Gauge{name: name}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.checkFrozenLocked(name)
 	if _, dup := r.byName[name]; dup {
 		panic(fmt.Sprintf("stats: duplicate metric registration: %q", name))
 	}
@@ -89,14 +91,23 @@ func (r *Registry) NewGauge(name string) *Gauge {
 	return g
 }
 
-// checkRegister panics if the registry is frozen or the name fails validation.
-// Called from NewCounter and NewGauge before they take r.mu.Lock.
-func (r *Registry) checkRegister(name string) {
-	if r.frozen.Load() {
-		panic(fmt.Sprintf("stats: registry frozen: cannot register %q post-boot", name))
-	}
+// checkName panics if the name fails the nameRE validation. Called outside
+// r.mu by NewCounter and NewGauge so the regex match isn't serialized.
+func (r *Registry) checkName(name string) {
 	if !nameRE.MatchString(name) {
 		panic(fmt.Sprintf("stats: invalid metric name: %q (must match %s)", name, nameRE.String()))
+	}
+}
+
+// checkFrozenLocked panics if the registry has been frozen. Must be called
+// with r.mu held. Closes the Freeze/NewCounter race: an unlocked
+// frozen.Load() in checkName would let a concurrent Freeze slip past
+// between the load and the Lock acquisition; reading the same atomic
+// inside the held lock guarantees Freeze's effect is visible (and Freeze's
+// Store-after-Lock-release pairs correctly with Load-after-Lock-acquire).
+func (r *Registry) checkFrozenLocked(name string) {
+	if r.frozen.Load() {
+		panic(fmt.Sprintf("stats: registry frozen: cannot register %q post-boot", name))
 	}
 }
 
