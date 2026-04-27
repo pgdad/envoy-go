@@ -18,6 +18,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
+	"github.com/esalaine/envoy-go/internal/stats"
 	internaltls "github.com/esalaine/envoy-go/internal/tls"
 )
 
@@ -44,22 +45,31 @@ type listenerCtx struct {
 }
 
 // filterConstructor builds a filterHandler from a typed_config Any, the
-// resolved cluster manager, and per-chain listenerCtx. Phase 05.1 adds lc.
-type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx) (filterHandler, error)
+// resolved cluster manager, per-chain listenerCtx, and the Registry the HCM
+// constructor will use to allocate its 5 per-instance metrics at Task 11.
+// Phase 05.1 adds lc; phase 06.1 (Task 10) adds registry — the HCM-factory
+// closure captures it so per-HCM-instance metric allocation works at filter-
+// build time. The TCP-proxy constructor ignores it (no per-tcp_proxy metrics
+// in 06.1).
+type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry) (filterHandler, error)
 
 // filterRegistry maps a filter typed_config.type_url to its constructor.
 // SPEC §5.3: inline; phase 07 generalises.
 var filterRegistry = map[string]filterConstructor{
-	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx) (filterHandler, error) {
+	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx, _ *stats.Registry) (filterHandler, error) {
 		f, err := tcpproxy.NewFilter(tc, cm)
 		if err != nil {
 			return nil, err
 		}
 		return f, nil
 	},
-	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx) (filterHandler, error) {
+	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, _ *stats.Registry) (filterHandler, error) {
 		// Bridge listenerCtx into hcm.ListenerCtx (the public shape exposed by
 		// hcm so that the listener manager doesn't import hcm-internal types).
+		// The Registry is captured here for Task 11; hcm.NewFilterWithCtx will
+		// gain a Registry parameter at that task and this closure forwards it
+		// then. For Task 10 the parameter is plumbed but the HCM constructor
+		// does not yet consume it.
 		f, err := hcm.NewFilterWithCtx(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C})
 		if err != nil {
 			return nil, err
@@ -84,12 +94,18 @@ type listenerRuntime struct {
 	tlsMode bool
 	tlsCfg  *stdtls.Config // top-level config with GetConfigForClient wired; nil for plaintext
 	chains  []*chainInfo   // sorted most-specific-first (exact > suffix-wildcard > catch-all)
+	// 06.1 metric fields (per SPEC §6 — listener-scope only, 2 metrics per
+	// listener). Allocated by registerListenerMetrics at Start time (post-bind,
+	// pre-Freeze) and Inc/Dec'd from the accept-loop hot path.
+	downstreamCxTotal  *stats.Counter
+	downstreamCxActive *stats.Gauge
 }
 
 // Manager owns every listener materialized from static_resources.listeners[]
 // and supervises their accept loops.
 type Manager struct {
 	runtimes  []*listenerRuntime
+	registry  *stats.Registry // captured at NewManager; consumed at Start to register the 2 listener-scope metrics per resolved bind address
 	startedMu sync.Mutex
 	started   bool
 }
@@ -100,8 +116,16 @@ type Manager struct {
 // subsequent listeners are not validated. No sockets are touched.
 //
 // Every error begins with "listener: ".
-func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false)
+//
+// Phase 06.1 (Task 10) widened the signature to accept a *stats.Registry; for
+// each listener the manager allocates the 2 listener-scope metrics from SPEC
+// §6 on the supplied Registry at Start time (after net.Listen resolves the
+// configured port — see registerListenerMetrics). The caller MUST pass a
+// non-nil Registry; the Registry MUST not yet be Frozen (cmd/envoy-go/main.go's
+// boot sequence freezes only after the listener manager and admin server are
+// up — Task 12 owns that ordering per SPEC §5.4).
+func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.Registry) (*Manager, error) {
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
@@ -109,8 +133,10 @@ func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager) (*Manager, error
 // DataSources in transport_socket are resolved relative to the config file
 // location. Pass "" to resolve relative to the process working directory
 // (phase-02 compat).
-func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false)
+//
+// Phase 06.1 (Task 10): see NewManager doc — same Registry contract applies.
+func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, registry *stats.Registry) (*Manager, error) {
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry)
 }
 
 // NewManagerWithBaseDirAndAllowH2C is the phase-05.1 constructor variant. It
@@ -121,15 +147,21 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 //
 // Existing callers NewManager and NewManagerWithBaseDir delegate here with
 // allowH2C=false.
-func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool) (*Manager, error) {
+//
+// Phase 06.1 (Task 10): the registry parameter is captured into each chain's
+// HCM-factory closure so per-HCM-instance metric allocation works at Task 11
+// filter-build time, AND it is the Registry on which the 2 listener-scope
+// metrics are allocated by registerListenerMetrics at this constructor's
+// per-listener loop.
+func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry) (*Manager, error) {
 	ls := bs.GetStaticResources().GetListeners()
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
 	}
-	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls))}
+	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry)
 		if err != nil {
 			return nil, err
 		}
@@ -142,11 +174,49 @@ func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Man
 	return m, nil
 }
 
+// normalizeAddr turns a "host:port" listener bind-address string into the
+// metric-name-segment form the SN3 flattening rule consumes: every ":" and
+// "." is replaced with "_" so the resulting segment contains no dots and
+// thus collapses to a single dot-segment in the hierarchical-dotted name
+// `listener.<addr>.<rest>`. Example: "0.0.0.0:10000" → "0_0_0_0_10000".
+//
+// SPEC §6 shows the example "0.0.0.0_10000" with dots preserved; the planner
+// selected the all-underscore form (PLAN.md Task 10 Step 2) because the SN3
+// extractor in internal/stats/name.go uses `strings.Index(tail, ".")` to find
+// the single delimiter — leaving dots in the address would cause the address
+// segment to be truncated to its first IPv4 octet. The all-underscore form is
+// also what name_test.go's `flattenToProm("listener.0_0_0_0_10000.…")`
+// fixture verifies as canonical.
+//
+// IPv6 forms — net.Listener.Addr().String() returns IPv6 hosts wrapped in
+// square brackets (e.g., "[::]:45259", "[::1]:8080") — also have "[" and "]"
+// stripped here because brackets are not in the SN-name regex's permitted
+// character class (`[a-zA-Z0-9_.]*`). "[::]:45259" thus normalizes to
+// "___45259" (three colons → three underscores; brackets dropped). h2spec
+// listens on IPv6 by default so this path is exercised by the conformance
+// gate.
+func normalizeAddr(addr string) string {
+	return strings.NewReplacer(":", "_", ".", "_", "[", "", "]", "").Replace(addr)
+}
+
+// registerListenerMetrics allocates the 2 listener-scope metrics per SPEC §6
+// and stores the pointers on rt for the accept-loop hot path. Called once per
+// listener at Start time, after net.Listen resolves the configured port (so
+// the metric name reflects the actual bound address, and so two listeners
+// configured with port 0 don't collide on the same registered name pre-bind).
+// Pre-Freeze (Task 12 owns the Freeze call after the admin server is up).
+func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
+	prefix := "listener." + normalizeAddr(rt.addr) + "."
+	rt.downstreamCxTotal = r.NewCounter(prefix + "downstream_cx_total")
+	rt.downstreamCxActive = r.NewGauge(prefix + "downstream_cx_active")
+}
+
 // buildListenerRuntimeWithCtx validates one Listener proto and constructs its
 // listenerRuntime (including all chainInfo entries). allowH2C is threaded into
-// each per-chain listenerCtx passed to the filter constructors. No socket is
-// bound here.
-func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool) (*listenerRuntime, error) {
+// each per-chain listenerCtx passed to the filter constructors. registry is
+// captured into the HCM-factory closure for per-HCM-instance metric allocation
+// at Task 11. No socket is bound here.
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -203,7 +273,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 			return nil, fmt.Errorf("listener: %q: filter_chains[%d]: unknown filter type_url %q", name, i, tc.GetTypeUrl())
 		}
 		lc := listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C}
-		fh, err := ctor(tc, cm, lc)
+		fh, err := ctor(tc, cm, lc, registry)
 		if err != nil {
 			return nil, fmt.Errorf("listener: %q: filter_chains[%d]: %w", name, i, err)
 		}
@@ -379,10 +449,26 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 		rt.netLn = ln
 		rt.addr = ln.Addr().String() // capture resolved address (e.g. when port was 0)
+		// 06.1 (Task 10): allocate the 2 listener-scope metrics on the bound
+		// (post-resolve) address. SPEC §6's `<addr>` is necessarily the bind
+		// address — pre-bind the configured port may be 0 ("OS-pick"), which
+		// would (a) produce metric names that don't reflect the actual bind
+		// and (b) collide between two `:0` listeners on the same host. The
+		// registration sits between rt.netLn assignment and the accept-loop
+		// goroutine launch below, both of which depend on the post-resolve
+		// rt.addr — keeping the three operations atomically ordered.
+		registerListenerMetrics(m.registry, rt)
 	}
 	for _, rt := range m.runtimes {
 		rt := rt
-		go rt.acceptLoop(ctx)
+		// Capture rt.netLn here (under the held startedMu, before any concurrent
+		// Stop can nil-write it) and pass it as a parameter to acceptLoop. Earlier
+		// versions read rt.netLn from inside the goroutine, which raced with
+		// Stop's nil-out under the race detector — surfaced by Task 10's
+		// AllocatesTwoMetricsPerListener test which Start+Stop's a listener
+		// without any intervening real-traffic delay.
+		ln := rt.netLn
+		go rt.acceptLoop(ctx, ln)
 	}
 	m.started = true
 	return nil
@@ -392,9 +478,18 @@ func (m *Manager) Start(ctx context.Context) error {
 // For plaintext listeners, each accepted connection is handed to the single
 // chain's filter.Handle in its own goroutine. For TLS listeners, each
 // connection is wrapped and handed to serveTLS.
-func (rt *listenerRuntime) acceptLoop(ctx context.Context) {
-	// Capture netLn locally so Stop()'s nil-out does not race with Accept().
-	ln := rt.netLn
+//
+// Phase 06.1 (Task 10) hot-path discipline (SPEC §5.5): on each accepted
+// connection Inc downstream_cx_total (counter, monotonic) AND downstream_cx_active
+// (gauge, +1); the per-conn dispatch goroutine defers downstream_cx_active.Dec()
+// so the gauge falls back when the filter's own deferred conn-close completes.
+// The Inc/Dec discipline is exactly once per conn — Inc on accept, Dec when
+// the dispatch goroutine returns.
+//
+// ln is captured by Start before launching the goroutine to keep the read off
+// the rt.netLn field that Stop nil-writes (the race detector flags the in-loop
+// read otherwise — surfaced by Task 10).
+func (rt *listenerRuntime) acceptLoop(ctx context.Context, ln net.Listener) {
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
@@ -407,12 +502,24 @@ func (rt *listenerRuntime) acceptLoop(ctx context.Context) {
 			log.Printf("listener %q: accept: %v", rt.name, err)
 			continue
 		}
+		// 06.1 hot path (SPEC §5.5): +2 LoC at the accept site; the matching
+		// Dec is deferred in the per-conn dispatch goroutine below.
+		rt.downstreamCxTotal.Inc()
+		rt.downstreamCxActive.Inc()
 		if !rt.tlsMode {
-			// Phase-02-style: single chain, dispatch directly.
-			go rt.chains[0].filter.Handle(ctx, raw)
+			// Phase-02-style: single chain, dispatch directly. The filter's
+			// Handle owns the conn-close lifecycle; the deferred Dec here
+			// fires after Handle returns (i.e., after the conn is closed).
+			go func(c net.Conn) {
+				defer rt.downstreamCxActive.Dec()
+				rt.chains[0].filter.Handle(ctx, c)
+			}(raw)
 			continue
 		}
-		go rt.serveTLS(ctx, raw)
+		go func(c net.Conn) {
+			defer rt.downstreamCxActive.Dec()
+			rt.serveTLS(ctx, c)
+		}(raw)
 	}
 }
 

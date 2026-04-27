@@ -623,3 +623,81 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.019s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.031s
 ```
+
+## Task 10 — Listener-side Registry threading + 2-metric per-listener alloc + accept-loop hot path
+
+**Commits:** TBD
+**Notes:** Widened `listener.NewManager(bs, cm)` and the two BaseDir/AllowH2C variants to accept a trailing `registry *stats.Registry` parameter; the new unexported `registerListenerMetrics(r, rt)` helper allocates the 2 listener-scope metrics from SPEC §6 (`listener.<addr>.downstream_cx_total` counter, `listener.<addr>.downstream_cx_active` gauge) per listener and stores the pointers on the existing `listenerRuntime` struct (two new unexported fields: `downstreamCxTotal`, `downstreamCxActive`). The `<addr>` segment is produced by the new unexported `normalizeAddr(s)` which `strings.NewReplacer(":", "_", ".", "_", "[", "", "]", "")`-replaces the full `host:port` form: IPv4 `127.0.0.1:8080` → `127_0_0_1_8080`; IPv6 `[::]:45259` → `___45259`. The `[`/`]` strip is needed because `net.Listener.Addr().String()` on IPv6 listeners returns bracketed-host syntax which the SN-name regex (`^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$`) rejects; surfaced by the h2spec conformance gate which binds IPv6 by default. Hot-path edits in `acceptLoop`: on each successful Accept, Inc `downstreamCxTotal` (counter, monotonic) AND `downstreamCxActive` (gauge, +1); the per-conn dispatch goroutine defers `downstreamCxActive.Dec()` so the gauge falls back when the filter's own deferred conn-close completes. Inc/Dec discipline is exactly once per conn — Inc on accept, Dec when the dispatch goroutine returns.
+
+The HCM-factory closure inside `filterRegistry[hcm.TypeURL]` was widened to accept the Registry as a trailing parameter; it forwards (currently unused) so Task 11 can wire `hcm.NewFilterWithCtx` to allocate its 5 per-instance metrics on the same Registry. The TCP-proxy constructor closure ignores the Registry parameter (no per-tcp_proxy metrics in 06.1). Thread-through goes via `buildListenerRuntimeWithCtx`'s new `registry` parameter.
+
+**PLAN deviation #1 — registration-at-Start, not at NewManager.** PLAN's example test code walks the Registry directly after `NewManager`. Implementation registers at `Start` time (post-`net.Listen`-resolves) instead, because (a) SPEC §6's `<addr>` is the BIND address — pre-bind the configured port may be 0 (`OS-pick`), producing metric names that don't reflect the actual bound port; (b) two listeners configured `:0` would collide on identical pre-resolve names (TestManager_HappyPath_Multi binds two `127.0.0.1:0` listeners — both would register `listener.127_0_0_1_0.downstream_cx_total` pre-bind and the second would panic with `stats: duplicate metric registration`). The Registry is captured on `Manager` at NewManager time and consumed in the per-listener bind loop in Start; `registerListenerMetrics(m.registry, rt)` sits between `rt.netLn = ln` and the post-loop accept-goroutine launches. Both new tests Start before walking — which mirrors the production scrape ordering (admin Start → listener Start → MarkReady → scrape).
+
+**PLAN deviation #2 — file-scope substitution.** PLAN names `internal/listener/listener.go` (separate from `manager.go`) and `internal/listener/listener_test.go`. The actual codebase has only `manager.go` (the listener accept-loop logic lives on `*listenerRuntime` in `manager.go`); creating a separate `listener.go` would split the existing 458-line file along an arbitrary axis and obscure the accept-loop's relationship to the runtime struct. The implementation edits `manager.go` for both the constructor + accept-loop changes and creates a fresh `internal/listener/listener_test.go` (per PLAN's test-file naming) to host the accept-loop hot-path test. The +2-LoC promise on the accept loop is met (line-count parity at the Inc site; the Dec is an additional defer in the per-conn dispatch goroutine).
+
+**PLAN deviation #3 — pre-existing race fix.** Surfaced by the new `TestListenerManager_AllocatesTwoMetricsPerListener` test which Start+Stop's a listener without intervening real-traffic delay: the race detector flagged `acceptLoop`'s `ln := rt.netLn` read against `Stop`'s `rt.netLn = nil` write. The pre-existing comment on the line said "Capture netLn locally so Stop()'s nil-out does not race with Accept()" but the capture was inside the goroutine — not before its launch. Fixed by changing `acceptLoop`'s signature from `(ctx context.Context)` to `(ctx context.Context, ln net.Listener)` and capturing `ln := rt.netLn` synchronously inside Start (under the held `m.startedMu`) before the `go rt.acceptLoop(ctx, ln)` launch. No behavior change; the race is gone.
+
+**Cascade-fix surface.** The constructor signature change cascaded into 35 mechanical updates in `internal/listener/manager_test.go` (32 × `NewManager(boot, cm)` → `NewManager(boot, cm, stats.NewRegistry())`, 2 × `NewManagerWithBaseDirAndAllowH2C(boot, cm, "", X)` → `…(boot, cm, "", X, stats.NewRegistry())`, 1 × `NewManager(bs, cm)` in the HCM-build-error wrap test); throwaway Registries scoped per-test, never Frozen, never observed via `/stats/prometheus`. The production `cmd/envoy-go/main.go` line 66 was updated as the proper threading: `listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C)` → `listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats)` — the listener manager now allocates its 2-per-listener metrics on the same `bs.Stats` Registry that Tasks 7–8 wired through. Until Task 12 lands, those metrics live on `bs.Stats` but stay invisible via `/stats/prometheus` (admin still uses its throwaway Registry from Task 6); Task 12 owns the `bs.Stats`-everywhere unification + post-listener-up Freeze. No new ADR (PLAN explicitly annotates Task 10 as ADR-free).
+
+Anchored: SPEC §1 #3, §4.2 (`listener/manager.go` extensions; the planned `listener.go` file is consolidated into `manager.go` per the actual file layout), §5.4 (boot wiring), §5.5 (accept-loop hot path), §6 (2 listener names), §11.3 (listener_test.go extension).
+**Outputs:**
+```
+$ go test -race ./internal/listener/ -run 'TestListenerManager_|TestListener_AcceptLoop_' -v
+# pre-implementation (RED — build failure: signatures don't accept the Registry yet):
+# github.com/esalaine/envoy-go/internal/listener [github.com/esalaine/envoy-go/internal/listener.test]
+internal/listener/listener_test.go:27:34: too many arguments in call to NewManager
+	have (*bootstrapv3.Bootstrap, *cluster.Manager, *stats.Registry)
+	want (*bootstrapv3.Bootstrap, *cluster.Manager)
+internal/listener/manager_test.go:1403:34: too many arguments in call to NewManager
+	have (*bootstrapv3.Bootstrap, *cluster.Manager, *stats.Registry)
+	want (*bootstrapv3.Bootstrap, *cluster.Manager)
+FAIL	github.com/esalaine/envoy-go/internal/listener [build failed]
+FAIL
+
+# post-implementation (GREEN):
+$ go test -race ./internal/listener/ -run 'TestListenerManager_AllocatesTwoMetricsPerListener|TestListener_AcceptLoop_IncsCxTotalAndCxActive' -v
+=== RUN   TestListener_AcceptLoop_IncsCxTotalAndCxActive
+--- PASS: TestListener_AcceptLoop_IncsCxTotalAndCxActive (0.01s)
+=== RUN   TestListenerManager_AllocatesTwoMetricsPerListener
+--- PASS: TestListenerManager_AllocatesTwoMetricsPerListener (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener	1.029s
+
+$ go test -race ./internal/listener/ ./internal/stats/ ./internal/admin/ ./internal/cluster/
+ok  	github.com/esalaine/envoy-go/internal/listener	1.035s
+ok  	github.com/esalaine/envoy-go/internal/stats	(cached)
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/cluster	(cached)
+
+$ go vet ./... && go build ./... && go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.726s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.081s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.045s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.055s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.262s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.518s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.033s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.051s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.029s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.087s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.252s
+ok  	github.com/esalaine/envoy-go/test/differential	9.522s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.012s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.012s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.026s
+```

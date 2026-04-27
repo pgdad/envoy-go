@@ -63,7 +63,7 @@ func main() {
 	}
 	defer func() { _ = admSrv.Close() }()
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

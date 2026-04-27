@@ -106,7 +106,7 @@ func TestManager_HappyPath_Single(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestManager_HappyPath_Multi(t *testing.T) {
 		mkListener("l_tcp_b", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestManager_Error_ZeroListeners(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	boot := mkBoot(0, []*listenerv3.Listener{}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -223,7 +223,7 @@ func TestManager_Error_DuplicateName(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -247,7 +247,7 @@ func TestManager_Error_TwoFilterChains(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -275,7 +275,7 @@ func TestManager_Error_NonEmptyFilterChainMatch(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -299,7 +299,7 @@ func TestManager_Error_TwoFilters(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -323,7 +323,7 @@ func TestManager_Error_PopulatedTransportSocket(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -356,7 +356,7 @@ func TestManager_Error_UnknownFilterTypeURL(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -371,7 +371,7 @@ func TestManager_Error_FilterConstructionPropagated(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_does_not_exist")),
 	}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -398,7 +398,7 @@ func TestManager_Error_NonSocketAddressListener(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -422,7 +422,7 @@ func TestManager_BindUnwind(t *testing.T) {
 		mkListener("l_b", "127.0.0.1", heldPort, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -621,7 +621,7 @@ func TestNewManager_SingleChain_Plaintext_Unchanged(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_plain", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -650,7 +650,7 @@ func TestNewManager_MultiChain_SNIHappy(t *testing.T) {
 		mkTLSChain([]string{"beta.envoy-go.test"}, tsBeta, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -700,7 +700,7 @@ func TestNewManager_MultiChain_SNIWildcard(t *testing.T) {
 		mkTLSChain([]string{"*.envoy-go.test"}, tsAlpha, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -741,7 +741,7 @@ func TestNewManager_MultiChain_Specificity(t *testing.T) {
 		mkTLSChain([]string{"alpha.envoy-go.test"}, tsAlpha, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -782,7 +782,7 @@ func TestNewManager_MultiChain_CatchAll(t *testing.T) {
 		mkTLSChain(nil, tsAlpha, filter), // catch-all
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -821,7 +821,7 @@ func TestNewManager_MultiChain_NoSNIMatch(t *testing.T) {
 		mkTLSChain([]string{"beta.envoy-go.test"}, tsBeta, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -857,7 +857,7 @@ func TestNewManager_MultiChain_MixedTLSPlaintext_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for mixed TLS/plaintext chains, got nil")
 	}
@@ -889,7 +889,7 @@ func TestNewManager_MultiChain_DefaultFilterChain_Errors(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for default_filter_chain, got nil")
 	}
@@ -956,7 +956,7 @@ func TestNewManager_MultiChain_NonSNIMatchField_Errors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			boot := mkBoot(0, []*listenerv3.Listener{makeListener(tc.fcm)}, nil)
-			_, err := NewManager(boot, cm)
+			_, err := NewManager(boot, cm, stats.NewRegistry())
 			if err == nil {
 				t.Fatalf("expected error for %s, got nil", tc.name)
 			}
@@ -991,7 +991,7 @@ func TestNewManager_MultiChain_ApplicationProtocols_Errors(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for application_protocols, got nil")
 	}
@@ -1015,7 +1015,7 @@ func TestNewManager_MultiChain_TooManyCatchAlls_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for two catch-all chains, got nil")
 	}
@@ -1038,7 +1038,7 @@ func TestNewManager_MultiChain_RequireClientCert_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for require_client_certificate=true, got nil")
 	}
@@ -1069,7 +1069,7 @@ func TestNewManager_MultiChain_UnknownTransportSocket_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for unknown transport_socket type_url, got nil")
 	}
@@ -1091,7 +1091,7 @@ func TestNewManager_PlaintextMultiChain_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm)
+	_, err := NewManager(boot, cm, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("expected error for plaintext multi-chain, got nil")
 	}
@@ -1129,7 +1129,7 @@ func TestNewManager_ChainSelectionPropagation(t *testing.T) {
 		mkTLSChain([]string{"beta.envoy-go.test"}, tsBeta, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1241,7 +1241,7 @@ func TestNewManager_HCMRegistration(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_http", "127.0.0.1", 0, mkHCMFilter(t)),
 	}, nil)
-	if _, err := NewManager(boot, cm); err != nil {
+	if _, err := NewManager(boot, cm, stats.NewRegistry()); err != nil {
 		t.Fatalf("NewManager with HCM listener: %v", err)
 	}
 }
@@ -1297,7 +1297,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1317,7 +1317,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry())
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
@@ -1338,7 +1338,7 @@ func TestNewManager_BackwardsCompat_DefaultsAllowH2CFalse(t *testing.T) {
 		mkTLSChain(nil, tsAlpha, mkHCMHTTP2Filter(t)),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	m, err := NewManager(boot, cm)
+	m, err := NewManager(boot, cm, stats.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewManager = %v, want nil (TLS+HTTP2 path)", err)
 	}
@@ -1374,7 +1374,7 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 			}},
 		}},
 	}}, nil)
-	_, buildErr := NewManager(bs, cm)
+	_, buildErr := NewManager(bs, cm, stats.NewRegistry())
 	if buildErr == nil {
 		t.Fatal("expected build error, got nil")
 	}
@@ -1382,5 +1382,57 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 	want := `listener: "l_http": filter_chains[0]: hcm: codec_type HTTP2`
 	if !strings.Contains(buildErr.Error(), want) {
 		t.Errorf("error %q does not contain %q", buildErr.Error(), want)
+	}
+}
+
+// TestListenerManager_AllocatesTwoMetricsPerListener verifies the listener-side
+// per-listener metric-allocation loop registers exactly the 2 listener-scope
+// metrics from SPEC §6 (`listener.<addr>.downstream_cx_total` counter,
+// `listener.<addr>.downstream_cx_active` gauge) on the supplied Registry at
+// boot time. The address segment is the bound (post-resolve) bind address
+// normalized per the planner-pinned `strings.NewReplacer(":", "_", ".", "_")`
+// shape so that the resulting name has exactly three top-level dot-segments
+// (`listener.<addr>.<rest>`) — necessary for `flattenToProm`'s SN3 single-dot
+// split to extract the address as a label.
+//
+// PLAN-deviation note: the PLAN's example test code walks the Registry directly
+// after NewManager. The implementation registers at Start time (post-bind)
+// instead, because (a) SPEC §6's <addr> is the BIND address — pre-bind the
+// configured port may be 0 ("OS-pick"), and (b) two listeners with configured
+// `:0` would collide on the same registered name pre-resolve. The test calls
+// Start before walking — which is also what the differential fixture (Task 14)
+// does, so the test mirrors the production scrape ordering.
+func TestListenerManager_AllocatesTwoMetricsPerListener(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_h1", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	r := stats.NewRegistry()
+	lm, err := NewManager(boot, cm, r)
+	if err != nil {
+		t.Fatalf("listener.NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := lm.Start(ctx); err != nil {
+		t.Fatalf("listener.Start: %v", err)
+	}
+	defer lm.Stop()
+	// Walk the registry; the listener.<addr>.downstream_cx_{total,active}
+	// names must be present.
+	var seen []string
+	r.Walk(func(m stats.Metric) { seen = append(seen, m.Name()) })
+	wantSubstr := []string{".downstream_cx_total", ".downstream_cx_active"}
+	for _, w := range wantSubstr {
+		found := false
+		for _, n := range seen {
+			if strings.HasPrefix(n, "listener.") && strings.HasSuffix(n, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing listener.<addr>%s metric (seen=%v)", w, seen)
+		}
 	}
 }
