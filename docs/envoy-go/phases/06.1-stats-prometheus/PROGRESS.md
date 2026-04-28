@@ -2257,3 +2257,281 @@ The REVIEW.md deliverable is the lifecycle-state 6 phase-done step's input per B
 - **L4 review-followup queue (26 Minors)** from impl Tasks 8–14 — listed in the impl-branch's Task 15 closing notes above. Triage queued for the eventual REVIEW phase; not for the verifier.
 
 **Verification result:** gates (a)/(b)/(c)/(d)/(e)-part-1/(e)-part-2 all PASS; gate (f) deferred to lifecycle-state 6. **Phase 06.1 may advance to lifecycle-state 5.** STATE.md transitions to lifecycle-state 5 with `next-skill: superpowers:requesting-code-review`. ROADMAP rows unchanged (06.1 stays `in-progress`; 06 stays `in-progress`; 06.2 stays `planned`); ROADMAP transitions land at the lifecycle-state 6 phase-done commit per BOOTSTRAP §5 step 6.
+
+---
+
+## Lifecycle-state 4 — REVIEW-followup re-verification (M-1 closure) — PASSED
+
+The REVIEW-followup branch `phase/06.1-stats-prometheus-review-followup`
+(worktree `.worktrees/phase-06.1-stats-prometheus-review-followup`,
+branched from REVIEW SHA-fill tip `d21d50b` per ADR-0003) closed the
+single Path-A REVIEW finding M-1 (cluster-name latent vulnerability at
+`internal/cluster/manager.go:97` — explicitly forward-flagged in
+ADR-0065 Consequences (d)). The fix landed in two commits: `caa58e5`
+(M-1 boundary guard at `buildCluster` + `TestNewManager_ClusterNameInvalidChars`
+6-case regression test mirroring `TestParseFilter_StatPrefixInvalidChars`
+at `internal/filter/hcm/config_test.go:221`; inherits ADR-0065's pattern by
+reference — no new ADR per ADR-0065 Consequences (d)) and `665c879`
+(spelling fixup `minimised → minimized` to silence golangci-lint
+misspell on the test docstring). REVIEW Importants I-1
+(SPEC §14 line 715 file-path mismatch) and I-2 (ROADMAP row 06.1 still
+`planned`) require no commits on this branch: I-1 closed by
+REVIEW + PROGRESS Task 11 deviation #1 as-corrigendum; I-2 closed at
+the lifecycle-state-6 phase-done commit's natural `planned → done` row
+flip per the 05.2 `0c01ed6` one-step precedent. The 12 collapsed Minors
+carry forward to the L4 review-followup batch (separate post-phase-done
+branch); zero Minor closure on this branch.
+
+This block re-runs gates (b)/(c)/(d)/(e) at HEAD `665c879` to confirm
+the M-1 fix did not regress any non-deferred SPEC §3 phase-done gate.
+Gate (a) was implicitly re-confirmed by gate (b)'s sweep (fixture
+`0005-prometheus-stats` is one of the six fixtures swept). Gate (f)
+REVIEW.md is closed — the REVIEW commit landed at `59d86f2` on the
+review branch and was carried into this followup branch's ancestry.
+
+**Gate (b) — all 6 differential fixtures green (gate (a) implied):**
+
+```
+$ go test -count=1 -v -run '^TestDifferential$' ./test/differential/
+--- PASS: TestDifferential (9.04s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.68s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.29s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.24s)
+    --- PASS: TestDifferential/0003-http11-routing (1.26s)
+    --- PASS: TestDifferential/0004-h2-routing (1.67s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.89s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	9.116s
+```
+
+All six fixtures PASS. Fixture `0005-prometheus-stats` (the gate-(a)
+non-vacuous observability differential introduced in this phase) PASSES
+unchanged after the M-1 fix; the M-1 guard rejects only invalid cluster
+names (`cluster c0` is valid), so the per-counter delta-equality + per-gauge
+snapshot-equality assertions across the 13 unique Prometheus names against
+reference Envoy under the 5-request defined load remain green.
+
+**Gate (c) — h2spec 53/53 PASS at the ADR-0051 pin:**
+
+```
+$ go test -count=1 -v -run '^TestH2Spec' ./test/conformance/h2spec/
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+--- PASS: TestH2Spec (2.19s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.273s
+```
+
+53/53 PASS at the unchanged threshold list (sections 3, 4, 5, 6 ex-6.6,
+7, 8). The pinned `summerwind/h2spec` SHA in `CONFORMANCE_PINS.md` is
+unchanged (D-3.7 reserves pin bumps for dedicated phases). 06.1 does not
+touch H2 wire code, so this gate is structurally unchanged from the
+verifier-2 run at `1ed6cd0`.
+
+**Gate (d) — all 7 fuzzers PASS at the 30s ADR-0018 budget:**
+
+```
+$ go test -fuzz=^FuzzBootstrapLoad$ -fuzztime=30s -run='^$' ./internal/bootstrap/
+fuzz: elapsed: 30s, execs: 454924 (0/sec), new interesting: 8 (total: 1086)
+fuzz: elapsed: 31s, execs: 454924 (0/sec), new interesting: 8 (total: 1086)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.080s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=^FuzzTcpProxyFilter$ -fuzztime=30s -run='^$' ./internal/filter/tcpproxy/
+fuzz: elapsed: 30s, execs: 3764981 (132168/sec), new interesting: 0 (total: 564)
+fuzz: elapsed: 31s, execs: 3764981 (0/sec), new interesting: 0 (total: 564)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.047s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=^FuzzTLSContextParse$ -fuzztime=30s -run='^$' ./internal/tls/
+fuzz: elapsed: 30s, execs: 3534778 (240352/sec), new interesting: 8 (total: 703)
+fuzz: elapsed: 31s, execs: 3534778 (0/sec), new interesting: 8 (total: 703)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.058s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=^FuzzHCMConfigParse$ -fuzztime=30s -run='^$' ./internal/filter/hcm/
+fuzz: elapsed: 30s, execs: 3045557 (101170/sec), new interesting: 3 (total: 537)
+fuzz: elapsed: 31s, execs: 3045557 (0/sec), new interesting: 3 (total: 537)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.056s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=^FuzzFrameStream$ -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/
+fuzz: elapsed: 30s, execs: 13500060 (450228/sec), new interesting: 3 (total: 418)
+fuzz: elapsed: 30s, execs: 13500060 (0/sec), new interesting: 3 (total: 418)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	30.149s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=^FuzzHPACKDecode$ -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/
+fuzz: elapsed: 30s, execs: 1878914 (0/sec), new interesting: 1 (total: 165)
+fuzz: elapsed: 31s, execs: 1878914 (0/sec), new interesting: 1 (total: 165)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.069s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=^FuzzPromTextFormat$ -fuzztime=30s -run='^$' ./internal/stats/
+fuzz: elapsed: 30s, execs: 25337684 (837715/sec), new interesting: 3 (total: 117)
+fuzz: elapsed: 30s, execs: 25340614 (28145/sec), new interesting: 3 (total: 117)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	30.116s
+$ git status --porcelain
+$ # empty
+```
+
+All seven PASS at the ADR-0018 30s budget; `git status --porcelain` empty
+after each run (no auto-persisted-seed corpus growth observed; in
+particular, no replay of the gate-(d) seed `9ba19570cf17f59f` at
+`internal/filter/hcm/testdata/fuzz/FuzzHCMConfigParse/` or analogous
+cluster-name seed at `internal/bootstrap/testdata/fuzz/FuzzBootstrapLoad/`
+— the M-1 fix is durable; no new corpus crashers surfaced).
+
+**Gate (e) — go vet / golangci-lint / go test -race ./...:**
+
+```
+$ go vet ./...
+$ # exit 0 (no output)
+
+$ golangci-lint run ./...
+$ # exit 0 (no output) — the misspell linter's "minimised → minimized"
+$ # warning at internal/cluster/manager_test.go:159 was closed by 665c879
+
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.643s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.070s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.035s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.042s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.261s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	8.413s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.026s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.052s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.027s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.086s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.164s
+ok  	github.com/esalaine/envoy-go/test/differential	11.583s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.010s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.011s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.013s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.012s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.026s
+```
+
+18 ok / 0 FAIL / 0 DATA RACE under `-race`. The new
+`TestNewManager_ClusterNameInvalidChars` 6-case regression test (added
+at `caa58e5`, spelling-fix at `665c879`) is included in the
+`internal/cluster` package's PASS line and passes clean under `-race`
+on every iteration.
+
+**ADR-0046 boundary grep (production imports of `golang.org/x/net/http2` outside the 5 allowed files):**
+
+```
+$ grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go' | grep -v 'internal/filter/hcm/h2/framer.go\|internal/filter/hcm/h2/hpack.go\|internal/filter/hcm/h2/settings.go\|internal/filter/hcm/h2/conn.go\|internal/filter/hcm/h2/client.go'
+$ # empty
+```
+
+Empty. Raw production hits unchanged from the verifier-2 run:
+
+```
+$ grep -nR '"golang.org/x/net/http2"' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go'
+internal/filter/hcm/h2/settings.go:4:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/conn.go:11:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/client.go:24:	"golang.org/x/net/http2"
+internal/filter/hcm/h2/framer.go:11:	"golang.org/x/net/http2"
+```
+
+4 hits in 4 of the 5 allowed files (per ADR-0054, `hpack.go` legitimately
+omits the root-package import).
+
+**ADR-0048 client.go presence:**
+
+```
+$ ls internal/filter/hcm/h2/client.go
+internal/filter/hcm/h2/client.go
+```
+
+**Forbidden-runtime-imports grep (ADR-0046):**
+
+```
+$ grep -nR 'http2\.Server\|http2\.Transport\|http2\.ConfigureServer' internal/ cmd/envoy-go/main.go --include='*.go' | grep -v '_test.go'
+internal/filter/hcm/h2/doc.go:22:// What this package does NOT do: it does NOT use http2.Server,
+internal/filter/hcm/h2/doc.go:23:// http2.Server.ServeConn, http2.ConfigureServer, http2.Transport, or
+internal/filter/hcm/h2/doc.go:24:// http2.Transport.NewClientConn. The connection lifecycle is driven explicitly
+```
+
+3 hits, all in `doc.go`'s prohibition statement (no production-runtime use).
+
+**ADR-0059 internal/stats stdlib-only constraint (no third-party imports):**
+
+```
+$ grep -nR '^import\|^\t"' internal/stats/ --include='*.go' | grep -v '_test.go' | grep -E '"[^/]+/[^/]+/'
+$ # empty (stdlib-only)
+```
+
+Empty — `internal/stats` continues to import only Go stdlib packages
+(`fmt`, `io`, `regexp`, `sort`, `strconv`, `strings`, `sync`,
+`sync/atomic`) per ADR-0059's package-foundation invariant.
+
+**Final cleanliness check at HEAD `665c879`:**
+
+```
+$ git status --porcelain
+$ # empty (this addendum + STATE update not yet staged)
+$ git rev-parse HEAD
+665c87968d6dab0eef9a4a5b22f1cc46c5f5e6cb
+```
+
+**REVIEW-followup verification verdict:** all five non-deferred SPEC §3
+gates GREEN at HEAD `665c879` (gate (a) implied by gate (b)'s six-fixture
+sweep that includes `0005-prometheus-stats`; gate (f) closed by REVIEW.md
+at `59d86f2`). The single REVIEW Path-A finding M-1 is closed by
+`caa58e5` + `665c879`. REVIEW Important findings I-1 and I-2 are closed
+without code/doc changes on this branch (I-1 by REVIEW + PROGRESS Task 11
+deviation #1 as-corrigendum; I-2 by the next session's phase-done commit's
+natural ROADMAP `planned → done` row flip). The 12 collapsed Minors
+carry forward to the L4 review-followup batch (separate post-phase-done
+branch). STATE advances to lifecycle-state 4 ("REVIEW-followup batch
+complete; gates re-run green"); a follow-up commit promotes lifecycle-state
+4 → 5; the phase-done commit at lifecycle-state 6 (next session) flips
+ROADMAP row 06.1 `planned → done` directly per the 05.2 `0c01ed6` one-step
+precedent + REVIEW I-2 disposition.
