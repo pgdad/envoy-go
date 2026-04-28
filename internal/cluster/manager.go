@@ -117,6 +117,21 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if name == "" {
 		return nil, fmt.Errorf("cluster: clusters[%d]: missing name", idx)
 	}
+	// Validate the assembled metric-name shape before any registry write.
+	// cluster.<name> is propagated into eight "cluster.<name>.<metric>" names
+	// at registerClusterMetrics; if the assembled name contains characters
+	// outside the metric-name regex's permitted [a-zA-Z0-9_.] class (or
+	// otherwise produces an invalid assembled name), Registry.NewCounter
+	// would panic per ADR-0059's boot-time panic discipline. We reject at
+	// the user-input boundary instead. Inherits ADR-0065's pattern by
+	// reference per ADR-0065 Consequences (d) (no new ADR); symmetric to
+	// the parseFilterWithCtx guard at internal/filter/hcm/config.go:143.
+	// Validating the longest assembled name suffices because the other
+	// seven assembled names differ only in suffixes within the regex's
+	// permitted class (they pass/fail together).
+	if !stats.IsValidName("cluster." + name + ".upstream_rq_total") {
+		return nil, fmt.Errorf("cluster: %q: invalid cluster name (must contain only ASCII letters, digits, underscore, or dot, and form a valid metric-name segment)", name)
+	}
 	t, ok := c.GetClusterDiscoveryType().(*clusterv3.Cluster_Type)
 	if !ok {
 		return nil, fmt.Errorf("cluster: %q: cluster_discovery_type must be Type, got %T (only STATIC supported)", name, c.GetClusterDiscoveryType())

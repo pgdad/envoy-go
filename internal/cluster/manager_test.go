@@ -146,6 +146,42 @@ func TestManager_Error_DuplicateName(t *testing.T) {
 	}
 }
 
+// TestNewManager_ClusterNameInvalidChars is the M-1 review-followup regression
+// test (REVIEW.md §Findings/Minor; ADR-0065 Consequences (d) carry-forward).
+// Cluster names propagate into eight assembled metric names ("cluster.<name>.
+// upstream_rq_total" etc.) at registerClusterMetrics; if the assembled name
+// contains characters outside the internal/stats nameRE permitted class
+// ([a-zA-Z0-9_.] with the [a-zA-Z_] first-char and non-dot last-char rules),
+// stats.Registry.NewCounter would panic in checkName per ADR-0059's boot-time
+// panic discipline. The contract (mirror of TestParseFilter_StatPrefixInvalidChars
+// at internal/filter/hcm/config_test.go:221): NewManager MUST return an
+// "invalid cluster name" error and MUST NOT panic. The "0000000000 0" case
+// reproduces the verbatim minimised fuzz-seed shape from the ADR-0065
+// gate-(d) HCM crasher (12 bytes, literal SP at index 10), demonstrating
+// the symmetric vulnerability surface.
+func TestNewManager_ClusterNameInvalidChars(t *testing.T) {
+	cases := []string{
+		"0000000000 0", // verbatim shape of the ADR-0065 fuzz-seed minimized payload
+		"foo bar",      // simpler space form
+		"foo-bar",      // dash
+		"foo:bar",      // colon
+		"foo/bar",      // slash
+		"foo$bar",      // dollar
+	}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			bs := mkBootstrap(mkStaticCluster(name, mkLbEndpoint("127.0.0.1", 8080)))
+			_, err := NewManager(bs, stats.NewRegistry())
+			if err == nil {
+				t.Fatalf("expected error for cluster name %q, got nil", name)
+			}
+			if !strings.Contains(err.Error(), "invalid cluster name") {
+				t.Errorf("error %q does not contain %q", err.Error(), "invalid cluster name")
+			}
+		})
+	}
+}
+
 func TestManager_Error_StrictDNS(t *testing.T) {
 	c := mkStaticCluster("c_dns", mkLbEndpoint("127.0.0.1", 8080))
 	c.ClusterDiscoveryType = &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STRICT_DNS}
