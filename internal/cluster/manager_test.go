@@ -156,7 +156,7 @@ func TestManager_Error_DuplicateName(t *testing.T) {
 // panic discipline. The contract (mirror of TestParseFilter_StatPrefixInvalidChars
 // at internal/filter/hcm/config_test.go:221): NewManager MUST return an
 // "invalid cluster name" error and MUST NOT panic. The "0000000000 0" case
-// reproduces the verbatim minimised fuzz-seed shape from the ADR-0065
+// reproduces the verbatim minimized fuzz-seed shape from the ADR-0065
 // gate-(d) HCM crasher (12 bytes, literal SP at index 10), demonstrating
 // the symmetric vulnerability surface.
 func TestNewManager_ClusterNameInvalidChars(t *testing.T) {
