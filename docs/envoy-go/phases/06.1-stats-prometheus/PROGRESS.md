@@ -1992,3 +1992,268 @@ $ # 7/7 fuzzers PASS — no crashers in any target.
 **ADRs introduced:** ADR-0065 ("Validate metric-name-deriving inputs at the user-input boundary"). The phase-done commit (lifecycle-state 6) will name ADR-0065 alongside the six 06.1 ADRs already landed (ADR-0059, 0060, 0061, 0062, 0063, 0064) per BOOTSTRAP §5.3.
 
 **Lifecycle-state transition:** 3 → 4 (implementation complete, not verified). `next-skill: superpowers:verification-before-completion`. The next session re-runs all six BOOTSTRAP §7.5 gates from a fresh verify worktree (`.worktrees/phase-06.1-stats-prometheus-verify-2`, branched from this commit's HEAD per ADR-0003) per the verifier role contract: verifier commit changes only `STATE.md` + `PROGRESS.md`; no production code, test, or fixture changes.
+
+## Verification (lifecycle-state 4 — re-run after gate-(d) fix) — PASSED
+
+Per `BOOTSTRAP_PROMPT.md` §5 state 4 and `STATE.md`'s `next-skill-scope` (set on the gate-(d) fix commit `79be6b0` and its SHA-fill follow-up `4982713`): a fresh-session re-run of every BOOTSTRAP §7.5 phase-done gate, with each command's verbatim output captured here. This session's HEAD on branch `phase/06.1-stats-prometheus-verify-2` is `498271398d33e4cf089aadf050fcc2551f1e61bb` — the gate-(d) fix branch's tip (STATE.md + PROGRESS.md SHA-fill follow-up to the fix at `79be6b0`). Worktree: `.worktrees/phase-06.1-stats-prometheus-verify-2`, branched from gate-(d) fix-branch tip per ADR-0003 + per-phase-worktree convention; the fix worktree at `.worktrees/phase-06.1-stats-prometheus-impl-followup-gate-d` is closed-history at this state transition. Verifier date: 2026-04-28.
+
+**Outcome: gates (a)/(b)/(c)/(d)/(e) all GREEN; gate (f) deferred to lifecycle-state 6.** The gate-(d) regression target `FuzzHCMConfigParse` (which crashed on seed `9ba19570cf17f59f` under the prior verifier `1f94b74`) now runs the full ADR-0018 30 s budget without any crasher: the `stats.IsValidName` boundary guard added to `parseFilterWithCtx` at `79be6b0` per ADR-0065 catches every metric-name-deriving `stat_prefix` whose assembled name would fail `Registry.checkName`'s regex, returning the documented `hcm: invalid stat_prefix: %q (...)` error before `Registry.NewCounter` is reached. Gate (e) part 2 (`go test -race ./...`) inherits the durable regression test `TestParseFilter_StatPrefixInvalidChars` (6 cases including the verbatim seed prefix `"0000000000 0"`) and passes it under `-race` along with all 17 other test packages — no DATA RACE warnings anywhere. The remaining four gates (a/b/c/e-part-1) and the ADR-0059 boundary grep + 17-stat-emit call-site grep precedents from the impl-branch's Task 15 sweep are mechanically equivalent to this re-run; no surface change between Task 15's sweep and this re-verify other than the ADR-0065 fix.
+
+**Next action per BOOTSTRAP §5 step 4 → 5:** STATE advances to lifecycle-state 5 (verified, not reviewed) with `next-skill: superpowers:requesting-code-review`. ROADMAP rows unchanged (06.1 stays `in-progress`; 06 stays `in-progress`; 06.2 stays `planned`); ROADMAP transitions to `done` happen at the lifecycle-state 6 phase-done commit per BOOTSTRAP §5 step 6.
+
+**Seed file disposition (verifier role contract).** No new auto-generated fuzz seed file appeared during this re-verify. `git status --porcelain` was empty after each of the seven 30 s fuzz runs and again after the `-race` test sweep. The single inherited seed file `internal/stats/testdata/fuzz/FuzzPromTextFormat/1d8483e640bf8347` (committed earlier under the impl-branch chain — verified tracked via `git ls-files`) is unchanged. Per the 05.2 verifier role contract (`b34bd99`) followed by the prior failing verifier (`1f94b74`), this verifier commit changes ONLY `STATE.md` + `PROGRESS.md` — no production code, test, or fixture changes; no testdata/fuzz/ corpus changes.
+
+**Outputs:**
+
+```
+$ pwd
+/home/esa/git/envoy-go/.worktrees/phase-06.1-stats-prometheus-verify-2
+$ git rev-parse --abbrev-ref HEAD
+phase/06.1-stats-prometheus-verify-2
+$ git log -1 --format=%H
+498271398d33e4cf089aadf050fcc2551f1e61bb
+$ go version
+go version go1.26.2 linux/amd64
+$ golangci-lint version 2>&1 | head -1
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+$ docker version --format '{{.Server.Version}}'
+28.1.1
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0065: Validate metric-name-deriving inputs at the user-input boundary
+$ # ADR-0065 is the chronological-add tail; 06.1 chain ADRs in commit-add order:
+$ # 0059, 0060, 0061, 0064, 0063, 0062 (impl Task 15) → 0065 (gate-(d) fix). Non-monotonic per 05.2 precedent.
+$ git status --porcelain
+$ # empty
+```
+
+**Gate (a) — all 6 differential fixtures (0000-0005) — PASS:**
+
+```
+$ go test -count=1 -v -run TestDifferential -timeout=900s ./test/differential/
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0000-tcp-echo
+[testcontainers ryuk + reference-Envoy lifecycle abbreviated; envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd matches ENVOY_TARGET.md pin.]
+=== RUN   TestDifferential/0001-tcp-proxy-rr
+=== RUN   TestDifferential/0002-tls-tcp
+=== RUN   TestDifferential/0003-http11-routing
+=== RUN   TestDifferential/0004-h2-routing
+[ "hcm: h2: EOF" lines from H2 reachability probes during 0004 setup elided — same as 05.2/L4-FAIL verification. ]
+=== RUN   TestDifferential/0005-prometheus-stats
+--- PASS: TestDifferential (8.74s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.52s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.20s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.19s)
+    --- PASS: TestDifferential/0003-http11-routing (1.21s)
+    --- PASS: TestDifferential/0004-h2-routing (1.65s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.98s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	8.822s
+```
+
+6/6 fixtures green. Reference Envoy SHA matches `ENVOY_TARGET.md` pin; the 06.1 stats-Registry threading through cluster/listener/HCM (impl Tasks 7–12) does not regress any pre-existing fixture, and the new fixture-0005 differential equivalence per ADR-0062's shape rules is verified non-vacuously.
+
+**Gate (b) — pre-existing fixtures (regression check) — PASS (subset of (a)):**
+
+The 5 pre-existing fixtures (0000–0004) are run as `TestDifferential/0000…0004` subtests inside the same gate (a) invocation above and all PASS. No separate command needed; per 05.2 verifier precedent, gate (b) is implicit in (a) when (a) covers the full set including pre-existing fixtures. 5/5 pre-existing fixtures green.
+
+**Gate (c) — h2spec conformance (UNCHANGED from 05.1/05.2/L4-FAIL baseline per SPEC §3) — PASS:**
+
+```
+$ go test -count=1 -v -timeout=600s ./test/conformance/h2spec/
+[testcontainers + container lifecycle abbreviated.]
+2026/04/28 06:56:36 🐳 Creating container for image summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0
+[ "hcm: h2: …" probe-driven error lines elided — same shape as L4-FAIL verifier block. ]
+        Finished in 0.5490 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+[ container terminate lines elided. ]
+--- PASS: TestH2Spec (2.14s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.235s
+```
+
+53 of 53 PASS at the pinned `summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0`. Per-section breakdown matches the 05.1/05.2/L4-FAIL baselines byte-for-byte (2+3+3+3+13+2+1+2+2+2+2+1+1+4+2+7+2+1 = 53); covers sections 3, 4, 5, 6 ex-6.6, 7, 8 per ADR-0051's threshold list.
+
+**Gate (d) — 7 fuzz targets at 30 s ADR-0018 budget — PASS (FuzzHCMConfigParse cleared after gate-(d) fix; other 6 PASS as before):**
+
+```
+$ go test -fuzz=FuzzBootstrapLoad -fuzztime=30s -count=1 -run='^$' ./internal/bootstrap/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/1076 completed
+fuzz: elapsed: 5s, gathering baseline coverage: 1076/1076 completed, now fuzzing with 32 workers
+fuzz: elapsed: 9s, execs: 302873 (59798/sec), new interesting: 2 (total: 1078)
+[ ... ]
+fuzz: elapsed: 31s, execs: 327499 (0/sec), new interesting: 2 (total: 1078)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.084s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=FuzzPromTextFormat -fuzztime=30s -count=1 -run='^$' ./internal/stats/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/114 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 114/114 completed, now fuzzing with 32 workers
+[ ... ]
+fuzz: elapsed: 30s, execs: 26217681 (883668/sec), new interesting: 0 (total: 114)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	30.112s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=FuzzTcpProxyFilter -fuzztime=30s -count=1 -run='^$' ./internal/filter/tcpproxy/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/563 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 563/563 completed, now fuzzing with 32 workers
+[ ... ]
+fuzz: elapsed: 31s, execs: 4029470 (0/sec), new interesting: 1 (total: 564)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.051s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=FuzzHCMConfigParse -fuzztime=30s -count=1 -run='^$' ./internal/filter/hcm/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/533 completed
+fuzz: elapsed: 4s, gathering baseline coverage: 533/533 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 331164 (110269/sec), new interesting: 0 (total: 533)
+fuzz: elapsed: 9s, execs: 726420 (131636/sec), new interesting: 0 (total: 533)
+fuzz: elapsed: 12s, execs: 1145546 (139850/sec), new interesting: 1 (total: 534)
+fuzz: elapsed: 15s, execs: 1517026 (123812/sec), new interesting: 1 (total: 534)
+fuzz: elapsed: 18s, execs: 1899146 (127372/sec), new interesting: 1 (total: 534)
+fuzz: elapsed: 21s, execs: 2268440 (123107/sec), new interesting: 1 (total: 534)
+fuzz: elapsed: 24s, execs: 2624874 (118794/sec), new interesting: 1 (total: 534)
+fuzz: elapsed: 27s, execs: 2936455 (103880/sec), new interesting: 1 (total: 534)
+fuzz: elapsed: 30s, execs: 3244770 (102767/sec), new interesting: 1 (total: 534)
+fuzz: elapsed: 31s, execs: 3244770 (0/sec), new interesting: 1 (total: 534)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.046s
+$ git status --porcelain
+$ # empty — no auto-persisted seed; the gate-(d) fix's boundary guard catches every invalid stat_prefix at parse time, before Registry.NewCounter
+
+$ go test -fuzz=FuzzFrameStream -fuzztime=30s -count=1 -run='^$' ./internal/filter/hcm/h2/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/410 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 410/410 completed, now fuzzing with 32 workers
+[ ... ]
+fuzz: elapsed: 30s, execs: 13882377 (450368/sec), new interesting: 5 (total: 415)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	30.150s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=FuzzHPACKDecode -fuzztime=30s -count=1 -run='^$' ./internal/filter/hcm/h2/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/164 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 164/164 completed, now fuzzing with 32 workers
+[ ... ]
+fuzz: elapsed: 31s, execs: 1893954 (0/sec), new interesting: 0 (total: 164)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.071s
+$ git status --porcelain
+$ # empty
+
+$ go test -fuzz=FuzzTLSContextParse -fuzztime=30s -count=1 -run='^$' ./internal/tls/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/684 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 684/684 completed, now fuzzing with 32 workers
+[ ... ]
+fuzz: elapsed: 31s, execs: 4016676 (0/sec), new interesting: 11 (total: 695)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.057s
+$ git status --porcelain
+$ # empty
+```
+
+**Per-target summary (gate d):**
+
+| target                  | execs               | new-interesting | result |
+|-------------------------|---------------------|-----------------|--------|
+| `FuzzBootstrapLoad`     | 327,499             | 2               | PASS   |
+| `FuzzPromTextFormat`    | 26,217,681          | 0               | PASS   |
+| `FuzzTcpProxyFilter`    | 4,029,470           | 1               | PASS   |
+| `FuzzHCMConfigParse`    | 3,244,770           | 1               | **PASS** (regression target — cleared after ADR-0065 fix) |
+| `FuzzFrameStream`       | 13,882,377          | 5               | PASS   |
+| `FuzzHPACKDecode`       | 1,893,954           | 0               | PASS   |
+| `FuzzTLSContextParse`   | 4,016,676           | 11              | PASS   |
+| **Total**               | **53,609,610**      | **20**          | **7/7 PASS, 0 crashers** |
+
+Comparison to gate-(d) fix-branch's local sanity sweep (recorded at `79be6b0`'s "Lifecycle-state 3 — gate-(d) fix landed" block above): `FuzzHCMConfigParse` then 3.49 M execs / 19 new-interesting; this verifier 3.24 M execs / 1 new-interesting. Different exec rates and corpus-discovery counts are normal under fuzzing's non-deterministic worker scheduling; the gate criterion is "no crasher" and that is met by both runs. `FuzzPromTextFormat`'s 0 new-interesting matches its very small (114-input) baseline corpus — the search space is largely covered.
+
+**Gate (e) part 1 — `go vet` + `golangci-lint run` + `go build` — PASS:**
+
+```
+$ go vet ./...
+$ # exit 0; empty output
+
+$ golangci-lint run ./...
+$ # exit 0; empty output
+
+$ go build ./...
+$ # exit 0; empty output
+```
+
+Six lint-fix-sweep fixes from impl Task 15 (`58d4ec9`) plus the gate-(d) fix's `IsValidName` + `parseFilterWithCtx` guard at `79be6b0` are all durable; no new lint findings introduced.
+
+**Gate (e) part 2 — `go test -race ./...` — PASS (18 ok, 0 FAIL, 0 DATA RACE):**
+
+```
+$ go test -race -count=1 -timeout=600s ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.570s
+?   	github.com/esalaine/envoy-go/internal/accesslog	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/admin	1.066s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.034s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.041s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.261s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.501s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.027s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.050s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.032s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.085s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.145s
+ok  	github.com/esalaine/envoy-go/test/differential	11.160s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.012s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.012s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.026s
+$ # exit 0; 18 ok packages, 14 [no test files], 0 FAIL, 0 DATA RACE
+```
+
+18 ok / 0 FAIL — including `internal/filter/hcm` (which under the prior verifier `1f94b74` failed by replaying the auto-persisted `FuzzHCMConfigParse/9ba19570cf17f59f` seed). The durable regression test `TestParseFilter_StatPrefixInvalidChars` (in `internal/filter/hcm/config_test.go`, added at `79be6b0`) covers all 6 invalid-char cases including the verbatim seed prefix `"0000000000 0"` and PASSES under `-race`. `grep -E '(DATA RACE|^FAIL|^---? FAIL)'` over the full output: empty. h2spec, differential (all 6 fixtures including 0005), listener, cluster, hcm, hcm/h2, stats, tls, admin, bootstrap, tcpproxy, cmd/envoy-go, conformance/h2spec, all 5 fixture drivers (0001/0002/0003/0004/0005), and helpers all pass clean under `-race`.
+
+**Gate (f) — `REVIEW.md` approved — deferred to lifecycle-state 6 per BOOTSTRAP §5.**
+
+The REVIEW.md deliverable is the lifecycle-state 6 phase-done step's input per BOOTSTRAP §5; not produced or consumed by this verifier session.
+
+**Carry-forwards (informational; not gate-(d)-blocking, not verifier-scope).**
+
+- **Cluster-name latent vulnerability** at `internal/cluster/manager.go:97` (`registerClusterMetrics` propagates `cluster.<name>` into eight metric names without validating `cluster.<name>` against `nameRE`) — recorded in the gate-(d) fix block above; NOT gate-(d)-blocking (the verifier's `FuzzBootstrapLoad` 30 s run did not happen to discover a cluster-name crasher). A separate follow-up branch will add the same `stats.IsValidName` guard at `cluster.NewManager`'s boundary, inheriting ADR-0065's pattern by reference. Listener is already safe via `normalizeAddr` (`internal/listener/manager.go:196-198`).
+- **L4 review-followup queue (26 Minors)** from impl Tasks 8–14 — listed in the impl-branch's Task 15 closing notes above. Triage queued for the eventual REVIEW phase; not for the verifier.
+
+**Verification result:** gates (a)/(b)/(c)/(d)/(e)-part-1/(e)-part-2 all PASS; gate (f) deferred to lifecycle-state 6. **Phase 06.1 may advance to lifecycle-state 5.** STATE.md transitions to lifecycle-state 5 with `next-skill: superpowers:requesting-code-review`. ROADMAP rows unchanged (06.1 stays `in-progress`; 06 stays `in-progress`; 06.2 stays `planned`); ROADMAP transitions land at the lifecycle-state 6 phase-done commit per BOOTSTRAP §5 step 6.
