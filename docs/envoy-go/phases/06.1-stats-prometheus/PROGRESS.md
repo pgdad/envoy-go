@@ -1858,7 +1858,7 @@ FAIL
 
 **Verification result:** gates (a)/(b)/(c)/(e)-part-1 PASS, gate (d) FAIL on `FuzzHCMConfigParse`, gate (e)-part-2 FAIL on the same root-cause via seed replay, gate (f) deferred. **Phase 06.1 cannot advance to lifecycle-state 5.** STATE.md transitions back to lifecycle-state 3 with `next-skill: superpowers:systematic-debugging`. ROADMAP rows unchanged (06.1 stays `in-progress`; 06 stays `in-progress`; 06.2 stays `planned`). The auto-generated seed file `internal/filter/hcm/testdata/fuzz/FuzzHCMConfigParse/9ba19570cf17f59f` is deleted from this verifier's worktree before commit per the 05.2 verifier role contract — see "Seed file disposition" prose above.
 
-## Lifecycle-state 3 — gate-(d) fix landed (commit `TBD`)
+## Lifecycle-state 3 — gate-(d) fix landed (commit `79be6b0`)
 
 **Branch:** `phase/06.1-stats-prometheus-impl-followup-gate-d` (worktree `.worktrees/phase-06.1-stats-prometheus-impl-followup-gate-d`, branched from verify-branch tip `6a053a4` per ADR-0003).
 
