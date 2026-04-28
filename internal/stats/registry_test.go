@@ -51,6 +51,42 @@ func TestRegistry_NewCounter_InvalidNamePanics(t *testing.T) {
 	}
 }
 
+// TestIsValidName covers the read-only IsValidName helper introduced for
+// callers (HCM, future cluster-name validation) that derive metric names
+// from user-controlled inputs and need to validate at the input boundary
+// rather than trip NewCounter's panic-on-invalid-name discipline. Same
+// regex as Registry.checkName; happy + sad cases mirror the existing
+// TestRegistry_NewCounter_InvalidNamePanics matrix plus full assembled-
+// name forms produced by the HCM/cluster/listener naming patterns.
+func TestIsValidName(t *testing.T) {
+	valid := []string{
+		"a", "_", "ab", "a_b", "a.b",
+		"http.ingress_http.downstream_rq_total",
+		"cluster.c_backend.upstream_rq_2xx",
+		"listener.0_0_0_0_10000.downstream_cx_total",
+		"server.live",
+	}
+	for _, n := range valid {
+		if !IsValidName(n) {
+			t.Errorf("IsValidName(%q) = false, want true", n)
+		}
+	}
+	invalid := []string{
+		"",
+		"1leading-digit",
+		"with space",
+		"with-dash",
+		"trailing.",
+		"with$char",
+		"http.0000000000 0.downstream_rq_total", // verbatim assembled name from gate-(d) seed
+	}
+	for _, n := range invalid {
+		if IsValidName(n) {
+			t.Errorf("IsValidName(%q) = true, want false", n)
+		}
+	}
+}
+
 func TestRegistry_Walk_RegistrationOrderInvariantNotPromised(t *testing.T) {
 	r := NewRegistry()
 	a := r.NewCounter("a")

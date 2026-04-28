@@ -45,6 +45,15 @@ type Metric interface {
 // "trailing." is a malformed name with an empty trailing segment).
 var nameRE = regexp.MustCompile(`^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$`)
 
+// IsValidName reports whether name passes the same regex that NewCounter and
+// NewGauge enforce internally via checkName. Exposed so callers that derive
+// metric names from user-controlled inputs (e.g. HCM stat_prefix, cluster
+// name) can validate at the input boundary and return a hcm-/cluster-prefixed
+// error rather than trip NewCounter's panic-on-invalid-name discipline. ADR-
+// 0059 keeps the panic path correct for programmer errors at boot; this
+// helper is the matching read-only check for the user-input boundary.
+func IsValidName(name string) bool { return nameRE.MatchString(name) }
+
 // Registry holds every metric registered at boot. The list of metrics is
 // mutable only during boot; once Freeze is called, NewCounter / NewGauge
 // panic. This is the LBP-1 invariant — see ADR-0059 Consequences (a) + (b).

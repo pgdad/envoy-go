@@ -1857,3 +1857,138 @@ FAIL
 **Gate (f) — `REVIEW.md` approved — deferred to lifecycle-state 6 per BOOTSTRAP §5.**
 
 **Verification result:** gates (a)/(b)/(c)/(e)-part-1 PASS, gate (d) FAIL on `FuzzHCMConfigParse`, gate (e)-part-2 FAIL on the same root-cause via seed replay, gate (f) deferred. **Phase 06.1 cannot advance to lifecycle-state 5.** STATE.md transitions back to lifecycle-state 3 with `next-skill: superpowers:systematic-debugging`. ROADMAP rows unchanged (06.1 stays `in-progress`; 06 stays `in-progress`; 06.2 stays `planned`). The auto-generated seed file `internal/filter/hcm/testdata/fuzz/FuzzHCMConfigParse/9ba19570cf17f59f` is deleted from this verifier's worktree before commit per the 05.2 verifier role contract — see "Seed file disposition" prose above.
+
+## Lifecycle-state 3 — gate-(d) fix landed (commit `TBD`)
+
+**Branch:** `phase/06.1-stats-prometheus-impl-followup-gate-d` (worktree `.worktrees/phase-06.1-stats-prometheus-impl-followup-gate-d`, branched from verify-branch tip `6a053a4` per ADR-0003).
+
+**Fix shape:** Validate metric-name-deriving inputs at the user-input boundary (HCM `parseFilterWithCtx`), using the same regex (`internal/stats.nameRE`) that `Registry.checkName` enforces — single source of truth, no drift risk. ADR-0065 (this commit) records the rationale, including the rejected alternatives: (A) "sanitise stat_prefix per Rule SN1" — rejected because Rule SN2 preserves `stat_prefix` verbatim as the Prometheus label value `envoy_http_conn_manager_prefix=<stat_prefix>`, and sanitising would silently mutate that label vs upstream Envoy + cause two-prefixes-collapse-to-one data-loss; (B) "convert `Registry.NewCounter` to error-return" — rejected because it would force the duplicate-name and post-Freeze panic paths to follow for symmetry, a wider API change than the gate-(d) blocker requires.
+
+**Surface change:**
+- `internal/stats/registry.go` — adds `IsValidName(name string) bool` (read-only helper wrapping `nameRE.MatchString`). Existing `Registry.NewCounter` / `Registry.NewGauge` panic discipline is unchanged.
+- `internal/stats/registry_test.go` — adds `TestIsValidName` (5 valid + 7 invalid names; the invalid set includes the verbatim assembled name `http.0000000000 0.downstream_rq_total` from the gate-(d) seed).
+- `internal/filter/hcm/config.go` — adds a single guard between the existing `stat_prefix` non-empty check and the route-config build: `if !stats.IsValidName("http." + statPrefix + ".downstream_rq_total") { return nil, fmt.Errorf("hcm: invalid stat_prefix: %q (...)", statPrefix) }`. Validating the longest assembled name suffices because the four `_<N>xx` suffixes share the same character class.
+- `internal/filter/hcm/config_test.go` — adds `TestParseFilter_StatPrefixInvalidChars` (6 cases: `"0000000000 0"` verbatim from the fuzz seed, plus `"foo bar"`, `"foo-bar"`, `"foo:bar"`, `"foo/bar"`, `"foo$bar"`). Each case uses the existing `expectErr` helper to assert the error is `hcm:`-prefixed and contains the substring `invalid stat_prefix`.
+- `docs/envoy-go/DECISIONS.md` — appends ADR-0065.
+
+**TDD evidence — RED (regression test wired up before the fix):**
+
+```
+$ go test -run '^TestParseFilter_StatPrefixInvalidChars$' -v ./internal/filter/hcm/
+=== RUN   TestParseFilter_StatPrefixInvalidChars
+=== RUN   TestParseFilter_StatPrefixInvalidChars/0000000000_0
+--- FAIL: TestParseFilter_StatPrefixInvalidChars (0.00s)
+    --- FAIL: TestParseFilter_StatPrefixInvalidChars/0000000000_0 (0.00s)
+panic: stats: invalid metric name: "http.0000000000 0.downstream_rq_total" (must match ^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$) [recovered, repanicked]
+[ … same call stack as the verifier-block panic above:
+  internal/stats/registry.go:100 → registry.NewCounter:67 → hcm/config.go:164 → fuzz_test.go:37 (replaced by config_test.go:106 expectErr) … ]
+FAIL
+exit status 1
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm	0.006s
+```
+
+The other 5 subtests did not run because the parent panic crashed the test function. Same root cause as the verifier block's gate-(d) FAIL — confirms the regression test reproduces the right defect.
+
+**TDD evidence — GREEN (after the `internal/stats.IsValidName` + `parseFilterWithCtx` guard landed):**
+
+```
+$ go test -run '^TestParseFilter_StatPrefixInvalidChars$' -v ./internal/filter/hcm/
+=== RUN   TestParseFilter_StatPrefixInvalidChars
+=== RUN   TestParseFilter_StatPrefixInvalidChars/0000000000_0
+=== RUN   TestParseFilter_StatPrefixInvalidChars/foo_bar
+=== RUN   TestParseFilter_StatPrefixInvalidChars/foo-bar
+=== RUN   TestParseFilter_StatPrefixInvalidChars/foo:bar
+=== RUN   TestParseFilter_StatPrefixInvalidChars/foo/bar
+=== RUN   TestParseFilter_StatPrefixInvalidChars/foo$bar
+--- PASS: TestParseFilter_StatPrefixInvalidChars (0.00s)
+    --- PASS: TestParseFilter_StatPrefixInvalidChars/0000000000_0 (0.00s)
+    --- PASS: TestParseFilter_StatPrefixInvalidChars/foo_bar (0.00s)
+    --- PASS: TestParseFilter_StatPrefixInvalidChars/foo-bar (0.00s)
+    --- PASS: TestParseFilter_StatPrefixInvalidChars/foo:bar (0.00s)
+    --- PASS: TestParseFilter_StatPrefixInvalidChars/foo/bar (0.00s)
+    --- PASS: TestParseFilter_StatPrefixInvalidChars/foo$bar (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+```
+
+All 6 subtests pass — including the verbatim seed prefix `"0000000000 0"`. The `TestIsValidName` happy + sad coverage for the new helper passes (`ok internal/stats 0.001s`).
+
+**Local re-run of BOOTSTRAP §7.5 gates (a)/(b)/(c)/(d)/(e) — all GREEN.** Note: this is the FIX-branch's own local sanity sweep; the formal lifecycle-state-4 verifier run is the next session's responsibility (in a fresh `.worktrees/phase-06.1-stats-prometheus-verify-2` per the 05.2 verifier role contract).
+
+```
+$ go vet ./...
+$ # (clean — no output)
+
+$ golangci-lint run
+$ # (clean — no output)
+
+$ go build ./...
+$ # (clean — no output)
+
+$ go test ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	0.005s
+ok  	github.com/esalaine/envoy-go/internal/admin	0.029s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.022s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.025s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.216s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	2.472s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.009s
+ok  	github.com/esalaine/envoy-go/internal/listener	0.017s
+ok  	github.com/esalaine/envoy-go/internal/stats	0.003s
+ok  	github.com/esalaine/envoy-go/internal/tls	0.020s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.152s
+ok  	github.com/esalaine/envoy-go/test/differential	10.973s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.007s
+$ # 18 ok packages; 0 FAIL.
+
+$ go test -race ./...
+[ … 18 ok packages, 0 FAIL, no DATA RACE warnings; package timings ~1.0–11.1s … ]
+
+$ go test -fuzz='^FuzzHCMConfigParse$' -fuzztime=30s -count=1 -run='^$' ./internal/filter/hcm/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/513 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 437/513 completed
+fuzz: elapsed: 3s, gathering baseline coverage: 513/513 completed, now fuzzing with 32 workers
+fuzz: elapsed: 6s, execs: 396928 (132203/sec), new interesting: 4 (total: 517)
+fuzz: elapsed: 9s, execs: 825098 (142729/sec), new interesting: 8 (total: 521)
+fuzz: elapsed: 12s, execs: 1306788 (160596/sec), new interesting: 11 (total: 524)
+fuzz: elapsed: 15s, execs: 1700639 (131288/sec), new interesting: 11 (total: 524)
+fuzz: elapsed: 18s, execs: 2113271 (137533/sec), new interesting: 13 (total: 526)
+fuzz: elapsed: 21s, execs: 2500943 (129206/sec), new interesting: 15 (total: 528)
+fuzz: elapsed: 24s, execs: 2881749 (126943/sec), new interesting: 16 (total: 529)
+fuzz: elapsed: 27s, execs: 3204132 (107469/sec), new interesting: 18 (total: 531)
+fuzz: elapsed: 30s, execs: 3489858 (95227/sec), new interesting: 19 (total: 532)
+fuzz: elapsed: 31s, execs: 3489858 (0/sec), new interesting: 19 (total: 532)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.058s
+$ # gate (d) cleared at the ADR-0018 30s budget: 3.49M execs, 19 new-interesting, 0 crashers.
+
+$ # Sanity sweep of all 7 fuzzers at a 10s budget each (the formal verifier session re-runs at 30s):
+$ for fz in 'FuzzBootstrapLoad ./internal/bootstrap' 'FuzzPromTextFormat ./internal/stats' \
+            'FuzzTcpProxyFilter ./internal/filter/tcpproxy' 'FuzzHCMConfigParse ./internal/filter/hcm' \
+            'FuzzFrameStream ./internal/filter/hcm/h2' 'FuzzHPACKDecode ./internal/filter/hcm/h2' \
+            'FuzzTLSContextParse ./internal/tls'; do
+  set -- $fz
+  go test -fuzz="^$1$" -fuzztime=10s -count=1 -run='^$' "$2" 2>&1 | tail -1
+done
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	11.067s
+ok  	github.com/esalaine/envoy-go/internal/stats	10.112s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	10.134s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	10.430s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	10.130s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	11.064s
+ok  	github.com/esalaine/envoy-go/internal/tls	11.051s
+$ # 7/7 fuzzers PASS — no crashers in any target.
+```
+
+**No persisted seed file.** The 30 s `FuzzHCMConfigParse` re-run did not produce any new crasher; `internal/filter/hcm/testdata/fuzz/` does not exist on this branch. Per the 05.2 verifier role contract, no production-test-corpus changes are committed; the durable regression artifact is `TestParseFilter_StatPrefixInvalidChars` in `internal/filter/hcm/config_test.go`, not a binary fuzz seed.
+
+**Cluster-name carry-forward (latent but not gate-(d)-blocking).** `internal/cluster/manager.go:97` (`registerClusterMetrics`) propagates `cluster.<name>` into eight metric names without validating the cluster name's character set, mirroring the HCM defect. The verifier's `FuzzBootstrapLoad` 30 s run did not happen to discover a cluster-name crasher (the 30 s budget did not drift the bootstrap fuzz corpus to a cluster name with chars outside `[a-zA-Z0-9_.]`), but the latent vulnerability is real. Per `STATE.md`'s "the gate-(d) fix should be a focused single-issue branch, not bundled with Minors triage" guidance, this fix is NOT bundled into the gate-(d) branch — a follow-up branch will add the same `stats.IsValidName` validation guard at `cluster.NewManager`'s `cluster.<name>` boundary, inheriting ADR-0065's pattern by reference. Listener is already safe via `normalizeAddr` (`internal/listener/manager.go:196-198`).
+
+**ADRs introduced:** ADR-0065 ("Validate metric-name-deriving inputs at the user-input boundary"). The phase-done commit (lifecycle-state 6) will name ADR-0065 alongside the six 06.1 ADRs already landed (ADR-0059, 0060, 0061, 0062, 0063, 0064) per BOOTSTRAP §5.3.
+
+**Lifecycle-state transition:** 3 → 4 (implementation complete, not verified). `next-skill: superpowers:verification-before-completion`. The next session re-runs all six BOOTSTRAP §7.5 gates from a fresh verify worktree (`.worktrees/phase-06.1-stats-prometheus-verify-2`, branched from this commit's HEAD per ADR-0003) per the verifier role contract: verifier commit changes only `STATE.md` + `PROGRESS.md`; no production code, test, or fixture changes.

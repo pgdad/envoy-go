@@ -2291,3 +2291,43 @@ The fixture 0005 stats differential asserts equivalence on the 17-name allow-lis
 ### Lands-in-task
 
 Phase-06.1 Task 14 (fixture 0005-prometheus-stats + runner registration). Supersedes nothing.
+
+## ADR-0065: Validate metric-name-deriving inputs at the user-input boundary
+
+**Status:** Accepted
+**Date:** 2026-04-28
+**Doctrine:** D-3.4 (record durable design rationale) + D-3.6 (every phase is a green build).
+
+### Context
+
+Phase-06.1 verifier commit `1f94b74` surfaced a `FuzzHCMConfigParse` crasher: HCM stat-name construction at `internal/filter/hcm/config.go:164` builds `"http." + stat_prefix + ".downstream_rq_total"` from a user-controlled `stat_prefix` and feeds it to `stats.Registry.NewCounter`, which panics in `Registry.checkName` (`internal/stats/registry.go:100`) when the assembled name fails the metric-name regex `^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$`. The minimised seed `9ba19570cf17f59f` reproduced the panic with `stat_prefix = "0000000000 0"` (12 bytes, literal SP at index 10).
+
+ADR-0059 establishes that `Registry.NewCounter` panics on invalid name (and on duplicate registration, and post-Freeze) because metric registration is a boot-time concern — programmer errors at boot should crash loudly, not return errors callers might silently ignore. That contract is correct for static, programmer-supplied metric names (`server.live`, `server.live`-style fixed strings). It is wrong when the caller derives the name from user input — the panic then becomes an undefined runtime crash.
+
+The same shape exists at three call sites in the 06.1 surface: HCM (`stat_prefix`), cluster (`cluster.<name>`), and listener (`listener.<addr>`). Listener already pre-sanitises via `normalizeAddr` (`internal/listener/manager.go:196-198`, replaces `:`, `.`, `[`, `]`); HCM and cluster do not.
+
+Two fix-shape candidates were considered, both rejected for the stated reasons:
+
+- **(A) Sanitise `stat_prefix` per Rule SN1's invalid-character substitution** before constructing the counter name. **Rejected:** Per ADR-0061's empirically-pinned Rule SN2, `stat_prefix` is preserved verbatim as the Prometheus label `envoy_http_conn_manager_prefix=<stat_prefix>`. Sanitising would silently mutate that label vs upstream Envoy's emission. Two stat_prefixes differing only in invalid chars would collapse to the same Prometheus label value — a silent data-loss bug. Rule SN1 was empirically anchored against reference Envoy v1.37.2; extending it with substitution semantics requires its own ADR + re-pinning evidence.
+
+- **(B) Convert `Registry.NewCounter` to return `(c, error)` instead of panicking on invalid name.** **Rejected:** ADR-0059's panic discipline is load-bearing for the LBP-1 invariant — duplicate-name and post-Freeze panic for the same boot-error reason, and converting one of the three panic paths to error-return would force the other two to follow for symmetry. That is a wider API change than the gate-(d) blocker requires.
+
+### Decision
+
+Validate every metric-name-deriving user input at the boundary where the input enters envoy-go's process state — before the assembled name reaches `Registry.NewCounter`. Use the same regex (`internal/stats.nameRE`) that `Registry.checkName` would enforce, so the boundary check and the registry check are guaranteed to agree (no drift risk).
+
+The mechanism: `internal/stats` exposes a read-only `IsValidName(name string) bool` helper that wraps `nameRE.MatchString`. Callers that derive names from user input call this helper on the assembled name and return a domain-prefixed error (`hcm: invalid stat_prefix: …`, `cluster: invalid cluster name: …`) on failure.
+
+This preserves ADR-0059's panic discipline for programmer errors (e.g., `server.live` is a static literal — if a future commit typos it to `server live`, panic-at-boot is the right response) while routing user-input failures through the normal config-parse error channel. It is also the same shape the listener path already uses (the `normalizeAddr` pre-pass guarantees the assembled name is always valid).
+
+### Consequences
+
+- (a) `internal/stats/registry.go` exposes `IsValidName(name string) bool`. The function is read-only (no state mutation), takes a single `string`, returns a single `bool`, and adds zero coupling. The existing `Registry.NewCounter` / `Registry.NewGauge` panic discipline is unchanged.
+- (b) `parseFilterWithCtx` (`internal/filter/hcm/config.go`) gains a single guard between the existing `stat_prefix` non-empty check and the route-config build: `if !stats.IsValidName("http." + statPrefix + ".downstream_rq_total") { return nil, fmt.Errorf("hcm: invalid stat_prefix: %q (...)", statPrefix) }`. Validating the longest assembled name suffices because the other four assembled names (`downstream_rq_2xx` through `downstream_rq_5xx`) differ only in the suffix's last 4 chars (`tota` → `total`, `_2xx` etc.) which are all in the regex's permitted character class — they pass/fail together.
+- (c) The fuzz target's "no panic; every error message is hcm:-prefixed" contract (`internal/filter/hcm/fuzz_test.go:38-40`) is preserved: the new error path returns a hcm:-prefixed error.
+- (d) The same vulnerability latently exists in `internal/cluster/manager.go:97` where `cluster.<name>` is propagated into eight metric names without validating the cluster name's character set. This is a carry-forward — the gate-(d) fix branch is scoped to the single-blocker fix per `STATE.md`'s "focused single-issue branch" guidance. A follow-up branch will add `cluster.NewManager` validation using the same `stats.IsValidName` helper. The carry-forward is recorded in `PROGRESS.md`'s lifecycle-state-3 fix block and inherits ADR-0065's pattern by reference (no new ADR needed).
+- (e) Future filter / extension authors that introduce metrics derived from user input MUST validate at their input boundary using `stats.IsValidName` (or an equivalent boundary check) — the panic discipline is correct for static names but not for user-input-derived names, and silently relying on `Registry.NewCounter`'s panic to surface invalid input is a design defect.
+
+### Lands-in-task
+
+Phase-06.1 lifecycle-state-3 fix branch (`phase/06.1-stats-prometheus-impl-followup-gate-d`). The cluster-name carry-forward will land in a future branch under the same phase-06.1 umbrella or in a phase-06.1 review-followup batch; it inherits this ADR's pattern by reference. Supersedes nothing; complements ADR-0059.

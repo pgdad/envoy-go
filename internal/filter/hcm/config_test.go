@@ -209,6 +209,31 @@ func TestParseFilter_MissingStatPrefix(t *testing.T) {
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.StatPrefix = "" }, "stat_prefix")
 }
 
+// TestParseFilter_StatPrefixInvalidChars is the gate-(d) regression test for
+// the FuzzHCMConfigParse crasher surfaced by verifier commit 1f94b74. A
+// stat_prefix containing a literal space (or any character outside the
+// internal metric-name regex's permitted [a-zA-Z0-9_.] class) caused
+// stats.Registry.NewCounter to panic at registry.go:checkName when the
+// assembled "http.<stat_prefix>.downstream_rq_total" name was registered.
+// The contract: parseFilter MUST return an "hcm: invalid stat_prefix" error
+// and MUST NOT panic. The "0000000000 0" case reproduces the verbatim
+// minimized fuzz seed payload (12 bytes; literal SP at index 10).
+func TestParseFilter_StatPrefixInvalidChars(t *testing.T) {
+	cases := []string{
+		"0000000000 0", // verbatim fuzz-seed minimized payload (gate-(d) crasher)
+		"foo bar",      // simpler space form
+		"foo-bar",      // dash
+		"foo:bar",      // colon
+		"foo/bar",      // slash
+		"foo$bar",      // dollar
+	}
+	for _, prefix := range cases {
+		t.Run(prefix, func(t *testing.T) {
+			expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.StatPrefix = prefix }, "invalid stat_prefix")
+		})
+	}
+}
+
 func TestParseFilter_RDSRouteSpecifier(t *testing.T) {
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) {
 		h.RouteSpecifier = &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{RouteConfigName: "rc"}}

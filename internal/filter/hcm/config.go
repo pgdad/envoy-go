@@ -132,6 +132,17 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 	if statPrefix == "" {
 		return nil, fmt.Errorf("hcm: stat_prefix is required")
 	}
+	// Validate the assembled metric-name shape before any registry write.
+	// stat_prefix is propagated into "http.<stat_prefix>.<metric>" counter
+	// names at the bottom of this function; if it contains characters outside
+	// the metric-name regex's permitted [a-zA-Z0-9_.] class (or otherwise
+	// produces an invalid assembled name), Registry.NewCounter would panic
+	// per ADR-0059's boot-time panic discipline. We reject at the user-input
+	// boundary instead so the failure surfaces as a hcm:-prefixed error per
+	// the FuzzHCMConfigParse contract.
+	if !stats.IsValidName("http." + statPrefix + ".downstream_rq_total") {
+		return nil, fmt.Errorf("hcm: invalid stat_prefix: %q (must contain only ASCII letters, digits, underscore, or dot, and form a valid metric-name segment)", statPrefix)
+	}
 
 	rc, err := requireInlineRouteConfig(msg)
 	if err != nil {
