@@ -155,7 +155,7 @@ ok  	github.com/esalaine/envoy-go/internal/accesslog	1.013s
 
 ## Task 5 — `internal/accesslog/stats.go` + `internal/stats/name.go` helpText extension [ADR-0069]
 
-**Commits:** TBD — this task's commit
+**Commits:** `5278161`
 **Notes:** Created `internal/accesslog/stats.go` with `RegisterDroppedCounter(*stats.Registry) *stats.Counter` allocating the `server.accesslog_dropped` counter per ADR-0069. The counter maps to Prometheus name `envoy_server_accesslog_dropped` via Rule SN5 (no labels). Extended `internal/stats/name.go` helpText map from 10 to 11 entries; updated comment to reflect new count. Added `TestHelpText_AccessLogDropped` to `internal/stats/name_test.go`. Appended ADR-0069 to `docs/envoy-go/DECISIONS.md`. TDD discipline followed: test file written first, RED confirmed, then implementation to GREEN.
 **Outputs:**
 ```
