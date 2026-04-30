@@ -117,10 +117,10 @@ func escapeLabelValue(s string) string {
 // helpText maps each Prometheus name emitted by 06.1 to a static English
 // description per BRAINSTORM §4.5. Per Rule SN6, HELP text is NOT byte-equal
 // to Envoy's HELP text — the differential equivalence claim is on values +
-// label keys + types only. The 10 entries cover the 13 unique Prometheus
+// label keys + types only. The 11 entries cover the 13 unique Prometheus
 // names emitted by 06.1 (the four _Nxx counters per HCM and per cluster
 // collapse to envoy_http_downstream_rq_xx and envoy_cluster_upstream_rq_xx
-// respectively per Rule SN4).
+// respectively per Rule SN4) plus one 06.2 backpressure counter.
 var helpText = map[string]string{
 	"envoy_listener_downstream_cx_total":  "Total connections accepted on the listener.",
 	"envoy_listener_downstream_cx_active": "Active connections on the listener.",
@@ -132,4 +132,5 @@ var helpText = map[string]string{
 	"envoy_cluster_upstream_cx_active":    "Active connections to upstream clusters.",
 	"envoy_cluster_membership_total":      "Number of endpoints in the cluster.",
 	"envoy_server_live":                   "1 if the server is live, 0 otherwise.",
+	"envoy_server_accesslog_dropped":      "Total access-log records dropped due to backpressure (per-process aggregate across all sinks).",
 }

@@ -2364,3 +2364,38 @@ Hot-path discipline: lock-free on `Submit` — Go's buffered-channel non-blockin
 ### Lands-in-task
 
 Task 2 (the Sink-interface + Record-struct introduction; the architectural shape applies to every subsequent task in the package). Supersedes nothing; complements ADR-0059.
+
+## ADR-0069: `server.accesslog_dropped` counter naming (SN5 mapping)
+
+**Status:** Accepted
+**Date:** 2026-04-30
+**Doctrine:** D-3.4 (record durable design rationale where context-isolation requires it).
+
+### Context
+
+Per ADR-0066, `internal/accesslog`'s AsyncFileSink uses drop-newest backpressure: full-channel Submit increments a counter and emits a rate-limited diagnostic. The counter must be allocated against 06.1's `*stats.Registry` (per ADR-0059 the Registry is the single source of truth for Prometheus exposition), and its name must follow the SN1–SN5 flattening rules from ADR-0061 so the resulting Prometheus name reads naturally and aggregates across sinks correctly.
+
+### Decision
+
+The drop-newest backpressure counter is allocated as `registry.NewCounter("server.accesslog_dropped")`. Per 06.1 Rule SN5 (`server.<rest>` → `envoy_server_<rest>`, no labels), the Prometheus exposition name is `envoy_server_accesslog_dropped`. **Outside the 06.1 17-name allow-list** — fixture 0005's differential explicitly ignores the metric per ADR-0062's allow-list discipline. Operator-visible at `/stats/prometheus` only.
+
+The counter is allocated **once per process** (not once per sink) — the loop in `cmd/envoy-go/main.go` allocates exactly once even with N sinks, sharing the counter across all sinks; per-sink debug visibility comes through the per-sink `path` value in the rate-limited diagnostic log line.
+
+The internal-stats `helpText` map in `internal/stats/name.go` gains one entry per Decision K + SPEC §12 #5: `"envoy_server_accesslog_dropped": "Total access-log records dropped due to backpressure (per-process aggregate across all sinks)."`.
+
+### Alternatives considered
+
+- (A) `accesslog.dropped` — REJECTED. Violates the SN1–SN5 prefix convention; would need a new SN-rule.
+- (B) `http.<stat_prefix>.accesslog_dropped` — REJECTED. The per-process aggregation surface doesn't cleanly key per stat_prefix when there are multiple HCMs.
+- (C) Per-sink `accesslog.<sink_path>.dropped` — REJECTED. Path strings are not metric-name-safe (filesystem characters fail `internal/stats.nameRE`); per-sink granularity is over-shaped for a backpressure indicator.
+
+### Consequences
+
+- (a) The counter name is a constant in `internal/accesslog/stats.go`'s `RegisterDroppedCounter` function.
+- (b) The `helpText` map entry follows 06.1's discipline (per Rule SN6).
+- (c) Future sink types (ALS, OTLP) introduced in later phases may add sibling counters (e.g., `server.accesslog_als_failed`) under the same SN5 mapping.
+- (d) The metric is OUTSIDE the 06.1 17-name fixture-0005 allow-list per ADR-0062 — that fixture's parser silently drops it; no test changes needed in the 06.1 fixture.
+
+### Lands-in-task
+
+Task 5 (alongside the package skeleton; the counter wiring lives in `internal/accesslog/stats.go`; the `helpText` map extension lives in `internal/stats/name.go`). Supersedes nothing; complements ADR-0059 + ADR-0061.

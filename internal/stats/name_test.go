@@ -160,3 +160,10 @@ func TestHelpText_Coverage(t *testing.T) {
 		}
 	}
 }
+
+func TestHelpText_AccessLogDropped(t *testing.T) {
+	want := "Total access-log records dropped due to backpressure (per-process aggregate across all sinks)."
+	if got := helpText["envoy_server_accesslog_dropped"]; got != want {
+		t.Errorf("helpText[envoy_server_accesslog_dropped] = %q, want %q", got, want)
+	}
+}

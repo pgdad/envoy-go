@@ -152,3 +152,37 @@ ok  	github.com/esalaine/envoy-go/internal/accesslog	1.012s
 # All 12 tests pass (7 TestDefault_* + 5 TestAsyncFileSink_*); no race detected
 ok  	github.com/esalaine/envoy-go/internal/accesslog	1.013s
 ```
+
+## Task 5 — `internal/accesslog/stats.go` + `internal/stats/name.go` helpText extension [ADR-0069]
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/accesslog/stats.go` with `RegisterDroppedCounter(*stats.Registry) *stats.Counter` allocating the `server.accesslog_dropped` counter per ADR-0069. The counter maps to Prometheus name `envoy_server_accesslog_dropped` via Rule SN5 (no labels). Extended `internal/stats/name.go` helpText map from 10 to 11 entries; updated comment to reflect new count. Added `TestHelpText_AccessLogDropped` to `internal/stats/name_test.go`. Appended ADR-0069 to `docs/envoy-go/DECISIONS.md`. TDD discipline followed: test file written first, RED confirmed, then implementation to GREEN.
+**Outputs:**
+```
+# RED — go test ./internal/accesslog/ -count=1 -run TestRegisterDroppedCounter -v (before stats.go)
+# github.com/esalaine/envoy-go/internal/accesslog [github.com/esalaine/envoy-go/internal/accesslog.test]
+internal/accesslog/stats_test.go:10:7: undefined: RegisterDroppedCounter
+internal/accesslog/stats_test.go:19:6: undefined: RegisterDroppedCounter
+FAIL	github.com/esalaine/envoy-go/internal/accesslog [build failed]
+FAIL
+
+# GREEN — go test ./internal/accesslog/ -count=1 -run TestRegisterDroppedCounter -v (after stats.go)
+=== RUN   TestRegisterDroppedCounter_Name
+--- PASS: TestRegisterDroppedCounter_Name (0.00s)
+=== RUN   TestRegisterDroppedCounter_FlattensToPromName
+--- PASS: TestRegisterDroppedCounter_FlattensToPromName (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
+
+# GREEN — go test ./internal/accesslog/ ./internal/stats/ -count=1 (full acceptance)
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.004s
+ok  	github.com/esalaine/envoy-go/internal/stats	0.002s
+
+# helpText grep
+$ grep -n 'envoy_server_accesslog_dropped' internal/stats/name.go
+135:	"envoy_server_accesslog_dropped":      "Total access-log records dropped due to backpressure (per-process aggregate across all sinks).",
+
+# ADR-0069 grep
+$ grep -n '^## ADR-0069:' docs/envoy-go/DECISIONS.md
+2368:## ADR-0069: `server.accesslog_dropped` counter naming (SN5 mapping)
+```
