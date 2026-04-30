@@ -567,9 +567,14 @@ Mirrors 06.1's Rule SN4 empirical-pin block in `BEHAVIOR_CONTRACT.md ## Stat-nam
 ```
 Empirical evidence (verbatim excerpt from reference-Envoy /tmp/envoy-access.log
 under the 5-request workload from §7.2; reference image v1.37.2 at
-ENVOY_TARGET.md SHA c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd):
+ENVOY_TARGET.md SHA c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd;
+captured 2026-04-30 by phase 06.2 PLAN Task 3 step 3):
 
-<<TBD: pinned at PLAN Task N — empirical scrape>>
+[2026-04-30T09:10:30.856Z] "GET /health HTTP/1.1" 200 - 0 3 0 - "-" "curl/8.5.0" "b66c2c7d-3921-4184-b6c1-6a80dd5e7e8e" "127.0.0.1:15006" "-"
+[2026-04-30T09:10:30.861Z] "GET /api/v1/foo HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "1210434d-5aa4-4a56-a256-3ff6fc989ce5" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.865Z] "GET /api/v1/bar HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "c76bd1e7-3f55-4a6b-a3df-f88f00c7250a" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.870Z] "GET /api/v1/baz HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "5b25ba00-2be4-4ae6-9693-0ce90609f529" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.875Z] "GET /notfound HTTP/1.1" 404 - 0 10 0 - "-" "curl/8.5.0" "5a9c562a-1ebf-4676-a556-bf02f89a0fad" "127.0.0.1:15006" "-"
 ```
 
 The pin block above is what `BEHAVIOR_CONTRACT.md ## Access log field mapping`'s in-place edit will ALSO carry verbatim (per §13 below). The §13 block + the §11 block are synchronized (no drift).
@@ -645,9 +650,14 @@ X-ENVOY-ORIGINAL-PATH?:PATH fallback note (per 06.2 SPEC §6.1):
 
 Empirical evidence (verbatim excerpt from reference-Envoy /tmp/envoy-access.log
 under the 5-request workload from 06.2 SPEC §7.2; reference image v1.37.2 at
-ENVOY_TARGET.md SHA c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd):
+ENVOY_TARGET.md SHA c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd;
+captured 2026-04-30 by phase 06.2 PLAN Task 3 step 3):
 
-<<TBD: pinned at PLAN Task N — empirical scrape>>
+[2026-04-30T09:10:30.856Z] "GET /health HTTP/1.1" 200 - 0 3 0 - "-" "curl/8.5.0" "b66c2c7d-3921-4184-b6c1-6a80dd5e7e8e" "127.0.0.1:15006" "-"
+[2026-04-30T09:10:30.861Z] "GET /api/v1/foo HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "1210434d-5aa4-4a56-a256-3ff6fc989ce5" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.865Z] "GET /api/v1/bar HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "c76bd1e7-3f55-4a6b-a3df-f88f00c7250a" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.870Z] "GET /api/v1/baz HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "5b25ba00-2be4-4ae6-9693-0ce90609f529" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.875Z] "GET /notfound HTTP/1.1" 404 - 0 10 0 - "-" "curl/8.5.0" "5a9c562a-1ebf-4676-a556-bf02f89a0fad" "127.0.0.1:15006" "-"
 ```
 
 ### 13.2 `## Equivalence Matrix` row (existing row, definition concretized)
@@ -722,7 +732,7 @@ A reviewer (phase 06.2's `superpowers:requesting-code-review` subagent) signs of
 - [ ] `BEHAVIOR_CONTRACT.md ## Access log field mapping` is populated with the 15-operator format table from §6 + the three-tier matrix from §13.1 + the empirical-pin block (verbatim from §11 once PLAN Task N's scrape lands) + the `X-ENVOY-ORIGINAL-PATH?:PATH` fallback note from §6.1; the in-place edit lands at the phase-done commit (NOT the SPEC commit) per ADR-0052's discipline. The existing `## Equivalence Matrix` row at line 18 is unchanged in text; its definition is now load-bearing per §13.2.
 - [ ] All four 06.2 ADRs (ADR-0066 architecture / ADR-0067 reject-log_format / ADR-0068 differential-equivalence-shape / ADR-0069 counter-naming) appear in `DECISIONS.md` with full Context/Decision/Consequences sections per ADR-0001's template. The ADR-numbering-shift discipline from ADR-0045 + ADR-0004 is honored (the planner verified next-free at write time and the four numbers are contiguous; topical-vs-commit-order non-monotonicity is permitted and recorded in each ADR's `Lands-in-task` field per the 05.2 ADR-0055..ADR-0058 + 06.1 ADR-0059..ADR-0064 precedents).
 - [ ] Fixture `0006-access-log/` is committed in full: `envoy.yaml` + `envoy-go.yaml` + `expectations.yaml` + `README.md` + `driver/driver.go` + `driver/driver_test.go` + `backends/main.go`. The 5-request workload + polling-loop drain discipline (Decision G) + per-record three-tier matrix (Decision D) is implemented in `driver/driver.go`; the `--concurrency 1` reference invocation is honored.
-- [ ] **The empirical-format pin is filled.** §11's `<<TBD: pinned at PLAN Task N — empirical scrape>>` placeholder is replaced with the verbatim 5-record scrape from reference Envoy v1.37.2 at the `ENVOY_TARGET.md` SHA. The `BEHAVIOR_CONTRACT.md ## Access log field mapping` subsection's empirical-pin block carries the same verbatim scrape (no drift between SPEC §11 and the contract addition).
+- [x] **The empirical-format pin is filled.** §11's empirical-scrape placeholder is replaced with the verbatim 5-record scrape from reference Envoy v1.37.2 at the `ENVOY_TARGET.md` SHA (captured 2026-04-30 by phase 06.2 PLAN Task 3 step 3). The `BEHAVIOR_CONTRACT.md ## Access log field mapping` subsection's empirical-pin block carries the same verbatim scrape (no drift between SPEC §11 and the contract addition).
 - [ ] `test/conformance/h2spec/` is UNCHANGED; pin still at the ADR-0051 SHA; 53/53 PASS.
 - [ ] No phase-04 / 05.1 / 05.2 / 06.1 fixture (`0000`/`0001`/`0002`/`0003`/`0004`/`0005`) regressed under the unrestricted `go test ./test/differential/...` run.
 - [ ] `STATE.md` is at lifecycle-state 6 for 06.2; `ROADMAP.md` row `06.2` is `done`; row `06` (parent) flips `in-progress → done` AT THE SAME phase-done commit. The §5.1 phase-done commit's commit-message body explicitly names BOTH ROADMAP-row transitions per parent SPEC §5.

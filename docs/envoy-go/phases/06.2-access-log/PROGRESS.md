@@ -63,3 +63,55 @@ ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
  internal/accesslog/doc.go            | 14 ++++++++---
  4 files changed, 130 insertions(+), 4 deletions(-)
 ```
+
+## Task 3 — `internal/accesslog/format.go` — Default formatter + empirical-format-pin scrape
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/accesslog/format.go` with `Default(*Record) []byte` implementing the Envoy v1.37.2 default access-log format (15 operators, identical positions on every record per SPEC §6). Six escape rules: `"` → `\"`, `\n` → `\n` literal, `\r` → `\r` literal in all field values; embedded LFs replaced so line-stream invariant holds. The 5 unplumbed operators (RESPONSE_FLAGS, BYTES_RECEIVED, RESP(X-ENVOY-UPSTREAM-SERVICE-TIME), X-FORWARDED-FOR, X-REQUEST-ID) emit literal `-` per Decision A (Tier-S). Created `internal/accesslog/format_test.go` with 7 TDD tests (happy-path, routed upstream host, quote escaping, no-embedded-LF, empty-fields-dash, RFC3339ms time format, ms-rounded-down duration).
+
+Empirical scrape: booted reference Envoy v1.37.2 (SHA `c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`) with a minimal HCM config + small Go backend on port 18443; drove 5 sequential GETs (`/health`, `/api/v1/foo`, `/api/v1/bar`, `/api/v1/baz`, `/notfound`); captured `/tmp/0006-pin/envoy-access.log`. Format analysis: reference Envoy emits `0` for BYTES_RECEIVED and UUID for X-REQUEST-ID (Envoy auto-generates it); subject emits `-` for all 5 Tier-S operators per Decision A. Positional structure (operator count = 15, delimiter shapes `[`, `]`, `"`, space) matches exactly — no corrections needed to `format.go`. Both TBD placeholders in SPEC.md filled: §11 (line 572 area) and §13.1 (line 650 area), using the verbatim 5-line scrape.
+
+**Outputs:**
+```
+# RED — go test ./internal/accesslog/ -count=1 -run TestDefault -v (before format.go)
+# github.com/esalaine/envoy-go/internal/accesslog [github.com/esalaine/envoy-go/internal/accesslog.test]
+internal/accesslog/format_test.go:18:9: undefined: Default
+internal/accesslog/format_test.go:38:14: undefined: Default
+internal/accesslog/format_test.go:49:14: undefined: Default
+internal/accesslog/format_test.go:61:9: undefined: Default
+internal/accesslog/format_test.go:72:14: undefined: Default
+internal/accesslog/format_test.go:81:14: undefined: Default
+internal/accesslog/format_test.go:93:14: undefined: Default
+FAIL	github.com/esalaine/envoy-go/internal/accesslog [build failed]
+FAIL
+
+# GREEN — go test ./internal/accesslog/ -count=1 -run TestDefault -v (after format.go)
+=== RUN   TestDefault_HappyPath_HCMDirect
+--- PASS: TestDefault_HappyPath_HCMDirect (0.00s)
+=== RUN   TestDefault_RoutedPath_UpstreamHostFormatted
+--- PASS: TestDefault_RoutedPath_UpstreamHostFormatted (0.00s)
+=== RUN   TestDefault_QuoteEscaping
+--- PASS: TestDefault_QuoteEscaping (0.00s)
+=== RUN   TestDefault_NeverEmbedsLF
+--- PASS: TestDefault_NeverEmbedsLF (0.00s)
+=== RUN   TestDefault_EmptyFieldsEmitDash
+--- PASS: TestDefault_EmptyFieldsEmitDash (0.00s)
+=== RUN   TestDefault_StartTimeFormat_RFC3339Ms
+--- PASS: TestDefault_StartTimeFormat_RFC3339Ms (0.00s)
+=== RUN   TestDefault_DurationMillisecondsRoundedDown
+--- PASS: TestDefault_DurationMillisecondsRoundedDown (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
+
+# Empirical scrape — verbatim /tmp/0006-pin/envoy-access.log from reference Envoy v1.37.2
+# (image SHA c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd, captured 2026-04-30)
+[2026-04-30T09:10:30.856Z] "GET /health HTTP/1.1" 200 - 0 3 0 - "-" "curl/8.5.0" "b66c2c7d-3921-4184-b6c1-6a80dd5e7e8e" "127.0.0.1:15006" "-"
+[2026-04-30T09:10:30.861Z] "GET /api/v1/foo HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "1210434d-5aa4-4a56-a256-3ff6fc989ce5" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.865Z] "GET /api/v1/bar HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "c76bd1e7-3f55-4a6b-a3df-f88f00c7250a" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.870Z] "GET /api/v1/baz HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "5b25ba00-2be4-4ae6-9693-0ce90609f529" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.875Z] "GET /notfound HTTP/1.1" 404 - 0 10 0 - "-" "curl/8.5.0" "5a9c562a-1ebf-4676-a556-bf02f89a0fad" "127.0.0.1:15006" "-"
+
+# Verification grep (no match = PASS)
+$ ! grep -F 'TBD: pinned at PLAN Task N' docs/envoy-go/phases/06.2-access-log/SPEC.md
+(no output — PASS)
+```
