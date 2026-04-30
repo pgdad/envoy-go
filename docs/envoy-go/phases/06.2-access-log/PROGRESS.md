@@ -414,7 +414,7 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.003s
 
 ## Task 12 — HCM H1 emit-deferral sites (directResponseAction.do + routerAction.do)
 
-**Commits:** TBD
+**Commits:** `d6d35be`
 **Notes:** Added `filter *Filter` field to `directResponseAction`, `routerAction`, and `routerActionH2` structs (the H2 field is wired at Task 13; added now so `routeTable.bindFilter` compiles). Added `routeTable.bindFilter(f *Filter)` to `route.go`: iterates routes and sets the filter backpointer on each action that holds one; called from `parseFilterWithCtx` after the `*Filter` is constructed (actions are built before Filter exists — post-build wiring pattern). Modified `directResponseAction.do` to record `start := time.Now()` and defer `a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)` guarded by `a.filter != nil`. Modified `routerAction.do` to wrap `bw` in `byteCounterWriter` (counts downstream bytes via `resp.Write(bcw)`), capture `picked` from `Cluster.Dial`, and register a single top-of-function defer (closure capturing `statusCode` and `picked` by reference) that reads the final values after all writes; `statusCode` is set on each early-return path (503 for dial-failure, 502 for write/read failure, `resp.StatusCode` on success). Added 4 new tests: `TestDirectResponseAction_EmitsAccessLog`, `TestDirectResponseAction_NilFilter_DoesNotPanic`, `TestRouterAction_EmitsAccessLog_HappyPath`, `TestRouterAction_EmitsAccessLog_DialFailure`. All pass. Import `github.com/esalaine/envoy-go/internal/accesslog` added to `actions_test.go`. Deviation: the defer-count grep finds 1 literal `defer.*emitAccessLog(` in actions.go (directResponseAction path) plus 1 inside a `defer func(){...}()` closure (routerAction path) — both fire on return; the plan's "≥2 matches" was approximate, functional coverage is complete.
 **Outputs:**
 ```
@@ -442,7 +442,7 @@ $ grep -nE 'emitAccessLog' internal/filter/hcm/actions.go
 
 ## Task 13 — HCM H2 emit-deferral sites (h2DirectResponseAdapter.WriteH2 + routerActionH2.doH2)
 
-**Commits:** TBD
+**Commits:** `aefe093`
 **Notes:** Modified `h2DirectResponseAdapter.WriteH2` in `h2dispatch.go`: added `start := time.Now()` + `defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)`. The `req h2.H2Request` parameter was previously blank (`_`); renamed so the emit can read it. Added `"time"` and `"github.com/esalaine/envoy-go/internal/cluster"` imports to `h2dispatch.go`. Modified `routerActionH2.doH2` in `actions.go`: added `start := time.Now()`; declared `statusForHCM`, `bytesSentH2`, and `picked` before a top-of-function `defer func(){...}()` closure (guarded by `r.filter != nil`) that calls `r.filter.emitAccessLogH2` with final values; `statusForHCM` set to 502 on dial-failure + RoundTrip error paths, `resp.Status` on success; remains 0 on the ctx-cancel CANCEL path — `emitAccessLogH2` guards on statusCode==0 and skips emission per SPEC §2.1. `bytesSentH2 = len(resp.Body)` on success path. The `filter *Filter` field added to `routerActionH2` in Task 12 is consumed here. Added 4 new tests to `h2dispatch_test.go`: `TestH2DirectResponseAdapter_WriteH2_EmitsAccessLog`, `TestRouterActionH2_DoH2_EmitsAccessLog_HappyPath`, `TestRouterActionH2_DoH2_EmitsAccessLog_DialFailure`, `TestRouterActionH2_DoH2_CtxCancel_SkipsEmit`. All pass. Added `"time"` + `"github.com/esalaine/envoy-go/internal/accesslog"` imports to `h2dispatch_test.go`.
 **Outputs:**
 ```
