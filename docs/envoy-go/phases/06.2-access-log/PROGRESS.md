@@ -917,7 +917,7 @@ $ # All four anticipated 06.2 ADRs anchored in DECISIONS.md.
 
 ## Fix — gate-(d) FuzzAccessLogFormat — escape() backslash catalog extension
 
-**Commits:** `<TBD>`
+**Commits:** `3fe7fbf`
 
 Worktree `.worktrees/phase-06.2-access-log-impl-followup-gate-d`, branch `phase/06.2-access-log-impl-followup-gate-d`, branched from master fast-forward HEAD `a0192c0` (verify-fail SHA-fill) per ADR-0003 + per-phase-worktree convention. Mirrors the 06.1 gate-(d) fix precedent at `79be6b0` (`phase 06.1 fix: gate-(d) FuzzHCMConfigParse — validate stat_prefix at HCM parse boundary [ADR-0065]`).
 
@@ -1053,4 +1053,4 @@ ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
 - 06.1 REVIEW M-8 (drain-loop polling) — closed prophylactically in fixture 0006 driver at Task 15 (`085890d`); unchanged here.
 - This commit's lint cleanup (`gofmt` + 3× `misspell`) is local to the new test/code lines added by this fix; it is NOT a carry-forward and does NOT close any pre-existing review item.
 
-STATE advances 3 → 4 with `next-skill: superpowers:verification-before-completion`. The next session is a verify-2 (`phase/06.2-access-log-verify-2`, fresh worktree per the 05.1 + 06.1 verify-2 precedent) that re-runs all six gates fresh — gate (d) at the 30s budget specifically. SHA-fill follow-up per the phase-02..06.1 convention: `phase 06.2 follow-up: STATE.md + PROGRESS.md SHA-fill for gate-(d) fix commit (TBD → <SHA>)` after the master fast-forward.
+STATE advances 3 → 4 with `next-skill: superpowers:verification-before-completion`. The next session is a verify-2 (`phase/06.2-access-log-verify-2`, fresh worktree per the 05.1 + 06.1 verify-2 precedent) that re-runs all six gates fresh — gate (d) at the 30s budget specifically. SHA-fill follow-up per the phase-02..06.1 convention: `phase 06.2 follow-up: STATE.md + PROGRESS.md SHA-fill for gate-(d) fix commit (TBD → 3fe7fbf)` after the master fast-forward.
