@@ -382,3 +382,32 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.216s
 $ grep -nE 'accessLog \[\]accesslog\.Sink' internal/filter/hcm/config.go
 66:	accessLog []accesslog.Sink
 ```
+
+## Task 10 — `internal/filter/hcm/accesslog_emit.go` — Filter.emitAccessLog (H1 + H2)
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/filter/hcm/accesslog_emit.go` with three functions: `(*Filter).emitAccessLog` (H1 variant — reads `*http.Request` primitives), `(*Filter).emitAccessLogH2` (H2 variant — reads `h2.H2Request` pseudo-headers and extracts User-Agent via `h2UserAgent`), and helpers `h2UserAgent` (case-insensitive `user-agent` scan over `[]hpack.HeaderField`) and `upstreamHostString` (renders `Endpoint` as `host:port` or empty string for zero endpoint). Both emit methods guard on `statusCode == 0` (H2 ctx-cancel sentinel per SPEC §2.1) and `len(f.accessLog) == 0` (no-op when no sinks). Created `accesslog_emit_test.go` with 6 TDD tests (RED then GREEN). All 6 new tests plus full hcm suite pass.
+**Outputs:**
+```
+# RED — go test -count=1 -run TestEmitAccessLog ./internal/filter/hcm/ -v (before accesslog_emit.go)
+internal/filter/hcm/accesslog_emit_test.go:26:4: f.emitAccessLog undefined (type *Filter has no field or method emitAccessLog)
+internal/filter/hcm/accesslog_emit_test.go:54:4: f.emitAccessLog undefined (type *Filter has no field or method emitAccessLog)
+...
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm [build failed]
+
+# GREEN — go test -count=1 -run TestEmitAccessLog ./internal/filter/hcm/ -v (after accesslog_emit.go)
+=== RUN   TestEmitAccessLog_H1_DirectResponseShape
+--- PASS: TestEmitAccessLog_H1_DirectResponseShape (0.00s)
+=== RUN   TestEmitAccessLog_H1_RoutedShape
+--- PASS: TestEmitAccessLog_H1_RoutedShape (0.00s)
+=== RUN   TestEmitAccessLog_MultipleSinks_AllReceiveRecord
+--- PASS: TestEmitAccessLog_MultipleSinks_AllReceiveRecord (0.00s)
+=== RUN   TestEmitAccessLog_H2_PseudoHeadersFromH2Request
+--- PASS: TestEmitAccessLog_H2_PseudoHeadersFromH2Request (0.00s)
+=== RUN   TestEmitAccessLog_H2_StatusZeroSkipsEmission
+--- PASS: TestEmitAccessLog_H2_StatusZeroSkipsEmission (0.00s)
+=== RUN   TestEmitAccessLog_NoSinks_IsNoOp
+--- PASS: TestEmitAccessLog_NoSinks_IsNoOp (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.003s
+```
