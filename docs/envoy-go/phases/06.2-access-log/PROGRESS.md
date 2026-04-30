@@ -494,7 +494,7 @@ ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.850s
 
 ## Task 15 — Differential fixture 0006-access-log + runner registration [ADR-0068]
 
-**Commits:** TBD
+**Commits:** `085890d`
 **Notes:** Created the project's first per-record access-log differential fixture. Deliverables: `test/fixtures/0006-access-log/` (envoy-go.yaml, envoy.yaml, expectations.yaml, README.md, driver/driver.go, driver/driver_test.go, backends/main.go); extended `test/differential/fixture/fixture.go` (HTTPFixedBody BackendKind=4, HostMount struct, ReferenceLogMounter + AccessLogAsserter interfaces); extended `test/differential/harness.go` (StartReferenceProxyWithMounts using HostConfig.Binds — testcontainers v0.27.0 silently drops MountTypeBind in ContainerMounts, documented in-code); extended `test/differential/runner_test.go` (blank-import driver, HTTPFixedBody backend spawn, mount+assert wiring at steps 11).
 
 Key implementation decisions: (a) BYTES_SENT fixed by moving `io.ReadAll` before `resp.Write` in `routerAction.do` so only body bytes are counted (not status-line+headers); (b) reference log polling uses 30s deadline (Envoy v1.37.2 flushes its file-access-log buffer on ~1s periodic timer; tested: flush arrives within 10s); (c) DriveReference normalizes `localhost:{port}` → `127.0.0.1:{port}` to make Go HTTP client send matching `Host` header for Tier-E AUTHORITY assertion; (d) RESP_SVC_TIME (field 10) promoted from Tier-E to Tier-S — reference Envoy injects X-Envoy-Upstream-Service-Time on routed requests (Decision A: envoy-go does not); (e) bind-mount uses Docker `HostConfig.Binds` format `"hostPath:containerPath"` — testcontainers-go v0.27.0's `MountTypeBind` is silently dropped in `mapToDockerMounts`.
