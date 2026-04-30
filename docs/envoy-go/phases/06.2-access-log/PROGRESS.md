@@ -550,7 +550,7 @@ $ grep -nE '^## ADR-0068:' docs/envoy-go/DECISIONS.md
 
 ## Task 16 — BEHAVIOR_CONTRACT in-place edit + closing all-gates sweep [ADR-0066..ADR-0069]
 
-**Commits:** TBD — this task's commit
+**Commits:** `a349f35`
 
 **Notes:** Closing implementation-session task. Edited `docs/envoy-go/BEHAVIOR_CONTRACT.md` `## Access log field mapping` placeholder in place per ADR-0052 — populated subsection per SPEC §13.1, anchored on ADR-0066/0067/0068/0069. Three-tier matrix lists 7 Tier-E + 3 Tier-F + 5 Tier-S = 15 operators (RESP-SVC-TIME demoted from Tier-E to Tier-S during Task 15 fixture-0006 implementation per Decision A — reference Envoy injects the header but envoy-go does not). Six-gate local sweep run; gates (a)/(b)/(c)/(d)/(e) all GREEN; gate (f) deferred to REVIEW session per BOOTSTRAP §5 step 6. Lint cleanup performed during closing sweep: `gofmt` fixes to `internal/bootstrap/bootstrap.go`, `test/fixtures/0006-access-log/driver/driver.go`, `internal/accesslog/format_test.go`, `internal/accesslog/accesslog_test.go`; `goimports` fixes to `internal/accesslog/stats_test.go`; `errcheck` fix (`defer f.Close()` → `defer func() { _ = f.Close() }()`) in `internal/accesslog/writer_test.go`. STATE.md advanced lifecycle-state 3 → 4; next-skill set to `superpowers:verification-before-completion`. ROADMAP rows 06.2 + 06 will flip to `done` AT THE PHASE-DONE COMMIT in the REVIEW session per parent SPEC §5 closure pattern (NOT at this Task 16 commit).
 
