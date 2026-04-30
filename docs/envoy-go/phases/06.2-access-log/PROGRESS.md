@@ -25,3 +25,41 @@ $ git log -1 --format=%H -- docs/envoy-go/phases/06.2-access-log/SPEC.md
 $ ls internal/accesslog/
 doc.go
 ```
+
+## Task 2 — `internal/accesslog/accesslog.go` — Sink interface + Record struct + doc.go rewrite [ADR-0066]
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/accesslog/accesslog.go` with `Sink` interface (`Submit(*Record)` + `Close() error`) and `Record` struct (10 plumbed fields: StartTime, Method, Path, Protocol, ResponseCode, BytesSent, Duration, Authority, UserAgent, UpstreamHost). Rewrote `internal/accesslog/doc.go` from phase-00 stub to reference ADR-0066 and lifecycle context. Appended ADR-0066 to `docs/envoy-go/DECISIONS.md` (Access-log architecture decision: thin in-tree primitive, no third-party access-log dependency). TDD discipline followed: test file written first, RED confirmed, then implementation to GREEN.
+**Outputs:**
+```
+# RED — go test ./internal/accesslog/ -count=1 -v (before accesslog.go)
+# github.com/esalaine/envoy-go/internal/accesslog [github.com/esalaine/envoy-go/internal/accesslog.test]
+internal/accesslog/accesslog_test.go:9:8: undefined: Record
+internal/accesslog/accesslog_test.go:24:7: undefined: Record
+internal/accesslog/accesslog_test.go:35:34: undefined: Record
+internal/accesslog/accesslog_test.go:36:33: undefined: Record
+internal/accesslog/accesslog_test.go:40:8: undefined: Sink
+internal/accesslog/accesslog_test.go:41:8: undefined: Record
+FAIL	github.com/esalaine/envoy-go/internal/accesslog [build failed]
+FAIL
+
+# GREEN — go test ./internal/accesslog/ -count=1 -v (after accesslog.go)
+=== RUN   TestRecord_AllFieldsZeroValueWellDefined
+--- PASS: TestRecord_AllFieldsZeroValueWellDefined (0.00s)
+=== RUN   TestRecord_PopulatedShape
+--- PASS: TestRecord_PopulatedShape (0.00s)
+=== RUN   TestSink_InterfaceImplementation
+--- PASS: TestSink_InterfaceImplementation (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
+
+# grep -nE '^## ADR-0066:' docs/envoy-go/DECISIONS.md
+2335:## ADR-0066: Access-log architecture (file sink + AsyncFileSink + drop-newest backpressure)
+
+# git diff --stat HEAD (after staging)
+ docs/envoy-go/DECISIONS.md           | 33 +++++++++++++++++++++++++
+ internal/accesslog/accesslog.go      | 40 ++++++++++++++++++++++++++++++
+ internal/accesslog/accesslog_test.go | 47 ++++++++++++++++++++++++++++++++++++
+ internal/accesslog/doc.go            | 14 ++++++++---
+ 4 files changed, 130 insertions(+), 4 deletions(-)
+```

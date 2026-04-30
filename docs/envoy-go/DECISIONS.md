@@ -2331,3 +2331,36 @@ This preserves ADR-0059's panic discipline for programmer errors (e.g., `server.
 ### Lands-in-task
 
 Phase-06.1 lifecycle-state-3 fix branch (`phase/06.1-stats-prometheus-impl-followup-gate-d`). The cluster-name carry-forward will land in a future branch under the same phase-06.1 umbrella or in a phase-06.1 review-followup batch; it inherits this ADR's pattern by reference. Supersedes nothing; complements ADR-0059.
+
+## ADR-0066: Access-log architecture (file sink + AsyncFileSink + drop-newest backpressure)
+
+**Status:** Accepted
+**Date:** 2026-04-30
+**Doctrine:** D-3.2 (no third-party-runtime-import for runtime-critical surfaces) + D-3.3 (own the canonical observation surface).
+
+### Context
+
+Phase 06.2 lands envoy-go's access-log subsystem. The architectural choice — whether to consume a third-party access-log library (logrus / zap / zerolog / fluent) or to own a thin in-tree shape — is foundational because the Sink interface choice today constrains every future Observability-family phase (gRPC ALS, OTLP) that wants to add additional sinks. Phase 06.1 made the same architectural choice for stats (own an internal `stats.Registry`, no Prometheus client library) per ADR-0059; the same reasoning applies to access logs: future sinks should hook a Sink interface envoy-go owns, not a third-party logger's specific record shape.
+
+### Decision
+
+A thin in-tree `internal/accesslog` package: `Sink` interface with `Submit(*Record)` + `Close() error`, `Record` struct (10 plumbed fields per Decision A), `Default` formatter (15-operator Envoy-default-format line), `AsyncFileSink` async-writer with bounded-channel drop-newest backpressure. NO third-party access-log dependency: `go.mod` MUST NOT contain `github.com/sirupsen/logrus`, `go.uber.org/zap`, `github.com/rs/zerolog`, `github.com/fluent/fluent-logger-golang`, or equivalents. The package's only non-stdlib dependency is `internal/stats` (for the drop-counter Counter type).
+
+Hot-path discipline: lock-free on `Submit` — Go's buffered-channel non-blocking `select`-with-`default` is atomic-CAS-bounded (no mutex, no syscall) when the channel has capacity. Single-consumer writer goroutine drains the channel into per-record `os.File.Write`, atomic for sub-PAGE writes under `O_APPEND` per `man 2 write` on Linux (no `fsync`; OS page cache is the durability ceiling — matches Envoy). Drop-newest backpressure: full-channel Submit increments `server.accesslog_dropped` counter (per ADR-0069) and emits a 1-second-rate-limited `log.Printf` diagnostic. No queue-depth gauge (would force `atomic.LoadInt64` on every submit, contrary to the lock-free hot-path discipline).
+
+### Alternatives considered
+
+- (A) `logrus` / `zap` / `zerolog` directly — REJECTED. Future-sink coupling: binds the in-process record model to a structured-logging library's specific shape, blocking the gRPC ALS / OTLP sinks future phases will land. Same reasoning as ADR-0059's rejection of `prometheus/client_golang`.
+- (B) Per-record blocking `os.File.Write` on the hot path — REJECTED. Per-request HCM finalization should not block on disk I/O.
+- (C) Unbounded channel — REJECTED. OOM-on-overload is worse than drop-newest.
+
+### Consequences
+
+- (a) `internal/accesslog` package's external dependencies are limited to the Go stdlib + `internal/stats` (for the drop-counter Counter type). The boundary grep at the closing all-gates sweep enforces this.
+- (b) The AsyncFileSink concurrency model is documented inline in `writer.go` (Submit non-blocking; writer goroutine single-consumer; Close `sync.Once`-guarded).
+- (c) Future Observability-family phases that introduce additional sinks (ALS, OTLP) extend this package by implementing the `Sink` interface — no architectural churn needed.
+- (d) The phase 06.2 acceptance grep `! grep -rE 'logrus|go.uber.org/zap|rs/zerolog|fluent-logger-golang' .` is the gate; both production code and `_test.go` are subject to the boundary.
+
+### Lands-in-task
+
+Task 2 (the Sink-interface + Record-struct introduction; the architectural shape applies to every subsequent task in the package). Supersedes nothing; complements ADR-0059.
