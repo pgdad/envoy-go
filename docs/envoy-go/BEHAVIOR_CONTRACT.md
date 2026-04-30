@@ -214,10 +214,20 @@ Tier-E/F expectations under the new behavior.
 
 ### Empirical evidence (verbatim excerpt from reference-Envoy /tmp/envoy-access.log)
 
-The 5-line empirical-pin scrape from `docs/envoy-go/phases/06.2-access-log/SPEC.md` §11
-(captured 2026-04-30 from reference Envoy v1.37.2 image SHA
-`c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`) is the
-ground truth. SPEC §11 is the canonical location; this subsection mirrors it.
+```
+Empirical evidence (verbatim excerpt from reference-Envoy /tmp/envoy-access.log
+under the 5-request workload from §7.2; reference image v1.37.2 at
+ENVOY_TARGET.md SHA c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd;
+captured 2026-04-30 by phase 06.2 PLAN Task 3 step 3):
+
+[2026-04-30T09:10:30.856Z] "GET /health HTTP/1.1" 200 - 0 3 0 - "-" "curl/8.5.0" "b66c2c7d-3921-4184-b6c1-6a80dd5e7e8e" "127.0.0.1:15006" "-"
+[2026-04-30T09:10:30.861Z] "GET /api/v1/foo HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "1210434d-5aa4-4a56-a256-3ff6fc989ce5" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.865Z] "GET /api/v1/bar HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "c76bd1e7-3f55-4a6b-a3df-f88f00c7250a" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.870Z] "GET /api/v1/baz HTTP/1.1" 200 - 0 15 0 0 "-" "curl/8.5.0" "5b25ba00-2be4-4ae6-9693-0ce90609f529" "127.0.0.1:15006" "192.168.65.2:18443"
+[2026-04-30T09:10:30.875Z] "GET /notfound HTTP/1.1" 404 - 0 10 0 - "-" "curl/8.5.0" "5a9c562a-1ebf-4676-a556-bf02f89a0fad" "127.0.0.1:15006" "-"
+```
+
+The block above is paste-verbatim-synchronized with `docs/envoy-go/phases/06.2-access-log/SPEC.md` §11 lines 567-578 (mirrors the 06.1 BEHAVIOR_CONTRACT `## Stat-name mapping` Rule SN4 paste-verbatim discipline; the two blocks must change atomically — any future Envoy image bump per `ENVOY_TARGET.md`'s refresh procedure that alters the format requires updating both locations in the same commit, no drift permitted).
 
 ### Applies to
 
