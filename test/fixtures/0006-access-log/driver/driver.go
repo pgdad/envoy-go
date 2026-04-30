@@ -77,9 +77,9 @@ func newAccessLogDriver() *accessLogDriver {
 //   - fixture.ReferenceLogMounter  (tells the runner to bind-mount refLogPath)
 //   - fixture.AccessLogAsserter    (three-tier matrix assertion)
 type accessLogDriver struct {
-	mu              sync.Mutex
-	subjLogPath     string // host path for subject's access log
-	refLogPath      string // host path for reference's access log (bind-mounted)
+	mu               sync.Mutex
+	subjLogPath      string // host path for subject's access log
+	refLogPath       string // host path for reference's access log (bind-mounted)
 	subjListenerAddr string
 	refListenerAddr  string
 }
@@ -366,21 +366,21 @@ var logLineRE = regexp.MustCompile(
 // LogTuple holds the 15 positional fields parsed from one access-log line.
 // Field names match the SPEC §6 operator table.
 type LogTuple struct {
-	StartTime    string // field 1
-	Method       string // field 2
-	Path         string // field 3
-	Protocol     string // field 4
-	ResponseCode string // field 5
+	StartTime     string // field 1
+	Method        string // field 2
+	Path          string // field 3
+	Protocol      string // field 4
+	ResponseCode  string // field 5
 	ResponseFlags string // field 6
 	BytesReceived string // field 7
-	BytesSent    string // field 8
-	Duration     string // field 9
-	SvcTime      string // field 10
+	BytesSent     string // field 8
+	Duration      string // field 9
+	SvcTime       string // field 10
 	XForwardedFor string // field 11
-	UserAgent    string // field 12
-	XRequestID   string // field 13
-	Authority    string // field 14
-	UpstreamHost string // field 15
+	UserAgent     string // field 12
+	XRequestID    string // field 13
+	Authority     string // field 14
+	UpstreamHost  string // field 15
 }
 
 // ParseLogLine parses one access-log line into a LogTuple via logLineRE.
@@ -652,8 +652,8 @@ static_resources:
 
 // Compile-time interface checks.
 var (
-	_ fixture.Driver             = (*accessLogDriver)(nil)
-	_ fixture.BackendKindAware   = (*accessLogDriver)(nil)
+	_ fixture.Driver              = (*accessLogDriver)(nil)
+	_ fixture.BackendKindAware    = (*accessLogDriver)(nil)
 	_ fixture.ReferenceLogMounter = (*accessLogDriver)(nil)
-	_ fixture.AccessLogAsserter  = (*accessLogDriver)(nil)
+	_ fixture.AccessLogAsserter   = (*accessLogDriver)(nil)
 )

@@ -547,3 +547,167 @@ ok  	github.com/esalaine/envoy-go/test/helpers
 $ grep -nE '^## ADR-0068:' docs/envoy-go/DECISIONS.md
 2448:## ADR-0068: Differential fixture 0006-access-log — three-tier equivalence matrix
 ```
+
+## Task 16 — BEHAVIOR_CONTRACT in-place edit + closing all-gates sweep [ADR-0066..ADR-0069]
+
+**Commits:** TBD — this task's commit
+
+**Notes:** Closing implementation-session task. Edited `docs/envoy-go/BEHAVIOR_CONTRACT.md` `## Access log field mapping` placeholder in place per ADR-0052 — populated subsection per SPEC §13.1, anchored on ADR-0066/0067/0068/0069. Three-tier matrix lists 7 Tier-E + 3 Tier-F + 5 Tier-S = 15 operators (RESP-SVC-TIME demoted from Tier-E to Tier-S during Task 15 fixture-0006 implementation per Decision A — reference Envoy injects the header but envoy-go does not). Six-gate local sweep run; gates (a)/(b)/(c)/(d)/(e) all GREEN; gate (f) deferred to REVIEW session per BOOTSTRAP §5 step 6. Lint cleanup performed during closing sweep: `gofmt` fixes to `internal/bootstrap/bootstrap.go`, `test/fixtures/0006-access-log/driver/driver.go`, `internal/accesslog/format_test.go`, `internal/accesslog/accesslog_test.go`; `goimports` fixes to `internal/accesslog/stats_test.go`; `errcheck` fix (`defer f.Close()` → `defer func() { _ = f.Close() }()`) in `internal/accesslog/writer_test.go`. STATE.md advanced lifecycle-state 3 → 4; next-skill set to `superpowers:verification-before-completion`. ROADMAP rows 06.2 + 06 will flip to `done` AT THE PHASE-DONE COMMIT in the REVIEW session per parent SPEC §5 closure pattern (NOT at this Task 16 commit).
+
+**Outputs:**
+
+```
+# Gate (a): new fixture green (0006)
+$ go test -count=1 -timeout 120s ./test/differential/ -run 'TestDifferential/0006' -v 2>&1 | tail -20
+2026/04/30 06:26:36 🐳 Creating container for image testcontainers/ryuk:0.6.0
+2026/04/30 06:26:36 ✅ Container created: de2885b22bdf
+2026/04/30 06:26:36 🐳 Starting container: de2885b22bdf
+2026/04/30 06:26:36 ✅ Container started: de2885b22bdf
+2026/04/30 06:26:36 🐳 Creating container for image envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+2026/04/30 06:26:36 ✅ Container created: 1add499c8896
+2026/04/30 06:26:36 🐳 Starting container: 1add499c8896
+2026/04/30 06:26:36 ✅ Container started: 1add499c8896
+2026/04/30 06:26:47 🐳 Terminating container: 1add499c8896
+2026/04/30 06:26:47 🚫 Container terminated: 1add499c8896
+--- PASS: TestDifferential (11.30s)
+    --- PASS: TestDifferential/0006-access-log (11.30s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	11.386s
+
+# Gate (b): pre-existing fixtures still green (0000-0005)
+$ go test -count=1 -timeout 120s ./test/differential/ -run 'TestDifferential/000[0-5]' -v 2>&1 | tail -15
+--- PASS: TestDifferential (8.71s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.48s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.20s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.21s)
+    --- PASS: TestDifferential/0003-http11-routing (1.24s)
+    --- PASS: TestDifferential/0004-h2-routing (1.64s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.92s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	8.792s
+
+# Gate (c): h2spec conformance (53/53 PASS)
+$ go test -count=1 -timeout 120s ./test/conformance/h2spec/ -v 2>&1 | tail -10
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+2026/04/30 06:27:03 🚫 Container terminated: 3d56ffde97a0
+--- PASS: TestH2Spec (2.22s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.299s
+
+# Gate (d): fuzz seed corpus runs (7 fuzzers)
+$ go test -count=1 ./internal/bootstrap/ -run FuzzBootstrapLoad -v 2>&1 | tail -5
+    --- PASS: FuzzBootstrapLoad/seed#5 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#6 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#7 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.005s
+
+$ go test -count=1 ./internal/filter/tcpproxy/ -run FuzzTcpProxyFilter -v 2>&1 | tail -5
+    --- PASS: FuzzTcpProxyFilter/seed#0 (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#1 (0.00s)
+    --- PASS: FuzzTcpProxyFilter/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.003s
+
+$ go test -count=1 ./internal/tls/ -run FuzzTLSContextParse -v 2>&1 | tail -5
+    --- PASS: FuzzTLSContextParse/seed#1 (0.00s)
+    --- PASS: FuzzTLSContextParse/seed#2 (0.00s)
+    --- PASS: FuzzTLSContextParse/seed#3 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	0.003s
+
+$ go test -count=1 ./internal/filter/hcm/ -run FuzzHCMConfigParse -v 2>&1 | tail -5
+    --- PASS: FuzzHCMConfigParse/seed#0 (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#1 (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+
+$ go test -count=1 ./internal/filter/hcm/h2/ -run 'FuzzFrameStream|FuzzHPACKDecode' -v 2>&1 | tail -5
+--- PASS: FuzzHPACKDecode (0.00s)
+    --- PASS: FuzzHPACKDecode/seed#0 (0.00s)
+    --- PASS: FuzzHPACKDecode/seed#1 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.002s
+
+$ go test -count=1 ./internal/stats/ -run FuzzPromTextFormat -v 2>&1 | tail -5
+    --- PASS: FuzzPromTextFormat/seed#6 (0.00s)
+    --- PASS: FuzzPromTextFormat/seed#7 (0.00s)
+    --- PASS: FuzzPromTextFormat/1d8483e640bf8347 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	0.001s
+
+$ go test -count=1 ./internal/accesslog/ -run FuzzAccessLogFormat -v 2>&1 | tail -5
+    --- PASS: FuzzAccessLogFormat/seed#3 (0.00s)
+    --- PASS: FuzzAccessLogFormat/seed#4 (0.00s)
+    --- PASS: FuzzAccessLogFormat/seed#5 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
+
+# Gate (e): vet/lint/test
+$ go vet ./...
+(no output — clean)
+
+$ golangci-lint run ./... 2>&1
+(no output after lint fixes — clean)
+
+$ go test -race -count=1 ./... 2>&1 | grep -E '^(ok|FAIL)'
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.088s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.018s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.072s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.051s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.049s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.475s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.527s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.033s
+ok  	github.com/esalaine/envoy-go/internal/listener	1.052s
+ok  	github.com/esalaine/envoy-go/internal/stats	1.029s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.081s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.097s
+ok  	github.com/esalaine/envoy-go/test/differential	22.318s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.008s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.010s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.017s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.016s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.016s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.010s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.033s
+(20 packages: all ok, no FAIL)
+
+# Step 3 boundary greps per SPEC §15
+$ grep -nE 'github.com/sirupsen/logrus|go.uber.org/zap|github.com/rs/zerolog|github.com/fluent/fluent-logger-golang' go.mod | head -5
+50: github.com/sirupsen/logrus v1.9.3 // indirect
+(logrus is an indirect dependency only — NOT imported in internal/ or cmd/ code)
+
+$ grep -rE '"github.com/(sirupsen/logrus|go\.uber\.org/zap|rs/zerolog|fluent/fluent-logger-golang)' internal/ cmd/ | head -5
+(no output — no third-party access-log library imported in code)
+
+$ grep -nE 'emitAccessLog' internal/filter/hcm/actions.go internal/filter/hcm/h2dispatch.go
+internal/filter/hcm/actions.go:106:        a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)
+internal/filter/hcm/actions.go:158:        defer func() { a.filter.emitAccessLog(req, statusCode, bytesSent, picked, start) }()
+internal/filter/hcm/actions.go:283:        r.filter.emitAccessLogH2(req, statusForHCM, int64(bytesSentH2), picked, start)
+internal/filter/hcm/h2dispatch.go:96:  defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)
+(4 emit-hook sites: 2 H1 in actions.go lines 106+158, 2 H2 in actions.go:283 + h2dispatch.go:96)
+
+$ grep -nE '^## ADR-006[6-9]:' docs/envoy-go/DECISIONS.md
+2349:## ADR-0066: Access-log architecture (file sink + AsyncFileSink + drop-newest backpressure)
+2382:## ADR-0069: server.accesslog_dropped counter naming (SN5 mapping)
+2417:## ADR-0067: Reject log_format at parse (option β; extends ADR-0065's boundary-validation pattern)
+2448:## ADR-0068: Differential fixture 0006-access-log — three-tier equivalence matrix
+```
+
+**Carry-forward triage:**
+- 06.1 REVIEW M-8 (drain-loop polling): ADOPTED PROPHYLACTICALLY in fixture-0006 driver (Task 15, commit `085890d`). Does NOT close M-8 against fixture 0005 — its actual fix is reserved for a 06.1 review-followup batch.
+- 05.2 M-4 / M-10 / M-12: unchanged.
+- 05.2 prose Minors (7): unchanged.
+- 06.1 12 Minors (M-2..M-12 + reviewer-discovered): unchanged.
+
+**Four ADRs landed (per BOOTSTRAP §5.3 commit-message-completeness):**
+- ADR-0066 (Access-log architecture): Task 2, commit `76f3ecd`
+- ADR-0067 (Reject log_format at parse): Task 7, commit `6949fce`
+- ADR-0068 (Three-tier equivalence matrix): Task 15, commit `085890d`
+- ADR-0069 (server.accesslog_dropped counter naming): Task 5, commit `5278161`

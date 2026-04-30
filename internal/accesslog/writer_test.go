@@ -37,7 +37,7 @@ func TestAsyncFileSink_HappyPath_NRecordsLandNLines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	scanner := bufio.NewScanner(f)
 	count := 0
 	for scanner.Scan() {

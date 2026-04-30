@@ -169,9 +169,70 @@ Rule SN8: Per-endpoint cluster stats are not emitted by 06.1. (Forward-looking.)
 
 ## Access log field mapping
 
-_to be filled per-phase as needed._
+*Introduced by phase 06.2. Justified by ADR-0066 (architecture: in-tree file sink + AsyncFileSink + drop-newest backpressure), ADR-0067 (reject log_format at parse), ADR-0068 (this subsection — three-tier per-record per-field equivalence matrix), ADR-0069 (server.accesslog_dropped counter naming).*
 
-The access-log field mapping enumerates every field that must appear (and the field it maps to on upstream Envoy), the ignore-list for values that are inherently non-deterministic (timestamps, connection ids, durations), and the format normalization rules used by the differential harness before comparison.
+The access-log field mapping enumerates every operator in the Envoy default
+access-log format (15 operators in identical positions on every record) per
+ADR-0066, the per-operator equivalence tier per ADR-0068's three-tier matrix,
+and the empirical-pin block recording the verbatim format-string shape from
+reference Envoy v1.37.2. The differential equivalence claim (the
+"Semantically equal after field-mapping" predicate from the Equivalence
+Matrix row at line 18) IS the three-tier matrix below.
+
+### 15-operator default format (per ADR-0066; empirical-pin in §11 of the 06.2 SPEC)
+
+[<START_TIME>] "<:METHOD> <:PATH> <PROTOCOL>" <RESPONSE_CODE> <RESPONSE_FLAGS>
+<BYTES_RECEIVED> <BYTES_SENT> <DURATION> <RESP-SVC-TIME> "<X-FORWARDED-FOR>"
+"<USER-AGENT>" "<X-REQUEST-ID>" "<:AUTHORITY>" "<UPSTREAM_HOST>"
+
+### Three-tier matrix (per ADR-0068)
+
+Tier E (exact byte-equal cross-side; 7 operators):
+  :METHOD, :PATH, PROTOCOL, RESPONSE_CODE, BYTES_SENT, USER-AGENT, :AUTHORITY
+
+Tier F (format-only — parses to expected shape on both sides; cross-side value
+not asserted equal; 3 operators):
+  START_TIME (RFC3339 ms-precision UTC, within workload wall-clock window)
+  DURATION (int ms ≥ 0)
+  UPSTREAM_HOST (`<host>:<port>` for routed; `-` for direct_response)
+
+Tier S (subject must emit `-`; reference unconstrained; 5 operators):
+  RESPONSE_FLAGS, BYTES_RECEIVED, RESP(X-ENVOY-UPSTREAM-SERVICE-TIME),
+  X-FORWARDED-FOR, X-REQUEST-ID
+
+Counts: 7 + 3 + 5 = 15 (= the operator count in the format).
+
+### X-ENVOY-ORIGINAL-PATH?:PATH fallback note (per 06.2 SPEC §6.1)
+
+Operator #3 in the format is %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% — emit the
+original-path header if present, else fall through to :PATH. Neither side
+emits X-ENVOY-ORIGINAL-PATH on fixture 0006's workload (envoy-go does not
+inject it; reference Envoy doesn't either, because fixture 0006 has no
+path_rewrite-bearing route); both sides emit :PATH via the fallback. A
+future phase introducing path-rewriting must re-evaluate fixture 0006's
+Tier-E/F expectations under the new behavior.
+
+### Empirical evidence (verbatim excerpt from reference-Envoy /tmp/envoy-access.log)
+
+The 5-line empirical-pin scrape from `docs/envoy-go/phases/06.2-access-log/SPEC.md` §11
+(captured 2026-04-30 from reference Envoy v1.37.2 image SHA
+`c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`) is the
+ground truth. SPEC §11 is the canonical location; this subsection mirrors it.
+
+### Applies to
+
+- Phase-06.2 envoy-go `internal/accesslog` package + the four HCM emit-deferral sites (`directResponseAction.do`, `routerAction.do`, `h2DirectResponseAdapter.WriteH2`, `routerActionH2.doH2`), exercised via fixture `0006-access-log` (H1 differential) + `internal/filter/hcm/accesslog_emit_test.go` (H2 unit tests).
+- The 15-operator Envoy default format only. Custom format strings (the `log_format`/`format_string`/`json_format` typed-config fields) are rejected at parse-time per ADR-0067.
+
+### Does not yet apply to
+
+- Operators not plumbed in 06.2 (5 of 15: RESPONSE_FLAGS, BYTES_RECEIVED, RESP-SVC-TIME, X-FORWARDED-FOR, X-REQUEST-ID — Tier S subject-emits-`-`).
+- Sinks other than `envoy.access_loggers.file` (stdout / tcp_grpc (gRPC ALS) / open_telemetry — silently-ignored per ADR-0041 06.2 amendment).
+- Per-route access-log filters (`access_log[].filter` — silently-ignored).
+- Log rotation, fsync, durability ceilings (out of scope per SPEC §2.1).
+- Trailers in access logs (deferred to gRPC family per ADR-0058).
+- Access-log records for ctx-cancelled requests (skipped per the H2 zero-status sentinel, SPEC §2.1).
+- SIGTERM-while-record-pending drain semantics (Phase 08's deliverable).
 
 ---
 

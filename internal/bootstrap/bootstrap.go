@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"io"
 
-	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
+	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	fileaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+
 	// Blank-imported so the filter extension's proto descriptor is registered
 	// with protoregistry.GlobalTypes, which lets protojson round-trip the
 	// typed_config Any without envoy-go interpreting its contents (ADR-0016).
