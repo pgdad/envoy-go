@@ -1054,3 +1054,161 @@ ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
 - This commit's lint cleanup (`gofmt` + 3× `misspell`) is local to the new test/code lines added by this fix; it is NOT a carry-forward and does NOT close any pre-existing review item.
 
 STATE advances 3 → 4 with `next-skill: superpowers:verification-before-completion`. The next session is a verify-2 (`phase/06.2-access-log-verify-2`, fresh worktree per the 05.1 + 06.1 verify-2 precedent) that re-runs all six gates fresh — gate (d) at the 30s budget specifically. SHA-fill follow-up per the phase-02..06.1 convention: `phase 06.2 follow-up: STATE.md + PROGRESS.md SHA-fill for gate-(d) fix commit (TBD → 3fe7fbf)` after the master fast-forward.
+
+## Verify-2 (lifecycle-state 4) — PASSED
+
+Per `BOOTSTRAP_PROMPT.md` §5 state 4 and `STATE.md`'s `next-skill-scope` (after the gate-(d) fix at `3fe7fbf`): a fresh-session re-run of every BOOTSTRAP §7.5 phase-done gate, with each command's verbatim output captured here. Worktree `.worktrees/phase-06.2-access-log-verify-2`, branch `phase/06.2-access-log-verify-2`, branched from gate-(d) fix-branch master fast-forward HEAD `0668eea` per ADR-0003 + per-phase-worktree convention. Verifier date: 2026-04-30. Mirrors the 06.1 verify-2 precedent at `1ed6cd0`.
+
+**Outcome: all five executable gates GREEN.** Gate (a) fixture-0006-access-log PASS; gate (b) 0000–0005 PASS; gate (c) h2spec 53/53 PASS; gate (d) `FuzzAccessLogFormat` -fuzztime=30s PASS (the previously-failing gate, now CLEAR after the `3fe7fbf` `escape()` catalog extension) plus 7 pre-existing fuzzers seed-corpus PASS; gate (e) `go vet` + `golangci-lint` + `go test -race ./...` clean for all 20 packages. Gate (f) REVIEW.md deferred to lifecycle-state 6.
+
+**Verifier role contract.** Per the 05.2 verifier precedent (`b34bd99`) and the 06.1 verify-1 (`1f94b74`) and verify-2 (`1ed6cd0`) precedents, this commit changes ONLY `STATE.md` + `PROGRESS.md` — no production-code, test-code, or test-corpus changes. `git status --porcelain` empty after each gate's run; the 30s fuzz run found 1 new interesting input but persisted no new crasher (no new files under `internal/accesslog/testdata/fuzz/`); the inherited regression seed `internal/accesslog/testdata/fuzz/FuzzAccessLogFormat/1bdc705d534eee86` (committed in `3fe7fbf`) is unchanged. This entry's SHA is filled in a follow-up commit per the phase-02..06.1 SHA-fill convention.
+
+**Outputs:**
+
+```
+$ pwd
+/home/esa/git/envoy-go/.worktrees/phase-06.2-access-log-verify-2
+$ git rev-parse --abbrev-ref HEAD
+phase/06.2-access-log-verify-2
+$ git log -1 --format=%H master
+0668eea (verify-2 worktree branched from this — master FF'd at gate-(d) fix SHA-fill)
+$ go version
+go version go1.26.2 linux/amd64
+$ golangci-lint version 2>&1 | head -1
+golangci-lint has version v1.64.8 built with go1.26.2
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | tail -1
+## ADR-0068: Differential fixture 0006-access-log — three-tier equivalence matrix
+```
+
+**Gate (a) — fixture-0006-access-log differential — PASS:**
+
+```
+$ go test -count=1 -timeout 120s ./test/differential/ -run 'TestDifferential/0006' -v 2>&1 | grep -E '^---|^PASS|^ok'
+--- PASS: TestDifferential (11.29s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	11.367s
+```
+
+Reference Envoy SHA at the `ENVOY_TARGET.md` pin exercised non-vacuously (testcontainers ryuk + reference-Envoy lifecycle visible in full output); three-tier equivalence per ADR-0068 verified.
+
+**Gate (b) — pre-existing differential fixtures (regression check) — PASS:**
+
+```
+$ go test -count=1 -timeout 120s ./test/differential/ -run 'TestDifferential/000[0-5]' -v 2>&1 | grep -E '^---|^PASS|^ok'
+--- PASS: TestDifferential (8.79s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	8.882s
+```
+
+All six pre-existing fixtures (0000-tcp-echo, 0001-tcp-proxy-rr, 0002-tls-tcp, 0003-http11-routing, 0004-h2-routing, 0005-prometheus-stats) PASS — no regression from access-log emit-hook plumbing or the gate-(d) `escape()` catalog extension.
+
+**Gate (c) — h2spec conformance (UNCHANGED 53/53 PASS) — PASS:**
+
+```
+$ go test -count=1 -timeout 120s ./test/conformance/h2spec/ -v 2>&1 | tail -5
+2026/04/30 08:07:14 🐳 Terminating container: 5da322a241d9
+2026/04/30 08:07:14 🚫 Container terminated: 5da322a241d9
+--- PASS: TestH2Spec (2.22s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.300s
+```
+
+53/53 PASS at the pinned summerwind/h2spec SHA per ADR-0051 threshold. UNCHANGED relative to phase 05/05.1/05.2/06.1 as required by SPEC §15.
+
+**Gate (d) — `FuzzAccessLogFormat` -fuzztime=30s — PASS (the verify-1's failing gate, now CLEAR):**
+
+```
+$ go test -count=1 -fuzz=FuzzAccessLogFormat -fuzztime=30s ./internal/accesslog/ 2>&1 | tail -8
+fuzz: elapsed: 18s, execs: 16851335 (807350/sec), new interesting: 0 (total: 87)
+fuzz: elapsed: 21s, execs: 19078193 (742208/sec), new interesting: 0 (total: 87)
+fuzz: elapsed: 24s, execs: 21255582 (725662/sec), new interesting: 1 (total: 88)
+fuzz: elapsed: 27s, execs: 23580067 (774589/sec), new interesting: 1 (total: 88)
+fuzz: elapsed: 30s, execs: 25753579 (724675/sec), new interesting: 1 (total: 88)
+fuzz: elapsed: 31s, execs: 25753579 (0/sec), new interesting: 1 (total: 88)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	31.036s
+```
+
+25,753,579 executions in 30 s, **0 crashers**, 88 interesting inputs (87 from the prior fix-branch run plus 1 newly-discovered in this verify-2 run — no failure, no new crasher). The `escape()` catalog extension at `3fe7fbf` matches reference Envoy `AccessLogFormatUtils::escapeUtilityValue` + RFC 4180 CSV-style; the parseability invariant in `internal/accesslog/fuzz_test.go::FuzzAccessLogFormat` (now using consecutive-backslash counting per the same fix) holds across the entire 30 s sample.
+
+The 7 pre-existing fuzzers' seed-corpus runs all PASS (no regression from the gate-(d) fix's `format.go` / `fuzz_test.go` edits, which are scoped to the access-log package only):
+
+```
+$ go test -count=1 ./internal/bootstrap/ -run FuzzBootstrapLoad
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.005s
+$ go test -count=1 ./internal/filter/tcpproxy/ -run FuzzTcpProxyFilter
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.003s
+$ go test -count=1 ./internal/tls/ -run FuzzTLSContextParse
+ok  	github.com/esalaine/envoy-go/internal/tls	0.003s
+$ go test -count=1 ./internal/filter/hcm/ -run FuzzHCMConfigParse
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+$ go test -count=1 ./internal/stats/ -run FuzzPromTextFormat
+ok  	github.com/esalaine/envoy-go/internal/stats	0.001s
+$ go test -count=1 ./internal/filter/hcm/h2/ -run 'FuzzFrameStream|FuzzHPACKDecode'
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.002s
+$ go test -count=1 ./internal/accesslog/ -run FuzzAccessLogFormat
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.002s
+```
+
+All 8 fuzzers PASS seed corpus including `FuzzAccessLogFormat`'s 6 hand-picked seeds plus the 1 inherited regression seed `1bdc705d534eee86` (the verify-1 gate-(d) crasher, now passing post-`3fe7fbf`).
+
+**Gate (e) — `go vet` / `golangci-lint` / `go test -race ./...` — PASS:**
+
+```
+$ go vet ./...
+(exit 0, no output)
+
+$ golangci-lint run ./...
+(exit 0, no output)
+
+$ go test -race -count=1 -timeout 600s ./... 2>&1 | grep -E '^(ok|FAIL)'
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.332s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.020s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.079s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.059s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.056s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.495s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.536s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.045s
+ok  	github.com/esalaine/envoy-go/internal/listener	1.063s
+ok  	github.com/esalaine/envoy-go/internal/stats	1.036s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.101s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.207s
+ok  	github.com/esalaine/envoy-go/test/differential	22.728s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.019s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.020s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.020s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.016s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.019s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.033s
+(20 packages: all ok, no FAIL, no DATA RACE warnings)
+```
+
+**SPEC §15 boundary greps — PASS:**
+
+```
+$ grep -nE 'github.com/sirupsen/logrus|go.uber.org/zap|github.com/rs/zerolog|github.com/fluent/fluent-logger-golang' go.mod
+50:	github.com/sirupsen/logrus v1.9.3 // indirect
+$ # logrus is // indirect (transitive testcontainers dependency); no direct imports in code.
+$ grep -rE '"github.com/(sirupsen/logrus|go\.uber\.org/zap|rs/zerolog|fluent/fluent-logger-golang)' internal/ cmd/
+(no output — clean)
+
+$ grep -nE 'a\.filter\.emitAccessLog|a\.f\.emitAccessLogH2|r\.filter\.emitAccessLogH2' internal/filter/hcm/actions.go internal/filter/hcm/h2dispatch.go
+internal/filter/hcm/actions.go:106:			a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)
+internal/filter/hcm/actions.go:158:		defer func() { a.filter.emitAccessLog(req, statusCode, bytesSent, picked, start) }()
+internal/filter/hcm/actions.go:283:			r.filter.emitAccessLogH2(req, statusForHCM, int64(bytesSentH2), picked, start)
+internal/filter/hcm/h2dispatch.go:96:	defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)
+$ # 4 emit-hook sites: 2 H1 (actions.go:106, :158) + 2 H2 (actions.go:283, h2dispatch.go:96).
+
+$ grep -nE '^## ADR-006[6-9]:' docs/envoy-go/DECISIONS.md
+2349:## ADR-0066: Access-log architecture (file sink + AsyncFileSink + drop-newest backpressure)
+2382:## ADR-0069: `server.accesslog_dropped` counter naming (SN5 mapping)
+2417:## ADR-0067: Reject `log_format` at parse (option β; extends ADR-0065's boundary-validation pattern)
+2448:## ADR-0068: Differential fixture 0006-access-log — three-tier equivalence matrix
+$ # All four anticipated 06.2 ADRs anchored.
+```
+
+**Differential surface:** gate (a) fixture-0006-access-log PASS non-vacuous (reference Envoy at the ENVOY_TARGET pin); gate (b) 6/6 pre-existing fixtures PASS (0000/0001/0002/0003/0004/0005). **Conformance:** h2spec 53/53 PASS at the pinned summerwind SHA. **Fuzz:** 8/8 PASS (all 7 pre-existing seed corpora + `FuzzAccessLogFormat` -fuzztime=30s); the previously-failing target `FuzzAccessLogFormat` now runs the full 30 s budget without any crasher: the `escape()` catalog extension at `3fe7fbf` per RFC 4180 / reference Envoy convention, plus the parseability-invariant heuristic strengthening, eliminate the prior bug. Gate (e) part 2 inherits the durable regression seed at `internal/accesslog/testdata/fuzz/FuzzAccessLogFormat/1bdc705d534eee86` and the three RED-then-GREEN unit tests in `internal/accesslog/format_test.go` and passes them all under `-race` along with the 19 other test packages.
+
+STATE → lifecycle-state 5 with `next-skill: superpowers:requesting-code-review` per BOOTSTRAP §5 step 4 → step 5. ROADMAP rows unchanged (06 + 06.2 stay `in-progress`); ROADMAP transitions land at the lifecycle-state 6 phase-done commit per BOOTSTRAP §5 step 6.
