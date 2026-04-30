@@ -128,7 +128,7 @@ type routerAction struct {
 func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
 	a.cluster.IncUpstreamRqTotal()
 
-	upstream, err := a.cluster.Dial(ctx)
+	upstream, _, err := a.cluster.Dial(ctx)
 	if err != nil {
 		a.cluster.IncStatusClass(503)
 		return 503, writeStatusReply(bw, 503, "")
@@ -222,7 +222,7 @@ type routerActionH2 struct {
 func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.StreamWriter) (int, error) {
 	r.cluster.IncUpstreamRqTotal()
 
-	cc, err := r.cluster.DialH2(ctx)
+	cc, _, err := r.cluster.DialH2(ctx)
 	if err != nil {
 		r.cluster.IncStatusClass(502)
 		return 502, r.write502(w)

@@ -125,7 +125,7 @@ func TestCluster_Dial_Plaintext(t *testing.T) {
 	ep := endpointFromAddr(ln.Addr())
 	c := mkTestCluster("test", nil, ep)
 
-	conn, err := c.Dial(context.Background())
+	conn, _, err := c.Dial(context.Background())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestCluster_Dial_TLS(t *testing.T) {
 	ep := endpointFromAddr(ln.Addr())
 	c := mkTestCluster("test-tls", upCfg, ep)
 
-	conn, err := c.Dial(context.Background())
+	conn, _, err := c.Dial(context.Background())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestCluster_Dial_TLS_HandshakeFailure(t *testing.T) {
 		MinVersion: stdtls.VersionTLS12,
 	}, ep)
 
-	_, err := c.Dial(context.Background())
+	_, _, err := c.Dial(context.Background())
 	if err == nil || !strings.HasPrefix(err.Error(), "cluster: tls: handshake:") {
 		t.Errorf("want cluster: tls: handshake: prefix, got: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestCluster_Dial_CtxCanceled(t *testing.T) {
 	ep := Endpoint{Host: "127.0.0.1", Port: 1} // unreachable
 	c := mkTestCluster("test", nil, ep)
 
-	_, err := c.Dial(ctx)
+	_, _, err := c.Dial(ctx)
 	if err == nil {
 		t.Error("want ctx error")
 	}
@@ -354,7 +354,7 @@ func TestDial_IncsCxMetricsAndWrapsForActiveDecOnClose(t *testing.T) {
 		t.Errorf("pre-Dial upstream_cx_active = %d, want 0", got)
 	}
 
-	conn, err := c.Dial(context.Background())
+	conn, _, err := c.Dial(context.Background())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestDial_CloseIdempotent(t *testing.T) {
 	ep := endpointFromAddr(ln.Addr())
 	c := mkTestCluster("test-cx-idem", nil, ep)
 
-	conn, err := c.Dial(context.Background())
+	conn, _, err := c.Dial(context.Background())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -402,5 +402,34 @@ func TestDial_CloseIdempotent(t *testing.T) {
 
 	if got := c.upstreamCxActive.Load(); got != 0 {
 		t.Errorf("after double-Close upstream_cx_active = %d, want 0 (sync.Once must guard the Dec)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Dial — surfaced endpoint (phase 06.2 Task 8)
+// ---------------------------------------------------------------------------
+
+// TestCluster_Dial_ReturnsPickedEndpoint verifies that Dial surfaces the
+// picked Endpoint in the second return value. The returned ep.Host must be
+// non-empty and must match the single endpoint the test cluster was built
+// with (round-robin over one endpoint always returns the same one).
+func TestCluster_Dial_ReturnsPickedEndpoint(t *testing.T) {
+	ln := listenTCP(t)
+	defer func() { _ = ln.Close() }()
+
+	want := endpointFromAddr(ln.Addr())
+	c := mkTestCluster("test-ep-surface", nil, want)
+
+	conn, got, err := c.Dial(context.Background())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if got.Host == "" {
+		t.Errorf("returned Endpoint.Host is empty; want non-empty")
+	}
+	if got.Host != want.Host || got.Port != want.Port {
+		t.Errorf("returned Endpoint = %v, want %v", got, want)
 	}
 }

@@ -267,7 +267,7 @@ func TestCluster_DialH2_HappyPath(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cc, err := c.DialH2(ctx)
+	cc, _, err := c.DialH2(ctx)
 	if err != nil {
 		t.Fatalf("DialH2: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestCluster_DialH2_ALPNMismatch(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := c.DialH2(ctx)
+	_, _, err := c.DialH2(ctx)
 	if err == nil {
 		t.Fatal("DialH2: want error, got nil")
 	}
@@ -325,7 +325,7 @@ func TestCluster_DialH2_NotTLS(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := c.DialH2(ctx)
+	_, _, err := c.DialH2(ctx)
 	if err == nil {
 		t.Fatal("DialH2: want error, got nil")
 	}
@@ -347,7 +347,7 @@ func TestCluster_DialH2_CtxCancel(t *testing.T) {
 	ep := Endpoint{Host: "127.0.0.1", Port: 1} // unreachable, but Dial short-circuits on ctx.Err()
 	c := mkTestCluster("test-ctx-cancel", nil, ep)
 
-	_, err := c.DialH2(ctx)
+	_, _, err := c.DialH2(ctx)
 	if err == nil {
 		t.Fatal("DialH2: want ctx error, got nil")
 	}
@@ -385,7 +385,7 @@ func TestCluster_DialH2_IncsCxMetricsAndDecsOnClose(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cc, err := c.DialH2(ctx)
+	cc, _, err := c.DialH2(ctx)
 	if err != nil {
 		t.Fatalf("DialH2: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestCluster_DialH2_TLSHandshakeFailure(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := c.DialH2(ctx)
+	_, _, err := c.DialH2(ctx)
 	if err == nil {
 		t.Fatal("DialH2: want handshake error, got nil")
 	}
@@ -433,5 +433,38 @@ func TestCluster_DialH2_TLSHandshakeFailure(t *testing.T) {
 	msg := err.Error()
 	if !strings.Contains(msg, "handshake") && !strings.Contains(msg, "tls") {
 		t.Errorf("err = %q, expected handshake/tls error chain", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DialH2 — surfaced endpoint (phase 06.2 Task 8)
+// ---------------------------------------------------------------------------
+
+// TestCluster_DialH2_ReturnsPickedEndpoint verifies that DialH2 surfaces the
+// picked Endpoint in the second return value. The returned ep.Host must be
+// non-empty and must match the single endpoint the test cluster was built
+// with (round-robin over one endpoint always returns the same one).
+func TestCluster_DialH2_ReturnsPickedEndpoint(t *testing.T) {
+	pki := mkH2TestPKI(t)
+	ln := listenH2(t, pki, []string{"h2"})
+	defer func() { _ = ln.Close() }()
+
+	want := endpointFromAddr(ln.Addr())
+	upCfg := upstreamCfgForTest(pki, []string{"h2"})
+	c := mkTestCluster("test-h2-ep-surface", upCfg, want)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cc, got, err := c.DialH2(ctx)
+	if err != nil {
+		t.Fatalf("DialH2: %v", err)
+	}
+	defer func() { _ = cc.Close() }()
+
+	if got.Host == "" {
+		t.Errorf("returned Endpoint.Host is empty; want non-empty")
+	}
+	if got.Host != want.Host || got.Port != want.Port {
+		t.Errorf("returned Endpoint = %v, want %v", got, want)
 	}
 }

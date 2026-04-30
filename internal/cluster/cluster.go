@@ -146,31 +146,31 @@ func (c *Cluster) ConnectTimeout() time.Duration {
 // internally to reach the inner *stdtls.Conn for the ALPN check, but passes
 // the wrapper to h2.NewClientConn so the *h2.ClientConn.Close path Decs the
 // gauge through the wrapper.
-func (c *Cluster) Dial(ctx context.Context) (net.Conn, error) {
+func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, Endpoint{}, err
 	}
 	ep, err := c.PickEndpoint()
 	if err != nil {
-		return nil, err
+		return nil, Endpoint{}, err
 	}
 	d := &net.Dialer{Timeout: c.connectTimeout}
 	raw, err := d.DialContext(ctx, "tcp", ep.Addr())
 	if err != nil {
-		return nil, fmt.Errorf("cluster: dial: %w", err)
+		return nil, Endpoint{}, fmt.Errorf("cluster: dial: %w", err)
 	}
 	var final net.Conn = raw
 	if c.upstreamCfg != nil {
 		conn := stdtls.Client(raw, c.upstreamCfg)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
-			return nil, fmt.Errorf("cluster: tls: handshake: %w", err)
+			return nil, Endpoint{}, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}
 		final = conn
 	}
 	c.upstreamCxTotal.Inc()
 	c.upstreamCxActive.Inc()
-	return &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}, nil
+	return &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}, ep, nil
 }
 
 // connWithGauge wraps a net.Conn so its Close decrements an upstream-cx-active

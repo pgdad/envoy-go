@@ -294,3 +294,45 @@ $ grep -nE 'AccessLogConfigs' internal/bootstrap/bootstrap.go
 165:// File-type entries with a valid path are appended to result.AccessLogConfigs.
 197:	result.AccessLogConfigs = append(result.AccessLogConfigs, AccessLogConfig{Path: fal.GetPath()})
 ```
+
+## Task 8 — `Cluster.Dial` / `DialH2` return-tuple expansion (surface picked endpoint)
+
+**Commits:** TBD — this task's commit
+**Notes:** Widened `Cluster.Dial(ctx) (net.Conn, error)` → `(net.Conn, Endpoint, error)` and `Cluster.DialH2(ctx) (*h2.ClientConn, error)` → `(*h2.ClientConn, Endpoint, error)`. All error paths return `Endpoint{}` (zero value); success paths surface the `ep` variable already captured by `PickEndpoint()`. Updated all call sites: `internal/filter/hcm/actions.go` (both `routerAction.do` and `routerActionH2.doH2`) and `internal/filter/tcpproxy/filter.go` use receive-but-discard `_` per PLAN Task 8 (Tasks 12–13 will replace `_` with `picked`). All existing tests in `cluster_test.go` and `dial_h2_test.go` updated to the new 3-tuple form. One new test per dial method added: `TestCluster_Dial_ReturnsPickedEndpoint` and `TestCluster_DialH2_ReturnsPickedEndpoint` each assert `ep.Host` non-empty and endpoint matches configured listener address.
+**Outputs:**
+```
+# go test -count=1 ./internal/cluster/ -v (last lines)
+--- PASS: TestBuildCluster_NoTypedExtension_BaselineFalse (0.00s)
+=== RUN   TestBuildCluster_HttpProtocolOptions_NilUpstreamProtocolOptions
+--- PASS: TestBuildCluster_HttpProtocolOptions_NilUpstreamProtocolOptions (0.00s)
+=== RUN   TestNewManager_MixedPlaintextAndTLSClusters
+--- PASS: TestNewManager_MixedPlaintextAndTLSClusters (0.00s)
+=== RUN   TestNewManager_AllocatesEightMetricsPerCluster
+--- PASS: TestNewManager_AllocatesEightMetricsPerCluster (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.011s
+
+# go test -count=1 ./internal/filter/hcm/ -v (last lines)
+--- PASS: TestH2RouterActionAdapter_WriteH2_NoLogOnSuccess (0.00s)
+=== RUN   TestMatchPath
+--- PASS: TestMatchPath (0.00s)
+=== RUN   TestMatchPrefix
+--- PASS: TestMatchPrefix (0.00s)
+=== RUN   TestRouteTableMatch_FirstMatchWins
+--- PASS: TestRouteTableMatch_FirstMatchWins (0.00s)
+=== RUN   TestRouteTableMatch_QueryStringExcluded
+--- PASS: TestRouteTableMatch_QueryStringExcluded (0.00s)
+=== RUN   TestRouteTableMatch_NoMatch
+--- PASS: TestRouteTableMatch_NoMatch (0.00s)
+=== RUN   TestRouteTableMatch_EmptyTable
+--- PASS: TestRouteTableMatch_EmptyTable (0.00s)
+=== RUN   FuzzHCMConfigParse
+--- PASS: FuzzHCMConfigParse (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.216s
+
+# grep verification
+$ grep -nE 'func \(c \*Cluster\) Dial|func \(c \*Cluster\) DialH2' internal/cluster/cluster.go internal/cluster/dial_h2.go
+internal/cluster/dial_h2.go:32:func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) {
+internal/cluster/cluster.go:149:func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
+```

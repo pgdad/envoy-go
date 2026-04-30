@@ -67,7 +67,7 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
-	upstream, err := f.cluster.Dial(ctx)
+	upstream, _, err := f.cluster.Dial(ctx)
 	if err != nil {
 		log.Printf("tcpproxy: dial cluster %q: %v", f.cluster.Name(), err)
 		return

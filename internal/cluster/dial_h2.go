@@ -29,10 +29,10 @@ import (
 // returns the conn-owning *h2.ClientConn on success (caller takes ownership);
 // on error there is no caller-owned wrapper to defer-close, so the underlying
 // conn would otherwise leak file descriptors.
-func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, error) {
-	raw, err := c.Dial(ctx)
+func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) {
+	raw, ep, err := c.Dial(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("cluster: dial h2: %w", err)
+		return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: %w", err)
 	}
 	// Phase 06.1 Task 9: Cluster.Dial now wraps every successful dial in a
 	// *connWithGauge whose Close Decs the upstream_cx_active gauge. Unwrap
@@ -44,12 +44,12 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, error) {
 	wrapped, ok := raw.(*connWithGauge)
 	if !ok {
 		_ = raw.Close()
-		return nil, errors.New("cluster: dial h2: not a connWithGauge")
+		return nil, Endpoint{}, errors.New("cluster: dial h2: not a connWithGauge")
 	}
 	tlsConn, ok := wrapped.Conn.(*stdtls.Conn)
 	if !ok {
 		_ = wrapped.Close()
-		return nil, errors.New("cluster: dial h2: not a TLS conn")
+		return nil, Endpoint{}, errors.New("cluster: dial h2: not a TLS conn")
 	}
 	// Defensive: ensure the handshake is complete so NegotiatedProtocol is
 	// authoritative. HandshakeContext is idempotent on already-handshaken
@@ -57,17 +57,17 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, error) {
 	// Cluster.Dial refactor that might return a not-yet-handshaken *tls.Conn.
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = wrapped.Close()
-		return nil, fmt.Errorf("cluster: dial h2: handshake: %w", err)
+		return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: handshake: %w", err)
 	}
 	alpn := tlsConn.ConnectionState().NegotiatedProtocol
 	if alpn != "h2" {
 		_ = wrapped.Close()
-		return nil, fmt.Errorf("cluster: dial h2: alpn negotiated %q, want %q", alpn, "h2")
+		return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: alpn negotiated %q, want %q", alpn, "h2")
 	}
 	cc, err := h2.NewClientConn(ctx, wrapped)
 	if err != nil {
 		_ = wrapped.Close()
-		return nil, fmt.Errorf("cluster: dial h2: client conn: %w", err)
+		return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: client conn: %w", err)
 	}
-	return cc, nil
+	return cc, ep, nil
 }
