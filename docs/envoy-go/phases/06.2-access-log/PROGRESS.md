@@ -354,7 +354,7 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
 
 ## Task 11 — HCM Filter struct extension + parseFilterWithCtx sink-slice plumbing
 
-**Commits:** TBD — this task's commit
+**Commits:** `d6c9749`
 **Notes:** Added `accessLog []accesslog.Sink` field to `Filter` struct (config.go line 66). Extended `parseFilterWithCtx` signature with trailing `accessLogSinks []accesslog.Sink` parameter; field set in returned `*Filter`. Updated all 6 callers: `NewFilterWithCtx`, `parseFilter` (config.go), `NewFilter` (filter.go), and all 5 `parseFilterWithCtx` call sites in `config_test.go` — each passes `nil` (Task 14 wires real sinks). Added `TestFilter_AccessLogField_Plumbed` to `config_test.go`. Added `"github.com/esalaine/envoy-go/internal/accesslog"` import to both `config.go` and `config_test.go`.
 **Outputs:**
 ```
@@ -385,7 +385,7 @@ $ grep -nE 'accessLog \[\]accesslog\.Sink' internal/filter/hcm/config.go
 
 ## Task 10 — `internal/filter/hcm/accesslog_emit.go` — Filter.emitAccessLog (H1 + H2)
 
-**Commits:** TBD — this task's commit
+**Commits:** `94a8568`
 **Notes:** Created `internal/filter/hcm/accesslog_emit.go` with three functions: `(*Filter).emitAccessLog` (H1 variant — reads `*http.Request` primitives), `(*Filter).emitAccessLogH2` (H2 variant — reads `h2.H2Request` pseudo-headers and extracts User-Agent via `h2UserAgent`), and helpers `h2UserAgent` (case-insensitive `user-agent` scan over `[]hpack.HeaderField`) and `upstreamHostString` (renders `Endpoint` as `host:port` or empty string for zero endpoint). Both emit methods guard on `statusCode == 0` (H2 ctx-cancel sentinel per SPEC §2.1) and `len(f.accessLog) == 0` (no-op when no sinks). Created `accesslog_emit_test.go` with 6 TDD tests (RED then GREEN). All 6 new tests plus full hcm suite pass.
 **Outputs:**
 ```
