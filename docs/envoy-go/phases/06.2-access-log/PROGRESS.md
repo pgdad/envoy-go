@@ -215,7 +215,7 @@ ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
 
 ## Task 7 — `internal/bootstrap/bootstrap.go` — parse `access_log[]` + reject `log_format` [ADR-0067]
 
-**Commits:** TBD — this task's commit
+**Commits:** `6949fce`
 **Notes:** Added `AccessLogConfig` struct and `AccessLogConfigs []AccessLogConfig` field to `Bootstrap`. Implemented `parseAccessLogConfigs` + `parseOneAccessLog` helpers that walk static_resources listeners → filter_chains → HCM filters → `access_log[]` entries. File-type entries (`type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog`) with `path` set are collected; `log_format` / `format_string` (`format` field) / `json_format` / `typed_json_format` produce fatal parse errors per ADR-0067 option β. Non-file typed_configs (stdout/stream, tcp_grpc, open_telemetry) are silently ignored per ADR-0041 amendment. Added blank imports for `file/v3` and `stream/v3` so protojson can round-trip bootstraps containing those typed_configs without "type not registered" errors. Added 8 new tests (all GREEN); total bootstrap tests: 19 pass (11 existing + 8 new). Appended ADR-0067 to DECISIONS.md; amended ADR-0041 with 06.2 amendment block.
 **Outputs:**
 ```
