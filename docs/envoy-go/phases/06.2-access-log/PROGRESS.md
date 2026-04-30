@@ -351,3 +351,34 @@ $ go test -count=1 -run TestByteCounterWriter ./internal/filter/hcm/ -v
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
 ```
+
+## Task 11 — HCM Filter struct extension + parseFilterWithCtx sink-slice plumbing
+
+**Commits:** TBD — this task's commit
+**Notes:** Added `accessLog []accesslog.Sink` field to `Filter` struct (config.go line 66). Extended `parseFilterWithCtx` signature with trailing `accessLogSinks []accesslog.Sink` parameter; field set in returned `*Filter`. Updated all 6 callers: `NewFilterWithCtx`, `parseFilter` (config.go), `NewFilter` (filter.go), and all 5 `parseFilterWithCtx` call sites in `config_test.go` — each passes `nil` (Task 14 wires real sinks). Added `TestFilter_AccessLogField_Plumbed` to `config_test.go`. Added `"github.com/esalaine/envoy-go/internal/accesslog"` import to both `config.go` and `config_test.go`.
+**Outputs:**
+```
+$ go test -count=1 ./internal/filter/hcm/ -v 2>&1 | tail -20
+=== RUN   TestMatchPrefix
+--- PASS: TestMatchPrefix (0.00s)
+=== RUN   TestRouteTableMatch_FirstMatchWins
+--- PASS: TestRouteTableMatch_FirstMatchWins (0.00s)
+=== RUN   TestRouteTableMatch_QueryStringExcluded
+--- PASS: TestRouteTableMatch_QueryStringExcluded (0.00s)
+=== RUN   TestRouteTableMatch_NoMatch
+--- PASS: TestRouteTableMatch_NoMatch (0.00s)
+=== RUN   TestRouteTableMatch_EmptyTable
+--- PASS: TestRouteTableMatch_EmptyTable (0.00s)
+=== RUN   FuzzHCMConfigParse
+=== RUN   FuzzHCMConfigParse/seed#0
+=== RUN   FuzzHCMConfigParse/seed#1
+=== RUN   FuzzHCMConfigParse/seed#2
+--- PASS: FuzzHCMConfigParse (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#0 (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#1 (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.216s
+$ grep -nE 'accessLog \[\]accesslog\.Sink' internal/filter/hcm/config.go
+66:	accessLog []accesslog.Sink
+```

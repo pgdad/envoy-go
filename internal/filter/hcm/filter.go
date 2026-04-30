@@ -21,7 +21,7 @@ import (
 // see NewFilterWithCtx (config.go) for the contract. The 5 HCM-scope metrics
 // per SPEC §6 are allocated at filter-build time, pre-Freeze.
 func NewFilter(tc *anypb.Any, clusters *cluster.Manager, registry *stats.Registry) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, registry)
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, registry, nil)
 }
 
 // Handle drives one downstream connection from acceptance to close. ALPN

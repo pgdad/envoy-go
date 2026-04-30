@@ -9,6 +9,7 @@ import (
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -58,6 +59,11 @@ type Filter struct {
 	downstreamRq3xx   *stats.Counter
 	downstreamRq4xx   *stats.Counter
 	downstreamRq5xx   *stats.Counter
+
+	// accessLog holds the configured access-log sinks. Nil when no sinks are
+	// configured (pre-Task 14) or for listeners without access_log[] entries.
+	// Plumbed via parseFilterWithCtx; Task 14 wires real AsyncFileSinks.
+	accessLog []accesslog.Sink
 }
 
 // downstreamStatusClassCounter returns the downstream_rq_<Nxx> counter for the
@@ -89,7 +95,7 @@ func (f *Filter) downstreamStatusClassCounter(code int) *stats.Counter {
 // the constructor allocates the 5 HCM-scope per-instance metrics on the
 // supplied Registry (pre-Freeze; SPEC §5.4 + §6).
 func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc, registry)
+	return parseFilterWithCtx(tc, clusters, lc, registry, nil)
 }
 
 // parseFilter is the legacy entry point retained for existing tests.
@@ -97,7 +103,7 @@ func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, 
 // fresh throwaway Registry (legacy callers do not exercise the metric
 // pointers).
 func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry())
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry(), nil)
 }
 
 // parseFilterWithCtx decodes the typed_config Any into a *Filter. All errors
@@ -107,7 +113,7 @@ func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
 //
 // Task 11: registry is the *stats.Registry the 5 HCM-scope per-instance
 // metrics are allocated on. Must be non-nil and non-Frozen.
-func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry) (*Filter, error) {
+func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink) (*Filter, error) {
 	if got := tc.GetTypeUrl(); got != TypeURL {
 		return nil, fmt.Errorf("hcm: wrong type_url %q (want %q)", got, TypeURL)
 	}
@@ -177,6 +183,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		downstreamRq3xx:   registry.NewCounter(prefix + "downstream_rq_3xx"),
 		downstreamRq4xx:   registry.NewCounter(prefix + "downstream_rq_4xx"),
 		downstreamRq5xx:   registry.NewCounter(prefix + "downstream_rq_5xx"),
+		accessLog:         accessLogSinks,
 	}, nil
 }
 
