@@ -8,7 +8,7 @@ None. All 12 preconditions satisfied at cold-start: branch `phase/06.2-access-lo
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** TBD — this task's commit
+**Commits:** `015fc0c`
 **Notes:** Created PROGRESS.md; verified all 12 preconditions per PLAN §"Execution preconditions"; phase-06.1 close confirmed present in HEAD; SPEC at `7bbf4a2`; ADR tail at 0065 (next-free 0066); `internal/accesslog/` contains only `doc.go` (the package implementation lands at Task 2+).
 **Outputs:**
 ```
