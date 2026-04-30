@@ -15,10 +15,14 @@ import (
 // Per Decision A's option-B partial coverage, the 5 unplumbed operators
 // (RESPONSE_FLAGS, BYTES_RECEIVED, RESP(X-ENVOY-UPSTREAM-SERVICE-TIME),
 // X-FORWARDED-FOR, X-REQUEST-ID) emit the literal `-` (Envoy missing-value
-// convention). Quoted operators escape literal `"` to `\"` per Envoy convention.
-// The line is terminated with a single `\n`; embedded LFs in any field are
-// stripped (replaced with `\n` literal escape) so the line-stream invariant
-// load-bearing for the fixture-0006 parser holds (per SPEC §1 #10 + Decision J).
+// convention). Quoted operators escape `\` to `\\` and `"` to `\"` per Envoy
+// AccessLogFormatUtils::escapeUtilityValue + RFC 4180 CSV convention; the
+// backslash-first ordering ensures `\"` in a field value serializes as `\\\"`
+// (escaped backslash + escaped quote) rather than `\\"` (which would parse as
+// escaped-backslash + bare-quote = field terminator). The line is terminated
+// with a single `\n`; embedded LFs in any field are stripped (replaced with
+// the literal escape `\n`) so the line-stream invariant load-bearing for the
+// fixture-0006 parser holds (per SPEC §1 #10 + Decision J).
 func Default(r *Record) []byte {
 	var b bytes.Buffer
 	b.Grow(256)
@@ -56,10 +60,14 @@ func Default(r *Record) []byte {
 }
 
 func escape(s string) string {
-	if !strings.ContainsAny(s, "\"\n\r") {
+	if !strings.ContainsAny(s, "\\\"\n\r") {
 		return s
 	}
-	r := strings.NewReplacer(`"`, `\"`, "\n", `\n`, "\r", `\r`)
+	// Backslash escape MUST come first in the NewReplacer arg list — strings.NewReplacer
+	// is single-pass non-overlapping, so listing `\` → `\\` before `"` → `\"` ensures
+	// `\"` in input becomes `\\\"` in output (escaped backslash + escaped quote), not
+	// `\\"` (which would re-parse as escaped-backslash + bare-quote = field terminator).
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`)
 	return r.Replace(s)
 }
 

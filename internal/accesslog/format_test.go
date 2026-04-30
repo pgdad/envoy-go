@@ -66,6 +66,86 @@ func TestDefault_QuoteEscaping(t *testing.T) {
 	}
 }
 
+// Regression for the gate-(d) verifier finding (verify commit 503c8ee): when
+// a quoted-operator value ends with a literal backslash, the closing `"`
+// field-delimiter must be preceded by `\\` (escaped backslash), not by a
+// single `\` (which round-trip readers and the FuzzAccessLogFormat parseability
+// invariant would interpret as an escaped quote — silently swallowing the
+// closing field delimiter). Matches reference Envoy
+// AccessLogFormatUtils::escapeUtilityValue and RFC 4180 CSV-style escaping.
+func TestDefault_BackslashInQuotedField(t *testing.T) {
+	rec := &Record{
+		StartTime: time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
+		Method:    "0", Path: "0", Protocol: "0",
+		ResponseCode: 200, BytesSent: 42, Duration: 5 * time.Millisecond,
+		Authority: "0", UserAgent: "0", UpstreamHost: `\`,
+	}
+	s := string(Default(rec))
+	// The UPSTREAM_HOST field is the last quoted operator. Its body is one
+	// backslash. After escape() that backslash must be `\\` so the closing
+	// `"` is preceded by `\\` (legit close), not by `\` (looks like `\"`).
+	if !strings.HasSuffix(s, `"\\"`+"\n") {
+		t.Errorf("UPSTREAM_HOST=`\\` should serialize to `\"\\\\\"`; got tail = %q", s[len(s)-8:])
+	}
+	if strings.HasSuffix(s, `"\"`+"\n") {
+		t.Errorf("UPSTREAM_HOST tail looks like an escaped quote (closing `\"` swallowed): %q", s)
+	}
+	// Even count of un-escaped quotes (matches the FuzzAccessLogFormat invariant
+	// — a `"` is escaped iff preceded by an ODD number of `\`).
+	body := []byte(s)
+	quoteCount := 0
+	for i := 0; i < len(body); i++ {
+		if body[i] != '"' {
+			continue
+		}
+		bsCount := 0
+		for j := i - 1; j >= 0 && body[j] == '\\'; j-- {
+			bsCount++
+		}
+		if bsCount%2 == 0 {
+			quoteCount++
+		}
+	}
+	if quoteCount%2 != 0 {
+		t.Errorf("odd un-escaped quote count (%d) in %q", quoteCount, s)
+	}
+}
+
+// Backslash that does NOT terminate a field still gets escaped to `\\` per the
+// RFC 4180 / reference-Envoy convention — verifies the escape catalog is
+// consistent across positions in the value, not just at the trailing edge.
+func TestDefault_BackslashInMiddleOfField(t *testing.T) {
+	rec := &Record{
+		StartTime: time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
+		Method:    "GET", Path: "/", Protocol: "HTTP/1.1",
+		ResponseCode: 200,
+		UserAgent:    `a\b\c`,
+	}
+	s := string(Default(rec))
+	if !strings.Contains(s, `"a\\b\\c"`) {
+		t.Errorf("interior backslashes not doubled; got %q", s)
+	}
+	if strings.Contains(s, `"a\b\c"`) {
+		t.Errorf("interior backslashes still single (un-escaped): %q", s)
+	}
+}
+
+// Backslash + quote in same field: escape order must produce `\\\"` (backslash
+// escapes first, then quote escapes), not `\\"` (which would be parsed as
+// escaped-backslash + bare quote = field terminator).
+func TestDefault_BackslashThenQuoteInField(t *testing.T) {
+	rec := &Record{
+		StartTime: time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
+		Method:    "GET", Path: "/", Protocol: "HTTP/1.1",
+		ResponseCode: 200,
+		UserAgent:    `\"`,
+	}
+	s := string(Default(rec))
+	if !strings.Contains(s, `"\\\""`) {
+		t.Errorf("backslash-quote not escaped to `\\\\\\\"`; got %q", s)
+	}
+}
+
 func TestDefault_NeverEmbedsLF(t *testing.T) {
 	rec := &Record{
 		StartTime: time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),

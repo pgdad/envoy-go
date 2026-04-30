@@ -914,3 +914,143 @@ $ # All four anticipated 06.2 ADRs anchored in DECISIONS.md.
 ```
 
 **Differential surface:** gate (a) fixture-0006-access-log PASS non-vacuous (reference Envoy at the ENVOY_TARGET pin); gate (b) 6/6 pre-existing fixtures PASS (0000/0001/0002/0003/0004/0005). **Conformance:** h2spec 53/53 PASS at the pinned summerwind SHA (sections 3/4/5/6 ex-6.6/7/8 per ADR-0051 threshold). **Fuzz:** 7/8 PASS (BootstrapLoad, TcpProxyFilter, FrameStream, HPACKDecode, TLSContextParse, HCMConfigParse, PromTextFormat); 1/8 FAIL (AccessLogFormat — see gate (d) above).
+
+## Fix — gate-(d) FuzzAccessLogFormat — escape() backslash catalog extension
+
+**Commits:** `<TBD>`
+
+Worktree `.worktrees/phase-06.2-access-log-impl-followup-gate-d`, branch `phase/06.2-access-log-impl-followup-gate-d`, branched from master fast-forward HEAD `a0192c0` (verify-fail SHA-fill) per ADR-0003 + per-phase-worktree convention. Mirrors the 06.1 gate-(d) fix precedent at `79be6b0` (`phase 06.1 fix: gate-(d) FuzzHCMConfigParse — validate stat_prefix at HCM parse boundary [ADR-0065]`).
+
+**Notes.** Closes the gate-(d) FAIL recorded in the verification block above. Two changes:
+
+1. **`internal/accesslog/format.go::escape()`** — extend the escape catalog from `{", \n, \r}` to `{\, ", \n, \r}` and add `\` to the early-return `ContainsAny` filter. Order matters: `\` → `\\` MUST appear first in the `strings.NewReplacer` arg list because `NewReplacer` is single-pass non-overlapping; listing `\` first means an input `\"` is processed as `\` (replaces to `\\`) then `"` (replaces to `\"`) → output `\\\"` (escaped backslash + escaped quote, well-formed). Listing `"` first would emit `\"` first, then attempt to replace the introduced `\` (but NewReplacer doesn't re-scan — so the introduced `\` stays bare; output `\\"` would parse as escaped-backslash + bare-quote = field terminator, which is what the bug looked like). The Default doc-comment updated to record the catalog and the order rationale; the SPEC §11 empirical-pin block needs no amend (the 5-record reference scrape contains no backslash content; SPEC §6.1 et al. say "per Envoy convention" — under-specified but consistent with the fix).
+
+2. **`internal/accesslog/fuzz_test.go::FuzzAccessLogFormat`** — strengthen the parseability-invariant heuristic. The original heuristic (`got[i] == '"' && got[i-1] != '\\'`) is wrong on the well-formed sequence `\\"` (escaped-backslash + bare-quote = legitimate field terminator): it sees the preceding `\` and incorrectly classifies the `"` as escaped. The fix counts CONSECUTIVE preceding `\` bytes and treats the `"` as escaped iff that count is ODD. With the format.go fix in place, an input `upstream="\"` produces output `..."\\"` — the closing `"` is preceded by 2 backslashes (even) → counted as un-escaped → the total quote count is 12 (even) → invariant holds. The mirror heuristic in `format_test.go::TestDefault_BackslashInQuotedField` uses the same pair-counting approach.
+
+3. **Regression seed.** Re-introduced the auto-saved Go-fuzz crasher input at `internal/accesslog/testdata/fuzz/FuzzAccessLogFormat/1bdc705d534eee86` (6-line file: `go test fuzz v1` / 5× `string("0")` / `string("\\")` representing the minimised input — method=path=proto=authority=ua=`"0"`, upstream=`\` single backslash). Go's fuzz framework auto-replays files at `testdata/fuzz/<FuzzName>/<sha>` on every `go test ./internal/accesslog/` run; this guarantees the bug never recurs even if the format.go change is later refactored.
+
+4. **Three new unit tests in `internal/accesslog/format_test.go`** (TDD discipline per D-3.1; RED before fix, GREEN after):
+   - `TestDefault_BackslashInQuotedField` — exact reproduction of the failing fuzz seed (UPSTREAM_HOST=`\`); asserts the closing `"` is preceded by `\\` not `\`, and that the un-escaped quote count is even using the same pair-counting heuristic.
+   - `TestDefault_BackslashInMiddleOfField` — interior backslashes also doubled (catalog extension is positional-uniform).
+   - `TestDefault_BackslashThenQuoteInField` — the order-sensitive case: input `\"` serializes to `\\\"` (4 chars) not `\\"` (3 chars).
+
+**ADR consideration.** No ADR added. The fix is mechanical: the escape catalog extension matches reference Envoy `AccessLogFormatUtils::escapeUtilityValue` and RFC 4180 CSV-style escaping; no design alternative was meaningfully considered. (Mirror 06.1's ADR-0065 only when a non-obvious validation pattern is being introduced — that fix introduced a NEW pattern "validate metric-name-deriving inputs at the user-input boundary"; this fix is a 1-character extension to an existing escape catalog with the obvious choice. A code-comment in `escape()` records the order-sensitivity rationale.)
+
+**Outputs:**
+
+```
+$ pwd
+/home/esa/git/envoy-go/.worktrees/phase-06.2-access-log-impl-followup-gate-d
+$ git rev-parse --abbrev-ref HEAD
+phase/06.2-access-log-impl-followup-gate-d
+$ git log -1 --format=%H master
+a0192c08a4e0bc7adde50f0a8ccc2f1849e63c7e
+
+# RED — new tests fail before format.go fix
+$ go test -count=1 -v -run 'TestDefault_BackslashInQuotedField|TestDefault_BackslashInMiddleOfField|TestDefault_BackslashThenQuoteInField' ./internal/accesslog/
+=== RUN   TestDefault_BackslashInQuotedField
+    format_test.go:88: UPSTREAM_HOST=`\` should serialize to `"\\"`; got tail = "\"0\" \"\\\"\n"
+    format_test.go:91: UPSTREAM_HOST tail looks like an escaped quote (closing `"` swallowed): "[2026-04-29T00:00:00.000Z] \"0 0 0\" 200 - - 42 5 - \"-\" \"0\" \"-\" \"0\" \"\\\"\n"
+    format_test.go:102: odd un-escaped quote count (11) in "..."
+--- FAIL: TestDefault_BackslashInQuotedField (0.00s)
+=== RUN   TestDefault_BackslashInMiddleOfField
+    format_test.go:118: interior backslashes not doubled; got "...\"a\\b\\c\"..."
+--- FAIL: TestDefault_BackslashInMiddleOfField (0.00s)
+=== RUN   TestDefault_BackslashThenQuoteInField
+    format_test.go:137: backslash-quote not escaped to `\\\"`; got "...\\\\\"\"..."
+--- FAIL: TestDefault_BackslashThenQuoteInField (0.00s)
+FAIL
+
+# GREEN — same tests pass after format.go fix + fuzz_test.go invariant strengthening
+$ go test -count=1 -v -run 'TestDefault_BackslashInQuotedField|TestDefault_BackslashInMiddleOfField|TestDefault_BackslashThenQuoteInField' ./internal/accesslog/
+=== RUN   TestDefault_BackslashInQuotedField
+--- PASS: TestDefault_BackslashInQuotedField (0.00s)
+=== RUN   TestDefault_BackslashInMiddleOfField
+--- PASS: TestDefault_BackslashInMiddleOfField (0.00s)
+=== RUN   TestDefault_BackslashThenQuoteInField
+--- PASS: TestDefault_BackslashThenQuoteInField (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.004s
+
+# Regression seed re-introduced + replayed
+$ go test -count=1 -v -run 'FuzzAccessLogFormat/1bdc705d534eee86' ./internal/accesslog/
+=== RUN   FuzzAccessLogFormat
+=== RUN   FuzzAccessLogFormat/1bdc705d534eee86
+--- PASS: FuzzAccessLogFormat (0.00s)
+    --- PASS: FuzzAccessLogFormat/1bdc705d534eee86 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
+
+# Local six-gate sweep — all GREEN
+
+# Gate (a) — fixture-0006-access-log differential
+$ go test -count=1 -timeout 120s ./test/differential/ -run 'TestDifferential/0006' -v 2>&1 | grep -E '^---|^PASS|^ok'
+--- PASS: TestDifferential (11.43s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	11.501s
+
+# Gate (b) — pre-existing fixtures 0000-0005 (regression check)
+$ go test -count=1 -timeout 120s ./test/differential/ -run 'TestDifferential/000[0-5]' -v 2>&1 | grep -E '^---|^PASS|^ok'
+--- PASS: TestDifferential (9.14s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	9.217s
+
+# Gate (c) — h2spec
+$ go test -count=1 -timeout 120s ./test/conformance/h2spec/ -v 2>&1 | tail -3
+--- PASS: TestH2Spec (2.36s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.443s
+
+# Gate (d) — FuzzAccessLogFormat 30s budget (the verifier's failing gate, now PASS)
+$ go test -count=1 -fuzz=FuzzAccessLogFormat -fuzztime=30s ./internal/accesslog/ 2>&1 | tail -10
+fuzz: elapsed: 24s, execs: 20588601 (939234/sec), new interesting: 66 (total: 87)
+fuzz: elapsed: 27s, execs: 24333799 (1248186/sec), new interesting: 66 (total: 87)
+fuzz: elapsed: 30s, execs: 27109368 (925592/sec), new interesting: 66 (total: 87)
+fuzz: elapsed: 31s, execs: 27109368 (0/sec), new interesting: 66 (total: 87)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	31.018s
+
+(27,109,368 executions in 30s, 0 crashers, 87 interesting inputs — clean.)
+
+# Gate (e) — go vet / golangci-lint / go test -race ./...
+$ go vet ./...
+(exit 0, no output)
+$ golangci-lint run ./...
+(exit 0, no output — lint cleanup applied during fix: gofmt of TestDefault_BackslashInQuotedField; misspell `serialises`→`serializes`, `serialise`→`serialize`, `catalogue`→`catalog`)
+$ go test -race -count=1 -timeout 600s ./... 2>&1 | grep -E '^(ok|FAIL)'
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.126s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.017s
+[... 18 other packages, all ok ...]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.026s
+(20 packages: all ok, no FAIL, no DATA RACE warnings)
+
+# 7 pre-existing fuzzers seed-corpus runs (regression check; output abbreviated)
+$ for fz in \
+    'BootstrapLoad,bootstrap' \
+    'TcpProxyFilter,filter/tcpproxy' \
+    'TLSContextParse,tls' \
+    'HCMConfigParse,filter/hcm' \
+    'PromTextFormat,stats'; do
+    name="${fz%,*}"; pkg="${fz#*,}"
+    go test -count=1 ./internal/$pkg/ -run "Fuzz$name" 2>&1 | tail -1
+done
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.005s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.004s
+ok  	github.com/esalaine/envoy-go/internal/tls	0.003s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.005s
+ok  	github.com/esalaine/envoy-go/internal/stats	0.002s
+$ go test -count=1 ./internal/filter/hcm/h2/ -run 'FuzzFrameStream|FuzzHPACKDecode' 2>&1 | tail -1
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	0.003s
+$ go test -count=1 ./internal/accesslog/ -run FuzzAccessLogFormat 2>&1 | tail -1
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
+(8/8 fuzzers PASS seed corpus, including the previously-failing FuzzAccessLogFormat which now also passes the 30s budget at gate (d).)
+```
+
+**Carry-forward triage:**
+- 06.1 review-followup carry (M-2..M-12 + reviewer-discovered Minors): unchanged.
+- 05.2 M-4 / M-10 / M-12: unchanged.
+- 05.2 prose Minors (7): unchanged.
+- 06.1 REVIEW M-8 (drain-loop polling) — closed prophylactically in fixture 0006 driver at Task 15 (`085890d`); unchanged here.
+- This commit's lint cleanup (`gofmt` + 3× `misspell`) is local to the new test/code lines added by this fix; it is NOT a carry-forward and does NOT close any pre-existing review item.
+
+STATE advances 3 → 4 with `next-skill: superpowers:verification-before-completion`. The next session is a verify-2 (`phase/06.2-access-log-verify-2`, fresh worktree per the 05.1 + 06.1 verify-2 precedent) that re-runs all six gates fresh — gate (d) at the 30s budget specifically. SHA-fill follow-up per the phase-02..06.1 convention: `phase 06.2 follow-up: STATE.md + PROGRESS.md SHA-fill for gate-(d) fix commit (TBD → <SHA>)` after the master fast-forward.

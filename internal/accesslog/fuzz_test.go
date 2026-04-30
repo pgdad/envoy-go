@@ -41,9 +41,23 @@ func FuzzAccessLogFormat(f *testing.F) {
 		if bytes.IndexByte(body, '\n') >= 0 {
 			t.Fatalf("embedded LF in record body: %q (input method=%q path=%q)", got, method, path)
 		}
+		// Count un-escaped quotes (parseability invariant). A `"` is escaped iff it
+		// is preceded by an ODD number of consecutive `\` bytes; even (including 0)
+		// means the quote is a legitimate field delimiter. The naïve "previous byte
+		// is `\`" heuristic is wrong on `\\"` (escaped-backslash + bare-quote, a real
+		// delimiter): the verify commit 503c8ee gate-(d) fix at format.go::escape()
+		// emits exactly this sequence when a quoted operator's value ends with `\`,
+		// and the stricter pair-counting check is needed to validate the fix.
 		quoteCount := 0
 		for i := 0; i < len(got); i++ {
-			if got[i] == '"' && (i == 0 || got[i-1] != '\\') {
+			if got[i] != '"' {
+				continue
+			}
+			bsCount := 0
+			for j := i - 1; j >= 0 && got[j] == '\\'; j-- {
+				bsCount++
+			}
+			if bsCount%2 == 0 {
 				quoteCount++
 			}
 		}
