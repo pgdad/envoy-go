@@ -146,6 +146,14 @@ const (
 	// (ADR-0062). Because the backend is a subprocess, the runner's in-process
 	// accept counter is NOT incremented.
 	HTTPStatusHeader BackendKind = 3
+	// HTTPFixedBody is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0006-access-log/backends/main.go on the pre-allocated port.
+	// The backend returns 200 OK with a fixed 17-byte body regardless of path
+	// (byte-identical across all instances — ensures BYTES_SENT Tier-E equality
+	// against RR endpoint-selection divergence, per SPEC §7.2). No TLS.
+	// Introduced by fixture 0006 / ADR-0068. Because the backend is a subprocess,
+	// the runner's in-process accept counter is NOT incremented.
+	HTTPFixedBody BackendKind = 4
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
@@ -153,4 +161,36 @@ const (
 // 0003). Drivers that do NOT implement it default to TCPEcho.
 type BackendKindAware interface {
 	BackendKind() BackendKind
+}
+
+// HostMount describes a file bind-mount from the test host into the reference
+// container. The file at HostPath must exist on the host before the container
+// starts. HostPath is the absolute host-side file path; ContainerPath is the
+// absolute in-container target path.
+//
+// This type is defined here (in the leaf fixture package) so that driver
+// packages can use it without importing testcontainers-go directly. The runner
+// translates each HostMount into a testcontainers.ContainerMount before calling
+// StartReferenceProxyWithMounts.
+type HostMount struct {
+	HostPath      string
+	ContainerPath string
+}
+
+// ReferenceLogMounter is an OPTIONAL driver-side interface the runner invokes
+// before starting the reference container. Drivers that need to bind-mount a
+// file into the container (e.g., fixture 0006-access-log needs to bind-mount the
+// reference log file) implement this interface. The runner pre-creates each host
+// file and sets permissions 0o666, then passes the mounts to
+// StartReferenceProxyWithMounts. Introduced by fixture 0006 / ADR-0068.
+type ReferenceLogMounter interface {
+	ReferenceHostMounts() []HostMount
+}
+
+// AccessLogAsserter is an OPTIONAL driver-side interface the runner invokes
+// after ProbeAdmin (step 10, mirroring StatsAsserter). Drivers that implement
+// it receive the per-side log file paths it set up via ReferenceLogMounter and
+// SubjectConfig, then assert the three-tier matrix. Introduced by ADR-0068.
+type AccessLogAsserter interface {
+	AssertAccessLog(t TB)
 }

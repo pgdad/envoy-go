@@ -2,6 +2,7 @@ package hcm
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -140,16 +141,21 @@ type routerAction struct {
 // write-side failure).
 func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
 	start := time.Now()
-	// byteCounterWriter wraps bw so response body bytes flowing through
-	// resp.Write are counted for BYTES_SENT per SPEC §12 #3 option (a).
-	bcw := &byteCounterWriter{w: bw}
+
+	// bytesSent counts only the response body bytes for BYTES_SENT per SPEC
+	// §12 #3 option (a). We do NOT wrap bw in a byteCounterWriter because
+	// resp.Write writes the full HTTP/1.1 wire bytes (status line + headers +
+	// body), which would inflate the count. Instead, we read the body into a
+	// buffer, record its length, replace resp.Body with the buffered reader, and
+	// let resp.Write drain the buffer through bw directly.
+	bytesSent := int64(0)
 
 	// statusCode and picked are captured by the deferred access-log emit so
 	// the closure always reads the final values after all writes have completed.
 	statusCode := 0
 	picked := cluster.Endpoint{}
 	if a.filter != nil {
-		defer func() { a.filter.emitAccessLog(req, statusCode, bcw.n, picked, start) }()
+		defer func() { a.filter.emitAccessLog(req, statusCode, bytesSent, picked, start) }()
 	}
 
 	a.cluster.IncUpstreamRqTotal()
@@ -158,7 +164,7 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	if err != nil {
 		a.cluster.IncStatusClass(503)
 		statusCode = 503
-		return 503, writeStatusReply(bcw, 503, "")
+		return 503, writeStatusReply(bw, 503, "")
 	}
 	defer func() { _ = upstream.Close() }()
 	picked = ep
@@ -174,21 +180,31 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	if err := req.Write(upstream); err != nil {
 		a.cluster.IncStatusClass(502)
 		statusCode = 502
-		return 502, writeStatusReply(bcw, 502, "")
+		return 502, writeStatusReply(bw, 502, "")
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
 	if err != nil {
 		a.cluster.IncStatusClass(502)
 		statusCode = 502
-		return 502, writeStatusReply(bcw, 502, "")
+		return 502, writeStatusReply(bw, 502, "")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	a.cluster.IncStatusClass(resp.StatusCode)
 	statusCode = resp.StatusCode
 
-	if err := resp.Write(bcw); err != nil {
+	// Read the entire response body to count body bytes for BYTES_SENT.
+	// Replace resp.Body with a bytes.Reader so resp.Write drains the same
+	// bytes downstream without a second upstream read.
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, err
+	}
+	bytesSent = int64(len(bodyBytes))
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	if err := resp.Write(bw); err != nil {
 		return resp.StatusCode, err
 	}
 	// Honor the upstream's Connection: close (and HTTP/1.0 close-by-default)

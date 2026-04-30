@@ -1,0 +1,100 @@
+# Fixture 0006-access-log — expectations
+#
+# Three-tier matrix per ADR-0068 / SPEC §7.4.
+# Records are paired by index (subject record N vs. reference record N).
+# 5 records per side (10 total across both proxies).
+#
+# Tier E (byte-equal cross-side, 7 operators):
+#   :METHOD, :PATH, PROTOCOL, RESPONSE_CODE, BYTES_SENT, USER-AGENT, :AUTHORITY
+#
+# Tier F (format-only — parses to expected shape on both sides;
+#          cross-side value NOT asserted equal, 3 operators):
+#   START_TIME  (RFC3339 ms-precision UTC)
+#   DURATION    (int ms >= 0)
+#   UPSTREAM_HOST (host:port for routed; "-" for direct_response)
+#
+# Tier S (subject MUST emit "-"; reference unconstrained, 5 operators):
+#   RESPONSE_FLAGS, BYTES_RECEIVED, X-FORWARDED-FOR, X-REQUEST-ID,
+#   RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)
+#   (envoy-go does not inject X-Envoy-Upstream-Service-Time; Decision A)
+
+workload:
+  - index: 1
+    path: /health
+    action: direct_response
+    expected_status: 200
+    expected_bytes_sent: 3  # "OK\n"
+    fields:
+      - pos: 1  name: START_TIME          tier: F  predicate: "regex ^\\[\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z\\]$"
+      - pos: 2  name: ":METHOD"            tier: E  value: '"GET'
+      - pos: 3  name: ":PATH"              tier: E  value: "/health"
+      - pos: 4  name: PROTOCOL             tier: E  value: 'HTTP/1.1"'
+      - pos: 5  name: RESPONSE_CODE        tier: E  value: "200"
+      - pos: 6  name: RESPONSE_FLAGS       tier: S  subject_value: "-"
+      - pos: 7  name: BYTES_RECEIVED       tier: S  subject_value: "-"
+      - pos: 8  name: BYTES_SENT           tier: E  value: "3"
+      - pos: 9  name: DURATION             tier: F  predicate: "int >= 0"
+      - pos: 10 name: RESP_SVC_TIME        tier: S  subject_value: "-"
+      - pos: 11 name: X_FORWARDED_FOR      tier: S  subject_value: '"-"'
+      - pos: 12 name: USER_AGENT           tier: E  value: '"Go-http-client/1.1"'
+      - pos: 13 name: X_REQUEST_ID         tier: S  subject_value: '"-"'
+      - pos: 14 name: ":AUTHORITY"          tier: E  note: "normalized — host part == 127.0.0.1"
+      - pos: 15 name: UPSTREAM_HOST        tier: F  value: '"-"'
+
+  - index: 2
+    path: /api/v1/foo
+    action: routerAction
+    expected_status: 200
+    expected_bytes_sent: 17  # "backend:v1/fixed\n"
+    fields:
+      - pos: 1  name: START_TIME          tier: F
+      - pos: 2  name: ":METHOD"            tier: E  value: '"GET'
+      - pos: 3  name: ":PATH"              tier: E  value: "/api/v1/foo"
+      - pos: 4  name: PROTOCOL             tier: E  value: 'HTTP/1.1"'
+      - pos: 5  name: RESPONSE_CODE        tier: E  value: "200"
+      - pos: 6  name: RESPONSE_FLAGS       tier: S  subject_value: "-"
+      - pos: 7  name: BYTES_RECEIVED       tier: S  subject_value: "-"
+      - pos: 8  name: BYTES_SENT           tier: E  value: "17"
+      - pos: 9  name: DURATION             tier: F  predicate: "int >= 0"
+      - pos: 10 name: RESP_SVC_TIME        tier: S  subject_value: "-"
+      - pos: 11 name: X_FORWARDED_FOR      tier: S  subject_value: '"-"'
+      - pos: 12 name: USER_AGENT           tier: E  value: '"Go-http-client/1.1"'
+      - pos: 13 name: X_REQUEST_ID         tier: S  subject_value: '"-"'
+      - pos: 14 name: ":AUTHORITY"          tier: E  note: "normalized"
+      - pos: 15 name: UPSTREAM_HOST        tier: F  predicate: 'regex "^\"[^\"]+:\\d+\"$"'
+
+  - index: 3
+    path: /api/v1/bar
+    action: routerAction
+    expected_status: 200
+    expected_bytes_sent: 17
+    note: same field shape as record 2; :PATH = /api/v1/bar
+
+  - index: 4
+    path: /api/v1/baz
+    action: routerAction
+    expected_status: 200
+    expected_bytes_sent: 17
+    note: same field shape as record 2; :PATH = /api/v1/baz
+
+  - index: 5
+    path: /notfound
+    action: direct_response
+    expected_status: 404
+    expected_bytes_sent: 10  # "not found\n"
+    fields:
+      - pos: 1  name: START_TIME          tier: F
+      - pos: 2  name: ":METHOD"            tier: E  value: '"GET'
+      - pos: 3  name: ":PATH"              tier: E  value: "/notfound"
+      - pos: 4  name: PROTOCOL             tier: E  value: 'HTTP/1.1"'
+      - pos: 5  name: RESPONSE_CODE        tier: E  value: "404"
+      - pos: 6  name: RESPONSE_FLAGS       tier: S  subject_value: "-"
+      - pos: 7  name: BYTES_RECEIVED       tier: S  subject_value: "-"
+      - pos: 8  name: BYTES_SENT           tier: E  value: "10"
+      - pos: 9  name: DURATION             tier: F  predicate: "int >= 0"
+      - pos: 10 name: RESP_SVC_TIME        tier: S  subject_value: "-"
+      - pos: 11 name: X_FORWARDED_FOR      tier: S  subject_value: '"-"'
+      - pos: 12 name: USER_AGENT           tier: E  value: '"Go-http-client/1.1"'
+      - pos: 13 name: X_REQUEST_ID         tier: S  subject_value: '"-"'
+      - pos: 14 name: ":AUTHORITY"          tier: E  note: "normalized"
+      - pos: 15 name: UPSTREAM_HOST        tier: F  value: '"-"'

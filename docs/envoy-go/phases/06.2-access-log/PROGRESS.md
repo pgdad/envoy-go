@@ -491,3 +491,59 @@ $ go test -count=1 ./internal/listener/ ./cmd/envoy-go/ ./internal/filter/hcm/ -
 PASS
 ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.850s
 ```
+
+## Task 15 — Differential fixture 0006-access-log + runner registration [ADR-0068]
+
+**Commits:** TBD
+**Notes:** Created the project's first per-record access-log differential fixture. Deliverables: `test/fixtures/0006-access-log/` (envoy-go.yaml, envoy.yaml, expectations.yaml, README.md, driver/driver.go, driver/driver_test.go, backends/main.go); extended `test/differential/fixture/fixture.go` (HTTPFixedBody BackendKind=4, HostMount struct, ReferenceLogMounter + AccessLogAsserter interfaces); extended `test/differential/harness.go` (StartReferenceProxyWithMounts using HostConfig.Binds — testcontainers v0.27.0 silently drops MountTypeBind in ContainerMounts, documented in-code); extended `test/differential/runner_test.go` (blank-import driver, HTTPFixedBody backend spawn, mount+assert wiring at steps 11).
+
+Key implementation decisions: (a) BYTES_SENT fixed by moving `io.ReadAll` before `resp.Write` in `routerAction.do` so only body bytes are counted (not status-line+headers); (b) reference log polling uses 30s deadline (Envoy v1.37.2 flushes its file-access-log buffer on ~1s periodic timer; tested: flush arrives within 10s); (c) DriveReference normalizes `localhost:{port}` → `127.0.0.1:{port}` to make Go HTTP client send matching `Host` header for Tier-E AUTHORITY assertion; (d) RESP_SVC_TIME (field 10) promoted from Tier-E to Tier-S — reference Envoy injects X-Envoy-Upstream-Service-Time on routed requests (Decision A: envoy-go does not); (e) bind-mount uses Docker `HostConfig.Binds` format `"hostPath:containerPath"` — testcontainers-go v0.27.0's `MountTypeBind` is silently dropped in `mapToDockerMounts`.
+
+All 9 driver unit tests pass. Full differential suite (0000–0006, 7 fixtures) passes: `TestDifferential` PASS (21s). All 20 packages pass `go test ./...`.
+**Outputs:**
+```
+$ go test -count=1 -v -timeout 120s ./test/differential/ -run 'TestDifferential/0006'
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0006-access-log
+[... container lifecycle logs ...]
+--- PASS: TestDifferential/0006-access-log (11.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	11.365s
+
+$ go test -count=1 ./test/differential/ -v 2>&1 | grep -E 'PASS|FAIL'
+--- PASS: TestDifferential/0000-tcp-echo (1.20s)
+--- PASS: TestDifferential/0001-tcp-proxy-rr (1.20s)
+--- PASS: TestDifferential/0002-tls-tcp (1.25s)
+--- PASS: TestDifferential/0003-http11-routing (1.27s)
+--- PASS: TestDifferential/0004-h2-routing (1.65s)
+--- PASS: TestDifferential/0005-prometheus-stats (1.98s)
+--- PASS: TestDifferential/0006-access-log (11.00s)
+--- PASS: TestDifferential (19.56s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	21.060s
+
+$ go test ./... 2>&1 | grep -E '^ok|^FAIL'
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go
+ok  	github.com/esalaine/envoy-go/internal/accesslog
+ok  	github.com/esalaine/envoy-go/internal/admin
+ok  	github.com/esalaine/envoy-go/internal/bootstrap
+ok  	github.com/esalaine/envoy-go/internal/cluster
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy
+ok  	github.com/esalaine/envoy-go/internal/listener
+ok  	github.com/esalaine/envoy-go/internal/stats
+ok  	github.com/esalaine/envoy-go/internal/tls
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec
+ok  	github.com/esalaine/envoy-go/test/differential
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver
+ok  	github.com/esalaine/envoy-go/test/helpers
+
+$ grep -nE '^## ADR-0068:' docs/envoy-go/DECISIONS.md
+2448:## ADR-0068: Differential fixture 0006-access-log — three-tier equivalence matrix
+```

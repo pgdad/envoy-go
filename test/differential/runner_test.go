@@ -27,6 +27,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -141,6 +142,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
+		case fixture.HTTPFixedBody:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPFixedBodyBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
 		}
 		backends[i] = bo
 	}
@@ -149,9 +168,30 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 		backendPorts[i] = b.port
 	}
 
-	// 2. Reference proxy.
+	// 2. Reference proxy. If the driver implements ReferenceLogMounter, pre-create
+	// the host-side files and pass bind-mounts to StartReferenceProxyWithMounts.
+	// Bind mounts use HostConfig.Binds (not ContainerMounts) because testcontainers
+	// v0.27.0 silently drops MountTypeBind entries in mapToDockerMounts.
 	bootstrap := d.ReferenceBootstrap(backendPorts)
-	ref, err := StartReferenceProxy(ctx, pin, bootstrap, d.ReferenceListenerPort())
+	var ref *ReferenceProxy
+	var err error
+	if rlm, ok := d.(fixture.ReferenceLogMounter); ok {
+		hostMounts := rlm.ReferenceHostMounts()
+		for _, hm := range hostMounts {
+			// Pre-create the host file so Docker bind-mounts a file (not a dir).
+			f, ferr := os.OpenFile(hm.HostPath, os.O_CREATE|os.O_WRONLY, 0o666)
+			if ferr != nil {
+				t.Fatalf("ref mount pre-create %s: %v", hm.HostPath, ferr)
+			}
+			_ = f.Close()
+			if ferr = os.Chmod(hm.HostPath, 0o666); ferr != nil {
+				t.Fatalf("ref mount chmod %s: %v", hm.HostPath, ferr)
+			}
+		}
+		ref, err = StartReferenceProxyWithMounts(ctx, pin, bootstrap, hostMounts, d.ReferenceListenerPort())
+	} else {
+		ref, err = StartReferenceProxy(ctx, pin, bootstrap, d.ReferenceListenerPort())
+	}
 	if err != nil {
 		t.Fatalf("ref start: %v", err)
 	}
@@ -269,6 +309,14 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	// structure extension).
 	if sa, ok := d.(fixture.StatsAsserter); ok {
 		sa.AssertStats(t, ref.AdminAddr(), subj.AdminAddr())
+	}
+
+	// 11. Optional access-log equivalence assertion (phase 06.2, ADR-0068). Fires
+	// when the driver implements fixture.AccessLogAsserter. The driver holds its
+	// own per-side log-file paths (set during SubjectConfig / ReferenceBootstrap)
+	// and performs the per-record three-tier assertion in-band.
+	if ala, ok := d.(fixture.AccessLogAsserter); ok {
+		ala.AssertAccessLog(t)
 	}
 }
 
@@ -470,6 +518,27 @@ func startHTTPSH2Backend(ctx context.Context, repoRoot string, port, idx int) (*
 // Introduced for fixture 0005's controlled-502 path (ADR-0062).
 func startHTTPStatusHeaderBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0005-prometheus-stats/backends",
+		"--port", fmt.Sprintf("%d", port),
+	)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	return cmd, nil
+}
+
+// startHTTPFixedBodyBackend spawns the fixture-0006 HTTP/1.1 fixed-body backend
+// subprocess on port. The backend returns 200 OK with a fixed 17-byte body
+// "backend:v1/fixed\n" for any GET request, regardless of path or backend index.
+// No TLS. Introduced for fixture 0006's BYTES_SENT Tier-E equality (ADR-0068):
+// byte-identical body length across all endpoints keeps BYTES_SENT equal despite
+// RR divergence. Because the backend is a subprocess, the runner's in-process
+// accept counter is NOT incremented.
+func startHTTPFixedBodyBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0006-access-log/backends",
 		"--port", fmt.Sprintf("%d", port),
 	)
 	cmd.Dir = repoRoot

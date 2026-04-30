@@ -2442,3 +2442,49 @@ The bootstrap parser READS HCM `access_log[]` as a list of any length; each entr
 ### Lands-in-task
 
 Task 7 (the bootstrap parser extension; first use of the option-β rejection in production code). Supersedes nothing; complements ADR-0065.
+
+---
+
+## ADR-0068: Differential fixture 0006-access-log — three-tier equivalence matrix
+
+**Status:** Accepted
+**Date:** 2026-04-30
+
+### Context
+
+Phase 06.2 ships access-log emission in envoy-go. The differential suite verifies that envoy-go's per-request access-log records are equivalent to reference Envoy v1.37.2 on the 15-operator default format. However, not all 15 operators can be byte-equal across both sides:
+
+- Some operators are inherently non-deterministic (timestamps, request IDs) or per-side (upstream host address).
+- Some operators envoy-go deliberately omits per Decision A (the Tier-S operators: RESPONSE_FLAGS, BYTES_RECEIVED, X-FORWARDED-FOR, X-REQUEST-ID, RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)).
+- The remaining operators should be byte-equal across both sides for the same workload.
+
+A single "byte-equal or skip" policy would either over-constrain (failing on valid divergences) or under-constrain (missing real bugs). A three-tier matrix is needed.
+
+### Decision
+
+Adopt a three-tier equivalence matrix for fixture 0006-access-log:
+
+**Tier E (byte-equal, 7 operators):** `:METHOD`, `:PATH`, `PROTOCOL`, `RESPONSE_CODE`, `BYTES_SENT`, `USER-AGENT`, `:AUTHORITY` — cross-side byte-equal (after host-part normalization for AUTHORITY).
+
+**Tier F (format-only, 3 operators):** `START_TIME` (RFC3339 ms-precision UTC on both sides), `DURATION` (int ms ≥ 0 on both sides), `UPSTREAM_HOST` (either both "-" for direct_response, or both `host:port`-shaped for routed).
+
+**Tier S (subject emits "-", 5 operators):** `RESPONSE_FLAGS`, `BYTES_RECEIVED`, `X-FORWARDED-FOR`, `X-REQUEST-ID`, `RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)` — subject MUST emit literal "-" (Decision A / not implemented in phase 06.2); reference unconstrained.
+
+BYTES_SENT is Tier-E: envoy-go's `routerAction.do` reads the upstream response body into a buffer (via `io.ReadAll`), records `bytesSent = len(bodyBytes)`, then writes the full HTTP/1.1 response downstream. This isolates the body-byte count from the wire framing bytes (status line + headers), matching Envoy's BYTES_SENT semantics (body bytes only).
+
+### Alternatives considered
+
+- (A) Two-tier (equal vs. skip) — REJECTED. Does not distinguish "must be equal" (BYTES_SENT) from "format-check only" (START_TIME) from "subject-must-emit-dash" (X-REQUEST-ID). Conflating these loses signal on Tier-E regressions.
+- (B) Skip-all non-equal fields — REJECTED. Would not catch a regression where BYTES_SENT drifts to 0 or to a wrong value.
+
+### Consequences
+
+- (a) `fixture.ReferenceLogMounter`, `fixture.AccessLogAsserter`, `fixture.HostMount` interfaces added to `test/differential/fixture/fixture.go`.
+- (b) `StartReferenceProxyWithMounts` added to `test/differential/harness.go` using `HostConfig.Binds` (testcontainers-go v0.27.0 silently drops `ContainerMounts` bind entries in `mapToDockerMounts` — workaround documented in-code).
+- (c) Fixture 0006-access-log: driver, backends, config templates, expectations.yaml, README.md.
+- (d) Reference log polling uses a 30s deadline (Envoy v1.37.2 flushes its file-access-log buffer on a ~1s periodic timer; 30s guarantees ≥5 flushes within the poll window).
+- (e) `DriveReference` normalizes `localhost:{port}` → `127.0.0.1:{port}` so the Go HTTP client sends `Host: 127.0.0.1:{port}`, matching the subject side and satisfying the Tier-E AUTHORITY assertion.
+
+### Lands-in-task
+
+Task 15 (differential fixture 0006-access-log + runner registration). Supersedes nothing; extends the differential suite architecture established by ADR-0028.
