@@ -189,7 +189,7 @@ $ grep -n '^## ADR-0069:' docs/envoy-go/DECISIONS.md
 
 ## Task 6 — `internal/accesslog/fuzz_test.go` — FuzzAccessLogFormat (eighth fuzzer)
 
-**Commits:** TBD
+**Commits:** `fa161a1`
 **Notes:** Created `internal/accesslog/fuzz_test.go` with `FuzzAccessLogFormat(f *testing.F)` — the eighth fuzzer per Decision J + SPEC §1 #10 + §14.6. The fuzzer validates robustness of the `Default` formatter against malformed, control-laden, and edge-case inputs. Six seed corpus cases cover: normal inputs (case 0), embedded LF in fields (case 1), embedded quote in fields (case 2), NUL bytes (case 3), large strings (case 4, 2048 'a's), and 8-bit sequences (case 5, `\xff\x80\x81` etc.). Each test invocation: (1) constructs a `Record` with fuzzer-provided inputs for method, path, protocol, authority, user-agent, and upstream host; (2) calls `Default(rec)` within a panic-catch handler (verifying no panic); (3) asserts no embedded LF in the output body (line-stream invariant — output is exactly one line ending with `\n`); (4) counts un-escaped quotes and verifies count is even (matched pairs — every quote either escaped or quoted-off).
 
 **Outputs:**
