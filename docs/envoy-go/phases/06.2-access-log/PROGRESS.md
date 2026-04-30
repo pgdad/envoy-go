@@ -297,7 +297,7 @@ $ grep -nE 'AccessLogConfigs' internal/bootstrap/bootstrap.go
 
 ## Task 8 — `Cluster.Dial` / `DialH2` return-tuple expansion (surface picked endpoint)
 
-**Commits:** TBD — this task's commit
+**Commits:** `6ba3905`
 **Notes:** Widened `Cluster.Dial(ctx) (net.Conn, error)` → `(net.Conn, Endpoint, error)` and `Cluster.DialH2(ctx) (*h2.ClientConn, error)` → `(*h2.ClientConn, Endpoint, error)`. All error paths return `Endpoint{}` (zero value); success paths surface the `ep` variable already captured by `PickEndpoint()`. Updated all call sites: `internal/filter/hcm/actions.go` (both `routerAction.do` and `routerActionH2.doH2`) and `internal/filter/tcpproxy/filter.go` use receive-but-discard `_` per PLAN Task 8 (Tasks 12–13 will replace `_` with `picked`). All existing tests in `cluster_test.go` and `dial_h2_test.go` updated to the new 3-tuple form. One new test per dial method added: `TestCluster_Dial_ReturnsPickedEndpoint` and `TestCluster_DialH2_ReturnsPickedEndpoint` each assert `ep.Host` non-empty and endpoint matches configured listener address.
 **Outputs:**
 ```
