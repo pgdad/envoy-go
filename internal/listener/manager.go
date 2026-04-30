@@ -15,6 +15,7 @@ import (
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
@@ -45,30 +46,31 @@ type listenerCtx struct {
 }
 
 // filterConstructor builds a filterHandler from a typed_config Any, the
-// resolved cluster manager, per-chain listenerCtx, and the Registry the HCM
-// constructor will use to allocate its 5 per-instance metrics at Task 11.
-// Phase 05.1 adds lc; phase 06.1 (Task 10) adds registry — the HCM-factory
-// closure captures it so per-HCM-instance metric allocation works at filter-
-// build time. The TCP-proxy constructor ignores it (no per-tcp_proxy metrics
-// in 06.1).
-type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry) (filterHandler, error)
+// resolved cluster manager, per-chain listenerCtx, the Registry the HCM
+// constructor will use to allocate its 5 per-instance metrics at Task 11,
+// and the accessLogSinks slice threaded from main.go at Task 14.
+// Phase 05.1 adds lc; phase 06.1 (Task 10) adds registry; phase 06.2 (Task 14)
+// adds accessLogSinks. The TCP-proxy constructor ignores both registry and sinks
+// (no per-tcp_proxy metrics or access logging in phase 06.2).
+type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink) (filterHandler, error)
 
 // filterRegistry maps a filter typed_config.type_url to its constructor.
 // SPEC §5.3: inline; phase 07 generalises.
 var filterRegistry = map[string]filterConstructor{
-	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx, _ *stats.Registry) (filterHandler, error) {
+	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx, _ *stats.Registry, _ []accesslog.Sink) (filterHandler, error) {
 		f, err := tcpproxy.NewFilter(tc, cm)
 		if err != nil {
 			return nil, err
 		}
 		return f, nil
 	},
-	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry) (filterHandler, error) {
+	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink) (filterHandler, error) {
 		// Bridge listenerCtx into hcm.ListenerCtx (the public shape exposed by
 		// hcm so that the listener manager doesn't import hcm-internal types).
-		// Phase 06.1 Task 11: the Registry is now consumed by NewFilterWithCtx
+		// Phase 06.1 Task 11: the Registry is now consumed by NewFilterWithCtxAndSinks
 		// to allocate the 5 HCM-scope per-instance metrics per SPEC §6.
-		f, err := hcm.NewFilterWithCtx(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C}, registry)
+		// Phase 06.2 Task 14: accessLogSinks are the opened AsyncFileSinks from main.go.
+		f, err := hcm.NewFilterWithCtxAndSinks(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C}, registry, accessLogSinks)
 		if err != nil {
 			return nil, err
 		}
@@ -123,7 +125,7 @@ type Manager struct {
 // boot sequence freezes only after the listener manager and admin server are
 // up — Task 12 owns that ordering per SPEC §5.4).
 func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.Registry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
@@ -134,7 +136,7 @@ func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.
 //
 // Phase 06.1 (Task 10): see NewManager doc — same Registry contract applies.
 func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, registry *stats.Registry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil)
 }
 
 // NewManagerWithBaseDirAndAllowH2C is the phase-05.1 constructor variant. It
@@ -151,7 +153,7 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 // filter-build time, AND it is the Registry on which the 2 listener-scope
 // metrics are allocated by registerListenerMetrics at this constructor's
 // per-listener loop.
-func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry) (*Manager, error) {
+func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink) (*Manager, error) {
 	ls := bs.GetStaticResources().GetListeners()
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
@@ -159,7 +161,7 @@ func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Man
 	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks)
 		if err != nil {
 			return nil, err
 		}
@@ -213,8 +215,9 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 // listenerRuntime (including all chainInfo entries). allowH2C is threaded into
 // each per-chain listenerCtx passed to the filter constructors. registry is
 // captured into the HCM-factory closure for per-HCM-instance metric allocation
-// at Task 11. No socket is bound here.
-func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry) (*listenerRuntime, error) {
+// at Task 11. accessLogSinks are the opened AsyncFileSinks from main.go
+// (Task 14); nil means no access logging. No socket is bound here.
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -271,7 +274,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 			return nil, fmt.Errorf("listener: %q: filter_chains[%d]: unknown filter type_url %q", name, i, tc.GetTypeUrl())
 		}
 		lc := listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C}
-		fh, err := ctor(tc, cm, lc, registry)
+		fh, err := ctor(tc, cm, lc, registry, accessLogSinks)
 		if err != nil {
 			return nil, fmt.Errorf("listener: %q: filter_chains[%d]: %w", name, i, err)
 		}

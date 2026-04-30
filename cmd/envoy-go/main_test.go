@@ -422,6 +422,118 @@ static_resources:
 	}
 }
 
+// TestEnvoyGoBinary_AccessLogSmoke boots the binary with an HCM listener that
+// has a file access_log configured, makes one HTTP/1.1 request, and asserts
+// that the access-log file is non-empty after the process exits (write-on-close
+// flush). The log path is inside t.TempDir() so it is cleaned up automatically.
+//
+// Verifies SPEC §5.3 boot wiring: the AsyncFileSink is opened by main.go and
+// threaded through to the HCM filter via the listener manager.
+func TestEnvoyGoBinary_AccessLogSmoke(t *testing.T) {
+	listenerPort := freeTCPPort(t)
+	adminPort := freeTCPPort(t)
+
+	tmp := t.TempDir()
+	bin := buildBinaryOrSkip(t)
+
+	logPath := filepath.Join(tmp, "access.log")
+
+	cfgPath := filepath.Join(tmp, "envoy-go.yaml")
+	cfg := fmt.Sprintf(`
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: %s
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+`, adminPort, listenerPort, logPath)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+
+	addrs := waitForReadySentinels(t, stdout, []string{"l_http"}, 15*time.Second)
+
+	listenerAddr := addrs["l_http"]
+	conn, err := net.DialTimeout("tcp", listenerAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = conn.Write([]byte("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
+	body, _ := io.ReadAll(conn)
+	if !strings.Contains(string(body), "HTTP/1.1 200 OK") {
+		t.Fatalf("unexpected response: %s", body)
+	}
+
+	// Signal shutdown so the defer-Close on the sink flushes buffered entries.
+	_ = cmd.Process.Signal(os.Interrupt)
+	_, _ = cmd.Process.Wait()
+
+	// Assert the access-log file is non-empty: at least one line was written.
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read access log %q: %v", logPath, err)
+	}
+	if len(logData) == 0 {
+		t.Errorf("access log %q is empty — sink not flushed or not wired", logPath)
+	}
+}
+
 // TestEnvoyGoBinary_H2Smoke exercises the phase-05.1 dataplane: a single
 // HTTP/2-over-TLS listener with ALPN "h2", serving an HCM direct_response.
 // Asserts that:

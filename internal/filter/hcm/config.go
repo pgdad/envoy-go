@@ -98,6 +98,15 @@ func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, 
 	return parseFilterWithCtx(tc, clusters, lc, registry, nil)
 }
 
+// NewFilterWithCtxAndSinks is the phase-06.2 constructor variant. It extends
+// NewFilterWithCtx with an accessLogSinks slice so that cmd/envoy-go/main.go
+// can thread the opened AsyncFileSinks through to the HCM filter at build
+// time. A nil or empty slice is treated as "no access logging" and is safe
+// to pass — NewFilterWithCtx delegates here with nil.
+func NewFilterWithCtxAndSinks(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink) (*Filter, error) {
+	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks)
+}
+
 // parseFilter is the legacy entry point retained for existing tests.
 // It delegates to parseFilterWithCtx with a zero-value ListenerCtx and a
 // fresh throwaway Registry (legacy callers do not exercise the metric

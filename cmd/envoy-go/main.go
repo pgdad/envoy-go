@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/admin"
 	"github.com/esalaine/envoy-go/internal/bootstrap"
 	"github.com/esalaine/envoy-go/internal/cluster"
@@ -54,13 +55,32 @@ func main() {
 		log.Fatalf("cluster manager: %v", err)
 	}
 
+	// Phase 06.2 (Task 14): open one AsyncFileSink per access_log[] file entry
+	// parsed by bootstrap.Load. A single dropped counter is shared across all
+	// sinks per ADR-0069. The defer fires after lm.Stop() (defers are LIFO)
+	// so in-flight log records have been flushed before the files are closed.
+	droppedCounter := accesslog.RegisterDroppedCounter(bs.Stats)
+	sinks := make([]accesslog.Sink, 0, len(bs.AccessLogConfigs))
+	for _, cfg := range bs.AccessLogConfigs {
+		sink, err := accesslog.NewAsyncFileSink(cfg.Path, droppedCounter)
+		if err != nil {
+			log.Fatalf("accesslog: open %q: %v", cfg.Path, err)
+		}
+		sinks = append(sinks, sink)
+	}
+	defer func() {
+		for _, s := range sinks {
+			_ = s.Close()
+		}
+	}()
+
 	admSrv := admin.New(adminAddr, bs.Stats)
 	if _, err := admSrv.Start(); err != nil {
 		log.Fatalf("admin start %s: %v", adminAddr, err)
 	}
 	defer func() { _ = admSrv.Close() }()
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

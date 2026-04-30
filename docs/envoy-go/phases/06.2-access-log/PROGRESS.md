@@ -465,3 +465,29 @@ $ grep -nE 'emitAccessLogH2' internal/filter/hcm/h2dispatch.go internal/filter/h
 internal/filter/hcm/h2dispatch.go:96:	defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)
 internal/filter/hcm/actions.go:267:			r.filter.emitAccessLogH2(req, statusForHCM, int64(bytesSentH2), picked, start)
 ```
+
+## Task 14 — `cmd/envoy-go/main.go` — open AsyncFileSinks + thread + defer Close
+
+**Commits:** `TBD`
+**Notes:** Widened `hcm.NewFilterWithCtxAndSinks` (new exported function in `config.go`) that delegates to `parseFilterWithCtx` with the sinks slice — `NewFilterWithCtx` continues to call with `nil` preserving backward compat. In `internal/listener/manager.go`: added `"github.com/esalaine/envoy-go/internal/accesslog"` import; widened `filterConstructor` type with trailing `[]accesslog.Sink` parameter; updated `tcpproxy` and `hcm` closures in `filterRegistry` (`hcm` now calls `NewFilterWithCtxAndSinks`); widened `buildListenerRuntimeWithCtx` with `accessLogSinks []accesslog.Sink` and threads it to the constructor call; widened `NewManagerWithBaseDirAndAllowH2C` with the same parameter; `NewManager` and `NewManagerWithBaseDir` delegate with `nil` (strategy b — minimal diff). In `cmd/envoy-go/main.go`: added `"github.com/esalaine/envoy-go/internal/accesslog"` import; after `cluster.NewManagerWithBaseDir` success, call `accesslog.RegisterDroppedCounter(bs.Stats)` and loop over `bs.AccessLogConfigs` opening each `NewAsyncFileSink`; added a `defer func(){ for _, s := range sinks { _ = s.Close() } }()` placed before the `admSrv` and `lm` constructions so it fires (LIFO) after `lm.Stop()` + `admSrv.Close()`, ensuring in-flight log records flush before files close; pass `sinks` to `NewManagerWithBaseDirAndAllowH2C`. Updated `internal/listener/manager_test.go`: both `NewManagerWithBaseDirAndAllowH2C` call sites pass `nil` for the new parameter. Added `TestEnvoyGoBinary_AccessLogSmoke` to `cmd/envoy-go/main_test.go`: boots binary with HCM access_log pointing to a temp file, makes one HTTP/1.1 GET, signals SIGINT shutdown, then asserts the log file is non-empty.
+**Outputs:**
+```
+$ go build ./...
+(no output — clean)
+
+$ go vet ./...
+(no output — clean)
+
+$ go test -count=1 ./internal/listener/ ./cmd/envoy-go/ ./internal/filter/hcm/ -v 2>&1 | tail -20
+--- PASS: TestEnvoyGoBinary_TwoListenerCutover (0.57s)
+=== RUN   TestEnvoyGoBinary_HCMSmoke
+--- PASS: TestEnvoyGoBinary_HCMSmoke (0.53s)
+=== RUN   TestMain_StatsPrometheusEndpointResponds
+--- PASS: TestMain_StatsPrometheusEndpointResponds (0.57s)
+=== RUN   TestEnvoyGoBinary_AccessLogSmoke
+--- PASS: TestEnvoyGoBinary_AccessLogSmoke (0.60s)
+=== RUN   TestEnvoyGoBinary_H2Smoke
+--- PASS: TestEnvoyGoBinary_H2Smoke (0.57s)
+PASS
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.850s
+```

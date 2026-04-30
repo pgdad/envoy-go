@@ -1297,7 +1297,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry())
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1317,7 +1317,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry())
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil)
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
