@@ -1212,3 +1212,42 @@ $ # All four anticipated 06.2 ADRs anchored.
 **Differential surface:** gate (a) fixture-0006-access-log PASS non-vacuous (reference Envoy at the ENVOY_TARGET pin); gate (b) 6/6 pre-existing fixtures PASS (0000/0001/0002/0003/0004/0005). **Conformance:** h2spec 53/53 PASS at the pinned summerwind SHA. **Fuzz:** 8/8 PASS (all 7 pre-existing seed corpora + `FuzzAccessLogFormat` -fuzztime=30s); the previously-failing target `FuzzAccessLogFormat` now runs the full 30 s budget without any crasher: the `escape()` catalog extension at `3fe7fbf` per RFC 4180 / reference Envoy convention, plus the parseability-invariant heuristic strengthening, eliminate the prior bug. Gate (e) part 2 inherits the durable regression seed at `internal/accesslog/testdata/fuzz/FuzzAccessLogFormat/1bdc705d534eee86` and the three RED-then-GREEN unit tests in `internal/accesslog/format_test.go` and passes them all under `-race` along with the 19 other test packages.
 
 STATE → lifecycle-state 5 with `next-skill: superpowers:requesting-code-review` per BOOTSTRAP §5 step 4 → step 5. ROADMAP rows unchanged (06 + 06.2 stay `in-progress`); ROADMAP transitions land at the lifecycle-state 6 phase-done commit per BOOTSTRAP §5 step 6.
+
+## Review-followup re-verification (lifecycle-state 4) — PASSED
+
+Per BOOTSTRAP §5.2 review-feedback re-entry analogue + the 06.1 review-followup re-verification precedent at `5ddef1b`: after the I-2 close at `9f7b68f` (BEHAVIOR_CONTRACT.md `## Access log field mapping` `### Empirical evidence` verbatim re-paste from SPEC §11), this re-verification confirms the doc-only fix didn't break anything code-side. Worktree `.worktrees/phase-06.2-access-log-review-followup`, branch `phase/06.2-access-log-review-followup`. Verifier date: 2026-04-30. Mirrors the 06.1 review-followup re-verification at `5ddef1b`.
+
+**Outcome: gate (e) GREEN.** Gates (a)/(b)/(c)/(d) carry forward unchanged from `d0e13ae` verify-2 (no code, test, fixture, or testdata changes since that verification — only the BEHAVIOR_CONTRACT.md doc-only edit at `9f7b68f`). Gate (f) closed by REVIEW.md at `dbff215`.
+
+```
+$ go vet ./...
+(exit 0, no output)
+
+$ golangci-lint run ./...
+(exit 0, no output)
+
+$ go test -race -count=1 -timeout 600s ./... 2>&1 | grep -E '^(ok|FAIL)'
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.133s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.015s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.069s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.045s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.048s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.494s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	8.411s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.042s
+ok  	github.com/esalaine/envoy-go/internal/listener	1.059s
+ok  	github.com/esalaine/envoy-go/internal/stats	1.037s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.092s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.172s
+ok  	github.com/esalaine/envoy-go/test/differential	23.029s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.017s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.016s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.013s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.018s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.027s
+(20 packages: all ok, no FAIL, no DATA RACE warnings)
+```
+
+STATE advances 3 → 4. The next commit advances 4 → 5 (mirrors 06.1's `46b3435`); the commit after that is the phase-done commit advancing 5 → 6 with ROADMAP rows 06 + 06.2 → done flipped at the same commit per parent SPEC §5 closure pattern.
