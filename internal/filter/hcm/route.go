@@ -76,3 +76,20 @@ func (t *routeTable) match(req *http.Request) (*routeEntry, bool) {
 	}
 	return nil, false
 }
+
+// bindFilter sets the filter backpointer on every action in the route table
+// that requires it for access-log emission. Called from parseFilterWithCtx
+// after the *Filter is constructed (the actions are built before the Filter
+// exists, so this post-build step completes the wiring per Task 12 pattern).
+func (t *routeTable) bindFilter(f *Filter) {
+	for i := range t.routes {
+		switch a := t.routes[i].action.(type) {
+		case *directResponseAction:
+			a.filter = f
+		case *routerAction:
+			a.filter = f
+		case *routerActionH2:
+			a.filter = f
+		}
+	}
+}

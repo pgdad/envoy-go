@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -46,6 +47,7 @@ var errCloseAfterAction = errors.New("hcm: action requested connection close")
 type directResponseAction struct {
 	status   int
 	bodyText string
+	filter   *Filter // set post-build by routeTable.bindFilter; nil when no sinks configured.
 }
 
 // body returns the synthesized response in codec-neutral form per SPEC §5.5
@@ -92,7 +94,17 @@ func (a *directResponseAction) writeH2(sw h2.StreamWriter) error {
 // Phase 06.1 Task 11: returns (a.status, error). The configured direct_response
 // status is the finalized response code; runConnection Inc's the matching
 // downstream_rq_<Nxx> bucket from this return.
-func (a *directResponseAction) do(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, error) {
+//
+// Phase 06.2 Task 12: emits access-log record via a.filter.emitAccessLog on
+// return. bytesSent is len(bodyText) — the wire bytes for the inline body per
+// SPEC §12 #3 (direct_response writes no upstream bytes; only the local body).
+func (a *directResponseAction) do(_ context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
+	start := time.Now()
+	defer func() {
+		if a.filter != nil {
+			a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)
+		}
+	}()
 	return a.status, a.writeH1(bw)
 }
 
@@ -110,6 +122,7 @@ func (a *directResponseAction) do(_ context.Context, _ *http.Request, bw *bufio.
 // (modulo stdlib's textproto canonicalization on header names).
 type routerAction struct {
 	cluster *cluster.Cluster
+	filter  *Filter // set post-build by routeTable.bindFilter; nil when no sinks configured.
 }
 
 // do drives one upstream H1 round-trip. Phase 06.1 Task 11 wires the cluster-
@@ -126,14 +139,29 @@ type routerAction struct {
 // err is the routeAction error (errCloseAfterAction sentinel or a real
 // write-side failure).
 func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
+	start := time.Now()
+	// byteCounterWriter wraps bw so response body bytes flowing through
+	// resp.Write are counted for BYTES_SENT per SPEC §12 #3 option (a).
+	bcw := &byteCounterWriter{w: bw}
+
+	// statusCode and picked are captured by the deferred access-log emit so
+	// the closure always reads the final values after all writes have completed.
+	statusCode := 0
+	picked := cluster.Endpoint{}
+	if a.filter != nil {
+		defer func() { a.filter.emitAccessLog(req, statusCode, bcw.n, picked, start) }()
+	}
+
 	a.cluster.IncUpstreamRqTotal()
 
-	upstream, _, err := a.cluster.Dial(ctx)
+	upstream, ep, err := a.cluster.Dial(ctx)
 	if err != nil {
 		a.cluster.IncStatusClass(503)
-		return 503, writeStatusReply(bw, 503, "")
+		statusCode = 503
+		return 503, writeStatusReply(bcw, 503, "")
 	}
 	defer func() { _ = upstream.Close() }()
+	picked = ep
 
 	// Propagate the downstream ctx deadline (if any) to the upstream socket
 	// so a stalled upstream cannot hold the action past the ctx's deadline
@@ -145,19 +173,22 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 
 	if err := req.Write(upstream); err != nil {
 		a.cluster.IncStatusClass(502)
-		return 502, writeStatusReply(bw, 502, "")
+		statusCode = 502
+		return 502, writeStatusReply(bcw, 502, "")
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
 	if err != nil {
 		a.cluster.IncStatusClass(502)
-		return 502, writeStatusReply(bw, 502, "")
+		statusCode = 502
+		return 502, writeStatusReply(bcw, 502, "")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	a.cluster.IncStatusClass(resp.StatusCode)
+	statusCode = resp.StatusCode
 
-	if err := resp.Write(bw); err != nil {
+	if err := resp.Write(bcw); err != nil {
 		return resp.StatusCode, err
 	}
 	// Honor the upstream's Connection: close (and HTTP/1.0 close-by-default)
@@ -197,6 +228,7 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 // see the do method's docstring for the rationale).
 type routerActionH2 struct {
 	cluster *cluster.Cluster
+	filter  *Filter // set post-build by routeTable.bindFilter; nil when no sinks configured.
 }
 
 // doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip

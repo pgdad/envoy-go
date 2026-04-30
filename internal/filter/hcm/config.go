@@ -173,7 +173,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 	}
 
 	prefix := "http." + statPrefix + "."
-	return &Filter{
+	f := &Filter{
 		table:             table,
 		clusters:          clusters,
 		statPrefix:        statPrefix,
@@ -184,7 +184,14 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		downstreamRq4xx:   registry.NewCounter(prefix + "downstream_rq_4xx"),
 		downstreamRq5xx:   registry.NewCounter(prefix + "downstream_rq_5xx"),
 		accessLog:         accessLogSinks,
-	}, nil
+	}
+	// Task 12: bind the filter backpointer on every action so emit-deferral
+	// sites in directResponseAction.do, routerAction.do, and routerActionH2.doH2
+	// can call f.emitAccessLog / f.emitAccessLogH2. The actions are built before
+	// the Filter exists (buildRouteTable is called above), so this post-build
+	// step completes the wiring.
+	table.bindFilter(f)
+	return f, nil
 }
 
 func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteConfiguration, error) {

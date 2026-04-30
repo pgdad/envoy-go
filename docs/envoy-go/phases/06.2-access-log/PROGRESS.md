@@ -411,3 +411,31 @@ FAIL	github.com/esalaine/envoy-go/internal/filter/hcm [build failed]
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.003s
 ```
+
+## Task 12 — HCM H1 emit-deferral sites (directResponseAction.do + routerAction.do)
+
+**Commits:** TBD
+**Notes:** Added `filter *Filter` field to `directResponseAction`, `routerAction`, and `routerActionH2` structs (the H2 field is wired at Task 13; added now so `routeTable.bindFilter` compiles). Added `routeTable.bindFilter(f *Filter)` to `route.go`: iterates routes and sets the filter backpointer on each action that holds one; called from `parseFilterWithCtx` after the `*Filter` is constructed (actions are built before Filter exists — post-build wiring pattern). Modified `directResponseAction.do` to record `start := time.Now()` and defer `a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)` guarded by `a.filter != nil`. Modified `routerAction.do` to wrap `bw` in `byteCounterWriter` (counts downstream bytes via `resp.Write(bcw)`), capture `picked` from `Cluster.Dial`, and register a single top-of-function defer (closure capturing `statusCode` and `picked` by reference) that reads the final values after all writes; `statusCode` is set on each early-return path (503 for dial-failure, 502 for write/read failure, `resp.StatusCode` on success). Added 4 new tests: `TestDirectResponseAction_EmitsAccessLog`, `TestDirectResponseAction_NilFilter_DoesNotPanic`, `TestRouterAction_EmitsAccessLog_HappyPath`, `TestRouterAction_EmitsAccessLog_DialFailure`. All pass. Import `github.com/esalaine/envoy-go/internal/accesslog` added to `actions_test.go`. Deviation: the defer-count grep finds 1 literal `defer.*emitAccessLog(` in actions.go (directResponseAction path) plus 1 inside a `defer func(){...}()` closure (routerAction path) — both fire on return; the plan's "≥2 matches" was approximate, functional coverage is complete.
+**Outputs:**
+```
+$ go test -count=1 ./internal/filter/hcm/ -v -run 'TestDirectResponseAction_EmitsAccessLog|TestDirectResponseAction_NilFilter|TestRouterAction_EmitsAccessLog'
+=== RUN   TestDirectResponseAction_EmitsAccessLog
+--- PASS: TestDirectResponseAction_EmitsAccessLog (0.00s)
+=== RUN   TestDirectResponseAction_NilFilter_DoesNotPanic
+--- PASS: TestDirectResponseAction_NilFilter_DoesNotPanic (0.00s)
+=== RUN   TestRouterAction_EmitsAccessLog_HappyPath
+--- PASS: TestRouterAction_EmitsAccessLog_HappyPath (0.00s)
+=== RUN   TestRouterAction_EmitsAccessLog_DialFailure
+--- PASS: TestRouterAction_EmitsAccessLog_DialFailure (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.006s
+
+$ go test -count=1 ./internal/filter/hcm/ 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.220s
+
+$ grep -nE 'emitAccessLog' internal/filter/hcm/actions.go
+98:// Phase 06.2 Task 12: emits access-log record via a.filter.emitAccessLog on
+103:	defer func() {
+105:			a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)
+152:		defer func() { a.filter.emitAccessLog(req, statusCode, bcw.n, picked, start) }()
+```

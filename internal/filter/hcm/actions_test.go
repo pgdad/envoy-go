@@ -37,6 +37,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -933,6 +934,120 @@ func TestRouterActionH2_Upstream5xxForwardedVerbatim(t *testing.T) {
 	}
 	if len(w.data) != 1 || !bytes.Equal(w.data[0], body) {
 		t.Errorf("body forwarded = %q, want %q", w.data, body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 06.2 Task 12 — H1 emit-deferral tests
+// ---------------------------------------------------------------------------
+
+// TestDirectResponseAction_EmitsAccessLog verifies that directResponseAction.do
+// submits exactly one access-log record with the correct ResponseCode and
+// BytesSent (== len(bodyText)) when a Filter with a capture sink is wired.
+func TestDirectResponseAction_EmitsAccessLog(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{accessLog: []accesslog.Sink{cs}}
+	a := &directResponseAction{status: 200, bodyText: "OK\n", filter: f}
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := a.do(context.Background(), req, bw); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	_ = bw.Flush()
+
+	if len(cs.recs) != 1 {
+		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	}
+	r := cs.recs[0]
+	if r.ResponseCode != 200 {
+		t.Errorf("ResponseCode = %d, want 200", r.ResponseCode)
+	}
+	if r.BytesSent != 3 {
+		t.Errorf("BytesSent = %d, want 3 (len(\"OK\\n\"))", r.BytesSent)
+	}
+	if r.UpstreamHost != "" {
+		t.Errorf("UpstreamHost = %q, want empty (direct_response)", r.UpstreamHost)
+	}
+}
+
+// TestDirectResponseAction_NilFilter_DoesNotPanic verifies that
+// directResponseAction.do is safe when filter is nil (no sinks wired).
+func TestDirectResponseAction_NilFilter_DoesNotPanic(t *testing.T) {
+	a := &directResponseAction{status: 404, bodyText: "not found\n", filter: nil}
+	req, _ := http.NewRequest("GET", "/missing", nil)
+	req.Proto = "HTTP/1.1"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	// Must not panic.
+	if _, err := a.do(context.Background(), req, bw); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+}
+
+// TestRouterAction_EmitsAccessLog_HappyPath verifies that routerAction.do
+// submits one access-log record with a non-empty UpstreamHost and BytesSent > 0
+// when the upstream responds successfully.
+func TestRouterAction_EmitsAccessLog_HappyPath(t *testing.T) {
+	addr, stop := loopbackHTTPEcho(t)
+	defer stop()
+
+	cs := &emitCaptureSink{}
+	f := &Filter{accessLog: []accesslog.Sink{cs}}
+	c := singleEndpointCluster(t, addr)
+	a := &routerAction{cluster: c, filter: f}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
+		t.Fatalf("do: %v", err)
+	}
+	_ = bw.Flush()
+
+	if len(cs.recs) != 1 {
+		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	}
+	r := cs.recs[0]
+	if r.ResponseCode != 200 {
+		t.Errorf("ResponseCode = %d, want 200", r.ResponseCode)
+	}
+	if r.BytesSent <= 0 {
+		t.Errorf("BytesSent = %d, want > 0", r.BytesSent)
+	}
+	if r.UpstreamHost == "" {
+		t.Errorf("UpstreamHost is empty, want non-empty (routed request)")
+	}
+}
+
+// TestRouterAction_EmitsAccessLog_DialFailure verifies that routerAction.do
+// emits an access-log record with status 503 and an empty UpstreamHost on
+// the dial-failure path (port 1 is always rejected).
+func TestRouterAction_EmitsAccessLog_DialFailure(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{accessLog: []accesslog.Sink{cs}}
+	c := singleEndpointCluster(t, "127.0.0.1:1")
+	a := &routerAction{cluster: c, filter: f}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	_, _ = a.do(req.Context(), req, bw)
+	_ = bw.Flush()
+
+	if len(cs.recs) != 1 {
+		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	}
+	r := cs.recs[0]
+	if r.ResponseCode != 503 {
+		t.Errorf("ResponseCode = %d, want 503 (dial-failure local-reply)", r.ResponseCode)
+	}
+	if r.UpstreamHost != "" {
+		t.Errorf("UpstreamHost = %q, want empty on dial failure", r.UpstreamHost)
 	}
 }
 
