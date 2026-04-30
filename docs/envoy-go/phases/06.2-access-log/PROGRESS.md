@@ -64,6 +64,43 @@ ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
  4 files changed, 130 insertions(+), 4 deletions(-)
 ```
 
+## Task 4 — `internal/accesslog/writer.go` — AsyncFileSink + drop-newest backpressure
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/accesslog/writer.go` with `AsyncFileSink`: bounded 4096-cap channel (drop-newest discipline per ADR-0066); `NewAsyncFileSink` opens path with `O_APPEND|O_CREATE|O_WRONLY 0644` and spawns writer goroutine; `Submit` does a non-blocking channel send — on full channel increments the `*stats.Counter` (ADR-0069 `server.accesslog_dropped`) and emits a rate-limited diagnostic (at most once per second via `atomic.Int64` + `CompareAndSwap`); `Close` is idempotent+threadsafe via `sync.Once` — closes the channel, waits for the writer goroutine to drain (blocking on `<-s.done`), then closes the file descriptor. Created `internal/accesslog/writer_test.go` with 5 TDD tests: happy-path 5-records-land-5-lines, concurrent 8×100 submit race-clean, drop-newest full-channel increments counter (capacity-1 sink + 100 submits), Close idempotent (double-close no error), Close drains pending (50 queued records → non-empty file). `stats.Counter.Load()` returns `uint64`; test comparisons against `0` are untyped and compile without cast.
+
+**Outputs:**
+```
+# RED — go test -race ./internal/accesslog/ -run TestAsyncFileSink -v (before writer.go)
+# github.com/esalaine/envoy-go/internal/accesslog [github.com/esalaine/envoy-go/internal/accesslog.test]
+internal/accesslog/writer_test.go:25:12: undefined: NewAsyncFileSink
+internal/accesslog/writer_test.go:57:12: undefined: NewAsyncFileSink
+internal/accesslog/writer_test.go:82:12: undefined: newAsyncFileSinkWithCapacity
+internal/accesslog/writer_test.go:99:12: undefined: NewAsyncFileSink
+internal/accesslog/writer_test.go:115:12: undefined: NewAsyncFileSink
+FAIL	github.com/esalaine/envoy-go/internal/accesslog [build failed]
+FAIL
+
+# GREEN — go test -race -count=1 ./internal/accesslog/ -run TestAsyncFileSink -v (after writer.go)
+=== RUN   TestAsyncFileSink_HappyPath_NRecordsLandNLines
+--- PASS: TestAsyncFileSink_HappyPath_NRecordsLandNLines (0.00s)
+=== RUN   TestAsyncFileSink_ConcurrentSubmit_RaceClean
+--- PASS: TestAsyncFileSink_ConcurrentSubmit_RaceClean (0.00s)
+=== RUN   TestAsyncFileSink_DropNewest_FullChannelIncrementsCounter
+2026/04/30 05:18:32 accesslog: channel full, dropping record (path=...)
+--- PASS: TestAsyncFileSink_DropNewest_FullChannelIncrementsCounter (0.00s)
+=== RUN   TestAsyncFileSink_Close_Idempotent
+--- PASS: TestAsyncFileSink_Close_Idempotent (0.00s)
+=== RUN   TestAsyncFileSink_Close_DrainsPending
+--- PASS: TestAsyncFileSink_Close_DrainsPending (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.012s
+
+# Verification — go test -race -count=1 ./internal/accesslog/ -v (full package)
+# All 12 tests pass (7 TestDefault_* + 5 TestAsyncFileSink_*); no race detected
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.013s
+```
+
 ## Task 3 — `internal/accesslog/format.go` — Default formatter + empirical-format-pin scrape
 
 **Commits:** `d3da508`
