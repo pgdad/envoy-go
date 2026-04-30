@@ -1348,6 +1348,20 @@ Rationale for silent-ignore (vs error): the alternative — erroring on every un
 
 Lands in Task 7 alongside ADR-0040. **Supersedes:** none.
 
+**06.2 amendment** (per ADR-0067): the silently-ignored set is extended to include:
+- `envoy.access_loggers.stdout` (typed_config of HCM `access_log[]` entries)
+- `envoy.access_loggers.tcp_grpc` (gRPC ALS)
+- `envoy.access_loggers.open_telemetry` (OTLP)
+- HCM `access_log[].filter` field (per-record predicate filter)
+- HCM `access_log_options`
+- Listener-scope `access_log[]`
+- Cluster-scope `access_log[]`
+
+Rejected explicitly (NOT silently-ignored — fatal parse error per ADR-0067):
+- `envoy.extensions.access_loggers.file.v3.FileAccessLog.log_format`
+- `envoy.extensions.access_loggers.file.v3.FileAccessLog.format_string`
+- `envoy.extensions.access_loggers.file.v3.FileAccessLog.json_format`
+
 ---
 
 ## ADR-0042: Phase-04 HTTP-filter chain shape — exactly `[router]`
@@ -2399,3 +2413,32 @@ The internal-stats `helpText` map in `internal/stats/name.go` gains one entry pe
 ### Lands-in-task
 
 Task 5 (alongside the package skeleton; the counter wiring lives in `internal/accesslog/stats.go`; the `helpText` map extension lives in `internal/stats/name.go`). Supersedes nothing; complements ADR-0059 + ADR-0061.
+
+## ADR-0067: Reject `log_format` at parse (option β; extends ADR-0065's boundary-validation pattern)
+
+**Status:** Accepted
+**Date:** 2026-04-30
+**Doctrine:** D-3.4 (record durable design rationale; the rejection is a contract that future bootstrap consumers MUST observe).
+
+### Context
+
+Per Decision C, phase 06.2's bootstrap parser reads HCM `access_log[]` as a list (any length: 0 → no-op; N → emit to all N sinks per request, in registration order — no artificial 1-cap). The `envoy.extensions.access_loggers.file.v3.FileAccessLog` typed_config supports a custom format via `log_format` / `format_string` / `json_format` — features envoy-go does NOT implement in phase 06.2. The choice: silently ignore the format fields (emit Envoy-default-format always) OR reject at parse-time with a clear error.
+
+### Decision
+
+The bootstrap parser READS HCM `access_log[]` as a list of any length; each entry's typed-config of type `envoy.access_loggers.file` MUST have `path` (required, non-empty string); ANY presence of `log_format` / `format_string` / `json_format` produces a fatal parse error: `bootstrap: unsupported config: access_log[].log_format (envoy-go ships only the implicit default format in phase 06.2; superseded by a later phase)`. Other typed-config types (`envoy.access_loggers.stdout`, `envoy.access_loggers.tcp_grpc`, `envoy.access_loggers.open_telemetry`) remain silently-ignored per the ADR-0041 amendment (Consequences (c)).
+
+### Alternatives considered
+
+- (A) Silent-ignore — REJECTED. A bootstrap that says "I want JSON-formatted access logs" but receives Envoy-default-formatted logs is a silent deviation from the operator's intent; failing-loud at parse-time forces the operator to remove the field (or the project to ship the parser surface in a future phase).
+- (B) Honor `log_format` via a command-operator parser — REJECTED. The format-string parser surface is ~500 LoC and a non-goal of phase 06.2 (per SPEC §2.1 first bullet).
+
+### Consequences
+
+- (a) The silently-ignored field set is amended (per ADR-0041's amendment shape, mirroring the 05.1 + 05.2 + 06.1 amendments) to add `envoy.access_loggers.stdout` / `tcp_grpc` / `open_telemetry` entries; see the ADR-0041 amendment block in DECISIONS.md.
+- (b) Parse-fail messages on `log_format` are grep-verifiable in `bootstrap_test.go`.
+- (c) Future phases that ship the format-string parser supersede this ADR.
+
+### Lands-in-task
+
+Task 7 (the bootstrap parser extension; first use of the option-β rejection in production code). Supersedes nothing; complements ADR-0065.

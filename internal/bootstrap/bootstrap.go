@@ -6,6 +6,9 @@ import (
 	"io"
 
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
+	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
+	fileaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	// Blank-imported so the filter extension's proto descriptor is registered
 	// with protoregistry.GlobalTypes, which lets protojson round-trip the
 	// typed_config Any without envoy-go interpreting its contents (ADR-0016).
@@ -27,11 +30,38 @@ import (
 	// interpreting typed_config. Per ADR-0016 amendment policy this addition
 	// is documented in PROGRESS, not as a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	// Phase 06.2 (Task 7) registers the FileAccessLog extension proto and the
+	// StdoutAccessLog (stream) extension proto so protojson round-trips
+	// bootstraps carrying HCM access_log[] entries of those types without
+	// "type not registered" errors (ADR-0067). Per ADR-0016 amendment policy
+	// these additions are documented in PROGRESS, not as a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/stream/v3"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 
 	"github.com/esalaine/envoy-go/internal/stats"
 )
+
+const (
+	// hcmTypeURL is the TypeURL for HttpConnectionManager, used when walking
+	// listener filter chains to find HCM filters during access_log[] parsing.
+	hcmTypeURL = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
+
+	// fileAccessLogTypeURL is the TypeURL for the file access logger
+	// (envoy.access_loggers.file). Used in access_log[] typed_config
+	// type-switching per ADR-0067.
+	fileAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"
+)
+
+// AccessLogConfig is the parsed-but-not-yet-opened representation of one
+// envoy.access_loggers.file entry from HCM access_log[]. The sink itself is
+// constructed in cmd/envoy-go/main.go after Load returns; this struct carries
+// only the parse-time data.
+type AccessLogConfig struct {
+	Path string
+}
 
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
 // boot-time *stats.Registry that downstream constructors (cluster/listener/HCM
@@ -48,6 +78,13 @@ type Bootstrap struct {
 	// counters/gauges on it during boot. Task 12 owns the post-construction
 	// Freeze call per SPEC §5.4.
 	Stats *stats.Registry
+	// AccessLogConfigs is the parsed access_log[] file-sink entries from each
+	// HCM filter, in registration order across all listeners and HCM filters.
+	// Empty when no file-type access_log entries are configured. Per ADR-0067,
+	// log_format/format_string/json_format on file-type entries is rejected at
+	// parse time. Other typed_config types (stdout, tcp_grpc, open_telemetry)
+	// are silently ignored per the ADR-0041 amendment.
+	AccessLogConfigs []AccessLogConfig
 }
 
 // Load parses r as YAML (upstream Envoy's YAML shape), converts to JSON, and
@@ -85,7 +122,80 @@ func Load(r io.Reader) (*Bootstrap, error) {
 	if err := opts.Unmarshal(jsonBytes, bs); err != nil {
 		return nil, fmt.Errorf("bootstrap: protojson: %w", err)
 	}
-	return &Bootstrap{Proto: bs, Stats: stats.NewRegistry()}, nil
+	result := &Bootstrap{Proto: bs, Stats: stats.NewRegistry()}
+	if err := parseAccessLogConfigs(bs, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// parseAccessLogConfigs walks the static_resources listeners looking for HCM
+// filters, then parses each HCM's access_log[] entries per ADR-0067. File-type
+// entries are collected into result.AccessLogConfigs; other typed_config types
+// are silently ignored. log_format/format_string/json_format on file-type
+// entries produce a fatal error.
+func parseAccessLogConfigs(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
+	sr := bs.GetStaticResources()
+	if sr == nil {
+		return nil
+	}
+	for _, listener := range sr.GetListeners() {
+		for _, fc := range listener.GetFilterChains() {
+			for _, f := range fc.GetFilters() {
+				tc := f.GetTypedConfig()
+				if tc == nil || tc.GetTypeUrl() != hcmTypeURL {
+					continue
+				}
+				hcm := &hcmv3.HttpConnectionManager{}
+				if err := proto.Unmarshal(tc.GetValue(), hcm); err != nil {
+					return fmt.Errorf("bootstrap: hcm unmarshal: %w", err)
+				}
+				for i, al := range hcm.GetAccessLog() {
+					if err := parseOneAccessLog(al, i, result); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// parseOneAccessLog processes a single AccessLog entry from an HCM filter.
+// File-type entries with a valid path are appended to result.AccessLogConfigs.
+// File-type entries with log_format/format_string/json_format produce errors.
+// Non-file typed_config types are silently ignored per ADR-0041 amendment.
+func parseOneAccessLog(al *accesslogv3.AccessLog, idx int, result *Bootstrap) error {
+	tc := al.GetTypedConfig()
+	if tc == nil {
+		// No typed_config — silently ignore.
+		return nil
+	}
+	if tc.GetTypeUrl() != fileAccessLogTypeURL {
+		// Non-file typed_config (stdout, tcp_grpc, open_telemetry, etc.) —
+		// silently ignored per ADR-0041 amendment / ADR-0067.
+		return nil
+	}
+	fal := &fileaccesslogv3.FileAccessLog{}
+	if err := proto.Unmarshal(tc.GetValue(), fal); err != nil {
+		return fmt.Errorf("bootstrap: access_log[%d] unmarshal: %w", idx, err)
+	}
+	// Reject any custom format fields — ADR-0067 option β.
+	switch fal.GetAccessLogFormat().(type) {
+	case *fileaccesslogv3.FileAccessLog_LogFormat:
+		return fmt.Errorf("bootstrap: unsupported config: access_log[].log_format (envoy-go ships only the implicit default format in phase 06.2; superseded by a later phase)")
+	case *fileaccesslogv3.FileAccessLog_Format:
+		return fmt.Errorf("bootstrap: unsupported config: access_log[].format_string (envoy-go ships only the implicit default format in phase 06.2; superseded by a later phase)")
+	case *fileaccesslogv3.FileAccessLog_JsonFormat:
+		return fmt.Errorf("bootstrap: unsupported config: access_log[].json_format (envoy-go ships only the implicit default format in phase 06.2; superseded by a later phase)")
+	case *fileaccesslogv3.FileAccessLog_TypedJsonFormat:
+		return fmt.Errorf("bootstrap: unsupported config: access_log[].json_format (envoy-go ships only the implicit default format in phase 06.2; superseded by a later phase)")
+	}
+	if fal.GetPath() == "" {
+		return fmt.Errorf("bootstrap: access_log[%d]: path is required (must be a non-empty file path)", idx)
+	}
+	result.AccessLogConfigs = append(result.AccessLogConfigs, AccessLogConfig{Path: fal.GetPath()})
+	return nil
 }
 
 // AdminSocket returns host and port from admin.address.socket_address. Errors

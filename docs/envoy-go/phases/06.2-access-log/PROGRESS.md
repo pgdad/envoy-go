@@ -212,3 +212,85 @@ $ go test -count=1 ./internal/accesslog/ -run FuzzAccessLogFormat -v
 PASS
 ok  	github.com/esalaine/envoy-go/internal/accesslog	0.001s
 ```
+
+## Task 7 — `internal/bootstrap/bootstrap.go` — parse `access_log[]` + reject `log_format` [ADR-0067]
+
+**Commits:** TBD — this task's commit
+**Notes:** Added `AccessLogConfig` struct and `AccessLogConfigs []AccessLogConfig` field to `Bootstrap`. Implemented `parseAccessLogConfigs` + `parseOneAccessLog` helpers that walk static_resources listeners → filter_chains → HCM filters → `access_log[]` entries. File-type entries (`type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog`) with `path` set are collected; `log_format` / `format_string` (`format` field) / `json_format` / `typed_json_format` produce fatal parse errors per ADR-0067 option β. Non-file typed_configs (stdout/stream, tcp_grpc, open_telemetry) are silently ignored per ADR-0041 amendment. Added blank imports for `file/v3` and `stream/v3` so protojson can round-trip bootstraps containing those typed_configs without "type not registered" errors. Added 8 new tests (all GREEN); total bootstrap tests: 19 pass (11 existing + 8 new). Appended ADR-0067 to DECISIONS.md; amended ADR-0041 with 06.2 amendment block.
+**Outputs:**
+```
+$ go test -count=1 ./internal/bootstrap/ -v
+=== RUN   TestLoad_HappyPath
+--- PASS: TestLoad_HappyPath (0.00s)
+=== RUN   TestLoad_RejectsDynamicResources
+--- PASS: TestLoad_RejectsDynamicResources (0.00s)
+=== RUN   TestLoad_RejectsLayeredRuntime
+--- PASS: TestLoad_RejectsLayeredRuntime (0.00s)
+=== RUN   TestLoad_YAMLSyntaxError
+--- PASS: TestLoad_YAMLSyntaxError (0.00s)
+=== RUN   TestLoad_UnknownTopLevelField
+--- PASS: TestLoad_UnknownTopLevelField (0.00s)
+=== RUN   TestLoad_EmptyDocument
+--- PASS: TestLoad_EmptyDocument (0.00s)
+=== RUN   TestAdminSocket_HappyPath
+--- PASS: TestAdminSocket_HappyPath (0.00s)
+=== RUN   TestAdminSocket_MissingAdmin
+--- PASS: TestAdminSocket_MissingAdmin (0.00s)
+=== RUN   TestBootstrap_RoundTrips_FixtureFour_Shape
+--- PASS: TestBootstrap_RoundTrips_FixtureFour_Shape (0.00s)
+=== RUN   TestLoad_AllocatesStatsRegistry
+--- PASS: TestLoad_AllocatesStatsRegistry (0.00s)
+=== RUN   TestLoad_HCMRoundTrip
+--- PASS: TestLoad_HCMRoundTrip (0.00s)
+=== RUN   TestBootstrap_AccessLog_FileType_PathRequired
+--- PASS: TestBootstrap_AccessLog_FileType_PathRequired (0.00s)
+=== RUN   TestBootstrap_AccessLog_RejectLogFormat
+--- PASS: TestBootstrap_AccessLog_RejectLogFormat (0.00s)
+=== RUN   TestBootstrap_AccessLog_RejectJSONFormat
+--- PASS: TestBootstrap_AccessLog_RejectJSONFormat (0.00s)
+=== RUN   TestBootstrap_AccessLog_RejectFormatString
+--- PASS: TestBootstrap_AccessLog_RejectFormatString (0.00s)
+=== RUN   TestBootstrap_AccessLog_PathEmptyRejects
+--- PASS: TestBootstrap_AccessLog_PathEmptyRejects (0.00s)
+=== RUN   TestBootstrap_AccessLog_StdoutSilentlyIgnored
+--- PASS: TestBootstrap_AccessLog_StdoutSilentlyIgnored (0.00s)
+=== RUN   TestBootstrap_AccessLog_NoEntriesIsValid
+--- PASS: TestBootstrap_AccessLog_NoEntriesIsValid (0.00s)
+=== RUN   TestBootstrap_AccessLog_TwoFileEntries
+--- PASS: TestBootstrap_AccessLog_TwoFileEntries (0.00s)
+=== RUN   FuzzBootstrapLoad
+=== RUN   FuzzBootstrapLoad/seed#0
+=== RUN   FuzzBootstrapLoad/seed#1
+=== RUN   FuzzBootstrapLoad/seed#2
+=== RUN   FuzzBootstrapLoad/seed#3
+=== RUN   FuzzBootstrapLoad/seed#4
+=== RUN   FuzzBootstrapLoad/seed#5
+=== RUN   FuzzBootstrapLoad/seed#6
+=== RUN   FuzzBootstrapLoad/seed#7
+--- PASS: FuzzBootstrapLoad (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#0 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#1 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#2 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#3 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#4 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#5 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#6 (0.00s)
+    --- PASS: FuzzBootstrapLoad/seed#7 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.008s
+```
+```
+$ grep -nE '^## ADR-0067:' docs/envoy-go/DECISIONS.md
+2417:## ADR-0067: Reject `log_format` at parse (option β; extends ADR-0065's boundary-validation pattern)
+```
+```
+$ grep -nE 'AccessLogConfigs' internal/bootstrap/bootstrap.go
+81:	// AccessLogConfigs is the parsed access_log[] file-sink entries from each
+87:	AccessLogConfigs []AccessLogConfig
+126:	if err := parseAccessLogConfigs(bs, result); err != nil {
+132:// parseAccessLogConfigs walks the static_resources listeners looking for HCM
+134:// entries are collected into result.AccessLogConfigs; other typed_config types
+137:func parseAccessLogConfigs(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
+165:// File-type entries with a valid path are appended to result.AccessLogConfigs.
+197:	result.AccessLogConfigs = append(result.AccessLogConfigs, AccessLogConfig{Path: fal.GetPath()})
+```

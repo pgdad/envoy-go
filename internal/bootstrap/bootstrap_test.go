@@ -302,3 +302,197 @@ static_resources:
 		t.Fatalf("protojson.Marshal: %v", err)
 	}
 }
+
+// hcmWithAccessLog builds a complete bootstrap YAML string containing a single
+// HCM listener with the given accessLogBlock embedded as the access_log[]
+// section. If accessLogBlock is empty, the access_log field is omitted.
+func hcmWithAccessLog(accessLogBlock string) string {
+	accessLogField := ""
+	if accessLogBlock != "" {
+		accessLogField = "\n                access_log:\n" + accessLogBlock
+	}
+	return `
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http` + accessLogField + `
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+`
+}
+
+// TestBootstrap_AccessLog_FileType_PathRequired verifies that a file-type
+// access_log entry with a valid path is parsed, returned in AccessLogConfigs,
+// and the Path field is set correctly.
+func TestBootstrap_AccessLog_FileType_PathRequired(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access.log`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.AccessLogConfigs); got != 1 {
+		t.Fatalf("AccessLogConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.AccessLogConfigs[0].Path, "/tmp/envoy-access.log"; got != want {
+		t.Errorf("AccessLogConfigs[0].Path: got %q, want %q", got, want)
+	}
+}
+
+// TestBootstrap_AccessLog_RejectLogFormat verifies that a file-type
+// access_log entry with log_format set is rejected with the correct error.
+func TestBootstrap_AccessLog_RejectLogFormat(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access.log
+                      log_format:
+                        text_format_source:
+                          inline_string: "[%START_TIME%] %REQ(:METHOD)%\n"`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for log_format, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported config: access_log[].log_format") {
+		t.Errorf("error should contain 'unsupported config: access_log[].log_format': %q", err.Error())
+	}
+}
+
+// TestBootstrap_AccessLog_RejectJSONFormat verifies that a file-type
+// access_log entry with json_format set is rejected with the correct error.
+func TestBootstrap_AccessLog_RejectJSONFormat(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access.log
+                      json_format:
+                        timestamp: "%START_TIME%"`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for json_format, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported config: access_log[].json_format") {
+		t.Errorf("error should contain 'unsupported config: access_log[].json_format': %q", err.Error())
+	}
+}
+
+// TestBootstrap_AccessLog_RejectFormatString verifies that a file-type
+// access_log entry with the deprecated format (format_string) set is rejected
+// with the correct error. The deprecated proto field is the oneof
+// FileAccessLog_Format (proto field name "format").
+func TestBootstrap_AccessLog_RejectFormatString(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access.log
+                      format: "[%START_TIME%] %REQ(:METHOD)% %REQ(X-FORWARDED-FOR)%\n"`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for format_string, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported config: access_log[].format_string") {
+		t.Errorf("error should contain 'unsupported config: access_log[].format_string': %q", err.Error())
+	}
+}
+
+// TestBootstrap_AccessLog_PathEmptyRejects verifies that a file-type
+// access_log entry with an empty path is rejected.
+func TestBootstrap_AccessLog_PathEmptyRejects(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: ""`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for empty path, got nil")
+	}
+	if !strings.Contains(err.Error(), "path is required") {
+		t.Errorf("error should contain 'path is required': %q", err.Error())
+	}
+}
+
+// TestBootstrap_AccessLog_StdoutSilentlyIgnored verifies that a stdout-type
+// access_log entry is silently ignored — no error and no AccessLogConfigs entry.
+func TestBootstrap_AccessLog_StdoutSilentlyIgnored(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.AccessLogConfigs); got != 0 {
+		t.Errorf("AccessLogConfigs: got %d, want 0 (stdout should be silently ignored)", got)
+	}
+}
+
+// TestBootstrap_AccessLog_NoEntriesIsValid verifies that an HCM with no
+// access_log entries (missing field) parses successfully with an empty
+// AccessLogConfigs slice.
+func TestBootstrap_AccessLog_NoEntriesIsValid(t *testing.T) {
+	bs, err := Load(strings.NewReader(hcmWithAccessLog("")))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.AccessLogConfigs); got != 0 {
+		t.Errorf("AccessLogConfigs: got %d, want 0", got)
+	}
+}
+
+// TestBootstrap_AccessLog_TwoFileEntries verifies that two file-type entries
+// are both parsed and returned in registration order.
+func TestBootstrap_AccessLog_TwoFileEntries(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access-1.log
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access-2.log`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.AccessLogConfigs); got != 2 {
+		t.Fatalf("AccessLogConfigs: got %d, want 2", got)
+	}
+	if got, want := bs.AccessLogConfigs[0].Path, "/tmp/envoy-access-1.log"; got != want {
+		t.Errorf("AccessLogConfigs[0].Path: got %q, want %q", got, want)
+	}
+	if got, want := bs.AccessLogConfigs[1].Path, "/tmp/envoy-access-2.log"; got != want {
+		t.Errorf("AccessLogConfigs[1].Path: got %q, want %q", got, want)
+	}
+}
