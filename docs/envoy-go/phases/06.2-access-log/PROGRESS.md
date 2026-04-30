@@ -336,3 +336,18 @@ $ grep -nE 'func \(c \*Cluster\) Dial|func \(c \*Cluster\) DialH2' internal/clus
 internal/cluster/dial_h2.go:32:func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) {
 internal/cluster/cluster.go:149:func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 ```
+
+## Task 9 — `internal/filter/hcm/bytecounter.go` — byteCounterWriter
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/filter/hcm/bytecounter.go` (~10 LoC): tiny `byteCounterWriter` struct wrapping an `io.Writer` and accumulating an `int64` running byte count via `Write(p) (int, error)` that increments `n` by the actual bytes written (short-writes account the actual count, not the request length, per SPEC §12 #3). Created `internal/filter/hcm/bytecounter_test.go` with 2 TDD tests: happy-path 3-write accumulation (12 bytes total) and short-write accounting (3 returned + error).
+**Outputs:**
+```
+$ go test -count=1 -run TestByteCounterWriter ./internal/filter/hcm/ -v
+=== RUN   TestByteCounterWriter_AccumulatesBytesWritten
+--- PASS: TestByteCounterWriter_AccumulatesBytesWritten (0.00s)
+=== RUN   TestByteCounterWriter_ShortWriteAccountsActualBytes
+--- PASS: TestByteCounterWriter_ShortWriteAccountsActualBytes (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+```
