@@ -339,7 +339,7 @@ internal/cluster/cluster.go:149:func (c *Cluster) Dial(ctx context.Context) (net
 
 ## Task 9 — `internal/filter/hcm/bytecounter.go` — byteCounterWriter
 
-**Commits:** TBD — this task's commit
+**Commits:** `3c16e29`
 **Notes:** Created `internal/filter/hcm/bytecounter.go` (~10 LoC): tiny `byteCounterWriter` struct wrapping an `io.Writer` and accumulating an `int64` running byte count via `Write(p) (int, error)` that increments `n` by the actual bytes written (short-writes account the actual count, not the request length, per SPEC §12 #3). Created `internal/filter/hcm/bytecounter_test.go` with 2 TDD tests: happy-path 3-write accumulation (12 bytes total) and short-write accounting (3 returned + error).
 **Outputs:**
 ```
