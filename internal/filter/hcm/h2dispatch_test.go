@@ -10,6 +10,9 @@ package hcm
 // in package hcm; this file substitutes for the planned h2-sub-package test
 // per the SPEC's "appended to existing test file" relaxation. The deviation
 // is recorded in PROGRESS Task 11 Notes.
+//
+// Phase 06.2 Task 13: H2 emit-deferral tests added below (TestH2DirectResponse*
+// and TestRouterActionH2_EmitsAccessLog*).
 
 import (
 	"bytes"
@@ -18,7 +21,9 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -126,5 +131,158 @@ func TestH2RouterActionAdapter_WriteH2_NoLogOnSuccess(t *testing.T) {
 	}
 	if got := logBuf.String(); strings.Contains(got, "h2: doH2 error:") {
 		t.Errorf("M-9 log line emitted on doH2 success path; got: %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 06.2 Task 13 — H2 emit-deferral tests
+// ---------------------------------------------------------------------------
+
+// newFilterWithSink builds a minimal *Filter with the given accesslog sink
+// wired in; allocates required metric fields so downstreamStatusClassCounter
+// doesn't nil-deref.
+func newFilterWithSink(t *testing.T, cs accesslog.Sink) *Filter {
+	t.Helper()
+	r := stats.NewRegistry()
+	prefix := "http.test_t13."
+	return &Filter{
+		downstreamRqTotal: r.NewCounter(prefix + "downstream_rq_total"),
+		downstreamRq2xx:   r.NewCounter(prefix + "downstream_rq_2xx"),
+		downstreamRq3xx:   r.NewCounter(prefix + "downstream_rq_3xx"),
+		downstreamRq4xx:   r.NewCounter(prefix + "downstream_rq_4xx"),
+		downstreamRq5xx:   r.NewCounter(prefix + "downstream_rq_5xx"),
+		accessLog:         []accesslog.Sink{cs},
+	}
+}
+
+// TestH2DirectResponseAdapter_WriteH2_EmitsAccessLog verifies that
+// h2DirectResponseAdapter.WriteH2 submits one access-log record with the
+// correct ResponseCode and BytesSent.
+func TestH2DirectResponseAdapter_WriteH2_EmitsAccessLog(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := newFilterWithSink(t, cs)
+	a := &h2DirectResponseAdapter{
+		a: &directResponseAction{status: 200, bodyText: "OK\n", filter: f},
+		f: f,
+	}
+	req := h2.H2Request{Method: "GET", Path: "/health", Authority: "localhost"}
+	if err := a.WriteH2(context.Background(), req, &captureH2Writer{}); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	if len(cs.recs) != 1 {
+		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	}
+	rec := cs.recs[0]
+	if rec.ResponseCode != 200 {
+		t.Errorf("ResponseCode = %d, want 200", rec.ResponseCode)
+	}
+	if rec.BytesSent != 3 {
+		t.Errorf("BytesSent = %d, want 3 (len(\"OK\\n\"))", rec.BytesSent)
+	}
+	if rec.Protocol != "HTTP/2.0" {
+		t.Errorf("Protocol = %q, want HTTP/2.0", rec.Protocol)
+	}
+	if rec.UpstreamHost != "" {
+		t.Errorf("UpstreamHost = %q, want empty (direct_response)", rec.UpstreamHost)
+	}
+}
+
+// TestRouterActionH2_DoH2_EmitsAccessLog_HappyPath verifies that
+// routerActionH2.doH2 submits one access-log record with a non-empty
+// UpstreamHost and BytesSent > 0 when the upstream responds successfully.
+func TestRouterActionH2_DoH2_EmitsAccessLog_HappyPath(t *testing.T) {
+	pki := mkH2BackendPKI(t)
+	body := []byte("upstream-ok\n")
+	ln := startH2Backend(t, pki, h2BackendOK, body)
+	defer func() { _ = ln.Close() }()
+
+	cs := &emitCaptureSink{}
+	f := newFilterWithSink(t, cs)
+	c := h2EndpointCluster(t, ln.Addr().String(), pki)
+	a := &routerActionH2{cluster: c, filter: f}
+
+	w := &captureH2Writer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
+		t.Fatalf("doH2: %v", err)
+	}
+
+	if len(cs.recs) != 1 {
+		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	}
+	rec := cs.recs[0]
+	if rec.ResponseCode != 200 {
+		t.Errorf("ResponseCode = %d, want 200", rec.ResponseCode)
+	}
+	if rec.BytesSent <= 0 {
+		t.Errorf("BytesSent = %d, want > 0", rec.BytesSent)
+	}
+	if rec.UpstreamHost == "" {
+		t.Errorf("UpstreamHost is empty, want non-empty (routed H2 request)")
+	}
+	if rec.Protocol != "HTTP/2.0" {
+		t.Errorf("Protocol = %q, want HTTP/2.0", rec.Protocol)
+	}
+}
+
+// TestRouterActionH2_DoH2_EmitsAccessLog_DialFailure verifies that
+// routerActionH2.doH2 emits an access-log record with status 502 and empty
+// UpstreamHost on the dial-failure path.
+func TestRouterActionH2_DoH2_EmitsAccessLog_DialFailure(t *testing.T) {
+	pki := mkH2BackendPKI(t)
+	cs := &emitCaptureSink{}
+	f := newFilterWithSink(t, cs)
+	// Port 1 is always rejected, so DialH2 fails.
+	c := h2EndpointCluster(t, "127.0.0.1:1", pki)
+	a := &routerActionH2{cluster: c, filter: f}
+
+	w := &captureH2Writer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = a.doH2(ctx, h2RequestForTest(), w)
+
+	if len(cs.recs) != 1 {
+		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	}
+	rec := cs.recs[0]
+	if rec.ResponseCode != 502 {
+		t.Errorf("ResponseCode = %d, want 502 (dial-failure local-reply)", rec.ResponseCode)
+	}
+	if rec.UpstreamHost != "" {
+		t.Errorf("UpstreamHost = %q, want empty on dial failure", rec.UpstreamHost)
+	}
+}
+
+// TestRouterActionH2_DoH2_CtxCancel_SkipsEmit verifies that a ctx-cancel
+// during doH2 results in zero access-log records (statusForHCM==0 sentinel
+// skips emission per SPEC §2.1). This test mirrors the existing
+// TestRouterActionH2_CtxCancelEmitsRSTStreamCancel test but asserts the
+// access-log side-effect.
+func TestRouterActionH2_DoH2_CtxCancel_SkipsEmit(t *testing.T) {
+	pki := mkH2BackendPKI(t)
+	ln := startH2Backend(t, pki, h2BackendHang, nil)
+	defer func() { _ = ln.Close() }()
+
+	cs := &emitCaptureSink{}
+	f := newFilterWithSink(t, cs)
+	c := h2EndpointCluster(t, ln.Addr().String(), pki)
+	a := &routerActionH2{cluster: c, filter: f}
+
+	w := &captureH2Writer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	_, err := a.doH2(ctx, h2RequestForTest(), w)
+	if err == nil {
+		t.Fatal("doH2 returned nil; want stream-scoped CANCEL error")
+	}
+
+	// ctx-cancel → statusForHCM==0 → emitAccessLogH2 skips emission.
+	if len(cs.recs) != 0 {
+		t.Errorf("captured %d records, want 0 (ctx-cancel skips emission per SPEC §2.1)", len(cs.recs))
 	}
 }

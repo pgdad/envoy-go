@@ -11,7 +11,9 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
+	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 )
 
@@ -81,12 +83,17 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 // Phase 06.1 Task 11: f is the parent Filter (held for the response-class
 // hook); a.a.status is the finalized status — Inc the matching HCM bucket
 // before delegating to writeH2 ("before bytes hit the wire", SPEC §5.5).
+//
+// Phase 06.2 Task 13: emits access-log record via f.emitAccessLogH2 on
+// return. bytesSent is len(bodyText) — the wire bytes for the inline body.
 type h2DirectResponseAdapter struct {
 	a *directResponseAction
 	f *Filter
 }
 
-func (a *h2DirectResponseAdapter) WriteH2(_ context.Context, _ h2.H2Request, sw h2.StreamWriter) error {
+func (a *h2DirectResponseAdapter) WriteH2(_ context.Context, req h2.H2Request, sw h2.StreamWriter) error {
+	start := time.Now()
+	defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)
 	if c := a.f.downstreamStatusClassCounter(a.a.status); c != nil {
 		c.Inc()
 	}

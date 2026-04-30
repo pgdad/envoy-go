@@ -252,14 +252,32 @@ type routerActionH2 struct {
 // downstream_rq_<Nxx> counter on the H2 path per SPEC §5.5 "HCM response
 // hook" row.
 func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.StreamWriter) (int, error) {
+	start := time.Now()
+
+	// statusForHCM, bytesSentH2, and picked are captured by the deferred
+	// access-log emit so the closure reads the final values. Per SPEC §2.1,
+	// a zero statusForHCM (ctx-cancel sentinel) skips emission inside
+	// emitAccessLogH2. bytesSentH2 is set to len(resp.Body) on the success
+	// path per SPEC §12 #3 option (a).
+	statusForHCM := 0
+	bytesSentH2 := 0
+	picked := cluster.Endpoint{}
+	if r.filter != nil {
+		defer func() {
+			r.filter.emitAccessLogH2(req, statusForHCM, int64(bytesSentH2), picked, start)
+		}()
+	}
+
 	r.cluster.IncUpstreamRqTotal()
 
-	cc, _, err := r.cluster.DialH2(ctx)
+	cc, ep, err := r.cluster.DialH2(ctx)
 	if err != nil {
 		r.cluster.IncStatusClass(502)
+		statusForHCM = 502
 		return 502, r.write502(w)
 	}
 	defer func() { _ = cc.Close() }() // ADR-0056: per-request fresh conn close (analog of phase-04 H1's defer upstream.Close())
+	picked = ep
 
 	resp, err := cc.RoundTrip(ctx, req)
 	if err != nil {
@@ -273,15 +291,18 @@ func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.Stream
 			// Surface a stream-scoped CANCEL to serverStream.dispatch which
 			// emits RST_STREAM(CANCEL) per the dispatch carry-error contract.
 			// No upstream_rq_<Nxx> Inc — the request did not produce a
-			// terminating response status. Return 0 so the adapter skips
-			// the HCM-scope downstream_rq_<Nxx> Inc as well.
+			// terminating response status. statusForHCM remains 0 so
+			// emitAccessLogH2 skips emission (SPEC §2.1 sentinel).
 			return 0, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
 		}
 		r.cluster.IncStatusClass(502)
+		statusForHCM = 502
 		return 502, r.write502(w)
 	}
 
 	r.cluster.IncStatusClass(resp.Status)
+	statusForHCM = resp.Status
+	bytesSentH2 = len(resp.Body)
 
 	// Forward response: the codec preserves wire order, so resp.Headers already
 	// has :status (and any other pseudo-headers) first per RFC 9113 §8.3.

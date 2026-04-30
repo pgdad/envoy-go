@@ -439,3 +439,29 @@ $ grep -nE 'emitAccessLog' internal/filter/hcm/actions.go
 105:			a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)
 152:		defer func() { a.filter.emitAccessLog(req, statusCode, bcw.n, picked, start) }()
 ```
+
+## Task 13 — HCM H2 emit-deferral sites (h2DirectResponseAdapter.WriteH2 + routerActionH2.doH2)
+
+**Commits:** TBD
+**Notes:** Modified `h2DirectResponseAdapter.WriteH2` in `h2dispatch.go`: added `start := time.Now()` + `defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)`. The `req h2.H2Request` parameter was previously blank (`_`); renamed so the emit can read it. Added `"time"` and `"github.com/esalaine/envoy-go/internal/cluster"` imports to `h2dispatch.go`. Modified `routerActionH2.doH2` in `actions.go`: added `start := time.Now()`; declared `statusForHCM`, `bytesSentH2`, and `picked` before a top-of-function `defer func(){...}()` closure (guarded by `r.filter != nil`) that calls `r.filter.emitAccessLogH2` with final values; `statusForHCM` set to 502 on dial-failure + RoundTrip error paths, `resp.Status` on success; remains 0 on the ctx-cancel CANCEL path — `emitAccessLogH2` guards on statusCode==0 and skips emission per SPEC §2.1. `bytesSentH2 = len(resp.Body)` on success path. The `filter *Filter` field added to `routerActionH2` in Task 12 is consumed here. Added 4 new tests to `h2dispatch_test.go`: `TestH2DirectResponseAdapter_WriteH2_EmitsAccessLog`, `TestRouterActionH2_DoH2_EmitsAccessLog_HappyPath`, `TestRouterActionH2_DoH2_EmitsAccessLog_DialFailure`, `TestRouterActionH2_DoH2_CtxCancel_SkipsEmit`. All pass. Added `"time"` + `"github.com/esalaine/envoy-go/internal/accesslog"` imports to `h2dispatch_test.go`.
+**Outputs:**
+```
+$ go test -count=1 ./internal/filter/hcm/ -v -run 'TestH2DirectResponse.*EmitsAccessLog|TestRouterActionH2_DoH2_EmitsAccessLog|TestRouterActionH2_DoH2_CtxCancel_SkipsEmit'
+=== RUN   TestH2DirectResponseAdapter_WriteH2_EmitsAccessLog
+--- PASS: TestH2DirectResponseAdapter_WriteH2_EmitsAccessLog (0.00s)
+=== RUN   TestRouterActionH2_DoH2_EmitsAccessLog_HappyPath
+--- PASS: TestRouterActionH2_DoH2_EmitsAccessLog_HappyPath (0.00s)
+=== RUN   TestRouterActionH2_DoH2_EmitsAccessLog_DialFailure
+--- PASS: TestRouterActionH2_DoH2_EmitsAccessLog_DialFailure (0.00s)
+=== RUN   TestRouterActionH2_DoH2_CtxCancel_SkipsEmit
+--- PASS: TestRouterActionH2_DoH2_CtxCancel_SkipsEmit (0.20s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.210s
+
+$ go test -count=1 ./internal/filter/hcm/ 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.419s
+
+$ grep -nE 'emitAccessLogH2' internal/filter/hcm/h2dispatch.go internal/filter/hcm/actions.go
+internal/filter/hcm/h2dispatch.go:96:	defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)
+internal/filter/hcm/actions.go:267:			r.filter.emitAccessLogH2(req, statusForHCM, int64(bytesSentH2), picked, start)
+```
