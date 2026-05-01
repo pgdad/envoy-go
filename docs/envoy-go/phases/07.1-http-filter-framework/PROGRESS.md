@@ -88,7 +88,7 @@ $ grep -nE '^## ADR-0072:' docs/envoy-go/DECISIONS.md
 
 ## Task 4 — internal/filter/http/perroute.go [ADR-0073]
 
-**Commits:** TBD — this task's commit
+**Commits:** 02c45b0 — this task's commit
 **Notes:** Created internal/filter/http/{perroute,perroute_test}.go. Defines routeScope, scopeParsed, cacheKey, PerRouteConfig types; BuildPerRouteConfig parser+validator with chain-name allow-list (errors on unknown keys with verbatim message); Resolve method performs Route > VHost > RC most-specific-override lookup with lazy per-(filter,route) cache. Six new tests covering merge precedence (route-wins, vh-fallback, rc-fallback), nil-on-absent, unknown-filter-name rejection, and cache-pointer-stability. Landed ADR-0073 (typed_per_filter_config 3-tier merge; amends ADR-0041's silent-ignore set).
 **Outputs:**
 ```
