@@ -208,6 +208,6 @@ func (r *routerActionH2) write502(w h2.StreamWriter) error {
 // decisions" note in PLAN Task 11; closes REVIEW I-2 (observability
 // gap on the unreachable defensive stub).
 func (r *routerActionH2) do(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, error) {
-	log.Printf("hcm: routerActionH2.do reached on H1 path — bootstrap misconfiguration; route variant selection should have produced *routerAction, not *routerActionH2 (cluster=%q)", r.cluster.Name())
+	log.Printf("router: routerActionH2.do reached on H1 path — bootstrap misconfiguration; route variant selection should have produced *routerAction, not *routerActionH2 (cluster=%q)", r.cluster.Name())
 	return 500, writeStatusReply(bw, 500, "")
 }

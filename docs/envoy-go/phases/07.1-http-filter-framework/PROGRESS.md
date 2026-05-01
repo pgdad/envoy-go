@@ -783,3 +783,24 @@ $ go build ./...
 $ go test ./internal/filter/hcm/ -count=1 -short   # confirm hcm still passes (routerAction + routerActionH2 still live here; Task 12 deletes them)
 ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.419s
 ```
+
+**Code-review-loop follow-up:** I-1 (log-prefix symmetry) addressed in commit `TBD`. The defensive `(*routerActionH2).do` H1-stub log line in `internal/filter/http/router/router_h2.go` had a `"hcm:"` prefix left over from the pre-extraction text; this is asymmetric with the prior `errCloseAfterAction` rename (`"hcm: action requested connection close"` → `"router: action requested connection close"`) made when the package was extracted. An operator debugging an unexpected 500 in the new package's logs will grep for `router:` and miss the unreachable-but-defensive line. Renamed `"hcm:"` → `"router:"` in that single log message; the test `TestRouterActionH2_DefensiveDoEmits500AndLogs` substring assertions only check `"routerActionH2.do reached on H1 path"` and `"cluster="`, so the prefix change is safe. Minor issues M-1..M-6 from the review (docstring polish, stale comment, etc.) are deferred to future tasks. Fixed log line:
+
+```
+log.Printf("router: routerActionH2.do reached on H1 path — bootstrap misconfiguration; route variant selection should have produced *routerAction, not *routerActionH2 (cluster=%q)", r.cluster.Name())
+```
+
+**Follow-up outputs:**
+```
+$ go test ./internal/filter/http/router/ -count=1 -run TestRouterActionH2_DefensiveDoEmits500AndLogs -v
+=== RUN   TestRouterActionH2_DefensiveDoEmits500AndLogs
+--- PASS: TestRouterActionH2_DefensiveDoEmits500AndLogs (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	0.003s
+
+$ go test -race ./internal/filter/http/router/ -count=1
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.234s
+
+$ go vet ./...
+$ go build ./...
+```
