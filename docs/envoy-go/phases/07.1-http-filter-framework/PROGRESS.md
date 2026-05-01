@@ -735,3 +735,51 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http	1.146s
 $ go vet ./...
 $ go build ./...
 ```
+
+## Task 11 — internal/filter/http/router/ — extract router as terminal filter (byte-preserved tests)
+
+**Commits:** TBD — this task's commit
+**Notes:** Created internal/filter/http/router/{doc,router,router_h2,router_test,router_h2_test}.go. Migrated `routerAction` + `routerActionH2` from `internal/filter/hcm/actions.go` to the new package; the iteration-protocol surface (`Filter` implementing `envoyhttp.StreamDecoderFilter` + `envoyhttp.StreamEncoderFilter` per ADR-0071, exposed at boot via the `New` HTTPFilterFactory + `TypeURL = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"`) lands as a working skeleton (Decode*/Encode* return Continue / DataContinue / TrailersContinue; Tasks 15+16 wire HCM dispatch through to drive the route-action dispatch via the chain). All 14 router-related tests from `actions_test.go` are byte-preserved verbatim — only `package hcm` → `package router` and the import block adjusts (regrouped per the new package's surface, with `regexp`+`os` dropped since the H1-golden test stays in hcm/). Per the PLAN's Task 11 → Task 12 split, `internal/filter/hcm/actions.go` STILL contains `routerAction` + `routerActionH2` at this commit; the duplication is intentional and Task 12 deletes the hcm-side originals in a separate clean commit. **PLAN deviations / byte-preservation deviations:** (1) The PLAN scaffold described a complete inlining of `routerAction.do(ctx, req, bw)` body into `(*Filter).DecodeHeaders/Data/Trailers`; this is structurally incompatible with byte-preserved tests that exercise `&routerAction{...}.do(ctx, req, bw)` directly (the test bodies would have to change shape). To honor BRAINSTORM §6.8 byte-preservation, this task keeps `routerAction` + `routerActionH2` as private dispatch primitives in the new package with verbatim signatures + bodies; the iteration-protocol `Filter` type wraps them at the public boundary. Tasks 15+16 (HCM dispatch wiring) connect `Filter.DecodeHeaders`'s end-of-stream point to the routerAction dispatch — i.e., the inlining the PLAN sketched lands as composition, not flattening. This preserves the entire test surface verbatim while still satisfying the iteration-protocol contract. (2) Five private helpers are duplicated from `internal/filter/hcm` into the new package (`writeStatusReply`, `dateHeader`, `serverHeader`, `upstreamHostString`, `h2UserAgent`) plus three constants/vars (`bad502Body`, `errCloseAfterAction`, the `Filter` struct's `accessLog` field + `emitAccessLog` + `emitAccessLogH2` methods). Exporting these from hcm would create a forward-coupling that Task 12 can clean, but the PLAN's explicit "duplication is intentional between Task 11 and Task 12" framing means duplicating in this task is correct (Task 12 deletes the hcm-side originals; if Task 12 ALSO removes the helper duplication, that's a separate concern for Task 13's hcm-side trim). The `errCloseAfterAction` error message changes from `"hcm: action requested connection close"` to `"router: action requested connection close"` to identify the new package as the source — tests use `errors.Is` (identity-based), so the prose change does not break byte-preservation. All 14 byte-preserved tests pass; `go vet ./...` + `go build ./...` clean; `go test -race ./internal/filter/http/router/` clean.
+**Outputs:**
+```
+$ go test ./internal/filter/http/router/ -count=1 -v
+=== RUN   TestRouterActionH2_HappyPath
+--- PASS: TestRouterActionH2_HappyPath (0.00s)
+=== RUN   TestRouterActionH2_502OnDialFailure
+--- PASS: TestRouterActionH2_502OnDialFailure (0.00s)
+=== RUN   TestRouterActionH2_502OnRoundTripProtocolError
+--- PASS: TestRouterActionH2_502OnRoundTripProtocolError (0.00s)
+=== RUN   TestRouterActionH2_CtxCancelEmitsRSTStreamCancel
+--- PASS: TestRouterActionH2_CtxCancelEmitsRSTStreamCancel (0.20s)
+=== RUN   TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass
+--- PASS: TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass (0.00s)
+=== RUN   TestRouterActionH2_Upstream5xxForwardedVerbatim
+--- PASS: TestRouterActionH2_Upstream5xxForwardedVerbatim (0.00s)
+=== RUN   TestRouterActionH2_DefensiveDoEmits500AndLogs
+--- PASS: TestRouterActionH2_DefensiveDoEmits500AndLogs (0.00s)
+=== RUN   TestRouterAction_DoHappy
+--- PASS: TestRouterAction_DoHappy (0.00s)
+=== RUN   TestRouterAction_DoDialFailureReturns503
+--- PASS: TestRouterAction_DoDialFailureReturns503 (0.00s)
+=== RUN   TestRouterAction_DoCtxCancel
+--- PASS: TestRouterAction_DoCtxCancel (0.00s)
+=== RUN   TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass
+--- PASS: TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass (0.00s)
+=== RUN   TestRouterAction_Do_DialFailureInc5xx
+--- PASS: TestRouterAction_Do_DialFailureInc5xx (0.00s)
+=== RUN   TestRouterAction_EmitsAccessLog_HappyPath
+--- PASS: TestRouterAction_EmitsAccessLog_HappyPath (0.00s)
+=== RUN   TestRouterAction_EmitsAccessLog_DialFailure
+--- PASS: TestRouterAction_EmitsAccessLog_DialFailure (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	0.211s
+
+$ go test -race ./internal/filter/http/router/ -count=1
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.234s
+
+$ go vet ./...
+$ go build ./...
+
+$ go test ./internal/filter/hcm/ -count=1 -short   # confirm hcm still passes (routerAction + routerActionH2 still live here; Task 12 deletes them)
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.419s
+```
