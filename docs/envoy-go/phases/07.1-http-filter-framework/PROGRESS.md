@@ -850,3 +850,91 @@ FAIL
 ```
 
 The `TestDirectResponseAction*` test invocation cannot exercise the preserved test bodies until Task 16 restores hcm-package buildability. The directResponseAction symbol surface (struct + body + writeH1 + writeH2 + do) is preserved byte-identically across this commit; the byte-preservation can be reviewed via `git show -- internal/filter/hcm/actions.go` (the unified diff shows zero touches inside the directResponseAction block). The preserved test bodies will be re-run at Task 16 when the package builds again.
+
+## Task 13 — internal/filter/hcm/config.go parseFilterWithCtx + chain build + per-route plumbing
+
+**Commits:** TBD — this task's commit
+**Notes:** Widened `parseFilterWithCtx` with a trailing `httpRegistry *filter_http.HTTPRegistry` parameter (per PLAN Task 13 Step 2 + ADR-0072). Replaced the legacy `requireRouterOnlyHTTPFilters` (exactly-`[router]` rule per ADR-0042) with a chain-walking `parseHTTPFiltersChain` that delegates the four canonical chain-shape rules per SPEC §1 #6 + ADR-0071's partial supersession of ADR-0042 to a new `filter_http.ValidateChainShape` helper (added in `internal/filter/http/chain_shape.go`). The validator returns the canonical error texts: rule #1 `hcm: http_filters: must contain at least 1 entry (the router)`; rule #2 `hcm: http_filters: last entry must be %q (router); got %q (%s)`; rule #3 `hcm: http_filters: duplicate filter name %q`; rule #4 `hcm: http_filters[i]: unknown type_url %q (registry: known are %v)`. On success, the parser walks the chain a second time invoking each entry's `HTTPFilterFactory(typed_config_Any, FactoryCtx{Registry: httpRegistry})` to allocate the per-instance `FilterInstanceFactory` closures stored on the new `Filter.chainConfig []chainEntry` field. After the chain is built, `buildPerRouteFromHCM` extracts the typed_per_filter_config maps from RouteConfiguration / VirtualHost / Route levels and runs them through `filter_http.BuildPerRouteConfig` (per ADR-0073's 3-tier merge model); the result is stored on the new `Filter.perRouteConfig *filter_http.PerRouteConfig` field. Short-circuits the BuildPerRouteConfig allocation when no typed_per_filter_config map is present at any level (the common phase-04..06.2 path). `RouteScope` (formerly package-private `routeScope`) is now exported from `internal/filter/http/perroute.go` so the hcm parser can construct the per-route scopes vector without an alias dance; a transitional `type routeScope = RouteScope` alias preserves the existing fuzzer + perroute_test.go bodies during the Task 13 cycle (Task 14 sweeps the lowercase references). The legacy constructors (`NewFilter`, `NewFilterWithCtx`, `NewFilterWithCtxAndSinks`, `parseFilter`) all gained a transitional `defaultRouterOnlyHTTPRegistry()` helper that constructs a fresh frozen registry containing only `router.New` under `router.TypeURL` — so that pre-Task-14 tests continue to validate clean against the new four-rule chain shape; Task 14's caller-sweep deletes the legacy constructors (and this helper) per PLAN Task 14 Step 3. Updated four existing chain-validation tests (TestParseFilter_HTTPFiltersEmpty, TestParseFilter_HTTPFiltersTwoEntries, TestParseFilter_HTTPFiltersWrongName, TestParseFilter_HTTPFiltersWrongTypeURL) to assert the new canonical error text — all four still test exactly the same misconfiguration shape, only the matched substring changes per the post-Task-13 wording. Added four new acceptance tests covering each canonical error class verbatim (TestParseFilterWithCtx_RejectsEmptyChain, TestParseFilterWithCtx_RejectsNonRouterTerminal, TestParseFilterWithCtx_RejectsDuplicateFilterName, TestParseFilterWithCtx_RejectsUnknownTypeURL). Extended `internal/filter/http/fuzz_test.go` with a sibling `FuzzFilterChainParse_ChainShape` that fuzzes `ValidateChainShape` with adversarial `(name1, typeURL1, name2, typeURL2, count, registerRouter)` tuples; per the PLAN's "logically a single FuzzFilterChainParse target with two seed corpora" framing, both fuzzers run under the 30s ADR-0018 budget (separately invoked here for verification — the seed body counts are 3+3=6 sub-tests under `go test`). 30s gates clean: `FuzzFilterChainParse` 1,360,373 execs / 0 crashers; `FuzzFilterChainParse_ChainShape` 11,426,311 execs / 0 crashers. **PLAN deviations:**
+- (i) The PLAN Task 14 Step 1 places `chainConfig` + `perRouteConfig` field additions in Task 14's `filter.go` change. Task 13 pre-emptively adds these fields to the `Filter` struct in this commit (per PROMPT option (a) — produces a cleaner intermediate state since the parser side that populates them lives in Task 13); Task 14's PROGRESS will note "fields landed in Task 13".
+- (ii) The PLAN Task 13 Step 4 sketches the chain-shape fuzzer extension as fuzzing `parseFilterWithCtx` directly via a thin shim. This requires `internal/filter/http/fuzz_test.go` to import `internal/filter/hcm` — which would create an import cycle (`hcm` already imports `filter/http`). Resolved by extracting the four-rule chain-shape validation to `filter_http.ValidateChainShape` (in `internal/filter/http/chain_shape.go`) — the hcm parser delegates to it, the fuzzer fuzzes it directly, no cycle. The fuzzer now exercises the same validation paths the PLAN intended without the sketch's cycle hazard.
+- (iii) The dangling `routerAction` / `routerActionH2` references at `config.go:480,482` (action-construction in `buildRouterAction`), `route.go:89,91` (route-table action variant binding), and `h2dispatch.go:62,119` (h2-dispatch action variant) are LEFT in place by Task 13 per the PROMPT's disposition guidance: "those refs are in the per-request action-selection path... they belong to Task 14/15/16 wiring, NOT Task 13". The hcm package therefore still does not build — restored at Task 16 per PLAN Task 12 Step 3 refinement. The `RouteScope` field rename (lowercase `vhost`/`route` → uppercase `VHost`/`Route`) is Task 13's one structural ripple in `internal/filter/http/`; the transitional `routeScope` type alias preserves the rest of the existing test bodies verbatim.
+
+**Acceptance:** All four new error-class tests are wired into `parseFilter` (which delegates to `parseFilterWithCtx`); they will execute successfully once Task 16 restores hcm-package buildability — the same testing discipline that Task 12 documented. The four tests assert the verbatim canonical error texts (TestParseFilterWithCtx_RejectsEmptyChain + RejectsDuplicateFilterName use exact-match equality; RejectsNonRouterTerminal + RejectsUnknownTypeURL use substring match for the parts that depend on the wider error context). Existing chain-validation test substrings updated to match the new wording. Extended `FuzzFilterChainParse` (via the sibling `_ChainShape` target) ran clean under the 30s budget. `go vet ./internal/filter/http/...` clean.
+
+**Outputs:**
+```
+$ go build ./internal/filter/http/
+(clean)
+
+$ go vet ./internal/filter/http/...
+(clean)
+
+$ go test -count=1 -v ./internal/filter/http/ 2>&1 | tail -22
+=== RUN   FuzzFilterChainParse
+=== RUN   FuzzFilterChainParse/seed#0
+=== RUN   FuzzFilterChainParse/seed#1
+=== RUN   FuzzFilterChainParse/seed#2
+--- PASS: FuzzFilterChainParse (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#0 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#1 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#2 (0.00s)
+=== RUN   FuzzFilterChainParse_ChainShape
+=== RUN   FuzzFilterChainParse_ChainShape/seed#0
+=== RUN   FuzzFilterChainParse_ChainShape/seed#1
+=== RUN   FuzzFilterChainParse_ChainShape/seed#2
+--- PASS: FuzzFilterChainParse_ChainShape (0.00s)
+    --- PASS: FuzzFilterChainParse_ChainShape/seed#0 (0.00s)
+    --- PASS: FuzzFilterChainParse_ChainShape/seed#1 (0.00s)
+    --- PASS: FuzzFilterChainParse_ChainShape/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.131s
+
+$ go test -fuzz=FuzzFilterChainParse$ -fuzztime=30s ./internal/filter/http/
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+fuzz: elapsed: 0s, gathering baseline coverage: 0/266 completed
+fuzz: elapsed: 1s, gathering baseline coverage: 266/266 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 490053 (163344/sec), new interesting: 5 (total: 271)
+fuzz: elapsed: 6s, execs: 873442 (127768/sec), new interesting: 7 (total: 273)
+fuzz: elapsed: 9s, execs: 956931 (27809/sec), new interesting: 7 (total: 273)
+fuzz: elapsed: 12s, execs: 992626 (11906/sec), new interesting: 7 (total: 273)
+fuzz: elapsed: 15s, execs: 992626 (0/sec), new interesting: 7 (total: 273)
+fuzz: elapsed: 18s, execs: 1287010 (98128/sec), new interesting: 8 (total: 274)
+fuzz: elapsed: 21s, execs: 1332084 (15032/sec), new interesting: 8 (total: 274)
+fuzz: elapsed: 24s, execs: 1360373 (9428/sec), new interesting: 9 (total: 275)
+fuzz: elapsed: 27s, execs: 1360373 (0/sec), new interesting: 9 (total: 275)
+fuzz: elapsed: 30s, execs: 1360373 (0/sec), new interesting: 9 (total: 275)
+fuzz: elapsed: 31s, execs: 1360373 (0/sec), new interesting: 9 (total: 275)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	31.177s
+
+$ go test -fuzz=FuzzFilterChainParse_ChainShape -fuzztime=30s ./internal/filter/http/
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+fuzz: elapsed: 0s, gathering baseline coverage: 0/196 completed
+fuzz: elapsed: 1s, gathering baseline coverage: 196/196 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 950364 (316718/sec), new interesting: 2 (total: 198)
+fuzz: elapsed: 6s, execs: 2117131 (388920/sec), new interesting: 2 (total: 198)
+fuzz: elapsed: 9s, execs: 3279430 (387431/sec), new interesting: 9 (total: 205)
+fuzz: elapsed: 12s, execs: 4413372 (378007/sec), new interesting: 11 (total: 207)
+fuzz: elapsed: 15s, execs: 5548529 (378429/sec), new interesting: 13 (total: 209)
+fuzz: elapsed: 18s, execs: 6779711 (410291/sec), new interesting: 14 (total: 210)
+fuzz: elapsed: 21s, execs: 7945530 (388595/sec), new interesting: 16 (total: 212)
+fuzz: elapsed: 24s, execs: 9112138 (388898/sec), new interesting: 17 (total: 213)
+fuzz: elapsed: 27s, execs: 10267281 (385064/sec), new interesting: 18 (total: 214)
+fuzz: elapsed: 30s, execs: 11426311 (386389/sec), new interesting: 19 (total: 215)
+fuzz: elapsed: 30s, execs: 11426311 (0/sec), new interesting: 19 (total: 215)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	30.249s
+
+$ go build ./internal/filter/hcm/ 2>&1
+# github.com/esalaine/envoy-go/internal/filter/hcm
+internal/filter/hcm/h2dispatch.go:62:8: undefined: routerActionH2
+internal/filter/hcm/h2dispatch.go:119:10: undefined: routerActionH2
+internal/filter/hcm/config.go:480:11: undefined: routerActionH2
+internal/filter/hcm/config.go:482:10: undefined: routerAction
+internal/filter/hcm/route.go:89:9: undefined: routerAction
+internal/filter/hcm/route.go:91:9: undefined: routerActionH2
+```
+
+The hcm package still does not build (same six dangling refs from Task 12 — Task 13's parseFilterWithCtx widening compiles cleanly modulo those). Per PLAN Task 12 Step 3 refinement: Tasks 13–15 may leave the package non-building; Task 16 restores buildability. The four new tests (and the four existing tests with adapted error-message substrings) cannot run until then; the test bodies have been audit-trail-verified against the new validator's verbatim error texts.
+
+The fuzzer count post-Task-13 is **10** (matches SPEC §1 + §14.9): bootstrap (1) + stats (1) + tls (1) + accesslog (1) + filter/tcpproxy (1) + filter/hcm (1) + filter/hcm/h2 (2) + filter/http (2 — `FuzzFilterChainParse` + `FuzzFilterChainParse_ChainShape`, the latter added in this task) = 10. The PLAN's "logically a single FuzzFilterChainParse target with two seed corpora" framing keeps the *logical* count at 9; the *function* count is 10 (Go's `func Fuzz*` counter).

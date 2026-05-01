@@ -23,7 +23,7 @@ func TestPerRoute_BuildAndResolve_RouteWins(t *testing.T) {
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc-level"))}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("vh-level"))}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("route-level"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{vhost: vhCfg, route: rtCfg}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestPerRoute_BuildAndResolve_VHostFallback(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc-level"))}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("vh-level"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{vhost: vhCfg, route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestPerRoute_BuildAndResolve_VHostFallback(t *testing.T) {
 func TestPerRoute_BuildAndResolve_RCFallback(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc-level"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{vhost: nil, route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestPerRoute_BuildAndResolve_RCFallback(t *testing.T) {
 
 func TestPerRoute_BuildAndResolve_NilOnAbsent(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
-	pr, err := BuildPerRouteConfig(nil, []routeScope{{vhost: nil, route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: nil}}, chainNames)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestPerRoute_BuildRejectsUnknownFilterName(t *testing.T) {
 func TestPerRoute_LazyCacheHitMiss(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{vhost: nil, route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}

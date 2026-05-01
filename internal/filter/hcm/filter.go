@@ -20,8 +20,12 @@ import (
 // Phase 06.1 Task 11 widened the signature with a trailing *stats.Registry —
 // see NewFilterWithCtx (config.go) for the contract. The 5 HCM-scope metrics
 // per SPEC §6 are allocated at filter-build time, pre-Freeze.
+//
+// Task 13 transitional: this legacy constructor builds a default router-only
+// HTTPRegistry so the http_filters[] chain validates clean. Task 14 sweeps
+// all callers to a registry-aware constructor and DELETES this function.
 func NewFilter(tc *anypb.Any, clusters *cluster.Manager, registry *stats.Registry) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, registry, nil)
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, registry, nil, defaultRouterOnlyHTTPRegistry())
 }
 
 // Handle drives one downstream connection from acceptance to close. ALPN

@@ -5,12 +5,13 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -21,12 +22,22 @@ const (
 	TypeURL = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
 
 	// routerFilterName is the canonical Envoy name for the router HTTP filter.
-	// SPEC §4.1 and ADR-0040 require it as the only permitted http_filters entry.
+	// SPEC §4.1 and ADR-0040 (now superseded by ADR-0071) require it as the
+	// terminal entry in http_filters[]. Per ADR-0071 the chain may contain
+	// additional non-terminal filter entries before the router (cors, probe).
 	routerFilterName = "envoy.filters.http.router"
-
-	// routerTypeURL is the proto descriptor URL for the Router HTTP filter.
-	routerTypeURL = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
 )
+
+// chainEntry is one (name, factory) pair in the HCM Filter's resolved
+// http_filters[] chain. The factory is the per-instance allocator returned by
+// HTTPFilterFactory at HCM-build time per ADR-0071's two-step factory pattern;
+// it is invoked once per request to allocate a fresh filter instance bound to
+// the parsed config. Task 13 introduces this type; Task 15 (H1 dispatch) and
+// Task 16 (H2 dispatch) consume it via FilterChain construction.
+type chainEntry struct {
+	name    string
+	factory filter_http.FilterInstanceFactory
+}
 
 // ListenerCtx carries listener-side context the HCM filter constructor uses
 // at build time. Phase 05.1 added this for the --allow-h2c flag plumbing
@@ -64,6 +75,27 @@ type Filter struct {
 	// configured (pre-Task 14) or for listeners without access_log[] entries.
 	// Plumbed via parseFilterWithCtx; Task 14 wires real AsyncFileSinks.
 	accessLog []accesslog.Sink
+
+	// chainConfig is the resolved http_filters[] chain in declaration order.
+	// Populated by parseFilterWithCtx (Task 13); consumed by H1/H2 dispatch
+	// (Tasks 15/16) which calls each entry's factory once per request to
+	// allocate a fresh per-stream filter instance and assembles them into a
+	// *filter_http.FilterChain. Per ADR-0071's two-step factory pattern.
+	//
+	// Pre-emptively added in Task 13 (PLAN's Task 14 Step 1 specifies these
+	// fields land in filter.go / Task 14, but Task 13 is the parser side that
+	// populates them — adding the field here lets the parser write into the
+	// *Filter directly without an intermediate tuple-return refactor at
+	// Task 14). See PROGRESS Task 13 PLAN-deviation note.
+	chainConfig []chainEntry
+
+	// perRouteConfig holds the parsed-and-validated typed_per_filter_config
+	// tree from RouteConfiguration / VirtualHost / Route scopes (per ADR-0073's
+	// 3-tier merge model). nil if no typed_per_filter_config is present
+	// anywhere. Populated by parseFilterWithCtx; consumed by H1/H2 dispatch
+	// at filter-instantiation time via FilterChain.SetRequestCtx + the chain's
+	// internal Resolve cache.
+	perRouteConfig *filter_http.PerRouteConfig
 }
 
 // downstreamStatusClassCounter returns the downstream_rq_<Nxx> counter for the
@@ -94,8 +126,13 @@ func (f *Filter) downstreamStatusClassCounter(code int) *stats.Counter {
 // Phase 06.1 Task 11 widened the signature with a trailing *stats.Registry;
 // the constructor allocates the 5 HCM-scope per-instance metrics on the
 // supplied Registry (pre-Freeze; SPEC §5.4 + §6).
+//
+// Task 13 transitional: this legacy constructor builds a default router-only
+// HTTPRegistry so the http_filters[] chain validates clean for callers that
+// have not yet been swept to the registry-aware constructor (Task 14 sweeps
+// all callers and DELETES this function).
 func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc, registry, nil)
+	return parseFilterWithCtx(tc, clusters, lc, registry, nil, defaultRouterOnlyHTTPRegistry())
 }
 
 // NewFilterWithCtxAndSinks is the phase-06.2 constructor variant. It extends
@@ -103,26 +140,56 @@ func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, 
 // can thread the opened AsyncFileSinks through to the HCM filter at build
 // time. A nil or empty slice is treated as "no access logging" and is safe
 // to pass — NewFilterWithCtx delegates here with nil.
+//
+// Task 13 transitional: see NewFilterWithCtx note re: default registry.
 func NewFilterWithCtxAndSinks(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks)
+	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks, defaultRouterOnlyHTTPRegistry())
 }
 
 // parseFilter is the legacy entry point retained for existing tests.
 // It delegates to parseFilterWithCtx with a zero-value ListenerCtx and a
 // fresh throwaway Registry (legacy callers do not exercise the metric
 // pointers).
+//
+// Task 13 transitional: see NewFilterWithCtx note re: default registry.
 func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry(), nil)
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry(), nil, defaultRouterOnlyHTTPRegistry())
+}
+
+// defaultRouterOnlyHTTPRegistry returns a freshly-allocated, frozen
+// *HTTPRegistry containing only the router filter (envoy.filters.http.router
+// → router.New). Used by the Task 13 transitional legacy constructors so
+// callers that have not yet been swept to the registry-aware constructor
+// (Task 14 sweep) still produce a chain that validates clean against the
+// four chain-shape rules. Task 14 deletes the legacy constructors and this
+// helper along with them.
+func defaultRouterOnlyHTTPRegistry() *filter_http.HTTPRegistry {
+	r := filter_http.NewHTTPRegistry()
+	r.Register(router.TypeURL, router.New)
+	r.Freeze()
+	return r
 }
 
 // parseFilterWithCtx decodes the typed_config Any into a *Filter. All errors
-// begin with "hcm: ". See ADR-0040 (HTTP-filter framework subset), ADR-0041
-// (stat_prefix + ignored-set), ADR-0042 (HTTP-filter chain shape), ADR-0038
-// (route match subset), ADR-0050 (ALPN dispatch), and SPEC §2/§9.
+// begin with "hcm: ". See ADR-0040 (HTTP-filter framework subset; superseded
+// by ADR-0071), ADR-0041 (stat_prefix + ignored-set), ADR-0042 (HTTP-filter
+// chain shape; partially superseded by ADR-0071), ADR-0071 (chain-shape
+// terminal-router rule + factory pattern), ADR-0072 (HTTPRegistry threaded
+// constructor map), ADR-0073 (typed_per_filter_config 3-tier merge),
+// ADR-0038 (route match subset), ADR-0050 (ALPN dispatch), and SPEC §2/§9.
 //
 // Task 11: registry is the *stats.Registry the 5 HCM-scope per-instance
 // metrics are allocated on. Must be non-nil and non-Frozen.
-func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink) (*Filter, error) {
+//
+// Task 13: httpRegistry is the *filter_http.HTTPRegistry the parser uses to
+// resolve each http_filters[] entry's typed_config.type_url to a per-instance
+// factory closure; it must be non-nil. Must be Frozen at call time per
+// ADR-0072 (boot-time-populated, freeze-after-boot). The four chain-shape
+// rules per SPEC §1 #6 + ADR-0071's partial supersession of ADR-0042 are
+// applied via filter_http.ValidateChainShape; on success the per-entry
+// HTTPFilterFactory is invoked with the typed_config Any to allocate the
+// FilterInstanceFactory closure stored on Filter.chainConfig.
+func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry) (*Filter, error) {
 	if got := tc.GetTypeUrl(); got != TypeURL {
 		return nil, fmt.Errorf("hcm: wrong type_url %q (want %q)", got, TypeURL)
 	}
@@ -172,7 +239,17 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, fmt.Errorf("hcm: route_config: virtual_hosts[0]: domains: got %v, want [\"*\"]", domains)
 	}
 
-	if err := requireRouterOnlyHTTPFilters(msg.GetHttpFilters()); err != nil {
+	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), httpRegistry)
+	if err != nil {
+		return nil, err
+	}
+
+	chainNames := make([]string, len(chainConfig))
+	for i, e := range chainConfig {
+		chainNames[i] = e.name
+	}
+	perRoute, err := buildPerRouteFromHCM(rc, chainNames)
+	if err != nil {
 		return nil, err
 	}
 
@@ -193,6 +270,8 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		downstreamRq4xx:   registry.NewCounter(prefix + "downstream_rq_4xx"),
 		downstreamRq5xx:   registry.NewCounter(prefix + "downstream_rq_5xx"),
 		accessLog:         accessLogSinks,
+		chainConfig:       chainConfig,
+		perRouteConfig:    perRoute,
 	}
 	// Task 12: bind the filter backpointer on every action so emit-deferral
 	// sites in directResponseAction.do, routerAction.do, and routerActionH2.doH2
@@ -219,25 +298,87 @@ func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteC
 	}
 }
 
-func requireRouterOnlyHTTPFilters(filters []*hcmv3.HttpFilter) error {
-	if len(filters) != 1 {
-		return fmt.Errorf("hcm: http_filters: got %d entries, want exactly 1 (router only) per ADR-0042", len(filters))
+// parseHTTPFiltersChain walks the http_filters[] slice in declaration order
+// and returns the resolved []chainEntry. The four chain-shape rules per
+// SPEC §1 #6 + ADR-0071's partial supersession of ADR-0042 are delegated to
+// filter_http.ValidateChainShape:
+//
+//  1. Empty chain                       → "hcm: http_filters: must contain at least 1 entry (the router)"
+//  2. Last entry not router             → "hcm: http_filters: last entry must be %q (router); got %q (%s)"
+//  3. Duplicate filter name             → "hcm: http_filters: duplicate filter name %q"
+//  4. Unknown typed_config.type_url     → "hcm: http_filters[i]: unknown type_url %q (registry: known are %v)"
+//
+// Per ADR-0071 the per-entry typed_config Any is then handed to the resolved
+// HTTPFilterFactory, which parses + validates the typed_config once and
+// returns a per-request FilterInstanceFactory closure stored on the
+// chainEntry. Factory errors are wrapped with the http_filters[i] prefix.
+func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, httpRegistry *filter_http.HTTPRegistry) ([]chainEntry, error) {
+	// Build the (name, type_url) entries for ValidateChainShape. Defensive
+	// nil-typed_config handling: the empty-string TypeURL never matches a
+	// registered factory, so the rule-#4 branch fires with a clear message.
+	entries := make([]filter_http.ChainShapeEntry, len(filters))
+	for i, f := range filters {
+		var tu string
+		if tc, ok := f.GetConfigType().(*hcmv3.HttpFilter_TypedConfig); ok && tc.TypedConfig != nil {
+			tu = tc.TypedConfig.GetTypeUrl()
+		}
+		entries[i] = filter_http.ChainShapeEntry{Name: f.GetName(), TypeURL: tu}
 	}
-	f := filters[0]
-	if f.GetName() != routerFilterName {
-		return fmt.Errorf("hcm: http_filters[0]: name %q, want %q", f.GetName(), routerFilterName)
+	factories, err := filter_http.ValidateChainShape(entries, httpRegistry, routerFilterName, router.TypeURL)
+	if err != nil {
+		return nil, err
 	}
-	tc, ok := f.GetConfigType().(*hcmv3.HttpFilter_TypedConfig)
-	if !ok || tc.TypedConfig == nil {
-		return fmt.Errorf("hcm: http_filters[0]: typed_config is missing")
+	// Walk a second time to invoke each factory with its typed_config Any,
+	// accumulating per-instance factory closures.
+	chainConfig := make([]chainEntry, 0, len(filters))
+	for i, f := range filters {
+		var tcAny *anypb.Any
+		if tc, ok := f.GetConfigType().(*hcmv3.HttpFilter_TypedConfig); ok {
+			tcAny = tc.TypedConfig
+		}
+		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry})
+		if err != nil {
+			return nil, fmt.Errorf("hcm: http_filters[%d]: factory: %w", i, err)
+		}
+		chainConfig = append(chainConfig, chainEntry{name: f.GetName(), factory: instanceFactory})
 	}
-	if got := tc.TypedConfig.GetTypeUrl(); got != routerTypeURL {
-		return fmt.Errorf("hcm: http_filters[0]: typed_config type_url %q, want %q", got, routerTypeURL)
+	return chainConfig, nil
+}
+
+// buildPerRouteFromHCM extracts typed_per_filter_config maps from the parsed
+// RouteConfiguration / VirtualHost / Route levels and runs them through
+// filter_http.BuildPerRouteConfig (per ADR-0073's 3-tier merge model). The
+// downstream validator rejects any map key that is not a filter name in
+// chainNames (the resolved chain). Returns nil when no maps are present at
+// any level — short-circuits the gratuitous PerRouteConfig allocation that
+// the common phase-04..06.2 "no typed_per_filter_config in any scope" path
+// would otherwise produce.
+func buildPerRouteFromHCM(rc *routev3.RouteConfiguration, chainNames []string) (*filter_http.PerRouteConfig, error) {
+	rcMap := rc.GetTypedPerFilterConfig()
+	// Phase-04 enforces exactly one virtual_host with domains=["*"]
+	// (validated above); we still loop generally over routes inside that
+	// one vhost so the per-route scopes vector is well-shaped for ADR-0073's
+	// 3-tier merge cache.
+	var scopes []filter_http.RouteScope
+	for _, vh := range rc.GetVirtualHosts() {
+		vhMap := vh.GetTypedPerFilterConfig()
+		for _, r := range vh.GetRoutes() {
+			scopes = append(scopes, filter_http.RouteScope{VHost: vhMap, Route: r.GetTypedPerFilterConfig()})
+		}
 	}
-	if err := tc.TypedConfig.UnmarshalTo(&routerv3.Router{}); err != nil {
-		return fmt.Errorf("hcm: http_filters[0]: typed_config unmarshal: %w", err)
+	hasAny := len(rcMap) > 0
+	if !hasAny {
+		for _, s := range scopes {
+			if len(s.VHost) > 0 || len(s.Route) > 0 {
+				hasAny = true
+				break
+			}
+		}
 	}
-	return nil
+	if !hasAny {
+		return nil, nil
+	}
+	return filter_http.BuildPerRouteConfig(rcMap, scopes, chainNames)
 }
 
 func buildRouteTable(routes []*routev3.Route, clusters *cluster.Manager) (*routeTable, error) {

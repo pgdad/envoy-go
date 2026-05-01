@@ -272,30 +272,144 @@ func TestParseFilter_VHostDomainsNotStarOnly(t *testing.T) {
 	}, "domains")
 }
 
+// TestParseFilter_HTTPFiltersEmpty verifies the rule-#1 error class per
+// SPEC §1 #6 + ADR-0071: an empty http_filters[] is rejected with the
+// canonical "must contain at least 1 entry (the router)" message. Renamed
+// + asserted substring updated post-Task-13 (was: substring "http_filters",
+// pre-Task-13's exactly-[router] rule).
 func TestParseFilter_HTTPFiltersEmpty(t *testing.T) {
-	expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.HttpFilters = nil }, "http_filters")
+	expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.HttpFilters = nil }, "must contain at least 1 entry")
 }
 
+// TestParseFilter_HTTPFiltersTwoEntries verifies that two entries with the
+// same name fall into rule-#3 (duplicate filter name) rather than the
+// previous "exactly-[router]" rejection. The mkHCM-default + appended entry
+// share name "envoy.filters.http.router" — exactly the duplicate case.
 func TestParseFilter_HTTPFiltersTwoEntries(t *testing.T) {
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) {
 		h.HttpFilters = append(h.HttpFilters, &hcmv3.HttpFilter{
 			Name:       "envoy.filters.http.router",
 			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouter()},
 		})
-	}, "http_filters")
+	}, "duplicate filter name")
 }
 
+// TestParseFilter_HTTPFiltersWrongName verifies the rule-#2 error class:
+// when the last (and only) entry's name is not the router, the error
+// reports "last entry must be ... (router)". Pre-Task-13 the substring
+// was "name"; post-Task-13 the canonical wording per ADR-0071 is the
+// "last entry must be" form.
 func TestParseFilter_HTTPFiltersWrongName(t *testing.T) {
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) {
 		h.HttpFilters[0].Name = "envoy.filters.http.cors"
-	}, "name")
+	}, "last entry must be")
 }
 
+// TestParseFilter_HTTPFiltersWrongTypeURL verifies that when the last entry's
+// name is router but typed_config.type_url is wrong, rule-#2 fires (last
+// entry's (name, type_url) pair must equal the router pair). Pre-Task-13
+// this surfaced as an inline typed_config type_url check; post-Task-13 the
+// shape-validator reports the same condition via the unified "last entry
+// must be" message — which renders the actual type_url after the comma.
 func TestParseFilter_HTTPFiltersWrongTypeURL(t *testing.T) {
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) {
 		other, _ := anypb.New(&wrapperspb.StringValue{Value: "x"})
 		h.HttpFilters[0].ConfigType = &hcmv3.HttpFilter_TypedConfig{TypedConfig: other}
-	}, "type_url")
+	}, "last entry must be")
+}
+
+// TestParseFilterWithCtx_RejectsEmptyChain is the rule-#1 acceptance test
+// (per Task 13 §Acceptance bullet 1). Asserts the verbatim canonical error
+// "hcm: http_filters: must contain at least 1 entry (the router)" — exact
+// text per SPEC §1 #6 + ADR-0071's partial supersession of ADR-0042.
+func TestParseFilterWithCtx_RejectsEmptyChain(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.HttpFilters = nil })
+	_, err := parseFilter(any, cm)
+	if err == nil {
+		t.Fatal("expected error for empty http_filters[], got nil")
+	}
+	wantExact := `hcm: http_filters: must contain at least 1 entry (the router)`
+	if err.Error() != wantExact {
+		t.Errorf("error = %q, want exact %q", err.Error(), wantExact)
+	}
+}
+
+// TestParseFilterWithCtx_RejectsNonRouterTerminal is the rule-#2 acceptance
+// test (per Task 13 §Acceptance bullet 1). The chain has a single entry
+// whose name is not the router — error must be the canonical "last entry
+// must be ..." form.
+func TestParseFilterWithCtx_RejectsNonRouterTerminal(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.HttpFilters[0].Name = "envoy.filters.http.cors"
+	})
+	_, err := parseFilter(any, cm)
+	if err == nil {
+		t.Fatal("expected error for non-router terminal, got nil")
+	}
+	want := `hcm: http_filters: last entry must be "envoy.filters.http.router" (router); got "envoy.filters.http.cors"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want substring %q", err.Error(), want)
+	}
+}
+
+// TestParseFilterWithCtx_RejectsDuplicateFilterName is the rule-#3 acceptance
+// test (per Task 13 §Acceptance bullet 1). The chain has two entries that
+// share a name — error must be the canonical "duplicate filter name" form.
+func TestParseFilterWithCtx_RejectsDuplicateFilterName(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		// Append a second router-named entry — two entries with name
+		// "envoy.filters.http.router" → rule #3 fires on the second iter.
+		h.HttpFilters = append(h.HttpFilters, &hcmv3.HttpFilter{
+			Name:       "envoy.filters.http.router",
+			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouter()},
+		})
+	})
+	_, err := parseFilter(any, cm)
+	if err == nil {
+		t.Fatal("expected error for duplicate filter name, got nil")
+	}
+	wantExact := `hcm: http_filters: duplicate filter name "envoy.filters.http.router"`
+	if err.Error() != wantExact {
+		t.Errorf("error = %q, want exact %q", err.Error(), wantExact)
+	}
+}
+
+// TestParseFilterWithCtx_RejectsUnknownTypeURL is the rule-#4 acceptance test
+// (per Task 13 §Acceptance bullet 1). A non-terminal entry's type_url is not
+// in the registry — error must be the canonical "unknown type_url" form
+// reporting the bad type_url + the registry's known set. We construct an
+// adversarial chain with a bogus-typed-non-terminal then router as terminal
+// (so rule #2 passes; rule #4 fires on the first iteration).
+func TestParseFilterWithCtx_RejectsUnknownTypeURL(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		bogus, _ := anypb.New(&wrapperspb.StringValue{Value: "x"})
+		// Prepend a non-terminal entry with an unknown type_url. Last entry
+		// remains the default router → rule #2 passes; rule #4 fires.
+		h.HttpFilters = append(
+			[]*hcmv3.HttpFilter{{
+				Name:       "envoy.filters.http.unknown",
+				ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: bogus},
+			}},
+			h.HttpFilters...,
+		)
+	})
+	_, err := parseFilter(any, cm)
+	if err == nil {
+		t.Fatal("expected error for unknown type_url, got nil")
+	}
+	want := `hcm: http_filters[0]: unknown type_url "type.googleapis.com/google.protobuf.StringValue"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want substring %q", err.Error(), want)
+	}
+	// Also assert "registry: known are" appears so the actionable-output
+	// contract from PLAN Step 2 is covered.
+	if !strings.Contains(err.Error(), "registry: known are") {
+		t.Errorf("error = %q, missing 'registry: known are' actionable suffix", err.Error())
+	}
 }
 
 func TestParseFilter_RouteUnknownAction(t *testing.T) {

@@ -8,13 +8,24 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// routeScope carries the typed_per_filter_config maps from a single Route +
-// its containing VirtualHost. The PerRouteConfig holds one routeScope per
+// RouteScope carries the typed_per_filter_config maps from a single Route +
+// its containing VirtualHost. The PerRouteConfig holds one RouteScope per
 // matched route + the RouteConfiguration-level map.
-type routeScope struct {
-	vhost map[string]*anypb.Any
-	route map[string]*anypb.Any
+//
+// Exported (Task 13) so the HCM config parser in internal/filter/hcm can
+// construct one without a constructor-call dance. Pre-Task-13 this type was
+// package-private (named routeScope); the routeScope alias below preserves
+// the existing fuzzer + perroute_test.go bodies verbatim through the Task 13
+// cycle (Task 14 sweeps the lowercase references).
+type RouteScope struct {
+	VHost map[string]*anypb.Any // typed_per_filter_config from the containing virtual_host
+	Route map[string]*anypb.Any // typed_per_filter_config from the route itself
 }
+
+// routeScope is a transitional alias preserved so the fuzzer's internal seed
+// body and perroute_test.go can keep using the lowercase form during the
+// Task 13 cycle. Removed in Task 14 when the test bodies are swept.
+type routeScope = RouteScope
 
 // PerRouteConfig is the parsed-and-validated per-route config tree, built
 // once at HCM-build time. Resolve performs the merge + unmarshal at
@@ -73,11 +84,11 @@ func BuildPerRouteConfig(rcCfg map[string]*anypb.Any, scopes []routeScope, chain
 	}
 	out.scopes = make([]scopeParsed, len(scopes))
 	for i, s := range scopes {
-		vh, err := parseMap(s.vhost, fmt.Sprintf("route_config.virtual_hosts[%d]", i))
+		vh, err := parseMap(s.VHost, fmt.Sprintf("route_config.virtual_hosts[%d]", i))
 		if err != nil {
 			return nil, err
 		}
-		rt, err := parseMap(s.route, fmt.Sprintf("route_config.virtual_hosts[%d].routes[%d]", i, i))
+		rt, err := parseMap(s.Route, fmt.Sprintf("route_config.virtual_hosts[%d].routes[%d]", i, i))
 		if err != nil {
 			return nil, err
 		}
