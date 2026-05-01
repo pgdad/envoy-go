@@ -1273,8 +1273,8 @@ func TestChain_DecodeData_BelowCapDoesNotSynthesize(t *testing.T) {
 }
 
 // TestChain_EncodeData_OverflowReturnsSentinel asserts ADR-0076 encode-side
-// overflow path: RunEncodeData accumulates encodeBuf across calls; when a chunk
-// would push the total above filterBufferLimitBytes the chain returns
+// overflow path: RunEncodeData accumulates encodeBufLen across calls; when a
+// chunk would push the total above filterBufferLimitBytes the chain returns
 // errEncodeBufferOverflow without iterating further encode-side filters on
 // that chunk. The HCM dispatch path resets the connection (H1 close, H2
 // RST_STREAM) — handled in Tasks 15 + 16.
@@ -1291,7 +1291,7 @@ func TestChain_EncodeData_OverflowReturnsSentinel(t *testing.T) {
 	chain, _ := newChainOf(a)
 
 	// First call: a chunk exactly at the cap. This should NOT overflow yet
-	// (len(encodeBuf)+len(data) == filterBufferLimitBytes; the check is "> cap",
+	// (encodeBufLen+len(data) == filterBufferLimitBytes; the check is "> cap",
 	// not ">= cap" per the PLAN scaffold).
 	first := make([]byte, filterBufferLimitBytes)
 	terminated, err := chain.RunEncodeData(context.Background(), first, false)
