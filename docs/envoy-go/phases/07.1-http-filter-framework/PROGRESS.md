@@ -548,3 +548,97 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http	2.116s
 $ go vet ./internal/filter/http/...
 $ go build ./...
 ```
+
+## Task 9 — chain.go buffer overflow [ADR-0076]
+
+**Commits:** TBD — this task's commit
+**Notes:** Implemented `RunDecodeData` + decode-side 413-on-overflow path + encode-side overflow sentinel in `internal/filter/http/chain.go` per ADR-0076 + SPEC §11 #3 empirical pin + SPEC §15 acceptance bullet 2. **`RunDecodeData`** iterates decode-side filters in declaration order with cursor-reset to 0 at the start (mirroring the encode-side cursor reset in `RunEncodeData` from Task 6 — the cursor sits at `len(filters)` after `RunDecodeHeaders` completes); on `DataStopIterationAndBuffer` the chain checks `len(c.decodeBuf)+len(data) > filterBufferLimitBytes` and either accumulates into `decodeBuf` + parks via `parkDecode` or — on overflow — synthesizes the verbatim 413 wire shape via `beginLocalReply(c.ambientCtx, c.decodeIdx, 413, "Payload Too Large", http.Header{"Connection": ["close"]})` and returns `(false, nil)` with the chain transitioned to encode mode. The 17-byte body literal is pinned in the package-private constant `localReply413BodyBytes = "Payload Too Large"` (no trailing newline per §11 #3). `Date` and `Server` headers are intentionally NOT framework-injected (per ADR-0075 (b) — those land on the HCM wire-write path at Task 15). The same `localReplyDone` early-out + post-filter-call short-circuit pattern from `RunDecodeHeaders` (Task 7) is honored, so a filter's `DecodeData` calling `SendLocalReply` directly is also handled correctly. **`RunEncodeData`** updated to track per-stream encode-side buffer accumulation in the new `encodeBuf []byte` field; the cap check `len(c.encodeBuf)+len(data) > filterBufferLimitBytes` runs at the TOP of the method (before any filter is iterated on the overflowing chunk) and returns the package-private sentinel `errEncodeBufferOverflow = errors.New("chain: encode-side buffer overflow; resetting connection")` with `(false, errEncodeBufferOverflow)`. The HCM dispatch path consumes this sentinel at Tasks 15 + 16 (H1: `connection: close` + conn close; H2: RST_STREAM with `INTERNAL_ERROR`). After successful iteration on a within-cap chunk, the bytes are appended to `encodeBuf` to update the accumulator. Two new struct fields landed for symmetry with the existing `decodeBuf`/`decodeBufOver`: `encodeBuf []byte` + `encodeBufOver bool`. **Tests:** four new tests added (38 total, was 34): `TestChain_DecodeData_OverflowSynthesizes413` (the §11 #3 verbatim-pin assertion in unit-test form — synthetic 2-filter chain `[buf, router]` where `buf.DecodeData` returns `DataStopIterationAndBuffer`; chunk `filterBufferLimitBytes+1` bytes triggers 413; `captureRecorder` snapshot asserts body == `"Payload Too Large"` (17 bytes, no trailing newline) + `Content-Length: 17` + `Content-Type: text/plain` + `Connection: close` on the encode-side captured headers + `chain.localReplyDone == true` proxies the unobservable status code), `TestChain_DecodeData_BelowCapDoesNotSynthesize` (a 1024-byte chunk on the same chain with async `ContinueDecoding` 20ms later — iteration completes, `localReplyDone=false`, `decodeBuf` accumulated 1024 bytes, router's decode side ran), `TestChain_EncodeData_OverflowReturnsSentinel` (encode-side: first `RunEncodeData` call with `filterBufferLimitBytes` bytes succeeds; second call with 1 byte triggers `errEncodeBufferOverflow` at exactly the cap boundary; verified via `errors.Is`), and `TestChain_EncodeData_BelowCapNoSentinel` (three 1024-byte chunks succeed without sentinel). The `bufferOnceFilter` + `captureRecorder` test helpers were added (extending the Task 7 `headerCaptureRecorder` pattern with body capture). **PLAN deviations:** (i) the PLAN's pseudo-code for `RunDecodeData` did not show an explicit `c.decodeIdx = 0` reset; without the reset the loop body never runs because `decodeIdx == len(filters)` after `RunDecodeHeaders` completes. The reset is necessary + matches `RunEncodeData`'s symmetric reset already present from Task 6; codified as a deviation here per the phase-04..06.2 PLAN-deviation precedent. (ii) the PLAN scaffold for the encode-side cap check placed the check inside the `case` branch; landed as a top-of-method check instead — semantically equivalent (the sentinel is returned BEFORE any filter runs on the overflowing chunk, which is the discipline asked for by the encode-side reset semantics — no partially-emitted overflowing data). All 38 tests pass under `-race`; `go vet ./...` + `go build ./...` clean. ADR-0076 appended to `DECISIONS.md` (full Status / Date / Doctrine / Amends / Context / Decision / Inline-supersession / Alternatives / Consequences / Lands-in-task template per ADR-0001 + ADR-0075 stylistic precedent).
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/ -count=1 -v
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestChain_Decode_AllContinue
+--- PASS: TestChain_Decode_AllContinue (0.00s)
+=== RUN   TestChain_Decode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Decode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Decode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Decode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_ReverseOrder
+--- PASS: TestChain_Encode_ReverseOrder (0.00s)
+=== RUN   TestChain_Encode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Encode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Encode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Encode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_UnknownTrailersStatusErrs
+--- PASS: TestChain_Encode_UnknownTrailersStatusErrs (0.00s)
+=== RUN   TestChain_SendLocalReply_EntersAtLenMinus1
+--- PASS: TestChain_SendLocalReply_EntersAtLenMinus1 (0.00s)
+=== RUN   TestChain_SendLocalReply_FirstCallWins
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+--- PASS: TestChain_SendLocalReply_FirstCallWins (0.00s)
+=== RUN   TestChain_SendLocalReply_CallingFilterEncodeRuns
+--- PASS: TestChain_SendLocalReply_CallingFilterEncodeRuns (0.00s)
+=== RUN   TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs
+--- PASS: TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs (0.00s)
+=== RUN   TestChain_SendLocalReply_UserContentTypeNonCanonicalKey
+--- PASS: TestChain_SendLocalReply_UserContentTypeNonCanonicalKey (0.00s)
+=== RUN   TestChain_SendLocalReply_DefaultsAmbientCtxToBackground
+--- PASS: TestChain_SendLocalReply_DefaultsAmbientCtxToBackground (0.02s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_DecodeData_OverflowSynthesizes413
+--- PASS: TestChain_DecodeData_OverflowSynthesizes413 (0.01s)
+=== RUN   TestChain_DecodeData_BelowCapDoesNotSynthesize
+--- PASS: TestChain_DecodeData_BelowCapDoesNotSynthesize (0.02s)
+=== RUN   TestChain_EncodeData_OverflowReturnsSentinel
+--- PASS: TestChain_EncodeData_OverflowReturnsSentinel (0.00s)
+=== RUN   TestChain_EncodeData_BelowCapNoSentinel
+--- PASS: TestChain_EncodeData_BelowCapNoSentinel (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RouteWins
+--- PASS: TestPerRoute_BuildAndResolve_RouteWins (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_VHostFallback
+--- PASS: TestPerRoute_BuildAndResolve_VHostFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RCFallback
+--- PASS: TestPerRoute_BuildAndResolve_RCFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_NilOnAbsent
+--- PASS: TestPerRoute_BuildAndResolve_NilOnAbsent (0.00s)
+=== RUN   TestPerRoute_BuildRejectsUnknownFilterName
+--- PASS: TestPerRoute_BuildRejectsUnknownFilterName (0.00s)
+=== RUN   TestPerRoute_LazyCacheHitMiss
+--- PASS: TestPerRoute_LazyCacheHitMiss (0.00s)
+=== RUN   TestRegistry_RegisterLookup
+--- PASS: TestRegistry_RegisterLookup (0.00s)
+=== RUN   TestRegistry_DuplicateRegisterPanics
+--- PASS: TestRegistry_DuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistry_PostFreezeRegisterPanics
+--- PASS: TestRegistry_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_FreezeIdempotent
+--- PASS: TestRegistry_FreezeIdempotent (0.00s)
+=== RUN   TestRegistry_LookupAfterFreezeOK
+--- PASS: TestRegistry_LookupAfterFreezeOK (0.00s)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.148s
+
+$ go vet ./...
+$ go build ./...
+
+$ grep -nE '^## ADR-0076:' docs/envoy-go/DECISIONS.md
+2702:## ADR-0076: Body buffer cap; 413 on decode overflow; reset on encode overflow
+```

@@ -3,6 +3,7 @@ package http
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -1054,4 +1055,293 @@ func TestChain_DestroyVsInFlightContinueEncoding(t *testing.T) {
 
 	// Final ContinueEncoding after the second Destroy — still must not panic.
 	b.ecb.ContinueEncoding()
+}
+
+// bufferOnceFilter is a decode-side filter that returns DataStopIterationAndBuffer
+// the first time DecodeData is called. Used to drive the buffer-overflow path on
+// RunDecodeData: a chunk that exceeds filterBufferLimitBytes synthesizes a 413
+// local reply per ADR-0076 + SPEC §11 #3.
+type bufferOnceFilter struct {
+	*recordingFilter
+}
+
+func (b *bufferOnceFilter) DecodeData(d []byte, end bool) FilterDataStatus {
+	b.recordingFilter.DecodeData(d, end)
+	return DataStopIterationAndBuffer
+}
+
+// captureRecorder is an Encoder wrapper that captures both the encoded
+// http.Header map and the encoded body bytes as beginLocalReply passes them
+// down the encode chain. Used by TestChain_DecodeData_OverflowSynthesizes413
+// to assert the verbatim 413 wire shape (headers + body).
+type captureRecorder struct {
+	f             *recordingFilter
+	capturedHdr   *http.Header
+	capturedBody  *[]byte
+	mu            *sync.Mutex
+}
+
+func (c captureRecorder) EncodeHeaders(hd http.Header, end bool) FilterHeadersStatus {
+	c.mu.Lock()
+	cp := make(http.Header, len(hd))
+	for k, vs := range hd {
+		cp[k] = append([]string(nil), vs...)
+	}
+	*c.capturedHdr = cp
+	c.mu.Unlock()
+	return c.f.EncodeHeaders(hd, end)
+}
+func (c captureRecorder) EncodeData(d []byte, end bool) FilterDataStatus {
+	c.mu.Lock()
+	body := make([]byte, len(d))
+	copy(body, d)
+	*c.capturedBody = body
+	c.mu.Unlock()
+	return c.f.EncodeData(d, end)
+}
+func (c captureRecorder) EncodeTrailers(t http.Header) FilterTrailersStatus {
+	return c.f.EncodeTrailers(t)
+}
+func (c captureRecorder) SetEncoderCallbacks(cb EncoderFilterCallbacks) {
+	c.f.SetEncoderCallbacks(cb)
+}
+func (c captureRecorder) OnDestroy() { c.f.OnDestroy() }
+
+// TestChain_DecodeData_OverflowSynthesizes413 asserts ADR-0076 + SPEC §11 #3
+// empirical pin: when a decode-side filter returns DataStopIterationAndBuffer
+// and the per-stream body buffer would exceed filterBufferLimitBytes, the
+// chain synthesizes a 413 local reply with the verbatim wire shape:
+//   - body == "Payload Too Large" (17 bytes ASCII; no trailing newline);
+//   - Content-Length: 17;
+//   - Content-Type: text/plain (framework default — no user override);
+//   - Connection: close (framework-injected per the 413 path).
+//
+// Status code is consumed by the HCM wire-write layer (Task 13/15) and is not
+// observable at the chain layer; the assertion proxies it via
+// `chain.localReplyDone == true` (the SendLocalReply guard fired).
+//
+// The Date and Server headers are NOT framework-injected (per ADR-0075 (b) +
+// the empirical pin's footnote: those land on the wire-write path) — only the
+// three observable headers above are asserted on the encode-chain capture.
+func TestChain_DecodeData_OverflowSynthesizes413(t *testing.T) {
+	var capturedHdr http.Header
+	var capturedBody []byte
+	var capMu sync.Mutex
+
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	bufRec := mk("buf")
+	router := mk("router")
+	bufferer := &bufferOnceFilter{recordingFilter: bufRec}
+	hf := []HTTPFilter{
+		{Name: "buf", Decoder: bufferer, Encoder: captureRecorder{f: bufRec, capturedHdr: &capturedHdr, capturedBody: &capturedBody, mu: &capMu}},
+		{Name: "router", Decoder: router, Encoder: captureRecorder{f: router, capturedHdr: &capturedHdr, capturedBody: &capturedBody, mu: &capMu}},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+
+	// Drive RunDecodeHeaders first (decode iteration cursor must advance to the
+	// data phase) then RunDecodeData with a chunk larger than filterBufferLimitBytes.
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, false); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	// The cursor sits at len(filters) after RunDecodeHeaders completes (both
+	// filters returned Continue on headers). For RunDecodeData the cursor must
+	// re-enter at index 0; the production code resets the cursor at the top of
+	// RunDecodeData (mirrors the encode-side reset in RunEncodeData).
+	chunk := make([]byte, filterBufferLimitBytes+1)
+	for i := range chunk {
+		chunk[i] = 'A'
+	}
+	terminated, err := chain.RunDecodeData(context.Background(), chunk, true)
+	if err != nil {
+		t.Fatalf("RunDecodeData: %v", err)
+	}
+	if terminated {
+		t.Fatalf("expected RunDecodeData to abort iteration via 413 synthesis (terminated=false); got true")
+	}
+
+	// localReplyDone is the framework's signal that a SendLocalReply (synthesized
+	// or otherwise) fired.
+	if !chain.localReplyDone.Load() {
+		t.Fatalf("expected localReplyDone=true after overflow-triggered 413 synthesis")
+	}
+
+	// Verify the encode chain ran with the verbatim 413 wire shape.
+	capMu.Lock()
+	gotHdr := capturedHdr
+	gotBody := capturedBody
+	capMu.Unlock()
+	if gotHdr == nil {
+		t.Fatalf("expected encode chain to have run + captured headers; got nil")
+	}
+
+	// Body: 17 bytes, exact ASCII "Payload Too Large", no trailing newline.
+	wantBody := "Payload Too Large"
+	if len(gotBody) != 17 {
+		t.Fatalf("expected body length == 17; got %d", len(gotBody))
+	}
+	if string(gotBody) != wantBody {
+		t.Fatalf("expected body == %q; got %q", wantBody, string(gotBody))
+	}
+	if bytes.HasSuffix(gotBody, []byte{'\n'}) {
+		t.Fatalf("expected body to have NO trailing newline; got %q", string(gotBody))
+	}
+
+	// Content-Length: 17.
+	if cl := gotHdr.Get("Content-Length"); cl != "17" {
+		t.Fatalf("expected Content-Length: 17; got %q", cl)
+	}
+	// Content-Type: text/plain (framework default).
+	if ct := gotHdr.Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("expected Content-Type: text/plain; got %q", ct)
+	}
+	// Connection: close (framework-injected on the 413 path).
+	if cn := gotHdr.Get("Connection"); cn != "close" {
+		t.Fatalf("expected Connection: close on 413 synthesis; got %q", cn)
+	}
+}
+
+// TestChain_DecodeData_BelowCapDoesNotSynthesize asserts the body-cap-respected-
+// on-non-overflow path: a chunk that does NOT exceed filterBufferLimitBytes is
+// buffered (decodeBuf accumulates) and parkDecode is invoked; once
+// ContinueDecoding fires the iteration advances and NO 413 is synthesized.
+func TestChain_DecodeData_BelowCapDoesNotSynthesize(t *testing.T) {
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	bufRec := mk("buf")
+	router := mk("router")
+	bufferer := &bufferOnceFilter{recordingFilter: bufRec}
+	hf := []HTTPFilter{
+		{Name: "buf", Decoder: bufferer, Encoder: bufRec},
+		{Name: "router", Decoder: router, Encoder: router},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, false); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	// Async resume: park happens because bufferer returns DataStopIterationAndBuffer;
+	// 20ms later we fire ContinueDecoding to unblock the dispatch goroutine.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		bufferer.dcb.ContinueDecoding()
+	}()
+	// Chunk well under the cap (1024 bytes).
+	chunk := make([]byte, 1024)
+	for i := range chunk {
+		chunk[i] = 'B'
+	}
+	terminated, err := chain.RunDecodeData(context.Background(), chunk, true)
+	if err != nil {
+		t.Fatalf("RunDecodeData: %v", err)
+	}
+	if !terminated {
+		t.Fatalf("expected RunDecodeData to complete after async resume (terminated=true); got false")
+	}
+	// No 413 synthesis: localReplyDone must NOT be set.
+	if chain.localReplyDone.Load() {
+		t.Fatalf("expected localReplyDone=false on under-cap chunk; got true")
+	}
+	// decodeBuf must have accumulated the chunk (1024 bytes).
+	if len(chain.decodeBuf) != 1024 {
+		t.Fatalf("expected decodeBuf length 1024; got %d", len(chain.decodeBuf))
+	}
+	// router's decode side must have run (iteration advanced past the buffering filter).
+	if router.decodeData.Load() != 1 {
+		t.Fatalf("expected router.DecodeData called once after resume; got %d", router.decodeData.Load())
+	}
+}
+
+// TestChain_EncodeData_OverflowReturnsSentinel asserts ADR-0076 encode-side
+// overflow path: RunEncodeData accumulates encodeBuf across calls; when a chunk
+// would push the total above filterBufferLimitBytes the chain returns
+// errEncodeBufferOverflow without iterating further encode-side filters on
+// that chunk. The HCM dispatch path resets the connection (H1 close, H2
+// RST_STREAM) — handled in Tasks 15 + 16.
+func TestChain_EncodeData_OverflowReturnsSentinel(t *testing.T) {
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	chain, _ := newChainOf(a)
+
+	// First call: a chunk exactly at the cap. This should NOT overflow yet
+	// (len(encodeBuf)+len(data) == filterBufferLimitBytes; the check is "> cap",
+	// not ">= cap" per the PLAN scaffold).
+	first := make([]byte, filterBufferLimitBytes)
+	terminated, err := chain.RunEncodeData(context.Background(), first, false)
+	if err != nil {
+		t.Fatalf("RunEncodeData(first): %v", err)
+	}
+	if !terminated {
+		t.Fatalf("expected first chunk to complete iteration (terminated=true); got false")
+	}
+
+	// Second call: ONE more byte would push us over the cap. Sentinel must be
+	// returned at exactly this boundary.
+	overflow := make([]byte, 1)
+	terminated, err = chain.RunEncodeData(context.Background(), overflow, true)
+	if err == nil {
+		t.Fatalf("expected errEncodeBufferOverflow on encode-side overflow; got nil")
+	}
+	if !errors.Is(err, errEncodeBufferOverflow) {
+		t.Fatalf("expected errEncodeBufferOverflow sentinel; got %v", err)
+	}
+	if terminated {
+		t.Fatalf("expected terminated=false on overflow sentinel; got true")
+	}
+}
+
+// TestChain_EncodeData_BelowCapNoSentinel asserts the symmetric-with-decode
+// case: encode-side chunks that stay within the cap iterate normally and do
+// NOT return the overflow sentinel.
+func TestChain_EncodeData_BelowCapNoSentinel(t *testing.T) {
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	chain, _ := newChainOf(a)
+	// Three small chunks well under the cap.
+	for i := 0; i < 3; i++ {
+		terminated, err := chain.RunEncodeData(context.Background(), make([]byte, 1024), i == 2)
+		if err != nil {
+			t.Fatalf("RunEncodeData(i=%d): %v", i, err)
+		}
+		if !terminated {
+			t.Fatalf("expected each under-cap chunk to complete (terminated=true); got false on i=%d", i)
+		}
+	}
+	if a.encodeData.Load() != 3 {
+		t.Fatalf("expected a.EncodeData called 3 times; got %d", a.encodeData.Load())
+	}
 }

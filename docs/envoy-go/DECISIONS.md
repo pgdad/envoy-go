@@ -2698,3 +2698,50 @@ The empirical pin in SPEC §11 #4 is the durable evidence (verified at SPEC time
 Task 7 (the `chain.go` `beginLocalReply` implementation; first use of the encode-chain-entry-at-`filter[len-1]` semantics in production code). Supersedes nothing.
 
 ---
+
+## ADR-0076: Body buffer cap; 413 on decode overflow; reset on encode overflow
+
+**Status:** Accepted
+**Date:** 2026-05-01
+**Doctrine:** D-3.5 (record durable rationale for the buffer cap + overflow disposition) + D-3.6 (the 413 wire shape is differentially observable; the §11 #3 empirical pin is the durable evidence).
+**Amends ADR-0041** (the parse-time silent-ignore set is extended — see §"Decision" + §"Inline-supersession" below).
+
+### Context
+
+The HTTP filter framework's `FilterChain` per-stream state machine accumulates body chunks on the decode side when a filter returns `DataStopIterationAndBuffer`, and pipes encoded body chunks down the reverse encode chain when the upstream returns response data. Without an upper bound on per-stream buffer size, a hostile or malformed client can exhaust framework memory by sending an unbounded request body that filters opt to buffer (decode side) or by eliciting an unbounded response that has to traverse the encode chain (encode side). Reference Envoy v1.37.2 enforces a 1 MiB per-stream body-buffer cap by default and synthesizes a verbatim `413 Payload Too Large` response on decode-side overflow (verified at SPEC time — see §11 #3 empirical pin). On encode-side overflow Envoy resets the connection (H1: `connection: close` after the local reply emits, then conn close; H2: RST_STREAM after the local-reply HEADERS+DATA frames). envoy-go must match these disciplines to ship a green differential at fixture 0007a-cors and to pass the byte-shape pin at SPEC §11 #3 + the connection-reset semantics at §15 acceptance bullet 2.
+
+The two configurable Envoy knobs that scale the cap (`per_connection_buffer_limit_bytes` on Listener, `per_request_buffer_limit_bytes` on Route) are out of scope for 07.1 (no production filter in 07.1's filter set — `cors` + `envoy_go_test` — needs them) and are deferred to a future buffer-policy phase or to whichever first family-phase that demands them.
+
+### Decision
+
+(a) **Hardcoded cap.** `internal/filter/http/chain.go` declares `const filterBufferLimitBytes = 1 << 20 // 1 MiB` matching Envoy's default. The constant is package-scoped (not exposed as a knob) — future-phase tunability is the dedicated buffer-policy phase's scope.
+
+(b) **Decode-side overflow → 413 verbatim shape.** When `RunDecodeData` observes a chunk that would push `len(c.decodeBuf)+len(data)` above `filterBufferLimitBytes` on a `DataStopIterationAndBuffer` return, the chain synthesizes a local reply via `beginLocalReply` with: status `413`, body `"Payload Too Large"` (17 bytes ASCII; constant `localReply413BodyBytes`; no trailing newline per §11 #3 empirical pin), and a user-supplied header `Connection: close`. The framework's `beginLocalReply` then merges the framework-injected `Content-Length: 17` + `Content-Type: text/plain` (default) and runs the FULL encode chain in reverse declaration order per ADR-0075. The `Date` and `Server` headers are filled by the HCM wire-write path (per ADR-0075 (b) + §11 #3's "modulo `date` and `server`" footnote — those land on the wire-write layer, NOT in the framework's beginLocalReply).
+
+(c) **Encode-side overflow → connection-reset sentinel.** When `RunEncodeData` observes a chunk that would push `len(c.encodeBuf)+len(data)` above `filterBufferLimitBytes`, it returns the package-private sentinel `errEncodeBufferOverflow` (with descriptive text `"chain: encode-side buffer overflow; resetting connection"`) WITHOUT iterating any encode-side filter on the overflowing chunk. The HCM dispatch path in `internal/filter/hcm/connection.go` (Task 15) and `internal/filter/hcm/h2dispatch.go` (Task 16) handles the sentinel: H1 closes the connection after writing whatever it has emitted; H2 emits RST_STREAM (`code: INTERNAL_ERROR`) and tears the stream down. The sentinel is package-private — the HCM layer imports `internal/filter/http` and uses `errors.Is(err, http.ErrEncodeBufferOverflow)` once Tasks 15 + 16 promote it to an exported alias if needed (or compares via the chain's RunEncodeData return convention).
+
+(d) **Configurable knobs silently ignored.** Both `per_connection_buffer_limit_bytes` (Listener-scope) and `per_request_buffer_limit_bytes` (Route-scope) are silently ignored at parse-time per the ADR-0041 amendment in §"Inline-supersession" below. Build-time validation MUST NOT reject configs that set them; runtime behavior MUST honor only the hardcoded `filterBufferLimitBytes`.
+
+### Inline-supersession
+
+This ADR **amends ADR-0041** by extending the parse-time silent-ignore set with two new fields: `per_connection_buffer_limit_bytes` (Listener-scope) and `per_request_buffer_limit_bytes` (Route-scope). The amendment shape mirrors ADR-0073's amendment of the same ADR (`typed_per_filter_config` moves from silent-ignored to honored): ADR-0076 strictly EXTENDS the silent-ignore set; it does NOT remove any previously-ignored field. Per ADR-0045's inline-supersession discipline this amendment is recorded here at the amending ADR (not as a new note inside ADR-0041 itself; ADR-0041 carries a forward-pointer to the amenders).
+
+### Alternatives considered
+
+- **(A) Make `filterBufferLimitBytes` runtime-configurable via the Envoy proto knobs (`per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes`) at parse-time** — REJECTED for 07.1. The 07.1 filter set (`cors` + `envoy_go_test`) does not exercise the knobs; honoring them would add proto-traversal + per-stream cap-override plumbing that is dead code until a future filter-family phase needs it. Per ADR-0041's silent-ignore discipline + SPEC §6.5: defer to a future buffer-policy phase.
+- **(B) Reset the connection on decode-side overflow (instead of synthesizing a 413)** — REJECTED. Diverges from Envoy's verbatim §11 #3 empirical pin, which emits a structured `413 Payload Too Large` response with `connection: close` BEFORE closing the conn. envoy-go's decode-side discipline must emit the structured response so the client can distinguish between "request body too large" (413) and "transport error" (raw close). The encode-side overflow CAN reset because by definition the upstream response is mid-stream and a structured response no longer fits the wire-protocol state.
+- **(C) Synthesize a 503 (or other status) on encode-side overflow instead of resetting** — REJECTED. Envoy resets at this point per the §11 #3 footnote; emitting another status would diverge differentially. Additionally, on H2 the HEADERS frame for the response may already have been flushed by the time the overflow is detected, making a "synthesize a different status" path semantically impossible without retroactively rewriting the wire.
+- **(D) Use a watermark / streaming-body model (StopAllIterationAndWatermark) instead of a hard cap** — REJECTED for 07.1 per SPEC §2.1 non-goal. Watermark backpressure is deferred to the first HTTP-filter-family phase that demands it (likely a streaming-body filter like compression).
+
+### Consequences
+
+- (a) `internal/filter/http/chain.go` declares `localReply413BodyBytes = "Payload Too Large"` + `errEncodeBufferOverflow` at the head of the file (Task 9). The `RunDecodeData` method implements the cap check + 413 synthesis path; `RunEncodeData` implements the encode-side cap check + sentinel return.
+- (b) The unit tests `TestChain_DecodeData_OverflowSynthesizes413` (verbatim wire shape) + `TestChain_DecodeData_BelowCapDoesNotSynthesize` (body-cap-respected-on-non-overflow) + `TestChain_EncodeData_OverflowReturnsSentinel` (sentinel returned at the boundary) + `TestChain_EncodeData_BelowCapNoSentinel` assert the framework-side discipline. The HCM-side wire emission (close conn / RST_STREAM) is covered by Tasks 15 + 16 integration tests.
+- (c) The BEHAVIOR_CONTRACT.md `## HTTP filter chain` section landed at phase-done (Task 23) carries the §11 #3 empirical-pin block verbatim, paste-synchronized with SPEC §11.3 (no drift permitted; future image bumps require updating both in the same commit per ADR-0052).
+- (d) Future filter-family phases that need configurable caps (e.g., a streaming-compression filter that buffers more than 1 MiB legitimately) author a follow-up ADR that promotes `per_connection_buffer_limit_bytes` + `per_request_buffer_limit_bytes` from silent-ignored to honored — mirroring ADR-0073's promotion path for `typed_per_filter_config`.
+
+### Lands-in-task
+
+Task 9 (the `chain.go` `RunDecodeData` + buffer-overflow path + encode-overflow sentinel; first use of the framework's body-cap discipline). Amends ADR-0041; supersedes nothing.
+
+---

@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,18 @@ import (
 // default. Per ADR-0076 (lands in Task 9). Defined here at chain.go's head so
 // later tasks can reference it without re-declaration.
 const filterBufferLimitBytes = 1 << 20 // 1 MiB
+
+// localReply413BodyBytes is the verbatim 17-byte ASCII body of the synthesized
+// 413 Payload Too Large response. Per SPEC §11 #3 empirical pin: no trailing
+// newline. Pinned here to ensure the body shape can never drift relative to
+// the wire-shape contract asserted in TestChain_DecodeData_OverflowSynthesizes413.
+const localReply413BodyBytes = "Payload Too Large" // 17 bytes
+
+// errEncodeBufferOverflow is the sentinel returned by RunEncodeData when the
+// per-stream encode-side buffer cap (filterBufferLimitBytes) is exceeded. The
+// HCM dispatch path resets the connection (H1 close, H2 RST_STREAM) on this
+// sentinel — wired in Tasks 15 + 16. Per ADR-0076.
+var errEncodeBufferOverflow = errors.New("chain: encode-side buffer overflow; resetting connection")
 
 // FilterChain is the per-stream state machine that drives iteration of HTTP
 // filters. Allocated by HCM dispatch (connection.go for H1, h2dispatch.go for
@@ -39,10 +52,16 @@ type FilterChain struct {
 	decodeResumeCh chan struct{}
 	encodeResumeCh chan struct{}
 
-	// Body buffers (decode-side; encode-side added in Task 6/Task 9 with the
-	// 413/reset overflow paths).
+	// Body buffers. Per ADR-0076: decode-side overflow synthesizes a 413 local
+	// reply (verbatim shape per SPEC §11 #3); encode-side overflow returns the
+	// errEncodeBufferOverflow sentinel from RunEncodeData (HCM dispatch resets
+	// the connection — Tasks 15 + 16). The *Over flags are set when the cap is
+	// crossed and are observable for debug/log; the framework's behavior is
+	// driven by the local-reply path / sentinel return.
 	decodeBuf     []byte
 	decodeBufOver bool
+	encodeBuf     []byte
+	encodeBufOver bool
 
 	// SendLocalReply guard (Task 7).
 	localReplyOnce sync.Once
@@ -146,6 +165,72 @@ func (c *FilterChain) parkDecode(ctx context.Context) error {
 	}
 }
 
+// RunDecodeData iterates decode-side body chunks in declaration order. Per
+// ADR-0076 + SPEC §11 #3 empirical pin: a filter returning
+// DataStopIterationAndBuffer accumulates body bytes into c.decodeBuf up to
+// filterBufferLimitBytes; an overflowing chunk synthesizes a verbatim 413
+// Payload Too Large local reply (entered through beginLocalReply, which runs
+// the FULL encode chain in reverse declaration order per ADR-0075). After the
+// 413 fires, the chain state machine has transitioned to encode mode and
+// RunDecodeData returns (false, nil).
+//
+// The decode iteration cursor resets to 0 at the top of every RunDecodeData
+// call (mirrors the encode-side cursor reset in RunEncodeData) — RunDecodeHeaders
+// has already advanced the cursor past len(filters) by the time we get here.
+func (c *FilterChain) RunDecodeData(ctx context.Context, data []byte, endStream bool) (bool, error) {
+	c.decodeIdx = 0
+	for c.decodeIdx < len(c.filters) {
+		if c.localReplyDone.Load() {
+			return false, nil
+		}
+		f := c.filters[c.decodeIdx].Decoder
+		if f == nil {
+			c.decodeIdx++
+			continue
+		}
+		status := f.DecodeData(data, endStream)
+		// If the filter triggered SendLocalReply during DecodeData, the encode
+		// chain has already run synchronously inside beginLocalReply; abort
+		// decode-data iteration immediately regardless of returned status.
+		if c.localReplyDone.Load() {
+			return false, nil
+		}
+		switch status {
+		case DataContinue:
+			c.decodeIdx++
+		case DataStopIterationAndBuffer:
+			// Buffer cap enforcement per ADR-0076 + SPEC §6.5: if appending the
+			// current chunk would exceed filterBufferLimitBytes, synthesize the
+			// verbatim 413 wire shape (per SPEC §11 #3 empirical pin) — the
+			// chain transitions to encode mode via beginLocalReply.
+			if len(c.decodeBuf)+len(data) > filterBufferLimitBytes {
+				c.decodeBufOver = true
+				headers := http.Header{}
+				// Connection: close per the §11 #3 empirical pin — forces the
+				// H1 conn to terminate after the local reply emits. The HCM
+				// dispatch path reads this header on the synthesized response
+				// and closes the conn after writing (Task 15).
+				headers.Set("Connection", "close")
+				c.beginLocalReply(c.ambientCtx, c.decodeIdx, 413, localReply413BodyBytes, headers)
+				return false, nil
+			}
+			c.decodeBuf = append(c.decodeBuf, data...)
+			if err := c.parkDecode(ctx); err != nil {
+				return false, err
+			}
+			c.decodeIdx++
+		case DataStopIterationNoBuffer:
+			if err := c.parkDecode(ctx); err != nil {
+				return false, err
+			}
+			c.decodeIdx++
+		default:
+			return false, fmt.Errorf("chain: filter %q returned unknown FilterDataStatus %d on decode", c.filters[c.decodeIdx].Name, status)
+		}
+	}
+	return true, nil
+}
+
 // RunEncodeHeaders iterates the encode-side filters in REVERSE declaration
 // order per SPEC §5.5 + §11.1 empirical pin. Returns (terminated=true) when
 // iteration completes; (terminated=false, err) if aborted by ctx-cancel.
@@ -176,8 +261,19 @@ func (c *FilterChain) RunEncodeHeaders(ctx context.Context, headers http.Header,
 }
 
 // RunEncodeData iterates encode-side body chunks in reverse declaration order.
-// Buffer overflow / 413-on-encode handling lands in Task 9.
+// Per ADR-0076: tracks per-stream encode-side buffer accumulation against
+// filterBufferLimitBytes; if a chunk would push the cumulative size above the
+// cap, returns errEncodeBufferOverflow without iterating any filter on that
+// chunk. The HCM dispatch path resets the connection (H1 close, H2 RST_STREAM)
+// on this sentinel — wired in Tasks 15 + 16.
 func (c *FilterChain) RunEncodeData(ctx context.Context, data []byte, endStream bool) (bool, error) {
+	// Buffer-cap check up front: the sentinel is returned BEFORE iterating any
+	// filter, so the connection-reset wire path never observes a partially-
+	// emitted overflowing chunk. Per ADR-0076 + SPEC §15 acceptance bullet 2.
+	if len(c.encodeBuf)+len(data) > filterBufferLimitBytes {
+		c.encodeBufOver = true
+		return false, errEncodeBufferOverflow
+	}
 	c.encodeIdx = len(c.filters) - 1
 	for c.encodeIdx >= 0 {
 		f := c.filters[c.encodeIdx].Encoder
@@ -198,6 +294,12 @@ func (c *FilterChain) RunEncodeData(ctx context.Context, data []byte, endStream 
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterDataStatus %d on encode", c.filters[c.encodeIdx].Name, status)
 		}
 	}
+	// Iteration completed; record the chunk's size in the encode-side buffer
+	// accumulator. We only track the size (len) rather than the bytes — the
+	// bytes have already been forwarded down the encode chain on this call;
+	// no replay is required (encode-side StopIterationAndBuffer is treated as
+	// park-only in Task 6, no per-filter replay buffer).
+	c.encodeBuf = append(c.encodeBuf, data...)
 	return true, nil
 }
 
