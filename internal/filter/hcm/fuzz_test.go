@@ -16,8 +16,8 @@ import (
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
-// FuzzHCMConfigParse exercises NewFilter against arbitrary Any byte streams.
-// Asserts: no panic; every error message is hcm:-prefixed.
+// FuzzHCMConfigParse exercises the HCM constructor against arbitrary Any byte
+// streams. Asserts: no panic; every error message is hcm:-prefixed.
 //
 // Per ADR-0018: short-budget (30s in CI; arbitrary local time). Seed corpus
 // gives the fuzzer three starting points: one well-formed Any, one truncated
@@ -29,12 +29,14 @@ func FuzzHCMConfigParse(f *testing.F) {
 	f.Add("type.googleapis.com/google.protobuf.StringValue", []byte("hello"))
 
 	cm := mkOneClusterManagerTB(f)
+	httpReg := testHTTPRegistry()
 
 	f.Fuzz(func(t *testing.T, typeURL string, value []byte) {
 		any := &anypb.Any{TypeUrl: typeURL, Value: value}
-		// Fresh Registry per iteration so the 5 HCM-scope counters NewFilter
-		// allocates on the happy path don't collide across fuzz iterations.
-		_, err := NewFilter(any, cm, stats.NewRegistry())
+		// Fresh Registry per iteration so the 5 HCM-scope counters the
+		// constructor allocates on the happy path don't collide across fuzz
+		// iterations. The httpReg is reused (frozen, no per-iter mutation).
+		_, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, httpReg)
 		if err != nil && !strings.HasPrefix(err.Error(), "hcm:") {
 			t.Errorf("error not hcm:-prefixed: %v", err)
 		}

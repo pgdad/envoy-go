@@ -99,12 +99,12 @@ func mkClusterManager(t *testing.T) *cluster.Manager {
 	return cm
 }
 
-// expectErr runs parseFilter with the modifier-built Any and asserts the
+// expectErr runs parseFilterTest with the modifier-built Any and asserts the
 // returned error has the "hcm:" prefix and contains wantSubstr.
 func expectErr(t *testing.T, modify func(*hcmv3.HttpConnectionManager), wantSubstr string) {
 	t.Helper()
 	cm := mkClusterManager(t)
-	_, err := parseFilter(mkHCM(modify), cm)
+	_, err := parseFilterTest(mkHCM(modify), cm)
 	if err == nil {
 		t.Fatalf("expected error containing %q, got nil", wantSubstr)
 	}
@@ -118,7 +118,7 @@ func expectErr(t *testing.T, modify func(*hcmv3.HttpConnectionManager), wantSubs
 
 func TestParseFilter_Happy(t *testing.T) {
 	cm := mkClusterManager(t)
-	if _, err := parseFilter(mkHCM(nil), cm); err != nil {
+	if _, err := parseFilterTest(mkHCM(nil), cm); err != nil {
 		t.Fatalf("happy: %v", err)
 	}
 }
@@ -126,7 +126,7 @@ func TestParseFilter_Happy(t *testing.T) {
 func TestParseFilter_WrongTypeURL(t *testing.T) {
 	cm := mkClusterManager(t)
 	other, _ := anypb.New(&wrapperspb.StringValue{Value: "x"})
-	_, err := parseFilter(other, cm)
+	_, err := parseFilterTest(other, cm)
 	if err == nil || !strings.HasPrefix(err.Error(), "hcm: wrong type_url") {
 		t.Errorf("expected hcm: wrong type_url ..., got: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestParseFilter_CodecTypeHTTP2(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	_, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: false, AllowH2C: false}, stats.NewRegistry(), nil)
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: false, AllowH2C: false}, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for HTTP2 + plaintext, got nil")
 	}
@@ -156,7 +156,7 @@ func TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_AcceptsTLS(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: true}, stats.NewRegistry(), nil); err != nil {
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: true}, stats.NewRegistry(), nil, testHTTPRegistry()); err != nil {
 		t.Errorf("HTTP2 + TLS should be accepted, got: %v", err)
 	}
 }
@@ -166,7 +166,7 @@ func TestParseFilter_CodecTypeHTTP2_AcceptsTLS(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_AcceptsAllowH2C(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil); err != nil {
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry()); err != nil {
 		t.Errorf("HTTP2 + allowH2C should be accepted, got: %v", err)
 	}
 }
@@ -177,7 +177,7 @@ func TestParseFilter_CodecTypeAUTO_Accepts_BothCases(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
 	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
-		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil); err != nil {
+		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil, testHTTPRegistry()); err != nil {
 			t.Errorf("AUTO + lc=%+v should be accepted, got: %v", lc, err)
 		}
 	}
@@ -189,7 +189,7 @@ func TestParseFilter_CodecTypeHTTP1_Accepts_BothCases(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP1 })
 	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
-		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil); err != nil {
+		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil, testHTTPRegistry()); err != nil {
 			t.Errorf("HTTP1 + lc=%+v should be accepted, got: %v", lc, err)
 		}
 	}
@@ -201,7 +201,7 @@ func TestParseFilter_CodecTypeHTTP3(t *testing.T) {
 
 func TestParseFilter_CodecTypeAUTO(t *testing.T) {
 	cm := mkClusterManager(t)
-	if _, err := parseFilter(mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO }), cm); err != nil {
+	if _, err := parseFilterTest(mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO }), cm); err != nil {
 		t.Errorf("AUTO should be accepted as alias for HTTP1: %v", err)
 	}
 }
@@ -216,7 +216,7 @@ func TestParseFilter_MissingStatPrefix(t *testing.T) {
 // internal metric-name regex's permitted [a-zA-Z0-9_.] class) caused
 // stats.Registry.NewCounter to panic at registry.go:checkName when the
 // assembled "http.<stat_prefix>.downstream_rq_total" name was registered.
-// The contract: parseFilter MUST return an "hcm: invalid stat_prefix" error
+// The contract: parseFilterTest MUST return an "hcm: invalid stat_prefix" error
 // and MUST NOT panic. The "0000000000 0" case reproduces the verbatim
 // minimized fuzz seed payload (12 bytes; literal SP at index 10).
 func TestParseFilter_StatPrefixInvalidChars(t *testing.T) {
@@ -325,7 +325,7 @@ func TestParseFilter_HTTPFiltersWrongTypeURL(t *testing.T) {
 func TestParseFilterWithCtx_RejectsEmptyChain(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.HttpFilters = nil })
-	_, err := parseFilter(any, cm)
+	_, err := parseFilterTest(any, cm)
 	if err == nil {
 		t.Fatal("expected error for empty http_filters[], got nil")
 	}
@@ -344,7 +344,7 @@ func TestParseFilterWithCtx_RejectsNonRouterTerminal(t *testing.T) {
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
 		h.HttpFilters[0].Name = "envoy.filters.http.cors"
 	})
-	_, err := parseFilter(any, cm)
+	_, err := parseFilterTest(any, cm)
 	if err == nil {
 		t.Fatal("expected error for non-router terminal, got nil")
 	}
@@ -367,7 +367,7 @@ func TestParseFilterWithCtx_RejectsDuplicateFilterName(t *testing.T) {
 			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouter()},
 		})
 	})
-	_, err := parseFilter(any, cm)
+	_, err := parseFilterTest(any, cm)
 	if err == nil {
 		t.Fatal("expected error for duplicate filter name, got nil")
 	}
@@ -397,7 +397,7 @@ func TestParseFilterWithCtx_RejectsUnknownTypeURL(t *testing.T) {
 			h.HttpFilters...,
 		)
 	})
-	_, err := parseFilter(any, cm)
+	_, err := parseFilterTest(any, cm)
 	if err == nil {
 		t.Fatal("expected error for unknown type_url, got nil")
 	}
@@ -528,7 +528,7 @@ func TestParseFilter_RouterActionHappy(t *testing.T) {
 			ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_test"},
 		}}
 	})
-	if _, err := parseFilter(any, cm); err != nil {
+	if _, err := parseFilterTest(any, cm); err != nil {
 		t.Errorf("router-action happy: %v", err)
 	}
 }
@@ -672,7 +672,7 @@ func TestFilter_AccessLogField_Plumbed(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(nil)
 	sinks := []accesslog.Sink{}
-	got, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), sinks)
+	got, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), sinks, testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("parseFilterWithCtx: %v", err)
 	}

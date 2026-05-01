@@ -49,13 +49,13 @@ type ListenerCtx struct {
 
 // Filter is the per-listener HTTP connection manager. It owns the resolved
 // route table, the cluster manager handle, and the configured stat_prefix
-// (forward-look for phase 06 stats per ADR-0041). NewFilter and Handle are
-// declared in filter.go (Task 8).
+// (forward-look for phase 06 stats per ADR-0041). NewFilterWithCtxAndSinksAndRegistry
+// and Handle are declared in filter.go.
 //
 // 06.1 Task 11: Filter gains 5 HCM-scope per-instance metric pointers per
-// SPEC §6 ("HCM — 5 names"). Allocated by NewFilter from the supplied
-// *stats.Registry at filter-build time (pre-Freeze, per SPEC §5.4 boot
-// ordering); incremented from the H1 connection.go and H2 h2dispatch.go
+// SPEC §6 ("HCM — 5 names"). Allocated by NewFilterWithCtxAndSinksAndRegistry
+// from the supplied *stats.Registry at filter-build time (pre-Freeze, per SPEC
+// §5.4 boot ordering); incremented from the H1 connection.go and H2 h2dispatch.go
 // hot paths per SPEC §5.5.
 type Filter struct {
 	table      *routeTable
@@ -64,7 +64,7 @@ type Filter struct {
 	codecType  hcmv3.HttpConnectionManager_CodecType
 
 	// 06.1 metric fields (per SPEC §6 — HCM-scope; 5 metrics per HCM
-	// instance). Allocated by NewFilter at build time; pre-Freeze.
+	// instance). Allocated at build time; pre-Freeze.
 	downstreamRqTotal *stats.Counter
 	downstreamRq2xx   *stats.Counter
 	downstreamRq3xx   *stats.Counter
@@ -72,8 +72,8 @@ type Filter struct {
 	downstreamRq5xx   *stats.Counter
 
 	// accessLog holds the configured access-log sinks. Nil when no sinks are
-	// configured (pre-Task 14) or for listeners without access_log[] entries.
-	// Plumbed via parseFilterWithCtx; Task 14 wires real AsyncFileSinks.
+	// configured or for listeners without access_log[] entries. Plumbed via
+	// parseFilterWithCtx from main.go's opened AsyncFileSinks (Phase 06.2).
 	accessLog []accesslog.Sink
 
 	// chainConfig is the resolved http_filters[] chain in declaration order.
@@ -82,11 +82,12 @@ type Filter struct {
 	// allocate a fresh per-stream filter instance and assembles them into a
 	// *filter_http.FilterChain. Per ADR-0071's two-step factory pattern.
 	//
-	// Pre-emptively added in Task 13 (PLAN's Task 14 Step 1 specifies these
-	// fields land in filter.go / Task 14, but Task 13 is the parser side that
-	// populates them — adding the field here lets the parser write into the
+	// Field added in Task 13 (PLAN's Task 14 Step 1 specifies these fields
+	// land in filter.go / Task 14, but Task 13 is the parser side that
+	// populates them — adding the field there lets the parser write into the
 	// *Filter directly without an intermediate tuple-return refactor at
-	// Task 14). See PROGRESS Task 13 PLAN-deviation note.
+	// Task 14). See PROGRESS Task 13 PLAN-deviation note (i); Task 14's
+	// struct-extension step is therefore a no-op.
 	chainConfig []chainEntry
 
 	// perRouteConfig holds the parsed-and-validated typed_per_filter_config
@@ -117,57 +118,6 @@ func (f *Filter) downstreamStatusClassCounter(code int) *stats.Counter {
 	default:
 		return nil
 	}
-}
-
-// NewFilterWithCtx is the phase-05.1 constructor variant. The existing
-// NewFilter delegates with the zero-value ListenerCtx (allowH2C=false,
-// hasTLS=false), preserving phase-04 semantics.
-//
-// Phase 06.1 Task 11 widened the signature with a trailing *stats.Registry;
-// the constructor allocates the 5 HCM-scope per-instance metrics on the
-// supplied Registry (pre-Freeze; SPEC §5.4 + §6).
-//
-// Task 13 transitional: this legacy constructor builds a default router-only
-// HTTPRegistry so the http_filters[] chain validates clean for callers that
-// have not yet been swept to the registry-aware constructor (Task 14 sweeps
-// all callers and DELETES this function).
-func NewFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc, registry, nil, defaultRouterOnlyHTTPRegistry())
-}
-
-// NewFilterWithCtxAndSinks is the phase-06.2 constructor variant. It extends
-// NewFilterWithCtx with an accessLogSinks slice so that cmd/envoy-go/main.go
-// can thread the opened AsyncFileSinks through to the HCM filter at build
-// time. A nil or empty slice is treated as "no access logging" and is safe
-// to pass — NewFilterWithCtx delegates here with nil.
-//
-// Task 13 transitional: see NewFilterWithCtx note re: default registry.
-func NewFilterWithCtxAndSinks(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks, defaultRouterOnlyHTTPRegistry())
-}
-
-// parseFilter is the legacy entry point retained for existing tests.
-// It delegates to parseFilterWithCtx with a zero-value ListenerCtx and a
-// fresh throwaway Registry (legacy callers do not exercise the metric
-// pointers).
-//
-// Task 13 transitional: see NewFilterWithCtx note re: default registry.
-func parseFilter(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry(), nil, defaultRouterOnlyHTTPRegistry())
-}
-
-// defaultRouterOnlyHTTPRegistry returns a freshly-allocated, frozen
-// *HTTPRegistry containing only the router filter (envoy.filters.http.router
-// → router.New). Used by the Task 13 transitional legacy constructors so
-// callers that have not yet been swept to the registry-aware constructor
-// (Task 14 sweep) still produce a chain that validates clean against the
-// four chain-shape rules. Task 14 deletes the legacy constructors and this
-// helper along with them.
-func defaultRouterOnlyHTTPRegistry() *filter_http.HTTPRegistry {
-	r := filter_http.NewHTTPRegistry()
-	r.Register(router.TypeURL, router.New)
-	r.Freeze()
-	return r
 }
 
 // parseFilterWithCtx decodes the typed_config Any into a *Filter. All errors

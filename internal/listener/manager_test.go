@@ -24,8 +24,22 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
+
+// testHTTPRegistry returns a freshly-allocated, frozen *filter_http.HTTPRegistry
+// containing only the router terminal filter. Used by every NewManager*
+// call site in this test file post-Task-14 to satisfy the
+// "boot-populated, frozen" ADR-0072 contract; tcpproxy-only listeners ignore
+// the registry but it is still threaded for uniformity.
+func testHTTPRegistry() *filter_http.HTTPRegistry {
+	r := filter_http.NewHTTPRegistry()
+	r.Register(router.TypeURL, router.New)
+	r.Freeze()
+	return r
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -106,7 +120,7 @@ func TestManager_HappyPath_Single(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -160,7 +174,7 @@ func TestManager_HappyPath_Multi(t *testing.T) {
 		mkListener("l_tcp_b", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -207,7 +221,7 @@ func TestManager_Error_ZeroListeners(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	boot := mkBoot(0, []*listenerv3.Listener{}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -223,7 +237,7 @@ func TestManager_Error_DuplicateName(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -247,7 +261,7 @@ func TestManager_Error_TwoFilterChains(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -275,7 +289,7 @@ func TestManager_Error_NonEmptyFilterChainMatch(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -299,7 +313,7 @@ func TestManager_Error_TwoFilters(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -323,7 +337,7 @@ func TestManager_Error_PopulatedTransportSocket(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -356,7 +370,7 @@ func TestManager_Error_UnknownFilterTypeURL(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -371,7 +385,7 @@ func TestManager_Error_FilterConstructionPropagated(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_does_not_exist")),
 	}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -398,7 +412,7 @@ func TestManager_Error_NonSocketAddressListener(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -422,7 +436,7 @@ func TestManager_BindUnwind(t *testing.T) {
 		mkListener("l_b", "127.0.0.1", heldPort, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -621,7 +635,7 @@ func TestNewManager_SingleChain_Plaintext_Unchanged(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_plain", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -650,7 +664,7 @@ func TestNewManager_MultiChain_SNIHappy(t *testing.T) {
 		mkTLSChain([]string{"beta.envoy-go.test"}, tsBeta, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -700,7 +714,7 @@ func TestNewManager_MultiChain_SNIWildcard(t *testing.T) {
 		mkTLSChain([]string{"*.envoy-go.test"}, tsAlpha, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -741,7 +755,7 @@ func TestNewManager_MultiChain_Specificity(t *testing.T) {
 		mkTLSChain([]string{"alpha.envoy-go.test"}, tsAlpha, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -782,7 +796,7 @@ func TestNewManager_MultiChain_CatchAll(t *testing.T) {
 		mkTLSChain(nil, tsAlpha, filter), // catch-all
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -821,7 +835,7 @@ func TestNewManager_MultiChain_NoSNIMatch(t *testing.T) {
 		mkTLSChain([]string{"beta.envoy-go.test"}, tsBeta, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -857,7 +871,7 @@ func TestNewManager_MultiChain_MixedTLSPlaintext_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for mixed TLS/plaintext chains, got nil")
 	}
@@ -889,7 +903,7 @@ func TestNewManager_MultiChain_DefaultFilterChain_Errors(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for default_filter_chain, got nil")
 	}
@@ -956,7 +970,7 @@ func TestNewManager_MultiChain_NonSNIMatchField_Errors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			boot := mkBoot(0, []*listenerv3.Listener{makeListener(tc.fcm)}, nil)
-			_, err := NewManager(boot, cm, stats.NewRegistry())
+			_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 			if err == nil {
 				t.Fatalf("expected error for %s, got nil", tc.name)
 			}
@@ -991,7 +1005,7 @@ func TestNewManager_MultiChain_ApplicationProtocols_Errors(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for application_protocols, got nil")
 	}
@@ -1015,7 +1029,7 @@ func TestNewManager_MultiChain_TooManyCatchAlls_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for two catch-all chains, got nil")
 	}
@@ -1038,7 +1052,7 @@ func TestNewManager_MultiChain_RequireClientCert_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for require_client_certificate=true, got nil")
 	}
@@ -1069,7 +1083,7 @@ func TestNewManager_MultiChain_UnknownTransportSocket_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for unknown transport_socket type_url, got nil")
 	}
@@ -1091,7 +1105,7 @@ func TestNewManager_PlaintextMultiChain_Errors(t *testing.T) {
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry())
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
 		t.Fatal("expected error for plaintext multi-chain, got nil")
 	}
@@ -1129,7 +1143,7 @@ func TestNewManager_ChainSelectionPropagation(t *testing.T) {
 		mkTLSChain([]string{"beta.envoy-go.test"}, tsBeta, filter),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManager(boot, cm, stats.NewRegistry())
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1241,7 +1255,7 @@ func TestNewManager_HCMRegistration(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_http", "127.0.0.1", 0, mkHCMFilter(t)),
 	}, nil)
-	if _, err := NewManager(boot, cm, stats.NewRegistry()); err != nil {
+	if _, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry()); err != nil {
 		t.Fatalf("NewManager with HCM listener: %v", err)
 	}
 }
@@ -1290,14 +1304,14 @@ func mkHCMHTTP2Filter(t *testing.T) *listenerv3.Filter {
 
 // TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow verifies that
 // NewManagerWithBaseDirAndAllowH2C with allowH2C=true accepts a plaintext
-// listener with HCM codec_type=HTTP2. The stub hcm.NewFilterWithCtx remaps
+// listener with HCM codec_type=HTTP2. The HCM constructor remaps
 // HTTP2→AUTO so the phase-04 validator passes; Task 12 replaces the stub.
 func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T) {
 	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1317,7 +1331,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
@@ -1338,7 +1352,7 @@ func TestNewManager_BackwardsCompat_DefaultsAllowH2CFalse(t *testing.T) {
 		mkTLSChain(nil, tsAlpha, mkHCMHTTP2Filter(t)),
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	m, err := NewManager(boot, cm, stats.NewRegistry())
+	m, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager = %v, want nil (TLS+HTTP2 path)", err)
 	}
@@ -1346,7 +1360,7 @@ func TestNewManager_BackwardsCompat_DefaultsAllowH2CFalse(t *testing.T) {
 }
 
 // TestNewManager_HCMBuildErrorWrapsAsListenerFilter verifies that a parse
-// error from hcm.NewFilter is wrapped with the standard listener prefix:
+// error from the HCM constructor is wrapped with the standard listener prefix:
 // listener: "<name>": filter_chains[<i>]: hcm: ...
 func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 	// HTTP2 codec_type is the cheapest trigger for an hcm: error.
@@ -1374,7 +1388,7 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 			}},
 		}},
 	}}, nil)
-	_, buildErr := NewManager(bs, cm, stats.NewRegistry())
+	_, buildErr := NewManager(bs, cm, stats.NewRegistry(), testHTTPRegistry())
 	if buildErr == nil {
 		t.Fatal("expected build error, got nil")
 	}
@@ -1408,7 +1422,7 @@ func TestListenerManager_AllocatesTwoMetricsPerListener(t *testing.T) {
 		mkListener("l_h1", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	r := stats.NewRegistry()
-	lm, err := NewManager(boot, cm, r)
+	lm, err := NewManager(boot, cm, r, testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("listener.NewManager: %v", err)
 	}

@@ -14,9 +14,9 @@ import (
 
 func TestNewFilter_HappyPath(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilter(mkHCM(nil), cm, stats.NewRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err != nil {
-		t.Fatalf("NewFilter: %v", err)
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 	if f.statPrefix != "ingress_http" {
 		t.Errorf("statPrefix: got %q, want %q", f.statPrefix, "ingress_http")
@@ -29,20 +29,21 @@ func TestNewFilter_HappyPath(t *testing.T) {
 func TestNewFilter_PreservesParseErrorPrefix(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	// NewFilter uses zero-value ListenerCtx (no TLS, no allowH2C); HTTP2 must be rejected.
-	if _, err := NewFilter(any, cm, stats.NewRegistry()); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
+	// Zero-value ListenerCtx (no TLS, no allowH2C); HTTP2 must be rejected.
+	if _, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry()); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
 		t.Errorf("expected hcm:-prefixed error, got: %v", err)
 	}
 }
 
-// TestNewFilter_Allocates5HCMMetrics — Phase 06.1 Task 11: NewFilter must
-// register the 5 HCM-scope per-instance counters per SPEC §6 ("HCM — 5 names")
-// on the supplied Registry, keyed by stat_prefix from the HCM config.
+// TestNewFilter_Allocates5HCMMetrics — Phase 06.1 Task 11: the HCM constructor
+// must register the 5 HCM-scope per-instance counters per SPEC §6
+// ("HCM — 5 names") on the supplied Registry, keyed by stat_prefix from the
+// HCM config.
 func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	if _, err := NewFilter(mkHCM(nil), cm, r); err != nil {
-		t.Fatalf("NewFilter: %v", err)
+	if _, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry()); err != nil {
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 	want := map[string]bool{
 		"http.ingress_http.downstream_rq_total": false,
@@ -58,7 +59,7 @@ func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
 	})
 	for name, seen := range want {
 		if !seen {
-			t.Errorf("missing HCM-scope metric %q in Registry after NewFilter", name)
+			t.Errorf("missing HCM-scope metric %q in Registry after filter build", name)
 		}
 	}
 }
@@ -70,9 +71,9 @@ func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
 func TestFilter_RequestEntry_IncsDownstreamRqTotal(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	f, err := NewFilter(mkHCM(nil), cm, r)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry())
 	if err != nil {
-		t.Fatalf("NewFilter: %v", err)
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 	if got := f.downstreamRqTotal.Load(); got != 0 {
 		t.Fatalf("downstream_rq_total pre-request = %d, want 0", got)
@@ -100,9 +101,9 @@ func TestFilter_RequestEntry_IncsDownstreamRqTotal(t *testing.T) {
 func TestFilter_ResponseFinalization_IncsStatusClassCounter(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	f, err := NewFilter(mkHCM(nil), cm, r)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry())
 	if err != nil {
-		t.Fatalf("NewFilter: %v", err)
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 
 	// 200 — /health direct_response.
@@ -146,9 +147,9 @@ func TestFilter_ResponseFinalization_IncsStatusClassCounter(t *testing.T) {
 func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	f, err := NewFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err != nil {
-		t.Fatalf("NewFilterWithCtx: %v", err)
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 
 	client, server := connPair(t)
@@ -172,9 +173,9 @@ func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
-	f, err := NewFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err != nil {
-		t.Fatalf("NewFilterWithCtx: %v", err)
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 
 	client, server := connPair(t)
@@ -189,7 +190,7 @@ func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 
 func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilter(mkHCM(nil), cm, stats.NewRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +211,7 @@ func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 
 func TestFilter_Handle_CtxAlreadyCancelledShortCircuits(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilter(mkHCM(nil), cm, stats.NewRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
