@@ -2488,3 +2488,52 @@ BYTES_SENT is Tier-E: envoy-go's `routerAction.do` reads the upstream response b
 ### Lands-in-task
 
 Task 15 (differential fixture 0006-access-log + runner registration). Supersedes nothing; extends the differential suite architecture established by ADR-0028.
+
+---
+
+## ADR-0070: Phase-07 planner-time split (07.1 + 07.2)
+
+**Status:** Accepted — 2026-05-01
+**Doctrine:** D-3.5 (decisions are written), D-3.6 (every phase is a green build).
+**Lands-in-task:** 07.1 PLAN Task 1 (PROGRESS preamble — first commit of the implementation session; the ROADMAP edit anchored by this ADR already landed at master `ee45aba` per SPEC drafting).
+
+### Context
+
+Phase 07 (filter-chain framework, BOOTSTRAP §8 row 07) covers two structurally distinct halves: (a) the HTTP filter framework — iteration protocol + extension registry + per-route config + the `cors` real filter + `envoy_go_test` test-only probe + the router-as-terminal-filter migration — anchored under the `internal/filter/hcm/` + `internal/filter/http/` package surface; and (b) the listener-chain completion — `listener_filters[]` framework, `FilterChainMatch` fields beyond SNI, `Listener.default_filter_chain` — anchored under the `internal/listener/` package surface. The two halves share no production-code surface; they share only the BOOTSTRAP §8 row identifier.
+
+Per BRAINSTORM §1 + parent SPEC §3, the BRAINSTORM session split phase 07 along this surface axis at brainstorm-close. The split landed in the SPEC-drafting commit (master `ee45aba`) via:
+- ROADMAP row `07` flipped `planned → in-progress` with sub-phases column `07.1, 07.2`.
+- Row `07.1` added as `planned` with depends-on `06`.
+- Row `07.2` added as `planned` with depends-on `07.1`.
+
+This ADR formalizes the split decision durably; the ROADMAP edit is its concrete on-disk effect.
+
+### Decision
+
+Phase 07 is split into two sub-phases at planner-time per ADR-0045's discipline (which documented the 05.1 + 05.2 split and the 06.1 + 06.2 split):
+- **07.1 — HTTP filter framework.** Surface: `internal/filter/http/` (NEW package tree) + `internal/filter/hcm/` (refactored). Differential surface at end: fixtures 0007a (cors differential) + 0007b (iteration-probe structural). Lands the iteration protocol that BOOTSTRAP §9 HTTP-filters family depends on.
+- **07.2 — Listener-chain completion.** Surface: `internal/listener/`. Differential surface at end: TBD (07.2 SPEC drafts the fixtures). Lands the listener-side filter primitives.
+
+Ordering is 07.1-first, 07.2-second because 07.1 unblocks the BOOTSTRAP §9 HTTP-filters family (every future HTTP filter — `header_manipulation`, `fault`, `jwt_authn`, `ext_authz`, etc. — depends on the iteration protocol + extension registry shipping in 07.1) while 07.2 has no §9 dependents.
+
+The parent ROADMAP row `07` flips `planned → in-progress` at the SPEC-drafting commit (already landed at master `ee45aba`); transitions to `done` ONLY at 07.2's phase-done commit (NOT at 07.1's phase-done) — mirroring the 05/05.1/05.2 + 06/06.1/06.2 closure pattern.
+
+### Alternatives considered
+
+(A) Ship phase 07 as one sub-phase. Rejected: the cumulative LoC estimate (HTTP framework + listener chain + filter set + two fixtures) is ~12000 LoC, well above the §6.1 plan-size gate's ~1500-LoC OR-leg AND would push task count past the 25-task gate.
+
+(B) Split along a different axis (e.g., filter-set first, then framework, then listener). Rejected: the iteration protocol + extension registry + chain state machine is the load-bearing primitive every filter depends on; splitting filter-set-first would require the framework's interfaces to be defined twice (placeholder in filter-set-first; real in framework-second) — wasted work.
+
+(C) Defer the listener-chain to a feature-family phase post-08. Rejected: BOOTSTRAP §8 row 07's "filter chain framework" canonical title covers BOTH the HTTP framework AND the listener chain; deferring the listener chain would leave the BOOTSTRAP MVP trunk's row 07 incomplete on a load-bearing primitive (listener filters are needed for BOOTSTRAP §9's network-filters family).
+
+### Consequences
+
+(a) The phase 07 ROADMAP row carries a `sub-phases` column listing `07.1, 07.2`; status `in-progress` until BOTH sub-phases land done.
+
+(b) 07.1's phase-done commit flips row `07.1 → done` AND leaves row `07` at `in-progress`; 07.2's phase-done commit flips BOTH rows `07.2 → done` AND `07 → done` AT THE SAME COMMIT.
+
+(c) The 07.1 + 07.2 SPECs are siblings under a parent master SPEC at `docs/envoy-go/phases/07-filter-chain-framework/SPEC.md`; the parent SPEC is read-only history once drafted (mirror of the 05 + 06 parent master SPECs).
+
+(d) The seven 07.1 ADRs (ADR-0070..ADR-0076) are 07.1-scoped; 07.2 will introduce its own ADRs at its own SPEC + PLAN time.
+
+(e) Total task count of phases 07.1 + 07.2 is bounded: 07.1 ships at 23 tasks (this PLAN); 07.2 will draft its own task count at its own PLAN time.
