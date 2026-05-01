@@ -134,3 +134,65 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http	0.002s
 $ grep -nE '^## ADR-0073:' docs/envoy-go/DECISIONS.md
 2631:## ADR-0073: typed_per_filter_config 3-tier merge model
 ```
+
+## Task 5 — internal/filter/http/chain.go decode-side iteration
+
+**Commits:** TBD — this task's commit
+**Notes:** Created internal/filter/http/{chain,chain_test}.go (initial decode-side surface). Defines filterBufferLimitBytes constant (1<<20 = 1 MiB; honored at Task 9), FilterChain struct (filters slice, decodeIdx/encodeIdx int cursors per Decision §3.5, decodeResumeCh/encodeResumeCh capacity-1 buffered channels for async-resume per ADR-0071, decodeBuf decode buffer scaffolding for Task 9, localReplyOnce/localReplyDone/encodeStarted scaffolding for Task 7), NewFilterChain (per-stream allocation, per-filter callback wiring), RunDecodeHeaders (decode-side declaration-order iteration with Continue / StopIteration / unknown-status err handling), parkDecode (single-goroutine select on decodeResumeCh / ctx.Done), Destroy (idempotent OnDestroy fan-out), decoderCB + encoderCB concrete callback structs (idempotent non-blocking signal sends; SendLocalReply stubbed for Task 7). PLAN scaffold's `RequestRouteConfig() any` corrected to `RequestRouteConfig() proto.Message` to satisfy DecoderFilterCallbacks interface from callbacks.go (returning nil satisfies the interface; PLAN's "temporary divergence" framing was a planner-time error since Go's interface satisfaction is compile-time-checked). Three new tests for decode-side iteration: TestChain_Decode_AllContinue (Continue chain), TestChain_Decode_StopIteration_ResumeAdvances (async resume after 20ms), TestChain_Decode_StopIteration_CtxCancelAborts (ctx-cancel during park yields ctx.Err + OnDestroy fires on chain.Destroy). All 21 tests pass under -race.
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/ -run TestChain_Decode -count=1 -v
+=== RUN   TestChain_Decode_AllContinue
+--- PASS: TestChain_Decode_AllContinue (0.00s)
+=== RUN   TestChain_Decode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Decode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Decode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Decode_StopIteration_CtxCancelAborts (0.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.037s
+$ go test -race ./internal/filter/http/ -count=1 -v
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestChain_Decode_AllContinue
+--- PASS: TestChain_Decode_AllContinue (0.00s)
+=== RUN   TestChain_Decode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Decode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Decode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Decode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestPerRoute_BuildAndResolve_RouteWins
+--- PASS: TestPerRoute_BuildAndResolve_RouteWins (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_VHostFallback
+--- PASS: TestPerRoute_BuildAndResolve_VHostFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RCFallback
+--- PASS: TestPerRoute_BuildAndResolve_RCFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_NilOnAbsent
+--- PASS: TestPerRoute_BuildAndResolve_NilOnAbsent (0.00s)
+=== RUN   TestPerRoute_BuildRejectsUnknownFilterName
+--- PASS: TestPerRoute_BuildRejectsUnknownFilterName (0.00s)
+=== RUN   TestPerRoute_LazyCacheHitMiss
+--- PASS: TestPerRoute_LazyCacheHitMiss (0.00s)
+=== RUN   TestRegistry_RegisterLookup
+--- PASS: TestRegistry_RegisterLookup (0.00s)
+=== RUN   TestRegistry_DuplicateRegisterPanics
+--- PASS: TestRegistry_DuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistry_PostFreezeRegisterPanics
+--- PASS: TestRegistry_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_FreezeIdempotent
+--- PASS: TestRegistry_FreezeIdempotent (0.00s)
+=== RUN   TestRegistry_LookupAfterFreezeOK
+--- PASS: TestRegistry_LookupAfterFreezeOK (0.00s)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.041s
+```
