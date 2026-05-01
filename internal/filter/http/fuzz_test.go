@@ -1,15 +1,19 @@
 package http
 
 import (
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// FuzzFilterChainParse exercises BuildPerRouteConfig against adversarial
-// typed_per_filter_config maps + chain-name slices. Asserts: no panic; the
-// function returns either nil or an error — no crashes — and never deadlocks.
+// FuzzFilterChainParse exercises BuildPerRouteConfig + Resolve against
+// adversarial typed_per_filter_config maps + chain-name slices. Asserts:
+// no panic; errors carry the canonical `hcm:` prefix (matches the prior
+// fuzzer discipline in internal/filter/hcm/fuzz_test.go and
+// internal/filter/tcpproxy/fuzz_test.go); on success, Resolve runs at
+// boundary routeIdx values without crashing or deadlocking.
 //
 // Per ADR-0018: short-budget (30s in CI; arbitrary local time). Seed corpus
 // gives the fuzzer three starting points: one well-formed filter name + four
@@ -42,7 +46,19 @@ func FuzzFilterChainParse(f *testing.F) {
 		// adversarial surface.
 		chains := [][]string{{}, {string(filterName)}, {string(filterName), "envoy.filters.http.router"}}
 		for _, chain := range chains {
-			_, _ = BuildPerRouteConfig(rcCfg, []routeScope{{vhost: vh, route: rt}}, chain)
+			pc, err := BuildPerRouteConfig(rcCfg, []routeScope{{vhost: vh, route: rt}}, chain)
+			if err != nil {
+				if !strings.HasPrefix(err.Error(), "hcm:") {
+					t.Errorf("error not hcm:-prefixed: %v", err)
+				}
+				continue
+			}
+			// Exercise Resolve at valid + boundary + invalid routeIdx values.
+			// Distinct routeIdx values exercise the cache-miss + bounds-check
+			// paths; the lookup at routeIdx=0 also primes the lazy cache.
+			_ = pc.Resolve(string(filterName), 0)
+			_ = pc.Resolve(string(filterName), -1)
+			_ = pc.Resolve(string(filterName), 999)
 		}
 	})
 }
