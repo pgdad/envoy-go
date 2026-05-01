@@ -26,7 +26,7 @@ OK
 
 ## Task 2 — internal/filter/http/types.go + callbacks.go [ADR-0071]
 
-**Commits:** TBD — this task's commit
+**Commits:** 0a6526b — this task's commit
 **Notes:** Created internal/filter/http/{doc,types,callbacks}.go + test pairs. Defined StreamDecoderFilter + StreamEncoderFilter interfaces, three status enums (FilterHeadersStatus/FilterDataStatus/FilterTrailersStatus), DecoderFilterCallbacks + EncoderFilterCallbacks interfaces, two-step HTTPFilterFactory + FilterInstanceFactory pattern. Landed ADR-0071 (HTTP filter iteration protocol shape; supersedes ADR-0040 totally; partially supersedes ADR-0042). go test ./internal/filter/http/ green; package compiles standalone (registry.go + chain.go + perroute.go land in subsequent tasks).
 **Outputs:**
 ```
