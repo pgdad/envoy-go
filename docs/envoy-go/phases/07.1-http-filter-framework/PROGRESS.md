@@ -399,3 +399,152 @@ hcm: filter "b" called SendLocalReply after encode-side started; ignoring
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http	1.092s
 ```
+
+## Task 8 — chain.go async-resume + concurrent-callback race tests
+
+**Commits:** <TBD> — this task's commit
+**Notes:** Added three race-tested cases to `internal/filter/http/chain_test.go` to explicitly exercise the concurrent-callback discipline + per-stream-goroutine model that Tasks 5/6 wired into `chain.go`. **No production-code change** — the buffered-1 + non-blocking-send pattern in `decoderCB.ContinueDecoding` / `encoderCB.ContinueEncoding`, the `sync.Once` + `encodeStarted` first-call-wins guard in `beginLocalReply`, and the `destroyOnce`-guarded `Destroy()` were all already present from Tasks 5/6/7. Task 8 is the explicit race-test coverage for SPEC §5.7 + §14.10's four bullets (this task lands three of the four; the `HTTPRegistry.Lookup` race-clean bullet is already covered by `TestRegistry_ConcurrentLookup_RaceClean` from Task 3). Per `superpowers:test-driven-development`'s "red" reasoning — without the production-code disciplines under test, each new test would catch a regression: (1) without the `default:` arm of `decoderCB.ContinueDecoding`'s select, 63 of the 64 senders in `TestChain_ConcurrentContinueDecoding_Coalesced` would block forever on a full channel and the WaitGroup's 2s timeout would fire `t.Fatalf("ContinueDecoding goroutines leaked")`; (2) without `localReplyOnce` + `encodeStarted` being concurrency-safe, `TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply`'s timer-goroutine + dispatch-goroutine concurrent access would surface a DATA RACE under `-race`; (3) if `Destroy()` closed `encodeResumeCh` (it doesn't, by design), `TestChain_DestroyVsInFlightContinueEncoding`'s post-Destroy `b.ecb.ContinueEncoding()` would panic with "send on closed channel" and the inner `recover()` would `t.Errorf` — the test confirms the production code's "channel send silently dropped" via the buffered-1 + non-blocking-send pattern (the channel is intentionally not closed so in-flight senders are safe). **PLAN deviation context for Step 3:** PLAN.md framed Step 3 as testing "channel send silently dropped" but the production `Destroy()` does NOT have a "kill the channel" mechanism (and shouldn't — closing would panic concurrent senders); the observable invariant in the production code is that `ContinueEncoding`'s non-blocking send into `encodeResumeCh` is a no-op once the dispatch goroutine has returned (the buffered-1 absorbs the first stale send, and subsequent senders hit the `default:` arm and drop). The test asserts this invariant by spawning 8 concurrent post-Destroy `ContinueEncoding` calls + verifying no panic + verifying `Destroy()` is idempotent (sync.Once). Test count: 31 → 34 (3 new). All 34 tests × 10 iterations = 340 PASS, zero FAIL, zero DATA RACE under `go test -race -count=10 -v`.
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/ -run 'TestChain_ConcurrentContinueDecoding_Coalesced|TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply|TestChain_DestroyVsInFlightContinueEncoding' -count=10 -v
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.294s
+
+$ go test -race ./internal/filter/http/ -count=10 -v   # full suite (representative trailing block; 10× iterations all PASS)
+... [9 prior iterations elided — each identical to the iteration shown below; 34 tests × 10 iterations = 340 PASS lines, 0 FAIL, 0 DATA RACE; verified via `... | grep -c -- '--- PASS'` → 340 and `... | grep -c -- '--- FAIL\|DATA RACE'` → 0]
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestChain_Decode_AllContinue
+--- PASS: TestChain_Decode_AllContinue (0.00s)
+=== RUN   TestChain_Decode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Decode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Decode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Decode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_ReverseOrder
+--- PASS: TestChain_Encode_ReverseOrder (0.00s)
+=== RUN   TestChain_Encode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Encode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Encode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Encode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_UnknownTrailersStatusErrs
+--- PASS: TestChain_Encode_UnknownTrailersStatusErrs (0.00s)
+=== RUN   TestChain_SendLocalReply_EntersAtLenMinus1
+--- PASS: TestChain_SendLocalReply_EntersAtLenMinus1 (0.00s)
+=== RUN   TestChain_SendLocalReply_FirstCallWins
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+--- PASS: TestChain_SendLocalReply_FirstCallWins (0.00s)
+=== RUN   TestChain_SendLocalReply_CallingFilterEncodeRuns
+--- PASS: TestChain_SendLocalReply_CallingFilterEncodeRuns (0.00s)
+=== RUN   TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs
+--- PASS: TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs (0.00s)
+=== RUN   TestChain_SendLocalReply_UserContentTypeNonCanonicalKey
+--- PASS: TestChain_SendLocalReply_UserContentTypeNonCanonicalKey (0.00s)
+=== RUN   TestChain_SendLocalReply_DefaultsAmbientCtxToBackground
+--- PASS: TestChain_SendLocalReply_DefaultsAmbientCtxToBackground (0.02s)
+=== RUN   TestChain_ConcurrentContinueDecoding_Coalesced
+--- PASS: TestChain_ConcurrentContinueDecoding_Coalesced (0.02s)
+=== RUN   TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply
+--- PASS: TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply (0.01s)
+=== RUN   TestChain_DestroyVsInFlightContinueEncoding
+--- PASS: TestChain_DestroyVsInFlightContinueEncoding (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RouteWins
+--- PASS: TestPerRoute_BuildAndResolve_RouteWins (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_VHostFallback
+--- PASS: TestPerRoute_BuildAndResolve_VHostFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RCFallback
+--- PASS: TestPerRoute_BuildAndResolve_RCFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_NilOnAbsent
+--- PASS: TestPerRoute_BuildAndResolve_NilOnAbsent (0.00s)
+=== RUN   TestPerRoute_BuildRejectsUnknownFilterName
+--- PASS: TestPerRoute_BuildRejectsUnknownFilterName (0.00s)
+=== RUN   TestPerRoute_LazyCacheHitMiss
+--- PASS: TestPerRoute_LazyCacheHitMiss (0.00s)
+=== RUN   TestRegistry_RegisterLookup
+--- PASS: TestRegistry_RegisterLookup (0.00s)
+=== RUN   TestRegistry_DuplicateRegisterPanics
+--- PASS: TestRegistry_DuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistry_PostFreezeRegisterPanics
+--- PASS: TestRegistry_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_FreezeIdempotent
+--- PASS: TestRegistry_FreezeIdempotent (0.00s)
+=== RUN   TestRegistry_LookupAfterFreezeOK
+--- PASS: TestRegistry_LookupAfterFreezeOK (0.00s)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	2.116s
+
+$ go vet ./internal/filter/http/...
+$ go build ./...
+```

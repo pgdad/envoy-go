@@ -767,3 +767,291 @@ func TestChain_SendLocalReply_DefaultsAmbientCtxToBackground(t *testing.T) {
 		t.Fatalf("expected router.EncodeHeaders called once; got %d", router.encodeHeaders.Load())
 	}
 }
+
+// TestChain_ConcurrentContinueDecoding_Coalesced asserts SPEC §5.7 + §14.10
+// bullet 1: N goroutines concurrently calling ContinueDecoding on the same
+// chain are silently coalesced by the buffered-1 + non-blocking-send pattern.
+// Concretely: filter[0] returns StopIteration → dispatch goroutine parks; 64
+// goroutines each call dcb.ContinueDecoding; the buffered-1 channel absorbs
+// exactly one send (the rest hit the default arm of the select and silently
+// drop); dispatch unparks once and iteration completes; no panic, no race
+// (assert under -race), no goroutine leak (sync.WaitGroup guards return of
+// every spawned goroutine before the test exits).
+//
+// The discipline under test lives in decoderCB.ContinueDecoding:
+//
+//	select { case d.c.decodeResumeCh <- struct{}{}: default: }
+//
+// Without the `default:` arm, 63 of the 64 goroutines would block forever on
+// the channel send (capacity 1 is full), which would manifest under -race as
+// a goroutine leak detected by the test's WaitGroup timeout.
+func TestChain_ConcurrentContinueDecoding_Coalesced(t *testing.T) {
+	a := &recordingFilter{name: "a", headersStatus: StopIteration, dataStatus: DataContinue, trailersStatus: TrailersContinue}
+	b := &recordingFilter{name: "b", headersStatus: Continue, dataStatus: DataContinue, trailersStatus: TrailersContinue}
+	chain, _ := newChainOf(a, b)
+
+	const N = 64
+	startGate := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(N)
+	// Spawn N goroutines that all unblock simultaneously on close(startGate)
+	// and then hammer ContinueDecoding. Use a small delay before close() to
+	// give the dispatch goroutine time to enter parkDecode, so all 64 sends
+	// race against an actually-parked receiver (vs. hitting it before park).
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			<-startGate
+			a.dcb.ContinueDecoding()
+		}()
+	}
+	go func() {
+		// Let dispatch reach parkDecode before flooding the channel.
+		time.Sleep(20 * time.Millisecond)
+		close(startGate)
+	}()
+
+	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatalf("expected iteration to complete after concurrent resume hammer")
+	}
+
+	// Every spawned goroutine MUST have returned — a leak would mean a sender
+	// blocked on a full channel (i.e., the `default:` arm regressed). Bound
+	// the wait so a regression fails fast rather than hanging the test suite.
+	doneAll := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneAll)
+	}()
+	select {
+	case <-doneAll:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ContinueDecoding goroutines leaked — non-blocking-send default arm regressed (some sends blocked on full channel)")
+	}
+
+	if a.decodeHeaders.Load() != 1 || b.decodeHeaders.Load() != 1 {
+		t.Fatalf("expected each filter's DecodeHeaders called once; got a=%d b=%d", a.decodeHeaders.Load(), b.decodeHeaders.Load())
+	}
+}
+
+// timerSendLocalReplyFilter is filter[1] of TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply.
+// Its DecodeHeaders spawns a goroutine that — after a short delay — calls
+// cb.SendLocalReply from OUTSIDE the dispatch goroutine, then calls
+// ContinueDecoding to unpark the dispatch goroutine (which will see
+// localReplyDone=true and return cleanly). DecodeHeaders itself returns
+// StopIteration, which parks the dispatch goroutine while the timer races.
+type timerSendLocalReplyFilter struct {
+	*recordingFilter
+	delay  time.Duration
+	status int
+	body   string
+}
+
+func (f *timerSendLocalReplyFilter) DecodeHeaders(h http.Header, end bool) FilterHeadersStatus {
+	f.recordingFilter.DecodeHeaders(h, end)
+	go func() {
+		time.Sleep(f.delay)
+		// Race: SendLocalReply is called from this goroutine while the
+		// dispatch goroutine is parked in parkDecode. The encode chain runs
+		// on THIS goroutine via beginLocalReply. After encode completes we
+		// signal ContinueDecoding to unpark dispatch, which will observe
+		// localReplyDone=true at the top of the RunDecodeHeaders loop and
+		// return (false, nil).
+		f.dcb.SendLocalReply(f.status, f.body, nil)
+		f.dcb.ContinueDecoding()
+	}()
+	return StopIteration
+}
+
+// TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply asserts SPEC §5.6
+// + §14.10 bullet 2: a filter's timer goroutine racing with the dispatch
+// goroutine on cb.SendLocalReply is safe — first-call-wins via sync.Once +
+// encodeStarted gate, no race-detector hit, encode chain runs to completion.
+//
+// Setup: 3-filter chain [a, b, c]. a returns Continue (decode iteration
+// advances). b's DecodeHeaders spawns a timer goroutine that 5ms later calls
+// SendLocalReply(403, ...) from off-dispatch; b returns StopIteration so the
+// dispatch goroutine parks at index 1 (b) while the timer races. The encode
+// chain — running on the timer goroutine via beginLocalReply — must run all
+// three encoders in reverse order (c → b → a). After the encode chain
+// completes the timer fires ContinueDecoding to unpark dispatch, which sees
+// localReplyDone=true and returns (false, nil).
+//
+// The discipline under test:
+//   - chain.localReplyOnce + chain.encodeStarted are concurrency-safe across
+//     the dispatch + timer goroutines (no racy read of localReplyDone);
+//   - decodeResumeCh's buffered-1 + non-blocking-send tolerates the timer
+//     calling ContinueDecoding even though no one is currently parked
+//     (would happen if dispatch races ahead and exits first — buffered-1
+//     absorbs the stale signal harmlessly).
+func TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply(t *testing.T) {
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	bRec := mk("b")
+	c := mk("c")
+	bTimer := &timerSendLocalReplyFilter{
+		recordingFilter: bRec,
+		delay:           5 * time.Millisecond,
+		status:          403,
+		body:            "",
+	}
+	hf := []HTTPFilter{
+		{Name: "a", Decoder: a, Encoder: a},
+		{Name: "b", Decoder: bTimer, Encoder: bRec},
+		{Name: "c", Decoder: c, Encoder: c},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+
+	// bTimer needs the decoder callbacks handle; set after NewFilterChain wires
+	// them. The wrapper struct embeds *recordingFilter so the chain wired b's
+	// callback into bRec.dcb during NewFilterChain.
+	bTimer.dcb = bRec.dcb
+
+	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if terminated {
+		t.Fatalf("expected decode iteration aborted by SendLocalReply (terminated=false); got true")
+	}
+
+	// Encode chain must have run on every filter exactly once (full reverse
+	// iteration including b — the calling filter — per ADR-0075 (d)). The
+	// race is between the timer goroutine driving the encode chain and any
+	// hypothetical concurrent dispatch-side encode entry; the encodeStarted
+	// gate + sync.Once make first-call-wins safe across goroutines.
+	if a.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected a.EncodeHeaders called once; got %d", a.encodeHeaders.Load())
+	}
+	if bRec.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected b.EncodeHeaders called once; got %d", bRec.encodeHeaders.Load())
+	}
+	if c.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected c.EncodeHeaders called once; got %d", c.encodeHeaders.Load())
+	}
+	// Decode side: a + b ran; c did NOT (decode aborted at b's SendLocalReply).
+	if a.decodeHeaders.Load() != 1 {
+		t.Fatalf("expected a.DecodeHeaders called once; got %d", a.decodeHeaders.Load())
+	}
+	if bRec.decodeHeaders.Load() != 1 {
+		t.Fatalf("expected b.DecodeHeaders called once; got %d", bRec.decodeHeaders.Load())
+	}
+	if c.decodeHeaders.Load() != 0 {
+		t.Fatalf("expected c.DecodeHeaders NOT called (decode aborted at b); got %d", c.decodeHeaders.Load())
+	}
+}
+
+// TestChain_DestroyVsInFlightContinueEncoding asserts SPEC §14.10 bullet 4 +
+// the OnDestroy semantics: a filter that races against chain teardown — i.e.,
+// calls cb.ContinueEncoding AFTER chain.Destroy has fired — must NOT panic.
+// The buffered-1 + non-blocking-send pattern on encodeResumeCh ensures the
+// stale send is silently absorbed (first call fills the buffer; subsequent
+// calls hit the default arm and drop). The channel is intentionally NEVER
+// closed by Destroy (closing would panic any in-flight sender), so the
+// observable invariant is: no panic + the dispatch goroutine has already
+// returned (chain teardown happens after iteration completes per §5.7).
+//
+// We exercise both the once-after-Destroy case (single send into the
+// post-iteration channel) AND the multiple-after-Destroy case (subsequent
+// sends drop via the default arm). The race-tested concurrency model is
+// asserted by N=8 goroutines each calling ContinueEncoding from off-dispatch
+// after Destroy has fired — under -race no synchronization issue surfaces
+// (the channel itself + the recordingFilter's atomic counters are the only
+// shared state, both lock-free safe).
+func TestChain_DestroyVsInFlightContinueEncoding(t *testing.T) {
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	b := mk("b")
+	chain, _ := newChainOf(a, b)
+	chain.SetRequestCtx(context.Background(), 0)
+
+	// Drive an encode pass so encoderCB callbacks are wired and the chain has
+	// completed iteration. After this returns, the dispatch goroutine is gone.
+	terminated, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatalf("expected encode iteration to complete")
+	}
+
+	// Tear down the chain. After Destroy returns, OnDestroy has fired on every
+	// filter. A slow filter that lost the race against teardown (e.g., a timer
+	// goroutine that wakes up post-OnDestroy) might still call ContinueEncoding;
+	// this MUST be a no-op, not a panic.
+	chain.Destroy()
+	if a.destroyed.Load() != 1 || b.destroyed.Load() != 1 {
+		t.Fatalf("expected OnDestroy to fire on chain.Destroy; a=%d b=%d", a.destroyed.Load(), b.destroyed.Load())
+	}
+
+	// Now race N goroutines all calling ContinueEncoding from off-dispatch
+	// after Destroy. Each call must:
+	//   (a) not panic (channel is not closed by Destroy);
+	//   (b) be silently absorbed by the buffered-1 + non-blocking-send pattern
+	//       (first send fills the unread buffer; rest hit the default arm).
+	const N = 8
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("ContinueEncoding after Destroy panicked: %v", r)
+		}
+	}()
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			// Defensive recover inside the goroutine too — a panic here would
+			// crash the test process before the outer recover fires.
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("ContinueEncoding goroutine panicked: %v", r)
+				}
+			}()
+			b.ecb.ContinueEncoding()
+		}()
+	}
+	doneAll := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneAll)
+	}()
+	select {
+	case <-doneAll:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ContinueEncoding goroutines leaked after Destroy — non-blocking-send default arm regressed")
+	}
+
+	// Calling Destroy again must be idempotent (sync.Once guard).
+	chain.Destroy()
+	if a.destroyed.Load() != 1 || b.destroyed.Load() != 1 {
+		t.Fatalf("expected Destroy to be idempotent (each filter's OnDestroy called exactly once); a=%d b=%d", a.destroyed.Load(), b.destroyed.Load())
+	}
+
+	// Final ContinueEncoding after the second Destroy — still must not panic.
+	b.ecb.ContinueEncoding()
+}
