@@ -30,8 +30,8 @@ const (
 type FilterTrailersStatus int
 
 const (
-	TrailersContinue       FilterTrailersStatus = iota
-	TrailersStopIteration                       // park; resume via cb.Continue*
+	TrailersContinue       FilterTrailersStatus = iota // proceed
+	TrailersStopIteration                              // park; resume via cb.Continue*
 )
 
 // StreamDecoderFilter is implemented by filters that participate in the

@@ -27,6 +27,8 @@
 // dispatch goroutine).
 //
 // External dependencies: Go stdlib + google.golang.org/protobuf +
+// github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3
+// (proto types only; blank-imported in internal/bootstrap/bootstrap.go at Task 20) +
 // internal/cluster (router sub-package only). NO third-party
 // filter-chain-engine / filter-iteration library.
 package http

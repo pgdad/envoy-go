@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 // DecoderFilterCallbacks is the framework-supplied callback shape for
@@ -51,6 +52,7 @@ type EncoderFilterCallbacks interface {
 	EncodeTrailers(trailers http.Header)
 }
 
-// Static-assertion helpers: the proto.Message return type must compile with
-// google.golang.org/protobuf/proto.
-var _ proto.Message = nil
+// Compile-time assertion: a real concrete proto type satisfies proto.Message,
+// confirming the import wiring (the package's RequestRouteConfig contract
+// returns a value of this interface type).
+var _ proto.Message = (*anypb.Any)(nil)

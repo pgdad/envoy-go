@@ -15,14 +15,14 @@ func TestFilterHeadersStatus_Values(t *testing.T) {
 }
 
 func TestFilterDataStatus_Values(t *testing.T) {
-	if DataContinue == DataStopIterationAndBuffer || DataStopIterationAndBuffer == DataStopIterationNoBuffer {
-		t.Fatalf("data status enums must be distinct")
+	if int(DataContinue) != 0 || int(DataStopIterationAndBuffer) != 1 || int(DataStopIterationNoBuffer) != 2 {
+		t.Fatalf("expected DataContinue=0, DataStopIterationAndBuffer=1, DataStopIterationNoBuffer=2; got %d/%d/%d", DataContinue, DataStopIterationAndBuffer, DataStopIterationNoBuffer)
 	}
 }
 
 func TestFilterTrailersStatus_Values(t *testing.T) {
-	if TrailersContinue == TrailersStopIteration {
-		t.Fatalf("trailers status enums must be distinct")
+	if int(TrailersContinue) != 0 || int(TrailersStopIteration) != 1 {
+		t.Fatalf("expected TrailersContinue=0, TrailersStopIteration=1; got %d/%d", TrailersContinue, TrailersStopIteration)
 	}
 }
 

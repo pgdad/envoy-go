@@ -2580,7 +2580,7 @@ Envoy's production filter chain is large (1xx headers, metadata frames, watermar
 
 ### Consequences
 
-- (a) The framework's external dependencies are limited to Go stdlib + `google.golang.org/protobuf` + `internal/cluster` (router sub-package only) — no third-party filter-chain-engine.
+- (a) The framework's external dependencies are limited to Go stdlib + `google.golang.org/protobuf` + `github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3` (proto types only; blank-imported in `internal/bootstrap/bootstrap.go` at Task 20) + `internal/cluster` (router sub-package only) — no third-party filter-chain-engine.
 - (b) The iteration-protocol shape is documented in `internal/filter/http/doc.go` (the package overview comment).
 - (c) Future family phases that introduce additional iteration features (1xx, metadata, watermark) extend this package by adding to the `StreamDecoderFilter` / `StreamEncoderFilter` interfaces — each such addition lands its own ADR.
 
