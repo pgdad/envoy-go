@@ -642,3 +642,58 @@ $ go build ./...
 $ grep -nE '^## ADR-0076:' docs/envoy-go/DECISIONS.md
 2702:## ADR-0076: Body buffer cap; 413 on decode overflow; reset on encode overflow
 ```
+
+## Task 10 — FuzzFilterChainParse (ninth fuzzer)
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/filter/http/fuzz_test.go` with `FuzzFilterChainParse` per PLAN scaffold, targeting `BuildPerRouteConfig` (Task 4) on adversarial typed_per_filter_config maps. Asserts: no panic; the function returns either nil or an error — no crashes — and never deadlocks. Per ADR-0018, the 30s short-budget gate ran clean (3,996,389 execs, 217 new-interesting inputs, 0 crashers). Doc-comment style matches the prior `FuzzHCMConfigParse` precedent (header naming the assertion + ADR-0018 reference for the 30s budget). Seed corpus exercises three distinct shapes: (1) well-formed filter name `envoy.filters.http.cors` + four payload byte slices; (2) all-empty (zero-length non-nil) shape; (3) binary-noise shape (`\x00\x01\x02` name + `\xff\xfe` rcVal + zero-length vh/rt). The fuzzer body iterates over three chain shapes — empty, matching-only `{filterName}`, and matching-plus-router `{filterName, "envoy.filters.http.router"}` — exercising the chain-name exact-string-equality surface in `BuildPerRouteConfig`. Total fuzzer count post-Task-10 is **9** (matches SPEC §1 + §14.9): bootstrap (1) + stats (1) + tls (1) + accesslog (1) + filter/tcpproxy (1) + filter/hcm (1) + filter/hcm/h2 (2) + filter/http (1, this task) = 9. **PLAN deviations:** the PLAN scaffold's `f.Add(..., nil, nil)` seed entries used Go-`nil` for the third + fourth `[]byte` arguments. Go's fuzz engine accepts typed-nil `[]byte` arguments at `f.Add` time, but to keep the seed corpus shapes unambiguous + safely round-trippable through the corpus-file format, the empty-everywhere + binary-noise seeds use `[]byte{}` (zero-length but non-nil) instead — semantically equivalent in the fuzzer body (`mk` calls `wrapperspb.String(string(b))` which yields `""` for both nil + empty inputs). One sentence deviation noted per the phase-04..06.2 PLAN-deviation precedent. All 38 prior tests + 3 fuzzer seed sub-tests pass under `-race`; `go vet ./...` + `go build ./...` clean.
+**Outputs:**
+```
+$ go test -fuzz=FuzzFilterChainParse -fuzztime=30s ./internal/filter/http/
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+fuzz: elapsed: 0s, gathering baseline coverage: 0/3 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 3/3 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 97016 (32330/sec), new interesting: 87 (total: 90)
+fuzz: elapsed: 6s, execs: 355749 (86207/sec), new interesting: 141 (total: 144)
+fuzz: elapsed: 9s, execs: 985209 (209840/sec), new interesting: 177 (total: 180)
+fuzz: elapsed: 12s, execs: 1911704 (309011/sec), new interesting: 208 (total: 211)
+fuzz: elapsed: 15s, execs: 2275689 (121305/sec), new interesting: 209 (total: 212)
+fuzz: elapsed: 18s, execs: 2530284 (84881/sec), new interesting: 214 (total: 217)
+fuzz: elapsed: 21s, execs: 2766090 (78587/sec), new interesting: 214 (total: 217)
+fuzz: elapsed: 24s, execs: 3334760 (189579/sec), new interesting: 216 (total: 219)
+fuzz: elapsed: 27s, execs: 3674797 (113324/sec), new interesting: 217 (total: 220)
+fuzz: elapsed: 30s, execs: 3996389 (107141/sec), new interesting: 217 (total: 220)
+fuzz: elapsed: 31s, execs: 3996389 (0/sec), new interesting: 217 (total: 220)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	31.177s
+
+(3,996,389 executions in 30s, 0 crashers, 220 interesting inputs — clean. The leading `hcm: filter "b" ...` line is stderr-leakage from the prior `TestChain_SendLocalReply_FirstCallWins` test that runs before fuzzing begins; not from the fuzz target.)
+
+$ go test -race ./internal/filter/http/ -count=1 -v   # 38 tests + 3 fuzzer seeds (trailing block)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+=== RUN   FuzzFilterChainParse
+=== RUN   FuzzFilterChainParse/seed#0
+=== RUN   FuzzFilterChainParse/seed#1
+=== RUN   FuzzFilterChainParse/seed#2
+--- PASS: FuzzFilterChainParse (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#0 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#1 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.146s
+
+$ go vet ./...
+$ go build ./...
+
+$ find internal -name 'fuzz_test.go' -exec grep -c '^func Fuzz' {} + | awk -F: '{s+=$2} END {print s}'
+9
+```
