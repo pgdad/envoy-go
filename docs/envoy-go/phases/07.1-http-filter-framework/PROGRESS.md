@@ -137,7 +137,7 @@ $ grep -nE '^## ADR-0073:' docs/envoy-go/DECISIONS.md
 
 ## Task 5 — internal/filter/http/chain.go decode-side iteration
 
-**Commits:** TBD — this task's commit
+**Commits:** 73b2783 — this task's commit
 **Notes:** Created internal/filter/http/{chain,chain_test}.go (initial decode-side surface). Defines filterBufferLimitBytes constant (1<<20 = 1 MiB; honored at Task 9), FilterChain struct (filters slice, decodeIdx/encodeIdx int cursors per Decision §3.5, decodeResumeCh/encodeResumeCh capacity-1 buffered channels for async-resume per ADR-0071, decodeBuf decode buffer scaffolding for Task 9, localReplyOnce/localReplyDone/encodeStarted scaffolding for Task 7), NewFilterChain (per-stream allocation, per-filter callback wiring), RunDecodeHeaders (decode-side declaration-order iteration with Continue / StopIteration / unknown-status err handling), parkDecode (single-goroutine select on decodeResumeCh / ctx.Done), Destroy (idempotent OnDestroy fan-out), decoderCB + encoderCB concrete callback structs (idempotent non-blocking signal sends; SendLocalReply stubbed for Task 7). PLAN scaffold's `RequestRouteConfig() any` corrected to `RequestRouteConfig() proto.Message` to satisfy DecoderFilterCallbacks interface from callbacks.go (returning nil satisfies the interface; PLAN's "temporary divergence" framing was a planner-time error since Go's interface satisfaction is compile-time-checked). Three new tests for decode-side iteration: TestChain_Decode_AllContinue (Continue chain), TestChain_Decode_StopIteration_ResumeAdvances (async resume after 20ms), TestChain_Decode_StopIteration_CtxCancelAborts (ctx-cancel during park yields ctx.Err + OnDestroy fires on chain.Destroy). All 21 tests pass under -race.
 **Outputs:**
 ```
