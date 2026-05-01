@@ -196,3 +196,62 @@ $ go test -race ./internal/filter/http/ -count=1 -v
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http	1.041s
 ```
+
+## Task 6 — chain.go encode-side reverse iteration
+
+**Commits:** TBD — this task's commit
+**Notes:** Added RunEncodeHeaders / RunEncodeData / RunEncodeTrailers + parkEncode to internal/filter/http/chain.go. Encode iteration traverses `len(filters)-1 → 0` per SPEC §5.5 + §11.1 empirical pin (Envoy filter order is reverse-of-decode on the encode side). Continue advances the cursor; StopIteration / DataStopIterationAndBuffer / DataStopIterationNoBuffer / TrailersStopIteration park on encodeResumeCh until ContinueEncoding fires (non-blocking, capacity-1 coalesce); ctx.Done unparks with ctx.Err. RunEncodeHeaders also flips encodeStarted to true (Task 7's beginLocalReply consults this flag). Three new tests added under -race: TestChain_Encode_ReverseOrder (asserts c→b→a invocation order via encodeRecorder wrapper), TestChain_Encode_StopIteration_ResumeAdvances (parks at b, async ContinueEncoding 20ms later, both filters ran exactly once), and TestChain_Encode_StopIteration_CtxCancelAborts (encode-side analogue of the existing decode ctx-cancel test). Recording-filter struct gained three additional fields (encHeadersStatus / encDataStatus / encTrailersStatus) so encode-side returns can be configured independently from decode-side; existing tests are zero-value compatible (Continue/DataContinue/TrailersContinue). Out of scope and deferred per PLAN: SendLocalReply trigger (Task 7), buffer overflow / 413-on-encode (Task 9), HCM dispatch wiring (Tasks 15/16). No new ADR introduced (PLAN reserves ADR slots for tasks T1/T2/T3/T4/T7/T9/T18). All 24 tests pass under -race.
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/ -count=1 -v
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestChain_Decode_AllContinue
+--- PASS: TestChain_Decode_AllContinue (0.00s)
+=== RUN   TestChain_Decode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Decode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Decode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Decode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_ReverseOrder
+--- PASS: TestChain_Encode_ReverseOrder (0.00s)
+=== RUN   TestChain_Encode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Encode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Encode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Encode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestPerRoute_BuildAndResolve_RouteWins
+--- PASS: TestPerRoute_BuildAndResolve_RouteWins (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_VHostFallback
+--- PASS: TestPerRoute_BuildAndResolve_VHostFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RCFallback
+--- PASS: TestPerRoute_BuildAndResolve_RCFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_NilOnAbsent
+--- PASS: TestPerRoute_BuildAndResolve_NilOnAbsent (0.00s)
+=== RUN   TestPerRoute_BuildRejectsUnknownFilterName
+--- PASS: TestPerRoute_BuildRejectsUnknownFilterName (0.00s)
+=== RUN   TestPerRoute_LazyCacheHitMiss
+--- PASS: TestPerRoute_LazyCacheHitMiss (0.00s)
+=== RUN   TestRegistry_RegisterLookup
+--- PASS: TestRegistry_RegisterLookup (0.00s)
+=== RUN   TestRegistry_DuplicateRegisterPanics
+--- PASS: TestRegistry_DuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistry_PostFreezeRegisterPanics
+--- PASS: TestRegistry_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_FreezeIdempotent
+--- PASS: TestRegistry_FreezeIdempotent (0.00s)
+=== RUN   TestRegistry_LookupAfterFreezeOK
+--- PASS: TestRegistry_LookupAfterFreezeOK (0.00s)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.071s
+```

@@ -118,6 +118,95 @@ func (c *FilterChain) parkDecode(ctx context.Context) error {
 	}
 }
 
+// RunEncodeHeaders iterates the encode-side filters in REVERSE declaration
+// order per SPEC §5.5 + §11.1 empirical pin. Returns (terminated=true) when
+// iteration completes; (terminated=false, err) if aborted by ctx-cancel.
+// Mirror of RunDecodeHeaders with the cursor traversing len-1 → 0.
+func (c *FilterChain) RunEncodeHeaders(ctx context.Context, headers http.Header, endStream bool) (bool, error) {
+	c.encodeStarted.Store(true)
+	c.encodeIdx = len(c.filters) - 1
+	for c.encodeIdx >= 0 {
+		f := c.filters[c.encodeIdx].Encoder
+		if f == nil {
+			c.encodeIdx--
+			continue
+		}
+		status := f.EncodeHeaders(headers, endStream)
+		switch status {
+		case Continue:
+			c.encodeIdx--
+		case StopIteration:
+			if err := c.parkEncode(ctx); err != nil {
+				return false, err
+			}
+			c.encodeIdx--
+		default:
+			return false, fmt.Errorf("chain: filter %q returned unknown FilterHeadersStatus %d on encode", c.filters[c.encodeIdx].Name, status)
+		}
+	}
+	return true, nil
+}
+
+// RunEncodeData iterates encode-side body chunks in reverse declaration order.
+// Buffer overflow / 413-on-encode handling lands in Task 9.
+func (c *FilterChain) RunEncodeData(ctx context.Context, data []byte, endStream bool) (bool, error) {
+	c.encodeIdx = len(c.filters) - 1
+	for c.encodeIdx >= 0 {
+		f := c.filters[c.encodeIdx].Encoder
+		if f == nil {
+			c.encodeIdx--
+			continue
+		}
+		status := f.EncodeData(data, endStream)
+		switch status {
+		case DataContinue:
+			c.encodeIdx--
+		case DataStopIterationAndBuffer, DataStopIterationNoBuffer:
+			if err := c.parkEncode(ctx); err != nil {
+				return false, err
+			}
+			c.encodeIdx--
+		default:
+			return false, fmt.Errorf("chain: filter %q returned unknown FilterDataStatus %d on encode", c.filters[c.encodeIdx].Name, status)
+		}
+	}
+	return true, nil
+}
+
+// RunEncodeTrailers iterates encode-side trailers in reverse declaration order.
+func (c *FilterChain) RunEncodeTrailers(ctx context.Context, trailers http.Header) (bool, error) {
+	c.encodeIdx = len(c.filters) - 1
+	for c.encodeIdx >= 0 {
+		f := c.filters[c.encodeIdx].Encoder
+		if f == nil {
+			c.encodeIdx--
+			continue
+		}
+		status := f.EncodeTrailers(trailers)
+		switch status {
+		case TrailersContinue:
+			c.encodeIdx--
+		case TrailersStopIteration:
+			if err := c.parkEncode(ctx); err != nil {
+				return false, err
+			}
+			c.encodeIdx--
+		}
+	}
+	return true, nil
+}
+
+// parkEncode waits on encodeResumeCh, ctx.Done, or returns the appropriate
+// error. Single-goroutine invariant — only the dispatch goroutine calls this.
+func (c *FilterChain) parkEncode(ctx context.Context) error {
+	select {
+	case <-c.encodeResumeCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Destroy fires OnDestroy on every filter exactly once. Safe to call multiple
 // times; idempotent.
 func (c *FilterChain) Destroy() {
