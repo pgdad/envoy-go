@@ -917,10 +917,10 @@ func TestChain_TimerGoroutineRaceWithDispatch_SendLocalReply(t *testing.T) {
 	chain := NewFilterChain(hf, nil)
 	chain.SetRequestCtx(context.Background(), 0)
 
-	// bTimer needs the decoder callbacks handle; set after NewFilterChain wires
-	// them. The wrapper struct embeds *recordingFilter so the chain wired b's
-	// callback into bRec.dcb during NewFilterChain.
-	bTimer.dcb = bRec.dcb
+	// NewFilterChain calls bTimer.SetDecoderCallbacks via the embedded
+	// *recordingFilter's promoted method, which writes bRec.dcb. The timer
+	// goroutine accesses the same memory through embedding promotion as
+	// bTimer.dcb — no explicit copy is needed.
 
 	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
 	if err != nil {
