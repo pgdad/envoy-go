@@ -2591,3 +2591,39 @@ Envoy's production filter chain is large (1xx headers, metadata frames, watermar
 Task 2 (the iteration-protocol introduction). First use of the iteration-protocol shape in production code; the architectural shape applies to every subsequent task in the package.
 
 ---
+
+## ADR-0072: HTTPRegistry threaded constructor map, no package-global
+
+**Status:** Accepted
+**Date:** 2026-05-01
+**Doctrine:** D-3.4 (record durable design rationale; the threading discipline is a contract that future package consumers MUST observe).
+
+### Context
+
+Phase 07.1 introduces the HTTP filter chain framework with a per-process registry mapping `typed_config` type_urls to filter factories. The choice: package-global with `init()`-based registration vs. an explicit threaded constructor map allocated at boot. The project has an established precedent from ADR-0059: `*stats.Registry` LBP-1 uses an explicit threaded constructor map frozen after boot — any late `Register` panics loudly.
+
+### Decision
+
+The `HTTPRegistry` is constructed once at boot in `cmd/envoy-go/main.go`, threaded explicitly into `hcm.NewFilterWithCtxAndSinksAndRegistry(...)` via the listener-manager's HCM-construction path, NOT a package-global registered via `init()`. Freeze-after-boot invariant mirrors `*stats.Registry` LBP-1 from ADR-0059:
+
+1. `HTTPRegistry.Freeze()` is called from `cmd/envoy-go/main.go` after all `Register` calls.
+2. Any subsequent `Register` panics with `filter: registry frozen: cannot register %q post-boot`.
+3. `Lookup` does not panic post-Freeze (read-allowed).
+4. Three filters registered at boot: `router.New` (`envoy.filters.http.router`), `cors.New` (`envoy.filters.http.cors`), `envoygotest.New` (`envoy.filters.http.envoy_go_test`).
+
+### Alternatives considered
+
+- **(A) `init()`-based global** — REJECTED. Test isolation hard (each test wants its own filter set); ties filter-set composition to import-graph layout; contradicts the `*stats.Registry` LBP-1 precedent established in 06.1.
+- **(B) Interface-injection without freeze (just a Lookup interface)** — REJECTED. The freeze-after-boot invariant is the load-bearing test for "no late filter registration"; without it, a future bug that calls `Register` post-boot fails silently rather than loudly.
+
+### Consequences
+
+- (a) All HCM constructors widen by one parameter (`*filter.HTTPRegistry`); pre-existing call sites in `cmd/envoy-go/main.go`, `internal/listener/manager.go`, and tests update mechanically (Decision §3.4 settles deletion of legacy constructors over forwarding shims).
+- (b) The freeze-after-boot invariant is grep-verifiable in `registry_test.go` (`TestRegistry_PostFreezeRegisterPanics`).
+- (c) Future Observability-family / xDS-family / WASM-family phases that introduce additional filter types extend this registry by registering their factories at boot — no architectural churn needed.
+
+### Lands-in-task
+
+Task 3 (the `internal/filter/http/registry.go` introduction). Supersedes nothing; complements ADR-0059.
+
+---

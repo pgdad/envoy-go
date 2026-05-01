@@ -80,8 +80,3 @@ type FactoryCtx struct {
 	// Future extensions (cluster manager, stats registry, accesslog sinks) added
 	// per-family-phase as filter implementations require them.
 }
-
-// HTTPRegistry is the extension registry for HTTP filters. Defined in full in
-// registry.go (Task 3); forward-declared here so FactoryCtx compiles in this
-// task before registry.go lands.
-type HTTPRegistry struct{}

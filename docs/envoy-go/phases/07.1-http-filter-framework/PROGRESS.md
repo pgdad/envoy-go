@@ -48,3 +48,40 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http	0.002s
 $ grep -nE '^## ADR-0071:' docs/envoy-go/DECISIONS.md
 2547:## ADR-0071: HTTP filter iteration protocol shape
 ```
+
+## Task 3 — internal/filter/http/registry.go [ADR-0072]
+
+**Commits:** TBD — this task's commit
+**Notes:** Created internal/filter/http/{registry,registry_test}.go. Removed the Task-2 forward-declaration stub of HTTPRegistry from types.go now that registry.go defines the real type. HTTPRegistry exposes Register / Lookup / Freeze / KnownTypeURLs; freeze-after-boot invariant via atomic.Bool; duplicate Register and post-Freeze Register both panic with verbatim messages per SPEC §5.3 + ADR-0072. Six new tests (registry shape + duplicate-panic + post-Freeze-panic + Freeze-idempotent + Lookup-after-Freeze + concurrent-Lookup-race-clean); all pass under -race. Landed ADR-0072 (*HTTPRegistry threaded constructor map; mirrors *stats.Registry LBP-1 from ADR-0059).
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/ -count=1 -v
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestRegistry_RegisterLookup
+--- PASS: TestRegistry_RegisterLookup (0.00s)
+=== RUN   TestRegistry_DuplicateRegisterPanics
+--- PASS: TestRegistry_DuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistry_PostFreezeRegisterPanics
+--- PASS: TestRegistry_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_FreezeIdempotent
+--- PASS: TestRegistry_FreezeIdempotent (0.00s)
+=== RUN   TestRegistry_LookupAfterFreezeOK
+--- PASS: TestRegistry_LookupAfterFreezeOK (0.00s)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.009s
+$ grep -nE '^## ADR-0072:' docs/envoy-go/DECISIONS.md
+2595:## ADR-0072: HTTPRegistry threaded constructor map, no package-global
+```
