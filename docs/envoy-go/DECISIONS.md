@@ -2493,9 +2493,9 @@ Task 15 (differential fixture 0006-access-log + runner registration). Supersedes
 
 ## ADR-0070: Phase-07 planner-time split (07.1 + 07.2)
 
-**Status:** Accepted — 2026-05-01
+**Status:** Accepted
+**Date:** 2026-05-01
 **Doctrine:** D-3.5 (decisions are written), D-3.6 (every phase is a green build).
-**Lands-in-task:** 07.1 PLAN Task 1 (PROGRESS preamble — first commit of the implementation session; the ROADMAP edit anchored by this ADR already landed at master `ee45aba` per SPEC drafting).
 
 ### Context
 
@@ -2537,3 +2537,9 @@ The parent ROADMAP row `07` flips `planned → in-progress` at the SPEC-drafting
 (d) The seven 07.1 ADRs (ADR-0070..ADR-0076) are 07.1-scoped; 07.2 will introduce its own ADRs at its own SPEC + PLAN time.
 
 (e) Total task count of phases 07.1 + 07.2 is bounded: 07.1 ships at 23 tasks (this PLAN); 07.2 will draft its own task count at its own PLAN time.
+
+### Lands-in-task
+
+07.1 PLAN Task 1 (PROGRESS preamble — first commit of the implementation session; the ROADMAP edit anchored by this ADR already landed at master `ee45aba` per SPEC drafting).
+
+---
