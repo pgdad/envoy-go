@@ -2543,3 +2543,51 @@ The parent ROADMAP row `07` flips `planned → in-progress` at the SPEC-drafting
 07.1 PLAN Task 1 (PROGRESS preamble — first commit of the implementation session; the ROADMAP edit anchored by this ADR already landed at master `ee45aba` per SPEC drafting).
 
 ---
+
+## ADR-0071: HTTP filter iteration protocol shape
+
+**Status:** Accepted
+**Date:** 2026-05-01
+**Doctrine:** D-3.2 (write from scratch — no third-party filter-chain library), D-3.5 (record durable design rationale).
+
+### Context
+
+The envoy-go HTTP filter chain framework needs an iteration protocol that lets multiple filters participate in request/response processing — each filter inspecting or mutating headers, body, and trailers — while remaining faithful to Envoy's filter-chain semantics without importing any third-party filter-chain engine. The protocol must address: (a) the method set each filter must implement (decode-side and encode-side); (b) how iteration status is signalled (status enums); (c) how filter instances are constructed per-request (factory pattern); (d) how asynchronous work in a filter (e.g., an external auth call) parks the HCM dispatch goroutine and later resumes it; and (e) what goroutine-safety guarantees exist.
+
+Envoy's production filter chain is large (1xx headers, metadata frames, watermark-based backpressure, dual-dispatcher, etc.). For the envoy-go MVP, an Envoy-faithful *subset* is sufficient: the method set that serves cors, a test-probe filter, and the router-as-terminal-filter migration. Methods with no in-scope callers are deferred per D-3.5 (YAGNI).
+
+### Decision
+
+1. **Filter interfaces**: `StreamDecoderFilter` (decode-side: `DecodeHeaders`, `DecodeData`, `DecodeTrailers`, `SetDecoderCallbacks`, `OnDestroy`) and `StreamEncoderFilter` (encode-side: `EncodeHeaders`, `EncodeData`, `EncodeTrailers`, `SetEncoderCallbacks`, `OnDestroy`). A filter may implement one or both interfaces; the `HTTPFilter` struct carries nullable `Decoder`/`Encoder` fields as a tagged union — the chain dispatches per non-nil side.
+
+2. **Status enums** — three types with the following iota values:
+   - `FilterHeadersStatus`: `Continue` (0) — proceed to next filter; `StopIteration` (1) — park, resume via `ContinueDecoding`/`ContinueEncoding`. (`ContinueAndDontEndStream` out of MVP per YAGNI.)
+   - `FilterDataStatus`: `DataContinue` (0) — proceed; `DataStopIterationAndBuffer` (1) — park and accumulate body chunks until end_stream; `DataStopIterationNoBuffer` (2) — park without body accumulation. (Watermark variant `StopAllIterationAndWatermark` out of MVP.)
+   - `FilterTrailersStatus`: `TrailersContinue` (0) — proceed; `TrailersStopIteration` (1) — park, resume via `Continue*`.
+
+3. **Out-of-MVP set** deferred per YAGNI: `ContinueAndDontEndStream`, `StopAllIterationAndWatermark`, `Encode1xxHeaders`, `decodeMetadata`/`encodeMetadata`.
+
+4. **Two-step factory pattern**: `HTTPFilterFactory(tc *anypb.Any, ctx FactoryCtx) (FilterInstanceFactory, error)` — called once at HCM-build time to parse and validate `typed_config`; returns a `FilterInstanceFactory func() HTTPFilter` — called once per request to allocate a fresh filter instance bound to the parsed config. This separates config-parse cost (per-HCM-boot) from instance-allocation cost (per-request).
+
+5. **Async-resume mechanics**: each per-stream `FilterChain` holds a buffered `chan struct{}` with capacity 1. When a filter returns `StopIteration` the dispatch goroutine blocks on `<-resumeCh`. When a filter's spawned goroutine calls `ContinueDecoding`/`ContinueEncoding`, it performs a non-blocking send (`select { case resumeCh <- struct{}{}: default: }`). Capacity-1 + non-blocking send means duplicate calls coalesce: the second send is a no-op if the channel is already full. This is idempotent by construction.
+
+6. **Single-goroutine-per-request iteration invariant**: the HCM dispatch goroutine is the sole goroutine that drives `chain.runDecode*` / `chain.runEncode*`. Filter-spawned goroutines that do async work (e.g., an auth RPC) communicate back ONLY via the resume channel send — they do NOT re-enter chain iteration directly. This eliminates the need for a mutex on the iteration cursor.
+
+### Alternatives considered
+
+- **(A) Envoy's full method set** — REJECTED for YAGNI per D-3.5; methods we drop (`Encode1xxHeaders`, `decodeMetadata`/`encodeMetadata`, watermark callbacks) have no in-scope callers in the 07.1 task set.
+- **(B) Per-filter goroutine** — REJECTED; goroutine-bloat in the common case (all filters returning `Continue` never need a goroutine); Envoy itself uses single-goroutine iteration in its HCM dispatcher (filter goroutines are opt-in via async callbacks, not the default dispatch path).
+
+### Consequences
+
+- (a) The framework's external dependencies are limited to Go stdlib + `google.golang.org/protobuf` + `internal/cluster` (router sub-package only) — no third-party filter-chain-engine.
+- (b) The iteration-protocol shape is documented in `internal/filter/http/doc.go` (the package overview comment).
+- (c) Future family phases that introduce additional iteration features (1xx, metadata, watermark) extend this package by adding to the `StreamDecoderFilter` / `StreamEncoderFilter` interfaces — each such addition lands its own ADR.
+
+**Supersedes ADR-0040 totally** (router-as-direct-call inside HCM connection loop is replaced by router-as-terminal-filter via the iteration protocol). **Partially supersedes ADR-0042** (the "exactly `[router]`" rule's lower bound stays as "must contain router as last entry"; the upper bound "exactly `[router]`" is lifted to "non-empty; last entry must be router").
+
+### Lands-in-task
+
+Task 2 (the iteration-protocol introduction). First use of the iteration-protocol shape in production code; the architectural shape applies to every subsequent task in the package.
+
+---

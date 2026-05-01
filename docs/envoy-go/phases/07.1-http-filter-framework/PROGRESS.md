@@ -23,3 +23,28 @@ f2dd6593ceb2f74fff73120b053c32bb0c0b1486
 $ test ! -d internal/filter/http && echo OK
 OK
 ```
+
+## Task 2 — internal/filter/http/types.go + callbacks.go [ADR-0071]
+
+**Commits:** TBD — this task's commit
+**Notes:** Created internal/filter/http/{doc,types,callbacks}.go + test pairs. Defined StreamDecoderFilter + StreamEncoderFilter interfaces, three status enums (FilterHeadersStatus/FilterDataStatus/FilterTrailersStatus), DecoderFilterCallbacks + EncoderFilterCallbacks interfaces, two-step HTTPFilterFactory + FilterInstanceFactory pattern. Landed ADR-0071 (HTTP filter iteration protocol shape; supersedes ADR-0040 totally; partially supersedes ADR-0042). go test ./internal/filter/http/ green; package compiles standalone (registry.go + chain.go + perroute.go land in subsequent tasks).
+**Outputs:**
+```
+$ go test ./internal/filter/http/ -count=1 -v
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.002s
+$ grep -nE '^## ADR-0071:' docs/envoy-go/DECISIONS.md
+2547:## ADR-0071: HTTP filter iteration protocol shape
+```
