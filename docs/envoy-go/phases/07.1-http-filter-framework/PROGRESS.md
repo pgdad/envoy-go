@@ -8,7 +8,7 @@ None — all 14 preconditions were satisfied at cold-start.
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble [ADR-0070]
 
-**Commits:** TBD — this task's commit
+**Commits:** 9d59c6d — this task's commit
 **Notes:** Created PROGRESS.md; verified all 14 preconditions per PLAN §"Execution preconditions"; phase-06.2 close confirmed present in HEAD; SPEC at f2dd6593ceb2f74fff73120b053c32bb0c0b1486; ADR tail at 0069 (next-free 0070); internal/filter/http/ absent (the package implementation lands at Task 2+); HTTPRegistry symbol absent. Landed ADR-0070 (phase-07 planner-time split per ADR-0045's pattern).
 **Outputs:**
 ```
