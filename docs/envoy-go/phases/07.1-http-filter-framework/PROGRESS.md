@@ -804,3 +804,49 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.234s
 $ go vet ./...
 $ go build ./...
 ```
+
+## Task 12 — internal/filter/hcm/actions.go — delete routerAction + routerActionH2 (moved to internal/filter/http/router)
+
+**Commits:** TBD — this task's commit
+**Notes:** Mechanical deletion per PLAN Task 12. Removed from `internal/filter/hcm/actions.go`: `routerAction` struct + `routerAction.do`, `routerActionH2` struct + `routerActionH2.doH2` + `routerActionH2.write502` + the defensive `routerActionH2.do` H1 stub, plus the `bad502Body` constant (only consumed by the now-deleted `routerActionH2.write502`). Preserved verbatim: `errCloseAfterAction` (still consumed by `connection.go`'s H1 loop), `directResponseAction` struct, `directResponseAction.body` / `writeH1` / `writeH2` / `do`. Removed from `internal/filter/hcm/actions_test.go`: 14 router-related test functions (TestRouterAction_DoHappy, TestRouterAction_DoDialFailureReturns503, TestRouterAction_DoCtxCancel, TestRouterActionH2_HappyPath, TestRouterActionH2_502OnDialFailure, TestRouterActionH2_502OnRoundTripProtocolError, TestRouterActionH2_CtxCancelEmitsRSTStreamCancel, TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass, TestRouterAction_Do_DialFailureInc5xx, TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass, TestRouterActionH2_Upstream5xxForwardedVerbatim, TestRouterAction_EmitsAccessLog_HappyPath, TestRouterAction_EmitsAccessLog_DialFailure, TestRouterActionH2_DefensiveDoEmits500AndLogs) plus all router-only test helpers (loopbackHTTPEcho, singleEndpointCluster*, h2BackendPKI + mkH2BackendPKI, h2BackendBehavior + runH2Backend + startH2Backend, h2EndpointCluster*, pemEncodeCAPool, h2RequestForTest, captureH2Writer, counterValue). Preserved verbatim: TestDirectResponseAction_Do, TestDirectResponseWriteH1_GoldenCompat, TestDirectResponseWriteH2_HEADERSThenDATAEndStream, TestDirectResponseAction_EmitsAccessLog, TestDirectResponseAction_NilFilter_DoesNotPanic, plus the captureSW shim those tests share. Trimmed now-unused imports from `actions.go` (dropped `bytes`, `log`) and from `actions_test.go` (dropped `crypto/ecdsa`, `crypto/elliptic`, `crypto/rand`, `stdtls`, `crypto/x509`, `crypto/x509/pkix`, `encoding/pem`, `errors`, `fmt`, `io`, `log`, `math/big`, `net`, `strconv`, `sync`, `time`, the six envoy go-control-plane proto packages, `golang.org/x/net/http2`, `anypb`, `durationpb`, and the project-internal `cluster`/`h2`/`stats` imports). LoC delta: actions.go 378 → 100 (−278); actions_test.go 1102 → 161 (−941). **Package does not yet build; restored at Task 16** — per PLAN §Task 12 Step 3 refinement: deleting `routerAction` + `routerActionH2` breaks references in `internal/filter/hcm/h2dispatch.go` (Cluster.UseH2 → routerActionH2 selection), `internal/filter/hcm/config.go` (variant selection in buildRouterAction), `internal/filter/hcm/route.go` (route-table action variant), `internal/filter/hcm/config_test.go`, and `internal/filter/hcm/connection_test.go`. The PLAN explicitly permits Tasks 12–15 to land with the package not-yet-building; Task 13 (config.go chain build), Task 15 (connection.go H1 dispatch through chain), and Task 16 (h2dispatch.go H2 dispatch through chain) collectively restore buildability via the FilterChain calling `internal/filter/http/router/`'s `Filter` instead of the deleted hcm-package symbols. This is doctrine D-3.6 release-valve compliance: the deliberate red state is documented in this PROGRESS entry + verbatim error output below so a reviewer or future debug session can confirm these are EXACTLY the references that Tasks 13/15/16 will resolve.
+
+**Verification (zero-match grep + LoC delta + router-package build clean + expected hcm red state):**
+```
+$ grep -nE 'routerAction|routerActionH2' internal/filter/hcm/actions.go internal/filter/hcm/actions_test.go
+(zero matches)
+
+$ wc -l internal/filter/hcm/actions.go internal/filter/hcm/actions_test.go
+  100 internal/filter/hcm/actions.go
+  161 internal/filter/hcm/actions_test.go
+  261 total
+
+$ go build ./internal/filter/http/router/
+(clean — router package independent)
+
+$ go build ./internal/filter/hcm/ 2>&1 | head -30
+# github.com/esalaine/envoy-go/internal/filter/hcm
+internal/filter/hcm/h2dispatch.go:62:8: undefined: routerActionH2
+internal/filter/hcm/h2dispatch.go:119:10: undefined: routerActionH2
+internal/filter/hcm/config.go:339:11: undefined: routerActionH2
+internal/filter/hcm/config.go:341:10: undefined: routerAction
+internal/filter/hcm/route.go:89:9: undefined: routerAction
+internal/filter/hcm/route.go:91:9: undefined: routerActionH2
+
+$ go test ./internal/filter/hcm/ -run TestDirectResponseAction -count=1 -v 2>&1 | head -15
+# github.com/esalaine/envoy-go/internal/filter/hcm [github.com/esalaine/envoy-go/internal/filter/hcm.test]
+internal/filter/hcm/h2dispatch.go:62:8: undefined: routerActionH2
+internal/filter/hcm/h2dispatch.go:119:10: undefined: routerActionH2
+internal/filter/hcm/config.go:339:11: undefined: routerActionH2
+internal/filter/hcm/config.go:341:10: undefined: routerAction
+internal/filter/hcm/route.go:89:9: undefined: routerAction
+internal/filter/hcm/route.go:91:9: undefined: routerActionH2
+internal/filter/hcm/config_test.go:527:21: undefined: routerAction
+internal/filter/hcm/config_test.go:539:21: undefined: routerActionH2
+internal/filter/hcm/connection_test.go:228:7: undefined: singleEndpointCluster
+internal/filter/hcm/connection_test.go:230:38: undefined: routerAction
+internal/filter/hcm/connection_test.go:230:38: too many errors
+FAIL	github.com/esalaine/envoy-go/internal/filter/hcm [build failed]
+FAIL
+```
+
+The `TestDirectResponseAction*` test invocation cannot exercise the preserved test bodies until Task 16 restores hcm-package buildability. The directResponseAction symbol surface (struct + body + writeH1 + writeH2 + do) is preserved byte-identically across this commit; the byte-preservation can be reviewed via `git show -- internal/filter/hcm/actions.go` (the unified diff shows zero touches inside the directResponseAction block). The preserved test bodies will be re-run at Task 16 when the package builds again.
