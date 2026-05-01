@@ -2627,3 +2627,34 @@ The `HTTPRegistry` is constructed once at boot in `cmd/envoy-go/main.go`, thread
 Task 3 (the `internal/filter/http/registry.go` introduction). Supersedes nothing; complements ADR-0059.
 
 ---
+
+## ADR-0073: typed_per_filter_config 3-tier merge model
+
+**Status:** Accepted
+**Date:** 2026-05-01
+**Doctrine:** D-3.5 (record durable design rationale).
+
+### Context
+
+Phase 07.1 introduces per-route filter configuration via Envoy's `typed_per_filter_config` map on Route, VirtualHost, and RouteConfiguration scopes. ADR-0041 (phases 04/05.1/05.2) silently-ignored these maps; phase 07.1's first real filter (cors) requires per-route policy to differ between routes (the cors differential at 0007a-cors needs different `CorsPolicy` per route).
+
+### Decision
+
+`typed_per_filter_config` is honored at parse-time on Route, VirtualHost, and RouteConfiguration scopes; merge order is **Route > VirtualHost > RouteConfiguration** with most-specific-override (no field-merge); lazy cache `map[cacheKey]proto.Message` on first `RequestRouteConfig()` call per request (cacheKey = filterName + routeIdx); build-time validation: keys MUST reference filter names present in the chain's `http_filters[]`; unknown filter names error at parse with `hcm: <location>: typed_per_filter_config: unknown filter name %q (chain has [...])`. **Honored at parse-time — partial supersession of ADR-0041's silent-ignore set:** `typed_per_filter_config` moves from silent-ignored to honored.
+
+### Alternatives considered
+
+- **(A) Eager `[]proto.Message` indexed by filter chain index** — REJECTED. Allocates one slot per filter even if no filter calls RequestRouteConfig — wasted in the common case.
+- **(B) Field-level merge mode** — REJECTED. YAGNI in 07.1; no in-scope filter consumes the field-merge semantic; cors policy is most-specific-override regardless. Deferred to first family phase that demands it via Envoy-equivalent test.
+
+### Consequences
+
+- (a) The silently-ignored field set is amended (per ADR-0041's amendment shape, mirroring the 05.1 + 05.2 + 06.1 + 06.2 amendments) — `typed_per_filter_config` is REMOVED from the silent-ignore set on Route/VirtualHost/RouteConfiguration.
+- (b) `filter.disabled` flag stays silent-ignored at parse-time (per SPEC §2.2 + §9; deferred to family phase that demands it).
+- (c) Future fixtures that exercise field-level merge will land their own ADR superseding the most-specific-override discipline if needed.
+
+### Lands-in-task
+
+Task 4 (the `internal/filter/http/perroute.go` introduction). Supersedes nothing; **amends ADR-0041**.
+
+---
