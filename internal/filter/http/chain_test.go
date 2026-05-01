@@ -252,3 +252,46 @@ func TestChain_Encode_StopIteration_CtxCancelAborts(t *testing.T) {
 		t.Fatalf("expected OnDestroy to fire on chain.Destroy after ctx-cancel; a=%d b=%d", a.destroyed.Load(), b.destroyed.Load())
 	}
 }
+
+// TestChain_Encode_UnknownTrailersStatusErrs guards the spec-review fix to
+// RunEncodeTrailers' switch. Before the fix, an unknown FilterTrailersStatus
+// value fell through the switch, encodeIdx was not decremented, and the for-
+// loop re-tested the same cursor → infinite loop on the dispatch goroutine.
+// The default clause (mirroring RunEncodeHeaders / RunEncodeData / RunDecode*)
+// must abort iteration with a descriptive error and terminated=false. Run with
+// a -timeout shorter than the default 10m so a regression hangs the test
+// rather than the whole suite, but t.Fatalf on timeout would still fire.
+func TestChain_Encode_UnknownTrailersStatusErrs(t *testing.T) {
+	// Cast 99 (an unknown FilterTrailersStatus value) to force the default
+	// branch in RunEncodeTrailers' switch.
+	b := &recordingFilter{
+		name:              "b",
+		encHeadersStatus:  Continue,
+		encDataStatus:     DataContinue,
+		encTrailersStatus: FilterTrailersStatus(99),
+	}
+	chain, _ := newChainOf(b)
+	done := make(chan struct{})
+	var (
+		terminated bool
+		err        error
+	)
+	go func() {
+		terminated, err = chain.RunEncodeTrailers(context.Background(), http.Header{})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("RunEncodeTrailers hung on unknown FilterTrailersStatus — missing default clause regressed")
+	}
+	if err == nil {
+		t.Fatalf("expected unknown-status error from RunEncodeTrailers; got nil")
+	}
+	if terminated {
+		t.Fatalf("expected terminated=false on unknown-status err; got true")
+	}
+	if b.encodeTrailers.Load() != 1 {
+		t.Fatalf("expected EncodeTrailers called exactly once; got %d", b.encodeTrailers.Load())
+	}
+}

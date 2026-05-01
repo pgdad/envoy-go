@@ -191,6 +191,8 @@ func (c *FilterChain) RunEncodeTrailers(ctx context.Context, trailers http.Heade
 				return false, err
 			}
 			c.encodeIdx--
+		default:
+			return false, fmt.Errorf("chain: filter %q returned unknown FilterTrailersStatus %d on encode", c.filters[c.encodeIdx].Name, status)
 		}
 	}
 	return true, nil
