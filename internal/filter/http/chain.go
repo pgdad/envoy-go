@@ -3,7 +3,9 @@ package http
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -50,6 +52,18 @@ type FilterChain struct {
 	// a no-op + log line.
 	encodeStarted atomic.Bool
 
+	// Per-request state set by HCM dispatch via SetRequestCtx (Task 7; HCM wire-up at Task 13).
+	// routeIdx is the matched-route index used by RequestRouteConfig's perRoute lookup.
+	// ambientCtx is the request context propagated to beginLocalReply when a filter
+	// triggers SendLocalReply (since SendLocalReply itself does not take a ctx).
+	routeIdx   int
+	ambientCtx context.Context
+
+	// diagLogW overrides the destination of the framework's diagnostic log
+	// lines. Default nil → stderr. Test-only setter SetDiagLogWriter swaps in
+	// a buffer to capture the log line in TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs.
+	diagLogW io.Writer
+
 	// Per-stream destroyed-once guard.
 	destroyOnce sync.Once
 }
@@ -92,6 +106,14 @@ func (c *FilterChain) RunDecodeHeaders(ctx context.Context, headers http.Header,
 			continue
 		}
 		status := f.DecodeHeaders(headers, endStream)
+		// If the filter triggered SendLocalReply during DecodeHeaders, the
+		// encode chain has already run synchronously inside beginLocalReply;
+		// abort decode iteration immediately regardless of returned status
+		// (do NOT park even if StopIteration was returned, since no
+		// ContinueDecoding will arrive — the request is terminated).
+		if c.localReplyDone.Load() {
+			return false, nil
+		}
 		switch status {
 		case Continue:
 			c.decodeIdx++
@@ -239,22 +261,19 @@ func (d *decoderCB) ContinueDecoding() {
 }
 
 func (d *decoderCB) SendLocalReply(status int, body string, headers http.Header) {
-	// Implementation lands in Task 7 (beginLocalReply + first-call-wins).
-	// Stubbed for Task 5 to avoid linker-error cascade; Task 7 replaces.
-	_ = d.c.localReplyOnce
-	d.c.localReplyDone.Store(true)
-	_ = status
-	_ = body
-	_ = headers
+	d.c.beginLocalReply(d.c.ambientCtx, d.idx, status, body, headers)
 }
 
 // RequestRouteConfig returns the merged proto.Message for the calling filter's
-// name. Returns nil until Task 7 wires in the perRoute lookup (the lookup
-// needs the route-match index from the HCM dispatch path, which connects in
-// Task 13). Note: PLAN scaffold used `any` as the return type but that does
-// not satisfy DecoderFilterCallbacks (declared in callbacks.go) which requires
-// proto.Message — corrected here.
-func (d *decoderCB) RequestRouteConfig() proto.Message { return nil } // wired to perroute lookup in Task 7
+// name via the chain's perRoute lookup at the route-index supplied by HCM
+// dispatch (chain.routeIdx, set by SetRequestCtx). Returns nil if the chain
+// has no perRoute config or no scope carries an entry for this filter.
+func (d *decoderCB) RequestRouteConfig() proto.Message {
+	if d.c.perRoute == nil {
+		return nil
+	}
+	return d.c.perRoute.Resolve(d.c.filters[d.idx].Name, d.c.routeIdx)
+}
 
 func (d *decoderCB) EncodeHeaders(http.Header, bool) {}
 func (d *decoderCB) EncodeData([]byte, bool)         {}
@@ -277,3 +296,75 @@ func (e *encoderCB) ContinueEncoding() {
 func (e *encoderCB) EncodeHeaders(http.Header, bool) {}
 func (e *encoderCB) EncodeData([]byte, bool)         {}
 func (e *encoderCB) EncodeTrailers(http.Header)      {}
+
+// SetRequestCtx wires the request context + matched-route index into the
+// chain. Called by HCM dispatch at request start (HCM wire-up lands in
+// Task 13). The ambient ctx is used by beginLocalReply since the
+// DecoderFilterCallbacks.SendLocalReply API does not accept a ctx.
+func (c *FilterChain) SetRequestCtx(ctx context.Context, routeIdx int) {
+	c.ambientCtx = ctx
+	c.routeIdx = routeIdx
+}
+
+// SetDiagLogWriter overrides the destination for framework diagnostic log
+// lines. Test-only helper: production callers leave this unset (the default
+// destination is os.Stderr). The TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs
+// test uses this to capture the "second SendLocalReply ignored" log line.
+//
+// Codified deviation from PLAN.md scaffold (which framed SetDiagLogWriter as
+// "not in this task") — Task 7's last test asserts the log line, so the
+// helper must land here. Mirrors the phase-04..06.2 PLAN-deviation precedent.
+func (c *FilterChain) SetDiagLogWriter(w io.Writer) { c.diagLogW = w }
+
+// diagLogWriter returns the destination for log messages. Default is stderr;
+// tests override via SetDiagLogWriter.
+func (c *FilterChain) diagLogWriter() io.Writer {
+	if c.diagLogW != nil {
+		return c.diagLogW
+	}
+	return os.Stderr
+}
+
+// beginLocalReply synthesizes a response from a filter's SendLocalReply call.
+// Per ADR-0075 + SPEC §11 #4 empirical pin:
+//   - enters the encode chain at filter[len-1] (NOT at the calling filter's
+//     index, NOT at index 0);
+//   - runs the FULL encode chain in reverse declaration order, INCLUDING the
+//     calling filter's own encode side;
+//   - first-call-wins via sync.Once;
+//   - second-call-after-encode-started is a no-op + diagnostic log.
+//
+// Date and Server response headers are NOT set here — those are filled by the
+// HCM wire-write path (per ADR-0075 (b)). The framework injects only the
+// minimal Content-Length + default Content-Type headers needed for a valid
+// HTTP/1.x response shape.
+func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status int, body string, headers http.Header) {
+	if c.encodeStarted.Load() {
+		// Encode chain already started; second SendLocalReply is a no-op + log.
+		fmt.Fprintf(c.diagLogWriter(), "hcm: filter %q called SendLocalReply after encode-side started; ignoring\n", c.filters[callerIdx].Name)
+		return
+	}
+	c.localReplyOnce.Do(func() {
+		c.localReplyDone.Store(true)
+		// Merge framework-injected standard headers with user-supplied headers.
+		merged := make(http.Header, len(headers)+4)
+		for k, v := range headers {
+			merged[k] = v
+		}
+		merged.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		if merged.Get("Content-Type") == "" {
+			merged.Set("Content-Type", "text/plain")
+		}
+		// status currently advisory in the framework path; HCM wire-write uses
+		// it on the status-line. Suppress unused-warning until Task 13 lands.
+		_ = status
+		// Run the encode chain. Errors here propagate to logs only — at this
+		// point the request has already reached SendLocalReply and there is
+		// no upstream to report failure to.
+		_, _ = c.RunEncodeHeaders(ctx, merged, len(body) == 0)
+		if len(body) > 0 {
+			_, _ = c.RunEncodeData(ctx, []byte(body), true)
+		}
+		// no trailers
+	})
+}

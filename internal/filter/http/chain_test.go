@@ -1,8 +1,10 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -294,4 +296,263 @@ func TestChain_Encode_UnknownTrailersStatusErrs(t *testing.T) {
 	if b.encodeTrailers.Load() != 1 {
 		t.Fatalf("expected EncodeTrailers called exactly once; got %d", b.encodeTrailers.Load())
 	}
+}
+
+// localReplyFilter wraps a recordingFilter and triggers SendLocalReply on its
+// DecodeHeaders call. Used by the SendLocalReply tests to inject the
+// encode-chain-entry path. Returns StopIteration so the chain stops further
+// decode-side iteration after the trigger.
+type localReplyFilter struct {
+	*recordingFilter
+	status  int
+	body    string
+	headers http.Header
+	// triggerCount permits TestChain_SendLocalReply_FirstCallWins to call
+	// SendLocalReply twice in a row from a single DecodeHeaders. Default 1.
+	triggerCount int
+}
+
+func (lf *localReplyFilter) DecodeHeaders(h http.Header, end bool) FilterHeadersStatus {
+	lf.recordingFilter.DecodeHeaders(h, end)
+	n := lf.triggerCount
+	if n == 0 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		lf.dcb.SendLocalReply(lf.status, lf.body, lf.headers)
+	}
+	return StopIteration
+}
+
+// TestChain_SendLocalReply_EntersAtLenMinus1 asserts SPEC §11 #4 empirical
+// pin: on a synthetic 4-filter chain [a, b, c, router] where b's DecodeHeaders
+// calls SendLocalReply, the FULL encode chain runs in reverse declaration
+// order — router → c → b → a — and NO decode side past b runs.
+func TestChain_SendLocalReply_EntersAtLenMinus1(t *testing.T) {
+	order := make([]string, 0, 4)
+	var orderMu sync.Mutex
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	bRec := mk("b")
+	c := mk("c")
+	router := mk("router")
+	bTrigger := &localReplyFilter{
+		recordingFilter: bRec,
+		status:          418,
+		body:            "i am teapot",
+		headers:         nil,
+	}
+	hf := []HTTPFilter{
+		{Name: "a", Decoder: a, Encoder: encodeRecorder{f: a, order: &order, mu: &orderMu}},
+		{Name: "b", Decoder: bTrigger, Encoder: encodeRecorder{f: bRec, order: &order, mu: &orderMu}},
+		{Name: "c", Decoder: c, Encoder: encodeRecorder{f: c, order: &order, mu: &orderMu}},
+		{Name: "router", Decoder: router, Encoder: encodeRecorder{f: router, order: &order, mu: &orderMu}},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+
+	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if terminated {
+		// SendLocalReply aborts decode-side iteration; expect terminated=false.
+		t.Fatalf("expected decode iteration aborted by SendLocalReply (terminated=false); got true")
+	}
+	// The FULL encode chain must have run in reverse order including b's own
+	// encode side (per ADR-0075 (d)).
+	want := []string{"router", "c", "b", "a"}
+	if !equalSlice(order, want) {
+		t.Fatalf("expected encode order %v (entry at filter[len-1], reverse iteration, calling filter's encode side INCLUDED); got %v", want, order)
+	}
+	// Decode side past b must NOT have run (a + b were called; c + router were not).
+	if a.decodeHeaders.Load() != 1 {
+		t.Fatalf("expected a.DecodeHeaders called once; got %d", a.decodeHeaders.Load())
+	}
+	if bRec.decodeHeaders.Load() != 1 {
+		t.Fatalf("expected b.DecodeHeaders called once; got %d", bRec.decodeHeaders.Load())
+	}
+	if c.decodeHeaders.Load() != 0 {
+		t.Fatalf("expected c.DecodeHeaders NOT called; got %d", c.decodeHeaders.Load())
+	}
+	if router.decodeHeaders.Load() != 0 {
+		t.Fatalf("expected router.DecodeHeaders NOT called; got %d", router.decodeHeaders.Load())
+	}
+}
+
+// TestChain_SendLocalReply_FirstCallWins asserts that two back-to-back
+// SendLocalReply calls from the same DecodeHeaders invocation result in
+// exactly one synthesized response (sync.Once first-call-wins).
+func TestChain_SendLocalReply_FirstCallWins(t *testing.T) {
+	order := make([]string, 0, 2)
+	var orderMu sync.Mutex
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	bRec := mk("b")
+	bTrigger := &localReplyFilter{
+		recordingFilter: bRec,
+		status:          500,
+		body:            "boom",
+		headers:         nil,
+		triggerCount:    2, // call SendLocalReply twice in a row
+	}
+	hf := []HTTPFilter{
+		{Name: "a", Decoder: a, Encoder: encodeRecorder{f: a, order: &order, mu: &orderMu}},
+		{Name: "b", Decoder: bTrigger, Encoder: encodeRecorder{f: bRec, order: &order, mu: &orderMu}},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+	_, _ = chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	// Each encode-side filter should run exactly once (sync.Once dedup'd the
+	// second SendLocalReply, NOT producing a second encode-chain pass).
+	if a.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected a.EncodeHeaders called once (first-call-wins); got %d", a.encodeHeaders.Load())
+	}
+	if bRec.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected b.EncodeHeaders called once (first-call-wins); got %d", bRec.encodeHeaders.Load())
+	}
+}
+
+// TestChain_SendLocalReply_CallingFilterEncodeRuns asserts ADR-0075 (d): the
+// FULL encode chain runs INCLUDING the calling filter's own encode side.
+// (Distinct from EntersAtLenMinus1 in framing — that test asserts ordering;
+// this one asserts inclusion of the calling filter.)
+func TestChain_SendLocalReply_CallingFilterEncodeRuns(t *testing.T) {
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	bRec := mk("b")
+	c := mk("c")
+	bTrigger := &localReplyFilter{
+		recordingFilter: bRec,
+		status:          403,
+		body:            "denied",
+		headers:         nil,
+	}
+	hf := []HTTPFilter{
+		{Name: "a", Decoder: a, Encoder: a},
+		{Name: "b", Decoder: bTrigger, Encoder: bRec},
+		{Name: "c", Decoder: c, Encoder: c},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+	_, _ = chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	// b is the calling filter — its EncodeHeaders MUST run per ADR-0075 (d).
+	if bRec.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected calling filter b's EncodeHeaders to run on SendLocalReply (ADR-0075 (d)); got %d", bRec.encodeHeaders.Load())
+	}
+	// All other encode sides also run (full chain in reverse).
+	if a.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected a.EncodeHeaders called; got %d", a.encodeHeaders.Load())
+	}
+	if c.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected c.EncodeHeaders called; got %d", c.encodeHeaders.Load())
+	}
+	// Body present → EncodeData must also run on each encoder.
+	if bRec.encodeData.Load() != 1 || a.encodeData.Load() != 1 || c.encodeData.Load() != 1 {
+		t.Fatalf("expected each filter's EncodeData called once for non-empty body; got a=%d b=%d c=%d",
+			a.encodeData.Load(), bRec.encodeData.Load(), c.encodeData.Load())
+	}
+}
+
+// TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs asserts that a
+// second SendLocalReply invoked AFTER the encode chain has begun is a no-op
+// AND emits the diagnostic log line (per ADR-0075 (e)).
+func TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs(t *testing.T) {
+	var buf bytes.Buffer
+
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	a := mk("a")
+	// Encoder for a: when it runs (during the synthesized-reply encode pass),
+	// it issues a SECOND SendLocalReply via a's decoder callbacks. encodeStarted
+	// is true at this point so the call should be a no-op + log.
+	a2 := &reentrantEncoderFilter{recordingFilter: a}
+
+	bRec := mk("b")
+	bTrigger := &localReplyFilter{
+		recordingFilter: bRec,
+		status:          418,
+		body:            "i am teapot",
+		headers:         nil,
+	}
+	hf := []HTTPFilter{
+		{Name: "a", Decoder: a, Encoder: a2},
+		{Name: "b", Decoder: bTrigger, Encoder: bRec},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+	chain.SetDiagLogWriter(&buf)
+	// a2 needs a decoder callback handle to issue the second SendLocalReply
+	// from the encode-side path; the chain wired callbacks at NewFilterChain.
+	a2.dcb = a.dcb
+
+	_, _ = chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+
+	logged := buf.String()
+	wantSubstr := `hcm: filter "a" called SendLocalReply after encode-side started; ignoring`
+	if !strings.Contains(logged, wantSubstr) {
+		t.Fatalf("expected log to contain %q; got %q", wantSubstr, logged)
+	}
+	// First SendLocalReply still won; encode chain ran exactly once per filter.
+	if a.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected a.EncodeHeaders called once; got %d", a.encodeHeaders.Load())
+	}
+	if bRec.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected b.EncodeHeaders called once; got %d", bRec.encodeHeaders.Load())
+	}
+}
+
+// reentrantEncoderFilter is an encoder that issues a SendLocalReply from its
+// EncodeHeaders. Used by TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs
+// to drive the "second call after encode-started" path.
+type reentrantEncoderFilter struct {
+	*recordingFilter
+	dcb DecoderFilterCallbacks
+}
+
+func (r *reentrantEncoderFilter) EncodeHeaders(h http.Header, end bool) FilterHeadersStatus {
+	st := r.recordingFilter.EncodeHeaders(h, end)
+	if r.dcb != nil {
+		r.dcb.SendLocalReply(500, "second-call-ignored", nil)
+	}
+	return st
 }

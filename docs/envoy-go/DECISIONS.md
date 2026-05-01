@@ -2658,3 +2658,43 @@ Phase 07.1 introduces per-route filter configuration via Envoy's `typed_per_filt
 Task 4 (the `internal/filter/http/perroute.go` introduction). Supersedes nothing; **amends ADR-0041**.
 
 ---
+
+## ADR-0075: `sendLocalReply` encode-chain semantics
+
+**Status:** Accepted
+**Date:** 2026-05-01
+**Doctrine:** D-3.3 (the synthesized-response shape is differentially observable; the empirical pin is the durable evidence) + D-3.5 (record the rationale durably).
+
+### Context
+
+When an HTTP filter calls `cb.SendLocalReply(status, body, headers)` from any callback (decode or encode side), the framework must synthesize a response and run it through the encode-side filter chain. The shape of "running through the encode-side filter chain" is differentially observable (it determines which filter's encoded headers/body are visible on the wire). Phase 07.1's `cors` filter is the first production filter that calls `SendLocalReply` (on the preflight path with `OPTIONS` requests + matching origin). The framework's discipline must replicate Envoy's behavior to ship a green differential at fixture 0007a-cors.
+
+### Decision
+
+When a filter calls `cb.SendLocalReply(status, body, headers)`:
+
+(a) the chain marks decode-side aborted at the calling filter's index (cancels any pending resume);
+(b) constructs the synthesized response (merging framework-injected standard headers — `content-length`, `content-type`, `date`, `server` — with the user-supplied headers; `date` + `server` are filled by the HCM wire-write path, NOT by `beginLocalReply`);
+(c) enters the encode chain at `filter[len-1]` of the encode-side filter set (NOT at the calling filter's index, NOT at index 0);
+(d) iterates the FULL encode chain in reverse order (every encode-side filter runs, INCLUDING the calling filter's own encode side);
+(e) first-call-wins via `sync.Once`; second-call-after-encode-started is a no-op + log line `hcm: filter %q called SendLocalReply after encode-side started; ignoring`.
+
+The empirical pin in SPEC §11 #4 is the durable evidence (verified at SPEC time against reference Envoy v1.37.2 with chain `[lua_a, lua_b, lua_c, router]` where `lua_b` calls Envoy's `respond` API; observed encode order `lua_c → lua_b → lua_a` — i.e., entry at filter[len-1] of the encode-side set; ALL three Lua filters' encode sides ran).
+
+### Alternatives considered
+
+- **(A) Entry at the calling filter's encode index (NOT filter[len-1])** — REJECTED. Diverges from Envoy and would break differential equivalence on the cors filter's preflight path (cors is at filter[0]; if it called SendLocalReply, an entry-at-calling-index discipline would skip the router's encode side, breaking the encode-chain contract).
+- **(B) Skip the calling filter's own encode side (since it produced the response)** — REJECTED per SPEC §12 #6 + §11 #4 empirical pin. Envoy uses (a): the calling filter's encode side runs.
+- **(C) Parallel encode-side iteration on SendLocalReply (faster)** — REJECTED. Parallel iteration breaks the ordering contract (encode-side filters declare their order; a header-mutation filter at index 1 must observe and possibly modify what filter at index 2 emitted).
+
+### Consequences
+
+- (a) The `chain.beginLocalReply` implementation in `chain.go` (Task 7) honors the four sub-decisions (a–e) verbatim.
+- (b) The unit test `TestChain_SendLocalReply_EntersAtLenMinus1` in `chain_test.go` asserts the encode-iteration entry point on a synthetic 4-filter chain.
+- (c) The BEHAVIOR_CONTRACT addition at Task 23 carries the §11 #4 empirical-pin block verbatim (no drift permitted; the §11 block + the §13 block are paste-verbatim-synchronized).
+
+### Lands-in-task
+
+Task 7 (the `chain.go` `beginLocalReply` implementation; first use of the encode-chain-entry-at-`filter[len-1]` semantics in production code). Supersedes nothing.
+
+---

@@ -257,3 +257,73 @@ $ go test -race ./internal/filter/http/ -count=1 -v
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http	1.071s
 ```
+
+## Task 7 — chain.go beginLocalReply + first-call-wins [ADR-0075]
+
+**Commits:** TBD — this task's commit
+**Notes:** Implemented `beginLocalReply` in `internal/filter/http/chain.go` per ADR-0075 + SPEC §11 #4 empirical pin: the synthesized response enters the encode chain at `filter[len-1]`, the FULL encode chain runs in reverse declaration order (INCLUDING the calling filter's own encode side), first-call-wins via `sync.Once`, and second-call-after-encode-started is a no-op + the diagnostic log line `hcm: filter %q called SendLocalReply after encode-side started; ignoring`. Wired `decoderCB.SendLocalReply` to call `beginLocalReply` (replacing the Task 5 stub) and wired `decoderCB.RequestRouteConfig` to consult `c.perRoute.Resolve(filterName, c.routeIdx)`. Added two struct fields to `FilterChain` — `routeIdx int` and `ambientCtx context.Context` — set by HCM dispatch via the new `SetRequestCtx(ctx, routeIdx)` method (HCM wire-up lands in Task 13). Framework-injected response headers: `Content-Length` (always set from `len(body)`) and `Content-Type` (defaults to `text/plain` if user did not supply); `Date` and `Server` are intentionally NOT set here per ADR-0075 (b) — they are filled by the HCM wire-write path. `RunDecodeHeaders` gained a post-filter-call short-circuit: after `f.DecodeHeaders` returns, if `localReplyDone` is set the loop returns `(false, nil)` immediately rather than parking — critical for the `StopIteration`-after-SendLocalReply pattern (the calling filter typically returns StopIteration; without this gate the dispatch goroutine would deadlock on `decodeResumeCh` since no `ContinueDecoding` will arrive after a SendLocalReply). Four new tests added (29 total in package): `TestChain_SendLocalReply_EntersAtLenMinus1` (the §11 #4 empirical-pin assertion in unit-test form — synthetic 4-filter chain `[a, b, c, router]` where `b`'s `DecodeHeaders` triggers SendLocalReply; observed encode order is `router → c → b → a` and decode side past b never ran), `TestChain_SendLocalReply_FirstCallWins` (two back-to-back SendLocalReply calls from the same DecodeHeaders → each encode-side filter runs exactly once), `TestChain_SendLocalReply_CallingFilterEncodeRuns` (asserts ADR-0075 (d) — the calling filter's own encode side runs), and `TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs` (a reentrant encoder fires a second SendLocalReply during the synthesized-reply encode pass; the diagnostic log line is emitted to the captured buffer and the original encode pass completes unaffected). The `TestChain_SendLocalReply_FirstCallWins` test does emit the "second call ignored" log line to stderr in the test output (visible in the verbatim dump above) — that's expected behavior since the test does not override the diag-log writer; the assertion is on encode-side counters, not log content. **PLAN deviation:** PLAN.md line 1717 framed `SetDiagLogWriter` as "test-only helper not in this task," but the Task 7 acceptance includes `TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs` which MUST be able to capture the log line — `SetDiagLogWriter` is therefore landed in this task. Mirrors the phase-04..06.2 PLAN-deviation precedent (codify in PROGRESS notes). All tests pass under `-race`.
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/ -count=1 -v
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestChain_Decode_AllContinue
+--- PASS: TestChain_Decode_AllContinue (0.00s)
+=== RUN   TestChain_Decode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Decode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Decode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Decode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_ReverseOrder
+--- PASS: TestChain_Encode_ReverseOrder (0.00s)
+=== RUN   TestChain_Encode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Encode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Encode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Encode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_UnknownTrailersStatusErrs
+--- PASS: TestChain_Encode_UnknownTrailersStatusErrs (0.00s)
+=== RUN   TestChain_SendLocalReply_EntersAtLenMinus1
+--- PASS: TestChain_SendLocalReply_EntersAtLenMinus1 (0.00s)
+=== RUN   TestChain_SendLocalReply_FirstCallWins
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+--- PASS: TestChain_SendLocalReply_FirstCallWins (0.00s)
+=== RUN   TestChain_SendLocalReply_CallingFilterEncodeRuns
+--- PASS: TestChain_SendLocalReply_CallingFilterEncodeRuns (0.00s)
+=== RUN   TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs
+--- PASS: TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RouteWins
+--- PASS: TestPerRoute_BuildAndResolve_RouteWins (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_VHostFallback
+--- PASS: TestPerRoute_BuildAndResolve_VHostFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RCFallback
+--- PASS: TestPerRoute_BuildAndResolve_RCFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_NilOnAbsent
+--- PASS: TestPerRoute_BuildAndResolve_NilOnAbsent (0.00s)
+=== RUN   TestPerRoute_BuildRejectsUnknownFilterName
+--- PASS: TestPerRoute_BuildRejectsUnknownFilterName (0.00s)
+=== RUN   TestPerRoute_LazyCacheHitMiss
+--- PASS: TestPerRoute_LazyCacheHitMiss (0.00s)
+=== RUN   TestRegistry_RegisterLookup
+--- PASS: TestRegistry_RegisterLookup (0.00s)
+=== RUN   TestRegistry_DuplicateRegisterPanics
+--- PASS: TestRegistry_DuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistry_PostFreezeRegisterPanics
+--- PASS: TestRegistry_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_FreezeIdempotent
+--- PASS: TestRegistry_FreezeIdempotent (0.00s)
+=== RUN   TestRegistry_LookupAfterFreezeOK
+--- PASS: TestRegistry_LookupAfterFreezeOK (0.00s)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.071s
+```
