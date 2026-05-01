@@ -937,4 +937,51 @@ internal/filter/hcm/route.go:91:9: undefined: routerActionH2
 
 The hcm package still does not build (same six dangling refs from Task 12 — Task 13's parseFilterWithCtx widening compiles cleanly modulo those). Per PLAN Task 12 Step 3 refinement: Tasks 13–15 may leave the package non-building; Task 16 restores buildability. The four new tests (and the four existing tests with adapted error-message substrings) cannot run until then; the test bodies have been audit-trail-verified against the new validator's verbatim error texts.
 
-The fuzzer count post-Task-13 is **10** (matches SPEC §1 + §14.9): bootstrap (1) + stats (1) + tls (1) + accesslog (1) + filter/tcpproxy (1) + filter/hcm (1) + filter/hcm/h2 (2) + filter/http (2 — `FuzzFilterChainParse` + `FuzzFilterChainParse_ChainShape`, the latter added in this task) = 10. The PLAN's "logically a single FuzzFilterChainParse target with two seed corpora" framing keeps the *logical* count at 9; the *function* count is 10 (Go's `func Fuzz*` counter).
+The fuzzer count post-Task-13 is **10** (matches SPEC §1 + §14.9): bootstrap (1) + stats (1) + tls (1) + accesslog (1) + filter/tcpproxy (1) + filter/hcm (1) + filter/hcm/h2 (2) + filter/http (2 — `FuzzFilterChainParse` + `FuzzFilterChainParse_ChainShape`, the latter added in this task) = 10. The PLAN's "logically a single FuzzFilterChainParse target with two seed corpora" framing keeps the *logical* count at 9; the *function* count is 10 (Go's `func Fuzz*` counter). [Superseded by the **Code-review-loop follow-up** below — fuzzer count returned to 9 by consolidating both branches into one `FuzzFilterChainParse` function with a discriminator parameter; the count delta resolves the I-1 review issue.]
+
+**Code-review-loop follow-up:** I-1 (fuzzer-count discipline — SPEC §1 + §14.9 + PLAN.md:2917,2925 + Task 23 close-out gate all commit to "9 fuzzers post-07.1"; the function-count delta to 10 was a documented mismatch above) addressed in commit `TBD`. Consolidated `FuzzFilterChainParse_ChainShape` into the existing `FuzzFilterChainParse` per PLAN.md:2179 ("logically a single FuzzFilterChainParse target with two seed corpora"). **Pattern A picked** (single function, single seed corpus split by leading discriminator byte `mode`, each branch keeps its own assertion shape) over Pattern B (run both branches per fuzz input) — the two branches have divergent input-arity needs (chain-shape wants count + registry-toggle that the per-route path does not), so Pattern A keeps each branch's assertion surface narrow with no cross-branch noise. The two branch bodies are extracted into private package-private helpers (`fuzzBuildPerRouteAndResolve` for `mode==0`, `fuzzValidateChainShape` for `mode!=0`); the `f.Fuzz` callback dispatches via a `switch` on the discriminator. Six seed entries are preserved verbatim — three per branch — under one common 7-arg seed shape (the unused branch-0 args `count` + `registerRouter` are pinned to zero values; the mirror unused branch-1 args are absorbed into the dispatch). Re-ran the 30s gate clean (7,207,481 execs / 227 new-interesting / 0 crashers — the per-iteration cost dropped vs. the prior `_ChainShape`-only run because branch-0's BuildPerRouteConfig+Resolve work is a fraction of the 32-worker dispatch slot share, but well above the prior `FuzzFilterChainParse`-only run because the simpler branch-0 path now shares iterations with branch-1; PASS confirms clean). All 39 tests + 6 fuzzer seed sub-tests still pass under `-race`; `go vet ./internal/filter/http/...` + `go build ./internal/filter/http/...` clean (the wider-tree hcm-package still-not-building red state from Task 12 is unchanged — same six dangling refs documented above; restored at Task 16 per PLAN Task 12 Step 3). Function-count post-consolidation: **9** (verified via `find internal -name 'fuzz_test.go' -exec grep -c '^func Fuzz' {} + | awk -F: '{s+=$2} END {print s}'`). Minor issues M-1..M-6 from the review (`defaultRouterOnlyHTTPRegistry` over-build; `RouteScope` alias; field naming; test scope shift; helper decomposition; import alias) deferred to natural cleanup at Tasks 14+.
+
+**Follow-up outputs:**
+```
+$ find internal -name 'fuzz_test.go' -exec grep -c '^func Fuzz' {} + | awk -F: '{s+=$2} END {print s}'
+9
+
+$ go test -fuzz=FuzzFilterChainParse -fuzztime=30s ./internal/filter/http/
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+fuzz: elapsed: 0s, gathering baseline coverage: 0/6 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 6/6 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 125338 (41770/sec), new interesting: 95 (total: 101)
+fuzz: elapsed: 6s, execs: 483477 (119390/sec), new interesting: 140 (total: 146)
+fuzz: elapsed: 9s, execs: 1506225 (340930/sec), new interesting: 164 (total: 170)
+fuzz: elapsed: 12s, execs: 2504469 (332672/sec), new interesting: 185 (total: 191)
+fuzz: elapsed: 15s, execs: 3401939 (299193/sec), new interesting: 200 (total: 206)
+fuzz: elapsed: 18s, execs: 4017076 (205070/sec), new interesting: 211 (total: 217)
+fuzz: elapsed: 21s, execs: 4725944 (236233/sec), new interesting: 218 (total: 224)
+fuzz: elapsed: 24s, execs: 5920622 (398226/sec), new interesting: 224 (total: 230)
+fuzz: elapsed: 27s, execs: 6604003 (227800/sec), new interesting: 226 (total: 232)
+fuzz: elapsed: 30s, execs: 7207481 (201121/sec), new interesting: 227 (total: 233)
+fuzz: elapsed: 31s, execs: 7207481 (0/sec), new interesting: 227 (total: 233)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	31.178s
+
+$ go test -race ./internal/filter/http/ -count=1 -v   # 39 tests + 6 fuzzer seeds (trailing block)
+=== RUN   FuzzFilterChainParse
+=== RUN   FuzzFilterChainParse/seed#0
+=== RUN   FuzzFilterChainParse/seed#1
+=== RUN   FuzzFilterChainParse/seed#2
+=== RUN   FuzzFilterChainParse/seed#3
+=== RUN   FuzzFilterChainParse/seed#4
+=== RUN   FuzzFilterChainParse/seed#5
+--- PASS: FuzzFilterChainParse (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#0 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#1 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#2 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#3 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#4 (0.00s)
+    --- PASS: FuzzFilterChainParse/seed#5 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.147s
+
+$ go vet ./internal/filter/http/...
+$ go build ./internal/filter/http/...
+```
