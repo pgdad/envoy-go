@@ -77,6 +77,12 @@ func NewFilterChain(filters []HTTPFilter, perRoute *PerRouteConfig) *FilterChain
 		perRoute:       perRoute,
 		decodeResumeCh: make(chan struct{}, 1),
 		encodeResumeCh: make(chan struct{}, 1),
+		// Default-init ambientCtx so any code path that calls SendLocalReply
+		// before HCM dispatch invokes SetRequestCtx (tests, or pre-Task-13
+		// callers) does not propagate a nil ctx into parkEncode/parkDecode
+		// where `<-ctx.Done()` on a nil interface would panic. SetRequestCtx
+		// overwrites this in production. Per code-quality review on a03a1d3.
+		ambientCtx: context.Background(),
 	}
 	// Wire per-filter callback structs (concrete impl tied to this chain).
 	for i := range filters {
@@ -341,23 +347,31 @@ func (c *FilterChain) diagLogWriter() io.Writer {
 func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status int, body string, headers http.Header) {
 	if c.encodeStarted.Load() {
 		// Encode chain already started; second SendLocalReply is a no-op + log.
-		fmt.Fprintf(c.diagLogWriter(), "hcm: filter %q called SendLocalReply after encode-side started; ignoring\n", c.filters[callerIdx].Name)
+		_, _ = fmt.Fprintf(c.diagLogWriter(), "hcm: filter %q called SendLocalReply after encode-side started; ignoring\n", c.filters[callerIdx].Name)
 		return
 	}
 	c.localReplyOnce.Do(func() {
 		c.localReplyDone.Store(true)
 		// Merge framework-injected standard headers with user-supplied headers.
+		// Use Header.Add (which canonicalizes via textproto.CanonicalMIMEHeaderKey)
+		// rather than a raw map copy — otherwise a user-supplied non-canonical key
+		// like "content-type" would survive verbatim and the subsequent
+		// merged.Get("Content-Type") miss would cause the framework to inject a
+		// duplicate default Content-Type pair on the wire. Per code-quality review
+		// on a03a1d3 (I-1).
 		merged := make(http.Header, len(headers)+4)
-		for k, v := range headers {
-			merged[k] = v
+		for k, vs := range headers {
+			for _, v := range vs {
+				merged.Add(k, v)
+			}
 		}
 		merged.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		if merged.Get("Content-Type") == "" {
 			merged.Set("Content-Type", "text/plain")
 		}
-		// status currently advisory in the framework path; HCM wire-write uses
-		// it on the status-line. Suppress unused-warning until Task 13 lands.
-		_ = status
+		// The status int is consumed by the HCM wire-write layer (Task 13) on
+		// the response status-line; the framework's beginLocalReply does not
+		// emit a status code itself, only the response headers + body.
 		// Run the encode chain. Errors here propagate to logs only — at this
 		// point the request has already reached SendLocalReply and there is
 		// no upstream to report failure to.

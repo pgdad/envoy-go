@@ -392,7 +392,15 @@ func TestChain_SendLocalReply_EntersAtLenMinus1(t *testing.T) {
 
 // TestChain_SendLocalReply_FirstCallWins asserts that two back-to-back
 // SendLocalReply calls from the same DecodeHeaders invocation result in
-// exactly one synthesized response (sync.Once first-call-wins).
+// exactly one synthesized response. The dedup mechanism is layered: the
+// `c.encodeStarted.Load()` early-return at the top of beginLocalReply
+// short-circuits the second call BEFORE Once.Do is reached (RunEncodeHeaders
+// flips encodeStarted on the first call's encode pass, before this filter's
+// DecodeHeaders even returns to issue the second SendLocalReply). Once.Do is
+// defense-in-depth for a hypothetical pre-RunEncodeHeaders concurrent call
+// from another goroutine — which the ADR-0071 single-driver invariant rules
+// out in production. The user-observable behavior (one synthesized response)
+// is correct either way.
 func TestChain_SendLocalReply_FirstCallWins(t *testing.T) {
 	order := make([]string, 0, 2)
 	var orderMu sync.Mutex
@@ -423,8 +431,11 @@ func TestChain_SendLocalReply_FirstCallWins(t *testing.T) {
 	chain := NewFilterChain(hf, nil)
 	chain.SetRequestCtx(context.Background(), 0)
 	_, _ = chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
-	// Each encode-side filter should run exactly once (sync.Once dedup'd the
-	// second SendLocalReply, NOT producing a second encode-chain pass).
+	// Each encode-side filter should run exactly once. The encodeStarted gate
+	// short-circuits the second SendLocalReply at the top of beginLocalReply
+	// (the encode chain has already started + flipped the flag by the time
+	// the calling filter's DecodeHeaders issues call #2); Once.Do is
+	// defense-in-depth and is not exercised here.
 	if a.encodeHeaders.Load() != 1 {
 		t.Fatalf("expected a.EncodeHeaders called once (first-call-wins); got %d", a.encodeHeaders.Load())
 	}
@@ -555,4 +566,204 @@ func (r *reentrantEncoderFilter) EncodeHeaders(h http.Header, end bool) FilterHe
 		r.dcb.SendLocalReply(500, "second-call-ignored", nil)
 	}
 	return st
+}
+
+// headerCaptureRecorder is an Encoder wrapper that captures the encoded
+// http.Header map exactly as beginLocalReply passes it down the encode chain.
+// Used by TestChain_SendLocalReply_UserContentTypeNonCanonicalKey to assert
+// that user-supplied non-canonical keys (e.g. "content-type") are merged into
+// the canonical "Content-Type" key — i.e. NO duplicate header pair on the wire.
+type headerCaptureRecorder struct {
+	f        *recordingFilter
+	captured *http.Header
+	mu       *sync.Mutex
+}
+
+func (h headerCaptureRecorder) EncodeHeaders(hd http.Header, end bool) FilterHeadersStatus {
+	h.mu.Lock()
+	// Snapshot the header map at the moment this encoder runs.
+	cp := make(http.Header, len(hd))
+	for k, vs := range hd {
+		cp[k] = append([]string(nil), vs...)
+	}
+	*h.captured = cp
+	h.mu.Unlock()
+	return h.f.EncodeHeaders(hd, end)
+}
+func (h headerCaptureRecorder) EncodeData(d []byte, end bool) FilterDataStatus {
+	return h.f.EncodeData(d, end)
+}
+func (h headerCaptureRecorder) EncodeTrailers(t http.Header) FilterTrailersStatus {
+	return h.f.EncodeTrailers(t)
+}
+func (h headerCaptureRecorder) SetEncoderCallbacks(cb EncoderFilterCallbacks) {
+	h.f.SetEncoderCallbacks(cb)
+}
+func (h headerCaptureRecorder) OnDestroy() { h.f.OnDestroy() }
+
+// TestChain_SendLocalReply_UserContentTypeNonCanonicalKey is the regression
+// guard for I-1 (code-quality review on commit a03a1d3): when a filter passes
+// a user-supplied header map with a non-canonical key like "content-type",
+// beginLocalReply's merge step must canonicalize the key so the wire shape
+// has EXACTLY ONE Content-Type header (the user's value), not a duplicate
+// pair (`content-type: application/json` AND `Content-Type: text/plain`).
+//
+// Pre-fix: `for k, v := range headers { merged[k] = v }` copies the lowercase
+// key verbatim; merged.Get("Content-Type") (which canonicalizes its arg) then
+// misses the user value, and the framework injects the default text/plain
+// under the canonical key — duplicate Content-Type on the wire.
+//
+// Post-fix: `merged.Add(k, v)` calls textproto.CanonicalMIMEHeaderKey
+// internally, ensuring all keys land canonical and the user's value wins.
+func TestChain_SendLocalReply_UserContentTypeNonCanonicalKey(t *testing.T) {
+	var captured http.Header
+	var capMu sync.Mutex
+
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	aRec := mk("a")
+	router := mk("router")
+	aTrigger := &localReplyFilter{
+		recordingFilter: aRec,
+		status:          200,
+		body:            "hi",
+		headers:         http.Header{"content-type": []string{"application/json"}},
+	}
+	hf := []HTTPFilter{
+		{Name: "a", Decoder: aTrigger, Encoder: headerCaptureRecorder{f: aRec, captured: &captured, mu: &capMu}},
+		{Name: "router", Decoder: router, Encoder: headerCaptureRecorder{f: router, captured: &captured, mu: &capMu}},
+	}
+	chain := NewFilterChain(hf, nil)
+	chain.SetRequestCtx(context.Background(), 0)
+	_, _ = chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+
+	// Snapshot the captured map (router's encoder runs first per reverse
+	// iteration; a's overwrites with the same canonical map).
+	capMu.Lock()
+	got := captured
+	capMu.Unlock()
+	if got == nil {
+		t.Fatalf("expected encode chain to have run and captured headers; got nil")
+	}
+
+	// The canonical "Content-Type" key MUST exist with the user's value.
+	ct := got["Content-Type"]
+	if len(ct) != 1 || ct[0] != "application/json" {
+		t.Fatalf("expected exactly one canonical Content-Type=application/json; got %v", ct)
+	}
+	// The non-canonical "content-type" key MUST NOT exist (would manifest
+	// as a duplicate header on the wire). Probing for the non-canonical key
+	// is the whole point of this regression test — staticcheck SA1008 flags
+	// the literal as suspicious in a normal Header use, but here it is the
+	// negative assertion we need.
+	//nolint:staticcheck // SA1008: deliberate probe for non-canonical key absence
+	if v, present := got["content-type"]; present {
+		t.Fatalf("expected non-canonical \"content-type\" to be merged into canonical key; saw duplicate: %v", v)
+	}
+	// Defense-in-depth: total Content-Type values across the entire map (any
+	// case) is exactly 1 — no other casing variant either.
+	totalCT := 0
+	for k, vs := range got {
+		if strings.EqualFold(k, "Content-Type") {
+			totalCT += len(vs)
+		}
+	}
+	if totalCT != 1 {
+		t.Fatalf("expected exactly one Content-Type value across all casings; got %d in %v", totalCT, got)
+	}
+}
+
+// TestChain_SendLocalReply_DefaultsAmbientCtxToBackground is the regression
+// guard for I-2 (code-quality review on commit a03a1d3): if a filter calls
+// SendLocalReply BEFORE HCM dispatch has called SetRequestCtx (e.g. tests, or
+// pre-Task-13 callers), c.ambientCtx is nil → decoderCB.SendLocalReply
+// propagates nil to beginLocalReply → RunEncode* → parkEncode(nil) where
+// `<-ctx.Done()` on a nil channel blocks forever, masking cancellation.
+//
+// The hang only manifests when an encoder filter returns StopIteration, since
+// that is when parkEncode is reached. We construct a chain where router's
+// encode side returns StopIteration once, then ContinueEncoding is fired
+// async — under the fix (ambientCtx defaults to context.Background()) the
+// resume channel unparks the encode chain. Without the fix, parkEncode would
+// be `select { case <-resumeCh; case <-nil-ctx-Done }` — fortuitously the
+// resumeCh path still wins, BUT a hostile race between a hypothetical
+// ctx-cancel and the resume signal would blackhole. The strong assertion is
+// nil-safety in the select itself: a nil context.Done() channel just blocks
+// (does not panic), which means the bug is silent — we therefore assert the
+// observable invariant that parkEncode does not block forever and the encode
+// chain completes.
+//
+// Fix: NewFilterChain sets ambientCtx = context.Background() by default.
+func TestChain_SendLocalReply_DefaultsAmbientCtxToBackground(t *testing.T) {
+	mk := func(name string) *recordingFilter {
+		return &recordingFilter{
+			name:              name,
+			headersStatus:     Continue,
+			dataStatus:        DataContinue,
+			trailersStatus:    TrailersContinue,
+			encHeadersStatus:  Continue,
+			encDataStatus:     DataContinue,
+			encTrailersStatus: TrailersContinue,
+		}
+	}
+	aRec := mk("a")
+	// router's encode side returns StopIteration — forces parkEncode under the
+	// (potentially-nil) ambient ctx. Resume is fired async so the test has a
+	// happy-path completion.
+	router := mk("router")
+	router.encHeadersStatus = StopIteration
+
+	aTrigger := &localReplyFilter{
+		recordingFilter: aRec,
+		status:          200,
+		body:            "ok",
+		headers:         nil,
+	}
+	hf := []HTTPFilter{
+		{Name: "a", Decoder: aTrigger, Encoder: aRec},
+		{Name: "router", Decoder: router, Encoder: router},
+	}
+	chain := NewFilterChain(hf, nil)
+	// NOTE: deliberately NOT calling chain.SetRequestCtx — exercises the
+	// ambientCtx == nil path. Without the I-2 fix, parkEncode's
+	// `case <-ctx.Done()` arm operates on a nil channel.
+
+	// Async resume so the StopIteration park returns. We allow up to 1s
+	// before the resume signal fires; under the fix this completes quickly.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		router.ecb.ContinueEncoding()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			// Defensive: a nil-ctx panic would also fail this test.
+			_ = recover()
+			close(done)
+		}()
+		_, _ = chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("RunDecodeHeaders hung — ambientCtx default-init regressed (parkEncode reached on nil ctx.Done channel)")
+	}
+
+	// Encode chain ran on both filters (full reverse iteration).
+	if aRec.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected a.EncodeHeaders called once; got %d", aRec.encodeHeaders.Load())
+	}
+	if router.encodeHeaders.Load() != 1 {
+		t.Fatalf("expected router.EncodeHeaders called once; got %d", router.encodeHeaders.Load())
+	}
 }

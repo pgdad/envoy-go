@@ -327,3 +327,75 @@ hcm: filter "b" called SendLocalReply after encode-side started; ignoring
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http	1.071s
 ```
+
+**Code-quality-review follow-up:** Code-quality reviewer report on `a03a1d3` flagged two important + three minor issues, addressed in a single follow-up commit. **I-1 (Content-Type case-canonicalization on user-supplied headers)** — `beginLocalReply`'s merge step copied user-supplied keys verbatim via `merged[k] = v`, so a user header `http.Header{"content-type": []string{"application/json"}}` survived as a non-canonical key; the subsequent `merged.Get("Content-Type")` (which canonicalizes its argument) missed the user value and the framework injected the default `text/plain` under the canonical key, producing a duplicate `content-type` + `Content-Type` pair on the wire. Fix: replace the raw map copy with a per-value `merged.Add(k, v)` loop, which canonicalizes via `textproto.CanonicalMIMEHeaderKey` internally. Regression test `TestChain_SendLocalReply_UserContentTypeNonCanonicalKey` (TDD-red verified pre-fix; failing assertion `expected exactly one canonical Content-Type=application/json; got [text/plain]`) asserts (a) canonical `Content-Type` has exactly one value `application/json`, (b) no `content-type` key present, (c) total Content-Type values across all casings is exactly 1. **I-2 (`ambientCtx` nil-unsafe pre-`SetRequestCtx`)** — `decoderCB.SendLocalReply` propagates `c.ambientCtx` to `beginLocalReply` → `RunEncode*` → `parkEncode(nil)`, where `<-ctx.Done()` on a nil interface panics (or, depending on race ordering, blocks forever masking cancellation). Fix: `NewFilterChain` now default-initializes `ambientCtx = context.Background()`; `SetRequestCtx` overwrites in production. Regression test `TestChain_SendLocalReply_DefaultsAmbientCtxToBackground` (TDD-red verified pre-fix; failing assertion `expected a.EncodeHeaders called once; got 0` because the nil-ctx panic short-circuited the encode chain) constructs a chain WITHOUT `SetRequestCtx`, has the router's encode side return `StopIteration` to force a `parkEncode` reach, then asynchronously fires `ContinueEncoding` and asserts the chain completes within 2s with both filters' EncodeHeaders called exactly once. **M-1 (misleading first-call-wins comment)** — the test comment claimed `sync.Once` dedups the second call; in reality `c.encodeStarted.Load()` short-circuits at the top of `beginLocalReply` before `Once.Do` is reached on the second call. Comment updated to acknowledge the layered mechanism (encodeStarted gate fires first; `Once` is defense-in-depth for hypothetical pre-`RunEncodeHeaders` concurrent calls — ruled out in production by ADR-0071's single-driver invariant). **M-2 (`fmt.Fprintf` errcheck warning)** — wrapped the diagnostic-log `fmt.Fprintf` call in `_, _ = fmt.Fprintf(...)` to silence golangci-lint's errcheck warning; baseline lint diff confirms the `chain.go:344` errcheck warning is gone post-fix. **M-4 (stale `_ = status` discard + misleading comment)** — Go does not warn on unused function parameters, so the `_ = status` line and accompanying "Suppress unused-warning until Task 13 lands" comment were misleading (the parameter IS used by future call sites — it just is not consumed inside the framework body); removed the discard and replaced the comment with a brief note that the status int travels to the HCM wire-write layer (Task 13). One additional staticcheck SA1008 false positive on `got["content-type"]` in the I-1 regression test (probing for a non-canonical key absence is the negative assertion the test needs) is suppressed via `//nolint:staticcheck` with rationale on the immediately-preceding line. M-3 (ADR prose "cancel any pending resume" — vacuous parenthetical) and M-5 (Sprintf vs strconv.Itoa — stylistic; PLAN scaffold uses Sprintf) deferred per reviewer-marked out-of-scope. Test count post-fix: 31 (was 29). All 31 tests pass under `-race`. Net lint warnings introduced: zero (one removed via M-2; the new SA1008 is intentional + suppressed).
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/ -count=1 -v
+=== RUN   TestDecoderFilterCallbacks_Compile
+--- PASS: TestDecoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestEncoderFilterCallbacks_Compile
+--- PASS: TestEncoderFilterCallbacks_Compile (0.00s)
+=== RUN   TestChain_Decode_AllContinue
+--- PASS: TestChain_Decode_AllContinue (0.00s)
+=== RUN   TestChain_Decode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Decode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Decode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Decode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_ReverseOrder
+--- PASS: TestChain_Encode_ReverseOrder (0.00s)
+=== RUN   TestChain_Encode_StopIteration_ResumeAdvances
+--- PASS: TestChain_Encode_StopIteration_ResumeAdvances (0.02s)
+=== RUN   TestChain_Encode_StopIteration_CtxCancelAborts
+--- PASS: TestChain_Encode_StopIteration_CtxCancelAborts (0.01s)
+=== RUN   TestChain_Encode_UnknownTrailersStatusErrs
+--- PASS: TestChain_Encode_UnknownTrailersStatusErrs (0.00s)
+=== RUN   TestChain_SendLocalReply_EntersAtLenMinus1
+--- PASS: TestChain_SendLocalReply_EntersAtLenMinus1 (0.00s)
+=== RUN   TestChain_SendLocalReply_FirstCallWins
+hcm: filter "b" called SendLocalReply after encode-side started; ignoring
+--- PASS: TestChain_SendLocalReply_FirstCallWins (0.00s)
+=== RUN   TestChain_SendLocalReply_CallingFilterEncodeRuns
+--- PASS: TestChain_SendLocalReply_CallingFilterEncodeRuns (0.00s)
+=== RUN   TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs
+--- PASS: TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs (0.00s)
+=== RUN   TestChain_SendLocalReply_UserContentTypeNonCanonicalKey
+--- PASS: TestChain_SendLocalReply_UserContentTypeNonCanonicalKey (0.00s)
+=== RUN   TestChain_SendLocalReply_DefaultsAmbientCtxToBackground
+--- PASS: TestChain_SendLocalReply_DefaultsAmbientCtxToBackground (0.02s)
+=== RUN   TestPerRoute_BuildAndResolve_RouteWins
+--- PASS: TestPerRoute_BuildAndResolve_RouteWins (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_VHostFallback
+--- PASS: TestPerRoute_BuildAndResolve_VHostFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_RCFallback
+--- PASS: TestPerRoute_BuildAndResolve_RCFallback (0.00s)
+=== RUN   TestPerRoute_BuildAndResolve_NilOnAbsent
+--- PASS: TestPerRoute_BuildAndResolve_NilOnAbsent (0.00s)
+=== RUN   TestPerRoute_BuildRejectsUnknownFilterName
+--- PASS: TestPerRoute_BuildRejectsUnknownFilterName (0.00s)
+=== RUN   TestPerRoute_LazyCacheHitMiss
+--- PASS: TestPerRoute_LazyCacheHitMiss (0.00s)
+=== RUN   TestRegistry_RegisterLookup
+--- PASS: TestRegistry_RegisterLookup (0.00s)
+=== RUN   TestRegistry_DuplicateRegisterPanics
+--- PASS: TestRegistry_DuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistry_PostFreezeRegisterPanics
+--- PASS: TestRegistry_PostFreezeRegisterPanics (0.00s)
+=== RUN   TestRegistry_FreezeIdempotent
+--- PASS: TestRegistry_FreezeIdempotent (0.00s)
+=== RUN   TestRegistry_LookupAfterFreezeOK
+--- PASS: TestRegistry_LookupAfterFreezeOK (0.00s)
+=== RUN   TestRegistry_ConcurrentLookup_RaceClean
+--- PASS: TestRegistry_ConcurrentLookup_RaceClean (0.00s)
+=== RUN   TestFilterHeadersStatus_Values
+--- PASS: TestFilterHeadersStatus_Values (0.00s)
+=== RUN   TestFilterDataStatus_Values
+--- PASS: TestFilterDataStatus_Values (0.00s)
+=== RUN   TestFilterTrailersStatus_Values
+--- PASS: TestFilterTrailersStatus_Values (0.00s)
+=== RUN   TestFilterInterfaces_Compile
+--- PASS: TestFilterInterfaces_Compile (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.092s
+```
