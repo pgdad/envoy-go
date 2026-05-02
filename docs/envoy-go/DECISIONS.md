@@ -3011,3 +3011,108 @@ The timeout is enforced as a **per-pipeline shared budget** (per Decision N from
 07.2 PLAN Task 4 (the `Pipeline.Run` timeout-enforcement mechanic). The bootstrap parser's envelope-check at `internal/listener/manager.go` (Task 9) cross-references this ADR. Supersedes nothing.
 
 ---
+
+## ADR-0080: `default_filter_chain` semantics (no-match fallback; empty-match chain BEATS default_filter_chain; TLS posture independent)
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.3 (differential correctness beats internal fidelity) + D-3.5 (honor proto fields widely used in real Envoy deployments).
+**Supersedes:** ADR-0033 clause 3 (the parse-time error on `default_filter_chain` is totally superseded — 07.2 honors the field).
+
+### Context
+
+Phase 07.2 introduces `internal/listener/listenerfilter/chainmatch.go` (the `SelectChain` 2-pass eligibility-then-specificity algorithm) and is the first phase to honor the `Listener.default_filter_chain` proto field. SPEC §5.7 enumerates the supersession of ADR-0033's filter-chain whitelist; SPEC §8 raises the `default_filter_chain` semantics question: does it act as a no-match fallback, an always-preferred override, or something else; what happens when the user has BOTH an empty-match chain in `filter_chains[]` AND a `default_filter_chain`; and what are the cross-chain TLS-posture rules between `filter_chains[]` and `default_filter_chain`.
+
+The phase-03 ADR-0033 took the conservative position that any `default_filter_chain` was a parse-time error (clause 3), reflecting MVP scope at the time. With 07.2's expanded surface — full 8-dimension `FilterChainMatch` with ALPN dispatch + listener-filter pipeline — `default_filter_chain` becomes useful as a fallback when none of the 8-dim chains match (e.g., a connection from an unexpected source with no SNI on a TLS-only listener; the operator wants a graceful TLS-rejecting fallback rather than a closed connection). The proto field is widely used in real Envoy deployments. SPEC §8 settled the semantics by pinning Envoy v1.37.2's behavior; this ADR records the decision in DECISIONS.md.
+
+### Decision
+
+The `Listener.default_filter_chain` proto field is honored, with the following semantics:
+
+1. **No-match fallback only.** `default_filter_chain` is consulted ONLY when no `filter_chains[]` entry's `filter_chain_match` is eligible against the per-connection `ChainMatchInputs`. If at least one `filter_chains[]` entry is eligible, `default_filter_chain` is NOT consulted (the eligible chain wins per the 8-dim specificity score per ADR-0081, even if the eligible chain has lower specificity than the operator might expect).
+
+2. **Empty-match chain in `filter_chains[]` BEATS `default_filter_chain`.** A `filter_chains[]` entry with an absent or all-zero `filter_chain_match` (an "empty-match chain") is universally eligible at Pass 1 of the chain-match algorithm. When such a chain coexists with a `default_filter_chain`, the empty-match chain wins (the empty-match chain ENTERS the eligibility set, so `len(eligibleChains) >= 1`, so the no-match-fallback path is not taken). This matches Envoy's documented behavior.
+
+3. **Independent TLS posture.** `default_filter_chain` may carry an independent `transport_socket` (TLS or plaintext) regardless of the `filter_chains[]` entries' TLS posture. The cross-chain mixed-TLS-and-plaintext rule from ADR-0033 clause 5 (preserved as ADR-0078 caveat: plaintext multi-chain disallowed when any chain populates `server_names`) applies WITHIN `filter_chains[]` only; `default_filter_chain` is a structurally-separate slot and is NOT subject to the cross-chain TLS uniformity rule.
+
+### Empirical evidence
+
+Both decisions are pinned to Envoy v1.37.2 at server SHA `5afe27fb338b16d5bb06b3a7198bcd581b4e3dee` per ENVOY_TARGET:
+
+- **SPEC §11.1 (no-match fallback honored).** Verbatim Envoy stats from a single-chain bootstrap with `filter_chains[].filter_chain_match.destination_port = 18080` + `default_filter_chain` (TCP-proxy to a different backend) on a connection to port 18081: `tcp.tcp_dstport_18080.downstream_cx_total: 0`, `tcp.tcp_default.downstream_cx_total: 1`. Envoy honors `default_filter_chain` as the no-match fallback.
+
+- **SPEC §11.2 (empty-match beats default).** Verbatim Envoy stats from a bootstrap with both an empty-match chain in `filter_chains[]` (`tcp_empty`) AND a `default_filter_chain` (`tcp_default`) on a connection from any source: `tcp.tcp_empty.downstream_cx_total: 1`, `tcp.tcp_default.downstream_cx_total: 0`. Envoy boots cleanly with both fields populated AND the empty-match chain wins dispatch.
+
+### Alternatives considered
+
+- **(A) `default_filter_chain` ALWAYS preferred (bypass `filter_chains[]` if `default_filter_chain` is set).** REJECTED per the §11.1 empirical pin (Envoy honors `filter_chains[]` first; `default_filter_chain` is consulted only on no-match). This alternative would break differential parity with Envoy on the dispatch-ordering axis and is therefore disqualified by D-3.3.
+
+- **(B) Error if both empty-match chain in `filter_chains[]` AND `default_filter_chain` exist.** REJECTED per the §11.2 empirical pin (Envoy boots cleanly on the combined config; the empty-match chain simply wins by virtue of being eligible at Pass 1). Erroring on a config Envoy accepts would force operators to choose between the two structural slots when both are valid; the chosen semantics make the empty-match-vs-default-chain coexistence well-defined without operator intervention.
+
+### Consequences
+
+- (a) The `chainmatch.SelectChain(inputs, chains, defaultChain)` algorithm consults `defaultChain` ONLY when `len(eligibleChains) == 0`. Concretely, the implementation runs Pass 1 (eligibility) over `chains` first; if the eligibility set is empty, returns `defaultChain` if non-nil OR `ErrNoChainMatched` if nil. The algorithm is implemented in `internal/listener/listenerfilter/chainmatch.go` at the lands-in-task commit.
+
+- (b) The `catchAllCount > 1` validation at `internal/listener/manager.go` (the phase-03 check that rejects a `filter_chains[]` slice with two empty-match chains) is preserved for `filter_chains[]` empty-match entries. The `default_filter_chain` is a SEPARATE structural slot and does NOT count toward `catchAllCount`. Therefore the four combinations of (empty-match-chain-count-in-filter_chains[], default-chain-presence) — `(0, no)`, `(1, no)`, `(0, yes)`, `(1, yes)` — are all valid; only `(2+, *)` errors at parse time.
+
+- (c) The cross-chain mixed-TLS-and-plaintext rule from ADR-0033 clause 5 (preserved as ADR-0078 caveat) applies WITHIN `filter_chains[]` only. `default_filter_chain` is independent; an operator may have a TLS-only `filter_chains[]` entry coexisting with a plaintext `default_filter_chain` (e.g., a TLS listener that gracefully degrades to plaintext-rejection on no-match) without parse error.
+
+### Lands-in-task
+
+07.2 PLAN Task 5 (the `chainmatch.SelectChain` default-fallback path; same task as ADR-0081). The bootstrap parser's `default_filter_chain` honoring at `internal/listener/manager.go` (Task 9) and the manager's `defaultChain` plumbing into `SelectChain` (Task 10) cross-reference this ADR.
+
+---
+
+## ADR-0081: `FilterChainMatch` 8-dimension precedence algorithm
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.5 (honor proto fields widely used in real Envoy deployments) + D-3.6 (record durable design rationale; the 8-dim priority order is a contract that future xDS/listener phases MUST consult).
+**Supersedes (partial):** ADR-0033 clause 2 (the phase-03 `filter_chain_match` whitelist is partially superseded — only `direct_source_prefix_ranges` stays silent-skipped post-07.2, all other dimensions are honored per the 8-dim algorithm).
+
+### Context
+
+Phase 07.2 introduces `internal/listener/listenerfilter/chainmatch.go`'s `SelectChain` function — the per-connection chain-match algorithm. SPEC §5.5 raises the precedence-algorithm question: given 8 match dimensions on `FilterChainMatch` (`destination_port`, `prefix_ranges`, `server_names`, `transport_protocol`, `application_protocols`, `source_type`, `source_prefix_ranges`, `source_ports` — the upstream `direct_source_prefix_ranges` field is silent-skipped per ADR-0078), what is the priority order between dimensions; how are ties within a single priority slot broken; and what happens when two chains are identical on all 8 dimensions.
+
+SPEC §7.1 enumerates the 8 dimensions; §7.2 documents the priority order matching the upstream `filter_chain_match.proto` comments; §7.3 documents the 2-pass eligibility-then-specificity algorithm; §11.3 pins the empirical evidence that `destination_port` BEATS `source_prefix_ranges` on a real Envoy v1.37.2 dispatch path.
+
+### Decision
+
+`SelectChain` runs a 2-pass eligibility-then-specificity algorithm over a slice of `*ChainSpec` plus an optional `*ChainSpec` default chain (per ADR-0080):
+
+1. **Priority order (highest priority first).** `[destination_port, prefix_ranges, server_names, transport_protocol, application_protocols, source_type, source_prefix_ranges, source_ports]`. This matches the upstream `filter_chain_match.proto` documented order.
+
+2. **Pass 1: eligibility.** A chain is eligible iff every specified (non-zero / non-empty) dimension matches the corresponding `ChainMatchInputs` field. A chain with all dimensions unspecified (the "empty-match" chain) is universally eligible. Chains with at least one specified dimension that does not match the input are eliminated. The output of Pass 1 is the eligibility set.
+
+3. **Pass 2: specificity scoring.** Each eligible chain is scored by an 8-bit integer where bit `prioCount-1-i` is set iff the dimension at priority slot `i` is specified on the chain. Bit ordering puts the most-significant-bit on the highest-priority dimension so a numerical compare reflects the priority order. The chain with the highest specificity integer wins.
+
+4. **Tie-breaking at finer grain.** When two chains have identical specificity vectors, ties are broken by per-dimension finer-grain criteria:
+   - `prefix_ranges` / `source_prefix_ranges`: longest CIDR prefix containing the input IP wins (longer prefix = more specific).
+   - `server_names`: SNI specificity per ADR-0033 clause 9 (preserved as ADR-0078 sub-ordering): exact > suffix-wildcard > universal-wildcard > catch-all (lower rank = more specific).
+   - All other dimensions are exact-value match — no sub-ordering.
+
+5. **Final ties (chains identical on all 8 dimensions AND on tie-break sub-ordering).** Error at `NewManager`-build time with `listener: %q: filter_chains[i] and filter_chains[j] have identical filter_chain_match — ambiguous selection`. The bootstrap parser duplicate-matches `*ChainSpec` entries structurally and surfaces `ErrAmbiguousChainMatch` to the operator at config-load time, NOT at per-connection dispatch time.
+
+### Empirical evidence
+
+The priority-order decision is pinned to Envoy v1.37.2 at server SHA `5afe27fb338b16d5bb06b3a7198bcd581b4e3dee` per ENVOY_TARGET. SPEC §11.3 documents verbatim Envoy stats from a 2-chain bootstrap (`tcp_dstport` with `destination_port: 8080`; `tcp_srcprefix` with `source_prefix_ranges: 127.0.0.0/8`) on a connection from `127.0.0.1` to port `8080` (BOTH chains eligible at Pass 1; Pass 2 selects on priority): `tcp.tcp_dstport.downstream_cx_total: 1`, `tcp.tcp_srcprefix.downstream_cx_total: 0`. The `destination_port` priority slot (index 0) BEATS the `source_prefix_ranges` priority slot (index 6); this is the load-bearing empirical pin for the priority order.
+
+### Alternatives considered
+
+- **(A) Per-priority-level eligibility (eliminate chains as soon as ANY higher-priority dimension's value differs).** REJECTED for two reasons: (1) it introduces O(N²) worst-case lookup as each priority level re-scans the surviving set; the chosen 2-pass algorithm is O(N × D) with D = 8 (constant), so O(N) per dispatch; (2) it doesn't respect Envoy's documented eligibility-then-specificity semantics — Envoy considers ALL dimensions together at Pass 1 and disambiguates by priority at Pass 2, NOT by progressive per-level elimination.
+
+- **(B) String-based pattern matching (regex) on chain names or composite-key strings.** REJECTED as out-of-scope. The 8-dim algorithm is structural (each dimension has a typed match-function); regex matching would require a separate dimension and is not in any in-scope `FilterChainMatch` proto field. Future phases that add string-pattern dimensions (e.g., a hypothetical `path_prefix` future field) would re-litigate via their own ADR.
+
+### Consequences
+
+- (a) The `SelectChain` algorithm is O(N × D) where N = number of chains in `filter_chains[]` and D = 8 (constant). Per-connection dispatch latency is therefore microseconds-scale even for listeners with hundreds of chains; well below the `listener_filters_timeout` budget (per ADR-0082; default 15s).
+
+- (b) The `*ChainSpec` slice is built at `NewManager`-build time from the bootstrap's `filter_chains[]` (per Decision O from SPEC §5.6) and is immutable thereafter. Concurrent per-connection `SelectChain` calls are read-only on this slice and lock-free by construction (no `sync.Map` overhead per the SPEC's recommendation). The chain-list-immutability invariant is documented in `internal/listener/listenerfilter/chainmatch.go`'s `ChainSpec` doc comment.
+
+- (c) The algorithm's worst-case latency per accepted connection is microseconds (8 dimension checks × O(1) each per chain × O(N) chains). The realistic deployment profile (N < 100 chains, D = 8) yields sub-microsecond dispatch latency; well below the `listener_filters_timeout` envelope's 1s lower bound. Future hardening phases that introduce e.g. radix-tree-based prefix-range indexing would supersede this ADR's "lock-free linear scan" claim with their own ADR.
+
+### Lands-in-task
+
+07.2 PLAN Task 5 (the `chainmatch.SelectChain` algorithm; same task as ADR-0080). The bootstrap parser's `*ChainSpec` construction at `internal/listener/manager.go` (Task 9) and the per-connection `SelectChain` invocation in the manager's accept-loop (Task 10) cross-reference this ADR.
+
+---

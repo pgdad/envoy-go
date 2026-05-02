@@ -136,3 +136,53 @@ ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.047s
 $ go vet ./internal/listener/listenerfilter/...
 $ golangci-lint run ./internal/listener/listenerfilter/...
 ```
+
+## Task 5 — internal/listener/listenerfilter/chainmatch.go [ADR-0080, ADR-0081]
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/listener/listenerfilter/chainmatch.go` (~320 LoC) implementing the 8-dimension `SelectChain` precedence algorithm — the heart of phase 07.2. Defines `ChainSpec` struct with 11 fields (`Name`, `Empty`, `DestinationPort`, `PrefixRanges`, `ServerNames`, `TransportProtocol`, `ApplicationProtocols`, `SourceTypeLocal`, `SourceTypeExternal`, `SourcePrefixRanges`, `SourcePorts`); 8 priority constants (`prioDestinationPort` = 0 through `prioSourcePorts` = 7) + `prioCount` = 8; `ErrNoChainMatched` and `ErrAmbiguousChainMatch` sentinel errors. The `SelectChain(inputs ChainMatchInputs, chains []*ChainSpec, defaultChain *ChainSpec) (*ChainSpec, error)` function runs the 2-pass eligibility-then-specificity algorithm per SPEC §5.5 + §7.3: Pass 1 builds the eligibility set via `matches(c, &inputs)`; if empty, returns `defaultChain` if non-nil OR `ErrNoChainMatched` if nil (per ADR-0080's no-match-fallback semantics); Pass 2 scores each eligible chain via `specificityScore(c)` returning a `uint8` where bit `prioCount-1-i` is set iff priority slot `i` is specified, and chain with the highest score wins; ties broken via `breakTie(a, b, &inputs)` on per-dimension finer-grain criteria (longest CIDR prefix on `prefix_ranges`/`source_prefix_ranges`; SNI specificity on `server_names` per `sniSpecificityRank` — the new copy of `manager.go:chainSpecificityRank` per ADR-0033 clause 9 preserved as ADR-0078 sub-ordering; the duplication is intentional and temporary — Task 9 deletes the manager.go original); chains entirely indistinguishable on this input return `nil` from `breakTie` and `SelectChain` returns `ErrAmbiguousChainMatch`. Helpers: `ipInAny`, `portInAny`, `longestPrefix`, `sniMatchAny`, `alpnMatchAny`, `sniSpecificityRank`. The `matches` helper short-circuits on `c.Empty` (universally eligible) and otherwise checks each non-zero / non-empty dimension against the corresponding `ChainMatchInputs` field. Created `internal/listener/listenerfilter/chainmatch_test.go` (~140 LoC, 10 tests + `cidr(s)` helper at the top): `TestSelectChainEmptyMatchUniversallyEligible` (catch-all chain with `DestinationPort: 8080` + `SourceIP: 10.0.0.1` inputs); `TestSelectChainDestinationPortBeatsSourcePrefix` (the SPEC §11.3 empirical-pin assertion — `dstport` wins over `srcprefix` on a connection from `127.0.0.1` to port `8080`); `TestSelectChainDefaultChainOnNoMatch` (specific `loopback` chain not eligible against `10.0.0.1` source → `default` chain wins); `TestSelectChainEmptyMatchBeatsDefault` (the SPEC §11.2 empirical-pin assertion — empty-match chain in `filter_chains[]` BEATS `default_filter_chain` per ADR-0080); `TestSelectChainNoEligibleNoDefault` (uses `errors.Is(err, ErrNoChainMatched)`; verifies returned chain is nil); `TestSelectChainPrefixRangesLongerWins` (192.168.1.0/24 beats 192.168.0.0/16 on input 192.168.1.50 — longest-prefix tie-breaker); `TestSelectChainServerNamesSpecificity` (exact `foo.example.test` > suffix `*.example.test` > universal `*` on input `foo.example.test`); `TestSelectChainSourceTypeLocal` (loopback source → `source_type:LOCAL` chain wins over universal); `TestSelectChainSourceTypeExternalSkipsLoopback` (loopback source → `source_type:EXTERNAL` chain eliminated, universal wins); `TestSelectChainApplicationProtocolsTieBreaker` (ALPN `h2` offer → h2 chain wins, h1 chain eliminated). TDD discipline observed: chainmatch_test.go was written first; tests confirmed failing (build error: `undefined: ChainSpec`, `undefined: SelectChain`); then chainmatch.go landed; tests confirmed passing under `-race`. All 10 tests PASS; vet clean; golangci-lint clean. Landed ADR-0080 (`default_filter_chain` no-match-fallback semantics; empty-match BEATS default; TLS posture independent — supersedes ADR-0033 clause 3) and ADR-0081 (8-dim precedence algorithm; eligibility-then-specificity 2-pass; tie-break finer-grain; `ErrAmbiguousChainMatch` at NewManager-build time — partially supersedes ADR-0033 clause 2). The `sniSpecificityRank` function is a NEW copy of the existing `internal/listener/manager.go:chainSpecificityRank` (line 352) semantics; the duplication is intentional and temporary — Task 9 will refactor manager.go to delete the original (per ADR-0078 caveat).
+**Outputs:**
+```
+$ go test ./internal/listener/listenerfilter/... 2>&1 | head -30
+# github.com/esalaine/envoy-go/internal/listener/listenerfilter [github.com/esalaine/envoy-go/internal/listener/listenerfilter.test]
+internal/listener/listenerfilter/chainmatch_test.go:12:9: undefined: ChainSpec
+internal/listener/listenerfilter/chainmatch_test.go:14:14: undefined: SelectChain
+internal/listener/listenerfilter/chainmatch_test.go:14:37: undefined: ChainSpec
+internal/listener/listenerfilter/chainmatch_test.go:24:14: undefined: ChainSpec
+internal/listener/listenerfilter/chainmatch_test.go:25:16: undefined: ChainSpec
+internal/listener/listenerfilter/chainmatch_test.go:27:14: undefined: SelectChain
+internal/listener/listenerfilter/chainmatch_test.go:27:37: undefined: ChainSpec
+internal/listener/listenerfilter/chainmatch_test.go:37:15: undefined: ChainSpec
+internal/listener/listenerfilter/chainmatch_test.go:38:10: undefined: ChainSpec
+internal/listener/listenerfilter/chainmatch_test.go:40:14: undefined: SelectChain
+internal/listener/listenerfilter/chainmatch_test.go:40:14: too many errors
+FAIL	github.com/esalaine/envoy-go/internal/listener/listenerfilter [build failed]
+FAIL
+$ go test -race -run 'TestSelectChain' ./internal/listener/listenerfilter/... -v
+=== RUN   TestSelectChainEmptyMatchUniversallyEligible
+--- PASS: TestSelectChainEmptyMatchUniversallyEligible (0.00s)
+=== RUN   TestSelectChainDestinationPortBeatsSourcePrefix
+--- PASS: TestSelectChainDestinationPortBeatsSourcePrefix (0.00s)
+=== RUN   TestSelectChainDefaultChainOnNoMatch
+--- PASS: TestSelectChainDefaultChainOnNoMatch (0.00s)
+=== RUN   TestSelectChainEmptyMatchBeatsDefault
+--- PASS: TestSelectChainEmptyMatchBeatsDefault (0.00s)
+=== RUN   TestSelectChainNoEligibleNoDefault
+--- PASS: TestSelectChainNoEligibleNoDefault (0.00s)
+=== RUN   TestSelectChainPrefixRangesLongerWins
+--- PASS: TestSelectChainPrefixRangesLongerWins (0.00s)
+=== RUN   TestSelectChainServerNamesSpecificity
+--- PASS: TestSelectChainServerNamesSpecificity (0.00s)
+=== RUN   TestSelectChainSourceTypeLocal
+--- PASS: TestSelectChainSourceTypeLocal (0.00s)
+=== RUN   TestSelectChainSourceTypeExternalSkipsLoopback
+--- PASS: TestSelectChainSourceTypeExternalSkipsLoopback (0.00s)
+=== RUN   TestSelectChainApplicationProtocolsTieBreaker
+--- PASS: TestSelectChainApplicationProtocolsTieBreaker (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.007s
+$ go test -race ./internal/listener/listenerfilter/...
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.049s
+$ go vet ./internal/listener/listenerfilter/...
+$ golangci-lint run ./internal/listener/listenerfilter/...
+```
