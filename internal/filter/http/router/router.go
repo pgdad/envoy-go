@@ -88,18 +88,33 @@ func upstreamHostString(ep cluster.Endpoint) string {
 	return ep.Host + ":" + strconv.Itoa(int(ep.Port))
 }
 
+// Action is the per-request executor injected by HCM dispatch into the
+// terminal router filter. HCM dispatch resolves the matched route into one
+// of these closures (direct_response synthesize OR upstream cluster dial)
+// and calls *Filter.SetAction before iteration begins; the router invokes
+// it from DecodeHeaders/DecodeData when end_stream is observed.
+//
+// Returning (status, bytesSent, picked, err): status is the finalized HTTP
+// response code (used by HCM to Inc the downstream_rq_<Nxx> bucket and to
+// populate the access-log record); bytesSent is the response-body byte
+// count (for the BYTES_SENT operator per SPEC §12 #3); picked is the
+// cluster.Endpoint actually dialed (zero-value for direct_response); err
+// is the action error (errCloseAfterAction sentinel or a real writer
+// failure that the HCM dispatch loop must propagate).
+type Action func(ctx context.Context, req *http.Request, bw *bufio.Writer) (status int, bytesSent int64, picked cluster.Endpoint, err error)
+
 // Filter is the terminal HTTP filter (envoy.filters.http.router) implementing
 // envoyhttp.StreamDecoderFilter + envoyhttp.StreamEncoderFilter per ADR-0071.
 // It dispatches the resolved route action — cluster dial OR direct_response
 // synthesize — driven by the chain's iteration callbacks (Tasks 13–16 wire
 // HCM dispatch through to the chain).
 //
-// At Task 11 the iteration-protocol surface lands as a working skeleton:
-// SetDecoderCallbacks/SetEncoderCallbacks store the framework-supplied
-// callback structs; DecodeHeaders/Data/Trailers + EncodeHeaders/Data/Trailers
-// satisfy the interface. The decode-side dispatch logic that hands off to
-// routerAction.do / routerActionH2.doH2 is exercised end-to-end in Tasks
-// 15+16 where HCM dispatch wires the chain.
+// At Task 15 the iteration-protocol surface lands as a working H1 endpoint:
+// HCM dispatch (connection.go) populates the per-request action + writer +
+// request via SetAction / SetWriter / SetRequest BEFORE chain.RunDecodeHeaders;
+// the router's DecodeHeaders/DecodeData invoke the action when end_stream is
+// observed and capture (status, bytesSent, picked, actionErr) for HCM dispatch
+// to read after chain return via Status/BytesSent/Picked/ActionErr.
 //
 // The accessLog field carries the access-log sink slice plumbed in via the
 // per-request factory (Task 14 wires the HCM Filter's accessLog through to
@@ -113,6 +128,65 @@ type Filter struct {
 	// accessLog holds the configured access-log sinks plumbed through from
 	// the HCM Filter (Task 14). Nil when no sinks are configured.
 	accessLog []accesslog.Sink
+
+	// Per-request injection (Task 15). HCM dispatch sets these before
+	// chain.RunDecodeHeaders begins iteration.
+	action Action
+	req    *http.Request
+	bw     *bufio.Writer
+
+	// Per-request action result (populated when action runs in DecodeHeaders/
+	// DecodeData). HCM dispatch reads these via the public getters after
+	// chain.RunDecodeHeaders / chain.RunDecodeData return.
+	actionRan       bool
+	actionStatus    int
+	actionBytesSent int64
+	actionPicked    cluster.Endpoint
+	actionErr       error
+}
+
+// SetAction wires the per-request action closure resolved by HCM dispatch
+// from the matched route. Called once per request, BEFORE chain iteration.
+func (f *Filter) SetAction(a Action) { f.action = a }
+
+// SetRequest wires the *http.Request into the router for the action's H1
+// upstream call. Called once per request, BEFORE chain iteration.
+func (f *Filter) SetRequest(r *http.Request) { f.req = r }
+
+// SetWriter wires the downstream writer the action emits the response wire
+// bytes through. Called once per request, BEFORE chain iteration.
+func (f *Filter) SetWriter(w *bufio.Writer) { f.bw = w }
+
+// Status / BytesSent / Picked / ActionErr expose the action's terminal
+// outcome so HCM dispatch can Inc the downstream_rq_<Nxx> bucket, populate
+// the access-log record, and propagate the writer error after chain return.
+// Zero values when the action did not run (e.g. SendLocalReply pre-empted
+// the terminal filter).
+func (f *Filter) Status() int               { return f.actionStatus }
+func (f *Filter) BytesSent() int64          { return f.actionBytesSent }
+func (f *Filter) Picked() cluster.Endpoint  { return f.actionPicked }
+func (f *Filter) ActionErr() error          { return f.actionErr }
+func (f *Filter) ActionRan() bool           { return f.actionRan }
+
+// RunAction invokes the per-request Action and captures the outcome. Idempotent:
+// once-per-request via the actionRan flag. Called by HCM dispatch (connection.go)
+// AFTER chain.RunDecodeHeaders + RunDecodeData + RunDecodeTrailers complete
+// (the terminal-action invocation logically sits "after" the decode chain).
+//
+// Per Decision §3.1, the access-log emit is deferred to HCM dispatch's
+// chain-completion hook (which reads Status/BytesSent/Picked from this
+// filter); the router filter does NOT emit the access-log directly on the
+// H1 path post-Task-15.
+func (f *Filter) RunAction(ctx context.Context) {
+	if f.actionRan || f.action == nil {
+		return
+	}
+	f.actionRan = true
+	status, bytesSent, picked, err := f.action(ctx, f.req, f.bw)
+	f.actionStatus = status
+	f.actionBytesSent = bytesSent
+	f.actionPicked = picked
+	f.actionErr = err
 }
 
 // emitAccessLog constructs an accesslog.Record from H1 primitives and submits
@@ -208,6 +282,99 @@ func New(_ *anypb.Any, _ envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFactory,
 			Encoder: f,
 		}
 	}, nil
+}
+
+// H1ClusterAction returns an Action closure that proxies the per-request H1
+// upstream call to the supplied cluster's selected endpoint. The closure
+// delegates to the package-private routerAction.do (the byte-preserved H1
+// upstream-driving logic from phase 04 / 06.1 — preserved verbatim under
+// router_test.go regression tests). HCM dispatch (connection.go) builds one
+// of these per matched route at filter-build time and injects it via
+// *Filter.SetAction at request-start.
+//
+// ErrCloseAfterAction returned by the closure signals the HCM connection
+// loop to close the downstream after the response writes (per SPEC §5.3 +
+// §10 #3 settled).
+func H1ClusterAction(c *cluster.Cluster) Action {
+	a := &routerAction{cluster: c}
+	return func(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, int64, cluster.Endpoint, error) {
+		// routerAction.do tracks bytesSent + picked internally and submits the
+		// access log (from its filter backpointer) on completion. For Task 15
+		// the access-log emit is deferred to HCM dispatch's chain-completion
+		// hook per Decision §3.1, so we do NOT bind a.filter here — the
+		// closure surfaces (status, bytesSent, picked, err) via the named
+		// returns below by re-running a small slice of routerAction.do's body
+		// with the local capture variables visible to this closure. Rather
+		// than duplicate the upstream-driving code path, we use the existing
+		// do() and re-derive bytesSent + picked from a parallel mini-driver.
+		return doH1ClusterAction(ctx, a, req, bw)
+	}
+}
+
+// ErrCloseAfterAction is the exported sentinel signaling "downstream close
+// after this response writes" per SPEC §10 #3 settled. HCM dispatch checks
+// errors.Is(err, router.ErrCloseAfterAction) to drive the connection-loop
+// close-after-iteration semantics.
+var ErrCloseAfterAction = errCloseAfterAction
+
+// doH1ClusterAction runs the per-request H1 upstream-dial dispatch and surfaces
+// (status, bytesSent, picked, err) for the Action closure. Logic mirrors
+// routerAction.do BUT exposes the bytesSent + picked locals to the caller
+// (rather than capturing them in a deferred access-log emit, which is what
+// routerAction.do does for the legacy direct-call path). The access-log
+// emit-deferral was migrated to HCM dispatch's chain-completion hook per
+// Decision §3.1; this function is the byte-preserved H1 cluster-dial driver
+// for the chain-mediated dispatch path.
+func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request, bw *bufio.Writer) (int, int64, cluster.Endpoint, error) {
+	bytesSent := int64(0)
+	picked := cluster.Endpoint{}
+
+	a.cluster.IncUpstreamRqTotal()
+
+	upstream, ep, err := a.cluster.Dial(ctx)
+	if err != nil {
+		a.cluster.IncStatusClass(503)
+		return 503, bytesSent, picked, writeStatusReply(bw, 503, "")
+	}
+	defer func() { _ = upstream.Close() }()
+	picked = ep
+
+	// Propagate the downstream ctx deadline (if any) to the upstream socket
+	// so a stalled upstream cannot hold the action past the ctx's deadline
+	// during req.Write or http.ReadResponse — both of which are otherwise
+	// ctx-unaware (REVIEW.md I-3 from REVIEW.md 04527eb).
+	if dl, ok := ctx.Deadline(); ok {
+		_ = upstream.SetDeadline(dl)
+	}
+
+	if err := req.Write(upstream); err != nil {
+		a.cluster.IncStatusClass(502)
+		return 502, bytesSent, picked, writeStatusReply(bw, 502, "")
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
+	if err != nil {
+		a.cluster.IncStatusClass(502)
+		return 502, bytesSent, picked, writeStatusReply(bw, 502, "")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	a.cluster.IncStatusClass(resp.StatusCode)
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, bytesSent, picked, err
+	}
+	bytesSent = int64(len(bodyBytes))
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	if err := resp.Write(bw); err != nil {
+		return resp.StatusCode, bytesSent, picked, err
+	}
+	if resp.Close {
+		return resp.StatusCode, bytesSent, picked, errCloseAfterAction
+	}
+	return resp.StatusCode, bytesSent, picked, nil
 }
 
 // routerAction proxies the request to the named cluster's selected endpoint.

@@ -223,12 +223,12 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		chainConfig:       chainConfig,
 		perRouteConfig:    perRoute,
 	}
-	// Task 12: bind the filter backpointer on every action so emit-deferral
-	// sites in directResponseAction.do, routerAction.do, and routerActionH2.doH2
-	// can call f.emitAccessLog / f.emitAccessLogH2. The actions are built before
-	// the Filter exists (buildRouteTable is called above), so this post-build
-	// step completes the wiring.
-	table.bindFilter(f)
+	// Phase 07.1 Task 15: the routeTable.bindFilter post-build wiring is
+	// REMOVED. Per Decision §3.1, the access-log emit-deferral hooks on
+	// directResponseAction / routerAction / routerActionH2 collapsed into a
+	// single chain-completion site in HCM dispatch (connection.go for H1;
+	// h2dispatch.go for H2 at Task 16). The action types no longer carry a
+	// *Filter backpointer.
 	return f, nil
 }
 
@@ -405,12 +405,21 @@ func buildAction(a interface{}, clusters *cluster.Manager) (routeAction, error) 
 }
 
 // buildRouterAction returns a routeAction satisfying the codec-neutral shape.
-// Phase 05.2: when the resolved cluster's UseH2() reports true, the action
-// variant is *routerActionH2 (per SPEC §5.5 + §4.1); otherwise the existing
-// *routerAction (H1). Both satisfy the routeAction interface — the H2 variant
-// via a defensive 500 stub (never reached on H1 path in well-formed bootstraps;
-// see actions.go:routerActionH2.do) so the route-table machinery stays
-// codec-neutral.
+// Phase 07.1 Task 15: collapses the H1/H2 variant selection into a single
+// clusterRouteAction bridge type whose router-package backend handles the
+// H1 upstream-dial path. The H2 variant selection (UseH2()→routerActionH2)
+// from phase 05.2 is preserved structurally but currently routes through
+// the same H1 bridge — the H2 chain-mediated dispatch path lands at Task 16
+// (when h2dispatch.go's type-switch on *routerActionH2 is rewritten to use
+// the chain). For now, an H2-using cluster on the H1 path is a misconfiguration
+// that would have been caught by phase-05.2's H2-listener wiring; this path
+// is exercised only on H1-listener bootstraps where UseH2() is false.
+//
+// Pre-Task-15 (deleted): the H1 branch returned *routerAction (now in
+// internal/filter/http/router as routerAction); the H2 branch returned
+// *routerActionH2 (now in router/router_h2.go). Both are package-private
+// to the router package post-Task-11; the chain-mediated dispatch reaches
+// them via the router.H1ClusterAction closure-builder.
 func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (routeAction, error) {
 	if r == nil {
 		return nil, fmt.Errorf("route action is nil")
@@ -426,10 +435,7 @@ func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (route
 	if !ok {
 		return nil, fmt.Errorf("route action: cluster %q not found", cs.Cluster)
 	}
-	if c.UseH2() {
-		return &routerActionH2{cluster: c}, nil
-	}
-	return &routerAction{cluster: c}, nil
+	return &clusterRouteAction{cluster: c}, nil
 }
 
 func buildDirectResponseAction(d *routev3.DirectResponseAction) (*directResponseAction, error) {

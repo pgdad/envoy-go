@@ -22,6 +22,8 @@ import (
 	"github.com/esalaine/envoy-go/internal/admin"
 	"github.com/esalaine/envoy-go/internal/bootstrap"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/listener"
 )
 
@@ -80,7 +82,19 @@ func main() {
 	}
 	defer func() { _ = admSrv.Close() }()
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks)
+	// Phase 07.1 Task 15 minimal boot wiring: build the *filter_http.HTTPRegistry
+	// and register the router terminal filter so HCM bootstraps that include
+	// the router in http_filters[] (i.e., every well-formed HCM config) parse
+	// cleanly. Per ADR-0072 the registry is freeze-after-boot. cors and
+	// envoygotest filter registrations land at Task 20 (when their factories
+	// land at Tasks 18+19); for Task 15 the router-only registry is sufficient
+	// to drive the H1 differential gate (fixtures 0003-http11-routing,
+	// 0006-access-log) which exercise only the router terminal filter.
+	httpReg := filter_http.NewHTTPRegistry()
+	httpReg.Register(router.TypeURL, router.New)
+	httpReg.Freeze()
+
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

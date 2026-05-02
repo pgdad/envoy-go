@@ -624,34 +624,51 @@ func mkH2ClusterManager(t *testing.T) *cluster.Manager {
 	return cm
 }
 
-// TestBuildRouterAction_PicksH2VariantByClusterUseH2 verifies the variant-
-// selection contract at filter-build time per SPEC §5.5 + §4.1: a route
-// whose cluster has UseH2()==true gets a *routerActionH2; UseH2()==false
-// gets the existing *routerAction.
-func TestBuildRouterAction_PicksH2VariantByClusterUseH2(t *testing.T) {
+// TestBuildRouterAction_ReturnsClusterRouteAction verifies the post-Task-15
+// shape of buildRouterAction: both H1 and H2 cluster types resolve to a
+// *clusterRouteAction wrapping the cluster handle. The H1/H2 variant
+// selection is now deferred to the chain-mediated dispatch path: the
+// router-package's H1ClusterAction (called via clusterRouteAction.asRouterAction)
+// drives the H1 upstream-dial loop; the H2 chain wiring lands at Task 16.
+//
+// Pre-Task-15 (deleted): the test asserted distinct *routerAction (H1) vs
+// *routerActionH2 (H2) return types; both are package-private to
+// internal/filter/http/router post-Task-11 and the variant selection moved
+// into the router package's closure-builder. The H2-side dispatch invariant
+// is exercised in h2dispatch_test.go (which currently fails to build per
+// Task 16's territory).
+func TestBuildRouterAction_ReturnsClusterRouteAction(t *testing.T) {
 	cm := mkH2ClusterManager(t)
 
-	// H1 cluster → *routerAction
+	// H1 cluster → *clusterRouteAction wrapping c_h1.
 	{
 		ra := &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h1"}}
 		got, err := buildRouterAction(ra, cm)
 		if err != nil {
 			t.Fatalf("buildRouterAction(c_h1): %v", err)
 		}
-		if _, ok := got.(*routerAction); !ok {
-			t.Errorf("c_h1 → %T; want *routerAction", got)
+		bridge, ok := got.(*clusterRouteAction)
+		if !ok {
+			t.Fatalf("c_h1 → %T; want *clusterRouteAction", got)
+		}
+		if bridge.cluster == nil {
+			t.Errorf("c_h1: bridge.cluster is nil; want non-nil cluster handle")
 		}
 	}
 
-	// H2 cluster → *routerActionH2
+	// H2 cluster → *clusterRouteAction wrapping c_h2 (H2 chain wiring at Task 16).
 	{
 		ra := &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h2"}}
 		got, err := buildRouterAction(ra, cm)
 		if err != nil {
 			t.Fatalf("buildRouterAction(c_h2): %v", err)
 		}
-		if _, ok := got.(*routerActionH2); !ok {
-			t.Errorf("c_h2 → %T; want *routerActionH2", got)
+		bridge, ok := got.(*clusterRouteAction)
+		if !ok {
+			t.Fatalf("c_h2 → %T; want *clusterRouteAction", got)
+		}
+		if bridge.cluster == nil {
+			t.Errorf("c_h2: bridge.cluster is nil; want non-nil cluster handle")
 		}
 	}
 }

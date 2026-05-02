@@ -54,7 +54,7 @@ func TestListener_AcceptLoop_IncsCxTotalAndCxActive(t *testing.T) {
 		mkListener("l_accept", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	r := stats.NewRegistry()
-	lm, err := NewManager(boot, cm, r)
+	lm, err := NewManager(boot, cm, r, testHTTPRegistry())
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}

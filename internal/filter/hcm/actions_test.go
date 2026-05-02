@@ -11,8 +11,6 @@ import (
 	"testing"
 
 	"golang.org/x/net/http2/hpack"
-
-	"github.com/esalaine/envoy-go/internal/accesslog"
 )
 
 func TestDirectResponseAction_Do(t *testing.T) {
@@ -111,51 +109,24 @@ func TestDirectResponseWriteH2_HEADERSThenDATAEndStream(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 06.2 Task 12 — H1 emit-deferral tests
+// Phase 07.1 Task 15 — emit-deferral migration to chain-completion (Decision §3.1)
 // ---------------------------------------------------------------------------
-
-// TestDirectResponseAction_EmitsAccessLog verifies that directResponseAction.do
-// submits exactly one access-log record with the correct ResponseCode and
-// BytesSent (== len(bodyText)) when a Filter with a capture sink is wired.
-func TestDirectResponseAction_EmitsAccessLog(t *testing.T) {
-	cs := &emitCaptureSink{}
-	f := &Filter{accessLog: []accesslog.Sink{cs}}
-	a := &directResponseAction{status: 200, bodyText: "OK\n", filter: f}
-
-	req, _ := http.NewRequest("GET", "/health", nil)
-	req.Proto = "HTTP/1.1"
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	if _, err := a.do(context.Background(), req, bw); err != nil {
-		t.Fatalf("do: %v", err)
-	}
-	_ = bw.Flush()
-
-	if len(cs.recs) != 1 {
-		t.Fatalf("captured %d records, want 1", len(cs.recs))
-	}
-	r := cs.recs[0]
-	if r.ResponseCode != 200 {
-		t.Errorf("ResponseCode = %d, want 200", r.ResponseCode)
-	}
-	if r.BytesSent != 3 {
-		t.Errorf("BytesSent = %d, want 3 (len(\"OK\\n\"))", r.BytesSent)
-	}
-	if r.UpstreamHost != "" {
-		t.Errorf("UpstreamHost = %q, want empty (direct_response)", r.UpstreamHost)
-	}
-}
-
-// TestDirectResponseAction_NilFilter_DoesNotPanic verifies that
-// directResponseAction.do is safe when filter is nil (no sinks wired).
-func TestDirectResponseAction_NilFilter_DoesNotPanic(t *testing.T) {
-	a := &directResponseAction{status: 404, bodyText: "not found\n", filter: nil}
-	req, _ := http.NewRequest("GET", "/missing", nil)
-	req.Proto = "HTTP/1.1"
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	// Must not panic.
-	if _, err := a.do(context.Background(), req, bw); err != nil {
-		t.Fatalf("do: %v", err)
-	}
-}
+//
+// The Phase 06.2 H1 emit-deferral tests (TestDirectResponseAction_EmitsAccessLog,
+// TestDirectResponseAction_NilFilter_DoesNotPanic) asserted that
+// directResponseAction.do emitted the access log on its deferred site. Per
+// Decision §3.1 in the 07.1 PLAN, the access-log emit moves from the four
+// per-action emit sites (directResponseAction.do, routerAction.do,
+// h2DirectResponseAdapter.WriteH2, routerActionH2.doH2) to a single uniform
+// chain-completion site in HCM dispatch. The H1 emit-from-chain-completion
+// is asserted by TestDispatchRequest_ChainMediatedAccessLogEmit in
+// connection_test.go (the new home of the emit-deferral assertion).
+//
+// The two pre-Task-15 tests above are DELETED — their assertion shape (action
+// owns the emit) is no longer valid. Replacement coverage:
+//   - TestDispatchRequest_ChainMediatedAccessLogEmit (connection_test.go) —
+//     asserts the chain-mediated emit fires with correct ResponseCode +
+//     BytesSent + empty UpstreamHost on a direct_response.
+//   - TestDispatchRequest_DirectResponseRunsChain (connection_test.go) —
+//     asserts the chain-mediated path produces the byte-equivalent wire
+//     output relative to the legacy direct-call shape.

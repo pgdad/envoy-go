@@ -7,12 +7,12 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/esalaine/envoy-go/internal/filter/http/router"
 )
 
 // errCloseAfterAction is returned by routeAction.do when the action's
@@ -35,10 +35,17 @@ var errCloseAfterAction = errors.New("hcm: action requested connection close")
 // All call sites update mechanically; the wire output is unchanged.
 //
 // Per ADR-0045 + SPEC §5.5.
+//
+// Phase 07.1 Task 15: the *Filter backpointer is REMOVED; the access-log
+// emit-deferral hook in do() is REMOVED. Per Decision §3.1, access-log
+// emit fires from HCM dispatch's chain-completion hook (a single uniform
+// site that replaces the four per-action emit-deferral sites from 06.2).
+// directResponseAction is now invoked by HCM dispatch via the router
+// filter's per-request Action closure (built at config.go's
+// buildDirectResponseAction → asRouterAction() bridge).
 type directResponseAction struct {
 	status   int
 	bodyText string
-	filter   *Filter // set post-build by routeTable.bindFilter; nil when no sinks configured.
 }
 
 // body returns the synthesized response in codec-neutral form per SPEC §5.5
@@ -79,22 +86,66 @@ func (a *directResponseAction) writeH2(sw h2.StreamWriter) error {
 	return sw.WriteData(body, true /* end stream */)
 }
 
-// do (preserved for the routeAction interface — H1 connection.go calls this
-// unchanged). Behaviourally identical to phase-04 because writeH1 == old do.
+// do is the legacy direct-call shape preserved for the routeAction interface
+// (H2 dispatch + tests still reach it directly). The H1 dispatch path
+// post-Task-15 invokes directResponseAction via the chain-mediated path —
+// asRouterAction returns a router.Action closure that calls writeH1 and
+// surfaces (status, bytesSent, picked={}, err) to HCM dispatch's
+// chain-completion hook (where the access-log emit fires per Decision §3.1).
 //
 // Phase 06.1 Task 11: returns (a.status, error). The configured direct_response
 // status is the finalized response code; runConnection Inc's the matching
 // downstream_rq_<Nxx> bucket from this return.
 //
-// Phase 06.2 Task 12: emits access-log record via a.filter.emitAccessLog on
-// return. bytesSent is len(bodyText) — the wire bytes for the inline body per
-// SPEC §12 #3 (direct_response writes no upstream bytes; only the local body).
-func (a *directResponseAction) do(_ context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	start := time.Now()
-	defer func() {
-		if a.filter != nil {
-			a.filter.emitAccessLog(req, a.status, int64(len(a.bodyText)), cluster.Endpoint{}, start)
-		}
-	}()
+// Phase 07.1 Task 15: access-log emit-deferral hook REMOVED per Decision §3.1.
+func (a *directResponseAction) do(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, error) {
 	return a.status, a.writeH1(bw)
+}
+
+// asRouterAction returns a router.Action closure wrapping a.writeH1 for the
+// chain-mediated H1 dispatch path (Task 15). The closure surfaces
+// (status, bytesSent=len(bodyText), picked=zero, err=writeH1 error) so HCM
+// dispatch's chain-completion hook can populate the access-log record per
+// SPEC §12 #3 + Decision §3.1.
+func (a *directResponseAction) asRouterAction() router.Action {
+	return func(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, int64, cluster.Endpoint, error) {
+		err := a.writeH1(bw)
+		return a.status, int64(len(a.bodyText)), cluster.Endpoint{}, err
+	}
+}
+
+// clusterRouteAction is the H1 cluster-dial bridge introduced at Task 15.
+// It wraps a *cluster.Cluster handle and satisfies the routeAction interface
+// by delegating BOTH do() and asRouterAction() to the canonical H1
+// upstream-driving logic in internal/filter/http/router. The router-package
+// holds the byte-preserved upstream-dial / req.Write / ReadResponse /
+// resp.Write loop migrated at Task 11; this bridge is the seam HCM dispatch
+// uses to plumb cluster-routed actions into the chain-mediated dispatch path.
+//
+// Replaces the deleted *routerAction type that lived in actions.go pre-Task-12.
+// The H2-side equivalent (clusterRouteActionH2 wrapping routerActionH2) is
+// Task 16's territory; the H2 type-switch in h2dispatch.go:62,119 stays
+// dangling until Task 16 lands.
+type clusterRouteAction struct {
+	cluster *cluster.Cluster
+}
+
+// do invokes the per-request cluster-dial action via the router-package
+// closure and discards the bytesSent/picked surface (the legacy direct-call
+// shape returns only status + err per the routeAction interface). HCM
+// dispatch post-Task-15 does NOT call do() on the H1 path — it calls
+// asRouterAction() and runs the action through the chain — so do()'s return
+// is informational here. Preserved to satisfy the routeAction interface
+// for symmetry with directResponseAction.
+func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
+	status, _, _, err := router.H1ClusterAction(a.cluster)(ctx, req, bw)
+	return status, err
+}
+
+// asRouterAction returns the router.Action closure built by the router
+// package's H1ClusterAction constructor. This is the seam HCM dispatch's
+// chain-mediated H1 path (Task 15 connection.go) plumbs into the terminal
+// router filter via *Filter.SetAction.
+func (a *clusterRouteAction) asRouterAction() router.Action {
+	return router.H1ClusterAction(a.cluster)
 }

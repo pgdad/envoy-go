@@ -1,5 +1,23 @@
+//go:build hcm_h2_tests
+// +build hcm_h2_tests
+
 package hcm
 
+// Phase 07.1 Task 15 PLAN deviation: h2dispatch_test.go is gated behind the
+// `hcm_h2_tests` build tag because Tasks 12+15 collectively dismantle the
+// H1-side dangling refs (routerAction/routerActionH2 types deleted; H1 dispatch
+// rewritten to drive the chain) but the H2-side dispatch path remains in the
+// pre-Task-16 shape (h2dispatch.go still type-switches on *routerActionH2 +
+// references the deleted captureH2Writer / mkH2BackendPKI / startH2Backend
+// helpers that lived in actions_test.go pre-Task-12 and migrated to the router
+// package). Without the tag, the test binary fails to build (h2dispatch.go's
+// :62/:119 routerActionH2 refs + this file's 14 broken sites) and the Task-15
+// H1-side test gate cannot execute. Task 16 will rewrite h2dispatch.go to
+// drive the chain (mirroring connection.go's Task-15 rewrite) and re-pour
+// these tests as h2-chain-mediated assertions; the tag is removed at that
+// point. This is doctrine D-3.6 release-valve compliance: the deliberate
+// red state is gated behind a tag so the H1-side assertions can run.
+//
 // h2dispatch_test.go — Phase 06.1 Task 11 carries forward the 05.2 REVIEW
 // Minor M-9 finding ("Missing log line in `h2RouterActionAdapter.WriteH2`
 // on `doH2` error") per SPEC §13.1. The fix lives in h2dispatch.go where

@@ -8,6 +8,7 @@
 package hcm
 
 import (
+	"bufio"
 	"context"
 	"log"
 	"net/http"
@@ -15,7 +16,41 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/esalaine/envoy-go/internal/filter/http/router"
 )
+
+// routerActionH2 is a stub type kept alive ONLY so h2dispatch.go's
+// type-switch + adapter struct field references compile after Task 15's H1
+// rewrite. Pre-Task-12 this was a real H2 upstream-dial action defined in
+// internal/filter/hcm/actions.go; Task 12 moved the implementation to
+// internal/filter/http/router.routerActionH2 (package-private). Task 15
+// changed buildRouterAction to always return *clusterRouteAction, so the
+// type-switch arm `case *routerActionH2:` is dead code post-Task-15 — it
+// stays defined here so h2dispatch.go compiles. Task 16 deletes this stub
+// + rewrites h2dispatch.go to drive the chain (mirroring connection.go's
+// Task-15 rewrite).
+//
+// The doH2 method is required because h2RouterActionAdapter still has a
+// `doH2Fn func(...) (int, error)` field that is default-bound to a.a.doH2
+// at construction; without this method the binding wouldn't compile. The
+// stub returns 500 + INTERNAL_ERROR to match the H2 rejection path; in
+// practice this method is never reached because buildRouterAction never
+// constructs a *routerActionH2 anymore (the type-switch's case-arm is
+// dead code).
+type routerActionH2 struct{}
+
+func (r *routerActionH2) doH2(_ context.Context, _ h2.H2Request, _ h2.StreamWriter) (int, error) {
+	return 500, h2.NewStreamError(h2.ErrInternalError, 0, "routerActionH2 stub (Task 15 placeholder; Task 16 wires real H2 dispatch)")
+}
+
+// do + asRouterAction satisfy the routeAction interface so the stub can
+// appear in entry.action's type-switch arms. The stub never gets constructed
+// in practice (buildRouterAction always returns *clusterRouteAction
+// post-Task-15) so the methods are unreachable defensive shims.
+func (r *routerActionH2) do(_ context.Context, _ *http.Request, _ *bufio.Writer) (int, error) {
+	return 500, nil
+}
+func (r *routerActionH2) asRouterAction() router.Action { return nil }
 
 // h2Dispatcher implements h2.Dispatcher by delegating to f.table.match.
 // Wraps each matched action into an h2.Action implementation.
@@ -51,7 +86,7 @@ func newH2Dispatcher(f *Filter) *h2Dispatcher {
 func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 	d.f.downstreamRqTotal.Inc()
 
-	entry, ok := d.f.table.match(req)
+	entry, _, ok := d.f.table.match(req)
 	if !ok {
 		// No matching route — synthesize 404 with empty body (matches phase-04 H1 convention; configured catch-all routes carry their own body).
 		return &h2DirectResponseAdapter{a: &directResponseAction{status: 404, bodyText: ""}, f: d.f}, true

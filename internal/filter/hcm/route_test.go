@@ -46,11 +46,11 @@ func TestRouteTableMatch_FirstMatchWins(t *testing.T) {
 		{match: matchPath("/health")},
 		{match: matchPrefix("/")},
 	}}
-	if e, ok := t1.match(reqWithPath("/health")); !ok || e != &t1.routes[0] {
-		t.Error("first-match-wins should resolve /health to routes[0]")
+	if e, idx, ok := t1.match(reqWithPath("/health")); !ok || e != &t1.routes[0] || idx != 0 {
+		t.Errorf("first-match-wins should resolve /health to routes[0]; got idx=%d ok=%v", idx, ok)
 	}
-	if e, ok := t1.match(reqWithPath("/anything-else")); !ok || e != &t1.routes[1] {
-		t.Error("first-match-wins should resolve /anything-else to routes[1] (catch-all)")
+	if e, idx, ok := t1.match(reqWithPath("/anything-else")); !ok || e != &t1.routes[1] || idx != 1 {
+		t.Errorf("first-match-wins should resolve /anything-else to routes[1] (catch-all); got idx=%d ok=%v", idx, ok)
 	}
 }
 
@@ -59,7 +59,7 @@ func TestRouteTableMatch_QueryStringExcluded(t *testing.T) {
 		{match: matchPrefix("/api")},
 	}}
 	r := &http.Request{URL: &url.URL{Path: "/api", RawQuery: "q=1"}}
-	if _, ok := tt.match(r); !ok {
+	if _, _, ok := tt.match(r); !ok {
 		t.Error("match should evaluate URL.Path only (query excluded)")
 	}
 }
@@ -69,14 +69,14 @@ func TestRouteTableMatch_NoMatch(t *testing.T) {
 		{match: matchPath("/health")},
 		{match: matchPrefix("/api")},
 	}}
-	if _, ok := tt.match(reqWithPath("/missing")); ok {
+	if _, _, ok := tt.match(reqWithPath("/missing")); ok {
 		t.Error("expected no-match for unrouted path")
 	}
 }
 
 func TestRouteTableMatch_EmptyTable(t *testing.T) {
 	tt := &routeTable{}
-	if _, ok := tt.match(reqWithPath("/anything")); ok {
+	if _, _, ok := tt.match(reqWithPath("/anything")); ok {
 		t.Error("empty route table should never match")
 	}
 }
