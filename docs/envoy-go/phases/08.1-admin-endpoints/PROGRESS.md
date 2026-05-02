@@ -474,3 +474,45 @@ $ grep -nE 'bs\.ConfigPath' cmd/envoy-go/main.go
 $ grep -c '^func TestMain_FourNewAdminEndpointsRespond200' cmd/envoy-go/main_test.go
 1
 ```
+
+## Task 11 — `internal/admin/admin_test.go` — four-endpoint smoke + method-discrimination Envoy parity
+
+**Commits:** `4e17985` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** Lands per PLAN Steps 1-3. Step 1 appended two new tests to `internal/admin/admin_test.go` (added `"strings"` import alongside the existing `"io"`/`"net/http"`/`"testing"`/`"time"` set). The first test, `TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders`, is the per-endpoint smoke test mandated by SPEC §3 gate (b) + §6.4 per-endpoint contract + §11.6 four-header set: it builds the canonical §7.3 fixture (via `mustMinimalBs` / `mustMinimalCM` / `mustMinimalLM` helpers from `admin_helpers_test.go` — no helper relocation needed for T11; the deferred T8 refactor of `mkAdminListener` / `mkAdminCluster` / `mustLMFromBs` from `listeners_test.go` is NOT triggered by T11 because the smoke test only needs the minimal-fixture helpers, not the per-listener / per-cluster builders), constructs the widened `admin.New(addr, bs.Stats, bs, cm, lm)`, starts it, calls `MarkReady()`, sleeps 20ms for the accept goroutine, then runs a four-row table-driven subtest (one `t.Run` per endpoint) over `/config_dump` (Content-Type `application/json`), `/clusters` (`text/plain; charset=UTF-8`), `/listeners` (same), `/server_info` (`application/json`). Each subtest asserts: (a) status 200, (b) Content-Type matches the row's expected value, (c) the three constant headers from §11.6 — `Cache-Control: no-cache, max-age=0`, `X-Content-Type-Options: nosniff`, `Server: envoy` — match exactly via a nested `[]struct{key, want string}` table, (d) the `Date` header is non-empty (net/http auto-adds it per RFC 9110 §6.6.1, per planner-time decision 5 + headers.go §11.6 commentary). The second test, `TestAdmin_FourEndpointsAcceptAnyMethod`, pins SPEC §11.8 method-discrimination Envoy parity: upstream Envoy v1.37.2 does NOT enforce GET-only on read-only admin endpoints (the SPEC §11.8 verbatim evidence shows POST returns the same 200 + body as GET). Test boots the same widened admin server, then issues `http.Post("http://"+addr+"/config_dump", "application/json", strings.NewReader(""))` and asserts status 200; this contract is what allows envoy-go to register the four handlers via plain `mux.HandleFunc(path, handler)` (no method check) — matching the existing four handlers in `configdump.go` / `clusters.go` / `listeners.go` / `serverinfo.go` which do not branch on `r.Method` (verified by grep — none of the four handlers reads `r.Method`). Step 2 ran the targeted tests — both PASS: `TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders` (4 subtests, 30ms total), `TestAdmin_FourEndpointsAcceptAnyMethod` (20ms). Then ran the full admin package (`go test -count=1 ./internal/admin/...` ok 0.419s, all tests passing including the existing 06.1 prometheus + the four 08.1 handler unit tests + the new T11 smoke + parity tests), `go test -count=1 -short ./...` (PASS across all packages — admin, bootstrap, cluster, listener, filter/*, cmd/envoy-go, conformance/h2spec, differential, all fixture drivers), `go vet ./...` clean, `golangci-lint run ./...` clean. NO method-discrimination logic was added to handlers — the PLAN's Step 3 simpler path was taken: assert that POST returns 200 (Envoy parity for read-only endpoints is "method ignored — return body"), no GET-only guard added. This matches the existing handler implementations from Tasks 6-9 which all use `mux.HandleFunc` without method branching. The deferred T8 helper-relocation (move `mkAdminListener` / `mkAdminCluster` / `mustLMFromBs` from `listeners_test.go` to `admin_helpers_test.go`) is documented as NOT triggered by T11 — those helpers build per-cluster + per-listener fixtures for unit-level body-shape tests in clusters_test.go / listeners_test.go; T11's smoke tests only need the package-level four-endpoint contract, satisfied by `mustMinimalBs/CM/LM`. The relocation can wait for T15 REVIEW or skip entirely — no block on T11. Step 3 committed at `4e17985`. One file modified: `internal/admin/admin_test.go` (modified, +88 LoC: +1 import line for `"strings"` + ~85 LoC two new test functions).
+
+**Outputs:**
+```
+$ go build ./... 2>&1
+(clean)
+
+$ go vet ./... 2>&1
+(clean)
+
+$ go test -count=1 -run 'TestAdmin_AllFourEndpoints|TestAdmin_FourEndpointsAcceptAnyMethod' -v ./internal/admin/... 2>&1 | tail -15
+=== RUN   TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders
+=== RUN   TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//config_dump
+=== RUN   TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//clusters
+=== RUN   TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//listeners
+=== RUN   TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//server_info
+--- PASS: TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders (0.03s)
+    --- PASS: TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//config_dump (0.00s)
+    --- PASS: TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//clusters (0.00s)
+    --- PASS: TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//listeners (0.00s)
+    --- PASS: TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders//server_info (0.00s)
+=== RUN   TestAdmin_FourEndpointsAcceptAnyMethod
+--- PASS: TestAdmin_FourEndpointsAcceptAnyMethod (0.02s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.051s
+
+$ go test -count=1 ./internal/admin/... 2>&1 | tail -1
+ok  	github.com/esalaine/envoy-go/internal/admin	0.419s
+
+$ go test -count=1 -short ./... 2>&1 | grep -E 'FAIL|^---' | head -10
+(no failures — all packages PASS)
+
+$ golangci-lint run ./... 2>&1
+(clean)
+
+$ grep -c '^func TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders\|^func TestAdmin_FourEndpointsAcceptAnyMethod' internal/admin/admin_test.go
+2
+```
