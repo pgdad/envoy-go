@@ -186,8 +186,20 @@ func specificityScore(c *ChainSpec) uint8 {
 // their specificity vectors are identical. Returns the winner; returns nil
 // if a and b are entirely indistinguishable (a NewManager-time config error
 // the listener manager surfaces as ErrAmbiguousChainMatch).
+//
+// Cascade order follows SPEC §5.5 line 519 ("walk down the priority list
+// with finer-grain tie-breakers") and §7.3 line 524 ("more-specific value
+// within the highest-priority dimension where they differ in specifics"):
+// the cascade visits dimensions in the SPEC §7.2 priority order, consulting
+// each only if both chains specify it (otherwise the specificityScore would
+// already have decided the winner). Only dimensions with a meaningful
+// finer-grain sub-ordering are listed: PrefixRanges (slot 1, longest CIDR),
+// ServerNames (slot 2, SNI rank), SourcePrefixRanges (slot 6, longest CIDR).
+// Dimensions that are exact-value match (DestinationPort, TransportProtocol,
+// ApplicationProtocols, SourceType, SourcePorts) have no sub-ordering and
+// are skipped.
 func breakTie(a, b *ChainSpec, inputs *ChainMatchInputs) *ChainSpec {
-	// PrefixRanges: longer prefix wins (smaller IPNet).
+	// Slot 1 — PrefixRanges: longer prefix wins (smaller IPNet).
 	if len(a.PrefixRanges) > 0 && len(b.PrefixRanges) > 0 {
 		la := longestPrefix(inputs.DestinationIP, a.PrefixRanges)
 		lb := longestPrefix(inputs.DestinationIP, b.PrefixRanges)
@@ -198,18 +210,7 @@ func breakTie(a, b *ChainSpec, inputs *ChainMatchInputs) *ChainSpec {
 			return b
 		}
 	}
-	// SourcePrefixRanges: longer prefix wins.
-	if len(a.SourcePrefixRanges) > 0 && len(b.SourcePrefixRanges) > 0 {
-		la := longestPrefix(inputs.SourceIP, a.SourcePrefixRanges)
-		lb := longestPrefix(inputs.SourceIP, b.SourcePrefixRanges)
-		if la > lb {
-			return a
-		}
-		if lb > la {
-			return b
-		}
-	}
-	// ServerNames: SNI specificity (exact > suffix > universal > catch-all).
+	// Slot 2 — ServerNames: SNI specificity (exact > suffix > universal > catch-all).
 	if len(a.ServerNames) > 0 && len(b.ServerNames) > 0 {
 		ra := sniSpecificityRank(a.ServerNames)
 		rb := sniSpecificityRank(b.ServerNames)
@@ -217,6 +218,17 @@ func breakTie(a, b *ChainSpec, inputs *ChainMatchInputs) *ChainSpec {
 			return a
 		} // lower rank = more specific
 		if rb < ra {
+			return b
+		}
+	}
+	// Slot 6 — SourcePrefixRanges: longer prefix wins.
+	if len(a.SourcePrefixRanges) > 0 && len(b.SourcePrefixRanges) > 0 {
+		la := longestPrefix(inputs.SourceIP, a.SourcePrefixRanges)
+		lb := longestPrefix(inputs.SourceIP, b.SourcePrefixRanges)
+		if la > lb {
+			return a
+		}
+		if lb > la {
 			return b
 		}
 	}

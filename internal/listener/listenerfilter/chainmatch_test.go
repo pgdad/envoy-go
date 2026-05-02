@@ -138,3 +138,75 @@ func TestSelectChainApplicationProtocolsTieBreaker(t *testing.T) {
 		t.Errorf("expected h2 chain (ALPN match); got %v", got)
 	}
 }
+
+func TestSelectChainBreakTieFollowsPriorityOrder(t *testing.T) {
+	// Both chains: PrefixRanges + ServerNames + SourcePrefixRanges → identical specificityScore.
+	// Per SPEC §5.5/§7.3, ties walk in priority order: PrefixRanges (slot 1) → ServerNames
+	// (slot 2) → SourcePrefixRanges (slot 6). On PrefixRanges tie (both /8), ServerNames
+	// exact-match must win BEFORE SourcePrefixRanges length is consulted.
+	a := &ChainSpec{
+		Name:               "a",
+		PrefixRanges:       []*net.IPNet{cidr("10.0.0.0/8")},
+		ServerNames:        []string{"*"},
+		SourcePrefixRanges: []*net.IPNet{cidr("192.168.1.0/24")},
+	}
+	b := &ChainSpec{
+		Name:               "b",
+		PrefixRanges:       []*net.IPNet{cidr("10.0.0.0/8")},
+		ServerNames:        []string{"foo.example"},
+		SourcePrefixRanges: []*net.IPNet{cidr("192.168.0.0/16")},
+	}
+	inputs := ChainMatchInputs{
+		DestinationIP: net.ParseIP("10.0.0.5"),
+		ServerName:    "foo.example",
+		SourceIP:      net.ParseIP("192.168.1.5"),
+	}
+	got, err := SelectChain(inputs, []*ChainSpec{a, b}, nil)
+	if err != nil {
+		t.Fatalf("SelectChain: %v", err)
+	}
+	if got != b {
+		t.Errorf("priority cascade should pick b (exact ServerNames at slot 2) before SourcePrefixRanges (slot 6); got %v", got)
+	}
+}
+
+func TestSelectChainAmbiguousReturnsError(t *testing.T) {
+	// Two chains identical on all 8 dimensions (only TransportProtocol set; equal value).
+	// No sub-orderings available. SelectChain returns ErrAmbiguousChainMatch.
+	a := &ChainSpec{Name: "a", TransportProtocol: "tls"}
+	b := &ChainSpec{Name: "b", TransportProtocol: "tls"}
+	inputs := ChainMatchInputs{TransportProtocol: "tls"}
+	got, err := SelectChain(inputs, []*ChainSpec{a, b}, nil)
+	if !errors.Is(err, ErrAmbiguousChainMatch) {
+		t.Errorf("got (%v, %v), want (nil, ErrAmbiguousChainMatch)", got, err)
+	}
+	if got != nil {
+		t.Errorf("got chain=%v on ambiguous, want nil", got)
+	}
+}
+
+func TestSelectChainTransportProtocol(t *testing.T) {
+	tls := &ChainSpec{Name: "tls", TransportProtocol: "tls"}
+	universal := &ChainSpec{Name: "u", Empty: true}
+	inputs := ChainMatchInputs{TransportProtocol: "tls"}
+	got, err := SelectChain(inputs, []*ChainSpec{universal, tls}, nil)
+	if err != nil {
+		t.Fatalf("SelectChain: %v", err)
+	}
+	if got != tls {
+		t.Errorf("expected transport_protocol-specified chain; got %v", got)
+	}
+}
+
+func TestSelectChainSourcePorts(t *testing.T) {
+	sp := &ChainSpec{Name: "sp", SourcePorts: []uint32{12345, 54321}}
+	universal := &ChainSpec{Name: "u", Empty: true}
+	inputs := ChainMatchInputs{SourcePort: 12345}
+	got, err := SelectChain(inputs, []*ChainSpec{universal, sp}, nil)
+	if err != nil {
+		t.Fatalf("SelectChain: %v", err)
+	}
+	if got != sp {
+		t.Errorf("expected source_ports-specified chain; got %v", got)
+	}
+}
