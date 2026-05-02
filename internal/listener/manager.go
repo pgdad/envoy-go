@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -672,6 +673,15 @@ func findIdenticalChainSpecs(specs []*listenerfilter.ChainSpec) (int, int, bool)
 // chainSpecKey deterministically serializes a ChainSpec's match dimensions
 // (Name excluded) into a comparable string. Used by findIdenticalChainSpecs
 // for ambiguous-selection detection at NewManager-build time.
+//
+// Each multi-element field is order-canonicalized (sorted on a copy — the
+// input *ChainSpec is documented immutable post-build) before serialization
+// so that two chains differing only in slice declaration order — which
+// matches() treats as semantically identical because every multi-element
+// dimension is set-based (sniMatchAny / alpnMatchAny / portInAny / ipInAny)
+// — produce the same key. Without this, the boot-time duplicate-detection
+// would miss the duplicate, and at runtime SelectChain.breakTie would return
+// nil → ErrAmbiguousChainMatch on the first matching connection.
 func chainSpecKey(s *listenerfilter.ChainSpec) string {
 	if s.Empty {
 		return "EMPTY"
@@ -679,20 +689,29 @@ func chainSpecKey(s *listenerfilter.ChainSpec) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "dp=%d|", s.DestinationPort)
 	b.WriteString("pr=")
-	for _, n := range s.PrefixRanges {
-		b.WriteString(n.String())
+	prefixRanges := make([]string, len(s.PrefixRanges))
+	for i, n := range s.PrefixRanges {
+		prefixRanges[i] = n.String()
+	}
+	sort.Strings(prefixRanges)
+	for _, n := range prefixRanges {
+		b.WriteString(n)
 		b.WriteByte(',')
 	}
 	b.WriteByte('|')
 	b.WriteString("sn=")
-	for _, sn := range s.ServerNames {
+	serverNames := append([]string(nil), s.ServerNames...)
+	sort.Strings(serverNames)
+	for _, sn := range serverNames {
 		b.WriteString(sn)
 		b.WriteByte(',')
 	}
 	b.WriteByte('|')
 	fmt.Fprintf(&b, "tp=%s|", s.TransportProtocol)
 	b.WriteString("ap=")
-	for _, ap := range s.ApplicationProtocols {
+	appProtos := append([]string(nil), s.ApplicationProtocols...)
+	sort.Strings(appProtos)
+	for _, ap := range appProtos {
 		b.WriteString(ap)
 		b.WriteByte(',')
 	}
@@ -700,13 +719,20 @@ func chainSpecKey(s *listenerfilter.ChainSpec) string {
 	fmt.Fprintf(&b, "stl=%t|", s.SourceTypeLocal)
 	fmt.Fprintf(&b, "ste=%t|", s.SourceTypeExternal)
 	b.WriteString("spr=")
-	for _, n := range s.SourcePrefixRanges {
-		b.WriteString(n.String())
+	srcPrefixRanges := make([]string, len(s.SourcePrefixRanges))
+	for i, n := range s.SourcePrefixRanges {
+		srcPrefixRanges[i] = n.String()
+	}
+	sort.Strings(srcPrefixRanges)
+	for _, n := range srcPrefixRanges {
+		b.WriteString(n)
 		b.WriteByte(',')
 	}
 	b.WriteByte('|')
 	b.WriteString("sp=")
-	for _, p := range s.SourcePorts {
+	srcPorts := append([]uint32(nil), s.SourcePorts...)
+	sort.Slice(srcPorts, func(i, j int) bool { return srcPorts[i] < srcPorts[j] })
+	for _, p := range srcPorts {
 		fmt.Fprintf(&b, "%d,", p)
 	}
 	return b.String()

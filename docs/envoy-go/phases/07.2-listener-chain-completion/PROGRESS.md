@@ -398,3 +398,5 @@ ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.044s
 ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	0.003s
 [every other package PASS — full output omitted]
 ```
+
+**Follow-up commit (review-driven fix):** Code-quality reviewer flagged I-1 (chainSpecKey did not canonicalize slice order, causing duplicate-detection to miss semantically-identical chains differing only by slice permutation; matches() is set-based so this could surface as runtime ErrAmbiguousChainMatch on the first matching connection — worse failure mode than a boot-time error) and two test-coverage gaps (I-2 errUnwrapFilterChain unwrap, I-3 nil-lfRegistry-with-non-empty-listener_filters). Fix: chainSpecKey now sorts ServerNames / ApplicationProtocols / SourcePorts / PrefixRanges / SourcePrefixRanges (via copies — ChainSpec is immutable post-build) before serializing. Added three new tests covering the I-1, I-2, I-3 surfaces. Per ADR-0017 (small-mechanical-fixes do not require ADRs), no new ADR.

@@ -1891,3 +1891,191 @@ func TestParseDefaultFilterChain_Plaintext_WithTLSFilterChain(t *testing.T) {
 		t.Error("defaultChain.tlsCfg should be nil (plaintext default)")
 	}
 }
+
+// TestIdenticalFilterChainsAmbiguousSelectionDetectedDespiteSlicePermutation
+// is a code-review-driven follow-up on Task 9: chainSpecKey must canonicalize
+// (sort) every multi-element ChainSpec field before serializing, because
+// chainmatch.matches() is set-based on every multi-element dimension
+// (sniMatchAny / alpnMatchAny / portInAny / ipInAny). Without canonicalization,
+// two chains differing only in declared slice order would produce different
+// keys → boot-time duplicate detection misses them → at runtime SelectChain
+// hits the ambiguous-tie path on the first matching connection (worse failure
+// mode than a boot-time error). Each subtest exercises one multi-element
+// dimension's permutation and asserts it is detected as a duplicate at boot.
+//
+// SNI / ALPN cases use TLS chains because plaintext+SNI on a multi-chain
+// listener is rejected earlier (not the path under test); other cases stay
+// plaintext because they do not depend on a TLS-only dimension.
+func TestIdenticalFilterChainsAmbiguousSelectionDetectedDespiteSlicePermutation(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	tsAlpha := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
+
+	type plainCase struct {
+		fcmA *listenerv3.FilterChainMatch
+		fcmB *listenerv3.FilterChainMatch
+	}
+	plainCases := map[string]plainCase{
+		"SourcePorts permutation": {
+			fcmA: &listenerv3.FilterChainMatch{SourcePorts: []uint32{1000, 2000}},
+			fcmB: &listenerv3.FilterChainMatch{SourcePorts: []uint32{2000, 1000}},
+		},
+		"PrefixRanges permutation": {
+			fcmA: &listenerv3.FilterChainMatch{PrefixRanges: []*corev3.CidrRange{
+				{AddressPrefix: "10.0.0.0", PrefixLen: wrapperspb.UInt32(8)},
+				{AddressPrefix: "192.168.0.0", PrefixLen: wrapperspb.UInt32(16)},
+			}},
+			fcmB: &listenerv3.FilterChainMatch{PrefixRanges: []*corev3.CidrRange{
+				{AddressPrefix: "192.168.0.0", PrefixLen: wrapperspb.UInt32(16)},
+				{AddressPrefix: "10.0.0.0", PrefixLen: wrapperspb.UInt32(8)},
+			}},
+		},
+		"SourcePrefixRanges permutation": {
+			fcmA: &listenerv3.FilterChainMatch{SourcePrefixRanges: []*corev3.CidrRange{
+				{AddressPrefix: "10.0.0.0", PrefixLen: wrapperspb.UInt32(8)},
+				{AddressPrefix: "172.16.0.0", PrefixLen: wrapperspb.UInt32(12)},
+			}},
+			fcmB: &listenerv3.FilterChainMatch{SourcePrefixRanges: []*corev3.CidrRange{
+				{AddressPrefix: "172.16.0.0", PrefixLen: wrapperspb.UInt32(12)},
+				{AddressPrefix: "10.0.0.0", PrefixLen: wrapperspb.UInt32(8)},
+			}},
+		},
+	}
+	for name, tc := range plainCases {
+		t.Run(name, func(t *testing.T) {
+			l := &listenerv3.Listener{
+				Name: "l_perm",
+				Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+					SocketAddress: &corev3.SocketAddress{
+						Address:       "127.0.0.1",
+						PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+					},
+				}},
+				FilterChains: []*listenerv3.FilterChain{
+					{FilterChainMatch: tc.fcmA, Filters: []*listenerv3.Filter{filter}},
+					{FilterChainMatch: tc.fcmB, Filters: []*listenerv3.Filter{filter}},
+				},
+			}
+			boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+			_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+			if err == nil {
+				t.Fatalf("expected ambiguous-selection error for permuted %s, got nil", name)
+			}
+			if !strings.Contains(err.Error(), "ambiguous selection") {
+				t.Errorf("error %q does not contain %q (permuted %s)", err.Error(), "ambiguous selection", name)
+			}
+		})
+	}
+
+	type tlsCase struct {
+		fcmA *listenerv3.FilterChainMatch
+		fcmB *listenerv3.FilterChainMatch
+	}
+	tlsCases := map[string]tlsCase{
+		"ServerNames permutation": {
+			fcmA: &listenerv3.FilterChainMatch{ServerNames: []string{"a.example", "b.example"}},
+			fcmB: &listenerv3.FilterChainMatch{ServerNames: []string{"b.example", "a.example"}},
+		},
+		"ApplicationProtocols permutation": {
+			fcmA: &listenerv3.FilterChainMatch{ApplicationProtocols: []string{"h2", "http/1.1"}},
+			fcmB: &listenerv3.FilterChainMatch{ApplicationProtocols: []string{"http/1.1", "h2"}},
+		},
+	}
+	for name, tc := range tlsCases {
+		t.Run(name, func(t *testing.T) {
+			l := &listenerv3.Listener{
+				Name: "l_perm_tls",
+				Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+					SocketAddress: &corev3.SocketAddress{
+						Address:       "127.0.0.1",
+						PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+					},
+				}},
+				FilterChains: []*listenerv3.FilterChain{
+					{FilterChainMatch: tc.fcmA, TransportSocket: tsAlpha, Filters: []*listenerv3.Filter{filter}},
+					{FilterChainMatch: tc.fcmB, TransportSocket: tsAlpha, Filters: []*listenerv3.Filter{filter}},
+				},
+			}
+			boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+			_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+			if err == nil {
+				t.Fatalf("expected ambiguous-selection error for permuted %s, got nil", name)
+			}
+			if !strings.Contains(err.Error(), "ambiguous selection") {
+				t.Errorf("error %q does not contain %q (permuted %s)", err.Error(), "ambiguous selection", name)
+			}
+		})
+	}
+}
+
+// TestParseDefaultFilterChainBuildErrorIsSinglePrefixed is a code-review-driven
+// follow-up on Task 9: errUnwrapFilterChain peels the inner
+// `listener: %q: default_filter_chain: ` prefix that buildTerminalFilter emits
+// so the caller-side wrap does not double-prefix. Without the unwrap, the
+// surfaced message would be
+// `listener: "x": default_filter_chain: listener: "x": default_filter_chain: <inner>`.
+// This test exercises the path by building a default_filter_chain with two
+// filters (buildTerminalFilter rejects len != 1) and asserts the
+// `default_filter_chain: ` prefix appears exactly once.
+func TestParseDefaultFilterChainBuildErrorIsSinglePrefixed(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "l_dfc_two",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{
+			{Filters: []*listenerv3.Filter{filter}},
+		},
+		DefaultFilterChain: &listenerv3.FilterChain{
+			// Two filters → buildTerminalFilter errors with "expected exactly
+			// one filter, got 2".
+			Filters: []*listenerv3.Filter{filter, filter},
+		},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		t.Fatal("expected error from default_filter_chain with two filters, got nil")
+	}
+	const marker = "default_filter_chain: "
+	if got := strings.Count(err.Error(), marker); got != 1 {
+		t.Errorf("error %q contains %q %d times, want exactly 1 (errUnwrapFilterChain regression)", err.Error(), marker, got)
+	}
+	if !strings.Contains(err.Error(), "expected exactly one filter") {
+		t.Errorf("error %q does not contain inner build-error text", err.Error())
+	}
+}
+
+// TestParseListenerFiltersNilRegistryErrors is a code-review-driven follow-up
+// on Task 9: a Listener carrying listener_filters[] but compiled against a
+// nil ListenerFilterRegistry must error with the documented message — the
+// path is otherwise reachable but untested.
+func TestParseListenerFiltersNilRegistryErrors(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "l_nilreg",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains:    []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{filter}}},
+		ListenerFilters: []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	if err == nil {
+		t.Fatal("expected error for non-empty listener_filters[] with nil lfRegistry, got nil")
+	}
+	want := `listener: "l_nilreg": listener_filters[] is non-empty but no listener-filter registry was supplied`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err.Error(), want)
+	}
+}
