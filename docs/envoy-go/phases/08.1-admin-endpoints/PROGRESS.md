@@ -110,3 +110,70 @@ $ go build ./...
 $ grep -nE '^func \(m \*Manager\) Clusters\(\) \[\]ClusterInfo' internal/cluster/manager.go
 150:func (m *Manager) Clusters() []ClusterInfo {
 ```
+
+## Task 4 — `internal/admin/headers.go` + `internal/admin/version.go` shared helpers
+
+**Commits:** `6a3a10b` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-8, run as two sequential cycles to keep the red→green phase visible per file. Cycle 1 (headers): Step 1 created `internal/admin/headers_test.go` with the four tests verbatim from PLAN (`TestWriteAdminHeaders_SetsFourConstantHeaders`, `_DoesNotSetDateOrContentLength`, `_OverwritePreviousContentType`, `_AppliedThroughHTTPServer`). Step 2 confirmed the build error `undefined: writeAdminHeaders` (4 occurrences across the test file). Step 3 created `internal/admin/headers.go` with the verbatim 4-line `writeAdminHeaders(w, contentType)` body (lowercase / unexported per task spec) and verbatim ADR-0014/SPEC §11.6 doc comment. Step 4 confirmed 4 PASS. Cycle 2 (version): Step 5 created `internal/admin/version_test.go` with the five tests verbatim from PLAN (`TestBuildVersionString_FiveTokens`, `_GoVersionToken`, `_LiteralCleanReleaseGocrypto`, `_RevisionDefaultsToUnknownInTestBuild`, `_RevisionLDFlagOverride`). Step 6 confirmed the build error `undefined: BuildVersionString` (and `undefined: Revision`). Step 7 created `internal/admin/version.go` with the verbatim impl: `var Revision = readRevision()`, `readRevision()` walking `runtime/debug.ReadBuildInfo().Settings` for `vcs.revision` with `"unknown"` fallback, and `BuildVersionString()` emitting `<rev[:7]>/<runtime.Version()>/Clean/RELEASE/Go-crypto`. Step 8 confirmed 5 PASS. The `Revision` package var + `BuildVersionString` are exported (uppercase) so `-ldflags "-X .Revision=<sha>"` and the Task 9 `/server_info` handler can reach them; `writeAdminHeaders` stays lowercase (unexported, package-internal). The `TestBuildVersionString_RevisionLDFlagOverride` test uses the prescribed `saved := Revision; defer func(){Revision = saved}()` save/restore pattern so test order does not matter. **One deviation from PLAN-verbatim:** the package-doc comment in `version.go` originally read `Default-initialised` (PLAN Step 3 verbatim text); golangci-lint's `misspell` check flagged it as British spelling and was rejected. Fixed to `Default-initialized` (a comment-only edit; semantics unchanged). All 9 new tests PASS; existing admin tests (`Server_*`, `HandlePrometheus_*`) still PASS — no regression. `go vet`, `golangci-lint`, `go build ./...`, and `go test -count=1 ./...` all clean.
+
+**Outputs:**
+```
+$ go test -run TestWriteAdminHeaders ./internal/admin/... 2>&1 | head -10
+# github.com/esalaine/envoy-go/internal/admin [github.com/esalaine/envoy-go/internal/admin.test]
+internal/admin/headers_test.go:11:2: undefined: writeAdminHeaders
+internal/admin/headers_test.go:28:2: undefined: writeAdminHeaders
+internal/admin/headers_test.go:40:2: undefined: writeAdminHeaders
+internal/admin/headers_test.go:51:3: undefined: writeAdminHeaders
+FAIL	github.com/esalaine/envoy-go/internal/admin [build failed]
+FAIL
+
+$ go test -run TestWriteAdminHeaders ./internal/admin/... -v 2>&1 | tail -15
+=== RUN   TestWriteAdminHeaders_SetsFourConstantHeaders
+--- PASS: TestWriteAdminHeaders_SetsFourConstantHeaders (0.00s)
+=== RUN   TestWriteAdminHeaders_DoesNotSetDateOrContentLength
+--- PASS: TestWriteAdminHeaders_DoesNotSetDateOrContentLength (0.00s)
+=== RUN   TestWriteAdminHeaders_OverwritePreviousContentType
+--- PASS: TestWriteAdminHeaders_OverwritePreviousContentType (0.00s)
+=== RUN   TestWriteAdminHeaders_AppliedThroughHTTPServer
+--- PASS: TestWriteAdminHeaders_AppliedThroughHTTPServer (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.002s
+
+$ go test -run TestBuildVersionString ./internal/admin/... 2>&1 | head -10
+# github.com/esalaine/envoy-go/internal/admin [github.com/esalaine/envoy-go/internal/admin.test]
+internal/admin/version_test.go:10:7: undefined: BuildVersionString
+internal/admin/version_test.go:18:7: undefined: BuildVersionString
+internal/admin/version_test.go:26:7: undefined: BuildVersionString
+internal/admin/version_test.go:44:7: undefined: BuildVersionString
+internal/admin/version_test.go:54:11: undefined: Revision
+internal/admin/version_test.go:55:17: undefined: Revision
+internal/admin/version_test.go:56:2: undefined: Revision
+internal/admin/version_test.go:57:7: undefined: BuildVersionString
+FAIL	github.com/esalaine/envoy-go/internal/admin [build failed]
+
+$ go test -run TestBuildVersionString ./internal/admin/... -v 2>&1 | tail -20
+=== RUN   TestBuildVersionString_FiveTokens
+--- PASS: TestBuildVersionString_FiveTokens (0.00s)
+=== RUN   TestBuildVersionString_GoVersionToken
+--- PASS: TestBuildVersionString_GoVersionToken (0.00s)
+=== RUN   TestBuildVersionString_LiteralCleanReleaseGocrypto
+--- PASS: TestBuildVersionString_LiteralCleanReleaseGocrypto (0.00s)
+=== RUN   TestBuildVersionString_RevisionDefaultsToUnknownInTestBuild
+--- PASS: TestBuildVersionString_RevisionDefaultsToUnknownInTestBuild (0.00s)
+=== RUN   TestBuildVersionString_RevisionLDFlagOverride
+--- PASS: TestBuildVersionString_RevisionLDFlagOverride (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.002s
+
+$ go test -count=1 ./internal/admin/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/admin	0.048s
+
+$ go vet ./...
+(clean)
+
+$ golangci-lint run ./internal/admin/...
+(clean)
+
+$ go build ./...
+(clean)
+```
