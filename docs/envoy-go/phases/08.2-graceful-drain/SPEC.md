@@ -60,7 +60,7 @@ Per `BOOTSTRAP_PROMPT.md` §6.3 (scope-bounding) and ADR-0040 (out-of-scope defe
 - **HTTP/2 over admin (admin stays HTTP/1.1 — phase-01 contract; 08.1 §2.4 inherited).**
 - **TLS on admin (admin stays plaintext).**
 - **Compression on admin responses.**
-- **Streaming responses for /drain_listeners.** The handler is fire-and-forget — body is `OK\n` (10 bytes) buffered before write.
+- **Streaming responses for /drain_listeners.** The handler is fire-and-forget — body is `OK\n` (3 bytes) buffered before write.
 
 ### 2.5 Security non-purposes
 
