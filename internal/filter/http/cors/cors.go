@@ -98,26 +98,29 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 	// Allowed-origin preflight: synthesize the 200 response with the six
 	// CORS headers in §11.2 verbatim order via SendLocalReply. The chain
 	// runs the encode side inline (per ADR-0075) and aborts decode iteration.
-	ph := http.Header{}
-	// Order matters for wire emission downstream (HCM dispatch + writeStatusReply
-	// preserve insertion / canonical order in the body() shape). The six
-	// headers are populated in §11.2 order; the chain's beginLocalReply uses
-	// http.Header.Add for canonicalization.
-	ph.Set("Access-Control-Allow-Origin", origin)
+	//
+	// Use OrderedHeaders (Task 18 review fix) to preserve §11.2 verbatim
+	// 6-header order on the wire. http.Header (Go map) iteration is non-
+	// deterministic and net/http's stdlib Header.Write emits keys
+	// alphabetically sorted — both lose the §11.2 order. The OrderedHeaders
+	// carrier flows from here through chain.SendLocalReply →
+	// chain.LocalReplyResponse → writeH1Reply / writeH2Reply byte-for-byte.
+	ph := make(envoyhttp.OrderedHeaders, 0, 6)
+	ph = append(ph, envoyhttp.HeaderField{Name: "Access-Control-Allow-Origin", Value: origin})
 	if policy.GetAllowCredentials().GetValue() {
-		ph.Set("Access-Control-Allow-Credentials", "true")
+		ph = append(ph, envoyhttp.HeaderField{Name: "Access-Control-Allow-Credentials", Value: "true"})
 	}
 	if methods := policy.GetAllowMethods(); methods != "" {
-		ph.Set("Access-Control-Allow-Methods", methods)
+		ph = append(ph, envoyhttp.HeaderField{Name: "Access-Control-Allow-Methods", Value: methods})
 	}
 	if hdrs := policy.GetAllowHeaders(); hdrs != "" {
-		ph.Set("Access-Control-Allow-Headers", hdrs)
+		ph = append(ph, envoyhttp.HeaderField{Name: "Access-Control-Allow-Headers", Value: hdrs})
 	}
 	if maxAge := policy.GetMaxAge(); maxAge != "" {
-		ph.Set("Access-Control-Max-Age", maxAge)
+		ph = append(ph, envoyhttp.HeaderField{Name: "Access-Control-Max-Age", Value: maxAge})
 	}
 	if expose := policy.GetExposeHeaders(); expose != "" {
-		ph.Set("Access-Control-Expose-Headers", expose)
+		ph = append(ph, envoyhttp.HeaderField{Name: "Access-Control-Expose-Headers", Value: expose})
 	}
 	f.dcb.SendLocalReply(200, "", ph)
 	return envoyhttp.StopIteration

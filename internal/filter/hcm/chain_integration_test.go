@@ -548,21 +548,30 @@ func TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders(t
 		t.Errorf("expected 200 OK status line, got: %q", out)
 	}
 
-	// Verify the six CORS headers in §11.2 verbatim order are present in the
-	// wire output. Order verification: walk through the wire output and check
-	// that each header appears AFTER the previous one in the wire stream.
+	// Verify the six CORS headers in §11.2 verbatim order are present AND
+	// emitted IN ORDER on the wire. Order verification: walk the wire output
+	// and require each successive header's start index to be strictly greater
+	// than the previous one's. Per Task 18 review: this is the strict ORDER
+	// assertion that the differential gate (Task 21) needs — reference Envoy
+	// v1.37.2 emits the §11.2 6 headers in this exact verbatim order on the
+	// wire, and envoy-go MUST match byte-for-byte.
 	wantHeaders := []string{
-		"Access-Control-Allow-Origin: https://example.test",
-		"Access-Control-Allow-Credentials: true",
-		"Access-Control-Allow-Methods: GET, POST, OPTIONS",
-		"Access-Control-Allow-Headers: x-foo, x-bar",
-		"Access-Control-Max-Age: 600",
-		"Access-Control-Expose-Headers: x-baz",
+		"Access-Control-Allow-Origin: https://example.test\r\n",
+		"Access-Control-Allow-Credentials: true\r\n",
+		"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n",
+		"Access-Control-Allow-Headers: x-foo, x-bar\r\n",
+		"Access-Control-Max-Age: 600\r\n",
+		"Access-Control-Expose-Headers: x-baz\r\n",
 	}
-	for _, wh := range wantHeaders {
-		if !strings.Contains(out, wh) {
-			t.Errorf("missing CORS header line %q in wire output\n---FULL OUTPUT---\n%s\n---END---", wh, out)
+	prevEnd := 0
+	for i, wh := range wantHeaders {
+		idx := strings.Index(out[prevEnd:], wh)
+		if idx < 0 {
+			t.Errorf("missing CORS header line %d %q in wire output (or out of order — previous header ended at byte %d)\n---FULL OUTPUT---\n%s\n---END---",
+				i, wh, prevEnd, out)
+			break
 		}
+		prevEnd += idx + len(wh)
 	}
 
 	// Body should be empty (preflight 200 has Content-Length: 0).

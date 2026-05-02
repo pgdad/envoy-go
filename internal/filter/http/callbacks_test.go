@@ -13,9 +13,9 @@ type fakeDecoderCB struct {
 	routeCfgCalls int
 }
 
-func (c *fakeDecoderCB) ContinueDecoding()                                          { c.continueCalls++ }
-func (c *fakeDecoderCB) SendLocalReply(int, string, http.Header)                    { c.localReplies++ }
-func (c *fakeDecoderCB) RequestRouteConfig() proto.Message                          { c.routeCfgCalls++; return nil }
+func (c *fakeDecoderCB) ContinueDecoding()                       { c.continueCalls++ }
+func (c *fakeDecoderCB) SendLocalReply(int, string, OrderedHeaders) { c.localReplies++ }
+func (c *fakeDecoderCB) RequestRouteConfig() proto.Message       { c.routeCfgCalls++; return nil }
 func (c *fakeDecoderCB) EncodeHeaders(http.Header, bool)                            {}
 func (c *fakeDecoderCB) EncodeData([]byte, bool)                                    {}
 func (c *fakeDecoderCB) EncodeTrailers(http.Header)                                 {}

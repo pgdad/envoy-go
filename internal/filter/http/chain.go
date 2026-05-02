@@ -77,7 +77,7 @@ type FilterChain struct {
 	// Now dispatch reads this via LocalReplyResponse() when localReplyDone
 	// is set.
 	localReplyStatus  int
-	localReplyHeaders http.Header
+	localReplyHeaders OrderedHeaders
 	localReplyBody    []byte
 
 	// Encode-side started flag (Task 7) — second SendLocalReply after this is
@@ -218,12 +218,13 @@ func (c *FilterChain) RunDecodeData(ctx context.Context, data []byte, endStream 
 			// chain transitions to encode mode via beginLocalReply.
 			if len(c.decodeBuf)+len(data) > filterBufferLimitBytes {
 				c.decodeBufOver = true
-				headers := http.Header{}
 				// Connection: close per the §11 #3 empirical pin — forces the
 				// H1 conn to terminate after the local reply emits. The HCM
 				// dispatch path reads this header on the synthesized response
 				// and closes the conn after writing (Task 15).
-				headers.Set("Connection", "close")
+				headers := OrderedHeaders{
+					{Name: "Connection", Value: "close"},
+				}
 				c.beginLocalReply(c.ambientCtx, c.decodeIdx, 413, localReply413Body, headers)
 				return false, nil
 			}
@@ -379,7 +380,7 @@ func (d *decoderCB) ContinueDecoding() {
 	}
 }
 
-func (d *decoderCB) SendLocalReply(status int, body string, headers http.Header) {
+func (d *decoderCB) SendLocalReply(status int, body string, headers OrderedHeaders) {
 	d.c.beginLocalReply(d.c.ambientCtx, d.idx, status, body, headers)
 }
 
@@ -457,7 +458,7 @@ func (c *FilterChain) diagLogWriter() io.Writer {
 // HCM wire-write path (per ADR-0075 (b)). The framework injects only the
 // minimal Content-Length + default Content-Type headers needed for a valid
 // HTTP/1.x response shape.
-func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status int, body string, headers http.Header) {
+func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status int, body string, headers OrderedHeaders) {
 	if c.encodeStarted.Load() {
 		// Encode chain already started; second SendLocalReply is a no-op + log.
 		_, _ = fmt.Fprintf(c.diagLogWriter(), "hcm: filter %q called SendLocalReply after encode-side started; ignoring\n", c.filters[callerIdx].Name)
@@ -465,18 +466,22 @@ func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status
 	}
 	c.localReplyOnce.Do(func() {
 		c.localReplyDone.Store(true)
-		// Merge framework-injected standard headers with user-supplied headers.
-		// Use Header.Add (which canonicalizes via textproto.CanonicalMIMEHeaderKey)
-		// rather than a raw map copy — otherwise a user-supplied non-canonical key
-		// like "content-type" would survive verbatim and the subsequent
-		// merged.Get("Content-Type") miss would cause the framework to inject a
-		// duplicate default Content-Type pair on the wire. Per code-quality review
-		// on a03a1d3 (I-1).
+		// Build an http.Header view of the ordered carrier so encode-side
+		// filters (which still operate on the http.Header API per ADR-0071)
+		// can mutate values via Set/Add. Mutations are reconciled back onto
+		// the OrderedHeaders carrier after RunEncodeHeaders returns to
+		// preserve caller-supplied wire-emission order (per Task 18 review:
+		// SPEC §11.2 verbatim 6-header order must survive on the wire).
+		//
+		// Use http.Header.Add (which canonicalizes via textproto.CanonicalMIMEHeaderKey)
+		// rather than a raw map copy — a user-supplied non-canonical key like
+		// "content-type" would otherwise survive verbatim and the subsequent
+		// merged.Get("Content-Type") miss would cause the framework to inject
+		// a duplicate default Content-Type pair on the wire. Per code-quality
+		// review on a03a1d3 (I-1).
 		merged := make(http.Header, len(headers)+4)
-		for k, vs := range headers {
-			for _, v := range vs {
-				merged.Add(k, v)
-			}
+		for _, hf := range headers {
+			merged.Add(hf.Name, hf.Value)
 		}
 		merged.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		if merged.Get("Content-Type") == "" {
@@ -494,17 +499,76 @@ func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status
 		}
 		// no trailers
 
-		// Phase 07.1 Task 18 prereq P2: surface the synthesized response (post-
-		// encode-chain mutation) to HCM dispatch so the wire-write path can
-		// emit the bytes. Pre-Task-18 the chain ran the encode chain but the
-		// synthesized response never reached the wire — wire-write was the
-		// Action's responsibility and SendLocalReply bypassed Action. Capture
-		// the merged headers + body bytes after RunEncode* returns so the
-		// chain's LocalReplyResponse() getter returns the post-mutation shape.
+		// Phase 07.1 Task 18 prereq P2 + Task 18 review fix: surface the
+		// synthesized response (post-encode-chain mutation) to HCM dispatch
+		// so the wire-write path can emit the bytes IN CALLER-SUPPLIED ORDER.
+		// Reconcile post-encode mutations back onto the OrderedHeaders carrier:
+		//   1. Walk the original ordered list; for each name take the (possibly-
+		//      mutated) value from `merged` (encode-side filters mutate via Set,
+		//      preserving order at the framework level for known names).
+		//   2. Append any net-new keys from `merged` that were not in the
+		//      original list (framework-injected Content-Length / Content-Type,
+		//      plus any encode-side filter Add()s for new header names).
+		// This preserves the §11.2 6-header verbatim order from cors.go while
+		// honoring encode-side mutations + framework defaults.
 		c.localReplyStatus = status
-		c.localReplyHeaders = merged
+		c.localReplyHeaders = reconcileOrderedHeaders(headers, merged)
 		c.localReplyBody = []byte(body)
 	})
+}
+
+// reconcileOrderedHeaders merges encode-chain mutations on `merged` back onto
+// the caller-supplied ordered carrier `original`. For each name in `original`
+// (looked up canonically), emits the post-encode value(s) from `merged` in
+// the original order; then appends any net-new header keys from `merged`
+// (canonical key already, since merged was built via Add which canonicalizes).
+// This is the order-preservation bridge between the http.Header-mutation-friendly
+// encode-chain API and the order-pinned wire-emit shape required by SPEC §11.2.
+func reconcileOrderedHeaders(original OrderedHeaders, merged http.Header) OrderedHeaders {
+	out := make(OrderedHeaders, 0, len(merged))
+	seen := make(map[string]bool, len(original))
+	for _, hf := range original {
+		canon := http.CanonicalHeaderKey(hf.Name)
+		if seen[canon] {
+			continue // dedupe duplicates in original; first occurrence wins
+		}
+		seen[canon] = true
+		if vs, ok := merged[canon]; ok {
+			for _, v := range vs {
+				out = append(out, HeaderField{Name: canon, Value: v})
+			}
+		}
+		// If a header was deleted on the encode side (rare), it falls out here.
+	}
+	// Append net-new keys from merged in alphabetical order so framework-
+	// injected (Content-Length / Content-Type) and encode-side-added keys
+	// land in deterministic order after the caller-pinned ones. Determinism
+	// matters for byte-equivalence in the differential gate (Task 21).
+	newKeys := make([]string, 0)
+	for k := range merged {
+		if !seen[k] {
+			newKeys = append(newKeys, k)
+		}
+	}
+	// Stable order for new keys; sort.Strings.
+	sortStrings(newKeys)
+	for _, k := range newKeys {
+		for _, v := range merged[k] {
+			out = append(out, HeaderField{Name: k, Value: v})
+		}
+	}
+	return out
+}
+
+// sortStrings is a tiny insertion sort for the new-keys slice (typically ≤4
+// entries: Content-Length, Content-Type, optional Server, optional Date).
+// Avoids importing "sort" for this single use.
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
 }
 
 // LocalReplyDone reports whether SendLocalReply was invoked on this chain.
@@ -519,6 +583,11 @@ func (c *FilterChain) LocalReplyDone() bool { return c.localReplyDone.Load() }
 // beginLocalReply ran the encode chain over (status, headers, body); this
 // getter surfaces the (post-mutation) shape so HCM dispatch can write wire
 // bytes via writeH1Reply / writeH2Reply.
-func (c *FilterChain) LocalReplyResponse() (int, http.Header, []byte) {
+//
+// Per Task 18 review (SPEC §11.2 ordered-headers compliance): headers is the
+// ordered carrier that preserves caller-supplied insertion order through the
+// chain's encode iteration. writeH1Reply / writeH2Reply iterate this slice
+// in order rather than walking an http.Header map (which would lose order).
+func (c *FilterChain) LocalReplyResponse() (int, OrderedHeaders, []byte) {
 	return c.localReplyStatus, c.localReplyHeaders, c.localReplyBody
 }

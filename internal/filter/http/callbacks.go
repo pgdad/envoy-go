@@ -20,7 +20,14 @@ type DecoderFilterCallbacks interface {
 	// filter[len-1] (per ADR-0075 + SPEC §11 #4 empirical pin). First-call-wins
 	// via sync.Once on the chain; second-call-after-encode-started is a no-op
 	// + log line.
-	SendLocalReply(status int, body string, headers http.Header)
+	//
+	// Per Task 18 review (SPEC §11.2 ordered-headers compliance): the headers
+	// parameter is an ordered (name, value) carrier (OrderedHeaders) so the
+	// caller-supplied insertion order survives the chain's encode-iteration
+	// and the wire-write layer. The unordered http.Header map cannot preserve
+	// the §11.2 verbatim 6-header order — Go map iteration is non-deterministic
+	// and net/http's Header.Write emits keys alphabetically sorted.
+	SendLocalReply(status int, body string, headers OrderedHeaders)
 
 	// RequestRouteConfig returns the merged proto.Message for the calling
 	// filter's name (Route > VirtualHost > RouteConfiguration most-specific

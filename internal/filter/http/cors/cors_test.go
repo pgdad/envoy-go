@@ -107,6 +107,14 @@ func buildChain(t *testing.T, policy *corsv3.CorsPolicy) (*envoyhttp.FilterChain
 // TestCors_Preflight_AllowedOriginEmits200WithSixHeaders verifies that an
 // OPTIONS preflight with an allow-listed origin triggers SendLocalReply(200)
 // with the six CORS headers in the §11.2 verbatim order.
+//
+// Order assertion: the chain's LocalReplyResponse() returns OrderedHeaders —
+// a slice carrying caller-supplied insertion order through the encode chain
+// and out to HCM dispatch. The test walks the slice in order and asserts the
+// six §11.2 headers appear in the pinned sequence (Allow-Origin first,
+// Expose-Headers last). This is the strict ORDER assertion that closes the
+// Task 18 review gap (Go map iteration on http.Header was non-deterministic;
+// stdlib Header.Write emits keys alphabetically — both lose §11.2 order).
 func TestCors_Preflight_AllowedOriginEmits200WithSixHeaders(t *testing.T) {
 	policy := makeCorsPolicy([]string{"https://example.test"})
 	chain, term, _ := buildChain(t, policy)
@@ -131,52 +139,57 @@ func TestCors_Preflight_AllowedOriginEmits200WithSixHeaders(t *testing.T) {
 	if !term.encodeCalled {
 		t.Fatalf("recordingTerminal.EncodeHeaders never called; encode chain did not run")
 	}
-	gotStatus := term.encodeHeaders.Get(":status")
-	if gotStatus == "" {
-		// SendLocalReply with status=200 → chain's beginLocalReply does NOT
-		// inject :status (status flows out-of-band). The chain framework's
-		// caller (HCM dispatch) is responsible for the status int. For this
-		// unit test, we trust the chain's docs (SendLocalReply path) and only
-		// check the headers it carries.
-		gotStatus = "" // tolerate absence; the assertion is on headers
+
+	// Strict ORDER assertion (Task 18 review fix): walk the OrderedHeaders
+	// returned by chain.LocalReplyResponse() and verify the six §11.2 CORS
+	// headers appear in the pinned sequence. The slice may carry additional
+	// framework-injected entries (Content-Length, Content-Type) AFTER the
+	// caller-pinned six per beginLocalReply's reconcile step — those are not
+	// part of the §11.2 pin and are tolerated, but the relative order of the
+	// six MUST match.
+	if !chain.LocalReplyDone() {
+		t.Fatalf("chain.LocalReplyDone() = false; expected SendLocalReply path to have fired")
+	}
+	gotStatus, gotHeaders, gotBody := chain.LocalReplyResponse()
+	if gotStatus != 200 {
+		t.Errorf("status = %d, want 200", gotStatus)
+	}
+	if len(gotBody) != 0 {
+		t.Errorf("preflight body should be empty; got %q", string(gotBody))
 	}
 
-	// Verify the six CORS headers are present with correct values + order.
-	wantOrder := []string{
-		"Access-Control-Allow-Origin",
-		"Access-Control-Allow-Credentials",
-		"Access-Control-Allow-Methods",
-		"Access-Control-Allow-Headers",
-		"Access-Control-Max-Age",
-		"Access-Control-Expose-Headers",
+	// The six §11.2 headers in pinned order, with verbatim values.
+	wantOrder := []envoyhttp.HeaderField{
+		{Name: "Access-Control-Allow-Origin", Value: "https://example.test"},
+		{Name: "Access-Control-Allow-Credentials", Value: "true"},
+		{Name: "Access-Control-Allow-Methods", Value: "GET, POST, OPTIONS"},
+		{Name: "Access-Control-Allow-Headers", Value: "x-foo, x-bar"},
+		{Name: "Access-Control-Max-Age", Value: "600"},
+		{Name: "Access-Control-Expose-Headers", Value: "x-baz"},
 	}
-	for _, h := range wantOrder {
-		if v := term.encodeHeaders.Get(h); v == "" {
-			t.Errorf("missing CORS header %q in preflight response (got headers=%v)", h, term.encodeHeaders)
+	// Filter the carrier down to entries whose canonical name is in the
+	// §11.2 set, then assert slice equality (name + value, in order).
+	pinSet := make(map[string]bool, len(wantOrder))
+	for _, hf := range wantOrder {
+		pinSet[http.CanonicalHeaderKey(hf.Name)] = true
+	}
+	got := make([]envoyhttp.HeaderField, 0, len(wantOrder))
+	for _, hf := range gotHeaders {
+		if pinSet[http.CanonicalHeaderKey(hf.Name)] {
+			got = append(got, envoyhttp.HeaderField{
+				Name:  http.CanonicalHeaderKey(hf.Name),
+				Value: hf.Value,
+			})
 		}
 	}
-	if got := term.encodeHeaders.Get("Access-Control-Allow-Origin"); got != "https://example.test" {
-		t.Errorf("Access-Control-Allow-Origin = %q; want https://example.test", got)
+	if len(got) != len(wantOrder) {
+		t.Fatalf("§11.2 header count = %d; want %d. got=%v want=%v", len(got), len(wantOrder), got, wantOrder)
 	}
-	if got := term.encodeHeaders.Get("Access-Control-Allow-Credentials"); got != "true" {
-		t.Errorf("Access-Control-Allow-Credentials = %q; want true", got)
-	}
-	if got := term.encodeHeaders.Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS" {
-		t.Errorf("Access-Control-Allow-Methods = %q", got)
-	}
-	if got := term.encodeHeaders.Get("Access-Control-Allow-Headers"); got != "x-foo, x-bar" {
-		t.Errorf("Access-Control-Allow-Headers = %q", got)
-	}
-	if got := term.encodeHeaders.Get("Access-Control-Max-Age"); got != "600" {
-		t.Errorf("Access-Control-Max-Age = %q", got)
-	}
-	if got := term.encodeHeaders.Get("Access-Control-Expose-Headers"); got != "x-baz" {
-		t.Errorf("Access-Control-Expose-Headers = %q", got)
-	}
-
-	// Body should be empty for a preflight 200.
-	if len(term.encodeBody) != 0 {
-		t.Errorf("preflight body should be empty; got %q", string(term.encodeBody))
+	for i := range wantOrder {
+		if got[i].Name != wantOrder[i].Name || got[i].Value != wantOrder[i].Value {
+			t.Errorf("§11.2 header[%d] = {Name:%q Value:%q}; want {Name:%q Value:%q}",
+				i, got[i].Name, got[i].Value, wantOrder[i].Name, wantOrder[i].Value)
+		}
 	}
 }
 

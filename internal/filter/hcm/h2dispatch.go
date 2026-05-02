@@ -218,7 +218,10 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		lrStatus, lrHeaders, lrBody := chain.LocalReplyResponse()
 		var werr error
 		if lrStatus > 0 {
-			werr = writeH2Reply(sw, lrStatus, lrHeaders, lrBody)
+			// Task 18 review fix: ordered carrier preserves caller insertion
+			// order (e.g. SPEC §11.2 6-header pin from cors.go) on the H2
+			// HEADERS frame. Map iteration in writeH2Reply would lose order.
+			werr = writeH2ReplyOrdered(sw, lrStatus, lrHeaders, lrBody)
 		}
 		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime)
 		if lrStatus > 0 {
@@ -335,6 +338,55 @@ func writeH2Reply(sw h2.StreamWriter, status int, headers http.Header, body []by
 		for _, v := range vs {
 			hf = append(hf, hpack.HeaderField{Name: ln, Value: v})
 		}
+	}
+	endStream := len(body) == 0
+	if err := sw.WriteHeaders(hf, endStream); err != nil {
+		return err
+	}
+	if !endStream {
+		if err := sw.WriteData(body, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeH2ReplyOrdered is the order-preserving sibling of writeH2Reply for the
+// SendLocalReply path (Task 18 review fix). Iterates headers as a slice
+// (filter_http.OrderedHeaders) so caller-supplied insertion order (e.g. SPEC
+// §11.2 verbatim 6-header order from cors.go) survives on the wire.
+//
+// Header emission order:
+//  1. :status pseudo-header (RFC 9113 §8.3 — pseudo-headers must come first).
+//  2. The headers slice in iteration order (lowercased per RFC 9113 §8.1.2).
+//     Content-Length is overridden inline to match len(body).
+//  3. date, server defaults appended if absent in the carrier.
+func writeH2ReplyOrdered(sw h2.StreamWriter, status int, headers filter_http.OrderedHeaders, body []byte) error {
+	hf := []hpack.HeaderField{{Name: ":status", Value: strconv.Itoa(status)}}
+	hasServer := false
+	hasDate := false
+	for _, h := range headers {
+		if h.Name == "" {
+			continue
+		}
+		ln := strings.ToLower(h.Name)
+		val := h.Value
+		if ln == "content-length" {
+			val = strconv.Itoa(len(body))
+		}
+		if ln == "server" {
+			hasServer = true
+		}
+		if ln == "date" {
+			hasDate = true
+		}
+		hf = append(hf, hpack.HeaderField{Name: ln, Value: val})
+	}
+	if !hasServer {
+		hf = append(hf, hpack.HeaderField{Name: "server", Value: serverHeader()})
+	}
+	if !hasDate {
+		hf = append(hf, hpack.HeaderField{Name: "date", Value: dateHeader()})
 	}
 	endStream := len(body) == 0
 	if err := sw.WriteHeaders(hf, endStream); err != nil {

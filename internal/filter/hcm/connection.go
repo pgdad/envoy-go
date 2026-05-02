@@ -268,12 +268,16 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 		bytesSent := int64(len(lrBody))
 		var werr error
 		if lrStatus > 0 {
-			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
+			// Task 18 review fix: SendLocalReply path uses ordered headers so
+			// SPEC §11.2's verbatim 6-header order survives on the wire (the
+			// stdlib http.Header.Write emits keys alphabetically sorted and
+			// would lose the §11.2 order). lrHeaders is filter_http.OrderedHeaders.
+			werr = writeH1ReplyOrdered(bw, lrStatus, lrHeaders, lrBody)
 		}
 		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime)
 		// Honor any user-supplied Connection: close on the local-reply
 		// headers (the 413 overflow path sets this; cors preflight does not).
-		if lrHeaders != nil && strings.EqualFold(lrHeaders.Get("Connection"), "close") {
+		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
 			if werr == nil {
 				werr = errCloseAfterAction
 			}

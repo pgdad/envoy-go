@@ -307,7 +307,7 @@ type localReplyFilter struct {
 	*recordingFilter
 	status  int
 	body    string
-	headers http.Header
+	headers OrderedHeaders
 	// triggerCount permits TestChain_SendLocalReply_FirstCallWins to call
 	// SendLocalReply twice in a row from a single DecodeHeaders. Default 1.
 	triggerCount int
@@ -637,7 +637,9 @@ func TestChain_SendLocalReply_UserContentTypeNonCanonicalKey(t *testing.T) {
 		recordingFilter: aRec,
 		status:          200,
 		body:            "hi",
-		headers:         http.Header{"content-type": []string{"application/json"}},
+		// Non-canonical key "content-type" is the regression probe — beginLocalReply
+		// must canonicalize it via http.Header.Add when building its mutation view.
+		headers: OrderedHeaders{{Name: "content-type", Value: "application/json"}},
 	}
 	hf := []HTTPFilter{
 		{Name: "a", Decoder: aTrigger, Encoder: headerCaptureRecorder{f: aRec, captured: &captured, mu: &capMu}},

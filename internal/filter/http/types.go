@@ -64,6 +64,59 @@ type HTTPFilter struct {
 	Encoder StreamEncoderFilter // nil for decoder-only filters
 }
 
+// HeaderField is one (name, value) header entry for the SendLocalReply path.
+// Pairs with OrderedHeaders below to carry deterministic insertion order from
+// the calling filter through the chain's encode iteration to the wire-write
+// layer (writeH1Reply / writeH2Reply). Per Task 18 review: the unordered
+// http.Header map cannot preserve the SPEC §11.2 verbatim 6-header order on
+// the wire (Go map iteration is non-deterministic; net/http's headers.Write
+// emits alphabetically sorted). HeaderField + OrderedHeaders is the ordered
+// carrier that closes that gap.
+type HeaderField struct {
+	Name  string
+	Value string
+}
+
+// OrderedHeaders is the ordered (name, value) carrier used by SendLocalReply
+// and the local-reply wire-write path. The carrier preserves caller insertion
+// order so reference Envoy's CORS preflight 6-header §11.2 order survives
+// chain encode-iteration and lands on the wire byte-for-byte. Encode-side
+// filters operating on the SendLocalReply path may mutate values via the
+// http.Header view the chain hands them; the chain reconciles mutations back
+// onto the OrderedHeaders carrier after RunEncodeHeaders returns (preserving
+// caller-order for known names; appending net-new keys after the original set).
+//
+// Per Task 18 review: an http.Header carrier loses order on the wire — Go map
+// iteration is non-deterministic and net/http's stdlib Header.Write emits
+// keys alphabetically sorted. OrderedHeaders carries the §11.2 verbatim
+// 6-header order from cors.go through the chain to the wire-write layer.
+type OrderedHeaders []HeaderField
+
+// Get returns the first value for name (case-insensitive comparison via
+// http.CanonicalHeaderKey) or "" if absent. Mirrors http.Header.Get for the
+// ordered carrier.
+func (oh OrderedHeaders) Get(name string) string {
+	canon := http.CanonicalHeaderKey(name)
+	for _, hf := range oh {
+		if http.CanonicalHeaderKey(hf.Name) == canon {
+			return hf.Value
+		}
+	}
+	return ""
+}
+
+// ToHTTPHeader returns an http.Header view of the ordered carrier. Used by
+// the chain to feed encode-side filter EncodeHeaders calls (which still
+// operate on the http.Header API). Mutations on the returned map are
+// reconciled back to the carrier by the chain after iteration completes.
+func (oh OrderedHeaders) ToHTTPHeader() http.Header {
+	h := make(http.Header, len(oh))
+	for _, hf := range oh {
+		h.Add(hf.Name, hf.Value)
+	}
+	return h
+}
+
 // HTTPFilterFactory parses + validates typed_config once at HCM-build time and
 // returns a per-request FilterInstanceFactory closure. Per ADR-0071 two-step
 // factory pattern.
