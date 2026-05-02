@@ -471,3 +471,33 @@ $ grep -n tls_inspector internal/bootstrap/bootstrap.go
 63:	// for SNI-indexed filter chains MUST declare tls_inspector explicitly
 67:	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 ```
+
+## Task 12 — internal/listener/integration_test.go (end-to-end unit test)
+
+**Commits:** TBD — this task's commit
+**Notes:** Added a single `TestIntegration` parent with 5 table-driven subtests exercising the full Task-10 unified pre/post-handshake dispatch path (Manager.Start + acceptLoop + serveConnection) against a real `net.Listen` bound on 127.0.0.1:0 + real `net.DialTimeout` from the test goroutine. Subtests cover the four chain-match decisions called out by PLAN.md Task 12 plus the listener-filter pipeline timeout abort: (i) `match_dstport_only` — `chain_dstport_only` matches the bound port, `chain_srcprefix_only` is `10.0.0.0/8` (loopback dialer no-match) → tag 'D'; (ii) `match_srcprefix_only` — `chain_dstport_only` is `bound_port+1` (no-match), `chain_srcprefix_only` is `127.0.0.1/32` → tag 'S'; (iii) `match_both_dstport_wins` — both chains match; per ADR-0081 priority vector destination_port (slot 0) outranks source_prefix_ranges (slot 6) → tag 'D'; (iv) `match_neither_falls_to_default` — neither specific chain matches, `default_filter_chain` wins → tag 'X'; (v) `listener_filters_timeout_abort` — single chain + 1s lfTimeout + slow listener filter that blocks 2s + continue=false → conn closed by the listener (Read returns EOF/non-nil err, no tag delivered). Each subtest probe-listens on `127.0.0.1:0` to learn the OS-assigned port, then re-binds the Manager on the same port (race-free because the kernel won't recycle the 4-tuple in the µs gap). Three new helpers local to `integration_test.go`: `mkChainsListener` (2-chain + default-chain listener constructor), `threeClusterMgr` (3-cluster cousin of manager_test.go's `twoClusterMgr`), `mkStaticCluster` (factored from threeClusterMgr to keep it small). Reuses existing manager_test.go helpers `startTaggedBackend`, `readByteWithTimeout`, `mkTcpProxyFilter`, `mkBoot`, `testHTTPRegistry`, `installSlowListenerFilter` (all in same package, no exports needed). The TLS+SNI dispatch dimension is already covered by `TestUnifiedDispatchTLSWithSNI` (Task 10) so this file focuses on the plaintext + listener-filter-timeout matrix per the PLAN line 2287 enumeration. All 5 subtests PASS under `-race`; aggregate runtime ~1s.
+
+**Outputs:**
+```
+$ go vet ./internal/listener/...
+$ golangci-lint run ./internal/listener/...
+$ go test -race ./internal/listener/... -run TestIntegration -v
+=== RUN   TestIntegration
+=== RUN   TestIntegration/match_dstport_only
+=== RUN   TestIntegration/match_srcprefix_only
+=== RUN   TestIntegration/match_both_dstport_wins
+=== RUN   TestIntegration/match_neither_falls_to_default
+=== RUN   TestIntegration/listener_filters_timeout_abort
+--- PASS: TestIntegration (1.01s)
+    --- PASS: TestIntegration/match_dstport_only (0.00s)
+    --- PASS: TestIntegration/match_srcprefix_only (0.00s)
+    --- PASS: TestIntegration/match_both_dstport_wins (0.00s)
+    --- PASS: TestIntegration/match_neither_falls_to_default (0.00s)
+    --- PASS: TestIntegration/listener_filters_timeout_abort (1.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener	2.021s
+$ go test -race -short -count=1 ./...
+[every package PASS — full output omitted]
+$ wc -l internal/listener/integration_test.go
+294 internal/listener/integration_test.go
+```
