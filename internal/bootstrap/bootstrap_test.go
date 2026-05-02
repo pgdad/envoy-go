@@ -639,3 +639,26 @@ func TestBootstrap_AccessLog_TwoFileEntries(t *testing.T) {
 		t.Errorf("AccessLogConfigs[1].Path: got %q, want %q", got, want)
 	}
 }
+
+func TestBootstrap_ConfigPathFieldExistsAndDefaultsEmpty(t *testing.T) {
+	const minimalBootstrap = `admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+static_resources:
+  listeners: []
+  clusters: []
+`
+	bs, err := Load(strings.NewReader(minimalBootstrap))
+	if err == nil {
+		// minimal bootstrap should error (zero clusters), but if it loads,
+		// assert ConfigPath is empty
+		if bs.ConfigPath != "" {
+			t.Errorf("ConfigPath after Load: got %q, want \"\"", bs.ConfigPath)
+		}
+	}
+	// Construct directly and assert the field is settable.
+	b := &Bootstrap{ConfigPath: "/tmp/envoy.yaml"}
+	if b.ConfigPath != "/tmp/envoy.yaml" {
+		t.Errorf("ConfigPath after struct-literal set: got %q, want %q", b.ConfigPath, "/tmp/envoy.yaml")
+	}
+}

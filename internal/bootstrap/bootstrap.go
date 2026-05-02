@@ -113,6 +113,13 @@ type Bootstrap struct {
 	// parse time. Other typed_config types (stdout, tcp_grpc, open_telemetry)
 	// are silently ignored per the ADR-0041 amendment.
 	AccessLogConfigs []AccessLogConfig
+	// ConfigPath is the file path the bootstrap was loaded from. Set by the
+	// caller (cmd/envoy-go/main.go) post-Load via bs.ConfigPath = *cfgPath;
+	// Load itself leaves this empty (the bootstrap.Load API takes an io.Reader,
+	// not a file path, by ADR-0001 design). Phase 08.1's /server_info admin
+	// handler reads this for the command_line_options.config_path field.
+	// Test code that does not exercise /server_info may leave this field empty.
+	ConfigPath string
 }
 
 // Load parses r as YAML (upstream Envoy's YAML shape), converts to JSON, and
