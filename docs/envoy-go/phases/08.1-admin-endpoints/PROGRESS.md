@@ -368,3 +368,61 @@ cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
 $ grep -nE 'func \(s \*Server\) handleListeners' internal/admin/admin.go internal/admin/listeners.go
 internal/admin/listeners.go:26:func (s *Server) handleListeners(w http.ResponseWriter, _ *http.Request) {
 ```
+
+## Task 9 — `internal/admin/serverinfo.go` — `/server_info` handler + ADR-0088
+
+**Commits:** `7b080e0` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-7. Step 1 wrote `internal/admin/serverinfo_test.go` with the six tests verbatim from PLAN Step 1: `TestHandleServerInfo_HTTPSmoke200JSON` (200 + `application/json` Content-Type + body parses as JSON + carries all seven required top-level fields `version`, `state`, `uptime_current_epoch`, `uptime_all_epochs`, `node`, `command_line_options`, `hot_restart_version`), `TestHandleServerInfo_StatePostMarkReady` (post-`MarkReady()` body contains `"state": "LIVE"`), `TestHandleServerInfo_StatePreMarkReady` (no-MarkReady body contains `"state": "PRE_INITIALIZING"`), `TestHandleServerInfo_UptimeMonotonic` (defensive — both bodies parse + carry `uptime_current_epoch`; sub-second values may both round to `"0s"` so monotonicity is asserted as "trivially ≥" per PLAN's note), `TestHandleServerInfo_CommandLineOptionsConfigPath` (`mustMinimalBs` sets `bs.ConfigPath = "/test/envoy-go.yaml"`, body contains `"config_path": "/test/envoy-go.yaml"`), `TestHandleServerInfo_HotRestartVersionDisabled` (literal `"hot_restart_version": "disabled"`). Step 2 confirmed all 6 fail against the placeholder (501 status; missing JSON shape; placeholder text body `server_info: not yet implemented`). Step 3 created `internal/admin/serverinfo.go` (53 LoC) with three functions: `handleServerInfo` (handler — calls `buildServerInfo`, marshals via the reused `configDumpMarshalOptions` from configdump.go, writes `application/json` + 200 + body; defensive 500 + `{}` on marshal error), `buildServerInfo` (assembles `*adminv3.ServerInfo` from the Server's threaded fields — `Version = BuildVersionString()`, `State = deriveState(&s.ready)`, `UptimeCurrentEpoch = UptimeAllEpochs = durationpb.New(time.Since(s.bootTime))` (same value, single epoch — no hot-restart), `HotRestartVersion = "disabled"`, `CommandLineOptions = &adminv3.CommandLineOptions{ConfigPath: s.bs.ConfigPath}` (partial — other fields zero-valued via `EmitUnpopulated: true`), `Node = s.bs.Proto.GetNode()` (proto3-nil-safe); defensive nil-handling for `s.bs == nil`), `deriveState` (returns `adminv3.ServerInfo_LIVE` when `ready.Load()` is true, else `adminv3.ServerInfo_PRE_INITIALIZING` — INITIALIZING unreachable in MVP per ADR-0088, DRAINING is 08.2's deliverable). The `core_v3_Node` placeholder in PLAN Step 3's pseudocode was resolved by importing `corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"` and declaring `var node *corev3.Node` directly. Step 4 deleted the placeholder `func (s *Server) handleServerInfo` (8 LoC) from `internal/admin/admin.go` introduced by Task 5; the mux registration `mux.HandleFunc("/server_info", s.handleServerInfo)` resolves to the real handler in serverinfo.go. After the placeholder deletion `gofmt -w` removed a single trailing blank line; `strconv` remains in use by `handleReady`. `grep -nE 'func \(s \*Server\) handleConfigDump|handleClusters|handleListeners|handleServerInfo' internal/admin/admin.go` returns ZERO matches — all four placeholder handlers from Task 5 are now gone from admin.go (real handlers live in configdump.go, clusters.go, listeners.go, serverinfo.go respectively). Step 5 ran the four verification gates — all clean: `go build ./internal/admin/...` clean, `go test -count=1 ./internal/admin/...` 43 PASS + 1 SKIP (37 from Task 8 + 6 new from Task 9; the IPv6 test from Task 8 still skips on the pre-existing listener.Manager limitation), `go vet ./internal/admin/...` clean, `golangci-lint run ./internal/admin/...` clean. Step 6 appended ADR-0088 to `docs/envoy-go/DECISIONS.md` (Status: Accepted, Date: 2026-05-02, Doctrine: D-3.3 + D-3.5, Lands-in-task: Task 9). The ADR establishes the body-shape contract: protojson over `*adminv3.ServerInfo` reusing `configDumpMarshalOptions` per ADR-0086 consequence (d); state-enum coverage in 08.1 is exactly `LIVE` + `PRE_INITIALIZING` (INITIALIZING unreachable in static-bootstrap-only MVP; DRAINING is 08.2's deliverable, will be added by ADR-0088 amendment); MVP field set is `version` (BuildVersionString per ADR-0086), `state`, `uptime_current_epoch` + `uptime_all_epochs` (single epoch), `hot_restart_version: "disabled"` (literal — envoy-go has no hot-restart per ADR-0001), partial `command_line_options{config_path: bs.ConfigPath}` (other fields zero-valued via `EmitUnpopulated`), `node` from bootstrap proto. Consequences: (a) /server_info equivalence claim is post-MarkReady; (b) `configDumpMarshalOptions` reuse per ADR-0086 (d); (c) 08.2 amends this ADR to add DRAINING; (d) `version`, `uptime_*`, `command_line_options.*` (beyond `config_path`), `hot_restart_version`, `node.user_agent_*` + `node.extensions[]` are §13.2 differential-allow-listed; the `state` field IS byte-equal post-MarkReady. `grep -c '^## ADR-0088:' docs/envoy-go/DECISIONS.md` returns 1. Step 7 committed at `7b080e0`. **IMPORTANT:** `go build ./cmd/envoy-go/...` STILL FAILS with `cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New` — INTENTIONAL per PLAN; Task 10 fixes the call site AND lands the `bs.ConfigPath = *cfgPath` post-Load assignment. Four files modified/created: `internal/admin/serverinfo.go` (created, 53 LoC), `internal/admin/serverinfo_test.go` (created, 145 LoC for the 6 tests), `internal/admin/admin.go` (modified, -8 LoC removing the placeholder handler + 1 trailing-blank-line strip via gofmt), `docs/envoy-go/DECISIONS.md` (modified, +ADR-0088 appended after ADR-0087).
+
+**Outputs:**
+```
+$ go test -count=1 -run TestHandleServerInfo -v ./internal/admin/... 2>&1 | tail -16
+=== RUN   TestHandleServerInfo_HTTPSmoke200JSON
+--- PASS: TestHandleServerInfo_HTTPSmoke200JSON (0.02s)
+=== RUN   TestHandleServerInfo_StatePostMarkReady
+--- PASS: TestHandleServerInfo_StatePostMarkReady (0.02s)
+=== RUN   TestHandleServerInfo_StatePreMarkReady
+--- PASS: TestHandleServerInfo_StatePreMarkReady (0.02s)
+=== RUN   TestHandleServerInfo_UptimeMonotonic
+--- PASS: TestHandleServerInfo_UptimeMonotonic (0.06s)
+=== RUN   TestHandleServerInfo_CommandLineOptionsConfigPath
+--- PASS: TestHandleServerInfo_CommandLineOptionsConfigPath (0.01s)
+=== RUN   TestHandleServerInfo_HotRestartVersionDisabled
+--- PASS: TestHandleServerInfo_HotRestartVersionDisabled (0.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.152s
+
+$ go build ./internal/admin/...
+(clean)
+
+$ go test -count=1 ./internal/admin/... 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/internal/admin	0.374s
+
+$ go vet ./internal/admin/...
+(clean)
+
+$ golangci-lint run ./internal/admin/...
+(clean)
+
+$ go test -v -count=1 ./internal/admin/... 2>&1 | grep -c '^--- PASS:'
+43
+
+$ go test -v -count=1 ./internal/admin/... 2>&1 | grep -c '^--- SKIP:'
+1
+
+$ go build ./cmd/envoy-go/... 2>&1
+# github.com/esalaine/envoy-go/cmd/envoy-go
+cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
+	have (string, *stats.Registry)
+	want (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager)
+(EXPECTED FAIL — Task 10 fixes the call site)
+
+$ grep -nE 'func \(s \*Server\) handleConfigDump|handleClusters|handleListeners|handleServerInfo' internal/admin/admin.go
+(no matches — all four placeholder handlers from Task 5 are now removed; real handlers live in configdump.go, clusters.go, listeners.go, serverinfo.go)
+
+$ grep -nE 'func \(s \*Server\) handleServerInfo' internal/admin/serverinfo.go
+internal/admin/serverinfo.go:21:func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
+
+$ grep -c '^## ADR-0088:' docs/envoy-go/DECISIONS.md
+1
+```
