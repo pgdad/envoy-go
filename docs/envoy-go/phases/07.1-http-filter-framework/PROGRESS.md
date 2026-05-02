@@ -1547,7 +1547,7 @@ ok  	github.com/esalaine/envoy-go/test/differential	20.849s
 
 ## Task 19 — envoygotest probe filter [bundled with Task 18 prerequisite I-3]
 
-**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+**Commits:** 3dd7e12 (code) → TBD (PROGRESS SHA-fill).
 **Notes:** Single bundled commit per task brief option (ii) — both Piece A (Task 18 deferred I-3 prerequisite: `ActionResponse.Headers http.Header → OrderedHeaders` + dual-write-helper collapse) and Piece B (Task 19 `envoygotest` probe filter) co-resident in the same task surface. PROGRESS entry covers both pieces.
 
 ### Piece A — Task 18 prerequisite I-3 close-out: ActionResponse.Headers → OrderedHeaders
