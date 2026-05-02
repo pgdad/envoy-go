@@ -49,6 +49,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	// Phase 08.1 (Task 2 + planner-time decision 9): record the config-file
+	// path on the bootstrap so /server_info can emit it under
+	// command_line_options.config_path. The field is plumbed-from-flag rather
+	// than parsed-from-bootstrap because Envoy v3 Bootstrap has no
+	// config_path field — it's a CLI argument the operator passed.
+	bs.ConfigPath = *cfgPath
 
 	adminHost, adminPort, err := bootstrap.AdminSocket(bs.Proto)
 	if err != nil {
@@ -79,12 +85,6 @@ func main() {
 			_ = s.Close()
 		}
 	}()
-
-	admSrv := admin.New(adminAddr, bs.Stats)
-	if _, err := admSrv.Start(); err != nil {
-		log.Fatalf("admin start %s: %v", adminAddr, err)
-	}
-	defer func() { _ = admSrv.Close() }()
 
 	// Phase 07.1 Task 20 boot wiring: build the *filter_http.HTTPRegistry and
 	// register the three filter factories envoy-go ships at 07.1 — router
@@ -123,6 +123,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}
+
+	// Phase 08.1: admin.New is constructed AFTER cm + lm so the four new
+	// read-only operator-introspection endpoints (/config_dump, /clusters,
+	// /listeners, /server_info per ADR-0085) can read live cluster +
+	// listener state. The constructor must be called before bs.Stats.Freeze()
+	// because admin allocates the server.live gauge at New time (SPEC §5.4 +
+	// §12 #3). Defers are LIFO; the order here is:
+	//   1. defer sinks-close (above) — flushes access logs last
+	//   2. defer admSrv.Close() — closes admin first, before sinks
+	//   3. defer lm.Stop()        — shuts listeners after admin
+	// 08.1 SPEC does not mandate a strict ordering across these resources;
+	// the move from pre-lm to post-lm is the LBP-1 cost (cluster + listener
+	// must exist before admin can introspect them).
+	admSrv := admin.New(adminAddr, bs.Stats, bs, cm, lm)
+	if _, err := admSrv.Start(); err != nil {
+		log.Fatalf("admin start %s: %v", adminAddr, err)
+	}
+	defer func() { _ = admSrv.Close() }()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

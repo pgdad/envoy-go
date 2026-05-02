@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -787,5 +788,139 @@ static_resources:
 	}
 	if resp.ProtoMajor != 2 {
 		t.Errorf("ProtoMajor = %d, want 2 (HTTP/2)", resp.ProtoMajor)
+	}
+}
+
+// TestMain_FourNewAdminEndpointsRespond200 is the phase-08.1 (Task 10)
+// boot-wiring smoke test for the four new read-only operator-introspection
+// endpoints landed in 08.1 per SPEC §1: /config_dump, /clusters, /listeners,
+// /server_info (ADR-0085 records the constructor-widening; ADRs 0086-0088
+// record the per-endpoint shapes). Boots the binary on a representative
+// HCM-with-router bootstrap, waits for the ready sentinel, then GETs each of
+// the four endpoints from the admin port and asserts:
+//
+//   - status code 200 (200 OK contract per SPEC §5.4)
+//   - body is non-empty (admin renders a real payload, not a stub)
+//   - /config_dump body parses as JSON (SPEC §5.4.1: emits an
+//     envoy.admin.v3.ConfigDump protojson document, NOT a YAML round-trip)
+//   - /server_info body parses as JSON (SPEC §5.4.4: ServerInfo protojson)
+//
+// The /clusters and /listeners endpoints emit text/plain by 08.1 contract
+// (the admin formats are operator-friendly text — JSON variants land later);
+// they're asserted only on status + non-empty body. End-to-end shape
+// assertions live in differential fixture 0009 (Task 14) and the in-package
+// admin tests (Task 11).
+//
+// Pre-Task-10 main.go's admin.New(addr, bs.Stats) call had only 2 args while
+// the constructor (Task 5) widened to 5: this test does NOT compile against
+// the broken main.go (the binary build at the top of the test fails with
+// "not enough arguments in call to admin.New"). Post-Task-10 wiring it
+// passes. Verifies SPEC §4.2 boot wiring + SPEC §1 endpoint set.
+func TestMain_FourNewAdminEndpointsRespond200(t *testing.T) {
+	listenerPort := freeTCPPort(t)
+	adminPort := freeTCPPort(t)
+
+	bin := buildBinaryOrSkip(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "envoy-go.yaml")
+	cfg := fmt.Sprintf(`
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+`, adminPort, listenerPort)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+
+	_ = waitForReadySentinels(t, stdout, []string{"l_http"}, 15*time.Second)
+
+	adminAddr := fmt.Sprintf("127.0.0.1:%d", adminPort)
+	endpoints := []struct {
+		path     string
+		wantJSON bool
+	}{
+		{"/config_dump", true},
+		{"/clusters", false},
+		{"/listeners", false},
+		{"/server_info", true},
+	}
+	for _, ep := range endpoints {
+		ep := ep
+		t.Run(ep.path, func(t *testing.T) {
+			resp, err := http.Get("http://" + adminAddr + ep.path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", ep.path, err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("status = %d, want 200", resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if len(body) == 0 {
+				t.Errorf("empty body for %s", ep.path)
+			}
+			if ep.wantJSON {
+				var generic map[string]interface{}
+				if err := json.Unmarshal(body, &generic); err != nil {
+					t.Errorf("body for %s is not valid JSON: %v\n--- body ---\n%s", ep.path, err, body)
+				}
+			}
+		})
 	}
 }
