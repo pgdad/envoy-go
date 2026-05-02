@@ -266,3 +266,54 @@ $ grep -c '^## ADR-0086:' docs/envoy-go/DECISIONS.md
 ```
 
 **Follow-up — T6 review:** Tightened `TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent` per code-review I-1 (depth-1 field anchors 1-space indent — replaced loose `\n ` substring check with `\n "configs"` substring which only matches under `Indent: " "`; under any wider indent the depth-1 field would carry N+ spaces and silently miss) and I-2 (`"node":\s+null` regex anchors `EmitUnpopulated: true` — the §7.3 fixture's bootstrap has no `node` field so under `EmitUnpopulated: true` the marshaler emits `"node": null` and under `EmitUnpopulated: false` would elide the field entirely; regex tolerates protojson's deliberate post-colon-spacing randomization which alternates between 1 and 2 spaces per Marshal call). Added `regexp` import; no other code touched. `go test -count=1 -run TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent ./internal/admin/... -v` PASS (10/10 in stress run); `go test -count=1 ./internal/admin/...` 26 PASS; `go vet`/`golangci-lint` clean. Commit `7b938fc`.
+
+## Task 7 — `internal/admin/clusters.go` — `/clusters` handler [ADR-0087]
+
+**Commits:** `2022e68` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-7. Step 1 wrote `internal/admin/clusters_test.go` with seven tests covering the SPEC §11.2 + ADR-0087 contract: `TestHandleClusters_HTTPSmoke200Text` (200 + `text/plain; charset=UTF-8` Content-Type + non-empty body), `TestHandleClusters_TenClusterLevelLinesPerCluster` (exact 46-line count for the §7.3 fixture: 10 cluster-level + 2×18 per-endpoint), `TestHandleClusters_ClusterLevelLineFormat` (verifies all 10 §11.2(b) cluster-level lines present in exact verbatim form: `observability_name`, the 4 `default_priority::*` + 4 `high_priority::*` circuit-breaker constants, `added_via_api::false`), `TestHandleClusters_PerEndpointLinesAllZeroPlusConstants` (verifies the 8 cx_/rq_ counter lines emit literal `0` per planner-time decision 8, plus the 10 §11.2(c) per-endpoint constant lines: `hostname::` empty, `health_flags::healthy`, `weight::1`, `region/zone/sub_zone` empty, `canary::false`, `priority::0`, `success_rate::-1`, `local_origin_success_rate::-1`), `TestHandleClusters_BodyExactByteLayout` (full 46-line byte-equal assertion against the §11.2-pinned line set with cx_/rq_ counters as `0`), `TestHandleClusters_EndpointDeclarationOrderPreserved` (asserts `127.0.0.1:18001` block precedes `127.0.0.1:18002` per bootstrap-declared order — NOT alphabetical / address-sorted), `TestHandleClusters_NilManagerEmitsEmptyBody` (defensive nil-cm path emits 200 + empty body rather than panicking, supporting the ADR-0085 nil-tolerated test convention). The PLAN-suggested `TestHandleClusters_AlphabeticalByClusterName` was omitted (PLAN explicitly notes it requires a `mustParseBs(yaml)` helper that does not yet exist; the alphabetical sort is covered by Task 3's `TestManager_Clusters_SnapshotReturnsAllClusters` per the PLAN's own note). Step 2 confirmed the 7 tests fail against the placeholder (501 status; missing line content; nil-cm path returns 501 not 200). Step 3 created `internal/admin/clusters.go` (97 LoC) with three functions: `(s *Server) handleClusters(w, r)` walks `s.cm.Clusters()` and accumulates the per-cluster blocks into a `bytes.Buffer`, then emits `text/plain; charset=UTF-8` headers + 200 + body; `writeClusterBlock(buf, c)` orchestrates the 10 cluster-level + 18 per-endpoint emission for one cluster; `writeClusterLevelLines(buf, name)` and `writeEndpointLines(buf, clusterName, addr)` each emit their respective verbatim §11.2 line sets via `fmt.Fprintf`. The handler accepts `*cluster.ClusterInfo` directly (no interface indirection — the PLAN-suggested `clusterInfoLike`/`endpointInfoLike` interface adapters were skipped per the PLAN's "simpler is to reference cluster.ClusterInfo / cluster.EndpointInfo directly" note; the helpers are package-private and unit-testable through the public handler entry point with zero adapter overhead). The 8 cx_/rq_ counter values emit literal `"0"` per planner-time decision 8 + ADR-0063 per-endpoint stats deferral; the 10 cluster-level constants (`1024`, `3`, `false`) and 10 per-endpoint constants (`healthy`, `1`, empty, `false`, `0`, `-1`) are emitted unconditionally. The nil-cm guard `if s.cm != nil` wraps the cluster iteration; under nil-cm the buffer stays empty and the handler still emits 200 + empty body. Step 4 deleted the placeholder `func (s *Server) handleClusters` block (10 LoC) from `internal/admin/admin.go` introduced by Task 5; the mux registration `mux.HandleFunc("/clusters", s.handleClusters)` resolves to the real handler in clusters.go. `grep -nE 'func \(s \*Server\) handleClusters' internal/admin/admin.go internal/admin/clusters.go` returns exactly 1 match (clusters.go line 26). Step 5 ran the four verification gates — all clean: `go build ./internal/admin/...` clean, `go test -count=1 ./internal/admin/...` 33 PASS (26 from Task 6 + 7 new), `go vet ./internal/admin/...` clean, `golangci-lint run ./internal/admin/...` clean (after one minor lint fix: `localise` was misspell-flagged, replaced with `localize` to match US-spelling project convention). Step 6 appended ADR-0087 to `docs/envoy-go/DECISIONS.md` (one match for `^## ADR-0087:`); Status Accepted; Date 2026-05-02; Doctrine D-3.3 + D-3.5; Lands-in-task Task 7 (covers BOTH `/clusters` here and `/listeners` in Task 8 — Task 8 references this ADR rather than introducing a new one); Context paragraph anchors SPEC §11.2 + §11.3 verbatim Envoy v1.37.2 scrape pin + the planner-time decision 8 cx_/rq_ counter `0`-emission rationale + ADR-0063 cross-reference + the bind-address-via-`Listener.GetAddress()` clause for `/listeners`; Decision paragraph documents the text/plain Content-Type + the exact 28-line per-cluster layout (10 cluster-level + 18 per-endpoint) + the per-endpoint constants list + the §11.3 one-line-per-listener form for `/listeners`; six Alternatives (counter-from-cluster-totals, live-per-endpoint stats, JSON form, skip-non-modeled lines, listener-extension fields, listener-bind-via-runtime-state) all rejected with reasons; five Consequences (a)-(e) covering: (a) `/clusters` byte-equality modulo §13.2 8-cx_/rq_-fields-per-endpoint allow-list; (b) `/listeners` byte-equality + framing dechunk handled by harness; (c) ADR-0063 reaffirmed + future per-endpoint-stats supersedes planner-time decision 8 (line layout unchanged; 8 emitted values become live readings); (d) `/listeners` stays trivial (one-line-per-listener; 08.2 may surface drain-state field as additive extension); (e) shared ADR rationale (the two text-format endpoints' decisions are tightly coupled — same Content-Type, same line terminator, same alphabetical-by-name ordering, same accessor-walk pattern, both omit JSON form per ADR-0089 — so consolidation per ADR-0004's anti-fragmentation guidance). Step 7 commit landed at `2022e68`. **IMPORTANT:** `go build ./cmd/envoy-go/...` STILL FAILS at this commit with `cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New` — INTENTIONAL per PLAN; Task 10 fixes the call site. Four files modified/created: `internal/admin/clusters.go` (created, 97 LoC), `internal/admin/clusters_test.go` (created, 308 LoC for the 7 tests), `internal/admin/admin.go` (modified, -10 LoC removing the placeholder handler), `docs/envoy-go/DECISIONS.md` (appended ADR-0087, +59 LoC).
+
+**Outputs:**
+```
+$ go test -count=1 -run TestHandleClusters -v ./internal/admin/... 2>&1 | tail -16
+=== RUN   TestHandleClusters_HTTPSmoke200Text
+--- PASS: TestHandleClusters_HTTPSmoke200Text (0.01s)
+=== RUN   TestHandleClusters_TenClusterLevelLinesPerCluster
+--- PASS: TestHandleClusters_TenClusterLevelLinesPerCluster (0.01s)
+=== RUN   TestHandleClusters_ClusterLevelLineFormat
+--- PASS: TestHandleClusters_ClusterLevelLineFormat (0.01s)
+=== RUN   TestHandleClusters_PerEndpointLinesAllZeroPlusConstants
+--- PASS: TestHandleClusters_PerEndpointLinesAllZeroPlusConstants (0.01s)
+=== RUN   TestHandleClusters_BodyExactByteLayout
+--- PASS: TestHandleClusters_BodyExactByteLayout (0.01s)
+=== RUN   TestHandleClusters_EndpointDeclarationOrderPreserved
+--- PASS: TestHandleClusters_EndpointDeclarationOrderPreserved (0.01s)
+=== RUN   TestHandleClusters_NilManagerEmitsEmptyBody
+--- PASS: TestHandleClusters_NilManagerEmitsEmptyBody (0.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.082s
+
+$ go build ./internal/admin/...
+(clean)
+
+$ go test -count=1 ./internal/admin/... 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/internal/admin	0.154s
+
+$ go vet ./internal/admin/...
+(clean)
+
+$ golangci-lint run ./internal/admin/...
+(clean)
+
+$ go build ./cmd/envoy-go/... 2>&1
+# github.com/esalaine/envoy-go/cmd/envoy-go
+cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
+	have (string, *stats.Registry)
+	want (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager)
+(EXPECTED FAIL — Task 10 fixes the call site)
+
+$ grep -nE 'func \(s \*Server\) handleClusters' internal/admin/admin.go internal/admin/clusters.go
+internal/admin/clusters.go:26:func (s *Server) handleClusters(w http.ResponseWriter, _ *http.Request) {
+
+$ grep -c '^## ADR-0087:' docs/envoy-go/DECISIONS.md
+1
+```
