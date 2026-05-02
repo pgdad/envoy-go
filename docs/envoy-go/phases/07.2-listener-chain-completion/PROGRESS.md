@@ -188,3 +188,29 @@ $ golangci-lint run ./internal/listener/listenerfilter/...
 ```
 
 **Follow-up commit (review-driven fix):** Code-quality reviewer flagged a SPEC §5.5/§7.3 violation in the original `breakTie` cascade order: PrefixRanges → SourcePrefixRanges → ServerNames was PLAN-verbatim but contradicted the SPEC's "walk down the priority list" rule (§5.5 line 519, §7.3 line 524). The cascade now follows priority order: PrefixRanges (slot 1) → ServerNames (slot 2) → SourcePrefixRanges (slot 6). Added 4 new tests: TestSelectChainBreakTieFollowsPriorityOrder (the multi-dim counter-example), TestSelectChainAmbiguousReturnsError (covers ErrAmbiguousChainMatch — an acceptance criterion missing from the original test set), TestSelectChainTransportProtocol + TestSelectChainSourcePorts (cover the two priority dimensions previously not exercised). Per ADR-0017 (small-mechanical-fixes do not require ADRs), no new ADR — the fix aligns code with SPEC §5.5/§7.3 and ADR-0081's documented priority-ordered tie-break rule.
+
+## Task 6 — internal/listener/listenerfilter/fuzz_test.go (10th fuzzer)
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/listener/listenerfilter/fuzz_test.go` (~75 LoC) introducing `FuzzFilterChainMatch` — the 10th fuzzer overall in the repo (prior 9: `FuzzAccessLogFormat`, `FuzzBootstrapLoad`, `FuzzFilterChainParse`, `FuzzHCMConfigParse`, `FuzzFrameStream`, `FuzzHPACKDecode`, `FuzzTcpProxyFilter`, `FuzzPromTextFormat`, `FuzzTLSContextParse`). Verbatim PLAN Step 1 source: 4 seed-corpus entries (§11.3-shape inputs `(8080, 0, "127.0.0.1", "")`; non-loopback `(0, 54321, "10.0.0.1", "foo.test")`; IPv6 loopback `(443, 0, "::1", "")`; wildcard SNI `(80, 12345, "192.168.1.1", "*")`); 4 assertions per SPEC §15.6 — (i) `SelectChain` never panics; (ii) returned chain is one of input chains OR `defaultChain` OR `(nil, ErrNoChainMatched)` / `(nil, ErrAmbiguousChainMatch)`; (iii) returned chain's match dimensions are all satisfied by the inputs (re-runs `matches`); (iv) deterministic on identical inputs (running twice yields the same result). The fuzz body builds a varied chain set covering the 8 priority dimensions: chain `a` with `DestinationPort: 8080`, chain `b` with `SourcePrefixRanges: 127.0.0.0/8`, chain `c` with `ServerNames: ["foo.test", "*.bar.test"]`, chain `d` with `Empty: true`, plus a `def` default chain. Local helper `mustCIDR(s)` panics on parse error; this is intentionally distinct from `chainmatch_test.go`'s `cidr(s)` helper which returns nil on error — both coexist in the same package because `mustCIDR` is fuzz-test seed-construction (must surface parse errors loudly) while `cidr` is unit-test inline literal (must be tolerant of typos at write time). Ran the 30s ADR-0018 short-budget locally: 17,175,377 executions at ~576k execs/sec, 76 interesting inputs discovered, 0 counterexamples — clean. Seed corpus runs as normal `go test` cases (the 4 `f.Add` entries become test inputs under `go test -run=FuzzFilterChainMatch`); all PASS. CI will replay the seed corpus per ADR-0018 (short-budget = 30s in CI, deterministic seed-corpus replay always). Pristine state confirmed: `go vet` clean, `golangci-lint run` clean, `go test -race -count=1 ./internal/listener/listenerfilter/...` PASS.
+**Outputs:**
+```
+$ go test -fuzz=FuzzFilterChainMatch -fuzztime=30s ./internal/listener/listenerfilter/ 2>&1 | tail -10
+fuzz: elapsed: 9s, execs: 5075793 (587034/sec), new interesting: 71 (total: 75)
+fuzz: elapsed: 12s, execs: 6795521 (573201/sec), new interesting: 71 (total: 75)
+fuzz: elapsed: 15s, execs: 8541202 (581917/sec), new interesting: 71 (total: 75)
+fuzz: elapsed: 18s, execs: 10283306 (580511/sec), new interesting: 72 (total: 76)
+fuzz: elapsed: 21s, execs: 12013519 (576707/sec), new interesting: 72 (total: 76)
+fuzz: elapsed: 24s, execs: 13706085 (564403/sec), new interesting: 72 (total: 76)
+fuzz: elapsed: 27s, execs: 15446634 (580175/sec), new interesting: 72 (total: 76)
+fuzz: elapsed: 30s, execs: 17175377 (576264/sec), new interesting: 72 (total: 76)
+fuzz: elapsed: 30s, execs: 17175377 (0/sec), new interesting: 72 (total: 76)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	30.176s
+$ go test -count=1 ./internal/listener/listenerfilter/...
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.042s
+$ go test -race -count=1 ./internal/listener/listenerfilter/...
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.049s
+$ go vet ./internal/listener/listenerfilter/...
+$ golangci-lint run ./internal/listener/listenerfilter/...
+```
