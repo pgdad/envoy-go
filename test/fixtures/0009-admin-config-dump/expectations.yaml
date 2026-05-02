@@ -5,57 +5,86 @@
 # canonicalisation + the runner's CompareBytes pass on the canonicalised
 # scrape results.
 #
-# Asserted equivalence (per SPEC §7.1 + ADR-0086 + ADR-0087 + ADR-0088,
-# refined per planner-time decision 8 in PLAN §"Planner-time deferred-
-# decision resolution"):
+# Asserted equivalence (per SPEC §7.1 (refined per Task 14 iter-2 to
+# structural-projection assertion shape per ADR-0086 EmitUnpopulated:true
+# consequence) + ADR-0086 + ADR-0087 + ADR-0088, refined per planner-time
+# decision 8 in PLAN §"Planner-time deferred-decision resolution"):
 #
-#   /config_dump (per ADR-0086):
-#     - body parsed as JSON; recursively compared with allow-list applied.
-#     - allow-listed JSON paths (zeroed on BOTH sides before comparison):
-#       - bootstrap.node.user_agent_name
-#       - bootstrap.node.user_agent_build_version (entire subtree)
-#       - bootstrap.node.extensions[]
-#       - configs[*].bootstrap.last_updated  (timestamps differ trivially)
-#       - configs[*].listeners.last_updated (likewise)
-#       - configs[*].clusters.last_updated  (likewise)
-#     - asserted: three sub-envelopes in order (BootstrapConfigDump,
-#       ListenersConfigDump, ClustersConfigDump); version_info: "static" on
-#       both static envelopes; static_listeners[] populated with one entry
-#       (l_main); static_clusters[] populated with one entry (c_backend with
-#       2 endpoints).
+# The four per-endpoint canonicalisers in driver/driver.go each project
+# the body down to a narrow assertion shape rather than apply per-field
+# allow-listing to the full body. The projection captures the load-
+# bearing equivalence claim and discards surrounding noise (notably
+# the proto-default enum-string divergences induced by ADR-0086's
+# EmitUnpopulated:true marshal posture across deeply-nested admin/v3
+# proto fields, which would otherwise require ~40 allow-list entries
+# to handle uniformly across /config_dump and /server_info). This is
+# the same correctness discipline used by phase 06.1 for
+# /stats/prometheus (twin-series filter discipline).
 #
-#   /clusters (per ADR-0087, refined by planner-time decision 8):
-#     - body parsed into (cluster, key, value) tuple set.
-#     - 8 per-endpoint cx_*/rq_* counter tuples DROPPED on both sides
-#       before set comparison (planner-time decision 8 — envoy-go emits 0
-#       for all 8; Envoy emits per-endpoint observed values; the gap is
-#       intentional and codified).
-#     - asserted: 10 cluster-level lines per cluster (in §11.2 order);
-#       10 per-endpoint constant lines per endpoint (hostname, health_flags,
-#       weight, region, zone, sub_zone, canary, priority, success_rate,
-#       local_origin_success_rate); cluster ordering (alphabetical-by-name).
+#   /config_dump (per ADR-0086; canonicaliseConfigDump):
+#     - body parsed as JSON; projected to {configs_types, static_listeners,
+#       static_clusters} where configs_types is intersected to the three
+#       envoy-go-emitted envelope types (BootstrapConfigDump,
+#       ListenersConfigDump, ClustersConfigDump) so reference Envoy's
+#       additional envelopes (Routes / Secrets / Endpoints /
+#       ScopedRoutes — all deferred per ADR-0089) are filtered to the
+#       envoy-go-emitted subset.
+#     - projection structurally drops the §13.2 allow-listed paths:
+#       bootstrap.node.user_agent_name, bootstrap.node.user_agent_build_version,
+#       bootstrap.node.extensions[], configs[*].last_updated.
+#     - asserted: three sub-envelopes in order on the configs_types list
+#       (BootstrapConfigDump first, ListenersConfigDump second,
+#       ClustersConfigDump third); static_listeners[] populated with one
+#       entry (l_main); static_clusters[] populated with one entry
+#       (c_backend with 2 endpoints — endpoint count asserted separately
+#       via /clusters per-endpoint lines).
 #
-#   /listeners (per ADR-0087):
-#     - body byte-equal modulo framing dechunk (the runner's existing
-#       dechunk preprocessor — phase-01 inheritance — handles upstream's
-#       transfer-encoding: chunked).
-#     - asserted: one line per listener `<name>::<addr>`; alphabetical
-#       ordering.
+#   /clusters (per ADR-0087, refined by planner-time decision 8;
+#              canonicaliseClusters):
+#     - body parsed into (cluster, key, value) tuple set with two
+#       normalisations:
+#       (i) the 8 per-endpoint cx_*/rq_* counter tuples are DROPPED on
+#           both sides before set comparison (planner-time decision 8 —
+#           envoy-go emits 0 for all 8; Envoy emits per-endpoint observed
+#           values; the gap is intentional and codified);
+#       (ii) the per-endpoint address suffix is STRIPPED from the tuple
+#            key so 127.0.0.1:18001 (subj loopback bind) and
+#            host.docker.internal:18001 (ref bridge resolution) converge
+#            to a single tuple per endpoint key, AND the `hostname` field-
+#            key is dropped on both sides because Envoy's STRICT_DNS
+#            resolution emits `host.docker.internal` while envoy-go's
+#            STATIC bind emits empty.
+#     - per-endpoint key allow-set: hostname (dropped per (ii)),
+#       health_flags, weight, region, zone, sub_zone, canary, priority,
+#       success_rate, local_origin_success_rate.
+#     - cluster-level key allow-set (10): observability_name,
+#       default_priority::max_connections, default_priority::max_pending_requests,
+#       default_priority::max_requests, default_priority::max_retries,
+#       high_priority::max_connections, high_priority::max_pending_requests,
+#       high_priority::max_requests, high_priority::max_retries,
+#       added_via_api.
+#     - asserted: the canonicalised set of (cluster, key, value) tuples
+#       matches across sides; cluster ordering (alphabetical-by-name) is
+#       inherent in the canonicaliser's sort step.
 #
-#   /server_info (per ADR-0088):
-#     - body parsed as JSON; recursively compared with allow-list applied.
-#     - allow-listed JSON paths (zeroed on BOTH sides before comparison):
-#       - version
-#       - uptime_current_epoch
-#       - uptime_all_epochs
-#       - hot_restart_version
-#       - command_line_options.* (entire subtree EXCEPT it would be
-#         reasonable to keep config_path comparison; allow-list it for
-#         simplicity since envoy-go's path is host-side and Envoy's is
-#         container-side)
-#       - node.user_agent_name
-#       - node.user_agent_build_version (entire subtree)
-#       - node.extensions[]
+#   /listeners (per ADR-0087; canonicaliseListeners):
+#     - body parsed line-by-line; the address suffix after the first
+#       `::` is STRIPPED so only the listener name remains per line.
+#       This sheds the cross-side address discrepancy (subj is host-
+#       loopback 127.0.0.1:<ephemeral>; ref is container-internal
+#       0.0.0.0:<refContainerListenerPort>) without requiring a framing-
+#       aware diff (the runner's existing dechunk preprocessor still
+#       handles the upstream transfer-encoding: chunked).
+#     - asserted: name-only line set is byte-equal across sides;
+#       alphabetical ordering inherent in the canonicaliser's sort step.
+#
+#   /server_info (per ADR-0088; canonicaliseServerInfo):
+#     - body parsed as JSON; projected to {state: <enum string>}.
+#     - projection structurally drops the §13.2 allow-listed paths:
+#       version, uptime_current_epoch, uptime_all_epochs,
+#       hot_restart_version, command_line_options.* (entire subtree),
+#       node.user_agent_name, node.user_agent_build_version,
+#       node.extensions[].
 #     - asserted: state field byte-equal ("LIVE" on both sides).
 #
 # Not asserted (allow-listed structurally):

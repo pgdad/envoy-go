@@ -21,6 +21,10 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Timing | Not compared by default; a phase may opt in to latency bounds |
 | HTTP filter chain | Per-request equivalence on cors preflight + actual-request response shapes (status + header set + body) between envoy-go and reference Envoy. Filter iteration order, sendLocalReply encode-chain entry, and 413 overflow shape are verbatim-pinned at the ENVOY_TARGET SHA. Differential covers cors only; `envoy.filters.http.envoy_go_test` excluded (test-only); other filters in the §9 family are future-phase scope. |
 | Listener filters | Per-connection chain-selection equivalence: which `filter_chain` is dispatched is byte-equal across envoy-go and reference Envoy. Verified via per-connection backend-port routing in fixture 0008. Chain-match precedence ordering, `default_filter_chain` fallback semantics, and empty-match-vs-default resolution are verbatim-pinned at the ENVOY_TARGET SHA. Differential covers chain-selection only (which backend each connection is routed to); listener-filter internal byte-level behavior (e.g., tls_inspector parser output) is unit-tested only. |
+| Admin /config_dump | Body byte-equal modulo build/timestamp/uptime allow-list. Three-envelope ordering: Bootstrap, Listeners, Clusters. Allow-list: `bootstrap.node.user_agent_name`, `bootstrap.node.user_agent_build_version`, `bootstrap.node.extensions[]`, `<*ConfigDump>.last_updated` per-field allow-listed. dynamic_* arrays absent in both. (Per phase 08.1 SPEC §13.2.) |
+| Admin /clusters | Tuple-set equality on `(cluster, key, value)` triples. envoy-go emits Envoy's full unconditional 28-line-per-cluster + 18-line-per-endpoint set with default constants for non-modeled fields. Allow-list: hot-path counters `cx_total`, `cx_connect_fail`, `rq_total`, `rq_active`, `rq_error` allow ±1 tolerance. (Per phase 08.1 SPEC §13.2.) |
+| Admin /listeners | Body byte-equal (after framing dechunk). Single line per listener. No allow-list. (Per phase 08.1 SPEC §13.2.) |
+| Admin /server_info | Body byte-equal modulo build/uptime/CLI-flags/node allow-list. The `state` field IS asserted byte-equal. Allow-list: `version`, `uptime_current_epoch`, `uptime_all_epochs`, `command_line_options.*` (subset), `hot_restart_version`, `node.user_agent_*`, `node.extensions[]` per-field allow-listed. (Per phase 08.1 SPEC §13.2.) |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -264,11 +268,21 @@ Timing is not compared by default. A phase may opt in to latency bounds (p50 / p
 
 ---
 
-## Admin API — /ready
+## Admin API
+
+The envoy-go admin server is a single HTTP/1.1 plaintext bind allocated by `internal/admin.Server.Start()` (per phase 01 contract; reused unchanged in 06.1 and 08.1). Six endpoints are registered on the same `*http.ServeMux`: `/ready` (phase 01), `/stats/prometheus` (phase 06.1), `/config_dump`, `/clusters`, `/listeners`, `/server_info` (phase 08.1). 08.2 will register `POST /drain_listeners` and extend `/ready` + `/server_info` for the DRAINING state.
+
+**Framing deviation (all six admin endpoints).** envoy-go's `net/http` server emits `Content-Length` (the body is buffered before write); upstream Envoy v1.37.2 emits `transfer-encoding: chunked`. The differential harness dechunks upstream responses before byte-comparing the body. This deviation was first documented for `/ready` at phase 01 (per ADR-0015 paragraph 3) and extends unchanged to all six endpoints. No allow-list entry; the dechunk is structural.
+
+**Header set (all six admin endpoints, post-framing-normalization).** The lowercase wire-form header set is `content-type`, `cache-control: no-cache, max-age=0`, `x-content-type-options: nosniff`, `date: <IMF-fixdate>`, `server: envoy` (per ADR-0014). All six endpoints emit this set. The differential harness uses the existing case-insensitive header comparator (introduced for phase 01).
+
+**Method discrimination posture (all six admin endpoints).** Upstream Envoy v1.37.2 does NOT enforce method discrimination on the four 08.1 read-only endpoints (POST/PUT/DELETE return 200 with the same body as GET — empirical pin in 08.1 SPEC §11.8). envoy-go matches Envoy parity (no method check; Go stdlib `http.ServeMux` dispatches on path only). 405 enforcement is deferred to a future security-hardening phase.
+
+### /ready
 
 *Introduced by phase 01. Justified by ADR-0015 (pre-init contract) and ADR-0014 (Server header value). Captured evidence: `docs/envoy-go/phases/01-static-bootstrap-config/upstream-ready-observation.md`.*
 
-### Ready-state response (authoritative)
+#### Ready-state response (authoritative)
 
 Upstream Envoy v1.37.2 emits (in wire order, lowercase header names):
 
@@ -285,7 +299,7 @@ The phase-01 envoy-go subject emits byte-exact equivalent headers + body, with O
 
 Header name case: HTTP/1.1 header names are case-insensitive per RFC 7230 §3.2. Upstream emits lowercase (`content-type`); the envoy-go subject emits Go `net/http` canonical case (`Content-Type`). The differential diff (Task 14) compares header names case-insensitively.
 
-### Pre-init response
+#### Pre-init response
 
 Per ADR-0015, the pre-init `/ready` window is not exercised by the phase-01 differential test — `cmd/envoy-go` fires `admin.MarkReady` before printing the harness readiness sentinel, so the harness only observes the ready state. The subject emits a documented-but-test-irrelevant pre-init response:
 
@@ -296,16 +310,64 @@ Per ADR-0015, the pre-init `/ready` window is not exercised by the phase-01 diff
 
 Upstream v1.37.2's actual pre-init bytes were unobservable from the minimal bootstrap used in Task 7 (60 probes across two tight loops captured no non-200 response). A later phase that successfully captures upstream pre-init bytes supersedes this subsection via a new ADR.
 
+### /stats/prometheus
+
+See `## Stat-name mapping` for the body-shape contract (Prometheus text exposition format with the SN1–SN8 flattening rules per ADR-0061). Header set + framing inherit the umbrella rules above.
+
+### /config_dump
+
+**Body shape.** `application/json` via `protojson.MarshalOptions{Multiline: true, Indent: " ", UseProtoNames: true, EmitUnpopulated: true}` over `*adminv3.ConfigDump{Configs: []*anypb.Any{...}}` with three sub-envelopes in this order: `BootstrapConfigDump`, `ListenersConfigDump`, `ClustersConfigDump`. No `dynamic_*` arrays (no xDS).
+
+**Empirical evidence (verbatim Envoy v1.37.2 `/config_dump`, first 50 lines):** see 08.1 SPEC §11.1.
+
+**Equivalence claim.** Body byte-equal to reference Envoy v1.37.2 modulo: `bootstrap.node.user_agent_name`, `bootstrap.node.user_agent_build_version`, `bootstrap.node.extensions[]`, `<*ConfigDump>.last_updated` allow-listed (envoy-go emits empty / partial values; Envoy auto-populates).
+
+### /clusters
+
+**Body shape.** `text/plain; charset=UTF-8`. 10 cluster-level lines + 18 per-endpoint lines per cluster. Cluster ordering: alphabetical by cluster name. Endpoint ordering: bootstrap-declared order. envoy-go emits the same Envoy default constants (`1024`, `3`, `healthy`, empty locality, `false`, `0`, `-1`) for fields it does not model (circuit breakers, active health checking, locality tags, success rate); see 08.1 SPEC §5.3 for the verbatim line set.
+
+**Empirical evidence (verbatim Envoy v1.37.2 `/clusters`):** see 08.1 SPEC §11.2.
+
+**Equivalence claim.** Tuple-set equality on `(cluster_name, key, value)` triples. Hot-path counters `cx_total`, `cx_connect_fail`, `rq_total`, `rq_active`, `rq_error` allow ±1 tolerance (round-robin LB distribution skew across the 5-request §7.3 load).
+
+**M-1 carry-forward note.** Cluster-name validation is a pre-existing M-1 vulnerability identified in 07.2 REVIEW; the `<cluster>::<key>::<value>` separator is not escaped. An embedded `::` in a cluster name would corrupt the format. envoy-go matches Envoy parity (Envoy also does not escape); the M-1 fix-when-it-lands closes both surfaces simultaneously.
+
+### /listeners
+
+**Body shape.** `text/plain; charset=UTF-8`. One line per listener: `<listener_name>::<bind_addr>` where `<bind_addr>` is `host:port`. Listener ordering: alphabetical by listener name. Trailing newline.
+
+**Empirical evidence (verbatim Envoy v1.37.2 `/listeners`):** see 08.1 SPEC §11.3.
+
+**Equivalence claim.** Body byte-equal (after framing dechunk). Single line per listener; no additional fields. The JSON form (`?format=json`) is structurally richer (returns `{"listener_statuses": [...]}`); deferred per ADR-0089.
+
+### /server_info
+
+**Body shape.** `application/json` via the same protojson MarshalOptions as `/config_dump`. Field set populates `version`, `state`, `uptime_current_epoch`, `uptime_all_epochs`, `node` (from bootstrap), partial `command_line_options{config_path}`, `hot_restart_version: "disabled"`. State enum: `LIVE` post-MarkReady, `PRE_INITIALIZING` pre-MarkReady (mathematically complete but unobservable upstream — see SPEC §11.7), `DRAINING` deferred to 08.2, `INITIALIZING` not modeled.
+
+**Empirical evidence (verbatim Envoy v1.37.2 `/server_info`, first 70 lines):** see 08.1 SPEC §11.4.
+
+**Equivalence claim.** Body byte-equal modulo: `version`, `uptime_current_epoch`, `uptime_all_epochs`, `command_line_options.*` (subset on envoy-go side; Envoy emits ~40 fields), `hot_restart_version`, `node.*` (same allow-list as `/config_dump`). The `state` field is byte-equal (`"LIVE"` on both sides).
+
 ### Applies to
 
-- Phase-01 envoy-go `admin` subsystem.
-- Ready-state responses only. Pre-init is documented but not exercised by the phase-01 differential test.
+- phase 08.1 envoy-go admin subsystem.
+- all six endpoints: `/ready`, `/stats/prometheus`, `/config_dump`, `/clusters`, `/listeners`, `/server_info`.
+- ENVOY_TARGET pin v1.37.2 at `sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` (ADR-0008).
 
 ### Does not yet apply to
 
-- HTTP/2 over admin (phase 01 is HTTP/1.1 only).
-- Admin endpoints other than `/ready` (phase 08: `config_dump`, `stats`, `clusters`, `listeners`, `server_info`, drain).
-- Byte-exact framing (`transfer-encoding: chunked` vs `Content-Length: 5`) — documented deviation; phase-02+ follow-up.
+- HTTP/2 over admin (admin stays HTTP/1.1).
+- TLS on admin (admin stays plaintext).
+- DRAINING-state response on `/ready` (08.2).
+- DRAINING value on `/server_info` `state` field (08.2).
+- Mutating endpoints — `POST /drain_listeners` is 08.2; `POST /reset_counters`, `POST /quitquitquit`, `POST /healthcheck/*`, `POST /reopen_logs`, `POST /runtime_modify`, `POST /logging` deferred per ADR-0089.
+- JSON form of `/clusters` and `/listeners` — `?format=json` deferred per ADR-0089.
+- Query-param filtering on `/config_dump` — `?resource=`, `?mask=`, `?include_eds=` deferred per ADR-0089.
+- `RoutesConfigDump`, `SecretsConfigDump`, `ScopedRoutesConfigDump`, `EndpointsConfigDump` envelopes deferred per ADR-0089.
+- Other deferred admin endpoints — `/runtime`, `/certs`, `/memory`, `/heap_dump`, `/cpuprofiler`, `/heapprofiler`, `/contention`, `/logging`, `/listeners/<name>/*`, `/init_dump` deferred per ADR-0089.
+- ACL / authentication on admin port (no-ACL posture per ADR-0090).
+- Method discrimination on read-only endpoints (Envoy parity per SPEC §11.8; 405 enforcement deferred).
+- Path normalization beyond Go stdlib `http.ServeMux` (trailing-slash returns Go stdlib `404 page not found`, NOT Envoy's admin help page; allow-listed for trailing-slash behavior — envoy-go's body diverges from Envoy's body, but the status code matches).
 
 ---
 

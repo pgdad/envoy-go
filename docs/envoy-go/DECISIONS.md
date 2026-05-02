@@ -3446,3 +3446,149 @@ The state-enum coverage in 08.1 is exactly two values: `LIVE` (post-MarkReady) a
 
 (f) The `INITIALIZING` enum value is documented in `adminv3.ServerInfo_State` but unreachable in envoy-go's static-bootstrap-only model. Future xDS-bearing phases (none planned in the current roadmap) would need to revisit this — at which point the state coverage would extend to all four values, and this ADR would be amended (not superseded) accordingly.
 
+## ADR-0089: Admin-endpoint deferral list — canonical enumeration of Envoy admin surface NOT modeled by envoy-go in 08.1 (per ADR-0040 deferral-ADR format)
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.5 (decisions written down). Per-ADR-0040 deferral format.
+**Lands-in-task:** 08.1 PLAN Task 15 (BEHAVIOR_CONTRACT umbrella restructure + this ADR + ADR-0090 + phase-done bundle).
+
+### Context
+
+Phase 08.1 lands four read-only admin endpoints (`/config_dump`, `/clusters`, `/listeners`, `/server_info`) on the existing `internal/admin.Server` mux per the parent BRAINSTORM §1 split (ADR-0084) and the SPEC §2 scope. Phase 08.2 lands `POST /drain_listeners`, the DRAINING transitions on `/ready` + `/server_info`, and the `## Graceful drain` BEHAVIOR_CONTRACT umbrella. Beyond the 08.1 + 08.2 combined surface (six read-only endpoints + one mutating drain endpoint + the DRAINING state extensions), the upstream Envoy v1.37.2 admin surface offers ~30 additional endpoints that envoy-go does NOT model and DOES NOT plan to model in any currently-roadmapped phase. SPEC §2.1 + §2.2 enumerate this deferred surface; the deferral list needs an explicit ADR per ADR-0040's deferral-format precedent so future admin-extensions phases can reference a single canonical list (and append to it, rather than create new per-feature deferral ADRs).
+
+The deferral surface clusters into three families: (a) **mutating endpoints** that envoy-go would have to grow ACL machinery to safely expose (`POST /reset_counters`, `POST /quitquitquit`, `POST /healthcheck/fail`, `POST /healthcheck/ok`, `POST /reopen_logs`, `POST /runtime_modify`, `POST /logging?<level>`); (b) **read-only operator-introspection endpoints** that depend on subsystems envoy-go does not yet model (`/runtime` requires the Runtime layer / RTDS consumer; `/certs` requires SDS or static-cert introspection beyond what TLS-listener parsing exposes; `/memory` + `/heap_dump` + `/cpuprofiler` + `/heapprofiler` + `/contention` require profiling integration beyond `pprof` defaults; `/logging` mirrors `/logging?<level>` on the read side; `/listeners/<name>/*` requires per-listener stat scoping the current admin server does not implement; `/init_dump` requires the xDS init-manager subsystem); (c) **body-shape extensions on the four 08.1 endpoints** that envoy-go does not implement in MVP (`/config_dump?resource=`, `?mask=`, `?include_eds=` query-param filters; `?format=json` form on `/clusters` and `/listeners` returning structurally-richer JSON bodies; the four omitted ConfigDump envelopes — `RoutesConfigDump`, `SecretsConfigDump`, `ScopedRoutesConfigDump`, `EndpointsConfigDump`).
+
+The trailing-slash + path-normalization deviation (Go stdlib `http.ServeMux` returns `404 page not found` on `/clusters/` etc., NOT Envoy's admin-help page) is a fourth category — body-divergent but status-code-equal — that the differential allow-lists structurally rather than carrying as a deferral. This ADR records the disposition for completeness.
+
+### Decision
+
+The complete enumeration of admin-surface deferrals NOT planned for any currently-roadmapped phase (08.1, 08.2, or any feature-family phase 09+) is fixed at this ADR. Each item carries a target phase (or `unscheduled` for items that have no current roadmap row). Future deferrals append to this list rather than create new ADRs unless the deferred item subsequently lands.
+
+**(a) Mutating admin endpoints (security-hardening pre-requisite per ADR-0090):**
+
+| Endpoint | Target phase |
+|---|---|
+| `POST /drain_listeners` | 08.2 (graceful drain) |
+| `POST /reset_counters` | unscheduled (security-hardening pre-requisite) |
+| `POST /quitquitquit` | unscheduled (security-hardening pre-requisite) |
+| `POST /healthcheck/fail` | unscheduled (active health checking family) |
+| `POST /healthcheck/ok` | unscheduled (active health checking family) |
+| `POST /reopen_logs` | unscheduled (operational tooling family) |
+| `POST /runtime_modify` | unscheduled (Runtime layer / RTDS consumer family) |
+| `POST /logging?<level>` | unscheduled (operational tooling family) |
+
+**(b) Read-only admin endpoints (sub-system pre-requisite):**
+
+| Endpoint | Pre-requisite | Target phase |
+|---|---|---|
+| `/runtime` | Runtime layer / RTDS consumer | unscheduled (Runtime + hot restart family) |
+| `/certs` | SDS or static-cert introspection | unscheduled (xDS / dynamic config family) |
+| `/memory` | Profiling integration | unscheduled (operational tooling family) |
+| `/heap_dump` | Profiling integration | unscheduled |
+| `/cpuprofiler` | Profiling integration | unscheduled |
+| `/heapprofiler` | Profiling integration | unscheduled |
+| `/contention` | Profiling integration | unscheduled |
+| `/logging` (read-side) | Operational tooling | unscheduled |
+| `/listeners/<name>/*` | Per-listener stat scoping | unscheduled |
+| `/init_dump` | xDS init-manager | unscheduled (xDS / dynamic config family) |
+
+**(c) Body-shape extensions on the four 08.1 endpoints:**
+
+| Surface | Target phase |
+|---|---|
+| `/config_dump?resource=<name>` query-param filter | unscheduled |
+| `/config_dump?mask=<paths>` field-mask filter | unscheduled |
+| `/config_dump?include_eds=true` xDS endpoint dump | unscheduled (depends on xDS) |
+| `/clusters?format=json` JSON form | unscheduled |
+| `/listeners?format=json` JSON form (returns `{"listener_statuses": [...]}`) | unscheduled |
+| `RoutesConfigDump` envelope on `/config_dump` | unscheduled (depends on RDS or extracted route view) |
+| `SecretsConfigDump` envelope on `/config_dump` | unscheduled (depends on SDS) |
+| `ScopedRoutesConfigDump` envelope on `/config_dump` | unscheduled |
+| `EndpointsConfigDump` envelope on `/config_dump` | unscheduled (depends on EDS) |
+
+**(d) Path-normalization / trailing-slash deviation (NOT deferred — allow-listed structurally):**
+
+Go stdlib `http.ServeMux` does NOT canonicalise trailing-slash URLs (it returns `404 page not found` on `/clusters/`, `/server_info/` etc. with default body bytes, NOT Envoy's admin-help HTML body). The status-code is matched (404 vs 404); the body diverges. The differential harness allow-lists the trailing-slash body divergence structurally (the `0009-admin-config-dump` driver only scrapes the canonical paths). Adopting Envoy's admin-help HTML body would require ~200 LoC of static asset packaging and runtime path-normalization with no operator value at MVP scope. This is recorded for completeness — it is NOT a deferral, it is a documented permitted divergence.
+
+### Alternatives considered
+
+(A) Issue a separate per-feature deferral ADR for each of the ~25 deferred items. Rejected: the SPEC §8 anticipation table already lists this ADR as the canonical deferral list; ADR-0040's precedent (a single deferral ADR per phase rather than per-feature) supports consolidation; future readers benefit from a single grep-discoverable list rather than ~25 separate ADRs.
+
+(B) Defer this ADR to 08.2's phase-done landing (pair it with the closing of the parent ROADMAP row). Rejected: the deferral list is already settled at 08.1 SPEC time; deferring the ADR until 08.2 would leave the BEHAVIOR_CONTRACT `### Does not yet apply to` block referencing an unanchored ADR. The §13 BEHAVIOR_CONTRACT umbrella restructure already cites `ADR-0089` as the deferral-list authority across nine bullet items; the ADR must land at 08.1 phase-done.
+
+(C) Promote any of the deferred items into 08.1 scope. Rejected: the parent BRAINSTORM §10 + SPEC §2 already bound 08.1's scope to four read-only endpoints; widening scope at phase-done time violates the planner-time scope discipline (ADR-0045's split-gate — 08 was split into 08.1 + 08.2 specifically because the combined surface exceeded the gate threshold).
+
+### Consequences
+
+(a) The `BEHAVIOR_CONTRACT.md ## Admin API ### Does not yet apply to` block (per §13.1) cites `ADR-0089` for nine of the ten bullet items (the tenth, no-ACL posture, cites ADR-0090). This is the canonical cross-reference: any future reader investigating "is `/runtime` modeled?" greps `ADR-0089` and finds the deferral disposition with target-phase context.
+
+(b) Future admin-extensions phases (none currently roadmapped) that land any of the deferred items append to this ADR's table (in-place edit per ADR-0052's BEHAVIOR_CONTRACT precedent applied to ADR text), rather than create new per-feature deferral ADRs. The lands-in disposition flips from `unscheduled` to the target phase id; the ADR text records the supersession via "ADR-0089 partially superseded by ADR-0091+" if and when it lands.
+
+(c) The trailing-slash body divergence (item (d)) is a permitted divergence rather than a deferral — the `0009-admin-config-dump` differential driver does not scrape trailing-slash URLs; the divergence is structural (Go stdlib vs Envoy default body) with no operator surface to fix without packaging static HTML assets. This ADR records the disposition so a future security-review or operator-affordances phase can re-open the question with a new ADR if needed.
+
+(d) The mutating-endpoint family (item (a) bullets 2-8) is gated on ADR-0090's no-ACL security posture. Adding any of these endpoints without an ACL would expose envoy-go's process to remote control by any local-network actor; the security-hardening pre-requisite is recorded explicitly in the table. ADR-0090's eventual partial supersession by an ACL-introducing ADR would unblock these endpoints' implementation.
+
+(e) The body-shape extensions on the four 08.1 endpoints (item (c)) are non-breaking forward extensions: adding `?resource=<name>` filtering would extend the existing `/config_dump` handler with a query-param path that returns a subset of the current body; the differential equivalence claim from §13.2 (byte-equal modulo allow-list) extends naturally to the filtered output. This ADR records that the extensions are deferred for scope reasons rather than for any architectural blocker.
+
+(f) The four omitted ConfigDump envelopes (item (c) bullets 6-9) depend on subsystems envoy-go does not model in MVP. `RoutesConfigDump` is the closest to landable (the static route configuration sits in HCM today; extracting a flat view would be ~50 LoC); the other three depend on SDS / xDS-scoped-routes / EDS that are out-of-scope for the MVP-trunk closure (per ADR-0001). This ADR records the disposition so a future routes-introspection ADR can supersede the deferral cleanly.
+
+(g) ADR-0089's status remains `Accepted` even as items flip from `unscheduled` to scheduled; the disposition table is the live record. If the deferral list is fully exhausted (every item lands), the ADR transitions to `Historical` per ADR-0001's status taxonomy.
+
+## ADR-0090: No-ACL admin-endpoint security posture — admin port is plaintext HTTP/1.1 with no authentication, no authorization, no method discrimination on read-only endpoints (operator firewall is the security boundary; mirrors upstream Envoy default)
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.5 (decisions written down).
+**Lands-in-task:** 08.1 PLAN Task 15 (BEHAVIOR_CONTRACT umbrella restructure + ADR-0089 + this ADR + phase-done bundle).
+
+### Context
+
+The envoy-go admin port is allocated by `internal/admin.Server.Start()` per the phase-01 contract (HTTP/1.1, plaintext, single-bind). Phase 06.1 added `/stats/prometheus`; phase 08.1 adds `/config_dump`, `/clusters`, `/listeners`, `/server_info`; phase 08.2 will add `POST /drain_listeners`. Throughout this evolution the admin port has carried no authentication, no ACL, no TLS, and no method discrimination on read-only endpoints — matching upstream Envoy v1.37.2's default admin posture (per BRAINSTORM §2.1 Decision G + SPEC §2.5).
+
+The decision to mirror Envoy's no-ACL default rather than pre-emptively introduce ACL machinery is anchored on three facts: (a) upstream Envoy v1.37.2's empirical scrape (08.1 SPEC §11.8) shows POST/PUT/DELETE on the four read-only endpoints return 200 with the same body as GET — Envoy does NOT enforce method discrimination either; (b) the parent BRAINSTORM §10 commitment to "match Envoy parity at MVP scope; security hardening is a future-phase concern with its own brainstorm" — pre-emptive ACL machinery would diverge from Envoy parity for no operator benefit at MVP; (c) operator deployments universally firewall the admin port at the network boundary (k8s NetworkPolicy, hostNetwork=false + service-IP isolation, on-host iptables) — the security boundary is the operator's network policy, not application-level ACL. envoy-go does not have the request-routing primitives a real ACL would require (no JWT validation, no mTLS client-auth, no IP-list matching beyond what `Listener.address` already provides; the admin server uses the plain `http.ServeMux` from stdlib).
+
+The mutating endpoint family (per ADR-0089 item (a)) — `POST /drain_listeners` (08.2), `POST /reset_counters`, `POST /quitquitquit`, `POST /healthcheck/*`, `POST /reopen_logs`, `POST /runtime_modify`, `POST /logging?<level>` — would be remote-control vectors if exposed to untrusted local-network actors. ADR-0089's deferral table records that these endpoints' landing is gated on this ADR's eventual partial supersession by a security-hardening ADR (ADR-0091+) that introduces an ACL primitive. Until such a phase brainstorms and lands, ADR-0090 is the operative posture: no-ACL, plaintext, operator-firewall-bounded.
+
+### Decision
+
+envoy-go's admin port carries the following security posture for phase 08.1 (and 06.1 + 08.2 by inheritance):
+
+1. **No authentication.** No HTTP Basic, no JWT, no mTLS client-auth, no API token, no client-IP allowlist beyond what `Listener.address` already provides at bind time. Any actor with network reachability to the admin bind can issue any GET request to any endpoint.
+
+2. **No authorization (ACL).** The same permission set applies to all clients: read access to the six read-only endpoints (08.1 + 06.1 + 08.2 GET surface). The 08.2 mutating endpoint (`POST /drain_listeners`) inherits the same posture — no per-method or per-role gating.
+
+3. **No method discrimination on read-only endpoints.** POST / PUT / DELETE / HEAD on the four 08.1 read-only endpoints return 200 with the same body as GET (per 08.1 SPEC §11.8 empirical pin against Envoy v1.37.2). The Go stdlib `http.ServeMux` dispatches on path only; the `internal/admin/*.go` handlers do NOT inspect `r.Method`. This matches Envoy parity.
+
+4. **No TLS on admin.** Admin remains plaintext HTTP/1.1 per the phase-01 contract. TLS termination is a separate `Listener` concern; the admin server is its own bind allocated by `Server.Start()`.
+
+5. **Operator firewall is the security boundary.** The deployed-environment configuration (k8s NetworkPolicy, hostNetwork=false + service-IP isolation, on-host iptables, container-network isolation) is the load-bearing security primitive. envoy-go's documentation (`internal/admin/doc.go` + this ADR + the BEHAVIOR_CONTRACT `## Admin API` umbrella) records the no-ACL posture so operators are not surprised.
+
+6. **Future security-hardening ADR (ADR-0091+) supersedes partially.** A future security-hardening phase (no current roadmap row; the WASM / observability / xDS families are higher priority per ROADMAP §"Feature Families") will brainstorm and land an ACL primitive. The ACL would gate the mutating endpoints from ADR-0089's table and could optionally gate the read-only endpoints. ADR-0091+ partially supersedes ADR-0090 by introducing the gating; the no-ACL default for read-only endpoints may persist as the un-configured baseline (per Envoy's `admin.access_log_path` precedent — opt-in security, not opt-out).
+
+### Alternatives considered
+
+(A) Pre-emptively add an HTTP Basic ACL with operator-supplied credentials at boot. Rejected: diverges from Envoy parity (Envoy does not require credentials by default); doubles the bootstrap surface (a new `Admin.basic_auth` field would need parsing + tests + ADRs); operator deployments universally firewall the admin port already, making credentials redundant in the common case and a config-burden in the uncommon case.
+
+(B) Enforce method discrimination on read-only endpoints (return 405 on POST/PUT/DELETE). Rejected: contradicts the SPEC §11.8 empirical pin against Envoy v1.37.2 (Envoy returns 200 with the GET body on POST/PUT/DELETE for the four read-only endpoints); the differential equivalence claim from §13.2 would fail; operator-tooling (e.g. monitoring scripts that POST as a "tickle" pattern) would silently break.
+
+(C) Add TLS to the admin port (mutual or one-way). Rejected: requires bootstrap-time cert distribution to the admin clients (Prometheus scrapers, operator CLIs); the operational burden exceeds the MVP-scope security benefit; the operator firewall already provides the analogous network-boundary protection; TLS on admin is recorded as a deferred surface in the BEHAVIOR_CONTRACT `### Does not yet apply to` block (per §13.1).
+
+(D) Restrict admin to localhost-bind only (`address: 127.0.0.1`). Rejected: many deployment scenarios (remote stat scraping, sidecar Prometheus, cross-pod operator tooling) require non-loopback bind. The current `Listener.address` field already lets operators choose loopback or public bind per their topology; envoy-go does not over-constrain the choice. The default in the §7.3 fixture and the typical config IS loopback bind (`127.0.0.1`) — but the framework allows public bind when the operator's threat model permits it.
+
+### Consequences
+
+(a) The `BEHAVIOR_CONTRACT.md ## Admin API ### Does not yet apply to` block (per §13.1) cites `ADR-0090` for the no-ACL bullet ("ACL / authentication on admin port (no-ACL posture per ADR-0090)"). The "method discrimination on read-only endpoints (Envoy parity per SPEC §11.8; 405 enforcement deferred)" bullet implicitly inherits this ADR's posture decision — both bullets describe the same security-posture surface.
+
+(b) ADR-0089's mutating-endpoint table (item (a)) is gated on this ADR's eventual partial supersession. The ADR-0089 → ADR-0090 dependency is forward-only: ADR-0089 names the deferred surface; ADR-0090 records why none of them can safely land at MVP scope; ADR-0091+ (hypothetical) would unblock specific endpoints by introducing an ACL primitive.
+
+(c) The operator-firewall-as-security-boundary posture is recorded in `internal/admin/doc.go` package-level prose and in this ADR. Future operator-affordances brainstorms (no current roadmap row) may add CLI flags or bootstrap fields that further constrain admin bind (e.g. `--admin-bind-loopback-only` enforced flag); such changes would be additive and would not require ADR-0090 supersession.
+
+(d) The 08.1 differential fixture `0009-admin-config-dump` exercises the no-ACL posture implicitly — the driver issues unauthenticated GET requests and asserts 200 on the four endpoints. If a future ADR introduces an ACL, the fixture's driver would need to either (i) configure the bootstrap to disable the ACL for the test run, or (ii) issue authenticated requests; the fixture is forward-compatible because the driver already supplies bootstrap files.
+
+(e) ADR-0090 supersedes nothing (no prior ADR has the no-ACL posture explicitly). Implicit precedent in phase 01 (admin server allocated without ACL machinery) and phase 06.1 (`/stats/prometheus` added without ACL machinery) is now retro-anchored to this ADR; the implicit decisions become explicit.
+
+(f) The BOOTSTRAP_PROMPT.md §7.5 phase-done six-gate checklist's gate (f) (BEHAVIOR_CONTRACT populated) checks for both this ADR and the corresponding `### Does not yet apply to` bullets; the cross-reference is grep-discoverable both ways.
+
+(g) A future security-review session (per `superpowers:requesting-code-review` / `security-review` skill) may identify hardenings within the no-ACL posture (e.g. response-body redaction of cluster names that resemble secrets, `/config_dump` field-masking of TLS-context private-key references). Such hardenings extend ADR-0090's posture without superseding it; the no-ACL principle stays intact while specific data-exposure surfaces tighten.
+

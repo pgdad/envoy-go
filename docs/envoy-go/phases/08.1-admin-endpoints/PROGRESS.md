@@ -628,3 +628,112 @@ $ go vet ./... 2>&1
 $ golangci-lint run ./... 2>&1
 (clean)
 ```
+
+## Task 15 — BEHAVIOR_CONTRACT umbrella restructure + ADR-0089 + ADR-0090 + six-gate verification + REVIEW.md + phase-done bundle + STATE/ROADMAP advance
+
+**Goal:** phase-done landing per PLAN §"Task 15". Six-gate verification sweep; BEHAVIOR_CONTRACT.md `## Admin API` umbrella restructure; ADR-0089 (deferral list) + ADR-0090 (no-ACL security posture); ROADMAP row 08.1 `in-progress → done`; STATE.md advance to 08.2 lifecycle-state 0; `internal/admin/doc.go` enumerate six endpoints; REVIEW.md authored per 07.2 shape; T14 review follow-up (a) + (b) (SPEC §7.1 + expectations.yaml prose updates to match the structural-projection assertion shape); phase-done commit per PLAN §9.
+
+**Implementation summary:**
+
+1. **Six-gate verification sweep (Step 1).** All six gates GREEN at HEAD:
+   - Gate (a) — `go build ./... && go vet ./... && golangci-lint run ./...` — all clean.
+   - Gate (b) — `go test -count=1 ./...` and `go test -count=1 -race ./...` — both clean (incl. TestAdminConcurrentScrapeRace 100×4×1s race-detector contract).
+   - Gate (c) — h2spec — 53/53 PASS at the ADR-0051 pin (unchanged).
+   - Gate (d) — fuzzers — 11 fuzzers actual (not 10 as PLAN gate-command listed; FuzzDefaultFormatRender named in the PLAN never existed in-codebase — PLAN-doc-error noted in REVIEW.md Six-gate appendix). All 11 ran 30s clean: FuzzBootstrapLoad, FuzzTcpProxyFilter, FuzzTLSContextParse, FuzzHCMConfigParse, FuzzFrameStream, FuzzHPACKDecode, FuzzPromTextFormat, FuzzAccessLogFormat, FuzzFilterChainParse, FuzzFilterChainMatch, FuzzConfigDumpFormat.
+   - Gate (e) — differential — 11 fixtures green (0000–0008 + 0007a-cors + 0007b-iteration-probe + 0009-admin-config-dump).
+   - Gate (f) — BEHAVIOR_CONTRACT.md populated by THIS task's Step 2.
+
+2. **BEHAVIOR_CONTRACT.md restructure (Step 2).** Per SPEC §13.1 verbatim:
+   - `## Admin API — /ready` renamed to `## Admin API` umbrella.
+   - Three opening paragraphs added (framing deviation, header set, method discrimination posture).
+   - Existing `### Ready-state response (authoritative)` and `### Pre-init response` sub-blocks demoted to `####` under new `### /ready` subsection (verbatim-preserved).
+   - Five new per-endpoint subsections added: `### /stats/prometheus`, `### /config_dump`, `### /clusters`, `### /listeners`, `### /server_info`.
+   - `### Applies to` and `### Does not yet apply to` lists added per SPEC §13.1 verbatim.
+   - Four new equivalence-matrix rows added at the head of the file (folded into the existing 2-column table; the SPEC §13.2 verbatim 3-column patch was adapted by folding the allow-list info into the "Required equivalence" cell with explicit "(Per phase 08.1 SPEC §13.2.)" tail).
+
+3. **ADR-0089 + ADR-0090 (Step 3).** Both appended to DECISIONS.md per ADR-0001 template:
+   - ADR-0089: "Admin-endpoint deferral list — canonical enumeration of Envoy admin surface NOT modeled by envoy-go in 08.1 (per ADR-0040 deferral-ADR format)". Tables enumerate 7 mutating endpoints + 10 read-only endpoints + 9 body-shape extensions + the trailing-slash-body permitted divergence. Cross-referenced from BEHAVIOR_CONTRACT `### Does not yet apply to` block (9 of 10 bullets cite this ADR).
+   - ADR-0090: "No-ACL admin-endpoint security posture". Six-point decision (no auth / no ACL / no method discrimination / no TLS / operator firewall is boundary / future ADR-0091+ supersedes). Cross-referenced from BEHAVIOR_CONTRACT `### Does not yet apply to` block (1 bullet — "ACL / authentication on admin port (no-ACL posture per ADR-0090)").
+
+4. **internal/admin/doc.go updated (Step 4).** Replaced two-endpoint enumeration (phase 01 + 06.1) with six-endpoint enumeration citing 08.1 per-endpoint ADRs. ~30 LoC of package-level prose.
+
+5. **REVIEW.md authored (Step 5).** Per the 07.1 / 07.2 REVIEW.md shape: headline assessment (APPROVED) + strengths (9 sub-sections) + Major/Minor/Note findings (no Major; no Minor requiring inline-fix; 5 Note findings carry-forward) + carry-forward dispositions (5 items, all to 08.2 or future hardening passes) + six-gate verification appendix + acceptance against SPEC §15. The reviewer subagent dispatch tool was not available in the executing harness; the review was authored inline by the implementing session per the PLAN's explicit allowance ("Use the requesting-code-review skill OR spawn a code-reviewer subagent yourself").
+
+6. **ROADMAP.md updated (Step 6).** Row 08.1 flipped `in-progress → done`. Row 08 stays `in-progress` (parent flips at 08.2 phase-done per parent SPEC §5). Row 08.2 stays `planned`.
+
+7. **STATE.md rewritten (Step 7).** Advance to `active-phase: 08.2-graceful-drain`, `lifecycle-state: 0`, `next-skill: superpowers:brainstorming`. The PLAN-template's reference to "the SPEC stub README.md from the 08.1 SPEC commit (1f85b07)" was retained because the 08.2 directory + README.md DO already exist (verified at `docs/envoy-go/phases/08.2-graceful-drain/README.md` per ls). `last-commit` left as `<TBD>` for SHA-fill follow-up.
+
+8. **PROGRESS.md updated (Step 8).** This entry.
+
+9. **T14 review follow-up (mandatory addition to T15 scope).** Applied (a) + (b); deferred (c) per the time-budget allowance:
+   - (a) **SPEC §7.1 prose updated.** New paragraph records that the implemented assertion is structural projection rather than per-field allow-listing; cites the iter-2 enum-default-emission divergence + ADR-0086 EmitUnpopulated:true as the empirical justification; documents per-endpoint projections explicitly (configs_types + static_listeners + static_clusters for /config_dump; tuple-set with 2 normalisations for /clusters; name-only set for /listeners; state-only for /server_info); references the canonicaliser functions in the driver source.
+   - (b) **expectations.yaml prose updated.** Replaced "parsed as JSON; recursively compared with allow-list applied" wording with explicit per-endpoint projection descriptions; named the canonicaliser functions explicitly (canonicaliseConfigDump / canonicaliseClusters / canonicaliseListeners / canonicaliseServerInfo).
+   - (c) **Tightening canonicaliseConfigDump to assert listener port_value + endpoint addresses-from-allow-set: deferred.** The structural-projection approach is intentionally narrow (capturing the load-bearing assertion); tightening would tip toward "narrow allow-list" which the iter-2 reasoning explicitly avoided due to the ~40 enum-default-emission divergences in the deeply-nested admin/v3 proto. The current projection asserts the named-listener / named-cluster present-and-correct on both sides (the load-bearing claim per SPEC §7.1's per-endpoint equivalence statement); address fields are inferred indirectly. A future hardening pass may revisit (c) as a tightening if the projection ever proves too lax in a regression — at MVP scope the current shape is correct. Disposition recorded in REVIEW.md §3.
+
+**Files changed:** 8 modified + 1 created in this commit.
+- Modified: `docs/envoy-go/BEHAVIOR_CONTRACT.md` (umbrella restructure + 4 equivalence-matrix rows).
+- Modified: `docs/envoy-go/DECISIONS.md` (+284 LoC = ADR-0089 + ADR-0090).
+- Modified: `docs/envoy-go/ROADMAP.md` (row 08.1 status flip).
+- Modified: `docs/envoy-go/STATE.md` (rewrite).
+- Modified: `docs/envoy-go/phases/08.1-admin-endpoints/SPEC.md` (§7.1 prose update — T14 follow-up (a)).
+- Modified: `docs/envoy-go/phases/08.1-admin-endpoints/PROGRESS.md` (this entry).
+- Modified: `internal/admin/doc.go` (six-endpoint enumeration).
+- Modified: `test/fixtures/0009-admin-config-dump/expectations.yaml` (T14 follow-up (b) prose).
+- Created: `docs/envoy-go/phases/08.1-admin-endpoints/REVIEW.md` (~330 LoC; per 07.2 shape).
+
+**Six-gate verification outputs (verbatim):**
+```
+$ go build ./... 2>&1
+(clean)
+
+$ go vet ./... 2>&1
+(clean)
+
+$ golangci-lint run ./... 2>&1
+(clean)
+
+$ go test -count=1 ./... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	0.004s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	0.005s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	0.009s
+
+$ go test -count=1 -race ./... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.031s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.029s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.045s
+
+$ go test -count=1 -v ./test/conformance/h2spec/... 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.651s
+# (53 tests, 53 passed, 0 skipped, 0 failed at the ADR-0051 pin.)
+
+$ go test -count=1 -v ./test/differential/... 2>&1 | tail -10
+--- PASS: TestDifferential/0008-listener-chain-match (5.84s)
+    --- PASS: TestDifferential/0009-admin-config-dump (4.31s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	47.591s
+
+# 11 fuzzers (FuzzDefaultFormatRender named in PLAN gate-command does NOT exist in-tree — PLAN-doc-error)
+$ for fuzz in FuzzBootstrapLoad FuzzTcpProxyFilter FuzzTLSContextParse FuzzHCMConfigParse FuzzFrameStream FuzzHPACKDecode FuzzPromTextFormat FuzzAccessLogFormat FuzzFilterChainParse FuzzFilterChainMatch FuzzConfigDumpFormat; do go test -fuzz=$fuzz -fuzztime=30s ./<pkg>/ 2>&1 | tail -1; done
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.110s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.071s
+ok  	github.com/esalaine/envoy-go/internal/tls	31.089s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.079s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	33.521s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	33.546s
+ok  	github.com/esalaine/envoy-go/internal/stats	30.121s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	30.488s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	31.186s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	30.197s
+ok  	github.com/esalaine/envoy-go/internal/admin	32.556s
+
+$ grep -c '^## ADR-0089:' docs/envoy-go/DECISIONS.md
+1
+$ grep -c '^## ADR-0090:' docs/envoy-go/DECISIONS.md
+1
+```
+
+**Phase-done acceptance per SPEC §15:** all 16 acceptance items checked (see REVIEW.md §7). Phase 08.1 closes at this commit; ROADMAP row 08.1 reads `done`; STATE.md `active-phase: 08.2-graceful-drain` + `lifecycle-state: 0` + `next-skill: superpowers:brainstorming`. SHA-fill follow-up commit per the phase-04..07.2 SHA-fill convention.
