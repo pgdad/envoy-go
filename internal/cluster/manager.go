@@ -3,6 +3,7 @@ package cluster
 import (
 	stdtls "crypto/tls"
 	"fmt"
+	"sort"
 
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -110,6 +111,53 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 func (m *Manager) Get(name string) (*Cluster, bool) {
 	c, ok := m.clusters[name]
 	return c, ok
+}
+
+// ClusterInfo is the public read-only summary of one cluster, returned by
+// Manager.Clusters() and consumed by phase-08.1's /clusters admin handler.
+// Per ADR-0087, the /clusters handler reads the snapshot once per scrape and
+// formats one block per cluster (10 cluster-level lines + 18 per-endpoint
+// lines per the §11.2 empirical pin).
+//
+//nolint:revive // ADR-0087 reserves the ClusterInfo name for the public /clusters-snapshot surface; phase-08.1 SPEC §6.2 fixes the type name verbatim.
+type ClusterInfo struct {
+	Name      string
+	Endpoints []EndpointInfo
+}
+
+// EndpointInfo is the public read-only summary of one upstream endpoint
+// within a ClusterInfo. Address is the dotted-quad / IPv6-literal host; Port
+// is the TCP port. The combined "address:port" form is what the /clusters
+// handler emits in the per-endpoint key prefix per SPEC §11.2.
+type EndpointInfo struct {
+	Address string
+	Port    uint32
+}
+
+// Clusters returns a freshly-allocated snapshot of all configured clusters
+// and their endpoints, in alphabetical-by-name order. Per-cluster endpoints
+// are returned in their bootstrap-declared order (the order extractEndpoints
+// preserves at NewManager time). The returned slice is safe for caller
+// mutation: modifying it does not affect the Manager's internal state.
+//
+// Counters / gauges are NOT cached in the returned struct — phase-08.1's
+// /clusters handler emits literal `0` for all 8 per-endpoint cx_*/rq_*
+// counter fields per the planner-time decision (envoy-go has no per-endpoint
+// stats per ADR-0063 deferral; cluster-level counters are surfaced via
+// /stats/prometheus and would not partition meaningfully across endpoints).
+//
+// Phase 08.1 (Task 3) introduces this accessor; ADR-0087 records the design.
+func (m *Manager) Clusters() []ClusterInfo {
+	out := make([]ClusterInfo, 0, len(m.clusters))
+	for _, c := range m.clusters {
+		eps := make([]EndpointInfo, 0, len(c.endpoints))
+		for _, ep := range c.endpoints {
+			eps = append(eps, EndpointInfo{Address: ep.Host, Port: ep.Port})
+		}
+		out = append(out, ClusterInfo{Name: c.name, Endpoints: eps})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, error) {

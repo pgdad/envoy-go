@@ -716,3 +716,79 @@ func TestNewManager_AllocatesEightMetricsPerCluster(t *testing.T) {
 		t.Errorf("missing cluster metrics: %v", wantNames)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 08.1 (Task 3) — Manager.Clusters() snapshot accessor tests
+// ---------------------------------------------------------------------------
+
+func TestManager_Clusters_SnapshotReturnsAllClusters(t *testing.T) {
+	bs := mkBootstrap(
+		mkStaticCluster("c_a",
+			mkLbEndpoint("10.0.0.1", 9000),
+			mkLbEndpoint("10.0.0.2", 9001),
+		),
+		mkStaticCluster("c_b",
+			mkLbEndpoint("10.0.1.1", 9100),
+			mkLbEndpoint("10.0.1.2", 9101),
+		),
+	)
+	m, err := NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	infos := m.Clusters()
+	if len(infos) != 2 {
+		t.Fatalf("Clusters() returned %d; want 2", len(infos))
+	}
+	// Alphabetical-by-name ordering invariant
+	if infos[0].Name != "c_a" || infos[1].Name != "c_b" {
+		t.Errorf("Clusters() ordering: got [%q, %q]; want [c_a, c_b]", infos[0].Name, infos[1].Name)
+	}
+	// Per-cluster endpoints populated
+	if len(infos[0].Endpoints) != 2 {
+		t.Errorf("Clusters()[0].Endpoints: got %d; want 2", len(infos[0].Endpoints))
+	}
+	if infos[0].Endpoints[0].Address == "" || infos[0].Endpoints[0].Port == 0 {
+		t.Errorf("Clusters()[0].Endpoints[0]: empty fields: %+v", infos[0].Endpoints[0])
+	}
+}
+
+func TestManager_Clusters_FreshlyAllocatedPerCall(t *testing.T) {
+	bs := mkBootstrap(
+		mkStaticCluster("c_a",
+			mkLbEndpoint("10.0.0.1", 9000),
+			mkLbEndpoint("10.0.0.2", 9001),
+		),
+		mkStaticCluster("c_b",
+			mkLbEndpoint("10.0.1.1", 9100),
+			mkLbEndpoint("10.0.1.2", 9101),
+		),
+	)
+	m, _ := NewManager(bs, stats.NewRegistry())
+	a := m.Clusters()
+	b := m.Clusters()
+	// Different slice headers (snapshot semantics)
+	if &a[0] == &b[0] {
+		t.Errorf("Clusters() returned aliased slice; expect freshly allocated per call")
+	}
+	// Mutation of returned slice does not affect manager state
+	a[0].Name = "MUTATED"
+	a[0].Endpoints[0].Address = "MUTATED"
+	c := m.Clusters()
+	if c[0].Name == "MUTATED" {
+		t.Errorf("mutating Clusters() result affected manager state (Name)")
+	}
+	if c[0].Endpoints[0].Address == "MUTATED" {
+		t.Errorf("mutating Clusters() result affected manager state (Endpoint.Address)")
+	}
+}
+
+func TestManager_Clusters_EmptyClustersListReturnsEmpty(t *testing.T) {
+	// NewManager errors on zero clusters per the existing manager.go contract;
+	// this test asserts that IF a Manager could ever have zero clusters,
+	// Clusters() returns an empty (non-nil) slice. Constructed directly:
+	m := &Manager{clusters: map[string]*Cluster{}}
+	if got := m.Clusters(); got == nil || len(got) != 0 {
+		t.Errorf("Clusters() on empty manager: got %v; want non-nil empty slice", got)
+	}
+}
