@@ -1804,3 +1804,98 @@ ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.010s
 ```
 
 Task 22 (`0007b-iteration-probe` structural fixture) is now unblocked.
+
+---
+
+## Task 22 — structural fixture 0007b-iteration-probe
+
+**Commits:** d680152 (code) → TBD (PROGRESS SHA-fill).
+
+**Files created:**
+
+- `test/fixtures/0007b-iteration-probe/envoy-go.yaml` — subject bootstrap (STATIC cluster on `c_backend`; HCM `http_filters: [envoy.filters.http.envoy_go_test, envoy.filters.http.router]`; per-route `typed_per_filter_config[envoy.filters.http.envoy_go_test] = EnvoyGoTestPerRoute{count: 7}` on the `/` route). On-disk file is documentation parity; the driver's `subjectTmpl` constant is the load-bearing one.
+- `test/fixtures/0007b-iteration-probe/expectations.yaml` — prose 8-mode expectation table per SPEC §7.3 + the mode-8 disposition note (H1 HCM dispatch does not invoke `RunDecodeTrailers` end-to-end; mode 8's wire shape is identical to mode 1).
+- `test/fixtures/0007b-iteration-probe/README.md` — fixture overview, topology, filter chain, per-route count config, 8-mode workload table, iteration-protocol state coverage attribution, mode-8 disposition note, and run instructions.
+- `test/fixtures/0007b-iteration-probe/driver/driver.go` — registers `iterationProbeDriver{}` via `init()`; `BackendCount()=1`, `BackendKind()=HTTPEchoBody`, `SubjectListenerName()="l_h1"`, `RequiresReference()=false` (first reference-less fixture in the project, implementing the new `fixture.ReferenceLessFixture` interface). `DriveSubject` issues 8 sequential H1 round-trips per SPEC §7.3 — each with a distinct `x-envoy-go-test-mode` header, GET or POST per the mode's body needs — via `helpers.HTTPRoundTrip`. Drive returns a deterministic byte stream encoding `(status, sorted-lowercased-headers, body%q)` per request. `AssertSubject` (the new `fixture.SubjectAsserter` in-band callback) inspects the captured stream against the embedded `modeExpectations` table for per-mode `(status, headersPresent, headersAbsent, body)` substring presence/absence.
+- `test/fixtures/0007b-iteration-probe/driver/driver_test.go` — 7 unit tests: 3 encodeProbe shape pinning tests (continue, local-reply, modify-encode-data); modeProbes-vs-modeExpectations parallel-ordering invariant; 8-mode coverage exhaustiveness; fixtureName drift; RequiresReference=false drift.
+- `test/fixtures/0007b-iteration-probe/backends/main.go` — H1 backend subprocess: `200 OK` + body equal to request body verbatim (if non-empty) else fixed 8-byte `"backend\n"` (intentional length so mode 7's `copy("MODIFIED\n", "backend\n")` truncates to `"MODIFIED"`). `Connection: close` set so envoy-go's keepalive upstream pool retires after each response.
+
+**Files modified:**
+
+- `test/differential/fixture/fixture.go` — added new `BackendKind` constant `HTTPEchoBody = 6`; added new optional `ReferenceLessFixture` interface (`RequiresReference() bool`); added new optional `SubjectAsserter` interface (`AssertSubject(t TB, subjBytes []byte)`). All three additions are additive — pre-existing fixtures 0000–0007a do NOT implement either new interface and remain unaffected.
+- `test/differential/runner_test.go` — three changes: (1) blank-import `_ "github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver"` so the driver's `init()` registers with `fixture.DriverRegistry`; (2) added `case fixture.HTTPEchoBody` arm to the per-fixture backend switch + `startHTTPEchoBodyBackend(ctx, root, port)` spawn function; (3) added a reference-less branch that fires immediately after backend setup when the driver implements `fixture.ReferenceLessFixture` returning `false` — short-circuits to a new `runReferenceLessFixture` helper that spawns ONLY the subject, drives subject, and invokes `fixture.SubjectAsserter`. The reference-less branch skips reference-proxy spawn, `DriveReference`, the byte-stream `CompareBytes`, and the admin probe diff; only `DriveSubject` + `AssertSubject` run.
+- `internal/filter/hcm/connection.go` — H1 dispatch fix forwarded from Task 22 fixture surface: (a) buffer the request body bytes during the chain.RunDecodeData drain loop and restore `req.Body` (as `io.NopCloser(bytes.NewReader(...))`) before invoking the terminal router action's `req.Write(upstream)`. Previously the body bytes were drained into `RunDecodeData` and the upstream got `Content-Length` headers + zero body bytes, manifesting as 502 Bad Gateway on every POST request — exposed by 0007b's modes 3 (stop-and-buffer-data) and 5 (local-reply-decode-data) which both POST a body and either expect 200+echoed-body (mode 3) or 418 (mode 5). (b) added a `chain.LocalReplyDone()` post-body-loop branch mirroring the post-RunDecodeHeaders branch — when a non-terminal filter calls `dcb.SendLocalReply` from `DecodeData`, the chain has already run the encode chain over the synthesized response inside `beginLocalReply`; we now write the synthesized wire shape via `writeH1Reply` and return immediately, without dialing the upstream cluster (which would otherwise produce a stale 502 after the local reply already fired).
+- `docs/envoy-go/phases/07.1-http-filter-framework/PROGRESS.md` — this entry.
+
+**Mode 8 disposition (honest):**
+
+The probe filter's `DecodeTrailers` branch returns `TrailersStopIteration` and spawns an async resumer (filter.go); this is exercised at unit-test scope by `internal/filter/http/envoygotest/filter_test.go::TestEnvoyGoTest_ModeStopTrailers` which directly drives `chain.RunDecodeTrailers`. **However**, H1 HCM dispatch does NOT currently invoke `chain.RunDecodeTrailers` (the H1 chunked-T-E trailer parsing was deferred at Task 15 close-out per Task 15 PROGRESS notes; H2 observe-and-discard per ADR-0058). Mode 8's end-to-end wire shape on this fixture is therefore identical to mode 1 (`continue`); the probe's stop-trailers branch never fires on H1 traffic. The fixture documents this honestly in `expectations.yaml`, `driver.go`'s `modeExpectations`, and the driver's package-level doc.go so a future maintainer adding H1-chunked-T-E trailer parsing will rebaseline mode 8's expected behavior to a delayed-resume shape.
+
+**Bug fix forwarded into Task 22 (no new ADR):**
+
+The H1 dispatch body-drain bug + the missing `LocalReplyDone()` post-body-loop check are both pre-existing latent regressions from Task 15 — Phase 04's H1 routing tests (fixture 0003) only exercised GET requests, and Task 18's cors fixture (0007a) only exercised OPTIONS preflight + GET requests. Task 22 is the first fixture that POSTs a body through the H1 dispatch + chain + cluster forwarding path, so it surfaced both gaps. The fix is pure plumbing — it does NOT introduce a new ADR (the surfaced bugs contradict the existing ADR-0075 SendLocalReply contract and the implicit Task 15 + Task 11 invariant that "POST request body reaches the upstream cluster"). The fix is forwarded inline into this Task 22 entry rather than back-amended into Task 15's PROGRESS entry per the project's "PROGRESS is append-only forward-quoted" convention (mirrors how Task 18's encode-side ordering fix landed in Task 18, not back into Task 15).
+
+**Acceptance:**
+
+- `go test ./test/differential/ -run 'TestDifferential/0007b' -count=1 -v` PASS (0.68s).
+- `go test ./test/differential/ -count=1 -v -run TestDifferential` PASS (9/9 fixtures: 0000–0006 + 0007a + 0007b).
+- `go test ./test/fixtures/0007b-iteration-probe/...` PASS (7 driver-internal unit tests).
+- `go test ./internal/filter/... -count=1` PASS (no regressions in HCM / chain / cors / envoygotest / router after the H1 dispatch fix).
+- `go vet ./...` clean.
+- ADR-0071 (filter API stability) preserved. ADR-0072 (registry threading) preserved. ADR-0073 (per-route 3-tier merge) preserved. ADR-0074 (cors + envoygotest filter set) preserved. ADR-0075 (SendLocalReply encode-chain entry) preserved (now exercised end-to-end via mode 5 on H1 dispatch in addition to the unit-test scope from Task 19). ADR-0076 (body buffer cap + 413/reset) preserved. No new ADR.
+
+**Outputs:**
+
+```
+$ go test ./test/fixtures/0007b-iteration-probe/driver/ -count=1 -v
+=== RUN   TestEncodeProbe_ContinueShape
+--- PASS: TestEncodeProbe_ContinueShape (0.00s)
+=== RUN   TestEncodeProbe_LocalReplyShape
+--- PASS: TestEncodeProbe_LocalReplyShape (0.00s)
+=== RUN   TestEncodeProbe_ModifyEncodeDataShape
+--- PASS: TestEncodeProbe_ModifyEncodeDataShape (0.00s)
+=== RUN   TestModeProbes_OrderMatchesExpectations
+--- PASS: TestModeProbes_OrderMatchesExpectations (0.00s)
+=== RUN   TestModeExpectations_AllEightCovered
+--- PASS: TestModeExpectations_AllEightCovered (0.00s)
+=== RUN   TestDriver_RegisteredAtInit
+--- PASS: TestDriver_RegisteredAtInit (0.00s)
+=== RUN   TestDriver_RequiresReferenceFalse
+--- PASS: TestDriver_RequiresReferenceFalse (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	0.002s
+
+$ go test ./test/differential/ -run 'TestDifferential/0007b' -count=1 -v -timeout=5m 2>&1 | tail -10
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0007b-iteration-probe
+2026/05/01 22:42:19 backend listening on :42205
+--- PASS: TestDifferential (0.68s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.68s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	0.777s
+
+$ go test ./test/differential/ -count=1 -v -timeout=15m -run TestDifferential 2>&1 | tail -12
+--- PASS: TestDifferential (21.60s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.50s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.15s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.21s)
+    --- PASS: TestDifferential/0003-http11-routing (1.20s)
+    --- PASS: TestDifferential/0004-h2-routing (1.62s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.87s)
+    --- PASS: TestDifferential/0006-access-log (11.01s)
+    --- PASS: TestDifferential/0007a-cors (1.35s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.70s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	21.687s
+
+$ go test ./internal/filter/... -count=1 2>&1 | tail -8
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.010s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	2.494s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.130s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	0.003s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	0.033s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	0.213s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.008s
+```
+
+Task 23 (BEHAVIOR_CONTRACT in-place edit + ROADMAP/STATE updates + closing six-gate sweep) is now unblocked.
