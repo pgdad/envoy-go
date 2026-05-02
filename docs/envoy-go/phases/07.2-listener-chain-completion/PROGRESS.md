@@ -526,3 +526,21 @@ ok  	github.com/esalaine/envoy-go/test/differential	0.086s
 $ grep -cE '^## ADR-[0-9]+' docs/envoy-go/DECISIONS.md
 83
 ```
+
+## Task 14 — test/differential/runner_test.go (multi-listener + alternate-config branches)
+
+**Commits:** TBD — this task's commit
+**Notes:** Added the runner-side branches that consume the two new optional interfaces from Task 13. (a) Multi-listener branch: hoisted a single `mld, isMulti := d.(fixture.MultiListenerDriver)` type-assertion to the top of the reference-spawn block so the same `isMulti` flag drives BOTH the exposed-ports list passed to `StartReferenceProxy` / `StartReferenceProxyWithMounts` (now spreads `refPorts...` — `[]int{d.ReferenceListenerPort()}` for single-listener fixtures, or `mld.ReferenceListenerPorts()` for multi-listener) AND the DriveReference / DriveSubject dispatch (now selects between the single-addr Drive variants and the new DriveReferenceMulti / DriveSubjectMulti). The Multi variants build a name→addr map by zipping `SubjectListenerNames()` with bound subject addrs (via `subj.ListenerAddr(name)` per ADR-0026 sentinel) and reference addrs (via `ref.ListenerAddr(ports[i])`); a length-mismatch between names and ports triggers `t.Fatalf` (defensive — Task 13's `TestOptionalInterfaces` already pins the contract). (b) Alternate-config branch: appended a step-12 block AFTER all primary-pair assertions (admin/stats/accesslog) that type-asserts on `fixture.AlternateConfigDriver`; if implemented, spawns a SECOND ref+subj pair via `StartReferenceProxy(ctx, pin, AlternateReferenceBootstrap(backendPorts), AlternateReferenceListenerPort())` + `StartSubjectProxy(...)` with fresh `freeTCPPort` allocations for `altSubjPort` and `altSubjAdminPort`, looks up the alternate addrs via `altRef.ListenerAddr(altRefPort)` and `altSubj.ListenerAddr(AlternateSubjectListenerName())`, calls `DriveAlternate(ctx, altRefAddr, altSubjAddr)`, and surfaces the error path while accepting the returned bytes (driver does in-band assertion — mirrors SubjectAsserter / StatsAsserter / AccessLogAsserter precedent per SPEC §12 #8). Both branches are guarded by type-assertions; pre-existing fixtures (0000-0007b) do not implement either interface, so `ok=false` falls through to the standard path unchanged. **Surface adjustments from PLAN pseudo-code:** PLAN line 2420 used positional `acd.AlternateReferenceListenerPort()` directly in `StartReferenceProxy(ctx, pin, altRefBootstrap, acd.AlternateReferenceListenerPort())` — the actual `StartReferenceProxy` signature is `(ctx, pin, bootstrap, listenerPorts ...int)`, which accepts a single int arg cleanly; no API change needed. PLAN line 2413 ("call `StartReferenceProxy*` with the slice instead of single port") landed as variadic spread (`refPorts...`) since the existing helpers were already variadic. Test infrastructure changes ONLY — no production code modified. DECISIONS.md unchanged at 83 ADRs.
+
+**Outputs:**
+```
+$ go vet ./test/differential/...
+$ golangci-lint run ./test/differential/...
+$ go test -count=1 ./test/differential/ -run 'TestDifferential/(0000|0001|0002|0003|0004|0005|0006|0007)'
+ok  	github.com/esalaine/envoy-go/test/differential	21.970s
+$ go test -count=1 -short ./test/differential/...
+ok  	github.com/esalaine/envoy-go/test/differential	0.083s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.001s
+$ grep -cE '^## ADR-[0-9]+' docs/envoy-go/DECISIONS.md
+83
+```

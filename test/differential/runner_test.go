@@ -227,7 +227,20 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	// the host-side files and pass bind-mounts to StartReferenceProxyWithMounts.
 	// Bind mounts use HostConfig.Binds (not ContainerMounts) because testcontainers
 	// v0.27.0 silently drops MountTypeBind entries in mapToDockerMounts.
+	//
+	// Phase 07.2 (Task 14): if the driver implements fixture.MultiListenerDriver,
+	// the reference container exposes ALL of its ReferenceListenerPorts() (>=2)
+	// instead of the single ReferenceListenerPort(). The single-addr fallback
+	// (else branch below) is unchanged for pre-existing fixtures (0000-0007b)
+	// which do not implement MultiListenerDriver.
 	bootstrap := d.ReferenceBootstrap(backendPorts)
+	mld, isMulti := d.(fixture.MultiListenerDriver)
+	var refPorts []int
+	if isMulti {
+		refPorts = mld.ReferenceListenerPorts()
+	} else {
+		refPorts = []int{d.ReferenceListenerPort()}
+	}
 	var ref *ReferenceProxy
 	var err error
 	if rlm, ok := d.(fixture.ReferenceLogMounter); ok {
@@ -243,9 +256,9 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 				t.Fatalf("ref mount chmod %s: %v", hm.HostPath, ferr)
 			}
 		}
-		ref, err = StartReferenceProxyWithMounts(ctx, pin, bootstrap, hostMounts, d.ReferenceListenerPort())
+		ref, err = StartReferenceProxyWithMounts(ctx, pin, bootstrap, hostMounts, refPorts...)
 	} else {
-		ref, err = StartReferenceProxy(ctx, pin, bootstrap, d.ReferenceListenerPort())
+		ref, err = StartReferenceProxy(ctx, pin, bootstrap, refPorts...)
 	}
 	if err != nil {
 		t.Fatalf("ref start: %v", err)
@@ -272,8 +285,26 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 		refBaseline[i] = b.accepts.Load()
 	}
 
-	// 5. Drive ref.
-	refBytes, err := d.DriveReference(ctx, refAddr)
+	// 5. Drive ref. Phase 07.2 (Task 14): if the driver implements
+	// fixture.MultiListenerDriver, build a name->addr map across ALL listener
+	// names and dispatch DriveReferenceMulti instead of the single-addr Drive.
+	// Pre-existing fixtures (0000-0007b) do not implement MultiListenerDriver
+	// and fall through to the single-addr DriveReference path unchanged.
+	var refBytes []byte
+	if isMulti {
+		refAddrs := map[string]string{}
+		names := mld.SubjectListenerNames()
+		ports := mld.ReferenceListenerPorts()
+		if len(names) != len(ports) {
+			t.Fatalf("MultiListenerDriver: SubjectListenerNames()=%d != ReferenceListenerPorts()=%d", len(names), len(ports))
+		}
+		for i, name := range names {
+			refAddrs[name] = ref.ListenerAddr(ports[i])
+		}
+		refBytes, err = mld.DriveReferenceMulti(ctx, refAddrs)
+	} else {
+		refBytes, err = d.DriveReference(ctx, refAddr)
+	}
 	if err != nil {
 		t.Fatalf("ref drive: %v", err)
 	}
@@ -286,8 +317,20 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 		subjBaseline[i] = b.accepts.Load()
 	}
 
-	// 6. Drive subj.
-	subjBytes, err := d.DriveSubject(ctx, subj.ListenerAddr(d.SubjectListenerName()))
+	// 6. Drive subj. Phase 07.2 (Task 14): if the driver implements
+	// fixture.MultiListenerDriver, build a name->addr map across ALL subject
+	// listener names and dispatch DriveSubjectMulti instead of the single-addr
+	// Drive. Pre-existing fixtures (0000-0007b) fall through unchanged.
+	var subjBytes []byte
+	if isMulti {
+		subjAddrs := map[string]string{}
+		for _, name := range mld.SubjectListenerNames() {
+			subjAddrs[name] = subj.ListenerAddr(name)
+		}
+		subjBytes, err = mld.DriveSubjectMulti(ctx, subjAddrs)
+	} else {
+		subjBytes, err = d.DriveSubject(ctx, subj.ListenerAddr(d.SubjectListenerName()))
+	}
 	if err != nil {
 		t.Fatalf("subj drive: %v", err)
 	}
@@ -372,6 +415,44 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	// and performs the per-record three-tier assertion in-band.
 	if ala, ok := d.(fixture.AccessLogAsserter); ok {
 		ala.AssertAccessLog(t)
+	}
+
+	// 12. Optional alternate-config diff (phase 07.2, Task 14). Fires when the
+	// driver implements fixture.AlternateConfigDriver. The runner spawns a SECOND
+	// ref+subj pair using AlternateReferenceBootstrap + AlternateSubjectConfig,
+	// drives the alternate listener via DriveAlternate, and accepts the returned
+	// bytes — the driver performs in-band assertion (mirrors the SubjectAsserter
+	// + StatsAsserter + AccessLogAsserter precedent: SPEC §12 #8). fixture-0008
+	// uses this for the c4 variant where chain_other is removed to exercise the
+	// default_filter_chain fallback. Pre-existing fixtures (0000-0007b) do not
+	// implement AlternateConfigDriver and skip this branch unchanged.
+	if acd, ok := d.(fixture.AlternateConfigDriver); ok {
+		altRefBootstrap := acd.AlternateReferenceBootstrap(backendPorts)
+		altRefPort := acd.AlternateReferenceListenerPort()
+		altRef, err := StartReferenceProxy(ctx, pin, altRefBootstrap, altRefPort)
+		if err != nil {
+			t.Fatalf("alt ref start: %v", err)
+		}
+		defer func() { _ = altRef.Stop(context.Background()) }()
+		altSubjPort := freeTCPPort(t)
+		altSubjAdminPort := freeTCPPort(t)
+		altSubjCfg := acd.AlternateSubjectConfig(altRefPort, altSubjPort, backendPorts, altSubjAdminPort)
+		altSubj, err := StartSubjectProxy(ctx, root, altSubjCfg, fmt.Sprintf("127.0.0.1:%d", altSubjAdminPort))
+		if err != nil {
+			t.Fatalf("alt subj start: %v", err)
+		}
+		defer func() { _ = altSubj.Stop() }()
+		altRefAddr := altRef.ListenerAddr(altRefPort)
+		altSubjAddr := altSubj.ListenerAddr(acd.AlternateSubjectListenerName())
+		altBytes, err := acd.DriveAlternate(ctx, altRefAddr, altSubjAddr)
+		if err != nil {
+			t.Fatalf("DriveAlternate: %v", err)
+		}
+		// DriveAlternate returns one byte slice the driver produced after
+		// driving both ref+subj sides; the diff is intrinsic to the driver's
+		// logic (in-band per SubjectAsserter precedent). The runner only
+		// surfaces the error path here.
+		_ = altBytes
 	}
 }
 
