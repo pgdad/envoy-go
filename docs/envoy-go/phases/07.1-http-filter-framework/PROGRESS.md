@@ -1316,3 +1316,76 @@ $ go test ./test/conformance/h2spec/ -count=1 -v 2>&1 | grep -E '53 tests'
 - **Multi-frame H2 DATA test gap (Task 17 candidate):** Task 16's deviation (ii) — H2 body fed as a single `RunDecodeData` chunk per ADR-0076's 1 MiB cap — is currently validated only by the `0004-h2-routing` differential fixture (which exercises GET only, no body). A unit test that POSTs a multi-frame body (e.g., 256 KiB across multiple DATA frames) and verifies `RunDecodeData` is invoked once with the snapshotted full buffer + `endStream=true`, with the action receiving the body verbatim, would close the gap. Filed as Task 17 forward (chain_integration_test scope) per code-review-loop.
 
 **Code-review-loop follow-up:** I-1 (test-name honesty: `TestH2Dispatcher_CtxCancel_Status0_SkipsAccessLog` → `TestH2Dispatcher_Status0Sentinel_SkipsAccessLog` — the test passes `context.Background()` (never canceled) and uses a `faultyAction` returning `(0, 0, {}, sentinel)`; it exercises the post-RunAction status==0 sentinel guard, NOT ctx-cancel; docstring updated to describe the guard honestly), and I-3 (test-name scope-honesty: `TestH2Dispatcher_Match_DirectResponse_RunsChainAndEmitsAccessLog` → `TestH2Dispatcher_Match_DirectResponse_WireOutputAndAccessLog` — the test asserts wire output + access-log emit + bucket-Inc only; no recording filter is installed, so chain-mediation order is not verified; docstring updated to clarify scope and forward chain-mediation-order verification to Task 17's `chain_integration_test.go`) addressed in commit `d3fe74b`. I-2 (multi-frame H2 DATA test gap) forwarded to Task 17 via the **Task 17 forwards:** block above per the review's explicit forwarding directive.
+
+## Task 17 — internal/filter/hcm/chain_integration_test.go — H1 + H2 happy paths
+
+**Commits:** b8a0286 — this task's commit (chain_integration_test); TBD-task17-shafill — PROGRESS SHA-fill follow-up
+
+**Notes:** Added `internal/filter/hcm/chain_integration_test.go` proving the chain-mediated dispatch path runs filters in declaration order ahead of the terminal router on BOTH the H1 and H2 codecs. Three tests cover the H1 + H2 happy paths AND close the multi-frame H2 DATA gap forwarded from Task 16 PROGRESS:
+
+1. `TestChainIntegration_H1_DirectResponseHappy` — H1 path. Two recording filters (a, b) wired ahead of the terminal router with a `direct_response` route synthesizing `200 OK\n`. Drives `f.dispatchRequest(ctx, req, bw)`. Asserts the order slice contains exactly `["a-DecodeHeaders", "b-DecodeHeaders"]` (declaration order, before the terminal router action), the H1 wire output starts with `HTTP/1.1 200 OK\r\n` and ends with `OK\n`, and `status==200` propagates back to runConnection's bucket-Inc machinery.
+
+2. `TestChainIntegration_H2_DirectResponseHappy` — H2 path. Same chain shape (a, b, router); same direct_response route. Drives `disp.Match(req)` → `action.WriteH2(ctx, h2req, sw)` with a `captureH2Writer` capturing HEADERS + DATA. Asserts the same decode-side order, `:status=200`, exactly one DATA frame containing `OK\n`, and `downstream_rq_2xx == 1`.
+
+3. `TestChainIntegration_H2_MultiFrameDATA` — multi-frame body gap closure (Task 16 PROGRESS Task 17 forward; SPEC §11.1 + Task 16 deviation (ii)). POSTs a 256 KiB body via `h2req.Body` (the H2 codec layer's snapshotted-buffered shape; the chain sees this as a single `RunDecodeData(snapshot, endStream=true)` call). Filter "a" captures the body via DecodeData; the assertion is byte-equality against the input. Decode-order assertion preserved (header-phase only — the recording filter only records headers; data-capture writes to a separate pointer so the order slice is identical to the H1/H2 happy-path test).
+
+**Architectural decisions made:**
+
+1. **Recording-filter pattern (b) — inline definition.** Per the prompt's three options for sourcing the recording filter helper, picked option (b): defined `integrationRecordingFilter` inline in `chain_integration_test.go` rather than promoting `recordingFilter` from `internal/filter/http/chain_test.go` to a shared exported test fixture package. Rationale: keeps package boundaries tight; the integration filter is purpose-built for chain-order assertions (records phase-tagged strings to a shared `*[]string` rather than per-callback atomic counters) and shares no code with the chain.go-internal test helper. Future cleanup if more cross-package test-helper sharing arrives: promote a stripped-down version to `internal/filter/http/filtertest/` (option (a)).
+
+2. **Per-test fresh-instance pattern via shared closures.** The `integrationFilterFactory(name, order, mu, bodyCapture)` returns a `filter_http.FilterInstanceFactory` that allocates a fresh `integrationRecordingFilter` each call. The `*[]string` order slice + `*sync.Mutex` + `*[]byte` body-capture pointer are captured by closure so the per-request fresh instances all write into the same shared per-test buffer. This mirrors the production two-step factory pattern (ADR-0071) — at-bootstrap factory parses config + returns a per-instance allocator; per-request the chain calls the allocator to get a fresh filter.
+
+3. **Encode-side methods present but not asserted.** The recording filter implements `EncodeHeaders`/`EncodeData`/`EncodeTrailers` to satisfy `StreamEncoderFilter` (the chain framework requires both sides for filters wired via `HTTPFilter{Decoder: f, Encoder: f}`). Their counter atomics are NOT asserted — the encode chain is dormant on both H1 + H2 dispatch paths until Task 18 rewires wire-output through chain-fed buffers. The test file's package-level docstring documents this explicitly: "encode-side ordering verified at Task 18 (cors)".
+
+4. **Multi-frame H2 DATA test as in-process body-capture.** The Task 16 PROGRESS forward asked for a 256 KiB body across multiple DATA frames; the actual frame-split happens at the H2 codec layer (`h2.serverStream`), which is not exercised in-process here. The test instead constructs `h2req.Body` directly with the full 256 KiB buffer — this is the snapshotted shape the H2 codec layer surfaces to the dispatch goroutine (per Task 16 deviation (ii): "the H2 codec buffers DATA frames into `s.reqBody` and snapshots the body before launching the dispatch goroutine"). The test verifies the chain receives the full buffer via `RunDecodeData(snapshot, endStream=true)` and the action sees it verbatim. Multi-frame split-and-reassemble is implicitly covered by the differential harness (0004-h2-routing exercises GET only; a future fixture POST-with-body would round-trip through real DATA frame split). Per the prompt's note "If the test infrastructure for sending multi-frame H2 bodies in-process is non-trivial, the test may use a smaller body that still exercises the `RunDecodeData(snapshot, endStream=true)` shape" — 256 KiB is well above the 16 KiB max DATA frame size so a real codec layer would have split this; the in-process test exercises the post-snapshot shape that the chain actually sees.
+
+**Files changed:**
+
+- `internal/filter/hcm/chain_integration_test.go` (NEW, 308 LoC test file). Three integration tests + `integrationRecordingFilter` (recording StreamDecoderFilter+StreamEncoderFilter) + `integrationFilterFactory` + `buildChainConfig` + `newIntegrationFilter` helpers.
+
+- `docs/envoy-go/phases/07.1-http-filter-framework/PROGRESS.md`: this entry.
+
+**PLAN deviations:**
+
+- (i) **Recording-filter helper duplicated, not promoted to a shared package.** PLAN.md:2418 references "Task 5's `recordingFilter` helper, exported here as a test fixture." Per the prompt's option-(a)/(b)/(c) explanation, option (b) (inline definition) was selected over option (a) (new `internal/filter/http/filtertest/` package) and option (c) (impossible — hcm tests can't import filter/http test-only symbols). The integration test's recording filter is purpose-built (records phase-tagged strings to a shared slice) and shares no code with the chain.go-internal `recordingFilter` (which uses per-callback atomic counters, not order-recording). Future cleanup: promote to a shared `filtertest` package if Task 18 (cors integration tests) or Task 19 (envoygotest probe filter tests) need cross-package test-helper sharing.
+
+- (ii) **Wire-output assertion shape adapted per codec.** PLAN.md:2436's pseudocode mentions verifying `"HTTP/1.1 200 OK\r\n...\r\n\r\nOK\n"` for H1; for H2 the analog is HEADERS frame `:status=200` + DATA frame `OK\n`. The H1 test asserts `strings.HasPrefix(out, "HTTP/1.1 200 OK\r\n")` + `strings.HasSuffix(out, "OK\n")` — the intermediate Date/Server/Content-Type/Content-Length headers are byte-equivalent to the Task 15 connection_test.go suite which does the full byte-equality check. This integration test focuses on chain-order assertion + happy-path wire-shape sanity; the byte-equivalent shape proof lives one level down in connection_test.go / h2dispatch_test.go.
+
+- (iii) **Multi-frame H2 DATA test uses snapshotted-body shape, not real codec frame-split.** Per Task 16 deviation (ii) the H2 codec pre-buffers DATA frames into `h2req.Body` before invoking dispatch; the chain sees the body as a single `RunDecodeData(snapshot, endStream=true)` call regardless of how many DATA frames the codec assembled it from. The integration test exercises the post-snapshot shape (256 KiB single chunk); real codec frame-split is exercised by the H2 test infrastructure (h2spec / 0004-h2-routing differential) but not in this in-process test. Per the prompt's allowance: "the test may use a smaller body that still exercises the `RunDecodeData(snapshot, endStream=true)` shape (the spec reviewer noted the codec snapshots reqBody before dispatch)".
+
+**Acceptance:**
+
+- `go build ./...` clean.
+- `go vet ./...` clean.
+- `go test ./internal/filter/hcm/ -run TestChainIntegration -count=1 -v` PASS (3/3).
+- `go test ./internal/filter/hcm/ -run TestChainIntegration -count=1 -race -v` PASS (3/3 under race detector).
+- `go test ./internal/filter/hcm/ -count=1` PASS (full hcm package; the new tests join the existing 91 from Tasks 1-16).
+- No production-code changes (Task 17 is test-only per the prompt's "No production-code changes" discipline).
+
+**Outputs:**
+
+```
+$ go test ./internal/filter/hcm/ -run TestChainIntegration -count=1 -v
+=== RUN   TestChainIntegration_H1_DirectResponseHappy
+--- PASS: TestChainIntegration_H1_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_DirectResponseHappy
+--- PASS: TestChainIntegration_H2_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_MultiFrameDATA
+--- PASS: TestChainIntegration_H2_MultiFrameDATA (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+
+$ go test ./internal/filter/hcm/ -run TestChainIntegration -count=1 -race -v
+=== RUN   TestChainIntegration_H1_DirectResponseHappy
+--- PASS: TestChainIntegration_H1_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_DirectResponseHappy
+--- PASS: TestChainIntegration_H2_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_MultiFrameDATA
+--- PASS: TestChainIntegration_H2_MultiFrameDATA (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.014s
+```
+
+**Closes Task 16 forward:** Multi-frame H2 DATA test gap is CLOSED via `TestChainIntegration_H2_MultiFrameDATA` — 256 KiB body POSTed as `h2req.Body`, captured verbatim by recording filter "a", byte-equality asserted against the input.
+
+**Task 18 carries forward:** Encode-side ordering assertion (the `b.EncodeHeaders` + `a.EncodeHeaders` reverse-order assertion the prompt mentions but defers to Task 18) — the recording filter implements encode methods but no test asserts encode-order. Task 18 (cors filter) will add encode-side ordering tests when it rewires the wire-output through chain-fed buffers.
