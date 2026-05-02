@@ -177,3 +177,44 @@ $ golangci-lint run ./internal/admin/...
 $ go build ./...
 (clean)
 ```
+
+## Task 5 — `internal/admin/admin.go` constructor widening + `bootTime` field [ADR-0085]
+
+**Commits:** `4fc9706` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-8. Step 1 wrote the two new tests (`TestServer_NewWidenedConstructor`, `TestAdminWriteTimeoutIs30s`) into `internal/admin/admin_test.go` referencing the not-yet-widened `New(addr, registry, nil, nil, nil)` signature plus the not-yet-added `bootTime` field. Step 2 confirmed the build error `too many arguments in call to New` (and `s.bootTime undefined`). Step 3 widened `internal/admin/admin.go`: added imports for `internal/bootstrap`, `internal/cluster`, `internal/listener`; widened the `Server` struct with four new fields (`bs *bootstrap.Bootstrap`, `cm *cluster.Manager`, `lm *listener.Manager`, `bootTime time.Time`); widened `New` signature from `(addr, registry)` to `(addr, registry, bs, cm, lm)` setting `bootTime: time.Now()`; widened `http.Server.WriteTimeout` from `5*time.Second` to `30*time.Second` per planner-time decision 2; pre-registered the four placeholder mux entries (`/config_dump`, `/clusters`, `/listeners`, `/server_info`) routing to `s.handleConfigDump`/`Clusters`/`Listeners`/`ServerInfo`; added the four placeholder handlers each emitting `<endpoint>: not yet implemented\n` text body with `Content-Length` set inline (no `bytes` package needed at Task 5 — the per-endpoint files in Tasks 6-9 each add their own `bytes` consumer). Per the PLAN's "alternative is to defer adding the import until Task 6" note (which is the cleaner option flagged in PLAN Step 3), the `bytes` import was deferred — no `var _ = bytes.Buffer{}` hack is in this commit. Step 4 created `internal/admin/admin_helpers_test.go` with the verbatim `minimalBootstrapYAML` constant + `mustMinimalBs`/`mustMinimalCM`/`mustMinimalLM` helpers; the helper file imports `internal/filter/http/router` and registers `router.New` on the HTTPRegistry before `Freeze()` per the existing 07.1 boot pattern + per the existing `internal/listener/manager_test.go:42` (`testHTTPRegistry`) precedent — the §7.3 fixture's HCM filter chain references `envoy.filters.http.router` and the listener-manager build at `NewManagerWithBaseDirAndAllowH2C` parse-time fails without it. The listener-filter registry is empty-but-frozen because the §7.3 fixture has no `listener_filters[]`. All four helpers carry `//nolint:unused // PLAN Task 5 scaffolding; consumed by Tasks 6-9 handler tests.` pragmas (mirroring the existing pragma pattern at `internal/listener/listenerfilter/callbacks_test.go:13`) since at Task-5 commit time none of the helpers have a consumer; Tasks 6-9 each add a per-endpoint test file that consumes one or more of them. Step 5 mechanically updated the seven existing `New(...)` call sites in `internal/admin/admin_test.go` (lines 13, 57, 83, 115, 121, 137, 158 per PLAN preamble) by appending `, nil, nil, nil` — these tests do NOT exercise the four new endpoints so nil is correct per ADR-0085 consequence (b). Step 6 confirmed `go build ./internal/admin/... clean`, `go test -count=1 ./internal/admin/... ok` (20 PASS — 6 pre-existing `TestServer_*` + 1 pre-existing `TestServer_LiveGaugeSetOnceFlippedAtFirstReady200` + 2 new `TestServer_NewWidenedConstructor` + `TestAdminWriteTimeoutIs30s` + 4 `TestWriteAdminHeaders_*` + 3 `TestHandlePrometheus_*` + 5 `TestBuildVersionString_*` from Task 4), `go vet ./internal/admin/...` clean, `golangci-lint run ./internal/admin/...` clean (the four `//nolint:unused` pragmas suppress the unused-helper warnings as documented in PLAN Step 4 + the listener-filter precedent). Step 7 appended ADR-0085 to `docs/envoy-go/DECISIONS.md` (one match for `^## ADR-0085:`); Status Accepted; Date 2026-05-02; Doctrine D-3.2 + D-3.4; Lands-in-task Task 5; Context paragraph anchors the four read-only endpoints + the existing-server-reuse rationale + the LBP-1 generalisation; Decision paragraph documents the three-arg widening + the 30s WriteTimeout + the placeholder-then-Tasks-6-9-overwrite shape; four Alternatives (second-server, package-globals, drop-registry, keep-5s) all rejected with reasons; five Consequences (a)-(e) covering: (a) cmd/envoy-go widens at Task 10; (b) test code passes nil for bs/cm/lm when not exercising new endpoints + the `mustMinimalBs/CM/LM` helper pattern; (c) LBP-1's fourth sibling application (06.1 + 07.1 + 07.2 + 08.1) ratifying the canonical wiring discipline; (d) 08.2 inherits without further constructor widening; (e) WriteTimeout 30s ceiling still bounds slowloris. Step 8 commit landed at `4fc9706`. **IMPORTANT:** `go build ./cmd/envoy-go/...` FAILS at this commit with `cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New / have (string, *stats.Registry) / want (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager)` — this is INTENTIONAL and EXPECTED per PLAN Step 6 ("`go build ./cmd/envoy-go/...` is EXPECTED to fail at this point (call-site breakage); Task 10 fixes that"); the call-site update lands at Task 10. Between Tasks 5 and 10 inclusive, `go build ./cmd/envoy-go/...`, `go vet ./...`, and `go test ./...` will all fail at the cmd/envoy-go boundary; the per-task acceptance gates only require `./internal/admin/...` (and the per-task target package) to be clean. Five files modified/created: `internal/admin/admin.go` (modified, +88/-12 LoC including widened struct/New/Start + four placeholder handlers); `internal/admin/admin_test.go` (modified, +43/-7 LoC including 7 call-site updates + 2 new tests); `internal/admin/admin_helpers_test.go` (created, 102 LoC); `docs/envoy-go/DECISIONS.md` (appended ADR-0085, +43 LoC).
+
+**Outputs:**
+```
+$ go test -run "TestServer_NewWidenedConstructor|TestAdminWriteTimeoutIs30s" -v ./internal/admin/... 2>&1 | tail -10
+=== RUN   TestServer_NewWidenedConstructor
+--- PASS: TestServer_NewWidenedConstructor (0.00s)
+=== RUN   TestAdminWriteTimeoutIs30s
+--- PASS: TestAdminWriteTimeoutIs30s (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.004s
+
+$ go build ./internal/admin/...
+(clean)
+
+$ go test -count=1 ./internal/admin/... 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/internal/admin	0.051s
+
+$ go vet ./internal/admin/...
+(clean)
+
+$ golangci-lint run ./internal/admin/...
+(clean)
+
+$ go test -v -count=1 ./internal/admin/... 2>&1 | grep -c '^--- PASS:'
+20
+
+$ go build ./cmd/envoy-go/... 2>&1
+# github.com/esalaine/envoy-go/cmd/envoy-go
+cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
+	have (string, *stats.Registry)
+	want (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager)
+(EXPECTED FAIL — Task 10 fixes the call site)
+
+$ grep -c '^## ADR-0085:' docs/envoy-go/DECISIONS.md
+1
+```
