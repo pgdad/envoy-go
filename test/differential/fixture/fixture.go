@@ -251,3 +251,40 @@ type ReferenceLessFixture interface {
 type SubjectAsserter interface {
 	AssertSubject(t TB, subjBytes []byte)
 }
+
+// MultiListenerDriver is an OPTIONAL driver-side interface for fixtures
+// that target >1 listener simultaneously. Drivers that implement it return
+// >=2 listener names (and matching reference ports); the runner allocates
+// additional subject ports and exposes additional reference ports, then
+// dispatches DriveReferenceMulti / DriveSubjectMulti instead of the
+// single-addr Drive variants. The single-addr Driver methods
+// (SubjectListenerName / ReferenceListenerPort / DriveReference /
+// DriveSubject) MUST still be implemented (returning the first listener as
+// the primary) so the runner's pre-multi-branch path still works for the
+// fixture-discovery / admin-probe steps.
+//
+// Introduced by phase 07.2 / fixture-0008 per SPEC §7.4.
+type MultiListenerDriver interface {
+	SubjectListenerNames() []string
+	ReferenceListenerPorts() []int
+	DriveReferenceMulti(ctx context.Context, addrs map[string]string) ([]byte, error)
+	DriveSubjectMulti(ctx context.Context, addrs map[string]string) ([]byte, error)
+}
+
+// AlternateConfigDriver is an OPTIONAL driver-side interface for fixtures
+// that need to spawn a SECOND ref+subj pair with an alternate bootstrap
+// (e.g., to exercise a code path the primary bootstrap cannot reach
+// without removing one of its chains). The runner spawns the alternate
+// pair AFTER the primary diff completes, runs DriveAlternate against the
+// alternate addrs, and diffs the resulting bytes. fixture-0008 uses this
+// for the c4 variant (chain_other removed) which exercises the
+// default_filter_chain fallback.
+//
+// Introduced by phase 07.2 / fixture-0008 per SPEC §7.4 + Decision G.
+type AlternateConfigDriver interface {
+	AlternateReferenceBootstrap(backendPorts []int) string
+	AlternateSubjectConfig(refListenerPort, subjListenerPort int, backendPorts []int, subjAdminPort int) string
+	AlternateSubjectListenerName() string
+	AlternateReferenceListenerPort() int
+	DriveAlternate(ctx context.Context, refAddr, subjAddr string) ([]byte, error)
+}

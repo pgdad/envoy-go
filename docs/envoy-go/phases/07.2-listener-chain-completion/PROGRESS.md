@@ -501,3 +501,28 @@ $ go test -race -short -count=1 ./...
 $ wc -l internal/listener/integration_test.go
 294 internal/listener/integration_test.go
 ```
+
+## Task 13 — test/differential/fixture/{fixture.go,fixture_test.go} (MultiListenerDriver + AlternateConfigDriver optional interfaces)
+
+**Commits:** TBD — this task's commit
+**Notes:** Extended `test/differential/fixture/fixture.go` with two new OPTIONAL driver-side interfaces required by fixture-0008 (per SPEC §7.4 + Decision G). `MultiListenerDriver` (4 methods: `SubjectListenerNames() []string`, `ReferenceListenerPorts() []int`, `DriveReferenceMulti(ctx, addrs map[string]string) ([]byte, error)`, `DriveSubjectMulti(...)`) is for fixtures targeting >1 listener simultaneously; the runner (Task 14) type-asserts on it after the standard startup, allocates additional subject ports + exposes additional reference ports, builds the listener-name → bound-addr map, and dispatches the Multi variants instead of the single-addr Drive. `AlternateConfigDriver` (5 methods: `AlternateReferenceBootstrap(backendPorts) string`, `AlternateSubjectConfig(refPort, subjPort, backendPorts, subjAdminPort) string`, `AlternateSubjectListenerName() string`, `AlternateReferenceListenerPort() int`, `DriveAlternate(ctx, refAddr, subjAddr) ([]byte, error)`) is for fixtures that need a SECOND ref+subj pair with an alternate bootstrap (the Task-14 runner spawns the alternate pair AFTER the primary diff completes, runs DriveAlternate, and diffs its bytes via CompareBytes); fixture-0008 uses this for the c4 variant where `chain_other` is removed to exercise the `default_filter_chain` fallback. Both interfaces are PURELY ADDITIVE — the existing `Driver` interface is UNCHANGED. Per the doctrine in §7.4 + Task-13 spec, multi-listener drivers MUST still implement the single-addr `Driver` methods (returning the FIRST listener as the primary) so the runner's pre-multi-branch path (fixture discovery + admin probe) still works. Pre-existing fixtures (0000–0007b) don't implement either interface; the type-assertions at the runner branch (Task 14) return `ok=false` for them and the standard runner path runs unchanged. Existing optional-interface idiom mirrored exactly: same comment style, same "Introduced by phase X / fixture-Y" attribution footer, same shape as `MultiListenerDriver` siblings (`DistributionAsserter`, `StatsAsserter`, `HTTPExpectations`, `BackendKindAware`, `ReferenceLogMounter`, `AccessLogAsserter`, `ReferenceLessFixture`, `SubjectAsserter`). Created new `fixture_test.go` (137 LoC) with: (a) `stubMultiAltDriver` — a no-op stub implementing all of `Driver` + `MultiListenerDriver` + `AlternateConfigDriver`; the FIRST listener-name returned by `SubjectListenerNames()` (`"l_test_a"`) equals what `SubjectListenerName()` returns, mirroring the SPEC §7.4 primary-listener rule; (b) compile-time interface checks (`var _ Driver = stubMultiAltDriver{}`, etc.) for all three interfaces — if a method signature drifts, the package fails to compile; (c) `TestOptionalInterfaces` — type-asserts the stub against both optional interfaces, asserts `len(names) >= 2`, asserts `names[0] == "l_test_a"`, asserts `Driver.SubjectListenerName() == names[0]` (primary-listener rule pinned by test), asserts `len(ReferenceListenerPorts()) == len(names)`, asserts `AlternateReferenceListenerPort() == 15010` and `AlternateSubjectListenerName() != ""`; (d) `baseOnlyStub` + `TestOptionalInterfaces_NotImplemented` — negative-path test: a Driver-only stub MUST NOT satisfy either optional interface, locking in the contract that pre-existing fixtures' standard runner path is unaffected. `gofmt -w` applied (initial lint flagged the multi-line method-receiver block; gofmt auto-aligned the column boundary). DECISIONS.md unchanged at 83 ADRs (this task is mechanical; no new decisions).
+
+**Outputs:**
+```
+$ go vet ./test/differential/...
+$ golangci-lint run ./test/differential/fixture/...
+$ go test ./test/differential/fixture/... -v
+=== RUN   TestOptionalInterfaces
+--- PASS: TestOptionalInterfaces (0.00s)
+=== RUN   TestOptionalInterfaces_NotImplemented
+--- PASS: TestOptionalInterfaces_NotImplemented (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.002s
+$ go test -race -short -count=1 ./test/differential/fixture/...
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.006s
+$ go build ./...
+$ go test ./test/differential/ -count=1 -short
+ok  	github.com/esalaine/envoy-go/test/differential	0.086s
+$ grep -cE '^## ADR-[0-9]+' docs/envoy-go/DECISIONS.md
+83
+```
