@@ -226,12 +226,14 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 
 	// Phase 07.1 Task 18 prereq: inject the request method as ":method"
 	// pseudo-header on the headers map so chain-level filters (cors etc.)
-	// can read the method without codec-specific surfacing. The method is
-	// removed before any wire-emit could observe it (the chain's encode-side
-	// is the only consumer; HCM dispatch never re-emits decode-side headers).
-	// http.Header.Set canonicalizes the key; we use a lowercase pseudo-header
-	// literal to mirror H2's :method convention.
-	if req.Header.Get(":method") == "" {
+	// can read the method without codec-specific surfacing. ":method" is
+	// left on req.Header for the request lifetime; no wire-emit path
+	// observes pseudo-headers (verified via writeH1Reply/writeH2Reply
+	// iterating only response headers — req.Header is decode-side only).
+	// Use raw-map access: http.Header.Get canonicalizes the key via
+	// textproto.CanonicalMIMEHeaderKey, which does not preserve the
+	// leading colon and would not see the colon-prefixed pseudo-header.
+	if _, ok := req.Header[":method"]; !ok {
 		req.Header[":method"] = []string{req.Method}
 	}
 

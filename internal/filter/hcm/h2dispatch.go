@@ -185,8 +185,14 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// can read the method without codec-specific surfacing. H2 routes already
 	// place :method on the request struct via h2.parseHeadersForRequest;
 	// reflect it onto the *http.Request.Header here so RunDecodeHeaders
-	// observes it consistent with the H1 path.
-	if c.req.Header.Get(":method") == "" {
+	// observes it consistent with the H1 path. ":method" is left on
+	// c.req.Header for the request lifetime; no wire-emit path observes
+	// pseudo-headers (verified via writeH1Reply/writeH2Reply iterating only
+	// response headers — c.req.Header is decode-side only). Use raw-map
+	// access: http.Header.Get canonicalizes the key via
+	// textproto.CanonicalMIMEHeaderKey, which does not preserve the
+	// leading colon and would not see the colon-prefixed pseudo-header.
+	if _, ok := c.req.Header[":method"]; !ok {
 		c.req.Header[":method"] = []string{c.req.Method}
 	}
 
