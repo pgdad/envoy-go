@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -137,12 +138,21 @@ func TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent(t *testing.T) 
 	if !strings.Contains(bodyStr, `"static_listeners"`) {
 		t.Errorf("body lacks snake_case 'static_listeners'; got camelCase? body excerpt: %s", bodyStr[:min(300, len(bodyStr))])
 	}
-	// 1-space indent per ADR-0086 (Indent: " "). The body MUST contain at
-	// least one "\n " (newline-then-one-space) sequence introducing a nested
-	// field; if it contains "\n  " (two-space) without an intermediate
-	// "\n {\n" (object-open), then the indent is 2-space (wrong).
-	if !strings.Contains(bodyStr, "\n ") {
-		t.Errorf("body lacks 1-space indent marker; body excerpt: %s", bodyStr[:min(300, len(bodyStr))])
+	// Indent: " " (1-space) per ADR-0086. The depth-1 JSON field "configs"
+	// appears at exactly 1 space of indent under Indent: " "; under any
+	// wider indent (e.g., "  ") it would be N+ spaces. This is the
+	// load-bearing distinguisher between the empirical pin and the nearest
+	// wrong shape — `\n ` alone is too loose (also matches 2-space, etc).
+	if !strings.Contains(bodyStr, "\n \"configs\"") {
+		t.Errorf("body lacks 1-space-indent depth-1 marker '\\n \"configs\"'; indent appears wider than 1 space; body excerpt: %s", bodyStr[:min(300, len(bodyStr))])
 	}
-	// EmitUnpopulated: zero-valued fields appear (concretely: cluster's load_assignment ought to be present even if no zero defaults yet shown; we don't test specific zero defaults to avoid coupling)
+	// EmitUnpopulated: true per ADR-0086. The bootstrap's `node` field is
+	// unset on the §7.3 fixture; under EmitUnpopulated: true it serializes
+	// as `"node": null` — under EmitUnpopulated: false it would be elided
+	// entirely. protojson deliberately randomizes the post-colon spacing
+	// (1 or 2 spaces) per Marshal call to discourage consumers from
+	// depending on its output format, so we tolerate either via regex.
+	if !regexp.MustCompile(`"node":\s+null`).MatchString(bodyStr) {
+		t.Errorf("body lacks EmitUnpopulated marker '\"node\": null'; flag may be false; body excerpt: %s", bodyStr[:min(300, len(bodyStr))])
+	}
 }
