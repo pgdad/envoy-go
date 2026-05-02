@@ -16,6 +16,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 )
 
 // TypeURL is the canonical envoy.filters.http.router type URL. Boot wiring
@@ -103,6 +104,21 @@ func upstreamHostString(ep cluster.Endpoint) string {
 // failure that the HCM dispatch loop must propagate).
 type Action func(ctx context.Context, req *http.Request, bw *bufio.Writer) (status int, bytesSent int64, picked cluster.Endpoint, err error)
 
+// H2Action is the H2-flavored counterpart to Action — the per-request executor
+// injected by HCM dispatch into the terminal router filter on the H2 path.
+// HCM dispatch (h2dispatch.go) resolves the matched route into one of these
+// closures (direct_response synthesize OR upstream H2 RoundTrip) and calls
+// *Filter.SetH2Action before chain iteration begins; the router invokes it
+// from RunH2Action after the decode chain returns.
+//
+// Returning (status, bytesSent, picked, err): mirrors Action's contract.
+// status==0 is the H2 ctx-cancel sentinel per SPEC §2.1 last bullet — HCM
+// dispatch's chain-completion access-log emit hook skips submission on
+// status==0. err carrying an *h2.Error propagates upward; serverStream.dispatch
+// then emits the matching RST_STREAM(<code>) per the dispatch carry-error
+// contract.
+type H2Action func(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) (status int, bytesSent int64, picked cluster.Endpoint, err error)
+
 // Filter is the terminal HTTP filter (envoy.filters.http.router) implementing
 // envoyhttp.StreamDecoderFilter + envoyhttp.StreamEncoderFilter per ADR-0071.
 // It dispatches the resolved route action — cluster dial OR direct_response
@@ -161,6 +177,14 @@ type Filter struct {
 	req    *http.Request
 	bw     *bufio.Writer
 
+	// Per-request H2 injection (Task 16). HCM dispatch sets these on the H2
+	// path before chain.RunDecodeHeaders begins iteration. Mutually exclusive
+	// with the H1 trio above: HCM populates ONE set per request based on the
+	// listener's negotiated codec. RunAction routes to the populated path.
+	h2Action H2Action
+	h2Req    h2.H2Request
+	h2Sw     h2.StreamWriter
+
 	// Per-request action result (populated when action runs in DecodeHeaders/
 	// DecodeData). HCM dispatch reads these via the public getters after
 	// chain.RunDecodeHeaders / chain.RunDecodeData return.
@@ -183,6 +207,23 @@ func (f *Filter) SetRequest(r *http.Request) { f.req = r }
 // bytes through. Called once per request, BEFORE chain iteration.
 func (f *Filter) SetWriter(w *bufio.Writer) { f.bw = w }
 
+// SetH2Action is the H2-side mirror of SetAction (Task 16). HCM h2dispatch.go
+// injects the per-request H2 action closure resolved from the matched route.
+// Called once per request, BEFORE chain iteration. Mutually exclusive with
+// SetAction — the same *Filter instance must NOT receive both an H1 and an
+// H2 action; HCM dispatch picks ONE based on the listener's negotiated codec.
+func (f *Filter) SetH2Action(a H2Action) { f.h2Action = a }
+
+// SetH2Request wires the codec-internal H2Request into the router for the
+// action's upstream H2 RoundTrip. Called once per request, BEFORE chain
+// iteration.
+func (f *Filter) SetH2Request(r h2.H2Request) { f.h2Req = r }
+
+// SetH2Writer wires the downstream H2 stream writer the action emits the
+// response HEADERS + DATA frames through. Called once per request, BEFORE
+// chain iteration.
+func (f *Filter) SetH2Writer(w h2.StreamWriter) { f.h2Sw = w }
+
 // Status / BytesSent / Picked / ActionErr expose the action's terminal
 // outcome so HCM dispatch can Inc the downstream_rq_<Nxx> bucket, populate
 // the access-log record, and propagate the writer error after chain return.
@@ -198,44 +239,67 @@ func (f *Filter) ActionRan() bool           { return f.actionRan }
 // once-per-request via the `actionRan` boolean (a check-then-set, NOT a sync.Once
 // — see lifecycle doc on `Filter`).
 //
+// Routes to either the H1 path (action+req+bw populated via Set*) or the H2
+// path (h2Action+h2Req+h2Sw populated via SetH2*) based on which setter trio
+// HCM dispatch invoked. The two trios are mutually exclusive: HCM populates
+// exactly ONE per request based on the listener's negotiated codec.
+//
 // Concurrency contract: this method assumes the single-goroutine-per-stream
 // invariant codified by ADR-0071's chain-dispatch model. The HCM dispatch path
-// (connection.go's `dispatchRequest`) is the sole caller per request, runs on a
-// single goroutine, and reads the result fields only AFTER this method returns.
-// The result-capture fields (actionRan / actionStatus / actionBytesSent /
-// actionPicked / actionErr) are written here without synchronization — that is
-// safe ONLY under the single-goroutine invariant. Concurrent invocations from
-// multiple goroutines are NOT supported and would race on `actionRan`. Future
-// filters that schedule encode-side work on a separate goroutine MUST
-// synchronize externally before calling RunAction.
+// (connection.go's `dispatchRequest` for H1; h2dispatch.go's per-stream
+// dispatch for H2) is the sole caller per request, runs on a single goroutine,
+// and reads the result fields only AFTER this method returns. The result-
+// capture fields (actionRan / actionStatus / actionBytesSent / actionPicked /
+// actionErr) are written here without synchronization — that is safe ONLY
+// under the single-goroutine invariant. Concurrent invocations from multiple
+// goroutines are NOT supported and would race on `actionRan`. Future filters
+// that schedule encode-side work on a separate goroutine MUST synchronize
+// externally before calling RunAction.
 //
-// Called by HCM dispatch (connection.go) AFTER chain.RunDecodeHeaders +
-// RunDecodeData + RunDecodeTrailers complete (the terminal-action invocation
-// logically sits "after" the decode chain).
+// Called by HCM dispatch AFTER chain.RunDecodeHeaders + RunDecodeData +
+// RunDecodeTrailers complete (the terminal-action invocation logically sits
+// "after" the decode chain).
 //
 // Per Decision §3.1, the access-log emit is deferred to HCM dispatch's
 // chain-completion hook (which reads Status/BytesSent/Picked from this
-// filter); the router filter does NOT emit the access-log directly on the
-// H1 path post-Task-15.
+// filter); the router filter does NOT emit the access-log directly post-Task-15.
 //
-// Panics with a clear message if `SetAction` / `SetRequest` / `SetWriter` were
-// not all called before RunAction. This is programmer-error early-detection
-// per the per-request lifecycle doc on `*Filter` (step 2 must precede step 4).
-// The HCM dispatch path always calls all three setters before chain iteration;
-// a panic here means a future caller has violated the contract.
+// Panics with a clear message if neither trio was populated before RunAction.
+// This is programmer-error early-detection per the per-request lifecycle
+// doc on `*Filter` (step 2 must precede step 4). The HCM dispatch path always
+// calls one trio of setters before chain iteration; a panic here means a
+// future caller has violated the contract.
 func (f *Filter) RunAction(ctx context.Context) {
 	if f.actionRan {
 		return
 	}
-	if f.action == nil || f.req == nil || f.bw == nil {
-		panic("router.Filter.RunAction: SetAction / SetRequest / SetWriter must all be called before RunAction (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
+	switch {
+	case f.h2Action != nil:
+		// H2 path (Task 16). h2Sw must be non-nil; h2Req is a value type so
+		// the zero value is allowed (no nil-pointer check needed).
+		if f.h2Sw == nil {
+			panic("router.Filter.RunAction: SetH2Action set without SetH2Writer (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
+		}
+		f.actionRan = true
+		status, bytesSent, picked, err := f.h2Action(ctx, f.h2Req, f.h2Sw)
+		f.actionStatus = status
+		f.actionBytesSent = bytesSent
+		f.actionPicked = picked
+		f.actionErr = err
+	case f.action != nil:
+		// H1 path (Task 15). req + bw must be set.
+		if f.req == nil || f.bw == nil {
+			panic("router.Filter.RunAction: SetAction set without SetRequest/SetWriter (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
+		}
+		f.actionRan = true
+		status, bytesSent, picked, err := f.action(ctx, f.req, f.bw)
+		f.actionStatus = status
+		f.actionBytesSent = bytesSent
+		f.actionPicked = picked
+		f.actionErr = err
+	default:
+		panic("router.Filter.RunAction: neither SetAction nor SetH2Action was called before RunAction (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
 	}
-	f.actionRan = true
-	status, bytesSent, picked, err := f.action(ctx, f.req, f.bw)
-	f.actionStatus = status
-	f.actionBytesSent = bytesSent
-	f.actionPicked = picked
-	f.actionErr = err
 }
 
 // emitAccessLog constructs an accesslog.Record from H1 primitives and submits

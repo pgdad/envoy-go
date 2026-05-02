@@ -114,6 +114,18 @@ func (a *directResponseAction) asRouterAction() router.Action {
 	}
 }
 
+// asRouterActionH2 returns a router.H2Action closure wrapping a.writeH2 for
+// the chain-mediated H2 dispatch path (Task 16). The closure surfaces
+// (status, bytesSent=len(bodyText), picked=zero, err=writeH2 error) so HCM
+// h2dispatch.go's chain-completion hook can populate the access-log record
+// per SPEC §12 #3 + Decision §3.1.
+func (a *directResponseAction) asRouterActionH2() router.H2Action {
+	return func(_ context.Context, _ h2.H2Request, sw h2.StreamWriter) (int, int64, cluster.Endpoint, error) {
+		err := a.writeH2(sw)
+		return a.status, int64(len(a.bodyText)), cluster.Endpoint{}, err
+	}
+}
+
 // clusterRouteAction is the H1 cluster-dial bridge introduced at Task 15.
 // It wraps a *cluster.Cluster handle and satisfies the routeAction interface
 // by delegating BOTH do() and asRouterAction() to the canonical H1
@@ -148,4 +160,17 @@ func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufi
 // router filter via *Filter.SetAction.
 func (a *clusterRouteAction) asRouterAction() router.Action {
 	return router.H1ClusterAction(a.cluster)
+}
+
+// asRouterActionH2 returns the router.H2Action closure built by the router
+// package's H2ClusterAction constructor. This is the seam HCM h2dispatch.go's
+// chain-mediated H2 path (Task 16) plumbs into the terminal router filter via
+// *Filter.SetH2Action. The same clusterRouteAction satisfies BOTH H1 and H2
+// dispatch paths; HCM dispatch picks which asRouterAction* to invoke based on
+// the listener's negotiated codec — H1 listeners go through asRouterAction,
+// H2 listeners through asRouterActionH2. This collapses the phase-05.2
+// H1/H2 routerAction variant selection into a single bridge type whose
+// router-package backend handles both protocols.
+func (a *clusterRouteAction) asRouterActionH2() router.H2Action {
+	return router.H2ClusterAction(a.cluster)
 }

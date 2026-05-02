@@ -8,70 +8,32 @@
 package hcm
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/esalaine/envoy-go/internal/cluster"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 )
 
-// routerActionH2 is a stub type kept alive ONLY so h2dispatch.go's
-// type-switch + adapter struct field references compile after Task 15's H1
-// rewrite. Pre-Task-12 this was a real H2 upstream-dial action defined in
-// internal/filter/hcm/actions.go; Task 12 moved the implementation to
-// internal/filter/http/router.routerActionH2 (package-private). Task 15
-// changed buildRouterAction to always return *clusterRouteAction, so the
-// type-switch arm `case *routerActionH2:` is dead code post-Task-15 — it
-// stays defined here so h2dispatch.go compiles. Task 16 deletes this stub
-// + rewrites h2dispatch.go to drive the chain (mirroring connection.go's
-// Task-15 rewrite).
+// h2Dispatcher implements h2.Dispatcher by delegating to f.table.match. Phase
+// 07.1 Task 16: Match no longer wraps a routeAction into an action-specific
+// adapter — it returns a single chainDispatchAction that, on WriteH2, builds
+// the per-stream *FilterChain, drives decode-side iteration, invokes the
+// terminal router filter's RunAction, and emits the access-log record from
+// the chain-completion hook (Decision §3.1, mirroring connection.go's
+// Task-15 H1 rewrite).
 //
-// The doH2 method is required because h2RouterActionAdapter still has a
-// `doH2Fn func(...) (int, error)` field that is default-bound to a.a.doH2
-// at construction; without this method the binding wouldn't compile. The
-// stub returns 500 + INTERNAL_ERROR to match the H2 rejection path; in
-// practice this method is never reached because buildRouterAction never
-// constructs a *routerActionH2 anymore (the type-switch's case-arm is
-// dead code).
-type routerActionH2 struct{}
-
-func (r *routerActionH2) doH2(_ context.Context, _ h2.H2Request, _ h2.StreamWriter) (int, error) {
-	return 500, h2.NewStreamError(h2.ErrInternalError, 0, "routerActionH2 stub (Task 15 placeholder; Task 16 wires real H2 dispatch)")
-}
-
-// do + asRouterAction satisfy the routeAction interface so the stub can
-// appear in entry.action's type-switch arms. The stub never gets constructed
-// in practice (buildRouterAction always returns *clusterRouteAction
-// post-Task-15) so the methods are unreachable defensive shims.
-//
-// All three methods (`do`, `doH2`, `asRouterAction`) return an identically-
-// shaped 500 / INTERNAL_ERROR outcome so a hypothetical misrouted invocation
-// produces a coherent error path rather than a silent nil-deref. In particular
-// `asRouterAction` returns a non-nil `router.Action` closure (NOT nil) so a
-// caller that injects the closure into `*router.Filter.SetAction` and then
-// drives `RunAction` produces a 500 + descriptive error rather than a panic
-// on a nil function call. M-6 from REVIEW.md (Task 15 review-loop).
-func (r *routerActionH2) do(_ context.Context, _ *http.Request, _ *bufio.Writer) (int, error) {
-	return 500, errors.New("hcm: routerActionH2 stub reached — Task 16 territory")
-}
-func (r *routerActionH2) asRouterAction() router.Action {
-	return func(_ context.Context, _ *http.Request, _ *bufio.Writer) (int, int64, cluster.Endpoint, error) {
-		return 500, 0, cluster.Endpoint{}, errors.New("hcm: routerActionH2 stub reached — Task 16 territory")
-	}
-}
-
-// h2Dispatcher implements h2.Dispatcher by delegating to f.table.match.
-// Wraps each matched action into an h2.Action implementation.
-//
-// Phase 06.1 Task 11: holds the *Filter (not just the *routeTable) so the
-// per-instance HCM-scope counters can be Inc'd at dispatch entry (per
-// SPEC §5.5 + §12 #1 site (a)) and on response status finalization (the
-// adapters below carry the Filter reference for the response-class hook).
+// On no-match, Match returns a chainDispatchAction whose action+routeIdx
+// reflect the synthesized 404 path (no chain is built; the action writes the
+// 404 directly to the H2 stream writer + emits the access-log record). This
+// matches the H1 path's no-match branch in connection.go.
 type h2Dispatcher struct {
 	f *Filter
 }
@@ -82,13 +44,15 @@ func newH2Dispatcher(f *Filter) *h2Dispatcher {
 
 // Match resolves an incoming *http.Request to an h2.Action. Returns ok=true
 // in all cases:
-//   - direct_response route        → h2DirectResponseAdapter wrapping the action.
-//   - no-match (table miss)        → h2DirectResponseAdapter with a 404 synthesis (empty body, matching phase-04 H1 convention at connection.go).
-//   - *routerActionH2 route        → h2RouterActionAdapter wrapping the action (phase 05.2 + SPEC §5.5).
-//   - any other route action       → h2RouterActionRejection, which returns ErrInternalError on WriteH2 (SPEC §5.2 step 4c).
+//   - matched route                → chainDispatchAction wrapping the matched
+//     entry's H2 action + routeIdx; WriteH2 drives the per-stream chain.
+//   - no-match (table miss)        → chainDispatchAction with a synthesized
+//     404 H2 action and routeIdx=-1; WriteH2 writes the 404 directly without
+//     running any chain (matches the H1 path's no-match branch in
+//     connection.go).
 //
-// ok=false is never returned because the match engine itself cannot fail;
-// a Dispatcher returning ok=false would cause the dispatch helper to emit
+// ok=false is never returned because the match engine itself cannot fail; a
+// Dispatcher returning ok=false would cause the dispatch helper to emit
 // RST_STREAM(INTERNAL_ERROR), which is correct for a genuine engine failure
 // but not for the expected "no match" case.
 //
@@ -99,123 +63,199 @@ func newH2Dispatcher(f *Filter) *h2Dispatcher {
 func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 	d.f.downstreamRqTotal.Inc()
 
-	entry, _, ok := d.f.table.match(req)
+	entry, routeIdx, ok := d.f.table.match(req)
 	if !ok {
-		// No matching route — synthesize 404 with empty body (matches phase-04 H1 convention; configured catch-all routes carry their own body).
-		return &h2DirectResponseAdapter{a: &directResponseAction{status: 404, bodyText: ""}, f: d.f}, true
+		// No matching route — synthesize 404 with empty body. The chain is
+		// NOT built; we surface the 404 via a directResponseAction-equivalent
+		// closure (writeH2 invocation) so HCM's chain-completion hook +
+		// access-log emit fire on a single uniform shape. routeIdx=-1
+		// signals "no chain" to chainDispatchAction.WriteH2.
+		notFound := &directResponseAction{status: 404, bodyText: ""}
+		return &chainDispatchAction{
+			f:        d.f,
+			action:   notFound.asRouterActionH2(),
+			req:      req,
+			routeIdx: -1,
+			status:   404,
+		}, true
 	}
-	switch a := entry.action.(type) {
-	case *directResponseAction:
-		return &h2DirectResponseAdapter{a: a, f: d.f}, true
-	case *routerActionH2:
-		// Phase 05.2: routerActionH2 routes proxy via fresh upstream H2 dial.
-		adapter := &h2RouterActionAdapter{a: a, f: d.f}
-		// Phase 06.1 Task 11: default-bind doH2Fn to the receiver-bound
-		// method so production behavior is unchanged; tests substitute the
-		// field to drive the M-9 log-line surface (see h2dispatch_test.go).
-		adapter.doH2Fn = a.doH2
-		return adapter, true
-	default:
-		// Non-H2 router action on H2 path (e.g. *routerAction). Variant selection
-		// at filter-build time (config.go:buildRouterAction) should prevent this
-		// in well-formed bootstraps; defensively return INTERNAL_ERROR + RST.
-		return &h2RouterActionRejection{f: d.f}, true
-	}
+
+	return &chainDispatchAction{
+		f:        d.f,
+		action:   entry.action.asRouterActionH2(),
+		req:      req,
+		routeIdx: routeIdx,
+	}, true
 }
 
-// h2DirectResponseAdapter wraps a *directResponseAction as an h2.Action.
-// WriteH2 delegates to a.a.writeH2(sw) (the codec-neutral writer factored
-// out in 05.1 Task 10). Phase 05.2: WriteH2 ignores ctx + req — direct_response
-// synthesizes the reply from its own state.
+// chainDispatchAction is the single h2.Action implementation that drives the
+// per-stream *FilterChain on the H2 path post-Task-16. The Match call
+// resolves the matched route's H2 action closure (or a 404 synth on no-match)
+// and packages it here; WriteH2 runs the per-request chain machinery.
 //
-// Phase 06.1 Task 11: f is the parent Filter (held for the response-class
-// hook); a.a.status is the finalized status — Inc the matching HCM bucket
-// before delegating to writeH2 ("before bytes hit the wire", SPEC §5.5).
+// Lifecycle (mirrors connection.go's H1 dispatchRequest, Task 15):
+//  1. Allocate fresh per-request *HTTPFilter instances from f.chainConfig.
+//  2. Build chain via filter_http.NewFilterChain(chainHF, f.perRouteConfig);
+//     defer chain.Destroy.
+//  3. SetRequestCtx(ctx, routeIdx) on the chain.
+//  4. Locate the terminal *router.Filter, inject SetH2Action / SetH2Request /
+//     SetH2Writer.
+//  5. Run RunDecodeHeaders(req.Header, endStream=...). H2 body is buffered
+//     fully before dispatch (h2.serverStream snapshots reqBody before
+//     spawning the dispatch goroutine), so we feed it to RunDecodeData in a
+//     single chunk after decode-headers if non-empty.
+//  6. Invoke rf.RunAction(ctx). This dispatches to the H2Action closure
+//     (the matched route's writer logic) which calls sw.WriteHeaders /
+//     sw.WriteData and surfaces (status, bytesSent, picked, err).
+//  7. Read back the captures; emit access-log via f.emitAccessLogH2 — a
+//     no-op when status==0 (H2 ctx-cancel sentinel per SPEC §2.1) or when
+//     f.accessLog is empty.
+//  8. Inc the HCM-scope downstream_rq_<Nxx> counter once per finalized
+//     status. status==0 skips the bucket Inc (matches the ctx-cancel
+//     "request did not complete" semantics).
+//  9. Return the actionErr. serverStream.dispatch reads *h2.Error to emit
+//     the matching RST_STREAM(<code>) on the wire.
 //
-// Phase 06.2 Task 13: emits access-log record via f.emitAccessLogH2 on
-// return. bytesSent is len(bodyText) — the wire bytes for the inline body.
-type h2DirectResponseAdapter struct {
-	a *directResponseAction
-	f *Filter
+// No-match path (routeIdx == -1): skip chain construction and run the H2Action
+// closure directly. This matches the H1 path in connection.go where 404
+// catch-all does not build a chain (no route → no per-route config → no
+// terminal action machinery to run). HCM-scope downstream_rq_<Nxx> Inc + the
+// access-log emit still fire from the same hook.
+type chainDispatchAction struct {
+	f        *Filter
+	action   router.H2Action
+	req      *http.Request
+	routeIdx int
+	// status pinned at construction time; for no-match path only (404). Unused
+	// for the matched-route case (status comes from rf.Status() post-RunAction).
+	status int
 }
 
-func (a *h2DirectResponseAdapter) WriteH2(_ context.Context, req h2.H2Request, sw h2.StreamWriter) error {
-	start := time.Now()
-	defer a.f.emitAccessLogH2(req, a.a.status, int64(len(a.a.bodyText)), cluster.Endpoint{}, start)
-	if c := a.f.downstreamStatusClassCounter(a.a.status); c != nil {
-		c.Inc()
+func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, sw h2.StreamWriter) error {
+	startTime := time.Now()
+
+	// No-match path: skip chain construction; invoke the synthesized 404
+	// action directly + emit access-log. Mirrors H1 connection.go's
+	// dispatchRequest no-match branch.
+	if c.routeIdx < 0 {
+		status, bytesSent, picked, err := c.action(ctx, h2req, sw)
+		c.f.emitAccessLogH2(h2req, status, bytesSent, picked, startTime)
+		if cnt := c.f.downstreamStatusClassCounter(status); cnt != nil {
+			cnt.Inc()
+		}
+		return err
 	}
-	return a.a.writeH2(sw)
-}
 
-// h2RouterActionAdapter wraps a *routerActionH2 as an h2.Action. WriteH2
-// delegates to a.a.doH2(ctx, req, sw) — see actions.go for the H2 driver.
-// Per ADR-0058: trailers are observed but not forwarded by the upstream-side
-// codec; the adapter does not surface them to the downstream-side writer.
-//
-// Phase 06.1 Task 11:
-//   - f is the parent Filter held so the adapter can later report the
-//     response-class to the HCM-scope counter (see the per-status post-doH2
-//     hook in WriteH2 below).
-//   - doH2Fn is a function-typed test hook (default-bound to a.a.doH2 by
-//     newH2Dispatcher.Match). Tests substitute it to inject sentinel-failing
-//     drivers for the M-9 log-line surface (per SPEC §11.4 + §13.1).
-//   - The M-9 carry-forward log line ("h2: doH2 error: %v") fires on the
-//     doH2 error path before the error propagates upward — addresses the
-//     observability gap noted in 05.2 REVIEW M-9.
-type h2RouterActionAdapter struct {
-	a      *routerActionH2
-	f      *Filter
-	doH2Fn func(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) (int, error)
-}
-
-func (a *h2RouterActionAdapter) WriteH2(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) error {
-	fn := a.doH2Fn
-	if fn == nil {
-		fn = a.a.doH2 // defensive: production path Match always default-binds, but a hand-built adapter (tests) might not.
+	// Allocate fresh per-request filter instances from chainConfig. Per
+	// ADR-0071's two-step factory pattern: each entry's factory is invoked
+	// once per request to allocate a new instance bound to its parsed config.
+	chainHF := make([]filter_http.HTTPFilter, len(c.f.chainConfig))
+	for i, e := range c.f.chainConfig {
+		chainHF[i] = e.factory()
 	}
-	status, err := fn(ctx, req, sw)
-	// Phase 06.1 Task 11: HCM-scope downstream_rq_<Nxx> Inc on the H2 path
-	// per SPEC §5.5 "HCM response hook" row — Inc once per finalized
-	// response status. status==0 (ctx-cancel path) skips the bucket Inc
-	// since no terminating status was produced.
-	if status > 0 {
-		if c := a.f.downstreamStatusClassCounter(status); c != nil {
-			c.Inc()
+	chain := filter_http.NewFilterChain(chainHF, c.f.perRouteConfig)
+	chain.SetRequestCtx(ctx, c.routeIdx)
+	defer chain.Destroy()
+
+	// Locate the terminal router filter and inject the per-request H2
+	// action + req + writer. ValidateChainShape pins the terminal type_url
+	// to router.TypeURL and router.New is the only registered factory for
+	// that URL; the cast is defensive against future shape changes only.
+	rf, ok := chainHF[len(chainHF)-1].Decoder.(*router.Filter)
+	if !ok {
+		log.Printf("hcm: h2dispatch: terminal filter is not *router.Filter (got %T)", chainHF[len(chainHF)-1].Decoder)
+		// Best-effort 500 synthesis on the wire; mirrors the H1 path's
+		// dispatchRequest defensive branch.
+		_ = c.f.write500H2(sw)
+		c.f.emitAccessLogH2(h2req, 500, 0, cluster.Endpoint{}, startTime)
+		if cnt := c.f.downstreamStatusClassCounter(500); cnt != nil {
+			cnt.Inc()
+		}
+		return nil
+	}
+	rf.SetH2Action(c.action)
+	rf.SetH2Request(h2req)
+	rf.SetH2Writer(sw)
+
+	// Decode side: headers → data → trailers. H2 body is fully buffered
+	// before dispatch (h2.serverStream snapshots reqBody before spawning
+	// the dispatch goroutine — see stream.go), so we know if a body is
+	// present from h2req.Body length and feed it as a single chunk via
+	// RunDecodeData with endStream=true. If the body is empty, RunDecodeHeaders
+	// fires with endStream=true. RunDecodeTrailers is not invoked: SPEC §2.1
+	// observes-and-discards request trailers in the codec layer (per ADR-0058);
+	// the FilterChain does not yet expose RunDecodeTrailers (Task 18 will
+	// extend if needed for cors/probe).
+	hasBody := len(h2req.Body) > 0
+	endStreamOnHeaders := !hasBody
+
+	if _, err := chain.RunDecodeHeaders(ctx, c.req.Header, endStreamOnHeaders); err != nil {
+		// ctx-cancel or unknown filter status. status==0 → emitAccessLogH2
+		// skips submission per SPEC §2.1 sentinel. Surface the err to
+		// serverStream.dispatch which decides RST code from *h2.Error.
+		return err
+	}
+
+	if hasBody {
+		if _, err := chain.RunDecodeData(ctx, h2req.Body, true); err != nil {
+			return err
 		}
 	}
-	if err != nil {
-		// Phase 06.1 Task 11 — M-9 carry-forward (SPEC §13.1). The 05.2
-		// REVIEW deferred this to "phase-06 observability when logging /
-		// metrics surface lands" (REVIEW.md M-9). One-line log to stderr
-		// gives an operator debugging an INTERNAL_ERROR-class RST_STREAM
-		// the underlying doH2 error string without spelunking the
-		// dispatch carry-error path.
-		log.Printf("h2: doH2 error: %v", err)
-		return err
+
+	// Terminal-action invocation. Idempotent — if a non-terminal filter
+	// triggered SendLocalReply earlier, the chain transitioned to encode
+	// mode and rf.actionRan stays false; the rf.h2Action does NOT run, so
+	// the captures stay zero-valued and emitAccessLogH2 / counter Inc skip
+	// per their status==0 guards. Task-16 H2 path with router-only chain
+	// always reaches here with the action populated.
+	rf.RunAction(ctx)
+
+	status := rf.Status()
+	bytesSent := rf.BytesSent()
+	picked := rf.Picked()
+	actionErr := rf.ActionErr()
+
+	// Per Decision §3.1: single uniform access-log emit site at chain-completion.
+	// emitAccessLogH2 is a no-op when status==0 (H2 ctx-cancel sentinel per
+	// SPEC §2.1 last bullet) or when f.accessLog is empty.
+	c.f.emitAccessLogH2(h2req, status, bytesSent, picked, startTime)
+
+	// Phase 06.1 Task 11: HCM-scope downstream_rq_<Nxx> Inc on the H2 path
+	// per SPEC §5.5 "HCM response hook" row — Inc once per finalized response
+	// status. status==0 (ctx-cancel path) skips the bucket Inc since no
+	// terminating status was produced.
+	if status > 0 {
+		if cnt := c.f.downstreamStatusClassCounter(status); cnt != nil {
+			cnt.Inc()
+		}
+	}
+
+	if actionErr != nil {
+		// Phase 06.1 M-9 carry-forward (SPEC §13.1). One-line log gives an
+		// operator debugging an INTERNAL_ERROR-class RST_STREAM the underlying
+		// action error string without spelunking the dispatch carry-error
+		// path. Preserved from the pre-Task-16 h2RouterActionAdapter.
+		log.Printf("h2: action error: %v", actionErr)
+		return actionErr
 	}
 	return nil
 }
 
-// h2RouterActionRejection is a sentinel h2.Action returned when the matched
-// route action is neither a *directResponseAction nor a *routerActionH2.
-// WriteH2 returns ErrInternalError so stream.dispatch emits RST_STREAM(INTERNAL_ERROR)
-// per SPEC §5.2 step 4c. Phase 05.2: WriteH2 ignores ctx + req (the rejection
-// is unconditional).
-//
-// Phase 06.1 Task 11: f is the parent Filter held for symmetry with the
-// other adapters; the rejection is conceptually a 500-class outcome so
-// Inc downstream_rq_5xx before returning the INTERNAL_ERROR.
-type h2RouterActionRejection struct {
-	f *Filter
-}
-
-func (r *h2RouterActionRejection) WriteH2(_ context.Context, _ h2.H2Request, _ h2.StreamWriter) error {
-	if c := r.f.downstreamStatusClassCounter(500); c != nil {
-		c.Inc()
+// write500H2 emits a minimal 500 Internal Server Error local reply on the
+// H2 stream writer. Used only on the defensive non-*router.Filter terminal
+// branch above (unreachable in well-formed bootstraps because ValidateChainShape
+// pins the terminal type_url to router.TypeURL). Body is empty to match the
+// phase-04 H1 convention for synthesized 500s.
+func (f *Filter) write500H2(sw h2.StreamWriter) error {
+	hdrs := []hpack.HeaderField{
+		{Name: ":status", Value: "500"},
+		{Name: "date", Value: dateHeader()},
+		{Name: "server", Value: serverHeader()},
+		{Name: "content-type", Value: "text/plain"},
+		{Name: "content-length", Value: strconv.Itoa(0)},
 	}
-	// Pass stream ID 0 — the dispatch helper reads only the Code field when
-	// deciding which ErrCode to use for the RST_STREAM; the stream ID in the
-	// error is informational only.
-	return h2.NewStreamError(h2.ErrInternalError, 0, "router action on h2 listener (SPEC §5.2 step 4c)")
+	if err := sw.WriteHeaders(hdrs, true); err != nil {
+		return err
+	}
+	return nil
 }

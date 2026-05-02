@@ -60,6 +60,11 @@ func (m matchPrefix) matches(p string) bool { return strings.HasPrefix(p, string
 type routeAction interface {
 	do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error)
 	asRouterAction() router.Action
+	// asRouterActionH2 returns the H2-flavored router.H2Action closure for the
+	// chain-mediated H2 dispatch path (Task 16). HCM h2dispatch.go injects this
+	// closure into the terminal router filter via *Filter.SetH2Action before
+	// chain iteration begins. Mirrors asRouterAction's role on the H1 path.
+	asRouterActionH2() router.H2Action
 }
 
 // routeEntry pairs a match predicate with the action to invoke on a hit. The

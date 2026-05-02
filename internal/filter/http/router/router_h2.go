@@ -17,6 +17,81 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 )
 
+// H2ClusterAction returns an H2Action closure that proxies the per-request
+// H2 upstream call to the supplied cluster's selected endpoint. The closure
+// delegates to a fresh internal driver (doH2ClusterAction) modeled after the
+// byte-preserved routerActionH2.doH2 logic but surfacing (status, bytesSent,
+// picked, err) for the chain-mediated dispatch path. HCM h2dispatch.go builds
+// one of these per matched route at filter-build time and injects it via
+// *Filter.SetH2Action at request-start.
+//
+// Per SPEC §11.9 / SPEC §2.1:
+//   - Cluster.DialH2 error        → 502 local reply, status=502, err=nil
+//   - RoundTrip ctx-cancel        → status=0, err=*h2.Error(CANCEL) (sentinel)
+//   - RoundTrip protocol error    → 502 local reply, status=502, err=nil
+//   - Upstream HTTP status        → forwarded verbatim to downstream sw,
+//                                   status=resp.Status, err=writer-error or nil.
+//
+// status=0 on the ctx-cancel path is the H2 sentinel per SPEC §2.1 last
+// bullet; HCM's chain-completion access-log emit hook skips submission on
+// status=0.
+func H2ClusterAction(c *cluster.Cluster) H2Action {
+	a := &routerActionH2{cluster: c}
+	return func(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) (int, int64, cluster.Endpoint, error) {
+		return doH2ClusterAction(ctx, a, req, sw)
+	}
+}
+
+// doH2ClusterAction runs the per-request H2 upstream-dial dispatch and surfaces
+// (status, bytesSent, picked, err) for the H2Action closure. Logic mirrors
+// routerActionH2.doH2 BUT exposes the bytesSent + picked locals to the caller
+// (rather than capturing them in a deferred access-log emit, which is what
+// routerActionH2.doH2 does for the legacy direct-call path). The access-log
+// emit-deferral was migrated to HCM dispatch's chain-completion hook per
+// Decision §3.1; this function is the byte-preserved H2 cluster-dial driver
+// for the chain-mediated dispatch path.
+func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request, sw h2.StreamWriter) (int, int64, cluster.Endpoint, error) {
+	bytesSent := int64(0)
+	picked := cluster.Endpoint{}
+
+	a.cluster.IncUpstreamRqTotal()
+
+	cc, ep, err := a.cluster.DialH2(ctx)
+	if err != nil {
+		a.cluster.IncStatusClass(502)
+		return 502, bytesSent, picked, a.write502(sw)
+	}
+	defer func() { _ = cc.Close() }()
+	picked = ep
+
+	resp, err := cc.RoundTrip(ctx, req)
+	if err != nil {
+		// Distinguish caller-side ctx-cancel/deadline (→ stream-scoped CANCEL
+		// surfaced upward as *h2.Error so serverStream.dispatch emits
+		// RST_STREAM(CANCEL)) from any other error (→ 502 local reply). Mirror
+		// of routerActionH2.doH2's ctx-vs-other discrimination.
+		if ctx.Err() != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+			// status=0 → H2 ctx-cancel sentinel per SPEC §2.1 last bullet.
+			// emitAccessLogH2 skips submission on status==0; serverStream.dispatch
+			// reads err.Code == ErrCancel and emits RST_STREAM(CANCEL).
+			return 0, bytesSent, picked, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
+		}
+		a.cluster.IncStatusClass(502)
+		return 502, bytesSent, picked, a.write502(sw)
+	}
+
+	a.cluster.IncStatusClass(resp.Status)
+	bytesSent = int64(len(resp.Body))
+
+	if err := sw.WriteHeaders(resp.Headers, false); err != nil {
+		return resp.Status, bytesSent, picked, err
+	}
+	if err := sw.WriteData(resp.Body, true); err != nil {
+		return resp.Status, bytesSent, picked, err
+	}
+	return resp.Status, bytesSent, picked, nil
+}
+
 // emitAccessLogH2 is the H2-flavored variant of (*Filter).emitAccessLog;
 // reads pseudo-headers (:method, :path, :authority) and User-Agent from
 // H2Request fields. Per SPEC §2.1 last bullet, a zero statusCode is the H2
