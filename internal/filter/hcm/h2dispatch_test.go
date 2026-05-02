@@ -114,12 +114,18 @@ func routerOnlyChain(t *testing.T) []chainEntry {
 	return []chainEntry{{name: "envoy.filters.http.router", factory: rfFactory}}
 }
 
-// TestH2Dispatcher_Match_DirectResponse_RunsChainAndEmitsAccessLog covers the
+// TestH2Dispatcher_Match_DirectResponse_WireOutputAndAccessLog covers the
 // chain-mediated H2 dispatch path for a matched direct_response route. The
 // chainDispatchAction allocates a per-stream FilterChain, drives decode
 // iteration through the terminal router, invokes RunAction (which calls the
 // directResponseAction's writeH2 via H2Action), and emits a single access-log
 // record from the chain-completion hook.
+//
+// Scope note: this test asserts wire output + access-log emit + bucket-Inc
+// only — it does NOT install a recording filter, so it does not verify
+// chain-mediation order. Chain-mediation order (decode/encode invocation
+// sequencing across multiple filters) is a Task-17 responsibility, exercised
+// by chain_integration_test.go.
 //
 // Asserted:
 //   - WriteH2 returns nil (no action error).
@@ -127,7 +133,7 @@ func routerOnlyChain(t *testing.T) []chainEntry {
 //   - One access-log record was submitted with ResponseCode=200, Protocol=HTTP/2.0,
 //     UpstreamHost=empty (direct_response).
 //   - downstream_rq_2xx was Inc'd to 1.
-func TestH2Dispatcher_Match_DirectResponse_RunsChainAndEmitsAccessLog(t *testing.T) {
+func TestH2Dispatcher_Match_DirectResponse_WireOutputAndAccessLog(t *testing.T) {
 	cs := &emitCaptureSink{}
 	tt := &routeTable{routes: []routeEntry{
 		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
@@ -305,12 +311,17 @@ func TestH2Dispatcher_ActionError_LogsM9(t *testing.T) {
 	}
 }
 
-// TestH2Dispatcher_CtxCancel_Status0_SkipsAccessLog verifies the H2 ctx-cancel
-// sentinel discipline (SPEC §2.1 last bullet): when the H2Action returns
-// status==0 (the canonical "ctx canceled, no terminating status" shape), the
-// chain-completion access-log emit hook is a no-op. Mirrors the pre-Task-16
-// TestRouterActionH2_DoH2_CtxCancel_SkipsEmit assertion.
-func TestH2Dispatcher_CtxCancel_Status0_SkipsAccessLog(t *testing.T) {
+// TestH2Dispatcher_Status0Sentinel_SkipsAccessLog verifies the post-RunAction
+// status==0 sentinel guard (SPEC §2.1 last bullet): when the action returned
+// status==0 (regardless of cause — could be ctx-cancel, could be a
+// sentinel-error path; this test exercises a faultyAction returning
+// (0, 0, {}, sentinel) under context.Background()), the chain-completion
+// access-log emit hook is a no-op and the per-bucket downstream_rq_Nxx
+// counters are not Inc'd. Mirrors the pre-Task-16
+// TestRouterActionH2_DoH2_CtxCancel_SkipsEmit assertion (renamed for
+// honesty: ctx is never canceled here; the guard fires on the status==0
+// shape itself).
+func TestH2Dispatcher_Status0Sentinel_SkipsAccessLog(t *testing.T) {
 	cs := &emitCaptureSink{}
 	sentinel := h2.NewStreamError(h2.ErrCancel, 0, "ctx canceled (test)")
 	tt := &routeTable{routes: []routeEntry{
