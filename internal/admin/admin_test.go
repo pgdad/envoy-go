@@ -3,6 +3,7 @@ package admin
 import (
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -226,5 +227,91 @@ func TestAdminWriteTimeoutIs30s(t *testing.T) {
 	_ = addr
 	if got := s.httpSrv.WriteTimeout; got != 30*time.Second {
 		t.Errorf("WriteTimeout: got %v, want %v (per PLAN planner-time decision 2)", got, 30*time.Second)
+	}
+}
+
+// TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders is the per-endpoint
+// smoke test per SPEC §3 gate (b) + §6.4 per-endpoint contract + §11.6
+// header set. Each of the four 08.1 endpoints (/config_dump, /clusters,
+// /listeners, /server_info) must return 200, the correct Content-Type, and
+// the four constant headers (Cache-Control, X-Content-Type-Options, Server,
+// Date — Date is auto-added by net/http).
+func TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders(t *testing.T) {
+	bs := mustMinimalBs(t)
+	cm := mustMinimalCM(t, bs)
+	lm := mustMinimalLM(t, bs, cm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	addr, err := s.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	s.MarkReady()
+	time.Sleep(20 * time.Millisecond)
+
+	cases := []struct {
+		path        string
+		wantContent string
+	}{
+		{"/config_dump", "application/json"},
+		{"/clusters", "text/plain; charset=UTF-8"},
+		{"/listeners", "text/plain; charset=UTF-8"},
+		{"/server_info", "application/json"},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			resp, err := http.Get("http://" + addr + c.path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", c.path, err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != 200 {
+				t.Errorf("status: got %d, want 200", resp.StatusCode)
+			}
+			if got := resp.Header.Get("Content-Type"); got != c.wantContent {
+				t.Errorf("Content-Type: got %q, want %q", got, c.wantContent)
+			}
+			// Four constant headers from §11.6.
+			for _, h := range []struct{ key, want string }{
+				{"Cache-Control", "no-cache, max-age=0"},
+				{"X-Content-Type-Options", "nosniff"},
+				{"Server", "envoy"},
+			} {
+				if got := resp.Header.Get(h.key); got != h.want {
+					t.Errorf("header %q: got %q, want %q", h.key, got, h.want)
+				}
+			}
+			// Date is auto-added by net/http; assert non-empty.
+			if got := resp.Header.Get("Date"); got == "" {
+				t.Errorf("Date header empty (net/http should auto-add)")
+			}
+		})
+	}
+}
+
+// TestAdmin_FourEndpointsAcceptAnyMethod pins SPEC §11.8 Envoy parity:
+// upstream Envoy v1.37.2 does NOT enforce method discrimination on the
+// read-only admin endpoints; envoy-go matches Envoy parity. This test
+// asserts POST /config_dump returns 200 (mirrors §11.8 verbatim evidence).
+func TestAdmin_FourEndpointsAcceptAnyMethod(t *testing.T) {
+	bs := mustMinimalBs(t)
+	cm := mustMinimalCM(t, bs)
+	lm := mustMinimalLM(t, bs, cm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	addr, err := s.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	s.MarkReady()
+	time.Sleep(20 * time.Millisecond)
+
+	resp, err := http.Post("http://"+addr+"/config_dump", "application/json", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("POST /config_dump: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		t.Errorf("POST /config_dump status: got %d, want 200 (Envoy parity per §11.8)", resp.StatusCode)
 	}
 }
