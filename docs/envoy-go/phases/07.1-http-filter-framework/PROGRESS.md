@@ -1658,3 +1658,62 @@ ok  	github.com/esalaine/envoy-go/test/differential	20.823s
 ```
 
 **Closes Task 18 prerequisite I-3 (deferred from review-loop):** ActionResponse.Headers promoted from `http.Header` → `OrderedHeaders`; the dual-shape `writeH1Reply`/`writeH1ReplyOrdered` (and H2 mirror) collapsed to a single ordered helper per codec. cors's encode-side actual-request 3-header injection now flows through the `OrderedHeaders` carrier with deterministic alphabetical ordering for net-new keys (trade-off documented above). Task 21 (`0007a-cors` differential fixture) becomes pure fixture-authoring with no further framework-side changes required.
+
+---
+
+## Task 20 — boot wiring (HTTPRegistry alloc + freeze) + cors v3 blank-import
+
+**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+
+**Files changed:**
+
+- `cmd/envoy-go/main.go` — extended the Task-15 minimal HTTPRegistry boot block from router-only to the full three-filter set: `Register(router.TypeURL, router.New)`, `Register(cors.TypeURL, cors.New)`, `Register(envoygotest.TypeURL, envoygotest.New)`, then `Freeze()`. New imports for `cors` and `envoygotest` packages. The router-only Task-15 block was a deliberate bridge while Tasks 18–19 produced the cors / envoygotest factories; Task 20 is the canonical phase-07.1 boot shape per ADR-0072 (freeze-after-boot extension registry). The Freeze call is placed BEFORE `listener.NewManagerWithBaseDirAndAllowH2C` so the chain build (which resolves typed_config TypeURLs against the frozen registry) sees a fully-populated immutable registry. The HTTPRegistry is then threaded through unchanged from Task 14's manager-signature widening — no listener-side changes were required at Task 20.
+- `internal/listener/manager.go` — verified threading (no edits needed; Task 14 already widened `NewManagerWithBaseDirAndAllowH2C` to take `*filter_http.HTTPRegistry`, capture it into the HCM-factory closure, and pass it through to `hcm.NewFilterWithCtxAndSinksAndRegistry`).
+- `internal/bootstrap/bootstrap.go` — added blank-import `_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"` so the `Cors` filter-level message and the `CorsPolicy` per-route message are both registered with `protoregistry.GlobalTypes`. Without this, protojson would reject 07.1 fixture bootstraps that carry `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{...}` entries on virtual_hosts / routes (the form used by 0007a-cors at Task 21). Strictly speaking the `cors` filter package itself imports `cors/v3` transitively, but the explicit blank-import here makes the dependency obvious to bootstrap-side readers and guarantees registration regardless of any future build-graph rearrangement. Per ADR-0016 amendment policy the addition is documented in this PROGRESS entry, not as a new ADR.
+- `internal/filter/doc.go` — REWRITTEN per PLAN sketch. The phase-00 placeholder ("real implementation lands in phase 07") is replaced with an architectural overview pointing to `filter/http/`, `filter/hcm/`, `filter/tcpproxy/`, and listing the framework deliverables introduced by phase 07.1 with ADR refs (ADR-0071/0072/0073/0074/0075/0076).
+- `internal/bootstrap/bootstrap_test.go` — added `TestBootstrap_RoundTrips_CorsPerRouteConfig`. Models the existing `TestBootstrap_RoundTrips_FixtureFour_Shape` pattern: a minimal HCM bootstrap with a `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{allow_origin_string_match, allow_methods, allow_headers, allow_credentials}` entry on a virtual_host. Asserts both `Load` and `protojson.Marshal` round-trip cleanly. This is the "verify the post-bootstrap state" check called out in the Task 20 brief — pinning the cors/v3 blank-import contract so a future maintainer who removes the import gets a localized test failure rather than an obscure 07.1 fixture failure.
+- `cmd/envoy-go/main_test.go` — no edits required. All three tests (`TestEnvoyGoBinary_TwoListenerCutover`, `TestEnvoyGoBinary_HCMSmoke`, `TestMain_StatsPrometheusEndpointResponds`, `TestEnvoyGoBinary_AccessLogSmoke`, `TestEnvoyGoBinary_H2Smoke`) boot the binary as a subprocess via `exec.Command` and exercise the wire surface only — they do not call `main()` inline and therefore do not need an inline HTTPRegistry helper. The brief's "if `main_test.go` exercises boot logic" caveat does not apply.
+
+**Boot-time invariants pinned by this task:**
+
+1. **Freeze-after-Register-before-construction** (ADR-0072): the three `Register` calls precede `Freeze()` and `Freeze()` precedes `listener.NewManagerWithBaseDirAndAllowH2C`. Any future filter addition MUST land before `Freeze()`; runtime registration is impossible (the registry has no Register method post-Freeze; the post-Freeze contract is enforced by panic).
+2. **TypeURL coverage**: the three TypeURLs registered are exactly those a phase-07.1 HCM bootstrap can reference in `http_filters[].typed_config["@type"]`:
+   - `type.googleapis.com/envoy.extensions.filters.http.router.v3.Router`
+   - `type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors`
+   - `type.googleapis.com/envoy.filters.http.envoy_go_test.v0.EnvoyGoTest`
+3. **Bootstrap protojson coverage**: the four blank-imports relevant to phase-07.1 HCM bootstraps are now all present in `bootstrap.go`:
+   - `envoy/extensions/filters/http/router/v3` (phase 04)
+   - `envoy/extensions/filters/http/cors/v3` (Task 20)
+   - the `envoygotest` proto registers itself at package-init via `dynamicpb.NewMessageType` (Task 19) — no blank-import needed in bootstrap.go for the test-only filter
+
+**Acceptance:**
+
+- `go build ./...` clean.
+- `go vet ./...` clean.
+- `go test ./cmd/envoy-go/ ./internal/listener/ ./internal/bootstrap/ -count=1 -v` PASS (all pre-existing tests green + the new `TestBootstrap_RoundTrips_CorsPerRouteConfig` green).
+- `go test ./test/differential/ -count=1 -v -run TestDifferential` PASS (7/7 fixtures).
+- `go test ./internal/filter/... -count=1` PASS (no regressions).
+- ADR-0072 (HTTPRegistry freeze-after-boot) consistent. ADR-0016 (extension blank-imports for protojson) consistent. No new ADR required.
+
+**Outputs:**
+
+```
+$ go test ./test/differential/ -count=1 -v -run TestDifferential 2>&1 | tail -10
+--- PASS: TestDifferential (19.72s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.52s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.24s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.23s)
+    --- PASS: TestDifferential/0003-http11-routing (1.19s)
+    --- PASS: TestDifferential/0004-h2-routing (1.64s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.90s)
+    --- PASS: TestDifferential/0006-access-log (11.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	19.800s
+
+$ go test ./cmd/envoy-go/ ./internal/listener/ ./internal/bootstrap/ -count=1 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.797s
+ok  	github.com/esalaine/envoy-go/internal/listener	0.020s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.009s
+```
+
+**Deviations from PLAN sketch:** none. The five files-modified count in the PLAN ("Five files modified; one rewritten") matches the implementation (cmd/envoy-go/main.go, internal/bootstrap/bootstrap.go, internal/filter/doc.go [rewritten], internal/bootstrap/bootstrap_test.go, docs/.../PROGRESS.md = 5; internal/listener/manager.go was inspected only — Task 14 already covered the manager-signature change so no edits at Task 20). Task 21 (`0007a-cors` differential fixture) is now unblocked.

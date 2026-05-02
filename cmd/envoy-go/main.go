@@ -23,6 +23,8 @@ import (
 	"github.com/esalaine/envoy-go/internal/bootstrap"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/http/cors"
+	"github.com/esalaine/envoy-go/internal/filter/http/envoygotest"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/listener"
 )
@@ -82,16 +84,20 @@ func main() {
 	}
 	defer func() { _ = admSrv.Close() }()
 
-	// Phase 07.1 Task 15 minimal boot wiring: build the *filter_http.HTTPRegistry
-	// and register the router terminal filter so HCM bootstraps that include
-	// the router in http_filters[] (i.e., every well-formed HCM config) parse
-	// cleanly. Per ADR-0072 the registry is freeze-after-boot. cors and
-	// envoygotest filter registrations land at Task 20 (when their factories
-	// land at Tasks 18+19); for Task 15 the router-only registry is sufficient
-	// to drive the H1 differential gate (fixtures 0003-http11-routing,
-	// 0006-access-log) which exercise only the router terminal filter.
+	// Phase 07.1 Task 20 boot wiring: build the *filter_http.HTTPRegistry and
+	// register the three filter factories envoy-go ships at 07.1 — router
+	// (terminal; ADR-0071 supersedes ADR-0040 routerAction), cors (real
+	// Envoy filter; ADR-0074), envoygotest (test-only probe; ADR-0074). Per
+	// ADR-0072 the registry is freeze-after-boot: Freeze MUST be invoked
+	// after all Register calls and before the first listener is constructed
+	// (the chain build inside listener.NewManagerWithBaseDirAndAllowH2C
+	// resolves typed_config TypeURLs against the frozen registry). Task 15
+	// landed the minimal router-only variant; Task 20 is the full boot
+	// wiring per PLAN.
 	httpReg := filter_http.NewHTTPRegistry()
 	httpReg.Register(router.TypeURL, router.New)
+	httpReg.Register(cors.TypeURL, cors.New)
+	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
 	httpReg.Freeze()
 
 	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg)

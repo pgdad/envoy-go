@@ -38,6 +38,18 @@ import (
 	// these additions are documented in PROGRESS, not as a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/stream/v3"
+	// Phase 07.1 (Task 20) registers the cors HTTP filter extension proto so
+	// protojson round-trips bootstraps that carry
+	// `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{...}`
+	// entries on virtual_hosts / routes (the per-route CORS config form used
+	// by the 07.1 differential fixture 0007a-cors). The filter-level Cors
+	// message in http_filters[] is registered transitively by the cors filter
+	// package itself (cors.go imports `cors/v3`); the explicit blank-import
+	// here makes the dependency obvious to bootstrap-side readers and
+	// guarantees registration even if the filter package is ever vendored
+	// or excluded from a future build. Per ADR-0016 amendment policy this
+	// addition is documented in PROGRESS, not as a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"

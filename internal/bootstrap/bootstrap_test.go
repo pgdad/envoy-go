@@ -470,6 +470,73 @@ func TestBootstrap_AccessLog_NoEntriesIsValid(t *testing.T) {
 	}
 }
 
+// TestBootstrap_RoundTrips_CorsPerRouteConfig exercises the phase-07.1
+// (Task 20) blank-import of `envoy/extensions/filters/http/cors/v3`: a
+// minimal HCM bootstrap with a virtual_host carrying
+// `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{...}` must
+// load cleanly via Load (no protojson "type not registered" error) AND
+// survive a protojson.Marshal round-trip. Without the cors/v3 blank import,
+// protojson would reject the CorsPolicy Any at unmarshal time (ADR-0016).
+//
+// The shape mirrors the per-route configuration form used by the phase-07.1
+// 0007a-cors differential fixture (Task 21) but is kept minimal here.
+func TestBootstrap_RoundTrips_CorsPerRouteConfig(t *testing.T) {
+	yamlSrc := `
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      typed_per_filter_config:
+                        envoy.filters.http.cors:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+                          allow_origin_string_match:
+                            - exact: "https://example.com"
+                          allow_methods: "GET, POST"
+                          allow_headers: "x-custom-header"
+                          allow_credentials: true
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.cors
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+`
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.Proto.GetStaticResources().GetListeners()); got != 1 {
+		t.Fatalf("listeners: got %d, want 1", got)
+	}
+	// Round-trip via protojson — would error if the CorsPolicy proto descriptor
+	// (or the Cors filter-level descriptor) were unregistered.
+	if _, err := protojson.Marshal(bs.Proto); err != nil {
+		t.Fatalf("protojson.Marshal: %v", err)
+	}
+}
+
 // TestBootstrap_AccessLog_TwoFileEntries verifies that two file-type entries
 // are both parsed and returned in registration order.
 func TestBootstrap_AccessLog_TwoFileEntries(t *testing.T) {
