@@ -218,3 +218,49 @@ cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
 $ grep -c '^## ADR-0085:' docs/envoy-go/DECISIONS.md
 1
 ```
+
+## Task 6 — `internal/admin/configdump.go` — `/config_dump` handler [ADR-0086]
+
+**Commits:** `044f751` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-7. Step 1 wrote `internal/admin/configdump_test.go` with the six tests verbatim from PLAN: four `TestBuildConfigDump_*` unit tests (three-sub-envelopes-in-order; bootstrap-envelope-contains-parsed-proto; listeners-envelope-contains-one-static-listener; clusters-envelope-contains-one-static-cluster) + two HTTP smoke tests (`TestHandleConfigDump_HTTPSmoke200JSON` exercising 200/Content-Type/Server header + `json.Unmarshal`-parseable body with `configs` field present, and `TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent` exercising `static_listeners` snake_case + 1-space indent). Imports added: `time`, `adminv3` (per PLAN Step 1 note "the implementer adds them as needed"); `bootstrapv3` is NOT directly referenced in the test file (the helpers in admin_helpers_test.go expose `*bootstrap.Bootstrap`, and `cd.Configs[N].UnmarshalTo(&adminv3.<X>ConfigDump{})` walks types in adminv3 only). The PLAN Step 1 trailing `func min(a, b int) int { ... }` helper was OMITTED — go.mod pins `go 1.23.0` which makes Go's built-in `min` available; defining a local helper would shadow the builtin and trigger lint. Step 2 confirmed the build error `undefined: buildConfigDump` (4 references, all from configdump_test.go, all flagged). Step 3 wrote `internal/admin/configdump.go` per PLAN Step 3 verbatim minus the trailing `var _ = bytes.Buffer{}` placeholder line: Task 5 deferred adding the `bytes` import (PROGRESS Task 5 note explicitly states "the per-endpoint files in Tasks 6-9 each add their own `bytes` consumer; no `var _ = bytes.Buffer{}` hack"), so configdump.go has no `bytes` import and no `var _ = bytes.Buffer{}` line either; the package compiles clean. The package-level `configDumpMarshalOptions` carries the four-value tuple `{Multiline: true, Indent: " ", UseProtoNames: true, EmitUnpopulated: true}` per ADR-0086. The `handleConfigDump` method dispatches `buildConfigDump(s.bs, s.bootTime)` then `configDumpMarshalOptions.Marshal(cd)` with the dual error path returning 500 + `{}` body per ADR-0086 consequence (e). `buildConfigDump` defends against `bs == nil || bs.Proto == nil` by returning empty `*adminv3.ConfigDump{}` (relevant for tests that pass nil; the four widened-constructor `TestServer_*` tests in admin_test.go pass nil so the handler MUST tolerate it gracefully — the empty body is then a valid JSON document). The two `enumerateStatic*` helpers walk `bs.GetStaticResources().GetListeners()/GetClusters()` directly per planner-time decision 7 (NOT through cm.Clusters()/lm.Listeners()), each pack inner items into `*anypb.Any` with `LastUpdated: timestamppb.New(bootTime)`. Step 4 deleted the placeholder `func (s *Server) handleConfigDump` block (10 LoC) from `internal/admin/admin.go` introduced by Task 5; the mux registration `mux.HandleFunc("/config_dump", s.handleConfigDump)` now resolves to the real handler in configdump.go (Go compiles the file as part of the same package). The `bytes` import in admin.go was already absent (Task 5 deferred per PROGRESS Task 5 note); no further import-cleanup needed. Step 5 ran the four verification gates — all clean: `go build ./internal/admin/...` clean, `go test -count=1 ./internal/admin/...` 26 PASS (the 20 from Task 5 + 6 new), `go vet ./internal/admin/...` clean, `golangci-lint run ./internal/admin/...` clean (after two minor lint fixes: the PLAN-verbatim test had an empty-branch `if !strings.Contains(bodyStr, "\n {\n") && !strings.Contains(bodyStr, "\n  ") {}` that staticcheck SA9003-flagged; rewrote it as `if !strings.Contains(bodyStr, "\n ") { t.Errorf("body lacks 1-space indent marker; ...") }` which preserves the test intent — assert at least one one-space indent token exists in the body — and is non-empty; and the PLAN-verbatim docstring "behaviour" was misspell-flagged, replaced with "behavior" to match US-spelling project convention). Step 6 appended ADR-0086 to `docs/envoy-go/DECISIONS.md` (one match for `^## ADR-0086:`); Status Accepted; Date 2026-05-02; Doctrine D-3.3 + D-3.7; Lands-in-task Task 6; Context paragraph anchors SPEC §11.1 verbatim Envoy v1.37.2 scrape pin + the four-tuple non-derivability + planner-time decision 7's bootstrap-walk choice; Decision paragraph documents the four `protojson.MarshalOptions` values + the three-sub-envelope ordering invariant + the static-only stance + the `EmitUnpopulated` body-shape character + the 500 + `{}` error path + the cross-endpoint `configDumpMarshalOptions` reuse for /server_info; five Alternatives (defaults, encoding/json mirror, manager-walk, no-ADR-implicit ordering, empty-`dynamic_*`-arrays) all rejected with reasons; five Consequences (a)-(e) covering: (a) byte-equality modulo §13.2 allow-list (node.user_agent_*, node.extensions[], `<*ConfigDump>.last_updated`); (b) Task 13's comparator depends on the three-position invariant; (c) future RoutesConfigDump/SecretsConfigDump etc. envelopes append at index >= 3 (additive, never reordering); (d) /server_info reuses the same MarshalOptions tuple for cross-endpoint consistency; (e) error path returns 500 + `{}` JSON-valid body. Step 7 commit landed at `044f751`. **IMPORTANT:** `go build ./cmd/envoy-go/...` STILL FAILS at this commit with `cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New` — INTENTIONAL per PLAN; Task 10 fixes the call site. Four files modified/created: `internal/admin/configdump.go` (created, 145 LoC), `internal/admin/configdump_test.go` (created, 144 LoC after the lint-fix rewrite of the empty-branch indent assertion), `internal/admin/admin.go` (modified, -10 LoC removing the placeholder handler), `docs/envoy-go/DECISIONS.md` (appended ADR-0086, +43 LoC).
+
+**Outputs:**
+```
+$ go test -count=1 -run 'TestBuildConfigDump|TestHandleConfigDump' -v ./internal/admin/... 2>&1 | tail -15
+=== RUN   TestBuildConfigDump_ThreeSubEnvelopesInOrder
+--- PASS: TestBuildConfigDump_ThreeSubEnvelopesInOrder (0.00s)
+=== RUN   TestBuildConfigDump_BootstrapEnvelopeContainsParsedProto
+--- PASS: TestBuildConfigDump_BootstrapEnvelopeContainsParsedProto (0.00s)
+=== RUN   TestBuildConfigDump_ListenersEnvelopeContainsOneStaticListener
+--- PASS: TestBuildConfigDump_ListenersEnvelopeContainsOneStaticListener (0.00s)
+=== RUN   TestBuildConfigDump_ClustersEnvelopeContainsOneStaticCluster
+--- PASS: TestBuildConfigDump_ClustersEnvelopeContainsOneStaticCluster (0.00s)
+=== RUN   TestHandleConfigDump_HTTPSmoke200JSON
+--- PASS: TestHandleConfigDump_HTTPSmoke200JSON (0.01s)
+=== RUN   TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent
+--- PASS: TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent (0.01s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.030s
+
+$ go build ./internal/admin/...
+(clean)
+
+$ go test -count=1 ./internal/admin/... 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/internal/admin	0.076s
+
+$ go vet ./internal/admin/...
+(clean)
+
+$ golangci-lint run ./internal/admin/...
+(clean)
+
+$ go build ./cmd/envoy-go/... 2>&1
+# github.com/esalaine/envoy-go/cmd/envoy-go
+cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
+	have (string, *stats.Registry)
+	want (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager)
+(EXPECTED FAIL — Task 10 fixes the call site)
+
+$ grep -c '^## ADR-0086:' docs/envoy-go/DECISIONS.md
+1
+```
