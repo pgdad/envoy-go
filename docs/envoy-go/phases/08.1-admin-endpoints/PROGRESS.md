@@ -317,3 +317,54 @@ internal/admin/clusters.go:26:func (s *Server) handleClusters(w http.ResponseWri
 $ grep -c '^## ADR-0087:' docs/envoy-go/DECISIONS.md
 1
 ```
+
+## Task 8 — `internal/admin/listeners.go` — `/listeners` handler
+
+**Commits:** `9362f65` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-6. NO new ADR — Task 8 is covered by ADR-0087 from Task 7 (the shared text-format-endpoint shape consolidates `/clusters` + `/listeners` per ADR-0004's anti-fragmentation guidance). Step 1 wrote `internal/admin/listeners_test.go` with five tests covering the SPEC §11.3 + ADR-0087 contract: `TestHandleListeners_HTTPSmoke200Text` (200 + `text/plain; charset=UTF-8` Content-Type + body has `l_main::` prefix + `\n` suffix), `TestHandleListeners_BodyExactByteLayout` (byte-exact `l_main::127.0.0.1:10000\n` for the §7.3 fixture, 24 bytes), `TestHandleListeners_NilManagerEmitsEmptyBody` (defensive nil-lm path emits 200 + empty body per ADR-0085 nil-tolerated convention), `TestHandleListeners_AlphabeticalByName` (multi-listener fixture `l_z` + `l_a` declared non-alphabetical; body emits `l_a::` before `l_z::`), `TestHandleListeners_IPv6BindAddrPassthrough` (documents the byte-pass-through contract for IPv6 addresses; skips when listener.Manager's pre-existing `fmt.Sprintf("%s:%d", host, port)` IPv6 bind limitation hits — out of Task 8 scope to fix). The PLAN Step 1 multi-listener test sketch (`t.Skip` per PLAN's "requires multi-listener fixture" note) was promoted to a real test using a proto-direct fixture builder (`mustMultiListenerBs` + `mkAdminListener` + `mkAdminCluster`) modeled on `internal/listener/manager_test.go:73` (`mkListener` / `mkTcpProxyFilter` / `mkClusterMgr`); the alphabetical-by-name ordering is now exercised end-to-end through the handler. Step 2 confirmed the 4 non-skip tests fail against the placeholder (501 status; missing line content; nil-lm path returns 501 not 200). Step 3 created `internal/admin/listeners.go` (40 LoC) with one method `(s *Server) handleListeners(w, _)` that allocates a `bytes.Buffer`, walks `s.lm.Listeners()` snapshot (when non-nil), defensively `sort.Slice`-orders by `Name` (the snapshot's source — manager.go:928's `m.runtimes` walk — is declaration-order, NOT alphabetical, so the §11.3 ordering is enforced at scrape time), emits `<Name>::<Addr>\n` per listener, then sets `text/plain; charset=UTF-8` headers + 200 + body. Per the existing handler convention the second `*http.Request` parameter is `_` (unused). Listener.Info `{Name string; Addr string}` is the post-Start snapshot from `internal/listener/manager.go:34`; `Addr` is `ln.Addr().String()` captured at Start time (manager.go:738) — which natively produces square-bracket-wrapped IPv6 host forms (`[::]:port` / `[::1]:port`). The handler is a pure pass-through — no parsing, splitting, or reformatting — so byte-shape parity with whatever the listener.Manager surfaces is preserved by construction. Step 4 deleted the placeholder `func (s *Server) handleListeners` block (8 LoC) from `internal/admin/admin.go` introduced by Task 5; the mux registration `mux.HandleFunc("/listeners", s.handleListeners)` resolves to the real handler in listeners.go. `grep -nE 'func \(s \*Server\) handleListeners' internal/admin/admin.go internal/admin/listeners.go` returns exactly 1 match (listeners.go line 26). Step 5 ran the four verification gates — all clean: `go build ./internal/admin/...` clean, `go test -count=1 ./internal/admin/...` 37 PASS + 1 SKIP (33 from Task 7 + 4 new passes; the IPv6 test skips on the pre-existing listener.Manager bind limitation), `go vet ./internal/admin/...` clean, `golangci-lint run ./internal/admin/...` clean. Step 6 committed at `9362f65`. **NO ADR landed for Task 8 per PLAN** — the shape decisions for both /clusters and /listeners are consolidated in ADR-0087 from Task 7. **IMPORTANT:** `go build ./cmd/envoy-go/...` STILL FAILS with `cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New` — INTENTIONAL per PLAN; Task 10 fixes the call site. Three files modified/created: `internal/admin/listeners.go` (created, 40 LoC), `internal/admin/listeners_test.go` (created, 343 LoC for the 5 tests + 4 fixture/helper builders: `mkAdminListener`, `mkAdminCluster`, `mustMultiListenerBs`, `mustIPv6Bs`, `mustLMFromBs`), `internal/admin/admin.go` (modified, -8 LoC removing the placeholder handler).
+
+**Outputs:**
+```
+$ go test -count=1 -run TestHandleListeners -v ./internal/admin/... 2>&1 | tail -15
+=== RUN   TestHandleListeners_HTTPSmoke200Text
+--- PASS: TestHandleListeners_HTTPSmoke200Text (0.02s)
+=== RUN   TestHandleListeners_BodyExactByteLayout
+--- PASS: TestHandleListeners_BodyExactByteLayout (0.02s)
+=== RUN   TestHandleListeners_NilManagerEmitsEmptyBody
+--- PASS: TestHandleListeners_NilManagerEmitsEmptyBody (0.01s)
+=== RUN   TestHandleListeners_AlphabeticalByName
+--- PASS: TestHandleListeners_AlphabeticalByName (0.02s)
+=== RUN   TestHandleListeners_IPv6BindAddrPassthrough
+    listeners_test.go:218: lm.Start IPv6 bind failed (pre-existing listener.Manager limitation outside Task 8 scope): listener: "l_v6": bind ::1:0: listen tcp: address ::1:0: too many colons in address
+--- SKIP: TestHandleListeners_IPv6BindAddrPassthrough (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.079s
+
+$ go build ./internal/admin/...
+(clean)
+
+$ go test -count=1 ./internal/admin/... 2>&1 | tail -3
+ok  	github.com/esalaine/envoy-go/internal/admin	0.225s
+
+$ go vet ./internal/admin/...
+(clean)
+
+$ golangci-lint run ./internal/admin/...
+(clean)
+
+$ go test -v -count=1 ./internal/admin/... 2>&1 | grep -c '^--- PASS:'
+37
+
+$ go test -v -count=1 ./internal/admin/... 2>&1 | grep -c '^--- SKIP:'
+1
+
+$ go build ./cmd/envoy-go/... 2>&1
+# github.com/esalaine/envoy-go/cmd/envoy-go
+cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
+	have (string, *stats.Registry)
+	want (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager)
+(EXPECTED FAIL — Task 10 fixes the call site)
+
+$ grep -nE 'func \(s \*Server\) handleListeners' internal/admin/admin.go internal/admin/listeners.go
+internal/admin/listeners.go:26:func (s *Server) handleListeners(w http.ResponseWriter, _ *http.Request) {
+```
