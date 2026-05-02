@@ -2919,3 +2919,57 @@ The orthogonality argument is the cleanest representation of the intended dispat
 07.2 PLAN Task 1 (PROGRESS preamble alongside ADR-0077; this ADR is mainly explanatory and doesn't anchor a code change — pairing it with ADR-0077 at T1 keeps the PROGRESS preamble's ADR list cohesive). Settles ADR-0050; supersedes nothing.
 
 ---
+
+## ADR-0079: Listener-filter dispatch protocol shape (sync-only; narrow `Inspect(peeker, inputs)` surface; freeze-after-boot registry; two-step factory pattern)
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.2 (write from scratch when the surface has no Envoy-FFI legacy to mirror) + D-3.5 (record durable design rationale; the dispatch-protocol shape is a contract that future listener-filter implementers MUST observe).
+
+### Context
+
+Phase 07.2 introduces the listener-filter framework — `internal/listener/listenerfilter/` — which dispatches a per-connection pipeline of `ListenerFilter` instances over a peek-without-consume `net.Conn` wrapper, populating a `ChainMatchInputs` struct that the chain-match algorithm consults to select a `filter_chain` entry. SPEC §6 raised the question of the dispatch-protocol shape: how narrow should the `ListenerFilter` interface be, what status enum carries the result, how is the registry threaded, and how is per-connection allocation paid for?
+
+The project has two parent patterns that establish the registry-shape precedent:
+- **ADR-0072** (07.1's `*filter.HTTPRegistry`) — boot-populated, freeze-after-boot, threaded explicitly into HCM construction; no package-global `init()` registration; late `Register` panics loudly. The two-step factory pattern (HTTPFilterFactory parses the typed_config Any once at boot; FilterInstanceFactory allocates per-request) is the 07.1 precedent for filter parsing.
+- **ADR-0059** (06.1's `*stats.Registry` LBP-1) — the original freeze-after-boot construct that ADR-0072 mirrors.
+
+Listener filters have a much narrower surface than HTTP filters: they peek the connection's byte preamble (read without consuming), populate fields on a chain-match-inputs struct, and return Continue/StopIteration. They do not buffer bodies, do not iterate over headers, do not call back into the connection manager, and do not need to support async-resume because the operations they perform (peek + populate) are CPU-bound and bounded by `peekerBufSize`. The MVP register only `tls_inspector` (Decision D from SPEC §1 #1), but the framework supports multi-filter pipelines (sequential dispatch).
+
+### Decision
+
+The listener-filter dispatch protocol is shaped per the following decisions, all anchored at this ADR:
+
+- **Sync-only dispatch (Decision A from SPEC §6.1).** `ListenerFilter.Inspect(ctx, peeker, inputs) (Status, error)` is synchronous; no async-resume token, no goroutine-park, no callback registration. A filter that needs more bytes than were peeked returns `StopIteration` (or aborts via error). The peek buffer is large enough (4096 default) that no realistic listener filter needs to "wait for more data" — the inputs the filter consults are bounded by the peek buffer size.
+
+- **`ListenerFilter` interface — single `Inspect` method + `OnDestroy()`.** No `SetCallbacks`, no `OnNewConnection`, no `OnConnectionEvent`. The two-method surface is the minimum viable contract: `Inspect` is the work; `OnDestroy` releases per-connection resources (closed-over file handles, etc.) when the pipeline ends (either after dispatch completes or on connection close before dispatch).
+
+- **`ListenerFilterStatus` 2-state enum.** `Continue = 0` (advance to next filter); `StopIteration = 1` (halt the pipeline; chain-match runs on partial inputs). No `WaitForData`, no `Pause`, no `ResumeWithBytes`. The 2-state enum is sufficient because the peek-buffer is bounded and filters that need more bytes than peeked simply abort.
+
+- **`*ListenerFilterRegistry` threaded constructor (mirrors ADR-0072 + ADR-0059).** The registry is allocated at boot in `cmd/envoy-go/main.go`, threaded explicitly into the listener-manager's construction path, NOT a package-global registered via `init()`. Freeze-after-boot invariant: any post-`Freeze` `Register` panics loudly; `Lookup` is read-allowed. The 07.2 MVP registers only `tls_inspector` at boot.
+
+- **Two-step factory pattern (mirrors ADR-0072).** `ListenerFilterFactory func(tc *anypb.Any, ctx FactoryCtx) (FilterInstanceFactory, error)` parses + validates the `typed_config` Any once at `NewManager`-build time and returns a per-connection `FilterInstanceFactory func() ListenerFilter` closure. Per-config validation cost is paid once at boot; per-connection cost is one allocation. The `FactoryCtx` carrier is currently empty but reserved for future extensions (e.g., a Registry pointer for filters that compose).
+
+- **Per-connection sequential dispatch (Decision D from SPEC §1 #1).** The MVP supports multi-filter pipelines (sequential dispatch through `filters[]` in the order they appear in the listener config). Sequential dispatch is intentional: per-filter goroutines would be goroutine-bloat (each accepted connection already has a goroutine). The SPEC's `pipeline_test.go` exercises a 2-filter case using two `tls_inspector` instances with different `initial_read_buffer_size` values — no test-only filter type pollutes the production package.
+
+- **4096-byte default peeker buffer (Decision C from SPEC §5.3); clamped [256, 65536] via `tls_inspector.initial_read_buffer_size` proto override.** 4096 matches Envoy's `tls_inspector.initial_read_buffer_size` default. Lower bound 256 is safely above the minimum ClientHello (~50 bytes); upper bound 65536 is the maximum useful peek size before a TLS record would have to span multiple records (TLS record max is 16384, so 65536 covers four records). The clamp is implemented in `NewPeekerConnSize` (silent clamp) and at proto-config parse time in `tls_inspector/proto.go` (parse-error on out-of-range values; both checkpoints land at later 07.2 tasks).
+
+### Alternatives considered
+
+- **(A) Envoy's full listener-filter API (with `SetCallbacks`-style callback registration + watermark-aware buffered I/O + async-resume tokens).** REJECTED for YAGNI. The methods we drop have no in-scope callers in 07.2's filter set: `tls_inspector` does not need watermarks, does not need callback registration, does not need async-resume. Any future listener filter that needs them would re-litigate via its own ADR — at which point the framework can be extended additively. Adding the machinery now would commit to a dispatch-protocol shape that no in-scope filter uses; that is unjustified surface area.
+
+- **(B) Per-filter goroutine (each filter runs in its own goroutine, communicates via channels).** REJECTED. Spawning a goroutine per filter per connection is goroutine-bloat: each connection already has a goroutine for the accept-loop dispatch, and the dispatch is CPU-bound (peek + parse + populate). Channel-based dispatch would add latency without buying any throughput because the pipeline is intrinsically sequential (each filter potentially mutates `ChainMatchInputs`, which is the single channel of communication). Per-pipeline `context.WithTimeout` (ADR-0082) provides the timeout discipline without per-filter goroutines.
+
+### Consequences
+
+- (a) The framework's external dependencies are limited to the Go stdlib (`bufio`, `context`, `net`) + `google.golang.org/protobuf` (for the `anypb.Any` typed_config carrier) + the `tls_inspector v3` proto package (for the only registered filter). No third-party listener-filter library; no cgo; no Envoy-extension Go binding. The framework is self-contained.
+
+- (b) The dispatch-protocol shape is documented in `internal/listener/listenerfilter/doc.go` (the package-level doc-comment landed alongside this ADR) — future readers consult `doc.go` first, then this ADR for rationale.
+
+- (c) Future family-phase listener filters (e.g., `original_dst`, `proxy_protocol`, `http_inspector`) extend this package by adding to the `ListenerFilter` interface (or, more likely, by adding to the registry without changing the interface — the `Inspect(peeker, inputs)` surface is intentionally generic over the inputs the filter populates). Each such addition lands its own ADR in the family phase that needs it; no architectural churn at 07.2's expense.
+
+### Lands-in-task
+
+07.2 PLAN Task 2 (the `internal/listener/listenerfilter/` package introduction; specifically the `doc.go` + `types.go` + `callbacks.go` + their tests). Supersedes nothing; complements ADR-0072 (HTTPRegistry pattern) and ADR-0059 (stats Registry LBP-1).
+
+---
