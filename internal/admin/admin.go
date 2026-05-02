@@ -141,16 +141,6 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// handleListeners is a placeholder; real impl lands in Task 8
-// (internal/admin/listeners.go).
-func (s *Server) handleListeners(w http.ResponseWriter, r *http.Request) {
-	body := []byte("listeners: not yet implemented\n")
-	writeAdminHeaders(w, "text/plain; charset=UTF-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusNotImplemented)
-	_, _ = w.Write(body)
-}
-
 // handleServerInfo is a placeholder; real impl lands in Task 9
 // (internal/admin/serverinfo.go).
 func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
