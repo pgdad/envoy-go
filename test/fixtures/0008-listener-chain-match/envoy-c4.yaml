@@ -1,0 +1,94 @@
+# Fixture 0008-listener-chain-match — reference (Envoy v1.37.2) — c4 variant.
+#
+# Same shape as `envoy-go-c4.yaml`. Used for connection 4 of the 5-connection
+# workload. Identical to `envoy.yaml` (reference primary) EXCEPT:
+#   - `chain_other` is REMOVED from filter_chains[]
+#   - only `l_test_b` is configured
+#
+# Per ADR-0010: STRICT_DNS clusters with `dns_lookup_family: V4_ONLY` reaching
+# host backends via `host.docker.internal`.
+# Per ADR-0028: `--concurrency 1` inherited from the test harness.
+#
+# Driver-rendered placeholders (sprintf-style — see Task 16 driver/driver.go):
+#   - admin port_value          (= 9901, container fixed)
+#   - l_test_b port_value       (= 15009 — Task 16 AlternateReferenceListenerPort())
+#   - chain_dstport_alpha.destination_port (= 15008 — primary l_test_a port,
+#                                          preserved for shape symmetry; no
+#                                          connection in c4 matches it)
+#   - chain_srcprefix_loopback.source_ports[0] (= known_driver_port — driver-rendered)
+#   - 3 backend port_values (host.docker.internal — runner-rendered)
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+static_resources:
+  listeners:
+    - name: l_test_b
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 15009 }
+      filter_chains:
+        - name: chain_dstport_alpha
+          filter_chain_match:
+            destination_port: 15008                            # primary l_test_a port
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: tcp_dstport
+                cluster: c_dstport
+        - name: chain_srcprefix_loopback
+          filter_chain_match:
+            source_prefix_ranges:
+              - { address_prefix: 127.0.0.1, prefix_len: 32 }
+            source_ports: [0]                                  # = known_driver_port — driver-rendered
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: tcp_srcprefix
+                cluster: c_srcprefix
+        # NOTE: chain_other intentionally REMOVED from this variant.
+      default_filter_chain:
+        name: chain_default
+        filters:
+          - name: envoy.filters.network.tcp_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+              stat_prefix: tcp_default
+              cluster: c_default
+  clusters:
+    - name: c_dstport
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY     # ADR-0010
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_dstport
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 1 — runner-rendered
+    - name: c_srcprefix
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_srcprefix
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 2 — runner-rendered
+    - name: c_default
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_default
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 0 }   # backend 4 — runner-rendered

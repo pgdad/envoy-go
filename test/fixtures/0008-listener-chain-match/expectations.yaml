@@ -1,0 +1,122 @@
+# Phase 07.2 fixture 0008-listener-chain-match — expectations.
+#
+# This file is prose, not machine-evaluated (per ADR-0019). The runner enforces
+# the assertions described below via test/differential/runner_test.go's
+# byte-comparison pass + the in-band assertion of Task 16's
+# driver.DriveAlternate (mirrors 05.2 / 06.1 / 06.2 / 07.1 in-band precedent).
+#
+# Differential equivalence claim (per SPEC §9.1):
+#   per-connection backend-port routing decision (i.e., which of the 4 backends
+#   each connection ends up at) is byte-equal across envoy-go and reference
+#   Envoy v1.37.2. Each backend echoes its own `ln.Addr().String()` so the
+#   per-connection response body uniquely identifies the chain that handled it.
+#
+# Workload (5 connections — see SPEC §7.4 for the canonical table):
+#
+#   Connection 1 — primary variant
+#     target listener:    l_test_a (port_a)
+#     source IP/port:     non-loopback (OS-picked outbound)
+#     expected chain:     chain_dstport_alpha
+#                          (filter_chain_match.destination_port == port_a;
+#                           the `destination_port` priority slot 0 chain is
+#                           the only one whose specifying dimension matches)
+#     expected backend:   c_dstport endpoint → P_dstport
+#     demonstrates:       `destination_port` populated chain wins over the
+#                         catch-all `chain_other` empty-match.
+#
+#   Connection 2 — primary variant
+#     target listener:    l_test_b (port_b)
+#     source IP/port:     127.0.0.1 / known_driver_port (driver pre-allocates
+#                          via net.Listen("tcp","127.0.0.1:0"); closes; reuses
+#                          the captured port via net.Dialer{LocalAddr})
+#     expected chain:     chain_srcprefix_loopback
+#                          (source_prefix_ranges 127.0.0.1/32 + source_ports
+#                           [known_driver_port] both match;
+#                           chain_dstport_alpha eliminated because port_b ≠
+#                           port_a; chain_other is the only remaining
+#                           catch-all but the populated chain wins)
+#     expected backend:   c_srcprefix endpoint → P_srcprefix
+#     demonstrates:       `source_prefix_ranges` + `source_ports` populated
+#                         chain wins over the catch-all `chain_other`.
+#
+#   Connection 3 — primary variant
+#     target listener:    l_test_b (port_b)
+#     source IP/port:     non-loopback (OS-picked outbound)
+#     expected chain:     chain_other (filter_chain_match: {} — empty-match;
+#                          chain_dstport_alpha eliminated by port_b ≠ port_a;
+#                          chain_srcprefix_loopback eliminated by non-loopback
+#                          source)
+#     expected backend:   c_other endpoint → P_other
+#     demonstrates:       empty-match catch-all wins when no specific chain
+#                         matches.
+#
+#   Connection 4 — c4 variant (envoy-go-c4.yaml / envoy-c4.yaml)
+#     target listener:    l_test_b (port_b)
+#     source IP/port:     non-loopback (OS-picked outbound)
+#     expected chain:     chain_default (no filter_chains[] entry eligible —
+#                          chain_other is REMOVED from this variant; both
+#                          remaining chains are eliminated as in connection 3;
+#                          no entry is eligible → fall through to default)
+#     expected backend:   c_default endpoint → P_default
+#     demonstrates:       `default_filter_chain` consulted when no
+#                         `filter_chains[]` entry matches (SPEC §11.1
+#                         empirical pin).
+#
+#   Connection 5 — primary variant
+#     target listener:    l_test_a (port_a)
+#     source IP/port:     127.0.0.1 / known_driver_port (same source as conn 2)
+#     expected chain:     chain_dstport_alpha (BOTH chain_dstport_alpha AND
+#                          chain_srcprefix_loopback satisfy their dimensions;
+#                          precedence selects destination_port slot 0 over
+#                          source_prefix_ranges slot 6)
+#     expected backend:   c_dstport endpoint → P_dstport
+#     demonstrates:       precedence — `destination_port` (priority slot 0)
+#                         BEATS `source_prefix_ranges` (priority slot 6)
+#                         (SPEC §11.3 empirical pin).
+#
+# Per-connection table (compact form mirroring SPEC §7.4):
+#
+# | # | Variant  | Listener | Source              | Winning chain            | Backend     | Pin          |
+# |---|----------|----------|---------------------|--------------------------|-------------|--------------|
+# | 1 | primary  | l_test_a | non-loopback        | chain_dstport_alpha      | P_dstport   | precedence   |
+# | 2 | primary  | l_test_b | 127.0.0.1:driver    | chain_srcprefix_loopback | P_srcprefix | populated>cat|
+# | 3 | primary  | l_test_b | non-loopback        | chain_other              | P_other     | empty-match  |
+# | 4 | c4       | l_test_b | non-loopback        | chain_default            | P_default   | §11.1        |
+# | 5 | primary  | l_test_a | 127.0.0.1:driver    | chain_dstport_alpha      | P_dstport   | §11.3        |
+#
+# Differential surface (subject vs reference):
+#   - response-body: byte-exact required (each connection's body is the
+#     backend's ln.Addr().String() echoed once; format is "127.0.0.1:NNNN\n"
+#     for subject, "0.0.0.0:NNNN\n" or similar for reference — see runner
+#     contract notes below).
+#   - response-status / response-headers / response-trailers: N/A (TCP, not
+#     HTTP).
+#
+# Cross-side body shape note:
+#   Subject backends listen on 0.0.0.0:NNNN and the echoed string is
+#   "0.0.0.0:NNNN\n". Reference backends are the SAME process (the runner
+#   spawns the backends once on the host and both proxies reach them — subject
+#   via 127.0.0.1, reference via host.docker.internal). The echoed body is
+#   therefore the host-side bind string of THE SAME backend instance regardless
+#   of which proxy delivered the connection. Byte-equality across proxies
+#   holds because the response body identifies the chain, not the proxy.
+#
+# Distribution assertion: N/A (each backend is targeted by EXACTLY one chain;
+# there is no RR distribution to assert. Per-side connection-count snapshot is
+# 1/1/1/1 across the 4 chains — the runner does not assert this directly; the
+# byte-equality of response bodies implies it transitively).
+#
+# Workload precondition (driver-side, per Task 16):
+#   - driver pre-allocates known_driver_port via net.Listen+close (so it can
+#     embed the captured port in BOTH bootstraps' chain_srcprefix_loopback.
+#     source_ports BEFORE either proxy starts).
+#   - 4 backend processes spawned on the host before either proxy starts.
+#   - 2 listener ports (l_test_a, l_test_b) allocated for the subject;
+#     reference uses fixed container ports 15008/15009.
+#
+# Container concurrency:
+#   --concurrency 1 inherited from phase-02 ADR-0028 via test/differential/harness.go.
+
+response-body:
+  applicable: true
+  scope: byte-exact

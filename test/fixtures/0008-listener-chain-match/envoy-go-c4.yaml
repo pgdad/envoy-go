@@ -1,0 +1,96 @@
+# Fixture 0008-listener-chain-match — subject (envoy-go) — c4 variant.
+#
+# Used for connection 4 of the 5-connection workload (per SPEC §7.4).
+# Identical to `envoy-go.yaml` EXCEPT:
+#   - `chain_other` is REMOVED from filter_chains[]
+#   - only `l_test_b` is configured (connection 4 hits l_test_b only;
+#     `l_test_a` is unnecessary in this variant)
+#
+# With `chain_other` removed, a non-loopback connection to `l_test_b` matches
+# NO `filter_chains[]` entry (chain_dstport_alpha's destination_port is the
+# l_test_a port; chain_srcprefix_loopback requires a 127.0.0.1 source) and
+# therefore falls through to `default_filter_chain` — the §11.1 empirical pin
+# demonstration that the default is consulted only when no `filter_chains[]`
+# entry matches.
+#
+# Driver-rendered placeholders (sprintf-style — see Task 16 driver/driver.go):
+#   - admin port_value          (subjAdminPort — fresh allocation, separate
+#                                  from the primary variant's admin port)
+#   - l_test_b port_value       (altSubjPort — fresh allocation)
+#   - chain_dstport_alpha.destination_port (= primary l_test_a port — preserved
+#                                          so the chain remains structurally
+#                                          identical; no connection in the c4
+#                                          variant matches this dimension)
+#   - chain_srcprefix_loopback.source_ports[0] (= known_driver_port — same
+#                                                pre-allocated port as primary)
+#   - 2 backend port_values (c_dstport, c_srcprefix unused in this variant; only
+#     c_default is hit. Wired identically to primary for shape symmetry.)
+node: { id: envoy-go-subject-0008-c4, cluster: envoy-go-differential }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }     # subjAdminPort — driver-rendered
+static_resources:
+  listeners:
+    - name: l_test_b
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 } # altSubjPort — driver-rendered
+      filter_chains:
+        - name: chain_dstport_alpha
+          filter_chain_match:
+            destination_port: 0                                # = primary l_test_a port — driver-rendered
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: tcp_dstport
+                cluster: c_dstport
+        - name: chain_srcprefix_loopback
+          filter_chain_match:
+            source_prefix_ranges:
+              - { address_prefix: 127.0.0.1, prefix_len: 32 }
+            source_ports: [0]                                  # = known_driver_port — driver-rendered
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: tcp_srcprefix
+                cluster: c_srcprefix
+        # NOTE: chain_other is intentionally REMOVED from this variant. The
+        # absence is what forces connection 4 (non-loopback to l_test_b) to
+        # fall through to default_filter_chain.
+      default_filter_chain:
+        name: chain_default
+        filters:
+          - name: envoy.filters.network.tcp_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+              stat_prefix: tcp_default
+              cluster: c_default
+  clusters:
+    - name: c_dstport
+      type: STATIC
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_dstport
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 0 } } }   # backend 1 — driver-rendered
+    - name: c_srcprefix
+      type: STATIC
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_srcprefix
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 0 } } }   # backend 2 — driver-rendered
+    - name: c_default
+      type: STATIC
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_default
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 0 } } }   # backend 4 — driver-rendered

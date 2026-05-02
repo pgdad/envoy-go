@@ -544,3 +544,36 @@ ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.001s
 $ grep -cE '^## ADR-[0-9]+' docs/envoy-go/DECISIONS.md
 83
 ```
+
+## Task 15 — test/fixtures/0008-listener-chain-match/ (primary + c4 bootstraps + backends)
+
+**Commits:** TBD — this task's commit
+**Notes:** Created the seven static files for fixture-0008 (driver lands at Task 16) — four bootstrap variants (subject primary, reference primary, subject c4, reference c4), `expectations.yaml`, `README.md`, and `backends/main.go`. The four bootstraps differ ONLY along the two ADR-anchored axes per Task-15 spec: (a) STATIC vs STRICT_DNS clusters per ADR-0010 (subject dials literal `127.0.0.1`; reference dials `host.docker.internal` with `dns_lookup_family: V4_ONLY` from inside the Docker container — same backend processes are reached either way) and (b) primary-vs-c4 chain set (primary carries 3 `filter_chains[]` entries `chain_dstport_alpha` / `chain_srcprefix_loopback` / `chain_other` plus `default_filter_chain`; c4 removes `chain_other` so connection 4's non-loopback connection to `l_test_b` falls through to the default — the §11.1 empirical-pin demonstration). Both primary bootstraps configure two listeners (`l_test_a`, `l_test_b`) carrying the SAME chain set per SPEC §7.4 — the dual-listener shape is required for `destination_port` to be a genuine discriminator (single-port listener cannot exercise the `destination_port` priority dimension). c4 bootstraps configure only `l_test_b` (connection 4 hits l_test_b only — `l_test_a` is unnecessary in that variant). All four chain TCP-proxy filters point at distinct STATIC/STRICT_DNS clusters (`c_dstport`, `c_srcprefix`, `c_other`, `c_default`) so the per-connection response body uniquely identifies which chain handled the connection (the differential dimension chosen per SPEC §9.4: backend port routing). Backend program (`backends/main.go`, 67 LoC) accepts TCP, drains via `io.Copy(io.Discard, conn)` until client half-closes (matches `helpers.TCPRoundTrip` half-close pattern), then writes back the listener's local address (`ln.Addr().String() + "\n"`) and closes; CLI is `--port <port>` flag (matching the existing fixture-0001/0005/0006/0007a/0007b backend convention — the runner's `start*Backend` helpers all spawn via `--port`; the PLAN-Task-15 brief mentioned `BACKEND_PORT` env var but the runner-spawn pattern uniformly uses `--port` so this backend follows the established precedent for symmetry with how Task 16 will mirror the existing `start*Backend` helper). `expectations.yaml` is prose per ADR-0019 (mirrors 0006/0007a precedent — runner enforces via Task-16 in-band assertion); contains the 5-connection per-connection table mirroring SPEC §7.4 (chain selected, backend port, precedence dimension demonstrated). `README.md` covers fixture purpose, STATIC-vs-STRICT_DNS divergence, dual-listener rationale, c4-variant rationale, the §11.3 precedence demo (connection 5 → both `chain_dstport_alpha` AND `chain_srcprefix_loopback` satisfy their dimensions; `destination_port` slot 0 wins over `source_prefix_ranges` slot 6), and cross-reference to `BEHAVIOR_CONTRACT.md ## Listener filters` (introduced at 07.2 phase-done — Task 17). All four YAMLs parse via `yaml.safe_load_all` (Python). Subject YAMLs (`envoy-go.yaml` + `envoy-go-c4.yaml`) round-trip cleanly through `bootstrap.Load` + `protojson.Marshal` (verified via ad-hoc test harness scoped to this commit; not landed in repo since `internal/bootstrap/bootstrap_test.go` does not have a generic `TestBootstrapLoadAllFixtures` auto-discovery and Task 16's driver is what wires the fixture into the test framework). Reference YAMLs are NOT loaded by `bootstrap.Load` — they are consumed by the reference Envoy container and only need YAML-syntax validity. Backend builds clean (`go build`); vets clean (`go vet`); `golangci-lint run` clean. DECISIONS.md unchanged at 83 ADRs (Task 15 is mechanical YAML/text — no new decisions; the §11.4 carry-forward + §11.4-derived ADR is Task 16's domain).
+
+**Outputs:**
+```
+$ go build ./test/fixtures/0008-listener-chain-match/backends/...
+$ go vet ./test/fixtures/0008-listener-chain-match/backends/...
+$ golangci-lint run ./test/fixtures/0008-listener-chain-match/backends/...
+$ python3 -c "import yaml; [list(yaml.safe_load_all(open(p))) for p in ['test/fixtures/0008-listener-chain-match/envoy-go.yaml','test/fixtures/0008-listener-chain-match/envoy.yaml','test/fixtures/0008-listener-chain-match/envoy-go-c4.yaml','test/fixtures/0008-listener-chain-match/envoy-c4.yaml','test/fixtures/0008-listener-chain-match/expectations.yaml']]"
+$ go test ./internal/bootstrap/... -run TestFixture0008RoundTripAdHoc -v   # ad-hoc, scoped to commit
+=== RUN   TestFixture0008RoundTripAdHoc
+=== RUN   TestFixture0008RoundTripAdHoc/envoy-go.yaml
+=== RUN   TestFixture0008RoundTripAdHoc/envoy-go-c4.yaml
+--- PASS: TestFixture0008RoundTripAdHoc (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.006s
+$ go test ./internal/bootstrap/...
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.009s
+$ wc -l test/fixtures/0008-listener-chain-match/{envoy*.yaml,expectations.yaml,README.md,backends/main.go}
+   94 test/fixtures/0008-listener-chain-match/envoy-c4.yaml
+   96 test/fixtures/0008-listener-chain-match/envoy-go-c4.yaml
+  149 test/fixtures/0008-listener-chain-match/envoy-go.yaml
+  154 test/fixtures/0008-listener-chain-match/envoy.yaml
+  122 test/fixtures/0008-listener-chain-match/expectations.yaml
+   98 test/fixtures/0008-listener-chain-match/README.md
+   67 test/fixtures/0008-listener-chain-match/backends/main.go
+  780 total
+$ grep -cE '^## ADR-[0-9]+' docs/envoy-go/DECISIONS.md
+83
+```
