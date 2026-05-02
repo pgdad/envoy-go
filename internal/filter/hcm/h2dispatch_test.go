@@ -1,10 +1,11 @@
-//go:build hcm_h2_tests
-// +build hcm_h2_tests
+//go:build envoy_go_hcm_h2_legacy_tests
+// +build envoy_go_hcm_h2_legacy_tests
 
 package hcm
 
 // Phase 07.1 Task 15 PLAN deviation: h2dispatch_test.go is gated behind the
-// `hcm_h2_tests` build tag because Tasks 12+15 collectively dismantle the
+// `envoy_go_hcm_h2_legacy_tests` build tag because Tasks 12+15 collectively
+// dismantle the
 // H1-side dangling refs (routerAction/routerActionH2 types deleted; H1 dispatch
 // rewritten to drive the chain) but the H2-side dispatch path remains in the
 // pre-Task-16 shape (h2dispatch.go still type-switches on *routerActionH2 +

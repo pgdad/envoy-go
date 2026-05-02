@@ -10,6 +10,7 @@ package hcm
 import (
 	"bufio"
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -47,10 +48,22 @@ func (r *routerActionH2) doH2(_ context.Context, _ h2.H2Request, _ h2.StreamWrit
 // appear in entry.action's type-switch arms. The stub never gets constructed
 // in practice (buildRouterAction always returns *clusterRouteAction
 // post-Task-15) so the methods are unreachable defensive shims.
+//
+// All three methods (`do`, `doH2`, `asRouterAction`) return an identically-
+// shaped 500 / INTERNAL_ERROR outcome so a hypothetical misrouted invocation
+// produces a coherent error path rather than a silent nil-deref. In particular
+// `asRouterAction` returns a non-nil `router.Action` closure (NOT nil) so a
+// caller that injects the closure into `*router.Filter.SetAction` and then
+// drives `RunAction` produces a 500 + descriptive error rather than a panic
+// on a nil function call. M-6 from REVIEW.md (Task 15 review-loop).
 func (r *routerActionH2) do(_ context.Context, _ *http.Request, _ *bufio.Writer) (int, error) {
-	return 500, nil
+	return 500, errors.New("hcm: routerActionH2 stub reached — Task 16 territory")
 }
-func (r *routerActionH2) asRouterAction() router.Action { return nil }
+func (r *routerActionH2) asRouterAction() router.Action {
+	return func(_ context.Context, _ *http.Request, _ *bufio.Writer) (int, int64, cluster.Endpoint, error) {
+		return 500, 0, cluster.Endpoint{}, errors.New("hcm: routerActionH2 stub reached — Task 16 territory")
+	}
+}
 
 // h2Dispatcher implements h2.Dispatcher by delegating to f.table.match.
 // Wraps each matched action into an h2.Action implementation.

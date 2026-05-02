@@ -121,6 +121,32 @@ type Action func(ctx context.Context, req *http.Request, bw *bufio.Writer) (stat
 // the router instance). Tests (`router_test.go`) exercise the access-log
 // emit directly by constructing &Filter{accessLog: []accesslog.Sink{...}}
 // — this matches the byte-preserved shape from internal/filter/hcm.
+//
+// Per-request lifecycle (single-goroutine-per-stream — see ADR-0071's
+// "single dispatch goroutine drives the chain" invariant):
+//
+//  1. HCM allocates a fresh `*Filter` from the per-instance factory (router.New's
+//     returned FilterInstanceFactory closure runs once per request).
+//  2. HCM calls `SetRequest`, `SetWriter`, `SetAction` in any order, all BEFORE
+//     chain iteration begins (i.e. BEFORE chain.RunDecodeHeaders).
+//  3. The chain's iteration callbacks (`SetDecoderCallbacks`, `SetEncoderCallbacks`,
+//     `DecodeHeaders/Data/Trailers`, `EncodeHeaders/Data/Trailers`) run during
+//     chain dispatch on the chain's single dispatch goroutine.
+//  4. HCM calls `RunAction(ctx)` exactly once after `chain.RunDecodeHeaders`
+//     (and `RunDecodeData` if body) returns.
+//  5. HCM reads result fields via `Status / BytesSent / Picked / ActionErr /
+//     ActionRan` AFTER `RunAction` returns.
+//  6. The `*Filter` is then discarded; `OnDestroy` callback fires.
+//
+// The single-goroutine-per-stream invariant means the result-capture fields
+// (`actionRan`, `actionStatus`, `actionBytesSent`, `actionPicked`, `actionErr`)
+// require no synchronization: only one goroutine ever reads or writes them
+// per request. Future filters that schedule encode-side work on a separate
+// goroutine MUST synchronize externally before invoking RunAction or reading
+// the getters; Task 18 (cors as encode-side filter) is the first task that
+// could surface this concern, and the chain framework's parkEncode/resume
+// machinery preserves the invariant by routing the resume back through the
+// same dispatch goroutine.
 type Filter struct {
 	dcb envoyhttp.DecoderFilterCallbacks
 	ecb envoyhttp.EncoderFilterCallbacks
@@ -168,18 +194,41 @@ func (f *Filter) Picked() cluster.Endpoint  { return f.actionPicked }
 func (f *Filter) ActionErr() error          { return f.actionErr }
 func (f *Filter) ActionRan() bool           { return f.actionRan }
 
-// RunAction invokes the per-request Action and captures the outcome. Idempotent:
-// once-per-request via the actionRan flag. Called by HCM dispatch (connection.go)
-// AFTER chain.RunDecodeHeaders + RunDecodeData + RunDecodeTrailers complete
-// (the terminal-action invocation logically sits "after" the decode chain).
+// RunAction invokes the per-request Action and captures the outcome. Idempotent
+// once-per-request via the `actionRan` boolean (a check-then-set, NOT a sync.Once
+// — see lifecycle doc on `Filter`).
+//
+// Concurrency contract: this method assumes the single-goroutine-per-stream
+// invariant codified by ADR-0071's chain-dispatch model. The HCM dispatch path
+// (connection.go's `dispatchRequest`) is the sole caller per request, runs on a
+// single goroutine, and reads the result fields only AFTER this method returns.
+// The result-capture fields (actionRan / actionStatus / actionBytesSent /
+// actionPicked / actionErr) are written here without synchronization — that is
+// safe ONLY under the single-goroutine invariant. Concurrent invocations from
+// multiple goroutines are NOT supported and would race on `actionRan`. Future
+// filters that schedule encode-side work on a separate goroutine MUST
+// synchronize externally before calling RunAction.
+//
+// Called by HCM dispatch (connection.go) AFTER chain.RunDecodeHeaders +
+// RunDecodeData + RunDecodeTrailers complete (the terminal-action invocation
+// logically sits "after" the decode chain).
 //
 // Per Decision §3.1, the access-log emit is deferred to HCM dispatch's
 // chain-completion hook (which reads Status/BytesSent/Picked from this
 // filter); the router filter does NOT emit the access-log directly on the
 // H1 path post-Task-15.
+//
+// Panics with a clear message if `SetAction` / `SetRequest` / `SetWriter` were
+// not all called before RunAction. This is programmer-error early-detection
+// per the per-request lifecycle doc on `*Filter` (step 2 must precede step 4).
+// The HCM dispatch path always calls all three setters before chain iteration;
+// a panic here means a future caller has violated the contract.
 func (f *Filter) RunAction(ctx context.Context) {
-	if f.actionRan || f.action == nil {
+	if f.actionRan {
 		return
+	}
+	if f.action == nil || f.req == nil || f.bw == nil {
+		panic("router.Filter.RunAction: SetAction / SetRequest / SetWriter must all be called before RunAction (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
 	}
 	f.actionRan = true
 	status, bytesSent, picked, err := f.action(ctx, f.req, f.bw)
