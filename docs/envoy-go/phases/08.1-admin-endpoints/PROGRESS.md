@@ -426,3 +426,51 @@ internal/admin/serverinfo.go:21:func (s *Server) handleServerInfo(w http.Respons
 $ grep -c '^## ADR-0088:' docs/envoy-go/DECISIONS.md
 1
 ```
+
+## Task 10 — `cmd/envoy-go/main.go` — admin.New(bs,cm,lm) call-site + Bootstrap.ConfigPath wiring
+
+**Commits:** `4b2e1c2` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** Lands per PLAN Steps 1-5. Step 1 edited `cmd/envoy-go/main.go` with three coordinated changes: (a) added `bs.ConfigPath = *cfgPath` immediately after `bootstrap.Load(f)` (line ~52-57; populates the field added by Task 2 so /server_info can emit it under `command_line_options.config_path` per ADR-0088); (b) deleted the original pre-`httpReg` `admSrv := admin.New(adminAddr, bs.Stats); ... defer admSrv.Close()` block (5 LoC removed); (c) inserted the new widened `admSrv := admin.New(adminAddr, bs.Stats, bs, cm, lm)` block (with the LBP-1 + defer-LIFO commentary) immediately after `lm, err := listener.NewManagerWithBaseDirAndAllowH2C(...)` and before `ctx, cancel := signal.NotifyContext(...)`. The boot-order rationale: cluster + listener manager must exist before `admin.New` is called because the constructor binds them into `s.cm` + `s.lm` for the four new endpoints (per ADR-0085 + planner-time decision 6); `admin.New` must still happen before `bs.Stats.Freeze()` because admin allocates the `server.live` gauge at New time (SPEC §5.4 + §12 #3). Defer LIFO ordering changes from {sinks, admSrv, lm} pre-08.1 to {sinks, admSrv, lm-Stop} post-08.1 — admin still closes before sinks; the new `lm.Stop()` defer (registered AFTER admSrv.Close defer because `lm.Start(ctx)` happens AFTER `admSrv.Start()`) runs FIRST under LIFO. 08.1 SPEC §5.3 does not mandate strict resource-shutdown ordering across admin/listener/sinks; the cost is the LBP-1 cluster + listener pre-existence requirement. Step 2 verified `go build ./...` clean — FIRST FULL-REPO BUILD SUCCESS SINCE TASK 5 (the admin.New 2-arg → 5-arg widening at Task 5 had broken cmd/envoy-go intentionally; Tasks 5-9 ran with the cmd/envoy-go build red, completing internal/admin/* development against `go build ./internal/admin/...` only; this task closes the breakage). Step 3 added `TestMain_FourNewAdminEndpointsRespond200` (~125 LoC) to `cmd/envoy-go/main_test.go` — boots the binary on a representative HCM-with-router bootstrap (the fixture-0005 / fixture-0006 shape), waits for the `l_http` ready sentinel via the existing `waitForReadySentinels` helper, then GETs each of the four endpoints from the admin port and asserts: (a) status 200, (b) body non-empty, (c) `/config_dump` and `/server_info` bodies parse as `map[string]interface{}` via `json.Unmarshal` (SPEC §5.4.1 + §5.4.4 — both render protojson, NOT YAML); `/clusters` and `/listeners` are asserted only on status + non-empty (their text/plain bodies are operator-friendly per ADR-0087, byte-shape covered by Task 11 in-package tests + Task 14 differential fixture). The test uses subtests via `t.Run(ep.path, ...)` so a single endpoint failure surfaces independently. Added one new import `encoding/json` to main_test.go. The `buildBinaryOrSkip` + `freeTCPPort` + `waitForReadySentinels` helpers are reused unchanged from the existing 06.1/07.1/07.2 patterns. Step 4 ran the four verification gates — all clean: `go build ./...` clean (FIRST FULL-REPO SUCCESS SINCE TASK 5), `go test -count=1 -short ./...` PASS across all packages including admin (43 + 1-skip), bootstrap, cluster, listener, filter/* and cmd/envoy-go (now 6 tests including the new four-endpoint smoke), `go vet ./...` clean, `golangci-lint run ./...` clean. The differential suite passed end-to-end on a re-run after one transient flake on `0006-access-log` (Envoy container readiness timeout — orthogonal to this task; re-run was green). Step 5 committed at `4b2e1c2`. **THIS TASK ENDS THE INTENTIONAL `cmd/envoy-go` BUILD BREAKAGE FROM TASK 5**; full repo `go build ./...` is now clean. Two files modified: `cmd/envoy-go/main.go` (modified, +24 / -6 LoC: +1 `bs.ConfigPath = *cfgPath` line + 6 lines of supporting commentary, -5 LoC pre-`httpReg` admSrv block, +14 LoC post-`lm` admSrv block + 11 lines of LBP-1/defer commentary), `cmd/envoy-go/main_test.go` (modified, +135 LoC: +1 import line for `encoding/json` + ~125 LoC `TestMain_FourNewAdminEndpointsRespond200` function + comment block).
+
+**Outputs:**
+```
+$ go build ./... 2>&1
+(clean — FIRST FULL-REPO BUILD SUCCESS SINCE TASK 5)
+
+$ go vet ./... 2>&1
+(clean)
+
+$ go test -count=1 ./cmd/envoy-go/... 2>&1 | tail -1
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.223s
+
+$ go test -count=1 -short ./... 2>&1 | tail -10
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	0.079s
+ok  	github.com/esalaine/envoy-go/test/differential	0.079s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.006s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	0.007s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	0.004s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	0.005s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.008s
+
+$ golangci-lint run ./... 2>&1
+(clean)
+
+$ go test -count=1 ./test/differential/... 2>&1 | tail -2
+ok  	github.com/esalaine/envoy-go/test/differential	26.693s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.002s
+
+$ grep -nE 'admin\.New\(' cmd/envoy-go/main.go
+139:	admSrv := admin.New(adminAddr, bs.Stats, bs, cm, lm)
+
+$ grep -nE 'bs\.ConfigPath' cmd/envoy-go/main.go
+57:	bs.ConfigPath = *cfgPath
+
+$ grep -c '^func TestMain_FourNewAdminEndpointsRespond200' cmd/envoy-go/main_test.go
+1
+```
