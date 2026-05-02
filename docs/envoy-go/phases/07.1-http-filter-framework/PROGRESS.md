@@ -1904,7 +1904,7 @@ Task 23 (BEHAVIOR_CONTRACT in-place edit + ROADMAP/STATE updates + closing six-g
 
 ## Task 23 — BEHAVIOR_CONTRACT in-place edit + closing six-gate sweep [ADR-0070, ADR-0071, ADR-0072, ADR-0073, ADR-0074, ADR-0075, ADR-0076]
 
-**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+**Commits:** 801dab0 (code) → TBD (PROGRESS SHA-fill).
 
 **Files modified:**
 
