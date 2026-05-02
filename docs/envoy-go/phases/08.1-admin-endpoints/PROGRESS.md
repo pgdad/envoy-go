@@ -516,3 +516,32 @@ $ golangci-lint run ./... 2>&1
 $ grep -c '^func TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders\|^func TestAdmin_FourEndpointsAcceptAnyMethod' internal/admin/admin_test.go
 2
 ```
+
+## Task 12 — `internal/admin/admin_test.go::TestAdminConcurrentScrapeRace` — concurrent-scrape race-detector contract
+
+**Commits:** `5e1d454` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** Lands per PLAN Steps 1-4 the SPEC §3 gate (b) + §5.6 race-detector contract: 100 goroutines × 4 endpoints × 1s wall under `go test -race`. Step 1 appended `TestAdminConcurrentScrapeRace` to `internal/admin/admin_test.go` (+66 LoC), and added three new imports — `"fmt"` (for the `fmt.Errorf` wrapping in goroutine error sends), `"sync"` (for `sync.WaitGroup`), augmenting the existing `"io"`/`"net/http"`/`"strings"`/`"testing"`/`"time"` set. The test boots the canonical four-endpoint fixture via `mustMinimalBs` / `mustMinimalCM` / `mustMinimalLM`, calls `admin.New(addr, bs.Stats, bs, cm, lm)`, starts the server, calls `MarkReady()`, then sleeps 20ms for the accept goroutine. It then computes `deadline := time.Now().Add(1*time.Second)`, declares the four endpoints `[]string{"/config_dump", "/clusters", "/listeners", "/server_info"}`, allocates a `sync.WaitGroup`, and a buffered `chan error` of size `100*4=400` (deep enough to never block on send even if every goroutine reports max errors). It then spawns 100 goroutines, each running its own `&http.Client{Timeout: 2 * time.Second}` (per-goroutine to avoid sharing a `Client.Transport`'s connection pool semantics across hot-loop senders, but `http.Client` itself IS goroutine-safe — the per-goroutine allocation is purely defensive); each goroutine loops while `time.Now().Before(deadline)`, picks an endpoint via `endpoints[(i+int(time.Now().UnixNano()))%len(endpoints)]` (a per-goroutine round-robin offset by the wall-clock nanosecond — guarantees all four endpoints get hit by all 100 goroutines, and the per-iter randomness varies request ordering so the race detector sees more interleavings), `client.Get`s the URL, drains the body via `io.Copy(io.Discard, resp.Body)`, closes the body, and on either err or non-200 sends an error on the buffered channel via a non-blocking `select { case errs <- err: default: }`. After all 100 goroutines complete, `wg.Wait()` returns, `close(errs)`, and the test ranges over the channel and reports each error via `t.Errorf`. The `testing.Short()` guard at the top — `t.Skip("race-stress test; skipped under -short")` — keeps the 1s + race-detector overhead out of the inner-loop `-short` runs, matching the SPEC §5.6 contract that this is a `-race`-only stress test (run separately by `go test -race -run TestAdminConcurrentScrapeRace`). Step 2 ran the test under `-race` — PASSED in 1.04s wall (race-detector overhead minimal because all four handlers read immutable-post-boot state per ADR-0085: `s.bs.Proto` is the once-set static bootstrap, `s.cm.Clusters()` returns a copy of the immutable cluster snapshot, `s.lm.Listeners()` returns a copy of the immutable listener snapshot, `s.bootTime` is set in `New()` before any goroutine accesses it; the only mutable state read is `s.ready` which is a `sync/atomic.Bool` — reads on it are race-free by definition). Step 3 ran `go test -count=1 -race ./internal/admin/...` — full admin package PASS in 2.530s (every existing test continues to pass under `-race`, no regressions from the new test's added compile/link cost). Step 4 ran `go test -race -count=1 -short ./...` (full repo, no failures across all packages — admin, bootstrap, cluster, listener, filter/*, cmd/envoy-go, conformance/h2spec, differential, all fixture drivers), `go vet ./...` clean, `golangci-lint run ./...` clean. Step 5 committed at `5e1d454` with the exact PLAN-prescribed message. One file modified: `internal/admin/admin_test.go` (modified, +66 LoC: +2 import lines for `"fmt"` and `"sync"` + ~64 LoC the new test function with comment block).
+
+**Outputs:**
+```
+$ go test -count=1 -race -run TestAdminConcurrentScrapeRace -v ./internal/admin/... 2>&1 | tail -10
+=== RUN   TestAdminConcurrentScrapeRace
+--- PASS: TestAdminConcurrentScrapeRace (1.04s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	2.067s
+
+$ go test -count=1 -race ./internal/admin/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/admin	2.530s
+
+$ go test -race -count=1 -short ./... 2>&1 | grep -E 'FAIL|^---' | head -10
+(no failures — all packages PASS)
+
+$ go vet ./... 2>&1
+(clean)
+
+$ golangci-lint run ./... 2>&1
+(clean)
+
+$ grep -c '^func TestAdminConcurrentScrapeRace' internal/admin/admin_test.go
+1
+```
