@@ -97,31 +97,32 @@ type chainInfo struct {
 // listenerRuntime is the phase-03 replacement for builtListener. It holds
 // everything needed to bind, accept, and dispatch connections on one listener.
 //
-// Phase 07.2 (Task 9, ADR-0078): the per-listener struct is widened with the
-// 8-dimension chain-match plumbing. The legacy SNI-only `chains` + `tlsCfg`
-// fields are preserved by Task 9 to keep the (still-active) legacy dispatch
-// path working until Task 10 lifts them out. The new fields are populated at
-// build time but not yet consulted by `acceptLoop`/`dispatch`/`serveTLS`.
+// Phase 07.2 (Task 10): the unified pre/post-handshake dispatch path consults
+// chainSpecs / defaultSpec / chainByName via listenerfilter.SelectChain. The
+// legacy SNI-only `chains` slice + listener-level `tlsCfg` (with the
+// GetConfigForClient SNI dispatch callback) introduced by phase 03 / preserved
+// through Task 9 are gone — chain selection now happens BEFORE the TLS
+// handshake, and each selected chainInfo carries its own per-chain
+// *stdtls.Config that is passed directly to stdtls.Server.
 type listenerRuntime struct {
 	name    string
 	addr    string
 	netLn   net.Listener
 	tlsMode bool
-	tlsCfg  *stdtls.Config // top-level config with GetConfigForClient wired; nil for plaintext
-	chains  []*chainInfo   // legacy SNI-only ordering preserved for the Task-9 dispatch path
 	// 07.2 (Task 9, ADR-0078) chain-match fields. chainSpecs and defaultSpec
 	// describe the parsed `filter_chains[]` + `default_filter_chain` shape per
-	// ADR-0081's 8-dimension algorithm; `chainByName` lets Task 10 look up the
-	// per-chain `chainInfo` (filter handler, TLS config) by the winning
-	// ChainSpec's Name. defaultChain is the per-connection terminal-filter
-	// state for default_filter_chain.
+	// ADR-0081's 8-dimension algorithm; `chainByName` looks up the per-chain
+	// `chainInfo` (filter handler, TLS config) by the winning ChainSpec's
+	// Name. defaultChain is the per-connection terminal-filter state for
+	// default_filter_chain.
 	chainSpecs   []*listenerfilter.ChainSpec
 	defaultSpec  *listenerfilter.ChainSpec
 	defaultChain *chainInfo
 	chainByName  map[string]*chainInfo
 	// 07.2 (Task 9, ADR-0079) listener-filter pipeline plumbing. Populated
-	// from listener_filters[] at build time; consumed by Task 10's per-conn
-	// pipeline. lfTimeoutMs is in [1000, 60000] (ADR-0082); default 15000.
+	// from listener_filters[] at build time; consumed by serveConnection's
+	// per-conn pipeline. lfTimeoutMs is in [1000, 60000] (ADR-0082); default
+	// 15000.
 	listenerFilterFactories []listenerfilter.FilterInstanceFactory
 	lfTimeoutMs             uint32
 	continueOnLfTimeout     bool
@@ -432,19 +433,18 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		return nil, err
 	}
 
-	// Phase-07.2 Task 9 preserves the legacy SNI-only chain ordering in `cis`
-	// and the legacy GetConfigForClient TLS dispatch path so the still-active
-	// dispatch (Task 10 lifts it) keeps working. Order chains for the legacy
-	// path: empty/catch-all chains move to the end; SNI-bearing chains stay
-	// in declared order (we no longer pre-sort by SNI specificity since
-	// chainmatch.SelectChain owns specificity at Task 10).
-	legacyChains := orderLegacyChains(cis)
+	// Phase-07.2 Task 10: unified pre/post-handshake dispatch consumes
+	// chainSpecs / defaultSpec / chainByName directly via
+	// listenerfilter.SelectChain — there is no listener-level *stdtls.Config
+	// (each chainInfo carries its own per-chain config) and no legacy chain
+	// ordering. The unused `cis` local accumulator is silently discarded;
+	// chainByName is the canonical post-build chainInfo lookup.
+	_ = cis
 
 	rt := &listenerRuntime{
 		name:                    name,
 		addr:                    fmt.Sprintf("%s:%d", addr.GetAddress(), addr.GetPortValue()),
 		tlsMode:                 anyTLS,
-		chains:                  legacyChains,
 		chainSpecs:              chainSpecs,
 		defaultSpec:             defaultSpec,
 		defaultChain:            defaultChain,
@@ -452,11 +452,6 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		listenerFilterFactories: lfFactories,
 		lfTimeoutMs:             lfTimeoutMs,
 		continueOnLfTimeout:     l.GetContinueOnListenerFiltersTimeout(),
-	}
-	if anyTLS {
-		rt.tlsCfg = &stdtls.Config{
-			GetConfigForClient: makeGetConfigForClient(rt),
-		}
 	}
 	return rt, nil
 }
@@ -523,29 +518,6 @@ func parseListenerFiltersTimeout(name string, d *durationpb.Duration) (uint32, e
 		return 0, fmt.Errorf("listener: %q: listener_filters_timeout %s is outside the supported [1s, 60s] envelope", name, total)
 	}
 	return uint32(ms), nil
-}
-
-// orderLegacyChains preserves the phase-03 dispatch path's "catch-all
-// chain at the end" invariant the post-handshake `dispatch` function relies
-// on. Empty/no-server_names chains are moved to the end of the slice;
-// SNI-bearing chains keep their declared order. The phase-07.2 Task-10
-// refactor will replace this with chainmatch.SelectChain and remove the
-// legacy `chains` slice.
-func orderLegacyChains(cis []*chainInfo) []*chainInfo {
-	if len(cis) <= 1 {
-		return cis
-	}
-	out := make([]*chainInfo, 0, len(cis))
-	var trailing []*chainInfo
-	for _, ci := range cis {
-		if len(ci.serverNames) == 0 {
-			trailing = append(trailing, ci)
-			continue
-		}
-		out = append(out, ci)
-	}
-	out = append(out, trailing...)
-	return out
 }
 
 // parseChainSpec converts a listenerv3.FilterChainMatch into the listener-filter
@@ -738,45 +710,6 @@ func chainSpecKey(s *listenerfilter.ChainSpec) string {
 	return b.String()
 }
 
-// makeGetConfigForClient returns the GetConfigForClient callback for a TLS
-// listener. It runs the chain-match logic at ClientHello time, returning the
-// per-chain *stdtls.Config for the best-matching chain, or (nil, error) if no
-// chain matches. Chains are already sorted most-specific-first by
-// buildListenerRuntime.
-func makeGetConfigForClient(rt *listenerRuntime) func(*stdtls.ClientHelloInfo) (*stdtls.Config, error) {
-	return func(hello *stdtls.ClientHelloInfo) (*stdtls.Config, error) {
-		sni := hello.ServerName
-		for _, ci := range rt.chains {
-			if len(ci.serverNames) == 0 {
-				// Catch-all — matches any SNI. Most-specific-first ordering
-				// guarantees this is only reached when no specific chain matched.
-				return ci.tlsCfg.Clone(), nil
-			}
-			if internaltls.MatchServerName(ci.serverNames, sni) {
-				return ci.tlsCfg.Clone(), nil
-			}
-		}
-		return nil, fmt.Errorf("listener: %q: no filter_chain matches SNI %q", rt.name, sni)
-	}
-}
-
-// dispatch re-runs the chain-match logic after a successful handshake, using
-// the SNI recorded in the connection state. Because SNI is fixed from the
-// ClientHello through the connection's lifetime, re-running the pure-function
-// match is deterministic (ADR-0033 chain-selection propagation mechanism).
-func (rt *listenerRuntime) dispatch(ctx context.Context, tlsConn *stdtls.Conn) {
-	sni := tlsConn.ConnectionState().ServerName
-	for _, ci := range rt.chains {
-		if len(ci.serverNames) == 0 || internaltls.MatchServerName(ci.serverNames, sni) {
-			ci.filter.Handle(ctx, tlsConn)
-			return
-		}
-	}
-	// Should not happen: GetConfigForClient already rejected un-matchable SNIs.
-	log.Printf("listener %q: post-handshake dispatch: no chain matches SNI %q (race/logic bug)", rt.name, sni)
-	_ = tlsConn.Close()
-}
-
 // Start binds every built listener, captures its bound address, and launches
 // one accept goroutine per listener. Returns after every bind succeeds (or on
 // the first bind failure, after unwinding any already-bound sockets). Every
@@ -829,16 +762,20 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // acceptLoop runs until the listener is closed (Stop) or ctx is canceled.
-// For plaintext listeners, each accepted connection is handed to the single
-// chain's filter.Handle in its own goroutine. For TLS listeners, each
-// connection is wrapped and handed to serveTLS.
+// Each accepted connection is dispatched to serveConnection in its own
+// goroutine (single-goroutine-per-connection per SPEC §5.6).
 //
 // Phase 06.1 (Task 10) hot-path discipline (SPEC §5.5): on each accepted
-// connection Inc downstream_cx_total (counter, monotonic) AND downstream_cx_active
-// (gauge, +1); the per-conn dispatch goroutine defers downstream_cx_active.Dec()
-// so the gauge falls back when the filter's own deferred conn-close completes.
-// The Inc/Dec discipline is exactly once per conn — Inc on accept, Dec when
-// the dispatch goroutine returns.
+// connection Inc downstream_cx_total (counter, monotonic) AND
+// downstream_cx_active (gauge, +1); serveConnection defers
+// downstream_cx_active.Dec() so the gauge falls back when the per-conn
+// pipeline + dispatch returns. Inc/Dec is exactly once per conn — Inc here
+// on accept, Dec on serveConnection return.
+//
+// Phase 07.2 (Task 10): the previous TLS / non-TLS branching is gone — the
+// unified serveConnection helper runs (1) listener-filter pipeline → (2)
+// chain-match → (3) handshake (if the selected chain has TLS) → (4)
+// terminal-filter dispatch on every connection regardless of TLS posture.
 //
 // ln is captured by Start before launching the goroutine to keep the read off
 // the rt.netLn field that Stop nil-writes (the race detector flags the in-loop
@@ -857,37 +794,133 @@ func (rt *listenerRuntime) acceptLoop(ctx context.Context, ln net.Listener) {
 			continue
 		}
 		// 06.1 hot path (SPEC §5.5): +2 LoC at the accept site; the matching
-		// Dec is deferred in the per-conn dispatch goroutine below.
+		// Dec is deferred in serveConnection.
 		rt.downstreamCxTotal.Inc()
 		rt.downstreamCxActive.Inc()
-		if !rt.tlsMode {
-			// Phase-02-style: single chain, dispatch directly. The filter's
-			// Handle owns the conn-close lifecycle; the deferred Dec here
-			// fires after Handle returns (i.e., after the conn is closed).
-			go func(c net.Conn) {
-				defer rt.downstreamCxActive.Dec()
-				rt.chains[0].filter.Handle(ctx, c)
-			}(raw)
-			continue
-		}
-		go func(c net.Conn) {
-			defer rt.downstreamCxActive.Dec()
-			rt.serveTLS(ctx, c)
-		}(raw)
+		go rt.serveConnection(ctx, raw)
 	}
 }
 
-// serveTLS wraps raw in a TLS server connection, performs the handshake, then
-// dispatches to the correct chain via dispatch. Handshake errors are logged
-// and the raw connection is closed.
-func (rt *listenerRuntime) serveTLS(ctx context.Context, raw net.Conn) {
-	tlsConn := stdtls.Server(raw, rt.tlsCfg)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		log.Printf("listener %q: handshake: %v", rt.name, err)
-		_ = raw.Close()
+// serveConnection is the per-connection unified pre/post-handshake dispatch
+// helper introduced by phase 07.2 Task 10 (SPEC §5.2 lifecycle). The 8 steps:
+//
+//  1. Build ChainMatchInputs from the connection's local/remote addresses.
+//  2. Wrap raw in a peekerConn so listener filters can Peek without consuming.
+//  3. Construct per-connection ListenerFilter instances from the per-listener
+//     factory slice (one allocation per filter per connection).
+//  4. Run the listener-filter pipeline; on error, honor
+//     `continue_on_listener_filters_timeout` — false aborts the connection,
+//     true falls through with whatever inputs were populated so far.
+//  5. Run listenerfilter.SelectChain over chainSpecs / defaultSpec; abort on
+//     ErrNoChainMatched or ErrAmbiguousChainMatch.
+//  6. If the selected chain has TLS, hand the peekerConn to stdtls.Server with
+//     the chain's per-chain *stdtls.Config and run HandshakeContext; abort on
+//     handshake error.
+//  7. Dispatch to the selected chain's terminal filter.Handle; the filter
+//     owns the conn-close lifecycle.
+//
+// The deferred downstreamCxActive.Dec() at the top of the function fires when
+// the per-conn pipeline + dispatch goroutine returns (i.e., when Handle
+// returns or any of the abort paths runs); the matching Inc happens in
+// acceptLoop.
+//
+// Per ADR-0079 the listener-filter Pipeline.Run already calls OnDestroy on
+// every constructed filter instance via its own deferred loop (pipeline.go
+// lines 33-37) — the helper does NOT need to re-defer that here.
+func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
+	defer rt.downstreamCxActive.Dec()
+
+	// (1) ChainMatchInputs from connection-level facts.
+	inputs := listenerfilter.ChainMatchInputs{
+		DestinationIP:   localIP(raw),
+		DestinationPort: localPort(raw),
+		SourceIP:        remoteIP(raw),
+		SourcePort:      remotePort(raw),
+	}
+
+	// (2) Wrap in peekerConn so listener filters can read without consuming.
+	pkConn := listenerfilter.NewPeekerConn(raw)
+
+	// (3) Construct per-connection ListenerFilter instances from factories.
+	filters := make([]listenerfilter.ListenerFilter, len(rt.listenerFilterFactories))
+	for i, fac := range rt.listenerFilterFactories {
+		filters[i] = fac()
+	}
+
+	// (4) Run listener-filter pipeline.
+	var p listenerfilter.Pipeline
+	if err := p.Run(ctx, filters, listenerfilter.AsPeeker(pkConn), &inputs, rt.lfTimeoutMs); err != nil {
+		if !rt.continueOnLfTimeout {
+			log.Printf("listener %q: listener-filter pipeline aborted: %v", rt.name, err)
+			_ = pkConn.Close()
+			return
+		}
+		// continue_on_listener_filters_timeout=true: fall through with partial inputs.
+	}
+
+	// (5) Run chain-match algorithm.
+	selectedSpec, err := listenerfilter.SelectChain(inputs, rt.chainSpecs, rt.defaultSpec)
+	if err != nil {
+		log.Printf("listener %q: chain-match: %v", rt.name, err)
+		_ = pkConn.Close()
 		return
 	}
-	rt.dispatch(ctx, tlsConn)
+	selected := rt.chainByName[selectedSpec.Name]
+	if selected == nil {
+		// Defensive — chainByName is populated for every ChainSpec at build time;
+		// reaching here would be a logic bug, not a runtime path.
+		log.Printf("listener %q: chain-match: no chainInfo for selected spec %q (logic bug)", rt.name, selectedSpec.Name)
+		_ = pkConn.Close()
+		return
+	}
+
+	// (6) If selected chain has TLS, run handshake.
+	var dispatchConn net.Conn = pkConn
+	if selected.tlsCfg != nil {
+		tlsConn := stdtls.Server(pkConn, selected.tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			log.Printf("listener %q: handshake: %v", rt.name, err)
+			_ = pkConn.Close()
+			return
+		}
+		dispatchConn = tlsConn
+	}
+
+	// (7) Dispatch to terminal filter.
+	selected.filter.Handle(ctx, dispatchConn)
+}
+
+// localIP / localPort / remoteIP / remotePort extract the IP+port pieces from
+// a net.Conn's LocalAddr / RemoteAddr. Currently only TCP addresses are
+// observed in the listener pipeline — the type-assertion to *net.TCPAddr
+// returns the zero value (nil IP, port 0) for any other address kind, which
+// the chain-match algorithm treats as unmatched on every IP/port dimension.
+func localIP(c net.Conn) net.IP {
+	if a, ok := c.LocalAddr().(*net.TCPAddr); ok {
+		return a.IP
+	}
+	return nil
+}
+
+func localPort(c net.Conn) uint32 {
+	if a, ok := c.LocalAddr().(*net.TCPAddr); ok {
+		return uint32(a.Port)
+	}
+	return 0
+}
+
+func remoteIP(c net.Conn) net.IP {
+	if a, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+		return a.IP
+	}
+	return nil
+}
+
+func remotePort(c net.Conn) uint32 {
+	if a, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+		return uint32(a.Port)
+	}
+	return 0
 }
 
 // Listeners returns one Info per bound listener. Empty before Start or after a

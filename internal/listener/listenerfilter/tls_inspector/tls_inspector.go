@@ -2,6 +2,7 @@ package tls_inspector
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 
 	"google.golang.org/protobuf/types/known/anypb"
@@ -41,11 +42,40 @@ type filter struct {
 // populates inputs with extracted SNI + ALPN. Else sets
 // inputs.TransportProtocol = "raw_buffer". Always returns Continue (the
 // pipeline advances regardless of inspection outcome).
+//
+// The peek is incremental: first 5 bytes (TLS record header) to learn the
+// record length, then exactly 5+recordLen bytes capped at bufferSize. This
+// avoids the bufio.Reader.Peek deadlock that would otherwise occur when the
+// configured bufferSize exceeds the ClientHello's actual byte length —
+// bufio's Peek(n) blocks until n bytes are available, which would hang the
+// handshake forever (a typical ClientHello is ~250-350 bytes; the default
+// bufferSize is 4096). Phase 07.2 Task 10 surfaced this deadlock when the
+// listener-filter pipeline began running on real network connections.
 func (f *filter) Inspect(ctx context.Context, peeker listenerfilter.Peeker, inputs *listenerfilter.ChainMatchInputs) (listenerfilter.ListenerFilterStatus, error) {
-	buf, err := peeker.Peek(f.cfg.bufferSize)
+	// Step 1: peek the 5-byte TLS record header to learn the record length.
+	hdr, err := peeker.Peek(5)
+	if err != nil && len(hdr) == 0 {
+		if errors.Is(err, context.Canceled) {
+			return listenerfilter.Continue, ctx.Err()
+		}
+		inputs.TransportProtocol = "raw_buffer"
+		return listenerfilter.Continue, nil
+	}
+	if len(hdr) < 5 || hdr[0] != 0x16 {
+		// Too short for a TLS record header, or not a Handshake record.
+		inputs.TransportProtocol = "raw_buffer"
+		return listenerfilter.Continue, nil
+	}
+	// Step 2: derive the full record length, cap by bufferSize, and peek that
+	// exact number of bytes. The cap tolerates pathological clients sending
+	// out-of-spec record lengths.
+	recordLen := int(binary.BigEndian.Uint16(hdr[3:5]))
+	want := 5 + recordLen
+	if want > f.cfg.bufferSize {
+		want = f.cfg.bufferSize
+	}
+	buf, err := peeker.Peek(want)
 	if err != nil && len(buf) == 0 {
-		// Connection closed before any bytes arrived; non-fatal — let the
-		// chain-match algorithm operate on the un-inspected facts.
 		if errors.Is(err, context.Canceled) {
 			return listenerfilter.Continue, ctx.Err()
 		}
