@@ -29,6 +29,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -179,12 +180,47 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
+		case fixture.HTTPEchoBody:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPEchoBodyBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
 		}
 		backends[i] = bo
 	}
 	backendPorts := make([]int, n)
 	for i, b := range backends {
 		backendPorts[i] = b.port
+	}
+
+	// 1b. Reference-less fast path. Drivers that implement
+	// fixture.ReferenceLessFixture and return false from RequiresReference()
+	// signal to the runner that this fixture has no reference Envoy
+	// counterpart (e.g. fixture 0007b-iteration-probe — envoy-go-only
+	// structural assertion of the iteration-protocol state machine via the
+	// hand-rolled envoy.filters.http.envoy_go_test probe filter, which does
+	// not exist in upstream Envoy). The runner SKIPS reference-proxy spawn,
+	// SKIPS DriveReference, SKIPS the byte-stream CompareBytes, and SKIPS
+	// the admin probe diff. Only DriveSubject + the optional SubjectAsserter
+	// run. SPEC §7.4 + ADR-0074. Pre-existing fixtures 0000-0007a do NOT
+	// implement ReferenceLessFixture, so they default to RequiresReference()
+	// = true and stay on the differential path unchanged.
+	if rl, ok := d.(fixture.ReferenceLessFixture); ok && !rl.RequiresReference() {
+		runReferenceLessFixture(ctx, t, root, d, backendPorts)
+		return
 	}
 
 	// 2. Reference proxy. If the driver implements ReferenceLogMounter, pre-create
@@ -608,6 +644,69 @@ func startHTTPHelloBackend(ctx context.Context, repoRoot string, port int) (*exe
 		return nil, fmt.Errorf("start: %w", err)
 	}
 	return cmd, nil
+}
+
+// startHTTPEchoBodyBackend spawns the fixture-0007b HTTP/1.1 echo-body backend
+// subprocess on port. The backend returns 200 OK with the request body if
+// non-empty, else with the fixed 8-byte body "backend\n". No TLS. Introduced
+// for fixture 0007b-iteration-probe (Task 22) so the iteration-protocol
+// structural fixture's modify-encode-data mode can verify in-place body
+// mutation against an echoed payload, and the no-body modes have a stable
+// baseline body. Because the backend is a subprocess, the runner's in-process
+// accept counter is NOT incremented.
+func startHTTPEchoBodyBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0007b-iteration-probe/backends",
+		"--port", fmt.Sprintf("%d", port),
+	)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	return cmd, nil
+}
+
+// runReferenceLessFixture is the runner's per-fixture loop variant for drivers
+// that implement fixture.ReferenceLessFixture and return false from
+// RequiresReference(). It spawns ONLY the subject proxy, drives subject, and
+// invokes the driver's SubjectAsserter (in-band assertion per SPEC §12 #8).
+// No reference-Envoy container is spawned; no byte-stream comparison runs;
+// no admin diff fires. Used by fixture 0007b-iteration-probe (Task 22) for
+// the envoy-go-only iteration-protocol structural assertion.
+//
+// The reference-related arguments to d.SubjectConfig are zero-valued (the
+// fixture has no reference, so refListenerPort = 0). Drivers that go through
+// this branch MUST tolerate that — 0007b's SubjectConfig template ignores
+// the refListenerPort argument.
+func runReferenceLessFixture(ctx context.Context, t *testing.T, root string, d FixtureDriver, backendPorts []int) {
+	t.Helper()
+	// Subject proxy.
+	subjPort := freeTCPPort(t)
+	subjAdminPort := freeTCPPort(t)
+	subjCfg := d.SubjectConfig(0, subjPort, backendPorts, subjAdminPort)
+	subj, err := StartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
+	if err != nil {
+		t.Fatalf("subj start: %v", err)
+	}
+	defer func() { _ = subj.Stop() }()
+
+	// Drive subj. The driver's DriveSubject returns whatever bytes it captures
+	// per-mode; the in-band SubjectAsserter inspects the captured bytes
+	// against the embedded expectation table.
+	subjBytes, err := d.DriveSubject(ctx, subj.ListenerAddr(d.SubjectListenerName()))
+	if err != nil {
+		t.Fatalf("subj drive: %v", err)
+	}
+
+	// In-band per-mode assertion. If the driver does NOT implement
+	// SubjectAsserter, the runner only validates that DriveSubject returned
+	// without error — the structural assertion lives entirely in DriveSubject
+	// in that case (driver-internal t.Errorf via captured *testing.T).
+	if sa, ok := d.(fixture.SubjectAsserter); ok {
+		sa.AssertSubject(t, subjBytes)
+	}
 }
 
 // waitTCPDial polls addr until a TCP dial succeeds or the timeout elapses.

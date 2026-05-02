@@ -162,6 +162,17 @@ const (
 	// differential. Because the backend is a subprocess, the runner's
 	// in-process accept counter is NOT incremented.
 	HTTPHello BackendKind = 5
+	// HTTPEchoBody is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0007b-iteration-probe/backends/main.go on the pre-allocated
+	// port. The backend returns 200 OK with the request body if the request had
+	// a non-empty body, else with the fixed 8-byte body "backend\n" (7 chars +
+	// LF). No TLS. Introduced by fixture 0007b-iteration-probe (Task 22) for
+	// the iteration-protocol structural fixture: the per-mode driver issues
+	// some requests with bodies (POST) and some without (GET); the echo path
+	// allows the modify-encode-data mode to verify the in-place body mutation,
+	// and the fixed body covers the no-body modes. Because the backend is a
+	// subprocess, the runner's in-process accept counter is NOT incremented.
+	HTTPEchoBody BackendKind = 6
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
@@ -201,4 +212,42 @@ type ReferenceLogMounter interface {
 // SubjectConfig, then assert the three-tier matrix. Introduced by ADR-0068.
 type AccessLogAsserter interface {
 	AssertAccessLog(t TB)
+}
+
+// ReferenceLessFixture is an OPTIONAL driver-side interface. Drivers that
+// implement it returning false signal to the runner that this fixture has no
+// reference Envoy counterpart — the runner SKIPS reference-proxy spawn,
+// SKIPS DriveReference, SKIPS the byte-stream CompareBytes between ref/subj,
+// and SKIPS the admin probe diff. Only DriveSubject + the optional
+// SubjectAsserter run. Phase-07.1 fixture 0007b-iteration-probe is the first
+// reference-less structural fixture (envoy-go-only iteration-protocol probe;
+// no real Envoy filter equivalent exists for the envoy.filters.http.envoy_go_test
+// type URL). The runner's per-fixture loop falls through the
+// reference-spawn/drive/compare branches when this returns false; the
+// SubjectAsserter (if also implemented) runs in-band against the subject's
+// captured response stream.
+//
+// Drivers that do NOT implement this interface default to true (i.e., the
+// pre-07.1 default — every fixture has a reference Envoy counterpart). This
+// keeps the 0000–0007a fixtures untouched.
+//
+// Introduced by SPEC §7.4 + PLAN Task 22 / ADR-0074.
+type ReferenceLessFixture interface {
+	RequiresReference() bool
+}
+
+// SubjectAsserter is an OPTIONAL driver-side interface the runner invokes after
+// DriveSubject when the driver implements it. The runner passes the bytes
+// returned by DriveSubject; the driver performs in-band assertions against
+// them (e.g., a structural fixture's per-mode embedded-expectation table). For
+// reference-less fixtures (RequiresReference() == false) this is the only
+// assertion path the runner exercises after Drive — the byte-stream
+// CompareBytes against a reference is skipped.
+//
+// Introduced by fixture 0007b-iteration-probe (Task 22) so the driver's 8-mode
+// assertion logic lives in-band per SPEC §12 #8 (mirrors the StatsAsserter +
+// AccessLogAsserter precedent). Drivers that do NOT implement this interface
+// experience a no-op runner branch.
+type SubjectAsserter interface {
+	AssertSubject(t TB, subjBytes []byte)
 }

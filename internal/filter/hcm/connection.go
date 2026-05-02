@@ -2,6 +2,7 @@ package hcm
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -288,11 +289,33 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 	}
 
 	if hasBody {
+		// Phase 07.1 Task 22: buffer the body bytes as we feed them to the
+		// chain so the terminal router action's `req.Write(upstream)` sees a
+		// readable req.Body again. Without this, the body bytes were drained
+		// into RunDecodeData and the upstream got headers + zero body bytes
+		// despite a non-zero Content-Length, causing the upstream backend to
+		// hang waiting for body bytes that never came (manifesting as 502 on
+		// every POST request — exposed by fixture 0007b's modes 3 + 5 when
+		// they POST a body and either return 200 (mode 3) or 418 (mode 5)).
+		//
+		// The buffering is unconditional in this branch — every POST/PUT
+		// request with a body goes through chain.RunDecodeData (so any
+		// filter's DecodeData callback fires) AND the buffered bytes go
+		// to the upstream via the restored req.Body. Phase 04 streamed the
+		// body directly through req.Write; Task 15 introduced the chain
+		// drain; Task 22 closes the gap.
+		//
+		// Buffer cap is filter_http.FilterBufferLimitBytes (1 MiB per
+		// ADR-0076) — overflow synthesizes a 413 inside RunDecodeData (per
+		// the §11 #3 empirical pin), so this branch never sees an
+		// over-cap body in practice.
 		buf := make([]byte, 32*1024)
+		var bodyBuf []byte
 		for {
 			n, rerr := req.Body.Read(buf)
 			endStreamOnData := rerr != nil
 			if n > 0 {
+				bodyBuf = append(bodyBuf, buf[:n]...)
 				if _, derr := chain.RunDecodeData(ctx, buf[:n], endStreamOnData); derr != nil {
 					return 0, derr
 				}
@@ -301,6 +324,34 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 				break
 			}
 		}
+		// Restore req.Body so the downstream router's req.Write(upstream)
+		// can stream the body to the upstream cluster. Use a bytes.Reader
+		// wrapped in io.NopCloser since req.Write reads whatever Reader
+		// req.Body wraps.
+		req.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+	}
+
+	// Phase 07.1 Task 22: SendLocalReply path on DecodeData. If a non-terminal
+	// filter (e.g. envoygotest in local-reply-decode-data mode) called
+	// dcb.SendLocalReply during the body loop above, the chain transitioned
+	// to encode mode and the encode chain ran synchronously inside
+	// beginLocalReply. We mirror the post-RunDecodeHeaders branch (handled at
+	// line ~268) here so the terminal action does NOT dial the upstream
+	// cluster — the synthesized response shape is already on the chain.
+	if chain.LocalReplyDone() {
+		lrStatus, lrHeaders, lrBody := chain.LocalReplyResponse()
+		bytesSent := int64(len(lrBody))
+		var werr error
+		if lrStatus > 0 {
+			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
+		}
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime)
+		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
+			if werr == nil {
+				werr = errCloseAfterAction
+			}
+		}
+		return lrStatus, werr
 	}
 
 	// Terminal-action invocation: the router filter's RunAction surfaces the

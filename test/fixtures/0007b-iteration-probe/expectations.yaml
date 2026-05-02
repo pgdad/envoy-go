@@ -1,0 +1,116 @@
+# Phase 07.1 fixture 0007b-iteration-probe — expectations
+#
+# This file is prose, not machine-evaluated (per ADR-0019). The runner
+# enforces the assertions described below via the driver's AssertSubject
+# in-band callback (test/fixtures/0007b-iteration-probe/driver/driver.go),
+# invoked by test/differential/runner_test.go's reference-less branch
+# (runReferenceLessFixture). The driver's modeExpectations table is the
+# load-bearing data structure; this file documents the same shape in prose
+# for human consumption.
+#
+# Asserted shape (per SPEC §7.3 + ADR-0074):
+#   - per-mode response status code (8 modes)
+#   - per-mode response body byte-equal (Go-quoted in the captured stream
+#     so trailing-newline / non-printable divergences surface)
+#   - per-mode response header presence (load-bearing headers per mode)
+#
+# Not asserted (allow-listed):
+#   - Date, Server, Content-Type, Content-Length, x-envoy-*, x-request-id —
+#     these are rendered into the captured stream but the per-mode
+#     headersPresent / headersAbsent table only checks for the load-bearing
+#     iteration-probe headers (x-envoy-go-test-route-count and the per-mode
+#     x-envoy-go-test-encoded marker).
+#
+# Per-route count config:
+#   - typed_per_filter_config[envoy.filters.http.envoy_go_test] =
+#     EnvoyGoTestPerRoute{count: 7} on the route /. Every response should
+#     carry x-envoy-go-test-route-count: 7 per the universal encode-side
+#     branch in internal/filter/http/envoygotest/filter.go EncodeHeaders.
+#
+# 8-mode workload (SPEC §7.3 table; deterministic ordering):
+#
+#   1. continue  (GET /)
+#      x-envoy-go-test-mode: continue
+#      expect: 200; body "backend\n" (8 bytes from backends/main.go fixed
+#              body); x-envoy-go-test-route-count: 7.
+#
+#   2. stop-and-resume-headers  (GET /)
+#      x-envoy-go-test-mode: stop-and-resume-headers
+#      expect: 200; body "backend\n"; x-envoy-go-test-route-count: 7. The
+#              probe filter's DecodeHeaders returns StopIteration; a
+#              goroutine resumes after 10ms via ContinueDecoding. The wire
+#              shape is identical to mode 1 — the resume is transparent.
+#
+#   3. stop-and-buffer-data  (POST /, body "payload")
+#      x-envoy-go-test-mode: stop-and-buffer-data
+#      expect: 200; body "payload" (backend echoes the POST body since it's
+#              non-empty); x-envoy-go-test-route-count: 7. The probe
+#              filter's DecodeData returns DataStopIterationAndBuffer; a
+#              goroutine resumes after 10ms.
+#
+#   4. local-reply-decode  (GET /)
+#      x-envoy-go-test-mode: local-reply-decode
+#      expect: 418; body "i am a teapot\n" (verbatim from
+#              SendLocalReply); x-envoy-go-test-route-count: 7. The probe's
+#              DecodeHeaders calls SendLocalReply(418, "i am a teapot\n")
+#              and returns StopIteration. The chain transitions to encode
+#              synchronously inside beginLocalReply (ADR-0075); the encode
+#              chain runs in REVERSE declaration order, so the probe's
+#              EncodeHeaders fires AFTER the SendLocalReply and adds the
+#              route-count header.
+#
+#   5. local-reply-decode-data  (POST /, body "payload")
+#      x-envoy-go-test-mode: local-reply-decode-data
+#      expect: 418; body "i am a teapot\n"; x-envoy-go-test-route-count: 7.
+#              Same wire shape as mode 4 — the local reply fires from
+#              DecodeData (after DecodeHeaders has already passed through).
+#
+#   6. modify-encode-headers  (GET /)
+#      x-envoy-go-test-mode: modify-encode-headers
+#      expect: 200; body "backend\n"; x-envoy-go-test-route-count: 7;
+#              x-envoy-go-test-encoded: yes (added by the probe's
+#              EncodeHeaders when mode is modify-encode-headers).
+#
+#   7. modify-encode-data  (GET /)
+#      x-envoy-go-test-mode: modify-encode-data
+#      expect: 200; body "MODIFIED" (8 bytes — the result of copy-truncate
+#              "MODIFIED\n" (9 bytes) into the 8-byte "backend\n" backing
+#              array per filter.go EncodeData; the trailing \n is dropped);
+#              x-envoy-go-test-route-count: 7.
+#
+#   8. stop-trailers  (GET /)
+#      x-envoy-go-test-mode: stop-trailers
+#      expect: 200; body "backend\n"; x-envoy-go-test-route-count: 7.
+#              IMPORTANT — H1 HCM dispatch (internal/filter/hcm/connection.go)
+#              does NOT currently invoke RunDecodeTrailers (the H1 chunked-T-E
+#              trailer parsing was deferred at Task 15 close-out per
+#              PROGRESS notes). The probe filter's DecodeTrailers branch is
+#              wired (filter_test.go: TestEnvoyGoTest_ModeStopTrailers
+#              exercises it directly via chain.RunDecodeTrailers) but does
+#              NOT fire end-to-end on this H1 fixture. Mode 8's expected
+#              wire shape is therefore identical to mode 1 — the request
+#              flows through as if mode were "continue". This is the
+#              honest documented behavior per the Task 22 prompt's
+#              mode 8 caveat; updating HCM to drive RunDecodeTrailers from
+#              H1 chunked-T-E would shift mode 8 to a delayed-resume shape
+#              in a future phase.
+#
+# Filter chain (declaration order):
+#
+#   1. envoy.filters.http.envoy_go_test  (test-only probe; ADR-0074)
+#   2. envoy.filters.http.router         (terminal; Task 11 migration)
+#
+# Backend body format:
+#   - Empty request body (GET) → "backend\n" (8 bytes)
+#   - Non-empty request body (POST) → echo of the request body verbatim
+#
+# Subject-only invariants:
+#   - RequiresReference: false  (envoy-go-only; no reference Envoy in this
+#     fixture — the envoy.filters.http.envoy_go_test type URL is
+#     hand-rolled and does not exist in upstream Envoy)
+#   - The runner registers the fixture via the optional
+#     fixture.ReferenceLessFixture interface returning false (see
+#     test/differential/fixture/fixture.go)
+#   - The runner's reference-less branch (runReferenceLessFixture) skips
+#     reference-proxy spawn, DriveReference, byte-stream CompareBytes,
+#     and admin probe diff; only DriveSubject + AssertSubject run.
