@@ -264,3 +264,5 @@ cmd/envoy-go/main.go:83:33: not enough arguments in call to admin.New
 $ grep -c '^## ADR-0086:' docs/envoy-go/DECISIONS.md
 1
 ```
+
+**Follow-up — T6 review:** Tightened `TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent` per code-review I-1 (depth-1 field anchors 1-space indent — replaced loose `\n ` substring check with `\n "configs"` substring which only matches under `Indent: " "`; under any wider indent the depth-1 field would carry N+ spaces and silently miss) and I-2 (`"node":\s+null` regex anchors `EmitUnpopulated: true` — the §7.3 fixture's bootstrap has no `node` field so under `EmitUnpopulated: true` the marshaler emits `"node": null` and under `EmitUnpopulated: false` would elide the field entirely; regex tolerates protojson's deliberate post-colon-spacing randomization which alternates between 1 and 2 spaces per Marshal call). Added `regexp` import; no other code touched. `go test -count=1 -run TestHandleConfigDump_ProtoJSONUsesSnakeCaseAndOneSpaceIndent ./internal/admin/... -v` PASS (10/10 in stress run); `go test -count=1 ./internal/admin/...` 26 PASS; `go vet`/`golangci-lint` clean. Commit `7b938fc`.
