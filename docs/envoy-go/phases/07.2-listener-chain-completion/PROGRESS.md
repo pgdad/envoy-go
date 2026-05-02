@@ -214,3 +214,44 @@ ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.049s
 $ go vet ./internal/listener/listenerfilter/...
 $ golangci-lint run ./internal/listener/listenerfilter/...
 ```
+
+## Task 7 — internal/listener/listenerfilter/tls_inspector/parser.go
+
+**Commits:** TBD — this task's commit
+**Notes:** Created the `tls_inspector/` sub-package — the FIRST file in this directory — with `parser.go` (~150 LoC: `parseClientHello` + `parseServerName` + `parseALPN`; pure functions; no I/O; only `encoding/binary` import) and `parser_test.go` (~108 LoC: 7 tests using a `captureClientHello(t, sni, alpns)` helper that runs `crypto/tls.Client` against `net.Pipe()` to capture verbatim ClientHello bytes from the standard library — TestParseClientHelloWithSNIAndALPN, TestParseClientHelloSNIOnly, TestParseClientHelloALPNOnly, TestParseClientHelloEmpty, TestParseClientHelloNonTLSPreamble, TestParseClientHelloTruncated [loops cuts 1..50 asserting ok=false], TestParseClientHelloMalformedLengthPrefix [recovers from any panic]). PLAN-verbatim Go source from PLAN lines 1672-1756 (test) + 1765-1866 (impl). The parser is hand-rolled per D-3.2 (no cgo / C++ binding to upstream Envoy's `tls_inspector`); adapted from `crypto/tls/handshake_messages.go:unmarshal` for the ClientHello case, narrowed to two extension types of interest — `0x0000` (server_name, RFC 6066 §3) and `0x0010` (application_layer_protocol_negotiation, RFC 7301 §3.1). Defensive parsing: every length-bounded read checks remaining buffer size before advancing; malformed inputs return `ok=false` without panicking. The `case 0x0000`/`case 0x0010` handlers use `if name, ok := parseServerName(body); ok { sni = name }` — the inner `ok` shadows the outer return value but is scoped to the `if` block (per Go scoping rules), so a malformed extension body silently leaves `sni`/`alpns` empty rather than aborting the whole parse. TDD discipline observed: parser_test.go was written first; `go test ./internal/listener/listenerfilter/tls_inspector/... 2>&1 | head -30` confirmed failing (build error: undefined symbol `parseClientHello`); then parser.go landed; tests passed under `-race`. Two adaptations from PLAN-verbatim source for lint cleanliness: (a) `defer cli.Close()` / `defer srv.Close()` rewritten to `defer func() { _ = cli.Close() }()` / `defer func() { _ = srv.Close() }()` to satisfy errcheck (mirrors the `internal/listener/listenerfilter/callbacks_test.go` precedent established in Task 2); (b) added a package doc comment to `parser.go` to satisfy revive's `package-comments` rule (the only revive linter that fired against the PLAN-verbatim source) — the comment cites D-3.2 (no cgo) + ADR-0079 (the `tls_inspector` underscore name follows the `envoy.filters.listener.tls_inspector` type_url convention; an explicit `//nolint:revive` directive on the package declaration documents the convention even though revive did not flag the underscore itself). No new ADR — these are mechanical lint adaptations within the small-mechanical-fixes umbrella (ADR-0017). Pristine state confirmed: `go vet` clean, `golangci-lint run` clean, `go test -race` PASS for both the new sub-package AND the parent `listenerfilter` package.
+**Outputs:**
+```
+$ go test ./internal/listener/listenerfilter/tls_inspector/... 2>&1 | head -30
+# github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector [github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector.test]
+internal/listener/listenerfilter/tls_inspector/parser_test.go:33:20: undefined: parseClientHello
+internal/listener/listenerfilter/tls_inspector/parser_test.go:47:20: undefined: parseClientHello
+internal/listener/listenerfilter/tls_inspector/parser_test.go:61:20: undefined: parseClientHello
+internal/listener/listenerfilter/tls_inspector/parser_test.go:74:14: undefined: parseClientHello
+internal/listener/listenerfilter/tls_inspector/parser_test.go:82:14: undefined: parseClientHello
+internal/listener/listenerfilter/tls_inspector/parser_test.go:91:15: undefined: parseClientHello
+internal/listener/listenerfilter/tls_inspector/parser_test.go:107:12: undefined: parseClientHello
+FAIL	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector [build failed]
+FAIL
+$ go test -race ./internal/listener/listenerfilter/tls_inspector/... -v 2>&1 | tail -30
+=== RUN   TestParseClientHelloWithSNIAndALPN
+--- PASS: TestParseClientHelloWithSNIAndALPN (0.00s)
+=== RUN   TestParseClientHelloSNIOnly
+--- PASS: TestParseClientHelloSNIOnly (0.00s)
+=== RUN   TestParseClientHelloALPNOnly
+--- PASS: TestParseClientHelloALPNOnly (0.00s)
+=== RUN   TestParseClientHelloEmpty
+--- PASS: TestParseClientHelloEmpty (0.00s)
+=== RUN   TestParseClientHelloNonTLSPreamble
+--- PASS: TestParseClientHelloNonTLSPreamble (0.00s)
+=== RUN   TestParseClientHelloTruncated
+--- PASS: TestParseClientHelloTruncated (0.00s)
+=== RUN   TestParseClientHelloMalformedLengthPrefix
+--- PASS: TestParseClientHelloMalformedLengthPrefix (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.008s
+$ go test -race ./internal/listener/listenerfilter/...
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.049s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.008s
+$ go vet ./internal/listener/listenerfilter/tls_inspector/...
+$ golangci-lint run ./internal/listener/listenerfilter/tls_inspector/...
+```
