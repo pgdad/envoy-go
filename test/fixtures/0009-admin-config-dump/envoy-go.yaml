@@ -1,0 +1,36 @@
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+
+static_resources:
+  listeners:
+    - name: l_main
+      address: {socket_address: {address: 127.0.0.1, port_value: 10000}}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: rc_main
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {prefix: /}
+                          route: {cluster: c_backend}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: c_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: 127.0.0.1, port_value: 18001}}}
+              - endpoint: {address: {socket_address: {address: 127.0.0.1, port_value: 18002}}}

@@ -1,0 +1,76 @@
+# Phase 08.1 fixture 0009-admin-config-dump — expectations
+#
+# This file is prose, not machine-evaluated (per ADR-0019). The runner
+# enforces the assertions described below via the driver's ProbeAdmin
+# canonicalisation + the runner's CompareBytes pass on the canonicalised
+# scrape results.
+#
+# Asserted equivalence (per SPEC §7.1 + ADR-0086 + ADR-0087 + ADR-0088,
+# refined per planner-time decision 8 in PLAN §"Planner-time deferred-
+# decision resolution"):
+#
+#   /config_dump (per ADR-0086):
+#     - body parsed as JSON; recursively compared with allow-list applied.
+#     - allow-listed JSON paths (zeroed on BOTH sides before comparison):
+#       - bootstrap.node.user_agent_name
+#       - bootstrap.node.user_agent_build_version (entire subtree)
+#       - bootstrap.node.extensions[]
+#       - configs[*].bootstrap.last_updated  (timestamps differ trivially)
+#       - configs[*].listeners.last_updated (likewise)
+#       - configs[*].clusters.last_updated  (likewise)
+#     - asserted: three sub-envelopes in order (BootstrapConfigDump,
+#       ListenersConfigDump, ClustersConfigDump); version_info: "static" on
+#       both static envelopes; static_listeners[] populated with one entry
+#       (l_main); static_clusters[] populated with one entry (c_backend with
+#       2 endpoints).
+#
+#   /clusters (per ADR-0087, refined by planner-time decision 8):
+#     - body parsed into (cluster, key, value) tuple set.
+#     - 8 per-endpoint cx_*/rq_* counter tuples DROPPED on both sides
+#       before set comparison (planner-time decision 8 — envoy-go emits 0
+#       for all 8; Envoy emits per-endpoint observed values; the gap is
+#       intentional and codified).
+#     - asserted: 10 cluster-level lines per cluster (in §11.2 order);
+#       10 per-endpoint constant lines per endpoint (hostname, health_flags,
+#       weight, region, zone, sub_zone, canary, priority, success_rate,
+#       local_origin_success_rate); cluster ordering (alphabetical-by-name).
+#
+#   /listeners (per ADR-0087):
+#     - body byte-equal modulo framing dechunk (the runner's existing
+#       dechunk preprocessor — phase-01 inheritance — handles upstream's
+#       transfer-encoding: chunked).
+#     - asserted: one line per listener `<name>::<addr>`; alphabetical
+#       ordering.
+#
+#   /server_info (per ADR-0088):
+#     - body parsed as JSON; recursively compared with allow-list applied.
+#     - allow-listed JSON paths (zeroed on BOTH sides before comparison):
+#       - version
+#       - uptime_current_epoch
+#       - uptime_all_epochs
+#       - hot_restart_version
+#       - command_line_options.* (entire subtree EXCEPT it would be
+#         reasonable to keep config_path comparison; allow-list it for
+#         simplicity since envoy-go's path is host-side and Envoy's is
+#         container-side)
+#       - node.user_agent_name
+#       - node.user_agent_build_version (entire subtree)
+#       - node.extensions[]
+#     - asserted: state field byte-equal ("LIVE" on both sides).
+#
+# Not asserted (allow-listed structurally):
+#   - Date / Server / Content-Length / Content-Type / Transfer-Encoding —
+#     per the existing helpers / differential allow-list in
+#     BEHAVIOR_CONTRACT.md ## Header allow-list. The driver's ProbeAdmin
+#     does NOT include headers in the canonicalised byte stream.
+#
+# Per planner-time decision 4: the four new endpoints are NOT gated on
+# MarkReady. The driver waits 200ms after the 5-request load completes
+# before scraping the four endpoints; both proxies will be in LIVE state
+# by then (envoy-go is post-MarkReady; reference Envoy is post-init). No
+# pre-MarkReady scrape is exercised by this fixture.
+#
+# Per planner-time decision 7: /config_dump's three sub-envelope walks
+# read from the bootstrap proto directly (NOT from the listener/cluster
+# managers' runtime state). This makes the body deterministic and
+# detached from any post-boot state changes.
