@@ -3260,3 +3260,60 @@ The three new constructor parameters (`bs`, `cm`, `lm`) are typed against concre
 (e) `WriteTimeout` widens to 30s for ALL admin endpoints — `/ready` (sub-millisecond), `/stats/prometheus` (low-millisecond), `/config_dump` (the new slow-path), `/clusters`, `/listeners`, `/server_info` (all expected sub-second on the SPEC §7.3 fixture). The widening does not weaken resilience: the 30s ceiling still bounds slowloris-style resource exhaustion; the only handler that approaches the budget is `/config_dump` on large bootstraps, where 30s is generous enough.
 
 ---
+
+## ADR-0086: `/config_dump` body shape — `protojson.MarshalOptions{Multiline, Indent:" ", UseProtoNames, EmitUnpopulated}` over `*adminv3.ConfigDump{Configs: [Bootstrap, Listeners, Clusters]}`
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.3 (capture empirical observations as ADRs when the contract source is not derivable from documentation), D-3.7 (planner-time consolidation of cross-cutting decisions before implementation).
+**Lands-in-task:** 08.1 PLAN Task 6 (`internal/admin/configdump.go`).
+
+### Context
+
+The `/config_dump` endpoint is the largest of phase-08.1's four read-only operator-introspection surfaces. Its body shape is not derivable from the protobuf IDL alone — both the on-the-wire JSON formatting (indent width, field-name case, zero-valued-field elision behavior) AND the three-sub-envelope ordering inside `*adminv3.ConfigDump.Configs` are pinned by empirical observation of upstream Envoy v1.37.2 against the SPEC §7.3 fixture, captured verbatim in SPEC §11.1. The shape is load-bearing for the Task 13 differential equivalence comparator: byte-equality (modulo the §13.2 allow-list of node.user_agent_*, node.extensions[], `<*ConfigDump>.last_updated`) requires both Envoy and envoy-go to render the same field set with the same indent, the same case, the same emit-zeroed-fields behavior, AND the same envelope ordering inside the outer `Configs` slice.
+
+The four protojson MarshalOptions values (`Multiline`, `Indent`, `UseProtoNames`, `EmitUnpopulated`) form a tuple that no single SPEC reference can fully consolidate — the first three are observable from a single Envoy scrape, but the fourth (`EmitUnpopulated: true`) is observable only from the body's "show-me-everything" character (Envoy emits zero-valued protobuf fields like `cluster.original_dst_lb_config: {}` and `cluster.cleanup_interval: "0s"` even when not user-populated; envoy-go must do the same or the comparator's field-set diff will flag spurious mismatches).
+
+The three-sub-envelope ordering — Bootstrap (Configs[0]), Listeners (Configs[1]), Clusters (Configs[2]) — is also pinned empirically. The `*adminv3.ConfigDump` proto schema does not enforce ordering (it's a `repeated google.protobuf.Any`); upstream Envoy's source-level ordering happens to match the schema-declaration order of its admin-impl ConfigDumpHandler, but that's an implementation detail not a contract. envoy-go pins this ordering via ADR to prevent silent differential-comparator drift if a future refactor reorders `enumerateStatic*` calls in `buildConfigDump`.
+
+Per planner-time decision 7 (PLAN preamble), the static-listener and static-cluster enumeration walks the bootstrap proto directly — `bs.Proto.GetStaticResources().GetListeners()` / `.GetClusters()` — rather than consulting the cluster/listener managers' runtime state (`cm.Clusters()` / `lm.Listeners()`). The bootstrap proto is the canonical source of static resources for `/config_dump`'s purpose (operator introspection of declared config), and walking it directly avoids any post-boot mutation drift from the manager's runtime state representation.
+
+### Decision
+
+The `/config_dump` body is `application/json` (per SPEC §11.6 + ADR-0014) rendered via the package-level `configDumpMarshalOptions = protojson.MarshalOptions{Multiline: true, Indent: " ", UseProtoNames: true, EmitUnpopulated: true}` over a `*adminv3.ConfigDump{Configs: []*anypb.Any{<BootstrapAny>, <ListenersAny>, <ClustersAny>}}` envelope, in this exact order:
+
+1. `Configs[0]` — `*adminv3.BootstrapConfigDump` packed via `anypb.New`. Carries the parsed `bs.Proto` in `.Bootstrap` and `timestamppb.New(bootTime)` in `.LastUpdated`.
+2. `Configs[1]` — `*adminv3.ListenersConfigDump` packed via `anypb.New`. `.VersionInfo = "static"`. `.StaticListeners` populated by `enumerateStaticListeners(bs.Proto, bootTime)` walking `bs.GetStaticResources().GetListeners()` and packing each into a `*adminv3.ListenersConfigDump_StaticListener{Listener: <anypb.New(l)>, LastUpdated: <timestamppb.New(bootTime)>}`.
+3. `Configs[2]` — `*adminv3.ClustersConfigDump` packed via `anypb.New`. `.VersionInfo = "static"`. `.StaticClusters` populated by `enumerateStaticClusters(bs.Proto, bootTime)` mirroring the listener walker.
+
+Static-only — no `dynamic_*` arrays anywhere (envoy-go has no xDS surface). The four other ConfigDump sub-envelope types in upstream Envoy (RoutesConfigDump, SecretsConfigDump, ScopedRoutesConfigDump, EndpointsConfigDump) are deferred per ADR-0089 (Task 15); their omission from envoy-go's body is differential-comparator-allow-listed at §13.2.
+
+The `protojson.Marshal` error path (which can fire if a sub-envelope contains an unregistered proto type, or if `anypb.New` returns an error) writes 500 Internal Server Error with `{}` body — defensive shape since Envoy's empirical behavior on `/config_dump` failure is undocumented; an empty-JSON-object body keeps the response a valid JSON document. Errors are logged at `log.Printf` level with the `admin: /config_dump:` prefix per SPEC §5.2.
+
+The same `configDumpMarshalOptions` package var is reused by `/server_info` (Task 9) for cross-endpoint JSON-body shape consistency — the four-value tuple is identical for both endpoints (both are protojson-rendered admin surfaces that must round-trip differentially against upstream Envoy).
+
+### Alternatives considered
+
+(A) Use `protojson.MarshalOptions{}` (defaults) and accept the resulting body shape. Rejected: defaults are `Multiline: false` (single-line JSON), `Indent: ""`, `UseProtoNames: false` (camelCase field names), `EmitUnpopulated: false` (zero-valued fields elided). All four diverge from upstream Envoy's empirical scrape; the differential comparator would flag every endpoint as a body mismatch.
+
+(B) Render JSON via `encoding/json` over a hand-written Go struct mirror of `adminv3.ConfigDump`. Rejected: doubles the maintenance surface (every proto field added upstream requires a Go struct field added in envoy-go) and loses protojson's well-tested `*anypb.Any` packing semantics. The protojson approach is canonical for go-control-plane proto rendering.
+
+(C) Walk the cluster/listener managers' runtime state (`cm.Clusters()` / `lm.Listeners()`) to populate `enumerateStatic*`. Rejected per planner-time decision 7: the bootstrap proto is the canonical source for `/config_dump`'s purpose; walking the managers introduces post-boot mutation-state coupling that the static-only contract does not need. Future phase 08.2's `/drain_listeners` does mutate listener state, but `/config_dump` reflects the declared config not the runtime state.
+
+(D) Pin the three-sub-envelope ordering implicitly via the `buildConfigDump` source order (Bootstrap → Listeners → Clusters) without ADR ratification. Rejected: a future refactor that reorders the three `anypb.New` calls (e.g. for stylistic reasons) would silently break the differential comparator. The ADR makes the ordering a contract not an accident; Task 13's comparator can reference this ADR when asserting envelope-position equivalence.
+
+(E) Emit `dynamic_*` arrays as empty (e.g. `dynamic_listeners: []`) to match a hypothetical "Envoy with no xDS configured" body. Rejected: empirical scrape against upstream Envoy v1.37.2 with the SPEC §7.3 fixture shows that `dynamic_*` arrays are simply ABSENT from the body when xDS is not configured, not present-but-empty. `EmitUnpopulated: true` does NOT emit the `dynamic_*` fields because they are not populated AT ALL on the Go-side sub-envelope (they're only populated when ListenersConfigDump.DynamicListeners has entries — `EmitUnpopulated` is a marshaler flag, not an "emit-default-for-empty-repeated" flag).
+
+### Consequences
+
+(a) The `/config_dump` body is byte-equal to upstream Envoy v1.37.2 on the SPEC §7.3 fixture modulo the §13.2 differential allow-list: `node.user_agent_name`, `node.user_agent_build_version`, `node.extensions[]` (envoy-go's node has no extensions; Envoy's has the v1.37.2 extension list), and `<BootstrapConfigDump|ListenersConfigDump_StaticListener|ClustersConfigDump_StaticCluster>.last_updated` (timestamps differ by build/run time). All four allow-list entries are documented in BEHAVIOR_CONTRACT.md §Admin API (Task 15) and the differential harness applies them at field-walk time.
+
+(b) Task 13's differential comparator (`tools/differential/cmd/diff-config-dump`) JSON-parses both Envoy's and envoy-go's `/config_dump` bodies into `map[string]interface{}` (or `*adminv3.ConfigDump` via protojson `Unmarshal` with `DiscardUnknown: true`), then field-walks with the §13.2 allow-list applied to detect any non-allow-listed mismatch. The comparator depends on this ADR's three-sub-envelope ordering invariant: `cd.Configs[0]` MUST be Bootstrap, `[1]` MUST be Listeners, `[2]` MUST be Clusters on both sides. If a future change adds a fourth envelope (RoutesConfigDump etc., per ADR-0089's deferral), it MUST be appended at index 3 — never inserted before the existing three — so the comparator's positional indexing remains stable.
+
+(c) Future phases that extend `/config_dump` with additional sub-envelopes (RoutesConfigDump for static route configs, SecretsConfigDump if envoy-go ever gains an SDS-on-disk shape, ScopedRoutesConfigDump if scoped-RDS lands, EndpointsConfigDump if EDS lands) MUST append to `cd.Configs` at indices >= 3 and MUST NOT renumber the existing three. The three-position invariant is the contract; extension is additive at the tail. ADR-0089 (Task 15) records the deferral of those four envelope types from phase 08.1's scope.
+
+(d) The same `configDumpMarshalOptions` four-value tuple is reused by `/server_info` (Task 9) for cross-endpoint body-shape consistency. Both endpoints render protojson over admin/v3 messages; both differentially round-trip against upstream Envoy under the same comparator allow-list discipline. Future protojson-rendered admin surfaces (e.g. phase 08.2's `/drain_listeners` if it returns a JSON body, though current SPEC §1 has it return `OK\n` text) follow the same MarshalOptions tuple by default.
+
+(e) Errors from `protojson.Marshal` or `anypb.New` are recovered at handler level into a 500 + `{}` body. The `{}` body keeps the response a valid JSON document for any operator tooling that parses it; the 500 status code communicates the failure cleanly. Logging is at `log.Printf` level with the `admin: /config_dump:` prefix; future phases may upgrade to structured logging (slog) without changing this contract.
+
+---

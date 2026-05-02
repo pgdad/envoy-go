@@ -141,17 +141,6 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// handleConfigDump is a placeholder; the real implementation lands in Task 6
-// (internal/admin/configdump.go). The placeholder is kept here so the mux
-// route resolves between Tasks 5 and 6.
-func (s *Server) handleConfigDump(w http.ResponseWriter, r *http.Request) {
-	body := []byte("config_dump: not yet implemented\n")
-	writeAdminHeaders(w, "text/plain; charset=UTF-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusNotImplemented)
-	_, _ = w.Write(body)
-}
-
 // handleClusters is a placeholder; real impl lands in Task 7
 // (internal/admin/clusters.go).
 func (s *Server) handleClusters(w http.ResponseWriter, r *http.Request) {
