@@ -3215,3 +3215,48 @@ The parent ROADMAP row `08` flips `planned → in-progress` at the SPEC-drafting
 08.1 PLAN Task 1 (PROGRESS preamble — first commit of the implementation session; the ROADMAP edit anchored by this ADR already landed at master `1f85b07` per SPEC drafting).
 
 ---
+
+## ADR-0085: Admin-mux reuse + LBP-1 third application — `admin.New` widens to thread `*bootstrap.Bootstrap` + `*cluster.Manager` + `*listener.Manager`
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.2 (one-way constructor wiring at boot), D-3.4 (plan-size + scope-locality govern phase scope).
+**Lands-in-task:** 08.1 PLAN Task 5 (`internal/admin/admin.go` constructor widening).
+
+### Context
+
+The phase-08.1 admin endpoints (`/config_dump`, `/clusters`, `/listeners`, `/server_info`) are read-only operator-introspection surfaces consuming snapshots of three boot-time structures: the parsed `*bootstrap.Bootstrap` (for `/config_dump`'s body, `/server_info`'s `node` field, and `command_line_options.config_path`), the `*cluster.Manager` (for `/clusters`'s cluster snapshot via the new `Clusters()` accessor — Task 3), and the `*listener.Manager` (for `/listeners`'s listener snapshot via the existing `Listeners()` accessor). The phase-01 admin server already has a working bind, working `/ready` gate, working timeouts, working integration into the lifecycle (per phase-01 + phase-06.1 architecture); splitting into a NEW admin server for the four new endpoints would duplicate all that for zero benefit.
+
+The constructor-widening pattern that 06.1 used for `*stats.Registry` (boot-time-allocated, one-way-threaded) and 07.1 used for `*HTTPRegistry` (boot-populated then `Freeze()`d) and 07.2 used for `*ListenerFilterRegistry` (boot-populated then `Freeze()`d) generalises to a third application here. The pattern — call it LBP-1 (Linear Boot-time Provisioning, single application) — has now been ratified across three independent surface areas and the PLAN-time third generalisation (08.1's three-thread widening of `admin.New`) confirms it as the project's canonical wiring discipline for boot-time provisioning of read-only state through the constructor graph.
+
+Per planner-time decision 2 (PLAN), the WriteTimeout on the admin `*http.Server` widens from phase 01's 5s to 30s — the new `/config_dump` handler's protojson rendering of large bootstraps may approach the budget on slow scrape clients; 30s is generous enough for any reasonable fixture without weakening resilience under malicious-slow-loris-style abuse (the 30s ceiling still bounds resource exhaustion).
+
+### Decision
+
+Extend `internal/admin.Server` with four new fields — `bs *bootstrap.Bootstrap`, `cm *cluster.Manager`, `lm *listener.Manager`, `bootTime time.Time` — by widening `admin.New(addr, registry)` to `admin.New(addr, registry, bs, cm, lm)`. `bootTime` is set to `time.Now()` at `New()` call (consumed by `/server_info`'s `uptime_current_epoch` + `uptime_all_epochs` fields per Task 9). Register four new `mux.HandleFunc` entries (`/config_dump`, `/clusters`, `/listeners`, `/server_info`) on the existing `*http.ServeMux` in `admin.Server.Start()`; no new HTTP server, no new bind, no new transport. Per planner-time decision 2, `WriteTimeout` widens from 5s to 30s. Task 5 lands placeholder handlers that return 501 Not Implemented; Tasks 6-9 each create per-endpoint files (`configdump.go` / `clusters.go` / `listeners.go` / `serverinfo.go`) that overwrite the placeholder bodies with real implementations.
+
+The three new constructor parameters (`bs`, `cm`, `lm`) are typed against concrete `*Type` rather than interfaces — consistent with 06.1's `*stats.Registry`, 07.1's `*HTTPRegistry`, and 07.2's `*ListenerFilterRegistry` choice — because the admin handlers are read-only consumers of well-defined snapshot accessors (no swap-out / mock-out requirement at runtime; tests construct minimal real instances per the `mustMinimalBs/CM/LM` helpers introduced at Task 5).
+
+### Alternatives considered
+
+(A) Spin up a SECOND admin `*http.Server` for the four new endpoints. Rejected: duplicates the bind/timeouts/lifecycle scaffolding for zero benefit; the four new handlers share the existing admin authority surface (port 9901 by convention, `Server: envoy` header, the four constant headers from `writeAdminHeaders`); a second server would either require operators to scrape two ports or front-end them with a reverse proxy — both worse than mux reuse on a single server.
+
+(B) Stash `bs`/`cm`/`lm` in package-level globals and have the four handlers read them. Rejected: violates LBP-1 (the project's three-prior-applications-strong constructor-threading discipline); package globals make test isolation harder (cannot construct two `*Server` instances with different bootstraps in the same test process); and explicit threading is the documented project convention since 06.1 (ADR-0072 for HTTP, ADR-0079 for listener-filter).
+
+(C) Widen `New` to take only the three new args and drop the `*stats.Registry` arg (since `bs.Stats` carries it). Rejected: the existing `*stats.Registry` thread-through is consumed at `New()` time to allocate `server.live` (SPEC §12 #3); the registry must be available at constructor time before `bs` is necessarily complete (test code passes `nil` for `bs` but always passes a non-nil registry). Keeping all four constructor args explicit also preserves the existing-test-code call-site shape with one additive change rather than a rearrangement.
+
+(D) Keep `WriteTimeout` at 5s; rely on the `/config_dump` body being small for the SPEC §7.3 fixture. Rejected: the SPEC §7.3 fixture is small but the four handlers are operator-facing and operators in production may scrape against bootstraps with O(100) clusters / O(50) listeners — `/config_dump`'s protojson rendering of those bodies may approach 5s under slow-network conditions; widening to 30s is a one-line change with no per-endpoint complexity. 30s also still bounds slowloris-style resource exhaustion.
+
+### Consequences
+
+(a) `cmd/envoy-go/main.go`'s `admin.New` call site widens by three args (Task 10 lands the call-site update). Between Task 5 (this ADR's lands-in-task) and Task 10, `go build ./cmd/envoy-go/...` will fail with `not enough arguments in call to admin.New`; this is intentional and is documented in PROGRESS for Tasks 5-9 (each of which lands an admin-internal change before the call-site update).
+
+(b) Test code that does NOT exercise the four new endpoints passes `nil` for `bs`/`cm`/`lm` — the four widened-constructor call sites in `internal/admin/admin_test.go` (the seven existing `TestServer_*` tests + the two new `TestServer_NewWidenedConstructor` + `TestAdminWriteTimeoutIs30s` tests) all pass `nil, nil, nil`. Tasks 6-9's per-endpoint test files use `mustMinimalBs(t)` / `mustMinimalCM(t, bs)` / `mustMinimalLM(t, bs, cm)` from `internal/admin/admin_helpers_test.go` (Task 5) to construct the `§7.3` fixture-shaped real instances; the four handler implementations check for nil at handler-entry and return a clear error response if one of the three references is nil (Tasks 6-9 land that defensive shape).
+
+(c) The LBP-1 explicit-threading discipline now has FOUR sibling applications across three independent surface areas: 06.1 `*stats.Registry` (boot-allocated, one-way-threaded into `cluster.NewManager`/`listener.NewManager`/HCM), 07.1 `*HTTPRegistry` (boot-populated then `Freeze()`d, one-way-threaded into `listener.NewManager`), 07.2 `*ListenerFilterRegistry` (boot-populated then `Freeze()`d, one-way-threaded into `listener.NewManager`), and 08.1 admin's three-thread (`*bootstrap.Bootstrap` + `*cluster.Manager` + `*listener.Manager`, all one-way-threaded into `admin.New`). The pattern is now ratified as the project's canonical wiring discipline for boot-time provisioning of read-only state through the constructor graph; future phases that add operator-introspection or boot-time-resolved configuration follow this template by default.
+
+(d) Phase 08.2 (graceful drain) inherits the four threaded fields without further constructor widening; 08.2 may add a single `drainState atomic.Pointer[DrainState]` field on `Server` (or equivalent) without changing `New`'s signature. The four 08.1 fields (`bs`/`cm`/`lm`/`bootTime`) are reused by 08.2's mutating handlers (`/healthcheck/fail`, `/quitquitquit`, `/drain_listeners`) — the drain handlers consult `bs.Proto.Admin` for `drain_strategy` defaults, the listener manager for the per-listener accept-loop pause-then-stop sequencing, and `bootTime` for `/server_info`'s extended state field per the BEHAVIOR_CONTRACT extension at 08.2.
+
+(e) `WriteTimeout` widens to 30s for ALL admin endpoints — `/ready` (sub-millisecond), `/stats/prometheus` (low-millisecond), `/config_dump` (the new slow-path), `/clusters`, `/listeners`, `/server_info` (all expected sub-second on the SPEC §7.3 fixture). The widening does not weaken resilience: the 30s ceiling still bounds slowloris-style resource exhaustion; the only handler that approaches the budget is `/config_dump` on large bootstraps, where 30s is generous enough.
+
+---

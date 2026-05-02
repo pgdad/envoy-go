@@ -10,7 +10,7 @@ import (
 )
 
 func TestServer_ReadyState(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry())
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -54,7 +54,7 @@ func TestServer_ReadyState(t *testing.T) {
 }
 
 func TestServer_PreInit_BeforeMarkReady(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry())
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -80,7 +80,7 @@ func TestServer_PreInit_BeforeMarkReady(t *testing.T) {
 }
 
 func TestServer_MarkReady_IsAtomic(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry())
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -112,13 +112,13 @@ func TestServer_MarkReady_IsAtomic(t *testing.T) {
 }
 
 func TestServer_Close_Idempotent(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry())
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
 	// Close before Start.
 	if err := s.Close(); err != nil {
 		t.Errorf("Close before Start: %v", err)
 	}
 	// Close after Start.
-	s2 := New("127.0.0.1:0", stats.NewRegistry())
+	s2 := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
 	_, err := s2.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -134,7 +134,7 @@ func TestServer_Close_Idempotent(t *testing.T) {
 
 func TestServer_StatsPrometheusRouteRegistered(t *testing.T) {
 	r := stats.NewRegistry()
-	srv := New("127.0.0.1:0", r)
+	srv := New("127.0.0.1:0", r, nil, nil, nil)
 	addr, err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -155,7 +155,7 @@ func TestServer_StatsPrometheusRouteRegistered(t *testing.T) {
 
 func TestServer_LiveGaugeSetOnceFlippedAtFirstReady200(t *testing.T) {
 	r := stats.NewRegistry()
-	srv := New("127.0.0.1:0", r)
+	srv := New("127.0.0.1:0", r, nil, nil, nil)
 	addr, err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -186,5 +186,45 @@ func TestServer_LiveGaugeSetOnceFlippedAtFirstReady200(t *testing.T) {
 	}
 	if got := srv.liveGauge.Load(); got != 1 {
 		t.Errorf("server.live after MarkReady + 3× /ready = %d, want 1", got)
+	}
+}
+
+// TestServer_NewWidenedConstructor verifies that the 08.1-widened New
+// signature threads bs/cm/lm and sets bootTime per ADR-0085 + planner-time
+// decision 6. Test code that does not exercise the four new endpoints
+// passes nil for bs/cm/lm; the four handlers will check at handler-entry
+// time.
+func TestServer_NewWidenedConstructor(t *testing.T) {
+	r := stats.NewRegistry()
+	s := New("127.0.0.1:0", r, nil, nil, nil)
+	if s == nil {
+		t.Fatal("New returned nil")
+	}
+	if s.registry != r {
+		t.Errorf("registry not threaded")
+	}
+	// bs/cm/lm fields are nil-safe (the four handlers will check); bootTime is set.
+	if s.bootTime.IsZero() {
+		t.Errorf("bootTime not set at New time")
+	}
+	if s.liveGauge == nil {
+		t.Errorf("liveGauge not allocated (server.live)")
+	}
+}
+
+// TestAdminWriteTimeoutIs30s pins planner-time decision 2: the WriteTimeout
+// for the admin HTTP server widens from phase 01's 5s to 30s, generous
+// enough for /config_dump's protojson rendering of large bootstraps on slow
+// scrape clients.
+func TestAdminWriteTimeoutIs30s(t *testing.T) {
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
+	addr, err := s.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	_ = addr
+	if got := s.httpSrv.WriteTimeout; got != 30*time.Second {
+		t.Errorf("WriteTimeout: got %v, want %v (per PLAN planner-time decision 2)", got, 30*time.Second)
 	}
 }

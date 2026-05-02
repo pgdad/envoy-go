@@ -8,11 +8,23 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/esalaine/envoy-go/internal/bootstrap"
+	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
-// Server is the admin HTTP/1.1 server. /ready and /stats/prometheus are
-// implemented in phase 06.1; other admin endpoints land in phase 08.
+// Server is the admin HTTP/1.1 server. Phase 01 introduced /ready; phase 06.1
+// added /stats/prometheus; phase 08.1 adds /config_dump, /clusters, /listeners,
+// /server_info (the four read-only operator-introspection endpoints from
+// SPEC §1). The constructor widens to thread *bootstrap.Bootstrap (for
+// /config_dump body + /server_info node + command_line_options.config_path),
+// *cluster.Manager (for /clusters cluster snapshot), and *listener.Manager
+// (for /listeners listener snapshot) — the third application of the LBP-1
+// explicit-threading discipline (after 06.1's *stats.Registry and 07.1's
+// *HTTPRegistry / 07.2's *ListenerFilterRegistry); ADR-0085 records the
+// generalisation. 08.2 will add POST /drain_listeners and extend /ready +
+// /server_info for the DRAINING state.
 type Server struct {
 	addr      string
 	ln        net.Listener
@@ -21,23 +33,42 @@ type Server struct {
 	registry  *stats.Registry
 	liveGauge *stats.Gauge
 	liveOnce  sync.Once
+	// 08.1 fields (per ADR-0085 + planner-time decision 6)
+	bs       *bootstrap.Bootstrap
+	cm       *cluster.Manager
+	lm       *listener.Manager
+	bootTime time.Time
 }
 
 // New returns an admin server targeting addr. The server is not running yet;
 // call Start. The /ready gate is initially closed (MarkReady flips it). The
 // registry parameter is the boot-time Registry threaded by main.go; it MUST
 // NOT be Frozen yet (admin allocates the server.live gauge at New time per
-// SPEC §5.4 + §12 #3).
-func New(addr string, registry *stats.Registry) *Server {
+// SPEC §5.4 + §12 #3). The bs/cm/lm parameters are the bootstrap +
+// cluster manager + listener manager threaded by main.go for the four new
+// 08.1 admin endpoints (per ADR-0085); they may be nil in test code that
+// does NOT exercise those endpoints. bootTime is set to time.Now() at call.
+func New(addr string, registry *stats.Registry, bs *bootstrap.Bootstrap, cm *cluster.Manager, lm *listener.Manager) *Server {
 	return &Server{
 		addr:      addr,
 		registry:  registry,
 		liveGauge: registry.NewGauge("server.live"),
+		bs:        bs,
+		cm:        cm,
+		lm:        lm,
+		bootTime:  time.Now(),
 	}
 }
 
 // Start binds and begins serving in a background goroutine. Returns the bound
 // address (useful when addr had port 0). Error only if bind fails.
+//
+// Six routes are registered post-08.1: /ready (phase 01), /stats/prometheus
+// (phase 06.1), /config_dump + /clusters + /listeners + /server_info
+// (phase 08.1). WriteTimeout is widened from phase 01's 5s to 30s per
+// planner-time decision 2 — /config_dump's protojson rendering of large
+// bootstraps may approach the budget on slow scrape clients; 30s is generous
+// enough for any reasonable fixture without weakening resilience.
 func (s *Server) Start() (string, error) {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -47,10 +78,14 @@ func (s *Server) Start() (string, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/stats/prometheus", handlePrometheus(s.registry))
+	mux.HandleFunc("/config_dump", s.handleConfigDump)
+	mux.HandleFunc("/clusters", s.handleClusters)
+	mux.HandleFunc("/listeners", s.handleListeners)
+	mux.HandleFunc("/server_info", s.handleServerInfo)
 	s.httpSrv = &http.Server{
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
+		WriteTimeout: 30 * time.Second,
 	}
 	go func() { _ = s.httpSrv.Serve(ln) }()
 	return ln.Addr().String(), nil
@@ -103,5 +138,46 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	body := []byte("LIVE\n")
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// handleConfigDump is a placeholder; the real implementation lands in Task 6
+// (internal/admin/configdump.go). The placeholder is kept here so the mux
+// route resolves between Tasks 5 and 6.
+func (s *Server) handleConfigDump(w http.ResponseWriter, r *http.Request) {
+	body := []byte("config_dump: not yet implemented\n")
+	writeAdminHeaders(w, "text/plain; charset=UTF-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusNotImplemented)
+	_, _ = w.Write(body)
+}
+
+// handleClusters is a placeholder; real impl lands in Task 7
+// (internal/admin/clusters.go).
+func (s *Server) handleClusters(w http.ResponseWriter, r *http.Request) {
+	body := []byte("clusters: not yet implemented\n")
+	writeAdminHeaders(w, "text/plain; charset=UTF-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusNotImplemented)
+	_, _ = w.Write(body)
+}
+
+// handleListeners is a placeholder; real impl lands in Task 8
+// (internal/admin/listeners.go).
+func (s *Server) handleListeners(w http.ResponseWriter, r *http.Request) {
+	body := []byte("listeners: not yet implemented\n")
+	writeAdminHeaders(w, "text/plain; charset=UTF-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusNotImplemented)
+	_, _ = w.Write(body)
+}
+
+// handleServerInfo is a placeholder; real impl lands in Task 9
+// (internal/admin/serverinfo.go).
+func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
+	body := []byte("server_info: not yet implemented\n")
+	writeAdminHeaders(w, "text/plain; charset=UTF-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusNotImplemented)
 	_, _ = w.Write(body)
 }
