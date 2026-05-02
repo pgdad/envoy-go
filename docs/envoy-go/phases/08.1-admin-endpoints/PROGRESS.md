@@ -48,3 +48,32 @@ $ golangci-lint run ./...
 $ go test -race -count=1 -short ./...
 (all PASS)
 ```
+
+## Task 2 — `internal/bootstrap.Bootstrap.ConfigPath` field addition
+
+**Commits:** `50f3473` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-4. Step 1 appended the failing test `TestBootstrap_ConfigPathFieldExistsAndDefaultsEmpty` to `internal/bootstrap/bootstrap_test.go` (the existing `strings` import covered the new test). Step 2 confirmed the build error `unknown field ConfigPath in struct literal of type Bootstrap`. Step 3 added the `ConfigPath string` field to the `Bootstrap` struct in `internal/bootstrap/bootstrap.go` immediately after `AccessLogConfigs`, with the doc comment from PLAN verbatim (calls out ADR-0001 design — `Load` takes `io.Reader` not a path; sidecar setter pattern from `cmd/envoy-go/main.go`; reader at Task 9's `/server_info` handler for `command_line_options.config_path`). Step 4 confirmed test PASS, vet clean, lint clean. Per planner-time decision 9, `bootstrap.Load(r io.Reader)`'s signature was NOT widened — the field defaults to `""` and tests that don't need it leave it zero. `go build ./...` clean (cmd/envoy-go still compiles; the call-site wiring lands at Task 10). `grep -nE 'ConfigPath\s+string' internal/bootstrap/bootstrap.go` returns 1 match at line 122.
+
+**Outputs:**
+```
+$ go test -run TestBootstrap_ConfigPathFieldExistsAndDefaultsEmpty -v ./internal/bootstrap/...
+=== RUN   TestBootstrap_ConfigPathFieldExistsAndDefaultsEmpty
+--- PASS: TestBootstrap_ConfigPathFieldExistsAndDefaultsEmpty (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.004s
+
+$ go test ./internal/bootstrap/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.008s
+
+$ go vet ./...
+(clean)
+
+$ golangci-lint run ./internal/bootstrap/...
+(clean)
+
+$ go build ./...
+(clean)
+
+$ grep -nE 'ConfigPath\s+string' internal/bootstrap/bootstrap.go
+122:	ConfigPath string
+```
