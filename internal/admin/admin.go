@@ -141,16 +141,6 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// handleClusters is a placeholder; real impl lands in Task 7
-// (internal/admin/clusters.go).
-func (s *Server) handleClusters(w http.ResponseWriter, r *http.Request) {
-	body := []byte("clusters: not yet implemented\n")
-	writeAdminHeaders(w, "text/plain; charset=UTF-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusNotImplemented)
-	_, _ = w.Write(body)
-}
-
 // handleListeners is a placeholder; real impl lands in Task 8
 // (internal/admin/listeners.go).
 func (s *Server) handleListeners(w http.ResponseWriter, r *http.Request) {

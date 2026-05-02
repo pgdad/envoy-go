@@ -3317,3 +3317,68 @@ The same `configDumpMarshalOptions` package var is reused by `/server_info` (Tas
 (e) Errors from `protojson.Marshal` or `anypb.New` are recovered at handler level into a 500 + `{}` body. The `{}` body keeps the response a valid JSON document for any operator tooling that parses it; the 500 status code communicates the failure cleanly. Logging is at `log.Printf` level with the `admin: /config_dump:` prefix; future phases may upgrade to structured logging (slog) without changing this contract.
 
 ---
+
+## ADR-0087: `/clusters` and `/listeners` body shape — text/plain with full Envoy-parity line-set; per-endpoint cx_/rq_ counters emit literal `0`
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.3 (capture empirical observations as ADRs when the contract source is not derivable from documentation), D-3.5 (decisions written down).
+**Lands-in-task:** 08.1 PLAN Task 7 (`internal/admin/clusters.go`); covers both `/clusters` here and `/listeners` (Task 8 references this ADR rather than introducing a new one — the two text-format endpoints share a single body-shape contract).
+
+### Context
+
+The `/clusters` and `/listeners` admin endpoints are the two text-format read-only operator-introspection surfaces in phase 08.1 (the other two — `/config_dump` and `/server_info` — are JSON via `protojson`, settled by ADR-0086). Their body shapes are not derivable from any Envoy proto schema — neither endpoint is rendered from a top-level proto; both are produced by Envoy's text-mode admin handler with hand-written line layouts in C++. The line set, the field constants, and the per-cluster + per-endpoint emission order are pinned by empirical observation of upstream Envoy v1.37.2 against the SPEC §7.3 fixture, captured verbatim in SPEC §11.2 (`/clusters`) and §11.3 (`/listeners`).
+
+For `/clusters`, the §11.2 verbatim scrape establishes a 28-line block per cluster: 10 cluster-level lines (`observability_name`; the 4 `default_priority::*` lines + 4 `high_priority::*` lines for circuit-breaker thresholds; `added_via_api::false`) followed by 18 lines per endpoint (`cx_active`, `cx_connect_fail`, `cx_total`, `rq_active`, `rq_error`, `rq_success`, `rq_timeout`, `rq_total` — the 8 cx_/rq_ counters; then `hostname::`, `health_flags::healthy`, `weight::1`, `region::`, `zone::`, `sub_zone::`, `canary::false`, `priority::0`, `success_rate::-1`, `local_origin_success_rate::-1` — the 10 metadata constants). The cluster-level constants `1024` and `3` are the proto defaults from `envoy.config.cluster.v3.CircuitBreakers.Thresholds` (`max_connections=1024, max_pending_requests=1024, max_requests=1024, max_retries=3`); envoy-go has no circuit-breaker machinery (deferred to the upstream-robustness phase family) but emits the same constants for byte-shape parity. The per-endpoint metadata constants (`healthy`, `1`, `0`, empty string, `false`, `-1`) are Envoy's default-when-not-configured values for fields envoy-go does not model (active health checking, locality tags, weight, priority, canary, success-rate measurement).
+
+Per planner-time decision 8 (PLAN), all 8 per-endpoint cx_/rq_ counter values emit literal `0` rather than reading live cluster-level counters. The rationale: envoy-go's stats registry from phase 06.1 has cluster-level counters (`cluster.<name>.upstream_cx_total`, etc.) but no per-endpoint partitioning per ADR-0063 deferral (per-endpoint stats were explicitly out-of-scope for the 06.1 stats phase; round-robin LB across endpoints means no natural partition exists). Emitting cluster-level counters as the per-endpoint value would be misleading (the same value would appear under each endpoint's row, summing to 2× or 3× the cluster total when a comparator aggregates); emitting `0` is the conservative choice that the differential allow-list (SPEC §13.2 + Task 13's comparator) accommodates by fully allow-listing the 8 per-endpoint cx_/rq_ fields per endpoint on both sides.
+
+For `/listeners`, the §11.3 verbatim scrape establishes a one-line-per-listener layout: `<name>::<bind_addr>` (e.g. `l_main::0.0.0.0:10000`). No additional fields are emitted by Envoy v1.37.2 in text mode; the JSON form (`?format=json`) is deferred per ADR-0089. Field-extension proposals from BRAINSTORM §2.2 (e.g. active connection count) are deferred since upstream Envoy v1.37.2 emits ONLY `<name>::<addr>` per listener — adding fields would diverge from byte-shape parity.
+
+The bind address for `/listeners` is resolved via the existing `Listener.GetAddress()` proto walk surfaced by `lm.Listeners()` (which already populates `ListenerInfo.Addr` in `host:port` form per phase 02 / 07.2). No new accessor is needed.
+
+### Decision
+
+Both endpoints emit `Content-Type: text/plain; charset=UTF-8` (per SPEC §11.6 + ADR-0014). Both bodies are line-oriented (`\n` line terminator, no leading or trailing blank lines, no implicit framing characters).
+
+**`/clusters`** (per SPEC §11.2 + Task 7):
+
+For each cluster in alphabetical-by-name order (`s.cm.Clusters()` returns alphabetically sorted per SPEC §6.2), emit:
+
+1. 10 cluster-level lines, in this exact order: `<name>::observability_name::<name>`, `<name>::default_priority::max_connections::1024`, `<name>::default_priority::max_pending_requests::1024`, `<name>::default_priority::max_requests::1024`, `<name>::default_priority::max_retries::3`, `<name>::high_priority::max_connections::1024`, `<name>::high_priority::max_pending_requests::1024`, `<name>::high_priority::max_requests::1024`, `<name>::high_priority::max_retries::3`, `<name>::added_via_api::false`.
+2. 18 per-endpoint lines per endpoint (in bootstrap-declared order, NOT alphabetical), in this exact order: `<name>::<addr>::cx_active::0`, `<name>::<addr>::cx_connect_fail::0`, `<name>::<addr>::cx_total::0`, `<name>::<addr>::rq_active::0`, `<name>::<addr>::rq_error::0`, `<name>::<addr>::rq_success::0`, `<name>::<addr>::rq_timeout::0`, `<name>::<addr>::rq_total::0`, `<name>::<addr>::hostname::`, `<name>::<addr>::health_flags::healthy`, `<name>::<addr>::weight::1`, `<name>::<addr>::region::`, `<name>::<addr>::zone::`, `<name>::<addr>::sub_zone::`, `<name>::<addr>::canary::false`, `<name>::<addr>::priority::0`, `<name>::<addr>::success_rate::-1`, `<name>::<addr>::local_origin_success_rate::-1`.
+
+The 8 cx_/rq_ counter values are emitted as literal `0` per planner-time decision 8 (envoy-go has no per-endpoint stats per ADR-0063 deferral). The cluster-level constants (`1024`, `3`, `false`) and per-endpoint constants (`healthy`, `1`, empty, `false`, `0`, `-1`) are emitted unconditionally.
+
+For the SPEC §7.3 fixture (one cluster `c_backend` with 2 endpoints), the body has exactly 10 + 2×18 = 46 lines.
+
+**`/listeners`** (per SPEC §11.3 + Task 8 — references this ADR):
+
+For each listener in alphabetical-by-name order, emit one line: `<name>::<bind_addr>`. The bind address is resolved via `Listener.GetAddress()` proto walk surfaced by `ListenerInfo.Addr` (already populated in `host:port` form by phase 02 / 07.2's listener-manager construction).
+
+### Alternatives considered
+
+(A) Render the per-endpoint cx_/rq_ counter values from the cluster-level counters in the stats registry (`cluster.<name>.upstream_cx_total`, etc.), repeating the cluster-level value under each endpoint's row. Rejected per planner-time decision 8: the same cluster-level value duplicated under each endpoint's row would be misleading (a comparator that sums per-endpoint values would see 2× or 3× the true total); endpoint-level partitioning of the cluster total would require a fair-share computation envoy-go does not perform; and the differential comparator's allow-list approach is simpler and correct on both sides.
+
+(B) Emit the 8 per-endpoint cx_/rq_ counter lines with envoy-go's true per-endpoint values (which would require landing per-endpoint stats infrastructure — a feature explicitly deferred per ADR-0063). Rejected: out-of-scope for phase 08.1's MVP; the fix path (post-MVP feature) lands per-endpoint stats, at which point the `/clusters` handler will emit live values without changing the line layout (the 18 per-endpoint lines remain; only the values change from `0` to the observed counter readings).
+
+(C) Render `/clusters` in JSON (`?format=json`) for "modern" tooling. Rejected: deferred per ADR-0089. Text mode is the operator default (`curl http://localhost:9901/clusters`), is the only mode upstream Envoy v1.37.2 emits when no `?format=` query param is present, and is simpler to byte-compare in the differential harness.
+
+(D) Emit only the lines envoy-go actually models (skip the 10 cluster-level circuit-breaker constants and the 10 per-endpoint metadata constants). Rejected: violates byte-shape parity with upstream Envoy v1.37.2; the §13.2 differential allow-list would have to allow-list 18 lines per endpoint and 9 per cluster, eclipsing the differential equivalence claim; emitting Envoy's default-when-not-configured constants is a one-shot constant-string emission per line at zero runtime cost.
+
+(E) Emit one extension field per listener (e.g. active connection count from existing 06.1 stats) for `/listeners`. Rejected: upstream Envoy v1.37.2 emits ONLY `<name>::<addr>` in text mode; adding fields would break byte-equality. Field extension is deferred to a future phase that may evaluate the JSON-form `?format=json` shape extension (which Envoy itself does not currently extend in text mode).
+
+(F) Resolve `/listeners` bind address through the listener manager's runtime accept-loop state (e.g. `*net.Listener.Addr().String()`) rather than through `Listener.GetAddress()` proto walk. Rejected: the runtime accept-loop address is the resolved bind address (e.g. `127.0.0.1:10000` after binding `0.0.0.0:0`); the `/listeners` text-format contract emits the configured address from the bootstrap proto (e.g. `0.0.0.0:10000` as declared). Phase 02 / 07.2's `ListenerInfo.Addr` already surfaces the configured-bind-address form via the proto walk.
+
+### Consequences
+
+(a) The `/clusters` body is byte-equal to upstream Envoy v1.37.2 on the SPEC §7.3 fixture modulo the §13.2 differential allow-list: the 8 per-endpoint cx_/rq_ counter fields per endpoint are fully allow-listed (envoy-go emits `0`, Envoy emits the observed value from the 5-request load); all other 38 lines per cluster (10 cluster-level + 10 per-endpoint metadata × 2 endpoints + 8 cx_/rq_ counter line-skeletons) are byte-equal. Task 13's differential comparator parses both bodies into `(cluster_name, key, value)` tuple sets and applies the allow-list to the 8 cx_/rq_ keys per endpoint before tuple-set comparison.
+
+(b) The `/listeners` body is byte-equal to upstream Envoy v1.37.2 on the SPEC §7.3 fixture (one listener `l_main` on `0.0.0.0:10000`); no allow-list is needed for `/listeners`. The framing deviation from §6.6 (envoy-go emits `Content-Length`; Envoy emits `transfer-encoding: chunked`) is handled by the differential harness's existing dechunk preprocessor (mirrors `/ready`'s handling).
+
+(c) ADR-0063's per-endpoint-stats-deferral is reaffirmed and explicitly cross-referenced. Future stats-hardening phase that lands per-endpoint stats supersedes the planner-time decision 8: the `/clusters` handler will then read live per-endpoint values (no line-layout change; only the 8 emitted values change from `0` to live counter readings), and the §13.2 allow-list narrows back to a tolerance band (e.g. ±1 for round-robin LB skew across the 5-request §7.3 load) on the 8 fields. The 10 cluster-level constants and 10 per-endpoint metadata constants are NOT affected by per-endpoint stats addition (they remain Envoy default-when-not-configured constants).
+
+(d) `/listeners` stays trivial: one line per listener, no extension fields anticipated until 08.2 may evaluate (08.2's drain semantics may surface a per-listener drain-state field; that extension would be additive at the line tail, e.g. `<name>::<addr>::draining`, and would land a new ADR superseding this one's `/listeners` clause). The listener bind address is resolved via the existing `ListenerInfo.Addr` field (no new accessor; no proto-walk in the admin handler).
+
+(e) The two text-format endpoints share a single body-shape ADR rather than two ADRs because their decisions are tightly coupled: both emit text/plain, both use `\n` line terminators, both order entries alphabetically by name, both walk the existing snapshot accessors (`s.cm.Clusters()` and `s.lm.Listeners()`), and both omit the JSON form per ADR-0089. Splitting into ADR-0087a and ADR-0087b would duplicate the rationale; ADR-0004's anti-fragmentation guidance favors consolidation when the decisions are coupled.
+
