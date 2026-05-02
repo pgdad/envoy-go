@@ -37,21 +37,23 @@ import (
 // status=0.
 func H2ClusterAction(c *cluster.Cluster) H2Action {
 	a := &routerActionH2{cluster: c}
-	return func(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) (int, int64, cluster.Endpoint, error) {
-		return doH2ClusterAction(ctx, a, req, sw)
+	return func(ctx context.Context, req h2.H2Request) (ActionResponse, cluster.Endpoint, error) {
+		return doH2ClusterAction(ctx, a, req)
 	}
 }
 
 // doH2ClusterAction runs the per-request H2 upstream-dial dispatch and surfaces
-// (status, bytesSent, picked, err) for the H2Action closure. Logic mirrors
-// routerActionH2.doH2 BUT exposes the bytesSent + picked locals to the caller
-// (rather than capturing them in a deferred access-log emit, which is what
-// routerActionH2.doH2 does for the legacy direct-call path). The access-log
-// emit-deferral was migrated to HCM dispatch's chain-completion hook per
-// Decision §3.1; this function is the byte-preserved H2 cluster-dial driver
-// for the chain-mediated dispatch path.
-func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request, sw h2.StreamWriter) (int, int64, cluster.Endpoint, error) {
-	bytesSent := int64(0)
+// the logical ActionResponse for the H2Action closure. Phase 07.1 Task 18
+// prereq P1: returns ActionResponse instead of writing wire bytes via sw.
+// HCM h2dispatch.go's chain-completion path runs the response through the
+// encode chain THEN writes HEADERS+DATA frames via sw.
+//
+// On dial / RoundTrip failure paths, returns an ActionResponse with status=502
+// and the canonical bad502Body. On caller-ctx-cancel returns Status=0 + an
+// *h2.Error so serverStream.dispatch emits RST_STREAM(CANCEL). On wire-write
+// failure (impossible at this layer post-refactor — wire-write moved to
+// dispatch), the error is just propagated.
+func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request) (ActionResponse, cluster.Endpoint, error) {
 	picked := cluster.Endpoint{}
 
 	a.cluster.IncUpstreamRqTotal()
@@ -59,7 +61,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request,
 	cc, ep, err := a.cluster.DialH2(ctx)
 	if err != nil {
 		a.cluster.IncStatusClass(502)
-		return 502, bytesSent, picked, a.write502(sw)
+		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
 	}
 	defer func() { _ = cc.Close() }()
 	picked = ep
@@ -74,22 +76,41 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request,
 			// status=0 → H2 ctx-cancel sentinel per SPEC §2.1 last bullet.
 			// emitAccessLogH2 skips submission on status==0; serverStream.dispatch
 			// reads err.Code == ErrCancel and emits RST_STREAM(CANCEL).
-			return 0, bytesSent, picked, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
+			return ActionResponse{Status: 0}, picked, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
 		}
 		a.cluster.IncStatusClass(502)
-		return 502, bytesSent, picked, a.write502(sw)
+		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
 	}
 
 	a.cluster.IncStatusClass(resp.Status)
-	bytesSent = int64(len(resp.Body))
 
-	if err := sw.WriteHeaders(resp.Headers, false); err != nil {
-		return resp.Status, bytesSent, picked, err
+	// Convert h2 hpack header fields into http.Header for the chain's encode
+	// side. Pseudo-headers (:status etc.) are stripped — the chain works on
+	// regular headers; HCM h2dispatch's wire-write emits :status from
+	// resp.Status before the regular header set.
+	respHeaders := http.Header{}
+	for _, hf := range resp.Headers {
+		if strings.HasPrefix(hf.Name, ":") {
+			continue
+		}
+		respHeaders.Add(hf.Name, hf.Value)
 	}
-	if err := sw.WriteData(resp.Body, true); err != nil {
-		return resp.Status, bytesSent, picked, err
-	}
-	return resp.Status, bytesSent, picked, nil
+	return ActionResponse{
+		Status:  resp.Status,
+		Headers: respHeaders,
+		Body:    resp.Body,
+	}, picked, nil
+}
+
+// h2LocalReplyHeaders builds the standard local-reply header set for
+// synthesized 5xx H2 responses. Mirrors the Header set previously written by
+// routerActionH2.write502.
+func h2LocalReplyHeaders() http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain")
+	h.Set("Date", dateHeader())
+	h.Set("Server", serverHeader())
+	return h
 }
 
 // emitAccessLogH2 is the H2-flavored variant of (*Filter).emitAccessLog;

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -38,6 +39,50 @@ func writeStatusReply(w io.Writer, status int, body string) error {
 	}
 	if body != "" {
 		if _, err := io.WriteString(w, body); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeH1Reply writes a complete HTTP/1.1 response to w from a pre-built
+// header set + body. Phase 07.1 Task 18 prereq P2: the chain-mediated H1
+// dispatch path serializes the action's (post-encode-chain-mutated) response
+// here. This replaces the previous "Action writes via bw directly" pattern.
+//
+// Header emission order:
+//  1. Status line: HTTP/1.1 <status> <reason>
+//  2. Content-Length is recomputed from len(body) (overrides any value in
+//     headers — the encode chain may have mutated body).
+//  3. Server + Date are stamped if absent (filters that mutate Server/Date
+//     are honored).
+//  4. All other headers from the headers map are emitted in arbitrary order
+//     (Go map iteration; deterministic byte-equivalence with phase-04 is
+//     preserved by the writeStatusReply path for the local-reply HCM-internal
+//     synthesis call sites — only chain-mediated dispatch goes through here).
+//  5. Blank line (CRLF) then body bytes.
+func writeH1Reply(w io.Writer, status int, headers http.Header, body []byte) error {
+	reason := http.StatusText(status)
+	if _, err := fmt.Fprintf(w, "HTTP/1.1 %d %s\r\n", status, reason); err != nil {
+		return err
+	}
+	// Ensure Content-Length matches the body bytes regardless of upstream value.
+	headers = headers.Clone()
+	headers.Set("Content-Length", strconv.Itoa(len(body)))
+	if headers.Get("Server") == "" {
+		headers.Set("Server", serverHeader())
+	}
+	if headers.Get("Date") == "" {
+		headers.Set("Date", dateHeader())
+	}
+	if err := headers.Write(w); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\r\n"); err != nil {
+		return err
+	}
+	if len(body) > 0 {
+		if _, err := w.Write(body); err != nil {
 			return err
 		}
 	}

@@ -234,8 +234,8 @@ func TestH2Dispatcher_Match_NoMatch_Synthesizes404(t *testing.T) {
 // the M-9 carry-forward log-line assertion. status=0 mirrors the production
 // ctx-cancel / unrecoverable-error shape.
 func faultyH2Action(sentinel error) router.H2Action {
-	return func(_ context.Context, _ h2.H2Request, _ h2.StreamWriter) (int, int64, cluster.Endpoint, error) {
-		return 0, 0, cluster.Endpoint{}, sentinel
+	return func(_ context.Context, _ h2.H2Request) (router.ActionResponse, cluster.Endpoint, error) {
+		return router.ActionResponse{Status: 0}, cluster.Endpoint{}, sentinel
 	}
 }
 
@@ -251,8 +251,8 @@ func (a *faultyAction) do(context.Context, *http.Request, *bufio.Writer) (int, e
 	return 500, nil
 }
 func (a *faultyAction) asRouterAction() router.Action {
-	return func(context.Context, *http.Request, *bufio.Writer) (int, int64, cluster.Endpoint, error) {
-		return 500, 0, cluster.Endpoint{}, nil
+	return func(context.Context, *http.Request) (router.ActionResponse, cluster.Endpoint, error) {
+		return router.ActionResponse{Status: 500}, cluster.Endpoint{}, nil
 	}
 }
 func (a *faultyAction) asRouterActionH2() router.H2Action { return faultyH2Action(a.sentinel) }

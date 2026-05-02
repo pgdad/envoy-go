@@ -221,9 +221,19 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 	}
 	rf.SetAction(action)
 	rf.SetRequest(req)
-	rf.SetWriter(bw)
 
 	startTime := time.Now()
+
+	// Phase 07.1 Task 18 prereq: inject the request method as ":method"
+	// pseudo-header on the headers map so chain-level filters (cors etc.)
+	// can read the method without codec-specific surfacing. The method is
+	// removed before any wire-emit could observe it (the chain's encode-side
+	// is the only consumer; HCM dispatch never re-emits decode-side headers).
+	// http.Header.Set canonicalizes the key; we use a lowercase pseudo-header
+	// literal to mirror H2's :method convention.
+	if req.Header.Get(":method") == "" {
+		req.Header[":method"] = []string{req.Method}
+	}
 
 	// Decode side: headers → data → trailers. endStream on RunDecodeHeaders is
 	// true when the request has no body (req.Body == nil || req.Body ==
@@ -246,6 +256,31 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 		return 0, err
 	}
 
+	// Phase 07.1 Task 18 prereq P2: SendLocalReply path. If a non-terminal
+	// filter (e.g. cors) called dcb.SendLocalReply during decode, the chain
+	// has already run the encode chain over the synthesized response inside
+	// beginLocalReply (per ADR-0075). Pull the (post-mutation) response shape
+	// out of the chain via LocalReplyResponse and write wire bytes via
+	// writeH1Reply. Bypasses RunAction (the terminal action does NOT run on
+	// the local-reply path).
+	if chain.LocalReplyDone() {
+		lrStatus, lrHeaders, lrBody := chain.LocalReplyResponse()
+		bytesSent := int64(len(lrBody))
+		var werr error
+		if lrStatus > 0 {
+			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
+		}
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime)
+		// Honor any user-supplied Connection: close on the local-reply
+		// headers (the 413 overflow path sets this; cors preflight does not).
+		if lrHeaders != nil && strings.EqualFold(lrHeaders.Get("Connection"), "close") {
+			if werr == nil {
+				werr = errCloseAfterAction
+			}
+		}
+		return lrStatus, werr
+	}
+
 	if hasBody {
 		buf := make([]byte, 32*1024)
 		for {
@@ -262,18 +297,53 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 		}
 	}
 
-	// Terminal-action invocation: the router filter's RunAction writes the
-	// response wire bytes to bw and captures (status, bytesSent, picked, err).
-	// Idempotent — if a non-terminal filter triggered SendLocalReply earlier
-	// in the decode chain, the chain transitioned to encode mode and the
-	// terminal action is NOT invoked (rf.ActionRan stays false). For the
-	// Task-15 H1 path with router-only chain, RunAction always fires.
+	// Terminal-action invocation: the router filter's RunAction surfaces the
+	// logical ActionResponse (Phase 07.1 Task 18 prereq P1). Idempotent — if
+	// a non-terminal filter triggered SendLocalReply earlier in the decode
+	// chain, the chain transitioned to encode mode and the terminal action
+	// is NOT invoked (rf.ActionRan stays false). For the Task-15 H1 path
+	// with router-only chain, RunAction always fires.
 	rf.RunAction(ctx)
 
-	status := rf.Status()
-	bytesSent := rf.BytesSent()
+	resp := rf.Response()
 	picked := rf.Picked()
 	actionErr := rf.ActionErr()
+
+	// Phase 07.1 Task 18 prereq P2: run the response through the encode chain
+	// so encode-side filters (cors etc.) can mutate headers/body BEFORE the
+	// wire-write fires. RunEncodeHeaders iterates filters in REVERSE
+	// declaration order per SPEC §5.5 + §11.1; cors's EncodeHeaders mutates
+	// headers in place via the http.Header map. Skipped when actionRan is
+	// false (the chain already ran the encode side via SendLocalReply during
+	// decode iteration; the local-reply path's wire-write happens below from
+	// chain state captured by a recordingTerminal-style hook — but for the
+	// router-terminal chain, decode-side SendLocalReply is rare and lands a
+	// status==0 here on the rare action-bypass path).
+	status := resp.Status
+	if rf.ActionRan() && status > 0 && actionErr == nil {
+		if _, err := chain.RunEncodeHeaders(ctx, resp.Headers, len(resp.Body) == 0); err != nil {
+			return status, err
+		}
+		if len(resp.Body) > 0 {
+			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
+				return status, err
+			}
+		}
+	}
+
+	bytesSent := int64(len(resp.Body))
+
+	// Phase 07.1 Task 18 prereq P2: wire-write the response via writeH1Reply
+	// (mirrors writeStatusReply but takes a pre-built http.Header so encode-
+	// chain mutations are visible on the wire). The action's surfaced response
+	// (post-encode-chain) is the source of truth for status + headers + body.
+	if rf.ActionRan() && actionErr == nil && status > 0 {
+		if werr := writeH1Reply(bw, resp.Status, resp.Headers, resp.Body); werr != nil {
+			actionErr = werr
+		} else if resp.Close {
+			actionErr = errCloseAfterAction
+		}
+	}
 
 	// Per Decision §3.1: single uniform access-log emit site at chain-completion.
 	// emitAccessLog is a no-op when status==0 (ctx-cancel sentinel) or when

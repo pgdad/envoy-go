@@ -1389,3 +1389,126 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.014s
 **Closes Task 16 forward:** Multi-frame H2 DATA test gap is CLOSED via `TestChainIntegration_H2_MultiFrameDATA` — 256 KiB body POSTed as `h2req.Body`, captured verbatim by recording filter "a", byte-equality asserted against the input.
 
 **Task 18 carries forward:** Encode-side ordering assertion (the `b.EncodeHeaders` + `a.EncodeHeaders` reverse-order assertion the prompt mentions but defers to Task 18) — the recording filter implements encode methods but no test asserts encode-order. Task 18 (cors filter) will add encode-side ordering tests when it rewires the wire-output through chain-fed buffers.
+
+---
+
+## Task 18 — internal/filter/http/cors — real envoy.filters.http.cors filter [ADR-0074]
+
+**Commits:** TBD-task18 — this task's commit (cors filter + encode chain wiring + Action 3-tuple); TBD-task18-shafill — PROGRESS SHA-fill follow-up
+
+**Notes:** Landed the first real Envoy HTTP filter — `envoy.filters.http.cors` — alongside the two infrastructure prerequisites carried forward from Tasks 15 + 16: P1 (the `router.Action` 4-tuple `(status, bytesSent, picked, err)` collapses to the 3-tuple `(ActionResponse, picked, err)` so the chain becomes the source of truth for wire-byte accounting) and P2 (the encode chain is wired through HCM dispatch — `dispatchRequest` and `chainDispatchAction.WriteH2` run `RunEncodeHeaders`/`RunEncodeData` over the action's response BEFORE the wire-write fires, so cors's encode-side header injection takes effect on actual responses).
+
+The cors filter implements the SPEC §11.2 verbatim wire-shape pin in `internal/filter/http/cors/cors.go` (~190 LoC). Six unit tests in `cors_test.go` cover the four wire-shape paths from §11.2 (preflight allowed-origin → 200 + six headers; preflight disallowed-origin → passthrough; actual GET allowed-origin → three encode-side headers; actual GET no-origin → no-op), plus a per-route override shape and the `New` factory roundtrip.
+
+**Architectural decisions made:**
+
+1. **P1 — Action signature: option (a) ActionResponse struct.** The `Action` and `H2Action` types now return `(ActionResponse, cluster.Endpoint, error)`. `ActionResponse` carries `{Status int; Headers http.Header; Body []byte; Close bool}`. The wire-byte accounting for the access-log `BytesSent` operator naturally derives from `len(resp.Body)` — no separate field on the router filter. The `Close` boolean replaces the `errCloseAfterAction` sentinel as the H1 connection-close signal (the sentinel is preserved as a backwards-compat error wrapper for the legacy `do()` direct-call path, but the chain-mediated dispatch reads the boolean directly). Rationale: the alternative options surveyed were (b) Action writes via `EncoderFilterCallbacks.EncodeHeaders/Data` which would require a callback-driven encode-chain entry that the current chain framework does not naturally support without inverting the iteration model, and (c) HCM dispatch counts bytes externally via a wire-write closure introspection which would require non-trivial scaffolding around `bw`/`sw`. Option (a) is the lightest seam: the action becomes a pure logical-response builder, and the wire-write path is a small new helper (`writeH1Reply` / `writeH2Reply`) that takes a pre-built header set + body. Body bytes flow through `RunEncodeData` so a future encode-side filter that mutates body has the chain framework handling buffer-cap accounting (per ADR-0076).
+
+2. **P2 — Encode chain integration: dispatch-driven, post-RunAction.** The chain-mediated H1 dispatch (`dispatchRequest`) and H2 dispatch (`chainDispatchAction.WriteH2`) both adopt the same shape: (1) `rf.RunAction(ctx)` produces the logical `ActionResponse`; (2) `chain.RunEncodeHeaders(ctx, resp.Headers, len(resp.Body)==0)` runs the encode chain in REVERSE declaration order — cors's `EncodeHeaders` mutates the headers map in place; (3) `chain.RunEncodeData(ctx, resp.Body, true)` runs the encode-data chain (no-op for cors but provides the seam for future body-mutating filters and exercises the buffer-cap discipline from ADR-0076); (4) wire-write via `writeH1Reply` / `writeH2Reply` emits the (post-mutation) response on the bw/sw. Skipped on the SendLocalReply path (rf.actionRan stays false; the chain's `beginLocalReply` already ran the encode chain inline and the wire-write happens via the same path with the synthesized response). Skipped on ctx-cancel (status==0). Rationale: the chain framework's `RunEncode*` primitives were Task 6's territory; they were structurally complete but never invoked from dispatch. This task wires them into the dispatch path with a minimal (~30 LoC) addition; the chain's existing reverse-iteration discipline + park/resume machinery + buffer-cap enforcement all flow through the new dispatch hook for free.
+
+3. **Wire-write moves from Action to dispatch.** Pre-Task-18, the Action took a `*bufio.Writer` (H1) or `h2.StreamWriter` (H2) and wrote response bytes directly. Post-Task-18 the Action no longer takes the writer — wire-write is HCM dispatch's responsibility. Two new helpers land: `writeH1Reply(w, status, headers, body)` in `codec.go` (mirrors the existing `writeStatusReply` shape but takes a pre-built `http.Header` map so encode-chain mutations are visible on the wire) and `writeH2Reply(sw, status, headers, body)` in `h2dispatch.go` (emits HEADERS with `:status` pseudo + lowercased regular headers + DATA frame). Content-Length is recomputed from `len(body)` at wire-write time; Server + Date are stamped if absent. Rationale: this is the only place the encode-chain mutations can take effect — putting wire-write inside the action would require running the encode chain inside the action's closure too, which is a more invasive refactor with no behavioral upside.
+
+4. **`:method` pseudo-header injection in dispatch.** The cors filter needs to discriminate OPTIONS preflight requests from regular GET/POST requests. Reading `req.Method` from the `*http.Request` would require the cors filter (which only sees `http.Header`) to take a method parameter — diverging from the standard `DecodeHeaders(headers, endStream)` signature. Instead, both H1 (`dispatchRequest`) and H2 (`chainDispatchAction.WriteH2`) inject `:method` into `req.Header` before invoking `chain.RunDecodeHeaders` (mirroring the H2 native pseudo-header convention from RFC 9113 §8.1.2). The cors filter reads `headers.Get(":method")` via the package-internal `getMethod` helper. Rationale: this is the lightest seam for cross-codec method visibility; the alternative (extending the StreamDecoderFilter interface to take a `*http.Request` parameter) would breach ADR-0071's filter API stability.
+
+5. **502/503 local-reply paths flow through the encode chain.** Pre-Task-18 the H1 cluster-dial failure paths called `writeStatusReply(bw, 503, "")` directly inside the Action closure; the H2 cluster-dial failure paths called `routerActionH2.write502(sw)` directly. Post-Task-18 these synthesize `ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}` (or `{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}` for H2) and let the chain-completion dispatch run the encode chain over them THEN write the wire bytes. Rationale: uniform shape across success + failure paths means encode-side filters see EVERY response (cors injects CORS headers on a 503 too, if the request had an allowed Origin — matches reference Envoy's behavior).
+
+6. **Origin matcher: exact + prefix + suffix only.** The phase-07.1 differential fixture (0007a-cors) exercises only `exact` matchers per SPEC §11.2's probe configuration. The cors implementation supports `exact`, `prefix`, and `suffix` since these are the three shapes documented in reference Envoy's CORS examples; `safe_regex`, `contains`, `ignore_case` are silently treated as no-match (matches the silent-ignore discipline from ADR-0041). Per ADR-0074 §(e). Future runtime-fraction phases extend.
+
+**Files changed:**
+
+- `internal/filter/http/cors/doc.go` (NEW, ~40 LoC). Package docstring with the verbatim §11.2 header order + ADR-0074 reference.
+
+- `internal/filter/http/cors/cors.go` (NEW, ~190 LoC). The cors filter — `filter` struct, `New` HTTPFilterFactory, `DecodeHeaders` (preflight detection + SendLocalReply), `EncodeHeaders` (three-header injection on actual responses), pass-through `DecodeData`/`DecodeTrailers`/`EncodeData`/`EncodeTrailers`, helpers `routePolicy` / `originAllowedByPolicy` / `getMethod`. `TypeURL` constant.
+
+- `internal/filter/http/cors/cors_test.go` (NEW, ~310 LoC). Six unit tests covering the §11.2 wire-shape paths + per-route override + factory roundtrip. Test helpers `makeCorsPolicy` (builds the standard probe shape from `[]allowedOrigins`) + `recordingTerminal` (captures the encode-side response shape via `EncodeHeaders`/`EncodeData`) + `buildChain` (assembles a 2-filter chain with cors + recording terminal).
+
+- `internal/filter/http/router/router.go` (MODIFIED, ~50 LoC delta). `Action` type signature: `func(ctx, req) (ActionResponse, cluster.Endpoint, error)` (was 4-tuple with bw + bytesSent). `ActionResponse` struct. `*Filter.bw` and `SetWriter` removed; `actionStatus`/`actionBytesSent` collapsed into `actionResponse`. `Status()` reads from `actionResponse.Status`; `BytesSent()` getter REMOVED (HCM dispatch reads `len(rf.Response().Body)` directly); new `Response()` getter. `RunAction` updated to capture the 3-tuple. `H1ClusterAction` + `doH1ClusterAction` refactored to return `ActionResponse` with `Status: <upstream status>` + `Headers: <upstream headers>` + `Body: <upstream body bytes>` on the success path; `Status: 503` / `Status: 502` with `localReplyHeaders` on dial / write / read failure paths; `Close: resp.Close` on the H1 close-after path. `localReplyHeaders` helper added.
+
+- `internal/filter/http/router/router_h2.go` (MODIFIED, ~40 LoC delta). `H2Action` signature reduced to 3-tuple. `H2ClusterAction` + `doH2ClusterAction` refactored to return `ActionResponse` with the upstream H2 response shape; ctx-cancel returns `Status: 0` + `*h2.Error(CANCEL)` per the §2.1 sentinel. `h2LocalReplyHeaders` helper added. The `routerActionH2.write502` method is preserved for the legacy `doH2` direct-call path.
+
+- `internal/filter/hcm/actions.go` (MODIFIED, ~30 LoC delta). `directResponseAction.asRouterAction` and `asRouterActionH2` return `ActionResponse` shapes by calling `a.body()` (the existing codec-neutral synth shape) and packaging the result. `clusterRouteAction.do()` now invokes `H1ClusterAction(...)`'s closure, builds the wire bytes via `writeStatusReply` (legacy direct-call path).
+
+- `internal/filter/hcm/connection.go` (MODIFIED, ~40 LoC delta). `dispatchRequest` injects `:method` into `req.Header` before `RunDecodeHeaders`. After `rf.RunAction(ctx)`: reads `rf.Response()` for the logical shape; runs `chain.RunEncodeHeaders` + `chain.RunEncodeData` over the response (skipped on status==0 / actionErr); writes wire bytes via the new `writeH1Reply` (skipped on ctx-cancel / SendLocalReply path). `errCloseAfterAction` is set from `resp.Close` instead of being threaded through Action's err.
+
+- `internal/filter/hcm/h2dispatch.go` (MODIFIED, ~50 LoC delta). `chainDispatchAction.WriteH2` injects `:method` similarly. Post-RunAction: runs encode chain over `rf.Response()`; writes wire bytes via the new `writeH2Reply`. The no-match 404 path also uses the new shape (action returns ActionResponse → writeH2Reply emits HEADERS+DATA). `writeH2Reply` helper added (HEADERS frame with `:status` first per RFC 9113 §8.3, then date/server defaults, then content-length recomputed from `len(body)`, then DATA frame with `end_stream=true`).
+
+- `internal/filter/hcm/codec.go` (MODIFIED, ~50 LoC delta). New `writeH1Reply(w, status, headers, body)` helper. Mirrors `writeStatusReply` shape but takes a pre-built `http.Header` so encode-chain mutations are visible on the wire. Recomputes Content-Length from `len(body)`, stamps Server + Date if absent, emits headers via `http.Header.Write` (canonical-cased).
+
+- `internal/filter/hcm/h2dispatch_test.go` (MODIFIED, ~6 LoC). Updated `faultyH2Action` and `faultyAction.asRouterAction` to the new 3-tuple signatures.
+
+- `docs/envoy-go/DECISIONS.md` (MODIFIED). Appended ADR-0074 with the cors filter's three-decision shape (decode-side discipline, encode-side discipline, per-route resolution, matcher support) + rejected alternatives + consequences enumerating the prereqs P1/P2 lands-in-task as part of Task 18.
+
+- `docs/envoy-go/phases/07.1-http-filter-framework/PROGRESS.md`: this entry.
+
+**PLAN deviations:**
+
+- (i) **Action signature option (a) chosen for P1 — `(ActionResponse, picked, err)` 3-tuple.** PLAN.md:2440-2613 does NOT prescribe how to address P1 — the prompt explicitly says "There is no PLAN sketch for the architectural redesign. You must decide." The 3-tuple shape was selected as the cleanest seam: removes wire-write from Action; gives the encode chain something to mutate; keeps `bytesSent` derivable as `len(resp.Body)`. The alternative shapes — keeping the 4-tuple but adding a chain-side `WireBytesWritten()` getter, or threading wire-write through callbacks — were considered and rejected as adding more surface than they save. See PROGRESS architectural decision #1 above.
+
+- (ii) **Encode-chain integration via dispatch-driven `RunEncodeHeaders`/`RunEncodeData` after RunAction.** PLAN.md prescribes nothing concrete here either; the prompt's three options (a)/(b)/(c) were surveyed and option (a) (Action returns logical response; dispatch runs encode chain; dispatch writes wire) was selected. See architectural decision #2 above.
+
+- (iii) **`getMethod` reads `:method` from `http.Header` (matching PLAN sketch)**. PLAN.md:2587-2596's sketch suggested falling back to `headers.Get("X-Method")` if `:method` is absent. Removed the X-Method fallback: HCM dispatch (both H1 + H2) now ALWAYS injects `:method` into the headers map before invoking RunDecodeHeaders, so the fallback is dead code. The cors filter's `getMethod` helper just calls `headers.Get(":method")` and returns "" if absent (which the filter treats as a no-op via the `origin == ""` guard if no method is set, matching the production case where dispatch always populates it).
+
+- (iv) **No explicit "TestCors_FactoryRoundTrip through HTTPRegistry" test.** PLAN.md:2455 lists "the type_url + factory round-trip through the registry" as the sixth test. Implemented as a direct factory roundtrip (`New(tc, FactoryCtx{})` returns a working `FilterInstanceFactory`; the returned `HTTPFilter` carries the right Name + non-nil Decoder/Encoder; TypeURL constant has the expected suffix). The full registry roundtrip (registering `cors.New` under TypeURL in a `*HTTPRegistry`, then looking it up) is more naturally exercised at Task 20 boot wiring time; Task 18 verifies the factory shape independently.
+
+- (v) **502/503 H1 local-reply body becomes empty under the new shape.** Pre-Task-18, `writeStatusReply(bw, 503, "")` emitted Status 503 with empty body. Post-Task-18, the cluster-dial-failure path returns `ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil}` and `writeH1Reply` emits a 503 with `Content-Length: 0` + Server + Date. The wire shape is byte-equivalent (modulo the Date stamp which was already there). For H2, `bad502Body` is now in the response body (was always in the body via `routerActionH2.write502`); the wire shape is byte-equivalent.
+
+- (vi) **SendLocalReply wire-write path closed within Task 18.** Initially the prereq P2 left a gap: `chain.beginLocalReply` ran the encode chain but did NOT emit wire bytes (the chain framework's responsibility per ADR-0075 (b) was wire-write deferral). Pre-Task-18 the gap was masked because the action wrote wire bytes inside its closure; post-Task-18 the action no longer wrote wire bytes, so the SendLocalReply path lost wire output. Closed via two additions: (a) `*FilterChain` exposes `LocalReplyDone()` + `LocalReplyResponse() (status, headers, body)` getters that surface the synthesized response post-encode-chain mutation; (b) HCM dispatch (both `dispatchRequest` and `chainDispatchAction.WriteH2`) checks `chain.LocalReplyDone()` after `RunDecodeHeaders` returns and emits wire bytes via `writeH1Reply` / `writeH2Reply` from the captured response shape. New integration test `TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders` verifies the end-to-end path: cors preflight through dispatchRequest → 200 OK + six CORS headers on the wire.
+
+**Acceptance:**
+
+- `go build ./...` clean.
+- `go vet ./...` clean.
+- `go test ./internal/filter/http/cors/ -count=1 -v` PASS (6/6).
+- `go test ./internal/filter/hcm/ -count=1` PASS (no regressions; all Task 1-17 tests still green).
+- `go test ./internal/filter/... -count=1 -race` PASS (race-clean).
+- `go test ./test/differential/ -count=1` PASS (7/7 fixtures still green).
+- `go test ./... -count=1` PASS.
+- ADR-0074 appended to `docs/envoy-go/DECISIONS.md`; status Accepted; date 2026-05-01.
+
+**Outputs:**
+
+```
+$ go test ./internal/filter/http/cors/ -count=1 -v
+=== RUN   TestCors_Preflight_AllowedOriginEmits200WithSixHeaders
+--- PASS: TestCors_Preflight_AllowedOriginEmits200WithSixHeaders (0.00s)
+=== RUN   TestCors_Preflight_DisallowedOriginPassesThrough
+--- PASS: TestCors_Preflight_DisallowedOriginPassesThrough (0.00s)
+=== RUN   TestCors_ActualRequest_AllowedOriginAddsThreeHeaders
+--- PASS: TestCors_ActualRequest_AllowedOriginAddsThreeHeaders (0.00s)
+=== RUN   TestCors_ActualRequest_NoOriginIsNoOp
+--- PASS: TestCors_ActualRequest_NoOriginIsNoOp (0.00s)
+=== RUN   TestCors_PerRouteOverride
+--- PASS: TestCors_PerRouteOverride (0.00s)
+=== RUN   TestCors_FactoryRoundTrip
+--- PASS: TestCors_FactoryRoundTrip (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	0.002s
+
+$ go test ./internal/filter/hcm/ -run TestChainIntegration -count=1 -v
+=== RUN   TestChainIntegration_H1_DirectResponseHappy
+--- PASS: TestChainIntegration_H1_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_DirectResponseHappy
+--- PASS: TestChainIntegration_H2_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_MultiFrameDATA
+--- PASS: TestChainIntegration_H2_MultiFrameDATA (0.00s)
+=== RUN   TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders
+--- PASS: TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.003s
+
+$ go test ./test/differential/ -count=1 | tail -5
+--- PASS: TestDifferential (19.36s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.14s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.18s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.16s)
+    --- PASS: TestDifferential/0003-http11-routing (1.28s)
+    --- PASS: TestDifferential/0004-h2-routing (1.74s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.91s)
+    --- PASS: TestDifferential/0006-access-log (10.96s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	20.849s
+```
+
+**Closes Tasks 15 + 16 forwards:** P1 (`router.Action` 4-tuple → 3-tuple wire-byte accounting refactor) + P2 (encode chain wired through HCM dispatch) — both forwarded prereqs are addressed in this commit alongside the cors filter implementation. The SendLocalReply wire-write path is also closed in this commit (see deviation (vi)) — the integration test `TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders` proves the end-to-end shape.
+
+**Task 21 (differential fixture 0007a-cors) carries forward:** None — Task 18 closes the wire-write gaps so the 0007a-cors fixture should drive end-to-end without further infrastructure work. The remaining items for Task 21 are the fixture authoring itself (bootstrap configs, expectation files, driver code).

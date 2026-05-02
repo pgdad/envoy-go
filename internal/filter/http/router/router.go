@@ -89,35 +89,72 @@ func upstreamHostString(ep cluster.Endpoint) string {
 	return ep.Host + ":" + strconv.Itoa(int(ep.Port))
 }
 
+// ActionResponse is the logical response shape produced by an Action. It is
+// the unit fed to the encode chain (Phase 07.1 Task 18 prereq P2): HCM
+// dispatch invokes the chain's RunEncodeHeaders/RunEncodeData over the
+// response BEFORE writing wire bytes, so encode-side filters (e.g. cors) can
+// inject/modify headers on the actual upstream response.
+//
+// Status is the finalized HTTP response code; Headers is the response header
+// set (mutable — filters mutate this in place via the chain); Body is the
+// response body bytes (for direct_response: the inline_string; for cluster
+// proxying: the upstream response body bytes, fully buffered before encode).
+//
+// On the H1 path, the wire-bytes serialization is the chain-completion
+// dispatch's responsibility (status line + headers + body via writeStatusReply
+// or http.Response.Write). On the H2 path, dispatch maps Status into the
+// :status pseudo-header and writes HEADERS+DATA frames via h2.StreamWriter.
+type ActionResponse struct {
+	Status  int
+	Headers http.Header
+	Body    []byte
+	// Close is true if the action requested the connection be closed after
+	// the response (H1 only; H2 ignores). Surfaced via this field rather than
+	// errCloseAfterAction so the wire-write path can observe it without
+	// shadowing real errors. Phase 07.1 Task 18 prereq P1 surfaces this
+	// alongside the response struct.
+	Close bool
+}
+
 // Action is the per-request executor injected by HCM dispatch into the
 // terminal router filter. HCM dispatch resolves the matched route into one
 // of these closures (direct_response synthesize OR upstream cluster dial)
 // and calls *Filter.SetAction before iteration begins; the router invokes
-// it from DecodeHeaders/DecodeData when end_stream is observed.
+// it from RunAction after decode chain iteration returns.
 //
-// Returning (status, bytesSent, picked, err): status is the finalized HTTP
-// response code (used by HCM to Inc the downstream_rq_<Nxx> bucket and to
-// populate the access-log record); bytesSent is the response-body byte
-// count (for the BYTES_SENT operator per SPEC §12 #3); picked is the
-// cluster.Endpoint actually dialed (zero-value for direct_response); err
-// is the action error (errCloseAfterAction sentinel or a real writer
-// failure that the HCM dispatch loop must propagate).
-type Action func(ctx context.Context, req *http.Request, bw *bufio.Writer) (status int, bytesSent int64, picked cluster.Endpoint, err error)
+// Phase 07.1 Task 18 prereq P1: the signature is reduced to (resp, picked, err).
+// bytesSent is removed from the Action's surface — the chain owns wire-byte
+// accounting via len(resp.Body) + the chain's encode-side iteration. The
+// Action no longer takes a *bufio.Writer: wire-bytes serialization moved out
+// of Action and into HCM dispatch's chain-completion path so the encode chain
+// can mutate the response BEFORE the wire-write fires.
+//
+// Returning (resp, picked, err): resp.Status is the finalized HTTP response
+// code (used by HCM to Inc the downstream_rq_<Nxx> bucket and to populate
+// the access-log record); resp.Body provides bytesSent via len(); picked is
+// the cluster.Endpoint actually dialed (zero-value for direct_response); err
+// is the action error (e.g. a writer failure on cluster proxying).
+type Action func(ctx context.Context, req *http.Request) (resp ActionResponse, picked cluster.Endpoint, err error)
 
 // H2Action is the H2-flavored counterpart to Action — the per-request executor
 // injected by HCM dispatch into the terminal router filter on the H2 path.
 // HCM dispatch (h2dispatch.go) resolves the matched route into one of these
 // closures (direct_response synthesize OR upstream H2 RoundTrip) and calls
 // *Filter.SetH2Action before chain iteration begins; the router invokes it
-// from RunH2Action after the decode chain returns.
+// from RunAction after the decode chain returns.
 //
-// Returning (status, bytesSent, picked, err): mirrors Action's contract.
-// status==0 is the H2 ctx-cancel sentinel per SPEC §2.1 last bullet — HCM
-// dispatch's chain-completion access-log emit hook skips submission on
-// status==0. err carrying an *h2.Error propagates upward; serverStream.dispatch
-// then emits the matching RST_STREAM(<code>) per the dispatch carry-error
-// contract.
-type H2Action func(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) (status int, bytesSent int64, picked cluster.Endpoint, err error)
+// Phase 07.1 Task 18 prereq P1: signature reduced to (resp, picked, err).
+// status==0 in resp.Status is the H2 ctx-cancel sentinel per SPEC §2.1 last
+// bullet — HCM dispatch's chain-completion access-log emit hook skips
+// submission on status==0. err carrying an *h2.Error propagates upward;
+// serverStream.dispatch then emits the matching RST_STREAM(<code>) per the
+// dispatch carry-error contract.
+//
+// Note: H2 actions populate ActionResponse.Headers with HTTP-style header
+// fields (regular header keys, no colon-prefixed pseudo-headers). The
+// chain-completion dispatch path injects the :status pseudo-header at
+// wire-write time from resp.Status.
+type H2Action func(ctx context.Context, req h2.H2Request) (resp ActionResponse, picked cluster.Endpoint, err error)
 
 // Filter is the terminal HTTP filter (envoy.filters.http.router) implementing
 // envoyhttp.StreamDecoderFilter + envoyhttp.StreamEncoderFilter per ADR-0071.
@@ -126,11 +163,13 @@ type H2Action func(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) (s
 // HCM dispatch through to the chain).
 //
 // At Task 15 the iteration-protocol surface lands as a working H1 endpoint:
-// HCM dispatch (connection.go) populates the per-request action + writer +
-// request via SetAction / SetWriter / SetRequest BEFORE chain.RunDecodeHeaders;
-// the router's DecodeHeaders/DecodeData invoke the action when end_stream is
-// observed and capture (status, bytesSent, picked, actionErr) for HCM dispatch
-// to read after chain return via Status/BytesSent/Picked/ActionErr.
+// HCM dispatch (connection.go) populates the per-request action + request
+// via SetAction / SetRequest BEFORE chain.RunDecodeHeaders; the router's
+// RunAction invokes the action after the decode chain returns and captures
+// (response, picked, actionErr) for HCM dispatch to read via
+// Status/Response/Picked/ActionErr. Phase 07.1 Task 18 prereq P1 removed the
+// SetWriter setter and the (status, bytesSent) tuple — wire-bytes
+// serialization is now HCM dispatch's responsibility post-encode-chain.
 //
 // The accessLog field carries the access-log sink slice plumbed in via the
 // per-request factory (Task 14 wires the HCM Filter's accessLog through to
@@ -143,26 +182,27 @@ type H2Action func(ctx context.Context, req h2.H2Request, sw h2.StreamWriter) (s
 //
 //  1. HCM allocates a fresh `*Filter` from the per-instance factory (router.New's
 //     returned FilterInstanceFactory closure runs once per request).
-//  2. HCM calls `SetRequest`, `SetWriter`, `SetAction` in any order, all BEFORE
-//     chain iteration begins (i.e. BEFORE chain.RunDecodeHeaders).
+//  2. HCM calls `SetRequest`, `SetAction` in any order, both BEFORE
+//     chain iteration begins (i.e. BEFORE chain.RunDecodeHeaders). On the H2
+//     path, SetH2Action + SetH2Request are called instead.
 //  3. The chain's iteration callbacks (`SetDecoderCallbacks`, `SetEncoderCallbacks`,
 //     `DecodeHeaders/Data/Trailers`, `EncodeHeaders/Data/Trailers`) run during
 //     chain dispatch on the chain's single dispatch goroutine.
 //  4. HCM calls `RunAction(ctx)` exactly once after `chain.RunDecodeHeaders`
 //     (and `RunDecodeData` if body) returns.
-//  5. HCM reads result fields via `Status / BytesSent / Picked / ActionErr /
-//     ActionRan` AFTER `RunAction` returns.
+//  5. HCM reads result fields via `Status / Response / Picked / ActionErr /
+//     ActionRan` AFTER `RunAction` returns; runs the response through the
+//     encode chain (`RunEncodeHeaders` / `RunEncodeData`); finally writes
+//     wire bytes via codec-specific writeH1Reply / writeH2Reply.
 //  6. The `*Filter` is then discarded; `OnDestroy` callback fires.
 //
 // The single-goroutine-per-stream invariant means the result-capture fields
-// (`actionRan`, `actionStatus`, `actionBytesSent`, `actionPicked`, `actionErr`)
-// require no synchronization: only one goroutine ever reads or writes them
-// per request. Future filters that schedule encode-side work on a separate
-// goroutine MUST synchronize externally before invoking RunAction or reading
-// the getters; Task 18 (cors as encode-side filter) is the first task that
-// could surface this concern, and the chain framework's parkEncode/resume
-// machinery preserves the invariant by routing the resume back through the
-// same dispatch goroutine.
+// (`actionRan`, `actionResponse`, `actionPicked`, `actionErr`) require no
+// synchronization: only one goroutine ever reads or writes them per request.
+// Future filters that schedule encode-side work on a separate goroutine MUST
+// synchronize externally before invoking RunAction or reading the getters;
+// the chain framework's parkEncode/resume machinery preserves the invariant
+// by routing the resume back through the same dispatch goroutine.
 type Filter struct {
 	dcb envoyhttp.DecoderFilterCallbacks
 	ecb envoyhttp.EncoderFilterCallbacks
@@ -173,26 +213,39 @@ type Filter struct {
 
 	// Per-request injection (Task 15). HCM dispatch sets these before
 	// chain.RunDecodeHeaders begins iteration.
+	//
+	// Phase 07.1 Task 18 prereq P1: the *bufio.Writer (bw) is REMOVED from the
+	// per-request injection set. Wire-bytes serialization moved from the
+	// Action into HCM dispatch's chain-completion path so the encode chain
+	// can mutate the response before wire-write. SetWriter is preserved as a
+	// no-op tombstone so existing test scaffolding compiles; will be deleted
+	// in a follow-up cleanup.
 	action Action
 	req    *http.Request
-	bw     *bufio.Writer
 
 	// Per-request H2 injection (Task 16). HCM dispatch sets these on the H2
 	// path before chain.RunDecodeHeaders begins iteration. Mutually exclusive
 	// with the H1 trio above: HCM populates ONE set per request based on the
 	// listener's negotiated codec. RunAction routes to the populated path.
+	//
+	// Phase 07.1 Task 18 prereq P1: h2Sw REMOVED from the per-request
+	// injection set; wire-bytes serialization moved out of Action.
 	h2Action H2Action
 	h2Req    h2.H2Request
-	h2Sw     h2.StreamWriter
 
-	// Per-request action result (populated when action runs in DecodeHeaders/
-	// DecodeData). HCM dispatch reads these via the public getters after
-	// chain.RunDecodeHeaders / chain.RunDecodeData return.
-	actionRan       bool
-	actionStatus    int
-	actionBytesSent int64
-	actionPicked    cluster.Endpoint
-	actionErr       error
+	// Per-request action result (populated when action runs in RunAction).
+	// HCM dispatch reads these via the public getters after RunAction returns.
+	//
+	// Phase 07.1 Task 18 prereq P1: actionBytesSent removed (chain owns
+	// wire-byte accounting; HCM dispatch reads len(actionResponse.Body)
+	// directly when populating the access-log record). actionResponse holds
+	// the logical response surfaced by the action; HCM dispatch feeds it to
+	// the encode chain BEFORE wire-write so encode-side filters (cors etc.)
+	// can mutate headers/body.
+	actionRan      bool
+	actionResponse ActionResponse
+	actionPicked   cluster.Endpoint
+	actionErr      error
 }
 
 // SetAction wires the per-request action closure resolved by HCM dispatch
@@ -202,10 +255,6 @@ func (f *Filter) SetAction(a Action) { f.action = a }
 // SetRequest wires the *http.Request into the router for the action's H1
 // upstream call. Called once per request, BEFORE chain iteration.
 func (f *Filter) SetRequest(r *http.Request) { f.req = r }
-
-// SetWriter wires the downstream writer the action emits the response wire
-// bytes through. Called once per request, BEFORE chain iteration.
-func (f *Filter) SetWriter(w *bufio.Writer) { f.bw = w }
 
 // SetH2Action is the H2-side mirror of SetAction (Task 16). HCM h2dispatch.go
 // injects the per-request H2 action closure resolved from the matched route.
@@ -219,21 +268,21 @@ func (f *Filter) SetH2Action(a H2Action) { f.h2Action = a }
 // iteration.
 func (f *Filter) SetH2Request(r h2.H2Request) { f.h2Req = r }
 
-// SetH2Writer wires the downstream H2 stream writer the action emits the
-// response HEADERS + DATA frames through. Called once per request, BEFORE
-// chain iteration.
-func (f *Filter) SetH2Writer(w h2.StreamWriter) { f.h2Sw = w }
-
-// Status / BytesSent / Picked / ActionErr expose the action's terminal
+// Status / Response / Picked / ActionErr expose the action's terminal
 // outcome so HCM dispatch can Inc the downstream_rq_<Nxx> bucket, populate
-// the access-log record, and propagate the writer error after chain return.
-// Zero values when the action did not run (e.g. SendLocalReply pre-empted
-// the terminal filter).
-func (f *Filter) Status() int               { return f.actionStatus }
-func (f *Filter) BytesSent() int64          { return f.actionBytesSent }
-func (f *Filter) Picked() cluster.Endpoint  { return f.actionPicked }
-func (f *Filter) ActionErr() error          { return f.actionErr }
-func (f *Filter) ActionRan() bool           { return f.actionRan }
+// the access-log record, run the encode chain over the response, and write
+// wire bytes after chain return. Zero values when the action did not run
+// (e.g. SendLocalReply pre-empted the terminal filter).
+//
+// Phase 07.1 Task 18 prereq P1: BytesSent() getter REMOVED — HCM dispatch
+// reads len(rf.Response().Body) directly when populating the access-log
+// record. Response() returns the logical response struct surfaced by the
+// action; HCM dispatch feeds it through the encode chain BEFORE wire-write.
+func (f *Filter) Status() int                 { return f.actionResponse.Status }
+func (f *Filter) Response() ActionResponse    { return f.actionResponse }
+func (f *Filter) Picked() cluster.Endpoint    { return f.actionPicked }
+func (f *Filter) ActionErr() error            { return f.actionErr }
+func (f *Filter) ActionRan() bool             { return f.actionRan }
 
 // RunAction invokes the per-request Action and captures the outcome. Idempotent
 // once-per-request via the `actionRan` boolean (a check-then-set, NOT a sync.Once
@@ -275,26 +324,20 @@ func (f *Filter) RunAction(ctx context.Context) {
 	}
 	switch {
 	case f.h2Action != nil:
-		// H2 path (Task 16). h2Sw must be non-nil; h2Req is a value type so
-		// the zero value is allowed (no nil-pointer check needed).
-		if f.h2Sw == nil {
-			panic("router.Filter.RunAction: SetH2Action set without SetH2Writer (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
-		}
+		// H2 path (Task 16). h2Req is a value type so the zero value is allowed.
 		f.actionRan = true
-		status, bytesSent, picked, err := f.h2Action(ctx, f.h2Req, f.h2Sw)
-		f.actionStatus = status
-		f.actionBytesSent = bytesSent
+		resp, picked, err := f.h2Action(ctx, f.h2Req)
+		f.actionResponse = resp
 		f.actionPicked = picked
 		f.actionErr = err
 	case f.action != nil:
-		// H1 path (Task 15). req + bw must be set.
-		if f.req == nil || f.bw == nil {
-			panic("router.Filter.RunAction: SetAction set without SetRequest/SetWriter (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
+		// H1 path (Task 15). req must be set.
+		if f.req == nil {
+			panic("router.Filter.RunAction: SetAction set without SetRequest (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
 		}
 		f.actionRan = true
-		status, bytesSent, picked, err := f.action(ctx, f.req, f.bw)
-		f.actionStatus = status
-		f.actionBytesSent = bytesSent
+		resp, picked, err := f.action(ctx, f.req)
+		f.actionResponse = resp
 		f.actionPicked = picked
 		f.actionErr = err
 	default:
@@ -410,17 +453,13 @@ func New(_ *anypb.Any, _ envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFactory,
 // §10 #3 settled).
 func H1ClusterAction(c *cluster.Cluster) Action {
 	a := &routerAction{cluster: c}
-	return func(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, int64, cluster.Endpoint, error) {
-		// routerAction.do tracks bytesSent + picked internally and submits the
-		// access log (from its filter backpointer) on completion. For Task 15
-		// the access-log emit is deferred to HCM dispatch's chain-completion
-		// hook per Decision §3.1, so we do NOT bind a.filter here — the
-		// closure surfaces (status, bytesSent, picked, err) via the named
-		// returns below by re-running a small slice of routerAction.do's body
-		// with the local capture variables visible to this closure. Rather
-		// than duplicate the upstream-driving code path, we use the existing
-		// do() and re-derive bytesSent + picked from a parallel mini-driver.
-		return doH1ClusterAction(ctx, a, req, bw)
+	return func(ctx context.Context, req *http.Request) (ActionResponse, cluster.Endpoint, error) {
+		// Phase 07.1 Task 18 prereq P1: doH1ClusterAction returns an
+		// ActionResponse logical shape (no wire-bytes serialization here).
+		// HCM dispatch's chain-completion path runs the encode chain over
+		// the response THEN writes wire bytes — see internal/filter/hcm/
+		// connection.go's dispatchRequest at the chain-mediated dispatch path.
+		return doH1ClusterAction(ctx, a, req)
 	}
 }
 
@@ -431,15 +470,18 @@ func H1ClusterAction(c *cluster.Cluster) Action {
 var ErrCloseAfterAction = errCloseAfterAction
 
 // doH1ClusterAction runs the per-request H1 upstream-dial dispatch and surfaces
-// (status, bytesSent, picked, err) for the Action closure. Logic mirrors
-// routerAction.do BUT exposes the bytesSent + picked locals to the caller
-// (rather than capturing them in a deferred access-log emit, which is what
-// routerAction.do does for the legacy direct-call path). The access-log
-// emit-deferral was migrated to HCM dispatch's chain-completion hook per
-// Decision §3.1; this function is the byte-preserved H1 cluster-dial driver
-// for the chain-mediated dispatch path.
-func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request, bw *bufio.Writer) (int, int64, cluster.Endpoint, error) {
-	bytesSent := int64(0)
+// the logical ActionResponse for the Action closure. Phase 07.1 Task 18 prereq
+// P1: returns an ActionResponse (status + headers + body + close) instead of
+// writing wire bytes directly. The HCM dispatch chain-completion path runs
+// the response through the encode chain THEN writes wire bytes via writeH1Reply.
+//
+// On dial / req.Write / ReadResponse failures the function synthesizes a 502
+// or 503 ActionResponse shape (status + minimal headers + empty body); the
+// HCM dispatch path treats these uniformly with proxied responses (encode
+// chain runs; wire-write happens in dispatch). This collapses the previous
+// "writeStatusReply directly into bw on failure path" with the chain-mediated
+// path into a single shape.
+func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) (ActionResponse, cluster.Endpoint, error) {
 	picked := cluster.Endpoint{}
 
 	a.cluster.IncUpstreamRqTotal()
@@ -447,7 +489,7 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request, 
 	upstream, ep, err := a.cluster.Dial(ctx)
 	if err != nil {
 		a.cluster.IncStatusClass(503)
-		return 503, bytesSent, picked, writeStatusReply(bw, 503, "")
+		return ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
 	defer func() { _ = upstream.Close() }()
 	picked = ep
@@ -462,13 +504,13 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request, 
 
 	if err := req.Write(upstream); err != nil {
 		a.cluster.IncStatusClass(502)
-		return 502, bytesSent, picked, writeStatusReply(bw, 502, "")
+		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
 	if err != nil {
 		a.cluster.IncStatusClass(502)
-		return 502, bytesSent, picked, writeStatusReply(bw, 502, "")
+		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -476,18 +518,36 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request, 
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, bytesSent, picked, err
+		return ActionResponse{Status: resp.StatusCode}, picked, err
 	}
-	bytesSent = int64(len(bodyBytes))
-	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
-	if err := resp.Write(bw); err != nil {
-		return resp.StatusCode, bytesSent, picked, err
+	// Build the response headers from the upstream response. Use a fresh
+	// http.Header so the chain's encode-side mutations don't escape to the
+	// caller. Content-Length is recomputed at wire-write time from len(Body).
+	respHeaders := http.Header{}
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			respHeaders.Add(k, v)
+		}
 	}
-	if resp.Close {
-		return resp.StatusCode, bytesSent, picked, errCloseAfterAction
-	}
-	return resp.StatusCode, bytesSent, picked, nil
+	return ActionResponse{
+		Status:  resp.StatusCode,
+		Headers: respHeaders,
+		Body:    bodyBytes,
+		Close:   resp.Close,
+	}, picked, nil
+}
+
+// localReplyHeaders builds the standard local-reply header set for synthesized
+// 5xx responses on the cluster-dial / write / read failure paths. Mirrors
+// writeStatusReply's wire shape.
+func localReplyHeaders(bodyLen int) http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain")
+	h.Set("Content-Length", strconv.Itoa(bodyLen))
+	h.Set("Server", serverHeader())
+	h.Set("Date", dateHeader())
+	return h
 }
 
 // routerAction proxies the request to the named cluster's selected endpoint.

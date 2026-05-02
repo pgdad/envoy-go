@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
@@ -93,13 +94,12 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 // resolves the matched route's H2 action closure (or a 404 synth on no-match)
 // and packages it here; WriteH2 runs the per-request chain machinery.
 //
-// Lifecycle (mirrors connection.go's H1 dispatchRequest, Task 15):
+// Lifecycle (mirrors connection.go's H1 dispatchRequest, Task 15 + Task 18):
 //  1. Allocate fresh per-request *HTTPFilter instances from f.chainConfig.
 //  2. Build chain via filter_http.NewFilterChain(chainHF, f.perRouteConfig);
 //     defer chain.Destroy.
 //  3. SetRequestCtx(ctx, routeIdx) on the chain.
-//  4. Locate the terminal *router.Filter, inject SetH2Action / SetH2Request /
-//     SetH2Writer.
+//  4. Locate the terminal *router.Filter, inject SetH2Action / SetH2Request.
 //  5. Run RunDecodeHeaders(req.Header, endStream=...). H2 body is buffered
 //     fully before dispatch (h2.serverStream snapshots reqBody before
 //     spawning the dispatch goroutine), so we feed it to RunDecodeData in a
@@ -135,12 +135,16 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	startTime := time.Now()
 
 	// No-match path: skip chain construction; invoke the synthesized 404
-	// action directly + emit access-log. Mirrors H1 connection.go's
-	// dispatchRequest no-match branch.
+	// action directly + emit access-log + write wire bytes. Mirrors H1
+	// connection.go's dispatchRequest no-match branch. Phase 07.1 Task 18
+	// prereq P1: action returns ActionResponse; we serialize wire bytes here.
 	if c.routeIdx < 0 {
-		status, bytesSent, picked, err := c.action(ctx, h2req, sw)
-		c.f.emitAccessLogH2(h2req, status, bytesSent, picked, startTime)
-		if cnt := c.f.downstreamStatusClassCounter(status); cnt != nil {
+		resp, picked, err := c.action(ctx, h2req)
+		if err == nil && resp.Status > 0 {
+			err = writeH2Reply(sw, resp.Status, resp.Headers, resp.Body)
+		}
+		c.f.emitAccessLogH2(h2req, resp.Status, int64(len(resp.Body)), picked, startTime)
+		if cnt := c.f.downstreamStatusClassCounter(resp.Status); cnt != nil {
 			cnt.Inc()
 		}
 		return err
@@ -175,7 +179,16 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	}
 	rf.SetH2Action(c.action)
 	rf.SetH2Request(h2req)
-	rf.SetH2Writer(sw)
+
+	// Phase 07.1 Task 18 prereq: inject the request method as ":method"
+	// pseudo-header on the headers map so chain-level filters (cors etc.)
+	// can read the method without codec-specific surfacing. H2 routes already
+	// place :method on the request struct via h2.parseHeadersForRequest;
+	// reflect it onto the *http.Request.Header here so RunDecodeHeaders
+	// observes it consistent with the H1 path.
+	if c.req.Header.Get(":method") == "" {
+		c.req.Header[":method"] = []string{c.req.Method}
+	}
 
 	// Decode side: headers → data → trailers. H2 body is fully buffered
 	// before dispatch (h2.serverStream snapshots reqBody before spawning
@@ -196,6 +209,26 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		return err
 	}
 
+	// Phase 07.1 Task 18 prereq P2: SendLocalReply path on the H2 codec.
+	// Mirrors the H1 path in connection.go: if a non-terminal filter (cors)
+	// triggered SendLocalReply, the chain ran the encode chain over the
+	// synthesized response; pull it out via LocalReplyResponse and emit
+	// HEADERS+DATA via writeH2Reply.
+	if chain.LocalReplyDone() {
+		lrStatus, lrHeaders, lrBody := chain.LocalReplyResponse()
+		var werr error
+		if lrStatus > 0 {
+			werr = writeH2Reply(sw, lrStatus, lrHeaders, lrBody)
+		}
+		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime)
+		if lrStatus > 0 {
+			if cnt := c.f.downstreamStatusClassCounter(lrStatus); cnt != nil {
+				cnt.Inc()
+			}
+		}
+		return werr
+	}
+
 	if hasBody {
 		if _, err := chain.RunDecodeData(ctx, h2req.Body, true); err != nil {
 			return err
@@ -210,10 +243,40 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// always reaches here with the action populated.
 	rf.RunAction(ctx)
 
-	status := rf.Status()
-	bytesSent := rf.BytesSent()
+	resp := rf.Response()
 	picked := rf.Picked()
 	actionErr := rf.ActionErr()
+	status := resp.Status
+
+	// Phase 07.1 Task 18 prereq P2: run the response through the encode chain
+	// so encode-side filters (cors etc.) can mutate headers/body BEFORE the
+	// HEADERS+DATA frames hit the wire. Reverse declaration order per SPEC
+	// §5.5 + §11.1.
+	if rf.ActionRan() && status > 0 && actionErr == nil {
+		if _, err := chain.RunEncodeHeaders(ctx, resp.Headers, len(resp.Body) == 0); err != nil {
+			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime)
+			return err
+		}
+		if len(resp.Body) > 0 {
+			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
+				c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime)
+				return err
+			}
+		}
+	}
+
+	// Phase 07.1 Task 18 prereq P2: wire-write the (post-encode-chain) response
+	// via writeH2Reply. Skipped on ctx-cancel (status==0) and on the rare
+	// SendLocalReply-during-decode path (rf.ActionRan==false; the chain's
+	// beginLocalReply wrote the response through the encode chain inline but
+	// did NOT emit wire bytes — that is THIS layer's responsibility on H2 too).
+	if rf.ActionRan() && actionErr == nil && status > 0 {
+		if werr := writeH2Reply(sw, resp.Status, resp.Headers, resp.Body); werr != nil {
+			actionErr = werr
+		}
+	}
+
+	bytesSent := int64(len(resp.Body))
 
 	// Per Decision §3.1: single uniform access-log emit site at chain-completion.
 	// emitAccessLogH2 is a no-op when status==0 (H2 ctx-cancel sentinel per
@@ -237,6 +300,50 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		// path. Preserved from the pre-Task-16 h2RouterActionAdapter.
 		log.Printf("h2: action error: %v", actionErr)
 		return actionErr
+	}
+	return nil
+}
+
+// writeH2Reply emits an HTTP/2 response on sw from a pre-built header set +
+// body. Phase 07.1 Task 18 prereq P2: the chain-mediated H2 dispatch path
+// serializes the action's (post-encode-chain-mutated) response here.
+//
+// Header emission order:
+//  1. :status pseudo-header (RFC 9113 §8.3 — pseudo-headers must come first)
+//  2. date, server (stamped if absent — filters that set Date/Server are honored)
+//  3. content-type and other headers from the headers map
+//  4. content-length last, recomputed from len(body) (overrides upstream value)
+//
+// HEADERS frame is emitted with end_stream=false (body follows) when len(body)>0;
+// end_stream=true when body is empty.
+func writeH2Reply(sw h2.StreamWriter, status int, headers http.Header, body []byte) error {
+	hf := []hpack.HeaderField{{Name: ":status", Value: strconv.Itoa(status)}}
+	// Stamp Date + Server defaults if not provided.
+	hclone := headers.Clone()
+	if hclone.Get("Date") == "" {
+		hclone.Set("Date", dateHeader())
+	}
+	if hclone.Get("Server") == "" {
+		hclone.Set("Server", serverHeader())
+	}
+	hclone.Set("Content-Length", strconv.Itoa(len(body)))
+	for k, vs := range hclone {
+		// HTTP/2 lowercases regular header names per RFC 9113 §8.1.2; emit
+		// canonical-cased names so HpackEncoder applies its own canonicalization
+		// (or the test verification can compare lowercase).
+		ln := strings.ToLower(k)
+		for _, v := range vs {
+			hf = append(hf, hpack.HeaderField{Name: ln, Value: v})
+		}
+	}
+	endStream := len(body) == 0
+	if err := sw.WriteHeaders(hf, endStream); err != nil {
+		return err
+	}
+	if !endStream {
+		if err := sw.WriteData(body, true); err != nil {
+			return err
+		}
 	}
 	return nil
 }

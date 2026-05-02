@@ -68,6 +68,18 @@ type FilterChain struct {
 	localReplyOnce sync.Once
 	localReplyDone atomic.Bool
 
+	// localReplyResponse carries the synthesized response shape from
+	// SendLocalReply so HCM dispatch's wire-write path can emit the bytes
+	// after the chain's beginLocalReply runs the encode side. Phase 07.1
+	// Task 18 prereq P2: pre-Task-18 the chain ran the encode chain but did
+	// not surface the synthesized response to dispatch — wire-write was the
+	// Action's responsibility and the SendLocalReply path bypassed Action.
+	// Now dispatch reads this via LocalReplyResponse() when localReplyDone
+	// is set.
+	localReplyStatus  int
+	localReplyHeaders http.Header
+	localReplyBody    []byte
+
 	// Encode-side started flag (Task 7) — second SendLocalReply after this is
 	// a no-op + log line.
 	encodeStarted atomic.Bool
@@ -481,5 +493,32 @@ func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status
 			_, _ = c.RunEncodeData(ctx, []byte(body), true)
 		}
 		// no trailers
+
+		// Phase 07.1 Task 18 prereq P2: surface the synthesized response (post-
+		// encode-chain mutation) to HCM dispatch so the wire-write path can
+		// emit the bytes. Pre-Task-18 the chain ran the encode chain but the
+		// synthesized response never reached the wire — wire-write was the
+		// Action's responsibility and SendLocalReply bypassed Action. Capture
+		// the merged headers + body bytes after RunEncode* returns so the
+		// chain's LocalReplyResponse() getter returns the post-mutation shape.
+		c.localReplyStatus = status
+		c.localReplyHeaders = merged
+		c.localReplyBody = []byte(body)
 	})
+}
+
+// LocalReplyDone reports whether SendLocalReply was invoked on this chain.
+// HCM dispatch reads this post-RunDecodeHeaders to discriminate the local-
+// reply path (chain owns the response shape) from the action-driven path
+// (router filter owns the response shape).
+func (c *FilterChain) LocalReplyDone() bool { return c.localReplyDone.Load() }
+
+// LocalReplyResponse returns the synthesized local-reply response (status +
+// headers + body) for the wire-write path. Only meaningful when
+// LocalReplyDone() returns true. Phase 07.1 Task 18 prereq P2: the chain's
+// beginLocalReply ran the encode chain over (status, headers, body); this
+// getter surfaces the (post-mutation) shape so HCM dispatch can write wire
+// bytes via writeH1Reply / writeH2Reply.
+func (c *FilterChain) LocalReplyResponse() (int, http.Header, []byte) {
+	return c.localReplyStatus, c.localReplyHeaders, c.localReplyBody
 }

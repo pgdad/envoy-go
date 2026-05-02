@@ -102,27 +102,35 @@ func (a *directResponseAction) do(_ context.Context, _ *http.Request, bw *bufio.
 	return a.status, a.writeH1(bw)
 }
 
-// asRouterAction returns a router.Action closure wrapping a.writeH1 for the
-// chain-mediated H1 dispatch path (Task 15). The closure surfaces
-// (status, bytesSent=len(bodyText), picked=zero, err=writeH1 error) so HCM
-// dispatch's chain-completion hook can populate the access-log record per
-// SPEC §12 #3 + Decision §3.1.
+// asRouterAction returns a router.Action closure that surfaces the
+// direct-response shape as a logical ActionResponse for the chain-mediated H1
+// dispatch path (Task 15). Phase 07.1 Task 18 prereq P1: wire-bytes
+// serialization moved out of the action — HCM dispatch's chain-completion
+// path runs the response through the encode chain THEN writes wire bytes.
+// The Action closure is now a pure logical-response builder.
 func (a *directResponseAction) asRouterAction() router.Action {
-	return func(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, int64, cluster.Endpoint, error) {
-		err := a.writeH1(bw)
-		return a.status, int64(len(a.bodyText)), cluster.Endpoint{}, err
+	return func(_ context.Context, _ *http.Request) (router.ActionResponse, cluster.Endpoint, error) {
+		_, hdrs, body := a.body()
+		return router.ActionResponse{
+			Status:  a.status,
+			Headers: hdrs,
+			Body:    body,
+		}, cluster.Endpoint{}, nil
 	}
 }
 
-// asRouterActionH2 returns a router.H2Action closure wrapping a.writeH2 for
-// the chain-mediated H2 dispatch path (Task 16). The closure surfaces
-// (status, bytesSent=len(bodyText), picked=zero, err=writeH2 error) so HCM
-// h2dispatch.go's chain-completion hook can populate the access-log record
-// per SPEC §12 #3 + Decision §3.1.
+// asRouterActionH2 returns a router.H2Action closure for the chain-mediated
+// H2 dispatch path (Task 16). Same logical-response shape as asRouterAction;
+// HCM h2dispatch's chain-completion path runs the encode chain THEN writes
+// HEADERS+DATA frames.
 func (a *directResponseAction) asRouterActionH2() router.H2Action {
-	return func(_ context.Context, _ h2.H2Request, sw h2.StreamWriter) (int, int64, cluster.Endpoint, error) {
-		err := a.writeH2(sw)
-		return a.status, int64(len(a.bodyText)), cluster.Endpoint{}, err
+	return func(_ context.Context, _ h2.H2Request) (router.ActionResponse, cluster.Endpoint, error) {
+		_, hdrs, body := a.body()
+		return router.ActionResponse{
+			Status:  a.status,
+			Headers: hdrs,
+			Body:    body,
+		}, cluster.Endpoint{}, nil
 	}
 }
 
@@ -143,15 +151,28 @@ type clusterRouteAction struct {
 }
 
 // do invokes the per-request cluster-dial action via the router-package
-// closure and discards the bytesSent/picked surface (the legacy direct-call
-// shape returns only status + err per the routeAction interface). HCM
-// dispatch post-Task-15 does NOT call do() on the H1 path — it calls
-// asRouterAction() and runs the action through the chain — so do()'s return
-// is informational here. Preserved to satisfy the routeAction interface
-// for symmetry with directResponseAction.
+// closure. Phase 07.1 Task 18 prereq P1: the action no longer takes a
+// *bufio.Writer; instead it surfaces an ActionResponse and HCM dispatch
+// writes wire bytes. The do method preserves the legacy direct-call shape
+// (status int + error) for the routeAction interface; the chain-mediated H1
+// path goes through asRouterAction(), not do().
 func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	status, _, _, err := router.H1ClusterAction(a.cluster)(ctx, req, bw)
-	return status, err
+	resp, _, err := router.H1ClusterAction(a.cluster)(ctx, req)
+	if err != nil {
+		return resp.Status, err
+	}
+	// The legacy direct-call path emits wire bytes via bw. Phase 07.1's
+	// chain-mediated dispatch goes through dispatchRequest which runs the
+	// encode chain + does its own wire-write — not this method. Preserved
+	// for the routeAction interface only; the HCM dispatch loop never
+	// invokes this on the H1 path post-Task-15.
+	if err := writeStatusReply(bw, resp.Status, string(resp.Body)); err != nil {
+		return resp.Status, err
+	}
+	if resp.Close {
+		return resp.Status, errCloseAfterAction
+	}
+	return resp.Status, nil
 }
 
 // asRouterAction returns the router.Action closure built by the router

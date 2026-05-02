@@ -2745,3 +2745,58 @@ This ADR **amends ADR-0041** by extending the parse-time silent-ignore set with 
 Task 9 (the `chain.go` `RunDecodeData` + buffer-overflow path + encode-overflow sentinel; first use of the framework's body-cap discipline). Amends ADR-0041; supersedes nothing.
 
 ---
+
+## ADR-0074: `envoy.filters.http.cors` — SendLocalReply discipline + encode-side header injection
+
+**Status:** Accepted. **Date:** 2026-05-01. **Doctrine:** D-3.3 + D-3.4. **Anchored:** SPEC §11.2 (verbatim wire-shape pin), §4.1 (filter inventory).
+
+### Context
+
+Phase 07.1 ships TWO filters in addition to the terminal `router`: the real-world differential filter (`envoy.filters.http.cors`) and the test-only structural-coverage probe filter (`envoy.filters.http.envoy_go_test`). ADR-0074 codifies the cors filter's behavioral contract; the probe filter's iteration-state coverage attribution is documented separately in PROGRESS Task 19.
+
+The cors filter's behavior is non-trivial because it exercises THREE iteration-protocol surfaces simultaneously: (1) decode-side preflight detection + `SendLocalReply` for allowed-origin OPTIONS requests; (2) decode-side passthrough for disallowed-origin preflights (router 405s); (3) encode-side header injection on actual non-preflight responses when the request had an allowed Origin. The empirical wire-shape was scraped from reference Envoy v1.37.2 (per SPEC §11.2 four probes) and pinned in the spec; the filter implementation MUST match the verbatim header order on preflight responses and the verbatim header subset on actual responses.
+
+### Decision
+
+**(a) Filter set.** Phase 07.1 ships `envoy.filters.http.cors` (real Envoy filter, used by differential fixture `0007a`) + `envoy.filters.http.envoy_go_test` (test-only probe filter, used by structural fixture `0007b`). The `Cors` + `CorsPolicy` proto types are pulled from `github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3` per SPEC §4.1 (proto types only; no runtime helpers); the `envoygotest` proto schema is envoy-go-only (hand-rolled, not in upstream go-control-plane). No new go-control-plane runtime imports.
+
+**(b) Cors decode-side discipline (per SPEC §11.2 empirical pin).**
+
+- **No Origin header:** filter is a no-op (`Continue`); not a CORS request.
+- **Origin present + method=OPTIONS + `Access-Control-Request-Method` present:** preflight detected.
+  - **Origin allowed by per-route `CorsPolicy`:** synthesize `200 OK` with empty body via `dcb.SendLocalReply(200, "", corsHeaders)`. The `corsHeaders` map carries the SIX CORS preflight response headers in `§11.2` verbatim order: `Access-Control-Allow-Origin`, `Access-Control-Allow-Credentials`, `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, `Access-Control-Max-Age`, `Access-Control-Expose-Headers`. Returns `StopIteration`.
+  - **Origin disallowed:** filter does NOT inject a 4xx local reply. The request passes through to the router, which 405s the OPTIONS request (since standard route configs don't accept OPTIONS). This matches v1.37.2's empirical behavior pinned in §11.2 probe (b).
+- **Origin present + non-preflight (actual GET/POST/etc.):** filter records `originAllowed` + `matchedOrigin` for encode-side use; returns `Continue` (passthrough to router).
+
+**(c) Cors encode-side discipline (per SPEC §11.2 probe (c)).**
+
+- If `originAllowed` was set during decode, encode-side injects THREE response headers on the upstream response: `Access-Control-Allow-Origin: <matchedOrigin>`, `Access-Control-Allow-Credentials: true` (when policy allows), `Access-Control-Expose-Headers: <policy.expose_headers>` (when set). Allow-Methods / Allow-Headers / Max-Age are PREFLIGHT-ONLY and MUST NOT appear on actual responses.
+- No-op (no header injection) when origin was not allowed or not present.
+
+**(d) Per-route policy resolution.** Cors reads its `*CorsPolicy` via `dcb.RequestRouteConfig()` which delegates to the chain's `*PerRouteConfig.Resolve(filterName, routeIdx)` (3-tier merge per ADR-0073). When no per-route config is set, the policy is empty → no origins allowed → filter is effectively disabled. Per-route override is the primary deployment shape for cors per the v1.37.2 fixture pattern.
+
+**(e) Origin matcher support.** Phase 07.1 supports the THREE matcher variants exercised by reference Envoy's CORS examples: `exact`, `prefix`, `suffix`. Other StringMatcher variants (`safe_regex`, `contains`, `ignore_case`) are silently treated as no-match — extension to the full StringMatcher surface is deferred per the silent-ignore discipline of ADR-0041.
+
+### Inline-supersession
+
+None. ADR-0074 is additive; no prior ADR is amended or superseded.
+
+### Alternatives considered
+
+- **(A) Synthesize a 403 (or other 4xx) on disallowed-origin preflight instead of passthrough.** REJECTED. v1.37.2 empirical scrape (probe b) shows 405 Method Not Allowed coming from the ROUTER (not cors), confirmed by the `x-envoy-upstream-service-time` header on the disallowed-origin response (which would not be present if cors had short-circuited the request). Differential equivalence requires envoy-go's cors filter to passthrough on disallowed origin.
+- **(B) Inject all six CORS headers on actual responses (not just three).** REJECTED. v1.37.2 probe (c) shows ONLY three headers on actual responses; allow-methods/allow-headers/max-age are preflight-only per spec. Differential equivalence requires the three-header-only shape.
+- **(C) Hand-roll the CorsPolicy proto type.** REJECTED. The upstream `envoy/extensions/filters/http/cors/v3.CorsPolicy` type is already in `github.com/envoyproxy/go-control-plane`; D-3.2 forbids new runtime helpers but allows proto types. Using the upstream type avoids drift on a non-trivial schema (10 fields).
+- **(D) Implement the `filter_enabled` / `shadow_enabled` runtime fractions on CorsPolicy.** REJECTED for 07.1. The 07.1 differential fixture exercises only the always-on path; the runtime-fraction surface is silent-ignored per the ADR-0041 discipline. Future runtime-fraction phases promote both fields from silent-ignored to honored.
+
+### Consequences
+
+- (a) `internal/filter/http/cors/cors.go` (~190 LoC) implements the three-decision shape above. Six unit tests in `cors_test.go` exercise the four wire-shape paths (preflight allowed, preflight disallowed, actual allowed, actual no-origin) + the per-route override shape + the factory roundtrip via the package's `New` HTTPFilterFactory.
+- (b) `internal/filter/http/cors.TypeURL = "type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors"` — boot-time registration in `cmd/envoy-go/main.go` (Task 20) registers `cors.New` under this key in the `*HTTPRegistry` per ADR-0072.
+- (c) The differential fixture `0007a-cors` (Task 21) drives 4 sequential requests against both proxies and asserts per-request equivalence (modulo the standard `Server` / `Date` / `Content-Length` differential ignore-list).
+- (d) Phase 07.1 Task 18 introduces TWO infrastructure prereqs that land alongside cors: P1 (the `router.Action` 4-tuple is reduced to the 3-tuple `(ActionResponse, picked, err)` so the chain owns wire-byte accounting); P2 (the encode chain is wired through HCM dispatch — `dispatchRequest` / `chainDispatchAction.WriteH2` run `RunEncodeHeaders` + `RunEncodeData` over the action's response BEFORE the wire-write fires, so cors's encode-side header injection takes effect on actual responses). The wire-write moves from inside the action closure into HCM dispatch via `writeH1Reply` (codec.go) + `writeH2Reply` (h2dispatch.go). These prereqs are intrinsic to cors's encode-side discipline; without P2 the encode-chain mutation has no effect on the wire.
+
+### Lands-in-task
+
+Task 18 (cors filter) + Tasks 21 (differential fixture 0007a) + the Task-18 prereqs P1 + P2 (wire-byte accounting refactor + encode chain wiring through HCM dispatch). The probe filter `envoy.filters.http.envoy_go_test` lands separately at Task 19 + Task 22; ADR-0074's coverage attribution table for the eight iteration-state modes is documented in Task 19's PROGRESS entry, not in this ADR (which is cors-scoped).
+
+---
