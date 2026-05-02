@@ -785,3 +785,124 @@ $ grep -A5 '^### Empirical evidence (tls_inspector ALPN)' docs/envoy-go/BEHAVIOR
 
 **Probe configuration:** listener with `tls_inspector` listener filter + two filter_chains discriminated by `application_protocols` (h2 vs http/1.1). Each chain has its own DownstreamTlsContext (real cert+key, ephemeral self-signed, generated at probe time only — NOT committed) advertising both ALPNs (`alpn_protocols: ["h2", "http/1.1"]`) and a per-chain TCP-proxy with distinct `stat_prefix` (`tcp_h2` for the h2 chain; `tcp_h1` for the http/1.1 chain). Bootstrap at `/tmp/envoy-07.2-impl-empirical/envoy-tls-alpn.yaml` (NOT committed; impl-time scratch directory per the SPEC §11 empirical-pin convention):
 ```
+
+## Verification — six-gate sweep [BOOTSTRAP §7.5]
+
+**Commits:** TBD — this verification commit
+**Notes:** Independent verification session per `superpowers:verification-before-completion` discipline (lifecycle-state 4 → 5 per `BOOTSTRAP_PROMPT.md` §5 step 4). Re-runs all six phase-done gates fresh against HEAD `46e416c` on branch `phase/07.2-listener-chain-completion-impl`; does NOT trust the Task 17 sweep — fresh evidence is captured below verbatim. Pre-flight: `git status` clean, `git rev-parse HEAD` = `46e416cfe9d41e63109fc3bca6997c43d02feee6`. All six gates GREEN: gate (a) fixture 0008-listener-chain-match PASS at the ENVOY_TARGET pin (the new differential fixture introduced at Task 16); gate (b) all 9 pre-existing fixtures (0000-0007b) PASS — zero regressions; gate (c) h2spec 53/53 PASS at the ADR-0051 pin (`summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0`) — UNCHANGED relative to phase 07.1 because 07.2's listener-filter pipeline runs BEFORE HCM and doesn't touch H2 framing; gate (d) all 10 fuzzers PASS at `-fuzztime=30s` each (the 9 inherited from prior phases + the new `FuzzFilterChainMatch` from Task 6) with zero crashers and zero persisted corpus failures — full ADR-0018 short-budget honored; gate (e) `go build ./...` clean (empty output), `go vet ./...` clean (empty output), `golangci-lint run ./...` clean (empty output), `go test -race -count=1 ./...` PASS across all 30 packages (no FAIL, no DATA RACE). Gate (f) defers to the REVIEW session per BOOTSTRAP §5 step 6. Verification session does NOT modify production code — only PROGRESS.md (this `## Verification` entry) and STATE.md (lifecycle 4 → 5 with `next-skill: superpowers:requesting-code-review`). The `last-commit` SHA-fill convention applies: STATE.md records `TBD` and a follow-up SHA-fill commit (or the REVIEW session) resolves it.
+**Outputs (verbatim):**
+```
+$ git rev-parse HEAD
+46e416cfe9d41e63109fc3bca6997c43d02feee6
+$ git status
+On branch phase/07.2-listener-chain-completion-impl
+nothing to commit, working tree clean
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 ./... 2>&1 | tail -40
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.527s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.162s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.034s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.064s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.272s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.060s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.107s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.072s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.033s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.053s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.116s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.386s
+ok  	github.com/esalaine/envoy-go/test/differential	28.130s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.028s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.031s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.028s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.031s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.029s
+?   	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.034s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.033s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.045s
+$ go test -count=1 ./test/differential/... -v 2>&1 | tail -20
+--- PASS: TestDifferential (23.75s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.20s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.15s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.20s)
+    --- PASS: TestDifferential/0003-http11-routing (1.23s)
+    --- PASS: TestDifferential/0004-h2-routing (1.74s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.92s)
+    --- PASS: TestDifferential/0006-access-log (10.91s)
+    --- PASS: TestDifferential/0007a-cors (1.33s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.71s)
+    --- PASS: TestDifferential/0008-listener-chain-match (2.37s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	25.170s
+=== RUN   TestOptionalInterfaces
+--- PASS: TestOptionalInterfaces (0.00s)
+=== RUN   TestOptionalInterfaces_NotImplemented
+--- PASS: TestOptionalInterfaces_NotImplemented (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.001s
+$ go test -count=1 -timeout 180s ./test/conformance/h2spec/ -v 2>&1 | grep -E '53 tests|^PASS|^ok'
+        53 tests, 53 passed, 0 skipped, 0 failed
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.191s
+$ go test -fuzz=FuzzBootstrapLoad -fuzztime=30s -run='^$' ./internal/bootstrap/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 639992 (0/sec), new interesting: 6 (total: 1107)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.084s
+$ go test -fuzz=FuzzTcpProxyFilter -fuzztime=30s -run='^$' ./internal/filter/tcpproxy/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3974603 (0/sec), new interesting: 0 (total: 572)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.056s
+$ go test -fuzz=FuzzTLSContextParse -fuzztime=30s -run='^$' ./internal/tls/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 4491833 (0/sec), new interesting: 4 (total: 736)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.056s
+$ go test -fuzz=FuzzHCMConfigParse -fuzztime=30s -run='^$' ./internal/filter/hcm/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3524079 (0/sec), new interesting: 2 (total: 555)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.056s
+$ go test -fuzz=FuzzFrameStream -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 13632200 (0/sec), new interesting: 2 (total: 433)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	30.158s
+$ go test -fuzz=FuzzHPACKDecode -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 1946601 (0/sec), new interesting: 1 (total: 169)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.078s
+$ go test -fuzz=FuzzPromTextFormat -fuzztime=30s -run='^$' ./internal/stats/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 25640681 (0/sec), new interesting: 0 (total: 119)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	30.110s
+$ go test -fuzz=FuzzAccessLogFormat -fuzztime=30s -run='^$' ./internal/accesslog/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 25136854 (0/sec), new interesting: 1 (total: 89)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	31.029s
+$ go test -fuzz=FuzzFilterChainParse -fuzztime=30s -run='^$' ./internal/filter/http/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 4687424 (0/sec), new interesting: 3 (total: 294)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	31.059s
+$ go test -fuzz=FuzzFilterChainMatch -fuzztime=30s -run='^$' ./internal/listener/listenerfilter/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 16447352 (0/sec), new interesting: 5 (total: 93)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	30.139s
+```
