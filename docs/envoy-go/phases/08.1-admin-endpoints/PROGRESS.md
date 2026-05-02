@@ -77,3 +77,36 @@ $ go build ./...
 $ grep -nE 'ConfigPath\s+string' internal/bootstrap/bootstrap.go
 122:	ConfigPath string
 ```
+
+## Task 3 — `internal/cluster.Manager.Clusters()` snapshot accessor + `ClusterInfo`/`EndpointInfo` types
+
+**Commits:** `07c72bd` — this task's commit; PROGRESS bookkeeping commit TBD
+**Notes:** TDD red→green per PLAN Steps 1-4. Step 1 appended three failing tests to `internal/cluster/manager_test.go` (`TestManager_Clusters_SnapshotReturnsAllClusters`, `TestManager_Clusters_FreshlyAllocatedPerCall`, `TestManager_Clusters_EmptyClustersListReturnsEmpty`); the placeholder `mustParseBootstrap(t, /* fixture YAML */)` from PLAN was substituted with the file's existing builder pattern (`mkBootstrap` + `mkStaticCluster` + `mkLbEndpoint`) — that pattern is the canonical bootstrap fixture in this test file (no YAML fixture helper exists). Step 2 confirmed the build error `m.Clusters undefined (type *Manager has no field or method Clusters, but does have field clusters)`. Step 3 added types `ClusterInfo` and `EndpointInfo` plus method `(m *Manager) Clusters() []ClusterInfo` to `internal/cluster/manager.go` immediately after the existing `Get` method, copying the verbatim Go code from PLAN Step 3 including docstrings (which reference ADR-0063, ADR-0087, and planner-time decision 8). Added `"sort"` to imports. Added a single `//nolint:revive // ADR-0087 reserves the ClusterInfo name…` pragma on `ClusterInfo` to silence revive's stutter check (the codebase uses this pattern when public type names are deliberately ADR-anchored — see `internal/listener/listenerfilter/types.go:12` and `internal/filter/http/types.go:72`). Step 4 confirmed all three new tests PASS (entire cluster package PASS), `go vet` clean, `golangci-lint run ./internal/cluster/...` clean. `go build ./...` clean. `grep -nE '^func \(m \*Manager\) Clusters\(\) \[\]ClusterInfo' internal/cluster/manager.go` returns 1 match at line 150. Mutation-of-returned-slice test passes because the implementation allocates fresh slices via `make()` for both the outer `[]ClusterInfo` and per-cluster `[]EndpointInfo`. Alphabetical-by-name ordering implemented via `sort.Slice`. The Manager-direct construction path (`&Manager{clusters: map[string]*Cluster{}}`) confirmed `clusters` (lowercase) is the correct field name. Field mapping: `Cluster.name → ClusterInfo.Name`; `Cluster.endpoints[].Host → EndpointInfo.Address`; `Cluster.endpoints[].Port → EndpointInfo.Port`.
+
+**Outputs:**
+```
+$ go test -run TestManager_Clusters -v ./internal/cluster/... 2>&1 | tail -20
+=== RUN   TestManager_Clusters_SnapshotReturnsAllClusters
+--- PASS: TestManager_Clusters_SnapshotReturnsAllClusters (0.00s)
+=== RUN   TestManager_Clusters_FreshlyAllocatedPerCall
+--- PASS: TestManager_Clusters_FreshlyAllocatedPerCall (0.00s)
+=== RUN   TestManager_Clusters_EmptyClustersListReturnsEmpty
+--- PASS: TestManager_Clusters_EmptyClustersListReturnsEmpty (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.003s
+
+$ go test -count=1 ./internal/cluster/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.012s
+
+$ go vet ./...
+(clean)
+
+$ golangci-lint run ./internal/cluster/...
+(clean)
+
+$ go build ./...
+(clean)
+
+$ grep -nE '^func \(m \*Manager\) Clusters\(\) \[\]ClusterInfo' internal/cluster/manager.go
+150:func (m *Manager) Clusters() []ClusterInfo {
+```
