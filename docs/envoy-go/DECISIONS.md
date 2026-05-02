@@ -3382,3 +3382,67 @@ For each listener in alphabetical-by-name order, emit one line: `<name>::<bind_a
 
 (e) The two text-format endpoints share a single body-shape ADR rather than two ADRs because their decisions are tightly coupled: both emit text/plain, both use `\n` line terminators, both order entries alphabetically by name, both walk the existing snapshot accessors (`s.cm.Clusters()` and `s.lm.Listeners()`), and both omit the JSON form per ADR-0089. Splitting into ADR-0087a and ADR-0087b would duplicate the rationale; ADR-0004's anti-fragmentation guidance favors consolidation when the decisions are coupled.
 
+---
+
+## ADR-0088: `/server_info` body shape — protojson over `*adminv3.ServerInfo` with the `LIVE`/`PRE_INITIALIZING` state-enum coverage; reuse `configDumpMarshalOptions`; partial `command_line_options{config_path}`; `hot_restart_version: "disabled"` constant
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.3 (capture empirical observations as ADRs when the contract source is not derivable from documentation), D-3.5 (decisions written down).
+**Lands-in-task:** 08.1 PLAN Task 9 (`internal/admin/serverinfo.go`).
+
+### Context
+
+`/server_info` is the fourth read-only operator-introspection admin endpoint in phase 08.1. Like `/config_dump` (settled by ADR-0086), it is JSON-rendered via protojson over a top-level admin/v3 proto — `*adminv3.ServerInfo` — but the proto's field set is much smaller (eight scalar/message fields per `envoy.admin.v3.ServerInfo`: `version`, `state`, `uptime_current_epoch`, `uptime_all_epochs`, `hot_restart_version`, `command_line_options`, `node`). The body shape is pinned by SPEC §11.4's empirical scrape against upstream Envoy v1.37.2 with the SPEC §7.3 fixture — duration values render as `"<N>s"` strings (durationpb's protojson form), the state enum renders as the upper-case enum-name string (`"LIVE"`, `"PRE_INITIALIZING"`), the partial `command_line_options` carries only `config_path` (envoy-go does not model the other CommandLineOptions fields — log levels, base id, restart epoch, etc.), and `hot_restart_version` is the literal string `"disabled"` (envoy-go has no hot-restart machinery, by ADR-0001).
+
+The state-enum coverage decision was explicitly delegated to planner-time (decision 4). The four `ServerInfo_State` enum values defined by `envoy.admin.v3.ServerInfo` are `LIVE`, `DRAINING`, `PRE_INITIALIZING`, and `INITIALIZING`. envoy-go has no xDS init phase that survives admin-server bind (the admin server starts AFTER `bs.Load` + cluster/listener manager construction, which is the totality of "init" in envoy-go's static-bootstrap-only model), so `INITIALIZING` is unreachable in MVP — there is no observable window during which a request to `/server_info` could observe `INITIALIZING` rather than `LIVE` or `PRE_INITIALIZING`. `DRAINING` is 08.2's deliverable: phase 08.2 lands `POST /drain_listeners` and the corresponding state transition; until 08.2, no envoy-go process can be in the draining state. SPEC §11.7 documents the structural sibling: ADR-0015's pre-init contract for `/ready` covers the same gate transition, on a different endpoint, with the same `LIVE`/`PRE_INITIALIZING` enum coverage and the same MarkReady atomic flip.
+
+The version-string format was settled by planner-time decision 1 + ADR-0086's `BuildVersionString()` consequence (option A — 5-token mirror of Envoy's `<sha>/1.37.2/Clean/RELEASE/BoringSSL` shape, with envoy-go substituting `Go-crypto` for `BoringSSL`); the field is allow-listed in the §13.2 differential matrix because envoy-go's revision/Go-version differs from Envoy's release-tag/C++-version on every build by construction. The uptime values use `durationpb.New(time.Since(s.bootTime))` where `bootTime` is set at `admin.New` time (per ADR-0085's constructor widening, which threads the value into the Server struct); both `uptime_current_epoch` and `uptime_all_epochs` carry the same value because envoy-go has a single epoch (no hot-restart, no epoch-rollover semantics).
+
+The `command_line_options.config_path` value is read from `s.bs.ConfigPath`, the field added by Task 2 and assigned by `cmd/envoy-go/main.go` post-Load (Task 10). The other CommandLineOptions fields (log-level, component-log-level, base-id, restart-epoch, etc.) are emitted as zero-values via `EmitUnpopulated: true` in the reused MarshalOptions — the body shape will carry e.g. `"base_id": "0"`, `"restart_epoch": 0`, etc., matching upstream Envoy's empirical scrape on a fixture that does not configure those fields. The `node` field is sourced from `bs.Proto.GetNode()` (proto3-nil-safe; returns an empty Node when the bootstrap declares no `node`).
+
+### Decision
+
+The `/server_info` handler renders `application/json` via the SAME `configDumpMarshalOptions` package-level `protojson.MarshalOptions` tuple introduced by ADR-0086 and consumed by Task 6's `/config_dump` handler. The four-value tuple is `Multiline: true, Indent: " ", UseProtoNames: true, EmitUnpopulated: true`. Reuse (not redefinition) is the contract — both endpoints round-trip protojson over admin/v3 messages under one shared MarshalOptions for cross-endpoint body-shape consistency (ADR-0086 consequence (d)).
+
+The `*adminv3.ServerInfo` value is assembled by `buildServerInfo(s *Server) *adminv3.ServerInfo` in `serverinfo.go` from the Server's threaded fields:
+
+- `Version = BuildVersionString()` — the ADR-0086 5-token format.
+- `State = deriveState(&s.ready)` — returns `adminv3.ServerInfo_LIVE` when `s.ready.Load()` is true, else `adminv3.ServerInfo_PRE_INITIALIZING`. INITIALIZING is unreachable in 08.1 MVP; DRAINING is 08.2's deliverable.
+- `UptimeCurrentEpoch = UptimeAllEpochs = durationpb.New(time.Since(s.bootTime))` — same value, single epoch (no hot-restart).
+- `HotRestartVersion = "disabled"` — literal constant.
+- `CommandLineOptions = &adminv3.CommandLineOptions{ConfigPath: s.bs.ConfigPath}` — partial; other fields stay zero-valued (emitted via `EmitUnpopulated`).
+- `Node = s.bs.Proto.GetNode()` — proto3-nil-safe; returns empty Node when bootstrap has no `node`.
+
+Defensive nil-handling: when `s.bs == nil` (only encountered in tests that do not exercise this endpoint, but defended for code robustness), `configPath` stays empty and `node` stays nil; the body still renders as a valid JSON document. A `protojson.Marshal` error is recovered + logged + synthesized as `500 Internal Server Error` with `{}` body, mirroring `/config_dump`'s defensive shape.
+
+The state-enum coverage in 08.1 is exactly two values: `LIVE` (post-MarkReady) and `PRE_INITIALIZING` (pre-MarkReady). 08.2 will extend the coverage by adding `DRAINING`; the extension lands as an ADR amendment to this ADR (not a superseding ADR — ADR-0004's anti-fragmentation guidance favors amendment when the addition is purely additive). `INITIALIZING` is documented as a defined enum value in `adminv3.ServerInfo_State` but never emitted by envoy-go in any phase — there is no observable code path that produces it.
+
+### Alternatives considered
+
+(A) Use a separate `protojson.MarshalOptions` tuple for `/server_info` (e.g. with `EmitUnpopulated: false` to elide zero-valued CommandLineOptions fields). Rejected: the differential comparator would need to negotiate two distinct body shapes (one per endpoint) against the same upstream Envoy convention, doubling the comparator's allow-list discipline. Reuse of `configDumpMarshalOptions` keeps the cross-endpoint body shape uniform; ADR-0086 consequence (d) anticipated this reuse.
+
+(B) Cover all four `ServerInfo_State` enum values in 08.1 (including `DRAINING` and `INITIALIZING`) by introducing additional atomic flags on the Server struct. Rejected: `DRAINING` requires the drain machinery itself, which is 08.2's deliverable (the state would never transition out of `LIVE` until 08.2's `/drain_listeners` lands). `INITIALIZING` is unreachable in static-bootstrap-only mode — the admin server starts after init completes, so the gate is binary (pre-MarkReady is observable only because the admin server is up by then). Adding flags that can never flip would be code without a code path.
+
+(C) Emit a synthetic `command_line_options.log_level` (or other CommandLineOptions fields) populated from envoy-go's runtime configuration. Rejected: envoy-go has no command-line model for log levels (logs go through `log.Printf` to stderr at default level; ADR-0067 covers access-log paths separately). Emitting a synthetic value would create a source of differential noise without operator value. The §13.2 allow-list covers the zero-valued CommandLineOptions fields uniformly.
+
+(D) Format duration as a sub-second decimal (e.g. `0.123s`) rather than rounded integer seconds. Rejected: durationpb's protojson form is the canonical rendering; `durationpb.New(time.Since(bootTime))` produces the appropriate sub-second precision (`"0.020s"` for 20ms, `"5.012s"` for 5s 12ms, etc.) with no manual formatting. The differential comparator uses a tolerance-band on the uptime fields per §13.2 (uptime values differ by request-arrival timing on each side); the format itself is byte-shape consistent.
+
+(E) Compute `uptime_current_epoch` from a per-request `time.Now()` minus `bootTime`, but `uptime_all_epochs` from a hypothetical "first-epoch" timestamp distinct from `bootTime`. Rejected: envoy-go has a single epoch by construction (no hot-restart). The two fields carry the same `*durationpb.Duration` reference; if a future hot-restart-equivalent feature lands (it will not — hot-restart is excluded by ADR-0001), the two values would diverge at that point.
+
+(F) Emit `hot_restart_version` as the empty string `""` rather than the literal `"disabled"`. Rejected: upstream Envoy v1.37.2's empirical scrape on a build without hot-restart support emits a non-empty string carrying the hot-restart RPC version; envoy-go's literal `"disabled"` is the operator-readable signal that the feature is absent (ADR-0001's exclusion). The §13.2 allow-list covers the field uniformly because the value differs across the two implementations by construction.
+
+### Consequences
+
+(a) The `/server_info` body's equivalence claim against upstream Envoy v1.37.2 is post-MarkReady (both sides emit `"state": "LIVE"`); the pre-MarkReady body is documented but test-irrelevant in the differential harness because the cmd/envoy-go binary calls `s.MarkReady()` before any request arrives in normal operation. Pre-MarkReady is exercised only by the unit test (Task 9 step 1's `TestHandleServerInfo_StatePreMarkReady`); the structural sibling is ADR-0015's pre-init contract for `/ready`, which has the same "documented but test-irrelevant pre-init body" carry-forward.
+
+(b) The same `configDumpMarshalOptions` four-value tuple is reused per ADR-0086 consequence (d). Future protojson-rendered admin surfaces (e.g. a hypothetical 08.2 JSON response on `/drain_listeners`, though current SPEC §1 has it return `OK\n` text) follow the same MarshalOptions tuple by default unless an explicit ADR supersedes the reuse.
+
+(c) Phase 08.2's drain implementation extends the state enum coverage to `LIVE` + `PRE_INITIALIZING` + `DRAINING` by adding a third atomic flag (or by extending `s.ready` semantics — 08.2's PLAN settles the choice) and amending `deriveState` to return `adminv3.ServerInfo_DRAINING` when the drain flag is set. The amendment is purely additive; no other field changes. The ADR-0088 amendment will record the addition without superseding this ADR.
+
+(d) The `version` field is allow-listed in the §13.2 differential matrix because envoy-go does not byte-compare against Envoy's version string (envoy-go's revision/Go-version differs from Envoy's release-tag/C++-version on every build). The `uptime_current_epoch` and `uptime_all_epochs` fields are tolerance-banded in the same matrix (per-side uptime differs by request-arrival timing). The `command_line_options.*` fields beyond `config_path` are allow-listed (envoy-go emits zero-values; Envoy emits its build-time defaults). The `hot_restart_version` field is allow-listed (envoy-go emits `"disabled"`; Envoy emits the build's hot-restart RPC version). The `node.user_agent_*` and `node.extensions[]` fields are allow-listed identically to ADR-0086's `/config_dump` claim. The `state` field IS byte-equal across both sides post-MarkReady (both emit `"LIVE"`).
+
+(e) Task 13's differential comparator (or equivalent admin-endpoint comparator if `/server_info` gets its own tool) JSON-parses both Envoy's and envoy-go's `/server_info` bodies into `map[string]interface{}` (or `*adminv3.ServerInfo` via protojson `Unmarshal` with `DiscardUnknown: true`) and field-walks with the §13.2 allow-list applied. The parser depends on the field set being exactly the seven top-level fields named here; a future addition (e.g. an `envoy_*` extension field) would require a comparator update.
+
+(f) The `INITIALIZING` enum value is documented in `adminv3.ServerInfo_State` but unreachable in envoy-go's static-bootstrap-only model. Future xDS-bearing phases (none planned in the current roadmap) would need to revisit this — at which point the state coverage would extend to all four values, and this ADR would be amended (not superseded) accordingly.
+

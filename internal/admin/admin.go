@@ -140,13 +140,3 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }
-
-// handleServerInfo is a placeholder; real impl lands in Task 9
-// (internal/admin/serverinfo.go).
-func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
-	body := []byte("server_info: not yet implemented\n")
-	writeAdminHeaders(w, "text/plain; charset=UTF-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusNotImplemented)
-	_, _ = w.Write(body)
-}
