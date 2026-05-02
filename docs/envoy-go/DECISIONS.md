@@ -3162,3 +3162,56 @@ A clause-by-clause supersession ADR is the cleanest way to record the relationsh
 07.2 PLAN Task 9 (the `internal/listener/manager.go` rewrite of `validateFilterChainMatch` → `parseChainSpec`, the removal of the `default_filter_chain` parse-time error, the addition of `listener_filters[]` parsing — the first task that materially realizes the supersession in production code). The dispatch-path consumption of the new `listenerRuntime` fields lands at Task 10.
 
 ---
+
+## ADR-0084: Phase-08 planner-time split (08.1 + 08.2)
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.4 (plan-size gates govern phase scope), D-3.5 (decisions are written).
+
+### Context
+
+Phase 08 (admin + observability completion, BOOTSTRAP §8 row 08) covers two structurally distinct halves: (a) the read-only admin endpoints — `/config_dump`, `/clusters`, `/listeners`, `/server_info` — anchored under `internal/admin/` with read-only consumers of `*bootstrap.Bootstrap` + `*cluster.Manager` + `*listener.Manager` snapshots; and (b) the graceful-drain mutating semantics — `/healthcheck/fail`, `/quitquitquit`, `/drain_listeners` — anchored under cross-cutting drain-state plumbing that mutates listener accept loops + the shared `*Server.draining` state machine. The two halves share no runtime mutation surface; the read-only handlers introduce no new state, while the drain handlers introduce a new state machine that affects every existing listener accept loop.
+
+Per BRAINSTORM §1 + parent SPEC, the BRAINSTORM session split phase 08 along this read-only-vs-mutating axis at brainstorm-close. The combined LoC + task estimate (~1100–1600 LoC + ~28–38 tasks combined per BRAINSTORM §1) crosses BOTH ADR-0045 plan-size-gate thresholds (the ~1500-LoC OR-leg AND the 25-task gate); splitting is mandatory under ADR-0045's discipline. The split landed in the SPEC-drafting commit (master `1f85b07`) via:
+- ROADMAP row `08` flipped `planned → in-progress` with sub-phases column `08.1, 08.2`.
+- Row `08.1` added as `planned` with depends-on `07.2`.
+- Row `08.2` added as `planned` with depends-on `08.1`.
+
+This ADR formalizes the split decision durably; the ROADMAP edit is its concrete on-disk effect. The pattern mirrors ADR-0070's phase-07 split (07.1 + 07.2), ADR-0045's phase-05 + phase-06 splits (05.1 + 05.2 / 06.1 + 06.2), and is anchored at the implementation session's first commit (Task 1 PROGRESS preamble) — the first opportunity to land an ADR after the SPEC commit's ROADMAP edit.
+
+### Decision
+
+Phase 08 is split into two sub-phases at planner-time per ADR-0045's discipline (which documented the 05.1 + 05.2, 06.1 + 06.2, and — as ADR-0070 — the 07.1 + 07.2 splits):
+- **08.1 — Admin read-only endpoints.** Surface: `internal/admin/` (the four new handler files `configdump.go`, `clusters.go`, `listeners.go`, `serverinfo.go` plus shared helpers `headers.go`, `version.go`); read-only consumers of `*bootstrap.Bootstrap` (carrying the new `ConfigPath` field), `*cluster.Manager` (carrying the new `Clusters()` snapshot accessor), and `*listener.Manager` (existing `Listeners()` accessor reused unchanged). Differential surface at end: fixture 0009-admin-config-dump (config_dump byte-equality with allow-list). Lands the read-only admin observability surface that the ADR-0045 / ADR-0063 admin family depends on.
+- **08.2 — Graceful drain.** Surface: cross-cutting — listener accept-loop instrumentation, `*Server.draining` state machine, the three mutating handlers `/healthcheck/fail`, `/quitquitquit`, `/drain_listeners`, plus drain-time-budget plumbing into the connection-shutdown path. Differential surface at end: TBD (08.2 SPEC drafts the fixtures). Lands the graceful-drain semantics that the BOOTSTRAP §8 row 08 canonical title also covers.
+
+Ordering is 08.1-first, 08.2-second because 08.1 ships read-only consumers of existing structures and depends only on phase-07.2 closure, while 08.2 depends on 08.1's `*Server` constructor widening (08.2 reuses the same `*Server` to host the mutating handlers; the `*Server.bs` field added by 08.1 is also the bootstrap reference 08.2's drain state machine consults for `drain_strategy` defaults).
+
+The parent ROADMAP row `08` flips `planned → in-progress` at the SPEC-drafting commit (already landed at master `1f85b07`); it transitions to `done` ONLY at 08.2's phase-done commit (NOT at 08.1's phase-done) — mirroring the 05/05.1/05.2 + 06/06.1/06.2 + 07/07.1/07.2 closure pattern. 08.1's phase-done commit flips row `08.1 → done` AND leaves row `08` at `in-progress`; 08.2's phase-done commit flips BOTH rows `08.2 → done` AND `08 → done` AT THE SAME COMMIT.
+
+### Alternatives considered
+
+(A) Ship phase 08 as one sub-phase. Rejected: the cumulative LoC + task estimate (~1100–1600 LoC, ~28–38 tasks combined) crosses BOTH ADR-0045 plan-size-gate thresholds (the ~1500-LoC OR-leg AND the 25-task gate); splitting is mandatory under ADR-0045's discipline.
+
+(B) Split along a different axis (e.g., per-endpoint sub-phases — one sub-phase per admin endpoint). Rejected: the four read-only endpoints share their handler scaffolding (header helpers, error-shape helpers, the widened `*Server` constructor); splitting per-endpoint would either duplicate the scaffolding across sub-phases or push the scaffolding into a zeroth sub-phase, neither of which improves on the read-only-vs-mutating axis. The mutating handlers (`/healthcheck/fail`, `/quitquitquit`, `/drain_listeners`) genuinely share the drain state machine with each other and have no shared structure with the read-only handlers — so the read-only-vs-mutating axis is the natural cut.
+
+(C) Defer the graceful-drain handlers to a feature-family phase post-08 (e.g., post-09). Rejected: BOOTSTRAP §8 row 08's "admin + observability completion" canonical title covers BOTH the read-only endpoints AND the drain semantics; deferring the drain handlers would leave the BOOTSTRAP MVP trunk's row 08 incomplete on a load-bearing primitive (graceful drain is needed for any production-shaped deployment that expects rolling-restart correctness; xDS phases 09+ depend on the drain semantics for cluster-membership change handling).
+
+### Consequences
+
+(a) The phase 08 ROADMAP row carries a `sub-phases` column listing `08.1, 08.2`; status `in-progress` until BOTH sub-phases land done. The parent row 08 stays `in-progress` through both sub-phase phase-done commits and flips `done` only at 08.2's phase-done — per the parent SPEC §5 closure rule.
+
+(b) 08.1 and 08.2 ship as independent sub-phases, each with their own `SPEC.md` + `PLAN.md` + `PROGRESS.md` + `REVIEW.md` lifecycle artefacts under `docs/envoy-go/phases/08.1-admin-endpoints/` and `docs/envoy-go/phases/08.2-graceful-drain/`. The parent SPEC at `docs/envoy-go/phases/08-admin-completion/SPEC.md` is read-only history once drafted (mirror of the 05 + 06 + 07 parent master SPECs).
+
+(c) The seven 08.1 ADRs (ADR-0084..ADR-0090) are 08.1-scoped; 08.2 will introduce its own ADRs at its own SPEC + PLAN time. Future ADR-0091..onwards may amend either sub-phase without colliding.
+
+(d) The BEHAVIOR_CONTRACT umbrella section for phase 08 is restructured by 08.1 (the first sub-phase to land a phase-done commit under the parent row); 08.2 extends the same umbrella section with its mutating-drain contract. The umbrella reorganization lands at 08.1 Task 15.
+
+(e) Total task count of phases 08.1 + 08.2 is bounded: 08.1 ships at 15 tasks (this PLAN); 08.2 will draft its own task count at its own PLAN time — the BRAINSTORM §1 estimate of ~28–38 tasks combined leaves ~13–23 tasks for 08.2.
+
+### Lands-in-task
+
+08.1 PLAN Task 1 (PROGRESS preamble — first commit of the implementation session; the ROADMAP edit anchored by this ADR already landed at master `1f85b07` per SPEC drafting).
+
+---
