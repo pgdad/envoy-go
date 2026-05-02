@@ -1,0 +1,109 @@
+# Phase 07.1 fixture 0007a-cors — expectations
+#
+# This file is prose, not machine-evaluated (per ADR-0019). The runner
+# enforces the assertions described below via test/differential/runner_test.go's
+# byte-comparison + HTTPExpectations passes.
+#
+# Asserted equivalence (per SPEC §11.2 + ADR-0074):
+#   - per-request status code (4 requests/side)
+#   - per-request response body (4 requests/side; body bytes captured into
+#     the Drive byte stream, %q-quoted for round-trip-safe comparison)
+#   - per-request response CORS-header SET (case-insensitive on name;
+#     value byte-equal). Headers are sorted alphabetically inside the
+#     Drive byte stream so ordering divergence between reference Envoy
+#     (source-order) and envoy-go (alphabetical for net-new keys per
+#     ReconcileOrderedHeaders, see internal/filter/http/types.go) does not
+#     break the gate. Set-equality is what SPEC §11.2 requires; sorting is
+#     the carrier (the alternative — tightening ReconcileOrderedHeaders to
+#     preserve cors-emit order — would break ADR-0071's filter API
+#     stability claim by requiring an EncodeHeadersOrdered callback).
+#
+# Not asserted (allow-listed):
+#   - Date / Server / Content-Length / Content-Type / x-envoy-* /
+#     x-request-id / Transfer-Encoding — per the existing
+#     helpers.PhaseFourHTTPAllowList and the differential allow-list in
+#     BEHAVIOR_CONTRACT.md ## Header allow-list. These headers are NOT
+#     emitted into the Drive byte stream so they are silently allow-listed.
+#
+# Header set-equality fallback (b) per Task 21 prompt:
+#   The cors filter's encode-side actual-request 3-header injection lands
+#   AFTER the original (upstream-supplied) carrier in alphabetical order
+#   on the envoy-go subject side (per
+#   internal/filter/http/types.go ReconcileOrderedHeaders). Reference
+#   Envoy v1.37.2 emits these 3 headers in source-order (allow-origin,
+#   allow-credentials, expose-headers). Byte-equality on the wire is
+#   therefore NOT achievable for the actual-request path; set-equality on
+#   header NAMES + per-name value byte-equality IS achievable and is what
+#   the alphabetical-sort-then-byte-compare in driver.go's encodeProbe
+#   delivers. ADR-0071's filter API stability is preserved (see Task 19
+#   close-out trade-off note in PROGRESS).
+#
+# 4-request workload (deterministic ordering):
+#
+#   1. OPTIONS /permissive
+#      headers: Origin: https://example.test
+#               Access-Control-Request-Method: POST
+#               Access-Control-Request-Headers: x-foo,x-bar
+#      expect: 200; cors filter synthesizes preflight via SendLocalReply
+#              with 6 access-control-* headers (sorted in Drive stream);
+#              empty body.
+#
+#   2. OPTIONS /strict
+#      headers: Origin: https://other.test
+#               Access-Control-Request-Method: POST
+#      expect: 405 (cors filter passes through — origin doesn't match the
+#              /strict route's only.test policy; falls through to the
+#              direct_response 405 on the /strict route); body
+#              "method not allowed\n"; no cors headers (cors no-op +
+#              direct_response doesn't add them).
+#
+#   3. GET /permissive
+#      headers: Origin: https://example.test
+#      expect: 200; cors filter encode-side injects 3 access-control-*
+#              headers (allow-origin, allow-credentials, expose-headers);
+#              body "hello\n".
+#
+#   4. GET /permissive  (no Origin)
+#      expect: 200; cors filter is no-op (no Origin); zero CORS headers;
+#              body "hello\n".
+#
+# Route table (declaration order; first-match-wins; per-route cors policy
+# attached via typed_per_filter_config):
+#
+#   1. match.path: "/permissive"  -> route { cluster: c_backend }
+#                                    typed_per_filter_config[envoy.filters.http.cors] =
+#                                      CorsPolicy{
+#                                        allow_origin_string_match: [exact: "https://example.test"]
+#                                        allow_methods: "GET, POST, OPTIONS"
+#                                        allow_headers: "x-foo, x-bar"
+#                                        max_age:       "600"
+#                                        expose_headers: "x-baz"
+#                                        allow_credentials: true
+#                                      }
+#   2. match.path: "/strict"      -> direct_response 405 "method not allowed\n"
+#                                    typed_per_filter_config[envoy.filters.http.cors] =
+#                                      CorsPolicy{ allow_origin_string_match: [exact: "https://only.test"] }
+#                                    (very-restrictive; no test origin matches)
+#
+# Container concurrency:
+#   --concurrency 1 inherited from phase-02 ADR-0028 via test/differential/harness.go
+#
+# Backend body format:
+#   "hello\n" (6 bytes) returned by 0007a-cors/backends/main.go on every
+#   request regardless of method/path. Single backend instance (no RR).
+#
+# Deviation from PLAN Task 21 brief:
+#   - PLAN brief says request 4 is `GET /strict` no-Origin → 200 + body.
+#     This is incompatible with /strict being direct_response 405. We
+#     instead use `GET /permissive` no-Origin for request 4 — same
+#     coverage (no-Origin actual-request → cors no-op → backend 200) and
+#     preserves the 4-request matrix. SPEC §11.2 probe (d) explicitly
+#     uses the same route as probes (a)/(c), so the deviation aligns
+#     with §11.2 rather than diverges from it.
+#   - PLAN brief says request 2 expects 405 via "router fallthrough".
+#     envoy-go's router (per internal/filter/http/router/router.go) does
+#     NOT 405 OPTIONS by default (no method-restricted routing in phase
+#     04's matchPath/matchPrefix vocabulary; see internal/filter/hcm/route.go).
+#     We instead use direct_response 405 on the /strict route so both
+#     reference Envoy and envoy-go produce 405 deterministically without
+#     depending on undocumented v1.37.2 router-side OPTIONS handling.

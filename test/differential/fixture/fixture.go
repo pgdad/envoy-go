@@ -154,6 +154,14 @@ const (
 	// Introduced by fixture 0006 / ADR-0068. Because the backend is a subprocess,
 	// the runner's in-process accept counter is NOT incremented.
 	HTTPFixedBody BackendKind = 4
+	// HTTPHello is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0007a-cors/backends/main.go on the pre-allocated port.
+	// The backend returns 200 OK with a fixed 6-byte body "hello\n"
+	// regardless of path or method. No TLS. Introduced by fixture 0007a-cors
+	// (Task 21) for actual-request body byte-equivalence on the cors
+	// differential. Because the backend is a subprocess, the runner's
+	// in-process accept counter is NOT incremented.
+	HTTPHello BackendKind = 5
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

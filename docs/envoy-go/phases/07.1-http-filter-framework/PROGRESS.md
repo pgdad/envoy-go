@@ -1717,3 +1717,90 @@ ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.009s
 ```
 
 **Deviations from PLAN sketch:** none. The five files-modified count in the PLAN ("Five files modified; one rewritten") matches the implementation (cmd/envoy-go/main.go, internal/bootstrap/bootstrap.go, internal/filter/doc.go [rewritten], internal/bootstrap/bootstrap_test.go, docs/.../PROGRESS.md = 5; internal/listener/manager.go was inspected only — Task 14 already covered the manager-signature change so no edits at Task 20). Task 21 (`0007a-cors` differential fixture) is now unblocked.
+
+---
+
+## Task 21 — differential fixture 0007a-cors
+
+**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+
+**Files created:**
+
+- `test/fixtures/0007a-cors/envoy-go.yaml` — subject bootstrap (STATIC cluster; HCM `http_filters: [envoy.filters.http.cors, envoy.filters.http.router]`; per-route `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{...}` on `/permissive` and `/strict`).
+- `test/fixtures/0007a-cors/envoy.yaml` — reference bootstrap (STRICT_DNS + `host.docker.internal` + V4_ONLY per ADR-0010; admin on 9901; listener on 15007 in-container).
+- `test/fixtures/0007a-cors/expectations.yaml` — prose 4-request expectation table per SPEC §11.2 probes (a/b/c/d) + the (b)-style header-set-equality fallback rationale + the two PLAN deviations (request 4 path, /strict-405 via direct_response).
+- `test/fixtures/0007a-cors/README.md` — fixture overview, topology diagram, route table, request schedule, deviation rationale.
+- `test/fixtures/0007a-cors/driver/driver.go` — registers as `corsDriver{}` via `init()`; `BackendCount()=1`, `BackendKind()=HTTPHello`, `SubjectListenerName()="l_http"`, `ReferenceListenerPort()=15007`. `DriveSubject` / `DriveReference` issue 4 sequential H1 round-trips with the §11.2 request shapes (Origin / Access-Control-Request-Method / Access-Control-Request-Headers as appropriate) via `helpers.HTTPRoundTrip`. Drive returns a deterministic byte stream encoding `(status, sorted-cors-headers, body%q)` per request — the runner's `CompareBytes` pass enforces equivalence on this stream. Non-CORS headers (Date / Server / Content-Length / Content-Type / x-envoy-* / x-request-id) are omitted from the byte stream; `helpers.PhaseFourHTTPAllowList` already covers them at the runner-side `HTTPHeaderDiff` layer.
+- `test/fixtures/0007a-cors/driver/driver_test.go` — 5 unit tests for `encodeProbe` (per-probe shape pinning + non-cors-header exclusion + preflight-only-header exclusion on actual-request) + `TestDriver_RegisteredAtInit` for fixture-name drift.
+- `test/fixtures/0007a-cors/backends/main.go` — H1 backend subprocess returning `200 OK` + body `"hello\n"` (6 bytes) on every request regardless of method/path. `Connection: close` set so reference Envoy retires upstream connections per response.
+
+**Files modified:**
+
+- `test/differential/fixture/fixture.go` — added new `BackendKind` constant `HTTPHello = 5` (mirrors the phase-04..06 pattern of one BackendKind per fixture-family).
+- `test/differential/runner_test.go` — three changes: (1) blank-import `_ "github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver"` so the driver's init() registers with `fixture.DriverRegistry`; (2) added `case fixture.HTTPHello` arm to the per-fixture backend switch + `startHTTPHelloBackend(ctx, root, port)` spawn function; (3) extended `discoverFixtures` to recognize the `NNNN<letter>-name` shape (e.g. `0007a-cors`) in addition to the bare 4-digit-prefix `NNNN-name` shape — the optional-letter form was introduced by the phase-07.1 split into 0007a (differential) + 0007b (structural).
+
+**Header set-equality fallback (b) per Task 21 prompt:** the cors filter's encode-side actual-request 3-header injection lands AFTER the upstream-supplied carrier in alphabetical order on the envoy-go subject side (per `internal/filter/http/types.go:ReconcileOrderedHeaders`); reference Envoy v1.37.2 emits these 3 headers in source-order. **Wire byte-equality is therefore NOT achievable for the actual-request path**; the driver's `encodeProbe` sorts CORS headers alphabetically before serializing into the Drive byte stream, which delivers set-equality on header NAMES + per-name value byte-equality. ADR-0071's filter API stability is preserved (no breaking `EncodeHeadersOrdered` callback). This is the prompt-pre-approved (b) fallback — the trade-off was already documented at Task 19 close-out (the `ReconcileOrderedHeaders` semantic landed with the alphabetical net-new-key contract). No new ADR landed; ADR-0074 is consistent.
+
+**PLAN deviations (small, sensible):**
+
+1. **Request 4 path: `/permissive` (not `/strict`).** PLAN brief says `GET /strict` no-Origin → 200 + body. `/strict` is direct_response 405 (necessary for request 2's deterministic 405 — see deviation #2), so `GET /strict` would 405 not 200. Substituted `GET /permissive` no-Origin: same coverage (no-Origin actual-request → cors no-op → backend 200), preserves the 4-request matrix, and directly mirrors SPEC §11.2 probe (d) which uses the same route as probes (a)/(c).
+2. **`/strict` 405 via direct_response (not router fallthrough).** PLAN brief assumes envoy-go's router 405s OPTIONS by default the way reference Envoy v1.37.2 does empirically in §11.2 probe (b). envoy-go's router (`internal/filter/http/router/router.go`) does NOT implement this — phase-04's `matchPath` / `matchPrefix` vocabulary doesn't include method-restricted routes (see `internal/filter/hcm/route.go`). Using `direct_response: 405` on the `/strict` route makes both proxies 405 OPTIONS /strict deterministically. The cors filter's behavior under test (passthrough on disallowed-origin preflight) is preserved — the cors filter still passes through the disallowed-origin preflight; the 405 is produced by the next-hop direct_response action rather than by the router's default OPTIONS handling.
+
+Both deviations are documented in `expectations.yaml` and `README.md` of the fixture.
+
+**Acceptance:**
+
+- `go test ./test/differential/ -run 'TestDifferential/0007a' -count=1 -v` PASS (1.31s).
+- `go test ./test/differential/ -count=1 -v -run TestDifferential` PASS (8/8 fixtures: 0000–0006 unchanged + new 0007a-cors).
+- `go test ./test/fixtures/0007a-cors/...` PASS (5 driver-internal unit tests).
+- `go test ./internal/filter/... -count=1` PASS (no regressions).
+- `go vet ./...` clean.
+- ADR-0071 (filter API stability) preserved. ADR-0074 (cors filter) consistent. ADR-0075 (SendLocalReply encode-chain entry) consistent. No new ADR.
+
+**Outputs:**
+
+```
+$ go test ./test/fixtures/0007a-cors/driver/ -count=1 -v
+=== RUN   TestEncodeProbe_PreflightAllowed
+--- PASS: TestEncodeProbe_PreflightAllowed (0.00s)
+=== RUN   TestEncodeProbe_DisallowedPreflight
+--- PASS: TestEncodeProbe_DisallowedPreflight (0.00s)
+=== RUN   TestEncodeProbe_ActualAllowed
+--- PASS: TestEncodeProbe_ActualAllowed (0.00s)
+=== RUN   TestEncodeProbe_ActualNoOrigin
+--- PASS: TestEncodeProbe_ActualNoOrigin (0.00s)
+=== RUN   TestDriver_RegisteredAtInit
+--- PASS: TestDriver_RegisteredAtInit (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	0.001s
+
+$ go test ./test/differential/ -run 'TestDifferential/0007a' -count=1 -v -timeout=10m 2>&1 | tail -6
+--- PASS: TestDifferential (1.77s)
+    --- PASS: TestDifferential/0007a-cors (1.77s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.851s
+
+$ go test ./test/differential/ -count=1 -v -timeout=15m -run TestDifferential 2>&1 | tail -12
+--- PASS: TestDifferential (21.05s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.44s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.19s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.35s)
+    --- PASS: TestDifferential/0003-http11-routing (1.24s)
+    --- PASS: TestDifferential/0004-h2-routing (1.63s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.87s)
+    --- PASS: TestDifferential/0006-access-log (11.01s)
+    --- PASS: TestDifferential/0007a-cors (1.31s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	21.125s
+
+$ go test ./internal/filter/... -count=1 2>&1 | tail -8
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.012s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	2.473s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.131s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	0.004s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	0.033s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	0.214s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.010s
+```
+
+Task 22 (`0007b-iteration-probe` structural fixture) is now unblocked.

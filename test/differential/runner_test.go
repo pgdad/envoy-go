@@ -28,6 +28,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -146,6 +147,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startHTTPFixedBodyBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPHello:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPHelloBackend(ctx, root, port)
 			if err != nil {
 				t.Fatalf("backend[%d] start: %v", i, err)
 			}
@@ -402,9 +421,23 @@ func discoverFixtures(t *testing.T, dir string) []string {
 		if !e.IsDir() {
 			continue
 		}
-		// Fixture names start with a 4-digit prefix (NNNN-name).
-		if len(e.Name()) >= 5 && isNumeric(e.Name()[:4]) && e.Name()[4] == '-' {
-			names = append(names, e.Name())
+		// Fixture names start with a 4-digit prefix optionally followed by a
+		// single lowercase letter, then '-' and the fixture name. Examples:
+		// "0006-access-log" (4-digit only), "0007a-cors" (4-digit + 'a').
+		// The optional-letter form was introduced by phase 07.1's split into
+		// 0007a-cors (differential) + 0007b-iteration-probe (structural).
+		name := e.Name()
+		if len(name) >= 5 && isNumeric(name[:4]) {
+			// Bare 4-digit prefix: "0006-..."
+			if name[4] == '-' {
+				names = append(names, name)
+				continue
+			}
+			// 4-digit + letter prefix: "0007a-..."
+			if len(name) >= 6 && isLowerLetter(name[4]) && name[5] == '-' {
+				names = append(names, name)
+				continue
+			}
 		}
 	}
 	sort.Strings(names)
@@ -418,6 +451,12 @@ func isNumeric(s string) bool {
 		}
 	}
 	return len(s) > 0
+}
+
+// isLowerLetter reports whether b is in 'a'..'z'. Used by discoverFixtures to
+// recognize the phase-07.1 split-prefix shape "NNNN<letter>-name".
+func isLowerLetter(b byte) bool {
+	return b >= 'a' && b <= 'z'
 }
 
 func acceptEchoCounting(ln net.Listener, counter *atomic.Uint64) {
@@ -539,6 +578,26 @@ func startHTTPStatusHeaderBackend(ctx context.Context, repoRoot string, port int
 // accept counter is NOT incremented.
 func startHTTPFixedBodyBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0006-access-log/backends",
+		"--port", fmt.Sprintf("%d", port),
+	)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	return cmd, nil
+}
+
+// startHTTPHelloBackend spawns the fixture-0007a HTTP/1.1 hello backend
+// subprocess on port. The backend returns 200 OK with body "hello\n" (6 bytes)
+// for any request regardless of method or path. No TLS. Introduced for
+// fixture 0007a-cors (Task 21) for actual-request body byte-equivalence on
+// the cors differential. Because the backend is a subprocess, the runner's
+// in-process accept counter is NOT incremented.
+func startHTTPHelloBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0007a-cors/backends",
 		"--port", fmt.Sprintf("%d", port),
 	)
 	cmd.Dir = repoRoot
