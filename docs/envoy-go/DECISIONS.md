@@ -2800,3 +2800,122 @@ None. ADR-0074 is additive; no prior ADR is amended or superseded.
 Task 18 (cors filter) + Tasks 21 (differential fixture 0007a) + the Task-18 prereqs P1 + P2 (wire-byte accounting refactor + encode chain wiring through HCM dispatch). The probe filter `envoy.filters.http.envoy_go_test` lands separately at Task 19 + Task 22; ADR-0074's coverage attribution table for the eight iteration-state modes is documented in Task 19's PROGRESS entry, not in this ADR (which is cors-scoped).
 
 ---
+
+## ADR-0077: Phase-07.2 scope decision (split confirmation + listener-filter MVP boundary)
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.5 (decisions are written) + D-3.6 (every phase is a green build).
+
+### Context
+
+Phase 07 (filter-chain framework, BOOTSTRAP §8 row 07) was split into two sub-phases at planner-time per ADR-0070: 07.1 covered the HTTP filter framework (anchored under `internal/filter/http/` + `internal/filter/hcm/`); 07.2 covers the listener-chain completion (anchored under `internal/listener/`). The two halves share no production-code surface; they share only the BOOTSTRAP §8 row identifier. 07.1 closed at master `424485b` with all seven of its anticipated ADRs (ADR-0070..ADR-0076) landed and ROADMAP row 07.1 → done; the parent ROADMAP row 07 stayed at `in-progress` per ADR-0070's documented closure pattern, awaiting 07.2's phase-done commit.
+
+Per the parent BRAINSTORM §1 and parent SPEC §3, the 07.2 sub-phase's design was first explored in the BRAINSTORM session, then narrowed in the SPEC drafting session (master `bb5f437`). The SPEC drafting session landed three concrete design decisions in addition to the ROADMAP edit (row 07.2 `planned → in-progress`):
+
+1. **Listener-filter framework scope** — a new `internal/listener/listenerfilter/` package with `ListenerFilter` interface, `Pipeline` per-connection state machine, `*ListenerFilterRegistry` (mirroring 07.1 ADR-0072's threaded-constructor LBP-1 discipline), `ChainMatchInputs` carrier, and `Peeker` peek-buffer wrapper.
+
+2. **`FilterChainMatch` algorithm scope** — full 8-dimension algorithm (`destination_port`, `prefix_ranges`, `server_names`, `transport_protocol`, `application_protocols`, `source_type`, `source_prefix_ranges`, `source_ports`) with priority-ordered specificity and `default_filter_chain` no-match fallback. Phase 03's ADR-0033 narrowing (SNI-only) is partially superseded.
+
+3. **Concrete listener filter set** — one filter at MVP: `envoy.filters.listener.tls_inspector` (peeks ClientHello, contributes SNI + ALPN to `ChainMatchInputs`). `original_dst`, `proxy_protocol`, and `http_inspector` are explicitly deferred per Decision F (§5 of the SPEC) on the rationale that the MVP dispatch pipeline is fully exercised by `tls_inspector` alone and adding additional filters later is purely additive (a new package + a new Register call at boot).
+
+The ROADMAP edit landed at the SPEC commit (`bb5f437`); 07.2 PLAN Task 1 (this PROGRESS preamble) is the first opportunity to land the formal scope-decision ADR after the SPEC commit's ROADMAP edit, mirroring ADR-0070's anchoring at 07.1 PLAN Task 1.
+
+### Decision
+
+Phase 07.2 ships the following three deliverables as scoped in SPEC §1 #1, #2, #4, #5, #6:
+
+(a) **Listener-filter framework.** A new `internal/listener/listenerfilter/` package with: the `ListenerFilter` interface (single method `Inspect(ctx, peeker, inputs) (Status, error)` + `OnDestroy()`); a 2-state `ListenerFilterStatus` enum (`Continue`, `StopIteration`); a `ChainMatchInputs` struct holding the eight chain-match dimensions populated incrementally by listener filters and the connection-level facts already known at accept time; a `Peeker` interface + `peekerConn` concrete implementation that buffers reads internally so bytes consumed by the inspector are NOT consumed from the perspective of the downstream filter chain; a `*ListenerFilterRegistry` threaded constructor with Register / Lookup / Freeze (mirrors 07.1's `*HTTPRegistry` per ADR-0072 + 06.1 LBP-1 from ADR-0059); a `Pipeline` per-connection state machine (sequential dispatch — current filter must finish before the next one starts; no async-resume at MVP); and the two-step factory pattern (`ListenerFilterFactory` parses + validates `typed_config` once at HCM-build time; `FilterInstanceFactory` allocates per-connection). The full dispatch-protocol shape is recorded in ADR-0079.
+
+(b) **Full 8-dimension `FilterChainMatch` algorithm.** Phase 03's ADR-0033 narrowed `filter_chain_match` to `server_names` only (errors at parse on any other dimension). 07.2 expands to all eight dimensions (`destination_port`, `prefix_ranges`, `server_names`, `transport_protocol`, `application_protocols`, `source_type`, `source_prefix_ranges`, `source_ports`). The eighth field `direct_source_prefix_ranges` (proxy-protocol original-source-IP) is silently ignored (deferred to a future xDS / proxy-protocol family phase). The chain-match precedence algorithm is priority-ordered specificity (most-specific-wins across the eight dimensions in their documented priority list) with eligibility-then-specificity 2-pass scoring. The algorithm's specifics are recorded in ADR-0081; `default_filter_chain` semantics are recorded in ADR-0080; the ADR-0033 supersession enumeration is recorded in ADR-0078.
+
+(c) **`Listener.default_filter_chain` honored.** Phase 03's listener manager errored at parse if `default_filter_chain` was set; 07.2 honors it as the no-match fallback. An empty-match chain in `filter_chains[]` BEATS `default_filter_chain` when both coexist (per SPEC §11.2 empirical pin). The `default_filter_chain` may carry an independent `transport_socket` (TLS or plaintext) regardless of the `filter_chains[]` entries' TLS posture. Recorded in ADR-0080 (which supersedes ADR-0033 clause 3).
+
+**Explicit deferrals** (out of scope for 07.2; each documented in SPEC §2):
+
+- `envoy.filters.listener.original_dst` — deferred per Decision F. Rationale: the MVP dispatch pipeline is fully exercised by `tls_inspector` alone — `tls_inspector`'s contribution to `ChainMatchInputs.ServerName` + `.ApplicationProtocols` exercises the same dispatch surface `original_dst`'s contribution to `.DestinationPort` would. Future-phase pointer: a dedicated transparent-proxy phase OR the network-filters family.
+- `envoy.filters.listener.proxy_protocol` — deferred. Future-phase pointer: bundled with the `direct_source_prefix_ranges` chain-match dimension.
+- `envoy.filters.listener.http_inspector` — deferred (phase 05.1 ADR-0050 covers TLS H1-vs-H2; plaintext H1-vs-H2 is `http_inspector`'s niche).
+- `direct_source_prefix_ranges` chain-match dimension — silently ignored at parse time. Future-phase pointer: bundled with the proxy-protocol filter phase.
+- xDS LDS dynamic listener filter / chain updates — out of scope.
+- Listener-level access logging on chain-match-miss — silently ignored at parse.
+- Per-listener-filter metrics — none at MVP; 06.1 stats discipline supports adding them later (3-LoC per-call site change).
+
+This ADR mirrors ADR-0070's 07.1 scope-confirmation pattern. **Anchors the ROADMAP edit landed at the SPEC commit (row 07.2 → in-progress)** — which is the 07.1 REVIEW I-3 corrected pattern continued.
+
+### Alternatives considered
+
+(A) Ship `original_dst` alongside `tls_inspector` at MVP. Rejected per Decision F: the dispatch pipeline is filter-agnostic (adding `original_dst` later is purely additive — a new package + a new Register call); `original_dst`'s deployment niche (transparent proxying behind iptables `REDIRECT` rules) is not on the BOOTSTRAP MVP trunk; including it would inflate the 07.2 task count without exercising new dispatch-pipeline code paths.
+
+(B) Defer `default_filter_chain` (keep ADR-0033 clause 3's parse-time error in force at 07.2). Rejected: the parent ROADMAP row 07 explicitly enumerates `Listener.default_filter_chain` honored as one of the closure deliverables; deferring would leave row 07 incomplete on a load-bearing primitive.
+
+(C) Ship the full `direct_source_prefix_ranges` dimension (i.e., honor it without the proxy-protocol filter). Rejected: honoring the dimension without the filter would be a no-op that confuses future readers (the dimension would never match because the source IP at the dispatch layer is always the L4 connection peer, never the proxy-protocol-recovered original source). Bundling the dimension with its enabling filter is cleaner.
+
+### Consequences
+
+(a) The phase 07.2 ROADMAP row carries `status: in-progress` until phase-done; both rows 07.2 and 07 flip to `done` AT THE SAME COMMIT at 07.2's phase-done (per ADR-0070 (b)).
+
+(b) The seven 07.2 ADRs (ADR-0077..ADR-0083) are 07.2-scoped. ADR-0077 + ADR-0083 land at PLAN Task 1 (this PROGRESS preamble; ADR-0083 is paired here per SPEC §10's "lands wherever the integration is documented (likely the PROGRESS preamble; this ADR is mainly explanatory)"); ADR-0079 lands at Task 2; ADR-0082 at Task 4; ADR-0080 + ADR-0081 at Task 5 (paired); ADR-0078 at Task 9. The non-monotonic commit-time mapping (0077, 0083, 0079, 0082, 0080, 0081, 0078) is explicitly permitted per SPEC §10 and per the 05.2 + 06.1 + 06.2 + 07.1 precedents.
+
+(c) The `internal/listener/listenerfilter/` package is the listener-side analog of 07.1's `internal/filter/http/` package: similarly small (~400-600 LoC of new machinery), similarly anchored on a freeze-after-boot threaded registry, similarly using the two-step factory pattern. Future family phases that introduce additional listener filters (e.g., `original_dst`, `proxy_protocol`) extend this package by adding the new filter package + Register call; each such addition lands its own ADR in the phase that needs it.
+
+(d) The differential fixture surface at 07.2 close adds one new fixture (`0008-listener-chain-match`) introducing two new harness primitives: the `MultiListener` interface (a single subject/reference proxy pair binds two distinct listeners) and the `AlternateConfig` interface (a fixture's connection-`i` step swaps to a config variant — used by connection 4's `chain_other` removal). Pre-existing fixtures (0000–0007b) remain green without bootstrap changes (07.2's surface is additive on the listener-side).
+
+### Lands-in-task
+
+07.2 PLAN Task 1 (PROGRESS preamble — first commit of the implementation session; the ROADMAP edit anchored by this ADR already landed at master `bb5f437` per SPEC drafting). Supersedes nothing.
+
+---
+
+## ADR-0083: ADR-0050 disposition (no supersession; `application_protocols` chain-match and HCM-internal ALPN dispatch coexist)
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.5 (durable rationale for the non-supersession decision).
+**Settles:** ADR-0050 (ALPN-driven codec selection inside `Filter.Handle`).
+
+### Context
+
+ADR-0050 (phase 05.1) decided that ALPN-driven codec selection happens **inside `Filter.Handle`** — the HCM type-asserts on `*tls.Conn` and reads `NegotiatedProtocol` to decide whether to dispatch the connection through the H1 codec (`runConnection`) or the H2 codec (`runH2`). The dispatch decision is made post-handshake, INSIDE the chain's terminal filter, and is independent of any listener-side chain-match consultation of ALPN.
+
+Phase 07.2 introduces the `application_protocols` chain-match dimension on `FilterChainMatch` (SPEC §1 #4) — which IS a listener-side consultation of ALPN: at chain-match time (after the listener-filter pipeline runs but before the chain's terminal filter dispatches), the algorithm scores each chain whose `application_protocols` is set against the `ChainMatchInputs.ApplicationProtocols` populated by `tls_inspector`. So the question naturally arises (SPEC §2.5): does 07.2's `application_protocols` chain-match field SUPERSEDE ADR-0050's HCM-internal ALPN dispatch? Should ALPN dispatch move entirely from HCM-internal to chain-match, with ADR-0050 retired?
+
+This ADR settles the question per Decision H (SPEC §14) by recording the orthogonality argument and explicitly preserving ADR-0050.
+
+### Decision
+
+ADR-0050 stays in force. 07.2's `application_protocols` chain-match field and ADR-0050's HCM-internal ALPN dispatch are **orthogonal mechanisms**:
+
+- **ADR-0050's HCM-internal ALPN dispatch governs codec-selection** — which Go-level codec implementation runs the request: phase-04's `runConnection` for H1, phase-05.1's `runH2` for H2. The dispatch happens AFTER the TLS handshake completes, INSIDE the chain's terminal HCM filter, on a `codec_type: AUTO` HCM. It is independent of which chain was selected.
+
+- **07.2's `application_protocols` chain-match governs chain-selection** — which `filter_chain` entry runs at all. The match happens BEFORE the TLS handshake completes (the `tls_inspector` listener filter peeks the ClientHello and populates `ChainMatchInputs.ApplicationProtocols` from the ALPN extension), at chain-match time, on the listener manager's pre-handshake dispatch path. It selects between distinct `filter_chain` entries which may carry distinct codec-type configurations.
+
+The two coexist by construction:
+
+- A user can deploy a single listener with one filter chain whose terminal filter is an HCM with `codec_type: AUTO` → ADR-0050's mechanic fires; 07.2's `application_protocols` is empty (or matches everything); behavior is unchanged from 05.1.
+- A user can deploy a listener with two chains, one matched on `application_protocols: [h2]` (terminal HCM with `codec_type: HTTP2`) + one on `application_protocols: [http/1.1]` (terminal HCM with `codec_type: HTTP1`) → 07.2's chain-match selects between them; ADR-0050's HCM-internal dispatch is a no-op because each chain's HCM has a forced `codec_type` (the `AUTO` branch never fires).
+- A user can deploy a listener with two chains where the chain-match is on a DIFFERENT dimension (e.g., `prefix_ranges`) and BOTH chains' terminal filters are `codec_type: AUTO` HCMs → 07.2's `application_protocols` is empty; chain-selection runs on the prefix-range dimension; codec-selection runs per-chain via ADR-0050 inside each chain's HCM. The two mechanisms operate on independent axes of the dispatch pipeline.
+
+The orthogonality argument is the cleanest representation of the intended dispatch pipeline. The empirical-pin obligation that confirms the dispatch interaction (SPEC §11.4 carry-forward, Decision K) is resolved at 07.2 PLAN Task 16 (the fixture-0008 driver task) — the executor produces the verbatim Envoy v1.37.2 evidence by spawning a TLS bootstrap with `tls_inspector` + multi-chain `application_protocols` matching, captures the per-chain `tcp.tcp_(h2|h1).downstream_cx_total` stats, and pastes the output verbatim into both SPEC §11.4 (replacing the carry-forward placeholder) and `BEHAVIOR_CONTRACT.md ## Listener filters` at Task 17.
+
+### Alternatives considered
+
+(A) Supersede ADR-0050 — move ALPN dispatch entirely into the chain-match algorithm; retire ADR-0050. Rejected: ADR-0050 covers the AUTO-codec case which is independent of chain-match. A single-chain listener with no `application_protocols` still needs ADR-0050's HCM-internal mechanic to choose between H1 and H2 codecs based on the negotiated ALPN. Forcing every TLS deployment to use multi-chain + per-chain forced `codec_type` to get H1/H2 dispatch would be a needless deployment-config blowup AND would require deprecating the `codec_type: AUTO` path entirely.
+
+(B) Supersede ADR-0050 partially — chain-match preferred when both could fire (e.g., a listener with multi-chain `application_protocols` matching AND `codec_type: AUTO` HCMs). Rejected as confusing: the orthogonality is cleaner. With per-chain forced `codec_type`, the `AUTO` branch is a structural no-op (the HCM never exercises the type-assert path because the codec is statically known); with no `application_protocols` matching, ADR-0050 fires per-chain. There's no scenario where both fire on the same connection; partial supersession would create a mental model where the implementer has to reason about precedence between the two mechanisms when in practice the configuration shape determines which fires.
+
+(C) Add an explicit configuration knob (e.g., a listener-level `prefer_chain_match_alpn` bool) to disambiguate. Rejected: the configuration shape already disambiguates (per-chain `codec_type` vs `AUTO`); adding a knob would be redundant and would invite bug reports about "knob set wrong" misconfigurations.
+
+### Consequences
+
+(a) ADR-0050 is preserved verbatim. The HCM-internal ALPN dispatch path (`Filter.Handle` type-asserting on `*tls.Conn`) stays in force unchanged. No code change to `internal/filter/hcm/` is anchored by this ADR.
+
+(b) `BEHAVIOR_CONTRACT.md ## TLS "Scope boundaries"` enumeration is amended at 07.2 phase-done (Task 17): "ALPN-driven filter-chain selection" is REMOVED from the out-of-scope list (07.2 ships it via `application_protocols` chain-match); "ALPN-driven codec selection inside Filter.Handle" REMAINS in scope and is still asserted (this is ADR-0050's purview). The new `## Listener filters` section that lands at Task 17 carries the §11.4 ALPN-dispatch empirical-pin block that resolves the carry-forward at Task 16.
+
+(c) Future xDS phases that revisit ALPN dispatch consult both ADRs — ADR-0050 for the AUTO-codec single-chain case; ADR-0083 for the multi-chain `application_protocols` case. Should a future xDS / matcher API phase introduce a unified-matcher API that absorbs both cases, that phase's ADR would explicitly supersede both — but until then, the orthogonality is the durable contract.
+
+### Lands-in-task
+
+07.2 PLAN Task 1 (PROGRESS preamble alongside ADR-0077; this ADR is mainly explanatory and doesn't anchor a code change — pairing it with ADR-0077 at T1 keeps the PROGRESS preamble's ADR list cohesive). Settles ADR-0050; supersedes nothing.
+
+---
