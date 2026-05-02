@@ -51,6 +51,20 @@ import (
 	// or excluded from a future build. Per ADR-0016 amendment policy this
 	// addition is documented in PROGRESS, not as a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
+
+	// Phase 07.2 (Task 11) registers the tls_inspector listener-filter
+	// extension proto so protojson round-trips bootstraps carrying
+	// `listener_filters: [{name: envoy.filters.listener.tls_inspector,
+	// typed_config: {"@type": ...TlsInspector}}]` (ADR-0079). Without this
+	// blank-import protojson errors with "type not registered" at boot
+	// because the bootstrap parser walks listener_filters[].typed_config
+	// generically. Task 10's accept-loop refactor removed the implicit
+	// crypto/tls.GetConfigForClient SNI extraction, so subject bootstraps
+	// for SNI-indexed filter chains MUST declare tls_inspector explicitly
+	// (mirroring what reference Envoy already required). Per ADR-0016
+	// amendment policy this addition is documented in PROGRESS, not as a
+	// new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"

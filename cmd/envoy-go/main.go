@@ -27,6 +27,8 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/envoygotest"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/listener"
+	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
+	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
 )
 
 func main() {
@@ -100,11 +102,24 @@ func main() {
 	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
 	httpReg.Freeze()
 
-	// Task 11 will populate a *listenerfilter.ListenerFilterRegistry with
-	// the boot-registered filters (tls_inspector); for now thread nil. A nil
-	// registry is fine as long as no listener configures listener_filters[]
-	// (the manager errors at parse time otherwise).
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, nil)
+	// Phase 07.2 Task 11 boot wiring: build the
+	// *listenerfilter.ListenerFilterRegistry and register the one listener
+	// filter envoy-go ships at 07.2 — tls_inspector (extracts SNI / ALPN /
+	// transport_protocol from the ClientHello so the unified pre-handshake
+	// dispatch path can do 8-dimension chain selection per ADR-0079 +
+	// ADR-0081). Per ADR-0072 / ADR-0079 the registry is freeze-after-boot:
+	// Freeze MUST be invoked after all Register calls and before the listener
+	// manager is constructed (the per-listener parser inside
+	// NewManagerWithBaseDirAndAllowH2C resolves listener_filters[] type_urls
+	// against the frozen registry). Task 10's accept-loop refactor deleted the
+	// crypto/tls.GetConfigForClient SNI shortcut, so a bootstrap with
+	// SNI-indexed filter chains now requires explicit
+	// `listener_filters: [tls_inspector]` to extract SNI.
+	lfReg := listenerfilter.NewListenerFilterRegistry()
+	lfReg.Register(tls_inspector.TypeURL, tls_inspector.New)
+	lfReg.Freeze()
+
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

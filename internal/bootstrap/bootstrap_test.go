@@ -537,6 +537,82 @@ static_resources:
 	}
 }
 
+// TestBootstrap_RoundTrips_TLSInspectorListenerFilter exercises the
+// phase-07.2 (Task 11) blank-import of
+// `envoy/extensions/filters/listener/tls_inspector/v3`: a minimal bootstrap
+// carrying `listener_filters: [{name: envoy.filters.listener.tls_inspector,
+// typed_config: TlsInspector}]` must load cleanly via Load (no protojson
+// "type not registered" error) AND survive a protojson.Marshal round-trip.
+//
+// Without the tls_inspector v3 blank import, protojson would reject the
+// TlsInspector Any at unmarshal time (ADR-0016). The shape is the listener
+// filter declaration the unified pre-handshake dispatch path (ADR-0079)
+// requires for SNI extraction, mirroring fixture-0002 / fixture-0008.
+func TestBootstrap_RoundTrips_TLSInspectorListenerFilter(t *testing.T) {
+	yamlSrc := `
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_tls
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+      filter_chains:
+        - filter_chain_match:
+            server_names: ["alpha.example.test"]
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls
+                cluster: c_alpha
+  clusters:
+    - name: c_alpha
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_alpha
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }
+`
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	listeners := bs.Proto.GetStaticResources().GetListeners()
+	if got := len(listeners); got != 1 {
+		t.Fatalf("listeners: got %d, want 1", got)
+	}
+	lfs := listeners[0].GetListenerFilters()
+	if got := len(lfs); got != 1 {
+		t.Fatalf("listener_filters: got %d, want 1", got)
+	}
+	if got, want := lfs[0].GetName(), "envoy.filters.listener.tls_inspector"; got != want {
+		t.Errorf("listener_filters[0].name: got %q, want %q", got, want)
+	}
+	tc := lfs[0].GetTypedConfig()
+	if tc == nil {
+		t.Fatal("listener_filters[0].typed_config: nil")
+	}
+	const want = "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"
+	if got := tc.GetTypeUrl(); got != want {
+		t.Errorf("listener_filters[0].typed_config.@type: got %q, want %q", got, want)
+	}
+	// Round-trip via protojson — would error if the TlsInspector proto
+	// descriptor were unregistered.
+	if _, err := protojson.Marshal(bs.Proto); err != nil {
+		t.Fatalf("protojson.Marshal: %v", err)
+	}
+}
+
 // TestBootstrap_AccessLog_TwoFileEntries verifies that two file-type entries
 // are both parsed and returned in registration order.
 func TestBootstrap_AccessLog_TwoFileEntries(t *testing.T) {

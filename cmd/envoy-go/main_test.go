@@ -422,6 +422,98 @@ static_resources:
 	}
 }
 
+// TestEnvoyGoBinary_TLSInspectorBootWiring is the phase-07.2 (Task 11)
+// boot-wiring smoke test: it boots the binary on a bootstrap that declares
+// `listener_filters: [{name: envoy.filters.listener.tls_inspector,
+// typed_config: TlsInspector}]` and asserts the binary reaches the ready
+// sentinel without error. This exercises the full Task-11 boot wiring:
+//
+//  1. The internal/bootstrap blank-import of tls_inspector v3 (without it,
+//     protojson would error "type not registered" at parse time);
+//  2. main.go allocating a *listenerfilter.ListenerFilterRegistry,
+//     registering tls_inspector.New under tls_inspector.TypeURL, calling
+//     Freeze(), and threading it into NewManagerWithBaseDirAndAllowH2C
+//     (without it, the per-listener parser would error
+//     "listener_filters[]: registry is nil but listener_filters is non-empty"
+//     or fail to resolve the type_url);
+//  3. The frozen registry's Lookup path resolving tls_inspector at
+//     listener-build time (without it, the per-listener parser would error
+//     "unknown listener filter type_url").
+//
+// The bootstrap is plaintext-on-loopback (no TLS handshake exercised — the
+// test asserts only that boot succeeds). End-to-end SNI dispatch is covered
+// by fixture-0002 and the unit-test integration_test.go (Task 12).
+//
+// Pre-Task-11, with main.go threading nil for lfRegistry, the listener
+// manager's parseListenerFilters would error and main() would log.Fatalf
+// before emitting the ready sentinel; waitForReadySentinels would time out.
+func TestEnvoyGoBinary_TLSInspectorBootWiring(t *testing.T) {
+	listenerPort := freeTCPPort(t)
+	adminPort := freeTCPPort(t)
+
+	bin := buildBinaryOrSkip(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "envoy-go.yaml")
+	cfg := fmt.Sprintf(`
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+static_resources:
+  listeners:
+    - name: l_tls
+      address:
+        socket_address: { address: 127.0.0.1, port_value: %d }
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls
+                cluster: c_unused
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+`, adminPort, listenerPort)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+
+	// Capture stderr so a boot failure surfaces in the test log.
+	var stderrBuf bytes.Buffer
+	go func() { _, _ = io.Copy(&stderrBuf, stderr) }()
+
+	addrs := waitForReadySentinels(t, stdout, []string{"l_tls"}, 15*time.Second)
+	if addrs["l_tls"] == "" {
+		t.Fatalf("missing l_tls ready sentinel; stderr:\n%s", stderrBuf.String())
+	}
+}
+
 // TestEnvoyGoBinary_AccessLogSmoke boots the binary with an HCM listener that
 // has a file access_log configured, makes one HTTP/1.1 request, and asserts
 // that the access-log file is non-empty after the process exits (write-on-close

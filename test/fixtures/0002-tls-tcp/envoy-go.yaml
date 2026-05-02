@@ -5,14 +5,18 @@
 # for {{BACKEND_PORT_N}}, {{SUBJECT_LISTENER_PORT}}, and {{ADMIN_PORT}}.
 #
 # Shape mirrors envoy.yaml with these divergences:
-#   - No listener_filters: envoy-go reads SNI natively via crypto/tls
-#     GetConfigForClient (no tls_inspector needed or parsed).
 #   - Cluster type: STATIC (ADR-0027) — subject uses 127.0.0.1 not host.docker.internal.
 #   - Admin address: 127.0.0.1:{{ADMIN_PORT}} (randomly-allocated per run).
 #   - Plaintext upstream clusters (same as reference).
 #
+# Phase 07.2 update (ADR-0079): the subject yaml now declares the same
+# tls_inspector listener filter as reference Envoy. Phase 07.2 Task 10 deleted
+# the crypto/tls.GetConfigForClient SNI shortcut; the unified pre-handshake
+# dispatch path requires tls_inspector to populate ChainMatchInputs.ServerName
+# before filter-chain selection.
+#
 # See also: ADR-0010 (V4_ONLY), ADR-0027 (STATIC vs STRICT_DNS), ADR-0028
-# (--concurrency 1 inheritance).
+# (--concurrency 1 inheritance), ADR-0079 (listener-filter dispatch protocol).
 
 node: { id: envoy-go-subject-0002, cluster: envoy-go-differential }
 
@@ -25,6 +29,10 @@ static_resources:
     - name: l_tls
       address:
         socket_address: { address: 127.0.0.1, port_value: 0 }   # subjListenerPort — driver-rendered
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
       filter_chains:
         # --- alpha chain ---
         - filter_chain_match:

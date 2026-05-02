@@ -186,13 +186,20 @@ func (*tlsDriver) ReferenceBootstrap(backendPorts []int) string {
 }
 
 // SubjectConfig returns the envoy-go bootstrap YAML with:
+//   - tls_inspector listener filter (required for SNI-based filter_chain_match
+//     under the phase-07.2 unified pre-handshake dispatch path per ADR-0079;
+//     reference Envoy already required this and the subject now matches)
 //   - 2 SNI-indexed downstream TLS filter chains
 //   - 2 STATIC clusters (c_alpha, c_beta) reaching backends via 127.0.0.1
 //     (ADR-0027), plaintext upstream
 //
-// No tls_inspector listener filter is needed: envoy-go's SNI dispatch uses
-// Go's crypto/tls GetConfigForClient callback which reads the SNI directly from
-// the ClientHello.
+// Phase 07.2 Task 10 deleted the legacy crypto/tls.GetConfigForClient SNI
+// shortcut: chain selection now happens BEFORE the TLS handshake against
+// inputs (server_name / application_protocols / transport_protocol)
+// populated by the listener-filter pipeline. Without an explicit
+// tls_inspector entry the unified path cannot extract SNI and TLS chains
+// would never match, regressing fixture-0002. This subject yaml therefore
+// declares tls_inspector identically to the reference yaml.
 func (*tlsDriver) SubjectConfig(_, subjListenerPort int, backendPorts []int, subjAdminPort int) string {
 	if len(backendPorts) != 6 {
 		panic(fmt.Sprintf("0002: expected 6 backend ports, got %d", len(backendPorts)))
@@ -206,11 +213,12 @@ func (*tlsDriver) SubjectConfig(_, subjListenerPort int, backendPorts []int, sub
 	)
 }
 
-// buildBootstrap assembles the full YAML bootstrap string. The reference config
-// includes a tls_inspector listener_filter (Envoy needs it to read SNI before
-// filter_chain_match); the subject config omits it (envoy-go reads SNI via
-// crypto/tls directly). The isReference flag selects which set of sections
-// to include — here the node stanza being empty distinguishes the two.
+// buildBootstrap assembles the full YAML bootstrap string. Both reference
+// and subject configs declare a `listener_filters: [tls_inspector]` entry
+// (per phase-07.2 ADR-0079 the subject's unified pre-handshake dispatch path
+// requires explicit tls_inspector for SNI extraction; reference Envoy has
+// always required it). The yaml shapes are identical modulo the node stanza,
+// admin/listener addresses, cluster type, and dns_lookup_family.
 func buildBootstrap(
 	nodeStanza string,
 	adminAddr string, adminPort int,
@@ -235,19 +243,17 @@ func buildBootstrap(
 		[3]int{backendPorts[3], backendPorts[4], backendPorts[5]},
 	)
 
-	// Reference Envoy requires tls_inspector to detect SNI before filter_chain
-	// selection. The subject (envoy-go) reads SNI natively via crypto/tls and
-	// does not parse listener_filters at all — omitting it is safe and avoids a
-	// "unsupported listener_filter" parse error.
-	listenerFiltersSection := ""
-	if nodeStanza == "" {
-		// Reference path: Envoy needs tls_inspector.
-		listenerFiltersSection = `      listener_filters:
+	// Both reference and subject require tls_inspector to detect SNI before
+	// filter_chain selection. Reference Envoy has always required it; phase
+	// 07.2 (ADR-0079) replaced the subject's crypto/tls.GetConfigForClient
+	// SNI shortcut with a unified pre-handshake dispatch that extracts SNI
+	// via the listener_filters[] pipeline, so the subject yaml now declares
+	// tls_inspector identically.
+	listenerFiltersSection := `      listener_filters:
         - name: envoy.filters.listener.tls_inspector
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
 `
-	}
 
 	return fmt.Sprintf(`%vadmin:
   address:

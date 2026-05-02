@@ -429,3 +429,45 @@ $ for fx in 0000 0001 0003 0004 0005 0006 0007a 0007b; do go test -count=1 -v ./
 $ go test -count=1 -v ./test/differential/ -run "TestDifferential/0002"
 [FAIL — handshake EOF; expected boundary effect, resolved at Task 11 per PLAN line 2272]
 ```
+
+## Task 11 — cmd/envoy-go/main.go + internal/bootstrap/bootstrap.go (boot wiring)
+
+**Commits:** TBD — this task's commit
+**Notes:** Wired the boot-time `*listenerfilter.ListenerFilterRegistry` per ADR-0079: `main()` now allocates the registry, registers `tls_inspector.New` under `tls_inspector.TypeURL`, calls `Freeze()`, and threads the frozen registry into `listener.NewManagerWithBaseDirAndAllowH2C` (replacing the Task-9 `nil` placeholder). Two new imports landed in `cmd/envoy-go/main.go`: `internal/listener/listenerfilter` and `internal/listener/listenerfilter/tls_inspector`. Added one new blank-import to `internal/bootstrap/bootstrap.go`: `envoy/extensions/filters/listener/tls_inspector/v3` — without it `protojson` would error "type not registered" when parsing a bootstrap that declares `listener_filters: [{name: envoy.filters.listener.tls_inspector, typed_config: {"@type": ...TlsInspector}}]`. Per ADR-0016 amendment policy this addition is documented in PROGRESS, not as a new ADR (mirrors phase 04 / 05.2 / 06.2 / 07.1 blank-import precedent). New tests: `TestBootstrap_RoundTrips_TLSInspectorListenerFilter` (round-trips a minimal bootstrap carrying a `tls_inspector v3` typed_config through `Load` + `protojson.Marshal`; would error pre-blank-import) and `TestEnvoyGoBinary_TLSInspectorBootWiring` (boots the binary on a bootstrap declaring `listener_filters: [tls_inspector]` and asserts the `l_tls` ready sentinel emits — exercises the full Task-11 wiring chain end-to-end: blank-import + Registry alloc + Register + Freeze + threading + listener-build-time Lookup).
+
+**Task-10 boundary-effect resolution (authorized PLAN deviation per ADR-0017 small-mechanical-fixes):** Task 10's accept-loop refactor deleted `crypto/tls.GetConfigForClient` so the unified pre-handshake dispatch path requires an explicit `tls_inspector` listener filter for SNI extraction. This caused fixture-0002-tls-tcp to regress (RED at Task-10 HEAD: TLS handshake EOF — the subject yaml had no `listener_filters[]` and SNI was never populated). Updated `test/fixtures/0002-tls-tcp/driver/driver.go`: the `buildBootstrap` helper now emits the same `listener_filters: [tls_inspector]` block for both reference and subject (previously emitted only for the reference path); the subject's `SubjectConfig` doc comment + the documentation-only `test/fixtures/0002-tls-tcp/envoy-go.yaml` were updated to remove the stale "envoy-go reads SNI natively via crypto/tls GetConfigForClient (no tls_inspector needed or parsed)" comment and replace it with a phase-07.2 ADR-0079 reference. PLAN.md (lines 2215-2274) does not explicitly mention this fixture-0002 update; it is the resolution of the boundary effect documented in the Task-10 PROGRESS entry's "Differential note" and authorized by PLAN line 2272 ("pre-existing fixtures must be re-runnable from THIS commit") plus ADR-0017's small-mechanical-fixes carve-out.
+**Outputs:**
+```
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.895s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.019s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.080s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.067s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.068s
+[every other package PASS — full output omitted]
+$ go test -count=1 -v ./test/differential/ -run 'TestDifferential/(0000|0001|0002|0003|0004|0005|0006|0007)'
+--- PASS: TestDifferential (22.00s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.54s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.29s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.26s)
+    --- PASS: TestDifferential/0003-http11-routing (1.19s)
+    --- PASS: TestDifferential/0004-h2-routing (1.76s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.93s)
+    --- PASS: TestDifferential/0006-access-log (10.91s)
+    --- PASS: TestDifferential/0007a-cors (1.35s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.77s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	22.082s
+$ grep -nE 'lfReg|lfRegistry' cmd/envoy-go/main.go
+118:	lfReg := listenerfilter.NewListenerFilterRegistry()
+119:	lfReg.Register(tls_inspector.TypeURL, tls_inspector.New)
+120:	lfReg.Freeze()
+122:	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg)
+$ grep -n tls_inspector internal/bootstrap/bootstrap.go
+55:	// Phase 07.2 (Task 11) registers the tls_inspector listener-filter
+57:	// `listener_filters: [{name: envoy.filters.listener.tls_inspector,
+63:	// for SNI-indexed filter chains MUST declare tls_inspector explicitly
+67:	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
+```
