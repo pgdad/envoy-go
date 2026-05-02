@@ -62,3 +62,37 @@ ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.002s
 $ go vet ./internal/listener/listenerfilter/...
 $ golangci-lint run ./internal/listener/listenerfilter/...
 ```
+
+## Task 3 — internal/listener/listenerfilter/registry.go
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/listener/listenerfilter/registry.go` (~57 LoC: `ListenerFilterRegistry struct{ mu sync.RWMutex; byTypeURL map[string]ListenerFilterFactory; frozen atomic.Bool }`, `NewListenerFilterRegistry()` empty-allocator, `Register(typeURL, f)` with frozen-guard + duplicate-guard panics, `Lookup(typeURL)` RLock-protected, `Freeze()` idempotent atomic.Bool.Store(true)) and `internal/listener/listenerfilter/registry_test.go` (~75 LoC, 5 tests + `dummyFactory` helper). Tests cover register+lookup happy path + absent-key ok=false branch (`TestRegistryRegisterAndLookup`), duplicate-Register panic (`TestRegistryDuplicateRegisterPanics`), post-Freeze Register panic (`TestRegistryFreezeBlocksRegister`), Freeze idempotency over 3 calls (`TestRegistryFreezeIsIdempotent`), and 100-goroutine concurrent Lookup under `-race` (`TestRegistryConcurrentLookup`). No new ADR for Task 3 — follows ADR-0079's pre-landed registry shape and mirrors 07.1's `internal/filter/http/registry.go` HTTPRegistry (ADR-0072) + 06.1's `*stats.Registry` LBP-1 (ADR-0059) freeze-after-boot discipline. Panic messages match PLAN exactly: `listenerfilter: registry frozen: cannot register %q post-boot` and `listenerfilter: duplicate factory for %q`. TDD discipline observed: registry_test.go was written first; tests confirmed failing (build error: `undefined: NewListenerFilterRegistry` x5); then registry.go landed; tests confirmed passing under `-race`. Project-precedent `//nolint:revive` on the `ListenerFilterRegistry` stuttering type name cites ADR-0079 (mirrors `internal/filter/http/registry.go`'s `HTTPRegistry` ADR-0072 annotation).
+**Outputs:**
+```
+$ go test ./internal/listener/listenerfilter/... 2>&1 | head -30
+# github.com/esalaine/envoy-go/internal/listener/listenerfilter [github.com/esalaine/envoy-go/internal/listener/listenerfilter.test]
+internal/listener/listenerfilter/registry_test.go:15:7: undefined: NewListenerFilterRegistry
+internal/listener/listenerfilter/registry_test.go:31:7: undefined: NewListenerFilterRegistry
+internal/listener/listenerfilter/registry_test.go:43:7: undefined: NewListenerFilterRegistry
+internal/listener/listenerfilter/registry_test.go:56:7: undefined: NewListenerFilterRegistry
+internal/listener/listenerfilter/registry_test.go:63:7: undefined: NewListenerFilterRegistry
+FAIL	github.com/esalaine/envoy-go/internal/listener/listenerfilter [build failed]
+FAIL
+$ go test -race -run 'TestRegistry' ./internal/listener/listenerfilter/... -v
+=== RUN   TestRegistryRegisterAndLookup
+--- PASS: TestRegistryRegisterAndLookup (0.00s)
+=== RUN   TestRegistryDuplicateRegisterPanics
+--- PASS: TestRegistryDuplicateRegisterPanics (0.00s)
+=== RUN   TestRegistryFreezeBlocksRegister
+--- PASS: TestRegistryFreezeBlocksRegister (0.00s)
+=== RUN   TestRegistryFreezeIsIdempotent
+--- PASS: TestRegistryFreezeIsIdempotent (0.00s)
+=== RUN   TestRegistryConcurrentLookup
+--- PASS: TestRegistryConcurrentLookup (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.007s
+$ go test -race ./internal/listener/listenerfilter/...
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.008s
+$ go vet ./internal/listener/listenerfilter/...
+$ golangci-lint run ./internal/listener/listenerfilter/...
+```
