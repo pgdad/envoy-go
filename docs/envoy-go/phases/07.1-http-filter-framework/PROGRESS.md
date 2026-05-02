@@ -1544,3 +1544,117 @@ ok  	github.com/esalaine/envoy-go/test/differential	20.849s
 - `go vet ./...` clean.
 - `go test ./internal/filter/hcm/ -count=1` PASS.
 - `go test ./internal/filter/http/cors/ -count=1` PASS.
+
+## Task 19 — envoygotest probe filter [bundled with Task 18 prerequisite I-3]
+
+**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+**Notes:** Single bundled commit per task brief option (ii) — both Piece A (Task 18 deferred I-3 prerequisite: `ActionResponse.Headers http.Header → OrderedHeaders` + dual-write-helper collapse) and Piece B (Task 19 `envoygotest` probe filter) co-resident in the same task surface. PROGRESS entry covers both pieces.
+
+### Piece A — Task 18 prerequisite I-3 close-out: ActionResponse.Headers → OrderedHeaders
+
+**Motivation.** The Task 18 review-loop deferred I-3 noted ~80 LoC of helper duplication: `writeH1Reply` (action-driven path on `http.Header`) vs `writeH1ReplyOrdered` (SendLocalReply path on `OrderedHeaders`); same dual-shape on H2 with `writeH2Reply` / `writeH2ReplyOrdered`. The dual-shape bridged via `ActionResponse.Headers http.Header` (action-driven) and `chain.LocalReplyResponse() OrderedHeaders` (SendLocalReply). This is messy and would force a re-touch at Task 21 fixture-authoring time when `0007a-cors`'s actual-request differential probe lands. Closing I-3 now collapses the dual-shape to a single ordered carrier surface; Task 21 becomes pure fixture-authoring.
+
+**Files changed (Piece A):**
+- `internal/filter/http/types.go` — added exported `ReconcileOrderedHeaders(original OrderedHeaders, merged http.Header) OrderedHeaders` (was lowercase `reconcileOrderedHeaders` private to chain.go) + `OrderedHeadersFromHTTPHeader(h http.Header) OrderedHeaders` (alphabetical-by-canonical-name projection for upstream-response carrier).
+- `internal/filter/http/chain.go` — collapsed `reconcileOrderedHeaders` + `sortStrings` private helpers; the chain's `beginLocalReply` now thin-wraps the exported `ReconcileOrderedHeaders`. Added `RunDecodeTrailers(ctx, trailers)` (mirror of `RunEncodeTrailers`) — required by envoygotest's `stop-trailers` mode (Piece B). The chain framework had `RunEncodeTrailers` since Task 7 but no decode-side trailer iteration; HCM dispatch does not yet drive decode-trailers (H1 chunked T-E gated, H2 observe-and-discard per ADR-0058) so this is exercised by chain-direct tests only.
+- `internal/filter/http/router/router.go` — `ActionResponse.Headers` field type changed `http.Header` → `envoyhttp.OrderedHeaders`. `localReplyHeaders(bodyLen)` now returns `OrderedHeaders` literal preserving four-header insertion order (Content-Type, Content-Length, Server, Date). `doH1ClusterAction`'s upstream-response projection uses `envoyhttp.OrderedHeadersFromHTTPHeader(resp.Header)` (alphabetical-by-canonical-name; Go map iteration is non-deterministic so wire-order from the upstream is LOST — alphabetical is the deterministic substitute).
+- `internal/filter/http/router/router_h2.go` — `h2LocalReplyHeaders()` returns `OrderedHeaders` literal (Content-Type, Date, Server). `doH2ClusterAction`'s response-header projection iterates `resp.Headers` ([]hpack.HeaderField, wire-order-preserving from the H2 codec) into `OrderedHeaders` directly — H2 wire-order survives.
+- `internal/filter/hcm/codec.go` — collapsed `writeH1Reply` + `writeH1ReplyOrdered` into single `writeH1Reply(w, status, headers OrderedHeaders, body)`. Old `http.Header`-flavored helper deleted; the unified ordered helper is the only wire-emit path on H1 for chain-mediated responses (the locally-synthesized parse-error 400 / 417 / 501 / 404 / 500 paths still use `writeStatusReply` which is byte-preserved from phase-04).
+- `internal/filter/hcm/h2dispatch.go` — collapsed `writeH2Reply` + `writeH2ReplyOrdered` similarly. Added an `OrderedHeaders → http.Header → ReconcileOrderedHeaders` round-trip around `RunEncodeHeaders` on both action-driven branches (matched-route + no-match-404). The encode chain still operates on `http.Header` (per ADR-0071 filter API stability — `EncodeHeaders(headers http.Header, ...)` unchanged); the reconcile preserves caller insertion order across encode-chain mutations.
+- `internal/filter/hcm/connection.go` — same round-trip pattern around `RunEncodeHeaders` + collapsed `writeH1Reply` call.
+- `internal/filter/hcm/actions.go` — `directResponseAction.body()` returns `OrderedHeaders` (was `http.Header`). The four headers (Content-Type, Content-Length, Server, Date) land on the wire in their literal-order via the unified ordered helper. `writeH2` still uses `.Get` accessors on the ordered carrier (the carrier's `Get` method mirrors `http.Header.Get` semantics).
+- `internal/filter/hcm/chain_integration_test.go` — added `TestChainIntegration_H1_CorsActualRequest_AppendsThreeHeadersAfterUpstream` that drives the action-driven-with-cors-encode-mutation path through `dispatchRequest` and asserts the wire-order carries the four upstream/synth headers FIRST (in carrier order) and the cors three (Allow-Credentials, Allow-Origin, Expose-Headers) AFTER (in alphabetical order). This pins the reconcile's net-new-keys behavior.
+
+**Encode-side filter API discipline.** The encode chain stays on `http.Header` (no breaking change for filter authors). `EncodeHeaders(headers http.Header, endStream bool)` mutates via `Set/Add/Del` as before. HCM dispatch projects `resp.Headers.ToHTTPHeader()` → `http.Header` for `RunEncodeHeaders`; reconciles via `ReconcileOrderedHeaders(originalCarrier, postEncodeMap)` after iteration completes. Net-new keys (cors's three encode-side `Set`s; framework defaults like Content-Length / Content-Type) sort alphabetically AFTER the original carrier — deterministic but does NOT preserve cors's intra-encode-Set order.
+
+**Trade-off documented.** Reference Envoy's actual-request 3-header order on the wire is whatever cors's encode-side `Set` calls produce, in source-code order (Allow-Origin, Allow-Credentials, Expose-Headers per cors.go's encode block). Envoy-go's reconcile sorts alphabetically — Allow-Credentials, Allow-Origin, Expose-Headers. Byte-equality with reference Envoy on the actual-request path is therefore APPROXIMATE not EXACT. To get byte-exact match, cors itself would need to use a hypothetical `EncodeHeadersOrdered` callback (out of scope for this task; would break the ADR-0071 filter API stability invariant). Task 21's `0007a-cors` differential fixture is expected to test this trade-off; if exact match is required, the fix shape is a follow-up to Task 21 within Phase 07.1's review-loop.
+
+**Upstream H1 response headers — wire-order LOST.** Go's `net/http.Response.Header` is a `map[string][]string`; iteration order is non-deterministic. Reference Envoy preserves upstream wire order on actual-request responses; envoy-go's `OrderedHeadersFromHTTPHeader` uses alphabetical-by-canonical-name as the deterministic substitute. This is an inherent Go stdlib limitation — fixing it requires a custom HTTP/1.1 response parser that captures wire-order, which is Phase 11+ territory at the earliest.
+
+### Piece B — envoygotest probe filter
+
+**Files created (Piece B):**
+- `internal/filter/http/envoygotest/doc.go` — package doc covering purpose, mode dispatch (8 modes), per-route count echo, and iteration-protocol coverage matrix.
+- `internal/filter/http/envoygotest/filter.go` — `New` factory + `filter` struct + per-mode dispatch via explicit-switch (Decision §3.7). 8 modes wired: `continue`, `stop-and-resume-headers`, `stop-and-buffer-data`, `local-reply-decode`, `local-reply-decode-data`, `modify-encode-headers`, `modify-encode-data`, `stop-trailers`. Async-resume modes spawn a 10ms-delay goroutine that calls `dcb.ContinueDecoding`; `local-reply-*` modes call `dcb.SendLocalReply(418, "i am a teapot\n", nil)`. Per-route `count` echoed into `x-envoy-go-test-route-count: <N>` on encodeHeaders for ANY mode (not gated on mode); the helper `routeCount` reads via protoreflect so both the typed wrapper (`*EnvoyGoTestPerRoute`) and a raw `*dynamicpb.Message` work uniformly (the latter is what `BuildPerRouteConfig`'s `anypb.UnmarshalNew` produces via the global proto registry's NewFunc).
+- `internal/filter/http/envoygotest/filter_test.go` — 10 tests: 8 mode-specific (one per §7.3 mode), `TestEnvoyGoTest_PerRouteCountConfig`, `TestEnvoyGoTest_FactoryRoundTrip`. Async-resume modes assert wall-clock elapse ≥ 5ms (a generous lower bound that demonstrates parkDecode held the goroutine without flake-prone exact-timing).
+- `internal/filter/http/envoygotest/proto/envoygotest.pb.go` — hand-rolled proto schema. Two messages: `EnvoyGoTest{mode_default string}` + `EnvoyGoTestPerRoute{count int32}`. The descriptor is built at package-init via `descriptorpb.FileDescriptorProto` → `protodesc.NewFile`; the typed wrappers embed `*dynamicpb.Message` and provide typed Getters/Setters. Both message types are registered in `protoregistry.GlobalTypes` via `dynamicpb.NewMessageType` so `anypb.Any.UnmarshalNew` resolves the type URLs without callers needing to import the proto subpackage explicitly. TypeURLs: `type.googleapis.com/envoy.filters.http.envoy_go_test.v0.{EnvoyGoTest,EnvoyGoTestPerRoute}`.
+
+**Hand-rolled proto vs protoc-generated decision.** PLAN Task 19 step 1 says "the hand-rolled approach is preferred per SPEC §4.1 since the proto schema is envoy-go-only". The pure hand-roll approach (mimicking protoc-gen-go's `MessageState/sizeCache/unknownFields` + raw FileDescriptor binary) requires either (a) committing a binary FileDescriptor blob produced offline by protoc, or (b) writing several hundred lines of `protoreflect.Message` interface satisfaction by hand. Neither is acceptable for a test-only probe filter. The chosen approach — `descriptorpb.FileDescriptorProto` built in Go code at package-init + `*dynamicpb.Message` typed wrappers — is hand-rolled in the sense that NO `.proto` source file or protoc invocation is required, but uses runtime descriptor + dynamic message machinery from `google.golang.org/protobuf` (already a project dependency). This is the cleanest pragmatic interpretation of "hand-rolled minimal proto" and avoids the protoc toolchain dependency entirely.
+
+**Mode dispatch — explicit switch.** Per Decision §3.7. The `DecodeHeaders` switch handles 9 cases (8 modes + default fallthrough); `DecodeData` switch handles 2 cases (the two body-side modes); `DecodeTrailers` switch handles 1 case (`stop-trailers`); `EncodeHeaders` switch handles 1 case (`modify-encode-headers`); `EncodeData` switch handles 1 case (`modify-encode-data`). Mode is captured in `f.mode` during `DecodeHeaders` and consulted across the per-request lifecycle. The per-route count echo is universal (gated on `routeCount() > 0`, not on mode).
+
+**Framework extension — RunDecodeTrailers added.** The existing `*FilterChain` had `RunEncodeTrailers` (Task 6 era) but no `RunDecodeTrailers`. Added in Piece A's chain.go change so envoygotest's `stop-trailers` mode test exercises a real chain decode-trailer iteration rather than a no-op stub. HCM dispatch does NOT drive decode-trailers (H1 chunked T-E gated; H2 observe-and-discard per ADR-0058) so this method is currently exercised only by chain-direct tests (the structural fixture at Task 22 will gate this further as needed).
+
+**EncodeData semantics for modify-encode-data.** The probe writes `"MODIFIED\n"` into the encode-data slice via `copy(data, "MODIFIED\n")`; tail bytes (when len(data) > 9) are zeroed. The chain framework hands filters the same backing array forward through encode iteration, so the in-place mutation is visible to subsequent encode-side filters / wire-write. The terminal in tests sees the ORIGINAL bytes (it's invoked first per reverse-encode-order); the post-mutation bytes are visible in the caller's slice (the test's `original := []byte("OK\n")` becomes `"MOD"` after the 3-byte copy).
+
+**Deviations from PLAN sketch:**
+
+- (i) **`local-reply-decode-data` returns DataStopIterationNoBuffer.** PLAN Task 19 step 3 sketch returns `DataStopIterationAndBuffer` for the buffer-data mode and `DataContinue` (with the local-reply already fired) for the local-reply-on-data mode. Implemented as DataStopIterationNoBuffer for clarity: SendLocalReply has fired, the chain is in encode mode; returning `DataStopIterationNoBuffer` (instead of `DataContinue`) is more honest about the iteration outcome. The chain framework's `RunDecodeData` short-circuits on `localReplyDone.Load()` BEFORE the status switch reads, so the returned status is moot — but the chosen value documents intent.
+
+- (ii) **`countViaReflect` defensive fallback.** The `routeCount()` first tries the typed wrapper assertion `*envoygotestpb.EnvoyGoTestPerRoute`; if the assertion fails (i.e. the proto.Message is a raw `*dynamicpb.Message` produced by `anypb.UnmarshalNew` via the global registry), it falls back to a protoreflect-based read. Both paths exercised: tests that build the per-route config via `NewEnvoyGoTestPerRoute` may go either way depending on whether the assertion succeeds (the wrapper embeds the dynamic message, and `anypb.Any.UnmarshalNew` returns a fresh dynamic message — the typed wrapper is only the construction-time artifact). In practice the tests exercise the protoreflect fallback path.
+
+**Acceptance (Task 19 bundled):**
+
+- `go build ./...` clean.
+- `go vet ./...` clean.
+- `go test -race ./internal/filter/http/envoygotest/ -count=1 -v` PASS (10/10).
+- `go test -race ./internal/filter/... -count=1` PASS (no regressions across hcm, http, http/cors, http/envoygotest, http/router, hcm/h2, tcpproxy).
+- `go test ./test/differential/ -count=1` PASS (7/7 fixtures still green).
+- `go test ./... -count=1` PASS (full sweep).
+- ADR-0074 still consistent (cors filter; no amendment needed). ADR-0075 (SendLocalReply encode-chain entry) still consistent. ADR-0076 (body buffer cap) still consistent. No new ADR required for Task 19; the OrderedHeaders unification is an extension of the Task 18 follow-up's design.
+
+**Outputs:**
+
+```
+$ go test -race ./internal/filter/http/envoygotest/ -count=1 -v
+=== RUN   TestEnvoyGoTest_ModeContinue
+--- PASS: TestEnvoyGoTest_ModeContinue (0.00s)
+=== RUN   TestEnvoyGoTest_ModeStopAndResumeHeaders
+--- PASS: TestEnvoyGoTest_ModeStopAndResumeHeaders (0.01s)
+=== RUN   TestEnvoyGoTest_ModeStopAndBufferData
+--- PASS: TestEnvoyGoTest_ModeStopAndBufferData (0.01s)
+=== RUN   TestEnvoyGoTest_ModeLocalReplyDecode
+--- PASS: TestEnvoyGoTest_ModeLocalReplyDecode (0.00s)
+=== RUN   TestEnvoyGoTest_ModeLocalReplyDecodeData
+--- PASS: TestEnvoyGoTest_ModeLocalReplyDecodeData (0.00s)
+=== RUN   TestEnvoyGoTest_ModeModifyEncodeHeaders
+--- PASS: TestEnvoyGoTest_ModeModifyEncodeHeaders (0.00s)
+=== RUN   TestEnvoyGoTest_ModeModifyEncodeData
+--- PASS: TestEnvoyGoTest_ModeModifyEncodeData (0.00s)
+=== RUN   TestEnvoyGoTest_ModeStopTrailers
+--- PASS: TestEnvoyGoTest_ModeStopTrailers (0.01s)
+=== RUN   TestEnvoyGoTest_PerRouteCountConfig
+--- PASS: TestEnvoyGoTest_PerRouteCountConfig (0.00s)
+=== RUN   TestEnvoyGoTest_FactoryRoundTrip
+--- PASS: TestEnvoyGoTest_FactoryRoundTrip (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.038s
+
+$ go test ./internal/filter/hcm/ -run TestChainIntegration -count=1 -v
+=== RUN   TestChainIntegration_H1_DirectResponseHappy
+--- PASS: TestChainIntegration_H1_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_DirectResponseHappy
+--- PASS: TestChainIntegration_H2_DirectResponseHappy (0.00s)
+=== RUN   TestChainIntegration_H2_MultiFrameDATA
+--- PASS: TestChainIntegration_H2_MultiFrameDATA (0.00s)
+=== RUN   TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders
+--- PASS: TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders (0.00s)
+=== RUN   TestChainIntegration_H1_CorsActualRequest_AppendsThreeHeadersAfterUpstream
+--- PASS: TestChainIntegration_H1_CorsActualRequest_AppendsThreeHeadersAfterUpstream (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.004s
+
+$ go test ./test/differential/ -count=1 | tail -10
+--- PASS: TestDifferential (19.35s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.13s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.24s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.27s)
+    --- PASS: TestDifferential/0003-http11-routing (1.16s)
+    --- PASS: TestDifferential/0004-h2-routing (1.73s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.90s)
+    --- PASS: TestDifferential/0006-access-log (10.92s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	20.823s
+```
+
+**Closes Task 18 prerequisite I-3 (deferred from review-loop):** ActionResponse.Headers promoted from `http.Header` → `OrderedHeaders`; the dual-shape `writeH1Reply`/`writeH1ReplyOrdered` (and H2 mirror) collapsed to a single ordered helper per codec. cors's encode-side actual-request 3-header injection now flows through the `OrderedHeaders` carrier with deterministic alphabetical ordering for net-new keys (trade-off documented above). Task 21 (`0007a-cors` differential fixture) becomes pure fixture-authoring with no further framework-side changes required.

@@ -104,9 +104,20 @@ func upstreamHostString(ep cluster.Endpoint) string {
 // dispatch's responsibility (status line + headers + body via writeStatusReply
 // or http.Response.Write). On the H2 path, dispatch maps Status into the
 // :status pseudo-header and writes HEADERS+DATA frames via h2.StreamWriter.
+//
+// Phase 07.1 Task 19 (I-3 prereq): Headers is the OrderedHeaders carrier (was
+// http.Header pre-Task-19). The unification with the SendLocalReply path
+// collapses ~80 LoC of helper duplication (writeH1Reply{,Ordered} +
+// writeH2Reply{,Ordered}) into a single ordered helper per codec. Encode-
+// chain integration: HCM dispatch projects Headers.ToHTTPHeader() into a
+// mutable map for RunEncodeHeaders, then reconciles via
+// envoyhttp.ReconcileOrderedHeaders so caller-supplied insertion order is
+// preserved across filter mutations. See PROGRESS Task 19 close-out for
+// trade-offs around upstream-response wire-order (lost via Go's net/http
+// resp.Header map iteration; alphabetical-by-canonical-name as substitute).
 type ActionResponse struct {
 	Status  int
-	Headers http.Header
+	Headers envoyhttp.OrderedHeaders
 	Body    []byte
 	// Close is true if the action requested the connection be closed after
 	// the response (H1 only; H2 ignores). Surfaced via this field rather than
@@ -521,18 +532,16 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 		return ActionResponse{Status: resp.StatusCode}, picked, err
 	}
 
-	// Build the response headers from the upstream response. Use a fresh
-	// http.Header so the chain's encode-side mutations don't escape to the
-	// caller. Content-Length is recomputed at wire-write time from len(Body).
-	respHeaders := http.Header{}
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			respHeaders.Add(k, v)
-		}
-	}
+	// Build the response headers from the upstream response. Phase 07.1 Task 19
+	// (I-3 prereq): project resp.Header (Go map; iteration non-deterministic)
+	// into an OrderedHeaders carrier with deterministic alphabetical key
+	// ordering. The original wire-order from the upstream is LOST inside Go's
+	// net/http response parser (resp.Header is a map); alphabetical-by-canonical-
+	// name is the deterministic substitute. Content-Length is recomputed at
+	// wire-write time from len(Body).
 	return ActionResponse{
 		Status:  resp.StatusCode,
-		Headers: respHeaders,
+		Headers: envoyhttp.OrderedHeadersFromHTTPHeader(resp.Header),
 		Body:    bodyBytes,
 		Close:   resp.Close,
 	}, picked, nil
@@ -541,13 +550,18 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 // localReplyHeaders builds the standard local-reply header set for synthesized
 // 5xx responses on the cluster-dial / write / read failure paths. Mirrors
 // writeStatusReply's wire shape.
-func localReplyHeaders(bodyLen int) http.Header {
-	h := http.Header{}
-	h.Set("Content-Type", "text/plain")
-	h.Set("Content-Length", strconv.Itoa(bodyLen))
-	h.Set("Server", serverHeader())
-	h.Set("Date", dateHeader())
-	return h
+//
+// Phase 07.1 Task 19 (I-3 prereq): returns OrderedHeaders so the action-
+// driven wire-emit path (writeH1Reply / writeH2Reply on ActionResponse)
+// preserves the four-header insertion order (Content-Type, Content-Length,
+// Server, Date) — matching writeStatusReply's verbatim shape from phase-04.
+func localReplyHeaders(bodyLen int) envoyhttp.OrderedHeaders {
+	return envoyhttp.OrderedHeaders{
+		{Name: "Content-Type", Value: "text/plain"},
+		{Name: "Content-Length", Value: strconv.Itoa(bodyLen)},
+		{Name: "Server", Value: serverHeader()},
+		{Name: "Date", Value: dateHeader()},
+	}
 }
 
 // routerAction proxies the request to the named cluster's selected endpoint.

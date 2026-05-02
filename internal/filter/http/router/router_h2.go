@@ -14,6 +14,7 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 )
 
@@ -84,16 +85,20 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 
 	a.cluster.IncStatusClass(resp.Status)
 
-	// Convert h2 hpack header fields into http.Header for the chain's encode
+	// Convert h2 hpack header fields into OrderedHeaders for the chain's encode
 	// side. Pseudo-headers (:status etc.) are stripped — the chain works on
 	// regular headers; HCM h2dispatch's wire-write emits :status from
-	// resp.Status before the regular header set.
-	respHeaders := http.Header{}
+	// resp.Status before the regular header set. Phase 07.1 Task 19 (I-3
+	// prereq): the carrier is OrderedHeaders so insertion order from the H2
+	// HPACK-decoded sequence survives through the chain to the wire (H2 codec
+	// preserves wire order on resp.Headers per RFC 9113 §8.1.2 — slice already
+	// carries the correct order).
+	respHeaders := make(envoyhttp.OrderedHeaders, 0, len(resp.Headers))
 	for _, hf := range resp.Headers {
 		if strings.HasPrefix(hf.Name, ":") {
 			continue
 		}
-		respHeaders.Add(hf.Name, hf.Value)
+		respHeaders = append(respHeaders, envoyhttp.HeaderField{Name: hf.Name, Value: hf.Value})
 	}
 	return ActionResponse{
 		Status:  resp.Status,
@@ -104,13 +109,15 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 
 // h2LocalReplyHeaders builds the standard local-reply header set for
 // synthesized 5xx H2 responses. Mirrors the Header set previously written by
-// routerActionH2.write502.
-func h2LocalReplyHeaders() http.Header {
-	h := http.Header{}
-	h.Set("Content-Type", "text/plain")
-	h.Set("Date", dateHeader())
-	h.Set("Server", serverHeader())
-	return h
+// routerActionH2.write502. Phase 07.1 Task 19 (I-3 prereq): returns
+// OrderedHeaders so the action-driven wire-emit path preserves the three-
+// header insertion order (Content-Type, Date, Server) on the H2 HEADERS frame.
+func h2LocalReplyHeaders() envoyhttp.OrderedHeaders {
+	return envoyhttp.OrderedHeaders{
+		{Name: "Content-Type", Value: "text/plain"},
+		{Name: "Date", Value: dateHeader()},
+		{Name: "Server", Value: serverHeader()},
+	}
 }
 
 // emitAccessLogH2 is the H2-flavored variant of (*Filter).emitAccessLog;

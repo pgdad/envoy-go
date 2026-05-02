@@ -11,6 +11,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 )
@@ -52,13 +53,19 @@ type directResponseAction struct {
 // + §13's acceptance check. status is the configured value; headers contain
 // Date/Server/Content-Type/Content-Length; the returned body bytes are the
 // configured inline_string.
-func (a *directResponseAction) body() (status int, headers http.Header, body []byte) {
+//
+// Phase 07.1 Task 19 (I-3 prereq): returns OrderedHeaders so the four headers
+// (Content-Type, Content-Length, Server, Date) land on the wire in their
+// insertion order — matching writeStatusReply's verbatim shape from phase-04
+// (and the writeH2 path's HEADERS-frame deterministic order).
+func (a *directResponseAction) body() (status int, headers filter_http.OrderedHeaders, body []byte) {
 	bodyBytes := []byte(a.bodyText)
-	hdrs := http.Header{}
-	hdrs.Set("Date", dateHeader())
-	hdrs.Set("Server", serverHeader())
-	hdrs.Set("Content-Type", "text/plain")
-	hdrs.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+	hdrs := filter_http.OrderedHeaders{
+		{Name: "Content-Type", Value: "text/plain"},
+		{Name: "Content-Length", Value: strconv.Itoa(len(bodyBytes))},
+		{Name: "Server", Value: serverHeader()},
+		{Name: "Date", Value: dateHeader()},
+	}
 	return a.status, hdrs, bodyBytes
 }
 
@@ -70,7 +77,9 @@ func (a *directResponseAction) writeH1(w io.Writer) error {
 
 // writeH2 is the H2 adapter — writes HEADERS (`:status` pseudo first per
 // RFC 9113 §8.3, then regular headers in deterministic order) + DATA + END_STREAM
-// via the streamWriter.
+// via the streamWriter. Phase 07.1 Task 19 (I-3 prereq): hdrs is OrderedHeaders;
+// .Get is the carrier-friendly accessor mirroring http.Header.Get's
+// canonical-name semantics.
 func (a *directResponseAction) writeH2(sw h2.StreamWriter) error {
 	status, hdrs, body := a.body()
 	headers := []hpack.HeaderField{

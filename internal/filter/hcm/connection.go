@@ -270,11 +270,11 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 		bytesSent := int64(len(lrBody))
 		var werr error
 		if lrStatus > 0 {
-			// Task 18 review fix: SendLocalReply path uses ordered headers so
-			// SPEC §11.2's verbatim 6-header order survives on the wire (the
-			// stdlib http.Header.Write emits keys alphabetically sorted and
-			// would lose the §11.2 order). lrHeaders is filter_http.OrderedHeaders.
-			werr = writeH1ReplyOrdered(bw, lrStatus, lrHeaders, lrBody)
+			// Task 18 review fix + Task 19 unification: SendLocalReply path
+			// uses the unified ordered helper so SPEC §11.2's verbatim
+			// 6-header order survives on the wire (alphabetical sort via
+			// http.Header.Write would lose the §11.2 order).
+			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
 		}
 		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime)
 		// Honor any user-supplied Connection: close on the local-reply
@@ -319,17 +319,20 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 	// so encode-side filters (cors etc.) can mutate headers/body BEFORE the
 	// wire-write fires. RunEncodeHeaders iterates filters in REVERSE
 	// declaration order per SPEC §5.5 + §11.1; cors's EncodeHeaders mutates
-	// headers in place via the http.Header map. Skipped when actionRan is
-	// false (the chain already ran the encode side via SendLocalReply during
-	// decode iteration; the local-reply path's wire-write happens below from
-	// chain state captured by a recordingTerminal-style hook — but for the
-	// router-terminal chain, decode-side SendLocalReply is rare and lands a
-	// status==0 here on the rare action-bypass path).
+	// headers in place via the http.Header map. Phase 07.1 Task 19 (I-3
+	// prereq): project resp.Headers (OrderedHeaders) → http.Header for the
+	// encode chain, then reconcile post-encode mutations back via
+	// filter_http.ReconcileOrderedHeaders. Caller-supplied insertion order
+	// survives encode-chain mutations; net-new keys (cors's encode-side
+	// 3-header append on the actual-request path) sort alphabetical after the
+	// original carrier.
 	status := resp.Status
 	if rf.ActionRan() && status > 0 && actionErr == nil {
-		if _, err := chain.RunEncodeHeaders(ctx, resp.Headers, len(resp.Body) == 0); err != nil {
+		merged := resp.Headers.ToHTTPHeader()
+		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
 			return status, err
 		}
+		resp.Headers = filter_http.ReconcileOrderedHeaders(resp.Headers, merged)
 		if len(resp.Body) > 0 {
 			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
 				return status, err
@@ -340,9 +343,9 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 	bytesSent := int64(len(resp.Body))
 
 	// Phase 07.1 Task 18 prereq P2: wire-write the response via writeH1Reply
-	// (mirrors writeStatusReply but takes a pre-built http.Header so encode-
-	// chain mutations are visible on the wire). The action's surfaced response
-	// (post-encode-chain) is the source of truth for status + headers + body.
+	// (the unified ordered helper post-Task-19 — same path as the SendLocalReply
+	// branch above). The action's surfaced response (post-encode-chain) is the
+	// source of truth for status + headers + body.
 	if rf.ActionRan() && actionErr == nil && status > 0 {
 		if werr := writeH1Reply(bw, resp.Status, resp.Headers, resp.Body); werr != nil {
 			actionErr = werr

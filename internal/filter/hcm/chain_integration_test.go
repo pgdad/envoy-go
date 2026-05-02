@@ -579,3 +579,128 @@ func TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders(t
 		t.Errorf("expected Content-Length: 0 (empty preflight body); got: %q", out)
 	}
 }
+
+// TestChainIntegration_H1_CorsActualRequest_AppendsThreeHeadersAfterUpstream
+// Phase 07.1 Task 19 (I-3 prereq close-out): proves that the cors filter's
+// encode-side actual-request 3-header injection lands AFTER the original
+// (action-supplied) response headers on the H1 wire. The unification of
+// ActionResponse.Headers from http.Header → OrderedHeaders + the encode-chain
+// reconcile (filter_http.ReconcileOrderedHeaders) preserves the action's
+// caller-supplied insertion order; cors's three encode-side Set()s
+// (Allow-Origin, Allow-Credentials, Expose-Headers) appear as net-new keys
+// after the original carrier in deterministic alphabetical order.
+//
+// This exercises the action-driven path (not SendLocalReply) — direct_response
+// synthesizes a 200 with Content-Type/Content-Length/Server/Date pinned in
+// localReplyHeaders order; cors's encode-side mutates via http.Header.Set on
+// the merged map view; the reconcile projects back to OrderedHeaders.
+//
+// Order assertion: the upstream four (Content-Type, Content-Length, Server,
+// Date) come first in their carrier-defined order; the cors three follow in
+// alphabetical order (Allow-Credentials, Allow-Origin, Expose-Headers). This
+// is NOT byte-equivalent with reference Envoy's "cors-set-order" — see
+// PROGRESS Task 19 close-out trade-off note for the rationale (Go map
+// iteration is non-deterministic; alphabetical is the deterministic
+// substitute for byte-equality across runs of the same fixture).
+func TestChainIntegration_H1_CorsActualRequest_AppendsThreeHeadersAfterUpstream(t *testing.T) {
+	policy := &corsv3.CorsPolicy{
+		AllowOriginStringMatch: []*matcherv3.StringMatcher{
+			{MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "https://example.test"}},
+		},
+		AllowMethods:     "GET, POST, OPTIONS",
+		AllowHeaders:     "x-foo, x-bar",
+		ExposeHeaders:    "x-baz",
+		MaxAge:           "600",
+		AllowCredentials: wrapperspb.Bool(true),
+	}
+	policyAny, err := anypb.New(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	corsFactory, err := cors.New(nil, filter_http.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("cors.New: %v", err)
+	}
+	rfFactory, err := router.New(nil, filter_http.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	chainCfg := []chainEntry{
+		{name: "envoy.filters.http.cors", factory: corsFactory},
+		{name: "envoy.filters.http.router", factory: rfFactory},
+	}
+	scopes := []filter_http.RouteScope{
+		{Route: map[string]*anypb.Any{"envoy.filters.http.cors": policyAny}},
+	}
+	pr, err := filter_http.BuildPerRouteConfig(nil, scopes, []string{"envoy.filters.http.cors", "envoy.filters.http.router"})
+	if err != nil {
+		t.Fatalf("BuildPerRouteConfig: %v", err)
+	}
+
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/api"), action: &directResponseAction{status: 200, bodyText: "ok\n"}},
+	}}
+	r := stats.NewRegistry()
+	prefix := "http.test_chain_integration_cors_actual."
+	f := &Filter{
+		table:             tt,
+		statPrefix:        "test_chain_integration_cors_actual",
+		downstreamRqTotal: r.NewCounter(prefix + "downstream_rq_total"),
+		downstreamRq2xx:   r.NewCounter(prefix + "downstream_rq_2xx"),
+		downstreamRq3xx:   r.NewCounter(prefix + "downstream_rq_3xx"),
+		downstreamRq4xx:   r.NewCounter(prefix + "downstream_rq_4xx"),
+		downstreamRq5xx:   r.NewCounter(prefix + "downstream_rq_5xx"),
+		chainConfig:       chainCfg,
+		perRouteConfig:    pr,
+	}
+
+	req, _ := http.NewRequest("GET", "/api", nil)
+	req.Proto = "HTTP/1.1"
+	req.Header.Set("Origin", "https://example.test")
+
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	status, derr := f.dispatchRequest(context.Background(), req, bw)
+	if derr != nil {
+		t.Fatalf("dispatchRequest: %v", derr)
+	}
+	if status != 200 {
+		t.Errorf("status = %d, want 200", status)
+	}
+	_ = bw.Flush()
+	out := buf.String()
+
+	// Status line + four-then-three header order assertion. Walk the wire
+	// successively; require each successive header's start index strictly
+	// greater than the previous one's. The original carrier is
+	// {Content-Type, Content-Length, Server, Date} from localReplyHeaders;
+	// the cors-appended trio sorts alphabetically: Access-Control-Allow-
+	// Credentials, Access-Control-Allow-Origin, Access-Control-Expose-Headers.
+	if !strings.HasPrefix(out, "HTTP/1.1 200 OK\r\n") {
+		t.Errorf("expected 200 OK status line, got: %q", out)
+	}
+	wantOrder := []string{
+		"Content-Type: text/plain\r\n",
+		"Content-Length: 3\r\n", // "ok\n" is 3 bytes
+		"Server: envoy\r\n",
+		"Access-Control-Allow-Credentials: true\r\n",
+		"Access-Control-Allow-Origin: https://example.test\r\n",
+		"Access-Control-Expose-Headers: x-baz\r\n",
+	}
+	prevEnd := 0
+	for i, wh := range wantOrder {
+		idx := strings.Index(out[prevEnd:], wh)
+		if idx < 0 {
+			t.Errorf("missing/out-of-order header line %d %q in wire output (previous header ended at byte %d)\n---FULL OUTPUT---\n%s\n---END---",
+				i, wh, prevEnd, out)
+			break
+		}
+		prevEnd += idx + len(wh)
+	}
+
+	// Body present.
+	if !strings.HasSuffix(out, "ok\n") {
+		t.Errorf("expected body 'ok\\n' at end of wire output; got: %q", out)
+	}
+}

@@ -245,6 +245,45 @@ func (c *FilterChain) RunDecodeData(ctx context.Context, data []byte, endStream 
 	return true, nil
 }
 
+// RunDecodeTrailers iterates decode-side trailers in declaration order.
+// Phase 07.1 Task 19: added to support the envoygotest probe filter's
+// stop-trailers mode (DecodeTrailers returns TrailersStopIteration; resume
+// via dcb.ContinueDecoding). HCM dispatch (connection.go / h2dispatch.go)
+// does not yet drive trailers — H1 trailers are gated on chunked transfer-
+// encoding which the phase-04..07.1 fixture set does not exercise; H2
+// trailers are observed-and-discarded in the codec layer per ADR-0058.
+// envoygotest's chain-direct test exercises this method without HCM
+// dispatch.
+func (c *FilterChain) RunDecodeTrailers(ctx context.Context, trailers http.Header) (bool, error) {
+	c.decodeIdx = 0
+	for c.decodeIdx < len(c.filters) {
+		if c.localReplyDone.Load() {
+			return false, nil
+		}
+		f := c.filters[c.decodeIdx].Decoder
+		if f == nil {
+			c.decodeIdx++
+			continue
+		}
+		status := f.DecodeTrailers(trailers)
+		if c.localReplyDone.Load() {
+			return false, nil
+		}
+		switch status {
+		case TrailersContinue:
+			c.decodeIdx++
+		case TrailersStopIteration:
+			if err := c.parkDecode(ctx); err != nil {
+				return false, err
+			}
+			c.decodeIdx++
+		default:
+			return false, fmt.Errorf("chain: filter %q returned unknown FilterTrailersStatus %d on decode", c.filters[c.decodeIdx].Name, status)
+		}
+	}
+	return true, nil
+}
+
 // RunEncodeHeaders iterates the encode-side filters in REVERSE declaration
 // order per SPEC §5.5 + §11.1 empirical pin. Returns (terminated=true) when
 // iteration completes; (terminated=false, err) if aborted by ctx-cancel.
@@ -517,58 +556,13 @@ func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status
 	})
 }
 
-// reconcileOrderedHeaders merges encode-chain mutations on `merged` back onto
-// the caller-supplied ordered carrier `original`. For each name in `original`
-// (looked up canonically), emits the post-encode value(s) from `merged` in
-// the original order; then appends any net-new header keys from `merged`
-// (canonical key already, since merged was built via Add which canonicalizes).
-// This is the order-preservation bridge between the http.Header-mutation-friendly
-// encode-chain API and the order-pinned wire-emit shape required by SPEC §11.2.
+// reconcileOrderedHeaders is a thin wrapper around the package-level
+// ReconcileOrderedHeaders helper. Phase 07.1 Task 19 (I-3 prereq) exported
+// the implementation so HCM dispatch's action-driven path can use the same
+// machinery; this wrapper preserves the call site's lowercase form for chain
+// internals.
 func reconcileOrderedHeaders(original OrderedHeaders, merged http.Header) OrderedHeaders {
-	out := make(OrderedHeaders, 0, len(merged))
-	seen := make(map[string]bool, len(original))
-	for _, hf := range original {
-		canon := http.CanonicalHeaderKey(hf.Name)
-		if seen[canon] {
-			continue // dedupe duplicates in original; first occurrence wins
-		}
-		seen[canon] = true
-		if vs, ok := merged[canon]; ok {
-			for _, v := range vs {
-				out = append(out, HeaderField{Name: canon, Value: v})
-			}
-		}
-		// If a header was deleted on the encode side (rare), it falls out here.
-	}
-	// Append net-new keys from merged in alphabetical order so framework-
-	// injected (Content-Length / Content-Type) and encode-side-added keys
-	// land in deterministic order after the caller-pinned ones. Determinism
-	// matters for byte-equivalence in the differential gate (Task 21).
-	newKeys := make([]string, 0)
-	for k := range merged {
-		if !seen[k] {
-			newKeys = append(newKeys, k)
-		}
-	}
-	// Stable order for new keys; sort.Strings.
-	sortStrings(newKeys)
-	for _, k := range newKeys {
-		for _, v := range merged[k] {
-			out = append(out, HeaderField{Name: k, Value: v})
-		}
-	}
-	return out
-}
-
-// sortStrings is a tiny insertion sort for the new-keys slice (typically ≤4
-// entries: Content-Length, Content-Type, optional Server, optional Date).
-// Avoids importing "sort" for this single use.
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
+	return ReconcileOrderedHeaders(original, merged)
 }
 
 // LocalReplyDone reports whether SendLocalReply was invoked on this chain.

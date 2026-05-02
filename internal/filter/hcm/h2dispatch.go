@@ -224,10 +224,10 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		lrStatus, lrHeaders, lrBody := chain.LocalReplyResponse()
 		var werr error
 		if lrStatus > 0 {
-			// Task 18 review fix: ordered carrier preserves caller insertion
-			// order (e.g. SPEC §11.2 6-header pin from cors.go) on the H2
-			// HEADERS frame. Map iteration in writeH2Reply would lose order.
-			werr = writeH2ReplyOrdered(sw, lrStatus, lrHeaders, lrBody)
+			// Task 18 review fix + Task 19 unification: ordered carrier
+			// preserves caller insertion order (e.g. SPEC §11.2 6-header pin
+			// from cors.go) on the H2 HEADERS frame.
+			werr = writeH2Reply(sw, lrStatus, lrHeaders, lrBody)
 		}
 		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime)
 		if lrStatus > 0 {
@@ -260,12 +260,21 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// Phase 07.1 Task 18 prereq P2: run the response through the encode chain
 	// so encode-side filters (cors etc.) can mutate headers/body BEFORE the
 	// HEADERS+DATA frames hit the wire. Reverse declaration order per SPEC
-	// §5.5 + §11.1.
+	// §5.5 + §11.1. Phase 07.1 Task 19 (I-3 prereq): project resp.Headers
+	// (OrderedHeaders) → http.Header for the encode chain (which still
+	// operates on http.Header per ADR-0071's filter API stability), then
+	// reconcile post-encode mutations back onto the OrderedHeaders carrier
+	// via filter_http.ReconcileOrderedHeaders. Caller-supplied insertion
+	// order survives encode mutations; net-new keys (cors's encode-side
+	// allow-origin/allow-credentials/expose-headers append) sort alphabetical
+	// after the original carrier.
 	if rf.ActionRan() && status > 0 && actionErr == nil {
-		if _, err := chain.RunEncodeHeaders(ctx, resp.Headers, len(resp.Body) == 0); err != nil {
+		merged := resp.Headers.ToHTTPHeader()
+		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
 			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime)
 			return err
 		}
+		resp.Headers = filter_http.ReconcileOrderedHeaders(resp.Headers, merged)
 		if len(resp.Body) > 0 {
 			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
 				c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime)
@@ -313,61 +322,25 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	return nil
 }
 
-// writeH2Reply emits an HTTP/2 response on sw from a pre-built header set +
-// body. Phase 07.1 Task 18 prereq P2: the chain-mediated H2 dispatch path
-// serializes the action's (post-encode-chain-mutated) response here.
-//
-// Header emission order:
-//  1. :status pseudo-header (RFC 9113 §8.3 — pseudo-headers must come first)
-//  2. date, server (stamped if absent — filters that set Date/Server are honored)
-//  3. content-type and other headers from the headers map
-//  4. content-length last, recomputed from len(body) (overrides upstream value)
-//
-// HEADERS frame is emitted with end_stream=false (body follows) when len(body)>0;
-// end_stream=true when body is empty.
-func writeH2Reply(sw h2.StreamWriter, status int, headers http.Header, body []byte) error {
-	hf := []hpack.HeaderField{{Name: ":status", Value: strconv.Itoa(status)}}
-	// Stamp Date + Server defaults if not provided.
-	hclone := headers.Clone()
-	if hclone.Get("Date") == "" {
-		hclone.Set("Date", dateHeader())
-	}
-	if hclone.Get("Server") == "" {
-		hclone.Set("Server", serverHeader())
-	}
-	hclone.Set("Content-Length", strconv.Itoa(len(body)))
-	for k, vs := range hclone {
-		// HTTP/2 lowercases regular header names per RFC 9113 §8.1.2; emit
-		// canonical-cased names so HpackEncoder applies its own canonicalization
-		// (or the test verification can compare lowercase).
-		ln := strings.ToLower(k)
-		for _, v := range vs {
-			hf = append(hf, hpack.HeaderField{Name: ln, Value: v})
-		}
-	}
-	endStream := len(body) == 0
-	if err := sw.WriteHeaders(hf, endStream); err != nil {
-		return err
-	}
-	if !endStream {
-		if err := sw.WriteData(body, true); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// writeH2ReplyOrdered is the order-preserving sibling of writeH2Reply for the
-// SendLocalReply path (Task 18 review fix). Iterates headers as a slice
-// (filter_http.OrderedHeaders) so caller-supplied insertion order (e.g. SPEC
-// §11.2 verbatim 6-header order from cors.go) survives on the wire.
+// writeH2Reply emits an HTTP/2 response on sw from a pre-built ordered header
+// set + body. Phase 07.1 Task 18 prereq P2: the chain-mediated H2 dispatch
+// path serializes the action's (post-encode-chain-mutated) response here.
+// Phase 07.1 Task 19 (I-3 prereq): unified path — the SendLocalReply path and
+// action-driven path BOTH use this single helper (collapsed from
+// writeH2Reply{,Ordered} duplication). Iterates headers as a slice so caller-
+// supplied insertion order (SPEC §11.2 verbatim 6-header order from cors.go
+// on the SendLocalReply path; the H2 codec's wire-order on the upstream path)
+// lands on the wire byte-for-byte.
 //
 // Header emission order:
 //  1. :status pseudo-header (RFC 9113 §8.3 — pseudo-headers must come first).
 //  2. The headers slice in iteration order (lowercased per RFC 9113 §8.1.2).
 //     Content-Length is overridden inline to match len(body).
 //  3. date, server defaults appended if absent in the carrier.
-func writeH2ReplyOrdered(sw h2.StreamWriter, status int, headers filter_http.OrderedHeaders, body []byte) error {
+//
+// HEADERS frame is emitted with end_stream=false (body follows) when
+// len(body)>0; end_stream=true when body is empty.
+func writeH2Reply(sw h2.StreamWriter, status int, headers filter_http.OrderedHeaders, body []byte) error {
 	hf := []hpack.HeaderField{{Name: ":status", Value: strconv.Itoa(status)}}
 	hasServer := false
 	hasDate := false
