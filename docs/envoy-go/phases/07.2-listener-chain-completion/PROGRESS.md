@@ -660,3 +660,128 @@ tls_inspector.tls_found: 2
 tls_inspector.tls_not_found: 0
 tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,1475) P90(nan,1490) P95(nan,1495) P99(nan,1499) P99.5(nan,1499.5) P99.9(nan,1499.9) P100(nan,1500)
 ```
+
+## Task 17 — BEHAVIOR_CONTRACT in-place edit + closing six-gate sweep [ADR-0077, ADR-0078, ADR-0079, ADR-0080, ADR-0081, ADR-0082, ADR-0083]
+
+**Commits:** TBD — this task's commit
+**Notes:** Landed `BEHAVIOR_CONTRACT.md ## Listener filters` section with `### Asserted equivalence` / `### Not asserted` / `### Dispatch protocol` / `### Chain-match algorithm` / `### default_filter_chain semantics` subsections + four §11 empirical-pin blocks paste-verbatim from SPEC §11.1 / §11.2 / §11.3 / §11.4 (resolved at Task 16) into the four `### Empirical evidence (...)` subsections. Amended `## TCP proxy ### Does not yet apply to`: removed `Filter chain matching (filter_chain_match non-empty) — phase 07.` and replaced `Multiple filters in a chain — phase 07.` with the network-filter-family forward-pointer plus `Multiple listener filters in a listener_filters[] pipeline IS supported as of 07.2 — see ## Listener filters`. Amended `## TLS ### Scope boundaries`: removed `ALPN-driven filter-chain selection`, `non-SNI filter-chain match fields`, `Listener.default_filter_chain`, and `listener_filters (still silently skipped)` from the deferred list; added forward-pointer `See ## Listener filters for the listener-side filter primitives` and an explicit ADR-0050 / ADR-0083 coexistence-not-supersession paragraph (ALPN-codec-dispatch and ALPN-chain-match are orthogonal). Added new row to the `## Equivalence Matrix` table for `Listener filters`. Removed `Listener filters` / `FilterChainMatch beyond SNI` / `Listener.default_filter_chain` from the `## HTTP filter chain ### Does not yet apply to` deferred list with a REMOVED-from-this-list note pointing at the new section. Six-gate sweep all GREEN: gate (a) all 10 differential fixtures (0000-0008 including 0007a/0007b) PASS at the ENVOY_TARGET pin; gate (c) h2spec 53/53 PASS at the ADR-0051 pin (`summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0`) — UNCHANGED relative to phase 07.1 because 07.2's listener-filter pipeline runs BEFORE HCM and doesn't touch H2 framing; gate (d) all 10 fuzzers PASS at -fuzztime=30s each (the 9 inherited from prior phases + the new `FuzzFilterChainMatch` from Task 6) with zero crashers and zero persisted corpus failures; gate (e) `go vet ./...` empty, `golangci-lint run ./...` empty, `go test -race -count=1 -short ./...` all packages PASS; gate boundary grep zero matches (no third-party listener-filter or chain-match library imported per SPEC §16). Empirical-pin grep confirms all four §11 blocks are paste-verbatim-synchronized into BEHAVIOR_CONTRACT.md. Gate (f) defers to the REVIEW session per BOOTSTRAP §5 step 6. Total fuzzer count post-07.2 is 10. DECISIONS.md unchanged at 83 ADRs (no new ADRs at Task 17 — all seven 0077-0083 anchored at Tasks 1/2/4/5/9). STATE.md and ROADMAP.md NOT touched at this commit per ADR-0052 / SPEC §4.4 / BOOTSTRAP §5 — STATE 3→4 advances at the verification session; ROADMAP rows flip at the REVIEW session's phase-done commit.
+**Outputs (verbatim — gate (a) tail; gate (c) summary; gate (d) per-fuzzer summary lines; gate (e) all clean; boundary grep zero):**
+```
+$ go test -count=1 ./test/differential/... -v 2>&1 | tail -20
+--- PASS: TestDifferential (23.97s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.14s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.22s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.26s)
+    --- PASS: TestDifferential/0003-http11-routing (1.28s)
+    --- PASS: TestDifferential/0004-h2-routing (1.70s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.90s)
+    --- PASS: TestDifferential/0006-access-log (11.04s)
+    --- PASS: TestDifferential/0007a-cors (1.26s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.72s)
+    --- PASS: TestDifferential/0008-listener-chain-match (2.46s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	25.594s
+=== RUN   TestOptionalInterfaces
+--- PASS: TestOptionalInterfaces (0.00s)
+=== RUN   TestOptionalInterfaces_NotImplemented
+--- PASS: TestOptionalInterfaces_NotImplemented (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.002s
+$ go test -count=1 -timeout 180s ./test/conformance/h2spec/ -v 2>&1 | grep -E '53 tests|^PASS|^ok'
+        53 tests, 53 passed, 0 skipped, 0 failed
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.304s
+$ go test -fuzz=FuzzBootstrapLoad -fuzztime=30s -run='^$' ./internal/bootstrap/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 513089 (0/sec), new interesting: 4 (total: 1101)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.093s
+$ go test -fuzz=FuzzTcpProxyFilter -fuzztime=30s -run='^$' ./internal/filter/tcpproxy/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3903145 (0/sec), new interesting: 4 (total: 572)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.056s
+$ go test -fuzz=FuzzTLSContextParse -fuzztime=30s -run='^$' ./internal/tls/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3885082 (0/sec), new interesting: 9 (total: 732)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.055s
+$ go test -fuzz=FuzzHCMConfigParse -fuzztime=30s -run='^$' ./internal/filter/hcm/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3750853 (0/sec), new interesting: 8 (total: 553)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.059s
+$ go test -fuzz=FuzzFrameStream -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 13479517 (0/sec), new interesting: 3 (total: 431)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	30.158s
+$ go test -fuzz=FuzzHPACKDecode -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 1846073 (0/sec), new interesting: 1 (total: 168)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.079s
+$ go test -fuzz=FuzzPromTextFormat -fuzztime=30s -run='^$' ./internal/stats/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 25270389 (0/sec), new interesting: 0 (total: 119)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	30.108s
+$ go test -fuzz=FuzzAccessLogFormat -fuzztime=30s -run='^$' ./internal/accesslog/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 27103377 (0/sec), new interesting: 0 (total: 88)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	31.026s
+$ go test -fuzz=FuzzFilterChainParse -fuzztime=30s -run='^$' ./internal/filter/http/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 4675237 (0/sec), new interesting: 13 (total: 291)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	31.054s
+$ go test -fuzz=FuzzFilterChainMatch -fuzztime=30s -run='^$' ./internal/listener/listenerfilter/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 16495210 (0/sec), new interesting: 6 (total: 88)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	30.143s
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./... 2>&1 | tail -25
+ok  	github.com/esalaine/envoy-go/internal/listener	4.086s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.065s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.022s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.041s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.106s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	1.158s
+ok  	github.com/esalaine/envoy-go/test/differential	1.154s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.012s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.015s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.025s
+$ grep -rE 'github.com/.*listener.*filter|github.com/.*chain.*match' . --include='*.go' --include='go.mod' --include='go.sum' | grep -v 'envoyproxy/go-control-plane' | grep -v 'envoy-go'
+$ grep -A5 '^### Empirical evidence (default_filter_chain fallback)' docs/envoy-go/BEHAVIOR_CONTRACT.md | head -6
+### Empirical evidence (default_filter_chain fallback)
+
+**Probe configuration:** listener with one specific-match `filter_chain` (`source_prefix_ranges: 127.0.0.1/32`) + a `default_filter_chain`. Each chain's terminal filter is a TCP-proxy with a distinct `stat_prefix` (`tcp_loopback` for the loopback-source chain; `tcp_default` for the default chain). The bootstrap is at `/tmp/envoy-07.2-empirical/envoy-defaultchain.yaml`:
+
+```yaml
+static_resources:
+$ grep -A5 '^### Empirical evidence (empty-match-vs-default)' docs/envoy-go/BEHAVIOR_CONTRACT.md | head -6
+### Empirical evidence (empty-match-vs-default)
+
+**Probe configuration:** listener with one empty-match `filter_chain` (`filter_chain_match` not set — equivalent to all-zero) + a `default_filter_chain`. Each chain's terminal filter is a TCP-proxy with a distinct `stat_prefix` (`tcp_empty` for the empty-match chain; `tcp_default` for the default chain). The bootstrap is at `/tmp/envoy-07.2-empirical/envoy-emptyandef.yaml`:
+
+```yaml
+static_resources:
+$ grep -A5 '^### Empirical evidence (precedence-ordering)' docs/envoy-go/BEHAVIOR_CONTRACT.md | head -6
+### Empirical evidence (precedence-ordering)
+
+**Probe configuration:** listener with two `filter_chains[]` entries — one matching `destination_port: 10000` (the listener's own bind port; will match every connection on this listener), one matching `source_prefix_ranges: 127.0.0.1/32`. Each chain's terminal filter is a TCP-proxy with a distinct `stat_prefix` (`tcp_dstport` for the destination-port chain; `tcp_srcprefix` for the source-prefix chain). The bootstrap is at `/tmp/envoy-07.2-empirical/envoy-precedence.yaml`:
+
+```yaml
+static_resources:
+$ grep -A5 '^### Empirical evidence (tls_inspector ALPN)' docs/envoy-go/BEHAVIOR_CONTRACT.md | head -6
+### Empirical evidence (tls_inspector ALPN)
+
+**Status: RESOLVED at Task 16 of phase 07.2 impl session per Decision K.**
+
+**Probe configuration:** listener with `tls_inspector` listener filter + two filter_chains discriminated by `application_protocols` (h2 vs http/1.1). Each chain has its own DownstreamTlsContext (real cert+key, ephemeral self-signed, generated at probe time only — NOT committed) advertising both ALPNs (`alpn_protocols: ["h2", "http/1.1"]`) and a per-chain TCP-proxy with distinct `stat_prefix` (`tcp_h2` for the h2 chain; `tcp_h1` for the http/1.1 chain). Bootstrap at `/tmp/envoy-07.2-impl-empirical/envoy-tls-alpn.yaml` (NOT committed; impl-time scratch directory per the SPEC §11 empirical-pin convention):
+```

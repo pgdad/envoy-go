@@ -20,6 +20,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | xDS wire behavior | ADS message sequences match the protocol state machine; effective-config diff on identical snapshots |
 | Timing | Not compared by default; a phase may opt in to latency bounds |
 | HTTP filter chain | Per-request equivalence on cors preflight + actual-request response shapes (status + header set + body) between envoy-go and reference Envoy. Filter iteration order, sendLocalReply encode-chain entry, and 413 overflow shape are verbatim-pinned at the ENVOY_TARGET SHA. Differential covers cors only; `envoy.filters.http.envoy_go_test` excluded (test-only); other filters in the §9 family are future-phase scope. |
+| Listener filters | Per-connection chain-selection equivalence: which `filter_chain` is dispatched is byte-equal across envoy-go and reference Envoy. Verified via per-connection backend-port routing in fixture 0008. Chain-match precedence ordering, `default_filter_chain` fallback semantics, and empty-match-vs-default resolution are verbatim-pinned at the ENVOY_TARGET SHA. Differential covers chain-selection only (which backend each connection is routed to); listener-filter internal byte-level behavior (e.g., tls_inspector parser output) is unit-tested only. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -359,8 +360,7 @@ If any listener fails to bind, neither proxy should partially serve. Upstream En
 
 ### Does not yet apply to
 
-- Filter chain matching (`filter_chain_match` non-empty) — phase 07.
-- Multiple filters in a chain — phase 07.
+- Multiple network filters in a single filter_chain (e.g., chained `redis_proxy + tcp_proxy`) — Network filters family. Multiple listener filters in a `listener_filters[]` pipeline IS supported as of 07.2 — see `## Listener filters`.
 - TLS — phase 03.
 - HTTP-aware proxying (`HttpConnectionManager`) — phase 04+.
 - LB policies other than ROUND_ROBIN — load-balancing family.
@@ -404,7 +404,11 @@ Two `tls_params` fields do not round-trip with full fidelity between Envoy's Bor
 
 ### Scope boundaries
 
-Phase 03 does NOT implement session resumption assertion, OCSP stapling, mTLS validation on the downstream side, SDS, SPIFFE / custom validators, post-quantum key exchange, ALPN-driven filter-chain selection, non-SNI filter-chain match fields, `Listener.default_filter_chain`, `listener_filters` (still silently skipped), HTTPS (HTTP over TLS — phase 04+), upstream TLS differential assertion (deferred per ADR-0035), or transport socket types beyond `tls`. See SPEC §2 for the full non-purposes list and the phase each is deferred to.
+Phase 03 does NOT implement session resumption assertion, OCSP stapling, mTLS validation on the downstream side, SDS, SPIFFE / custom validators, post-quantum key exchange, HTTPS (HTTP over TLS — phase 04+), upstream TLS differential assertion (deferred per ADR-0035), or transport socket types beyond `tls`. See SPEC §2 for the full non-purposes list and the phase each is deferred to.
+
+ALPN-driven codec selection inside `Filter.Handle` (per ADR-0050; HCM-internal AUTO-codec dispatch) is the TLS-layer ALPN consumer; it remains in scope for the TLS section. As of phase 07.2 the listener-side ALPN consumer (chain-match against `application_protocols` populated by `tls_inspector`) is also in scope, but lives in `## Listener filters`. The two ALPN consumers coexist orthogonally per ADR-0083: `tls_inspector` populates `inputs.ApplicationProtocols` from the ClientHello before chain-match selection (chain selects which `filter_chain` runs); ADR-0050's HCM-internal codec dispatch then chooses HTTP/1.1 vs HTTP/2 inside whichever HCM filter the selected chain wires up. ADR-0050 is NOT superseded by ADR-0083 / ADR-0081.
+
+See `## Listener filters` for the listener-side filter primitives (the listener-filter dispatch pipeline, the 8-dimension `FilterChainMatch` algorithm, and `Listener.default_filter_chain` fallback semantics — all in scope as of phase 07.2).
 
 ---
 
@@ -720,7 +724,301 @@ Verbatim response (CORS headers absent — passthrough confirmed):
 
 ### Does not yet apply to
 - Network filter chain (still phase 02 minimal — TCP-proxy or HCM as single entry per ADR-0033).
-- Listener filters (deferred to 07.2).
-- FilterChainMatch beyond SNI (deferred to 07.2).
-- Listener.default_filter_chain (deferred to 07.2).
 - HTTP filter family implementations beyond cors + envoy_go_test (incrementally landed by §9 family phases).
+
+(REMOVED from this list — now active as of phase 07.2: listener filters, FilterChainMatch beyond SNI, and `Listener.default_filter_chain` are in scope. See `## Listener filters` below.)
+
+---
+
+## Listener filters
+
+*Introduced by phase 07.2. Justified by ADR-0077 (scope), ADR-0078 (ADR-0033 partial supersession), ADR-0079 (dispatch protocol), ADR-0080 (default_filter_chain semantics; supersedes ADR-0033 clause 3), ADR-0081 (8-dimension precedence algorithm; supersedes ADR-0033 clause 2 partial), ADR-0082 (listener_filters_timeout [1s,60s] envelope), ADR-0083 (no supersession of ADR-0050; coexistence).*
+
+Phase 07.2 lands envoy-go's listener-side filter-chain completion: the listener-filter dispatch pipeline that runs BEFORE HCM (and before any other network filter) on every accepted downstream connection, the full `FilterChainMatch` algorithm with seven match dimensions beyond SNI, and the `Listener.default_filter_chain` fallback semantics. This subsection codifies the per-connection chain-selection contract between envoy-go and reference Envoy v1.37.2.
+
+### Asserted equivalence
+- `default_filter_chain` honored as no-match fallback — verbatim scrape pinned in `### Empirical evidence (default_filter_chain fallback)` below.
+- Empty-match `filter_chain` BEATS `default_filter_chain` when both coexist — verbatim scrape pinned in `### Empirical evidence (empty-match-vs-default)` below.
+- `destination_port` BEATS `source_prefix_ranges` in chain-match precedence when both could match — verbatim scrape pinned in `### Empirical evidence (precedence-ordering)` below.
+- `tls_inspector`-populated ALPN feeds `application_protocols` chain-match — verbatim scrape pinned in `### Empirical evidence (tls_inspector ALPN)` below (resolved at 07.2 impl time per the SPEC §11.4 carry-forward).
+- 8-dimension chain-match precedence ordering: `destination_port` > `prefix_ranges` > `server_names` > `transport_protocol` > `application_protocols` > `source_type` > `source_prefix_ranges` > `source_ports`.
+
+### Not asserted
+- xDS LDS dynamic listener-filter / chain insertion / removal / reorder.
+- `direct_source_prefix_ranges` chain-match dimension (proxy-protocol; silently ignored).
+- `Listener.connection_balance_config`, `bind_to_port`, `reuse_port`, `transparent`, `freebind` (silently ignored).
+- `listener_filters[].filter_disabled` (CEL-driven per-conn disable; silently ignored).
+- `tls_inspector.enable_ja3_fingerprinting` (silently ignored).
+
+### Dispatch protocol
+- Synchronous-only (no async-resume).
+- `ListenerFilter.Inspect(ctx, peeker, inputs)` returns `Continue` or `StopIteration`; on `StopIteration` the pipeline halts with whatever inputs were populated.
+- Per-pipeline timeout (`Listener.listener_filters_timeout`); default 15s; honored in [1s, 60s] envelope; `continue_on_listener_filters_timeout` honored as proto-documented.
+- Single-goroutine-per-connection iteration; no per-filter goroutine.
+- `ListenerFilterRegistry` is boot-populated, frozen-after-boot (mirrors 07.1 `*HTTPRegistry` LBP-1 per ADR-0072).
+
+### Chain-match algorithm
+- 8 dimensions: `destination_port`, `prefix_ranges`, `server_names`, `transport_protocol`, `application_protocols`, `source_type`, `source_prefix_ranges`, `source_ports`.
+- 2-pass algorithm: (1) eligibility (every non-zero dimension must match); (2) specificity scoring by priority-ordered vector.
+- Tie-breakers within dimensions: longer CIDR prefix (`prefix_ranges` / `source_prefix_ranges`); SNI-specificity (exact > suffix > universal > catch-all per ADR-0033 clause 9 preserved as special case); exact value match for all other dimensions.
+- Final ties (chains identical on all 8 dimensions) error at `NewManager`-build time.
+- No-match → `default_filter_chain` (if set) → close conn (otherwise).
+
+### default_filter_chain semantics
+- Consulted ONLY when no `filter_chains[]` entry is eligible.
+- Empty-match chain in `filter_chains[]` BEATS `default_filter_chain` when both coexist (the empty-match chain is universally eligible).
+- TLS posture independent of `filter_chains[]` entries' TLS posture (mixed TLS-and-plaintext rule applies WITHIN `filter_chains[]` only).
+- ADR-0033 clause 5 preserved with caveat: at most one catch-all chain in `filter_chains[]` AND at most one `default_filter_chain` (independent).
+
+### Empirical evidence (default_filter_chain fallback)
+
+**Probe configuration:** listener with one specific-match `filter_chain` (`source_prefix_ranges: 127.0.0.1/32`) + a `default_filter_chain`. Each chain's terminal filter is a TCP-proxy with a distinct `stat_prefix` (`tcp_loopback` for the loopback-source chain; `tcp_default` for the default chain). The bootstrap is at `/tmp/envoy-07.2-empirical/envoy-defaultchain.yaml`:
+
+```yaml
+static_resources:
+  listeners:
+  - name: l_test
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    filter_chains:
+    - name: chain_loopback
+      filter_chain_match:
+        source_prefix_ranges:
+        - { address_prefix: 127.0.0.1, prefix_len: 32 }
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_loopback, cluster: c_loopback } } ]
+    default_filter_chain:
+      name: chain_default
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_default, cluster: c_default } } ]
+```
+
+**Verbatim Envoy `/server_info` (server SHA confirmation):**
+
+```
+$ curl -s http://127.0.0.1:19901/server_info | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])"
+5afe27fb338b16d5bb06b3a7198bcd581b4e3dee/1.37.2/Clean/RELEASE/BoringSSL
+```
+
+**Verbatim Envoy `/config_dump` (chain-shape confirmation that Envoy parsed the config without error):**
+
+```
+LISTENER l_test
+  CHAIN chain_loopback fcm= {"source_prefix_ranges": [{"address_prefix": "127.0.0.1", "prefix_len": 32}]}
+  DEFAULT chain_default fcm= {}
+```
+
+**Probe (a) — connection from non-loopback source (Docker NAT bridge IP):**
+
+Driver: a TCP connection from the host's Docker bridge address (i.e., NOT 127.0.0.1 from Envoy's perspective due to user-mode NAT). The connection is closed immediately because both backend clusters point to non-listening ports — but the dispatch decision is recorded in the per-chain `downstream_cx_total` stat counter.
+
+Verbatim stats output (`/stats?filter=tcp_(loopback|default).downstream_cx_total`):
+
+```
+tcp.tcp_default.downstream_cx_total: 1
+tcp.tcp_loopback.downstream_cx_total: 0
+```
+
+**Probe (b) — connection from 127.0.0.1 (intra-container loopback):**
+
+Driver: `docker exec envoy-pin2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/10000 && printf "hi\n" >&3 && timeout 0.3 cat <&3'` — inside the Envoy container so the source IP is 127.0.0.1.
+
+Verbatim stats output after probe (b):
+
+```
+tcp.tcp_default.downstream_cx_total: 1
+tcp.tcp_loopback.downstream_cx_total: 1
+```
+
+**Conclusions (pinned):**
+
+- `default_filter_chain` is honored: a connection that doesn't match any `filter_chains[]` entry IS dispatched into the default chain (`tcp_default.downstream_cx_total` ticked from 0 → 1 on probe (a)).
+- A connection that matches a specific `filter_chains[]` entry is dispatched there (NOT to the default): `tcp_loopback.downstream_cx_total` ticked from 0 → 1 on probe (b); `tcp_default` did NOT tick a second time.
+- envoy-go MUST honor `default_filter_chain`: when no `filter_chains[]` entry's `filter_chain_match` matches the per-connection inputs, the algorithm falls through to `default_filter_chain` and dispatches there.
+
+### Empirical evidence (empty-match-vs-default)
+
+**Probe configuration:** listener with one empty-match `filter_chain` (`filter_chain_match` not set — equivalent to all-zero) + a `default_filter_chain`. Each chain's terminal filter is a TCP-proxy with a distinct `stat_prefix` (`tcp_empty` for the empty-match chain; `tcp_default` for the default chain). The bootstrap is at `/tmp/envoy-07.2-empirical/envoy-emptyandef.yaml`:
+
+```yaml
+static_resources:
+  listeners:
+  - name: l_test
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    filter_chains:
+    - name: chain_empty
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_empty, cluster: c_a } } ]
+    default_filter_chain:
+      name: chain_default
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_default, cluster: c_b } } ]
+```
+
+**Boot:** Envoy starts cleanly (no parse-time error on having both an empty-match chain AND a `default_filter_chain` — the only pre-flight warning is the unrelated `connection limit` notice).
+
+**Probe — connection from 127.0.0.1 (intra-container; would match either chain since both have no specifying dimensions):**
+
+```
+$ docker exec envoy-pin3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/10000 && printf "hi\n" >&3 && timeout 0.3 cat <&3'
+cat: -: Connection reset by peer
+```
+
+**Verbatim stats output (`/stats?filter=tcp_(empty|default).downstream_cx_total`):**
+
+```
+tcp.tcp_default.downstream_cx_total: 0
+tcp.tcp_empty.downstream_cx_total: 1
+```
+
+**Conclusions (pinned):**
+
+- An empty-match `filter_chain` BEATS `default_filter_chain` when both coexist: `tcp_empty.downstream_cx_total` ticked from 0 → 1; `tcp_default.downstream_cx_total` STAYED AT 0.
+- The `default_filter_chain` is consulted ONLY when no `filter_chains[]` entry is eligible. An empty-match chain is universally eligible (it's a chain in `filter_chains[]` with no specific dimensions to fail), so it always wins over `default_filter_chain`.
+- envoy-go's chain-match algorithm MUST: (a) treat empty-match `filter_chains[]` entries as universally eligible per Pass 1 of §5.5; (b) fall through to `default_filter_chain` ONLY if zero `filter_chains[]` entries are eligible.
+
+### Empirical evidence (precedence-ordering)
+
+**Probe configuration:** listener with two `filter_chains[]` entries — one matching `destination_port: 10000` (the listener's own bind port; will match every connection on this listener), one matching `source_prefix_ranges: 127.0.0.1/32`. Each chain's terminal filter is a TCP-proxy with a distinct `stat_prefix` (`tcp_dstport` for the destination-port chain; `tcp_srcprefix` for the source-prefix chain). The bootstrap is at `/tmp/envoy-07.2-empirical/envoy-precedence.yaml`:
+
+```yaml
+static_resources:
+  listeners:
+  - name: l_test
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    filter_chains:
+    - name: chain_dstport
+      filter_chain_match:
+        destination_port: 10000
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_dstport, cluster: c_a } } ]
+    - name: chain_srcprefix
+      filter_chain_match:
+        source_prefix_ranges:
+        - { address_prefix: 127.0.0.1, prefix_len: 32 }
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_srcprefix, cluster: c_b } } ]
+```
+
+**Probe — connection from 127.0.0.1 (intra-container; satisfies BOTH `destination_port: 10000` AND `source_prefix_ranges: 127.0.0.1/32`):**
+
+```
+$ docker exec envoy-pin4 bash -c 'exec 3<>/dev/tcp/127.0.0.1/10000 && printf "hi\n" >&3 && timeout 0.3 cat <&3'
+cat: -: Connection reset by peer
+```
+
+**Verbatim stats output (`/stats?filter=tcp_(dstport|srcprefix).downstream_cx_total`):**
+
+```
+tcp.tcp_dstport.downstream_cx_total: 1
+tcp.tcp_srcprefix.downstream_cx_total: 0
+```
+
+**Conclusions (pinned):**
+
+- When both chains match a connection, `destination_port` BEATS `source_prefix_ranges`: `tcp_dstport.downstream_cx_total` ticked from 0 → 1; `tcp_srcprefix.downstream_cx_total` STAYED AT 0.
+- This confirms the priority ordering documented in `filter_chain_match.proto` upstream comments and codified in §7.2: `destination_port` (priority slot 0) is more specific than `source_prefix_ranges` (priority slot 6). The chain whose specifying dimension is at a higher-priority slot wins.
+- envoy-go's `chainmatch.SelectChain` MUST score chains by the priority-ordered specificity vector per §5.5 and select the highest-scoring eligible chain.
+
+### Empirical evidence (tls_inspector ALPN)
+
+**Status: RESOLVED at Task 16 of phase 07.2 impl session per Decision K.**
+
+**Probe configuration:** listener with `tls_inspector` listener filter + two filter_chains discriminated by `application_protocols` (h2 vs http/1.1). Each chain has its own DownstreamTlsContext (real cert+key, ephemeral self-signed, generated at probe time only — NOT committed) advertising both ALPNs (`alpn_protocols: ["h2", "http/1.1"]`) and a per-chain TCP-proxy with distinct `stat_prefix` (`tcp_h2` for the h2 chain; `tcp_h1` for the http/1.1 chain). Bootstrap at `/tmp/envoy-07.2-impl-empirical/envoy-tls-alpn.yaml` (NOT committed; impl-time scratch directory per the SPEC §11 empirical-pin convention):
+
+```yaml
+static_resources:
+  listeners:
+  - name: l_tls
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    filter_chains:
+    - name: chain_h2
+      filter_chain_match: { application_protocols: ["h2"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: /etc/tls/server.crt }
+              private_key:       { filename: /etc/tls/server.key }
+            alpn_protocols: ["h2", "http/1.1"]
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_h2, cluster: c_h2 } } ]
+    - name: chain_h1
+      filter_chain_match: { application_protocols: ["http/1.1"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: /etc/tls/server.crt }
+              private_key:       { filename: /etc/tls/server.key }
+            alpn_protocols: ["h2", "http/1.1"]
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_h1, cluster: c_h1 } } ]
+```
+
+**Verbatim Envoy `/server_info` (server SHA confirmation — same image as §11.1–§11.3):**
+
+```
+$ curl -s http://127.0.0.1:19901/server_info | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])"
+5afe27fb338b16d5bb06b3a7198bcd581b4e3dee/1.37.2/Clean/RELEASE/BoringSSL
+```
+
+**Verbatim Envoy `/config_dump` (chain-shape confirmation that Envoy parsed the listener_filters[] + application_protocols match without error):**
+
+```
+LISTENER l_tls
+  LFILTER envoy.filters.listener.tls_inspector
+  CHAIN chain_h2 fcm= {"application_protocols": ["h2"]}
+  CHAIN chain_h1 fcm= {"application_protocols": ["http/1.1"]}
+```
+
+**Probe (a) — TLS connection with `NextProtos: ["h2"]`:**
+
+A Go probe (`probe.go` in the scratch directory) issues `tls.Dial("tcp", "127.0.0.1:19000", &tls.Config{InsecureSkipVerify: true, NextProtos: ["h2"]})`. The probe receives `cs.NegotiatedProtocol == "h2"` from `conn.ConnectionState()`, confirming the TLS handshake completed and Envoy advertised h2.
+
+Verbatim stats output (`/stats?filter=tcp_(h2|h1).downstream_cx_total`):
+
+```
+tcp.tcp_h1.downstream_cx_total: 0
+tcp.tcp_h2.downstream_cx_total: 1
+```
+
+**Probe (b) — TLS connection with `NextProtos: ["http/1.1"]`:**
+
+Same probe with `--alpn http/1.1`. Receives `cs.NegotiatedProtocol == "http/1.1"`.
+
+Verbatim stats output after probe (b):
+
+```
+tcp.tcp_h1.downstream_cx_total: 1
+tcp.tcp_h2.downstream_cx_total: 1
+```
+
+**Verbatim `tls_inspector` per-listener-filter stats (corroborates the inspector ran and observed the ALPN extension):**
+
+```
+$ curl -s "http://127.0.0.1:19901/stats?filter=tls_inspector"
+tls_inspector.alpn_found: 2
+tls_inspector.alpn_not_found: 0
+tls_inspector.client_hello_too_large: 0
+tls_inspector.sni_found: 0
+tls_inspector.sni_not_found: 2
+tls_inspector.tls_found: 2
+tls_inspector.tls_not_found: 0
+tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,1475) P90(nan,1490) P95(nan,1495) P99(nan,1499) P99.5(nan,1499.5) P99.9(nan,1499.9) P100(nan,1500)
+```
+
+**Conclusions (pinned):**
+
+- An HTTPS connection offering `NextProtos: ["h2"]` is dispatched to `chain_h2` (the chain whose `application_protocols: [h2]` matches): `tcp_h2.downstream_cx_total` ticked from 0 → 1 on probe (a); `tcp_h1.downstream_cx_total` STAYED AT 0.
+- An HTTPS connection offering `NextProtos: ["http/1.1"]` is dispatched to `chain_h1` (the chain whose `application_protocols: [http/1.1]` matches): `tcp_h1.downstream_cx_total` ticked from 0 → 1 on probe (b); `tcp_h2.downstream_cx_total` STAYED AT 1 (did NOT tick further).
+- The `tls_inspector` per-filter counters confirm the listener filter ran on both connections (`tls_found: 2`, `alpn_found: 2`, `sni_not_found: 2` — neither probe sent SNI). This is the empirical demonstration that `tls_inspector` populates `inputs.ApplicationProtocols` from the ClientHello's ALPN extension; without `tls_inspector` in `listener_filters[]`, `application_protocols` chain-match cannot fire (the chain-match algorithm has no source of ALPN data otherwise).
+- envoy-go MUST run the `tls_inspector` listener filter BEFORE chain-match selection so that `inputs.ApplicationProtocols` is populated when chains discriminate on `application_protocols`. The §13.1 BEHAVIOR_CONTRACT integration enforces this at the phase-done commit (Task 17). ADR-0083 confirms this is orthogonal to ADR-0050's HCM-internal AUTO-codec dispatch — the chain-match `application_protocols` is what selects the chain, not the codec; the chain's terminal filter (HCM with forced `codec_type`, or here a TCP-proxy as the minimal probe) consumes the chain selection result.
+
+### Applies to
+- Phase 07.2 onward (listener filters + 8-dimension `FilterChainMatch` + `default_filter_chain`).
+
+### Does not yet apply to
+- Listener filters beyond `tls_inspector` (`original_dst`, `proxy_protocol`, `http_inspector` deferred — SPEC §2.1).
+- xDS LDS dynamic listener configuration (xDS family).
+- `direct_source_prefix_ranges` chain-match dimension (bundled with proxy-protocol filter phase).
+- HTTP/3 + QUIC listener filters (HTTP/3 family).
