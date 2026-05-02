@@ -332,3 +332,69 @@ ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector
 $ go vet ./internal/listener/listenerfilter/tls_inspector/...
 $ golangci-lint run ./internal/listener/listenerfilter/tls_inspector/...
 ```
+
+## Task 9 — internal/listener/manager.go [ADR-0078]
+
+**Commits:** TBD — this task's commit
+**Notes:** Largest single-file refactor of the phase. Rewrote `validateFilterChainMatch` (the phase-03 narrow whitelist that errored on every dimension beyond `server_names` + `transport_protocol == "tls"`) into `parseChainSpec` (the 8-dimension parser per ADR-0081 returning `*listenerfilter.ChainSpec`); removed the parse-time error on `Listener.default_filter_chain` (ADR-0033 clause 3 superseded by ADR-0078) and added the default-chain construction path (independent TLS posture per ADR-0080); added `listener_filters[]` parsing with type_url resolution through the threaded `*ListenerFilterRegistry` (ADR-0079 + ADR-0078 clause 8 supersession); parsed `listener_filters_timeout` per ADR-0082's [1s, 60s] envelope (default 15s); built `[]*ChainSpec` alongside the legacy `[]*chainInfo` per chain with ambiguous-selection detection at NewManager-build time per ADR-0081; widened `NewManagerWithBaseDirAndAllowH2C` signature with a trailing `lfRegistry *listenerfilter.ListenerFilterRegistry` parameter (delegating constructors `NewManager` + `NewManagerWithBaseDir` thread `nil`; `cmd/envoy-go/main.go` likewise threads `nil` until Task 11 wires the boot-populated registry); deleted `chainSpecificityRank` from `manager.go` (no remaining callers — the SNI-internal sub-ordering logic lives now ONLY as `sniSpecificityRank` in `chainmatch.go`, introduced verbatim at Task 5); preserved the legacy `chains` slice ordering (catch-all chains moved to end, no SNI-specificity sort) and the `makeGetConfigForClient` GetConfigForClient path so the Task-9 commit doesn't yet touch the dispatch path (Task 10 owns the acceptLoop/dispatch/serveTLS refactor); `listenerRuntime` widened with 7 new fields (`chainSpecs []*ChainSpec`, `defaultSpec *ChainSpec`, `defaultChain *chainInfo`, `chainByName map[string]*chainInfo`, `listenerFilterFactories []FilterInstanceFactory`, `lfTimeoutMs uint32`, `continueOnLfTimeout bool`) populated at build time but not yet consulted by dispatch; mixed-TLS rule preserved within `filter_chains[]` (ADR-0033 clause 5); plaintext-multi-chain rule narrowed to "only when at least one chain populates `server_names[]`" (ADR-0033 clause 6 partial supersession). TDD discipline: existing `TestManager_Error_NonEmptyFilterChainMatch` / `TestNewManager_MultiChain_NonSNIMatchField_Errors` / `TestNewManager_MultiChain_ApplicationProtocols_Errors` / `TestNewManager_MultiChain_DefaultFilterChain_Errors` / `TestNewManager_PlaintextMultiChain_Errors` rewritten to verify ACCEPT semantics (the dimension parses + populates the ChainSpec field) since the phase-03 errors are no longer surfaced; new tests `TestParseChainSpecAcceptsAllEightDimensions` (7 sub-tests, one per dimension), `TestParseChainSpecSilentlyIgnoresDirectSourcePrefixRanges`, `TestParseChainSpecRejectsUnknownTransportProtocol`, `TestParseDefaultFilterChainNoLongerErrors`, `TestParseListenerFiltersResolvesViaRegistry`, `TestParseListenerFiltersUnknownTypeURLErrors`, `TestParseListenerFiltersTimeoutInRange`, `TestParseListenerFiltersTimeoutDefault`, `TestParseListenerFiltersTimeoutBelowFloorErrors`, `TestParseListenerFiltersTimeoutAboveCapErrors`, `TestParseChainSpecMixedTLSPreserved`, `TestIdenticalFilterChainsErrorWithAmbiguousSelection`, `TestParseDefaultFilterChain_Plaintext_WithTLSFilterChain` cover the ADR-0078 supersession surface, the ADR-0079 listener_filters[] resolution, the ADR-0082 timeout envelope, and the ADR-0081 ambiguous-selection detection. Test bootstrap helper `testLFRegistry()` mirrors the `testHTTPRegistry()` pattern (registers tls_inspector via TypeURL into a frozen `*ListenerFilterRegistry`) — Task 11 will replicate this in main.go. Landed ADR-0078 (ADR-0033 partial supersession enumeration; full clause-by-clause table in §5.7 of SPEC.md mirrored verbatim in the ADR body).
+**Outputs:**
+```
+$ go vet ./internal/listener/...
+$ golangci-lint run ./internal/listener/...
+$ go test -race ./internal/listener/...
+ok  	github.com/esalaine/envoy-go/internal/listener	1.024s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	(cached)
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	(cached)
+$ go test -race -run 'TestParseChainSpec|TestParseDefaultFilterChain|TestParseListenerFilters|TestIdenticalFilterChains|TestNewManager_PlaintextMultiChain|TestNewManager_MultiChain_ApplicationProtocols|TestManager_NonEmptyFilterChainMatch_DestinationPort' ./internal/listener/ -v
+=== RUN   TestManager_NonEmptyFilterChainMatch_DestinationPort_Accepted
+--- PASS: TestManager_NonEmptyFilterChainMatch_DestinationPort_Accepted (0.00s)
+=== RUN   TestParseDefaultFilterChainNoLongerErrors
+--- PASS: TestParseDefaultFilterChainNoLongerErrors (0.00s)
+=== RUN   TestParseChainSpecAcceptsAllEightDimensions
+    --- PASS: TestParseChainSpecAcceptsAllEightDimensions/destination_port (0.00s)
+    --- PASS: TestParseChainSpecAcceptsAllEightDimensions/prefix_ranges (0.00s)
+    --- PASS: TestParseChainSpecAcceptsAllEightDimensions/source_prefix_ranges (0.00s)
+    --- PASS: TestParseChainSpecAcceptsAllEightDimensions/source_type_LOCAL (0.00s)
+    --- PASS: TestParseChainSpecAcceptsAllEightDimensions/source_ports (0.00s)
+    --- PASS: TestParseChainSpecAcceptsAllEightDimensions/application_protocols (0.00s)
+    --- PASS: TestParseChainSpecAcceptsAllEightDimensions/transport_protocol_raw_buffer (0.00s)
+--- PASS: TestParseChainSpecAcceptsAllEightDimensions (0.00s)
+=== RUN   TestParseChainSpecSilentlyIgnoresDirectSourcePrefixRanges
+--- PASS: TestParseChainSpecSilentlyIgnoresDirectSourcePrefixRanges (0.00s)
+=== RUN   TestParseChainSpecRejectsUnknownTransportProtocol
+--- PASS: TestParseChainSpecRejectsUnknownTransportProtocol (0.00s)
+=== RUN   TestNewManager_MultiChain_ApplicationProtocols_Accepted
+--- PASS: TestNewManager_MultiChain_ApplicationProtocols_Accepted (0.00s)
+=== RUN   TestNewManager_PlaintextMultiChain_WithSNI_Errors
+--- PASS: TestNewManager_PlaintextMultiChain_WithSNI_Errors (0.00s)
+=== RUN   TestNewManager_PlaintextMultiChain_NonSNIDimensions_Accepted
+--- PASS: TestNewManager_PlaintextMultiChain_NonSNIDimensions_Accepted (0.00s)
+=== RUN   TestParseListenerFiltersResolvesViaRegistry
+--- PASS: TestParseListenerFiltersResolvesViaRegistry (0.00s)
+=== RUN   TestParseListenerFiltersUnknownTypeURLErrors
+--- PASS: TestParseListenerFiltersUnknownTypeURLErrors (0.00s)
+=== RUN   TestParseListenerFiltersTimeoutInRange
+--- PASS: TestParseListenerFiltersTimeoutInRange (0.00s)
+=== RUN   TestParseListenerFiltersTimeoutDefault
+--- PASS: TestParseListenerFiltersTimeoutDefault (0.00s)
+=== RUN   TestParseListenerFiltersTimeoutBelowFloorErrors
+--- PASS: TestParseListenerFiltersTimeoutBelowFloorErrors (0.00s)
+=== RUN   TestParseListenerFiltersTimeoutAboveCapErrors
+--- PASS: TestParseListenerFiltersTimeoutAboveCapErrors (0.00s)
+=== RUN   TestParseChainSpecMixedTLSPreserved
+--- PASS: TestParseChainSpecMixedTLSPreserved (0.00s)
+=== RUN   TestIdenticalFilterChainsErrorWithAmbiguousSelection
+--- PASS: TestIdenticalFilterChainsErrorWithAmbiguousSelection (0.00s)
+=== RUN   TestParseDefaultFilterChain_Plaintext_WithTLSFilterChain
+--- PASS: TestParseDefaultFilterChain_Plaintext_WithTLSFilterChain (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener	1.024s
+$ grep -nE 'chainSpecificityRank|^func validateFilterChainMatch' internal/listener/manager.go
+278:// ADR-0078 supersession (Task 9): the previous phase-03 `validateFilterChainMatch`
+$ go test -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	2.326s
+ok  	github.com/esalaine/envoy-go/internal/listener	0.023s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.044s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	0.003s
+[every other package PASS — full output omitted]
+```

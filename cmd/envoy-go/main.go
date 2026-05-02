@@ -100,7 +100,11 @@ func main() {
 	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
 	httpReg.Freeze()
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg)
+	// Task 11 will populate a *listenerfilter.ListenerFilterRegistry with
+	// the boot-registered filters (tls_inspector); for now thread nil. A nil
+	// registry is fine as long as no listener configures listener_filters[]
+	// (the manager errors at parse time otherwise).
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, nil)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

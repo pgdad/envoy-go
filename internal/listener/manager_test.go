@@ -26,6 +26,8 @@ import (
 	"github.com/esalaine/envoy-go/internal/cluster"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
+	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -37,6 +39,19 @@ import (
 func testHTTPRegistry() *filter_http.HTTPRegistry {
 	r := filter_http.NewHTTPRegistry()
 	r.Register(router.TypeURL, router.New)
+	r.Freeze()
+	return r
+}
+
+// testLFRegistry returns a freshly-allocated, frozen
+// *listenerfilter.ListenerFilterRegistry containing only tls_inspector. Used
+// by NewManager* call sites post-Task-9 to satisfy the boot-populated,
+// frozen ADR-0079 contract; listeners with no listener_filters[] ignore the
+// registry but it is still threaded for uniformity. Task 11 will replicate
+// this pattern in cmd/envoy-go/main.go.
+func testLFRegistry() *listenerfilter.ListenerFilterRegistry {
+	r := listenerfilter.NewListenerFilterRegistry()
+	r.Register(tls_inspector.TypeURL, tls_inspector.New)
 	r.Freeze()
 	return r
 }
@@ -272,7 +287,10 @@ func TestManager_Error_TwoFilterChains(t *testing.T) {
 	}
 }
 
-func TestManager_Error_NonEmptyFilterChainMatch(t *testing.T) {
+// TestManager_NonEmptyFilterChainMatch_DestinationPort_Accepted verifies the
+// ADR-0078 supersession of ADR-0033 clause 2: destination_port is now an
+// accepted FilterChainMatch dimension and parses without error.
+func TestManager_NonEmptyFilterChainMatch_DestinationPort_Accepted(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 	l := &listenerv3.Listener{
@@ -289,13 +307,15 @@ func TestManager_Error_NonEmptyFilterChainMatch(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(destination_port=80): %v (expected nil after ADR-0078)", err)
 	}
-	// Phase-03 (ADR-0033): destination_port is the specific field rejected.
-	if !strings.Contains(err.Error(), "destination_port") {
-		t.Errorf("error %q does not contain %q", err.Error(), "destination_port")
+	if len(mgr.runtimes) != 1 || len(mgr.runtimes[0].chainSpecs) != 1 {
+		t.Fatalf("expected 1 runtime with 1 chainSpec, got %d/%d", len(mgr.runtimes), len(mgr.runtimes[0].chainSpecs))
+	}
+	if got := mgr.runtimes[0].chainSpecs[0].DestinationPort; got != 80 {
+		t.Errorf("chainSpecs[0].DestinationPort = %d, want 80", got)
 	}
 }
 
@@ -880,9 +900,10 @@ func TestNewManager_MultiChain_MixedTLSPlaintext_Errors(t *testing.T) {
 	}
 }
 
-// TestNewManager_MultiChain_DefaultFilterChain_Errors verifies that setting
-// Listener.default_filter_chain is rejected.
-func TestNewManager_MultiChain_DefaultFilterChain_Errors(t *testing.T) {
+// TestParseDefaultFilterChainNoLongerErrors verifies the ADR-0078 supersession
+// of ADR-0033 clause 3: default_filter_chain is honored at parse — the
+// runtime's defaultSpec/defaultChain are populated.
+func TestParseDefaultFilterChainNoLongerErrors(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 
@@ -903,18 +924,24 @@ func TestNewManager_MultiChain_DefaultFilterChain_Errors(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
-	if err == nil {
-		t.Fatal("expected error for default_filter_chain, got nil")
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(default_filter_chain): %v (expected nil after ADR-0078)", err)
 	}
-	if !strings.Contains(err.Error(), "default_filter_chain") {
-		t.Errorf("error %q does not contain %q", err.Error(), "default_filter_chain")
+	rt := mgr.runtimes[0]
+	if rt.defaultSpec == nil {
+		t.Error("listenerRuntime.defaultSpec is nil; expected populated default ChainSpec")
+	}
+	if rt.defaultChain == nil {
+		t.Error("listenerRuntime.defaultChain is nil; expected populated default chainInfo")
 	}
 }
 
-// TestNewManager_MultiChain_NonSNIMatchField_Errors verifies that various
-// non-SNI FilterChainMatch fields are rejected.
-func TestNewManager_MultiChain_NonSNIMatchField_Errors(t *testing.T) {
+// TestParseChainSpecAcceptsAllEightDimensions verifies the ADR-0078
+// supersession of ADR-0033 clause 2: every chain-match dimension Envoy v1.37.2
+// documents is accepted by parseChainSpec without error and surfaces on the
+// constructed ChainSpec.
+func TestParseChainSpecAcceptsAllEightDimensions(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 
@@ -935,56 +962,161 @@ func TestNewManager_MultiChain_NonSNIMatchField_Errors(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		fcm     *listenerv3.FilterChainMatch
-		wantErr string
+		name string
+		fcm  *listenerv3.FilterChainMatch
+		// check inspects the parsed ChainSpec for the test's dimension.
+		check func(t *testing.T, spec *listenerfilter.ChainSpec)
 	}{
 		{
-			name:    "destination_port",
-			fcm:     &listenerv3.FilterChainMatch{DestinationPort: wrapperspb.UInt32(80)},
-			wantErr: "destination_port",
+			name: "destination_port",
+			fcm:  &listenerv3.FilterChainMatch{DestinationPort: wrapperspb.UInt32(80)},
+			check: func(t *testing.T, s *listenerfilter.ChainSpec) {
+				if s.DestinationPort != 80 {
+					t.Errorf("DestinationPort = %d, want 80", s.DestinationPort)
+				}
+			},
 		},
 		{
 			name: "prefix_ranges",
 			fcm: &listenerv3.FilterChainMatch{
 				PrefixRanges: []*corev3.CidrRange{{AddressPrefix: "10.0.0.0", PrefixLen: wrapperspb.UInt32(8)}},
 			},
-			wantErr: "prefix_ranges",
-		},
-		{
-			name: "source_ports",
-			fcm: &listenerv3.FilterChainMatch{
-				SourcePorts: []uint32{8080},
+			check: func(t *testing.T, s *listenerfilter.ChainSpec) {
+				if len(s.PrefixRanges) != 1 {
+					t.Errorf("PrefixRanges len = %d, want 1", len(s.PrefixRanges))
+				}
 			},
-			wantErr: "source_ports",
 		},
 		{
 			name: "source_prefix_ranges",
 			fcm: &listenerv3.FilterChainMatch{
 				SourcePrefixRanges: []*corev3.CidrRange{{AddressPrefix: "192.168.0.0", PrefixLen: wrapperspb.UInt32(16)}},
 			},
-			wantErr: "source_prefix_ranges",
+			check: func(t *testing.T, s *listenerfilter.ChainSpec) {
+				if len(s.SourcePrefixRanges) != 1 {
+					t.Errorf("SourcePrefixRanges len = %d, want 1", len(s.SourcePrefixRanges))
+				}
+			},
+		},
+		{
+			name: "source_type_LOCAL",
+			fcm:  &listenerv3.FilterChainMatch{SourceType: listenerv3.FilterChainMatch_SAME_IP_OR_LOOPBACK},
+			check: func(t *testing.T, s *listenerfilter.ChainSpec) {
+				if !s.SourceTypeLocal {
+					t.Error("SourceTypeLocal = false, want true")
+				}
+			},
+		},
+		{
+			name: "source_ports",
+			fcm:  &listenerv3.FilterChainMatch{SourcePorts: []uint32{8080}},
+			check: func(t *testing.T, s *listenerfilter.ChainSpec) {
+				if len(s.SourcePorts) != 1 || s.SourcePorts[0] != 8080 {
+					t.Errorf("SourcePorts = %v, want [8080]", s.SourcePorts)
+				}
+			},
+		},
+		{
+			name: "application_protocols",
+			fcm:  &listenerv3.FilterChainMatch{ApplicationProtocols: []string{"h2", "http/1.1"}},
+			check: func(t *testing.T, s *listenerfilter.ChainSpec) {
+				if len(s.ApplicationProtocols) != 2 {
+					t.Errorf("ApplicationProtocols len = %d, want 2", len(s.ApplicationProtocols))
+				}
+			},
+		},
+		{
+			name: "transport_protocol_raw_buffer",
+			fcm:  &listenerv3.FilterChainMatch{TransportProtocol: "raw_buffer"},
+			check: func(t *testing.T, s *listenerfilter.ChainSpec) {
+				if s.TransportProtocol != "raw_buffer" {
+					t.Errorf("TransportProtocol = %q, want %q", s.TransportProtocol, "raw_buffer")
+				}
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			boot := mkBoot(0, []*listenerv3.Listener{makeListener(tc.fcm)}, nil)
-			_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
-			if err == nil {
-				t.Fatalf("expected error for %s, got nil", tc.name)
+			mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+			if err != nil {
+				t.Fatalf("NewManager(%s): %v (expected nil)", tc.name, err)
 			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+			if len(mgr.runtimes) != 1 || len(mgr.runtimes[0].chainSpecs) != 1 {
+				t.Fatalf("expected 1 runtime/1 chainSpec, got %d/%d", len(mgr.runtimes), len(mgr.runtimes[0].chainSpecs))
 			}
+			tc.check(t, mgr.runtimes[0].chainSpecs[0])
 		})
 	}
 }
 
-// TestNewManager_MultiChain_ApplicationProtocols_Errors verifies that
-// application_protocols in filter_chain_match is rejected (ALPN match deferred
-// to phase 07).
-func TestNewManager_MultiChain_ApplicationProtocols_Errors(t *testing.T) {
+// TestParseChainSpecSilentlyIgnoresDirectSourcePrefixRanges verifies that
+// `direct_source_prefix_ranges` (the proxy-protocol original-source dimension)
+// is silently skipped at parse per SPEC §12 — no error, no field on the
+// ChainSpec.
+func TestParseChainSpecSilentlyIgnoresDirectSourcePrefixRanges(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "l_dspr",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{
+			FilterChainMatch: &listenerv3.FilterChainMatch{
+				DirectSourcePrefixRanges: []*corev3.CidrRange{{AddressPrefix: "10.0.0.0", PrefixLen: wrapperspb.UInt32(8)}},
+			},
+			Filters: []*listenerv3.Filter{filter},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v (direct_source_prefix_ranges should be silently skipped)", err)
+	}
+	spec := mgr.runtimes[0].chainSpecs[0]
+	if !spec.Empty {
+		t.Errorf("ChainSpec.Empty = false, want true (only direct_source_prefix_ranges set, which is silently skipped)")
+	}
+}
+
+// TestParseChainSpecRejectsUnknownTransportProtocol verifies that the
+// transport_protocol enum domain is enforced at parse: only "tls",
+// "raw_buffer", or "" are accepted.
+func TestParseChainSpecRejectsUnknownTransportProtocol(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "l_tp",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{
+			FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "quic"},
+			Filters:          []*listenerv3.Filter{filter},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		t.Fatal("expected error for transport_protocol=quic, got nil")
+	}
+	if !strings.Contains(err.Error(), `transport_protocol "quic"`) {
+		t.Errorf("error %q does not name the bad value", err.Error())
+	}
+}
+
+// TestNewManager_MultiChain_ApplicationProtocols_Accepted verifies that
+// application_protocols in filter_chain_match is accepted post-ADR-0078.
+// (Phase 03's parse-time error is superseded by ADR-0078 clause 2.)
+func TestNewManager_MultiChain_ApplicationProtocols_Accepted(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 
@@ -1005,12 +1137,12 @@ func TestNewManager_MultiChain_ApplicationProtocols_Errors(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
-	if err == nil {
-		t.Fatal("expected error for application_protocols, got nil")
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(application_protocols): %v (expected nil after ADR-0078)", err)
 	}
-	if !strings.Contains(err.Error(), "application_protocols") {
-		t.Errorf("error %q does not contain %q", err.Error(), "application_protocols")
+	if got := mgr.runtimes[0].chainSpecs[0].ApplicationProtocols; len(got) != 2 {
+		t.Errorf("chainSpecs[0].ApplicationProtocols = %v, want 2 elements", got)
 	}
 }
 
@@ -1093,25 +1225,65 @@ func TestNewManager_MultiChain_UnknownTransportSocket_Errors(t *testing.T) {
 	}
 }
 
-// TestNewManager_PlaintextMultiChain_Errors verifies that a plaintext listener
-// with more than one filter chain is rejected (SNI match requires TLS).
-func TestNewManager_PlaintextMultiChain_Errors(t *testing.T) {
+// TestNewManager_PlaintextMultiChain_WithSNI_Errors verifies the
+// ADR-0078 clause-6 caveat: a plaintext listener with multiple chains where
+// at least one chain populates server_names[] is still rejected — SNI cannot
+// match on plaintext.
+func TestNewManager_PlaintextMultiChain_WithSNI_Errors(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 
 	l := mkTLSListener("l_pt2", "127.0.0.1", 0, []*listenerv3.FilterChain{
-		mkTLSChain(nil, nil, filter), // plaintext catch-all
-		mkTLSChain(nil, nil, filter), // plaintext catch-all #2 — triggers both errors
+		mkTLSChain([]string{"alpha.envoy-go.test"}, nil, filter), // plaintext + SNI
+		mkTLSChain(nil, nil, filter),                             // plaintext catch-all
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
 	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
-		t.Fatal("expected error for plaintext multi-chain, got nil")
+		t.Fatal("expected error for plaintext multi-chain with SNI, got nil")
 	}
-	// Either "multiple filter_chains" or "plaintext" should appear.
-	if !strings.Contains(err.Error(), "plaintext") && !strings.Contains(err.Error(), "multiple") && !strings.Contains(err.Error(), "catch") {
-		t.Errorf("error %q does not mention plaintext/multiple constraint", err.Error())
+	if !strings.Contains(err.Error(), "plaintext") {
+		t.Errorf("error %q does not mention plaintext SNI constraint", err.Error())
+	}
+}
+
+// TestNewManager_PlaintextMultiChain_NonSNIDimensions_Accepted verifies that a
+// plaintext listener with multiple chains differing on non-SNI dimensions is
+// now ACCEPTED (ADR-0078 clause-6 partial supersession). The rule was: "no
+// multi-chain plaintext"; the rule is now: "no SNI-bearing multi-chain
+// plaintext".
+func TestNewManager_PlaintextMultiChain_NonSNIDimensions_Accepted(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+
+	l := &listenerv3.Listener{
+		Name: "l_pt_dst",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{
+			{
+				FilterChainMatch: &listenerv3.FilterChainMatch{DestinationPort: wrapperspb.UInt32(8080)},
+				Filters:          []*listenerv3.Filter{filter},
+			},
+			{
+				FilterChainMatch: &listenerv3.FilterChainMatch{DestinationPort: wrapperspb.UInt32(8081)},
+				Filters:          []*listenerv3.Filter{filter},
+			},
+		},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(plaintext multi-chain on dest_port): %v (expected nil after ADR-0078)", err)
+	}
+	if len(mgr.runtimes[0].chainSpecs) != 2 {
+		t.Errorf("chainSpecs len = %d, want 2", len(mgr.runtimes[0].chainSpecs))
 	}
 }
 
@@ -1311,7 +1483,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry())
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry())
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1331,7 +1503,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry())
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry())
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
@@ -1448,5 +1620,274 @@ func TestListenerManager_AllocatesTwoMetricsPerListener(t *testing.T) {
 		if !found {
 			t.Errorf("missing listener.<addr>%s metric (seen=%v)", w, seen)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-07.2 Task 9: listener_filters[] + ADR-0078 + ambiguous-selection tests
+// ---------------------------------------------------------------------------
+
+// mkTLSInspectorFilter returns a listenerv3.ListenerFilter wrapping an empty
+// (default-config) tls_inspector typed_config. Used by Task-9 tests that
+// exercise listener_filters[] resolution through the registry.
+//
+// The Any is constructed directly with the canonical tls_inspector type_url
+// and a nil Value. The tls_inspector parser tolerates a nil typed_config
+// Value (it returns the default config — see internal/listener/listenerfilter/tls_inspector/proto.go).
+func mkTLSInspectorFilter(_ *testing.T) *listenerv3.ListenerFilter {
+	return &listenerv3.ListenerFilter{
+		Name: "envoy.filters.listener.tls_inspector",
+		ConfigType: &listenerv3.ListenerFilter_TypedConfig{
+			TypedConfig: &anypb.Any{TypeUrl: tls_inspector.TypeURL},
+		},
+	}
+}
+
+// TestParseListenerFiltersResolvesViaRegistry verifies that a Listener
+// carrying `listener_filters: [{tls_inspector}]` is resolved through the
+// threaded *ListenerFilterRegistry — the per-connection FilterInstanceFactory
+// is captured on listenerRuntime.listenerFilterFactories.
+func TestParseListenerFiltersResolvesViaRegistry(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "l_lf",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains:    []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{filter}}},
+		ListenerFilters: []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if got := len(mgr.runtimes[0].listenerFilterFactories); got != 1 {
+		t.Errorf("listenerFilterFactories len = %d, want 1", got)
+	}
+}
+
+// TestParseListenerFiltersUnknownTypeURLErrors verifies that an unknown
+// listener-filter type_url errors with the documented message format.
+func TestParseListenerFiltersUnknownTypeURLErrors(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	bogus := &anypb.Any{TypeUrl: "type.googleapis.com/foo", Value: nil}
+	l := &listenerv3.Listener{
+		Name: "name",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{filter}}},
+		ListenerFilters: []*listenerv3.ListenerFilter{{
+			Name:       "envoy.filters.listener.unknown",
+			ConfigType: &listenerv3.ListenerFilter_TypedConfig{TypedConfig: bogus},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry())
+	if err == nil {
+		t.Fatal("expected error for unknown listener-filter type_url, got nil")
+	}
+	want := `listener: "name": listener_filters[0]: unknown filter type_url "type.googleapis.com/foo"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err.Error(), want)
+	}
+}
+
+// TestParseListenerFiltersTimeoutInRange verifies that a 5s
+// listener_filters_timeout parses to lfTimeoutMs=5000.
+func TestParseListenerFiltersTimeoutInRange(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "l_to",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains:           []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{filter}}},
+		ListenerFiltersTimeout: durationpb.New(5 * time.Second),
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if got := mgr.runtimes[0].lfTimeoutMs; got != 5000 {
+		t.Errorf("lfTimeoutMs = %d, want 5000", got)
+	}
+}
+
+// TestParseListenerFiltersTimeoutDefault verifies the unset/nil
+// listener_filters_timeout defaults to 15000ms (ADR-0082).
+func TestParseListenerFiltersTimeoutDefault(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_def", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if got := mgr.runtimes[0].lfTimeoutMs; got != 15000 {
+		t.Errorf("lfTimeoutMs default = %d, want 15000", got)
+	}
+}
+
+// TestParseListenerFiltersTimeoutBelowFloorErrors verifies that a 500ms
+// listener_filters_timeout errors with the [1s, 60s] envelope message.
+func TestParseListenerFiltersTimeoutBelowFloorErrors(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "name",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains:           []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{filter}}},
+		ListenerFiltersTimeout: durationpb.New(500 * time.Millisecond),
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		t.Fatal("expected error for listener_filters_timeout=500ms, got nil")
+	}
+	want := `listener: "name": listener_filters_timeout 500ms is outside the supported [1s, 60s] envelope`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err.Error(), want)
+	}
+}
+
+// TestParseListenerFiltersTimeoutAboveCapErrors verifies that a 90s
+// listener_filters_timeout errors with the same envelope-violation format.
+func TestParseListenerFiltersTimeoutAboveCapErrors(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	l := &listenerv3.Listener{
+		Name: "name",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains:           []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{filter}}},
+		ListenerFiltersTimeout: durationpb.New(90 * time.Second),
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		t.Fatal("expected error for listener_filters_timeout=90s, got nil")
+	}
+	want := `listener: "name": listener_filters_timeout 1m30s is outside the supported [1s, 60s] envelope`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err.Error(), want)
+	}
+}
+
+// TestParseChainSpecMixedTLSPreserved verifies that ADR-0033 clause 5
+// (preserved by ADR-0078): mixed TLS + plaintext WITHIN filter_chains[] is
+// rejected unless server_names disambiguate. The phase-03 test already
+// covers the mixed-TLS error message; this test re-asserts the post-ADR-0078
+// preservation.
+func TestParseChainSpecMixedTLSPreserved(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	tsAlpha := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
+
+	l := mkTLSListener("l_mix", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain([]string{"alpha.envoy-go.test"}, tsAlpha, filter), // TLS
+		mkTLSChain([]string{"beta.envoy-go.test"}, nil, filter),      // plaintext
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		t.Fatal("expected error for mixed TLS+plaintext in filter_chains[], got nil")
+	}
+	if !strings.Contains(err.Error(), "mixed TLS") {
+		t.Errorf("error %q does not contain %q", err.Error(), "mixed TLS")
+	}
+}
+
+// TestIdenticalFilterChainsErrorWithAmbiguousSelection verifies the
+// ADR-0081 final-tie rule: two chains with identical filter_chain_match
+// shapes error at NewManager-build with an `ambiguous selection` message.
+func TestIdenticalFilterChainsErrorWithAmbiguousSelection(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	// Two chains differing on terminal-filter only, identical match shape
+	// (DestinationPort=8080).
+	fcm := &listenerv3.FilterChainMatch{DestinationPort: wrapperspb.UInt32(8080)}
+	l := &listenerv3.Listener{
+		Name: "l_ambig",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{
+			{FilterChainMatch: fcm, Filters: []*listenerv3.Filter{filter}},
+			{FilterChainMatch: fcm, Filters: []*listenerv3.Filter{filter}},
+		},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		t.Fatal("expected error for identical filter_chain_match, got nil")
+	}
+	if !strings.Contains(err.Error(), "ambiguous selection") {
+		t.Errorf("error %q does not contain %q", err.Error(), "ambiguous selection")
+	}
+}
+
+// TestParseDefaultFilterChain_Plaintext_WithTLSFilterChain verifies the
+// ADR-0080 + ADR-0078 clause-5 caveat: default_filter_chain may have an
+// independent TLS posture from filter_chains[]. Specifically a TLS
+// filter_chains[] entry + a plaintext default_filter_chain coexist.
+func TestParseDefaultFilterChain_Plaintext_WithTLSFilterChain(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	tsAlpha := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
+
+	l := &listenerv3.Listener{
+		Name: "l_tls_plus_plain_default",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{
+			mkTLSChain([]string{"alpha.envoy-go.test"}, tsAlpha, filter),
+		},
+		DefaultFilterChain: &listenerv3.FilterChain{
+			Filters: []*listenerv3.Filter{filter}, // plaintext (no transport_socket)
+		},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v (TLS chains + plaintext default coexistence per ADR-0080)", err)
+	}
+	if mgr.runtimes[0].defaultChain == nil {
+		t.Error("defaultChain not populated")
+	}
+	if mgr.runtimes[0].defaultChain != nil && mgr.runtimes[0].defaultChain.tlsCfg != nil {
+		t.Error("defaultChain.tlsCfg should be nil (plaintext default)")
 	}
 }

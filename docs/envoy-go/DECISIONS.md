@@ -3116,3 +3116,49 @@ The priority-order decision is pinned to Envoy v1.37.2 at server SHA `5afe27fb33
 07.2 PLAN Task 5 (the `chainmatch.SelectChain` algorithm; same task as ADR-0080). The bootstrap parser's `*ChainSpec` construction at `internal/listener/manager.go` (Task 9) and the per-connection `SelectChain` invocation in the manager's accept-loop (Task 10) cross-reference this ADR.
 
 ---
+
+## ADR-0078: ADR-0033 partial supersession enumeration
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.5 (record durable design rationale; the supersession enumeration is a contract that future xDS / listener phases MUST consult).
+**Supersedes (partial):** ADR-0033 (Phase-03 filter-chain subset).
+
+### Context
+
+Phase 07.2's deliverable rewrites `internal/listener/manager.go`'s `validateFilterChainMatch` (the phase-03 narrow whitelist) into `parseChainSpec` (the phase-07.2 8-dimension parser per ADR-0081), removes the parse-time error on `Listener.default_filter_chain` (per ADR-0080), and adds `listener_filters[]` parsing (per ADR-0079). Each of these changes lifts a constraint introduced by ADR-0033 (Phase-03 filter-chain subset). SPEC §5.7 enumerates the clause-by-clause disposition: which parts of ADR-0033 stay in 07.2 vs are superseded. This ADR is the dedicated record of that enumeration so future readers of ADR-0033 see the supersession relationship via a grep on `DECISIONS.md`.
+
+ADR-0033 has 9 clauses. The 07.2 deliverables explicitly settle each one — three are fully preserved, three are preserved with caveats, and three are superseded. Recording this in a dedicated ADR makes the relationship grep-verifiable and discoverable from either side (the future reader of ADR-0033 can find ADR-0078 by searching for "Supersedes (partial): ADR-0033"; the reader of ADR-0078 sees the canonical clause-by-clause table).
+
+### Decision
+
+The 9 ADR-0033 clauses receive the following 07.2 disposition (full clause-by-clause table in SPEC §5.7):
+
+1. **Clause 1 (`filter_chains` must be ≥ 1):** **STAYS** with a wording-update caveat — 07.2 preserves the structural requirement but the union of `filter_chains[]` and `default_filter_chain` must contribute at least one chain (a default-only listener is now valid per ADR-0080).
+2. **Clause 2 (`filter_chain_match` whitelist — only `server_names` + `transport_protocol == "tls"`):** **PARTIALLY SUPERSEDED.** 07.2 honors the full 8-dimension `FilterChainMatch` per ADR-0081. Only `direct_source_prefix_ranges` remains silently-ignored.
+3. **Clause 3 (`Listener.default_filter_chain` set → error):** **TOTALLY SUPERSEDED.** 07.2 honors the field per ADR-0080 — `default_filter_chain` is the no-match fallback chain.
+4. **Clause 4 (`transport_socket` may be nil or carry `DownstreamTlsContext`):** **STAYS.** Unchanged.
+5. **Clause 5 (mixed TLS/plaintext-on-one-listener error):** **STAYS** with caveat — the mixed-TLS-and-plaintext rule is preserved WITHIN `filter_chains[]`; `default_filter_chain` MAY have its own `transport_socket` independent of the `filter_chains[]` entries' TLS posture per ADR-0080.
+6. **Clause 6 (plaintext multi-chain error):** **PARTIALLY SUPERSEDED.** A plaintext listener with multiple chains is now allowed if the chains use non-SNI dimensions for matching. The legacy "no plaintext multi-chain" error is preserved as a special case for plaintext listeners where at least one chain populates `server_names[]` (SNI cannot match on plaintext).
+7. **Clause 7 (`require_client_certificate=true` errors):** **STAYS.** Unchanged.
+8. **Clause 8 (`listener_filters` silently skipped):** **TOTALLY SUPERSEDED.** 07.2 honors the field per ADR-0079 — `listener_filters[]` resolves through the threaded `*ListenerFilterRegistry` and dispatches before chain match.
+9. **Clause 9 (SNI-internal sub-ordering):** **PRESERVED AS SPECIAL CASE.** The SNI-internal sub-ordering (exact > suffix-wildcard > universal-wildcard > catch-all) becomes the tie-breaker WITHIN the `server_names` priority slot of the new 8-dimension algorithm. The "handshake fails" no-match case is replaced by "fall through to `default_filter_chain` if set; otherwise close conn" per ADR-0080. The `chainSpecificityRank` LOGIC is preserved verbatim as `sniSpecificityRank` in `internal/listener/listenerfilter/chainmatch.go`; the original `chainSpecificityRank` symbol in `internal/listener/manager.go` is deleted at Task 9 (no remaining callers after the chain-sort and dispatch refactor).
+
+**Net effect:** clauses 1, 4, 7 fully preserved; clauses 5, 6, 9 preserved with caveats; clauses 2, 3, 8 superseded.
+
+### Rationale
+
+A clause-by-clause supersession ADR is the cleanest way to record the relationship between ADR-0033 and the 07.2 ADR set. The alternative — leaving the supersession implicit, scattered across ADR-0079 / ADR-0080 / ADR-0081 — would require a future reader to grep three ADRs to reconstruct the picture. ADR-0078 consolidates the enumeration in one place; the table is the canonical source the SPEC §5.7 row points at. Future xDS / listener phases that revisit any ADR-0033 clause can cite ADR-0078 directly.
+
+### Consequences
+
+- (a) A future reader of ADR-0033 sees the supersession relationship enumerated in ADR-0078 (grep `DECISIONS.md` for `Supersedes (partial): ADR-0033`).
+- (b) The `chainSpecificityRank` symbol is deleted from `internal/listener/manager.go` at Task 9; the LOGIC is preserved in `internal/listener/listenerfilter/chainmatch.go`'s `sniSpecificityRank`. Future hardening phases that revisit SNI specificity consult `chainmatch.go`, not the deleted manager.go function.
+- (c) The `parseChainSpec` function (replacing `validateFilterChainMatch`) accepts all 8 chain-match dimensions per ADR-0081. The phase-03 7-error rejection-path block at the old `manager.go:382-398` is removed.
+- (d) The `listenerRuntime` struct gains `chainSpecs []*ChainSpec`, `defaultSpec *ChainSpec`, `defaultChain *chainInfo`, `chainByName map[string]*chainInfo`, `listenerFilterFactories []FilterInstanceFactory`, `lfTimeoutMs uint32`, and `continueOnLfTimeout bool` at Task 9; Task 10 consumes these in the dispatch refactor.
+
+### Lands-in-task
+
+07.2 PLAN Task 9 (the `internal/listener/manager.go` rewrite of `validateFilterChainMatch` → `parseChainSpec`, the removal of the `default_filter_chain` parse-time error, the addition of `listener_filters[]` parsing — the first task that materially realizes the supersession in production code). The dispatch-path consumption of the new `listenerRuntime` fields lands at Task 10.
+
+---
