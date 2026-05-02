@@ -1663,7 +1663,7 @@ ok  	github.com/esalaine/envoy-go/test/differential	20.823s
 
 ## Task 20 — boot wiring (HTTPRegistry alloc + freeze) + cors v3 blank-import
 
-**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+**Commits:** ca3ba49 (code) → TBD (PROGRESS SHA-fill).
 
 **Files changed:**
 
