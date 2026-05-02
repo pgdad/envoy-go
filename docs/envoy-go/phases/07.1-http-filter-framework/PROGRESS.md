@@ -1206,3 +1206,107 @@ Test counts post-fix: 86 top-level tests (was 85) + 3 fuzz seeds (FuzzHCMConfigP
 2. **Encode chain dormant.** `dispatchRequest` writes via the action's direct `bw` access; `RunEncodeHeaders` / `RunEncodeData` / `RunEncodeTrailers` are never invoked on the H1 path post-Task-15. The router's own Encode* methods are Continue pass-throughs. PLAN deviation (vi) — recorded above — captures this; with router as the only filter in the chain, the encode chain is a no-op and running it produces no behavior change. Task 18 (cors response-header injection) is the first task that requires the encode chain to actually run on the H1 path. Task 18 design must address: routing the action's wire output through a chain-fed buffer (instead of direct-to-bw) so encode-side filters can mutate response headers + body before the wire bytes are flushed; the action's role narrows to "produce upstream-response headers + body" rather than "write the final wire envelope". Coupled with item 1 above (chain becomes the source of truth for wire-byte accounting).
 
 These are NOT bugs in Task 15's deliverable; they are structural-debt items that fall on Task 18 to repay. The chain's encode-side machinery (Tasks 6 + 7 + 9) is already implemented; Task 18 wires it into the H1 dispatch path AND collapses the Action 4-tuple into a 3-tuple at the same time.
+
+## Task 16 — internal/filter/hcm/h2dispatch.go — H2 dispatch runs FilterChain
+
+**Commits:** 2829491 — this task's commit (H2 dispatch + chain wiring); TBD-task16-shafill — PROGRESS SHA-fill follow-up
+
+**Notes:** Rewrote `internal/filter/hcm/h2dispatch.go`'s dispatch entry-point to drive the per-stream `*filter_http.FilterChain` allocated from `f.chainConfig`. The new shape mirrors Task 15's H1 connection.go rewrite:
+
+1. `h2Dispatcher.Match` resolves the route via `f.table.match` and returns a `chainDispatchAction` (a single `h2.Action` implementation) carrying the matched route's `H2Action` closure + `routeIdx`. The pre-Task-16 type-switch on `*routerActionH2` / `*directResponseAction` and the four adapter types (`h2DirectResponseAdapter`, `h2RouterActionAdapter`, `h2RouterActionRejection`, plus the `routerActionH2` defensive stub) are GONE.
+2. `chainDispatchAction.WriteH2` allocates fresh per-request filter instances from `chainConfig`, builds `chain := filter_http.NewFilterChain(chainHF, f.perRouteConfig)`, calls `chain.SetRequestCtx(ctx, routeIdx)`, locates the terminal `*router.Filter`, injects `SetH2Action` / `SetH2Request` / `SetH2Writer`, runs `chain.RunDecodeHeaders(req.Header, endStream=...)` (and `RunDecodeData(h2req.Body, true)` if a body is present — H2 bodies are fully buffered at the codec layer before dispatch is spawned per `h2.serverStream.dispatch`), invokes `rf.RunAction(ctx)`, reads back `(status, bytesSent, picked, actionErr)` via the existing getters, emits the access-log record via `f.emitAccessLogH2`, Inc's the HCM-scope `downstream_rq_<Nxx>` bucket, logs M-9 carry-forward (`"h2: action error: %v"`) on action error, and returns the actionErr.
+3. **No-match path:** `Match` returns a `chainDispatchAction` with `routeIdx=-1` whose `action` is `(&directResponseAction{status:404}).asRouterActionH2()`. `WriteH2` short-circuits chain construction, runs the closure directly (writing the 404 to the H2 writer), emits access-log, Inc's the 4xx bucket. Mirrors H1 `connection.go` `dispatchRequest`'s no-match branch.
+
+The H2 fixture set (0004-h2-routing) is restored to GREEN; h2spec at 53/53 PASS. The defensive `routerActionH2` stub from Task 15 is DELETED. The deliberate-red build-tag gate `envoy_go_hcm_h2_legacy_tests` on `h2dispatch_test.go` is REMOVED — the file builds and runs unconditionally with a fresh test set targeting the chain-mediated dispatch path.
+
+**Architectural decisions made:**
+
+1. **Parallel H2 injection surface on `*router.Filter`.** Added `H2Action` function type (`func(ctx, h2.H2Request, h2.StreamWriter) (status, bytesSent, picked, err)`) + three new H2 fields/setters: `SetH2Action`, `SetH2Request`, `SetH2Writer`. Mutually exclusive with the H1 setter trio: HCM dispatch picks ONE per request based on the listener's negotiated codec. `RunAction(ctx)` was widened to route to the H2 path when `h2Action` is set, the H1 path when `action` is set, and panics otherwise. The shared result-capture fields (`actionStatus`, `actionBytesSent`, `actionPicked`, `actionErr`) are reused — the chain-completion access-log emit hook reads the same getters regardless of codec. This is the lighter-path option from the architectural-notes section ("H2-specific setter + H2-specific Action variant"); a unified writer abstraction is left for Task 18's reviewer to decide if it's worth the refactor.
+
+2. **`router.H2ClusterAction(c *cluster.Cluster) router.H2Action` constructor.** Exported from the router package. Builds a closure that delegates to a fresh internal driver `doH2ClusterAction(ctx, a, req, sw)` modeled after `routerActionH2.doH2` but surfacing `(status, bytesSent, picked, err)` for the chain-mediated dispatch path. Failure-class mapping per SPEC §11.9: `Cluster.DialH2` error → 502 local reply; `RoundTrip` ctx-cancel → status=0 + `*h2.Error(CANCEL)` (caller-side ctx-cancel sentinel discrimination via `errors.Is(ctx.Err(), context.Canceled/DeadlineExceeded)` — distinguishes from upstream-conn-died errors); `RoundTrip` protocol error → 502 local reply; upstream HTTP status forwarded verbatim. The status==0 path is the H2 sentinel per SPEC §2.1 last bullet — `emitAccessLogH2` skips submission and the bucket Inc skips per the `status > 0` guard in `chainDispatchAction.WriteH2`.
+
+3. **`clusterRouteAction.asRouterActionH2()` + `directResponseAction.asRouterActionH2()`.** The same `clusterRouteAction` bridge type now satisfies BOTH H1 and H2 dispatch paths via `asRouterAction()` + `asRouterActionH2()`. HCM dispatch picks which `asRouterAction*` to invoke based on the listener's negotiated codec — H1 listeners go through `connection.go` calling `asRouterAction`; H2 listeners go through `h2dispatch.go` calling `asRouterActionH2`. This collapses the phase-05.2 `*routerAction` / `*routerActionH2` variant selection into a single bridge type whose router-package backend handles both protocols. The `routeAction` interface gained a third method `asRouterActionH2() router.H2Action`; `directResponseAction` got a parallel `asRouterActionH2` returning a closure wrapping `writeH2`.
+
+4. **Single `chainDispatchAction` h2.Action implementation.** The pre-Task-16 dispatcher had 4 distinct h2.Action types (one per match-outcome class). Task 16 collapses them into ONE: the post-match path is identical regardless of action variant (build chain, run decode, RunAction, read captures, emit access-log, Inc bucket). The match-time decision becomes "which `H2Action` closure to inject into the terminal router filter" (matched route's `asRouterActionH2()` OR a 404-synth direct_response's `asRouterActionH2()`); the dispatch-time machinery is uniform. Mirrors H1's single `dispatchRequest` shape.
+
+5. **No-match short-circuit (no chain construction).** When `routeIdx==-1`, `WriteH2` skips chain allocation and invokes the H2Action closure directly. This matches the H1 path: `dispatchRequest` synthesizes 404 without building a chain because there is no route → no per-route config → no terminal action machinery. The HCM-scope `downstream_rq_total` Inc still fires (in `Match`, before route resolution); the response-class Inc + access-log emit fire from the same chain-completion hook.
+
+6. **H2 ctx-cancel sentinel preserved (SPEC §2.1).** The H2Action's status==0 return value is the canonical "ctx canceled, no terminating status" shape. `chainDispatchAction.WriteH2` does NOT special-case it; the `f.emitAccessLogH2` and `f.downstreamStatusClassCounter(status)` paths are no-ops on status==0 (per their own internal guards). The actionErr (an `*h2.Error{Code: ErrCancel}`) propagates upward to `serverStream.dispatch`, which reads `err.Code` to emit `RST_STREAM(CANCEL)` per the dispatch carry-error contract. Logging M-9 still fires on the err path.
+
+**Files changed:**
+
+- `internal/filter/http/router/router.go` (+~50 LoC): added `H2Action` function type + import of `internal/filter/hcm/h2`. Added `h2Action`, `h2Req`, `h2Sw` fields on `*Filter`. Added `SetH2Action`, `SetH2Request`, `SetH2Writer` setters. Widened `RunAction(ctx)` to route via switch over which trio is populated; panic message tightened to disambiguate H1-trio-incomplete vs H2-trio-incomplete vs neither-set.
+
+- `internal/filter/http/router/router_h2.go` (+~70 LoC): added `H2ClusterAction(c)` exported constructor + `doH2ClusterAction` helper that mirrors `routerActionH2.doH2` upstream-driving logic but exposes `bytesSent + picked` to the closure caller. The pre-existing `routerActionH2` type + `doH2` method are preserved verbatim (consumed by the `router_h2_test.go` byte-preserved tests).
+
+- `internal/filter/hcm/route.go`: extended `routeAction` interface with a third method `asRouterActionH2() router.H2Action`.
+
+- `internal/filter/hcm/actions.go`: added `directResponseAction.asRouterActionH2` (closure wrapping `writeH2`) + `clusterRouteAction.asRouterActionH2` (delegates to `router.H2ClusterAction`).
+
+- `internal/filter/hcm/h2dispatch.go`: full rewrite. Removed: defensive `routerActionH2` stub, `h2Dispatcher.Match`'s 4-arm type-switch, `h2DirectResponseAdapter`, `h2RouterActionAdapter`, `h2RouterActionRejection`. Added: `chainDispatchAction` (single `h2.Action` implementation); `(*Filter).write500H2` defensive helper for the unreachable non-`*router.Filter`-terminal branch.
+
+- `internal/filter/hcm/h2dispatch_test.go`: full rewrite. Removed `//go:build envoy_go_hcm_h2_legacy_tests` build tag (file builds unconditionally). Removed pre-Task-16 tests against `h2RouterActionAdapter` / `h2DirectResponseAdapter` / `routerActionH2`. Added 5 new tests targeting the chain-mediated dispatch path: `TestH2Dispatcher_Match_DirectResponse_RunsChainAndEmitsAccessLog`, `TestH2Dispatcher_Match_NoMatch_Synthesizes404`, `TestH2Dispatcher_ActionError_LogsM9` (M-9 carry-forward), `TestH2Dispatcher_CtxCancel_Status0_SkipsAccessLog` (SPEC §2.1 sentinel), `TestH2Dispatcher_Match_IncDownstreamRqTotal`. Local `captureH2Writer` helper (the router-package's helper is package-private to that package's tests).
+
+**PLAN deviations:**
+
+- (i) **`RunDecodeTrailers` not invoked on H2 path.** PLAN.md:2398 says the H2 path may need `RunDecodeData` if a body is streamed via DATA frames; it does NOT mention trailers. Task 16's implementation skips `RunDecodeTrailers` on the H2 path because (a) the FilterChain framework does not yet expose `RunDecodeTrailers` (Task 18 will add it for the cors/probe filters), and (b) per ADR-0058, request trailers are observed-and-discarded at the codec layer (`h2.serverStream.recvTrailingHeaders` returns nil after pseudo-header validation) — they don't reach the chain. The H2 fixture set (0004-h2-routing) does not exercise trailers; h2spec passes 53/53 with this shape. Task 18 will revisit if cors needs trailer-side hooks.
+
+- (ii) **H2 body fed as a single `RunDecodeData` chunk.** The H2 codec buffers DATA frames into `s.reqBody` and snapshots the body before launching the dispatch goroutine (per `h2.serverStream.dispatch` snapshotting). Task 16 surfaces the buffered body as a single `RunDecodeData(body, endStream=true)` call on the chain — NOT as a stream of per-frame chunks. The chain-side `DataStopIterationAndBuffer` cap (1 MiB per ADR-0076) is enforced; future per-frame-chunk threading would require codec-layer changes (the dispatcher would need to be invoked per-DATA-frame, not once-per-stream-end). This matches the H1 path's body shape: `connection.go` reads chunks of up to 32 KiB but the chain sees them as decode-data calls — the H2 path uses one bigger call. No behavior divergence on the test set.
+
+- (iii) **`H2ClusterAction` constructor lives in `router_h2.go`, NOT a new file.** PLAN.md:2402 says "the router filter currently has `H1ClusterAction` as a constructor for the H1 path. You will need an `H2ClusterAction` mirror." Task 16 colocates `H2ClusterAction` + `doH2ClusterAction` next to the existing `routerActionH2` driver in `router_h2.go` (mirrors H1's `H1ClusterAction` + `doH1ClusterAction` colocation in `router.go`). No new files in the router package.
+
+- (iv) **M-9 log-line text changed: "h2: doH2 error" → "h2: action error".** The pre-Task-16 log line was specific to `h2RouterActionAdapter`'s direct invocation of `doH2`. Post-Task-16, the chain-mediated dispatch path's terminal invocation is `rf.RunAction(ctx)` which dispatches to either an `H2Action` closure (cluster-routed) OR an `H2Action` closure wrapping `writeH2` (direct_response) — neither is named `doH2` from HCM dispatch's vantage point. The log line was generalized to "h2: action error: %v" to cover both shapes. Operators grep'ing logs for the pre-Task-16 prefix will need to update; the surface is INTERNAL_ERROR-class RST_STREAM diagnostic logging only (no operator runbook references the prefix).
+
+- (v) **`asRouterActionH2() router.H2Action` added to `routeAction` interface.** PLAN.md:2398-2402 doesn't explicitly say to extend the interface; it implies "the H2 action (replacing the deleted `routerActionH2`) drives the H2 codec wire output via the H2 streamWriter." The cleanest seam is the interface extension (mirrors `asRouterAction`); the alternative (a separate `routeActionH2` interface with a type assertion at the call site) was considered and rejected because both action types need to satisfy both H1 and H2 dispatch paths (a direct_response route is codec-neutral; only the writer differs).
+
+**Acceptance:**
+
+- `go build ./...` clean (final restoration — the package now builds across all tags).
+- `go vet ./...` clean.
+- `go test ./internal/filter/hcm/ -count=1 -v` PASS (91 tests + 3 fuzz seeds, no build tags). The 5 new H2 dispatch tests join the existing 86 from Task 15; h2dispatch_test.go runs unconditionally.
+- `go test ./...` PASS across all packages including `./test/conformance/h2spec/` (53/53 h2spec tests PASS).
+- `go test ./test/differential/ -count=1 -v -run TestDifferential` — all 7 fixtures PASS (0000, 0001, 0002, 0003, 0004, 0005, 0006). Fixture 0004-h2-routing is GREEN again.
+- `grep -rn 'routerAction\b\|routerActionH2\b' internal/` returns ZERO non-comment matches outside the router package (where `routerAction` + `routerActionH2` are package-private types). The 6 dangling-reference call sites in `internal/filter/hcm/h2dispatch.go` from Task 12 are GONE.
+- Defensive `routerActionH2` stub from Task 15 is DELETED.
+
+**Outputs:**
+
+```
+$ go build ./...
+(clean)
+
+$ go vet ./...
+(clean)
+
+$ grep -rn 'routerAction\b\|routerActionH2\b' internal/filter/hcm/ --include='*.go' | grep -vE '//' | grep -v 'comment'
+(zero non-comment matches in hcm package)
+
+$ go test ./internal/filter/hcm/ -count=1 -v 2>&1 | tail -8
+=== RUN   FuzzHCMConfigParse/seed#1
+=== RUN   FuzzHCMConfigParse/seed#2
+--- PASS: FuzzHCMConfigParse (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#0 (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#1 (0.00s)
+    --- PASS: FuzzHCMConfigParse/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.009s
+
+$ go test ./test/differential/ -count=1 -v -run TestDifferential 2>&1 | tail -10
+--- PASS: TestDifferential (20.32s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.69s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.20s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.30s)
+    --- PASS: TestDifferential/0003-http11-routing (1.33s)
+    --- PASS: TestDifferential/0004-h2-routing (1.82s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.99s)
+    --- PASS: TestDifferential/0006-access-log (10.98s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	20.406s
+
+$ go test ./test/conformance/h2spec/ -count=1 -v 2>&1 | grep -E '53 tests'
+        53 tests, 53 passed, 0 skipped, 0 failed
+```
+
+**Closes Tasks 12-15 transient-non-buildable / dangling-refs / build-tag situation:** the hcm package is fully buildable across all tags; all 7 differential fixtures PASS; h2spec at 53/53; no `routerAction` / `routerActionH2` non-comment refs outside the router package; the defensive Task-15 `routerActionH2` stub is DELETED; the `envoy_go_hcm_h2_legacy_tests` build tag is REMOVED.
+
+**Task 18 prerequisites carried forward unchanged from Task 15** — both prerequisites (router.Action 4-tuple → 3-tuple collapse; encode chain wired into dispatch path) still apply on the H2 side. The H2 path's `H2Action` is also a 4-tuple (`status, bytesSent, picked, err`); Task 18's chain-rewrite must collapse both H1 + H2 Action shapes uniformly. The encode chain is NOT exercised by `chainDispatchAction.WriteH2` post-Task-16 (the H2Action writes HEADERS+DATA directly to the `h2.StreamWriter`); Task 18 design must address routing the H2 wire output through a chain-fed buffer so encode-side filters can mutate response headers + body before the wire bytes are written.
