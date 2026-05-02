@@ -1,9 +1,11 @@
 package admin
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -313,5 +315,69 @@ func TestAdmin_FourEndpointsAcceptAnyMethod(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("POST /config_dump status: got %d, want 200 (Envoy parity per §11.8)", resp.StatusCode)
+	}
+}
+
+// TestAdminConcurrentScrapeRace lands SPEC §3 gate (b) + §5.6 race-detector
+// contract: 100 goroutines × 4 endpoints × 1s under `go test -race ./...`.
+// Asserts no race-detector finding, no panic, and all responses succeed (200).
+//
+// The four 08.1 handlers read immutable-post-boot state (s.bs.Proto,
+// s.cm.Clusters() snapshot, s.lm.Listeners() snapshot, s.bootTime); only
+// s.ready is read mutably (via atomic.Bool). This test gives the race
+// detector a chance to flag any unsynchronised access while the four
+// endpoints are scraped concurrently.
+func TestAdminConcurrentScrapeRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("race-stress test; skipped under -short")
+	}
+	bs := mustMinimalBs(t)
+	cm := mustMinimalCM(t, bs)
+	lm := mustMinimalLM(t, bs, cm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	addr, err := s.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	s.MarkReady()
+	time.Sleep(20 * time.Millisecond)
+
+	const N = 100
+	const D = 1 * time.Second
+	deadline := time.Now().Add(D)
+	endpoints := []string{"/config_dump", "/clusters", "/listeners", "/server_info"}
+	var wg sync.WaitGroup
+	errs := make(chan error, N*4)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			client := &http.Client{Timeout: 2 * time.Second}
+			for time.Now().Before(deadline) {
+				ep := endpoints[(i+int(time.Now().UnixNano()))%len(endpoints)]
+				resp, err := client.Get("http://" + addr + ep)
+				if err != nil {
+					select {
+					case errs <- fmt.Errorf("goroutine %d %s: %w", i, ep, err):
+					default:
+					}
+					return
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != 200 {
+					select {
+					case errs <- fmt.Errorf("goroutine %d %s: status %d", i, ep, resp.StatusCode):
+					default:
+					}
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("%v", err)
 	}
 }
