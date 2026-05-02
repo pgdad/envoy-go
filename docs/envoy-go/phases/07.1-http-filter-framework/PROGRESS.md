@@ -1063,7 +1063,7 @@ The hcm package non-buildability is the same six dangling-refs red state as Task
 
 ## Task 15 — internal/filter/hcm/connection.go — H1 dispatch runs FilterChain
 
-**Commits:** TBD-task15 — this task's commit (H1 dispatch + chain wiring); TBD-task15-shafill — PROGRESS SHA-fill follow-up
+**Commits:** 7d677e3 — this task's commit (H1 dispatch + chain wiring); TBD-task15-shafill — PROGRESS SHA-fill follow-up
 
 **Notes:** Rewrote `internal/filter/hcm/connection.go`'s inner dispatch (now factored into `(*Filter).dispatchRequest`) to drive the per-request `*filter_http.FilterChain` allocated from `f.chainConfig`. The new shape:
 
