@@ -1394,7 +1394,7 @@ ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.014s
 
 ## Task 18 — internal/filter/http/cors — real envoy.filters.http.cors filter [ADR-0074]
 
-**Commits:** TBD-task18 — this task's commit (cors filter + encode chain wiring + Action 3-tuple); TBD-task18-shafill — PROGRESS SHA-fill follow-up
+**Commits:** c548532 — this task's commit (cors filter + encode chain wiring + Action 3-tuple); TBD-task18-shafill — PROGRESS SHA-fill follow-up
 
 **Notes:** Landed the first real Envoy HTTP filter — `envoy.filters.http.cors` — alongside the two infrastructure prerequisites carried forward from Tasks 15 + 16: P1 (the `router.Action` 4-tuple `(status, bytesSent, picked, err)` collapses to the 3-tuple `(ActionResponse, picked, err)` so the chain becomes the source of truth for wire-byte accounting) and P2 (the encode chain is wired through HCM dispatch — `dispatchRequest` and `chainDispatchAction.WriteH2` run `RunEncodeHeaders`/`RunEncodeData` over the action's response BEFORE the wire-write fires, so cors's encode-side header injection takes effect on actual responses).
 
