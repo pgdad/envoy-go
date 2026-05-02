@@ -906,3 +906,11 @@ fuzz: elapsed: 30s, execs: 16447352 (0/sec), new interesting: 5 (total: 93)
 PASS
 ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	30.139s
 ```
+
+---
+
+## Phase 07.2 — DONE [ADR-0077, ADR-0078, ADR-0079, ADR-0080, ADR-0081, ADR-0082, ADR-0083]
+
+**Commits:** TBD — this phase-done commit
+**Notes:** Phase 07.2 lands the listener-chain-completion surface — `internal/listener/listenerfilter/` package with 8-dim FilterChainMatch precedence algorithm + `tls_inspector` listener filter + `Listener.default_filter_chain` honored + `listener_filters[]` honored + unified pre/post-handshake dispatch in `internal/listener/manager.go`. Differential surface: fixture `0008-listener-chain-match` GREEN (per-connection backend-port routing byte-equal across envoy-go and reference Envoy v1.37.2 over the 5-connection workload). Conformance: h2spec 53/53 PASS at the ADR-0051 pin (UNCHANGED). All 10 fuzzers (FuzzFilterChainMatch is the new 10th) clean for 30s each at the ADR-0018 short-budget. The parent ROADMAP row `07-filter-chain-framework` flips to `done` at this commit per the parent SPEC §5 closure pattern. REVIEW.md APPROVED with 10 carry-forward minors (no Critical/Important).
+**REVIEW.md:** present and APPROVED at this commit.
