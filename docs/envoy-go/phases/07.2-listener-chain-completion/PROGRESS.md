@@ -255,3 +255,80 @@ ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector
 $ go vet ./internal/listener/listenerfilter/tls_inspector/...
 $ golangci-lint run ./internal/listener/listenerfilter/tls_inspector/...
 ```
+
+## Task 8 — internal/listener/listenerfilter/tls_inspector/{doc,tls_inspector,proto}.go
+
+**Commits:** TBD — this task's commit
+**Notes:** Completed the `tls_inspector/` sub-package with the full ListenerFilter implementation: `doc.go` (~22 LoC; package-level overview citing ADR-0079 two-step factory pattern + D-3.2 no-cgo discipline + Introduced-by 07.2 marker), `tls_inspector.go` (~70 LoC: PLAN-verbatim from PLAN lines 1913-1979 — `TypeURL` constant matching upstream go-control-plane's `type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector`; `New(tc, ctx) (FilterInstanceFactory, error)` factory; private `config{bufferSize int}` + `filter{cfg *config}` types; `Inspect(ctx, peeker, inputs)` peeks `cfg.bufferSize` bytes, sets `inputs.TransportProtocol="raw_buffer"` on parse failure or empty preamble, sets `"tls"` + populates `ServerName`/`ApplicationProtocols` on ClientHello detection — always returns `Continue`; `OnDestroy()` no-op), `proto.go` (~38 LoC: PLAN-verbatim from PLAN lines 1985-2021 — `defaultBufferSize=4096`, `minBufferSize=256`, `maxBufferSize=65536`; `parseConfig(*anypb.Any)` returns default config on nil tc; unmarshals `tls_inspectorv3.TlsInspector`; honors `InitialReadBufferSize` with floor-error `tls_inspector: initial_read_buffer_size %d below floor 256` and silent-clamp at 65536; `EnableJa3Fingerprinting` silently ignored per SPEC §12). Tests in `tls_inspector_test.go` (~190 LoC; 6 tests) cover: `TestInspectWithClientHelloPopulatesInputs` (drives Inspect over a peekConn fed real ClientHello bytes via `feedBytesAsPeeker(captureClientHelloBytes(...))` — asserts TransportProtocol="tls", ServerName="foo.example.test", ApplicationProtocols=[h2 http/1.1]), `TestInspectWithNonTLSPreambleSetsRawBuffer` (HTTP/1.1 GET preamble → TransportProtocol="raw_buffer"; SNI + ALPN remain empty), `TestInspectWithEmptyConnectionDoesNotPanic` (cli + srv both pre-closed; recover() guard + Continue assertion), `TestNewRoundtripsThroughRegistry` (Register `New` under `TypeURL` in a `NewListenerFilterRegistry`, Freeze, Lookup, instantiate via FilterInstanceFactory, type-assert `*filter`, verify cfg.bufferSize=2048 honors UInt32(2048) override), `TestInspectConcurrentIndependentConnections` (10 goroutines each running Inspect on independent feedBytesAsPeeker pipes — race-clean), `TestOnDestroyIsNoOp` (3 calls, no panic). Tests in `proto_test.go` (~95 LoC; 6 tests) cover: nil-tc default, empty-proto default, custom-in-range (1024), below-floor error (128 → exact match `tls_inspector: initial_read_buffer_size 128 below floor 256`), above-cap clamp (999999 → 65536, no error), JA3 silently-ignored (parseConfig succeeds, bufferSize=4096). Helper file `helpers_test.go` (~30 LoC) factors `captureClientHelloBytes(t, sni, alpns)` — adapted from parser_test.go's helper but renamed to avoid same-package-test collision with `captureClientHello`. Removed parser.go's package-doc comment (relocated to doc.go per Go convention; doc.go is now the canonical package-doc location).
+
+TDD discipline observed: tls_inspector_test.go + proto_test.go were written first; `go test ./internal/listener/listenerfilter/tls_inspector/... 2>&1 | head -40` confirmed failing (build error: `undefined: parseConfig`, `undefined: defaultBufferSize`, etc.); then doc.go / tls_inspector.go / proto.go landed; tests confirmed passing under `-race`. PLAN-verbatim Go source from PLAN lines 1913-1979 (tls_inspector.go) + 1985-2021 (proto.go); test file content was described (not verbatim) per PLAN Step 1.
+
+Two PLAN-verbatim adaptations for lint cleanliness (within ADR-0017 small-mechanical-fixes umbrella): (a) the if-statements in `Inspect` were reformatted to multi-line bodies (`if sni != ""` and `if len(alpns) > 0`) per gofmt's preference vs. the PLAN's single-line `{ inputs.X = Y }` shorthand; (b) project-precedent goimports 3-group import ordering (stdlib + third-party + project-local with blank-line separators) applied to both tls_inspector.go and tls_inspector_test.go (mirrors `internal/filter/tcpproxy/filter.go` convention).
+
+A subtle fixture-shape decision arose during TDD: the first test draft attempted to drive Inspect over a live `crypto/tls.Client` handshake against a `net.Pipe()` with the srv-side wrapped in a peekConn. That construction deadlocked at 10 minutes — `bufio.Reader.Peek(4096)` on net.Pipe blocks until the buffer fills OR the underlying reader returns an error; the tls.Client's Handshake() call meanwhile blocks waiting for a ServerHello that never comes; the result is a circular-block where neither side advances. Fix: pre-capture the ClientHello bytes via the parser_test.go pattern (run tls.Client against an ephemeral net.Pipe, srv.Read gives a verbatim copy of the ClientHello), then write those bytes onto a fresh net.Pipe and close the cli end immediately — Peek(4096) then returns the buffered ~500 bytes plus io.EOF, and Inspect's `if err != nil && len(buf) == 0` clause correctly proceeds to parseClientHello with the available bytes. This matches the production discipline where Peek(n) returns whatever is available when the underlying conn signals EOF (the listener manager's accept-loop sees the same shape on a connection-closed-during-handshake scenario).
+
+No new ADR — Task 8's surface is fully covered by ADR-0079 (two-step factory pattern + 4096-byte default + [256, 65536] clamp + freeze-after-boot registry) + SPEC §12 (silent-ignore set including `enable_ja3_fingerprinting`) + D-3.2 (no cgo). Pristine state confirmed: `go vet` clean, `golangci-lint run` clean, `go test -race` PASS for the new sub-package (6 new tls_inspector_test.go tests + 6 new proto_test.go tests + 7 pre-existing parser_test.go tests = 19 total) AND the parent `listenerfilter` package (cached green from Task 6's last invocation).
+**Outputs:**
+```
+$ go test ./internal/listener/listenerfilter/tls_inspector/... 2>&1 | head -40
+# github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector [github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector.test]
+internal/listener/listenerfilter/tls_inspector/proto_test.go:13:14: undefined: parseConfig
+internal/listener/listenerfilter/tls_inspector/proto_test.go:17:23: undefined: defaultBufferSize
+internal/listener/listenerfilter/tls_inspector/proto_test.go:18:59: undefined: defaultBufferSize
+internal/listener/listenerfilter/tls_inspector/proto_test.go:27:14: undefined: parseConfig
+internal/listener/listenerfilter/tls_inspector/proto_test.go:31:23: undefined: defaultBufferSize
+internal/listener/listenerfilter/tls_inspector/proto_test.go:32:59: undefined: defaultBufferSize
+internal/listener/listenerfilter/tls_inspector/proto_test.go:43:14: undefined: parseConfig
+internal/listener/listenerfilter/tls_inspector/proto_test.go:59:11: undefined: parseConfig
+internal/listener/listenerfilter/tls_inspector/proto_test.go:76:14: undefined: parseConfig
+internal/listener/listenerfilter/tls_inspector/proto_test.go:80:23: undefined: maxBufferSize
+internal/listener/listenerfilter/tls_inspector/proto_test.go:80:23: too many errors
+FAIL	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector [build failed]
+FAIL
+$ go test -race ./internal/listener/listenerfilter/tls_inspector/... -v 2>&1 | tail -50
+=== RUN   TestParseClientHelloWithSNIAndALPN
+--- PASS: TestParseClientHelloWithSNIAndALPN (0.00s)
+=== RUN   TestParseClientHelloSNIOnly
+--- PASS: TestParseClientHelloSNIOnly (0.00s)
+=== RUN   TestParseClientHelloALPNOnly
+--- PASS: TestParseClientHelloALPNOnly (0.00s)
+=== RUN   TestParseClientHelloEmpty
+--- PASS: TestParseClientHelloEmpty (0.00s)
+=== RUN   TestParseClientHelloNonTLSPreamble
+--- PASS: TestParseClientHelloNonTLSPreamble (0.00s)
+=== RUN   TestParseClientHelloTruncated
+--- PASS: TestParseClientHelloTruncated (0.00s)
+=== RUN   TestParseClientHelloMalformedLengthPrefix
+--- PASS: TestParseClientHelloMalformedLengthPrefix (0.00s)
+=== RUN   TestParseConfigNilReturnsDefault
+--- PASS: TestParseConfigNilReturnsDefault (0.00s)
+=== RUN   TestParseConfigDefaultBuffer
+--- PASS: TestParseConfigDefaultBuffer (0.00s)
+=== RUN   TestParseConfigCustomBufferInRange
+--- PASS: TestParseConfigCustomBufferInRange (0.00s)
+=== RUN   TestParseConfigBufferBelowFloorErrors
+--- PASS: TestParseConfigBufferBelowFloorErrors (0.00s)
+=== RUN   TestParseConfigBufferAboveCapClamps
+--- PASS: TestParseConfigBufferAboveCapClamps (0.00s)
+=== RUN   TestParseConfigEnableJA3SilentlyIgnored
+--- PASS: TestParseConfigEnableJA3SilentlyIgnored (0.00s)
+=== RUN   TestInspectWithClientHelloPopulatesInputs
+--- PASS: TestInspectWithClientHelloPopulatesInputs (0.00s)
+=== RUN   TestInspectWithNonTLSPreambleSetsRawBuffer
+--- PASS: TestInspectWithNonTLSPreambleSetsRawBuffer (0.00s)
+=== RUN   TestInspectWithEmptyConnectionDoesNotPanic
+--- PASS: TestInspectWithEmptyConnectionDoesNotPanic (0.00s)
+=== RUN   TestNewRoundtripsThroughRegistry
+--- PASS: TestNewRoundtripsThroughRegistry (0.00s)
+=== RUN   TestInspectConcurrentIndependentConnections
+--- PASS: TestInspectConcurrentIndependentConnections (0.00s)
+=== RUN   TestOnDestroyIsNoOp
+--- PASS: TestOnDestroyIsNoOp (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.010s
+$ go test -race ./internal/listener/listenerfilter/...
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.049s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.010s
+$ go vet ./internal/listener/listenerfilter/tls_inspector/...
+$ golangci-lint run ./internal/listener/listenerfilter/tls_inspector/...
+```

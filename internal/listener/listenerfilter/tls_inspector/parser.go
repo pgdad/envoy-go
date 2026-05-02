@@ -1,14 +1,3 @@
-// Package tls_inspector implements envoy-go's `envoy.filters.listener.tls_inspector`
-// listener filter — peeks the first TLS ClientHello bytes off a connection
-// (without consuming them), extracts SNI + ALPN, and contributes them to
-// ChainMatchInputs. Hand-rolled minimal ClientHello parser per D-3.2 (no cgo
-// / C++ binding to upstream Envoy's tls_inspector); adapted from
-// crypto/tls/handshake_messages.go for the ClientHello case, narrowed to
-// extension types 0 (server_name, RFC 6066 §3) + 16 (ALPN, RFC 7301 §3.1).
-// The package name follows the proto type_url naming convention
-// (envoy.filters.listener.tls_inspector); see ADR-0079.
-//
-//nolint:revive // ADR-0079: package name follows envoy.filters.listener.tls_inspector type_url convention.
 package tls_inspector
 
 import "encoding/binary"
