@@ -11,8 +11,8 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
-	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 )
 

@@ -76,7 +76,7 @@ func FuzzFilterChainParse(f *testing.F) {
 // bounds, and out-of-range bounds-check paths without crashing or deadlocking.
 func fuzzBuildPerRouteAndResolve(t *testing.T, filterName, rcVal, vhVal, rtVal []byte) {
 	// Build adversarial typed_per_filter_config maps. mk returns nil when
-	// the StringValue Any cannot be marshalled (defensive — wrapperspb
+	// the StringValue Any cannot be marshaled (defensive — wrapperspb
 	// accepts any string, but anypb.New can in principle fail).
 	mk := func(b []byte) map[string]*anypb.Any {
 		a, err := anypb.New(wrapperspb.String(string(b)))

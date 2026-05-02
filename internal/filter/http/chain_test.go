@@ -145,10 +145,14 @@ func (e encodeRecorder) EncodeHeaders(h http.Header, end bool) FilterHeadersStat
 	e.mu.Unlock()
 	return e.f.EncodeHeaders(h, end)
 }
-func (e encodeRecorder) EncodeData(d []byte, end bool) FilterDataStatus      { return e.f.EncodeData(d, end) }
-func (e encodeRecorder) EncodeTrailers(t http.Header) FilterTrailersStatus   { return e.f.EncodeTrailers(t) }
-func (e encodeRecorder) SetEncoderCallbacks(cb EncoderFilterCallbacks)       { e.f.SetEncoderCallbacks(cb) }
-func (e encodeRecorder) OnDestroy()                                          { e.f.OnDestroy() }
+func (e encodeRecorder) EncodeData(d []byte, end bool) FilterDataStatus {
+	return e.f.EncodeData(d, end)
+}
+func (e encodeRecorder) EncodeTrailers(t http.Header) FilterTrailersStatus {
+	return e.f.EncodeTrailers(t)
+}
+func (e encodeRecorder) SetEncoderCallbacks(cb EncoderFilterCallbacks) { e.f.SetEncoderCallbacks(cb) }
+func (e encodeRecorder) OnDestroy()                                    { e.f.OnDestroy() }
 
 func equalSlice(a, b []string) bool {
 	if len(a) != len(b) {
@@ -232,7 +236,7 @@ func TestChain_Encode_StopIteration_ResumeAdvances(t *testing.T) {
 }
 
 func TestChain_Encode_StopIteration_CtxCancelAborts(t *testing.T) {
-	// Encode-side analogue of TestChain_Decode_StopIteration_CtxCancelAborts.
+	// Encode-side analog of TestChain_Decode_StopIteration_CtxCancelAborts.
 	// b returns StopIteration on encode; ctx cancellation during park yields
 	// ctx.Err and terminated=false.
 	a := &recordingFilter{name: "a", encHeadersStatus: Continue}
@@ -1077,10 +1081,10 @@ func (b *bufferOnceFilter) DecodeData(d []byte, end bool) FilterDataStatus {
 // down the encode chain. Used by TestChain_DecodeData_OverflowSynthesizes413
 // to assert the verbatim 413 wire shape (headers + body).
 type captureRecorder struct {
-	f             *recordingFilter
-	capturedHdr   *http.Header
-	capturedBody  *[]byte
-	mu            *sync.Mutex
+	f            *recordingFilter
+	capturedHdr  *http.Header
+	capturedBody *[]byte
+	mu           *sync.Mutex
 }
 
 func (c captureRecorder) EncodeHeaders(hd http.Header, end bool) FilterHeadersStatus {

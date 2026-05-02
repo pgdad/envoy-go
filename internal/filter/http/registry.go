@@ -10,6 +10,8 @@ import (
 // registry mapping typed_config type_urls to HTTPFilterFactory functions.
 // Per ADR-0072: explicit threaded constructor map (no package-global init);
 // freeze-after-boot invariant mirrors *stats.Registry LBP-1 from ADR-0059.
+//
+//nolint:revive // ADR-0072 reserves the HTTPRegistry name for the boot-time HTTP-filter registry.
 type HTTPRegistry struct {
 	mu        sync.RWMutex
 	byTypeURL map[string]HTTPFilterFactory

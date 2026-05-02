@@ -33,35 +33,35 @@
 // modes are:
 //
 //  1. continue                  — pure pass-through. DecodeHeaders/Data/
-//                                Trailers and EncodeHeaders/Data/Trailers
-//                                all return Continue.
+//     Trailers and EncodeHeaders/Data/Trailers
+//     all return Continue.
 //  2. stop-and-resume-headers   — DecodeHeaders returns StopIteration; a
-//                                spawned goroutine calls dcb.ContinueDecoding
-//                                after a 10ms sleep. Exercises the framework's
-//                                async-resume channel + parkDecode loop.
+//     spawned goroutine calls dcb.ContinueDecoding
+//     after a 10ms sleep. Exercises the framework's
+//     async-resume channel + parkDecode loop.
 //  3. stop-and-buffer-data      — DecodeData returns
-//                                DataStopIterationAndBuffer; the chain's
-//                                buffer-cap accumulator + park machinery
-//                                exercise. A spawned goroutine resumes via
-//                                dcb.ContinueDecoding after a 10ms sleep.
+//     DataStopIterationAndBuffer; the chain's
+//     buffer-cap accumulator + park machinery
+//     exercise. A spawned goroutine resumes via
+//     dcb.ContinueDecoding after a 10ms sleep.
 //  4. local-reply-decode        — DecodeHeaders calls
-//                                dcb.SendLocalReply(418, "i am a teapot\n",
-//                                nil) and returns StopIteration. Exercises
-//                                the SendLocalReply path through the encode
-//                                chain.
+//     dcb.SendLocalReply(418, "i am a teapot\n",
+//     nil) and returns StopIteration. Exercises
+//     the SendLocalReply path through the encode
+//     chain.
 //  5. local-reply-decode-data   — DecodeData calls dcb.SendLocalReply with
-//                                the same shape (418 / teapot body) and
-//                                returns DataStopIterationNoBuffer.
+//     the same shape (418 / teapot body) and
+//     returns DataStopIterationNoBuffer.
 //  6. modify-encode-headers     — DecodeHeaders returns Continue;
-//                                EncodeHeaders mutates via headers.Set,
-//                                adding `x-envoy-go-test-encoded: yes`.
+//     EncodeHeaders mutates via headers.Set,
+//     adding `x-envoy-go-test-encoded: yes`.
 //  7. modify-encode-data        — DecodeHeaders returns Continue; EncodeData
-//                                replaces the body bytes with a probe-
-//                                specific marker (`MODIFIED\n`).
+//     replaces the body bytes with a probe-
+//     specific marker (`MODIFIED\n`).
 //  8. stop-trailers             — DecodeTrailers returns
-//                                TrailersStopIteration; a spawned goroutine
-//                                resumes via dcb.ContinueDecoding after a
-//                                10ms sleep.
+//     TrailersStopIteration; a spawned goroutine
+//     resumes via dcb.ContinueDecoding after a
+//     10ms sleep.
 //
 // The 10ms sleep on the async-resume modes (2, 3, 8) is intentionally
 // realistic: the framework's parkDecode select must hold the dispatch
@@ -85,16 +85,16 @@
 // filter + a recording terminal) and asserts the per-mode behavior in
 // isolation. Coverage matrix:
 //
-//   | Mode                       | Decode     | Encode    | Async-resume |
-//   |----------------------------|------------|-----------|--------------|
-//   | continue                   | Continue   | Continue  | no           |
-//   | stop-and-resume-headers    | Stop+resume| Continue  | yes (10ms)   |
-//   | stop-and-buffer-data       | Stop+buf   | Continue  | yes (10ms)   |
-//   | local-reply-decode         | LocalReply | n/a       | no           |
-//   | local-reply-decode-data    | LocalReply | n/a       | no           |
-//   | modify-encode-headers      | Continue   | Mutate    | no           |
-//   | modify-encode-data         | Continue   | Mutate    | no           |
-//   | stop-trailers              | Stop+resume| Continue  | yes (10ms)   |
+//	| Mode                       | Decode     | Encode    | Async-resume |
+//	|----------------------------|------------|-----------|--------------|
+//	| continue                   | Continue   | Continue  | no           |
+//	| stop-and-resume-headers    | Stop+resume| Continue  | yes (10ms)   |
+//	| stop-and-buffer-data       | Stop+buf   | Continue  | yes (10ms)   |
+//	| local-reply-decode         | LocalReply | n/a       | no           |
+//	| local-reply-decode-data    | LocalReply | n/a       | no           |
+//	| modify-encode-headers      | Continue   | Mutate    | no           |
+//	| modify-encode-data         | Continue   | Mutate    | no           |
+//	| stop-trailers              | Stop+resume| Continue  | yes (10ms)   |
 //
 // At Task 22 the structural fixture wires all eight modes through HCM
 // dispatch end-to-end and asserts the wire output via `0007b-iteration-probe`.

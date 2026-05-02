@@ -1899,3 +1899,180 @@ ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.008s
 ```
 
 Task 23 (BEHAVIOR_CONTRACT in-place edit + ROADMAP/STATE updates + closing six-gate sweep) is now unblocked.
+
+---
+
+## Task 23 — BEHAVIOR_CONTRACT in-place edit + closing six-gate sweep [ADR-0070, ADR-0071, ADR-0072, ADR-0073, ADR-0074, ADR-0075, ADR-0076]
+
+**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+
+**Files modified:**
+
+- `docs/envoy-go/BEHAVIOR_CONTRACT.md` — three structural edits per PLAN Steps 1–3:
+  - **Step 1 (insert NEW `## HTTP filter chain` top-level section):** appended after the existing `## HTTP/2` section (the SPEC §13.1 phrasing "between `## HTTP/2` and `## TCP proxy`" was adapted because the actual file ordering has `## TCP proxy` BEFORE `## HTTP/2` — `## HTTP/2` is currently the last top-level section. SPEC §13.1 explicitly authorises "the structural-equivalent place; the planner picks at the in-place-edit commit", so appending after `## HTTP/2` is the structurally-equivalent location). The full SPEC §13.1 prose block landed verbatim — Asserted equivalence (6 bullets), Not asserted (6 bullets), Buffer overflow behavior (3 bullets), Async resume mechanics (4 bullets), Filter ordering (3 bullets), Applies to (1 bullet), Does not yet apply to (5 bullets) — plus the four `### Empirical evidence (...)` subsections each carrying the §11.1 / §11.2 / §11.3 / §11.4 verbatim block (paste-from-terminal Envoy stderr traces, wire-order response captures, body hex dump). Per ADR-0052 (in-place-edit-at-impl-session-last-commit) and per the Refinement section's paste-verbatim-synchronization note, the §11 block + the §13 block are now byte-equivalent in BEHAVIOR_CONTRACT.md (drift forbidden; future ENVOY_TARGET pin bumps that change any of the four shapes must update both locations in the same commit).
+  - **Step 2 (`## HTTP/1.1` + `## HTTP/2` ADR-0040 / ADR-0042 supersession amendments):** the two phase-04 lines under `## HTTP/1.1` `### Applies to` + `### Does not yet apply to` were rewritten per the PLAN's verbatim text — "phase-04 HCM-filter chain shape `[router]` (ADR-0042)" → "non-empty with router as terminal entry; ADR-0042 lower bound stays, upper bound lifted to ADR-0071 — see `## HTTP filter chain`"; "HCM filter chain beyond `[router]` (phase 07's filter-chain framework)" → "full HTTP-filter chain framework — see `## HTTP filter chain`". Under `## HTTP/2`, a new italic phase-07.1 note paragraph was added directly after the phase-05.2 introduction paragraph: "phase 07.1 wires the H2 dispatch path through the same `internal/filter/http` iteration protocol as H1 (per ADR-0071); the original ADR-0040 (HCM-direct-call subset) is totally superseded and ADR-0042's "exactly `[router]`" upper bound is partially superseded — see `## HTTP filter chain` for HCM filter-chain dispatch wiring." Both cross-references resolve to the new top-level section.
+  - **Step 3 (`## Equivalence Matrix` row addition):** added a new row to the existing matrix table. The current matrix at lines 9–23 is a 2-column shape (`Dimension | Required equivalence`), not the 3-column shape (`Dimension | Equivalence claim | Allow-list / tolerance`) that SPEC §13.2 / PLAN Step 3 sketched. The row's content was condensed into the existing 2-column shape: "HTTP filter chain | Per-request equivalence on cors preflight + actual-request response shapes (status + header set + body) between envoy-go and reference Envoy. Filter iteration order, sendLocalReply encode-chain entry, and 413 overflow shape are verbatim-pinned at the ENVOY_TARGET SHA. Differential covers cors only; `envoy.filters.http.envoy_go_test` excluded (test-only); other filters in the §9 family are future-phase scope." The substantive claim (per-request cors equivalence + envoy_go_test exclusion + filter family deferral) is preserved verbatim from SPEC §13.2.
+- `docs/envoy-go/phases/07.1-http-filter-framework/PROGRESS.md` — this entry.
+
+**Lint baseline restoration (gate (e) inline fixes):**
+
+The first gate-(e) `golangci-lint run ./...` invocation surfaced 32 issues spanning gofmt (18 files), goimports (1 file), revive `exported` (10 cases — 4 stuttering type names `HTTPRegistry` / `HTTPFilter` / `HTTPFilterFactory`, 3 missing const-block comments on the FilterHeadersStatus / FilterDataStatus / FilterTrailersStatus enums in `internal/filter/http/types.go`, 4 missing method comments on `Filter.Response/Picked/ActionErr/ActionRan` in `internal/filter/http/router/router.go`), unused (1 `continueCalls` field in `callbacks_test.go`; 1 `fileDesc` package-level var in the hand-written `envoygotest/proto/envoygotest.pb.go`), and misspell (`analogue` → `analog` in `chain_test.go`; `marshalled` → `marshaled` in `fuzz_test.go`). All 32 fixes landed in this commit alongside the BEHAVIOR_CONTRACT edits — gofmt issues fixed mechanically via `gofmt -w` over the 18 flagged files; goimports fixed via `goimports -w -local github.com/esalaine/envoy-go internal/bootstrap/bootstrap.go`; the three stuttering type names received `//nolint:revive` directives with rationale referencing the relevant ADRs (mirroring the ADR-0048 H2Request / H2Response precedent in `internal/filter/hcm/h2/client.go`); the const block comments + method comments were added with one-line godoc; unused field/var removed; misspells corrected. Post-fix, `golangci-lint run ./...` exits 0 (zero output). The lint baseline now matches master's pre-07.1 clean state.
+
+**Acceptance — six-gate sweep:**
+
+- Gate (a) — all 9 differential fixtures (`0000-tcp-echo` / `0001-tcp-proxy-rr` / `0002-tls-tcp` / `0003-http11-routing` / `0004-h2-routing` / `0005-prometheus-stats` / `0006-access-log` / `0007a-cors` / `0007b-iteration-probe`): PASS.
+- Gate (b) — H2 dispatch: covered by `0004-h2-routing` in gate (a) + the H2 chain integration tests under `internal/filter/hcm/chain_integration_test.go::TestChainIntegration_H2_*` exercised by gate (e)'s `go test -race`.
+- Gate (c) — h2spec at the `summerwind/h2spec@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0` pin (ADR-0051): 53 tests, 53 passed, 0 skipped, 0 failed.
+- Gate (d) — all 9 fuzzers clean for 30s each (per ADR-0018): `FuzzBootstrapLoad` / `FuzzPromTextFormat` / `FuzzTLSContextParse` / `FuzzAccessLogFormat` / `FuzzFilterChainParse` (the new phase-07.1 fuzzer; mode-discriminator-unified per the post-Task-13 review-loop) / `FuzzTcpProxyFilter` / `FuzzHCMConfigParse` / `FuzzFrameStream` / `FuzzHPACKDecode`. Zero crashers across all nine. Total fuzzer count post-07.1 is 9 (8 from prior phases + 1 from this phase).
+- Gate (e) — `go vet ./...` clean (exit 0, no output); `golangci-lint run ./...` clean (exit 0, no output, post-baseline-restoration); `go test -race -count=1 ./...` clean (all packages PASS under the race detector).
+- Gate (f) — REVIEW.md APPROVED: defers to the REVIEW session per BOOTSTRAP §5 lifecycle-state 5 → 6.
+
+**Boundary grep (PLAN Step 8):** `grep -rE 'github.com/justinas/alice|github.com/urfave/negroni|github.com/go-chi/chi/middleware|github.com/gorilla/handlers' . --include='*.go' --include='go.mod' --include='go.sum'` → zero matches (per SPEC §15 final-acceptance bullet; ADR-0071's no-third-party-filter-chain-library invariant preserved across both production and test code).
+
+**Empirical-pin grep (PLAN Step 9):** all four `grep -A5 '^### Empirical evidence (...)' docs/envoy-go/BEHAVIOR_CONTRACT.md` invocations return the heading + the §11 block's first 5 content lines verbatim. Confirmed paste-verbatim-synchronization between SPEC §11 and BEHAVIOR_CONTRACT.md `## HTTP filter chain`.
+
+**STATE.md / ROADMAP.md NOT touched at this commit:** per PLAN Refinement (and per the BOOTSTRAP §5 verification + REVIEW session lifecycle): STATE.md advances 4 → 5 at the verification session's commit (after this commit fast-forwards to master); ROADMAP row 07.1 flips `in-progress → done` at the REVIEW session's phase-done commit (with row 07 staying `in-progress` per the 05/05.1/05.2 + 06/06.1/06.2 closure pattern).
+
+**Outputs (verbatim):**
+
+```
+$ go test -count=1 ./test/differential/... -v 2>&1 | tail -15
+=== RUN   TestDifferential/0007b-iteration-probe
+2026/05/01 22:48:30 backend listening on :37039
+--- PASS: TestDifferential (21.79s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.19s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.27s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.27s)
+    --- PASS: TestDifferential/0003-http11-routing (1.29s)
+    --- PASS: TestDifferential/0004-h2-routing (1.82s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.95s)
+    --- PASS: TestDifferential/0006-access-log (10.95s)
+    --- PASS: TestDifferential/0007a-cors (1.31s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.73s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	23.629s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+
+$ go test -run TestH2Spec ./test/conformance/h2spec/ -count=1 -v -timeout=10m 2>&1 | grep '53 tests'
+        53 tests, 53 passed, 0 skipped, 0 failed
+
+$ go test -run TestH2Spec ./test/conformance/h2spec/ -count=1 -v -timeout=10m 2>&1 | tail -3
+--- PASS: TestH2Spec (2.23s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.314s
+
+$ go test -fuzz=FuzzBootstrapLoad -fuzztime=30s -run='^$' ./internal/bootstrap/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 306416 (0/sec), new interesting: 3 (total: 1089)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	31.092s
+
+$ go test -fuzz=FuzzPromTextFormat -fuzztime=30s -run='^$' ./internal/stats/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 26114182 (0/sec), new interesting: 0 (total: 117)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/stats	30.118s
+
+$ go test -fuzz=FuzzTLSContextParse -fuzztime=30s -run='^$' ./internal/tls/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 4173163 (0/sec), new interesting: 10 (total: 713)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/tls	31.068s
+
+$ go test -fuzz=FuzzAccessLogFormat -fuzztime=30s -run='^$' ./internal/accesslog/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 28403194 (0/sec), new interesting: 0 (total: 88)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/accesslog	31.038s
+
+$ go test -fuzz=FuzzFilterChainParse -fuzztime=30s -run='^$' ./internal/filter/http/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3572777 (0/sec), new interesting: 17 (total: 250)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	31.050s
+
+$ go test -fuzz=FuzzTcpProxyFilter -fuzztime=30s -run='^$' ./internal/filter/tcpproxy/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3677879 (0/sec), new interesting: 2 (total: 566)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	31.057s
+
+$ go test -fuzz=FuzzHCMConfigParse -fuzztime=30s -run='^$' ./internal/filter/hcm/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 3675854 (0/sec), new interesting: 3 (total: 540)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	31.061s
+
+$ go test -fuzz=FuzzFrameStream -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/ 2>&1 | tail -3
+fuzz: elapsed: 30s, execs: 13689336 (0/sec), new interesting: 1 (total: 419)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	30.155s
+
+$ go test -fuzz=FuzzHPACKDecode -fuzztime=30s -run='^$' ./internal/filter/hcm/h2/ 2>&1 | tail -3
+fuzz: elapsed: 31s, execs: 1878051 (0/sec), new interesting: 1 (total: 166)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	31.098s
+
+$ go vet ./...
+(empty — clean)
+
+$ golangci-lint run ./...
+(empty — clean, post-baseline-restoration)
+
+$ go test -race -count=1 ./... 2>&1 | tail -25
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.049s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.053s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.061s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	8.409s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.160s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.023s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.050s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.254s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.041s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	1.062s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.039s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.096s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.138s
+ok  	github.com/esalaine/envoy-go/test/differential	24.494s
+?   	github.com/esalaine/envoy-go/test/differential/fixture	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.017s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.019s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.021s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.019s
+
+$ grep -rE 'github.com/justinas/alice|github.com/urfave/negroni|github.com/go-chi/chi/middleware|github.com/gorilla/handlers' . --include='*.go' --include='go.mod' --include='go.sum'
+(empty — zero matches)
+
+$ grep -A5 '^### Empirical evidence (filter ordering)' docs/envoy-go/BEHAVIOR_CONTRACT.md
+### Empirical evidence (filter ordering)
+
+**Probe configuration:** chain `[lua_a, lua_b, envoy.filters.http.router]` where `lua_a` and `lua_b` log on decode/encode entry via Envoy's Lua filter (`logCritical` writes to Envoy's stderr at `[critical]` level). Listener `127.0.0.1:10000`; route `/` → STRICT_DNS cluster `c0` reaching a host-side nginx backend.
+
+**Probe request:** `GET / HTTP/1.1` (single sequential request).
+
+
+$ grep -A5 '^### Empirical evidence (cors preflight)' docs/envoy-go/BEHAVIOR_CONTRACT.md
+### Empirical evidence (cors preflight)
+
+**Probe configuration:** chain `[envoy.filters.http.cors, envoy.filters.http.router]`; one virtual_host with `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{allow_origin_string_match: [exact: "https://example.test"], allow_methods: "GET, POST, OPTIONS", allow_headers: "x-foo, x-bar", expose_headers: "x-baz", allow_credentials: true, max_age: "600"}`; one route `/` → STRICT_DNS cluster `c0` reaching a host-side nginx backend (which serves a 200 + HTML body on `GET /`).
+
+**Probe (a) — Preflight, allowed origin:**
+
+
+$ grep -A5 '^### Empirical evidence (413 overflow)' docs/envoy-go/BEHAVIOR_CONTRACT.md
+### Empirical evidence (413 overflow)
+
+**Probe configuration:** chain `[envoy.filters.http.buffer, envoy.filters.http.router]` with `Buffer{max_request_bytes: 1024}`. Listener `per_connection_buffer_limit_bytes: 1024`. Route `/` → STRICT_DNS cluster `c0` (nginx backend).
+
+**Probe request:** `POST / HTTP/1.1` `Content-Length: 2048` with a 2048-byte body of ASCII `'A'`.
+
+
+$ grep -A5 '^### Empirical evidence (sendLocalReply entry)' docs/envoy-go/BEHAVIOR_CONTRACT.md
+### Empirical evidence (sendLocalReply entry)
+
+**Probe configuration:** chain `[lua_a, lua_b, lua_c, envoy.filters.http.router]` where `lua_b` calls `respond` (Envoy's sendLocalReply API) with status 418 + a `x-from: filterB` header + body `"418 from filterB\n"`. `lua_a`, `lua_c` log on decode/encode entry. Route `/` → STRICT_DNS cluster `c0` (would route to nginx, but `lua_b`'s `respond` aborts decode mid-chain).
+
+**Probe request:** `GET / HTTP/1.1`
+```
+
+Phase 07.1 implementation session is complete on `phase/07.1-http-filter-framework-impl`. The verification session (next-fresh) re-runs the six gates per BOOTSTRAP §7.5 and advances STATE 4 → 5; the REVIEW session (next-fresh after verification) writes REVIEW.md and the phase-done commit (ROADMAP row 07.1 → done; row 07 stays in-progress; STATE → phase 07.2 lifecycle-state 1).

@@ -31,15 +31,15 @@ func TestFilterTrailersStatus_Values(t *testing.T) {
 // this test fails to compile.
 type fakeFilter struct{}
 
-func (fakeFilter) DecodeHeaders(http.Header, bool) FilterHeadersStatus    { return Continue }
-func (fakeFilter) DecodeData([]byte, bool) FilterDataStatus               { return DataContinue }
-func (fakeFilter) DecodeTrailers(http.Header) FilterTrailersStatus        { return TrailersContinue }
-func (fakeFilter) SetDecoderCallbacks(DecoderFilterCallbacks)             {}
-func (fakeFilter) EncodeHeaders(http.Header, bool) FilterHeadersStatus    { return Continue }
-func (fakeFilter) EncodeData([]byte, bool) FilterDataStatus               { return DataContinue }
-func (fakeFilter) EncodeTrailers(http.Header) FilterTrailersStatus        { return TrailersContinue }
-func (fakeFilter) SetEncoderCallbacks(EncoderFilterCallbacks)             {}
-func (fakeFilter) OnDestroy()                                             {}
+func (fakeFilter) DecodeHeaders(http.Header, bool) FilterHeadersStatus { return Continue }
+func (fakeFilter) DecodeData([]byte, bool) FilterDataStatus            { return DataContinue }
+func (fakeFilter) DecodeTrailers(http.Header) FilterTrailersStatus     { return TrailersContinue }
+func (fakeFilter) SetDecoderCallbacks(DecoderFilterCallbacks)          {}
+func (fakeFilter) EncodeHeaders(http.Header, bool) FilterHeadersStatus { return Continue }
+func (fakeFilter) EncodeData([]byte, bool) FilterDataStatus            { return DataContinue }
+func (fakeFilter) EncodeTrailers(http.Header) FilterTrailersStatus     { return TrailersContinue }
+func (fakeFilter) SetEncoderCallbacks(EncoderFilterCallbacks)          {}
+func (fakeFilter) OnDestroy()                                          {}
 
 func TestFilterInterfaces_Compile(t *testing.T) {
 	var _ StreamDecoderFilter = fakeFilter{}

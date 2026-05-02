@@ -9,8 +9,8 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	corsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
@@ -70,7 +70,7 @@ func (r *recordingTerminal) EncodeTrailers(http.Header) envoyhttp.FilterTrailers
 	return envoyhttp.TrailersContinue
 }
 func (r *recordingTerminal) SetEncoderCallbacks(envoyhttp.EncoderFilterCallbacks) {}
-func (r *recordingTerminal) OnDestroy()                                            {}
+func (r *recordingTerminal) OnDestroy()                                           {}
 
 // buildChain assembles a FilterChain with the cors filter ahead of a recording
 // terminal. The cors filter is at index 0; the terminal at index 1. Per-route

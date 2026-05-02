@@ -13,11 +13,11 @@
 //
 //  2. Routes:
 //     - /permissive: route to backend cluster; per-route cors policy
-//       allowing https://example.test with the §11.2 allow-methods /
-//       allow-headers / max-age / expose-headers / allow-credentials.
+//     allowing https://example.test with the §11.2 allow-methods /
+//     allow-headers / max-age / expose-headers / allow-credentials.
 //     - /strict: direct_response 405 "method not allowed\n"; per-route
-//       cors policy with the very-restrictive https://only.test (no
-//       request origin matches).
+//     cors policy with the very-restrictive https://only.test (no
+//     request origin matches).
 //
 //     The /strict 405 is a direct_response (not router fallthrough) per
 //     this fixture's design deviation — envoy-go's router does not

@@ -21,11 +21,11 @@ type recordingTerminal struct {
 	dcb envoyhttp.DecoderFilterCallbacks
 	ecb envoyhttp.EncoderFilterCallbacks
 
-	decodeHdrCalls    atomic.Int32
-	decodeDataCalls   atomic.Int32
-	decodeTrailCalls  atomic.Int32
-	encodeHdrCalls    atomic.Int32
-	encodeDataCalls   atomic.Int32
+	decodeHdrCalls   atomic.Int32
+	decodeDataCalls  atomic.Int32
+	decodeTrailCalls atomic.Int32
+	encodeHdrCalls   atomic.Int32
+	encodeDataCalls  atomic.Int32
 
 	encodeHeaders http.Header
 	encodeBody    []byte

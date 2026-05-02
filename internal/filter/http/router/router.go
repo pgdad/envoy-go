@@ -15,8 +15,8 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
 // TypeURL is the canonical envoy.filters.http.router type URL. Boot wiring
@@ -289,11 +289,20 @@ func (f *Filter) SetH2Request(r h2.H2Request) { f.h2Req = r }
 // reads len(rf.Response().Body) directly when populating the access-log
 // record. Response() returns the logical response struct surfaced by the
 // action; HCM dispatch feeds it through the encode chain BEFORE wire-write.
-func (f *Filter) Status() int                 { return f.actionResponse.Status }
-func (f *Filter) Response() ActionResponse    { return f.actionResponse }
-func (f *Filter) Picked() cluster.Endpoint    { return f.actionPicked }
-func (f *Filter) ActionErr() error            { return f.actionErr }
-func (f *Filter) ActionRan() bool             { return f.actionRan }
+// Status returns the action response status code (0 if action did not run).
+func (f *Filter) Status() int { return f.actionResponse.Status }
+
+// Response returns the logical action response captured at RunAction time.
+func (f *Filter) Response() ActionResponse { return f.actionResponse }
+
+// Picked returns the cluster endpoint chosen by the action (zero value if none).
+func (f *Filter) Picked() cluster.Endpoint { return f.actionPicked }
+
+// ActionErr returns any error captured during RunAction (nil on success).
+func (f *Filter) ActionErr() error { return f.actionErr }
+
+// ActionRan reports whether the per-request Action has already executed.
+func (f *Filter) ActionRan() bool { return f.actionRan }
 
 // RunAction invokes the per-request Action and captures the outcome. Idempotent
 // once-per-request via the `actionRan` boolean (a check-then-set, NOT a sync.Once

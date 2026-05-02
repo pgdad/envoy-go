@@ -14,8 +14,8 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
 // H2ClusterAction returns an H2Action closure that proxies the per-request
@@ -31,7 +31,7 @@ import (
 //   - RoundTrip ctx-cancel        → status=0, err=*h2.Error(CANCEL) (sentinel)
 //   - RoundTrip protocol error    → 502 local reply, status=502, err=nil
 //   - Upstream HTTP status        → forwarded verbatim to downstream sw,
-//                                   status=resp.Status, err=writer-error or nil.
+//     status=resp.Status, err=writer-error or nil.
 //
 // status=0 on the ctx-cancel path is the H2 sentinel per SPEC §2.1 last
 // bullet; HCM's chain-completion access-log emit hook skips submission on

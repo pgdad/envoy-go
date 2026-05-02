@@ -11,27 +11,37 @@ import (
 // out of MVP).
 type FilterHeadersStatus int
 
+// FilterHeadersStatus enum values per ADR-0071.
 const (
-	Continue       FilterHeadersStatus = iota // proceed to the next filter
-	StopIteration                             // park; resume via cb.ContinueDecoding/ContinueEncoding
+	// Continue advances to the next filter in the chain.
+	Continue FilterHeadersStatus = iota
+	// StopIteration parks the chain; resume via cb.ContinueDecoding/ContinueEncoding.
+	StopIteration
 )
 
 // FilterDataStatus is returned by DecodeData / EncodeData to signal iteration
 // control + per-filter buffering. Per ADR-0071 (watermark variants out of MVP).
 type FilterDataStatus int
 
+// FilterDataStatus enum values per ADR-0071.
 const (
-	DataContinue              FilterDataStatus = iota // proceed
-	DataStopIterationAndBuffer                        // park + accumulate body chunks until end_stream
-	DataStopIterationNoBuffer                         // park; no body accumulation
+	// DataContinue advances to the next filter.
+	DataContinue FilterDataStatus = iota
+	// DataStopIterationAndBuffer parks the chain and accumulates body chunks until end_stream.
+	DataStopIterationAndBuffer
+	// DataStopIterationNoBuffer parks the chain without accumulating body bytes.
+	DataStopIterationNoBuffer
 )
 
 // FilterTrailersStatus is returned by DecodeTrailers / EncodeTrailers.
 type FilterTrailersStatus int
 
+// FilterTrailersStatus enum values per ADR-0071.
 const (
-	TrailersContinue       FilterTrailersStatus = iota // proceed
-	TrailersStopIteration                              // park; resume via cb.Continue*
+	// TrailersContinue advances to the next filter.
+	TrailersContinue FilterTrailersStatus = iota
+	// TrailersStopIteration parks the chain; resume via cb.Continue*.
+	TrailersStopIteration
 )
 
 // StreamDecoderFilter is implemented by filters that participate in the
@@ -58,6 +68,8 @@ type StreamEncoderFilter interface {
 
 // HTTPFilter is the tagged-union over decoder-only / encoder-only / both. The
 // factory returns this; the chain dispatches per non-nil side.
+//
+//nolint:revive // ADR-0071 reserves the HTTPFilter name for the iteration-protocol surface.
 type HTTPFilter struct {
 	Name    string              // filter name from http_filters[].name
 	Decoder StreamDecoderFilter // nil for encoder-only filters
@@ -224,6 +236,8 @@ func ReconcileOrderedHeaders(original OrderedHeaders, merged http.Header) Ordere
 // HTTPFilterFactory parses + validates typed_config once at HCM-build time and
 // returns a per-request FilterInstanceFactory closure. Per ADR-0071 two-step
 // factory pattern.
+//
+//nolint:revive // ADR-0071 reserves the HTTPFilterFactory name for the boot-time factory surface.
 type HTTPFilterFactory func(tc *anypb.Any, ctx FactoryCtx) (FilterInstanceFactory, error)
 
 // FilterInstanceFactory allocates a fresh filter instance bound to the parsed

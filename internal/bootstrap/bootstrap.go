@@ -38,6 +38,7 @@ import (
 	// these additions are documented in PROGRESS, not as a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/stream/v3"
+
 	// Phase 07.1 (Task 20) registers the cors HTTP filter extension proto so
 	// protojson round-trips bootstraps that carry
 	// `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{...}`

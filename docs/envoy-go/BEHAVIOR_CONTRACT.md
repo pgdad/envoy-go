@@ -19,6 +19,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Stats output | Per-stat behavioral delta after defined load is equal between envoy-go and reference Envoy. Gauges are snapshot-equal after drain. Names + label keys + types byte-equal; HELP text ignored. Allow-list: 17 stats listed in § Stat-name mapping. All other Envoy stat names in /stats/prometheus output are ignored by the differential. |
 | xDS wire behavior | ADS message sequences match the protocol state machine; effective-config diff on identical snapshots |
 | Timing | Not compared by default; a phase may opt in to latency bounds |
+| HTTP filter chain | Per-request equivalence on cors preflight + actual-request response shapes (status + header set + body) between envoy-go and reference Envoy. Filter iteration order, sendLocalReply encode-chain entry, and 413 overflow shape are verbatim-pinned at the ENVOY_TARGET SHA. Differential covers cors only; `envoy.filters.http.envoy_go_test` excluded (test-only); other filters in the §9 family are future-phase scope. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -434,14 +435,14 @@ See the `## Header allow-list` table above, rows added by ADR-0044: `Server`, `C
 ### Applies to
 
 - Phase-04 envoy-go `internal/filter/hcm/` package, exercised via fixture `0003-http11-routing`.
-- The phase-04 HCM-filter chain shape `[router]` (ADR-0042).
+- The phase-04 HCM-filter chain shape requirement that the chain be non-empty with router as terminal entry; the original ADR-0042 "exactly `[router]`" rule was partially superseded by ADR-0071 in phase 07.1 (lower bound stays; upper bound lifted) — see `## HTTP filter chain` for the full discipline.
 - `match.prefix` (bytewise) and `match.path` (case-sensitive exact) only.
 
 ### Does not yet apply to
 
 - HTTP/2 (phase 05).
 - HTTP/3 (later).
-- HCM filter chain beyond `[router]` (phase 07's filter-chain framework).
+- The full HTTP-filter chain framework (iteration protocol, async-resume, sendLocalReply semantics, per-route config) — see `## HTTP filter chain`.
 - Upstream connection pooling (upstream-robustness family).
 - HTTPS (phase 04.x or 05.x or a dedicated HTTPS-fixture sub-phase).
 - `match.regex` / `match.path_separated_prefix` / `match.connect_matcher` / header-aware match / query-parameter-aware match (subset enforcement — ADR-0038).
@@ -456,6 +457,8 @@ See the `## Header allow-list` table above, rows added by ADR-0044: `Server`, `C
 *Extended by phase 05.2. Justified by ADR-0055 (flow-control discipline), ADR-0056 (per-request fresh upstream H2 dial), ADR-0057 (closes ADR-0035 H2 leg via fixture 0004), ADR-0058 (trailers observed but not forwarded; carry-forwards M-4 + M-10).*
 
 Phase 05.1 introduced envoy-go's downstream HTTP/2 dataplane; phase 05.2 closes the dataplane on the upstream side: cluster-side HttpProtocolOptions parsing, Cluster.DialH2 + ClientConn + RoundTrip, routerActionH2 action variant, and the project's first full-stack HTTPS h2 differential fixture (0004-h2-routing) closing ADR-0035 H2 leg. The flow-control discipline tightening per ADR-0055 makes the codec primitives load-bearing for realistic H2 workloads.
+
+*Phase-07.1 HCM filter-chain framework note: phase 07.1 wires the H2 dispatch path through the same `internal/filter/http` iteration protocol as H1 (per ADR-0071); the original ADR-0040 (HCM-direct-call subset) is totally superseded and ADR-0042's "exactly `[router]`" upper bound is partially superseded — see `## HTTP filter chain` for HCM filter-chain dispatch wiring.*
 
 ### Asserted equivalence (05.1 + 05.2 scope)
 
@@ -505,3 +508,219 @@ Sections 3, 4, 5, 6 (excluding 6.6 PUSH_PROMISE), 7, 8 — all `failed == 0`. Pi
 - Mixed-codec clusters (a single cluster used by both H1 and H2 listeners — load-balancing family or a future phase explicitly adding mixed-codec clusters).
 
 (REMOVED from this list — now active: routed-to-upstream H2 → active per ADR-0057; fixture 0004 → active per phase-05.2 Task 14.)
+
+---
+
+## HTTP filter chain
+
+*Introduced by phase 07.1. Justified by ADR-0070 (planner-time split), ADR-0071 (iteration protocol shape; supersedes ADR-0040 totally; partially supersedes ADR-0042), ADR-0072 (HTTPRegistry threading), ADR-0073 (typed_per_filter_config 3-tier merge; amends ADR-0041), ADR-0074 (cors + envoy_go_test filter set), ADR-0075 (sendLocalReply encode-chain entry semantics), ADR-0076 (1 MiB buffer cap; 413 on decode overflow; reset on encode overflow; amends ADR-0041).*
+
+### Asserted equivalence
+- cors filter preflight response shape (status, header set, header values) byte-equal to reference Envoy v1.37.2 — verbatim scrape pinned in `### Empirical evidence (cors preflight)` below.
+- cors filter actual-request response header injection byte-equal.
+- Filter declaration order on decode side; reverse on encode side — verbatim scrape evidence pinned in `### Empirical evidence (filter ordering)` below.
+- 413 Payload Too Large response shape on decode-side buffer overflow — verbatim scrape evidence pinned in `### Empirical evidence (413 overflow)` below.
+- typed_per_filter_config 3-tier merge precedence (Route > VirtualHost > RouteConfiguration); most-specific override (no field-merge).
+- sendLocalReply enters encode chain at filter[len-1] of the encode-side filter set (reverse iteration start); full encode chain runs — verbatim scrape evidence pinned in `### Empirical evidence (sendLocalReply entry)` below.
+
+### Not asserted
+- Behavioral equivalence of the test-only `envoy.filters.http.envoy_go_test` probe filter — structural assertion only (no reference Envoy implements it).
+- Watermark backpressure event timing (out of MVP scope).
+- 1xx informational header processing (out of MVP scope).
+- Metadata frame processing (out of MVP scope).
+- ContinueAndDontEndStream status semantics (out of MVP scope).
+- Per-route filter `disabled` flag honoring (out of MVP scope).
+
+### Buffer overflow behavior
+- decode-side: 413 local reply, hardcoded constant 1 MiB (filterBufferLimitBytes), enters encode chain.
+- encode-side: connection reset (H1: close; H2: RST_STREAM).
+- per_connection_buffer_limit_bytes / per_request_buffer_limit_bytes silently ignored — extends ADR-0041 silent-ignore set.
+
+### Async resume mechanics
+- StopIteration parks dispatch goroutine on a per-stream resume channel.
+- ContinueDecoding / ContinueEncoding callbacks unblock the channel.
+- Single-goroutine-per-request iteration; no per-filter goroutine spawned by the framework.
+- ctx.Done() during pause aborts iteration; OnDestroy fires for cleanup.
+
+### Filter ordering
+- http_filters[] declaration order on decode-side.
+- Reverse declaration order on encode-side (router last on decode → router first on encode).
+- Last entry MUST be the router (terminal filter); errors at parse otherwise.
+
+### Empirical evidence (filter ordering)
+
+**Probe configuration:** chain `[lua_a, lua_b, envoy.filters.http.router]` where `lua_a` and `lua_b` log on decode/encode entry via Envoy's Lua filter (`logCritical` writes to Envoy's stderr at `[critical]` level). Listener `127.0.0.1:10000`; route `/` → STRICT_DNS cluster `c0` reaching a host-side nginx backend.
+
+**Probe request:** `GET / HTTP/1.1` (single sequential request).
+
+**Verbatim Envoy stderr trace (decoded/encoded line emit order; timestamps preserved):**
+
+```
+[2026-05-01 01:10:55.841][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: DECODE filter=A index=0
+[2026-05-01 01:10:55.841][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: DECODE filter=B index=1
+[2026-05-01 01:10:55.842][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: ENCODE filter=B index=1
+[2026-05-01 01:10:55.842][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: ENCODE filter=A index=0
+```
+
+**Conclusion (pinned):** decode-side iteration is in declaration order (`lua_a` index 0 → `lua_b` index 1 → router index 2 implicitly terminal). Encode-side iteration is in **reverse** declaration order (`lua_b` index 1 → `lua_a` index 0; router has no encode-side log emission in this probe but is the entry point into the encode chain since it produces the upstream response). This is the empirical evidence for the §6.6 + §5.5 reverse-encode-order rule. envoy-go's `chain.runEncodeHeaders` / `runEncodeData` / `runEncodeTrailers` MUST iterate from `len(filters)-1` down to `0`.
+
+### Empirical evidence (cors preflight)
+
+**Probe configuration:** chain `[envoy.filters.http.cors, envoy.filters.http.router]`; one virtual_host with `typed_per_filter_config[envoy.filters.http.cors] = CorsPolicy{allow_origin_string_match: [exact: "https://example.test"], allow_methods: "GET, POST, OPTIONS", allow_headers: "x-foo, x-bar", expose_headers: "x-baz", allow_credentials: true, max_age: "600"}`; one route `/` → STRICT_DNS cluster `c0` reaching a host-side nginx backend (which serves a 200 + HTML body on `GET /`).
+
+**Probe (a) — Preflight, allowed origin:**
+
+Request: `OPTIONS / HTTP/1.1` `Origin: https://example.test` `Access-Control-Request-Method: GET` `Access-Control-Request-Headers: x-foo,x-bar`
+
+Verbatim response (header set in wire order, lowercase as emitted by Envoy):
+
+```
+< HTTP/1.1 200 OK
+< access-control-allow-origin: https://example.test
+< access-control-allow-credentials: true
+< access-control-allow-methods: GET, POST, OPTIONS
+< access-control-allow-headers: x-foo, x-bar
+< access-control-max-age: 600
+< access-control-expose-headers: x-baz
+< date: Fri, 01 May 2026 01:09:51 GMT
+< server: envoy
+< content-length: 0
+```
+
+**Probe (b) — Preflight, disallowed origin:**
+
+Request: `OPTIONS / HTTP/1.1` `Origin: https://other.test` `Access-Control-Request-Method: GET`
+
+Verbatim response:
+
+```
+< HTTP/1.1 405 Method Not Allowed
+< server: envoy
+< date: Fri, 01 May 2026 01:09:51 GMT
+< content-type: text/html
+< content-length: 157
+< x-envoy-upstream-service-time: 0
+```
+
+**Probe (c) — Actual GET, allowed origin:**
+
+Request: `GET / HTTP/1.1` `Origin: https://example.test`
+
+Verbatim response (CORS-relevant headers shown in wire order; full body omitted — body is the upstream nginx default-page):
+
+```
+< HTTP/1.1 200 OK
+< server: envoy
+< date: Fri, 01 May 2026 01:09:51 GMT
+< content-type: text/html
+< content-length: 896
+< last-modified: Tue, 07 Apr 2026 12:09:53 GMT
+< etag: "69d4f411-380"
+< accept-ranges: bytes
+< x-envoy-upstream-service-time: 0
+< access-control-allow-origin: https://example.test
+< access-control-allow-credentials: true
+< access-control-expose-headers: x-baz
+```
+
+**Probe (d) — Actual GET, no Origin:**
+
+Request: `GET / HTTP/1.1` (no Origin header)
+
+Verbatim response (CORS headers absent — passthrough confirmed):
+
+```
+< HTTP/1.1 200 OK
+< server: envoy
+< date: Fri, 01 May 2026 01:09:51 GMT
+< content-type: text/html
+< content-length: 896
+< last-modified: Tue, 07 Apr 2026 12:09:53 GMT
+< etag: "69d4f411-380"
+< accept-ranges: bytes
+< x-envoy-upstream-service-time: 0
+```
+
+**Conclusions (pinned):**
+
+- **Preflight, allowed origin (probe a):** status `200 OK` (NOT `204 No Content` — BRAINSTORM §2.4 hypothesized 204; v1.37.2 emits 200). Six CORS response headers in this order: `access-control-allow-origin`, `access-control-allow-credentials`, `access-control-allow-methods`, `access-control-allow-headers`, `access-control-max-age`, `access-control-expose-headers`. Body length 0. envoy-go's cors filter MUST emit `200 OK` with empty body and the same six headers in the same order.
+- **Preflight, disallowed origin (probe b):** the cors filter does NOT synthesize a 4xx local-reply for disallowed-origin preflights. Instead, the preflight passes through to the router, which sees an `OPTIONS /` and responds `405 Method Not Allowed` (since the route doesn't accept OPTIONS — which is the v1.37.2 default for routes without `route.connect_matcher` or explicit options handling). envoy-go's cors filter MUST replicate this passthrough (do NOT inject a 4xx; let the request flow to the router).
+- **Actual request, allowed origin (probe c):** the cors filter's encodeHeaders adds three CORS response headers to the upstream response: `access-control-allow-origin`, `access-control-allow-credentials`, `access-control-expose-headers`. (NOT all six — `allow-methods`/`allow-headers`/`max-age` are preflight-only.)
+- **Actual request, no Origin (probe d):** the cors filter is a no-op (no CORS response headers injected). Confirms the filter's gating discipline (no Origin → no encode-side action).
+
+### Empirical evidence (413 overflow)
+
+**Probe configuration:** chain `[envoy.filters.http.buffer, envoy.filters.http.router]` with `Buffer{max_request_bytes: 1024}`. Listener `per_connection_buffer_limit_bytes: 1024`. Route `/` → STRICT_DNS cluster `c0` (nginx backend).
+
+**Probe request:** `POST / HTTP/1.1` `Content-Length: 2048` with a 2048-byte body of ASCII `'A'`.
+
+**Verbatim response:**
+
+```
+< HTTP/1.1 413 Payload Too Large
+< content-length: 17
+< content-type: text/plain
+< date: Fri, 01 May 2026 01:10:15 GMT
+< server: envoy
+< connection: close
+```
+
+**Body bytes (verbatim hex dump):**
+
+```
+00000000: 5061 796c 6f61 6420 546f 6f20 4c61 7267  Payload Too Larg
+00000010: 65                                       e
+```
+
+**Conclusions (pinned):**
+
+- Status: `413 Payload Too Large`.
+- Body: 17 bytes, exact ASCII `Payload Too Large` (no trailing newline).
+- Headers in wire order: `content-length: 17`, `content-type: text/plain`, `date: <stamp>`, `server: envoy`, `connection: close`.
+- Connection is closed (note `connection: close`) — the 413 forces the H1 conn to terminate; envoy-go's encode-side overflow must mirror this discipline (H1: emit 413 then close conn; H2: RST_STREAM after the local-reply HEADERS+DATA frames). The `connection: close` header is what makes the 413 path's connection-reset semantically explicit on the wire.
+- envoy-go's decode-side buffer overflow MUST synthesize this verbatim shape (status + body + headers — modulo `date` and `server` which are already in the differential allow-list per `BEHAVIOR_CONTRACT.md ## Header allow-list`).
+
+### Empirical evidence (sendLocalReply entry)
+
+**Probe configuration:** chain `[lua_a, lua_b, lua_c, envoy.filters.http.router]` where `lua_b` calls `respond` (Envoy's sendLocalReply API) with status 418 + a `x-from: filterB` header + body `"418 from filterB\n"`. `lua_a`, `lua_c` log on decode/encode entry. Route `/` → STRICT_DNS cluster `c0` (would route to nginx, but `lua_b`'s `respond` aborts decode mid-chain).
+
+**Probe request:** `GET / HTTP/1.1`
+
+**Verbatim Envoy stderr trace (timestamps preserved):**
+
+```
+[2026-05-01 01:11:17.263][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: DECODE filter=A index=0
+[2026-05-01 01:11:17.263][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: DECODE filter=B index=1 (calling respond)
+[2026-05-01 01:11:17.263][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: ENCODE filter=C index=2
+[2026-05-01 01:11:17.263][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: ENCODE filter=B index=1
+[2026-05-01 01:11:17.263][13][critical][lua] [source/extensions/filters/common/lua/lua.cc:35] script log: ENCODE filter=A index=0
+```
+
+**Verbatim response:**
+
+```
+< HTTP/1.1 418 Unknown
+< x-from: filterB
+< content-length: 17
+< content-type: text/plain
+< date: Fri, 01 May 2026 01:11:16 GMT
+< server: envoy
+```
+
+**Conclusions (pinned):**
+
+- Decode aborted at `lua_b` (index 1) when it called `respond`. `lua_c` (index 2) and router (index 3) NEVER ran on the decode side.
+- Encode-side iteration entered at **`lua_c` (index 2)** — i.e., `filter[len-1]` of the encode-side filter set (router has no observable encode-side action in this probe but is at index 3; the encode-side iteration starts from the last filter that has an encode side, which in this chain is `lua_c` at index 2).
+- ALL THREE Lua filters' encode sides ran (`lua_c` → `lua_b` → `lua_a`), even though only filter B's decode side reached its abort point — confirming that `sendLocalReply` runs the FULL encode chain in reverse order, not just from the abort point upward.
+- Status `418 Unknown`: HTTP/1.1 status text "Unknown" because 418 is not a stdlib-known status code on Envoy's HTTP/1.1 codec; the payload includes the user-supplied `x-from: filterB` header alongside the framework-injected `content-length` / `content-type` / `date` / `server`.
+- envoy-go's `chain.beginLocalReply` MUST: (a) abort decode-side iteration at the calling filter's index; (b) enter encode-side iteration at `filter[len-1]` of the encode-side set (NOT at the calling filter's index, NOT at index 0); (c) iterate the FULL encode chain in reverse order (every encode-side filter runs); (d) merge framework-injected standard headers (`content-length`, `content-type`, `date`, `server`) with the user-supplied headers (`x-from`).
+
+### Applies to
+- Phase 07.1 onward (HTTP filter framework).
+
+### Does not yet apply to
+- Network filter chain (still phase 02 minimal — TCP-proxy or HCM as single entry per ADR-0033).
+- Listener filters (deferred to 07.2).
+- FilterChainMatch beyond SNI (deferred to 07.2).
+- Listener.default_filter_chain (deferred to 07.2).
+- HTTP filter family implementations beyond cors + envoy_go_test (incrementally landed by §9 family phases).

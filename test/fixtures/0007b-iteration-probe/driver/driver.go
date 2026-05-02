@@ -105,8 +105,8 @@ func (iterationProbeDriver) SubjectListenerName() string { return subjListenerNa
 // return zero / empty defensively so that any future runner refactor that
 // inadvertently calls them on a reference-less fixture surfaces immediately
 // as a misconfigured-bootstrap error rather than silently using stale state.
-func (iterationProbeDriver) ReferenceListenerPort() int           { return 0 }
-func (iterationProbeDriver) ReferenceBootstrap(_ []int) string    { return "" }
+func (iterationProbeDriver) ReferenceListenerPort() int        { return 0 }
+func (iterationProbeDriver) ReferenceBootstrap(_ []int) string { return "" }
 func (iterationProbeDriver) DriveReference(context.Context, string) ([]byte, error) {
 	return nil, nil
 }
@@ -311,49 +311,49 @@ type modeExpectation struct {
 //
 // Per-mode rationale:
 //
-// 1. continue          — pure pass-through. Backend returns "backend\n" on GET.
-//                        Probe filter EncodeHeaders fires and adds the route-count header.
-// 2. stop-and-resume-headers — DecodeHeaders returns StopIteration; goroutine resumes
-//                        after 10ms via dcb.ContinueDecoding. The chain framework's
-//                        parkDecode loop yields and the request flows through normally.
-//                        Same expected response as mode 1 (resume is transparent to
-//                        the wire).
-// 3. stop-and-buffer-data — DecodeData returns DataStopIterationAndBuffer; resumes
-//                        after 10ms. The framework buffers the request body and
-//                        re-runs from the next filter on resume. POST body
-//                        "payload" reaches the backend; the backend echoes it.
-// 4. local-reply-decode — SendLocalReply(418, "i am a teapot\n") on DecodeHeaders.
-//                        The chain transitions to encode synchronously inside
-//                        beginLocalReply; the encode chain runs in REVERSE
-//                        declaration order from filter[len-1], which means the
-//                        probe filter's EncodeHeaders fires AFTER the SendLocalReply
-//                        and sets x-envoy-go-test-route-count: 7 on the synthesized
-//                        response. Body is "i am a teapot\n" verbatim from the
-//                        SendLocalReply call.
-// 5. local-reply-decode-data — same as mode 4 but the SendLocalReply fires from
-//                        DecodeData (after DecodeHeaders has already passed through).
-//                        The POST body is consumed before the SendLocalReply
-//                        synthesizes — same wire shape as mode 4 (418 +
-//                        "i am a teapot\n" + route-count header).
-// 6. modify-encode-headers — EncodeHeaders sets x-envoy-go-test-encoded: yes.
-//                        The route-count header also lands per the universal
-//                        encode-side branch in the probe filter.
-// 7. modify-encode-data — EncodeData replaces body bytes in-place via
-//                        copy(data, "MODIFIED\n"). The backend's GET body is
-//                        "backend\n" (8 bytes); copy writes the first 8 bytes
-//                        of "MODIFIED\n" → "MODIFIED" (no trailing newline,
-//                        the 9th byte of "MODIFIED\n" is dropped). Expected
-//                        body: "MODIFIED" (8 bytes). The route-count header
-//                        also lands per the universal encode-side branch.
-// 8. stop-trailers     — DecodeTrailers returns TrailersStopIteration in the
-//                        probe filter, but H1 HCM dispatch does NOT currently
-//                        invoke RunDecodeTrailers (the H1 chunked-T-E trailer
-//                        parsing was deferred at Task 15 close-out per
-//                        PROGRESS notes). The probe filter's DecodeTrailers
-//                        branch therefore never fires end-to-end on this H1
-//                        fixture; the request flows through as if mode were
-//                        "continue". This is documented honestly here per
-//                        the Task 22 prompt's mode 8 caveat.
+//  1. continue          — pure pass-through. Backend returns "backend\n" on GET.
+//     Probe filter EncodeHeaders fires and adds the route-count header.
+//  2. stop-and-resume-headers — DecodeHeaders returns StopIteration; goroutine resumes
+//     after 10ms via dcb.ContinueDecoding. The chain framework's
+//     parkDecode loop yields and the request flows through normally.
+//     Same expected response as mode 1 (resume is transparent to
+//     the wire).
+//  3. stop-and-buffer-data — DecodeData returns DataStopIterationAndBuffer; resumes
+//     after 10ms. The framework buffers the request body and
+//     re-runs from the next filter on resume. POST body
+//     "payload" reaches the backend; the backend echoes it.
+//  4. local-reply-decode — SendLocalReply(418, "i am a teapot\n") on DecodeHeaders.
+//     The chain transitions to encode synchronously inside
+//     beginLocalReply; the encode chain runs in REVERSE
+//     declaration order from filter[len-1], which means the
+//     probe filter's EncodeHeaders fires AFTER the SendLocalReply
+//     and sets x-envoy-go-test-route-count: 7 on the synthesized
+//     response. Body is "i am a teapot\n" verbatim from the
+//     SendLocalReply call.
+//  5. local-reply-decode-data — same as mode 4 but the SendLocalReply fires from
+//     DecodeData (after DecodeHeaders has already passed through).
+//     The POST body is consumed before the SendLocalReply
+//     synthesizes — same wire shape as mode 4 (418 +
+//     "i am a teapot\n" + route-count header).
+//  6. modify-encode-headers — EncodeHeaders sets x-envoy-go-test-encoded: yes.
+//     The route-count header also lands per the universal
+//     encode-side branch in the probe filter.
+//  7. modify-encode-data — EncodeData replaces body bytes in-place via
+//     copy(data, "MODIFIED\n"). The backend's GET body is
+//     "backend\n" (8 bytes); copy writes the first 8 bytes
+//     of "MODIFIED\n" → "MODIFIED" (no trailing newline,
+//     the 9th byte of "MODIFIED\n" is dropped). Expected
+//     body: "MODIFIED" (8 bytes). The route-count header
+//     also lands per the universal encode-side branch.
+//  8. stop-trailers     — DecodeTrailers returns TrailersStopIteration in the
+//     probe filter, but H1 HCM dispatch does NOT currently
+//     invoke RunDecodeTrailers (the H1 chunked-T-E trailer
+//     parsing was deferred at Task 15 close-out per
+//     PROGRESS notes). The probe filter's DecodeTrailers
+//     branch therefore never fires end-to-end on this H1
+//     fixture; the request flows through as if mode were
+//     "continue". This is documented honestly here per
+//     the Task 22 prompt's mode 8 caveat.
 var modeExpectations = []modeExpectation{
 	{
 		mode:           "continue",

@@ -17,7 +17,7 @@
 //
 //   - EnvoyGoTestPerRoute (per-route config carried via typed_per_filter_config):
 //     1. count int32 — echoed into x-envoy-go-test-route-count: <N> response
-//        header on encodeHeaders.
+//     header on encodeHeaders.
 //
 // TypeURL conventions:
 //
@@ -50,15 +50,14 @@ const (
 	TypeURLEnvoyGoTestPerRoute = "type.googleapis.com/envoy.filters.http.envoy_go_test.v0.EnvoyGoTestPerRoute"
 )
 
-// fileDesc holds the package-init-built FileDescriptor for the two messages.
-// Lazy-built once via fileDescOnce to avoid the descriptor-build cost on
-// import in tests that do not exercise the filter.
+// envoyGoTestDesc / perRouteDesc hold the package-init-built MessageDescriptors
+// for the two messages. Lazy-built once via descOnce to avoid the
+// descriptor-build cost on import in tests that do not exercise the filter.
 var (
-	fileDesc           protoreflect.FileDescriptor
-	envoyGoTestDesc    protoreflect.MessageDescriptor
-	perRouteDesc       protoreflect.MessageDescriptor
-	descOnce           sync.Once
-	descBuildErr       error
+	envoyGoTestDesc protoreflect.MessageDescriptor
+	perRouteDesc    protoreflect.MessageDescriptor
+	descOnce        sync.Once
+	descBuildErr    error
 )
 
 // init eagerly builds the descriptor + registers the two messages in the
@@ -87,21 +86,21 @@ func initDesc() {
 		// these fields). JSON names are protoc's lowerCamelCase convention
 		// applied manually here.
 		var (
-			syntax    = "proto3"
-			pkg       = "envoy.filters.http.envoy_go_test.v0"
-			fname     = "envoy/filters/http/envoy_go_test/v0/envoy_go_test.proto"
-			msg1Name  = "EnvoyGoTest"
-			msg2Name  = "EnvoyGoTestPerRoute"
-			f1Name    = "mode_default"
-			f1JSON    = "modeDefault"
-			f1Number  = int32(1)
-			f1Type    = descriptorpb.FieldDescriptorProto_TYPE_STRING
-			f1Label   = descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL
-			f2Name    = "count"
-			f2JSON    = "count"
-			f2Number  = int32(1)
-			f2Type    = descriptorpb.FieldDescriptorProto_TYPE_INT32
-			f2Label   = descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL
+			syntax   = "proto3"
+			pkg      = "envoy.filters.http.envoy_go_test.v0"
+			fname    = "envoy/filters/http/envoy_go_test/v0/envoy_go_test.proto"
+			msg1Name = "EnvoyGoTest"
+			msg2Name = "EnvoyGoTestPerRoute"
+			f1Name   = "mode_default"
+			f1JSON   = "modeDefault"
+			f1Number = int32(1)
+			f1Type   = descriptorpb.FieldDescriptorProto_TYPE_STRING
+			f1Label  = descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL
+			f2Name   = "count"
+			f2JSON   = "count"
+			f2Number = int32(1)
+			f2Type   = descriptorpb.FieldDescriptorProto_TYPE_INT32
+			f2Label  = descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL
 		)
 
 		fdp := &descriptorpb.FileDescriptorProto{
@@ -140,7 +139,6 @@ func initDesc() {
 			descBuildErr = fmt.Errorf("envoygotestpb: build file descriptor: %w", err)
 			return
 		}
-		fileDesc = fd
 		envoyGoTestDesc = fd.Messages().ByName(protoreflect.Name(msg1Name))
 		perRouteDesc = fd.Messages().ByName(protoreflect.Name(msg2Name))
 		if envoyGoTestDesc == nil || perRouteDesc == nil {
