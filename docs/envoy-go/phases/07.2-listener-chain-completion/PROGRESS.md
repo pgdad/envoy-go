@@ -96,3 +96,43 @@ ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.008s
 $ go vet ./internal/listener/listenerfilter/...
 $ golangci-lint run ./internal/listener/listenerfilter/...
 ```
+
+## Task 4 — internal/listener/listenerfilter/pipeline.go [ADR-0082]
+
+**Commits:** TBD — this task's commit
+**Notes:** Created `internal/listener/listenerfilter/pipeline.go` (~60 LoC: empty `Pipeline struct{}` reserved for future per-pipeline state; `Run(ctx, filters, peeker, inputs, timeoutMs uint32) (retErr error)` driving sequential dispatch with `defer` calling `OnDestroy()` on every constructed filter regardless of exit path; zero-filters short-circuit returning nil without timeout setup; `timeoutMs > 0` establishes a single shared `context.WithTimeout` once before the loop — per-pipeline NOT per-filter time-slicing per ADR-0082 + Decision N; `timeoutMs == 0` passes the caller's ctx through unmodified; per-iteration `Inspect` followed by error-wrap `listener-filter[%d]: %w`, post-Inspect `ctx.Err()` check wrapped `listener-filter[%d]: pipeline timeout: %w`, and `StopIteration` early-return) and `internal/listener/listenerfilter/pipeline_test.go` (~170 LoC, 7 tests + `stubFilter` test-only impl). Tests cover zero-filters (`TestPipelineRunZeroFilters`), Continue-then-finish populating both filters' inputs and verifying OnDestroy on both (`TestPipelineRunContinuePath`), StopIteration short-circuit with f2-not-fired assertion + OnDestroy on both (`TestPipelineRunStopIterationPath`), filter error propagation via `errors.Is` (`TestPipelineRunFilterError`), per-pipeline shared-budget timing (`TestPipelineRunTimeoutSharedAcrossFilters` — 30ms budget, f1 sleeps 50ms; f2 must not fire), zero-timeout no-op (`TestPipelineRunZeroTimeoutDisablesEnforcement`), and `fmt.Errorf` wrapping (`TestPipelineRunPropagatesError`). TDD discipline observed: pipeline_test.go was written first; tests confirmed failing (build error: `undefined: Pipeline` x7); then pipeline.go landed; tests confirmed passing under `-race`. Project-precedent `defer func() { _ = c.Close() }()` pattern adopted in tests for errcheck cleanliness (mirrors `callbacks_test.go` Task 2 precedent). No `nolint:revive` needed for the `Pipeline` type — name does not stutter against the package name. The 30ms budget on the timing-sensitive test is intentional (real `context.WithTimeout` mechanic; on slow CI it could flake — increase only if observed). Landed ADR-0082 (`listener_filters_timeout` [1s, 60s] envelope, 15s default, `continue_on_listener_filters_timeout` honored, per-pipeline shared budget per Decision N).
+**Outputs:**
+```
+$ go test ./internal/listener/listenerfilter/... 2>&1 | head -30
+# github.com/esalaine/envoy-go/internal/listener/listenerfilter [github.com/esalaine/envoy-go/internal/listener/listenerfilter.test]
+internal/listener/listenerfilter/pipeline_test.go:30:8: undefined: Pipeline
+internal/listener/listenerfilter/pipeline_test.go:50:8: undefined: Pipeline
+internal/listener/listenerfilter/pipeline_test.go:78:8: undefined: Pipeline
+internal/listener/listenerfilter/pipeline_test.go:103:8: undefined: Pipeline
+internal/listener/listenerfilter/pipeline_test.go:130:8: undefined: Pipeline
+internal/listener/listenerfilter/pipeline_test.go:152:8: undefined: Pipeline
+internal/listener/listenerfilter/pipeline_test.go:167:8: undefined: Pipeline
+FAIL	github.com/esalaine/envoy-go/internal/listener/listenerfilter [build failed]
+FAIL
+$ go test -race -run 'TestPipeline' ./internal/listener/listenerfilter/... -v
+=== RUN   TestPipelineRunZeroFilters
+--- PASS: TestPipelineRunZeroFilters (0.00s)
+=== RUN   TestPipelineRunContinuePath
+--- PASS: TestPipelineRunContinuePath (0.00s)
+=== RUN   TestPipelineRunStopIterationPath
+--- PASS: TestPipelineRunStopIterationPath (0.00s)
+=== RUN   TestPipelineRunFilterError
+--- PASS: TestPipelineRunFilterError (0.00s)
+=== RUN   TestPipelineRunTimeoutSharedAcrossFilters
+--- PASS: TestPipelineRunTimeoutSharedAcrossFilters (0.03s)
+=== RUN   TestPipelineRunZeroTimeoutDisablesEnforcement
+--- PASS: TestPipelineRunZeroTimeoutDisablesEnforcement (0.01s)
+=== RUN   TestPipelineRunPropagatesError
+--- PASS: TestPipelineRunPropagatesError (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.047s
+$ go test -race ./internal/listener/listenerfilter/...
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.047s
+$ go vet ./internal/listener/listenerfilter/...
+$ golangci-lint run ./internal/listener/listenerfilter/...
+```

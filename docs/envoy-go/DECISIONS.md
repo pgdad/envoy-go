@@ -2973,3 +2973,41 @@ The listener-filter dispatch protocol is shaped per the following decisions, all
 07.2 PLAN Task 2 (the `internal/listener/listenerfilter/` package introduction; specifically the `doc.go` + `types.go` + `callbacks.go` + their tests). Supersedes nothing; complements ADR-0072 (HTTPRegistry pattern) and ADR-0059 (stats Registry LBP-1).
 
 ---
+
+## ADR-0082: `listener_filters_timeout` honored in [1s, 60s]; default 15s; `continue_on_listener_filters_timeout` honored
+
+**Status:** Accepted
+**Date:** 2026-05-02
+**Doctrine:** D-3.5 (honor proto fields widely used in real Envoy deployments) + D-3.6 (record durable design rationale; the timeout envelope + per-pipeline shared-budget mechanic is a contract that future tuning phases MUST consult).
+
+### Context
+
+Phase 07.2 introduces the per-connection listener-filter pipeline (`internal/listener/listenerfilter/pipeline.go`). The Envoy `Listener` proto carries a `listener_filters_timeout` field (a `google.protobuf.Duration`) that bounds how long the listener-filter pipeline may run on an accepted connection before the dispatch path either aborts the connection or proceeds to chain match with partial inputs (gated by the sibling `continue_on_listener_filters_timeout` boolean). SPEC §6.5 raised the question of how the timeout is enforced: per-filter (each filter gets its own budget) or per-pipeline (all filters share one budget); what the validation envelope is at parse time; and what the default is when the proto field is unset.
+
+### Decision
+
+The `listener_filters_timeout` proto field is honored, with values clamped/validated to a `[1s, 60s]` envelope. The default is `15s` when the field is unset (zero-valued duration). Values outside the envelope error at parse time with the message `listener: %q: listener_filters_timeout %s is outside the supported [1s, 60s] envelope` (matching the rest of `internal/listener/manager.go`'s error-message conventions, which all begin with `listener: %q:`).
+
+The `continue_on_listener_filters_timeout` sibling field is honored as-is per the proto's documented semantics: `false` (the proto default) → on timeout the dispatch path aborts the connection (no chain match runs); `true` → on timeout the listener-filter pipeline is treated as having returned `Continue` and chain match proceeds against whatever inputs were populated before the deadline. Task 9 wires the dispatch-path branch on the `continue_on_listener_filters_timeout` value; Task 4 (this ADR's lands-in task) implements the timeout-detection mechanic that Task 9 consumes.
+
+The timeout is enforced as a **per-pipeline shared budget** (per Decision N from SPEC §6.5 — NOT per-filter time-slicing). A single `context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)` is established once before the pipeline loop and shared across all filters' `Inspect` calls. A slow first filter eats subsequent filters' budget; the second filter sees an already-expired ctx if the first filter consumed the entire budget. This is correct: the user's `listener_filters_timeout` budget is the budget for all listener filters combined on a given connection.
+
+### Alternatives considered
+
+- **(A) Per-filter timeout (each filter gets the full budget independently).** REJECTED per Decision N. Per-filter timeouts would force `len(filters)` `context.WithTimeout` derivations per accepted connection (allocations on a hot path) AND would unfairly penalize multi-filter pipelines (a 3-filter pipeline with a 15s budget would have 45s of cumulative budget while a 1-filter pipeline gets 15s — that is not what the proto field documents). The proto's documented semantics are per-pipeline; honoring per-pipeline matches Envoy's behavior.
+
+- **(B) Hardcoded 15s ignoring the proto field.** REJECTED because the proto field is widely used in real Envoy deployments (operators tune it to match their dispatch-path latency budget). Honoring it is doctrine D-3.5 (real-world parity over MVP simplification).
+
+### Consequences
+
+- (a) The bootstrap parser's envelope-check error message format (`listener: %q: listener_filters_timeout %s is outside the supported [1s, 60s] envelope`) is consistent with the rest of `internal/listener/manager.go`'s error-message conventions (verified at PLAN time by inspection of existing errors at lines 247, 252, 257, 286, 290, 294 — all begin with `listener: %q:`). Future error-message refactors that touch `manager.go` should preserve this format.
+
+- (b) `Pipeline.Run` takes a `timeoutMs uint32` parameter. `0 = no-op` (no `context.WithTimeout` wrapping; the caller's ctx is passed through unmodified). The listener manager passes `lfTimeoutMs` populated from the parsed proto field (15s = 15000 by default; clamped/validated at parse time per the envelope above). Test scaffolding that exercises `Pipeline.Run` directly may pass `0` to disable timeout enforcement.
+
+- (c) A future hardening phase may revisit the `[1s, 60s]` envelope — for example, relax the upper bound for slow-network deployments (TLS over satellite, etc.) — with its own ADR. The envelope is durable for the BOOTSTRAP MVP trunk's deployment profile; relaxation requires a documented rationale + empirical pin.
+
+### Lands-in-task
+
+07.2 PLAN Task 4 (the `Pipeline.Run` timeout-enforcement mechanic). The bootstrap parser's envelope-check at `internal/listener/manager.go` (Task 9) cross-references this ADR. Supersedes nothing.
+
+---
