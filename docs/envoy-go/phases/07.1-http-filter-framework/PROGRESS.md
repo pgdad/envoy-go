@@ -1722,7 +1722,7 @@ ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.009s
 
 ## Task 21 — differential fixture 0007a-cors
 
-**Commits:** TBD (code) → TBD (PROGRESS SHA-fill).
+**Commits:** 9a710f3 (code) → TBD (PROGRESS SHA-fill).
 
 **Files created:**
 
