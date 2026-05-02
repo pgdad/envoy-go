@@ -577,3 +577,86 @@ $ wc -l test/fixtures/0008-listener-chain-match/{envoy*.yaml,expectations.yaml,R
 $ grep -cE '^## ADR-[0-9]+' docs/envoy-go/DECISIONS.md
 83
 ```
+
+## Task 16 — test/fixtures/0008-listener-chain-match/driver/{driver,sockopts,driver_test}.go + SPEC §11.4 carry-forward resolution
+
+**Commits:** TBD — this task's commit
+**Notes:** Implemented fixture-0008's driver — the project's first MULTI-listener driver and the first to use AlternateConfigDriver. Created `driver/driver.go` (~938 LoC after gofmt — most lines are the 4 embedded YAML templates per the established 0001/0007a precedent of in-source const templates), `driver/sockopts.go` (47 LoC; Linux-only `setReuseSockopts` helper for SO_REUSEADDR + SO_REUSEPORT on the source-bind socket — needed because connections 2 and 5 share the same source port and the second back-to-back source-bind would otherwise fail with EADDRINUSE on TIME_WAIT), and `driver/driver_test.go` (303 LoC; 10 unit tests covering interface satisfaction, primary-listener rule, BackendCount, knownDriverPort allocation, all 4 bootstrap-render paths, c4-variant chain_other-removal invariant, and the driveFour 4-connection ordering verified via in-process echo backends with per-listener accept counters). Driver implements all 3 fixture interfaces — `Driver` (single-listener compat: SubjectListenerName="l_test_a", ReferenceListenerPort=15008, DriveSubject/DriveReference are STUBS because the runner's multi-listener branch dispatches to the Multi variants and never invokes the single-addr Drives), `MultiListenerDriver` (SubjectListenerNames=["l_test_a","l_test_b"], ReferenceListenerPorts=[15008,15009], DriveSubjectMulti+DriveReferenceMulti both delegate to driveFour which issues 4 sequential TCP connections per SPEC §7.4 — connection 1 (l_test_a, no source-bind), connection 2 (l_test_b, source-bound 127.0.0.1:knownDriverPort), connection 3 (l_test_b, no source-bind), connection 5 (l_test_a, source-bound) — and concatenates response bodies separated by `=== conn N (chain)` headers for debug legibility), `AlternateConfigDriver` (AlternateSubjectListenerName="l_test_b", AlternateReferenceListenerPort=15010 — distinct from primary's 15009 to avoid testcontainers exposed-port collision when both containers run concurrently — DriveAlternate issues connection 4 (l_test_b, no source-bind) against ref then subj, asserts byte-equality in-band per the SubjectAsserter precedent, returns concatenated bytes for the runner's `_ = altBytes` consumer). BackendCount=5 per PLAN line 2569 (4 chain-specific + 1 placeholder-for-symmetry; only ports[0..3] are wired into clusters, ports[4] is allocated but unused — driver_test.go's TestReferenceBootstrapRenders pins this invariant). known_driver_port pre-allocated in init() via net.Listen("tcp","127.0.0.1:0") + Close — captured port number is embedded in chain_srcprefix_loopback.source_ports[0] of all 4 bootstraps AND used as net.Dialer.LocalAddr.Port for connections 2 + 5.
+
+**Source-IP cross-side compatibility surface adjustment:** The static envoy.yaml + envoy-c4.yaml files (committed at Task 15) declare `source_prefix_ranges: [{address_prefix: 127.0.0.1, prefix_len: 32}]`. With Docker bridge networking, host-originated connections to a published container port arrive at the reference Envoy with a SOURCE IP that is NOT 127.0.0.1 (it is the bridge gateway, e.g. 172.17.0.1) — so a literal 127.0.0.1/32 source_prefix_ranges would eliminate chain_srcprefix_loopback for ALL connections on the reference side, breaking the differential. **The driver-embedded const templates use `0.0.0.0/0` for source_prefix_ranges in BOTH subject and reference templates** (universally-matching on source IP). The discriminator becomes purely `source_ports: [known_driver_port]`. The chain still has slot 6 (SourcePrefixRanges) and slot 7 (SourcePorts) specified, so the specificity vector for the §11.3 precedence demonstration (connection 5: chain_dstport_alpha at slot 0 BEATS chain_srcprefix_loopback at slots {6,7}) is unchanged. The static fixture YAMLs remain illustrative documentation per the 0001/0007a precedent (the load-bearing definition is the driver-embedded const). The driver doc-comment's "Source-IP cross-side compatibility" section explains the rationale verbatim.
+
+**SPEC §11.4 carry-forward resolved [Decision K].** Built scratch probe at `/tmp/envoy-07.2-impl-empirical/` (NOT committed): TLS bootstrap with `tls_inspector` listener filter + 2 filter_chains discriminated by `application_protocols: [h2]` vs `application_protocols: [http/1.1]`, each with its own DownstreamTlsContext (real cert+key, ephemeral self-signed via `openssl req -x509 -newkey rsa:2048 -nodes -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"`) advertising both ALPNs. Spawned the pinned Envoy v1.37.2 container (`envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`, server SHA `5afe27fb338b16d5bb06b3a7198bcd581b4e3dee` per `/server_info` — same SHA as §§11.1–11.3) with `--rm` + bind-mounted YAML and certs. Issued two probes via Go probe.go: probe (a) `tls.Dial` with `NextProtos: ["h2"]` → received `cs.NegotiatedProtocol == "h2"`, `tcp_h2.downstream_cx_total: 0→1`, `tcp_h1` STAYED 0; probe (b) `tls.Dial` with `NextProtos: ["http/1.1"]` → received `cs.NegotiatedProtocol == "http/1.1"`, `tcp_h1.downstream_cx_total: 0→1`, `tcp_h2` STAYED 1. tls_inspector per-filter stats corroborated (`tls_found: 2, alpn_found: 2, sni_not_found: 2`). Pasted verbatim into SPEC §11.4 replacing the carry-forward placeholder; structure mirrors §§11.1–11.3 (probe configuration + verbatim /server_info + verbatim /config_dump + per-probe verbatim stats + conclusions). The §11 preamble at line 645 + Decision K at line 1067 + the §13.1 BEHAVIOR_CONTRACT-integration placeholder at line 1003 ("verbatim block resolved at impl time per §11.4 carry-forward") are NOT touched here — those are descriptive references and the §13.1 paste-verbatim landing is Task 17's domain.
+
+**Differential fixture-0008 PASS:** `go test ./test/differential/ -run 'TestDifferential/0008'` PASSED first try (2.88s). Per-connection backend-port routing byte-equal across envoy-go and reference Envoy v1.37.2 — chain selection equivalence empirically confirmed across the 5-connection workload (4 primary + 1 c4-variant). All pre-existing fixtures (0000-0007b) PASS unchanged: full `go test ./test/differential/ -count=1` 25.7s green. Driver unit tests 10/10 PASS (TestInterfaceSatisfaction, TestPrimaryListenerRule, TestBackendCount, TestKnownDriverPortAllocated, TestReferenceBootstrapRenders, TestSubjectConfigRenders, TestAlternateBootstrapRenders, TestAlternateListenerName, TestDriveFourConnectionCount, TestDriveFourMissingAddr).
+
+**Surface adjustments from PLAN pseudo-code:** PLAN line 2571 mentions "5 backends total: 4 chain-specific + 1 default-chain backend" — the c_default cluster is wired with backendPorts[3] (4th port, distinct from the 4-chain mapping interpretation); the 5th port (backendPorts[4]) is an UNUSED placeholder per the 5-connection symmetry note in test/fixtures/0008-listener-chain-match/backends/main.go's package doc-comment. PLAN line 2581 ("driver_test.go ~120 LoC") landed at 303 LoC because the in-process echo-backend stand-ins for testing driveFour added ~80 LoC (TestDriveFourConnectionCount + mustListen + runEchoBackend); the additional coverage was judged worthwhile because driveFour is the load-bearing differential surface. PLAN line 2576 ("DriveSubject and DriveReference (single-listener Driver compat) — for the runner's pre-multi-branch path") clarifies via the runner_test.go body inspection that the single-addr Drives are NEVER invoked when isMulti=true — they are stubbed (return nil, nil) per the MultiListenerDriver doc-comment in fixture/fixture.go ("the single-addr Driver methods MUST still be implemented [...] so the runner's pre-multi-branch path still works for the fixture-discovery / admin-probe steps" — but the runner's fixture-discovery / admin-probe steps don't invoke Drive*; only DriveSubject / DriveReference invocations are the ones in the else-branch of `if isMulti`, which is dead code for our fixture). DECISIONS.md unchanged at 83 ADRs (Task 16 resolves a SPEC-anchored carry-forward and adds test code; no new architectural decisions).
+
+**Outputs:**
+```
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test ./test/fixtures/0008-listener-chain-match/driver/ -count=1 -v
+=== RUN   TestInterfaceSatisfaction
+--- PASS: TestInterfaceSatisfaction (0.00s)
+=== RUN   TestPrimaryListenerRule
+--- PASS: TestPrimaryListenerRule (0.00s)
+=== RUN   TestBackendCount
+--- PASS: TestBackendCount (0.00s)
+=== RUN   TestKnownDriverPortAllocated
+--- PASS: TestKnownDriverPortAllocated (0.00s)
+=== RUN   TestReferenceBootstrapRenders
+--- PASS: TestReferenceBootstrapRenders (0.00s)
+=== RUN   TestSubjectConfigRenders
+--- PASS: TestSubjectConfigRenders (0.00s)
+=== RUN   TestAlternateBootstrapRenders
+--- PASS: TestAlternateBootstrapRenders (0.00s)
+=== RUN   TestAlternateListenerName
+--- PASS: TestAlternateListenerName (0.00s)
+=== RUN   TestDriveFourConnectionCount
+--- PASS: TestDriveFourConnectionCount (0.00s)
+=== RUN   TestDriveFourMissingAddr
+--- PASS: TestDriveFourMissingAddr (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	0.002s
+$ go test ./test/differential/ -run 'TestDifferential/0008' -count=1 -v
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0008-listener-chain-match
+--- PASS: TestDifferential (2.88s)
+    --- PASS: TestDifferential/0008-listener-chain-match (2.88s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.972s
+$ go test ./test/differential/ -count=1
+ok  	github.com/esalaine/envoy-go/test/differential	25.698s
+$ wc -l test/fixtures/0008-listener-chain-match/driver/{driver,sockopts,driver_test}.go
+  938 test/fixtures/0008-listener-chain-match/driver/driver.go
+   47 test/fixtures/0008-listener-chain-match/driver/sockopts.go
+  303 test/fixtures/0008-listener-chain-match/driver/driver_test.go
+ 1288 total
+$ grep -cE '^## ADR-[0-9]+' docs/envoy-go/DECISIONS.md
+83
+```
+
+§11.4 verbatim Envoy probe outputs (paste-from-terminal — already in SPEC.md §11.4):
+```
+$ curl -s http://127.0.0.1:19901/server_info | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])"
+5afe27fb338b16d5bb06b3a7198bcd581b4e3dee/1.37.2/Clean/RELEASE/BoringSSL
+$ go run probe.go --alpn h2  # probe (a)
+alpn negotiated: "h2"
+$ curl -s "http://127.0.0.1:19901/stats?filter=tcp_(h2|h1).downstream_cx_total"
+tcp.tcp_h1.downstream_cx_total: 0
+tcp.tcp_h2.downstream_cx_total: 1
+$ go run probe.go --alpn http/1.1  # probe (b)
+alpn negotiated: "http/1.1"
+$ curl -s "http://127.0.0.1:19901/stats?filter=tcp_(h2|h1).downstream_cx_total"
+tcp.tcp_h1.downstream_cx_total: 1
+tcp.tcp_h2.downstream_cx_total: 1
+$ curl -s "http://127.0.0.1:19901/stats?filter=tls_inspector"
+tls_inspector.alpn_found: 2
+tls_inspector.alpn_not_found: 0
+tls_inspector.client_hello_too_large: 0
+tls_inspector.sni_found: 0
+tls_inspector.sni_not_found: 2
+tls_inspector.tls_found: 2
+tls_inspector.tls_not_found: 0
+tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,1475) P90(nan,1490) P95(nan,1495) P99(nan,1499) P99.5(nan,1499.5) P99.9(nan,1499.9) P100(nan,1500)
+```

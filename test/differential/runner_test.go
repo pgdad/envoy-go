@@ -30,6 +30,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 

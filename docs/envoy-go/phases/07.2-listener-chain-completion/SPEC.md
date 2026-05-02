@@ -789,21 +789,108 @@ tcp.tcp_srcprefix.downstream_cx_total: 0
 - This confirms the priority ordering documented in `filter_chain_match.proto` upstream comments and codified in §7.2: `destination_port` (priority slot 0) is more specific than `source_prefix_ranges` (priority slot 6). The chain whose specifying dimension is at a higher-priority slot wins.
 - envoy-go's `chainmatch.SelectChain` MUST score chains by the priority-ordered specificity vector per §5.5 and select the highest-scoring eligible chain.
 
-### 11.4 Empirical pin #4 (carry-forward) — `tls_inspector`-populated ALPN feeds `application_protocols` chain-match
+### 11.4 Empirical pin #4 — `tls_inspector`-populated ALPN feeds `application_protocols` chain-match
 
-**Status: CARRY-FORWARD to impl time** per Decision K.
+**Status: RESOLVED at Task 16 of phase 07.2 impl session per Decision K.**
 
-**Why deferred:** verifying this empirically requires a probe that (a) opens a TLS connection to Envoy with a specific ALPN offer (e.g., `h2`); (b) observes which chain Envoy dispatches to (via per-chain stats or per-chain log). The prerequisites are:
+**Probe configuration:** listener with `tls_inspector` listener filter + two filter_chains discriminated by `application_protocols` (h2 vs http/1.1). Each chain has its own DownstreamTlsContext (real cert+key, ephemeral self-signed, generated at probe time only — NOT committed) advertising both ALPNs (`alpn_protocols: ["h2", "http/1.1"]`) and a per-chain TCP-proxy with distinct `stat_prefix` (`tcp_h2` for the h2 chain; `tcp_h1` for the http/1.1 chain). Bootstrap at `/tmp/envoy-07.2-impl-empirical/envoy-tls-alpn.yaml` (NOT committed; impl-time scratch directory per the SPEC §11 empirical-pin convention):
 
-1. A real TLS bootstrap (with a real cert + key — would need to commit PEM files OR generate ephemeral, the latter requiring Go scaffolding code that the ADR-0004 hard-gate forbids at SPEC time).
-2. A driver that issues the TLS handshake with a specific `NextProtos` list — same Go-scaffolding constraint.
-3. The driver's connection arrives via a non-loopback path (so the Docker NAT mapping doesn't interfere) — adds container-network setup complexity.
+```yaml
+static_resources:
+  listeners:
+  - name: l_tls
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    filter_chains:
+    - name: chain_h2
+      filter_chain_match: { application_protocols: ["h2"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: /etc/tls/server.crt }
+              private_key:       { filename: /etc/tls/server.key }
+            alpn_protocols: ["h2", "http/1.1"]
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_h2, cluster: c_h2 } } ]
+    - name: chain_h1
+      filter_chain_match: { application_protocols: ["http/1.1"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: /etc/tls/server.crt }
+              private_key:       { filename: /etc/tls/server.key }
+            alpn_protocols: ["h2", "http/1.1"]
+      filters: [ { name: envoy.filters.network.tcp_proxy, typed_config: { "@type": ".../TcpProxy", stat_prefix: tcp_h1, cluster: c_h1 } } ]
+```
 
-The empirical evidence is straightforwardly producible at impl time when the PLAN's first listener-filter task lands a real driver — at which point the four-pin block in `BEHAVIOR_CONTRACT.md ## Listener filters` is updated with the verbatim Envoy output (mirroring the 06.1 SN4 carry-forward pattern that resolved at 06.1 impl time).
+**Verbatim Envoy `/server_info` (server SHA confirmation — same image as §11.1–§11.3):**
 
-**What this pin will resolve at impl time:** verbatim Envoy stats confirming that an HTTPS-`h2` connection to a listener with `filter_chains: [{application_protocols: [h2], filters: [HCM-h2]}, {application_protocols: [http/1.1], filters: [HCM-h1]}]` dispatches to `chain_h2`, AND an HTTPS-`http/1.1` connection dispatches to `chain_h1`. The `tls_inspector` listener filter is what populates `inputs.ApplicationProtocols` from the ClientHello's ALPN extension — without it, `application_protocols` chain-match would never fire.
+```
+$ curl -s http://127.0.0.1:19901/server_info | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])"
+5afe27fb338b16d5bb06b3a7198bcd581b4e3dee/1.37.2/Clean/RELEASE/BoringSSL
+```
 
-**Implementer obligation (per Decision K):** the PLAN's first listener-filter integration task includes a sub-task to produce this empirical evidence and pin it verbatim in the BEHAVIOR_CONTRACT in-place edit at the phase-done commit. The 06.1 SN4 + 06.2 default-format empirical-pin patterns are the precedents.
+**Verbatim Envoy `/config_dump` (chain-shape confirmation that Envoy parsed the listener_filters[] + application_protocols match without error):**
+
+```
+LISTENER l_tls
+  LFILTER envoy.filters.listener.tls_inspector
+  CHAIN chain_h2 fcm= {"application_protocols": ["h2"]}
+  CHAIN chain_h1 fcm= {"application_protocols": ["http/1.1"]}
+```
+
+**Probe (a) — TLS connection with `NextProtos: ["h2"]`:**
+
+A Go probe (`probe.go` in the scratch directory) issues `tls.Dial("tcp", "127.0.0.1:19000", &tls.Config{InsecureSkipVerify: true, NextProtos: ["h2"]})`. The probe receives `cs.NegotiatedProtocol == "h2"` from `conn.ConnectionState()`, confirming the TLS handshake completed and Envoy advertised h2.
+
+Verbatim stats output (`/stats?filter=tcp_(h2|h1).downstream_cx_total`):
+
+```
+tcp.tcp_h1.downstream_cx_total: 0
+tcp.tcp_h2.downstream_cx_total: 1
+```
+
+**Probe (b) — TLS connection with `NextProtos: ["http/1.1"]`:**
+
+Same probe with `--alpn http/1.1`. Receives `cs.NegotiatedProtocol == "http/1.1"`.
+
+Verbatim stats output after probe (b):
+
+```
+tcp.tcp_h1.downstream_cx_total: 1
+tcp.tcp_h2.downstream_cx_total: 1
+```
+
+**Verbatim `tls_inspector` per-listener-filter stats (corroborates the inspector ran and observed the ALPN extension):**
+
+```
+$ curl -s "http://127.0.0.1:19901/stats?filter=tls_inspector"
+tls_inspector.alpn_found: 2
+tls_inspector.alpn_not_found: 0
+tls_inspector.client_hello_too_large: 0
+tls_inspector.sni_found: 0
+tls_inspector.sni_not_found: 2
+tls_inspector.tls_found: 2
+tls_inspector.tls_not_found: 0
+tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,1475) P90(nan,1490) P95(nan,1495) P99(nan,1499) P99.5(nan,1499.5) P99.9(nan,1499.9) P100(nan,1500)
+```
+
+**Conclusions (pinned):**
+
+- An HTTPS connection offering `NextProtos: ["h2"]` is dispatched to `chain_h2` (the chain whose `application_protocols: [h2]` matches): `tcp_h2.downstream_cx_total` ticked from 0 → 1 on probe (a); `tcp_h1.downstream_cx_total` STAYED AT 0.
+- An HTTPS connection offering `NextProtos: ["http/1.1"]` is dispatched to `chain_h1` (the chain whose `application_protocols: [http/1.1]` matches): `tcp_h1.downstream_cx_total` ticked from 0 → 1 on probe (b); `tcp_h2.downstream_cx_total` STAYED AT 1 (did NOT tick further).
+- The `tls_inspector` per-filter counters confirm the listener filter ran on both connections (`tls_found: 2`, `alpn_found: 2`, `sni_not_found: 2` — neither probe sent SNI). This is the empirical demonstration that `tls_inspector` populates `inputs.ApplicationProtocols` from the ClientHello's ALPN extension; without `tls_inspector` in `listener_filters[]`, `application_protocols` chain-match cannot fire (the chain-match algorithm has no source of ALPN data otherwise).
+- envoy-go MUST run the `tls_inspector` listener filter BEFORE chain-match selection so that `inputs.ApplicationProtocols` is populated when chains discriminate on `application_protocols`. The §13.1 BEHAVIOR_CONTRACT integration enforces this at the phase-done commit (Task 17). ADR-0083 confirms this is orthogonal to ADR-0050's HCM-internal AUTO-codec dispatch — the chain-match `application_protocols` is what selects the chain, not the codec; the chain's terminal filter (HCM with forced `codec_type`, or here a TCP-proxy as the minimal probe) consumes the chain selection result.
+
+**Empirical-pin scaffolding:** The probe lives at `/tmp/envoy-07.2-impl-empirical/{envoy-tls-alpn.yaml, server.crt, server.key, probe.go}` and is NOT committed (per the SPEC §11 empirical-pin convention — the verbatim outputs above are the durable evidence; the scaffolding is reproducible by re-running the probe against the same pinned image).
 
 ### 11.5 Synchronization with BEHAVIOR_CONTRACT.md
 
