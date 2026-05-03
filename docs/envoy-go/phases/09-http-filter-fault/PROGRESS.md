@@ -39,7 +39,7 @@ The thirteen planner-time deferred decisions reproduced verbatim from PLAN.md so
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** TBD — this task's commit
+**Commits:** 29c0958 — this task's commit
 **Notes:** Created PROGRESS.md; verified all 15 preconditions per PLAN §"Execution preconditions"; phase-09 SPEC + 09 PLAN confirmed present in HEAD; SPEC at da29807; ADR tail at 0099 (next-free 0100); internal/filter/http/fault/ absent (Task 3 lands); FactoryCtx single-field 2-param form (Task 2 widens); parseHTTPFiltersChain 2-param signature (Task 2 widens). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention; ADRs land at first-use commit per PLAN's ADR table).
 **Outputs:**
 ```
