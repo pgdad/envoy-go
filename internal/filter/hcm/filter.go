@@ -11,6 +11,7 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -48,8 +49,9 @@ func NewFilterWithCtxAndSinksAndRegistry(
 	registry *stats.Registry,
 	accessLogSinks []accesslog.Sink,
 	httpRegistry *filter_http.HTTPRegistry,
+	dm *drain.Manager,
 ) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks, httpRegistry)
+	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks, httpRegistry, dm)
 }
 
 // Handle drives one downstream connection from acceptance to close. ALPN

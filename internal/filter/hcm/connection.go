@@ -83,65 +83,101 @@ func runConnection(ctx context.Context, downstream net.Conn, f *Filter) {
 		// once-per-request dispatch-entry hook.
 		f.downstreamRqTotal.Inc()
 
-		if req.Header.Get("Expect") != "" {
-			_ = writeStatusReply(bw, 417, "")
-			_ = bw.Flush()
-			if c := f.downstreamStatusClassCounter(417); c != nil {
-				c.Inc()
-			}
-			drainAndClose(req)
-			return
-		}
-		if req.Header.Get("Upgrade") != "" || strings.EqualFold(req.Header.Get("Connection"), "Upgrade") {
-			_ = writeStatusReply(bw, 501, "")
-			_ = bw.Flush()
-			if c := f.downstreamStatusClassCounter(501); c != nil {
-				c.Inc()
-			}
-			drainAndClose(req)
-			return
-		}
-
-		closeAfterRequest := strings.EqualFold(req.Header.Get("Connection"), "close")
-		closeAfterAction := false
-
-		status, actErr := f.dispatchRequest(ctx, req, bw)
-		if errors.Is(actErr, errCloseAfterAction) || errors.Is(actErr, router.ErrCloseAfterAction) {
-			closeAfterAction = true
-		} else if actErr != nil {
-			log.Printf("hcm: action: %v", actErr)
-			// Inc the response-class counter for whatever the action
-			// finalized before the writer error: status was already set
-			// by dispatchRequest, so the integer-divide bucket reflects
-			// what HCM produced even when the downstream flush failed.
-			if c := f.downstreamStatusClassCounter(status); c != nil {
-				c.Inc()
-			}
-			_ = bw.Flush()
-			drainAndClose(req)
-			return
-		}
-
-		// Response status finalized (status is set on every code path inside
-		// dispatchRequest: 404 catch-all, action result). Inc the bucket per
-		// SPEC §5.5 "switch on response status class → downstream_rq_<Nxx>.Inc()
-		// once per response". Lives BEFORE bw.Flush per SPEC's "before bytes
-		// hit the wire" — Inc'ing post-Flush would skew on flush-error.
-		if c := f.downstreamStatusClassCounter(status); c != nil {
-			c.Inc()
-		}
-
-		if err := bw.Flush(); err != nil {
-			drainAndClose(req)
-			return
-		}
-
-		drainAndClose(req)
-
-		if closeAfterRequest || closeAfterAction {
+		// Phase 08.2 Task 9: per-request Inc/Dec inflight per ADR-0096.
+		// serveOneRequest wraps the per-request body so defer fires at
+		// request-end (not connection-end). Returns keepAlive=false when
+		// the connection must be closed after this request.
+		if keepAlive := f.serveOneRequest(ctx, req, bw); !keepAlive {
 			return
 		}
 	}
+}
+
+// serveOneRequest handles one successfully-parsed HTTP/1.1 request on the
+// H1 path. It is called from runConnection's loop after http.ReadRequest
+// succeeds and downstreamRqTotal.Inc fires. Returns keepAlive=true when the
+// connection should be kept alive for the next request, false when the
+// connection should be closed.
+//
+// Phase 08.2 Task 9: the per-request *drain.Manager Inc/Dec pair lives here
+// so the deferred Dec fires at request-end (= function return) rather than
+// at connection-end. The markedInflight sentinel ensures Dec never fires
+// without a matching Inc (per ADR-0096 + ADR-0075). Placement: after
+// downstreamRqTotal.Inc (parse succeeded), before the filter chain runs
+// (dispatchRequest). Access-log emit fires inside dispatchRequest, so Dec
+// occurs after access-log is recorded per the task spec.
+func (f *Filter) serveOneRequest(ctx context.Context, req *http.Request, bw *bufio.Writer) (keepAlive bool) {
+	var markedInflight bool
+	if f.dm != nil {
+		f.dm.Inc()
+		markedInflight = true
+	}
+	defer func() {
+		if markedInflight {
+			f.dm.Dec()
+			markedInflight = false
+		}
+	}()
+
+	if req.Header.Get("Expect") != "" {
+		_ = writeStatusReply(bw, 417, "")
+		_ = bw.Flush()
+		if c := f.downstreamStatusClassCounter(417); c != nil {
+			c.Inc()
+		}
+		drainAndClose(req)
+		return false
+	}
+	if req.Header.Get("Upgrade") != "" || strings.EqualFold(req.Header.Get("Connection"), "Upgrade") {
+		_ = writeStatusReply(bw, 501, "")
+		_ = bw.Flush()
+		if c := f.downstreamStatusClassCounter(501); c != nil {
+			c.Inc()
+		}
+		drainAndClose(req)
+		return false
+	}
+
+	closeAfterRequest := strings.EqualFold(req.Header.Get("Connection"), "close")
+	closeAfterAction := false
+
+	status, actErr := f.dispatchRequest(ctx, req, bw)
+	if errors.Is(actErr, errCloseAfterAction) || errors.Is(actErr, router.ErrCloseAfterAction) {
+		closeAfterAction = true
+	} else if actErr != nil {
+		log.Printf("hcm: action: %v", actErr)
+		// Inc the response-class counter for whatever the action
+		// finalized before the writer error: status was already set
+		// by dispatchRequest, so the integer-divide bucket reflects
+		// what HCM produced even when the downstream flush failed.
+		if c := f.downstreamStatusClassCounter(status); c != nil {
+			c.Inc()
+		}
+		_ = bw.Flush()
+		drainAndClose(req)
+		return false
+	}
+
+	// Response status finalized (status is set on every code path inside
+	// dispatchRequest: 404 catch-all, action result). Inc the bucket per
+	// SPEC §5.5 "switch on response status class → downstream_rq_<Nxx>.Inc()
+	// once per response". Lives BEFORE bw.Flush per SPEC's "before bytes
+	// hit the wire" — Inc'ing post-Flush would skew on flush-error.
+	if c := f.downstreamStatusClassCounter(status); c != nil {
+		c.Inc()
+	}
+
+	if err := bw.Flush(); err != nil {
+		drainAndClose(req)
+		return false
+	}
+
+	drainAndClose(req)
+
+	if closeAfterRequest || closeAfterAction {
+		return false
+	}
+	return true
 }
 
 // dispatchRequest runs one request through the per-request *FilterChain. Per

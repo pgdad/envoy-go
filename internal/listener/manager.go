@@ -78,7 +78,6 @@ var filterRegistry = map[string]filterConstructor{
 		return f, nil
 	},
 	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, dm *drain.Manager) (filterHandler, error) {
-		_ = dm // T9 will plumb dm into hcm.NewFilterWithCtxAndSinksAndRegistry
 		// Bridge listenerCtx into hcm.ListenerCtx (the public shape exposed by
 		// hcm so that the listener manager doesn't import hcm-internal types).
 		// Phase 06.1 Task 11: the Registry is consumed by the HCM constructor
@@ -87,7 +86,9 @@ var filterRegistry = map[string]filterConstructor{
 		// Phase 07.1 Task 14: httpRegistry is the boot-populated, frozen
 		// *filter_http.HTTPRegistry threaded from main.go (Task 20 wires the
 		// real boot-time population; ADR-0072 freeze-after-boot contract).
-		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C}, registry, accessLogSinks, httpRegistry)
+		// Phase 08.2 Task 9: dm is threaded through to hcm.NewFilterWithCtxAndSinksAndRegistry
+		// (replaces the Task 5 _ = dm placeholder per ADR-0096).
+		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}

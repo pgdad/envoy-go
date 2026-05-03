@@ -132,6 +132,25 @@ type chainDispatchAction struct {
 }
 
 func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, sw h2.StreamWriter) error {
+	// Phase 08.2 Task 9: per-stream Inc/Dec inflight per ADR-0096. WriteH2 is
+	// called once per H2 stream (= one request), so the defer fires at stream-
+	// end (= function return) ensuring pair-balance under all exit paths. The
+	// markedInflight sentinel prevents Dec from firing without a matching Inc
+	// (per ADR-0096 + ADR-0075). Access-log emit fires inside WriteH2 at its
+	// respective emitAccessLogH2 calls, so Dec occurs after access-log is
+	// recorded per the task spec.
+	var markedInflight bool
+	if c.f.dm != nil {
+		c.f.dm.Inc()
+		markedInflight = true
+	}
+	defer func() {
+		if markedInflight {
+			c.f.dm.Dec()
+			markedInflight = false
+		}
+	}()
+
 	startTime := time.Now()
 
 	// No-match path: skip chain construction; invoke the synthesized 404

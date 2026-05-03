@@ -10,6 +10,7 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -76,6 +77,12 @@ type Filter struct {
 	// parseFilterWithCtx from main.go's opened AsyncFileSinks (Phase 06.2).
 	accessLog []accesslog.Sink
 
+	// dm is the central drain.Manager threaded from the listener manager.
+	// Nil when no drain manager is configured (e.g. in tests that pass nil).
+	// HCM calls dm.Inc() at request-begin and dm.Dec() at request-end via
+	// a deferred markedInflight sentinel per ADR-0096 + ADR-0075.
+	dm *drain.Manager
+
 	// chainConfig is the resolved http_filters[] chain in declaration order.
 	// Populated by parseFilterWithCtx (Task 13); consumed by H1/H2 dispatch
 	// (Tasks 15/16) which calls each entry's factory once per request to
@@ -139,7 +146,7 @@ func (f *Filter) downstreamStatusClassCounter(code int) *stats.Counter {
 // applied via filter_http.ValidateChainShape; on success the per-entry
 // HTTPFilterFactory is invoked with the typed_config Any to allocate the
 // FilterInstanceFactory closure stored on Filter.chainConfig.
-func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry) (*Filter, error) {
+func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, dm *drain.Manager) (*Filter, error) {
 	if got := tc.GetTypeUrl(); got != TypeURL {
 		return nil, fmt.Errorf("hcm: wrong type_url %q (want %q)", got, TypeURL)
 	}
@@ -220,6 +227,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		downstreamRq4xx:   registry.NewCounter(prefix + "downstream_rq_4xx"),
 		downstreamRq5xx:   registry.NewCounter(prefix + "downstream_rq_5xx"),
 		accessLog:         accessLogSinks,
+		dm:                dm,
 		chainConfig:       chainConfig,
 		perRouteConfig:    perRoute,
 	}

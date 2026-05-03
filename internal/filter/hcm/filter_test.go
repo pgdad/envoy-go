@@ -9,12 +9,13 @@ import (
 
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 
+	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func TestNewFilter_HappyPath(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -30,7 +31,7 @@ func TestNewFilter_PreservesParseErrorPrefix(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
 	// Zero-value ListenerCtx (no TLS, no allowH2C); HTTP2 must be rejected.
-	if _, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry()); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
+	if _, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
 		t.Errorf("expected hcm:-prefixed error, got: %v", err)
 	}
 }
@@ -42,7 +43,7 @@ func TestNewFilter_PreservesParseErrorPrefix(t *testing.T) {
 func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	if _, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry()); err != nil {
+	if _, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil); err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 	want := map[string]bool{
@@ -71,7 +72,7 @@ func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
 func TestFilter_RequestEntry_IncsDownstreamRqTotal(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -101,7 +102,7 @@ func TestFilter_RequestEntry_IncsDownstreamRqTotal(t *testing.T) {
 func TestFilter_ResponseFinalization_IncsStatusClassCounter(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -147,7 +148,7 @@ func TestFilter_ResponseFinalization_IncsStatusClassCounter(t *testing.T) {
 func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -173,7 +174,7 @@ func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
-	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 
 func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +212,7 @@ func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 
 func TestFilter_Handle_CtxAlreadyCancelledShortCircuits(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry())
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,6 +230,73 @@ func TestFilter_Handle_CtxAlreadyCancelledShortCircuits(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Error("Handle did not return promptly on canceled ctx")
 	}
+}
+
+// TestHCM_DrainInflightBalance — Phase 08.2 Task 9: a request that completes
+// normally must Dec the inflight counter (so Done() fires after Drain()).
+func TestHCM_DrainInflightBalance(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	cm := mkClusterManager(t)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), dm)
+	if err != nil {
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
+	}
+	srv, client := net.Pipe()
+	defer func() { _ = srv.Close(); _ = client.Close() }()
+	go f.Handle(context.Background(), srv)
+	_, _ = client.Write([]byte("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+	buf := make([]byte, 1024)
+	_ = client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _ = client.Read(buf)
+	dm.Drain()
+	select {
+	case <-dm.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("dm.Done() did not fire — inflight not balanced")
+	}
+}
+
+// TestHCM_DrainInflightBalance_SendLocalReply — Phase 08.2 Task 9: a request
+// that hits the no-route 404 sendLocalReply path must still Dec via defer so
+// Done() fires after Drain().
+func TestHCM_DrainInflightBalance_SendLocalReply(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	cm := mkClusterManager(t)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), dm)
+	if err != nil {
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
+	}
+	srv, client := net.Pipe()
+	defer func() { _ = srv.Close(); _ = client.Close() }()
+	go f.Handle(context.Background(), srv)
+	_, _ = client.Write([]byte("GET /no-route-match HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+	buf := make([]byte, 1024)
+	_ = client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _ = client.Read(buf) // expect 404
+	dm.Drain()
+	select {
+	case <-dm.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("dm.Done() did not fire after sendLocalReply path — markedInflight unbalanced")
+	}
+}
+
+// TestHCM_DrainInflightBalance_NilDrainManager — Phase 08.2 Task 9: a nil dm
+// must not panic; the nil-tolerant gate skips Inc/Dec silently.
+func TestHCM_DrainInflightBalance_NilDrainManager(t *testing.T) {
+	cm := mkClusterManager(t)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	if err != nil {
+		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
+	}
+	srv, client := net.Pipe()
+	defer func() { _ = srv.Close(); _ = client.Close() }()
+	go f.Handle(context.Background(), srv)
+	_, _ = client.Write([]byte("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+	buf := make([]byte, 1024)
+	_ = client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _ = client.Read(buf)
+	// Test passes if no panic.
 }
 
 // Compile-time check that Filter implements the listener.filterHandler shape.
