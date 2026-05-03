@@ -324,3 +324,120 @@ $ go build ./...
 $ go vet ./...
 $ golangci-lint run ./...
 ```
+
+## Task 6 — max_active_faults atomic counter + markedActive idempotency guard + OnDestroy timer-cancel + race-detector cycle test [ADR-0105]
+
+**Commits:** TBD — this task's commit
+**Notes:** Strict-TDD per PLAN.md Task 6 Steps 1–7. Step 1 added 3 new tests to `internal/filter/http/fault/fault_test.go`: `TestDecodeHeaders_MaxActiveFaultsCapOverflow` (delay 100% 200ms, max_active_faults=1; allocate 2 instances from same factory sharing `*atomic.Int64` counter; first DecodeHeaders → StopIteration, second → Continue, faults_overflow == 1), `TestOnDestroy_TimerStopped` (delay 100% 500ms; DecodeHeaders schedules timer; OnDestroy cancels before fire; sleep 100ms; assert dcb.continued.Load() == 0; assert fl.active.Load() == 0 — Inc balanced by Dec), `TestFault_DelayTimerRace` (race-cycle test under -race per planner-time decision 10; -short skipped; loop 100 iterations with 1ms delay; each iteration: factory() → DecodeHeaders → sleep i%2 ms → OnDestroy; forces OnDestroy to race the timer-callback). Step 2 confirmed `TestDecodeHeaders_MaxActiveFaultsCapOverflow` fails with the expected signatures (`second request: got 1, want Continue (cap should skip fault)` + `faults_overflow: got 0, want 1` — the StopIteration value is 1, observed because Task 5's placeholder doesn't insert a cap check). The other two tests passed coincidentally pre-implementation (TestOnDestroy_TimerStopped because Task 4's decrementActive is a no-op stub when markedActive is false + the 500ms timer hadn't fired in the 100ms test window; TestFault_DelayTimerRace because there was no markedActive RMW to race on — Task 5's timer callback called the no-op decrementActive). Step 3 implemented per PLAN snippet: inserted the cap check in `DecodeHeaders` after the `delayApplies/abortApplies` short-circuit and before the dispatch branches (`if cfg.maxActiveFaults > 0 && f.active.Load() >= cfg.maxActiveFaults { recordFaultEvent(eventFaultsOverflow); return Continue }; f.markActive()`); added the `markActive` helper (Inc the *atomic.Int64 + set markedActive + record eventActiveFaultsInc); replaced OnDestroy stub with `if f.delayTimer != nil { _ = f.delayTimer.Stop() }; f.decrementActive()`; removed `nolint:unused` directives from `markedActive` field doc-comment (Task 6 consumes via markActive) and from `decrementActive` (Task 6 consumes via OnDestroy + timer-callback). Step 4 confirmed all 18 tests PASS (15 Tasks 3–5 + 3 new Task-6 tests; 0.314s without -race). Step 5 ran `go test -race -count=10 ./internal/filter/http/fault/...` and IT FAILED — race detector flagged the plain-bool `markedActive` field's RMW between the timer-callback goroutine (DecodeHeaders.func2 calling decrementActive at fault.go:397 via timer goroutine) and the OnDestroy goroutine (test goroutine calling decrementActive at fault.go:396). The PLAN's claim "race-clean by single-goroutine-per-stream invariant per ADR-0071" was inaccurate — `time.AfterFunc(d, fn)` runs `fn` on a runtime-managed goroutine, NOT on the dispatch goroutine; the OnDestroy and timer-callback Decs genuinely race during chain teardown when `delayTimer.Stop()` returns false. Per the implementer prompt's explicit refactoring branch: upgraded `markedActive bool` → `markedActive atomic.Bool` and changed decrementActive to use `f.markedActive.CompareAndSwap(true, false)` for race-clean exactly-once Dec; markActive uses `f.markedActive.Store(true)` (the Inc side runs only on the dispatch goroutine after the cap check, so a plain Store is sufficient — but atomic.Bool's Store + CAS pair is the type-correct race-clean form). Re-ran `go test -race -count=10 ./internal/filter/http/fault/...` and got `ok ... 4.126s` clean across all 10 iterations. ADR-0105 §Alternatives (A) records the empirical-evidence-driven decision to use atomic.Bool over plain bool. ADR-0105 §Consequences (b) records that future maintenance MUST preserve the atomic.Bool form. Step 6 appended ADR-0105 to `docs/envoy-go/DECISIONS.md` per the ADR-0001 template (Status / Date / Doctrine / Lands-in-task / Context / Decision / Alternatives considered (seven alternatives A-G) / Consequences (seven items a-g)). ADR-0105 anchors max_active_faults concurrency cap + LBP-1 sixth application + closure-captured *atomic.Int64 shared counter + markedActive atomic.Bool per-instance idempotency guard (UPGRADED from plain bool per empirical race-detector evidence) + OnDestroy timer-cancel discipline + faults_overflow stat semantics. Cross-references ADR-0072 (HTTPRegistry — LBP-1 first), ADR-0079 (ListenerFilterRegistry — LBP-1 second), ADR-0061 (stats Registry — LBP-1 third), ADR-0091 (drain Manager — LBP-1 fourth), ADR-0078 (ChainBuilder closure-capture — LBP-1 fifth), ADR-0071 (single-goroutine-per-stream invariant — REFINED: governs dispatch goroutine + RNG + markActive; does NOT govern OnDestroy/timer-callback Dec — those genuinely straddle goroutines and need atomic.Bool CAS), ADR-0102 (timer mechanics — cancel-on-OnDestroy promise lights up here), ADR-0107 (5-stat extension — recordFaultEvent dispatches eventFaultsOverflow + eventActiveFaultsInc + eventActiveFaultsDec). Anchors SPEC §5.6 + §5.7 + §6.4 + §6.5 + §14.1. Lands-in-task field reads "Task 6 (phase 09); commit TBD" — SHA-fill follow-up replaces TBD per the 08.2 precedent (PROGRESS.md Task 6 entry's `Commits:` line + DECISIONS.md ADR-0105 Lands-in-task line updated together in the SHA-fill commit). markedActive bool vs atomic.Bool note: **atomic.Bool was needed**; the plain-bool form failed `-race -count=10` on the first invocation; the atomic.Bool form is clean.
+**Outputs:**
+```
+$ go test ./internal/filter/http/fault/ -v
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_AbortHTTPStatusOutOfRange
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/zero
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/too_high
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/too_low
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/upper_exclusive
+--- PASS: TestNew_AbortHTTPStatusOutOfRange (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/zero (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/too_high (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/too_low (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/upper_exclusive (0.00s)
+=== RUN   TestNew_DelayPercentageWithoutFixedDelay
+--- PASS: TestNew_DelayPercentageWithoutFixedDelay (0.00s)
+=== RUN   TestNew_HappyPath
+--- PASS: TestNew_HappyPath (0.00s)
+=== RUN   TestNew_RegistersStats
+--- PASS: TestNew_RegistersStats (0.00s)
+=== RUN   TestRuntimeConfig_FieldExtraction
+--- PASS: TestRuntimeConfig_FieldExtraction (0.00s)
+=== RUN   TestDecodeHeaders_AbortOnly_100Percent
+--- PASS: TestDecodeHeaders_AbortOnly_100Percent (0.00s)
+=== RUN   TestDecodeHeaders_AbortOnly_0Percent
+--- PASS: TestDecodeHeaders_AbortOnly_0Percent (0.00s)
+=== RUN   TestDecodeHeaders_HeadersFieldExactMatch_CaseInsensitiveName
+--- PASS: TestDecodeHeaders_HeadersFieldExactMatch_CaseInsensitiveName (0.00s)
+=== RUN   TestDecodeHeaders_HeadersFieldExactMatch_CaseSensitiveValue
+--- PASS: TestDecodeHeaders_HeadersFieldExactMatch_CaseSensitiveValue (0.00s)
+=== RUN   TestDecodeHeaders_NoFaultHeaderMismatch
+--- PASS: TestDecodeHeaders_NoFaultHeaderMismatch (0.00s)
+=== RUN   TestDecodeHeaders_AbortStatRecorded
+--- PASS: TestDecodeHeaders_AbortStatRecorded (0.00s)
+=== RUN   TestDecodeHeaders_DelayOnly
+--- PASS: TestDecodeHeaders_DelayOnly (0.05s)
+=== RUN   TestDecodeHeaders_Combined
+--- PASS: TestDecodeHeaders_Combined (0.05s)
+=== RUN   TestDecodeHeaders_DelayStatRecorded
+--- PASS: TestDecodeHeaders_DelayStatRecorded (0.00s)
+=== RUN   TestDecodeHeaders_CombinedStatsRecorded
+--- PASS: TestDecodeHeaders_CombinedStatsRecorded (0.05s)
+=== RUN   TestDecodeHeaders_MaxActiveFaultsCapOverflow
+--- PASS: TestDecodeHeaders_MaxActiveFaultsCapOverflow (0.00s)
+=== RUN   TestOnDestroy_TimerStopped
+--- PASS: TestOnDestroy_TimerStopped (0.10s)
+=== RUN   TestFault_DelayTimerRace
+--- PASS: TestFault_DelayTimerRace (0.05s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	0.314s
+$ go test -race -count=10 ./internal/filter/http/fault/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	4.126s
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.487s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.016s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.527s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.080s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.078s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.141s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.078s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.537s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.164s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.035s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.063s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.293s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.265s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.208s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.085s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.068s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.036s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.046s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.107s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	1.146s
+ok  	github.com/esalaine/envoy-go/test/differential	1.143s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.024s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.028s
+?   	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.028s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.028s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/backends	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.047s
+```

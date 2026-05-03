@@ -211,7 +211,7 @@ type filter struct {
 	ecb envoyhttp.EncoderFilterCallbacks
 
 	delayTimer   *time.Timer // ADR-0102 async-resume timer; Task 5 wires; Task 6 cancels in OnDestroy.
-	markedActive bool        //nolint:unused // Task 6 (ADR-0105) markedActive guard; Task 3 lands the field.
+	markedActive atomic.Bool // ADR-0105 sync.Once-equivalent guard; markActive Store(true), decrementActive CAS(true,false).
 }
 
 // Statically assert the both-sides interface conformance (matches cors precedent).
@@ -236,12 +236,17 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 	if !delayApplies && !abortApplies {
 		return envoyhttp.Continue
 	}
-	// Task 6 inserts max_active_faults cap check here:
-	//   if cfg.maxActiveFaults > 0 && f.active.Load() >= cfg.maxActiveFaults {
-	//       f.recordFaultEvent(eventFaultsOverflow)
-	//       return envoyhttp.Continue
-	//   }
-	//   f.markActive()
+	// max_active_faults cap check per ADR-0105 + SPEC §5.6: when configured (> 0)
+	// and the closure-captured *atomic.Int64 active counter has already hit the
+	// cap, SKIP the fault (faults_overflow Inc; return Continue without dialing
+	// SendLocalReply or scheduling the timer). When the fault IS injected, mark
+	// the per-instance markedActive bool so OnDestroy + timer-callback Dec
+	// exactly once via the markedActive guard in decrementActive.
+	if cfg.maxActiveFaults > 0 && f.active.Load() >= cfg.maxActiveFaults {
+		f.recordFaultEvent(eventFaultsOverflow)
+		return envoyhttp.Continue
+	}
+	f.markActive()
 	if delayApplies && abortApplies {
 		// Combined: timer fires; callback calls SendLocalReply (NOT
 		// ContinueDecoding) per ADR-0102 — the upstream is never dialed; the
@@ -364,18 +369,36 @@ func (f *filter) recordFaultEvent(k faultEventKind) {
 	}
 }
 
-// decrementActive is the markedActive-guarded per-instance Inc/Dec balance helper.
-// Task 6 wires the markedActive bool + the Inc/Dec calls fully; Task 4 lands
-// the helper as the (no-Inc-yet) Dec-side stub so OnDestroy and timer-
+// markActive Inc's the closure-captured *atomic.Int64 active counter and sets
+// the per-instance markedActive flag (atomic.Bool). The flag is the
+// sync.Once-equivalent guard ensuring decrementActive Dec's exactly once per
+// Inc. Although ADR-0071 establishes the single-goroutine-per-stream invariant
+// for the dispatch goroutine, OnDestroy and the time.AfterFunc-spawned timer
+// callback may straddle that invariant during chain teardown — the
+// markedActive store/CAS uses atomic operations so the data race detector
+// stays clean across the OnDestroy-races-timer-callback case (per ADR-0105
+// race-clean discipline; markActive runs on the dispatch goroutine where the
+// Inc precedes the timer-Schedule, so a plain Store is sufficient on the
+// Inc side; the Dec side uses CAS(true, false) for race-clean exactly-once).
+func (f *filter) markActive() {
+	f.active.Add(1)
+	f.markedActive.Store(true)
+	f.recordFaultEvent(eventActiveFaultsInc)
+}
+
+// decrementActive is the markedActive-guarded per-instance Inc/Dec balance
+// helper. Task 6 wires the markedActive bool + the Inc/Dec calls fully; Task 4
+// lands the helper as the (no-Inc-yet) Dec-side stub so OnDestroy and timer-
 // callback paths added in Tasks 5/6 can call it without sequencing concerns.
-// The markedActive bool gate guarantees Inc/Dec balance under double-call
-// (e.g. if both timer-callback AND OnDestroy fire, only the first call
-// performs the Dec).
-//
-//nolint:unused // Task 6 (ADR-0105) consumes from OnDestroy + timer callback; Task 4 lands the helper.
+// The markedActive.CompareAndSwap(true, false) gate guarantees Inc/Dec balance
+// under concurrent double-call (timer-callback AND OnDestroy from different
+// goroutines): exactly one CAS succeeds; the other observes false-already and
+// no-ops. This is the race-clean form per ADR-0105 — a plain bool RMW would
+// trip the race detector even though both paths converge on the same final
+// state, because the timer goroutine and OnDestroy goroutine genuinely run
+// concurrently when timer.Stop() returns false (callback already firing).
 func (f *filter) decrementActive() {
-	if f.markedActive {
-		f.markedActive = false
+	if f.markedActive.CompareAndSwap(true, false) {
 		f.active.Add(-1)
 		f.recordFaultEvent(eventActiveFaultsDec)
 	}
@@ -394,5 +417,16 @@ func (f *filter) EncodeTrailers(http.Header) envoyhttp.FilterTrailersStatus {
 	return envoyhttp.TrailersContinue
 }
 
-// OnDestroy is a stub at Task 3; Task 6 fills in the timer-cancel + Dec.
-func (f *filter) OnDestroy() {}
+// OnDestroy cancels any pending delay timer and decrements activeFaults if
+// the fault was marked active and not already decremented (per ADR-0105
+// markedActive idempotency guard). Called by the chain teardown path
+// (request completion or downstream-disconnect-induced reset). The
+// best-effort timer.Stop() returns false when the timer has already fired or
+// is firing; in that case the timer-callback's decrementActive flips
+// markedActive to false and OnDestroy's decrementActive call becomes a no-op.
+func (f *filter) OnDestroy() {
+	if f.delayTimer != nil {
+		_ = f.delayTimer.Stop() // best-effort; markedActive guard handles double-Dec.
+	}
+	f.decrementActive()
+}

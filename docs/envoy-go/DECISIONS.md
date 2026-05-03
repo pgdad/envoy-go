@@ -4513,3 +4513,142 @@ The ±10ms timing tolerance is a property of the differential-fixture's assertio
    - Task 7's per-route 3-tier merge is orthogonal to the timer mechanics; the timer reads `cfg.delayFixedDelay` from the resolved-route config, not from `f.cfg` directly (Task 7 swaps `cfg := f.cfg` for `cfg := f.routeConfigOrListener()` upstream of the timer scheduling — the timer captures the local `cfg` by closure).
    - Task 14's differential-fixture `time_total ∈ [delay - 10ms, delay + 10ms]` assertion is the operationally-load-bearing pin; this ADR records the tolerance contract that the fixture consumes.
 
+## ADR-0105: `max_active_faults` concurrency cap + LBP-1 sixth application + closure-captured `*atomic.Int64` shared counter + `markedActive atomic.Bool` per-instance idempotency guard + OnDestroy timer-cancel discipline + `fault.faults_overflow` stat semantics
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.5 (record durable design rationale; the LBP-1 closure-captured counter is the sixth application of a stable engineering pattern + the `markedActive` atomic.Bool guard is a load-bearing concurrency invariant whose race-clean discipline must survive future maintenance) + D-3.7 (race-detector evidence is durable; the `markedActive` field upgrade from plain `bool` to `atomic.Bool` is empirically motivated by `go test -race -count=10` flagging the OnDestroy-races-timer-callback case).
+**Lands-in-task:** Task 6 (phase 09); commit TBD.
+
+### Context
+
+Per SPEC §5.6 + §5.7 + §6.4 the fault filter implements a `max_active_faults` concurrency cap: when configured (`max_active_faults > 0`) and the in-flight fault count has hit the cap, the fault is SKIPPED — `fault.faults_overflow` increments and `DecodeHeaders` returns `Continue` without invoking `SendLocalReply` or scheduling the delay timer. When the fault IS injected, an in-flight counter increments at fault-fire time and decrements at fault-completion time (whichever fires first: the timer callback OR `OnDestroy` driven by chain teardown).
+
+Three load-bearing pieces of the concurrency model:
+
+1. **Closure-captured `*atomic.Int64` shared counter (LBP-1 sixth application).** The counter is allocated by `New` (the `HTTPFilterFactory` factory function) at HCM-build time and CLOSURE-CAPTURED by the per-instance allocator returned from `New`; every `*filter` produced by the same factory shares the same `*atomic.Int64`. This is LBP-1 (the "factory-allocated, instance-shared, lock-free" pattern) — the sixth application of the same pattern, after ADR-0072 (HTTPRegistry typed-config map), ADR-0079 (ListenerFilterRegistry), ADR-0061 (stats Registry counter pointers), ADR-0091 (drain Manager broadcast channel), and ADR-0078 (ChainBuilder closure-captured filter list). The hot path is a single `f.active.Load()` compared against `cfg.maxActiveFaults` (relaxed memory order) — no mutex, no contention.
+
+2. **Per-instance `markedActive atomic.Bool` idempotency guard.** Each `*filter` instance carries an `atomic.Bool` flag; `markActive()` runs on the dispatch goroutine immediately after the cap check passes, performing `f.active.Add(1) → f.markedActive.Store(true) → recordFaultEvent(eventActiveFaultsInc)`. The Dec side (`decrementActive()`) uses `f.markedActive.CompareAndSwap(true, false)` — exactly one CAS succeeds across the racing pair (timer callback Dec'ing on the timer goroutine; `OnDestroy` Dec'ing on the chain-teardown goroutine). The atomic-Bool form is REQUIRED, not optional — empirical race-detector evidence (`go test -race -count=10 ./internal/filter/http/fault/...`) flags a plain `bool` RMW under `TestFault_DelayTimerRace` because `time.AfterFunc(d, fn)` runs `fn` on a runtime goroutine that genuinely races `OnDestroy` when `delayTimer.Stop()` returns false (the timer has already fired or is firing). The atomic.Bool form is race-clean by construction.
+
+3. **OnDestroy timer-cancel discipline.** `OnDestroy` calls `f.delayTimer.Stop()` (best-effort; nil-checked) then `f.decrementActive()`. The `Stop()` return value is intentionally ignored — `markedActive.CompareAndSwap` handles both success cases (Stop-succeeded → callback never fires → OnDestroy Dec wins the CAS) and failure cases (Stop-failed → callback already firing or fired → whichever Dec call lands first wins the CAS; the loser observes false-already and no-ops). This is the ADR-0102 "cancel-on-OnDestroy" mechanics promised at Task 5.
+
+A fourth piece — `fault.faults_overflow` stat semantics — falls out of (1): the counter increments exactly once per request that rolls into the fault path (delayApplies OR abortApplies hit) AND finds `f.active.Load() >= cfg.maxActiveFaults` at the cap check. Requests that don't roll into the fault path (no fault configured, percentage rolls miss, headers-field gate fails) do NOT consult the cap and do NOT increment `faults_overflow` — the counter is a measure of "would-have-fired-but-cap-blocked" cases, not a generic "rejected" counter.
+
+### Decision
+
+The fault filter's `DecodeHeaders` cap-check + dispatch sequence emits exactly:
+
+```go
+delayApplies := cfg.delayEnabled && f.rollPercent(cfg.delayPercentage)
+abortApplies := cfg.abortEnabled && f.rollPercent(cfg.abortPercentage)
+if !delayApplies && !abortApplies {
+    return envoyhttp.Continue
+}
+if cfg.maxActiveFaults > 0 && f.active.Load() >= cfg.maxActiveFaults {
+    f.recordFaultEvent(eventFaultsOverflow)
+    return envoyhttp.Continue
+}
+f.markActive()
+// ... fault dispatch (combined / delay-only / abort-only) ...
+```
+
+The `markActive` helper:
+
+```go
+func (f *filter) markActive() {
+    f.active.Add(1)
+    f.markedActive.Store(true)
+    f.recordFaultEvent(eventActiveFaultsInc)
+}
+```
+
+The `decrementActive` helper:
+
+```go
+func (f *filter) decrementActive() {
+    if f.markedActive.CompareAndSwap(true, false) {
+        f.active.Add(-1)
+        f.recordFaultEvent(eventActiveFaultsDec)
+    }
+}
+```
+
+The `OnDestroy` body:
+
+```go
+func (f *filter) OnDestroy() {
+    if f.delayTimer != nil {
+        _ = f.delayTimer.Stop() // best-effort; markedActive guard handles double-Dec.
+    }
+    f.decrementActive()
+}
+```
+
+Field shape on `*filter`:
+
+```go
+type filter struct {
+    // ... cfg, active *atomic.Int64, stats, rng, dcb, ecb ...
+    delayTimer   *time.Timer  // ADR-0102 async-resume timer
+    markedActive atomic.Bool  // ADR-0105 sync.Once-equivalent guard
+}
+```
+
+The closure-captured counter allocation in `New`:
+
+```go
+activeFaults := new(atomic.Int64)
+// ...
+return func() envoyhttp.HTTPFilter {
+    f := &filter{
+        cfg:    rc,
+        active: activeFaults, // shared across all instances from this factory
+        // ...
+    }
+    // ...
+}, nil
+```
+
+### Alternatives considered
+
+(A) **Plain `bool` for `markedActive`** (the original PLAN form). REJECTED EMPIRICALLY: `go test -race -count=10 ./internal/filter/http/fault/...` flags the `TestFault_DelayTimerRace` cycle test. The data race is genuine — `time.AfterFunc(d, fn)` runs `fn` on a runtime-managed goroutine, and during chain teardown the OnDestroy goroutine and the timer goroutine concurrently execute the read-then-write sequence on `markedActive`. Even though both paths converge on the same final state (markedActive=false, active counter Dec'd exactly once via the bool guard), the race detector is unhappy because the RMW is unsynchronized. The PLAN's claim "race-clean by single-goroutine-per-stream invariant per ADR-0071" was inaccurate — ADR-0071 governs the dispatch goroutine, but `time.AfterFunc` callbacks and chain-teardown's OnDestroy run on DIFFERENT goroutines. The atomic.Bool form (this ADR) supersedes the PLAN's plain-bool form.
+
+(B) **`sync.Mutex` guarding both `markedActive` AND `f.active.Add(...)`**. REJECTED: heavyweight relative to the atomic.Bool CAS. The atomic.Bool's CompareAndSwap is a single CPU instruction (CMPXCHG on amd64) — cheaper than mutex Lock+Unlock pair. The mutex would also need to live on `*filter`, adding 16 bytes per instance vs. 4 bytes for atomic.Bool.
+
+(C) **`sync.Once` instead of `atomic.Bool`**. REJECTED: `sync.Once.Do(fn)` runs `fn` exactly once — but it runs the FIRST caller's fn, locking out subsequent callers. This matches the "exactly-one-Dec" requirement BUT `sync.Once` allocates a 12-byte struct per instance (Go 1.21+) vs. atomic.Bool's 4 bytes, and the closure boilerplate (`f.decOnce.Do(func() { f.active.Add(-1); ... })`) is verbose. The atomic.Bool CAS is the leaner form for this exact pattern.
+
+(D) **`atomic.Int32`** treating "marked active" as 1 and "decremented" as 0 with `CompareAndSwap`. REJECTED: equivalent to atomic.Bool but with wider semantics (4-byte signed int) for no benefit. atomic.Bool is the type-correct form for a binary flag.
+
+(E) **Skip the `markedActive` guard entirely; rely on `f.active.Add(-1)` happening exactly once via the chain's OnDestroy-or-callback-but-not-both invariant**. REJECTED: the chain machinery does NOT guarantee "exactly one of OnDestroy/callback". When `time.Timer.Stop()` returns false the callback IS firing concurrently with OnDestroy — both will reach `f.decrementActive`, and without the markedActive guard both would Dec the counter, leaving it negative. The differential-fixture's StatsAsserter (Task 14) would see a negative `active_faults` gauge — divergent from reference Envoy. The markedActive guard is REQUIRED, not optional.
+
+(F) **Cap the counter via `CompareAndSwap` on `*atomic.Int64` directly** (`for { v := f.active.Load(); if v >= cap { break }; if f.active.CompareAndSwap(v, v+1) { ... } }`). REJECTED: the load-then-Add sequence in the current shape (`if f.active.Load() >= cap { skip }; ... f.active.Add(1)`) has a benign race window: two concurrent decoders from different streams can both observe `Load() < cap` and both `Add(1)`, briefly overshooting the cap by one. This is acceptable per SPEC §5.6 — `max_active_faults` is a soft cap, not a hard cap; reference Envoy v1.37.2 has the same race window. The CAS-loop form would close the window but at the cost of complexity (~5 LoC per cap check) and a potential live-lock under heavy contention. The simple Load-then-Add form is the operating point.
+
+(G) **Per-counter sub-Registry for `fault.*` stats** (instead of the flat `http.<sp>.fault.<metric>` namespace). REJECTED per planner-time decision 5: the `internal/stats.Registry` from phase 06.1 is a flat counter map per ADR-0061's pre-Freeze discipline; sub-registries are out of scope for phase 09. Threading `*stats.Registry` through `FactoryCtx` (Task 2 / ADR-0100) is sufficient for the 5 fault stats — the namespace prefix `http.<sp>.fault.<metric>` is the discriminator.
+
+### Consequences
+
+(a) The `*atomic.Int64` allocation per factory is grep-verifiable: `internal/filter/http/fault/fault.go::New` calls `activeFaults := new(atomic.Int64)` exactly once, before the per-instance closure. The closure captures `activeFaults` by reference; every `*filter` instance from that factory shares the same counter. Multiple-listener / multiple-route-with-distinct-fault-config deployments allocate ONE counter per factory (one per New invocation) — the cap is per-fault-config, NOT global across the listener.
+
+(b) The `markedActive` field upgrade from plain `bool` to `atomic.Bool` is recorded in this ADR; the PLAN.md Step 3 snippet's plain-bool form is superseded by the atomic.Bool form. The decision to upgrade was empirically motivated — the race-detector flagged the plain-bool form on the FIRST `-race -count=10` invocation, and the atomic.Bool form went clean across all 10 iterations on the same run. Future maintenance MUST preserve the atomic.Bool form; downgrading to plain bool will re-introduce the data race.
+
+(c) The `fault.faults_overflow` counter semantics are grep-verifiable: `recordFaultEvent(eventFaultsOverflow)` appears exactly once in `internal/filter/http/fault/fault.go::DecodeHeaders` — at the cap-check skip path. No other call site Inc's the counter. `TestDecodeHeaders_MaxActiveFaultsCapOverflow` asserts `faults_overflow == 1` after a 2-instance overflow scenario (cap=1; first request fires; second request hits the cap).
+
+(d) The OnDestroy timer-cancel mechanics complete the ADR-0102 cancel-on-OnDestroy promise: Task 5's timer-callback's `f.decrementActive()` call site (the Task-6 forward reference at ADR-0102 Consequences (e)) lights up here. The `f.delayTimer.Stop()` return value is intentionally ignored — `markedActive.CompareAndSwap` handles both branches (Stop-succeeded vs. Stop-failed-with-callback-racing).
+
+(e) Cross-references:
+   - ADR-0071 (single-goroutine-per-stream invariant) — REFINED. ADR-0071 governs the dispatch goroutine; `time.AfterFunc` callbacks + OnDestroy genuinely run on different goroutines during chain teardown. The single-goroutine invariant covers RNG access (`f.rng.Float64()` in `rollPercent` runs only on the dispatch goroutine per ADR-0102 Consequence (b)) and `markActive` (also dispatch-goroutine). The Dec side (`decrementActive`) genuinely straddles goroutines — atomic.Bool CAS handles that case.
+   - ADR-0072 (HTTPRegistry closure-captured map) — anchored. LBP-1 first application; this ADR is the sixth.
+   - ADR-0079 (ListenerFilterRegistry) — anchored. LBP-1 second application.
+   - ADR-0061 (stats Registry counter pointers) — anchored. LBP-1 third application.
+   - ADR-0091 (drain Manager broadcast channel) — anchored. LBP-1 fourth application.
+   - ADR-0078 (ChainBuilder closure-captured filter list) — anchored. LBP-1 fifth application.
+   - ADR-0102 (delay async-resume) — anchored at the cancel-on-OnDestroy mechanics. The Task-5 timer-callback's `f.decrementActive()` is the timer-side Dec; this ADR's `OnDestroy` is the chain-teardown-side Dec. Both converge on the markedActive CAS.
+   - ADR-0107 (5-stat extension) — anchored at `recordFaultEvent(eventFaultsOverflow)` + `recordFaultEvent(eventActiveFaultsInc)` + `recordFaultEvent(eventActiveFaultsDec)`. All three Inc/Dec sites consolidate through `recordFaultEvent` per planner-time decision 3.
+   - SPEC §5.6 (max_active_faults overflow flow) + §5.7 (concurrency model + markedActive guard) + §6.4 (DecodeHeaders cap check + dispatch sequence) + §6.5 (OnDestroy timer-cancel + Dec) + §14.1 (unit-test list including TestFault_DelayTimerRace) — anchored.
+
+(f) The `TestFault_DelayTimerRace` cycle test (planner-time decision 10) is the operationally-load-bearing race-detector pin. It runs 100 iterations of `factory() → DecodeHeaders → sleep 0/1ms → OnDestroy` under `go test -race`; the 0/1ms sleep straddles the 1ms `delay.fixed_delay` so each iteration probabilistically hits Stop-succeeded, Stop-failed-callback-running, and callback-already-fired branches. `-count=10` repeats the 100-iteration loop 10 times, surfacing scheduler-dependent race-detector flakes. The test is `-short` skipped to keep the inner loop out of the default `go test -short` cycle.
+
+(g) Tasks 7/14 build on this task's foundation:
+   - Task 7's per-route 3-tier merge passes through the cap check unchanged — the timer captures the resolved-route `cfg.maxActiveFaults` by closure; per-route configs CAN override the listener-level cap (wholesale-replace per §11.7).
+   - Task 14's differential-fixture exercises the cap by issuing concurrent requests against a 1-cap configuration; the StatsAsserter walks `/stats/prometheus` for `faults_overflow` and `active_faults` post-roll values. The `active_faults` gauge is asserted to return to 0 after all in-flight requests complete (Inc/Dec balance).
+

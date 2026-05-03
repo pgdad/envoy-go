@@ -544,3 +544,101 @@ func TestDecodeHeaders_CombinedStatsRecorded(t *testing.T) {
 		t.Errorf("aborts_injected (post-timer): got %d, want 1", got)
 	}
 }
+
+// TestDecodeHeaders_MaxActiveFaultsCapOverflow verifies the LBP-1 sixth
+// application + faults_overflow stat per ADR-0105 + SPEC §5.6. delay 100% 200ms,
+// max_active_faults=1; allocate 2 instances from the same factory (sharing the
+// closure-captured *atomic.Int64 activeFaults counter). First DecodeHeaders →
+// StopIteration (fault fires, active=1). Second DecodeHeaders → Continue (cap
+// hit, faults_overflow Inc, no fault injected). faults_overflow == 1.
+func TestDecodeHeaders_MaxActiveFaultsCapOverflow(t *testing.T) {
+	reg := stats.NewRegistry()
+	f := &faultv3.HTTPFault{
+		Delay: &commonfaultv3.FaultDelay{
+			Percentage:         &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+			FaultDelaySecifier: &commonfaultv3.FaultDelay_FixedDelay{FixedDelay: durationpb.New(200 * time.Millisecond)},
+		},
+		MaxActiveFaults: wrapperspb.UInt32(1),
+	}
+	factory, err := New(mustAny(t, f), envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "x"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Allocate two instances from the same factory (sharing the activeFaults counter).
+	fl1 := factory().Decoder.(*filter)
+	fl1.SetDecoderCallbacks(&recordingDCB{})
+	fl2 := factory().Decoder.(*filter)
+	fl2.SetDecoderCallbacks(&recordingDCB{})
+
+	s1 := fl1.DecodeHeaders(http.Header{}, true)
+	if s1 != envoyhttp.StopIteration {
+		t.Errorf("first request: got %v, want StopIteration (fault should fire)", s1)
+	}
+	s2 := fl2.DecodeHeaders(http.Header{}, true)
+	if s2 != envoyhttp.Continue {
+		t.Errorf("second request: got %v, want Continue (cap should skip fault)", s2)
+	}
+	if got := counterValue(t, reg, "http.x.fault.faults_overflow"); got != 1 {
+		t.Errorf("faults_overflow: got %d, want 1", got)
+	}
+}
+
+// TestOnDestroy_TimerStopped verifies that OnDestroy cancels the pending delay
+// timer + Dec's the activeFaults counter (idempotent via markedActive guard) per
+// ADR-0105 + SPEC §6.5. delay 100% 500ms; DecodeHeaders schedules timer; OnDestroy
+// cancels before fire; sleep 100ms; assert dcb.continued == 0; assert
+// active.Load() == 0 (Inc balanced by Dec).
+func TestOnDestroy_TimerStopped(t *testing.T) {
+	f := &faultv3.HTTPFault{
+		Delay: &commonfaultv3.FaultDelay{
+			Percentage:         &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+			FaultDelaySecifier: &commonfaultv3.FaultDelay_FixedDelay{FixedDelay: durationpb.New(500 * time.Millisecond)},
+		},
+	}
+	factory, err := New(mustAny(t, f), envoyhttp.FactoryCtx{Stats: stats.NewRegistry(), StatPrefix: "x"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	fl := factory().Decoder.(*filter)
+	dcb := &recordingDCB{}
+	fl.SetDecoderCallbacks(dcb)
+	fl.DecodeHeaders(http.Header{}, true)
+	fl.OnDestroy()                     // should cancel the timer before it fires
+	time.Sleep(100 * time.Millisecond) // briefly wait; timer should NOT have fired
+	if got := dcb.continued.Load(); got != 0 {
+		t.Errorf("timer fired despite OnDestroy; ContinueDecoding called %d times", got)
+	}
+	// active counter should be balanced (Inc'd on DecodeHeaders, Dec'd on OnDestroy).
+	if got := fl.active.Load(); got != 0 {
+		t.Errorf("active counter: got %d, want 0", got)
+	}
+}
+
+// TestFault_DelayTimerRace is the race-detector cycle test per planner-time
+// decision 10. Skip under -short. Loop 100 iterations with 1ms delay; each
+// iteration: factory() → DecodeHeaders → sleep 0/1ms → OnDestroy. Forces
+// OnDestroy to race the timer-callback. The markedActive guard in
+// decrementActive guarantees exactly-one Inc/Dec balance under the race.
+func TestFault_DelayTimerRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("race-cycle test skipped under -short")
+	}
+	f := &faultv3.HTTPFault{
+		Delay: &commonfaultv3.FaultDelay{
+			Percentage:         &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+			FaultDelaySecifier: &commonfaultv3.FaultDelay_FixedDelay{FixedDelay: durationpb.New(1 * time.Millisecond)},
+		},
+	}
+	factory, err := New(mustAny(t, f), envoyhttp.FactoryCtx{Stats: stats.NewRegistry(), StatPrefix: "x"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		fl := factory().Decoder.(*filter)
+		fl.SetDecoderCallbacks(&recordingDCB{})
+		fl.DecodeHeaders(http.Header{}, true)
+		// Race OnDestroy against the timer firing.
+		time.Sleep(time.Duration(i%2) * time.Millisecond) // 0 or 1ms — straddles the 1ms timer
+		fl.OnDestroy()
+	}
+}
