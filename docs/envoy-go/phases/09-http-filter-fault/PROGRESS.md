@@ -441,3 +441,5 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.047s
 ```
+
+**Task 6 follow-up (post-review):** ADR-0105 §Context + §Consequences (e) corrected the LBP-1 chain: per code-quality review, the original chain incorrectly named ADR-0061 (which is stat-name-flattening, not LBP-1), fabricated an ADR-0078 reference (which is ADR-0033 partial supersession, no LBP-1 content), and omitted ADR-0085 (LBP-1 fourth application). The corrected chain (ADR-0059 → 0072 → 0079 → 0085 → 0091 → 0105 sixth) matches ADR-0091's own self-numbering at DECISIONS.md:3618. Commit f43d3fc.
