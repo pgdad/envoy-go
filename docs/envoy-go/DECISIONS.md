@@ -3473,7 +3473,7 @@ The complete enumeration of admin-surface deferrals NOT planned for any currentl
 
 | Endpoint | Target phase |
 |---|---|
-| `POST /drain_listeners` | 08.2 (graceful drain) |
+| `POST /drain_listeners` | delivered in 08.2 per ADR-0093 |
 | `POST /reset_counters` | unscheduled (security-hardening pre-requisite) |
 | `POST /quitquitquit` | unscheduled (security-hardening pre-requisite) |
 | `POST /healthcheck/fail` | unscheduled (active health checking family) |
@@ -4028,5 +4028,61 @@ This is a **deliberate divergence** from Envoy v1.37.2's 600s default. The equiv
 (c) Operator-knob to configure the timeout is deferred to a future runtime/hot-restart family phase. The boot-site literal is the single change point; a flag-parsing addition would be localized to `cmd/envoy-go/main.go`.
 
 (d) The `Manager` itself does NOT enforce the timeout — callers select on `time.After` alongside `Done` per ADR-0091 design. This is visible in the Task 11 SIGTERM-handler block and the admin drain handler (Task 7 / ADR-0093); both use caller-side timeout selects.
+
+## ADR-0099: Hot restart / parent-child handoff deferred to runtime + hot restart family — out of scope for 08.2 and the entire BOOTSTRAP_PROMPT.md §8 MVP trunk
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.5 (decisions written down). Per ADR-0040 deferral format.
+**Lands-in-task:** 08.2 PLAN Task 13 (BEHAVIOR_CONTRACT restructure + this ADR + phase-done bundle; MVP-trunk-close commit).
+
+### Context
+
+SPEC §2.1 (Lifecycle non-goals) enumerates hot restart / parent-child handoff as explicitly out of 08.2's scope. BRAINSTORM Decision 11 settles the same scope boundary from the brainstorm session's first-principles analysis. BOOTSTRAP_PROMPT.md §9 (Runtime + hot restart family) is the canonical placeholder for this deliverable in the feature-family expansion post-MVP-trunk.
+
+Hot restart in upstream Envoy v1.37.2 implements a multi-process orchestration protocol:
+
+1. **SCM_RIGHTS file-descriptor transfer.** The parent process passes listening socket file descriptors to the child process via Unix-domain socket ancillary data (`SCM_RIGHTS`). The child binds to the inherited FDs and begins serving new connections without a rebind-gap.
+2. **Shared-memory existing-connection table.** The parent and child share a region of shared memory that tracks the existing-connection state — specifically, per-connection identifiers and stats counters. This enables the child to drain the parent's in-flight connections without race conditions on connection close.
+3. **Parent-shutdown-time orchestration.** After the child signals readiness (via the hot-restart protocol handshake), the parent begins its own drain-then-exit sequence. The parent's drain window is bounded by `parent_shutdown_time` (default 900s in Envoy v1.37.2). The parent exits via `exit(0)` after its in-flight connections complete or the timeout fires.
+4. **Custom signal protocol (SIGUSR1 / SIGUSR2).** The hot-restart orchestration is driven by SIGUSR1 (child → parent: "I am ready; begin drain") and SIGUSR2 (parent → child: "I have drained; you may terminate me"). This signal protocol is separate from the SIGTERM/SIGINT pair handled by 08.2's SIGTERM-handler upgrade (ADR-0092).
+
+None of these four mechanisms are present in envoy-go's MVP trunk (phases 00–08). Implementing them would require:
+- A `unix.SendmsgN` / `unix.RecvmsgN` (or `syscall.RightsControlMessage`) call pair for FD transfer; only valid on Unix-family OSes.
+- A `syscall.ShmOpen` / `mmap` pair for shared-memory state; or a Unix-domain socket with a custom length-prefixed protocol.
+- A second goroutine (or process) managing the parent-shutdown-time orchestration, including a `time.After(parentShutdownTime)` watchdog.
+- A `signal.Notify(sigsusrCh, syscall.SIGUSR1, syscall.SIGUSR2)` handler in `cmd/envoy-go/main.go`, distinct from the SIGTERM/SIGINT handler landed at 08.2 (ADR-0092).
+- Modifications to `internal/listener.Manager` to accept inherited FDs and to export per-listener file descriptors for SCM_RIGHTS transfer.
+
+This is a multi-phase deliverable. Phase 08.2's drain machinery (ADR-0091 + ADR-0092 + ADR-0094 + ADR-0096) is the prerequisite: the existing-connection drain protocol (Inc/Dec hooks, Done channel, SIGTERM-handler block) is the parent-side component that hot restart extends; it is not a substitute.
+
+Cross-reference: ADR-0089 (admin-endpoint deferral list) records `POST /quitquitquit` and `POST /healthcheck/fail` as carrying adjacent deferrals in the same MVP scope-bounding cluster — those endpoints are semantically adjacent to hot restart (quitquitquit is the child's signal to the parent that it can exit; healthcheck/fail is the load-balancer disposition flip that complements the listener drain during a hot restart window). All three are deferred to the feature-family expansion together.
+
+### Decision
+
+Hot restart / parent-child handoff (SCM_RIGHTS FD transfer + shared-memory existing-connection table + parent-shutdown-time orchestration + custom signal protocol SIGUSR1/SIGUSR2) is **OUT OF SCOPE** for:
+
+1. Phase 08.2 (graceful drain).
+2. The entire BOOTSTRAP_PROMPT.md §8 MVP trunk (phases 00–08).
+
+This decision is deferred to a future feature-family phase under BOOTSTRAP_PROMPT.md §9's "Runtime + hot restart family." The deferral is recorded in `BEHAVIOR_CONTRACT.md ## Graceful drain ### Does not yet apply to`.
+
+### Alternatives considered
+
+(A) Implement a minimal hot-restart stub (FD transfer only, no shared-memory state). Rejected: a stub that transfers FDs without the shared-memory existing-connection table would produce a split-brain state where the parent and child both serve traffic on the same listeners without coordinating connection handoff. This would be WORSE than no hot restart (the operator would observe double-serving without the drain guarantee). A stub without the full protocol is not a useful deliverable.
+
+(B) Implement hot restart in 08.2 as an optional feature behind a build tag or environment variable. Rejected: the four-component protocol (SCM_RIGHTS + shared memory + parent-shutdown orchestration + SIGUSR1/SIGUSR2) is the minimal correct implementation; a build-tag-optional stub (per (A)) would still be a broken stub. The effort is a full feature-family phase, not a Task 13 deliverable.
+
+(C) Implement hot restart in a post-08.2 trunk phase (e.g., a hypothetical phase 09 before the feature families). Rejected: BOOTSTRAP_PROMPT.md §8 + §9 separates the MVP trunk (00–08, done at 08.2 phase-done) from the feature-family expansion (09+). Hot restart belongs in the §9 "Runtime + hot restart family" — deferring it there keeps the MVP trunk minimal and the feature families properly scoped.
+
+### Consequences
+
+(a) envoy-go MVP drain is one-process scope only. The SIGTERM-handler block (ADR-0092) and the POST /drain_listeners endpoint (ADR-0093) provide operator-driven single-process graceful drain without process handoff. This is sufficient for the Kubernetes `terminationGracePeriodSeconds` workflow (SIGTERM → drain window → exit), which is the primary operator workflow envoy-go targets in MVP.
+
+(b) Future runtime / hot restart family phase delivers SCM_RIGHTS-based handoff. That phase will build on 08.2's drain machinery (ADR-0091 Inc/Dec hooks; ADR-0094 Accept-loop fast-path; ADR-0092 SIGTERM-handler block) as the parent-side component of the two-process handoff.
+
+(c) The deferral is recorded in `BEHAVIOR_CONTRACT.md ## Graceful drain ### Does not yet apply to` as: "Hot restart / parent-child handoff (deferred to runtime / hot-restart family per ADR-0099)."
+
+(d) Cross-reference: ADR-0089 (parallel admin-endpoint deferral list) carries `POST /quitquitquit` and `POST /healthcheck/fail` as adjacent deferrals in the same MVP scope-bounding cluster. The `quitquitquit` endpoint is the child-to-parent signal in the hot-restart protocol (the child calls POST /quitquitquit to tell the parent it has drained and can exit); deferring quitquitquit is consequentially correct given this ADR. The `healthcheck/fail` endpoint is the load-balancer-disposition flip that complements the listener drain during hot restart; its deferral per ADR-0089 is also consequentially correct.
 
 

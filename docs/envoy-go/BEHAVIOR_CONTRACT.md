@@ -25,6 +25,9 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Admin /clusters | Tuple-set equality on `(cluster, key, value)` triples. envoy-go emits Envoy's full unconditional 28-line-per-cluster + 18-line-per-endpoint set with default constants for non-modeled fields. Allow-list: hot-path counters `cx_total`, `cx_connect_fail`, `rq_total`, `rq_active`, `rq_error` allow ±1 tolerance. (Per phase 08.1 SPEC §13.2.) |
 | Admin /listeners | Body byte-equal (after framing dechunk). Single line per listener. No allow-list. (Per phase 08.1 SPEC §13.2.) |
 | Admin /server_info | Body byte-equal modulo build/uptime/CLI-flags/node allow-list. The `state` field IS asserted byte-equal. Allow-list: `version`, `uptime_current_epoch`, `uptime_all_epochs`, `command_line_options.*` (subset), `hot_restart_version`, `node.user_agent_*`, `node.extensions[]` per-field allow-listed. (Per phase 08.1 SPEC §13.2.) |
+| Admin /drain_listeners | Body byte-equal `OK\n` (POST); 405 + body `Method <X> not allowed, POST required.\n` (non-POST). Idempotent semantics; query-param ?graceful=true silent-ignored. Header set inherits umbrella rules; framing per phase-01 dechunk-discipline. Method-discrimination is the FIRST envoy-go endpoint with 405 enforcement (per ADR-0093 partially amending ADR-0090). |
+| Admin /ready (DRAINING) | Body byte-equal `DRAINING\n` to reference Envoy v1.37.2 in DRAINING state. Status 503. DRAINING precedence over LIVE / PRE_INITIALIZING. Status 503 (matches PRE_INITIALIZING). Header set inherits umbrella rules. Per-proxy trigger script normalization per 08.2 SPEC §7.2 (envoy-go: /drain_listeners; ref Envoy: /drain_listeners + /healthcheck/fail). |
+| Admin /server_info (DRAINING) | The `state` field IS asserted byte-equal (`"DRAINING"`) when both proxies are in DRAINING. Other fields per ADR-0088 allow-list. Inherits ADR-0088 allow-list for non-state fields (version, uptime_*, command_line_options, hot_restart_version, node). |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -270,13 +273,13 @@ Timing is not compared by default. A phase may opt in to latency bounds (p50 / p
 
 ## Admin API
 
-The envoy-go admin server is a single HTTP/1.1 plaintext bind allocated by `internal/admin.Server.Start()` (per phase 01 contract; reused unchanged in 06.1 and 08.1). Six endpoints are registered on the same `*http.ServeMux`: `/ready` (phase 01), `/stats/prometheus` (phase 06.1), `/config_dump`, `/clusters`, `/listeners`, `/server_info` (phase 08.1). 08.2 will register `POST /drain_listeners` and extend `/ready` + `/server_info` for the DRAINING state.
+The envoy-go admin server is a single HTTP/1.1 plaintext bind allocated by `internal/admin.Server.Start()` (per phase 01 contract; reused unchanged in 06.1 and 08.1). Seven endpoints are registered on the same `*http.ServeMux`: `/ready` (phase 01), `/stats/prometheus` (phase 06.1), `/config_dump`, `/clusters`, `/listeners`, `/server_info` (phase 08.1), `POST /drain_listeners` (phase 08.2; NEW mutating endpoint). Phase 08.2 also extends `/ready` + `/server_info` for the DRAINING state.
 
-**Framing deviation (all six admin endpoints).** envoy-go's `net/http` server emits `Content-Length` (the body is buffered before write); upstream Envoy v1.37.2 emits `transfer-encoding: chunked`. The differential harness dechunks upstream responses before byte-comparing the body. This deviation was first documented for `/ready` at phase 01 (per ADR-0015 paragraph 3) and extends unchanged to all six endpoints. No allow-list entry; the dechunk is structural.
+**Framing deviation (all seven admin endpoints).** envoy-go's `net/http` server emits `Content-Length` (the body is buffered before write); upstream Envoy v1.37.2 emits `transfer-encoding: chunked`. The differential harness dechunks upstream responses before byte-comparing the body. This deviation was first documented for `/ready` at phase 01 (per ADR-0015 paragraph 3) and extends unchanged to all seven endpoints. No allow-list entry; the dechunk is structural.
 
-**Header set (all six admin endpoints, post-framing-normalization).** The lowercase wire-form header set is `content-type`, `cache-control: no-cache, max-age=0`, `x-content-type-options: nosniff`, `date: <IMF-fixdate>`, `server: envoy` (per ADR-0014). All six endpoints emit this set. The differential harness uses the existing case-insensitive header comparator (introduced for phase 01).
+**Header set (all seven admin endpoints, post-framing-normalization).** The lowercase wire-form header set is `content-type`, `cache-control: no-cache, max-age=0`, `x-content-type-options: nosniff`, `date: <IMF-fixdate>`, `server: envoy` (per ADR-0014). All seven endpoints emit this set. The differential harness uses the existing case-insensitive header comparator (introduced for phase 01).
 
-**Method discrimination posture (all six admin endpoints).** Upstream Envoy v1.37.2 does NOT enforce method discrimination on the four 08.1 read-only endpoints (POST/PUT/DELETE return 200 with the same body as GET — empirical pin in 08.1 SPEC §11.8). envoy-go matches Envoy parity (no method check; Go stdlib `http.ServeMux` dispatches on path only). 405 enforcement is deferred to a future security-hardening phase.
+**Method discrimination posture.** Upstream Envoy v1.37.2 does NOT enforce method discrimination on the six 08.1 read-only endpoints (POST/PUT/DELETE return 200 with the same body as GET — empirical pin in 08.1 SPEC §11.8). envoy-go matches Envoy parity on those six endpoints (no method check; Go stdlib `http.ServeMux` dispatches on path only). The 08.2 mutating endpoint `POST /drain_listeners` DOES enforce method discrimination: non-POST methods return 405 with body `Method <METHOD> not allowed, POST required.\n` per 08.2 SPEC §11.4 empirical pin (ADR-0093 partially amending ADR-0090).
 
 ### /ready
 
@@ -310,6 +313,14 @@ Per ADR-0015, the pre-init `/ready` window is not exercised by the phase-01 diff
 
 Upstream v1.37.2's actual pre-init bytes were unobservable from the minimal bootstrap used in Task 7 (60 probes across two tight loops captured no non-200 response). A later phase that successfully captures upstream pre-init bytes supersedes this subsection via a new ADR.
 
+**DRAINING-state response (08.2 NEW).** When `drain.Manager.State() == DRAINING`, the handler returns 503 Service Unavailable with body `DRAINING\n` (9 bytes; uppercase `DRAINING` followed by single newline) per 08.2 SPEC §11.2 empirical pin. The DRAINING check has precedence over both LIVE and PRE_INITIALIZING — once drain has fired, /ready returns the DRAINING body even if MarkReady has been called and even if /server_info would otherwise return state="LIVE". Header set inherits the umbrella rules.
+
+**Empirical evidence (verbatim Envoy v1.37.2 `/ready` during DRAINING):** see 08.2 SPEC §11.2.
+
+**Equivalence claim.** Body byte-equal to reference Envoy v1.37.2 in DRAINING state. Status 503 byte-equal.
+
+**Forward-pointer note.** ADR-0015 (pre-init contract for /ready) is **partially superseded by ADR-0097**: the LIVE / PRE_INITIALIZING two-state coverage extends to LIVE / PRE_INITIALIZING / DRAINING three-state coverage. ADR-0015's verbatim pre-init body and pre-init status are preserved; ADR-0097 adds the DRAINING branch and the precedence rule.
+
 ### /stats/prometheus
 
 See `## Stat-name mapping` for the body-shape contract (Prometheus text exposition format with the SN1–SN8 flattening rules per ADR-0061). Header set + framing inherit the umbrella rules above.
@@ -342,32 +353,136 @@ See `## Stat-name mapping` for the body-shape contract (Prometheus text expositi
 
 ### /server_info
 
-**Body shape.** `application/json` via the same protojson MarshalOptions as `/config_dump`. Field set populates `version`, `state`, `uptime_current_epoch`, `uptime_all_epochs`, `node` (from bootstrap), partial `command_line_options{config_path}`, `hot_restart_version: "disabled"`. State enum: `LIVE` post-MarkReady, `PRE_INITIALIZING` pre-MarkReady (mathematically complete but unobservable upstream — see SPEC §11.7), `DRAINING` deferred to 08.2, `INITIALIZING` not modeled.
+**Body shape.** `application/json` via the same protojson MarshalOptions as `/config_dump`. Field set populates `version`, `state`, `uptime_current_epoch`, `uptime_all_epochs`, `node` (from bootstrap), partial `command_line_options{config_path}`, `hot_restart_version: "disabled"`. State enum (08.2 EXTENDED): `LIVE` (post-MarkReady, drain has not fired), `PRE_INITIALIZING` (pre-MarkReady, drain has not fired), `DRAINING` (drain has fired — supersedes LIVE and PRE_INITIALIZING). `INITIALIZING` is documented in `adminv3.ServerInfo_State` but unreachable in envoy-go's static-bootstrap-only model (08.1 SPEC §11.7).
 
 **Empirical evidence (verbatim Envoy v1.37.2 `/server_info`, first 70 lines):** see 08.1 SPEC §11.4.
 
-**Equivalence claim.** Body byte-equal modulo: `version`, `uptime_current_epoch`, `uptime_all_epochs`, `command_line_options.*` (subset on envoy-go side; Envoy emits ~40 fields), `hot_restart_version`, `node.*` (same allow-list as `/config_dump`). The `state` field is byte-equal (`"LIVE"` on both sides).
+**Equivalence claim.** Body byte-equal modulo: `version`, `uptime_current_epoch`, `uptime_all_epochs`, `command_line_options.*` (subset on envoy-go side; Envoy emits ~40 fields), `hot_restart_version`, `node.*` (same allow-list as `/config_dump`). The `state` field is byte-equal (`"LIVE"` on both sides post-MarkReady without drain).
+
+**Equivalence claim extension (08.2).** The `state` field IS asserted byte-equal across both proxies in DRAINING (`"DRAINING"` literal, per 08.2 SPEC §11.2 empirical pin). The 08.1 byte-equal claim for `"LIVE"` post-MarkReady is unchanged.
+
+**Forward-pointer note.** ADR-0088 is **amended** by ADR-0098 (NOT superseded — purely additive per ADR-0088 consequence (c) verbatim). The ADR-0088 amendment record adds DRAINING to the enum-coverage table and refers to ADR-0098 for the timing semantics.
+
+### /drain_listeners
+
+*Introduced by phase 08.2. Justified by ADR-0093 (method discrimination; partially amends ADR-0090) and ADR-0097 (drain trigger semantics).*
+
+**Body shape (POST).** `text/plain; charset=UTF-8`. Body verbatim `OK\n` (3 bytes; capital `OK` followed by single newline) per 08.2 SPEC §11.1 empirical pin against Envoy v1.37.2. Status 200 OK. The handler is fire-and-forget — 200 OK is emitted BEFORE drain completes; the operator polls /ready or /server_info to observe drain progress. Idempotent — subsequent POSTs during DRAINING return 200 with the same body without re-firing the drain trigger (sync.Once-guarded internally).
+
+**Method discrimination.** Non-POST methods (GET, PUT, DELETE, HEAD) return `405 Method Not Allowed` with body `Method <METHOD> not allowed, POST required.\n` per 08.2 SPEC §11.4 empirical pin. This is the FIRST admin endpoint in envoy-go with method enforcement; partially amends ADR-0090's no-method-discrimination posture (which applies uniformly to read-only endpoints; ADR-0093 records the qualification).
+
+**`?graceful=true` query-param.** Silently accepted (per ADR-0041's silent-ignore precedent). envoy-go's drain is always graceful by construction (the three-state machine has no non-graceful immediate-stop variant); the query-param has no semantic effect.
+
+**Side effects.** First POST: `drain.Manager.Drain()` called (Live → Draining transition); subsequent POSTs: no-op. The endpoint does NOT trigger process exit — the operator-driven drain stays in DRAINING indefinitely until SIGTERM/SIGINT (or kill -9).
+
+**Cross-trigger note.** Upstream Envoy v1.37.2 separates the listener-side drain (POST /drain_listeners — does NOT flip /ready or /server_info to DRAINING) from the load-balancer-disposition flip (POST /healthcheck/fail — DOES flip /ready and /server_info to DRAINING). envoy-go's MVP UNIFIES these triggers under a single drain manager: POST /drain_listeners DOES flip /ready and /server_info to DRAINING in envoy-go (the BODY shapes match Envoy verbatim per §11.2; the TRIGGERS differ at the wiring level). The differential gate's per-proxy trigger script normalizes per 08.2 SPEC §7.2.
+
+**Empirical evidence (verbatim Envoy v1.37.2 `POST /drain_listeners`):** see 08.2 SPEC §11.1.
+
+**Empirical evidence (verbatim Envoy v1.37.2 `GET/PUT/DELETE/HEAD /drain_listeners`):** see 08.2 SPEC §11.4.
+
+**Equivalence claim.** Body byte-equal to reference Envoy v1.37.2 (after framing dechunk). Method-discrimination behavior asserted byte-equal — non-POST returns 405 with the templated body across both proxies. Header set inherits the umbrella rules.
+
+**Forward-pointer note.** ADR-0090 (no-ACL admin-endpoint security posture; no method discrimination on read-only endpoints) is **partially amended** by ADR-0093: the no-ACL posture is preserved verbatim; the no-method-discrimination posture is qualified to read-only endpoints only.
 
 ### Applies to
 
-- phase 08.1 envoy-go admin subsystem.
-- all six endpoints: `/ready`, `/stats/prometheus`, `/config_dump`, `/clusters`, `/listeners`, `/server_info`.
+- phase 08.1 and phase 08.2 envoy-go admin subsystem.
+- all seven endpoints: `/ready`, `/stats/prometheus`, `/config_dump`, `/clusters`, `/listeners`, `/server_info`, `POST /drain_listeners` (08.2 NEW).
+- `/ready` DRAINING-state body `DRAINING\n` (503; ADR-0097 partially supersedes ADR-0015).
+- `/server_info` DRAINING-state `state: "DRAINING"` (ADR-0098 amends ADR-0088).
 - ENVOY_TARGET pin v1.37.2 at `sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` (ADR-0008).
 
 ### Does not yet apply to
 
 - HTTP/2 over admin (admin stays HTTP/1.1).
 - TLS on admin (admin stays plaintext).
-- DRAINING-state response on `/ready` (08.2).
-- DRAINING value on `/server_info` `state` field (08.2).
-- Mutating endpoints — `POST /drain_listeners` is 08.2; `POST /reset_counters`, `POST /quitquitquit`, `POST /healthcheck/*`, `POST /reopen_logs`, `POST /runtime_modify`, `POST /logging` deferred per ADR-0089.
+- Other mutating endpoints — `POST /reset_counters`, `POST /quitquitquit`, `POST /healthcheck/*`, `POST /reopen_logs`, `POST /runtime_modify`, `POST /logging` deferred per ADR-0089.
 - JSON form of `/clusters` and `/listeners` — `?format=json` deferred per ADR-0089.
 - Query-param filtering on `/config_dump` — `?resource=`, `?mask=`, `?include_eds=` deferred per ADR-0089.
 - `RoutesConfigDump`, `SecretsConfigDump`, `ScopedRoutesConfigDump`, `EndpointsConfigDump` envelopes deferred per ADR-0089.
 - Other deferred admin endpoints — `/runtime`, `/certs`, `/memory`, `/heap_dump`, `/cpuprofiler`, `/heapprofiler`, `/contention`, `/logging`, `/listeners/<name>/*`, `/init_dump` deferred per ADR-0089.
 - ACL / authentication on admin port (no-ACL posture per ADR-0090).
-- Method discrimination on read-only endpoints (Envoy parity per SPEC §11.8; 405 enforcement deferred).
+- Method discrimination on read-only endpoints (Envoy parity per SPEC §11.8; 405 enforcement deferred for read-only; mutating endpoint /drain_listeners DOES enforce per ADR-0093).
 - Path normalization beyond Go stdlib `http.ServeMux` (trailing-slash returns Go stdlib `404 page not found`, NOT Envoy's admin help page; allow-listed for trailing-slash behavior — envoy-go's body diverges from Envoy's body, but the status code matches).
+
+---
+
+## Graceful drain
+
+The envoy-go drain machinery transitions the process from LIVE → DRAINING → exit (via SIGTERM/SIGINT) or LIVE → DRAINING (via POST /drain_listeners; no exit). The state machine lives in the `internal/drain` package (08.2 NEW; ADR-0091); the drain manager is a single-instance lock-free state machine with three states (LIVE / DRAINING / DRAINED) and an in-flight counter.
+
+### Drain triggers
+
+Two operator workflows trigger drain in envoy-go:
+
+1. **SIGTERM or SIGINT:** drain-then-exit. The signal causes `cmd/envoy-go/main.go`'s top-level context to cancel; the main goroutine then calls `drain.Manager.Drain()`, waits on `drain.Manager.Done()` (or a 30s timeout per ADR-0095), then proceeds to per-cluster connection-pool teardown + listener-socket close + admin server close + access-log flush. The total drain window is bounded by the 30s timeout.
+
+   **Deliberate divergence from Envoy v1.37.2** (per 08.2 SPEC §11.7 empirical pin): upstream Envoy v1.37.2 SIGTERM is immediate-exit-without-drain (the log shows `caught ENVOY_SIGTERM` → `shutting down server instance` → `exiting` within ~7ms; no drain delay). envoy-go's design choice (ADR-0092) is to honor the operator-ergonomic expectation that SIGTERM = graceful drain (the dominant Kubernetes / cluster-orchestrator workflow). The differential equivalence claim does NOT exercise the SIGTERM path; the divergence is contract-level.
+
+2. **POST /drain_listeners admin endpoint:** drain-without-exit. The handler triggers `drain.Manager.Drain()` synchronously and returns 200 OK before drain completes. The proxy stays running in DRAINING indefinitely; the operator separately issues SIGTERM/SIGINT (or kill -9) at a later time to actually exit.
+
+Both triggers result in the same drain BEHAVIOR (state transition, listener stop-accepting, in-flight completion, /ready and /server_info responses). They differ only in the post-drain disposition (exit vs. stay-running).
+
+### Drain semantics
+
+When drain fires (state transitions LIVE → DRAINING):
+
+- **New connections rejected via accept-then-FIN.** The Listener Accept loop's fast-path checks `drain.Manager.IsDraining()` on each iteration; an Accept-ed conn during DRAINING is immediately closed (`conn.Close()` → kernel sends FIN) without filter-chain dispatch. Per 08.2 SPEC §11.5 empirical pin: the TCP 3-way handshake completes; the client observes "Empty reply from server" on its first read attempt. NOT listener-socket-close (which would produce kernel RST-on-no-listener for new connections).
+
+- **In-flight requests complete normally.** The HCM filter chain's `decodeHeaders`/`encodeFinalize` pair calls `drain.Manager.Inc()`/`Dec()` to track per-request in-flight count; the drain manager's `Done()` channel closes when the in-flight counter reaches 0 (or the 30s timeout fires). Per 08.2 SPEC §11.3 empirical pin: in-flight HTTP/1.1 requests during drain receive full body delivery with status 200 (no abort), and the response carries NO `Connection: close` header — the keep-alive connection remains open after the response (subsequent requests on the same conn extend the drain window via further Inc calls; deliberate MVP simplification, per-conn drainable-close-at-next-idle-window deferred).
+
+- **TCP-proxy connections complete at connection-close.** TCP-proxy filter's `OnNewConnection`/`OnConnectionClose` pair calls `Inc()`/`Dec()` per connection (correct because TCP-proxy has no per-request semantic).
+
+- **/ready returns 503 DRAINING\n** (per 08.2 SPEC §11.2 verbatim). Operators / load balancers observe the DRAINING signal and stop sending traffic.
+
+- **/server_info returns `state: "DRAINING"`** (per ADR-0098 amending ADR-0088).
+
+- **Idempotent.** Subsequent Drain() calls (e.g., a second POST /drain_listeners, or SIGTERM after a prior /drain_listeners) no-op — the state transition has already fired (sync.Once-guarded).
+
+### Drain timeout
+
+The drain timeout is a hardcoded 30s in envoy-go MVP (per ADR-0095). Envoy v1.37.2's default is 600s (per 08.2 SPEC §11.7 + 08.1 SPEC §11.4 verbatim `"drain_time": "600s"`). The divergence is deliberate to keep test-suite cost tractable; the drain BEHAVIOR is the equivalence claim, not the timeout VALUE. Operator-knob to configure the timeout is deferred to a future runtime / hot-restart family phase.
+
+The drain strategy in upstream Envoy v1.37.2 is `"Gradual"` (the only strategy in the v1.37.2 default-config flow per 08.2 SPEC §11.7 + 08.1 SPEC §11.4). envoy-go's drain is graceful-by-construction (no IMMEDIATE strategy); the strategy concept is not modeled.
+
+### Connection-level drain semantics
+
+Phase 08.2 does NOT implement per-connection drainable closure at next-idle-window (Envoy supports this via `drain_strategy: "Gradual"`'s back-off). HTTP/1.1 keep-alive connections during drain do NOT receive `Connection: close` on the in-flight response (per 08.2 SPEC §11.3 empirical pin matching Envoy parity); subsequent requests on the same conn during DRAINING are processed normally (extending the drain window). HTTP/2 connections during drain emit GOAWAY at drain-trigger (envoy-go MVP design choice; not asserted differentially per 08.2 SPEC §2.1 deferral note).
+
+### Drain manager API surface
+
+- `internal/drain.New(timeout time.Duration) *drain.Manager` — constructor; state initialized to Live.
+- `(m *Manager).State() drain.State` — atomic load; returns Live or Draining.
+- `(m *Manager).Drain()` — sync.Once-guarded; transitions Live → Draining; arms the Done rendezvous.
+- `(m *Manager).Done() <-chan struct{}` — channel closes when inflight reaches 0 after Drain has fired.
+- `(m *Manager).Inc()` / `(m *Manager).Dec()` — atomic increment/decrement of inflight counter.
+- `(m *Manager).IsDraining() bool` — Listener Accept-loop fast-path; equivalent to State() == Draining.
+- `(m *Manager).Timeout() time.Duration` — returns the configured timeout (read-only).
+
+### Applies to
+
+- phase 08.2 envoy-go drain subsystem.
+- the SIGTERM/SIGINT-handler in `cmd/envoy-go/main.go` (ADR-0092; deliberate divergence from Envoy parity).
+- the POST /drain_listeners admin endpoint (ADR-0093; method discrimination per Envoy parity).
+- the /ready DRAINING-state body (ADR-0097; partially supersedes ADR-0015).
+- the /server_info DRAINING-state field (ADR-0098; amends ADR-0088).
+- ENVOY_TARGET pin v1.37.2 at `sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` (ADR-0008).
+
+### Does not yet apply to
+
+- Hot restart / parent-child handoff (deferred to runtime / hot-restart family per ADR-0099).
+- POST /quitquitquit endpoint (semantic overlap with SIGTERM + /drain_listeners; deferred per ADR-0089 + ADR-0099).
+- POST /healthcheck/fail endpoint (envoy-go MVP unifies the listener-drain and load-balancer-disposition triggers under /drain_listeners + the drain manager; /healthcheck/fail stays deferred per ADR-0089).
+- Per-listener selective drain (`/listeners/<name>/drain` admin sub-routes deferred per ADR-0089).
+- `drain_strategy` per-listener (default GRADUAL only; IMMEDIATE strategy deferred).
+- Configurable drain timeout (hardcoded 30s; operator-knob deferred per ADR-0095).
+- Per-connection drainable closure at next-idle-window.
+- Drain manager interaction with xDS (no xDS yet; deferred).
+- HTTP/3 drain semantics (no H3 in MVP; deferred to HTTP/3 + QUIC family).
+- Drain progress JSON body on /server_info (envoy-go matches Envoy's empty-of-this-field behavior).
+- `Connection: drain` custom response header (Envoy emits no such header per 08.2 SPEC §11.3).
+- Multi-instance drain coordination (operator's load-balancer responsibility).
 
 ---
 

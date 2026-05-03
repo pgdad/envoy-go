@@ -332,3 +332,56 @@ ADR-0090:
 $ git log -1 --format=%H -- docs/envoy-go/phases/08.2-graceful-drain/SPEC.md
 0fc63f677776449e3be66c54f4f3b5be1f0bf128
 ```
+
+## Task 13 — BEHAVIOR_CONTRACT restructure + ADR-0099 + ADR-0089 amendment + six-gate verification + REVIEW.md + ROADMAP double-flip + STATE rewrite (MVP-trunk-close commit)
+
+**Commits:** `<TBD — SHA-fill follow-up>`
+**Notes:** MVP-trunk-close task. No production code changes. Deliverables: (1) `BEHAVIOR_CONTRACT.md` in-place patches per SPEC §13 (seven subsections: `## Admin API` umbrella updated to 7 endpoints + method-discrimination paragraph updated; `### /ready` DRAINING-state block appended; `### /server_info` state-enum extended + ADR-0098 forward-pointer; `### /drain_listeners` NEW subsection inserted alphabetically; `## Graceful drain` NEW umbrella section inserted after `## Admin API`; three new `## Equivalence Matrix` rows; ADR-0015/ADR-0088/ADR-0090 forward-pointer notes); (2) `DECISIONS.md` ADR-0099 (hot-restart deferral; full Context/Decision/Consequences) appended + ADR-0089 in-place amendment (`POST /drain_listeners` entry flipped from "08.2 (graceful drain)" to "delivered in 08.2 per ADR-0093"); (3) `REVIEW.md` (08-family REVIEW; covers 08.1 + 08.2 jointly per parent SPEC §5; inline-authored from SPEC §13 + branch diff + 08.1 REVIEW.md template); (4) `ROADMAP.md` rows 08.2 AND 08 BOTH flipped `in-progress → done` (BOOTSTRAP_PROMPT.md §8 MVP-trunk closure); (5) `STATE.md` rewritten to `awaiting next planning` / lifecycle-state 0 / next-skill `superpowers:brainstorming`. Six-gate verification passed — see REVIEW.md §"Six-gate verification appendix" for verbatim outputs. One inline fix applied during Step 1b: `TestHandleServerInfo_State*` assertions updated to accept both single-space and double-space protojson format (M-1 finding; RESOLVED inline; see REVIEW.md §3.2).
+**Six-gate summary:**
+```
+(a) go build ./... + go vet ./... + golangci-lint run ./... : PASS (clean)
+(b) go test -count=1 ./... : PASS (clean)
+    go test -count=1 -race ./... : PASS (clean; M-1 inline fix applied)
+(c) go test -count=1 -v ./test/conformance/h2spec/... : PASS — 53/53 at ADR-0051 pin
+(d) 12 fuzzers @ 30s ADR-0018 budget: ALL PASS
+    FuzzDrainTransitions (NEW): 49,714,065 execs; 0 new-interesting; PASS
+(e) go test -count=1 -v ./test/differential/... : PASS — 12 fixtures 0000-0010 all green
+    0010-graceful-drain: PASS (9.41s; admin-trigger + SIGTERM-trigger paths)
+(f) BEHAVIOR_CONTRACT.md populated: PASS
+    ## Admin API ### /drain_listeners: present
+    ## Graceful drain umbrella: present
+    3 new Equivalence Matrix rows: present
+```
+**ROADMAP double-flip:** row 08.2 `in-progress → done`; parent row 08 `in-progress → done` simultaneously per parent SPEC §5 — BOOTSTRAP_PROMPT.md §8 MVP trunk closed.
+**STATE:** `active-phase: awaiting next planning`; `lifecycle-state: 0`; `next-skill: superpowers:brainstorming`; `last-commit: <TBD>`.
+**ADRs landed:** ADR-0099 (hot-restart deferral; lands in this task per PLAN's ADR table); ADR-0089 in-place amendment.
+**08.1 carry-forwards settled in 08.2:** N-1 (Listeners() doc-comment; landed at T5 `3b75a82`); N-4 (wantedTypes cross-reference; landed at T12 in fixture 0009 driver). N-2, N-3, N-5 remain deferred (no regression).
+**Outputs:**
+```
+$ go test -count=1 -race ./... 2>&1 | grep -E "^(ok|FAIL|---)" | head -30
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	6.255s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.018s
+ok  	github.com/esalaine/envoy-go/internal/admin	2.602s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.083s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.083s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.147s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.084s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.538s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.172s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.032s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.064s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.270s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.208s
+ok  	github.com/esalaine/envoy-go/internal/listener	4.119s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.070s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.037s
+ok  	github.com/esalaine/envoy-go/internal/stats	1.048s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.108s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.627s
+ok  	github.com/esalaine/envoy-go/test/differential	39.580s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.028s
+$ go test -count=1 -v ./test/differential/... 2>&1 | tail -15
+    --- PASS: TestDifferential/0010-graceful-drain (9.41s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	37.219s
+```

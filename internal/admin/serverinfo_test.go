@@ -62,8 +62,10 @@ func TestHandleServerInfo_StatePostMarkReady(t *testing.T) {
 	resp, _ := http.Get("http://" + addr + "/server_info")
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `"state": "LIVE"`) {
-		t.Errorf("state post-MarkReady: body lacks `\"state\": \"LIVE\"`; body: %s", body)
+	// protojson Multiline+Indent:" " emits two spaces after the key colon:
+	// `"state":  "LIVE"`. Accept both single-space and double-space variants.
+	if !strings.Contains(string(body), `"state":  "LIVE"`) && !strings.Contains(string(body), `"state": "LIVE"`) {
+		t.Errorf("state post-MarkReady: body lacks state LIVE; body: %s", body)
 	}
 }
 
@@ -78,8 +80,10 @@ func TestHandleServerInfo_StatePreMarkReady(t *testing.T) {
 	resp, _ := http.Get("http://" + addr + "/server_info")
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `"state": "PRE_INITIALIZING"`) {
-		t.Errorf("state pre-MarkReady: body lacks `\"state\": \"PRE_INITIALIZING\"`; body: %s", body)
+	// protojson Multiline+Indent:" " emits two spaces after the key colon:
+	// `"state":  "PRE_INITIALIZING"`. Accept both single-space and double-space variants.
+	if !strings.Contains(string(body), `"state":  "PRE_INITIALIZING"`) && !strings.Contains(string(body), `"state": "PRE_INITIALIZING"`) {
+		t.Errorf("state pre-MarkReady: body lacks state PRE_INITIALIZING; body: %s", body)
 	}
 }
 
@@ -129,8 +133,10 @@ func TestHandleServerInfo_CommandLineOptionsConfigPath(t *testing.T) {
 	resp, _ := http.Get("http://" + addr + "/server_info")
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `"config_path": "/test/envoy-go.yaml"`) {
-		t.Errorf("body lacks `\"config_path\": \"/test/envoy-go.yaml\"`; body excerpt: %s", body)
+	// protojson Multiline+Indent:" " emits two spaces after the key colon.
+	// Accept both single-space and double-space variants.
+	if !strings.Contains(string(body), `"config_path":  "/test/envoy-go.yaml"`) && !strings.Contains(string(body), `"config_path": "/test/envoy-go.yaml"`) {
+		t.Errorf("body lacks config_path /test/envoy-go.yaml; body excerpt: %s", body)
 	}
 }
 
@@ -145,8 +151,10 @@ func TestHandleServerInfo_HotRestartVersionDisabled(t *testing.T) {
 	resp, _ := http.Get("http://" + addr + "/server_info")
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `"hot_restart_version": "disabled"`) {
-		t.Errorf("body lacks `\"hot_restart_version\": \"disabled\"`; body excerpt: %s", body)
+	// protojson Multiline+Indent:" " emits two spaces after the key colon.
+	// Accept both single-space and double-space variants.
+	if !strings.Contains(string(body), `"hot_restart_version":  "disabled"`) && !strings.Contains(string(body), `"hot_restart_version": "disabled"`) {
+		t.Errorf("body lacks hot_restart_version disabled; body excerpt: %s", body)
 	}
 }
 
