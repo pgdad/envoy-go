@@ -35,6 +35,51 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 2 — `internal/drain/` package — `Manager` + `FuzzDrainTransitions` [ADR-0091]
+
+**Commits:** e884998a1a5b5b3a7bfbc2f2e84a4f9374d6d3ac — this task's substantive commit
+**Notes:** Created four files: `internal/drain/doc.go`, `internal/drain/manager.go`, `internal/drain/manager_test.go`, `internal/drain/fuzz_test.go`. Three-state Manager (LIVE/DRAINING/DRAINED-as-channel-close) per SPEC §5.9 + §6.2. Lock-free hot path: `atomic.Uint32` state + `atomic.Int64` inflight; `chan struct{}` rendezvous; `sync.Once` Drain-guard + `sync.Once` close-done-guard. Manager does NOT enforce timeout (callers select on `time.After(m.Timeout())` alongside `<-m.Done()` per ADR-0095). 9/9 unit tests PASS; race clean; vet clean; lint clean (one gofmt deviation corrected: three double-space inline comments normalized to single-space by gofmt requirement). FuzzDrainTransitions (eleventh fuzzer; 30s budget per ADR-0018) PASS — ~49.7M executions, no crashers, three invariants verified. ADR-0091 appended to DECISIONS.md. LBP-1 fifth application: drain.Manager joins stats.Registry/HTTPRegistry/ListenerFilterRegistry/08.1-bs+cm+lm as boot-threaded dependency; wiring into admin.New (Task 3), listener.Manager (Task 5), HCM (Task 9), TCP-proxy (Task 10), main.go (Task 11) lands in subsequent tasks.
+**Outputs:**
+```
+$ go test -count=1 ./internal/drain/... -v 2>&1 | tail -25
+=== RUN   TestStateTransitions
+--- PASS: TestStateTransitions (0.00s)
+=== RUN   TestInflightBalance
+--- PASS: TestInflightBalance (0.00s)
+=== RUN   TestDrainCompletionRendezvous
+--- PASS: TestDrainCompletionRendezvous (0.02s)
+=== RUN   TestDrainTimeout_NoInflight
+--- PASS: TestDrainTimeout_NoInflight (0.00s)
+=== RUN   TestDrainTimeout_StuckInflight_CallerEnforces
+--- PASS: TestDrainTimeout_StuckInflight_CallerEnforces (0.05s)
+=== RUN   TestIdempotentDrain
+--- PASS: TestIdempotentDrain (0.00s)
+=== RUN   TestIsDrainingFastPath
+--- PASS: TestIsDrainingFastPath (0.00s)
+=== RUN   TestNilSafety
+--- PASS: TestNilSafety (0.00s)
+=== RUN   TestConcurrentIncDec
+--- PASS: TestConcurrentIncDec (0.00s)
+=== RUN   FuzzDrainTransitions
+=== RUN   FuzzDrainTransitions/seed#0
+=== RUN   FuzzDrainTransitions/seed#1
+=== RUN   FuzzDrainTransitions/seed#2
+--- PASS: FuzzDrainTransitions (0.00s)
+    --- PASS: FuzzDrainTransitions/seed#0 (0.00s)
+    --- PASS: FuzzDrainTransitions/seed#1 (0.00s)
+    --- PASS: FuzzDrainTransitions/seed#2 (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/drain	0.076s
+$ go test -race -count=1 ./internal/drain/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/drain	1.128s
+$ go test -fuzz=FuzzDrainTransitions -fuzztime=30s ./internal/drain/ 2>&1 | tail -10
+fuzz: elapsed: 27s, execs: 44854118 (1657699/sec), new interesting: 8 (total: 11)
+fuzz: elapsed: 30s, execs: 49755659 (1634565/sec), new interesting: 8 (total: 11)
+fuzz: elapsed: 30s, execs: 49755659 (0/sec), new interesting: 8 (total: 11)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/drain	30.176s
+```
+
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
 **Commits:** 1ce41cc8ca4b9776992abdc24b7aff6178a451ea — this task's commit
