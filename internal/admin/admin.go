@@ -136,6 +136,18 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Server", "envoy")
 
+	// 08.2 (Task 8) DRAINING-first branch per SPEC §6.4 + §11.2 + ADR-0097
+	// (partially supersedes ADR-0015 — DRAINING precedence > LIVE >
+	// PRE_INITIALIZING). Body verbatim "DRAINING\n" (9 bytes) per §11.2
+	// empirical pin.
+	if s.dm != nil && s.dm.State() == drain.StateDraining {
+		body := []byte("DRAINING\n")
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write(body)
+		return
+	}
+
 	if !s.ready.Load() {
 		body := []byte("PRE_INITIALIZING\n")
 		h.Set("Content-Length", strconv.Itoa(len(body)))

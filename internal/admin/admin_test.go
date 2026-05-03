@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -411,5 +412,71 @@ func TestServer_NewWidenedConstructor_NilDrainManagerTolerated(t *testing.T) {
 	}
 	if s.dm != nil {
 		t.Errorf("dm field should be nil when nil passed")
+	}
+}
+
+// TestHandleReady_Draining pins SPEC §11.2 empirical pin: once Drain() fires,
+// /ready returns 503 + body "DRAINING\n" (9 bytes) per ADR-0097.
+func TestHandleReady_Draining(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, dm)
+	s.MarkReady()
+	dm.Drain() // transition to DRAINING
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/ready", nil)
+	s.handleReady(w, r)
+	if got := w.Code; got != http.StatusServiceUnavailable {
+		t.Errorf("status: got %d, want 503", got)
+	}
+	if got := w.Body.String(); got != "DRAINING\n" {
+		t.Errorf("body: got %q, want %q", got, "DRAINING\n")
+	}
+}
+
+// TestHandleReady_DrainingPrecedesLive asserts DRAINING overrides LIVE per
+// ADR-0097 precedence rule: DRAINING > PRE_INITIALIZING > LIVE.
+func TestHandleReady_DrainingPrecedesLive(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, dm)
+	s.MarkReady() // LIVE state
+	dm.Drain()    // DRAINING — should override LIVE
+	w := httptest.NewRecorder()
+	s.handleReady(w, httptest.NewRequest("GET", "/ready", nil))
+	if got := w.Body.String(); got != "DRAINING\n" {
+		t.Errorf("DRAINING precedence over LIVE: got %q, want %q", got, "DRAINING\n")
+	}
+}
+
+// TestHandleReady_DrainingPrecedesPreInitializing asserts DRAINING overrides
+// PRE_INITIALIZING (MarkReady not called) per ADR-0097 precedence rule.
+func TestHandleReady_DrainingPrecedesPreInitializing(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, dm)
+	// MarkReady NOT called — would normally yield PRE_INITIALIZING
+	dm.Drain()
+	w := httptest.NewRecorder()
+	s.handleReady(w, httptest.NewRequest("GET", "/ready", nil))
+	if got := w.Body.String(); got != "DRAINING\n" {
+		t.Errorf("DRAINING precedence over PRE_INITIALIZING: got %q, want %q", got, "DRAINING\n")
+	}
+}
+
+// TestHandleReady_DrainingHeaders pins the six-header set on the DRAINING
+// response per SPEC §11.6 + ADR-0097.
+func TestHandleReady_DrainingHeaders(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, dm)
+	dm.Drain()
+	w := httptest.NewRecorder()
+	s.handleReady(w, httptest.NewRequest("GET", "/ready", nil))
+	h := w.Header()
+	if got := h.Get("Content-Type"); got != "text/plain; charset=UTF-8" {
+		t.Errorf("Content-Type: got %q", got)
+	}
+	if got := h.Get("Server"); got != "envoy" {
+		t.Errorf("Server: got %q", got)
+	}
+	if got := h.Get("Cache-Control"); got != "no-cache, max-age=0" {
+		t.Errorf("Cache-Control: got %q", got)
 	}
 }

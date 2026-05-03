@@ -5,8 +5,14 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	adminv3 "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+
+	"github.com/esalaine/envoy-go/internal/drain"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func TestHandleServerInfo_HTTPSmoke200JSON(t *testing.T) {
@@ -141,5 +147,57 @@ func TestHandleServerInfo_HotRestartVersionDisabled(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), `"hot_restart_version": "disabled"`) {
 		t.Errorf("body lacks `\"hot_restart_version\": \"disabled\"`; body excerpt: %s", body)
+	}
+}
+
+// TestHandleServerInfo_StateDraining pins ADR-0098: once Drain() fires,
+// buildServerInfo returns ServerInfo_DRAINING.
+func TestHandleServerInfo_StateDraining(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, dm)
+	s.MarkReady()
+	dm.Drain()
+	info := buildServerInfo(s)
+	if got := info.State; got != adminv3.ServerInfo_DRAINING {
+		t.Errorf("state: got %v, want DRAINING", got)
+	}
+}
+
+// TestHandleServerInfo_StatePrecedence_DrainingOverLive asserts DRAINING
+// overrides LIVE per ADR-0098 precedence (DRAINING > LIVE > PRE_INITIALIZING).
+func TestHandleServerInfo_StatePrecedence_DrainingOverLive(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, dm)
+	s.MarkReady()
+	dm.Drain()
+	info := buildServerInfo(s)
+	if got := info.State; got != adminv3.ServerInfo_DRAINING {
+		t.Errorf("Draining > Live: got %v, want DRAINING", got)
+	}
+}
+
+// TestHandleServerInfo_StatePrecedence_DrainingOverPreInit asserts DRAINING
+// overrides PRE_INITIALIZING (MarkReady not called) per ADR-0098.
+func TestHandleServerInfo_StatePrecedence_DrainingOverPreInit(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, dm)
+	dm.Drain() // MarkReady NOT called
+	info := buildServerInfo(s)
+	if got := info.State; got != adminv3.ServerInfo_DRAINING {
+		t.Errorf("Draining > PreInit: got %v, want DRAINING", got)
+	}
+}
+
+// TestDeriveState_NilDrainManager verifies nil dm falls through to the
+// LIVE/PRE_INITIALIZING two-state logic (ADR-0088 preserved verbatim).
+func TestDeriveState_NilDrainManager(t *testing.T) {
+	var ready atomic.Bool
+	ready.Store(true)
+	if got := deriveState(&ready, nil); got != adminv3.ServerInfo_LIVE {
+		t.Errorf("nil dm + ready: got %v, want LIVE", got)
+	}
+	ready.Store(false)
+	if got := deriveState(&ready, nil); got != adminv3.ServerInfo_PRE_INITIALIZING {
+		t.Errorf("nil dm + not ready: got %v, want PRE_INITIALIZING", got)
 	}
 }

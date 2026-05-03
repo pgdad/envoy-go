@@ -506,6 +506,8 @@ Framing exception: upstream emits `transfer-encoding: chunked` with no `Content-
 
 **Link to evidence:** `docs/envoy-go/phases/01-static-bootstrap-config/upstream-ready-observation.md` — captured 2026-04-22 against `envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`.
 
+> **Phase 08.2 amendment (per ADR-0097):** ADR-0015 is **partially superseded** by ADR-0097 — the LIVE/PRE_INITIALIZING two-state coverage extends to LIVE/PRE_INITIALIZING/DRAINING three-state coverage. ADR-0015's verbatim pre-init body (`PRE_INITIALIZING\n`) and pre-init status (503) are preserved; ADR-0097 adds the DRAINING branch and the precedence rule (DRAINING > PRE_INITIALIZING > LIVE).
+
 ---
 
 ## ADR-0014: `Server:` header value on envoy-go admin responses
@@ -3446,6 +3448,8 @@ The state-enum coverage in 08.1 is exactly two values: `LIVE` (post-MarkReady) a
 
 (f) The `INITIALIZING` enum value is documented in `adminv3.ServerInfo_State` but unreachable in envoy-go's static-bootstrap-only model. Future xDS-bearing phases (none planned in the current roadmap) would need to revisit this — at which point the state coverage would extend to all four values, and this ADR would be amended (not superseded) accordingly.
 
+> **Phase 08.2 amendment (per ADR-0098):** the state-enum coverage extends to LIVE + PRE_INITIALIZING + **DRAINING**. The amendment is purely additive (no other field changes; per ADR-0088's own consequence (c) verbatim). `deriveState` signature widens from `(ready *atomic.Bool)` to `(ready *atomic.Bool, dm *drain.Manager)`; precedence DRAINING > LIVE > PRE_INITIALIZING. INITIALIZING remains unreachable.
+
 ## ADR-0089: Admin-endpoint deferral list — canonical enumeration of Envoy admin surface NOT modeled by envoy-go in 08.1 (per ADR-0040 deferral-ADR format)
 
 **Status:** Accepted
@@ -3814,4 +3818,113 @@ Per planner-time-resolved nil-dm policy: a nil `s.dm` yields 500 Internal Server
 (d) Idempotent: subsequent POSTs return identical 200/`OK\n` without re-firing Drain. The `sync.Once` guard is inside `drain.Manager.Drain()` — the handler does not need its own idempotency mechanism.
 
 (e) The ten unit tests in `internal/admin/drain_test.go` cover: POST fires + body exact + idempotent + graceful-param silently ignored + nil-dm 500 + GET/PUT/DELETE/HEAD all return 405 + header set correct.
+
+---
+
+## ADR-0097: `/ready` DRAINING-branch — 503 + `DRAINING\n` body; precedence DRAINING > PRE_INITIALIZING > LIVE; partial supersession of ADR-0015
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (capture empirical observations as ADRs when the contract source is not derivable from documentation), D-3.5 (decisions written down).
+**Lands-in-task:** 08.2 PLAN Task 8 (`internal/admin/admin.go` `handleReady` DRAINING-branch).
+
+### Context
+
+SPEC §6.4 + §11.2 + §5.4 + BRAINSTORM Decision 9. The §11.2 empirical pin against upstream Envoy v1.37.2 verbatim settles the body shape: `/ready` returns `DRAINING\n` (9 bytes; status 503 Service Unavailable) with the standard six-header set per SPEC §11.6 when the server is in the draining state.
+
+**SURPRISE finding:** upstream Envoy v1.37.2 ties `/ready` DRAINING to `/healthcheck/fail` (NOT `/drain_listeners` alone) — a distinct endpoint that flips the load-balancer-disposition flag independently from the listener-drain trigger. envoy-go MVP unifies these triggers under the single `drain.Manager` state machine: one `Drain()` call (fired by `POST /drain_listeners` or SIGTERM) transitions both the listener fast-path AND the `/ready` + `/server_info` state to DRAINING. The differential fixture's per-proxy trigger script normalises for upstream Envoy's separate `/healthcheck/fail` trigger per SPEC §7.2.
+
+The precedence rule — which state wins when both drain and pre-init are possible — was left to the PLAN to settle. DRAINING takes highest precedence (DRAINING > PRE_INITIALIZING > LIVE) because: (a) a draining server should refuse new work regardless of whether MarkReady was ever called; (b) the DRAINING-first ordering is symmetric with `deriveState`'s DRAINING-first check on `/server_info` (ADR-0098) for cross-endpoint consistency; (c) the pre-init scenario where drain fires before MarkReady is a corner case (operator fires drain during boot) that should not silently resolve to PRE_INITIALIZING and mask the drain signal.
+
+### Decision
+
+NEW first branch in `handleReady`, inserted BETWEEN the six-header set and the pre-init check:
+
+```go
+if s.dm != nil && s.dm.State() == drain.StateDraining {
+    body := []byte("DRAINING\n")
+    h.Set("Content-Length", strconv.Itoa(len(body)))
+    w.WriteHeader(http.StatusServiceUnavailable)
+    _, _ = w.Write(body)
+    return
+}
+```
+
+The DRAINING branch uses the same inline header/write pattern as the existing PRE_INITIALIZING and LIVE branches (manual `Content-Length` set + `WriteHeader` + `Write`). The six-header set above the branch (Content-Type, Cache-Control, X-Content-Type-Options, Server) applies to all three state paths. `s.dm == nil` tolerance is preserved — the branch is guarded by `s.dm != nil`, so test code that passes nil for `dm` sees no behavioral change.
+
+Precedence: DRAINING (new, highest) > PRE_INITIALIZING (existing, middle) > LIVE (existing, lowest). The existing PRE_INITIALIZING and LIVE branches are preserved verbatim.
+
+### Alternatives considered
+
+(A) Add DRAINING AFTER the pre-init check (precedence PRE_INITIALIZING > DRAINING > LIVE). Rejected: masks the DRAINING signal during boot; an operator who fires drain during initialisation should see DRAINING, not PRE_INITIALIZING.
+
+(B) Separate drain and pre-init signals with a combined state (DRAINING_PRE_INIT). Rejected: over-engineering for a corner case; the three-state machine with priority ordering is sufficient and consistent with upstream Envoy's state model.
+
+(C) Return 200 + body `DRAINING\n` during drain (mirror upstream's pre-1.37.2 behavior where drain did not affect /ready). Rejected: contradicts the §11.2 empirical pin; load-balancers that poll `/ready` for health-checking would continue sending traffic to a draining instance.
+
+(D) Block the DRAINING response on `<-s.dm.Done()` (drain completion). Rejected: same reason as ADR-0093 alternative (C) — `/ready` is a health-check polling endpoint, not a drain-completion signal. Fire-and-forget + operator polling is the correct model.
+
+### Consequences
+
+(a) `/ready` returns `DRAINING\n` (503) once `Drain()` fires regardless of `MarkReady` state. Load-balancers that poll `/ready` will remove the instance from rotation immediately on drain.
+
+(b) The differential fixture's per-proxy trigger script (SPEC §7.2) normalizes for upstream Envoy's separate `/healthcheck/fail` trigger — envoy-go fires drain via `POST /drain_listeners`; the script fires both `/drain_listeners` + `/healthcheck/fail` against upstream, then waits for `/ready` to return DRAINING on both sides before asserting equivalence.
+
+(c) **ADR-0015 is partially superseded** by this ADR — the LIVE/PRE_INITIALIZING two-state coverage extends to LIVE/PRE_INITIALIZING/DRAINING three-state coverage. ADR-0015's verbatim pre-init body (`PRE_INITIALIZING\n`) and pre-init status (503) are preserved; this ADR adds the DRAINING branch and the precedence rule. ADR-0015 is amended in-place with a forward-pointer note per the ADR-0089 consequence (b) pattern.
+
+(d) Four new unit tests cover the DRAINING path: `TestHandleReady_Draining` (smoke), `TestHandleReady_DrainingPrecedesLive`, `TestHandleReady_DrainingPrecedesPreInitializing`, `TestHandleReady_DrainingHeaders`.
+
+---
+
+## ADR-0098: `/server_info` `state` field DRAINING — `deriveState` signature widen; DRAINING-first check; purely additive amendment of ADR-0088
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (capture empirical observations as ADRs when the contract source is not derivable from documentation), D-3.5 (decisions written down).
+**Lands-in-task:** 08.2 PLAN Task 8 (`internal/admin/serverinfo.go` `deriveState` widen + `buildServerInfo` call site).
+
+### Context
+
+SPEC §6.5 + §11.2 + BRAINSTORM Decision 10 + ADR-0088 consequence (c) verbatim: "Phase 08.2's drain implementation extends the state enum coverage to `LIVE` + `PRE_INITIALIZING` + `DRAINING` by adding a third atomic flag (or by extending `s.ready` semantics — 08.2's PLAN settles the choice) and amending `deriveState` to return `adminv3.ServerInfo_DRAINING` when the drain flag is set. The amendment is purely additive; no other field changes. The ADR-0088 amendment will record the addition without superseding this ADR."
+
+The §11.2 empirical pin settles the enum render: protojson encodes the enum by name (`"DRAINING"` — the upper-case proto enum NAME), consistent with the existing `"LIVE"` and `"PRE_INITIALIZING"` renderings. No format change to the surrounding body; only the `state` field value changes.
+
+The `deriveState` signature widen approach (threading `*drain.Manager` rather than a third atomic flag) was chosen at PLAN time for two reasons: (1) it is consistent with the LBP-1 explicit-threading discipline applied throughout phase 08.2 (ADR-0091); (2) it avoids adding a new exported flag that would need its own synchronization contract — `drain.Manager.State()` is already lock-free (atomic read per ADR-0091).
+
+The DRAINING precedence matches ADR-0097's `/ready` precedence (DRAINING > LIVE > PRE_INITIALIZING) for cross-endpoint consistency: a load-balancer or operator observing both endpoints simultaneously sees the same state signal from both.
+
+### Decision
+
+`deriveState` signature widens from `(ready *atomic.Bool)` to `(ready *atomic.Bool, dm *drain.Manager)`. NEW first check:
+
+```go
+if dm != nil && dm.State() == drain.StateDraining {
+    return adminv3.ServerInfo_DRAINING
+}
+```
+
+Existing LIVE / PRE_INITIALIZING returns preserved verbatim. `buildServerInfo` call site updated to `deriveState(&s.ready, s.dm)`. `drain` import added to `serverinfo.go`.
+
+The amendment is purely additive per ADR-0088 consequence (c): no other field in `*adminv3.ServerInfo` changes; the `configDumpMarshalOptions` reuse (ADR-0086 + ADR-0088) is unchanged; `INITIALIZING` remains unreachable per ADR-0088 consequence (f).
+
+ADR-0088 is amended in-place per ADR-0089 consequence (b) pattern: the amendment record (appended to ADR-0088 Consequences) adds DRAINING to the enum-coverage table and refers to this ADR for the timing semantics.
+
+### Alternatives considered
+
+(A) Add a third `atomic.Bool` flag (`s.draining`) to `Server` and pass it to `deriveState` instead of `*drain.Manager`. Rejected: the flag would need its own synchronization contract and flip site; `drain.Manager.State()` already provides this — threading the Manager is simpler and consistent with LBP-1.
+
+(B) Expose `drain.Manager.State()` as a boolean (`drain.Manager.IsDraining() bool`) and pass that boolean to `deriveState`. Rejected: a boolean snapshot loses the type-safety of `drain.StateDraining`; the `State()` method already returns a typed enum, and the DRAINING-first guard is a single one-liner either way.
+
+(C) Supersede ADR-0088 rather than amend it. Rejected: ADR-0088 consequence (c) explicitly prescribes amendment ("the amendment is purely additive … the ADR-0088 amendment will record the addition without superseding this ADR"); ADR-0004's anti-fragmentation guidance favors amendment when the addition does not change existing decisions.
+
+### Consequences
+
+(a) `/server_info` `state` field renders `"DRAINING"` (proto enum NAME) when `Drain()` has fired, matching upstream Envoy v1.37.2's empirical scrape per §11.2. The existing `"LIVE"` and `"PRE_INITIALIZING"` renderings are preserved.
+
+(b) ADR-0088 is amended in-place — Consequences § Phase 08.2 amendment paragraph appended. The state-enum coverage table extends to LIVE + PRE_INITIALIZING + DRAINING; INITIALIZING remains unreachable.
+
+(c) Four new unit tests cover the DRAINING path: `TestHandleServerInfo_StateDraining` (smoke), `TestHandleServerInfo_StatePrecedence_DrainingOverLive`, `TestHandleServerInfo_StatePrecedence_DrainingOverPreInit`, `TestDeriveState_NilDrainManager` (nil-dm fallback to ADR-0088 two-state logic).
+
+(d) The differential comparator (Task 13 / SPEC §13.2) can byte-compare the `state` field value post-drain across both sides: both upstream Envoy (after `/healthcheck/fail` + `/drain_listeners`) and envoy-go (after `POST /drain_listeners`) return `"state": "DRAINING"`. The per-proxy trigger script normalizes for the separate upstream trigger per SPEC §7.2.
+
 

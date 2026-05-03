@@ -9,6 +9,8 @@ import (
 	adminv3 "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/esalaine/envoy-go/internal/drain"
 )
 
 // handleServerInfo implements /server_info per SPEC §5.5 + §11.4 + ADR-0088.
@@ -47,7 +49,7 @@ func buildServerInfo(s *Server) *adminv3.ServerInfo {
 	uptime := durationpb.New(time.Since(s.bootTime))
 	return &adminv3.ServerInfo{
 		Version:            BuildVersionString(),
-		State:              deriveState(&s.ready),
+		State:              deriveState(&s.ready, s.dm),
 		UptimeCurrentEpoch: uptime,
 		UptimeAllEpochs:    uptime,
 		HotRestartVersion:  "disabled",
@@ -58,11 +60,25 @@ func buildServerInfo(s *Server) *adminv3.ServerInfo {
 	}
 }
 
-// deriveState returns ServerInfo_LIVE when the ready atomic is set, else
-// ServerInfo_PRE_INITIALIZING per planner-time decision 4 + SPEC §11.7.
-// INITIALIZING is unreachable in 08.1 MVP (no xDS init phase that
-// survives admin-server bind). DRAINING is 08.2's deliverable.
-func deriveState(ready *atomic.Bool) adminv3.ServerInfo_State {
+// deriveState returns the ServerInfo state enum value using the precedence
+// rule DRAINING > LIVE > PRE_INITIALIZING (ADR-0097 + ADR-0098 + SPEC §11.7).
+//
+// If dm is non-nil and dm.State() == StateDraining, ServerInfo_DRAINING is
+// returned regardless of the ready flag (DRAINING takes highest precedence
+// per ADR-0098 + ADR-0097 — the additively-amended extension of ADR-0088).
+//
+// Otherwise: ServerInfo_LIVE when ready is set, ServerInfo_PRE_INITIALIZING
+// when it is not (the ADR-0088 two-state coverage, preserved verbatim).
+//
+// INITIALIZING is unreachable in the MVP (no xDS init phase that survives
+// admin-server bind — ADR-0088 §f).
+func deriveState(ready *atomic.Bool, dm *drain.Manager) adminv3.ServerInfo_State {
+	// 08.2 (Task 8) DRAINING-first check per SPEC §6.5 + §11.2 + ADR-0098
+	// (amends ADR-0088 additively). Precedence DRAINING > LIVE >
+	// PRE_INITIALIZING per ADR-0097 + ADR-0098 cross-reference.
+	if dm != nil && dm.State() == drain.StateDraining {
+		return adminv3.ServerInfo_DRAINING
+	}
 	if ready.Load() {
 		return adminv3.ServerInfo_LIVE
 	}
