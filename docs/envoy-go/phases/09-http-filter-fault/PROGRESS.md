@@ -126,3 +126,94 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.050s
 ```
+
+## Task 3 — fault package core (doc.go + fault.go + fault_test.go) [ADR-0100, ADR-0101, ADR-0107]
+
+**Commits:** TBD — this task's commit
+**Notes:** Strict-TDD per PLAN.md Task 3 Steps 1–8. Step 1 wrote `internal/filter/http/fault/fault_test.go` with seven tests (`TestNew_NilTC`, `TestNew_MalformedTC`, `TestNew_AbortHTTPStatusOutOfRange` with 4 subcases zero/too_high/too_low/upper_exclusive, `TestNew_DelayPercentageWithoutFixedDelay`, `TestNew_HappyPath`, `TestNew_RegistersStats`, `TestRuntimeConfig_FieldExtraction`); imports settled per `go doc` queries — `commonfaultv3 "envoy/extensions/filters/common/fault/v3"` for `FaultDelay`, `faultv3 "envoy/extensions/filters/http/fault/v3"` for `HTTPFault`/`FaultAbort`, `routev3 "envoy/config/route/v3"` for `HeaderMatcher`, `matcherv3 "envoy/type/matcher/v3"` for `StringMatcher`, `typev3 "envoy/type/v3"` for `FractionalPercent`, `wrapperspb` for `UInt32`, `durationpb` for `New(time.Duration)`, `proto.Message`. Confirmed PLAN's `FaultDelaySecifier` field name is the actual generated proto name (upstream typo "Secifier" not "Specifier"). Step 2 confirmed compile error: `undefined: New ... undefined: parseRuntimeConfig`. Step 3 wrote `internal/filter/http/fault/doc.go` verbatim from PLAN lines 717–796 (decode-side 5-step discipline; async-resume mechanics; abort terminal-replace; max_active_faults LBP-1 sixth; per-route policy wholesale-override; encode-side no-op; 5-stat list; deferral list; ADR cross-reference list 0100..0107). Step 4 wrote `internal/filter/http/fault/fault.go`: `TypeURL` const + `faultAbortBody = "fault filter abort"` (18 bytes, nolint:unused for Task 4) + `faultStats` 5-field struct + `runtimeConfig` 8-scalar+1-slice struct + `headerMatch{name, exactValue}` + `New(tc, ctx)` factory (8-step contract per ADR-0101) + `parseRuntimeConfig` (PGV [200, 600) gate + delay.fixed_delay > 0 gate + headers `string_match.exact` only) + `percentageToFloat` (HUNDRED/TEN_THOUSAND/MILLION denominators) + `registerFaultStats` (nil-tolerant per ADR-0085) + `filter` 8-field struct (with `delayTimer` + `markedActive` nolint:unused for Tasks 5/6) + static interface assertions `_ envoyhttp.StreamDecoderFilter / StreamEncoderFilter = (*filter)(nil)` + decoder/encoder method set with stub DecodeHeaders returning Continue + pass-through Data/Trailers + stub OnDestroy. Two PLAN refinements: (a) abort.error_type discrimination uses type-assertion `_, ok := a.GetErrorType().(*faultv3.FaultAbort_HttpStatus)` rather than the PLAN snippet's `hs != 0 || a.GetErrorType() != nil` — the type assertion correctly silent-ignores `header_abort` and `grpc_status` variants per ADR-0104 (the snippet's heuristic would have validated hs=0 against [200, 600) for header_abort variants and incorrectly errored). (b) Headers gate parses via `h.GetHeaderMatchSpecifier().(*routev3.HeaderMatcher_StringMatch)` rather than `h.GetStringMatch()` directly because the helper would coerce non-string-match variants. Step 5 confirmed all 7 tests PASS (4 subcases of TestNew_AbortHTTPStatusOutOfRange + 6 top-level = 10 PASS lines; 0.004s). Step 6 confirmed `go build ./...` clean, `go vet ./...` clean, `golangci-lint run ./...` clean, `go test -race -count=1 ./internal/filter/http/fault/...` clean (1.013s), `go test -race -count=1 -short ./...` clean across all 30 packages including the 11 differential fixtures unchanged. Step 7 appended ADR-0100, ADR-0101, ADR-0107 to `docs/envoy-go/DECISIONS.md` per the ADR-0001 template (Status / Date / Doctrine / Lands-in-task / Context / Decision / Alternatives considered / Consequences). ADR-0100 anchors package shape + `FactoryCtx` framework extension consequences; cross-references ADR-0072 (HTTPRegistry threaded constructor extended to 4 entries), ADR-0074 (filter set extended to {cors, envoygotest, fault, router}), ADR-0085 (nil-tolerance), ADR-0061 (pre-Freeze stat registration). ADR-0101 anchors runtimeConfig 6-vs-11 decomposition + PGV [200, 600) mirror + delay.fixed_delay > 0 validation + per-instance RNG seeding; cross-references ADR-0073 (3-tier merge wholesale-override empirically confirmed at §11.7), ADR-0104 (header-driven fault path deferred). ADR-0107 anchors 17→22-name extension + response_rl_injected route A; cross-references ADR-0061 (SN1–SN8 flattening rules unchanged). Each ADR's Lands-in-task field reads "Task 3 (phase 09); commit TBD" — SHA-fill follow-up replaces TBD per the 08.2 precedent (PROGRESS.md Task 3 entry's `Commits:` line + DECISIONS.md three Lands-in-task lines updated together in the SHA-fill commit).
+**Outputs:**
+```
+$ go test ./internal/filter/http/fault/... -v
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_AbortHTTPStatusOutOfRange
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/zero
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/too_high
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/too_low
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/upper_exclusive
+--- PASS: TestNew_AbortHTTPStatusOutOfRange (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/zero (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/too_high (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/too_low (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/upper_exclusive (0.00s)
+=== RUN   TestNew_DelayPercentageWithoutFixedDelay
+--- PASS: TestNew_DelayPercentageWithoutFixedDelay (0.00s)
+=== RUN   TestNew_HappyPath
+--- PASS: TestNew_HappyPath (0.00s)
+=== RUN   TestNew_RegistersStats
+--- PASS: TestNew_RegistersStats (0.00s)
+=== RUN   TestRuntimeConfig_FieldExtraction
+--- PASS: TestRuntimeConfig_FieldExtraction (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	0.004s
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 ./internal/filter/http/fault/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.013s
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.533s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.049s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.542s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.088s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.083s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.144s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.086s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.538s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.174s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.039s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.062s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.044s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.272s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.211s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.091s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.075s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.036s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.045s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.114s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	1.158s
+ok  	github.com/esalaine/envoy-go/test/differential	1.159s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.029s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.029s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.026s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.037s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.036s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.034s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/backends	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.049s
+```

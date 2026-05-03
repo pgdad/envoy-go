@@ -4085,4 +4085,239 @@ This decision is deferred to a future feature-family phase under BOOTSTRAP_PROMP
 
 (d) Cross-reference: ADR-0089 (parallel admin-endpoint deferral list) carries `POST /quitquitquit` and `POST /healthcheck/fail` as adjacent deferrals in the same MVP scope-bounding cluster. The `quitquitquit` endpoint is the child-to-parent signal in the hot-restart protocol (the child calls POST /quitquitquit to tell the parent it has drained and can exit); deferring quitquitquit is consequentially correct given this ADR. The `healthcheck/fail` endpoint is the load-balancer-disposition flip that complements the listener drain during hot restart; its deferral per ADR-0089 is also consequentially correct.
 
+---
+
+## ADR-0100: `internal/filter/http/fault/` package shape + boot registration + `FactoryCtx` framework extension
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.5 (record durable design rationale; the package shape is a contract that future filter authors mirror) + D-3.4 (the `FactoryCtx` extension is a framework-level invariant that future stat-bearing filters depend on).
+**Lands-in-task:** Task 3 (phase 09); commit TBD. Code consequences span Task 2 (FactoryCtx extension at `internal/filter/http/types.go` — ADR text references the framework-extension that Task 2 lands) and Task 8 (boot registration line in `cmd/envoy-go/main.go`).
+
+### Context
+
+Phase 09 introduces `envoy.filters.http.fault` as the first member of the §9 HTTP filters family beyond the 07.x trunk three (`router`, `cors`, `envoygotest`). Per SPEC §6.1 the filter package needs (1) a public `TypeURL` constant for the boot wiring registration line, (2) a public `New` `HTTPFilterFactory` that the listener-manager threads through `parseHTTPFiltersChain`, (3) unexported types (`runtimeConfig`, `headerMatch`, `filter`) with the per-instance per-request state. The package shape mirrors `internal/filter/http/cors/` (the 07.1 precedent) — same `TypeURL` + `New` + `filter` decomposition, same dual-side `StreamDecoderFilter` + `StreamEncoderFilter` impl on the single `*filter` type, same boot-time registration via `httpReg.Register(fault.TypeURL, fault.New)` at `cmd/envoy-go/main.go`.
+
+Fault is the first stat-bearing HTTP filter — cors / envoygotest / router register zero metrics on `*stats.Registry`; fault registers five (per ADR-0107). The pre-09 `FactoryCtx` carried only `Registry *HTTPRegistry` (the cross-filter-lookup field added at 07.1); fault's `New` needs (a) `*stats.Registry` to register its 5 stats at HCM-build time, and (b) the HCM's `stat_prefix` string to key those stats per the ADR-0061 `http.<stat_prefix>.<metric>` discipline. This is a framework-level invariant: every future stat-bearing HTTP filter (e.g., `header_to_metadata`, `local_ratelimit`, `rbac` if it carries policy_match counters) will need the same two fields.
+
+The decision: WIDEN `FactoryCtx` to a 3-field struct `{Registry, Stats, StatPrefix}` rather than introducing a per-filter side-channel. This consolidates the boot-time framework surface, keeps the call-site ergonomic (`fault.New(tc, ctx)` continues to take a single struct), and avoids a second framework constructor signature variation.
+
+### Decision
+
+The `internal/filter/http/fault/` package consists of:
+
+1. `doc.go` — package-level docs anchoring SPEC §6 + the eight ADRs (ADR-0100..ADR-0107).
+2. `fault.go` — public surface (`TypeURL`, `New`) + unexported types (`faultStats`, `runtimeConfig`, `headerMatch`, `filter`) + parser (`parseRuntimeConfig` + `percentageToFloat`) + stats registration (`registerFaultStats`) + the per-request `*filter` with `StreamDecoderFilter` + `StreamEncoderFilter` method set.
+3. `fault_test.go` (and follow-up `fault_route_test.go` / `fault_race_test.go` at later tasks) — TDD-discipline unit tests.
+
+Boot registration line in `cmd/envoy-go/main.go` (Task 8): `httpReg.Register(fault.TypeURL, fault.New)`. Same shape as the existing three trunk lines for `router.New`, `cors.New`, `envoygotest.New`.
+
+`FactoryCtx` widens to:
+
+```go
+type FactoryCtx struct {
+    Registry   *HTTPRegistry
+    Stats      *stats.Registry
+    StatPrefix string
+}
+```
+
+Per-field semantics:
+- `Registry`: same as 07.1; the cross-filter lookup pointer for filters that need to inspect sibling factories. Untouched semantics.
+- `Stats`: non-nil at HCM-build time per the ADR-0061 pre-Freeze discipline; nil-tolerated in test code per ADR-0085 (test code that does not exercise stat-bearing filters is not required to allocate a registry). Filters that consume `Stats` MUST guard nil per ADR-0085 (fault's `registerFaultStats` returns an all-nil `*faultStats` on nil registry; the field is unused by the four phase-09 stats but the discipline propagates).
+- `StatPrefix`: the HCM's `stat_prefix` per the §13 stat-name flattening anchor; empty-tolerated in test code.
+
+The framework's `parseHTTPFiltersChain` (in `internal/filter/hcm/config.go`) populates the two new fields from the HCM-build context. The 11 differential fixtures (0000..0010) PASS unchanged because their filters (router, cors, envoygotest) never read `Stats` / `StatPrefix`.
+
+### Alternatives considered
+
+(A) Add a per-filter side-channel (e.g., `fault.NewWithStats(tc, ctx, statsReg, prefix)`). REJECTED: the framework constructor signature would diverge per filter; future stat-bearing filters (`local_ratelimit`, `header_to_metadata`) would each need their own bespoke factory shape. Not scalable; future-readers of the codebase would have a per-filter mental model rather than the single framework model `HTTPFilterFactory`.
+
+(B) Make stats registration LAZY inside the per-request `*filter` (first-DecodeHeaders allocates the `*Counter` on demand). REJECTED: violates the ADR-0061 pre-Freeze discipline — the `*stats.Registry` is frozen after boot; first-DecodeHeaders runs WAY after Freeze, so the lazy registration would panic at the first request. Stats MUST be registered at HCM-build time.
+
+(C) Use a package-global `*stats.Registry` (mirror upstream Envoy's stats store singleton). REJECTED: contradicts the ADR-0059 LBP-1 invariant (no package-globals; explicit threaded constructor map). The threaded `FactoryCtx.Stats` is the LBP-1-compliant equivalent.
+
+(D) Skip the `Stats` field; require fault's factory signature to widen instead (`func New(tc *anypb.Any, ctx FactoryCtx, sreg *stats.Registry, prefix string) ...`). REJECTED: the `HTTPFilterFactory` type is a single function-type alias used by the registry's `Register` API; widening the signature would require a v2 registry type and break the 07.1 ADR-0072 contract.
+
+### Consequences
+
+(a) The `FactoryCtx` framework extension is purely additive — partial supersession of the 07.1 ADR-0072 / ADR-0074 cluster: the trunk filter set extends from `{cors, envoygotest, router}` to `{cors, envoygotest, fault, router}`. Boot-registration order is alphabetical; `cmd/envoy-go/main.go` adds one line between `envoygotest` and `router`.
+
+(b) The `FactoryCtx` superset contract: future stat-bearing filters consume `ctx.Stats` + `ctx.StatPrefix` directly without further framework changes. Future cross-filter-policy filters (e.g., a `compose` filter that wraps siblings) consume `ctx.Registry` directly. The 3-field `FactoryCtx` is the canonical framework-context shape for the §9 HTTP filters family.
+
+(c) Cross-references:
+   - ADR-0072 (HTTPRegistry threaded constructor) — extended; the registry's value-set grows from 3 to 4 entries.
+   - ADR-0074 (boot-time three-filter set: `cors`, `envoygotest`, `router`) — extended; the boot-time set grows to 4. ADR-0074's "filters registered at boot" enumeration is now `{cors, envoygotest, fault, router}`. This ADR amends ADR-0074 in the additive-only sense (no removal of existing entries).
+   - ADR-0085 (nil-tolerance for framework-injected pointers) — anchored at the new `Stats` field; fault's `registerFaultStats` exhibits the pattern.
+   - ADR-0061 (pre-Freeze stat registration discipline) — anchored at fault's New-time stat registration; fault is the first HTTP filter to exercise the discipline (cors/envoygotest/router register zero stats; previously only HCM and listener-side code registered stats).
+
+(d) The `FactoryCtx` extension is grep-verifiable in `internal/filter/http/types.go` (`Stats *stats.Registry` line); future readers tracing the Phase-09 first-use can locate the framework extension here.
+
+(e) Boot-time fail-fast continues per ADR-0072: `fault.New` rejects `nil` typed_config + malformed Any + abort.http_status out of [200, 600) + delay.percentage > 0 without delay.fixed_delay > 0. The `cmd/envoy-go/main.go` boot path observes the error and exits non-zero before serving traffic.
+
+---
+
+## ADR-0101: `runtimeConfig` shape + 6-field-consumed / 11-field-silent-ignore decomposition + `abort.http_status` PGV [200, 600) validation + `delay.fixed_delay` > 0 validation + percentage-roll determinism
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.5 (record durable design rationale; the runtimeConfig shape is the load-bearing parser contract for fault's behavioral semantics) + D-3.3 (the silent-ignore decomposition is the empirically-pinned divergence from upstream Envoy and must be recorded for differential-fixture readers).
+**Lands-in-task:** Task 3 (phase 09); commit TBD.
+
+### Context
+
+Per SPEC §6.2 the `runtimeConfig` is the projection of the upstream `*faultv3.HTTPFault` proto (16 fields per the v1.37.2 generated `.pb.go`) into the smaller per-instance shape that fault's DecodeHeaders consumes. The decomposition is:
+
+**Six fields consumed at fault-eval time (8 if you count `matchHeaders` + `maxActiveFaults` separately):**
+- `delayEnabled` — derived from `delay != nil && delay.fixed_delay > 0`
+- `delayPercentage` — float64 in [0, 100]; from `delay.percentage` projected via FractionalPercent denominator
+- `delayFixedDelay` — `time.Duration`; from `delay.fixed_delay.AsDuration()`
+- `abortEnabled` — derived from `abort != nil && abort.http_status set`
+- `abortPercentage` — float64 in [0, 100]; from `abort.percentage`
+- `abortHTTPStatus` — int; PGV-validated [200, 600) at New time
+- `matchHeaders` — `[]headerMatch{name, exactValue}`; only `string_match.exact` honored
+- `maxActiveFaults` — int64; 0 = no cap
+
+**Eleven fields silently ignored per ADR-0104 / SPEC §2 deferrals:**
+- `delay.header_delay` (deferred-coupled with `abort.header_abort`)
+- `abort.header_abort` (same)
+- `abort.grpc_status`
+- `upstream_cluster`
+- `downstream_nodes`
+- `disable_downstream_cluster_stats`
+- `delay_percent_runtime` / `delay_duration_runtime` / `abort_percent_runtime` / `abort_http_status_runtime` / `max_active_faults_runtime` (5 runtime-key overrides; runtime layer not modeled in 09)
+- `response_rate_limit` (response RL filter not in scope)
+- `response_rate_limit_percent_runtime` / `abort_grpc_status_runtime` (additional runtime keys)
+- `filter_metadata` (dynamic-metadata propagation deferred)
+
+Per SPEC §11.1 PGV-empirically-pinned constraint: `abort.http_status` MUST be in [200, 600) — upstream Envoy's PGV constraint at the proto level; reference Envoy v1.37.2 rejects out-of-range values at `xds_listener` parse time. Fault's `New` mirrors this constraint at New time so the boot path fails fast (per ADR-0072 boot-time-fail-fast).
+
+Per SPEC §11.1 secondary constraint: `delay.percentage > 0` requires `delay.fixed_delay > 0`. A delay block with non-zero rolling probability but zero duration is a configuration mistake — it would emit a 0-duration timer that fires synchronously, defeating the async-resume mechanic (ADR-0102) and producing observable behavior indistinguishable from "no delay". Fault rejects this at New time.
+
+Per planner-time decision 12 (settled at PLAN.md): the percentage-roll RNG is a per-instance `*math/rand.Rand` seeded by `time.Now().UnixNano()` at filter-instance allocation time. 0% rolls short-circuit to false; 100% rolls short-circuit to true; intermediate values consult the per-instance RNG. This is non-deterministic across requests by design (each instance has its own seed) — the differential gate at fixture 0011 uses 0% / 100% scenarios exclusively to keep determinism; intermediate-percentage scenarios are out of differential scope per SPEC §7.4 fixture composition.
+
+### Decision
+
+`runtimeConfig` is an 8-scalar struct with one slice (`matchHeaders`). `parseRuntimeConfig(*faultv3.HTTPFault) (*runtimeConfig, error)` projects the proto and validates:
+
+1. **`delay.percentage > 0` without `delay.fixed_delay > 0`** → `errors.New("fault: delay.fixed_delay required when delay.percentage > 0")`.
+2. **`abort.http_status` ∉ [200, 600)** → `fmt.Errorf("fault: abort.http_status %d out of range [200, 600)", hs)`. The check fires only when `abort.error_type` is the `HttpStatus` oneof variant; `header_abort` / `grpc_status` variants are silent-ignored per ADR-0104.
+3. **Header matchers** — only `HeaderMatcher_StringMatch` with non-empty `Exact` value is honored. All other variants (regex, prefix, suffix, contains, present-only, range-match) are silent-ignored at parse time. Header NAME is canonicalized via `http.CanonicalHeaderKey` so the runtime gate match is RFC-7230-correct (case-insensitive name match).
+
+The percentage-roll discipline is per-instance:
+
+- 0% → false (short-circuit; never consult RNG)
+- 100% → true (short-circuit; never consult RNG)
+- intermediate p → `f.rng.Float64() * 100 < p` (consult per-instance RNG seeded once at allocation)
+
+This is settled in Task 3 by the `rng: rand.New(rand.NewSource(time.Now().UnixNano()))` line in the `New` factory closure; Task 4 lands the `rollPercent` helper that consumes it.
+
+### Alternatives considered
+
+(A) Inline parser in `New` (no extracted `parseRuntimeConfig`). REJECTED: per planner-time decision 2, the parser is shared between New (with full validation) and per-route resolution (Task 7's `parseRouteRuntimeConfig`). A separate function keeps both call sites symmetric. Per-route validation fires at HCM-build time (the RouteConfiguration parse path resolves typed_per_filter_config) so the same validation guards apply.
+
+(B) Validate `abort.http_status` against the standard library's `http.StatusText` table (only "real" status codes pass). REJECTED: the PGV constraint is [200, 600) — non-stdlib codes like 418 / 419 / 421 are valid envoy-go inputs. Per SPEC §11.1 the constraint is a numeric range, not a set membership.
+
+(C) Use a global `*math/rand.Rand` with `sync.Mutex` for the percentage rolls. REJECTED: lock contention on the rolling path is unnecessary; per-instance RNG is fully sufficient (no cross-request determinism requirement). The seed-per-instance design also means two simultaneous requests do not see correlated RNG sequences — per SPEC §6.4 the rolls are independent across requests.
+
+(D) Use `crypto/rand` instead of `math/rand`. REJECTED: fault's percentage-roll is a behavioral decision, not a security decision. `math/rand` is faster and adequate for the purpose; reference Envoy uses a similar non-cryptographic PRNG.
+
+(E) Validate the entire 16-field proto for "deprecated/unsupported" fields and emit warnings. REJECTED: silent-ignore is the SPEC-pinned discipline (per ADR-0041 + SPEC §2). Surface-noise warnings would require a logging contract that does not exist in 09; deferred to a future runtime/observability phase.
+
+### Consequences
+
+(a) The 6-vs-11 decomposition is grep-verifiable in `internal/filter/http/fault/fault.go` (the `runtimeConfig` struct + the `parseRuntimeConfig` body). Future readers tracing what fault honors vs. what it silent-ignores can locate the contract here.
+
+(b) Cross-references:
+   - ADR-0073 (typed_per_filter_config 3-tier merge model) — wholesale-override discipline empirically confirmed at SPEC §11.7 applies to fault's per-route resolution. A per-route HTTPFault that omits delay does NOT inherit listener-level delay; the per-route runtimeConfig is independently parsed via `parseRouteRuntimeConfig` (Task 7).
+   - ADR-0104 (header-driven fault path DEFERRED) — anchored by the 11-field silent-ignore set. The `delay.header_delay` + `abort.header_abort` pair is the load-bearing element of that ADR's deferral set.
+
+(c) The PGV [200, 600) range mirror is boot-time-fail-fast per ADR-0072: a misconfigured `abort.http_status` (e.g., 100 or 999) surfaces as a non-zero exit before the listener accepts traffic. Operators observe the failure at envoy-go startup, not at first faulted request.
+
+(d) The percentage-roll RNG seeding is per-instance — across a long-running envoy-go process the per-request rolls are NOT cryptographically random but ARE statistically uncorrelated for the differential-fixture scope (0% / 100% scenarios short-circuit before consulting RNG; the only RNG-consulting fixture cells would be intermediate percentages, which are out of 09's differential scope).
+
+(e) Future intermediate-percentage scenarios (e.g., a fault-statistics phase that exercises 25% / 50% / 75% rolls with a sampling window) will need a deterministic-seed override; that is deferred to the future phase. Task 3's decision is the per-instance seeded RNG; future phases supersede with an explicit seed knob if needed.
+
+---
+
+## ADR-0107: `BEHAVIOR_CONTRACT.md ## Stat-name mapping` 17→22-name extension for FIVE `fault.*` stats + `response_rl_injected` permanently-zero counter discipline (route A)
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (the stat-name set is differentially observable and the empirical pin against reference Envoy v1.37.2 is the durable evidence) + D-3.5 (record durable design rationale).
+**Lands-in-task:** Task 3 (phase 09); commit TBD. Stat registration code lands in Task 3; the BEHAVIOR_CONTRACT.md table extension lands in Task 15 alongside the rest of the §13 patches.
+
+### Context
+
+Per SPEC §11.6 + §13.2 the fault filter contributes FIVE stats to the BEHAVIOR_CONTRACT.md ## Stat-name mapping table. Pre-09 the table held 17 stat names (the trunk set: HCM-level + cluster-level + listener-level + admin-level counters/gauges). Phase 09 extends the table to 22 entries.
+
+Empirically pinned against reference Envoy v1.37.2 with the SPEC §7.4 fixture composition:
+
+**4 counters:**
+- `http.<stat_prefix>.fault.aborts_injected` — incremented when an abort fault fires (DecodeHeaders → SendLocalReply path).
+- `http.<stat_prefix>.fault.delays_injected` — incremented when a delay fault fires (DecodeHeaders → time.AfterFunc path).
+- `http.<stat_prefix>.fault.faults_overflow` — incremented when a fault is SKIPPED because `max_active_faults` cap is reached.
+- `http.<stat_prefix>.fault.response_rl_injected` — permanently zero in phase 09 (route A: emit for differential parity per SPEC §11.6 + §1.1 amendment).
+
+**1 gauge:**
+- `http.<stat_prefix>.fault.active_faults` — Inc/Dec around the active fault window (Inc when a delay or combined fault begins; Dec when the fault completes via timer-callback or OnDestroy).
+
+The flattening discipline (SN1–SN8 per ADR-0061) applies unchanged: the `http.<stat_prefix>.fault.<metric>` Envoy-stat-name flattens to the Prometheus-name `envoy_http_<stat_prefix>_fault_<metric>` per SN1 (dot → underscore) + SN2 (`envoy_` prefix). The 22-name extension is purely additive — no existing stat-name semantics change.
+
+`response_rl_injected` is a special case: upstream Envoy v1.37.2 emits this counter from a different filter (`envoy.filters.http.bandwidth_limit` or the downstream-rate-limit machinery inside fault's response-rate-limit code path). Phase 09 does NOT model `response_rate_limit` (it is in the 11-field silent-ignore set per ADR-0101); the counter would naturally be zero. The decision: emit the counter anyway with permanently-zero value (route A) rather than omit it (route B). Rationale:
+
+1. **Differential parity.** Reference Envoy emits the counter (with zero value if `response_rate_limit` is unconfigured); envoy-go's `/stats/prometheus` output must match the line-set for the differential-fixture allow-list to pass. Route A keeps the line present; route B would force the differential to allow-list-skip the line, which is heavier configuration than emitting a zero-valued counter.
+
+2. **Future-proofing.** When envoy-go gains response-rate-limit (a future small follow-up phase), the counter becomes hot without any framework change — only the increment site is added. Route A makes the counter's existence orthogonal to its semantics.
+
+3. **Zero-cost discipline.** A registered-but-never-incremented counter has the same memory cost as any other counter (~16 bytes); the runtime cost is zero (no Inc calls). Route A is essentially free.
+
+### Decision
+
+The fault package registers FIVE stats at HCM-build time on `ctx.Stats` (per ADR-0100's `FactoryCtx` extension). The stat names are keyed by `"http." + ctx.StatPrefix + ".fault." + <metric>`:
+
+```go
+return &faultStats{
+    abortsInjected:     reg.NewCounter(p + "aborts_injected"),
+    delaysInjected:     reg.NewCounter(p + "delays_injected"),
+    faultsOverflow:     reg.NewCounter(p + "faults_overflow"),
+    activeFaults:       reg.NewGauge(p + "active_faults"),
+    responseRLInjected: reg.NewCounter(p + "response_rl_injected"),
+}
+```
+
+The `responseRLInjected` counter is allocated but never incremented in phase 09 (route A). The SN1–SN8 flattening per ADR-0061 yields five `envoy_http_<stat_prefix>_fault_*` Prometheus names visible in `/stats/prometheus`.
+
+The BEHAVIOR_CONTRACT.md ## Stat-name mapping table extension is a 5-row purely-additive amendment at Task 15:
+
+| Envoy stat name | Prometheus name | Type | Notes |
+|---|---|---|---|
+| `http.<sp>.fault.aborts_injected` | `envoy_http_<sp>_fault_aborts_injected` | counter | aborts fired by fault |
+| `http.<sp>.fault.delays_injected` | `envoy_http_<sp>_fault_delays_injected` | counter | delays fired by fault |
+| `http.<sp>.fault.faults_overflow` | `envoy_http_<sp>_fault_faults_overflow` | counter | max_active_faults cap hits |
+| `http.<sp>.fault.active_faults` | `envoy_http_<sp>_fault_active_faults` | gauge | active fault window |
+| `http.<sp>.fault.response_rl_injected` | `envoy_http_<sp>_fault_response_rl_injected` | counter | route A: permanently zero in phase 09 |
+
+### Alternatives considered
+
+(A) **Route B: omit `response_rl_injected` from the stat set** — REJECTED. Reference Envoy emits the line; the differential-fixture allow-list would need a per-line skip directive. The per-line skip would itself need an ADR documenting WHY only that one line is skipped — the documentation cost exceeds the registration cost. Route A consolidates the decision: emit the counter with zero value, no allow-list skip needed.
+
+(B) **Register the counter conditionally** (only when `response_rate_limit` is configured). REJECTED: the runtimeConfig parser would need to peek at `c.GetResponseRateLimit() != nil` and gate the counter. The conditional logic adds a code path that future readers must trace; the unconditional registration is simpler.
+
+(C) **Register a single `fault.faults_total` counter** that combines aborts + delays + overflow + response_rl. REJECTED: upstream Envoy emits the four separate counters; combining them would diverge from the differential-fixture line-set.
+
+(D) **Use sub-registries** (`stats.Registry.NewSubRegistry("http.<sp>.fault")`) to organize the five stats. REJECTED per planner-time decision 5: sub-registries are out of scope for 06.1's `*stats.Registry`; the flat-name discipline (SN1–SN8 per ADR-0061) handles the prefix structurally.
+
+### Consequences
+
+(a) Cross-references:
+   - ADR-0061 (SN1–SN8 flattening rules unchanged) — the 22-name extension is purely additive; SN1 (dot → underscore) + SN2 (`envoy_` prefix) apply unchanged. ADR-0061's enumeration grows from 17 to 22 entries; no rule change.
+   - ADR-0100 (FactoryCtx framework extension) — the `Stats *stats.Registry` + `StatPrefix string` fields are the load-bearing inputs to fault's stat registration. The first-use of those fields lands at this ADR's registration code.
+
+(b) `response_rl_injected` is the load-bearing route-A counter; its permanently-zero status is grep-verifiable in `internal/filter/http/fault/fault.go` (the `responseRLInjected` field exists; no `Inc()` call references it). Future phases that wire response-rate-limit will add the Inc call without touching the registration site.
+
+(c) The 22-name table is the authoritative differential-fixture line-set for phase 09. The 0011-http-fault driver's StatsAsserter (Task 14) walks `/stats/prometheus` and asserts presence of all 22 names with the expected post-roll values; intermediate-percentage rolls are out of scope (per SPEC §7.4 fixture composition).
+
+(d) The BEHAVIOR_CONTRACT.md ## Stat-name mapping table is the canonical reference for operators reading envoy-go's metric output. Phase 15 (a hypothetical Observability-family phase) will reference this ADR when adding additional `fault.*` stats (e.g., `fault.delay_total_us` if response-rate-limit lands).
+
 
