@@ -35,6 +35,25 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 4 — `internal/cluster.Manager.Drain()` + `Cluster.closePool()` stub [ADR-0096 cluster anchor]
+
+**Commits:** 9289c13 — this task's substantive commit
+**Notes:** Added `closePool()` unexported method on `*Cluster` in `internal/cluster/cluster.go` as a forward-extensible stub (no-op-with-comment): `Cluster` carries no exported pool fields at this point in the codebase's evolution (phase 02 dials per-request without keep-alive pooling; phase 05.2 H2 `ClientConn` has no exported close hook today). Added `Drain()` exported method on `*Manager` in `internal/cluster/manager.go` that walks `m.clusters` and calls `c.closePool()` on each; best-effort, no error return, idempotent. Added three tests in `manager_test.go`: `TestManager_Drain_ClosesPools` (NewManager + two Drain calls; asserts no panic), `TestManager_Drain_Idempotent` (10× Drain calls; asserts no panic), `TestManager_Drain_EmptyClusterList` (struct-literal Manager with empty map; asserts no panic on empty). Tests follow the established `mkBootstrap` / `mkStaticCluster` / `mkLbEndpoint` inline-builder pattern from sibling tests (`TestManager_HappyPath_Single` et al.); no new helper invented. Appended ADR-0096 (consolidated in-flight-completion ADR: three-part discipline — HCM per-request Inc/Dec, TCP-proxy per-conn Inc/Dec, cluster.Manager.Drain after rendezvous) to `docs/envoy-go/DECISIONS.md`; Tasks 9 + 10 cite ADR-0096 in their commit messages without re-anchoring. Task 6 consolidated into this commit (PLAN documented Task 6 as a no-op placeholder slot). `cmd/envoy-go` broken-window persists (Task 11 fixes).
+**Outputs:**
+```
+$ go test -count=1 ./internal/cluster/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.010s
+$ go vet ./internal/cluster/...
+(no output — clean)
+$ golangci-lint run ./internal/cluster/...
+(no output — clean)
+$ grep -nE '^func \(m \*Manager\) Drain\(\)' internal/cluster/manager.go
+179:func (m *Manager) Drain() {
+$ go build ./cmd/envoy-go/... 2>&1 | head -3
+cmd/envoy-go/main.go:139:51: not enough arguments in call to admin.New
+(EXPECTED FAILURE — intentional broken-window; Task 11 fixes the call site)
+```
+
 ## Task 3 — `internal/admin.New` constructor widening — thread `*drain.Manager` (LBP-1 fifth application)
 
 **Commits:** 42256f0 — this task's substantive commit
