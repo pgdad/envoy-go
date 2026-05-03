@@ -170,8 +170,11 @@ func (m *Manager) Clusters() []ClusterInfo {
 // descriptors for cleanest shutdown but is not required for correctness
 // (Go's runtime will close TCP sockets on process exit regardless).
 //
-// Idempotent; safe under concurrent invocation (closePool is internally
-// idempotent per planner-time decision 6).
+// Idempotent; safe to call multiple times. The m.clusters map is populated
+// once at construction (NewManager) and never modified afterward, so
+// concurrent range here is safe. Per-cluster pool fields, when they exist
+// in future hot-restart-family expansions, must provide their own close-
+// idempotency (e.g., sync.Once) per planner-time decision 6.
 //
 // Phase 08.2 (Task 4) introduces this accessor; ADR-0096 records the
 // design (the consolidated in-flight-completion ADR; Tasks 9 + 10 cite
