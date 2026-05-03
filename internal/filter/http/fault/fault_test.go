@@ -3,6 +3,7 @@ package fault
 import (
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -183,7 +184,15 @@ func TestRuntimeConfig_FieldExtraction(t *testing.T) {
 // need a callback mock (Task-3 stub returns Continue without consulting f.dcb);
 // Task 4's abort-only path calls f.dcb.SendLocalReply, so this stub records
 // the (status, body, headers) triple for assertion.
+//
+// Task 5 introduces the timer-callback path: SendLocalReply may be invoked
+// from the time.AfterFunc-spawned goroutine while the test goroutine is
+// polling for completion. The (status, body, headers) triple is therefore
+// guarded by a sync.Mutex; tests read via the Status/Body/Headers accessors
+// rather than touching the unexported fields directly. ContinueDecoding's
+// counter is already an atomic.Int32 and is goroutine-safe without the mutex.
 type recordingDCB struct {
+	mu          sync.Mutex
 	sentStatus  int
 	sentBody    string
 	sentHeaders envoyhttp.OrderedHeaders
@@ -192,9 +201,26 @@ type recordingDCB struct {
 }
 
 func (r *recordingDCB) SendLocalReply(s int, b string, h envoyhttp.OrderedHeaders) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.sentStatus = s
 	r.sentBody = b
 	r.sentHeaders = h
+}
+func (r *recordingDCB) Status() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sentStatus
+}
+func (r *recordingDCB) Body() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sentBody
+}
+func (r *recordingDCB) Headers() envoyhttp.OrderedHeaders {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sentHeaders
 }
 func (r *recordingDCB) ContinueDecoding()                 { r.continued.Add(1) }
 func (r *recordingDCB) RequestRouteConfig() proto.Message { return r.routeCfg }
@@ -236,17 +262,17 @@ func TestDecodeHeaders_AbortOnly_100Percent(t *testing.T) {
 	if status != envoyhttp.StopIteration {
 		t.Errorf("status: got %v, want StopIteration", status)
 	}
-	if dcb.sentStatus != 503 {
-		t.Errorf("sentStatus: got %d, want 503", dcb.sentStatus)
+	if got := dcb.Status(); got != 503 {
+		t.Errorf("sentStatus: got %d, want 503", got)
 	}
-	if dcb.sentBody != "fault filter abort" {
-		t.Errorf("sentBody: got %q, want %q", dcb.sentBody, "fault filter abort")
+	if got := dcb.Body(); got != "fault filter abort" {
+		t.Errorf("sentBody: got %q, want %q", got, "fault filter abort")
 	}
-	if got, want := len(dcb.sentBody), 18; got != want {
+	if got, want := len(dcb.Body()), 18; got != want {
 		t.Errorf("body length: got %d, want %d (no trailing newline)", got, want)
 	}
-	if len(dcb.sentHeaders) != 1 || dcb.sentHeaders[0].Name != "Content-Type" || dcb.sentHeaders[0].Value != "text/plain" {
-		t.Errorf("sentHeaders: got %+v, want OrderedHeaders{Content-Type: text/plain}", dcb.sentHeaders)
+	if h := dcb.Headers(); len(h) != 1 || h[0].Name != "Content-Type" || h[0].Value != "text/plain" {
+		t.Errorf("sentHeaders: got %+v, want OrderedHeaders{Content-Type: text/plain}", h)
 	}
 }
 
@@ -259,8 +285,8 @@ func TestDecodeHeaders_AbortOnly_0Percent(t *testing.T) {
 	if status != envoyhttp.Continue {
 		t.Errorf("status: got %v, want Continue (0%% should not fire)", status)
 	}
-	if dcb.sentStatus != 0 {
-		t.Errorf("sentStatus: got %d, want 0 (no SendLocalReply at 0%%)", dcb.sentStatus)
+	if got := dcb.Status(); got != 0 {
+		t.Errorf("sentStatus: got %d, want 0 (no SendLocalReply at 0%%)", got)
 	}
 }
 
@@ -280,8 +306,8 @@ func TestDecodeHeaders_HeadersFieldExactMatch_CaseInsensitiveName(t *testing.T) 
 	if status != envoyhttp.StopIteration {
 		t.Errorf("status: got %v, want StopIteration (case-insensitive name match)", status)
 	}
-	if dcb.sentStatus != 503 {
-		t.Errorf("sentStatus: got %d, want 503", dcb.sentStatus)
+	if got := dcb.Status(); got != 503 {
+		t.Errorf("sentStatus: got %d, want 503", got)
 	}
 }
 
@@ -300,8 +326,8 @@ func TestDecodeHeaders_HeadersFieldExactMatch_CaseSensitiveValue(t *testing.T) {
 	if status != envoyhttp.Continue {
 		t.Errorf("status: got %v, want Continue (case-sensitive value mismatch)", status)
 	}
-	if dcb.sentStatus != 0 {
-		t.Errorf("sentStatus: got %d, want 0 (no fault on value mismatch)", dcb.sentStatus)
+	if got := dcb.Status(); got != 0 {
+		t.Errorf("sentStatus: got %d, want 0 (no fault on value mismatch)", got)
 	}
 }
 
@@ -318,8 +344,8 @@ func TestDecodeHeaders_NoFaultHeaderMismatch(t *testing.T) {
 	if status != envoyhttp.Continue {
 		t.Errorf("status: got %v, want Continue", status)
 	}
-	if dcb.sentStatus != 0 {
-		t.Errorf("sentStatus: got %d, want 0 (no fault when headers absent)", dcb.sentStatus)
+	if got := dcb.Status(); got != 0 {
+		t.Errorf("sentStatus: got %d, want 0 (no fault when headers absent)", got)
 	}
 }
 
@@ -351,5 +377,170 @@ func TestDecodeHeaders_AbortStatRecorded(t *testing.T) {
 	})
 	if got != 1 {
 		t.Errorf("aborts_injected: got %d, want 1", got)
+	}
+}
+
+// counterValue walks the Registry and returns the Load() of the counter named
+// `name`, or -1 if no counter by that name is registered. Mirrors the helper
+// at internal/filter/http/router/router_test.go:counterValue per the broader
+// project precedent for stat-counter assertions across the package boundary.
+// Used by Task-5 timer-callback Inc-from-timer-goroutine assertions.
+func counterValue(t *testing.T, r *stats.Registry, name string) int64 {
+	t.Helper()
+	got := int64(-1)
+	r.Walk(func(m stats.Metric) {
+		if m.Name() == name {
+			if c, ok := m.(*stats.Counter); ok {
+				got = int64(c.Load())
+			}
+		}
+	})
+	return got
+}
+
+// makeDelayFilter constructs a fault filter with delay-only or combined
+// delay+abort configuration. delayMs is the fixed-delay in ms. abortStatus=0
+// disables the abort side (delay-only path); non-zero enables the combined
+// path. The supplied registry is used so the caller can assert counter values
+// after the timer callback fires.
+func makeDelayFilter(t *testing.T, reg *stats.Registry, delayMs uint32, abortStatus uint32) (*filter, *recordingDCB) {
+	t.Helper()
+	f := &faultv3.HTTPFault{
+		Delay: &commonfaultv3.FaultDelay{
+			Percentage: &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+			FaultDelaySecifier: &commonfaultv3.FaultDelay_FixedDelay{
+				FixedDelay: durationpb.New(time.Duration(delayMs) * time.Millisecond),
+			},
+		},
+	}
+	if abortStatus != 0 {
+		f.Abort = &faultv3.FaultAbort{
+			Percentage: &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+			ErrorType:  &faultv3.FaultAbort_HttpStatus{HttpStatus: abortStatus},
+		}
+	}
+	factory, err := New(mustAny(t, f), envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "ingress_http"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	inst := factory()
+	fl := inst.Decoder.(*filter)
+	dcb := &recordingDCB{}
+	fl.SetDecoderCallbacks(dcb)
+	return fl, dcb
+}
+
+// waitForCondition polls fn at 2ms intervals until it returns true or the
+// deadline elapses. Returns true if fn became true within the deadline.
+// Used by the Task-5 timer-callback tests to avoid CPU spin while waiting on
+// the time.AfterFunc-driven async resume.
+func waitForCondition(deadline time.Duration, fn func() bool) bool {
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		if fn() {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return fn()
+}
+
+// TestDecodeHeaders_DelayOnly verifies the delay-only async-resume path per
+// SPEC §5.2 + §11.2 + ADR-0102: delay 100% 50ms → DecodeHeaders returns
+// StopIteration synchronously; a time.AfterFunc-scheduled callback fires
+// after ~50ms and calls cb.ContinueDecoding(); no SendLocalReply is invoked
+// (delay-only does NOT abort the request). Timing tolerance per §11.2
+// conclusion (c): elapsed ∈ [40ms, 200ms].
+func TestDecodeHeaders_DelayOnly(t *testing.T) {
+	fl, dcb := makeDelayFilter(t, stats.NewRegistry(), 50, 0)
+	start := time.Now()
+	status := fl.DecodeHeaders(http.Header{}, true)
+	if status != envoyhttp.StopIteration {
+		t.Errorf("status: got %v, want StopIteration (delay-only parks the chain)", status)
+	}
+	// Wait up to 500ms for the timer callback to fire ContinueDecoding.
+	if !waitForCondition(500*time.Millisecond, func() bool {
+		return dcb.continued.Load() > 0
+	}) {
+		t.Fatalf("ContinueDecoding never invoked within 500ms; continued=%d", dcb.continued.Load())
+	}
+	elapsed := time.Since(start)
+	if elapsed < 40*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Errorf("elapsed: got %v, want in [40ms, 200ms] per §11.2 conclusion (c)", elapsed)
+	}
+	if got := dcb.Status(); got != 0 {
+		t.Errorf("sentStatus: got %d, want 0 (delay-only must NOT call SendLocalReply)", got)
+	}
+}
+
+// TestDecodeHeaders_Combined verifies the combined delay+abort timer-callback
+// path per SPEC §5.4 + §11.3 + ADR-0102: delay 100% 50ms + abort 100% 503 →
+// DecodeHeaders returns StopIteration synchronously; the timer fires after
+// ~50ms and the callback invokes SendLocalReply (NOT ContinueDecoding) so the
+// upstream is never dialed. The wire response is the abort response shape
+// (sentStatus=503, sentBody="fault filter abort") arriving delay.fixed_delay
+// after the request.
+func TestDecodeHeaders_Combined(t *testing.T) {
+	fl, dcb := makeDelayFilter(t, stats.NewRegistry(), 50, 503)
+	start := time.Now()
+	status := fl.DecodeHeaders(http.Header{}, true)
+	if status != envoyhttp.StopIteration {
+		t.Errorf("status: got %v, want StopIteration (combined parks the chain at the timer)", status)
+	}
+	// Wait up to 500ms for the timer callback to invoke SendLocalReply.
+	if !waitForCondition(500*time.Millisecond, func() bool {
+		return dcb.Status() != 0
+	}) {
+		t.Fatalf("SendLocalReply never invoked within 500ms; sentStatus=%d", dcb.Status())
+	}
+	elapsed := time.Since(start)
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("elapsed: got %v, want >= 40ms per §11.2 conclusion (c) lower bound", elapsed)
+	}
+	if got := dcb.Status(); got != 503 {
+		t.Errorf("sentStatus: got %d, want 503", got)
+	}
+	if got := dcb.Body(); got != "fault filter abort" {
+		t.Errorf("sentBody: got %q, want %q", got, "fault filter abort")
+	}
+	if got := dcb.continued.Load(); got != 0 {
+		t.Errorf("continued: got %d, want 0 (combined must call SendLocalReply, not ContinueDecoding)", got)
+	}
+}
+
+// TestDecodeHeaders_DelayStatRecorded verifies the recordFaultEvent
+// (eventDelaysInjected) Inc dispatch on the delay path. After a 100% delay
+// fires, http.ingress_http.fault.delays_injected counter == 1. The Inc
+// happens BEFORE the timer is scheduled (on the dispatch goroutine), so this
+// assertion does not need to wait for the callback to fire.
+func TestDecodeHeaders_DelayStatRecorded(t *testing.T) {
+	reg := stats.NewRegistry()
+	fl, _ := makeDelayFilter(t, reg, 50, 0)
+	fl.DecodeHeaders(http.Header{}, true)
+	if got := counterValue(t, reg, "http.ingress_http.fault.delays_injected"); got != 1 {
+		t.Errorf("delays_injected: got %d, want 1", got)
+	}
+}
+
+// TestDecodeHeaders_CombinedStatsRecorded verifies stat-Inc ordering on the
+// combined path: delays_injected Inc happens synchronously on the dispatch
+// goroutine; aborts_injected Inc happens from the timer-callback goroutine
+// after the delay elapses. Both end at 1 after the timer fires.
+func TestDecodeHeaders_CombinedStatsRecorded(t *testing.T) {
+	reg := stats.NewRegistry()
+	fl, dcb := makeDelayFilter(t, reg, 50, 503)
+	fl.DecodeHeaders(http.Header{}, true)
+	// delays_injected fires synchronously before the timer is scheduled.
+	if got := counterValue(t, reg, "http.ingress_http.fault.delays_injected"); got != 1 {
+		t.Errorf("delays_injected (synchronous): got %d, want 1", got)
+	}
+	// Wait for the timer callback to fire SendLocalReply + aborts_injected Inc.
+	if !waitForCondition(500*time.Millisecond, func() bool {
+		return dcb.Status() != 0
+	}) {
+		t.Fatalf("SendLocalReply never invoked within 500ms")
+	}
+	if got := counterValue(t, reg, "http.ingress_http.fault.aborts_injected"); got != 1 {
+		t.Errorf("aborts_injected (post-timer): got %d, want 1", got)
 	}
 }

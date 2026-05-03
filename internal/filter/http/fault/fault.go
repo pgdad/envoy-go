@@ -210,7 +210,7 @@ type filter struct {
 	dcb envoyhttp.DecoderFilterCallbacks
 	ecb envoyhttp.EncoderFilterCallbacks
 
-	delayTimer   *time.Timer //nolint:unused // Task 5 (ADR-0102) async-resume timer; Task 3 lands the field.
+	delayTimer   *time.Timer // ADR-0102 async-resume timer; Task 5 wires; Task 6 cancels in OnDestroy.
 	markedActive bool        //nolint:unused // Task 6 (ADR-0105) markedActive guard; Task 3 lands the field.
 }
 
@@ -243,12 +243,35 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 	//   }
 	//   f.markActive()
 	if delayApplies && abortApplies {
-		// Combined path lands in Task 5.
-		return envoyhttp.Continue // placeholder; Task 5 replaces
+		// Combined: timer fires; callback calls SendLocalReply (NOT
+		// ContinueDecoding) per ADR-0102 — the upstream is never dialed; the
+		// abort response arrives delay.fixed_delay after the request.
+		// delays_injected Inc happens synchronously on the dispatch goroutine
+		// (before the timer is scheduled); aborts_injected Inc happens from the
+		// timer-callback goroutine. Per planner-time decision 12, the percentage
+		// rolls already consumed the RNG on the dispatch goroutine, so the
+		// callback never consults f.rng — RNG access stays single-goroutine.
+		f.recordFaultEvent(eventDelaysInjected)
+		f.delayTimer = time.AfterFunc(cfg.delayFixedDelay, func() {
+			f.recordFaultEvent(eventAbortsInjected)
+			f.dcb.SendLocalReply(cfg.abortHTTPStatus, faultAbortBody, envoyhttp.OrderedHeaders{
+				{Name: "Content-Type", Value: "text/plain"},
+			})
+			f.decrementActive() // Task 6 wires markedActive guard
+		})
+		return envoyhttp.StopIteration
 	}
 	if delayApplies {
-		// Delay-only path lands in Task 5.
-		return envoyhttp.Continue // placeholder; Task 5 replaces
+		// Delay-only: timer fires; callback calls ContinueDecoding per ADR-0102.
+		// The upstream is dialed AFTER delay.fixed_delay elapses; the chain
+		// parks at StopIteration per ADR-0071 + ADR-0075 until the callback
+		// re-enters via cb.ContinueDecoding from the timer goroutine.
+		f.recordFaultEvent(eventDelaysInjected)
+		f.delayTimer = time.AfterFunc(cfg.delayFixedDelay, func() {
+			f.dcb.ContinueDecoding()
+			f.decrementActive() // Task 6 wires markedActive guard
+		})
+		return envoyhttp.StopIteration
 	}
 	// Abort-only path (Task 4 scope).
 	f.recordFaultEvent(eventAbortsInjected)

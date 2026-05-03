@@ -4412,5 +4412,104 @@ The 0011-http-fault fixture (Tasks 11–14) configures abort.http_status=503 —
    - Task 6 inserts the `max_active_faults` cap-check between the percentage-roll-evaluation and the abort/delay dispatch; the placeholder comment in the Task-4 DecodeHeaders body marks the insertion point.
    - Task 7 replaces `cfg := f.cfg` with `cfg := f.routeConfigOrListener()` to land the per-route 3-tier merge; the rest of the abort-only path is unchanged.
 
+---
 
+## ADR-0102: `time.AfterFunc`-driven delay async-resume + combined delay+abort timer-callback decision (timer fires; callback calls `SendLocalReply`, NOT `ContinueDecoding`) + ±10ms timing tolerance per §11.2 conclusion (c)
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (the delay path's wire-observable timing fingerprint — `time_total ≈ delay ± 10ms` — is differentially observable against reference Envoy v1.37.2 and the durable timing pin) + D-3.5 (record durable design rationale; the timer-callback ordering — delay-then-abort, NOT abort-then-delay — is a load-bearing invariant of the combined path that determines whether the upstream is dialed and what response shape the wire sees).
+**Lands-in-task:** Task 5 (phase 09); commit TBD. Task 6 (phase 09) extends with cancel-on-OnDestroy + markedActive Inc-side wiring.
+
+### Context
+
+Per SPEC §5.2 + §5.4 + §11.2 + §11.3 the delay-injection path lands a configurable fixed delay on the request path BEFORE the upstream is dialed. The delay does not block the dispatch goroutine — `DecodeHeaders` returns synchronously with `StopIteration` so the chain machinery parks at the filter's index per ADR-0071's chain discipline, and a deferred mechanism re-enters via `cb.ContinueDecoding()` (delay-only path) or `cb.SendLocalReply(...)` (combined path) after the configured delay elapses.
+
+Three load-bearing pieces of the async-resume mechanics:
+
+1. **Timer mechanism: `time.AfterFunc`.** Go's `time.AfterFunc(d, fn)` schedules `fn` to run on its own goroutine after duration `d`; it returns a `*time.Timer` that can be canceled via `Timer.Stop()`. The callback runs on a runtime-managed goroutine, NOT on the dispatch goroutine — this is precisely what async-resume needs: `DecodeHeaders` returns immediately, the dispatch goroutine is freed, and the callback re-enters via the supplied `cb` (which is goroutine-safe by the `DecoderFilterCallbacks` contract per ADR-0071's amendment for cross-goroutine entry — the chain's `SendLocalReply` and `ContinueDecoding` are dispatched through the chain's per-stream synchronization). Alternative: `time.NewTimer(d) + go-routine-with-select` (manual goroutine + drain loop) — REJECTED in (A) below.
+
+2. **Combined delay+abort ordering: timer fires, callback calls `SendLocalReply` (NOT `ContinueDecoding`).** When BOTH the delay percentage AND the abort percentage roll hit on the dispatch goroutine, the combined path schedules a single timer at `delay.fixed_delay`; the timer's callback then calls `cb.SendLocalReply(abortHTTPStatus, faultAbortBody, headers)` from the timer goroutine. The upstream is NEVER dialed. The empirical pin per §11.3 (5 samples at 100ms delay + 503 abort: total 101.1–102.1ms) confirms reference Envoy v1.37.2 emits the abort response delay+~1.5ms after the request — this matches the "timer-callback calls SendLocalReply" ordering, NOT a "delay-then-ContinueDecoding-then-router-aborts" two-phase ordering. The callback must NOT call `ContinueDecoding` because that would dial the upstream and produce a backend response, divergent from the differential pin.
+
+3. **±10ms timing tolerance per §11.2 conclusion (c).** The differential-fixture (Task 14) asserts `time_total ∈ [delay - 10ms, delay + 10ms]` for delay scenarios. The 10ms tolerance accommodates: (i) Go runtime scheduler jitter on the timer goroutine (typically <1ms but bursty under load); (ii) syscall + connection-accept overhead between the curl probe and envoy-go's listener; (iii) reference Envoy's own +1.5ms post-delay overhead on the abort path. A tighter tolerance (±2ms) would cause spurious differential-fixture failures on busy CI hosts; a looser tolerance (±50ms) would mask real timing regressions. Empirical testing across the 50/100/200/500ms sweep validates ±10ms as the operating point.
+
+A fourth piece — RNG goroutine-safety — falls out of (1) + the planner-time decision 12 short-circuits documented in `rollPercent`. The percentage rolls (`f.rng.Float64()`) consult the per-instance `*rand.Rand` ON THE DISPATCH GOROUTINE before the timer is scheduled; the timer callback never touches `f.rng`. This preserves the single-goroutine-RNG-access invariant without per-instance mutex overhead — `*rand.Rand` is NOT goroutine-safe, but it is touched by exactly one goroutine per filter instance.
+
+### Decision
+
+The fault filter's delay-only DecodeHeaders path emits exactly:
+
+```go
+f.recordFaultEvent(eventDelaysInjected)
+f.delayTimer = time.AfterFunc(cfg.delayFixedDelay, func() {
+    f.dcb.ContinueDecoding()
+    f.decrementActive() // Task 6 wires markedActive guard
+})
+return envoyhttp.StopIteration
+```
+
+The combined delay+abort path emits exactly:
+
+```go
+f.recordFaultEvent(eventDelaysInjected)
+f.delayTimer = time.AfterFunc(cfg.delayFixedDelay, func() {
+    f.recordFaultEvent(eventAbortsInjected)
+    f.dcb.SendLocalReply(cfg.abortHTTPStatus, faultAbortBody, envoyhttp.OrderedHeaders{
+        {Name: "Content-Type", Value: "text/plain"},
+    })
+    f.decrementActive() // Task 6 wires markedActive guard
+})
+return envoyhttp.StopIteration
+```
+
+where:
+
+- `cfg.delayFixedDelay` is the parsed `time.Duration` from `delay.fixed_delay` per ADR-0101.
+- `f.delayTimer` is the `*time.Timer` field on `*filter`; Task 6's OnDestroy will call `f.delayTimer.Stop()` to cancel a pending callback when the stream closes before the delay elapses (cancel-on-OnDestroy mechanics).
+- `f.recordFaultEvent(eventDelaysInjected)` fires SYNCHRONOUSLY on the dispatch goroutine (before the timer is scheduled); `f.recordFaultEvent(eventAbortsInjected)` (combined path only) fires from the TIMER GOROUTINE inside the callback. Both Inc calls go through `recordFaultEvent` which is goroutine-safe by virtue of `*stats.Counter`'s atomic Inc (per ADR-0061's Counter contract); the per-counter nil-guards inherited from Task 4 cover the cross-goroutine entry without additional synchronization.
+- The return value is `envoyhttp.StopIteration` for both paths; the chain parks at the filter's index per ADR-0071 + ADR-0075 until the callback re-enters.
+- The `OrderedHeaders` carrier in the combined path is identical to the abort-only path's per ADR-0103; the chain's `SendLocalReply`-from-timer-goroutine entry is handled by `chain.beginLocalReply`'s `sync.Once` first-call-wins guard per ADR-0103 cross-reference.
+
+The ±10ms timing tolerance is a property of the differential-fixture's assertion shape (Task 14's expectations.yaml `time_total: ∈ [delay - 10ms, delay + 10ms]`), not a property of the fault filter's source code — `time.AfterFunc(d, fn)` runs `fn` "after at least duration d" per Go's runtime scheduler; the upper bound is host-dependent. The fixture's 10ms tolerance is the operating point.
+
+### Alternatives considered
+
+(A) **`time.NewTimer(d) + select` loop on a manually-spawned goroutine** instead of `time.AfterFunc`. REJECTED: equivalent runtime behavior but verbose — `time.AfterFunc` is the idiomatic Go API for "run f after d elapses" and avoids the boilerplate `go func() { <-t.C; fn() }()` + extra `t.Stop()`-vs-`<-t.C`-drain dance. The `time.AfterFunc`-returned `*time.Timer` exposes `Stop()` directly with the standard "returns true if the call stops the timer; false if it has already fired or been stopped" semantics — Task 6's OnDestroy uses this directly.
+
+(B) **Synchronously sleep on the dispatch goroutine** (`time.Sleep(cfg.delayFixedDelay)` then continue). REJECTED: blocks the dispatch goroutine for the full delay duration. Per ADR-0071's single-goroutine-per-stream invariant, the dispatch goroutine handles ALL stream activity for the request — blocking it would freeze the stream's I/O AND prevent the framework from servicing OnDestroy or any subsequent decode events on the same connection. The whole purpose of the StopIteration + async-resume pattern is to free the dispatch goroutine while the timer ticks.
+
+(C) **Combined path: timer fires, callback calls `ContinueDecoding`, the router or a downstream filter then synthesizes the abort.** REJECTED: this would require either (i) a stateful "post-delay-abort-pending" flag in fault that an EncodeHeaders-side check would consult OR (ii) a side-channel signaling mechanism through stream context. Both add code complexity for no observable benefit; the timer-callback can call `SendLocalReply` directly with the same `OrderedHeaders` carrier as the abort-only path. The empirical §11.3 pin (delay-then-abort response shape, no upstream dial) is consistent with the simpler "timer-callback calls SendLocalReply" ordering.
+
+(D) **Combined path: emit BOTH ContinueDecoding AND SendLocalReply from the timer callback** (defensively, in case the chain machinery routes differently). REJECTED: the chain's `SendLocalReply` machinery is `sync.Once`-guarded per ADR-0075's amendment; calling both would be benign but misleading. The cleaner ordering — call exactly one of the two re-entry methods per timer callback — matches the SPEC §5.4 narrative and the §11.3 empirical pin.
+
+(E) **Tighter timing tolerance (±2ms or ±5ms)** for the differential-fixture. REJECTED: empirical sweep across 50/100/200/500ms delays showed CI hosts under load occasionally exceed +5ms drift; the ±10ms operating point reliably distinguishes "timer fired correctly" from "timer skipped or fired in the wrong order" without false positives. The tighter tolerances would inject flake without improving the differential-pin signal.
+
+(F) **Looser timing tolerance (±50ms or ±100ms)** to accommodate slower CI. REJECTED: would mask real timing regressions — a 50ms delay configured but firing in 0ms (no-op) or 100ms+ (wrong delay value) would slip through. The ±10ms tolerance keeps the differential-pin meaningful.
+
+(G) **Delay path: stash `delay` on a per-stream `context.Context` deadline + signal completion via `<-ctx.Done()`** instead of `time.AfterFunc`. REJECTED: the framework's per-stream context is owned by the chain machinery, not by individual filters; injecting a deadline into it would couple fault to chain internals AND require a second goroutine to react to the context. `time.AfterFunc` is goroutine-cheap (Go's runtime pools timer-callback goroutines) and self-contained — no chain-internals coupling needed.
+
+### Consequences
+
+(a) The `*time.Timer` carried on the filter struct (`f.delayTimer`) is allocated lazily — it is `nil` for streams that don't fire the delay path (no-fault requests, abort-only fires, percentage-rolled-out). Task 6's OnDestroy nil-checks before calling `Stop()`. The per-stream allocation cost is one timer struct (~96 bytes on amd64) when the delay path fires — negligible.
+
+(b) RNG goroutine-safety is grep-verifiable: `f.rng.Float64()` appears exactly once in `internal/filter/http/fault/fault.go` inside `rollPercent`, which is called from `DecodeHeaders` BEFORE `time.AfterFunc` is invoked. The timer callback closures never reference `f.rng`. The `*rand.Rand` per-instance (allocated in `New`'s factory closure) is touched by exactly one goroutine — the dispatch goroutine for that stream — preserving the non-goroutine-safe `*rand.Rand` invariant without mutex overhead.
+
+(c) The combined path's "timer fires, callback calls SendLocalReply" ordering is grep-verifiable: the timer-callback closure for the combined path calls `f.dcb.SendLocalReply` and does NOT call `f.dcb.ContinueDecoding`; `TestDecodeHeaders_Combined` asserts `dcb.continued.Load() == 0` after the timer fires. The reverse ordering ("ContinueDecoding then SendLocalReply") would fail this assertion AND dial the upstream — divergent from the §11.3 differential pin.
+
+(d) The ±10ms timing tolerance is asserted in two places: (i) `TestDecodeHeaders_DelayOnly` checks `elapsed ∈ [40ms, 200ms]` for a 50ms-configured delay — the lower bound (40ms) accommodates `time.Sleep`-based test polling jitter; the upper bound (200ms) accommodates GC pauses + scheduler stalls on busy CI; the test's tolerance is wider than the differential-fixture's because the test runs under `go test -race -short` with race-instrumentation overhead. (ii) The differential-fixture's expectations.yaml (Task 14) asserts `time_total ∈ [delay - 10ms, delay + 10ms]` for the on-the-wire delay scenario; this is the operationally-meaningful tolerance per BEHAVIOR_CONTRACT.md `## HTTP filter chain ### Asserted equivalence`'s timing-fingerprint clause. The two tolerances serve different purposes (test correctness vs. wire-observable equivalence) and do not need to agree.
+
+(e) Cancel-on-OnDestroy mechanics anchor at Task 6 — the OnDestroy stub at Task 3 / Task 4 is a no-op; Task 6 fills in `if f.delayTimer != nil { f.delayTimer.Stop() }` + the markedActive Dec via `decrementActive()`. The `f.decrementActive()` call inside the timer callback is a Task-6 forward reference; at Task 5's commit point `decrementActive()` is the no-op stub from Task 4 (the `f.markedActive` field is always false because Task 6 hasn't wired the Inc side yet). The Task-5 timer-callback compiles and runs against the stub; Task 6 lights up the Inc side without changing Task 5's call sites.
+
+(f) Cross-references:
+   - ADR-0071 (single-goroutine-per-stream invariant + chain discipline) — anchored. The dispatch goroutine returns immediately at `StopIteration`; the timer goroutine re-enters via the chain's `cb.ContinueDecoding` / `cb.SendLocalReply` paths — both of which dispatch through the chain's per-stream synchronization per ADR-0071's amendment for cross-goroutine callback entry.
+   - ADR-0075 (`SendLocalReply` enters encode chain at `filter[len-1]`; `OrderedHeaders` carrier; `sync.Once` first-call-wins guard) — anchored. The combined path's `SendLocalReply`-from-timer-goroutine entry is handled by the same first-call-wins guard as the abort-only synchronous path — no per-filter special-case in the chain machinery.
+   - ADR-0103 (abort terminal-replace mechanics + body byte-exact + 4-header set) — anchored. The combined path's timer callback reuses the same `OrderedHeaders{Content-Type: text/plain}` carrier shape as the synchronous abort path; the wire response is byte-equivalent to the abort-only path, just delayed by `delay.fixed_delay`.
+   - ADR-0105 (max_active_faults atomic counter + markedActive idempotency) — Task-6 forward reference. The `decrementActive()` call inside both timer callbacks is the timer-callback Dec site for the markedActive lifecycle; Task 6 wires the Inc side at the cap-check + the markedActive bool gate.
+   - ADR-0107 (5-stat extension) — anchored at `recordFaultEvent(eventDelaysInjected)` (synchronous; dispatch goroutine) + `recordFaultEvent(eventAbortsInjected)` (combined path; timer goroutine). Both Inc calls go through `recordFaultEvent` per planner-time decision 3.
+   - SPEC §5.2 (delay-injection flow) + §5.4 (combined delay+abort ordering) + §6.4 (DecodeHeaders body) + §6.5 (timer + OnDestroy interplay; deferred to Task 6's anchor) + §11.2 (delay timing fingerprint + ±10ms tolerance conclusion (c)) + §11.3 (combined-path empirical pin: delay+~1.5ms total) + §14.1 (ROADMAP row 09 timing-tolerance commitment) — anchored.
+
+(g) Tasks 6/7/14 build on this task's foundation:
+   - Task 6 wires OnDestroy's `f.delayTimer.Stop()` + the `markedActive` Inc/Dec balance via the cap-check insertion point. The Task-5 timer-callback's `f.decrementActive()` call site lights up at Task 6.
+   - Task 7's per-route 3-tier merge is orthogonal to the timer mechanics; the timer reads `cfg.delayFixedDelay` from the resolved-route config, not from `f.cfg` directly (Task 7 swaps `cfg := f.cfg` for `cfg := f.routeConfigOrListener()` upstream of the timer scheduling — the timer captures the local `cfg` by closure).
+   - Task 14's differential-fixture `time_total ∈ [delay - 10ms, delay + 10ms]` assertion is the operationally-load-bearing pin; this ADR records the tolerance contract that the fixture consumes.
 
