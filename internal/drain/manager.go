@@ -94,6 +94,12 @@ func (m *Manager) Done() <-chan struct{} {
 
 // Inc atomically increments the inflight counter. Called by HCM at request-
 // begin and by TCP-proxy at conn-begin. Lock-free.
+//
+// Callers must check IsDraining() == false before calling Inc(); a late Inc
+// arriving after the drain rendezvous has fired (Done() closed) will not
+// reopen Done(), and the matching Dec will silently no-op the close-guard.
+// The Listener Accept-loop fast-path (Task 5) and the HCM/TCP-proxy filter
+// hooks (Tasks 9, 10) check IsDraining() before invoking Inc().
 func (m *Manager) Inc() {
 	m.inflight.Add(1)
 }
