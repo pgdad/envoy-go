@@ -4327,7 +4327,7 @@ The BEHAVIOR_CONTRACT.md ## Stat-name mapping table extension is a 5-row purely-
 **Status:** Accepted
 **Date:** 2026-05-03
 **Doctrine:** D-3.3 (the abort response shape is differentially observable on the wire and its empirical pin against reference Envoy v1.37.2 is the durable evidence) + D-3.5 (record durable design rationale; the 4-header set + 18-byte body + OrderedHeaders carrier shape are load-bearing wire-protocol invariants).
-**Lands-in-task:** Task 4 (phase 09); commit TBD.
+**Lands-in-task:** Task 4 (phase 09); commit afea8ec.
 
 ### Context
 
