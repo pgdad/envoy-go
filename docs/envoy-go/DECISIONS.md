@@ -4419,7 +4419,7 @@ The 0011-http-fault fixture (Tasks 11–14) configures abort.http_status=503 —
 **Status:** Accepted
 **Date:** 2026-05-03
 **Doctrine:** D-3.3 (the delay path's wire-observable timing fingerprint — `time_total ≈ delay ± 10ms` — is differentially observable against reference Envoy v1.37.2 and the durable timing pin) + D-3.5 (record durable design rationale; the timer-callback ordering — delay-then-abort, NOT abort-then-delay — is a load-bearing invariant of the combined path that determines whether the upstream is dialed and what response shape the wire sees).
-**Lands-in-task:** Task 5 (phase 09); commit TBD. Task 6 (phase 09) extends with cancel-on-OnDestroy + markedActive Inc-side wiring.
+**Lands-in-task:** Task 5 (phase 09); commit 2ec1507. Task 6 (phase 09) extends with cancel-on-OnDestroy + markedActive Inc-side wiring.
 
 ### Context
 
