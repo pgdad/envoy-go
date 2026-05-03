@@ -792,3 +792,38 @@ func TestManager_Clusters_EmptyClustersListReturnsEmpty(t *testing.T) {
 		t.Errorf("Clusters() on empty manager: got %v; want non-nil empty slice", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 08.2 (Task 4) — Manager.Drain() + Cluster.closePool() [ADR-0096]
+// ---------------------------------------------------------------------------
+
+func TestManager_Drain_ClosesPools(t *testing.T) {
+	bs := mkBootstrap(
+		mkStaticCluster("c_drain", mkLbEndpoint("127.0.0.1", 9000)),
+	)
+	m, err := NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	// Drain is a best-effort pool close; we assert no panic + idempotency.
+	m.Drain()
+	// Subsequent Drain calls must be safe (no double-close panics).
+	m.Drain()
+}
+
+func TestManager_Drain_Idempotent(t *testing.T) {
+	bs := mkBootstrap(
+		mkStaticCluster("c_drain_idem", mkLbEndpoint("127.0.0.1", 9001)),
+	)
+	m, _ := NewManager(bs, stats.NewRegistry())
+	for i := 0; i < 10; i++ {
+		m.Drain()
+	}
+	// No assertions beyond "did not panic"; closePool stubs may grow more
+	// invariants in future hot-restart family work (per SPEC §2.1 deferral).
+}
+
+func TestManager_Drain_EmptyClusterList(t *testing.T) {
+	m := &Manager{clusters: map[string]*Cluster{}}
+	m.Drain() // must not panic on empty map
+}

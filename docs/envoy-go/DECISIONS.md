@@ -3659,3 +3659,56 @@ The Manager is the LBP-1 fifth application. Threading wiring (Tasks 3, 5, 9, 10,
 
 (e) ADR-0085's consequence (d) anticipated that phase 08.2 "may add a single `drainState atomic.Pointer[DrainState]` field on `Server` (or equivalent) without changing `New`'s signature." Task 2's `*drain.Manager` design supersedes that anticipation: rather than an inline atomic field on `admin.Server`, the drain state lives in a dedicated package-level Manager that is constructor-threaded into `admin.Server` (Task 3). The `admin.New` signature DOES widen by one parameter (`drainMgr *drain.Manager`), contrary to ADR-0085's consequence (d) prediction. The divergence is intentional and superior: LBP-1 threading into `admin.New` is consistent with the four prior applications; an inline atomic on `Server` would have duplicated the inflight-counter machinery that HCM and TCP-proxy also need.
 
+## ADR-0096: In-flight-completion HCM/TCP-proxy hooks + cluster.Manager.Drain consolidated — three-part drain discipline; cluster pool-close anchor
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (defensive-correctness > optimistic-performance), D-3.5 (decisions written down).
+**Lands-in-task:** Task 4 (anchor: `internal/cluster.Manager.Drain()` + `Cluster.closePool()` stub); Tasks 9, 10 realize the HCM/TCP-proxy in-flight-completion components.
+
+### Context
+
+SPEC §6.6 + §6.7 + §11.3 + BRAINSTORM Decisions 7 + 8 consolidated. Phase 08.2 introduces a three-state drain machine (ADR-0091) with a rendezvous channel (`drainMgr.Done()`) that fires once inflight reaches 0 after Drain has been called. Two filter families must participate in the inflight counter to make the rendezvous meaningful:
+
+1. **HCM filter (Task 9):** Each HTTP request that passes the filter chain contributes one Inc at request-begin and one Dec at request-end. For HTTP/1.1 keep-alive connections, multiple requests on the same connection each independently Inc/Dec (per-request granularity, NOT per-connection). This is the correct granularity because each request is independently schedulable: a slow backend response keeps one inflight unit pinned; the next pipelined request on the same conn is a separate unit.
+
+2. **TCP-proxy filter (Task 10):** Each proxied TCP connection contributes one Inc at connection-begin (top of `Handle`, after `ctx.Err()` check, before `Dial`) and one Dec via `defer` immediately after Inc (per-connection granularity). This is correct for TCP-proxy because there is no per-request signal: the connection IS the unit of work.
+
+3. **cluster.Manager.Drain (this task):** After `<-drainMgr.Done()` fires (no in-flight downstream requests remain, therefore no in-flight upstream requests can remain), `cm.Drain()` closes upstream connection pools. This is best-effort: Go's runtime will close sockets on process exit regardless; the explicit close allows cleanest release of socket file descriptors before the deferred-stop chain runs.
+
+SPEC §11.3 empirical evidence establishes that envoy-go does NOT mark in-flight H1.1 keep-alive responses with `Connection: close` — matching upstream Envoy behavior. Subsequent requests on the same conn during the DRAINING window each contribute additional Inc/Dec pairs, extending the drain window. This is the deliberate MVP simplification: per-conn drainable-close-at-next-idle-window (where Envoy would close the connection after the response completes during DRAINING) is deferred per SPEC §2.1.
+
+A `markedInflight bool` sentinel field on the per-request HCM stream struct ensures Inc/Dec pair-balance under the `sendLocalReply` early-exit path per ADR-0075. Without the sentinel, a request that hits `sendLocalReply` (e.g., 502 Bad Gateway from upstream dial failure) could Dec without a prior Inc (if the early-exit fires before the request-begin Inc), or could double-Dec (if the early-exit fires in a code path that also calls the normal request-end Dec).
+
+`closePool()` lands as a stub today because `internal/cluster.Cluster` carries no exported connection-pool field at this point in the codebase's evolution (phase 02 dials per-request without keep-alive pooling; phase 05.2 H2 `ClientConn` instances have no exported close hook today). The stub is a forward-extensible hook: the future operator-affordances phase adds a pool field, and `closePool` grows to drain it without changing `Manager.Drain()`'s API. Per planner-time decision 6.
+
+### Decision
+
+Three-part discipline:
+
+1. **HCM (Task 9):** inflight `Inc` at request-begin (per stream — multiple keep-alive requests on one H1.1 conn each Inc/Dec independently); `Dec` at request-end (post-access-log per phase 06.2). A `markedInflight bool` sentinel field on the per-request struct ensures pair-balance under `sendLocalReply` per ADR-0075. When `IsDraining()` is true, the HCM does NOT inject `Connection: close` — Envoy parity per SPEC §11.3 empirical evidence; the drain window extends naturally via further Inc/Dec pairs on the existing keep-alive connection.
+
+2. **TCP-proxy (Task 10):** inflight `Inc` at conn-begin (`Handle` top, after `ctx.Err()` check, before `Dial`); `Dec` via `defer` immediately after `Inc` (per-connection granularity). The deferred Dec fires when `Handle` returns — after both `io.Copy` directions complete and the connection is torn down.
+
+3. **cluster.Manager.Drain (this task):** best-effort upstream-pool close after the rendezvous fires. `Manager.Drain()` walks `m.clusters` and calls `c.closePool()` on each. `closePool()` is a no-op stub today; future expansion grows the per-cluster pool-close logic without changing the `Drain()` API.
+
+### Alternatives considered
+
+(A) Per-connection Inc/Dec in HCM (not per-request). Rejected: HTTP/1.1 keep-alive connections carry multiple independent requests; Inc/Dec at connection granularity would cause the drain window to undercount in-flight work (a slow request on a keep-alive conn holds inflight=1, but the next pipelined request would not bump inflight=2; the rendezvous could fire while requests are still in-flight on the connection). Per-request granularity is strictly correct.
+
+(B) Inject `Connection: close` on every response during DRAINING (to prevent keep-alive from extending the drain window). Rejected per SPEC §11.3 empirical pin: upstream Envoy v1.37.2 does NOT do this for the `/drain_listeners`-triggered DRAINING path; envoy-go matches Envoy behavior as the MVP default. Per-conn drainable-close-at-next-idle-window is deferred per SPEC §2.1.
+
+(C) Implement pool-close immediately (even with no pool fields today) by intercepting `connWithGauge.Close` calls to track open connections. Rejected: `connWithGauge` already Decs `upstream_cx_active` gauge on Close; adding drain tracking would conflate two concerns; the architectural close-after-rendezvous pattern means no upstream requests are in-flight when `cm.Drain()` runs anyway — there are no open connections to close that aren't already being closed by the request/connection teardown.
+
+(D) Omit `cluster.Manager.Drain()` entirely (process exit closes sockets). Rejected: explicit pool-close is the cleanest signal for future hot-restart family work (where the parent process must NOT hold onto upstream FDs that the child process is about to own); the `Drain()` API provides the correct architectural hook even if today's implementation is a no-op stub.
+
+### Consequences
+
+(a) Per SPEC §11.3 empirical evidence, envoy-go does NOT mark in-flight H1.1 keep-alive responses with `Connection: close` — Envoy parity. Subsequent requests on the same conn during DRAINING extend the drain window via further Inc calls (deliberate MVP simplification; per-conn drainable-close-at-next-idle-window deferred per SPEC §2.1).
+
+(b) The `closePool()` stub today is a forward-extensible hook; future hot-restart/operator-affordances family expansion grows the per-cluster pool-close logic without changing the `Drain()` API.
+
+(c) Race-detector-clean under `TestAdminConcurrentScrapeRace` (Task 12) extended with a Drain-mid-test goroutine.
+
+(d) Tasks 9 and 10 cite ADR-0096 in their commit messages ("per ADR-0096") without re-anchoring; this ADR entry is the single authoritative record of the consolidated three-part discipline.
+

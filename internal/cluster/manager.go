@@ -160,6 +160,28 @@ func (m *Manager) Clusters() []ClusterInfo {
 	return out
 }
 
+// Drain closes upstream connection pools across all configured clusters.
+// Best-effort — returns no error. Walks m.clusters map and calls
+// c.closePool() on each cluster.
+//
+// Called from cmd/envoy-go/main.go AFTER <-drainMgr.Done() fires (i.e.,
+// after no in-flight downstream requests remain — therefore no in-flight
+// upstream requests can remain). The pool close releases socket file
+// descriptors for cleanest shutdown but is not required for correctness
+// (Go's runtime will close TCP sockets on process exit regardless).
+//
+// Idempotent; safe under concurrent invocation (closePool is internally
+// idempotent per planner-time decision 6).
+//
+// Phase 08.2 (Task 4) introduces this accessor; ADR-0096 records the
+// design (the consolidated in-flight-completion ADR; Tasks 9 + 10 cite
+// ADR-0096 without re-anchoring).
+func (m *Manager) Drain() {
+	for _, c := range m.clusters {
+		c.closePool()
+	}
+}
+
 func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, error) {
 	name := c.GetName()
 	if name == "" {

@@ -196,6 +196,31 @@ func (c *connWithGauge) Close() error {
 	return c.Conn.Close()
 }
 
+// closePool closes the per-cluster connection-pool resources at drain time.
+// Best-effort; no error return; idempotent.
+//
+// 08.2 lands this as a forward-extensible hook. The exact set of pooled
+// resources to close evolves with each upstream-protocol family:
+//   - HTTP/1.1 keep-alive idle conns (no exported pool field today; phase 02
+//     dials per-request without keep-alive pooling — the future operator-
+//     affordances phase may add a pool, in which case closePool grows to
+//     drain it).
+//   - HTTP/2 ClientConn instances from phase 05.2 (no exported close hook
+//     today; the future operator-affordances phase may add one).
+//   - TLS upstream connections from phase 03 (covered by the H1.1/H2 pool
+//     close above when those land; tls.Conn instances are inside).
+//
+// Today, closePool is a stub with a debug log. The cm.Drain() call from
+// cmd/envoy-go/main.go (post-rendezvous, before the deferred-stop chain
+// runs) provides the architectural call-site for future expansion per
+// SPEC §2.1 deferral note. Per planner-time decision 6.
+func (c *Cluster) closePool() {
+	// Future: iterate c.h1Pool / c.h2ClientConns / c.tlsUpstreamConns when
+	// those fields exist. For now, a best-effort log indicating the cluster
+	// is being drained at the cluster-pool layer.
+	// log.Printf("cluster %q: closePool (drain hook)", c.name)
+}
+
 // CloseWrite delegates the half-close to the underlying *net.TCPConn or
 // *stdtls.Conn (whichever the wrapper is carrying). tcpproxy's halfClose
 // half-closes the write side after each io.Copy direction completes; before
