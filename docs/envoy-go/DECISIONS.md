@@ -3592,6 +3592,8 @@ envoy-go's admin port carries the following security posture for phase 08.1 (and
 
 (g) A future security-review session (per `superpowers:requesting-code-review` / `security-review` skill) may identify hardenings within the no-ACL posture (e.g. response-body redaction of cluster names that resemble secrets, `/config_dump` field-masking of TLS-context private-key references). Such hardenings extend ADR-0090's posture without superseding it; the no-ACL principle stays intact while specific data-exposure surfaces tighten.
 
+**Phase 08.2 amendment (per ADR-0093):** the no-method-discrimination posture is qualified to **read-only endpoints only**. The mutating `POST /drain_listeners` endpoint (08.2's first mutating endpoint) DOES enforce method discrimination per SPEC §11.4 empirical pin (Envoy parity). Non-POST methods (GET, PUT, DELETE, HEAD) return 405 Method Not Allowed with the templated body `Method <METHOD> not allowed, POST required.\n`. The no-ACL posture is preserved verbatim — operator firewall remains the security boundary.
+
 ---
 
 ## ADR-0091: Drain state-machine shape — new `internal/drain/` package + `Manager` type + LBP-1 fifth application; lock-free hot path; caller-enforced timeout; DRAINED state observable only via channel close
@@ -3756,4 +3758,60 @@ The `dm *drain.Manager` field is propagated field-locally onto each `listenerRun
 (c) The fast-path is field-local (`rt.dm`) rather than chasing back through `*Manager` — minimizes the hot-path indirection per D-3.3.
 
 (d) `cmd/envoy-go` remains broken until Task 11 wires the updated constructor (expected broken-window per LBP-1). `internal/filter/hcm/...` and `internal/filter/tcpproxy/...` are unaffected — their constructor signatures widen at Tasks 9/10.
+
+---
+
+## ADR-0093: POST /drain_listeners handler + method discrimination — first mutating admin endpoint; 405 on non-POST; fire-and-forget Drain(); ADR-0090 no-method-discrimination qualified to read-only endpoints
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (lock-free hot path), D-3.5 (decisions written down), D-3.7 (Envoy parity governs).
+**Lands-in-task:** 08.2 PLAN Task 7 (`internal/admin/drain.go` POST handler + 405 method discrimination).
+
+### Context
+
+SPEC §6.3 + §11.1 + §11.4 + BRAINSTORM Decision 3. Two empirical pins settle the contract:
+
+1. **§11.1** — POST `/drain_listeners` returns 200 OK with body `OK\n` (3 bytes: capital `OK` followed by single newline) + the standard six-header set per §11.6.
+2. **§11.4** — non-POST methods (GET, PUT, DELETE, HEAD) return 405 Method Not Allowed with body `Method <METHOD> not allowed, POST required.\n` (38 + len(METHOD) bytes) + the standard six-header set per §11.6.
+
+Both paths use `writeAdminHeaders(w, "text/plain; charset=UTF-8")` and the 08.1 pattern of net/http-auto-managed Date + Content-Length.
+
+The §11.4 finding is a **SURPRISE** that contradicts BRAINSTORM Decision 3's hypothesis, which expected Envoy parity = no method check (mirroring the 08.1 read-only-endpoint posture per ADR-0090). Upstream Envoy v1.37.2 DOES enforce method discrimination on the mutating `/drain_listeners` endpoint — a deliberate departure from the no-method-discrimination posture it applies to read-only endpoints. This distinction is now encoded in envoy-go: read-only endpoints (per ADR-0090) remain method-agnostic; mutating endpoints (starting with `/drain_listeners`) enforce POST-only.
+
+### Decision
+
+Method discrimination check FIRST (return 405 with templated body `Method <METHOD> not allowed, POST required.\n` for non-POST). The 405 is a hard rejection — DOES NOT trigger drain.
+
+On POST:
+
+- Call `s.dm.Drain()` synchronously (sync.Once-guarded inside `drain.Manager`; subsequent POSTs no-op the state transition but return identical 200/`OK\n`).
+- Fire-and-forget — does NOT block on `<-s.dm.Done()`.
+- Does NOT trigger process exit (SPEC §6.3 — operator-driven drain stays in DRAINING indefinitely until SIGTERM/SIGINT per §5.3 lifecycle).
+
+The `?graceful=true` query-param is silently accepted per ADR-0041's silent-ignore precedent (envoy-go's drain is always graceful by construction).
+
+Per planner-time-resolved nil-dm policy: a nil `s.dm` yields 500 Internal Server Error with body `drain manager not configured\n` (defensive — the operator gets a clear signal that the drain machinery is not wired). Production builds always thread a non-nil dm.
+
+### Alternatives considered
+
+(A) No method discrimination on `/drain_listeners` (mirror the read-only-endpoint no-method-discrimination posture from ADR-0090). Rejected: contradicts the SPEC §11.4 empirical pin against Envoy v1.37.2; differential equivalence claim from §13.2 would fail on non-POST method probes.
+
+(B) Return 200 OK with no drain side-effect for non-POST (lenient passthrough). Rejected: silently swallows operator errors where a typo causes a GET to appear to "drain" but nothing drains; the 405 provides the operator a clear diagnostic.
+
+(C) Block on `<-s.dm.Done()` (synchronous drain wait). Rejected: SPEC §6.3 explicitly separates the drain trigger from the completion signal; blocking the admin HTTP connection for the full drain window could exceed WriteTimeout; fire-and-forget + operator polling of `/server_info` state is the correct model.
+
+(D) Return 500 with no-op (silent nil-dm) instead of 500 with body. Rejected: the nil-dm path is a wiring error visible at boot; the 500 body `drain manager not configured\n` gives the operator a direct diagnostic rather than a generic 500 that could be confused with a handler crash.
+
+### Consequences
+
+(a) `/drain_listeners` is the FIRST admin endpoint in envoy-go with method discrimination; the no-method-discrimination posture from ADR-0090 is qualified to **read-only endpoints only**.
+
+(b) ADR-0090 is partially amended in-place per the ADR-0089 consequence (b) pattern (the no-ACL posture is preserved verbatim; only the no-method-discrimination posture is qualified to read-only endpoints). See ADR-0090 Consequences § Phase 08.2 amendment paragraph.
+
+(c) The `/healthcheck/fail` endpoint stays in ADR-0089's deferral list — envoy-go MVP unifies the listener-drain (which §11.2 evidence ties to `/drain_listeners`) and load-balancer-disposition flip (which §11.2 evidence ties to `/healthcheck/fail`) under a single `drain.Manager` state machine; the differential gate's per-proxy trigger script normalizes (§7.2).
+
+(d) Idempotent: subsequent POSTs return identical 200/`OK\n` without re-firing Drain. The `sync.Once` guard is inside `drain.Manager.Drain()` — the handler does not need its own idempotency mechanism.
+
+(e) The ten unit tests in `internal/admin/drain_test.go` cover: POST fires + body exact + idempotent + graceful-param silently ignored + nil-dm 500 + GET/PUT/DELETE/HEAD all return 405 + header set correct.
 

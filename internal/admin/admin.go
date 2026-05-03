@@ -73,12 +73,12 @@ func New(addr string, registry *stats.Registry, bs *bootstrap.Bootstrap, cm *clu
 // Start binds and begins serving in a background goroutine. Returns the bound
 // address (useful when addr had port 0). Error only if bind fails.
 //
-// Six routes are registered post-08.1: /ready (phase 01), /stats/prometheus
+// Seven routes are registered post-08.2: /ready (phase 01), /stats/prometheus
 // (phase 06.1), /config_dump + /clusters + /listeners + /server_info
-// (phase 08.1). WriteTimeout is widened from phase 01's 5s to 30s per
-// planner-time decision 2 — /config_dump's protojson rendering of large
-// bootstraps may approach the budget on slow scrape clients; 30s is generous
-// enough for any reasonable fixture without weakening resilience.
+// (phase 08.1), /drain_listeners (phase 08.2). WriteTimeout is widened from
+// phase 01's 5s to 30s per planner-time decision 2 — /config_dump's protojson
+// rendering of large bootstraps may approach the budget on slow scrape clients;
+// 30s is generous enough for any reasonable fixture without weakening resilience.
 func (s *Server) Start() (string, error) {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -92,6 +92,7 @@ func (s *Server) Start() (string, error) {
 	mux.HandleFunc("/clusters", s.handleClusters)
 	mux.HandleFunc("/listeners", s.handleListeners)
 	mux.HandleFunc("/server_info", s.handleServerInfo)
+	mux.HandleFunc("/drain_listeners", s.handleDrainListeners)
 	s.httpSrv = &http.Server{
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
