@@ -35,6 +35,29 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 10 — TCP-proxy Inc/Dec hooks + `dm` field + constructor widening [ADR-0096]
+
+**Commits:** 3617f19 — this task's substantive commit
+**Notes:** Widened `NewFilter` from 2-param to 3-param adding `dm *drain.Manager` as the 3rd parameter. Added `dm *drain.Manager` field to `Filter` struct (after `statPrefix` field) with doc-comment per ADR-0096. Handle body: after `ctx.Err()` check, before `Dial` call, added nil-guarded `if f.dm != nil { f.dm.Inc(); defer f.dm.Dec() }` — per-connection granularity (TCP-proxy has no per-request semantic; planner-time decision 5). Defer fires on all early-return paths (dial failure, context cancellation, normal connection close). Listener `filterRegistry` TCP-proxy closure: removed `_ = dm` discard (T5 placeholder) and now passes `dm` as 3rd arg to `tcpproxy.NewFilter`. Updated all test call sites: 7 direct `NewFilter` calls in `filter_test.go`; 1 call in `fuzz_test.go`. Added 2 new tests: `TestTCPProxy_DrainInflightBalance` (real echo backend, connection closes → Dec → Done fires within 500ms), `TestTCPProxy_DrainInflightBalance_NilDrainManager` (nil dm → no panic). `cmd/envoy-go` broken-window persists (Task 11 fixes).
+**Outputs:**
+```
+$ go test -count=1 ./internal/filter/tcpproxy/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.159s
+$ go test -race -count=1 ./internal/filter/tcpproxy/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.177s
+$ go test -count=1 ./internal/listener/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/listener	3.023s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.043s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	0.003s
+$ go vet ./internal/filter/tcpproxy/... ./internal/listener/...
+(no output — clean)
+$ golangci-lint run ./internal/filter/tcpproxy/... ./internal/listener/...
+(no output — clean)
+$ go build ./cmd/envoy-go/... 2>&1 | head -3
+cmd/envoy-go/main.go:122:130: not enough arguments in call to listener.NewManagerWithBaseDirAndAllowH2C
+(EXPECTED FAILURE — intentional broken-window; Task 11 fixes the call site)
+```
+
 ## Task 9 — HCM Inc/Dec hooks + `dm` field + constructor widening [ADR-0096]
 
 **Commits:** 9760837 — this task's substantive commit
