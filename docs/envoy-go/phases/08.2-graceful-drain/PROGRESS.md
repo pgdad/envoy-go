@@ -35,6 +35,37 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 8 — `/ready` + `/server_info` DRAINING extensions [ADR-0097, ADR-0098]
+
+**Commits:** bed9c65 — this task's substantive commit
+**Notes:** Added NEW DRAINING-first branch in `handleReady` (inserted BETWEEN the six-header set and the pre-init check): `if s.dm != nil && s.dm.State() == drain.StateDraining` returns 503 + body `"DRAINING\n"` (9 bytes) per SPEC §11.2 empirical pin. Precedence DRAINING > PRE_INITIALIZING > LIVE per ADR-0097; existing PRE_INITIALIZING and LIVE branches preserved verbatim. Widened `deriveState` from `(ready *atomic.Bool)` to `(ready *atomic.Bool, dm *drain.Manager)` with NEW DRAINING-first check returning `adminv3.ServerInfo_DRAINING`; updated `buildServerInfo` call site to `deriveState(&s.ready, s.dm)`. Added `drain` import to `serverinfo.go` (three-group goimports order: stdlib / external / local). Added `net/http/httptest` import to `admin_test.go`. Eight new tests: 4 in `admin_test.go` (`TestHandleReady_Draining`, `TestHandleReady_DrainingPrecedesLive`, `TestHandleReady_DrainingPrecedesPreInitializing`, `TestHandleReady_DrainingHeaders`) + 4 in `serverinfo_test.go` (`TestHandleServerInfo_StateDraining`, `TestHandleServerInfo_StatePrecedence_DrainingOverLive`, `TestHandleServerInfo_StatePrecedence_DrainingOverPreInit`, `TestDeriveState_NilDrainManager`). Appended ADR-0097 + ADR-0098 to `docs/envoy-go/DECISIONS.md`; in-place amended ADR-0015 (forward-pointer note after Link-to-evidence) and ADR-0088 (Phase 08.2 amendment paragraph after consequence (f)). Pre-existing flaky failures (`TestHandleServerInfo_StatePostMarkReady` et al.) confirmed NOT caused by T8 — they fail identically on the T7 baseline (protojson `"state":  "LIVE"` double-space vs single-space substring check; pre-existing broken-window).
+**Outputs:**
+```
+$ go test -count=1 -run 'TestHandleReady_Draining|TestHandleReady_DrainingPrecedesLive|TestHandleReady_DrainingPrecedesPreInitializing|TestHandleReady_DrainingHeaders|TestHandleServerInfo_StateDraining|TestHandleServerInfo_StatePrecedence_DrainingOverLive|TestHandleServerInfo_StatePrecedence_DrainingOverPreInit|TestDeriveState_NilDrainManager' ./internal/admin/... -v 2>&1 | tail -20
+=== RUN   TestHandleReady_Draining
+--- PASS: TestHandleReady_Draining (0.00s)
+=== RUN   TestHandleReady_DrainingPrecedesLive
+--- PASS: TestHandleReady_DrainingPrecedesLive (0.00s)
+=== RUN   TestHandleReady_DrainingPrecedesPreInitializing
+--- PASS: TestHandleReady_DrainingPrecedesPreInitializing (0.00s)
+=== RUN   TestHandleReady_DrainingHeaders
+--- PASS: TestHandleReady_DrainingHeaders (0.00s)
+=== RUN   TestHandleServerInfo_StateDraining
+--- PASS: TestHandleServerInfo_StateDraining (0.00s)
+=== RUN   TestHandleServerInfo_StatePrecedence_DrainingOverLive
+--- PASS: TestHandleServerInfo_StatePrecedence_DrainingOverLive (0.00s)
+=== RUN   TestHandleServerInfo_StatePrecedence_DrainingOverPreInit
+--- PASS: TestHandleServerInfo_StatePrecedence_DrainingOverPreInit (0.00s)
+=== RUN   TestDeriveState_NilDrainManager
+--- PASS: TestDeriveState_NilDrainManager (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.006s
+$ go vet ./internal/admin/...
+(no output — clean)
+$ golangci-lint run ./internal/admin/...
+(no output — clean)
+```
+
 ## Task 7 — `internal/admin/drain.go` POST handler + method discrimination [ADR-0093]
 
 **Commits:** b72e83b — this task's substantive commit
