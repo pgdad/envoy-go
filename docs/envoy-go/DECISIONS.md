@@ -4518,7 +4518,7 @@ The ±10ms timing tolerance is a property of the differential-fixture's assertio
 **Status:** Accepted
 **Date:** 2026-05-03
 **Doctrine:** D-3.5 (record durable design rationale; the LBP-1 closure-captured counter is the sixth application of a stable engineering pattern + the `markedActive` atomic.Bool guard is a load-bearing concurrency invariant whose race-clean discipline must survive future maintenance) + D-3.7 (race-detector evidence is durable; the `markedActive` field upgrade from plain `bool` to `atomic.Bool` is empirically motivated by `go test -race -count=10` flagging the OnDestroy-races-timer-callback case).
-**Lands-in-task:** Task 6 (phase 09); commit TBD.
+**Lands-in-task:** Task 6 (phase 09); commit b2174fd.
 
 ### Context
 
