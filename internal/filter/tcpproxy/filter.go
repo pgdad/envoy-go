@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/drain"
 )
 
 // TypeURL is the proto type URL phase 02 registers in the listener's inline
@@ -23,17 +24,20 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.
 // resolved cluster it dispatches to. Immutable after NewFilter returns.
 type Filter struct {
 	cluster    *cluster.Cluster
-	statPrefix string // unread at phase 02; SPEC §10 #8 settled — stored for forward-compat
+	statPrefix string         // unread at phase 02; SPEC §10 #8 settled — stored for forward-compat
+	dm         *drain.Manager // 08.2 Task 10: nil-tolerant drain manager for in-flight Inc/Dec
 }
 
 // NewFilter parses tc as a TcpProxy proto and resolves its cluster reference
-// against cm. Returns an error if (a) tc.TypeUrl is not the TcpProxy URL, (b)
+// against cm. dm is the drain manager used for per-connection in-flight
+// tracking (ADR-0096); pass nil if drain tracking is not needed.
+// Returns an error if (a) tc.TypeUrl is not the TcpProxy URL, (b)
 // the proto bytes do not unmarshal, (c) the cluster reference is missing or
 // names a cluster cm does not know, or (d) the proto uses weighted_clusters
 // (phase 02 does not implement weighted dispatch).
 //
 // Every error begins with "tcpproxy: ".
-func NewFilter(tc *anypb.Any, cm *cluster.Manager) (*Filter, error) {
+func NewFilter(tc *anypb.Any, cm *cluster.Manager, dm *drain.Manager) (*Filter, error) {
 	if got := tc.GetTypeUrl(); got != TypeURL {
 		return nil, fmt.Errorf("tcpproxy: wrong type_url %q (want %q)", got, TypeURL)
 	}
@@ -51,7 +55,7 @@ func NewFilter(tc *anypb.Any, cm *cluster.Manager) (*Filter, error) {
 		if !ok {
 			return nil, fmt.Errorf("tcpproxy: cluster %q not found", name)
 		}
-		return &Filter{cluster: c, statPrefix: msg.GetStatPrefix()}, nil
+		return &Filter{cluster: c, statPrefix: msg.GetStatPrefix(), dm: dm}, nil
 	case *tcpproxyv3.TcpProxy_WeightedClusters:
 		return nil, fmt.Errorf("tcpproxy: weighted_clusters is not supported in phase 02")
 	default:
@@ -66,6 +70,14 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 	defer func() { _ = downstream.Close() }()
 	if err := ctx.Err(); err != nil {
 		return
+	}
+	// 08.2 (Task 10) drain Inc/Dec per ADR-0096 + planner-time decision 5:
+	// per-connection granularity (TCP-proxy has no per-request semantic).
+	// Inc at conn-begin (after ctx.Err check, before Dial); Dec via defer
+	// for pair-balance on all early-return paths (dial failure, etc.).
+	if f.dm != nil {
+		f.dm.Inc()
+		defer f.dm.Dec()
 	}
 	upstream, _, err := f.cluster.Dial(ctx)
 	if err != nil {

@@ -70,8 +70,7 @@ type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, 
 // signatures per ADR-0094.
 var filterRegistry = map[string]filterConstructor{
 	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx, _ *stats.Registry, _ []accesslog.Sink, _ *filter_http.HTTPRegistry, dm *drain.Manager) (filterHandler, error) {
-		_ = dm // T10 will plumb dm into tcpproxy.NewFilter
-		f, err := tcpproxy.NewFilter(tc, cm)
+		f, err := tcpproxy.NewFilter(tc, cm, dm)
 		if err != nil {
 			return nil, err
 		}

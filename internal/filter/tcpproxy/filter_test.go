@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -75,7 +76,7 @@ func TestNewFilter_Happy(t *testing.T) {
 		StatPrefix:       "ingress_tcp",
 		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_echo"},
 	})
-	f, err := NewFilter(any, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999))
+	f, err := NewFilter(any, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999), nil)
 	if err != nil {
 		t.Fatalf("NewFilter: %v", err)
 	}
@@ -85,7 +86,7 @@ func TestNewFilter_Happy(t *testing.T) {
 }
 
 func TestNewFilter_WrongTypeURL(t *testing.T) {
-	_, err := NewFilter(&anypb.Any{TypeUrl: "type.googleapis.com/google.protobuf.StringValue", Value: nil}, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999))
+	_, err := NewFilter(&anypb.Any{TypeUrl: "type.googleapis.com/google.protobuf.StringValue", Value: nil}, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999), nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -100,7 +101,7 @@ func TestNewFilter_WrongTypeURL(t *testing.T) {
 }
 
 func TestNewFilter_UnmarshalError(t *testing.T) {
-	_, err := NewFilter(&anypb.Any{TypeUrl: tcpProxyTypeURL, Value: []byte{0xff, 0xff, 0xff, 0xff, 0xff}}, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999))
+	_, err := NewFilter(&anypb.Any{TypeUrl: tcpProxyTypeURL, Value: []byte{0xff, 0xff, 0xff, 0xff, 0xff}}, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999), nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -115,7 +116,7 @@ func TestNewFilter_MissingCluster(t *testing.T) {
 		StatPrefix:       "ingress_tcp",
 		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_does_not_exist"},
 	})
-	_, err := NewFilter(any, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999))
+	_, err := NewFilter(any, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999), nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -134,7 +135,7 @@ func TestNewFilter_WeightedClustersUnsupported(t *testing.T) {
 			WeightedClusters: &tcpproxyv3.TcpProxy_WeightedCluster{},
 		},
 	})
-	_, err := NewFilter(any, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999))
+	_, err := NewFilter(any, mkClusterMgr(t, "c_echo", "127.0.0.1", 9999), nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -159,7 +160,7 @@ func TestHandle_BidirectionalEcho(t *testing.T) {
 		StatPrefix:       "ingress_tcp",
 		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_echo"},
 	})
-	f, err := NewFilter(any, cm)
+	f, err := NewFilter(any, cm, nil)
 	if err != nil {
 		t.Fatalf("NewFilter: %v", err)
 	}
@@ -224,7 +225,7 @@ func TestHandle_DialFailure_ClosesDownstream(t *testing.T) {
 		StatPrefix:       "ingress_tcp",
 		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_dead"},
 	})
-	f, err := NewFilter(any, cm)
+	f, err := NewFilter(any, cm, nil)
 	if err != nil {
 		t.Fatalf("NewFilter: %v", err)
 	}
@@ -427,7 +428,7 @@ func TestFilter_Handle_CtxCanceledBeforeDial(t *testing.T) {
 		StatPrefix:       "ingress_tcp",
 		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_cancel"},
 	})
-	f, err := NewFilter(any, cm)
+	f, err := NewFilter(any, cm, nil)
 	if err != nil {
 		t.Fatalf("NewFilter: %v", err)
 	}
@@ -466,7 +467,7 @@ func TestFilter_Handle_TLSUpstreamTransparent(t *testing.T) {
 		StatPrefix:       "ingress_tcp",
 		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_tls_echo"},
 	})
-	f, err := NewFilter(any, cm)
+	f, err := NewFilter(any, cm, nil)
 	if err != nil {
 		t.Fatalf("NewFilter: %v", err)
 	}
@@ -516,6 +517,73 @@ func TestFilter_Handle_TLSUpstreamTransparent(t *testing.T) {
 	}
 }
 
+// TestTCPProxy_DrainInflightBalance verifies that a Handle call Incs the drain
+// manager on connect and Decs it when the connection closes, so dm.Done()
+// fires after dm.Drain() is called and the last in-flight connection exits.
+func TestTCPProxy_DrainInflightBalance(t *testing.T) {
+	dm := drain.New(10 * time.Millisecond)
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer func() { _ = backend.Close() }()
+	go acceptEchoForTest(backend)
+	port := uint32(backend.Addr().(*net.TCPAddr).Port)
+
+	cm := mkClusterMgr(t, "c_backend", "127.0.0.1", port)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "drain_test",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_backend"},
+	})
+	f, err := NewFilter(any, cm, dm)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+	srv, client := net.Pipe()
+	defer func() { _ = srv.Close(); _ = client.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.Handle(ctx, srv)
+	_, _ = client.Write([]byte("hello\n"))
+	_ = client.Close()
+	time.Sleep(100 * time.Millisecond)
+	dm.Drain()
+	select {
+	case <-dm.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("dm.Done() did not fire — TCP-proxy inflight not balanced")
+	}
+}
+
+// TestTCPProxy_DrainInflightBalance_NilDrainManager verifies that Handle does
+// not panic when dm is nil (nil-tolerant guard in Handle).
+func TestTCPProxy_DrainInflightBalance_NilDrainManager(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer func() { _ = backend.Close() }()
+	go acceptEchoForTest(backend)
+	port := uint32(backend.Addr().(*net.TCPAddr).Port)
+
+	cm := mkClusterMgr(t, "c_backend_nil", "127.0.0.1", port)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "nil_dm_test",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_backend_nil"},
+	})
+	f, err := NewFilter(any, cm, nil)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+	srv, client := net.Pipe()
+	defer func() { _ = srv.Close(); _ = client.Close() }()
+	go f.Handle(context.Background(), srv)
+	_, _ = client.Write([]byte("hello\n"))
+	_ = client.Close()
+	time.Sleep(50 * time.Millisecond)
+	// Test passes if no panic.
+}
+
 // TestFilter_Handle_HalfCloseOverTLS verifies that halfClose(*stdtls.Conn)
 // propagates a write-shutdown to the upstream after the downstream closes its
 // write side, allowing the upstream echo to complete and the downstream to read
@@ -530,7 +598,7 @@ func TestFilter_Handle_HalfCloseOverTLS(t *testing.T) {
 		StatPrefix:       "ingress_tcp",
 		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c_tls_half"},
 	})
-	f, err := NewFilter(any, cm)
+	f, err := NewFilter(any, cm, nil)
 	if err != nil {
 		t.Fatalf("NewFilter: %v", err)
 	}

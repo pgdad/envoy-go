@@ -45,7 +45,7 @@ func FuzzTcpProxyFilter(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, typeURL string, body []byte) {
 		a := &anypb.Any{TypeUrl: typeURL, Value: body}
-		_, err := NewFilter(a, cm)
+		_, err := NewFilter(a, cm, nil)
 		if err == nil {
 			return // no error is also acceptable (the input parsed)
 		}
