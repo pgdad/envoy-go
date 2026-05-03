@@ -17,10 +17,10 @@
 //  3. ProbeAdmin runs the full drain sequence for each proxy in turn:
 //     a. Scrape /ready → assert "LIVE\n".
 //     b. Start long-lived GET /slow goroutine against the listener addr;
-//        wait for first byte (in-flight established).
+//     wait for first byte (in-flight established).
 //     c. Trigger drain (per-proxy trigger script per §11.2 deviation):
-//        - envoy-go: POST /drain_listeners only.
-//        - reference Envoy: POST /drain_listeners + POST /healthcheck/fail.
+//     - envoy-go: POST /drain_listeners only.
+//     - reference Envoy: POST /drain_listeners + POST /healthcheck/fail.
 //     d. Poll /ready until "DRAINING\n" (max 5s).
 //     e. Scrape /server_info; assert state field == "DRAINING".
 //     f. Attempt new TCP conn + HTTP read; assert accept-then-FIN.
@@ -29,11 +29,11 @@
 //     the same log lines → byte-equal after wrapping → CompareBytes passes.
 //
 // Per SPEC §7.1, five per-state-transition equivalence claims are asserted:
-//   1. /ready LIVE pre-drain.
-//   2. POST /drain_listeners response = "OK\n".
-//   3. /ready DRAINING post-trigger.
-//   4. /server_info state = "DRAINING".
-//   5. in-flight GET /slow body = 5120 bytes of 'x'.
+//  1. /ready LIVE pre-drain.
+//  2. POST /drain_listeners response = "OK\n".
+//  3. /ready DRAINING post-trigger.
+//  4. /server_info state = "DRAINING".
+//  5. in-flight GET /slow body = 5120 bytes of 'x'.
 //
 // SIGTERM-trigger path: deferred per PLAN gotcha 1 (runner harness does not
 // expose SIGTERM injection). This fixture covers the admin-trigger path only.
@@ -63,10 +63,10 @@ const (
 
 // drainDriver implements fixture.Driver for the graceful-drain differential.
 type drainDriver struct {
-	mu              sync.Mutex
-	refListenerAddr string
+	mu               sync.Mutex
+	refListenerAddr  string
 	subjListenerAddr string
-	backendPort     int
+	backendPort      int
 }
 
 func init() {
@@ -458,7 +458,7 @@ func assertAcceptThenFIN(ctx context.Context, addr string, timeout time.Duration
 	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		// During drain some proxies may refuse new connections outright.
-		// Both behaviours (refuse / accept-then-FIN) satisfy the constraint.
+		// Both behaviors (refuse / accept-then-FIN) satisfy the constraint.
 		return nil
 	}
 	defer func() { _ = conn.Close() }()
