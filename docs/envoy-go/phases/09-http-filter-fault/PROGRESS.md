@@ -562,3 +562,76 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.043s
 ```
+
+## Task 8 — cmd/envoy-go/main.go register fault.New under fault.TypeURL [ADR-0100]
+
+**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Notes:** Mechanical boot-wiring task per PLAN.md Task 8 Steps 1–7. Step 1 inspected the existing http filter import block + Register chain in `cmd/envoy-go/main.go` (router/cors/envoygotest landed in 07.1 Task 20). Step 2 added `"github.com/esalaine/envoy-go/internal/filter/http/fault"` to the http filter import block, sorted alphabetically between `envoygotest` and `router` (gofmt-stable ordering). Step 3 inserted `httpReg.Register(fault.TypeURL, fault.New)` after the `envoygotest` Register and before `httpReg.Freeze()`, preserving the BRAINSTORM Decision 2 router-first-then-alphabetical convention. Step 4 ran the four-gate suite (`go build ./...` + `go vet ./...` + `golangci-lint run ./...` + `go test -race -count=1 -short ./...`) — all four clean; 32 packages PASS unchanged. Step 5 was deliberately SKIPPED per PLAN.md Task 8 Step 5 — the smoke test (crafting a minimal bootstrap and running the binary) is deferred because the differential fixture (Tasks 11–14) exercises the exact end-to-end registration → typed_config resolution → factory invocation path against reference Envoy, and the Task 16 phase-done six-gate verification is a second backstop for boot-wiring regressions. NO new ADR landed — ADR-0100 (boot registration) was anchored in Task 3. Per-package cmd test (`go test -race -count=1 ./cmd/envoy-go/...`) passes confirming the binary still builds and the new Register call wires correctly.
+**Outputs:**
+```
+$ grep -nE 'httpReg|fault' cmd/envoy-go/main.go | head -10
+27:	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+30:	"github.com/esalaine/envoy-go/internal/filter/http/fault"
+111:	httpReg := filter_http.NewHTTPRegistry()
+112:	httpReg.Register(router.TypeURL, router.New)
+113:	httpReg.Register(cors.TypeURL, cors.New)
+114:	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
+115:	httpReg.Register(fault.TypeURL, fault.New)
+116:	httpReg.Freeze()
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.711s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.041s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.539s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.081s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.075s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.152s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.081s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.538s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.166s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.036s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.060s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.296s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.266s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.210s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.085s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.073s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.038s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.048s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.110s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	1.140s
+ok  	github.com/esalaine/envoy-go/test/differential	1.139s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.022s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.029s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.029s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.026s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.026s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.031s
+?   	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.031s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/backends	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.045s
+```
