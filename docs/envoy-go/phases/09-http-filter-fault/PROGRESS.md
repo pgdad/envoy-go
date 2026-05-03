@@ -635,3 +635,85 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.045s
 ```
+
+## Task 9 — FuzzFaultConfigParse fuzzer (twelfth fuzzer per ADR-0018)
+
+**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Notes:** Mechanical fuzzer-ship task per PLAN.md Task 9 Steps 1–4 + planner-time decision 1 (SHIP). Step 1 wrote `internal/filter/http/fault/fuzz_test.go` verbatim per PLAN.md lines 1975–2019: `FuzzFaultConfigParse` feeds arbitrary byte sequences as the `tc *anypb.Any` Value (TypeURL pinned to `fault.TypeURL`) and asserts the New factory returns either `(factory, nil)` OR `(nil, error)` — never `(nil, nil)`, never both. Seed corpus is the 5 byte sequences from PLAN: nil, empty, `{0x00}`, `{0xff,0xff,0xff,0xff}`, `[]byte("not-a-proto")`. Step 2 ran the 30s fuzz budget — no panics, no `(nil, nil)` returns; corpus expanded from baseline 4 (the 5 dedup'd seeds — nil and `{}` are byte-equivalent under f.Add) to 250 interesting inputs; ~3.36M execs total at peak ~322k/sec. Step 3 ran short-mode (`go test -count=1 -short ./internal/filter/http/fault/`) confirming the seed corpus runs as part of the normal test suite — PASS. Step 4 ran the four-gate suite — `go build ./...` + `go vet ./...` + `golangci-lint run ./...` + `go test -race -count=1 -short ./...` all clean; 33 packages PASS unchanged. NO new ADR landed (ADR-0018 fuzz-CI policy is the anchoring ADR; established phase 04+; this is the twelfth fuzzer in that lineage per PLAN.md Task 9 + planner-time decision 1).
+**Outputs:**
+```
+$ go test -fuzz=FuzzFaultConfigParse -fuzztime=30s ./internal/filter/http/fault/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/4 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 4/4 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 71331 (23777/sec), new interesting: 106 (total: 110)
+fuzz: elapsed: 6s, execs: 486519 (138356/sec), new interesting: 182 (total: 186)
+fuzz: elapsed: 9s, execs: 742536 (85355/sec), new interesting: 199 (total: 203)
+fuzz: elapsed: 12s, execs: 1245085 (167491/sec), new interesting: 215 (total: 219)
+fuzz: elapsed: 15s, execs: 1540717 (98558/sec), new interesting: 225 (total: 229)
+fuzz: elapsed: 18s, execs: 1641378 (33546/sec), new interesting: 230 (total: 234)
+fuzz: elapsed: 21s, execs: 1742008 (33554/sec), new interesting: 232 (total: 236)
+fuzz: elapsed: 24s, execs: 1767753 (8579/sec), new interesting: 232 (total: 236)
+fuzz: elapsed: 27s, execs: 2387235 (206544/sec), new interesting: 236 (total: 240)
+fuzz: elapsed: 30s, execs: 3355456 (322633/sec), new interesting: 246 (total: 250)
+fuzz: elapsed: 31s, execs: 3355456 (0/sec), new interesting: 246 (total: 250)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	31.394s
+$ go test -count=1 -short ./internal/filter/http/fault/
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	0.260s
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.627s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.014s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.541s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.085s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.084s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.146s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.088s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.539s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.170s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.039s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.069s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.304s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.269s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.213s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.094s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.077s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.037s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.050s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.111s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	1.165s
+ok  	github.com/esalaine/envoy-go/test/differential	1.165s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.027s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.029s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.031s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.029s
+?   	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.028s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.028s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.033s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.034s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/backends	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.050s
+```
