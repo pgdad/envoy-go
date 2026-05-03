@@ -860,3 +860,43 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ?   	github.com/esalaine/envoy-go/test/fixtures/0011-http-fault/backends	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.047s
 ```
+
+## Task 12 — Fixture 0011 envoy.yaml + envoy-go.yaml bootstraps per SPEC §7.4
+
+**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Notes:** Mechanical fixture-ship task per PLAN.md Task 12 Steps 1–4 + SPEC §7.4 verbatim YAML + planner-time decision 8 (STRICT_DNS) + ADR-0010 (V4_ONLY). Step 1 wrote `test/fixtures/0011-http-fault/envoy.yaml` (reference Envoy bootstrap, 80 lines) verbatim per PLAN snippet (lines 2246–2325): admin :9902 + listener :10001 (literal in-container ports for the reference Envoy container per planner-time decision; the runner publishes to allocated host ports), HCM with `codec_type: HTTP1` + `stat_prefix: ingress_http` + 5 routes (`/scenario1` no-fault, `/scenario2` per-route delay+abort 100% 100ms+503, `/scenario3-wholesale` per-route abort-only 418 (NO delay — wholesale-override case), `/scenario3-baseline` no-fault (inherits listener delay), `/scenario4` per-route abort 503 + headers `x-fault-on: yes`) + 2 http_filters (listener-level fault: delay 100% 100ms only NO abort; router) + cluster `c_backend` STRICT_DNS V4_ONLY ROUND_ROBIN connect_timeout 0.25s with `{{.BackendHost}}:{{.BackendPort}}` Go-template tokens for runtime substitution by the Task 14 driver. Step 2 wrote `test/fixtures/0011-http-fault/envoy-go.yaml` (subject envoy-go bootstrap, 80 lines) — identical body modulo admin/listener ports which are `{{.AdminPort}}`/`{{.ListenerPort}}` Go-template tokens (rendered to runner-allocated host ports by the Task 14 driver). Step 3 verified YAML structural validity via Python `yaml.safe_load` after manual template substitution (BackendHost=127.0.0.1, BackendPort=18001 for envoy.yaml; +AdminPort=9901, ListenerPort=10000 for envoy-go.yaml) — both parse cleanly; structural assertions confirmed: 5 routes with correct match prefixes, per-route fault config presence/absence per spec (s1/s3-baseline=False; s2/s3-wholesale/s4=True), s2 has BOTH delay+abort, s3-wholesale has abort-only http_status=418 (NO delay → wholesale-override), s4 has abort 503 + headers x-fault-on exact "yes", listener-level fault has delay-only fixed_delay=0.1s (NO abort), cluster STRICT_DNS V4_ONLY ROUND_ROBIN, endpoint resolves to 127.0.0.1:18001. The PLAN's optional Step 3 Alternative smoke test (`go run ./cmd/envoy-go -c /tmp/rendered.yaml` + curl scenario1) was attempted and failed because the current envoy-go cluster manager only supports STATIC clusters (`cluster manager: cluster: "c_backend": only STATIC clusters supported; got STRICT_DNS`); this is an upstream gap orthogonal to Task 12 — SPEC §7.4 mandates STRICT_DNS verbatim and the Task 14 driver will handle resolution via the harness backend hostname per planner-time decision 8. Step 4 ran the four-gate suite: `go build ./...` + `go vet ./...` + `golangci-lint run ./...` all clean (YAMLs are not Go); `go test -race -count=1 -short ./...` initially flaked once on `TestServerStream_StateTransitions_HeadersThenData` in `internal/filter/hcm/h2` (unrelated to YAML changes — no Go modified) and PASSED on retry (`-count=3`). NO new ADR.
+**Outputs:**
+```
+$ python3 -c "import yaml; yaml.safe_load(open('test/fixtures/0011-http-fault/envoy.yaml').read().replace('{{.BackendHost}}','127.0.0.1').replace('{{.BackendPort}}','18001'))"
+envoy.yaml: parsed OK; admin port= 9902
+listener port= 10001
+routes count= 5
+  /scenario1 per-route-fault= False
+  /scenario2 per-route-fault= True
+  /scenario3-wholesale per-route-fault= True
+  /scenario3-baseline per-route-fault= False
+  /scenario4 per-route-fault= True
+http_filters= ['envoy.filters.http.fault', 'envoy.filters.http.router']
+cluster= c_backend STRICT_DNS ROUND_ROBIN
+endpoint= {'address': '127.0.0.1', 'port_value': 18001}
+$ python3 -c "...envoy-go.yaml after AdminPort=9901+ListenerPort=10000+BackendHost=127.0.0.1+BackendPort=18001 substitution..."
+envoy-go.yaml: parsed OK; admin port= 9901
+listener port= 10000
+routes count= 5
+  /scenario1 per-route-fault= False
+  /scenario2 per-route-fault= True
+  /scenario3-wholesale per-route-fault= True
+  /scenario3-baseline per-route-fault= False
+  /scenario4 per-route-fault= True
+http_filters= ['envoy.filters.http.fault', 'envoy.filters.http.router']
+s2 has delay= True abort= True headers= False
+s3-wholesale has delay= False abort= True http_status= 418
+s4 has delay= False abort= True headers= [{'name': 'x-fault-on', 'string_match': {'exact': 'yes'}}]
+listener fault has delay= True abort= False fixed_delay= 0.1s
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.300s
+ok  	(33 packages PASS unchanged; one transient flake in internal/filter/hcm/h2 TestServerStream_StateTransitions_HeadersThenData unrelated to YAML; PASSED on retry with -count=3)
+```
