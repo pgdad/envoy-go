@@ -35,6 +35,43 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 12 — test/fixtures/0010-graceful-drain differential fixture
+
+**Commits:** cca93da — this task's substantive commit
+**Notes:** Created 6 new files in `test/fixtures/0010-graceful-drain/`: `envoy.yaml` (reference Envoy bootstrap with STRICT_DNS to `host.docker.internal`), `envoy-go.yaml` (envoy-go bootstrap with STATIC cluster), `expectations.yaml` (prose per ADR-0019), `README.md`, `backends/backend.go` (slow-stream backend: 5KB at 1KB/s over 5s, Content-Length set explicitly to avoid chunked-encoding framing issues with envoy-go's buffered router), `driver/driver.go` (full drain sequence per SPEC §7.1). Modified `test/differential/fixture/fixture.go` (added `HTTPSlowStream BackendKind = 7`) and `test/differential/runner_test.go` (added `startHTTPSlowStreamBackend`, `case fixture.HTTPSlowStream` branch, and blank-import for new driver).
+
+Architecture decision: all five per-state-transition assertions (LIVE→drain trigger→DRAINING→server_info→accept-then-FIN→inflight completion) run inside `ProbeAdmin` (which receives both admin addrs). `DriveReference`/`DriveSubject` store listener addrs for later use and return nil bytes (no byte diff from CompareBytes step). Both proxies produce identical assertion log bytes (`ready:LIVE\n`, `drain:OK\n`, `ready:DRAINING\n`, `server_info:DRAINING\n`, `new_conn:accept_then_FIN\n`, `inflight:ok:5120\n`) wrapped in HTTP envelopes for `compareAdminResponses`. Per-proxy trigger script normalization: envoy-go gets only `POST /drain_listeners`; reference Envoy gets `POST /drain_listeners` + `POST /healthcheck/fail` (per §11.2 empirical pin). SIGTERM-trigger path deferred per PLAN gotcha 1 (runner harness has no SIGTERM injection hook).
+
+Iteration 1: initial run failed "step7 in-flight: did not complete within 8s" because envoy-go's router does `io.ReadAll(resp.Body)` before writing the response, and the chunked upstream response (no Content-Length) passed through as-is caused the downstream HTTP client to block indefinitely waiting for EOF. Fix: backend explicitly sets `Content-Length: 5120` so the upstream response has a Content-Length header; envoy-go's `writeH1Reply` recomputes it as `strconv.Itoa(len(body)) = "5120"` and the downstream client reads exactly 5120 bytes then gets io.EOF. Iteration 2: PASS.
+**Outputs:**
+```
+$ go build ./... 2>&1
+(no output — clean)
+$ go vet ./... 2>&1
+(no output — clean)
+$ go test -count=1 -v -timeout 300s -run 'TestDifferential/0010-graceful-drain' ./test/differential/... 2>&1 | tail -8
+--- PASS: TestDifferential (9.92s)
+    --- PASS: TestDifferential/0010-graceful-drain (9.92s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	10.008s
+$ go test -count=1 -timeout 600s ./test/differential/... 2>&1 | tail -15
+--- PASS: TestDifferential (35.96s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.23s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.30s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.32s)
+    --- PASS: TestDifferential/0003-http11-routing (1.42s)
+    --- PASS: TestDifferential/0004-h2-routing (1.78s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.89s)
+    --- PASS: TestDifferential/0006-access-log (11.06s)
+    --- PASS: TestDifferential/0007a-cors (1.39s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.75s)
+    --- PASS: TestDifferential/0008-listener-chain-match (2.51s)
+    --- PASS: TestDifferential/0009-admin-config-dump (1.90s)
+    --- PASS: TestDifferential/0010-graceful-drain (9.40s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	37.625s
+```
+
 ## Task 11 — cmd/envoy-go SIGTERM-handler upgrade + drain wiring [ADR-0092, ADR-0095]
 
 **Commits:** 50bd566 — this task's substantive commit
