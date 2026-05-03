@@ -181,6 +181,14 @@ const (
 	// in-flight window for the graceful-drain differential. Because the backend
 	// is a subprocess, the runner's in-process accept counter is NOT incremented.
 	HTTPSlowStream BackendKind = 7
+	// HTTPFault is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0011-http-fault/backends/backend.go on the pre-allocated
+	// port. The backend serves / with body "backend\n" (8 bytes). No TLS.
+	// Introduced by fixture 0011-http-fault (phase 09 Task 10) to provide the
+	// deterministic-body backend the per-scenario equivalence assertions
+	// expect. Because the backend is a subprocess, the runner's in-process
+	// accept counter is NOT incremented.
+	HTTPFault BackendKind = 8
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

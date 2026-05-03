@@ -219,6 +219,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
+		case fixture.HTTPFault:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPFaultBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
 		}
 		backends[i] = bo
 	}
@@ -779,6 +797,26 @@ func startHTTPEchoBodyBackend(ctx context.Context, repoRoot string, port int) (*
 // is NOT incremented.
 func startHTTPSlowStreamBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0010-graceful-drain/backends",
+		"--port", fmt.Sprintf("%d", port),
+	)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	return cmd, nil
+}
+
+// startHTTPFaultBackend spawns the fixture-0011 HTTP/1.1 backend subprocess
+// on port. The backend serves / with body "backend\n" (8 bytes). No TLS.
+// Introduced for fixture 0011-http-fault (phase 09 Task 10) to provide the
+// deterministic-body backend the per-scenario equivalence assertions expect.
+// Because the backend is a subprocess, the runner's in-process accept counter
+// is NOT incremented.
+func startHTTPFaultBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0011-http-fault/backends",
 		"--port", fmt.Sprintf("%d", port),
 	)
 	cmd.Dir = repoRoot
