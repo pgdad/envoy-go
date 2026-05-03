@@ -35,6 +35,25 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 3 — `internal/admin.New` constructor widening — thread `*drain.Manager` (LBP-1 fifth application)
+
+**Commits:** 42256f0 — this task's substantive commit
+**Notes:** Widened `internal/admin.New` from 6-param (08.1 form: `New(addr, registry, bs, cm, lm)`) to 7-param adding `dm *drain.Manager` per SPEC §6.1 + BRAINSTORM Decision 4. Added `dm *drain.Manager` field to `Server` struct (after existing `lm` field) with the 08.2 doc-comment per ADR-0091 + BRAINSTORM Decision 4. Updated all 12 `New(...)` call sites in `admin_test.go` and 19 additional call sites across `clusters_test.go`, `configdump_test.go`, `listeners_test.go`, and `serverinfo_test.go` — 31 total call sites updated to the 7-arg form (nil for dm at all existing sites). Added two new prescribed tests: `TestServer_NewWidenedConstructor_DrainManager` (verifies dm field threaded through New) and `TestServer_NewWidenedConstructor_NilDrainManagerTolerated` (verifies nil dm accepted). Updated `Server` struct doc-comment to mention 08.2 drain extension surface. Updated ADR-0085 Consequence (a) in-place with the LBP-1 fifth-application forward-pointer per the prescribed prose. This commit intentionally leaves `cmd/envoy-go/main.go:139` broken (`not enough arguments in call to admin.New`); Task 11 fixes the call site.
+**Outputs:**
+```
+$ go test ./internal/admin/... 2>&1 | tail -10
+ok  	github.com/esalaine/envoy-go/internal/admin	1.436s
+$ go vet ./internal/admin/...
+(no output — clean)
+$ golangci-lint run ./internal/admin/...
+(no output — clean)
+$ go build ./cmd/envoy-go/... 2>&1 | tail -3
+cmd/envoy-go/main.go:139:51: not enough arguments in call to admin.New
+	have (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager)
+	want (string, *stats.Registry, *bootstrap.Bootstrap, *cluster.Manager, *listener.Manager, *drain.Manager)
+(EXPECTED FAILURE — intentional broken-window; Task 11 fixes the call site)
+```
+
 ## Task 2 — `internal/drain/` package — `Manager` + `FuzzDrainTransitions` [ADR-0091]
 
 **Commits:** e884998a1a5b5b3a7bfbc2f2e84a4f9374d6d3ac — this task's substantive commit
