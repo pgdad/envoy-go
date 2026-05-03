@@ -35,6 +35,31 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 9 — HCM Inc/Dec hooks + `dm` field + constructor widening [ADR-0096]
+
+**Commits:** 9760837 — this task's substantive commit
+**Notes:** Widened `NewFilterWithCtxAndSinksAndRegistry` from 6-param to 7-param adding `dm *drain.Manager` as the last parameter. Widened `parseFilterWithCtx` correspondingly. Added `dm *drain.Manager` field to `Filter` struct (after `accessLog` field) with doc-comment per ADR-0096. H1.1 path: introduced `(*Filter).serveOneRequest(ctx, req, bw) bool` method to wrap the per-request loop body so `defer` fires at request-end (not connection-end — key correctness point for keep-alive connections); `runConnection`'s loop delegates per-iteration work there. Inside `serveOneRequest`: `var markedInflight bool`; `if f.dm != nil { f.dm.Inc(); markedInflight = true }`; `defer func() { if markedInflight { f.dm.Dec(); markedInflight = false } }()`. H2 path: identical Inc/Dec with `markedInflight` sentinel added directly inside `(*chainDispatchAction).WriteH2` (already a per-stream function, so defer fires per-stream = per-request). Listener `filterRegistry` HCM closure: removed `_ = dm` discard and now passes `dm` as 7th arg to `hcm.NewFilterWithCtxAndSinksAndRegistry` (replaces T5 placeholder). Updated all test call sites: `parseFilterTest` wrapper in `testhelpers_test.go`; 6 direct `parseFilterWithCtx` calls in `config_test.go`; 10 `NewFilterWithCtxAndSinksAndRegistry` calls in `filter_test.go`; 1 call in `fuzz_test.go`. Added 3 new tests: `TestHCM_DrainInflightBalance` (normal request completes → Dec → Done fires), `TestHCM_DrainInflightBalance_SendLocalReply` (no-route 404 path → defer Dec → Done fires), `TestHCM_DrainInflightBalance_NilDrainManager` (nil dm → no panic). `cmd/envoy-go` broken-window persists (Task 11 fixes).
+**Outputs:**
+```
+$ go test -count=1 ./internal/filter/hcm/... 2>&1 | tail -10
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.010s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	2.492s
+$ go test -race -count=1 ./internal/filter/hcm/... 2>&1 | tail -10
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.041s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	8.420s
+$ go test -count=1 ./internal/listener/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/listener	3.030s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.043s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	0.003s
+$ go vet ./internal/filter/hcm/... ./internal/listener/...
+(no output — clean)
+$ golangci-lint run ./internal/filter/hcm/... ./internal/listener/...
+(no output — clean)
+$ go build ./cmd/envoy-go/... 2>&1 | head -3
+cmd/envoy-go/main.go:122:130: not enough arguments in call to listener.NewManagerWithBaseDirAndAllowH2C
+(EXPECTED FAILURE — intentional broken-window; Task 11 fixes the call site)
+```
+
 ## Task 8 — `/ready` + `/server_info` DRAINING extensions [ADR-0097, ADR-0098]
 
 **Commits:** bed9c65 — this task's substantive commit
