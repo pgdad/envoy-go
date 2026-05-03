@@ -35,6 +35,31 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 5 — `internal/listener.Manager.Drain()` + Accept-loop fast-path [ADR-0094]
+
+**Commits:** 3b75a82 — this task's substantive commit
+**Notes:** Widened `NewManagerWithBaseDirAndAllowH2C` from 8-param to 9-param adding `dm *drain.Manager` as the last parameter (LBP-1 fifth-application carry-through; nil-safe for legacy callers). Added `dm *drain.Manager` field to both `Manager` struct and `listenerRuntime` struct; `dm` is propagated field-locally to each runtime at construction time to minimize hot-path indirection per ADR-0094. Updated `buildListenerRuntimeWithCtx` and `buildTerminalFilter` signatures to thread `dm` through; widened `filterConstructor` type and `filterRegistry` HCM/TCP-proxy closures to accept `dm` with `_ = dm` discard (T9/T10 widen the inner filter constructor signatures). Added `Drain()` public method on `*Manager` that delegates to `m.dm.Drain()` (nil-safe); idempotent via `sync.Once` in `drain.Manager`. Added Accept-loop fast-path: two lines AT THE TOP of each `acceptLoop` iteration after `ln.Accept()` returns — `if rt.dm != nil && rt.dm.IsDraining() { _ = raw.Close(); continue }` — without executing the 06.1 +2-LoC accept-site Inc lines. N-1 carry-forward: `Listeners()` doc-comment ordering note landed inline per SPEC §10.2. Updated 8 existing `NewManagerWithBaseDirAndAllowH2C` call sites in `manager_test.go` with trailing `nil`. Added 4 new drain tests: `TestManager_Drain`, `TestManager_DrainIdempotent`, `TestManager_AcceptDuringDrainClosesConn` (dials real listener post-Drain; asserts EOF accept-then-FIN), `TestManager_StopAfterDrain`. Appended ADR-0094 to `docs/envoy-go/DECISIONS.md`. cmd/envoy-go broken-window persists (Task 11 fixes).
+**Outputs:**
+```
+$ go test -count=1 ./internal/listener/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/listener	3.023s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.042s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	0.002s
+$ go test -race -count=1 ./internal/listener/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/internal/listener	4.066s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.049s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.011s
+$ go vet ./internal/listener/...
+(no output — clean)
+$ golangci-lint run ./internal/listener/...
+(no output — clean)
+$ grep -nE '^func \(m \*Manager\) Drain\(\)' internal/listener/manager.go
+981:func (m *Manager) Drain() {
+$ go build ./cmd/envoy-go/... 2>&1 | head -3
+cmd/envoy-go/main.go:122:130: not enough arguments in call to listener.NewManagerWithBaseDirAndAllowH2C
+(EXPECTED FAILURE — intentional broken-window; Task 11 fixes the call site)
+```
+
 ## Task 4 — `internal/cluster.Manager.Drain()` + `Cluster.closePool()` stub [ADR-0096 cluster anchor]
 
 **Commits:** 9289c13 — this task's substantive commit
