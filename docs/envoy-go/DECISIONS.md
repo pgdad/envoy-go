@@ -3927,4 +3927,106 @@ ADR-0088 is amended in-place per ADR-0089 consequence (b) pattern: the amendment
 
 (d) The differential comparator (Task 13 / SPEC §13.2) can byte-compare the `state` field value post-drain across both sides: both upstream Envoy (after `/healthcheck/fail` + `/drain_listeners`) and envoy-go (after `POST /drain_listeners`) return `"state": "DRAINING"`. The per-proxy trigger script normalizes for the separate upstream trigger per SPEC §7.2.
 
+---
+
+## ADR-0092: SIGTERM-handler drain-then-exit — deliberate divergence from Envoy v1.37.2's SIGTERM=immediate-exit
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (capture empirical observations as ADRs when the contract source is not derivable from documentation), D-3.5 (decisions written down).
+**Lands-in-task:** 08.2 PLAN Task 11 (`cmd/envoy-go/main.go` SIGTERM-handler upgrade).
+
+### Context
+
+SPEC §6.8 + §11.7 + BRAINSTORM Decision 2. The §11.7 empirical evidence pins Envoy v1.37.2's SIGTERM and SIGINT paths as STRUCTURALLY IDENTICAL: both produce immediate-exit with ~6-7ms round-trip (`caught X` → `shutting down server instance` → `exiting`; no observable drain delay). This SURPRISES and CONTRADICTS BRAINSTORM Decision 2's hypothesis, which assumed Envoy's SIGTERM = drain-then-exit and treated envoy-go's proposed drain-then-exit as Envoy parity. In reality, Envoy's drain machinery is triggered via the admin surface (`/drain_listeners` + `/healthcheck/fail`) — SIGTERM bypasses it entirely at v1.37.2.
+
+envoy-go's existing `signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)` registration stays unchanged: both SIGTERM and SIGINT cancel the context and unblock `<-ctx.Done()`. The upgrade is in the body that runs AFTER `<-ctx.Done()`.
+
+### Decision
+
+The `<-ctx.Done()` body is upgraded from a bare block-until-signal to the drain-then-exit sequence per SPEC §6.8:
+
+```go
+<-ctx.Done()
+log.Print("signal received; initiating graceful drain")
+drainMgr.Drain()
+select {
+case <-drainMgr.Done():
+    log.Print("drain rendezvous: in-flight reached 0")
+case <-time.After(drainMgr.Timeout()):
+    log.Print("drain rendezvous: timeout fired (best-effort)")
+}
+cm.Drain()
+// deferred-stop chain runs as the function unwinds (LIFO: lm.Stop, admSrv.Close, sinks-close)
+```
+
+This is a **deliberate divergence** from upstream Envoy v1.37.2's SIGTERM=immediate-exit behavior. The rationale is operator ergonomics: most Kubernetes and cluster orchestrators send SIGTERM to a terminating pod expecting graceful drain (rolling-restart workflow). envoy-go's drain machinery honors this expectation.
+
+Per planner-time decision 9: `cm.Drain()` is an explicit call after the drain rendezvous, not deferred. Deferred calls continue to run as the function unwinds (LIFO order: `lm.Stop`, `admSrv.Close`, sinks-close).
+
+### Alternatives considered
+
+(A) Preserve Envoy parity: bare `<-ctx.Done()` with immediate exit. Rejected: operator-unfriendly in Kubernetes rolling-restart workflows; envoy-go's drain machinery would be dead code on the SIGTERM path.
+
+(B) Issue `drainMgr.Drain()` via SIGTERM and `drainMgr.Drain()` separately from the admin handler (two separate trigger paths). Accepted as-is: both the admin handler (`POST /drain_listeners`) and the SIGTERM path call `drainMgr.Drain()` — `Drain()` is idempotent (once-only via `sync.Once` per ADR-0091).
+
+(C) Block `<-ctx.Done()` until drain completes without a timeout select. Rejected: drain without a timeout risks blocking indefinitely on hung in-flight connections; ADR-0095 establishes the 30s timeout bound.
+
+### Consequences
+
+(a) SIGTERM and SIGINT on envoy-go now trigger drain-then-exit. Kubernetes rolling-restart (SIGTERM) will wait up to 30s (per ADR-0095) for in-flight connections to complete before the process exits.
+
+(b) The differential equivalence claim does NOT exercise the SIGTERM path — only the admin-trigger path (`POST /drain_listeners`) runs differentially (SPEC §13.2). The SIGTERM path is envoy-go-only structural-completeness.
+
+(c) BEHAVIOR_CONTRACT.md `## Graceful drain ### Drain triggers` (§13.4 / Task 13) documents the divergence at the contract level: `SIGTERM` is listed as an envoy-go-only trigger with an explicit note that upstream Envoy v1.37.2 does not drain on SIGTERM.
+
+(d) `drainMgr.Drain()` is idempotent: if the admin handler fires drain before SIGTERM arrives, the SIGTERM path's `drainMgr.Drain()` call is a no-op; the rendezvous select correctly picks up the already-closed `Done()` channel.
+
+---
+
+## ADR-0095: Drain timeout 30s envoy-go MVP default — deliberate divergence from Envoy v1.37.2's 600s default
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (capture empirical observations as ADRs when the contract source is not derivable from documentation), D-3.5 (decisions written down).
+**Lands-in-task:** 08.2 PLAN Task 11 (`cmd/envoy-go/main.go` `drain.New(30 * time.Second)` boot site).
+
+### Context
+
+SPEC §11.7 verbatim re-validation of `"drain_time": "600s"` (Envoy v1.37.2 default; visible in the `/server_info` `command_line_options` field) + BRAINSTORM Decision 6. Envoy's drain_time default is 600 seconds (~10 minutes). Using 600s for envoy-go's drain timeout would block the differential gate for up to 10 minutes per test run on the graceful-drain fixture (Task 12) — unacceptable for a fast-feedback CI gate.
+
+Per ADR-0091 design decision: the `drain.Manager` does NOT enforce the timeout internally. Callers select on `time.After(drainMgr.Timeout())` alongside `drainMgr.Done()`. This means the timeout value is a caller-side concern, not a Manager-side enforcement, and test code can construct `drain.New(10 * time.Millisecond)` for fast-path tests without fighting the Manager.
+
+### Decision
+
+The drain timeout is hardcoded `30 * time.Second` at the `cmd/envoy-go/main.go` boot site:
+
+```go
+drainMgr := drain.New(30 * time.Second)
+```
+
+The literal lives at the call site (not as a constant in the `drain` package) so test code and integration fixtures can construct `drain.New(<any duration>)` without importing a constant that encodes a production policy. The `Timeout()` accessor on `Manager` returns whatever duration was passed to `New`.
+
+This is a **deliberate divergence** from Envoy v1.37.2's 600s default. The equivalence claim is over drain BEHAVIOR (in-flight counter mechanics, Done channel semantics, DRAINING state rendering) not timeout VALUE.
+
+### Alternatives considered
+
+(A) Use Envoy's 600s default. Rejected: would block CI differential gate for ~10 minutes per test run; unacceptable for a fast-feedback workflow.
+
+(B) Use a flag (`--drain-timeout`) to make the timeout operator-configurable. Deferred: the operator-knob is a future runtime/hot-restart family phase concern. Hardcoding at the boot site keeps the MVP minimal; the literal's location (call site, not package constant) ensures refactoring to a flag later is a one-liner.
+
+(C) Encode the 30s default as a constant in the `drain` package (`drain.DefaultTimeout`). Rejected: a package-level constant would be imported by test code and fixture runners, coupling their timing to the production default. The call-site literal keeps test construction free to choose any duration.
+
+(D) Make the Manager enforce the timeout internally (blocking `Drain()` until either Done or timeout). Rejected: per ADR-0091 design — callers own the timeout select. Internal enforcement would make `drain.Manager` untestable at fast timescales without mocking `time.After`.
+
+### Consequences
+
+(a) Drain timeout is 30s in the envoy-go MVP binary. Kubernetes `terminationGracePeriodSeconds` should be set to at least 35s (30s drain + 5s headroom) for production-like deployments.
+
+(b) The equivalence claim is over drain BEHAVIOR not timeout VALUE. The differential fixture (Task 12) uses `drain.New(10 * time.Millisecond)` in test helpers for near-instant drain completion; the production 30s literal is not exercised in the differential gate.
+
+(c) Operator-knob to configure the timeout is deferred to a future runtime/hot-restart family phase. The boot-site literal is the single change point; a flag-parsing addition would be localized to `cmd/envoy-go/main.go`.
+
+(d) The `Manager` itself does NOT enforce the timeout — callers select on `time.After` alongside `Done` per ADR-0091 design. This is visible in the Task 11 SIGTERM-handler block and the admin drain handler (Task 7 / ADR-0093); both use caller-side timeout selects.
+
 

@@ -17,11 +17,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/admin"
 	"github.com/esalaine/envoy-go/internal/bootstrap"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/cors"
 	"github.com/esalaine/envoy-go/internal/filter/http/envoygotest"
@@ -55,6 +57,15 @@ func main() {
 	// than parsed-from-bootstrap because Envoy v3 Bootstrap has no
 	// config_path field — it's a CLI argument the operator passed.
 	bs.ConfigPath = *cfgPath
+
+	// Phase 08.2 (Task 11) drain manager allocation per SPEC §5.1 boot-order
+	// + planner-time decision 7: after bootstrap.Load (no dependencies on the
+	// bootstrap proto) and before cluster.NewManagerWithBaseDir (the drain
+	// manager is consumed by all subsequent constructors). The 30s timeout is
+	// the hardcoded envoy-go MVP default per ADR-0095 (Envoy v1.37.2 default
+	// is 600s per §11.7 + 08.1 SPEC §11.4 — deliberate divergence to keep test-
+	// suite cost tractable; operator-knob deferred per ADR-0095).
+	drainMgr := drain.New(30 * time.Second)
 
 	adminHost, adminPort, err := bootstrap.AdminSocket(bs.Proto)
 	if err != nil {
@@ -119,7 +130,7 @@ func main() {
 	lfReg.Register(tls_inspector.TypeURL, tls_inspector.New)
 	lfReg.Freeze()
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}
@@ -136,7 +147,7 @@ func main() {
 	// 08.1 SPEC does not mandate a strict ordering across these resources;
 	// the move from pre-lm to post-lm is the LBP-1 cost (cluster + listener
 	// must exist before admin can introspect them).
-	admSrv := admin.New(adminAddr, bs.Stats, bs, cm, lm)
+	admSrv := admin.New(adminAddr, bs.Stats, bs, cm, lm, drainMgr)
 	if _, err := admSrv.Start(); err != nil {
 		log.Fatalf("admin start %s: %v", adminAddr, err)
 	}
@@ -168,4 +179,21 @@ func main() {
 	_, _ = fmt.Fprintln(os.Stdout, "envoy-go ready")
 
 	<-ctx.Done()
+	log.Print("signal received; initiating graceful drain")
+	// Phase 08.2 (Task 11) drain rendezvous per SPEC §5.2 + §6.8 + ADR-0092:
+	// drain-then-exit on SIGTERM/SIGINT (deliberate divergence from Envoy
+	// v1.37.2's SIGTERM=immediate-exit per §11.7 — operator-ergonomic choice).
+	// Bound by drainMgr.Timeout() (30s default per ADR-0095).
+	drainMgr.Drain()
+	select {
+	case <-drainMgr.Done():
+		log.Print("drain rendezvous: in-flight reached 0")
+	case <-time.After(drainMgr.Timeout()):
+		log.Print("drain rendezvous: timeout fired (best-effort)")
+	}
+	// Per planner-time decision 9: explicit cm.Drain() call after rendezvous,
+	// before deferred-stop chain runs (LIFO: lm.Stop, admSrv.Close, sinks-close).
+	// Best-effort upstream-pool close per ADR-0096.
+	cm.Drain()
+	// Existing deferred-stop chain runs as the function unwinds.
 }
