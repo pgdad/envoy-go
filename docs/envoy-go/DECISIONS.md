@@ -4092,7 +4092,7 @@ This decision is deferred to a future feature-family phase under BOOTSTRAP_PROMP
 **Status:** Accepted
 **Date:** 2026-05-03
 **Doctrine:** D-3.5 (record durable design rationale; the package shape is a contract that future filter authors mirror) + D-3.4 (the `FactoryCtx` extension is a framework-level invariant that future stat-bearing filters depend on).
-**Lands-in-task:** Task 3 (phase 09); commit TBD. Code consequences span Task 2 (FactoryCtx extension at `internal/filter/http/types.go` — ADR text references the framework-extension that Task 2 lands) and Task 8 (boot registration line in `cmd/envoy-go/main.go`).
+**Lands-in-task:** Task 3 (phase 09); commit e80aa10. Code consequences span Task 2 (FactoryCtx extension at `internal/filter/http/types.go` — ADR text references the framework-extension that Task 2 lands) and Task 8 (boot registration line in `cmd/envoy-go/main.go`).
 
 ### Context
 
@@ -4162,7 +4162,7 @@ The framework's `parseHTTPFiltersChain` (in `internal/filter/hcm/config.go`) pop
 **Status:** Accepted
 **Date:** 2026-05-03
 **Doctrine:** D-3.5 (record durable design rationale; the runtimeConfig shape is the load-bearing parser contract for fault's behavioral semantics) + D-3.3 (the silent-ignore decomposition is the empirically-pinned divergence from upstream Envoy and must be recorded for differential-fixture readers).
-**Lands-in-task:** Task 3 (phase 09); commit TBD.
+**Lands-in-task:** Task 3 (phase 09); commit e80aa10.
 
 ### Context
 
@@ -4245,7 +4245,7 @@ This is settled in Task 3 by the `rng: rand.New(rand.NewSource(time.Now().UnixNa
 **Status:** Accepted
 **Date:** 2026-05-03
 **Doctrine:** D-3.3 (the stat-name set is differentially observable and the empirical pin against reference Envoy v1.37.2 is the durable evidence) + D-3.5 (record durable design rationale).
-**Lands-in-task:** Task 3 (phase 09); commit TBD. Stat registration code lands in Task 3; the BEHAVIOR_CONTRACT.md table extension lands in Task 15 alongside the rest of the §13 patches.
+**Lands-in-task:** Task 3 (phase 09); commit e80aa10. Stat registration code lands in Task 3; the BEHAVIOR_CONTRACT.md table extension lands in Task 15 alongside the rest of the §13 patches.
 
 ### Context
 
