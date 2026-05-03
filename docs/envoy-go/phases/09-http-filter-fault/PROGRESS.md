@@ -720,7 +720,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.050s
 
 ## Task 10 — BackendKind HTTPFault enum + startHTTPFaultBackend spawn helper
 
-**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Commits:** 8366980 — this task's commit; TBD — SHA-fill follow-up
 **Notes:** Mechanical fixture-infrastructure task per PLAN.md Task 10 Steps 1–2 (Step 3 build/test gate, Step 4 commit). Step 1 added `HTTPFault BackendKind = 8` to `test/differential/fixture/fixture.go` after the existing `HTTPSlowStream BackendKind = 7`, with the doc-comment per PLAN snippet (deterministic-body backend serving `/` → `"backend\n"` (8 bytes), no TLS, subprocess thus no in-process accept counter). Step 2 added two pieces to `test/differential/runner_test.go`: (a) `startHTTPFaultBackend(ctx, repoRoot, port)` helper after `startHTTPSlowStreamBackend`, mirroring the `exec.CommandContext("go", "run", "./test/fixtures/0011-http-fault/backends", "--port", …)` + `cmd.Dir = repoRoot` + Stdout/Stderr → os.Stderr + `Setpgid: true` + `Start()` pattern; (b) `case fixture.HTTPFault:` in the runFixture switch immediately after `case fixture.HTTPSlowStream:`, mirroring the freeTCPPort + bo.port = port + start backend + bo.proc = cmd + defer-SIGKILL-process-group + waitTCPDial(5s) shape. Per PLAN's revised step 2(c), the blank-import for the driver package is DEFERRED to Task 14 (driver package doesn't exist until Task 14, so adding the blank-import now would break `go build`). Step 3 ran the four-gate suite — `go build ./...` + `go vet ./...` + `golangci-lint run ./...` + `go test -race -count=1 -short ./...` all clean; 33 packages PASS unchanged; the runner correctly does NOT see fixture 0011-http-fault yet (no fixture dir created until Tasks 11+). NO new ADR.
 **Outputs:**
 ```
