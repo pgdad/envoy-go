@@ -163,6 +163,54 @@ func parseRuntimeConfig(c *faultv3.HTTPFault) (*runtimeConfig, error) {
 	return rc, nil
 }
 
+// routeConfigOrListener resolves the per-route runtimeConfig if a per-route
+// HTTPFault is present (wholesale-override per §11.7), else returns the
+// listener-level config from the factory closure. Per ADR-0073 + SPEC §6.5.
+//
+// Wholesale-override discipline (NOT field-merge): when the chain's
+// RequestRouteConfig returns a non-nil *faultv3.HTTPFault proto,
+// parseRouteRuntimeConfig projects it independently — a per-route HTTPFault
+// that omits `delay` does NOT inherit the listener-level `delay`. Any error
+// from parseRouteRuntimeConfig (validation race or defensively-malformed
+// fixture) defensively falls through to the listener config; per-route
+// configs are validated at HCM-build time so this path is unreachable in
+// production, but the guard keeps DecodeHeaders panic-free under any input.
+func (f *filter) routeConfigOrListener() *runtimeConfig {
+	if f.dcb == nil {
+		return f.cfg
+	}
+	raw := f.dcb.RequestRouteConfig()
+	if raw == nil {
+		return f.cfg
+	}
+	routeProto, ok := raw.(*faultv3.HTTPFault)
+	if !ok {
+		return f.cfg // defensive; shouldn't happen if perroute parses anypb correctly
+	}
+	rc, err := parseRouteRuntimeConfig(routeProto)
+	if err != nil {
+		// Per-route config is invalid — silently fall through to listener config.
+		// The boot-time factory would have rejected the listener config; per-route
+		// configs are validated at HCM-build time too, so reaching this branch
+		// means a runtime parse race or a defensively-malformed test fixture.
+		return f.cfg
+	}
+	return rc
+}
+
+// parseRouteRuntimeConfig is the per-route projection of HTTPFault into
+// runtimeConfig. Per planner-time decision 2 (KEEP separate from
+// parseRuntimeConfig): kept as its own function so the New-time-only validations
+// (the `tc != nil` guard upstream of parseRuntimeConfig in New) stay distinct
+// from per-route-resolve-time validation. Today the body delegates to
+// parseRuntimeConfig directly because the SPEC §11.7 wholesale-override
+// discipline applies the same field validation to both inputs; if a future
+// per-route deferral diverges (e.g., a per-route-only field set), this
+// function diverges without affecting parseRuntimeConfig's New-time semantics.
+func parseRouteRuntimeConfig(c *faultv3.HTTPFault) (*runtimeConfig, error) {
+	return parseRuntimeConfig(c)
+}
+
 // percentageToFloat projects FractionalPercent into a float64 in [0, 100].
 // Envoy's FractionalPercent denominator is one of HUNDRED / TEN_THOUSAND / MILLION.
 func percentageToFloat(p *typev3.FractionalPercent) float64 {
@@ -227,7 +275,7 @@ func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ec
 // Task 4 lands the abort-only path + headers gate + percentage roll. Tasks 5/6/7
 // fill in delay async-resume, max_active_faults Inc/Dec, and per-route 3-tier merge.
 func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	cfg := f.cfg // Task 7 replaces with f.routeConfigOrListener()
+	cfg := f.routeConfigOrListener()
 	if !f.matchesHeaders(headers, cfg) {
 		return envoyhttp.Continue
 	}

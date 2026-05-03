@@ -614,6 +614,49 @@ func TestOnDestroy_TimerStopped(t *testing.T) {
 	}
 }
 
+// TestPerRouteWholesaleOverride verifies the per-route 3-tier merge
+// wholesale-override discipline per ADR-0073 + SPEC §6.5 + §11.7. Listener-level
+// config carries a 200ms delay only; per-route HTTPFault carries an abort 100%
+// 418 with NO delay. When `cb.RequestRouteConfig()` returns the per-route
+// HTTPFault proto, `routeConfigOrListener` projects it WHOLESALE (NOT
+// field-merge) so the listener-level delay is dropped; the abort fires
+// immediately (elapsed < 50ms) and `sentStatus == 418`. Confirms that a
+// per-route HTTPFault that omits `delay` does NOT inherit the listener-level
+// `delay` per the §11.7 empirical pin.
+func TestPerRouteWholesaleOverride(t *testing.T) {
+	listenerCfg := &faultv3.HTTPFault{
+		Delay: &commonfaultv3.FaultDelay{
+			Percentage:         &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+			FaultDelaySecifier: &commonfaultv3.FaultDelay_FixedDelay{FixedDelay: durationpb.New(200 * time.Millisecond)},
+		},
+	}
+	routeCfg := &faultv3.HTTPFault{
+		Abort: &faultv3.FaultAbort{
+			Percentage: &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+			ErrorType:  &faultv3.FaultAbort_HttpStatus{HttpStatus: 418},
+		},
+	}
+	factory, err := New(mustAny(t, listenerCfg), envoyhttp.FactoryCtx{Stats: stats.NewRegistry(), StatPrefix: "x"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	fl := factory().Decoder.(*filter)
+	dcb := &recordingDCB{routeCfg: routeCfg}
+	fl.SetDecoderCallbacks(dcb)
+	start := time.Now()
+	status := fl.DecodeHeaders(http.Header{}, true)
+	elapsed := time.Since(start)
+	if status != envoyhttp.StopIteration {
+		t.Errorf("status: got %v, want StopIteration (per-route abort should fire)", status)
+	}
+	if got := dcb.Status(); got != 418 {
+		t.Errorf("sentStatus: got %d, want 418 (per-route override)", got)
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("elapsed: got %v, want <50ms (no inherited delay — wholesale-override)", elapsed)
+	}
+}
+
 // TestFault_DelayTimerRace is the race-detector cycle test per planner-time
 // decision 10. Skip under -short. Loop 100 iterations with 1ms delay; each
 // iteration: factory() → DecodeHeaders → sleep 0/1ms → OnDestroy. Forces
