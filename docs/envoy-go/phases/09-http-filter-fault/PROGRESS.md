@@ -900,3 +900,5 @@ $ go test -race -count=1 -short ./...
 ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.300s
 ok  	(33 packages PASS unchanged; one transient flake in internal/filter/hcm/h2 TestServerStream_StateTransitions_HeadersThenData unrelated to YAML; PASSED on retry with -count=3)
 ```
+
+Task 12 follow-up: smoke test revealed envoy-go's cluster manager only supports STATIC clusters (not STRICT_DNS). Updated envoy-go.yaml to type: STATIC with literal 127.0.0.1 (port still templated). The reference envoy.yaml retains STRICT_DNS + host.docker.internal per ADR-0010. The planner-time decision 8 wording in PLAN.md was incomplete (should have specified the split per 0007a-cors precedent); the corrected disposition is now: reference Envoy uses STRICT_DNS in Docker (host.docker.internal); envoy-go subject uses STATIC with 127.0.0.1. Commit 2d0cf9a.
