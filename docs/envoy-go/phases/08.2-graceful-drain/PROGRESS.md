@@ -38,7 +38,7 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
 **Commits:** 1ce41cc8ca4b9776992abdc24b7aff6178a451ea — this task's commit
-**Notes:** Created PROGRESS.md; verified all 15 preconditions per PLAN §"Execution preconditions"; phase-08.2 SPEC + 08.2 PLAN confirmed present in HEAD; SPEC at 546b08a; ADR tail at 0090 (next-free 0091); internal/drain/ absent (Task 2 lands); listener/cluster Manager.Drain() not yet present (Tasks 5/6); admin.New constructor at 6-param 08.1 form (Task 3 widens to 7-param). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention; ADRs land at first-use commit per PLAN's ADR table).
+**Notes:** Created PROGRESS.md; verified all 15 preconditions per PLAN §"Execution preconditions"; phase-08.2 SPEC + 08.2 PLAN confirmed present in HEAD; SPEC at 0fc63f6 (descendant of 546b08a; typo-fix follow-up touched SPEC.md); ADR tail at 0090 (next-free 0091); internal/drain/ absent (Task 2 lands); listener/cluster Manager.Drain() not yet present (Tasks 5/6); admin.New constructor at 6-param 08.1 form (Task 3 widens to 7-param). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention; ADRs land at first-use commit per PLAN's ADR table).
 **Outputs:**
 ```
 $ git rev-parse --abbrev-ref HEAD
