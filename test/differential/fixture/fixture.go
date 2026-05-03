@@ -173,6 +173,14 @@ const (
 	// and the fixed body covers the no-body modes. Because the backend is a
 	// subprocess, the runner's in-process accept counter is NOT incremented.
 	HTTPEchoBody BackendKind = 6
+	// HTTPSlowStream is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0010-graceful-drain/backends/backend.go on the pre-allocated
+	// port. The backend serves /slow which streams 5KB at 1KB/s (5s total), and
+	// / which returns 200 OK with body "backend1\n". No TLS. Introduced by
+	// fixture 0010-graceful-drain (phase 08.2 Task 12) to provide a stable 5s
+	// in-flight window for the graceful-drain differential. Because the backend
+	// is a subprocess, the runner's in-process accept counter is NOT incremented.
+	HTTPSlowStream BackendKind = 7
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

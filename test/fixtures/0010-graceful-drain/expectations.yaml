@@ -1,0 +1,48 @@
+# Phase 08.2 fixture 0010-graceful-drain — expectations
+#
+# This file is prose, not machine-evaluated (per ADR-0019). The runner
+# enforces the assertions described below via the driver's per-step
+# assertions in driver.go.
+#
+# Asserted per-state-transition equivalence (per SPEC §7.1):
+#
+#   1. Steady-state /ready (pre-drain): byte-equal "LIVE\n" on both proxies.
+#   2. POST /drain_listeners response: byte-equal "OK\n" on both proxies.
+#      Status 200 on both. Headers structurally equivalent under the
+#      standard six-header set per SPEC §11.6.
+#   3. /ready DRAINING: byte-equal "DRAINING\n" on both proxies. Status 503.
+#      NOTE: per §11.2 empirical pin, upstream Envoy v1.37.2's /ready returns
+#      DRAINING ONLY after POST /healthcheck/fail. The driver's per-proxy
+#      trigger script normalizes:
+#        - envoy-go gets POST /drain_listeners (which triggers DRAINING in
+#          envoy-go's design — unified drain.Manager).
+#        - reference Envoy gets POST /drain_listeners + POST /healthcheck/fail
+#          (which together trigger DRAINING in Envoy's design).
+#   4. /server_info DRAINING: state field byte-equal "DRAINING" when both
+#      proxies are in DRAINING. Other fields per the ADR-0088 allow-list
+#      (08.1 baseline carries forward).
+#   5. In-flight GET /slow request: 200 OK with body length 5KB; body bytes
+#      byte-equal across both proxies (the upstream backend serves the same
+#      content on both runs; the proxy is transparent).
+#
+# Connectivity-level checks (NOT body-level diff):
+#   - New TCP connect attempt during drain: TCP handshake succeeds; HTTP
+#     read returns empty/error per §11.5 accept-then-FIN. Both proxies
+#     exhibit this behavior.
+#
+# SIGTERM-trigger driver path (per SPEC §7.3):
+#   - Envoy-go ONLY (per §11.7 deviation — Envoy v1.37.2 SIGTERM is
+#     immediate-exit, NON-equivalent). Asserts envoy-go's drain rendezvous
+#     + exit ordering are correct. Exit status 0 expected.
+#   - Deferred per PLAN gotcha 1: the differential runner harness does not
+#     expose SIGTERM injection. This path is not exercised by the
+#     differential fixture at this time.
+#
+# Cross-references:
+#   - SPEC §7 (differential fixture); §11.1–§11.7 (verbatim Envoy scrapes)
+#   - ADR-0093 (POST /drain_listeners contract)
+#   - ADR-0097 (/ready DRAINING extension)
+#   - ADR-0098 (/server_info DRAINING transition)
+#   - ADR-0094 (listener accept-then-FIN)
+#   - planner-time decision 8 (driver framework reuse: shared boot helpers;
+#     canonicalisation NOT shared)

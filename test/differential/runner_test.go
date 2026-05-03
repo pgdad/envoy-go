@@ -32,6 +32,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -186,6 +187,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startHTTPEchoBodyBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPSlowStream:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPSlowStreamBackend(ctx, root, port)
 			if err != nil {
 				t.Fatalf("backend[%d] start: %v", i, err)
 			}
@@ -739,6 +758,27 @@ func startHTTPHelloBackend(ctx context.Context, repoRoot string, port int) (*exe
 // accept counter is NOT incremented.
 func startHTTPEchoBodyBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0007b-iteration-probe/backends",
+		"--port", fmt.Sprintf("%d", port),
+	)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	return cmd, nil
+}
+
+// startHTTPSlowStreamBackend spawns the fixture-0010 HTTP/1.1 slow-stream backend
+// subprocess on port. The backend serves /slow which streams 5KB at 1KB/s
+// (5s total), and / which returns 200 OK with body "backend1\n". No TLS.
+// Introduced for fixture 0010-graceful-drain (phase 08.2 Task 12) for the
+// stable 5s in-flight window needed by the graceful-drain differential.
+// Because the backend is a subprocess, the runner's in-process accept counter
+// is NOT incremented.
+func startHTTPSlowStreamBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0010-graceful-drain/backends",
 		"--port", fmt.Sprintf("%d", port),
 	)
 	cmd.Dir = repoRoot
