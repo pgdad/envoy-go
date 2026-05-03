@@ -20,6 +20,7 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/filter/hcm"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
@@ -53,24 +54,31 @@ type listenerCtx struct {
 // filterConstructor builds a filterHandler from a typed_config Any, the
 // resolved cluster manager, per-chain listenerCtx, the Registry the HCM
 // constructor will use to allocate its 5 per-instance metrics (06.1 Task 11),
-// the accessLogSinks slice threaded from main.go (06.2 Task 14), and the
+// the accessLogSinks slice threaded from main.go (06.2 Task 14), the
 // boot-populated, frozen *filter_http.HTTPRegistry threaded from main.go
-// (07.1 Task 14, per ADR-0072). The TCP-proxy constructor ignores everything
-// past cm (no per-tcp_proxy metrics, access logging, or HTTP-filter chain
-// in the L4 path).
-type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry) (filterHandler, error)
+// (07.1 Task 14, per ADR-0072), and the central *drain.Manager threaded from
+// the listener Manager (08.2 Task 5, per ADR-0094). The TCP-proxy constructor
+// ignores everything past cm (no per-tcp_proxy metrics, access logging, or
+// HTTP-filter chain in the L4 path); tasks 9/10 widen the inner filter
+// constructor signatures to consume dm.
+type filterConstructor func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, dm *drain.Manager) (filterHandler, error)
 
 // filterRegistry maps a filter typed_config.type_url to its constructor.
 // SPEC §5.3: inline; phase 07 generalises.
+// 08.2 Task 5: closures widened to accept dm *drain.Manager; _ = dm discard
+// keeps the build clean until T9/T10 widen the inner filter constructor
+// signatures per ADR-0094.
 var filterRegistry = map[string]filterConstructor{
-	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx, _ *stats.Registry, _ []accesslog.Sink, _ *filter_http.HTTPRegistry) (filterHandler, error) {
+	tcpproxy.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, _ listenerCtx, _ *stats.Registry, _ []accesslog.Sink, _ *filter_http.HTTPRegistry, dm *drain.Manager) (filterHandler, error) {
+		_ = dm // T10 will plumb dm into tcpproxy.NewFilter
 		f, err := tcpproxy.NewFilter(tc, cm)
 		if err != nil {
 			return nil, err
 		}
 		return f, nil
 	},
-	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry) (filterHandler, error) {
+	hcm.TypeURL: func(tc *anypb.Any, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, dm *drain.Manager) (filterHandler, error) {
+		_ = dm // T9 will plumb dm into hcm.NewFilterWithCtxAndSinksAndRegistry
 		// Bridge listenerCtx into hcm.ListenerCtx (the public shape exposed by
 		// hcm so that the listener manager doesn't import hcm-internal types).
 		// Phase 06.1 Task 11: the Registry is consumed by the HCM constructor
@@ -131,6 +139,9 @@ type listenerRuntime struct {
 	// pre-Freeze) and Inc/Dec'd from the accept-loop hot path.
 	downstreamCxTotal  *stats.Counter
 	downstreamCxActive *stats.Gauge
+	// 08.2 (Task 5) drain fast-path field. Field-local (not chasing back through
+	// *Manager) to minimize hot-path indirection per ADR-0094.
+	dm *drain.Manager
 }
 
 // Manager owns every listener materialized from static_resources.listeners[]
@@ -138,6 +149,7 @@ type listenerRuntime struct {
 type Manager struct {
 	runtimes  []*listenerRuntime
 	registry  *stats.Registry // captured at NewManager; consumed at Start to register the 2 listener-scope metrics per resolved bind address
+	dm        *drain.Manager  // 08.2 Task 5: central drain manager; nil if drain is not wired (legacy callers)
 	startedMu sync.Mutex
 	started   bool
 }
@@ -164,7 +176,7 @@ type Manager struct {
 // freeze-after-boot). Task 20 wires the real boot-time population; until then
 // callers (test bootstraps) build a router-only frozen registry.
 func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.Registry, httpRegistry *filter_http.HTTPRegistry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil, nil)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
@@ -176,7 +188,7 @@ func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.
 // Phase 06.1 (Task 10): see NewManager doc — same Registry contract applies.
 // Phase 07.1 (Task 14): see NewManager doc — same HTTPRegistry contract applies.
 func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, registry *stats.Registry, httpRegistry *filter_http.HTTPRegistry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil, nil)
 }
 
 // NewManagerWithBaseDirAndAllowH2C is the phase-05.1 constructor variant. It
@@ -204,15 +216,15 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 // resolution. May be nil — but if any listener in bs has a non-empty
 // `listener_filters[]`, a non-nil frozen registry is required (the parser
 // errors otherwise).
-func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry) (*Manager, error) {
+func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager) (*Manager, error) {
 	ls := bs.GetStaticResources().GetListeners()
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
 	}
-	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry}
+	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry, dm: dm}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
@@ -220,6 +232,7 @@ func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Man
 			return nil, fmt.Errorf("listener: duplicate listener name %q", rt.name)
 		}
 		seen[rt.name] = struct{}{}
+		rt.dm = dm // 08.2 Task 5: propagate drain manager to each runtime for fast-path
 		m.runtimes = append(m.runtimes, rt)
 	}
 	return m, nil
@@ -283,7 +296,7 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 // per SPEC §12. The phase-03 parse-time errors on `default_filter_chain` and
 // `listener_filters[]` (ADR-0033 clauses 3 and 8) are also superseded; both
 // fields are now honored.
-func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry) (*listenerRuntime, error) {
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -336,7 +349,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 
 		// Build the terminal filter (same single-filter rule as phase 02).
-		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C}, registry, accessLogSinks, httpRegistry)
+		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
@@ -395,7 +408,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 		// Per ADR-0080: default_filter_chain has an INDEPENDENT TLS posture
 		// from filter_chains[] — no mixed-TLS-rule cross-check here.
-		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C}, registry, accessLogSinks, httpRegistry)
+		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, errUnwrapFilterChain(err))
 		}
@@ -461,7 +474,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 // with the standard `listener: %q: filter_chains[%d]: ...` (or
 // `listener: %q/default: ...` when chainIdx is -1, denoting
 // default_filter_chain) prefix to keep error-prefix discipline intact.
-func buildTerminalFilter(name string, chainIdx int, filters []*listenerv3.Filter, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry) (filterHandler, error) {
+func buildTerminalFilter(name string, chainIdx int, filters []*listenerv3.Filter, cm *cluster.Manager, lc listenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, dm *drain.Manager) (filterHandler, error) {
 	prefix := fmt.Sprintf("listener: %q: filter_chains[%d]", name, chainIdx)
 	if chainIdx < 0 {
 		// Caller (default_filter_chain path) re-wraps with the proper prefix;
@@ -479,7 +492,7 @@ func buildTerminalFilter(name string, chainIdx int, filters []*listenerv3.Filter
 	if !ok {
 		return nil, fmt.Errorf("%s: unknown filter type_url %q", prefix, tc.GetTypeUrl())
 	}
-	fh, err := ctor(tc, cm, lc, registry, accessLogSinks, httpRegistry)
+	fh, err := ctor(tc, cm, lc, registry, accessLogSinks, httpRegistry, dm)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", prefix, err)
 	}
@@ -793,6 +806,16 @@ func (rt *listenerRuntime) acceptLoop(ctx context.Context, ln net.Listener) {
 			log.Printf("listener %q: accept: %v", rt.name, err)
 			continue
 		}
+		// 08.2 (Task 5) drain fast-path per ADR-0094 + SPEC §11.5: on drain,
+		// the accepted conn is immediately closed without filter-chain
+		// dispatch (TCP handshake completes; the client observes accept-then-
+		// FIN — "Empty reply from server" per curl error 52). The 06.1 +2-LoC
+		// accept-site Inc lines are NOT executed for the drained-conn case
+		// (the conn never enters serveConnection).
+		if rt.dm != nil && rt.dm.IsDraining() {
+			_ = raw.Close()
+			continue
+		}
 		// 06.1 hot path (SPEC §5.5): +2 LoC at the accept site; the matching
 		// Dec is deferred in serveConnection.
 		rt.downstreamCxTotal.Inc()
@@ -925,6 +948,10 @@ func remotePort(c net.Conn) uint32 {
 
 // Listeners returns one Info per bound listener. Empty before Start or after a
 // Start that errored out (the unwind clears every socket).
+//
+// Order is bootstrap-declaration order; callers needing alphabetical ordering
+// must sort. (Per 08.1 REVIEW N-1 carry-forward, landed inline in 08.2 Task 5
+// per SPEC §10.2.)
 func (m *Manager) Listeners() []Info {
 	out := make([]Info, 0, len(m.runtimes))
 	for _, rt := range m.runtimes {
@@ -934,6 +961,27 @@ func (m *Manager) Listeners() []Info {
 		out = append(out, Info{Name: rt.name, Addr: rt.netLn.Addr().String()})
 	}
 	return out
+}
+
+// Drain transitions the manager to drain mode by calling m.dm.Drain()
+// (delegates to the central drain.Manager). The per-runtime Accept loops
+// already check m.dm.IsDraining() at the top of each iteration; once
+// Drain has been called, the next Accept return is the first conn that
+// gets the accept-then-FIN treatment per SPEC §11.5.
+//
+// Idempotent — calling Drain multiple times is safe (delegates to the
+// sync.Once-guarded drain.Manager.Drain).
+//
+// This method does NOT close the listening sockets. Existing in-flight
+// downstream connections continue running their HCM filter chains to
+// completion. The post-drain teardown is Stop(), invoked from the
+// deferred-stop chain in cmd/envoy-go/main.go AFTER <-drainMgr.Done().
+//
+// Phase 08.2 (Task 5) introduces this accessor; ADR-0094 records the design.
+func (m *Manager) Drain() {
+	if m.dm != nil {
+		m.dm.Drain()
+	}
 }
 
 // Stop closes every bound listener socket. Idempotent. In-flight Handle

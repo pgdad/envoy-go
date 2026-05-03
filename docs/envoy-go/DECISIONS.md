@@ -3712,3 +3712,48 @@ Three-part discipline:
 
 (d) Tasks 9 and 10 cite ADR-0096 in their commit messages ("per ADR-0096") without re-anchoring; this ADR entry is the single authoritative record of the consolidated three-part discipline.
 
+## ADR-0094: Listener-side drain plumbing — `internal/listener.Manager.Drain()` + Accept-loop fast-path
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (defensive-correctness > optimistic-performance), D-3.5 (decisions written down).
+**Lands-in-task:** Task 5.
+
+### Context
+
+SPEC §6.6 requires `internal/listener.Manager` to expose a `Drain()` method that transitions the manager to drain mode. SPEC §11.5 records the empirical close-mechanism evidence from upstream Envoy v1.37.2: when `/drain_listeners` is called, new connection attempts are accepted at the TCP level (3-way handshake completes per `Connected to 127.0.0.1`) and then immediately closed with FIN (curl observes "Empty reply from server" — error 52; nc reads 0 bytes). This settle the choice between two candidate mechanisms:
+
+(a) **Accept-then-FIN**: accept the connection (let the TCP handshake complete), then immediately `conn.Close()` it without dispatching to the filter chain. The client observes a TCP-established connection followed by FIN (empty body / EOF on first read).
+
+(b) **Listener-socket-close**: close the listening socket so the kernel produces RST-on-no-listener for new connection attempts. The client observes a connection refused at the OS level before the TCP handshake.
+
+Upstream Envoy v1.37.2 uses (a) for the `/drain_listeners`-triggered DRAINING path. BRAINSTORM Decision 5 confirmed this is the correct target behavior for envoy-go.
+
+### Decision
+
+`internal/listener.Manager.Drain()` is a public method that delegates to the central `drain.Manager.Drain()`. The actual stop-accepting mechanism is a per-runtime Accept-loop fast-path: at the top of each Accept iteration (after `Accept()` returns, after error-handling), the loop body checks `rt.dm.IsDraining()`; if true, the new conn is immediately `conn.Close()`'d and the loop continues without filter-chain dispatch. This produces the accept-then-FIN behavior matching §11.5 empirical pin verbatim.
+
+The existing `listener.Manager.Stop()` method stays unchanged as the post-drain teardown step (closes the listening sockets). Stop is invoked from the deferred-stop chain in `cmd/envoy-go/main.go` AFTER `<-drainMgr.Done()`.
+
+The `dm *drain.Manager` field is propagated field-locally onto each `listenerRuntime` (not chased through `*Manager` at Accept time) to minimize hot-path indirection. The `filterRegistry` HCM/TCP-proxy closures are widened to accept `dm`; the inner filter constructors will plumb `dm` through at Tasks 9/10 — until then the closures use `_ = dm` discard.
+
+`NewManagerWithBaseDirAndAllowH2C` is widened to take `dm *drain.Manager` as the 9th parameter (LBP-1 fifth application carry-through; `nil` is safe for callers that do not yet wire drain).
+
+### Alternatives considered
+
+(A) **Listener-socket-close on drain** (mechanism b above). Rejected: upstream Envoy empirical pin at §11.5 unambiguously shows (a); envoy-go matches Envoy behavior as the MVP default. Listener-socket-close would also prevent new connections from seeing the TCP 3-way handshake complete, which is inconsistent with the observed Envoy behavior.
+
+(B) **Chase through `*Manager` at Accept time** (access `rt.manager.dm` instead of `rt.dm`). Rejected: field-local `rt.dm` avoids one pointer dereference on every accepted connection in the hot path; the indirection is immaterial at low load but correct to avoid per ADR-0094 doctrine D-3.3.
+
+(C) **Expose drain state directly on `listenerRuntime`** without threading through `Manager.Drain()`. Rejected: `Manager.Drain()` is the SPEC §6.6-prescribed API; the delegating-to-central-Manager pattern is consistent with `cluster.Manager.Drain()` (ADR-0096) and `admin.Server`'s drain integration (ADR-0091 + ADR-0093).
+
+### Consequences
+
+(a) New connections during drain receive accept-then-FIN per §11.5; the 06.1 +2-LoC accept-site Inc lines (`downstreamCxTotal` / `downstreamCxActive`) are NOT executed for the drained-conn case (the conn never enters `serveConnection`).
+
+(b) In-flight `serveConnection` goroutines (running the HCM filter chain) continue to completion — they are not interrupted by `Drain()`. The drain window is the time between `Drain()` and all in-flight goroutines returning; `drain.Manager.Done()` fires when the inflight counter reaches zero.
+
+(c) The fast-path is field-local (`rt.dm`) rather than chasing back through `*Manager` — minimizes the hot-path indirection per D-3.3.
+
+(d) `cmd/envoy-go` remains broken until Task 11 wires the updated constructor (expected broken-window per LBP-1). `internal/filter/hcm/...` and `internal/filter/tcpproxy/...` are unaffected — their constructor signatures widen at Tasks 9/10.
+
