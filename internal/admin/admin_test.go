@@ -9,11 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func TestServer_ReadyState(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -57,7 +58,7 @@ func TestServer_ReadyState(t *testing.T) {
 }
 
 func TestServer_PreInit_BeforeMarkReady(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -83,7 +84,7 @@ func TestServer_PreInit_BeforeMarkReady(t *testing.T) {
 }
 
 func TestServer_MarkReady_IsAtomic(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -115,13 +116,13 @@ func TestServer_MarkReady_IsAtomic(t *testing.T) {
 }
 
 func TestServer_Close_Idempotent(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, nil)
 	// Close before Start.
 	if err := s.Close(); err != nil {
 		t.Errorf("Close before Start: %v", err)
 	}
 	// Close after Start.
-	s2 := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
+	s2 := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, nil)
 	_, err := s2.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -137,7 +138,7 @@ func TestServer_Close_Idempotent(t *testing.T) {
 
 func TestServer_StatsPrometheusRouteRegistered(t *testing.T) {
 	r := stats.NewRegistry()
-	srv := New("127.0.0.1:0", r, nil, nil, nil)
+	srv := New("127.0.0.1:0", r, nil, nil, nil, nil)
 	addr, err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -158,7 +159,7 @@ func TestServer_StatsPrometheusRouteRegistered(t *testing.T) {
 
 func TestServer_LiveGaugeSetOnceFlippedAtFirstReady200(t *testing.T) {
 	r := stats.NewRegistry()
-	srv := New("127.0.0.1:0", r, nil, nil, nil)
+	srv := New("127.0.0.1:0", r, nil, nil, nil, nil)
 	addr, err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -199,7 +200,7 @@ func TestServer_LiveGaugeSetOnceFlippedAtFirstReady200(t *testing.T) {
 // time.
 func TestServer_NewWidenedConstructor(t *testing.T) {
 	r := stats.NewRegistry()
-	s := New("127.0.0.1:0", r, nil, nil, nil)
+	s := New("127.0.0.1:0", r, nil, nil, nil, nil)
 	if s == nil {
 		t.Fatal("New returned nil")
 	}
@@ -220,7 +221,7 @@ func TestServer_NewWidenedConstructor(t *testing.T) {
 // enough for /config_dump's protojson rendering of large bootstraps on slow
 // scrape clients.
 func TestAdminWriteTimeoutIs30s(t *testing.T) {
-	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil)
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -242,7 +243,7 @@ func TestAdmin_AllFourEndpointsReturn200WithCorrectHeaders(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
 	lm := mustMinimalLM(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -299,7 +300,7 @@ func TestAdmin_FourEndpointsAcceptAnyMethod(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
 	lm := mustMinimalLM(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -334,7 +335,7 @@ func TestAdminConcurrentScrapeRace(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
 	lm := mustMinimalLM(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -379,5 +380,36 @@ func TestAdminConcurrentScrapeRace(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Errorf("%v", err)
+	}
+}
+
+func TestServer_NewWidenedConstructor_DrainManager(t *testing.T) {
+	r := stats.NewRegistry()
+	dm := drain.New(10 * time.Millisecond)
+	s := New("127.0.0.1:0", r, nil, nil, nil, dm)
+	if s == nil {
+		t.Fatal("New returned nil")
+	}
+	if s.dm != dm {
+		t.Errorf("dm field not threaded through New")
+	}
+	// Existing 08.1 fields still threaded:
+	if s.registry != r {
+		t.Errorf("registry not threaded")
+	}
+	if s.bootTime.IsZero() {
+		t.Errorf("bootTime not set at New time")
+	}
+}
+
+func TestServer_NewWidenedConstructor_NilDrainManagerTolerated(t *testing.T) {
+	// Test code that does not exercise drain semantics may pass nil per
+	// ADR-0085 nil-tolerance + planner-time decision 7.
+	s := New("127.0.0.1:0", stats.NewRegistry(), nil, nil, nil, nil)
+	if s == nil {
+		t.Fatal("New returned nil")
+	}
+	if s.dm != nil {
+		t.Errorf("dm field should be nil when nil passed")
 	}
 }

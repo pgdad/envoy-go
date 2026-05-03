@@ -10,6 +10,7 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/bootstrap"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -23,7 +24,9 @@ import (
 // (for /listeners listener snapshot) — the third application of the LBP-1
 // explicit-threading discipline (after 06.1's *stats.Registry and 07.1's
 // *HTTPRegistry / 07.2's *ListenerFilterRegistry); ADR-0085 records the
-// generalisation. 08.2 will add POST /drain_listeners and extend /ready +
+// generalisation. Phase 08.2 widens the constructor further to thread
+// *drain.Manager (the LBP-1 fifth application; ADR-0085 consequence (a)
+// extended + ADR-0091) and adds POST /drain_listeners, extending /ready +
 // /server_info for the DRAINING state.
 type Server struct {
 	addr      string
@@ -38,6 +41,9 @@ type Server struct {
 	cm       *cluster.Manager
 	lm       *listener.Manager
 	bootTime time.Time
+	// 08.2 field (per ADR-0091 + BRAINSTORM Decision 4 — LBP-1 fifth application).
+	// May be nil in test code that does not exercise drain semantics.
+	dm *drain.Manager
 }
 
 // New returns an admin server targeting addr. The server is not running yet;
@@ -48,7 +54,10 @@ type Server struct {
 // cluster manager + listener manager threaded by main.go for the four new
 // 08.1 admin endpoints (per ADR-0085); they may be nil in test code that
 // does NOT exercise those endpoints. bootTime is set to time.Now() at call.
-func New(addr string, registry *stats.Registry, bs *bootstrap.Bootstrap, cm *cluster.Manager, lm *listener.Manager) *Server {
+// Phase 08.2 widens the signature to thread *drain.Manager (the LBP-1 fifth
+// application; ADR-0085 consequence (a) extended + ADR-0091). May be nil in
+// test code that does not exercise drain semantics.
+func New(addr string, registry *stats.Registry, bs *bootstrap.Bootstrap, cm *cluster.Manager, lm *listener.Manager, dm *drain.Manager) *Server {
 	return &Server{
 		addr:      addr,
 		registry:  registry,
@@ -56,6 +65,7 @@ func New(addr string, registry *stats.Registry, bs *bootstrap.Bootstrap, cm *clu
 		bs:        bs,
 		cm:        cm,
 		lm:        lm,
+		dm:        dm,
 		bootTime:  time.Now(),
 	}
 }

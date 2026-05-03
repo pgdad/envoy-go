@@ -13,7 +13,7 @@ func TestHandleServerInfo_HTTPSmoke200JSON(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
 	lm := mustMinimalLM(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -48,7 +48,7 @@ func TestHandleServerInfo_HTTPSmoke200JSON(t *testing.T) {
 func TestHandleServerInfo_StatePostMarkReady(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, _ := s.Start()
 	defer func() { _ = s.Close() }()
 	s.MarkReady()
@@ -64,7 +64,7 @@ func TestHandleServerInfo_StatePostMarkReady(t *testing.T) {
 func TestHandleServerInfo_StatePreMarkReady(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, _ := s.Start()
 	defer func() { _ = s.Close() }()
 	// NO MarkReady call.
@@ -80,7 +80,7 @@ func TestHandleServerInfo_StatePreMarkReady(t *testing.T) {
 func TestHandleServerInfo_UptimeMonotonic(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, _ := s.Start()
 	defer func() { _ = s.Close() }()
 	s.MarkReady()
@@ -115,7 +115,7 @@ func TestHandleServerInfo_UptimeMonotonic(t *testing.T) {
 func TestHandleServerInfo_CommandLineOptionsConfigPath(t *testing.T) {
 	bs := mustMinimalBs(t) // sets bs.ConfigPath = "/test/envoy-go.yaml"
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, _ := s.Start()
 	defer func() { _ = s.Close() }()
 	s.MarkReady()
@@ -131,7 +131,7 @@ func TestHandleServerInfo_CommandLineOptionsConfigPath(t *testing.T) {
 func TestHandleServerInfo_HotRestartVersionDisabled(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, _ := s.Start()
 	defer func() { _ = s.Close() }()
 	s.MarkReady()

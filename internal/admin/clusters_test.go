@@ -16,7 +16,7 @@ func TestHandleClusters_HTTPSmoke200Text(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
 	lm := mustMinimalLM(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -48,7 +48,7 @@ func TestHandleClusters_HTTPSmoke200Text(t *testing.T) {
 func TestHandleClusters_TenClusterLevelLinesPerCluster(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -76,7 +76,7 @@ func TestHandleClusters_TenClusterLevelLinesPerCluster(t *testing.T) {
 func TestHandleClusters_ClusterLevelLineFormat(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -121,7 +121,7 @@ func TestHandleClusters_ClusterLevelLineFormat(t *testing.T) {
 func TestHandleClusters_PerEndpointLinesAllZeroPlusConstants(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -172,7 +172,7 @@ func TestHandleClusters_PerEndpointLinesAllZeroPlusConstants(t *testing.T) {
 func TestHandleClusters_BodyExactByteLayout(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -246,7 +246,7 @@ c_backend::127.0.0.1:18002::local_origin_success_rate::-1
 func TestHandleClusters_EndpointDeclarationOrderPreserved(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -278,7 +278,7 @@ func TestHandleClusters_EndpointDeclarationOrderPreserved(t *testing.T) {
 // panicking.
 func TestHandleClusters_NilManagerEmitsEmptyBody(t *testing.T) {
 	bs := mustMinimalBs(t)
-	s := New("127.0.0.1:0", bs.Stats, bs, nil, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)

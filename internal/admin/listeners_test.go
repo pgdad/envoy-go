@@ -34,7 +34,7 @@ func TestHandleListeners_HTTPSmoke200Text(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
 	lm := mustMinimalLM(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -76,7 +76,7 @@ func TestHandleListeners_BodyExactByteLayout(t *testing.T) {
 	bs := mustMinimalBs(t)
 	cm := mustMinimalCM(t, bs)
 	lm := mustMinimalLM(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -112,7 +112,7 @@ func TestHandleListeners_BodyExactByteLayout(t *testing.T) {
 // panicking.
 func TestHandleListeners_NilManagerEmitsEmptyBody(t *testing.T) {
 	bs := mustMinimalBs(t)
-	s := New("127.0.0.1:0", bs.Stats, bs, nil, nil)
+	s := New("127.0.0.1:0", bs.Stats, bs, nil, nil, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -145,7 +145,7 @@ func TestHandleListeners_AlphabeticalByName(t *testing.T) {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}
 	lm := mustLMFromBs(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -210,7 +210,7 @@ func TestHandleListeners_IPv6BindAddrPassthrough(t *testing.T) {
 		t.Fatalf("cluster.NewManager: %v", err)
 	}
 	lm := mustLMFromBs(t, bs, cm)
-	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm)
+	s := New("127.0.0.1:0", bs.Stats, bs, cm, lm, nil)
 	addr, err := s.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
