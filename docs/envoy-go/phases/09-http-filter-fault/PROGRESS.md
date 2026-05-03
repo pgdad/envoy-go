@@ -52,3 +52,77 @@ ADR-0099:
 $ git log -1 --format=%H -- docs/envoy-go/phases/09-http-filter-fault/SPEC.md
 da29807d83db9fe1816a8f52c5e34c1fa3b602d7
 ```
+
+## Task 2 — FactoryCtx extension
+
+**Commits:** TBD — this task's commit
+**Notes:** Strict-TDD per PLAN.md Task 2 Steps 1–10. Step 1 added `TestFactoryCtx_StatsRegistryThreaded` and `TestFactoryCtx_NilStatsRegistryTolerated` to `internal/filter/http/types_test.go` (the natural FactoryCtx test home; pre-Task-2 the file held the FilterHeadersStatus / FilterDataStatus / FilterTrailersStatus / FilterInterfaces compile-only tests). Step 2 confirmed compile error (`ctx.Stats undefined ... ctx.StatPrefix undefined ... unknown field Stats in struct literal`). Step 3 extended `FactoryCtx` in `internal/filter/http/types.go` with `Stats *stats.Registry` and `StatPrefix string` fields, plus the `internal/stats` import; doc-comment paragraphs anchor ADR-0061 pre-Freeze + ADR-0085 nil-tolerance + ADR-0100 first-use. Step 4 confirmed both `TestFactoryCtx_*` tests pass. Step 5 added `TestParseHTTPFiltersChain_FactoryCtxThreading` to `internal/filter/hcm/config_test.go` with `filter_http` + `router` aliases (the file's first uses; reused existing `mkRouter()` helper instead of defining a `mustAny` local). Step 6 confirmed compile error (`too many arguments in call to parseHTTPFiltersChain`). Step 7 widened `parseHTTPFiltersChain` from 2-param to 4-param shape (`registry *stats.Registry, statPrefix string` appended), updated the call site in `parseFilterWithCtx` and the `FactoryCtx` populate inside the second loop. Doc-comment paragraph notes the Phase 09 ADR-0100 first-use anchor + ADR-0085 nil-tolerance for non-stat-bearing filters. Step 8 confirmed targeted test PASS + full hcm suite PASS. Step 9 confirmed `go build`, `go vet`, `golangci-lint`, `go test -race -count=1 -short ./...` all clean. No ADR landed (ADR-0100 lands at Task 3 per PLAN's ADR-on-impl convention; this task is the framework-extension code that ADR-0100's text references). The 11 differential fixtures (0000..0010) PASS unchanged — the FactoryCtx extension is non-load-bearing for non-stat-bearing filters (router, cors, envoygotest ignore the new fields per ADR-0085).
+**Outputs:**
+```
+$ go test ./internal/filter/http/ -run TestFactoryCtx -v
+=== RUN   TestFactoryCtx_StatsRegistryThreaded
+--- PASS: TestFactoryCtx_StatsRegistryThreaded (0.00s)
+=== RUN   TestFactoryCtx_NilStatsRegistryTolerated
+--- PASS: TestFactoryCtx_NilStatsRegistryTolerated (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.002s
+$ go test ./internal/filter/hcm/ -run TestParseHTTPFiltersChain_FactoryCtxThreading -v
+=== RUN   TestParseHTTPFiltersChain_FactoryCtxThreading
+--- PASS: TestParseHTTPFiltersChain_FactoryCtxThreading (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.003s
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.045s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.551s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.082s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.082s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.147s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.083s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.545s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.169s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.033s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.062s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.271s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.214s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.088s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.069s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.034s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.040s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.112s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	1.145s
+ok  	github.com/esalaine/envoy-go/test/differential	1.147s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.022s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.031s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.031s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.024s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.033s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.033s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.031s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/backends	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.050s
+```

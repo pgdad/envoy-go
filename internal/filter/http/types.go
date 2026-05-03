@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"google.golang.org/protobuf/types/known/anypb"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 // FilterHeadersStatus is returned by DecodeHeaders / EncodeHeaders to signal
@@ -248,6 +250,16 @@ type FilterInstanceFactory func() HTTPFilter
 // per-filter parsers.
 type FactoryCtx struct {
 	Registry *HTTPRegistry // optional reference for filter factories that need to look up sibling filters
-	// Future extensions (cluster manager, stats registry, accesslog sinks) added
-	// per-family-phase as filter implementations require them.
+	// Stats is the *stats.Registry the per-filter factory uses for stat-name
+	// registration. Non-nil at HCM-build time per ADR-0061's pre-Freeze
+	// discipline. May be nil in test code that does not exercise stat-bearing
+	// filters; per ADR-0085 nil-tolerance pattern. Phase 09 first-use anchor;
+	// ADR-0100 §Consequences records the framework consequence.
+	Stats *stats.Registry
+	// StatPrefix is the HCM's stat_prefix per ADR-0061's
+	// "http.<stat_prefix>.<metric>" discipline. Empty in test code that does
+	// not exercise stat-bearing filters. Phase 09 first-use anchor.
+	StatPrefix string
+	// Future extensions (cluster manager, accesslog sinks) added per-family-
+	// phase as filter implementations require them.
 }

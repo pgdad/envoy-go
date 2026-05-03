@@ -196,7 +196,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, fmt.Errorf("hcm: route_config: virtual_hosts[0]: domains: got %v, want [\"*\"]", domains)
 	}
 
-	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), httpRegistry)
+	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), httpRegistry, registry, statPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +270,16 @@ func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteC
 // HTTPFilterFactory, which parses + validates the typed_config once and
 // returns a per-request FilterInstanceFactory closure stored on the
 // chainEntry. Factory errors are wrapped with the http_filters[i] prefix.
-func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, httpRegistry *filter_http.HTTPRegistry) ([]chainEntry, error) {
+//
+// Phase 09 (ADR-0100 first-use anchor): registry + statPrefix are threaded
+// into FactoryCtx so stats-bearing per-filter factories (fault, future
+// header_mutation, jwt_authn, etc.) can register their stat names at
+// HCM-build time per ADR-0061's pre-Freeze discipline. Existing 07.1 filters
+// (router, cors, envoygotest) ignore the FactoryCtx Stats + StatPrefix
+// fields gracefully (per ADR-0085 nil-tolerance pattern); registry may be
+// non-nil unconditionally — non-stat-bearing factories simply do not consume
+// it.
+func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, httpRegistry *filter_http.HTTPRegistry, registry *stats.Registry, statPrefix string) ([]chainEntry, error) {
 	// Build the (name, type_url) entries for ValidateChainShape. Defensive
 	// nil-typed_config handling: the empty-string TypeURL never matches a
 	// registered factory, so the rule-#4 branch fires with a clear message.
@@ -294,7 +303,7 @@ func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, httpRegistry *filter_htt
 		if tc, ok := f.GetConfigType().(*hcmv3.HttpFilter_TypedConfig); ok {
 			tcAny = tc.TypedConfig
 		}
-		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry})
+		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry, Stats: registry, StatPrefix: statPrefix})
 		if err != nil {
 			return nil, fmt.Errorf("hcm: http_filters[%d]: factory: %w", i, err)
 		}

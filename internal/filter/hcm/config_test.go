@@ -22,6 +22,8 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -695,5 +697,44 @@ func TestFilter_AccessLogField_Plumbed(t *testing.T) {
 	}
 	if got.accessLog == nil {
 		t.Error("parseFilterWithCtx: accessLog field is nil, want non-nil slice")
+	}
+}
+
+// TestParseHTTPFiltersChain_FactoryCtxThreading verifies that
+// parseHTTPFiltersChain threads the *stats.Registry + stat_prefix into the
+// FactoryCtx supplied to each per-filter HTTPFilterFactory. Per Phase 09
+// Task 2 (FactoryCtx framework extension; ADR-0100 first-use anchor): the
+// extension exists so stats-bearing per-filter factories (fault, future
+// header_mutation, jwt_authn, etc.) can register their stat names at
+// HCM-build time per ADR-0061's pre-Freeze discipline. Existing non-stat-
+// bearing filters (router, cors, envoygotest) ignore the FactoryCtx Stats +
+// StatPrefix fields gracefully (per ADR-0085 nil-tolerance pattern).
+func TestParseHTTPFiltersChain_FactoryCtxThreading(t *testing.T) {
+	var captured filter_http.FactoryCtx
+	testFactory := filter_http.HTTPFilterFactory(func(_ *anypb.Any, ctx filter_http.FactoryCtx) (filter_http.FilterInstanceFactory, error) {
+		captured = ctx
+		return func() filter_http.HTTPFilter { return filter_http.HTTPFilter{Name: "test.factoryctx"} }, nil
+	})
+	httpReg := filter_http.NewHTTPRegistry()
+	httpReg.Register("type.googleapis.com/test.FactoryCtxProbe", testFactory)
+	httpReg.Register(router.TypeURL, router.New)
+	httpReg.Freeze()
+
+	reg := stats.NewRegistry()
+	statPrefix := "ingress_http"
+
+	filters := []*hcmv3.HttpFilter{
+		{Name: "test.factoryctx", ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: &anypb.Any{TypeUrl: "type.googleapis.com/test.FactoryCtxProbe"}}},
+		{Name: "envoy.filters.http.router", ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouter()}},
+	}
+	_, err := parseHTTPFiltersChain(filters, httpReg, reg, statPrefix)
+	if err != nil {
+		t.Fatalf("parseHTTPFiltersChain: %v", err)
+	}
+	if captured.Stats != reg {
+		t.Errorf("FactoryCtx.Stats: got %p, want %p", captured.Stats, reg)
+	}
+	if captured.StatPrefix != statPrefix {
+		t.Errorf("FactoryCtx.StatPrefix: got %q, want %q", captured.StatPrefix, statPrefix)
 	}
 }
