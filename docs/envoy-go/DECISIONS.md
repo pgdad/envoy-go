@@ -3592,3 +3592,70 @@ envoy-go's admin port carries the following security posture for phase 08.1 (and
 
 (g) A future security-review session (per `superpowers:requesting-code-review` / `security-review` skill) may identify hardenings within the no-ACL posture (e.g. response-body redaction of cluster names that resemble secrets, `/config_dump` field-masking of TLS-context private-key references). Such hardenings extend ADR-0090's posture without superseding it; the no-ACL principle stays intact while specific data-exposure surfaces tighten.
 
+---
+
+## ADR-0091: Drain state-machine shape — new `internal/drain/` package + `Manager` type + LBP-1 fifth application; lock-free hot path; caller-enforced timeout; DRAINED state observable only via channel close
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.2 (one-way constructor wiring at boot), D-3.4 (plan-size + scope-locality govern phase scope), D-3.5 (decisions written down).
+**Lands-in-task:** 08.2 PLAN Task 2 (`internal/drain/` package — `Manager` type + `FuzzDrainTransitions`).
+
+### Context
+
+Phase 08.2 (graceful drain, SPEC §1) introduces drain state as a first-class boot-time concern shared across five actors: `cmd/envoy-go/main.go` (SIGTERM-handler, Task 11), `internal/admin.Server` (POST `/drain_listeners` handler, Task 7), `internal/listener.Manager` (Accept-loop fast-path, Task 5), HCM filter constructor (in-flight Inc/Dec hooks, Task 9), and TCP-proxy filter constructor (per-connection Inc/Dec hooks, Task 10). All five actors read and/or mutate a single drain state that evolves monotonically from LIVE to DRAINING to DRAINED.
+
+The drain machinery is a hot-path concern for two of the five actors: the HCM filter's request-begin/end hooks (Inc/Dec) fire on every HTTP request; the listener.Manager's Accept-loop fast-path check (IsDraining) fires on every new connection attempt. Both must be lock-free under concurrent scrape load per SPEC §6.1's concurrency model. The other three actors fire the Drain trigger (admin handler + SIGTERM-handler) or observe the Done rendezvous (main.go teardown) at much lower frequency — sync.Once-level synchronization suffices for both.
+
+The three-state machine shape (LIVE → DRAINING → DRAINED-as-channel-close, per SPEC §5.9) was chosen over simpler two-state (boolean `draining` flag + no rendezvous) because: (a) the Done rendezvous is the load-bearing signal for cmd/envoy-go/main.go's SIGTERM-handler to decide when teardown is safe — a boolean flag would require a polling loop; (b) the channel-close pattern is Go's canonical "broadcast to N concurrent waiters" primitive, with zero per-waiter overhead and no lock in the select path; (c) SPEC §5.9 explicitly specifies the rendezvous channel as a first-class API surface.
+
+The LBP-1 (Linear Boot-time Provisioning) explicit-threading discipline has four prior applications: `*stats.Registry` (phase 06.1), `*HTTPRegistry` (phase 07.1), `*ListenerFilterRegistry` (phase 07.2), and the 08.1 `*bootstrap.Bootstrap` + `*cluster.Manager` + `*listener.Manager` triplet threaded into `admin.New` (ADR-0085). Phase 08.2's `*drain.Manager` is the fifth LBP-1 application: allocated once at boot in `cmd/envoy-go/main.go`, threaded into `admin.New` (Task 3), `listener.NewManagerWithBaseDirAndAllowH2C` (Task 5), HCM filter constructor (Task 9), and TCP-proxy filter constructor (Task 10). The pattern is consistent and grep-discoverable via `grep -rn drain.Manager internal/ cmd/`.
+
+The Manager does NOT enforce its configured timeout. This separation of concerns (per ADR-0095's rationale, landed at Task 11) keeps the Manager's API surface minimal and testable in isolation: the Manager exposes `Timeout()` so callers can retrieve the configured budget, but the mechanism that enforces the timeout — a `select { case <-m.Done(): case <-time.After(m.Timeout()): }` — lives in `cmd/envoy-go/main.go`'s SIGTERM-handler. This means the Manager's unit tests can verify rendezvous behavior without real-time sleeps, and the SIGTERM-handler's tests can verify timeout-enforcement independently.
+
+DRAINED state is NOT publicly exposed via `State()` per SPEC §5.9's design rationale: making DRAINED observable via `State()` would require callers to poll (busy-loop on `m.State() == StateDrained`) rather than block on `<-m.Done()`; the channel-close rendezvous is strictly superior. `State()` continues to return `StateDraining` post-rendezvous; the only observable signal for DRAINED is the Done channel close.
+
+Per planner-time decision 1 (PLAN §"Planner-time deferred-decision resolution"), `FuzzDrainTransitions` is SHIPPED (eleventh fuzzer overall; ~60 LoC; 30s budget per ADR-0018). The fuzzer asserts three invariants across arbitrary sequences of Inc/Dec/Drain operations: (i) state monotonicity (state never decreases — LIVE → DRAINING only); (ii) inflight balance (every Inc has a matching Dec before Done fires); (iii) Done fires exactly once after Drain has been called and inflight reaches 0.
+
+### Decision
+
+A new `internal/drain/` package with a `Manager` type implementing the three-state drain machine (SPEC §5.9 + §6.2). The implementation shape:
+
+1. **Lock-free hot path.** `state atomic.Uint32` (load/store of `State` as `uint32`) + `inflight atomic.Int64` (per-request/per-connection counter). `IsDraining()` and `Inc()`/`Dec()` are single-atomic-op; no mutex, no channel write, no scheduler yield on the hot path.
+
+2. **sync.Once Drain-guard.** `once sync.Once` on `Drain()` so that concurrent triggers from the admin handler (`POST /drain_listeners`) and the SIGTERM-handler are safe: exactly one caller transitions `state` from `StateLive` to `StateDraining`, and exactly one caller conditionally fires the rendezvous.
+
+3. **sync.Once-equivalent close-done-guard.** `closeOnce sync.Once` on `close(done)` so that the done channel is closed exactly once regardless of whether the rendezvous fires at Drain-time (inflight already 0) or at Dec-time (last inflight Dec after Drain). A double-close of a channel panics; the `closeOnce` guard makes both code paths (Drain-time and Dec-time) safe under concurrent load.
+
+4. **DRAINED is channel-only.** `State()` returns `StateLive` or `StateDraining`. `StateDrained` exists as a sentinel constant (for fuzzer/test use) but is never stored to `state`. The rendezvous is `done chan struct{}` (allocated at `New()` time; closed by `closeOnce`).
+
+5. **Caller-enforced timeout.** `timeout time.Duration` is stored in the Manager and returned by `Timeout()`. The Manager itself does NOT start a timer; the SIGTERM-handler in `cmd/envoy-go/main.go` calls `m.Timeout()` and selects on `time.After(m.Timeout())` alongside `<-m.Done()`.
+
+6. **FuzzDrainTransitions shipped.** Eleventh fuzzer; ~60 LoC; 30s budget per ADR-0018. Assets three invariants (state-monotonicity, inflight-balance, Done-fires) across arbitrary 0..8-op bit-sequences.
+
+The Manager is the LBP-1 fifth application. Threading wiring (Tasks 3, 5, 9, 10, 11) lands in subsequent tasks; this ADR covers the package shape and invariants.
+
+### Alternatives considered
+
+(A) Boolean `draining` flag (atomic) + no rendezvous channel; main.go polls `m.IsDraining()` after Drain to busy-loop on inflight reaching 0. Rejected: busy-loop wastes CPU during the drain window (which may last up to 30s per ADR-0095); the channel-close pattern is Go's canonical broadcast primitive with zero per-waiter overhead; SPEC §5.9 explicitly specifies the Done rendezvous as a first-class API surface.
+
+(B) Embed timeout enforcement in the Manager (internal goroutine started at `Drain()` time that fires `close(done)` after `timeout`). Rejected: conflates two orthogonal concerns — "did inflight reach 0" and "did the timeout expire"; makes unit tests depend on real-time sleeps (the test for timeout-enforcement must wait at least `timeout` wall-clock time); the SIGTERM-handler's select-on-two-channels idiom is cleaner and testable independently.
+
+(C) Mutex-based state machine (sync.Mutex on all transitions). Rejected: Inc/Dec are hot-path operations called once per HTTP request (HCM, Task 9) and once per TCP connection (TCP-proxy, Task 10); under high concurrency (SPEC §6.1's 100-concurrent-scrape model), a mutex contends with every request/connection; atomic operations are strictly cheaper and sufficient for the three-state monotonic machine.
+
+(D) Interface-based `Drainer` (`IsDraining() bool; Inc(); Dec(); Done() <-chan struct{}`) over concrete `*Manager`. Rejected: the five consumers all live within the same binary; there is no test-time swap-out requirement (test code uses real `*Manager` instances with small timeout values); interface indirection adds a vtable dispatch to every hot-path Inc/Dec call with no compensating benefit; consistent with ADR-0085's choice of concrete `*Type` over interface for boot-threaded dependencies.
+
+(E) Package-level global `var DrainMgr *Manager`. Rejected: violates LBP-1 (the project's five-prior-applications-strong constructor-threading discipline); package globals make test isolation impossible (two `TestXxx` functions in the same test binary cannot have independent drain states); grep-discoverability of the threading wiring (`grep -rn drain.Manager`) fails on a global.
+
+### Consequences
+
+(a) Race-detector-clean for N concurrent goroutines calling Inc/Dec interleaved with Drain, as asserted by `TestConcurrentIncDec` (100 goroutines × 1000 Inc/Dec pairs) and by `go test -race` in the Task 2 acceptance gate. The concurrent-trigger case (two goroutines both calling `Drain()` simultaneously) is guarded by `sync.Once` and asserted by `TestIdempotentDrain` (50-goroutine fan-in). Extended `TestAdminConcurrentScrapeRace` (Task 7, Task 13) will assert race-clean across all seven admin endpoints + a separate goroutine firing Drain mid-test.
+
+(b) The five consumers' boot wiring is grep-discoverable via `grep -rn drain.Manager internal/ cmd/`. Tasks 3, 5, 9, 10, 11 each add one threading site; the completed grep output (Task 13 phase-done gate) must show exactly five non-test-file match lines.
+
+(c) Future hot-restart family (per ADR-0099 deferral, Task 12) extends this Manager rather than replacing it; SCM_RIGHTS-based parent-child handoff is out of MVP scope. A future hot-restart ADR would add a `HotRestart(newEpochManager *Manager)` method or an epoch-aware variant — the current Manager's API surface is forward-compatible with that extension.
+
+(d) `FuzzDrainTransitions` is the eleventh fuzzer (per ADR-0018's fuzz-CI 30s short-budget policy). The ten prior fuzzers continue to pass; the eleventh is independently seeded with three corpus seeds (bit-patterns 0b10101010/5, 0b00000001/1, 0b11111111/8) and achieves ~49M executions in 30s on the Task 2 acceptance-gate run.
+
+(e) ADR-0085's consequence (d) anticipated that phase 08.2 "may add a single `drainState atomic.Pointer[DrainState]` field on `Server` (or equivalent) without changing `New`'s signature." Task 2's `*drain.Manager` design supersedes that anticipation: rather than an inline atomic field on `admin.Server`, the drain state lives in a dedicated package-level Manager that is constructor-threaded into `admin.Server` (Task 3). The `admin.New` signature DOES widen by one parameter (`drainMgr *drain.Manager`), contrary to ADR-0085's consequence (d) prediction. The divergence is intentional and superior: LBP-1 threading into `admin.New` is consistent with the four prior applications; an inline atomic on `Server` would have duplicated the inflight-counter machinery that HCM and TCP-proxy also need.
+
