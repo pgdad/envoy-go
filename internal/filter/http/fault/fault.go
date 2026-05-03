@@ -24,8 +24,6 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTP
 
 // faultAbortBody is the byte-exact response body the abort path emits.
 // 18 bytes; NO trailing newline (per SPEC §11.3/§11.4 empirical pin).
-//
-//nolint:unused // Task 4 (ADR-0103) consumes; Task 3 lands the constant.
 const faultAbortBody = "fault filter abort"
 
 // faultStats holds the 5 fault.* stats registered at HCM-build time per
@@ -225,9 +223,139 @@ var (
 func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.dcb = cb }
 func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb }
 
-// DecodeHeaders is a stub at Task 3; Tasks 4–7 replace.
-func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	return envoyhttp.Continue
+// DecodeHeaders implements the fault filter's decode-side discipline per SPEC §6.4.
+// Task 4 lands the abort-only path + headers gate + percentage roll. Tasks 5/6/7
+// fill in delay async-resume, max_active_faults Inc/Dec, and per-route 3-tier merge.
+func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
+	cfg := f.cfg // Task 7 replaces with f.routeConfigOrListener()
+	if !f.matchesHeaders(headers, cfg) {
+		return envoyhttp.Continue
+	}
+	delayApplies := cfg.delayEnabled && f.rollPercent(cfg.delayPercentage)
+	abortApplies := cfg.abortEnabled && f.rollPercent(cfg.abortPercentage)
+	if !delayApplies && !abortApplies {
+		return envoyhttp.Continue
+	}
+	// Task 6 inserts max_active_faults cap check here:
+	//   if cfg.maxActiveFaults > 0 && f.active.Load() >= cfg.maxActiveFaults {
+	//       f.recordFaultEvent(eventFaultsOverflow)
+	//       return envoyhttp.Continue
+	//   }
+	//   f.markActive()
+	if delayApplies && abortApplies {
+		// Combined path lands in Task 5.
+		return envoyhttp.Continue // placeholder; Task 5 replaces
+	}
+	if delayApplies {
+		// Delay-only path lands in Task 5.
+		return envoyhttp.Continue // placeholder; Task 5 replaces
+	}
+	// Abort-only path (Task 4 scope).
+	f.recordFaultEvent(eventAbortsInjected)
+	f.dcb.SendLocalReply(cfg.abortHTTPStatus, faultAbortBody, envoyhttp.OrderedHeaders{
+		{Name: "Content-Type", Value: "text/plain"},
+	})
+	return envoyhttp.StopIteration
+}
+
+// matchesHeaders returns true if cfg.matchHeaders is empty (match-all) OR
+// every (canonical-name, exactValue) pair has a matching request-header
+// VALUE under case-sensitive byte-equality (per §11.8 conclusion (a)+(b)).
+// Header NAMES match case-insensitively via http.CanonicalHeaderKey
+// (parse-time canonicalization in parseRuntimeConfig + http.Header.Get's
+// runtime canonicalization — both sides land on the same canonical key).
+func (f *filter) matchesHeaders(headers http.Header, cfg *runtimeConfig) bool {
+	if len(cfg.matchHeaders) == 0 {
+		return true
+	}
+	for _, hm := range cfg.matchHeaders {
+		if headers.Get(hm.name) != hm.exactValue {
+			return false
+		}
+	}
+	return true
+}
+
+// rollPercent returns true iff a fresh random sample falls under p (in [0, 100]).
+// Per planner-time decision 12: 0 short-circuits to false; 100 short-circuits
+// to true; intermediate values consult the per-instance *rand.Rand seeded by
+// time.Now().UnixNano() at filter-instance allocation time. The short-circuits
+// preserve determinism at the boundary percentages (0% never fires; 100%
+// always fires) without consulting the RNG — important for the
+// decode-goroutine-only RNG-access invariant per ADR-0102.
+func (f *filter) rollPercent(p float64) bool {
+	if p <= 0 {
+		return false
+	}
+	if p >= 100 {
+		return true
+	}
+	return f.rng.Float64()*100 < p
+}
+
+// faultEventKind enumerates stat-event kinds dispatched through recordFaultEvent
+// per planner-time decision 3 (consolidated stat-call-site).
+type faultEventKind int
+
+// faultEventKind enum values. Tasks 4/5/6 increment the relevant counters via
+// recordFaultEvent rather than directly touching f.stats.X.Inc()/Dec() —
+// consolidation makes the test surface (counter equality at the
+// http.<sp>.fault.<metric> name) the single observable point.
+const (
+	eventAbortsInjected faultEventKind = iota
+	eventDelaysInjected
+	eventFaultsOverflow
+	eventActiveFaultsInc
+	eventActiveFaultsDec
+)
+
+// recordFaultEvent dispatches the stat-counter Inc/Dec per planner-time decision 3
+// (consolidated stat-call-site). Tolerates nil stats (test code per ADR-0085);
+// per-counter nil-guards tolerate the all-nil faultStats produced by the
+// nil-registry path in registerFaultStats.
+func (f *filter) recordFaultEvent(k faultEventKind) {
+	if f.stats == nil {
+		return
+	}
+	switch k {
+	case eventAbortsInjected:
+		if f.stats.abortsInjected != nil {
+			f.stats.abortsInjected.Inc()
+		}
+	case eventDelaysInjected:
+		if f.stats.delaysInjected != nil {
+			f.stats.delaysInjected.Inc()
+		}
+	case eventFaultsOverflow:
+		if f.stats.faultsOverflow != nil {
+			f.stats.faultsOverflow.Inc()
+		}
+	case eventActiveFaultsInc:
+		if f.stats.activeFaults != nil {
+			f.stats.activeFaults.Inc()
+		}
+	case eventActiveFaultsDec:
+		if f.stats.activeFaults != nil {
+			f.stats.activeFaults.Dec()
+		}
+	}
+}
+
+// decrementActive is the markedActive-guarded per-instance Inc/Dec balance helper.
+// Task 6 wires the markedActive bool + the Inc/Dec calls fully; Task 4 lands
+// the helper as the (no-Inc-yet) Dec-side stub so OnDestroy and timer-
+// callback paths added in Tasks 5/6 can call it without sequencing concerns.
+// The markedActive bool gate guarantees Inc/Dec balance under double-call
+// (e.g. if both timer-callback AND OnDestroy fire, only the first call
+// performs the Dec).
+//
+//nolint:unused // Task 6 (ADR-0105) consumes from OnDestroy + timer callback; Task 4 lands the helper.
+func (f *filter) decrementActive() {
+	if f.markedActive {
+		f.markedActive = false
+		f.active.Add(-1)
+		f.recordFaultEvent(eventActiveFaultsDec)
+	}
 }
 
 // Encode-side and data/trailer methods are no-op pass-through.

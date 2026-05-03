@@ -4320,4 +4320,97 @@ The BEHAVIOR_CONTRACT.md ## Stat-name mapping table extension is a 5-row purely-
 
 (d) The BEHAVIOR_CONTRACT.md ## Stat-name mapping table is the canonical reference for operators reading envoy-go's metric output. Phase 15 (a hypothetical Observability-family phase) will reference this ADR when adding additional `fault.*` stats (e.g., `fault.delay_total_us` if response-rate-limit lands).
 
+---
+
+## ADR-0103: Abort terminal-replace mechanics + body byte-exact `"fault filter abort"` (18 bytes, no trailing newline) + 4-header set on the wire + `OrderedHeaders` carrier discipline + status-text allow-list for non-stdlib codes
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.3 (the abort response shape is differentially observable on the wire and its empirical pin against reference Envoy v1.37.2 is the durable evidence) + D-3.5 (record durable design rationale; the 4-header set + 18-byte body + OrderedHeaders carrier shape are load-bearing wire-protocol invariants).
+**Lands-in-task:** Task 4 (phase 09); commit TBD.
+
+### Context
+
+Per SPEC §5.3 + §6.4 the abort path is a TERMINAL-REPLACE: when the abort percentage rolls hit AND the headers field matches AND `max_active_faults` is not exceeded, the fault filter aborts the upstream-bound request and synthesizes a local reply via `cb.SendLocalReply(status, body, headers)`. The chain machinery's `SendLocalReply` enters the encode chain at `filter[len-1]` per ADR-0075 and emits the synthesized response on the wire. Phase 09 must pin the EXACT shape of that synthesized response against reference Envoy v1.37.2 — the differential-fixture (Task 14) walks the wire bytes and asserts byte-equality.
+
+Three load-bearing pieces of the wire shape:
+
+1. **Body byte-exactness.** Reference Envoy v1.37.2 emits `"fault filter abort"` (18 bytes) as the response body. NO trailing newline. SPEC §11.4 captures the empirical byte-dump. The differential-fixture's `Content-Length: 18` line and the body bytes are the differential pin; an extra newline would break content-length AND the body byte-equality assertion. The constant `faultAbortBody = "fault filter abort"` is grep-verifiable in `internal/filter/http/fault/fault.go`.
+
+2. **4-header set on the wire.** Reference Envoy emits exactly four response headers for the abort path: `content-length: 18`, `content-type: text/plain` (NO `; charset=utf-8` modifier — distinct from the admin endpoints' 6-header-set per phase-05a Task pin), `date: <IMF-fixdate>`, `server: envoy`. The §11.3 / §11.4 empirical pin captures the exact header set. The fault filter contributes only the `Content-Type: text/plain` override via OrderedHeaders; the other three (content-length, date, server) are framework-injected by the chain's `beginLocalReply` reconcile step + the wire-write layer per phase-04 Task 18 review.
+
+3. **OrderedHeaders carrier.** Per ADR-0075's `SendLocalReply` contract + Phase 04 Task 18 review: the `headers` parameter is `OrderedHeaders` (slice carrier, deterministic insertion order) — NOT `http.Header` (Go map, non-deterministic iteration; net/http's `Header.Write` emits alphabetically). Fault passes the single override entry as `OrderedHeaders{{Name: "Content-Type", Value: "text/plain"}}`; the chain reconciles this carrier-supplied entry with the framework-injected three (content-length, date, server) per the post-encode reconcile step in `chain.beginLocalReply`. The reconcile preserves the caller's `Content-Type` value (text/plain WITHOUT charset modifier) — distinguishing fault's abort from cors's preflight (which carries six caller-supplied headers in the §11.2 verbatim order) and from admin endpoints (which carry `text/plain; charset=utf-8`).
+
+A fourth piece — status-text — depends on whether the configured `abort.http_status` is in Go's `net/http`-stdlib status-text table. For the canonical 503 (`Service Unavailable`), 404 (`Not Found`), 405 (`Method Not Allowed`), and 200 (`OK`) the stdlib's `http.StatusText` returns the exact text reference Envoy emits; the differential-fixture asserts byte-equality on those four. For non-stdlib codes (e.g., 418 `I'm a teapot`, 599 custom-app-codes) reference Envoy emits its own status-text table — sometimes verbatim-stdlib, sometimes divergent. Per planner-time decision 7 the differential-fixture allow-list is NARROWED: only 200 / 503 / 404 / 405 byte-equal on the status-line; 418 and similar codes compare on STATUS CODE (the integer) only. This narrowing keeps phase 09 simple without compromising the differential-pin discipline for the canonical codes.
+
+### Decision
+
+The fault filter's abort-only DecodeHeaders path emits exactly:
+
+```go
+f.recordFaultEvent(eventAbortsInjected)
+f.dcb.SendLocalReply(cfg.abortHTTPStatus, faultAbortBody, envoyhttp.OrderedHeaders{
+    {Name: "Content-Type", Value: "text/plain"},
+})
+return envoyhttp.StopIteration
+```
+
+where:
+
+- `cfg.abortHTTPStatus` is the PGV-validated `[200, 600)` integer per ADR-0101.
+- `faultAbortBody` is the 18-byte constant `"fault filter abort"` with NO trailing newline.
+- The `OrderedHeaders` carrier holds exactly one entry: `{Name: "Content-Type", Value: "text/plain"}`. The chain's `beginLocalReply` reconciles this entry with the framework-injected `Content-Length: 18`, `Date: <IMF-fixdate>`, `Server: envoy` to land the 4-header set on the wire per the §11.3 empirical pin.
+- The `recordFaultEvent(eventAbortsInjected)` call site fires BEFORE `SendLocalReply` so the counter increments regardless of any encode-chain behavior. Per planner-time decision 3, all stat Inc/Dec calls in fault are routed through `recordFaultEvent` rather than direct `f.stats.X.Inc()` calls — the consolidated dispatch makes the test surface (counter equality at the `http.<sp>.fault.<metric>` name) the single observable point.
+- The return value is `envoyhttp.StopIteration` so the chain parks at the filter's index. The `SendLocalReply` machinery's first-call-wins `sync.Once` per chain guards against double-emission (Task 5's combined delay+abort path will land a timer-callback that calls `SendLocalReply` from the timer goroutine — same `sync.Once` guard handles the cross-goroutine case).
+
+The status-text differential-fixture allow-list narrows to four canonical codes for byte-equal status-line assertions:
+
+| Status code | Stdlib `http.StatusText` | Differential pin |
+|---|---|---|
+| 200 | `OK` | byte-equal status-line |
+| 404 | `Not Found` | byte-equal status-line |
+| 405 | `Method Not Allowed` | byte-equal status-line |
+| 503 | `Service Unavailable` | byte-equal status-line |
+| 418 / others | (varies) | STATUS CODE only |
+
+The 0011-http-fault fixture (Tasks 11–14) configures abort.http_status=503 — the canonical code per the differential-pin allow-list.
+
+### Alternatives considered
+
+(A) **Append a trailing newline to the body** (`"fault filter abort\n"` — 19 bytes). REJECTED: reference Envoy v1.37.2's empirical byte-dump (SPEC §11.4) is 18 bytes with NO newline. The extra byte would break the differential-fixture's content-length assertion AND the body byte-equality.
+
+(B) **Emit `Content-Type: text/plain; charset=utf-8`** (matching the admin endpoints' 6-header set). REJECTED: reference Envoy emits `text/plain` WITHOUT the charset modifier on the fault path. The differential-fixture would diverge byte-for-byte. The admin-vs-fault distinction is a wire-protocol invariant, not a code-organization preference.
+
+(C) **Pass the headers as `http.Header` (Go map)** instead of `OrderedHeaders`. REJECTED per Phase 04 Task 18 review: `http.Header` cannot preserve insertion order on the wire — Go map iteration is non-deterministic and stdlib's `Header.Write` emits keys alphabetically sorted. The current `SendLocalReply` signature on `DecoderFilterCallbacks` accepts `OrderedHeaders` per ADR-0075's amendment; using `http.Header` would require a second SendLocalReply variant or break the framework contract.
+
+(D) **Inline the stat Inc/Dec at the call sites** (`f.stats.abortsInjected.Inc()` directly) without `recordFaultEvent`. REJECTED per planner-time decision 3: each Inc call would need a per-counter nil-guard (`if f.stats.abortsInjected != nil`) per ADR-0085's nil-tolerance pattern. The 5 stat-call-sites would each carry the boilerplate; the consolidated `recordFaultEvent` switch handles all 5 in one place. The dispatch is sub-microsecond and not on the hot path — the abort path fires once per request that hits the percentage roll.
+
+(E) **Defer the status-text byte-equal assertion entirely** (compare on status-code only for ALL codes). REJECTED: the canonical 200/404/405/503 stdlib texts ARE differentially observable; narrowing to "code-only" would weaken the differential pin needlessly. The narrow allow-list (planner-time decision 7) keeps the byte-equal pin where it is reliable (stdlib texts) and falls back to code-only where it diverges (418 etc.). Phase 09's 0011-http-fault fixture only exercises 503, which is in the byte-equal allow-list.
+
+(F) **Emit the abort response with `Content-Length: 0` + a separate body chunk** (HTTP/1.1 chunked-transfer with the 18-byte body in a chunk). REJECTED: reference Envoy emits a standard non-chunked response with `Content-Length: 18` for the abort path. Chunked-transfer would diverge from the empirical wire pin and complicate the wire-write layer.
+
+### Consequences
+
+(a) The 4-header set on the wire is grep-verifiable: `internal/filter/http/fault/fault.go` calls `SendLocalReply` with the single `Content-Type: text/plain` override; the other three headers (content-length, content-type, date, server) are reconciled by the chain's local-reply machinery. The differential-fixture (Task 14) walks the wire bytes and asserts the 4-header set verbatim against reference Envoy v1.37.2.
+
+(b) Body byte-exactness is grep-verifiable: `faultAbortBody = "fault filter abort"` is a package-level const; no other call site mutates it. `len(faultAbortBody) == 18` is asserted in `TestDecodeHeaders_AbortOnly_100Percent`.
+
+(c) The `OrderedHeaders` carrier discipline mirrors phase 07.1's cors precedent: cors's preflight emits 6 entries via `OrderedHeaders` per the §11.2 verbatim order; fault's abort emits 1 entry via `OrderedHeaders` per the §11.3 verbatim shape. Both filters consume the same `SendLocalReply` contract; the chain's reconcile step handles both — there is no per-filter special-case in the chain machinery.
+
+(d) Cross-references:
+   - ADR-0075 (`SendLocalReply` enters encode chain at `filter[len-1]`; OrderedHeaders amendment) — anchored. Fault's abort-only path is the second consumer (cors's preflight is the first).
+   - ADR-0072 (factory validates typed_config at boot) — referenced. The `cfg.abortHTTPStatus` consumed in DecodeHeaders is the PGV-validated `[200, 600)` integer per ADR-0101's parser gate; no runtime re-validation needed.
+   - ADR-0085 (nil-tolerance) — anchored. `recordFaultEvent` tolerates nil stats + per-counter nil-guards; the abort path fires correctly even when `f.stats == nil` (test code without a registry).
+   - ADR-0102 (delay async-resume) — cross-referenced. Task 5's combined delay+abort path will reuse the same `OrderedHeaders{Content-Type: text/plain}` carrier from the timer-callback goroutine; the `sync.Once` first-call-wins guard inside the chain's `beginLocalReply` handles the cross-goroutine entry safely.
+   - ADR-0107 (5-stat extension) — anchored at `recordFaultEvent(eventAbortsInjected)`. The aborts_injected counter Inc happens once per fired abort; the 0011-http-fault fixture's StatsAsserter (Task 14) walks `/stats/prometheus` for the post-roll value.
+   - SPEC §5.3 (abort-only flow) + §6.4 (DecodeHeaders body) + §6.6 (SendLocalReply OrderedHeaders carrier) + §11.3 (4-header set + body byte-exact) + §11.4 (body byte-dump) + §11.8 (headers-field exact-match semantics) — anchored.
+
+(e) The status-text allow-list (200 / 404 / 405 / 503 byte-equal; others code-only) is recorded in this ADR; the 0011-http-fault fixture's expectations.yaml (Task 13) and driver (Task 14) consume the allow-list. Future phases that add fault-bearing fixtures with non-canonical codes (e.g., 418) will reference this ADR to know they fall on the code-only side of the allow-list.
+
+(f) Tasks 5/6/7 build on this task's foundation:
+   - Task 5 reuses `recordFaultEvent` for `eventDelaysInjected` + `eventActiveFaultsInc/Dec`; the abort path's call-site is the precedent.
+   - Task 6 inserts the `max_active_faults` cap-check between the percentage-roll-evaluation and the abort/delay dispatch; the placeholder comment in the Task-4 DecodeHeaders body marks the insertion point.
+   - Task 7 replaces `cfg := f.cfg` with `cfg := f.routeConfigOrListener()` to land the per-route 3-tier merge; the rest of the abort-only path is unchanged.
+
+
 

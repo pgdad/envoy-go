@@ -217,3 +217,52 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.049s
 ```
+
+## Task 4 — DecodeHeaders abort terminal-replace path + headers gate + percentage-roll [ADR-0103]
+
+**Commits:** TBD — this task's commit
+**Notes:** Strict-TDD per PLAN.md Task 4 Steps 1–7. Step 1 added the `recordingDCB` test stub (a `DecoderFilterCallbacks` impl with `sentStatus`/`sentBody`/`sentHeaders`/`continued atomic.Int32`/`routeCfg proto.Message` fields, plus `SendLocalReply` / `ContinueDecoding` / `RequestRouteConfig` / `EncodeHeaders` / `EncodeData` / `EncodeTrailers` methods covering the 6 required interface methods per `internal/filter/http/callbacks.go`'s `DecoderFilterCallbacks` shape) + `makeFilter` helper (constructs a fault filter via `New` + `factory()` + `inst.Decoder.(*filter)` + `SetDecoderCallbacks(&recordingDCB{})` and returns the filter+dcb pair) + 6 failing tests: `TestDecodeHeaders_AbortOnly_100Percent` (abort 503 100% → StopIteration + sentStatus=503 + sentBody="fault filter abort" 18 bytes + sentHeaders=OrderedHeaders{Content-Type: text/plain}), `TestDecodeHeaders_AbortOnly_0Percent` (0% → Continue + no SendLocalReply via rollPercent's p<=0 short-circuit), `TestDecodeHeaders_HeadersFieldExactMatch_CaseInsensitiveName` ("X-FAULT-ON: yes" matches matcher (name="x-fault-on", exact="yes") via canonicalization-on-both-sides), `TestDecodeHeaders_HeadersFieldExactMatch_CaseSensitiveValue` ("x-fault-on: YES" against matcher exact "yes" → no match → Continue per §11.8 conclusion (b)), `TestDecodeHeaders_NoFaultHeaderMismatch` (empty request headers + non-empty matcher → no match → Continue), `TestDecodeHeaders_AbortStatRecorded` (100% abort fires → registry walked + http.ingress_http.fault.aborts_injected counter == 1 via `strconv.ParseInt(m.Format(), 10, 64)`). New imports: `net/http`, `strconv`, `sync/atomic`. Step 2 confirmed 3 of 6 tests fail (TestDecodeHeaders_AbortOnly_100Percent, TestDecodeHeaders_HeadersFieldExactMatch_CaseInsensitiveName, TestDecodeHeaders_AbortStatRecorded) with the expected error signatures (`status: got 0, want StopIteration`, `sentStatus: got 0, want 503`, `aborts_injected: got 0, want 1`); 3 coincidentally PASS because the Task-3 stub returns Continue and the "no fault expected" assertions match — those will continue to PASS post-implementation. Step 3 replaced `DecodeHeaders` body in `fault.go` with the abort-only path per SPEC §6.4 (matchesHeaders gate → percentage rolls → max_active_faults placeholder comment for Task 6 → combined/delay-only placeholder Continues for Task 5 → abort-only `recordFaultEvent(eventAbortsInjected) + dcb.SendLocalReply(cfg.abortHTTPStatus, faultAbortBody, OrderedHeaders{{Name: "Content-Type", Value: "text/plain"}}) + return StopIteration`). Added 4 helpers: `matchesHeaders(headers, cfg) bool` (empty matchHeaders = match-all; non-empty requires ALL pairs match via `headers.Get(hm.name) != hm.exactValue` — case-insensitive name via `http.Header.Get`'s canonicalization + parse-time `http.CanonicalHeaderKey`; case-sensitive byte-equal value); `rollPercent(p float64) bool` (p<=0 → false short-circuit; p>=100 → true short-circuit; intermediate `f.rng.Float64()*100 < p` consulting per-instance RNG only — no RNG access at the boundary 0/100 percentages preserves determinism + isolates RNG to the dispatch goroutine per ADR-0102); `faultEventKind` enum + 5 constants (`eventAbortsInjected`, `eventDelaysInjected`, `eventFaultsOverflow`, `eventActiveFaultsInc`, `eventActiveFaultsDec`); `recordFaultEvent(k faultEventKind)` (consolidates stat dispatch per planner-time decision 3; nil-tolerant per ADR-0085 — `if f.stats == nil` early return + per-counter `if f.stats.X != nil` nil-guards on each switch arm); `decrementActive()` markedActive-guarded Dec stub (Task 6 wires the Inc side; the helper is `nolint:unused` because Task 4's abort-only path doesn't call it — abort fires synchronously, no markedActive lifecycle yet). Removed the `nolint:unused` directive from `faultAbortBody` (now consumed by DecodeHeaders). Step 4 confirmed all 13 tests PASS (7 Task-3 + 6 Task-4; 0.004s). Step 5 confirmed `go test -race -count=1 ./internal/filter/http/fault/...` clean (1.012s), `go vet ./...` clean, `golangci-lint run ./internal/filter/http/fault/...` clean, full `go test -race -count=1 -short ./...` PASS across all 30 packages including the 11 differential fixtures unchanged. Step 6 appended ADR-0103 to `docs/envoy-go/DECISIONS.md` per the ADR-0001 template (Status / Date / Doctrine / Lands-in-task / Context / Decision / Alternatives considered (six alternatives A-F) / Consequences (six items a-f)). ADR-0103 anchors the abort terminal-replace mechanics + body byte-exact "fault filter abort" (18 bytes, no trailing newline) + 4-header set on the wire (content-length: 18, content-type: text/plain WITHOUT charset modifier, date: <IMF-fixdate>, server: envoy) + OrderedHeaders carrier discipline (Content-Type override per ADR-0075's SendLocalReply ordered-headers contract) + status-text allow-list narrowed to four canonical codes (200/404/405/503 byte-equal; others code-only) per planner-time decision 7. Cross-references ADR-0075 (SendLocalReply + OrderedHeaders amendment), ADR-0072 (factory validates typed_config at boot — cfg.abortHTTPStatus is PGV-validated, no runtime re-validation), ADR-0085 (nil-tolerance — recordFaultEvent + per-counter nil-guards), ADR-0102 (delay async-resume — Task 5's combined delay+abort path will reuse the same OrderedHeaders carrier from a timer goroutine; sync.Once first-call-wins inside chain.beginLocalReply handles the cross-goroutine entry safely), ADR-0107 (5-stat extension — recordFaultEvent(eventAbortsInjected) is the abort-side Inc call site). Anchors SPEC §5.3 + §6.4 + §6.6 + §11.3 + §11.4 + §11.8. Lands-in-task field reads "Task 4 (phase 09); commit TBD" — SHA-fill follow-up replaces TBD per the 08.2 precedent (PROGRESS.md Task 4 entry's `Commits:` line + DECISIONS.md ADR-0103 Lands-in-task line updated together in the SHA-fill commit). One PLAN-recorded helper (`decrementActive`) lands as a `nolint:unused` stub because Task 4's abort-only synchronous path does not consume it — Task 6 wires the markedActive Inc side from the cap-check insertion point + the OnDestroy/timer-callback Dec sites.
+**Outputs:**
+```
+$ go test ./internal/filter/http/fault/ -v
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_AbortHTTPStatusOutOfRange
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/zero
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/too_high
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/too_low
+=== RUN   TestNew_AbortHTTPStatusOutOfRange/upper_exclusive
+--- PASS: TestNew_AbortHTTPStatusOutOfRange (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/zero (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/too_high (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/too_low (0.00s)
+    --- PASS: TestNew_AbortHTTPStatusOutOfRange/upper_exclusive (0.00s)
+=== RUN   TestNew_DelayPercentageWithoutFixedDelay
+--- PASS: TestNew_DelayPercentageWithoutFixedDelay (0.00s)
+=== RUN   TestNew_HappyPath
+--- PASS: TestNew_HappyPath (0.00s)
+=== RUN   TestNew_RegistersStats
+--- PASS: TestNew_RegistersStats (0.00s)
+=== RUN   TestRuntimeConfig_FieldExtraction
+--- PASS: TestRuntimeConfig_FieldExtraction (0.00s)
+=== RUN   TestDecodeHeaders_AbortOnly_100Percent
+--- PASS: TestDecodeHeaders_AbortOnly_100Percent (0.00s)
+=== RUN   TestDecodeHeaders_AbortOnly_0Percent
+--- PASS: TestDecodeHeaders_AbortOnly_0Percent (0.00s)
+=== RUN   TestDecodeHeaders_HeadersFieldExactMatch_CaseInsensitiveName
+--- PASS: TestDecodeHeaders_HeadersFieldExactMatch_CaseInsensitiveName (0.00s)
+=== RUN   TestDecodeHeaders_HeadersFieldExactMatch_CaseSensitiveValue
+--- PASS: TestDecodeHeaders_HeadersFieldExactMatch_CaseSensitiveValue (0.00s)
+=== RUN   TestDecodeHeaders_NoFaultHeaderMismatch
+--- PASS: TestDecodeHeaders_NoFaultHeaderMismatch (0.00s)
+=== RUN   TestDecodeHeaders_AbortStatRecorded
+--- PASS: TestDecodeHeaders_AbortStatRecorded (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	0.004s
+$ go test -race -count=1 ./internal/filter/http/fault/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.012s
+$ go vet ./...
+$ golangci-lint run ./internal/filter/http/fault/...
+```
