@@ -784,3 +784,79 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.023s
 ```
+
+## Task 11 — Fixture 0011 backends/backend.go (Go HTTP backend serving `backend\n`)
+
+**Commits:** d4aa744 — this task's commit; TBD — SHA-fill follow-up
+**Notes:** Mechanical fixture-ship task per PLAN.md Task 11 Steps 1–4 + planner-time decision 11 (path). Step 1 wrote `test/fixtures/0011-http-fault/backends/backend.go` verbatim per PLAN snippet (24 LoC; gofmt'd to tab indent — Go canonical): `package main` Go HTTP backend with `--port` flag (default 18001), single `/` handler returning `200 OK` with `Content-Type: text/plain` + explicit `Content-Length: 8` + body `"backend\n"` (8 bytes; matches the §11 empirical-pin backend used during phase 09 SPEC drafting). The parent dir `test/fixtures/0011-http-fault/` did not exist prior to this task — Task 11 creates both the fixture-root and the `backends/` subdir. Step 2 ran `go build ./test/fixtures/0011-http-fault/backends/...` — clean. Step 3 ran the manual smoke test: `go run ./test/fixtures/0011-http-fault/backends --port 18001 &; sleep 1; curl -sS -i http://127.0.0.1:18001/; kill %1` — confirmed `HTTP/1.1 200 OK` + `Content-Length: 8` + `Content-Type: text/plain` + body `backend\n` (hex `62 61 63 6b 65 6e 64 0a`, exactly 8 bytes including the trailing LF). Step 4 ran the four-gate suite — `go build ./...` + `go vet ./...` + `golangci-lint run ./...` + `go test -race -count=1 -short ./...` all clean; 33 packages PASS unchanged plus the new `test/fixtures/0011-http-fault/backends` package now visible as `[no test files]` (consistent with all other fixture `backends/` packages). NO new ADR.
+**Outputs:**
+```
+$ go build ./test/fixtures/0011-http-fault/backends/...
+$ go run ./test/fixtures/0011-http-fault/backends --port 18001 &
+$ sleep 1; curl -sS -i http://127.0.0.1:18001/
+HTTP/1.1 200 OK
+Content-Length: 8
+Content-Type: text/plain
+Date: Sun, 03 May 2026 23:46:31 GMT
+
+backend
+$ curl -sS http://127.0.0.1:18001/ | xxd
+00000000: 6261 636b 656e 640a                      backend.
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.7s (unchanged)
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.0s
+ok  	github.com/esalaine/envoy-go/internal/admin	1.5s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.083s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.084s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.146s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.083s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.538s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.165s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.034s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.064s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.305s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.270s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.213s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.090s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.067s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.036s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.046s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.109s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	1.153s
+ok  	github.com/esalaine/envoy-go/test/differential	1.152s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.034s
+?   	github.com/esalaine/envoy-go/test/fixtures/0000-tcp-echo/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.031s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/pki/gen	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.035s
+?   	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/pki/gen	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.030s
+?   	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.033s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.026s
+?   	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.027s
+?   	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/backends	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver	[no test files]
+?   	github.com/esalaine/envoy-go/test/fixtures/0011-http-fault/backends	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.047s
+```
