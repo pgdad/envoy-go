@@ -565,7 +565,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.043s
 
 ## Task 8 — cmd/envoy-go/main.go register fault.New under fault.TypeURL [ADR-0100]
 
-**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Commits:** 311f363 — this task's commit; TBD — SHA-fill follow-up
 **Notes:** Mechanical boot-wiring task per PLAN.md Task 8 Steps 1–7. Step 1 inspected the existing http filter import block + Register chain in `cmd/envoy-go/main.go` (router/cors/envoygotest landed in 07.1 Task 20). Step 2 added `"github.com/esalaine/envoy-go/internal/filter/http/fault"` to the http filter import block, sorted alphabetically between `envoygotest` and `router` (gofmt-stable ordering). Step 3 inserted `httpReg.Register(fault.TypeURL, fault.New)` after the `envoygotest` Register and before `httpReg.Freeze()`, preserving the BRAINSTORM Decision 2 router-first-then-alphabetical convention. Step 4 ran the four-gate suite (`go build ./...` + `go vet ./...` + `golangci-lint run ./...` + `go test -race -count=1 -short ./...`) — all four clean; 32 packages PASS unchanged. Step 5 was deliberately SKIPPED per PLAN.md Task 8 Step 5 — the smoke test (crafting a minimal bootstrap and running the binary) is deferred because the differential fixture (Tasks 11–14) exercises the exact end-to-end registration → typed_config resolution → factory invocation path against reference Envoy, and the Task 16 phase-done six-gate verification is a second backstop for boot-wiring regressions. NO new ADR landed — ADR-0100 (boot registration) was anchored in Task 3. Per-package cmd test (`go test -race -count=1 ./cmd/envoy-go/...`) passes confirming the binary still builds and the new Register call wires correctly.
 **Outputs:**
 ```
