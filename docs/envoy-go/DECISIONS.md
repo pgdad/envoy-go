@@ -4526,7 +4526,7 @@ Per SPEC §5.6 + §5.7 + §6.4 the fault filter implements a `max_active_faults`
 
 Three load-bearing pieces of the concurrency model:
 
-1. **Closure-captured `*atomic.Int64` shared counter (LBP-1 sixth application).** The counter is allocated by `New` (the `HTTPFilterFactory` factory function) at HCM-build time and CLOSURE-CAPTURED by the per-instance allocator returned from `New`; every `*filter` produced by the same factory shares the same `*atomic.Int64`. This is LBP-1 (the "factory-allocated, instance-shared, lock-free" pattern) — the sixth application of the same pattern, after ADR-0072 (HTTPRegistry typed-config map), ADR-0079 (ListenerFilterRegistry), ADR-0061 (stats Registry counter pointers), ADR-0091 (drain Manager broadcast channel), and ADR-0078 (ChainBuilder closure-captured filter list). The hot path is a single `f.active.Load()` compared against `cfg.maxActiveFaults` (relaxed memory order) — no mutex, no contention.
+1. **Closure-captured `*atomic.Int64` shared counter (LBP-1 sixth application).** The counter is allocated by `New` (the `HTTPFilterFactory` factory function) at HCM-build time and CLOSURE-CAPTURED by the per-instance allocator returned from `New`; every `*filter` produced by the same factory shares the same `*atomic.Int64`. This is LBP-1 (the "factory-allocated, instance-shared, lock-free" pattern) — the sixth application of the same pattern, after ADR-0059 (stats Registry counter pointers — first), ADR-0072 (HTTPRegistry typed-config map — second), ADR-0079 (ListenerFilterRegistry — third), ADR-0085 (admin three-thread bootstrap+cluster+listener — fourth), and ADR-0091 (drain Manager — fifth). The hot path is a single `f.active.Load()` compared against `cfg.maxActiveFaults` (relaxed memory order) — no mutex, no contention.
 
 2. **Per-instance `markedActive atomic.Bool` idempotency guard.** Each `*filter` instance carries an `atomic.Bool` flag; `markActive()` runs on the dispatch goroutine immediately after the cap check passes, performing `f.active.Add(1) → f.markedActive.Store(true) → recordFaultEvent(eventActiveFaultsInc)`. The Dec side (`decrementActive()`) uses `f.markedActive.CompareAndSwap(true, false)` — exactly one CAS succeeds across the racing pair (timer callback Dec'ing on the timer goroutine; `OnDestroy` Dec'ing on the chain-teardown goroutine). The atomic-Bool form is REQUIRED, not optional — empirical race-detector evidence (`go test -race -count=10 ./internal/filter/http/fault/...`) flags a plain `bool` RMW under `TestFault_DelayTimerRace` because `time.AfterFunc(d, fn)` runs `fn` on a runtime goroutine that genuinely races `OnDestroy` when `delayTimer.Stop()` returns false (the timer has already fired or is firing). The atomic.Bool form is race-clean by construction.
 
@@ -4637,11 +4637,11 @@ return func() envoyhttp.HTTPFilter {
 
 (e) Cross-references:
    - ADR-0071 (single-goroutine-per-stream invariant) — REFINED. ADR-0071 governs the dispatch goroutine; `time.AfterFunc` callbacks + OnDestroy genuinely run on different goroutines during chain teardown. The single-goroutine invariant covers RNG access (`f.rng.Float64()` in `rollPercent` runs only on the dispatch goroutine per ADR-0102 Consequence (b)) and `markActive` (also dispatch-goroutine). The Dec side (`decrementActive`) genuinely straddles goroutines — atomic.Bool CAS handles that case.
-   - ADR-0072 (HTTPRegistry closure-captured map) — anchored. LBP-1 first application; this ADR is the sixth.
-   - ADR-0079 (ListenerFilterRegistry) — anchored. LBP-1 second application.
-   - ADR-0061 (stats Registry counter pointers) — anchored. LBP-1 third application.
-   - ADR-0091 (drain Manager broadcast channel) — anchored. LBP-1 fourth application.
-   - ADR-0078 (ChainBuilder closure-captured filter list) — anchored. LBP-1 fifth application.
+   - ADR-0059 (stats Registry counter pointers) — anchored. LBP-1 first application; this ADR is the sixth.
+   - ADR-0072 (HTTPRegistry closure-captured map) — anchored. LBP-1 second application.
+   - ADR-0079 (ListenerFilterRegistry) — anchored. LBP-1 third application.
+   - ADR-0085 (admin three-thread bootstrap+cluster+listener) — anchored. LBP-1 fourth application.
+   - ADR-0091 (drain Manager) — anchored. LBP-1 fifth application.
    - ADR-0102 (delay async-resume) — anchored at the cancel-on-OnDestroy mechanics. The Task-5 timer-callback's `f.decrementActive()` is the timer-side Dec; this ADR's `OnDestroy` is the chain-teardown-side Dec. Both converge on the markedActive CAS.
    - ADR-0107 (5-stat extension) — anchored at `recordFaultEvent(eventFaultsOverflow)` + `recordFaultEvent(eventActiveFaultsInc)` + `recordFaultEvent(eventActiveFaultsDec)`. All three Inc/Dec sites consolidate through `recordFaultEvent` per planner-time decision 3.
    - SPEC §5.6 (max_active_faults overflow flow) + §5.7 (concurrency model + markedActive guard) + §6.4 (DecodeHeaders cap check + dispatch sequence) + §6.5 (OnDestroy timer-cancel + Dec) + §14.1 (unit-test list including TestFault_DelayTimerRace) — anchored.
