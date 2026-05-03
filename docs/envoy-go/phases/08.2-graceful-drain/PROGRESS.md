@@ -35,6 +35,24 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 11 — cmd/envoy-go SIGTERM-handler upgrade + drain wiring [ADR-0092, ADR-0095]
+
+**Commits:** 50bd566 — this task's substantive commit
+**Notes:** Added `"github.com/esalaine/envoy-go/internal/drain"` and `"time"` imports. Allocated `drainMgr := drain.New(30 * time.Second)` after `bs.ConfigPath = *cfgPath` (post-bootstrap.Load) and before `cluster.NewManagerWithBaseDir` per planner-time decision 7. Threaded `drainMgr` as the 9th arg to `listener.NewManagerWithBaseDirAndAllowH2C` and as the 7th arg to `admin.New` — fixing the broken-window that has existed since Task 3. Upgraded the `<-ctx.Done()` body to the drain-then-exit sequence per SPEC §6.8 + ADR-0092: `drainMgr.Drain()` → `select { case <-drainMgr.Done() / case <-time.After(drainMgr.Timeout()) }` → `cm.Drain()` → existing deferred-stop chain (LIFO: lm.Stop, admSrv.Close, sinks-close) per planner-time decision 9. Appended ADR-0092 (SIGTERM=drain-then-exit deliberate divergence from Envoy v1.37.2's immediate-exit) and ADR-0095 (30s MVP timeout vs Envoy 600s default) to `docs/envoy-go/DECISIONS.md`. `go build ./...` is clean for the first time since Task 3.
+**Outputs:**
+```
+$ go build ./cmd/envoy-go/... 2>&1
+(no output — clean)
+$ go build ./... 2>&1
+(no output — clean)
+$ go test -count=1 ./cmd/envoy-go/... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	4.149s
+$ go vet ./... 2>&1
+(no output — clean)
+$ golangci-lint run ./cmd/envoy-go/... 2>&1
+(no output — clean)
+```
+
 ## Task 10 — TCP-proxy Inc/Dec hooks + `dm` field + constructor widening [ADR-0096]
 
 **Commits:** 3617f19 — this task's substantive commit
