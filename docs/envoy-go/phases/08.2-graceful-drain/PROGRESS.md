@@ -35,6 +35,46 @@ The ten planner-time deferred decisions reproduced verbatim from PLAN.md so this
 9. **`cm.Drain()` call ordering vs deferred-stop chain = explicit call after rendezvous, before deferred-stop chain runs** (LIFO: lm.Stop, admSrv.Close, sinks-close per phase 06.2).
 10. **`POST /drain_listeners` with `nil` drain manager = return 500 Internal Server Error with body `drain manager not configured\n`** (defensive-loud over silent-200; aligns with the ADR-0085 nil-tolerance pattern only for read-only endpoints, not for the mutating `/drain_listeners`; settles SPEC §14.2's `TestHandleDrainListeners_NilDrainManager` ambiguity).
 
+## Task 7 — `internal/admin/drain.go` POST handler + method discrimination [ADR-0093]
+
+**Commits:** b72e83b — this task's substantive commit
+**Notes:** Created `internal/admin/drain.go` with `(*Server).handleDrainListeners` implementing the POST /drain_listeners contract per SPEC §6.3 + §11.1 + §11.4. Method discrimination FIRST: non-POST returns 405 with body `Method <METHOD> not allowed, POST required.\n` (hard rejection; no drain side-effect). POST calls `s.dm.Drain()` (sync.Once-guarded inside drain.Manager; idempotent) and returns 200 `OK\n`. Fire-and-forget (no `<-s.dm.Done()` block). `?graceful=true` silently accepted per ADR-0041. Nil dm → 500 `drain manager not configured\n` per planner-time decision 10. Uses `writeAdminHeaders(w, "text/plain; charset=UTF-8")` per the 08.1 header helper (Content-Length + Date auto-managed by net/http per SPEC §12 #5). Added `mux.HandleFunc("/drain_listeners", s.handleDrainListeners)` to `admin.Server.Start()` (seventh handler). Updated Start() doc-comment: "Seven routes" (was "Six routes"). Also fixed pre-existing T5 broken-window: `admin_helpers_test.go` + `listeners_test.go` test helpers called `listener.NewManagerWithBaseDirAndAllowH2C` with the old 8-arg signature (missing `*drain.Manager`); updated to 9-arg with nil dm (nil-tolerated per ADR-0085 test convention). Appended ADR-0093 to `docs/envoy-go/DECISIONS.md`; in-place amended ADR-0090 Consequences (phase 08.2 amendment paragraph) per ADR-0089 consequence (b) pattern.
+**Outputs:**
+```
+$ go test -run TestHandleDrainListeners ./internal/admin/... -v 2>&1 | tail -30
+=== RUN   TestHandleDrainListeners_PostFires
+--- PASS: TestHandleDrainListeners_PostFires (0.00s)
+=== RUN   TestHandleDrainListeners_BodyExact
+--- PASS: TestHandleDrainListeners_BodyExact (0.00s)
+=== RUN   TestHandleDrainListeners_Idempotent
+--- PASS: TestHandleDrainListeners_Idempotent (0.00s)
+=== RUN   TestHandleDrainListeners_GraceQueryParamSilentlyIgnored
+--- PASS: TestHandleDrainListeners_GraceQueryParamSilentlyIgnored (0.00s)
+=== RUN   TestHandleDrainListeners_NilDrainManager
+--- PASS: TestHandleDrainListeners_NilDrainManager (0.00s)
+=== RUN   TestHandleDrainListeners_GetReturns405
+--- PASS: TestHandleDrainListeners_GetReturns405 (0.00s)
+=== RUN   TestHandleDrainListeners_PutReturns405
+--- PASS: TestHandleDrainListeners_PutReturns405 (0.00s)
+=== RUN   TestHandleDrainListeners_DeleteReturns405
+--- PASS: TestHandleDrainListeners_DeleteReturns405 (0.00s)
+=== RUN   TestHandleDrainListeners_HeadReturns405
+--- PASS: TestHandleDrainListeners_HeadReturns405 (0.00s)
+=== RUN   TestHandleDrainListeners_HeaderSet
+--- PASS: TestHandleDrainListeners_HeaderSet (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/admin	0.003s
+$ go vet ./internal/admin/...
+(no output — clean)
+$ golangci-lint run ./internal/admin/...
+(no output — clean)
+$ go build ./internal/admin/...
+(no output — clean)
+$ go build ./cmd/envoy-go/... 2>&1 | head -3
+cmd/envoy-go/main.go:122:130: not enough arguments in call to listener.NewManagerWithBaseDirAndAllowH2C
+(EXPECTED FAILURE — intentional broken-window; Task 11 fixes the call site)
+```
+
 ## Task 5 — `internal/listener.Manager.Drain()` + Accept-loop fast-path [ADR-0094]
 
 **Commits:** 3b75a82 — this task's substantive commit
