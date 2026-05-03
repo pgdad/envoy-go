@@ -638,7 +638,7 @@ ok  	github.com/esalaine/envoy-go/test/helpers	1.045s
 
 ## Task 9 — FuzzFaultConfigParse fuzzer (twelfth fuzzer per ADR-0018)
 
-**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Commits:** 73c2b08 — this task's commit; TBD — SHA-fill follow-up
 **Notes:** Mechanical fuzzer-ship task per PLAN.md Task 9 Steps 1–4 + planner-time decision 1 (SHIP). Step 1 wrote `internal/filter/http/fault/fuzz_test.go` verbatim per PLAN.md lines 1975–2019: `FuzzFaultConfigParse` feeds arbitrary byte sequences as the `tc *anypb.Any` Value (TypeURL pinned to `fault.TypeURL`) and asserts the New factory returns either `(factory, nil)` OR `(nil, error)` — never `(nil, nil)`, never both. Seed corpus is the 5 byte sequences from PLAN: nil, empty, `{0x00}`, `{0xff,0xff,0xff,0xff}`, `[]byte("not-a-proto")`. Step 2 ran the 30s fuzz budget — no panics, no `(nil, nil)` returns; corpus expanded from baseline 4 (the 5 dedup'd seeds — nil and `{}` are byte-equivalent under f.Add) to 250 interesting inputs; ~3.36M execs total at peak ~322k/sec. Step 3 ran short-mode (`go test -count=1 -short ./internal/filter/http/fault/`) confirming the seed corpus runs as part of the normal test suite — PASS. Step 4 ran the four-gate suite — `go build ./...` + `go vet ./...` + `golangci-lint run ./...` + `go test -race -count=1 -short ./...` all clean; 33 packages PASS unchanged. NO new ADR landed (ADR-0018 fuzz-CI policy is the anchoring ADR; established phase 04+; this is the twelfth fuzzer in that lineage per PLAN.md Task 9 + planner-time decision 1).
 **Outputs:**
 ```
