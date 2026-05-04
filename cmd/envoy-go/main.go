@@ -28,6 +28,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/cors"
 	"github.com/esalaine/envoy-go/internal/filter/http/envoygotest"
 	"github.com/esalaine/envoy-go/internal/filter/http/fault"
+	"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
@@ -113,6 +114,7 @@ func main() {
 	httpReg.Register(cors.TypeURL, cors.New)
 	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
 	httpReg.Register(fault.TypeURL, fault.New)
+	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
 	httpReg.Freeze()
 
 	// Phase 07.2 Task 11 boot wiring: build the
