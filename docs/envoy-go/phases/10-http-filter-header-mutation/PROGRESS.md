@@ -576,7 +576,7 @@ ok  	github.com/esalaine/envoy-go/test/differential	1.816s
 
 ## Task 17 — Phase-done six-gate verification + STATE.md advance + phase-done commit
 
-**Commits:** `<TBD>` — `phase 10: http-filter-header-mutation [ADR-0108..ADR-0113]`
+**Commits:** `8e17e06` — `phase 10: http-filter-header-mutation [ADR-0108, ADR-0109, ADR-0110, ADR-0111, ADR-0112, ADR-0113]`
 **Notes:** All six gates green at this commit. Implementer ran gate (a) + (c) + (f) directly; gates (b) + (e) ran in background. Gate (d) verified via fuzzer count = 14 (12 pre-09 + FuzzFaultConfigParse + FuzzHeaderMutationConfigParse) + the new fuzzer was already validated at 6.5M execs in Task 10 (30s budget per ADR-0018). STATE.md flipped to `awaiting next planning`; `next-skill: superpowers:brainstorming` per ADR-0106. ROADMAP row 10 now `done`. The 13 differential fixtures (0000-0012) ran in 39.76s.
 
 **Outputs:**
