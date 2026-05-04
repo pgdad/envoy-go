@@ -231,3 +231,60 @@ $ go test -race ./internal/filter/http/header_mutation/... -v 2>&1
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.011s
 ```
+
+## Task 6 — header_mutation applyOps + applyAppendAction + AppendAction × 4 + keep_empty_value boundary + multi-value tests
+
+**Commits:** `898c3ed` — `phase 10: header_mutation applyOps + AppendAction × 4 + keep_empty_value boundary`
+
+**Notes:** Landed the per-tier mutation-application algorithm (ADR-0109 apply-loop semantics). Two functions added to `internal/filter/http/header_mutation/header_mutation.go` after `validatePerRouteHeaderMutation` and before the `filter` struct:
+
+- `applyOps(headers http.Header, ops []compiledMutationOp)`: iterates the ops slice in proto-declared order, dispatching to `headers.Del(op.headerName)` for `kindRemove` or `applyAppendAction(headers, op)` for `kindAppend`.
+
+- `applyAppendAction(headers http.Header, op compiledMutationOp)`: keep_empty_value=false silent-skip fires FIRST (before the AppendAction switch per §11.2 conclusion (c)). Switch covers all 4 variants: `APPEND_IF_EXISTS_OR_ADD` → `headers.Add` (preserves existing multi-values, per §11.4); `ADD_IF_ABSENT` → `headers.Add` if `headers.Get` is empty; `OVERWRITE_IF_EXISTS_OR_ADD` → `headers.Set` (collapses multi-value to single, per §11.4); `OVERWRITE_IF_EXISTS` → `headers.Set` only if `headers.Get` is non-empty.
+
+`net/http` import added to `header_mutation_test.go` (tests directly construct `http.Header{}`).
+
+15 test functions added (11 top-level + 4 table-driven sub-cases in `TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions`). No ADR landed in this task (ADR-0109 already landed in Task 5).
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/header_mutation/... -v -run TestApplyOps 2>&1
+=== RUN   TestApplyOps_AppendIfExistsOrAdd_AbsentTarget
+--- PASS: TestApplyOps_AppendIfExistsOrAdd_AbsentTarget (0.00s)
+=== RUN   TestApplyOps_AppendIfExistsOrAdd_PresentMultiValue
+--- PASS: TestApplyOps_AppendIfExistsOrAdd_PresentMultiValue (0.00s)
+=== RUN   TestApplyOps_AddIfAbsent_AbsentTarget
+--- PASS: TestApplyOps_AddIfAbsent_AbsentTarget (0.00s)
+=== RUN   TestApplyOps_AddIfAbsent_PresentTarget
+--- PASS: TestApplyOps_AddIfAbsent_PresentTarget (0.00s)
+=== RUN   TestApplyOps_OverwriteIfExistsOrAdd_AbsentTarget
+--- PASS: TestApplyOps_OverwriteIfExistsOrAdd_AbsentTarget (0.00s)
+=== RUN   TestApplyOps_OverwriteIfExistsOrAdd_PresentMultiValue
+--- PASS: TestApplyOps_OverwriteIfExistsOrAdd_PresentMultiValue (0.00s)
+=== RUN   TestApplyOps_OverwriteIfExists_AbsentTarget
+--- PASS: TestApplyOps_OverwriteIfExists_AbsentTarget (0.00s)
+=== RUN   TestApplyOps_OverwriteIfExists_PresentTarget
+--- PASS: TestApplyOps_OverwriteIfExists_PresentTarget (0.00s)
+=== RUN   TestApplyOps_Remove_PresentTarget
+--- PASS: TestApplyOps_Remove_PresentTarget (0.00s)
+=== RUN   TestApplyOps_Remove_AbsentTarget
+--- PASS: TestApplyOps_Remove_AbsentTarget (0.00s)
+=== RUN   TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions
+=== RUN   TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/APPEND_IF_EXISTS_OR_ADD
+=== RUN   TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/ADD_IF_ABSENT
+=== RUN   TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/OVERWRITE_IF_EXISTS_OR_ADD
+=== RUN   TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/OVERWRITE_IF_EXISTS
+--- PASS: TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions (0.00s)
+    --- PASS: TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/APPEND_IF_EXISTS_OR_ADD (0.00s)
+    --- PASS: TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/ADD_IF_ABSENT (0.00s)
+    --- PASS: TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/OVERWRITE_IF_EXISTS_OR_ADD (0.00s)
+    --- PASS: TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions/OVERWRITE_IF_EXISTS (0.00s)
+=== RUN   TestApplyOps_KeepEmptyValueTrue_EmptyValue_AppendIfExistsOrAdd
+--- PASS: TestApplyOps_KeepEmptyValueTrue_EmptyValue_AppendIfExistsOrAdd (0.00s)
+=== RUN   TestApplyOps_KeepEmptyValueTrue_EmptyValue_OverwriteIfExists_AbsentTarget
+--- PASS: TestApplyOps_KeepEmptyValueTrue_EmptyValue_OverwriteIfExists_AbsentTarget (0.00s)
+=== RUN   TestApplyOps_KeepEmptyValueTrue_EmptyValue_OverwriteIfExists_PresentTarget
+--- PASS: TestApplyOps_KeepEmptyValueTrue_EmptyValue_OverwriteIfExists_PresentTarget (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.009s
+```
