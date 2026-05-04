@@ -48,3 +48,43 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | sed 's/.*ADR-0*\([0-9]*\):.*/\1/'
 $ git log -1 --format=%H -- docs/envoy-go/phases/10-http-filter-header-mutation/SPEC.md
 f339c1251168d46422cf72a4380a733829bda6ae
 ```
+
+## Task 2 — PerRouteConfig.ResolveAllTiers framework method
+
+**Commits:** `3eba8df48ef78878a49482a95cad71800c7a5a8d` — `phase 10: framework — PerRouteConfig.ResolveAllTiers per ADR-0110`
+
+**Notes:** Landed `PerRouteConfig.ResolveAllTiers(filterName string, routeIdx int) (route, vhost, rc proto.Message)` in `internal/filter/http/perroute.go`, appended after the existing `Resolve` method. Method reads directly from `p.scopes[routeIdx].route`, `p.scopes[routeIdx].vhost`, and `p.rc` maps without most-specific selection logic; returns the unmerged 3-tuple with nil entries for tiers with no config for filterName. Does not consult or pollute `p.cache` (planner-time decision 2). No ADR text in this task — ADR-0110 text lands in Task 7 at first end-to-end use. 12 test functions added to `perroute_test.go` covering all tier combinations + edge cases (out-of-range routeIdx, absent filterName, cache non-pollution, nil receiver). `go vet ./...` and `golangci-lint run ./internal/filter/http/...` both clean.
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/... -run TestResolveAllTiers -v 2>&1 | grep -E "^(=== RUN|--- (PASS|FAIL)|PASS|FAIL)"
+=== RUN   TestResolveAllTiers_AllThreeSet
+--- PASS: TestResolveAllTiers_AllThreeSet (0.00s)
+=== RUN   TestResolveAllTiers_RouteAndVHostOnly
+--- PASS: TestResolveAllTiers_RouteAndVHostOnly (0.00s)
+=== RUN   TestResolveAllTiers_RouteAndRCOnly
+--- PASS: TestResolveAllTiers_RouteAndRCOnly (0.00s)
+=== RUN   TestResolveAllTiers_VHostAndRCOnly
+--- PASS: TestResolveAllTiers_VHostAndRCOnly (0.00s)
+=== RUN   TestResolveAllTiers_RouteOnly
+--- PASS: TestResolveAllTiers_RouteOnly (0.00s)
+=== RUN   TestResolveAllTiers_VHostOnly
+--- PASS: TestResolveAllTiers_VHostOnly (0.00s)
+=== RUN   TestResolveAllTiers_RCOnly
+--- PASS: TestResolveAllTiers_RCOnly (0.00s)
+=== RUN   TestResolveAllTiers_NoneSet
+--- PASS: TestResolveAllTiers_NoneSet (0.00s)
+=== RUN   TestResolveAllTiers_RouteIdxOutOfRange
+--- PASS: TestResolveAllTiers_RouteIdxOutOfRange (0.00s)
+=== RUN   TestResolveAllTiers_FilterNameNotPresent
+--- PASS: TestResolveAllTiers_FilterNameNotPresent (0.00s)
+=== RUN   TestResolveAllTiers_DoesNotPolluteResolveCache
+--- PASS: TestResolveAllTiers_DoesNotPolluteResolveCache (0.00s)
+=== RUN   TestResolveAllTiers_NilReceiver
+--- PASS: TestResolveAllTiers_NilReceiver (0.00s)
+PASS
+PASS
+PASS
+PASS
+PASS
+```
