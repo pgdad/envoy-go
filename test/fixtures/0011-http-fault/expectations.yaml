@@ -1,0 +1,86 @@
+# Per-scenario equivalence claims for fixture 0011-http-fault (phase 09).
+# Per ADR-0019 this YAML is prose documentation; the runner enforces via
+# driver/driver.go's per-scenario assertions.
+
+scenarios:
+  - id: scenario1
+    path_prefix: /scenario1
+    description: |
+      Listener-level inheritance: NO per-route override → request inherits
+      listener fault delay 100% 100ms (no abort).
+    expect:
+      status: 200
+      body_byte_equal: "backend\n"
+      time_total_ms_min: 90
+      time_total_ms_max: 110
+      stat_deltas:
+        delays_injected: +1
+        aborts_injected: +0
+        faults_overflow: 0
+        active_faults: 0  # final
+        response_rl_injected: 0  # always zero in phase 09 per ADR-0107 route A
+
+  - id: scenario2
+    path_prefix: /scenario2
+    description: |
+      Combined delay+abort per-route override: per-route HTTPFault re-includes
+      the delay AND adds abort 503; wholesale-override per ADR-0073/§11.7 +
+      timer-callback decision per ADR-0102 (delay fires, then abort fires).
+    expect:
+      status: 503
+      body_byte_equal: "fault filter abort"  # 18 bytes, NO trailing newline
+      headers:                                # 4-header set per §11.3 / ADR-0103
+        content-length: "18"
+        content-type: "text/plain"            # NO charset modifier
+        date: "<allow-listed>"
+        server: "envoy"
+      time_total_ms_min: 90
+      stat_deltas:
+        delays_injected: +1
+        aborts_injected: +1
+
+  - id: scenario3a
+    path_prefix: /scenario3-wholesale
+    description: |
+      Per-route wholesale-override (the canonical wholesale-override demo):
+      per-route abort 418 with NO delay field; the per-route HTTPFault
+      WHOLESALE-replaces the listener-level delay (ADR-0073 + §11.7).
+    expect:
+      status: 418
+      status_text_allow_listed: true   # planner-time decision 7: non-stdlib codes
+      body_byte_equal: "fault filter abort"
+      time_total_ms_max: 50            # NO inherited delay
+      stat_deltas:
+        aborts_injected: +1
+
+  - id: scenario3b
+    path_prefix: /scenario3-baseline
+    description: |
+      Listener-level baseline (NO per-route override): inherits listener fault
+      delay 100% 100ms only. Probe to confirm baseline-vs-wholesale delta.
+    expect:
+      status: 200
+      body_byte_equal: "backend\n"
+      time_total_ms_min: 90
+      time_total_ms_max: 110
+      stat_deltas:
+        delays_injected: +1
+
+  - id: scenario4
+    path_prefix: /scenario4
+    description: |
+      Headers-field exact-match gate (4 sub-probes per §7.1):
+        4a — no x-fault-on header → no fault → backend 200
+        4b — x-fault-on: yes → fault fires → 503 abort
+        4c — X-FAULT-ON: yes (uppercase NAME) → match (case-insensitive) → 503
+        4d — x-fault-on: YES (uppercase VALUE) → no match (case-sensitive) → 200
+      Listener-level delay is wholesale-replaced by the per-route fault config
+      (which has no delay field), so the misses (4a, 4d) hit the backend
+      immediately (no inherited delay).
+    expect:
+      probe_a: { status: 200, body_byte_equal: "backend\n" }
+      probe_b: { status: 503, body_byte_equal: "fault filter abort" }
+      probe_c: { status: 503, body_byte_equal: "fault filter abort" }
+      probe_d: { status: 200, body_byte_equal: "backend\n" }
+      stat_deltas:
+        aborts_injected: +2  # probes b + c hit
