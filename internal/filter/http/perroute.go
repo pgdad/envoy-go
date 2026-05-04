@@ -126,3 +126,37 @@ func (p *PerRouteConfig) Resolve(filterName string, routeIdx int) proto.Message 
 	p.cache[key] = msg
 	return msg
 }
+
+// ResolveAllTiers returns the parsed per-route config at each tier, unmerged.
+// Tiers are returned in canonical proto order: Route (most specific),
+// VirtualHost (intermediate), RouteConfiguration (least specific). A tier
+// with no config for filterName at the matched route is nil.
+//
+// Used by filters whose semantics require multi-tier evaluation rather than
+// most-specific override (e.g., envoy.filters.http.header_mutation per its
+// most_specific_header_mutations_wins flag — see ADR-0110). The default
+// Resolve method (per ADR-0073) remains the canonical accessor for filters
+// that use most-specific override (cors, fault).
+//
+// NOTE: ResolveAllTiers does NOT consult or pollute the existing p.cache
+// (which is keyed by (filterName, routeIdx) returning a single proto.Message;
+// multi-tier returns 3 messages with different cache shape). The map reads
+// (p.scopes[routeIdx].route, p.scopes[routeIdx].vhost, p.rc) are sub-microsecond;
+// per-request re-reads are acceptable per phase 10 PLAN planner-time decision 2.
+func (p *PerRouteConfig) ResolveAllTiers(filterName string, routeIdx int) (route, vhost, rc proto.Message) {
+	if p == nil {
+		return nil, nil, nil
+	}
+	if routeIdx >= 0 && routeIdx < len(p.scopes) {
+		if m, ok := p.scopes[routeIdx].route[filterName]; ok {
+			route = m
+		}
+		if m, ok := p.scopes[routeIdx].vhost[filterName]; ok {
+			vhost = m
+		}
+	}
+	if m, ok := p.rc[filterName]; ok {
+		rc = m
+	}
+	return route, vhost, rc
+}
