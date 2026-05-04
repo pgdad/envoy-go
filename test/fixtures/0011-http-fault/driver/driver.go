@@ -71,8 +71,12 @@ const (
 	// comfortable margin for CI scheduling jitter (±10ms tolerance per §13.3).
 	fastDelayThresholdMs = 80
 	// statPrefix matches the YAML's HCM stat_prefix (ingress_http). Reference
-	// Envoy + envoy-go both flatten the stat name to envoy_http_<sp>_fault_<n>
-	// per ADR-0061 (SN1 dot→underscore + SN2 envoy_ prefix).
+	// Envoy + envoy-go both flatten `http.<sp>.fault.<metric>` to the
+	// Prometheus form `envoy_http_fault_<metric>{envoy_http_conn_manager_prefix="<sp>"}`
+	// per ADR-0061 SN2 (HCM-namespace rule: `<sp>` is extracted as the
+	// `envoy_http_conn_manager_prefix` label, NOT part of the metric name) +
+	// the SN2 internal-dot transform (Phase 09 / Task 14 follow-up: nested
+	// rest's `.` → `_` for Prometheus name-grammar compliance).
 	statPrefix = "ingress_http"
 )
 

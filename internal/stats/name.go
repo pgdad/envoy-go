@@ -57,13 +57,17 @@ func flattenToProm(internal string) (string, []Label, error) {
 			return "", nil, fmt.Errorf("stats: name %q matches http.* but has no <rest> segment", internal)
 		}
 		labels = append(labels, Label{Key: "envoy_http_conn_manager_prefix", Value: tail[:dot]})
-		// Per SPEC §10.1 / ADR-0061 SN1: any remaining `.` in the rest segment
-		// is converted to `_` for Prometheus name compliance (periods are not
-		// legal in Prometheus metric names). For the existing 17-name set the
-		// rest never contained an internal period; phase 09's fault stats
-		// (`fault.aborts_injected` etc.) are the first sub-namespace nested
-		// under the HCM stat_prefix that exercises this transform — confirmed
-		// by SPEC §11.6 empirical pin: reference Envoy emits
+		// Phase 09 / Task 14 follow-up: SN2 internal-dot transform — Prometheus
+		// metric names cannot contain `.`, so any remaining `.` in the rest
+		// segment of HCM-scoped stats is converted to `_` before forming the
+		// base. ADR-0061's SN1–SN8 list is unchanged in spirit; this is an
+		// SN2 implementation detail surfaced by phase 09's
+		// `http.<sp>.fault.<metric>` keying — the first HCM-scoped stat with
+		// a nested rest segment containing internal dots. (SN1 is the
+		// `cluster.*` rule; SN3 is the `listener.*` rule; SN5 is the
+		// `server.*` rule; the dot→underscore transform applies wherever a
+		// nested rest is introduced — currently SN2 only.) Confirmed by
+		// SPEC §11.6 empirical pin: reference Envoy v1.37.2 emits
 		// `envoy_http_fault_aborts_injected{...}` (underscore, not period).
 		rest = strings.ReplaceAll(tail[dot+1:], ".", "_")
 		base = "envoy_http_" + rest

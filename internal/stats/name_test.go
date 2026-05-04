@@ -33,6 +33,26 @@ func TestFlattenToProm_HCM(t *testing.T) {
 	}
 }
 
+// TestFlattenToProm_HCM_DottedRest exercises the SN2 internal-dot transform
+// (Phase 09 / Task 14 follow-up). The HCM stat `http.<sp>.fault.<metric>` has
+// a nested rest segment (`fault.aborts_injected`); its internal `.` must be
+// converted to `_` so the projected Prometheus metric name is valid (Prom
+// names cannot contain `.`). The `<sp>` is extracted as the
+// `envoy_http_conn_manager_prefix` label, NOT included in the metric name.
+func TestFlattenToProm_HCM_DottedRest(t *testing.T) {
+	prom, labels, err := flattenToProm("http.ingress_http.fault.aborts_injected")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if prom != "envoy_http_fault_aborts_injected" {
+		t.Errorf("promName = %q, want %q", prom, "envoy_http_fault_aborts_injected")
+	}
+	want := []Label{{Key: "envoy_http_conn_manager_prefix", Value: "ingress_http"}}
+	if !reflect.DeepEqual(labels, want) {
+		t.Errorf("labels = %+v, want %+v", labels, want)
+	}
+}
+
 func TestFlattenToProm_Cluster(t *testing.T) {
 	prom, labels, err := flattenToProm("cluster.c0.upstream_cx_active")
 	if err != nil {

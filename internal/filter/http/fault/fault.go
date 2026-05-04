@@ -296,9 +296,10 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 	}
 	f.markActive()
 	if delayApplies && abortApplies {
-		// Combined: timer fires; callback calls SendLocalReply (NOT
-		// ContinueDecoding) per ADR-0102 — the upstream is never dialed; the
-		// abort response arrives delay.fixed_delay after the request.
+		// Combined: timer fires; callback calls SendLocalReply + ContinueDecoding
+		// per ADR-0102 — the chain's localReplyDone gate ensures the resumed
+		// iteration short-circuits without dialing the upstream; the abort
+		// response arrives delay.fixed_delay after the request.
 		// delays_injected Inc happens synchronously on the dispatch goroutine
 		// (before the timer is scheduled); aborts_injected Inc happens from the
 		// timer-callback goroutine. Per planner-time decision 12, the percentage
