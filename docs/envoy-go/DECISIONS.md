@@ -4664,7 +4664,7 @@ return func() envoyhttp.HTTPFilter {
 **Status:** Deferred
 **Date:** 2026-05-03
 **Doctrine:** D-3.5 (record durable design rationale; explicit deferral with target follow-up so future readers can trace the scope choice). Per-ADR-0040 deferral-ADR format (mirrors ADR-0089's deferral-list precedent).
-**Lands-in-task:** Task 15 (phase 09); commit TBD.
+**Lands-in-task:** Task 15 (phase 09); commit 40db754.
 
 ### Context
 
@@ -4729,7 +4729,7 @@ The header-driven fault path is DEFERRED from phase 09. Specifically:
 **Status:** Accepted
 **Date:** 2026-05-03
 **Doctrine:** D-3.5 (record durable design rationale; the family-expansion shape is a load-bearing invariant of the §9 trunk that subsequent filter phases will inherit). Per-ADR-0001 template.
-**Lands-in-task:** Task 15 (phase 09); commit TBD.
+**Lands-in-task:** Task 15 (phase 09); commit 40db754.
 
 ### Context
 
