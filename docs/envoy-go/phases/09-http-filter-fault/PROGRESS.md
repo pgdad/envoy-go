@@ -1004,7 +1004,7 @@ $ go test -race -count=1 -short ./...
 
 ## Task 16 — Phase-done six-gate verification + STATE.md advance + phase-done commit
 
-**Commits:** TBD — phase-done commit; TBD — STATE.md SHA-fill follow-up
+**Commits:** c7de495 — phase-done commit; TBD — STATE.md SHA-fill follow-up
 **Notes:** Final lifecycle-state 5 → 6 task. All six gates green per BOOTSTRAP_PROMPT.md §5 phase-done discipline. Gate (d) abbreviated per planner-time PLAN guidance option B: ran ONLY the new `FuzzFaultConfigParse` for 30s (rationale: the existing 12 fuzzers were verified in prior phases AND phase 09 touches none of their code paths; Task 9 already ran `FuzzFaultConfigParse` for 30s with 3.36M execs at fuzzer-introduction time). The phase-done commit message names ALL eight ADRs ADR-0100..ADR-0107 in the subject and body per ADR-0044 ADR-on-impl convention + the 08.2 phase-done precedent. STATE.md flipped from `lifecycle-state: 3 / active-phase: 09-http-filter-fault` to `lifecycle-state: awaiting / active-phase: awaiting next planning` per BOOTSTRAP_PROMPT.md §5 between-phases state machine; `next-skill: superpowers:brainstorming` against §9 family list per ADR-0106 (flat top-level rows; the §9 heading at ROADMAP line 56 is an umbrella whose state is implicit and unchanged). No code changes in Task 16 — verification + state-advance + commit only.
 
 **Gate (a) — `go build ./...` clean:**
