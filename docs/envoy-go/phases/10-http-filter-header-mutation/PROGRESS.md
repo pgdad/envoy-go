@@ -104,3 +104,52 @@ PASS
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http	0.002s
 ```
+
+## Task 4 — HTTPRegistry.RegisterPerRouteValidator + BuildPerRouteConfig integration
+
+**Commits:** `80df1ea6e0e2c74ca5ce682281b39f15e6ad8155` — `phase 10: framework — HTTPRegistry.RegisterPerRouteValidator + BuildPerRouteConfig integration per ADR-0110`
+
+**Notes:** Landed the third and final ADR-0110 framework piece (planner-time decision 3, eager validator lifecycle). Changes:
+
+- `internal/filter/http/registry.go`: added `perRouteValidators map[string]func(proto.Message) error` field to `*HTTPRegistry`; initialised in `NewHTTPRegistry()`; added `RegisterPerRouteValidator(filterName string, validator func(proto.Message) error)` (panic-after-Freeze, mirrors existing `Register` discipline with `r.frozen.Load()` atomic check + RWMutex write lock) + `PerRouteValidator(filterName string) func(proto.Message) error` (nil-safe receiver, RLock, returns nil for unregistered names). Added `"google.golang.org/protobuf/proto"` import.
+
+- `internal/filter/http/perroute.go`: widened `BuildPerRouteConfig` signature from 3-param to 4-param (`reg *HTTPRegistry` as last parameter, optional/nil-safe). Added validator pass after existing `parseMap` calls and before `return out, nil`: iterates `chainNames`, calls `reg.PerRouteValidator(name)`, skips nil validators, checks RC tier then each scope's VHost + Route tiers, returns `fmt.Errorf(...)` with canonical location prefix on first error.
+
+- `internal/filter/hcm/config.go`: widened `buildPerRouteFromHCM` signature to accept `*filter_http.HTTPRegistry`; updated its internal `filter_http.BuildPerRouteConfig(...)` call to pass `httpRegistry`; updated call site at line 208 from `buildPerRouteFromHCM(rc, chainNames)` to `buildPerRouteFromHCM(rc, chainNames, httpRegistry)`.
+
+**Test-only callers swept (`, nil` additions — 19 total):**
+- `internal/filter/http/perroute_test.go`: 17 calls updated
+- `internal/filter/http/callbacks_test.go`: 1 call updated
+- `internal/filter/http/fuzz_test.go`: 1 call updated (used `chain` variable, not `chainNames`, required manual edit)
+- `internal/filter/http/envoygotest/filter_test.go`: 1 call updated
+- `internal/filter/http/cors/cors_test.go`: 2 calls updated
+- `internal/filter/hcm/chain_integration_test.go`: 2 calls updated (used string-literal `[]string{...}`, not `chainNames`, required manual edits)
+
+**New tests:** 4 registry tests in `internal/filter/http/registry_test.go` + 6 perroute validator integration tests in `internal/filter/http/perroute_test.go` = 10 new tests total. One minor deviation from PLAN verbatim: `TestRegistry_PerRouteValidator_LookupNotRegisteredReturnsNil` uses `"got non-nil func"` instead of `%v` formatting on a func value (vet caught `func value, not called` at format-string check).
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/... -run 'TestRegistry_RegisterPerRouteValidator|TestRegistry_PerRouteValidator|TestBuildPerRouteConfig_PerRouteValidator' -v 2>&1 | grep -E '^(=== RUN|--- (PASS|FAIL)|PASS|FAIL|ok)'
+=== RUN   TestBuildPerRouteConfig_PerRouteValidator_NilSucceeds
+--- PASS: TestBuildPerRouteConfig_PerRouteValidator_NilSucceeds (0.00s)
+=== RUN   TestBuildPerRouteConfig_PerRouteValidator_NoValidatorRegisteredSucceeds
+--- PASS: TestBuildPerRouteConfig_PerRouteValidator_NoValidatorRegisteredSucceeds (0.00s)
+=== RUN   TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnRouteTier
+--- PASS: TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnRouteTier (0.00s)
+=== RUN   TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnVHostTier
+--- PASS: TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnVHostTier (0.00s)
+=== RUN   TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnRCTier
+--- PASS: TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnRCTier (0.00s)
+=== RUN   TestBuildPerRouteConfig_PerRouteValidator_OnlyConsultedForRegisteredFilters
+--- PASS: TestBuildPerRouteConfig_PerRouteValidator_OnlyConsultedForRegisteredFilters (0.00s)
+=== RUN   TestRegistry_RegisterPerRouteValidator_BeforeFreezeSucceeds
+--- PASS: TestRegistry_RegisterPerRouteValidator_BeforeFreezeSucceeds (0.00s)
+=== RUN   TestRegistry_RegisterPerRouteValidator_AfterFreezePanics
+--- PASS: TestRegistry_RegisterPerRouteValidator_AfterFreezePanics (0.00s)
+=== RUN   TestRegistry_PerRouteValidator_LookupNotRegisteredReturnsNil
+--- PASS: TestRegistry_PerRouteValidator_LookupNotRegisteredReturnsNil (0.00s)
+=== RUN   TestRegistry_PerRouteValidator_DoesNotConflictWithRegister
+--- PASS: TestRegistry_PerRouteValidator_DoesNotConflictWithRegister (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	(cached)
+```
