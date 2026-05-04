@@ -35,7 +35,7 @@ The eleven planner-time deferred decisions reproduced verbatim from PLAN.md so t
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** TBD — this task's commit
+**Commits:** `c9f4e61` — `phase 10: PROGRESS preamble + planner-time decision resolution`
 **Notes:** Created PROGRESS.md; verified all 16 preconditions per PLAN §"Execution preconditions"; phase-10 SPEC + 10 PLAN confirmed present in HEAD; SPEC at f339c12; ADR tail at 0107 (next-free 0108); internal/filter/http/header_mutation/ absent (Task 5 lands); ResolveAllTiers absent (Task 2 lands); RequestRouteConfigsAllTiers absent (Task 3 lands); RegisterPerRouteValidator absent (Task 4 lands). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention; ADRs land at first-use commit per PLAN's ADR table).
 **Outputs:**
 ```
