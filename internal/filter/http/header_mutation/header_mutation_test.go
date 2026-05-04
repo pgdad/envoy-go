@@ -1,6 +1,7 @@
 package header_mutation
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -274,5 +275,139 @@ func TestIsProtectedHeader(t *testing.T) {
 		if isProtectedHeader(n) {
 			t.Errorf("isProtectedHeader(%q): got true, want false", n)
 		}
+	}
+}
+
+func TestApplyOps_AppendIfExistsOrAdd_AbsentTarget(t *testing.T) {
+	h := http.Header{}
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD}})
+	if got := h.Values("X-Test"); len(got) != 1 || got[0] != "v" {
+		t.Errorf("got %v, want [v]", got)
+	}
+}
+
+func TestApplyOps_AppendIfExistsOrAdd_PresentMultiValue(t *testing.T) {
+	h := http.Header{}
+	h.Add("X-Test", "old1")
+	h.Add("X-Test", "old2")
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD}})
+	if got := h.Values("X-Test"); len(got) != 3 || got[0] != "old1" || got[1] != "old2" || got[2] != "v" {
+		t.Errorf("APPEND should preserve prior + add (per §11.4); got %v", got)
+	}
+}
+
+func TestApplyOps_AddIfAbsent_AbsentTarget(t *testing.T) {
+	h := http.Header{}
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_ADD_IF_ABSENT}})
+	if got := h.Get("X-Test"); got != "v" {
+		t.Errorf("got %q, want v", got)
+	}
+}
+
+func TestApplyOps_AddIfAbsent_PresentTarget(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Test", "old")
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_ADD_IF_ABSENT}})
+	if got := h.Get("X-Test"); got != "old" {
+		t.Errorf("got %q, want old (no-op)", got)
+	}
+}
+
+func TestApplyOps_OverwriteIfExistsOrAdd_AbsentTarget(t *testing.T) {
+	h := http.Header{}
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD}})
+	if got := h.Get("X-Test"); got != "v" {
+		t.Errorf("got %q, want v", got)
+	}
+}
+
+func TestApplyOps_OverwriteIfExistsOrAdd_PresentMultiValue(t *testing.T) {
+	h := http.Header{}
+	h.Add("X-Test", "old1")
+	h.Add("X-Test", "old2")
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD}})
+	if got := h.Values("X-Test"); len(got) != 1 || got[0] != "v" {
+		t.Errorf("OVERWRITE should collapse multi-value to single (per §11.4); got %v", got)
+	}
+}
+
+func TestApplyOps_OverwriteIfExists_AbsentTarget(t *testing.T) {
+	h := http.Header{}
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS}})
+	if got := h.Get("X-Test"); got != "" {
+		t.Errorf("got %q, want '' (no-op for absent target)", got)
+	}
+}
+
+func TestApplyOps_OverwriteIfExists_PresentTarget(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Test", "old")
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "v", appendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS}})
+	if got := h.Get("X-Test"); got != "v" {
+		t.Errorf("got %q, want v", got)
+	}
+}
+
+func TestApplyOps_Remove_PresentTarget(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Test", "old")
+	applyOps(h, []compiledMutationOp{{kind: kindRemove, headerName: "X-Test"}})
+	if h.Get("X-Test") != "" {
+		t.Errorf("Remove should delete header")
+	}
+}
+
+func TestApplyOps_Remove_AbsentTarget(t *testing.T) {
+	h := http.Header{}
+	applyOps(h, []compiledMutationOp{{kind: kindRemove, headerName: "X-Test"}})
+	if h.Get("X-Test") != "" {
+		t.Errorf("Remove of absent header should be no-op")
+	}
+}
+
+func TestApplyOps_KeepEmptyValueFalse_EmptyValue_AllAppendActions(t *testing.T) {
+	actions := []corev3.HeaderValueOption_HeaderAppendAction{
+		corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+		corev3.HeaderValueOption_ADD_IF_ABSENT,
+		corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		corev3.HeaderValueOption_OVERWRITE_IF_EXISTS,
+	}
+	for _, a := range actions {
+		t.Run(a.String(), func(t *testing.T) {
+			h := http.Header{}
+			// Pre-existing target for OVERWRITE_IF_EXISTS to ensure even with EXISTS-true,
+			// the keep_empty_value=false silent-skip fires FIRST per §11.2 conclusion (c).
+			h.Set("X-Test", "original")
+			applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "", keepEmptyValue: false, appendAction: a}})
+			if got := h.Get("X-Test"); got != "original" {
+				t.Errorf("%s: keep_empty_value=false + empty value should silent-skip; got %q want original", a, got)
+			}
+		})
+	}
+}
+
+func TestApplyOps_KeepEmptyValueTrue_EmptyValue_AppendIfExistsOrAdd(t *testing.T) {
+	h := http.Header{}
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "", keepEmptyValue: true, appendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD}})
+	// Materialize empty value.
+	if vs := h.Values("X-Test"); len(vs) != 1 || vs[0] != "" {
+		t.Errorf("keep=true + empty + APPEND: got %v, want one empty value", vs)
+	}
+}
+
+func TestApplyOps_KeepEmptyValueTrue_EmptyValue_OverwriteIfExists_AbsentTarget(t *testing.T) {
+	h := http.Header{}
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "", keepEmptyValue: true, appendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS}})
+	if got := h.Get("X-Test"); got != "" || len(h.Values("X-Test")) != 0 {
+		t.Errorf("keep=true + empty + OVERWRITE_IF_EXISTS + absent target: should be no-op (EXISTS gate fires); got %v", h.Values("X-Test"))
+	}
+}
+
+func TestApplyOps_KeepEmptyValueTrue_EmptyValue_OverwriteIfExists_PresentTarget(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Test", "original")
+	applyOps(h, []compiledMutationOp{{kind: kindAppend, headerName: "X-Test", headerValue: "", keepEmptyValue: true, appendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS}})
+	if vs := h.Values("X-Test"); len(vs) != 1 || vs[0] != "" {
+		t.Errorf("keep=true + empty + OVERWRITE_IF_EXISTS + present target: should replace with empty; got %v", vs)
 	}
 }

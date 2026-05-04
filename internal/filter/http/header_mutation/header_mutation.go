@@ -209,6 +209,43 @@ func validatePerRouteHeaderMutation(msg proto.Message) error {
 	return nil
 }
 
+// applyOps iterates ops in proto-declared order, applying each to headers.
+// Per ADR-0109 + SPEC §6.6.
+func applyOps(headers http.Header, ops []compiledMutationOp) {
+	for _, op := range ops {
+		switch op.kind {
+		case kindRemove:
+			headers.Del(op.headerName)
+		case kindAppend:
+			applyAppendAction(headers, op)
+		}
+	}
+}
+
+// applyAppendAction implements the AppendAction × 4 + keep_empty_value
+// boundary per SPEC §6.6 + §11.2 + ADR-0109. The keep_empty_value=false
+// silent-skip on empty value fires FIRST, BEFORE the AppendAction switch
+// (per §11.2 conclusion (c)).
+func applyAppendAction(headers http.Header, op compiledMutationOp) {
+	if op.headerValue == "" && !op.keepEmptyValue {
+		return // silent skip per §11.2
+	}
+	switch op.appendAction {
+	case corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD:
+		headers.Add(op.headerName, op.headerValue)
+	case corev3.HeaderValueOption_ADD_IF_ABSENT:
+		if headers.Get(op.headerName) == "" {
+			headers.Add(op.headerName, op.headerValue)
+		}
+	case corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD:
+		headers.Set(op.headerName, op.headerValue)
+	case corev3.HeaderValueOption_OVERWRITE_IF_EXISTS:
+		if headers.Get(op.headerName) != "" {
+			headers.Set(op.headerName, op.headerValue)
+		}
+	}
+}
+
 // filter is the per-request header_mutation instance. Per-instance state is
 // race-free by the single-goroutine-per-stream invariant per ADR-0071.
 //
