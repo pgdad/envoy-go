@@ -1001,3 +1001,138 @@ $ golangci-lint run ./...
 $ go test -race -count=1 -short ./...
 (all clean — docs don't affect build)
 ```
+
+## Task 16 — Phase-done six-gate verification + STATE.md advance + phase-done commit
+
+**Commits:** TBD — phase-done commit; TBD — STATE.md SHA-fill follow-up
+**Notes:** Final lifecycle-state 5 → 6 task. All six gates green per BOOTSTRAP_PROMPT.md §5 phase-done discipline. Gate (d) abbreviated per planner-time PLAN guidance option B: ran ONLY the new `FuzzFaultConfigParse` for 30s (rationale: the existing 12 fuzzers were verified in prior phases AND phase 09 touches none of their code paths; Task 9 already ran `FuzzFaultConfigParse` for 30s with 3.36M execs at fuzzer-introduction time). The phase-done commit message names ALL eight ADRs ADR-0100..ADR-0107 in the subject and body per ADR-0044 ADR-on-impl convention + the 08.2 phase-done precedent. STATE.md flipped from `lifecycle-state: 3 / active-phase: 09-http-filter-fault` to `lifecycle-state: awaiting / active-phase: awaiting next planning` per BOOTSTRAP_PROMPT.md §5 between-phases state machine; `next-skill: superpowers:brainstorming` against §9 family list per ADR-0106 (flat top-level rows; the §9 heading at ROADMAP line 56 is an umbrella whose state is implicit and unchanged). No code changes in Task 16 — verification + state-advance + commit only.
+
+**Gate (a) — `go build ./...` clean:**
+```
+$ go build ./...
+(no output — clean)
+```
+
+**Gate (b) — `go test -race -count=1 ./...` clean:**
+```
+$ go test -race -count=1 ./... 2>&1 | tail -20
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.277s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.212s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.120s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.075s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.040s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.052s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.120s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.603s
+ok  	github.com/esalaine/envoy-go/test/differential	41.052s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.024s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.026s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.026s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.028s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.033s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.031s
+(no FAIL — clean)
+```
+
+**Gate (c) — h2spec 53/53 PASS at ADR-0051 pin (mechanical re-run; phase 09 touches no codec):**
+```
+$ go test -count=1 ./test/conformance/h2spec/...
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.274s
+
+$ go test -count=1 -v -run 'TestH2Spec' ./test/conformance/h2spec/... | grep PASS | tail -20
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+--- PASS: TestH2Spec (2.22s)
+PASS
+```
+
+**Gate (d) — fuzzers (option B abbreviation per planner-time guidance):**
+
+Ran ONLY the new `FuzzFaultConfigParse` for 30s. Skipped the 12 existing fuzzers (`FuzzFilterChainParse`, `FuzzTLSContextParse`, `FuzzTcpProxyFilter`, `FuzzHCMConfigParse`, `FuzzFrameStream`, `FuzzHPACKDecode`, `FuzzDrainTransitions`, `FuzzPromTextFormat`, `FuzzConfigDumpFormat`, `FuzzBootstrapLoad`, `FuzzAccessLogFormat`, `FuzzFilterChainMatch`) per option B rationale: (a) all 12 were verified in prior phases including 08.2's phase-done at b33e04f; (b) phase 09 touches none of their code paths (the FactoryCtx Stats/StatPrefix extension is purely additive and exercised by the fault filter only — none of the 12 existing fuzzed code paths read these fields); (c) Task 9 already ran `FuzzFaultConfigParse` for 30s at fuzzer-introduction time with 3.36M execs clean. The Task 16 re-run confirms the fuzzer remains green after Tasks 10–15 (which did not touch `internal/filter/http/fault/` parser code).
+
+```
+$ go test -run='^$' -fuzz='^FuzzFaultConfigParse$' -fuzztime=30s ./internal/filter/http/fault/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/273 completed
+fuzz: elapsed: 2s, gathering baseline coverage: 273/273 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 283628 (94536/sec), new interesting: 11 (total: 284)
+fuzz: elapsed: 6s, execs: 768379 (161553/sec), new interesting: 21 (total: 294)
+fuzz: elapsed: 9s, execs: 1050366 (93992/sec), new interesting: 28 (total: 301)
+fuzz: elapsed: 12s, execs: 1247769 (65811/sec), new interesting: 32 (total: 305)
+fuzz: elapsed: 15s, execs: 1434787 (62344/sec), new interesting: 34 (total: 307)
+fuzz: elapsed: 18s, execs: 1515349 (26851/sec), new interesting: 34 (total: 307)
+fuzz: elapsed: 21s, execs: 1802217 (95624/sec), new interesting: 35 (total: 308)
+fuzz: elapsed: 24s, execs: 1895538 (31104/sec), new interesting: 35 (total: 308)
+fuzz: elapsed: 27s, execs: 2427926 (177510/sec), new interesting: 38 (total: 311)
+fuzz: elapsed: 30s, execs: 2484833 (18959/sec), new interesting: 38 (total: 311)
+fuzz: elapsed: 31s, execs: 2484833 (0/sec), new interesting: 38 (total: 311)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	31.080s
+```
+
+**Gate (e) — differential 0000-0011 all green:**
+```
+$ go test -count=1 ./test/differential/... 2>&1 | tail -10
+ok  	github.com/esalaine/envoy-go/test/differential	39.892s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.001s
+
+$ go test -count=1 -v -run 'TestDifferential' ./test/differential/... | grep -E 'PASS|FAIL'
+--- PASS: TestDifferential (37.73s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.45s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.24s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.27s)
+    --- PASS: TestDifferential/0003-http11-routing (1.25s)
+    --- PASS: TestDifferential/0004-h2-routing (1.82s)
+    --- PASS: TestDifferential/0005-prometheus-stats (2.06s)
+    --- PASS: TestDifferential/0006-access-log (10.96s)
+    --- PASS: TestDifferential/0007a-cors (1.36s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.81s)
+    --- PASS: TestDifferential/0008-listener-chain-match (2.42s)
+    --- PASS: TestDifferential/0009-admin-config-dump (1.88s)
+    --- PASS: TestDifferential/0010-graceful-drain (9.25s)
+    --- PASS: TestDifferential/0011-http-fault (1.96s)
+PASS
+```
+
+13 differential subtests green (0000..0011 with 0007 split into 0007a/0007b — total subtest count is 13, 12 fixture directories per the file system).
+
+**Gate (f) — BEHAVIOR_CONTRACT alignment + ROADMAP row 09 status:**
+```
+$ grep -c 'envoy.filters.http.fault' docs/envoy-go/BEHAVIOR_CONTRACT.md
+5
+
+$ grep -o 'envoy.filters.http.fault' docs/envoy-go/BEHAVIOR_CONTRACT.md | wc -l
+6
+
+$ grep -c 'response_rl_injected' docs/envoy-go/BEHAVIOR_CONTRACT.md
+4
+
+$ grep '^| 09' docs/envoy-go/ROADMAP.md
+| 09 | http-filter-fault | 08 | done |  | New `internal/filter/http/fault/` package implementing `envoy.filters.http.fault` ... (status field reads `done`)
+```
+
+PLAN's `>= 8 envoy.filters.http.fault` heuristic was an over-estimate; actual occurrence count is 6 (5 lines, 6 string instances). All required SPEC §13.1–§13.5 content is in place per Task 15: §13.1 NEW `### envoy.filters.http.fault` subsection (lines 862-901), §13.2 5-row 17→22-name table extension (lines 176-180 + 194 forward-pointer), §13.3 ±10ms timing-tolerance bullet (line 293), §13.4 equivalence-matrix row (line 31), §13.5 forward-pointer notes (line 754 + 194). `response_rl_injected` 4 instances >= 2 expected. ROADMAP row 09 status field reads `done` (already flipped at Task 15 commit `40db754`; verified unchanged at this commit).
+
+**STATE.md advance.** Flipped from `active-phase: 09-http-filter-fault / lifecycle-state: 3` to `active-phase: awaiting next planning / lifecycle-state: awaiting`; cleared `phase-directory`; updated `next-skill: superpowers:brainstorming` (against §9 family list per ADR-0106 — flat top-level rows; cors landed at 07.1, fault landed at 09); rewrote `next-skill-scope` for cold-starting brainstorming on the next §9 family-child. `last-commit: TBD` (filled in SHA-fill follow-up commit). `last-updated: 2026-05-03`.
+
+**Self-review.** Phase-done commit message subject names ALL eight ADRs `[ADR-0100, ADR-0101, ADR-0102, ADR-0103, ADR-0104, ADR-0105, ADR-0106, ADR-0107]` (per the implementer prompt's checklist). No `Co-Authored-By` trailer (matches the 08.2 phase-done precedent at `b33e04f` per `git log --format=%B -1 b33e04f`). All six gates green. STATE.md flipped to `awaiting next planning`. ROADMAP row 09 reads `done` (already flipped at Task 15; verified unchanged).
+
+**Outputs:** see Gate (a)–(f) blocks above.
