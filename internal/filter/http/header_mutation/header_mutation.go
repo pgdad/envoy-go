@@ -246,6 +246,35 @@ func applyAppendAction(headers http.Header, op compiledMutationOp) {
 	}
 }
 
+// compileForRequest projects a per-route HeaderMutationPerRoute proto.Message
+// into a request-mutations slice. Sub-microsecond on small per-route configs
+// (typical: <5 ops per tier). Per planner-time decision 2 we re-compile fresh
+// per request rather than caching; the cost is negligible.
+//
+// Returns nil for nil input or for messages that fail the type-assertion (the
+// per-route validator at HCM-build time per ADR-0111 already rejects per-route
+// configs containing protected-header mutations, so the compileOps call here
+// is expected to succeed; defensive on error → return nil).
+func (f *filter) compileForRequest(msg proto.Message) []compiledMutationOp {
+	if msg == nil {
+		return nil
+	}
+	pr, ok := msg.(*headermutationv3.HeaderMutationPerRoute)
+	if !ok {
+		return nil
+	}
+	m := pr.GetMutations()
+	if m == nil {
+		return nil
+	}
+	ops, err := compileOps(m.GetRequestMutations())
+	if err != nil {
+		// Per-route validator at HCM-build time rejects this case; defensive return.
+		return nil
+	}
+	return ops
+}
+
 // filter is the per-request header_mutation instance. Per-instance state is
 // race-free by the single-goroutine-per-stream invariant per ADR-0071.
 //
@@ -268,8 +297,32 @@ var (
 func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.dcb = cb }
 func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb }
 
-// DecodeHeaders is STUBBED in Task 5. Task 7 lands the full body per SPEC §6.6.
-func (f *filter) DecodeHeaders(http.Header, bool) envoyhttp.FilterHeadersStatus {
+// DecodeHeaders implements the header_mutation filter's decode-side discipline
+// per SPEC §6.6 + ADR-0109 + ADR-0110. Apply listener-level cfg.requestOps
+// FIRST (per the proto comment at header_mutation.pb.go:141–142), then
+// per-route tiers in flag-controlled order (per §6.5 algorithm + §11.5
+// empirical confirmation).
+func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
+	applyOps(headers, f.cfg.requestOps)
+	if f.dcb == nil {
+		return envoyhttp.Continue
+	}
+	routeMsg, vhMsg, rcMsg := f.dcb.RequestRouteConfigsAllTiers()
+	routeOps := f.compileForRequest(routeMsg)
+	vhOps := f.compileForRequest(vhMsg)
+	rcOps := f.compileForRequest(rcMsg)
+
+	if !f.cfg.mostSpecificHeaderMutationsWins {
+		// DEFAULT (flag=false): Route → VHost → RC; least-specific wins overlap
+		applyOps(headers, routeOps)
+		applyOps(headers, vhOps)
+		applyOps(headers, rcOps)
+	} else {
+		// flag=true: RC → VHost → Route; most-specific wins overlap
+		applyOps(headers, rcOps)
+		applyOps(headers, vhOps)
+		applyOps(headers, routeOps)
+	}
 	return envoyhttp.Continue
 }
 

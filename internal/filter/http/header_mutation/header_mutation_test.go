@@ -411,3 +411,185 @@ func TestApplyOps_KeepEmptyValueTrue_EmptyValue_OverwriteIfExists_PresentTarget(
 		t.Errorf("keep=true + empty + OVERWRITE_IF_EXISTS + present target: should replace with empty; got %v", vs)
 	}
 }
+
+// fakeDecoderCB is a minimal test impl of DecoderFilterCallbacks supporting
+// only RequestRouteConfigsAllTiers + RequestRouteConfig (returns nil) +
+// the two no-op callbacks. The other methods panic if called.
+type fakeDecoderCB struct {
+	route, vhost, rc proto.Message
+}
+
+func (f *fakeDecoderCB) ContinueDecoding()                                    {}
+func (f *fakeDecoderCB) SendLocalReply(int, string, envoyhttp.OrderedHeaders) {}
+func (f *fakeDecoderCB) RequestRouteConfig() proto.Message                    { return nil }
+func (f *fakeDecoderCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
+	return f.route, f.vhost, f.rc
+}
+func (f *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
+func (f *fakeDecoderCB) EncodeData([]byte, bool)         {}
+func (f *fakeDecoderCB) EncodeTrailers(http.Header)      {}
+
+func mkPerRoute(req, resp []*commonmutationrulesv3.HeaderMutation) *headermutationv3.HeaderMutationPerRoute {
+	return &headermutationv3.HeaderMutationPerRoute{
+		Mutations: &headermutationv3.Mutations{RequestMutations: req, ResponseMutations: resp},
+	}
+}
+
+func mkFilterFromMutation(t *testing.T, mut *headermutationv3.HeaderMutation, dcb envoyhttp.DecoderFilterCallbacks) *filter {
+	t.Helper()
+	factory, err := New(mustAny(t, mut), envoyhttp.FactoryCtx{Registry: envoyhttp.NewHTTPRegistry()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	inst := factory()
+	f := inst.Decoder.(*filter)
+	f.SetDecoderCallbacks(dcb)
+	return f
+}
+
+func TestDecodeHeaders_ListenerLevel_NoPerRoute(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			RequestMutations: []*commonmutationrulesv3.HeaderMutation{
+				mkAppendOp("x-test", "listener", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+				mkRemoveOp("user-agent"),
+			},
+		},
+	}
+	dcb := &fakeDecoderCB{} // no per-route configs
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	h.Set("user-agent", "curl/8.20")
+	if status := f.DecodeHeaders(h, false); status != envoyhttp.Continue {
+		t.Errorf("status: got %v, want Continue", status)
+	}
+	if h.Get("X-Test") != "listener" {
+		t.Errorf("x-test: got %q, want listener", h.Get("X-Test"))
+	}
+	if h.Get("User-Agent") != "" {
+		t.Errorf("user-agent should be removed; got %q", h.Get("User-Agent"))
+	}
+}
+
+func TestDecodeHeaders_PerRoute_RouteOnly(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			RequestMutations: []*commonmutationrulesv3.HeaderMutation{
+				mkAppendOp("x-test", "listener", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+			},
+		},
+	}
+	routePR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{
+		mkAppendOp("x-test", "route", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+	}, nil)
+	dcb := &fakeDecoderCB{route: routePR}
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.DecodeHeaders(h, false)
+	if got := h.Get("X-Test"); got != "route" {
+		t.Errorf("got %q, want route (route applied after listener)", got)
+	}
+}
+
+func TestDecodeHeaders_MultiTier_FlagFalse(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			RequestMutations: []*commonmutationrulesv3.HeaderMutation{
+				mkAppendOp("x-test", "listener", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+			},
+		},
+		MostSpecificHeaderMutationsWins: false,
+	}
+	routePR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "route", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	vhPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "vh", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	rcPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "rc", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	dcb := &fakeDecoderCB{route: routePR, vhost: vhPR, rc: rcPR}
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.DecodeHeaders(h, false)
+	// flag=false: Route → VHost → RC (RC applied LAST, wins overlap) per §11.5
+	if got := h.Get("X-Test"); got != "rc" {
+		t.Errorf("flag=false: got %q, want rc (least-specific wins per §11.5)", got)
+	}
+}
+
+func TestDecodeHeaders_MultiTier_FlagTrue(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			RequestMutations: []*commonmutationrulesv3.HeaderMutation{
+				mkAppendOp("x-test", "listener", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+			},
+		},
+		MostSpecificHeaderMutationsWins: true,
+	}
+	routePR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "route", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	vhPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "vh", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	rcPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "rc", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	dcb := &fakeDecoderCB{route: routePR, vhost: vhPR, rc: rcPR}
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.DecodeHeaders(h, false)
+	// flag=true: RC → VHost → Route (Route applied LAST, wins overlap) per §11.5
+	if got := h.Get("X-Test"); got != "route" {
+		t.Errorf("flag=true: got %q, want route (most-specific wins per §11.5)", got)
+	}
+}
+
+func TestDecodeHeaders_MultiTier_TwoOfThree_RouteAndVHost(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{Mutations: &headermutationv3.Mutations{}, MostSpecificHeaderMutationsWins: false}
+	routePR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "route", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	vhPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "vh", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	dcb := &fakeDecoderCB{route: routePR, vhost: vhPR} // rc nil
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.DecodeHeaders(h, false)
+	// flag=false: Route → VHost (RC nil — skipped); VHost wins
+	if got := h.Get("X-Test"); got != "vh" {
+		t.Errorf("got %q, want vh (route + vhost; VHost applied last)", got)
+	}
+}
+
+func TestDecodeHeaders_MultiTier_TwoOfThree_RouteAndRC(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{Mutations: &headermutationv3.Mutations{}, MostSpecificHeaderMutationsWins: false}
+	routePR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "route", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	rcPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "rc", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	dcb := &fakeDecoderCB{route: routePR, rc: rcPR} // vhost nil
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.DecodeHeaders(h, false)
+	if got := h.Get("X-Test"); got != "rc" {
+		t.Errorf("got %q, want rc (route + rc; RC applied last)", got)
+	}
+}
+
+func TestDecodeHeaders_MultiTier_TwoOfThree_VHostAndRC(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{Mutations: &headermutationv3.Mutations{}, MostSpecificHeaderMutationsWins: false}
+	vhPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "vh", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	rcPR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "rc", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	dcb := &fakeDecoderCB{vhost: vhPR, rc: rcPR}
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.DecodeHeaders(h, false)
+	if got := h.Get("X-Test"); got != "rc" {
+		t.Errorf("got %q, want rc (vh + rc; RC applied last)", got)
+	}
+}
+
+func TestDecodeHeaders_NilDecoderCallbacks_AppliesListenerOnly(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			RequestMutations: []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-test", "listener", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)},
+		},
+	}
+	factory, _ := New(mustAny(t, mut), envoyhttp.FactoryCtx{Registry: envoyhttp.NewHTTPRegistry()})
+	inst := factory()
+	f := inst.Decoder.(*filter)
+	// Do NOT SetDecoderCallbacks — exercise the dcb-nil branch.
+	h := http.Header{}
+	if status := f.DecodeHeaders(h, false); status != envoyhttp.Continue {
+		t.Errorf("status: got %v, want Continue", status)
+	}
+	if got := h.Get("X-Test"); got != "listener" {
+		t.Errorf("listener-only path: got %q, want listener", got)
+	}
+}

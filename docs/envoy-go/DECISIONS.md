@@ -2659,6 +2659,16 @@ Phase 07.1 introduces per-route filter configuration via Envoy's `typed_per_filt
 
 Task 4 (the `internal/filter/http/perroute.go` introduction). Supersedes nothing; **amends ADR-0041**.
 
+## Amendment (per phase 10 ADR-0110)
+
+The most-specific-override discipline codified above is now the DEFAULT model;
+filters whose proto semantics demand multi-tier evaluation (e.g.,
+envoy.filters.http.header_mutation per its `most_specific_header_mutations_wins`
+flag) use `PerRouteConfig.ResolveAllTiers` per ADR-0110 — see that ADR for the
+per-filter accessor-choice discipline. ADR-0073's wholesale-override semantics
+remain authoritative for filters that opt into the most-specific accessor
+(cors @ 07.1, fault @ 09).
+
 ---
 
 ## ADR-0075: `sendLocalReply` encode-chain semantics
@@ -5012,4 +5022,47 @@ fmt.Errorf("header_mutation: %q is :-prefixed or host; may not be modified", nam
    - ADR-0108 (package shape) — the `New` factory is where listener-level validation occurs.
    - ADR-0109 (`compileOps`) — the function that contains `isProtectedHeader` call sites.
    - ADR-0110 (`RegisterPerRouteValidator`) — the framework mechanism for per-route config-load-time validation.
+
+---
+
+## ADR-0110: Multi-tier per-route evaluation: PerRouteConfig.ResolveAllTiers + DecoderFilterCallbacks.RequestRouteConfigsAllTiers + HTTPRegistry.RegisterPerRouteValidator + per-filter accessor-choice discipline + cross-tier algorithm; amends ADR-0073
+
+**Status:** Accepted
+**Date:** 2026-05-04
+**Doctrine:** Phase 10's multi-tier per-route evaluation; sibling to most-specific override per ADR-0073.
+
+### Lands-in-task
+
+Phase 10 — Tasks 2/3/4 (framework piece commits) + Task 7 (first end-to-end use; this ADR text).
+
+### Context
+
+The `most_specific_header_mutations_wins` proto field on `HeaderMutation` requires that per-route configs at all three tiers (Route, VirtualHost, RouteConfiguration) be evaluated and applied — not just the most-specific one. The empirical confirmation at SPEC §11.5 matches the proto comment verbatim: with the flag false, all three tiers are applied in Route→VHost→RC order; with the flag true, all three are applied in RC→VHost→Route order. The existing `PerRouteConfig.Resolve` (per ADR-0073) returns only the most-specific non-nil tier and discards the others — it cannot satisfy the header_mutation semantics. ADR-0073 was the right design for cors and fault (most-specific override), but a new accessor shape is needed for multi-tier evaluation.
+
+### Decision
+
+Three framework additions land in Tasks 2/3/4, first consumed end-to-end in Task 7:
+
+1. **`PerRouteConfig.ResolveAllTiers(filterName, routeIdx) (route, vhost, rc proto.Message)`** — sibling method to `Resolve`; returns all three tiers unmerged (each may be nil if the tier has no entry for the filter). Does not replace `Resolve`; cors and fault continue to use `Resolve` unchanged.
+
+2. **`DecoderFilterCallbacks.RequestRouteConfigsAllTiers() (route, vhost, rc proto.Message)`** — DECODER-ONLY callback per planner-time decision 1. Filters that need it on the encode side use the `f.dcb` reference set via `SetDecoderCallbacks` (the framework wires both dcb and ecb on a both-sides filter); the cors precedent at `cors.go:163` (`f.dcb.RequestRouteConfig()` called from `EncodeHeaders`) applies identically here.
+
+3. **`HTTPRegistry.RegisterPerRouteValidator(filterName, validator func(proto.Message) error)`** — hook consumed by `BuildPerRouteConfig` to surface per-route protected-header violations as boot-time errors (per ADR-0111), mirroring the listener-level discipline in `New`.
+
+**Per-filter accessor-choice discipline:** cors and fault use `RequestRouteConfig()` (most-specific override per ADR-0073); `envoy.filters.http.header_mutation` uses `RequestRouteConfigsAllTiers()` (multi-tier per this ADR). Future filters choose the accessor whose semantics match their proto contract; the choice is documented in the filter's ADR.
+
+**Cross-tier ordering algorithm:** Listener-level mutations are applied FIRST always (per the proto comment at `header_mutation.pb.go:141–142`). Then per-route tiers in flag-controlled order: flag=false (default) → Route→VHost→RC (least-specific applied last, wins on overlap); flag=true → RC→VHost→Route (most-specific applied last, wins on overlap). This is the algorithm confirmed empirically at SPEC §11.5.
+
+### Alternatives considered
+
+- **(A) Keep using `Resolve` and treat the flag as selecting between two single-tier behaviors** — REJECTED. Loses configuration fidelity; the proto semantics require that ALL present tiers contribute mutations, not that the flag selects which single tier to read.
+- **(B) Generalize the framework merger (per-filter merger interface in `PerRouteConfig`)** — REJECTED. Would require a ~300 LoC framework refactor and force re-verification of cors + fault per-route tests. The multi-tier concern is local to header_mutation in phase 10 scope; a generic merger is YAGNI.
+- **(C) Push multi-tier resolution into HCM-build time (pre-merge all three tiers at parse time)** — REJECTED. Per-route config is per-request (the active route index is known only at request-eval time); resolution must be deferred to request time.
+- **(D) ADD `ResolveAllTiers` as a sibling method, leaving `Resolve` + cors/fault untouched** — ACCEPTED. Minimal footprint; no regressions on existing filters; semantics match the proto contract exactly.
+
+### Consequences
+
+- (a) ADR-0073 is amended (not superseded) — the most-specific-override discipline remains the DEFAULT model for filters that opt into the `RequestRouteConfig()` accessor (cors @ 07.1, fault @ 09). An in-place amendment paragraph is appended to ADR-0073 below.
+- (b) The `RegisterPerRouteValidator` hook is reusable by future filters with similar boot-time validation invariants (e.g., any filter that validates per-route proto fields at build time rather than request time).
+- (c) The 3-tuple cache shape `(route, vhost, rc)` is incompatible with the existing single-`proto.Message` cache in `PerRouteConfig.Resolve`; per-tuple caching for `ResolveAllTiers` is deferred per planner-time decision 2 (the cost of re-compiling <5 ops per tier per request is negligible).
 
