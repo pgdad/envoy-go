@@ -358,3 +358,37 @@ $ go test -race ./internal/filter/http/header_mutation/... -run TestDecodeHeader
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.011s
 ```
+
+## Task 9 — cmd/envoy-go/main.go register header_mutation.New
+
+**Commits:** `1246525` — `phase 10: register header_mutation.New under header_mutation.TypeURL`
+
+**Notes:** Landed boot-time registration for header_mutation per ADR-0072 + ADR-0108. Two changes to `cmd/envoy-go/main.go`:
+
+- Import line: added `"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"` to the imports block, alphabetically between `fault` and `router` (lines 28–32).
+
+- Registration line: added `httpReg.Register(header_mutation.TypeURL, header_mutation.New)` in the httpReg.Register block, between `httpReg.Register(fault.TypeURL, fault.New)` and `httpReg.Freeze()` (lines 113–118).
+
+Resulting register block (5 filter registrations + Freeze):
+```go
+httpReg := filter_http.NewHTTPRegistry()
+	httpReg.Register(router.TypeURL, router.New)
+	httpReg.Register(cors.TypeURL, cors.New)
+	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
+	httpReg.Register(fault.TypeURL, fault.New)
+	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
+	httpReg.Freeze()
+```
+
+Build/vet/test all green.
+
+**Outputs:**
+```
+$ go build ./cmd/envoy-go && go vet ./... && echo "Build and vet OK"
+Build and vet OK
+$ go test -race -count=1 ./internal/filter/http/header_mutation/... -run 'Test' 2>&1 | tail -5
+=== RUN   TestDecodeHeaders_NilDecoderCallbacks_AppliesListenerOnly
+--- PASS: TestDecodeHeaders_NilDecoderCallbacks_AppliesListenerOnly (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.038s
+```
