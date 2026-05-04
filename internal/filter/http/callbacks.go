@@ -35,6 +35,27 @@ type DecoderFilterCallbacks interface {
 	// on first lookup per request.
 	RequestRouteConfig() proto.Message
 
+	// RequestRouteConfigsAllTiers returns the parsed per-route config at each
+	// of the three tiers (Route, VirtualHost, RouteConfiguration), UNMERGED.
+	// Used by filters whose semantics require multi-tier evaluation rather
+	// than most-specific override — primarily envoy.filters.http.header_mutation
+	// per its most_specific_header_mutations_wins flag (see ADR-0110 amending
+	// ADR-0073). The default RequestRouteConfig method (per ADR-0073) remains
+	// the canonical accessor for filters that use most-specific override
+	// (cors, fault).
+	//
+	// Per phase 10 PLAN planner-time decision 1: this callback lives ONLY on
+	// DecoderFilterCallbacks (NOT on EncoderFilterCallbacks). Filters that
+	// need it on the encode side use the dcb reference set via
+	// SetDecoderCallbacks (the framework wires both dcb and ecb on a both-
+	// sides filter). The cors precedent at cors.go:163 (routePolicy) calls
+	// f.dcb.RequestRouteConfig() from EncodeHeaders — same pattern applies.
+	//
+	// Returns (nil, nil, nil) when:
+	//   - the chain has no perRoute config;
+	//   - no scope at any tier carries an entry for the calling filter's name.
+	RequestRouteConfigsAllTiers() (route, vhost, rc proto.Message)
+
 	// EncodeHeaders / EncodeData / EncodeTrailers are encode-side injection
 	// methods for filters that synthesize responses without using
 	// SendLocalReply. Rare; intended for filters like header_manipulation

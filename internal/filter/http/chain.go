@@ -434,6 +434,18 @@ func (d *decoderCB) RequestRouteConfig() proto.Message {
 	return d.c.perRoute.Resolve(d.c.filters[d.idx].Name, d.c.routeIdx)
 }
 
+// RequestRouteConfigsAllTiers returns the unmerged per-tier configs for the
+// calling filter's name via the chain's perRoute lookup at the route-index
+// supplied by HCM dispatch (chain.routeIdx, set by SetRequestCtx). Returns
+// (nil, nil, nil) if the chain has no perRoute config or no scope carries
+// an entry for this filter at any tier.
+func (d *decoderCB) RequestRouteConfigsAllTiers() (route, vhost, rc proto.Message) {
+	if d.c.perRoute == nil {
+		return nil, nil, nil
+	}
+	return d.c.perRoute.ResolveAllTiers(d.c.filters[d.idx].Name, d.c.routeIdx)
+}
+
 func (d *decoderCB) EncodeHeaders(http.Header, bool) {}
 func (d *decoderCB) EncodeData([]byte, bool)         {}
 func (d *decoderCB) EncodeTrailers(http.Header)      {}

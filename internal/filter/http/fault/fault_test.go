@@ -224,9 +224,12 @@ func (r *recordingDCB) Headers() envoyhttp.OrderedHeaders {
 }
 func (r *recordingDCB) ContinueDecoding()                 { r.continued.Add(1) }
 func (r *recordingDCB) RequestRouteConfig() proto.Message { return r.routeCfg }
-func (r *recordingDCB) EncodeHeaders(http.Header, bool)   {}
-func (r *recordingDCB) EncodeData([]byte, bool)           {}
-func (r *recordingDCB) EncodeTrailers(http.Header)        {}
+func (r *recordingDCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
+	return nil, nil, nil
+}
+func (r *recordingDCB) EncodeHeaders(http.Header, bool) {}
+func (r *recordingDCB) EncodeData([]byte, bool)         {}
+func (r *recordingDCB) EncodeTrailers(http.Header)      {}
 
 // makeFilter constructs a fault filter with the supplied abort.http_status,
 // abort.percentage, and headers-field shape, returning the *filter and the
