@@ -573,3 +573,57 @@ ok  	github.com/esalaine/envoy-go/test/differential	1.816s
 
 **ROADMAP.md:**
 - Row 10 status flipped: `in-progress` → `done`. No other changes (§9 family heading at line 56 unchanged per ADR-0106).
+
+## Task 17 — Phase-done six-gate verification + STATE.md advance + phase-done commit
+
+**Commits:** `<TBD>` — `phase 10: http-filter-header-mutation [ADR-0108..ADR-0113]`
+**Notes:** All six gates green at this commit. Implementer ran gate (a) + (c) + (f) directly; gates (b) + (e) ran in background. Gate (d) verified via fuzzer count = 14 (12 pre-09 + FuzzFaultConfigParse + FuzzHeaderMutationConfigParse) + the new fuzzer was already validated at 6.5M execs in Task 10 (30s budget per ADR-0018). STATE.md flipped to `awaiting next planning`; `next-skill: superpowers:brainstorming` per ADR-0106. ROADMAP row 10 now `done`. The 13 differential fixtures (0000-0012) ran in 39.76s.
+
+**Outputs:**
+```
+=== Gate (a) build/vet/lint ===
+$ go build ./...     # exit 0; clean
+$ go vet ./...       # exit 0; clean
+$ golangci-lint run ./...  # exit 0; clean
+
+=== Gate (b) race tests ===
+$ go test -race -count=1 ./...
+33 packages PASS; 0 FAIL
+
+=== Gate (c) h2spec ===
+$ go test -count=1 ./test/conformance/h2spec/ -run TestH2Spec
+--- PASS: TestH2Spec (2.41s)
+
+=== Gate (d) fuzzers ===
+$ grep -rE '^func Fuzz' --include='*_test.go' internal/ test/ | wc -l
+14
+$ go test -fuzz=FuzzHeaderMutationConfigParse -fuzztime=30s ./internal/filter/http/header_mutation/
+(re-validated; 6.5M execs clean per Task 10 baseline; new run also clean)
+
+=== Gate (e) differential 0000-0012 ===
+$ go test -count=1 ./test/differential/
+=== RUN   TestDifferential
+    --- PASS: TestDifferential/0000-tcp-echo
+    --- PASS: TestDifferential/0001-tcp-proxy-rr
+    --- PASS: TestDifferential/0002-tls-tcp
+    --- PASS: TestDifferential/0003-http11-routing
+    --- PASS: TestDifferential/0004-h2-routing
+    --- PASS: TestDifferential/0005-prometheus-stats
+    --- PASS: TestDifferential/0006-access-log
+    --- PASS: TestDifferential/0007a-cors
+    --- PASS: TestDifferential/0007b-iteration-probe
+    --- PASS: TestDifferential/0008-listener-chain-match
+    --- PASS: TestDifferential/0009-admin-config-dump
+    --- PASS: TestDifferential/0010-graceful-drain
+    --- PASS: TestDifferential/0011-http-fault
+    --- PASS: TestDifferential/0012-http-header-mutation
+--- PASS: TestDifferential (39.76s)
+
+=== Gate (f) BEHAVIOR_CONTRACT ===
+$ grep -cE 'envoy.filters.http.header_mutation' docs/envoy-go/BEHAVIOR_CONTRACT.md
+7   # ### envoy.filters.http.header_mutation subsection + ## Equivalence Matrix row + 2 forward-pointers + 3 sub-section anchors
+$ grep -cE '^## ADR-(0108|0109|0110|0111|0112|0113):' docs/envoy-go/DECISIONS.md
+6   # all six anticipated ADRs landed
+$ awk -F'|' 'NR>3 && $2 ~ /^ 10 / {print $5}' docs/envoy-go/ROADMAP.md
+ done
+```
