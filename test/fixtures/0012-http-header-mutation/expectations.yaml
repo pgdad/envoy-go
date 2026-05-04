@@ -1,0 +1,58 @@
+# Phase 10 SPEC §7.1 — per-scenario equivalence claims for fixture 0012-http-header-mutation.
+#
+# This file is PROSE per ADR-0019 (not machine-evaluated). The runner enforces
+# via the driver's per-scenario assertions. Cross-refs SPEC §7.1 + §13.1 + ADR-0109 + ADR-0110 + ADR-0111.
+
+scenario_1_listener_only:
+  probe: GET /listener-only/anything against l_lws (flag=false)
+  expects:
+    status: 200
+    body: byte-equal — echo backend reflects post-mutation request headers (sorted)
+    response_headers:
+      - x-resp-test: listener-resp        # OVERWRITE listener-level
+      - x-resp-multi: appended            # APPEND adds one more (single-value initially)
+      # Plus standard backend headers + any allow-listed framework injections (date, server)
+    notes:
+      - listener-level request_mutations exercise all 4 AppendActions + Remove + keep_empty_value boundary
+      - x-test: listener (OVERWRITE)
+      - x-listener-add: added (APPEND)
+      - x-add-if-absent-test: added-if-absent (ADD_IF_ABSENT, target absent)
+      - x-overwrite-if-exists-test: NOT PRESENT (OVERWRITE_IF_EXISTS, target absent + empty value → no-op via keep_empty_value=false silent skip)
+      - x-empty-skip: NOT PRESENT (APPEND, empty value, keep_empty_value=false default → skip)
+      - x-empty-keep: '' (APPEND, empty value, keep_empty_value=true → materialize)
+      - User-Agent: REMOVED
+
+scenario_2_route_override:
+  probe: GET /route-override/anything against l_lws (flag=false)
+  expects:
+    status: 200
+    body: byte-equal — backend echoes post-mutation headers (listener applied first, then Route tier)
+    notes:
+      - listener applies all the scenario_1 mutations FIRST
+      - Route tier adds: x-route-only: yes (via OVERWRITE)
+      - VHost tier sets x-test: vh (overwrites listener's x-test: listener)
+      - Final upstream sees x-route-only AND the listener-applied set
+
+scenario_3_multi_tier_flag_false:
+  probe: GET /multi-tier/anything against l_lws (flag=false)
+  expects:
+    status: 200
+    body: byte-equal — backend echoes post-mutation headers
+    notes:
+      - per §11.5: flag=false → Route → VHost → RC; least-specific (RC) wins overlap
+      - final upstream x-test: rc (OVERWRITE chain: listener=listener → route=route → vh=vh → rc=rc)
+      - final response x-resp-test: rc-resp (symmetric on response side)
+
+scenario_4_multi_tier_flag_true:
+  probe: GET /multi-tier/anything against l_mws (flag=true)
+  expects:
+    status: 200
+    body: byte-equal — backend echoes post-mutation headers
+    notes:
+      - per §11.5: flag=true → RC → VHost → Route; most-specific (Route) wins overlap
+      - final upstream x-test: route
+      - final response x-resp-test: route-resp
+
+# Stat assertions: NONE (header_mutation emits ZERO stats per SPEC §11.3 + ADR-0074 cors precedent).
+# Timing assertions: NONE (synchronous filter; no time-bounded operations).
+# Status text byte-equality: only stdlib codes (200) — phase 10 doesn't exercise non-stdlib codes.
