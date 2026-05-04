@@ -464,3 +464,31 @@ Accept: */*
 User-Agent: curl/8.5.0
 X-Probe: yes
 ```
+
+## Task 13 — Fixture 0012 envoy.yaml + envoy-go.yaml dual-listener bootstraps per SPEC §7.4
+
+**Commits:** `237ecad` — `phase 10: fixture 0012 envoy.yaml + envoy-go.yaml dual-listener bootstrap per SPEC §7.4`
+
+**Notes:** Created the two bootstrap files for fixture 0012-http-header-mutation. Templating convention mirrors `test/fixtures/0011-http-fault/` exactly:
+
+- **envoy.yaml** (reference, runs in Docker via runner): cluster `c_backend` uses `STRICT_DNS` + `dns_lookup_family: V4_ONLY`; address template `{{.BackendHost}}:{{.BackendPort}}`; admin/listener ports are FIXED (9912, l_lws :10012, l_mws :10013 — reference side has no dynamic port allocation).
+- **envoy-go.yaml** (subject, runs host-side): cluster `c_backend` uses `STATIC` at `127.0.0.1:{{.BackendPort}}`; admin/listener ports use templates `{{.AdminPort}}` / `{{.LwsPort}}` / `{{.MwsPort}}` per the two-listener shape (driver PLAN §Task 15 struct `{AdminPort, LwsPort, MwsPort, BackendPort int}`).
+
+Both files: two listeners `l_lws` (`most_specific_header_mutations_wins: false`) + `l_mws` (`most_specific_header_mutations_wins: true`) with IDENTICAL per-route tier configurations at RC / VirtualHost / Route tiers. Per-route config present at all three tiers for `/multi-tier`; only route tier for `/route-override`; no per-route config for `/listener-only`. Listener-level mutations exercise all 4 AppendActions + Remove + `keep_empty_value` on `l_lws`; abbreviated listener mutations on `l_mws`.
+
+Docker validation: envoy.yaml passed `--mode validate` with templates substituted (BackendHost=host.docker.internal, BackendPort=18012); Envoy accepted 2 listeners and 1 cluster without errors. `go vet ./...`, `golangci-lint run ./...`, and `go test -race -count=1 ./...` all clean.
+
+**Outputs:**
+```
+$ docker run --rm -v "/tmp/envoy-validate.yaml:/etc/envoy/envoy.yaml" envoyproxy/envoy:v1.37.2 envoy -c /etc/envoy/envoy.yaml --mode validate 2>&1 | tail -5
+[2026-05-04 17:18:54.866][1][info][config] [source/server/configuration_impl.cc:132] loading 0 static secret(s)
+[2026-05-04 17:18:54.866][1][info][config] [source/server/configuration_impl.cc:138] loading 1 cluster(s)
+[2026-05-04 17:18:54.866][1][info][config] [source/server/configuration_impl.cc:148] loading 2 listener(s)
+configuration '/etc/envoy/envoy.yaml' OK
+[2026-05-04 17:18:54.869][1][info][config] [source/server/configuration_impl.cc:164] loading stats configuration
+$ go test -race -count=1 ./... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/test/differential	41.836s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.032s
+?   	github.com/esalaine/envoy-go/test/fixtures/0012-http-header-mutation/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.030s
+```
