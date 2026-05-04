@@ -4792,3 +4792,224 @@ The §9 HTTP filters family-expansion shape is fixed at this ADR:
 
 (g) The §9 heading's state-field-unchanged invariant is grep-verifiable: future commits MUST NOT modify ROADMAP.md line 56's text or its position relative to the §9 family-children enumeration at line 58. A commit that modifies the heading is a violation of this ADR and should be reverted.
 
+---
+
+## ADR-0108: `header_mutation` package shape + boot registration — 4-file split mirroring `cors`/`fault`; `TypeURL` constant + `New` factory; zero-stats discipline
+
+**Status:** Accepted
+**Date:** 2026-05-04
+**Doctrine:** D-3.5 (record durable design rationale) + D-3.3 (empirical pin against reference Envoy v1.37.2).
+**Lands-in-task:** Task 5 (phase 10); commit in phase-10-http-filter-header-mutation-impl branch.
+
+### Context
+
+Phase 10 adds `envoy.filters.http.header_mutation` as the fifth HTTP filter in envoy-go. The first four are: router (phase 07), cors (phase 07.1), fault (phase 09), and the framework-internal router. Each real HTTP filter is a separate sub-package of `internal/filter/http/` with a 4-file split: `doc.go`, `<name>.go`, `<name>_test.go`, and (where present) a fuzzer. Phase 10 follows the same shape.
+
+The boot-registration discipline (per ADR-0072) requires each filter factory to register a `TypeURL` constant + `New` factory in `cmd/envoy-go/main.go`. The cors and fault precedents each define `TypeURL` as a package-level constant and expose `New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFactory, error)` as the single public factory.
+
+The `FactoryCtx` shape (3-field: `Registry *HTTPRegistry`, `Stats *stats.Registry`, `StatPrefix string`) was established by ADR-0100. Phase 10 does NOT consume `ctx.Stats` or `ctx.StatPrefix` — header_mutation emits zero stats (per SPEC §11.3 confirmation + empirical Envoy v1.37.2 scrape). This is analogous to cors (ADR-0074: cors also emits zero stats).
+
+### Decision
+
+The `header_mutation` package is structured as:
+- `internal/filter/http/header_mutation/doc.go` — package doc-comment with full algorithm description + ADR cross-references.
+- `internal/filter/http/header_mutation/header_mutation.go` — `TypeURL`, `filterName`, `runtimeConfig`, `mutationOpKind`, `compiledMutationOp`, `New`, `buildRuntimeConfig`, `compileOps`, `isProtectedHeader`, `validatePerRouteHeaderMutation`, `filter`.
+- `internal/filter/http/header_mutation/header_mutation_test.go` — New-time test suite (11 test functions).
+
+`TypeURL` is the string `"type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation"`. `New` is the HTTPFilterFactory. Both are public; everything else is unexported.
+
+The `filter` struct implements both `StreamDecoderFilter` and `StreamEncoderFilter`. Both interfaces are statically asserted via blank-identifier compile-time checks (matching cors + fault precedents). `filter` holds `cfg *runtimeConfig` (read-only shared across requests), `dcb envoyhttp.DecoderFilterCallbacks`, and `ecb envoyhttp.EncoderFilterCallbacks`.
+
+Zero stats: `ctx.Stats` and `ctx.StatPrefix` are not consumed. No `*faultStats`-equivalent struct exists. The 3-field `FactoryCtx` is passed through but only `ctx.Registry` is used (for per-route validator registration per ADR-0110).
+
+### Alternatives considered
+
+(A) **Merge with another filter package** — REJECTED. Each filter is independently deployable; the 4-file split keeps lint, test, and dependency graphs clean.
+
+(B) **Consume `ctx.Stats` / `ctx.StatPrefix` for future stats** — REJECTED. Premature allocation; per ADR-0072 boot-fail-fast discipline, allocating stats that are never emitted is observable waste. If header_mutation gains stats in a future phase, that phase's Task 1 will add the allocation.
+
+(C) **Use a shared `TypeURL` registry** in `internal/filter/http` — REJECTED per ADR-0072: each filter owns its `TypeURL` constant in its own package; the main.go registry is the single join point.
+
+### Consequences
+
+(a) The filter set grows from 4 to 5 real HTTP filters (router, cors, fault, router-internal, header_mutation). The `cmd/envoy-go/main.go` registry (Task 9) adds one entry.
+
+(b) `ctx.Stats` and `ctx.StatPrefix` in `FactoryCtx` remain unconsumed by header_mutation (analogous to cors per ADR-0074). Grep-verifiable: no `ctx.Stats` reference in `header_mutation.go`.
+
+(c) ADR-0109 defines the `runtimeConfig` + `compiledMutationOp` shapes. ADR-0111 defines the protected-header validation discipline. Both land in the same Task 5 commit as this ADR.
+
+(d) Tasks 6/7/8 extend `header_mutation.go` with `applyOps`, `applyAppendAction`, and the full `DecodeHeaders`/`EncodeHeaders` bodies. Task 5 stubs those two methods to `return Continue`.
+
+---
+
+## ADR-0109: `runtimeConfig` 3-field shape + `compiledMutationOp` value-typed flat struct + AppendAction × 4 mapping + `keep_empty_value` semantics + multi-value per §11.4
+
+**Status:** Accepted
+**Date:** 2026-05-04
+**Doctrine:** D-3.5 (record durable design rationale) + D-3.3 (empirical pin against §11.2–§11.4 SPEC).
+**Lands-in-task:** Task 5 (phase 10); full `applyOps` + `applyAppendAction` body lands in Task 6.
+
+### Context
+
+The `header_mutation` filter applies a list of per-operation mutations (Append or Remove) to HTTP headers at request-eval time. The proto representation uses `HeaderMutation` (from `envoy/config/common/mutation_rules/v3`) which is a oneof over `Remove string` and `Append *HeaderValueOption`. `HeaderValueOption` carries `Header *HeaderValue` (key+value), `AppendAction HeaderValueOption_HeaderAppendAction`, and `KeepEmptyValue bool`.
+
+The four `AppendAction` variants (per SPEC §6.6 + empirical Envoy v1.37.2 scrape):
+1. `APPEND_IF_EXISTS_OR_ADD` (0, default) — append to existing value(s); add if absent.
+2. `ADD_IF_ABSENT` (1) — add only if header is absent; no-op if present.
+3. `OVERWRITE_IF_EXISTS_OR_ADD` (2) — overwrite if present; add if absent.
+4. `OVERWRITE_IF_EXISTS` (3) — overwrite if present; no-op if absent.
+
+`keep_empty_value` (per SPEC §11.2): if false (default), a mutation with empty value string AND `KeepEmptyValue=false` is silently dropped (the header is not added). If true, the empty value is materialized on the wire.
+
+Multi-value semantics (per SPEC §11.4): `APPEND_IF_EXISTS_OR_ADD` preserves existing multi-value headers (net/http canonical map carries multiple values per key); the new value is appended to the slice. `OVERWRITE_IF_EXISTS_OR_ADD` replaces all existing values. `ADD_IF_ABSENT` no-ops if any value exists (even if multi-valued). `OVERWRITE_IF_EXISTS` replaces if any value exists.
+
+The `mutations.query_parameter_mutations` field (`[]*corev3.KeyValueMutation`) is silently ignored per ADR-0112 deferral. The field is parsed by the proto library but `buildRuntimeConfig` does not project it into `runtimeConfig`.
+
+Planner-time decision 4 chose value-typed `compiledMutationOp` (not pointer-typed) for cache locality during the apply-loop slice iteration. The struct is small (discriminator + two strings + enum + bool; ~56 bytes) and copied cheaply.
+
+### Decision
+
+**`runtimeConfig`** has exactly 3 fields:
+```go
+type runtimeConfig struct {
+    requestOps                      []compiledMutationOp
+    responseOps                     []compiledMutationOp
+    mostSpecificHeaderMutationsWins bool
+}
+```
+The fourth proto field (`mutations.query_parameter_mutations`) is silently ignored (ADR-0112).
+
+**`compiledMutationOp`** is value-typed with 5 fields:
+```go
+type compiledMutationOp struct {
+    kind           mutationOpKind
+    headerName     string   // http.CanonicalHeaderKey applied at parse time
+    headerValue    string   // kindAppend only; "" for kindRemove
+    appendAction   corev3.HeaderValueOption_HeaderAppendAction
+    keepEmptyValue bool     // kindAppend only
+}
+```
+`kindRemove` and `kindAppend` are the two `mutationOpKind uint8` constants.
+
+**`compileOps`** projects `[]*commonmutationrulesv3.HeaderMutation` → `[]compiledMutationOp`. Key choices:
+- `http.CanonicalHeaderKey` is applied to `headerName` at parse time (once per boot, not per-request).
+- Protected-header validation (ADR-0111) runs inside `compileOps` before the `compiledMutationOp` is appended.
+- Unknown/nil actions are defensively skipped (no error).
+- `compileOps` is called from both `buildRuntimeConfig` (listener-level) and `validatePerRouteHeaderMutation` (per-route validation).
+
+**AppendAction × 4 mapping** (Task 6 `applyAppendAction` body, cross-referenced here):
+| Proto constant | Behavior |
+|---|---|
+| `APPEND_IF_EXISTS_OR_ADD` | append to existing slice; add if absent |
+| `ADD_IF_ABSENT` | no-op if header present; add if absent |
+| `OVERWRITE_IF_EXISTS_OR_ADD` | replace all values; add if absent |
+| `OVERWRITE_IF_EXISTS` | replace all values; no-op if absent |
+
+**`keep_empty_value` semantics** (per §11.2): `applyAppendAction` (Task 6) gates on `op.keepEmptyValue || op.headerValue != ""` before mutating the header map.
+
+### Alternatives considered
+
+(A) **Pointer-typed `*compiledMutationOp`** — REJECTED per planner-time decision 4. Pointer typing would scatter the ops across the heap, degrading cache locality in the apply-loop. The struct is small enough that value-copy is cheap.
+
+(B) **Keep the `AppendAction` as a proto enum in the runtime path** — ACCEPTED (the proto enum is already an `int32` alias; no translation table needed). The enum constants are used directly in `applyAppendAction`.
+
+(C) **Expand `runtimeConfig` to include a `queryParameterOps` field** — REJECTED per ADR-0112. The `query_parameter_mutations` field is silently ignored; adding a field for it would confuse future readers about whether it has behavioral effect. The `buildRuntimeConfig` comment explicitly notes the silent-ignore.
+
+(D) **Materialize header names in lowercase** instead of canonical form — REJECTED. The `net/http` canonical map uses `http.CanonicalHeaderKey` form; mismatched keys would silently miss mutations. Canonical form at parse time is the correct discipline.
+
+### Consequences
+
+(a) Cross-references ADR-0101 (fault's `runtimeConfig` precedent — fault also has a small value-typed config with a silent-ignore field; the pattern is consistent).
+
+(b) `compileOps` is the single mutation-compilation entry point used at both listener-level (boot) and per-route (HCM-build-time) validation. The deduplication is load-bearing: a bug fix in `compileOps` applies to both paths automatically.
+
+(c) Task 6 (`applyOps` + `applyAppendAction` + full test suite for AppendAction × 4 + keep_empty_value + multi-value) extends `header_mutation.go` in-place. The `compiledMutationOp` struct shape is fixed by this ADR; Task 6 does not change it.
+
+(d) `mutations.query_parameter_mutations` is silently parsed by the proto library but not projected into `runtimeConfig`. Grep-verifiable: `buildRuntimeConfig` contains a comment `// mutations.query_parameter_mutations silently ignored per ADR-0112.` and no `GetQueryParameterMutations()` call produces ops.
+
+---
+
+## ADR-0111: Protected-header set per §11.1 + CONFIG-LOAD-TIME rejection (MAJOR amendment to BRAINSTORM Decision 11) + verbatim error format + EAGER per-route validation via `RegisterPerRouteValidator`
+
+**Status:** Accepted
+**Date:** 2026-05-04
+**Doctrine:** D-3.3 (empirical pin against reference Envoy v1.37.2 §11.1 behavior) + D-3.5 (record durable design rationale).
+**Lands-in-task:** Task 5 (phase 10).
+
+### Context
+
+SPEC §11.1 defines a 6-name protected-header set that header_mutation MUST NOT modify:
+- `:method`, `:path`, `:authority`, `:scheme`, `:status` (the 5 HTTP/2 pseudo-headers).
+- `host` (case-insensitive; Envoy v1.37.2 rejects `host`, `Host`, `HOST` symmetrically).
+
+BRAINSTORM Decision 11 proposed runtime rejection (per-request, when the header is encountered). The PLAN's planner-time decisions revised this to CONFIG-LOAD-TIME rejection — a MAJOR amendment to Decision 11.
+
+The amendment rationale:
+1. **Boot-fail-fast discipline per ADR-0072.** Configuration errors that are detectable at boot time MUST be surfaced at boot time. A misconfigured protected-header mutation will fire on EVERY request if not caught at boot; catching it at boot causes exactly ONE error (the server fails to start) rather than one error per request.
+2. **Symmetry with listener-level and per-route validation.** Both listener-level (`New`) and per-route (`validatePerRouteHeaderMutation` via `RegisterPerRouteValidator`) are evaluated at config-load time. The operator sees the error before any traffic is served.
+3. **Simplicity in the request-eval hot path.** `applyOps` (Task 6) does NOT need to check `isProtectedHeader` at request time — the `compiledMutationOp` slice is already clean.
+
+Planner-time decision 5 chose the predicate shape:
+- `strings.HasPrefix(name, ":")` — catches all 5 pseudo-headers AND future ones (e.g., `:protocol`, `:upgrade`).
+- `strings.EqualFold(name, "host")` — catches `host` / `Host` / `HOST` symmetrically.
+
+The verbatim error format mirrors Envoy v1.37.2's `source/server/server.cc:453`:
+```
+"header_mutation: %q is :-prefixed or host; may not be modified"
+```
+
+The per-route validator is registered via `ctx.Registry.RegisterPerRouteValidator(filterName, validatePerRouteHeaderMutation)` inside `New`. At HCM-build time, `BuildPerRouteConfig` (ADR-0110) invokes this validator against each per-route `HeaderMutationPerRoute` proto at each tier (Route, VirtualHost, RouteConfiguration). This surfaces per-route protected-header violations as boot-time errors identical in effect to listener-level violations.
+
+### Decision
+
+**Protected-header predicate** (`isProtectedHeader`):
+```go
+func isProtectedHeader(name string) bool {
+    if strings.HasPrefix(name, ":") {
+        return true
+    }
+    return strings.EqualFold(name, "host")
+}
+```
+
+**Rejection point:** `compileOps`, called from `buildRuntimeConfig` (listener-level, inside `New`) and from `validatePerRouteHeaderMutation` (per-route, inside `RegisterPerRouteValidator` callback). First violation returns:
+```
+fmt.Errorf("header_mutation: %q is :-prefixed or host; may not be modified", name)
+```
+
+**Rejection applies to both Remove and Append operations.** A mutation that removes `:path` or appends `host` is equally rejected.
+
+**Per-route validator registration:** `New` calls `ctx.Registry.RegisterPerRouteValidator(filterName, validatePerRouteHeaderMutation)` before returning the factory. The registration is idempotent (overwriting with the same function is benign per ADR-0110's registry contract).
+
+**`validatePerRouteHeaderMutation`** casts `proto.Message` to `*headermutationv3.HeaderMutationPerRoute`, extracts `GetMutations().GetRequestMutations()` and `GetResponseMutations()`, runs `compileOps` on each, and returns the first error. A nil `Mutations` field is a no-op (valid).
+
+**BRAINSTORM Decision 11 amendment:** The original Decision 11 ("runtime rejection — detect at request time") is superseded by this ADR's config-load-time rejection. The change is a pure shift-left: the same set of headers is rejected, but at boot time rather than request time. No behavioral difference is observable for correctly-configured operators; incorrectly-configured operators see the error sooner and unambiguously.
+
+### Alternatives considered
+
+(A) **Runtime rejection (original BRAINSTORM Decision 11)** — REJECTED. Surfaces errors per-request; violates ADR-0072 boot-fail-fast discipline. A misconfigured operator would need to inspect request-time logs to discover the error; boot-time rejection is unambiguous.
+
+(B) **Exact 6-name set (`:method`, `:path`, `:authority`, `:scheme`, `:status`, `host`) without prefix generalization** — REJECTED in favor of the prefix-check on `:`. The prefix-check future-proofs against new pseudo-headers. The 5 proto-specified names are a subset of "all :-prefixed names"; the prefix-check is strictly more protective.
+
+(C) **Case-sensitive `host` check (`name == "host"`)** — REJECTED. Envoy v1.37.2 rejects `Host` and `HOST` symmetrically (empirically pinned per §11.1 conclusion (b)). `strings.EqualFold` is the correct predicate.
+
+(D) **Defer protected-header validation to the codec layer** (let the underlying HTTP/2 implementation reject pseudo-header modifications) — REJECTED. Codec-layer errors are opaque and non-configurable; config-load-time errors with the verbatim format give the operator an actionable message.
+
+(E) **Reject only Append, allow Remove** — REJECTED. SPEC §11.1 applies to both operations; removing `:path` is as invalid as appending it.
+
+### Consequences
+
+(a) `isProtectedHeader` is the single predicate used by both listener-level and per-route validation. Grep-verifiable: only two call sites in `header_mutation.go` — one in the `Remove` case of `compileOps`, one in the `Append` case.
+
+(b) The `applyOps` hot path (Task 6) does NOT call `isProtectedHeader`. The absence of the check is intentional and grep-verifiable: `applyOps` trusts that `compiledMutationOp` slices were already validated by `compileOps` at boot.
+
+(c) BRAINSTORM Decision 11 is superseded. The BRAINSTORM.md document retains the original text as historical context; this ADR is the authoritative record of the shift-left amendment.
+
+(d) The verbatim error format `"header_mutation: %q is :-prefixed or host; may not be modified"` is tested by `TestNew_ProtectedHeader` (table-driven, 10 cases) and `TestNew_ProtectedHeader_RemoveAlsoRejected`. Any change to the format string is a breaking change requiring an ADR amendment.
+
+(e) Cross-references:
+   - ADR-0072 (boot-fail-fast discipline) — the foundational principle for config-load-time rejection.
+   - ADR-0108 (package shape) — the `New` factory is where listener-level validation occurs.
+   - ADR-0109 (`compileOps`) — the function that contains `isProtectedHeader` call sites.
+   - ADR-0110 (`RegisterPerRouteValidator`) — the framework mechanism for per-route config-load-time validation.
+
