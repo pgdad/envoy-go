@@ -289,6 +289,37 @@ PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.009s
 ```
 
+## Task 8 — header_mutation EncodeHeaders symmetric + race-detector cycle test
+
+**Commits:** `6169b09` — `phase 10: header_mutation EncodeHeaders symmetric + race-detector cycle test`
+
+**Notes:** Landed the full `EncodeHeaders` body per SPEC §6.8 and the race-detector cycle test per SPEC §12 deferred decision 7. Two changes to `internal/filter/http/header_mutation/header_mutation.go`:
+
+- `compileForResponse(msg proto.Message) []compiledMutationOp` (method on `*filter`): symmetric to `compileForRequest`; extracts `response_mutations` from the per-route `*HeaderMutationPerRoute` proto. Returns nil for nil input, wrong type, nil mutations, or compile error. Inserted after `compileForRequest`.
+
+- Full `EncodeHeaders` body (replaces the Task 5 stub): applies `f.cfg.responseOps` first; if `f.dcb` is nil returns Continue (listener-only path); calls `f.dcb.RequestRouteConfigsAllTiers()` (DECODER-ONLY per planner-time decision 1 — same callback used for both decode and encode sides, mirrors cors precedent); compiles each tier via `compileForResponse`; applies in flag-controlled order: flag=false → Route→VHost→RC; flag=true → RC→VHost→Route; returns Continue.
+
+No new ADRs in this task (ADR-0109 + ADR-0110 already landed).
+
+4 new test functions added to `header_mutation_test.go` (+ `import "sync"` added): `TestEncodeHeaders_Symmetric`, `TestEncodeHeaders_MultiTier_FlagFalse_ResponseSide`, `TestEncodeHeaders_MultiTier_FlagTrue_ResponseSide`, `TestHeaderMutation_MultiTierConcurrentRequests`. The concurrent test spawns 64 goroutines each constructing a fresh `*filter` from the same shared factory (shared `*runtimeConfig`) and calling `DecodeHeaders` + `EncodeHeaders`; validates the read-only-after-New invariant under the race detector.
+
+One minor formatting deviation: the PLAN's `TestEncodeHeaders_MultiTier_FlagTrue_ResponseSide` struct literal had a trailing comma after `MostSpecificHeaderMutationsWins: true` that triggered a golangci-lint gofmt violation. Fixed by running `gofmt -w` on the test file.
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/header_mutation/... -v -run 'TestEncodeHeaders|TestHeaderMutation_MultiTierConcurrent' 2>&1
+=== RUN   TestEncodeHeaders_Symmetric
+--- PASS: TestEncodeHeaders_Symmetric (0.00s)
+=== RUN   TestEncodeHeaders_MultiTier_FlagFalse_ResponseSide
+--- PASS: TestEncodeHeaders_MultiTier_FlagFalse_ResponseSide (0.00s)
+=== RUN   TestEncodeHeaders_MultiTier_FlagTrue_ResponseSide
+--- PASS: TestEncodeHeaders_MultiTier_FlagTrue_ResponseSide (0.00s)
+=== RUN   TestHeaderMutation_MultiTierConcurrentRequests
+--- PASS: TestHeaderMutation_MultiTierConcurrentRequests (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	(cached)
+```
+
 ## Task 7 — header_mutation DecodeHeaders + multi-tier resolution [ADR-0110, ADR-0073 amendment]
 
 **Commits:** `a242b78` — `phase 10: header_mutation DecodeHeaders multi-tier + ADR-0110 + ADR-0073 amendment`
