@@ -492,3 +492,22 @@ ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.032s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0012-http-header-mutation/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.030s
 ```
+
+## Task 14 — Fixture 0012 expectations.yaml + README.md per SPEC §7.1
+
+**Commits:** `dc648dd` — `phase 10: fixture 0012 expectations.yaml + README.md per SPEC §7.1`
+
+**Notes:** Created the two prose-narrative + per-scenario equivalence-claim documentation files for fixture 0012 per SPEC §7.1. ADR-0019 (expectations as prose, NOT machine-evaluated) applies; runner enforces via driver's per-scenario assertions.
+
+- `test/fixtures/0012-http-header-mutation/expectations.yaml` (58 lines): YAML with 4 scenario keys (scenario_1_listener_only, scenario_2_route_override, scenario_3_multi_tier_flag_false, scenario_4_multi_tier_flag_true), each with probe path, status, body-equality claim, response_headers assertions, and notes covering AppendAction × 4, Remove, keep_empty_value boundary, multi-tier flag-controlled ordering, stat/timing/H2 non-assertions.
+
+- `test/fixtures/0012-http-header-mutation/README.md` (65 lines): Fixture overview + 4-scenario list + bootstrap shape (dual-listener pattern, l_lws port 10012, l_mws port 10013) + backend description (echo + multi-value testing per SPEC §11.4) + what-this-fixture-does-NOT-test (stats, timing, protected-header rejection CONFIG-LOAD-TIME, H2, cross-filter interaction, query_parameter_mutations deferred ADR-0112, formatter substitution deferred ADR-0113) + planner-time decision cross-references (fixture path via SPEC erratum, BackendKind enum) + cross-references to SPEC §7, BEHAVIOR_CONTRACT, ADRs 0108/0109/0110/0111.
+
+Content is verbatim from PLAN.md §Task 14 Steps 1 + 2. No ADRs landed in this task (all six ADRs already landed at their first-use commits).
+
+**Outputs:**
+```
+$ wc -l test/fixtures/0012-http-header-mutation/expectations.yaml test/fixtures/0012-http-header-mutation/README.md
+58 test/fixtures/0012-http-header-mutation/expectations.yaml
+65 test/fixtures/0012-http-header-mutation/README.md
+```
