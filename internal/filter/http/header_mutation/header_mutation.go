@@ -275,6 +275,27 @@ func (f *filter) compileForRequest(msg proto.Message) []compiledMutationOp {
 	return ops
 }
 
+// compileForResponse projects a per-route HeaderMutationPerRoute proto.Message
+// into a response-mutations slice. Symmetric to compileForRequest.
+func (f *filter) compileForResponse(msg proto.Message) []compiledMutationOp {
+	if msg == nil {
+		return nil
+	}
+	pr, ok := msg.(*headermutationv3.HeaderMutationPerRoute)
+	if !ok {
+		return nil
+	}
+	m := pr.GetMutations()
+	if m == nil {
+		return nil
+	}
+	ops, err := compileOps(m.GetResponseMutations())
+	if err != nil {
+		return nil
+	}
+	return ops
+}
+
 // filter is the per-request header_mutation instance. Per-instance state is
 // race-free by the single-goroutine-per-stream invariant per ADR-0071.
 //
@@ -326,8 +347,31 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 	return envoyhttp.Continue
 }
 
-// EncodeHeaders is STUBBED in Task 5. Task 8 lands the full body per SPEC §6.8.
-func (f *filter) EncodeHeaders(http.Header, bool) envoyhttp.FilterHeadersStatus {
+// EncodeHeaders implements the header_mutation filter's encode-side discipline
+// per SPEC §6.8 — symmetric to DecodeHeaders modulo (a) reads cfg.responseOps;
+// (b) compiles response-side mutations via compileForResponse; (c) uses the
+// SAME f.dcb.RequestRouteConfigsAllTiers callback (DECODER-ONLY per planner-
+// time decision 1; the dcb is set during chain wiring regardless of decode
+// vs encode firing — mirrors cors precedent at cors.go:163).
+func (f *filter) EncodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
+	applyOps(headers, f.cfg.responseOps)
+	if f.dcb == nil {
+		return envoyhttp.Continue
+	}
+	routeMsg, vhMsg, rcMsg := f.dcb.RequestRouteConfigsAllTiers()
+	routeOps := f.compileForResponse(routeMsg)
+	vhOps := f.compileForResponse(vhMsg)
+	rcOps := f.compileForResponse(rcMsg)
+
+	if !f.cfg.mostSpecificHeaderMutationsWins {
+		applyOps(headers, routeOps)
+		applyOps(headers, vhOps)
+		applyOps(headers, rcOps)
+	} else {
+		applyOps(headers, rcOps)
+		applyOps(headers, vhOps)
+		applyOps(headers, routeOps)
+	}
 	return envoyhttp.Continue
 }
 

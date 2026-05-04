@@ -3,6 +3,7 @@ package header_mutation
 import (
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	commonmutationrulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
@@ -592,4 +593,101 @@ func TestDecodeHeaders_NilDecoderCallbacks_AppliesListenerOnly(t *testing.T) {
 	if got := h.Get("X-Test"); got != "listener" {
 		t.Errorf("listener-only path: got %q, want listener", got)
 	}
+}
+
+func TestEncodeHeaders_Symmetric(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			ResponseMutations: []*commonmutationrulesv3.HeaderMutation{
+				mkAppendOp("x-resp", "listener-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+				mkAppendOp("x-multi", "APPENDED", corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD),
+			},
+		},
+	}
+	dcb := &fakeDecoderCB{}
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	h.Add("X-Multi", "alpha")
+	h.Add("X-Multi", "beta")
+	if status := f.EncodeHeaders(h, false); status != envoyhttp.Continue {
+		t.Errorf("status: got %v, want Continue", status)
+	}
+	if got := h.Get("X-Resp"); got != "listener-resp" {
+		t.Errorf("x-resp: got %q, want listener-resp", got)
+	}
+	if got := h.Values("X-Multi"); len(got) != 3 || got[0] != "alpha" || got[1] != "beta" || got[2] != "APPENDED" {
+		t.Errorf("x-multi APPEND should preserve + add (per §11.4); got %v", got)
+	}
+}
+
+func TestEncodeHeaders_MultiTier_FlagFalse_ResponseSide(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			ResponseMutations: []*commonmutationrulesv3.HeaderMutation{
+				mkAppendOp("x-resp", "listener-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+			},
+		},
+		MostSpecificHeaderMutationsWins: false,
+	}
+	routePR := mkPerRoute(nil, []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-resp", "route-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)})
+	vhPR := mkPerRoute(nil, []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-resp", "vh-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)})
+	rcPR := mkPerRoute(nil, []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-resp", "rc-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)})
+	dcb := &fakeDecoderCB{route: routePR, vhost: vhPR, rc: rcPR}
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.EncodeHeaders(h, false)
+	if got := h.Get("X-Resp"); got != "rc-resp" {
+		t.Errorf("flag=false response: got %q, want rc-resp", got)
+	}
+}
+
+func TestEncodeHeaders_MultiTier_FlagTrue_ResponseSide(t *testing.T) {
+	mut := &headermutationv3.HeaderMutation{
+		Mutations:                       &headermutationv3.Mutations{},
+		MostSpecificHeaderMutationsWins: true,
+	}
+	routePR := mkPerRoute(nil, []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-resp", "route-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)})
+	vhPR := mkPerRoute(nil, []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-resp", "vh-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)})
+	rcPR := mkPerRoute(nil, []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-resp", "rc-resp", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)})
+	dcb := &fakeDecoderCB{route: routePR, vhost: vhPR, rc: rcPR}
+	f := mkFilterFromMutation(t, mut, dcb)
+	h := http.Header{}
+	f.EncodeHeaders(h, false)
+	if got := h.Get("X-Resp"); got != "route-resp" {
+		t.Errorf("flag=true response: got %q, want route-resp", got)
+	}
+}
+
+func TestHeaderMutation_MultiTierConcurrentRequests(t *testing.T) {
+	// Race-detector cycle test per SPEC §12 deferred decision 7. Spawn many
+	// goroutines that each construct a fresh *filter from the SAME factory
+	// (sharing the closure-captured *runtimeConfig) and call DecodeHeaders +
+	// EncodeHeaders concurrently. The framework's per-instance discipline +
+	// *runtimeConfig read-only-after-New invariant make this safe by
+	// construction; the race detector validates.
+	mut := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			RequestMutations:  []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-req", "v", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)},
+			ResponseMutations: []*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-resp", "v", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)},
+		},
+	}
+	factory, err := New(mustAny(t, mut), envoyhttp.FactoryCtx{Registry: envoyhttp.NewHTTPRegistry()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	routePR := mkPerRoute([]*commonmutationrulesv3.HeaderMutation{mkAppendOp("x-tier", "route", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD)}, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			inst := factory()
+			f := inst.Decoder.(*filter)
+			f.SetDecoderCallbacks(&fakeDecoderCB{route: routePR})
+			h := http.Header{}
+			f.DecodeHeaders(h, false)
+			f.EncodeHeaders(h, false)
+		}()
+	}
+	wg.Wait()
 }
