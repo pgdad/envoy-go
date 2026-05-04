@@ -511,3 +511,46 @@ $ wc -l test/fixtures/0012-http-header-mutation/expectations.yaml test/fixtures/
 58 test/fixtures/0012-http-header-mutation/expectations.yaml
 65 test/fixtures/0012-http-header-mutation/README.md
 ```
+
+## Task 15 — Fixture 0012 driver.go (4-scenario orchestration)
+
+**Commit:** `eb55904` — `phase 10: fixture 0012 driver — 4-scenario orchestration`
+
+**Differential test result:** PASS (all 4 scenarios). Two runs confirmed stable.
+
+**Files changed:**
+- `test/fixtures/0012-http-header-mutation/driver/doc.go` — DELETED (Task 11 stub)
+- `test/fixtures/0012-http-header-mutation/driver/driver.go` — CREATED (full driver, 326 LoC)
+- `test/fixtures/0012-http-header-mutation/envoy.yaml` — FIXED: admin port was 9912, corrected to 9901 (the harness's `StartReferenceProxy` waits for `/ready` on `9901/tcp`; Task 13 oversight)
+- `internal/filter/http/header_mutation/header_mutation.go` — FIXED: removed post-Freeze `RegisterPerRouteValidator` call from `New`; added exported `RegisterPerRouteValidator` function for pre-Freeze wiring
+- `internal/filter/http/header_mutation/header_mutation_test.go` — UPDATED: `TestNew_RegistersPerRouteValidator` → `TestRegisterPerRouteValidator` to match new contract
+- `cmd/envoy-go/main.go` — ADDED: `header_mutation.RegisterPerRouteValidator(httpReg)` call before `httpReg.Freeze()`
+
+**Architecture decisions:**
+- Implements `fixture.MultiListenerDriver` (SubjectListenerNames/ReferenceListenerPorts/DriveReferenceMulti/DriveSubjectMulti) so both listeners (l_lws port 10012, l_mws port 10013) get allocated and exposed by the runner.
+- Uses `runtime.Caller(0)` + `filepath.Dir(filepath.Dir(...))` to locate YAML files (same as 0011 precedent; `//go:embed` was advisory but requires files in the same directory tree as the source file — not applicable here since YAMLs are in the parent directory).
+- Body filtering strips: `x-forwarded-for`, `x-forwarded-proto`, `x-request-id`, `x-envoy-*`, `connection`, `user-agent` (all proxy-injected headers that vary between reference Envoy and envoy-go).
+- Response header capture: emits only `x-resp-*` and `x-multi` headers (mutation-relevant) sorted for determinism; drops `date`/`server`/`content-length`/etc.
+
+**Allow-list iterations (3):**
+1. Initial: stripped `x-forwarded-for`, `x-forwarded-proto`, `x-request-id`, `x-envoy-*` (standard set from 0011 precedent).
+2. Added `connection`: HTTPRoundTrip helper sends `Connection: close`; reference Envoy strips hop-by-hop headers before forwarding; envoy-go passes them through.
+3. Added `user-agent`: header_mutation's `remove: "user-agent"` strips the driver-supplied header; envoy-go's Go net/http upstream client then injects `User-Agent: Go-http-client/1.1`; reference Envoy (C++ upstream) does not inject any.
+
+**Bug discovered and fixed:** `RegisterPerRouteValidator` was being called inside `New()` which runs post-`httpReg.Freeze()` during listener construction. The registry's freeze guard panicked on the second listener (l_mws). Fix: move registration to a dedicated pre-Freeze call in `main.go` via a new exported `header_mutation.RegisterPerRouteValidator(reg)` function.
+
+**Outputs:**
+```
+$ go build ./test/fixtures/0012-http-header-mutation/driver/...
+(clean)
+$ go vet ./...
+(clean)
+$ golangci-lint run ./...
+(clean)
+$ go test -race -count=1 -short ./...
+(all ok, no FAIL)
+$ go test -count=1 -v ./test/differential/ -run "TestDifferential/0012" 2>&1 | tail -5
+--- PASS: TestDifferential/0012-http-header-mutation (1.73s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.816s
+```
