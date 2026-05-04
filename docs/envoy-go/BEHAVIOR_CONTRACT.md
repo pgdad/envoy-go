@@ -29,6 +29,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Admin /ready (DRAINING) | Body byte-equal `DRAINING\n` to reference Envoy v1.37.2 in DRAINING state. Status 503. DRAINING precedence over LIVE / PRE_INITIALIZING. Status 503 (matches PRE_INITIALIZING). Header set inherits umbrella rules. Per-proxy trigger script normalization per 08.2 SPEC §7.2 (envoy-go: /drain_listeners; ref Envoy: /drain_listeners + /healthcheck/fail). |
 | Admin /server_info (DRAINING) | The `state` field IS asserted byte-equal (`"DRAINING"`) when both proxies are in DRAINING. Other fields per ADR-0088 allow-list. Inherits ADR-0088 allow-list for non-state fields (version, uptime_*, command_line_options, hot_restart_version, node). |
 | HTTP filter `envoy.filters.http.fault` | Per-request equivalence on abort response shape (status + 4-header set + body byte-exact `fault filter abort`), delay timing (±10ms tolerance), per-route wholesale-override resolution, headers-field exact-match gate, and stat counter increments under the per-scenario differential gate (fixture 0011-http-fault). NOT asserted: header-driven fault path (deferred — ADR-0104), response_rate_limit (deferred), abort.grpc_status (deferred), HeaderMatcher non-exact variants. |
+| HTTP filter `envoy.filters.http.header_mutation` | Per-request equivalence on post-mutation request headers (visible at upstream backend) and post-mutation response headers (visible at downstream client) under listener-level + per-route 3-tier configurations, including AppendAction × 4 + Remove + `keep_empty_value` boundary + multi-valued header collapse / preserve semantics + `most_specific_header_mutations_wins` cross-tier ordering (both flag values). Boot-time enforcement of the 6-name protected-header set per ADR-0111 + phase 10 §11.1. Differential gate fixture 0012-http-header-mutation. NOT asserted: header-value formatter substitution (deferred — ADR-0113), `query_parameter_mutations` (deferred — ADR-0112), H2 differential coverage. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -732,6 +733,8 @@ Sections 3, 4, 5, 6 (excluding 6.6 PUSH_PROMISE), 7, 8 — all `failed == 0`. Pi
 - typed_per_filter_config 3-tier merge precedence (Route > VirtualHost > RouteConfiguration); most-specific override (no field-merge).
 - sendLocalReply enters encode chain at filter[len-1] of the encode-side filter set (reverse iteration start); full encode chain runs — verbatim scrape evidence pinned in `### Empirical evidence (sendLocalReply entry)` below.
 
+> **Phase 10 forward-pointer (per ADR-0110).** Phase 10 (`envoy.filters.http.header_mutation`) introduces the **multi-tier evaluation** model (per ADR-0110 amending ADR-0073). The default model remains most-specific-override per ADR-0073 (used by cors, fault); filters whose proto semantics demand multi-tier evaluation use the framework's `RequestRouteConfigsAllTiers` callback + `PerRouteConfig.ResolveAllTiers` accessor, opting into the multi-tier model per ADR-0110.
+
 ### Not asserted
 - Behavioral equivalence of the test-only `envoy.filters.http.envoy_go_test` probe filter — structural assertion only (no reference Envoy implements it).
 - Watermark backpressure event timing (out of MVP scope).
@@ -859,6 +862,8 @@ Verbatim response (CORS headers absent — passthrough confirmed):
 - **Actual request, allowed origin (probe c):** the cors filter's encodeHeaders adds three CORS response headers to the upstream response: `access-control-allow-origin`, `access-control-allow-credentials`, `access-control-expose-headers`. (NOT all six — `allow-methods`/`allow-headers`/`max-age` are preflight-only.)
 - **Actual request, no Origin (probe d):** the cors filter is a no-op (no CORS response headers injected). Confirms the filter's gating discipline (no Origin → no encode-side action).
 
+> **Phase 10 forward-pointer.** Phase 10 (`envoy.filters.http.header_mutation`) is the SECOND production filter to mutate response headers in `EncodeHeaders` — see `### envoy.filters.http.header_mutation` for the programmable-mutation discipline. Cors injects a fixed 3-header set; header_mutation runs a programmable AppendAction × 4 + Remove pipeline.
+
 ### envoy.filters.http.fault
 
 #### Asserted equivalence (per phase 09 SPEC §11)
@@ -915,6 +920,75 @@ fault filter abort
 ```
 
 (Body byte-count = 18; NO trailing newline; 4-header set as above.)
+
+### envoy.filters.http.header_mutation
+
+#### Asserted equivalence (per phase 10 SPEC §11)
+
+When `envoy.filters.http.header_mutation` is present in `http_filters`, envoy-go MUST emit the same post-mutation request headers (visible at the upstream backend) and post-mutation response headers (visible at the downstream client) as reference Envoy v1.37.2 for the canonical mutation scenarios.
+
+- **Request-side mutations** (per `mutations.request_mutations[]`): applied in proto-declared order in `DecodeHeaders` BEFORE the request reaches the upstream router. Each mutation is one of `Remove` (deletes the named header) or `Append` with one of 4 `AppendAction` variants:
+    - `APPEND_IF_EXISTS_OR_ADD` (default; enum 0): `headers.Add(name, value)` — multi-valued header gets one more value; absent target gets first value.
+    - `ADD_IF_ABSENT` (1): conditional add if and only if the target is absent (`headers.Get(name) == ""`).
+    - `OVERWRITE_IF_EXISTS_OR_ADD` (2): `headers.Set(name, value)` — collapses any multi-valued slot to a single value; absent target gets first value.
+    - `OVERWRITE_IF_EXISTS` (3): conditional set if and only if the target is present.
+- **Response-side mutations** (per `mutations.response_mutations[]`): applied in proto-declared order in `EncodeHeaders` BEFORE the response writes to the wire. Same 4 AppendAction variants + Remove. envoy-go's `EncodeHeaders` runs in REVERSE filter-list order per ADR-0075; header_mutation's response_mutations apply AFTER any later-in-list filter's encode-side mutations.
+- **`keep_empty_value` semantics**: when an Append op has `value == ""` and `keep_empty_value=false` (default), the op is a SILENT NO-OP regardless of AppendAction. When `keep_empty_value=true`, the empty value is materialized subject to the AppendAction's conditional gate (e.g., `OVERWRITE_IF_EXISTS` with empty value + keep + absent target = no-op; with present target = replace value with empty).
+- **Multi-valued header behavior** (per phase 10 SPEC §11.4): `OVERWRITE_*` collapses multi-valued slots to a single value (the new one). `APPEND_IF_EXISTS_OR_ADD` preserves prior values + adds one more (resulting in N+1 values). Applies to all multi-valued headers including `Set-Cookie`, `Vary`, `Cache-Control`.
+
+#### Multi-tier per-route evaluation (per ADR-0110 + phase 10 SPEC §11.5)
+
+Per-route `typed_per_filter_config` for `envoy.filters.http.header_mutation` is evaluated at ALL THREE tiers (Route, VirtualHost, RouteConfiguration), NOT merged most-specific-only. This is structurally different from cors / fault per-route handling (which use most-specific override per ADR-0073). The cross-tier ordering is controlled by the listener-level `most_specific_header_mutations_wins` flag:
+
+- **`most_specific_header_mutations_wins=false`** (DEFAULT): Listener-level mutations applied FIRST, then per-route tiers in order Route → VirtualHost → RouteConfiguration. RouteConfiguration's mutations are applied LAST → least-specific-wins overlap.
+- **`most_specific_header_mutations_wins=true`**: Listener-level mutations applied FIRST, then per-route tiers in REVERSED order RouteConfiguration → VirtualHost → Route. Route's mutations are applied LAST → most-specific-wins overlap.
+
+Each tier's mutations are applied in proto-declared order WITHIN the tier (the cross-tier flag controls only the inter-tier sequence). Listener-level mutations are ALWAYS applied first regardless of the flag.
+
+Empirically confirmed: with listener `x-test=listener`, RouteConfiguration `x-test=rc`, VirtualHost `x-test=vh`, Route `x-test=route` (all OVERWRITE_IF_EXISTS_OR_ADD): flag=false → final `x-test: rc`; flag=true → final `x-test: route`.
+
+#### Protected-header set (per ADR-0111 + phase 10 SPEC §11.1)
+
+Envoy v1.37.2 enforces a hard-coded protected-header set at CONFIG-LOAD TIME: a `header_mutation` config attempting to mutate any protected header causes Envoy to refuse to boot with a verbatim error `:-prefixed or host headers may not be modified`. The protected set is exactly:
+
+- All five `:`-prefixed pseudo-headers: `:method`, `:path`, `:authority`, `:scheme`, `:status`.
+- The HTTP/1.1 `host` header (case-insensitive: `host`, `Host`, `HOST` all rejected).
+
+Protection scope spans listener-level filter configs, per-route `HeaderMutationPerRoute` configs, `request_mutations`, and `response_mutations` — all four combinations rejected at boot.
+
+envoy-go MIRRORS this discipline by validating each `compiledMutationOp.headerName` against the protected set at `New` time (listener-level) and at HCM-build time (per-route, per §6.7 / §12 deferred decision 3); the verbatim error format is `header_mutation: %q is :-prefixed or host; may not be modified`. Boot-time-fail-fast per ADR-0072 — a misconfigured protected-header mutation surfaces as a non-zero exit before the listener accepts traffic.
+
+#### Stats — none emitted (per phase 10 SPEC §11.3)
+
+`envoy.filters.http.header_mutation` emits ZERO stats. The proto has no `stat_prefix` field; no `header_mutation.*` namespace exists in `/stats` or `/stats?format=prometheus`. envoy-go matches: zero stats. The `## Stat-name mapping ### 22-name table` (extended by phase 09) is UNCHANGED in phase 10.
+
+(Cors @ 07.1 also emits zero stats per ADR-0074. The pattern is established: not every HTTP filter is stat-bearing.)
+
+#### Does not yet apply to (per phase 10 deferrals — ADRs 0112, 0113)
+
+- **`mutations.query_parameter_mutations[]`** (KeyValueMutation triple): path-query rewriting deferred per ADR-0112. envoy-go silently parses the field but does not honor it; configured query-parameter mutations are no-ops.
+- **Header-value formatter substitution** (`%REQ(:path)%`, `%DOWNSTREAM_REMOTE_ADDRESS%`, `%RESPONSE_CODE%`, etc.): formatter syntax deferred per ADR-0113. envoy-go materializes header values as STATIC strings verbatim; a configured value of `"%REQ(:path)%"` produces the literal 11-byte string on the wire, not the substituted path.
+- **Differential testing under H2 streams**: fixture 0012 is HTTP/1.1-only; H2 differential testing of header_mutation is deferred.
+- **Cross-filter interaction tests** (header_mutation × cors, header_mutation × fault): fixture 0012 is header_mutation + router only; cross-filter encode-side ordering with sibling encode-mutating filters is deferred to whatever phase lands the second encode-mutating filter.
+
+#### Empirical evidence (verbatim curl excerpts from phase 10 SPEC §11)
+
+```
+$ curl -isS http://127.0.0.1:10000/echo  # listener: OVERWRITE x-multi to OVERWRITTEN, then APPEND APPENDED
+
+HTTP/1.1 200 OK
+server: envoy
+date: Mon, 04 May 2026 14:37:52 GMT
+content-type: text/plain
+content-length: 245
+x-resp-test: backend-original
+x-multi: OVERWRITTEN
+x-multi: APPENDED
+set-cookie: OVERWRITTEN
+x-resp-added: added-via-add-if-absent
+```
+
+(Multi-value `x-multi`: OVERWRITE collapsed `alpha`/`beta` to single `OVERWRITTEN`, then APPEND added `APPENDED`. Final response carries 2 `x-multi` values per phase 10 §11.4.)
 
 ### Empirical evidence (413 overflow)
 

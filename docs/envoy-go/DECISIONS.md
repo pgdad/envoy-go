@@ -5066,3 +5066,98 @@ Three framework additions land in Tasks 2/3/4, first consumed end-to-end in Task
 - (b) The `RegisterPerRouteValidator` hook is reusable by future filters with similar boot-time validation invariants (e.g., any filter that validates per-route proto fields at build time rather than request time).
 - (c) The 3-tuple cache shape `(route, vhost, rc)` is incompatible with the existing single-`proto.Message` cache in `PerRouteConfig.Resolve`; per-tuple caching for `ResolveAllTiers` is deferred per planner-time decision 2 (the cost of re-compiling <5 ops per tier per request is negligible).
 
+---
+
+## ADR-0112: `mutations.query_parameter_mutations[]` deferred — coupled to `KeyValueMutation` triple + path-query rewriting subsystem
+
+**Status:** Deferred
+**Date:** 2026-05-04
+**Doctrine:** D-3.5 (record durable design rationale; explicit deferral with target follow-up so future readers can trace the scope choice). Per-ADR-0040 deferral-ADR format (mirrors ADR-0104's deferral-list precedent).
+**Lands-in-task:** Phase 10 — Task 16 (this commit).
+
+### Context
+
+SPEC §2.1 enumerates the 3-field `Mutations` message: `request_mutations` (HeaderMutation repeated), `query_parameter_mutations` (QueryParameterMutation repeated), and `response_mutations` (HeaderMutation repeated). Phase 10's scope per SPEC §1.1 is header-only mutations: the first and third fields are fully implemented; the second field (`query_parameter_mutations`) is out of scope.
+
+The `query_parameter_mutations` field carries a `KeyValueMutation` triple (key, value, action) targeting URL query parameters rather than HTTP headers. Honoring it requires access to the parsed query string at request time — a separate subsystem from the header-mutation pipeline — and is therefore coupled to whatever future phase lands path-query rewriting. The phase 10 SPEC §1.1 envelope explicitly deems this field out of scope.
+
+Reference Envoy v1.37.2 accepts `query_parameter_mutations` in the proto config and applies it at request time. Phase 10 envoy-go parses the proto field (the `buildRuntimeConfig` function reads the `Mutations` message in full) but does NOT consume `query_parameter_mutations`; the field is silently ignored.
+
+### Decision
+
+`mutations.query_parameter_mutations` is DEFERRED from phase 10. Specifically:
+
+(a) **Proto field `mutations.query_parameter_mutations[]`** is silently parsed (the `buildRuntimeConfig` function does not error on its presence) but NOT honored at request-eval time. Configured query-parameter mutations are no-ops at runtime.
+
+(b) **No `runtimeConfig.queryParamMutations` field** is allocated — the field is not stored after parse; the proto value is consumed then discarded.
+
+(c) **Operator experience**: operators who configure `query_parameter_mutations` get no error, no warning, no behavioral effect in phase 10 envoy-go. This matches reference Envoy parity at the proto-parse level (both accept the config); the divergence is in the runtime honor (reference Envoy applies it; phase 10 envoy-go silently drops it).
+
+(d) **Future follow-up phase** lands the `query_parameter_mutations` field alongside the path-query rewriting subsystem as a coherent slice. The follow-up phase is unscheduled as of phase 10 phase-done; it appends to the §9 HTTP filters family per ADR-0106's flat-row family-expansion shape.
+
+### Alternatives considered
+
+(A) **Implement now**: REJECTED — out of scope for a header-only filter per SPEC §1.1; coupled to a separate path-query rewriting subsystem that is multi-phase in its own right.
+
+(B) **Error on non-empty `query_parameter_mutations`**: REJECTED — diverges from reference Envoy's behavior. Reference Envoy silently parses and applies the field; causing a boot error on its presence would make envoy-go less compatible than Envoy itself at the config-load layer.
+
+### Consequences
+
+(a) The `BEHAVIOR_CONTRACT.md ## HTTP filter chain ### envoy.filters.http.header_mutation ### Does not yet apply to` block explicitly cites this ADR for the `mutations.query_parameter_mutations[]` bullet. Future readers grep ADR-0112 and find the deferral disposition with the coupled-subsystem rationale.
+
+(b) No code change is needed to honor this ADR — the silent-ignore behavior is the natural outcome of not implementing the field. The deferral is documented at the ADR level for traceability.
+
+(c) Cross-references:
+   - ADR-0040 (deferral-ADR format precedent) — anchored.
+   - ADR-0104 (fault header-driven path deferral) — sibling deferral ADR; same format.
+   - SPEC §1.1 + §2.1 (header-only scope; Mutations message field enumeration) — load-bearing scope definition.
+   - BEHAVIOR_CONTRACT.md §13.1 `#### Does not yet apply to` — documents the deferral to operators.
+
+---
+
+## ADR-0113: Header-value formatter substitution syntax deferred — full Envoy command-string subsystem is its own multi-phase project
+
+**Status:** Deferred
+**Date:** 2026-05-04
+**Doctrine:** D-3.5 (record durable design rationale; explicit deferral with target follow-up so future readers can trace the scope choice). Per-ADR-0040 deferral-ADR format (mirrors ADR-0104's deferral-list precedent).
+**Lands-in-task:** Phase 10 — Task 16 (this commit).
+
+### Context
+
+Envoy's `HeaderValue.value` field (used in `HeaderMutation.append.value.value`) accepts formatter-substitution tokens evaluated against per-request context. Examples: `%REQ(:path)%` (the request path), `%DOWNSTREAM_REMOTE_ADDRESS%` (the downstream remote address), `%RESPONSE_CODE%` (the upstream response code), `%START_TIME(...)%` (the request start time with format string). This is the same command-string substitution system used in Envoy's access log formatter (implemented in phase 06.2 for access log output, per ADR-0065).
+
+The formatter-substitution subsystem is a multi-phase project in its own right: it requires a per-request evaluation context (carrying `*RequestInfo`, decoded upstream response metadata, timing, connection metadata), a command-string parser (tokenizing `%...%` escape sequences), and per-command evaluators for each supported substitution token. Phase 06.2 implemented a subset of the formatter for access log output; lifting that subset into a header-value evaluator requires extension with request-path-time substitution tokens (e.g., `%REQ(:path)%` is only meaningful on the request side; `%RESPONSE_CODE%` only on the response side).
+
+Phase 10's scope per SPEC §2.1 is static header values only. The `buildRuntimeConfig` function stores each `HeaderValue.value` as a STATIC string verbatim — no tokenization, no substitution, no evaluation context.
+
+### Decision
+
+Header-value formatter substitution is DEFERRED from phase 10. Specifically:
+
+(a) **`runtimeConfig` stores `headerValue` as a STATIC string verbatim**: the value field from the proto is stored as-is. No tokenization or substitution is performed at config-load time or at request-eval time.
+
+(b) **Runtime materialization**: a configured `HeaderValue.value` of `"%REQ(:path)%"` produces the literal 11-byte string on the wire (`%REQ(:path)%`), NOT the substituted path. Operators who configure formatter syntax in phase 10 envoy-go observe literal string verbatim output.
+
+(c) **No error, no warning**: phase 10 envoy-go does not detect or reject formatter-syntax patterns in `HeaderValue.value`. The silent-literal behavior is the outcome of not implementing the substitution layer.
+
+(d) **Future follow-up phase** lifts the access-log subset from phase 06.2 into a header-value evaluator, extending it with request-path-time + response-path-time substitution tokens. The follow-up phase is unscheduled as of phase 10 phase-done.
+
+### Alternatives considered
+
+(A) **Implement now**: REJECTED — the full command-string subsystem is multi-phase in scope; implementing it correctly requires extending the phase 06.2 access-log formatter with request/response-side evaluation contexts, a non-trivial addition beyond phase 10's header-only envelope.
+
+(B) **Subset-implement (e.g., `%REQ(...)%` only)**: REJECTED — picking a subset would produce a partial substitution grammar that mismatches Envoy's full command-string grammar. Operators who configure tokens outside the subset would get silent literal output for some tokens and substituted output for others, which is more confusing than consistent literal output across all tokens.
+
+### Consequences
+
+(a) The `BEHAVIOR_CONTRACT.md ## HTTP filter chain ### envoy.filters.http.header_mutation ### Does not yet apply to` block explicitly cites this ADR for the header-value formatter substitution bullet. Future readers grep ADR-0113 and find the deferral disposition with the command-string subsystem rationale.
+
+(b) The differential gate fixture 0012 uses only literal string values in all `HeaderValue.value` fields — no formatter tokens. The differential equivalence claim per SPEC §11 is valid for literal-value configurations only.
+
+(c) Cross-references:
+   - ADR-0040 (deferral-ADR format precedent) — anchored.
+   - ADR-0104 (fault header-driven path deferral) — sibling deferral ADR; same format.
+   - ADR-0065 (access-log formatter implementation in phase 06.2) — the future follow-up phase lifts from this foundation.
+   - SPEC §2.1 (static-string HeaderValue scope for phase 10) — load-bearing scope definition.
+   - BEHAVIOR_CONTRACT.md §13.1 `#### Does not yet apply to` — documents the deferral to operators.
+
