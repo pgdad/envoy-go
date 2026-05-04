@@ -288,3 +288,42 @@ $ go test -race ./internal/filter/http/header_mutation/... -v -run TestApplyOps 
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.009s
 ```
+
+## Task 7 — header_mutation DecodeHeaders + multi-tier resolution [ADR-0110, ADR-0073 amendment]
+
+**Commits:** `a242b78` — `phase 10: header_mutation DecodeHeaders multi-tier + ADR-0110 + ADR-0073 amendment`
+
+**Notes:** Landed the full `DecodeHeaders` body per SPEC §6.6 + ADR-0110. Two additions to `internal/filter/http/header_mutation/header_mutation.go`:
+
+- `compileForRequest(msg proto.Message) []compiledMutationOp` (method on `*filter`): type-asserts the per-route `proto.Message` to `*HeaderMutationPerRoute`, extracts `request_mutations`, compiles via `compileOps`. Returns nil for nil input, wrong type, nil mutations, or compile error (defensive — the per-route validator at HCM-build time already rejects protected-header violations). Inserted between `applyAppendAction` and `type filter struct`.
+
+- Full `DecodeHeaders` body (replaces the Task 5 stub): applies `f.cfg.requestOps` first; if `f.dcb` is nil returns Continue (listener-only path); calls `f.dcb.RequestRouteConfigsAllTiers()` to get the 3 unmerged per-route messages; compiles each via `compileForRequest`; applies in flag-controlled order: flag=false (default) → Route→VHost→RC (RC applied last, wins overlap); flag=true → RC→VHost→Route (Route applied last, wins overlap); returns Continue.
+
+ADR-0110 appended to `docs/envoy-go/DECISIONS.md`: codifies the 3 framework additions (ResolveAllTiers, RequestRouteConfigsAllTiers DECODER-ONLY, RegisterPerRouteValidator), the per-filter accessor-choice discipline, the cross-tier ordering algorithm, 4 alternatives A/B/C/D with D accepted.
+
+ADR-0073 amendment paragraph appended at the END of the ADR-0073 section (after the "Lands-in-task" paragraph, before the `---` separator): forward-pointer noting most-specific-override is now the DEFAULT model; multi-tier filters use ResolveAllTiers per ADR-0110.
+
+8 new test functions added to `header_mutation_test.go`: `fakeDecoderCB` helper + `mkPerRoute` + `mkFilterFromMutation` + 7 `TestDecodeHeaders_*` tests covering listener-only, route-only, 3-tier flag=false, 3-tier flag=true, 2-of-3 combinations (RouteAndVHost, RouteAndRC, VHostAndRC), and nil-dcb path.
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/header_mutation/... -run TestDecodeHeaders -v 2>&1
+=== RUN   TestDecodeHeaders_ListenerLevel_NoPerRoute
+--- PASS: TestDecodeHeaders_ListenerLevel_NoPerRoute (0.00s)
+=== RUN   TestDecodeHeaders_PerRoute_RouteOnly
+--- PASS: TestDecodeHeaders_PerRoute_RouteOnly (0.00s)
+=== RUN   TestDecodeHeaders_MultiTier_FlagFalse
+--- PASS: TestDecodeHeaders_MultiTier_FlagFalse (0.00s)
+=== RUN   TestDecodeHeaders_MultiTier_FlagTrue
+--- PASS: TestDecodeHeaders_MultiTier_FlagTrue (0.00s)
+=== RUN   TestDecodeHeaders_MultiTier_TwoOfThree_RouteAndVHost
+--- PASS: TestDecodeHeaders_MultiTier_TwoOfThree_RouteAndVHost (0.00s)
+=== RUN   TestDecodeHeaders_MultiTier_TwoOfThree_RouteAndRC
+--- PASS: TestDecodeHeaders_MultiTier_TwoOfThree_RouteAndRC (0.00s)
+=== RUN   TestDecodeHeaders_MultiTier_TwoOfThree_VHostAndRC
+--- PASS: TestDecodeHeaders_MultiTier_TwoOfThree_VHostAndRC (0.00s)
+=== RUN   TestDecodeHeaders_NilDecoderCallbacks_AppliesListenerOnly
+--- PASS: TestDecodeHeaders_NilDecoderCallbacks_AppliesListenerOnly (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.011s
+```
