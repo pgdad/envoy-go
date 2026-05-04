@@ -554,3 +554,22 @@ $ go test -count=1 -v ./test/differential/ -run "TestDifferential/0012" 2>&1 | t
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	1.816s
 ```
+
+## Task 16 — BEHAVIOR_CONTRACT + ADR-0112 + ADR-0113 + ROADMAP row 10 done
+
+**Commit:** 5fbebad41cb187a98f1b2b8ddd7d057d1eac070a
+
+**Documentation patches landed:**
+
+**BEHAVIOR_CONTRACT.md:**
+- §13.1 inserted: `### envoy.filters.http.header_mutation` subsection after `### envoy.filters.http.fault`; contains 6 sub-sections: `#### Asserted equivalence`, `#### Multi-tier per-route evaluation`, `#### Protected-header set`, `#### Stats — none emitted`, `#### Does not yet apply to`, `#### Empirical evidence`.
+- §13.4 equivalence-matrix row appended: `| HTTP filter \`envoy.filters.http.header_mutation\` | ... |` after the fault row.
+- §13.5 forward-pointer (1): after `typed_per_filter_config 3-tier merge` bullet — ADR-0110 multi-tier amendment note.
+- §13.5 forward-pointer (2): after cors `### Asserted equivalence` conclusions — SECOND-production-filter-in-EncodeHeaders note.
+
+**DECISIONS.md:**
+- ADR-0112 appended: `mutations.query_parameter_mutations[]` deferred — coupled to `KeyValueMutation` triple + path-query rewriting subsystem. Status: Deferred. Date: 2026-05-04.
+- ADR-0113 appended: Header-value formatter substitution syntax deferred — full Envoy command-string subsystem is its own multi-phase project. Status: Deferred. Date: 2026-05-04.
+
+**ROADMAP.md:**
+- Row 10 status flipped: `in-progress` → `done`. No other changes (§9 family heading at line 56 unchanged per ADR-0106).
