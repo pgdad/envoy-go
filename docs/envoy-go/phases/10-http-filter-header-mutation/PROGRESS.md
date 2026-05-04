@@ -153,3 +153,81 @@ $ go test -race ./internal/filter/http/... -run 'TestRegistry_RegisterPerRouteVa
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http	(cached)
 ```
+
+## Task 5 — header_mutation package + parser + protected-header validation [ADR-0108, ADR-0109, ADR-0111]
+
+**Commits:** `7cda566` — `phase 10: header_mutation package + parser + protected-header validation [ADR-0108, ADR-0109, ADR-0111]`
+
+**Notes:** Landed the `internal/filter/http/header_mutation/` package (first real implementation in phase 10). Three files created:
+
+- `internal/filter/http/header_mutation/doc.go` (85 lines): Full package doc-comment with decode-side algorithm (5 steps), encode-side algorithm, concurrency model, public surface, New body discipline, stats discipline, ADR cross-references, and forward-pointers for ADR-0112 + ADR-0113 deferred features.
+
+- `internal/filter/http/header_mutation/header_mutation.go` (253 lines after gofmt): `TypeURL` constant, `filterName` constant, `runtimeConfig` (3-field), `mutationOpKind` (kindRemove/kindAppend), `compiledMutationOp` (value-typed, 5-field per planner-time decision 4), `New` factory, `buildRuntimeConfig`, `compileOps`, `isProtectedHeader`, `validatePerRouteHeaderMutation`, `filter` struct, interface conformance assertions, `SetDecoderCallbacks`/`SetEncoderCallbacks`, STUBBED `DecodeHeaders`/`EncodeHeaders` (return Continue), pass-through `DecodeData`/`EncodeData`/`DecodeTrailers`/`EncodeTrailers`/`OnDestroy`.
+
+- `internal/filter/http/header_mutation/header_mutation_test.go` (278 lines): 11 test functions — `TestNew_NilTC`, `TestNew_MalformedTC`, `TestNew_ProtectedHeader` (table-driven, 10 cases), `TestNew_ProtectedHeader_RemoveAlsoRejected`, `TestNew_HappyPath_ListenerLevelOnly`, `TestRuntimeConfig_FieldExtraction`, `TestRuntimeConfig_QueryParameterMutationsSilentlyIgnored`, `TestCompiledMutationOp_AllAppendActionsParse` (4 sub-cases), `TestCompiledMutationOp_RemoveAndAppend`, `TestNew_RegistersPerRouteValidator`, `TestIsProtectedHeader`.
+
+Three ADRs appended to `docs/envoy-go/DECISIONS.md` (+221 lines, 4794→5015):
+- ADR-0108: package shape + boot registration + zero-stats discipline.
+- ADR-0109: `runtimeConfig` 3-field shape + `compiledMutationOp` value-typed + AppendAction × 4 + keep_empty_value + multi-value.
+- ADR-0111: protected-header set + CONFIG-LOAD-TIME rejection (MAJOR amendment to BRAINSTORM Decision 11) + verbatim error format + eager per-route validation.
+
+**One deviation from PLAN verbatim source:** `TestRuntimeConfig_QueryParameterMutationsSilentlyIgnored` adapted. The PLAN used `{AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD, Append: &corev3.HeaderValue{Key: "q", Value: "v"}}` to construct a `KeyValueMutation`. At impl time, `go doc` revealed `KeyValueMutation` lives in `corev3` (not `mutation_rules/v3`) and has a different struct shape: `Append *KeyValueAppend` + `Remove string` (no `AppendAction` field at top level). The test was adapted to use `&corev3.KeyValueMutation{Remove: "q"}` — a valid minimal construction that still exercises the silent-ignore path (the test purpose is unchanged: verify no error, no ops produced).
+
+`gofmt` was run after initial write — the PLAN's alignment whitespace in `compiledMutationOp` struct literal was not canonical gofmt output; golangci-lint caught this and `gofmt -w` fixed it.
+
+**Outputs:**
+```
+$ go test -race ./internal/filter/http/header_mutation/... -v 2>&1
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_ProtectedHeader
+=== RUN   TestNew_ProtectedHeader/method-request
+--- PASS: TestNew_ProtectedHeader/method-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/path-request
+--- PASS: TestNew_ProtectedHeader/path-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/authority-request
+--- PASS: TestNew_ProtectedHeader/authority-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/scheme-request
+--- PASS: TestNew_ProtectedHeader/scheme-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/status-request
+--- PASS: TestNew_ProtectedHeader/status-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/host-lower-request
+--- PASS: TestNew_ProtectedHeader/host-lower-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/host-title-request
+--- PASS: TestNew_ProtectedHeader/host-title-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/host-upper-request
+--- PASS: TestNew_ProtectedHeader/host-upper-request (0.00s)
+=== RUN   TestNew_ProtectedHeader/status-response
+--- PASS: TestNew_ProtectedHeader/status-response (0.00s)
+=== RUN   TestNew_ProtectedHeader/host-response
+--- PASS: TestNew_ProtectedHeader/host-response (0.00s)
+--- PASS: TestNew_ProtectedHeader (0.00s)
+=== RUN   TestNew_ProtectedHeader_RemoveAlsoRejected
+--- PASS: TestNew_ProtectedHeader_RemoveAlsoRejected (0.00s)
+=== RUN   TestNew_HappyPath_ListenerLevelOnly
+--- PASS: TestNew_HappyPath_ListenerLevelOnly (0.00s)
+=== RUN   TestRuntimeConfig_FieldExtraction
+--- PASS: TestRuntimeConfig_FieldExtraction (0.00s)
+=== RUN   TestRuntimeConfig_QueryParameterMutationsSilentlyIgnored
+--- PASS: TestRuntimeConfig_QueryParameterMutationsSilentlyIgnored (0.00s)
+=== RUN   TestCompiledMutationOp_AllAppendActionsParse
+=== RUN   TestCompiledMutationOp_AllAppendActionsParse/APPEND_IF_EXISTS_OR_ADD
+--- PASS: TestCompiledMutationOp_AllAppendActionsParse/APPEND_IF_EXISTS_OR_ADD (0.00s)
+=== RUN   TestCompiledMutationOp_AllAppendActionsParse/ADD_IF_ABSENT
+--- PASS: TestCompiledMutationOp_AllAppendActionsParse/ADD_IF_ABSENT (0.00s)
+=== RUN   TestCompiledMutationOp_AllAppendActionsParse/OVERWRITE_IF_EXISTS_OR_ADD
+--- PASS: TestCompiledMutationOp_AllAppendActionsParse/OVERWRITE_IF_EXISTS_OR_ADD (0.00s)
+=== RUN   TestCompiledMutationOp_AllAppendActionsParse/OVERWRITE_IF_EXISTS
+--- PASS: TestCompiledMutationOp_AllAppendActionsParse/OVERWRITE_IF_EXISTS (0.00s)
+--- PASS: TestCompiledMutationOp_AllAppendActionsParse (0.00s)
+=== RUN   TestCompiledMutationOp_RemoveAndAppend
+--- PASS: TestCompiledMutationOp_RemoveAndAppend (0.00s)
+=== RUN   TestNew_RegistersPerRouteValidator
+--- PASS: TestNew_RegistersPerRouteValidator (0.00s)
+=== RUN   TestIsProtectedHeader
+--- PASS: TestIsProtectedHeader (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.011s
+```
