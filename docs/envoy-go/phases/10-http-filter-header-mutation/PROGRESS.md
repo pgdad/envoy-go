@@ -392,3 +392,26 @@ $ go test -race -count=1 ./internal/filter/http/header_mutation/... -run 'Test' 
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.038s
 ```
+
+## Task 10 — FuzzHeaderMutationConfigParse (thirteenth fuzzer per ADR-0018)
+
+**Commits:** `4a82931` — `phase 10: FuzzHeaderMutationConfigParse (thirteenth fuzzer per ADR-0018)`
+
+**Notes:** Landed `FuzzHeaderMutationConfigParse` in `internal/filter/http/header_mutation/fuzz_test.go` (37 lines). Fuzzes arbitrary byte sequences as the `tc *anypb.Any` parameter to `New`; asserts `New` returns either `(factory, nil)` OR `(nil, error)`; never panics; never returns `(nil, nil)`. Per ADR-0018's "every parser/codec/filter ships a fuzzer" + SPEC §14.3 planner-time decision 6. Three seed corpus entries: empty TypeURL + empty bytes (invalid); arbitrary bytes under canonical TypeURL (decode error); short proto-wire-format bytes.
+
+30s budget per ADR-0018 short-mode CI policy. Thirteenth fuzzer overall (post-09's twelfth FuzzFaultConfigParse).
+
+**Outputs:**
+```
+$ go test -fuzz=FuzzHeaderMutationConfigParse -fuzztime=30s ./internal/filter/http/header_mutation/... 2>&1 | tail -10
+fuzz: elapsed: 12s, execs: 3120504 (273195/sec), new interesting: 157 (total: 160)
+fuzz: elapsed: 15s, execs: 3827812 (235616/sec), new interesting: 169 (total: 172)
+fuzz: elapsed: 18s, execs: 4460966 (211225/sec), new interesting: 187 (total: 190)
+fuzz: elapsed: 21s, execs: 5143485 (227558/sec), new interesting: 200 (total: 203)
+fuzz: elapsed: 24s, execs: 5829933 (228759/sec), new interesting: 207 (total: 210)
+fuzz: elapsed: 27s, execs: 6218452 (129505/sec), new interesting: 215 (total: 218)
+fuzz: elapsed: 30s, execs: 6545485 (108999/sec), new interesting: 219 (total: 222)
+fuzz: elapsed: 31s, execs: 6545485 (0/sec), new interesting: 219 (total: 222)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	31.061s
+```
