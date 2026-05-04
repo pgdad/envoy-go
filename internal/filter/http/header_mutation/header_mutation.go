@@ -82,13 +82,11 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	if err != nil {
 		return nil, err
 	}
-	// Register per-route validator (per planner-time decision 3 + ADR-0110).
-	// Idempotent across multiple calls to New (same filter, multiple HCMs):
-	// RegisterPerRouteValidator overwrites the entry, but the validator function
-	// is identical so the overwrite is benign.
-	if ctx.Registry != nil {
-		ctx.Registry.RegisterPerRouteValidator(filterName, validatePerRouteHeaderMutation)
-	}
+	// Per-route validator registration happens BEFORE Freeze() in
+	// cmd/envoy-go/main.go via RegisterPerRouteValidator (exported). Do NOT
+	// call it here: New is invoked by the listener constructor which runs AFTER
+	// Freeze, so any call here would panic. The RegisterPerRouteValidator
+	// function exists so main.go can wire it pre-Freeze cleanly.
 	return func() envoyhttp.HTTPFilter {
 		f := &filter{cfg: rc}
 		return envoyhttp.HTTPFilter{
@@ -181,6 +179,17 @@ func isProtectedHeader(name string) bool {
 		return true
 	}
 	return strings.EqualFold(name, "host")
+}
+
+// RegisterPerRouteValidator registers the header_mutation per-route validator
+// with the supplied HTTPRegistry. MUST be called BEFORE httpReg.Freeze() in
+// cmd/envoy-go/main.go — the registry rejects registrations after Freeze, and
+// New is called during listener construction (after Freeze). Introduced to
+// correct the Task 9 design where New attempted to register post-Freeze.
+func RegisterPerRouteValidator(reg interface {
+	RegisterPerRouteValidator(filterName string, validator func(proto.Message) error)
+}) {
+	reg.RegisterPerRouteValidator(filterName, validatePerRouteHeaderMutation)
 }
 
 // validatePerRouteHeaderMutation is the per-route validator registered with

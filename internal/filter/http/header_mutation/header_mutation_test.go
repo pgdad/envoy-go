@@ -227,22 +227,16 @@ func TestCompiledMutationOp_RemoveAndAppend(t *testing.T) {
 	}
 }
 
-func TestNew_RegistersPerRouteValidator(t *testing.T) {
+func TestRegisterPerRouteValidator(t *testing.T) {
+	// The per-route validator is registered via the exported
+	// RegisterPerRouteValidator function (called in main.go before
+	// httpReg.Freeze). New does NOT call it because New is invoked post-Freeze
+	// during listener construction.
 	r := envoyhttp.NewHTTPRegistry()
-	mut := &headermutationv3.HeaderMutation{
-		Mutations: &headermutationv3.Mutations{
-			RequestMutations: []*commonmutationrulesv3.HeaderMutation{
-				mkAppendOp("x", "v", corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
-			},
-		},
-	}
-	_, err := New(mustAny(t, mut), envoyhttp.FactoryCtx{Registry: r})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	RegisterPerRouteValidator(r)
 	v := r.PerRouteValidator(filterName)
 	if v == nil {
-		t.Fatal("expected per-route validator registered after New; got nil")
+		t.Fatal("expected per-route validator registered after RegisterPerRouteValidator; got nil")
 	}
 	// Sanity: validator accepts a valid HeaderMutationPerRoute.
 	okMsg := &headermutationv3.HeaderMutationPerRoute{

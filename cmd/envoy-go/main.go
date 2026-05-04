@@ -115,6 +115,10 @@ func main() {
 	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
 	httpReg.Register(fault.TypeURL, fault.New)
 	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
+	// Register header_mutation per-route validator before Freeze (the registry
+	// rejects registrations after Freeze; New is called post-Freeze during
+	// listener construction, so it cannot call RegisterPerRouteValidator itself).
+	header_mutation.RegisterPerRouteValidator(httpReg)
 	httpReg.Freeze()
 
 	// Phase 07.2 Task 11 boot wiring: build the
