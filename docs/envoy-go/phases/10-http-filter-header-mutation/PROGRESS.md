@@ -436,3 +436,31 @@ ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.014s
 ?   	github.com/esalaine/envoy-go/test/fixtures/0012-http-header-mutation/driver	[no test files]
 ok  	github.com/esalaine/envoy-go/test/helpers	1.025s
 ```
+
+## Task 12 — Fixture 0012 backend.go (header echo + multi-value response)
+
+**Commits:** `4910547` — `phase 10: fixture 0012 backend — header echo + multi-value response headers`
+
+**Notes:** Created `test/fixtures/0012-http-header-mutation/backends/backend.go` (51 lines): HTTP server bound to `--port` flag (default 18012), `/` endpoint reflects sorted request headers into response body (one per line), emits single-value `X-Resp-Test: backend-original` + multi-value `X-Multi: alpha` + `X-Multi: beta` headers for OVERWRITE/APPEND testing per SPEC §7.5 + §11.4. Smoke test via curl: returned HTTP 200 OK with sorted headers in body + all expected response headers.
+
+**Outputs:**
+```
+$ go build ./test/fixtures/0012-http-header-mutation/backends/
+(no output — clean)
+$ go run ./test/fixtures/0012-http-header-mutation/backends/ --port 18099 &
+sleep 0.3
+curl -isS http://127.0.0.1:18099/ -H 'X-Probe: yes' | head -30
+kill $PID
+
+HTTP/1.1 200 OK
+Content-Length: 48
+Content-Type: text/plain
+X-Multi: alpha
+X-Multi: beta
+X-Resp-Test: backend-original
+Date: Mon, 04 May 2026 17:15:31 GMT
+
+Accept: */*
+User-Agent: curl/8.5.0
+X-Probe: yes
+```
