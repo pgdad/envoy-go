@@ -88,3 +88,19 @@ PASS
 PASS
 PASS
 ```
+
+## Task 3 — DecoderFilterCallbacks.RequestRouteConfigsAllTiers callback + chain wiring
+
+**Commits:** `0551b4366b485728d6eebbb30826433e8f2ce81c` — `phase 10: framework — DecoderFilterCallbacks.RequestRouteConfigsAllTiers per ADR-0110`
+
+**Notes:** Landed `RequestRouteConfigsAllTiers() (route, vhost, rc proto.Message)` on the `DecoderFilterCallbacks` interface in `internal/filter/http/callbacks.go` (after existing `RequestRouteConfig` method, with full ADR-0110 doc-comment covering decoder-only placement rationale and nil-return conditions). Added method body `decoderCB.RequestRouteConfigsAllTiers` in `internal/filter/http/chain.go` (after existing `RequestRouteConfig` method) delegating to `d.c.perRoute.ResolveAllTiers(d.c.filters[d.idx].Name, d.c.routeIdx)` with nil-guard on perRoute. Tests added to `internal/filter/http/callbacks_test.go`: `TestDecoderCB_RequestRouteConfigsAllTiers` (full 3-tier: route="route", vhost="vh", rc="rc") + `TestDecoderCB_RequestRouteConfigsAllTiers_NilPerRoute` (nil perRoute → all-nil return) + `fakeBothSidesFilter` helper capturing `dcb` via `SetDecoderCallbacks`. Mock sweep (Step 7): one affected file — `internal/filter/http/fault/fault_test.go`'s `recordingDCB` needed stub `RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) { return nil, nil, nil }`. `fakeDecoderCB` in `callbacks_test.go` also updated. `go vet ./...`, `golangci-lint run ./...`, and full `go test -race -count=1 ./...` all clean.
+
+**Outputs:**
+```
+=== RUN   TestDecoderCB_RequestRouteConfigsAllTiers
+--- PASS: TestDecoderCB_RequestRouteConfigsAllTiers (0.00s)
+=== RUN   TestDecoderCB_RequestRouteConfigsAllTiers_NilPerRoute
+--- PASS: TestDecoderCB_RequestRouteConfigsAllTiers_NilPerRoute (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.002s
+```
