@@ -4657,3 +4657,138 @@ return func() envoyhttp.HTTPFilter {
    - Task 7's per-route 3-tier merge passes through the cap check unchanged — the timer captures the resolved-route `cfg.maxActiveFaults` by closure; per-route configs CAN override the listener-level cap (wholesale-replace per §11.7).
    - Task 14's differential-fixture exercises the cap by issuing concurrent requests against a 1-cap configuration; the StatsAsserter walks `/stats/prometheus` for `faults_overflow` and `active_faults` post-roll values. The `active_faults` gauge is asserted to return to 0 after all in-flight requests complete (Inc/Dec balance).
 
+---
+
+## ADR-0104: Header-driven fault path deferred — coupled to delay.header_delay / abort.header_abort proto sub-messages per phase 09 §11.5 empirical pin
+
+**Status:** Deferred
+**Date:** 2026-05-03
+**Doctrine:** D-3.5 (record durable design rationale; explicit deferral with target follow-up so future readers can trace the scope choice). Per-ADR-0040 deferral-ADR format (mirrors ADR-0089's deferral-list precedent).
+**Lands-in-task:** Task 15 (phase 09); commit TBD.
+
+### Context
+
+Per SPEC §11.5 the empirical pin against reference Envoy v1.37.2 produced a major surprise that revised the BRAINSTORM-anticipated scope. The original BRAINSTORM §1.3 envelope listed the four documented `x-envoy-fault-{delay,abort}-request[-percentage]` request headers as a fifth fixture scenario ("header-driven abort"), with the implementation gated on the four headers landing as first-class request-side fault inputs alongside the proto-driven `percentage` rolls.
+
+The §11.5 probe established that the header-driven path is NOT independent of the `delay.header_delay` / `abort.header_abort` proto sub-messages — reference Envoy ONLY honors the request headers when the corresponding proto sub-message is present in the HTTPFault config. With the proto sub-messages absent (the phase 09 MVP envelope per ADR-0101's 6-field-consumed / 11-field-silent-ignore decomposition), the request headers are silently ignored even though they are syntactically valid. Envoy's parser accepts both `delay.header_delay` and `abort.header_abort` as proto sub-message types, but consuming them requires runtime machinery (the per-request header parse + validation + percentage-roll + delay/status computation) that is ~150 LoC of additional implementation beyond the phase 09 §11-amended scope.
+
+The two surfaces are therefore COUPLED: implementing the four request headers without the proto sub-messages would diverge from reference Envoy's behavior (envoy-go would honor headers that reference Envoy ignores); implementing the proto sub-messages without the request headers would leave the proto sub-messages parseable-but-dead. Both must land together for parity, OR both must defer together. Phase 09 chooses to defer both (this ADR).
+
+### Decision
+
+The header-driven fault path is DEFERRED from phase 09. Specifically:
+
+(a) **Proto sub-messages `delay.header_delay` and `abort.header_abort`** are silently parsed (the runtimeConfig parser does not error on their presence in the HTTPFault Any) but NOT honored at fault-eval time. They are members of the 11-field silent-ignore set per ADR-0101.
+
+(b) **The four documented request headers** (`x-envoy-fault-delay-request`, `x-envoy-fault-delay-request-percentage`, `x-envoy-fault-abort-request`, `x-envoy-fault-abort-request-percentage`) are silently ignored on the request path. envoy-go's fault filter never reads them, even when they are syntactically valid. Reference Envoy's parity (silent-ignore when the proto sub-message is absent) is preserved by virtue of phase 09 having NO `header_delay` / `header_abort` consumer.
+
+(c) **Differential-fixture coverage** drops the BRAINSTORM-anticipated 5th scenario ("header-driven abort"). The 4 phase 09 fixture scenarios per SPEC §7.1 are: delay-only listener-inherited; combined delay+abort per-route; per-route wholesale-override; headers-field exact-match gate. No fixture probes the request headers in phase 09.
+
+(d) **Future small follow-up phase** (~150 LoC) lands the coupled pair `delay.header_delay` + `abort.header_abort` proto sub-messages + the four request headers in one coherent slice. The follow-up phase is unscheduled as of phase 09 phase-done; it appends to the §9 HTTP filters family per ADR-0106's flat-row family-expansion shape (NOT a sub-phase of phase 09).
+
+### Alternatives considered
+
+(A) **Implement the four request headers without the proto sub-messages.** REJECTED: would diverge from reference Envoy's behavior — envoy-go would honor request headers that reference Envoy silently ignores when the proto sub-messages are absent, breaking the differential-equivalence claim from §13.1.
+
+(B) **Implement the proto sub-messages without the request headers.** REJECTED: leaves the proto sub-messages parseable-but-dead — adds proto-parsing code with no observable effect. The follow-up phase landing the request headers would have to coordinate with this dead-but-parsed state, which is more complex than landing both at once.
+
+(C) **Implement BOTH the proto sub-messages and the request headers in phase 09.** REJECTED: ~150 LoC of additional implementation + two new differential-fixture scenarios + at least one new ADR (header-parse mechanics) would push phase 09 past the ADR-0045 split-gate threshold. The phase-09 SPEC §1.1 amendment per §11.5 explicitly removes this from scope; the deferral preserves the phase 09 envelope.
+
+(D) **Implement the request headers as a "permitted extension"** beyond reference Envoy parity. REJECTED: violates the differential-equivalence claim (envoy-go would emit fault behavior reference Envoy does not). The differential discipline is byte-equality on the wire response, not "envoy-go is a superset of Envoy's fault filter".
+
+### Consequences
+
+(a) The `BEHAVIOR_CONTRACT.md ## HTTP filter chain ### envoy.filters.http.fault ### Does not yet apply to` block (per §13.1) explicitly cites this ADR for the header-driven fault path bullet. Future readers asking "does envoy-go honor `x-envoy-fault-delay-request`?" grep ADR-0104 and find the deferral disposition with the coupled-pair rationale.
+
+(b) The `runtimeConfig` parser per ADR-0101 silently accepts `header_delay` / `header_abort` proto sub-messages without erroring. The 11-field silent-ignore set per ADR-0101 explicitly lists both. No `runtimeConfig.headerDelay` or `runtimeConfig.headerAbort` field is allocated.
+
+(c) The four `x-envoy-fault-*-request*` request headers are NOT in any allow-list, NOT consumed by any code path, NOT mentioned in any test. They flow through to the upstream as part of the request's normal header set (no header allow-list discipline applies — the fault filter does not strip them). Reference Envoy's behavior is identical when the proto sub-messages are absent.
+
+(d) The future small follow-up phase that lands the coupled pair will:
+   - Add `headerDelay` + `headerAbort` parsed fields to `runtimeConfig`.
+   - Add per-request header parse + validation + percentage-roll logic to `DecodeHeaders`.
+   - Add a 5th fixture scenario to `0011-http-fault` (header-driven abort) OR add a new fixture `0012-http-fault-header-driven`.
+   - Add at least one ADR (header-parse mechanics + differential coverage).
+   - Estimated scope: ~150 LoC + 1 new fuzzer + 1 new fixture scenario; well within the ADR-0045 split-gate threshold for a single follow-up phase.
+
+(e) ADR-0104's status remains `Deferred` until the follow-up phase lands. At that point the ADR transitions to `Superseded by ADR-XXXX` per ADR-0001's status taxonomy; the supersession ADR records the actual implementation choices.
+
+(f) Cross-references:
+   - ADR-0040 (deferral-ADR format precedent) — anchored.
+   - ADR-0089 (admin-endpoint deferral list per ADR-0040 format) — sibling deferral ADR; same format.
+   - ADR-0101 (runtimeConfig 6-field-consumed / 11-field-silent-ignore) — `header_delay` + `header_abort` are members of the 11-field silent-ignore set.
+   - ADR-0103 (abort terminal-replace mechanics) — the future follow-up's `header_abort` path reuses the same `OrderedHeaders` carrier + 4-header set.
+   - ADR-0102 (delay async-resume) — the future follow-up's `header_delay` path reuses the same `time.AfterFunc` + parkDecode wake-up machinery.
+   - ADR-0106 (§9 family-expansion shape) — the future follow-up phase lands as a flat top-level row in ROADMAP.md, NOT as a sub-phase of phase 09.
+   - SPEC §11.5 (empirical pin: header-driven path requires proto sub-messages) — the load-bearing empirical evidence for the deferral.
+
+---
+
+## ADR-0106: §9 HTTP filters family expansion shape — flat top-level rows + no-sibling-stub discipline; the §9 heading at ROADMAP line 56 is an umbrella, not a row
+
+**Status:** Accepted
+**Date:** 2026-05-03
+**Doctrine:** D-3.5 (record durable design rationale; the family-expansion shape is a load-bearing invariant of the §9 trunk that subsequent filter phases will inherit). Per-ADR-0001 template.
+**Lands-in-task:** Task 15 (phase 09); commit TBD.
+
+### Context
+
+Phase 09 (`envoy.filters.http.fault`) is the FIRST §9 HTTP filters family-row to land. The BOOTSTRAP_PROMPT.md §9 invariant 4 reading governs how the §9 trunk grows: each family-child filter is its own coherent phase with a flat top-level ROADMAP row (rows 09, 10, 11, ... — one per filter), NOT as a sub-phase of a parent §9 row.
+
+The §9 family-children enumerated in ROADMAP.md line 58 are: header_mutation, cors, compression, fault, local + global rate limit, jwt_authn, rbac, ext_authz, ext_proc, oauth2, csrf, buffer, lua, wasm, adaptive concurrency, admission control, bandwidth limit. Each becomes one or more phases when it enters `in-progress`. The split-gate per ADR-0045 stays available if any filter's surface exceeds the ~1500 LoC / ~25 task threshold.
+
+The BRAINSTORM Decisions 12 + 13 settle two related family-expansion questions:
+
+- **Decision 12:** §9 family expansion is FLAT top-level rows. There is no parent "09 http-filters" row with sub-phases 09.1, 09.2, 09.3, etc. — each filter is its own row with its own number (09 = fault; 10 = the next filter to brainstorm; etc.). This contrasts with the trunk-phase split pattern (05 → 05.1 + 05.2; 06 → 06.1 + 06.2; 07 → 07.1 + 07.2; 08 → 08.1 + 08.2) which DID use parent-row + sub-phase. The §9 family is structurally different: family-children are independent (no shared deliverable they coordinate on), so a parent row would have no closure semantics.
+
+- **Decision 13:** No-sibling-stub discipline. When phase 09 lands, the ROADMAP does NOT pre-populate stub rows for the other family-children (header_mutation, jwt_authn, etc.). The §9 heading at ROADMAP line 56 stays as a conceptual umbrella; rows are added at brainstorming time, NOT at phase 09 phase-done. Future family-expansion brainstorms cold-start from the §9 heading + the just-shipped artefacts (whichever filters have already landed), rather than from a pre-populated stub.
+
+The §9 heading at ROADMAP line 56 is therefore a CONCEPTUAL UMBRELLA, not a row. Its state field is unchanged across all family-row landings — the heading is structural Markdown, not a phase entry. Rows 09, 10, 11, ... ARE phase entries with state fields that flip planned → in-progress → done.
+
+### Decision
+
+The §9 HTTP filters family-expansion shape is fixed at this ADR:
+
+(a) **Flat top-level rows.** Each §9 family-child filter is one or more flat top-level ROADMAP rows (numbered 09, 10, 11, ...). NO parent-row-with-sub-phases pattern is used for §9 family-children. The trunk-phase split pattern (05 → 05.1+05.2, etc.) does NOT apply.
+
+(b) **No-sibling-stub discipline.** When a §9 family-row lands, the ROADMAP MUST NOT pre-populate stub rows for the other not-yet-brainstormed family-children. Stub rows are added at brainstorming time per BOOTSTRAP_PROMPT.md §6 brainstorm discipline. The §9 family-children list at ROADMAP line 58 enumerates the conceptual surface; the ROADMAP rows enumerate only the filters currently in-progress or done.
+
+(c) **The §9 heading at ROADMAP line 56 (`### HTTP filters family`) is a conceptual umbrella, not a row.** The heading has no state field; its position in the ROADMAP is structural Markdown. Phase commits MUST NOT modify the heading's text or position; the heading stays unchanged across all family-row landings.
+
+(d) **Family-children inherit ADR-0045's split-gate.** Any individual §9 family-row whose SPEC/PLAN exceeds the ~1500 LoC / ~25 tasks threshold splits per ADR-0045 (using the trunk-phase split pattern WITHIN that one filter — e.g., a hypothetical phase 12.1 + 12.2 if filter 12 needs splitting). The split is internal to that filter's row, NOT a fragmentation of the §9 trunk.
+
+(e) **Brainstorm cold-start discipline.** Future family-expansion brainstorms cold-start from the §9 heading + the just-shipped artefacts (whichever filters have already landed). The cold-start input is: BOOTSTRAP_PROMPT.md §9 invariant 4 + ROADMAP.md §9 heading + the most-recently-landed §9 family-row's PROGRESS.md + DECISIONS.md ADRs. No pre-populated stub row to reference.
+
+### Alternatives considered
+
+(A) **Single parent "09 http-filters" row with sub-phases for each family-child** (09.1 = fault, 09.2 = jwt_authn, etc.). REJECTED: the trunk-phase split pattern works because the parent row has a closure semantic (e.g., "minimum admin API"); a §9 parent row would have no closure semantic since the family is open-ended (new filters can always be added). The flat-row pattern is the natural shape.
+
+(B) **Pre-populate stub rows for all 17 family-children at phase 09 phase-done.** REJECTED: each filter requires its own brainstorm before scope is clear; pre-populating stub rows creates a maintenance burden and pretends to know scope that hasn't been brainstormed. The no-sibling-stub discipline keeps the ROADMAP a record of actual scoped work, not aspirational placeholders.
+
+(C) **Treat phase 09 as both a filter implementation AND a "family infrastructure" landing** (i.e., phase 09 contains generic filter framework code that subsequent filters reuse). REJECTED: the filter framework was already landed at phase 07.1; phase 09 is purely a filter-instance implementation. Future filters reuse the 07.1 framework, not phase-09 code.
+
+(D) **Fold the §9 heading into the phase 09 row** (eliminate the heading; phase 09's row IS the §9 family entry). REJECTED: future family-children need a structural anchor in the ROADMAP; eliminating the heading would make their addition arbitrary. The umbrella heading is the structural anchor.
+
+### Consequences
+
+(a) Phase 09 is the FIRST §9 family-row to land. Subsequent filters (header_mutation, buffer, local_ratelimit, etc.) follow the same pattern — each its own coherent phase with its own row, ADR set, and PROGRESS.md.
+
+(b) The phase 09 phase-done commit flips ROADMAP row 09 status `in-progress → done` and leaves the §9 heading at ROADMAP line 56 unchanged. The phase-done commit message body explicitly states (per the §15 acceptance checklist): (1) ROADMAP row 09 flips in-progress → done; (2) the §9 family heading at ROADMAP line 56 stays unchanged; (3) phase 09 is the FIRST §9 family-row to land.
+
+(c) Future §9 family-row brainstorms cold-start from the §9 heading + the just-shipped artefacts. The brainstorm input does not include a pre-populated stub row; the brainstorm OUTPUT adds a new top-level row to ROADMAP.md (numbered sequentially after the previously-landed family-rows).
+
+(d) The future small follow-up phase per ADR-0104 (header-driven fault path coupled pair) lands as a NEW top-level row (NOT as phase 09.1 or a sub-phase of phase 09). The follow-up phase reuses phase 09's `internal/filter/http/fault/` package shape but adds new files (~150 LoC) for the coupled pair. The row numbering depends on what other family-children land before the follow-up.
+
+(e) ADR-0045's split-gate stays available WITHIN any §9 family-row. If, e.g., a hypothetical phase 12 (jwt_authn) exceeds the ~1500 LoC threshold, it splits into 12.1 + 12.2 internally — the split is per-filter, not per-§9-trunk.
+
+(f) Cross-references:
+   - ADR-0001 (template + status taxonomy) — anchored.
+   - ADR-0045 (split-gate; stays available within any §9 family-row).
+   - BOOTSTRAP_PROMPT.md §9 invariant 4 — the canonical reading of the §9 family-expansion discipline; this ADR records the load-bearing interpretation.
+   - BRAINSTORM Decisions 12 (flat top-level rows) + 13 (no-sibling-stub discipline) — settled at brainstorm time; this ADR records the durable form.
+   - ROADMAP.md line 56 (`### HTTP filters family`) — the umbrella heading; this ADR records its non-row status.
+   - ROADMAP.md line 58 (the family-children enumeration) — the conceptual surface; this ADR records the no-pre-populated-stub discipline.
+   - ADR-0104 (header-driven fault path deferred) — the future small follow-up phase lands as a new top-level row per this ADR's flat-row discipline.
+
+(g) The §9 heading's state-field-unchanged invariant is grep-verifiable: future commits MUST NOT modify ROADMAP.md line 56's text or its position relative to the §9 family-children enumeration at line 58. A commit that modifies the heading is a violation of this ADR and should be reverted.
+

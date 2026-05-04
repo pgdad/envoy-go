@@ -959,3 +959,45 @@ $ go test -count=1 -timeout=600s ./test/differential/ -run 'TestDifferential' -v
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	37.873s
 ```
+
+## Task 15 — BEHAVIOR_CONTRACT.md patches per SPEC §13 + ADR-0104 + ADR-0106 + ROADMAP row 09 done
+
+**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Notes:** Task 15 lands the documentation surface for phase 09 phase-done: five BEHAVIOR_CONTRACT.md patches per SPEC §13.1–§13.5, two new ADRs (ADR-0104 deferral-format per ADR-0040; ADR-0106 family-expansion shape per ADR-0001 template), and the ROADMAP row 09 status flip in-progress → done. The §9 family heading at ROADMAP line 56 stays unchanged per ADR-0106's no-row-state invariant.
+
+**§13.1 NEW `### envoy.filters.http.fault` subsection** inserted under `## HTTP filter chain` between `### Empirical evidence (cors preflight)` (existing) and `### Empirical evidence (413 overflow)` (existing). Six sub-sections per SPEC §13.1 verbatim block: Asserted equivalence (abort response shape + delay timing + combined ordering + headers-field gate); Per-route 3-tier merge (ADR-0073 + §11.7 wholesale-override); max_active_faults concurrency cap (LBP-1 sixth + per-filter-instance shared counter); Async-resume mechanics (ADR-0102 — corrected per Task 14 follow-up to reflect the combined-path callback's `SendLocalReply + ContinueDecoding` parkDecode-wake-up + chain's `localReplyDone` gate short-circuit); Does not yet apply to (9 deferred surfaces — header-driven + response_rate_limit + abort.grpc_status + upstream_cluster + downstream_nodes + runtime-key fields + disable_downstream_cluster_stats + filter_enabled + HeaderMatcher non-exact + H2 differential); Empirical evidence (verbatim curl excerpt from §11.3 — 503 + 4-header set + `fault filter abort` 18-byte body).
+
+**§13.2 17→22-name table extension** renamed the existing `### 17-name table (introduced by phase 06.1)` heading to `### 22-name table (introduced by phase 06.1; extended by phase 09)`; appended a 5-row `Fault filter — 5 names (introduced by phase 09)` subsection after the existing `Server — 2 names` block; updated the existing `Total: 17 internal names.` footer line to `Total: 22 internal names (17 from 06.1 + 5 from 09).` The Prometheus name column reflects the actual flattening behavior post-Task 14 SN2 dotted-rest fix per ADR-0107 amendment: `envoy_http_fault_<metric>{envoy_http_conn_manager_prefix="<sp>"}`.
+
+**§13.3 Timing tolerances bullet** appended one bullet at the end of the existing `## Timing tolerances` section: ±10ms per phase 09 §11.2 empirical pin; envoy-go's `time.AfterFunc` matches Envoy v1.37.2 across the 50/100/200/500ms sweep with worst-case +3.6ms overhead; the differential fixture 0011-http-fault's driver bucketizes elapsed timings (fast vs delayed) per planner-time decision 11.
+
+**§13.4 Equivalence Matrix new row** appended one row after the existing `Admin /server_info (DRAINING)` row (line 30): `HTTP filter envoy.filters.http.fault | Per-request equivalence on abort response shape + delay timing + per-route wholesale-override + headers-field exact-match + stat counter increments under fixture 0011-http-fault. NOT asserted: header-driven + response_rate_limit + abort.grpc_status + HeaderMatcher non-exact.`
+
+**§13.5 Forward-pointer notes** appended two notes (the third pointer is already covered by §13.4): (a) after `## HTTP filter chain ### Async resume mechanics` — phase 09 is the FIRST production exerciser of async-resume on the request side; cross-ref ADR-0102 + the `localReplyDone` gate short-circuit; (b) after `## Stat-name mapping ### Twin-series filter discipline` — phase 09 takes route A for `fault.response_rl_injected` (emit permanently-zero counter rather than per-line-skip in the differential allow-list); cross-ref ADR-0107.
+
+**ADR-0104 (Deferral)** appended to DECISIONS.md per ADR-0040 deferral-ADR format (sibling of ADR-0089's deferral-list precedent). Title: `Header-driven fault path deferred — coupled to delay.header_delay / abort.header_abort proto sub-messages per phase 09 §11.5 empirical pin`. Status: Deferred. Body covers: the §11.5 major-surprise empirical pin (request headers REQUIRE the proto sub-messages to activate; cannot be cleanly separated); phase 09 silently parses both sub-messages (per ADR-0101's 11-field silent-ignore set) but does not honor them; the four documented `x-envoy-fault-{delay,abort}-request[-percentage]` request headers are silently ignored; future small follow-up phase (~150 LoC + 1 fuzzer + 1 fixture scenario) lands the coupled pair as a new top-level row per ADR-0106. Lands-in-task: Task 15 (commit SHA TBD; SHA-fill follow-up replaces TBD).
+
+**ADR-0106 (Family-expansion shape)** appended to DECISIONS.md per ADR-0001 template. Title: `§9 HTTP filters family expansion shape — flat top-level rows + no-sibling-stub discipline; the §9 heading at ROADMAP line 56 is an umbrella, not a row`. Status: Accepted. Body covers: BRAINSTORM Decisions 12 (flat top-level rows for §9 family-children — no parent-row-with-sub-phases pattern) + 13 (no-sibling-stub discipline — ROADMAP rows added at brainstorming time, not at phase-done); the §9 heading at ROADMAP line 56 is a CONCEPTUAL UMBRELLA whose state is unchanged across all family-row landings; ADR-0045's split-gate stays available WITHIN any §9 family-row; future family-expansion brainstorms cold-start from the §9 heading + the just-shipped artefacts. Phase 09 is the FIRST §9 family-row to land; subsequent filters (header_mutation, buffer, local_ratelimit, jwt_authn, etc.) follow the same pattern. Lands-in-task: Task 15.
+
+**ROADMAP row 09 flip.** Found row 09 at line 48 (the SPEC commit per phase-done discipline added it with status `in-progress`); flipped status field from `in-progress` to `done`. Verified the `### HTTP filters family` heading at line 56 is UNCHANGED in both text and position (per ADR-0106's no-row-state invariant). The §9 family-children enumeration at line 58 is also unchanged.
+
+**Verification.** All five §13 patches anchor SPEC §13 anchors AND incorporate the Task 14 follow-up corrections (the combined-path callback now correctly documents `SendLocalReply + ContinueDecoding` parkDecode-wake-up + `localReplyDone` gate short-circuit per ADR-0102 amendment; Prom name shape is the post-SN2-dotted-rest-fix `envoy_http_fault_<metric>{envoy_http_conn_manager_prefix="<sp>"}` per ADR-0107 amendment). ADR-0104 follows ADR-0040 deferral format; ADR-0106 follows ADR-0001 template. All cross-references valid (ADR-0040, ADR-0045, ADR-0073, ADR-0089, ADR-0101, ADR-0102, ADR-0103, ADR-0105, ADR-0106, ADR-0107; SPEC §11.5 + §11.7 + §13; BOOTSTRAP_PROMPT.md §9 invariant 4; BRAINSTORM Decisions 12, 13).
+
+**Outputs:**
+```
+$ grep -n 'fault' docs/envoy-go/BEHAVIOR_CONTRACT.md | wc -l
+(>20 fault references — §13.1 NEW subsection + §13.2 5-row table + §13.3 bullet + §13.4 row + §13.5 forward-pointers)
+
+$ grep -n '^## ADR-0104\|^## ADR-0106' docs/envoy-go/DECISIONS.md
+(both ADRs present)
+
+$ grep -n '^| 09' docs/envoy-go/ROADMAP.md
+48:| 09 | http-filter-fault | 08 | done |  |  ...
+(status reads `done`)
+
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+$ go test -race -count=1 -short ./...
+(all clean — docs don't affect build)
+```

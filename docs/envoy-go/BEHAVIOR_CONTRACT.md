@@ -28,6 +28,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Admin /drain_listeners | Body byte-equal `OK\n` (POST); 405 + body `Method <X> not allowed, POST required.\n` (non-POST). Idempotent semantics; query-param ?graceful=true silent-ignored. Header set inherits umbrella rules; framing per phase-01 dechunk-discipline. Method-discrimination is the FIRST envoy-go endpoint with 405 enforcement (per ADR-0093 partially amending ADR-0090). |
 | Admin /ready (DRAINING) | Body byte-equal `DRAINING\n` to reference Envoy v1.37.2 in DRAINING state. Status 503. DRAINING precedence over LIVE / PRE_INITIALIZING. Status 503 (matches PRE_INITIALIZING). Header set inherits umbrella rules. Per-proxy trigger script normalization per 08.2 SPEC §7.2 (envoy-go: /drain_listeners; ref Envoy: /drain_listeners + /healthcheck/fail). |
 | Admin /server_info (DRAINING) | The `state` field IS asserted byte-equal (`"DRAINING"`) when both proxies are in DRAINING. Other fields per ADR-0088 allow-list. Inherits ADR-0088 allow-list for non-state fields (version, uptime_*, command_line_options, hot_restart_version, node). |
+| HTTP filter `envoy.filters.http.fault` | Per-request equivalence on abort response shape (status + 4-header set + body byte-exact `fault filter abort`), delay timing (±10ms tolerance), per-route wholesale-override resolution, headers-field exact-match gate, and stat counter increments under the per-scenario differential gate (fixture 0011-http-fault). NOT asserted: header-driven fault path (deferred — ADR-0104), response_rate_limit (deferred), abort.grpc_status (deferred), HeaderMatcher non-exact variants. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -127,7 +128,7 @@ Rule SN7: Histograms are not emitted by 06.1. (Forward-looking.)
 Rule SN8: Per-endpoint cluster stats are not emitted by 06.1. (Forward-looking.)
 ```
 
-### 17-name table (introduced by phase 06.1)
+### 22-name table (introduced by phase 06.1; extended by phase 09)
 
 `<stat_prefix>` is read from HCM config (already plumbed from phase 04). `<addr>` is the listener bind address normalized like Envoy does (e.g., `0.0.0.0:10000` → `0.0.0.0_10000`). `<n>` is the cluster name as configured in the bootstrap.
 
@@ -168,11 +169,29 @@ Rule SN8: Per-endpoint cluster stats are not emitted by 06.1. (Forward-looking.)
 | `server.live` | gauge | `envoy_server_live` (Set to 1 once admin `/ready` returns 200; never reset by 06.1) |
 | `server.uptime` | — | **NOT EMITTED** — depends on monotonic-clock + per-scrape recompute; deferred with histograms (see SPEC §2.1) |
 
-**Total: 17 internal names.** The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
+**Fault filter — 5 names (introduced by phase 09):**
+
+| Internal name | Type | Prometheus name |
+|---|---|---|
+| `http.<stat_prefix>.fault.aborts_injected` | counter | `envoy_http_fault_aborts_injected{envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.fault.delays_injected` | counter | `envoy_http_fault_delays_injected{envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.fault.faults_overflow` | counter | `envoy_http_fault_faults_overflow{envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.fault.active_faults` | gauge | `envoy_http_fault_active_faults{envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+| `http.<stat_prefix>.fault.response_rl_injected` | counter | `envoy_http_fault_response_rl_injected{envoy_http_conn_manager_prefix="<stat_prefix>"}` |
+
+`response_rl_injected` is emitted as a permanently-zero counter in phase 09
+— Envoy emits it even when `response_rate_limit` is not configured (per
+phase 09 §11.6 empirical pin); envoy-go matches the surface for differential
+parity per ADR-0107 route A. When `response_rate_limit` lands in a future
+phase, the same name carries the actual count.
+
+**Total: 22 internal names** (17 from 06.1 + 5 from 09). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
 
 ### Twin-series filter discipline (per empirical-verification scrape)
 
 > **Twin-series filter discipline (per empirical-verification scrape):** Envoy v1.37.2 ALSO emits two twin metric families that envoy-go does NOT emit and the differential fixture (§7) MUST filter out before per-counter delta comparison: (a) `envoy_cluster_external_upstream_rq_xx` (the "external" upstream-rq twin Envoy uses to split internal vs external traffic via `internal_traffic` config); (b) `envoy_listener_http_downstream_rq_xx` (a listener-scoped HCM-rq twin keyed by both listener address and HCM stat_prefix); plus the per-exact-status family `envoy_cluster_upstream_rq{envoy_response_code="200"}` (a separate metric family with `envoy_response_code` label, distinct from `envoy_cluster_upstream_rq_xx`'s `envoy_response_code_class` label). The fixture's allow-list enumerates exactly the 13 unique Prometheus names this SPEC ships; everything else in the Envoy scrape is ignored.
+
+> **Phase 09 fault-stat route-A note (forward-pointer per ADR-0107).** Phase 09 takes route A for `fault.response_rl_injected` (emit a permanently-zero counter rather than omit the line) — the twin-series-discipline analog but with envoy-go-side emission. Reference Envoy v1.37.2 emits `envoy_http_fault_response_rl_injected{...}` even when `response_rate_limit` is unconfigured; envoy-go matches the surface so the differential allow-list does not have to per-line-skip. The 22-name table above reflects the route A choice. When `response_rate_limit` lands in a future phase, the same registered counter starts incrementing without any framework change.
 
 ---
 
@@ -268,6 +287,15 @@ This subsection captures the ADS/delta state machine as the contract expects: al
 _to be filled per-phase as needed._
 
 Timing is not compared by default. A phase may opt in to latency bounds (p50 / p95 / p99 vs upstream, wall-clock or CPU-normalized) by adding a subsection here naming the fixture, the bound, and the measurement methodology. Opt-ins are additive; removing one requires a superseding ADR.
+
+- **Fault filter delay accuracy: ±10ms (per phase 09 §11.2 empirical pin).**
+  envoy-go's `time.AfterFunc` timer-driven async-resume matches Envoy v1.37.2's
+  fault delay accuracy within ±10ms across the 50/100/200/500ms sweep.
+  Empirical worst-case overhead observed: +3.6ms (Envoy v1.37.2 was tested;
+  envoy-go's overhead is similar). The differential fixture 0011-http-fault's
+  driver bucketizes elapsed timings (fast vs delayed) to absorb CI scheduling
+  jitter while still distinguishing the wholesale-override no-delay path from
+  the inherited-delay path.
 
 ---
 
@@ -723,6 +751,8 @@ Sections 3, 4, 5, 6 (excluding 6.6 PUSH_PROMISE), 7, 8 — all `failed == 0`. Pi
 - Single-goroutine-per-request iteration; no per-filter goroutine spawned by the framework.
 - ctx.Done() during pause aborts iteration; OnDestroy fires for cleanup.
 
+> **Phase 09 forward-pointer (per ADR-0102).** Phase 09 (`envoy.filters.http.fault`) is the FIRST production exerciser of the async-resume primitive on the request side; see `### envoy.filters.http.fault ### Async-resume mechanics` for fault-specific details (the `time.AfterFunc` timer + `cb.SendLocalReply` + `cb.ContinueDecoding` parkDecode-wake-up mechanics; the chain's `localReplyDone` gate short-circuits the resumed iteration without dialing the upstream). The 07.1 `envoy.filters.http.envoy_go_test` probe filter is the structural-coverage exerciser.
+
 ### Filter ordering
 - http_filters[] declaration order on decode-side.
 - Reverse declaration order on encode-side (router last on decode → router first on encode).
@@ -828,6 +858,63 @@ Verbatim response (CORS headers absent — passthrough confirmed):
 - **Preflight, disallowed origin (probe b):** the cors filter does NOT synthesize a 4xx local-reply for disallowed-origin preflights. Instead, the preflight passes through to the router, which sees an `OPTIONS /` and responds `405 Method Not Allowed` (since the route doesn't accept OPTIONS — which is the v1.37.2 default for routes without `route.connect_matcher` or explicit options handling). envoy-go's cors filter MUST replicate this passthrough (do NOT inject a 4xx; let the request flow to the router).
 - **Actual request, allowed origin (probe c):** the cors filter's encodeHeaders adds three CORS response headers to the upstream response: `access-control-allow-origin`, `access-control-allow-credentials`, `access-control-expose-headers`. (NOT all six — `allow-methods`/`allow-headers`/`max-age` are preflight-only.)
 - **Actual request, no Origin (probe d):** the cors filter is a no-op (no CORS response headers injected). Confirms the filter's gating discipline (no Origin → no encode-side action).
+
+### envoy.filters.http.fault
+
+#### Asserted equivalence (per phase 09 SPEC §11)
+
+When `envoy.filters.http.fault` is present in `http_filters`, envoy-go MUST emit the same response status, body, and 4-header set as reference Envoy v1.37.2 for the canonical fault scenarios.
+
+- **Abort response** (when `abort.percentage` rolls hit and `headers` field matches):
+    - Status: `<abort.http_status>` (constrained to `[200, 600)` at config-load time per ADR-0101; out-of-range values cause boot failure).
+    - Body: byte-exact `fault filter abort` (18 bytes, NO trailing newline). NO `charset=UTF-8` modifier on the content-type. NO `cache-control`, NO `x-content-type-options`, NO `transfer-encoding: chunked` headers.
+    - Header set on the wire: `content-length: 18`, `content-type: text/plain`, `date: <IMF-fixdate>`, `server: envoy`.
+    - For non-stdlib status codes (e.g. 418), the status text portion is allow-listed per the differential harness (`418 Unknown` upstream vs `418 I'm a teapot` envoy-go stdlib). Status code asserts byte-equal; status text portion is allow-listed.
+- **Delay response** (when `delay.percentage` rolls hit and `headers` field matches; no abort):
+    - Status: passes through from upstream (typically 200 OK + backend body).
+    - Latency: `delay.fixed_delay ± 10ms` (per the timing-tolerance bullet in `## Timing tolerances`).
+- **Combined delay + abort** (when both criteria match): delay fires first, then abort fires after the delay completes. The wire response is the abort response (4-header set + `fault filter abort` body), arriving `delay.fixed_delay` after the request.
+- **Headers-field gate**: when `headers` is non-empty, fault is only injected if ALL listed name+value pairs match the request. Header NAMES match case-insensitively (per HTTP/1.1); header VALUES match case-sensitively under `string_match.exact`. Other StringMatcher variants (regex, prefix, suffix, contains) are silently ignored at fault-eval time — see Does-not-yet-apply-to.
+
+#### Per-route 3-tier merge (per ADR-0073 + phase 09 SPEC §11.7)
+
+Per-route `typed_per_filter_config` for `envoy.filters.http.fault` WHOLESALE-overrides the listener-level fault config. A per-route HTTPFault that omits `delay` does NOT inherit the listener-level `delay` (and conversely for `abort`, `headers`, `max_active_faults`). Empirically confirmed: a route with `abort: 418, no delay` over a listener with `delay: 300ms` returns instant 418 (1.1ms total), NOT delayed 418 (~301ms).
+
+#### `max_active_faults` concurrency cap
+
+When `max_active_faults > 0`, a per-filter-instance `atomic.Int64` counter caps the in-flight fault count. New faults that arrive at the cap are SKIPPED (the request passes through normally) and the `fault.faults_overflow` counter increments. The cap is per-filter-instance (per `New` factory closure), shared across all requests routed through the same listener filter chain. LBP-1 sixth application — closure-captured `*atomic.Int64` shared counter (per ADR-0105).
+
+#### Async-resume mechanics (per ADR-0102)
+
+The fault filter's delay path uses `time.AfterFunc` to schedule a callback that calls `cb.ContinueDecoding()` after the configured delay. The chain parks at `StopIteration` and resumes from the timer goroutine. On the **combined delay+abort path**, the timer callback calls `cb.SendLocalReply(...)` followed by `cb.ContinueDecoding()` — the `ContinueDecoding` is purely a parkDecode wake-up signal; the chain's `localReplyDone` gate (set by `SendLocalReply`) makes the resumed iteration short-circuit WITHOUT advancing past the parked filter, so the upstream is NEVER dialed and the synthesized abort response is what reaches the wire. `OnDestroy` calls `f.delayTimer.Stop()` to cancel the timer on request teardown (downstream-disconnect, drain-induced stream-reset). The `markedActive` per-instance `atomic.Bool` flag guards the `activeFaults` atomic.Int64 counter Inc/Dec balance against the OnDestroy-races-timer-callback case.
+
+#### Does not yet apply to (per phase 09 deferrals — ADRs 0101, 0103, 0104, 0107)
+
+- **Header-driven fault path** (`x-envoy-fault-{delay,abort}-request[-percentage]`): coupled to `delay.header_delay` / `abort.header_abort` proto sub-messages per phase 09 §11.5 empirical pin; both deferred per ADR-0104. envoy-go silently parses the proto sub-messages but does not honor them; the four documented request headers are silently ignored.
+- **`response_rate_limit`** (FaultRateLimit token-bucket): deferred to a future fault-extension phase OR the bandwidth_limit filter. The `fault.response_rl_injected` stat is emitted as a permanently-zero counter for differential parity per ADR-0107.
+- **`abort.grpc_status`**: deferred to gRPC family.
+- **`upstream_cluster`, `downstream_nodes` filters**: deferred to small follow-up phases.
+- **All four runtime-key fields** (`*_runtime`): deferred to Runtime + hot restart family.
+- **`disable_downstream_cluster_stats`**: deferred to per-downstream-cluster stat fan-out phase (no current ROADMAP row).
+- **`filter_enabled` / `filter_enabled_runtime`**: deferred to Runtime + hot restart family.
+- **HeaderMatcher non-exact variants** (regex, range, prefix, suffix, contains, present-only): deferred to whatever phase lands the full HeaderMatcher engine.
+- **Differential testing under H2 streams**: fixture 0011 is HTTP/1.1-only; H2 differential testing of fault is deferred.
+
+#### Empirical evidence (verbatim curl excerpts from phase 09 SPEC §11.3)
+
+```
+$ curl -isS http://127.0.0.1:11000/foo  # delay 100% 100ms + abort 100% 503
+
+HTTP/1.1 503 Service Unavailable
+content-length: 18
+content-type: text/plain
+date: Sun, 03 May 2026 18:33:59 GMT
+server: envoy
+
+fault filter abort
+```
+
+(Body byte-count = 18; NO trailing newline; 4-header set as above.)
 
 ### Empirical evidence (413 overflow)
 
