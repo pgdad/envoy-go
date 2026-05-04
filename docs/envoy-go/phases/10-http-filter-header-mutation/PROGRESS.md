@@ -415,3 +415,24 @@ fuzz: elapsed: 31s, execs: 6545485 (0/sec), new interesting: 219 (total: 222)
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	31.061s
 ```
+
+## Task 11 — Fixture infrastructure — HTTPHeaderMutation BackendKind + spawn helper + driver stub
+
+**Commits:** `4078c45` — `phase 10: fixture infrastructure — HTTPHeaderMutation BackendKind + spawn helper + driver stub`
+
+**Notes:** Landed the three fixture-harness infrastructure pieces for fixture 0012. (1) `HTTPHeaderMutation BackendKind = 9` appended after `HTTPFault BackendKind = 8` in `test/differential/fixture/fixture.go` with full doc-comment per task spec. (2) `startHTTPHeaderMutationBackend` spawn helper added to `test/differential/runner_test.go` mirroring `startHTTPFaultBackend` signature exactly (`func(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error)`; error wrapped via `fmt.Errorf("start: %w", err)`). (3) `case fixture.HTTPHeaderMutation:` block added in `runFixture` switch, mirroring the `HTTPFault` case verbatim (bo.port + bo.proc + deferred SIGKILL + waitTCPDial). (4) Blank-import `_ "github.com/esalaine/envoy-go/test/fixtures/0012-http-header-mutation/driver"` appended after the 0011 import. (5) Stub `test/fixtures/0012-http-header-mutation/driver/doc.go` created (package-level doc comment only). No signature deviations from PLAN sketches — actual `startHTTPFaultBackend` matched the sketch's return shape. `go build ./test/differential/... ./test/fixtures/0012-http-header-mutation/...`, `go vet ./...`, `golangci-lint run ./...`, and `go test -race -count=1 ./...` all clean.
+
+**Outputs:**
+```
+$ go build ./test/differential/... ./test/fixtures/0012-http-header-mutation/...
+(no output — clean)
+$ go vet ./...
+(no output — clean)
+$ golangci-lint run ./...
+(no output — clean)
+$ go test -race -count=1 ./... 2>&1 | tail -5
+ok  	github.com/esalaine/envoy-go/test/differential	40.967s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.014s
+?   	github.com/esalaine/envoy-go/test/fixtures/0012-http-header-mutation/driver	[no test files]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.025s
+```
