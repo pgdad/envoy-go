@@ -89,7 +89,7 @@ func buildChain(t *testing.T, count int32) (*envoyhttp.FilterChain, *filter, *re
 		any.TypeUrl = envoygotestpb.TypeURLEnvoyGoTestPerRoute
 		scopes[0].Route = map[string]*anypb.Any{"envoy.filters.http.envoy_go_test": any}
 	}
-	prc, err := envoyhttp.BuildPerRouteConfig(nil, scopes, chainNames)
+	prc, err := envoyhttp.BuildPerRouteConfig(nil, scopes, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}

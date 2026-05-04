@@ -46,7 +46,7 @@ func TestDecoderCB_RequestRouteConfigsAllTiers(t *testing.T) {
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("rc"))}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("vh"))}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("route"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}

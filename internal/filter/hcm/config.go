@@ -205,7 +205,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 	for i, e := range chainConfig {
 		chainNames[i] = e.name
 	}
-	perRoute, err := buildPerRouteFromHCM(rc, chainNames)
+	perRoute, err := buildPerRouteFromHCM(rc, chainNames, httpRegistry)
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +320,7 @@ func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, httpRegistry *filter_htt
 // any level — short-circuits the gratuitous PerRouteConfig allocation that
 // the common phase-04..06.2 "no typed_per_filter_config in any scope" path
 // would otherwise produce.
-func buildPerRouteFromHCM(rc *routev3.RouteConfiguration, chainNames []string) (*filter_http.PerRouteConfig, error) {
+func buildPerRouteFromHCM(rc *routev3.RouteConfiguration, chainNames []string, httpRegistry *filter_http.HTTPRegistry) (*filter_http.PerRouteConfig, error) {
 	rcMap := rc.GetTypedPerFilterConfig()
 	// Phase-04 enforces exactly one virtual_host with domains=["*"]
 	// (validated above); we still loop generally over routes inside that
@@ -345,7 +345,7 @@ func buildPerRouteFromHCM(rc *routev3.RouteConfiguration, chainNames []string) (
 	if !hasAny {
 		return nil, nil
 	}
-	return filter_http.BuildPerRouteConfig(rcMap, scopes, chainNames)
+	return filter_http.BuildPerRouteConfig(rcMap, scopes, chainNames, httpRegistry)
 }
 
 func buildRouteTable(routes []*routev3.Route, clusters *cluster.Manager) (*routeTable, error) {

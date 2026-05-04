@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // HTTPRegistry is the boot-time-populated, freeze-after-boot extension
@@ -13,15 +15,19 @@ import (
 //
 //nolint:revive // ADR-0072 reserves the HTTPRegistry name for the boot-time HTTP-filter registry.
 type HTTPRegistry struct {
-	mu        sync.RWMutex
-	byTypeURL map[string]HTTPFilterFactory
-	frozen    atomic.Bool
+	mu                 sync.RWMutex
+	byTypeURL          map[string]HTTPFilterFactory
+	perRouteValidators map[string]func(proto.Message) error // per planner-time decision 3 + ADR-0110
+	frozen             atomic.Bool
 }
 
 // NewHTTPRegistry allocates an empty registry. Call Register for each filter
 // factory at boot, then Freeze before listenerManager.New.
 func NewHTTPRegistry() *HTTPRegistry {
-	return &HTTPRegistry{byTypeURL: make(map[string]HTTPFilterFactory)}
+	return &HTTPRegistry{
+		byTypeURL:          make(map[string]HTTPFilterFactory),
+		perRouteValidators: make(map[string]func(proto.Message) error),
+	}
 }
 
 // Register adds a filter factory under typeURL. Panics if the registry is
@@ -71,4 +77,34 @@ func (r *HTTPRegistry) KnownTypeURLs() []string {
 		}
 	}
 	return out
+}
+
+// RegisterPerRouteValidator registers a validator function for filterName that
+// BuildPerRouteConfig invokes against each parsed proto.Message at each tier
+// (Route, VirtualHost, RouteConfiguration) at HCM-build time. Used by filters
+// like envoy.filters.http.header_mutation whose per-route configs need
+// boot-time validation (e.g., the protected-header set check per ADR-0111).
+//
+// MUST be called BEFORE Freeze(); panics otherwise (mirrors the existing
+// Register/Freeze discipline per ADR-0072).
+//
+// Per planner-time decision 3 + ADR-0110.
+func (r *HTTPRegistry) RegisterPerRouteValidator(filterName string, validator func(proto.Message) error) {
+	if r.frozen.Load() {
+		panic(fmt.Sprintf("HTTPRegistry: RegisterPerRouteValidator(%q) after Freeze", filterName))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.perRouteValidators[filterName] = validator
+}
+
+// PerRouteValidator returns the registered validator for filterName, or nil if
+// none registered. Safe to call after Freeze. Consumed by BuildPerRouteConfig.
+func (r *HTTPRegistry) PerRouteValidator(filterName string) func(proto.Message) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.perRouteValidators[filterName]
 }

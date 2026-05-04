@@ -503,7 +503,7 @@ func TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders(t
 	scopes := []filter_http.RouteScope{
 		{Route: map[string]*anypb.Any{"envoy.filters.http.cors": policyAny}},
 	}
-	pr, err := filter_http.BuildPerRouteConfig(nil, scopes, []string{"envoy.filters.http.cors", "envoy.filters.http.router"})
+	pr, err := filter_http.BuildPerRouteConfig(nil, scopes, []string{"envoy.filters.http.cors", "envoy.filters.http.router"}, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -633,7 +633,7 @@ func TestChainIntegration_H1_CorsActualRequest_AppendsThreeHeadersAfterUpstream(
 	scopes := []filter_http.RouteScope{
 		{Route: map[string]*anypb.Any{"envoy.filters.http.cors": policyAny}},
 	}
-	pr, err := filter_http.BuildPerRouteConfig(nil, scopes, []string{"envoy.filters.http.cors", "envoy.filters.http.router"})
+	pr, err := filter_http.BuildPerRouteConfig(nil, scopes, []string{"envoy.filters.http.cors", "envoy.filters.http.router"}, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}

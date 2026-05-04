@@ -95,7 +95,7 @@ func fuzzBuildPerRouteAndResolve(t *testing.T, filterName, rcVal, vhVal, rtVal [
 	// adversarial surface.
 	chains := [][]string{{}, {string(filterName)}, {string(filterName), "envoy.filters.http.router"}}
 	for _, chain := range chains {
-		pc, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vh, Route: rt}}, chain)
+		pc, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vh, Route: rt}}, chain, nil)
 		if err != nil {
 			if !strings.HasPrefix(err.Error(), "hcm:") {
 				t.Errorf("error not hcm:-prefixed: %v", err)

@@ -91,7 +91,7 @@ func buildChain(t *testing.T, policy *corsv3.CorsPolicy) (*envoyhttp.FilterChain
 		Route: map[string]*anypb.Any{"envoy.filters.http.cors": policyAny},
 	}
 	chainNames := []string{"envoy.filters.http.cors", "test.terminal"}
-	pr, err := envoyhttp.BuildPerRouteConfig(nil, []envoyhttp.RouteScope{scope}, chainNames)
+	pr, err := envoyhttp.BuildPerRouteConfig(nil, []envoyhttp.RouteScope{scope}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestCors_PerRouteOverride(t *testing.T) {
 		{Route: map[string]*anypb.Any{"envoy.filters.http.cors": policy1Any}},
 	}
 	chainNames := []string{"envoy.filters.http.cors", "test.terminal"}
-	pr, err := envoyhttp.BuildPerRouteConfig(nil, scopes, chainNames)
+	pr, err := envoyhttp.BuildPerRouteConfig(nil, scopes, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}

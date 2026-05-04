@@ -1,6 +1,7 @@
 package http
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -23,7 +24,7 @@ func TestPerRoute_BuildAndResolve_RouteWins(t *testing.T) {
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc-level"))}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("vh-level"))}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("route-level"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -41,7 +42,7 @@ func TestPerRoute_BuildAndResolve_VHostFallback(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc-level"))}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("vh-level"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -54,7 +55,7 @@ func TestPerRoute_BuildAndResolve_VHostFallback(t *testing.T) {
 func TestPerRoute_BuildAndResolve_RCFallback(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc-level"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -66,7 +67,7 @@ func TestPerRoute_BuildAndResolve_RCFallback(t *testing.T) {
 
 func TestPerRoute_BuildAndResolve_NilOnAbsent(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
-	pr, err := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: nil}}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestPerRoute_BuildAndResolve_NilOnAbsent(t *testing.T) {
 func TestPerRoute_BuildRejectsUnknownFilterName(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.router"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("oops"))}
-	_, err := BuildPerRouteConfig(rcCfg, nil, chainNames)
+	_, err := BuildPerRouteConfig(rcCfg, nil, chainNames, nil)
 	if err == nil {
 		t.Fatalf("expected error on unknown filter name")
 	}
@@ -90,7 +91,7 @@ func TestPerRoute_BuildRejectsUnknownFilterName(t *testing.T) {
 func TestPerRoute_LazyCacheHitMiss(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("rc"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -106,7 +107,7 @@ func TestResolveAllTiers_AllThreeSet(t *testing.T) {
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("rc-level"))}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("vh-level"))}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("route-level"))}
-	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames)
+	pr, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames, nil)
 	if err != nil {
 		t.Fatalf("BuildPerRouteConfig: %v", err)
 	}
@@ -126,7 +127,7 @@ func TestResolveAllTiers_RouteAndVHostOnly(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("vh"))}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("route"))}
-	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames)
+	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: vhCfg, Route: rtCfg}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if route == nil || vhost == nil {
 		t.Errorf("route+vhost should be non-nil; got route=%v vhost=%v", route, vhost)
@@ -140,7 +141,7 @@ func TestResolveAllTiers_RouteAndRCOnly(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("rc"))}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("route"))}
-	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames)
+	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if route == nil || rc == nil {
 		t.Errorf("route+rc should be non-nil; got route=%v rc=%v", route, rc)
@@ -154,7 +155,7 @@ func TestResolveAllTiers_VHostAndRCOnly(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("rc"))}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("vh"))}
-	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames)
+	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if vhost == nil || rc == nil {
 		t.Errorf("vhost+rc should be non-nil; got vhost=%v rc=%v", vhost, rc)
@@ -167,7 +168,7 @@ func TestResolveAllTiers_VHostAndRCOnly(t *testing.T) {
 func TestResolveAllTiers_RouteOnly(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("route"))}
-	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames)
+	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if route == nil {
 		t.Errorf("route should be non-nil")
@@ -180,7 +181,7 @@ func TestResolveAllTiers_RouteOnly(t *testing.T) {
 func TestResolveAllTiers_VHostOnly(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	vhCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("vh"))}
-	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames)
+	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if vhost == nil {
 		t.Errorf("vhost should be non-nil")
@@ -193,7 +194,7 @@ func TestResolveAllTiers_VHostOnly(t *testing.T) {
 func TestResolveAllTiers_RCOnly(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("rc"))}
-	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames)
+	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if rc == nil {
 		t.Errorf("rc should be non-nil")
@@ -205,7 +206,7 @@ func TestResolveAllTiers_RCOnly(t *testing.T) {
 
 func TestResolveAllTiers_NoneSet(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
-	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: nil}}, chainNames)
+	pr, _ := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: nil}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if route != nil || vhost != nil || rc != nil {
 		t.Errorf("all should be nil; got route=%v vhost=%v rc=%v", route, vhost, rc)
@@ -215,7 +216,7 @@ func TestResolveAllTiers_NoneSet(t *testing.T) {
 func TestResolveAllTiers_RouteIdxOutOfRange(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("rc"))}
-	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames)
+	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames, nil)
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 99)
 	if route != nil || vhost != nil {
 		t.Errorf("route+vhost should be nil for out-of-range routeIdx; got route=%v vhost=%v", route, vhost)
@@ -229,7 +230,7 @@ func TestResolveAllTiers_RouteIdxOutOfRange(t *testing.T) {
 func TestResolveAllTiers_FilterNameNotPresent(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.cors", "envoy.filters.http.header_mutation"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("cors-rc"))}
-	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames)
+	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames, nil)
 	// Look up a filter name not present at any tier.
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if route != nil || vhost != nil || rc != nil {
@@ -241,7 +242,7 @@ func TestResolveAllTiers_DoesNotPolluteResolveCache(t *testing.T) {
 	chainNames := []string{"envoy.filters.http.header_mutation"}
 	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("rc"))}
 	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("route"))}
-	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames)
+	pr, _ := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames, nil)
 	// Call ResolveAllTiers first.
 	route, _, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if route == nil || rc == nil {
@@ -259,5 +260,92 @@ func TestResolveAllTiers_NilReceiver(t *testing.T) {
 	route, vhost, rc := pr.ResolveAllTiers("envoy.filters.http.header_mutation", 0)
 	if route != nil || vhost != nil || rc != nil {
 		t.Errorf("nil receiver should return all-nil; got route=%v vhost=%v rc=%v", route, vhost, rc)
+	}
+}
+
+func TestBuildPerRouteConfig_PerRouteValidator_NilSucceeds(t *testing.T) {
+	chainNames := []string{"envoy.filters.http.header_mutation"}
+	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("ok"))}
+	// nil registry → backwards-compatible (no validator consulted)
+	_, err := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames, nil)
+	if err != nil {
+		t.Errorf("nil registry should succeed; got %v", err)
+	}
+}
+
+func TestBuildPerRouteConfig_PerRouteValidator_NoValidatorRegisteredSucceeds(t *testing.T) {
+	r := NewHTTPRegistry()
+	r.Freeze()
+	chainNames := []string{"envoy.filters.http.header_mutation"}
+	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("ok"))}
+	_, err := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames, r)
+	if err != nil {
+		t.Errorf("no validator registered should succeed; got %v", err)
+	}
+}
+
+func TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnRouteTier(t *testing.T) {
+	r := NewHTTPRegistry()
+	sentinelErr := errors.New("validator-rejection")
+	r.RegisterPerRouteValidator("envoy.filters.http.header_mutation", func(m proto.Message) error {
+		return sentinelErr
+	})
+	r.Freeze()
+	chainNames := []string{"envoy.filters.http.header_mutation"}
+	rtCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("triggers-error"))}
+	_, err := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames, r)
+	if err == nil {
+		t.Fatal("expected error; got nil")
+	}
+	if !strings.Contains(err.Error(), "validator-rejection") {
+		t.Errorf("error should wrap validator error; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "routes[0]") {
+		t.Errorf("error should carry route-tier location prefix; got %v", err)
+	}
+}
+
+func TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnVHostTier(t *testing.T) {
+	r := NewHTTPRegistry()
+	r.RegisterPerRouteValidator("envoy.filters.http.header_mutation", func(m proto.Message) error {
+		return errors.New("validator-rejection")
+	})
+	r.Freeze()
+	chainNames := []string{"envoy.filters.http.header_mutation"}
+	vhCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("triggers-error"))}
+	_, err := BuildPerRouteConfig(nil, []routeScope{{VHost: vhCfg, Route: nil}}, chainNames, r)
+	if err == nil || !strings.Contains(err.Error(), "virtual_hosts[0]") {
+		t.Errorf("expected vhost-tier location prefix; got %v", err)
+	}
+}
+
+func TestBuildPerRouteConfig_PerRouteValidator_ValidatorReturnsErrorOnRCTier(t *testing.T) {
+	r := NewHTTPRegistry()
+	r.RegisterPerRouteValidator("envoy.filters.http.header_mutation", func(m proto.Message) error {
+		return errors.New("validator-rejection")
+	})
+	r.Freeze()
+	chainNames := []string{"envoy.filters.http.header_mutation"}
+	rcCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("triggers-error"))}
+	_, err := BuildPerRouteConfig(rcCfg, []routeScope{{VHost: nil, Route: nil}}, chainNames, r)
+	if err == nil || !strings.Contains(err.Error(), "route_config") {
+		t.Errorf("expected rc-tier location prefix; got %v", err)
+	}
+}
+
+func TestBuildPerRouteConfig_PerRouteValidator_OnlyConsultedForRegisteredFilters(t *testing.T) {
+	// Two filters in chain; only one has a validator. The non-validated one's
+	// per-route configs are accepted unconditionally.
+	r := NewHTTPRegistry()
+	r.RegisterPerRouteValidator("envoy.filters.http.header_mutation", func(m proto.Message) error {
+		return errors.New("validator-rejection")
+	})
+	r.Freeze()
+	chainNames := []string{"envoy.filters.http.cors", "envoy.filters.http.header_mutation"}
+	// Cors per-route config — header_mutation NOT in any tier.
+	rtCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("cors-policy"))}
+	_, err := BuildPerRouteConfig(nil, []routeScope{{VHost: nil, Route: rtCfg}}, chainNames, r)
+	if err != nil {
+		t.Errorf("unrelated filter's config should not trigger validator; got %v", err)
 	}
 }

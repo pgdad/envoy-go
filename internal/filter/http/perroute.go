@@ -54,7 +54,13 @@ type cacheKey struct {
 //
 // Most-specific override on Resolve: Route > VirtualHost > RouteConfiguration.
 // No field-merge per ADR-0073.
-func BuildPerRouteConfig(rcCfg map[string]*anypb.Any, scopes []routeScope, chainNames []string) (*PerRouteConfig, error) {
+//
+// The reg parameter is optional (may be nil). When non-nil, BuildPerRouteConfig
+// consults reg.PerRouteValidator(filterName) for each filter name in chainNames
+// and runs the validator on each parsed proto.Message at each tier, surfacing
+// per-route protected-header violations as boot-time errors per ADR-0110 +
+// ADR-0111 + planner-time decision 3.
+func BuildPerRouteConfig(rcCfg map[string]*anypb.Any, scopes []routeScope, chainNames []string, reg *HTTPRegistry) (*PerRouteConfig, error) {
 	chainSet := make(map[string]struct{}, len(chainNames))
 	for _, n := range chainNames {
 		chainSet[n] = struct{}{}
@@ -93,6 +99,37 @@ func BuildPerRouteConfig(rcCfg map[string]*anypb.Any, scopes []routeScope, chain
 			return nil, err
 		}
 		out.scopes[i] = scopeParsed{vhost: vh, route: rt}
+	}
+	// Per-route validation hook per ADR-0110 + planner-time decision 3:
+	// for each filter name in chainNames that has a registered validator,
+	// run the validator against each parsed proto.Message at each tier.
+	// Surfaces per-route protected-header violations (per ADR-0111) as
+	// boot-time errors mirroring Envoy v1.37.2's CONFIG-LOAD-TIME
+	// enforcement per phase 10 SPEC §11.1.
+	if reg != nil {
+		for _, name := range chainNames {
+			v := reg.PerRouteValidator(name)
+			if v == nil {
+				continue
+			}
+			if msg, ok := out.rc[name]; ok {
+				if err := v(msg); err != nil {
+					return nil, fmt.Errorf("hcm: route_config: typed_per_filter_config[%q]: %w", name, err)
+				}
+			}
+			for i, sp := range out.scopes {
+				if msg, ok := sp.vhost[name]; ok {
+					if err := v(msg); err != nil {
+						return nil, fmt.Errorf("hcm: route_config.virtual_hosts[%d]: typed_per_filter_config[%q]: %w", i, name, err)
+					}
+				}
+				if msg, ok := sp.route[name]; ok {
+					if err := v(msg); err != nil {
+						return nil, fmt.Errorf("hcm: route_config.virtual_hosts[%d].routes[%d]: typed_per_filter_config[%q]: %w", i, i, name, err)
+					}
+				}
+			}
+		}
 	}
 	return out, nil
 }
