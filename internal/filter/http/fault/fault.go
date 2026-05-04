@@ -304,13 +304,24 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 		// timer-callback goroutine. Per planner-time decision 12, the percentage
 		// rolls already consumed the RNG on the dispatch goroutine, so the
 		// callback never consults f.rng — RNG access stays single-goroutine.
+		//
+		// After SendLocalReply, the parked dispatch goroutine (waiting in
+		// parkDecode on decodeResumeCh) must be woken so RunDecodeHeaders can
+		// observe c.localReplyDone=true and return (terminated=false). Without
+		// the wake-up, the goroutine stays parked indefinitely and the request
+		// hangs even though beginLocalReply has already populated the
+		// synthesized response. ContinueDecoding here is a no-op for the chain
+		// state-machine (the chain's localReplyDone gate makes the resumed
+		// iteration short-circuit on the next loop turn) — its sole purpose is
+		// to unblock parkDecode.
 		f.recordFaultEvent(eventDelaysInjected)
 		f.delayTimer = time.AfterFunc(cfg.delayFixedDelay, func() {
 			f.recordFaultEvent(eventAbortsInjected)
 			f.dcb.SendLocalReply(cfg.abortHTTPStatus, faultAbortBody, envoyhttp.OrderedHeaders{
 				{Name: "Content-Type", Value: "text/plain"},
 			})
-			f.decrementActive() // Task 6 wires markedActive guard
+			f.dcb.ContinueDecoding() // wake the parked dispatch goroutine
+			f.decrementActive()      // Task 6 wires markedActive guard
 		})
 		return envoyhttp.StopIteration
 	}

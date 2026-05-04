@@ -33,6 +33,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0009-admin-config-dump/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0011-http-fault/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 

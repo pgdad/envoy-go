@@ -21,8 +21,13 @@ reference Envoy v1.37.2 per phase 09 SPEC §7.
 
 ## Bootstrap discipline
 
-- Reference: Envoy v1.37.2 in Docker; admin :9902, listener :10001 (in-container;
-  published to runner-allocated host ports).
+- Reference: Envoy v1.37.2 in Docker; admin :9901, listener :10001 (in-container;
+  published to runner-allocated host ports). Admin port is pinned to 9901
+  because the differential harness's `StartReferenceProxy` hard-codes the
+  /ready wait probe to port `9901/tcp` and only exposes that admin port — the
+  SPEC §3 / planner-time-prose 9902 reference was a pre-harness-discipline
+  carryover; the differential infrastructure has converged on 9901 across all
+  pre-existing fixtures (0006, 0009, 0010, etc.).
 - Subject: envoy-go on the host; admin + listener on runner-allocated ports.
 - Backend: `test/fixtures/0011-http-fault/backends/backend.go` (Go HTTP/1.1)
   bound to a runner-allocated port; serves `200 OK` + body `backend\n` on `/`.

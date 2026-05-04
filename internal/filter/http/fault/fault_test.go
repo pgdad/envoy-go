@@ -476,10 +476,18 @@ func TestDecodeHeaders_DelayOnly(t *testing.T) {
 // TestDecodeHeaders_Combined verifies the combined delay+abort timer-callback
 // path per SPEC §5.4 + §11.3 + ADR-0102: delay 100% 50ms + abort 100% 503 →
 // DecodeHeaders returns StopIteration synchronously; the timer fires after
-// ~50ms and the callback invokes SendLocalReply (NOT ContinueDecoding) so the
-// upstream is never dialed. The wire response is the abort response shape
-// (sentStatus=503, sentBody="fault filter abort") arriving delay.fixed_delay
-// after the request.
+// ~50ms and the callback invokes SendLocalReply with the abort response shape.
+// The wire response is the abort response shape (sentStatus=503,
+// sentBody="fault filter abort") arriving delay.fixed_delay after the request.
+//
+// The callback also calls ContinueDecoding to wake the parked dispatch
+// goroutine (which is blocked in parkDecode after StopIteration was returned
+// synchronously). Without that wake-up, the chain's RunDecodeHeaders would
+// stay parked indefinitely even though localReplyDone is set; on resume it
+// observes localReplyDone=true and returns terminated=false, so the
+// ContinueDecoding signal is purely a parkDecode wake-up — the chain does NOT
+// re-iterate the decode side. This is the load-bearing fixture-0011 scenario-2
+// integration claim verified at Task 14.
 func TestDecodeHeaders_Combined(t *testing.T) {
 	fl, dcb := makeDelayFilter(t, stats.NewRegistry(), 50, 503)
 	start := time.Now()
@@ -503,8 +511,11 @@ func TestDecodeHeaders_Combined(t *testing.T) {
 	if got := dcb.Body(); got != "fault filter abort" {
 		t.Errorf("sentBody: got %q, want %q", got, "fault filter abort")
 	}
-	if got := dcb.continued.Load(); got != 0 {
-		t.Errorf("continued: got %d, want 0 (combined must call SendLocalReply, not ContinueDecoding)", got)
+	// continued == 1: the callback signals ContinueDecoding to wake parkDecode.
+	// The chain's localReplyDone gate makes the resumed iteration short-circuit
+	// immediately; the signal is a wake-up, not a re-iteration request.
+	if got := dcb.continued.Load(); got != 1 {
+		t.Errorf("continued: got %d, want 1 (combined wakes parkDecode after SendLocalReply)", got)
 	}
 }
 

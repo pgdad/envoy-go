@@ -913,3 +913,47 @@ $ python3 -c "import yaml; yaml.safe_load(open('test/fixtures/0011-http-fault/ex
 YAML OK
 $ go build ./...
 ```
+
+## Task 14 — Fixture 0011 driver/driver.go + StatsAsserter (4-scenario orchestration, 8 probes)
+
+**Commits:** TBD — this task's commit; TBD — SHA-fill follow-up
+**Notes:** This task lights up the differential gate for fixture 0011-http-fault end-to-end. Step 1 wrote `test/fixtures/0011-http-fault/driver/driver.go` (~330 LoC) per PLAN.md Task 14 skeleton (lines 2650–2802) + 0007a-cors / 0010-graceful-drain driver precedents: implements `fixture.Driver` (BackendCount=1 + SubjectListenerName="l_main" + ReferenceListenerPort=10001 + ReferenceBootstrap/SubjectConfig that render the fixture YAMLs via `text/template` with runtime-substituted ports + DriveReference/DriveSubject that issue the same 8-probe sequence and emit a deterministic per-probe assertion-log byte stream + ProbeAdmin issuing `GET /ready` against both admin endpoints) + the optional `fixture.BackendKindAware` (returning HTTPFault) + `fixture.StatsAsserter` (scrapes `/stats/prometheus` + asserts the 5 fault.* counters per SPEC §7.1 final-state matrix: `aborts_injected=4` for scenarios 2/3a/4b/4c, `delays_injected=3` for scenarios 1/2/3b, `faults_overflow=0`, `active_faults=0` final, `response_rl_injected=0` permanently per ADR-0107). The 8-probe sequence: scenario1 → /scenario1/anything (no headers) → expect 200+backend+delayed; scenario2 → /scenario2/anything → expect 503+abort-body+delayed (combined delay+abort); scenario3-wholesale → /scenario3-wholesale/anything → expect 418+abort-body+fast (wholesale-override demo, NO inherited delay); scenario3-baseline → /scenario3-baseline/anything → expect 200+backend+delayed (listener-level inheritance); scenario4-a → /scenario4 (no header) → expect 200+backend+fast (no match); scenario4-b → /scenario4 (x-fault-on: yes) → expect 503+abort+fast (match); scenario4-c → /scenario4 (X-FAULT-ON: yes) → expect 503+abort+fast (case-insensitive name); scenario4-d → /scenario4 (x-fault-on: YES) → expect 200+backend+fast (case-sensitive value mismatch). Per-probe log: `probe <id> status=<code> body=<quoted> elapsed=<bucket>` where bucket="fast" if elapsed<80ms else "delayed" (planner-time decision 11 threshold). Status TEXT intentionally excluded from logs per planner-time decision 7 (allow-listed for non-stdlib codes like 418). Helpers added per the 0004-h2 / 0010-graceful-drain precedents: `fixtureDir()` via `runtime.Caller(0)`; `mustReadFixtureFile`/`mustRender` (text/template); `httpProbe` (helpers.HTTPRoundTrip wrapper); `scrapeFaultStats`/`parseFaultPromBody` (Prometheus exposition parser keyed on `envoy_http_fault_<n>{envoy_http_conn_manager_prefix=ingress_http}` per SPEC §11.6). Compile-time interface assertions for `fixture.Driver` + `fixture.BackendKindAware` + `fixture.StatsAsserter`. Step 2 added blank-import `_ "github.com/esalaine/envoy-go/test/fixtures/0011-http-fault/driver"` in `test/differential/runner_test.go` (alphabetically after 0010-graceful-drain).
+
+The first execution exposed three pre-existing bugs in earlier-task deliverables that had to be fixed for the differential gate to fire end-to-end:
+
+1. **`test/fixtures/0011-http-fault/envoy.yaml` admin port (Task 12 deliverable)**: the SPEC §3 + PLAN line 2249 + README pinned reference admin to `:9902`, but `harness.StartReferenceProxy` exposes only `9901/tcp` and waits for /ready on 9901/tcp — every other fixture (0006, 0009, 0010, etc.) uses 9901. The 9902 was a pre-harness-discipline carryover. Changed envoy.yaml admin to `9901` and updated README.md's "Bootstrap discipline" bullet to reflect the corrected port and the cause.
+
+2. **`internal/filter/http/fault/fault.go` combined delay+abort timer-callback path (Task 5 deliverable)**: the timer callback called `f.dcb.SendLocalReply` then exited without signaling the parked dispatch goroutine, leaving `parkDecode` blocked indefinitely on `decodeResumeCh`. Manual probe of envoy-go subject confirmed: scenarios 1/3a/3b/4* all returned correct responses; scenario 2 (combined delay+abort) hung past the 8s curl timeout. Added `f.dcb.ContinueDecoding()` after `SendLocalReply` in the combined branch — this purely wakes `parkDecode`; the chain's `localReplyDone` gate makes the resumed iteration short-circuit immediately. Updated `TestDecodeHeaders_Combined` in `fault_test.go` to expect `continued == 1` (was `== 0`) with a comment explaining the wake-up semantics: the signal is a parkDecode wake-up, not a re-iteration request.
+
+3. **`internal/stats/name.go` SN2 dotted-rest flattening (Task 3 / ADR-0061 carryover)**: `flattenToProm` for the `http.<sp>.<rest>` case preserved `<rest>` verbatim, including any internal `.`. The first 17 stat names never had dots in the rest, but `fault.aborts_injected` (and the four siblings) do. envoy-go was emitting `envoy_http_fault.aborts_injected{envoy_http_conn_manager_prefix="ingress_http"}` — the literal period is invalid Prometheus syntax. Per SPEC §11.6 empirical pin: reference Envoy emits `envoy_http_fault_aborts_injected{...}` (underscore). Fixed by `strings.ReplaceAll(tail[dot+1:], ".", "_")` on the rest before forming the base. Existing `name_test.go` tests pass unchanged (their inputs had no internal dots in the rest).
+
+Step 3 verified `go build ./...` clean. Step 4 ran `go test -count=1 ./test/differential/ -run 'TestDifferential/0011-http-fault' -v` — PASSES end-to-end in 2.32s (the differential gate (e) fires for fixture 0011 — first time on the fault filter). Step 5 ran the full `TestDifferential` suite (12 fixtures): all PASS in 37.79s (no regressions). Gate-(a) verification: `go build ./...` clean; `go vet ./...` clean; `gofmt -l` clean (after applying gofmt to the driver.go doc-comment indentation); `golangci-lint run ./...` clean; `go test -race -short ./...` all PASS (29 packages). NO new ADR.
+**Outputs:**
+```
+$ go build ./...
+$ go test -count=1 -timeout=180s ./test/differential/ -run 'TestDifferential/0011-http-fault' -v
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0011-http-fault
+--- PASS: TestDifferential (2.32s)
+    --- PASS: TestDifferential/0011-http-fault (2.32s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.394s
+
+$ go test -count=1 -timeout=600s ./test/differential/ -run 'TestDifferential' -v
+--- PASS: TestDifferential (37.79s)
+    --- PASS: TestDifferential/0000-tcp-echo (1.53s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.22s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.25s)
+    --- PASS: TestDifferential/0003-http11-routing (1.23s)
+    --- PASS: TestDifferential/0004-h2-routing (1.77s)
+    --- PASS: TestDifferential/0005-prometheus-stats (1.96s)
+    --- PASS: TestDifferential/0006-access-log (11.05s)
+    --- PASS: TestDifferential/0007a-cors (1.34s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.72s)
+    --- PASS: TestDifferential/0008-listener-chain-match (2.40s)
+    --- PASS: TestDifferential/0009-admin-config-dump (1.98s)
+    --- PASS: TestDifferential/0010-graceful-drain (9.38s)
+    --- PASS: TestDifferential/0011-http-fault (1.96s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	37.873s
+```
