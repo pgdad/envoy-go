@@ -189,6 +189,17 @@ const (
 	// expect. Because the backend is a subprocess, the runner's in-process
 	// accept counter is NOT incremented.
 	HTTPFault BackendKind = 8
+	// HTTPHeaderMutation is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0012-http-header-mutation/backends/backend.go on the pre-
+	// allocated port. The backend serves / reflecting received request headers
+	// into the response body (one header per line, sorted for determinism since
+	// Go map iteration is non-deterministic) plus a single-value
+	// X-Resp-Test: backend-original and multi-value X-Multi: alpha, beta response
+	// headers (for OVERWRITE / APPEND multi-value testing per phase 10 SPEC §11.4).
+	// No TLS. Introduced by fixture 0012-http-header-mutation (phase 10 Task 11).
+	// Because the backend is a subprocess, the runner's in-process accept counter
+	// is NOT incremented.
+	HTTPHeaderMutation BackendKind = 9
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
