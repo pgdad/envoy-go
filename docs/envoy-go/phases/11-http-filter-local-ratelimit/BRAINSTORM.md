@@ -18,7 +18,7 @@ The HTTP filters family lists candidate filters at `ROADMAP.md` line 58: header 
 
 ### 1.1 What 11 delivers as a self-contained whole
 
-Phase 11 lands `envoy.filters.http.local_ratelimit` (the canonical Envoy local rate-limiting filter) under the 07.1 framework. Eight in-scope items:
+Phase 11 lands `envoy.filters.http.local_ratelimit` (the canonical Envoy local rate-limiting filter) under the 07.1 framework. Eight in-scope filter-implementation items, plus three artefact-level deliverables (11 total bullets):
 
 1. **New `internal/filter/http/localratelimit/` package** owning the filter implementation. Package directory + Go package identifier are both `localratelimit` (no underscore) — diverges from the underscore-preserving directory pattern established by `header_mutation` (which used the directory name `header_mutation/`). Rationale: the filter's name reads more naturally as a single concept ("local rate-limiting") without the word-break, and the no-underscore form aligns with `cors` + `fault` directory naming where the proto type-name was already a single token. The departure is captured explicitly in ADR-0114 so future filters can apply either convention deliberately. Files mirror the `internal/filter/http/fault/` shape: `local_ratelimit.go` (filter type + factory + decode method + token-bucket primitive + runtimeConfig), `local_ratelimit_test.go` (unit tests), `fuzz_test.go` (the 15th fuzzer in the repo — `FuzzLocalRateLimitConfigParse`), `doc.go` (package overview + 5-consumed/14-deferred decomposition). The package exposes `TypeURL` (the canonical type-URL constant `"type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit"`) + `New` (the `HTTPFilterFactory`) per the cors / fault / header_mutation precedent.
 
@@ -59,7 +59,7 @@ The brainstorm's POSITION is that phase 11 is **single-row at brainstorm time** 
 - **11.1 = token-bucket primitive + listener-only filter MVP**: the `tokenBucket` type + lazy-refill `tryConsume` + listener-level `runtimeConfig` parsing + 4-counter stats + rate-limited response. Differential fixture covers listener-only scenarios (basic-allow, basic-rate-limited, refill-after-fill_interval).
 - **11.2 = per-route TPFC + 4th fixture scenario**: per-route `LocalRateLimitPerRoute` parsing + bucket-pointer-isolation discipline + per-route-override fixture scenario.
 
-This split mirrors phase 10's anticipated-but-unused split and the 08.1 (admin-endpoints) + 08.2 (graceful-drain) shape. The brainstorm does NOT pre-commit to the split; that's the SPEC author's call. The single-row position is supported by the modest LoC estimate (~500–700 impl + ~200 tests + ~50 fuzzer + ~200 fixture = ~1000 total) and modest task count estimate (~12–16 tasks).
+This split mirrors phase 10's anticipated-but-unused split and the 08.1 (admin-endpoints) + 08.2 (graceful-drain) shape. The brainstorm does NOT pre-commit to the split; that's the SPEC author's call. The single-row position is supported by the modest LoC estimate (~500–700 impl + ~200 tests + ~50 fuzzer + ~200 fixture-Go-driver/backend + ~210 fixture-yaml/README = ~1200–1400 total when including yaml configs and README; ~1000 if counting Go code alone) and modest task count estimate (~12–16 tasks). Both estimates remain comfortably under ADR-0045's 1500 LoC / 25 task split-trigger upstream of either accounting.
 
 ### 1.5 Seed-stub alignment
 
