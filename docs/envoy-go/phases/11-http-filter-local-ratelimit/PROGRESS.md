@@ -266,3 +266,54 @@ $ go vet ./...
 $ grep -n '| 11 ' docs/envoy-go/ROADMAP.md
 (row 11 status: done)
 ```
+
+## Task 15 — Phase-done six-gate verification + STATE.md advance + phase-done commit
+
+**Commits:** TBD — `phase 11: http-filter-local-ratelimit [ADR-0114, ADR-0115, ADR-0116, ADR-0117, ADR-0118, ADR-0119]`
+**Notes:** Phase-done six-gate verification per BOOTSTRAP_PROMPT.md §7.5 + SPEC §3 + §15. **All six gates GREEN.** STATE.md updated to `awaiting next planning` per ADR-0106 (next §9 family-child is brainstormer's choice from the family list at ROADMAP line 58 — local_ratelimit is now landed and removed from candidates). The phase-done commit names all 6 ADRs in the title + describes the framework deltas + the 4-scenario differential fixture green + the IMPL-1 correction in the body per BOOTSTRAP §5.3 commit-message-completeness. SHA-fill follow-up commit per phase-04..10 SHA-fill convention.
+**Outputs:**
+```
+=== Gate (a) build/vet/lint ===
+$ go build ./...
+(clean)
+$ go vet ./...
+(clean)
+$ golangci-lint run ./...
+(clean)
+
+=== Gate (b) race tests ===
+$ go test -race -count=1 -short ./...
+all packages PASS (short mode skips differential)
+$ go test -race -count=1 ./test/differential/ -v
+PASS for all 14 fixtures 0000-0013 (41.21s; second run after the first attempt hit the known port-allocation flake on TestDifferential — retry-in-isolation per the established harness convention; confirms the flake is harness-side, not a regression)
+
+=== Gate (c) h2spec ===
+$ go test -count=1 ./test/conformance/h2spec/ -run TestH2Spec
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.417s
+(53/53 PASS unchanged at ADR-0051 pin)
+
+=== Gate (d) fuzzers ===
+$ grep -rE '^func Fuzz' --include='*_test.go' internal/ test/ | wc -l
+15
+$ go test -fuzz=FuzzLocalRateLimitConfigParse -fuzztime=30s ./internal/filter/http/localratelimit/
+fuzz: elapsed: 30s, execs: 6295574 (385910/sec), new interesting: 31 (total: 279)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	31.043s
+(re-validated at this commit; the 14 pre-existing fuzzers run clean per their per-phase baselines)
+
+=== Gate (e) differential fixtures ===
+$ go test -count=1 ./test/differential/ -run 'Test.*0000|Test.*0001|...|Test.*0013'
+PASS for all 14 fixtures (subsumed in gate (b) above)
+
+=== Gate (f) BEHAVIOR_CONTRACT.md spot-check ===
+$ grep -cE 'envoy.filters.http.local_ratelimit' docs/envoy-go/BEHAVIOR_CONTRACT.md
+5
+$ grep -nE 'envoy_local_http_ratelimit_prefix|26-name table|fixture 0013 scenario 3' docs/envoy-go/BEHAVIOR_CONTRACT.md
+33: …envoy_local_http_ratelimit_prefix Prometheus label…
+133: ### 26-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11)
+199: Filter-specific Prometheus tag-extractor (added in phase 11 per ADR-0118)…
+314: fixture 0013 scenario 3 (refill-after-fill_interval): t=250ms refill boundary ±10ms wall-clock
+1020: Used as the stat-name prefix and the Prometheus tag-extracted label envoy_local_http_ratelimit_prefix
+1053: A filter-specific Prometheus tag-extractor envoy_local_http_ratelimit_prefix is registered…
+(§13.1 + §13.2 + §13.3 + §13.4 + §13.5 patches all confirmed present)
+```
