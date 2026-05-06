@@ -85,12 +85,10 @@
 //     source/server/config_validation/server.cc:76 message).
 //  7. Validate status.code: absent → default 429 (per §11.4); explicit
 //     out-of-[400,600) → reject (PGV per §11.4).
-//  8. Capture mostSpecificHeaderMutationsWins flag (NOT applicable to
-//     local_ratelimit; this filter has no equivalent flag).
-//  9. Construct *tokenBucket via newTokenBucket(maxTokens, tokensPerFill, fillInterval).
-//  10. Construct *filterStats via newFilterStats(ctx.Stats, statPrefix).
-//  11. Construct *runtimeConfig.
-//  12. Return FilterInstanceFactory closure that allocates a fresh *filter
+//  8. Construct *tokenBucket via newTokenBucket(maxTokens, tokensPerFill, fillInterval).
+//  9. Construct *filterStats via newFilterStats(ctx.Stats, statPrefix).
+//  10. Construct *runtimeConfig.
+//  11. Return FilterInstanceFactory closure that allocates a fresh *filter
 //     per request bound to *runtimeConfig.
 //
 // Stats: 4 counters per stat_prefix (per SPEC §6.6 + §11.5):

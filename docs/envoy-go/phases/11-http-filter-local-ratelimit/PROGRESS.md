@@ -59,3 +59,25 @@ $ grep '^## ADR-' docs/envoy-go/DECISIONS.md | sed 's/.*ADR-0*\([0-9]*\):.*/\1/'
 $ git log -1 --format=%H -- docs/envoy-go/phases/11-http-filter-local-ratelimit/SPEC.md
 63c88ed1856ae70dc8c89415ca162c2eb57c8b69
 ```
+
+## Task 2 + Task 3 — `localratelimit/` package skeleton + `runtimeConfig` parser + `tokenBucket` primitive
+
+**Commits:** `bfc0529` — `phase 11: localratelimit/ package skeleton + runtimeConfig parser + tokenBucket primitive [ADR-0114, ADR-0115, ADR-0116]`
+**Notes:** Combined Task 2 + Task 3 per PLAN line 932 recommendation. Lands the new `internal/filter/http/localratelimit/` package with 5 files (~700 LoC production + tests): `doc.go` (package doc with iteration-protocol coverage + lazy-cache per-route discipline per IMPL-1 + ADR-0117), `local_ratelimit.go` (TypeURL + types + `runtimeConfig` parser + 6 explicit PGV/filter-internal validation checks per planner-time decision 3 + `New` factory returning `envoyhttp.HTTPFilter{Name, Decoder, Encoder}` per fault precedent + pass-through methods + DecodeHeaders STUBBED to `Continue`), `bucket.go` (`tokenBucket` primitive — lazy refill on access; `sync.Mutex` per bucket; `time.Now().UnixNano()` monotonic clock; LBP-1-adjacent per ADR-0116), `local_ratelimit_test.go` (13 New-validation tests including verbatim Envoy error string assertion `local rate limit token bucket fill timer must be >= 50ms`), `bucket_test.go` (7 mechanics tests + `TestTokenBucket_ConcurrentTryConsume` race-detector cycle test per planner-time decision 7). Three structural deviations from PLAN sketches (all sound; spec-compliance reviewer verified): (a) `FilterInstanceFactory` returns `envoyhttp.HTTPFilter{Name, Decoder, Encoder}` (not raw `*filter`) per `internal/filter/http/types.go` + `fault.go` precedent; (b) `filterStats` fields are `*stats.Counter` (not `*atomic.Int64`) per `internal/stats/registry.go.NewCounter` return type — preserves Walk/Freeze discipline per ADR-0061; (c) `DecodeData`/`EncodeData` parameter is `[]byte` per `types.go` interface (PLAN sketch's `http.Header` was a planner-time error). ADRs ADR-0114 (package shape — no-underscore directory `localratelimit/` aligns with cors/fault precedent; diverges from header_mutation's underscore-preserving pattern; boot-registration ordering router → cors → envoygotest → fault → header_mutation → localratelimit), ADR-0115 (runtimeConfig 5-field shape + 14-field silent-ignore decomposition + 6 validation checks + filter-internal `fill_interval >= 50ms` discipline with verbatim Envoy error string for boot-log byte-equivalence — Context corrected per IMPL-1 to drop the false `LocalRateLimitPerRoute` per-route container claim), ADR-0116 (`tokenBucket` Option-A lazy-refill on access + `time.Now().UnixNano()` monotonic-time + LBP-1-adjacent declaration with rationale for the lock-free-hot-path departure + ±10ms empirical refill-timing tolerance) all land at this commit per ADR-0044 first-use convention. Tests: 21 new test functions (13 filter + 8 bucket) all PASS under `-race`. Cosmetic doc.go/test-comment fix-ups bundled in this follow-up commit (drop dead step 8 reference to `mostSpecificHeaderMutationsWins`; tighten epsilon-refill bound comment in concurrent test) per code-quality reviewer Minor items.
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/filter/http/localratelimit/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	1.015s
+$ go vet ./...
+(clean)
+$ golangci-lint run ./...
+(clean)
+$ git diff --stat 44db49d..bfc0529 -- internal/filter/http/localratelimit/ docs/envoy-go/DECISIONS.md
+ docs/envoy-go/DECISIONS.md                                | 297 +++++++++++++++++
+ internal/filter/http/localratelimit/bucket.go             |  99 ++++++
+ internal/filter/http/localratelimit/bucket_test.go        | 151 +++++++++
+ internal/filter/http/localratelimit/doc.go                | 139 ++++++++
+ internal/filter/http/localratelimit/local_ratelimit.go    | 239 ++++++++++++++
+ internal/filter/http/localratelimit/local_ratelimit_test.go | 205 ++++++++++++
+ 6 files changed, 1130 insertions(+)
+```

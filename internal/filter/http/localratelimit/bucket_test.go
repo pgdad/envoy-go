@@ -135,17 +135,18 @@ func TestTokenBucket_ConcurrentTryConsume(t *testing.T) {
 	wg.Wait()
 
 	total := allowed.Load()
-	// Bound: total must be in [0, initialTokens + epsilonRefills*tokensPerFill] where
-	// epsilonRefills <= 1 since fillInterval=1h and the test runs sub-second.
+	// Bound: with fillInterval=1h and a sub-second test window, zero refill
+	// quanta can occur, so total must equal initialTokens exactly. The +1/-1
+	// band is kept as a robustness margin against unanticipated scheduler skew.
 	if total < 0 {
 		t.Errorf("total allowed: %d, want >= 0", total)
 	}
 	if total > initialTokens+1 {
-		t.Errorf("total allowed: %d, want <= %d (initialTokens + epsilonRefills*tokensPerFill=1)", total, initialTokens+1)
+		t.Errorf("total allowed: %d, want <= %d (no refill quanta possible during sub-second test)", total, initialTokens+1)
 	}
 	if total < initialTokens-1 {
 		// The 64*100=6400 attempts comfortably exceed initialTokens=1000, so
-		// total should saturate at initialTokens (modulo the epsilonRefills band).
+		// total should saturate at initialTokens.
 		t.Errorf("total allowed: %d, want >= %d (saturation)", total, initialTokens-1)
 	}
 }
