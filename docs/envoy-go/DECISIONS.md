@@ -5161,3 +5161,167 @@ Header-value formatter substitution is DEFERRED from phase 10. Specifically:
    - SPEC §2.1 (static-string HeaderValue scope for phase 10) — load-bearing scope definition.
    - BEHAVIOR_CONTRACT.md §13.1 `#### Does not yet apply to` — documents the deferral to operators.
 
+---
+
+## ADR-0114: `internal/filter/http/localratelimit/` package shape — no-underscore directory + extension-registry registration ordering
+
+**Status:** Accepted
+**Date:** 2026-05-05 (phase 11 Task 2 commit)
+**Doctrine:** ADR-0044 ADR-on-impl convention; ADR-0072 HTTPRegistry boot-fail-fast.
+**Lands-in-task:** Phase 11 Task 2 (package skeleton) + Task 7 (boot registration line in cmd/envoy-go/main.go).
+
+### Context
+
+Phase 11 lands `envoy.filters.http.local_ratelimit` as the FOURTH production HTTP filter under `internal/filter/http/` (after cors @ 07.1, fault @ 09, header_mutation @ 10). The proto type-name carries an underscore (`local_ratelimit`); the prior 3-of-4 filters had single-token proto type-names (`cors`, `fault`) or single-token-with-underscore-preserved (`header_mutation`). The package-naming question: directory + Go-package identifier should both be `localratelimit` (no underscore) to align with cors + fault, OR both be `local_ratelimit` to align with header_mutation's underscore-preserving pattern.
+
+### Decision
+
+**Directory + Go-package identifier are both `localratelimit` (no underscore).** The naming rule is: when the proto type-name is a single token (cors, fault), the Go package is the same single token; when the proto type-name carries an underscore, the Go package elides the underscore for Go-idiomatic single-token form (Go convention prefers single-token package names per Effective Go). Phase 10's `header_mutation/` is the lone underscore-preserving exception; phase 11 returns to the cors + fault precedent. No back-port of phase 10's directory rename — header_mutation/ stays as-is (a single-package-name divergence does not justify cross-package churn).
+
+The boot-registration ordering in `cmd/envoy-go/main.go` follows BRAINSTORM Decision 2's "router-first-then-alphabetical" stylistic discipline (codified at phase-09 brainstorm time + reaffirmed at phase 10): `router → cors → envoygotest → fault → header_mutation → localratelimit → Freeze`. The local_ratelimit registration line lands AFTER header_mutation's registration AND BEFORE the existing `header_mutation.RegisterPerRouteValidator(httpReg)` call (since per-route-validator registrations must precede `Freeze` per ADR-0072) — local_ratelimit does NOT register a per-route validator (no per-route invariants requiring boot-time validation; per-route TPFC entries are validated lazily at request-time via `buildRuntimeConfigPerRoute`).
+
+### Alternatives considered
+
+(a) **Underscore-preserving directory `local_ratelimit/` matching header_mutation's pattern** — rejected. Phase 10's header_mutation pattern was a single-precedent divergence from cors + fault; treating it as a flip would require back-porting cors + fault to underscore-preserving, generating cross-package churn for a stylistic preference. The 3-of-4 cors-precedent stance prevails.
+
+(b) **Snake-case Go package identifier `local_ratelimit` (Go-syntactic but non-idiomatic)** — rejected. Go convention strongly prefers single-token package names; the lint rule `package-comments` (golangci-lint) would flag the snake-case form.
+
+### Consequences
+
+- Future filter packages with proto type-names carrying multi-tokens follow the elide-underscore rule (e.g., `globalratelimit`, `extauthz`, `jwtauthn`); single-token proto type-names map to the single-token Go package directly.
+- ADR-0074 (filter set: cors + envoy_go_test) extends to {cors, envoy_go_test, router, fault, header_mutation, local_ratelimit} — the FIFTH production filter (router is terminal, distinct from observable filters).
+- `cmd/envoy-go/main.go` registration ordering at phase 11 phase-done: `router → cors → envoygotest → fault → header_mutation → localratelimit → header_mutation.RegisterPerRouteValidator → Freeze`. The local_ratelimit Register call inserts after the existing header_mutation Register and before the existing RegisterPerRouteValidator call (Task 7 lands the line).
+
+---
+
+## ADR-0115: `runtimeConfig` shape + 5-consumed/14-silent-ignored field decomposition + PGV constraint table + filter-internal `fill_interval ≥ 50ms` validation discipline
+
+**Status:** Accepted
+**Date:** 2026-05-05 (phase 11 Task 2 commit)
+**Doctrine:** ADR-0040 silent-ignore discipline; ADR-0072 HTTPRegistry boot-fail-fast; ADR-0101 runtimeConfig shape + parser pattern (extended).
+**Lands-in-task:** Phase 11 Task 2.
+
+### Context
+
+The LocalRateLimit proto carries 19 top-level fields; phase 11 consumes 5 (`stat_prefix`, `token_bucket{max_tokens, tokens_per_fill, fill_interval}`, `status{code}`). The same `LocalRateLimit` proto is reused for per-route TPFC entries (no separate per-route container type exists upstream — confirmed empirically at IMPL-1; see PROGRESS.md preamble). The remaining 14 fields are silently ignored at config-load time per ADR-0040 silent-ignore discipline (full deferral list at SPEC §2.1 + BEHAVIOR_CONTRACT §13.1 / §13.5).
+
+The validation surface decomposes into TWO classes per SPEC §11.1–§11.4 empirical pins:
+- PGV constraints (4 checks): `stat_prefix` non-empty, `max_tokens > 0`, `tokens_per_fill > 0` if explicitly set, `status.code ∈ [400, 600)` if explicitly set.
+- Filter-internal constraint (1 check): `fill_interval >= 50ms` — NOT a PGV constraint; the check fires AFTER proto unmarshal succeeds; the verbatim Envoy v1.37.2 error string is `local rate limit token bucket fill timer must be >= 50ms` per SPEC §11.2c empirical pin (`source/server/config_validation/server.cc:76`).
+
+### Decision
+
+`runtimeConfig` carries 5 fields:
+
+```go
+type runtimeConfig struct {
+    statPrefix string         // from cfg.StatPrefix (PGV non-empty per §11.1)
+    bucket     *tokenBucket   // closure-captured per filter-instance / per per-route entry
+    statusCode int            // from cfg.Status.Code (default 429 per §11.4)
+    body       []byte         // literal "local_rate_limited" (18 bytes; per §11.3 + ADR-0119)
+    stats      *filterStats   // 4 counters scoped by stat_prefix
+}
+```
+
+Validation runs as 6 explicit checks in `buildRuntimeConfig` (per planner-time decision 3):
+1. `cfg.StatPrefix != ""` — PGV per §11.1.
+2. `cfg.TokenBucket != nil` — implicit-required per §6.4.
+3. `cfg.TokenBucket.MaxTokens > 0` — PGV per §11.2a.
+4. `tokens_per_fill`: absent → default 1; explicit zero → reject per §11.2b-i + §11.2b-ii.
+5. `cfg.TokenBucket.FillInterval >= 50ms` — FILTER-INTERNAL not PGV per §11.2c; verbatim Envoy error string preserved for boot-log byte-equivalence.
+6. `cfg.Status.Code ∈ [400, 600)` if explicitly set; default 429 per §11.4.
+
+The 14 silent-ignored fields (organized by 8 family-clusters per SPEC §2.1):
+- Descriptor-action (4): `descriptors`, `rate_limits`, `always_consume_default_token_bucket`, `max_dynamic_descriptors`.
+- Runtime + shadow-mode (3): `filter_enabled`, `filter_enforced`, `request_headers_to_add_when_not_enforced`. **Divergence-window:** envoy-go silent-ignores; ref Envoy defaults to 0% OFF; fixture configs MUST set both to 100% per SPEC §1.1.
+- xDS cluster-state (1): `local_cluster_rate_limit`.
+- Response-side header injection (1): `response_headers_to_add`.
+- Per-connection lifecycle (1): `local_rate_limit_per_downstream_connection`.
+- Multi-stage limiting (1): `stage`.
+- X-RateLimit headers + vh policy (2): `enable_x_ratelimit_headers`, `vh_rate_limits`.
+- gRPC trailer mapping (1): `rate_limited_as_resource_exhausted`.
+
+### Alternatives considered
+
+(a) **Implicit-PGV via protoreflect-based runtime checks** — rejected per planner-time decision 3. No prior phase wires it; introducing it for one filter would diverge from existing explicit-check discipline at zero code-quality benefit.
+
+(b) **Filter-internal `fill_interval` check coalesced with PGV** — rejected. Envoy v1.37.2's empirical surface distinguishes the two error-paths (PGV envelope vs filter-internal); envoy-go's wire-equivalence claim (boot-log error string fidelity) requires preserving the filter-internal-not-PGV distinction at the surface.
+
+(c) **Authoring per-cluster deferral ADRs (ADR-0120 omnibus + 14 per-field ADRs analogous to fault's ADR-0104 pattern)** — rejected per SPEC §8.1 ADR-0120 collapse. The 14-field deferral is a documentation artefact captured at BEHAVIOR_CONTRACT §13.1 / §13.5, not a load-bearing decision worthy of standalone ADRs.
+
+### Consequences
+
+- ADR-0101 (runtimeConfig shape + parser pattern) extends with the 5-field local_ratelimit variant; the closure-capture + parse-at-New + read-only-shared-after-New discipline carries through unchanged.
+- Future shadow-mode phase wiring `filter_enabled` + `filter_enforced` runtime-key support widens the runtimeConfig with two new fields (`filterEnabledFraction` + `filterEnforcedFraction`); the existing 5-field shape is forward-compatible.
+- The verbatim Envoy error string `local rate limit token bucket fill timer must be >= 50ms` is encoded as a string literal in the filter; if Envoy v1.37.2's error string changes in a future Envoy bump (per ADR-0008's pin-bump discipline), the literal string in `local_ratelimit.go` must be updated in lockstep.
+
+---
+
+## ADR-0116: `tokenBucket` primitive — Option-A lazy-refill on access + monotonic-time semantics + LBP-1-adjacent declaration + ±10ms empirical refill-timing tolerance
+
+**Status:** Accepted
+**Date:** 2026-05-05 (phase 11 Task 3 commit)
+**Doctrine:** ADR-0061 stats Registry / LBP-1 invariant; ADR-0008 Envoy v1.37.2 pin (empirical evidence source).
+**Lands-in-task:** Phase 11 Task 3.
+
+### Context
+
+The token-bucket primitive must implement Envoy v1.37.2's local-ratelimit semantics: each `tryConsume` call decrements one token if available, else rejects; tokens refill at `tokens_per_fill` per `fill_interval` quantum, capped at `max_tokens`. Three implementation strategies were considered at BRAINSTORM time (per BRAINSTORM §2.4):
+
+- **Option A:** Lazy refill on access. Single mutex per bucket; refill computed on each `tryConsume` call from `time.Now() - lastRefillNs` quantization. No per-bucket goroutine.
+- **Option B:** Active timer-driven refill. `time.Ticker` per bucket; refill goroutine wakes every `fill_interval` to add tokens; cancel-on-OnDestroy plumbing.
+- **Option C:** Signal-channel-driven refill. Hybrid Option-B with explicit goroutine + channel to avoid Ticker drift.
+
+Empirical pin SPEC §11.7 measured Envoy v1.37.2's refill behavior across 99 trials sweeping delay 180→400ms (4ms granularity in tight band 196→204ms): zero spurious refills before t=200ms; zero missed refills at t≥200ms. The boundary is sharp at ≤5ms granularity (the measurement floor of Python `time.sleep` resolution on Linux). This empirically confirms that Envoy itself uses lazy refill (not active timer) — the refill happens on access at ≥ `last_refill + fill_interval`.
+
+### Decision
+
+**Option A: lazy refill on access, single `sync.Mutex` per bucket.**
+
+```go
+type tokenBucket struct {
+    maxTokens, tokensPerFill int64
+    fillInterval             time.Duration
+
+    mu           sync.Mutex
+    tokens       int64
+    lastRefillNs int64
+}
+
+func (b *tokenBucket) tryConsume() bool {
+    b.mu.Lock(); defer b.mu.Unlock()
+    nowNs := time.Now().UnixNano()
+    elapsedNs := nowNs - b.lastRefillNs
+    if refills := elapsedNs / int64(b.fillInterval); refills > 0 {
+        b.tokens += refills * b.tokensPerFill
+        if b.tokens > b.maxTokens { b.tokens = b.maxTokens }
+        b.lastRefillNs += refills * int64(b.fillInterval)
+    }
+    if b.tokens > 0 { b.tokens--; return true }
+    return false
+}
+```
+
+Time source: `time.Now().UnixNano()` carries Go ≥1.9's monotonic component for `time.Now()`-derived values; arithmetic across `time.Now()` calls advances monotonically.
+
+Empirical refill-timing tolerance: **±10ms** wall-clock around the configured `fill_interval` boundary. Narrowed from BRAINSTORM's ±20ms hypothesis per SPEC §11.7's 52-trial empirical envelope (boundary sharp at ≤5ms granularity; the ±10ms tolerance accommodates CI scheduling jitter on the measurement floor + a small safety margin). PLAN reserves widening as a fallback per planner-time decision 4 + SPEC §12 D4 if fixture 0013 scenario 3 flakes during phase 11 impl under heavy CI load.
+
+**LBP-1-adjacent declaration:** the closure-capture half of LBP-1 (the bucket lifetime is bounded by the closure-captured `*runtimeConfig` lifetime; matches phase 06.1 / 09 / 10 discipline) is preserved. The lock-free hot-path half (LBP-1's `Walk-under-RLock-plus-atomic-Load` for stats Registry) deliberately departs: the `elapsed → refills → tokens` computation is a multi-step compute-then-conditional-update sequence not amenable to a single CAS. Phase 11 is the FIRST production filter to declare LBP-1-succession-adjacent stance explicitly; future per-filter reviewers consult ADR-0116 as the precedent for stateful-resource filters that need locking.
+
+### Alternatives considered
+
+(a) **Option B (active timer-driven refill)** — rejected at BRAINSTORM time. Per-bucket goroutine + cancel-on-OnDestroy plumbing adds significant complexity (~50 LoC per bucket + goroutine-leak risk on OnDestroy + Ticker-drift concerns). Lazy-refill matches Envoy's empirical behavior and is mechanically simpler.
+
+(b) **Option C (signal-channel-driven refill)** — rejected for similar reasons; hybrid complexity without the Option-A simplicity payoff.
+
+(c) **Lock-free CAS-based hot path** — rejected. The `elapsed → refills → tokens` computation requires atomic-swap of multiple state fields; no single-CAS encoding exists short of packing all state into a single `uint64` (which would limit `maxTokens` to 32 bits and risk overflow). Mutex is the deliberate choice; ADR-0116 records this as a deliberate departure from LBP-1's lock-free clause.
+
+(d) **Wider refill-timing tolerance ±20ms (BRAINSTORM hypothesis)** — rejected at SPEC time per §1.1 amendment; SPEC §11.7's empirical evidence allows a tighter ±10ms with safety margin. PLAN reserves widening as a fallback per planner-time decision 4 + SPEC §12 D4 if CI flakes.
+
+### Consequences
+
+- The `tokenBucket` primitive is reusable in principle by future rate-limit filters (e.g., `global_ratelimit` per its per-process token-bucket fallback if it lands; phase 11 does NOT export the primitive — it stays unexported in `localratelimit/bucket.go`; future cross-filter reuse would require either a refactor extracting the primitive to a shared package OR re-implementation per the convention of avoiding cross-filter primitive sharing).
+- The race-detector cycle test `TestTokenBucket_ConcurrentTryConsume` validates the mutex discipline mechanically; the test is the canonical evidence that the LBP-1-adjacent declaration is sound.
+- Future shadow-mode phase wiring `filter_enforced` runtime-key support widens the lockstep discipline: when `filter_enforced` < 100%, `enforced` increments only on the rate-limited subset that's also enforced; `rate_limited` increments on the full rate-limited set. The `tokenBucket` primitive itself stays UNCHANGED — the lockstep change happens at the `DecodeHeaders` call site.
+- The ±10ms empirical envelope is encoded at BEHAVIOR_CONTRACT §13.3 timing-tolerances row (per SPEC §13.3); fixture 0013 scenario 3 enforces the band; if CI-load flakes surface, ADR-0116 §Consequences amends in-place per ADR-0089 to record the chosen mitigation (widen tolerance OR retry-with-deadline harness).
+
