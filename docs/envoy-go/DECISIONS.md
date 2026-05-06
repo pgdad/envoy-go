@@ -5218,7 +5218,7 @@ type runtimeConfig struct {
     statPrefix string         // from cfg.StatPrefix (PGV non-empty per §11.1)
     bucket     *tokenBucket   // closure-captured per filter-instance / per per-route entry
     statusCode int            // from cfg.Status.Code (default 429 per §11.4)
-    body       []byte         // literal "local_rate_limited" (18 bytes; per §11.3 + ADR-0119)
+    body       string         // literal "local_rate_limited" (18 bytes; per §11.3 + ADR-0119)
     stats      *filterStats   // 4 counters scoped by stat_prefix
 }
 ```
