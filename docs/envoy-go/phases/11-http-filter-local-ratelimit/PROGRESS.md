@@ -98,3 +98,25 @@ $ git diff --stat 71c0069..9f0737a
  internal/filter/http/localratelimit/local_ratelimit_test.go | 162 +++++++++++++++++++-
  3 files changed, 235 insertions(+), 12 deletions(-)
 ```
+
+## Task 5 — Per-route TPFC bucket independence + `Registry.NewCounterIfAbsent` framework primitive + ADR-0073 amendment
+
+**Commits:** `ea152a1` — `phase 11: per-route TPFC bucket independence + Registry.NewCounterIfAbsent + ADR-0073 amendment [ADR-0117]`
+**Notes:** Lands the per-route TPFC handling per SPEC §11.6 + ADR-0117 + the small `internal/stats.Registry.NewCounterIfAbsent` framework primitive (~30 LoC delta — needed because the stats Registry is Frozen at boot before HCM-build sees per-route TPFCs and the per-route stat names are data-driven by the operator's chosen `stat_prefix`). Restructured the factory closure: was `*filter{rc *runtimeConfig}` capturing one config; now `*filter{state *factoryState}` where `factoryState` carries `listenerRC *runtimeConfig` (eager, listener-level) + `perRoute sync.Map` (lazy-cache keyed by `*localratelimitv3.LocalRateLimit` per IMPL-1 — diverges from PLAN sketch's `*LocalRateLimitPerRoute` key per PROGRESS.md preamble) + `reg *stats.Registry`. New `factoryState.resolvePerRouteConfig(msg proto.Message) *runtimeConfig` performs nil-fallback + type-assertion fallback + `sync.Map.Load` fast-path + `LoadOrStore`-race-safe lazy construction via `buildRuntimeConfigPerRoute`. New `buildRuntimeConfigPerRoute(c *LocalRateLimit, reg *stats.Registry)` mirrors the listener-level 6-check validation (verbatim error strings preserved including the Envoy `local rate limit token bucket fill timer must be >= 50ms`); only divergence is `newFilterStatsIfAbsent` (post-Freeze idempotent) instead of `newFilterStats` (boot-time only). `DecodeHeaders` updated to call `f.dcb.RequestRouteConfig()` (no args — IMPL fix vs PLAN sketch's `(filterName)` arg; actual interface signature per `internal/filter/http/callbacks.go:36` is no-args; framework resolves the calling-filter name internally), unwrap via `state.resolvePerRouteConfig`, operate on resolved per-route or listener-level `*runtimeConfig`. **IMPL-1 substitutions applied** in code, tests, and ADR-0117 wording: `*LocalRateLimitPerRoute` → `*LocalRateLimit` everywhere; no `.GetRateLimit()` indirection (PLAN sketch's wrapping doesn't exist upstream); `TestDecodeHeaders_PerRouteOverride_IndependentBuckets` constructs two `*LocalRateLimit` directly, no wrapper. ADR-0117 Context paragraph cites IMPL-1 + the upstream proto truth in one sentence. ADR-0073 amendment paragraph appended in-place at the existing ADR-0073 body, noting wholesale-override extends to stateful per-route resources (per ADR-0117) + `NewCounterIfAbsent` post-Freeze idempotent registration (per forthcoming Task 6 ADR-0118 amendment to ADR-0061). All 16 existing localratelimit tests migrated from `inst.rc.X` to `inst.state.listenerRC.X` access pattern. New `TestDecodeHeaders_PerRouteOverride_IndependentBuckets` validates the §11.6 empirical claim mechanically (3-way pointer-distinctness rcA/rcB/rcListener; rcA.bucket != rcB.bucket; rcA.stats != rcB.stats; idempotent re-resolution; cross-bucket isolation: drain rcA's bucket → rcB.tryConsume still succeeds). Three new `TestNewCounterIfAbsent_*` unit tests in `internal/stats/registry_test.go` (RegistersWhenAbsent / ReturnsExisting / BypassesFreeze). Total tests: 29 in localratelimit + 3 in stats. All PASS under `-race`. **Code-quality reviewer flagged 3 Important items + 3 Minor items** all bundled into this follow-up commit: (a) `doc.go` New-body discipline list steps 10-11 stale (didn't reflect the factoryState restructure) — corrected to 12 numbered steps with explicit factoryState wrapping at step 11; (b) `internal/stats/registry.go` `NewCounter` lacks cross-reference to the new `NewCounterIfAbsent` sibling — added a 3-line forward-pointer comment; (c) `resolvePerRouteConfig`'s wasted-allocation comment expanded to note `NewCounterIfAbsent`'s pointer-identity guarantee + a singleflight optimization TODO for future high-cardinality workloads. The 3 Minor items (test-self-containment fourth assertion, ADR forward-pending phrasing, buildRuntimeConfigPerRoute KEEP-IN-SYNC comment) deferred per reviewer assessment "low-risk additions that improve maintainability but do not block forward progress".
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/filter/http/localratelimit/... ./internal/stats/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	1.017s
+ok  	github.com/esalaine/envoy-go/internal/stats	1.025s
+$ go vet ./...
+(clean)
+$ golangci-lint run ./...
+(clean)
+$ git diff --stat c9e89ba..ea152a1
+ docs/envoy-go/DECISIONS.md                                  |  74 ++++++++
+ internal/filter/http/localratelimit/local_ratelimit.go      | 156 +++++++++++++--
+ internal/filter/http/localratelimit/local_ratelimit_test.go | 109 ++++++++++-
+ internal/stats/registry.go                                  |  31 ++
+ internal/stats/registry_test.go                             |  44 +++++
+ 5 files changed, 397 insertions(+), 17 deletions(-)
+```

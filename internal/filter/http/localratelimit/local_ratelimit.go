@@ -316,7 +316,15 @@ func (s *factoryState) resolvePerRouteConfig(msg proto.Message) *runtimeConfig {
 	// Lazy construction. Race-safe via sync.Map's LoadOrStore: if two goroutines
 	// race to construct the per-route rc, only one allocation wins; the loser's
 	// rc is GC'd (its registered counters are NOT GC'd since they're already in
-	// the Registry, but they're idempotent and equivalent to the winner's).
+	// the Registry, but they're idempotent and equivalent to the winner's via
+	// NewCounterIfAbsent's pointer-identity guarantee, so the winner and loser
+	// observe the same Counter instances).
+	//
+	// Future optimization for high-cardinality per-route maps under heavy initial
+	// concurrency: a singleflight wrapper would dedupe the duplicate
+	// buildRuntimeConfigPerRoute call. Not justified for the current low-
+	// cardinality workload; revisit if profiling at fixture-0013-scale shows
+	// repeated wasted allocations under cold-start fan-out.
 	fresh, err := buildRuntimeConfigPerRoute(perRoute, s.reg)
 	if err != nil {
 		// Per-route TPFC parsing failed. Treat as "inherit listener" to keep

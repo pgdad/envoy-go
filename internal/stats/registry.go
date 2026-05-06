@@ -72,6 +72,10 @@ func NewRegistry() *Registry {
 // NewCounter registers and returns a counter under the given hierarchical-
 // dotted name. Panics if frozen, on invalid name (per nameRE), or on
 // duplicate registration. The returned Counter is safe for concurrent Inc.
+//
+// For post-Freeze idempotent registration (e.g., per-route HTTP filter stats
+// whose stat_prefix is data-driven and not knowable at boot time), see
+// NewCounterIfAbsent below (added by phase 11 per ADR-0117).
 func (r *Registry) NewCounter(name string) *Counter {
 	r.checkName(name)
 	c := &Counter{name: name}

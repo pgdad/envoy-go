@@ -87,9 +87,13 @@
 //     out-of-[400,600) → reject (PGV per §11.4).
 //  8. Construct *tokenBucket via newTokenBucket(maxTokens, tokensPerFill, fillInterval).
 //  9. Construct *filterStats via newFilterStats(ctx.Stats, statPrefix).
-//  10. Construct *runtimeConfig.
-//  11. Return FilterInstanceFactory closure that allocates a fresh *filter
-//     per request bound to *runtimeConfig.
+//  10. Construct listener-level *runtimeConfig.
+//  11. Wrap in *factoryState{listenerRC, perRoute sync.Map, reg ctx.Stats}
+//     for the per-route lazy-cache discipline per ADR-0117.
+//  12. Return FilterInstanceFactory closure that allocates a fresh *filter
+//     per request bound to *factoryState (the closure-captured shared state;
+//     per-route *runtimeConfig instances are built lazily at first-resolve
+//     time and cached in factoryState.perRoute).
 //
 // Stats: 4 counters per stat_prefix (per SPEC §6.6 + §11.5):
 //
