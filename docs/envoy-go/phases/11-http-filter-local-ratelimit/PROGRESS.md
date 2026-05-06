@@ -208,3 +208,15 @@ $ git diff --stat 21d7c10..d1da8ca
  test/fixtures/0013-http-local-ratelimit/backends/backend.go | 24 ++++++++++++++++++++++++
  1 file changed, 24 insertions(+)
 ```
+
+## Task 11 — Fixture 0013 `envoy.yaml` + `envoy-go.yaml` bootstraps (4-listener pre-configured topology)
+
+**Commits:** `46866f0` — `phase 11: fixture 0013 bootstraps — 4-listener pre-configured topology`
+**Notes:** Lands the dual-bootstrap YAML files per planner-time decision 8 (the 4-listener pre-configured topology — diverges from SPEC §7.1's two-listener+teardown layout to fit the existing differential-fixture harness's single-Drive-call contract; bucket isolation provided at boot by listener-distinct factories). FOUR listeners in each bootstrap: `l_s1` (cap=10, fill=10, interval=1s, stat_prefix=foo), `l_s2` (cap=2, fill=2, interval=60s, stat_prefix=bar), `l_s3` (cap=1, fill=1, interval=200ms, stat_prefix=baz), `l_per_route` (listener-level cap=10/stat_prefix=qux + per-route `/strict` TPFC override cap=1/stat_prefix=strict + no-override `/loose`). All listeners explicitly set `filter_enabled` + `filter_enforced=100%` per SPEC §1.1 amendment with unique runtime_keys per listener-per-filter to avoid Envoy's runtime-key cross-contamination. Both bootstraps use port placeholders (`{{.AdminPort}}`, `{{.LS1Port}}`, `{{.LS2Port}}`, `{{.LS3Port}}`, `{{.LPerRoutePort}}`, `{{.BackendPort}}`) substituted by the runner via Go `text/template`. **IMPL-1 substitution applied** to the per-route TPFC entry per `/strict`: the `@type` URL is `...LocalRateLimit` (NOT `...LocalRateLimitPerRoute` — which doesn't exist upstream); the fields go directly under the message (NO `rate_limit:` wrapper). Difference between the two YAMLs: cluster type `STRICT_DNS` (envoy.yaml — reference Envoy needs DNS resolution to `host.docker.internal` since it runs in a container) vs `STATIC` (envoy-go.yaml — envoy-go convention; 127.0.0.1 backend address since envoy-go runs in-process). The `filter_enabled` + `filter_enforced` fields are PRESENT in envoy-go.yaml even though envoy-go silent-ignores them per SPEC §2.1 cluster 2 — field presence ensures byte-equivalent config-load behavior across reference + subject. Reviews: skipped subagent dispatch — YAML is verbatim from the PLAN sketch with the IMPL-1 substitution rule applied carefully + ports kept consistent.
+**Outputs:**
+```
+$ git diff --stat d1da8ca..46866f0
+ test/fixtures/0013-http-local-ratelimit/envoy-go.yaml | 159 ++++++++++++++++++++++
+ test/fixtures/0013-http-local-ratelimit/envoy.yaml    | 159 ++++++++++++++++++++++
+ 2 files changed, 318 insertions(+)
+```
