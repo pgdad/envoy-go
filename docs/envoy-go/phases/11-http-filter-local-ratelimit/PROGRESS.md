@@ -46,7 +46,7 @@ The nine planner-time deferred decisions reproduced verbatim from PLAN.md so thi
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** cbf07eb — initial PROGRESS.md create + preamble; this follow-up commit — IMPL-1 settle + SHA-fill.
+**Commits:** `cbf07eb` — `phase 11: PROGRESS preamble + planner-time decision resolution`
 **Notes:** Created PROGRESS.md; verified 15 of 16 preconditions per PLAN §"Execution preconditions"; precondition 11 (`LocalRateLimitPerRoute` proto present) FAILED at cold-start AND remained failed after a v1.37.0 bump attempt — confirmed at upstream Envoy v1.37.2 source that no such proto exists. Settled at the follow-up commit by IMPL-1 (substitution `*LocalRateLimitPerRoute` → `*LocalRateLimit`; affects Tasks 2, 5, 11, 14, 16); see preamble. phase-11 SPEC + PLAN confirmed present in HEAD; SPEC at 63c88ed; ADR tail at 0113 (next-free 0114); internal/filter/http/localratelimit/ absent (Task 2 lands); SN9 absent (Task 6 lands); fixture.HTTPLocalRateLimit absent (Task 9 lands). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention; ADRs land at first-use commit per PLAN's ADR table).
 **Outputs:**
 ```
