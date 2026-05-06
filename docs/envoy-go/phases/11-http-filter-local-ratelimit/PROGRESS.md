@@ -269,7 +269,7 @@ $ grep -n '| 11 ' docs/envoy-go/ROADMAP.md
 
 ## Task 15 — Phase-done six-gate verification + STATE.md advance + phase-done commit
 
-**Commits:** TBD — `phase 11: http-filter-local-ratelimit [ADR-0114, ADR-0115, ADR-0116, ADR-0117, ADR-0118, ADR-0119]`
+**Commits:** `1de512d` — `phase 11: http-filter-local-ratelimit [ADR-0114, ADR-0115, ADR-0116, ADR-0117, ADR-0118, ADR-0119]`
 **Notes:** Phase-done six-gate verification per BOOTSTRAP_PROMPT.md §7.5 + SPEC §3 + §15. **All six gates GREEN.** STATE.md updated to `awaiting next planning` per ADR-0106 (next §9 family-child is brainstormer's choice from the family list at ROADMAP line 58 — local_ratelimit is now landed and removed from candidates). The phase-done commit names all 6 ADRs in the title + describes the framework deltas + the 4-scenario differential fixture green + the IMPL-1 correction in the body per BOOTSTRAP §5.3 commit-message-completeness. SHA-fill follow-up commit per phase-04..10 SHA-fill convention.
 **Outputs:**
 ```
