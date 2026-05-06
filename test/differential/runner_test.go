@@ -35,6 +35,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0010-graceful-drain/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0011-http-fault/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0012-http-header-mutation/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0013-http-local-ratelimit/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
