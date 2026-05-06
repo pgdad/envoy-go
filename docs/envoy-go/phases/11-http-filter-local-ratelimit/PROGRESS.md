@@ -177,3 +177,19 @@ $ git diff --stat 60bac1b..f77385e
  internal/filter/http/localratelimit/fuzz_test.go | 39 +++++++++++++++++++++++
  1 file changed, 39 insertions(+)
 ```
+
+## Task 9 — Fixture infrastructure: `BackendKind` enum extension + `runner_test.go` spawn helper
+
+**Commits:** `21d7c10` — `phase 11: fixture 0013 infrastructure — BackendKind enum + spawn helper`
+**Notes:** Trivial 2-file delta per planner-time decision 9 + phase-10 Task 11 precedent. Adds `HTTPLocalRateLimit BackendKind = 10` to `test/differential/fixture/fixture.go` (after the existing `HTTPHeaderMutation BackendKind = 9` from phase 10) + `startHTTPLocalRateLimitBackend` spawn helper to `test/differential/runner_test.go` (mirrors `startHTTPHeaderMutationBackend`) + the matching `fixture.HTTPLocalRateLimit` switch case in `runFixture`'s backend-spawn dispatch. Per the PLAN's option (b) recommendation, the blank-import for the fixture driver is DEFERRED to Task 13 (the driver landing); Task 9's commit is atomic-by-itself (compiles cleanly without the driver). The 4-listener topology fits within the existing `fixture.MultiListenerDriver` contract introduced in phase 07.2 (`test/differential/fixture/fixture.go:294-299`); no per-scenario teardown primitive is added to the harness. Reviews: skipped subagent dispatch — the change is mechanical pattern-match against phase 10's precedent + verified via `go vet ./...` clean + `go build ./test/differential/...` clean.
+**Outputs:**
+```
+$ go vet ./...
+(clean)
+$ go build ./test/differential/...
+(clean)
+$ git diff --stat f77385e..21d7c10
+ test/differential/fixture/fixture.go |  9 +++++++++
+ test/differential/runner_test.go     | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+```
