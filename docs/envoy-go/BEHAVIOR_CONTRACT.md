@@ -30,6 +30,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Admin /server_info (DRAINING) | The `state` field IS asserted byte-equal (`"DRAINING"`) when both proxies are in DRAINING. Other fields per ADR-0088 allow-list. Inherits ADR-0088 allow-list for non-state fields (version, uptime_*, command_line_options, hot_restart_version, node). |
 | HTTP filter `envoy.filters.http.fault` | Per-request equivalence on abort response shape (status + 4-header set + body byte-exact `fault filter abort`), delay timing (±10ms tolerance), per-route wholesale-override resolution, headers-field exact-match gate, and stat counter increments under the per-scenario differential gate (fixture 0011-http-fault). NOT asserted: header-driven fault path (deferred — ADR-0104), response_rate_limit (deferred), abort.grpc_status (deferred), HeaderMatcher non-exact variants. |
 | HTTP filter `envoy.filters.http.header_mutation` | Per-request equivalence on post-mutation request headers (visible at upstream backend) and post-mutation response headers (visible at downstream client) under listener-level + per-route 3-tier configurations, including AppendAction × 4 + Remove + `keep_empty_value` boundary + multi-valued header collapse / preserve semantics + `most_specific_header_mutations_wins` cross-tier ordering (both flag values). Boot-time enforcement of the 6-name protected-header set per ADR-0111 + phase 10 §11.1. Differential gate fixture 0012-http-header-mutation. NOT asserted: header-value formatter substitution (deferred — ADR-0113), `query_parameter_mutations` (deferred — ADR-0112), H2 differential coverage. |
+| HTTP filter `envoy.filters.http.local_ratelimit` | 0013-http-local-ratelimit: scenario1: 5 reqs / cap=10 / fill=10 / interval=1s — 5×200; scenario2: 5 reqs / cap=2 — 2×200 + 3×429 (§11.3 wire shape); scenario3: 3 reqs / cap=1 / fill=1 / interval=200ms (refill ±10ms per §11.7); scenario4: 3+3 reqs interleaved /strict + /loose — wholesale-override (§11.6). Per-scenario tolerance per §13.3 timing-tolerances; lowercase wire-form 4-header set on 429; counter deltas across 4 stat names with `envoy_local_http_ratelimit_prefix` Prometheus label. NOT asserted: descriptor-action path (deferred — ADR-0120 family), runtime shadow-mode (deferred), X-RateLimit headers (deferred), H2 differential coverage. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -129,7 +130,7 @@ Rule SN7: Histograms are not emitted by 06.1. (Forward-looking.)
 Rule SN8: Per-endpoint cluster stats are not emitted by 06.1. (Forward-looking.)
 ```
 
-### 22-name table (introduced by phase 06.1; extended by phase 09)
+### 26-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11)
 
 `<stat_prefix>` is read from HCM config (already plumbed from phase 04). `<addr>` is the listener bind address normalized like Envoy does (e.g., `0.0.0.0:10000` → `0.0.0.0_10000`). `<n>` is the cluster name as configured in the bootstrap.
 
@@ -186,7 +187,18 @@ phase 09 §11.6 empirical pin); envoy-go matches the surface for differential
 parity per ADR-0107 route A. When `response_rate_limit` lands in a future
 phase, the same name carries the actual count.
 
-**Total: 22 internal names** (17 from 06.1 + 5 from 09). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
+**Local rate-limit filter — 4 names (introduced by phase 11):**
+
+| Internal name | Type | Source | Filter | Description |
+|---|---|---|---|---|
+| `<stat_prefix>.http_local_rate_limit.enabled`     | counter | filter | local_ratelimit | every request reaching the filter (§11.5) |
+| `<stat_prefix>.http_local_rate_limit.ok`          | counter | filter | local_ratelimit | request not rate-limited (`tryConsume` → true; §11.5) |
+| `<stat_prefix>.http_local_rate_limit.rate_limited`| counter | filter | local_ratelimit | request rate-limited (`tryConsume` → false; §11.5) |
+| `<stat_prefix>.http_local_rate_limit.enforced`    | counter | filter | local_ratelimit | request rate-limited AND enforced (lockstep with `rate_limited` under MVP per ADR-0118; §11.5) |
+
+**Filter-specific Prometheus tag-extractor (added in phase 11 per ADR-0118):** `<stat_prefix>.http_local_rate_limit.<counter>` extracts the `<stat_prefix>` segment into the Prometheus label `envoy_local_http_ratelimit_prefix`. NOTE: tag-extraction collisions occur if `<stat_prefix>` matches an Envoy-internal tag-extractor name (e.g. `listener` collides with `envoy.listener_address`); the differential fixture 0013 uses safe values (`foo`, `bar`, `baz`, `qux`, `strict`).
+
+**Total: 26 internal names** (17 from 06.1 + 5 from 09 + 4 from 11). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
 
 ### Twin-series filter discipline (per empirical-verification scrape)
 
@@ -297,6 +309,9 @@ Timing is not compared by default. A phase may opt in to latency bounds (p50 / p
   driver bucketizes elapsed timings (fast vs delayed) to absorb CI scheduling
   jitter while still distinguishing the wholesale-override no-delay path from
   the inherited-delay path.
+
+- **Local rate-limit token-bucket refill boundary: ±10ms (per phase 11 ADR-0116 + SPEC §11.7 empirical pin).**
+  fixture 0013 scenario 3 (refill-after-fill_interval): t=250ms refill boundary ±10ms wall-clock. Per ADR-0116 + §11.7 empirical (BRAINSTORM ±20ms hypothesis narrowed; PLAN author may widen back to ±20ms with retry-with-deadline harness if CI flakes per SPEC §12 D4).
 
 ---
 
@@ -990,6 +1005,80 @@ x-resp-added: added-via-add-if-absent
 
 (Multi-value `x-multi`: OVERWRITE collapsed `alpha`/`beta` to single `OVERWRITTEN`, then APPEND added `APPENDED`. Final response carries 2 `x-multi` values per phase 10 §11.4.)
 
+### envoy.filters.http.local_ratelimit
+
+Phase 11 ships `envoy.filters.http.local_ratelimit` per the canonical Envoy v1.37.2 filter spec. envoy-go consumes 5 of 19 top-level fields and silent-ignores the other 14 per the deferral list below + ADR-0040 silent-ignore discipline.
+
+#### Asserted equivalence (per phase 11 SPEC §11)
+
+When `envoy.filters.http.local_ratelimit` is present in `http_filters`, envoy-go MUST emit the same rate-limit decision (allow or 429) as reference Envoy v1.37.2 for the canonical scenarios: basic-allow, basic-rate-limited, refill-after-fill_interval, and per-route wholesale-override. The four stat counter increments (`enabled`, `ok`, `rate_limited`, `enforced`) MUST be equal after each scenario under the lockstep MVP invariant (`enforced == rate_limited` at every step per ADR-0118). Per-route bucket independence MUST hold: listener-level state is NOT touched for per-route requests.
+
+**Consumed fields (5):**
+
+| Proto field | envoy-go behavior |
+|---|---|
+| `stat_prefix` | Required (PGV non-empty per ADR-0115). Used as the stat-name prefix and the Prometheus tag-extracted label `envoy_local_http_ratelimit_prefix` value. |
+| `token_bucket.max_tokens` | Required (PGV `> 0` per shared `TokenBucket` proto). Initial bucket fill = `max_tokens`. |
+| `token_bucket.tokens_per_fill` | Optional; default `1` (matches Envoy proto default). PGV `> 0` if explicitly set. |
+| `token_bucket.fill_interval` | Required. Filter-internal validation: `≥ 50ms` (matches Envoy v1.37.2 filter-internal check; error string verbatim: `local rate limit token bucket fill timer must be >= 50ms`). NOT a PGV constraint per ADR-0115. |
+| `status.code` | Optional; default 429. PGV `[400, 600)` if explicitly set. Status text follows RFC 7231 (`Too Many Requests` for 429). |
+
+#### Token-bucket primitive (per ADR-0116)
+
+Lazy refill on access (Option A); single `sync.Mutex` per bucket; no per-bucket goroutine; `time.Now().UnixNano()` monotonic clock (Go ≥1.9 guarantee). Hot-path: 5–10 nanoseconds typical (compute elapsed → integer-divide by `fill_interval` → conditional add → decrement). LBP-1-adjacent discipline: the lazy-refill approach avoids goroutine proliferation per-bucket under high-cardinality per-route configs.
+
+#### Per-route override semantics (per ADR-0117 + ADR-0073 amendment)
+
+Wholesale-override per ADR-0073 + ADR-0117 (ADR-0073 amendment). Each per-route TPFC entry (`*LocalRateLimit` proto; same type as listener-level) runs through `New` at config-load time, allocating its own `*runtimeConfig` + own `*tokenBucket` + own `*filterStats`. The 3-tier `PerRouteConfig.Resolve` (Route > VirtualHost > RouteConfiguration) picks the most-specific config per request. Listener-level state is NOT touched for per-route requests (per §11.6 empirical confirmation). This is the FIRST production filter in envoy-go where per-route TPFC override implies independent stateful resources; cors / fault / header_mutation per-route configs are data-only.
+
+#### Rate-limited response wire shape (per ADR-0119 + SPEC §11.3)
+
+- Status: `429 Too Many Requests`
+- Body: `local_rate_limited` (18 bytes ASCII; NO trailing newline)
+- Headers in lexicographic order: `content-length: 18`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`
+- Framing: Content-Length
+
+The `SendLocalReply` mechanism mirrors fault abort (per ADR-0102 + ADR-0103). The 4-header set is lowercase wire-form; `server: envoy` (NOT `envoy-go`) per empirical pin §11.3.
+
+#### Allow-path response (per SPEC §11.8)
+
+NO `x-ratelimit-*` headers added by the filter on either side (request or response). `enable_x_ratelimit_headers` is a silent-ignored field in phase 11 (see § Silent-ignored fields below). Standard HCM/router headers (`server`, `date`, `x-envoy-*`) are unrelated to this filter.
+
+#### MVP invariant (per ADR-0118)
+
+`enforced == rate_limited` at every step. The `enforced` counter increments lockstep with `rate_limited` under the phase 11 MVP. Future shadow-mode phase widens to `enforced ≤ rate_limited` when `filter_enforced` runtime-key support lands.
+
+#### Stats (per SPEC §11.5 + Rule SN9)
+
+Four counters per `stat_prefix`: `http_local_rate_limit.enabled`, `http_local_rate_limit.ok`, `http_local_rate_limit.rate_limited`, `http_local_rate_limit.enforced`. A filter-specific Prometheus tag-extractor `envoy_local_http_ratelimit_prefix` is registered to extract the `<stat_prefix>` segment from the stat name. See `## Stat-name mapping ### 26-name table` for the full table.
+
+#### Silent-ignored fields (14, organized by family)
+
+- *Descriptor-action* (4): `descriptors`, `rate_limits`, `always_consume_default_token_bucket`, `max_dynamic_descriptors` — couples to `global_ratelimit` future phase.
+- *Runtime + shadow-mode* (3): `filter_enabled`, `filter_enforced`, `request_headers_to_add_when_not_enforced` — couples to Runtime + hot restart family. **Note:** reference Envoy defaults `filter_enabled` + `filter_enforced` to 0% (off); fixture configs MUST set both to 100% explicitly for differential equivalence. envoy-go's silent-ignore is equivalent to "always-100%" — divergence-window applies if user omits these fields outside the fixture context.
+- *xDS cluster-state* (1): `local_cluster_rate_limit` — couples to xDS / dynamic config family.
+- *Response-side header injection* (1): `response_headers_to_add`.
+- *Per-connection lifecycle* (1): `local_rate_limit_per_downstream_connection`.
+- *Multi-stage limiting* (1): `stage` — couples to descriptor-action subsystem.
+- *X-RateLimit headers + vh policy* (2): `enable_x_ratelimit_headers`, `vh_rate_limits`.
+- *gRPC trailer mapping* (1): `rate_limited_as_resource_exhausted` — couples to gRPC family.
+
+#### Empirical evidence (rate-limited wire shape from phase 11 SPEC §11.3)
+
+```
+$ curl -isS http://127.0.0.1:10000/  # after bucket exhausted (tokens=0)
+
+HTTP/1.1 429 Too Many Requests
+content-length: 18
+content-type: text/plain
+date: <RFC1123>
+server: envoy
+
+local_rate_limited
+```
+
+(18-byte body `local_rate_limited`, no trailing newline. 4-header set in lexicographic order. Content-Length framing.)
+
 ### Empirical evidence (413 overflow)
 
 **Probe configuration:** chain `[envoy.filters.http.buffer, envoy.filters.http.router]` with `Buffer{max_request_bytes: 1024}`. Listener `per_connection_buffer_limit_bytes: 1024`. Route `/` → STRICT_DNS cluster `c0` (nginx backend).
@@ -1360,3 +1449,24 @@ tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,
 - xDS LDS dynamic listener configuration (xDS family).
 - `direct_source_prefix_ranges` chain-match dimension (bundled with proxy-protocol filter phase).
 - HTTP/3 + QUIC listener filters (HTTP/3 family).
+
+---
+
+## Forward-pointer notes
+
+### Phase 11 forward-pointer notes
+
+**Deferred field families** (silent-ignored per ADR-0040; see `### envoy.filters.http.local_ratelimit ### Silent-ignored fields` above + phase 11 SPEC §2.1 for the full 14-field list):
+
+- Descriptor-action subsystem (4 fields) → couples to `global_ratelimit` future phase under `BOOTSTRAP_PROMPT.md` §9 HTTP filters family.
+- Runtime + shadow-mode subsystem (3 fields, including `filter_enabled` and `filter_enforced` `RuntimeFractionalPercent` fields) → couples to Runtime + hot restart family. **Divergence-window:** envoy-go silent-ignores these fields; reference Envoy defaults both to 0% (off). Differential fixture configs MUST set both to 100% explicitly; users running envoy-go with these fields set to non-100% values will diverge from Envoy (envoy-go behaves as always-100%, Envoy honors the percentage).
+- xDS cluster-state (1 field: `local_cluster_rate_limit`) → couples to xDS / dynamic config family.
+- Response-side header injection (1 field: `response_headers_to_add`) → standalone follow-on.
+- Per-connection lifecycle (1 field: `local_rate_limit_per_downstream_connection`) → standalone follow-on.
+- Multi-stage limiting (1 field: `stage`) → couples to descriptor-action subsystem.
+- X-RateLimit headers + vh policy (2 fields: `enable_x_ratelimit_headers`, `vh_rate_limits`) → standalone follow-on.
+- gRPC trailer mapping (1 field: `rate_limited_as_resource_exhausted`) → couples to gRPC family.
+
+**Tag-extraction collision quirk:** when `local_ratelimit.stat_prefix` matches an Envoy-internal tag-extractor name (`listener`, `http`, `cluster`, etc.), Envoy v1.37.2 mangles the Prometheus metric name. envoy-go's tag-extractor registration replicates the standard non-collision case; collision-mangling parity is OUT of scope for phase 11 (see phase 11 SPEC §1.1 amendment + §11.5 conclusions (e)).
+
+**`filter_enabled`/`filter_enforced` 0%-default divergence-window:** reference Envoy v1.37.2 defaults both `filter_enabled` and `filter_enforced` `RuntimeFractionalPercent` fields to 0% (off) when unset, meaning the filter is fully disabled by default unless both fields are set to 100% in the config. envoy-go silent-ignores both fields and is effectively always-100%. The differential fixture 0013 sets both to 100% explicitly on the Envoy side; any envoy-go deployment that omits these fields while pairing with reference Envoy will see divergent behavior (Envoy disabled, envoy-go enabled). This divergence-window is documented here and in phase 11 SPEC §13.1 pending a future Runtime family phase that adds `filter_enabled`/`filter_enforced` support.
