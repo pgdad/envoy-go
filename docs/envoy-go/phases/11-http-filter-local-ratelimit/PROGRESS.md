@@ -232,3 +232,21 @@ $ git diff --stat 46866f0..9ce550e
  test/fixtures/0013-http-local-ratelimit/expectations.yaml | 80 ++++++++++++++++
  2 files changed, 171 insertions(+)
 ```
+
+## Task 13 — Fixture 0013 driver.go (single-Drive 4-listener orchestration + ±10ms tolerance)
+
+**Commits:** `2fdfc5e` — `phase 11: fixture 0013 driver — 4-scenario orchestration via 4-listener topology`
+**Notes:** Lands the differential-fixture driver implementing `fixture.Driver` + `fixture.MultiListenerDriver` + `fixture.BackendKindAware` + `fixture.StatsAsserter` for fixture 0013. ~594 LoC. Single `driveAll(ctx, addrs)` orchestrating all 4 scenarios in ONE `DriveSubjectMulti`/`DriveReferenceMulti` invocation per planner-time decision 8 (4-listener topology). Scenario 1: 5 GETs to l_s1; assert 5×200 + counters foo.{enabled=5, ok=5, rate_limited=0, enforced=0}. Scenario 2: 5 GETs to l_s2; assert first 2×200 + last 3×429 with byte-exact body `local_rate_limited` (18 bytes) + 4-header set sorted alphabetically (date allow-listed). Scenario 3: 3 GETs at t=0/10ms/250ms with **±10ms post-hoc band assertion** `[200, 260]ms` per ADR-0116 + planner-time decision 4; emits `TOLERANCE_FAIL:` sentinel into the byte stream if outside band so CompareBytes surfaces the failure. Scenario 4: 6 interleaved GETs to /strict/loose; assert per-route bucket isolation per ADR-0117 (strict cap=1 → 2 rate-limited; loose cap=10 inherited → all allowed) + counter capture under BOTH `strict` AND `qux` stat_prefixes. **Differential test PASSES 3/3 against reference Envoy v1.37.2** (~2.5s per run; byte-equivalent output across all 4 scenarios; stats assertions green on both sides). The implementer flagged + fixed FOUR PLAN-sketch errors in-flight: (a) admin port `9913` → `9901` (the harness convention hardcodes 9901/tcp for all reference containers; not per-fixture); (b) `dns_lookup_family: V4_ONLY` added to the c_backend cluster in envoy.yaml (Task 11 omission — Docker Desktop's `host.docker.internal` resolves IPv6 by default; without V4_ONLY reference Envoy gets 503; envoy-go.yaml unaffected since STATIC cluster resolves to loopback at config time); (c) metric base name `envoy_http_local_rate_limit_*` (PLAN sketch had `envoy_local_ratelimit_*` — confirmed empirically against Prometheus output; ADR-0118 SN9 produces `envoy_http_local_rate_limit_<counter>` per the rule's transformation); (d) per-route stats semantics `qux ok=3` (not 6 — `/strict` requests use the per-route `strict` runtimeConfig exclusively per ADR-0117 wholesale-override; `/loose` requests use the listener-level `qux` config; the implementation confirms this — `resolvePerRouteConfig` returns the per-route rc exclusively for matching TPFC routes). Plus the blank-import added to `test/differential/runner_test.go` (deferred from Task 9 per the PLAN's option-(b) recommendation). One reviewer-flagged Minor (stale `9913` cite in driver.go line 104 doc comment) folded into this follow-up commit. The other 2 Minors (per-call `http.Client` allocation in probe; timeout-less `http.DefaultClient` in scrapeRateLimitStats) are pre-existing project patterns deferred per reviewer "production-quality" assessment.
+**Outputs:**
+```
+$ go test -count=1 -v ./test/differential/ -run 'TestDifferential/0013-http-local-ratelimit'
+=== RUN   TestDifferential/0013-http-local-ratelimit
+--- PASS: TestDifferential/0013-http-local-ratelimit (2.498s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	2.567s
+$ git diff --stat 9ce550e..2fdfc5e
+ test/differential/runner_test.go                          |   1 +
+ test/fixtures/0013-http-local-ratelimit/driver/driver.go  | 594 ++++++++++++++++++++
+ test/fixtures/0013-http-local-ratelimit/envoy.yaml        |   1 +
+ 3 files changed, 596 insertions(+)
+```

@@ -101,7 +101,7 @@ func (localRateLimitDriver) ReferenceListenerPort() int { return refLS1Port }
 
 // ReferenceBootstrap renders envoy.yaml with host.docker.internal +
 // runner-allocated backend port. Reference Envoy admin + listener ports are
-// pre-assigned constants (9913, 10013-10016).
+// pre-assigned constants (9901, 10013-10016).
 func (localRateLimitDriver) ReferenceBootstrap(backendPorts []int) string {
 	tpl := mustReadFixtureFile("envoy.yaml")
 	return mustRender(tpl, map[string]any{
