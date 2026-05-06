@@ -250,3 +250,19 @@ $ git diff --stat 9ce550e..2fdfc5e
  test/fixtures/0013-http-local-ratelimit/envoy.yaml        |   1 +
  3 files changed, 596 insertions(+)
 ```
+
+## Task 14 — BEHAVIOR_CONTRACT.md patches per SPEC §13 + ROADMAP row 11 in-progress→done
+
+**Commits:** `ac1ec1d` — `phase 11: BEHAVIOR_CONTRACT + ROADMAP row 11 done`
+**Notes:** Five in-place patches to BEHAVIOR_CONTRACT.md per SPEC §13 + ADR-0052 in-place-edit authorisation (113 lines added; 3 lines removed for the §13.2 heading 22→26 update + minor structural adjustments). NO new code touched. NO new ADRs (ADR-0114..ADR-0119 already landed). (a) §13.1: NEW `### envoy.filters.http.local_ratelimit` subsection inserted after the existing `### envoy.filters.http.header_mutation` subsection, with sub-subsections for asserted-equivalence, token-bucket primitive (per ADR-0116), per-route override semantics (per ADR-0117 + ADR-0073 amendment; **IMPL-1 substitution applied** — uses `*LocalRateLimit` wording, not `LocalRateLimitPerRoute`), 429 wire shape (per ADR-0119 + SPEC §11.3), allow-path response (no x-ratelimit-* headers), MVP invariant (per ADR-0118; `enforced == rate_limited` lockstep), stats (4 counters per stat_prefix; Prometheus tag-extractor SN9), silent-ignored fields (14 fields organized by 8 family-clusters), empirical evidence (sample wire shape). (b) §13.2: Stat-name mapping table heading updated `22-name table → 26-name table`; 4 new counter rows appended (`<stat_prefix>.http_local_rate_limit.{enabled,ok,rate_limited,enforced}`); table preamble note added describing the new filter-specific Prometheus tag-extractor `envoy_local_http_ratelimit_prefix` (Rule SN9) + the tag-extraction collision quirk (out of scope; fixture uses safe values foo/bar/baz/qux/strict to avoid). (c) §13.3: Timing-tolerances row added — fixture 0013 scenario 3 t=250ms refill boundary ±10ms wall-clock per ADR-0116 + SPEC §11.7 empirical. (d) §13.4: Equivalence Matrix row added — covers all 4 fixture scenarios + 4-header set + 4 stat-counter delta assertion + `envoy_local_http_ratelimit_prefix` label + the deferred-field clusters not asserted. (e) §13.5: NEW `### Phase 11 forward-pointer notes` subsection — 8 deferred field families (descriptor-action, runtime+shadow-mode, xDS, response-side, per-connection, multi-stage, X-RateLimit, gRPC trailer); filter_enabled/filter_enforced 0%-default divergence-window note; tag-extraction collision quirk note. ROADMAP row 11 status flipped `in-progress → done` per ADR-0106 (§9 family heading at line 56 stays unchanged). Reviews: skipped subagent dispatch — documentation-only changes verified by `go vet ./...` clean + visual structural inspection.
+**Outputs:**
+```
+$ git diff --stat 2fdfc5e..ac1ec1d
+ docs/envoy-go/BEHAVIOR_CONTRACT.md | 116 ++++++++++++++++++++++++++++--
+ docs/envoy-go/ROADMAP.md           |   2 +-
+ 2 files changed, 113 insertions(+), 5 deletions(-)
+$ go vet ./...
+(clean)
+$ grep -n '| 11 ' docs/envoy-go/ROADMAP.md
+(row 11 status: done)
+```
