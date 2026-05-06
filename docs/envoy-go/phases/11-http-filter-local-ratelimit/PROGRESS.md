@@ -193,3 +193,18 @@ $ git diff --stat f77385e..21d7c10
  test/differential/runner_test.go     | 34 ++++++++++++++++++++++++++++++++++
  2 files changed, 43 insertions(+)
 ```
+
+## Task 10 — Fixture 0013 `backends/backend.go`
+
+**Commits:** `d1da8ca` — `phase 11: fixture 0013 backend — minimal HTTP backend body backend\n`
+**Notes:** Minimal HTTP backend (~24 LoC) per SPEC §7.4. Mirrors fixture 0011-http-fault's backend exactly. Serves `/` with body `"backend\n"` (8 bytes; ASCII; trailing LF) and `Content-Type: text/plain` + `Content-Length: 8` headers. No special handling for `/strict` or `/loose` (rate-limit decision happens at Envoy/envoy-go BEFORE the upstream call; the backend is unreachable on rate-limited paths). Reviews: skipped subagent dispatch — file is a near-copy of the fault precedent. `go vet ./test/fixtures/0013-http-local-ratelimit/...` clean; `go build ./test/fixtures/0013-http-local-ratelimit/backends/` clean.
+**Outputs:**
+```
+$ go vet ./test/fixtures/0013-http-local-ratelimit/...
+(clean)
+$ go build ./test/fixtures/0013-http-local-ratelimit/backends/
+(clean)
+$ git diff --stat 21d7c10..d1da8ca
+ test/fixtures/0013-http-local-ratelimit/backends/backend.go | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+```
