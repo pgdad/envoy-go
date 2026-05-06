@@ -139,3 +139,22 @@ $ git diff --stat ea152a1..59c4aa4
  internal/stats/name_test.go     | 75 +++++++++++++++++++++++++++++++
  3 files changed, 183 insertions(+)
 ```
+
+## Task 7 — `cmd/envoy-go/main.go` register `localratelimit.New` under `localratelimit.TypeURL`
+
+**Commits:** `60bac1b` — `phase 11: register localratelimit.New under localratelimit.TypeURL`
+**Notes:** Trivial 2-line boot-wiring change (~3 LoC delta total: 1 import alphabetically positioned between `header_mutation` and `router`; 1 registration line inserted between `header_mutation.New` and `header_mutation.RegisterPerRouteValidator(httpReg)` so the localratelimit Register lands BEFORE the eager per-route-validator hook AND the `httpReg.Freeze()` call per ADR-0072). The final boot-registration order is: `router → cors → envoygotest → fault → header_mutation → localratelimit → header_mutation.RegisterPerRouteValidator → Freeze` — matching ADR-0114 Consequences exactly. local_ratelimit does NOT call `RegisterPerRouteValidator` per ADR-0114 + Task 5 settled approach (per-route TPFC entries are validated lazily at first-resolve via `buildRuntimeConfigPerRoute`, NOT at boot via the eager per-route-validator hook). No new ADR lands at this commit (ADR-0114 already covers the registration ordering at Task 2/3 commit). Reviews: skipped subagent dispatch for this trivially small change since the build + full test suite verify correctness directly. `go build ./cmd/envoy-go` clean; `go vet ./...` clean; `go test -race -count=1 -short ./...` all 30+ packages PASS with no regressions.
+**Outputs:**
+```
+$ go build ./cmd/envoy-go
+(clean)
+$ go vet ./...
+(clean)
+$ go test -race -count=1 -short ./...
+(every package PASS; clean)
+$ git diff --stat 59c4aa4..60bac1b
+ cmd/envoy-go/main.go | 2 ++
+ 1 file changed, 2 insertions(+)
+$ grep -cE 'httpReg.Register' cmd/envoy-go/main.go
+6
+```
