@@ -200,6 +200,15 @@ const (
 	// Because the backend is a subprocess, the runner's in-process accept counter
 	// is NOT incremented.
 	HTTPHeaderMutation BackendKind = 9
+
+	// HTTPLocalRateLimit is an out-of-process HTTP/1.1 backend: the runner
+	// spawns test/fixtures/0013-http-local-ratelimit/backends/backend.go on
+	// the pre-allocated port. The backend serves / with body "backend\n"
+	// (8 bytes; Content-Type: text/plain; Content-Length: 8). No TLS.
+	// Introduced by fixture 0013-http-local-ratelimit (phase 11 Task 9).
+	// Because the backend is a subprocess, the runner's in-process accept
+	// counter is NOT incremented.
+	HTTPLocalRateLimit BackendKind = 10
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
