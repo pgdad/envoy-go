@@ -172,8 +172,8 @@ func TestNew_StatusCodeOmittedDefaultsTo429(t *testing.T) {
 		t.Fatalf("New(status omitted, _): want success, got %v", err)
 	}
 	inst := factory().Decoder.(*filter)
-	if inst.rc.statusCode != 429 {
-		t.Errorf("statusCode default: got %d, want 429", inst.rc.statusCode)
+	if inst.state.listenerRC.statusCode != 429 {
+		t.Errorf("statusCode default: got %d, want 429", inst.state.listenerRC.statusCode)
 	}
 }
 
@@ -189,19 +189,19 @@ func TestNew_HappyPath_AllConsumedFields(t *testing.T) {
 		t.Fatalf("New(happy, _): want success, got %v", err)
 	}
 	inst := factory().Decoder.(*filter)
-	if inst.rc.statPrefix != "myprefix" {
-		t.Errorf("statPrefix: got %q, want %q", inst.rc.statPrefix, "myprefix")
+	if inst.state.listenerRC.statPrefix != "myprefix" {
+		t.Errorf("statPrefix: got %q, want %q", inst.state.listenerRC.statPrefix, "myprefix")
 	}
-	if inst.rc.statusCode != 503 {
-		t.Errorf("statusCode: got %d, want 503", inst.rc.statusCode)
+	if inst.state.listenerRC.statusCode != 503 {
+		t.Errorf("statusCode: got %d, want 503", inst.state.listenerRC.statusCode)
 	}
-	if inst.rc.body != "local_rate_limited" {
-		t.Errorf("body: got %q, want %q", inst.rc.body, "local_rate_limited")
+	if inst.state.listenerRC.body != "local_rate_limited" {
+		t.Errorf("body: got %q, want %q", inst.state.listenerRC.body, "local_rate_limited")
 	}
-	if inst.rc.bucket == nil {
+	if inst.state.listenerRC.bucket == nil {
 		t.Errorf("bucket: got nil, want non-nil")
 	}
-	if inst.rc.stats == nil {
+	if inst.state.listenerRC.stats == nil {
 		t.Errorf("stats: got nil, want non-nil (ctx.Stats provided)")
 	}
 }
@@ -214,6 +214,7 @@ type fakeDecoderCB struct {
 	sendStatus int
 	sendBody   string
 	sendHdrs   envoyhttp.OrderedHeaders
+	routeCfg   proto.Message // returned by RequestRouteConfig; nil by default
 }
 
 func (f *fakeDecoderCB) ContinueDecoding() {}
@@ -223,7 +224,7 @@ func (f *fakeDecoderCB) SendLocalReply(status int, body string, headers envoyhtt
 	f.sendBody = body
 	f.sendHdrs = headers
 }
-func (f *fakeDecoderCB) RequestRouteConfig() proto.Message { return nil }
+func (f *fakeDecoderCB) RequestRouteConfig() proto.Message { return f.routeCfg }
 func (f *fakeDecoderCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
 	return nil, nil, nil
 }
@@ -253,16 +254,16 @@ func TestDecodeHeaders_AllowPath_CountersIncremented(t *testing.T) {
 	if dcb.sendCalled {
 		t.Errorf("DecodeHeaders allow: SendLocalReply must NOT be called")
 	}
-	if got := f.rc.stats.enabled.Load(); got != 1 {
+	if got := f.state.listenerRC.stats.enabled.Load(); got != 1 {
 		t.Errorf("enabled: got %d, want 1", got)
 	}
-	if got := f.rc.stats.ok.Load(); got != 1 {
+	if got := f.state.listenerRC.stats.ok.Load(); got != 1 {
 		t.Errorf("ok: got %d, want 1", got)
 	}
-	if got := f.rc.stats.rateLimited.Load(); got != 0 {
+	if got := f.state.listenerRC.stats.rateLimited.Load(); got != 0 {
 		t.Errorf("rateLimited: got %d, want 0", got)
 	}
-	if got := f.rc.stats.enforced.Load(); got != 0 {
+	if got := f.state.listenerRC.stats.enforced.Load(); got != 0 {
 		t.Errorf("enforced: got %d, want 0", got)
 	}
 }
@@ -318,22 +319,95 @@ func TestDecodeHeaders_RateLimitedPath_CountersIncremented_Lockstep(t *testing.T
 		t.Errorf("SendLocalReply headers: got %v, want [{Content-Type text/plain}]", dcb.sendHdrs)
 	}
 
-	if got := f.rc.stats.enabled.Load(); got != 2 {
+	if got := f.state.listenerRC.stats.enabled.Load(); got != 2 {
 		t.Errorf("enabled: got %d, want 2", got)
 	}
-	if got := f.rc.stats.ok.Load(); got != 1 {
+	if got := f.state.listenerRC.stats.ok.Load(); got != 1 {
 		t.Errorf("ok: got %d, want 1", got)
 	}
-	if got := f.rc.stats.rateLimited.Load(); got != 1 {
+	if got := f.state.listenerRC.stats.rateLimited.Load(); got != 1 {
 		t.Errorf("rateLimited: got %d, want 1", got)
 	}
-	if got := f.rc.stats.enforced.Load(); got != 1 {
+	if got := f.state.listenerRC.stats.enforced.Load(); got != 1 {
 		t.Errorf("enforced: got %d, want 1", got)
 	}
 	// MVP invariant per ADR-0118: rateLimited == enforced (lockstep).
-	if f.rc.stats.rateLimited.Load() != f.rc.stats.enforced.Load() {
+	if f.state.listenerRC.stats.rateLimited.Load() != f.state.listenerRC.stats.enforced.Load() {
 		t.Errorf("MVP lockstep violated: rateLimited=%d enforced=%d",
-			f.rc.stats.rateLimited.Load(), f.rc.stats.enforced.Load())
+			f.state.listenerRC.stats.rateLimited.Load(), f.state.listenerRC.stats.enforced.Load())
+	}
+}
+
+// TestDecodeHeaders_PerRouteOverride_IndependentBuckets validates per-route
+// TPFC bucket independence per SPEC §11.6 + ADR-0117.
+//
+// IMPL-1: per-route TPFC entries are *localratelimitv3.LocalRateLimit directly
+// (no LocalRateLimitPerRoute wrapper — that proto does not exist in upstream
+// Envoy v1.37.2; per PROGRESS.md preamble IMPL-1).
+func TestDecodeHeaders_PerRouteOverride_IndependentBuckets(t *testing.T) {
+	// Build a listener-level config with cap=10.
+	listenerCfg := happyConfig()
+	listenerCfg.StatPrefix = "listener_prefix"
+	listenerCfg.TokenBucket.MaxTokens = 10
+	listenerCfg.TokenBucket.FillInterval = durationpb.New(60 * time.Second)
+	reg := stats.NewRegistry()
+	factory, err := New(mustAny(t, listenerCfg), envoyhttp.FactoryCtx{Stats: reg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	inst := factory().Decoder.(*filter)
+
+	// Build TWO per-route LocalRateLimit proto messages directly (IMPL-1: no
+	// LocalRateLimitPerRoute wrapper).
+	perRouteA := &localratelimitv3.LocalRateLimit{
+		StatPrefix: "perroute_a",
+		TokenBucket: &typev3.TokenBucket{
+			MaxTokens:    1,
+			FillInterval: durationpb.New(60 * time.Second),
+		},
+	}
+	perRouteB := &localratelimitv3.LocalRateLimit{
+		StatPrefix: "perroute_b",
+		TokenBucket: &typev3.TokenBucket{
+			MaxTokens:    1,
+			FillInterval: durationpb.New(60 * time.Second),
+		},
+	}
+
+	// Resolve each per-route to its *runtimeConfig.
+	rcA := inst.state.resolvePerRouteConfig(perRouteA)
+	rcB := inst.state.resolvePerRouteConfig(perRouteB)
+	rcListener := inst.state.resolvePerRouteConfig(nil)
+
+	// Assert pointer-distinct.
+	if rcA == rcB {
+		t.Error("perRouteA and perRouteB should resolve to DIFFERENT *runtimeConfig instances")
+	}
+	if rcA == rcListener || rcB == rcListener {
+		t.Error("per-route should NOT alias listener-level *runtimeConfig")
+	}
+	if rcA.bucket == rcB.bucket {
+		t.Error("perRouteA and perRouteB should have INDEPENDENT *tokenBucket pointers")
+	}
+	if rcA.stats == rcB.stats {
+		t.Error("perRouteA and perRouteB should have INDEPENDENT *filterStats pointers")
+	}
+
+	// Assert idempotent re-resolution (same pointer in → same *runtimeConfig out).
+	rcAAgain := inst.state.resolvePerRouteConfig(perRouteA)
+	if rcA != rcAAgain {
+		t.Error("re-resolving perRouteA should return the SAME *runtimeConfig (idempotent)")
+	}
+
+	// Drain rcA's bucket; verify rcB unaffected.
+	if !rcA.bucket.tryConsume() {
+		t.Fatal("rcA initial tryConsume should succeed (cap=1)")
+	}
+	if rcA.bucket.tryConsume() {
+		t.Error("rcA second tryConsume should fail (drained)")
+	}
+	if !rcB.bucket.tryConsume() {
+		t.Error("rcB tryConsume should succeed independently (NOT affected by rcA drain)")
 	}
 }
 

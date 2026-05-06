@@ -2669,6 +2669,20 @@ per-filter accessor-choice discipline. ADR-0073's wholesale-override semantics
 remain authoritative for filters that opt into the most-specific accessor
 (cors @ 07.1, fault @ 09).
 
+## Amendment (per phase 11 ADR-0117)
+
+Wholesale-override extends to STATEFUL per-route resources without further
+framework support; the `*LocalRateLimit` TPFC entry resolves at
+DecodeHeaders time to a fresh `*runtimeConfig` carrying its own
+`*tokenBucket` + own `*filterStats`. The listener-level state is fully
+shadowed for per-route reqs. Phase 11 is the FIRST production filter to
+demonstrate this; future stateful per-route filters (e.g., a future
+`global_ratelimit` if it lands per-process bucket fallback) follow the
+same discipline. See ADR-0117 for the precedent.
+
+The implementation requires post-Freeze stats Registry registration via
+the new `NewCounterIfAbsent` method (per ADR-0061 amendment in ADR-0118).
+
 ---
 
 ## ADR-0075: `sendLocalReply` encode-chain semantics
@@ -5368,3 +5382,45 @@ The `SendLocalReply` framework primitive at `internal/filter/http/callbacks.go::
 - Future shadow-mode phase wiring `filter_enforced` < 100% widens the response: when `enforced` is false but `rate_limited` is true, the request is allowed (no SendLocalReply) but the rate_limited counter still increments — the wire-shape decision in ADR-0119 holds for the enforced subset only; the shadow-mode phase amends ADR-0119 §Consequences in-place per ADR-0089 to record the divergence.
 - The wire-equivalence claim is enforced at fixture 0013 scenario 2 (basic-rate-limited): the driver captures the 429 response bytes + 4-header set + body and asserts byte-equality across reference + subject.
 
+---
+
+## ADR-0117: Per-route bucket isolation as ADR-0073 wholesale-override consequence — first stateful per-route filter; ADR-0073 amendment paragraph
+
+**Status:** Accepted
+**Date:** 2026-05-05 (phase 11 Task 5 commit)
+**Doctrine:** ADR-0073 typed_per_filter_config 3-tier merge (most-specific override) + AMENDMENT; ADR-0061 stats Registry LBP-1 invariant + AMENDMENT (NewCounterIfAbsent post-Freeze idempotent registration); ADR-0072 boot-fail-fast.
+**Lands-in-task:** Phase 11 Task 5.
+
+### Context
+
+Phase 11 is the FIRST production filter where per-route override implies independent stateful resources (per SPEC §1 + §11.6). Prior filters (cors, fault, header_mutation) had per-route configs that were either purely declarative (cors per-route rules) or stateful at listener level only (fault's `max_active_faults` is closure-shared across all requests on the listener but not per-route distinct). Phase 11's per-route TPFC carries an independent token bucket + independent stat counters per the §11.6 empirical pin (reference Envoy emits separate Prometheus counter series keyed by per-route stat_prefix).
+
+Implementing per-route bucket independence under the existing framework requires: (a) per-route counter allocation post-Freeze (per the existing `httpReg.Freeze()` discipline at boot, the stats Registry is also frozen — but per-route TPFCs are parsed at HCM-build time which is post-freeze for a config-load-with-validate flow); (b) lazy or eager allocation of per-route `*runtimeConfig` + `*tokenBucket` + `*filterStats`; (c) thread-safe cache from per-route TPFC pointer to the resolved `*runtimeConfig`.
+
+Per IMPL-1 (PROGRESS.md preamble), upstream Envoy v1.37.2's local_ratelimit reuses the same `LocalRateLimit` proto for both listener-level and per-route TPFC entries; there is no wrapping `LocalRateLimitPerRoute` message. Phase 11 therefore keys the per-route lazy-cache by `*LocalRateLimit` proto pointer.
+
+### Decision
+
+**ADR-0073 wholesale-override extends to STATEFUL per-route resources.** Each `*LocalRateLimit` TPFC entry resolves to its own `*runtimeConfig` carrying its own `*tokenBucket` + own `*filterStats`. Listener-level state is NOT touched for per-route reqs. The implementation:
+
+1. **Per-route lazy-cache:** the factory closure captures a `sync.Map` keyed by `*LocalRateLimit` pointer; lazily-populated at first `DecodeHeaders` resolve via `state.resolvePerRouteConfig`.
+2. **Post-Freeze stats registration:** `internal/stats.Registry` gains a `NewCounterIfAbsent(name) *Counter` method permitting idempotent post-Freeze registration. The method preserves the existing `NewCounter` panic-discipline for boot-time registrations; the new method is reserved for HCM-build-time per-route registrations. ~30 LoC framework delta in `internal/stats/registry.go`.
+3. **Wholesale-override carry-through:** the existing `PerRouteConfig.Resolve` (most-specific accessor per ADR-0073) returns the per-route TPFC; the filter type-asserts the `*LocalRateLimit` and consults the per-route `*runtimeConfig`. The listener-level state is fully shadowed for per-route reqs — listener-level counters do NOT increment for per-route reqs per SPEC §11.6.
+
+**ADR-0073 amendment paragraph** lands inline in the existing ADR-0073 body in `DECISIONS.md` (see above).
+
+### Alternatives considered
+
+(a) **Eager pre-allocation: walk all per-route TPFCs at HCM-build-time + pre-allocate per-route `*runtimeConfig` instances** — rejected. The framework's existing `BuildPerRouteConfig` parses TPFCs into `proto.Message` slots in the per-route map; extending it to call back into per-filter factory hooks (analogous to phase 10's per-route-validator) is heavier than the lazy-cache approach. The lazy-cache is ~80 LoC vs the eager-walk ~200 LoC.
+
+(b) **Per-route counters allocated under the listener-level stat_prefix (sharing counters across per-route entries)** — rejected. SPEC §11.6 empirical pin confirms reference Envoy emits SEPARATE Prometheus counter series per per-route stat_prefix; sharing counters would diverge.
+
+(c) **Defer per-route bucket independence to phase 11.1** — rejected. SPEC §1 + §11.6 + fixture 0013 scenario 4 explicitly require it; deferral would block fixture 0013's full 4-scenario green.
+
+### Consequences
+
+- ADR-0073 (typed_per_filter_config 3-tier merge / most-specific override) gains an inline amendment paragraph noting the stateful-resource extension; the canonical Decision body is unchanged.
+- ADR-0061 (stats Registry / LBP-1 invariant) gains an inline amendment in ADR-0118 noting the `NewCounterIfAbsent` post-Freeze idempotent registration extension.
+- Future stateful per-route filters reuse the lazy-cache + `NewCounterIfAbsent` pattern; phase 11's `state.resolvePerRouteConfig` + `buildRuntimeConfigPerRoute` are the canonical reference.
+- The race-safety of the lazy-cache is validated by the existing race-detector cycle test (`TestTokenBucket_ConcurrentTryConsume`) + the per-route bucket independence test (`TestDecodeHeaders_PerRouteOverride_IndependentBuckets`); both pass under `-race`.
+- Fixture 0013 scenario 4 mechanically validates the empirical claim per SPEC §11.6 (per-route counters increment independently from listener-level counters; listener counters do NOT increment for per-route reqs).

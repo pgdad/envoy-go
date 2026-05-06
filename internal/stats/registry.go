@@ -135,6 +135,37 @@ func (r *Registry) Walk(fn func(Metric)) {
 	}
 }
 
+// NewCounterIfAbsent returns the counter for `name` if already registered,
+// otherwise registers and returns a new one. Unlike NewCounter, this method
+// is idempotent and PERMITTED post-Freeze (registrations through this method
+// bypass the freeze check; the implementation guards via the same r.mu lock).
+//
+// Used by per-route filter configurations whose stat_prefix is data-driven
+// (e.g., envoy.filters.http.local_ratelimit per phase 11). At HCM-build-time
+// the per-route TPFC parser may need to register stat counters for stat_prefix
+// values that are not known at boot time; this method bridges the gap without
+// relaxing the Freeze discipline for boot-time registrations.
+//
+// Concurrency: safe for concurrent invocation; r.mu serializes the read +
+// register pair.
+//
+// Per ADR-0117 (phase 11 ADR-0073 amendment) + ADR-0061 LBP-1 amendment.
+func (r *Registry) NewCounterIfAbsent(name string) *Counter {
+	r.checkName(name) // panic-on-invalid-name preserved (programmer error, not ops issue)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.byName[name]; ok {
+		if c, ok := existing.(*Counter); ok {
+			return c
+		}
+		panic(fmt.Sprintf("stats: NewCounterIfAbsent: name %q registered as non-Counter", name))
+	}
+	c := &Counter{name: name}
+	r.metrics = append(r.metrics, c)
+	r.byName[name] = c
+	return c
+}
+
 // Freeze locks the metric list. Subsequent NewCounter / NewGauge calls panic.
 // Idempotent; safe for concurrent calls.
 func (r *Registry) Freeze() { r.frozen.Store(true) }

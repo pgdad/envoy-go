@@ -137,6 +137,39 @@ func TestRegistry_Freeze_Idempotent(t *testing.T) {
 	r.Freeze() // must not panic, must not race
 }
 
+func TestNewCounterIfAbsent_RegistersWhenAbsent(t *testing.T) {
+	r := NewRegistry()
+	c := r.NewCounterIfAbsent("test.counter.first")
+	if c == nil || c.Name() != "test.counter.first" {
+		t.Errorf("got %v, want non-nil counter named test.counter.first", c)
+	}
+}
+
+func TestNewCounterIfAbsent_ReturnsExisting(t *testing.T) {
+	r := NewRegistry()
+	c1 := r.NewCounter("test.counter.dup")
+	c2 := r.NewCounterIfAbsent("test.counter.dup")
+	if c1 != c2 {
+		t.Errorf("expected pointer-identical Counter; got c1=%p c2=%p", c1, c2)
+	}
+}
+
+func TestNewCounterIfAbsent_BypassesFreeze(t *testing.T) {
+	r := NewRegistry()
+	r.NewCounter("pre.freeze.counter")
+	r.Freeze()
+	// NewCounter would panic; NewCounterIfAbsent must succeed.
+	c := r.NewCounterIfAbsent("post.freeze.counter")
+	if c == nil {
+		t.Fatal("NewCounterIfAbsent post-freeze returned nil")
+	}
+	// Verify subsequent lookup returns the same instance.
+	c2 := r.NewCounterIfAbsent("post.freeze.counter")
+	if c != c2 {
+		t.Errorf("idempotency: got %p / %p, want pointer-identical", c, c2)
+	}
+}
+
 func TestRegistry_Walk_ConcurrentWithIncs_RaceClean(t *testing.T) {
 	r := NewRegistry()
 	c := r.NewCounter("conc.counter")
