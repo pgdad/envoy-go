@@ -158,3 +158,22 @@ $ git diff --stat 59c4aa4..60bac1b
 $ grep -cE 'httpReg.Register' cmd/envoy-go/main.go
 6
 ```
+
+## Task 8 — `internal/filter/http/localratelimit/fuzz_test.go` `FuzzLocalRateLimitConfigParse`
+
+**Commits:** `f77385e` — `phase 11: FuzzLocalRateLimitConfigParse (fifteenth fuzzer per ADR-0018)`
+**Notes:** Lands the fifteenth fuzzer overall (post phase-10's fourteenth `FuzzHeaderMutationConfigParse`) per SPEC §14.3 + ADR-0018's "every parser/codec/filter ships a fuzzer" discipline. ~40 LoC. Fuzzes arbitrary `(typeURL, value)` byte sequences as the `*anypb.Any` parameter to `New`. Asserts `New` returns either `(factory, nil)` OR `(nil, error)` — never panics; never returns `(nil, nil)`. Seed corpus: 3 entries (empty, malformed Any under canonical TypeURL, short proto-wire bytes). 30s budget per ADR-0018 short-mode CI policy. No new ADR (ADR-0018 already covers fuzzer discipline). Reviews: skipped subagent dispatch — fuzzer parameters mechanical; the 30s execution + the `go test -count=1 -run FuzzLocalRateLimitConfigParse` regression-corpus run verify correctness.
+**Outputs:**
+```
+$ go test -count=1 -run FuzzLocalRateLimitConfigParse ./internal/filter/http/localratelimit/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	0.003s
+$ go test -fuzz=FuzzLocalRateLimitConfigParse -fuzztime=30s ./internal/filter/http/localratelimit/...
+fuzz: elapsed: 30s, execs: 6394357 (272072/sec), new interesting: 245 (total: 248)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	31.058s
+$ go vet ./... && golangci-lint run ./...
+(both clean)
+$ git diff --stat 60bac1b..f77385e
+ internal/filter/http/localratelimit/fuzz_test.go | 39 +++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+```
