@@ -2,12 +2,14 @@ package localratelimit
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	localratelimitv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/local_ratelimit/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -193,13 +195,172 @@ func TestNew_HappyPath_AllConsumedFields(t *testing.T) {
 	if inst.rc.statusCode != 503 {
 		t.Errorf("statusCode: got %d, want 503", inst.rc.statusCode)
 	}
-	if string(inst.rc.body) != "local_rate_limited" {
-		t.Errorf("body: got %q, want %q", string(inst.rc.body), "local_rate_limited")
+	if inst.rc.body != "local_rate_limited" {
+		t.Errorf("body: got %q, want %q", inst.rc.body, "local_rate_limited")
 	}
 	if inst.rc.bucket == nil {
 		t.Errorf("bucket: got nil, want non-nil")
 	}
 	if inst.rc.stats == nil {
 		t.Errorf("stats: got nil, want non-nil (ctx.Stats provided)")
+	}
+}
+
+// fakeDecoderCB is a test implementation of envoyhttp.DecoderFilterCallbacks that
+// captures SendLocalReply arguments. The other methods are no-ops; unused proto
+// methods satisfy the interface.
+type fakeDecoderCB struct {
+	sendCalled bool
+	sendStatus int
+	sendBody   string
+	sendHdrs   envoyhttp.OrderedHeaders
+}
+
+func (f *fakeDecoderCB) ContinueDecoding() {}
+func (f *fakeDecoderCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
+	f.sendCalled = true
+	f.sendStatus = status
+	f.sendBody = body
+	f.sendHdrs = headers
+}
+func (f *fakeDecoderCB) RequestRouteConfig() proto.Message { return nil }
+func (f *fakeDecoderCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
+	return nil, nil, nil
+}
+func (f *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
+func (f *fakeDecoderCB) EncodeData([]byte, bool)         {}
+func (f *fakeDecoderCB) EncodeTrailers(http.Header)      {}
+
+// TestDecodeHeaders_AllowPath_CountersIncremented verifies that on the allow path
+// (bucket has tokens) DecodeHeaders returns Continue, increments enabled + ok,
+// and does NOT call SendLocalReply.
+func TestDecodeHeaders_AllowPath_CountersIncremented(t *testing.T) {
+	reg := stats.NewRegistry()
+	factory, err := New(mustAny(t, happyConfig()), envoyhttp.FactoryCtx{Stats: reg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	inst := factory()
+	f := inst.Decoder.(*filter)
+	dcb := &fakeDecoderCB{}
+	f.SetDecoderCallbacks(dcb)
+
+	status := f.DecodeHeaders(nil, true)
+
+	if status != envoyhttp.Continue {
+		t.Errorf("DecodeHeaders allow: got %v, want Continue", status)
+	}
+	if dcb.sendCalled {
+		t.Errorf("DecodeHeaders allow: SendLocalReply must NOT be called")
+	}
+	if got := f.rc.stats.enabled.Load(); got != 1 {
+		t.Errorf("enabled: got %d, want 1", got)
+	}
+	if got := f.rc.stats.ok.Load(); got != 1 {
+		t.Errorf("ok: got %d, want 1", got)
+	}
+	if got := f.rc.stats.rateLimited.Load(); got != 0 {
+		t.Errorf("rateLimited: got %d, want 0", got)
+	}
+	if got := f.rc.stats.enforced.Load(); got != 0 {
+		t.Errorf("enforced: got %d, want 0", got)
+	}
+}
+
+// TestDecodeHeaders_RateLimitedPath_CountersIncremented_Lockstep verifies that on
+// the rate-limited path DecodeHeaders returns StopIteration, calls SendLocalReply
+// with the canonical status/body/header, increments all 4 counters correctly,
+// and upholds the MVP invariant rateLimited == enforced (ADR-0118 lockstep).
+func TestDecodeHeaders_RateLimitedPath_CountersIncremented_Lockstep(t *testing.T) {
+	cfg := &localratelimitv3.LocalRateLimit{
+		StatPrefix: "rl_test",
+		TokenBucket: &typev3.TokenBucket{
+			MaxTokens:    1,
+			FillInterval: durationpb.New(60 * time.Second),
+			// TokensPerFill omitted → defaults to 1; fill interval very long
+			// so the bucket is exhausted after the first consume.
+		},
+	}
+	reg := stats.NewRegistry()
+	factory, err := New(mustAny(t, cfg), envoyhttp.FactoryCtx{Stats: reg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	inst := factory()
+	f := inst.Decoder.(*filter)
+	dcb := &fakeDecoderCB{}
+	f.SetDecoderCallbacks(dcb)
+
+	// First call: bucket has 1 token → allow.
+	first := f.DecodeHeaders(nil, true)
+	if first != envoyhttp.Continue {
+		t.Errorf("first call: got %v, want Continue", first)
+	}
+	if dcb.sendCalled {
+		t.Errorf("first call: SendLocalReply must NOT be called")
+	}
+
+	// Second call: bucket exhausted → rate-limited.
+	second := f.DecodeHeaders(nil, true)
+	if second != envoyhttp.StopIteration {
+		t.Errorf("second call: got %v, want StopIteration", second)
+	}
+	if !dcb.sendCalled {
+		t.Fatalf("second call: SendLocalReply must be called")
+	}
+	if dcb.sendStatus != 429 {
+		t.Errorf("SendLocalReply status: got %d, want 429", dcb.sendStatus)
+	}
+	if dcb.sendBody != "local_rate_limited" {
+		t.Errorf("SendLocalReply body: got %q, want %q", dcb.sendBody, "local_rate_limited")
+	}
+	if len(dcb.sendHdrs) != 1 || dcb.sendHdrs[0].Name != "Content-Type" || dcb.sendHdrs[0].Value != "text/plain" {
+		t.Errorf("SendLocalReply headers: got %v, want [{Content-Type text/plain}]", dcb.sendHdrs)
+	}
+
+	if got := f.rc.stats.enabled.Load(); got != 2 {
+		t.Errorf("enabled: got %d, want 2", got)
+	}
+	if got := f.rc.stats.ok.Load(); got != 1 {
+		t.Errorf("ok: got %d, want 1", got)
+	}
+	if got := f.rc.stats.rateLimited.Load(); got != 1 {
+		t.Errorf("rateLimited: got %d, want 1", got)
+	}
+	if got := f.rc.stats.enforced.Load(); got != 1 {
+		t.Errorf("enforced: got %d, want 1", got)
+	}
+	// MVP invariant per ADR-0118: rateLimited == enforced (lockstep).
+	if f.rc.stats.rateLimited.Load() != f.rc.stats.enforced.Load() {
+		t.Errorf("MVP lockstep violated: rateLimited=%d enforced=%d",
+			f.rc.stats.rateLimited.Load(), f.rc.stats.enforced.Load())
+	}
+}
+
+// TestStatNames_FourCountersUnderStatPrefix verifies that newFilterStats registers
+// exactly the 4 expected counter names under the given stat_prefix via
+// stats.Registry.Walk.
+func TestStatNames_FourCountersUnderStatPrefix(t *testing.T) {
+	reg := stats.NewRegistry()
+	prefix := "myns"
+	newFilterStats(reg, prefix)
+
+	want := []string{
+		"myns.http_local_rate_limit.enabled",
+		"myns.http_local_rate_limit.ok",
+		"myns.http_local_rate_limit.rate_limited",
+		"myns.http_local_rate_limit.enforced",
+	}
+	var got []string
+	reg.Walk(func(m stats.Metric) {
+		got = append(got, m.Name())
+	})
+	if len(got) != len(want) {
+		t.Fatalf("stat count: got %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for i, name := range want {
+		if got[i] != name {
+			t.Errorf("stat[%d]: got %q, want %q", i, got[i], name)
+		}
 	}
 }

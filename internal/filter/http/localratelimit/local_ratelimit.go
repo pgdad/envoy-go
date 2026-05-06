@@ -25,7 +25,10 @@ const filterName = "envoy.filters.http.local_ratelimit"
 // rateLimitedBody is the canonical 18-byte body emitted on the rate-limited
 // response per SPEC §11.3 empirical pin (ASCII; NO trailing newline; MD5
 // 397e830923f3080ba63b3d38b53678ac). Per ADR-0119.
-var rateLimitedBody = []byte("local_rate_limited")
+// Const-string form matches the fault precedent (faultAbortBody at
+// internal/filter/http/fault/fault.go:27) and the SendLocalReply(string)
+// signature — no []byte conversion needed.
+const rateLimitedBody = "local_rate_limited"
 
 // minFillInterval is the filter-internal minimum on token_bucket.fill_interval
 // per SPEC §11.2c empirical pin. The check fires AFTER proto unmarshal succeeds,
@@ -43,7 +46,7 @@ type runtimeConfig struct {
 	statPrefix string       // from cfg.StatPrefix (PGV non-empty per §11.1)
 	bucket     *tokenBucket // closure-captured per filter-instance / per per-route entry
 	statusCode int          // from cfg.Status.Code (default 429 per §11.4; PGV [400, 600))
-	body       []byte       // literal "local_rate_limited" (18 bytes; per §11.3 + ADR-0119)
+	body       string       // literal "local_rate_limited" (18 bytes; per §11.3 + ADR-0119)
 	stats      *filterStats // 4 counters scoped by stat_prefix; nil when ctx.Stats is nil (test path)
 }
 
@@ -201,22 +204,42 @@ func newFilterStats(reg *stats.Registry, prefix string) *filterStats {
 	}
 }
 
-// DecodeHeaders implements the rate-limit decision per SPEC §6.5. Task 4 lands
-// the full body; Task 2+3 combined commit stubs to Continue (no-op pass-through).
+// DecodeHeaders implements the rate-limit decision per SPEC §6.5 + ADR-0119.
+//
+// Discipline:
+//  1. Increment rc.stats.enabled (unconditional per-request).
+//  2. Call rc.bucket.tryConsume().
+//  3. If true: increment rc.stats.ok; return Continue.
+//  4. If false: increment rc.stats.rateLimited AND rc.stats.enforced
+//     IN LOCKSTEP (MVP invariant per ADR-0118; future shadow-mode phase
+//     widens to enforced ≤ rate_limited when filter_enforced runtime-key
+//     support lands per the Runtime + hot restart family).
+//  5. Invoke f.dcb.SendLocalReply(rc.statusCode, rc.body, OrderedHeaders{
+//     {Name: "Content-Type", Value: "text/plain"}}) per ADR-0102 + ADR-0119.
+//     Reuses the request-side terminal-replace primitive verbatim from phase
+//     09 fault precedent at internal/filter/http/fault/fault.go:321.
+//  6. Return StopIteration.
+//
+// The 4-header wire-form on the rate-limited path (content-length: 18,
+// content-type: text/plain, date: <RFC1123>, server: envoy) is produced by:
+//   - SendLocalReply call site (Content-Type from the OrderedHeaders arg)
+//   - HCM/router downstream auto-injection (content-length, date, server)
+//
+// Per the existing fault precedent + the existing internal/filter/hcm/codec.go:17
+// serverHeader() returning "envoy" — confirms SPEC §1.1 amendment that the
+// brainstorm hypothesis of `server: envoy-go` was incorrect.
 func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	// Task 4 wires:
-	//   f.rc.stats.enabled.Inc()
-	//   if f.rc.bucket.tryConsume() {
-	//       f.rc.stats.ok.Inc()
-	//       return envoyhttp.Continue
-	//   }
-	//   f.rc.stats.rateLimited.Inc()
-	//   f.rc.stats.enforced.Inc()
-	//   f.dcb.SendLocalReply(f.rc.statusCode, f.rc.body, envoyhttp.OrderedHeaders{
-	//       {Name: "Content-Type", Value: "text/plain"},
-	//   })
-	//   return envoyhttp.StopIteration
-	return envoyhttp.Continue
+	f.rc.stats.enabled.Inc()
+	if f.rc.bucket.tryConsume() {
+		f.rc.stats.ok.Inc()
+		return envoyhttp.Continue
+	}
+	f.rc.stats.rateLimited.Inc()
+	f.rc.stats.enforced.Inc() // lockstep MVP per ADR-0118
+	f.dcb.SendLocalReply(f.rc.statusCode, f.rc.body, envoyhttp.OrderedHeaders{
+		{Name: "Content-Type", Value: "text/plain"},
+	})
+	return envoyhttp.StopIteration
 }
 
 // Pass-through methods per SPEC §6.5. local_ratelimit operates only on

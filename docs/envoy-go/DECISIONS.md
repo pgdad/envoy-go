@@ -5325,3 +5325,46 @@ Empirical refill-timing tolerance: **±10ms** wall-clock around the configured `
 - Future shadow-mode phase wiring `filter_enforced` runtime-key support widens the lockstep discipline: when `filter_enforced` < 100%, `enforced` increments only on the rate-limited subset that's also enforced; `rate_limited` increments on the full rate-limited set. The `tokenBucket` primitive itself stays UNCHANGED — the lockstep change happens at the `DecodeHeaders` call site.
 - The ±10ms empirical envelope is encoded at BEHAVIOR_CONTRACT §13.3 timing-tolerances row (per SPEC §13.3); fixture 0013 scenario 3 enforces the band; if CI-load flakes surface, ADR-0116 §Consequences amends in-place per ADR-0089 to record the chosen mitigation (widen tolerance OR retry-with-deadline harness).
 
+---
+
+## ADR-0119: Rate-limited response wire shape — body byte-exact `local_rate_limited` (18 bytes, no LF) + 4-header set lowercase wire-form (`content-length: 18`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`) + 429 default status + `SendLocalReply` reuse from phase 09 fault precedent
+
+**Status:** Accepted
+**Date:** 2026-05-05 (phase 11 Task 4 commit)
+**Doctrine:** ADR-0102 terminal-replace + StopIteration; ADR-0103 fault abort wire shape (body byte-exact); ADR-0072 boot-fail-fast; ADR-0008 Envoy v1.37.2 pin (empirical evidence source).
+**Lands-in-task:** Phase 11 Task 4.
+
+### Context
+
+Envoy v1.37.2's local-ratelimit filter emits a deterministic rate-limited response when `tryConsume` returns false: status `429 Too Many Requests`; body `local_rate_limited` (18 bytes ASCII, no trailing newline); 4 headers in lexicographic-emission order `content-length: 18`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`; framing `Content-Length: 18` (NOT chunked).
+
+SPEC §11.3 empirical pin captured the verbatim 150-byte wire shape via raw-bytes hex capture; body MD5 `397e830923f3080ba63b3d38b53678ac`. The body is the LOAD-BEARING wire-equivalence claim per ADR-0103's body-byte-exact discipline (extended from fault to local_ratelimit); the 4-header set is the response-header equivalence claim.
+
+SPEC §1.1 amendment corrects the BRAINSTORM §1.1 hypothesis of `server: envoy-go`: reference Envoy emits literal `envoy`. envoy-go's existing `internal/filter/hcm/codec.go:17::serverHeader()` already returns `"envoy"` so NO envoy-go code change is needed for the server-header value.
+
+### Decision
+
+Phase 11's `DecodeHeaders` body emits the rate-limited response via `f.dcb.SendLocalReply(f.rc.statusCode, f.rc.body, envoyhttp.OrderedHeaders{{Name: "Content-Type", Value: "text/plain"}})`. The framework + HCM/router downstream auto-injection produces the remaining 3 headers (content-length, date, server) and the framing.
+
+The body is encoded as a package-level `const rateLimitedBody = "local_rate_limited"` matching the fault precedent (`const faultAbortBody = "fault filter abort"` at `internal/filter/http/fault/fault.go:27`). The `string` form is wire-equivalent to `[]byte` (Go's `string` is a read-only byte slice header) and matches the `SendLocalReply(status int, body string, headers OrderedHeaders)` signature without conversion.
+
+The status code defaults to 429 per SPEC §11.4; explicit configuration in `[400, 600)` is honored per the PGV check in `buildRuntimeConfig`.
+
+The `SendLocalReply` framework primitive at `internal/filter/http/callbacks.go::DecoderFilterCallbacks` is the EXISTING phase 09 fault primitive at `internal/filter/http/fault/fault.go:321`; phase 11 reuses it verbatim. NO new framework primitive is introduced.
+
+### Alternatives considered
+
+(a) **Body materialization as `var rateLimitedBody = []byte("local_rate_limited")` with `[]byte` runtimeConfig field** — rejected. `SendLocalReply` takes `string`, not `[]byte`; the `var []byte` form would require a `string(rateLimitedBody)` conversion at call site, which is unnecessary. The `const string` form (chosen) matches the fault precedent and requires no conversion.
+
+(b) **Custom 429 response with envoy-go-specific headers (e.g., `x-envoy-rate-limit: enforced`)** — rejected. The wire-equivalence claim requires byte-equivalent fidelity to Envoy v1.37.2; injecting filter-specific response headers would diverge.
+
+(c) **Status text customization (e.g., RFC 8941 status text)** — rejected. The HTTP status text follows RFC 7231 (`Too Many Requests` for 429); no customization needed.
+
+### Consequences
+
+- ADR-0103 (fault abort wire shape) extends with the local_ratelimit variant; the body-byte-exact discipline carries through.
+- The `rateLimitedBody` const is the canonical immutable body string; future filters with similar wire-equivalence claims should follow the same pattern (`const <name>Body = "..."` at package level; reference via `string`; matches `SendLocalReply` signature directly).
+- If Envoy v1.37.2's body string changes in a future Envoy bump (per ADR-0008's pin-bump discipline), the literal string must be updated in lockstep + the SPEC §11.3 empirical pin re-executed.
+- Future shadow-mode phase wiring `filter_enforced` < 100% widens the response: when `enforced` is false but `rate_limited` is true, the request is allowed (no SendLocalReply) but the rate_limited counter still increments — the wire-shape decision in ADR-0119 holds for the enforced subset only; the shadow-mode phase amends ADR-0119 §Consequences in-place per ADR-0089 to record the divergence.
+- The wire-equivalence claim is enforced at fixture 0013 scenario 2 (basic-rate-limited): the driver captures the 429 response bytes + 4-header set + body and asserts byte-equality across reference + subject.
+
