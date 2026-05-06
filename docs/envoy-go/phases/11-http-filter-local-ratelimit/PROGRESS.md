@@ -220,3 +220,15 @@ $ git diff --stat d1da8ca..46866f0
  test/fixtures/0013-http-local-ratelimit/envoy.yaml    | 159 ++++++++++++++++++++++
  2 files changed, 318 insertions(+)
 ```
+
+## Task 12 — Fixture 0013 `expectations.yaml` + `README.md`
+
+**Commits:** `9ce550e` — `phase 11: fixture 0013 expectations + README`
+**Notes:** Lands the prose narrative artefacts per SPEC §4.3 + ADR-0019 (expectations.yaml is prose, not machine-evaluated; the runner's `CompareBytes` enforces machine-checkable byte-equivalence). expectations.yaml documents the per-scenario equivalence claims for all 4 scenarios (basic-allow / basic-rate-limited / refill-after-fill_interval / per-route-override) with verbatim counter-delta assertions + the rate-limited 4-header set in lexicographic order + the lockstep MVP invariant + the ±10ms scenario-3 timing tolerance + the cross-references to ADR-0114..ADR-0119. README.md provides the fixture overview + per-scenario list + 4-listener pre-configured bootstrap discipline + Envoy-deviation note (NONE) + IMPL-1 substitution note + ADR cross-references + planner-time-decisions cross-references. Both files include explicit notes about the IMPL-1 substitution (per-route TPFC `@type` is `...LocalRateLimit`, not `...LocalRateLimitPerRoute`; fields go directly under the message — no `rate_limit:` wrapper) — captures the impl-time correction in the fixture-level prose so future readers don't need to chase PROGRESS.md preamble. Reviews: skipped subagent dispatch — both files are prose with verbatim PLAN content + IMPL-1 note adapted; no compilable code.
+**Outputs:**
+```
+$ git diff --stat 46866f0..9ce550e
+ test/fixtures/0013-http-local-ratelimit/README.md       |  91 +++++++++++++++++
+ test/fixtures/0013-http-local-ratelimit/expectations.yaml | 80 ++++++++++++++++
+ 2 files changed, 171 insertions(+)
+```
