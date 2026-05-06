@@ -2,6 +2,7 @@ package stats
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -185,5 +186,74 @@ func TestHelpText_AccessLogDropped(t *testing.T) {
 	want := "Total access-log records dropped due to backpressure (per-process aggregate across all sinks)."
 	if got := helpText["envoy_server_accesslog_dropped"]; got != want {
 		t.Errorf("helpText[envoy_server_accesslog_dropped] = %q, want %q", got, want)
+	}
+}
+
+// SN9 tests (phase 11 / ADR-0118): local_ratelimit filter-specific tag-extractor.
+
+func TestFlattenToProm_SN9_BasicStatPrefix(t *testing.T) {
+	base, labels, err := flattenToProm("foo.http_local_rate_limit.enabled")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_http_local_rate_limit_enabled" {
+		t.Errorf("base: got %q, want %q", base, "envoy_http_local_rate_limit_enabled")
+	}
+	if len(labels) != 1 || labels[0].Key != "envoy_local_http_ratelimit_prefix" || labels[0].Value != "foo" {
+		t.Errorf("labels: got %v, want [envoy_local_http_ratelimit_prefix=foo]", labels)
+	}
+}
+
+func TestFlattenToProm_SN9_AllFourCounters(t *testing.T) {
+	for _, counter := range []string{"enabled", "ok", "rate_limited", "enforced"} {
+		t.Run(counter, func(t *testing.T) {
+			base, labels, err := flattenToProm("test.http_local_rate_limit." + counter)
+			if err != nil {
+				t.Fatalf("flattenToProm: %v", err)
+			}
+			wantBase := "envoy_http_local_rate_limit_" + counter
+			if base != wantBase {
+				t.Errorf("base: got %q, want %q", base, wantBase)
+			}
+			if len(labels) != 1 || labels[0].Value != "test" {
+				t.Errorf("labels: got %v, want envoy_local_http_ratelimit_prefix=test", labels)
+			}
+		})
+	}
+}
+
+func TestFlattenToProm_SN9_PrefixWithUnderscores(t *testing.T) {
+	base, labels, err := flattenToProm("my_prefix.http_local_rate_limit.ok")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_http_local_rate_limit_ok" {
+		t.Errorf("base: got %q, want %q", base, "envoy_http_local_rate_limit_ok")
+	}
+	if len(labels) != 1 || labels[0].Value != "my_prefix" {
+		t.Errorf("labels: got %v, want value my_prefix", labels)
+	}
+}
+
+func TestFlattenToProm_SN9_DoesNotConflictWithSN1234(t *testing.T) {
+	// SN1 (cluster.) wins over SN9 even if name contains the SN9 segment.
+	base, labels, err := flattenToProm("cluster.foo.http_local_rate_limit.enabled")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	// SN1 produces envoy_cluster_<rest>; load-bearing claim: SN1 wins, NOT SN9.
+	if !strings.HasPrefix(base, "envoy_cluster_") {
+		t.Errorf("base: got %q, want SN1-prefixed envoy_cluster_*", base)
+	}
+	if len(labels) == 0 || labels[0].Key != "envoy_cluster_name" {
+		t.Errorf("labels: got %v, want envoy_cluster_name=foo (SN1 wins)", labels)
+	}
+}
+
+func TestFlattenToProm_SN9_RejectsUnknownCounter(t *testing.T) {
+	// SN9 only matches the 4 known counter names; other suffixes fall through to error.
+	_, _, err := flattenToProm("foo.http_local_rate_limit.unknown")
+	if err == nil {
+		t.Error("flattenToProm with unknown counter: want error, got nil")
 	}
 }

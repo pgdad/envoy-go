@@ -86,6 +86,34 @@ func flattenToProm(internal string) (string, []Label, error) {
 		rest = strings.TrimPrefix(internal, "server.")
 		base = "envoy_server_" + rest
 	default:
+		// Rule SN9 (added per phase 11 ADR-0118 + ADR-0061 amendment): the
+		// local_ratelimit filter-specific tag-extractor matches names of the
+		// shape `<stat_prefix>.http_local_rate_limit.<counter>` where
+		// <stat_prefix> is a single segment (no dots) and <counter> is one of
+		// {enabled, ok, rate_limited, enforced}. Produces Prometheus base name
+		// `envoy_http_local_rate_limit_<counter>` + label
+		// `envoy_local_http_ratelimit_prefix=<stat_prefix>`.
+		//
+		// The rule is a SECOND-PASS detection — fires only on the unmatched-
+		// prefix path (after SN1-SN5 prefix-segment switch fails). The existing
+		// SN1-SN5 hot-path is unchanged.
+		//
+		// Per SPEC §11.5 + ADR-0118.
+		const lrlSegment = ".http_local_rate_limit."
+		if idx := strings.Index(internal, lrlSegment); idx > 0 {
+			prefix := internal[:idx]
+			counter := internal[idx+len(lrlSegment):]
+			// Validate: prefix has no dots; counter is one of the 4 known names.
+			if !strings.ContainsRune(prefix, '.') {
+				switch counter {
+				case "enabled", "ok", "rate_limited", "enforced":
+					labels = append(labels, Label{Key: "envoy_local_http_ratelimit_prefix", Value: prefix})
+					base = "envoy_http_local_rate_limit_" + counter
+					// Skip SN4 status-class collapse below (SN9 names don't have _Nxx suffix).
+					return base, labels, nil
+				}
+			}
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 

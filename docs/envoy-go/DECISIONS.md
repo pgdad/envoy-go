@@ -2208,6 +2208,22 @@ Counter-examples (NOT what Envoy emits):
 
 Phase-06.1 Task 4. Supersedes nothing.
 
+## Amendment (per phase 11 ADR-0118)
+
+Rule SN9 added per phase 11: extends the `flattenToProm` switch with a
+filter-specific tag-extractor for the `<stat_prefix>.http_local_rate_limit.<counter>`
+shape; produces Prometheus base name `envoy_http_local_rate_limit_<counter>` +
+label `envoy_local_http_ratelimit_prefix=<stat_prefix>`. SN9 is a second-pass
+detection — fires only on the unmatched-prefix path (after SN1–SN5 prefix-segment
+switch fails); the existing SN1–SN8 hot-path is unchanged.
+
+Additionally, `Registry.NewCounterIfAbsent(name) *Counter` is added (per
+ADR-0117) permitting idempotent post-Freeze registration. Used by per-route
+filter configurations whose stat_prefix is data-driven (e.g.,
+envoy.filters.http.local_ratelimit per phase 11). The existing `NewCounter`
+panic-on-Freeze discipline is preserved for boot-time registrations; the new
+method is reserved for HCM-build-time per-route registrations.
+
 ## ADR-0064: `stats_config.stats_tags` config not honored; extraction hardcoded
 
 **Status:** Accepted
@@ -5424,3 +5440,59 @@ Per IMPL-1 (PROGRESS.md preamble), upstream Envoy v1.37.2's local_ratelimit reus
 - Future stateful per-route filters reuse the lazy-cache + `NewCounterIfAbsent` pattern; phase 11's `state.resolvePerRouteConfig` + `buildRuntimeConfigPerRoute` are the canonical reference.
 - The race-safety of the lazy-cache is validated by the existing race-detector cycle test (`TestTokenBucket_ConcurrentTryConsume`) + the per-route bucket independence test (`TestDecodeHeaders_PerRouteOverride_IndependentBuckets`); both pass under `-race`.
 - Fixture 0013 scenario 4 mechanically validates the empirical claim per SPEC §11.6 (per-route counters increment independently from listener-level counters; listener counters do NOT increment for per-route reqs).
+
+## ADR-0118: `BEHAVIOR_CONTRACT.md ## Stat-name mapping` 22→26-name extension + `enforced == rate_limited` MVP invariant + filter-specific Prometheus tag-extractor `envoy_local_http_ratelimit_prefix` (Rule SN9)
+
+**Status:** Accepted
+**Date:** 2026-05-05 (phase 11 Task 6 commit)
+**Doctrine:** ADR-0061 stats Registry / SN1–SN8 flattening rules + AMENDMENT (SN9 added); ADR-0040 silent-ignore discipline; ADR-0008 Envoy v1.37.2 pin (empirical evidence source).
+**Lands-in-task:** Phase 11 Task 6 (the SN9 rule + 22→26 extension + MVP-invariant ADR body land together).
+
+### Context
+
+Phase 11 emits 4 new counters per `<stat_prefix>` per SPEC §6.6 + §11.5:
+- `<stat_prefix>.http_local_rate_limit.enabled` (every req reaching the filter)
+- `<stat_prefix>.http_local_rate_limit.ok` (tryConsume → true)
+- `<stat_prefix>.http_local_rate_limit.rate_limited` (tryConsume → false)
+- `<stat_prefix>.http_local_rate_limit.enforced` (tryConsume → false; lockstep with rate_limited under MVP)
+
+The Prometheus rendering per SPEC §11.5 empirical pin requires:
+- Base name `envoy_http_local_rate_limit_<counter>` (NOT prefixed with the existing SN2 `envoy_http_conn_manager_prefix`-keyed shape — the local_ratelimit filter is NOT scoped under the HCM stat_prefix; it has its own filter-level stat_prefix per SPEC §6.1).
+- Label `envoy_local_http_ratelimit_prefix=<stat_prefix>` (filter-specific tag-extractor; NOT the existing SN2 `envoy_http_conn_manager_prefix` label).
+
+The existing `internal/stats/name.go` `flattenToProm` switch handles Rules SN1 (cluster.*), SN2 (http.*), SN3 (listener.*), SN5 (server.*); SN4 is the trailing `_Nxx` status-class collapse. The local_ratelimit names don't fit any existing rule (the prefix is the filter-level stat_prefix, not one of the 4 known top-level segments).
+
+### Decision
+
+**Rule SN9 added to `flattenToProm`'s `default` branch as a second-pass detection.** Matches names of the shape `<stat_prefix>.http_local_rate_limit.<counter>` where `<stat_prefix>` has no dots and `<counter>` is one of `{enabled, ok, rate_limited, enforced}`. Produces Prometheus base name `envoy_http_local_rate_limit_<counter>` + label `envoy_local_http_ratelimit_prefix=<stat_prefix>`. SN1-SN5 prefix-segment switch wins precedence over SN9 (e.g., `cluster.foo.http_local_rate_limit.enabled` routes to SN1, not SN9 — the `cluster.` prefix takes the name first).
+
+**`enforced == rate_limited` MVP invariant.** Phase 11 increments `rate_limited` AND `enforced` IN LOCKSTEP whenever `tryConsume` returns false. This matches reference Envoy's behavior when `filter_enforced=100%` (the SPEC §1.1 amendment requires fixture configs to set `filter_enforced=100%` explicitly). Future shadow-mode phase wiring `filter_enforced` < 100% support widens to `enforced ≤ rate_limited`: when `enforced` is sampled-out, `rate_limited` increments but `enforced` does not. The MVP invariant carries a documented natural-divergence point at the future shadow-mode landing.
+
+**`BEHAVIOR_CONTRACT.md ## Stat-name mapping` 22→26-name table extension** lands at the phase-done commit per ADR-0052 in-place edit authorisation. Verbatim Markdown patch (per SPEC §13.2):
+
+```markdown
+| `<stat_prefix>.http_local_rate_limit.enabled`     | counter | filter | local_ratelimit | every request reaching the filter (§11.5) |
+| `<stat_prefix>.http_local_rate_limit.ok`          | counter | filter | local_ratelimit | request not rate-limited (`tryConsume` → true; §11.5) |
+| `<stat_prefix>.http_local_rate_limit.rate_limited`| counter | filter | local_ratelimit | request rate-limited (`tryConsume` → false; §11.5) |
+| `<stat_prefix>.http_local_rate_limit.enforced`    | counter | filter | local_ratelimit | request rate-limited AND enforced (lockstep with `rate_limited` under MVP per ADR-0118; §11.5) |
+```
+
+**Tag-extraction collision quirk** (per SPEC §11.5 (e)): when `stat_prefix` matches an Envoy-internal tag-extractor name (e.g., literal `listener` matches `envoy.listener_address`), the Prometheus output is mangled. Phase 11's fixture 0013 deliberately uses safe values (`foo`, `bar`, `baz`, `qux`, `strict`) to avoid the collision. Future phases extending stat-prefix coverage may need to address the collision.
+
+**ADR-0061 amendment paragraph** lands inline in the existing ADR-0061 body in `DECISIONS.md`.
+
+### Alternatives considered
+
+(a) **Use SN2 (http.*) shape: rename `<stat_prefix>.http_local_rate_limit.<counter>` to `http.<stat_prefix>.local_rate_limit.<counter>`** — rejected. SPEC §11.5 empirical pin confirms reference Envoy uses the `<stat_prefix>.http_local_rate_limit.<counter>` shape (NOT `http.*`); wire-equivalence requires preserving the empirical shape.
+
+(b) **Filter-package-local tag-extractor registration via `init()` calling a registry-pattern primitive from `internal/stats`** — rejected per planner-time decision 1. The existing `flattenToProm` is a hardcoded switch with no registry/dispatch primitive; introducing one for a single rule would be over-engineering.
+
+(c) **MVP invariant `enforced ≤ rate_limited` (not lockstep)** — rejected. Phase 11's MVP silent-ignores `filter_enforced` (per SPEC §2.1 cluster 2); the fixture sets `filter_enforced=100%` explicitly; under that condition reference Envoy's behavior IS lockstep. The MVP invariant matches reference Envoy exactly under the fixture conditions; future shadow-mode phase widens.
+
+### Consequences
+
+- ADR-0061 (stats Registry / SN1–SN8 + LBP-1) gains an inline amendment paragraph noting Rule SN9 + the `NewCounterIfAbsent` post-Freeze idempotent registration extension. The canonical Decision body is unchanged.
+- The `<stat_prefix>` segment in SN9 is opaque to the rule (any non-dot string is accepted); validation that `<stat_prefix>` is non-empty + non-dot-containing happens at the filter's `New` factory time per ADR-0115.
+- Future filters whose stat-name shape doesn't fit SN1–SN5 follow the SN9 precedent: extend the `default` branch with a filter-specific second-pass detection. Each new rule documents the proto-level stat-name template + the resulting Prometheus base + label shape.
+- Fixture 0013's per-scenario `/stats/prometheus` scrape asserts the SN9 byte-equivalence: each per-stat_prefix scrape emits 4 lines under `envoy_http_local_rate_limit_*` with `envoy_local_http_ratelimit_prefix=<stat_prefix>` label.
+- The tag-extraction collision quirk (per SPEC §11.5 (e)) is OUT of scope for phase 11; the fixture uses safe stat_prefix values; future stat-name-discipline phase may address.
