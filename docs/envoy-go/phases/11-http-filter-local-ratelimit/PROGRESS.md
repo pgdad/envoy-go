@@ -120,3 +120,22 @@ $ git diff --stat c9e89ba..ea152a1
  internal/stats/registry_test.go                             |  44 +++++
  5 files changed, 397 insertions(+), 17 deletions(-)
 ```
+
+## Task 6 — `internal/stats/name.go` Rule SN9 + filter-specific Prometheus tag-extractor + 22→26 stat-table extension
+
+**Commits:** `59c4aa4` — `phase 11: Rule SN9 + filter-specific Prometheus tag-extractor [ADR-0118]`
+**Notes:** Lands Rule SN9 in `internal/stats/name.go`'s `flattenToProm` `default` branch — a SECOND-PASS detection that fires only on the unmatched-prefix path (after SN1-SN5 prefix-segment switch fails); the existing SN1-SN5 hot-path is unchanged. SN9 matches names of the shape `<stat_prefix>.http_local_rate_limit.<counter>` where `<stat_prefix>` has no dots and `<counter>` is one of `{enabled, ok, rate_limited, enforced}`; produces Prometheus base `envoy_http_local_rate_limit_<counter>` + label `envoy_local_http_ratelimit_prefix=<stat_prefix>` per SPEC §11.5 + ADR-0118 + planner-time decision 1. The `idx > 0` guard rejects empty-prefix inputs (leading-dot); the `!strings.ContainsRune(prefix, '.')` guard rejects multi-segment prefixes; the counter switch limits to the 4 known names. SN9 returns directly to skip the SN4 status-class collapse since `<stat_prefix>.http_local_rate_limit.{enabled,ok,rate_limited,enforced}` doesn't have a `_Nxx` suffix. ADR-0118 lands in full at this commit (NOT split with Task 4 per PLAN line 1507 recommendation): covers the SN9 rule design + `enforced == rate_limited` MVP invariant + 22→26-name BEHAVIOR_CONTRACT stat-table extension verbatim Markdown patch (Task 14 applies the patch to BEHAVIOR_CONTRACT.md) + tag-extraction collision quirk note (out-of-scope per SPEC §11.5 (e); fixture 0013 uses safe stat_prefix values to avoid). ADR-0061 amendment paragraph appended in-place at the existing ADR-0061 body (matching ADR-0073's amendment-placement convention from Tasks 5 + 7-prior phases) noting Rule SN9 + `Registry.NewCounterIfAbsent` extensions. Tests: 5 SN9 unit tests landed at the main commit (BasicStatPrefix / AllFourCounters table-driven over 4 counters / PrefixWithUnderscores / DoesNotConflictWithSN1234 — SN1 wins precedence / RejectsUnknownCounter); 2 additional negative tests added in the follow-up commit per code-quality reviewer Important items #1 + #2 (RejectsLeadingDot — exercises the `idx > 0` guard explicitly; RejectsDoublyNestedSegment — exercises the counter-switch rejection on a degenerate doubly-nested segment input). All 7 SN9 tests + the existing 49 stats tests PASS under `-race`. **Code-quality reviewer flagged 3 Important items + 3 Minor items;** 3 Important + 1 Minor folded into the follow-up commit: (a) +2 boundary tests for SN9 (Important #1 + #2) — leading-dot + doubly-nested-segment; (b) `name.go` SN9 counter-switch comment expanded (Important #3) — explicit "KEEP IN SYNC with newFilterStats / newFilterStatsIfAbsent" note + future-widening guidance to extend BOTH this switch AND the filter's filterStats struct in lockstep; (c) ADR-0057 stale forward-reference at line 2148 (Minor #5) — paragraph (c) originally anticipated calling the histogram rule "SN9" but phase 11 claimed the SN9 number for local_ratelimit; reworded to "a new flattening rule" + a HISTORICAL NOTE pointing at ADR-0118 + clarifying that the future histogram rule will use the next-free SN number at its landing. Reviewer's other Minor items (stale ADR-0057 SN9 cross-reference reading, `strings` import note, multi-segment-prefix-vs-SPEC-§11.5 confirmation) deferred per the reviewer's "no critical issues" assessment.
+**Outputs:**
+```
+$ go test -race -count=1 ./internal/stats/...
+ok  	github.com/esalaine/envoy-go/internal/stats	1.024s
+$ go vet ./...
+(clean)
+$ golangci-lint run ./...
+(clean)
+$ git diff --stat ea152a1..59c4aa4
+ docs/envoy-go/DECISIONS.md      | 78 ++++++++++++++++++++++++++++++++
+ internal/stats/name.go          | 30 +++++++++++++
+ internal/stats/name_test.go     | 75 +++++++++++++++++++++++++++++++
+ 3 files changed, 183 insertions(+)
+```

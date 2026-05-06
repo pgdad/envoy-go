@@ -257,3 +257,25 @@ func TestFlattenToProm_SN9_RejectsUnknownCounter(t *testing.T) {
 		t.Error("flattenToProm with unknown counter: want error, got nil")
 	}
 }
+
+func TestFlattenToProm_SN9_RejectsLeadingDot(t *testing.T) {
+	// Leading-dot input: idx == 0 (segment match starts at position 0); the
+	// `idx > 0` guard rejects this so prefix can never be empty. The name
+	// falls through to the error return.
+	_, _, err := flattenToProm(".http_local_rate_limit.enabled")
+	if err == nil {
+		t.Error("flattenToProm with leading-dot prefix: want error, got nil (idx==0 must reject)")
+	}
+}
+
+func TestFlattenToProm_SN9_RejectsDoublyNestedSegment(t *testing.T) {
+	// Degenerate input: stat_prefix that itself contains the SN9 segment
+	// substring. strings.Index returns the FIRST occurrence, so prefix becomes
+	// "a" and counter becomes "b.http_local_rate_limit.enabled". The counter
+	// switch rejects "b.http_local_rate_limit.enabled" (not in the 4-name
+	// set), so the name falls through to the error return.
+	_, _, err := flattenToProm("a.http_local_rate_limit.b.http_local_rate_limit.enabled")
+	if err == nil {
+		t.Error("flattenToProm with doubly-nested SN9 segment: want error, got nil")
+	}
+}

@@ -105,6 +105,12 @@ func flattenToProm(internal string) (string, []Label, error) {
 			counter := internal[idx+len(lrlSegment):]
 			// Validate: prefix has no dots; counter is one of the 4 known names.
 			if !strings.ContainsRune(prefix, '.') {
+				// KEEP IN SYNC with newFilterStats / newFilterStatsIfAbsent in
+				// internal/filter/http/localratelimit/local_ratelimit.go: the 4
+				// counter names below MUST match the filter's emitted set.
+				// Future widening (e.g., a `shadow_mode` counter when
+				// filter_enforced<100% support lands) extends BOTH this switch
+				// AND the filter's filterStats struct + constructors in lockstep.
 				switch counter {
 				case "enabled", "ok", "rate_limited", "enforced":
 					labels = append(labels, Label{Key: "envoy_local_http_ratelimit_prefix", Value: prefix})

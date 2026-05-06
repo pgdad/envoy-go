@@ -2145,7 +2145,7 @@ The deferral is to a later 06.x sub-phase or to an upstream-robustness-family ph
 
 - (a) **Rule SN7** (in `internal/stats/name.go` and BEHAVIOR_CONTRACT.md §Stat-name mapping) reads "Histograms are not emitted by 06.1 (forward-looking)." The flattening rules SN1–SN8 stay counter+gauge-only.
 - (b) The 17-name catalog in phase-06.1 SPEC §6 is exhaustive for 06.1. The differential gate (Task 14, fixture 0005) compares envoy-go's `/stats/prometheus` output against a pre-recorded Envoy v1.37.2 output that has been pre-filtered to those 17 names; histogram lines from Envoy's output are filtered out before the diff (per SPEC §3).
-- (c) The future histogram-introducing sub-phase supersedes this ADR. That ADR will introduce Rule SN9 (or extend SN7) to enable histogram emission, will introduce the histogram primitive in `internal/stats`, and will widen SPEC §6's catalog.
+- (c) The future histogram-introducing sub-phase supersedes this ADR. That ADR will introduce a new flattening rule (or extend SN7) to enable histogram emission, will introduce the histogram primitive in `internal/stats`, and will widen SPEC §6's catalog. (HISTORICAL NOTE: this paragraph originally anticipated calling the histogram rule "SN9". Phase 11 instead claimed the SN9 number for the local_ratelimit filter-specific tag-extractor — see ADR-0118. The future histogram rule will use the next-free SN number at its landing.)
 - (d) `server.uptime` is co-deferred to the same future sub-phase. 06.1's `server.live` gauge (always 1 once boot completes) is the only `server.*` metric in SPEC §6.
 
 ### Lands-in-task
