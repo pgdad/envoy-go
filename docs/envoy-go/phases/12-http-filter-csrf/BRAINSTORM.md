@@ -26,7 +26,7 @@ Phase 12 lands `envoy.filters.http.csrf` (the canonical Envoy CSRF filter) under
 
 2. **Extension-registry registration** at boot, per ADR-0072. `cmd/envoy-go/main.go` (currently registering `router.New`, `cors.New`, `envoygotest.New`, `fault.New`, `header_mutation.New`, `localratelimit.New` before the `httpReg.Freeze()` invocation) gains a seventh `httpReg.Register(csrf.TypeURL, csrf.New)` call before the freeze. Insertion alphabetical-after-router per the ADR-0100 §2.2 convention: `router → cors → csrf → envoy_go_test → fault → header_mutation → local_ratelimit → Freeze`. Csrf inserts between `cors` and `envoy_go_test` to maintain alphabetical-after-router ordering. Per ADR-0072, registration order does NOT affect runtime behavior; this is a stylistic discipline only.
 
-3. **Proto-config parsing** of `envoy.extensions.filters.http.csrf.v3.CsrfPolicy`, the canonical filter-level config message. Per `go-control-plane`'s v1.32.4 module (proto pin via ADR-0008 → Envoy v1.37.2 → proto v3), the message has 3 top-level fields (the smallest §9 family proto surface to date). Phase 12 consumes 1 — `additional_origins[].StringMatcher.exact` (the StringMatcher's `exact` variant only; non-exact variants — `prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case` — are silently skipped at match time per the entry-level silent-ignore discipline mirroring phase 09 fault `headers` precedent). The remaining 2 fields (`filter_enabled`, `shadow_enabled` — both `RuntimeFractionalPercent` couplings to the Runtime + hot restart family) are silently ignored at config-load time under the inline-deferral discipline (no omnibus ADR per phase 11 SPEC §8.1; see §8 below).
+3. **Proto-config parsing** of `envoy.extensions.filters.http.csrf.v3.CsrfPolicy`, the canonical filter-level config message. Per `go-control-plane`'s v1.32.4 module (proto pin via ADR-0008 → Envoy v1.37.2 → proto v3), the message has 3 top-level fields (the smallest §9 family proto surface to date). Phase 12 consumes 1 — `additional_origins[].StringMatcher.exact` (the StringMatcher's `exact` variant only with non-empty value; non-exact variants — `prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case` — are dropped at PARSE time, matching phase 09 fault `headers` discipline per ADR-0101 §3 verbatim: "only `HeaderMatcher_StringMatch` with non-empty `Exact` value is honored. All other variants … are silent-ignored at parse time"). The remaining 2 fields (`filter_enabled`, `shadow_enabled` — both `RuntimeFractionalPercent` couplings to the Runtime + hot restart family) are silently ignored at config-load time under the inline-deferral discipline (no omnibus ADR per phase 11 SPEC §8.1; see §8 below).
 
 4. **Method gate (Q4 = a₁).** The filter evaluates only modifying-method requests; non-modifying methods pass through with no counter increments and no origin extraction. Modifying-method set hardcoded as `{POST, PUT, DELETE, PATCH}`, case-sensitive match against the `:method` pseudo-header (HTTP/2) or method token (HTTP/1.1 — normalized upper-case by the HCM before filter dispatch). Methods outside this set — `GET`, `HEAD`, `OPTIONS`, `TRACE`, `CONNECT`, custom verbs — return `Continue` immediately from `DecodeHeaders` without inspecting any other request state. Empirical pin §11.P1 confirms exact set against Envoy v1.37.2.
 
@@ -44,7 +44,7 @@ Phase 12 lands `envoy.filters.http.csrf` (the canonical Envoy CSRF filter) under
     | ∈ modifying | != destination | no | yes | `Continue` | `request_valid +1` |
     | ∈ modifying | != destination | no | no | `SendLocalReply(403)` + `StopIteration` | `request_invalid +1` |
 
-    `additional_origins[]` iterated in proto-declared order; first `exact` match wins. Non-exact entries silently skipped (entry-level non-exact silent-ignore per phase 09 fault `headers` precedent). NO async-resume; NO encode-side state. `DecodeData` / `DecodeTrailers` / all `Encode*` are pass-through. csrf reuses fault.abort + local_ratelimit's request-side `StopIteration` + `SendLocalReply` primitives exactly — NO new framework primitive.
+    `additional_origins[]` (the runtime-visible slice — already filtered to surviving exact-with-non-empty-value entries at parse time per ADR-0101 §3 discipline) iterated in proto-declared order; first `exact` match wins. NO async-resume; NO encode-side state. `DecodeData` / `DecodeTrailers` / all `Encode*` are pass-through. csrf reuses fault.abort + local_ratelimit's request-side `StopIteration` + `SendLocalReply` primitives exactly — NO new framework primitive.
 
 8. **Per-route bucket isolation as wholesale override (data-only).** Per the proto message `CsrfPolicy` itself (which serves as both listener-level and per-route-TPFC type — there is NO separate `CsrfPolicyPerRoute` wrapper; the proto file defines exactly one top-level message), each TPFC entry runs through `New` at config-load time; each `New` invocation allocates its own `runtimeConfig` with its own compiled `additional_origins` slice (an opaque list of normalized-origin strings, one per entry whose StringMatcher.exact is non-empty). The 3-tier resolver picks the most-specific config per request; that config's `additional_origins` is consulted (NOT the listener-level fallback). Listener-level config is NOT merged with per-route — wholesale-replacement per ADR-0073. UNLIKE phase 11 (first stateful per-route filter, ADR-0117 amendment to ADR-0073), phase 12's per-route is purely **data-only** (just a slice of strings) — NO stateful resources, NO atomic counters, NO mutex-protected runtime state. Phase 12 adds NO amendment to ADR-0073.
 
@@ -116,7 +116,7 @@ This section is the brainstorm's decision log. Each Decision states **what** is 
 
 **Decision (per Q2 = Option C):** Phase 12 consumes 1 of 3 proto top-level fields:
 
-- **`additional_origins`** (`[]StringMatcher`, repeated) — **CONSUMED** with StringMatcher.exact variant only. Other StringMatcher variants (`prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case`) are silently skipped at match time per the entry-level silent-ignore discipline (the entry exists in the proto, is parsed, but its match attempt always fails — matching phase 09 fault `headers` precedent).
+- **`additional_origins`** (`[]StringMatcher`, repeated) — **CONSUMED** with StringMatcher.exact variant only (with non-empty value). Other StringMatcher variants (`prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case`) are dropped at PARSE time per ADR-0101 §3 verbatim discipline ("only `HeaderMatcher_StringMatch` with non-empty `Exact` value is honored. All other variants … are silent-ignored at parse time"). Non-exact entries do NOT survive the `New` factory; they are filtered out before `runtimeConfig` is constructed. This is architecturally cleaner than match-time-fail (no dead data carried into runtime) and matches the established phase 09 precedent verbatim.
 
 The remaining 2 fields are silently ignored at config-load time (no warnings):
 
@@ -153,7 +153,7 @@ The remaining 2 fields are silently ignored at config-load time (no warnings):
 
 **Comparison:**
 - Source-origin matches destination-origin if and only if the normalized canonical forms are byte-equal (case-folded scheme + host; port-equal modulo default).
-- Source-origin matches `additional_origins` if any list entry's StringMatcher.exact value (treated as a normalized canonical-origin-string at config-load time) byte-equals the normalized source-origin. Non-exact StringMatcher variants on entries are silently skipped at match time.
+- Source-origin matches `additional_origins` if any surviving list entry's StringMatcher.exact value (treated as a normalized canonical-origin-string at config-load time) byte-equals the normalized source-origin. Non-exact StringMatcher variants and empty-value exact entries are dropped at parse time per ADR-0101 §3 discipline; the runtime only sees the surviving entries.
 
 **Why full-origin (Q3 = α) vs. host-only (β) vs. defer-to-empirical (γ):**
 - (α) **CHOSEN.** Envoy's csrf filter is documented as a same-origin enforcement filter; same-origin in browser-security is full-triple per RFC 6454. Full-origin is the only flavor where the StringMatcher input format is unambiguous (the full normalized-origin string).
@@ -189,6 +189,8 @@ The remaining 2 fields are silently ignored at config-load time (no warnings):
 **Decision:** Per-route `typed_per_filter_config` for csrf carries a `*CsrfPolicy` value (the same proto type as listener-level — there is NO separate `CsrfPolicyPerRoute` wrapper; the proto file defines exactly one top-level message). Each TPFC entry is parsed via `New` at config-load time → produces a fresh `*runtimeConfig` with its own compiled `additional_origins` slice (an opaque list of normalized-origin strings). The 3-tier `PerRouteConfig.Resolve` (Route > VirtualHost > RouteConfiguration > listener fallback) selects the most-specific config per request; that config is the wholesale override.
 
 **Per-route is data-only.** UNLIKE phase 11 (first stateful per-route filter, ADR-0117 amendment to ADR-0073 — per-route entries each owned a `tokenBucket`), phase 12's per-route entries hold ONLY a slice of normalized-origin strings. NO stateful resources, NO atomic counters, NO mutex-protected runtime state. Phase 12 adds NO amendment to ADR-0073.
+
+**ADR-0073 has been amended TWICE prior to phase 12** — once by ADR-0110 (phase 10 multi-tier `ResolveAllTiers` accessor for filters whose proto semantics demand cross-tier evaluation rather than most-specific-override), and once by ADR-0117 (phase 11 stateful per-route bucket carry, codifying that wholesale-override extends to stateful resources without further framework support). Phase 12 inherits the wholesale-override discipline as established by both amendments — uses the existing 3-tier `Resolve` (NOT `ResolveAllTiers`, since csrf is most-specific-override per the cors/fault precedent, NOT multi-tier) and treats per-route data as wholesale-replacement (matching ADR-0117's general "wholesale-replacement extends across all data shapes" reading). Phase 12 adds NO third amendment.
 
 **Why this vs. alternatives:**
 - *Why same proto type (no per-route wrapper)?* The `CsrfPolicy` proto file defines exactly ONE top-level message. The Envoy-style design is that the same `CsrfPolicy` serves both listener-level and per-route-TPFC purposes. envoy-go follows the proto.
@@ -274,7 +276,7 @@ Phase 12 introduces ZERO new framework primitives. Specifically:
 - NO new `*HTTPRegistry` method (phase 11 added `NewCounterIfAbsent` to `stats.Registry`; phase 12 reuses as-is for the 3 counters).
 - NO new `PerRouteConfig` accessor (phase 10 added `ResolveAllTiers`; phase 12 uses the existing 3-tier `Resolve`).
 - NO new `RegisterPerRouteValidator` hook (phase 10 added the eager-validation hook; phase 12 does NOT — per-route configs validate standalone via `New`).
-- NO amendment to ADR-0073 (phase 11 added an amendment for stateful per-route via ADR-0117; phase 12 does NOT — per-route is data-only).
+- NO amendment to ADR-0073 (phase 10 added an amendment for multi-tier evaluation via ADR-0110; phase 11 added an amendment for stateful per-route via ADR-0117; phase 12 does NOT add a third — per-route is data-only AND most-specific-override).
 - NO new `internal/stats/name.go` SN flattening rule (phase 11 added Rule SN9; phase 12 does NOT — stats anchor at HCM stat_prefix, reusing existing `envoy_http_conn_manager_prefix` tag-extraction).
 
 This makes phase 12 the structurally-thinnest §9 family-row to date. The phase touches only:
@@ -324,7 +326,7 @@ additional_origins:
   - exact: "https://route-only.test"
 ```
 
-`filter_enabled` and `shadow_enabled` are unset on both sides (both default to 100%-active and 0%-shadow per Envoy convention; envoy-go silent-ignores both fields and is effectively always-100%-active never-shadow regardless).
+`filter_enabled` and `shadow_enabled` initial-fixture state is **conditional on §11.P11 empirical pin outcome**: BRAINSTORM hypothesizes both unset on both sides (Envoy convention per docstring: `filter_enabled` defaults to 100%-active, `shadow_enabled` defaults to 0%-shadow; envoy-go silent-ignores both fields and is effectively always-100%-active never-shadow regardless). However, phase 11's analogous local_ratelimit pin overturned the docstring-trust hypothesis at SPEC §11.2/§11.4 — the actual runtime default was 0%-OFF — forcing fixture configs to set explicit 100% on BOTH sides. SPEC author resolves §11.P11 in-session against Envoy v1.37.2 BEFORE finalizing fixture 0014 configs; if the pin reveals the same docstring-trust trap, both `envoy.yaml` and `envoy-go.yaml` must set `filter_enabled: {default_value: {numerator: 100, denominator: HUNDRED}}` explicitly (envoy-go side is mechanical since the field is silent-ignored runtime-side; Envoy side is required for differential equivalence).
 
 ### 6.2 6 scenarios (per Q5 = B+5)
 
@@ -369,7 +371,7 @@ Go driver in `inputs/driver.go` per phase 09/10/11 precedent — sequential requ
 | ADR | Subject | Anchor decision |
 |---|---|---|
 | **ADR-0120** | `internal/filter/http/csrf/` package shape — single-token directory matching cors precedent + boot registration ordering (`router → cors → csrf → ...`) + `TypeURL` constant + `New` factory + 4-file split | Decision 1 (§2.1) + Decision 2 (§2.2) |
-| **ADR-0121** | `runtimeConfig` shape + 1-consumed/2-deferred field decomposition (`additional_origins[].StringMatcher.exact` consumed; `filter_enabled` + `shadow_enabled` silent-ignored under Runtime + hot restart family deferral) + StringMatcher non-exact variants entry-level silent-ignore | Decision 3 (§2.3) |
+| **ADR-0121** | `runtimeConfig` shape + 1-consumed/2-deferred field decomposition (`additional_origins[].StringMatcher.exact` non-empty value consumed; `filter_enabled` + `shadow_enabled` silent-ignored under Runtime + hot restart family deferral) + StringMatcher non-exact variants dropped at PARSE time per ADR-0101 §3 discipline (NOT match-time-keep-and-fail) | Decision 3 (§2.3) |
 | **ADR-0122** | Origin extraction (Origin → Referer fallback) + comparison algorithm (full-origin equality per Q3 = α) + method gate (canonical 4-method set per Q4 = a₁) + normalization rules (lowercase scheme/host; strip default port; canonical `<scheme>://<host>[:<port>]`) + scheme inference from listener TLS state + `additional_origins[].exact` matched against full normalized origin string | Decision 4 (§2.4) + Decision 5 (§2.5) |
 | **ADR-0123** | Rejection path wire shape — `SendLocalReply(403)` + body byte-exact `Invalid origin` (14 bytes, no LF) + 4-header set lowercase wire-form (`content-length: 14`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`) + `StopIteration` from `DecodeHeaders` — reuses fault.abort/local_ratelimit primitive | Decision 8 (§2.8) |
 | **ADR-0124** | `BEHAVIOR_CONTRACT.md ## Stat-name mapping` 26→29-name extension for 3 `csrf.*` counters + namespace anchor at HCM stat_prefix (no new SN flattening rule; reuses existing `envoy_http_conn_manager_prefix` Prometheus tag) + drop `shadow_request_invalid` from MVP stat surface (couples to deferred shadow mode) | Decision 7 (§2.7) |
@@ -385,27 +387,29 @@ NO omnibus ADR for deferrals (phase 11 dropped this pattern at SPEC §8.1; defer
 ### 8.1 `filter_enabled` (RuntimeFractionalPercent)
 
 **Coupled to:** Runtime + hot restart family.
-**Envoy default:** 100% when unset (per Envoy v1.37.2 docstring: "This field defaults to 100/HUNDRED").
-**envoy-go behavior:** silent-ignored at config-load time; runtime is effectively always-100%-active.
-**Divergence-window:** differential fixture 0014 leaves the field unset on both sides (both sides default to 100%-active); users who explicitly set `default_value < 100%` will see Envoy gate by percentage, envoy-go always-100%. Documented at BEHAVIOR_CONTRACT.md `### envoy.filters.http.csrf` subsection + `### Phase 12 forward-pointer notes`.
+**Envoy default per docstring:** 100% when unset (per Envoy v1.37.2 csrf.pb.go:33-41 docstring: "This field defaults to 100/HUNDRED").
+**Envoy actual runtime default:** EMPIRICAL-PIN OPEN — see §11.P11. Phase 11's analogous `local_ratelimit.filter_enabled` pin (SPEC §11.2/§11.4) overturned the docstring-trust hypothesis (actual runtime default was 0%-OFF), forcing fixture configs to set explicit 100% on both sides. Phase 12 SPEC author resolves the same question for csrf in-session before finalizing fixture 0014.
+**envoy-go behavior:** silent-ignored at config-load time; runtime is effectively always-100%-active regardless of proto value.
+**Divergence-window:** differential fixture 0014 fixture-config decision is conditional on §11.P11 outcome (see §6.1). Users who explicitly set `default_value < 100%` will see Envoy gate by percentage, envoy-go always-100%. Documented at BEHAVIOR_CONTRACT.md `### envoy.filters.http.csrf` subsection + `### Phase 12 forward-pointer notes`.
 **Future re-activation:** when Runtime + hot restart family lands, the field becomes operational; the divergence-window closes.
 
 ### 8.2 `shadow_enabled` (RuntimeFractionalPercent)
 
 **Coupled to:** Runtime + hot restart family.
-**Envoy default:** 0% when unset (filter is in enforcement mode, not shadow mode).
-**envoy-go behavior:** silent-ignored at config-load time; runtime is effectively never-shadow.
-**Divergence-window:** differential fixture 0014 leaves the field unset on both sides (both sides default to enforcement mode); users who explicitly set `default_value > 0%` while also having `filter_enabled` off will see Envoy enter shadow mode (evaluate-but-don't-enforce), envoy-go always-enforce. Documented at BEHAVIOR_CONTRACT.md `### envoy.filters.http.csrf` subsection + `### Phase 12 forward-pointer notes`.
+**Envoy default per docstring:** 0% when unset; further per csrf.pb.go:43-50, the field is "intended to be used when filter_enabled is off and will be ignored otherwise" — so its observable runtime effect is conditional on `filter_enabled`'s state.
+**Envoy actual runtime default:** EMPIRICAL-PIN OPEN — see §11.P11 (same trap-detection scope covers `shadow_enabled`).
+**envoy-go behavior:** silent-ignored at config-load time; runtime is effectively never-shadow regardless of proto value.
+**Divergence-window:** differential fixture 0014 fixture-config decision is conditional on §11.P11 outcome. Users who explicitly set `default_value > 0%` while also having `filter_enabled` off will see Envoy enter shadow mode (evaluate-but-don't-enforce), envoy-go always-enforce. Documented at BEHAVIOR_CONTRACT.md `### envoy.filters.http.csrf` subsection + `### Phase 12 forward-pointer notes`.
 **Stat coupling:** the `shadow_request_invalid` counter is dropped from MVP stat surface (per Decision 7 §2.7). When shadow mode lands, the counter is added back; the 29-name table extends to 30 names.
 **Future re-activation:** when Runtime + hot restart family lands, the field becomes operational; the divergence-window closes; the counter is added back.
 
 ### 8.3 `additional_origins[].StringMatcher` non-exact variants
 
 **Coupled to:** whatever future phase lands the full StringMatcher engine (TBD; not currently a §9 family heading).
-**Variants deferred:** `prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case`. The `exact` variant is consumed.
-**envoy-go behavior:** entry-level silent-ignore at match time. The list entry is parsed into `runtimeConfig` (the proto round-trips through `New`), but the StringMatcher's match attempt at runtime always returns `false` for non-exact variants. The list as a whole still functions normally — non-exact entries are present-but-never-match; exact entries match per the algorithm.
-**Discipline:** mirrors phase 09 fault `headers` field (StringMatcher non-exact variants silently ignored at match time per ADR-0101 fault precedent).
-**Future re-activation:** when the full StringMatcher engine lands, non-exact variants become operational; the divergence-window closes; existing fixtures continue to work since they only use `exact`.
+**Variants deferred:** `prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case`. The `exact` variant (non-empty value) is consumed.
+**envoy-go behavior:** PARSE-TIME drop. Non-exact entries do NOT survive the `New` factory — they are filtered out before `runtimeConfig` is constructed; the runtime never sees them. Empty-value `exact` entries are also dropped (mirroring ADR-0101's "non-empty Exact value is honored" qualifier). The list as a whole still functions normally — only the surviving exact-entries enter the match loop.
+**Discipline:** mirrors phase 09 fault `headers` field verbatim (StringMatcher non-exact variants dropped at parse time per ADR-0101 §3). NOT match-time-keep-and-fail.
+**Future re-activation:** when the full StringMatcher engine lands, non-exact variants become operational at parse time; existing fixtures continue to work since they only use `exact`. Re-activation does NOT change the architectural shape (parse-time-decision rather than runtime-decision); it just expands the set of variants that survive parse.
 
 ---
 
@@ -425,6 +429,7 @@ The SPEC author scrapes reference Envoy v1.37.2 in-session per ADR-0004 and conf
 | §11.P8 | `additional_origins` matching target | full-origin string `<scheme>://<host>[:<port>]` | Scrape: confirm StringMatcher receives full triple, not bare host. Drive `Origin: http://app.example.test` against config `additional_origins: [exact: "https://app.example.test"]` — does Envoy reject (scheme differs)? |
 | §11.P9 | Per-route TPFC wholesale-override | listener `additional_origins` NOT merged with per-route | Scrape: listener `[A]`, per-route `[B]`; confirm route requests with origin `A` are REJECTED (not allowed by listener fallback). |
 | §11.P10 | Header set on rejection | 4-header lowercase wire-form (`content-length`, `content-type`, `date`, `server: envoy`); `content-length: 14`; `content-type: text/plain` (no `charset=UTF-8` modifier) | Scrape: full header dump on a 403 csrf rejection; confirm absence of `cache-control`, `x-content-type-options`, `transfer-encoding: chunked`, and absence of `charset=UTF-8` modifier. |
+| §11.P11 | `filter_enabled` runtime default with field UNSET | csrf proto docstring claims `filter_enabled` defaults to `100%/HUNDRED` when unset → filter evaluates every modifying request | **Highest-priority pin (precedent: phase 11 SPEC §11.2/§11.4 found `local_ratelimit.filter_enabled` defaults to 0%-OFF at runtime despite suggestive docstring, forcing fixture configs to set explicit 100% on BOTH sides).** Scrape reference Envoy v1.37.2 with NO `filter_enabled` field set: drive a cross-origin `POST /` with `Origin: https://evil.test` against listener-level CsrfPolicy that has `additional_origins: [exact: "https://app.example.test"]` (no `filter_enabled` field at all). Does Envoy reject (filter active per docstring) or allow (filter inactive — same trap as phase 11)? **Fixture decision is conditional on this pin's outcome:** if filter active when unset → fixture leaves `filter_enabled` unset on both sides per BRAINSTORM hypothesis (§6.1, §8.1); if filter inactive when unset → fixture must set explicit `filter_enabled: {default_value: {numerator: 100, denominator: HUNDRED}}` on the Envoy side (envoy-go silent-ignores either way; behavior is always-100%). Same trap-detection scope applies to `shadow_enabled`: per csrf.pb.go:43-50 the `shadow_enabled` field is "ignored when filter_enabled is on," so its runtime default behavior under all-defaults config is also empirically open. |
 
 If the SPEC author finds any divergence from these hypotheses, SPEC §11 records the divergence verbatim + reconciles with the BRAINSTORM Decision (most likely by amending the Decision in SPEC; the BRAINSTORM is not edited post-landing per D-3.5 + D-3.4).
 
@@ -470,12 +475,12 @@ Likely 12-18 test functions covering the algorithm + factory + per-route surface
 - `TestDecodeHeaders_OriginNormalization` — uppercase scheme + default port + uppercase host all normalize correctly.
 - `TestDecodeHeaders_DestinationSchemeFromTLS` — TLS listener → `https`; plaintext listener → `http`.
 - `TestDecodeHeaders_PerRouteOverride` — per-route TPFC produces independent disposition (listener config NOT consulted on per-route hit).
-- `TestRuntimeConfig_StringMatcherNonExact` — non-exact entries are present-but-silently-ignored at match time.
+- `TestRuntimeConfig_StringMatcherNonExact` — non-exact entries are dropped at parse time (do NOT survive `New`); `runtimeConfig` carries only the surviving exact entries (per ADR-0101 §3 discipline).
 - `TestStats_Counters` — `request_valid` / `request_invalid` / `missing_source_origin` increment per the disposition table.
 
 ### 11.2 Fuzzer (`fuzz_test.go`)
 
-`FuzzCsrfPolicyConfigParse` — the **16th fuzzer** in the repo. Fuzz target: random bytes → `protojson.Unmarshal` into `*CsrfPolicy` → `New(ctx, cfg)`; assert no panic. Optional secondary corpus: pre-seeded `additional_origins` with malformed StringMatcher.regex patterns (those silently ignored, but should not panic at parse time).
+`FuzzCsrfPolicyConfigParse` — the **16th fuzzer** in the repo. Fuzz target: random bytes → `protojson.Unmarshal` into `*CsrfPolicy` → `New(ctx, cfg)`; assert no panic. Optional secondary corpus: pre-seeded `additional_origins` with malformed StringMatcher.regex patterns (those dropped at parse time per ADR-0101 §3 discipline; should not panic during the parse-time filter step).
 
 The 15 prior fuzzers (per phase 11 STATE.md): trivially listed by `find . -name 'fuzz_test.go'` — phases 06.1 through 11 each landed at least one. Phase 12 adds one.
 
