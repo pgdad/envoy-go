@@ -463,7 +463,7 @@ This brainstorm does NOT pre-populate stub rows for the other §9 family-childre
 
 Likely 12-18 test functions covering the algorithm + factory + per-route surface:
 
-- `TestNew_*` — factory: valid policy, invalid Any (proto unmarshal failure), `additional_origins` with non-exact StringMatcher (entry-skip — test the entry is parsed but never matches at runtime).
+- `TestNew_*` — factory: valid policy, invalid Any (proto unmarshal failure), `additional_origins` with non-exact StringMatcher (test the non-exact entry is dropped at parse time and does NOT survive into the resulting `runtimeConfig`'s compiled-origin slice; runtime carries only surviving exact entries per ADR-0101 §3 discipline).
 - `TestDecodeHeaders_NonModifyingMethods` — parametrized over `GET, HEAD, OPTIONS, TRACE` (and at least one custom verb like `CONNECT` or `PROPFIND`); all return `Continue` immediately, no counter increments, no origin parsing invoked. **This subsumes scenario 6 from the Q5 dialogue.**
 - `TestDecodeHeaders_SameOrigin` — `Origin` matches `Host` (HTTP plaintext listener variant; HTTPS TLS listener variant — verifies scheme inference).
 - `TestDecodeHeaders_CrossOrigin` — `Origin` differs from `Host`; rejected with 403 + `Invalid origin` + 4-header set.
