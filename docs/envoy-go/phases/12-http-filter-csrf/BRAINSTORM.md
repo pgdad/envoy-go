@@ -58,7 +58,7 @@ Phase 12 lands `envoy.filters.http.csrf` (the canonical Envoy CSRF filter) under
 
 ### 1.2 What 12 does NOT deliver (forward to §8)
 
-The exhaustive deferral list lives in §8 under the inline-deferral discipline (no omnibus ADR per phase 11 SPEC §8.1 precedent; deferrals are 3 items grouped by family-coupling). The summary: percentage-based filter gating (`filter_enabled`), shadow-mode evaluation (`shadow_enabled`), and StringMatcher non-exact variants on `additional_origins` are all out-of-scope. None are blockers for closing row 12 phase-done; the percentage fields are silently ignored at config-load time (no warnings; faithful to the cors / fault / header_mutation / local_ratelimit deferral discipline); the StringMatcher non-exact variants are silently skipped at match time (per-entry; entry is present but never matches).
+The exhaustive deferral list lives in §8 under the inline-deferral discipline (no omnibus ADR per phase 11 SPEC §8.1 precedent; deferrals are 3 items grouped by family-coupling). The summary: percentage-based filter gating (`filter_enabled`), shadow-mode evaluation (`shadow_enabled`), and StringMatcher non-exact variants on `additional_origins` are all out-of-scope. None are blockers for closing row 12 phase-done; the percentage fields are silently ignored at config-load time (no warnings; faithful to the cors / fault / header_mutation / local_ratelimit deferral discipline); the StringMatcher non-exact variants are dropped at parse time per ADR-0101 §3 discipline (non-exact entries do not survive the `New` factory).
 
 ### 1.3 Phase-done as a §9 family-row landing
 
@@ -129,7 +129,7 @@ The remaining 2 fields are silently ignored at config-load time (no warnings):
 
 **Deferred to SPEC:** the precise wire shape of the silent-ignore for the two percentage fields (config-load-time reads them, runtime ignores them — same shape as phase 11's `filter_enabled`/`filter_enforced`).
 
-**ADR anchor:** ADR-0121 — `runtimeConfig` shape + 1-consumed/2-deferred decomposition + StringMatcher non-exact entry-level silent-ignore + Runtime-family coupling for both percentage fields + drop `shadow_request_invalid` from MVP stat surface.
+**ADR anchor:** ADR-0121 — `runtimeConfig` shape + 1-consumed/2-deferred decomposition + StringMatcher non-exact variants dropped at PARSE time per ADR-0101 §3 discipline + Runtime-family coupling for both percentage fields + drop `shadow_request_invalid` from MVP stat surface.
 
 ### 2.4 Origin extraction + comparison algorithm *(Decision 4 → ADR-0122)*
 
