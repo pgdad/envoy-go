@@ -478,3 +478,39 @@ PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.012s
 ```
 
+## Task 5 — `FuzzCsrfPolicyConfigParse` fuzzer
+
+**Commits:** `TBD` — `phase 12: FuzzCsrfPolicyConfigParse (16th fuzzer; 30s budget green)`
+**Notes:** Lands the SIXTEENTH fuzzer overall (post phase-11's fifteenth `FuzzLocalRateLimitConfigParse`) per SPEC §14.3 + ADR-0018's "every parser/codec/filter ships a fuzzer" discipline. ~70 LoC. Fuzzes arbitrary `[]byte` sequences as the `Value` of a `*anypb.Any` (with fixed canonical `TypeURL`) passed to `New`. Asserts: never panic; never return `(nil, nil)`; on factory-success the factory invokes without panic AND `hf.Decoder` is non-nil. Seed corpus: 3 well-formed `*csrfv3.CsrfPolicy` proto-marshalled entries (a) minimal `filter_enabled` 100/HUNDRED; (b) same with mixed `StringMatcher` variants exercising the parse-time-drop path (Exact + Prefix + empty-Exact); (c) empty `CsrfPolicy` (missing `filter_enabled` — must reject cleanly). 30s budget per ADR-0018 short-mode CI policy. **Deviation from PLAN-verbatim code** (lines 1444-1458): renamed local variable `any` → `tc` to avoid shadowing Go 1.18+'s predeclared `any` (alias for `interface{}`); linters (`predeclared`) commonly flag this. NO semantic change — same `*anypb.Any` value passed to `New`. No new ADR (ADR-0018 already covers fuzzer discipline). Reviews: skipped subagent dispatch — fuzzer parameters mechanical; the 30s execution + the seed-corpus regression run verify correctness.
+**Outputs:**
+```
+$ go test -fuzz=FuzzCsrfPolicyConfigParse -fuzztime=1s ./internal/filter/http/csrf/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/3 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 3/3 completed, now fuzzing with 32 workers
+fuzz: elapsed: 1s, execs: 15288 (14812/sec), new interesting: 37 (total: 40)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.042s
+$ go test -fuzz=FuzzCsrfPolicyConfigParse -fuzztime=30s ./internal/filter/http/csrf/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/40 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 40/40 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 294741 (98247/sec), new interesting: 108 (total: 148)
+fuzz: elapsed: 6s, execs: 859200 (188107/sec), new interesting: 132 (total: 172)
+fuzz: elapsed: 9s, execs: 1326404 (155730/sec), new interesting: 145 (total: 185)
+fuzz: elapsed: 12s, execs: 1616074 (96578/sec), new interesting: 148 (total: 188)
+fuzz: elapsed: 15s, execs: 1699130 (27678/sec), new interesting: 150 (total: 190)
+fuzz: elapsed: 18s, execs: 2143213 (148060/sec), new interesting: 154 (total: 194)
+fuzz: elapsed: 21s, execs: 2729056 (195156/sec), new interesting: 161 (total: 201)
+fuzz: elapsed: 24s, execs: 3262535 (177928/sec), new interesting: 163 (total: 203)
+fuzz: elapsed: 27s, execs: 4080049 (272492/sec), new interesting: 169 (total: 209)
+fuzz: elapsed: 30s, execs: 4770588 (230163/sec), new interesting: 175 (total: 215)
+fuzz: elapsed: 31s, execs: 4770588 (0/sec), new interesting: 175 (total: 215)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	31.062s
+$ go vet ./internal/filter/http/csrf/...
+$ golangci-lint run ./internal/filter/http/csrf/...
+$ go test ./internal/filter/http/csrf/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	0.003s
+$ grep -rE '^func Fuzz' --include='*_test.go' internal/ test/ | wc -l
+16
+```
+
