@@ -274,6 +274,20 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 		req.Header[":method"] = []string{req.Method}
 	}
 
+	// Phase 12 Task 11 prereq (csrf filter Host-target): inject the request
+	// authority as ":authority" pseudo-header on the headers map so chain-
+	// level filters (csrf etc.) can read the Host without codec-specific
+	// surfacing. http.ReadRequest strips the Host header off req.Header and
+	// stores it on req.Host (per stdlib documentation), so a filter reading
+	// req.Header.Get("Host") OR req.Header.Get(":authority") would otherwise
+	// see "" on the H1 path. We mirror the H2 codec's :authority population
+	// (h2/stream.go:341 case ":authority":) so chain-level filters observe
+	// a consistent request-Host signal across both H1 and H2. Same wire-emit
+	// safety as ":method": no response-emit path iterates req.Header.
+	if _, ok := req.Header[":authority"]; !ok && req.Host != "" {
+		req.Header[":authority"] = []string{req.Host}
+	}
+
 	// Decode side: headers → data → trailers. endStream on RunDecodeHeaders is
 	// true when the request has no body (req.Body == nil || req.Body ==
 	// http.NoBody || req.ContentLength == 0). Per ADR-0076 the chain may

@@ -215,6 +215,18 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		c.req.Header[":method"] = []string{c.req.Method}
 	}
 
+	// Phase 12 Task 11 prereq (csrf filter Host-target): inject the request
+	// authority as ":authority" pseudo-header on the headers map so chain-
+	// level filters (csrf etc.) can read the Host without codec-specific
+	// surfacing. The H2 codec strips :authority into a local var during
+	// parseHeadersForRequest (h2/stream.go:399); reflect it back onto
+	// c.req.Header so RunDecodeHeaders observes it consistent with the H1
+	// path. Same wire-emit safety as ":method": no response-emit path
+	// iterates c.req.Header.
+	if _, ok := c.req.Header[":authority"]; !ok && c.req.Host != "" {
+		c.req.Header[":authority"] = []string{c.req.Host}
+	}
+
 	// Decode side: headers → data → trailers. H2 body is fully buffered
 	// before dispatch (h2.serverStream snapshots reqBody before spawning
 	// the dispatch goroutine — see stream.go), so we know if a body is

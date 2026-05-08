@@ -650,3 +650,37 @@ $ wc -l test/fixtures/0014-http-csrf/expectations.yaml test/fixtures/0014-http-c
  108 total
 ```
 
+## Task 11 — Fixture 0014 `driver/driver.go` (single-listener 6-scenario sequential orchestration + `:authority` HCM injection prereq)
+
+**Commits:** `TBD` — `phase 12: fixture 0014 driver — single-listener 6-scenario orchestration + :authority H1/H2 inject`; `TBD` — `phase 12 Task 11 follow-up: PROGRESS.md SHA-fill (TBD → <sha>)`
+**Notes:** Replaces the Task 7 driver stub with the full single-listener `fixture.Driver` + `fixture.BackendKindAware` + `fixture.StatsAsserter` implementation (~440 LoC) per phase 12 SPEC §7.1 + §7.4 + planner-time decision 7. Driver shape mirrors the cors / fault / header_mutation precedent (single-addr `DriveReference` / `DriveSubject`) — NOT the `MultiListenerDriver` fan-out used by phase 11's 0013 fixture (csrf is data-only with no per-scenario timing/cap variation, so one HCM listener with two routes covers all 6 scenarios). Reference Envoy listener port pre-assigned to `10014` per `100NN`-for-`00NN` convention (phase 09: 10011, phase 10: 10012, phase 11: 10013-10016). Stat scrape uses `envoy_http_csrf_*` Prometheus prefix per ADR-0061 SN2 (HCM-namespace rule: `<sp>` is extracted as `envoy_http_conn_manager_prefix` label, NOT part of the metric name). PROBE-SEQUENCE: 7 sequential HTTP/1.1 POSTs against `l_main` (the 6 public scenarios + scenario 7 split into 7a + 7b sub-requests sharing the listener), each emitting a deterministic `probe <id> status=<code> body=<quoted>` line followed by the 4-header allow-list (lowercase wire-form, sorted: content-length, content-type, date, server) for non-200 responses ONLY (200 responses come from the backend with run-varying Date / Content-Length-of-fixed body / Server: backend headers — uninteresting for the differential and asserted via the body byte-equality on its own); the Date header value is allow-listed (rendered as `<allow-listed>`) since it varies per run. STATS ASSERTION: `AssertStats` scrapes `/stats/prometheus` from both admin endpoints and asserts the 3 csrf counters per SPEC §7.1 final-state matrix — `envoy_http_csrf_request_valid=4` (scenarios 1, 3, 5, 7a), `envoy_http_csrf_request_invalid=2` (scenarios 2, 7b), `envoy_http_csrf_missing_source_origin=1` (scenario 4). Per §11.9 amendment + ADR-0124: per-route counter increments AGGREGATE under the SAME `*filterStats` pointer (one counter series per HCM scope) — diverges from phase 11 ADR-0117 INDEPENDENT-stats precedent. Driver asserts a single set of 3 counter values, NOT a per-route split. **PRODUCTION-CODE PREREQ FIX (`internal/filter/hcm/connection.go` H1 path + `internal/filter/hcm/h2dispatch.go` H2 path):** The PLAN line 2189 anticipated this: failure mode (a) "`Host` header missing on H1 path → target hostAndPort is empty". Root cause: Go's `http.ReadRequest` strips the `Host` header off `req.Header` and stores it on `req.Host` per stdlib documentation, so a chain-level filter calling `headers.Get("Host")` OR `headers.Get(":authority")` would see "" on the H1 path; csrf's `targetOriginValue` therefore always saw empty → same-origin scenario 1 + Referer-fallback scenario 5 incorrectly rejected as cross-origin (subject sees `request_invalid=4 request_valid=2` instead of expected `request_invalid=2 request_valid=4`). FIX: alongside the existing Phase-07.1 Task-18 `:method` injection (lines 264-275 connection.go, 202-216 h2dispatch.go), inject `:authority` from `req.Host` into `req.Header[":authority"]` for both H1 and H2 paths. H2 codec already strips `:authority` into a local var during `parseHeadersForRequest` (h2/stream.go:399) — we reflect it back onto `c.req.Header` so chain-level filters observe a consistent request-Host signal across both H1 and H2. Same wire-emit safety guarantee as `:method`: response-emit paths (`writeH1Reply`/`writeH2Reply`/`writeStatusReply` in `codec.go`) iterate `OrderedHeaders` not `req.Header`, so the colon-prefixed pseudo-header never leaks onto the wire. The fix is 4 lines in connection.go + 4 lines in h2dispatch.go (mirror-symmetry preserved); both with verbatim Phase-07.1-style block comments cross-referencing the H2-codec parsing site. Verification: `go build ./...` clean; `go vet ./...` clean; `golangci-lint run ./internal/filter/hcm/... ./test/fixtures/0014-http-csrf/...` clean (after `gofmt -w` + `behavioural→behavioral` misspell fix on the new driver). All `./internal/...` package tests PASS unchanged (csrf 0.005s; hcm/h2 2.470s). DIFFERENTIAL FIRST-RUN: 0014 FAILED at first iteration with `differential mismatch` (subject 403 same-origin where reference 200) + `subj envoy_http_csrf_request_invalid=4 want 2` + `subj envoy_http_csrf_request_valid=2 want 4` — confirmed the `:authority` root-cause hypothesis. POST-FIX: 0014 PASSES; regression-suite `0011-0014` 4-fixture sequence PASSES end-to-end (wall ~7.3s). Test-sequence is sometimes flaky on the H1-binding port collision (TOCTOU race between `freeTCPPort()` returning port N and consecutive +1/+2/+3 hardcoded for fixture 0012/0013/0007a's multi-listener `subjPort+i` allocation pattern); this race is pre-existing on master (verified by stashing my changes and reproducing the same `bind: address already in use` on a clean tree) and unrelated to my fix. Driver self-review: file-level package comment documents the 7-probe shape + per-probe encoding + stat assertion contract; compile-time interface assertions present (`fixture.Driver`, `fixture.BackendKindAware`, `fixture.StatsAsserter`); per-probe header allow-list emit (sorted, date scrubbed) mirrors the 0013 driver's `emitRateLimitedHeaders` pattern; stat-scrape parser handles both bare-name and label-bearing Prometheus exposition forms; mustReadFixtureFile + mustRender helpers verbatim match phase 11 / phase 09 precedent. NO csrf package changes (constraint preserved). NO fixture.go changes. NO bootstrap changes (envoy.yaml + envoy-go.yaml from Task 9 stay byte-identical).
+
+**Outputs:**
+```
+$ go build ./test/fixtures/0014-http-csrf/...
+$ go vet ./test/fixtures/0014-http-csrf/...
+$ golangci-lint run ./test/fixtures/0014-http-csrf/...
+$ go build ./...
+$ go vet ./...
+$ go test -count=1 -v ./test/differential/ -run 'TestDifferential/0014'
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0014-http-csrf
+2026/05/08 09:20:57 0014-http-csrf backend listening on :34423
+[... testcontainers spinup elided ...]
+--- PASS: TestDifferential (1.71s)
+    --- PASS: TestDifferential/0014-http-csrf (1.71s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.785s
+$ go test -count=1 -v ./test/differential/ -run 'TestDifferential/0011-http-fault|TestDifferential/0012-http-header-mutation|TestDifferential/0013-http-local-ratelimit|TestDifferential/0014-http-csrf'
+[... testcontainers spinup elided ...]
+--- PASS: TestDifferential (7.25s)
+    --- PASS: TestDifferential/0011-http-fault (2.38s)
+    --- PASS: TestDifferential/0012-http-header-mutation (1.38s)
+    --- PASS: TestDifferential/0013-http-local-ratelimit (2.17s)
+    --- PASS: TestDifferential/0014-http-csrf (1.33s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	7.332s
+$ wc -l test/fixtures/0014-http-csrf/driver/driver.go
+441 test/fixtures/0014-http-csrf/driver/driver.go
+```
+
