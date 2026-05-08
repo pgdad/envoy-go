@@ -33,7 +33,13 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	if err := tc.UnmarshalTo(&c); err != nil {
 		return nil, err
 	}
-	listenerStats := newFilterStats(ctx.Stats, ctx.StatPrefix)
+	// Construct the *filterStats; nil-tolerance for test code paths per ADR-0085
+	// (callers in production wiring always provide a non-nil Registry, mirroring
+	// phase 11's local_ratelimit call-site guard pattern).
+	var listenerStats *filterStats
+	if ctx.Stats != nil {
+		listenerStats = newFilterStats(ctx.Stats, ctx.StatPrefix)
+	}
 	rc, err := buildRuntimeConfig(&c, listenerStats)
 	if err != nil {
 		return nil, err
@@ -110,9 +116,7 @@ func buildRuntimeConfig(c *csrfv3.CsrfPolicy, listenerStats *filterStats) (*runt
 		return nil, errors.New("csrf: filter_enabled.default_value is required")
 	}
 	// shadow_enabled is OPTIONAL — no validation per §11.11 probe #3.
-	// filter_enabled.default_value's percentage value is silent-ignored at
-	// runtime per §1.1 amendment 3 + planner-time decision below; we read it
-	// for documentation but do not capture it into runtimeConfig.
+	// filter_enabled.default_value's percentage value is silent-ignored at runtime per §1.1 amendment 3 — we do NOT inspect numerator/denominator.
 
 	compiled := compileAdditionalOrigins(c.GetAdditionalOrigins())
 	return &runtimeConfig{
@@ -153,13 +157,11 @@ func compileAdditionalOrigins(matchers []*matcherv3.StringMatcher) []string {
 // newFilterStats registers the 3-counter set at the HCM-level stat_prefix per
 // SPEC §6.6. Stats anchor at "http.<hcmStatPrefix>.csrf.<counter>" per the
 // existing SN2 rule from ADR-0061; NO new SN flattening rule needed (UNLIKE
-// phase 11 which introduced SN9 for filter-specific tag-extraction). Tolerates
-// nil registry per ADR-0085 nil-tolerance pattern (test paths may pass an
-// empty FactoryCtx; production wiring always provides a non-nil Registry).
+// phase 11 which introduced SN9 for filter-specific tag-extraction). Caller
+// MUST guarantee `reg != nil` — the call site in `New` guards via
+// `ctx.Stats != nil` per ADR-0085 nil-tolerance pattern (mirrors phase 11
+// local_ratelimit's call-site-guard precedent at local_ratelimit.go:204-207).
 func newFilterStats(reg *stats.Registry, hcmStatPrefix string) *filterStats {
-	if reg == nil {
-		return nil
-	}
 	prefix := "http." + hcmStatPrefix + ".csrf."
 	return &filterStats{
 		requestValid:        reg.NewCounter(prefix + "request_valid"),

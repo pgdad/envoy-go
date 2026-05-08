@@ -39,7 +39,7 @@
 //   - DecodeData / DecodeTrailers / OnDestroy: pass-through / no-op.
 //   - NO encode-side methods. The HTTPFilter value sets Decoder: f, Encoder: nil.
 //
-// Cross-cutting ADR anchors:
+// Cross-cutting ADR anchors (ADR-0122/0123/0124 land in phase 12 Tasks 3-4):
 //   - ADR-0120 (package shape + boot registration ordering)
 //   - ADR-0121 (runtimeConfig + 1/1/1-field decomposition + PGV-mirror discipline)
 //   - ADR-0122 (origin trichotomy + host:port-only equality + method gate)

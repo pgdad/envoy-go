@@ -116,3 +116,59 @@ $ grep -nE '^## ADR-0120|^## ADR-0121' docs/envoy-go/DECISIONS.md
 5502:## ADR-0120: `internal/filter/http/csrf/` package shape — single-token directory matching cors precedent + extension-registry registration ordering + decoder-only `HTTPFilter` value
 5550:## ADR-0121: `runtimeConfig` shape + 1-consumed / 1-PGV-validated-not-honored / 1-deferred field decomposition + PGV-mirror filter-internal validation discipline + StringMatcher non-exact parse-time-drop discipline
 ```
+
+### Task 2 follow-up — code-review issue fix-ups (I-1, I-2, M-1, M-3)
+
+**Commit:** `TBD` — `phase 12 Task 2 follow-up: code-review issue fix-ups (I-1 ADR-0121 prose; I-2 newFilterStats nil-guard; M-1, M-3)`
+**Notes:** Code-quality reviewer returned Approved-with-comments on the Task 2 commit (`d127af4`); this follow-up addresses the two Important + two cheap Minor issues without scope creep:
+
+- **I-1 (DECISIONS.md ADR-0121 §Decision (ii)):** Rewrote the self-correcting "— wait, ADR-0115 chose option (a) verbatim mirroring; the csrf precedent is the 50ms case INVERTED — phase 11 chose (a) for the boot-log byte-equivalence claim; phase 12 chooses (b) because…" mid-clause as polished ADR prose. New §Decision (ii) states the inversion crisply: phase 11 chose (a) verbatim Envoy-mirror wording for `fill_interval`'s numeric-bound check (canonical `server.cc:76` byte-equivalence target); phase 12 chooses (b) envoy-go-own-wording for csrf's proto-shape PGV check (no canonical Envoy-mirror equivalent — Envoy's PGV-template-generated messages are not hand-written byte-equivalence targets). §Decision and §Consequences are now mutually consistent (the §Consequences bullet on numeric-bound vs proto-shape was already crisp; §Decision (ii) now restates the same distinction without stream-of-consciousness).
+- **I-2 (csrf.go newFilterStats nil-guard relocation):** Moved nil-guard from inside `newFilterStats` to the call site in `New` (around csrf.go:36-42), mirroring phase 11 local_ratelimit's pattern at `local_ratelimit.go:204-207` (`var fs *filterStats; if ctx.Stats != nil { fs = newFilterStats(...) }`). Updated `newFilterStats` doc comment: "Caller MUST guarantee `reg != nil`" — references the call-site guard contract and points at the phase 11 precedent line range.
+- **M-1 (csrf.go:113-115 inaccurate comment):** Replaced "we read it for documentation but do not capture it into runtimeConfig" with the accurate phrasing: "filter_enabled.default_value's percentage value is silent-ignored at runtime per §1.1 amendment 3 — we do NOT inspect numerator/denominator." (The code does not call `.GetNumerator()`/`.GetDenominator()` anywhere; only checks wrapper presence.)
+- **M-3 (doc.go forward-references):** Added one-line forward disclaimer above the Cross-cutting ADR anchors block — `Cross-cutting ADR anchors (ADR-0122/0123/0124 land in phase 12 Tasks 3-4):` — preserves the architectural roadmap visible from `doc.go` without requiring per-task `doc.go` amendments when Tasks 3-4 land. Chose option (a) over option (b)-trim per the brief's instruction.
+
+Skipped (out of scope per the brief): I-3 (defensive `unset_oneof` test row — defer to Task 3 when DecodeHeaders body lands and the test surface broadens), M-2/M-4/M-5/M-6/M-7 (stylistic; defer indefinitely).
+
+Verified all Group 1 + Group 2 tests still pass; build + vet + lint stay clean.
+
+**Outputs:**
+```
+$ go build ./internal/filter/http/csrf/...
+$ go vet ./internal/filter/http/csrf/...
+$ golangci-lint run ./internal/filter/http/csrf/...
+$ go test -race -count=1 -v ./internal/filter/http/csrf/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_FilterEnabledNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored
+--- PASS: TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored (0.00s)
+=== RUN   TestNew_FilterEnabledHundredPercent_Accepted
+--- PASS: TestNew_FilterEnabledHundredPercent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledAbsent_Accepted
+--- PASS: TestNew_ShadowEnabledAbsent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledPresent_SilentIgnored
+--- PASS: TestNew_ShadowEnabledPresent_SilentIgnored (0.00s)
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact
+--- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact (0.00s)
+=== RUN   TestNew_AdditionalOrigins_EmptyExactValue_Dropped
+--- PASS: TestNew_AdditionalOrigins_EmptyExactValue_Dropped (0.00s)
+=== RUN   TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm
+--- PASS: TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.010s
+```
