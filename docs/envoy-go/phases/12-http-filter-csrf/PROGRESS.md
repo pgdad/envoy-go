@@ -264,7 +264,7 @@ $ grep -nE '^## ADR-0122|^## ADR-0123' docs/envoy-go/DECISIONS.md
 
 ## Task 4 — `filterStats` wiring + 3-counter Inc-discipline + per-route shared-stats build + Group 6 unit tests
 
-**Commits:** `TBD` — `phase 12: csrf per-route shared-stats unit tests + 3-counter stat-name discipline [ADR-0124]`
+**Commits:** `5b1b70e` — `phase 12: csrf per-route shared-stats unit tests + 3-counter stat-name discipline [ADR-0124]`
 **Notes:** Appended Group 6 (3 tests: `TestDecodeHeaders_PerRouteOverride_DataReplaced`, `TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute`, `TestStats_ThreeCountersUnderHCMStatPrefix`) to `csrf_test.go` per PLAN Task 4 lines 1267-1357. **NO production code changes** — Task 3 already landed the per-route shared-stats wiring via `buildPerRouteRuntime` per planner-time decision 5; Task 4 is unit-test confirmation + ADR landing only. All 27 test leaves PASS under `-race -count=1` (Groups 1-5 = 24 leaves; Group 6 adds 3).
 
 **Two PLAN-text deviations noted (both are PLAN verbatim test code that does not compile against the actual `*stats.Counter` / `*stats.Registry` API; impl adapted; no semantic change):**
