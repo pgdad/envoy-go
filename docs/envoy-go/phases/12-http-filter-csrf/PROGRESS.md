@@ -32,7 +32,7 @@ The nine planner-time deferred decisions reproduced verbatim from PLAN.md so thi
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** TBD — this task's commit
+**Commits:** `3f34717` — `phase 12: PROGRESS preamble + planner-time decision resolution`
 **Notes:** Created PROGRESS.md; verified all 16 preconditions per PLAN §"Execution preconditions"; phase-12 SPEC + PLAN confirmed present in HEAD; SPEC at a305b86; ADR tail at 0119 (next-free 0120); internal/filter/http/csrf/ absent (Task 2 lands); fixture.HTTPCsrf absent (Task 9 lands). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention; ADRs land at first-use commit per PLAN's ADR table).
 **Outputs:**
 ```
