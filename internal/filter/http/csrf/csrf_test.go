@@ -411,7 +411,7 @@ func TestDecodeHeaders_PerRouteOverride_DataReplaced(t *testing.T) {
 		t.Errorf("per-route Origin=route-only.test: got %v want Continue", status)
 	}
 	if f.rc.stats.requestValid.Load() != 1 {
-		t.Errorf("listener-level stats.requestValid should AGGREGATE per-route increments; got %d",
+		t.Errorf("per-route increment SHARES the listener-level counter; got %d",
 			f.rc.stats.requestValid.Load())
 	}
 }
@@ -476,11 +476,17 @@ func TestStats_ThreeCountersUnderHCMStatPrefix(t *testing.T) {
 		"http.ingress_csrf.csrf.missing_source_origin",
 	}
 	// stats.Registry exposes Walk (not Counter(name)) per phase 06.1 LBP-1
-	// invariant; collect names into a set then assert all three are present.
+	// invariant; collect names into a set then assert (a) the count is exactly
+	// 3 (no extras) AND (b) each expected name is present (no missing). Mirrors
+	// phase 11 TestStatNames_FourCountersUnderStatPrefix's both-sides assertion
+	// so this test rejects regressions in either direction.
 	registered := make(map[string]bool)
 	reg.Walk(func(m stats.Metric) {
 		registered[m.Name()] = true
 	})
+	if len(registered) != 3 {
+		t.Errorf("expected exactly 3 counters under prefix, got %d: %v", len(registered), registered)
+	}
 	for _, n := range want {
 		if !registered[n] {
 			t.Errorf("counter %q not registered (registered=%v)", n, registered)

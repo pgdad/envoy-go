@@ -361,3 +361,120 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.011s
 $ grep -nE '^## ADR-0124' docs/envoy-go/DECISIONS.md
 5757:## ADR-0124: `BEHAVIOR_CONTRACT.md ## Stat-name mapping` 26→29-name extension + 3 csrf counters anchored at HCM stat_prefix (NO new SN flattening rule) + drop `shadow_request_invalid` from MVP + per-route stats SHARED with listener-level (DIVERGES from phase 11 ADR-0117 INDEPENDENT-stats precedent)
 ```
+
+### Task 4 follow-up — code-review fix-ups (exact-count assertion + wording)
+
+**Commit:** `<TBD>` (filled after commit lands).
+
+**Reviewer findings addressed (Important + Minor from Task 4 review):**
+
+1. **Important — `TestStats_ThreeCountersUnderHCMStatPrefix` was MISSING-only-asymmetric:** the
+   Walk-based set-membership loop catches MISSING expected counters but would
+   silently pass if a 4th unexpected counter (e.g., a future `shadow_request_invalid`
+   re-introduction or a debug counter) sneaked into `newFilterStats`. Phase 11's
+   analogous `TestStatNames_FourCountersUnderStatPrefix`
+   (`internal/filter/http/localratelimit/local_ratelimit_test.go:432-434`)
+   asserts BOTH `len(got) != len(want)` AND per-name presence — closing this gap.
+   Added `if len(registered) != 3 { t.Errorf(...) }` ahead of the per-name
+   presence loop so this test now rejects regressions in EITHER direction
+   (extras AND missing).
+
+2. **Minor — misleading "AGGREGATE" wording in single-request test:**
+   `TestDecodeHeaders_PerRouteOverride_DataReplaced` (csrf_test.go:413-416)
+   issues exactly ONE per-route request and asserts `requestValid == 1`. The
+   prior error message said "listener-level stats.requestValid should AGGREGATE
+   per-route increments" — but with only a single increment, "AGGREGATE" mis-
+   describes the WHY. The actual property under test is that the per-route
+   `runtimeConfig` SHARES the listener's `*filterStats` pointer per ADR-0124,
+   so a per-route increment lands on the SAME counter the listener-level test
+   would see. (True multi-source aggregation is covered by the next test,
+   `TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute`.)
+   Reworded to: `"per-route increment SHARES the listener-level counter; got %d"`.
+
+**Production code untouched** — these are test-only follow-ups. The Important fix
+verifies the ALREADY-CORRECT production-side 3-counter discipline more strictly;
+the Minor is a pure error-message improvement.
+
+**Outputs:**
+```
+$ go vet ./internal/filter/http/csrf/
+$ golangci-lint run ./internal/filter/http/csrf/...
+$ go test -race -count=1 -v ./internal/filter/http/csrf/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_FilterEnabledNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored
+--- PASS: TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored (0.00s)
+=== RUN   TestNew_FilterEnabledHundredPercent_Accepted
+--- PASS: TestNew_FilterEnabledHundredPercent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledAbsent_Accepted
+--- PASS: TestNew_ShadowEnabledAbsent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledPresent_SilentIgnored
+--- PASS: TestNew_ShadowEnabledPresent_SilentIgnored (0.00s)
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact
+--- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact (0.00s)
+=== RUN   TestNew_AdditionalOrigins_EmptyExactValue_Dropped
+--- PASS: TestNew_AdditionalOrigins_EmptyExactValue_Dropped (0.00s)
+=== RUN   TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm
+--- PASS: TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm (0.00s)
+=== RUN   TestDecodeHeaders_NonModifyingMethods
+=== RUN   TestDecodeHeaders_NonModifyingMethods/GET
+=== RUN   TestDecodeHeaders_NonModifyingMethods/HEAD
+=== RUN   TestDecodeHeaders_NonModifyingMethods/OPTIONS
+=== RUN   TestDecodeHeaders_NonModifyingMethods/TRACE
+=== RUN   TestDecodeHeaders_NonModifyingMethods/PROPFIND
+--- PASS: TestDecodeHeaders_NonModifyingMethods (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/GET (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/HEAD (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/OPTIONS (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/TRACE (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/PROPFIND (0.00s)
+=== RUN   TestDecodeHeaders_OriginNullLiteral_MissingSourceOrigin_NoRefererFallback
+--- PASS: TestDecodeHeaders_OriginNullLiteral_MissingSourceOrigin_NoRefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginEmpty_RefererFallback
+--- PASS: TestDecodeHeaders_OriginEmpty_RefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginAbsent_RefererFallback
+--- PASS: TestDecodeHeaders_OriginAbsent_RefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginAbsent_RefererAbsent_MissingSourceOrigin
+--- PASS: TestDecodeHeaders_OriginAbsent_RefererAbsent_MissingSourceOrigin (0.00s)
+=== RUN   TestDecodeHeaders_OriginUnparseable_VerbatimUsed
+--- PASS: TestDecodeHeaders_OriginUnparseable_VerbatimUsed (0.00s)
+=== RUN   TestDecodeHeaders_SameOrigin_HostPortMatch
+--- PASS: TestDecodeHeaders_SameOrigin_HostPortMatch (0.00s)
+=== RUN   TestDecodeHeaders_CrossOrigin_HostMismatch
+--- PASS: TestDecodeHeaders_CrossOrigin_HostMismatch (0.00s)
+=== RUN   TestDecodeHeaders_AdditionalOriginsExactMatch
+--- PASS: TestDecodeHeaders_AdditionalOriginsExactMatch (0.00s)
+=== RUN   TestDecodeHeaders_NoCaseFolding_UppercaseRejected
+--- PASS: TestDecodeHeaders_NoCaseFolding_UppercaseRejected (0.00s)
+=== RUN   TestDecodeHeaders_NoDefaultPortStripping_PortMismatch
+--- PASS: TestDecodeHeaders_NoDefaultPortStripping_PortMismatch (0.00s)
+=== RUN   TestDecodeHeaders_TrailingSlashStripped_Allow
+--- PASS: TestDecodeHeaders_TrailingSlashStripped_Allow (0.00s)
+=== RUN   TestDecodeHeaders_OperatorFootgun_FullURLEntry_NeverMatches
+--- PASS: TestDecodeHeaders_OperatorFootgun_FullURLEntry_NeverMatches (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteOverride_DataReplaced
+--- PASS: TestDecodeHeaders_PerRouteOverride_DataReplaced (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute
+--- PASS: TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute (0.00s)
+=== RUN   TestStats_ThreeCountersUnderHCMStatPrefix
+--- PASS: TestStats_ThreeCountersUnderHCMStatPrefix (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.012s
+```
+
