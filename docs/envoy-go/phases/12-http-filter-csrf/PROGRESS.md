@@ -610,3 +610,27 @@ Date: Fri, 08 May 2026 13:06:12 GMT
 backend
 ```
 
+## Task 9 — Fixture 0014 `envoy.yaml` + `envoy-go.yaml` bootstraps (single-listener topology per planner-time decision 7)
+
+**Commits:** `TBD` — `phase 12: fixture 0014 bootstraps (single listener; filter_enabled=100% explicit per §11.11)`; `TBD` — `phase 12 Task 9 follow-up: PROGRESS.md SHA-fill (TBD → <sha>)`
+**Notes:** Lands the dual-bootstrap YAML files per planner-time decision 7 (single-listener topology — diverges from phase 11's 4-listener fan-out because phase 12's csrf is data-only with no per-scenario timing/cap variation; one HCM listener with two routes covers all six driver scenarios). Single listener `l_main` (HTTP1, stat_prefix=ingress_csrf) carries the csrf filter at listener level (additional_origins=[`app.example.test`]) + a per-route TPFC override on `/route-only` (additional_origins=[`route-only.test`]); `/` route inherits the listener-level config via the framework's 3-tier resolver fallback. Both csrf instances explicitly set `filter_enabled.default_value: { numerator: 100, denominator: HUNDRED }` per SPEC §11.11 amendment + ADR-0121 (`RuntimeFractionalPercent` is PGV-REQUIRED upstream — boot fails with `CsrfPolicyValidationError.FilterEnabled: value is required` if the field is absent; envoy-go validates field presence at parse time per filter-internal-validation; both sides see effective-100% so runtime is byte-equivalent). `shadow_enabled` is OMITTED on both sides per §11.11 probe #3 baseline (always-100% behavior with shadow_enabled absent). `additional_origins[].exact` values use the bare HOST form (`app.example.test`, `route-only.test` — NOT full URLs like `https://app.example.test`) per §11.8 amendment + ADR-0122; the csrf filter compares against `hostAndPort(source)` with the scheme prefix stripped, so full-URL forms would NEVER match a real `Origin:` header (operator footgun documented in SPEC §6.4 + BEHAVIOR_CONTRACT §13.1). Both bootstraps use Go-template port placeholders (`{{.AdminPort}}`, `{{.ListenerPort}}`, `{{.BackendPort}}`) substituted by the runner via `text/template` at fixture spawn — same convention as phase 11 fixture 0013. Difference between the two YAMLs: cluster type `STRICT_DNS` + `dns_lookup_family: V4_ONLY` + `host.docker.internal` (envoy.yaml — reference Envoy runs in a Docker container; V4_ONLY mirrors phase-11 IMPL fix because Docker Desktop's `host.docker.internal` resolves IPv6 by default and the IPv6 address is unroutable from the container) vs `STATIC` + `127.0.0.1` (envoy-go.yaml — envoy-go is in-process). The `filter_enabled` field is PRESENT in envoy-go.yaml even though envoy-go silent-ignores its percentage value at runtime per SPEC §2.1 cluster filter-enabled clause + §11.11 amendment — field presence ensures byte-equivalent config-load behavior. **Validation:** both YAMLs validate cleanly under `envoy --mode validate -c <yaml>` against `envoyproxy/envoy:v1.37.2` after substituting concrete ports (the `{{.X}}` placeholders are not parseable as port_value integers, so the validation run uses sed-substituted copies — `9914`/`19914`/`29914` for admin/listener/backend respectively; the configuration loads 1 cluster + 1 listener and reports `configuration '/etc/envoy/envoy.yaml' OK` and `configuration '/etc/envoy/envoy-go.yaml' OK`). The driver-time validation gate (Task 11) re-renders templates with runner-allocated ports and re-validates against the live envoy-go subject + reference Envoy container. NO production code changes (csrf package + driver untouched). NO `expectations.yaml`/README — Task 10. NO driver content beyond Task 7's stub — Task 11. Reviews: skipped subagent dispatch — YAML is verbatim from the PLAN §1725-1793 sketch with the phase-11 IMPL fix `dns_lookup_family: V4_ONLY` carried forward to envoy.yaml (same Docker Desktop IPv6 root cause). Verification: `go vet ./test/differential/...` clean; `go build ./test/differential/...` clean; both YAMLs validate under reference Envoy v1.37.2 in `--mode validate`.
+
+**Outputs:**
+```
+$ go vet ./test/differential/...
+$ go build ./test/differential/...
+$ wc -l test/fixtures/0014-http-csrf/envoy.yaml test/fixtures/0014-http-csrf/envoy-go.yaml
+  85 test/fixtures/0014-http-csrf/envoy.yaml
+  74 test/fixtures/0014-http-csrf/envoy-go.yaml
+ 159 total
+$ # Validation (with concrete ports substituted via sed):
+$ docker run --rm -v /tmp/0014-validate:/etc/envoy:ro envoyproxy/envoy:v1.37.2 -c /etc/envoy/envoy.yaml --mode validate
+[...][info][config] loading 1 cluster(s)
+[...][info][config] loading 1 listener(s)
+configuration '/etc/envoy/envoy.yaml' OK
+$ docker run --rm -v /tmp/0014-validate:/etc/envoy:ro envoyproxy/envoy:v1.37.2 -c /etc/envoy/envoy-go.yaml --mode validate
+[...][info][config] loading 1 cluster(s)
+[...][info][config] loading 1 listener(s)
+configuration '/etc/envoy/envoy-go.yaml' OK
+```
+
