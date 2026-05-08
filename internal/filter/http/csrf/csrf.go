@@ -3,6 +3,7 @@ package csrf
 import (
 	"errors"
 	"net/http"
+	"net/url"
 
 	csrfv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/csrf/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
@@ -98,10 +99,134 @@ func (f *filter) DecodeTrailers(_ http.Header) envoyhttp.FilterTrailersStatus {
 	return envoyhttp.TrailersContinue
 }
 
-// DecodeHeaders body is implemented in Task 3.
-func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	// Skeleton only — Task 3 lands the disposition table.
-	return envoyhttp.Continue
+// modifyingMethods is the canonical 4-method set per §11.1 empirical pin.
+// Case-sensitive uppercase string match against the :method pseudo-header.
+var modifyingMethods = map[string]struct{}{
+	"POST":   {},
+	"PUT":    {},
+	"DELETE": {},
+	"PATCH":  {},
+}
+
+// DecodeHeaders implements the disposition table per SPEC §6.5 + ADR-0122 + ADR-0123.
+func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
+	method := headers.Get(":method")
+	if _, ok := modifyingMethods[method]; !ok {
+		return envoyhttp.Continue // non-modifying: short-circuit BEFORE any state touch
+	}
+
+	// Resolve the effective runtimeConfig: per-route override OR listener-level fallback.
+	rc := f.rc
+	if perRoute := f.dcb.RequestRouteConfig(); perRoute != nil {
+		if c, ok := perRoute.(*csrfv3.CsrfPolicy); ok {
+			pr, err := buildPerRouteRuntime(c, f.rc.stats)
+			if err == nil && pr != nil {
+				rc = pr
+			}
+			// On err: fall through to listener-level rc. (Per-route invalid configs
+			// are caught by reference Envoy at PGV; differential equivalence is
+			// preserved for well-formed configs. See planner-time decision 5.)
+		}
+	}
+
+	target := targetOriginValue(headers)
+	source := sourceOriginValue(headers)
+	allow, missing := evaluate(rc, source, target)
+	switch {
+	case allow:
+		rc.stats.requestValid.Inc()
+		return envoyhttp.Continue
+	case missing:
+		rc.stats.missingSourceOrigin.Inc()
+	default:
+		rc.stats.requestInvalid.Inc()
+	}
+	f.dcb.SendLocalReply(403, "Invalid origin", envoyhttp.OrderedHeaders{
+		{Name: "Content-Type", Value: "text/plain"},
+	})
+	return envoyhttp.StopIteration
+}
+
+// sourceOriginValue implements the §11.2 trichotomy.
+//  1. Origin: "null" literal → empty (NO Referer fallback).
+//  2. Origin empty/absent OR yields empty hostAndPort → fall back to Referer's hostAndPort.
+//  3. Origin non-empty, non-"null", URL parse fails → return verbatim (NO Referer fallback).
+func sourceOriginValue(headers http.Header) string {
+	originVal := headers.Get("Origin")
+	if originVal == "null" {
+		return "" // case 1: missing_source_origin path
+	}
+	if originVal != "" {
+		// Case 3 OR successful parse: hostAndPort returns either u.Host or
+		// the verbatim string on parse failure.
+		hp := hostAndPort(originVal)
+		if hp != "" {
+			return hp
+		}
+		// hp == "" only if originVal was "" (already filtered above) — defensive.
+	}
+	// Case 2: Origin empty or absent → fall back to Referer.
+	refererVal := headers.Get("Referer")
+	if refererVal == "" {
+		return ""
+	}
+	return hostAndPort(refererVal)
+}
+
+// targetOriginValue constructs the target host:port from the request's Host
+// or :authority header. Per planner-time decision 8 + §11.3 amendment: scheme
+// is computed only to make the URL parser accept the input then stripped via
+// hostAndPort(); we use a synthetic "http://" prefix.
+func targetOriginValue(headers http.Header) string {
+	host := headers.Get(":authority")
+	if host == "" {
+		host = headers.Get("Host")
+	}
+	if host == "" {
+		return ""
+	}
+	return hostAndPort("http://" + host)
+}
+
+// hostAndPort parses an absolute URL and returns the host[:port] portion.
+// On parse failure (or empty u.Host), returns the verbatim input — mirrors
+// Envoy's Http::Utility::Url::initialize fallback per §11.2 source-of-truth.
+func hostAndPort(absoluteURL string) string {
+	if absoluteURL == "" {
+		return ""
+	}
+	u, err := url.Parse(absoluteURL)
+	if err != nil || u.Host == "" {
+		return absoluteURL
+	}
+	return u.Host
+}
+
+// evaluate implements the disposition algorithm per §6.4. Empty source →
+// missing path. Non-empty source: check additionalOrigins[] first (any byte-
+// equal match → allow), then target equality (byte-equal → allow), else reject.
+func evaluate(rc *runtimeConfig, source, target string) (allow bool, missing bool) {
+	if source == "" {
+		return false, true // missing_source_origin
+	}
+	for _, additional := range rc.additionalOrigins {
+		if source == additional {
+			return true, false
+		}
+	}
+	if source == target {
+		return true, false
+	}
+	return false, false
+}
+
+// buildPerRouteRuntime is the per-route runtimeConfig builder (per §11.9 +
+// planner-time decision 5). The per-route runtimeConfig SHARES the listener-
+// level *filterStats pointer; only the additionalOrigins slice is independent.
+// PGV-mirror validation runs the same as listener-level (filter_enabled
+// non-nil + non-nil DefaultValue).
+func buildPerRouteRuntime(perRoute *csrfv3.CsrfPolicy, listenerStats *filterStats) (*runtimeConfig, error) {
+	return buildRuntimeConfig(perRoute, listenerStats)
 }
 
 // buildRuntimeConfig validates the proto + compiles additional_origins. The
@@ -169,7 +294,3 @@ func newFilterStats(reg *stats.Registry, hcmStatPrefix string) *filterStats {
 		missingSourceOrigin: reg.NewCounter(prefix + "missing_source_origin"),
 	}
 }
-
-// Helpers (sourceOriginValue / targetOriginValue / hostAndPort / evaluate /
-// buildPerRouteRuntime) are introduced in Task 3 alongside the DecodeHeaders
-// body — keeping the skeleton minimal here avoids unused-symbol lint warnings.

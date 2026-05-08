@@ -5621,3 +5621,135 @@ Both errors are envoy-go-own-wording per planner-time decision 4 (PROGRESS.md pr
 - The PGV-mirror filter-internal validation discipline at `New` time is now demonstrated TWICE in the project: phase 11 ADR-0115 (with Envoy-verbatim wording for numeric-bound checks) and phase 12 ADR-0121 (with envoy-go-own wording for proto-shape checks). Future filters with PGV constraints will choose between the two precedents based on the nature of the constraint (numeric-bound → verbatim mirror; proto-shape → envoy-go-own wording).
 - The `runtimeConfig` shape forward-compatible with future shadow-mode wiring: when the Runtime + hot restart family lands and `shadow_enabled` becomes operational, `runtimeConfig` widens with a `shadowFraction` field (or similar); the existing 2-field shape stays as the active subset and gains a third field. NO breaking change to existing fixtures or per-route TPFCs.
 - The `*filterStats` pointer is the SAME listener-level pointer for both listener-level `runtimeConfig` and per-route `runtimeConfig` instances (per §11.9 amendment + ADR-0124). Task 4 wires the per-route SHARING via `buildPerRouteRuntime(perRoute, listenerStats)` per planner-time decision 5; this ADR establishes the data-shape (`stats` field is a pointer that may be shared); ADR-0124 establishes the wiring mechanism.
+
+---
+
+## ADR-0122: Origin extraction trichotomy + host:port-only equality + canonical 4-method gate + `additional_origins[].exact` matched against host[:port] form + scheme-strip discipline via synthetic `http://` prefix
+
+**Status:** Accepted
+**Date:** 2026-05-08
+**Doctrine:** ADR-0008 Envoy v1.37.2 pin (empirical evidence source); ADR-0040 silent-ignore discipline; ADR-0072 boot-fail-fast; ADR-0101 §3 StringMatcher non-exact parse-time-drop; ADR-0102 terminal-replace + StopIteration; ADR-0121 csrf `runtimeConfig` shape + parse-time-drop precedent.
+**Lands-in-task:** Phase 12 Task 3.
+
+### Context
+
+Envoy v1.37.2's `Filters::Http::Csrf::CsrfFilter::decodeHeaders` (source-of-truth: `source/extensions/filters/http/csrf/csrf_filter.cc`) implements four interlocking decisions that together define the request-time disposition algorithm. Each was confirmed empirically via SPEC §11 probes and is captured here as a single ADR (matching phase 11 ADR-0119's "wire shape" framing — group cohesive load-bearing decisions in one ADR for operator review):
+
+(1) **Method gate (§11.1 empirical pin):** Reference Envoy's `isModifyMethod()` returns true for exactly `{POST, PUT, DELETE, PATCH}` — case-sensitive uppercase comparison against the `:method` pseudo-header. All other methods (`GET, HEAD, OPTIONS, TRACE, PROPFIND, CONNECT, ...`) short-circuit BEFORE any state inspection (no Origin/Referer parse, no counter increment, no SendLocalReply). Probe pinned `PROPFIND` as a specific non-modifying method (Envoy's check is opt-in to the 4-method whitelist, not opt-out from a deny-list).
+
+(2) **Origin extraction trichotomy (§11.2 empirical pin):** The "source origin" is derived from `Origin` and `Referer` via three disjoint cases:
+- **Origin: `null` literal** → source is empty; NO Referer fallback. (Envoy's `Http::Utility::Url::initialize` rejects the `null` literal because it lacks a scheme; Envoy's source treats this as an empty source origin and does NOT consult Referer. The result is the `missing_source_origin` counter path → 403 Invalid origin.)
+- **Origin empty/absent** → fall back to Referer; parse Referer as an absolute URL via `Http::Utility::Url::initialize`; use the resulting host[:port].
+- **Origin non-empty, non-`null`, URL parse fails** → return the verbatim Origin string; NO Referer fallback. (Envoy's URL parser falls back to the verbatim string when scheme/authority parsing fails; the verbatim string then never byte-equals the target host[:port], so the `request_invalid` counter path → 403 Invalid origin.)
+
+(3) **Comparison algorithm host:port-only equality (§11.3 + §11.7 empirical pins):** The source and target origins are compared on their `host[:port]` projection only. The scheme (`http://` / `https://`) is stripped on BOTH sides via `Http::Utility::Url::initialize`'s `host()` accessor; NO normalization is performed (case is preserved per A2/A3 — `https://app` and `https://APP` differ; default ports are preserved per A4 — `https://example.test:443` and `https://example.test` differ; trailing slash is stripped via the URL parser's `path` accessor per A7 — `https://example.test/` matches `https://example.test`). Comparison is byte-equality.
+
+(4) **`additional_origins[].exact` matched against host[:port] form (§11.7 + §11.8 amendment):** The configured `additional_origins[]` `StringMatcher.exact` value is compared verbatim (post-parse-time-drop per ADR-0121) against the SOURCE origin's `host[:port]` projection. Operators MUST configure entries in host[:port] form (`app.example.test`, `app.example.test:8443`); a full-URL entry (`https://app.example.test`) NEVER matches a real Origin header — the source origin is always projected to `host[:port]` before comparison. This is an operator footgun documented at BEHAVIOR_CONTRACT §13.4. The decision is to mirror reference Envoy verbatim (NOT to silently strip scheme from configured entries) so envoy-go's misconfig-detection failure mode is byte-equivalent to Envoy's — operators see the same `request_invalid` counter increment and 403 disposition for the same misconfig in both implementations.
+
+(5) **Target-origin scheme synthesis (§11.3 amendment + planner-time decision 8):** The request target's scheme is NOT carried in HCM headers (the `:scheme` pseudo-header is absent from envoy-go's `http.Header` view at the filter boundary; phase 12 has no framework `:scheme` injection). To make the URL parser accept the target's `Host`/`:authority` value, envoy-go prepends a synthetic `http://` prefix — the prefix is stripped via the same `hostAndPort()` helper (which returns `u.Host`), so the `host[:port]` projection is byte-equivalent regardless of the synthetic-vs-real scheme. Planner-time decision 8 confirmed this is the cheapest correct approach (no framework extension, no `DownstreamTLS()` callback, no `:scheme` injection); §11.3 amendment recorded the strip discipline as load-bearing.
+
+### Decision
+
+`internal/filter/http/csrf/csrf.go` implements the four interlocked decisions as:
+
+(1) `modifyingMethods = map[string]struct{}{"POST":{}, "PUT":{}, "DELETE":{}, "PATCH":{}}` — package-level `var` (initialized at package-init); `DecodeHeaders` looks up `headers.Get(":method")` against this map and returns `Continue` BEFORE any state inspection on miss.
+
+(2) `sourceOriginValue(headers http.Header) string` returns:
+- `""` if `Origin == "null"` (case 1, missing_source_origin path);
+- `hostAndPort(originVal)` if `Origin` is non-empty and non-`null` (case 3 verbatim-on-parse-failure OR successful-parse-host);
+- otherwise `hostAndPort(refererVal)` if `Referer` is non-empty (case 2 fallback);
+- `""` if both are empty/absent.
+
+(3) `targetOriginValue(headers http.Header) string` returns `hostAndPort("http://" + host)` where `host` is `headers.Get(":authority")` or `headers.Get("Host")` (in that priority); `""` if both absent.
+
+(4) `hostAndPort(absoluteURL string) string` parses via `net/url.Parse` and returns `u.Host` on success-with-non-empty-host; verbatim input on parse error OR empty `u.Host` (planner-time decision 3 confirms `net/url.Parse` is the right level — Envoy's `Http::Utility::Url::initialize` is wider but the §11.2 + §11.7 unit-test surface confirms behavioral parity for the test cases that matter).
+
+(5) `evaluate(rc, source, target) (allow, missing bool)` implements:
+- empty source → `(false, true)` (missing_source_origin path);
+- non-empty source: linear scan `rc.additionalOrigins[]` for byte-equal match → `(true, false)`;
+- byte-equal source-vs-target → `(true, false)`;
+- otherwise → `(false, false)` (request_invalid path).
+
+The `additional_origins[]` linear scan is `O(N)` per request — acceptable for the typical operator-configured small N (1-20 entries); future optimization (sorted slice + binary search OR map lookup) is justified only if profiling at fixture scale shows hot-path cost.
+
+### Alternatives considered
+
+(a) **Generate `:scheme` injection at the framework boundary (or surface a `DownstreamTLS()` callback)** — rejected per planner-time decision 8. Adding framework state for scheme would couple csrf to a future framework extension; the synthetic `http://` prefix is byte-equivalent on the host[:port] projection (the only thing that matters per §11.3 amendment) and requires zero framework changes. Future filters that need scheme directly (TLS-aware authentication, redirect-rewriting, etc.) can introduce the extension; csrf does not need it.
+
+(b) **Normalize host[:port] form for comparison (lowercase host, strip default ports `:80`/`:443`)** — rejected per §11.7 A2/A3/A4 amendments. Reference Envoy does NOT normalize; envoy-go's byte-equivalence claim REQUIRES verbatim-match-only behavior. Normalization would diverge silently — `https://app.example.test:443` would match `app.example.test` in envoy-go but not in Envoy, breaking the differential equivalence invariant.
+
+(c) **Auto-strip scheme from configured `additional_origins[].exact` entries (operator-friendly)** — rejected per §11.8 amendment. Reference Envoy compares verbatim against the source origin's host[:port] projection; configured entries that include a scheme silently never match. Auto-stripping in envoy-go would diverge from Envoy: a misconfigured entry `https://app.example.test` would WORK in envoy-go but FAIL in Envoy, breaking operator-portability of the same config across implementations. The footgun is documented at BEHAVIOR_CONTRACT §13.4 instead (operator-facing remediation > silent fix).
+
+(d) **Use `Http::Utility::Url::initialize`-equivalent regex/parser instead of `net/url.Parse`** — rejected per planner-time decision 3. Envoy's parser is wider (handles edge cases like userinfo, IPv6 brackets, etc.) but the §11.2 + §11.7 empirical pins establish behavioral parity for all test cases that matter for csrf. The `verbatim-on-parse-failure` fallback covers the divergence boundary: any input that `net/url.Parse` cannot handle gets returned verbatim, which then never byte-equals a parsed-host target — the same `request_invalid` outcome as Envoy. Future filters that need stricter URL parsing parity (e.g., RFC 3986 strict mode) can introduce a shared helper.
+
+(e) **Method gate as a deny-list (reject on `OPTIONS`, `TRACE` only)** — rejected per §11.1 empirical pin. Reference Envoy's `isModifyMethod()` is an explicit allow-list of `{POST, PUT, DELETE, PATCH}`; PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK, and all other WebDAV methods are non-modifying per Envoy's check. Deny-list semantics would diverge for any future-added HTTP method.
+
+### Consequences
+
+- The `hostAndPort()` helper is the single comparison-projection primitive for csrf; future origin-comparison filters (potential future families: SameSite cookie enforcement, anti-XSS Origin probes) can reuse the helper if envoy-go adopts shared origin utilities. For now it stays in `csrf.go` per planner-time decision 6 (single-file package).
+- The synthetic `http://` prefix discipline is package-local; if a future filter needs the same scheme-synthesis pattern for target-origin parsing, ADR-0122 §Decision (5) is the precedent.
+- The 4-method gate set is the SECOND HTTP method whitelist in envoy-go (the first was phase 09 fault's HTTP-method abort gating per ADR-0103); future filters that gate on method should choose between (i) a package-level `var modifyingMethods = map[string]struct{}{...}` (csrf style) or (ii) a switch statement (fault style) based on cardinality and readability. Both are precedented; csrf's choice is guided by readability for the explicit 4-method set.
+- The operator-footgun (full-URL `additional_origins[]` entry) is documented at BEHAVIOR_CONTRACT §13.4 (lands at Task 12). Operators who configure full URLs see byte-equivalent behavior across reference + envoy-go (both reject as request_invalid + 403), so the footgun is observable and remediable in either runtime.
+- Future Envoy v1.37.2 → v1.38+ pin-bump per ADR-0008's pin-bump discipline MUST re-validate the 4-method set, the trichotomy edge-cases, and the host[:port] comparison algorithm via the §11.1/§11.2/§11.3/§11.7/§11.8 empirical pins. SPEC §11 amendments at pin-bump time amend ADR-0122 §Context inline per ADR-0089.
+- The `evaluate()` function's `(allow, missing bool)` return shape encodes a tristate `(true, _)`, `(false, true)`, `(false, false)`. Future readers should note this is NOT a `(allow, error)` shape — `missing` is a sub-state of `!allow` that selects between counter increments. The two booleans are conceptually exclusive (`allow=true` implies `missing=false`); the choice to encode as two booleans (rather than a 3-value enum) keeps the call site readable as a `switch` over 3 cases.
+
+---
+
+## ADR-0123: Rejection-path wire shape — `SendLocalReply(403, "Invalid origin", {Content-Type: text/plain})` + body byte-exact `Invalid origin` (14 bytes ASCII, no LF) + 4-header lowercase wire-form + 403 hardcoded status + `SendLocalReply` reuse from phase 09 fault precedent
+
+**Status:** Accepted
+**Date:** 2026-05-08
+**Doctrine:** ADR-0008 Envoy v1.37.2 pin (empirical evidence source); ADR-0075 SendLocalReply encode-chain entry; ADR-0102 terminal-replace + StopIteration; ADR-0103 fault abort wire shape (body-byte-exact precedent); ADR-0119 local_ratelimit wire shape (sibling §9 wire-shape ADR).
+**Lands-in-task:** Phase 12 Task 3.
+
+### Context
+
+When the disposition algorithm (per ADR-0122) yields `request_invalid` OR `missing_source_origin`, reference Envoy v1.37.2's `CsrfFilter::decodeHeaders` calls `decoder_callbacks_->sendLocalReply(Http::Code::Forbidden, "Invalid origin", nullptr, absl::nullopt, "csrf_origin_mismatch")`. The wire shape is:
+
+- **Status:** `403 Forbidden` (HARDCODED — no operator override; SPEC §11.4 confirms via probe that no proto field exists for status customization).
+- **Body:** `Invalid origin` (14 bytes ASCII, no trailing newline; MD5 `7433f3a046afcebee10e455dd26b0eb6`). Per SPEC §11.5 + §11.10 empirical pins via raw-bytes hex capture.
+- **Headers (4-header set):** `content-length: 14`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy` — emitted in lexicographic order by HCM/router framework auto-injection (NOT by csrf itself; csrf supplies only `Content-Type`).
+- **Framing:** `Content-Length: 14` (NOT chunked).
+
+This wire shape is structurally identical to phase 11 local_ratelimit's rate-limited response (per ADR-0119) — same 4-header set discipline, same `SendLocalReply(status, body, OrderedHeaders{Content-Type})` invocation pattern, same framework-auto-injection of the other 3 headers. The body string differs (`Invalid origin` vs `local_rate_limited`); the status code differs (403 vs 429); the wire-shape contract is identical.
+
+Per ADR-0102 + ADR-0075, `SendLocalReply` is the framework primitive for terminal-replace + StopIteration; csrf reuses the existing primitive verbatim — NO new framework primitive is introduced.
+
+### Decision
+
+`csrf.go::DecodeHeaders` emits the rejection response via:
+
+```go
+f.dcb.SendLocalReply(403, "Invalid origin", envoyhttp.OrderedHeaders{
+    {Name: "Content-Type", Value: "text/plain"},
+})
+return envoyhttp.StopIteration
+```
+
+The body `"Invalid origin"` is encoded as a string literal inline (NOT a package-level `const`) because — unlike phase 11's `rateLimitedBody` const which is referenced from multiple call sites and operator-configurable in concept (the body is hardcoded but documented at SPEC §11.10 amendment as the empirical pin) — csrf's body is referenced from exactly ONE call site (the single `SendLocalReply` at `DecodeHeaders`). Minor PLAN-text deviation: PLAN line 1125 shows the literal inline; this matches local_ratelimit's `rc.body` indirection only structurally (local_ratelimit holds `body` in `runtimeConfig` because the value flows through the rate-limit branch; csrf has no parallel branching). If a future ADR-0123 amendment introduces additional `SendLocalReply` call sites (e.g., a future fail-closed path on per-route TPFC parse error), the inline literal can be promoted to a package-level `const csrfInvalidOriginBody = "Invalid origin"` at that time.
+
+The status code `403` is HARDCODED at the call site (NOT an `runtimeConfig.statusCode` field) per SPEC §11.4 — Envoy's csrf has no status-customization proto field; envoy-go MUST hardcode 403 to preserve byte-equivalence on misconfig + on default config + on per-route TPFC.
+
+The `Content-Type: text/plain` header is the SOLE caller-supplied header in the `OrderedHeaders` slice; the framework auto-injects `content-length: 14` (from body length), `date: <RFC1123>` (from server time), and `server: envoy` (from `internal/filter/hcm/codec.go::serverHeader()`). The 4-header set's wire-emission order (lexicographic) is settled by the HCM/router downstream encoder, NOT by csrf. ADR-0123 documents the contract; the implementation invariant is that csrf supplies only `Content-Type`.
+
+`StopIteration` is returned from `DecodeHeaders` per ADR-0102 (terminal-replace ends decode iteration; the synthesized response enters the encode chain at `filter[len-1]` per ADR-0075). NO `ContinueDecoding()` callback is invoked from csrf — the chain's `sync.Once` first-call-wins discipline guarantees idempotency.
+
+### Alternatives considered
+
+(a) **Operator-configurable status code via a future `csrfv3.CsrfPolicy.status_code` field** — rejected. Envoy v1.37.2's `CsrfPolicy` proto has NO `status_code` field; introducing one in envoy-go's runtimeConfig would diverge from Envoy. If a future Envoy release adds the field, ADR-0123 §Decision amends in-place per ADR-0089.
+
+(b) **Operator-configurable body via a future `runtimeConfig.body` field (mirroring local_ratelimit's `rc.body`)** — rejected for the same reason as (a). Envoy v1.37.2's body is hardcoded `"Invalid origin"`; envoy-go MUST mirror verbatim.
+
+(c) **Custom envoy-go-prefixed body (e.g., `"envoy-go: invalid origin"`)** — rejected per ADR-0103's body-byte-exact discipline. The wire-equivalence claim REQUIRES byte-identical bodies across reference + envoy-go.
+
+(d) **Inject additional response headers (e.g., `x-envoy-csrf-rejection-reason: <reason>` to distinguish missing_source_origin from request_invalid)** — rejected. Envoy v1.37.2 emits NO csrf-specific response headers; the `details` argument to `sendLocalReply` (`"csrf_origin_mismatch"`) is a stat-name suffix, NOT a wire-header. Adding a custom header would diverge.
+
+(e) **Promote `"Invalid origin"` to a package-level `const`** — deferred. Single call site; readable inline; if future amendments add a second call site (e.g., per-route TPFC parse-failure fail-closed path), a const is the natural refactor.
+
+### Consequences
+
+- ADR-0103 (fault abort wire shape) → ADR-0119 (local_ratelimit rate-limited wire shape) → ADR-0123 (csrf rejection wire shape) is now a 3-element chain documenting the body-byte-exact + 4-header set + framework-auto-injection discipline for terminal-replace responses. Future filters with similar rejection responses follow the same template.
+- The body `"Invalid origin"` (14 bytes) is the SHORTEST per-filter rejection body to date (fault: `"fault filter abort"` 18 bytes; local_ratelimit: `"local_rate_limited"` 18 bytes). Operators distinguish csrf rejections from sibling filter rejections by body string + status code (403 vs 429) + the framework-injected stat-name suffix (NOT visible on the wire but visible in metrics).
+- Fixture 0014 scenario (lands at Task 11) will assert byte-equivalence of the 403 response across reference + subject — body text + 4-header set + framing — via the same raw-bytes hex-capture pattern used for fixture 0011 (fault) and fixture 0013 (local_ratelimit).
+- If Envoy v1.37.2's body string OR status code changes in a future Envoy bump per ADR-0008's pin-bump discipline, the `csrf.go::DecodeHeaders` literal MUST be updated in lockstep + the SPEC §11.4/§11.5/§11.10 empirical pins re-executed. SPEC § amendments at pin-bump time amend ADR-0123 §Decision inline per ADR-0089.
+- Future shadow-mode wiring (when `shadow_enabled` becomes operational at the deferred Runtime + hot restart family) widens the response: when shadow-mode is enforced, the 403 is suppressed but the `request_invalid`/`missing_source_origin` counter still increments. The wire-shape decision in ADR-0123 holds for the enforced subset only; the shadow-mode phase amends ADR-0123 §Consequences in-place per ADR-0089.

@@ -172,3 +172,92 @@ $ go test -race -count=1 -v ./internal/filter/http/csrf/
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.010s
 ```
+
+## Task 3 — `DecodeHeaders` body + origin trichotomy + host:port-only equality + reject path
+
+**Commits:** `TBD` — `phase 12: csrf DecodeHeaders body + origin trichotomy + host:port equality + reject path [ADR-0122, ADR-0123]`
+**Notes:** Filled in `DecodeHeaders` body + `modifyingMethods` map + 5 helpers (`sourceOriginValue`, `targetOriginValue`, `hostAndPort`, `evaluate`, `buildPerRouteRuntime`) per PLAN Task 3. TDD discipline: appended Group 3 (5-method NonModifyingMethods subtests) + Group 4 (5 origin-trichotomy tests) + Group 5 (6 host:port-only-equality tests) + test helpers (`newPostHeaders`, `mustNewListenerFactory`, `freshFilter`, `localReplyArgs`, `fakeCallbacks`) to `csrf_test.go` first; verified Groups 4 + 5 fail as expected against the skeleton (Group 1 + 2 + 3 PASS — Group 3 is the non-modifying-methods short-circuit which the skeleton's blanket `return Continue` happens to satisfy). Then landed the impl in `csrf.go`; all 24 test leaves PASS under `-race -count=1`.
+
+**One PLAN-text deviation noted:** the PLAN test code at lines 845-847 + 866 + 884 + 907 + 922-924 uses `.Add(1)` on counters; the PLAN impl code at lines 1118 + 1121 + 1123 also uses `.Add(1)`. The actual `*stats.Counter` API exposes both `.Inc()` (no-arg, +1) and `.Add(delta uint64)` so `.Add(1)` would compile via untyped-constant conversion. Implementation chose `.Inc()` to match the precedent established in phase 11's `local_ratelimit.go:363-369` which uses `Inc()` for the +1 case (idiomatic Counter usage; `Add(delta)` is reserved for non-unit increments). Tests use `.Load()` (returns `uint64`) directly per the PLAN.
+
+**ADR-0122 + ADR-0123 land at this commit per the ADR-0044 ADR-on-impl convention.** Both follow the ADR-0001 7-section template (Status / Date / Doctrine / Lands-in-task / Context / Decision / Alternatives considered / Consequences). ADR-0122 captures the four interlocked algorithm decisions: (1) 4-method gate `{POST, PUT, DELETE, PATCH}` per §11.1 empirical pin; (2) origin extraction trichotomy per §11.2 — `null` literal → empty NO Referer fallback / Origin empty/absent → Referer fallback / Origin non-empty unparseable → verbatim NO Referer fallback; (3) host:port-only equality per §11.3 + §11.7 — scheme stripped both sides via `hostAndPort()`, NO normalization (case preserved A2/A3, default ports preserved A4, trailing slash stripped via URL parser A7); (4) `additional_origins[].exact` matched against host[:port] form per §11.7 + §11.8 (operator footgun deferred to BEHAVIOR_CONTRACT §13.4); plus (5) synthetic `http://` prefix per planner-time decision 8 + §11.3 amendment for target-origin URL parser acceptance. ADR-0123 captures the rejection wire shape: `SendLocalReply(403, "Invalid origin", OrderedHeaders{Content-Type: text/plain})` — body byte-exact `Invalid origin` (14 bytes ASCII, no LF, MD5 `7433f3a046afcebee10e455dd26b0eb6`), 4-header lowercase wire-form (framework auto-injects 3 of 4 — content-length, date, server), 403 hardcoded status, `StopIteration` from DecodeHeaders, `SendLocalReply` reuse from phase 09 fault precedent (NO new framework primitive). Body literal kept inline at the single call site (NOT promoted to package-level `const`); structurally consistent with phase 11 `rateLimitedBody` which is `const` because of multi-call-site reference + `runtimeConfig.body` indirection — csrf has neither.
+
+**Outputs:**
+```
+$ go vet ./internal/filter/http/csrf/...
+$ golangci-lint run ./internal/filter/http/csrf/...
+$ go test -race -count=1 -v ./internal/filter/http/csrf/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_FilterEnabledNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored
+--- PASS: TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored (0.00s)
+=== RUN   TestNew_FilterEnabledHundredPercent_Accepted
+--- PASS: TestNew_FilterEnabledHundredPercent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledAbsent_Accepted
+--- PASS: TestNew_ShadowEnabledAbsent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledPresent_SilentIgnored
+--- PASS: TestNew_ShadowEnabledPresent_SilentIgnored (0.00s)
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact
+--- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact (0.00s)
+=== RUN   TestNew_AdditionalOrigins_EmptyExactValue_Dropped
+--- PASS: TestNew_AdditionalOrigins_EmptyExactValue_Dropped (0.00s)
+=== RUN   TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm
+--- PASS: TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm (0.00s)
+=== RUN   TestDecodeHeaders_NonModifyingMethods
+=== RUN   TestDecodeHeaders_NonModifyingMethods/GET
+=== RUN   TestDecodeHeaders_NonModifyingMethods/HEAD
+=== RUN   TestDecodeHeaders_NonModifyingMethods/OPTIONS
+=== RUN   TestDecodeHeaders_NonModifyingMethods/TRACE
+=== RUN   TestDecodeHeaders_NonModifyingMethods/PROPFIND
+--- PASS: TestDecodeHeaders_NonModifyingMethods (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/GET (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/HEAD (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/OPTIONS (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/TRACE (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/PROPFIND (0.00s)
+=== RUN   TestDecodeHeaders_OriginNullLiteral_MissingSourceOrigin_NoRefererFallback
+--- PASS: TestDecodeHeaders_OriginNullLiteral_MissingSourceOrigin_NoRefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginEmpty_RefererFallback
+--- PASS: TestDecodeHeaders_OriginEmpty_RefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginAbsent_RefererFallback
+--- PASS: TestDecodeHeaders_OriginAbsent_RefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginAbsent_RefererAbsent_MissingSourceOrigin
+--- PASS: TestDecodeHeaders_OriginAbsent_RefererAbsent_MissingSourceOrigin (0.00s)
+=== RUN   TestDecodeHeaders_OriginUnparseable_VerbatimUsed
+--- PASS: TestDecodeHeaders_OriginUnparseable_VerbatimUsed (0.00s)
+=== RUN   TestDecodeHeaders_SameOrigin_HostPortMatch
+--- PASS: TestDecodeHeaders_SameOrigin_HostPortMatch (0.00s)
+=== RUN   TestDecodeHeaders_CrossOrigin_HostMismatch
+--- PASS: TestDecodeHeaders_CrossOrigin_HostMismatch (0.00s)
+=== RUN   TestDecodeHeaders_AdditionalOriginsExactMatch
+--- PASS: TestDecodeHeaders_AdditionalOriginsExactMatch (0.00s)
+=== RUN   TestDecodeHeaders_NoCaseFolding_UppercaseRejected
+--- PASS: TestDecodeHeaders_NoCaseFolding_UppercaseRejected (0.00s)
+=== RUN   TestDecodeHeaders_NoDefaultPortStripping_PortMismatch
+--- PASS: TestDecodeHeaders_NoDefaultPortStripping_PortMismatch (0.00s)
+=== RUN   TestDecodeHeaders_TrailingSlashStripped_Allow
+--- PASS: TestDecodeHeaders_TrailingSlashStripped_Allow (0.00s)
+=== RUN   TestDecodeHeaders_OperatorFootgun_FullURLEntry_NeverMatches
+--- PASS: TestDecodeHeaders_OperatorFootgun_FullURLEntry_NeverMatches (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.011s
+$ grep -nE '^## ADR-0122|^## ADR-0123' docs/envoy-go/DECISIONS.md
+5627:## ADR-0122: Origin extraction trichotomy + host:port-only equality + canonical 4-method gate + `additional_origins[].exact` matched against host[:port] form + scheme-strip discipline via synthetic `http://` prefix
+5698:## ADR-0123: Rejection-path wire shape — `SendLocalReply(403, "Invalid origin", {Content-Type: text/plain})` + body byte-exact `Invalid origin` (14 bytes ASCII, no LF) + 4-header lowercase wire-form + 403 hardcoded status + `SendLocalReply` reuse from phase 09 fault precedent
+```
