@@ -1,0 +1,64 @@
+# Phase 12 fixture 0014 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per planner-time decision 7): single listener l_main with two routes.
+#   - Listener-level CsrfPolicy: additional_origins=[app.example.test], filter_enabled=100%
+#   - /route-only TPFC: additional_origins=[route-only.test], filter_enabled=100%
+#   - / default route: inherits listener-level
+#
+# Six scenarios (7 HTTP requests; scenario 7 has 7a + 7b sub-requests):
+#
+# Scenario 1: same-origin POST allowed
+#   Request:  POST / Origin: http://127.0.0.1:<listener-port>
+#   Response: 200 + backend body "backend\n" (8 bytes)
+#   Counter:  request_valid +1
+#
+# Scenario 2: cross-origin POST rejected
+#   Request:  POST / Origin: https://evil.test
+#   Response: 403 + body byte-exact "Invalid origin" (14 bytes, no LF)
+#             headers (lowercase wire-form, lexicographic):
+#               content-length: 14
+#               content-type: text/plain
+#               date: <RFC1123>
+#               server: envoy
+#   Counter:  request_invalid +1
+#
+# Scenario 3: additional_origins exact-match allowed
+#   Request:  POST / Origin: https://app.example.test
+#   Response: 200 + backend body
+#   Counter:  request_valid +1
+#   Note:    additional_origins entry MUST be "app.example.test" host:port form
+#            (NOT "https://app.example.test") per §11.8 amendment.
+#
+# Scenario 4: no source-origin rejected
+#   Request:  POST / (no Origin, no Referer)
+#   Response: 403 + "Invalid origin" + 4-header set
+#   Counter:  missing_source_origin +1
+#
+# Scenario 5: Referer fallback allowed
+#   Request:  POST / Referer: http://127.0.0.1:<listener-port>/somepage (no Origin)
+#   Response: 200 + backend body
+#   Counter:  request_valid +1
+#
+# Scenario 7: per-route wholesale-override (with shared stats per §11.9)
+#   7a. POST /route-only Origin: https://route-only.test
+#         → 200 + backend body
+#         → counter: request_valid +1 (AGGREGATES with listener-level series)
+#   7b. POST / Origin: https://route-only.test
+#         → 403 + "Invalid origin" (matches neither listener-default nor app.example.test)
+#         → counter: request_invalid +1 (AGGREGATES — per §11.9 amendment, NO independent
+#           per-route counter series; diverges from phase 11 ADR-0117 precedent).
+#
+# Final counter snapshot (after all 7 requests):
+#   request_valid        = 4   (scenarios 1, 3, 5, 7a)
+#   request_invalid      = 2   (scenarios 2, 7b)
+#   missing_source_origin = 1   (scenario 4)
+#
+# Prometheus form (after scrape):
+#   envoy_http_csrf_request_valid{envoy_http_conn_manager_prefix="ingress_csrf"} 4
+#   envoy_http_csrf_request_invalid{envoy_http_conn_manager_prefix="ingress_csrf"} 2
+#   envoy_http_csrf_missing_source_origin{envoy_http_conn_manager_prefix="ingress_csrf"} 1
+#
+# No timing tolerances. csrf is purely synchronous; all responses dispatch within
+# microseconds. NO analog to phase 11 fixture 0013 scenario 3's ±10ms refill boundary.
+#
+# Cross-refs: SPEC §7.1 + §13.1 + ADR-0122 + ADR-0123 + ADR-0124.
