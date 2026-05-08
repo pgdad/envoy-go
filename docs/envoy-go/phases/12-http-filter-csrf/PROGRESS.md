@@ -686,7 +686,7 @@ $ wc -l test/fixtures/0014-http-csrf/driver/driver.go
 
 ## Task 12 — BEHAVIOR_CONTRACT.md 4-edit bundle + ROADMAP row 12 flip + STATE.md advance + 6-gate phase-done verification
 
-**Commits:** `TBD` — `phase 12: http-filter-csrf [ADR-0120, ADR-0121, ADR-0122, ADR-0123, ADR-0124]`; `TBD` — `phase 12 follow-up: STATE.md SHA-fill (TBD → <phase-done SHA>)`
+**Commits:** `4f4ed39` — `phase 12: http-filter-csrf [ADR-0120, ADR-0121, ADR-0122, ADR-0123, ADR-0124]`; `TBD` — `phase 12 follow-up: STATE.md SHA-fill (TBD → 4f4ed39)`
 **Notes:** Phase-done close-out per PLAN Task 12 + SPEC §3 + BOOTSTRAP_PROMPT.md §7.5. Lands the verbatim §13 4-edit bundle to `docs/envoy-go/BEHAVIOR_CONTRACT.md` per ADR-0052 in-place-edit discipline:
 
 - **§13.1** — NEW `### envoy.filters.http.csrf` subsection inserted at line 1093, AFTER `### envoy.filters.http.local_ratelimit`'s last paragraph at line 1080 and BEFORE the sibling `### Empirical evidence (413 overflow)` subsection. ~75 LoC verbatim from SPEC §13.1: 3-field decomposition table (additional_origins / filter_enabled / shadow_enabled); method gate `{POST, PUT, DELETE, PATCH}`; origin extraction trichotomy; HOST:PORT-only equality discipline (NO case folding, NO default-port stripping, trailing-slash IS stripped, X-Forwarded-Proto irrelevant); operator footgun callout (full-URL form NEVER matches); per-route wholesale-override semantics; per-route stats SHARED with listener-level (diverges from phase 11 ADR-0117); rejection wire shape (403, 14-byte `Invalid origin`, lowercase 4-header set); allow-path response (no csrf-specific headers); 3-counter stat surface.
