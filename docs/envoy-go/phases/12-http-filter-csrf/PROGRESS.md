@@ -119,7 +119,7 @@ $ grep -nE '^## ADR-0120|^## ADR-0121' docs/envoy-go/DECISIONS.md
 
 ### Task 2 follow-up — code-review issue fix-ups (I-1, I-2, M-1, M-3)
 
-**Commit:** `TBD` — `phase 12 Task 2 follow-up: code-review issue fix-ups (I-1 ADR-0121 prose; I-2 newFilterStats nil-guard; M-1, M-3)`
+**Commit:** `6bf381e` — `phase 12 Task 2 follow-up: code-review issue fix-ups (I-1 ADR-0121 prose; I-2 newFilterStats nil-guard; M-1, M-3)`
 **Notes:** Code-quality reviewer returned Approved-with-comments on the Task 2 commit (`d127af4`); this follow-up addresses the two Important + two cheap Minor issues without scope creep:
 
 - **I-1 (DECISIONS.md ADR-0121 §Decision (ii)):** Rewrote the self-correcting "— wait, ADR-0115 chose option (a) verbatim mirroring; the csrf precedent is the 50ms case INVERTED — phase 11 chose (a) for the boot-log byte-equivalence claim; phase 12 chooses (b) because…" mid-clause as polished ADR prose. New §Decision (ii) states the inversion crisply: phase 11 chose (a) verbatim Envoy-mirror wording for `fill_interval`'s numeric-bound check (canonical `server.cc:76` byte-equivalence target); phase 12 chooses (b) envoy-go-own-wording for csrf's proto-shape PGV check (no canonical Envoy-mirror equivalent — Envoy's PGV-template-generated messages are not hand-written byte-equivalence targets). §Decision and §Consequences are now mutually consistent (the §Consequences bullet on numeric-bound vs proto-shape was already crisp; §Decision (ii) now restates the same distinction without stream-of-consciousness).
