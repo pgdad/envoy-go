@@ -516,7 +516,7 @@ $ grep -rE '^func Fuzz' --include='*_test.go' internal/ test/ | wc -l
 
 ## Task 6 — `cmd/envoy-go/main.go` boot-time registration of `csrf.New`
 
-**Commits:** `TBD` — `phase 12: register csrf.New in main.go (router → cors → csrf → envoygotest → ...)`
+**Commits:** `130207f` — `phase 12: register csrf.New in main.go (router → cors → csrf → envoygotest → ...)`
 **Notes:** Two-line registration delta in `cmd/envoy-go/main.go` per PLAN Task 6: (1) added `"github.com/esalaine/envoy-go/internal/filter/http/csrf"` import alphabetically between `cors` and `envoygotest`; (2) added `httpReg.Register(csrf.TypeURL, csrf.New)` between the existing `cors` and `envoygotest` Register calls. The Register-call ordering preserves the alphabetical-after-router invariant established at phase 07.1: `router` first (terminal), then alphabetical by single-token directory name — `cors`, `csrf`, `envoygotest`, `fault`, `header_mutation`, `localratelimit` — so the boot block now reads as a single sorted list of 7 filter factories. NO ADR landed (ADR-0120 §Decision already covers the registration ordering as a consequence of the package-shape decision; PLAN Task 6 explicitly notes "NO ADR"). NO production-side semantic change beyond making `csrf.TypeURL` resolvable through `httpReg` — Task 9's fixture envoy-go.yaml is the first config that consumes this registration. Verification: `grep -cE 'httpReg.Register' cmd/envoy-go/main.go` returns 7 (was 6); `go build ./cmd/envoy-go/...`, `go vet ./cmd/envoy-go/...`, `golangci-lint run ./cmd/envoy-go/...` all clean; `go build ./...` clean across the full tree; `go test -short ./...` green (all 26 packages with tests including all 14 differential fixtures 0000-0013).
 
 **Outputs:**
