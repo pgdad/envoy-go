@@ -364,7 +364,7 @@ $ grep -nE '^## ADR-0124' docs/envoy-go/DECISIONS.md
 
 ### Task 4 follow-up — code-review fix-ups (exact-count assertion + wording)
 
-**Commit:** `<TBD>` (filled after commit lands).
+**Commit:** `c3cdd2c` (filled after commit lands).
 
 **Reviewer findings addressed (Important + Minor from Task 4 review):**
 
