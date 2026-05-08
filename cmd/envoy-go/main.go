@@ -26,6 +26,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/cors"
+	"github.com/esalaine/envoy-go/internal/filter/http/csrf"
 	"github.com/esalaine/envoy-go/internal/filter/http/envoygotest"
 	"github.com/esalaine/envoy-go/internal/filter/http/fault"
 	"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"
@@ -113,6 +114,7 @@ func main() {
 	httpReg := filter_http.NewHTTPRegistry()
 	httpReg.Register(router.TypeURL, router.New)
 	httpReg.Register(cors.TypeURL, cors.New)
+	httpReg.Register(csrf.TypeURL, csrf.New)
 	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
 	httpReg.Register(fault.TypeURL, fault.New)
 	httpReg.Register(header_mutation.TypeURL, header_mutation.New)

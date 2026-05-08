@@ -514,3 +514,54 @@ $ grep -rE '^func Fuzz' --include='*_test.go' internal/ test/ | wc -l
 16
 ```
 
+## Task 6 — `cmd/envoy-go/main.go` boot-time registration of `csrf.New`
+
+**Commits:** `TBD` — `phase 12: register csrf.New in main.go (router → cors → csrf → envoygotest → ...)`
+**Notes:** Two-line registration delta in `cmd/envoy-go/main.go` per PLAN Task 6: (1) added `"github.com/esalaine/envoy-go/internal/filter/http/csrf"` import alphabetically between `cors` and `envoygotest`; (2) added `httpReg.Register(csrf.TypeURL, csrf.New)` between the existing `cors` and `envoygotest` Register calls. The Register-call ordering preserves the alphabetical-after-router invariant established at phase 07.1: `router` first (terminal), then alphabetical by single-token directory name — `cors`, `csrf`, `envoygotest`, `fault`, `header_mutation`, `localratelimit` — so the boot block now reads as a single sorted list of 7 filter factories. NO ADR landed (ADR-0120 §Decision already covers the registration ordering as a consequence of the package-shape decision; PLAN Task 6 explicitly notes "NO ADR"). NO production-side semantic change beyond making `csrf.TypeURL` resolvable through `httpReg` — Task 9's fixture envoy-go.yaml is the first config that consumes this registration. Verification: `grep -cE 'httpReg.Register' cmd/envoy-go/main.go` returns 7 (was 6); `go build ./cmd/envoy-go/...`, `go vet ./cmd/envoy-go/...`, `golangci-lint run ./cmd/envoy-go/...` all clean; `go build ./...` clean across the full tree; `go test -short ./...` green (all 26 packages with tests including all 14 differential fixtures 0000-0013).
+
+**Outputs:**
+```
+$ go build ./cmd/envoy-go/...
+$ go vet ./cmd/envoy-go/...
+$ golangci-lint run ./cmd/envoy-go/...
+$ grep -cE 'httpReg.Register' cmd/envoy-go/main.go
+7
+$ go build ./...
+$ go test -short -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.559s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.013s
+ok  	github.com/esalaine/envoy-go/internal/admin	0.422s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.016s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.019s
+ok  	github.com/esalaine/envoy-go/internal/drain	0.077s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.017s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	2.473s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.133s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	0.013s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	0.013s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	0.035s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	0.265s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	0.013s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	0.013s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	0.217s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.164s
+ok  	github.com/esalaine/envoy-go/internal/listener	3.027s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.045s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	0.013s
+ok  	github.com/esalaine/envoy-go/internal/stats	0.013s
+ok  	github.com/esalaine/envoy-go/internal/tls	0.022s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	0.070s
+ok  	github.com/esalaine/envoy-go/test/differential	0.070s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.014s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.015s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	0.004s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	0.002s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	0.004s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.008s
+```
+
