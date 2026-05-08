@@ -684,3 +684,181 @@ $ wc -l test/fixtures/0014-http-csrf/driver/driver.go
 441 test/fixtures/0014-http-csrf/driver/driver.go
 ```
 
+## Task 12 — BEHAVIOR_CONTRACT.md 4-edit bundle + ROADMAP row 12 flip + STATE.md advance + 6-gate phase-done verification
+
+**Commits:** `TBD` — `phase 12: http-filter-csrf [ADR-0120, ADR-0121, ADR-0122, ADR-0123, ADR-0124]`; `TBD` — `phase 12 follow-up: STATE.md SHA-fill (TBD → <phase-done SHA>)`
+**Notes:** Phase-done close-out per PLAN Task 12 + SPEC §3 + BOOTSTRAP_PROMPT.md §7.5. Lands the verbatim §13 4-edit bundle to `docs/envoy-go/BEHAVIOR_CONTRACT.md` per ADR-0052 in-place-edit discipline:
+
+- **§13.1** — NEW `### envoy.filters.http.csrf` subsection inserted at line 1093, AFTER `### envoy.filters.http.local_ratelimit`'s last paragraph at line 1080 and BEFORE the sibling `### Empirical evidence (413 overflow)` subsection. ~75 LoC verbatim from SPEC §13.1: 3-field decomposition table (additional_origins / filter_enabled / shadow_enabled); method gate `{POST, PUT, DELETE, PATCH}`; origin extraction trichotomy; HOST:PORT-only equality discipline (NO case folding, NO default-port stripping, trailing-slash IS stripped, X-Forwarded-Proto irrelevant); operator footgun callout (full-URL form NEVER matches); per-route wholesale-override semantics; per-route stats SHARED with listener-level (diverges from phase 11 ADR-0117); rejection wire shape (403, 14-byte `Invalid origin`, lowercase 4-header set); allow-path response (no csrf-specific headers); 3-counter stat surface.
+- **§13.2** — `### 26-name table` heading promoted to `### 29-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11; extended by phase 12)`. Appended a NEW `**CSRF filter — 3 names (introduced by phase 12):**` subsection between the existing `**Local rate-limit filter — 4 names**` group and the `**Total: N internal names**` summary. 3 csrf rows (`request_valid` / `request_invalid` / `missing_source_origin`) per SPEC §13.2 verbatim. Total updated 26→29. Added "**No new tag-extractor (phase 12):**" note documenting csrf reuses the existing SN2 HCM-namespace extractor (UNLIKE phase 11's SN9 `envoy_local_http_ratelimit_prefix`).
+- **§13.3** — Equivalence Matrix new row `| HTTP filter envoy.filters.http.csrf | ... |` appended at line 34, AFTER the local_ratelimit row (line 33). Verbatim from SPEC §13.3: enumerates fixture 0014's 6 scenarios + the no-timing-tolerance + no-H2-coverage notes + the per-route stats-SHARED divergence callout.
+- **§13.4** — NEW `### Phase 12 forward-pointer notes` subsection appended at line 1539 to the existing `## Forward-pointer notes` section. Verbatim from SPEC §13.4: deferred field families (filter_enabled PGV-required + percentage-gating deferred to Runtime + hot restart family; shadow_enabled silent-ignored; StringMatcher non-exact dropped at PARSE per ADR-0101 §3); operator footgun (host:port form NOT full URL); no-new-tag-extractor note; per-route stats-SHARED note (FIRST production filter to demonstrate "wholesale data-only override + shared stats" pattern; phase 11 is the precedent for "wholesale stateful override + independent stats").
+
+**ROADMAP row 12 status flipped `in-progress → done`** (line 51) per BOOTSTRAP_PROMPT.md §4.1 invariant 3. Summary text unchanged (already authored at SPEC commit `a305b86`).
+
+**Six-gate phase-done verification — all green at this commit:**
+
+**Gate (a) — build/vet/lint clean:**
+```
+$ go build ./...
+$ go vet ./...
+$ golangci-lint run ./...
+```
+All three commands clean (no output). The 16-package build set (cmd/envoy-go + 15 internal packages including the new csrf) compiles without warnings under Go ≥1.21.
+
+**Gate (b) — race-tagged tests pass on every package:**
+```
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	6.216s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.015s
+ok  	github.com/esalaine/envoy-go/internal/admin	2.593s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.078s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.075s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.137s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.076s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	3.563s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.172s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.036s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.041s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.058s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.368s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.038s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	1.049s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.272s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.204s
+ok  	github.com/esalaine/envoy-go/internal/listener	4.111s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.070s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.038s
+ok  	github.com/esalaine/envoy-go/internal/stats	1.048s
+ok  	github.com/esalaine/envoy-go/internal/tls	1.108s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.564s
+ok  	github.com/esalaine/envoy-go/test/differential	45.636s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.025s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	1.027s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	1.029s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	1.025s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	1.031s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	1.030s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	1.031s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	1.026s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	1.009s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	1.013s
+ok  	github.com/esalaine/envoy-go/test/helpers	1.028s
+```
+All packages PASS (no failures, no skipped tests, no race-detector flags). The differential suite ran in 45.6s under `-race`. No flake.
+
+**Gate (c) — h2spec 53/53 PASS at the ADR-0051 pin:**
+```
+$ go test -count=1 -v ./test/conformance/h2spec/ -run TestH2Spec
+[... container spinup elided ...]
+        Finished in 0.5492 seconds
+        53 tests, 53 passed, 0 skipped, 0 failed
+
+    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
+    h2spec_test.go:187:   [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    h2spec_test.go:187:   [PASS] 4.1. Frame Format: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.2. Frame Size: 3/3 passed
+    h2spec_test.go:187:   [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    h2spec_test.go:187:   [PASS] 5.1. Stream States: 13/13 passed
+    h2spec_test.go:187:   [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    h2spec_test.go:187:   [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    h2spec_test.go:187:   [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    h2spec_test.go:187:   [PASS] 7. Error Codes: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    h2spec_test.go:187:   [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    h2spec_test.go:187:   [PASS] 8.2. Server Push: 1/1 passed
+--- PASS: TestH2Spec (2.22s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.297s
+```
+53/53 PASS unchanged from phase 11 baseline; the `:authority` HCM injection deviation in Task 11 (see "Notable production-code deviation" below) does NOT regress h2 conformance.
+
+**Gate (d) — 16 fuzzers clean at 30s budget each:**
+```
+$ for fuzzer in FuzzTcpProxyFilter FuzzFaultConfigParse FuzzCsrfPolicyConfigParse \
+    FuzzHCMConfigParse FuzzConfigDumpFormat FuzzFilterChainMatch FuzzBootstrapLoad \
+    FuzzDrainTransitions FuzzFilterChainParse FuzzHeaderMutationConfigParse \
+    FuzzLocalRateLimitConfigParse FuzzFrameStream FuzzHPACKDecode FuzzAccessLogFormat \
+    FuzzPromTextFormat FuzzTLSContextParse; do
+    go test -run='^$' -fuzz="^${fuzzer}\$" -fuzztime=30s <package>
+done
+
+=== [1/16] FuzzTcpProxyFilter in ./internal/filter/tcpproxy/ ===           PASS  31.052s
+=== [2/16] FuzzFaultConfigParse in ./internal/filter/http/fault/ ===        PASS  31.074s
+=== [3/16] FuzzCsrfPolicyConfigParse in ./internal/filter/http/csrf/ ===    PASS  31.083s  (16th fuzzer; new in phase 12)
+=== [4/16] FuzzHCMConfigParse in ./internal/filter/hcm/ ===                 PASS  31.055s
+=== [5/16] FuzzConfigDumpFormat in ./internal/admin/ ===                    PASS  31.081s
+=== [6/16] FuzzFilterChainMatch in ./internal/listener/listenerfilter/ ===  PASS  30.135s
+=== [7/16] FuzzBootstrapLoad in ./internal/bootstrap/ ===                   PASS  31.082s
+=== [8/16] FuzzDrainTransitions in ./internal/drain/ ===                    PASS  30.100s
+=== [9/16] FuzzFilterChainParse in ./internal/filter/http/ ===              PASS  31.060s
+=== [10/16] FuzzHeaderMutationConfigParse in ./internal/filter/http/header_mutation/ === PASS 31.055s
+=== [11/16] FuzzLocalRateLimitConfigParse in ./internal/filter/http/localratelimit/ ===  PASS 31.049s
+=== [12/16] FuzzFrameStream in ./internal/filter/hcm/h2/ ===                PASS  30.157s
+=== [13/16] FuzzHPACKDecode in ./internal/filter/hcm/h2/ ===                PASS  31.073s
+=== [14/16] FuzzAccessLogFormat in ./internal/accesslog/ ===                PASS  31.029s
+=== [15/16] FuzzPromTextFormat in ./internal/stats/ ===                     PASS  30.115s
+=== [16/16] FuzzTLSContextParse in ./internal/tls/ ===                      PASS  31.064s
+```
+All 16 fuzzers ran clean at 30s budget each. The new `FuzzCsrfPolicyConfigParse` (the 16th fuzzer; introduced at Task 5) reached 2.2M execs / 30s without crashing or finding new corpus regressions. Total wall ≈ 8 minutes.
+
+**Gate (e) — all 14 differential fixtures (0000-0014) green:**
+```
+$ go test -count=1 -timeout=600s -v ./test/differential/ -run 'TestDifferential'
+[... container spinup elided ...]
+--- PASS: TestDifferential (83.17s)
+    --- PASS: TestDifferential/0000-tcp-echo (4.84s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (3.37s)
+    --- PASS: TestDifferential/0002-tls-tcp (3.71s)
+    --- PASS: TestDifferential/0003-http11-routing (3.63s)
+    --- PASS: TestDifferential/0004-h2-routing (4.51s)
+    --- PASS: TestDifferential/0005-prometheus-stats (4.12s)
+    --- PASS: TestDifferential/0006-access-log (12.15s)
+    --- PASS: TestDifferential/0007a-cors (3.74s)
+    --- PASS: TestDifferential/0007b-iteration-probe (1.64s)
+    --- PASS: TestDifferential/0008-listener-chain-match (7.59s)
+    --- PASS: TestDifferential/0009-admin-config-dump (4.51s)
+    --- PASS: TestDifferential/0010-graceful-drain (12.22s)
+    --- PASS: TestDifferential/0011-http-fault (4.29s)
+    --- PASS: TestDifferential/0012-http-header-mutation (3.96s)
+    --- PASS: TestDifferential/0013-http-local-ratelimit (5.09s)
+    --- PASS: TestDifferential/0014-http-csrf (3.79s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	83.329s
+```
+All 16 differential fixture sub-tests PASS (note: 14 fixture-suite directories with 0007 split into 0007a-cors + 0007b-iteration-probe = 16 sub-tests). 0014-http-csrf PASS in 3.79s on first attempt; no flake. Total wall 83s.
+
+**Gate (f) — BEHAVIOR_CONTRACT.md presence (verifies the 4-edit bundle landed at the expected anchors):**
+```
+$ grep -nE 'envoy.filters.http.csrf' docs/envoy-go/BEHAVIOR_CONTRACT.md | head -5
+34:| HTTP filter `envoy.filters.http.csrf` | 0014-http-csrf: scenario1: same-origin POST → 200; ...
+1093:### envoy.filters.http.csrf
+1095:Phase 12 ships `envoy.filters.http.csrf` per the canonical Envoy v1.37.2 filter spec. ...
+1541:**Deferred field families** (silent-ignored / parse-validated-but-runtime-ignored per ADR-0040 + ADR-0121; see `### envoy.filters.http.csrf ### Field decomposition` above + phase 12 SPEC §2.1 for the full 3-field map):
+
+$ grep -nE '29-name table' docs/envoy-go/BEHAVIOR_CONTRACT.md
+134:### 29-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11; extended by phase 12)
+
+$ grep -nE 'Phase 12 forward-pointer notes' docs/envoy-go/BEHAVIOR_CONTRACT.md
+1539:### Phase 12 forward-pointer notes
+
+$ grep -inE 'operator footgun' docs/envoy-go/BEHAVIOR_CONTRACT.md
+1123:**Operator footgun (per phase 12 SPEC §11.7 + §11.8):** ...
+1547:**Operator footgun (per phase 12 SPEC §11.7 + §11.8):** ...
+```
+All 4 expected matches present at the expected anchors (Equivalence Matrix line 34; HTTP filter chain subsection line 1093/1095; Stat-name mapping 29-name heading line 134; Forward-pointer notes Phase 12 subsection line 1539). PLAN line 2309's grep-pattern `'operator footgun'` is lowercase but the SPEC §13.1 + §13.4 verbatim Markdown uses capital-O `Operator footgun` — gate (f) is verified case-insensitively (matches at lines 1123 + 1547).
+
+**Notable production-code change during Task 11 that warrants carry-forward to REVIEW.md (Task 13):** Task 11 added a `:authority` injection in `internal/filter/hcm/connection.go` (H1 path) and `internal/filter/hcm/h2dispatch.go` (H2 path) — symmetric across both paths and mirroring the existing Phase-07.1 Task-18 `:method` injection. Root cause: Go's stdlib `http.ReadRequest` strips the `Host` header off `req.Header` and stores it on `req.Host`, so chain-level filters calling `headers.Get("Host")` OR `headers.Get(":authority")` saw "" on the H1 path; csrf's `targetOriginValue()` therefore always saw an empty target → same-origin scenario 1 + Referer-fallback scenario 5 incorrectly rejected as cross-origin (subject saw `request_invalid=4 / request_valid=2` instead of expected `request_invalid=2 / request_valid=4`). Fix: alongside the existing `:method` injection, inject `:authority` from `req.Host` into `req.Header[":authority"]` for both H1 and H2 paths. H2 codec already strips `:authority` into a local var during `parseHeadersForRequest` (h2/stream.go:399); the fix reflects it back onto `c.req.Header` so chain-level filters observe a consistent request-Host signal across both H1 and H2. Same wire-emit safety guarantee as `:method`: response-emit paths (`writeH1Reply`/`writeH2Reply`/`writeStatusReply` in `codec.go`) iterate `OrderedHeaders` not `req.Header`, so the colon-prefixed pseudo-header never leaks onto the wire. The fix is 4 lines in connection.go + 4 lines in h2dispatch.go (mirror-symmetry preserved) with verbatim Phase-07.1-style block comments cross-referencing the H2-codec parsing site. PLAN line 2189 anticipated this failure mode (a). The change is load-bearing for fixture 0014 to pass differential and is preserved in the phase-done commit; REVIEW.md (Task 13) is the right place to land the formal retrospective on this carry-forward.
+
+**STATE.md advanced** to `awaiting next planning` per BOOTSTRAP_PROMPT.md §5.3 + §7.5 + the post-phase-11 STATE.md style at commit `0f3a710`. `next-skill = superpowers:brainstorming`; `next-skill-scope` describes the cold-start read-order for the next §9 family-child brainstorm session (ROADMAP row 12 = done; BEHAVIOR_CONTRACT.md `### envoy.filters.http.csrf` subsection; DECISIONS.md tail at ADR-0124; remaining §9 family candidates including compression, jwt_authn, rbac, ext_authz, ext_proc, oauth2, buffer, lua, wasm, adaptive_concurrency, admission_control, bandwidth_limit). `active-phase` set to `<unset — next session resolves>` sentinel. `last-commit` filled at SHA-fill follow-up commit (Task 12 step 14).
+
+**Phase-done commit** uses the verbatim 50-line message from PLAN §2329-2378 + a "Notable production-code change" paragraph documenting the Task 11 HCM `:authority` injection deviation.
+
+**Outputs:** see verbatim gate output blocks above. Total wall for the 6-gate run ≈ 11 minutes (build/vet/lint instant; race tests 1m 12s; h2spec 2.3s; fuzzers 8m; differential 1m 23s; presence checks instant).
+

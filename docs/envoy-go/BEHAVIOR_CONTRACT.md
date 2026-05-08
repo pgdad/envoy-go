@@ -31,6 +31,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | HTTP filter `envoy.filters.http.fault` | Per-request equivalence on abort response shape (status + 4-header set + body byte-exact `fault filter abort`), delay timing (±10ms tolerance), per-route wholesale-override resolution, headers-field exact-match gate, and stat counter increments under the per-scenario differential gate (fixture 0011-http-fault). NOT asserted: header-driven fault path (deferred — ADR-0104), response_rate_limit (deferred), abort.grpc_status (deferred), HeaderMatcher non-exact variants. |
 | HTTP filter `envoy.filters.http.header_mutation` | Per-request equivalence on post-mutation request headers (visible at upstream backend) and post-mutation response headers (visible at downstream client) under listener-level + per-route 3-tier configurations, including AppendAction × 4 + Remove + `keep_empty_value` boundary + multi-valued header collapse / preserve semantics + `most_specific_header_mutations_wins` cross-tier ordering (both flag values). Boot-time enforcement of the 6-name protected-header set per ADR-0111 + phase 10 §11.1. Differential gate fixture 0012-http-header-mutation. NOT asserted: header-value formatter substitution (deferred — ADR-0113), `query_parameter_mutations` (deferred — ADR-0112), H2 differential coverage. |
 | HTTP filter `envoy.filters.http.local_ratelimit` | 0013-http-local-ratelimit: scenario1: 5 reqs / cap=10 / fill=10 / interval=1s — 5×200; scenario2: 5 reqs / cap=2 — 2×200 + 3×429 (§11.3 wire shape); scenario3: 3 reqs / cap=1 / fill=1 / interval=200ms (refill ±10ms per §11.7); scenario4: 3+3 reqs interleaved /strict + /loose — wholesale-override (§11.6). Per-scenario tolerance per §13.3 timing-tolerances; lowercase wire-form 4-header set on 429; counter deltas across 4 stat names with `envoy_local_http_ratelimit_prefix` Prometheus label. NOT asserted: descriptor-action path (deferred — ADR-0120 family), runtime shadow-mode (deferred), X-RateLimit headers (deferred), H2 differential coverage. |
+| HTTP filter `envoy.filters.http.csrf` | 0014-http-csrf: scenario1: same-origin POST → 200; scenario2: cross-origin POST → 403 (§11.10 wire shape: content-length=14, body=`Invalid origin`, 4-header lowercase set); scenario3: `additional_origins` host:port match → 200; scenario4: no source-origin → 403 + `missing_source_origin +1`; scenario5: Referer fallback → 200; scenario7: per-route TPFC wholesale-override (§11.9 — per-route data REPLACES listener data; counters AGGREGATE since stats are SHARED). All 6 scenarios HTTP/1.1 plaintext; no timing tolerances (csrf is purely synchronous). NOT asserted: StringMatcher non-exact variants (deferred — drop at PARSE per ADR-0101 §3), `filter_enabled` percentage values other than 100% (deferred — Runtime + hot restart family), `shadow_enabled` semantics (deferred), H2 differential coverage. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -130,7 +131,7 @@ Rule SN7: Histograms are not emitted by 06.1. (Forward-looking.)
 Rule SN8: Per-endpoint cluster stats are not emitted by 06.1. (Forward-looking.)
 ```
 
-### 26-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11)
+### 29-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11; extended by phase 12)
 
 `<stat_prefix>` is read from HCM config (already plumbed from phase 04). `<addr>` is the listener bind address normalized like Envoy does (e.g., `0.0.0.0:10000` → `0.0.0.0_10000`). `<n>` is the cluster name as configured in the bootstrap.
 
@@ -198,7 +199,17 @@ phase, the same name carries the actual count.
 
 **Filter-specific Prometheus tag-extractor (added in phase 11 per ADR-0118):** `<stat_prefix>.http_local_rate_limit.<counter>` extracts the `<stat_prefix>` segment into the Prometheus label `envoy_local_http_ratelimit_prefix`. NOTE: tag-extraction collisions occur if `<stat_prefix>` matches an Envoy-internal tag-extractor name (e.g. `listener` collides with `envoy.listener_address`); the differential fixture 0013 uses safe values (`foo`, `bar`, `baz`, `qux`, `strict`).
 
-**Total: 26 internal names** (17 from 06.1 + 5 from 09 + 4 from 11). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
+**CSRF filter — 3 names (introduced by phase 12):**
+
+| Internal name | Type | Source | Filter | Description |
+|---|---|---|---|---|
+| `http.<stat_prefix>.csrf.request_valid`         | counter | filter | csrf | modifying request whose source origin matches target or `additional_origins[].exact` (§11.6) |
+| `http.<stat_prefix>.csrf.request_invalid`       | counter | filter | csrf | modifying request whose source origin is determinable but matches neither (§11.6) |
+| `http.<stat_prefix>.csrf.missing_source_origin` | counter | filter | csrf | modifying request whose source origin is undeterminable (§11.6) |
+
+**No new tag-extractor (phase 12):** csrf reuses the existing `envoy_http_conn_manager_prefix` HCM-namespace SN2 extractor — no new pattern needed. UNLIKE phase 11 which added the filter-specific `envoy_local_http_ratelimit_prefix` (Rule SN9 per ADR-0118), phase 12 introduces NO new SN flattening rule.
+
+**Total: 29 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
 
 ### Twin-series filter discipline (per empirical-verification scrape)
 
@@ -1079,6 +1090,60 @@ local_rate_limited
 
 (18-byte body `local_rate_limited`, no trailing newline. 4-header set in lexicographic order. Content-Length framing.)
 
+### envoy.filters.http.csrf
+
+Phase 12 ships `envoy.filters.http.csrf` per the canonical Envoy v1.37.2 filter spec. envoy-go consumes 1 of 3 top-level fields actively, validates 1 at parse-time but silent-ignores its runtime value, and silent-ignores 1 entirely.
+
+**Field decomposition (3 fields):**
+
+| Proto field | envoy-go behavior |
+|---|---|
+| `additional_origins` | CONSUMED. Repeated `StringMatcher`. Only `exact` variant with non-empty value is honored; non-exact variants (`prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case`) are dropped at PARSE time per ADR-0101 §3 discipline. Empty-value `exact` entries are also dropped. |
+| `filter_enabled` | PGV-VALIDATED at parse-time (per phase 12 SPEC §11.11): envoy-go's `New` factory rejects with a non-nil error if the field is nil OR if its inner `default_value` is nil — mirroring Envoy's PGV envelope. SILENT-IGNORED at runtime: the percentage value is read but not consulted; the filter always evaluates as if 100%-active. Couples to deferred Runtime + hot restart family. |
+| `shadow_enabled` | OPTIONAL at parse-time (Envoy permits omission); SILENT-IGNORED at runtime; always-never-shadow regardless of proto value. Couples to deferred Runtime + hot restart family. |
+
+**Method gate:** csrf evaluates only modifying-method requests `{POST, PUT, DELETE, PATCH}` (case-sensitive uppercase string match against `:method`). Non-modifying methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `CONNECT`, `PROPFIND`, custom verbs) short-circuit to `Continue` BEFORE any state touch — no counter increment, no origin parse. CONNECT may be rejected at the HCM level (400 Bad Request) before csrf is reached; this is unrelated to csrf. (Per phase 12 SPEC §11.1.)
+
+**Origin extraction trichotomy** (per phase 12 SPEC §11.2):
+
+1. `Origin: null` (literal 4-char string `"null"`) → empty source_origin → `missing_source_origin` counter increment → reject. NO Referer fallback.
+2. `Origin:` empty value OR `Origin:` header absent → empty `hostAndPort()` → fall back to Referer's `hostAndPort()`. If Referer also yields empty `hostAndPort()` → empty source_origin → `missing_source_origin` → reject.
+3. `Origin:` non-empty, non-`null`, BUT URL parse fails (e.g., `Origin: not-a-url`) → return the verbatim raw string as source_origin. NO Referer fallback. The verbatim string almost always rejects (since it mismatches the target's `hostAndPort` and any `additional_origins[].exact` entry — unless an entry happens to equal that exact verbatim string).
+
+**Comparison algorithm — HOST:PORT-ONLY equality** (per phase 12 SPEC §11.3 / §11.7 / §11.8):
+
+- Source `hostAndPort` is computed via URL parse of the `Origin:` (or `Referer:`) value; if parse succeeds, the result is `host[:port]`. If parse fails, the verbatim raw string is used.
+- Target `hostAndPort` is computed via URL parse of `<scheme>://<:authority>`, where `<scheme>` is the request's `:scheme` pseudo-header (set by HCM from listener TLS state) and `<:authority>` is the `:authority` pseudo-header (HTTP/2) or `Host` header (HTTP/1.1). The scheme is consumed only to make the URL parseable; `hostAndPort()` strips it.
+- Equality is byte-exact between the two `host[:port]` strings.
+- **NO case folding.** `https://APP.EXAMPLE.TEST` does NOT match `app.example.test`. Operators MUST author configs in the lowercase form they expect Origin headers to carry.
+- **NO default-port stripping.** `https://app.example.test:443` does NOT match `app.example.test`. To support implicit-default-port equivalence, operators must explicitly add both port-suffixed and bare entries to `additional_origins`.
+- **Trailing slash IS stripped** (path component dropped via URL parser). `https://app.example.test/` yields `hostAndPort = app.example.test`.
+- **`X-Forwarded-Proto` is irrelevant.** Scheme is computed only for URL parsing; its value is stripped before equality.
+
+**Operator footgun (per phase 12 SPEC §11.7 + §11.8):** `additional_origins[].exact` is matched against the source's `host[:port]` form — NOT the full URL with scheme. Writing `exact: "https://app.example.test"` will NEVER match a real `Origin:` header, because the source's `hostAndPort` is `app.example.test` (not `https://app.example.test`). Operators MUST write `exact: "app.example.test"` (host only) or `exact: "app.example.test:443"` (explicit port); DO NOT include the scheme prefix. envoy-go faithfully replicates Envoy's behavior; this is a known footgun in the upstream spec.
+
+**Per-route override semantics:** Wholesale-override per ADR-0073. Each `CsrfPolicy` TPFC entry runs through `New` at config-load time, allocating its own `*runtimeConfig` with its own compiled `[]additionalOrigins` slice. The 3-tier `PerRouteConfig.Resolve` (Route > VirtualHost > RouteConfiguration) picks the most-specific config per request. Listener-level data is NOT touched for per-route reqs.
+
+**Per-route stats are SHARED with listener-level** (per phase 12 SPEC §11.9; **diverges from phase 11 local_ratelimit precedent**). The per-route `runtimeConfig` carries only the `additional_origins` data; stat counter increments always go to the listener-level `*filterStats` registered for the HCM scope. There is exactly ONE counter series per HCM stat_prefix per counter, regardless of how many per-route TPFC entries exist. Confirmed empirically: 4 requests across listener-level (`/`) and per-route (`/route`) increment the counters as a SUM (e.g., 2 valid + 2 invalid total, NOT split into separate series).
+
+**Rejection response wire shape (per phase 12 SPEC §11.10 empirical):**
+
+- Status: `403 Forbidden`
+- Body: `Invalid origin` (14 bytes ASCII; NO trailing newline)
+- Headers in lexicographic order: `content-length: 14`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`
+- Framing: Content-Length (NO chunked)
+- NO `cache-control`, NO `x-content-type-options`, NO `transfer-encoding`, NO `charset=UTF-8` modifier on `content-type`
+
+**Allow-path response (per phase 12 SPEC §11.6 empirical):** NO csrf-specific headers added on either side (request or response). Standard HCM/router headers (`server`, `date`, `x-envoy-*`) are unrelated to this filter.
+
+**Stat surface (3 counters per HCM scope):**
+
+- `http.<HCM stat_prefix>.csrf.request_valid` — incremented when modifying-method request's source origin matches target OR any `additional_origins[].exact`.
+- `http.<HCM stat_prefix>.csrf.request_invalid` — incremented when source origin is determinable but matches neither.
+- `http.<HCM stat_prefix>.csrf.missing_source_origin` — incremented when source origin is undeterminable (Origin: null literal, OR both Origin and Referer missing/yield-empty-hostAndPort).
+
+NO `shadow_request_invalid` counter — confirmed reference Envoy v1.37.2 also does not emit it under all-defaults config (shadow-only mode reuses the regular 3-counter family).
+
 ### Empirical evidence (413 overflow)
 
 **Probe configuration:** chain `[envoy.filters.http.buffer, envoy.filters.http.router]` with `Buffer{max_request_bytes: 1024}`. Listener `per_connection_buffer_limit_bytes: 1024`. Route `/` → STRICT_DNS cluster `c0` (nginx backend).
@@ -1470,3 +1535,17 @@ tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,
 **Tag-extraction collision quirk:** when `local_ratelimit.stat_prefix` matches an Envoy-internal tag-extractor name (`listener`, `http`, `cluster`, etc.), Envoy v1.37.2 mangles the Prometheus metric name. envoy-go's tag-extractor registration replicates the standard non-collision case; collision-mangling parity is OUT of scope for phase 11 (see phase 11 SPEC §1.1 amendment + §11.5 conclusions (e)).
 
 **`filter_enabled`/`filter_enforced` 0%-default divergence-window:** reference Envoy v1.37.2 defaults both `filter_enabled` and `filter_enforced` `RuntimeFractionalPercent` fields to 0% (off) when unset, meaning the filter is fully disabled by default unless both fields are set to 100% in the config. envoy-go silent-ignores both fields and is effectively always-100%. The differential fixture 0013 sets both to 100% explicitly on the Envoy side; any envoy-go deployment that omits these fields while pairing with reference Envoy will see divergent behavior (Envoy disabled, envoy-go enabled). This divergence-window is documented here and in phase 11 SPEC §13.1 pending a future Runtime family phase that adds `filter_enabled`/`filter_enforced` support.
+
+### Phase 12 forward-pointer notes
+
+**Deferred field families** (silent-ignored / parse-validated-but-runtime-ignored per ADR-0040 + ADR-0121; see `### envoy.filters.http.csrf ### Field decomposition` above + phase 12 SPEC §2.1 for the full 3-field map):
+
+- `filter_enabled` (`RuntimeFractionalPercent`) — PGV-required at parse-time (envoy-go validates presence of the field + its inner `default_value` per phase 12 SPEC §11.11; mirrors Envoy's PGV envelope). Silent-ignored at runtime; envoy-go always evaluates as if 100%-active. **Divergence-window:** users who explicitly set `default_value < 100%` will see Envoy gate by percentage (where `default_value=0%` short-circuits the filter entirely, all 3 counters stay at 0), envoy-go always-100%. Differential fixture 0014 sets explicit 100% on both sides for byte-equivalent equivalence. Couples to Runtime + hot restart family.
+- `shadow_enabled` (`RuntimeFractionalPercent`) — OPTIONAL at parse-time (Envoy permits omission). Silent-ignored at runtime; envoy-go always-never-shadow. **Stat coupling:** when `filter_enabled=0%` and `shadow_enabled=100%` in reference Envoy, the same 3-counter family increments (request_valid / request_invalid / missing_source_origin) but no 403 is emitted; envoy-go's MVP cannot reach this state since it always evaluates as 100%-enforce. Couples to Runtime + hot restart family.
+- `additional_origins[].StringMatcher` non-exact variants (`prefix`, `suffix`, `contains`, `safe_regex`, `ignore_case`) — dropped at PARSE time per ADR-0101 §3 discipline. Empty-value `exact` entries also dropped. Couples to whatever future phase lands the full StringMatcher engine (TBD; not currently a §9 family heading).
+
+**Operator footgun (per phase 12 SPEC §11.7 + §11.8):** `additional_origins[].exact` matches the source's `host[:port]` form (NOT the full URL with scheme). Writing `exact: "https://app.example.test"` will NEVER match a real `Origin:` header. Operators MUST write `exact: "app.example.test"` (host only) or `exact: "app.example.test:443"` (explicit port). envoy-go faithfully replicates Envoy's behavior; this is a footgun in the upstream spec, NOT an envoy-go-specific quirk.
+
+**No new tag-extractor:** csrf reuses the existing `envoy_http_conn_manager_prefix` Prometheus tag-extractor (Rule SN2 from ADR-0061). UNLIKE phase 11's local_ratelimit which introduced filter-specific `envoy_local_http_ratelimit_prefix` (Rule SN9 per ADR-0118), phase 12 introduces NO new SN flattening rule and NO new tag-extractor pattern.
+
+**Per-route stats SHARED with listener-level:** csrf is the FIRST production filter to demonstrate the "wholesale data-only override + shared stats" pattern. Phase 11's local_ratelimit is the precedent for "wholesale stateful override + independent stats" (per ADR-0117). The two patterns coexist under ADR-0073's wholesale-override discipline; future stateful per-route filters with their own stat namespaces follow phase 11; future data-only per-route filters with HCM-scoped stats follow phase 12.
