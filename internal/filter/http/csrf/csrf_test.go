@@ -390,6 +390,104 @@ func TestDecodeHeaders_OperatorFootgun_FullURLEntry_NeverMatches(t *testing.T) {
 	}
 }
 
+// Group 6 — per-route override + shared stats (per §11.9 amendment + ADR-0124).
+
+func TestDecodeHeaders_PerRouteOverride_DataReplaced(t *testing.T) {
+	listener := mustNewListenerFactory(t, []string{"app.example.test"})
+	f, cb := freshFilter(t, listener)
+	cb.perRoute = &csrfv3.CsrfPolicy{
+		FilterEnabled: &corev3.RuntimeFractionalPercent{
+			DefaultValue: &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+		},
+		AdditionalOrigins: []*matcherv3.StringMatcher{
+			{MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "route-only.test"}},
+		},
+	}
+
+	// Per-route request with route-only origin → allowed by per-route TPFC.
+	hA := newPostHeaders("127.0.0.1:8080")
+	hA.Set("Origin", "https://route-only.test")
+	if status := f.DecodeHeaders(hA, true); status != envoyhttp.Continue {
+		t.Errorf("per-route Origin=route-only.test: got %v want Continue", status)
+	}
+	if f.rc.stats.requestValid.Load() != 1 {
+		t.Errorf("listener-level stats.requestValid should AGGREGATE per-route increments; got %d",
+			f.rc.stats.requestValid.Load())
+	}
+}
+
+func TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute(t *testing.T) {
+	listener := mustNewListenerFactory(t, []string{"app.example.test"})
+	f, cb := freshFilter(t, listener)
+	cb.perRoute = &csrfv3.CsrfPolicy{
+		FilterEnabled: &corev3.RuntimeFractionalPercent{
+			DefaultValue: &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+		},
+		AdditionalOrigins: []*matcherv3.StringMatcher{
+			{MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "route-only.test"}},
+		},
+	}
+
+	// 1: per-route hit + match → request_valid +1.
+	h1 := newPostHeaders("127.0.0.1:8080")
+	h1.Set("Origin", "https://route-only.test")
+	f.DecodeHeaders(h1, true)
+
+	// 2: per-route hit + miss (Origin: app.example.test does NOT match per-route's
+	//    additionalOrigins=[route-only.test], does NOT match target 127.0.0.1:8080) → request_invalid +1.
+	cb.localReply = nil
+	h2 := newPostHeaders("127.0.0.1:8080")
+	h2.Set("Origin", "https://app.example.test")
+	f.DecodeHeaders(h2, true)
+
+	// 3: listener-level (no per-route this time) + Origin app.example.test → match additional_origins → request_valid +1.
+	cb.perRoute = nil
+	cb.localReply = nil
+	h3 := newPostHeaders("127.0.0.1:8080")
+	h3.Set("Origin", "https://app.example.test")
+	f.DecodeHeaders(h3, true)
+
+	// Aggregate counters: rv=2 (h1+h3), ri=1 (h2), mso=0. Single counter series.
+	if got, want := f.rc.stats.requestValid.Load(), uint64(2); got != want {
+		t.Errorf("requestValid AGGREGATE: got %d want %d", got, want)
+	}
+	if got, want := f.rc.stats.requestInvalid.Load(), uint64(1); got != want {
+		t.Errorf("requestInvalid AGGREGATE: got %d want %d", got, want)
+	}
+	if got := f.rc.stats.missingSourceOrigin.Load(); got != 0 {
+		t.Errorf("missingSourceOrigin: got %d want 0", got)
+	}
+}
+
+func TestStats_ThreeCountersUnderHCMStatPrefix(t *testing.T) {
+	reg := stats.NewRegistry()
+	ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "ingress_csrf"}
+	c := &csrfv3.CsrfPolicy{
+		FilterEnabled: &corev3.RuntimeFractionalPercent{
+			DefaultValue: &typev3.FractionalPercent{Numerator: 100, Denominator: typev3.FractionalPercent_HUNDRED},
+		},
+	}
+	if _, err := New(mustAnyFrom(t, c), ctx); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	want := []string{
+		"http.ingress_csrf.csrf.request_valid",
+		"http.ingress_csrf.csrf.request_invalid",
+		"http.ingress_csrf.csrf.missing_source_origin",
+	}
+	// stats.Registry exposes Walk (not Counter(name)) per phase 06.1 LBP-1
+	// invariant; collect names into a set then assert all three are present.
+	registered := make(map[string]bool)
+	reg.Walk(func(m stats.Metric) {
+		registered[m.Name()] = true
+	})
+	for _, n := range want {
+		if !registered[n] {
+			t.Errorf("counter %q not registered (registered=%v)", n, registered)
+		}
+	}
+}
+
 // Test helpers (lives at the end of csrf_test.go).
 
 func newPostHeaders(host string) http.Header {

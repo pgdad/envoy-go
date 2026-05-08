@@ -261,3 +261,103 @@ $ grep -nE '^## ADR-0122|^## ADR-0123' docs/envoy-go/DECISIONS.md
 5627:## ADR-0122: Origin extraction trichotomy + host:port-only equality + canonical 4-method gate + `additional_origins[].exact` matched against host[:port] form + scheme-strip discipline via synthetic `http://` prefix
 5698:## ADR-0123: Rejection-path wire shape — `SendLocalReply(403, "Invalid origin", {Content-Type: text/plain})` + body byte-exact `Invalid origin` (14 bytes ASCII, no LF) + 4-header lowercase wire-form + 403 hardcoded status + `SendLocalReply` reuse from phase 09 fault precedent
 ```
+
+## Task 4 — `filterStats` wiring + 3-counter Inc-discipline + per-route shared-stats build + Group 6 unit tests
+
+**Commits:** `TBD` — `phase 12: csrf per-route shared-stats unit tests + 3-counter stat-name discipline [ADR-0124]`
+**Notes:** Appended Group 6 (3 tests: `TestDecodeHeaders_PerRouteOverride_DataReplaced`, `TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute`, `TestStats_ThreeCountersUnderHCMStatPrefix`) to `csrf_test.go` per PLAN Task 4 lines 1267-1357. **NO production code changes** — Task 3 already landed the per-route shared-stats wiring via `buildPerRouteRuntime` per planner-time decision 5; Task 4 is unit-test confirmation + ADR landing only. All 27 test leaves PASS under `-race -count=1` (Groups 1-5 = 24 leaves; Group 6 adds 3).
+
+**Two PLAN-text deviations noted (both are PLAN verbatim test code that does not compile against the actual `*stats.Counter` / `*stats.Registry` API; impl adapted; no semantic change):**
+
+(a) **`int64` → `uint64` in counter assertions.** PLAN lines 1325-1330 use `int64(2)` / `int64(1)` for the AGGREGATE assertions, but `*stats.Counter.Load()` returns `uint64` (per `internal/stats/counter.go:30`). The phase 11 local_ratelimit precedent at `local_ratelimit_test.go` also uses `uint64` for Load() comparisons. Adapted: `uint64(2)` + `uint64(1)`. The `f.rc.stats.requestValid.Load() != 1` form at PLAN line 1287 + the `f.rc.stats.missingSourceOrigin.Load(); got != 0` form at line 1331 already compile via untyped-constant conversion (no change there). NO semantic change — the assertion compares the same numeric quantities.
+
+(b) **`reg.Counter(name)` → `reg.Walk(...)` set-membership check.** PLAN line 1353 calls `reg.Counter(n)` to look up a counter by name, but `*stats.Registry` exposes NO `Counter(name)` method (the Registry primitives are `NewCounter`, `NewCounterIfAbsent`, `Walk`, and `Freeze` per `internal/stats/registry.go`). Phase 11's `TestStatNames_FourCountersUnderStatPrefix` at `local_ratelimit_test.go:417-440` uses `reg.Walk(func(m stats.Metric) { ... })` to enumerate registered names; Task 4 mirrors this by collecting names into a `map[string]bool` set and asserting set-membership for the 3 expected counter names. NO semantic change — the assertion still verifies that the 3 expected counters were registered (per ADR-0124 §Decision (i) anchor `http.<HCM stat_prefix>.csrf.<name>`).
+
+**ADR-0124 lands at this commit per the ADR-0044 ADR-on-impl convention.** Follows the ADR-0001 7-section template (Status / Date / Doctrine / Lands-in-task / Context / Decision / Alternatives considered / Consequences). §Decision is split into 5 sub-decisions: (i) stat-name discipline + Rule SN2 reuse with NO new SN flattening rule (CONTRAST ADR-0118's SN9 addition for local_ratelimit); (ii) BEHAVIOR_CONTRACT.md 26→29-name extension landing at Task 12; (iii) `shadow_request_invalid` MVP scope-out aligned with §11.6 conclusion (e); (iv) per-route stats SHARED with listener-level — DIVERGENCE FROM PHASE 11 ADR-0117 INDEPENDENT-stats precedent — with the explicit phase-11 contrast paragraph per PLAN line 1371; (v) ADR-0073 wholesale-override applies AS-IS with NO amendment paragraph (phase 11's ADR-0117 amendment + phase 10's ADR-0110 amendment both stay landed and unused by phase 12). 5 alternatives considered (a-e); §Consequences 8 bullets including the `buildPerRouteRuntime` helper as canonical reference for "data-only per-route override + shared stats" implementations.
+
+ADR-0124 is the LAST ADR for phase 12 (per SPEC §8 anticipated ADRs ADR-0120..0124). All 5 anticipated ADRs now landed: ADR-0120 + ADR-0121 (Task 2), ADR-0122 + ADR-0123 (Task 3), ADR-0124 (Task 4).
+
+**Outputs:**
+```
+$ go vet ./internal/filter/http/csrf/...
+$ golangci-lint run ./internal/filter/http/csrf/...
+$ go test -race -count=1 -v ./internal/filter/http/csrf/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_FilterEnabledNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored
+--- PASS: TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored (0.00s)
+=== RUN   TestNew_FilterEnabledHundredPercent_Accepted
+--- PASS: TestNew_FilterEnabledHundredPercent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledAbsent_Accepted
+--- PASS: TestNew_ShadowEnabledAbsent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledPresent_SilentIgnored
+--- PASS: TestNew_ShadowEnabledPresent_SilentIgnored (0.00s)
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact
+--- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact (0.00s)
+=== RUN   TestNew_AdditionalOrigins_EmptyExactValue_Dropped
+--- PASS: TestNew_AdditionalOrigins_EmptyExactValue_Dropped (0.00s)
+=== RUN   TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm
+--- PASS: TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm (0.00s)
+=== RUN   TestDecodeHeaders_NonModifyingMethods
+=== RUN   TestDecodeHeaders_NonModifyingMethods/GET
+=== RUN   TestDecodeHeaders_NonModifyingMethods/HEAD
+=== RUN   TestDecodeHeaders_NonModifyingMethods/OPTIONS
+=== RUN   TestDecodeHeaders_NonModifyingMethods/TRACE
+=== RUN   TestDecodeHeaders_NonModifyingMethods/PROPFIND
+--- PASS: TestDecodeHeaders_NonModifyingMethods (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/GET (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/HEAD (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/OPTIONS (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/TRACE (0.00s)
+    --- PASS: TestDecodeHeaders_NonModifyingMethods/PROPFIND (0.00s)
+=== RUN   TestDecodeHeaders_OriginNullLiteral_MissingSourceOrigin_NoRefererFallback
+--- PASS: TestDecodeHeaders_OriginNullLiteral_MissingSourceOrigin_NoRefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginEmpty_RefererFallback
+--- PASS: TestDecodeHeaders_OriginEmpty_RefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginAbsent_RefererFallback
+--- PASS: TestDecodeHeaders_OriginAbsent_RefererFallback (0.00s)
+=== RUN   TestDecodeHeaders_OriginAbsent_RefererAbsent_MissingSourceOrigin
+--- PASS: TestDecodeHeaders_OriginAbsent_RefererAbsent_MissingSourceOrigin (0.00s)
+=== RUN   TestDecodeHeaders_OriginUnparseable_VerbatimUsed
+--- PASS: TestDecodeHeaders_OriginUnparseable_VerbatimUsed (0.00s)
+=== RUN   TestDecodeHeaders_SameOrigin_HostPortMatch
+--- PASS: TestDecodeHeaders_SameOrigin_HostPortMatch (0.00s)
+=== RUN   TestDecodeHeaders_CrossOrigin_HostMismatch
+--- PASS: TestDecodeHeaders_CrossOrigin_HostMismatch (0.00s)
+=== RUN   TestDecodeHeaders_AdditionalOriginsExactMatch
+--- PASS: TestDecodeHeaders_AdditionalOriginsExactMatch (0.00s)
+=== RUN   TestDecodeHeaders_NoCaseFolding_UppercaseRejected
+--- PASS: TestDecodeHeaders_NoCaseFolding_UppercaseRejected (0.00s)
+=== RUN   TestDecodeHeaders_NoDefaultPortStripping_PortMismatch
+--- PASS: TestDecodeHeaders_NoDefaultPortStripping_PortMismatch (0.00s)
+=== RUN   TestDecodeHeaders_TrailingSlashStripped_Allow
+--- PASS: TestDecodeHeaders_TrailingSlashStripped_Allow (0.00s)
+=== RUN   TestDecodeHeaders_OperatorFootgun_FullURLEntry_NeverMatches
+--- PASS: TestDecodeHeaders_OperatorFootgun_FullURLEntry_NeverMatches (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteOverride_DataReplaced
+--- PASS: TestDecodeHeaders_PerRouteOverride_DataReplaced (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute
+--- PASS: TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute (0.00s)
+=== RUN   TestStats_ThreeCountersUnderHCMStatPrefix
+--- PASS: TestStats_ThreeCountersUnderHCMStatPrefix (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.011s
+$ grep -nE '^## ADR-0124' docs/envoy-go/DECISIONS.md
+5757:## ADR-0124: `BEHAVIOR_CONTRACT.md ## Stat-name mapping` 26→29-name extension + 3 csrf counters anchored at HCM stat_prefix (NO new SN flattening rule) + drop `shadow_request_invalid` from MVP + per-route stats SHARED with listener-level (DIVERGES from phase 11 ADR-0117 INDEPENDENT-stats precedent)
+```
