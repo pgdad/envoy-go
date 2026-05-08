@@ -480,7 +480,7 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.012s
 
 ## Task 5 — `FuzzCsrfPolicyConfigParse` fuzzer
 
-**Commits:** `TBD` — `phase 12: FuzzCsrfPolicyConfigParse (16th fuzzer; 30s budget green)`
+**Commits:** `d87afe4` — `phase 12: FuzzCsrfPolicyConfigParse (16th fuzzer; 30s budget green)`
 **Notes:** Lands the SIXTEENTH fuzzer overall (post phase-11's fifteenth `FuzzLocalRateLimitConfigParse`) per SPEC §14.3 + ADR-0018's "every parser/codec/filter ships a fuzzer" discipline. ~70 LoC. Fuzzes arbitrary `[]byte` sequences as the `Value` of a `*anypb.Any` (with fixed canonical `TypeURL`) passed to `New`. Asserts: never panic; never return `(nil, nil)`; on factory-success the factory invokes without panic AND `hf.Decoder` is non-nil. Seed corpus: 3 well-formed `*csrfv3.CsrfPolicy` proto-marshalled entries (a) minimal `filter_enabled` 100/HUNDRED; (b) same with mixed `StringMatcher` variants exercising the parse-time-drop path (Exact + Prefix + empty-Exact); (c) empty `CsrfPolicy` (missing `filter_enabled` — must reject cleanly). 30s budget per ADR-0018 short-mode CI policy. **Deviation from PLAN-verbatim code** (lines 1444-1458): renamed local variable `any` → `tc` to avoid shadowing Go 1.18+'s predeclared `any` (alias for `interface{}`); linters (`predeclared`) commonly flag this. NO semantic change — same `*anypb.Any` value passed to `New`. No new ADR (ADR-0018 already covers fuzzer discipline). Reviews: skipped subagent dispatch — fuzzer parameters mechanical; the 30s execution + the seed-corpus regression run verify correctness.
 **Outputs:**
 ```
