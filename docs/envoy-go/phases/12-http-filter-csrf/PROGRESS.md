@@ -64,3 +64,55 @@ $ go test -count=1 ./test/differential/ -run 'TestDifferential' -v
 PASS
 ok  	github.com/esalaine/envoy-go/test/differential	42.575s
 ```
+
+## Task 2 — `internal/filter/http/csrf/` package skeleton + New factory PGV-mirror + parse-time StringMatcher drop
+
+**Commits:** TBD — `phase 12: csrf package skeleton + New factory PGV-mirror + parse-time StringMatcher drop [ADR-0120, ADR-0121]`
+**Notes:** Created `internal/filter/http/csrf/{doc.go, csrf.go, csrf_test.go}` per PLAN Task 2. TDD discipline: wrote failing tests (Group 1 PGV + Group 2 StringMatcher parse-time-drop) first; verified compile failure; then landed `doc.go` + `csrf.go` skeleton. Two minor PLAN-text adjustments at impl time: (a) `filterStats` field type is `*stats.Counter` (not `*atomic.Int64` as the PLAN/SPEC §6.2 documented conceptually) since `stats.Registry.NewCounter` returns `*stats.Counter` — the SPEC §6.2 documents `*atomic.Int64` as the conceptual semantics, and `*stats.Counter` itself wraps `atomic.Uint64` so the lock-free-Inc semantic is preserved (matches phase 11 ADR-0115's `filterStats` shape); (b) the PLAN's stub helpers (`sourceOriginValue`, `targetOriginValue`, `hostAndPort`, `evaluate`, `buildPerRouteRuntime`) + the `_ = url.Parse` import-keepalive were OMITTED — golangci-lint's `unused` linter flagged them; Task 3 lands them with their bodies + the `net/url` import in lockstep. Captured an ADR cross-reference adjustment in ADR-0121: planner-time decision 4's "envoy-go-own-wording" choice differs structurally from phase 11 ADR-0115's verbatim-mirror choice (numeric-bound check there vs proto-shape check here); ADR-0121 §Decision (ii) records the rationale.
+
+ADR-0120 + ADR-0121 land at this commit per the ADR-0044 ADR-on-impl convention. Both follow the ADR-0001 7-section template (Status / Date / Doctrine / Lands-in-task / Context / Decision / Alternatives considered / Consequences). ADR-0120 anchors the package shape (single-token directory matching cors precedent; decoder-only `HTTPFilter` value with `Encoder: nil`; boot-registration ordering between `cors` and `envoygotest`). ADR-0121 anchors the 1+1+1 field decomposition + the PGV-mirror filter-internal validation discipline (envoy-go-own-wording errors per planner-time decision 4) + the StringMatcher non-exact parse-time-drop discipline per ADR-0101 §3.
+
+**Outputs:**
+```
+$ go build ./internal/filter/http/csrf/...
+$ go vet ./internal/filter/http/csrf/...
+$ golangci-lint run ./internal/filter/http/csrf/...
+$ go test -race -count=1 -v ./internal/filter/http/csrf/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_FilterEnabledNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime
+--- PASS: TestNew_FilterEnabledDefaultValueNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored
+--- PASS: TestNew_FilterEnabledZeroPercent_AcceptedSilentIgnored (0.00s)
+=== RUN   TestNew_FilterEnabledHundredPercent_Accepted
+--- PASS: TestNew_FilterEnabledHundredPercent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledAbsent_Accepted
+--- PASS: TestNew_ShadowEnabledAbsent_Accepted (0.00s)
+=== RUN   TestNew_ShadowEnabledPresent_SilentIgnored
+--- PASS: TestNew_ShadowEnabledPresent_SilentIgnored (0.00s)
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex
+=== RUN   TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact
+--- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/prefix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/suffix (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/contains (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/safe_regex (0.00s)
+    --- PASS: TestNew_AdditionalOrigins_NonExactStringMatcher_DroppedAtParse/ignore_case_with_exact (0.00s)
+=== RUN   TestNew_AdditionalOrigins_EmptyExactValue_Dropped
+--- PASS: TestNew_AdditionalOrigins_EmptyExactValue_Dropped (0.00s)
+=== RUN   TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm
+--- PASS: TestNew_AdditionalOrigins_PreservesVerbatimHostPortForm (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.010s
+$ grep -nE '^## ADR-0120|^## ADR-0121' docs/envoy-go/DECISIONS.md
+5502:## ADR-0120: `internal/filter/http/csrf/` package shape — single-token directory matching cors precedent + extension-registry registration ordering + decoder-only `HTTPFilter` value
+5550:## ADR-0121: `runtimeConfig` shape + 1-consumed / 1-PGV-validated-not-honored / 1-deferred field decomposition + PGV-mirror filter-internal validation discipline + StringMatcher non-exact parse-time-drop discipline
+```

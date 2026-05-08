@@ -5496,3 +5496,128 @@ The existing `internal/stats/name.go` `flattenToProm` switch handles Rules SN1 (
 - Future filters whose stat-name shape doesn't fit SN1–SN5 follow the SN9 precedent: extend the `default` branch with a filter-specific second-pass detection. Each new rule documents the proto-level stat-name template + the resulting Prometheus base + label shape.
 - Fixture 0013's per-scenario `/stats/prometheus` scrape asserts the SN9 byte-equivalence: each per-stat_prefix scrape emits 4 lines under `envoy_http_local_rate_limit_*` with `envoy_local_http_ratelimit_prefix=<stat_prefix>` label.
 - The tag-extraction collision quirk (per SPEC §11.5 (e)) is OUT of scope for phase 11; the fixture uses safe stat_prefix values; future stat-name-discipline phase may address.
+
+---
+
+## ADR-0120: `internal/filter/http/csrf/` package shape — single-token directory matching cors precedent + extension-registry registration ordering + decoder-only `HTTPFilter` value
+
+**Status:** Accepted
+**Date:** 2026-05-08
+**Doctrine:** ADR-0044 ADR-on-impl convention; ADR-0072 HTTPRegistry boot-fail-fast; ADR-0114 single-token-package precedent.
+**Lands-in-task:** Phase 12 Task 2 (package skeleton) + Task 6 (boot registration line in cmd/envoy-go/main.go).
+
+### Context
+
+Phase 12 lands `envoy.filters.http.csrf` as the FIFTH production HTTP filter under `internal/filter/http/` (after cors @ 07.1, fault @ 09, header_mutation @ 10, local_ratelimit @ 11). The proto type-name is a single token (`csrf`); per the ADR-0114 naming rule (single-token proto type-name → single-token Go-package identifier), the directory + Go-package identifier are both `csrf`. NO underscore-elision question — the proto type-name has no underscore to begin with.
+
+A second package-shape question is structurally distinct: phase 12 is the FIRST production HTTP filter that is **decoder-only** (no encode-side state per SPEC §6.3). Prior filters (cors, fault, header_mutation, local_ratelimit) implement BOTH `StreamDecoderFilter` AND `StreamEncoderFilter` to satisfy the chain framework's both-sides-filter contract — even though some (e.g., local_ratelimit) operate exclusively on the decode side, they still implement the encode-side methods as no-ops + set `Encoder: f` on the returned `HTTPFilter`. Phase 12's planner-time decision 1+2 (PROGRESS.md preamble) settles this: decoder-only is structurally expressible by setting `Encoder: nil` on the `HTTPFilter` value; the chain dispatches per non-nil side per `internal/filter/http/types.go`'s `HTTPFilter` doc-comment ("nil for encoder-only filters" / "nil for decoder-only filters"). The csrf filter implements ONLY the decoder-side method set, saving ~25 LoC of no-op encode-side methods.
+
+Boot-registration ordering in `cmd/envoy-go/main.go` follows BRAINSTORM Decision 2's "router-first-then-alphabetical" stylistic discipline (codified at phase-09 brainstorm time + reaffirmed at phases 10 and 11 — ADR-0114 §Decision). After phase 11 the order is `router → cors → envoygotest → fault → header_mutation → localratelimit → header_mutation.RegisterPerRouteValidator → Freeze`. csrf inserts alphabetically — `csrf` comes between `cors` and `envoygotest`.
+
+### Decision
+
+**Directory + Go-package identifier are both `csrf` (single token, no underscore).** Files mirror the cors/fault/local_ratelimit precedent:
+
+- `csrf.go` — filter type + factory + decode method + origin-parsing helpers + `runtimeConfig` + `filterStats`. Per planner-time decision 6 (PROGRESS.md preamble), single-file (no `origin.go` split — the ~280 LoC stays under the mental-model threshold; no future filter is anticipated to reuse the host:port-only equality helpers).
+- `doc.go` — package overview + 1-consumed/1-PGV-validated-not-honored/1-deferred decomposition.
+- `csrf_test.go` — unit tests across 6 test groups per SPEC §14.1.
+- `fuzz_test.go` — `FuzzCsrfPolicyConfigParse` per SPEC §14.3 (Task 5).
+
+Two top-level exports: `TypeURL` (string constant) + `New` (the `HTTPFilterFactory`). All other types (`runtimeConfig`, `filterStats`, `filter`) are unexported.
+
+**Decoder-only `HTTPFilter` value: `Decoder: f, Encoder: nil`.** The csrf `filter` struct implements ONLY `StreamDecoderFilter` (`SetDecoderCallbacks`, `OnDestroy`, `DecodeHeaders`, `DecodeData`, `DecodeTrailers`). NO `SetEncoderCallbacks` / `EncodeHeaders` / `EncodeData` / `EncodeTrailers` methods exist. The `New` factory returns `envoyhttp.HTTPFilter{Name: filterName, Decoder: f, Encoder: nil}`. csrf is the FIRST §9 production filter to express decoder-only structurally — prior filters (including local_ratelimit which is also decode-side-only behaviorally per SPEC §6.5 phase 11 NOTE) implement both interfaces with no-op encode methods. This makes the decoder-only nature self-documenting at the type level; future reviewers reading `New`'s return value immediately see the missing encode side without reading method bodies.
+
+**Boot-registration ordering after phase 12:** `router → cors → csrf → envoygotest → fault → header_mutation → localratelimit → header_mutation.RegisterPerRouteValidator → Freeze`. The csrf line inserts alphabetically between `cors` and `envoygotest` (Task 6 lands the line). csrf does NOT register a per-route validator (per-route TPFC entries are validated lazily at request-time via `buildPerRouteRuntime` per SPEC §6.7 + planner-time decision 5; no per-route invariants requiring boot-time validation).
+
+### Alternatives considered
+
+(a) **Implement `StreamEncoderFilter` no-op methods + set `Encoder: f` matching the cors/fault/local_ratelimit precedent** — rejected per planner-time decision 1+2. The chain framework dispatches per non-nil side; setting `Encoder: nil` is a first-class supported configuration per `HTTPFilter`'s doc-comment. The ~25 LoC saving + improved type-level self-documentation outweigh the precedent-uniformity argument. Future decoder-only filters (e.g. potential rbac, ext_authz) follow csrf's lead.
+
+(b) **Multi-file split — `csrf.go` for the public surface, `origin.go` for `sourceOriginValue` / `targetOriginValue` / `hostAndPort` / `evaluate` helpers** — rejected per planner-time decision 6. The total LoC (~280) stays under the mental-model threshold for single-file readability; no future filter is anticipated to reuse the host:port-only equality helpers (the algorithm is csrf-specific). The cors filter is also single-file (`cors.go` only, no `origin.go` split despite carrying `originAllowedByPolicy` + `getMethod` helpers); precedent is single-file for filters of this scope.
+
+(c) **Underscore-preserving directory `csrf_v3/` matching the proto package's v3 versioning** — rejected. The Go package identifier should be the filter NAME, not the proto package version (which is an implementation detail of the proto's import path). The Go-naming convention prefers single-token package names matching the conceptual filter; `csrf` is the canonical name.
+
+### Consequences
+
+- The csrf package is the FIRST §9 production filter to express decoder-only structurally via `Encoder: nil`. Future decoder-only filters follow this precedent.
+- ADR-0074 (filter set: cors + envoy_go_test + router + fault + header_mutation + local_ratelimit) extends to {cors, envoy_go_test, router, fault, header_mutation, local_ratelimit, csrf} — the SIXTH production filter (router is terminal, distinct from observable filters; csrf joins as the fifth observable production filter).
+- `cmd/envoy-go/main.go` registration ordering at phase 12 phase-done: `router → cors → csrf → envoygotest → fault → header_mutation → localratelimit → header_mutation.RegisterPerRouteValidator → Freeze`. The csrf Register call inserts after the existing cors Register and before the existing envoygotest Register (Task 6 lands the line).
+- The single-file `csrf.go` discipline carries through Task 3 (DecodeHeaders body) + Task 4 (filterStats wiring + 3-counter discipline) without splitting; the file lands at phase-done at ~280 LoC.
+- Test-only access to the unexported `runtimeConfig` (e.g., the `mustGetRuntimeConfig` helper in `csrf_test.go`) is via package-internal (same-package) tests — NO `*_internal_test.go` split needed since `csrf_test.go` already lives in `package csrf`.
+
+---
+
+## ADR-0121: `runtimeConfig` shape + 1-consumed / 1-PGV-validated-not-honored / 1-deferred field decomposition + PGV-mirror filter-internal validation discipline + StringMatcher non-exact parse-time-drop discipline
+
+**Status:** Accepted
+**Date:** 2026-05-08
+**Doctrine:** ADR-0040 silent-ignore discipline; ADR-0072 HTTPRegistry boot-fail-fast; ADR-0101 §3 StringMatcher non-exact parse-time-drop discipline; ADR-0115 filter-internal-validation precedent (envoy-go-own-wording errors).
+**Lands-in-task:** Phase 12 Task 2.
+
+### Context
+
+The `envoy.extensions.filters.http.csrf.v3.CsrfPolicy` proto carries 3 top-level fields — the SMALLEST §9 family proto surface to date. SPEC §2.1 + §11.11 amendment classify the 3 fields into a 1+1+1 decomposition:
+
+- **Actively consumed (1):** `additional_origins` (`[]StringMatcher`, repeated). Only StringMatcher.exact variant with non-empty value is honored.
+- **Parse-time-validated, runtime-silent-ignored (1):** `filter_enabled` (`RuntimeFractionalPercent`). PGV-REQUIRED at parse-time per SPEC §11.11 amendment (probes #1 + #2 confirm reference Envoy boot-rejects with `CsrfPolicyValidationError.FilterEnabled: value is required` when omitted, and `RuntimeFractionalPercentValidationError.DefaultValue: value is required` when `filter_enabled.default_value` is omitted). Runtime is always-100%-active regardless of the configured percentage.
+- **Silent-ignored entirely (1):** `shadow_enabled` (`RuntimeFractionalPercent`). Optional at PGV (probe #3 confirms boot succeeds without it). Runtime is always-never-shadow.
+
+Three sub-decisions interlock:
+
+(i) The `runtimeConfig` shape captures only what is consumed at request-time. The `filter_enabled` percentage value is read for documentation but NOT captured (silent-ignored at runtime). The `shadow_enabled` field is unmarshalled (proto unmarshal is uniform per ADR-0040) but NOT inspected.
+
+(ii) The PGV-mirror at `New` time: envoy-go's filter rejects nil `filter_enabled` or nil `filter_enabled.default_value` with a non-nil error. SPEC §12 deferred decision D3 left the exact wording open (mirror Envoy's PGV envelope literally vs envoy-go's own clear-text wording); planner-time decision 4 (PROGRESS.md preamble) settles this as **option (b) envoy-go's own clear-text wording** matching phase 11's ADR-0115 precedent (`local rate limit token bucket fill timer must be >= 50ms` for the 50ms fill_interval check was NOT a verbatim Envoy error string — wait, ADR-0115 chose option (a) verbatim mirroring; the csrf precedent is the 50ms case INVERTED — phase 11 chose (a) for the boot-log byte-equivalence claim; phase 12 chooses (b) because the 11.11 PGV validation is a proto-shape validation, not a filter-config-numeric-bound, so envoy-go-own-wording is the honest representation: `csrf: filter_enabled is required` + `csrf: filter_enabled.default_value is required`).
+
+(iii) The `additional_origins` parse-time discipline: per ADR-0101 §3 verbatim ("only `HeaderMatcher_StringMatch` with non-empty `Exact` value is honored. All other variants … are silent-ignored at parse time"). Phase 12 extends this discipline from phase 09's fault `headers` field to the csrf `additional_origins` field. Non-exact StringMatcher variants (prefix, suffix, contains, safe_regex) are dropped at PARSE time — they do NOT survive into `runtimeConfig`. The `ignore_case` modifier is also dropped (it is a non-exact MODIFIER even on top of an exact pattern). Empty-value `exact` entries are also dropped (matches ADR-0101's "non-empty Exact value is honored" qualifier). Surviving entries are stored verbatim — NO normalization (NO case folding, NO default-port stripping) per SPEC §11.7 amendment.
+
+### Decision
+
+`runtimeConfig` carries 2 fields:
+
+```go
+type runtimeConfig struct {
+    additionalOrigins []string         // verbatim host[:port] entries from surviving exact-with-non-empty StringMatcher
+    stats             *filterStats     // listener-level; per-route SHARES this pointer per §11.9
+}
+
+type filterStats struct {
+    requestValid        *stats.Counter
+    requestInvalid      *stats.Counter
+    missingSourceOrigin *stats.Counter
+}
+```
+
+(SPEC §6.2 documents `*atomic.Int64` as the conceptual type; the impl uses `*stats.Counter` since `stats.Registry.NewCounter` returns `*stats.Counter`. The Counter primitive itself wraps `atomic.Uint64` — semantics match.)
+
+Validation runs as 2 explicit PGV-mirror checks in `buildRuntimeConfig` (per SPEC §11.11 amendment + planner-time decision 4):
+1. `c.GetFilterEnabled() != nil` — error wording `csrf: filter_enabled is required`.
+2. `c.GetFilterEnabled().GetDefaultValue() != nil` — error wording `csrf: filter_enabled.default_value is required`.
+
+Both errors are envoy-go-own-wording per planner-time decision 4 (PROGRESS.md preamble) following the phase 11 ADR-0115 pattern of choosing clear-text envoy-go-namespaced wording over Envoy's verbatim PGV envelope. Operators reading boot logs see envoy-go-style failures (filter prefix + plain English requirement); the load-bearing claim is structural-PGV-mirroring (parse-rejection happens at the same proto-level conditions that PGV would reject), NOT byte-level error-string mirroring.
+
+`compileAdditionalOrigins` applies the ADR-0101 §3 parse-time-drop discipline to the `additional_origins` slice:
+- nil `*StringMatcher` entries: dropped.
+- `IgnoreCase=true` entries: dropped (regardless of inner pattern).
+- Non-`StringMatcher_Exact` pattern variants (prefix, suffix, contains, safe_regex): dropped via Go type-switch.
+- `StringMatcher_Exact` with empty `Exact` value: dropped.
+- All other (exact-with-non-empty) entries: stored verbatim.
+
+`shadow_enabled` is NOT inspected (no rejection, no warning, no `runtimeConfig` field). Per SPEC §11.11 probe #3 + (d) confirmation, `shadow_enabled` is OPTIONAL at PGV; envoy-go runtime is always-never-shadow regardless of presence.
+
+### Alternatives considered
+
+(a) **Verbatim-mirror Envoy's PGV envelope error string `CsrfPolicyValidationError.FilterEnabled: value is required`** — rejected per planner-time decision 4. Phase 11 ADR-0115 chose verbatim-mirroring for the 50ms fill_interval check because that check is a numeric-bound verification (operators would compare against Envoy's `server.cc:76` source line); the csrf §11.11 check is a proto-shape verification (presence of a sub-message). envoy-go-own-wording is more honest: it makes clear that envoy-go validates AT PARSE TIME (mirroring Envoy's PGV behavior) but emits its own filter-namespaced error message — the load-bearing claim is structural mirroring, not byte-level error-string equivalence.
+
+(b) **Capture `filter_enabled.default_value.numerator` into `runtimeConfig` for future runtime-percentage gating** — rejected per SPEC §2.1.2. Runtime-key + percentage-roll handling couples to the deferred Runtime + hot restart family; the runtime value is silent-ignored under MVP. Capturing it now would either be unused dead code OR introduce a divergence-window between captured-but-unused and silent-ignored. The runtime always-100% behavior is achievable without the field present.
+
+(c) **Match-time-keep-and-fail discipline for non-exact StringMatcher variants (analogous to ADR-0072's typed_config rejection-at-runtime)** — rejected. ADR-0101 §3 establishes parse-time-drop as the canonical StringMatcher non-exact discipline; phase 09's fault filter uses parse-time-drop for its `headers` field; phase 12 follows the precedent verbatim. Match-time-keep-and-fail would make per-request iteration more expensive (re-checking variant on each comparison) AND introduce surprising operator-facing behavior (config that "looks" valid at boot but never matches at runtime).
+
+(d) **Allocate `*filterStats` lazily on first DecodeHeaders call rather than eagerly at `New` time** — rejected. The stats Registry's `NewCounter` panics on duplicate registration AND boot-time-known names should be registered eagerly per ADR-0061 LBP-1 invariant. Lazy registration would either bypass `NewCounter`'s duplicate-check panic (using `NewCounterIfAbsent` per phase 11 ADR-0117) — appropriate for per-route post-Freeze registration but not for boot-time-known listener-level registration — OR introduce race conditions on the first request.
+
+### Consequences
+
+- ADR-0101 (StringMatcher non-exact parse-time-drop) extends with a fourth confirmation point (after the original phase 09 fault `headers` precedent, phase 10 header_mutation `headers` precedent, and phase 11 local_ratelimit's lack-of-StringMatcher-fields). The discipline carries through unchanged for csrf's `additional_origins` field.
+- The 1+1+1 decomposition for csrf is the SMALLEST per-filter proto-field surface to date; future filters with similarly small protos (potentially 2-3 top-level fields) follow the csrf precedent of explicit per-field classification at the package's `doc.go`.
+- The PGV-mirror filter-internal validation discipline at `New` time is now demonstrated TWICE in the project: phase 11 ADR-0115 (with Envoy-verbatim wording for numeric-bound checks) and phase 12 ADR-0121 (with envoy-go-own wording for proto-shape checks). Future filters with PGV constraints will choose between the two precedents based on the nature of the constraint (numeric-bound → verbatim mirror; proto-shape → envoy-go-own wording).
+- The `runtimeConfig` shape forward-compatible with future shadow-mode wiring: when the Runtime + hot restart family lands and `shadow_enabled` becomes operational, `runtimeConfig` widens with a `shadowFraction` field (or similar); the existing 2-field shape stays as the active subset and gains a third field. NO breaking change to existing fixtures or per-route TPFCs.
+- The `*filterStats` pointer is the SAME listener-level pointer for both listener-level `runtimeConfig` and per-route `runtimeConfig` instances (per §11.9 amendment + ADR-0124). Task 4 wires the per-route SHARING via `buildPerRouteRuntime(perRoute, listenerStats)` per planner-time decision 5; this ADR establishes the data-shape (`stats` field is a pointer that may be shared); ADR-0124 establishes the wiring mechanism.
