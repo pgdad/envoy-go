@@ -565,3 +565,26 @@ ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver
 ok  	github.com/esalaine/envoy-go/test/helpers	0.008s
 ```
 
+## Task 7 — Fixture infrastructure: `BackendKind=HTTPCsrf` enum + runner spawn helper + driver stub
+
+**Commits:** `TBD` — `phase 12: BackendKind=HTTPCsrf + runner spawn helper + driver stub for blank-import`; `TBD` — `phase 12 Task 7 follow-up: PROGRESS.md SHA-fill (TBD → <sha>)`
+**Notes:** Three-file infrastructure delta wiring fixture 0014-http-csrf into the differential runner ahead of the actual fixture-content tasks (8-11). (1) `test/differential/fixture/fixture.go`: appended `HTTPCsrf BackendKind = 11` after `HTTPLocalRateLimit BackendKind = 10` with the PLAN-verbatim comment block stating that the runner spawns `test/fixtures/0014-http-csrf/backends/backend.go` on the pre-allocated port serving `/` with body `backend\n` (8 bytes; Content-Type: text/plain; Content-Length: 8), no TLS, and that — like every other out-of-process backend kind 7-10 — the runner's in-process accept counter is NOT incremented. (2) `test/differential/runner_test.go`: blank-import `_ "github.com/esalaine/envoy-go/test/fixtures/0014-http-csrf/driver"` inserted alphabetically after the 0013 line (line 39); `case fixture.HTTPCsrf:` switch arm added in `runFixture` mirroring the `HTTPLocalRateLimit` case verbatim (freeTCPPort allocation, startHTTPCsrfBackend spawn, defer-Setpgid-SIGKILL teardown, waitTCPDial readiness gate); new `startHTTPCsrfBackend(ctx, repoRoot, port)` helper added after `startHTTPLocalRateLimitBackend` mirroring it verbatim (`go run ./test/fixtures/0014-http-csrf/backends --port <port>`, `cmd.Dir = repoRoot`, stdout/stderr to os.Stderr, `Setpgid: true`, `cmd.Start()` with `fmt.Errorf("start: %w", err)` wrap). (3) `test/fixtures/0014-http-csrf/driver/driver.go`: minimal stub `package driver` + single comment line `// Stub — full implementation in Task 11.` so the blank-import resolves now even though the actual driver TestSubject/TestReference/Expectations methods land in Task 11. NO production code changes (csrf package untouched). NO other 0014 subdirs created at this task — backends/, expectations.yaml, README.md, envoy*.yaml all deferred to Tasks 8-10. Verification: `go build ./test/differential/...`, `go vet ./test/differential/...`, `golangci-lint run ./test/differential/...` all clean (no output); regression-suite `go test -count=1 ./test/differential/ -run 'TestDifferential/0011|TestDifferential/0012|TestDifferential/0013' -v` PASS for all three pre-existing fixtures (0011-http-fault 2.41s, 0012-http-header-mutation 1.42s, 0013-http-local-ratelimit 2.09s; total wall 6.011s).
+
+**Outputs:**
+```
+$ go build ./test/differential/...
+$ go vet ./test/differential/...
+$ golangci-lint run ./test/differential/...
+$ go test -count=1 ./test/differential/ -run 'TestDifferential/0011|TestDifferential/0012|TestDifferential/0013' -v
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0011-http-fault
+=== RUN   TestDifferential/0012-http-header-mutation
+=== RUN   TestDifferential/0013-http-local-ratelimit
+--- PASS: TestDifferential (5.93s)
+    --- PASS: TestDifferential/0011-http-fault (2.41s)
+    --- PASS: TestDifferential/0012-http-header-mutation (1.42s)
+    --- PASS: TestDifferential/0013-http-local-ratelimit (2.09s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	6.011s
+```
+

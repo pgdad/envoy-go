@@ -209,6 +209,13 @@ const (
 	// Because the backend is a subprocess, the runner's in-process accept
 	// counter is NOT incremented.
 	HTTPLocalRateLimit BackendKind = 10
+	// HTTPCsrf is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0014-http-csrf/backends/backend.go on the pre-allocated
+	// port. The backend serves "/" with body "backend\n" (8 bytes;
+	// Content-Type: text/plain; Content-Length: 8). No TLS. Introduced by
+	// fixture 0014-http-csrf (phase 12 Task 7). Because the backend is a
+	// subprocess, the runner's in-process accept counter is NOT incremented.
+	HTTPCsrf BackendKind = 11
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
