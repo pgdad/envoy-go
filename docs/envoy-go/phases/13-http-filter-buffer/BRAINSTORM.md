@@ -30,16 +30,26 @@ Phase 13 lands `envoy.filters.http.buffer` (the canonical Envoy buffer filter) u
 
 4. **Per-route TPFC: `disabled` boolean OR `max_request_bytes` override (Q4 = "both shapes").** Per the proto message `BufferPerRoute` (the per-route-TPFC type, separate from the listener-level `Buffer` — UNLIKE phase 12's csrf where the same `CsrfPolicy` served both purposes), per-route entries carry a oneof with two cases: (a) `disabled: true` — the filter is wholly inactive on this route, no buffering, no counter increments; (b) `buffer: { max_request_bytes: <UInt32Value> }` — a wholesale override of the listener-level cap (subject to the same ≤ 1 MiB validation). Both shapes are honored in MVP. Each TPFC entry runs through `parsePerRoute` at config-load time → produces a `*compiledPerRoute` value. The 3-tier `PerRouteConfig.Resolve` (Route > VirtualHost > RouteConfiguration > listener fallback) selects the most-specific per-route entry per request; that entry's shape (disabled OR override) drives the disposition. ADR-0125 codifies this as the **5th canonical per-route discipline** (after data-only-override per ADR-0073 used by cors/fault/header_mutation; multi-tier-evaluation via `ResolveAllTiers` per ADR-0110 used by header_mutation; stateful-override-with-independent-stats per ADR-0117 used by local_ratelimit; data-only-override-with-shared-stats per ADR-0124 used by csrf).
 
-5. **Disposition table + body-cap decision in `DecodeHeaders` + `DecodeData`.** The filter resolves the most-specific `compiledPerRoute` via 3-tier `PerRouteConfig.Resolve`, then computes the effective cap + per-stream disposition:
+5. **Disposition tables + body-cap decision in `DecodeHeaders` + `DecodeData`.** The filter resolves the most-specific `compiledPerRoute` via 3-tier `PerRouteConfig.Resolve`, then computes the effective cap + per-stream disposition. Split into two tables for clarity (the `endStream` boolean on the headers-call is distinct from the `endStream` boolean on each data-call; the prior single-table form conflated the two columns).
 
-    | Per-route resolve | endStream on headers | Content-Length known | CL > effectiveMax | Body bytes accumulated > effectiveMax | Disposition | Counter |
+    **Table A — `DecodeHeaders(headers, endStream)` disposition:**
+
+    | Per-route resolve | `endStream` on headers | Content-Length known | CL > effectiveMax | `DecodeHeaders` disposition | Counter | Notes |
     |---|---|---|---|---|---|---|
-    | `disabled=true` | (any) | (any) | (any) | (any) | `Continue` (passthrough; no buffering, no counter touch) | (none) |
-    | nil OR `override` | `endStream=true` (header-only request) | n/a | n/a | n/a | `Continue` (no body to buffer) | (none) |
-    | nil OR `override` | `endStream=false` | yes | yes | n/a (CL fast-fail) | `SendLocalReply(413, "Payload Too Large", connClose)` + `StopIteration` | `request_too_large +1` |
-    | nil OR `override` | `endStream=false` | (any) | no | no (and NOT endStream) | `DataStopIterationAndBuffer` (accumulate) | (none yet) |
-    | nil OR `override` | `endStream=false` | (any) | no | no (AND endStream) | `DataContinue` (release buffered body) | `request_buffered +1` |
-    | nil OR `override` | `endStream=false` | (any) | no | YES (mid-stream overflow) | `SendLocalReply(413, "Payload Too Large", connClose)` + `DataStopIterationNoBuffer` | `request_too_large +1` |
+    | `disabled=true` | (any) | (any) | (any) | `Continue`; set `f.passthrough=true` | (none) | route opted out; `DecodeData` short-circuits via the passthrough flag |
+    | nil OR `override` | `endStream=true` (header-only request) | n/a | n/a | `Continue` | (none) | no body expected; `DecodeData` will not be called |
+    | nil OR `override` | `endStream=false` | yes | yes | `SendLocalReply(413, "Payload Too Large", connClose)` + `StopIteration` | `request_too_large +1` | CL fast-fail; `DecodeData` will not be called |
+    | nil OR `override` | `endStream=false` | yes | no | `Continue` | (none) | begin streaming-cap path; `DecodeData` accumulates |
+    | nil OR `override` | `endStream=false` | no (Transfer-Encoding chunked OR header malformed) | n/a | `Continue` | (none) | begin streaming-cap path; `DecodeData` accumulates |
+
+    **Table B — `DecodeData(data, endStream)` disposition** (entered only when `f.passthrough==false` AND `DecodeHeaders` returned `Continue` AND not header-only; otherwise `DecodeData` is either skipped or fast-passthrough):
+
+    | `f.passthrough` | `accumulated += len(data)` then check | `endStream` on data | `DecodeData` disposition | Counter |
+    |---|---|---|---|---|
+    | `true` | (skipped) | (any) | `DataContinue` (passthrough; framework safety-net cap never engages because we never return `DataStopIterationAndBuffer`) | (none) |
+    | `false` | `accumulated > effectiveMax` (mid-stream overflow) | (any) | `SendLocalReply(413, "Payload Too Large", connClose)` + `DataStopIterationNoBuffer` | `request_too_large +1` |
+    | `false` | `accumulated ≤ effectiveMax` | `endStream=true` (terminal chunk fits) | `DataContinue` (release the fully-buffered body to upstream) | `request_buffered +1` |
+    | `false` | `accumulated ≤ effectiveMax` | `endStream=false` (in-flight chunk; more to come) | `DataStopIterationAndBuffer` (accumulate; framework holds bytes per ADR-0076) | (none yet) |
 
     The disposition uses `DataStopIterationAndBuffer` for in-flight buffering (the framework's existing accumulation path); `DataContinue` to release the fully-buffered body to the upstream; `DataStopIterationNoBuffer` on overflow (discards the partial buffer; the framework's `beginLocalReply` drives the encode chain immediately). NO async-resume; NO encode-side state. `DecodeTrailers` / all `Encode*` are pass-through.
 
