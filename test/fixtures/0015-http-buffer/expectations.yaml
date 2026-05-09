@@ -1,0 +1,84 @@
+# Phase 13 fixture 0015 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per planner-time decision 6): single listener l_main with three routes.
+#   - Listener-level Buffer: max_request_bytes=1048576 (1 MiB; the envoy-go cap per ADR-0126)
+#   - / (default route): inherits listener-level Buffer
+#   - /route-disabled TPFC: disabled=true (filter wholly inactive)
+#   - /route-tighter TPFC: buffer.max_request_bytes=131072 (128 KiB override; tighter than listener)
+#
+# Six scenarios (6 HTTP requests; all sequential against single listener):
+#
+# Scenario 1: Body fits within listener cap
+#   Request:  POST / body=1 KiB (CL-known)
+#   Response: 200 OK + backend echo body (header-only path does not trigger; payload passthrough)
+#   Counter:  downstream_rq_total +1, downstream_rq_2xx +1
+#   Note:     SPEC §7.1 scenario 1 + §11.1 baseline passthrough
+#
+# Scenario 2: Streaming overflow with CL-known body
+#   Request:  POST / body=2 MiB (CL-known); curl auto-injects Expect: 100-continue
+#   Response: HTTP/1.1 100 Continue (interim, stripped by http.Client.Do)
+#             followed by 413 Payload Too Large + body byte-exact "Payload Too Large" (17 bytes, no LF)
+#             headers (lowercase wire-form, set-equal modulo allow-list):
+#               content-length: 17
+#               content-type: text/plain
+#               date: <RFC1123 allow-listed>
+#               server: envoy
+#               connection: close
+#   Counter:  downstream_rq_total +1, downstream_rq_4xx +1
+#   Note:     SPEC §7.1 scenario 2 + §11.2 (strict > predicate) + §11.7 (413 wire shape)
+#             + §11.8 (100-Continue addendum on CL-known requests; driver sees final 413 only)
+#
+# Scenario 3: Chunked overflow against per-route tighter cap
+#   Request:  POST /route-tighter Transfer-Encoding: chunked body~=200 KiB (exceeds 128 KiB override)
+#   Response: 413 Payload Too Large (NO 100-Continue with chunked; chunked path bypasses Expect)
+#             + body byte-exact "Payload Too Large" (17 bytes, no LF)
+#             + 4-header set (same as scenario 2) + connection: close
+#   Counter:  downstream_rq_total +1, downstream_rq_4xx +1
+#   Note:     SPEC §7.1 scenario 3 + §11.9 (chunked passthrough; no 100-Continue with chunked)
+#             + ADR-0125 (per-route override fires; tighter 128 KiB cap applies instead of listener 1 MiB)
+#
+# Scenario 4: Per-route disabled bypasses cap entirely
+#   Request:  POST /route-disabled body=2 MiB (CL-known; exceeds listener 1 MiB)
+#   Response: 200 OK + backend echo body (filter wholly inactive on disabled route per §11.4)
+#   Counter:  downstream_rq_total +1, downstream_rq_2xx +1
+#   Note:     SPEC §7.1 scenario 4 + ADR-0125 (disabled boolean shortcut; filter returns HeadersContinue
+#             immediately; no DecodeData body-counting; payload passes through untouched to backend)
+#
+# Scenario 5: Per-route tighter override fires (CL-known)
+#   Request:  POST /route-tighter body=200 KiB (CL-known; exceeds 128 KiB override but fits 1 MiB)
+#   Response: HTTP/1.1 100 Continue (interim, stripped by http.Client.Do; curl auto-injects Expect on --data-binary)
+#             followed by 413 Payload Too Large + body "Payload Too Large" (17 bytes, no LF)
+#             + 4-header set (same as scenario 2) + connection: close
+#   Counter:  downstream_rq_total +1, downstream_rq_4xx +1
+#   Note:     SPEC §7.1 scenario 5 + ADR-0125 (per-route override applies; 128 KiB < 200 KiB →
+#             accumulated > effectiveMax fires 413) + §11.8 (100-Continue on CL-known; driver sees final 413 only)
+#
+# Scenario 6: Chunked-passthrough Content-Length injection (cross-cutting)
+#   Request:  POST / Transfer-Encoding: chunked body=10 KiB (chunked encoding; no Content-Length header)
+#   Response: 200 OK + backend echo body
+#   Backend:  asserts inbound request carries Content-Length: 10240 (NOT Transfer-Encoding: chunked)
+#             — load-bearing assertion for maybeAddContentLength mirror (SPEC §11.8-CL; ADR-0127 v2)
+#   Counter:  downstream_rq_total +1, downstream_rq_2xx +1
+#   Note:     SPEC §7.1 scenario 6 + §11.8-CL (maybeAddContentLength invoked on terminal endStream;
+#             chunked request body is accumulated, then CL injected before upstream forward;
+#             backend sees fixed Content-Length: 10240, NOT chunked encoding — verifies mirror)
+#
+# Final counter snapshot (after all 6 requests, envoy-go side):
+#   downstream_rq_total        = 6   (scenarios 1–6, one request each)
+#   downstream_rq_2xx          = 3   (scenarios 1, 4, 6 — passthrough 200 OK)
+#   downstream_rq_4xx          = 3   (scenarios 2, 3, 5 — overflow 413 Payload Too Large)
+#
+# Prometheus form (after scrape, HCM-level counters with tag extraction):
+#   envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="ingress_buffer"} 6
+#   envoy_http_downstream_rq_xx{envoy_response_code_class="2",envoy_http_conn_manager_prefix="ingress_buffer"} 3
+#   envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="ingress_buffer"} 3
+#
+# No timing tolerances. Buffer is purely synchronous; all responses dispatch within microseconds.
+# NO analog to phase 11 fixture 0013 scenario 3's ±10ms refill boundary.
+#
+# NO new buffer-filter-specific counters (SPEC §1.1 amendment 5; phase 13 contributes ZERO entries
+# to the 29-name stat-table). Envoy-only downstream_rq_too_large (+3) and downstream_rq_completed (+6)
+# counters are filtered out of the differential via the existing twin-series-discipline allow-list
+# (per BEHAVIOR_CONTRACT.md ### Twin-series filter discipline + phase 06.1 SPEC §11.5).
+#
+# Cross-refs: SPEC §7.1 + §7.3 + §13.1 + ADR-0125 + ADR-0126 + ADR-0127 v2.
