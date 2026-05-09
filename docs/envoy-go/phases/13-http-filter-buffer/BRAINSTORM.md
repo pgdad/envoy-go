@@ -1,6 +1,6 @@
 # Phase 13 Brainstorm — `envoy.filters.http.buffer`
 
-**Status:** brainstorm complete. This document captures the design decisions reached during the lifecycle-state-0 → 1 brainstorm session for phase 13 (`http-filter-buffer`), the SIXTH concrete phase under `BOOTSTRAP_PROMPT.md` §9's HTTP filters family (after `cors` at phase 07.1, `fault` at phase 09, `header_mutation` at phase 10, `local_ratelimit` at phase 11, and `csrf` at phase 12). The next session (lifecycle-state 1 → 2 for phase 13, skill `superpowers:writing-plans` per ADR-0005, routed through the SPEC-authoring step first per the phase 09/10/11/12 precedent) authors `docs/envoy-go/phases/13-http-filter-buffer/SPEC.md` based on this brainstorm — that SPEC is also responsible for executing the §9 empirical-pin obligations IN-SESSION against reference Envoy v1.37.2 per ADR-0004.
+**Status:** brainstorm complete + post-landing empirical amendment (§12 added 2026-05-09). This document captures the design decisions reached during the lifecycle-state-0 → 1 brainstorm session for phase 13 (`http-filter-buffer`), the SIXTH concrete phase under `BOOTSTRAP_PROMPT.md` §9's HTTP filters family (after `cors` at phase 07.1, `fault` at phase 09, `header_mutation` at phase 10, `local_ratelimit` at phase 11, and `csrf` at phase 12). The next session (lifecycle-state 1 → 2 for phase 13, skill `superpowers:writing-plans` per ADR-0005, routed through the SPEC-authoring step first per the phase 09/10/11/12 precedent) authors `docs/envoy-go/phases/13-http-filter-buffer/SPEC.md` based on this brainstorm — that SPEC is also responsible for executing the §9 empirical-pin obligations IN-SESSION against reference Envoy v1.37.2 per ADR-0004. **§12 below supersedes the affected portions of §§1.1, 2.5, 2.6, 2.7, 2.8, 6, 7, 8, and 11 in light of post-landing empirical findings; §§1–11 are preserved verbatim as the pre-amendment design sketch.**
 
 **Brainstorm session:** worktree `.worktrees/phase-13-http-filter-buffer-brainstorm`, branch `phase-13-http-filter-buffer-brainstorm`, branched from master tip `a782fc9` (the phase 12 phase-done REVIEW commit `phase 12: REVIEW — end-of-phase retrospective + N-1 carry-forward`). The phase 12 phase-done implementation commit `4f4ed39` and its SHA-fill follow-up `2706168` precede the REVIEW; `a782fc9` is the REVIEW-landing commit.
 
@@ -8,7 +8,7 @@
 
 **Document shape:** mirrors `docs/envoy-go/phases/12-http-filter-csrf/BRAINSTORM.md` section-for-section, reframed for the buffer scope and adapted for its specific surface area (the structurally-thinnest §9 row at the proto level — only ONE field on the parent `Buffer` proto; first body-touching HTTP filter; first per-route discipline introducing a `disabled` boolean shortcut as a first-class shape). Sections §§1–11 are decision-bearing prose; §9 enumerates the empirical-pin obligations the SPEC author resolves against Envoy v1.37.2. Per D-3.4 (context isolation), every load-bearing fact cited here lives on disk in the named files; no "see prior conversation" references appear. NO off-master prebrainstorm-notes branch was authored for phase 13 — this brainstorm cold-started fresh from the §9 heading + the phase 12 just-shipped artefacts per ADR-0106(e).
 
-**Authored:** 2026-05-08. Last-updated: 2026-05-08.
+**Authored:** 2026-05-08. Last-updated: 2026-05-09 (§12 amendment).
 
 ---
 
@@ -551,6 +551,244 @@ All unit tests + the existing differential suite + the new fixture 0015 must pas
 
 ---
 
-## End of phase 13 brainstorm
+## 12. Empirical amendment — 2026-05-09 (post-landing)
 
-Next-session input: this BRAINSTORM.md + `BOOTSTRAP_PROMPT.md` §5 lifecycle-state-1 → 2 transition + `SKILL_ROUTING.md` + the 4 ADRs from §7 (ADR-0125 through ADR-0128) anchored as anticipated. The next session authors `docs/envoy-go/phases/13-http-filter-buffer/SPEC.md` via `superpowers:writing-plans` (routed through SPEC-authoring step first per phase 09/10/11/12 precedent), executing the §9 empirical-pin obligations IN-SESSION against reference Envoy v1.37.2 per ADR-0004.
+**Trigger.** SPEC-authoring session 2026-05-09 began executing the §9 empirical-pin obligations against `envoyproxy/envoy:v1.37.2` (digest `sha256:c5e8a68e52f4…`) per ADR-0004. The first three pins surfaced findings that overturn the algorithmic core hypothesized in §2.6 + §2.7 + §2.8. The user paused SPEC drafting and chose the rare D-3.5 amendment route (§12) over routing the divergence through SPEC §11 alone, on the grounds that the empirical re-frame is large enough that the SPEC author benefits from a corrected design sketch — not just a §11 amendment block. §§1–11 above are PRESERVED VERBATIM (D-3.5 immutability of the original brainstorm landing); §12 documents the post-landing reconciliation and SUPERSEDES the affected design Decisions for SPEC-drafting purposes.
+
+**Scope of preservation.** §§1.1 (deliverable count), 1.4 (LoC envelope), 2.5 (per-route discipline), 2.6 (body-counting algorithm), 2.7 (stat surface), 2.8 (413 wire shape), 6 (fixture matrix), 7 (ADR roster), 8 (deferral list), and 11 (test scaffolding) are SUPERSEDED in part or whole by §12. §§1.2 (forward-pointers), 1.3 (phase-done framing), 1.5 (no-sibling-stub), 1.6 (no-prebrainstorm-branch), 2.1 (package layout), 2.2 (boot registration), 2.3 (1-consumed/0-deferred field decomposition), 2.4 (cap-layering rationale), 3 (iteration protocol), 4 (no framework deltas — STILL HOLDS), 5 (stats anchor — superseded by §12.5), 9 (empirical pin enumeration — RESOLVED in §12.3 below), and 10 (ROADMAP delta) are unchanged.
+
+### 12.1 Source-of-truth excerpts (`source/extensions/filters/http/buffer/buffer_filter.cc` at tag `v1.37.2`)
+
+The Envoy buffer filter is 102 lines of C++ (verbatim fetched from `https://raw.githubusercontent.com/envoyproxy/envoy/v1.37.2/source/extensions/filters/http/buffer/buffer_filter.cc`). The load-bearing methods:
+
+```cpp
+// buffer_filter.cc:50-67
+Http::FilterHeadersStatus BufferFilter::decodeHeaders(Http::RequestHeaderMap& headers,
+                                                      bool end_stream) {
+  if (end_stream) {
+    // If this is a header-only request, we don't need to do any buffering.
+    return Http::FilterHeadersStatus::Continue;
+  }
+  initConfig();                        // resolves per-route most-specific config
+  if (settings_->disabled()) {
+    // The filter has been disabled for this route.
+    return Http::FilterHeadersStatus::Continue;
+  }
+  callbacks_->setBufferLimit(settings_->maxRequestBytes());   // delegates cap to HCM
+  request_headers_ = &headers;
+  return Http::FilterHeadersStatus::StopIteration;            // holds headers until end-stream
+}
+
+// buffer_filter.cc:69-79
+Http::FilterDataStatus BufferFilter::decodeData(Buffer::Instance& data, bool end_stream) {
+  content_length_ += data.length();
+  if (end_stream || settings_->disabled()) {
+    maybeAddContentLength();
+    return Http::FilterDataStatus::Continue;
+  }
+  // Buffer until the complete request has been processed or the ConnectionManagerImpl sends a 413.
+  return Http::FilterDataStatus::StopIterationAndBuffer;
+}
+
+// buffer_filter.cc:91-97
+void BufferFilter::maybeAddContentLength() {
+  // request_headers_ is initialized iff plugin is enabled.
+  if (request_headers_ != nullptr && request_headers_->ContentLength() == nullptr) {
+    ASSERT(!settings_->disabled());
+    request_headers_->setContentLength(content_length_);
+  }
+}
+```
+
+Five algorithmic facts derive from the code:
+
+1. **Header-only fast-path.** `end_stream=true` on `decodeHeaders` returns `Continue` immediately; the filter never engages.
+2. **Per-route disabled bypass.** `settings_->disabled()` on a non-end-stream request returns `Continue` without setting any cap; the filter does NO body work; `decodeData` short-circuits via the same `disabled()` check.
+3. **Cap delegation, not enforcement.** When the filter does engage, it calls `callbacks_->setBufferLimit(maxRequestBytes)` and returns `StopIteration` from `decodeHeaders`. The cap is enforced by HCM's per-stream buffer limit machinery, not by the filter. The 413 on overflow is emitted by `ConnectionManagerImpl`, NOT by the filter — see the line 77 source comment "Buffer until the complete request has been processed or the ConnectionManagerImpl sends a 413."
+4. **No Content-Length fast-fail.** Nowhere does the filter inspect the `Content-Length` header. The cap fires only after data accumulates past the limit. (Probe §12.3.P6 confirms: a request with `Content-Length: 6291456` and zero body bytes does NOT 413 — Envoy waits for body, eventually times out the connection.)
+5. **Content-Length injection on chunked completion.** `maybeAddContentLength()` injects `Content-Length: <accumulated>` on the held headers when end-stream arrives AND the original request had no Content-Length (chunked transfer). This is observable on the upstream side: Envoy converts chunked → fixed-CL before forwarding.
+
+### 12.2 BufferPerRoute proto + decoder rejection mechanism (resolves §9.P3)
+
+The per-route message (verbatim from `buffer.proto` v3, type-URL `envoy.extensions.filters.http.buffer.v3.BufferPerRoute`):
+
+```protobuf
+message BufferPerRoute {
+  oneof override {
+    option (validate.required) = true;
+    bool disabled = 1 [(validate.rules).bool.const = true];
+    Buffer buffer = 2;
+  }
+}
+```
+
+Two PGV constraints: (a) the oneof has `validate.required` — exactly one of `disabled` or `buffer` must be set; (b) `disabled` has `bool.const = true` — only `disabled: true` is accepted (omitting it OR setting `disabled: false` are both rejected).
+
+Probe §12.3.P3 confirms: setting BOTH `disabled: true` AND `buffer: {…}` in the same `BufferPerRoute` entry rejects at boot, but the rejection mechanism is the **JSON→proto decoder**, not PGV. The error wording is `'disabled' has already been set (either directly or as part of a oneof)` — surfaced from protobuf-cpp's `JsonStringToMessage` before PGV runs. This is structurally upstream of the PGV `validate.required` check.
+
+For envoy-go (which uses `protojson.Unmarshal`), the same proto3 oneof discipline applies: the JSON decoder rejects oneof violations before any PGV-mirror validation sees the message. envoy-go's `parsePerRoute` inherits this for free; no envoy-go-specific PGV-mirror code is needed for the oneof-violation case.
+
+### 12.3 Empirical pin disposition table (resolves §9.P1..P11)
+
+Probe machinery: 5 per-pin bootstrap YAMLs at `/tmp/p13-pins/p{1,3,4}-*.yaml` (P2/P5/P6/P7/P8/P9/P10/P11 share `/tmp/p13-pins/p1-overcap.yaml` or `/tmp/p13-pins/p4-disabled.yaml` since they vary only the request shape against a stable bootstrap); reference Envoy in `--network=host` Docker container; backend Python `BaseHTTPRequestHandler` on host loopback reached via `host.docker.internal` from the container netns; `curlimages/curl:latest` sidecar `--network=host` issues probes. Verbatim probe transcripts are durable on this commit's machine at `/tmp/p13-pins/` and will be re-captured + recorded in SPEC §11 by the next session per phase 09/10/11/12 §11 discipline. The summary below is the reconciliation; the SPEC author re-runs each probe and records the verbatim output in SPEC §11.
+
+| Pin | BRAINSTORM hypothesis | Empirical reality | Verdict | Lands at |
+|---|---|---|---|---|
+| §9.P1 | Envoy boots cleanly with `max_request_bytes=5 MiB`; framework cap fires at 1 MiB on a 2 MiB body | Envoy boots cleanly with 5 MiB cap (✓); 2 MiB body **passes through** to upstream (5 MiB cap not engaged); 6 MiB body emits 413 with framework's 17-byte body | **AMENDED.** Envoy enforces the buffer filter's own cap (no separate "framework 1 MiB cap"). The "framework cap" framing is envoy-go-internal (ADR-0076's `filterBufferLimitBytes`); reference Envoy has no such hardcoded cap distinct from the filter's value. | §12.4 Decision 6 v2 |
+| §9.P2 | Body exactly at 1 MiB triggers buffer's check first; both proxies emit 413 | Body exactly at 1 MiB → **200 OK** (cap is `>`, not `>=`); 1 MiB + 1 byte → 413 | **AMENDED.** Cap predicate is `accumulated > effectiveMax`; exact-cap fits. | §12.4 Decision 6 v2 |
+| §9.P3 | PGV rejects oneof violation at boot | Rejected at boot, but mechanism is JSON→proto decoder error `'disabled' has already been set (either directly or as part of a oneof)`, NOT PGV | **CONFIRMED rejection; AMENDED mechanism.** envoy-go's `protojson.Unmarshal` mirrors this for free. | §12.4 Decision 5 v2 |
+| §9.P4 | Per-route `disabled: true` bypasses ALL cap discipline | CONFIRMED. `POST /route-disabled` body=2 MiB → 200 (passthrough); body=6 MiB → 503 from upstream (NOT a buffer 413; upstream cluster's connection-level handling rejected). Filter is wholly inactive when `settings_->disabled()` is true. | **CONFIRMED.** | §12.4 Decision 5 v2 |
+| §9.P5 | `envoy_http_buffer_request_buffered{…}` + `envoy_http_buffer_request_too_large{…}` 2-counter Prometheus surface; 29→31 stat-table extension via ADR-0128 | **NO `buffer.*` Prometheus counters exist in Envoy v1.37.2.** `/stats/prometheus` scrape after 4 buffer-overflow probes shows zero `envoy_http_buffer_*` metrics. The only relevant counter is `envoy_http_downstream_rq_too_large{envoy_http_conn_manager_prefix="ingress_pX"}` (HCM-level, generic — already in the 29-name table from phase 06.1; phase 13 contributes ZERO new stat-table entries). | **MAJOR AMENDMENT.** Phase 13's stat-table delta is ZERO. ADR-0128 retired (see §12.5). The buffer filter is observed entirely via the existing HCM `downstream_rq_*` family. | §12.5 Decision 7 v2 |
+| §9.P6 | Envoy CL fast-fails at `decodeHeaders` time when `Content-Length > effectiveMax` | Envoy does **NOT** fast-fail. Probe with `Content-Length: 6291456` and 0 body bytes hangs (no response in 5 s; connection eventually times out). Probe with `Content-Length` matching body size emits `100 Continue` then 413 only AFTER the body stream exceeds the cap. The filter never reads `Content-Length` (see source §12.1 `decodeHeaders`). | **MAJOR AMENDMENT.** No CL fast-fail. The body-counting path is purely streaming. | §12.4 Decision 6 v2 |
+| §9.P7 | `HTTP/1.1 413 Payload Too Large` exact status line | CONFIRMED on every overflow probe (P1 6 MiB; P2-edge 1 MiB+1; P4-C 2 MiB; P4-D 200 KiB chunked; P9 200 KiB chunked). | **CONFIRMED.** | §12.4 Decision 8 v2 |
+| §9.P8 | Body bytes byte-exact `Payload Too Large` (17 bytes, no LF) + 4-header lowercase wire-form (`content-length: 17`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`) + `Connection: close` | CONFIRMED. Addendum: when curl uses `--data-binary @<large-file>`, Envoy emits `100 Continue` BEFORE the eventual 413 (curl auto-injects `Expect: 100-continue` for large bodies). With `Transfer-Encoding: chunked`, NO `100 Continue` is emitted (curl does not inject `Expect:` for chunked). The 413 wire shape itself is identical in both cases. | **CONFIRMED + 100-Continue addendum.** | §12.4 Decision 8 v2 + SPEC §11 record |
+| §9.P9 | `Transfer-Encoding: chunked` accumulation: cap fires at `accumulated > effectiveMax` mid-stream | CONFIRMED. Chunked 200 KiB → /route-tighter (128 KiB cap) → 413; chunked 64 KiB → /route-tighter → 200. | **CONFIRMED.** | §12.4 Decision 6 v2 |
+| §9.P10 | Header-only `GET /` is pure passthrough; zero counter touch on buffer-specific stats | CONFIRMED (vacuously, since no `buffer.*` counter exists per §9.P5). HCM-level `downstream_rq_2xx + 1` and `downstream_rq_completed + 1` are the only deltas — same as any other GET. | **CONFIRMED.** | §12.5 Decision 7 v2 |
+| §9.P11 | Empty-body `POST` (`Content-Length: 0`) increments `request_buffered` (or doesn't — pin asks) | The `request_buffered` counter does not exist per §9.P5; question is moot. Empirically, `POST` with `CL=0` returns 200; only HCM-level `downstream_rq_2xx + 1` and `downstream_rq_completed + 1` increment. | **MOOT.** | §12.5 Decision 7 v2 |
+
+### 12.4 Re-framed Decisions 5, 6, 8 (supersede §2.5 + §2.6 + §2.8 for SPEC-drafting purposes)
+
+#### Decision 5 v2 — Per-route TPFC: still disabled-OR-override, but PGV mechanism amended
+
+**Decision (carries §2.5 + amends mechanism):** `BufferPerRoute` proto carries the oneof `{disabled: true, buffer: Buffer}`. envoy-go's `parsePerRoute` accepts each shape and produces a `*compiledPerRoute` value:
+
+- `disabled: true` → `&compiledPerRoute{disabled: true}` (filter is wholly inactive on this route).
+- `buffer: {max_request_bytes: N}` → `&compiledPerRoute{maxOverride: &N}` (subject to the same ≤ 1 MiB validation as listener-level per ADR-0126; rejection wording mirrors ADR-0121 precedent).
+- Both fields set → **rejected by `protojson.Unmarshal` BEFORE `parsePerRoute` runs**. The rejection mechanism is the proto3 oneof discipline (JSON decoder error: `'disabled' has already been set (either directly or as part of a oneof)`). envoy-go inherits this for free; no PGV-mirror code is needed for the oneof case. PGV's `validate.required` constraint on the oneof is structurally downstream of the JSON decode failure and is never reached for this input class.
+- Neither field set → **rejected by PGV's `validate.required = true` constraint** (NOT silent no-op as §2.5 hypothesized; envoy-go MUST PGV-mirror the `validate.required` constraint at parse time per ADR-0121 precedent). Wording: `"buffer per-route: override oneof is required"`.
+- `disabled: false` → **rejected by PGV's `bool.const = true` constraint** (the proto only accepts `disabled: true`). envoy-go MUST PGV-mirror this.
+
+The rest of §2.5 (5th canonical per-route discipline, ADR-0125 anchor, no amendment to ADR-0073, SHARED stats with listener-level) is **unchanged**. The 5-row canonical-shape table at §2.5 still holds.
+
+#### Decision 6 v2 — Body-counting algorithm (REPLACES §2.6 in full)
+
+**Decision (replaces §2.6):** envoy-go's filter algorithm DOES NOT mirror Envoy's `setBufferLimit + StopIteration + HCM-emits-413` model directly — envoy-go's framework lacks a per-stream cap-override primitive (per §4 invariant + ADR-0076 §Consequences (d) which defers cap promotion to a future phase). Instead, envoy-go's filter does its own per-stream byte-counting in `DecodeData` and emits the 413 itself via `SendLocalReply`, while preserving WIRE-EQUIVALENT outcomes with Envoy on every observable axis (status, body, headers, counter).
+
+**Algorithm:**
+
+`DecodeHeaders(headers, endStream)`:
+1. If `endStream` → return `Continue` (header-only request; filter does no work).
+2. Resolve `(effectiveMax, disabled)` via `RequestRouteConfig().Resolve("buffer", routeIdx)` + listener fallback.
+3. If `disabled` → set `f.passthrough = true`; return `Continue` (per-route bypass; `DecodeData` short-circuits).
+4. Else: store `effectiveMax`, store `f.headersRef = headers` (for §maybeAddContentLength mirror in step 7); return **`StopIteration`** (mirrors Envoy line 66 — holds headers until end-stream so that the upstream-side observable is the complete request with corrected Content-Length).
+
+`DecodeData(data, endStream)`:
+1. If `f.passthrough` → return `DataContinue` (route disabled; forward chunks raw; framework's safety-net cap never engages because we never return `DataStopIterationAndBuffer`).
+2. `f.accumulated += len(data)`.
+3. If `f.accumulated > f.effectiveMax` → **mid-stream overflow**: increment HCM `downstream_rq_too_large` (see §12.5); call `SendLocalReply(413, "Payload Too Large", connClose)`; return `DataStopIterationNoBuffer` (discards the partial buffer; framework's `beginLocalReply` runs the encode chain immediately).
+4. If `endStream`: invoke `maybeAddContentLength` (step 7) to inject `Content-Length: <accumulated>` on the held headers when the request was chunked; release the held headers + body; return `DataContinue`.
+5. Else (in-flight chunk; more to come): return `DataStopIterationAndBuffer` (accumulate; framework holds bytes per ADR-0076 §Decision (b)).
+
+`DecodeTrailers(trailers)`:
+- Invoke `maybeAddContentLength` (in case end-stream arrived via trailers, not via terminal `endStream=true` data chunk); return `TrailersContinue`.
+
+`maybeAddContentLength` (helper, mirrors `buffer_filter.cc:91-97`):
+- If `f.headersRef != nil` AND the original request had no `Content-Length` header → set `Content-Length: <f.accumulated>` on the held headers. The discipline is: chunked → fixed-CL conversion before forwarding upstream. This is observable on the backend; phase 13 fixture 0015 must assert byte-equivalence on the upstream-received `Content-Length`.
+
+`EncodeHeaders/EncodeData/EncodeTrailers`: pass-through (`Continue`/`DataContinue`/`TrailersContinue`); buffer is decoder-side-only.
+
+`OnDestroy`: no-op; buffer has no per-request resources to clean up.
+
+**Why this divergence is acceptable.** envoy-go's filter does work that Envoy delegates to HCM (byte-counting + 413 emission), but the WIRE OUTCOMES are byte-equivalent: status `413`, body `Payload Too Large` 17 bytes, 4-header set lowercase wire-form, `Connection: close`, plus the same `downstream_rq_too_large` counter increment (§12.5). The structural divergence is observable only via `maybeAddContentLength` semantics + trailer-arrival edge cases, which §6 fixture 0015 covers.
+
+**Counter increment ordering** (load-bearing for differential):
+- HCM `downstream_rq_too_large` fires **once per overflowing request** on the chunk where `accumulated > effectiveMax`.
+- Disabled per-route requests touch zero `buffer.*` counters (because none exist) AND zero `downstream_rq_too_large` (the cap never engages on the bypass path).
+- Header-only requests (`endStream=true` on `DecodeHeaders`) touch zero `buffer.*` counters AND zero `downstream_rq_too_large`.
+- Empty-body POST (`Content-Length: 0`) touches zero `buffer.*` counters AND zero `downstream_rq_too_large` (no overflow).
+
+**ADR anchor for v2:** ADR-0127 (renumbered to ADR-0127 v2) — Body-counting algorithm + maybeAddContentLength mirror + reuse of framework `SendLocalReply` 413 wire shape. The Decision 6 v1 Content-Length fast-fail clause is REMOVED; the §6 fixture matrix scenario 2 is restructured (§12.6).
+
+#### Decision 8 v2 — 413 wire shape + 100-Continue addendum (supersedes §2.8)
+
+**Decision (carries §2.8 + 100-Continue addendum):** The 413 emitted by the buffer filter on mid-stream overflow is byte-equivalent to the 413 emitted by the framework's existing `RunDecodeData` overflow path (ADR-0076 §Decision (b)):
+- Status: `HTTP/1.1 413 Payload Too Large`.
+- Body: `Payload Too Large` (17 bytes ASCII; constant `localReply413Body` from `internal/filter/http/chain.go:25`; no trailing newline).
+- Headers (lowercase wire-form): `content-length: 17`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`, plus user-supplied `Connection: close`.
+
+**100-Continue addendum (§12.3.P8 finding):** Reference Envoy emits `HTTP/1.1 100 Continue` BEFORE the eventual 413 when the request includes `Expect: 100-continue` (curl auto-injects this for large bodies via `--data-binary @<file>`). With `Transfer-Encoding: chunked`, no `100 Continue` is emitted. envoy-go's HCM/H1-codec `100 Continue` discipline (already shipped in phase 04) handles this transparently — buffer filter does NOT need to emit `100 Continue` itself; the HCM does. Phase 13 fixture 0015 driver MUST account for the `100 Continue` line in transcripts when curl-style probes are used; the assertion shape becomes "first non-1xx response is 413" rather than "first response is 413".
+
+**ADR anchor for v2:** ADR-0127 v2 (consequence; same anchor as Decision 6 v2).
+
+### 12.5 Re-framed Decision 7 — Stat surface (REPLACES §2.7 + retires ADR-0128)
+
+**Decision (replaces §2.7):** **Phase 13 contributes ZERO new entries to `BEHAVIOR_CONTRACT.md ## Stat-name mapping`. The 29-name table stays at 29 names.** Buffer-filter overflow increments the existing HCM-level counter `http.<HCM stat_prefix>.downstream_rq_too_large` (already in the 29-name table from phase 06.1); buffer-filter passthrough increments `http.<HCM stat_prefix>.downstream_rq_2xx + downstream_rq_completed` (also pre-existing).
+
+**Mechanism in envoy-go:** the `SendLocalReply(413, …)` call in `DecodeData` triggers HCM's `downstream_rq_4xx` + `downstream_rq_too_large` counters via the existing post-413 counter-emission discipline shipped in phase 06.1. The buffer filter does NOT directly increment any counter; the HCM-level counters are incremented automatically by the post-`SendLocalReply` framework code path.
+
+**Prometheus form (§12.3.P5 verbatim scrape):**
+```
+# TYPE envoy_http_downstream_rq_too_large counter
+envoy_http_downstream_rq_too_large{envoy_http_conn_manager_prefix="ingress_p4"} 4
+```
+This is the `envoy_http_conn_manager_prefix`-tagged HCM counter from phase 06.1 + ADR-0061 SN-rule set; no new SN rule is needed. Phase 13 retires the SN-rule extension hypothesized in §2.7.
+
+**ADR-0128 retired.** The anticipated ADR slot is no longer needed (no new stat-table entry; no new SN rule; no SHARED-vs-INDEPENDENT stats decision since there's nothing buffer-specific to share). Phase 13 anticipated ADRs become **3, not 4**: ADR-0125, ADR-0126, ADR-0127 v2. The next-free ADR after phase 13 is ADR-0128 (preserved for the next phase).
+
+**§5 (BRAINSTORM stats placeholder section) is updated.** The §5 anchor stays as a structural placeholder; its content is now "see §12.5" rather than "see §2.7."
+
+### 12.6 Re-framed §6 fixture 0015 (5 scenarios, restructured)
+
+The fixture topology in §6.1 (single listener, three routes `/`, `/route-disabled`, `/route-tighter`, listener-level cap 1 MiB, `/route-disabled` per-route disabled, `/route-tighter` per-route 128 KiB override) is **unchanged**.
+
+The 5-scenario matrix in §6.2 is restructured to drop the now-impossible Content-Length fast-fail scenario:
+
+| # | Scenario | Request | Expected | Counter delta |
+|---|---|---|---|---|
+| 1 | Body fits within listener cap | `POST /` body=1 KB (CL-known) | 200 + backend echo | `downstream_rq_2xx +1`, `downstream_rq_completed +1` |
+| 2 | **Streaming overflow with CL-known body** (replaces §6.2 row 2 "CL fast-fail") | `POST /` body=2 MiB (CL-known) — driver sends `100 Continue` first; cap fires mid-stream | 100-Continue + 413 + `Payload Too Large` body + 4-header set + `Connection: close` | `downstream_rq_4xx +1`, `downstream_rq_too_large +1`, `downstream_rq_completed +1` |
+| 3 | **Chunked overflow against per-route cap** | `POST /route-tighter` `Transfer-Encoding: chunked` body~=200 KiB (above 128 KiB override) | 413 + `Payload Too Large` (NO 100-Continue with chunked) | `downstream_rq_4xx +1`, `downstream_rq_too_large +1`, `downstream_rq_completed +1` |
+| 4 | Per-route disabled bypasses cap | `POST /route-disabled` body=2 MiB (above listener 1 MiB) | 200 + backend echo | `downstream_rq_2xx +1`, `downstream_rq_completed +1` |
+| 5 | Per-route tighter override fires | `POST /route-tighter` body=200 KiB (above 128 KiB override) | 100-Continue + 413 + `Payload Too Large` | `downstream_rq_4xx +1`, `downstream_rq_too_large +1`, `downstream_rq_completed +1` |
+
+**Plus a 6th assertion (cross-cutting, not a new request):** `Content-Length` injection on chunked-passthrough. Driver issues a 6th request `POST /` `Transfer-Encoding: chunked` body=10 KB; backend asserts the inbound request carries `Content-Length: 10240` (NOT chunked encoding). This exercises the `maybeAddContentLength` mirror per §12.4 Decision 6 v2.
+
+**Total fixture requests: 6 (was 5 in §6.2).** Counter equivalence: `downstream_rq_2xx +3`, `downstream_rq_4xx +3`, `downstream_rq_too_large +3`, `downstream_rq_completed +6`. No `buffer.*` counters asserted (none exist).
+
+### 12.7 Re-framed §1.1 deliverable count + §7 ADR roster + §11 obligations
+
+**§1.1 deliverables (was 11; now 10):**
+- Items 1, 2, 3, 4, 5, 6, 8, 9, 10 unchanged (with 10 amended: stat-table delta from "29→31" to "29 stays at 29"; new subsection still authored documenting buffer's reuse of `downstream_rq_too_large`; forward-pointer subsection still authored).
+- Item 7 (stat surface 29→31 extension) **retired** (§12.5).
+- Item 11 (4 ADRs) becomes **item 10 prime: 3 ADRs** (§12.7 below).
+
+**§7 ADR roster (was 4, now 3):**
+- **ADR-0125** unchanged — package shape + boot registration + per-route disabled-OR-override 5th canonical shape (PGV mechanism amendment per §12.4 Decision 5 v2 surfaces here).
+- **ADR-0126** unchanged — `compiledConfig` shape + 1-consumed/0-deferred + `max_request_bytes ≤ 1 MiB` parse-time validation + cap-layering rationale. (The cap-layering rationale tightens slightly: the ceiling now serves to keep buffer's filter cap inside envoy-go's framework safety net per ADR-0076; reference Envoy has no such layering.)
+- **ADR-0127 v2** — Body-counting algorithm + `maybeAddContentLength` mirror + reuse of framework `SendLocalReply` 413 wire shape. (Decision 6 v2 + Decision 8 v2.) The Content-Length fast-fail clause from v1 is REMOVED. The 100-Continue addendum is recorded.
+- **ADR-0128 RETIRED.** No new ADR; the slot is preserved for the next phase.
+
+Next-free ADR after phase 13 phase-done: **ADR-0128** (was ADR-0129 under v1).
+
+**§8 deferral list unchanged.** The 2 inline deferrals (8.1 `max_request_bytes > 1 MiB`; 8.2 `per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes`) still apply with the same forward-pointer to the cap-promotion phase.
+
+**§11 SPEC-author residual obligations.** Most §9 pins are RESOLVED in §12.3; the SPEC author re-runs each probe and records verbatim transcripts in SPEC §11 per ADR-0004 (no reduction in §11 verbosity), but no Decision-level questions remain open. The SPEC author MAY surface new questions only if the re-run scrape reveals divergence from §12.3's table. Anticipated wall-clock for §11 re-run: ~30-45 min (5 bootstrap YAMLs + 11 probes + transcripts). Anticipated SPEC.md size: ~1100-1300 lines (was hypothesized ~1500-1700; the smaller stat-table delta + simpler algorithm trim ~300 lines).
+
+**§11 test scaffolding (was 18-25 unit tests across 6 groups in §11.1):**
+- **G1 Factory parse** — same 6 cases.
+- **G2 PerRoute parse** — same 6 cases, but the "both fields set" case now asserts `protojson.Unmarshal` returns oneof-violation error (not custom envoy-go validation); the "neither field set" case becomes a PGV-mirror rejection (not silent-no-op).
+- **G3 DecodeHeaders** — restructured: drop the 3 `Content-Length`-specific cases; add a case asserting `StopIteration` is returned when bodied + not disabled (was hypothesized `Continue` in v1).
+- **G4 DecodeData** — restructured: same 6 cases, but the "single-chunk overflows cap" case asserts the `downstream_rq_too_large` HCM counter increments (not a hypothetical `request_too_large` buffer.* counter). Add a case asserting `maybeAddContentLength` injects `Content-Length` on chunked-end-stream.
+- **G5 Per-route integration** — same 5 cases.
+- **G6 Stats** — restructured: assert `downstream_rq_too_large` increments (not `request_too_large`); drop the `request_buffered` cases entirely (counter does not exist); the disabled-bypass and header-only cases now assert ZERO increment of `downstream_rq_too_large` (which is meaningful since that counter exists for HCM-level reasons).
+
+### 12.8 What §12 does NOT change
+
+- §1.2-§1.4 (forward-pointers, phase-done framing, LoC envelope) unchanged. §1.4 LoC estimate trims slightly (~280-330 impl + ~400-500 tests + ~60 fuzzer + ~150-200 fixture-Go = ~890-1090 total; still well below ADR-0045's 1500 LoC trigger).
+- §1.5-§1.6 (no-sibling-stub, no-prebrainstorm-branch) unchanged.
+- §2.1-§2.4 (package layout, boot registration, MVP envelope, cap layering) unchanged.
+- §3 (iteration protocol consequences) unchanged at the structural level; only DecodeHeaders status code differs (StopIteration now, was Continue) — already covered by §12.4.
+- **§4 (no framework deltas) STILL HOLDS.** The amendment preserves zero framework primitives. Despite the algorithmic re-frame, no new HTTPFilterFactoryCtx field, HTTPRegistry method, PerRouteConfig accessor, or `setBufferLimit`-equivalent is added. The deliberate divergence from Envoy's `setBufferLimit + HCM-emits` model is recorded in ADR-0127 v2 §Consequences with an explicit forward-pointer to the future cap-promotion phase that may revisit this.
+- §10 (ROADMAP delta) unchanged. Row 13 status stays `planned`. The amendment commit is docs-only; ROADMAP row text and §9 family heading are unchanged.
+
+### 12.9 Next-session input (replaces the closer below)
+
+The next session (lifecycle-state 1 → 2 for phase 13) authors `docs/envoy-go/phases/13-http-filter-buffer/SPEC.md` against §§1-12 of this BRAINSTORM. The §11 empirical-pin re-run is fast (most pins resolved by §12.3) but the verbatim transcripts MUST land in SPEC §11 per ADR-0004 and the phase 09/10/11/12 §11 discipline. The SPEC author authors 3 anticipated ADRs (ADR-0125, ADR-0126, ADR-0127 v2) — ADR-0128 is retired per §12.7. The §6 fixture matrix has 6 requests (5 originally hypothesized + 1 cross-cutting CL-injection assertion).
+
+Header-of-this-doc reminder (the `Last-updated:` field updated to `2026-05-09 (§12 amendment)`): the original §1-§11 design sketch is preserved verbatim per D-3.5; §12 supersedes the affected portions for SPEC-drafting purposes.
+
+---
+
+## End of phase 13 brainstorm (with §12 amendment 2026-05-09)
+
+Next-session input: this BRAINSTORM.md (§§1-12) + `BOOTSTRAP_PROMPT.md` §5 lifecycle-state-1 → 2 transition + `SKILL_ROUTING.md` + the 3 ADRs from §12.7 (ADR-0125 + ADR-0126 + ADR-0127 v2) anchored as anticipated. The next session authors `docs/envoy-go/phases/13-http-filter-buffer/SPEC.md` via `superpowers:writing-plans` (routed through SPEC-authoring step first per phase 09/10/11/12 precedent). The §9 empirical-pin obligations are LARGELY RESOLVED in §12.3; the SPEC author re-runs each probe per ADR-0004 and records verbatim transcripts in SPEC §11, but no Decision-level questions remain open absent re-run divergence from §12.3.
