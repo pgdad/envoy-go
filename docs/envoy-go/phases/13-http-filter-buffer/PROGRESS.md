@@ -506,3 +506,32 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.010s
 $ go test -race -count=1 ./internal/filter/http/buffer/
 ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.010s
 ```
+
+## Task 5 — `FuzzBufferConfigParse` fuzzer (17th in repo)
+
+**Commits:** `TBD` — `phase 13: FuzzBufferConfigParse — 17th fuzzer in repo`
+**Notes:** Created `internal/filter/http/buffer/fuzz_test.go` (~40 LoC). Mirrors phase 12 csrf's `FuzzCsrfPolicyConfigParse` shape per ADR-0018's "every parser/codec/filter ships a fuzzer" discipline. 8 seed corpus entries: 5 well-formed/intentionally-rejected `bufferv3.Buffer` protos (max_request_bytes ∈ {1, 1024, 1048576, 0, 5242880}) + 3 malformed-bytes seeds (empty / 0xff / printable-string garbage). The `any` builtin-shadow issue noted in the PLAN was resolved by renaming to `anyMsg`. The fuzzer asserts the (factory, nil) ⊕ (nil, error) invariant; no (nil, nil) path; no panics. `golangci-lint` clean.
+
+Fuzz run: 1,382,117 executions across 8-seed baseline + 10s fuzzing with 32 workers — no crashers, no invariant violations.
+
+**Outputs:**
+```
+$ go build ./internal/filter/http/buffer/... && go vet ./internal/filter/http/buffer/...
+(clean — no output)
+
+$ golangci-lint run ./internal/filter/http/buffer/...
+(clean — no output)
+
+$ go test -fuzz=FuzzBufferConfigParse -fuzztime=10s ./internal/filter/http/buffer/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/8 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 8/8 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 510546 (170171/sec), new interesting: 109 (total: 117)
+fuzz: elapsed: 6s, execs: 1082237 (190444/sec), new interesting: 121 (total: 129)
+fuzz: elapsed: 9s, execs: 1370982 (96282/sec), new interesting: 124 (total: 132)
+fuzz: elapsed: 11s, execs: 1382117 (5472/sec), new interesting: 124 (total: 132)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	11.051s
+
+$ go test -race -count=1 ./internal/filter/http/buffer/
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.010s
+```
