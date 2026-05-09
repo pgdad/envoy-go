@@ -199,14 +199,14 @@ func TestDecodeHeaders_PerRouteDisabled_Continue_PassthroughSet(t *testing.T) {
 	}
 }
 
-func TestDecodeHeaders_BodiedNonDisabled_StopIteration_EffectiveMaxStored(t *testing.T) {
+func TestDecodeHeaders_BodiedNonDisabled_Continue_EffectiveMaxStored(t *testing.T) {
 	f := freshFilter(t, 1024)
 	cb := newFakeCallbacks() // perRoute nil → listener fallback
 	f.dcb = cb
 	headers := newHeaders(map[string]string{":method": "POST", "content-length": "512"})
 	status := f.DecodeHeaders(headers, false)
-	if status != envoyhttp.StopIteration {
-		t.Errorf("expected StopIteration on bodied + non-disabled; got %v", status)
+	if status != envoyhttp.Continue {
+		t.Errorf("expected Continue on bodied + non-disabled (ADR-0127 v2 synchronous HCM); got %v", status)
 	}
 	if f.passthrough {
 		t.Error("expected passthrough flag NOT set")
@@ -219,7 +219,7 @@ func TestDecodeHeaders_BodiedNonDisabled_StopIteration_EffectiveMaxStored(t *tes
 	}
 }
 
-func TestDecodeHeaders_BodiedPerRouteOverride_StopIteration_OverrideMaxStored(t *testing.T) {
+func TestDecodeHeaders_BodiedPerRouteOverride_Continue_OverrideMaxStored(t *testing.T) {
 	f := freshFilter(t, 1024)
 	cb := newFakeCallbacks()
 	cb.perRoute = &bufferv3.BufferPerRoute{
@@ -230,8 +230,8 @@ func TestDecodeHeaders_BodiedPerRouteOverride_StopIteration_OverrideMaxStored(t 
 	f.dcb = cb
 	headers := newHeaders(map[string]string{":method": "POST", "content-length": "512"})
 	status := f.DecodeHeaders(headers, false)
-	if status != envoyhttp.StopIteration {
-		t.Errorf("expected StopIteration on bodied + override; got %v", status)
+	if status != envoyhttp.Continue {
+		t.Errorf("expected Continue on bodied + override (ADR-0127 v2 synchronous HCM); got %v", status)
 	}
 	if f.effectiveMax != 256 {
 		t.Errorf("expected effectiveMax=256 (override wins); got %d", f.effectiveMax)
@@ -245,8 +245,8 @@ func TestDecodeHeaders_DoesNotInspectContentLength(t *testing.T) {
 	f.dcb = cb
 	headers := newHeaders(map[string]string{":method": "POST", "content-length": "99999999999"})
 	status := f.DecodeHeaders(headers, false)
-	if status != envoyhttp.StopIteration {
-		t.Errorf("expected StopIteration (no CL fast-fail); got %v", status)
+	if status != envoyhttp.Continue {
+		t.Errorf("expected Continue (no CL fast-fail; ADR-0127 v2 synchronous HCM); got %v", status)
 	}
 	// SendLocalReply MUST NOT have been invoked.
 	if cb.localReplyCount != 0 {
@@ -376,16 +376,20 @@ func TestDecodeData_SingleChunkOverflow_413_StopIterationNoBuffer(t *testing.T) 
 	}
 }
 
-func TestDecodeData_MultiChunkBelowCap_StopIterationAndBuffer_TerminalContinue(t *testing.T) {
+func TestDecodeData_MultiChunkBelowCap_DataContinue_TerminalContinue(t *testing.T) {
+	// ADR-0127 v2: envoy-go's synchronous HCM dispatch means DataContinue for
+	// in-flight chunks (HCM already buffers all body bytes in bodyBuf before
+	// rf.RunAction dials upstream; DataStopIterationAndBuffer is unnecessary and
+	// would deadlock if DecodeHeaders returned StopIteration).
 	f := freshFilter(t, 1024)
 	f.effectiveMax = 1024
 	f.headersRef = newHeaders(map[string]string{"content-length": "512"})
 	// Chunks A=200, B=200, terminal C=112; total=512 < cap.
-	if got := f.DecodeData(newBuffer(make([]byte, 200)), false); got != envoyhttp.DataStopIterationAndBuffer {
-		t.Errorf("expected DataStopIterationAndBuffer on chunk A; got %v", got)
+	if got := f.DecodeData(newBuffer(make([]byte, 200)), false); got != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue on chunk A; got %v", got)
 	}
-	if got := f.DecodeData(newBuffer(make([]byte, 200)), false); got != envoyhttp.DataStopIterationAndBuffer {
-		t.Errorf("expected DataStopIterationAndBuffer on chunk B; got %v", got)
+	if got := f.DecodeData(newBuffer(make([]byte, 200)), false); got != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue on chunk B; got %v", got)
 	}
 	if got := f.DecodeData(newBuffer(make([]byte, 112)), true); got != envoyhttp.DataContinue {
 		t.Errorf("expected DataContinue on terminal chunk; got %v", got)
@@ -401,8 +405,8 @@ func TestDecodeData_MultiChunkOverflowMidStream_413(t *testing.T) {
 	f.headersRef = newHeaders(map[string]string{"content-length": "2048"})
 	cb := newFakeCallbacks()
 	f.dcb = cb
-	if got := f.DecodeData(newBuffer(make([]byte, 800)), false); got != envoyhttp.DataStopIterationAndBuffer {
-		t.Errorf("expected DataStopIterationAndBuffer on chunk 1 (under cap); got %v", got)
+	if got := f.DecodeData(newBuffer(make([]byte, 800)), false); got != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue on chunk 1 (under cap; ADR-0127 v2); got %v", got)
 	}
 	// Second chunk pushes accumulated past cap.
 	if got := f.DecodeData(newBuffer(make([]byte, 400)), false); got != envoyhttp.DataStopIterationNoBuffer {

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -361,6 +362,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 		// over-cap body in practice.
 		buf := make([]byte, 32*1024)
 		var bodyBuf []byte
+		lastEndStreamFired := false
 		for {
 			n, rerr := req.Body.Read(buf)
 			endStreamOnData := rerr != nil
@@ -369,9 +371,21 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 				if _, derr := chain.RunDecodeData(ctx, buf[:n], endStreamOnData); derr != nil {
 					return 0, derr
 				}
+				if endStreamOnData {
+					lastEndStreamFired = true
+				}
 			}
 			if rerr != nil {
 				break
+			}
+		}
+		// If the final Read returned (0, io.EOF) — no data chunk with
+		// endStream=true was ever sent to the chain — fire a synthetic
+		// empty-terminal chunk so filters that finalize on endStream (e.g.
+		// the buffer filter's maybeAddContentLength) observe end-of-stream.
+		if !lastEndStreamFired {
+			if _, derr := chain.RunDecodeData(ctx, nil, true); derr != nil {
+				return 0, derr
 			}
 		}
 		// Restore req.Body so the downstream router's req.Write(upstream)
@@ -379,6 +393,26 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 		// wrapped in io.NopCloser since req.Write reads whatever Reader
 		// req.Body wraps.
 		req.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+
+		// Phase 13 / buffer filter CL-injection reconciliation: req.Write uses
+		// req.ContentLength and req.TransferEncoding (not req.Header) to decide
+		// whether to emit Content-Length or Transfer-Encoding: chunked on the
+		// wire. The buffer filter's maybeAddContentLength mutates req.Header
+		// (which it receives as the DecodeHeaders headers argument), so we
+		// propagate the mutation back to the request struct fields here so
+		// req.Write sends the injected Content-Length (and not chunked) to the
+		// upstream backend.
+		//
+		// Condition: Content-Length was set by a filter AND Transfer-Encoding was
+		// dropped by the same filter (both mutations are atomic in
+		// maybeAddContentLength per buffer_filter.cc:91-97). No-op for requests
+		// that already had a Content-Length (req.ContentLength >= 0 stays).
+		if clStr := req.Header.Get("Content-Length"); clStr != "" && req.ContentLength < 0 {
+			if cl, err := strconv.ParseInt(clStr, 10, 64); err == nil {
+				req.ContentLength = cl
+				req.TransferEncoding = nil
+			}
+		}
 	}
 
 	// Phase 07.1 Task 22: SendLocalReply path on DecodeData. If a non-terminal

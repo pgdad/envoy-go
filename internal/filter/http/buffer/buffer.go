@@ -138,13 +138,18 @@ func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) {
 }
 
 // DecodeHeaders implements the per-SPEC §6.4 entry point for the body-counting
-// algorithm. Per ADR-0127 v2:
+// algorithm. Per ADR-0127 v2 + envoy-go HCM synchronous dispatch discipline:
 //
 //	(i) Header-only fast-path (endStream=true): mirrors buffer_filter.cc:54-56.
 //	    No Content-Length inspection per §11.6 empirical pin.
 //	(ii) Per-route disabled bypass: set passthrough + Continue (mirrors buffer_filter.cc:60-62).
-//	(iii) Bodied + non-disabled: store effectiveMax + headersRef; return StopIteration
-//	     (mirrors buffer_filter.cc:67). Task 4 completes DecodeData + maybeAddContentLength.
+//	(iii) Bodied + non-disabled: store effectiveMax + headersRef; return Continue.
+//	     envoy-go's HCM dispatches RunDecodeHeaders + body loop sequentially in one
+//	     goroutine (ADR-0076), so StopIteration here would deadlock (chain parks
+//	     waiting for ContinueDecoding while the body loop can't proceed). Returning
+//	     Continue passes headers through to the router filter; overflow detection
+//	     fires in DecodeData, which accumulates bytes each chunk — same observable
+//	     behavior as reference Envoy's buffer_filter.cc.
 func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.FilterHeadersStatus {
 	// Step 1: Header-only fast-path (mirrors buffer_filter.cc:54-56).
 	if endStream {
@@ -157,10 +162,10 @@ func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.Fi
 		f.passthrough = true
 		return envoyhttp.Continue
 	}
-	// Step 4: Bodied + non-disabled — hold headers; signal StopIteration (mirrors buffer_filter.cc:67).
+	// Step 4: Bodied + non-disabled — hold headers; return Continue (see doc above).
 	f.effectiveMax = effectiveMax
 	f.headersRef = headers
-	return envoyhttp.StopIteration
+	return envoyhttp.Continue
 }
 
 // resolveEffective resolves the effective max_request_bytes cap for this stream.
@@ -189,13 +194,17 @@ func (f *filter) resolveEffective() (effectiveMax uint32, disabled bool) {
 	return f.config.maxRequestBytes, false
 }
 
-// DecodeData implements the body-counting algorithm per ADR-0127 v2:
+// DecodeData implements the body-counting algorithm per ADR-0127 v2 + envoy-go
+// HCM synchronous dispatch discipline:
 //
 //	(i)   Per-route disabled bypass: passthrough returns DataContinue without accumulating.
 //	(ii)  Accumulate: f.accumulated += len(data).
 //	(iii) Overflow check (strict >): emit 413 + DataStopIterationNoBuffer.
 //	(iv)  Terminal chunk fits: invoke maybeAddContentLength; return DataContinue.
-//	(v)   In-flight chunk: return DataStopIterationAndBuffer (framework buffers bytes per ADR-0076).
+//	(v)   In-flight chunk: return DataContinue. envoy-go's HCM accumulates all body
+//	     bytes in connection.go's bodyBuf before RunAction dials the upstream (ADR-0076),
+//	     so DataStopIterationAndBuffer is not needed — the framework already holds
+//	     the bytes. DataContinue just passes the chunk through without parking.
 func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataStatus {
 	// Step 1: Per-route disabled bypass.
 	if f.passthrough {
@@ -215,8 +224,8 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		f.maybeAddContentLength()
 		return envoyhttp.DataContinue
 	}
-	// Step 5: In-flight chunk — accumulate; framework holds bytes per ADR-0076 §Decision (b).
-	return envoyhttp.DataStopIterationAndBuffer
+	// Step 5: In-flight chunk — return DataContinue (see doc above).
+	return envoyhttp.DataContinue
 }
 
 // maybeAddContentLength mirrors buffer_filter.cc:91-97. When the request had no

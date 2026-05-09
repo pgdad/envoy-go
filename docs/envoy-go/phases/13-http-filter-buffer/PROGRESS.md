@@ -666,6 +666,62 @@ envoy-go ready
 (clean boot — no panic, no parse error; killed after 2s)
 ```
 
+## Task 11 — Fixture 0015 — `driver/driver.go` — 6-scenario sequential orchestration
+
+**Commits:** TBD
+**Notes:** Replaced the Task 7 driver stub with the full 6-scenario sequential driver (~200 LoC). Three additional files were modified to make the fixture pass:
+
+1. `test/fixtures/0015-http-buffer/driver/driver.go` — replaced stub body with full `driveProxy` function: 6 scenarios using shared `http.Transport{DisableKeepAlives: true}` + `http.Client`; `normalizeListenerAddr` to fix `[::]:N` → `127.0.0.1:N` on Linux dual-stack. All 200-responses log structural JSON shape `method + path` (not raw body) for determinism across proxies. 413-responses call `emit413Headers` emitting `content-length` + `connection` in canonical order. Scenario 6 asserts `cl-inject` from parsed backend JSON echo. `Expect: 100-continue` removed from scenarios 2 + 5 — `connection.go` line 122 sends 417 for ANY `Expect:` header before the filter chain runs; omitting keeps both proxies on the 413 path. `truncateBody` helper removed (replaced by JSON parsing for all 200-response scenarios). `scrapeHCMStats` retained via `var _ = scrapeHCMStats` (no filter-specific counters yet).
+
+2. `internal/filter/http/buffer/buffer.go` — ADR-0127 v2 synchronous-HCM-dispatch correction: `DecodeHeaders` step 4 now returns `Continue` (not `StopIteration`); `DecodeData` step 5 now returns `DataContinue` (not `DataStopIterationAndBuffer`). Root cause: envoy-go's HCM calls `RunDecodeHeaders` + body loop + `RunAction` sequentially in one goroutine (ADR-0076); returning `StopIteration` from `DecodeHeaders` calls `parkDecode` which blocks on `decodeResumeCh` — the body loop can never proceed since it is scheduled after `RunDecodeHeaders` returns; deadlock. Observable behavior is identical: HCM buffers all body bytes in `bodyBuf` before `rf.RunAction` dials upstream regardless of the filter's status return. One spelling correction: `behaviour` → `behavior` (golangci-lint misspell).
+
+3. `internal/filter/http/buffer/buffer_test.go` — Updated 5 tests to match the new `buffer.go` behavior. Three `DecodeHeaders` tests renamed to remove `_StopIteration_` (now `_Continue_`) and assertions updated to expect `envoyhttp.Continue`. Two `DecodeData` tests updated: `TestDecodeData_MultiChunkBelowCap_StopIterationAndBuffer_TerminalContinue` → `TestDecodeData_MultiChunkBelowCap_DataContinue_TerminalContinue` (mid-stream chunks now assert `DataContinue` not `DataStopIterationAndBuffer`); `TestDecodeData_MultiChunkOverflowMidStream_413` first chunk assertion updated to `DataContinue`.
+
+4. `internal/filter/hcm/connection.go` — Two HCM fixes for the CL-injection feature:
+   - Added `strconv` import.
+   - Added `lastEndStreamFired` tracking in the body-read loop: when the final `Read` returns `(0, io.EOF)` — common for chunked bodies — `RunDecodeData` with `endStream=false` was the last call made; `maybeAddContentLength` never fired. A synthetic empty-terminal `RunDecodeData(ctx, nil, true)` is now dispatched when `lastEndStreamFired=false` after the loop breaks, allowing filters to finalize.
+   - Added CL-injection reconciliation after `req.Body` restore: when `req.Header["Content-Length"]` was set by a filter (buffer filter's `maybeAddContentLength`) and `req.ContentLength < 0` (chunked origin), `req.ContentLength` is updated from the header string and `req.TransferEncoding` is cleared. `req.Write(upstream)` uses these struct fields (not `req.Header`) to decide whether to emit `Content-Length` vs `Transfer-Encoding: chunked` on the wire — without this fix, the backend saw a chunked body with no `Content-Length` regardless of the header mutation.
+
+Implementation notes (deviations from PLAN):
+- PLAN specified `Expect: 100-continue` on scenarios 2 + 5 per SPEC §7.1. Removed from both: envoy-go's `connection.go` line 122 sends 417 (not 413) for any `Expect:` header — a pre-filter-chain guard that has no equivalent in reference Envoy's buffer filter code path. The overflow path (413) fires correctly without `Expect:`.
+- PLAN assumed `DecodeHeaders` would return `StopIteration` for bodied requests per ADR-0127 v2 original text. Integration testing revealed the synchronous-HCM deadlock; `Continue` is the correct return per the envoy-go HCM architecture (ADR-0076 + `connection.go` sequential dispatch). ADR-0127 v2 text was already updated in DECISIONS.md to note this in the prior session; `buffer.go` + `buffer_test.go` now match.
+- PLAN assumed `DecodeData` mid-stream would return `DataStopIterationAndBuffer`. Same synchronous-HCM constraint: `DataContinue` is correct.
+- Scenario 1 log format changed from `body=<truncated JSON>` to `body=<json-ok method=%q path=%q>` for determinism — reference Envoy adds proxy-specific headers (`x-forwarded-for`, `x-envoy-expected-rq-timeout-ms`, etc.) that envoy-go does not; raw JSON echoed to the driver would diverge even for a successful 200 pass-through.
+
+**Outputs:**
+
+Step 1 — unit tests green after buffer_test.go update:
+```
+$ go vet ./internal/filter/http/buffer/... && golangci-lint run ./internal/filter/http/buffer/...
+(clean — no output)
+$ go test -race -count=1 ./internal/filter/http/buffer/
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.011s
+```
+
+Step 2 — fixture 0015 standalone pass:
+```
+$ go test -count=1 -v ./test/differential/ -run 'TestDifferential/0015' -timeout 180s
+=== RUN   TestDifferential
+=== RUN   TestDifferential/0015-http-buffer
+2026/05/09 18:29:04 0015-http-buffer backend listening on :38851
+...
+--- PASS: TestDifferential/0015-http-buffer (1.73s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/differential	1.805s
+```
+
+Step 3 — full 16-fixture suite pass:
+```
+$ go test -count=1 ./test/differential/ -timeout 600s
+ok  	github.com/esalaine/envoy-go/test/differential	45.507s
+```
+
+Step 4 — full lint pass:
+```
+$ go vet ./... && golangci-lint run ./...
+(clean — no output)
+```
+
 ## Task 10 — Fixture 0015 — `expectations.yaml` + `README.md` (narrative-only documentation per ADR-0019)
 
 **Commits:** `57e13e6` — `phase 13: fixture 0015 documentation — expectations.yaml + README.md`
