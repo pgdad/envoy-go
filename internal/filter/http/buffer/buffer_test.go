@@ -271,18 +271,28 @@ func newHeaders(kv map[string]string) http.Header {
 	return h
 }
 
+// localReplyRecord captures a single SendLocalReply call's arguments.
+// hasConnectionClose checks whether the 413 wire shape includes Connection: close.
+type localReplyRecord struct {
+	status  int
+	body    string
+	headers envoyhttp.OrderedHeaders
+}
+
+func (r *localReplyRecord) hasConnectionClose() bool {
+	return r.headers.Get("Connection") == "close"
+}
+
 // fakeCallbacks implements envoyhttp.DecoderFilterCallbacks for unit tests.
 // Mirrors phase 12 csrf_test.go fakeCallbacks pattern (localReplyArgs + fakeCallbacks).
 // perRoute is a proto.Message injected by the test to simulate a per-route TPFC;
-// typically a *bufferv3.BufferPerRoute. localReplyCount tracks SendLocalReply invocations.
+// always a *bufferv3.BufferPerRoute. localReplyCount tracks SendLocalReply invocations.
+// resolveCount tracks RequestRouteConfig() call count (for TestPerRoute_ResolveCalledOncePerStream).
 type fakeCallbacks struct {
 	perRoute        proto.Message
 	localReplyCount int
-	localReplyArgs  *struct {
-		status  int
-		body    string
-		headers envoyhttp.OrderedHeaders
-	}
+	resolveCount    int
+	localReplyArgs  *localReplyRecord
 }
 
 func newFakeCallbacks() *fakeCallbacks { return &fakeCallbacks{} }
@@ -290,16 +300,253 @@ func newFakeCallbacks() *fakeCallbacks { return &fakeCallbacks{} }
 func (c *fakeCallbacks) ContinueDecoding() {}
 func (c *fakeCallbacks) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++
-	c.localReplyArgs = &struct {
-		status  int
-		body    string
-		headers envoyhttp.OrderedHeaders
-	}{status: status, body: body, headers: headers}
+	c.localReplyArgs = &localReplyRecord{status: status, body: body, headers: headers}
 }
-func (c *fakeCallbacks) RequestRouteConfig() proto.Message { return c.perRoute }
+func (c *fakeCallbacks) RequestRouteConfig() proto.Message {
+	c.resolveCount++
+	return c.perRoute
+}
 func (c *fakeCallbacks) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
 	return nil, nil, nil
 }
 func (c *fakeCallbacks) EncodeHeaders(_ http.Header, _ bool) {}
 func (c *fakeCallbacks) EncodeData(_ []byte, _ bool)         {}
 func (c *fakeCallbacks) EncodeTrailers(_ http.Header)        {}
+
+// newBuffer constructs a []byte body chunk for DecodeData tests. nil → empty body (§11.11).
+func newBuffer(b []byte) []byte {
+	return b
+}
+
+// --- Group 4: DecodeData accumulation + cap predicate ---
+
+func TestDecodeData_PassthroughFlag_DataContinue(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.passthrough = true
+	for i := 0; i < 5; i++ {
+		status := f.DecodeData(newBuffer(make([]byte, 4096)), false)
+		if status != envoyhttp.DataContinue {
+			t.Errorf("expected DataContinue per chunk on passthrough; got %v", status)
+		}
+	}
+}
+
+func TestDecodeData_SingleChunkFits_EndStream_DataContinue(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.effectiveMax = 1024
+	f.headersRef = newHeaders(map[string]string{"content-length": "512"})
+	status := f.DecodeData(newBuffer(make([]byte, 512)), true) // endStream=true; fits
+	if status != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue on single fit chunk; got %v", status)
+	}
+}
+
+func TestDecodeData_SingleChunkExactCap_EndStream_DataContinue(t *testing.T) {
+	// §11.2 — predicate is `>` strict; accumulated == effectiveMax must NOT trip.
+	f := freshFilter(t, 1024)
+	f.effectiveMax = 1024
+	f.headersRef = newHeaders(map[string]string{"content-length": "1024"})
+	status := f.DecodeData(newBuffer(make([]byte, 1024)), true)
+	if status != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue on exact-cap fit; got %v", status)
+	}
+}
+
+func TestDecodeData_SingleChunkOverflow_413_StopIterationNoBuffer(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.effectiveMax = 1024
+	f.headersRef = newHeaders(map[string]string{"content-length": "2048"})
+	cb := newFakeCallbacks()
+	f.dcb = cb
+	status := f.DecodeData(newBuffer(make([]byte, 2048)), false)
+	if status != envoyhttp.DataStopIterationNoBuffer {
+		t.Errorf("expected DataStopIterationNoBuffer on overflow; got %v", status)
+	}
+	if cb.localReplyCount != 1 {
+		t.Fatalf("expected 1 SendLocalReply call; got %d", cb.localReplyCount)
+	}
+	if cb.localReplyArgs.status != 413 {
+		t.Errorf("expected status 413; got %d", cb.localReplyArgs.status)
+	}
+	if cb.localReplyArgs.body != "Payload Too Large" {
+		t.Errorf("expected body 'Payload Too Large'; got %q", cb.localReplyArgs.body)
+	}
+	if !cb.localReplyArgs.hasConnectionClose() {
+		t.Error("expected Connection: close header")
+	}
+}
+
+func TestDecodeData_MultiChunkBelowCap_StopIterationAndBuffer_TerminalContinue(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.effectiveMax = 1024
+	f.headersRef = newHeaders(map[string]string{"content-length": "512"})
+	// Chunks A=200, B=200, terminal C=112; total=512 < cap.
+	if got := f.DecodeData(newBuffer(make([]byte, 200)), false); got != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("expected DataStopIterationAndBuffer on chunk A; got %v", got)
+	}
+	if got := f.DecodeData(newBuffer(make([]byte, 200)), false); got != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("expected DataStopIterationAndBuffer on chunk B; got %v", got)
+	}
+	if got := f.DecodeData(newBuffer(make([]byte, 112)), true); got != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue on terminal chunk; got %v", got)
+	}
+	if f.accumulated != 512 {
+		t.Errorf("expected accumulated=512; got %d", f.accumulated)
+	}
+}
+
+func TestDecodeData_MultiChunkOverflowMidStream_413(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.effectiveMax = 1024
+	f.headersRef = newHeaders(map[string]string{"content-length": "2048"})
+	cb := newFakeCallbacks()
+	f.dcb = cb
+	if got := f.DecodeData(newBuffer(make([]byte, 800)), false); got != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("expected DataStopIterationAndBuffer on chunk 1 (under cap); got %v", got)
+	}
+	// Second chunk pushes accumulated past cap.
+	if got := f.DecodeData(newBuffer(make([]byte, 400)), false); got != envoyhttp.DataStopIterationNoBuffer {
+		t.Errorf("expected DataStopIterationNoBuffer on overflow; got %v", got)
+	}
+	if cb.localReplyCount != 1 {
+		t.Errorf("expected 1 SendLocalReply call; got %d", cb.localReplyCount)
+	}
+}
+
+func TestDecodeData_EmptyTerminalChunk_DataContinue(t *testing.T) {
+	// §11.11 empty-body POST disposition.
+	f := freshFilter(t, 1024)
+	f.effectiveMax = 1024
+	f.headersRef = newHeaders(map[string]string{"content-length": "0"})
+	status := f.DecodeData(newBuffer(nil), true)
+	if status != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue on empty terminal; got %v", status)
+	}
+}
+
+// --- Group 5: maybeAddContentLength mirror ---
+
+func TestMaybeAddContentLength_NoOriginalCL_InjectsCL_DropsTransferEncoding(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.headersRef = newHeaders(map[string]string{"transfer-encoding": "chunked"})
+	f.accumulated = 10240
+	f.maybeAddContentLength()
+	if got := f.headersRef.Get("Content-Length"); got != "10240" {
+		t.Errorf("expected content-length=10240; got %q", got)
+	}
+	if got := f.headersRef.Get("Transfer-Encoding"); got != "" {
+		t.Errorf("expected transfer-encoding dropped; got %q", got)
+	}
+}
+
+func TestMaybeAddContentLength_OriginalCLPresent_NoOp(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.headersRef = newHeaders(map[string]string{"content-length": "512"})
+	f.accumulated = 512
+	f.maybeAddContentLength()
+	if got := f.headersRef.Get("Content-Length"); got != "512" {
+		t.Errorf("expected content-length unchanged at 512; got %q", got)
+	}
+}
+
+func TestMaybeAddContentLength_HeadersRefNil_NoOp(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.headersRef = nil // disabled or header-only paths leave headersRef unset
+	f.accumulated = 1024
+	f.maybeAddContentLength() // must not panic
+}
+
+func TestMaybeAddContentLength_Idempotent(t *testing.T) {
+	f := freshFilter(t, 1024)
+	f.headersRef = newHeaders(map[string]string{"transfer-encoding": "chunked"})
+	f.accumulated = 10240
+	f.maybeAddContentLength()
+	f.maybeAddContentLength() // second call: original-CL is now present (just-injected); no double-injection.
+	if got := f.headersRef.Get("Content-Length"); got != "10240" {
+		t.Errorf("expected content-length=10240 idempotent; got %q", got)
+	}
+}
+
+// --- Group 6: Per-route integration ---
+
+func TestPerRoute_ListenerFallback_AppliesWhenPerRouteNil(t *testing.T) {
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks() // perRoute nil
+	f.dcb = cb
+	headers := newHeaders(map[string]string{":method": "POST", "content-length": "512"})
+	f.DecodeHeaders(headers, false)
+	if f.effectiveMax != 1024 {
+		t.Errorf("expected listener fallback effectiveMax=1024; got %d", f.effectiveMax)
+	}
+}
+
+func TestPerRoute_OverrideSmaller_FiresAtSmallerCap(t *testing.T) {
+	f := freshFilter(t, 1024)
+	override := uint32(256)
+	cb := newFakeCallbacks()
+	cb.perRoute = &bufferv3.BufferPerRoute{
+		Override: &bufferv3.BufferPerRoute_Buffer{
+			Buffer: &bufferv3.Buffer{MaxRequestBytes: wrapperspb.UInt32(override)},
+		},
+	}
+	f.dcb = cb
+	f.DecodeHeaders(newHeaders(map[string]string{":method": "POST", "content-length": "512"}), false)
+	// Now drive 300 bytes past the 256-byte cap.
+	status := f.DecodeData(newBuffer(make([]byte, 300)), false)
+	if status != envoyhttp.DataStopIterationNoBuffer {
+		t.Errorf("expected 413 at 300 bytes vs 256 cap; got %v", status)
+	}
+}
+
+func TestPerRoute_OverrideLarger_FiresAtLargerCap(t *testing.T) {
+	f := freshFilter(t, 256)
+	override := uint32(1024)
+	cb := newFakeCallbacks()
+	cb.perRoute = &bufferv3.BufferPerRoute{
+		Override: &bufferv3.BufferPerRoute_Buffer{
+			Buffer: &bufferv3.Buffer{MaxRequestBytes: wrapperspb.UInt32(override)},
+		},
+	}
+	f.dcb = cb
+	f.DecodeHeaders(newHeaders(map[string]string{":method": "POST", "content-length": "768"}), false)
+	// Listener cap 256 would have fired at 256; override raises to 1024 → 768 fits.
+	status := f.DecodeData(newBuffer(make([]byte, 768)), true)
+	if status != envoyhttp.DataContinue {
+		t.Errorf("expected DataContinue at 768 vs 1024 override cap; got %v", status)
+	}
+}
+
+func TestPerRoute_DisabledBypassesCap(t *testing.T) {
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks()
+	cb.perRoute = &bufferv3.BufferPerRoute{Override: &bufferv3.BufferPerRoute_Disabled{Disabled: true}}
+	f.dcb = cb
+	f.DecodeHeaders(newHeaders(map[string]string{":method": "POST"}), false)
+	if !f.passthrough {
+		t.Fatal("expected passthrough flag set")
+	}
+	// Drive 8 MiB through DecodeData; passthrough returns DataContinue per chunk.
+	for i := 0; i < 8; i++ {
+		status := f.DecodeData(newBuffer(make([]byte, 1024*1024)), false)
+		if status != envoyhttp.DataContinue {
+			t.Errorf("expected DataContinue per MiB on disabled-route; got %v at chunk %d", status, i)
+		}
+	}
+	if cb.localReplyCount != 0 {
+		t.Errorf("expected zero SendLocalReply on disabled-route; got %d", cb.localReplyCount)
+	}
+}
+
+func TestPerRoute_ResolveCalledOncePerStream(t *testing.T) {
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks()
+	f.dcb = cb
+	headers := newHeaders(map[string]string{":method": "POST", "content-length": "512"})
+	f.DecodeHeaders(headers, false)
+	f.DecodeData(newBuffer(make([]byte, 100)), false)
+	f.DecodeData(newBuffer(make([]byte, 100)), false)
+	f.DecodeData(newBuffer(make([]byte, 312)), true)
+	if cb.resolveCount != 1 {
+		t.Errorf("expected exactly 1 RequestRouteConfig.Resolve call; got %d", cb.resolveCount)
+	}
+}

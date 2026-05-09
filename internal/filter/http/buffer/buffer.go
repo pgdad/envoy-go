@@ -50,16 +50,17 @@ type compiledPerRoute struct {
 // Fields set in DecodeHeaders (Task 3):
 //   - effectiveMax: resolved per-stream cap (listener or per-route override)
 //   - passthrough: true when per-route config disables the filter on this route
-//   - headersRef: reference to the held request headers for maybeAddContentLength (Task 4)
+//   - headersRef: reference to the held request headers for maybeAddContentLength
 //
-// Field added in DecodeData (Task 4):
-//   - accumulated: running byte count across all data chunks
+// Field accumulated in DecodeData (Task 4):
+//   - accumulated: running byte count across all data chunks (uint32, matches maxRequestBytes)
 type filter struct {
 	config       *compiledConfig
 	dcb          envoyhttp.DecoderFilterCallbacks
 	effectiveMax uint32      // resolved cap; set in DecodeHeaders; read in DecodeData
 	passthrough  bool        // true when per-route disabled; branched on in DecodeData
-	headersRef   http.Header // held reference; set in DecodeHeaders; used by maybeAddContentLength (Task 4)
+	headersRef   http.Header // held reference; set in DecodeHeaders; used by maybeAddContentLength
+	accumulated  uint32      // running byte count across all data chunks; set in DecodeData
 }
 
 // Statically assert decoder-only conformance per planner-time decision 1.
@@ -188,13 +189,52 @@ func (f *filter) resolveEffective() (effectiveMax uint32, disabled bool) {
 	return f.config.maxRequestBytes, false
 }
 
-// DecodeData skeleton — body lands in Task 4.
-func (f *filter) DecodeData(_ []byte, _ bool) envoyhttp.FilterDataStatus {
-	return envoyhttp.DataContinue
+// DecodeData implements the body-counting algorithm per ADR-0127 v2:
+//
+//	(i)   Per-route disabled bypass: passthrough returns DataContinue without accumulating.
+//	(ii)  Accumulate: f.accumulated += len(data).
+//	(iii) Overflow check (strict >): emit 413 + DataStopIterationNoBuffer.
+//	(iv)  Terminal chunk fits: invoke maybeAddContentLength; return DataContinue.
+//	(v)   In-flight chunk: return DataStopIterationAndBuffer (framework buffers bytes per ADR-0076).
+func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataStatus {
+	// Step 1: Per-route disabled bypass.
+	if f.passthrough {
+		return envoyhttp.DataContinue
+	}
+	// Step 2: Accumulate.
+	f.accumulated += uint32(len(data))
+	// Step 3: Mid-stream overflow — emit 413 + discard partial buffer.
+	if f.accumulated > f.effectiveMax {
+		f.dcb.SendLocalReply(413, "Payload Too Large", envoyhttp.OrderedHeaders{
+			{Name: "Connection", Value: "close"},
+		})
+		return envoyhttp.DataStopIterationNoBuffer
+	}
+	// Step 4: Terminal chunk fits — invoke maybeAddContentLength; release held headers + body.
+	if endStream {
+		f.maybeAddContentLength()
+		return envoyhttp.DataContinue
+	}
+	// Step 5: In-flight chunk — accumulate; framework holds bytes per ADR-0076 §Decision (b).
+	return envoyhttp.DataStopIterationAndBuffer
 }
 
-// DecodeTrailers skeleton — body lands in Task 4.
+// maybeAddContentLength mirrors buffer_filter.cc:91-97. When the request had no
+// Content-Length (chunked transfer encoding), injects Content-Length: <accumulated>
+// and drops Transfer-Encoding: chunked. No-op when headersRef is nil or when
+// Content-Length is already present (idempotent per §11.8).
+func (f *filter) maybeAddContentLength() {
+	if f.headersRef != nil && f.headersRef.Get("Content-Length") == "" {
+		f.headersRef.Set("Content-Length", fmt.Sprintf("%d", f.accumulated))
+		// Per §11.8 empirical evidence: Envoy ALSO drops Transfer-Encoding: chunked.
+		f.headersRef.Del("Transfer-Encoding")
+	}
+}
+
+// DecodeTrailers defensively invokes maybeAddContentLength in case end-stream
+// arrived via trailers rather than via terminal endStream=true on data.
 func (f *filter) DecodeTrailers(_ http.Header) envoyhttp.FilterTrailersStatus {
+	f.maybeAddContentLength()
 	return envoyhttp.TrailersContinue
 }
 

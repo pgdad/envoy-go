@@ -370,3 +370,139 @@ $ grep -nE '^## ADR-0127' docs/envoy-go/DECISIONS.md
 $ go test -race -count=1 ./internal/filter/http/buffer/
 ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
 ```
+
+## Task 4 — `DecodeData` body + `maybeAddContentLength` mirror + `DecodeTrailers` body + Groups 4+5+6 unit tests
+
+**Commits:** TBD — `phase 13: buffer DecodeData body + maybeAddContentLength mirror + DecodeTrailers + Groups 4-6 tests`
+**Notes:** TDD discipline applied: Groups 4+5+6 tests appended first; first run confirmed compile failure (`accumulated` field absent, `maybeAddContentLength` undefined); then `buffer.go` extended with `accumulated uint32` field + `DecodeData` body + `maybeAddContentLength` + `DecodeTrailers` body; all 6 groups PASS under `-race -count=1`.
+
+Framework adaptation notes:
+1. `DecodeData` signature is `(data []byte, endStream bool)` per `internal/filter/http/types.go` `StreamDecoderFilter` interface — `data.Len()` in PLAN becomes `len(data)`.
+2. `SendLocalReply` body arg is `string` not `[]byte` — PLAN's `[]byte("Payload Too Large")` adapted to `"Payload Too Large"`.
+3. `http.Header` uses `Get`/`Set`/`Del` (stdlib) — PLAN's `headersRef.Remove("transfer-encoding")` adapted to `f.headersRef.Del("Transfer-Encoding")`.
+4. PLAN's `hasConnectionClose()` was specified as a method on an anonymous struct (invalid Go); adapted to a named `localReplyRecord` type in test file. `fakeCallbacks.localReplyArgs` type changed from `*struct{...}` to `*localReplyRecord`.
+5. Group 6 tests used PLAN's `&compiledPerRoute{...}` notation; adapted to raw `*bufferv3.BufferPerRoute` proto (matching Task 3's existing Group 3 test pattern).
+6. `resolveCount` field added to `fakeCallbacks`; `RequestRouteConfig()` increments it; `TestPerRoute_ResolveCalledOncePerStream` confirms `resolveCount==1` after 1 DecodeHeaders + 3 DecodeData calls.
+7. `fakeCallbacks` doc comment "typically" → "always" for `*bufferv3.BufferPerRoute` (Task 3 carry-forward).
+8. Cap predicate is `>` strict (not `>=`): `TestDecodeData_SingleChunkExactCap_EndStream_DataContinue` confirms `accumulated == effectiveMax` → DataContinue (no 413).
+9. No new ADR — ADR-0127 v2 (anchored at Task 3) covers the full body-counting + maybeAddContentLength algorithm.
+
+**Outputs:**
+
+Step 1 — failing test run (Groups 4+5+6 build failure):
+```
+$ go test -race -count=1 -v ./internal/filter/http/buffer/
+# github.com/esalaine/envoy-go/internal/filter/http/buffer [github.com/esalaine/envoy-go/internal/filter/http/buffer.test]
+internal/filter/http/buffer/buffer_test.go:393:7: f.accumulated undefined (type *filter has no field or method accumulated)
+internal/filter/http/buffer/buffer_test.go:394:50: f.accumulated undefined (type *filter has no field or method accumulated)
+internal/filter/http/buffer/buffer_test.go:432:4: f.accumulated undefined (type *filter has no field or method accumulated)
+internal/filter/http/buffer/buffer_test.go:433:4: f.maybeAddContentLength undefined (type *filter has no field or method maybeAddContentLength)
+internal/filter/http/buffer/buffer_test.go:445:4: f.accumulated undefined (type *filter has no field or method accumulated)
+internal/filter/http/buffer/buffer_test.go:446:4: f.maybeAddContentLength undefined (type *filter has no field or method maybeAddContentLength)
+internal/filter/http/buffer/buffer_test.go:455:4: f.accumulated undefined (type *filter has no field or method accumulated)
+internal/filter/http/buffer/buffer_test.go:456:4: f.maybeAddContentLength undefined (type *filter has no field or method maybeAddContentLength)
+internal/filter/http/buffer/buffer_test.go:462:4: f.accumulated undefined (type *filter has no field or method accumulated)
+internal/filter/http/buffer/buffer_test.go:463:4: f.maybeAddContentLength undefined (type *filter has no field or method maybeAddContentLength)
+internal/filter/http/buffer/buffer_test.go:463:4: too many errors
+FAIL	github.com/esalaine/envoy-go/internal/filter/http/buffer [build failed]
+FAIL
+```
+
+Step 4 — passing test run (all 6 Groups PASS):
+```
+$ go vet ./internal/filter/http/buffer/...
+$ golangci-lint run ./internal/filter/http/buffer/...
+$ go test -race -count=1 -v ./internal/filter/http/buffer/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_MaxRequestBytesNil_RejectAtParseTime
+--- PASS: TestNew_MaxRequestBytesNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_MaxRequestBytesZero_RejectAtParseTime
+--- PASS: TestNew_MaxRequestBytesZero_RejectAtParseTime (0.00s)
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#00
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#01
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#02
+--- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#00 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#01 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#02 (0.00s)
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#00
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#01
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#02
+--- PASS: TestNew_MaxRequestBytesBoundary_Accepted (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#00 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#01 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#02 (0.00s)
+=== RUN   TestNew_HappyPath_Round
+--- PASS: TestNew_HappyPath_Round (0.00s)
+=== RUN   TestParsePerRoute_Disabled_Parses
+--- PASS: TestParsePerRoute_Disabled_Parses (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_Parses
+--- PASS: TestParsePerRoute_BufferOverride_Parses (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_Zero_Rejects
+--- PASS: TestParsePerRoute_BufferOverride_Zero_Rejects (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_OverCap_Rejects
+--- PASS: TestParsePerRoute_BufferOverride_OverCap_Rejects (0.00s)
+=== RUN   TestParsePerRoute_OneofUnset_Rejects
+--- PASS: TestParsePerRoute_OneofUnset_Rejects (0.00s)
+=== RUN   TestParsePerRoute_DisabledFalse_Rejects
+--- PASS: TestParsePerRoute_DisabledFalse_Rejects (0.00s)
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/GET
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/HEAD
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/OPTIONS
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/POST
+--- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/GET (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/HEAD (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/OPTIONS (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/POST (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteDisabled_Continue_PassthroughSet
+--- PASS: TestDecodeHeaders_PerRouteDisabled_Continue_PassthroughSet (0.00s)
+=== RUN   TestDecodeHeaders_BodiedNonDisabled_StopIteration_EffectiveMaxStored
+--- PASS: TestDecodeHeaders_BodiedNonDisabled_StopIteration_EffectiveMaxStored (0.00s)
+=== RUN   TestDecodeHeaders_BodiedPerRouteOverride_StopIteration_OverrideMaxStored
+--- PASS: TestDecodeHeaders_BodiedPerRouteOverride_StopIteration_OverrideMaxStored (0.00s)
+=== RUN   TestDecodeHeaders_DoesNotInspectContentLength
+--- PASS: TestDecodeHeaders_DoesNotInspectContentLength (0.00s)
+=== RUN   TestDecodeData_PassthroughFlag_DataContinue
+--- PASS: TestDecodeData_PassthroughFlag_DataContinue (0.00s)
+=== RUN   TestDecodeData_SingleChunkFits_EndStream_DataContinue
+--- PASS: TestDecodeData_SingleChunkFits_EndStream_DataContinue (0.00s)
+=== RUN   TestDecodeData_SingleChunkExactCap_EndStream_DataContinue
+--- PASS: TestDecodeData_SingleChunkExactCap_EndStream_DataContinue (0.00s)
+=== RUN   TestDecodeData_SingleChunkOverflow_413_StopIterationNoBuffer
+--- PASS: TestDecodeData_SingleChunkOverflow_413_StopIterationNoBuffer (0.00s)
+=== RUN   TestDecodeData_MultiChunkBelowCap_StopIterationAndBuffer_TerminalContinue
+--- PASS: TestDecodeData_MultiChunkBelowCap_StopIterationAndBuffer_TerminalContinue (0.00s)
+=== RUN   TestDecodeData_MultiChunkOverflowMidStream_413
+--- PASS: TestDecodeData_MultiChunkOverflowMidStream_413 (0.00s)
+=== RUN   TestDecodeData_EmptyTerminalChunk_DataContinue
+--- PASS: TestDecodeData_EmptyTerminalChunk_DataContinue (0.00s)
+=== RUN   TestMaybeAddContentLength_NoOriginalCL_InjectsCL_DropsTransferEncoding
+--- PASS: TestMaybeAddContentLength_NoOriginalCL_InjectsCL_DropsTransferEncoding (0.00s)
+=== RUN   TestMaybeAddContentLength_OriginalCLPresent_NoOp
+--- PASS: TestMaybeAddContentLength_OriginalCLPresent_NoOp (0.00s)
+=== RUN   TestMaybeAddContentLength_HeadersRefNil_NoOp
+--- PASS: TestMaybeAddContentLength_HeadersRefNil_NoOp (0.00s)
+=== RUN   TestMaybeAddContentLength_Idempotent
+--- PASS: TestMaybeAddContentLength_Idempotent (0.00s)
+=== RUN   TestPerRoute_ListenerFallback_AppliesWhenPerRouteNil
+--- PASS: TestPerRoute_ListenerFallback_AppliesWhenPerRouteNil (0.00s)
+=== RUN   TestPerRoute_OverrideSmaller_FiresAtSmallerCap
+--- PASS: TestPerRoute_OverrideSmaller_FiresAtSmallerCap (0.00s)
+=== RUN   TestPerRoute_OverrideLarger_FiresAtLargerCap
+--- PASS: TestPerRoute_OverrideLarger_FiresAtLargerCap (0.00s)
+=== RUN   TestPerRoute_DisabledBypassesCap
+--- PASS: TestPerRoute_DisabledBypassesCap (0.00s)
+=== RUN   TestPerRoute_ResolveCalledOncePerStream
+--- PASS: TestPerRoute_ResolveCalledOncePerStream (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.010s
+$ go test -race -count=1 ./internal/filter/http/buffer/
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.010s
+```
