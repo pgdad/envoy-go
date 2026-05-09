@@ -565,3 +565,26 @@ $ grep -nE 'httpReg.Register' cmd/envoy-go/main.go
 122:	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
 123:	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
 ```
+
+## Task 7 — Fixture infrastructure — `BackendKind=HTTPBuffer` + runner spawn helper + driver stub
+
+**Commits:** `TBD` — `phase 13: fixture 0015 infrastructure — BackendKind=HTTPBuffer + runner spawn helper + driver stub`
+**Notes:** Landed runner-side scaffolding for the 0015-http-buffer differential fixture. Three-file change set: (1) `test/differential/fixture/fixture.go` extended with `HTTPBuffer BackendKind = 12` enum value + 9-line doc comment per PLAN lines 1463-1473; (2) `test/differential/runner_test.go` extended with blank-import of `0015-http-buffer/driver` (alphabetically after `0014-http-csrf`), `case fixture.HTTPBuffer:` in the kind switch mirroring `HTTPCsrf` pattern, and `startHTTPBufferBackend` spawn helper at end of helpers block mirroring `startHTTPCsrfBackend` verbatim (substituting fixture path only); (3) created `test/fixtures/0015-http-buffer/driver/driver.go` stub — registers `0015-http-buffer` in `init()`, implements all 8 `fixture.Driver` interface methods returning zero/nil values, implements `fixture.BackendKindAware` returning `fixture.HTTPBuffer`, compile-time interface assertions (`_ fixture.Driver = (*bufferDriver)(nil)` + `_ fixture.BackendKindAware = (*bufferDriver)(nil)`). `go test -count=1 -short ./test/differential/` green: entire suite skips under `-short` (`testing.Short()` guard at TestDifferential line 47-49); no fixture-0015 execution occurs (backend subprocess `./test/fixtures/0015-http-buffer/backends` absent until Task 8). `grep -cE 'HTTPBuffer'` returns 2 (enum value line + doc comment line).
+
+**Outputs:**
+```
+$ go build ./test/...
+(clean — no output)
+
+$ go vet ./test/...
+(clean — no output)
+
+$ golangci-lint run ./test/...
+(clean — no output)
+
+$ go test -count=1 -short ./test/differential/
+ok  	github.com/esalaine/envoy-go/test/differential	0.081s
+
+$ grep -cE 'HTTPBuffer' test/differential/fixture/fixture.go
+2
+```

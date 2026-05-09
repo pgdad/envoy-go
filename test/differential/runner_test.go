@@ -37,6 +37,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0012-http-header-mutation/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0013-http-local-ratelimit/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0014-http-csrf/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0015-http-buffer/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -281,6 +282,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startHTTPCsrfBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPBuffer:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPBufferBackend(ctx, root, port)
 			if err != nil {
 				t.Fatalf("backend[%d] start: %v", i, err)
 			}
@@ -923,6 +942,22 @@ func startHTTPLocalRateLimitBackend(ctx context.Context, repoRoot string, port i
 // backends/backend.go on the runner-allocated port. Mirrors startHTTPLocalRateLimitBackend.
 func startHTTPCsrfBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0014-http-csrf/backends",
+		"--port", fmt.Sprintf("%d", port),
+	)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	return cmd, nil
+}
+
+// startHTTPBufferBackend spawns test/fixtures/0015-http-buffer/
+// backends/backend.go on the runner-allocated port. Mirrors startHTTPCsrfBackend.
+func startHTTPBufferBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "go", "run", "./test/fixtures/0015-http-buffer/backends",
 		"--port", fmt.Sprintf("%d", port),
 	)
 	cmd.Dir = repoRoot

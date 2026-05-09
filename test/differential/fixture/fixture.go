@@ -216,6 +216,16 @@ const (
 	// fixture 0014-http-csrf (phase 12 Task 7). Because the backend is a
 	// subprocess, the runner's in-process accept counter is NOT incremented.
 	HTTPCsrf BackendKind = 11
+	// HTTPBuffer is an out-of-process HTTP/1.1 backend: the runner spawns
+	// test/fixtures/0015-http-buffer/backends/backend.go on the pre-allocated
+	// port. The backend echoes the inbound request method + path + headers as a
+	// JSON object in the response body — load-bearing for fixture scenario 6's
+	// `Content-Length: 10240` assertion at the backend boundary per the
+	// `maybeAddContentLength` mirror per phase 13 SPEC §11.8-CL. Status 200;
+	// Content-Type: application/json. No TLS. Introduced by fixture
+	// 0015-http-buffer (phase 13 Task 7). Because the backend is a subprocess,
+	// the runner's in-process accept counter is NOT incremented.
+	HTTPBuffer BackendKind = 12
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
