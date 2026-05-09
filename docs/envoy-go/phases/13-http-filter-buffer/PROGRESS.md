@@ -32,7 +32,7 @@ The eleven planner-time deferred decisions reproduced verbatim from PLAN.md so t
 
 ## Task 1 — Execution-precondition check + PROGRESS.md preamble
 
-**Commits:** `TBD` — `phase 13: PROGRESS preamble + planner-time decision resolution`
+**Commits:** `827e7c9` — `phase 13: PROGRESS preamble + planner-time decision resolution`
 **Notes:** Created PROGRESS.md; verified all 16 preconditions per PLAN §"Execution preconditions"; phase-13 SPEC + PLAN confirmed present in HEAD; SPEC at f5d38fa; ADR tail at 0124 (next-free 0125); `internal/filter/http/buffer/` absent (Task 2 lands); `fixture.HTTPBuffer` absent (Task 7 lands). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention; ADRs land at first-use commit per PLAN's ADR table). Pre-existing fuzzers (16 fuzzers) deferred to Gate D per PLAN.
 
 **Outputs:**
