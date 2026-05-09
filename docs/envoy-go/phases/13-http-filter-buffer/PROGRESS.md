@@ -668,7 +668,7 @@ envoy-go ready
 
 ## Task 10 — Fixture 0015 — `expectations.yaml` + `README.md` (narrative-only documentation per ADR-0019)
 
-**Commits:** `TBD` — `phase 13: fixture 0015 documentation — expectations.yaml + README.md`
+**Commits:** `57e13e6` — `phase 13: fixture 0015 documentation — expectations.yaml + README.md`
 
 **Notes:** Created `test/fixtures/0015-http-buffer/expectations.yaml` (~35 LoC; prose YAML per ADR-0019) and `test/fixtures/0015-http-buffer/README.md` (~50 LoC; fixture overview). Both files document the 6-scenario equivalence claims (per SPEC §7.1) without machine-evaluated assertions — the driver enforces the actual assertions via per-scenario comparisons. expectations.yaml is a narrative record of each scenario's expected status, body bytes, header set, and counter delta on the envoy-go side, with cross-references to SPEC sections and ADRs. README.md covers the fixture topology (single-listener, three routes), scenario list, the envoy-go-only `max_request_bytes ≤ 1 MiB` parse-time validation (ADR-0126), the `maybeAddContentLength` chunked → fixed-CL conversion mirror (ADR-0127 v2), the per-route disabled-OR-override 5th canonical discipline (ADR-0125), the 100-Continue addendum (SPEC §11.8), and planner-time decision cross-references (D1, D3–D10).
 
