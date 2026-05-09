@@ -45,11 +45,21 @@ type compiledPerRoute struct {
 // filter is the per-instance per-stream filter state. Per ADR-0071's single-
 // goroutine-per-stream invariant, the per-instance state is race-free without
 // synchronization. The config pointer is closure-captured at New time and is
-// immutable post-construction. Fields effectiveMax, accumulated, passthrough,
-// headersRef are added in Tasks 3-4 when the body-counting body lands.
+// immutable post-construction.
+//
+// Fields set in DecodeHeaders (Task 3):
+//   - effectiveMax: resolved per-stream cap (listener or per-route override)
+//   - passthrough: true when per-route config disables the filter on this route
+//   - headersRef: reference to the held request headers for maybeAddContentLength (Task 4)
+//
+// Field added in DecodeData (Task 4):
+//   - accumulated: running byte count across all data chunks
 type filter struct {
-	config *compiledConfig
-	dcb    envoyhttp.DecoderFilterCallbacks
+	config       *compiledConfig
+	dcb          envoyhttp.DecoderFilterCallbacks
+	effectiveMax uint32      // resolved cap; set in DecodeHeaders; read in DecodeData
+	passthrough  bool        // true when per-route disabled; branched on in DecodeData
+	headersRef   http.Header // held reference; set in DecodeHeaders; used by maybeAddContentLength (Task 4)
 }
 
 // Statically assert decoder-only conformance per planner-time decision 1.
@@ -101,16 +111,18 @@ func parsePerRoute(perRoute proto.Message) (*compiledPerRoute, error) {
 		}
 		return &compiledPerRoute{disabled: true}, nil
 	case *bufferv3.BufferPerRoute_Buffer:
-		if v := override.Buffer.GetMaxRequestBytes(); v == nil {
+		v := override.Buffer.GetMaxRequestBytes()
+		if v == nil {
 			return nil, fmt.Errorf("buffer per-route: max_request_bytes is required")
-		} else if v.GetValue() == 0 {
-			return nil, fmt.Errorf("buffer per-route: max_request_bytes must be > 0")
-		} else if v.GetValue() > cap1MiB {
-			return nil, fmt.Errorf("buffer per-route: max_request_bytes (%d) exceeds envoy-go cap of %d bytes", v.GetValue(), cap1MiB)
-		} else {
-			n := v.GetValue()
-			return &compiledPerRoute{maxOverride: &n}, nil
 		}
+		if v.GetValue() == 0 {
+			return nil, fmt.Errorf("buffer per-route: max_request_bytes must be > 0")
+		}
+		if v.GetValue() > cap1MiB {
+			return nil, fmt.Errorf("buffer per-route: max_request_bytes (%d) exceeds envoy-go cap of %d bytes", v.GetValue(), cap1MiB)
+		}
+		n := v.GetValue()
+		return &compiledPerRoute{maxOverride: &n}, nil
 	case nil:
 		return nil, fmt.Errorf("buffer per-route: override oneof is required (neither disabled nor buffer set)")
 	default:
@@ -124,9 +136,56 @@ func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) {
 	f.dcb = cb
 }
 
-// DecodeHeaders skeleton — body lands in Task 3.
-func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	return envoyhttp.Continue
+// DecodeHeaders implements the per-SPEC §6.4 entry point for the body-counting
+// algorithm. Per ADR-0127 v2:
+//
+//	(i) Header-only fast-path (endStream=true): mirrors buffer_filter.cc:54-56.
+//	    No Content-Length inspection per §11.6 empirical pin.
+//	(ii) Per-route disabled bypass: set passthrough + Continue (mirrors buffer_filter.cc:60-62).
+//	(iii) Bodied + non-disabled: store effectiveMax + headersRef; return StopIteration
+//	     (mirrors buffer_filter.cc:67). Task 4 completes DecodeData + maybeAddContentLength.
+func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.FilterHeadersStatus {
+	// Step 1: Header-only fast-path (mirrors buffer_filter.cc:54-56).
+	if endStream {
+		return envoyhttp.Continue
+	}
+	// Step 2: Resolve effectiveMax + disabled flag.
+	effectiveMax, disabled := f.resolveEffective()
+	// Step 3: Per-route disabled bypass (mirrors buffer_filter.cc:60-62).
+	if disabled {
+		f.passthrough = true
+		return envoyhttp.Continue
+	}
+	// Step 4: Bodied + non-disabled — hold headers; signal StopIteration (mirrors buffer_filter.cc:67).
+	f.effectiveMax = effectiveMax
+	f.headersRef = headers
+	return envoyhttp.StopIteration
+}
+
+// resolveEffective resolves the effective max_request_bytes cap for this stream.
+// Returns (cap, disabled). Listener fallback applies when no per-route config is present.
+// Per ADR-0127 v2 §Decision (i): called once per stream from DecodeHeaders; result is
+// cached in f.effectiveMax + f.passthrough for use by DecodeData (Task 4).
+func (f *filter) resolveEffective() (effectiveMax uint32, disabled bool) {
+	if f.dcb == nil {
+		return f.config.maxRequestBytes, false
+	}
+	resolved := f.dcb.RequestRouteConfig() // returns proto.Message or nil
+	if resolved == nil {
+		return f.config.maxRequestBytes, false
+	}
+	cpr, err := parsePerRoute(resolved)
+	if err != nil {
+		// Unparseable per-route — fall back to listener config.
+		return f.config.maxRequestBytes, false
+	}
+	if cpr.disabled {
+		return 0, true
+	}
+	if cpr.maxOverride != nil {
+		return *cpr.maxOverride, false
+	}
+	return f.config.maxRequestBytes, false
 }
 
 // DecodeData skeleton — body lands in Task 4.

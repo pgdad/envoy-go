@@ -1,6 +1,7 @@
 package buffer
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -162,3 +163,143 @@ func mustMarshalAny(t *testing.T, m proto.Message) *anypb.Any {
 	}
 	return a
 }
+
+// --- Group 3: DecodeHeaders ---
+
+func TestDecodeHeaders_HeaderOnlyEndStream_Continue(t *testing.T) {
+	cases := []string{"GET", "HEAD", "OPTIONS", "POST"} // POST with endStream=true on headers (rare but legal)
+	for _, method := range cases {
+		method := method
+		t.Run(method, func(t *testing.T) {
+			f := freshFilter(t, 1024)
+			headers := newHeaders(map[string]string{":method": method})
+			status := f.DecodeHeaders(headers, true) // endStream=true on headers
+			if status != envoyhttp.Continue {
+				t.Errorf("expected Continue on header-only %s; got %v", method, status)
+			}
+			if f.passthrough || f.headersRef != nil || f.effectiveMax != 0 {
+				t.Errorf("expected zero state touch on header-only path; got passthrough=%v, headersRef=%v, effectiveMax=%d", f.passthrough, f.headersRef, f.effectiveMax)
+			}
+		})
+	}
+}
+
+func TestDecodeHeaders_PerRouteDisabled_Continue_PassthroughSet(t *testing.T) {
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks()
+	cb.perRoute = &bufferv3.BufferPerRoute{Override: &bufferv3.BufferPerRoute_Disabled{Disabled: true}}
+	f.dcb = cb
+	headers := newHeaders(map[string]string{":method": "POST"})
+	status := f.DecodeHeaders(headers, false)
+	if status != envoyhttp.Continue {
+		t.Errorf("expected Continue on per-route disabled; got %v", status)
+	}
+	if !f.passthrough {
+		t.Error("expected passthrough flag set")
+	}
+}
+
+func TestDecodeHeaders_BodiedNonDisabled_StopIteration_EffectiveMaxStored(t *testing.T) {
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks() // perRoute nil → listener fallback
+	f.dcb = cb
+	headers := newHeaders(map[string]string{":method": "POST", "content-length": "512"})
+	status := f.DecodeHeaders(headers, false)
+	if status != envoyhttp.StopIteration {
+		t.Errorf("expected StopIteration on bodied + non-disabled; got %v", status)
+	}
+	if f.passthrough {
+		t.Error("expected passthrough flag NOT set")
+	}
+	if f.effectiveMax != 1024 {
+		t.Errorf("expected effectiveMax=1024 (listener fallback); got %d", f.effectiveMax)
+	}
+	if f.headersRef == nil {
+		t.Error("expected headersRef stored")
+	}
+}
+
+func TestDecodeHeaders_BodiedPerRouteOverride_StopIteration_OverrideMaxStored(t *testing.T) {
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks()
+	cb.perRoute = &bufferv3.BufferPerRoute{
+		Override: &bufferv3.BufferPerRoute_Buffer{
+			Buffer: &bufferv3.Buffer{MaxRequestBytes: wrapperspb.UInt32(256)},
+		},
+	}
+	f.dcb = cb
+	headers := newHeaders(map[string]string{":method": "POST", "content-length": "512"})
+	status := f.DecodeHeaders(headers, false)
+	if status != envoyhttp.StopIteration {
+		t.Errorf("expected StopIteration on bodied + override; got %v", status)
+	}
+	if f.effectiveMax != 256 {
+		t.Errorf("expected effectiveMax=256 (override wins); got %d", f.effectiveMax)
+	}
+}
+
+func TestDecodeHeaders_DoesNotInspectContentLength(t *testing.T) {
+	// §11.6 — even with absurd CL header, DecodeHeaders does NOT fast-fail.
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks()
+	f.dcb = cb
+	headers := newHeaders(map[string]string{":method": "POST", "content-length": "99999999999"})
+	status := f.DecodeHeaders(headers, false)
+	if status != envoyhttp.StopIteration {
+		t.Errorf("expected StopIteration (no CL fast-fail); got %v", status)
+	}
+	// SendLocalReply MUST NOT have been invoked.
+	if cb.localReplyCount != 0 {
+		t.Errorf("expected zero SendLocalReply calls in DecodeHeaders; got %d", cb.localReplyCount)
+	}
+}
+
+// freshFilter constructs a minimal *filter with only the config field set, for
+// DecodeHeaders + resolveEffective unit tests that don't need a full factory build.
+func freshFilter(t *testing.T, maxBytes uint32) *filter {
+	t.Helper()
+	return &filter{config: &compiledConfig{maxRequestBytes: maxBytes}}
+}
+
+// newHeaders builds an http.Header from a map of lowercase key→value pairs.
+// Mirrors phase 12 csrf_test.go newPostHeaders pattern (adapts for arbitrary headers).
+func newHeaders(kv map[string]string) http.Header {
+	h := make(http.Header)
+	for k, v := range kv {
+		h.Set(k, v)
+	}
+	return h
+}
+
+// fakeCallbacks implements envoyhttp.DecoderFilterCallbacks for unit tests.
+// Mirrors phase 12 csrf_test.go fakeCallbacks pattern (localReplyArgs + fakeCallbacks).
+// perRoute is a proto.Message injected by the test to simulate a per-route TPFC;
+// typically a *bufferv3.BufferPerRoute. localReplyCount tracks SendLocalReply invocations.
+type fakeCallbacks struct {
+	perRoute        proto.Message
+	localReplyCount int
+	localReplyArgs  *struct {
+		status  int
+		body    string
+		headers envoyhttp.OrderedHeaders
+	}
+}
+
+func newFakeCallbacks() *fakeCallbacks { return &fakeCallbacks{} }
+
+func (c *fakeCallbacks) ContinueDecoding() {}
+func (c *fakeCallbacks) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
+	c.localReplyCount++
+	c.localReplyArgs = &struct {
+		status  int
+		body    string
+		headers envoyhttp.OrderedHeaders
+	}{status: status, body: body, headers: headers}
+}
+func (c *fakeCallbacks) RequestRouteConfig() proto.Message { return c.perRoute }
+func (c *fakeCallbacks) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
+	return nil, nil, nil
+}
+func (c *fakeCallbacks) EncodeHeaders(_ http.Header, _ bool) {}
+func (c *fakeCallbacks) EncodeData(_ []byte, _ bool)         {}
+func (c *fakeCallbacks) EncodeTrailers(_ http.Header)        {}

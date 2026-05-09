@@ -266,3 +266,107 @@ $ grep -nE '^## ADR-0125|^## ADR-0126' docs/envoy-go/DECISIONS.md
 $ go test -race -count=1 ./internal/filter/http/buffer/
 ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
 ```
+
+## Task 3 — `DecodeHeaders` body + `resolveEffective` helper + Group 3 tests [ADR-0127 v2]
+
+**Commits:** TBD — `phase 13: buffer DecodeHeaders body — header-only fast-path + per-route disabled passthrough + bodied StopIteration [ADR-0127 v2]`
+**Notes:** TDD discipline applied: Group 3 tests appended first; first run confirmed compile failure (fields `effectiveMax`, `passthrough`, `headersRef` not yet on filter struct); then buffer.go extended and bodies landed; Groups 1+2+3 all pass.
+
+Three Task 2 carry-forward issues resolved in this commit:
+1. Stale comment on filter struct (mentioned headersRef as a future field to add "in Tasks 3-4") — replaced with accurate struct documentation including all three new fields with their Task-3 landing status.
+2. `parsePerRoute` chained if/else in the `BufferPerRoute_Buffer` case — refactored to early-return style matching `New`'s validation pattern (per code reviewer carry-forward).
+3. Both failing-test output AND passing-test output captured in PROGRESS.md (this entry).
+
+Framework adaptation note: the PLAN used `envoyhttp.RequestHeaderMap` as the `DecodeHeaders` header type — the actual framework type is `http.Header` (per `internal/filter/http/types.go` `StreamDecoderFilter` interface). The PLAN's `cb.perRoute = &compiledPerRoute{...}` test injection was adapted: since `RequestRouteConfig()` returns `proto.Message`, `fakeCallbacks.perRoute` stores `*bufferv3.BufferPerRoute` (the raw proto, which `parsePerRoute` handles via type assertion), not `*compiledPerRoute`. The PLAN's note that "Implementer adapts per the existing test-helper precedent" covers this. The `resolveEffective` helper calls `parsePerRoute(resolved)` on the raw proto (same pattern csrf uses with `buildPerRouteRuntime(c, ...)`). The `accumulated` field (Task 4) was intentionally deferred to Task 4 to avoid an `unused` linter error.
+
+ADR-0127 v2 lands at this commit per ADR-0044 ADR-on-impl convention. All 7 ADR sections present; Date 2026-05-09; Lands-in-task Task 3; Status Accepted. v2 numbering reflects post-empirical-pin retirement of v1's Content-Length fast-fail clause (refuted by SPEC §11.6).
+
+**Outputs:**
+
+Step 2 — failing test run (Group 3 FAILS; Groups 1+2 would PASS if compilable):
+```
+$ go test -race -count=1 -v ./internal/filter/http/buffer/
+# github.com/esalaine/envoy-go/internal/filter/http/buffer [github.com/esalaine/envoy-go/internal/filter/http/buffer.test]
+internal/filter/http/buffer/buffer_test.go:180:9: f.passthrough undefined (type *filter has no field or method passthrough)
+internal/filter/http/buffer/buffer_test.go:180:26: f.headersRef undefined (type *filter has no field or method headersRef)
+internal/filter/http/buffer/buffer_test.go:180:49: f.effectiveMax undefined (type *filter has no field or method effectiveMax)
+internal/filter/http/buffer/buffer_test.go:181:117: f.passthrough undefined (type *filter has no field or method passthrough)
+internal/filter/http/buffer/buffer_test.go:181:132: f.headersRef undefined (type *filter has no field or method headersRef)
+internal/filter/http/buffer/buffer_test.go:181:146: f.effectiveMax undefined (type *filter has no field or method effectiveMax)
+internal/filter/http/buffer/buffer_test.go:197:8: f.passthrough undefined (type *filter has no field or method passthrough)
+internal/filter/http/buffer/buffer_test.go:211:7: f.passthrough undefined (type *filter has no field or method passthrough)
+internal/filter/http/buffer/buffer_test.go:214:7: f.effectiveMax undefined (type *filter has no field or method effectiveMax)
+internal/filter/http/buffer/buffer_test.go:215:72: f.effectiveMax undefined (type *filter has no field or method effectiveMax)
+internal/filter/http/buffer/buffer_test.go:215:72: too many errors
+FAIL	github.com/esalaine/envoy-go/internal/filter/http/buffer [build failed]
+FAIL
+```
+
+Step 4 — passing test run (Groups 1+2+3 all PASS):
+```
+$ go vet ./internal/filter/http/buffer/...
+$ golangci-lint run ./internal/filter/http/buffer/...
+$ go test -race -count=1 -v ./internal/filter/http/buffer/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_MaxRequestBytesNil_RejectAtParseTime
+--- PASS: TestNew_MaxRequestBytesNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_MaxRequestBytesZero_RejectAtParseTime
+--- PASS: TestNew_MaxRequestBytesZero_RejectAtParseTime (0.00s)
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#00
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#01
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#02
+--- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#00 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#01 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#02 (0.00s)
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#00
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#01
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#02
+--- PASS: TestNew_MaxRequestBytesBoundary_Accepted (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#00 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#01 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#02 (0.00s)
+=== RUN   TestNew_HappyPath_Round
+--- PASS: TestNew_HappyPath_Round (0.00s)
+=== RUN   TestParsePerRoute_Disabled_Parses
+--- PASS: TestParsePerRoute_Disabled_Parses (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_Parses
+--- PASS: TestParsePerRoute_BufferOverride_Parses (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_Zero_Rejects
+--- PASS: TestParsePerRoute_BufferOverride_Zero_Rejects (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_OverCap_Rejects
+--- PASS: TestParsePerRoute_BufferOverride_OverCap_Rejects (0.00s)
+=== RUN   TestParsePerRoute_OneofUnset_Rejects
+--- PASS: TestParsePerRoute_OneofUnset_Rejects (0.00s)
+=== RUN   TestParsePerRoute_DisabledFalse_Rejects
+--- PASS: TestParsePerRoute_DisabledFalse_Rejects (0.00s)
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/GET
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/HEAD
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/OPTIONS
+=== RUN   TestDecodeHeaders_HeaderOnlyEndStream_Continue/POST
+--- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/GET (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/HEAD (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/OPTIONS (0.00s)
+    --- PASS: TestDecodeHeaders_HeaderOnlyEndStream_Continue/POST (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteDisabled_Continue_PassthroughSet
+--- PASS: TestDecodeHeaders_PerRouteDisabled_Continue_PassthroughSet (0.00s)
+=== RUN   TestDecodeHeaders_BodiedNonDisabled_StopIteration_EffectiveMaxStored
+--- PASS: TestDecodeHeaders_BodiedNonDisabled_StopIteration_EffectiveMaxStored (0.00s)
+=== RUN   TestDecodeHeaders_BodiedPerRouteOverride_StopIteration_OverrideMaxStored
+--- PASS: TestDecodeHeaders_BodiedPerRouteOverride_StopIteration_OverrideMaxStored (0.00s)
+=== RUN   TestDecodeHeaders_DoesNotInspectContentLength
+--- PASS: TestDecodeHeaders_DoesNotInspectContentLength (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
+$ grep -nE '^## ADR-0127' docs/envoy-go/DECISIONS.md
+5896:## ADR-0127 v2: Body-counting + 413-trigger algorithm — STREAMING-CAP-ONLY + `maybeAddContentLength` mirror + reuse of framework `SendLocalReply` 413 wire shape + 100-Continue addendum
+$ go test -race -count=1 ./internal/filter/http/buffer/
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
+```

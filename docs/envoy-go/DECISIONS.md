@@ -5890,3 +5890,45 @@ Phase 13 consumes the only top-level field on the parent `Buffer` proto: `max_re
 - Operators with existing configs targeting `max_request_bytes > 1 MiB` against reference Envoy MUST adjust the value to load on envoy-go. Documented at BEHAVIOR_CONTRACT §13.4 `### Phase 13 forward-pointer notes`.
 - Future cap-promotion phase (compression's natural amender per ADR-0076 §Consequences (d)) amends THIS ADR in-place to remove the ≤ 1 MiB ceiling once the framework cap becomes per-stream tunable; `compiledConfig` field type may also widen from `uint32` to `uint64`.
 - The `compiledConfig` shape is the SMALLEST `compiledConfig` so far in §9 family rows (1 field vs csrf's 2 vs fault's 8). The minimal shape is the structurally honest one — buffer has no other state to carry.
+
+---
+
+## ADR-0127 v2: Body-counting + 413-trigger algorithm — STREAMING-CAP-ONLY + `maybeAddContentLength` mirror + reuse of framework `SendLocalReply` 413 wire shape + 100-Continue addendum
+
+**Status:** Accepted. (v1 was the BRAINSTORM-time hypothesis with Content-Length fast-fail; v2 retires that clause after empirical refutation at SPEC §11.6.)
+**Date:** 2026-05-09
+**Doctrine:** Phase-13 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in-task:** Task 3 (DecodeHeaders gateway lands first; Task 4 completes DecodeData + maybeAddContentLength without a new ADR).
+
+### Context
+
+Phase 13's filter implements a per-stream body-cap with 413 emission on overflow. Reference Envoy v1.37.2's `buffer_filter.cc:50-67` does NOT inspect `Content-Length` in `decodeHeaders`; the cap fires only after data accumulates past the limit (confirmed at SPEC §11.6 — a request with `Content-Length: 6291456` and zero body bytes does NOT 413, the connection times out). The v2 algorithm is STREAMING-CAP ONLY: `DecodeHeaders` returns `StopIteration` on bodied + non-disabled requests; `DecodeData` accumulates via `DataStopIterationAndBuffer` per chunk; on `accumulated > effectiveMax` the filter calls `SendLocalReply(413, "Payload Too Large", connClose)` + returns `DataStopIterationNoBuffer`; on terminal `endStream=true` the filter invokes `maybeAddContentLength` (mirrors `buffer_filter.cc:91-97`) before returning `DataContinue`. The cap predicate is `>` strict (per SPEC §11.2 — body=1 MiB exact does NOT trip; body=1 MiB+1 byte → 413). The 413 wire shape is byte-equivalent to ADR-0076's framework synthesis (status 413, body `Payload Too Large` 17 bytes ASCII no LF, 4-header lowercase wire-form, `Connection: close`). The 100-Continue prefix on CL-known overflow probes is HCM/H1-codec discipline (NOT buffer-filter discipline) and is emitted independently of the buffer filter.
+
+### Decision
+
+**(i)** `DecodeHeaders` discipline: header-only `endStream=true` → `Continue` (mirrors `buffer_filter.cc:54-56`); per-route `disabled=true` → set `passthrough` flag + `Continue` (mirrors `buffer_filter.cc:60-62`); bodied + non-disabled → store `effectiveMax` + `headersRef`; return `StopIteration` (mirrors `buffer_filter.cc:67`). NO `Content-Length` inspection — per §11.6.
+
+**(ii)** `DecodeData` discipline: passthrough flag → `DataContinue` (filter never returns `DataStopIterationAndBuffer` on disabled-route path; framework safety-net cap never engages on disabled routes); accumulate via `f.accumulated += uint32(data.Len())`; cap predicate `>` strict (per §11.2); `accumulated > effectiveMax` → `SendLocalReply(413, "Payload Too Large", connClose)` + `DataStopIterationNoBuffer`; terminal `endStream=true` (within cap) → invoke `maybeAddContentLength`; return `DataContinue`; in-flight chunk → `DataStopIterationAndBuffer` (framework holds bytes per ADR-0076 §Decision (b)).
+
+**(iii)** `maybeAddContentLength` mirror: if `headersRef != nil` AND original request had no `Content-Length` → set `Content-Length: <accumulated>` on held headers + drop `Transfer-Encoding: chunked`. Mirrors `buffer_filter.cc:91-97` + observable at upstream boundary per SPEC §11.8-CL empirical evidence.
+
+**(iv)** 413 wire shape: byte-equivalent to ADR-0076's framework path — `SendLocalReply(413, []byte("Payload Too Large"), OrderedHeaders{{Name: "Connection", Value: "close"}})`. The body literal is the verbatim 17-byte ASCII `Payload Too Large` (no trailing newline; same as the framework constant `localReply413Body` at `internal/filter/http/chain.go:25`). 4-header lowercase wire-form: `content-length: 17`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`. Plus the user-supplied `Connection: close`.
+
+**(v)** 100-Continue addendum: HCM/H1-codec emits `HTTP/1.1 100 Continue` BEFORE the eventual 413 when the request includes `Expect: 100-continue` (which curl auto-injects for `--data-binary @<file>`). The buffer filter does NOT need to emit 100-Continue itself; the HCM does (already shipped in phase 04). Chunked encoding bypasses 100-Continue (curl does not auto-inject).
+
+### Alternatives considered
+
+(a) v1 BRAINSTORM hypothesis with Content-Length fast-fail in `DecodeHeaders`: REFUTED by §11.6 empirical pin; reference Envoy does not fast-fail on CL. v1 retired.
+
+(b) Delegate body-counting to HCM via a `setBufferLimit`-equivalent framework primitive: rejected per BRAINSTORM §2.4 + ADR-0076 §Consequences (d) — the framework has no per-stream cap-override primitive; introducing one is the future cap-promotion phase's responsibility. The deliberate divergence is recorded here with a forward-pointer to that phase.
+
+(c) Cap predicate `>=` (off-by-one): REFUTED by §11.2 empirical pin; reference Envoy uses strict `>`. v1 already used `>` correctly; preserved verbatim in v2.
+
+(d) Distinct buffer-filter 413 wire shape: rejected per BRAINSTORM §2.8 + §11.7 + §11.8 — reference Envoy reuses the stock 413 path; reusing the framework's 413 wire shape preserves byte-equivalence with no risk of divergence-window.
+
+### Consequences
+
+- The framework's `filterBufferLimitBytes = 1 << 20` cap stays armed as a safety net. With ADR-0126's parse-time `effectiveMax ≤ 1 MiB` invariant, the framework cap is structurally unreachable in MVP.
+- `maybeAddContentLength` is the ONLY observable upstream-side divergence between envoy-go's filter and reference Envoy's; the wire-side 413 + counter increments are byte-equivalent on every probe.
+- Phase 13 is the FIRST §9 family-row to use `DataStopIterationAndBuffer` outside the framework's own ADR-0076 path. The chain framework's accumulation discipline carries through unchanged; buffer's filter just returns the status-code instead of letting the framework's overflow path fire.
+- Future cap-promotion phase (compression's natural amender per ADR-0076 §Consequences (d)) may revisit (ii) — if the framework gains a per-stream cap-override primitive, buffer can delegate body-counting to HCM and emit only `StopIteration`; the wire outcomes stay the same. ADR-0127 v3 would record that landing.
