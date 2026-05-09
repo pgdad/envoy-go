@@ -5810,3 +5810,83 @@ The `BEHAVIOR_CONTRACT.md ## Stat-name mapping` table at end-of-phase 11 carries
 - The `buildPerRouteRuntime` helper (per planner-time decision 5 option (b)) is now the canonical reference for "data-only per-route override + shared stats" implementations. Future filters mirroring this pattern reuse the helper signature `build<FilterName>PerRouteRuntime(perRoute *<FilterPolicy>, listenerStats *<filterStats>) (*runtimeConfig, error)` verbatim (modulo type names). The helper is REQUIRED to invoke the same listener-level `buildRuntimeConfig` to preserve PGV-mirror validation parity per ADR-0121.
 - Fixture 0014 scenario 7 (per-route wholesale-override; lands at Task 11) mechanically validates the §11.9 shared-stats invariant: 7a (per-route `/route-only` allow B.test) + 7b (default `/` reject B.test) yields aggregate `request_valid +1` + `request_invalid +1` on the SAME counter series — NO independent per-route series. This is the differential analog to the unit-level `TestDecodeHeaders_PerRouteStatsShared_AggregatesAcrossListenerAndPerRoute` test landed at this Task 4.
 - If a future Envoy bump per ADR-0008's pin-bump discipline changes the csrf counter set (e.g., adds `shadow_request_invalid` under all-defaults, or splits per-route stats into an independent series), ADR-0124 §Decision and the SPEC §11.6/§11.9 empirical pins MUST be re-executed in lockstep + the BEHAVIOR_CONTRACT.md stat-name table updated.
+
+---
+
+## ADR-0125: `internal/filter/http/buffer/` package shape — single-token directory + decoder-only `HTTPFilter` value + per-route disabled-OR-override 5th canonical discipline
+
+**Status:** Accepted
+**Date:** 2026-05-09
+**Doctrine:** Phase-13 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in-task:** Task 2 (this commit; package skeleton + parsePerRoute first lands).
+
+### Context
+
+Phase 13 lands `envoy.filters.http.buffer` as the 6th §9 production HTTP filter. The package shape decision (directory naming + file split + filter-struct + factory signature) builds on the cors / fault / header_mutation / localratelimit / csrf precedents. Per BRAINSTORM §1.1 + §2.1 + §2.5: directory `buffer/` (single-token; matches cors/fault/csrf precedent — no underscore needed since proto type-name is single token); decoder-only HTTPFilter value (mirrors phase 12 csrf ADR-0120; `Encoder: nil` saves StreamEncoderFilter method set); per-route TPFC carries `disabled: true` shortcut OR `buffer.max_request_bytes` wholesale override (5th canonical per-route discipline alongside ADR-0073 / ADR-0110 / ADR-0117 / ADR-0124).
+
+### Decision
+
+**(i)** Package directory + Go-package identifier are both `buffer` (single token; matches cors/fault/csrf precedent).
+
+**(ii)** Files: `doc.go`, `buffer.go`, `buffer_test.go`, `fuzz_test.go`. Single-file `buffer.go` per planner-time decision 6 (no `count.go` or `perroute.go` split).
+
+**(iii)** Public surface: `TypeURL` const + `New` HTTPFilterFactory.
+
+**(iv)** Decoder-only `HTTPFilter` value: `Decoder: f, Encoder: nil` (mirrors phase 12 csrf precedent; first-use in §9 family was phase 12).
+
+**(v)** Boot registration ordering: `router → buffer → cors → csrf → envoygotest → fault → header_mutation → localratelimit` (alphabetical-after-router per ADR-0100 §2.2 stylistic discipline).
+
+**(vi)** Per-route discipline: 5th canonical shape "disabled-OR-override" — `BufferPerRoute` proto carries `oneof override` with `disabled: true` (filter wholly inactive on route) OR `buffer: {max_request_bytes: ...}` (wholesale override of listener cap). `parsePerRoute` enforces oneof semantics + PGV-mirror constraints; "both fields set" rejection happens at JSON-decoder per §11.3 empirical pin (NOT PGV; rejection wording: `'buffer' has already been set (either directly or as part of a oneof)`).
+
+**(vii)** Per-route stats SHARED-vacuous with listener-level: phase 13 emits no filter-specific counters per SPEC §1.1 amendment 5; the SHARED-stats invariant from ADR-0124 carries through with the special case that "shared" is structurally vacuous when there is nothing to share.
+
+### Alternatives considered
+
+(a) Split `buffer.go` into `count.go` + `perroute.go` — rejected per planner-time decision 6 (~280-330 LoC stays under mental-model threshold).
+
+(b) `Decoder: f, Encoder: f` symmetric — rejected per planner-time decision 5 (decoder-only is structurally honest).
+
+(c) Per-route INDEPENDENT stats (mirroring phase 11 ADR-0117) — rejected because phase 13 emits no filter-specific counters at all per SPEC §11.5 empirical pin (reference Envoy emits no `envoy_http_buffer_*` counter family).
+
+### Consequences
+
+- Filter set extends from 7 → 8: `{buffer, cors, csrf, envoygotest, fault, header_mutation, localratelimit, router}`. ADR-0074 (filter set) absorbs the 8th member additively; no in-place edit.
+- Canonical 5-shape per-route table extends ADR-0073 + ADR-0117 + ADR-0124 with the disabled-OR-override sum-type; future per-route disciplines for additional §9 family rows can pick from the now 5-shape catalog or codify a new shape.
+- The "disabled-OR-override" sum-type is the FIRST per-route discipline to use a structural sum type (oneof) rather than a flat replace-all-fields wholesale override; the discriminator is the proto oneof case rather than a runtime type assertion. This sets a precedent for future per-route disciplines that need a "shortcut" alongside an "override" form.
+
+---
+
+## ADR-0126: `compiledConfig` shape + parse-time `max_request_bytes ≤ 1 MiB` validation + cap-layering rationale + PGV-mirror filter-internal validation discipline
+
+**Status:** Accepted
+**Date:** 2026-05-09
+**Doctrine:** Phase-13 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in-task:** Task 2.
+
+### Context
+
+Phase 13 consumes the only top-level field on the parent `Buffer` proto: `max_request_bytes` (UInt32Value, REQUIRED). Reference Envoy v1.37.2 accepts arbitrary `UInt32Value` up to ~4 GiB at parse time (confirmed at SPEC §11.1 empirical pin). envoy-go's framework safety net is the hardcoded `filterBufferLimitBytes = 1 << 20` (per `internal/filter/http/chain.go:19` + ADR-0076 §Decision (b)) which fires when `DataStopIterationAndBuffer` exceeds 1 MiB. Without an envoy-go-side parse-time ceiling, a config with `max_request_bytes > 1 MiB` would trip the framework's 17-byte 413 path BEFORE the buffer filter's own wire shape could fire — divergence-window. Per BRAINSTORM §2.3 + Q3 + §2.4: phase 13 imposes an envoy-go-only `max_request_bytes ≤ 1 MiB` parse-time validation that closes this divergence-window.
+
+### Decision
+
+**(i)** `compiledConfig` shape: 1 field — `maxRequestBytes uint32` (validated 0 < value ≤ 1048576). NO `*filterStats` field (phase 13 emits no filter-specific counters). NO additional state.
+
+**(ii)** Parse-time validation: `New` rejects nil `MaxRequestBytes`, rejects zero value, rejects values > 1048576 (1 MiB). Same validation applies to `BufferPerRoute.buffer.max_request_bytes` via `parsePerRoute`.
+
+**(iii)** Cap-layering rationale: buffer's own `accumulated > effectiveMax` check fires INSIDE the framework's `filterBufferLimitBytes = 1 << 20` cap because `effectiveMax ≤ 1 MiB` invariant per (ii). The framework cap stays armed as a safety net but is structurally unreachable in MVP. When the future cap-promotion phase amends ADR-0076's `filterBufferLimitBytes` to per-stream tunability (the `per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes` knobs become honored rather than silent-ignored), this ADR amends in-place to remove the parse-time ≤ 1 MiB validation; `max_request_bytes` becomes operationally equivalent to reference Envoy.
+
+**(iv)** PGV-mirror error wording: envoy-go-own clear-text per planner-time decision 3 + phase 11 ADR-0115 + phase 12 ADR-0121 precedent. Specifically: `"buffer: max_request_bytes is required"`, `"buffer: max_request_bytes must be > 0"`, `"buffer: max_request_bytes (%d) exceeds envoy-go cap of 1048576 bytes"`. Per-route variants prepend `"buffer per-route: "`. NOT verbatim-Envoy-PGV-envelope mirroring (option (a) rejected — no canonical Envoy boot-log byte-equivalence target for proto-shape PGV checks; phase 11's 50ms `fill_interval` exception was a numeric-bound check with a canonical Envoy server.cc wording; phase 13's proto-shape check has no analogous mirror target).
+
+### Alternatives considered
+
+(a) Match-time-truncate-to-1-MiB: silent and surprises operator at runtime (no boot signal); rejected per BRAINSTORM §2.3 in favor of parse-time rejection.
+
+(b) No cap-layering: defer to framework cap entirely; rejected because the framework cap's wire shape is the framework's own 17-byte 413 path, NOT the buffer filter's per-spec response — divergence-window opens.
+
+(c) Match Envoy's PGV envelope wording verbatim: rejected per planner-time decision 3 (no boot-log byte-equivalence target; envoy-go-own wording is operator-friendlier).
+
+### Consequences
+
+- Operators with existing configs targeting `max_request_bytes > 1 MiB` against reference Envoy MUST adjust the value to load on envoy-go. Documented at BEHAVIOR_CONTRACT §13.4 `### Phase 13 forward-pointer notes`.
+- Future cap-promotion phase (compression's natural amender per ADR-0076 §Consequences (d)) amends THIS ADR in-place to remove the ≤ 1 MiB ceiling once the framework cap becomes per-stream tunable; `compiledConfig` field type may also widen from `uint32` to `uint64`.
+- The `compiledConfig` shape is the SMALLEST `compiledConfig` so far in §9 family rows (1 field vs csrf's 2 vs fault's 8). The minimal shape is the structurally honest one — buffer has no other state to carry.

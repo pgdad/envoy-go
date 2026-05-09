@@ -206,3 +206,63 @@ $ grep -nE 'httpReg.Register' cmd/envoy-go/main.go
 $ grep -n '^### envoy.filters.http.csrf' docs/envoy-go/BEHAVIOR_CONTRACT.md
 1093:### envoy.filters.http.csrf
 ```
+
+## Task 2 — `internal/filter/http/buffer/` package skeleton + New factory PGV-mirror + parsePerRoute oneof discipline [ADR-0125, ADR-0126]
+
+**Commits:** `TBD` — `phase 13: buffer package skeleton + New factory PGV-mirror + parsePerRoute oneof discipline [ADR-0125, ADR-0126]`
+**Notes:** Created `internal/filter/http/buffer/{doc.go, buffer.go, buffer_test.go}` per PLAN Task 2. TDD discipline: wrote failing tests (Group 1 PGV + Group 2 parsePerRoute) first; verified compile failure (undefined: New, TypeURL, parsePerRoute); then landed `doc.go` + `buffer.go` skeleton. One PLAN-text adjustment at impl time: (a) the PLAN's `filter` struct included 4 future fields (`effectiveMax`, `accumulated`, `passthrough`, `headersRef`) for Tasks 3-4; the `unused` linter flagged them since they are not referenced yet — removed from the Task 2 skeleton, matching the csrf Task 2 precedent (doc comment in struct notes they land in Tasks 3-4). (b) the PLAN's `HTTPFilter` literal included `PerRoute: parsePerRoute` but the framework's `HTTPFilter` struct (per `internal/filter/http/types.go`) has no `PerRoute` field — per-route config is resolved at request time via `f.dcb.RequestRouteConfig()` (as in csrf) rather than being attached to the `HTTPFilter` struct; omitted the non-existent field, `parsePerRoute` remains a package-internal function callable from tests and from `DecodeHeaders` (Task 3).
+
+ADR-0125 + ADR-0126 land at this commit per the ADR-0044 ADR-on-impl convention. Both follow the ADR-0001 7-section template (Status / Date / Doctrine / Lands-in-task / Context / Decision / Alternatives considered / Consequences). ADR-0125 anchors the package shape (single-token directory matching cors/fault/csrf precedent; decoder-only `HTTPFilter` value with `Encoder: nil`; boot-registration ordering; 5th canonical per-route discipline "disabled-OR-override" — first use of a structural sum type oneof rather than flat wholesale-override). ADR-0126 anchors the `compiledConfig` shape (1 field, smallest so far in §9 family) + parse-time `max_request_bytes ≤ 1 MiB` validation + cap-layering rationale (framework `filterBufferLimitBytes` stays armed as safety net but is structurally unreachable given the parse-time ceiling).
+
+**Outputs:**
+```
+$ go build ./internal/filter/http/buffer/...
+$ go vet ./internal/filter/http/buffer/...
+$ golangci-lint run ./internal/filter/http/buffer/...
+$ go test -race -count=1 -v ./internal/filter/http/buffer/
+=== RUN   TestNew_NilTC
+--- PASS: TestNew_NilTC (0.00s)
+=== RUN   TestNew_MalformedTC
+--- PASS: TestNew_MalformedTC (0.00s)
+=== RUN   TestNew_MaxRequestBytesNil_RejectAtParseTime
+--- PASS: TestNew_MaxRequestBytesNil_RejectAtParseTime (0.00s)
+=== RUN   TestNew_MaxRequestBytesZero_RejectAtParseTime
+--- PASS: TestNew_MaxRequestBytesZero_RejectAtParseTime (0.00s)
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#00
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#01
+=== RUN   TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#02
+--- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#00 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#01 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesOverCap_RejectAtParseTime/#02 (0.00s)
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#00
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#01
+=== RUN   TestNew_MaxRequestBytesBoundary_Accepted/#02
+--- PASS: TestNew_MaxRequestBytesBoundary_Accepted (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#00 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#01 (0.00s)
+    --- PASS: TestNew_MaxRequestBytesBoundary_Accepted/#02 (0.00s)
+=== RUN   TestNew_HappyPath_Round
+--- PASS: TestNew_HappyPath_Round (0.00s)
+=== RUN   TestParsePerRoute_Disabled_Parses
+--- PASS: TestParsePerRoute_Disabled_Parses (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_Parses
+--- PASS: TestParsePerRoute_BufferOverride_Parses (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_Zero_Rejects
+--- PASS: TestParsePerRoute_BufferOverride_Zero_Rejects (0.00s)
+=== RUN   TestParsePerRoute_BufferOverride_OverCap_Rejects
+--- PASS: TestParsePerRoute_BufferOverride_OverCap_Rejects (0.00s)
+=== RUN   TestParsePerRoute_OneofUnset_Rejects
+--- PASS: TestParsePerRoute_OneofUnset_Rejects (0.00s)
+=== RUN   TestParsePerRoute_DisabledFalse_Rejects
+--- PASS: TestParsePerRoute_DisabledFalse_Rejects (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
+$ grep -nE '^## ADR-0125|^## ADR-0126' docs/envoy-go/DECISIONS.md
+5816:## ADR-0125: `internal/filter/http/buffer/` package shape — single-token directory + decoder-only `HTTPFilter` value + per-route disabled-OR-override 5th canonical discipline
+5859:## ADR-0126: `compiledConfig` shape + parse-time `max_request_bytes ≤ 1 MiB` validation + cap-layering rationale + PGV-mirror filter-internal validation discipline
+$ go test -race -count=1 ./internal/filter/http/buffer/
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
+```
