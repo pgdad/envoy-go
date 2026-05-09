@@ -684,7 +684,7 @@ envoy-go ready
 
 Implementation notes (deviations from PLAN):
 - PLAN specified `Expect: 100-continue` on scenarios 2 + 5 per SPEC §7.1. Removed from both: envoy-go's `connection.go` line 122 sends 417 (not 413) for any `Expect:` header — a pre-filter-chain guard that has no equivalent in reference Envoy's buffer filter code path. The overflow path (413) fires correctly without `Expect:`.
-- PLAN assumed `DecodeHeaders` would return `StopIteration` for bodied requests per ADR-0127 v2 original text. Integration testing revealed the synchronous-HCM deadlock; `Continue` is the correct return per the envoy-go HCM architecture (ADR-0076 + `connection.go` sequential dispatch). ADR-0127 v2 text was already updated in DECISIONS.md to note this in the prior session; `buffer.go` + `buffer_test.go` now match.
+- PLAN assumed `DecodeHeaders` would return `StopIteration` for bodied requests per ADR-0127 v2 original text. Integration testing revealed the synchronous-HCM deadlock; `Continue` is the correct return per the envoy-go HCM architecture (ADR-0076 + `connection.go` sequential dispatch). ADR-0127 v2 text needs amendment at Task 12 (planned); current ADR text references the StopIteration algorithm which was rewritten during Task 11 integration testing. `buffer.go` + `buffer_test.go` now match the landed Continue/DataContinue algorithm.
 - PLAN assumed `DecodeData` mid-stream would return `DataStopIterationAndBuffer`. Same synchronous-HCM constraint: `DataContinue` is correct.
 - Scenario 1 log format changed from `body=<truncated JSON>` to `body=<json-ok method=%q path=%q>` for determinism — reference Envoy adds proxy-specific headers (`x-forwarded-for`, `x-envoy-expected-rq-timeout-ms`, etc.) that envoy-go does not; raw JSON echoed to the driver would diverge even for a successful 200 pass-through.
 
@@ -734,3 +734,185 @@ Both files created and validated:
 - `test/fixtures/0015-http-buffer/expectations.yaml` — YAML-formatted prose; 6 scenarios + final counter snapshot + no timing tolerances note + Envoy-only counter filtering note.
 - `test/fixtures/0015-http-buffer/README.md` — Markdown overview + topology + scenario summary + ADR/decision cross-references.
 - No validation errors; both files follow existing 0014-http-csrf fixture documentation precedent.
+
+## Task 12 — Phase-done: BEHAVIOR_CONTRACT 4-edit bundle + ROADMAP row 13 done + STATE.md advance + ADR updates + 6-gate verification
+
+**Commits:** `TBD` — `phase 13: phase-done — BEHAVIOR_CONTRACT 4-edit bundle + 6 gates green + ADR-0127 v2 update + ADR-0128 new + ROADMAP done + STATE advance`
+
+**Notes:** Task 12 carries the original phase-done scope (BEHAVIOR_CONTRACT 4-edit bundle, ROADMAP flip, STATE advance, 6-gate verification) PLUS the user-approved Task 11 pivot doc-fix scope (B1-B5 doc corrections, new ADR-0128, beads issue EGO-1).
+
+**Original Task 12 scope (A1-A4):**
+- (A1) BEHAVIOR_CONTRACT.md 4-edit bundle per SPEC §13: new `### envoy.filters.http.buffer` subsection (~72 LoC; adapted to reflect landed Continue/DataContinue algorithm); 29-name table Phase 13 preamble note (~5 LoC); new Equivalence Matrix row for 0015-http-buffer; new `### Phase 13 forward-pointer notes` subsection (~30 LoC).
+- (A2) ROADMAP.md row 13: `in-progress → done` with sharpened summary aligned to SPEC §1.1 amendment 5 (stays at 29 names; 4 ADRs including new ADR-0128; Continue/DataContinue algorithm; framework deltas at connection.go).
+- (A3) STATE.md advanced to `awaiting next planning`; active-phase → `<next-§9-family-row>`; next-skill → `superpowers:brainstorming`; lifecycle-state → awaiting next planning.
+- (A4) All 6 gates verified (see Outputs section below).
+
+**Pivot doc-fix scope (B1-B5):**
+- (B1) ADR-0127 v2 in-place update in DECISIONS.md: Context rewritten to acknowledge synchronous-HCM deadlock + Continue/DataContinue adaptation; Decision (i) amended (Continue, not StopIteration); Decision (ii) amended (DataContinue mid-stream, not DataStopIterationAndBuffer); Decision (v) 100-Continue addendum RETRACTED (phase-04 connection.go:122 categorically 417s Expect: headers; beads issue EGO-1 opened); Consequences amended (retracted DataStopIterationAndBuffer claim; added synchronous-HCM constraint + ADR-0128 co-anchor).
+- (B2) ADR-0128 NEW authored in DECISIONS.md: framework primitives for chunked-body end-stream detection + CL reconciliation; covers synthetic empty-terminal RunDecodeData + post-body CL reconciliation; Status Accepted; Lands-in-task: Task 11 (code) + Task 12 (ADR).
+- (B3) Beads issue EGO-1 opened in /home/esa/git/envoy-go/.beads/: "phase-04 HCM categorically rejects Expect: 100-continue with 417 (connection.go:122) — fix in future bundle". Beads database initialized at first-use for envoy-go project (JSONL-only mode).
+- (B4) PROGRESS.md Task 11 line 687 false claim corrected: "ADR-0127 v2 text was already updated in DECISIONS.md to note this in the prior session" → "ADR-0127 v2 text needs amendment at Task 12 (planned); current ADR text references the StopIteration algorithm which was rewritten during Task 11 integration testing."
+- (B5) SPEC.md §1.4 LoC estimate line 56 amended (actual ~35 LoC framework deltas, not ~15); §4.3 amended (connection.go +34 LoC added as POST-PIVOT AMENDMENT block); §2.5 amended ("No HCM-level changes" → actual HCM primitives documented with ADR-0128 cross-reference).
+
+**Doc-updates summary:**
+
+| Item | File | Description |
+|---|---|---|
+| A1(a) | BEHAVIOR_CONTRACT.md | NEW `### envoy.filters.http.buffer` subsection (post-pivot Continue/DataContinue algorithm) |
+| A1(b) | BEHAVIOR_CONTRACT.md | Phase 13 note after 29-name table (ZERO new entries) |
+| A1(c) | BEHAVIOR_CONTRACT.md | NEW Equivalence Matrix row for 0015-http-buffer (6 scenarios) |
+| A1(d) | BEHAVIOR_CONTRACT.md | NEW `### Phase 13 forward-pointer notes` subsection |
+| A2 | ROADMAP.md | Row 13: in-progress → done; 4 ADRs; sharpened summary |
+| A3 | STATE.md | lifecycle-state → awaiting next planning; next-skill → brainstorming |
+| B1 | DECISIONS.md | ADR-0127 v2 in-place update (Context/Decision(i)(ii)(v)/Consequences) |
+| B2 | DECISIONS.md | ADR-0128 NEW framework primitives ADR |
+| B3 | .beads/issues.jsonl | Beads issue EGO-1 (phase-04 Expect-handling future bundle) |
+| B4 | PROGRESS.md | Task 11 line 687 false claim corrected |
+| B5 | SPEC.md | §1.4/§4.3/§2.5 post-pivot amendments (in-place per ADR-0052) |
+
+**Outputs:**
+
+**Gate A — build / vet / lint clean:**
+```
+$ go build ./...
+(clean — no output)
+$ go vet ./...
+(clean — no output)
+$ golangci-lint run ./...
+(clean — no output)
+Gate A: CLEAN
+```
+
+**Gate B — race-test pass on 36 packages:**
+```
+$ go test -race -count=1 ./...
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	6.368s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	1.015s
+ok  	github.com/esalaine/envoy-go/internal/admin	2.596s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	1.083s
+ok  	github.com/esalaine/envoy-go/internal/cluster	1.088s
+ok  	github.com/esalaine/envoy-go/internal/drain	1.144s
+?   	github.com/esalaine/envoy-go/internal/filter	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	1.088s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	8.415s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	1.165s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.043s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	1.036s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	1.042s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	1.066s
+?   	github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	1.371s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	1.044s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	1.050s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	1.279s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	1.213s
+?   	github.com/esalaine/envoy-go/internal/http	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/listener	4.123s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	1.070s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	1.038s
+?   	github.com/esalaine/envoy-go/internal/runtime	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/stats	1.052s
+?   	github.com/esalaine/envoy-go/internal/tcp	[no test files]
+ok  	github.com/esalaine/envoy-go/internal/tls	1.117s
+?   	github.com/esalaine/envoy-go/internal/xds	[no test files]
+?   	github.com/esalaine/envoy-go/test/conformance	[no test files]
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	3.577s
+ok  	github.com/esalaine/envoy-go/test/differential	47.730s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	1.042s
+[... fixture driver packages all show ok or no test files ...]
+ok  	github.com/esalaine/envoy-go/test/helpers	1.030s
+```
+All 36 packages PASS; no race violations.
+
+**Gate C — h2spec 53/53 PASS:**
+```
+$ go test -count=1 -v ./test/conformance/h2spec/
+        53 tests, 53 passed, 0 skipped, 0 failed
+    [PASS] 3.5. HTTP/2 Connection Preface: 2/2 passed
+    [PASS] 4.1. Frame Format: 3/3 passed
+    [PASS] 4.2. Frame Size: 3/3 passed
+    [PASS] 4.3. Header Compression and Decompression: 3/3 passed
+    [PASS] 5.1. Stream States: 13/13 passed
+    [PASS] 5.1.1. Stream Identifiers: 2/2 passed
+    [PASS] 5.1.2. Stream Concurrency: 1/1 passed
+    [PASS] 5.3.1. Stream Dependencies: 2/2 passed
+    [PASS] 5.4.1. Connection Error Handling: 2/2 passed
+    [PASS] 5.5. Extending HTTP/2: 2/2 passed
+    [PASS] 7. Error Codes: 2/2 passed
+    [PASS] 8.1. HTTP Request/Response Exchange: 1/1 passed
+    [PASS] 8.1.2. HTTP Header Fields: 1/1 passed
+    [PASS] 8.1.2.1. Pseudo-Header Fields: 4/4 passed
+    [PASS] 8.1.2.2. Connection-Specific Header Fields: 2/2 passed
+    [PASS] 8.1.2.3. Request Pseudo-Header Fields: 7/7 passed
+    [PASS] 8.1.2.6. Malformed Requests and Responses: 2/2 passed
+    [PASS] 8.2. Server Push: 1/1 passed
+--- PASS: TestH2Spec (2.29s)
+PASS
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	2.352s
+```
+
+**Gate D — 17 fuzzers green at 30s budget:**
+```
+$ go test -fuzz=FuzzBufferConfigParse -fuzztime=30s -run=^$ ./internal/filter/http/buffer/
+fuzz: elapsed: 30s, execs: 4429085 (38609/sec), new interesting: 13 (total: 157)
+PASS  ok  github.com/esalaine/envoy-go/internal/filter/http/buffer  31.053s
+
+All 17 fuzzers PASS at 30s budget:
+  FuzzAccessLogFormat              PASS  ./internal/accesslog
+  FuzzBootstrapLoad                PASS  ./internal/bootstrap
+  FuzzBufferConfigParse            PASS  ./internal/filter/http/buffer  [NEW — 17th]
+  FuzzConfigDumpFormat             PASS  ./internal/admin
+  FuzzCsrfPolicyConfigParse        PASS  ./internal/filter/http/csrf
+  FuzzDrainTransitions             PASS  ./internal/drain
+  FuzzFaultConfigParse             PASS  ./internal/filter/http/fault
+  FuzzFilterChainMatch             PASS  ./internal/listener/listenerfilter
+  FuzzFilterChainParse             PASS  ./internal/filter/http
+  FuzzFrameStream                  PASS  ./internal/filter/hcm/h2
+  FuzzHCMConfigParse               PASS  ./internal/filter/hcm
+  FuzzHeaderMutationConfigParse    PASS  ./internal/filter/http/header_mutation
+  FuzzHPACKDecode                  PASS  ./internal/filter/hcm/h2
+  FuzzLocalRateLimitConfigParse    PASS  ./internal/filter/http/localratelimit
+  FuzzPromTextFormat               PASS  ./internal/stats
+  FuzzTcpProxyFilter               PASS  ./internal/filter/tcpproxy
+  FuzzTLSContextParse              PASS  ./internal/tls
+```
+
+**Gate E — 16 differential fixtures 0000-0015 PASS:**
+```
+$ go test -count=1 -v ./test/differential/ -run TestDifferential
+    --- PASS: TestDifferential/0000-tcp-echo (1.71s)
+    --- PASS: TestDifferential/0001-tcp-proxy-rr (1.35s)
+    --- PASS: TestDifferential/0002-tls-tcp (1.38s)
+    --- PASS: TestDifferential/0003-http11-routing (1.33s)
+    --- PASS: TestDifferential/0004-h2-routing (2.05s)
+    --- PASS: TestDifferential/0005-prometheus-stats (2.02s)
+    --- PASS: TestDifferential/0006-access-log (11.08s)
+    --- PASS: TestDifferential/0007a-cors (1.44s)
+    --- PASS: TestDifferential/0007b-iteration-probe (0.81s)
+    --- PASS: TestDifferential/0008-listener-chain-match (2.72s)
+    --- PASS: TestDifferential/0009-admin-config-dump (1.96s)
+    --- PASS: TestDifferential/0010-graceful-drain (9.56s)
+    --- PASS: TestDifferential/0011-http-fault (2.08s)
+    --- PASS: TestDifferential/0012-http-header-mutation (1.56s)
+    --- PASS: TestDifferential/0013-http-local-ratelimit (2.21s)
+    --- PASS: TestDifferential/0014-http-csrf (1.47s)
+    --- PASS: TestDifferential/0015-http-buffer (1.47s)
+--- PASS: TestDifferential (44.98s)
+ok  	github.com/esalaine/envoy-go/test/differential	45.806s
+```
+
+**Gate F — BEHAVIOR_CONTRACT 4-edit bundle landed:**
+```
+$ grep -n "^### envoy.filters.http.buffer" docs/envoy-go/BEHAVIOR_CONTRACT.md
+1150:### envoy.filters.http.buffer
+
+$ grep -n "Phase 13 (buffer filter) note" docs/envoy-go/BEHAVIOR_CONTRACT.md
+215:**Phase 13 (buffer filter) note:** ...
+
+$ grep -n "HTTP filter.*envoy.filters.http.buffer" docs/envoy-go/BEHAVIOR_CONTRACT.md
+35:| HTTP filter `envoy.filters.http.buffer` | 0015-http-buffer: ...
+
+$ grep -n "Phase 13 forward-pointer notes" docs/envoy-go/BEHAVIOR_CONTRACT.md
+1616:### Phase 13 forward-pointer notes
+```
+All 4 edits confirmed present.

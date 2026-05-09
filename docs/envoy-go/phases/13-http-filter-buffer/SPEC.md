@@ -53,7 +53,7 @@ Phase 13 stays a SINGLE row at this SPEC. The implementation surface is estimate
 - ~25 LoC `doc.go`
 - ~400–500 LoC unit tests (6 test groups per §14.1 — ~50 LoC slimmer than phase 12's ~500 because fewer cases per group, but ~50 LoC heavier on the body-counting tests that need data-stream simulation)
 - ~60 LoC fuzzer
-- ~15 LoC framework deltas (zero new primitives; one new `httpReg.Register` line in `cmd/envoy-go/main.go`)
+- ~15 LoC framework deltas (zero new primitives; one new `httpReg.Register` line in `cmd/envoy-go/main.go`) [POST-PIVOT AMENDMENT: actual framework deltas are ~35 LoC — cmd/envoy-go/main.go +1 line + internal/filter/hcm/connection.go +34 LoC (synthetic empty-terminal RunDecodeData + CL reconciliation); see §4.3 amendment below and ADR-0128]
 - ~150–200 LoC fixture (envoy.yaml ~70 + envoy-go.yaml ~70 + driver/main.go ~150 + backend/main.go ~30 + expectations.yaml ~30 + README.md ~50; total approximate)
 - ~50 LoC ROADMAP+STATE+BEHAVIOR_CONTRACT additions at SPEC commit (this SPEC does not modify production code)
 
@@ -122,7 +122,7 @@ The buffer filter's body-counting algorithm is **STREAMING-CAP ONLY**. Specifica
 ### 2.5 Cross-filter non-purposes
 
 - **No interaction with cors / fault / header_mutation / local_ratelimit / csrf per-route configs in fixture 0015.** Phase 13's fixture configures ONLY `buffer` filters (plus the router terminal). Mixed-filter ordering tests are deferred.
-- **No HCM-level changes.** Phase 13 reuses the existing `internal/filter/hcm/` body discipline + `serverHeader()` returning `"envoy"` (per `internal/filter/hcm/codec.go:17`).
+- **HCM-level changes (POST-PIVOT AMENDMENT — Task 11; in-place per ADR-0052).** Phase 13 introduces 2 HCM primitives at `internal/filter/hcm/connection.go` (+34 LoC): (1) synthetic empty-terminal `RunDecodeData(ctx, nil, true)` on chunked-body EOF without prior endStream-fire; (2) post-body CL reconciliation propagating filter-set `Content-Length` into `req.ContentLength` + clearing `req.TransferEncoding`. See ADR-0128. `serverHeader()` returning `"envoy"` (per `internal/filter/hcm/codec.go:17`) is UNCHANGED.
 - **No extension to existing per-route framework primitives.** Phase 13 reuses `PerRouteConfig.Resolve` (per `internal/filter/http/perroute.go:103–128`); no `ResolveAllTiers` invocation (unlike phase 10 header_mutation), no new framework callback, no `RegisterPerRouteValidator` hook (unlike phase 10). The per-route `BufferPerRoute` shape is validated standalone via `parsePerRoute` at config-load time; no multi-tier protected-set discipline.
 
 ### 2.6 Security non-purposes
@@ -178,7 +178,16 @@ test/fixtures/0015-http-buffer/README.md              ~50 LoC; fixture overview 
 cmd/envoy-go/main.go                       +1 line; httpReg.Register(buffer.TypeURL, buffer.New) — alphabetical-after-router insertion (router → buffer → cors → csrf → ...) before httpReg.Freeze()
 ```
 
-NO other production-code changes. `internal/filter/hcm/`, `internal/filter/http/`, `internal/listener/`, `internal/cluster/`, `internal/admin/`, `internal/drain/`, `internal/stats/` are all UNTOUCHED at the production-code level. Phase 13 is the structurally-thinnest §9 family-row at the framework-delta level (matches phase 12 csrf).
+> **POST-PIVOT AMENDMENT (Task 11; in-place per ADR-0052):** Integration testing at Task 11 revealed two framework gaps; the following file was ALSO modified:
+>
+> ```
+> internal/filter/hcm/connection.go          +34 LoC; TWO framework primitives for chunked-body end-stream detection + Content-Length reconciliation (see ADR-0128):
+>   - synthetic empty-terminal RunDecodeData(ctx, nil, true) when chunked body Read returns (0, io.EOF) without prior endStream-fire
+>   - post-body CL reconciliation: when req.Header["Content-Length"] was set by a filter AND req.ContentLength < 0 (chunked origin), propagate into req.ContentLength + clear req.TransferEncoding so req.Write emits fixed-CL (not chunked) on the wire
+>   - strconv import added
+> ```
+
+The claim "NO other production-code changes" is amended: `internal/filter/hcm/connection.go` is modified (+34 LoC). The original SPEC claim held for the filter package itself (correct), but the HCM framework needed two primitives. See ADR-0128 for full rationale. Phase 13 is no longer the structurally-thinnest §9 family-row at the framework-delta level (below phase 12 csrf but above zero).
 
 ### 4.4 Modified docs (at SPEC commit)
 

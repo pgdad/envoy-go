@@ -32,6 +32,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | HTTP filter `envoy.filters.http.header_mutation` | Per-request equivalence on post-mutation request headers (visible at upstream backend) and post-mutation response headers (visible at downstream client) under listener-level + per-route 3-tier configurations, including AppendAction × 4 + Remove + `keep_empty_value` boundary + multi-valued header collapse / preserve semantics + `most_specific_header_mutations_wins` cross-tier ordering (both flag values). Boot-time enforcement of the 6-name protected-header set per ADR-0111 + phase 10 §11.1. Differential gate fixture 0012-http-header-mutation. NOT asserted: header-value formatter substitution (deferred — ADR-0113), `query_parameter_mutations` (deferred — ADR-0112), H2 differential coverage. |
 | HTTP filter `envoy.filters.http.local_ratelimit` | 0013-http-local-ratelimit: scenario1: 5 reqs / cap=10 / fill=10 / interval=1s — 5×200; scenario2: 5 reqs / cap=2 — 2×200 + 3×429 (§11.3 wire shape); scenario3: 3 reqs / cap=1 / fill=1 / interval=200ms (refill ±10ms per §11.7); scenario4: 3+3 reqs interleaved /strict + /loose — wholesale-override (§11.6). Per-scenario tolerance per §13.3 timing-tolerances; lowercase wire-form 4-header set on 429; counter deltas across 4 stat names with `envoy_local_http_ratelimit_prefix` Prometheus label. NOT asserted: descriptor-action path (deferred — ADR-0120 family), runtime shadow-mode (deferred), X-RateLimit headers (deferred), H2 differential coverage. |
 | HTTP filter `envoy.filters.http.csrf` | 0014-http-csrf: scenario1: same-origin POST → 200; scenario2: cross-origin POST → 403 (§11.10 wire shape: content-length=14, body=`Invalid origin`, 4-header lowercase set); scenario3: `additional_origins` host:port match → 200; scenario4: no source-origin → 403 + `missing_source_origin +1`; scenario5: Referer fallback → 200; scenario7: per-route TPFC wholesale-override (§11.9 — per-route data REPLACES listener data; counters AGGREGATE since stats are SHARED). All 6 scenarios HTTP/1.1 plaintext; no timing tolerances (csrf is purely synchronous). NOT asserted: StringMatcher non-exact variants (deferred — drop at PARSE per ADR-0101 §3), `filter_enabled` percentage values other than 100% (deferred — Runtime + hot restart family), `shadow_enabled` semantics (deferred), H2 differential coverage. |
+| HTTP filter `envoy.filters.http.buffer` | 0015-http-buffer: scenario1: body-fits-cap (1 KiB POST → 200); scenario2: streaming-overflow CL-known (2 MiB POST → 413; §11.7+§11.8 wire shape: content-length=17, body=`Payload Too Large`, 4-header lowercase set + Connection: close); scenario3: chunked-overflow against per-route tighter cap (200 KiB chunked → 413, NO 100-Continue with chunked); scenario4: per-route disabled bypass (2 MiB POST → 200 — cap wholly inactive on disabled route per §11.4); scenario5: per-route tighter override fires (200 KiB → 413 against 128 KiB override); scenario6: chunked-passthrough Content-Length injection (10 KiB chunked → 200, backend asserts inbound `Content-Length: 10240` per §11.8-CL `maybeAddContentLength` mirror). All 6 requests HTTP/1.1 plaintext; no timing tolerances (buffer is purely synchronous). Counter delta on envoy-go side: `downstream_rq_total +6`, `downstream_rq_2xx +3`, `downstream_rq_4xx +3`. Envoy-only `downstream_rq_too_large` (+3) and `downstream_rq_completed` (+6) filtered out via the existing twin-series-discipline allow-list. NOT asserted: `max_request_bytes > 1 MiB` operational behavior (deferred — envoy-go-only parse-time rejection per ADR-0126); `per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes` (silent-ignored per ADR-0076); H2 differential coverage. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -210,6 +211,8 @@ phase, the same name carries the actual count.
 **No new tag-extractor (phase 12):** csrf reuses the existing `envoy_http_conn_manager_prefix` HCM-namespace SN2 extractor — no new pattern needed. UNLIKE phase 11 which added the filter-specific `envoy_local_http_ratelimit_prefix` (Rule SN9 per ADR-0118), phase 12 introduces NO new SN flattening rule.
 
 **Total: 29 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
+
+**Phase 13 (buffer filter) note:** The `envoy.filters.http.buffer` filter shipped in phase 13 contributes ZERO new entries to this table. The filter has no filter-specific counter namespace at all (confirmed empirically at phase 13 SPEC §11.5 — reference Envoy v1.37.2 emits NO `envoy_http_buffer_*` counter family). Buffer-filter overflow is observable on the envoy-go side via the existing `downstream_rq_4xx` HCM counter (rendered via Rule SN4 status-class flattening as `envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="<HCM stat_prefix>"}`). The Envoy-only HCM counters `downstream_rq_too_large` (increments on every 413) and `downstream_rq_completed` (increments on every completed request) are NOT in this table; they are filtered out of the differential per the `### Twin-series filter discipline` allow-list discipline below.
 
 ### Twin-series filter discipline (per empirical-verification scrape)
 
@@ -1144,6 +1147,66 @@ Phase 12 ships `envoy.filters.http.csrf` per the canonical Envoy v1.37.2 filter 
 
 NO `shadow_request_invalid` counter — confirmed reference Envoy v1.37.2 also does not emit it under all-defaults config (shadow-only mode reuses the regular 3-counter family).
 
+### envoy.filters.http.buffer
+
+Phase 13 ships `envoy.filters.http.buffer` per the canonical Envoy v1.37.2 filter spec. envoy-go consumes the only top-level field on the parent `Buffer` proto actively, with envoy-go-own validation (≤ 1 MiB ceiling) that closes a divergence-window against reference Envoy's lack of such a ceiling.
+
+**Listener-level field decomposition (1 field):**
+
+| Proto field | envoy-go behavior |
+|---|---|
+| `max_request_bytes` (`UInt32Value`, REQUIRED) | CONSUMED. envoy-go-own validation: non-nil + value > 0 + value ≤ 1048576 (1 MiB). Rejected at parse time with envoy-go-own error wording. The 1 MiB ceiling is the load-bearing envoy-go-only divergence (reference Envoy accepts arbitrary `UInt32Value`). |
+
+**Per-route TPFC (`BufferPerRoute` proto — separate from listener-level `Buffer`):**
+
+| Proto field | envoy-go behavior |
+|---|---|
+| `override.disabled` (oneof case, `bool`, PGV `bool.const = true`) | CONSUMED. `disabled: true` → filter wholly inactive on this route. `disabled: false` rejected at parse-time per PGV mirror. |
+| `override.buffer` (oneof case, `Buffer` message) | CONSUMED. `buffer.max_request_bytes` subjected to the same ≤ 1 MiB validation as listener-level. Wholesale-override of listener cap per ADR-0073. |
+
+The `oneof override` carries PGV `validate.required = true` — exactly one case must be set; both-set + neither-set rejected at boot via the JSON→proto decoder (NOT PGV; mechanism per phase 13 SPEC §11.3 + ADR-0125).
+
+**Body-counting algorithm — STREAMING-CAP ONLY (per phase 13 SPEC §11.6):**
+
+The buffer filter does NOT inspect `Content-Length` in `DecodeHeaders`. The cap fires only after data accumulates past the limit:
+
+1. `DecodeHeaders(headers, endStream)`:
+   - `endStream=true` (header-only) → `Continue` (no body work; mirrors `buffer_filter.cc:54-56`).
+   - per-route resolves to `disabled=true` → set passthrough flag; `Continue` (mirrors `buffer_filter.cc:60-62`).
+   - bodied + non-disabled → store `effectiveMax` + `headersRef`; return `Continue`. (envoy-go's HCM dispatches headers + body sequentially in one goroutine; `StopIteration` here would deadlock — see ADR-0128 for the synchronous-HCM dispatch constraint. Observable behavior is identical to reference Envoy's `StopIteration` path: headers are held until the body counting completes.)
+2. `DecodeData(data, endStream)`:
+   - passthrough flag set → `DataContinue` (filter never returns `DataStopIterationAndBuffer` on this path; framework safety-net cap never engages on disabled routes).
+   - `accumulated += len(data)`.
+   - `accumulated > effectiveMax` → `SendLocalReply(413, "Payload Too Large", connClose)` + `DataStopIterationNoBuffer` (discards partial buffer).
+   - `endStream=true` (terminal chunk fits) → invoke `maybeAddContentLength` (mirrors `buffer_filter.cc:91-97`); release held headers + body; `DataContinue`.
+   - in-flight chunk → `DataContinue` (envoy-go's HCM already accumulates all body bytes in `connection.go`'s `bodyBuf` before the router action dials upstream per ADR-0076 + ADR-0128; `DataStopIterationAndBuffer` is not needed — the framework holds the bytes. Observable behavior identical to reference Envoy's `DataStopIterationAndBuffer` path.)
+3. `DecodeTrailers` → invoke `maybeAddContentLength` defensively; `TrailersContinue`.
+4. `Encode*` → all pass-through. Buffer is decoder-side-only.
+5. `OnDestroy` → no-op.
+
+`maybeAddContentLength` (mirrors `buffer_filter.cc:91-97`): if `headersRef != nil` AND original request had no `Content-Length` → set `Content-Length: <accumulated>` on the held headers AND drop `Transfer-Encoding: chunked`. The discipline is: chunked → fixed-CL conversion before forwarding upstream. Observable at the backend boundary (per phase 13 SPEC §11.8-CL).
+
+**Per-route override semantics:** Wholesale-override per ADR-0073 + ADR-0125 (5th canonical per-route discipline: disabled-OR-override). Each `BufferPerRoute` TPFC entry runs through `parsePerRoute` at config-load time, allocating its own `*compiledPerRoute{disabled, maxOverride}`. The 3-tier `PerRouteConfig.Resolve` (Route > VirtualHost > RouteConfiguration > listener fallback) picks the most-specific config per request.
+
+**Per-route stats are SHARED with listener-level** (mirrors phase 12 csrf ADR-0124; DIVERGES from phase 11 local_ratelimit ADR-0117). Phase 13 emits NO filter-specific counters (see "Stat surface" below); the SHARED-stats invariant is structurally vacuous for buffer (no counters to share or split) but documented for cross-filter consistency.
+
+**Cap layering against ADR-0076 framework safety net:** The buffer filter's `accumulated > effectiveMax` check fires INSIDE the framework's hardcoded `filterBufferLimitBytes = 1 << 20` cap (per `internal/filter/http/chain.go:19`). Because `effectiveMax ≤ 1 MiB` (invariant per ADR-0126's parse-time validation), the framework cap is structurally unreachable in MVP — the filter wins by construction. The framework cap remains armed as a safety net for any future configuration that might bypass the parse-time check (e.g., the future cap-promotion phase that promotes `per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes` from silent-ignored to honored).
+
+**Rejection response wire shape (per phase 13 SPEC §11.7 + §11.8 — REUSES framework path verbatim per ADR-0076 §Decision (b)):**
+
+- Status: `413 Payload Too Large`
+- Body: `Payload Too Large` (17 bytes ASCII; constant `localReply413Body` from `internal/filter/http/chain.go:25`; NO trailing newline)
+- Headers in lexicographic order: `content-length: 17`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`
+- Plus user-supplied `Connection: close`
+- Framing: Content-Length (NO chunked)
+- NO `cache-control`, NO `x-content-type-options`, NO `transfer-encoding`, NO `charset=UTF-8` modifier on `content-type`
+
+**100-Continue note:** envoy-go's `connection.go:122` categorically rejects any request carrying `Expect:` with a 417 response (pre-filter-chain guard; see phase 04). The `Expect: 100-continue` scenario documented in the original ADR-0127 v2 §Decision (v) cannot fire at the buffer-filter level; it is tracked for future fix in the phase-04 Expect-handling bundle (see ADR-0127 v2 §Decision (v) retraction).
+
+**Method gate:** Buffer evaluates ALL methods that carry a body; the method itself is not consulted. Bodied requests (`POST`, `PUT`, `PATCH`, `DELETE` with body, etc.) all pass through the streaming-cap path; non-bodied requests (`GET`, `HEAD`, `OPTIONS` with `endStream=true` on headers) short-circuit at `DecodeHeaders` step 1 (`Continue` without state touch).
+
+**Stat surface:** ZERO filter-specific counters. Reference Envoy v1.37.2 emits NO `envoy_http_buffer_*` counter family at all (confirmed at phase 13 SPEC §11.5 — `/stats/prometheus` scrape after 4 buffer-overflow probes shows ZERO `envoy_http_buffer_*` lines). Buffer-filter overflow is observable on envoy-go's side via the existing HCM `downstream_rq_4xx` counter (in the 29-name table per phase 06.1; rendered as `envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="<HCM stat_prefix>"}`). The Envoy-only `downstream_rq_too_large` and `downstream_rq_completed` HCM counters increment alongside in reference Envoy but are NOT in envoy-go's emit allow-list — they are filtered out per the `### Twin-series filter discipline` allow-list discipline (above).
+
 ### Empirical evidence (413 overflow)
 
 **Probe configuration:** chain `[envoy.filters.http.buffer, envoy.filters.http.router]` with `Buffer{max_request_bytes: 1024}`. Listener `per_connection_buffer_limit_bytes: 1024`. Route `/` → STRICT_DNS cluster `c0` (nginx backend).
@@ -1549,3 +1612,20 @@ tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,
 **No new tag-extractor:** csrf reuses the existing `envoy_http_conn_manager_prefix` Prometheus tag-extractor (Rule SN2 from ADR-0061). UNLIKE phase 11's local_ratelimit which introduced filter-specific `envoy_local_http_ratelimit_prefix` (Rule SN9 per ADR-0118), phase 12 introduces NO new SN flattening rule and NO new tag-extractor pattern.
 
 **Per-route stats SHARED with listener-level:** csrf is the FIRST production filter to demonstrate the "wholesale data-only override + shared stats" pattern. Phase 11's local_ratelimit is the precedent for "wholesale stateful override + independent stats" (per ADR-0117). The two patterns coexist under ADR-0073's wholesale-override discipline; future stateful per-route filters with their own stat namespaces follow phase 11; future data-only per-route filters with HCM-scoped stats follow phase 12.
+
+### Phase 13 forward-pointer notes
+
+**Deferred field families** (silent-ignored / parse-rejected per ADR-0040 + ADR-0076 + ADR-0126; see `### envoy.filters.http.buffer ### Listener-level field decomposition` above + phase 13 SPEC §2.1 for the full field map):
+
+- `Buffer.max_request_bytes > 1 MiB` (envoy-go-only PARSE-time rejection per ADR-0126) — coupled to the future cap-promotion phase (compression's natural amender per ADR-0076 §Consequences (d)). Reference Envoy accepts arbitrary `UInt32Value`; envoy-go rejects values > 1048576 at parse time with envoy-go-own error wording. **Divergence-window:** operators with existing configs targeting `max_request_bytes > 1 MiB` against reference Envoy MUST adjust their config (lower the value) to load on envoy-go. Future re-activation: when the cap-promotion phase amends ADR-0076 to make `filterBufferLimitBytes` per-stream tunable via `per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes`, ADR-0126 amends in-place to remove the parse-time ≤ 1 MiB validation; `max_request_bytes` becomes operationally equivalent to reference Envoy.
+- `per_connection_buffer_limit_bytes` (Listener-scope) / `per_request_buffer_limit_bytes` (Route-scope) — silent-ignored at parse time per ADR-0076 §Decision (d). Phase 13 does NOT change this disposition. Future re-activation: same cap-promotion phase as above.
+
+**No new tag-extractor:** Buffer reuses the existing `envoy_http_conn_manager_prefix` Prometheus tag-extractor (Rule SN2 from ADR-0061). UNLIKE phase 11's local_ratelimit which introduced filter-specific `envoy_local_http_ratelimit_prefix` (Rule SN9 per ADR-0118), phase 13 introduces NO new SN flattening rule and NO new tag-extractor pattern. Phase 13 furthermore introduces NO new stat-table entries at all (per phase 13 SPEC §11.5 + §1.1 amendment 5 — reference Envoy emits no `envoy_http_buffer_*` counter family).
+
+**Per-route stats SHARED with listener-level (vacuously):** Phase 13 demonstrates the disabled-OR-override per-route discipline (5th canonical shape per ADR-0125). The SHARED-stats invariant is structurally vacuous for buffer (no filter-specific counters to share or split) but documented for cross-filter consistency: future stateful per-route filters with their own stat namespaces follow phase 11 (ADR-0117 INDEPENDENT stats); future data-only per-route filters with HCM-scoped stats follow phase 12 (ADR-0124 SHARED stats); future disabled-OR-override per-route filters with NO filter-specific stats follow phase 13 (ADR-0125 SHARED-vacuous stats).
+
+**Body-counting algorithm divergence from reference Envoy:** envoy-go's filter does its own per-stream byte-counting + 413 emission via `SendLocalReply`, while reference Envoy delegates to HCM via `callbacks_->setBufferLimit + StopIteration`. The deliberate divergence is recorded in ADR-0127 v2 §Consequences with an explicit forward-pointer to the future cap-promotion phase that may revisit this. WIRE OUTCOMES are byte-equivalent on every observable axis (status, body, headers, counter increment, `Connection: close`); only the `maybeAddContentLength` semantics are observable upstream-side as a deliberate mirror of `buffer_filter.cc:91-97`.
+
+**Framework deltas at `internal/filter/hcm/connection.go`:** Phase 13 introduces two HCM primitives (synthetic empty-terminal `RunDecodeData` on chunked-body EOF + post-body CL reconciliation propagating filter-set `Content-Length` into `req.ContentLength`) to support the `maybeAddContentLength` observable. These are the FIRST framework deltas since phase 07.1's body-buffering machinery. Documented in ADR-0128. Future filters relying on chunked → fixed-CL conversion at the upstream boundary can rely on these primitives.
+
+**Phase-04 `Expect: 100-continue` deferral:** envoy-go's `connection.go:122` categorically rejects any request carrying `Expect:` with 417 (pre-filter-chain guard). The buffer filter's `Expect: 100-continue` + overflow path (which would emit 100-Continue before the 413 in reference Envoy) cannot fire in envoy-go MVP. Tracked for future fix in the phase-04 Expect-handling bundle; cross-referenced in ADR-0127 v2 §Decision (v).
