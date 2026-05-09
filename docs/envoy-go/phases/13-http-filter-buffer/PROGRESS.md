@@ -269,7 +269,7 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
 
 ## Task 3 — `DecodeHeaders` body + `resolveEffective` helper + Group 3 tests [ADR-0127 v2]
 
-**Commits:** TBD — `phase 13: buffer DecodeHeaders body — header-only fast-path + per-route disabled passthrough + bodied StopIteration [ADR-0127 v2]`
+**Commits:** `92ff3d0` — `phase 13: buffer DecodeHeaders body — header-only fast-path + per-route disabled passthrough + bodied StopIteration [ADR-0127 v2]`
 **Notes:** TDD discipline applied: Group 3 tests appended first; first run confirmed compile failure (fields `effectiveMax`, `passthrough`, `headersRef` not yet on filter struct); then buffer.go extended and bodies landed; Groups 1+2+3 all pass.
 
 Three Task 2 carry-forward issues resolved in this commit:
