@@ -737,7 +737,7 @@ Both files created and validated:
 
 ## Task 12 — Phase-done: BEHAVIOR_CONTRACT 4-edit bundle + ROADMAP row 13 done + STATE.md advance + ADR updates + 6-gate verification
 
-**Commits:** `TBD` — `phase 13: phase-done — BEHAVIOR_CONTRACT 4-edit bundle + 6 gates green + ADR-0127 v2 update + ADR-0128 new + ROADMAP done + STATE advance`
+**Commits:** `a05bb6f` — `phase 13: phase-done — BEHAVIOR_CONTRACT 4-edit bundle + 6 gates green + ADR-0127 v2 update + ADR-0128 new + ROADMAP done + STATE advance`
 
 **Notes:** Task 12 carries the original phase-done scope (BEHAVIOR_CONTRACT 4-edit bundle, ROADMAP flip, STATE advance, 6-gate verification) PLUS the user-approved Task 11 pivot doc-fix scope (B1-B5 doc corrections, new ADR-0128, beads issue EGO-1).
 
