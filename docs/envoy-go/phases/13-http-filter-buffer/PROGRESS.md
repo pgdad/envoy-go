@@ -373,7 +373,7 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.008s
 
 ## Task 4 — `DecodeData` body + `maybeAddContentLength` mirror + `DecodeTrailers` body + Groups 4+5+6 unit tests
 
-**Commits:** TBD — `phase 13: buffer DecodeData body + maybeAddContentLength mirror + DecodeTrailers + Groups 4-6 tests`
+**Commits:** `280b658` — `phase 13: buffer DecodeData body + maybeAddContentLength mirror + DecodeTrailers + Groups 4-6 tests`
 **Notes:** TDD discipline applied: Groups 4+5+6 tests appended first; first run confirmed compile failure (`accumulated` field absent, `maybeAddContentLength` undefined); then `buffer.go` extended with `accumulated uint32` field + `DecodeData` body + `maybeAddContentLength` + `DecodeTrailers` body; all 6 groups PASS under `-race -count=1`.
 
 Framework adaptation notes:
