@@ -535,3 +535,33 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	11.051s
 $ go test -race -count=1 ./internal/filter/http/buffer/
 ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	1.010s
 ```
+
+## Task 6 — `cmd/envoy-go/main.go` register `buffer.New` under `buffer.TypeURL`
+
+**Commits:** `7a1e5c6` — `phase 13: cmd/envoy-go register buffer.New under buffer.TypeURL`
+**Notes:** Boot-time HTTP filter registry registration — the eighth `httpReg.Register` call per ADR-0125 boot-ordering discipline. Added `buffer` import alphabetically among the `filter/http/*` imports (after `filter_http` declaration, before `cors`). Added registration immediately after `router` line (between `router` and `cors`), maintaining router-first-then-alphabetical style per BRAINSTORM Decision 2. All build verification clean: `go build ./cmd/envoy-go/...`, `go vet ./cmd/envoy-go/...`, `golangci-lint run ./cmd/envoy-go/...` pass. Grep count `httpReg.Register` returns 8 as expected (was 7 at Task 1 precondition).
+
+**Outputs:**
+```
+$ go build ./cmd/envoy-go/...
+(clean — no output)
+
+$ go vet ./cmd/envoy-go/...
+(clean — no output)
+
+$ golangci-lint run ./cmd/envoy-go/...
+(clean — no output)
+
+$ grep -cE 'httpReg.Register' cmd/envoy-go/main.go
+8
+
+$ grep -nE 'httpReg.Register' cmd/envoy-go/main.go
+116:	httpReg.Register(router.TypeURL, router.New)
+117:	httpReg.Register(buffer.TypeURL, buffer.New)
+118:	httpReg.Register(cors.TypeURL, cors.New)
+119:	httpReg.Register(csrf.TypeURL, csrf.New)
+120:	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
+121:	httpReg.Register(fault.TypeURL, fault.New)
+122:	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
+123:	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
+```
