@@ -636,7 +636,7 @@ Step 4 — PROGRESS.md appended (this entry); commit staged.
 
 ## Task 9 — Fixture 0015 — `envoy.yaml` + `envoy-go.yaml` bootstraps (single-listener, three routes)
 
-**Commits:** `TBD` — `phase 13: fixture 0015 bootstraps — envoy.yaml + envoy-go.yaml (single-listener, three routes)`
+**Commits:** `bc42c9a` — `phase 13: fixture 0015 bootstraps — envoy.yaml + envoy-go.yaml (single-listener, three routes)`
 **Notes:** Created `test/fixtures/0015-http-buffer/envoy.yaml` (reference Envoy bootstrap, ~68 LoC) and `test/fixtures/0015-http-buffer/envoy-go.yaml` (envoy-go bootstrap, ~65 LoC). Both follow the 0014-http-csrf fixture structure. Single listener `l_main`; one virtual_host `vh_main`; three routes in longest-prefix-first order: `/route-disabled` (TPFC `BufferPerRoute{disabled: true}`), `/route-tighter` (TPFC `BufferPerRoute{buffer: {max_request_bytes: 131072}}`), `/` (listener-level Buffer `max_request_bytes: 1048576`). Go text/template placeholders `{{.AdminPort}}`, `{{.ListenerPort}}`, `{{.BackendPort}}` per existing fixture convention. envoy.yaml uses STRICT_DNS + `host.docker.internal` + `dns_lookup_family: V4_ONLY` per ADR-0010 + phase-11 IMPL note. envoy-go.yaml uses STATIC + `127.0.0.1` per ADR-0010 fixture convention.
 
 Validation note: PLAN §step 3 used `<ADMIN_PORT>` angle-bracket placeholders in its sed command, but the existing fixture convention (and runner template renderer) uses Go text/template `{{.AdminPort}}` syntax. The sed substitution was adapted to match actual file content: `s/{{\.AdminPort}}/19990/` etc. Both bootstraps validate cleanly.
