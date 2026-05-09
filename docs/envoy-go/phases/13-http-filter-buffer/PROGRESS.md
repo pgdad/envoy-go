@@ -588,3 +588,48 @@ ok  	github.com/esalaine/envoy-go/test/differential	0.081s
 $ grep -cE 'HTTPBuffer' test/differential/fixture/fixture.go
 2
 ```
+
+## Task 8 — Fixture 0015 — `backends/backend.go` (Go HTTP backend echoing inbound headers as JSON)
+
+**Commits:** `[SHA-to-fill]` — `phase 13: fixture 0015 backend — Go HTTP echo serving inbound headers as JSON`
+**Notes:** Created `test/fixtures/0015-http-buffer/backends/backend.go` (~55 LoC) per PLAN lines 1574-1633 verbatim. Single-endpoint (`/`) HTTP/1.1 backend accepting any method; drains inbound body (consuming both Content-Length and chunked bodies); echoes inbound request method + path + headers (lowercased per Envoy wire-form discipline) as JSON in response body. Status 200; Content-Type: application/json; Content-Length set explicitly to JSON body length. Required `--port` flag (log.Fatal if omitted). Mirrors SPEC §11.5 python BaseHTTPRequestHandler echo behavior verbatim in Go. Load-bearing for fixture scenario 6's Content-Length: 10240 assertion at backend boundary per maybeAddContentLength mirror per SPEC §11.8-CL.
+
+Smoke test (step 2): Backend compiles + runs; `curl -s -H "X-Test: foo" http://127.0.0.1:18192/anypath` returns valid JSON with `headers["x-test"] == "foo"` (lowercase header key). Lowercase canonical header keys via `strings.ToLower(k)` per Envoy discipline — verified.
+
+**Outputs:**
+
+Step 1 — build verification:
+```
+$ go build ./test/fixtures/0015-http-buffer/backends/...
+(clean — no output)
+```
+
+Step 2 — smoke test:
+```
+$ go run ./test/fixtures/0015-http-buffer/backends --port 18192 &
+$ sleep 2
+$ curl -s -H "X-Test: foo" http://127.0.0.1:18192/anypath
+{"headers":{"accept":"*/*","user-agent":"curl/8.5.0","x-test":"foo"},"method":"GET","path":"/anypath"}
+$ kill $PID
+```
+
+Step 2 verification — JSON valid + header key lowercased:
+```
+$ go run ./test/fixtures/0015-http-buffer/backends --port 18192 &
+2026/05/09 17:50:08 0015-http-buffer backend listening on :18192
+$ curl -s -H "X-Test: foo" http://127.0.0.1:18192/anypath | jq .
+{
+  "headers": {
+    "accept": "*/*",
+    "user-agent": "curl/8.5.0",
+    "x-test": "foo"
+  },
+  "method": "GET",
+  "path": "/anypath"
+}
+$ curl -s -H "X-Test: foo" http://127.0.0.1:18192/anypath | jq '.headers["x-test"]'
+"foo"
+$ kill $PID
+```
+
+Step 4 — PROGRESS.md appended (this entry); commit staged.
