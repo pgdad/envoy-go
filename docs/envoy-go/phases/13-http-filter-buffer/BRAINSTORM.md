@@ -670,13 +670,13 @@ The rest of §2.5 (5th canonical per-route discipline, ADR-0125 anchor, no amend
 1. If `endStream` → return `Continue` (header-only request; filter does no work).
 2. Resolve `(effectiveMax, disabled)` via `RequestRouteConfig().Resolve("buffer", routeIdx)` + listener fallback.
 3. If `disabled` → set `f.passthrough = true`; return `Continue` (per-route bypass; `DecodeData` short-circuits).
-4. Else: store `effectiveMax`, store `f.headersRef = headers` (for §maybeAddContentLength mirror in step 7); return **`StopIteration`** (mirrors Envoy line 66 — holds headers until end-stream so that the upstream-side observable is the complete request with corrected Content-Length).
+4. Else: store `effectiveMax`, store `f.headersRef = headers` (for the `maybeAddContentLength` mirror; see helper below); return **`StopIteration`** (mirrors Envoy line 66 — holds headers until end-stream so that the upstream-side observable is the complete request with corrected Content-Length).
 
 `DecodeData(data, endStream)`:
 1. If `f.passthrough` → return `DataContinue` (route disabled; forward chunks raw; framework's safety-net cap never engages because we never return `DataStopIterationAndBuffer`).
 2. `f.accumulated += len(data)`.
 3. If `f.accumulated > f.effectiveMax` → **mid-stream overflow**: increment HCM `downstream_rq_too_large` (see §12.5); call `SendLocalReply(413, "Payload Too Large", connClose)`; return `DataStopIterationNoBuffer` (discards the partial buffer; framework's `beginLocalReply` runs the encode chain immediately).
-4. If `endStream`: invoke `maybeAddContentLength` (step 7) to inject `Content-Length: <accumulated>` on the held headers when the request was chunked; release the held headers + body; return `DataContinue`.
+4. If `endStream`: invoke `maybeAddContentLength` (see helper below) to inject `Content-Length: <accumulated>` on the held headers when the request was chunked; release the held headers + body; return `DataContinue`.
 5. Else (in-flight chunk; more to come): return `DataStopIterationAndBuffer` (accumulate; framework holds bytes per ADR-0076 §Decision (b)).
 
 `DecodeTrailers(trailers)`:
@@ -690,6 +690,8 @@ The rest of §2.5 (5th canonical per-route discipline, ADR-0125 anchor, no amend
 `OnDestroy`: no-op; buffer has no per-request resources to clean up.
 
 **Why this divergence is acceptable.** envoy-go's filter does work that Envoy delegates to HCM (byte-counting + 413 emission), but the WIRE OUTCOMES are byte-equivalent: status `413`, body `Payload Too Large` 17 bytes, 4-header set lowercase wire-form, `Connection: close`, plus the same `downstream_rq_too_large` counter increment (§12.5). The structural divergence is observable only via `maybeAddContentLength` semantics + trailer-arrival edge cases, which §6 fixture 0015 covers.
+
+**Race-at-1-MiB (carries §2.4 cap-layering analysis under v2).** §2.4 hypothesized that the framework's `filterBufferLimitBytes = 1 MiB` cap (ADR-0076 §Decision (b)) layers under the filter's own cap. Under v2 the filter does NOT call `setBufferLimit` (envoy-go has no such primitive per §4 invariant); instead the filter's `accumulated > effectiveMax` check at DecodeData step 3 races against the framework's safety-net cap that engages only when DecodeData returns `DataStopIterationAndBuffer` past 1 MiB. When `effectiveMax = 1 MiB` exactly, both checks would fire at the 1-MiB-plus-1-byte boundary; the filter wins because step 3 (`accumulated > effectiveMax` → `SendLocalReply` + `DataStopIterationNoBuffer`) executes before step 5 (the `DataStopIterationAndBuffer` return that would trip the framework cap). When `effectiveMax < 1 MiB` (e.g., `/route-tighter` 128 KiB override), the filter wins by an even larger margin. When `effectiveMax > 1 MiB` (out-of-scope per §2.3 + ADR-0126's parse-time `≤ 1 MiB` validation; rejected at boot), the framework cap would fire first — but this configuration cannot reach DecodeData. Net: §2.4's cap-layering analysis is preserved in spirit (framework cap remains the safety net under the filter's own cap), and the race resolves benignly in the only configuration that can occur at runtime.
 
 **Counter increment ordering** (load-bearing for differential):
 - HCM `downstream_rq_too_large` fires **once per overflowing request** on the chunk where `accumulated > effectiveMax`.
@@ -741,16 +743,18 @@ The 5-scenario matrix in §6.2 is restructured to drop the now-impossible Conten
 | 4 | Per-route disabled bypasses cap | `POST /route-disabled` body=2 MiB (above listener 1 MiB) | 200 + backend echo | `downstream_rq_2xx +1`, `downstream_rq_completed +1` |
 | 5 | Per-route tighter override fires | `POST /route-tighter` body=200 KiB (above 128 KiB override) | 100-Continue + 413 + `Payload Too Large` | `downstream_rq_4xx +1`, `downstream_rq_too_large +1`, `downstream_rq_completed +1` |
 
-**Plus a 6th assertion (cross-cutting, not a new request):** `Content-Length` injection on chunked-passthrough. Driver issues a 6th request `POST /` `Transfer-Encoding: chunked` body=10 KB; backend asserts the inbound request carries `Content-Length: 10240` (NOT chunked encoding). This exercises the `maybeAddContentLength` mirror per §12.4 Decision 6 v2.
+**Plus a 6th assertion (cross-cutting, not a new request):** `Content-Length` injection on chunked-passthrough. Driver issues a 6th request `POST /` `Transfer-Encoding: chunked` body=10 KB. **Expected: 200 + backend echo;** backend asserts the inbound request carries `Content-Length: 10240` (NOT chunked encoding). Counter delta for this 6th request: `downstream_rq_2xx +1`, `downstream_rq_completed +1` (no overflow; same shape as row 1). This exercises the `maybeAddContentLength` mirror per §12.4 Decision 6 v2.
 
 **Total fixture requests: 6 (was 5 in §6.2).** Counter equivalence: `downstream_rq_2xx +3`, `downstream_rq_4xx +3`, `downstream_rq_too_large +3`, `downstream_rq_completed +6`. No `buffer.*` counters asserted (none exist).
+
+**Empirical-pin cross-reference.** The 6-scenario matrix exercises the §12.3 dispositions as follows: scenario 2 (CL-known overflow) covers §12.3 P1 + P2 (cap predicate + 5 MiB-listener overflow) + P8's 100-Continue addendum; scenario 3 (chunked overflow against per-route cap) and scenario 5 (CL-known overflow against per-route cap) jointly cover §12.3 P9's chunked + CL-known overflow against the 128 KiB override + the absence-of-100-Continue-on-chunked half of P8; scenario 4 covers §12.3 P4 (per-route disabled bypass); the 6th cross-cutting CL-injection request covers §12.1 fact 5 (chunked → fixed-CL conversion via `maybeAddContentLength`). §12.3 P3 (oneof rejection mechanism) is exercised by the G2 PerRoute parse unit-tests (§12.7 below), not by fixture 0015.
 
 ### 12.7 Re-framed §1.1 deliverable count + §7 ADR roster + §11 obligations
 
 **§1.1 deliverables (was 11; now 10):**
 - Items 1, 2, 3, 4, 5, 6, 8, 9, 10 unchanged (with 10 amended: stat-table delta from "29→31" to "29 stays at 29"; new subsection still authored documenting buffer's reuse of `downstream_rq_too_large`; forward-pointer subsection still authored).
-- Item 7 (stat surface 29→31 extension) **retired** (§12.5).
-- Item 11 (4 ADRs) becomes **item 10 prime: 3 ADRs** (§12.7 below).
+- Item 7 (stat surface 29→31 extension) **retired** (§12.5). Items 8, 9, 10, 11 from the original §1.1 list are renumbered downward by one (8→7, 9→8, 10→9, 11→10) to close the gap.
+- Item 11 (was 4 ADRs) is **renumbered as item 10** in the new 10-bullet list AND **content-amended to 3 ADRs** (§12.7 below).
 
 **§7 ADR roster (was 4, now 3):**
 - **ADR-0125** unchanged — package shape + boot registration + per-route disabled-OR-override 5th canonical shape (PGV mechanism amendment per §12.4 Decision 5 v2 surfaces here).
