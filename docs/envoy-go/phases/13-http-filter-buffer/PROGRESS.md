@@ -668,7 +668,7 @@ envoy-go ready
 
 ## Task 11 — Fixture 0015 — `driver/driver.go` — 6-scenario sequential orchestration
 
-**Commits:** TBD
+**Commits:** `bfee62e` — `phase 13: fixture 0015 driver — 6-scenario sequential orchestration + ADR-0127 v2 synchronous-HCM dispatch fix`
 **Notes:** Replaced the Task 7 driver stub with the full 6-scenario sequential driver (~200 LoC). Three additional files were modified to make the fixture pass:
 
 1. `test/fixtures/0015-http-buffer/driver/driver.go` — replaced stub body with full `driveProxy` function: 6 scenarios using shared `http.Transport{DisableKeepAlives: true}` + `http.Client`; `normalizeListenerAddr` to fix `[::]:N` → `127.0.0.1:N` on Linux dual-stack. All 200-responses log structural JSON shape `method + path` (not raw body) for determinism across proxies. 413-responses call `emit413Headers` emitting `content-length` + `connection` in canonical order. Scenario 6 asserts `cl-inject` from parsed backend JSON echo. `Expect: 100-continue` removed from scenarios 2 + 5 — `connection.go` line 122 sends 417 for ANY `Expect:` header before the filter chain runs; omitting keeps both proxies on the 413 path. `truncateBody` helper removed (replaced by JSON parsing for all 200-response scenarios). `scrapeHCMStats` retained via `var _ = scrapeHCMStats` (no filter-specific counters yet).
