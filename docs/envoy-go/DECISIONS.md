@@ -5854,6 +5854,18 @@ Phase 13 lands `envoy.filters.http.buffer` as the 6th §9 production HTTP filter
 - Canonical 5-shape per-route table extends ADR-0073 + ADR-0117 + ADR-0124 with the disabled-OR-override sum-type; future per-route disciplines for additional §9 family rows can pick from the now 5-shape catalog or codify a new shape.
 - The "disabled-OR-override" sum-type is the FIRST per-route discipline to use a structural sum type (oneof) rather than a flat replace-all-fields wholesale override; the discriminator is the proto oneof case rather than a runtime type assertion. This sets a precedent for future per-route disciplines that need a "shortcut" alongside an "override" form.
 
+## Amendment (per phase 14 SPEC §1.1 amendment 4 + ADR-0131)
+
+Phase 14 compressor is the SECOND row to use the disabled-OR-override 5th canonical per-route discipline. Confirmed reusability + adds one structural clarification:
+
+**(viii) Per-route override field surface is FILTER-SPECIFIC and MAY be NARROWER than the listener-level config wholesale.** Phase 13 buffer's `BufferPerRoute.buffer.max_request_bytes` is wholesale-equivalent to listener-level `Buffer.max_request_bytes` (1 field on each side). Phase 14 compressor's `CompressorPerRoute.overrides.response_direction_config: ResponseDirectionOverrides` carries ONLY `remove_accept_encoding_header` (BoolValue), while listener-level `Compressor.response_direction_config: ResponseDirectionConfig` carries 5 fields (`common_config` + `disable_on_etag_header` + `remove_accept_encoding_header` + `uncompressible_response_codes` + `status_header_enabled`). Per-route override of `min_content_length`, `content_type`, `disable_on_etag_header`, `uncompressible_response_codes`, and `status_header_enabled` is STRUCTURALLY IMPOSSIBLE in Envoy v1.37.2's compressor proto. The wholesale-not-merge semantic of ADR-0073 applies WITHIN the override-field envelope (i.e., per-route `remove_accept_encoding_header: true` REPLACES listener-level `remove_accept_encoding_header: false` wholesale, not a 3-state merge); fields not present in the per-route override proto cannot be overridden at all (they inherit listener-level by structural impossibility).
+
+**(ix) Per-route stats SHARED with listener-level — extended to the disabled-OR-override discipline.** Phase 13 buffer's per-route stats are SHARED-vacuous (no filter-specific counters at all). Phase 14 compressor's per-route stats are SHARED-non-vacuous: 17 counters live at the listener-level scope (`compressor.<library>.<codec>.[response.]<counter>`); per-route-active routes increment these listener-level counters (the `disabled: true` route DOES NOT increment any compressor counter — wholly inactive; the per-route rmAE-override route increments the listener-level counters as if it were a listener-level request). Future stateful per-route filters (e.g., per-route library-swap if multi-codec lands) MAY introduce per-route counter scopes; the ADR-0125 5th canonical discipline does NOT mandate SHARED-stats vs INDEPENDENT-stats.
+
+**(x) Future per-route disciplines using the 5th canonical disabled-OR-override sum-type SHOULD enumerate the override-field-surface explicitly in their own ADR.** ADR-0125 is the discipline-codification ADR; per-row override-field surfaces are filter-specific and live in each row's package-shape ADR (phase 13 buffer at ADR-0125 §Decision (vi); phase 14 compressor at ADR-0129 + ADR-0131 §Decision (vi) for the framework primitive consequence).
+
+ADR-0125's canonical 5-shape per-route table extends to: data-only-most-specific (ADR-0073, used by cors / fault); multi-tier-evaluation via ResolveAllTiers (ADR-0110, used by header_mutation); stateful-override-with-INDEPENDENT-stats (ADR-0117, used by local_ratelimit); data-only-override-with-SHARED-stats (ADR-0124, used by csrf); disabled-OR-override-sum-type-with-SHARED-stats (THIS ADR-0125, used by buffer @ phase 13 + compressor @ phase 14).
+
 ---
 
 ## ADR-0126: `compiledConfig` shape + parse-time `max_request_bytes ≤ 1 MiB` validation + cap-layering rationale + PGV-mirror filter-internal validation discipline
@@ -5980,3 +5992,347 @@ Both primitives land in `internal/filter/hcm/connection.go`'s `dispatchRequest` 
 - Future filters that want chunked → fixed-CL conversion at the upstream boundary (i.e., write `Content-Length` into `req.Header` in `DecodeHeaders`) can rely on these primitives — no additional framework surgery needed.
 - Future filters that finalize on `endStream=true` in `DecodeData` (any terminal processing: content injection, signing, hash finalization) can rely on the synthetic empty-terminal primitive to receive `endStream=true` even on chunked bodies that end with a zero-data EOF read.
 - The `lastEndStreamFired` sentinel is `dispatchRequest`-local (not exported); future filter authors do not need to know about it — the guarantee is that `RunDecodeData` is always called with `endStream=true` exactly once per bodied request.
+
+---
+
+## ADR-0129: `internal/filter/http/compressor/` package shape — single-token directory + ENCODER+DECODER `HTTPFilter` value + 17-counter `filterStats` + boot-registration ordering
+
+**Status:** Accepted
+**Date:** 2026-05-10
+**Doctrine:** Phase-14 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in-task:** Task 2 (this commit; package skeleton + parsePerRoute first lands).
+
+### Context
+
+Phase 14 lands `envoy.filters.http.compressor` as the 7th §9 production HTTP filter. The package shape decision (directory naming + file split + filter-struct + factory signature) builds on the cors / fault / header_mutation / localratelimit / csrf / buffer precedents. Per phase 14 SPEC §1.1 + §6.1: directory `compressor/` (single-token; matches buffer/csrf/cors precedent — proto type-name is single token); ENCODER+DECODER HTTPFilter value (NEW: phase 14 is the FIRST §9 row to be encoder-primarily but with non-vacuous decode side; `Encoder: f, Decoder: f` SAME *filter instance handles both directions); 17-counter `filterStats` struct (per §1.1 amendment 3 + ADR-0132); boot-registration ordering alphabetical-after-buffer per ADR-0072 stylistic.
+
+### Decision
+
+**(i)** Package directory + Go-package identifier are both `compressor` (single token; matches cors/fault/csrf/buffer precedent).
+
+**(ii)** Files: `doc.go`, `compressor.go`, `compressor_test.go`, `fuzz_test.go`. Single-file `compressor.go` per phase-14 SPEC §4.1; PLAN may split if surface exceeds ~500 LoC (~2-3-way split into `codec.go` + `headers.go` + `perroute.go` is the natural split shape if needed).
+
+**(iii)** Public surface: `TypeURL` const + `New` HTTPFilterFactory. Plus internal package consts: `filterName = "envoy.filters.http.compressor"`, `gzipLibraryTypeURL`.
+
+**(iv)** ENCODER+DECODER `HTTPFilter` value: `Decoder: f, Encoder: f` (SAME *filter instance). FIRST §9 row to use this shape — phase 12 csrf and phase 13 buffer were decoder-only (`Encoder: nil`); phase 9 fault, phase 10 header_mutation, phase 11 local_ratelimit have both-sides with explicit no-op encoder methods. Phase 14 needs both sides because: (a) decode-side is non-vacuous (Accept-Encoding parser + per-route resolve + maybe-strip-AE per §1.1 amendment 4 + §6.4); (b) encode-side is the algorithmic core. The same *filter instance services both sides; per-stream state (acceptedEncoding, perRoute, willCompress, passthrough) lives on the *filter struct.
+
+**(v)** Boot registration ordering: `router → buffer → compressor → cors → csrf → envoygotest → fault → header_mutation → localratelimit → Freeze` (alphabetical-after-router per ADR-0072 / ADR-0100 / ADR-0114 / ADR-0120 / ADR-0125 stylistic discipline). Compressor inserts between `buffer` and `cors` to maintain alphabetical ordering.
+
+**(vi)** 17-counter `filterStats` struct registered at `New` factory time per HCM stat_prefix:
+- 6 Accept-Encoding-cluster counters (header_compressor_overshadowed, header_compressor_used, header_identity, header_not_valid, header_wildcard, no_accept_header — NOT split per direction)
+- 1 ETag-skip counter (not_compressed_etag)
+- 5 response-side counters (response_compressed, response_content_length_too_small, response_not_compressed, response_total_compressed_bytes, response_total_uncompressed_bytes — active in MVP)
+- 5 request-side counters (request_compressed, request_content_length_too_small, request_not_compressed, request_total_compressed_bytes, request_total_uncompressed_bytes — always-zero in MVP since `request_direction_config` silent-ignored; registered for byte-equivalent stat scrape with reference Envoy).
+
+Stat path: `http.<HCM_stat_prefix>.compressor.<library_name>.gzip.[response.]<counter>` per ADR-0132 §Decision (i); rendered via existing Rule SN2 (no new SN10 rule per §1.1 amendment 3).
+
+**(vii)** Per-route discipline: 5th canonical disabled-OR-override per ADR-0125 amendment §(viii); per-route override surface is filter-specific and NARROWER than listener-level (only `remove_accept_encoding_header` per `ResponseDirectionOverrides` proto). See ADR-0125 amendment paragraphs (viii)-(x) + ADR-0131 §Decision (vi).
+
+### Alternatives considered
+
+(a) Split `compressor.go` into multiple files at SPEC time — deferred to PLAN per phase-13 buffer §12 D2 precedent. SPEC enumerates the file surface; PLAN may split if test readability benefits.
+
+(b) Decoder-only HTTPFilter with no-op encode side — REJECTED: encode-side is the algorithmic core (gzip-encode + OverwriteBody); the SAME *filter instance services both sides per phase-09 fault / phase-11 local_ratelimit precedent. Setting `Encoder: nil` would require a separate encoder-only struct, which complicates per-stream state sharing (the encode-side needs to know what the decode-side parsed about Accept-Encoding).
+
+(c) Encoder-only HTTPFilter (`Decoder: nil`) — REJECTED: decode-side is non-vacuous (AE-parser + per-route resolve + maybe-strip-AE). Setting `Decoder: nil` would force the AE-parsing into encode-side at EncodeHeaders, but the AE header is on the REQUEST not the response — by the time encode-side fires, the request headers are no longer accessible. Decode-side AE-parse + state cache is the structurally-honest shape.
+
+(d) Per-route INDEPENDENT stats (mirroring phase-11 ADR-0117) — REJECTED: phase-14 emits a single 17-counter family at the listener level; per-route routes increment the listener-level counters (mirrors phase-12 csrf ADR-0124 + phase-13 buffer ADR-0125 SHARED-stats discipline). Per-route INDEPENDENT would require multiplying counter registrations per per-route entry, which breaks the byte-equivalent-stat-scrape contract with reference Envoy (which emits at listener-level only).
+
+### Consequences
+
+- Filter set extends from 8 → 9: `{buffer, compressor, cors, csrf, envoygotest, fault, header_mutation, localratelimit, router}`. ADR-0074 (filter set) absorbs the 9th member additively; no in-place edit.
+- The ENCODER+DECODER `Decoder: f, Encoder: f` SAME-instance discipline is the FIRST in §9 family to express both-sides-with-non-vacuous-both-paths structurally. Future filters whose decode + encode paths are both load-bearing (e.g., the future decompressor — request-body decompression with response-side passthrough; bandwidth_limit; jwt_authn validation+injection) follow this shape.
+- The 17-counter filterStats discipline (12 active + 5 vacuous) is the largest stat surface per filter to date in §9 family-rows (phase 11 had 4; phase 12 had 3; phase 13 had 0; phase 14 has 17).
+- Boot-registration ordering compressor-between-buffer-and-cors is the 9-entry list canonical position.
+
+---
+
+## ADR-0130: `compiledConfig` shape + 8 consumed/12 ignored field decomposition + codec-library Any-unmarshal-and-dispatch + parse-rejection of unknown TypeURL + Gzip compression-level mapping table + envoy-go-only error wording
+
+**Status:** Accepted
+**Date:** 2026-05-10
+**Doctrine:** Phase-14 §9 family-row. ADR-0044 ADR-on-impl convention; ADR-0040 silent-ignore discipline.
+**Lands-in-task:** Task 2.
+
+### Context
+
+Phase 14 consumes 6 listener-level fields + 2 codec-library fields = 8 effective consumed fields across the listener-level proto graph; silent-ignores 9 listener-level + 3 codec = 12 silent-ignored; parse-rejects 1 case (unknown `compressor_library` TypeURL). Per phase 14 SPEC §1.1 amendment 1 (the BRAINSTORM "8/9/1" headline survives but with revised bookkeeping per the §1.1 + §11.3 + §11.5 + §11.7 + §11.10 + §11.11 + §11.13 + §11.15 amendments). The proto v1.37.2 schema:
+- `Compressor` (9 top-level fields): consumed `compressor_library` + `response_direction_config` (5 sub-fields actively consumed: min_content_length + content_type + disable_on_etag_header + remove_accept_encoding_header + uncompressible_response_codes); silent-ignored 4 deprecated mirrors + runtime_enabled + choose_first + request_direction_config + status_header_enabled (added in v1.37.2 per §1.1 amendment 1) + response_direction_config.common_config.enabled (per §1.1 amendment 2).
+- `Gzip` (5 fields): consumed compression_level + compression_strategy; silent-ignored memory_level + window_bits + chunk_size.
+- `CompressorPerRoute`: oneof; per-route surface narrower than listener — see §1.1 amendment 4 + ADR-0125 amendment.
+
+### Decision
+
+**(i) `compiledConfig` shape:**
+```go
+type compiledConfig struct {
+    libraryName                 string                // empty allowed; embedded in stat namespace per ADR-0132
+    gzip                        *compiledGzipConfig   // gzip-only MVP; non-nil
+    minContentLength            uint32                // default 30 if proto unset; ≥ 1 if set
+    contentTypes                []string              // default 8-entry list; lowercase prefix-matched per §11.6
+    disableOnEtagHeader         bool                  // default false; dual-mode per §1.1 amendment 6
+    removeAcceptEncodingHeader  bool                  // default false; per-route override allowed
+    uncompressibleResponseCodes map[uint32]struct{}   // default empty per §11.2; valid range [200, 600) per PGV
+}
+
+type compiledGzipConfig struct {
+    level       int   // [-1, 9]; mapped from Envoy enum per §Decision (iv) below
+    huffmanOnly bool  // true if compression_strategy == HUFFMAN_ONLY
+}
+
+type compiledPerRoute struct {
+    disabled                            bool   // exclusive with override
+    removeAcceptEncodingHeaderOverride  *bool  // exclusive with disabled; nil unless set
+}
+```
+
+**(ii) Codec-library Any-unmarshal-and-dispatch:** `New` factory invokes `unmarshalCompressorLibrary(library *corev3.TypedExtensionConfig) (*compiledGzipConfig, libraryName string, error)`:
+1. If `library == nil` → error `"compressor: compressor_library is required"` (PGV-mirror per Envoy proto required constraint).
+2. Extract `library.GetTypedConfig()`; check `TypeUrl`.
+3. If `TypeUrl != gzipLibraryTypeURL` → error `"compressor: unsupported compressor_library TypeURL <url>; phase-14 MVP supports only envoy.extensions.compression.gzip.compressor.v3.Gzip"`.
+4. Else: `library.GetTypedConfig().UnmarshalTo(&gzipPB)` → `buildCompiledGzipConfig(&gzipPB)` → return `(*compiledGzipConfig, library.GetName(), nil)`.
+
+The dispatch is internal to the `compressor` package; future codec additions (brotli, zstd) extend with `unmarshalBrotliLibrary` / `unmarshalZstdLibrary` helpers + a registry pattern WITHIN the package OR a sub-package split.
+
+**(iii) Parse-rejection of unknown `compressor_library` TypeURL:** envoy-go-only error wording per the (ii)(3) clause above. Mirrors phase-13 buffer's `max_request_bytes > 1 MiB` envoy-go-only-check pattern (ADR-0126).
+
+**(iv) Gzip compression-level mapping table** (Envoy `Gzip.CompressionLevel` enum → Go `compress/gzip` level int):
+
+| Envoy enum | Go gzip constant | Numeric level |
+|---|---|---|
+| `DEFAULT_COMPRESSION` (0) | `gzip.DefaultCompression` | -1 |
+| `BEST_SPEED` / `COMPRESSION_LEVEL_1` (1) | `gzip.BestSpeed` | 1 |
+| `COMPRESSION_LEVEL_2..8` (2-8) | (no constant) | 2-8 |
+| `BEST_COMPRESSION` / `COMPRESSION_LEVEL_9` (9) | `gzip.BestCompression` | 9 |
+
+`gzip.NewWriterLevel` accepts any int ∈ [-1, 9]; numeric-passthrough is correct for levels 2-8.
+
+**(v) `compression_strategy` mapping:** only `HUFFMAN_ONLY` is honored — sets `compiledGzipConfig.huffmanOnly = true`; the filter constructs `gzip.Writer` via `gzip.NewWriterLevelDict` or equivalent that respects `huffmanOnly`. All other strategies (`DEFAULT_STRATEGY`, `FILTERED`, `RLE`, `FIXED`) collapse to gzip default — `huffmanOnly = false`. Go's `compress/gzip` does not expose libz-equivalent strategy knobs at fine granularity; the HUFFMAN_ONLY mode is the only one expressible via Go stdlib.
+
+**(vi) PGV-mirror error wording:** envoy-go-own clear-text per planner-time decision 3 + phase 11 ADR-0115 + phase 12 ADR-0121 + phase 13 ADR-0126 precedent. Specifically:
+- `"compressor: invalid typed_config: <wrap>"` — Any-unmarshal failure.
+- `"compressor: compressor_library is required"` — missing library.
+- `"compressor: unsupported compressor_library TypeURL <url>; phase-14 MVP supports only envoy.extensions.compression.gzip.compressor.v3.Gzip"` — non-Gzip library.
+- `"compressor: uncompressible_response_codes value <code> outside valid range [200, 600)"` — PGV-mirror on uncompressible_response_codes range.
+- `"compressor: uncompressible_response_codes contains duplicate value <code>"` — PGV-mirror on uniqueness.
+
+Per-route variants prepend `"compressor per-route: "`.
+
+### Alternatives considered
+
+(a) Match Envoy's PGV envelope wording verbatim — rejected per planner-time decision 3 + phase 11/12/13 precedent (no canonical Envoy boot-log byte-equivalence target for envoy-go-only validations; envoy-go-own wording is operator-friendlier).
+
+(b) Hardcode the 8-entry default content_type list as a package-level var — accepted (the SPEC's preferred shape; package-level `var defaultContentTypes = []string{"application/javascript", ...}` initialized at init-time).
+
+(c) Per-route library swap honored at parse — REJECTED per §1.1 amendment 4; per-route `overrides.compressor_library` is silent-ignored at parse + runtime; envoy-go uses listener-level library regardless of per-route override. Future codec-extension phase MAY revisit.
+
+(d) Strict per-Envoy-proto-default minContentLength=30 vs operator-friendly default-0 — accepted per §11.9 empirical (default IS 30; operators expecting "no minimum" are mistaken; ADR mirrors Envoy verbatim).
+
+### Consequences
+
+- The `compiledConfig` shape's 5 listener-level fields + the codec-library `compiledGzipConfig` reference cover all consumed listener-level state. Per-route `compiledPerRoute` adds the rmAE-override slot.
+- Future codec phases AMEND THIS ADR in-place to expand the recognized TypeURL set + add codec-library dispatch helpers. The dispatch shape from (ii) is designed to admit additions without filter-package surgery.
+- The PGV-mirror discipline at (vi) extends the phase 11/12/13 precedent: envoy-go-own clear-text on filter-internal validations; deferred-to-Envoy on standard PGV constraints (proto-decoder rejects malformed messages; `parsePerRoute` defensively re-checks for unit-test coverage).
+- Operator divergence-window: configs setting `Compressor.compressor_library.typed_config.@type = "type.googleapis.com/envoy.extensions.compression.brotli.compressor.v3.Brotli"` (or similar non-Gzip) FAIL to load on envoy-go; load on Envoy. Documented at BEHAVIOR_CONTRACT phase-14 forward-pointer notes.
+- The `huffmanOnly` strategy collapse is observable in compressed-byte output (HUFFMAN_ONLY produces measurably-different bytes from the default strategy); the per-counter `response_total_compressed_bytes` differential will reflect this when configured.
+
+---
+
+## ADR-0131: Body algorithm Path B (buffer-then-compress) + wire-shape divergence + `EncoderFilterCallbacks.OverwriteBody(b []byte)` framework primitive + min_content_length late-revert anomaly forward-pointer
+
+**Status:** Accepted
+**Date:** 2026-05-10
+**Doctrine:** Phase-14 §9 family-row. ADR-0044 ADR-on-impl convention. Co-anchors with ADR-0125 amendment + ADR-0128 (decode-side framework deltas precedent).
+**Lands-in-task:** Task 4 (framework primitive lands first; subsequent tasks consume).
+
+### Context
+
+Phase 14 compressor's body algorithm operates on the response side via `EncodeData`; envoy-go's encode-chain framework at `internal/filter/hcm/connection.go:467-475` (H1) + `internal/filter/hcm/h2dispatch.go:303-315` (H2) invokes `RunEncodeData(ctx, resp.Body, true)` ONCE with the full response body in a single call, `endStream=true`. The encode chain is non-streaming; HCM materializes `resp.Body []byte` upstream-side and the filter sees the whole body at once. Combined with `writeH1Reply` (`internal/filter/hcm/codec.go:74-119`) unconditionally rewriting `Content-Length: <len(body)>` on the wire (line 87-89), the framework as-is forces **Path B (buffer-then-compress)**: the filter operates on the already-accumulated `resp.Body`, gzip-encodes in one shot, and replaces the body via a new framework primitive.
+
+Phase 14 SPEC §3 framework survey (executed at SPEC drafting time, 2026-05-10): the existing `EncoderFilterCallbacks` interface (`internal/filter/http/callbacks.go:68-81`) carries no body-mutation primitive. The chain dispatch (`internal/filter/http/chain.go:336`) passes `data []byte` BY VALUE to `f.EncodeData(data, endStream)` and ignores any filter-side replacement; HCM reads `resp.Body` directly post-chain. **Path A FIRES** — phase 14 introduces `EncoderFilterCallbacks.OverwriteBody(b []byte)` as a SYMMETRIC encode-side primitive mirroring phase-13 ADR-0128's decode-side primitives (synthetic empty-terminal `RunDecodeData` + post-body Content-Length reconciliation).
+
+### Decision
+
+**(i)** Body algorithm is Path B: buffer-then-compress. `EncodeHeaders` runs the skip-decision sequence (§6.6); on the compress path mutates response headers (Content-Encoding, Vary-append, ETag-strong-strip per mode-a, Content-Length-strip). `EncodeData` on `f.willCompress = true + endStream = true + len(data) >= min_content_length` gzip-encodes via `gzip.NewWriterLevel(buf, level).Write(data).Close()` and emits via `cb.OverwriteBody(buf.Bytes())`.
+
+**(ii)** Wire-shape divergence-window from reference Envoy (deliberate; documented at BEHAVIOR_CONTRACT phase-14 forward-pointer notes per §13.4): envoy-go emits `Content-Encoding: gzip`, `Content-Length: <gzipped-length>`, NO `Transfer-Encoding`. Reference Envoy v1.37.2 emits `Content-Encoding: gzip`, `Transfer-Encoding: chunked`, NO `Content-Length` (confirmed at SPEC §11.9 — observed across body sizes 30 / 1024 bytes; chunked emission is universal on the compressed path). Decompressed body bytes are byte-equivalent (gzip is well-defined; both libraries decode identically). Compressed body bytes are NOT byte-equivalent (Go `compress/gzip` and Envoy libz make different block-boundary + Huffman-tree choices, plus differ in gzip-header `XFL` and `OS` bytes per §11.14).
+
+**(iii)** Forward-pointer to a future encode-side streaming framework phase that lands `writeH1Reply` chunked-output mode + `EncoderFilterCallbacks.EmitChunk` + chunk-by-chunk `RunEncodeData` invocation in HCM. The forward-pointer phase is the natural amender for the wire-shape divergence-window — analogous to phase-13's cap-promotion forward-pointer for the `max_request_bytes ≤ 1 MiB` divergence.
+
+**(iv)** Differential fixture's allow-list excludes `content-length` value comparison + `transfer-encoding` presence on compressed scenarios per §7.3 + ADR-0133. Decompressed-byte assertion via `compress/gzip.NewReader` is the load-bearing body-equivalence axis.
+
+**(v)** Compressed-body counter (`response_total_compressed_bytes`) per-counter assertion uses tolerance discipline per ADR-0133 §Decision (iii); exact tolerance shape (window vs. boundary-only) is a planner-time decision (SPEC §12 deferred 2).
+
+**(vi)** **`EncoderFilterCallbacks.OverwriteBody(b []byte)` framework primitive** (NEW; locks via §3 framework survey). Interface method added to `internal/filter/http/callbacks.go:68-81` (existing interface) — 1 LoC. Concrete implementation at `internal/filter/http/chain.go::encoderCB.OverwriteBody`: stores `b` on a new `c.encodeBodyOverride []byte` field on `*FilterChain` + flips a `c.encodeBodyOverridden bool` sentinel. Accessor `*FilterChain.EncodeBodyOverride() ([]byte, bool)` returns `(c.encodeBodyOverride, c.encodeBodyOverridden)`. HCM-side post-RunEncodeData harvest at `internal/filter/hcm/connection.go:472,478,485` (H1) + `internal/filter/hcm/h2dispatch.go:310,328,323` (H2): after `chain.RunEncodeData` returns, call `chain.EncodeBodyOverride()` and substitute `resp.Body` with the override before the wire-write path (writeH1Reply / writeH2Reply) consumes it. Total framework delta: ~20-25 LoC. Symmetric to phase-13 ADR-0128's decode-side primitives (~34 LoC) in shape and load-bearing-ness. Filters MUST call `OverwriteBody` ONLY from inside `EncodeData` (the current envoy-go HCM runs the encode chain synchronously in the dispatch goroutine; calling from outside the EncodeData scope is undefined behavior).
+
+**(vii)** **min_content_length late-revert anomaly forward-pointer.** When `Content-Length` is unset at EncodeHeaders time AND len(body) emerges below threshold only at EncodeData (structurally rare in envoy-go's framework since resp.Body is pre-buffered; but possible in edge cases), the filter cannot revert headers (the chain has already committed them through ReconcileOrderedHeaders). Phase-14 SPEC §6.6 + §6.7 documents the EncodeHeaders preferred algorithm (gate on Content-Length when known); the late-stage gate at EncodeData with header-revert is a structural anomaly. Future cap-promotion or revert-headers-primitive phase MAY add a `RevertEncodeHeaders` callback (~10-15 LoC HCM delta); deferred per SPEC §12 deferred 3.
+
+### Alternatives considered
+
+(a) Streaming compression in MVP — REJECTED. Requires `writeH1Reply` chunked-output mode + new `EncoderFilterCallbacks.EmitChunk` primitive + chunk-by-chunk `RunEncodeData` in HCM; much larger scope. Phase-14 inherits the "framework as-is" constraint per BRAINSTORM Q4. Future encode-side streaming framework phase is the natural amender.
+
+(b) Path C: side-channel body-replace via per-stream encoded-body-staging field with no new primitive on the public interface — REJECTED. Per-stream staging would be opaque to filter authors (no clear-cut API for "I want to replace the body"); the explicit `OverwriteBody` method is structurally honest.
+
+(c) Path B with `*[]byte` (pointer-to-slice) `EncodeData` signature — REJECTED. Breaks the existing `StreamEncoderFilter.EncodeData` interface (an ADR-0071-class change); much larger ripple. The new method-on-callbacks shape is minimally invasive.
+
+(d) Late-revert at EncodeData with full RevertEncodeHeaders primitive in MVP — REJECTED per §Decision (vii). Structurally rare anomaly; defer to future framework phase.
+
+### Consequences
+
+- Framework deltas now exist at `internal/filter/http/callbacks.go` (+1 LoC interface method) + `internal/filter/http/chain.go` (~6-8 LoC for impl + per-stream field + accessor) + `internal/filter/hcm/connection.go` (~6-8 LoC H1 harvest) + `internal/filter/hcm/h2dispatch.go` (~6-8 LoC H2 harvest). Total ~20-25 LoC.
+- These are the FIRST encode-side framework deltas in envoy-go's history (decode-side precedent is phase-13 ADR-0128). Future encode-side body-mutation filters (decompressor, bandwidth_limit transform mode, codec phases) can rely on this primitive — no additional framework surgery needed.
+- The wire-shape divergence-window from reference Envoy (fixed-CL identity vs chunked) is the FIRST §9 family-row wire-shape divergence on the response side. Future encode-side streaming framework phase MAY revisit; phase-14 SPEC documents at §13.4 phase-14 forward-pointer notes.
+- The min_content_length late-revert anomaly is a forward-pointed deferred deliverable; phase-14 fixture 0016 sidesteps via direct_response routes that always carry Content-Length on the action's headers (the gate fires at EncodeHeaders, never at late-EncodeData).
+- The `OverwriteBody` primitive is goroutine-unsafe-by-design (called only from EncodeData, which runs in the dispatch goroutine); future async-resume framework phase would need to revisit if encode-side parking lands.
+- Documentation: BEHAVIOR_CONTRACT phase-14 forward-pointer notes + ADR-0131 itself; no separate framework-API doc (the existing `internal/filter/http/callbacks.go` GoDoc on `EncoderFilterCallbacks.OverwriteBody` is the API reference).
+
+---
+
+## ADR-0132: 17-counter stat surface + namespace shape `compressor.<library_name>.<codec>.[response.]<counter>` + Rule SN2 reuse (NO new SN10) + per-route SHARED stats discipline
+
+**Status:** Accepted
+**Date:** 2026-05-10
+**Doctrine:** Phase-14 §9 family-row. ADR-0044 ADR-on-impl convention; ADR-0061 stats Registry / SN1–SN8 flattening rules; ADR-0040 silent-ignore discipline.
+**Lands-in-task:** Task 6 (the 17-counter filterStats lands together with the BEHAVIOR_CONTRACT.md 29→46 stat-table extension).
+
+### Context
+
+Phase 14 emits 17 counters per `<HCM_stat_prefix>` per active gzip compressor library — split into 4 family clusters per phase-14 SPEC §1.1 amendment 3 + §11.5 empirical evidence. BRAINSTORM §1.1 item 7 + §2.7 hypothesized 11 counters + a new Prometheus tag-extractor Rule SN10; both halves are EMPIRICALLY REFUTED at SPEC §11.5 — actual is 17 counters; namespace flattens via existing Rule SN2 (no new SN10 needed).
+
+The actual reference Envoy v1.37.2 stat surface for one active gzip compressor under one HCM stat_prefix:
+- 6 `header_*` counters (Accept-Encoding cluster; not split per direction)
+- 1 `not_compressed_etag` counter (NEW; not in BRAINSTORM hypothesis)
+- 5 `request_*` counters (request-side; phase-14 MVP always-zero)
+- 5 `response_*` counters (response-side; active in phase-14 MVP)
+
+Stat path: `http.<HCM_stat_prefix>.compressor.<compressor_library.name>.<codec_short_name>.[response.]<counter>`. The `response.` infix appears IFF `response_direction_config` is set on the listener-level Compressor (per compressor.proto line 158-164; observed empirically at probeA — set; vs. probeC — unset → flat namespace).
+
+### Decision
+
+**(i)** Phase 14 envoy-go registers 17 counters at `New` factory time per HCM stat_prefix:
+- 6 header_* counters at `compressor.<library_name>.gzip.<header_counter>` (no direction infix);
+- 1 not_compressed_etag counter at `compressor.<library_name>.gzip.not_compressed_etag` (no direction infix);
+- 5 request_* counters at `compressor.<library_name>.gzip.request.<counter>` (always-zero in MVP);
+- 5 response_* counters at `compressor.<library_name>.gzip.response.<counter>` (active in MVP).
+
+The `<library_name>` segment is the operator-supplied `compressor_library.name` (empty allowed; emits with consecutive dots → `compressor..gzip.<counter>` shape; valid Prometheus name after SN2 flatten). The `<codec>` segment is the codec library's short stat-tag (`gzip` for the gzip codec library).
+
+**(ii)** Phase 14 envoy-go MUST always set `response_direction_config` (or its compiled equivalent) so the `response.` infix is present in stat names. The differential fixture's `envoy.yaml` + `envoy-go.yaml` MUST agree on the namespace shape; both sides set `response_direction_config` for byte-equivalent stat scrape.
+
+**(iii) NO new SN flattening rule.** The stat path `http.<HCM_stat_prefix>.<rest>` flattens via existing Rule SN2 (ADR-0061) into `envoy_http_<rest>` with label `envoy_http_conn_manager_prefix=<HCM_stat_prefix>`. With `<rest>` = `compressor.text_optimized.gzip.response.compressed`, SN2 produces `envoy_http_compressor_text_optimized_gzip_response_compressed{envoy_http_conn_manager_prefix="ingress_p14a"}` — verbatim observed at SPEC §11.5. NO codec-as-Prometheus-label extraction; the library name and codec are PART OF THE STATIC stat-name suffix. NO `internal/stats/name.go` flattenToProm switch surgery; NO new ADR-0118-class flattening rule.
+
+**(iv) Per-route stats SHARED with listener-level** (mirrors phase-12 csrf ADR-0124 + phase-13 buffer ADR-0125; DIVERGES from phase-11 local_ratelimit ADR-0117 INDEPENDENT). Per-route-active routes increment the listener-level counter scope; no per-route counter namespace.
+
+**(v) `compressor_library.name` is LOAD-BEARING for stat-namespace identity.** Operators with bare-Gzip configs (no `name:` set) emit stats under `compressor..gzip.<counter>` (consecutive dots; Prometheus rendering: `envoy_http_compressor__gzip_<counter>` with double-underscore). Phase-14 envoy-go MUST mirror this exact shape. `compiledConfig.libraryName string` is empty-allowed and threaded into the stat-name builder at `New` factory time.
+
+**(vi) `BEHAVIOR_CONTRACT.md ## Stat-name mapping` 29→46-name table extension** lands at the phase-done commit per ADR-0052 in-place edit authorisation. Verbatim Markdown patch per phase-14 SPEC §13.2 (17 new rows).
+
+**(vii) Twin-series filter discipline:** the 5 always-zero `request_*` counters land in envoy-go's allow-list AND are observable on both sides as zero-counters. NO twin-series filtering of `request_*` from the differential — both sides emit zero, byte-equivalently. Phase-14 inherits the existing twin-series discipline unchanged (per ADR-0118 + phase-13 SPEC §11.5).
+
+### Alternatives considered
+
+(a) Introduce a new SN10 flattening rule mapping `compressor.<library>.<codec>.<counter>` → `envoy_compressor_<counter>{library=<lib>, codec=<codec>, prefix=<HCM>}` with codec-as-tag — REJECTED per §11.5 empirical evidence. Reference Envoy emits at the `http.*` SN2-eligible path; the library + codec are PART OF THE STATIC stat-name suffix. A new SN10 with codec-tagging would DIVERGE from reference Envoy's shape.
+
+(b) Register only 12 active counters; filter the 5 always-zero `request_*` via twin-series-discipline allow-list — REJECTED. Reference Envoy registers all 17; envoy-go matches 1:1. Differential fixture asserts byte-equivalent counter scrape on all 17 names. Twin-series-filtering would need a per-counter exception in envoy-go's allow-list config; structurally honester to register all 17 (mirrors phase-13 buffer's "register-but-emit-zero" precedent for the disabled-route path's HCM-level counters).
+
+(c) Per-route INDEPENDENT stats (mirroring phase-11 ADR-0117) — REJECTED per ADR-0125 amendment + phase-12 csrf ADR-0124 + phase-13 buffer ADR-0125 SHARED-stats precedent. Phase-14 lacks stateful per-route resources requiring per-route counter namespaces.
+
+(d) Filter-package-local tag-extractor registration via `init()` — REJECTED per ADR-0118 §Alternative (b) precedent. The existing flattenToProm is a hardcoded switch with no registry; introducing one for a counter family that fits SN2 verbatim would be over-engineering.
+
+### Consequences
+
+- ADR-0061 (stats Registry / SN1–SN9 + LBP-1) gains NO amendment paragraph (UNLIKE phase-11 ADR-0118 which extended SN1-SN8 to SN1-SN9). Phase-14 fits the existing SN2 rule unchanged.
+- The 17-counter family is the largest stat surface per filter to date in §9 family-rows: phase 11 had 4 counters (SN9 introduced); phase 12 had 3 counters (SN2 reused); phase 13 had 0 (no stat extension); phase 14 has 17.
+- The `compressor_library.name` slot embedding in stat namespace is a load-bearing operator-config point. Misconfigured `name:` values produce stat-name collisions if multiple compressor instances share the same name; the differential fixture MUST use consistent `name:` values across both sides.
+- Future codec phases (brotli, zstd) extending `compressor_library.typed_config.@type` will emit stats at `compressor.<library_name>.<brotli|zstd>.<counter>` — the codec short-name dictates the namespace differentiation. The 17-counter family is per-codec; multi-codec configs emit multiple 17-counter families.
+- Phase-14 fixture 0016's per-counter delta assertion uses byte-exact equality on 16 counters (all 17 except `response_total_compressed_bytes` which uses tolerance per ADR-0133); the 5 `request_*` counters are at +0 on both sides byte-equivalently.
+- The `not_compressed_etag` counter is observable when `disable_on_etag_header: true` AND ETag-present skip path fires; phase-14 fixture 0016 does NOT set `disable_on_etag_header: true` on any route (mode-a strong-strip discipline), so the counter stays at zero in fixture 0016. Future fixtures or unit tests cover the +1 increment.
+
+---
+
+## ADR-0133: Differential-fixture decompress-and-compare body-assertion discipline
+
+**Status:** Accepted
+**Date:** 2026-05-10
+**Doctrine:** Phase-14 §9 family-row. ADR-0044 ADR-on-impl convention. Generalizes from compressor; codifies for future codec/transform filters.
+**Lands-in-task:** Task 11 (fixture 0016 driver implementation; the decompress-and-compare helper lands here).
+
+### Context
+
+Phase 14 introduces a body-assertion challenge: the compressed-byte representations of envoy-go's gzip output (Go `compress/gzip`) and reference Envoy's gzip output (libz) DIFFER byte-by-byte. This is by design of the gzip-format spec (RFC 1952 / 1951): multiple valid encodings of the same input exist; compressors choose block boundaries + Huffman trees + LZ77 lookback decisions independently. Empirical evidence at SPEC §11.14: gzip-header bytes differ on `OS` field (Envoy `03 UNIX` vs Go default `255 unknown`) and `XFL` field; payload bytes differ in compression-block layout. Decompressed bytes ARE byte-equivalent (gzip-format is deterministic at decompress level).
+
+Differential fixtures historically asserted byte-exact response bodies. For phase-14 compressor (and future codec/transform filters that produce non-deterministic output from a deterministic input), the byte-exact assertion is structurally impossible; a NEW assertion discipline is required.
+
+### Decision
+
+**(i) Decompress-and-compare body-assertion mode.** The fixture driver (`inputs/driver.go`) inspects the response's `Content-Encoding` header to determine the assertion mode:
+- `Content-Encoding: gzip` → DECOMPRESS the response body via `compress/gzip.NewReader`; assert byte-exact equality between envoy-go's and Envoy's decompressed plaintexts (and OPTIONALLY against the original input plaintext).
+- `Content-Encoding: <other>` → DECOMPRESS via the corresponding codec library (future codec phases extend); same assertion discipline.
+- `Content-Encoding` empty / absent → byte-exact comparison on raw response bodies (uncompressed scenarios fall back to standard byte-exact).
+
+**(ii) Per-scenario assertion-mode selection logic in driver.** The driver's per-scenario assertion helper:
+```go
+func assertBodyEquivalent(envoyGoResponse, envoyResponse *http.Response, originalPayload []byte) error {
+    egEnc := envoyGoResponse.Header.Get("Content-Encoding")
+    enEnc := envoyResponse.Header.Get("Content-Encoding")
+    if egEnc != enEnc {
+        return fmt.Errorf("Content-Encoding mismatch: envoy-go=%q envoy=%q", egEnc, enEnc)
+    }
+    if egEnc == "" {
+        // Uncompressed: byte-exact body comparison.
+        return assertByteExactBody(envoyGoResponse.Body, envoyResponse.Body)
+    }
+    if egEnc == "gzip" {
+        egDecompressed, err := decompressGzip(envoyGoResponse.Body)
+        if err != nil { return err }
+        enDecompressed, err := decompressGzip(envoyResponse.Body)
+        if err != nil { return err }
+        if !bytes.Equal(egDecompressed, enDecompressed) {
+            return fmt.Errorf("decompressed bodies differ")
+        }
+        // Optional: assert decompressed matches original input.
+        if originalPayload != nil && !bytes.Equal(egDecompressed, originalPayload) {
+            return fmt.Errorf("decompressed body differs from original input")
+        }
+        return nil
+    }
+    return fmt.Errorf("unsupported Content-Encoding: %q", egEnc)
+}
+```
+
+**(iii) `response_total_compressed_bytes` per-counter tolerance discipline.** Compressed-byte counts WILL differ between envoy-go and Envoy due to compressor implementation variance. The fixture's per-counter assertion on this counter uses one of the following tolerance shapes (PLAN-time decision per phase-14 SPEC §12 deferred 2):
+- **Boundary-only** (SPEC's preferred shape): `0 < counter_value < uncompressed_input_bytes` on each side independently. Captures the structural invariant (compression makes bytes smaller; both libraries respect this) without coupling the assertion to specific compression ratios.
+- **Tolerance window**: `|envoy_go - envoy| / max(envoy_go, envoy) <= 0.20` (20% tolerance). Requires empirical calibration.
+- **Combination**: per-scenario allow-listed expected ranges based on observed compression ratios.
+
+ADR records boundary-only as the default; PLAN may switch to tolerance window if empirical compression-ratio variance is small enough to make 20% tolerance reliable.
+
+**(iv) Header axis allow-list for compressed scenarios.** The fixture's header-comparison allow-list excludes:
+- `content-length` value: envoy-go emits compressed-length CL; Envoy emits NO CL (uses chunked). Different shapes; comparison via "either side emits valid wire shape" allow-list.
+- `transfer-encoding` presence: envoy-go absent; Envoy `chunked`. Different shapes.
+- Existing allow-list (`date`, `server`, timing/identity headers per BEHAVIOR_CONTRACT.md `## Header allow-list`).
+
+Other header keys + values: byte-exact match.
+
+**(v) ADR-0133 scope:** the discipline is FILTER-AGNOSTIC; codifies the pattern for any filter whose output is a non-deterministic compression (or other lossy-but-reversible transform) of the input. First exercising filter is phase-14 compressor (gzip); future filters that fit the pattern: future `envoy.filters.http.decompressor` (response-side decompression — mirror image, decompresses pre-compressed responses); brotli + zstd codec phases extending compressor's `compressor_library` set; bandwidth_limit if a future variant introduces transform-mode body manipulation.
+
+### Alternatives considered
+
+(a) Byte-exact assertion on compressed bodies — REJECTED. Structurally impossible per §11.14 (gzip-format multi-encoding spec admits both Go `compress/gzip` and libz outputs as valid; compressed bytes diverge).
+
+(b) Compressed-byte allow-list (e.g., "compressed body length is between X and Y bytes") — REJECTED. Doesn't catch correctness regressions in the gzip-encode path (a malformed gzip output that decompresses to wrong plaintext would pass the length check); the decompress-and-compare assertion catches this.
+
+(c) Decompress + assert against original input only (skip the cross-side decompressed comparison) — REJECTED. Misses the case where both envoy-go AND Envoy decompress to a corrupted output; the cross-side assertion adds redundancy.
+
+(d) Force a deterministic-gzip mode (use a specific gzip library that matches libz byte-for-byte) — REJECTED. Out of scope; phase-14 stays pure-Go; future Go-gzip-library upgrade phase MAY revisit IF a deterministic-libz-compat library lands. Even then, decompress-and-compare is the structurally honest assertion (compressed-byte equivalence is brittle; decompressed-byte equivalence is the actual contract).
+
+### Consequences
+
+- The fixture driver's `decompressGzip(body []byte) ([]byte, error)` helper + `assertBodyEquivalent` per-scenario helper become reusable primitives for future codec/transform-filter fixtures.
+- Future codec phases extending compressor (`brotli` per `andybalholm/brotli`; `zstd` per `klauspost/compress/zstd`) extend the driver with `decompressBrotli` / `decompressZstd` helpers + dispatch on `Content-Encoding: br | zstd`.
+- Future `envoy.filters.http.decompressor` fixtures use the SAME discipline mirror-imaged: the request-side body is decompressed by the filter; the test asserts the upstream-side observed plaintext matches the original (decompressed) input. ADR-0133's pattern carries through.
+- The `response_total_compressed_bytes` boundary-only assertion is structurally honest (captures invariant; not coupled to ratios) but loses some sensitivity to compression-quality regressions. Future tightening MAY introduce per-codec compression-ratio expectations.
+- Header allow-list extension for `content-length` + `transfer-encoding` on compressed scenarios is fixture-0016-specific; future fixtures with different wire-shape divergences document their own allow-list extensions per BEHAVIOR_CONTRACT.md `## Equivalence Matrix` discipline.
+- Phase-14 fixture 0016's driver size grows from phase-13 buffer's ~150 LoC to ~200 LoC (gzip-decompression helper + classification helper + ETag-stripped assertion helper + AE-absence-in-echoed-headers assertion helper for scenario 6).
+
+---
