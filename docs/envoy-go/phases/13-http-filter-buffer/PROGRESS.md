@@ -919,7 +919,7 @@ All 4 edits confirmed present.
 
 ## Task 13 — REVIEW.md — end-of-phase retrospective
 
-**Commits:** TBD (this task)
+**Commits:** `908f052` — `phase 13: REVIEW — end-of-phase retrospective + N-1 carry-forward`
 **Notes:** REVIEW.md authored per the `superpowers:requesting-code-review` skill convention and the phase-12 REVIEW.md structural template. Covers 7 sections: §1 phase summary + APPROVED verdict; §2 ADR roster (ADR-0125..ADR-0128); §3 empirical pins outcome (all 11 SPEC §11 pins resolved at SPEC drafting; no new divergences during impl; §11.6 and §11.8-CL load-bearing for the v1→v2 pivot); §4 gate-by-gate evidence verbatim from PROGRESS Task 12 outputs; §5 acceptance checklist (21 items green + 1 retracted: 100-Continue addendum per ADR-0127 v2 §Decision (v)); §6 forward-pointer roster (3 items: ADR-0126 >1MiB divergence, ADR-0076 per_connection/request_buffer_limit_bytes silent-ignored, phase-04 Expect-417 deferral); §7 phase-done lessons learned (5 items: D-3.5 post-landing BRAINSTORM amendment precedent, v2-numbered ADR in-place update discipline, ZERO-stat-entries structurally-thinnest-row data point, synchronous-HCM dispatch deadlock as brainstorm-blind-spot, beads-tracker false-start as directive-clarity lesson). PROGRESS.md Task 13 entry appended at same commit per PLAN lines 2018-2038 convention.
 
 **Outputs:**
