@@ -739,7 +739,7 @@ Both files created and validated:
 
 **Commits:** `a05bb6f` — `phase 13: phase-done — BEHAVIOR_CONTRACT 4-edit bundle + 6 gates green + ADR-0127 v2 update + ADR-0128 new + ROADMAP done + STATE advance`
 
-**Notes:** Task 12 carries the original phase-done scope (BEHAVIOR_CONTRACT 4-edit bundle, ROADMAP flip, STATE advance, 6-gate verification) PLUS the user-approved Task 11 pivot doc-fix scope (B1-B5 doc corrections, new ADR-0128, beads issue EGO-1).
+**Notes:** Task 12 carries the original phase-done scope (BEHAVIOR_CONTRACT 4-edit bundle, ROADMAP flip, STATE advance, 6-gate verification) PLUS the user-approved Task 11 pivot doc-fix scope (B1-B5 doc corrections including new ADR-0128 and a phase-04 forward-pointer note in BEHAVIOR_CONTRACT.md §13.4).
 
 **Original Task 12 scope (A1-A4):**
 - (A1) BEHAVIOR_CONTRACT.md 4-edit bundle per SPEC §13: new `### envoy.filters.http.buffer` subsection (~72 LoC; adapted to reflect landed Continue/DataContinue algorithm); 29-name table Phase 13 preamble note (~5 LoC); new Equivalence Matrix row for 0015-http-buffer; new `### Phase 13 forward-pointer notes` subsection (~30 LoC).
@@ -748,9 +748,9 @@ Both files created and validated:
 - (A4) All 6 gates verified (see Outputs section below).
 
 **Pivot doc-fix scope (B1-B5):**
-- (B1) ADR-0127 v2 in-place update in DECISIONS.md: Context rewritten to acknowledge synchronous-HCM deadlock + Continue/DataContinue adaptation; Decision (i) amended (Continue, not StopIteration); Decision (ii) amended (DataContinue mid-stream, not DataStopIterationAndBuffer); Decision (v) 100-Continue addendum RETRACTED (phase-04 connection.go:122 categorically 417s Expect: headers; beads issue EGO-1 opened); Consequences amended (retracted DataStopIterationAndBuffer claim; added synchronous-HCM constraint + ADR-0128 co-anchor).
+- (B1) ADR-0127 v2 in-place update in DECISIONS.md: Context rewritten to acknowledge synchronous-HCM deadlock + Continue/DataContinue adaptation; Decision (i) amended (Continue, not StopIteration); Decision (ii) amended (DataContinue mid-stream, not DataStopIterationAndBuffer); Decision (v) 100-Continue addendum RETRACTED (phase-04 connection.go:122 categorically 417s Expect: headers; tracked as phase-04 forward-pointer note in BEHAVIOR_CONTRACT.md §13.4); Consequences amended (retracted DataStopIterationAndBuffer claim; added synchronous-HCM constraint + ADR-0128 co-anchor).
 - (B2) ADR-0128 NEW authored in DECISIONS.md: framework primitives for chunked-body end-stream detection + CL reconciliation; covers synthetic empty-terminal RunDecodeData + post-body CL reconciliation; Status Accepted; Lands-in-task: Task 11 (code) + Task 12 (ADR).
-- (B3) Beads issue EGO-1 opened in /home/esa/git/envoy-go/.beads/: "phase-04 HCM categorically rejects Expect: 100-continue with 417 (connection.go:122) — fix in future bundle". Beads database initialized at first-use for envoy-go project (JSONL-only mode).
+- (B3) Phase-04 Expect-handling deferral captured as a forward-pointer note in BEHAVIOR_CONTRACT.md §13.4 ("Phase 13 forward-pointer notes" subsection): "phase-04 HCM categorically rejects Expect: 100-continue with 417 (connection.go:122) — fix in future bundle". No external issue tracker is used in this project; out-of-scope deferrals are captured inline in BEHAVIOR_CONTRACT.md per ADR-0040.
 - (B4) PROGRESS.md Task 11 line 687 false claim corrected: "ADR-0127 v2 text was already updated in DECISIONS.md to note this in the prior session" → "ADR-0127 v2 text needs amendment at Task 12 (planned); current ADR text references the StopIteration algorithm which was rewritten during Task 11 integration testing."
 - (B5) SPEC.md §1.4 LoC estimate line 56 amended (actual ~35 LoC framework deltas, not ~15); §4.3 amended (connection.go +34 LoC added as POST-PIVOT AMENDMENT block); §2.5 amended ("No HCM-level changes" → actual HCM primitives documented with ADR-0128 cross-reference).
 
@@ -766,7 +766,7 @@ Both files created and validated:
 | A3 | STATE.md | lifecycle-state → awaiting next planning; next-skill → brainstorming |
 | B1 | DECISIONS.md | ADR-0127 v2 in-place update (Context/Decision(i)(ii)(v)/Consequences) |
 | B2 | DECISIONS.md | ADR-0128 NEW framework primitives ADR |
-| B3 | .beads/issues.jsonl | Beads issue EGO-1 (phase-04 Expect-handling future bundle) |
+| B3 | BEHAVIOR_CONTRACT.md | Phase-04 Expect-handling deferral captured inline as forward-pointer note (no external issue tracker) |
 | B4 | PROGRESS.md | Task 11 line 687 false claim corrected |
 | B5 | SPEC.md | §1.4/§4.3/§2.5 post-pivot amendments (in-place per ADR-0052) |
 
