@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -47,6 +48,28 @@ var errCloseAfterAction = errors.New("hcm: action requested connection close")
 type directResponseAction struct {
 	status   int
 	bodyText string
+
+	// extraHeaders carries the route-level response_headers_to_add entries
+	// (parsed at config-build time per buildDirectResponseAction). Applied in
+	// body() with OVERWRITE_IF_EXISTS_OR_ADD semantics — name-match
+	// case-insensitive replace against the 4 default headers; new keys
+	// appended in insertion order. Phase 14 fixture 0016 needs this so direct_
+	// response routes can set Content-Type to the per-route value (text/html,
+	// image/png) that the compressor filter's content_type-match bucket
+	// inspects at EncodeHeaders time — without this, envoy-go's directResponse
+	// emits a hardcoded `Content-Type: text/plain` that masquerades as
+	// "matches the default 8-entry list" and produces a fixture-0016 scenario
+	// 2 differential mismatch vs reference Envoy (which emits image/png and
+	// correctly hits the content_type_mismatch skip bucket).
+	//
+	// Simplification vs Envoy's full HeaderValueOption.AppendAction enum: we
+	// implement OVERWRITE_IF_EXISTS_OR_ADD uniformly. APPEND_IF_EXISTS_OR_ADD
+	// (the proto default) is NOT implemented; fixture YAMLs SHOULD set
+	// append_action: OVERWRITE_IF_EXISTS_OR_ADD explicitly so reference Envoy
+	// matches envoy-go's semantics. This is a phase-14-Task-14 incremental
+	// addition; broader response_headers_to_add support (full enum + multi-
+	// header dedup) is deferred to future phases.
+	extraHeaders filter_http.OrderedHeaders
 }
 
 // body returns the synthesized response in codec-neutral form per SPEC §5.5
@@ -58,6 +81,13 @@ type directResponseAction struct {
 // (Content-Type, Content-Length, Server, Date) land on the wire in their
 // insertion order — matching writeStatusReply's verbatim shape from phase-04
 // (and the writeH2 path's HEADERS-frame deterministic order).
+//
+// Phase 14 Task 14: extraHeaders (route-level response_headers_to_add) are
+// applied AFTER the 4 default headers with OVERWRITE_IF_EXISTS_OR_ADD
+// semantics — name-match (case-insensitive) replaces the default value;
+// otherwise appends. Required so the compressor filter at EncodeHeaders time
+// sees the per-route Content-Type the bootstrap configures (e.g. text/html,
+// image/png) rather than the hardcoded text/plain default.
 func (a *directResponseAction) body() (status int, headers filter_http.OrderedHeaders, body []byte) {
 	bodyBytes := []byte(a.bodyText)
 	hdrs := filter_http.OrderedHeaders{
@@ -65,6 +95,19 @@ func (a *directResponseAction) body() (status int, headers filter_http.OrderedHe
 		{Name: "Content-Length", Value: strconv.Itoa(len(bodyBytes))},
 		{Name: "Server", Value: serverHeader()},
 		{Name: "Date", Value: dateHeader()},
+	}
+	for _, eh := range a.extraHeaders {
+		replaced := false
+		for i := range hdrs {
+			if strings.EqualFold(hdrs[i].Name, eh.Name) {
+				hdrs[i].Value = eh.Value
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			hdrs = append(hdrs, filter_http.HeaderField{Name: eh.Name, Value: eh.Value})
+		}
 	}
 	return a.status, hdrs, bodyBytes
 }

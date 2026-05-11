@@ -355,7 +355,7 @@ func buildRouteTable(routes []*routev3.Route, clusters *cluster.Manager) (*route
 		if err != nil {
 			return nil, fmt.Errorf("hcm: route %d: %w", i, err)
 		}
-		action, err := buildAction(r.GetAction(), clusters)
+		action, err := buildAction(r.GetAction(), r.GetResponseHeadersToAdd(), clusters)
 		if err != nil {
 			return nil, fmt.Errorf("hcm: route %d: %w", i, err)
 		}
@@ -408,12 +408,12 @@ func buildMatch(m *routev3.RouteMatch) (routeMatch, error) {
 	}
 }
 
-func buildAction(a interface{}, clusters *cluster.Manager) (routeAction, error) {
+func buildAction(a interface{}, responseHeadersToAdd []*corev3.HeaderValueOption, clusters *cluster.Manager) (routeAction, error) {
 	switch act := a.(type) {
 	case *routev3.Route_Route:
 		return buildRouterAction(act.Route, clusters)
 	case *routev3.Route_DirectResponse:
-		return buildDirectResponseAction(act.DirectResponse)
+		return buildDirectResponseAction(act.DirectResponse, responseHeadersToAdd)
 	case nil:
 		return nil, fmt.Errorf("action is missing")
 	default:
@@ -455,7 +455,7 @@ func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (route
 	return &clusterRouteAction{cluster: c}, nil
 }
 
-func buildDirectResponseAction(d *routev3.DirectResponseAction) (*directResponseAction, error) {
+func buildDirectResponseAction(d *routev3.DirectResponseAction, responseHeadersToAdd []*corev3.HeaderValueOption) (*directResponseAction, error) {
 	if d == nil {
 		return nil, fmt.Errorf("direct_response is nil")
 	}
@@ -473,5 +473,52 @@ func buildDirectResponseAction(d *routev3.DirectResponseAction) (*directResponse
 	if is.InlineString == "" {
 		return nil, fmt.Errorf("direct_response.body.inline_string is empty")
 	}
-	return &directResponseAction{status: int(d.Status), bodyText: is.InlineString}, nil
+	extras, err := buildExtraResponseHeaders(responseHeadersToAdd)
+	if err != nil {
+		return nil, fmt.Errorf("direct_response.response_headers_to_add: %w", err)
+	}
+	return &directResponseAction{
+		status:       int(d.Status),
+		bodyText:     is.InlineString,
+		extraHeaders: extras,
+	}, nil
+}
+
+// buildExtraResponseHeaders converts route-level response_headers_to_add into
+// an OrderedHeaders slice the directResponseAction applies in body() with
+// OVERWRITE_IF_EXISTS_OR_ADD semantics (per phase 14 Task 14 — see
+// actions.go's directResponseAction GoDoc for rationale).
+//
+// Validation:
+//   - skips entries with nil header or empty key (defensive; the proto allows
+//     them, Envoy rejects at config-load time).
+//   - rejects unsupported AppendAction values (only OVERWRITE_IF_EXISTS_OR_ADD
+//     is supported; APPEND_IF_EXISTS_OR_ADD / ADD_IF_ABSENT / OVERWRITE_IF_EXISTS
+//     are reserved for future support).
+//
+// Phase-14 fixture 0016 YAMLs MUST set `append_action: OVERWRITE_IF_EXISTS_OR_ADD`
+// explicitly so envoy-go does not reject the config; reference Envoy honors
+// the explicit append_action symmetrically.
+func buildExtraResponseHeaders(opts []*corev3.HeaderValueOption) (filter_http.OrderedHeaders, error) {
+	if len(opts) == 0 {
+		return nil, nil
+	}
+	out := make(filter_http.OrderedHeaders, 0, len(opts))
+	for i, o := range opts {
+		if o == nil {
+			continue
+		}
+		if o.AppendAction != corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD {
+			return nil, fmt.Errorf("entry %d: append_action %v is not supported (only OVERWRITE_IF_EXISTS_OR_ADD)", i, o.AppendAction)
+		}
+		h := o.GetHeader()
+		if h == nil {
+			continue
+		}
+		if h.Key == "" {
+			continue
+		}
+		out = append(out, filter_http.HeaderField{Name: h.Key, Value: h.Value})
+	}
+	return out, nil
 }

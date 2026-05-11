@@ -312,6 +312,12 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 				return err
 			}
 		}
+		// Symmetric to connection.go H1 path; same primitive harvest per
+		// ADR-0131 §Decision (vi). Substitute resp.Body before writeH2Reply
+		// emits HEADERS+DATA frames.
+		if override, ok := chain.EncodeBodyOverride(); ok {
+			resp.Body = override
+		}
 	}
 
 	// Phase 07.1 Task 18 prereq P2: wire-write the (post-encode-chain) response

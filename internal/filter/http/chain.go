@@ -91,6 +91,16 @@ type FilterChain struct {
 	routeIdx   int
 	ambientCtx context.Context
 
+	// encodeBodyOverride / encodeBodyOverridden carry the encode-side body
+	// replacement bytes registered via EncoderFilterCallbacks.OverwriteBody.
+	// The sentinel discriminates (override is nil bytes + set) from (no
+	// override registered). HCM dispatch (connection.go H1 / h2dispatch.go H2)
+	// reads via EncodeBodyOverride() after RunEncodeData returns and
+	// substitutes resp.Body before the wire-write path consumes it.
+	// Per ADR-0131 §Decision (vi).
+	encodeBodyOverride   []byte
+	encodeBodyOverridden bool
+
 	// diagLogW overrides the destination of the framework's diagnostic log
 	// lines. Default nil → stderr. Test-only setter SetDiagLogWriter swaps in
 	// a buffer to capture the log line in TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs.
@@ -467,6 +477,26 @@ func (e *encoderCB) ContinueEncoding() {
 func (e *encoderCB) EncodeHeaders(http.Header, bool) {}
 func (e *encoderCB) EncodeData([]byte, bool)         {}
 func (e *encoderCB) EncodeTrailers(http.Header)      {}
+
+// OverwriteBody registers a replacement encode-side body on the chain.
+// Filters call this from inside their EncodeData(data, endStream)
+// implementation; HCM dispatch reads the registered bytes via
+// FilterChain.EncodeBodyOverride() after RunEncodeData returns and
+// substitutes resp.Body before the wire-write path consumes it.
+// Not goroutine-safe — the encode chain runs synchronously in the dispatch
+// goroutine (per ADR-0071). Per ADR-0131 §Decision (vi).
+func (e *encoderCB) OverwriteBody(b []byte) {
+	e.c.encodeBodyOverride = b
+	e.c.encodeBodyOverridden = true
+}
+
+// EncodeBodyOverride returns the registered encode-side body override (if any).
+// Returns (override, true) if a filter called cb.OverwriteBody during the
+// encode chain; (nil, false) otherwise. Callers (HCM dispatch) use this to
+// substitute resp.Body before the wire-write path. Per ADR-0131 §Decision (vi).
+func (c *FilterChain) EncodeBodyOverride() ([]byte, bool) {
+	return c.encodeBodyOverride, c.encodeBodyOverridden
+}
 
 // SetRequestCtx wires the request context + matched-route index into the
 // chain. Called by HCM dispatch at request start (HCM wire-up lands in

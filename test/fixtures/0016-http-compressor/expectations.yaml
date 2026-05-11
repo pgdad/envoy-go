@@ -1,0 +1,113 @@
+# Phase 14 fixture 0016 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per planner-time decision 9): single listener l_main with six routes.
+#   - Listener-level Compressor: compressor_library{name: text_optimized, Gzip} +
+#     response_direction_config: {} (defaults — enabled=true; min_content_length=30;
+#     content_type=<8-entry default list>; disable_on_etag_header=false;
+#     remove_accept_encoding_header=false; uncompressible_response_codes=[]).
+#   - /text-html-1024         direct_response 1024-byte body; content-type: text/html.
+#   - /image-png-1024         direct_response 1024-byte body; content-type: image/png.
+#   - /text-html-10           direct_response 10-byte   body; content-type: text/html.
+#   - /text-html-etag-strong  direct_response 1024-byte body; content-type: text/html + etag: "abc".
+#   - /per-route-disabled     direct_response 1024-byte body; content-type: text/html; TPFC disabled=true.
+#   - /per-route-rmae         cluster route to c_backend (echobackend); TPFC overrides.response_direction_config.remove_accept_encoding_header=true.
+#
+# Six scenarios (6 HTTP requests; all sequential against single listener; all GET + Accept-Encoding: gzip):
+#
+# Scenario 1: allow-compress (text/html default-list + above-min + no skip bucket fires)
+#   Request:  GET /text-html-1024 AE: gzip
+#   Response: 200 OK + content-encoding: gzip + vary: Accept-Encoding
+#             body: gzip-compressed 1024-byte plaintext; decompressed body byte-exact to original input
+#             content-length: <gzipped> on envoy-go (identity transfer); transfer-encoding: chunked on Envoy
+#   Counter:  response_compressed +1, response_total_uncompressed_bytes +1024,
+#             response_total_compressed_bytes +<gzipped-size>, header_compressor_used +1
+#   Note:     SPEC §7.1 scenario 1 + §11.1 (text/html in default 8-entry list) + ADR-0131 §Decision (ii) (wire-shape)
+#
+# Scenario 2: skip — content-type mismatch (image/png NOT in default list)
+#   Request:  GET /image-png-1024 AE: gzip
+#   Response: 200 OK + NO content-encoding + NO vary + content-length: 1024 + identity body byte-exact
+#   Counter:  response_not_compressed +1, header_compressor_used +1
+#   Note:     SPEC §7.1 scenario 2 + §6.4 (bucket 4: content-type-mismatch)
+#
+# Scenario 3: skip — below min_content_length (10 bytes < 30 default min)
+#   Request:  GET /text-html-10 AE: gzip
+#   Response: 200 OK + NO content-encoding + NO vary + content-length: 10 + identity body byte-exact
+#   Counter:  response_not_compressed +1, response_content_length_too_small +1, header_compressor_used +1
+#   Note:     SPEC §7.1 scenario 3 + §11.9 (min_content_length default 30) + §6.4 (bucket 6: below-min)
+#
+# Scenario 4: strong-ETag-strip + compressed-passthrough mode-a
+#   Request:  GET /text-html-etag-strong AE: gzip
+#   Response: 200 OK + content-encoding: gzip + vary: Accept-Encoding + NO etag header
+#             decompressed body byte-exact to original 1024-byte input
+#             content-length: <gzipped> on envoy-go (identity transfer); transfer-encoding: chunked on Envoy
+#   Counter:  response_compressed +1, response_total_uncompressed_bytes +1024,
+#             response_total_compressed_bytes +<gzipped-size>, header_compressor_used +1
+#   Note:     SPEC §7.1 scenario 4 + §1.1 amendment 6 mode-a (strong-ETag stripped on compressed path;
+#             disable_on_etag_header=false → strip-but-still-compress)
+#
+# Scenario 5: per-route disabled (filter wholly inactive)
+#   Request:  GET /per-route-disabled AE: gzip
+#   Response: 200 OK + NO content-encoding + NO vary + content-length: 1024 + identity body byte-exact
+#   Counter:  NO increments (filter wholly inactive per per-route disabled bucket 1; no header_compressor_used either)
+#   Note:     SPEC §7.1 scenario 5 + ADR-0125 amendment §(viii) (per-route disabled discipline) + §6.4 (bucket 1)
+#
+# Scenario 6: per-route remove_accept_encoding_header override + compressed-via-real-backend
+#   Request:  GET /per-route-rmae AE: gzip
+#   Response: 200 OK + content-encoding: gzip + vary: Accept-Encoding
+#             decompressed body is the echobackend's JSON object {method, path, headers};
+#             driver-side assertion: NO "accept-encoding" key in the echoed headers map
+#             content-length: <gzipped> on envoy-go (identity transfer); transfer-encoding: chunked on Envoy
+#   Counter:  response_compressed +1, response_total_uncompressed_bytes +<json-size>,
+#             response_total_compressed_bytes +<gzipped-size>, header_compressor_used +1
+#   Note:     SPEC §7.1 scenario 6 + ADR-0125 amendment §(viii) (per-route override discipline)
+#             + per-route rmAE strips Accept-Encoding before upstream forward — echobackend
+#             echoes upstream-observed headers; AE absence in the echoed map is the load-bearing assertion.
+#
+# Final counter snapshot (after all 6 requests, envoy-go side; per ADR-0132 17-counter table):
+#   response_compressed                 = 3  (scenarios 1, 4, 6)
+#   response_not_compressed             = 2  (scenarios 2, 3)
+#   response_content_length_too_small   = 1  (scenario 3)
+#   response_total_uncompressed_bytes   = N  (sum of compressed-side input lengths; scenarios 1+4+6)
+#   response_total_compressed_bytes     = M  (sum of compressed-side output lengths; scenarios 1+4+6)
+#   header_compressor_used              = 5  (every scenario except 5)
+#   not_compressed_etag                 = 0  (no scenario uses disable_on_etag_header: true)
+#   header_no_accept_header             = 0  (all scenarios send AE: gzip)
+#   header_wildcard                     = 0
+#   header_identity                     = 0
+#   header_not_valid                    = 0
+#   request_compressed                  = 0  (no request_direction_config configured — vacuous)
+#   request_not_compressed              = 0
+#   request_content_length_too_small    = 0
+#   request_total_uncompressed_bytes    = 0
+#   request_total_compressed_bytes      = 0
+#
+# Body assertion axis (per ADR-0133 §Decision (i)+(ii)):
+#   - Uncompressed scenarios (2, 3, 5): byte-exact body comparison (raw bytes).
+#   - Compressed scenarios (1, 4, 6):   decompress-and-compare via compress/gzip.NewReader;
+#                                       byte-exact equality of decompressed plaintexts;
+#                                       compressed-byte equality is NOT required (Go gzip vs libz
+#                                       differ in trailer/header bytes per §11.14).
+#
+# Wire-shape divergence allow-list (per ADR-0131 §Decision (ii) + ADR-0133 §Decision (iv)):
+#   On compressed scenarios (1, 4, 6) envoy-go emits identity transfer with fixed content-length
+#   (the gzip-output length is known when OverwriteBody fires); reference Envoy emits chunked
+#   transfer with no content-length. Both forms are wire-legal per RFC 7230. The driver excludes
+#   `content-length` (value) + `transfer-encoding` (presence) from cross-side header comparison
+#   on those three scenarios. On uncompressed scenarios (2, 3, 5) both sides emit identity +
+#   fixed content-length; no allow-list extension applies.
+#
+# Header allow-list (cross-side): standard envoy timing/identity headers per
+# BEHAVIOR_CONTRACT.md `## Header allow-list` — `date`, `server`, `x-envoy-upstream-service-time`, etc.
+#
+# Boundary-only tolerance on response_total_compressed_bytes (per planner-time decision 2
+# settling SPEC §12 deferred 2): the counter is asserted byte-exact ON EACH SIDE INDEPENDENTLY
+# (within a fixed range), but NOT cross-side byte-exact (compressed bytes diverge between Go
+# gzip and libz; total compressed size therefore diverges too). The boundary assertion is:
+# `0 < counter_value < sum(uncompressed input bytes from scenarios 1+4+6)`. Every other
+# counter in the table is asserted byte-exact cross-side.
+#
+# No timing tolerances. The compressor is purely synchronous; all responses dispatch within
+# microseconds. NO analog to phase 11 fixture 0013 scenario 3's ±10ms refill boundary.
+#
+# Cross-refs: SPEC §7.1 + §7.2 + §13.1 + ADR-0125 amendment §(viii)+(ix) + ADR-0129 + ADR-0130
+#             + ADR-0131 + ADR-0132 + ADR-0133.

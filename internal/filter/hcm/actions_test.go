@@ -10,7 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"golang.org/x/net/http2/hpack"
+
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
 func TestDirectResponseAction_Do(t *testing.T) {
@@ -105,6 +108,162 @@ func TestDirectResponseWriteH2_HEADERSThenDATAEndStream(t *testing.T) {
 	}
 	if !sw.endStream[1] /* DATA endStream */ {
 		t.Errorf("DATA frame had endStream=false; expected true (last frame)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14 Task 14 — directResponseAction.extraHeaders (response_headers_to_add)
+// ---------------------------------------------------------------------------
+
+// TestDirectResponseAction_ExtraHeaders_OverwriteContentType asserts that an
+// extraHeader keyed `Content-Type` REPLACES the hardcoded `text/plain`
+// default (OVERWRITE_IF_EXISTS_OR_ADD semantics). Without this behavior the
+// compressor filter at EncodeHeaders time would see `text/plain` (which
+// matches the default 8-entry content_type list per SPEC §11.1) on EVERY
+// direct_response route — masking the `image/png` content_type_mismatch
+// skip path required by fixture 0016 scenario 2.
+func TestDirectResponseAction_ExtraHeaders_OverwriteContentType(t *testing.T) {
+	a := &directResponseAction{
+		status:   200,
+		bodyText: "<png-bytes>",
+		extraHeaders: filter_http.OrderedHeaders{
+			{Name: "Content-Type", Value: "image/png"},
+		},
+	}
+	_, hdrs, _ := a.body()
+	if got := hdrs.Get("Content-Type"); got != "image/png" {
+		t.Errorf("Content-Type = %q, want %q", got, "image/png")
+	}
+	// Other default headers preserved.
+	if got := hdrs.Get("Content-Length"); got == "" {
+		t.Errorf("Content-Length is empty; expected default")
+	}
+	if got := hdrs.Get("Server"); got == "" {
+		t.Errorf("Server is empty; expected default")
+	}
+}
+
+// TestDirectResponseAction_ExtraHeaders_AppendETag asserts that an
+// extraHeader keyed `ETag` (not present in the 4 default headers) is
+// APPENDED to the output set. Fixture 0016 scenario 4 depends on this
+// (the strong-ETag-strip + compressed-passthrough path requires ETag be
+// PRESENT before the compressor's mode-a strip fires).
+func TestDirectResponseAction_ExtraHeaders_AppendETag(t *testing.T) {
+	a := &directResponseAction{
+		status:   200,
+		bodyText: "OK\n",
+		extraHeaders: filter_http.OrderedHeaders{
+			{Name: "ETag", Value: `"abc"`},
+		},
+	}
+	_, hdrs, _ := a.body()
+	if got := hdrs.Get("ETag"); got != `"abc"` {
+		t.Errorf("ETag = %q, want %q", got, `"abc"`)
+	}
+	// Original 4 defaults preserved.
+	if got := hdrs.Get("Content-Type"); got != "text/plain" {
+		t.Errorf("Content-Type = %q, want default text/plain", got)
+	}
+}
+
+// TestDirectResponseAction_ExtraHeaders_NilNoop asserts that the historic
+// 2-field constructor (status + bodyText, no extraHeaders) is unaffected —
+// pre-Task-14 callsites continue to produce identical output.
+func TestDirectResponseAction_ExtraHeaders_NilNoop(t *testing.T) {
+	a := &directResponseAction{status: 200, bodyText: "OK\n"}
+	_, hdrs, _ := a.body()
+	if len(hdrs) != 4 {
+		t.Errorf("expected 4 default headers; got %d: %+v", len(hdrs), hdrs)
+	}
+	if got := hdrs.Get("Content-Type"); got != "text/plain" {
+		t.Errorf("Content-Type = %q, want text/plain", got)
+	}
+}
+
+// TestBuildExtraResponseHeaders_OverwriteAction parses a HeaderValueOption
+// list with append_action=OVERWRITE_IF_EXISTS_OR_ADD and asserts the
+// resulting OrderedHeaders carry the (key, value) pairs in insertion order.
+func TestBuildExtraResponseHeaders_OverwriteAction(t *testing.T) {
+	opts := []*corev3.HeaderValueOption{
+		{
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header:       &corev3.HeaderValue{Key: "content-type", Value: "image/png"},
+		},
+		{
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header:       &corev3.HeaderValue{Key: "etag", Value: `"abc"`},
+		},
+	}
+	got, err := buildExtraResponseHeaders(opts)
+	if err != nil {
+		t.Fatalf("buildExtraResponseHeaders: %v", err)
+	}
+	want := filter_http.OrderedHeaders{
+		{Name: "content-type", Value: "image/png"},
+		{Name: "etag", Value: `"abc"`},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len mismatch: got %d, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("entry[%d]: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestBuildExtraResponseHeaders_NilInput returns (nil, nil) per the contract.
+func TestBuildExtraResponseHeaders_NilInput(t *testing.T) {
+	got, err := buildExtraResponseHeaders(nil)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got != nil {
+		t.Errorf("nil input → expected nil out; got %+v", got)
+	}
+}
+
+// TestBuildExtraResponseHeaders_AppendActionRejected asserts the default
+// APPEND_IF_EXISTS_OR_ADD action (proto default = 0) is rejected. Fixture
+// YAMLs MUST explicitly set append_action: OVERWRITE_IF_EXISTS_OR_ADD per
+// the actions.go directResponseAction GoDoc.
+func TestBuildExtraResponseHeaders_AppendActionRejected(t *testing.T) {
+	opts := []*corev3.HeaderValueOption{
+		{
+			AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+			Header:       &corev3.HeaderValue{Key: "x-foo", Value: "bar"},
+		},
+	}
+	if _, err := buildExtraResponseHeaders(opts); err == nil {
+		t.Fatalf("expected error on APPEND_IF_EXISTS_OR_ADD; got nil")
+	}
+}
+
+// TestBuildExtraResponseHeaders_SkipsNilEntries silently skips entries with
+// nil Header or empty key (defensive against malformed config — Envoy
+// rejects at config-load; envoy-go is permissive but lossy).
+func TestBuildExtraResponseHeaders_SkipsNilEntries(t *testing.T) {
+	opts := []*corev3.HeaderValueOption{
+		nil, // outer nil
+		{
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header:       nil, // inner nil header
+		},
+		{
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header:       &corev3.HeaderValue{Key: "", Value: "v"}, // empty key
+		},
+		{
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header:       &corev3.HeaderValue{Key: "x-keep", Value: "kept"},
+		},
+	}
+	got, err := buildExtraResponseHeaders(opts)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "x-keep" || got[0].Value != "kept" {
+		t.Errorf("expected 1 surviving entry (x-keep=kept); got %+v", got)
 	}
 }
 

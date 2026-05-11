@@ -6193,7 +6193,7 @@ Phase 14 SPEC §3 framework survey (executed at SPEC drafting time, 2026-05-10):
 **Status:** Accepted
 **Date:** 2026-05-10
 **Doctrine:** Phase-14 §9 family-row. ADR-0044 ADR-on-impl convention; ADR-0061 stats Registry / SN1–SN8 flattening rules; ADR-0040 silent-ignore discipline.
-**Lands-in-task:** Task 6 (the 17-counter filterStats lands together with the BEHAVIOR_CONTRACT.md 29→46 stat-table extension).
+**Lands-in-task:** Task 8 (the 17-counter `filterStats` 17-NewCounter registration helper `newFilterStats` + Group 8 namespace-shape tests; the BEHAVIOR_CONTRACT.md 29→46 stat-table extension lands separately at Task 15 per ADR-0052 in-place edit authorisation + per §Decision (vi) below).
 
 ### Context
 
@@ -6334,5 +6334,55 @@ Other header keys + values: byte-exact match.
 - The `response_total_compressed_bytes` boundary-only assertion is structurally honest (captures invariant; not coupled to ratios) but loses some sensitivity to compression-quality regressions. Future tightening MAY introduce per-codec compression-ratio expectations.
 - Header allow-list extension for `content-length` + `transfer-encoding` on compressed scenarios is fixture-0016-specific; future fixtures with different wire-shape divergences document their own allow-list extensions per BEHAVIOR_CONTRACT.md `## Equivalence Matrix` discipline.
 - Phase-14 fixture 0016's driver size grows from phase-13 buffer's ~150 LoC to ~200 LoC (gzip-decompression helper + classification helper + ETag-stripped assertion helper + AE-absence-in-echoed-headers assertion helper for scenario 6).
+
+---
+
+## ADR-0134: HCM directResponseAction.response_headers_to_add support (scoped to OVERWRITE_IF_EXISTS_OR_ADD)
+
+**Status:** Accepted
+**Date:** 2026-05-10
+**Doctrine:** Phase-14 framework-delta. ADR-0044 ADR-on-impl convention (ADR authored at impl-time when an unanticipated framework delta surfaces; landed at the same commit's follow-up per cold-start prompt's escape-valve clause).
+**Lands-in-task:** Task 14 (the fixture 0016 integration uncovered the missing functionality; ADR authored at Task 14 follow-up commit).
+
+### Context
+
+envoy-go's `internal/filter/hcm/actions.go` `directResponseAction.body()` previously hardcoded `Content-Type: text/plain` on every direct-response, ignoring the route-level `response_headers_to_add` field of the xDS `route.Route` message. The route's `response_headers_to_add` ([]*corev3.HeaderValueOption) was parsed into the xDS proto but never threaded through to the action's response-construction path; reference Envoy applies `response_headers_to_add` to direct-response responses per its standard header-injection discipline.
+
+Phase-14 fixture 0016 exercises a 6-scenario compressor workload. Scenario 2 (`/image-png-1024` → expected to SKIP compression via `content_type_mismatch`) failed on envoy-go: the route's `response_headers_to_add: Content-Type: image/png` was IGNORED, leaving the hardcoded `text/plain` which matched the compressor's default 8-entry `content_type` list (`text/plain` is the first default entry per SPEC §11.1) — triggering compression instead of the expected skip. Reference Envoy v1.37.2 honored `response_headers_to_add` and emitted `Content-Type: image/png`, hitting the `content_type_mismatch` skip path correctly.
+
+This gap was uncovered at INTEGRATION TIME during Task 14's per-counter assertion fleshing, NOT at SPEC §3 framework-survey time. The SPEC §3 survey enumerated HCM primitives required for the compressor filter itself; the directResponseAction.response_headers_to_add gap surfaced only when the fixture's 6-scenario route table required Content-Type injection on a per-route basis to discriminate the `content_type_mismatch` skip-bucket.
+
+Per cold-start prompt's escape-valve clause (ADR-0044 ADR-on-impl convention extension): "If any unanticipated framework delta surfaces during impl (e.g., a HCM dispatch corner case requiring a new primitive), author a new ADR per ADR-0044 ADR-on-impl convention + update PLAN's ADR roster table" — ADR-0134 lands at Task 14's follow-up commit to document the framework delta.
+
+### Decision
+
+**(i) Extend `directResponseAction` with `extraHeaders` field.** `directResponseAction` gains an `extraHeaders filter_http.OrderedHeaders` field carrying the route's `response_headers_to_add`. `body()` applies the extraHeaders with **OVERWRITE_IF_EXISTS_OR_ADD** semantics — case-insensitive name-match replaces the default-injected value; otherwise the (name, value) pair is appended. The 4-default-header baseline (Content-Type, Content-Length, Date, Server) is preserved for the zero-value case (callsites that pass nil/empty extraHeaders behave as before).
+
+**(ii) `buildExtraResponseHeaders` parser in `config.go`.** A new `buildExtraResponseHeaders` parser converts `[]*corev3.HeaderValueOption` into the `filter_http.OrderedHeaders` slice consumed by `directResponseAction.extraHeaders`. The parser ONLY accepts `append_action: OVERWRITE_IF_EXISTS_OR_ADD`; the other three `HeaderValueOption.AppendAction` enum values (`APPEND_IF_EXISTS_OR_ADD`, `ADD_IF_ABSENT`, `OVERWRITE_IF_EXISTS`) are parse-rejected with explicit error wording.
+
+**(iii) Fixture YAMLs MUST set `append_action` explicitly.** The proto default for `HeaderValueOption.AppendAction` is `APPEND_IF_EXISTS_OR_ADD` (enum value 0); fixture YAMLs targeting envoy-go's directResponse path MUST explicitly set `append_action: OVERWRITE_IF_EXISTS_OR_ADD` on every `response_headers_to_add` entry — implicit defaults are parse-rejected by envoy-go. This is PGV-compliance-equivalent (Envoy parse-rejects implicit-defaults when PGV-required on a field; we mirror the strict-required discipline).
+
+**(iv) `buildAction` signature change.** `buildAction(...)` gains a `[]*corev3.HeaderValueOption` argument; `buildRouteTable` threads `r.GetResponseHeadersToAdd()` through the call. The 28 existing `directResponseAction` test/fixture callsites continue to work unchanged (default zero-value `extraHeaders` is nil; body() preserves the 4-default-header baseline).
+
+**(v) Scope deferrals (NOT implemented at ADR-0134):**
+- Full `HeaderValueOption.AppendAction` enum support — `APPEND_IF_EXISTS_OR_ADD`, `ADD_IF_ABSENT`, `OVERWRITE_IF_EXISTS` are parse-rejected at config-build time. Future filters/fixtures requiring these semantics drive a follow-up ADR.
+- `request_headers_to_add` symmetric path — the request-side header injection is NOT implemented. directResponseAction operates on the response side only; `request_headers_to_add` would be a parallel field on a hypothetical request-side action variant (no current envoy-go filter requires it).
+- Multi-header dedup beyond OVERWRITE semantics — the current case-insensitive name-match is single-pass; if a config repeats the same header name twice in `extraHeaders`, the LAST entry wins. No dedup is applied across the 4-default-header baseline beyond the explicit OVERWRITE match.
+
+### Alternatives considered
+
+(a) Implement `response_headers_to_add` as a full multi-action implementation (all 4 `AppendAction` enum values + dedup semantics + request_headers_to_add symmetric path) at Task 14 — REJECTED as out-of-scope for phase 14's compressor fixture. Phase 14's scope is the compressor filter; the directResponseAction extension is a framework delta uncovered at fixture-integration time, sized to the minimum needed to discriminate scenario 2. Broader AppendAction support deferred to a future phase if/when needed.
+
+(b) Hardcode the scenario-2 Content-Type via direct body-content trickery (e.g., a sentinel byte sequence in the fixture body that the driver detects) — REJECTED as masking the underlying envoy-go gap. The directResponseAction.body() hardcoded-Content-Type behavior is a CORRECTNESS gap (reference Envoy honors response_headers_to_add; envoy-go silently ignored it); patching the fixture to work around it would hide the gap from future readers + future framework-survey reviews.
+
+(c) Defer the fix to a follow-up phase + skip fixture-0016 scenario 2 entirely — REJECTED. Scenario 2 (content_type_mismatch skip-bucket) is a primary equivalence claim for the compressor's skip-decision path per SPEC §7.1; skipping it would leave the `content_type_mismatch` counter assertion uncovered. The minimal extension at ADR-0134 unblocks the differential pass without growing phase-14 scope significantly.
+
+### Consequences
+
+- (i) envoy-go's directResponseAction now honors `route.response_headers_to_add` for `append_action: OVERWRITE_IF_EXISTS_OR_ADD` entries. Pre-existing directResponseAction callsites (28 in test/fixture corpus) continue to work unchanged.
+- (ii) Operators MUST set `append_action` EXPLICITLY in fixture YAMLs targeting envoy-go's directResponse path. Implicit-default `APPEND_IF_EXISTS_OR_ADD` (proto enum value 0) is parse-rejected. Mirrors PGV-required field discipline.
+- (iii) Broader `AppendAction` support (the other three enum values + request_headers_to_add symmetric path + multi-header dedup) deferred to a future phase if/when a filter/fixture requires those semantics.
+- (iv) Fixture 0016 differential pass GREEN at Task 14 requires this extension; scenario 2 (`/image-png-1024` → `content_type_mismatch` skip) now resolves correctly cross-side.
+- (v) The 6 new unit tests at `internal/filter/hcm/actions_test.go` cover the OVERWRITE happy path, the nil/empty noop case, the parse-rejection of the three unsupported `AppendAction` enum values, and the nil-entry-in-slice skip behavior.
 
 ---

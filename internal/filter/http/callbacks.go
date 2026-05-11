@@ -78,6 +78,17 @@ type EncoderFilterCallbacks interface {
 	EncodeHeaders(headers http.Header, endStream bool)
 	EncodeData(data []byte, endStream bool)
 	EncodeTrailers(trailers http.Header)
+
+	// OverwriteBody registers a replacement encode-side body. Filters MUST
+	// call this only from inside their EncodeData(data, endStream)
+	// implementation; the chain dispatch substitutes resp.Body before the
+	// wire-write path consumes it. Not goroutine-safe — the encode chain
+	// runs synchronously in the dispatch goroutine.
+	//
+	// Per ADR-0131 §Decision (vi); first encode-side framework primitive in
+	// envoy-go (phase 14; symmetric to phase-13 ADR-0128 decode-side
+	// primitives).
+	OverwriteBody(b []byte)
 }
 
 // Compile-time assertion: a real concrete proto type satisfies proto.Message,

@@ -16,7 +16,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Response trailers | Set-equal under the same allow-list discipline |
 | HTTP/2 & HTTP/3 framing | Structurally equivalent (same frame types/order on equivalent events); not byte-equal |
 | Access log records | Semantically equal after field-mapping |
-| Stats output | Per-stat behavioral delta after defined load is equal between envoy-go and reference Envoy. Gauges are snapshot-equal after drain. Names + label keys + types byte-equal; HELP text ignored. Allow-list: 17 stats listed in § Stat-name mapping. All other Envoy stat names in /stats/prometheus output are ignored by the differential. |
+| Stats output | Per-stat behavioral delta after defined load is equal between envoy-go and reference Envoy. Gauges are snapshot-equal after drain. Names + label keys + types byte-equal; HELP text ignored. Allow-list: 46 stats listed in § Stat-name mapping. All other Envoy stat names in /stats/prometheus output are ignored by the differential. |
 | xDS wire behavior | ADS message sequences match the protocol state machine; effective-config diff on identical snapshots |
 | Timing | Not compared by default; a phase may opt in to latency bounds |
 | HTTP filter chain | Per-request equivalence on cors preflight + actual-request response shapes (status + header set + body) between envoy-go and reference Envoy. Filter iteration order, sendLocalReply encode-chain entry, and 413 overflow shape are verbatim-pinned at the ENVOY_TARGET SHA. Differential covers cors only; `envoy.filters.http.envoy_go_test` excluded (test-only); other filters in the §9 family are future-phase scope. |
@@ -33,6 +33,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | HTTP filter `envoy.filters.http.local_ratelimit` | 0013-http-local-ratelimit: scenario1: 5 reqs / cap=10 / fill=10 / interval=1s — 5×200; scenario2: 5 reqs / cap=2 — 2×200 + 3×429 (§11.3 wire shape); scenario3: 3 reqs / cap=1 / fill=1 / interval=200ms (refill ±10ms per §11.7); scenario4: 3+3 reqs interleaved /strict + /loose — wholesale-override (§11.6). Per-scenario tolerance per §13.3 timing-tolerances; lowercase wire-form 4-header set on 429; counter deltas across 4 stat names with `envoy_local_http_ratelimit_prefix` Prometheus label. NOT asserted: descriptor-action path (deferred — ADR-0120 family), runtime shadow-mode (deferred), X-RateLimit headers (deferred), H2 differential coverage. |
 | HTTP filter `envoy.filters.http.csrf` | 0014-http-csrf: scenario1: same-origin POST → 200; scenario2: cross-origin POST → 403 (§11.10 wire shape: content-length=14, body=`Invalid origin`, 4-header lowercase set); scenario3: `additional_origins` host:port match → 200; scenario4: no source-origin → 403 + `missing_source_origin +1`; scenario5: Referer fallback → 200; scenario7: per-route TPFC wholesale-override (§11.9 — per-route data REPLACES listener data; counters AGGREGATE since stats are SHARED). All 6 scenarios HTTP/1.1 plaintext; no timing tolerances (csrf is purely synchronous). NOT asserted: StringMatcher non-exact variants (deferred — drop at PARSE per ADR-0101 §3), `filter_enabled` percentage values other than 100% (deferred — Runtime + hot restart family), `shadow_enabled` semantics (deferred), H2 differential coverage. |
 | HTTP filter `envoy.filters.http.buffer` | 0015-http-buffer: scenario1: body-fits-cap (1 KiB POST → 200); scenario2: streaming-overflow CL-known (2 MiB POST → 413; §11.7+§11.8 wire shape: content-length=17, body=`Payload Too Large`, 4-header lowercase set + Connection: close); scenario3: chunked-overflow against per-route tighter cap (200 KiB chunked → 413, NO 100-Continue with chunked); scenario4: per-route disabled bypass (2 MiB POST → 200 — cap wholly inactive on disabled route per §11.4); scenario5: per-route tighter override fires (200 KiB → 413 against 128 KiB override); scenario6: chunked-passthrough Content-Length injection (10 KiB chunked → 200, backend asserts inbound `Content-Length: 10240` per §11.8-CL `maybeAddContentLength` mirror). All 6 requests HTTP/1.1 plaintext; no timing tolerances (buffer is purely synchronous). Counter delta on envoy-go side: `downstream_rq_total +6`, `downstream_rq_2xx +3`, `downstream_rq_4xx +3`. Envoy-only `downstream_rq_too_large` (+3) and `downstream_rq_completed` (+6) filtered out via the existing twin-series-discipline allow-list. NOT asserted: `max_request_bytes > 1 MiB` operational behavior (deferred — envoy-go-only parse-time rejection per ADR-0126); `per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes` (silent-ignored per ADR-0076); H2 differential coverage. |
+| HTTP filter `envoy.filters.http.compressor` | 0016-http-compressor (gzip-only response-side): byte-exact status; decompressed-byte-exact body on compressed scenarios per ADR-0133 (gzip compressed bytes are STRUCTURALLY non-byte-exact between Go `compress/gzip` and Envoy libz — multi-encoding gzip-format spec admits both); allow-list `content-length` value + `transfer-encoding` presence on compressed scenarios (envoy-go fixed-CL identity vs Envoy chunked per ADR-0131); per-counter delta byte-equivalent on 12 active counters (10 cross-side + 1 dynamic per-side `response_total_uncompressed_bytes` + 1 boundary-only `response_total_compressed_bytes` per ADR-0133 §Decision (iii)); 4 per-side empirical-divergence counters (`header_compressor_used`, `header_not_valid`, `response_not_compressed`, `request_not_compressed`) pinned per-side at Task 14 empirical evidence — both sides locked, regressions on either surface immediately. 6 scenarios per phase 14 SPEC §7.1 (compress-text-default, skip-content-type, skip-min-content-length, skip-on-etag, per-route-disabled, per-route-rmAE-override). HCM `directResponseAction.response_headers_to_add` plumbed via ADR-0134 with explicit `OVERWRITE_IF_EXISTS_OR_ADD` AppendAction parse-gate. NOT asserted: brotli + zstd codec extensions (deferred — extends ADR-0130); `request_direction_config` activation + the future `envoy.filters.http.decompressor` filter (deferred); chunked-encoded response wire shape on the encode side (deferred — couples to future encode-side streaming framework phase per ADR-0131); Gzip codec sub-knobs `memory_level` / `window_bits` / `chunk_size` (Go gzip does not expose libz equivalents); `choose_first` first-acceptable selection mode (deferred); `runtime_enabled` + `enabled` runtime gates (Runtime + hot restart family); deprecated top-level mirrors; per-route `overrides.compressor_library` library swap; H2 differential coverage. |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -132,7 +133,7 @@ Rule SN7: Histograms are not emitted by 06.1. (Forward-looking.)
 Rule SN8: Per-endpoint cluster stats are not emitted by 06.1. (Forward-looking.)
 ```
 
-### 29-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11; extended by phase 12)
+### 46-name table (introduced by phase 06.1; extended by phase 09; extended by phase 11; extended by phase 12; UNCHANGED in phase 13; extended by phase 14)
 
 `<stat_prefix>` is read from HCM config (already plumbed from phase 04). `<addr>` is the listener bind address normalized like Envoy does (e.g., `0.0.0.0:10000` → `0.0.0.0_10000`). `<n>` is the cluster name as configured in the bootstrap.
 
@@ -210,7 +211,31 @@ phase, the same name carries the actual count.
 
 **No new tag-extractor (phase 12):** csrf reuses the existing `envoy_http_conn_manager_prefix` HCM-namespace SN2 extractor — no new pattern needed. UNLIKE phase 11 which added the filter-specific `envoy_local_http_ratelimit_prefix` (Rule SN9 per ADR-0118), phase 12 introduces NO new SN flattening rule.
 
-**Total: 29 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
+**Compressor filter — 17 names per HCM stat_prefix (introduced by phase 14):**
+
+| Internal name | Type | Source | Filter | Description |
+|---|---|---|---|---|
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.header_compressor_overshadowed`           | counter | filter | compressor | every request where this codec was selectable but overshadowed by a higher-q-value alternative (phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.header_compressor_used`                   | counter | filter | compressor | every request where this codec was the negotiated selection (regardless of whether response was compressed; phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.header_identity`                          | counter | filter | compressor | every request where client requested identity (no compression; phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.header_not_valid`                         | counter | filter | compressor | every request where Accept-Encoding header was malformed (q-value parse error, etc.; phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.header_wildcard`                          | counter | filter | compressor | every request where client sent Accept-Encoding: * (phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.no_accept_header`                         | counter | filter | compressor | every request where client had no Accept-Encoding header (phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.not_compressed_etag`                      | counter | filter | compressor | every response skipped on ETag presence with disable_on_etag_header=true (phase 14 SPEC §11.7) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.response.compressed`                      | counter | filter | compressor | every response compressed on this codec (phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.response.content_length_too_small`        | counter | filter | compressor | every response skipped due to body below min_content_length (phase 14 SPEC §11.5 + §11.9) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.response.not_compressed`                  | counter | filter | compressor | every response skipped (any reason; sum of skip counters; phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.response.total_compressed_bytes`          | counter | filter | compressor | cumulative compressed-body bytes emitted on response side (phase 14 SPEC §11.5; tolerance per ADR-0133) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.response.total_uncompressed_bytes`        | counter | filter | compressor | cumulative pre-compression body bytes seen on response side (phase 14 SPEC §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.request.compressed`                       | counter | filter | compressor | request-side counter; ALWAYS-ZERO in MVP (request_direction_config silent-ignored; phase 14 SPEC §1.1 amendment 1 + §11.5) |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.request.content_length_too_small`         | counter | filter | compressor | request-side counter; ALWAYS-ZERO in MVP |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.request.not_compressed`                   | counter | filter | compressor | request-side counter; ALWAYS-ZERO in MVP |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.request.total_compressed_bytes`           | counter | filter | compressor | request-side counter; ALWAYS-ZERO in MVP |
+| `<HCM_stat_prefix>.compressor.<library>.<codec>.request.total_uncompressed_bytes`         | counter | filter | compressor | request-side counter; ALWAYS-ZERO in MVP |
+
+Phase 14 adds 17 new rows: 9 active in MVP + 6 always-zero `request.*` (request-side request_direction_config silent-ignored; couples to future request-side compression / decompressor phase) + 2 always-active total_bytes accumulators. NO new SN flattening rule (uses existing SN2 per phase 14 SPEC §1.1 amendment 3). Prometheus rendering: `envoy_http_compressor_<library>_<codec>_<counter>{envoy_http_conn_manager_prefix=<HCM_stat_prefix>}`. `<library_name>` is operator-supplied (`compressor_library.name`); empty allowed; emits with consecutive dots. The `response.` infix appears IFF `response_direction_config` is set on the listener-level Compressor (per compressor.proto line 158-164).
+
+**Total: 46 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12 + 0 from 13 + 17 from 14). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline.
 
 **Phase 13 (buffer filter) note:** The `envoy.filters.http.buffer` filter shipped in phase 13 contributes ZERO new entries to this table. The filter has no filter-specific counter namespace at all (confirmed empirically at phase 13 SPEC §11.5 — reference Envoy v1.37.2 emits NO `envoy_http_buffer_*` counter family). Buffer-filter overflow is observable on the envoy-go side via the existing `downstream_rq_4xx` HCM counter (rendered via Rule SN4 status-class flattening as `envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="<HCM stat_prefix>"}`). The Envoy-only HCM counters `downstream_rq_too_large` (increments on every 413) and `downstream_rq_completed` (increments on every completed request) are NOT in this table; they are filtered out of the differential per the `### Twin-series filter discipline` allow-list discipline below.
 
@@ -1274,6 +1299,86 @@ The buffer filter does NOT inspect `Content-Length` in `DecodeHeaders`. The cap 
 - Status `418 Unknown`: HTTP/1.1 status text "Unknown" because 418 is not a stdlib-known status code on Envoy's HTTP/1.1 codec; the payload includes the user-supplied `x-from: filterB` header alongside the framework-injected `content-length` / `content-type` / `date` / `server`.
 - envoy-go's `chain.beginLocalReply` MUST: (a) abort decode-side iteration at the calling filter's index; (b) enter encode-side iteration at `filter[len-1]` of the encode-side set (NOT at the calling filter's index, NOT at index 0); (c) iterate the FULL encode chain in reverse order (every encode-side filter runs); (d) merge framework-injected standard headers (`content-length`, `content-type`, `date`, `server`) with the user-supplied headers (`x-from`).
 
+### envoy.filters.http.compressor
+
+Phase 14 ships `envoy.filters.http.compressor` (gzip-only response-side MVP) per the canonical Envoy v1.37.2 filter spec under the 07.1 framework. envoy-go's MVP envelope is the SEVENTH `§9` family-row (after cors @ 07.1, fault @ 09, header_mutation @ 10, local_ratelimit @ 11, csrf @ 12, buffer @ 13). It is the SECOND filter using the ADR-0125 5th canonical disabled-OR-override per-route discipline (after buffer).
+
+#### Field decomposition
+
+**Listener-level `envoy.extensions.filters.http.compressor.v3.Compressor` (15 fields enumerated; 6 consumed + 9 silent-ignored at the listener-level proto):**
+
+| Field | Type | Phase 14 disposition | Notes |
+|---|---|---|---|
+| `compressor_library` | TypedExtensionConfig | CONSUMED | REQUIRED per Envoy PGV; envoy-go gzip-only MVP rejects non-Gzip TypeURLs at parse with envoy-go-own error (per ADR-0130). |
+| `response_direction_config.common_config.min_content_length` | UInt32Value | CONSUMED | Default 30 (per phase 14 SPEC §11.9 empirical). |
+| `response_direction_config.common_config.content_type` | []string | CONSUMED | Default 8-entry list (per phase 14 SPEC §11.1 empirical). |
+| `response_direction_config.disable_on_etag_header` | bool | CONSUMED | Dual-mode per phase 14 SPEC §1.1 amendment 6 + §11.7. |
+| `response_direction_config.remove_accept_encoding_header` | bool | CONSUMED | Strips Accept-Encoding from upstream-bound request. |
+| `response_direction_config.uncompressible_response_codes` | []uint32 | CONSUMED | Default empty `[]` (per phase 14 SPEC §11.2 empirical). |
+| `response_direction_config.common_config.enabled` | RuntimeFeatureFlag (BoolValue default) | SILENT-IGNORED | Always-active runtime; OPTIONAL at parse-time (per phase 14 SPEC §1.1 amendment 2 + §11.3). Divergence-window if `default_value: false`. |
+| `response_direction_config.common_config.runtime_key` | string | SILENT-IGNORED | Couples to Runtime + hot restart family. |
+| `response_direction_config.response_direction_feature_*` | various | SILENT-IGNORED | Subset of compressor-specific knobs not exposed in MVP. |
+| `status_header_enabled` | bool | SILENT-IGNORED | Always-no-status-header; the `x-envoy-compression-status:` debug header is not emitted. Divergence-window if set true. |
+| `request_direction_config` | RequestDirectionConfig | SILENT-IGNORED | Always-disabled; envoy-go MVP is response-only. Divergence-window if set with `enabled: true`. |
+| `runtime_enabled` | RuntimeFeatureFlag | SILENT-IGNORED | Deprecated; superseded by `response_direction_config.common_config.enabled`. |
+| `choose_first` | bool | SILENT-IGNORED | Always-q-value-based selection. Divergence-window if `true` AND multi-coding AE. |
+| `content_length` (deprecated) | UInt32Value | SILENT-IGNORED | Deprecated top-level mirror of `response_direction_config.common_config.min_content_length`. |
+| `content_type` (deprecated) | []string | SILENT-IGNORED | Deprecated top-level mirror. |
+| `disable_on_etag_header` (deprecated) | bool | SILENT-IGNORED | Deprecated top-level mirror. |
+| `remove_accept_encoding_header` (deprecated) | bool | SILENT-IGNORED | Deprecated top-level mirror. |
+
+**Codec-library `envoy.extensions.compression.gzip.compressor.v3.Gzip` (5 fields; 2 consumed + 3 silent-ignored):**
+
+| Field | Type | Phase 14 disposition | Notes |
+|---|---|---|---|
+| `compression_level` | enum | CONSUMED | Mapped to Go `compress/gzip` level constant per ADR-0130 §Decision (iv) table. |
+| `compression_strategy` | enum | CONSUMED | Only `HUFFMAN_ONLY` honored; all others collapse to default. |
+| `memory_level` | UInt32Value | SILENT-IGNORED | Go gzip does not expose libz memory-level knob. |
+| `window_bits` | UInt32Value | SILENT-IGNORED | Go gzip does not expose libz window-bits knob. |
+| `chunk_size` | UInt32Value | SILENT-IGNORED | Go gzip does not expose libz chunk-size knob. |
+
+`compressor_library` non-Gzip TypeURLs are PARSE-REJECTED at boot with envoy-go-own error wording (per ADR-0130). Reference Envoy accepts `envoy.extensions.compression.{brotli,zstd}.compressor.v3.{Brotli,Zstd}`; envoy-go MVP refuses.
+
+**Per-route `CompressorPerRoute`:** oneof `disabled: true` OR `overrides: CompressorOverrides`. The `CompressorOverrides` shape carries `response_direction_config: ResponseDirectionOverrides` (only `remove_accept_encoding_header` BoolValue) + `compressor_library: TypedExtensionConfig` (silent-ignored per phase 14 SPEC §2.2). Per-route override of `min_content_length`, `content_type`, `disable_on_etag_header`, `uncompressible_response_codes`, `enabled`, `status_header_enabled`, `runtime_enabled`, `choose_first`, `request_direction_config` is STRUCTURALLY IMPOSSIBLE in Envoy v1.37.2's proto.
+
+#### Wire shape
+
+Compressed-path response wire shape (envoy-go MVP):
+- `content-type: <preserved>` — content-type preserved from upstream/direct_response.
+- `content-encoding: gzip` — set by filter on compress path.
+- `vary: Accept-Encoding` — appended to existing Vary OR set if absent (per phase 14 SPEC §1.1 amendment 5 — APPEND ALWAYS, even on existing `Vary: *`). Token-match dedup (case-insensitive).
+- `content-length: <gzipped-byte-count>` — fixed Content-Length (envoy-go writeH1Reply unconditional rewrite per `internal/filter/hcm/codec.go:87-89`).
+- NO `transfer-encoding: chunked` — envoy-go MVP does not support chunked output on the encode side.
+- ETag mode-a (`disable_on_etag_header: false`, default): strong-ETag stripped (regex `^"[^"]*"$` match → header deleted); weak-ETag preserved (regex `^W/"[^"]*"$`). RFC 7232 §2.3 motivation per phase 14 SPEC §1.1 amendment 6.
+- ETag mode-b (`disable_on_etag_header: true`): skip compression entirely on any ETag presence; `not_compressed_etag +1`.
+
+**Wire-shape divergence-window from reference Envoy (deliberate; ADR-0131 records):** Envoy emits `transfer-encoding: chunked` (NO `content-length`) on every compressed response (per phase 14 SPEC §11.9 empirical evidence covering body sizes 30 / 1024 bytes). envoy-go MVP emits fixed CL identity. The differential fixture 0016's allow-list excludes `content-length` value comparison + `transfer-encoding` presence on compressed scenarios.
+
+Compressed-path body shape: **decompressed-byte-equivalent to original** (per phase 14 SPEC §11.14 + ADR-0133 — decompress-and-compare assertion); compressed bytes structurally non-byte-exact between Go `compress/gzip` (default `OS: 255`, varying `XFL`) and Envoy libz (`OS: 03 UNIX`, `XFL: 00`). Forward-pointer to a future encode-side streaming framework phase per ADR-0131.
+
+Skip-path response wire shape: identity body unmodified; NO `content-encoding`; Vary INJECTED on AE-side-skip paths (no AE / identity / wildcard-uncompressed / not_valid) but NOT on server-side-skip paths (content-type-mismatch / already-encoded / etag-disabled / no-transform / content-length-too-small / uncompressible-status) per phase 14 SPEC §1.1 amendment / §11.15.
+
+#### Per-route disabled-OR-override 5th canonical (per ADR-0125 amendment §(viii)-(x) + phase 14 SPEC §1.1 amendment 4)
+
+Phase 14 is the SECOND row using ADR-0125 5th canonical disabled-OR-override discipline (after phase-13 buffer). Per-route override surface is FILTER-SPECIFIC and NARROWER than the listener-level config (only `remove_accept_encoding_header` per `ResponseDirectionOverrides` proto + per-route library swap silent-ignored). Per-route stats SHARED with listener-level (mirrors phase-12 csrf ADR-0124 + phase-13 buffer ADR-0125; DIVERGES from phase-11 local_ratelimit ADR-0117 INDEPENDENT-stats).
+
+#### HCM `directResponseAction.response_headers_to_add` plumbing (per ADR-0134)
+
+Phase 14 introduces a single new framework primitive at the HCM `directResponseAction` boundary: route-level `response_headers_to_add` entries are now plumbed through `buildExtraResponseHeaders` into `directResponseAction.extraHeaders` and applied at `body()` with `OVERWRITE_IF_EXISTS_OR_ADD` semantics. The motivation is fixture-0016 scenario 2 (image/png content-type-skip path), which requires the route's `Content-Type: image/png` override to take effect on envoy-go's direct_response body so the compressor's content-type predicate sees the correct value. Only the `OVERWRITE_IF_EXISTS_OR_ADD` `AppendAction` is honored at parse; `APPEND_IF_EXISTS_OR_ADD` / `ADD_IF_ABSENT` / `OVERWRITE_IF_EXISTS` are reserved for future support (parse-time rejection). Fixture configs MUST set the action explicitly. See ADR-0134.
+
+#### Stat surface (17 counters per HCM stat_prefix; per ADR-0132)
+
+Phase 14 emits 17 counters per HCM stat_prefix, namespaced `compressor.<library_name>.<codec>.[response.]<counter>` per phase 14 SPEC §11.5 empirical scrape. The 17-counter set is enumerated in `## Stat-name mapping ### 46-name table` below. Per-route stats are SHARED with listener-level (mirror of phase-12 csrf + phase-13 buffer; DIVERGES from phase-11 local_ratelimit independent stats per ADR-0117).
+
+**Per-counter empirical divergence-window pinned at Task 14** (4 counters where reference Envoy v1.37.2 + envoy-go diverge by design choice; both sides are valid implementations of the contract — see Phase 14 forward-pointer notes for the table):
+
+- `header_compressor_used` (ref=3, subj=5 on the 0016 6-scenario workload) — envoy-go caches Accept-Encoding classification BEFORE per-route `remove_accept_encoding_header` strips the header (per ADR-0129 same-`*filter` discipline); reference Envoy reclassifies post-strip.
+- `header_not_valid` (ref=1, subj=0) — reference Envoy's post-strip reclassification on per-route-rmAE routes classifies as `not_valid`; envoy-go's cached state classifies as `no_accept_header`.
+- `response_not_compressed` (ref=3, subj=2) — reference Envoy's per-route-disabled scenario STILL increments the counter despite the filter being wholly inactive; envoy-go's per-route-disabled path is wholly silent per ADR-0125.
+- `request_not_compressed` (ref=6, subj=0) — reference Envoy increments PER REQUEST even with `response_direction_config`-only setups; envoy-go MVP's request side is silent per ADR-0132 twin-series discipline (couples to future decompressor phase).
+
+These four counters are tested via per-side empirical assertion in fixture 0016 (mode `counterModePerSideExact`); cross-side delta-equality applies to the other 13 counters. See Phase 14 forward-pointer notes for forward-points.
+
 ### Applies to
 - Phase 07.1 onward (HTTP filter framework).
 
@@ -1629,3 +1734,37 @@ tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,
 **Framework deltas at `internal/filter/hcm/connection.go`:** Phase 13 introduces two HCM primitives (synthetic empty-terminal `RunDecodeData` on chunked-body EOF + post-body CL reconciliation propagating filter-set `Content-Length` into `req.ContentLength`) to support the `maybeAddContentLength` observable. These are the FIRST framework deltas since phase 07.1's body-buffering machinery. Documented in ADR-0128. Future filters relying on chunked → fixed-CL conversion at the upstream boundary can rely on these primitives.
 
 **Phase-04 `Expect: 100-continue` deferral:** envoy-go's `connection.go:122` categorically rejects any request carrying `Expect:` with 417 (pre-filter-chain guard). The buffer filter's `Expect: 100-continue` + overflow path (which would emit 100-Continue before the 413 in reference Envoy) cannot fire in envoy-go MVP. Tracked for future fix in the phase-04 Expect-handling bundle; cross-referenced in ADR-0127 v2 §Decision (v).
+
+### Phase 14 forward-pointer notes
+
+**Deferred field families** (silent-ignored / parse-rejected per ADR-0040 + ADR-0130; see `### envoy.filters.http.compressor ### Field decomposition` above + phase 14 SPEC §2.1 for the full field map):
+
+- `Compressor.compressor_library` non-Gzip TypeURLs (envoy-go-only PARSE-time rejection per ADR-0130) — coupled to future codec-extension phases (brotli + zstd). Reference Envoy accepts `envoy.extensions.compression.{brotli,zstd}.compressor.v3.{Brotli,Zstd}`; envoy-go rejects with envoy-go-own error wording. Future re-activation: codec phases extend ADR-0130 + add codec-library dispatch helpers.
+- `Compressor.request_direction_config` (silent-ignored at parse + runtime per ADR-0130) — coupled to future request-side compression phase + the future `envoy.filters.http.decompressor` filter.
+- 4 deprecated top-level mirror fields (`content_length`, `content_type`, `disable_on_etag_header`, `remove_accept_encoding_header`) — silent-ignored at parse; operators MUST use the `response_direction_config` paths.
+- `Compressor.runtime_enabled` + `response_direction_config.common_config.enabled` (RuntimeFeatureFlag fields) — silent-ignored at runtime; envoy-go always-100%-active. Couples to Runtime + hot restart family.
+- `Compressor.choose_first` — always-q-value-based selection; divergence-window when set true AND multi-coding AE.
+- `Compressor.response_direction_config.status_header_enabled` — always-no-status-header; the `x-envoy-compression-status:` debug header is not emitted. Operator divergence-window when set true.
+- `Gzip.{memory_level, window_bits, chunk_size}` — silent-ignored; Go `compress/gzip` does not expose libz-equivalent knobs.
+- Per-route `overrides.compressor_library` (per-route library swap) — silent-ignored at parse + runtime; envoy-go uses listener-level library regardless of per-route override.
+
+**Wire-shape divergence-window from reference Envoy (per ADR-0131 + phase 14 SPEC §11.9):** Envoy emits `Transfer-Encoding: chunked` + no `Content-Length` on every compressed response; envoy-go MVP emits fixed `Content-Length: <gzipped-len>` + identity transfer. Decompressed body bytes are byte-equivalent (gzip-format multi-encoding spec admits both). Compressed body bytes structurally diverge — Go `compress/gzip` (default `OS: 255`, variable `XFL`) vs. Envoy libz (`OS: 03 UNIX`, `XFL: 00`). Future re-activation: encode-side streaming framework phase (`writeH1Reply` chunked-output mode + `EncoderFilterCallbacks.EmitChunk` + chunk-by-chunk `RunEncodeData` invocation in HCM).
+
+**Framework deltas at `internal/filter/http/callbacks.go` + `chain.go` + `internal/filter/hcm/connection.go` + `h2dispatch.go`:** Phase 14 introduces `EncoderFilterCallbacks.OverwriteBody(b []byte)` interface method (1 LoC) + encoderCB.OverwriteBody impl (~6 LoC at chain.go) + per-stream encode-body-override field (~2 LoC) + accessor (~3 LoC) + HCM-side post-RunEncodeData harvest at H1 + H2 dispatch paths (~6-8 LoC each). Total ~20-25 LoC. Symmetric to phase-13 ADR-0128's decode-side primitives. Future filters needing encode-side body mutation (decompressor; bandwidth_limit transform mode; future codec/transform filters) can rely on this primitive.
+
+**HCM `directResponseAction.response_headers_to_add` plumbing (per ADR-0134):** Phase 14 uncovers an unanticipated framework gap at integration time — pre-phase-14 envoy-go's `directResponseAction.body()` hardcoded `Content-Type: text/plain` ignoring the route-level `response_headers_to_add`. The fixture-0016 scenario 2 (image/png content-type-skip path) required the route-level override to land on the direct_response body before the compressor's content-type predicate sees it. Phase 14 adds `directResponseAction.extraHeaders` + `buildExtraResponseHeaders` parser at `internal/filter/hcm/{actions.go, config.go}` (~100 LoC including 7 unit tests) with `OVERWRITE_IF_EXISTS_OR_ADD`-only AppendAction support; `APPEND_IF_EXISTS_OR_ADD` / `ADD_IF_ABSENT` / `OVERWRITE_IF_EXISTS` are reserved for future support (parse-time rejection). Fixture configs MUST set the action explicitly. Future filters with route-level direct_response interactions can rely on this primitive.
+
+**`min_content_length` late-revert anomaly:** when Content-Length is unset at EncodeHeaders + body length emerges below threshold only at EncodeData, the filter cannot revert headers. Phase 14 documents but defers; structurally rare in envoy-go's framework. Future cap-promotion or revert-headers-primitive phase may revisit. See ADR-0131 §Decision (vii).
+
+**Stat namespace shape:** `compressor.<library_name>.<codec>.[response.]<counter>`. `<library_name>` is operator-supplied (`compressor_library.name`); empty allowed; emits with consecutive dots. `[response.]` infix appears IFF `response_direction_config` is set on the listener-level Compressor (per compressor.proto line 158-164). Phase-14 fixture 0016 uses `name: text_optimized` on both sides + always sets `response_direction_config` for byte-equivalent stat namespace.
+
+**Per-side empirical-divergence counters (Task 14 pin):** four counters where reference Envoy v1.37.2 + envoy-go diverge by design choice on the 0016 6-scenario workload — both sides are valid implementations of the documented contract; the differential locks both per-side via `counterModePerSideExact`:
+
+| Counter | Ref Envoy v1.37.2 | envoy-go MVP | Root cause |
+|---|---|---|---|
+| `header_compressor_used` | 3 | 5 | envoy-go caches AE classification BEFORE per-route rmAE strip (ADR-0129 same-`*filter`); ref reclassifies post-strip |
+| `header_not_valid` | 1 | 0 | ref's post-strip reclassification on rmAE routes returns `not_valid`; envoy-go's cached state returns `no_accept_header` |
+| `response_not_compressed` | 3 | 2 | ref's per-route-disabled STILL increments despite filter being wholly inactive; envoy-go's per-route-disabled wholly silent (ADR-0125) |
+| `request_not_compressed` | 6 | 0 | ref increments PER REQUEST even with response-only configs; envoy-go MVP request side silent (ADR-0132 twin-series; couples to future decompressor phase) |
+
+Future re-activation of cross-side delta-equality on these 4 counters couples to: (a) AE-classification semantics alignment (could go either direction in a future refactor; both sides are valid); (b) per-route-disabled stat-emission discipline (ADR-0125 amendment if envoy-go decides to emit the SHARED-stats counter even on disabled-route paths); (c) request-side activation (decompressor phase / `request_direction_config` activation).

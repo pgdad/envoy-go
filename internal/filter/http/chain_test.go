@@ -1351,3 +1351,95 @@ func TestChain_EncodeData_BelowCapNoSentinel(t *testing.T) {
 		t.Fatalf("expected a.EncodeData called 3 times; got %d", a.encodeData.Load())
 	}
 }
+
+// --- ADR-0131 §Decision (vi) OverwriteBody primitive integration tests ---
+
+// overwriteBodyProbe is a test-only StreamEncoderFilter that calls
+// OverwriteBody on its callback during EncodeData. Used to verify the
+// chain dispatch substitutes resp.Body before wire-write.
+type overwriteBodyProbe struct {
+	cb       EncoderFilterCallbacks
+	override []byte
+	called   bool
+}
+
+func (p *overwriteBodyProbe) EncodeHeaders(http.Header, bool) FilterHeadersStatus {
+	return Continue
+}
+func (p *overwriteBodyProbe) EncodeData([]byte, bool) FilterDataStatus {
+	if p.override != nil {
+		p.cb.OverwriteBody(p.override)
+		p.called = true
+	}
+	return DataContinue
+}
+func (p *overwriteBodyProbe) EncodeTrailers(http.Header) FilterTrailersStatus {
+	return TrailersContinue
+}
+func (p *overwriteBodyProbe) SetEncoderCallbacks(cb EncoderFilterCallbacks) { p.cb = cb }
+func (p *overwriteBodyProbe) OnDestroy()                                    {}
+
+// newProbeChain wires a single-filter chain whose only filter is the
+// supplied overwriteBodyProbe (encode-only, no decode side). Mirrors
+// newChainOf's discipline but for a probe with no decode-side surface.
+func newProbeChain(p *overwriteBodyProbe) *FilterChain {
+	return NewFilterChain([]HTTPFilter{{Name: "probe", Encoder: p}}, nil)
+}
+
+func TestEncoderCB_OverwriteBody_StoresBytes_AccessorReflects(t *testing.T) {
+	probe := &overwriteBodyProbe{override: []byte("REPLACED")}
+	chain := newProbeChain(probe)
+	terminated, err := chain.RunEncodeData(context.Background(), []byte("ORIGINAL"), true)
+	if err != nil {
+		t.Fatalf("RunEncodeData: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunEncodeData to terminate")
+	}
+	body, ok := chain.EncodeBodyOverride()
+	if !ok {
+		t.Fatal("expected EncodeBodyOverride() to return ok=true")
+	}
+	if string(body) != "REPLACED" {
+		t.Errorf("expected body=%q; got %q", "REPLACED", body)
+	}
+	if !probe.called {
+		t.Error("expected probe to have called OverwriteBody")
+	}
+}
+
+func TestEncoderCB_NoOverwriteBody_AccessorReturnsFalse(t *testing.T) {
+	probe := &overwriteBodyProbe{override: nil} // does NOT call OverwriteBody
+	chain := newProbeChain(probe)
+	terminated, err := chain.RunEncodeData(context.Background(), []byte("ORIGINAL"), true)
+	if err != nil {
+		t.Fatalf("RunEncodeData: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunEncodeData to terminate")
+	}
+	body, ok := chain.EncodeBodyOverride()
+	if ok {
+		t.Errorf("expected EncodeBodyOverride() to return ok=false; got body=%q", body)
+	}
+	if body != nil {
+		t.Errorf("expected nil body when not overridden; got %q", body)
+	}
+}
+
+func TestEncoderCB_OverwriteBody_PassthroughOnSubsequentInvocations(t *testing.T) {
+	// override survives on a chain that runs RunEncodeData multiple times
+	// (relevant for future non-MVP scenarios; current MVP invokes once).
+	probe := &overwriteBodyProbe{override: []byte("REPLACED")}
+	chain := newProbeChain(probe)
+	if _, err := chain.RunEncodeData(context.Background(), []byte("CHUNK1"), false); err != nil {
+		t.Fatalf("RunEncodeData chunk1: %v", err)
+	}
+	if _, err := chain.RunEncodeData(context.Background(), []byte("CHUNK2"), true); err != nil {
+		t.Fatalf("RunEncodeData chunk2: %v", err)
+	}
+	body, ok := chain.EncodeBodyOverride()
+	if !ok || string(body) != "REPLACED" {
+		t.Errorf("expected ok=true + REPLACED; got (ok=%v, body=%q)", ok, body)
+	}
+}

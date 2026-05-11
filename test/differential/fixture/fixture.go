@@ -226,6 +226,23 @@ const (
 	// 0015-http-buffer (phase 13 Task 7). Because the backend is a subprocess,
 	// the runner's in-process accept counter is NOT incremented.
 	HTTPBuffer BackendKind = 12
+	// HTTPCompressor is an out-of-process HTTP/1.1 backend: the runner spawns
+	// the SHARED test/helpers/echobackend/cmd/echobackend binary on the pre-
+	// allocated port. The backend echoes the inbound request method + path +
+	// headers (lowercased canonical keys per ADR-0072) as a JSON object in the
+	// response body — load-bearing for fixture 0016 scenario 6's per-route
+	// remove_accept_encoding_header assertion (driver decompresses the gzipped
+	// response body and asserts no "accept-encoding" key in the echoed headers
+	// map, proving the per-route override stripped AE before forwarding
+	// upstream). Status 200; Content-Type: application/json. No TLS.
+	// Introduced by fixture 0016-http-compressor (phase 14 Task 10) per
+	// planner-time decision 12 (D7 settlement) — the FIRST consumer of the
+	// shared echobackend helper at test/helpers/echobackend/ (phase-13
+	// buffer's per-fixture backend at test/fixtures/0015-http-buffer/backends/
+	// MAY be migrated to use the shared helper in a future cleanup; out of
+	// scope for phase 14). Because the backend is a subprocess, the runner's
+	// in-process accept counter is NOT incremented.
+	HTTPCompressor BackendKind = 13
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

@@ -473,6 +473,16 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 				return status, err
 			}
 		}
+		// After chain.RunEncodeData returns, harvest any encode-body override.
+		// Per ADR-0131 §Decision (vi): filters that compress / transform the
+		// response body register the new bytes via cb.OverwriteBody(b); the
+		// chain stores them on c.encodeBodyOverride; HCM substitutes resp.Body
+		// before writeH1Reply consumes it. writeH1Reply rewrites Content-Length
+		// unconditionally per codec.go, so substituting bytes here is the
+		// load-bearing wire-shape mutation point.
+		if override, ok := chain.EncodeBodyOverride(); ok {
+			resp.Body = override
+		}
 	}
 
 	bytesSent := int64(len(resp.Body))

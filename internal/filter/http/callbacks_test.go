@@ -36,6 +36,7 @@ func (c *fakeEncoderCB) ContinueEncoding()               {}
 func (c *fakeEncoderCB) EncodeHeaders(http.Header, bool) {}
 func (c *fakeEncoderCB) EncodeData([]byte, bool)         {}
 func (c *fakeEncoderCB) EncodeTrailers(http.Header)      {}
+func (c *fakeEncoderCB) OverwriteBody([]byte)            {}
 
 func TestEncoderFilterCallbacks_Compile(t *testing.T) {
 	var _ EncoderFilterCallbacks = (*fakeEncoderCB)(nil)
