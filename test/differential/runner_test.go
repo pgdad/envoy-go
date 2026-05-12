@@ -39,6 +39,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0014-http-csrf/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0015-http-buffer/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0016-http-compressor/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0017-http-bandwidth-limit/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -316,6 +317,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
 		case fixture.HTTPCompressor:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPBandwidthLimit:
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)

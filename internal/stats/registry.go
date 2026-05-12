@@ -170,6 +170,40 @@ func (r *Registry) NewCounterIfAbsent(name string) *Counter {
 	return c
 }
 
+// NewGaugeIfAbsent returns the gauge for `name` if already registered,
+// otherwise registers and returns a new one. Gauge counterpart to
+// NewCounterIfAbsent; same semantics — idempotent and PERMITTED post-Freeze.
+//
+// Used by per-route filter configurations that emit *Gauge primitives whose
+// stat_prefix is data-driven and not knowable at boot time. Phase 15's
+// bandwidth_limit filter introduced this pair: phase 11 (local_ratelimit) had
+// counter-only stats, so NewGaugeIfAbsent was deferred; phase 15's
+// bandwidth_limit emits 6 gauges per stat_prefix (request_pending,
+// request_incoming_size, request_allowed_size + response_* symmetric) under
+// the 14-active-stat surface per ADR-0138, requiring per-route gauge
+// allocation post-Freeze.
+//
+// Concurrency: safe for concurrent invocation; r.mu serializes the read +
+// register pair (same discipline as NewCounterIfAbsent).
+//
+// Per ADR-0117 (phase 11) + ADR-0139 (phase 15 per-route INDEPENDENT-stats
+// ratification — extending the NewCounterIfAbsent pattern to gauges).
+func (r *Registry) NewGaugeIfAbsent(name string) *Gauge {
+	r.checkName(name) // panic-on-invalid-name preserved (programmer error, not ops issue)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.byName[name]; ok {
+		if g, ok := existing.(*Gauge); ok {
+			return g
+		}
+		panic(fmt.Sprintf("stats: NewGaugeIfAbsent: name %q registered as non-Gauge", name))
+	}
+	g := &Gauge{name: name}
+	r.metrics = append(r.metrics, g)
+	r.byName[name] = g
+	return g
+}
+
 // Freeze locks the metric list. Subsequent NewCounter / NewGauge calls panic.
 // Idempotent; safe for concurrent calls.
 func (r *Registry) Freeze() { r.frozen.Store(true) }

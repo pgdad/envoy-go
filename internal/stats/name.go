@@ -120,6 +120,46 @@ func flattenToProm(internal string) (string, []Label, error) {
 				}
 			}
 		}
+		// Phase-15 bandwidth_limit inline-prefix detection per SPEC §11.P10 +
+		// §11.P11 + §1.1 amendment 8 + ADR-0138 §Decision (iii). The internal
+		// stat path `<stat_prefix>.http_bandwidth_limit.<counter>` (mirrors
+		// phase-11 local_ratelimit's ADR-0118 SN9-shape) flattens to Prometheus
+		// `envoy_<stat_prefix>_http_bandwidth_limit_<counter>{}` with NO label
+		// extraction (stat_prefix INLINED into base name; NO tag-extractor).
+		//
+		// This is NOT a new SN-numbered rule per ADR-0138 §Alternative (b)
+		// rejected "new SN10 rule with tag-extractor" — it is a filter-specific
+		// inline-prefix detection (no label promotion; no per-segment
+		// extraction; just dot→underscore substitution + envoy_ prefix). KEEP
+		// IN SYNC with newFilterStats / newFilterStatsIfAbsent in
+		// internal/filter/http/bandwidthlimit/bandwidthlimit.go: the 14
+		// canonical names below MUST match the filter's emitted set per SPEC
+		// §1.1 amendment 7 (8 counters + 6 gauges).
+		//
+		// Per SPEC §11.P10 + ADR-0138.
+		const blSegment = ".http_bandwidth_limit."
+		if idx := strings.Index(internal, blSegment); idx > 0 {
+			prefix := internal[:idx]
+			counter := internal[idx+len(blSegment):]
+			// Validate: prefix has no dots; counter is one of the 14 known
+			// active names. Per amendment 7 (8 counters + 6 gauges).
+			if !strings.ContainsRune(prefix, '.') {
+				switch counter {
+				case "request_enabled", "request_enforced",
+					"request_incoming_total_size", "request_allowed_total_size",
+					"response_enabled", "response_enforced",
+					"response_incoming_total_size", "response_allowed_total_size",
+					"request_pending", "request_incoming_size", "request_allowed_size",
+					"response_pending", "response_incoming_size", "response_allowed_size":
+					// Inline-prefix shape: NO label promotion. The full
+					// dot→underscore substitution produces the Prometheus base.
+					base = "envoy_" + strings.ReplaceAll(internal, ".", "_")
+					// Skip SN4 status-class collapse (bandwidth_limit names
+					// do not carry _Nxx suffixes).
+					return base, nil, nil
+				}
+			}
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 

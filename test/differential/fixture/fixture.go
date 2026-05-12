@@ -243,6 +243,23 @@ const (
 	// scope for phase 14). Because the backend is a subprocess, the runner's
 	// in-process accept counter is NOT incremented.
 	HTTPCompressor BackendKind = 13
+	// HTTPBandwidthLimit is an out-of-process HTTP/1.1 backend: the runner spawns
+	// the SHARED test/helpers/echobackend/cmd/echobackend binary on the pre-
+	// allocated port (the same shared helper introduced at phase 14 Task 10 per
+	// planner-time decision 12 / D7 settlement). The backend echoes the inbound
+	// request method + path + headers (lowercased canonical keys per ADR-0072) as
+	// a JSON object in the response body. Status 200; Content-Type:
+	// application/json. No TLS. Introduced by fixture 0017-http-bandwidth-limit
+	// (phase 15 Task 10): scenarios 2 (decode-side throttle) + 3 (encode-side
+	// throttle) need a real upstream cluster (c_backend_b) so the differential
+	// can observe per-direction token-bucket pacing on a real body round-trip;
+	// scenarios 1 (filter disabled by runtime), 4 (per-route override), 5
+	// (per-route disable), and 6 (multi-direction REQUEST_AND_RESPONSE) use
+	// direct_response and therefore do NOT touch the echo backend (the runner
+	// still spawns it because BackendCount() reports the maximum across all
+	// scenarios). Because the backend is a subprocess, the runner's in-process
+	// accept counter is NOT incremented.
+	HTTPBandwidthLimit BackendKind = 14
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

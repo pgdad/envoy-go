@@ -279,3 +279,115 @@ func TestFlattenToProm_SN9_RejectsDoublyNestedSegment(t *testing.T) {
 		t.Error("flattenToProm with doubly-nested SN9 segment: want error, got nil")
 	}
 }
+
+// Phase-15 bandwidth_limit inline-prefix detection tests (ADR-0138 + SPEC
+// §11.P10 + §11.P11). Mirrors phase-11's SN9 test discipline above; the
+// bandwidth_limit shape `<stat_prefix>.http_bandwidth_limit.<counter>` is a
+// structural parallel to SN9 BUT differs in TWO load-bearing ways:
+//
+//	(a) NO label promotion — stat_prefix is INLINED into the Prometheus base
+//	    name (`envoy_<stat_prefix>_http_bandwidth_limit_<counter>{}` with NO
+//	    labels), NOT extracted as a tag-extractor-driven label.
+//	(b) 14 canonical counter+gauge names (8 counters + 6 gauges per amendment
+//	    7), not the 4 SN9 names.
+//
+// Per ADR-0138 §Alternative (b) rejected "new SN10 rule with tag-extractor"
+// — this is a filter-specific inline-prefix detection, NOT a new SN-numbered
+// rule. The tests below pin the boundary behavior at the flattenToProm layer
+// (the higher-level WriteProm pipeline tests in bandwidthlimit_test.go
+// exercise the same code via a different entry point).
+
+func TestFlattenToProm_BandwidthLimit_Basic(t *testing.T) {
+	base, labels, err := flattenToProm("default.http_bandwidth_limit.request_enabled")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	want := "envoy_default_http_bandwidth_limit_request_enabled"
+	if base != want {
+		t.Errorf("base: got %q, want %q", base, want)
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels: got %v, want [] (inline-prefix: stat_prefix is INLINED into base, NOT a label)", labels)
+	}
+}
+
+func TestFlattenToProm_BandwidthLimit_AllFourteenSuffixes(t *testing.T) {
+	// Per ADR-0138 §Decision (i) + SPEC §1.1 amendment 7: 8 counters + 6
+	// gauges. KEEP IN SYNC with name.go's blSegment switch + bandwidthlimit.go's
+	// newFilterStats / newFilterStatsIfAbsent.
+	counters := []string{
+		// 8 counters.
+		"request_enabled", "request_enforced",
+		"request_incoming_total_size", "request_allowed_total_size",
+		"response_enabled", "response_enforced",
+		"response_incoming_total_size", "response_allowed_total_size",
+		// 6 gauges.
+		"request_pending", "request_incoming_size", "request_allowed_size",
+		"response_pending", "response_incoming_size", "response_allowed_size",
+	}
+	if len(counters) != 14 {
+		t.Fatalf("test setup: want exactly 14 counter+gauge names, got %d", len(counters))
+	}
+	for _, c := range counters {
+		t.Run(c, func(t *testing.T) {
+			internal := "test_prefix.http_bandwidth_limit." + c
+			base, labels, err := flattenToProm(internal)
+			if err != nil {
+				t.Fatalf("flattenToProm(%q): %v", internal, err)
+			}
+			wantBase := "envoy_test_prefix_http_bandwidth_limit_" + c
+			if base != wantBase {
+				t.Errorf("base: got %q, want %q", base, wantBase)
+			}
+			if len(labels) != 0 {
+				t.Errorf("labels: got %v, want [] (no label promotion)", labels)
+			}
+		})
+	}
+}
+
+func TestFlattenToProm_BandwidthLimit_PrefixWithUnderscores(t *testing.T) {
+	// stat_prefix can contain underscores (only `.` is the segment separator).
+	// The dot→underscore substitution applies to the entire internal name;
+	// existing underscores in stat_prefix pass through unchanged.
+	base, labels, err := flattenToProm("route_override.http_bandwidth_limit.response_pending")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	want := "envoy_route_override_http_bandwidth_limit_response_pending"
+	if base != want {
+		t.Errorf("base: got %q, want %q", base, want)
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels: got %v, want []", labels)
+	}
+}
+
+func TestFlattenToProm_BandwidthLimit_RejectsUnknownCounter(t *testing.T) {
+	// The blSegment switch only matches the 14 canonical names; any other
+	// suffix falls through to the default error return.
+	_, _, err := flattenToProm("default.http_bandwidth_limit.bogus_counter")
+	if err == nil {
+		t.Error("flattenToProm with unknown counter: want error, got nil")
+	}
+}
+
+func TestFlattenToProm_BandwidthLimit_RejectsLeadingDot(t *testing.T) {
+	// Leading-dot input: idx == 0 (segment match starts at position 0); the
+	// `idx > 0` guard rejects this so prefix can never be empty. The name
+	// falls through to the error return.
+	_, _, err := flattenToProm(".http_bandwidth_limit.request_enabled")
+	if err == nil {
+		t.Error("flattenToProm with leading-dot prefix: want error, got nil (idx==0 must reject)")
+	}
+}
+
+func TestFlattenToProm_BandwidthLimit_RejectsDoublyNestedSegment(t *testing.T) {
+	// Degenerate input: stat_prefix that itself contains a `.` (multi-segment
+	// prefix). The `!strings.ContainsRune(prefix, '.')` guard rejects this;
+	// the name falls through to the error return.
+	_, _, err := flattenToProm("default.http_bandwidth_limit.foo.bar.request_enabled")
+	if err == nil {
+		t.Error("flattenToProm with multi-segment prefix: want error, got nil")
+	}
+}

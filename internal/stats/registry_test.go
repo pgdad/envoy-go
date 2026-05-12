@@ -170,6 +170,58 @@ func TestNewCounterIfAbsent_BypassesFreeze(t *testing.T) {
 	}
 }
 
+func TestNewGaugeIfAbsent_RegistersWhenAbsent(t *testing.T) {
+	r := NewRegistry()
+	g := r.NewGaugeIfAbsent("test.gauge.first")
+	if g == nil || g.Name() != "test.gauge.first" {
+		t.Errorf("got %v, want non-nil gauge named test.gauge.first", g)
+	}
+}
+
+func TestNewGaugeIfAbsent_ReturnsExisting(t *testing.T) {
+	r := NewRegistry()
+	g1 := r.NewGauge("test.gauge.dup")
+	g2 := r.NewGaugeIfAbsent("test.gauge.dup")
+	if g1 != g2 {
+		t.Errorf("expected pointer-identical Gauge; got g1=%p g2=%p", g1, g2)
+	}
+}
+
+func TestNewGaugeIfAbsent_BypassesFreeze(t *testing.T) {
+	r := NewRegistry()
+	r.NewGauge("pre.freeze.gauge")
+	r.Freeze()
+	// NewGauge would panic; NewGaugeIfAbsent must succeed.
+	g := r.NewGaugeIfAbsent("post.freeze.gauge")
+	if g == nil {
+		t.Fatal("NewGaugeIfAbsent post-freeze returned nil")
+	}
+	// Verify subsequent lookup returns the same instance.
+	g2 := r.NewGaugeIfAbsent("post.freeze.gauge")
+	if g != g2 {
+		t.Errorf("idempotency: got %p / %p, want pointer-identical", g, g2)
+	}
+}
+
+// TestNewGaugeIfAbsent_TypeMismatch verifies that calling NewGaugeIfAbsent on
+// a name previously registered as a Counter panics with a clear message
+// (programmer error parity with NewCounterIfAbsent's symmetric guard).
+func TestNewGaugeIfAbsent_TypeMismatch(t *testing.T) {
+	r := NewRegistry()
+	r.NewCounter("test.gauge.typemismatch")
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			t.Fatal("expected panic on type mismatch (Counter registered, NewGaugeIfAbsent called)")
+		}
+		msg, ok := rec.(string)
+		if !ok || msg == "" {
+			t.Errorf("recovered non-string or empty panic: %v", rec)
+		}
+	}()
+	r.NewGaugeIfAbsent("test.gauge.typemismatch")
+}
+
 func TestRegistry_Walk_ConcurrentWithIncs_RaceClean(t *testing.T) {
 	r := NewRegistry()
 	c := r.NewCounter("conc.counter")

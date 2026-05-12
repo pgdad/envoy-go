@@ -1,0 +1,172 @@
+# Phase 15 fixture 0017 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per SPEC §7.2): two listeners `l_test_a` + `l_test_b` + cluster
+# `c_backend_b` (echobackend pair). Listener `l_test_a` HCM chain
+# `bandwidth_limit → router` with 6 routes; listener-level config:
+#   stat_prefix: default, enable_mode: REQUEST_AND_RESPONSE,
+#   limit_kbps: 10 (KiB/s per §1.1 amendment 6 — NOT kilobits-per-second),
+#   fill_interval: 50ms.
+# Throttle math (per §6.6 + §11.P15): chunk_size = limit_kbps × 1024 ×
+# fill_interval_seconds bytes; throttle = ceil(body/chunk_size) × fill_interval.
+# For the listener-level (10 KiB/s, 50ms): chunk_size = 512 bytes/tick.
+#
+# Six scenarios (sequential against `l_test_a`; per-scenario pre/post scrape).
+# Per SPEC §7.3 the driver asserts: status (200), byte-exact body length
+# (bandwidth_limit does NOT transform bytes — only paces them), total
+# wall-clock within ±70ms tolerance (per §11.P9 + §13.5), per-counter delta
+# byte-equivalence across the 14 active stats per stat_prefix (8 counters +
+# 6 gauges per §1.1 amendment 7 + ADR-0138). Internal-form stat names are
+# `<stat_prefix>.http_bandwidth_limit.<counter>` (§11.P11); Prometheus
+# rendering inlines stat_prefix into the base name as
+# `envoy_<stat_prefix>_http_bandwidth_limit_<counter>{}` per §11.P10 +
+# §1.1 amendment 8 (NO tag-extractor; NO SN10 rule).
+#
+# Scenario 1: response-only throttle (default route)
+#   Request:  GET /echo-response
+#   Response: 200; body 10240 bytes (direct_response); wall-clock ≈ 1000ms (±70ms;
+#             chunk_size=512, ticks=ceil(10240/512)=20, throttle=20×50ms=1000ms).
+#   Counters: default.http_bandwidth_limit.response_enabled +1,
+#             default.http_bandwidth_limit.response_enforced +20,
+#             default.http_bandwidth_limit.response_incoming_total_size +10240,
+#             default.http_bandwidth_limit.response_allowed_total_size +10240.
+#   Note:     SPEC §7.1 row 1 + §11.P8 + §11.P9 + §11.P15. The request-side
+#             enable bump on empty-body requests under REQUEST_AND_RESPONSE
+#             listener config is SETTLED EMPIRICALLY at Task 14; the driver's
+#             current expectations table conservatively omits it.
+#
+# Scenario 2: request-only throttle (per-route enable_mode: REQUEST override)
+#   Request:  POST /echo-request, body 10240 bytes ("A"×10240)
+#   Response: 200; body length per-side variable (echobackend JSON echo with
+#             Envoy-injected x-envoy-* / x-request-id / x-forwarded-* + host:port
+#             string variance per phase-14 ADR-0133 §Decision (ii) precedent);
+#             driver expectBodyLen=-1 SKIPS the byte-exact-length assertion;
+#             upstream-arrival ≈ 1000ms (±70ms; 20 ticks decode-side).
+#   Counters: default.http_bandwidth_limit.request_enabled +1,
+#             default.http_bandwidth_limit.request_enforced +20,
+#             default.http_bandwidth_limit.request_incoming_total_size +10240,
+#             default.http_bandwidth_limit.request_allowed_total_size +10240.
+#   Note:     SPEC §7.1 row 2. Per-route enable_mode=REQUEST → response side
+#             wholly inactive on this route; NO response-side increments.
+#
+# Scenario 3: REQUEST_AND_RESPONSE symmetric (inherits listener)
+#   Request:  POST /echo-both, body 5120 bytes ("B"×5120)
+#   Response: 200; body length per-side variable (echobackend echo; expectBodyLen
+#             =-1); total wall-clock ≈ 1000ms (±70ms; decode 500ms + encode 500ms
+#             sequential across round-trip; per-direction ticks=ceil(5120/512)=10).
+#   Counters: default.http_bandwidth_limit.request_enabled +1,
+#             default.http_bandwidth_limit.request_enforced +10,
+#             default.http_bandwidth_limit.request_incoming_total_size +5120,
+#             default.http_bandwidth_limit.request_allowed_total_size +5120,
+#             default.http_bandwidth_limit.response_enabled +1,
+#             default.http_bandwidth_limit.response_enforced +10,
+#             default.http_bandwidth_limit.response_incoming_total_size +5120,
+#             default.http_bandwidth_limit.response_allowed_total_size +5120.
+#   Note:     SPEC §7.1 row 3 verbatim. The response-side ticks may need
+#             empirical refinement at Task 14 against the actual echobackend
+#             body length (JSON-encoded; per-side variable per ADR-0133 §(ii)).
+#
+# Scenario 4: tiny body within one-tick floor (inherits listener)
+#   Request:  GET /echo-tiny
+#   Response: 200; body 100 bytes (direct_response); wall-clock ≈ 50ms (±70ms;
+#             100 < chunk_size=512 → one-tick floor per §6.6; ticks=1).
+#   Counters: default.http_bandwidth_limit.response_enabled +1,
+#             default.http_bandwidth_limit.response_enforced +1,
+#             default.http_bandwidth_limit.response_incoming_total_size +100,
+#             default.http_bandwidth_limit.response_allowed_total_size +100.
+#   Note:     SPEC §7.1 row 4 + §11.P9. The fast-passthrough threshold from
+#             BRAINSTORM §11.4 + §6.6 hypothesis (1ms) is REPLACED by the
+#             fillInterval floor (50ms) per §1.1 amendment 6.
+#
+# Scenario 5: per-route disabled (enable_mode: DISABLED)
+#   Request:  GET /echo-disabled
+#   Response: 200; body 10240 bytes (direct_response); wall-clock < 70ms (no
+#             throttle on disabled route per §11.P12; upper-bound-only assertion
+#             via assertWithinTolerance's expectThrottle==0 branch).
+#   Counters: NO increments — filter wholly inactive per §11.P12. All 14
+#             active stats stay at their pre-scenario values; the per-route
+#             enable_mode=DISABLED short-circuits BEFORE any counter bump
+#             (per SPEC §1.1 amendment 1 — DISABLED is the disable mechanism).
+#   Note:     SPEC §7.1 row 5 + §11.P12.
+#
+# Scenario 6: per-route INDEPENDENT-stats override (stat_prefix=override)
+#   Request:  GET /echo-override
+#   Response: 200; body 10240 bytes (direct_response); wall-clock ≈ 100ms (±70ms;
+#             per-route limit_kbps=100, fill_interval=50ms → chunk_size = 100 ×
+#             1024 × 0.050 = 5120 bytes/tick; ticks=ceil(10240/5120)=2;
+#             throttle=2×50ms=100ms).
+#   Counters: override.http_bandwidth_limit.response_enabled +1,
+#             override.http_bandwidth_limit.response_enforced +2,
+#             override.http_bandwidth_limit.response_incoming_total_size +10240,
+#             override.http_bandwidth_limit.response_allowed_total_size +10240.
+#             NO increments under default.http_bandwidth_limit.* — INDEPENDENT
+#             stats per ADR-0139 + SPEC §11.P4 + §11.P14 (per-route stat_prefix
+#             creates a fresh stat-namespace tree disjoint from the listener-
+#             level one).
+#   Note:     SPEC §7.1 row 6 + §11.P4 + §11.P14 + §11.P15. Phase-15 introduces
+#             a NEW canonical per-route pattern (bare-BandwidthLimit-via-TPFC +
+#             code-level-required-limit_kbps-at-per-route) per ADR-0139 +
+#             ADR-0125 §(xi) amendment; distinct from BOTH ADR-0117 (4th
+#             canonical) AND ADR-0125 (5th canonical disabled-OR-override).
+#
+# Total cross-scenario delta summary (envoy-go side; default namespace):
+#   default.http_bandwidth_limit.request_enabled              +2  (scenarios 2, 3)
+#   default.http_bandwidth_limit.request_enforced             +30 (scenarios 2, 3)
+#   default.http_bandwidth_limit.request_incoming_total_size  +15360 (scenarios 2, 3)
+#   default.http_bandwidth_limit.request_allowed_total_size   +15360
+#   default.http_bandwidth_limit.response_enabled             +3  (scenarios 1, 3, 4)
+#   default.http_bandwidth_limit.response_enforced            +31 (scenarios 1, 3, 4)
+#   default.http_bandwidth_limit.response_incoming_total_size +15460 (scenarios 1, 3, 4)
+#   default.http_bandwidth_limit.response_allowed_total_size  +15460
+# Override namespace (scenario 6 only):
+#   override.http_bandwidth_limit.response_enabled             +1
+#   override.http_bandwidth_limit.response_enforced            +2
+#   override.http_bandwidth_limit.response_incoming_total_size +10240
+#   override.http_bandwidth_limit.response_allowed_total_size  +10240
+# All 6 gauges (request/response × pending/incoming_size/allowed_size) end at
+# 0 per stat_prefix at the end of the 6-scenario sweep (no streams in-flight;
+# per-tick transient state cleared at OnDestroy per SPEC §6.9).
+#
+# Twin-series-filter allow-list (per §1.1 amendment 9 + BEHAVIOR_CONTRACT §242):
+# The 2 unconditional Envoy transfer-duration histogram families fire on Envoy
+# side under EVERY active stat_prefix but are SKIPPED on the envoy-go MVP side
+# per the phase-06.1 baseline (no histogram-emission primitive on envoy-go
+# yet). The driver's `parseBandwidthLimitPromBody` STRIPS these from both
+# pre/post scrapes BEFORE computing the per-counter delta, so the divergence-
+# window is absorbed:
+#
+#   envoy_default_http_bandwidth_limit_request_transfer_duration_bucket{le="..."}
+#   envoy_default_http_bandwidth_limit_request_transfer_duration_sum
+#   envoy_default_http_bandwidth_limit_request_transfer_duration_count
+#   envoy_default_http_bandwidth_limit_response_transfer_duration_bucket{le="..."}
+#   envoy_default_http_bandwidth_limit_response_transfer_duration_sum
+#   envoy_default_http_bandwidth_limit_response_transfer_duration_count
+#   envoy_override_http_bandwidth_limit_request_transfer_duration_bucket{le="..."}
+#   envoy_override_http_bandwidth_limit_request_transfer_duration_sum
+#   envoy_override_http_bandwidth_limit_request_transfer_duration_count
+#   envoy_override_http_bandwidth_limit_response_transfer_duration_bucket{le="..."}
+#   envoy_override_http_bandwidth_limit_response_transfer_duration_sum
+#   envoy_override_http_bandwidth_limit_response_transfer_duration_count
+#
+# (Substring match: `_request_transfer_duration_` OR `_response_transfer_duration_`
+# catches all three Prometheus histogram family suffixes — _bucket / _sum /
+# _count — in a single check per driver.go's parseBandwidthLimitPromBody.)
+#
+# Wall-clock tolerance: ±70ms per SPEC §11.P9 + §13.5. Wider envelope than
+# phase-09 fault's ±10ms + phase-11 local_ratelimit's ±10ms — absorbs the
+# initial-burst-capacity approximation variance + `time.AfterFunc` Linux
+# granularity + CI scheduling jitter on the Path B-async (silent-then-blast)
+# wire shape converging with Envoy's Path A rate-paced chunks at exact
+# fill_interval cadence. Disabled-route scenario 5 uses upper-bound-only
+# assertion (got ≤ Tolerance; lower bound trivially 0).
+#
+# Header allow-list (cross-side): standard envoy timing/identity headers per
+# BEHAVIOR_CONTRACT.md `## Header allow-list` — `date`, `server`,
+# `x-envoy-upstream-service-time`, etc. NO `x-envoy-bandwidth-*` trailer
+# allow-list entries (the fixture does NOT set `enable_response_trailers:
+# true`; trailer-emission divergence is documented at §13.4 but not
+# exercised in fixture 0017).
+#
+# Cross-refs: SPEC §7.1 + §7.2 + §7.3 + §7.4 + §11.P3 + §11.P4 + §11.P9 +
+#             §11.P10 + §11.P14 + §11.P15 + §1.1 amendments 6 + 7 + 8 + 9 +
+#             ADR-0137 + ADR-0138 + ADR-0139 + BEHAVIOR_CONTRACT §242
+#             twin-series-filter discipline.
