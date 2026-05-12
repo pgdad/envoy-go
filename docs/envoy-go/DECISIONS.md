@@ -5884,6 +5884,14 @@ Phase 16 rbac is the FIRST row to use the 7th canonical per-route pattern. The e
 
 ADR-0125's canonical 6-shape per-route table extends to a **7-shape catalog**: data-only-most-specific (ADR-0073, used by cors / fault); multi-tier-evaluation via ResolveAllTiers (ADR-0110, used by header_mutation); stateful-override-with-INDEPENDENT-stats (ADR-0117, used by local_ratelimit @ phase 11); data-only-override-with-SHARED-stats (ADR-0124, used by csrf); disabled-OR-override-sum-type-with-SHARED-stats (5th canonical, used by buffer @ phase 13 + compressor @ phase 14); bare-message-via-TPFC-with-INDEPENDENT-stats-and-code-level-required-`limit_kbps` (6th canonical, used by bandwidth_limit @ phase 15 per ADR-0139); **wrapper-with-reserved-field-and-single-optional-sub-message-with-INDEPENDENT-stats** (7th canonical NEW THIS AMENDMENT, used by rbac @ phase 16 per ADR-0140 + ADR-0145). The 7th canonical shares the wrapper-proto framing of the 5th canonical (both have a `*PerRoute` wrapper distinct from the listener-level proto) but lacks the 5th canonical's `disabled` bool: the disable-shortcut is encoded by absence-of-the-sub-message-field, not by an explicit bool in a oneof. The 7th canonical's stat-discipline is INDEPENDENT (inherits ADR-0117 + ADR-0139 machinery: lazy-cache `sync.Map`, `NewCounterIfAbsent` post-Freeze registration, `resolvePerRouteConfig` accessor returning `(rc, isDisabled)` to disambiguate case (a) disabled from case (b) wholesale-override) — distinct from the 5th canonical's SHARED-stats discipline and aligned with the 4th + 6th canonical's INDEPENDENT-stats discipline.
 
+## Amendment (per phase 17 SPEC §1.1 amendments 5 + 6 + §5 + §11.P9 + §11.P12 + ADR-0148 doctrine; authored at phase-17 SPEC commit per phase-13/14/15/16 in-place-amend-at-SPEC precedent)
+
+Phase 17 jwt_authn is the FIRST row to use the 8th canonical per-route pattern. The empirical surface verbatim from Envoy v1.37.2 `envoy.extensions.filters.http.jwt_authn.v3.PerRouteConfig` (`config.pb.go:1595-1679`): a wrapper proto with NO reserved field + a REQUIRED oneof `RequirementSpecifier` (PGV `required = true` per `config.pb.validate.go:2472-2481`) carrying two arms — `disabled` (**bool**; varint at field 1; NOT `Empty` as phase-17 BRAINSTORM §2.7 hypothesized — REFUTED at SPEC time per §1.1 amendment 5) and `requirement_name` (string; bytes at field 2; PGV `min_len=1` per `config.pb.validate.go:2460-2462`). The structural shape is distinct from all 7 prior canonicals — the defining feature is **string-reference-delegation** into a separately-named registry: the per-route proto does NOT embed a filter config; it embeds a string name that resolves at REQUEST TIME (per §1.1 amendment 6 — Envoy filter_config.cc `findPerRouteVerifier()` runtime-resolves; on miss emits 403 + "Failed JWT authentication: Wrong requirement_name: <name>"; envoy-go MIRRORS) against the listener-level `JwtAuthentication.requirement_map`. ADR-0125's canonical-pattern roster grows from 7 to 8 via in-place amendment paragraph §(xiii) (mirrors phase-13 ADR-0127-v2 + phase-14 ADR-0125 §(viii)-(x) + phase-15 ADR-0125 §(xi) + phase-16 ADR-0125 §(xii) precedent for in-place ADR amendments at SPEC commit):
+
+**(xiii)** Phase 17 jwt_authn is the FIRST row to use the **8th canonical per-route pattern**: a wrapper proto (`PerRouteConfig`) with a REQUIRED oneof `requirement_specifier` containing two arms — `disabled` (**bool**; NOT Empty; the `true` value disables JWT validation on this route; the `false` value indicates the oneof is set to disabled-arm but does not actually disable, falling through to listener-level rules dispatch) and `requirement_name` (string; reference-by-name into the listener-level `JwtAuthentication.requirement_map`). Structurally distinct from all 7 prior canonicals: vs 1st (cors no-per-route) — 8th has explicit per-route surface; vs 2nd (data-only TPFC, cors / fault) — 8th has structural oneof, 2nd is bare-message; vs 3rd (multi-tier all-tier, header_mutation) — 8th uses 3-tier resolution, 3rd evaluates ALL tiers; vs 4th (INDEPENDENT-stats stateful, local_ratelimit) — 8th has SHARED stats (delegation-by-name spawns no new state); vs 5th (disabled-bool + wholesale-override sub-message, buffer + compressor) — 8th's "override" arm is a STRING REFERENCE (NOT a sub-message); both have disabled-as-bool but 5th's other arm is a local sub-message, 8th's other arm is a string-reference into a separate registry; vs 6th (bare-message-via-TPFC + code-level-required, bandwidth_limit) — 8th uses oneof wrapper; vs 7th (wrapper-with-reserved-field + single optional sub-message, absent-implies-disabled, rbac) — 8th has EXPLICIT disable-bool (NOT absence-implies-disabled), AND the "non-disabled" arm is a STRING REFERENCE (NOT a sub-message). The 8th canonical's defining feature: STRING-REFERENCE-DELEGATION into a separately-named registry — per-route does NOT carry its own config; it references-by-name into the listener-level requirement_map (per §1.1 amendment 6 — runtime-resolved at request time; dangling reference yields 403 + error string mirroring Envoy filter_config.cc `findPerRouteVerifier`). The 8th canonical's stat-discipline is SHARED with listener-level (per ADR-0154; mirrors phase-12 csrf ADR-0124 + phase-13 buffer ADR-0125 + phase-14 compressor ADR-0132 SHARED-stats discipline; DIVERGES from phase-11 / phase-15 / phase-16 INDEPENDENT-stats; rationale: pure delegation by name does NOT spawn new policy-evaluation state, so a shared stat namespace is operationally correct). Future §9 family-rows whose per-route proto follows the same "oneof with string-reference-delegation OR explicit-disable-bool" shape compose against this canonical. ADR-0125's canonical-pattern roster grows from 7 to 8.
+
+ADR-0125's canonical 7-shape per-route table extends to an **8-shape catalog**: data-only-most-specific (ADR-0073, used by cors / fault); multi-tier-evaluation via ResolveAllTiers (ADR-0110, used by header_mutation); stateful-override-with-INDEPENDENT-stats (ADR-0117, used by local_ratelimit @ phase 11); data-only-override-with-SHARED-stats (ADR-0124, used by csrf); disabled-OR-override-sum-type-with-SHARED-stats (5th canonical, used by buffer @ phase 13 + compressor @ phase 14); bare-message-via-TPFC-with-INDEPENDENT-stats-and-code-level-required-`limit_kbps` (6th canonical, used by bandwidth_limit @ phase 15 per ADR-0139); wrapper-with-reserved-field-and-single-optional-sub-message-with-INDEPENDENT-stats (7th canonical, used by rbac @ phase 16 per ADR-0140 + ADR-0145); **oneof-with-string-reference-delegation-OR-disable-bool-with-SHARED-stats** (8th canonical NEW THIS AMENDMENT, used by jwt_authn @ phase 17 per ADR-0148 + ADR-0153 + ADR-0154). The 8th canonical's structural innovation is the STRING-REFERENCE-DELEGATION arm: the per-route proto does not embed a config, it embeds a string name that resolves at REQUEST TIME against a listener-level registry (requirement_map). This is genuinely new structural shape; no prior canonical uses string-reference-delegation. The 8th canonical's stat-discipline returns to SHARED (after the 6th + 7th canonicals' INDEPENDENT discipline), reflecting the absence of stateful per-route policy-evaluation state. The runtime-resolve discipline (NOT parse-time) for dangling references is also a structural innovation — prior canonicals' per-route validation has been parse-time-resolved against listener-level data; the 8th canonical mirrors Envoy's `findPerRouteVerifier()` deferred-resolution semantic (operationally necessary for xDS-served deferred-listener-activation patterns).
+
 ---
 
 ## ADR-0126: `compiledConfig` shape + parse-time `max_request_bytes ≤ 1 MiB` validation + cap-layering rationale + PGV-mirror filter-internal validation discipline
@@ -7425,3 +7433,515 @@ If either condition fails, error with `"tls: downstream: require_client_certific
 - **Cross-references:** ADR-0032 §Decision (7) (phase-03 TLS-layer scope discipline — the lifted clause); ADR-0044 (ADR-on-impl convention — impl-time-unanticipated escape valve); ADR-0134 (phase-14 framework-delta precedent — impl-time-unanticipated ADR lands at impl-task follow-up); ADR-0127-v2 (phase-13 in-task-lift precedent); ADR-0144 (TLS-principal accessor framework primitive — the dependency this lift unblocks for fixture 0018 scenario 6); SPEC §7.2 (line 1241 — the authored listener config requiring the lift); SPEC §11.P14 (the ADR-0144 end-to-end integration anchor scenario 6).
 
 ---
+
+## ADR-0148: `internal/filter/http/jwtauthn/` package shape — single-token directory matching cors/fault/csrf/buffer/compressor/localratelimit/bandwidthlimit/rbac precedent (underscore-stripped per ADR-0114) + DECODER-only `HTTPFilter` value (`Encoder: nil`; 4th §9 row to ship pure decode-side per phase-12 csrf + phase-13 buffer + phase-16 rbac precedent) + 7-base-counter `filterStats` (per SPEC §1.1 amendment 9 + §11.P6 — REFUTES BRAINSTORM 8-per-provider-scaling hypothesis; NO gauges; NO histograms; canonical names `allowed` + `cors_preflight_bypassed` + `denied` + `jwks_fetch_success` + `jwks_fetch_failed` + `jwt_cache_hit` + `jwt_cache_miss` per `ALL_JWT_AUTHN_FILTER_STATS` macro) + unconditional counter allocation at New() time (NO lazy-allocation; mirrors phase-12 csrf + phase-13 buffer SHARED-stats discipline) + deny-path wire shape `SendLocalReply(401-or-403, getStatusString(reason), {www-authenticate: Bearer realm="<original_uri>"<, error="invalid_token">})` per SPEC §1.1 amendments 8 + 12 + §11.P1 + §11.P2 + boot-registration ordering (alphabetical-after-header_mutation)
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Co-anchors with ADR-0149 (compiledConfig shape) + ADR-0150 (HTTP-outbound primitive) + ADR-0151 (JWT verifier primitive) + ADR-0152 (token extraction) + ADR-0153 (8th canonical per-route) + ADR-0154 (stat surface) + ADR-0155 (deny-path wire shape).
+
+**Lands-in:** Task 2 of phase-17 PLAN (anticipated).
+
+### Context
+
+Phase 17 lands `envoy.filters.http.jwt_authn` as the 10th §9 production HTTP filter (after cors @ 07.1, fault @ 09, header_mutation @ 10, local_ratelimit @ 11, csrf @ 12, buffer @ 13, compressor @ 14, bandwidth_limit @ 15, rbac @ 16). The package shape decision (directory naming + file split + filter-struct + factory signature + filterStats shape + boot-registration ordering + deny-path wire shape) builds on the cors / fault / header_mutation / localratelimit / csrf / buffer / compressor / bandwidthlimit / rbac precedents.
+
+The package directory + Go-package identifier are both `jwtauthn` — single token underscore-stripped per ADR-0114 (which codified the single-token discipline for compound proto type-names; matches `localratelimit/` + `bandwidthlimit/` precedent). The proto type-URL preserves the underscore as `envoy.filters.http.jwt_authn` (per Envoy upstream convention), but the Go-package identifier strips it for Go-language naming hygiene.
+
+Files mirror the phase-14 + phase-15 + phase-16 multi-file split (the precedent for larger filters with multi-subsurface logic): `jwtauthn.go` (filter type + factory + decode methods + filterStats struct + compiledConfig + per-route helper), `evaluator.go` (6-variant JwtRequirement evaluator + extraction-source iteration + RequirementRule dispatch), `provider.go` (JwtProvider compiled-state + algorithm allow-list + JWKS reference + extraction-source set + side-effect set), `jwtauthn_test.go` (unit tests; anticipated 1500-2500 LoC given the evaluator + provider + extraction-source + verification subsurface), `fuzz_test.go` (the 21st fuzzer in the repo — `FuzzJwtAuthnConfigParse`), `doc.go` (package overview).
+
+The DECODER-only HTTPFilter value (`Encoder: nil`) makes phase 17 the 4th §9 row to ship pure decode-side (after phase-12 csrf, phase-13 buffer, phase-16 rbac). jwt_authn is a request-gate filter — validation happens at `DecodeHeaders` before any body, and side-effects (header strip + forward_payload_header + claim_to_headers + clear_route_cache) all operate on the request headers. No encode-side surface is structurally needed.
+
+The 7-base-counter `filterStats` shape is empirically RATIFIED-via-REFUTATION-of-BRAINSTORM-hypothesis at SPEC §11.P6 via verbatim scrape of Envoy v1.37.2 `source/extensions/filters/http/jwt_authn/stats.h`. The BRAINSTORM hypothesis of "8 base counters with per-provider scaling: 2 per-provider counters (jwt_authn_success/failed) + 5 per-provider JWKS counters + 1 filter-wide bypass" was REFUTED — Envoy emits 7 filter-wide counters (`allowed`, `cors_preflight_bypassed`, `denied`, `jwks_fetch_success`, `jwks_fetch_failed`, `jwt_cache_hit`, `jwt_cache_miss`) at the HCM stat_prefix scope; NO per-provider scaling; NO gauges; NO histograms. The `jwt_cache_hit` + `jwt_cache_miss` pair is gated on `jwt_cache_config` (deferred per §8 deferral 8); structurally unreachable under phase-17 MVP.
+
+The deny-path wire shape is empirically RATIFIED-AND-EXTENDED at SPEC §11.P1 + §11.P2 + §11.P3 via verbatim scrape of Envoy v1.37.2 `source/extensions/filters/http/jwt_authn/filter.cc`. The status mapping is 401 for most failure-reasons + 403 specifically for `JwtAudienceNotAllowed` (RFC 6750 semantic: 401 = unauthenticated; 403 = authenticated-but-not-authorized-for-this-audience). The body is `getStatusString(status)` from jwt_verify_lib's ~70-entry canonical mapping. The WWW-Authenticate header is `Bearer realm="<original_uri>"` with conditional `, error="invalid_token"` appended for non-`JwtMissed` statuses (RFC 6750 §3 challenge syntax). The `strip_failure_response: true` proto field strips BOTH body AND WWW-Authenticate header. The phase-04 HCM-scope limitation around `response_code_details` field emission is documented as a divergence-window per SPEC §1.1 amendment 11 + §8 deferral 13 (envoy-go MVP defers; Envoy emits `jwt_authn_access_denied{<reason>}`).
+
+The boot-registration ordering follows ADR-0072 + ADR-0100 §2.2 alphabetical-after-router convention: `router → bandwidthlimit → buffer → compressor → cors → csrf → envoygotest → fault → header_mutation → jwtauthn → localratelimit → rbac → Freeze`. The `jwtauthn` entry inserts between `header_mutation` and `localratelimit` to maintain alphabetical ordering. Per ADR-0072, registration order does NOT affect runtime behavior; this is a stylistic discipline only.
+
+The factoryState shape is SIMPLIFIED relative to phase-11/15/16 (which carried per-route lazy-cache `sync.Map` for INDEPENDENT-stats). Phase-17 SHARED-stats discipline (per ADR-0153 + §5.2) eliminates the need for per-route filterStats allocation; the listener-level filterStats is shared across all routes. The factoryState carries one `sync.Map` for `compiledPerRoute` lazy-build (keyed by per-route TPFC proto pointer; mirrors phase-16 pattern minus the per-route stats branch).
+
+The §1.1 amendments 8 + 12 + §11.P1 + §11.P2 RATIFICATIONS materially refine the deny-path wire shape from BRAINSTORM hypothesis:
+- BRAINSTORM §4 hypothesized "401 + WWW-Authenticate Bearer realm=\"<issuer>\"" — REFINED to "401 default + 403 for JwtAudienceNotAllowed + WWW-Authenticate Bearer realm=\"<original_uri>\" + conditional error=invalid_token append".
+- BRAINSTORM §10 §17.P2 hypothesized realm=\"<issuer>\" — REFUTED; Envoy uses request URI captured at DecodeHeaders.
+
+The 12 §1.1 amendments authored in phase-17 SPEC (matching phase-16 rbac's 12-amendment volume) document the empirical refinements. The structural design (DECODER-only filter, 7-counter filterStats, deny-path wire shape, boot-registration ordering) survives intact despite the refinements.
+
+---
+
+## ADR-0149: `compiledConfig` shape + 5-of-6 outer-field consumed proto-faithful (filter_state_rules silent-ignored per §1.1 amendment 1; refutes BRAINSTORM 5-field framing — proto has 6 fields per `[#next-free-field: 7]`) + 13-of-21 JwtProvider consumed (refutes BRAINSTORM 13-of-17 framing — proto has 21 fields per `[#next-free-field: 22]` with subjects + require_expiration + max_lifetime as v1.37.x extensions silent-ignored per §1.1 amendments 2 + 3) + 6-variant JwtRequirement evaluator (provider_name + provider_and_audiences + requires_any + requires_all + allow_missing + allow_missing_or_failed per §11.P16) + RS+ES algorithm allow-list (6 algorithms: RS256/384/512 + ES256/384/512) + side-effect emit-order (strip → forward_payload_header → claim_to_headers → clear_route_cache per §11.P10 + §11.P13) + listener-level rules dispatch (first-match-wins; inline `requires` + named `requirement_name` both honored per §1.1 amendment 4 — REFUTES BRAINSTORM deprecation-PARSE-REJECT hypothesis) + clock_skew_seconds 60s default consumed (per §1.1 amendment 7) + envoy-go-side defensive PGV-mirror validation
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Co-anchors with ADR-0148.
+
+**Lands-in:** Task 2 of phase-17 PLAN (anticipated).
+
+### Context
+
+Phase 17 consumes 5 of 6 outer-envelope fields of `JwtAuthentication` proto-faithful per Q2 + Q4 + Q8 BRAINSTORM picks. The SPEC §11.P9 empirical scrape RATIFIED the field-consumption surface with REFINEMENTS to the BRAINSTORM framing.
+
+**JwtAuthentication 6-field surface** (REFINES BRAINSTORM "5 fields all consumed" per §1.1 amendment 1):
+- Field 1: `providers` map<string, JwtProvider> — consumed.
+- Field 2: `rules` repeated RequirementRule — consumed.
+- Field 3: `filter_state_rules` FilterStateRule — SILENT-IGNORED in phase-17 MVP (couples to future filter-state-family phase per §8 deferral 12).
+- Field 4: `bypass_cors_preflight` bool — consumed.
+- Field 5: `requirement_map` map<string, JwtRequirement> — consumed.
+- Field 6: `strip_failure_response` bool — consumed.
+
+The BRAINSTORM-missed `filter_state_rules` field (per `[#next-free-field: 7]` annotation at config.pb.go:1446) is silent-ignored at parse + runtime. The parse accepts the field; the evaluator never consults it. Operators wiring `filter_state_rules` against Envoy see runtime requirement-selection driven by `StreamInfo.FilterState[<name>]` string; envoy-go falls through to listener-level `rules` dispatch as if no filter_state_rules were set.
+
+**JwtProvider 21-field surface** (REFINES BRAINSTORM "13 of 17 consumed" per §1.1 amendments 2 + 3):
+The proto has 21 fields per `[#next-free-field: 22]` annotation at config.pb.go:60. Phase-17 MVP consumes 13 fields + silent-ignores 8 fields:
+
+**Consumed (13):** issuer, audiences, remote_jwks, local_jwks, forward, from_headers, from_params, from_cookies, forward_payload_header, pad_forward_payload_header, claim_to_headers, clear_route_cache, clock_skew_seconds.
+
+**Silent-ignored (8):**
+- 4 dynamic-metadata-family-coupled fields per §8 deferrals 1-4: `payload_in_metadata` + `header_in_metadata` + `failed_status_in_metadata` + `normalize_payload_in_metadata`.
+- 1 caching-family-coupled field per §8 deferral 8: `jwt_cache_config` (default 100-entry LRU; structurally unreachable in MVP — the `jwt_cache_hit` + `jwt_cache_miss` counters are gated on this proto's being set).
+- 3 v1.37.x claim-coverage-extension-family-coupled fields per §8 deferrals 15-17 + §1.1 amendments 2 + 3: `subjects` (StringMatcher on `sub` claim) + `require_expiration` (bool; mandates JWT `exp` presence) + `max_lifetime` (Duration; rejects JWTs with `exp - now > max_lifetime`).
+
+The `clock_skew_seconds` field (#10) was BRAINSTORM-missed in the consumed-list per §1.1 amendment 7. Per JwtProvider.clock_skew_seconds proto comment at config.pb.go:281: `"Specify the clock skew in seconds when verifying JWT time constraint, such as 'exp', and 'nbf'. If not specified, default is 60 seconds."` Envoy's authenticator applies this tolerance to both `exp` and `nbf` claim validation. Operationally significant: clock-drift between JWT issuers + Envoy proxies routinely measures ~5-30 seconds; rejecting tokens that are ~30 seconds expired-or-pending punishes legitimate clients on clock-drift alone. Phase-17 envoy-go MVP HONORS `clock_skew_seconds` (default 60s) in MVP claim validation.
+
+**6-variant JwtRequirement evaluator** per Q4 Full-6 + §11.P16 RATIFIED:
+- `provider_name`: validate JWT against named provider; pass iff valid + claim-checks pass.
+- `provider_and_audiences`: validate against named provider with per-rule audience override.
+- `requires_any`: OR-semantic; short-circuit on first match; if all fail, propagates last failure status (per Envoy verifier.cc semantic).
+- `requires_all`: AND-semantic; short-circuit on first failure.
+- `allow_missing`: JWT absent → OK; JWT present-and-invalid → FAIL.
+- `allow_missing_or_failed`: any outcome → OK.
+
+The 6-variant recursive combinator structure mirrors phase-16 rbac's Permission_And/Permission_Or recursive evaluators. The recursion-depth foot-gun (no parse-time cap on requires_any/requires_all nesting) mirrors Envoy's permissive disposition per §11.P11 RATIFIED-VIA-ABSENCE in rbac (analogous pin in phase-17 not separately probed but structurally identical — no PGV at proto level, no documented hard cap in Envoy source). Documented foot-gun per §2.12 + BEHAVIOR_CONTRACT phase-17 forward-pointer notes.
+
+**RS+ES algorithm allow-list** per Q3: 6 algorithms total — RS256/384/512 (RSASSA-PKCS1-v1_5 with SHA-256/384/512) + ES256/384/512 (ECDSA with P-256/P-384/P-521 + SHA-256/384/512). Go stdlib coverage: `crypto/rsa.VerifyPKCS1v15` + `crypto/ecdsa.Verify`. Algorithm allow-list enforcement at TWO points per ADR-0151:
+- (a) JWK parse time: JWK with `alg` claim outside the six PARSE-REJECTED (envoy-go-strict; mirrors Envoy's permissive parse but envoy-go-strict at allow-list).
+- (b) JWT runtime: token with header `alg` outside the six runtime-rejected as `JwtHeaderNotImplementedAlg`.
+
+HS family + EdDSA + `none` algorithms DEFERRED per §8 deferrals 5-7; PS family also deferred (extension of §8 deferral 5; per SPEC §12.6 SPEC-author-call).
+
+**Side-effect emit-order** per §6.9 + §11.P10 + §11.P13: strip-on-success (forward=false) → forward_payload_header (base64url-encoded payload; with-or-without padding per pad_forward_payload_header) → claim_to_headers (dot-notation for nested claims; array claims rejected per §11.P10 + proto comment "Array type claims are not supported") → clear_route_cache (HCM-side primitive invocation when proto bool true; the implicit-trigger-on-claim-side-effect deferred per §8 deferral 18 NEW).
+
+**Listener-level rules dispatch** per §6.6 + §1.1 amendment 4: both oneof arms of `RequirementRule.requirement_type` honored proto-faithful. The BRAINSTORM PARSE-REJECT hypothesis for the deprecated `requires` arm is WITHDRAWN per §11.P12 + §1.1 amendment 4 — the v1.37.2 proto carries no deprecation annotation on either arm; Envoy filter_config.cc treats both equivalently. Dispatch order: first-matching rule wins (per Envoy semantic + phase-04 router first-match precedent).
+
+**Envoy-go-side defensive PGV-mirror validation** per §11.P9 + phase-11 ADR-0115 + phase-15 ADR-0136 + phase-16 ADR-0141 precedent: enforce the proto's PGV constraints in `buildCompiledConfig` with envoy-go-own error wording. Specifically:
+- `RemoteJwks.http_uri` REQUIRED (`"remote_jwks.http_uri is required"`).
+- `RemoteJwks.cache_duration` PGV `[1ms, 2500000h)` if set.
+- `RequirementRule.match` REQUIRED.
+- `PerRouteConfig.requirement_specifier` REQUIRED (oneof).
+- `PerRouteConfig.requirement_name` PGV `min_len=1` (when chosen arm).
+- `JwtProvider.JwksSourceSpecifier` oneof structurally-required (neither remote_jwks nor local_jwks set → PARSE-REJECT with envoy-go-only error `"either remote_jwks or local_jwks must be set"`).
+
+The compiledConfig + compiledProvider + compiledRequirement + filterStats shapes (per SPEC §6.2) compose against ADR-0148's package-shape decisions. The recursive `buildCompiledRequirement` traverses the 6-variant JwtRequirement tree; the iterative `buildCompiledConfig` parses listener-level providers + rules + requirement_map in O(N+M+K) where N=providers, M=rules, K=requirement_map entries.
+
+---
+
+## ADR-0150: HTTP-outbound JWKS fetcher framework primitive at NEW top-level package `internal/jwks/` — `Fetcher` opaque type wrapping URI + cache duration + AsyncFetch + RetryPolicy; cross-phase-reusable for future ext_authz HTTP-mode + oauth2 token-endpoint flows; refresh schedule 5s-before-TTL via `time.AfterFunc` per §11.P5 (default 10-minute cache); failed-refetch fixed-interval (1s default; configurable via `JwksAsyncFetch.failed_refetch_duration`) per §11.P4 — REFUTES BRAINSTORM exponential-backoff hypothesis; fast_listener mode controls blocking-vs-non-blocking initial fetch; PARSE-REJECT-for-missing-http_uri PGV-mirror
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Cross-phase-reusable framework primitive per phase-16 ADR-0142 + ADR-0144 cross-phase-reuse-at-introduction-time discipline. Co-anchors with ADR-0148 + ADR-0149.
+
+**Lands-in:** Task 3 of phase-17 PLAN (anticipated).
+
+### Context
+
+Phase 17 is the FIRST envoy-go phase to introduce an OUTBOUND-NETWORK framework primitive. All prior framework primitives operated on the inbound request (phase-04 HCM, phase-07.1 cors, phase-09 fault async-resume, phase-13 buffer body-buffering, phase-14 compressor OverwriteBody) OR on in-process state (phase-11 token-bucket, phase-15 throttle-config, phase-16 matcher-engine + TLS-principal accessor). The JWKS-fetcher primitive at `internal/jwks/` is strategically positioned for the AUTH-FILTER FAMILY: future ext_authz HTTP-mode (sends auth check to external HTTP service) + future oauth2 token-endpoint flow (fetches access tokens) both consume outbound-HTTP-from-filter primitives.
+
+**Package location decision** (per SPEC §3.1 + §12.1): LOCK to `internal/jwks/` (JWKS-specific). Alternative `internal/httpclient/` (generic outbound-HTTP wrapper) rejected at SPEC time — the JWKS sub-domain has enough framework-primitive-specific concerns (JWK Set parsing, kid+alg lookup, refresh-5s-before-TTL schedule per §11.P5, fixed-1s failed-refetch retry per §11.P4) that a JWKS-specific package is structurally cleaner. Future ext_authz + oauth2 MAY introduce a sibling `internal/httpclient/` (extract the request-shape + retry-policy plumbing) OR compose directly against the JWKS package's lower-level primitives. The cross-phase-reuse intent is preserved either way.
+
+**API surface** per SPEC §3.1:
+- `New(uri, cacheDuration, asyncFetch, retryPolicy)` constructor.
+- `Fetcher.Get(ctx)` returns cached JWKSet (or ErrJwksNotReady when fast_listener=true + initial fetch incomplete).
+- `Fetcher.Close()` stops background refresh.
+- `JWKSet.Lookup(kid, alg)` resolves key by kid + algorithm (Envoy pickKeyAlgWithKid logic).
+- ~10 canonical error sentinels mirroring jwt_verify_lib JWKS-subset status codes (ErrJwksFetchFail, ErrJwksParseError, ErrJwksKidAlgMismatch, ErrJwksNotReady, ErrJwksNoValidKeys, etc.).
+
+**Refresh schedule semantics** per §11.P5 RATIFIED-AND-EXTENDED via `jwks_async_fetcher.cc` scrape:
+- Default cache_duration: 10 minutes (`DefaultCacheExpirationSec=600s`).
+- Refresh fires `cache_duration - 5 seconds` before TTL expiry via `time.AfterFunc` (mirrors Envoy's `RefetchBeforeExpiredSec=5s` constant).
+- Clamped to 0 if cache_duration < 5s (no negative-lead-time).
+
+**Failed-refetch semantics** per §11.P4 REFUTED-BRAINSTORM-HYPOTHESIS via `jwks_async_fetcher.cc` scrape:
+- BRAINSTORM §10 §17.P4 hypothesized exponential 1s/2s/4s/8s/16s/30s-cap backoff — REFUTED.
+- Envoy implements FIXED-INTERVAL retry: default 1 second (`DefaultRefetchAfterFailedSec`); configurable via `JwksAsyncFetch.failed_refetch_duration` proto field.
+- NO exponential backoff; NO max-retries cap; NO jitter at the outer-refetch level.
+- Inner-HTTP-request retries (separate from outer refetch) configurable via `RemoteJwks.retry_policy` (envoy.config.core.v3.RetryPolicy) per `config.pb.go:649` proto comment — default 1 retry when num_retries omitted, base_interval defaults to 1000ms, max_interval defaults to 10*base. Phase-17 envoy-go MVP HONORS `retry_policy` at the inner-HTTP-request level.
+
+**Initial-fetch lifecycle** per §11.P4 RATIFIED + SPEC §6.10 + §12.3:
+- `fast_listener: false` (DEFAULT): `jwks.New()` BLOCKS until initial fetch completes (success or failure). Failure returns error from New() — phase-17 envoy-go MVP fails listener-load (DIVERGES from Envoy's `init_target_->ready()` semantic which activates the listener despite failure; documented at SPEC §12.3 SPEC-author-call).
+- `fast_listener: true`: `jwks.New()` returns immediately; background goroutine fetches; first calls to `Get()` may return `ErrJwksNotReady` until fetch completes.
+- No `async_fetch` proto sub-message at all: Envoy on-demand-fetch-on-first-request semantic; phase-17 MVP simplifies to `fast_listener: false`-equivalent blocking at first-request rather than at New()-time (per SPEC §6.10 + ADR-0150 §Decision (iii)).
+
+**Cross-phase reuse intent** (codified in §Decision body at impl-time):
+- Future `ext_authz` HTTP-mode (POST request body, response handling): reuses `http.Client` + retry-policy structure; differs on request-shape + auth-decision propagation.
+- Future `oauth2` token-endpoint flow (fetches access tokens; refresh on 401): reuses cache-and-refresh discipline; differs on token-refresh-on-401-from-upstream pattern.
+
+The cross-phase-reusability is genuine — the strategic positioning at `internal/jwks/` (outside `internal/filter/`) anchors the discipline that future cross-cutting outbound-HTTP primitives go in dedicated top-level packages, NOT on the filter-callback interface. Mirrors phase-16 ADR-0142 (`internal/matcher/`) + ADR-0144 (DownstreamPrincipal accessor) cross-phase-reuse precedent.
+
+**Lifecycle ownership** per SPEC §6.10: the `*jwks.Fetcher` is owned by `compiledProvider.jwksFetcher` (created at `buildCompiledProvider` time); lifetime is listener-lifetime; shared across all filter instances of the listener. Filter `OnDestroy` does NOT close the fetcher. The fetcher is closed when the listener drains (future graceful-drain integration; phase-17 MVP relies on goroutine-leak-on-restart per HCM lifecycle scope; documented as forward-pointer foot-gun).
+
+**Thread safety**: the Fetcher uses an internal `sync.Mutex` guarding the cached JWK Set + the refresh-timer state. `Get(ctx)` is safe for concurrent invocation from multiple goroutines (per-stream filter calls + background refresh). The refresh goroutine takes the mutex briefly to swap in fresh JWK Set; concurrent `Get()` callers see the old or new set atomically.
+
+**Operator-facing semantics**: documented at BEHAVIOR_CONTRACT §13.7 NEW `## JWKS framework primitive` top-level section (lands at phase-done). Covers Fetcher lifecycle, refresh schedule, failed-refetch schedule, cross-phase reuse intent, and operator-facing observability (`jwks_fetch_success` / `jwks_fetch_failed` counters per ADR-0154).
+
+---
+
+## ADR-0151: JWT verifier framework primitive at NEW top-level package `internal/jwt/` — `Parse(raw)` parses 3-part JWT structure; `Token.VerifySignature(key, alg)` with RS+ES algorithm allow-list per §11.P1 (PARSE-REJECT unsupported algs); `Token.ValidateClaims(opts)` checks exp + nbf + iss + aud with clock-skew tolerance per §11.P16 + §1.1 amendment 7; `Token.PayloadClaim(path)` dot-notation extractor with array-claim rejection per §11.P10 + §1.1 amendment 10; ~20 canonical error sentinels mirroring jwt_verify_lib status codes; pure-Go stdlib (`crypto/rsa.VerifyPKCS1v15` + `crypto/ecdsa.Verify` + `encoding/base64.RawURLEncoding`); cross-phase-reusable for future filters consuming JWT semantics (jwt_claim_router, oauth2 token validation)
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Cross-phase-reusable framework primitive per phase-16 ADR-0142 + ADR-0144 cross-phase-reuse-at-introduction-time discipline. Co-anchors with ADR-0148 + ADR-0149 + ADR-0150.
+
+**Lands-in:** Task 4 of phase-17 PLAN (anticipated).
+
+### Context
+
+Phase 17 is the FIRST envoy-go phase to introduce a JWT-PARSING + SIGNATURE-VERIFICATION framework primitive. JWT semantics are CROSS-CUTTING: any future filter that consumes JWT tokens (a hypothetical `jwt_claim_router` filter routing on claim values, oauth2's token validation step, or extension authn filters) composes against `internal/jwt/`. The package is strategically positioned for the auth-filter family alongside `internal/jwks/`.
+
+**Package location decision** (per SPEC §3.2): LOCK to `internal/jwt/` (top-level; OUTSIDE `internal/filter/`). Mirrors phase-16 ADR-0142 (`internal/matcher/`) cross-phase-reusable discipline.
+
+**API surface** per SPEC §3.2:
+- `Parse(raw string) (*Token, error)`: parses 3-part JWT structure (header.payload.signature); validates JSON-decoding; does NOT verify signature or claims at parse time (caller's two-step responsibility).
+- `Token.VerifySignature(key crypto.PublicKey, alg string) error`: verifies signature using the named algorithm against the provided public key; PARSE-REJECT for algorithms outside the RS+ES allow-list.
+- `Token.ValidateClaims(opts ValidateOptions) error`: checks exp + nbf + iss + aud per options with clock-skew tolerance; returns canonical errors on rejection.
+- `Token.PayloadClaim(path string) (interface{}, error)`: extracts a claim by dot-notation path; array-claims rejected (returns `ErrArrayClaim`); non-string scalar claims coerced via JSON-marshal.
+- `ParseJWKSet(raw []byte) (*JWKSet, error)`: parses inline JWK Set JSON (RFC 7517 §5); used by LocalJwks path.
+
+**Algorithm allow-list** per §11.P1 + Q3 BRAINSTORM pick: 6 algorithms — RS256/384/512 + ES256/384/512. Go stdlib coverage:
+- RS256/384/512 via `crypto/rsa.VerifyPKCS1v15(pub, sha256/384/512.Sum(...), signature)`.
+- ES256/384/512 via `crypto/ecdsa.Verify(pub, hash, r, s)` (with `r, s` extracted from raw signature per RFC 7515 §A).
+
+Algorithms outside the allow-list (HS family + EdDSA + `none` + PS family) → `ErrJwtHeaderNotImplementedAlg`. PARSE-REJECT discipline enforced at `VerifySignature` time (NOT at `Parse` time — `Parse` is algorithm-agnostic per §3.2 design). HS family DEFERRED per §8 deferral 5 (requires symmetric-secret config plumbing); EdDSA DEFERRED per §8 deferral 6 (less common; future enabler via `crypto/ed25519`); `none` DEFERRED-PERMANENTLY per §8 deferral 7 (security-sensitive); PS family DEFERRED per SPEC §12.6 (extension of §8 deferral 5).
+
+**Claim validation order** per §11.P16 RATIFIED-AND-EXTENDED via `authenticator.cc` scrape:
+1. `iss` (issuer): if `ValidateOptions.Issuer` non-empty, JWT.iss claim must match exactly. `ErrJwtUnknownIssuer` on mismatch.
+2. `exp` (expiration): if present, `now > exp + clock_skew_tolerance` → `ErrJwtExpired`.
+3. `nbf` (not-before): if present, `now + clock_skew_tolerance < nbf` → `ErrJwtNotYetValid`.
+4. `aud` (audience): if `ValidateOptions.Audiences` non-empty, JWT.aud (string or array) must have non-empty intersection with options. `ErrJwtAudienceNotAllowed` on mismatch (note: this status maps to HTTP 403, not 401, at the filter layer per §1.1 amendment 8).
+5. (DEFERRED) `sub` matching against `Subjects` StringMatcher — silent-ignored per §1.1 amendment 3.
+6. (DEFERRED) `RequireExpiration` mandatory-exp check — silent-ignored per §1.1 amendment 3.
+7. (DEFERRED) `MaxLifetime` ceiling check — silent-ignored per §1.1 amendment 3.
+
+`iat` (issued-at) is informational only; not enforced for rejection (mirrors Envoy semantic).
+
+**Clock-skew tolerance** per §1.1 amendment 7: default 60 seconds when `ValidateOptions.ClockSkew` unset (mirrors Envoy's default per `JwtProvider.clock_skew_seconds` proto comment). Tolerance applies to BOTH `exp` and `nbf` checks symmetrically.
+
+**Dot-notation claim extraction** per §11.P10 + JwtClaimToHeader.claim_name proto comment (config.pb.go:1690) `"it can be a nested claim of type (eg. \"claim.nested.key\", \"sub\"). String separated with \".\" in case of nested claims."`. `Token.PayloadClaim("claim.nested.key")` traverses `payload[claim][nested][key]` returning the typed value. Array-valued claims at ANY level → `ErrArrayClaim` (per proto comment "Array type claims are not supported"). Non-string scalar claims (int/float/bool) are returned as their Go-typed values; the caller's filter-side coerces to string via JSON-marshal semantics for header emission.
+
+**Canonical error sentinels** mirror jwt_verify_lib `status.cc` status codes per §11.P1 ~70-entry table. Phase-17 initial set per SPEC §3.2 (~20 entries; impl-time may extend additively):
+- `ErrJwtMissed` = `"Jwt is missing"`
+- `ErrJwtBadFormat` = `"Jwt is not in the form of Header.Payload.Signature with two dots and 3 sections"`
+- `ErrJwtHeaderBadAlg` = `"Jwt header [alg] field is required and must be a string"`
+- `ErrJwtHeaderNotImplementedAlg` = `"Jwt header [alg] is not supported"`
+- `ErrJwtHeaderParseErrorBadBase64` = `"Jwt header is an invalid Base64url encoded"`
+- `ErrJwtHeaderParseErrorBadJson` = `"Jwt header is an invalid JSON"`
+- `ErrJwtPayloadParseErrorBadBase64` = `"Jwt payload is an invalid Base64url encoded"`
+- `ErrJwtPayloadParseErrorBadJson` = `"Jwt payload is an invalid JSON"`
+- `ErrJwtSignatureParseErrorBadBase64` = `"Jwt signature is an invalid Base64url encoded"`
+- `ErrJwtUnknownIssuer` = `"Jwt issuer is not configured"`
+- `ErrJwtAudienceNotAllowed` = `"Audiences in Jwt are not allowed"` (note: HTTP 403, not 401, at filter layer)
+- `ErrJwtVerificationFail` = `"Jwt verification fails"`
+- `ErrJwtExpired` = `"Jwt is expired"`
+- `ErrJwtNotYetValid` = `"Jwt not yet valid"`
+- `ErrArrayClaim` (envoy-go-only; mirrors proto-comment "Array type claims are not supported")
+- (plus ~5 more per impl-time SPEC §12.2 discretion)
+
+**Cross-phase reuse intent**: future filters consuming JWT semantics (jwt_claim_router, oauth2 token validation) compose against `Parse` + `Token.VerifySignature` + `Token.ValidateClaims` + `Token.PayloadClaim` directly. The package is algorithm-agnostic for parsing (algorithm allow-list is checked at signature verification time, not parse time); claim validation is policy-driven via `ValidateOptions`.
+
+**Pure-Go stdlib dependencies**: NO third-party JWT library. Implementation uses `crypto/rsa.VerifyPKCS1v15` + `crypto/ecdsa.Verify` + `encoding/base64.RawURLEncoding` + `encoding/json`. The absence of third-party deps preserves the envoy-go zero-third-party-runtime-deps discipline (mirrors phase-06.1 ADR-0058 + phase-14 ADR-0129 zero-third-party precedent).
+
+**Operator-facing semantics**: documented at BEHAVIOR_CONTRACT §13.8 NEW `## JWT verifier framework primitive` top-level section (lands at phase-done). Covers Token lifecycle, algorithm allow-list, claim validation order, cross-phase reuse intent.
+
+---
+
+## ADR-0152: Token extraction across all 4 sources (default Authorization Bearer + access_token query param + configured from_headers + from_params + from_cookies); iteration order matches Envoy extractor.cc (headers first → params → cookies); first-success-wins discipline; case-sensitive lookup with URL-decode for params (§11.P14 RATIFIED-AND-REFINED) + verbatim value for cookies (§11.P15 RATIFIED); multi-value query first-value-only per §11.P14 REFINED; empty-extraction = JwtMissed failure-reason
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Co-anchors with ADR-0149.
+
+**Lands-in:** Task 5 of phase-17 PLAN (anticipated).
+
+### Context
+
+Phase 17 supports JWT extraction from all 4 proto-faithful sources per Q5 BRAINSTORM pick:
+1. `Authorization: Bearer <token>` header (default; honored when no explicit per-provider extraction-sources set).
+2. `access_token` query parameter (default; analogous to RFC 6750 §2.3 form-encoded body parameter but applied to URL query).
+3. Configured `from_headers[]` (repeated JwtHeader{name, value_prefix}).
+4. Configured `from_params[]` (repeated string; query parameter names).
+5. Configured `from_cookies[]` (repeated string; cookie names).
+
+The default sources (1 + 2) apply when the provider's explicit extraction-sources sets (from_headers + from_params + from_cookies) are ALL empty. Per Envoy extractor.cc + §11.P14 + §11.P15 RATIFIED:
+
+> *"If no explicit location is specified, the following default locations are tried in order: 1. The Authorization header using the Bearer schema. 2. access_token query parameter."*
+
+Per JwtProvider proto comment lines 144-156: the defaults are a structural fallback, NOT an additive overlay. When any of from_headers/from_params/from_cookies is non-empty, the defaults are NOT applied — extraction comes only from the explicit sources.
+
+**Iteration order** per `extractor.cc` scrape per §11.P14 + §11.P15: headers first, then params, then cookies. Within each category, the configured list iterates in declared order. First-match-wins within the source set; if any token is successfully extracted, validation proceeds against that token. Empty-extraction (no token found across any configured source) → `ErrJwtMissed` failure-reason; the deny-path emits 401 + body `"Jwt is missing"` + WWW-Authenticate Bearer challenge WITHOUT the conditional `, error="invalid_token"` append (per §11.P2 RATIFIED — `JwtMissed` case omits error param).
+
+**Case-sensitivity + URL-decode + multi-value handling** per §11.P14 RATIFIED-AND-REFINED via `extractor.cc` scrape:
+- Header name matching: case-INSENSITIVE per HTTP/1.1 RFC 7230 (Go stdlib `http.Header.Get(name)` handles canonical form).
+- Header value_prefix matching: substring search via `value_str.find(value_prefix)`; the substring AFTER the prefix is extracted as the raw JWT.
+- Query param name matching: case-SENSITIVE exact match (per `extractor.cc` `params.getFirstValue(param_key)` against `param_locations_` map keys).
+- Query param URL-decoding: ENABLED via `QueryParamsMulti::parseAndDecodeQueryString(path)` — values are URL-decoded BEFORE being used as the raw JWT.
+- Query param multi-value: ONLY first value extracted (`getFirstValue`); subsequent values for the same parameter name silently ignored. For `?token=a&token=b`, only `a` is treated as the JWT. **REFINES** BRAINSTORM §10 §17.P14 hypothesis of "array-param handling unclear" — Envoy's behavior is documented as first-value-only.
+- Cookie name matching: case-SENSITIVE exact match (per `extractor.cc` `cookie_locations_.contains(k)`; mirrors RFC 6265 §4.1.1 cookie-names-are-case-sensitive).
+- Cookie value parsing: verbatim value (NO URL-decode; per RFC 6265 cookie values are raw bytes).
+
+**from_headers value_prefix discipline**: when value_prefix is empty, the entire header value is used as the raw JWT. When value_prefix is non-empty (e.g., `"Bearer "` with trailing space), the filter substring-searches for the prefix in the value and extracts the substring AFTER it. The Envoy filter additionally strips non-base64url characters from the extracted substring (per `extractor.cc::extractJWT` "strips non-Base64Url characters using RFC-4648 compliance logic"); phase-17 envoy-go MVP MIRRORS this discipline.
+
+**Iteration discipline within JwtRequirement evaluator** (per §6.7 + §6.8 + ADR-0149): the extraction iteration happens INSIDE `evaluateProvider` for each JwtRequirement variant that resolves to a specific provider. For `requires_any` + `requires_all` combinators, the iteration happens per-sub-requirement (each sub-requirement triggers its own extraction against its named provider). For `allow_missing`, the iteration runs across ALL configured providers — if any provider's extraction-sources extracts a token, validation MUST succeed against THAT provider; else missing-OK.
+
+**Empty-extraction handling**: when iteration completes without finding any token, the evaluator returns `evalResult{allowed: false, err: ErrJwtMissed}`. The filter's `applyResult` maps this to status 401 + body `"Jwt is missing"` + conditional WWW-Authenticate (without the `, error="invalid_token"` append per §1.1 amendment 12). The `denied` counter increments.
+
+**Performance characteristics**: extraction is O(H + P + C) where H = configured from_headers count + 1 (Authorization default), P = configured from_params count + 1 (access_token default), C = configured from_cookies count. Typical operator config has <5 entries per source set; per-request extraction overhead is <1μs. Cookie parsing is the most expensive (Go stdlib `parseCookies` scans the entire Cookie header value); jwt_authn parses cookies lazily (only when from_cookies is non-empty).
+
+---
+
+## ADR-0153: Per-route 8th canonical pattern `oneof{disabled(bool) | requirement_name(string)}` (REFUTES BRAINSTORM `disabled(Empty)` hypothesis per SPEC §1.1 amendment 5 + §11.P9) + delegation via listener-level requirement_map + runtime-resolve at request time for dangling references (REFUTES BRAINSTORM parse-reject hypothesis per §1.1 amendment 6 + §11.P12 — Envoy filter_config.cc `findPerRouteVerifier` runtime-resolves; on miss emits 403 + "Failed JWT authentication: Wrong requirement_name: <name>"; envoy-go MIRRORS) + per-route stats SHARED with listener-level (mirrors phase-12/13/14 SHARED; DIVERGES from phase-11/15/16 INDEPENDENT) + ADR-0125 §(xiii) amendment paragraph at SPEC commit (NEW 8th canonical; ADR-0125 roster grows from 7 to 8)
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Co-anchors with ADR-0125 §(xiii) amendment paragraph (in-place amendment lands at SPEC commit) + ADR-0148 + ADR-0149 + ADR-0154.
+
+**Lands-in:** Task 7 of phase-17 PLAN (anticipated).
+
+### Context
+
+Phase 17 jwt_authn introduces the **8th canonical per-route pattern** in ADR-0125's roster. The roster after phase 16 has 7 entries (data-only / multi-tier / stateful-INDEPENDENT / data-only-SHARED / disabled-OR-override-bool / bare-message-via-TPFC / wrapper-with-reserved-field-absent-implies-disabled). Phase 17 adds an 8th: **oneof-with-string-reference-delegation-OR-disable-bool-with-SHARED-stats**. The structural innovation is the STRING-REFERENCE-DELEGATION arm — the per-route proto embeds a string name that resolves at REQUEST TIME against a listener-level registry (`JwtAuthentication.requirement_map`), NOT at parse time.
+
+**Empirical surface** verbatim from Envoy v1.37.2 `envoy.extensions.filters.http.jwt_authn.v3.PerRouteConfig` per SPEC §11.P9 (`config.pb.go:1595-1679`):
+
+```go
+type PerRouteConfig struct {
+    // ...
+    RequirementSpecifier isPerRouteConfig_RequirementSpecifier `protobuf_oneof:"requirement_specifier"`
+}
+
+type PerRouteConfig_Disabled struct {
+    Disabled bool `protobuf:"varint,1,opt,name=disabled,proto3,oneof"`
+}
+type PerRouteConfig_RequirementName struct {
+    RequirementName string `protobuf:"bytes,2,opt,name=requirement_name,json=requirementName,proto3,oneof"`
+}
+```
+
+PGV constraints per `config.pb.validate.go:2410-2487`:
+- `RequirementSpecifier` oneof is REQUIRED (PGV `value is required`).
+- `Disabled` arm: no value-level PGV.
+- `RequirementName` arm: PGV `min_len=1`.
+
+**§1.1 amendment 5 REFUTES BRAINSTORM hypothesis**: BRAINSTORM §2.7 + §4 framed the 8th canonical as `oneof{requirement_name(string) | disabled(Empty)}` — implying the disable-arm carries a marker message (`google.protobuf.Empty`). The empirical scrape REFUTES — `disabled` is `bool` (varint), NOT `Empty`. The structural ramifications:
+- The marker-message-Empty form (BRAINSTORM hypothesis) would be unambiguous: presence of `disabled: {}` means "disabled".
+- The actual `bool` form admits THREE wire states: `disabled: true` (clearly disabled), `disabled: false` (oneof set; explicit not-disabled), and oneof unset entirely (PGV-rejected).
+
+Phase-17 envoy-go disposition:
+- `PerRouteConfig{disabled: true}` → produce `compiledPerRoute{disabled: true}`; filter wholly inactive on route (no JWT validation; no counter increments).
+- `PerRouteConfig{disabled: false}` → produce `compiledPerRoute{disabled: false, requirementName: ""}`; the oneof IS set to disabled-arm but explicitly does not disable; falls through to listener-level rules dispatch as if no per-route override existed.
+- `PerRouteConfig{requirement_name: "<name>"}` → produce `compiledPerRoute{disabled: false, requirementName: "<name>"}`; runtime-resolve against listener-level requirement_map at DecodeHeaders.
+
+**§1.1 amendment 6 REFUTES BRAINSTORM PARSE-REJECT hypothesis**: BRAINSTORM §2.7 + §17.P12 hypothesized envoy-go-strict PARSE-REJECT for dangling `requirement_name` references. The empirical scrape of Envoy filter_config.cc REFUTES:
+
+```cpp
+const auto& it = name_verifiers_.find(per_route.config().requirement_name());
+if (it != name_verifiers_.end()) { return std::make_pair(it->second.get(), EMPTY_STRING); }
+return std::make_pair(nullptr, absl::StrCat("Wrong requirement_name: ...", name));
+```
+
+Envoy RUNTIME-RESOLVES per-route `requirement_name` at request time via `findPerRouteVerifier()`. On miss, returns an error string; the filter emits `SendLocalReply(403, "Failed JWT authentication: Wrong requirement_name: <name>", nullptr, ...)`. NOT parse-rejected.
+
+The rationale: parse-time validation against listener-level requirement_map is structurally IMPOSSIBLE in deferred-config-loading patterns (RDS-served route configs evaluated lazily against listener-level provider configs). Operationally necessary for xDS-served deferred-listener-activation.
+
+Phase-17 envoy-go disposition: MIRROR Envoy's runtime-resolve. `parsePerRoute` accepts `requirement_name: "<any-string>"` without consulting the listener-level requirement_map; `resolvePerRouteConfig` performs the map lookup at request time; on miss, the filter emits 403 + "Failed JWT authentication: Wrong requirement_name: <name>" + `denied +1` counter. Status 403 (NOT 401; per Envoy filter.cc uses `Http::Code::Forbidden`). NO WWW-Authenticate header for the per-route error case (filter.cc passes `nullptr` for the header-callback).
+
+**SHARED-stats discipline** per §5.2 + §11.P8 RATIFIED via `filter_config.cc` scrape: `findPerRouteVerifier()` contains NO stats-related logic; per-route emits to the SAME stat namespace as listener-level. Rationale: per-route is pure delegation (string-reference resolution against listener-level requirement_map). It does NOT spawn new policy-evaluation state — it merely selects WHICH listener-level requirement applies to this route. The SHARED-stats discipline is operationally correct.
+
+DIVERGES from phase-11 / phase-15 / phase-16 INDEPENDENT-stats (those filters' per-route overrides own NEW stateful config — token bucket / throttle config / policy set). MIRRORS phase-12 csrf + phase-13 buffer + phase-14 compressor SHARED-stats discipline.
+
+**ADR-0125 §(xiii) in-place amendment paragraph**: lands at SPEC commit (NOT IMPL commit) per phase-13 ADR-0127-v2 + phase-14 ADR-0125 §(viii)-(x) + phase-15 ADR-0125 §(xi) + phase-16 ADR-0125 §(xii) in-place-update precedent. The amendment paragraph documents the 8th canonical's defining feature (string-reference-delegation; explicit-disable-bool NOT Empty; runtime-resolve discipline; SHARED-stats discipline) and grows ADR-0125's canonical-pattern roster from 7 to 8. See DECISIONS.md ADR-0125 §(xiii) for the verbatim text.
+
+**Resolution flow at request time** per §5.3:
+1. If `compiledPerRoute.disabled == true` → set `f.passthrough = true`; `DecodeHeaders` short-circuits to `HeaderContinue`; NO counter increments.
+2. If `compiledPerRoute.disabled == false` AND `compiledPerRoute.requirementName != ""` → consult `listenerRC.requirementMap[requirementName]`. If found, evaluate against the request's extracted JWT; emit allowed/denied per result. If NOT found, emit 403 + "Failed JWT authentication: Wrong requirement_name: <name>" + `denied +1`.
+3. If `compiledPerRoute.disabled == false` AND `compiledPerRoute.requirementName == ""` (case (b)) → fall through to listener-level rules dispatch.
+4. If `resolvePerRouteConfig` returns nil (no per-route TPFC entry) → identical to case (b).
+
+---
+
+## ADR-0154: Stat surface 7 base counters (allowed + denied + cors_preflight_bypassed + jwks_fetch_success + jwks_fetch_failed + jwt_cache_hit + jwt_cache_miss; the last 2 structurally unreachable under MVP per §8 deferral 8) per HCM stat_prefix scope + NO per-provider scaling per §1.1 amendment 9 (REFUTES BRAINSTORM 8-per-provider-scaling hypothesis) + NO gauges + NO histograms + HCM-rooted SN2-reuse namespace `http.<HCM_stat_prefix>.jwt_authn.<counter>` per §11.P7 (RATIFIED-PENDING-IMPL-TIME-EMPIRICAL-SCRAPE; mirrors phase-14 + phase-15 + phase-16 SN2-reuse precedent) + per-route stats SHARED per §5.2 + §11.P8 (NO INDEPENDENT-stats discipline; pure delegation; mirrors phase-12/13/14 SHARED) + `cors_preflight_bypassed` canonical naming per §1.1 amendment 10 (REFUTES BRAINSTORM `bypassed_cors_preflight` hypothesis)
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Co-anchors with ADR-0148 + ADR-0153.
+
+**Lands-in:** Task 8 of phase-17 PLAN (anticipated; canonical Task-8 empirical-scrape closure point for the RATIFIED-PENDING §11.P7 Prometheus namespace claim per phase-16 §10 lesson (c)).
+
+### Context
+
+Phase 17 stat surface grows from 64 base names (post-phase-16) to 71 base names — 7 new filter-wide counters under the HCM stat_prefix scope. The 7-counter set was empirically RATIFIED-via-REFUTATION-of-BRAINSTORM-hypothesis at SPEC §11.P6 via verbatim scrape of `source/extensions/filters/http/jwt_authn/stats.h`:
+
+```
+COUNTER(allowed)
+COUNTER(cors_preflight_bypassed)
+COUNTER(denied)
+COUNTER(jwks_fetch_success)
+COUNTER(jwks_fetch_failed)
+COUNTER(jwt_cache_hit)
+COUNTER(jwt_cache_miss)
+```
+
+**§1.1 amendment 9 REFUTES BRAINSTORM hypothesis**: BRAINSTORM §1.1 item 7 hypothesized "8 new base counters with per-provider scaling: 2 per-provider counters (`jwt_authn.<provider>.jwt_authn_success` + `jwt_authn.<provider>.jwt_authn_failed`) + 5 per-provider JWKS counters + 1 filter-wide bypass". The empirical scrape REFUTES:
+- Envoy emits 7 filter-wide counters (NOT 8); single set keyed at HCM stat_prefix scope.
+- NO per-provider scaling — multiple providers contribute to the SAME `allowed` + `denied` counters; multiple RemoteJwks endpoints contribute to the SAME `jwks_fetch_success` + `jwks_fetch_failed` counters.
+- NO gauges (no `jwks_fetch_in_progress` gauge as BRAINSTORM hypothesized).
+- NO histograms in jwt_authn (counter-only filter; differs from phase-15 bandwidth_limit which had 2 unconditional histograms).
+
+**§1.1 amendment 10 REFINES BRAINSTORM naming**: BRAINSTORM hypothesized `bypassed_cors_preflight`; empirical scrape RATIFIES `cors_preflight_bypassed` (noun-noun-verb-past-participle ordering, NOT verb-past-participle-noun-noun).
+
+The `jwt_cache_hit` + `jwt_cache_miss` pair tracks the validated-JWT LRU cache controlled by `JwtCacheConfig` proto field. Phase-17 MVP defers `JwtCacheConfig` entirely per §8 deferral 8 (couples to future caching-framework phase). Under MVP configs, these 2 counters are STRUCTURALLY UNREACHABLE — the validated-JWT cache is never populated; the counters never increment. Phase-17 envoy-go MVP allocates the counters at New() time (predeclared empty counters for scrape stability per Prometheus best practice; matches Envoy's allocation discipline) but never increments them under MVP configs.
+
+**Namespace anchor** per §11.P7 RATIFIED-PENDING-IMPL-TIME-EMPIRICAL-SCRAPE: HCM-rooted `http.<HCM_stat_prefix>.jwt_authn.<counter>` (mirrors phase-14 + phase-15 + phase-16 SN2-reuse pattern). The existing HCM-stat-prefix Prometheus tag-extractor handles `http.*` segment routing verbatim without amendment. NO new SN10 rule needed unless impl-time Task-8 empirical scrape against reference Envoy v1.37.2 with a probe yaml refutes the SN2-reuse hypothesis.
+
+Phase-16 §10 lesson (c) Task-8 RATIFIED-PENDING closure mechanism applies: §11.P7 is the SOLE Task-8 closure pin in phase-17 (vs phase-16's 3 RATIFIED-PENDING pins §17.P7/P8/P9 closing at Task 8). The §11.P8 + §11.P12 pins were RATIFIED in-SPEC-session via filter_config.cc + filter.cc scrape; no further impl-time confirmation needed.
+
+**Per-route SHARED-stats discipline** per ADR-0153 + §5.2 + §11.P8 RATIFIED: per-route override emits to the SAME stat namespace as listener-level. No per-route `stat_prefix` field exists at jwt_authn. The `filterStats` struct lives at the listener-level `compiledConfig.stats`; per-route resolution does NOT allocate new stats.
+
+This SIMPLIFIES the factoryState shape relative to phase-11/15/16 (which carried per-route lazy-cache `sync.Map` for INDEPENDENT-stats via `newFilterStatsIfAbsent` + `NewCounterIfAbsent` post-Freeze idempotent registration). Phase-17's factoryState carries ONE `sync.Map` (for `compiledPerRoute` lazy-build keyed by per-route TPFC proto pointer); NO per-route stats sub-cache. Eliminates the post-Freeze idempotent registration code-path.
+
+**Stat surface count summary**:
+- Phase 15 (bandwidth_limit): 46 → 60 names (14 new active counter/gauge; SN2 reuse; +2 deferred histograms per ADR-0138).
+- Phase 16 (rbac): 60 → 64 base names (4 new active counter; per-policy lazy counter family conditional on `track_per_rule_stats: true`; SN2 reuse; ADR-0145).
+- **Phase 17 (jwt_authn): 64 → 71 names (7 new active counter; NO per-provider scaling; NO gauges; NO histograms; SN2 reuse).** 5 of 7 actively emitted under MVP; 2 (`jwt_cache_*`) structurally unreachable.
+
+**BEHAVIOR_CONTRACT §13.2 stat-table extension**: 7 new rows per SPEC §13.2 covering each counter (canonical name, type=counter, Prometheus tag-extractor reference `envoy_http_conn_manager_prefix (SN2)`, brief description). 2 of 7 rows annotated "UNREACHABLE under MVP; jwt_cache_config deferred per §8 deferral 8".
+
+**Operator-facing semantics**: `allowed` increments per successful JWT validation; `denied` increments per failed validation. `cors_preflight_bypassed` increments per OPTIONS preflight bypass. `jwks_fetch_success` + `jwks_fetch_failed` increment per JWKS fetch attempt across ALL configured RemoteJwks endpoints. The aggregated-across-providers nature means operators wanting per-provider visibility need access-log scraping (not stats-scrape).
+
+---
+
+## ADR-0155: Deny-path wire shape — 401 for most failure-reasons + 403 for `JwtAudienceNotAllowed` per §1.1 amendment 8 + §11.P1 (REFINES BRAINSTORM "always 401" hypothesis; mirrors Envoy filter.cc `code = (status == Status::JwtAudienceNotAllowed) ? Http::Code::Forbidden : Http::Code::Unauthorized`) + body = canonical jwt_verify_lib `getStatusString(status)` per §11.P1 (~70-string table; ~10 commonly-hit at runtime) + WWW-Authenticate header per RFC 6750 `Bearer realm="<original_uri>"` + conditional `, error="invalid_token"` append for non-JwtMissed per §1.1 amendment 12 + §11.P2 (REFINES BRAINSTORM `realm="<issuer>"` hypothesis — realm uses request URI captured at DecodeHeaders) + `strip_failure_response: true` strips both body AND www-authenticate per §11.P3 + `response_code_details = "jwt_authn_access_denied{<reason>}"` divergence-window per §1.1 amendment 11 + §8 deferral 13 (envoy-go MVP defers field emission per phase-04 HCM scope; mirrors phase-16 ADR-0146 response_code_details discipline) + per-route runtime-resolve error case emits 403 + plain body (NO www-authenticate header) per §1.1 amendment 6 + RFC 6750 conformance
+
+**Status:** Anticipated (SPEC commit anchors §Context only per ADR-0044; §Decision + §Consequences land at impl-time)
+
+**Doctrine:** Phase 17 §9 family-row. ADR-0044 ADR-on-impl convention. Co-anchors with ADR-0148 + ADR-0149 + ADR-0151 + ADR-0153.
+
+**Lands-in:** Task 9 of phase-17 PLAN (anticipated).
+
+### Context
+
+Phase 17's deny-path is RFC 6750-conformant Bearer-token challenge. The wire-shape composition was empirically RATIFIED-AND-REFINED at SPEC §11.P1 + §11.P2 + §11.P3 via verbatim scrape of `source/extensions/filters/http/jwt_authn/filter.cc` + WebFetch of jwt_verify_lib `src/status.cc` for `getStatusString()` canonical mapping.
+
+**Status code mapping** per §1.1 amendment 8 + §11.P1 REFINED:
+
+```cpp
+auto code = (status == Status::JwtAudienceNotAllowed) ? Http::Code::Forbidden : Http::Code::Unauthorized;
+```
+
+The dispatch table:
+- 401 (Unauthorized) for ALL failure-reasons EXCEPT `JwtAudienceNotAllowed`.
+- 403 (Forbidden) for `JwtAudienceNotAllowed` ONLY.
+
+Rationale (RFC 6750 semantic): 401 = unauthenticated/missing-credentials/credential-invalid; 403 = authenticated-but-not-authorized-for-this-resource. Audience-mismatch is the canonical "authenticated but not for this audience" case. **REFINES** BRAINSTORM §4 "always 401 + WWW-Authenticate Bearer challenge" hypothesis.
+
+**Body** = canonical jwt_verify_lib `getStatusString(status)` per §11.P1 ~70-entry table. Commonly-hit strings:
+- `JwtMissed` → `"Jwt is missing"` (14 bytes)
+- `JwtVerificationFail` → `"Jwt verification fails"` (22 bytes)
+- `JwtUnknownIssuer` → `"Jwt issuer is not configured"` (28 bytes)
+- `JwtExpired` → `"Jwt is expired"` (14 bytes)
+- `JwtAudienceNotAllowed` → `"Audiences in Jwt are not allowed"` (32 bytes)
+- `JwtNotYetValid` → `"Jwt not yet valid"` (17 bytes)
+- `JwtHeaderNotImplementedAlg` → `"Jwt header [alg] is not supported"` (33 bytes)
+- `JwtBadFormat` → `"Jwt is not in the form of Header.Payload.Signature with two dots and 3 sections"` (variable; truncated in source quote)
+- `JwksFetchFail` → `"Jwks remote fetch is failed"` (27 bytes)
+- `JwksKidAlgMismatch` → `"Jwks doesn't have key to match kid or alg from Jwt"` (variable)
+
+All strings are ASCII; NO trailing newline. The full 70-string table is imported verbatim into `internal/jwt` error sentinels per ADR-0151.
+
+**WWW-Authenticate header** per §1.1 amendment 12 + §11.P2 RATIFIED-AND-REFINED via filter.cc verbatim:
+
+```cpp
+std::string value = absl::StrCat("Bearer realm=\"", uri, "\"");
+if (status != Status::JwtMissed) {
+  absl::StrAppend(&value, InvalidTokenErrorString);  // = ", error=\"invalid_token\""
+}
+headers.setCopy(Http::Headers::get().WWWAuthenticate, value);
+```
+
+Two structural rules:
+- **realm** uses the **original request URI** captured at DecodeHeaders entry, NOT the JWT provider's `issuer` field as BRAINSTORM §4 + §17.P2 hypothesized. REFINES BRAINSTORM.
+- For all failure-reasons EXCEPT `JwtMissed`, the value additionally appends `, error="invalid_token"` (RFC 6750 §3 challenge syntax). `JwtMissed` case omits the error parameter (no credential was rejected; only absent).
+
+Phase-17 envoy-go disposition: capture `:path` at DecodeHeaders entry → `filter.originalURI`; thread into the SendLocalReply callsite. Conditional append for non-`JwtMissed` statuses. Header value format examples:
+- `JwtMissed`: `Bearer realm="/api/v1/foo"`
+- `JwtExpired`: `Bearer realm="/api/v1/foo", error="invalid_token"`
+- `JwtAudienceNotAllowed`: `Bearer realm="/api/v1/foo", error="invalid_token"` (same WWW-Authenticate format even though status is 403).
+
+NOTE on operator-subtle implication: if the JWT validation fires after a header-mutation filter has rewritten the `:path` pseudo-header, the realm reflects the MUTATED path, not the original. Operators with `:path` rewriters upstream of jwt_authn see WWW-Authenticate realms that may diverge from their dashboard expectations.
+
+**`strip_failure_response: true` semantic** per §11.P3 RATIFIED via filter.cc verbatim:
+
+```cpp
+decoder_callbacks_->sendLocalReply(code, "", nullptr, absl::nullopt, generateRcDetails(...));
+```
+
+When `strip_failure_response: true`:
+- Body = `""` (empty string; 0 bytes).
+- Headers-callback = `nullptr` (no header-mutation; WWW-Authenticate header NOT added).
+- Status code unchanged (401 or 403 per the same dispatch).
+- `response_code_details` still emitted by Envoy (but envoy-go MVP defers field emission entirely per §1.1 amendment 11).
+
+The 4-header standard set (`content-length: 0` when body empty, `content-type` may be absent, `date`, `server: envoy`) preserves the framework's standard SendLocalReply headers; the strip removes the body + the per-filter WWW-Authenticate header only.
+
+**`response_code_details` field-emission divergence-window** per §1.1 amendment 11 + §8 deferral 13 + filter.cc verbatim:
+
+```cpp
+constexpr absl::string_view kRcDetailJwtAuthnPrefix = "jwt_authn_access_denied";
+std::string generateRcDetails(absl::string_view error_msg) {
+  return absl::StrCat(kRcDetailJwtAuthnPrefix, "{",
+      StringUtil::replaceAllEmptySpace(error_msg), "}");
+}
+```
+
+Format: `jwt_authn_access_denied{<failure_reason_with_spaces_as_underscores>}`. E.g., `"Jwt is missing"` becomes `"jwt_authn_access_denied{Jwt_is_missing}"`. This lands in Envoy's HCM `response_flag_details` accessor + access-log `RESPONSE_CODE_DETAILS` operator.
+
+Phase-17 envoy-go MVP DEFERS the field emission per phase-04 HCM scope (current HCM does not surface response_code_details to local-reply callers; threading the value through HCM to access-log output is a phase-04 framework primitive concern). Divergence-window documented at §8 deferral 13 + BEHAVIOR_CONTRACT phase-17 forward-pointer notes. Operator dashboards inspecting access-log `RESPONSE_CODE_DETAILS` see Envoy-side emit but envoy-go absent on jwt_authn denials.
+
+Joint closure with phase-16 ADR-0146 `rbac_access_denied_matched_policy[<id>]` divergence-window: a future response-code-details framework phase closes BOTH simultaneously (the HCM-side primitive serves both filter families). Documented in SPEC §9.2 + phase-16 forward-pointer item 8.
+
+**Per-route runtime-resolve error case** per §1.1 amendment 6 + §11.P12 + filter.cc verbatim:
+
+```cpp
+decoder_callbacks_->sendLocalReply(
+    Http::Code::Forbidden,
+    config_.get()->stripFailureResponse() ? ""
+        : absl::StrCat("Failed JWT authentication: ", error_msg),
+    nullptr, absl::nullopt, generateRcDetails(error_msg));
+```
+
+When per-route `requirement_name` runtime-resolves against an absent map entry:
+- Status: 403 (Forbidden), NOT 401. Diverges from the standard JWT-validation deny path's 401-or-403 dispatch.
+- Body: `"Failed JWT authentication: Wrong requirement_name: <name>"` when strip false; empty when strip true.
+- Headers: `nullptr` callback — NO WWW-Authenticate header for this error case.
+- `response_code_details`: `jwt_authn_access_denied{<error_msg>}` (same format; envoy-go MVP defers).
+- Counter: `denied +1`.
+
+Phase-17 envoy-go disposition: MIRROR Envoy verbatim. The `applyResult` path in §6.9 handles the standard deny path; a separate emit-callsite in `DecodeHeaders` (per §6.6 `resolveRequirement` error branch) handles the per-route runtime-resolve error case.
+
+**4-header standard set (lowercase wire-form)** mirrors phase-09/11/12/13/16 SendLocalReply 4-header discipline:
+- `content-length: <body length>` (0 when stripped).
+- `content-type: text/plain` (when body non-empty; may be absent when stripped — exact disposition is HCM-framework-determined; phase-17 MVP relies on framework defaults).
+- `date: <RFC1123>`.
+- `server: envoy`.
+
+Plus the WWW-Authenticate (when not stripped + not per-route-runtime-resolve-error).
+
+**Connection disposition**: keep-alive (NO `connection: close`). Unlike phase-13 buffer 413 which closes the connection due to potential partial-body-consumption ambiguity, jwt_authn's deny is a pre-body decision (the body has not started yet at validation time at DecodeHeaders).
+
+**RFC 6750 conformance**: phase-17 jwt_authn's deny path is the FIRST §9 row emitting an RFC 6750-conformant Bearer-token challenge response. Conformance points:
+- Status 401 for credential-related failures + 403 for audience-mismatch (RFC 6750 §3).
+- WWW-Authenticate header with `Bearer` scheme + `realm` parameter + conditional `error="invalid_token"` parameter (RFC 6750 §3).
+- Conditional error parameter omitted when no credential supplied (`JwtMissed`).
+
+Future ext_authz HTTP-mode + oauth2 filters will compose against the same RFC 6750-conformant pattern; ADR-0155 provides the structural template.
+
+---
+
