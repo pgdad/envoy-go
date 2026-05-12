@@ -25,6 +25,7 @@ func (c *fakeDecoderCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Mess
 func (c *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
 func (c *fakeDecoderCB) EncodeData([]byte, bool)         {}
 func (c *fakeDecoderCB) EncodeTrailers(http.Header)      {}
+func (c *fakeDecoderCB) DownstreamPrincipal() []string   { return nil }
 
 func TestDecoderFilterCallbacks_Compile(t *testing.T) {
 	var _ DecoderFilterCallbacks = (*fakeDecoderCB)(nil)

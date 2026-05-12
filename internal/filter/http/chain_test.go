@@ -1443,3 +1443,118 @@ func TestEncoderCB_OverwriteBody_PassthroughOnSubsequentInvocations(t *testing.T
 		t.Errorf("expected ok=true + REPLACED; got (ok=%v, body=%q)", ok, body)
 	}
 }
+
+// --- ADR-0144 DownstreamPrincipal framework-primitive integration tests ---
+
+// downstreamPrincipalProbe is a test-only StreamDecoderFilter that captures
+// the result of DecoderFilterCallbacks.DownstreamPrincipal() during
+// DecodeHeaders. Used to verify the chain's plumbing of the TLS principal
+// candidates from chain.SetTLSPrincipals through to the per-stream callback
+// reaches the filter exactly as seeded (no copy, no reordering).
+//
+// Per ADR-0144 §Decision (i)+(ii): SetTLSPrincipals is the HCM-side wire-in
+// accessor; DownstreamPrincipal() is the filter-facing accessor on the
+// DecoderFilterCallbacks interface.
+type downstreamPrincipalProbe struct {
+	cb        DecoderFilterCallbacks
+	principal []string
+	captured  bool
+}
+
+func (p *downstreamPrincipalProbe) DecodeHeaders(http.Header, bool) FilterHeadersStatus {
+	p.principal = p.cb.DownstreamPrincipal()
+	p.captured = true
+	return Continue
+}
+func (p *downstreamPrincipalProbe) DecodeData([]byte, bool) FilterDataStatus {
+	return DataContinue
+}
+func (p *downstreamPrincipalProbe) DecodeTrailers(http.Header) FilterTrailersStatus {
+	return TrailersContinue
+}
+func (p *downstreamPrincipalProbe) SetDecoderCallbacks(cb DecoderFilterCallbacks) { p.cb = cb }
+func (p *downstreamPrincipalProbe) OnDestroy()                                    {}
+
+// newPrincipalProbeChain wires a single-filter chain whose only filter is the
+// supplied downstreamPrincipalProbe (decode-only, no encode side). Mirrors
+// newProbeChain's discipline for the encode-side OverwriteBody probe.
+func newPrincipalProbeChain(p *downstreamPrincipalProbe) *FilterChain {
+	return NewFilterChain([]HTTPFilter{{Name: "probe", Decoder: p}}, nil)
+}
+
+func TestDecoderCB_DownstreamPrincipal_NoSeed_NilSlice(t *testing.T) {
+	// Default chain (no SetTLSPrincipals call) → accessor returns nil. Mirrors
+	// the plaintext / non-mTLS connection semantic per ADR-0144 §Decision (iii):
+	// SetTLSPrincipals is not invoked by HCM dispatch when the downstream conn
+	// is not a *tls.Conn or when HandshakeComplete && PeerCertificates>0 fails.
+	probe := &downstreamPrincipalProbe{}
+	chain := newPrincipalProbeChain(probe)
+	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunDecodeHeaders to terminate")
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.principal != nil {
+		t.Errorf("expected nil principal slice on no-seed chain; got %#v", probe.principal)
+	}
+}
+
+func TestDecoderCB_DownstreamPrincipal_SeededViaSetTLSPrincipals_ReturnsSeed(t *testing.T) {
+	// HCM-side SetTLSPrincipals seeds the chain with the priority-ordered
+	// URI SAN → DNS SAN → Subject DN CN candidates extracted from the
+	// downstream *tls.Conn's ConnectionState. The accessor returns the
+	// same slice the filter callbacks see (no transformation in the
+	// plumbing path per ADR-0144 §Decision (ii)).
+	seed := []string{"spiffe://example.com/admin", "admin.example.com", "client.example.com"}
+	probe := &downstreamPrincipalProbe{}
+	chain := newPrincipalProbeChain(probe)
+	chain.SetTLSPrincipals(seed)
+	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunDecodeHeaders to terminate")
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if got := probe.principal; len(got) != len(seed) {
+		t.Fatalf("expected %d candidates; got %d (%#v)", len(seed), len(got), got)
+	}
+	for i, want := range seed {
+		if probe.principal[i] != want {
+			t.Errorf("candidate[%d]: got %q; want %q", i, probe.principal[i], want)
+		}
+	}
+}
+
+func TestDecoderCB_DownstreamPrincipal_OrderingPreservedAcrossCalls(t *testing.T) {
+	// Multiple DownstreamPrincipal() invocations on the same callback return
+	// the same slice in the same priority order. The plumbing is read-only
+	// post-SetTLSPrincipals (per ADR-0144 §Decision (ii) — the per-stream
+	// field is set once at chain-build time by HCM dispatch). This pins the
+	// no-copy + no-reorder semantic the prinAuthenticated three-case
+	// iteration depends on (case (b) URI-SAN-first priority per ADR-0144).
+	seed := []string{"spiffe://example.com/svc-a", "svc-a.example.com", "svc-a"}
+	chain := NewFilterChain([]HTTPFilter{}, nil)
+	chain.SetTLSPrincipals(seed)
+	cb := &decoderCB{c: chain, idx: 0}
+	const callCount = 3
+	for i := 0; i < callCount; i++ {
+		got := cb.DownstreamPrincipal()
+		if len(got) != len(seed) {
+			t.Fatalf("call %d: expected %d candidates; got %d", i, len(seed), len(got))
+		}
+		for j, want := range seed {
+			if got[j] != want {
+				t.Errorf("call %d candidate[%d]: got %q; want %q", i, j, got[j], want)
+			}
+		}
+	}
+}

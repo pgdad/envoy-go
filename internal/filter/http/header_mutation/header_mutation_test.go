@@ -423,6 +423,7 @@ func (f *fakeDecoderCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Mess
 func (f *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
 func (f *fakeDecoderCB) EncodeData([]byte, bool)         {}
 func (f *fakeDecoderCB) EncodeTrailers(http.Header)      {}
+func (f *fakeDecoderCB) DownstreamPrincipal() []string   { return nil }
 
 func mkPerRoute(req, resp []*commonmutationrulesv3.HeaderMutation) *headermutationv3.HeaderMutationPerRoute {
 	return &headermutationv3.HeaderMutationPerRoute{

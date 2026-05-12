@@ -95,8 +95,18 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 
 // runH2 constructs an h2.ServerConn for the downstream conn and runs it to
 // completion. Connection-level errors are logged with "hcm: h2: " prefix.
+//
+// Phase 16 Task 6 (ADR-0144): the per-connection h2Dispatcher captures the
+// downstream TLS principal-name candidates extracted once at connection
+// build time. All H2 streams on this conn share the same priority-ordered
+// candidate slice — symmetric to H1's per-request extraction (the H1 conn
+// is also pinned to a single TLS state for the connection lifetime, so
+// per-conn caching mirrors that semantic). The dispatcher seeds the
+// per-stream chain via chain.SetTLSPrincipals before RunDecodeHeaders
+// dispatch in chainDispatchAction.WriteH2.
 func (f *Filter) runH2(ctx context.Context, downstream net.Conn) {
 	disp := newH2Dispatcher(f)
+	disp.tlsPrincipals = downstreamTLSPrincipals(downstream)
 	sc := h2.NewServerConn(ctx, downstream, disp, h2.DefaultServerSettings)
 	if err := sc.Run(); err != nil {
 		log.Printf("hcm: h2: %v", err)

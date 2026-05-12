@@ -312,6 +312,7 @@ func (c *fakeCallbacks) RequestRouteConfigsAllTiers() (proto.Message, proto.Mess
 func (c *fakeCallbacks) EncodeHeaders(_ http.Header, _ bool) {}
 func (c *fakeCallbacks) EncodeData(_ []byte, _ bool)         {}
 func (c *fakeCallbacks) EncodeTrailers(_ http.Header)        {}
+func (c *fakeCallbacks) DownstreamPrincipal() []string       { return nil }
 
 // newBuffer constructs a []byte body chunk for DecodeData tests. nil → empty body (§11.11).
 func newBuffer(b []byte) []byte {

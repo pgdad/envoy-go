@@ -1,0 +1,242 @@
+# envoy-go bootstrap for fixture 0018-http-rbac.
+#
+# Functionally equivalent to envoy.yaml modulo:
+#   - cluster type: STATIC (envoy-go convention) vs STRICT_DNS (reference Envoy)
+#   - backend address: 127.0.0.1 (envoy-go is in-process) vs host.docker.internal
+#   - admin/listener ports independently allocated by the runner per proxy
+#   - PKI file paths: same fixture-shared `<fixtureDir>/pki/*.pem` files
+#     since envoy-go runs in-process on the host (no container path
+#     translation needed)
+#
+# Three-listener topology per SPEC §7.2 + Task 13 (mirrors envoy.yaml shape):
+#   l_test_a      — plaintext HCM with rbac → router; 4 listener policies;
+#                   5 routes including 2 per-route TPFC entries.
+#   l_test_b      — echo-backend HCM (cluster c_backend_b target).
+#   l_test_a_tls  — mTLS-required HCM mirroring l_test_a + authenticated_admin
+#                   policy + /admin route.
+#
+# Both RBAC config blocks set explicit `rules_stat_prefix` +
+# `shadow_rules_stat_prefix` per SPEC §1.1 amendment 9 so the SN2-reuse
+# Prometheus-counter namespace renders identically on both sides per
+# ADR-0145. Listener-level: `default`. Per-route override: `override` +
+# `override_shadow`.
+#
+# Direct-response payload `fixture-0018-direct-response-OK\n` (32 bytes) +
+# deny payload "RBAC: access denied" (19 bytes) per SPEC §4 + §1.1
+# amendment 10 match envoy.yaml verbatim — the differential gate requires
+# byte-exact body equivalence between the two sides.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    # === l_test_a — plaintext HCM with listener-level RBAC ===
+    - name: l_test_a
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LATestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_a
+                route_config:
+                  name: rc_test_a
+                  virtual_hosts:
+                    - name: vh_test_a
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "fixture-0018-direct-response-OK\n" }
+                        - match: { path: "/public" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "fixture-0018-direct-response-OK\n" }
+                        - match: { path: "/api" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "fixture-0018-direct-response-OK\n" }
+                        - match: { prefix: "/protected" }
+                          route: { cluster: c_backend_b }
+                        - match: { path: "/per-route-disabled" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "fixture-0018-direct-response-OK\n" }
+                          typed_per_filter_config:
+                            envoy.filters.http.rbac:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                              # rbac field intentionally absent → 7th
+                              # canonical disabled per ADR-0125 §(xii) case (a).
+                        - match: { path: "/per-route-override" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "fixture-0018-direct-response-OK\n" }
+                          typed_per_filter_config:
+                            envoy.filters.http.rbac:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                              rbac:
+                                rules_stat_prefix: override
+                                shadow_rules_stat_prefix: override_shadow
+                                rules:
+                                  action: DENY
+                                  policies:
+                                    guests:
+                                      permissions: [{ any: true }]
+                                      principals:
+                                        - header: { name: X-User, string_match: { exact: guest } }
+                                shadow_rules:
+                                  action: DENY
+                                  policies:
+                                    guests:
+                                      permissions: [{ any: true }]
+                                      principals:
+                                        - header: { name: X-User, string_match: { exact: guest } }
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules_stat_prefix: default
+                      shadow_rules_stat_prefix: default
+                      rules:
+                        action: ALLOW
+                        policies:
+                          admin_users:
+                            permissions: [{ any: true }]
+                            principals:
+                              - header: { name: X-User, string_match: { exact: admin } }
+                          public_paths:
+                            permissions:
+                              - url_path: { path: { exact: /public } }
+                            principals: [{ any: true }]
+                          tenant_api_users:
+                            # AND[url_path /api, header X-Tenant=acme] —
+                            # see envoy.yaml for the fixture-redesign
+                            # rationale (envoy-go MVP stubs DestinationPort/
+                            # DirectRemoteIP, so scenarios 4 + 5 use
+                            # header + url_path composites instead).
+                            permissions:
+                              - and_rules:
+                                  rules:
+                                    - url_path: { path: { exact: /api } }
+                                    - header: { name: X-Tenant, string_match: { exact: acme } }
+                            principals: [{ any: true }]
+                          internal_or_protected:
+                            permissions:
+                              - or_rules:
+                                  rules:
+                                    - url_path: { path: { prefix: /protected } }
+                                    - header: { name: X-Internal, string_match: { exact: "true" } }
+                            principals: [{ any: true }]
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_b — echo-backend listener ===
+    - name: l_test_b
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LBTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_b
+                route_config:
+                  name: rc_test_b
+                  virtual_hosts:
+                    - name: vh_test_b
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend_b }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_a_tls — mTLS-required HCM ===
+    - name: l_test_a_tls
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LATestTLSPort}} } }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: "{{.ServerCert}}" }
+                    private_key: { filename: "{{.ServerKey}}" }
+                validation_context:
+                  trusted_ca: { filename: "{{.CACert}}" }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_a_tls
+                route_config:
+                  name: rc_test_a_tls
+                  virtual_hosts:
+                    - name: vh_test_a_tls
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/admin" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "fixture-0018-direct-response-OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules_stat_prefix: default
+                      shadow_rules_stat_prefix: default
+                      rules:
+                        action: ALLOW
+                        policies:
+                          admin_users:
+                            permissions: [{ any: true }]
+                            principals:
+                              - header: { name: X-User, string_match: { exact: admin } }
+                          public_paths:
+                            permissions:
+                              - url_path: { path: { exact: /public } }
+                            principals: [{ any: true }]
+                          tenant_api_users:
+                            permissions:
+                              - and_rules:
+                                  rules:
+                                    - url_path: { path: { exact: /api } }
+                                    - header: { name: X-Tenant, string_match: { exact: acme } }
+                            principals: [{ any: true }]
+                          internal_or_protected:
+                            permissions:
+                              - or_rules:
+                                  rules:
+                                    - url_path: { path: { prefix: /protected } }
+                                    - header: { name: X-Internal, string_match: { exact: "true" } }
+                            principals: [{ any: true }]
+                          authenticated_admin:
+                            permissions:
+                              - url_path: { path: { exact: /admin } }
+                            principals:
+                              - authenticated:
+                                  principal_name: { exact: "spiffe://example.com/admin" }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: c_backend_b
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend_b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }

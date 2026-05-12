@@ -91,6 +91,21 @@ type FilterChain struct {
 	routeIdx   int
 	ambientCtx context.Context
 
+	// tlsPrincipals carries the priority-ordered TLS principal-name candidates
+	// (URI SAN → DNS SAN → Subject DN CN) extracted by HCM dispatch from the
+	// downstream *tls.Conn's ConnectionState at chain build time. nil for
+	// plaintext / non-mTLS / no-client-cert connections per ADR-0144
+	// §Decision (iii) + ADR-0143 §Decision (vi) case (c). Set once via
+	// SetTLSPrincipals before RunDecodeHeaders dispatch; read by per-stream
+	// decoderCB.DownstreamPrincipal() callbacks during filter iteration.
+	//
+	// Phase-16 ADR-0144 framework primitive (cross-phase reusable; future
+	// filters jwt_authn / ext_authz / oauth2 / ext_proc consume the same
+	// accessor surface). Per-stream-stateless after set: no mutation across
+	// filter dispatch — the slice is read-only per the single-dispatch-
+	// goroutine invariant (ADR-0071).
+	tlsPrincipals []string
+
 	// encodeBodyOverride / encodeBodyOverridden carry the encode-side body
 	// replacement bytes registered via EncoderFilterCallbacks.OverwriteBody.
 	// The sentinel discriminates (override is nil bytes + set) from (no
@@ -460,6 +475,15 @@ func (d *decoderCB) EncodeHeaders(http.Header, bool) {}
 func (d *decoderCB) EncodeData([]byte, bool)         {}
 func (d *decoderCB) EncodeTrailers(http.Header)      {}
 
+// DownstreamPrincipal returns the priority-ordered TLS principal-name
+// candidates from the chain's HCM-seeded tlsPrincipals field. Returns nil
+// for plaintext / non-mTLS / no-client-cert connections (HCM dispatch does
+// NOT call SetTLSPrincipals on such connections per ADR-0144 §Decision (iii)).
+// Per ADR-0144 §Decision (i)+(ii) framework primitive; cross-phase reusable.
+func (d *decoderCB) DownstreamPrincipal() []string {
+	return d.c.tlsPrincipals
+}
+
 // encoderCB is the framework's concrete impl of EncoderFilterCallbacks. Same
 // non-blocking send discipline.
 type encoderCB struct {
@@ -505,6 +529,27 @@ func (c *FilterChain) EncodeBodyOverride() ([]byte, bool) {
 func (c *FilterChain) SetRequestCtx(ctx context.Context, routeIdx int) {
 	c.ambientCtx = ctx
 	c.routeIdx = routeIdx
+}
+
+// SetTLSPrincipals seeds the chain's per-stream TLS principal-name candidate
+// slice. Called by HCM dispatch (connection.go H1 / h2dispatch.go H2) at chain
+// build time BEFORE RunDecodeHeaders dispatch when the downstream conn is a
+// *tls.Conn with HandshakeComplete && len(PeerCertificates) > 0. The slice is
+// priority-ordered: URI SANs first (from PeerCertificates[0].URIs), then
+// DNS SANs (PeerCertificates[0].DNSNames), then the Subject DN Common Name
+// (PeerCertificates[0].Subject.CommonName) — mirrors Envoy v1.37.2's
+// Principal_Authenticated extraction semantics per rbac.pb.go:1432-1438.
+//
+// Per ADR-0144 §Decision (ii)+(iii) (phase-16 framework primitive). Per-stream
+// callbacks read the seeded slice via decoderCB.DownstreamPrincipal(). HCM
+// dispatch does NOT call this method on plaintext / non-mTLS / no-client-cert
+// connections — the per-stream field stays nil, which prinAuthenticated's
+// three-case algorithm interprets as case (c) FALSE per ADR-0143 §Decision (vi).
+//
+// Concurrency: called once per request before filter iteration starts (single
+// dispatch-goroutine invariant per ADR-0071); no synchronization required.
+func (c *FilterChain) SetTLSPrincipals(p []string) {
+	c.tlsPrincipals = p
 }
 
 // SetDiagLogWriter overrides the destination for framework diagnostic log

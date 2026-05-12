@@ -37,6 +37,14 @@ import (
 // matches the H1 path's no-match branch in connection.go.
 type h2Dispatcher struct {
 	f *Filter
+
+	// tlsPrincipals is the priority-ordered TLS principal-name candidate
+	// slice extracted once at connection build time by runH2 via
+	// downstreamTLSPrincipals(downstream). nil for plaintext / non-mTLS /
+	// no-client-cert connections. Threaded into every per-stream chain via
+	// chainDispatchAction.tlsPrincipals → chain.SetTLSPrincipals before
+	// RunDecodeHeaders dispatch. Phase 16 Task 6 (ADR-0144 §Decision (iii)).
+	tlsPrincipals []string
 }
 
 func newH2Dispatcher(f *Filter) *h2Dispatcher {
@@ -73,19 +81,21 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 		// signals "no chain" to chainDispatchAction.WriteH2.
 		notFound := &directResponseAction{status: 404, bodyText: ""}
 		return &chainDispatchAction{
-			f:        d.f,
-			action:   notFound.asRouterActionH2(),
-			req:      req,
-			routeIdx: -1,
-			status:   404,
+			f:             d.f,
+			action:        notFound.asRouterActionH2(),
+			req:           req,
+			routeIdx:      -1,
+			status:        404,
+			tlsPrincipals: d.tlsPrincipals,
 		}, true
 	}
 
 	return &chainDispatchAction{
-		f:        d.f,
-		action:   entry.action.asRouterActionH2(),
-		req:      req,
-		routeIdx: routeIdx,
+		f:             d.f,
+		action:        entry.action.asRouterActionH2(),
+		req:           req,
+		routeIdx:      routeIdx,
+		tlsPrincipals: d.tlsPrincipals,
 	}, true
 }
 
@@ -129,6 +139,12 @@ type chainDispatchAction struct {
 	// status pinned at construction time; for no-match path only (404). Unused
 	// for the matched-route case (status comes from rf.Status() post-RunAction).
 	status int
+	// tlsPrincipals is the priority-ordered TLS principal-name candidate slice
+	// from the parent h2Dispatcher (extracted once at connection build time by
+	// runH2). nil for plaintext / non-mTLS / no-client-cert connections.
+	// Threaded into the per-stream chain via chain.SetTLSPrincipals before
+	// RunDecodeHeaders dispatch. Phase 16 Task 6 (ADR-0144 §Decision (iii)).
+	tlsPrincipals []string
 }
 
 func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, sw h2.StreamWriter) error {
@@ -178,6 +194,13 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	}
 	chain := filter_http.NewFilterChain(chainHF, c.f.perRouteConfig)
 	chain.SetRequestCtx(ctx, c.routeIdx)
+	// Phase 16 Task 6 (ADR-0144): seed the per-stream TLS principal-name
+	// candidates BEFORE RunDecodeHeaders dispatch (symmetric to the H1 path
+	// in connection.go's dispatchRequest). The candidates were extracted
+	// once at connection build time by runH2 → h2Dispatcher.tlsPrincipals →
+	// chainDispatchAction.tlsPrincipals here; nil for plaintext / non-mTLS /
+	// no-client-cert connections.
+	chain.SetTLSPrincipals(c.tlsPrincipals)
 	defer chain.Destroy()
 
 	// Locate the terminal router filter and inject the per-request H2
@@ -225,6 +248,20 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// iterates c.req.Header.
 	if _, ok := c.req.Header[":authority"]; !ok && c.req.Host != "" {
 		c.req.Header[":authority"] = []string{c.req.Host}
+	}
+
+	// Phase 16 Task 14: inject the request path as ":path" pseudo-header
+	// (symmetric with the H1 connection.go path; same rationale — rbac and
+	// similar URL-path-consuming filters observe :path consistently across
+	// H1 + H2). H2 already carried :path on the HEADERS frame; the codec
+	// strips it into the URL during parseHeadersForRequest. Reflect it back
+	// for filter consumption. Same wire-emit safety as :method.
+	if _, ok := c.req.Header[":path"]; !ok && c.req.URL != nil {
+		path := c.req.RequestURI
+		if path == "" {
+			path = c.req.URL.RequestURI()
+		}
+		c.req.Header[":path"] = []string{path}
 	}
 
 	// Decode side: headers → data → trailers. H2 body is fully buffered

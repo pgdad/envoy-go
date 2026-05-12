@@ -577,6 +577,7 @@ func (f *fakeDecoderCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Mess
 func (f *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
 func (f *fakeDecoderCB) EncodeData([]byte, bool)         {}
 func (f *fakeDecoderCB) EncodeTrailers(http.Header)      {}
+func (f *fakeDecoderCB) DownstreamPrincipal() []string   { return nil }
 
 // makeFilterWithMode constructs a *filter with the given enable_mode +
 // limit_kbps + fill_interval and a freshly-attached fakeDecoderCB. Used

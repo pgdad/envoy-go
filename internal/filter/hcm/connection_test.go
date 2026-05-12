@@ -395,7 +395,7 @@ func TestDispatchRequest_DirectResponseRunsChain(t *testing.T) {
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	status, err := f.dispatchRequest(context.Background(), req, bw)
+	status, err := f.dispatchRequest(context.Background(), nil, req, bw)
 	if err != nil {
 		t.Fatalf("dispatchRequest: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestDispatchRequest_ChainMediatedAccessLogEmit(t *testing.T) {
 	req.Proto = "HTTP/1.1"
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	if _, err := f.dispatchRequest(context.Background(), req, bw); err != nil {
+	if _, err := f.dispatchRequest(context.Background(), nil, req, bw); err != nil {
 		t.Fatalf("dispatchRequest: %v", err)
 	}
 	_ = bw.Flush()

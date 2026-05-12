@@ -1096,6 +1096,7 @@ func (c *fakeCallbacks) RequestRouteConfigsAllTiers() (proto.Message, proto.Mess
 func (c *fakeCallbacks) EncodeHeaders(http.Header, bool) {}
 func (c *fakeCallbacks) EncodeData([]byte, bool)         {}
 func (c *fakeCallbacks) EncodeTrailers(http.Header)      {}
+func (c *fakeCallbacks) DownstreamPrincipal() []string   { return nil }
 
 // OverwriteBody captures b (defensive copy — the EncodeData implementation
 // passes buf.Bytes() which aliases its bytes.Buffer's internal slice; capturing

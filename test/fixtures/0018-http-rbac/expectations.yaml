@@ -1,0 +1,255 @@
+# Phase 16 fixture 0018 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per SPEC §7.2): three listeners + one cluster.
+#   l_test_a      — plaintext HCM(hcm_local_a) with envoy.filters.http.rbac +
+#                   router; 5 listener policies (admin_users, public_paths,
+#                   tenant_api_users, internal_or_protected, authenticated_admin
+#                   is on l_test_a_tls only); 6 routes (/, /public, /api,
+#                   /protected, /per-route-disabled, /per-route-override).
+#   l_test_b      — echobackend listener (cluster c_backend_b target).
+#   l_test_a_tls  — mTLS-required HCM(hcm_local_a_tls) mirroring l_test_a's
+#                   listener-level RBAC + the authenticated_admin policy +
+#                   /admin route.
+# Both RBAC configs use rules_stat_prefix=default + shadow_rules_stat_prefix=default
+# at the listener level. The scenario-8 per-route override uses
+# rules_stat_prefix=override + shadow_rules_stat_prefix=override_shadow.
+#
+# Per SPEC §7.3 the driver asserts: per-scenario status code byte-stream
+# equivalence + per-side stat-counter expectations honoring the documented
+# INDEPENDENT-vs-SHARED-per-route-stats divergence-window (ADR-0145 +
+# Task-14 empirical finding). Total runtime ≈ 1.5s wallclock per fixture
+# (no throttle / wait-time scenarios in fixture 0018).
+#
+# ## Scenario matrix (per SPEC §7.1 — 8 scenarios)
+#
+# Scenario 1: Allow-by-header-match (canonical Permission_Header).
+#   Request:  GET / with X-User: admin (plaintext l_test_a)
+#   Both sides: 200 + 32-byte direct_response body
+#   "fixture-0018-direct-response-OK\n". Listener-level policy
+#   admin_users matches (header X-User exact admin). ALLOW path.
+#   Counter impact: default.allowed +1 (hcm_local_a) on both sides.
+#
+# Scenario 2: Deny-no-match (RBAC ALLOW + no-policy-match).
+#   Request:  GET / with X-User: guest (plaintext l_test_a)
+#   Both sides: 403 + 19-byte "RBAC: access denied" body.
+#   Counter impact: default.denied +1 (hcm_local_a) on both sides.
+#
+# Scenario 3: Allow-by-url-path (canonical Permission_UrlPath exact).
+#   Request:  GET /public (no special headers)
+#   Both sides: 200 + 32-byte direct_response. Policy public_paths
+#   matches (url_path exact /public). ALLOW path.
+#   Counter impact: default.allowed +1.
+#
+# Scenario 4: Allow-by-AND-composite (canonical Permission_AndRules).
+#   Request:  GET /api with X-Tenant: acme
+#   Both sides: 200 + 32-byte direct_response. Policy tenant_api_users
+#   matches (AND[url_path exact /api, header X-Tenant exact acme]).
+#   ALLOW path.
+#   Counter impact: default.allowed +1.
+#   Task-14 fixture redesign: the BRAINSTORM scenario 4 used a
+#   destination_port permission, but envoy-go MVP stubs DestinationPort()
+#   to 0 (the framework primitive for listener-bind-port introspection is
+#   not yet plumbed). The redesigned scenario exercises the same
+#   Permission_AndRules + Permission_UrlPath + Permission_Header canonical
+#   evaluators using MVP-plumbed accessors. The destination_port canonical
+#   remains covered by unit tests at Group 3.
+#
+# Scenario 5: Allow-by-OR-composite (canonical Permission_OrRules).
+#   Request:  GET /protected (no special headers)
+#   Both sides: 200 + echobackend JSON echo (variable-length body per
+#   phase-14 ADR-0133 §(ii) per-side echobackend body variance). Policy
+#   internal_or_protected matches via the OR-rules first clause
+#   (url_path prefix /protected). ALLOW path; routes through cluster
+#   c_backend_b to the echobackend.
+#   Counter impact: default.allowed +1.
+#   Task-14 fixture redesign: the BRAINSTORM scenario 5 used a
+#   direct_remote_ip principal, but envoy-go MVP stubs DirectRemoteIP()
+#   to nil. The redesigned scenario exercises Permission_OrRules using
+#   MVP-plumbed accessors. The direct_remote_ip canonical remains
+#   covered by unit tests at Group 4.
+#
+# Scenario 6: mTLS Allow-by-TLS-principal (canonical Principal_Authenticated
+#   + ADR-0144 framework primitive).
+#   Request:  GET /admin over HTTP/1.1-over-mTLS to l_test_a_tls; client
+#   presents cert with URI SAN spiffe://example.com/admin signed by
+#   fixture-CA.
+#   Both sides: 200 + 32-byte direct_response. Policy authenticated_admin
+#   matches (url_path exact /admin AND Principal_Authenticated.principal_name
+#   StringMatcher exact matches the URI SAN). ALLOW path.
+#   Counter impact: default.allowed +1 on hcm_local_a_tls (NOT hcm_local_a).
+#
+#   Note: scenario 6 exercises the unanticipated ADR-0147 — the phase-03
+#   TLS layer's blanket rejection of `require_client_certificate=true`
+#   was lifted SCOPED to well-formed mTLS configurations (validation_context
+#   carrying a trusted_ca PEM) per Task-14 unanticipated-amendment. The
+#   listener TLS context goes through stdlib crypto/tls's
+#   RequireAndVerifyClientCert mode + ClientCAs pool populated from the
+#   fixture-CA.
+#
+# Scenario 7: Per-route 7th-canonical disabled (ADR-0125 §(xii) case (a) +
+#   ADR-0145).
+#   Request:  GET /per-route-disabled with X-User: guest (would deny at
+#   the listener level)
+#   Both sides: 200 + 32-byte direct_response. Per-route TPFC carries
+#   RBACPerRoute{} (rbac field absent) → filter wholly disabled for this
+#   route per the 7th canonical absence-implies-disabled semantic. NO
+#   counter increment anywhere (filter bypassed).
+#   Counter impact: 0 on both sides.
+#
+# Scenario 8: Per-route wholesale-override with INDEPENDENT-stats vs SHARED-
+#   stats divergence-window (ADR-0145 + Task-14 empirical finding).
+#   Request:  GET /per-route-override with X-User: guest
+#   Both sides: 403 + 19-byte "RBAC: access denied" body. Per-route TPFC
+#   carries RBACPerRoute{rbac: <override config DENY guests>,
+#   rules_stat_prefix:override, shadow_rules_stat_prefix:override_shadow}.
+#   X-User=guest matches the override DENY policy → 403; shadow_rules
+#   mirror the primary so shadow also DENIES on the matched policy.
+#
+#   COUNTER IMPACT DIVERGES BY SIDE per the INDEPENDENT-vs-SHARED stats
+#   discipline (the differential gate accommodates this known
+#   divergence-window):
+#
+#   - envoy-go (INDEPENDENT-stats per ADR-0145): scenario 8 emits to the
+#     per-route prefixes EXCLUSIVELY. override.denied +1 (NOT default.denied);
+#     override_shadow.shadow_denied +1 (NOT default.shadow_denied). The
+#     listener-level default.* namespace is UNCHANGED by scenario 8.
+#
+#   - reference Envoy v1.37.2 (SHARED-stats per Task-14 empirical scrape):
+#     scenario 8 emits to the LISTENER-level prefixes despite the per-route
+#     rules_stat_prefix / shadow_rules_stat_prefix being set. default.denied +1
+#     (scenario 8 stacks on top of scenario 2 here); default.shadow_denied +1.
+#     NO override.* or override_shadow.* metrics are emitted on the
+#     reference side.
+#
+#   The driver's AssertStats helper enforces side-specific expectations
+#   (refExpectations + subjExpectations) AND a cross-side TOTAL-event-count
+#   equivalence assertion: the SUM of (default.denied + override.denied)
+#   matches between the two sides (both sides record the same number of
+#   DENY events — only the prefix-binding differs).
+#
+# ## Counter-delta map (per side; per SPEC §7.3 + Task-14 empirical)
+#
+# envoy-go (INDEPENDENT per-route stats per ADR-0145):
+#   http.hcm_local_a.rbac.default.allowed             +4  (scenarios 1, 3, 4, 5)
+#   http.hcm_local_a.rbac.default.denied              +1  (scenario 2)
+#   http.hcm_local_a.rbac.default.shadow_allowed      +0
+#   http.hcm_local_a.rbac.default.shadow_denied       +0
+#   http.hcm_local_a_tls.rbac.default.allowed         +1  (scenario 6)
+#   http.hcm_local_a_tls.rbac.default.denied          +0
+#   http.hcm_local_a.rbac.override.denied             +1  (scenario 8 primary)
+#   http.hcm_local_a.rbac.override_shadow.shadow_denied +1  (scenario 8 shadow)
+#   http.hcm_local_a.rbac.override.allowed             +0  (override is DENY-only)
+#   http.hcm_local_a.rbac.override_shadow.shadow_allowed +0
+#
+# reference Envoy v1.37.2 (SHARED per-route stats per Task-14 empirical):
+#   http.hcm_local_a.rbac.default.allowed             +4  (scenarios 1, 3, 4, 5)
+#   http.hcm_local_a.rbac.default.denied              +2  (scenarios 2 + 8 SHARED-fold)
+#   http.hcm_local_a.rbac.default.shadow_allowed      +0
+#   http.hcm_local_a.rbac.default.shadow_denied       +1  (scenario 8 shadow SHARED-fold)
+#   http.hcm_local_a_tls.rbac.default.allowed         +1  (scenario 6)
+#   http.hcm_local_a_tls.rbac.default.denied          +0
+#   (NO override.* or override_shadow.* metrics emitted)
+#
+# Both sides: total ALLOW events = 5 (scenarios 1, 3, 4, 5, 6); total DENY
+# events = 2 (scenarios 2 + 8); total SHADOW-DENY events = 1 (scenario 8
+# shadow). Scenario 7 emits NOTHING (per-route disabled bypass; reference +
+# envoy-go both honor the 7th canonical absence-implies-disabled semantic).
+#
+# ## Documented divergence-windows
+#
+# 1. **Prometheus tag-extractor surface divergence (Task-14 empirical):**
+#    Reference Envoy v1.37.2 ships a tag-extractor for the rbac filter's
+#    rules_stat_prefix segment — Prometheus emits
+#    `envoy_http_rbac_<suffix>{envoy_rbac_http_prefix="<namespace>", envoy_http_conn_manager_prefix="<HCM>"}`.
+#    envoy-go's MVP uses the SN2-reuse hypothesis from ADR-0145 with NO new
+#    SN10 flatten rule (or its equivalent for the rbac filter) — Prometheus
+#    emits `envoy_http_rbac_<namespace>_<suffix>{envoy_http_conn_manager_prefix="<HCM>"}`
+#    (namespace inlined into the base; no envoy_rbac_http_prefix label).
+#    The driver's lookupRBACCounter normalizes both conventions (Form A:
+#    reference label-form; Form B: envoy-go inline-form) with absent-as-
+#    zero fallback. Future enhancement: introduce a phase-16-stat-extractor
+#    in internal/stats/name.go (a phase-11/15-precedent SN9/inline-prefix-
+#    style detection for rbac) to close this divergence-window by emitting
+#    the label-form on envoy-go side too. Deferred to a future stat-surface-
+#    refinement phase.
+#
+# 2. **INDEPENDENT-vs-SHARED per-route stats divergence (ADR-0145 + Task-14
+#    empirical):** envoy-go's per-route INDEPENDENT-stats discipline (per
+#    ADR-0145) emits scenario 8's counters under the per-route
+#    rules_stat_prefix / shadow_rules_stat_prefix (`override` /
+#    `override_shadow`); reference Envoy v1.37.2 SHARED-stats discipline
+#    folds them into the LISTENER-level prefixes (`default` / `default`).
+#    The driver enforces side-specific expectations AND a cross-side TOTAL-
+#    event-count equivalence assertion. The divergence is a deliberate
+#    design choice on envoy-go side (per ADR-0145 §Decision INDEPENDENT-
+#    stats reasoning); reference Envoy's behavior is empirically observed
+#    + accommodated.
+#
+# 3. **LOG-action access_log_hint dynamic-metadata divergence (SPEC §6.6 +
+#    ADR-0146):** envoy-go silent (no metadata emission framework primitive);
+#    Envoy emits access_log_hint dynamic metadata on LOG-matched requests.
+#    Fixture 0018 does NOT exercise LOG action scenarios so this divergence-
+#    window is not surfaced empirically in the 8-scenario workload.
+#
+# 4. **Response_code_details on DENY divergence (SPEC §6.7 + ADR-0140):**
+#    envoy-go silent (no response_code_details framework primitive);
+#    Envoy emits "rbac_access_denied" details string. Fixture 0018 does NOT
+#    assert on response_code_details so this divergence-window is not
+#    surfaced.
+#
+# 5. **CEL three-field condition evaluation divergence (SPEC §6.5 + ADR-0143
+#    + amendment 6):** envoy-go silent-ignored (parsing accepts but
+#    evaluator returns FALSE); Envoy: full CEL evaluation. Fixture 0018's
+#    policies do NOT set the CEL condition field so this divergence-window
+#    is not surfaced.
+#
+# 6. **Shadow access-log integration divergence (SPEC §6.7 + amendment 9):**
+#    Both sides counter-only (no shadow-decision-annotated access-log
+#    entries) at fixture 0018 wallclock. No current observable divergence.
+#
+# 7. **sourced_metadata + filter_state Principal always-no-match (SPEC §2.5
+#    + §8.10 + ADR-0143):** envoy-go always-FALSE; Envoy: full evaluation
+#    against the per-stream metadata + filter_state stores. Fixture 0018
+#    does NOT exercise these Principal variants so the divergence-window
+#    is not surfaced.
+#
+# 8. **Principal_Authenticated canonical 3-cert-field scope (SPEC §8.9 +
+#    ADR-0144 §Decision):** envoy-go: URI SAN + DNS SAN + Subject DN CN
+#    only. Issuer DN, Serial Number, fingerprints DEFERRED. Fixture 0018's
+#    scenario 6 client cert carries URI SAN spiffe://example.com/admin
+#    (canonical accessor surface); the additional cert fields are not
+#    exercised so the divergence-window is not surfaced.
+#
+# 9. **mTLS require_client_certificate via ADR-0147 unanticipated lift:**
+#    Phase-03's blanket TLS-layer rejection of
+#    `require_client_certificate=true` (ADR-0032 §Decision (7)) is lifted
+#    SCOPED to well-formed mTLS configurations (validation_context.trusted_ca
+#    PEM provided) per Task-14 ADR-0147. The lift maps Envoy's
+#    require_client_certificate=true onto stdlib crypto/tls's
+#    RequireAndVerifyClientCert mode + ClientCAs pool. The previously
+#    parse-rejected surfaces (SDS-bound secrets, custom_validator_config,
+#    match_typed_subject_alt_names, verify_certificate_hash/spki) remain
+#    rejected; the lift is narrowly scoped to the trusted_ca path.
+#
+# ## Wall-clock tolerance
+#
+# Fixture 0018 has no throttle / wait-time scenarios; the per-scenario
+# wall-clock is dominated by the network round-trip + the rbac evaluator
+# evaluation (< 1ms typical). Total fixture wallclock ≈ 1.5s (8 scenarios
+# sequential against each proxy). NO wall-clock-tolerance assertion is
+# enforced; the per-scenario byte-stream verdict is the sole assertion.
+#
+# ## Header allow-list
+#
+# Standard envoy timing/identity headers per BEHAVIOR_CONTRACT.md
+# `## Header allow-list` — `date`, `server`, `x-envoy-upstream-service-time`,
+# `x-request-id`, `x-forwarded-*`, `x-envoy-*`. Cross-side body verdict
+# captures status + body-as-classified-by-scenario (allow-path verbatim
+# match; deny-path 19-byte text exact). The header-level differential is
+# NOT enforced at fixture 0018 (the driver's byte-stream omits headers
+# per Task-12 design).
+#
+# Cross-refs: SPEC §7.1 + §7.2 + §7.3 + §11.P4 + §11.P14 + §11.P15 +
+#             ADR-0125 §(xii) + ADR-0140 + ADR-0143 + ADR-0144 + ADR-0145 +
+#             ADR-0146 + ADR-0147 (unanticipated; Task-14 mTLS-lift) +
+#             BEHAVIOR_CONTRACT §245 (TBD) divergence-window roster.

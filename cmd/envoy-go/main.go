@@ -34,6 +34,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/fault"
 	"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"
 	"github.com/esalaine/envoy-go/internal/filter/http/localratelimit"
+	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
@@ -125,6 +126,7 @@ func main() {
 	httpReg.Register(fault.TypeURL, fault.New)
 	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
 	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
+	httpReg.Register(rbac.TypeURL, rbac.New)
 	// Register header_mutation per-route validator before Freeze (the registry
 	// rejects registrations after Freeze; New is called post-Freeze during
 	// listener construction, so it cannot call RegisterPerRouteValidator itself).

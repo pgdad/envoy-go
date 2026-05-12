@@ -123,7 +123,11 @@ func TestDispatchRequest_ChainInvocationOrder(t *testing.T) {
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	status, derr := f.dispatchRequest(context.Background(), req, bw)
+	// Phase 16 Task 6 (ADR-0144): dispatchRequest now takes a downstream
+	// net.Conn so the H1 path can extract TLS principal candidates. The
+	// test passes nil — TLS extraction returns nil for non-*tls.Conn types
+	// (the type assertion fails) so the chain's tlsPrincipals stays nil.
+	status, derr := f.dispatchRequest(context.Background(), nil, req, bw)
 	if derr != nil {
 		t.Fatalf("dispatchRequest: %v", derr)
 	}

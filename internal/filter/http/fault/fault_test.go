@@ -230,6 +230,7 @@ func (r *recordingDCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Messa
 func (r *recordingDCB) EncodeHeaders(http.Header, bool) {}
 func (r *recordingDCB) EncodeData([]byte, bool)         {}
 func (r *recordingDCB) EncodeTrailers(http.Header)      {}
+func (r *recordingDCB) DownstreamPrincipal() []string   { return nil }
 
 // makeFilter constructs a fault filter with the supplied abort.http_status,
 // abort.percentage, and headers-field shape, returning the *filter and the

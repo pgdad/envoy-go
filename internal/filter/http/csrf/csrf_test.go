@@ -553,3 +553,4 @@ func (c *fakeCallbacks) RequestRouteConfigsAllTiers() (proto.Message, proto.Mess
 func (c *fakeCallbacks) EncodeHeaders(_ http.Header, _ bool) {}
 func (c *fakeCallbacks) EncodeData(_ []byte, _ bool)         {}
 func (c *fakeCallbacks) EncodeTrailers(_ http.Header)        {}
+func (c *fakeCallbacks) DownstreamPrincipal() []string       { return nil }

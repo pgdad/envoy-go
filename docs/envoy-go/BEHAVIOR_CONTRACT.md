@@ -35,6 +35,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | HTTP filter `envoy.filters.http.buffer` | 0015-http-buffer: scenario1: body-fits-cap (1 KiB POST → 200); scenario2: streaming-overflow CL-known (2 MiB POST → 413; §11.7+§11.8 wire shape: content-length=17, body=`Payload Too Large`, 4-header lowercase set + Connection: close); scenario3: chunked-overflow against per-route tighter cap (200 KiB chunked → 413, NO 100-Continue with chunked); scenario4: per-route disabled bypass (2 MiB POST → 200 — cap wholly inactive on disabled route per §11.4); scenario5: per-route tighter override fires (200 KiB → 413 against 128 KiB override); scenario6: chunked-passthrough Content-Length injection (10 KiB chunked → 200, backend asserts inbound `Content-Length: 10240` per §11.8-CL `maybeAddContentLength` mirror). All 6 requests HTTP/1.1 plaintext; no timing tolerances (buffer is purely synchronous). Counter delta on envoy-go side: `downstream_rq_total +6`, `downstream_rq_2xx +3`, `downstream_rq_4xx +3`. Envoy-only `downstream_rq_too_large` (+3) and `downstream_rq_completed` (+6) filtered out via the existing twin-series-discipline allow-list. NOT asserted: `max_request_bytes > 1 MiB` operational behavior (deferred — envoy-go-only parse-time rejection per ADR-0126); `per_connection_buffer_limit_bytes` / `per_request_buffer_limit_bytes` (silent-ignored per ADR-0076); H2 differential coverage. |
 | HTTP filter `envoy.filters.http.compressor` | 0016-http-compressor (gzip-only response-side): byte-exact status; decompressed-byte-exact body on compressed scenarios per ADR-0133 (gzip compressed bytes are STRUCTURALLY non-byte-exact between Go `compress/gzip` and Envoy libz — multi-encoding gzip-format spec admits both); allow-list `content-length` value + `transfer-encoding` presence on compressed scenarios (envoy-go fixed-CL identity vs Envoy chunked per ADR-0131); per-counter delta byte-equivalent on 12 active counters (10 cross-side + 1 dynamic per-side `response_total_uncompressed_bytes` + 1 boundary-only `response_total_compressed_bytes` per ADR-0133 §Decision (iii)); 4 per-side empirical-divergence counters (`header_compressor_used`, `header_not_valid`, `response_not_compressed`, `request_not_compressed`) pinned per-side at Task 14 empirical evidence — both sides locked, regressions on either surface immediately. 6 scenarios per phase 14 SPEC §7.1 (compress-text-default, skip-content-type, skip-min-content-length, skip-on-etag, per-route-disabled, per-route-rmAE-override). HCM `directResponseAction.response_headers_to_add` plumbed via ADR-0134 with explicit `OVERWRITE_IF_EXISTS_OR_ADD` AppendAction parse-gate. NOT asserted: brotli + zstd codec extensions (deferred — extends ADR-0130); `request_direction_config` activation + the future `envoy.filters.http.decompressor` filter (deferred); chunked-encoded response wire shape on the encode side (deferred — couples to future encode-side streaming framework phase per ADR-0131); Gzip codec sub-knobs `memory_level` / `window_bits` / `chunk_size` (Go gzip does not expose libz equivalents); `choose_first` first-acceptable selection mode (deferred); `runtime_enabled` + `enabled` runtime gates (Runtime + hot restart family); deprecated top-level mirrors; per-route `overrides.compressor_library` library swap; H2 differential coverage. |
 | HTTP filter `envoy.filters.http.bandwidth_limit` | 0017-http-bandwidth-limit (BOTH-direction Path B-async with kbps-per-tick throttle math; KiB/s units): byte-exact status; byte-exact body (bandwidth_limit does not transform bytes); **±70ms per-side wall-clock tolerance per scenario** per ADR-0137 wire-shape-divergence-window — phase 15 Task 14 empirically refuted the SPEC §11.P9(c) cross-side "total-throttle-time converges within ±70ms" claim for bodies within initial-burst capacity (Envoy's initial-burst-discount + per-request bump-on-active-side-regardless-of-body diverges from envoy-go's deterministic ceil-formula); each side asserted independently within ±70ms of its predicted target. Per-counter delta byte-equivalent on 6 active counters (`*_incoming_total_size`, `*_allowed_total_size` × {request, response} via cross-side delta-equal; `*_enabled` + `*_enforced` × {request, response} via `counterModePerSideExact` per the same initial-burst-discount divergence-window). 6 gauges per stat_prefix (`*_pending`, `*_incoming_size`, `*_allowed_size` × {request, response}) NOT asserted (transient/noisy mid-stream observations). 2 unconditional Envoy histograms (`request_transfer_duration`, `response_transfer_duration`) allow-listed via twin-series-filter divergence-window per §13.4 + `### Twin-series filter discipline` phase-15 extension. INDEPENDENT per-route stats per ADR-0139 (per-route override allocates own `*compiledConfig` + own `*filterStats` keyed by per-route `stat_prefix`). 6 scenarios per phase 15 SPEC §7.1 (response-only throttle, request-only throttle, REQUEST_AND_RESPONSE symmetric, tiny-body within-burst, per-route DISABLED-via-`enable_mode`, per-route override with own stat_prefix). NOT asserted: intra-throttle-window chunk-arrival timing (envoy-go Path B-async silent-then-blast vs Envoy Path A rate-paced chunks at `fill_interval` cadence — deliberate divergence per ADR-0137; couples to future encode-side streaming framework phase); the 4 trailer-mode trailers emitted when `enable_response_trailers: true` (deferred — couples to future trailer-emission framework phase); the 2 unconditional histograms above (twin-series-filter allow-listed); `runtime_enabled` runtime-gate paths (Runtime + hot restart family); H2 differential coverage; `BandwidthLimitPerRoute` wrapper proto (does not exist in Envoy v1.37.2 — per-route uses bare `BandwidthLimit` via TPFC per §11.P1 + ADR-0125 §(xi) NEW 6th canonical). |
+| 0018-http-rbac | envoy.filters.http.rbac (decode-side dual-engine policy gate; rules-engine + matcher-engine + shadow + per-policy stats) | byte-exact status; byte-exact body on allow (passthrough) AND deny (19-byte "RBAC: access denied"); per-counter delta byte-equivalent on 4 base counters per active namespace (allowed/denied/shadow_allowed/shadow_denied); INDEPENDENT per-route stats per ADR-0145 (scenario 8); mTLS scenario 6 exercises ADR-0144 TLS-principal accessor; 7th canonical per-route absent-implies-disabled per ADR-0125 §(xii) (scenario 7) |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -264,7 +265,29 @@ Phase 14 adds 17 new rows: 9 active in MVP + 6 always-zero `request.*` (request-
 
 Phase 15 adds 14 new active rows (8 counters + 6 gauges) — namespace `<stat_prefix>.http_bandwidth_limit.<counter>` underscore-infix (NOT HCM-rooted per phase 15 SPEC §11.P11). NO new SN flattening rule (the existing `internal/stats/name.go` default-branch flatten handles via dot→underscore substitution; ADR-0061 + ADR-0118 NOT amended). Prometheus rendering: `envoy_<stat_prefix>_http_bandwidth_limit_<counter>{}` — stat_prefix INLINED into base name; NO labels / NO tag-extractor (per phase 15 SPEC §1.1 amendment 8 + §11.P10).
 
-**Total: 60 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12 + 0 from 13 + 17 from 14 + 14 from 15). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline. The 2 deferred histograms are documented at the twin-series-filter subsection + `### Phase 15 forward-pointer notes`; they do NOT count in the 60-name table.
+**RBAC filter — 4 active names (introduced by phase 16):**
+
+| Internal name | Type | Source | Filter | Description |
+|---|---|---|---|---|
+| `http.<HCM_stat_prefix>.rbac.<rules_stat_prefix>.allowed`         | counter | filter | rbac | increments per request whose primary engine result = ALLOWED (phase 16 SPEC §11.P6) |
+| `http.<HCM_stat_prefix>.rbac.<rules_stat_prefix>.denied`          | counter | filter | rbac | increments per request whose primary engine result = DENIED (phase 16 SPEC §11.P6) |
+| `http.<HCM_stat_prefix>.rbac.<shadow_rules_stat_prefix>.shadow_allowed` | counter | filter | rbac | increments per request whose shadow engine = ALLOWED (when shadow configured; phase 16 SPEC §11.P6) |
+| `http.<HCM_stat_prefix>.rbac.<shadow_rules_stat_prefix>.shadow_denied`  | counter | filter | rbac | increments per request whose shadow engine = DENIED (when shadow configured; phase 16 SPEC §11.P6) |
+
+**Per-policy counter family (variable; emitted when `track_per_rule_stats: true`):**
+
+| Internal name | Type | Source | Filter | Description |
+|---|---|---|---|---|
+| `http.<HCM_stat_prefix>.rbac.<rules_stat_prefix>.policy.<policy_name>.allowed`        | counter | filter | rbac | matched policy under primary ALLOWED |
+| `http.<HCM_stat_prefix>.rbac.<rules_stat_prefix>.policy.<policy_name>.denied`         | counter | filter | rbac | matched policy under primary DENIED |
+| `http.<HCM_stat_prefix>.rbac.<shadow_rules_stat_prefix>.policy.<policy_name>.shadow_allowed` | counter | filter | rbac | matched policy under shadow ALLOWED |
+| `http.<HCM_stat_prefix>.rbac.<shadow_rules_stat_prefix>.policy.<policy_name>.shadow_denied`  | counter | filter | rbac | matched policy under shadow DENIED |
+
+NOTE: Per-policy counter cost is operator-config-driven; the table entries are templates, not fixed names. The `.policy.` infix segment was empirically refined at Task 8 reference-Envoy v1.37.2 scrape per ADR-0145 (REFINES phase 16 SPEC §13.2 stub which omitted the segment). Operators with N policies × 2 base sides × 2 (primary + shadow) emit up to 4N per-policy counters per active namespace. Foot-gun documented at `### Phase 16 forward-pointer notes`.
+
+Phase 16 adds 4 new active rows (4 counters) — namespace `http.<HCM_stat_prefix>.rbac.<rules_stat_prefix>.<counter>` HCM-rooted (mirrors phase-09 fault, phase-12 csrf, phase-14 compressor; DIVERGES from phase-15 bandwidth_limit's non-HCM-rooted shape). NO new SN flattening rule per phase 16 SPEC §1.1 amendment 9 + ADR-0145 — SN2-reuse hypothesis RATIFIED at Task 8 empirical scrape. Prometheus rendering via existing `envoy_http_conn_manager_prefix` SN2 extractor + dot→underscore default-branch flatten: `envoy_http_rbac_<rules_stat_prefix>_<counter>{envoy_http_conn_manager_prefix="<HCM_stat_prefix>"}`.
+
+**Total: 64 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12 + 0 from 13 + 17 from 14 + 14 from 15 + 4 from 16). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline. The 2 deferred histograms (phase 15) + the per-policy counter family (phase 16; operator-config-driven) are documented separately; they do NOT count in the 64-name base total.
 
 **Phase 13 (buffer filter) note:** The `envoy.filters.http.buffer` filter shipped in phase 13 contributes ZERO new entries to this table. The filter has no filter-specific counter namespace at all (confirmed empirically at phase 13 SPEC §11.5 — reference Envoy v1.37.2 emits NO `envoy_http_buffer_*` counter family). Buffer-filter overflow is observable on the envoy-go side via the existing `downstream_rq_4xx` HCM counter (rendered via Rule SN4 status-class flattening as `envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="<HCM stat_prefix>"}`). The Envoy-only HCM counters `downstream_rq_too_large` (increments on every 413) and `downstream_rq_completed` (increments on every completed request) are NOT in this table; they are filtered out of the differential per the `### Twin-series filter discipline` allow-list discipline below.
 
@@ -1461,6 +1484,67 @@ Internal stat path: `<stat_prefix>.http_bandwidth_limit.<counter>` (underscore i
 
 These four counters are tested per-side; cross-side delta-equality applies to the four `*_incoming_total_size` + `*_allowed_total_size` counters. The 6 gauges (`*_pending`, `*_incoming_size`, `*_allowed_size` × {request, response}) are NOT asserted by the differential (transient/noisy mid-stream observations).
 
+### envoy.filters.http.rbac
+
+Phase 16 ships `envoy.filters.http.rbac` (Envoy v1.37.2 canonical role-based-access-control filter; decode-side dual-engine policy gate) per the canonical Envoy v1.37.2 filter spec under the 07.1 framework. envoy-go's MVP envelope is the NINTH §9 family-row (after cors @ 07.1, fault @ 09, header_mutation @ 10, local_ratelimit @ 11, csrf @ 12, buffer @ 13, compressor @ 14, bandwidth_limit @ 15). It is the FIRST §9 family-row since phase-14 compressor to introduce non-zero framework deltas + the FIRST single phase to introduce TWO new framework primitives: (i) `DecoderFilterCallbacks.DownstreamPrincipal() []string` accessor per ADR-0144 (TLS-principal introspection — cross-phase-reusable by future filters jwt_authn / ext_authz / oauth2 / ext_proc); (ii) `internal/matcher/` NEW top-level package per ADR-0142 (generic `xds.type.matcher.v3.Matcher` match-tree evaluator framework primitive — cross-phase-reusable). It is the THIRD row using stateful-override-with-INDEPENDENT-stats per ADR-0117 precedent (phase-11 local_ratelimit FIRST; phase-15 bandwidth_limit SECOND; phase-16 rbac THIRD); ADR-0145 codifies. ADR-0125 §(xii) in-place amendment documents the NEW canonical "wrapper-with-reserved-field-and-single-optional-sub-message; absent-implies-disabled; presence-implies-wholesale-override" 7th canonical per-route pattern; ADR-0147 unanticipated (Task 13 follow-up) lifts the phase-03 TLS-layer `require_client_certificate=true` blanket-rejection scoped to well-formed mTLS configs to enable fixture 0018 scenario 6.
+
+#### Field decomposition
+
+**Listener-level `envoy.extensions.filters.http.rbac.v3.RBAC` (7 top-level fields per [#next-free-field: 8]):**
+
+| Field | Type | Phase 16 disposition | Notes |
+|---|---|---|---|
+| `rules` | config.rbac.v3.RBAC | CONSUMED | Primary policy engine; UDPA-`field_alias`-grouped with `matcher` under `rules_specifier`; when both set, `rules` wins per `rbac.pb.go:38` proto comment + phase 16 SPEC §1.1 amendment 2. |
+| `shadow_rules` | config.rbac.v3.RBAC | CONSUMED | Parallel non-enforcing engine; UDPA-grouped with `shadow_matcher`; when both set, `shadow_rules` wins per `rbac.pb.go:53`. |
+| `shadow_rules_stat_prefix` | string | CONSUMED | Stat namespace tag for shadow counters; OPTIONAL (no PGV per phase 16 SPEC §1.1 amendment 3). |
+| `matcher` | xds.type.matcher.v3.Matcher | CONSUMED | Alternative match-tree engine via ADR-0142 framework primitive. |
+| `shadow_matcher` | xds.type.matcher.v3.Matcher | CONSUMED | Alternative shadow match-tree. |
+| `rules_stat_prefix` | string | CONSUMED | Stat namespace tag for primary counters; OPTIONAL (no PGV). |
+| `track_per_rule_stats` | bool | CONSUMED | When true, emit per-policy-name counters per matched policy. |
+
+**Inner `config.rbac.v3.RBAC` (rules-engine config; consumed when `rules` or `shadow_rules` set):**
+
+| Field | Type | Phase 16 disposition | Notes |
+|---|---|---|---|
+| `action` | RBAC_Action enum | CONSUMED | ALLOW=0 / DENY=1 / LOG=2; PGV `defined_only = true`. LOG = always-allow + match-runs + `access_log_hint` metadata silent (divergence-window per phase 16 SPEC §1.1 amendment 5). |
+| `policies` | map<string, Policy> | CONSUMED | Lexicographic-order-of-policy-name walk; Policy = permissions OR (≥1; PGV `min_items=1`) + principals OR (≥1) + condition silent-ignored. |
+| `audit_logging_options` | RBAC_AuditLoggingOptions | SILENT-IGNORED | `[#not-implemented-hide:]` upstream; Envoy emits nothing regardless. |
+
+**Inside Policy (3 CEL fields silent-ignored per Q7 + phase 16 SPEC §1.1 amendment 6):**
+
+`condition` (Expr) + `checked_condition` (CheckedExpr) + `cel_config` (CelExpressionConfig) all silent-ignored at runtime. Divergence-window.
+
+**Permission MVP Large 11 (11 of 14; per phase 16 SPEC §1.1 amendment 1 + §2.3):** any, header, url_path, destination_ip, destination_port, destination_port_range, requested_server_name, and_rules, or_rules, not_rule, sourced_metadata (always-no-match runtime).
+
+**Permission DEFERRED (3 of 14):** metadata (deprecated; PARSE-REJECT), matcher (extension; PARSE-REJECT), uri_template (extension; PARSE-REJECT).
+
+**Principal MVP Large 11 (11 of 14 per phase 16 SPEC §1.1 amendment 7 — Principal has 14 variants not 13):** any, authenticated (3-case algorithm per phase 16 SPEC §1.1 amendment 12 + ADR-0144), direct_remote_ip, remote_ip, header, url_path, and_ids, or_ids, not_id, sourced_metadata, filter_state (last two always-no-match runtime).
+
+**Principal DEFERRED (3 of 14):** source_ip (deprecated; PARSE-REJECT), metadata (deprecated; PARSE-REJECT), custom (extension; PARSE-REJECT — NEW per phase 16 SPEC §1.1 amendment 7).
+
+**Per-route `RBACPerRoute`:** wrapper proto with reserved field 1 + single optional `rbac` field at field 2. Absent (or `rbac: nil`) = disabled-on-route per proto comment + phase 16 SPEC §5.1 (a). Present = wholesale-override per phase 16 SPEC §5.1 (b). Per ADR-0125 §(xii) amendment: phase-16 introduces the **7th canonical per-route pattern** (absent-implies-disabled-OR-wholesale-override; structurally distinct from 5th canonical's explicit-disabled-bool-in-oneof AND 6th canonical's bare-message-via-TPFC). Per-route stats INDEPENDENT per ADR-0145 (mirrors phase-11 + phase-15 stateful-override-implies-INDEPENDENT precedent).
+
+#### Wire shape
+
+Deny-path wire shape (DENY engine result OR matcher-engine no-match):
+- Status: 403 Forbidden.
+- Body: byte-exact `"RBAC: access denied"` (19 bytes ASCII; no trailing newline; per phase 16 SPEC §1.1 amendment 10 + §11.P5).
+- 4-header set (lowercase wire-form): `content-length: 19`, `content-type: text/plain`, `date: <RFC1123>`, `server: envoy`.
+- Connection: keep-alive (no `connection: close`).
+- `response_code_details`: envoy-go MVP DEFERS (no emission per phase 16 SPEC §1.1 amendment 11 + §8.12); reference Envoy emits `"rbac_access_denied_matched_policy[<sanitized_policy_id>]"`.
+
+Allow-path wire shape: passthrough — `cb.SendLocalReply` NOT invoked; request forwards to next filter.
+
+#### Per-route INDEPENDENT-stats discipline (per ADR-0145 + phase 16 SPEC §5)
+
+Phase 16 is the THIRD row using stateful-override-with-INDEPENDENT-stats per ADR-0117 precedent (phase-11 local_ratelimit FIRST; phase-15 bandwidth_limit SECOND; phase-16 rbac THIRD). Per-route TPFC entries via `RBACPerRoute{rbac: <RBAC>}` (per ADR-0125 §(xii) NEW 7th canonical) own fresh `*compiledConfig` + fresh `*filterStats` keyed by per-route `rules_stat_prefix`. Listener-level counters do NOT increment for per-route-active streams.
+
+#### Stat surface + Prometheus rendering (per phase 16 SPEC §1.1 amendments 8 + 9)
+
+4 base counters per active namespace combination: `allowed`, `denied`, `shadow_allowed`, `shadow_denied`. Internal stat path (SN2-reuse confirmed at Task 8 empirical scrape per phase 16 SPEC §1.1 amendment 9 + ADR-0145): `http.<HCM_stat_prefix>.rbac.<rules_stat_prefix>.<counter>` for primary; `http.<HCM_stat_prefix>.rbac.<shadow_rules_stat_prefix>.<counter>` for shadow. Prometheus rendering via existing SN2 default-branch flatten; NO new SN10 rule.
+
+Per-policy counters (when `track_per_rule_stats: true`): `<base_prefix>.policy.<policy_name>.<suffix>` where suffix ∈ {allowed, denied, shadow_allowed, shadow_denied} (the `.policy.` infix segment per ADR-0145 Task 8 empirical scrape refinement to phase 16 SPEC §13.2 hypothesis). Operator-config-driven surface growth; foot-gun documented at `### Phase 16 forward-pointer notes` below.
+
 ### Applies to
 - Phase 07.1 onward (HTTP filter framework).
 
@@ -1767,6 +1851,44 @@ tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,
 
 ---
 
+## HTTPFilterCallbacks
+
+*Introduced by phase 16. Justified by ADR-0144 (TLS-principal accessor framework primitive).*
+
+This section codifies envoy-go-side extensions to the `DecoderFilterCallbacks` + `EncoderFilterCallbacks` interfaces introduced by §9 family-row phases. Each subsection names the accessor / primitive, the phase that introduced it, the justifying ADR, and the cross-phase reuse intent.
+
+### DownstreamPrincipal accessor (per phase 16 ADR-0144)
+
+`DecoderFilterCallbacks.DownstreamPrincipal() []string` returns the priority-ordered list of TLS principal-name candidates for the active downstream client connection:
+
+1. URI SAN values from `tls.ConnectionState.PeerCertificates[0].URIs[].String()` (priority 1 per `rbac.pb.go:1432-1438` proto comment).
+2. DNS SAN values from `tls.ConnectionState.PeerCertificates[0].DNSNames` (priority 2).
+3. Subject DN Common Name from `tls.ConnectionState.PeerCertificates[0].Subject.CommonName` (priority 3 fallback).
+
+For plaintext or non-mTLS connections OR connections where no client cert was presented, the accessor returns `nil` (or empty slice).
+
+Cross-phase reuse: future filters (jwt_authn, ext_authz, oauth2) consume the same accessor for TLS-principal introspection.
+
+Phase 16 is the FIRST §9 family-row to introduce this accessor.
+
+---
+
+## Matcher engine framework primitive (per phase 16 ADR-0142)
+
+*Introduced by phase 16. Justified by ADR-0142.*
+
+Phase 16 introduces a new top-level `internal/matcher/` package providing a generic `xds.type.matcher.v3.Matcher` match-tree evaluator. The package exports:
+
+- `matcher.New(tree *matchv3.Matcher, supportedActionTypes []string) (*Matcher, error)` — parses the match tree + validates terminal action TypeURLs against the caller's allow-list at config-load time; PARSE-REJECT for unknown TypeURLs with envoy-go-only error.
+- `matcher.Evaluate(ctx MatchContext) (*anypb.Any, error)` — walks the match tree at request time + returns the matched terminal action TypedExtensionConfig (wrapped as `Any`) OR `(nil, nil)` for no-match.
+- `matcher.MatchContext` interface — the caller (a filter) implements this on its per-stream `*filter` to expose request accessors (headers, IP, principal, etc.).
+
+Phase 16's rbac filter consumes the primitive with `supportedActionTypes = ["type.googleapis.com/envoy.config.rbac.v3.Action"]` (the canonical RBAC terminal; per phase 16 SPEC §11.P3); future filters extend the allow-list as new terminal types land.
+
+Cross-phase reuse intent: ext_authz, jwt_authn, oauth2 all use the same `xds.type.matcher.v3.Matcher` primitive for parts of their config surface. Each future filter extends `supportedActionTypes` + widens `MatchContext` additively.
+
+---
+
 ## Forward-pointer notes
 
 ### Phase 11 forward-pointer notes
@@ -1884,3 +2006,41 @@ Both orderings are valid; the contract documents the trade-off without prescribi
 **No per-route `BandwidthLimitPerRoute` proto (per phase 15 SPEC §1.1 amendment 1 + §11.P1):** Phase 15 BRAINSTORM hypothesized a `BandwidthLimitPerRoute` oneof envelope with `disabled` + override (5th canonical disabled-OR-override per ADR-0125). Empirically REFUTED at §11.P1: no wrapper proto exists in Envoy v1.37.2; per-route TPFC uses the same `BandwidthLimit` message directly. Mirrors phase-11 local_ratelimit per ADR-0117 IMPL-1, with one additional code-level constraint: per-route entries MUST set `limit_kbps` (else Envoy rejects at boot with `"limit must be set for per route filter config"`). Phase-15 introduces a NEW canonical per-route shape (bare-message-via-TPFC + code-level-required-`limit_kbps`-at-per-route) — the 6th canonical entry, documented at ADR-0125 §(xi) amendment paragraph. The 5th canonical disabled-OR-override stays bound to phase-13 buffer + phase-14 compressor.
 
 **No new tag-extractor:** bandwidth_limit reuses the existing `internal/stats/name.go` default-branch flatten — `<stat_prefix>.http_bandwidth_limit.<counter>` renders as `envoy_<stat_prefix>_http_bandwidth_limit_<counter>{}` via dot→underscore substitution; NO labels / NO tag-extractor / NO new SN10 rule (the BRAINSTORM-hypothesized SN10 was refuted at SPEC time when the empirical scrape showed stat_prefix inlined into the base name; ADR-0061 + ADR-0118 NOT amended).
+
+### Phase 16 forward-pointer notes
+
+**Deferred field families** (silent-ignored or PARSE-REJECT per ADR-0040 + ADR-0141 + ADR-0143; see `### envoy.filters.http.rbac ### Field decomposition` above + phase 16 SPEC §2 for the full 12-item deferral map):
+
+- `RBAC.audit_logging_options` (RBAC_AuditLoggingOptions) — silent-ignored at parse + runtime; `[#not-implemented-hide:]` upstream. Couples to future audit-logging family phase.
+- Policy `condition` + `checked_condition` + `cel_config` (three CEL fields per phase 16 SPEC §1.1 amendment 6) — silent-ignored at runtime per Q7. Couples to a future CEL framework phase landing `internal/cel/` + `github.com/google/cel-go`. Re-activation enables fine-grained condition evaluation.
+- Permission DEFERRED set: `metadata` (deprecated; PARSE-REJECT envoy-go-only divergence-window per §11.P12 — Envoy lenient-accepts with deprecation warning); `matcher` (TypedExtensionConfig; PARSE-REJECT); `uri_template` (TypedExtensionConfig; PARSE-REJECT). Couples to plugin framework.
+- Principal DEFERRED set (3 of 14 per phase 16 SPEC §1.1 amendment 7): `source_ip` (deprecated; PARSE-REJECT envoy-go-only divergence); `metadata` (deprecated; PARSE-REJECT); `custom` (TypedExtensionConfig; PARSE-REJECT — the 14th Principal variant). Couples to plugin framework + mTLS-extension family.
+- `Permission_SourcedMetadata` + `Principal_SourcedMetadata` + `Principal_FilterState` (parse-supported; always-no-match at runtime) — Couples to dynamic-metadata family + filter-state family. Real-world divergence appears only when operator configs explicitly set dynamic-metadata or filter-state from upstream filters.
+
+**Six divergence-windows enumerated at ADR-0146 §Context (the authoritative operator-awareness map):**
+
+1. **LOG-action `access_log_hint` dynamic-metadata divergence-window (per phase 16 SPEC §1.1 amendment 5 + §8.6):** Envoy v1.37.2 sets the `access_log_hint` dynamic metadata key under namespace `envoy.common` to `true` on LOG-matched requests (false on no-match). envoy-go MVP silent-no-metadata-emit. Counter emission: LOG-matched requests increment `allowed` counter (NOT a separate `logged` counter — per phase 16 SPEC §1.1 amendment 8 NO `logged` counter exists in Envoy v1.37.2). Operator divergence-window: dashboards inspecting `access_log_hint` see Envoy emit but envoy-go absent. Future re-activation: dynamic-metadata framework phase lands `EncoderFilterCallbacks.SetDynamicMetadata(key, value)` primitive (or equivalent decode-side accessor).
+
+2. **`response_code_details` field-emission divergence-window (per phase 16 SPEC §1.1 amendment 11 + §8.12):** Envoy v1.37.2's RBAC denial sets `response_code_details = "rbac_access_denied_matched_policy[<sanitized_policy_id>]"` per `utility.cc::responseDetail` (whitespace in policy-id replaced with underscores). The string lands in HCM `response_flag_details` accessor + access-log `RESPONSE_CODE_DETAILS` operator. envoy-go MVP does NOT thread response-code-details from filter through HCM to access-log; current phase-04 HCM scope. Operator divergence-window: access-log `RESPONSE_CODE_DETAILS` field is populated on Envoy-side RBAC denials + empty on envoy-go-side. Future re-activation: response-code-details framework phase couples HCM's local-reply path to a per-filter accessor (`DecoderFilterCallbacks.SetResponseCodeDetails(string)` or analogous).
+
+3. **CEL three-field divergence-window (per phase 16 SPEC §1.1 amendment 6 + Q7):** Policy `condition` (Expr) + `checked_condition` (CheckedExpr) + `cel_config` (CelExpressionConfig) all silent-ignored at runtime. envoy-go MVP folds CEL-aware policies into permissions-OR-principals-only evaluation. Operator divergence-window: configs relying on CEL `condition` for fine-grained gating see Envoy enforce but envoy-go skip. Future re-activation: CEL framework phase lands `internal/cel/` + `github.com/google/cel-go`.
+
+4. **Shadow access-log integration divergence-window (per phase 16 SPEC §8.7 + §11.P13):** envoy-go MVP emits shadow counters only; no shadow-decision-annotated access-log entries. Reference Envoy v1.37.2 confirmed counter-only via source review at SPEC time; no current divergence. Future Envoy version may add access-log integration; impl-time PROGRESS review checks.
+
+5. **SourcedMetadata + FilterState always-no-match runtime divergence-window (per phase 16 SPEC §11.P15 + §8.10):** `Permission_SourcedMetadata` + `Principal_SourcedMetadata` + `Principal_FilterState` parse-supported (no error at config load) but evaluator always returns FALSE at runtime. envoy-go MVP cannot evaluate dynamic-metadata or filter-state predicates because the framework has no metadata-emit or filter-state primitives. Operator divergence-window: configs whose policies depend on dynamic-metadata or filter-state see Envoy evaluate but envoy-go always-FALSE-on-that-rule (potentially deny when Envoy would allow, or vice versa). Future re-activation: dynamic-metadata + filter-state framework phases.
+
+6. **Principal_Authenticated canonical 3-cert-field scope divergence-window (per phase 16 SPEC §1.1 amendment 12 + §11.P14 + ADR-0144 §D11):** envoy-go MVP's `DownstreamPrincipal()` returns URI SAN + DNS SAN + Subject DN CN only. Envoy v1.37.2 also supports Issuer DN, certificate serial number, and fingerprint candidates per the full StringMatcher iteration in `principal.cc::matchPeer`. Operator divergence-window: configs whose `Principal_Authenticated.principal_name` matches against Issuer DN / Serial / Fingerprint see Envoy match but envoy-go no-match. Future re-activation: TLS-context-extension phase widens the accessor's return list.
+
+**Principal_Authenticated nil-principal_name semantic (per phase 16 SPEC §1.1 amendment 12 + §11.P14):** `Principal_Authenticated.principal_name == nil` matches ANY downstream user that passed TLS verification. envoy-go MVP implements three-case algorithm per §6.6: (a) nil principal_name → check `len(DownstreamPrincipal()) > 0`; (b) non-nil → StringMatcher iteration over URI SAN/DNS SAN/Subject DN candidates in priority order; (c) plaintext connection → always FALSE.
+
+**TWO new framework primitives (per phase 16 SPEC §3.1 + §3.2 + ADR-0142 + ADR-0144):** Phase 16 is the FIRST §9 row since phase 14 to introduce non-zero framework deltas + FIRST single phase to introduce TWO: (i) `DecoderFilterCallbacks.DownstreamPrincipal() []string` accessor surfacing the downstream client cert's URI SAN + DNS SAN + Subject DN CN in priority order; (ii) matcher-engine evaluator framework primitive at new top-level `internal/matcher/` package implementing `xds.type.matcher.v3.Matcher` generic match-tree evaluator with PARSE-REJECT-for-unknown-TypeURL discipline. Both cross-phase reusable by future filters (jwt_authn, ext_authz, ext_proc, oauth2).
+
+**ADR-0147 — unanticipated TLS-layer mTLS-lift surfaced at Task 13 follow-up (per Task 13 mTLS-fixture-PKI integration):** Phase-16 fixture 0018 scenario 6 requires a properly mTLS-configured downstream listener (server cert + trusted_ca for client-cert verification + URI SAN `spiffe://example.com/admin` on the test client cert). Phase-03 TLS-layer had a blanket-rejection at config-load of `require_client_certificate=true` (deferred per phase-03 SPEC). ADR-0147 LIFTS that blanket-rejection SCOPED to well-formed mTLS configs (validation_context.trusted_ca PEM provided) — maps onto stdlib `crypto/tls.RequireAndVerifyClientCert` mode + `ClientCAs` pool populated from the parsed trusted_ca. This was unanticipated at phase-16 PLAN time; surfaced at impl-time per ADR-0044 ADR-on-impl convention.
+
+**`track_per_rule_stats` operator-config-driven foot-gun (per phase 16 SPEC §1.1 amendment 8 + §8.5):** When `track_per_rule_stats: true`, the per-policy counter family is allocated lazily on first-match per policy. Misconfigured large-N policy configs (1000+ policies × 2 base sides × 2 (primary + shadow) = 4000 counters per filter instance) impose memory + CPU costs. envoy-go MVP imposes NO parse-time N-cap (mirrors Envoy permissive discipline). Future operator-ergonomics phase MAY add an envoy-go-only N-cap (e.g., max 256 policies under track-true).
+
+**`Principal_Set` + `Permission_Set` recursion depth foot-gun (per phase 16 SPEC §11.P11):** envoy-go MVP imposes NO parse-time recursion-depth cap. Operators authoring deeply-nested rules-engine configs may hit Go-stack-depth issues at config-load time (Go default ~10K frames). Documented above. Future operator-ergonomics phase MAY add an envoy-go-only depth-cap (e.g., max 32 levels of nesting).
+
+**No new tag-extractor (per phase 16 SPEC §1.1 amendment 9 + §11.P7 RATIFIED at Task 8 empirical scrape):** envoy-go's SN2-reuse hypothesis was RATIFIED at Task 8 — `http.<HCM_stat_prefix>.rbac.<rules_stat_prefix>.<counter>` renders via the existing SN2 (`http.*` segment routing) + dot→underscore default-branch flatten. NO labels / NO new SN10 rule. ADR-0145 codifies the ratification; the per-policy counter family's `.policy.` infix segment was refined at the same empirical scrape (REFINES SPEC §13.2 stub which omitted the segment).
+
+**Filter-chain ordering with respect to header_mutation / buffer / compressor / bandwidth_limit (per phase 16 SPEC §2.12):** rbac is recommended EARLY in the HCM chain (immediately after listener filters); denied requests don't incur downstream filter cost. Operators wanting header_mutation BEFORE rbac (e.g., to set `X-User` from upstream metadata before the policy gate evaluates it) have full flexibility per the operator's filter-chain order. Fixture 0018 pins rbac as the first HCM filter for byte-equivalence simplicity; SPEC documents the trade-off without prescribing.

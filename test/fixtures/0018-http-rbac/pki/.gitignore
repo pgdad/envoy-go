@@ -1,0 +1,10 @@
+# Per planner-time decision 11 + Task 13: the fixture-0018 PKI is FRESH-
+# generated at fixture-load time (NOT pre-baked / committed). The .pem files
+# below land via gen.go's init() (Generate(defaultOutputDir())) every time
+# the test binary loads. Committing them would leak as visible secrets +
+# defeat the freshness guarantee.
+ca.pem
+server.pem
+server.key.pem
+client.pem
+client.key.pem

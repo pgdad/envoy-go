@@ -42,12 +42,37 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string) (*Downstrea
 	if err := ts.GetTypedConfig().UnmarshalTo(ctx); err != nil {
 		return nil, fmt.Errorf("tls: downstream: unmarshal: %w", err)
 	}
-	if ctx.GetRequireClientCertificate().GetValue() {
-		return nil, fmt.Errorf("tls: downstream: require_client_certificate is not supported in phase 03")
-	}
 	cfg, err := commonTLSContextToConfig(ctx.GetCommonTlsContext(), baseDir, "downstream")
 	if err != nil {
 		return nil, err
+	}
+	// Phase-16 ADR-0147 (unanticipated): when require_client_certificate is
+	// true, configure the downstream listener for mandatory mTLS — load the
+	// validation_context.trusted_ca into the ClientCAs pool and set
+	// ClientAuth=RequireAndVerifyClientCert. This lifts the phase-03 clause-7
+	// rejection (ADR-0032 §Decision (7)) to support fixture 0018's scenario 6
+	// (ADR-0144 framework primitive end-to-end validation). The lift is
+	// SCOPED — only require_client_certificate=true with a validation_context
+	// carrying a trusted_ca PEM is accepted; the previously parse-rejected
+	// surfaces (SDS-bound secrets, custom_validator_config, match_typed_san,
+	// verify_certificate_hash/spki) remain rejected via the unchanged
+	// commonTLSContextToConfig pre-checks.
+	if ctx.GetRequireClientCertificate().GetValue() {
+		common := ctx.GetCommonTlsContext()
+		vc := common.GetValidationContext()
+		if vc == nil || vc.GetTrustedCa() == nil {
+			return nil, fmt.Errorf("tls: downstream: require_client_certificate=true requires validation_context.trusted_ca")
+		}
+		caPEM, err := loadDataSource(vc.GetTrustedCa(), baseDir)
+		if err != nil {
+			return nil, fmt.Errorf("tls: downstream: validation_context: trusted_ca: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("tls: downstream: validation_context: trusted_ca: parse failure")
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = stdtls.RequireAndVerifyClientCert
 	}
 	return &DownstreamConfig{TLSConfig: cfg}, nil
 }

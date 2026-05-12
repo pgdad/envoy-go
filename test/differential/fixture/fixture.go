@@ -260,6 +260,13 @@ const (
 	// scenarios). Because the backend is a subprocess, the runner's in-process
 	// accept counter is NOT incremented.
 	HTTPBandwidthLimit BackendKind = 14
+	// HTTPRbac reuses the existing echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for scenarios that exercise
+	// upstream routes (scenarios 5 + 6 + 8). Three-listener fixture (l_test_a
+	// plaintext + l_test_b echo-backend + l_test_a_tls mTLS-required for
+	// scenario 6). No new helper authored at phase 16 — phase-14's echobackend
+	// remains the shared helper.
+	HTTPRbac BackendKind = 15
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

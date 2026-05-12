@@ -63,6 +63,24 @@ type DecoderFilterCallbacks interface {
 	EncodeHeaders(headers http.Header, endStream bool)
 	EncodeData(data []byte, endStream bool)
 	EncodeTrailers(trailers http.Header)
+
+	// DownstreamPrincipal returns the priority-ordered TLS principal-name
+	// candidates from the downstream client connection: URI SANs first, then
+	// DNS SANs, then the Subject DN Common Name as fallback. Returns nil (or
+	// empty) for plaintext / non-mTLS connections or connections where no
+	// client cert was presented. The slice mirrors Envoy v1.37.2's
+	// Principal_Authenticated extraction semantics per rbac.pb.go:1432-1438.
+	//
+	// Per ADR-0144 §Decision (i)+(ii) (phase-16 framework primitive; lands at
+	// phase-16 Task 6): HCM dispatch (H1 connection.go + H2 h2dispatch.go)
+	// extracts tls.ConnectionState from the connection's *tls.Conn at chain
+	// build time, builds the priority-ordered candidate list, and threads it
+	// into chain.SetTLSPrincipals before RunDecodeHeaders dispatch. Each
+	// per-stream callback returns the chain's seeded slice verbatim.
+	//
+	// Cross-phase reusable by future filters (jwt_authn / ext_authz / oauth2
+	// / ext_proc) per ADR-0144 §Consequences.
+	DownstreamPrincipal() []string
 }
 
 // EncoderFilterCallbacks is the framework-supplied callback shape for

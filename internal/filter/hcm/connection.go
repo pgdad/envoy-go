@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"io"
 	"log"
@@ -17,6 +18,62 @@ import (
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 )
+
+// extractTLSPrincipals returns the priority-ordered TLS principal-name
+// candidates from the supplied tls.ConnectionState: URI SANs first (highest
+// priority — SPIFFE / service identity), then DNS SANs (DNS identity), then
+// the Subject DN Common Name as the third-priority fallback. Returns nil
+// for handshake-incomplete states OR states carrying no client cert
+// (PeerCertificates length == 0; covers plaintext / non-mTLS / no-client-
+// cert dispositions per ADR-0143 §Decision (vi) case (c)).
+//
+// Mirrors Envoy v1.37.2's Principal_Authenticated extraction semantics per
+// rbac.pb.go:1432-1438. Per ADR-0144 §Decision (iii) + D11: canonical 3 cert
+// fields only — Issuer DN / Serial / fingerprints DEFERRED to a future
+// TLS-context-extension phase.
+//
+// Cross-phase reuse: future HTTP filters (jwt_authn / ext_authz / oauth2 /
+// ext_proc) consume the same helper through DecoderFilterCallbacks.
+// DownstreamPrincipal() per ADR-0144 §Consequences.
+func extractTLSPrincipals(state *stdtls.ConnectionState) []string {
+	if state == nil || !state.HandshakeComplete || len(state.PeerCertificates) == 0 {
+		return nil
+	}
+	cert := state.PeerCertificates[0]
+	var principals []string
+	// URI SANs first (highest priority — SPIFFE / service identity).
+	for _, u := range cert.URIs {
+		if u == nil {
+			continue
+		}
+		principals = append(principals, u.String())
+	}
+	// DNS SANs second (DNS identity).
+	principals = append(principals, cert.DNSNames...)
+	// Subject DN Common Name third (fallback). Empty CN intentionally
+	// omitted — an empty-string candidate would otherwise match a Prefix("")
+	// matcher unexpectedly.
+	if cn := cert.Subject.CommonName; cn != "" {
+		principals = append(principals, cn)
+	}
+	return principals
+}
+
+// downstreamTLSPrincipals returns the priority-ordered TLS principal-name
+// candidates extracted from the downstream connection's *tls.Conn, or nil
+// if the conn is not a *tls.Conn / handshake incomplete / no client cert.
+// Wrapper around extractTLSPrincipals that handles the net.Conn type
+// assertion. Per ADR-0144 §Decision (iii); used by both H1 (connection.go
+// dispatchRequest) and H2 (h2dispatch.go via the per-connection dispatcher)
+// paths.
+func downstreamTLSPrincipals(downstream net.Conn) []string {
+	tc, ok := downstream.(*stdtls.Conn)
+	if !ok {
+		return nil
+	}
+	state := tc.ConnectionState()
+	return extractTLSPrincipals(&state)
+}
 
 // runConnection drives one downstream HTTP/1.1 connection from acceptance to
 // close. The loop reads requests via http.ReadRequest off a bufio.Reader
@@ -88,7 +145,13 @@ func runConnection(ctx context.Context, downstream net.Conn, f *Filter) {
 		// serveOneRequest wraps the per-request body so defer fires at
 		// request-end (not connection-end). Returns keepAlive=false when
 		// the connection must be closed after this request.
-		if keepAlive := f.serveOneRequest(ctx, req, bw); !keepAlive {
+		//
+		// Phase 16 Task 6 (ADR-0144): downstream is threaded through to
+		// dispatchRequest so the H1 path can extract TLS principal
+		// candidates from the *tls.Conn's ConnectionState and seed them
+		// onto the per-stream chain via chain.SetTLSPrincipals before
+		// RunDecodeHeaders dispatch.
+		if keepAlive := f.serveOneRequest(ctx, downstream, req, bw); !keepAlive {
 			return
 		}
 	}
@@ -107,7 +170,7 @@ func runConnection(ctx context.Context, downstream net.Conn, f *Filter) {
 // downstreamRqTotal.Inc (parse succeeded), before the filter chain runs
 // (dispatchRequest). Access-log emit fires inside dispatchRequest, so Dec
 // occurs after access-log is recorded per the task spec.
-func (f *Filter) serveOneRequest(ctx context.Context, req *http.Request, bw *bufio.Writer) (keepAlive bool) {
+func (f *Filter) serveOneRequest(ctx context.Context, downstream net.Conn, req *http.Request, bw *bufio.Writer) (keepAlive bool) {
 	var markedInflight bool
 	if f.dm != nil {
 		f.dm.Inc()
@@ -142,7 +205,7 @@ func (f *Filter) serveOneRequest(ctx context.Context, req *http.Request, bw *buf
 	closeAfterRequest := strings.EqualFold(req.Header.Get("Connection"), "close")
 	closeAfterAction := false
 
-	status, actErr := f.dispatchRequest(ctx, req, bw)
+	status, actErr := f.dispatchRequest(ctx, downstream, req, bw)
 	if errors.Is(actErr, errCloseAfterAction) || errors.Is(actErr, router.ErrCloseAfterAction) {
 		closeAfterAction = true
 	} else if actErr != nil {
@@ -205,7 +268,7 @@ func (f *Filter) serveOneRequest(ctx context.Context, req *http.Request, bw *buf
 // counter and detect the close-after-action sentinel. status is meaningful
 // even when err is non-nil (the action populates status before the writer
 // error path).
-func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
+func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *http.Request, bw *bufio.Writer) (int, error) {
 	entry, routeIdx, ok := f.table.match(req)
 	if !ok {
 		// 404 catch-all: phase-04 byte-preserved synthesis with empty body
@@ -238,6 +301,14 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 	}
 	chain := filter_http.NewFilterChain(chainHF, f.perRouteConfig)
 	chain.SetRequestCtx(ctx, routeIdx)
+	// Phase 16 Task 6 (ADR-0144): seed the per-stream TLS principal-name
+	// candidates BEFORE RunDecodeHeaders dispatch so decode-side filters
+	// (rbac, future jwt_authn / ext_authz / oauth2 / ext_proc) reading
+	// dcb.DownstreamPrincipal() observe the priority-ordered URI SAN →
+	// DNS SAN → Subject DN CN list. Returns nil for plaintext / non-mTLS /
+	// no-client-cert connections (the chain field stays nil; the accessor
+	// returns nil per ADR-0143 §Decision (vi) case (c)).
+	chain.SetTLSPrincipals(downstreamTLSPrincipals(downstream))
 	defer chain.Destroy()
 
 	// Locate the terminal router filter instance and inject the per-request
@@ -287,6 +358,26 @@ func (f *Filter) dispatchRequest(ctx context.Context, req *http.Request, bw *buf
 	// safety as ":method": no response-emit path iterates req.Header.
 	if _, ok := req.Header[":authority"]; !ok && req.Host != "" {
 		req.Header[":authority"] = []string{req.Host}
+	}
+
+	// Phase 16 Task 14: inject the request path as ":path" pseudo-header on
+	// the headers map so chain-level filters (rbac etc.) can read the URL
+	// path without codec-specific surfacing. http.ReadRequest parses the H1
+	// request-line and exposes the path via req.URL.Path; we mirror it onto
+	// req.Header[":path"] symmetric with the :method + :authority
+	// injection. Same wire-emit safety: no response-emit path iterates
+	// req.Header.
+	if _, ok := req.Header[":path"]; !ok && req.URL != nil {
+		// RequestURI preserves the raw path + query as it appeared on the
+		// wire (mirrors H2 codec's :path discipline per RFC 7540 §8.1.2.3);
+		// fall back to URL.Path when RequestURI is empty (server-side parsed
+		// requests carry RequestURI; client-side-constructed requests may
+		// have only URL.Path populated).
+		path := req.RequestURI
+		if path == "" {
+			path = req.URL.RequestURI()
+		}
+		req.Header[":path"] = []string{path}
 	}
 
 	// Decode side: headers → data → trailers. endStream on RunDecodeHeaders is

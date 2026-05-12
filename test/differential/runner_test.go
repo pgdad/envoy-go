@@ -40,6 +40,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0015-http-buffer/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0016-http-compressor/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0017-http-bandwidth-limit/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0018-http-rbac/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -335,6 +336,35 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
 		case fixture.HTTPBandwidthLimit:
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPRbac:
+			// Fixture 0018-http-rbac (phase 16) reuses the SHARED echobackend
+			// binary introduced at phase-14 Task 10 (planner-time decision 12 / D7
+			// settlement). Scenarios 5 + 6 + 8 exercise the upstream routes; the
+			// remaining scenarios use direct_response and do NOT touch the echo
+			// backend (the runner still spawns it because BackendCount() reports
+			// the maximum across all scenarios). Because the backend is a
+			// subprocess, the runner's in-process accept counter is NOT
+			// incremented. The blank-import for the fixture's inputs package
+			// lands at Task 12 when the inputs package is authored — at Task 11
+			// the BackendKind=HTTPRbac case is wired so the switch is complete
+			// for Task 12's fixture rollout.
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)

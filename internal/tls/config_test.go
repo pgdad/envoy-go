@@ -276,7 +276,12 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 		}
 	})
 
-	t.Run("require_client_certificate", func(t *testing.T) {
+	t.Run("require_client_certificate_without_trusted_ca", func(t *testing.T) {
+		// Per ADR-0147 (unanticipated phase-16 amendment): require_client_certificate=true
+		// without validation_context.trusted_ca must error — the listener cannot
+		// verify presented client certs without a CA pool. ADR-0147 lifts the
+		// phase-03 blanket rejection (ADR-0032 §Decision (7)) only for the
+		// well-formed mTLS configuration (trusted_ca PEM provided).
 		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
 			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
 			CommonTlsContext: &tlsv3.CommonTlsContext{
@@ -290,13 +295,49 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 		})
 		_, err := NewDownstreamConfig(ts, "")
 		if err == nil {
-			t.Fatal("expected error for require_client_certificate, got nil")
+			t.Fatal("expected error for require_client_certificate without trusted_ca, got nil")
 		}
 		if !strings.HasPrefix(err.Error(), "tls: ") {
 			t.Errorf("error should begin with 'tls: ', got: %v", err)
 		}
 		if !strings.Contains(err.Error(), "require_client_certificate") {
 			t.Errorf("error should contain 'require_client_certificate', got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "trusted_ca") {
+			t.Errorf("error should contain 'trusted_ca', got: %v", err)
+		}
+	})
+
+	t.Run("require_client_certificate_with_trusted_ca", func(t *testing.T) {
+		// ADR-0147: require_client_certificate=true with validation_context.trusted_ca
+		// configures the listener for mandatory mTLS — ClientCAs pool populated +
+		// ClientAuth=RequireAndVerifyClientCert. Lifts the phase-03 ADR-0032
+		// clause-7 rejection scoped to well-formed mTLS configs.
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{
+					{
+						CertificateChain: inlineBytes(pki.leafCertPEM),
+						PrivateKey:       inlineBytes(pki.leafKeyPEM),
+					},
+				},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+					ValidationContext: &tlsv3.CertificateValidationContext{
+						TrustedCa: inlineBytes(pki.caPEM),
+					},
+				},
+			},
+		})
+		cfg, err := NewDownstreamConfig(ts, "")
+		if err != nil {
+			t.Fatalf("expected success, got: %v", err)
+		}
+		if cfg.TLSConfig.ClientAuth != stdtls.RequireAndVerifyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.TLSConfig.ClientAuth)
+		}
+		if cfg.TLSConfig.ClientCAs == nil {
+			t.Errorf("ClientCAs nil; want populated pool")
 		}
 	})
 

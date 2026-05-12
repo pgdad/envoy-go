@@ -212,7 +212,7 @@ func TestChainIntegration_H1_DirectResponseHappy(t *testing.T) {
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	status, err := f.dispatchRequest(context.Background(), req, bw)
+	status, err := f.dispatchRequest(context.Background(), nil, req, bw)
 	if err != nil {
 		t.Fatalf("dispatchRequest: %v", err)
 	}
@@ -534,7 +534,7 @@ func TestChainIntegration_H1_CorsPreflight_AllowedOriginEmits200WithSixHeaders(t
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	status, derr := f.dispatchRequest(context.Background(), req, bw)
+	status, derr := f.dispatchRequest(context.Background(), nil, req, bw)
 	if derr != nil {
 		t.Fatalf("dispatchRequest: %v", derr)
 	}
@@ -661,7 +661,7 @@ func TestChainIntegration_H1_CorsActualRequest_AppendsThreeHeadersAfterUpstream(
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
-	status, derr := f.dispatchRequest(context.Background(), req, bw)
+	status, derr := f.dispatchRequest(context.Background(), nil, req, bw)
 	if derr != nil {
 		t.Fatalf("dispatchRequest: %v", derr)
 	}

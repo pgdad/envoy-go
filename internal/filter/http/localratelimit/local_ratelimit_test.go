@@ -231,6 +231,7 @@ func (f *fakeDecoderCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Mess
 func (f *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
 func (f *fakeDecoderCB) EncodeData([]byte, bool)         {}
 func (f *fakeDecoderCB) EncodeTrailers(http.Header)      {}
+func (f *fakeDecoderCB) DownstreamPrincipal() []string   { return nil }
 
 // TestDecodeHeaders_AllowPath_CountersIncremented verifies that on the allow path
 // (bucket has tokens) DecodeHeaders returns Continue, increments enabled + ok,
