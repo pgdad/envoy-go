@@ -1,0 +1,322 @@
+# Phase 18.1 — PROGRESS
+
+Append-only log. Each task lands one entry. Quote command outputs verbatim. Mirror phase-04..17 PROGRESS.md structure.
+
+- **Phase:** 18.1 — HTTP filter `envoy.filters.http.ext_authz` (HTTP-mode)
+- **Branch:** `phase-18.1-ext-authz-http-impl` (fresh worktree at `.worktrees/phase-18.1-ext-authz-http-impl`)
+- **Base commit (master tip):** `c4951ae` (phase-18.1 PLAN SHA-fill follow-up; PLAN squash `9f786f7`; SPEC squash `308e9b6`; SPEC SHA-fill `312beec`; BRAINSTORM squash `854fa2c`; BRAINSTORM SHA-fill `6862d2c`)
+
+## Preamble — execution preconditions
+
+All 17 preconditions verified green at cold-start. Worktree branch `phase-18.1-ext-authz-http-impl` (fresh worktree at `.worktrees/phase-18.1-ext-authz-http-impl`, branched from master tip `c4951ae`). Master tail shows PLAN SHA-fill follow-up at `c4951ae`, PLAN squash at `9f786f7`, SPEC SHA-fill follow-up at `312beec`, SPEC squash at `308e9b6`, BRAINSTORM SHA-fill follow-up at `6862d2c`, BRAINSTORM squash at `854fa2c`. Go 1.26.2, golangci-lint v1.64.8, Docker client 28.4.0 + server 28.1.1 present. ADR tail at 0164 (ADR-0164 — the highest §Context-draft / full ADR anchored at the SPEC commit; per ADR-0044 ADR-on-impl convention + phase-13/15/16/17 pattern, the 7 phase-18.1 ADRs ADR-0156/0157/0159/0160/0161/0162/0163 are anchored as §Context drafts at SPEC commit `308e9b6`; §Decision + §Consequences bodies land at impl-time anchor Tasks 2/2/3/4/5/6/7 per the per-ADR table below). No ADR-0125 §(xiv) amendment paragraph — phase 18.1 is the FIRST §9 family-row since phase 13 to REUSE an existing canonical (5th canonical via ADR-0163) rather than extend the ADR-0125 roster. The `grep -nE '\(xiv\)' docs/envoy-go/DECISIONS.md` command returns 2 matches but these are EXPLANATORY text within ADR-0163 §Context describing the ABSENCE of §(xiv) — confirmed via `grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md` returning 0 (no actual amendment paragraph). SPEC at `308e9b6`; PLAN at `9f786f7`. `internal/filter/http/extauthz/` absent (Task 2 lands). `test/helpers/extauthzhttp/` absent (Task 10 lands). `cmd/envoy-go/main.go` registers 12 `httpReg.Register` calls (`router` + 11 filters: `bandwidthlimit`, `buffer`, `compressor`, `cors`, `csrf`, `envoygotest`, `fault`, `header_mutation`, `jwtauthn`, `localratelimit`, `rbac`) at master tip `c4951ae`; `extauthz` insertion alphabetical-between-`envoygotest`-and-`fault` lands at Task 10. **Note on PLAN precondition 11 pattern**: the PLAN spec says to run `go test -count=1 ./test/differential/ -run 'Test.*00(0[0-9]|1[0-9])'`; this regex does NOT match `TestDifferential` (the actual function name), so the run returns "no tests to run" (PASS). The actual differential suite is `TestDifferential` with sub-tests `0000-tcp-echo` through `0019-http-jwt-authn`; verified via (a) fixtures 0000–0009 batch: `go test -count=1 ./test/differential/ -run 'TestDifferential/000[0-9]'` → ok (28.1s); (b) fixtures 0010–0019 batch: `go test -count=1 ./test/differential/ -run 'TestDifferential/001[0-9]'` → ok (29.9s). Full 20-at-once run shows intermittent `subj start: subject ready: EOF` failures on different fixtures across runs (transient Docker resource contention; each fixture PASSES when run individually); recorded here, not blocking. Reference Envoy image `envoyproxy/envoy:v1.37.2` present (SHA `sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`; ADR-0008 pin; unchanged through phase 18.1). **`ext_authz` proto** present in module closure (`go doc github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3 ExtAuthz | head -5` returns the type's exported fields). **Pre-existing fuzzers**: `grep -rE '^func Fuzz' --include='*.go' .` returns exactly 21 `Fuzz*` functions from phases 02–17 (co-located `fuzz_test.go` files under `internal/...`); full 30s-each run deferred to Task 14 Gate D phase-done verification per the phase-09..17 precedent. `go test -count=1 -short ./...` returns 47 `ok` packages with 0 failures. Working tree pristine (empty `git status --porcelain`).
+
+## Preamble — anticipated ADRs (per ADR-0044 ADR-on-impl convention; SPEC §10)
+
+The seven 18.1-landing ADRs anticipated by SPEC §10 (ADR-0156/0157/0159/0160/0161/0162/0163). **§Context drafts ALREADY LANDED at SPEC commit `308e9b6`** per ADR-0044 ADR-on-impl convention. **§Decision + §Consequences bodies AUTHORED AT IMPL-TIME** per the phase-13/15/16/17 pattern. **NO ADR-0125 amendment paragraph required** — ADR-0163 records the explicit 5th-canonical-REUSE classification (NO §(xiv); verified at Task 1 cold-start via `grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md` returning 0). Per-ADR Lands-in-task anchors (reproduced verbatim from PLAN §"ADRs introduced by this plan"):
+
+| ADR | Subject (18.1 portion) | Lands-in-task |
+|---|---|---|
+| **ADR-0156** | `internal/filter/http/extauthz/` package shape — single-token directory (underscore-stripped per ADR-0114; matches `localratelimit/` + `jwtauthn/`) + DECODER-only `HTTPFilter` (`Encoder: nil`; 5th §9 row pure decode-side) + 6-base-counter `filterStats` (`ok`/`denied`/`error`/`disabled`/`failure_mode_allowed`/`invalid`; `disabled` STRUCTURALLY UNREACHABLE under MVP; unconditional allocation at `New()` time) + boot-registration alphabetical between `envoygotest` and `fault` + the deny-path `SendLocalReply` mechanism (status/body/headers from the auth response or `status_on_error`; `content-length` synthesized per ADR-0085) | Task 2 |
+| **ADR-0157** | `compiledConfig` shape + the `services`-oneof dual-mode dispatch (a `checkFn` closure; `grpc_service` arm PARSE-REJECTs in 18.1, §Decision amended at 18.2 IMPL) + consumed-vs-deferred field discipline + the error-posture fields (`failure_mode_allow` / `failure_mode_allow_header_add` / `status_on_error` / `validate_mutations`) + `transport_api_version` V3-only PARSE-REJECT + the empty-`services`-oneof factory rejection + the §5.P10 error-classification boundary in `check.go` | Task 2 |
+| **ADR-0159** | HTTP-outbound auth-check framework primitive — the thin ext_authz-local client (disposition (b) per SPEC §3.1); `httpAuthClient` wrapping `*http.Client` + the configured `HttpService.server_uri.timeout` + `path_prefix`; composes-against (does NOT reuse) the phase-17 `internal/jwks/Fetcher` outbound-HTTP structure; the (a)-vs-(b) record + the oauth2-triggers-`internal/httpclient/`-generalization forward-pointer | Task 3 |
+| **ADR-0160** | `AuthorizationRequest` builder (HTTP-mode portion) — `headers_to_add` + `path_prefix` prepend + the top-level `ExtAuthz.allowed_headers`/`disallowed_headers` request-side filtering (`ListStringMatcher` → exact/prefix/suffix/contains/`ignore_case`/`safe_regex`; `custom` PARSE-REJECT) + the deprecated-`AuthorizationRequest.allowed_headers` honored-if-present disposition | Task 4 |
+| **ADR-0161** | Bidirectional header-mutation discipline (HTTP-mode portion) — `AuthorizationResponse.{allowed_upstream_headers, allowed_upstream_headers_to_append, allowed_client_headers}` compilation + allow-path upstream injection (set vs append) + deny-path downstream `allowed_client_headers`-filtered emission + `validate_mutations` gating → `invalid` counter + the deny-path header-set construction (`text/plain` fallback, decision-headers-first ordering) + the `allowed_client_headers_on_success` deferral + the stash-for-HCM revisit note | Task 5 |
+| **ADR-0162** | Request-body inclusion — `with_request_body{max_request_bytes, allow_partial_message, pack_as_bytes}` + the phase-13 ADR-0128 decode-side body-buffering reuse + the `allow_partial_message:false` over-limit → `SendLocalReply(413, "Payload Too Large", {connection: close})` edge case (auth NOT called, NO counters) + the `DecodeHeaders`-StopIteration / `DecodeData`-resume interaction | Task 6 |
+| **ADR-0163** | Per-route 5th-canonical REUSE classification (explicit no-new-canonical decision; **NO ADR-0125 amendment paragraph** — the FIRST §9 row to REUSE an ADR-0125 canonical) + SHARED-stats discipline + the `CheckSettings` narrower-override surface + the 6-counter stat surface (`http.<HCM_stat_prefix>.ext_authz.*`; HCM-rooted SN2-reuse; RATIFIED-PENDING-IMPL-TIME §18.P6 + §18.P7 closed at Task 8) + the PGV wrinkles (`disabled` `const: true`; `override` oneof PGV-required) | Task 7 |
+
+## Preamble — planner-time deferred-decision resolution (per PLAN §"Planner-time deferred-decision resolution")
+
+The twelve planner-time deferred decisions reproduced verbatim from PLAN.md so this PROGRESS.md is self-contained for any task-N reader:
+
+1. **D1 — `test/helpers/extauthzhttp/` directory name + helper shape LOCKED per SPEC §12.1.** The in-process HTTP auth server lands at the top-level shared-helper location `test/helpers/extauthzhttp/` (NOT per-fixture) — mirrors the phase-17 `test/helpers/jwksbackend/` precedent, anticipating that the 18.2 gRPC fixture will want a sibling `test/helpers/extauthzgrpc/`. Package name `extauthzhttp`. Helper shape: a `Server` type + `New(ctx, addr, script) (*Server, error)` + `Stop()` + `Addr()`; `Script` supports fixed-response, per-path/method map, and body-inspecting predicate modes. *Anchored: SPEC §12.1 + §7.2.*
+
+2. **D2 — `httpAuthClient` retry discipline LOCKED at ZERO retry per SPEC §12.2.** The thin ext_authz-local HTTP client does NO retry — single-attempt-then-error. Rationale: `HttpService` has no retry-policy field in the proto (unlike the JWKS fetcher's `RetryPolicy`); a connect failure / timeout maps straight to the **error** disposition per §5.P10. The 18.1 IMPL at Task 3 confirms against the §5.P10 error-classification boundary. Impl-time alternative (a fixed single-retry) NOT selected — MVP single-attempt. *Anchored: SPEC §12.2 + parent SPEC §5.P10.*
+
+3. **D3 — `extauthz_test.go` single-file LOCKED per SPEC §12.3.** All 9 unit-test groups stay in one `extauthz_test.go` for 18.1 (mirrors `rbac/rbac_test.go`). Impl-time MAY split `check_test.go` if the file exceeds ~1800 LoC — an IMPL-cohesion call recorded at Task 3/Task 4 if it triggers. *Anchored: SPEC §12.3.*
+
+4. **D4 — Async-resume-after-`OnDestroy` race guard LOCKED at the phase-09-fault pattern + an explicit `mu`/`done` guard + a cancellable `context.Context` per SPEC §12.4.** The outbound check runs in a plain goroutine (phase-09 fault precedent: `StopIteration` returned synchronously; the goroutine performs the cancellable call; `cb.ContinueDecoding()` or the deny `SendLocalReply` path on completion). The per-filter `mu sync.Mutex` + `done bool` guard: `OnDestroy` sets `done = true` under `mu` and calls `callCancel()`; the resume goroutine acquires `mu`, checks `done`, and aborts the callback touch if the stream is gone. The per-request `context.Context` (cancelled at `OnDestroy`) makes the in-flight `client.Do` return promptly. **This is the most-likely ADR-0044 escape-valve surface** (parent SPEC §7 + 18.1 SPEC §10) — if the `mu`/`done` guard proves insufficient or the HCM-dispatch interaction needs a framework primitive, it lands as **ADR-0165** at Task 9. Lands at Task 9. *Anchored: SPEC §12.4 + §6.3 + parent SPEC §7.*
+
+5. **D5 — `safe_regex` RegexMatcher engine subset LOCKED at the phase-09/12 RE2 subset per SPEC §12.5.** The `allowed_headers`/`disallowed_headers` (and the response-side matcher fields) `safe_regex` arm reuses the phase-09/12 RegexMatcher-subset discipline — the `google_re2` engine arm is honored (Go `regexp`, RE2-compatible); other `RegexMatcher` engine arms PARSE-REJECT envoy-go-strict. The 18.1 IMPL at Task 4 confirms the exact subset against reference Envoy v1.37.2. *Anchored: SPEC §12.5 + parent SPEC §5.P8.*
+
+6. **D6 — Deprecated `AuthorizationRequest.allowed_headers` disposition LOCKED at honored-if-present per SPEC §12.6.** When the deprecated `AuthorizationRequest.allowed_headers` (#1) IS present in a config, envoy-go honors it proto-faithful for backward-compat (mirrors the phase-17 amendment-4 "deprecated-but-honored" disposition). The top-level `ExtAuthz.allowed_headers` (#17) is the primary path. The 18.1 IMPL at Task 4 confirms against v1.37.2 whether it still honors the deprecated field or PARSE-IGNOREs it; if v1.37.2 PARSE-IGNOREs, the IMPL flips to silent-ignore + records the flip in PROGRESS.md + ADR-0160 §Decision. *Anchored: SPEC §12.6 + parent SPEC §6 amendment 2.*
+
+7. **D7 — `validate_mutations` validation rule set LOCKED at the phase-10 header_mutation protected-header discipline per SPEC §12.7.** When `validate_mutations: true`, the auth service's allow-path upstream-injection headers + the deny-path client headers are validated: `:`-prefixed pseudo-headers REJECTED; invalid header-name characters REJECTED; invalid header-value characters REJECTED. A rejection drives the **invalid** disposition + the `invalid` counter (treated as the error posture per SPEC §6.3). The 18.1 IMPL at Task 5 pins the exact rule set against v1.37.2 `validate_mutations` behavior. *Anchored: SPEC §12.7 + the phase-10 header_mutation precedent.*
+
+8. **D8 — RATIFIED-PENDING-IMPL-TIME pin closures assigned to concrete tasks (NEW; surfaces at PLAN-time per SPEC §11).** The three 18.1 RATIFIED-PENDING-IMPL-TIME pins close as follows: **§18.P6** (the 6-counter stat surface) + **§18.P7** (the Prometheus tag-extractor SN2-reuse) close at **Task 8** via an empirical scrape of reference Envoy v1.37.2's `/stats/prometheus` output for fixture 0020's listener config (the canonical RATIFIED-PENDING closure step per phase-16 §10 lesson (c) + phase-17 §11.P7 precedent); if divergent, amend ADR-0163 §Decision in-place at Task 8. The **§18.P11 deny-path header-ordering byte-shape** closes at **Task 13** via the fixture-harness differential diff (the auth-service-supplied decision headers first, framework housekeeping `content-length`/`date`/`server: envoy` after). *Anchored: SPEC §11 + parent SPEC §5.P6/P7/P11.*
+
+9. **D9 — Counter-delta byte-equivalence assertion convention carried forward per planner-time decision (NEW; surfaces at PLAN-time).** Fixture 0020's driver scrapes `/stats/prometheus` before + after each scenario; asserts byte-equivalence against reference Envoy's expected delta in `expectations.yaml`. The 5 reachable counters (`ok`/`denied`/`error`/`failure_mode_allowed`/`invalid`) are asserted; the `disabled` counter is NOT asserted (STRUCTURALLY UNREACHABLE under MVP per parent SPEC §6 amendment 7 — it publishes 0 always). The per-route `disabled` scenario (scenario 6) asserts NO `ext_authz` counter increments at all. *Anchored: SPEC §7 + parent SPEC §6 amendment 7 + the phase-16/17 ADR-0145 precedent.*
+
+10. **D10 — BEHAVIOR_CONTRACT §13.1 insertion at alphabetical-after-`csrf` position per SPEC §13.1 + ADR-0100 §2.2 (NEW; surfaces at PLAN-time).** The `### envoy.filters.http.ext_authz` subsection inserts alphabetically between `### envoy.filters.http.csrf` and the next subsection. The IMPL at Task 14 verifies the current BEHAVIOR_CONTRACT.md subsection ordering and, if it is landing-chronological rather than alphabetical, falls back to the observed convention + records the fallback in PROGRESS.md. *Anchored: SPEC §13.1 + ADR-0100 §2.2.*
+
+11. **D11 — ADR-0044 escape-valve disposition: NO pre-reserved task slot (NEW; surfaces at PLAN-time).** Per the phase-13/14/15/16/17 precedent (the impl-time-unanticipated ADR landed at a follow-up task or folded into a main task), this PLAN does NOT pre-reserve an explicit task slot. The most-likely surface is the async-resume-after-`OnDestroy` race guard (D4) → if it needs an ADR-lift it lands as **ADR-0165** at Task 9 or as a follow-up commit between Task 13 and Task 14. *Anchored: SPEC §10 + parent SPEC §7.*
+
+12. **D12 — Fixture 0020 is plaintext-only; NO PKI, NO TLS (NEW; surfaces at PLAN-time).** Unlike the phase-16 rbac mTLS fixture or the phase-17 jwt_authn RSA/ECDSA PKI fixture, fixture 0020 wires a plain HTTP/1.1 listener + a plain-HTTP auth server. No `pki/gen.go`. The TLS-to-auth-service plumbing is an 18.2 concern (parent SPEC §5.P13 RATIFIED-PENDING-IMPL-TIME). *Anchored: SPEC §7.2.*
+
+---
+
+## Task 1 — Execution-precondition check + PROGRESS.md preamble
+
+**Files changed:** `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (new)
+**Commit SHA:** <filled at commit time; capture via `git log -1 --format=%H -- docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` post-commit, or via a follow-up SHA-fill commit per phase-13/14/15/16/17 precedent>
+**Notes:** Created PROGRESS.md; verified all 17 preconditions per PLAN §"Execution preconditions"; phase-18.1 SPEC + PLAN confirmed present in HEAD; SPEC at `308e9b6`, PLAN at `9f786f7`; ADR tail at 0164 (the 7 phase-18.1 ADRs ADR-0156/0157/0159/0160/0161/0162/0163 §Context drafts ALREADY landed at SPEC commit `308e9b6` per ADR-0044 ADR-on-impl convention; §Decision + §Consequences bodies land at impl-time anchor Tasks 2/2/3/4/5/6/7 per the per-ADR table above — mirroring phase-13/15/16/17 pattern); `internal/filter/http/extauthz/` absent (Task 2 lands); `test/helpers/extauthzhttp/` absent (Task 10 lands). No ADR-0125 §(xiv) amendment paragraph (`grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md` returns 0 — the 2 `grep -nE '\(xiv\)'` matches are explanatory text within ADR-0163 §Context describing the absence). No ADR landed in Task 1 (ADR-0044 ADR-on-impl convention). Pre-existing fuzzers (21 fuzzers from phases 02–17 across co-located `fuzz_test.go` files) deferred to Task 14 Gate D phase-done verification per PLAN. **Note on PLAN precondition 11 wording**: the PLAN's regex `Test.*00(0[0-9]|1[0-9])` does not match `TestDifferential`; actual fixture differential run uses `TestDifferential/000[0-9]` + `TestDifferential/001[0-9]` patterns; both batches PASS; full 20-at-once run has transient Docker resource contention (different fixture EOF on each attempt; each individual fixture PASSES); documented above, not blocking.
+
+**Outputs:**
+
+### Precondition 1 — branch name
+
+```
+$ git rev-parse --abbrev-ref HEAD
+phase-18.1-ext-authz-http-impl
+```
+
+### Precondition 2 — master tail
+
+```
+$ git log --oneline master | head -6
+c4951ae phase 18.1 plan follow-up: STATE.md SHA-fill (TBD → 9f786f7 post-squash)
+9f786f7 Squash merge phase-18.1-ext-authz-http-plan
+312beec phase 18 spec follow-up: STATE.md SHA-fill (TBD → 308e9b6 post-squash)
+308e9b6 Squash merge phase-18-http-filter-ext-authz-spec
+6862d2c phase 18 brainstorm follow-up: STATE.md SHA-fill (TBD → 854fa2c post-squash)
+854fa2c Squash merge phase-18-http-filter-ext-authz-brainstorm
+```
+
+### Precondition 3 — toolchain (go + golangci-lint + docker)
+
+```
+$ go version && golangci-lint version && docker version 2>&1 | head -30
+go version go1.26.2 linux/amd64
+golangci-lint has version v1.64.8 built with go1.26.2 from (unknown, modified: ?, mod sum: "h1:y5TdeVidMtBGG32zgSC7ZXTFNHrsJkDnpO4ItB3Am+I=") on (unknown)
+Client: Docker Engine - Community
+ Version:           28.4.0
+ API version:       1.49 (downgraded from 1.51)
+ Go version:        go1.24.7
+ Git commit:        d8eb465
+ Built:             Wed Sep  3 20:57:32 2025
+ OS/Arch:           linux/amd64
+ Context:           desktop-linux
+
+Server: Docker Desktop 4.41.2 (191736)
+ Engine:
+  Version:          28.1.1
+  API version:      1.49 (minimum version 1.24)
+  Go version:       go1.23.8
+  Git commit:       01f442b
+  Built:            Fri Apr 18 09:52:57 2025
+  OS/Arch:          linux/amd64
+  Experimental:     false
+ containerd:
+  Version:          1.7.27
+  GitCommit:        05044ec0a9a75232cad458027ca83437aae3f4da
+ runc:
+  Version:          1.2.5
+  GitCommit:        v1.2.5-0-g59923ef
+ docker-init:
+  Version:          0.19.0
+  GitCommit:        de40ad0
+```
+
+### Precondition 4 — DECISIONS.md ADR tail
+
+```
+$ grep '^## ADR-' docs/envoy-go/DECISIONS.md | sed 's/.*ADR-0*\([0-9]*\):.*/\1/' | sort -n | tail -1
+164
+```
+
+### Precondition 5 — ADR §Context drafts present
+
+```
+$ grep -cE '^## ADR-015[6-9]|^## ADR-016[0-4]' docs/envoy-go/DECISIONS.md
+9
+
+$ grep -cE '^Lands-in: Task [0-9]+ of phase-18.1' docs/envoy-go/DECISIONS.md
+0
+
+$ grep -cE 'Lands-in: Task [0-9]+ of phase-18.1' docs/envoy-go/DECISIONS.md
+7
+```
+
+**GREEN with note on second command:** The PLAN's second command uses `^` (line-start anchor) and returns 0; the actual DECISIONS.md format for `Lands-in:` fields is `**Lands-in:** Task N of phase-18.1 PLAN` (bold markdown + `PLAN` suffix), so the line does not start bare with `Lands-in:`. The relaxed form (no `^` anchor) returns 7 matches (≥6 required by PLAN). Not blocking.
+
+### Precondition 6 — NO ADR-0125 §(xiv) amendment
+
+```
+$ grep -nE '\(xiv\)' docs/envoy-go/DECISIONS.md
+(2 matches — both are EXPLANATORY text within ADR-0163 §Context describing the ABSENCE of §(xiv); not actual amendment paragraphs)
+
+$ grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md
+0
+```
+
+**GREEN with note:** `grep -nE '\(xiv\)'` returns 2 matches but these are within ADR-0163 §Context's explanatory text documenting that no §(xiv) is needed. `grep -cE '^\*\*(xiv)\*\*'` returns 0 confirming no actual amendment paragraph. Not blocking.
+
+### Precondition 7 — SPEC SHA
+
+```
+$ git log -1 --format=%H -- docs/envoy-go/phases/18.1-ext-authz-http/SPEC.md
+308e9b62cfc42648e16e4347f3bff74a7c7a3c9d
+```
+
+(Matches `308e9b6` expected by PLAN.)
+
+### Precondition 8 — PLAN SHA
+
+```
+$ git log -1 --format=%H -- docs/envoy-go/phases/18.1-ext-authz-http/PLAN.md
+9f786f732e805d38d73d1fb93772b7eb0426e15a
+```
+
+### Precondition 9 — pristine tree
+
+```
+$ git status --porcelain
+(empty — no output)
+```
+
+**Note:** The PLAN spec says an untracked `.claude/` entry is acceptable; actual tree is fully pristine with no untracked entries. GREEN.
+
+### Precondition 10 — short `go test ./...` pass
+
+```
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^ok'
+47
+
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^(FAIL|---\s+FAIL)'
+0
+
+$ go test -count=1 -short ./... 2>&1 | grep -vE '^\?' | head -50
+ok  	github.com/esalaine/envoy-go/cmd/envoy-go	3.871s
+ok  	github.com/esalaine/envoy-go/internal/accesslog	0.009s
+ok  	github.com/esalaine/envoy-go/internal/admin	0.428s
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	0.020s
+ok  	github.com/esalaine/envoy-go/internal/cluster	0.022s
+ok  	github.com/esalaine/envoy-go/internal/drain	0.078s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm	0.022s
+ok  	github.com/esalaine/envoy-go/internal/filter/hcm/h2	2.494s
+ok  	github.com/esalaine/envoy-go/internal/filter/http	0.134s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/bandwidthlimit	0.390s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/buffer	0.008s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/compressor	0.014s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/cors	0.006s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/csrf	0.010s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/envoygotest	0.038s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/fault	0.265s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/header_mutation	0.007s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/jwtauthn	0.077s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/localratelimit	0.008s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/rbac	0.009s
+ok  	github.com/esalaine/envoy-go/internal/filter/http/router	0.217s
+ok  	github.com/esalaine/envoy-go/internal/filter/tcpproxy	0.168s
+ok  	github.com/esalaine/envoy-go/internal/jwks	1.612s
+ok  	github.com/esalaine/envoy-go/internal/jwt	0.044s
+ok  	github.com/esalaine/envoy-go/internal/listener	3.033s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter	0.044s
+ok  	github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector	0.006s
+ok  	github.com/esalaine/envoy-go/internal/matcher	0.005s
+ok  	github.com/esalaine/envoy-go/internal/stats	0.005s
+ok  	github.com/esalaine/envoy-go/internal/tls	0.023s
+ok  	github.com/esalaine/envoy-go/test/conformance/h2spec	0.064s
+ok  	github.com/esalaine/envoy-go/test/differential	0.064s
+ok  	github.com/esalaine/envoy-go/test/differential/fixture	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0001-tcp-proxy-rr/driver	0.005s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0002-tls-tcp/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0003-http11-routing/driver	0.005s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0004-h2-routing/driver	0.006s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0005-prometheus-stats/driver	0.004s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0006-access-log/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007a-cors/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0007b-iteration-probe/driver	0.003s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0008-listener-chain-match/driver	0.004s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0016-http-compressor/inputs	0.007s
+ok  	github.com/esalaine/envoy-go/test/fixtures/0018-http-rbac/pki	0.006s
+ok  	github.com/esalaine/envoy-go/test/helpers	0.010s
+ok  	github.com/esalaine/envoy-go/test/helpers/echobackend	0.007s
+ok  	github.com/esalaine/envoy-go/test/helpers/jwksbackend	0.006s
+```
+
+### Precondition 11 — pre-existing differential suite green
+
+**Note on PLAN regex:** The PLAN's command `go test -count=1 ./test/differential/ -run 'Test.*00(0[0-9]|1[0-9])'` returns "no tests to run" (PASS) because the regex does not match `TestDifferential`. The correct sub-test patterns are:
+
+```
+$ go test -count=1 ./test/differential/ -run 'TestDifferential/000[0-9]' -timeout 300s
+ok  	github.com/esalaine/envoy-go/test/differential	28.104s
+
+$ go test -count=1 ./test/differential/ -run 'TestDifferential/001[0-9]' -timeout 300s
+ok  	github.com/esalaine/envoy-go/test/differential	29.913s
+```
+
+Both fixture batches (0000–0009 and 0010–0019) PASS. Full 20-at-once run has transient Docker resource-contention failures (`subj start: subject ready: EOF`; different fixture each attempt); each individual fixture passes cleanly in isolation. **GREEN** (transient contention noted; not blocking per project precedent — see phase-17 PROGRESS precondition 11 note).
+
+### Precondition 12 — pre-existing fuzzers ≥21
+
+```
+$ grep -rE '^func Fuzz' --include='*.go' . | wc -l
+21
+```
+
+21 fuzzers from phases 02–17 present (co-located `fuzz_test.go` files under `internal/...`). Full 30s-each dedicated `-fuzz=… -fuzztime=30s` runs deferred to Task 14 Gate D phase-done verification per the phase-09..17 precedent. **GREEN with deferred fuzzer runs documented.**
+
+Fuzz functions found:
+- `internal/bootstrap/fuzz_test.go`: `FuzzBootstrapLoad`
+- `internal/accesslog/fuzz_test.go`: `FuzzAccessLogFormat`
+- `internal/stats/fuzz_test.go`: `FuzzPromTextFormat`
+- `internal/listener/listenerfilter/fuzz_test.go`: `FuzzFilterChainMatch`
+- `internal/drain/fuzz_test.go`: `FuzzDrainTransitions`
+- `internal/filter/tcpproxy/fuzz_test.go`: `FuzzTcpProxyFilter`
+- `internal/filter/http/fuzz_test.go`: `FuzzFilterChainParse`
+- `internal/filter/http/header_mutation/fuzz_test.go`: `FuzzHeaderMutationConfigParse`
+- `internal/filter/http/csrf/fuzz_test.go`: `FuzzCsrfPolicyConfigParse`
+- `internal/filter/http/localratelimit/fuzz_test.go`: `FuzzLocalRateLimitConfigParse`
+- `internal/filter/http/compressor/fuzz_test.go`: `FuzzCompressorConfigParse`
+- `internal/filter/http/fault/fuzz_test.go`: `FuzzFaultConfigParse`
+- `internal/filter/http/bandwidthlimit/fuzz_test.go`: `FuzzBandwidthLimitConfigParse`
+- `internal/filter/http/jwtauthn/fuzz_test.go`: `FuzzJwtAuthnConfigParse`
+- `internal/filter/http/buffer/fuzz_test.go`: `FuzzBufferConfigParse`
+- `internal/filter/http/rbac/fuzz_test.go`: `FuzzRBACConfigParse`
+- `internal/filter/hcm/fuzz_test.go`: `FuzzHCMConfigParse`
+- `internal/filter/hcm/h2/fuzz_test.go`: `FuzzFrameStream`
+- `internal/filter/hcm/h2/fuzz_test.go`: `FuzzHPACKDecode`
+- `internal/admin/fuzz_test.go`: `FuzzConfigDumpFormat`
+- `internal/tls/fuzz_test.go`: `FuzzTLSContextParse`
+
+### Precondition 13 — reference Envoy image SHA
+
+```
+$ docker image inspect envoyproxy/envoy:v1.37.2 --format '{{.Id}}'
+sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd
+```
+
+### Precondition 14 — ext_authz proto package present
+
+```
+$ go doc github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3 ExtAuthz | head -5
+package ext_authzv3 // import "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+
+type ExtAuthz struct {
+
+	// External authorization service configuration.
+```
+
+### Precondition 15 — `internal/filter/http/extauthz/` absent
+
+```
+$ test ! -d internal/filter/http/extauthz && echo "ok: extauthz absent"
+ok: extauthz absent
+```
+
+### Precondition 16 — `test/helpers/extauthzhttp/` absent
+
+```
+$ test ! -d test/helpers/extauthzhttp && echo "ok: extauthzhttp absent"
+ok: extauthzhttp absent
+```
+
+### Precondition 17 — `cmd/envoy-go/main.go` registers 12 `httpReg.Register` calls
+
+```
+$ grep -cE 'httpReg.Register' cmd/envoy-go/main.go
+12
+```
+
+The 12 registrations: `router` + 11 filters: `bandwidthlimit`, `buffer`, `compressor`, `cors`, `csrf`, `envoygotest`, `fault`, `header_mutation`, `jwtauthn`, `localratelimit`, `rbac`. `extauthz` (alphabetical between `envoygotest` and `fault`) lands at Task 10.
