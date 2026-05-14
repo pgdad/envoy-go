@@ -132,11 +132,11 @@ $ grep -cE '^## ADR-015[6-9]|^## ADR-016[0-4]' docs/envoy-go/DECISIONS.md
 $ grep -cE '^Lands-in: Task [0-9]+ of phase-18.1' docs/envoy-go/DECISIONS.md
 0
 
-$ grep -cE 'Lands-in: Task [0-9]+ of phase-18.1' docs/envoy-go/DECISIONS.md
+$ grep -cE 'Lands-in.*Task.*phase-18.1' docs/envoy-go/DECISIONS.md
 7
 ```
 
-**GREEN with note on second command:** The PLAN's second command uses `^` (line-start anchor) and returns 0; the actual DECISIONS.md format for `Lands-in:` fields is `**Lands-in:** Task N of phase-18.1 PLAN` (bold markdown + `PLAN` suffix), so the line does not start bare with `Lands-in:`. The relaxed form (no `^` anchor) returns 7 matches (≥6 required by PLAN). Not blocking.
+**GREEN with note on second command:** The PLAN's second command uses `^` (line-start anchor) and returns 0; the actual DECISIONS.md format for `Lands-in:` fields is `**Lands-in:** Task N of phase-18.1 PLAN` (bold markdown + `PLAN` suffix), so the line does not start bare with `Lands-in:`. The corrected command (relaxed pattern, no `^` anchor, dropping the literal `: ` and trailing suffix) returns 7 matches (≥6 required by PLAN). Not blocking.
 
 ### Precondition 6 — NO ADR-0125 §(xiv) amendment
 
