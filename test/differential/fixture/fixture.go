@@ -267,6 +267,15 @@ const (
 	// scenario 6). No new helper authored at phase 16 — phase-14's echobackend
 	// remains the shared helper.
 	HTTPRbac BackendKind = 15
+	// HTTPJwtAuthn reuses the existing echobackend helper for upstream routes +
+	// the NEW jwksbackend helper at test/helpers/jwksbackend/ for in-process
+	// JWKS-serving. Plaintext-only (no mTLS in phase 17 per SPEC §7.4). Used by
+	// fixture 0019-http-jwt-authn (phase 17 Task 10): scenarios 1 + 7 fetch JWKS
+	// from the in-process jwksbackend subprocess (RemoteJwks); scenario 2
+	// exercises LocalJwks inline; remaining scenarios exercise deny paths +
+	// CORS preflight bypass + per-route 8th canonical. Because both helpers run
+	// as subprocesses, the runner's in-process accept counter is NOT incremented.
+	HTTPJwtAuthn BackendKind = 16
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

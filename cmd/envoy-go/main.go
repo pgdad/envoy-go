@@ -33,6 +33,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/envoygotest"
 	"github.com/esalaine/envoy-go/internal/filter/http/fault"
 	"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"
+	"github.com/esalaine/envoy-go/internal/filter/http/jwtauthn"
 	"github.com/esalaine/envoy-go/internal/filter/http/localratelimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
@@ -125,6 +126,7 @@ func main() {
 	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
 	httpReg.Register(fault.TypeURL, fault.New)
 	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
+	httpReg.Register(jwtauthn.TypeURL, jwtauthn.New)
 	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
 	httpReg.Register(rbac.TypeURL, rbac.New)
 	// Register header_mutation per-route validator before Freeze (the registry

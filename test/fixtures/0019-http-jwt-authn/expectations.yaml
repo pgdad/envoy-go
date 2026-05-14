@@ -1,0 +1,209 @@
+# Phase 17 fixture 0019 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per SPEC §7.2): one plaintext listener + two clusters.
+#   l_test_a       — plaintext HCM(hcm_local_a) with envoy.filters.http.jwt_authn
+#                    + router. Listener-level JwtAuthentication carries 3
+#                    providers (provider-rs256 RemoteJwks, provider-es256
+#                    LocalJwks inline, provider-alt RemoteJwks), 1
+#                    requirement_map entry (alt-req → provider-alt), 1
+#                    listener-level rule (prefix / → requires_any[provider-rs256,
+#                    provider-es256]) + bypass_cors_preflight: true. Three
+#                    routes: / (scenarios 1-6), /alt-req (scenario 7, per-route
+#                    requirement_name delegation), /per-route-disabled
+#                    (scenario 8, per-route disabled: true).
+#   c_backend      — echobackend subprocess (reuses test/helpers/echobackend/
+#                    from phase 14) for the upstream-echo allow paths.
+#   c_jwks_backend — in-process JWKS server (test/helpers/jwksbackend/, NEW in
+#                    phase 17) serving /.well-known/jwks-rs.json (provider-rs256)
+#                    + /.well-known/jwks-alt.json (provider-alt). provider-es256
+#                    is LocalJwks inline_string — no fetch.
+#
+# Plaintext-only per SPEC §7.4 — no mTLS in phase 17. PKI (3 RSA-2048 + 1
+# ECDSA-P256 + 1 tampered RSA key) is generated fresh at fixture-load time via
+# pki/gen.go (planner-time decision 11; no checked-in private keys).
+#
+# Per SPEC §7.5 the driver asserts: per-scenario status + body byte-stream
+# equivalence (deny scenarios 3-5 also fold the WWW-Authenticate header verdict
+# into the byte stream) + per-side stat-counter expectations honoring the
+# documented divergence-windows. Total runtime ≈ 2s wallclock per fixture.
+#
+# # Host-header pin
+#
+# The differential harness reaches the reference proxy (testcontainers-mapped
+# `localhost:<port>`) and the subject proxy (envoy-go's dual-stack `[::]:<port>`)
+# at DIFFERENT addresses. Reference Envoy's jwt_authn reflects the request's
+# full URL into the WWW-Authenticate `realm` (`<scheme>://<authority><path>`),
+# so the driver pins `Host: jwt-authn.fixture.test` on every request — both
+# proxies then observe the identical authority and the realm is byte-equivalent.
+#
+# ## Scenario matrix (per SPEC §7.1 — 8 scenarios)
+#
+# Scenario 1: valid-RS256-RemoteJwks-allow.
+#   Request:  GET / with Authorization: Bearer <RS256 token, provider-rs256>.
+#   Both sides: 200 + echobackend echo body. Listener-level rule prefix /
+#   → requires_any → provider-rs256 validates (RemoteJwks fetched at filter
+#   load). ALLOW.
+#   Counter impact (envoy-go): allowed +1.
+#
+# Scenario 2: valid-ES256-LocalJwks-allow.
+#   Request:  GET / with Authorization: Bearer <ES256 token, provider-es256>.
+#   Both sides: 200 + echobackend echo body. requires_any → provider-es256
+#   validates via the inline LocalJwks (NO JWKS fetch). ALLOW.
+#   Counter impact (envoy-go): allowed +1.
+#
+# Scenario 3: missing-token-deny.
+#   Request:  GET / with NO Authorization header.
+#   Both sides: 401 + body byte-exact "Jwt is missing" (14B) + WWW-Authenticate
+#   `Bearer realm="http://jwt-authn.fixture.test/"` (NO error param — JwtMissed
+#   case per §1.1 amendment 12).
+#   Counter impact (envoy-go): denied +1.
+#
+# Scenario 4: expired-token-deny.
+#   Request:  GET / with Authorization: Bearer <RS256 token, exp in the past>.
+#   Both sides: 401 + body byte-exact "Jwt is expired" (14B) + WWW-Authenticate
+#   `Bearer realm="http://jwt-authn.fixture.test/", error="invalid_token"`.
+#   Counter impact (envoy-go): denied +1.
+#
+# Scenario 5: bad-signature-deny.
+#   Request:  GET / with Authorization: Bearer <token signed by the tampered
+#   RSA key, carrying provider-rs256's kid so kid-lookup succeeds but signature
+#   verification fails>.
+#   Both sides: 401 + body byte-exact "Jwt verification fails" (22B) +
+#   WWW-Authenticate `Bearer realm="http://jwt-authn.fixture.test/", error="invalid_token"`.
+#   Counter impact (envoy-go): denied +1.
+#
+# Scenario 6: bypass-cors-preflight.
+#   Request:  OPTIONS / with Origin + Access-Control-Request-Method headers,
+#   NO Authorization. bypass_cors_preflight: true → preflight predicate fires.
+#   Both sides: 200 + echobackend echo body (validation bypassed).
+#   Counter impact (envoy-go): cors_preflight_bypassed +1.
+#   Counter impact (reference): cors_preflight_bypassed +1 AND allowed +1 —
+#   see divergence-window 1.
+#
+# Scenario 7: per-route 8th-canonical requirement_name delegation.
+#   Request:  GET /alt-req with Authorization: Bearer <RS256 token, provider-alt>.
+#   The per-route TPFC PerRouteConfig{requirement_name: "alt-req"} resolves at
+#   request time against listener.requirement_map["alt-req"] = provider-alt.
+#   Both sides: 200 + echobackend echo body. ALLOW.
+#   Counter impact (envoy-go): allowed +1.
+#
+# Scenario 8: per-route 8th-canonical disabled.
+#   Request:  GET /per-route-disabled with NO Authorization. The per-route TPFC
+#   PerRouteConfig{disabled: true} bypasses jwt_authn wholly for this route.
+#   Both sides: 200 + echobackend echo body (filter inactive).
+#   Counter impact (envoy-go): NONE — per §1.1 amendment 5 "PerRouteConfig{
+#   disabled: true} → no counter increments".
+#   Counter impact (reference): allowed +1 — see divergence-window 1.
+#
+# ## Counter-delta map (per side; per SPEC §7.5 + Task-13 empirical scrape)
+#
+# All counters are HCM-rooted under the SN2-reuse namespace
+# `http.hcm_local_a.jwt_authn.<counter>` (Prometheus form
+# `envoy_http_jwt_authn_<counter>{envoy_http_conn_manager_prefix="hcm_local_a"}`
+# — IDENTICAL on both sides; §11.P7 SN2-reuse RATIFIED at Task 8).
+#
+# envoy-go (subject):
+#   http.hcm_local_a.jwt_authn.allowed                 +3  (scenarios 1, 2, 7)
+#   http.hcm_local_a.jwt_authn.denied                  +3  (scenarios 3, 4, 5)
+#   http.hcm_local_a.jwt_authn.cors_preflight_bypassed  +1  (scenario 6)
+#   http.hcm_local_a.jwt_authn.jwks_fetch_success       +2  (provider-rs256 +
+#                                                            provider-alt
+#                                                            load-time fetch)
+#   http.hcm_local_a.jwt_authn.jwks_fetch_failed        +0
+#   http.hcm_local_a.jwt_authn.jwt_cache_hit            +0  (structurally
+#                                                            unreachable — MVP)
+#   http.hcm_local_a.jwt_authn.jwt_cache_miss           +0  (structurally
+#                                                            unreachable — MVP)
+#
+# reference Envoy v1.37.2:
+#   http.hcm_local_a.jwt_authn.allowed                 +5  (scenarios 1, 2, 7
+#                                                            ALLOW + 6, 8 bypass)
+#   http.hcm_local_a.jwt_authn.denied                  +3  (scenarios 3, 4, 5)
+#   http.hcm_local_a.jwt_authn.cors_preflight_bypassed  +1  (scenario 6)
+#   http.hcm_local_a.jwt_authn.jwks_fetch_success       +2  (provider-rs256 +
+#                                                            provider-alt)
+#   http.hcm_local_a.jwt_authn.jwks_fetch_failed        +0
+#   http.hcm_local_a.jwt_authn.jwt_cache_hit            +0
+#   http.hcm_local_a.jwt_authn.jwt_cache_miss           +9  (validated-JWT LRU
+#                                                            cache always active)
+#
+# The driver's AssertStats enforces cross-side `ref == subj` equivalence on
+# `denied`, `cors_preflight_bypassed`, `jwks_fetch_success`, `jwks_fetch_failed`
+# (the four byte-equivalent counters) and per-side expectations on `allowed`
+# (ref 5 / subj 3 — divergence-window 1). `jwt_cache_*` is NOT asserted
+# (divergence-window 2).
+#
+# ## Documented divergence-windows
+#
+# 1. **`allowed` counter on bypass paths (Task-13 empirical discovery).**
+#    Reference Envoy increments `allowed` on EVERY request that clears the
+#    filter gate, INCLUDING the CORS-preflight-bypass path (scenario 6) and the
+#    per-route `disabled: true` passthrough (scenario 8). envoy-go MVP
+#    increments `allowed` ONLY on an active-engine ALLOWED result, per SPEC §3
+#    ("increments per request where the active engine result = ALLOWED") + §1.1
+#    amendment 5 ("PerRouteConfig{disabled: true} → no counter increments").
+#    This is SPEC-mandated envoy-go behaviour — the divergence is a deliberate
+#    design choice, NOT a bug. The driver asserts `allowed` per-side (ref 5,
+#    subj 3) and does NOT enforce cross-side equivalence on it.
+#
+# 2. **`jwt_cache_hit` / `jwt_cache_miss` structurally unreachable (SPEC §8
+#    deferral 8 + §1.1 amendment 9).** envoy-go MVP silent-ignores
+#    `jwt_cache_config`; the validated-JWT LRU cache is never constructed, so
+#    both cache counters stay at 0. Reference Envoy's cache is always active
+#    (`jwt_cache_miss` > 0). The two counters are registered in the filterStats
+#    struct (stat-table completeness, 71 names) but NEVER incremented under MVP.
+#    NOT asserted by the driver.
+#
+# 3. **`response_code_details` on DENY (SPEC §1.1 amendment 11 + §8 deferral
+#    13).** envoy-go silent (no response_code_details framework primitive);
+#    Envoy emits `jwt_authn_access_denied{<failure_reason_underscored>}`.
+#    Fixture 0019 does NOT assert on response_code_details, so the
+#    divergence-window is not surfaced empirically. Joint closure with the
+#    phase-16 rbac forward-pointer at a future response-code-details phase.
+#
+# 4. **`filter_state_rules` silent-ignored (SPEC §1.1 amendment 1 + §8 deferral
+#    12).** envoy-go silent (no filter-state framework primitive); Envoy drives
+#    runtime requirement-selection off StreamInfo.FilterState. Fixture 0019's
+#    listener config does NOT set filter_state_rules, so the divergence-window
+#    is not surfaced.
+#
+# 5. **Dynamic-metadata family silent-ignored (SPEC §8 deferrals 1-4).**
+#    `payload_in_metadata` + `header_in_metadata` + `failed_status_in_metadata`
+#    + `normalize_payload_in_metadata` are silent-ignored by envoy-go MVP.
+#    Fixture 0019's providers do NOT set these fields.
+#
+# 6. **v1.37.x claim-coverage extensions silent-ignored (SPEC §1.1 amendments
+#    2 + 3 + §8 deferrals 15-17).** `subjects` + `require_expiration` +
+#    `max_lifetime` are silent-ignored by envoy-go MVP. Fixture 0019's
+#    providers do NOT set these fields.
+#
+# 7. **`clear_route_cache` implicit-on-side-effect trigger (SPEC §8 deferral
+#    18).** envoy-go MVP honours only an explicit `clear_route_cache: true`;
+#    Envoy also clears when claim_to_headers adds ≥1 header OR payload_in_metadata
+#    is set. Fixture 0019's providers do NOT set claim_to_headers /
+#    forward_payload_header / clear_route_cache, so the divergence-window is
+#    not surfaced.
+#
+# ## Wall-clock tolerance
+#
+# Fixture 0019 has no throttle / wait-time scenarios; per-scenario wall-clock
+# is dominated by the network round-trip + JWT signature verification (< 2ms
+# typical). Total fixture wallclock ≈ 2s (8 scenarios sequential against each
+# proxy + the load-time JWKS fetches). NO wall-clock-tolerance assertion is
+# enforced; the per-scenario byte-stream verdict + the AssertStats counter
+# checks are the assertions.
+#
+# ## Header allow-list
+#
+# Standard envoy timing/identity headers per BEHAVIOR_CONTRACT.md
+# `## Header allow-list`. The cross-side byte-stream captures status + body
+# (allow-path: echobackend echo classified structurally; deny-path: 14/14/22-byte
+# canonical jwt_verify_lib string exact) + the WWW-Authenticate verdict for deny
+# scenarios 3-5. The general header-level differential is NOT enforced at
+# fixture 0019 (the driver's byte stream omits headers other than the folded
+# WWW-Authenticate verdict).
+#
+# Cross-refs: SPEC §7.1 + §7.2 + §7.3 + §7.4 + §7.5 + §1.1 amendments 1-3 + 5 +
+#             8-12 + §8 deferrals 1-18 + §11.P1 + §11.P2 + §11.P6 + §11.P7 +
+#             ADR-0148 + ADR-0150 + ADR-0152 + ADR-0153 + ADR-0154 + ADR-0155 +
+#             ADR-0125 §(xiii) + BEHAVIOR_CONTRACT §13.4 divergence-window roster.

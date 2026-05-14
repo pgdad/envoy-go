@@ -41,6 +41,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0016-http-compressor/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0017-http-bandwidth-limit/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0018-http-rbac/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0019-http-jwt-authn/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -365,6 +366,36 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// lands at Task 12 when the inputs package is authored — at Task 11
 			// the BackendKind=HTTPRbac case is wired so the switch is complete
 			// for Task 12's fixture rollout.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPJwtAuthn:
+			// Fixture 0019-http-jwt-authn (phase 17) reuses the SHARED
+			// echobackend binary (phase-14 Task 10) for upstream-echo routes.
+			// The in-process JWKS-serving subprocess (test/helpers/jwksbackend/)
+			// is lifecycle-managed BY THE DRIVER at Task 11 (it needs to know
+			// the per-scenario JWK Set payloads to seed); this switch-case only
+			// allocates the upstream echo backend. Plaintext-only per SPEC §7.4
+			// (no mTLS in phase 17). Because the backend is a subprocess, the
+			// runner's in-process accept counter is NOT incremented. The
+			// blank-import for the fixture's inputs package lands at Task 11
+			// when the inputs package is authored — at Task 10 the switch-case
+			// is wired ahead of the rollout so the BackendKind dispatch is
+			// complete.
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)
