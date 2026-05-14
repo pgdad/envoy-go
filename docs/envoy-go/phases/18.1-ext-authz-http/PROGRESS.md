@@ -142,13 +142,14 @@ $ grep -cE 'Lands-in.*Task.*phase-18.1' docs/envoy-go/DECISIONS.md
 
 ```
 $ grep -nE '\(xiv\)' docs/envoy-go/DECISIONS.md
-(2 matches — both are EXPLANATORY text within ADR-0163 §Context describing the ABSENCE of §(xiv); not actual amendment paragraphs)
+8503:**Phase 18 lands NO ADR-0125 amendment paragraph** — the FIRST §9 family-row since phase 13 to REUSE an existing canonical rather than extend the roster (breaking the phase-13-§(ix) / phase-14-§(x) / phase-15-§(xi) / phase-16-§(xii) / phase-17-§(xiii) per-phase-roster-growth streak). This is BRAINSTORM §11 lesson (d)'s inverse confirmation: the ADR-0125 roster grows when a filter's per-route shape is genuinely structurally novel, and stays flat when it is a textbook instance of an existing pattern. The absence of a §(xiv) amendment is itself a recorded decision — ADR-0163 records the explicit 5th-canonical-REUSE classification (the same way phase-13 §(ix) recorded the 5th canonical's *introduction*). Two minor PGV wrinkles vs the bare buffer/compressor 5th canonical are recorded (parent SPEC §6 amendment 3): `ExtAuthzPerRoute.disabled` is PGV `const: true` (envoy-go PARSE-REJECTs `disabled: false`) and the `override` oneof is PGV-required (envoy-go PARSE-REJECTs an empty `ExtAuthzPerRoute`); these do not constitute a new canonical — buffer's `BufferPerRoute` has the same disabled-bool-in-required-oneof structure.
+8515:LANDS AT phase-18.1 IMPL per ADR-0044. Records: ADR-0125's roster staying at 8 (NO §(xiv) growth); the 5th-canonical-REUSE as a notable data point (the roster does not grow monotonically per phase); the stat-table 71 → 77; the §18.P6/§18.P7 RATIFIED-PENDING closures at the 18.1 stat-surface task.
 
-$ grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md
+$ grep -cE '^\*\*\(xiv\)\*\*' docs/envoy-go/DECISIONS.md
 0
 ```
 
-**GREEN with note:** `grep -nE '\(xiv\)'` returns 2 matches but these are within ADR-0163 §Context's explanatory text documenting that no §(xiv) is needed. `grep -cE '^\*\*(xiv)\*\*'` returns 0 confirming no actual amendment paragraph. Not blocking.
+**GREEN with note:** `grep -nE '\(xiv\)'` returns 2 matches but both are EXPLANATORY text within ADR-0163 §Context describing the ABSENCE of §(xiv) — not actual amendment paragraphs. `grep -cE '^\*\*\(xiv\)\*\*'` returns 0 confirming no actual amendment paragraph. Not blocking.
 
 ### Precondition 7 — SPEC SHA
 
