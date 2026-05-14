@@ -8325,11 +8325,35 @@ The boot-registration ordering follows ADR-0072 + ADR-0100 §2.2 alphabetical-af
 
 ### Decision
 
-LANDS AT Task 2 of phase-18.1 PLAN per ADR-0044 ADR-on-impl convention. The §Decision body will codify: (i) the single-token `internal/filter/http/extauthz/` directory + `TypeURL`/`filterName` consts; (ii) the DECODER-only `HTTPFilter` value + the compile-time `var _ envoyhttp.StreamDecoderFilter` assertion; (iii) the 6-base-counter `filterStats` struct + `newFilterStats` unconditional allocation guarded by `if ctx.Stats != nil`; (iv) `disabled` registered-but-structurally-unreachable; (v) the deny-path / error-path `SendLocalReply` callsite shape; (vi) the boot-registration site in `cmd/envoy-go/main.go`; (vii) the `factoryState` simplification (SHARED-stats means no per-route `*filterStats` — per ADR-0163).
+**Status: Accepted — landed at Task 2 of phase-18.1 PLAN per ADR-0044.**
+
+**(i) Single-token directory + consts.** Package directory and Go-package identifier are both `extauthz` — single token, underscore-stripped per ADR-0114, matching `localratelimit/` + `jwtauthn/`. The internal `filterName` const is `"envoy.filters.http.ext_authz"` (underscore preserved, matching the listener typed_per_filter_config map key). The exported `TypeURL` const is `"type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz"`.
+
+**(ii) DECODER-only HTTPFilter value + compile-time assertion.** The factory returns `envoyhttp.HTTPFilter{Name: filterName, Decoder: f, Encoder: nil}`. Compile-time assertion `var _ envoyhttp.StreamDecoderFilter = (*filter)(nil)` at package scope. Mirrors phase-12 csrf + phase-13 buffer + phase-16 rbac + phase-17 jwt_authn decoder-only precedent (5th §9 row pure decode-side).
+
+**(iii) 6-base-counter `filterStats` + `newFilterStats` unconditional allocation.** The `filterStats` struct carries 6 `*stats.Counter` fields: `ok`, `denied`, `errored` (wire name: `error`), `disabled`, `failureModeAllowed` (wire name: `failure_mode_allowed`), `invalid`. `newFilterStats(reg, hcmStatPrefix)` registers all 6 via `reg.NewCounterIfAbsent` unconditionally (predeclared empty counters for scrape stability; mirrors phase-17 jwt_authn). `buildCompiledConfig` guards `if ctx.Stats != nil` before calling `newFilterStats` per ADR-0085 nil-tolerance.
+
+**(iv) `disabled` registered-but-structurally-unreachable.** The `disabled` counter is registered for scrape-stability but never incremented under MVP: the runtime `filter_enabled` / `filter_enabled_metadata` gate is silent-ignored in 18.1 (parent SPEC §5.P12 + §8 deferral 4). Mirrors phase-17 jwt_authn's `jwtCacheHit`/`jwtCacheMiss` structurally-unreachable discipline. `disabled` publishes 0 for the listener's lifetime.
+
+**(v) Deny-path / error-path `SendLocalReply` callsite shape.** On **deny**: `dcb.SendLocalReply(disp.denyStatus, string(disp.denyBody), filteredHeaders)` where `filteredHeaders` contains the auth service's `allowed_client_headers`-filtered headers + synthesized `content-length` (ADR-0085). On **error + `failure_mode_allow:false`**: `dcb.SendLocalReply(cc.statusOnError, "", nil)`. ext_authz is the FIRST §9 row whose deny-path status is not fixed — it comes from the auth service. The `SendLocalReply` body lands at Task 9 for the real dispatch; Task 2 ships the skeleton.
+
+**(vi) Boot-registration site deferred to Task 10.** The `cmd/envoy-go/main.go` registration (`httpReg.Register(extauthz.TypeURL, extauthz.New)`) alphabetical between `envoygotest` and `fault` lands at Task 10, growing the registry from 13 to 14 entries.
+
+**(vii) `factoryState` simplification.** SHARED-stats discipline per ADR-0163 means no per-route `*filterStats` allocation. `factoryState` carries only `listenerRC *compiledConfig` + `perRoute sync.Map`. Mirrors phase-17 jwtauthn's simplified `factoryState` (no `reg` or `hcmStatPrefix` thread-through).
 
 ### Consequences
 
-LANDS AT Task 2 of phase-18.1 PLAN per ADR-0044. The §Consequences body will record: the package landing at Task 2; the 6 counters publishing under the SN2-reuse namespace `http.<HCM_stat_prefix>.ext_authz.<counter>`; the `disabled` counter publishing 0 indefinitely under MVP (documented divergence-window vs reference Envoy which increments it via the runtime `filter_enabled` gate); the deny-path divergence-window for `response_code_details` (joint with phase-16 ADR-0146 + phase-17 ADR-0155); the boot-registration count 13 → 14; the Task 2 acceptance test groups.
+**Package landing at Task 2.** The `internal/filter/http/extauthz/` package lands with `doc.go` + `extauthz.go` + `extauthz_test.go` (Groups 1+2+7). Acceptance: `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet ./internal/filter/http/extauthz/...` exit 0; 39 tests pass.
+
+**6 counters under SN2-reuse namespace.** All 6 publish under `http.<HCM_stat_prefix>.ext_authz.<counter>`. Empty HCM stat_prefix (test code paths) folds to `ext_authz.<counter>` (nameRE discipline). RATIFIED-PENDING-IMPL-TIME via reference Envoy v1.37.2 empirical scrape at Task 8 per §18.P6.
+
+**`disabled` counter divergence-window.** Envoy v1.37.2 increments `disabled` via the runtime `filter_enabled` gate; envoy-go MVP defers that gate entirely → `disabled` publishes 0 indefinitely under 18.1. Documented divergence-window (see BEHAVIOR_CONTRACT §13.2 at Task 14).
+
+**`response_code_details` divergence-window.** Envoy v1.37.2 emits `ext_authz_denied` in `response_code_details` on the deny path; envoy-go's `SendLocalReply` has no `response_code_details` slot (3-arg signature from phase-04 HCM scope). Joint divergence-window with phase-16 ADR-0146 + phase-17 ADR-0155 (forward-pointer to future HCM framework phase).
+
+**Boot-registration count 13 → 14.** Lands at Task 10 (this task deferred per PLAN).
+
+**Task 2 test groups.** Groups 1 (`ExtAuthz` parse), 2 (`compiledConfig` shape), 7 (per-route) PASS. Groups 3/4/5/6/8/9 land at Tasks 4/3/9/6/5/9 respectively.
 
 ---
 
@@ -8352,11 +8376,33 @@ The error-classification boundary in `check.go` is empirically RATIFIED at the p
 
 ### Decision
 
-LANDS AT Task 2 of phase-18.1 PLAN (§Decision) + is AMENDED at phase-18.2 IMPL per ADR-0044. The 18.1 §Decision body will codify: the `compiledConfig` struct (`checkFn` + `withRequestBody` + the 4 error-posture fields + `clearRouteCache` + `allowedHeaders`/`disallowedHeaders` + `stats`); the `services`-oneof dispatch (`nil` → PARSE-REJECT; `*ExtAuthz_GrpcService` → PARSE-REJECT in 18.1; `*ExtAuthz_HttpService` → build the HTTP-mode `checkFn`); the V3-only `transport_api_version` PARSE-REJECT; the `checkDisposition` convergence value; the §5.P10 error-classification boundary in the `check.go` dispatcher. The 18.2 §Decision amendment will replace the `grpc_service` PARSE-REJECT with the gRPC `checkFn` construction.
+**Status: Accepted — landed at Task 2 of phase-18.1 PLAN per ADR-0044. §Decision amended at phase-18.2 IMPL to activate the `grpc_service` arm.**
+
+**(i) `compiledConfig` struct shape.** The `compiledConfig` struct carries: `checkFn` (the resolved transport closure), `withRequestBody *bufferSettings` (non-nil when `with_request_body.max_request_bytes > 0`), four error-posture fields (`failureModeAllow bool`, `failureModeAllowHeaderAdd bool`, `statusOnError uint32` default 403, `validateMutations bool`), `clearRouteCache bool`, `allowedHeaders *stringMatcherList` + `disallowedHeaders *stringMatcherList` (nil = all allowed / none denied respectively at Task 2 stub; compiled at Task 4), and `stats *filterStats` (SHARED per ADR-0163; nil-guarded per ADR-0085). No transport-specific fields — mode-agnostic and field-final at 18.1 (18.2 adds no field).
+
+**(ii) `services`-oneof dispatch in `buildCompiledConfig`.** The dispatch fires AFTER the structural checks (`transport_api_version` + `with_request_body`) and follows the deterministic ordering: (1) nil `services` oneof → PARSE-REJECT `"ext_authz: services oneof must be set (neither grpc_service nor http_service is configured)"`. (2) `*ExtAuthz_GrpcService` → PARSE-REJECT `"ext_authz: grpc_service mode not yet supported (lands in phase 18.2)"` in 18.1. (3) `*ExtAuthz_HttpService` → call `buildHTTPCheckFn` (Task 2 stub returns `errHTTPCheckFnStub`; Task 3 replaces with the real HTTP-mode `checkFn`). The 18.2 amendment replaces arm (2) with the gRPC `checkFn` construction consuming ADR-0158.
+
+**(iii) `transport_api_version` V3-only PARSE-REJECT.** Non-V3 values (including the zero-value `API_VERSION_UNSPECIFIED` = 0) PARSE-REJECT per ADR-0008. The check fires BEFORE the `services`-oneof dispatch (ordering: structural field checks first, then service-specific dispatch). Only `corev3.ApiVersion_V3` (value 2 in `go-control-plane v1.32.4`) is accepted.
+
+**(iv) `checkDisposition` convergence value.** The mode-agnostic convergence type `checkDisposition` carries: `class dispositionClass` (`dispAllow` / `dispDeny` / `dispError`); `upstreamSet []headerKV` + `upstreamApp []headerKV` (allow-path upstream header mutations — `allowed_upstream_headers` set/overwrite and `allowed_upstream_headers_to_append` append); `denyStatus uint32` + `denyBody []byte` + `denyHeaders []headerKV` (deny-path verbatim auth response). Both the HTTP-mode (18.1) and gRPC-mode (18.2) `checkFn` implementations produce this struct. The disposition-application logic is mode-agnostic and lives in the `check.go` dispatcher (Task 9).
+
+**(v) Error-classification boundary.** Per parent SPEC §5.P10 empirical ratification: transport/timeout/connect failure or HTTP-mode unrecognized status ⇒ `dispError` → `statusOnError` apply (or `failureModeAllow` pass-through); recognized deny status (`401`/`403` HTTP-mode, any non-OK gRPC `status.code`) ⇒ `dispDeny` → `SendLocalReply(disp.denyStatus, ...)`; empty-but-valid response ⇒ `dispAllow`. `failure_mode_allow` / `status_on_error` act on `dispError` only. Error + `failureModeAllow:true` increments BOTH `errored` AND `failureModeAllowed` counters.
+
+**(vi) `with_request_body` structural validation.** `BufferSettings.max_request_bytes == 0` is a PGV constraint violation treated as a PARSE-REJECT by envoy-go-strict. The check fires before `buildHTTPCheckFn` in `buildCompiledConfig` ordering. A valid `with_request_body` sets `compiledConfig.withRequestBody` to the parsed `*bufferSettings`.
+
+**(vii) `errHTTPCheckFnStub` sentinel at Task 2.** `buildHTTPCheckFn` at Task 2 validates `server_uri` presence then returns `errHTTPCheckFnStub = errors.New("ext_authz: buildHTTPCheckFn stub (Task 3 lands the real impl)")`. This makes Group 1 tests distinguish stub from real parse-rejections via `errors.Is(err, errHTTPCheckFnStub)`. Task 3 replaces this stub with the real HTTP-mode `checkFn`; the Group 1 "valid http_service" tests are tightened to assert `factory != nil` at that point.
 
 ### Consequences
 
-LANDS AT the respective IMPL tasks per ADR-0044. Records: the 18.1 `compiledConfig` landing; the `grpc_service` PARSE-REJECT divergence-window for 18.1 (configs using gRPC-mode fail to load under 18.1 envoy-go but succeed under reference Envoy — closed at 18.2); the 18.2 amendment activating the gRPC arm; the consumed-vs-deferred field roster (parent SPEC §5.P1 + §6 amendment 1).
+**`compiledConfig` landed at Task 2.** The struct is field-final at 18.1 — 18.2 adds no new field (only a second `checkFn` constructor). All Task 2 acceptance tests (Groups 1+2+7) pass with `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0.
+
+**`grpc_service` PARSE-REJECT divergence-window for 18.1.** Configs using `grpc_service` fail to load under 18.1 envoy-go but succeed under reference Envoy v1.37.2. This is an intentional 18.1-scoped divergence window, closed at 18.2 when arm (2) in `buildCompiledConfig` is replaced by the real gRPC `checkFn`. Documented divergence-window (see BEHAVIOR_CONTRACT at Task 14).
+
+**18.2 amendment forward-pointer.** The `*ExtAuthz_GrpcService` arm in `buildCompiledConfig` is the sole §Decision amendment point for 18.2. The amendment replaces the PARSE-REJECT with `buildGRPCCheckFn(cfg.GrpcService, ctx)` consuming ADR-0158. No other `compiledConfig` field changes at 18.2.
+
+**Consumed-vs-deferred field roster.** 18.1 consumes (per parent SPEC §5.P1 + §6 amendment 1): `http_service`, `transport_api_version`, `failure_mode_allow`, `failure_mode_allow_header_add`, `with_request_body`, `clear_route_cache`, `status_on_error`, `validate_mutations`, `allowed_headers`, `disallowed_headers`, `stat_prefix`. 18.1 PARSE-REJECTs: `grpc_service`. 18.1 silent-ignores ~13 fields (runtime/metadata/TLS families per doc.go §Silent-ignored list).
+
+**Task 2 Groups 1+2 test coverage.** Group 1 covers all `New()` PARSE-REJECT paths + the stub success path (via `errors.Is(err, errHTTPCheckFnStub)`). Group 2 covers `compiledConfig` field values post-parse (error-posture defaults, `with_request_body` validation, `statusOnError` default 403). Groups 3/4/5/6/8/9 land at Tasks 4/3/9/6/5/9 respectively.
 
 ---
 
