@@ -1408,4 +1408,4 @@ $ gofmt -l internal/filter/http/extauthz/
 
 ### Task 9 commit SHA
 
-TBD
+`c310d96`
