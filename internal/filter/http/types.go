@@ -5,6 +5,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -260,6 +261,14 @@ type FactoryCtx struct {
 	// "http.<stat_prefix>.<metric>" discipline. Empty in test code that does
 	// not exercise stat-bearing filters. Phase 09 first-use anchor.
 	StatPrefix string
-	// Future extensions (cluster manager, accesslog sinks) added per-family-
-	// phase as filter implementations require them.
+	// ClusterManager is the bootstrap-time cluster manager (per ADR-0158)
+	// threaded into per-filter factories that need to resolve an upstream
+	// cluster name to a `*cluster.Cluster` (e.g. ext_authz `grpc_service.
+	// envoy_grpc.cluster_name`). Non-nil at HCM-build time per the phase-18.2
+	// landing; may be nil in test code that does not exercise cluster-bearing
+	// filters (per ADR-0085 nil-tolerance — the filter factory checks for nil
+	// before calling Get/Drain). Phase 18.2 first-use anchor.
+	ClusterManager *cluster.Manager
+	// Future extensions (accesslog sinks) added per-family-phase as filter
+	// implementations require them.
 }

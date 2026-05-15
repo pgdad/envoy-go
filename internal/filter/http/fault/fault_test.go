@@ -1,6 +1,7 @@
 package fault
 
 import (
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -231,6 +232,14 @@ func (r *recordingDCB) EncodeHeaders(http.Header, bool) {}
 func (r *recordingDCB) EncodeData([]byte, bool)         {}
 func (r *recordingDCB) EncodeTrailers(http.Header)      {}
 func (r *recordingDCB) DownstreamPrincipal() []string   { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (r *recordingDCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (r *recordingDCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (r *recordingDCB) DownstreamTLSServerName() string  { return "" }
+func (r *recordingDCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (r *recordingDCB) DownstreamProtocol() string       { return "" }
+func (r *recordingDCB) ListenerPrincipal() string        { return "" }
 
 // makeFilter constructs a fault filter with the supplied abort.http_status,
 // abort.percentage, and headers-field shape, returning the *filter and the

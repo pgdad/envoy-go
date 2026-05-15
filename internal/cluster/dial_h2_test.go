@@ -310,28 +310,49 @@ func TestCluster_DialH2_ALPNMismatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DialH2 — not a TLS conn
+// DialH2 — plaintext h2c upstream (ADR-0166)
 // ---------------------------------------------------------------------------
 
-// TestCluster_DialH2_NotTLS verifies DialH2 errors when Cluster.Dial returns
-// a plain net.Conn (no upstream TLS configured).
-func TestCluster_DialH2_NotTLS(t *testing.T) {
-	ln := listenTCP(t)
+// listenH2C starts an in-process plaintext (NO TLS) h2c listener that runs the
+// from-scratch driver-side h2 handshake (preface + SETTINGS exchange) on each
+// accepted conn. Used by the plaintext-h2c dial test below; mirrors listenH2
+// minus the TLS wrap. Returns the listener; caller must Close.
+func listenH2C(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	go runH2Server(ln)
+	return ln
+}
+
+// TestCluster_DialH2_PlaintextH2CCluster_SkipTLSWrap verifies ADR-0166: a
+// cluster with upstreamCfg=nil (plaintext h2c upstream — no transport_socket
+// at config time) successfully completes DialH2 against a plaintext h2c
+// backend. The TLS-conn assertion is skipped; the raw *net.TCPConn (wrapped
+// in *connWithGauge) is handed directly to h2.NewClientConn for h2c
+// prior-knowledge per RFC 7540 §3.4. The returned *h2.ClientConn must be
+// non-nil with nil err.
+func TestCluster_DialH2_PlaintextH2CCluster_SkipTLSWrap(t *testing.T) {
+	ln := listenH2C(t)
 	defer func() { _ = ln.Close() }()
 
 	ep := endpointFromAddr(ln.Addr())
-	// upstreamCfg=nil → Cluster.Dial returns the raw TCP conn.
-	c := mkTestCluster("test-not-tls", nil, ep)
+	// upstreamCfg=nil → Cluster.Dial returns the raw TCP conn wrapped in
+	// *connWithGauge; DialH2 must skip the TLS-conn assertion (ADR-0166).
+	c := mkTestCluster("test-plaintext-h2c", nil, ep)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _, err := c.DialH2(ctx)
-	if err == nil {
-		t.Fatal("DialH2: want error, got nil")
+	cc, _, err := c.DialH2(ctx)
+	if err != nil {
+		t.Fatalf("DialH2 (plaintext h2c): %v", err)
 	}
-	if !strings.Contains(err.Error(), "not a TLS conn") {
-		t.Errorf("err = %q, want substring %q", err.Error(), "not a TLS conn")
+	if cc == nil {
+		t.Fatal("DialH2 returned nil ClientConn with nil err")
 	}
+	defer func() { _ = cc.Close() }()
 }
 
 // ---------------------------------------------------------------------------

@@ -309,6 +309,34 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// no-client-cert connections (the chain field stays nil; the accessor
 	// returns nil per ADR-0143 §Decision (vi) case (c)).
 	chain.SetTLSPrincipals(downstreamTLSPrincipals(downstream))
+	// Phase 18.2 Task 4 (ADR-0165): seed the 6 per-stream callback-surface
+	// extension fields BEFORE RunDecodeHeaders dispatch — the cross-phase
+	// reusable framework primitives for ext_authz gRPC-mode AttributeContext
+	// population (and future ext_proc / global_ratelimit filters). All 6
+	// mirror the SetTLSPrincipals seed-and-read discipline; the
+	// listener-principal is sourced from f.listenerPrincipal (pre-extracted
+	// by the listener manager at chain-build time from the chain's leaf TLS
+	// cert via extractListenerPrincipal — empty for plaintext chains). The
+	// downstream-protocol is the H1 canonical "HTTP/1.1".
+	//
+	// Nil-downstream guard: chain-dispatch unit tests
+	// (TestDispatchRequest_ChainInvocationOrder etc.) pass downstream=nil
+	// because they exercise the chain machinery directly without a real
+	// listener — the chain fields stay zero (nil net.Addr, "" SNI / cert
+	// DER) per the zero-value semantics documented on the chain struct.
+	if downstream != nil {
+		chain.SetDownstreamRemoteAddr(downstream.RemoteAddr())
+		chain.SetDownstreamLocalAddr(downstream.LocalAddr())
+	}
+	chain.SetDownstreamProtocol("HTTP/1.1")
+	chain.SetListenerPrincipal(f.listenerPrincipal)
+	if tlsConn, ok := downstream.(*stdtls.Conn); ok {
+		state := tlsConn.ConnectionState()
+		chain.SetDownstreamTLSServerName(state.ServerName)
+		if len(state.PeerCertificates) > 0 {
+			chain.SetDownstreamTLSPeerCertDER(state.PeerCertificates[0].Raw)
+		}
+	}
 	defer chain.Destroy()
 
 	// Locate the terminal router filter instance and inject the per-request

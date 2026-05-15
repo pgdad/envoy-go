@@ -2,6 +2,7 @@ package localratelimit
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -232,6 +233,14 @@ func (f *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
 func (f *fakeDecoderCB) EncodeData([]byte, bool)         {}
 func (f *fakeDecoderCB) EncodeTrailers(http.Header)      {}
 func (f *fakeDecoderCB) DownstreamPrincipal() []string   { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (f *fakeDecoderCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (f *fakeDecoderCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (f *fakeDecoderCB) DownstreamTLSServerName() string  { return "" }
+func (f *fakeDecoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (f *fakeDecoderCB) DownstreamProtocol() string       { return "" }
+func (f *fakeDecoderCB) ListenerPrincipal() string        { return "" }
 
 // TestDecodeHeaders_AllowPath_CountersIncremented verifies that on the allow path
 // (bucket has tokens) DecodeHeaders returns Continue, increments enabled + ok,

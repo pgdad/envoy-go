@@ -10,6 +10,7 @@ package hcm
 import (
 	"context"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,6 +46,23 @@ type h2Dispatcher struct {
 	// chainDispatchAction.tlsPrincipals → chain.SetTLSPrincipals before
 	// RunDecodeHeaders dispatch. Phase 16 Task 6 (ADR-0144 §Decision (iii)).
 	tlsPrincipals []string
+
+	// Phase 18.2 Task 4 (ADR-0165): the 4 per-connection callback-surface-
+	// extension fields below carry per-stream state captured ONCE at H2
+	// connection build time by runH2 — symmetric to tlsPrincipals (the H1
+	// connection is also pinned to a single conn-state for the connection
+	// lifetime; per-conn caching mirrors that semantic for the H2 path's
+	// many-streams-per-conn shape). Threaded into every per-stream chain via
+	// chainDispatchAction.{downstreamRemoteAddr/...} → chain.SetX before
+	// RunDecodeHeaders dispatch. Zero-value semantics match the chain
+	// fields (nil net.Addr / empty string / nil DER bytes for plaintext or
+	// no-client-cert connections). The listener-principal is the SAME
+	// per-listener string for all conns on this Filter — sourced from
+	// f.listenerPrincipal at runH2 time below.
+	downstreamRemoteAddr     net.Addr
+	downstreamLocalAddr      net.Addr
+	downstreamTLSServerName  string
+	downstreamTLSPeerCertDER []byte
 }
 
 func newH2Dispatcher(f *Filter) *h2Dispatcher {
@@ -81,21 +99,29 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 		// signals "no chain" to chainDispatchAction.WriteH2.
 		notFound := &directResponseAction{status: 404, bodyText: ""}
 		return &chainDispatchAction{
-			f:             d.f,
-			action:        notFound.asRouterActionH2(),
-			req:           req,
-			routeIdx:      -1,
-			status:        404,
-			tlsPrincipals: d.tlsPrincipals,
+			f:                        d.f,
+			action:                   notFound.asRouterActionH2(),
+			req:                      req,
+			routeIdx:                 -1,
+			status:                   404,
+			tlsPrincipals:            d.tlsPrincipals,
+			downstreamRemoteAddr:     d.downstreamRemoteAddr,
+			downstreamLocalAddr:      d.downstreamLocalAddr,
+			downstreamTLSServerName:  d.downstreamTLSServerName,
+			downstreamTLSPeerCertDER: d.downstreamTLSPeerCertDER,
 		}, true
 	}
 
 	return &chainDispatchAction{
-		f:             d.f,
-		action:        entry.action.asRouterActionH2(),
-		req:           req,
-		routeIdx:      routeIdx,
-		tlsPrincipals: d.tlsPrincipals,
+		f:                        d.f,
+		action:                   entry.action.asRouterActionH2(),
+		req:                      req,
+		routeIdx:                 routeIdx,
+		tlsPrincipals:            d.tlsPrincipals,
+		downstreamRemoteAddr:     d.downstreamRemoteAddr,
+		downstreamLocalAddr:      d.downstreamLocalAddr,
+		downstreamTLSServerName:  d.downstreamTLSServerName,
+		downstreamTLSPeerCertDER: d.downstreamTLSPeerCertDER,
 	}, true
 }
 
@@ -145,6 +171,18 @@ type chainDispatchAction struct {
 	// Threaded into the per-stream chain via chain.SetTLSPrincipals before
 	// RunDecodeHeaders dispatch. Phase 16 Task 6 (ADR-0144 §Decision (iii)).
 	tlsPrincipals []string
+
+	// Phase 18.2 Task 4 (ADR-0165): the 4 per-connection state fields below
+	// thread from the parent h2Dispatcher (captured at runH2 connection-build
+	// time) into per-stream chain.SetX seeders below in WriteH2. The
+	// listener-principal is NOT captured here — it is sourced from f.listenerPrincipal
+	// directly (the same per-Filter listener value for every conn on this
+	// listener). The downstream-protocol is the H2 canonical "HTTP/2" — also
+	// not captured per-conn since it is invariant for the H2 dispatch path.
+	downstreamRemoteAddr     net.Addr
+	downstreamLocalAddr      net.Addr
+	downstreamTLSServerName  string
+	downstreamTLSPeerCertDER []byte
 }
 
 func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, sw h2.StreamWriter) error {
@@ -201,6 +239,19 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// chainDispatchAction.tlsPrincipals here; nil for plaintext / non-mTLS /
 	// no-client-cert connections.
 	chain.SetTLSPrincipals(c.tlsPrincipals)
+	// Phase 18.2 Task 4 (ADR-0165): seed the 6 per-stream callback-surface
+	// extension fields BEFORE RunDecodeHeaders dispatch — symmetric to the
+	// H1 path in connection.go. RemoteAddr/LocalAddr/SNI/PeerCertDER come
+	// from the per-connection h2Dispatcher capture in runH2 (threaded via
+	// chainDispatchAction fields). Protocol is "HTTP/2" canonical for this
+	// dispatch path. listener-principal is the per-Filter listener value
+	// pre-extracted by the listener manager.
+	chain.SetDownstreamRemoteAddr(c.downstreamRemoteAddr)
+	chain.SetDownstreamLocalAddr(c.downstreamLocalAddr)
+	chain.SetDownstreamTLSServerName(c.downstreamTLSServerName)
+	chain.SetDownstreamTLSPeerCertDER(c.downstreamTLSPeerCertDER)
+	chain.SetDownstreamProtocol("HTTP/2")
+	chain.SetListenerPrincipal(c.f.listenerPrincipal)
 	defer chain.Destroy()
 
 	// Locate the terminal router filter and inject the per-request H2

@@ -1,6 +1,7 @@
 package bandwidthlimit
 
 import (
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -578,6 +579,14 @@ func (f *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
 func (f *fakeDecoderCB) EncodeData([]byte, bool)         {}
 func (f *fakeDecoderCB) EncodeTrailers(http.Header)      {}
 func (f *fakeDecoderCB) DownstreamPrincipal() []string   { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (f *fakeDecoderCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (f *fakeDecoderCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (f *fakeDecoderCB) DownstreamTLSServerName() string  { return "" }
+func (f *fakeDecoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (f *fakeDecoderCB) DownstreamProtocol() string       { return "" }
+func (f *fakeDecoderCB) ListenerPrincipal() string        { return "" }
 
 // makeFilterWithMode constructs a *filter with the given enable_mode +
 // limit_kbps + fill_interval and a freshly-attached fakeDecoderCB. Used

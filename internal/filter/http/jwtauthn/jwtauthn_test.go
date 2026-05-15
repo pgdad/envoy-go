@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -926,6 +927,14 @@ func (c *jwtFakeCB) EncodeHeaders(http.Header, bool) {}
 func (c *jwtFakeCB) EncodeData([]byte, bool)         {}
 func (c *jwtFakeCB) EncodeTrailers(http.Header)      {}
 func (c *jwtFakeCB) DownstreamPrincipal() []string   { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (c *jwtFakeCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *jwtFakeCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *jwtFakeCB) DownstreamTLSServerName() string  { return "" }
+func (c *jwtFakeCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *jwtFakeCB) DownstreamProtocol() string       { return "" }
+func (c *jwtFakeCB) ListenerPrincipal() string        { return "" }
 
 // newFilterWithListenerRC wires a *filter against the supplied listener-level
 // *compiledConfig + per-route *compiledPerRoute + fresh jwtFakeCB. Used by

@@ -1,14 +1,19 @@
 package extauthz
 
-// attributes.go — HTTP-mode AuthorizationRequest builder + StringMatcher machinery.
+// attributes.go — HTTP-mode AuthorizationRequest builder + gRPC-mode AttributeContext
+// builder + StringMatcher machinery.
 //
 // This file lands:
 //   - stringMatcherList type (moved here from the placeholder in extauthz.go)
 //   - compileStringMatcherList: ListStringMatcher → *stringMatcherList (error)
-//   - buildAuthRequest: filter client request headers + append headers_to_add
-//   - validateMutationHeaders: validate_mutations rule set (authored here, consumed Task 5)
+//   - buildAuthRequest: filter client request headers + append headers_to_add (18.1)
+//   - validateMutationHeaders: validate_mutations rule set (authored here, consumed Task 5 of 18.1)
+//   - buildAttributeContext: pure-function gRPC-mode AttributeContext builder (18.2 Task 5)
+//   - 5 helpers (addressFromNetAddr / lowercaseHeaderMap / firstOrEmpty /
+//     bodyStringIfNotBytes / bodyBytesIfBytes) consumed by buildAttributeContext
 //
-// ADR anchor: ADR-0160 (HTTP-mode portion).
+// ADR anchor: ADR-0160 (HTTP-mode portion lands at phase-18.1 Task 4;
+// gRPC-mode portion lands at phase-18.2 Task 5).
 //
 // Design: The stringMatcherList type is defined here alongside its constructor
 // compileStringMatcherList and its matchAny method, because all three are
@@ -48,11 +53,16 @@ package extauthz
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ---------------------------------------------------------------------------
@@ -432,4 +442,261 @@ func isTokenChar(c byte) bool {
 		return false
 	}
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// buildAttributeContext — gRPC-mode AttributeContext builder (ADR-0160 gRPC-mode
+// portion; SPEC §6.6; phase-18.2 Task 5).
+// ---------------------------------------------------------------------------
+//
+// Pure function of *authRequest + four boolean gates per SPEC §6.6 + the
+// AMENDMENT (ADR-0165 / Amendment date 2026-05-15). NO DecoderFilterCallbacks
+// parameter — all per-stream state is read from the extended *authRequest;
+// the 6-method DecoderFilterCallbacks extension per ADR-0165 is consumed at
+// the dispatchOutboundCheck seeding site (Task 8), NOT here.
+//
+// Populated set faithfully reproduces the §11.P4 RATIFIED in-session SPEC scrape:
+//
+//   - source = Peer{Address: socket_address from req.remoteAddr,
+//     Principal: first-of(req.downstreamPrincipal)}
+//   - destination = Peer{Address: socket_address from req.localAddr,
+//     Principal: req.listenerPrincipal (AUTOMATIC)}
+//   - request.http = AttributeContext_HttpRequest{Id, Method, Headers (lowercased map;
+//     pseudo-headers + HCM-injected x-forwarded-proto / x-request-id /
+//     x-envoy-auth-partial-body INCLUDED), Path, Host, Scheme,
+//     Size, Protocol, Body | RawBody (per pack_as_bytes)}
+//   - request.time = Timestamp from req.streamStartTime (or time.Now() if zero)
+//   - tls_session.sni — populated IFF includeTlsSession AND req.tlsServerName != ""
+//     (the conditional gate per §11.P4); ONLY sni populated.
+//   - source.certificate — populated IFF includePeerCert AND len(req.peerCertDER) > 0
+//     (the conditional gate per parent §5.P3).
+//   - encode_raw_headers — D6 in-this-task DEFERRED for MVP: when true, the
+//     header_map field is NOT populated (no-op); the legacy headers map suffices
+//     for fixture 0021's byte-equivalence assertion per §11.P4 + SPEC §12 item 6.
+//   - context_extensions = req.perRouteContextExtensions (empty for MVP-no-per-route
+//     per SPEC §5; Task 7 wires the merge).
+//   - metadata_context = empty *core.Metadata (NOT nil — the §11.P4 in-session
+//     scrape shows `metadataContext: {}` rendered).
+//   - route_metadata_context = empty *core.Metadata (NOT nil — same as above).
+//
+// Returns a freshly-allocated *authv3.AttributeContext suitable for shipping
+// in a *authv3.CheckRequest.
+func buildAttributeContext(
+	req *authRequest,
+	encodeRawHeaders bool,
+	packAsBytes bool,
+	includePeerCert bool,
+	includeTlsSession bool,
+) *authv3.AttributeContext {
+	// Step 1: source = Peer{address, principal}. Principal sourced from the
+	// ADR-0144 DownstreamPrincipal() join-list — first element (or "") per
+	// SPEC §6.6 step 1 + parent §5.P3.
+	source := &authv3.AttributeContext_Peer{
+		Address:   addressFromNetAddr(req.remoteAddr),
+		Principal: firstOrEmpty(req.downstreamPrincipal),
+	}
+
+	// Step 2: destination = Peer{address, principal}. Listener-principal
+	// populated AUTOMATICALLY (NOT gated by include_peer_certificate) per
+	// §11.P4 in-session SPEC scrape — see the "destination.principal populates
+	// AUTOMATICALLY from the listener TLS cert" finding.
+	destination := &authv3.AttributeContext_Peer{
+		Address:   addressFromNetAddr(req.localAddr),
+		Principal: req.listenerPrincipal,
+	}
+
+	// Step 3: request.http — pseudo-headers + HCM-injected headers INCLUDED in
+	// the lowercased headers map per §11.P4. The :authority / :scheme pseudo-
+	// header values are also surfaced separately on Host / Scheme (proto
+	// convention — these duplicate the headers-map entries).
+	httpReq := &authv3.AttributeContext_HttpRequest{
+		Id:       req.requestID,
+		Method:   req.method,
+		Headers:  lowercaseHeaderMap(req.headers),
+		Path:     req.path,
+		Host:     req.headers.Get(":authority"),
+		Scheme:   req.headers.Get(":scheme"),
+		Size:     int64(len(req.body)),
+		Protocol: req.protocol,
+		Body:     bodyStringIfNotBytes(req.body, packAsBytes),
+		RawBody:  bodyBytesIfBytes(req.body, packAsBytes),
+	}
+
+	// Step 7: encode_raw_headers — DEFERRED for MVP per SPEC §6.6 step 7 + §8
+	// item 8. When the flag is true the proto's header_map field MAY be populated
+	// in lieu of (or in addition to) the legacy headers map. The 18.2 IMPL keeps
+	// the legacy headers map and leaves header_map nil — the §11.P4 RATIFIED
+	// scrape shows reference Envoy populates the legacy headers map by default,
+	// and fixture 0021's byte-equivalence assertion is satisfied by that map. The
+	// flag PARSES (config-side) but produces no AttributeContext difference.
+	_ = encodeRawHeaders // flag honored as no-op for MVP per §8 item 8
+
+	// Step 4: request.time — timestamppb.New(req.streamStartTime), or
+	// timestamppb.Now() when streamStartTime is the zero value (SPEC §6.6
+	// step 4 IMPL settles for the zero-value fallback). The Group 12 tests
+	// assert non-zero AsTime() output, which both arms satisfy.
+	t := req.streamStartTime
+	if t.IsZero() {
+		t = time.Now()
+	}
+
+	request := &authv3.AttributeContext_Request{
+		Time: timestamppb.New(t),
+		Http: httpReq,
+	}
+
+	// Step 9: metadata_context + route_metadata_context populated as EMPTY
+	// proto messages (NOT nil pointers) per §11.P4 in-session evidence
+	// ("`metadataContext` + `routeMetadataContext` render as empty objects `{}`
+	// even with no fields set"). Deferred dynamic-metadata family per SPEC §8
+	// item 1 — the empty-message shape is the forward-compat placeholder.
+	ac := &authv3.AttributeContext{
+		Source:               source,
+		Destination:          destination,
+		Request:              request,
+		MetadataContext:      &corev3.Metadata{},
+		RouteMetadataContext: &corev3.Metadata{},
+		// Step 8: context_extensions — req.perRouteContextExtensions merged at
+		// resolve time (empty for MVP-no-per-route per SPEC §5; Task 7 wires it).
+		ContextExtensions: req.perRouteContextExtensions,
+	}
+
+	// Step 5: tls_session.sni — gated by includeTlsSession AND req.tlsServerName != ""
+	// per §11.P4 RATIFICATION. ONLY sni populated; other TLSSession fields
+	// (currently the proto only defines sni at v1.32.4) stay empty.
+	if includeTlsSession && req.tlsServerName != "" {
+		ac.TlsSession = &authv3.AttributeContext_TLSSession{Sni: req.tlsServerName}
+	}
+
+	// Step 6: source.certificate — gated by includePeerCert AND
+	// len(req.peerCertDER) > 0 per parent §5.P3. The proto field type is
+	// `string`; the proto docs say "the certificate contents are encoded in URL
+	// and PEM format". envoy-go MVP stores the raw DER bytes coerced to string
+	// (the IMPL settles per cost — URL+PEM encoding can be added later if a
+	// behavior delta surfaces against reference Envoy v1.37.2). The §11.P4
+	// in-session scrape did not exercise this field (curl presented no client
+	// cert), so the encoding choice is a 18.2 IMPL settle documented in the
+	// ADR-0160 gRPC-mode-portion §Consequences.
+	if includePeerCert && len(req.peerCertDER) > 0 {
+		source.Certificate = string(req.peerCertDER)
+	}
+
+	// Step 10: return.
+	return ac
+}
+
+// ---------------------------------------------------------------------------
+// buildAttributeContext helpers (consumed by the function above).
+// ---------------------------------------------------------------------------
+
+// addressFromNetAddr wraps a net.Addr into a *core.Address with the
+// SocketAddress arm + PortValue port specifier. The IP and port are extracted
+// from the underlying *net.TCPAddr (the canonical type used by net.Listen +
+// (*net.TCPConn).RemoteAddr/LocalAddr).
+//
+// A nil net.Addr returns nil — the caller must accept a nil Address (proto
+// will marshal it as absence of the field). A non-TCPAddr type returns a
+// best-effort Address parsed via SplitHostPort.
+//
+// The address string uses IP.String() to handle IPv4 / IPv6 formatting per
+// the net.IP convention (IPv4 → dotted-quad; IPv6 → bracketed-form NOT applied
+// at the SocketAddress.address level — Envoy's proto convention is bare IP,
+// no brackets).
+func addressFromNetAddr(a net.Addr) *corev3.Address {
+	if a == nil {
+		return nil
+	}
+	var ip string
+	var port uint32
+	switch v := a.(type) {
+	case *net.TCPAddr:
+		if v.IP != nil {
+			ip = v.IP.String()
+		}
+		port = uint32(v.Port)
+	default:
+		// Best-effort: SplitHostPort on the canonical "host:port" string form.
+		// Unparseable addresses produce an empty IP + zero port.
+		h, p, err := net.SplitHostPort(a.String())
+		if err == nil {
+			ip = h
+			var pn int
+			if _, err := fmt.Sscanf(p, "%d", &pn); err == nil {
+				port = uint32(pn)
+			}
+		}
+	}
+	return &corev3.Address{
+		Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address: ip,
+				PortSpecifier: &corev3.SocketAddress_PortValue{
+					PortValue: port,
+				},
+			},
+		},
+	}
+}
+
+// lowercaseHeaderMap converts an http.Header (canonicalized keys) into a
+// map[string]string with lowercased keys, joining multi-value headers with
+// "," per the §11.P4 reference Envoy convention (the in-session scrape shows
+// single-value rendering — Envoy's internal lowercase + comma-join discipline
+// for the AttributeContext.request.http.headers map).
+//
+// HTTP/2 pseudo-headers (:authority, :method, :path, :scheme) are INCLUDED
+// (NOT skipped — unlike HTTP-mode buildAuthRequest, which strips them because
+// net/http rejects ":"-prefixed names; the gRPC-mode AttributeContext.headers
+// map is a proto map and accepts pseudo-headers verbatim per §11.P4).
+//
+// A nil input returns an empty (non-nil) map — the proto map field is then
+// marshaled as `{}` rather than absent, matching the reference Envoy shape.
+func lowercaseHeaderMap(h http.Header) map[string]string {
+	out := make(map[string]string, len(h))
+	for k, vs := range h {
+		lk := strings.ToLower(k)
+		if len(vs) == 0 {
+			out[lk] = ""
+			continue
+		}
+		if len(vs) == 1 {
+			out[lk] = vs[0]
+			continue
+		}
+		// Multi-value join with "," per reference Envoy v1.37.2 internal
+		// lowercase+comma-join discipline (HTTP semantics: equivalent to a
+		// single value containing the joined string).
+		out[lk] = strings.Join(vs, ",")
+	}
+	return out
+}
+
+// firstOrEmpty returns the first element of a string slice, or "" when the
+// slice is empty or nil. Used to extract the source.principal from the
+// req.downstreamPrincipal (ADR-0144) joined-string slice per SPEC §6.6 step 1.
+func firstOrEmpty(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	return ss[0]
+}
+
+// bodyStringIfNotBytes returns string(body) when !packAsBytes, else "".
+// Used to populate AttributeContext.request.http.Body (string-arm of the
+// body/raw_body pair per SPEC §6.6 step 3 + ADR-0162 pack_as_bytes
+// gRPC-mode differentiator).
+func bodyStringIfNotBytes(body []byte, packAsBytes bool) string {
+	if packAsBytes {
+		return ""
+	}
+	return string(body)
+}
+
+// bodyBytesIfBytes returns body when packAsBytes, else nil.
+// Used to populate AttributeContext.request.http.RawBody (bytes-arm).
+func bodyBytesIfBytes(body []byte, packAsBytes bool) []byte {
+	if !packAsBytes {
+		return nil
+	}
+	return body
 }

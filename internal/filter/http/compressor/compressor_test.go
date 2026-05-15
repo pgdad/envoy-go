@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -1097,6 +1098,14 @@ func (c *fakeCallbacks) EncodeHeaders(http.Header, bool) {}
 func (c *fakeCallbacks) EncodeData([]byte, bool)         {}
 func (c *fakeCallbacks) EncodeTrailers(http.Header)      {}
 func (c *fakeCallbacks) DownstreamPrincipal() []string   { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (c *fakeCallbacks) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *fakeCallbacks) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *fakeCallbacks) DownstreamTLSServerName() string  { return "" }
+func (c *fakeCallbacks) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *fakeCallbacks) DownstreamProtocol() string       { return "" }
+func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
 
 // OverwriteBody captures b (defensive copy — the EncodeData implementation
 // passes buf.Bytes() which aliases its bytes.Buffer's internal slice; capturing

@@ -1,6 +1,7 @@
 package buffer
 
 import (
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -313,6 +314,14 @@ func (c *fakeCallbacks) EncodeHeaders(_ http.Header, _ bool) {}
 func (c *fakeCallbacks) EncodeData(_ []byte, _ bool)         {}
 func (c *fakeCallbacks) EncodeTrailers(_ http.Header)        {}
 func (c *fakeCallbacks) DownstreamPrincipal() []string       { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (c *fakeCallbacks) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *fakeCallbacks) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *fakeCallbacks) DownstreamTLSServerName() string  { return "" }
+func (c *fakeCallbacks) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *fakeCallbacks) DownstreamProtocol() string       { return "" }
+func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
 
 // newBuffer constructs a []byte body chunk for DecodeData tests. nil → empty body (§11.11).
 func newBuffer(b []byte) []byte {

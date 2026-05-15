@@ -1,0 +1,218 @@
+# envoy-go bootstrap for fixture 0021-http-ext-authz-grpc.
+#
+# Functionally equivalent to envoy.yaml modulo:
+#   - cluster type: STATIC (envoy-go convention per ADR-0002) vs STRICT_DNS (reference Envoy).
+#   - cluster endpoint addresses: 127.0.0.1 (envoy-go runs on the host loopback)
+#     vs host.docker.internal (reference Envoy runs in a Docker container).
+#   - admin/listener ports independently allocated by the runner per proxy.
+#   - no dns_lookup_family (STATIC clusters do not DNS-resolve).
+#
+# Three-listener plaintext topology per SPEC §7.2 + planner-time decision D10:
+#
+#   l_test_a (port {{.LATestPort}}) — scenarios 1+2+5+6+7+8.
+#     failure_mode_allow: false (default). Live c_authz_grpc auth cluster.
+#     with_request_body for S5; per-route disabled (/disabled) for S6;
+#     per-route context_extensions (/ctx) for S7.
+#
+#   l_test_b (port {{.LBTestPort}}) — scenario 3.
+#     failure_mode_allow: false; status_on_error: ServiceUnavailable (503).
+#     Driver stops auth server → gRPC dial fails → 503.
+#
+#   l_test_c (port {{.LCTestPort}}) — scenario 4.
+#     failure_mode_allow: true; failure_mode_allow_header_add: true.
+#     Driver stops auth server → gRPC dial fails → request proceeds + marker header.
+#
+# Subject listener ports are runner-allocated at SubjectConfig time:
+#   LA = subjListenerPort, LB = subjListenerPort+1, LC = subjListenerPort+2.
+#
+# Templating: rendered by the driver's mustRender() at SubjectConfig time.
+# Substitution keys (note: NO BackendHost — envoy-go always uses 127.0.0.1 for
+# STATIC clusters; AuthHost stays in the schema since the driver passes it for
+# both proxies symmetrically, but the rendered value is always 127.0.0.1):
+#   {{.AdminPort}}    — admin endpoint port (runner-allocated).
+#   {{.LATestPort}}   — l_test_a listener port (runner-allocated).
+#   {{.LBTestPort}}   — l_test_b listener port (runner-allocated).
+#   {{.LCTestPort}}   — l_test_c listener port (runner-allocated).
+#   {{.BackendPort}}  — echobackend port (runner-allocated).
+#   {{.AuthHost}}     — live gRPC auth server host (127.0.0.1 for envoy-go).
+#   {{.AuthPort}}     — live gRPC auth server port (driver-allocated; pre-bound).
+#
+# Cluster c_backend:    STATIC at 127.0.0.1:<BackendPort>.
+# Cluster c_authz_grpc: STATIC at <AuthHost>:<AuthPort> with mandatory
+#                       typed_extension_protocol_options.HttpProtocolOptions
+#                       .explicit_http_config.http2_protocol_options: {} for
+#                       gRPC framing per SPEC §11.P13 + §6.5.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    # === l_test_a — failure_mode_allow:false + live gRPC auth (c_authz_grpc) ===
+    # Scenarios 1 (gRPC allow), 2 (gRPC deny), 5 (with_request_body),
+    # 6 (per-route disabled), 7 (per-route context_extensions), 8 (OkHttpResponse mutation).
+    - name: l_test_a
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LATestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_a
+                route_config:
+                  name: rc_test_a
+                  virtual_hosts:
+                    - name: vh_test_a
+                      domains: ["*"]
+                      routes:
+                        # Scenario 1: gRPC allow — auth returns OK + OkHttpResponse{}.
+                        - match: { path: "/scenario1" }
+                          route: { cluster: c_backend }
+                        # Scenario 2: gRPC deny — auth returns PERMISSION_DENIED +
+                        # DeniedResponse{403, body, headers}. Body + headers applied verbatim.
+                        - match: { path: "/scenario2" }
+                          route: { cluster: c_backend }
+                        # Scenario 5: with_request_body POST — listener-level with_request_body
+                        # active; the filter buffers the body and attaches it to
+                        # AttributeContext.request.http.body before invoking the auth Check.
+                        - match: { path: "/scenario5" }
+                          route: { cluster: c_backend }
+                        # Scenario 6: per-route disabled — ExtAuthzPerRoute{disabled: true}.
+                        # No auth call; no ext_authz counter increments.
+                        - match: { path: "/disabled" }
+                          route: { cluster: c_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        # Scenario 7: per-route check_settings.context_extensions — populates
+                        # AttributeContext.context_extensions["policy"] = "scenario7"; auth
+                        # /ctx script echoes the policy back via x-authz-policy upstream header.
+                        - match: { path: "/ctx" }
+                          route: { cluster: c_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  policy: scenario7
+                        # Scenario 8: OkHttpResponse upstream mutation — 4 header mutations +
+                        # headers_to_remove. Echo backend reflects upstream-arrival headers.
+                        - match: { path: "/scenario8" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      with_request_body:
+                        max_request_bytes: 8192
+                        allow_partial_message: true
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: c_authz_grpc
+                        timeout: 10s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_b — failure_mode_allow:false + status_on_error:503 + auth-down at request time ===
+    # Scenario 3: driver stops auth server → gRPC dial fails → 503.
+    - name: l_test_b
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LBTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_b
+                route_config:
+                  name: rc_test_b
+                  virtual_hosts:
+                    - name: vh_test_b
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/scenario3" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      status_on_error:
+                        code: ServiceUnavailable
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: c_authz_grpc
+                        timeout: 10s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_c — failure_mode_allow:true + failure_mode_allow_header_add:true ===
+    # Scenario 4: driver stops auth server → gRPC dial fails → allowed through + marker.
+    - name: l_test_c
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LCTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_c
+                route_config:
+                  name: rc_test_c
+                  virtual_hosts:
+                    - name: vh_test_c
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/scenario4" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      failure_mode_allow: true
+                      failure_mode_allow_header_add: true
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: c_authz_grpc
+                        timeout: 10s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # c_backend: echobackend subprocess on host loopback.
+    - name: c_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }
+    # c_authz_grpc: in-process gRPC Authorization/Check server on host loopback.
+    # MANDATORY http2_protocol_options: {} for gRPC framing per SPEC §11.P13 + §6.5
+    # (UseH2() == true PARSE-REJECT gate). Plaintext h2c — no TLS in phase 18.2
+    # fixtures (§7.2 known testing gap).
+    - name: c_authz_grpc
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: c_authz_grpc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.AuthHost}}, port_value: {{.AuthPort}} }

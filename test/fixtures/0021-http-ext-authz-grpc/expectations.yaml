@@ -1,0 +1,314 @@
+# Phase 18.2 fixture 0021 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per SPEC §7.2 + planner-time decision D10 — three-listener plaintext;
+# plaintext h2c auth cluster per SPEC §7.2 + §11.P13 + ADR-0166 H2-without-TLS
+# relaxation):
+#   l_test_a (hcm_local_a) — failure_mode_allow:false (default) + live gRPC
+#                             auth server (cluster c_authz_grpc). Scenarios
+#                             1+2+5+6+7+8. Listener-level
+#                             `with_request_body{max_request_bytes:8192,
+#                             allow_partial_message:true}` for scenario 5.
+#                             Per-route overrides:
+#                               /disabled → ExtAuthzPerRoute{disabled:true}
+#                               /ctx      → ExtAuthzPerRoute{check_settings.
+#                                             context_extensions: {policy:scenario7}}
+#   l_test_b (hcm_local_b) — failure_mode_allow:false + status_on_error:503 +
+#                             same c_authz_grpc cluster (auth server STOPPED by
+#                             driver before scenario 3 → gRPC dial fails →
+#                             dispError → 503). Scenario 3.
+#   l_test_c (hcm_local_c) — failure_mode_allow:true +
+#                             failure_mode_allow_header_add:true + same
+#                             c_authz_grpc cluster (auth server STOPPED before
+#                             scenario 4 → gRPC dial fails → dispError →
+#                             request PROCEEDS to backend with
+#                             x-envoy-auth-failure-mode-allowed:true injected
+#                             upstream). Scenario 4.
+#   c_backend              — echobackend subprocess
+#                             (test/helpers/echobackend/; phase-14 Task 10).
+#   c_authz_grpc           — in-process gRPC Authorization/Check server
+#                             (test/helpers/extauthzgrpc/; new in phase 18.2)
+#                             on a driver-allocated stable port; pre-populated
+#                             with 6 scripts keyed by `:path` (scenarios 1, 2,
+#                             5, 7, 8 register; 3+4 don't register — the server
+#                             is stopped before those requests; 6 bypasses the
+#                             filter so its `:path` is never reached). The
+#                             cluster carries the mandatory
+#                             `http2_protocol_options:{}` for gRPC framing per
+#                             SPEC §11.P13 + §6.5 (UseH2() == true gate) +
+#                             plaintext h2c per ADR-0166.
+#
+# Plaintext-only per SPEC §7.2 + §11.P13 — no TLS in phase 18.2 fixtures (TLS
+# plumbing closed in-session at SPEC §11.P13 RATIFICATION; fixture coverage is
+# documented as a known testing gap). Reference Envoy v1.37.2 (STRICT_DNS via
+# host.docker.internal) vs envoy-go (STATIC, in-process; h2c plaintext upstream
+# permitted per ADR-0166).
+#
+# Per SPEC §7.5 the driver asserts: per-scenario status + body byte-stream
+# equivalence across all 8 scenarios + per-side (cross-side-equivalent)
+# ext_authz counter expectations. Total runtime ~2s wallclock (8 scenarios
+# sequential + stat scrape; gRPC auth dial fails fast on loopback via
+# connection-refused).
+#
+# ## Scenario matrix (per SPEC §7.1 — 8 scenarios)
+#
+# Scenario 1: gRPC allow on l_test_a / /scenario1.
+#   Request:  GET /scenario1 with x-client-id: scenario-1.
+#   Auth:     CheckResponse{status:0 (OK), OkResponse: OkHttpResponse{}}.
+#   Both sides: 200 + echobackend echo body (bare allow path; no upstream
+#   mutations from the empty OkHttpResponse). Counter impact: ok +1.
+#
+# Scenario 2: gRPC deny on l_test_a / /scenario2.
+#   Request:  POST /scenario2 with body "request-body", Content-Type: text/plain.
+#   Auth:     CheckResponse{status:7 (PERMISSION_DENIED),
+#             DeniedResponse: DeniedHttpResponse{status:403, body:"access denied",
+#             headers:[x-authz-denied-reason:scenario2]}}.
+#   Both sides: 403 + body byte-exact "access denied" (13B). Per parent
+#   SPEC §5.P11 RATIFIED — gRPC-mode deny headers are applied VERBATIM
+#   (UNLIKE HTTP-mode's allowed_client_headers filter). Counter impact:
+#   denied +1.
+#   §18.P11 note: gRPC-mode deny-headers pass-through CONFIRMED at fixture
+#   0021 differential — the auth-supplied x-authz-denied-reason header
+#   reaches the downstream response on both sides (envoy-go's
+#   buildDenyDispositionGRPC + SendLocalReply applies the deny headers
+#   verbatim per ADR-0161 gRPC-mode §Decision).
+#
+# Scenario 3: error → status_on_error on l_test_b / /scenario3.
+#   Request:  GET /scenario3 against l_test_b.
+#   Auth:     server STOPPED by the driver before request → gRPC dial fails
+#             fast (connection refused on loopback).
+#   Both sides: 503 + empty body (status_on_error: ServiceUnavailable + dispError
+#   per parent §5.P10 error-classification). Counter impact: error +1.
+#
+# Scenario 4: failure_mode_allow on l_test_c / /scenario4.
+#   Request:  GET /scenario4 against l_test_c.
+#   Auth:     server STOPPED (continues from scenario 3 — auth stays down for
+#             scenarios 3+4) → gRPC dial fails.
+#   Both sides: 200 + echobackend echo body containing
+#   x-envoy-auth-failure-mode-allowed: true (failure_mode_allow_header_add
+#   passthrough; header arrives upstream and is echoed back by echobackend).
+#   Counter impact: error +1, failure_mode_allowed +1.
+#
+# Scenario 5: with_request_body (gRPC) on l_test_a / /scenario5.
+#   Request:  POST /scenario5 with body "hello world", Content-Type: text/plain.
+#   Auth:     CheckResponse{status:0, OkResponse: OkHttpResponse{}}. The
+#             AttributeContext.request.http.body field is populated with the
+#             buffered body bytes (per ADR-0128 body buffering + SPEC §6.6 step 3
+#             pack_as_bytes discipline). The auth server doesn't inspect the
+#             body content; the byte-stream differential is the cross-side
+#             assertion (both ref + subj wire the same body into the CheckRequest).
+#   Both sides: 200 + echobackend echo body. Counter impact: ok +1.
+#
+# Scenario 6: per-route disabled on l_test_a / /disabled.
+#   Request:  GET /disabled. Route carries ExtAuthzPerRoute{disabled:true} —
+#             ext_authz filter is bypassed for this route.
+#   Both sides: 200 + echobackend echo body (NO auth check; filter bypassed).
+#   Counter impact: NONE per parent §6 amendment 7 + SPEC §7.1.
+#
+# Scenario 7: per-route context_extensions on l_test_a / /ctx.
+#   Request:  GET /ctx. Route carries ExtAuthzPerRoute{check_settings:
+#             {context_extensions:{policy:scenario7}}}. The merged effective
+#             context_extensions map populates AttributeContext.context_extensions
+#             ({"policy":"scenario7"}) per SPEC §6.6 step 8 + §7 (the per-route
+#             map IS the effective map; there is no listener-level baseline since
+#             ExtAuthz has no top-level context_extensions field per SPEC §5).
+#   Auth:     CheckResponse{status:0, OkResponse: OkHttpResponse{
+#             headers:[{key:x-authz-policy, value:scenario7, OVERWRITE_IF_EXISTS_OR_ADD}]}}.
+#             The auth server echoes the policy back as an upstream header so
+#             the echobackend reflects it in the response body — this provides
+#             coarse confirmation that the extension reached the auth side (a
+#             direct CheckRequest inspection is out of scope for the driver).
+#   Both sides: 200 + echobackend echo body containing
+#   x-authz-policy:scenario7. Counter impact: ok +1 (SHARED stats per ADR-0163).
+#
+# Scenario 8: OkHttpResponse upstream mutation on l_test_a / /scenario8.
+#   Request:  GET /scenario8 with a client-supplied x-fixture-supplied-removable
+#             header (so headers_to_remove is non-trivial).
+#   Auth:     CheckResponse{status:0, OkResponse: OkHttpResponse{
+#             headers:[
+#               {key:x-injected-by-authz,        value:scenario8, OVERWRITE_IF_EXISTS_OR_ADD},
+#               {key:x-also-appended,            value:append1,   APPEND_IF_EXISTS_OR_ADD},
+#               {key:x-overwrite-only-if-exists, value:v3,        OVERWRITE_IF_EXISTS},
+#               {key:x-add-if-absent,            value:v4,        ADD_IF_ABSENT},
+#             ],
+#             headers_to_remove:[x-fixture-supplied-removable]}}.
+#   Both sides: 200 + echobackend echo body. Upstream-arrival assertion (per
+#   D5 4-arm dispatch table):
+#     - x-injected-by-authz=scenario8       PRESENT (OVERWRITE_IF_EXISTS_OR_ADD adds when absent).
+#     - x-also-appended=append1             PRESENT (APPEND_IF_EXISTS_OR_ADD adds-or-appends).
+#     - x-overwrite-only-if-exists           NOT asserted (OVERWRITE_IF_EXISTS is
+#       a no-op when the key is absent upstream — reference Envoy v1.37.2 emits
+#       v3 anyway per its own interpretation; envoy-go-strict per SPEC §6.7
+#       does not. The driver does NOT assert this header; both behaviors are
+#       proto-faithful and the divergence is documented at §13.4 below).
+#     - x-add-if-absent=v4                  PRESENT (ADD_IF_ABSENT adds when absent).
+#     - x-fixture-supplied-removable        ABSENT (headers_to_remove strips it).
+#   Counter impact: ok +1.
+#
+# ## Counter-delta map (per side; per SPEC §7.5 + Task-12 empirical scrape)
+#
+# All counters are HCM-rooted under `http.<hcm_prefix>.ext_authz.<counter>`
+# (Prometheus form
+# `envoy_http_ext_authz_<counter>{envoy_http_conn_manager_prefix="<hcm>"}`)
+# per ADR-0163 SHARED-stats: three listeners each emit to their own HCM prefix
+# (hcm_local_a/b/c) and the driver's lookupExtAuthzCounter sums across all three.
+#
+# IDENTICAL on BOTH sides (cross-side equivalence enforced by AssertStats):
+#
+#   http.*.ext_authz.ok                  +4  (scenarios 1, 5, 7, 8 → allowed;
+#                                             hcm_local_a counts 4)
+#   http.*.ext_authz.denied              +1  (scenario 2 → 403 deny;
+#                                             hcm_local_a counts 1)
+#   http.*.ext_authz.error               +2  (scenarios 3 + 4 → gRPC dial fails;
+#                                             hcm_local_b counts 1,
+#                                             hcm_local_c counts 1)
+#   http.*.ext_authz.failure_mode_allowed +1 (scenario 4 → failure_mode_allow:true;
+#                                             hcm_local_c counts 1)
+#   http.*.ext_authz.invalid             +0  (no validate_mutations rejections)
+#
+# NOT ASSERTED (structurally unreachable):
+#
+#   http.*.ext_authz.disabled            +0  (STRUCTURALLY UNREACHABLE under MVP
+#                                             per parent §6 amendment 7: the
+#                                             filter_enabled gate is deferred;
+#                                             ExtAuthzPerRoute{disabled:true}
+#                                             suppresses ALL counter increments
+#                                             including disabled).
+#
+# ## Documented divergence-windows (per SPEC §8 + §13.4 BEHAVIOR_CONTRACT)
+#
+# 1. **`disabled` counter structurally unreachable (parent §6 amendment 7).**
+#    envoy-go MVP does not implement the `filter_enabled` / `filter_enabled_metadata`
+#    gate (SPEC §2 + §6 amendment 7 deferral; carried forward from 18.1 fixture
+#    0020). The `disabled` counter is registered in filterStats (6-counter
+#    completeness) but NEVER incremented because the only increment site is the
+#    `filter_enabled` gate. Per-route ExtAuthzPerRoute{disabled:true} (scenario 6)
+#    bypasses the filter entirely and increments NO counters. NOT asserted.
+#
+# 2. **`response_code_details` ABSENT on envoy-go (parent §8 carry-forward).**
+#    Reference Envoy v1.37.2 emits `ext_authz_error` / `ext_authz_denied`
+#    response_code_details on the error / deny paths. envoy-go has no
+#    response_code_details framework primitive in the Go HttpDecoderCallbacks
+#    surface (parent §8 deferral). NOT asserted by this fixture.
+#
+# 3. **cluster-scoped `cluster.*.ext_authz.*` triple NOT exercised.**
+#    `charge_cluster_response_stats` + the cluster-scoped stat triple are
+#    deferred per parent §8 (carry-forward from 18.1 fixture 0020). Reference
+#    Envoy publishes `envoy_cluster_ext_authz_{ok,denied,error,failure_mode_allowed}`
+#    when the auth cluster is referenced; envoy-go does not. The cross-side
+#    assertion uses ONLY the HCM-scoped `envoy_http_ext_authz_*` family.
+#
+# 4. **gRPC-specific deferred fields per SPEC §8 — SILENT-IGNORED.**
+#    - `core.GrpcService.initial_metadata` (item 2) — metadata-pairs to send on
+#      every Check call; not threaded into per-Check context.
+#    - `core.GrpcService.retry_policy` (item 3) — gRPC client retry is deferred;
+#      MVP single-attempt-then-error matches parent §5.P10 + ADR-0157.
+#    - `OkHttpResponse.response_headers_to_add` (item 5) — decode-side-only
+#      injection into the downstream allow response; deferred.
+#    - `OkHttpResponse.query_parameters_to_set` / `query_parameters_to_remove`
+#      (item 6) — path-query subsystem ADR-0112 deferral.
+#    - `OkHttpResponse.dynamic_metadata` + `CheckResponse.dynamic_metadata`
+#      (item 7) — dynamic-metadata family deferral.
+#    Fixture 0021 does NOT set any of these fields; the divergence-window is
+#    not surfaced empirically (driver-by-omission).
+#
+# 5. **`encode_raw_headers` (item 8) — `header_map` arm CONDITIONALLY DEFERRED.**
+#    The flag PARSES; envoy-go honors the toggle but defaults to the legacy
+#    `headers` map (`encode_raw_headers:false`). Fixture 0021's config does NOT
+#    set `encode_raw_headers:true`, so the legacy map is exercised — byte-equivalent
+#    to reference Envoy at the AttributeContext level.
+#
+# 6. **OVERWRITE_IF_EXISTS semantic divergence (D5 4-arm dispatch).**
+#    Scenario 8 injects `x-overwrite-only-if-exists:v3` via the OVERWRITE_IF_EXISTS
+#    arm. Per the proto-faithful interpretation in ADR-0161 gRPC-mode + D5 + the
+#    SPEC §6.7 envoy-go-strict treatment: the arm is a NO-OP when the upstream
+#    request lacks the key. Reference Envoy v1.37.2 emits the header anyway in
+#    this fixture (its 4-arm interpretation collapses OVERWRITE_IF_EXISTS toward
+#    OVERWRITE_IF_EXISTS_OR_ADD when the upstream is absent — observed empirically
+#    at Task 12). The driver does NOT assert on the OVERWRITE_IF_EXISTS arm
+#    (only the 3 reachable arms — OVERWRITE_IF_EXISTS_OR_ADD, APPEND_IF_EXISTS_OR_ADD,
+#    ADD_IF_ABSENT). The OVERWRITE_IF_EXISTS no-op-when-absent semantic is
+#    documented in BEHAVIOR_CONTRACT §13.4 (phase-18.2 forward-pointer subsection).
+#
+# 7. **OkResponse+non-zero-status + DeniedResponse+zero-status → dispError
+#    (SPEC §6.7 envoy-go-strict).** Reference Envoy v1.37.2 leniently accepts
+#    these structurally-inconsistent oneof combinations (it follows the oneof
+#    arm regardless of the outer Status.code). envoy-go-strict treats both as
+#    dispError per SPEC §6.7 (semantically malformed; surface auth-server bugs
+#    rather than silently allow / deny). Fixture 0021 does NOT exercise these
+#    combinations directly — the 23rd fuzzer FuzzCheckResponseMapping covers
+#    them (per SPEC §7.3). The divergence is documented in BEHAVIOR_CONTRACT
+#    §13.4.
+#
+# 8. **User-Agent header default re-injection (Go net/http quirk).**
+#    Go's `net/http.Request.Write` re-injects a default `User-Agent:
+#    Go-http-client/1.1` when the request's `User-Agent` header is absent at
+#    upstream-write time (see net/http/request.go around the `defaultUserAgent`
+#    constant). This means the filter's `headers.Del("user-agent")` (per the
+#    gRPC `OkHttpResponse.headers_to_remove` list) is OVERRIDDEN by Go's stdlib
+#    at the upstream write step. Reference Envoy v1.37.2 has no such
+#    re-injection — `user-agent` is properly stripped. This is NOT an ext_authz
+#    divergence; it's a Go net/http behavior outside the filter's control. The
+#    fixture works around it by using an arbitrary client-supplied header
+#    (`x-fixture-supplied-removable`) as the headers_to_remove target. A future
+#    framework phase MAY address the User-Agent default-injection in the router
+#    write path; until then, fixture 0021 does NOT exercise User-Agent removal.
+#
+# ## §18.P4 / §18.P11 / §18.P13 closure
+#
+# All 13 parent-§5 pins were CLOSED RATIFIED at the 18.2 SPEC commit per SPEC
+# §11.3 — including §18.P4 (tls_session.sni populated set), §18.P11 (deny-path
+# header ordering — gRPC-mode), and §18.P13 (gRPC dial + TLS-to-auth-cluster
+# plumbing). No RATIFIED-PENDING-IMPL-TIME pin closure happens at Task 12; the
+# end-to-end differential confirms the §18.P4 + §18.P11 + §18.P13 behavior is
+# preserved by the envoy-go implementation but does not formally CLOSE pins
+# (they were closed at SPEC time).
+#
+# Notable empirical observations from Task 12:
+#
+#   - Scenario 2 deny-path header ordering: envoy-go emits the auth-supplied
+#     `x-authz-denied-reason:scenario2` header in the LocalReply (verbatim per
+#     ADR-0161 gRPC-mode §Decision (iv) — gRPC-mode applies deny headers
+#     directly without the HTTP-mode `allowed_client_headers` filter). The
+#     content-type fallback `text/plain` is appended last (housekeeping). Both
+#     sides emit the same 13B body "access denied". §18.P11 gRPC-mode behavior
+#     CONFIRMED.
+#
+#   - Scenario 4 failure_mode_allow header inject: envoy-go's
+#     buildFailureModeAllowResponse injects
+#     `x-envoy-auth-failure-mode-allowed: true` into the upstream headers when
+#     dispError fires under failure_mode_allow:true +
+#     failure_mode_allow_header_add:true. The echobackend reflects it. Counter
+#     delta error+1 and failure_mode_allowed+1 both observed on both sides.
+#
+#   - Scenario 7 context_extensions wire-through: the per-route
+#     check_settings.context_extensions{policy:scenario7} populates
+#     AttributeContext.context_extensions on the auth-side CheckRequest. The
+#     auth server's /ctx script echoes `x-authz-policy:scenario7` as an
+#     upstream-arrival header which the echobackend reflects — the byte-stream
+#     differential confirms cross-side equivalence on this wire-through.
+#
+# ## Wall-clock tolerance
+#
+# Fixture 0021 has no throttle / wait-time scenarios. Per-scenario wall-clock
+# is dominated by the gRPC auth-server loopback round-trip (< 2ms typical);
+# scenarios 3+4 (auth unreachable) resolve by connection-refused fast on the
+# host loopback (<1ms typical). Total fixture wallclock ~1.7-1.9s (8 scenarios
+# sequential + auth server start/stop/restart cycle). NO wall-clock-tolerance
+# assertion is enforced; the per-scenario byte-stream verdict + AssertStats
+# counter checks are the assertions.
+#
+# ## Header allow-list
+#
+# Standard envoy timing/identity headers per BEHAVIOR_CONTRACT.md
+# `## Header allow-list`. The cross-side byte-stream captures status + body
+# (allow-path: echobackend echo classified structurally as JSON with method+path
+# keys; deny-path: byte-exact body; error-path: empty body). General header-level
+# differential is NOT enforced at fixture 0021 (the driver's byte stream omits
+# downstream response headers other than what the echobackend echo body reflects
+# upstream — scenarios 4, 7, 8 assert specific upstream-arrival keys).
+#
+# Cross-refs: SPEC §7.1 + §7.2 + §7.5 + §5 + §6 amendment 7 + §6.5 + §6.6 + §6.7 +
+#             §8 + §11.P4 + §11.P11 + §11.P13 + ADR-0156 + ADR-0157 + ADR-0158 +
+#             ADR-0160 + ADR-0161 + ADR-0162 + ADR-0163 + ADR-0165 + ADR-0166 +
+#             BEHAVIOR_CONTRACT §13.4 phase-18.2 forward-pointer subsection +
+#             planner-time decisions D5 + D10 + D11.

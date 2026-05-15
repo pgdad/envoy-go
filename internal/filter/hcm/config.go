@@ -43,9 +43,17 @@ type chainEntry struct {
 // ListenerCtx carries listener-side context the HCM filter constructor uses
 // at build time. Phase 05.1 added this for the --allow-h2c flag plumbing
 // (per ADR-0049 + ADR-0050). Future phases may extend.
+//
+// Phase 18.2 Task 4 (ADR-0165): ListenerPrincipal carries the listener TLS
+// server-cert principal pre-extracted by the listener manager from the
+// chain's *stdtls.Config.Certificates[0] leaf cert (URI SAN[0] → DNS SAN[0]
+// → Subject CN). Empty for plaintext chains. The HCM filter stores this
+// string and seeds it onto every per-stream FilterChain via
+// chain.SetListenerPrincipal in dispatchRequest / chainDispatchAction.WriteH2.
 type ListenerCtx struct {
-	HasTLS   bool
-	AllowH2C bool
+	HasTLS            bool
+	AllowH2C          bool
+	ListenerPrincipal string
 }
 
 // Filter is the per-listener HTTP connection manager. It owns the resolved
@@ -104,6 +112,16 @@ type Filter struct {
 	// at filter-instantiation time via FilterChain.SetRequestCtx + the chain's
 	// internal Resolve cache.
 	perRouteConfig *filter_http.PerRouteConfig
+
+	// listenerPrincipal is the TLS server-cert principal pre-extracted by the
+	// listener manager at chain-build time (URI SAN[0] → DNS SAN[0] → Subject
+	// CN of the chain's *stdtls.Config.Certificates[0] leaf). Empty for
+	// plaintext chains. Seeded onto every per-stream FilterChain via
+	// chain.SetListenerPrincipal in dispatchRequest (H1) and
+	// chainDispatchAction.WriteH2 (H2) before RunDecodeHeaders dispatch.
+	// Per ADR-0165 §Decision (phase-18.2 Task 4 — the ADR-0044 escape-valve
+	// firing per planner-time decision D3 + D12).
+	listenerPrincipal string
 }
 
 // downstreamStatusClassCounter returns the downstream_rq_<Nxx> counter for the
@@ -196,7 +214,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, fmt.Errorf("hcm: route_config: virtual_hosts[0]: domains: got %v, want [\"*\"]", domains)
 	}
 
-	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), httpRegistry, registry, statPrefix)
+	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), clusters, httpRegistry, registry, statPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -230,6 +248,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		dm:                dm,
 		chainConfig:       chainConfig,
 		perRouteConfig:    perRoute,
+		listenerPrincipal: lc.ListenerPrincipal,
 	}
 	// Phase 07.1 Task 15: the routeTable.bindFilter post-build wiring is
 	// REMOVED. Per Decision §3.1, the access-log emit-deferral hooks on
@@ -279,7 +298,7 @@ func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteC
 // fields gracefully (per ADR-0085 nil-tolerance pattern); registry may be
 // non-nil unconditionally — non-stat-bearing factories simply do not consume
 // it.
-func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, httpRegistry *filter_http.HTTPRegistry, registry *stats.Registry, statPrefix string) ([]chainEntry, error) {
+func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, clusters *cluster.Manager, httpRegistry *filter_http.HTTPRegistry, registry *stats.Registry, statPrefix string) ([]chainEntry, error) {
 	// Build the (name, type_url) entries for ValidateChainShape. Defensive
 	// nil-typed_config handling: the empty-string TypeURL never matches a
 	// registered factory, so the rule-#4 branch fires with a clear message.
@@ -303,7 +322,7 @@ func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, httpRegistry *filter_htt
 		if tc, ok := f.GetConfigType().(*hcmv3.HttpFilter_TypedConfig); ok {
 			tcAny = tc.TypedConfig
 		}
-		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry, Stats: registry, StatPrefix: statPrefix})
+		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry, Stats: registry, StatPrefix: statPrefix, ClusterManager: clusters})
 		if err != nil {
 			return nil, fmt.Errorf("hcm: http_filters[%d]: factory: %w", i, err)
 		}

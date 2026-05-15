@@ -16,8 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
@@ -51,14 +53,72 @@ const filterName = "envoy.filters.http.ext_authz"
 // closure. The function receives a per-request cancellable context.
 type checkFn func(ctx context.Context, req *authRequest) (checkDisposition, error)
 
-// authRequest carries the request-side-filtered inputs for the outbound auth
-// check POST (method, path-with-path_prefix, filtered headers, body).
-// Full construction lands at Task 4 (AuthorizationRequest builder).
+// authRequest carries the request-side inputs for the outbound auth check.
+//
+// HTTP-mode (18.1): the four base fields (method, path, headers, body) are the
+// request-side-filtered inputs for the POST.
+//
+// gRPC-mode (18.2): the base fields PLUS the 10 extension fields (per ADR-0160
+// gRPC-mode portion + ADR-0165) are the inputs for the *authv3.AttributeContext
+// constructed by buildAttributeContext. The 10 extension fields are populated
+// at DecodeHeaders time from the new DecoderFilterCallbacks accessors per
+// ADR-0165 (Task 8 wires the seeding via dispatchOutboundCheck — Task 5 only
+// declares the fields and authors the consumer buildAttributeContext).
+//
+// The 10 extension fields are appended unconditionally regardless of mode —
+// HTTP-mode buildAuthRequest leaves them at zero values; gRPC-mode
+// buildAttributeContext reads them. This keeps the struct mode-agnostic per
+// the ADR-0157 §Decision invariant.
 type authRequest struct {
+	// HTTP-mode + gRPC-mode shared (18.1 fields).
 	method  string
 	path    string
 	headers http.Header
 	body    []byte
+
+	// gRPC-mode extension fields (18.2 — D3 + ADR-0165 + ADR-0160 gRPC-mode portion).
+	// Populated at DecodeHeaders time from the per-stream DecoderFilterCallbacks
+	// accessors. Read by buildAttributeContext to populate the AttributeContext.
+	//
+	// remoteAddr is the downstream peer's *net.TCPAddr (or equivalent). Source of
+	// AttributeContext.source.address.socket_address per parent §5.P3 + ADR-0144.
+	remoteAddr net.Addr
+	// localAddr is the downstream-facing listener's *net.TCPAddr. Source of
+	// AttributeContext.destination.address.socket_address per §11.P4.
+	localAddr net.Addr
+	// tlsServerName is the downstream TLS ConnectionState.ServerName (SNI).
+	// Source of AttributeContext.tls_session.sni when include_tls_session=true
+	// AND non-empty (the gate per §11.P4 RATIFICATION).
+	tlsServerName string
+	// peerCertDER is the DER-encoded leaf cert of the downstream's CLIENT cert
+	// (NOT the listener cert — that is listenerPrincipal). Source of
+	// AttributeContext.source.certificate when include_peer_certificate=true
+	// AND non-empty (the gate per parent §5.P3).
+	peerCertDER []byte
+	// listenerPrincipal is the listener server-cert's URI SAN[0] / DNS SAN[0] /
+	// Subject CN, extracted at listener-build time per ADR-0165 §Decision +
+	// extractListenerPrincipal. Source of AttributeContext.destination.principal
+	// — populated AUTOMATICALLY per §11.P4 (NOT gated by include_peer_certificate).
+	listenerPrincipal string
+	// protocol is the downstream-connection protocol string ("HTTP/1.1" / "HTTP/2").
+	// Source of AttributeContext.request.http.protocol per §11.P4.
+	protocol string
+	// requestID is the value of the x-request-id header (HCM-injected per §11.P4).
+	// Source of AttributeContext.request.http.id. When absent, the IMPL leaves
+	// the field empty (no generation — HCM is the authoritative source).
+	requestID string
+	// streamStartTime is the time the stream was received. Source of
+	// AttributeContext.request.time. When zero, buildAttributeContext substitutes
+	// time.Now() per SPEC §6.6 step 4.
+	streamStartTime time.Time
+	// perRouteContextExtensions is the merged per-route CheckSettings.context_extensions
+	// map (resolved at DecodeHeaders time). Source of AttributeContext.context_extensions.
+	// Empty for MVP-no-per-route per SPEC §5; Task 7 wires the merge.
+	perRouteContextExtensions map[string]string
+	// downstreamPrincipal is the ADR-0144 DownstreamPrincipal() result (joined-string
+	// of URI SAN | DNS SAN | CN per ADR-0144). Source of AttributeContext.source.principal
+	// — buildAttributeContext takes the first element (or "" if empty) per SPEC §6.6 step 1.
+	downstreamPrincipal []string
 }
 
 // dispositionClass is the mode-agnostic three-way disposition per SPEC §6.2
@@ -78,10 +138,59 @@ const (
 	dispInvalid
 )
 
+// appendDispatch discriminates the four gRPC-mode `HeaderValueOption.append_action`
+// enum arms per ADR-0161 gRPC-mode portion (D5). Phase-18.1 HTTP-mode predates
+// this discriminator: all 18.1 `headerKV` values carry the zero value
+// (`appendDispatchDefault`) and the slice they live in (`upstreamSet` vs
+// `upstreamApp`) already encodes Set-vs-Add discipline. Phase-18.2 gRPC-mode
+// maps the 4-arm `append_action` enum onto:
+//
+//   - `APPEND_IF_EXISTS_OR_ADD`   → `upstreamApp` with `appendDispatchDefault`
+//     (Add semantics via `headers.Add`)
+//   - `OVERWRITE_IF_EXISTS_OR_ADD` → `upstreamSet` with `appendDispatchDefault`
+//     (Set semantics via `headers.Set` — 18.1 HTTP-mode default)
+//   - `OVERWRITE_IF_EXISTS`        → `upstreamSet` with `appendDispatchOverwriteOnly`
+//     (Set only when the header is already present; does NOT add)
+//   - `ADD_IF_ABSENT`              → `upstreamSet` with `appendDispatchAddIfAbsent`
+//     (Set only when the header is absent; does NOT overwrite)
+//
+// The discriminator lives on `headerKV` so `applyUpstreamMutations` can branch
+// per-entry without splitting the slice into 4 separate fields. This keeps the
+// 18.1 HTTP-mode call sites byte-identical (they emit `headerKV{name, value}`
+// literals with the zero-value action — Set/Add discipline preserved by slice).
+type appendDispatch int8
+
+// appendDispatch enum values per ADR-0161 gRPC-mode portion (D5).
+const (
+	// appendDispatchDefault is the zero value — the slice container
+	// (`upstreamSet` Set-discipline vs `upstreamApp` Add-discipline) determines
+	// behavior. All 18.1 HTTP-mode `headerKV` values use this default. gRPC-mode
+	// `APPEND_IF_EXISTS_OR_ADD` (→ `upstreamApp`) and `OVERWRITE_IF_EXISTS_OR_ADD`
+	// (→ `upstreamSet`) also use this default.
+	appendDispatchDefault appendDispatch = iota
+	// appendDispatchOverwriteOnly maps gRPC-mode `OVERWRITE_IF_EXISTS` — Set only
+	// when the header is already present in the upstream request map; does NOT
+	// add when absent. Lives in `upstreamSet`.
+	appendDispatchOverwriteOnly
+	// appendDispatchAddIfAbsent maps gRPC-mode `ADD_IF_ABSENT` — Set only when
+	// the header is absent from the upstream request map; does NOT overwrite
+	// when present. Lives in `upstreamSet`.
+	appendDispatchAddIfAbsent
+)
+
 // headerKV is a simple name/value header pair used in checkDisposition.
+//
+// `action` discriminates the gRPC-mode `HeaderValueOption.append_action`
+// 4-arm dispatch per ADR-0161 gRPC-mode portion (D5). Default zero value
+// (`appendDispatchDefault`) is honored by 18.1 HTTP-mode call sites — the
+// slice container (`upstreamSet` vs `upstreamApp`) encodes Set-vs-Add. The
+// non-default values (`appendDispatchOverwriteOnly` / `appendDispatchAddIfAbsent`)
+// apply only when the entry lives in `upstreamSet` and signal Set-IF-PRESENT
+// / Set-IF-ABSENT semantics respectively.
 type headerKV struct {
-	name  string
-	value string
+	name   string
+	value  string
+	action appendDispatch // D5 dispatch per ADR-0161 gRPC-mode portion; zero value = default
 }
 
 // checkDisposition is the mode-agnostic convergence value from a completed
@@ -91,13 +200,22 @@ type checkDisposition struct {
 	class dispositionClass // allow | deny | error
 
 	// Allow-path: headers to inject / append on the upstream request.
-	upstreamSet []headerKV // allowed_upstream_headers (overwrite/set)
-	upstreamApp []headerKV // allowed_upstream_headers_to_append (append)
+	upstreamSet []headerKV // allowed_upstream_headers (overwrite/set) + gRPC OkHttpResponse.headers (Set-discipline arms; D5)
+	upstreamApp []headerKV // allowed_upstream_headers_to_append (append) + gRPC OkHttpResponse.headers (APPEND_IF_EXISTS_OR_ADD arm)
+	// upstreamDel is the gRPC-mode `OkHttpResponse.headers_to_remove` list per
+	// ADR-0161 gRPC-mode portion. Each entry is a (lowercased) header name to
+	// be deleted from the upstream request headers via `headers.Del`. UNUSED
+	// in 18.1 HTTP-mode (the HTTP `AuthorizationResponse` proto has no
+	// equivalent field). Applied AFTER upstreamSet + upstreamApp in
+	// `applyUpstreamMutations` so the delete is the final step (Set+Add then
+	// Del = "remove unconditionally even if just set/added" — matches reference
+	// Envoy's verbatim semantics).
+	upstreamDel []string
 
 	// Deny-path: from the auth service's response.
 	denyStatus  uint32     // HTTP status from the auth response
 	denyBody    []byte     // verbatim auth response body
-	denyHeaders []headerKV // allowed_client_headers-filtered auth response headers
+	denyHeaders []headerKV // allowed_client_headers-filtered auth response headers (HTTP-mode); verbatim DeniedHttpResponse.headers (gRPC-mode per ADR-0161 §5.P11 — NO allowed_client_headers filter)
 }
 
 // bufferSettings carries the parsed with_request_body / per-route override
@@ -279,6 +397,20 @@ type filter struct {
 	// jwt_authn). This flag is the test-introspection anchor; production sees a
 	// no-op + forward-pointer to the future framework phase.
 	clearRouteCacheRequested bool
+
+	// streamStartTime is the wall-clock instant at which the stream's
+	// DecodeHeaders entry fired — the canonical anchor for
+	// AttributeContext.request.time per SPEC §11.P4 (request-arrival time, NOT
+	// the auth-call time). Captured at DecodeHeaders entry per PLAN Task 8
+	// §Step 3 (the recommended capture site — DecoderHeaders entry is the
+	// closest envoy-go-observable proxy for the request-arrival instant; the
+	// alternative dispatchOutboundCheck-time capture would systematically
+	// understate request.time when body-buffering delays the dispatch). Seeded
+	// onto the *authRequest in dispatchOutboundCheck so buildAttributeContext
+	// (Task 5 — Group 12) marshals it into AttributeContext.request.time.
+	//
+	// gRPC-mode-only consumer at 18.2 MVP; HTTP-mode 18.1 ignores the field.
+	streamStartTime time.Time
 }
 
 // Compile-time assertion: *filter implements the decoder-only filter interface
@@ -356,13 +488,16 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*compiledConfig, error) {
 	cc := &compiledConfig{}
 
-	// 1a. services oneof: nil → PARSE-REJECT; grpc_service → PARSE-REJECT.
+	// 1a. services oneof: nil → PARSE-REJECT; grpc_service → DISPATCH to
+	// buildGRPCCheckFn (Task 3 WIRE-UP per ADR-0157 §Decision AMENDMENT —
+	// activates the gRPC arm; buildGRPCCheckFn body is STUBBED at Task 3 and
+	// lands at Task 5).
 	switch svc := raw.GetServices().(type) {
 	case nil:
 		return nil, errors.New("ext_authz: services oneof must be set")
 	case *ext_authzv3.ExtAuthz_GrpcService:
+		// gRPC-mode arm — handled AFTER the structural checks below.
 		_ = svc
-		return nil, errors.New("ext_authz: grpc_service mode not yet supported (lands in phase 18.2)")
 	case *ext_authzv3.ExtAuthz_HttpService:
 		// validated below after transport_api_version + with_request_body checks
 	default:
@@ -394,14 +529,39 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 	cc.clearRouteCache = raw.GetClearRouteCache()
 	cc.validateMutations = raw.GetValidateMutations()
 
-	// 5. http_service arm → buildHTTPCheckFn (real impl Task 3; extended Task 5
-	//    to compile authorization_response matchers + accept validateMutations).
+	// 5. services oneof DISPATCH:
+	//    - *ExtAuthz_HttpService → buildHTTPCheckFn (18.1 HTTP-mode closure).
+	//    - *ExtAuthz_GrpcService → buildGRPCCheckFn (18.2 gRPC-mode closure;
+	//      ADR-0157 §Decision AMENDMENT — Task 3 WIRE-UP with a STUB body that
+	//      returns the "TODO (Task 5)" sentinel; Task 5/6 land the real body).
+	//
+	// Note: the services-oneof presence check fired at step 1a; here we
+	// re-dispatch to pick the per-arm constructor. The 18.1 PARSE-REJECT for
+	// the gRPC arm has been replaced by a real (stubbed) constructor call per
+	// the ADR-0157 §Decision AMENDMENT.
 	httpSvc := raw.GetHttpService()
-	fn, err := buildHTTPCheckFn(httpSvc, cc.validateMutations)
-	if err != nil {
-		return nil, err
+	switch s := raw.GetServices().(type) {
+	case *ext_authzv3.ExtAuthz_HttpService:
+		fn, err := buildHTTPCheckFn(httpSvc, cc.validateMutations)
+		if err != nil {
+			return nil, err
+		}
+		cc.checkFn = fn
+	case *ext_authzv3.ExtAuthz_GrpcService:
+		fn, err := buildGRPCCheckFn(
+			s.GrpcService,
+			ctx,
+			cc.validateMutations,
+			raw.GetIncludePeerCertificate(),
+			raw.GetIncludeTlsSession(),
+			raw.GetEncodeRawHeaders(),
+			packAsBytesFromWRB(cc.withRequestBody),
+		)
+		if err != nil {
+			return nil, err
+		}
+		cc.checkFn = fn
 	}
-	cc.checkFn = fn
 
 	// Pre-compile AuthorizationRequest fields from http_service at config-load time
 	// so that buildAuthRequest does not need the *HttpService proto at request time.
@@ -662,10 +822,23 @@ func baseStatPrefix(hcmStatPrefix string) string {
 // applyUpstreamMutations applies the allow-path header mutations from a
 // checkDisposition to the upstream request headers:
 //
-//  1. upstreamSet: for each headerKV, headers.Set(name, value) — overwrites any
-//     existing header with the same canonical key (allowed_upstream_headers).
+//  1. upstreamSet: per-entry dispatch on `headerKV.action` per ADR-0161
+//     gRPC-mode portion (D5):
+//     - appendDispatchDefault         → headers.Set(name, value) unconditionally
+//     (overwrite-or-add; 18.1 HTTP-mode default + gRPC OVERWRITE_IF_EXISTS_OR_ADD).
+//     - appendDispatchOverwriteOnly   → headers.Set(name, value) ONLY when the
+//     header is already present (gRPC OVERWRITE_IF_EXISTS).
+//     - appendDispatchAddIfAbsent     → headers.Set(name, value) ONLY when the
+//     header is absent (gRPC ADD_IF_ABSENT).
 //  2. upstreamApp: for each headerKV, headers.Add(name, value) — appends to any
-//     existing values for the same canonical key (allowed_upstream_headers_to_append).
+//     existing values for the same canonical key (allowed_upstream_headers_to_append
+//     + gRPC APPEND_IF_EXISTS_OR_ADD).
+//  3. upstreamDel: for each name, headers.Del(name) — removes any existing
+//     values (gRPC `OkHttpResponse.headers_to_remove` per ADR-0161 gRPC-mode
+//     portion). Applied LAST so that a header named in both `upstreamSet`/
+//     `upstreamApp` AND `upstreamDel` is deleted (matches reference Envoy's
+//     verbatim "set-then-remove" semantics — the auth service's intent is to
+//     remove the header regardless of what the client supplied).
 //
 // Set is applied before Append so that Append can stack on top of the overwritten
 // value. headers is the incoming client request header map (from DecodeHeaders)
@@ -674,13 +847,36 @@ func baseStatPrefix(hcmStatPrefix string) string {
 // Only the allow path calls this helper (disp.class == dispAllow); the deny and
 // error / invalid paths do NOT mutate the upstream headers.
 func applyUpstreamMutations(headers http.Header, disp checkDisposition) {
-	// 1. upstreamSet: overwrite (Set) per allowed_upstream_headers.
+	// 1. upstreamSet: Set-discipline with per-entry D5 dispatch.
 	for _, kv := range disp.upstreamSet {
-		headers.Set(kv.name, kv.value)
+		switch kv.action {
+		case appendDispatchOverwriteOnly:
+			// OVERWRITE_IF_EXISTS — Set only when the header is already present.
+			// We use http.Header.Values (the lowercased read accessor) to detect
+			// presence regardless of the canonical-case form used in the map key.
+			if len(headers.Values(kv.name)) > 0 {
+				headers.Set(kv.name, kv.value)
+			}
+		case appendDispatchAddIfAbsent:
+			// ADD_IF_ABSENT — Set only when the header is absent.
+			if len(headers.Values(kv.name)) == 0 {
+				headers.Set(kv.name, kv.value)
+			}
+		default:
+			// appendDispatchDefault — unconditional Set (18.1 HTTP-mode default
+			// + gRPC OVERWRITE_IF_EXISTS_OR_ADD).
+			headers.Set(kv.name, kv.value)
+		}
 	}
-	// 2. upstreamApp: append (Add) per allowed_upstream_headers_to_append.
+	// 2. upstreamApp: append (Add) per allowed_upstream_headers_to_append /
+	// gRPC APPEND_IF_EXISTS_OR_ADD.
 	for _, kv := range disp.upstreamApp {
 		headers.Add(kv.name, kv.value)
+	}
+	// 3. upstreamDel: delete (Del) per gRPC OkHttpResponse.headers_to_remove.
+	// UNUSED in 18.1 HTTP-mode (HTTP `AuthorizationResponse` has no equivalent).
+	for _, name := range disp.upstreamDel {
+		headers.Del(name)
 	}
 }
 
@@ -722,6 +918,35 @@ func (f *filter) effectiveWithRequestBody(pr *compiledPerRoute) *bufferSettings 
 		return f.activeRC.withRequestBody
 	}
 	return nil
+}
+
+// perRouteContextExtensionsFor returns the resolved per-route
+// `CheckSettings.context_extensions` map for the current stream's per-route
+// config. Returns nil when no per-route override applies OR when the per-route
+// is in a non-CheckSettings arm (e.g., disabled:true). The proto3 default
+// treats nil and empty maps equivalently on the wire — `AttributeContext.
+// context_extensions` is an empty map in both cases per SPEC §6.6 step 8.
+//
+// MVP per ADR-0163's 5th-canonical-REUSE: `ExtAuthz` carries no top-level
+// `context_extensions` field, and `core.GrpcService.initial_metadata` is
+// DEFERRED per SPEC §2.6 + §8 item 2. The per-route map is therefore the
+// ONLY source of context_extensions at 18.2 MVP. Per SPEC §5, per-route wins
+// on key collisions (none at MVP since there is no listener-level baseline).
+//
+// SPEC §8 item 8 (the 18.1 forward-pointer that parsed context_extensions but
+// NO-OPed in HTTP-mode) is CLOSED by this task: the parsed
+// `compiledCheckSettings.contextExtensions` map now flows into the
+// `*authRequest.perRouteContextExtensions` field at dispatchOutboundCheck
+// seeding time, which `buildAttributeContext` reads into
+// `AttributeContext.context_extensions` at gRPC-mode CheckRequest build time.
+//
+// Called from `dispatchOutboundCheck`; the return value seeds
+// `req.perRouteContextExtensions` BEFORE the checkFn closure invocation.
+func perRouteContextExtensionsFor(pr *compiledPerRoute) map[string]string {
+	if pr == nil || pr.checkSettings == nil {
+		return nil
+	}
+	return pr.checkSettings.contextExtensions
 }
 
 // dispatchOutboundCheck is the ONE source of truth for "build authRequest +
@@ -773,6 +998,40 @@ func (f *filter) dispatchOutboundCheck(headers http.Header) {
 	// cc.deprecatedAllowedHeaders). buildAuthRequest is fully hs-independent.
 	path := headers.Get(":path")
 	authReq := buildAuthRequest(f, headers, f.body, path)
+
+	// Task 7: seed req.perRouteContextExtensions from the resolved per-route
+	// CheckSettings.context_extensions map BEFORE the closure call. Mode-
+	// agnostic field — HTTP-mode 18.1 leaves it nil (no consumer); gRPC-mode
+	// 18.2 reads it via buildAttributeContext per SPEC §6.6 step 8 +
+	// ADR-0163's 5th-canonical-REUSE. Per ADR-0163: no listener-level
+	// baseline (ExtAuthz has no top-level context_extensions field), so the
+	// per-route map IS the effective map.
+	authReq.perRouteContextExtensions = perRouteContextExtensionsFor(f.perRoute)
+
+	// Task 8: seed the remaining 9 extended *authRequest fields per SPEC §6.5
+	// + the Task 4 callback-surface extension (ADR-0165). Sources:
+	//   - 6 socket / TLS / protocol accessors from f.dcb (DecoderFilterCallbacks);
+	//   - 1 listener-side principal from f.dcb.ListenerPrincipal();
+	//   - the canonical x-request-id from the incoming client headers;
+	//   - the request-arrival instant captured at DecodeHeaders entry.
+	//
+	// Mode-agnostic seeding: HTTP-mode 18.1 leaves the 10 extension fields at
+	// zero values; gRPC-mode 18.2 reads them via buildAttributeContext per
+	// SPEC §6.6 + §11.P4. The f.dcb nil-guard tolerates test setups that
+	// construct a *filter without a callbacks reference (the body-only test
+	// path) — in that case the 9 fields land at the zero values (effectively
+	// equivalent to a plaintext / synthetic stream).
+	if f.dcb != nil {
+		authReq.remoteAddr = f.dcb.DownstreamRemoteAddr()
+		authReq.localAddr = f.dcb.DownstreamLocalAddr()
+		authReq.tlsServerName = f.dcb.DownstreamTLSServerName()
+		authReq.peerCertDER = f.dcb.DownstreamTLSPeerCertDER()
+		authReq.listenerPrincipal = f.dcb.ListenerPrincipal()
+		authReq.downstreamPrincipal = f.dcb.DownstreamPrincipal() // ADR-0144 reuse
+		authReq.protocol = f.dcb.DownstreamProtocol()
+	}
+	authReq.requestID = headers.Get("x-request-id")
+	authReq.streamStartTime = f.streamStartTime
 
 	// Create the per-request cancellable context (D4 + Task-2-M5 forward-pointer).
 	callCtx, callCancel := context.WithCancel(context.Background())
@@ -930,6 +1189,14 @@ func headerKVToOrderedHeaders(kvs []headerKV) envoyhttp.OrderedHeaders {
 // path extracted from the :path pseudo-header — to construct the
 // request-side-filtered *authRequest; see dispatchOutboundCheck for details.
 func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.FilterHeadersStatus {
+	// Capture the stream's request-arrival instant per PLAN Task 8 §Step 3.
+	// This is the canonical anchor for AttributeContext.request.time per
+	// SPEC §11.P4 (request-arrival time, NOT the auth-call time). Captured
+	// BEFORE any per-route resolution so the body-buffering branch sees the
+	// already-set anchor when DecodeData later fires dispatchOutboundCheck.
+	// gRPC-mode-only consumer; HTTP-mode 18.1 ignores f.streamStartTime.
+	f.streamStartTime = time.Now()
+
 	// Step 1: resolve per-route config + cache on filter state.
 	var pr *compiledPerRoute
 	if f.state != nil && f.dcb != nil {

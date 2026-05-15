@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"testing"
 
@@ -26,6 +27,16 @@ func (c *fakeDecoderCB) EncodeHeaders(http.Header, bool) {}
 func (c *fakeDecoderCB) EncodeData([]byte, bool)         {}
 func (c *fakeDecoderCB) EncodeTrailers(http.Header)      {}
 func (c *fakeDecoderCB) DownstreamPrincipal() []string   { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4). Zero-value
+// returns keep the existing TestDecoderFilterCallbacks_Compile compile-time
+// conformance assertion green.
+func (c *fakeDecoderCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *fakeDecoderCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *fakeDecoderCB) DownstreamTLSServerName() string  { return "" }
+func (c *fakeDecoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *fakeDecoderCB) DownstreamProtocol() string       { return "" }
+func (c *fakeDecoderCB) ListenerPrincipal() string        { return "" }
 
 func TestDecoderFilterCallbacks_Compile(t *testing.T) {
 	var _ DecoderFilterCallbacks = (*fakeDecoderCB)(nil)

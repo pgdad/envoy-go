@@ -2180,6 +2180,14 @@ func (c *rbacFakeCB) DownstreamPrincipal() []string {
 	return c.principals
 }
 
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (c *rbacFakeCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *rbacFakeCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *rbacFakeCB) DownstreamTLSServerName() string  { return "" }
+func (c *rbacFakeCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *rbacFakeCB) DownstreamProtocol() string       { return "" }
+func (c *rbacFakeCB) ListenerPrincipal() string        { return "" }
+
 // newFilterWithRBAC constructs a *filter wrapping the supplied *rbacv3.RBAC
 // listener-level proto + freshly attached rbacFakeCB. Used by Group 6 +
 // Group 8 tests.

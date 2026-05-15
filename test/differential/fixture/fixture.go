@@ -290,6 +290,23 @@ const (
 	// in-process for extauthzhttp), the runner's in-process accept counter is
 	// NOT incremented. Introduced by phase 18.1 Task 10.
 	HTTPExtAuthzHTTP BackendKind = 17
+	// HTTPExtAuthzGRPC reuses the existing echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for the upstream route
+	// + the NEW extauthzgrpc helper at test/helpers/extauthzgrpc/ for the
+	// in-process gRPC auth server. 2-cluster topology (three HCM listeners
+	// l_test_a/b/c plaintext with ext_authz → router filter chain + cluster
+	// c_backend → echobackend subprocess + cluster c_authz_grpc → extauthzgrpc
+	// subprocess with http2_protocol_options: {}). No TLS — phase 18.2 fixture
+	// is HTTP/1.1 plaintext downstream + plaintext h2c auth cluster per SPEC
+	// §7.2 + §11.P13 in-session scrape RATIFICATION of TLS-to-auth-cluster.
+	// The extauthzgrpc helper is lifecycle-managed BY THE DRIVER (it needs the
+	// per-scenario Script registrations); this switch-case only allocates the
+	// upstream echo backend. Scenarios that exercise auth-server-unreachable
+	// stop the extauthzgrpc server before the request. Because both helpers
+	// run as subprocesses (echobackend) or in-process (extauthzgrpc), the
+	// runner's in-process accept counter is NOT incremented. Introduced by
+	// phase 18.2 Task 9 / fixture 0021.
+	HTTPExtAuthzGRPC BackendKind = 18
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -1556,5 +1557,250 @@ func TestDecoderCB_DownstreamPrincipal_OrderingPreservedAcrossCalls(t *testing.T
 				t.Errorf("call %d candidate[%d]: got %q; want %q", i, j, got[j], want)
 			}
 		}
+	}
+}
+
+// --- ADR-0165 callback-surface extension Group 13 tests ---
+//
+// Per planner-time decision D3 + D12 (ADR-0044 escape-valve fires), 6 new
+// DecoderFilterCallbacks methods land at phase-18.2 Task 4:
+//
+//   DownstreamRemoteAddr()       net.Addr
+//   DownstreamLocalAddr()        net.Addr
+//   DownstreamTLSServerName()    string
+//   DownstreamTLSPeerCertDER()   []byte
+//   DownstreamProtocol()         string
+//   ListenerPrincipal()          string
+//
+// Each is seeded onto the per-stream FilterChain via a Set* primitive at HCM
+// dispatch time (connection.go H1 + h2dispatch.go H2) mirroring the existing
+// SetTLSPrincipals / tlsPrincipals / DownstreamPrincipal() pattern. The
+// per-stream callback reads the chain field verbatim — no copy, no
+// transformation — so the Group 13 tests pin the round-trip (seed via
+// SetX, observe via cb.X) plus the nil/empty fall-through (no seed → zero
+// value).
+
+// callbackProbe is a test-only StreamDecoderFilter that captures the result
+// of all 6 new ADR-0165 callback accessors during DecodeHeaders. Mirrors
+// downstreamPrincipalProbe.
+type callbackProbe struct {
+	cb             DecoderFilterCallbacks
+	remoteAddr     net.Addr
+	localAddr      net.Addr
+	tlsServerName  string
+	tlsPeerCertDER []byte
+	protocol       string
+	listenerPrinc  string
+	captured       bool
+}
+
+func (p *callbackProbe) DecodeHeaders(http.Header, bool) FilterHeadersStatus {
+	p.remoteAddr = p.cb.DownstreamRemoteAddr()
+	p.localAddr = p.cb.DownstreamLocalAddr()
+	p.tlsServerName = p.cb.DownstreamTLSServerName()
+	p.tlsPeerCertDER = p.cb.DownstreamTLSPeerCertDER()
+	p.protocol = p.cb.DownstreamProtocol()
+	p.listenerPrinc = p.cb.ListenerPrincipal()
+	p.captured = true
+	return Continue
+}
+func (p *callbackProbe) DecodeData([]byte, bool) FilterDataStatus        { return DataContinue }
+func (p *callbackProbe) DecodeTrailers(http.Header) FilterTrailersStatus { return TrailersContinue }
+func (p *callbackProbe) SetDecoderCallbacks(cb DecoderFilterCallbacks)   { p.cb = cb }
+func (p *callbackProbe) OnDestroy()                                      {}
+
+// newCallbackProbeChain wires a single-filter chain whose only filter is the
+// supplied callbackProbe. Mirrors newPrincipalProbeChain.
+func newCallbackProbeChain(p *callbackProbe) *FilterChain {
+	return NewFilterChain([]HTTPFilter{{Name: "probe", Decoder: p}}, nil)
+}
+
+func TestDecoderCB_DownstreamRemoteAddr_SeededViaSetDownstreamRemoteAddr_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamRemoteAddr seeds the chain with the downstream
+	// conn's RemoteAddr (per ADR-0165). The accessor returns the same value
+	// the filter callbacks see verbatim — no transformation in the plumbing
+	// path (mirrors ADR-0144's DownstreamPrincipal seed-and-read).
+	seed := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 7), Port: 51514}
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	chain.SetDownstreamRemoteAddr(seed)
+	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunDecodeHeaders to terminate")
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.remoteAddr != seed {
+		t.Errorf("expected remoteAddr == seed (%v); got %v", seed, probe.remoteAddr)
+	}
+}
+
+func TestDecoderCB_DownstreamRemoteAddr_NoSeed_NilAddr(t *testing.T) {
+	// Default chain (no SetDownstreamRemoteAddr call) → accessor returns nil.
+	// Mirrors the plaintext / synthetic-stream fallback per ADR-0165.
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	_, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.remoteAddr != nil {
+		t.Errorf("expected nil remoteAddr on no-seed chain; got %v", probe.remoteAddr)
+	}
+}
+
+func TestDecoderCB_DownstreamLocalAddr_SeededViaSetDownstreamLocalAddr_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamLocalAddr seeds the chain with the downstream
+	// conn's LocalAddr (the listener's bound address per ADR-0165).
+	seed := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 18443}
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	chain.SetDownstreamLocalAddr(seed)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.localAddr != seed {
+		t.Errorf("expected localAddr == seed (%v); got %v", seed, probe.localAddr)
+	}
+}
+
+func TestDecoderCB_DownstreamLocalAddr_NoSeed_NilAddr(t *testing.T) {
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if probe.localAddr != nil {
+		t.Errorf("expected nil localAddr on no-seed chain; got %v", probe.localAddr)
+	}
+}
+
+func TestDecoderCB_DownstreamTLSServerName_SeededViaSetDownstreamTLSServerName_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamTLSServerName seeds the chain with the downstream
+	// TLS ConnectionState.ServerName (SNI per ADR-0165). Empty for plaintext
+	// or SNI-absent handshakes.
+	seed := "alpha.example.com"
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	chain.SetDownstreamTLSServerName(seed)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.tlsServerName != seed {
+		t.Errorf("expected tlsServerName=%q; got %q", seed, probe.tlsServerName)
+	}
+}
+
+func TestDecoderCB_DownstreamTLSServerName_NoSeed_EmptyString(t *testing.T) {
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if probe.tlsServerName != "" {
+		t.Errorf("expected empty tlsServerName on no-seed chain; got %q", probe.tlsServerName)
+	}
+}
+
+func TestDecoderCB_DownstreamTLSPeerCertDER_SeededViaSetDownstreamTLSPeerCertDER_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamTLSPeerCertDER seeds the chain with the raw DER
+	// bytes of the downstream client's leaf certificate (per ADR-0165). nil
+	// for plaintext / no-client-cert connections.
+	seed := []byte{0x30, 0x82, 0x01, 0x22, 0x30, 0x0d, 0x06, 0x09, 0xde, 0xad}
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	chain.SetDownstreamTLSPeerCertDER(seed)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if !bytes.Equal(probe.tlsPeerCertDER, seed) {
+		t.Errorf("expected tlsPeerCertDER=%x; got %x", seed, probe.tlsPeerCertDER)
+	}
+}
+
+func TestDecoderCB_DownstreamTLSPeerCertDER_NoSeed_NilBytes(t *testing.T) {
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if probe.tlsPeerCertDER != nil {
+		t.Errorf("expected nil tlsPeerCertDER on no-seed chain; got %x", probe.tlsPeerCertDER)
+	}
+}
+
+func TestDecoderCB_DownstreamProtocol_SeededViaSetDownstreamProtocol_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamProtocol seeds the chain with "HTTP/1.1" (H1
+	// dispatch) or "HTTP/2" (H2 dispatch) per ADR-0165.
+	seed := "HTTP/2"
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	chain.SetDownstreamProtocol(seed)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.protocol != seed {
+		t.Errorf("expected protocol=%q; got %q", seed, probe.protocol)
+	}
+}
+
+func TestDecoderCB_DownstreamProtocol_NoSeed_EmptyString(t *testing.T) {
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if probe.protocol != "" {
+		t.Errorf("expected empty protocol on no-seed chain; got %q", probe.protocol)
+	}
+}
+
+func TestDecoderCB_ListenerPrincipal_SeededViaSetListenerPrincipal_ReturnsSeed(t *testing.T) {
+	// HCM-side SetListenerPrincipal seeds the chain with the listener's leaf
+	// cert SAN[0]/CN (the server-cert principal — distinct from
+	// DownstreamPrincipal which is the client-cert SAN) per ADR-0165. Empty
+	// for plaintext listeners.
+	seed := "spiffe://example.com/listener-a"
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	chain.SetListenerPrincipal(seed)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.listenerPrinc != seed {
+		t.Errorf("expected listenerPrincipal=%q; got %q", seed, probe.listenerPrinc)
+	}
+}
+
+func TestDecoderCB_ListenerPrincipal_NoSeed_EmptyString(t *testing.T) {
+	probe := &callbackProbe{}
+	chain := newCallbackProbeChain(probe)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if probe.listenerPrinc != "" {
+		t.Errorf("expected empty listenerPrincipal on no-seed chain; got %q", probe.listenerPrinc)
 	}
 }

@@ -107,6 +107,27 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 func (f *Filter) runH2(ctx context.Context, downstream net.Conn) {
 	disp := newH2Dispatcher(f)
 	disp.tlsPrincipals = downstreamTLSPrincipals(downstream)
+	// Phase 18.2 Task 4 (ADR-0165): capture the 4 per-connection callback-
+	// surface-extension fields ONCE at H2 connection build time — symmetric
+	// to tlsPrincipals + the H1 path's per-request capture in dispatchRequest.
+	// The captured values thread into every per-stream chain via
+	// chainDispatchAction → chain.SetX. Protocol/listenerPrincipal are NOT
+	// captured here: protocol is invariant ("HTTP/2") at the dispatch site;
+	// listenerPrincipal is the per-Filter listener value.
+	//
+	// Nil-downstream guard mirrors the H1 path discipline (tests that pass
+	// nil exercise the dispatcher without a real listener-conn).
+	if downstream != nil {
+		disp.downstreamRemoteAddr = downstream.RemoteAddr()
+		disp.downstreamLocalAddr = downstream.LocalAddr()
+	}
+	if tlsConn, ok := downstream.(*stdtls.Conn); ok {
+		state := tlsConn.ConnectionState()
+		disp.downstreamTLSServerName = state.ServerName
+		if len(state.PeerCertificates) > 0 {
+			disp.downstreamTLSPeerCertDER = state.PeerCertificates[0].Raw
+		}
+	}
 	sc := h2.NewServerConn(ctx, downstream, disp, h2.DefaultServerSettings)
 	if err := sc.Run(); err != nil {
 		log.Printf("hcm: h2: %v", err)

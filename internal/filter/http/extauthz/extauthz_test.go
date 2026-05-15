@@ -27,7 +27,15 @@ package extauthz
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,14 +43,22 @@ import (
 	"testing"
 	"time"
 
+	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/esalaine/envoy-go/internal/cluster"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -142,8 +158,16 @@ func TestNew_EmptyServicesOneof(t *testing.T) {
 	}
 }
 
-// TestNew_GrpcServiceParseReject verifies PARSE-REJECT for grpc_service mode in 18.1.
-// Per SPEC §6.4 + ADR-0157: grpc_service is not yet supported in 18.1.
+// TestNew_GrpcServiceParseReject verifies PARSE-REJECT for an empty grpc_service
+// (no `target_specifier`) at phase 18.2. The 18.1 "not yet supported" wording was
+// replaced at Task 3 by the STUB sentinel ("TODO (Task 5)") and replaced again
+// at Task 6 by the real PARSE-REJECT — an empty GrpcService has no target_specifier
+// so the EnvoyGrpc arm-required path fires.
+//
+// Per ADR-0157 §Decision AMENDMENT (Task 3) + ADR-0161 gRPC-mode portion (Task 6):
+// the grpc_service arm is now ACTIVE; PARSE-REJECTs flow from `buildGRPCCheckFn`
+// (envoy_grpc.cluster_name PGV-mirror; cluster lookup; UseH2 gate; GoogleGrpc
+// envoy-go-strict).
 func TestNew_GrpcServiceParseReject(t *testing.T) {
 	cfg := &ext_authzv3.ExtAuthz{
 		Services: &ext_authzv3.ExtAuthz_GrpcService{
@@ -158,8 +182,10 @@ func TestNew_GrpcServiceParseReject(t *testing.T) {
 	if factory != nil {
 		t.Errorf("New(grpc_service): want nil factory, got non-nil")
 	}
-	if !strings.Contains(err.Error(), "grpc_service mode not yet supported (lands in phase 18.2)") {
-		t.Errorf("got %q; want substring 'grpc_service mode not yet supported (lands in phase 18.2)'", err.Error())
+	// At Task 6 the empty grpc_service falls through to the envoy_grpc arm-required
+	// PARSE-REJECT (no target_specifier set on the empty GrpcService).
+	if !strings.Contains(err.Error(), "envoy_grpc arm required") {
+		t.Errorf("got %q; want substring 'envoy_grpc arm required'", err.Error())
 	}
 }
 
@@ -3547,6 +3573,14 @@ func newFakeExtAuthzDCB() *fakeExtAuthzDCB { return &fakeExtAuthzDCB{} }
 
 func (c *fakeExtAuthzDCB) ContinueDecoding()             {}
 func (c *fakeExtAuthzDCB) DownstreamPrincipal() []string { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (c *fakeExtAuthzDCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *fakeExtAuthzDCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *fakeExtAuthzDCB) DownstreamTLSServerName() string  { return "" }
+func (c *fakeExtAuthzDCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *fakeExtAuthzDCB) DownstreamProtocol() string       { return "" }
+func (c *fakeExtAuthzDCB) ListenerPrincipal() string        { return "" }
 func (c *fakeExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++
 	c.localReplyArgs = &localReplyRecord6{status: status, body: body, headers: headers}
@@ -4203,6 +4237,14 @@ func (c *asyncExtAuthzDCB) ContinueDecoding() {
 	c.mu.Unlock()
 }
 func (c *asyncExtAuthzDCB) DownstreamPrincipal() []string { return nil }
+
+// ADR-0165 callback-surface extension stubs (phase-18.2 Task 4).
+func (c *asyncExtAuthzDCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *asyncExtAuthzDCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *asyncExtAuthzDCB) DownstreamTLSServerName() string  { return "" }
+func (c *asyncExtAuthzDCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *asyncExtAuthzDCB) DownstreamProtocol() string       { return "" }
+func (c *asyncExtAuthzDCB) ListenerPrincipal() string        { return "" }
 func (c *asyncExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.mu.Lock()
 	c.localReply = &localReplyRecord6{status: status, body: body, headers: headers}
@@ -4905,4 +4947,2149 @@ func TestOnDestroy_NoPanic_WhenNoActiveCall(t *testing.T) {
 		}
 	}()
 	f.OnDestroy()
+}
+
+// ============================================================================
+// Group 12 — buildAttributeContext (Task 5 of phase-18.2; ADR-0160 gRPC-mode portion)
+// ============================================================================
+//
+// Group 12 covers the pure-function buildAttributeContext (in attributes.go)
+// per SPEC §6.6 (AMENDMENT — ADR-0165 / 2026-05-15) + §11.P4 RATIFIED in-session
+// SPEC scrape. The function is mode-agnostic-pure: 5 parameters, no callback
+// dependency. Tests faithfully reproduce the §11.P4 populated set + the four
+// conditional gates (include_peer_cert / include_tls_session / pack_as_bytes /
+// encode_raw_headers).
+//
+// Test plan:
+//
+//  1. Populated set per §11.P4 evidence — pseudo-headers + HCM-injected
+//     headers visible; Time non-zero; socket_addresses correct;
+//     destination.principal automatic; metadata_context + route_metadata_context
+//     empty (NOT nil).
+//  2. tls_session.sni gating (4 cases — false/true × empty/non-empty).
+//  3. source.certificate gating (3 cases — false-with-bytes / true-with-nil /
+//     true-with-bytes).
+//  4. pack_as_bytes honored (Body vs RawBody arm).
+//  5. encode_raw_headers DEFERRED per D6 — flag true → header_map stays nil;
+//     legacy headers map populated normally.
+//  6. context_extensions from per-route — populated + empty.
+//  7. Helper unit tests — addressFromNetAddr / lowercaseHeaderMap / firstOrEmpty.
+//
+// Helpers below construct a representative *authRequest mirroring the §11.P4
+// in-session evidence (pseudo-headers + HCM-injected + content-length + body).
+
+// authReqFor18P4 constructs an *authRequest that closely mirrors the §11.P4
+// in-session SPEC scrape's CheckRequest input. Pseudo-headers + HCM-injected
+// headers + user-agent + content-type are present in the headers map. The
+// caller may overlay specific fields (tlsServerName / peerCertDER / etc.) on
+// the returned struct before passing it to buildAttributeContext.
+func authReqFor18P4(t *testing.T) *authRequest {
+	t.Helper()
+	h := make(http.Header)
+	h.Set(":authority", "downstream.scrape.test:10443")
+	h.Set(":method", "POST")
+	h.Set(":path", "/scrape-test-path")
+	h.Set(":scheme", "https")
+	h.Set("accept", "*/*")
+	h.Set("content-length", "17")
+	h.Set("content-type", "application/x-www-form-urlencoded")
+	h.Set("user-agent", "curl/8.5.0")
+	h.Set("x-envoy-auth-partial-body", "false")
+	h.Set("x-forwarded-proto", "https")
+	h.Set("x-request-id", "eed3400a-64fc-450b-9315-d30a080f244e")
+
+	remote := &net.TCPAddr{IP: net.ParseIP("172.17.0.1"), Port: 58476}
+	local := &net.TCPAddr{IP: net.ParseIP("172.17.0.2"), Port: 10443}
+
+	return &authRequest{
+		method:              "POST",
+		path:                "/scrape-test-path",
+		headers:             h,
+		body:                []byte("hello-from-scrape"),
+		remoteAddr:          remote,
+		localAddr:           local,
+		tlsServerName:       "downstream.scrape.test",
+		peerCertDER:         nil,
+		listenerPrincipal:   "downstream.scrape.test",
+		protocol:            "HTTP/1.1",
+		requestID:           "eed3400a-64fc-450b-9315-d30a080f244e",
+		streamStartTime:     time.Date(2026, 5, 15, 9, 38, 18, 351477000, time.UTC),
+		downstreamPrincipal: nil,
+	}
+}
+
+// TestBuildAttributeContext_PopulatedSet_18P4 reproduces the §11.P4 RATIFIED
+// in-session SPEC scrape populated set as the load-bearing positive case.
+func TestBuildAttributeContext_PopulatedSet_18P4(t *testing.T) {
+	req := authReqFor18P4(t)
+	// includeTlsSession:true to surface tls_session.sni per the §11.P4 evidence.
+	ac := buildAttributeContext(req, false, false, false, true)
+	if ac == nil {
+		t.Fatal("nil AttributeContext returned")
+	}
+	// Source: 172.17.0.1:58476 + empty principal (no client cert presented).
+	if got := ac.GetSource().GetAddress().GetSocketAddress().GetAddress(); got != "172.17.0.1" {
+		t.Errorf("source.address = %q; want 172.17.0.1", got)
+	}
+	if got := ac.GetSource().GetAddress().GetSocketAddress().GetPortValue(); got != 58476 {
+		t.Errorf("source.port = %d; want 58476", got)
+	}
+	if got := ac.GetSource().GetPrincipal(); got != "" {
+		t.Errorf("source.principal = %q; want empty (no client cert)", got)
+	}
+	// Destination: 172.17.0.2:10443 + listener principal AUTOMATIC.
+	if got := ac.GetDestination().GetAddress().GetSocketAddress().GetAddress(); got != "172.17.0.2" {
+		t.Errorf("destination.address = %q; want 172.17.0.2", got)
+	}
+	if got := ac.GetDestination().GetAddress().GetSocketAddress().GetPortValue(); got != 10443 {
+		t.Errorf("destination.port = %d; want 10443", got)
+	}
+	if got := ac.GetDestination().GetPrincipal(); got != "downstream.scrape.test" {
+		t.Errorf("destination.principal = %q; want downstream.scrape.test (automatic per §11.P4)", got)
+	}
+	// request.http populated set.
+	hr := ac.GetRequest().GetHttp()
+	if hr == nil {
+		t.Fatal("request.http is nil")
+	}
+	if hr.GetMethod() != "POST" {
+		t.Errorf("method = %q; want POST", hr.GetMethod())
+	}
+	if hr.GetPath() != "/scrape-test-path" {
+		t.Errorf("path = %q; want /scrape-test-path", hr.GetPath())
+	}
+	if hr.GetHost() != "downstream.scrape.test:10443" {
+		t.Errorf("host = %q; want downstream.scrape.test:10443", hr.GetHost())
+	}
+	if hr.GetScheme() != "https" {
+		t.Errorf("scheme = %q; want https", hr.GetScheme())
+	}
+	if hr.GetSize() != int64(len("hello-from-scrape")) {
+		t.Errorf("size = %d; want %d", hr.GetSize(), len("hello-from-scrape"))
+	}
+	if hr.GetProtocol() != "HTTP/1.1" {
+		t.Errorf("protocol = %q; want HTTP/1.1", hr.GetProtocol())
+	}
+	if hr.GetId() != "eed3400a-64fc-450b-9315-d30a080f244e" {
+		t.Errorf("id = %q; want eed3400a-64fc-450b-9315-d30a080f244e", hr.GetId())
+	}
+	if hr.GetBody() != "hello-from-scrape" {
+		t.Errorf("body = %q; want hello-from-scrape", hr.GetBody())
+	}
+	if hr.GetRawBody() != nil {
+		t.Errorf("raw_body = %v; want nil (pack_as_bytes=false)", hr.GetRawBody())
+	}
+	// Pseudo-headers + HCM-injected headers INCLUDED + lowercased.
+	headers := hr.GetHeaders()
+	wantHeaderKeys := []string{
+		":authority", ":method", ":path", ":scheme",
+		"accept", "content-length", "content-type", "user-agent",
+		"x-envoy-auth-partial-body", "x-forwarded-proto", "x-request-id",
+	}
+	for _, k := range wantHeaderKeys {
+		if _, ok := headers[k]; !ok {
+			t.Errorf("headers map missing key %q; got keys=%v", k, mapKeys(headers))
+		}
+	}
+	// Lowercasing: no canonical-case keys present (e.g. "Content-Type" should not appear).
+	for k := range headers {
+		if strings.ToLower(k) != k {
+			t.Errorf("headers key %q not lowercased", k)
+		}
+	}
+	// request.time non-zero (the streamStartTime non-zero arm).
+	if ac.GetRequest().GetTime() == nil {
+		t.Fatal("request.time is nil")
+	}
+	if ac.GetRequest().GetTime().AsTime().IsZero() {
+		t.Error("request.time AsTime() is zero")
+	}
+	// metadata_context + route_metadata_context are EMPTY messages (NOT nil) per §11.P4.
+	if ac.GetMetadataContext() == nil {
+		t.Error("metadata_context is nil; want empty message per §11.P4")
+	}
+	if ac.GetRouteMetadataContext() == nil {
+		t.Error("route_metadata_context is nil; want empty message per §11.P4")
+	}
+	// tls_session.sni populated (includeTlsSession=true + tlsServerName non-empty).
+	if ac.GetTlsSession() == nil {
+		t.Fatal("tls_session is nil; want populated with sni")
+	}
+	if got := ac.GetTlsSession().GetSni(); got != "downstream.scrape.test" {
+		t.Errorf("tls_session.sni = %q; want downstream.scrape.test", got)
+	}
+}
+
+// TestBuildAttributeContext_StreamStartTimeZero_FallsBackToNow verifies SPEC
+// §6.6 step 4 IMPL settle — zero streamStartTime → time.Now().
+func TestBuildAttributeContext_StreamStartTimeZero_FallsBackToNow(t *testing.T) {
+	req := authReqFor18P4(t)
+	req.streamStartTime = time.Time{} // zero
+	before := time.Now()
+	ac := buildAttributeContext(req, false, false, false, false)
+	after := time.Now()
+	got := ac.GetRequest().GetTime().AsTime()
+	// The captured time must be between `before` and `after` (within a small slop).
+	if got.Before(before.Add(-time.Second)) || got.After(after.Add(time.Second)) {
+		t.Errorf("request.time = %v; want between %v and %v (zero-streamStartTime → time.Now())", got, before, after)
+	}
+}
+
+// TestBuildAttributeContext_TlsSessionGating exercises the 4 gate cases for
+// tls_session.sni population per §11.P4.
+func TestBuildAttributeContext_TlsSessionGating(t *testing.T) {
+	tests := []struct {
+		name              string
+		includeTlsSession bool
+		tlsServerName     string
+		wantPopulated     bool
+		wantSni           string
+	}{
+		{"false_with_name", false, "foo", false, ""},
+		{"true_empty_name", true, "", false, ""},
+		{"true_with_name", true, "foo", true, "foo"},
+		{"false_empty_name", false, "", false, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := authReqFor18P4(t)
+			req.tlsServerName = tc.tlsServerName
+			ac := buildAttributeContext(req, false, false, false, tc.includeTlsSession)
+			tls := ac.GetTlsSession()
+			if tc.wantPopulated {
+				if tls == nil {
+					t.Fatal("tls_session is nil; want populated")
+				}
+				if got := tls.GetSni(); got != tc.wantSni {
+					t.Errorf("sni = %q; want %q", got, tc.wantSni)
+				}
+			} else {
+				if tls != nil && tls.GetSni() != "" {
+					t.Errorf("tls_session populated unexpectedly: %+v", tls)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildAttributeContext_PeerCertGating exercises the 3 gate cases for
+// source.certificate population per parent §5.P3.
+func TestBuildAttributeContext_PeerCertGating(t *testing.T) {
+	cert := []byte{0x30, 0x82, 0x01, 0x02} // arbitrary DER prefix bytes
+	tests := []struct {
+		name            string
+		includePeerCert bool
+		peerCertDER     []byte
+		wantSet         bool
+	}{
+		{"false_with_bytes", false, cert, false},
+		{"true_with_nil", true, nil, false},
+		{"true_with_empty", true, []byte{}, false},
+		{"true_with_bytes", true, cert, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := authReqFor18P4(t)
+			req.peerCertDER = tc.peerCertDER
+			ac := buildAttributeContext(req, false, false, tc.includePeerCert, false)
+			got := ac.GetSource().GetCertificate()
+			if tc.wantSet {
+				if got != string(cert) {
+					t.Errorf("source.certificate = %q; want %q", got, string(cert))
+				}
+			} else {
+				if got != "" {
+					t.Errorf("source.certificate = %q; want empty", got)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildAttributeContext_PackAsBytes verifies the Body / RawBody arm split
+// per SPEC §6.6 step 3 + ADR-0162 pack_as_bytes gRPC-mode differentiator.
+func TestBuildAttributeContext_PackAsBytes(t *testing.T) {
+	t.Run("false_body_string", func(t *testing.T) {
+		req := authReqFor18P4(t)
+		req.body = []byte("payload-data")
+		ac := buildAttributeContext(req, false, false, false, false)
+		hr := ac.GetRequest().GetHttp()
+		if hr.GetBody() != "payload-data" {
+			t.Errorf("body = %q; want payload-data", hr.GetBody())
+		}
+		if len(hr.GetRawBody()) != 0 {
+			t.Errorf("raw_body = %v; want nil/empty (packAsBytes=false)", hr.GetRawBody())
+		}
+	})
+	t.Run("true_raw_body_bytes", func(t *testing.T) {
+		req := authReqFor18P4(t)
+		req.body = []byte("payload-data")
+		ac := buildAttributeContext(req, false, true, false, false)
+		hr := ac.GetRequest().GetHttp()
+		if hr.GetBody() != "" {
+			t.Errorf("body = %q; want empty (packAsBytes=true)", hr.GetBody())
+		}
+		if string(hr.GetRawBody()) != "payload-data" {
+			t.Errorf("raw_body = %q; want payload-data", hr.GetRawBody())
+		}
+	})
+}
+
+// TestBuildAttributeContext_EncodeRawHeaders_DeferredHeaderMap verifies D6 +
+// SPEC §6.6 step 7 — header_map arm DEFERRED for MVP; flag true → header_map nil,
+// legacy headers map populated normally.
+func TestBuildAttributeContext_EncodeRawHeaders_DeferredHeaderMap(t *testing.T) {
+	req := authReqFor18P4(t)
+	// encodeRawHeaders=true: should NOT populate header_map for MVP.
+	ac := buildAttributeContext(req, true, false, false, false)
+	hr := ac.GetRequest().GetHttp()
+	if hr.GetHeaderMap() != nil {
+		t.Errorf("header_map = %+v; want nil (D6 DEFERRED per §8 item 8)", hr.GetHeaderMap())
+	}
+	// Legacy headers map populated normally.
+	if len(hr.GetHeaders()) == 0 {
+		t.Error("legacy headers map empty; want populated even with encodeRawHeaders=true")
+	}
+	if _, ok := hr.GetHeaders()[":method"]; !ok {
+		t.Error("legacy headers map missing :method; want pseudo-headers present")
+	}
+}
+
+// TestBuildAttributeContext_ContextExtensions_Populated verifies SPEC §6.6
+// step 8 — context_extensions from per-route is plumbed through.
+func TestBuildAttributeContext_ContextExtensions_Populated(t *testing.T) {
+	req := authReqFor18P4(t)
+	req.perRouteContextExtensions = map[string]string{"policy": "scenario7"}
+	ac := buildAttributeContext(req, false, false, false, false)
+	got := ac.GetContextExtensions()
+	if got["policy"] != "scenario7" {
+		t.Errorf("context_extensions[policy] = %q; want scenario7", got["policy"])
+	}
+}
+
+// TestBuildAttributeContext_ContextExtensions_NilMeansEmpty verifies that a nil
+// req.perRouteContextExtensions surfaces as nil on the proto field (proto
+// marshaling treats nil and empty maps equivalently per the proto3 default).
+func TestBuildAttributeContext_ContextExtensions_NilMeansEmpty(t *testing.T) {
+	req := authReqFor18P4(t)
+	req.perRouteContextExtensions = nil
+	ac := buildAttributeContext(req, false, false, false, false)
+	if len(ac.GetContextExtensions()) != 0 {
+		t.Errorf("context_extensions = %+v; want empty/nil", ac.GetContextExtensions())
+	}
+}
+
+// TestBuildAttributeContext_DownstreamPrincipal verifies SPEC §6.6 step 1 —
+// source.principal = first-of(req.downstreamPrincipal); empty when slice is nil/empty.
+func TestBuildAttributeContext_DownstreamPrincipal(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		req := authReqFor18P4(t)
+		req.downstreamPrincipal = nil
+		ac := buildAttributeContext(req, false, false, false, false)
+		if got := ac.GetSource().GetPrincipal(); got != "" {
+			t.Errorf("source.principal = %q; want empty", got)
+		}
+	})
+	t.Run("first_value", func(t *testing.T) {
+		req := authReqFor18P4(t)
+		req.downstreamPrincipal = []string{"spiffe://example.com/foo", "alt-identity"}
+		ac := buildAttributeContext(req, false, false, false, false)
+		if got := ac.GetSource().GetPrincipal(); got != "spiffe://example.com/foo" {
+			t.Errorf("source.principal = %q; want spiffe://example.com/foo (first element)", got)
+		}
+	})
+}
+
+// TestBuildAttributeContext_NilNetAddrs verifies that nil remoteAddr / localAddr
+// produce nil Address fields on the Peers (not a panic; not a default-IP populated).
+func TestBuildAttributeContext_NilNetAddrs(t *testing.T) {
+	req := authReqFor18P4(t)
+	req.remoteAddr = nil
+	req.localAddr = nil
+	ac := buildAttributeContext(req, false, false, false, false)
+	if ac.GetSource().GetAddress() != nil {
+		t.Errorf("source.address = %+v; want nil for nil remoteAddr", ac.GetSource().GetAddress())
+	}
+	if ac.GetDestination().GetAddress() != nil {
+		t.Errorf("destination.address = %+v; want nil for nil localAddr", ac.GetDestination().GetAddress())
+	}
+}
+
+// ============================================================================
+// Group 12 helper unit tests — addressFromNetAddr / lowercaseHeaderMap / firstOrEmpty.
+// ============================================================================
+
+func TestAddressFromNetAddr_TCPAddr(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 8443}
+	got := addressFromNetAddr(addr)
+	if got == nil {
+		t.Fatal("got nil; want populated *core.Address")
+	}
+	sa := got.GetSocketAddress()
+	if sa == nil {
+		t.Fatal("SocketAddress arm not set")
+	}
+	if sa.GetAddress() != "10.0.0.5" {
+		t.Errorf("address = %q; want 10.0.0.5", sa.GetAddress())
+	}
+	if sa.GetPortValue() != 8443 {
+		t.Errorf("port = %d; want 8443", sa.GetPortValue())
+	}
+}
+
+func TestAddressFromNetAddr_Nil(t *testing.T) {
+	if got := addressFromNetAddr(nil); got != nil {
+		t.Errorf("got %+v; want nil", got)
+	}
+}
+
+func TestAddressFromNetAddr_IPv6(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("::1"), Port: 9000}
+	got := addressFromNetAddr(addr)
+	if got == nil {
+		t.Fatal("nil result for IPv6 addr")
+	}
+	if a := got.GetSocketAddress().GetAddress(); a != "::1" {
+		t.Errorf("address = %q; want ::1", a)
+	}
+}
+
+func TestLowercaseHeaderMap_SingleValueLowercase(t *testing.T) {
+	h := make(http.Header)
+	h.Set("Content-Type", "application/json")
+	h.Set("X-Custom-Header", "value")
+	got := lowercaseHeaderMap(h)
+	if got["content-type"] != "application/json" {
+		t.Errorf("content-type = %q; want application/json", got["content-type"])
+	}
+	if got["x-custom-header"] != "value" {
+		t.Errorf("x-custom-header = %q; want value", got["x-custom-header"])
+	}
+	// No canonical-case keys remain.
+	if _, ok := got["Content-Type"]; ok {
+		t.Error("canonical-case key Content-Type present; want only lowercased")
+	}
+}
+
+func TestLowercaseHeaderMap_MultiValueCommaJoin(t *testing.T) {
+	h := make(http.Header)
+	h["X-Forwarded-For"] = []string{"10.0.0.1", "10.0.0.2"}
+	got := lowercaseHeaderMap(h)
+	if got["x-forwarded-for"] != "10.0.0.1,10.0.0.2" {
+		t.Errorf("x-forwarded-for = %q; want 10.0.0.1,10.0.0.2", got["x-forwarded-for"])
+	}
+}
+
+func TestLowercaseHeaderMap_PseudoHeadersIncluded(t *testing.T) {
+	h := make(http.Header)
+	h.Set(":method", "POST")
+	h.Set(":path", "/")
+	got := lowercaseHeaderMap(h)
+	if got[":method"] != "POST" {
+		t.Errorf(":method = %q; want POST", got[":method"])
+	}
+	if got[":path"] != "/" {
+		t.Errorf(":path = %q; want /", got[":path"])
+	}
+}
+
+func TestLowercaseHeaderMap_Empty(t *testing.T) {
+	got := lowercaseHeaderMap(make(http.Header))
+	if got == nil {
+		t.Error("got nil; want empty (non-nil) map")
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d entries; want 0", len(got))
+	}
+}
+
+func TestFirstOrEmpty(t *testing.T) {
+	if got := firstOrEmpty(nil); got != "" {
+		t.Errorf("nil → %q; want empty", got)
+	}
+	if got := firstOrEmpty([]string{}); got != "" {
+		t.Errorf("empty slice → %q; want empty", got)
+	}
+	if got := firstOrEmpty([]string{"a", "b"}); got != "a" {
+		t.Errorf("[a, b] → %q; want a", got)
+	}
+}
+
+func TestBodyStringIfNotBytes(t *testing.T) {
+	if got := bodyStringIfNotBytes([]byte("hello"), false); got != "hello" {
+		t.Errorf("got %q; want hello", got)
+	}
+	if got := bodyStringIfNotBytes([]byte("hello"), true); got != "" {
+		t.Errorf("got %q; want empty (packAsBytes=true)", got)
+	}
+}
+
+func TestBodyBytesIfBytes(t *testing.T) {
+	if got := bodyBytesIfBytes([]byte("hello"), true); string(got) != "hello" {
+		t.Errorf("got %q; want hello", got)
+	}
+	if got := bodyBytesIfBytes([]byte("hello"), false); got != nil {
+		t.Errorf("got %v; want nil (packAsBytes=false)", got)
+	}
+}
+
+// mapKeys returns the keys of a map[string]string as a sorted slice for
+// deterministic test error messages.
+func mapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	// not sorted, but deterministic enough for diagnostic logging
+	return keys
+}
+
+// ============================================================================
+// Group 11 — mapGRPCResponse + buildAllowDispositionGRPC + buildDenyDispositionGRPC
+// (Task 6 of phase-18.2; ADR-0161 gRPC-mode portion)
+// ============================================================================
+//
+// Group 11 covers the pure-function gRPC-mode `CheckResponse` → `checkDisposition`
+// mapping per SPEC §6.7 + ADR-0161 gRPC-mode portion. Tests are organized as:
+//
+//  1. mapGRPCResponse 6-row dispatch table (status.code × HttpResponse oneof).
+//  2. buildAllowDispositionGRPC — 4-arm append_action dispatch per D5 (all 4
+//     enum values: APPEND_IF_EXISTS_OR_ADD / OVERWRITE_IF_EXISTS_OR_ADD /
+//     OVERWRITE_IF_EXISTS / ADD_IF_ABSENT); headers_to_remove → upstreamDel;
+//     response_headers_to_add silent-ignored per D11; validate_mutations
+//     rejection → dispInvalid.
+//  3. buildDenyDispositionGRPC — verbatim header pass-through (UNLIKE HTTP-mode
+//     — NO `allowed_client_headers` filter); status default 403; body verbatim;
+//     validate_mutations rejection → dispInvalid.
+//  4. applyUpstreamMutations D5 dispatch — OVERWRITE_IF_EXISTS (set-if-present)
+//     + ADD_IF_ABSENT (set-if-absent) + upstreamDel.
+
+// ----------------------------------------------------------------------------
+// mapGRPCResponse — 6-row dispatch table per SPEC §6.7
+// ----------------------------------------------------------------------------
+
+// TestMapGRPCResponse_NilOneof_StatusZero_Allow verifies the empty-oneof +
+// status-zero row → dispAllow (implicit allow per SPEC §6.7).
+func TestMapGRPCResponse_NilOneof_StatusZero_Allow(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 0},
+		// HttpResponse: nil
+	}
+	disp := mapGRPCResponse(resp, false /*validateMutations*/)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+	if len(disp.upstreamSet) != 0 || len(disp.upstreamApp) != 0 || len(disp.upstreamDel) != 0 {
+		t.Errorf("expected no mutations on bare allow; got set=%v app=%v del=%v",
+			disp.upstreamSet, disp.upstreamApp, disp.upstreamDel)
+	}
+}
+
+// TestMapGRPCResponse_NilOneof_StatusNonZero_Deny verifies the empty-oneof +
+// non-zero status row → dispDeny with default 403 (status-only deny).
+func TestMapGRPCResponse_NilOneof_StatusNonZero_Deny(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 7 /*PERMISSION_DENIED*/},
+		// HttpResponse: nil
+	}
+	disp := mapGRPCResponse(resp, false)
+	if disp.class != dispDeny {
+		t.Errorf("class: got %v, want dispDeny", disp.class)
+	}
+	if disp.denyStatus != 403 {
+		t.Errorf("denyStatus: got %d, want 403 (default for status-only deny)", disp.denyStatus)
+	}
+	if len(disp.denyBody) != 0 {
+		t.Errorf("denyBody: got %q, want empty (status-only deny)", string(disp.denyBody))
+	}
+	if len(disp.denyHeaders) != 0 {
+		t.Errorf("denyHeaders: got %v, want empty (status-only deny)", disp.denyHeaders)
+	}
+}
+
+// TestMapGRPCResponse_OkResponse_StatusZero_Allow verifies the canonical allow
+// row → dispAllow via buildAllowDispositionGRPC.
+func TestMapGRPCResponse_OkResponse_StatusZero_Allow(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 0},
+		HttpResponse: &authv3.CheckResponse_OkResponse{
+			OkResponse: &authv3.OkHttpResponse{
+				Headers: []*corev3.HeaderValueOption{
+					{
+						Header:       &corev3.HeaderValue{Key: "x-authenticated-user", Value: "alice"},
+						AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+					},
+				},
+			},
+		},
+	}
+	disp := mapGRPCResponse(resp, false)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+	if len(disp.upstreamSet) != 1 {
+		t.Fatalf("upstreamSet: got %d entries, want 1", len(disp.upstreamSet))
+	}
+	if got := disp.upstreamSet[0]; got.name != "x-authenticated-user" || got.value != "alice" {
+		t.Errorf("upstreamSet[0]: got {%q, %q}, want {x-authenticated-user, alice}", got.name, got.value)
+	}
+}
+
+// TestMapGRPCResponse_OkResponse_StatusNonZero_Error verifies the structurally
+// inconsistent row → dispError per SPEC §6.7 commentary (envoy-go-strict
+// catches auth-server bugs).
+func TestMapGRPCResponse_OkResponse_StatusNonZero_Error(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 7 /*PERMISSION_DENIED*/},
+		HttpResponse: &authv3.CheckResponse_OkResponse{
+			OkResponse: &authv3.OkHttpResponse{},
+		},
+	}
+	disp := mapGRPCResponse(resp, false)
+	if disp.class != dispError {
+		t.Errorf("class: got %v, want dispError (OkResponse + non-zero status is structurally inconsistent)", disp.class)
+	}
+}
+
+// TestMapGRPCResponse_DeniedResponse_StatusNonZero_Deny verifies the canonical
+// deny row → dispDeny via buildDenyDispositionGRPC.
+func TestMapGRPCResponse_DeniedResponse_StatusNonZero_Deny(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 7 /*PERMISSION_DENIED*/},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status: &typev3.HttpStatus{Code: typev3.StatusCode_Unauthorized},
+				Body:   "go away",
+				Headers: []*corev3.HeaderValueOption{
+					{Header: &corev3.HeaderValue{Key: "WWW-Authenticate", Value: "Basic realm=test"}},
+				},
+			},
+		},
+	}
+	disp := mapGRPCResponse(resp, false)
+	if disp.class != dispDeny {
+		t.Errorf("class: got %v, want dispDeny", disp.class)
+	}
+	if disp.denyStatus != 401 {
+		t.Errorf("denyStatus: got %d, want 401", disp.denyStatus)
+	}
+	if string(disp.denyBody) != "go away" {
+		t.Errorf("denyBody: got %q, want %q", string(disp.denyBody), "go away")
+	}
+	if len(disp.denyHeaders) != 1 || disp.denyHeaders[0].name != "www-authenticate" {
+		t.Errorf("denyHeaders: got %v, want [{www-authenticate ...}]", disp.denyHeaders)
+	}
+}
+
+// TestMapGRPCResponse_DeniedResponse_StatusZero_Error verifies the
+// BEHAVIOR_CONTRACT divergence-window row → dispError per SPEC §6.7 + §13.4.
+func TestMapGRPCResponse_DeniedResponse_StatusZero_Error(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 0 /*OK — structurally inconsistent with DeniedResponse*/},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+				Body:   "should not reach client",
+			},
+		},
+	}
+	disp := mapGRPCResponse(resp, false)
+	if disp.class != dispError {
+		t.Errorf("class: got %v, want dispError (DeniedResponse + zero status is structurally inconsistent — envoy-go-strict)", disp.class)
+	}
+}
+
+// TestMapGRPCResponse_NilResponse_DefensiveAllow verifies that a nil
+// *CheckResponse maps to dispAllow (defensive empty-CheckResponse).
+func TestMapGRPCResponse_NilResponse_DefensiveAllow(t *testing.T) {
+	disp := mapGRPCResponse(nil, false)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow (defensive)", disp.class)
+	}
+}
+
+// TestMapGRPCResponse_NilStatus_Allow verifies that a CheckResponse with no
+// Status field (Status nil) is treated as status-code 0 → allow when the
+// HttpResponse oneof is also empty (the "fully-empty CheckResponse" case).
+func TestMapGRPCResponse_NilStatus_Allow(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		// Status: nil — GetStatus().GetCode() returns 0
+		// HttpResponse: nil
+	}
+	disp := mapGRPCResponse(resp, false)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// buildAllowDispositionGRPC — 4-arm append_action dispatch per D5
+// ----------------------------------------------------------------------------
+
+// TestBuildAllowDispositionGRPC_AppendIfExistsOrAdd verifies APPEND_IF_EXISTS_OR_ADD
+// (enum value 0; default) maps to upstreamApp with appendDispatchDefault.
+func TestBuildAllowDispositionGRPC_AppendIfExistsOrAdd(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{
+				Header:       &corev3.HeaderValue{Key: "X-Custom-Append", Value: "value1"},
+				AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+			},
+		},
+	}
+	disp := buildAllowDispositionGRPC(okResp, false)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+	if len(disp.upstreamApp) != 1 {
+		t.Fatalf("upstreamApp: got %d entries, want 1", len(disp.upstreamApp))
+	}
+	got := disp.upstreamApp[0]
+	if got.name != "x-custom-append" || got.value != "value1" || got.action != appendDispatchDefault {
+		t.Errorf("upstreamApp[0]: got {%q, %q, action=%d}, want {x-custom-append, value1, appendDispatchDefault}",
+			got.name, got.value, got.action)
+	}
+	if len(disp.upstreamSet) != 0 {
+		t.Errorf("upstreamSet: got %d entries, want 0 (APPEND → upstreamApp only)", len(disp.upstreamSet))
+	}
+}
+
+// TestBuildAllowDispositionGRPC_OverwriteIfExistsOrAdd verifies
+// OVERWRITE_IF_EXISTS_OR_ADD maps to upstreamSet with appendDispatchDefault.
+func TestBuildAllowDispositionGRPC_OverwriteIfExistsOrAdd(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{
+				Header:       &corev3.HeaderValue{Key: "x-authenticated-user", Value: "alice"},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			},
+		},
+	}
+	disp := buildAllowDispositionGRPC(okResp, false)
+	if len(disp.upstreamSet) != 1 {
+		t.Fatalf("upstreamSet: got %d entries, want 1", len(disp.upstreamSet))
+	}
+	got := disp.upstreamSet[0]
+	if got.name != "x-authenticated-user" || got.value != "alice" || got.action != appendDispatchDefault {
+		t.Errorf("upstreamSet[0]: got {%q, %q, action=%d}, want {x-authenticated-user, alice, appendDispatchDefault}",
+			got.name, got.value, got.action)
+	}
+}
+
+// TestBuildAllowDispositionGRPC_OverwriteIfExists verifies OVERWRITE_IF_EXISTS
+// maps to upstreamSet with appendDispatchOverwriteOnly.
+func TestBuildAllowDispositionGRPC_OverwriteIfExists(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{
+				Header:       &corev3.HeaderValue{Key: "X-Existing-Only", Value: "new-value"},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS,
+			},
+		},
+	}
+	disp := buildAllowDispositionGRPC(okResp, false)
+	if len(disp.upstreamSet) != 1 {
+		t.Fatalf("upstreamSet: got %d entries, want 1", len(disp.upstreamSet))
+	}
+	got := disp.upstreamSet[0]
+	if got.name != "x-existing-only" || got.value != "new-value" || got.action != appendDispatchOverwriteOnly {
+		t.Errorf("upstreamSet[0]: got {%q, %q, action=%d}, want {x-existing-only, new-value, appendDispatchOverwriteOnly}",
+			got.name, got.value, got.action)
+	}
+}
+
+// TestBuildAllowDispositionGRPC_AddIfAbsent verifies ADD_IF_ABSENT maps to
+// upstreamSet with appendDispatchAddIfAbsent.
+func TestBuildAllowDispositionGRPC_AddIfAbsent(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{
+				Header:       &corev3.HeaderValue{Key: "x-default-value", Value: "fallback"},
+				AppendAction: corev3.HeaderValueOption_ADD_IF_ABSENT,
+			},
+		},
+	}
+	disp := buildAllowDispositionGRPC(okResp, false)
+	if len(disp.upstreamSet) != 1 {
+		t.Fatalf("upstreamSet: got %d entries, want 1", len(disp.upstreamSet))
+	}
+	got := disp.upstreamSet[0]
+	if got.name != "x-default-value" || got.value != "fallback" || got.action != appendDispatchAddIfAbsent {
+		t.Errorf("upstreamSet[0]: got {%q, %q, action=%d}, want {x-default-value, fallback, appendDispatchAddIfAbsent}",
+			got.name, got.value, got.action)
+	}
+}
+
+// TestBuildAllowDispositionGRPC_AllFourArms verifies all 4 append_action arms
+// in a single OkHttpResponse — populates upstreamSet (3 entries: OVERWRITE_IF_EXISTS_OR_ADD,
+// OVERWRITE_IF_EXISTS, ADD_IF_ABSENT) + upstreamApp (1 entry: APPEND_IF_EXISTS_OR_ADD).
+func TestBuildAllowDispositionGRPC_AllFourArms(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{
+				Header:       &corev3.HeaderValue{Key: "x-append", Value: "a"},
+				AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+			},
+			{
+				Header:       &corev3.HeaderValue{Key: "x-overwrite-or-add", Value: "b"},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			},
+			{
+				Header:       &corev3.HeaderValue{Key: "x-overwrite-only", Value: "c"},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS,
+			},
+			{
+				Header:       &corev3.HeaderValue{Key: "x-add-if-absent", Value: "d"},
+				AppendAction: corev3.HeaderValueOption_ADD_IF_ABSENT,
+			},
+		},
+	}
+	disp := buildAllowDispositionGRPC(okResp, false)
+	if len(disp.upstreamApp) != 1 || disp.upstreamApp[0].name != "x-append" {
+		t.Errorf("upstreamApp: got %v, want [x-append]", disp.upstreamApp)
+	}
+	if len(disp.upstreamSet) != 3 {
+		t.Fatalf("upstreamSet: got %d entries, want 3", len(disp.upstreamSet))
+	}
+	expectActions := map[string]appendDispatch{
+		"x-overwrite-or-add": appendDispatchDefault,
+		"x-overwrite-only":   appendDispatchOverwriteOnly,
+		"x-add-if-absent":    appendDispatchAddIfAbsent,
+	}
+	for _, kv := range disp.upstreamSet {
+		want, ok := expectActions[kv.name]
+		if !ok {
+			t.Errorf("upstreamSet contains unexpected name %q", kv.name)
+			continue
+		}
+		if kv.action != want {
+			t.Errorf("upstreamSet[%s]: action=%d, want %d", kv.name, kv.action, want)
+		}
+	}
+}
+
+// TestBuildAllowDispositionGRPC_HeadersToRemove verifies that
+// `headers_to_remove` populates the new `upstreamDel []string` field on
+// checkDisposition (lowercased).
+func TestBuildAllowDispositionGRPC_HeadersToRemove(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		HeadersToRemove: []string{"X-Sensitive-Cookie", "x-internal-trace"},
+	}
+	disp := buildAllowDispositionGRPC(okResp, false)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+	if len(disp.upstreamDel) != 2 {
+		t.Fatalf("upstreamDel: got %d entries, want 2", len(disp.upstreamDel))
+	}
+	if disp.upstreamDel[0] != "x-sensitive-cookie" {
+		t.Errorf("upstreamDel[0]: got %q, want x-sensitive-cookie (lowercased)", disp.upstreamDel[0])
+	}
+	if disp.upstreamDel[1] != "x-internal-trace" {
+		t.Errorf("upstreamDel[1]: got %q, want x-internal-trace", disp.upstreamDel[1])
+	}
+}
+
+// TestBuildAllowDispositionGRPC_ResponseHeadersToAdd_SilentIgnored verifies
+// that `response_headers_to_add` is SILENT-IGNORED per D11 (no crash, no
+// disposition error, no allow-path mutation).
+func TestBuildAllowDispositionGRPC_ResponseHeadersToAdd_SilentIgnored(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		ResponseHeadersToAdd: []*corev3.HeaderValueOption{
+			{Header: &corev3.HeaderValue{Key: "X-Set-By-Auth", Value: "value"}},
+		},
+		// No regular headers; just the decode-side-only response_headers_to_add.
+	}
+	disp := buildAllowDispositionGRPC(okResp, false)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+	// response_headers_to_add must NOT leak into upstreamSet / upstreamApp /
+	// upstreamDel — the envoy-go filter is decoder-only and cannot inject into
+	// the downstream response on allow.
+	if len(disp.upstreamSet) != 0 || len(disp.upstreamApp) != 0 || len(disp.upstreamDel) != 0 {
+		t.Errorf("response_headers_to_add must be silent-ignored; got set=%v app=%v del=%v",
+			disp.upstreamSet, disp.upstreamApp, disp.upstreamDel)
+	}
+}
+
+// TestBuildAllowDispositionGRPC_ValidateMutations_PseudoHeader_Invalid verifies
+// that `validate_mutations: true` rejects a :-prefixed pseudo-header in the
+// allow-path mutations → dispInvalid.
+func TestBuildAllowDispositionGRPC_ValidateMutations_PseudoHeader_Invalid(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{
+				Header:       &corev3.HeaderValue{Key: ":authority", Value: "evil.example.com"},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			},
+		},
+	}
+	disp := buildAllowDispositionGRPC(okResp, true /*validateMutations*/)
+	if disp.class != dispInvalid {
+		t.Errorf("class: got %v, want dispInvalid (pseudo-header rejected by validateMutationHeaders)", disp.class)
+	}
+}
+
+// TestBuildAllowDispositionGRPC_ValidateMutations_AllPass verifies that
+// `validate_mutations: true` with valid mutations preserves the allow disposition.
+func TestBuildAllowDispositionGRPC_ValidateMutations_AllPass(t *testing.T) {
+	okResp := &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{
+				Header:       &corev3.HeaderValue{Key: "x-clean-header", Value: "ok"},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			},
+		},
+	}
+	disp := buildAllowDispositionGRPC(okResp, true)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+}
+
+// TestBuildAllowDispositionGRPC_NilOk verifies a nil *OkHttpResponse yields a
+// bare allow (defensive).
+func TestBuildAllowDispositionGRPC_NilOk(t *testing.T) {
+	disp := buildAllowDispositionGRPC(nil, false)
+	if disp.class != dispAllow {
+		t.Errorf("class: got %v, want dispAllow", disp.class)
+	}
+	if len(disp.upstreamSet) != 0 || len(disp.upstreamApp) != 0 || len(disp.upstreamDel) != 0 {
+		t.Errorf("bare allow must have no mutations; got set=%v app=%v del=%v",
+			disp.upstreamSet, disp.upstreamApp, disp.upstreamDel)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// buildDenyDispositionGRPC — verbatim header pass-through (UNLIKE HTTP-mode)
+// ----------------------------------------------------------------------------
+
+// TestBuildDenyDispositionGRPC_Verbatim verifies header pass-through is
+// VERBATIM (no allowed_client_headers filter — UNLIKE HTTP-mode). Per parent
+// SPEC §5.P11 + ADR-0161 gRPC-mode portion.
+func TestBuildDenyDispositionGRPC_Verbatim(t *testing.T) {
+	deniedResp := &authv3.DeniedHttpResponse{
+		Status: &typev3.HttpStatus{Code: typev3.StatusCode_Unauthorized},
+		Body:   "denied per policy",
+		Headers: []*corev3.HeaderValueOption{
+			{Header: &corev3.HeaderValue{Key: "WWW-Authenticate", Value: "Bearer realm=\"api\""}},
+			{Header: &corev3.HeaderValue{Key: "Content-Type", Value: "application/json"}},
+			{Header: &corev3.HeaderValue{Key: "X-Custom-Deny", Value: "anything"}},
+		},
+	}
+	disp := buildDenyDispositionGRPC(deniedResp, false)
+	if disp.class != dispDeny {
+		t.Errorf("class: got %v, want dispDeny", disp.class)
+	}
+	if disp.denyStatus != 401 {
+		t.Errorf("denyStatus: got %d, want 401", disp.denyStatus)
+	}
+	if string(disp.denyBody) != "denied per policy" {
+		t.Errorf("denyBody: got %q, want %q", string(disp.denyBody), "denied per policy")
+	}
+	if len(disp.denyHeaders) != 3 {
+		t.Fatalf("denyHeaders: got %d entries, want 3 (verbatim — no filter)", len(disp.denyHeaders))
+	}
+	wantNames := []string{"www-authenticate", "content-type", "x-custom-deny"}
+	for i, kv := range disp.denyHeaders {
+		if kv.name != wantNames[i] {
+			t.Errorf("denyHeaders[%d].name: got %q, want %q", i, kv.name, wantNames[i])
+		}
+	}
+}
+
+// TestBuildDenyDispositionGRPC_StatusDefault403 verifies that a zero status
+// code defaults to 403 per SPEC §6.7.
+func TestBuildDenyDispositionGRPC_StatusDefault403(t *testing.T) {
+	deniedResp := &authv3.DeniedHttpResponse{
+		// Status: nil — GetStatus().GetCode() returns 0 → default 403
+		Body: "default deny",
+	}
+	disp := buildDenyDispositionGRPC(deniedResp, false)
+	if disp.denyStatus != 403 {
+		t.Errorf("denyStatus: got %d, want 403 (default for zero status)", disp.denyStatus)
+	}
+	if string(disp.denyBody) != "default deny" {
+		t.Errorf("denyBody: got %q, want %q", string(disp.denyBody), "default deny")
+	}
+}
+
+// TestBuildDenyDispositionGRPC_NoFilterUnlikeHTTPMode is the load-bearing
+// negative test confirming that the gRPC-mode deny path does NOT apply the
+// HTTP-mode `allowed_client_headers` filter. The auth service's header set is
+// preserved verbatim regardless of any envelope-level allow-list.
+func TestBuildDenyDispositionGRPC_NoFilterUnlikeHTTPMode(t *testing.T) {
+	// In HTTP-mode, the equivalent path would filter `x-auth-detail` out unless
+	// `allowed_client_headers` matched it. gRPC-mode has no such filter —
+	// `buildDenyDispositionGRPC` accepts the auth service's headers verbatim.
+	deniedResp := &authv3.DeniedHttpResponse{
+		Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+		Headers: []*corev3.HeaderValueOption{
+			{Header: &corev3.HeaderValue{Key: "x-auth-detail", Value: "policy-X-failed"}},
+		},
+	}
+	disp := buildDenyDispositionGRPC(deniedResp, false)
+	if len(disp.denyHeaders) != 1 || disp.denyHeaders[0].name != "x-auth-detail" {
+		t.Errorf("denyHeaders: got %v, want [{x-auth-detail policy-X-failed}] (verbatim, no filter)", disp.denyHeaders)
+	}
+}
+
+// TestBuildDenyDispositionGRPC_ValidateMutations_PseudoHeader_Invalid verifies
+// validate_mutations rejection on the deny-path pseudo-header → dispInvalid.
+func TestBuildDenyDispositionGRPC_ValidateMutations_PseudoHeader_Invalid(t *testing.T) {
+	deniedResp := &authv3.DeniedHttpResponse{
+		Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+		Headers: []*corev3.HeaderValueOption{
+			{Header: &corev3.HeaderValue{Key: ":status", Value: "200" /*evil downgrade attempt*/}},
+		},
+	}
+	disp := buildDenyDispositionGRPC(deniedResp, true)
+	if disp.class != dispInvalid {
+		t.Errorf("class: got %v, want dispInvalid (pseudo-header rejected on deny path)", disp.class)
+	}
+}
+
+// TestBuildDenyDispositionGRPC_NilDenied verifies a nil *DeniedHttpResponse
+// yields default 403 deny.
+func TestBuildDenyDispositionGRPC_NilDenied(t *testing.T) {
+	disp := buildDenyDispositionGRPC(nil, false)
+	if disp.class != dispDeny {
+		t.Errorf("class: got %v, want dispDeny", disp.class)
+	}
+	if disp.denyStatus != 403 {
+		t.Errorf("denyStatus: got %d, want 403", disp.denyStatus)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// applyUpstreamMutations — D5 dispatch (OVERWRITE_IF_EXISTS / ADD_IF_ABSENT)
+// + upstreamDel
+// ----------------------------------------------------------------------------
+
+// TestApplyUpstreamMutations_OverwriteOnly_PresentSet verifies that
+// appendDispatchOverwriteOnly + a header that IS present → headers.Set fires.
+func TestApplyUpstreamMutations_OverwriteOnly_PresentSet(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("x-existing", "old-value")
+
+	disp := checkDisposition{
+		class: dispAllow,
+		upstreamSet: []headerKV{
+			{name: "x-existing", value: "new-value", action: appendDispatchOverwriteOnly},
+		},
+	}
+	applyUpstreamMutations(headers, disp)
+
+	if got := headers.Get("X-Existing"); got != "new-value" {
+		t.Errorf("OverwriteOnly(x-existing present): got %q, want %q (overwrite)", got, "new-value")
+	}
+}
+
+// TestApplyUpstreamMutations_OverwriteOnly_AbsentNoSet verifies that
+// appendDispatchOverwriteOnly + a header that is ABSENT → headers.Set is a NO-OP.
+func TestApplyUpstreamMutations_OverwriteOnly_AbsentNoSet(t *testing.T) {
+	headers := http.Header{}
+
+	disp := checkDisposition{
+		class: dispAllow,
+		upstreamSet: []headerKV{
+			{name: "x-not-present", value: "should-not-be-added", action: appendDispatchOverwriteOnly},
+		},
+	}
+	applyUpstreamMutations(headers, disp)
+
+	if got := headers.Get("X-Not-Present"); got != "" {
+		t.Errorf("OverwriteOnly(x-not-present absent): got %q, want empty (NO-OP on absent)", got)
+	}
+}
+
+// TestApplyUpstreamMutations_AddIfAbsent_PresentNoSet verifies that
+// appendDispatchAddIfAbsent + a header that IS present → headers.Set is a NO-OP.
+func TestApplyUpstreamMutations_AddIfAbsent_PresentNoSet(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("x-existing", "preserved")
+
+	disp := checkDisposition{
+		class: dispAllow,
+		upstreamSet: []headerKV{
+			{name: "x-existing", value: "should-not-overwrite", action: appendDispatchAddIfAbsent},
+		},
+	}
+	applyUpstreamMutations(headers, disp)
+
+	if got := headers.Get("X-Existing"); got != "preserved" {
+		t.Errorf("AddIfAbsent(x-existing present): got %q, want %q (NO-OP on present)", got, "preserved")
+	}
+}
+
+// TestApplyUpstreamMutations_AddIfAbsent_AbsentSet verifies that
+// appendDispatchAddIfAbsent + a header that is ABSENT → headers.Set fires.
+func TestApplyUpstreamMutations_AddIfAbsent_AbsentSet(t *testing.T) {
+	headers := http.Header{}
+
+	disp := checkDisposition{
+		class: dispAllow,
+		upstreamSet: []headerKV{
+			{name: "x-default", value: "fallback", action: appendDispatchAddIfAbsent},
+		},
+	}
+	applyUpstreamMutations(headers, disp)
+
+	if got := headers.Get("X-Default"); got != "fallback" {
+		t.Errorf("AddIfAbsent(x-default absent): got %q, want %q (added)", got, "fallback")
+	}
+}
+
+// TestApplyUpstreamMutations_UpstreamDel verifies that upstreamDel removes
+// existing headers via headers.Del.
+func TestApplyUpstreamMutations_UpstreamDel(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("x-keep", "keep-me")
+	headers.Set("x-remove", "byte-deleted")
+	headers.Add("x-also-remove", "v1")
+	headers.Add("x-also-remove", "v2")
+
+	disp := checkDisposition{
+		class:       dispAllow,
+		upstreamDel: []string{"x-remove", "x-also-remove"},
+	}
+	applyUpstreamMutations(headers, disp)
+
+	if got := headers.Get("X-Keep"); got != "keep-me" {
+		t.Errorf("X-Keep: got %q, want %q (untouched)", got, "keep-me")
+	}
+	if got := headers.Get("X-Remove"); got != "" {
+		t.Errorf("X-Remove: got %q, want empty (deleted)", got)
+	}
+	if got := len(headers.Values("X-Also-Remove")); got != 0 {
+		t.Errorf("X-Also-Remove: got %d values, want 0 (multi-value deleted)", got)
+	}
+}
+
+// TestApplyUpstreamMutations_SetThenDel verifies that upstreamDel is applied
+// AFTER upstreamSet (Set+Del = the auth service overrides any client-supplied
+// value AND then removes the header entirely — matching reference Envoy's
+// verbatim "set-then-remove" semantics).
+func TestApplyUpstreamMutations_SetThenDel(t *testing.T) {
+	headers := http.Header{}
+
+	disp := checkDisposition{
+		class: dispAllow,
+		upstreamSet: []headerKV{
+			{name: "x-transient", value: "ephemeral", action: appendDispatchDefault},
+		},
+		upstreamDel: []string{"x-transient"},
+	}
+	applyUpstreamMutations(headers, disp)
+
+	if got := headers.Get("X-Transient"); got != "" {
+		t.Errorf("Set+Del(x-transient): got %q, want empty (deleted AFTER set)", got)
+	}
+}
+
+// TestApplyUpstreamMutations_GRPCMode_AllFourArmsIntegration is the load-bearing
+// integration test for the 4-arm append_action dispatch — exercises every arm
+// AND upstreamDel on a single header map.
+func TestApplyUpstreamMutations_GRPCMode_AllFourArmsIntegration(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("x-overwrite-present", "old-overwrite-or-add")
+	headers.Set("x-overwrite-only-present", "old-overwrite-only")
+	headers.Set("x-add-if-absent-present", "preserved-add-if-absent")
+	headers.Set("x-append-existing", "first")
+	headers.Set("x-to-remove", "to-be-removed")
+
+	disp := checkDisposition{
+		class: dispAllow,
+		upstreamSet: []headerKV{
+			{name: "x-overwrite-present", value: "new-overwrite-or-add", action: appendDispatchDefault},
+			{name: "x-overwrite-only-present", value: "new-overwrite-only", action: appendDispatchOverwriteOnly},
+			{name: "x-overwrite-only-absent", value: "should-not-add", action: appendDispatchOverwriteOnly},
+			{name: "x-add-if-absent-present", value: "should-not-overwrite", action: appendDispatchAddIfAbsent},
+			{name: "x-add-if-absent-fresh", value: "fresh-added", action: appendDispatchAddIfAbsent},
+		},
+		upstreamApp: []headerKV{
+			{name: "x-append-existing", value: "second"},
+		},
+		upstreamDel: []string{"x-to-remove"},
+	}
+	applyUpstreamMutations(headers, disp)
+
+	// OVERWRITE_IF_EXISTS_OR_ADD (default): unconditional set.
+	if got := headers.Get("X-Overwrite-Present"); got != "new-overwrite-or-add" {
+		t.Errorf("X-Overwrite-Present: got %q, want %q", got, "new-overwrite-or-add")
+	}
+	// OVERWRITE_IF_EXISTS: present → overwritten.
+	if got := headers.Get("X-Overwrite-Only-Present"); got != "new-overwrite-only" {
+		t.Errorf("X-Overwrite-Only-Present: got %q, want %q", got, "new-overwrite-only")
+	}
+	// OVERWRITE_IF_EXISTS: absent → NO-OP.
+	if got := headers.Get("X-Overwrite-Only-Absent"); got != "" {
+		t.Errorf("X-Overwrite-Only-Absent: got %q, want empty (NO-OP on absent)", got)
+	}
+	// ADD_IF_ABSENT: present → NO-OP.
+	if got := headers.Get("X-Add-If-Absent-Present"); got != "preserved-add-if-absent" {
+		t.Errorf("X-Add-If-Absent-Present: got %q, want %q", got, "preserved-add-if-absent")
+	}
+	// ADD_IF_ABSENT: absent → added.
+	if got := headers.Get("X-Add-If-Absent-Fresh"); got != "fresh-added" {
+		t.Errorf("X-Add-If-Absent-Fresh: got %q, want %q", got, "fresh-added")
+	}
+	// APPEND: stacked.
+	if got := len(headers.Values("X-Append-Existing")); got != 2 {
+		t.Errorf("X-Append-Existing: got %d values, want 2 (stacked append)", got)
+	}
+	// DEL: removed.
+	if got := headers.Get("X-To-Remove"); got != "" {
+		t.Errorf("X-To-Remove: got %q, want empty (deleted)", got)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// mapGRPCResponse — validate_mutations integration (Allow + Deny paths)
+// ----------------------------------------------------------------------------
+
+// TestMapGRPCResponse_ValidateMutations_AllowPath_PseudoHeader_Invalid verifies
+// the validate_mutations gate fires on the allow path via mapGRPCResponse.
+func TestMapGRPCResponse_ValidateMutations_AllowPath_PseudoHeader_Invalid(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 0},
+		HttpResponse: &authv3.CheckResponse_OkResponse{
+			OkResponse: &authv3.OkHttpResponse{
+				Headers: []*corev3.HeaderValueOption{
+					{
+						Header:       &corev3.HeaderValue{Key: ":authority", Value: "evil"},
+						AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+					},
+				},
+			},
+		},
+	}
+	disp := mapGRPCResponse(resp, true)
+	if disp.class != dispInvalid {
+		t.Errorf("class: got %v, want dispInvalid", disp.class)
+	}
+}
+
+// TestMapGRPCResponse_ValidateMutations_DenyPath_PseudoHeader_Invalid verifies
+// the validate_mutations gate fires on the deny path via mapGRPCResponse.
+func TestMapGRPCResponse_ValidateMutations_DenyPath_PseudoHeader_Invalid(t *testing.T) {
+	resp := &authv3.CheckResponse{
+		Status: &status.Status{Code: 7},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+				Headers: []*corev3.HeaderValueOption{
+					{Header: &corev3.HeaderValue{Key: ":status", Value: "200"}},
+				},
+			},
+		},
+	}
+	disp := mapGRPCResponse(resp, true)
+	if disp.class != dispInvalid {
+		t.Errorf("class: got %v, want dispInvalid", disp.class)
+	}
+}
+
+// ============================================================================
+// Group 14 — context_extensions per-route → AttributeContext.context_extensions
+//            threading (Task 7 of phase-18.2; SPEC §8 item 8 closure;
+//            ADR-0163 5th-canonical-REUSE).
+// ============================================================================
+//
+// Group 14 covers the per-route CheckSettings.context_extensions consumption
+// path that 18.1 parsed-but-NO-OPed per SPEC §8 item 8. The 18.1 parser
+// (parsePerRoute) stored the map on compiledCheckSettings.contextExtensions;
+// Group 7 (TestParsePerRoute_CheckSettings_WithContextExtensions) covers the
+// PARSE side. Task 7 wires the CONSUME side:
+//
+//   (1) perRouteContextExtensionsFor(*compiledPerRoute) → map[string]string
+//       — pure helper returning the parsed map (or nil) per the per-route
+//       arm.
+//   (2) dispatchOutboundCheck seeds req.perRouteContextExtensions =
+//       perRouteContextExtensionsFor(f.perRoute) BEFORE the checkFn closure
+//       call.
+//   (3) buildAttributeContext (Group 12) reads req.perRouteContextExtensions
+//       into AttributeContext.context_extensions — already covered by
+//       TestBuildAttributeContext_ContextExtensions_Populated.
+//
+// Test plan:
+//
+//   14A. Direct helper unit tests — nil per-route / disabled-arm / check-
+//        settings-arm × {populated map / empty map / nil map}.
+//   14B. End-to-end via dispatchOutboundCheck — a capturing checkFn closure
+//        verifies the *authRequest delivered to the closure has
+//        perRouteContextExtensions populated from the resolved per-route.
+//
+// NOTE: 14B does NOT need the extauthzgrpc helper (lands at Task 9). The
+// closure-capture pattern directly observes the *authRequest that the gRPC-
+// mode checkFn would otherwise marshal into a CheckRequest via
+// buildAttributeContext. The buildAttributeContext mapping itself is
+// pinned by TestBuildAttributeContext_ContextExtensions_Populated (Group 12).
+
+// ---------------------------------------------------------------------------
+// Group 14A — perRouteContextExtensionsFor helper unit tests
+// ---------------------------------------------------------------------------
+
+// TestPerRouteContextExtensionsFor_NilPerRoute_ReturnsNil verifies the helper
+// returns nil when the per-route pointer is nil (the "no per-route TPFC" case).
+// Per SPEC §6.6 step 8: proto3 marshaling treats nil and empty maps
+// equivalently — both surface as an empty context_extensions on the wire.
+func TestPerRouteContextExtensionsFor_NilPerRoute_ReturnsNil(t *testing.T) {
+	got := perRouteContextExtensionsFor(nil)
+	if got != nil {
+		t.Errorf("got %+v, want nil for nil *compiledPerRoute", got)
+	}
+}
+
+// TestPerRouteContextExtensionsFor_DisabledArm_ReturnsNil verifies the helper
+// returns nil for the disabled:true per-route arm. Per ADR-0163: the disabled
+// arm carries no checkSettings (Task-9 short-circuit fires before dispatch
+// anyway, but the helper must be defensive).
+func TestPerRouteContextExtensionsFor_DisabledArm_ReturnsNil(t *testing.T) {
+	pr := &compiledPerRoute{disabled: true, checkSettings: nil}
+	got := perRouteContextExtensionsFor(pr)
+	if got != nil {
+		t.Errorf("got %+v, want nil for disabled-arm *compiledPerRoute", got)
+	}
+}
+
+// TestPerRouteContextExtensionsFor_CheckSettingsArm_ReturnsParsedMap verifies
+// the helper returns the parsed compiledCheckSettings.contextExtensions map
+// verbatim (same map pointer — no defensive copy). The proto map convention
+// per SPEC §5 is per-route wins; at 18.2 MVP there is no listener-level
+// baseline so "per-route wins" reduces to "per-route only".
+func TestPerRouteContextExtensionsFor_CheckSettingsArm_ReturnsParsedMap(t *testing.T) {
+	ce := map[string]string{
+		"policy":   "scenario7",
+		"vhost":    "my-virtual-host",
+		"audience": "internal",
+	}
+	pr := &compiledPerRoute{
+		disabled:      false,
+		checkSettings: &compiledCheckSettings{contextExtensions: ce},
+	}
+	got := perRouteContextExtensionsFor(pr)
+	if got == nil {
+		t.Fatal("got nil; want populated map")
+	}
+	if len(got) != 3 {
+		t.Errorf("len: got %d, want 3", len(got))
+	}
+	for k, v := range ce {
+		if got[k] != v {
+			t.Errorf("got[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// TestPerRouteContextExtensionsFor_CheckSettingsArm_EmptyMap_ReturnsEmpty
+// verifies that a check_settings arm with an empty (but non-nil) map flows
+// through as-is. Equivalent-on-wire to nil per proto3, but the helper does
+// not coerce.
+func TestPerRouteContextExtensionsFor_CheckSettingsArm_EmptyMap_ReturnsEmpty(t *testing.T) {
+	pr := &compiledPerRoute{
+		disabled:      false,
+		checkSettings: &compiledCheckSettings{contextExtensions: map[string]string{}},
+	}
+	got := perRouteContextExtensionsFor(pr)
+	if got == nil {
+		t.Fatal("got nil; want empty (non-nil) map")
+	}
+	if len(got) != 0 {
+		t.Errorf("len: got %d, want 0", len(got))
+	}
+}
+
+// TestPerRouteContextExtensionsFor_CheckSettingsArm_NilMap_ReturnsNil verifies
+// that a check_settings arm whose contextExtensions field is nil produces a
+// nil return (proto3 default; parsePerRoute may surface a nil map when the
+// proto field is unset).
+func TestPerRouteContextExtensionsFor_CheckSettingsArm_NilMap_ReturnsNil(t *testing.T) {
+	pr := &compiledPerRoute{
+		disabled:      false,
+		checkSettings: &compiledCheckSettings{contextExtensions: nil},
+	}
+	got := perRouteContextExtensionsFor(pr)
+	if got != nil {
+		t.Errorf("got %+v, want nil", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 14B — End-to-end via dispatchOutboundCheck: req.perRouteContextExtensions
+// seeded BEFORE the checkFn closure call.
+// ---------------------------------------------------------------------------
+
+// captureAuthReqCheckFn returns a checkFn closure that captures the *authRequest
+// it receives into the supplied pointer slot. The disposition returned is a
+// minimal dispAllow (the test asserts on the captured *authRequest, not on the
+// disposition application). The capture is guarded by an external mutex so
+// the race detector stays clean when the resume goroutine fires concurrently
+// with the test goroutine's polling via waitForContinueOrReply.
+func captureAuthReqCheckFn(mu *sync.Mutex, capture **authRequest) checkFn {
+	return func(_ context.Context, req *authRequest) (checkDisposition, error) {
+		mu.Lock()
+		*capture = req
+		mu.Unlock()
+		return checkDisposition{class: dispAllow}, nil
+	}
+}
+
+// TestContextExtensionsThreading_PerRouteMap_FlowsThroughDispatch verifies that
+// the per-route CheckSettings.context_extensions map (populated on
+// f.perRoute.checkSettings.contextExtensions) is seeded onto the *authRequest
+// passed to the checkFn closure. This is the load-bearing end-to-end test:
+// once seeded, buildAttributeContext (Group 12) maps it to
+// AttributeContext.context_extensions verbatim per SPEC §6.6 step 8.
+//
+// Reference scenario per SPEC §11.P4: per-route check_settings:
+// `context_extensions: {policy: "scenario7"}` results in the gRPC auth server
+// observing `AttributeContext.context_extensions["policy"] == "scenario7"`.
+func TestContextExtensionsThreading_PerRouteMap_FlowsThroughDispatch(t *testing.T) {
+	var mu sync.Mutex
+	var captured *authRequest
+	fn := captureAuthReqCheckFn(&mu, &captured)
+
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+
+	// Per-route compiledCheckSettings with context_extensions populated.
+	pr := &compiledPerRoute{
+		cc:       cc,
+		disabled: false,
+		checkSettings: &compiledCheckSettings{
+			contextExtensions: map[string]string{
+				"policy":   "scenario7",
+				"audience": "internal",
+			},
+		},
+	}
+
+	f := &filter{
+		state:    &factoryState{listenerRC: cc},
+		dcb:      dcb,
+		activeRC: cc,
+		perRoute: pr,
+	}
+
+	headers := make(http.Header)
+	headers.Set(":path", "/scrape-test-path")
+	headers.Set(":method", "GET")
+
+	f.dispatchOutboundCheck(headers)
+
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("dispatch resume never fired within 2s")
+	}
+
+	mu.Lock()
+	req := captured
+	mu.Unlock()
+	if req == nil {
+		t.Fatal("checkFn never received an *authRequest")
+	}
+	if req.perRouteContextExtensions == nil {
+		t.Fatal("req.perRouteContextExtensions: got nil; want populated map")
+	}
+	if req.perRouteContextExtensions["policy"] != "scenario7" {
+		t.Errorf("req.perRouteContextExtensions[policy] = %q; want %q",
+			req.perRouteContextExtensions["policy"], "scenario7")
+	}
+	if req.perRouteContextExtensions["audience"] != "internal" {
+		t.Errorf("req.perRouteContextExtensions[audience] = %q; want %q",
+			req.perRouteContextExtensions["audience"], "internal")
+	}
+	if len(req.perRouteContextExtensions) != 2 {
+		t.Errorf("len(req.perRouteContextExtensions) = %d; want 2",
+			len(req.perRouteContextExtensions))
+	}
+}
+
+// TestContextExtensionsThreading_NoPerRoute_NilMap verifies that when no
+// per-route TPFC applies (f.perRoute == nil), the *authRequest's
+// perRouteContextExtensions is nil. Per SPEC §5 + ADR-0163: no listener-level
+// baseline at MVP, so absent-per-route → empty (nil) context_extensions on
+// the AttributeContext.
+func TestContextExtensionsThreading_NoPerRoute_NilMap(t *testing.T) {
+	var mu sync.Mutex
+	var captured *authRequest
+	fn := captureAuthReqCheckFn(&mu, &captured)
+
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+
+	f := &filter{
+		state:    &factoryState{listenerRC: cc},
+		dcb:      dcb,
+		activeRC: cc,
+		perRoute: nil, // no per-route TPFC
+	}
+
+	headers := make(http.Header)
+	headers.Set(":path", "/")
+	headers.Set(":method", "GET")
+
+	f.dispatchOutboundCheck(headers)
+
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("dispatch resume never fired within 2s")
+	}
+
+	mu.Lock()
+	req := captured
+	mu.Unlock()
+	if req == nil {
+		t.Fatal("checkFn never received an *authRequest")
+	}
+	if req.perRouteContextExtensions != nil {
+		t.Errorf("req.perRouteContextExtensions = %+v; want nil (no per-route)",
+			req.perRouteContextExtensions)
+	}
+}
+
+// TestContextExtensionsThreading_DisabledArm_NilMap verifies that the
+// disabled:true per-route arm (which carries no checkSettings) results in a
+// nil perRouteContextExtensions on the *authRequest. NOTE: in production the
+// disabled arm short-circuits at DecodeHeaders (Task 9) BEFORE dispatch fires,
+// so this code path is normally unreachable; the helper is defensive against
+// future refactors. The test exercises the helper-via-dispatch contract.
+func TestContextExtensionsThreading_DisabledArm_NilMap(t *testing.T) {
+	var mu sync.Mutex
+	var captured *authRequest
+	fn := captureAuthReqCheckFn(&mu, &captured)
+
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+
+	pr := &compiledPerRoute{
+		cc:            cc,
+		disabled:      true,
+		checkSettings: nil,
+	}
+
+	f := &filter{
+		state:    &factoryState{listenerRC: cc},
+		dcb:      dcb,
+		activeRC: cc,
+		perRoute: pr,
+	}
+
+	headers := make(http.Header)
+	headers.Set(":path", "/")
+	headers.Set(":method", "GET")
+
+	f.dispatchOutboundCheck(headers)
+
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("dispatch resume never fired within 2s")
+	}
+
+	mu.Lock()
+	req := captured
+	mu.Unlock()
+	if req == nil {
+		t.Fatal("checkFn never received an *authRequest")
+	}
+	if req.perRouteContextExtensions != nil {
+		t.Errorf("req.perRouteContextExtensions = %+v; want nil (disabled arm)",
+			req.perRouteContextExtensions)
+	}
+}
+
+// TestContextExtensionsThreading_PerRouteEmptyMap_FlowsAsEmpty verifies that
+// an explicitly-empty (but non-nil) per-route context_extensions map flows
+// through to the *authRequest as a non-nil empty map. Proto3 marshaling
+// treats nil and empty maps equivalently, but the IMPL preserves the
+// parser's distinction.
+func TestContextExtensionsThreading_PerRouteEmptyMap_FlowsAsEmpty(t *testing.T) {
+	var mu sync.Mutex
+	var captured *authRequest
+	fn := captureAuthReqCheckFn(&mu, &captured)
+
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+
+	pr := &compiledPerRoute{
+		cc:       cc,
+		disabled: false,
+		checkSettings: &compiledCheckSettings{
+			contextExtensions: map[string]string{},
+		},
+	}
+
+	f := &filter{
+		state:    &factoryState{listenerRC: cc},
+		dcb:      dcb,
+		activeRC: cc,
+		perRoute: pr,
+	}
+
+	headers := make(http.Header)
+	headers.Set(":path", "/")
+	headers.Set(":method", "GET")
+
+	f.dispatchOutboundCheck(headers)
+
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("dispatch resume never fired within 2s")
+	}
+
+	mu.Lock()
+	req := captured
+	mu.Unlock()
+	if req == nil {
+		t.Fatal("checkFn never received an *authRequest")
+	}
+	if req.perRouteContextExtensions == nil {
+		t.Fatal("req.perRouteContextExtensions: got nil; want empty non-nil map")
+	}
+	if len(req.perRouteContextExtensions) != 0 {
+		t.Errorf("len(req.perRouteContextExtensions) = %d; want 0",
+			len(req.perRouteContextExtensions))
+	}
+}
+
+// TestContextExtensionsThreading_AttributeContextIntegration verifies the
+// full path: a populated per-route map flows from the *compiledPerRoute
+// → req.perRouteContextExtensions (via perRouteContextExtensionsFor) →
+// AttributeContext.context_extensions (via buildAttributeContext). This is
+// the integration assertion closing SPEC §8 item 8 (the 18.1 forward-pointer).
+func TestContextExtensionsThreading_AttributeContextIntegration(t *testing.T) {
+	pr := &compiledPerRoute{
+		disabled: false,
+		checkSettings: &compiledCheckSettings{
+			contextExtensions: map[string]string{"policy": "scenario7"},
+		},
+	}
+
+	// Build a minimal authRequest with the perRouteContextExtensions seeded
+	// via the Task 7 helper (mirrors the dispatchOutboundCheck flow).
+	req := &authRequest{
+		method:                    http.MethodPost,
+		path:                      "/test",
+		headers:                   make(http.Header),
+		perRouteContextExtensions: perRouteContextExtensionsFor(pr),
+	}
+
+	ac := buildAttributeContext(req, false, false, false, false)
+	got := ac.GetContextExtensions()
+	if got["policy"] != "scenario7" {
+		t.Errorf("AttributeContext.context_extensions[policy] = %q; want %q",
+			got["policy"], "scenario7")
+	}
+}
+
+// ============================================================================
+// Group 10 — gRPC arm parse-time validation + race-test exercise (Task 8 of phase-18.2)
+// ============================================================================
+//
+// Group 10 covers the comprehensive parse-time validation matrix of the
+// `grpc_service` arm at `buildCompiledConfig` time, plus the OnDestroy → cancel
+// propagation contract for gRPC-mode checkFn (parallel to 18.1's HTTP-mode
+// `TestOnDestroy_CancelsInFlightContext`).
+//
+// Parse-time matrix (5 tests):
+//   - UnknownCluster_ParseReject       — unknown cluster name → PARSE-REJECT
+//                                        wording "unknown cluster <name>"
+//   - UseH2False_ParseReject           — plaintext cluster (UseH2()==false) →
+//                                        PARSE-REJECT wording "must have
+//                                        http2_protocol_options{} set"
+//   - GoogleGrpcArm_ParseReject        — GoogleGrpc oneof arm → PARSE-REJECT
+//                                        wording "google_grpc arm not
+//                                        supported (envoy-go uses
+//                                        google.golang.org/grpc directly)"
+//   - EnvoyGrpcEmptyClusterName_ParseReject — empty cluster_name string →
+//                                        PARSE-REJECT wording
+//                                        "envoy_grpc.cluster_name must be
+//                                        non-empty"
+//   - HappyPath_ReturnsNonNilCheckFn   — h2 cluster known to the manager →
+//                                        returns non-nil `checkFn` without
+//                                        error
+//
+// Race-test (1 test, Option B per Task 8 §Race-test approach):
+//   - TestOnDestroy_CancelsInFlightGRPCCheck — mock-closure checkFn that
+//     blocks on `<-ctx.Done()` exercises the mu/done resume-after-OnDestroy
+//     guard for gRPC mode identically to the HTTP-mode equivalent. Avoids
+//     the extauthzgrpc helper (lands at Task 9) — the guard under test is
+//     the filter's mu/done discipline, NOT the grpcclient transport.
+// ----------------------------------------------------------------------------
+
+// extauthzTestPKI carries an in-memory CA + leaf cert/key pair sufficient for
+// constructing an h2-enabled `*cluster.Manager` (the leaf is never actually
+// served; the PKI bytes feed the cluster's TLS context construction so
+// `UseH2()` returns true at parse time). Mirrors `grpcclient/grpcclient_test.go`
+// `authTestPKI` — duplicated here to keep the extauthz test package self-
+// contained.
+type extauthzTestPKI struct {
+	caPEM       []byte
+	leafCertPEM []byte
+	leafKeyPEM  []byte //nolint:unused // retained for symmetry with grpcclient_test.go's authTestPKI; future Group 10 expansions may exercise the keypair
+}
+
+// mkExtauthzTestPKI creates a fresh in-memory CA + leaf keypair. The keypair
+// is generated once per test invocation; the CA-cert PEM bytes are passed to
+// `mkExtauthzH2ClusterMgr` for the `trusted_ca` field of the
+// `UpstreamTlsContext`. The leaf cert / key are retained for symmetry with
+// `grpcclient/grpcclient_test.go` but not exercised by Group 10 (the
+// PARSE-REJECT + happy-path tests do not perform an actual dial).
+func mkExtauthzTestPKI(t testing.TB) *extauthzTestPKI {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ca key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "extauthz test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("ca cert: %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("leaf key: %v", err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "alpha.envoy-go.test"},
+		DNSNames:     []string{"alpha.envoy-go.test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caTmpl, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("leaf cert: %v", err)
+	}
+	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatalf("leaf key marshal: %v", err)
+	}
+	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: leafKeyDER})
+
+	return &extauthzTestPKI{
+		caPEM:       caPEM,
+		leafCertPEM: leafCertPEM,
+		leafKeyPEM:  leafKeyPEM,
+	}
+}
+
+// mkExtauthzH2ClusterMgr builds a *cluster.Manager containing a single STATIC
+// cluster `name` listening at 127.0.0.1:port configured for HTTP/2 upstream
+// origination (TLS + ALPN h2 + `http2_protocol_options{}`). The CA cert
+// from `pki` is inlined as the cluster's `validation_context.trusted_ca`.
+// Modeled on `internal/grpcclient/grpcclient_test.go`'s `mkH2ClusterMgr`.
+func mkExtauthzH2ClusterMgr(t testing.TB, pki *extauthzTestPKI, name string, port uint32) *cluster.Manager {
+	t.Helper()
+	ctx := &tlsv3.UpstreamTlsContext{
+		Sni: "alpha.envoy-go.test",
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			AlpnProtocols: []string{"h2"},
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: &corev3.DataSource{
+						Specifier: &corev3.DataSource_InlineBytes{InlineBytes: pki.caPEM},
+					},
+				},
+			},
+		},
+	}
+	tsAny, err := anypb.New(ctx)
+	if err != nil {
+		t.Fatalf("anypb.New(UpstreamTlsContext): %v", err)
+	}
+	hpoH2 := &upstreamshttpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{},
+			},
+		},
+	}
+	hpoAny, err := anypb.New(hpoH2)
+	if err != nil {
+		t.Fatalf("anypb.New(HttpProtocolOptions): %v", err)
+	}
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{{
+				Name:                 name,
+				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+				ConnectTimeout:       durationpb.New(time.Second),
+				LoadAssignment: &endpointv3.ClusterLoadAssignment{
+					ClusterName: name,
+					Endpoints: []*endpointv3.LocalityLbEndpoints{{
+						LbEndpoints: []*endpointv3.LbEndpoint{{
+							HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+									SocketAddress: &corev3.SocketAddress{
+										Address:       "127.0.0.1",
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+									},
+								}},
+							}},
+						}},
+					}},
+				},
+				TransportSocket: &corev3.TransportSocket{
+					Name:       "envoy.transport_sockets.tls",
+					ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: tsAny},
+				},
+				TypedExtensionProtocolOptions: map[string]*anypb.Any{
+					"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": hpoAny,
+				},
+			}},
+		},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("cluster.NewManager(h2): %v", err)
+	}
+	return cm
+}
+
+// mkExtauthzPlainClusterMgr builds a *cluster.Manager containing a single
+// plaintext STATIC cluster `name` at 127.0.0.1:port with `UseH2() == false`.
+// The loopback port is arbitrary — PARSE-REJECT paths never reach the dial
+// step. Modeled on `internal/grpcclient/grpcclient_test.go`'s
+// `mkPlainClusterMgr`.
+func mkExtauthzPlainClusterMgr(t testing.TB, name string, port uint32) *cluster.Manager {
+	t.Helper()
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{{
+				Name:                 name,
+				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+				ConnectTimeout:       durationpb.New(time.Second),
+				LoadAssignment: &endpointv3.ClusterLoadAssignment{
+					ClusterName: name,
+					Endpoints: []*endpointv3.LocalityLbEndpoints{{
+						LbEndpoints: []*endpointv3.LbEndpoint{{
+							HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+									SocketAddress: &corev3.SocketAddress{
+										Address:       "127.0.0.1",
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+									},
+								}},
+							}},
+						}},
+					}},
+				},
+			}},
+		},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("cluster.NewManager(plain): %v", err)
+	}
+	return cm
+}
+
+// extauthzFactoryCtxWithClusterMgr returns a FactoryCtx with the supplied
+// cluster manager — used by Group 10 to thread a known cluster name to the
+// `buildGRPCCheckFn` call at config-parse time.
+func extauthzFactoryCtxWithClusterMgr(cm *cluster.Manager) envoyhttp.FactoryCtx {
+	return envoyhttp.FactoryCtx{
+		Stats:          stats.NewRegistry(),
+		StatPrefix:     "ingress_http",
+		ClusterManager: cm,
+	}
+}
+
+// mkGrpcExtAuthzConfig returns an ExtAuthz proto with the given GrpcService —
+// used by Group 10 parse-time tests. `gs` is the caller's choice of
+// `*core.GrpcService` (constructed per-test to exercise the 4 PARSE-REJECT
+// arms + the happy-path arm).
+func mkGrpcExtAuthzConfig(gs *corev3.GrpcService) *ext_authzv3.ExtAuthz {
+	return &ext_authzv3.ExtAuthz{
+		Services: &ext_authzv3.ExtAuthz_GrpcService{
+			GrpcService: gs,
+		},
+		TransportApiVersion: corev3.ApiVersion_V3,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 10A — parse-time gRPC arm validation
+// ---------------------------------------------------------------------------
+
+// TestBuildGRPCCheckFn_UnknownCluster_ParseReject verifies the unknown-cluster
+// PARSE-REJECT path per SPEC §6.5. A `grpc_service.envoy_grpc.cluster_name`
+// pointing at a name NOT present in the FactoryCtx.ClusterManager must produce
+// a PARSE-REJECT error whose wording mentions the offending cluster name (to
+// aid operator diagnostics).
+func TestBuildGRPCCheckFn_UnknownCluster_ParseReject(t *testing.T) {
+	// Cluster manager that knows ONLY "c_other" — the config asks for
+	// "c_does_not_exist" which is unknown to the manager.
+	cm := mkExtauthzPlainClusterMgr(t, "c_other", 19191)
+
+	gs := &corev3.GrpcService{
+		TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+			EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
+				ClusterName: "c_does_not_exist",
+			},
+		},
+	}
+	cfg := mkGrpcExtAuthzConfig(gs)
+
+	factory, err := New(mustAny(t, cfg), extauthzFactoryCtxWithClusterMgr(cm))
+	if err == nil {
+		t.Fatal("New(grpc_service unknown-cluster): want error, got nil")
+	}
+	if factory != nil {
+		t.Errorf("New(grpc_service unknown-cluster): want nil factory, got non-nil")
+	}
+	if !strings.Contains(err.Error(), "unknown cluster") {
+		t.Errorf("error wording: got %q; want substring 'unknown cluster'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "c_does_not_exist") {
+		t.Errorf("error wording: got %q; want offending cluster name 'c_does_not_exist'", err.Error())
+	}
+}
+
+// TestBuildGRPCCheckFn_UseH2False_ParseReject verifies the UseH2()==false
+// PARSE-REJECT path per SPEC §6.5. A `grpc_service.envoy_grpc.cluster_name`
+// pointing at a known plaintext cluster (no http2_protocol_options{}) must
+// produce a PARSE-REJECT error whose wording mentions the required
+// http2_protocol_options{} setting (gRPC requires HTTP/2 framing per §11.P13).
+func TestBuildGRPCCheckFn_UseH2False_ParseReject(t *testing.T) {
+	const clusterName = "c_plain"
+	cm := mkExtauthzPlainClusterMgr(t, clusterName, 19192)
+
+	gs := &corev3.GrpcService{
+		TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+			EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
+				ClusterName: clusterName,
+			},
+		},
+	}
+	cfg := mkGrpcExtAuthzConfig(gs)
+
+	factory, err := New(mustAny(t, cfg), extauthzFactoryCtxWithClusterMgr(cm))
+	if err == nil {
+		t.Fatal("New(grpc_service UseH2==false): want error, got nil")
+	}
+	if factory != nil {
+		t.Errorf("New(grpc_service UseH2==false): want nil factory, got non-nil")
+	}
+	if !strings.Contains(err.Error(), "http2_protocol_options") {
+		t.Errorf("error wording: got %q; want substring 'http2_protocol_options'", err.Error())
+	}
+	if !strings.Contains(err.Error(), clusterName) {
+		t.Errorf("error wording: got %q; want offending cluster name %q", err.Error(), clusterName)
+	}
+}
+
+// TestBuildGRPCCheckFn_GoogleGrpcArm_ParseReject verifies the GoogleGrpc-arm
+// PARSE-REJECT per SPEC §6.5 step 1 + parent §4.3 + ADR-0008 V3-only-transport-
+// discipline. envoy-go uses google.golang.org/grpc directly; the
+// `GoogleGrpc` native-channel arm is permanently out-of-scope.
+func TestBuildGRPCCheckFn_GoogleGrpcArm_ParseReject(t *testing.T) {
+	// Cluster manager is irrelevant — the GoogleGrpc arm rejects BEFORE the
+	// EnvoyGrpc cluster lookup step.
+	cm := mkExtauthzPlainClusterMgr(t, "c_unused", 19193)
+
+	gs := &corev3.GrpcService{
+		TargetSpecifier: &corev3.GrpcService_GoogleGrpc_{
+			GoogleGrpc: &corev3.GrpcService_GoogleGrpc{
+				TargetUri:  "127.0.0.1:19193",
+				StatPrefix: "googlegrpc_unused",
+			},
+		},
+	}
+	cfg := mkGrpcExtAuthzConfig(gs)
+
+	factory, err := New(mustAny(t, cfg), extauthzFactoryCtxWithClusterMgr(cm))
+	if err == nil {
+		t.Fatal("New(grpc_service google_grpc arm): want error, got nil")
+	}
+	if factory != nil {
+		t.Errorf("New(grpc_service google_grpc arm): want nil factory, got non-nil")
+	}
+	if !strings.Contains(err.Error(), "google_grpc arm not supported") {
+		t.Errorf("error wording: got %q; want substring 'google_grpc arm not supported'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "google.golang.org/grpc") {
+		t.Errorf("error wording: got %q; want substring 'google.golang.org/grpc'", err.Error())
+	}
+}
+
+// TestBuildGRPCCheckFn_EnvoyGrpcEmptyClusterName_ParseReject verifies the
+// PGV-mirror PARSE-REJECT for empty `envoy_grpc.cluster_name` per SPEC §6.5
+// step 2. The PGV `min_len: 1` constraint on cluster_name is mirrored as an
+// envoy-go-side PARSE-REJECT.
+func TestBuildGRPCCheckFn_EnvoyGrpcEmptyClusterName_ParseReject(t *testing.T) {
+	cm := mkExtauthzPlainClusterMgr(t, "c_unused", 19194)
+
+	gs := &corev3.GrpcService{
+		TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+			EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
+				ClusterName: "", // explicit empty — PGV min_len:1 violation
+			},
+		},
+	}
+	cfg := mkGrpcExtAuthzConfig(gs)
+
+	factory, err := New(mustAny(t, cfg), extauthzFactoryCtxWithClusterMgr(cm))
+	if err == nil {
+		t.Fatal("New(grpc_service empty cluster_name): want error, got nil")
+	}
+	if factory != nil {
+		t.Errorf("New(grpc_service empty cluster_name): want nil factory, got non-nil")
+	}
+	if !strings.Contains(err.Error(), "envoy_grpc.cluster_name must be non-empty") {
+		t.Errorf("error wording: got %q; want substring 'envoy_grpc.cluster_name must be non-empty'", err.Error())
+	}
+}
+
+// TestBuildGRPCCheckFn_HappyPath_ReturnsNonNilCheckFn verifies the happy-path
+// at parse time: a known h2-enabled cluster produces a non-nil checkFn
+// without error. The IMPL settles by exercising `New(...)` directly — a nil
+// error + non-nil factory is the success contract (the factory itself
+// allocates the per-stream filter when invoked).
+func TestBuildGRPCCheckFn_HappyPath_ReturnsNonNilCheckFn(t *testing.T) {
+	pki := mkExtauthzTestPKI(t)
+	const clusterName = "c_authgrpc"
+	cm := mkExtauthzH2ClusterMgr(t, pki, clusterName, 19195)
+
+	gs := &corev3.GrpcService{
+		TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+			EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
+				ClusterName: clusterName,
+			},
+		},
+		Timeout: durationpb.New(2 * time.Second),
+	}
+	cfg := mkGrpcExtAuthzConfig(gs)
+
+	factory, err := New(mustAny(t, cfg), extauthzFactoryCtxWithClusterMgr(cm))
+	if err != nil {
+		t.Fatalf("New(grpc_service h2 happy path): got error %v; want nil", err)
+	}
+	if factory == nil {
+		t.Fatal("New(grpc_service h2 happy path): got nil factory; want non-nil")
+	}
+
+	// Construct a per-stream filter from the factory and verify the compiled
+	// config carries a non-nil checkFn (the gRPC closure built by
+	// buildGRPCCheckFn). This is the load-bearing assertion: the parse path
+	// reached buildGRPCCheckFn step 6 and returned a real closure.
+	hf := factory()
+	dec := hf.Decoder
+	if dec == nil {
+		t.Fatal("factory()(): decoder is nil; want non-nil *filter")
+	}
+	f, ok := dec.(*filter)
+	if !ok {
+		t.Fatalf("factory()(): decoder type %T; want *filter", dec)
+	}
+	if f.state == nil || f.state.listenerRC == nil {
+		t.Fatal("factory()(): listenerRC is nil; expected populated compiledConfig")
+	}
+	if f.state.listenerRC.checkFn == nil {
+		t.Error("factory()(): listenerRC.checkFn is nil; expected non-nil gRPC closure")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 10B — Race-test exercise: OnDestroy cancels in-flight gRPC Check
+// ---------------------------------------------------------------------------
+
+// TestOnDestroy_CancelsInFlightGRPCCheck verifies the OnDestroy → cancel
+// propagation path for the gRPC-mode checkFn — parallel to 18.1's HTTP-mode
+// `TestOnDestroy_CancelsInFlightContext`. Per the PLAN Task 8 §Race-test
+// approach Option B: uses a mock checkFn closure that blocks on
+// `<-ctx.Done()` (representing the in-flight `(*AuthClient).Check` call) and
+// returns `dispError, ctx.Err()` on cancellation. This exercises:
+//
+//   - the per-request `callCtx`/`callCancel` plumbing in `dispatchOutboundCheck`,
+//   - the `OnDestroy → f.done = true → callCancel()` discipline (mu/done
+//     guard), and
+//   - the resume goroutine's `if f.done { return }` short-circuit AFTER the
+//     blocked Check call returns.
+//
+// The mock-closure approach is sufficient because (a) the grpcclient package
+// already has its own race + cancel tests (Groups 1–3 in
+// grpcclient_test.go), and (b) the contract under test here is the FILTER's
+// mu/done guard around `cc.checkFn` — that contract is mode-agnostic and
+// identical for HTTP-mode (validated by `TestOnDestroy_CancelsInFlightContext`)
+// and gRPC-mode (validated by this test). The Task 9 extauthzgrpc helper
+// will add a true gRPC roundtrip to the fixture infrastructure.
+func TestOnDestroy_CancelsInFlightGRPCCheck(t *testing.T) {
+	// Mock checkFn: blocks on ctx.Done() (the cancellation signal from
+	// OnDestroy → callCancel()) and returns dispError + ctx.Err(). This
+	// faithfully reproduces the contract of `(*AuthClient).Check` under
+	// context cancellation per ADR-0158 §Decision D7.
+	checkFnFired := make(chan struct{})
+	gRPCMockCheckFn := func(ctx context.Context, _ *authRequest) (checkDisposition, error) {
+		close(checkFnFired)
+		<-ctx.Done()
+		return checkDisposition{class: dispError}, ctx.Err()
+	}
+
+	cc := &compiledConfig{checkFn: gRPCMockCheckFn, statusOnError: 403, failureModeAllow: false}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	// Fire the async dispatch (parks chain on StopIteration).
+	status := f.DecodeHeaders(make(http.Header), true)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("DecodeHeaders before OnDestroy: want StopIteration, got %v", status)
+	}
+
+	// Wait for the mock checkFn to start executing (the goroutine has the
+	// per-request ctx and is blocked on ctx.Done() — the in-flight call).
+	select {
+	case <-checkFnFired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mock gRPC checkFn never fired within 2s")
+	}
+
+	// Call OnDestroy — this should cancel callCtx, which the mock checkFn
+	// observes via <-ctx.Done() and returns dispError + ctx.Err() (i.e.,
+	// context.Canceled). The goroutine then re-acquires f.mu, sees f.done
+	// == true, and aborts the callback touch without panic or double-use.
+	f.OnDestroy()
+
+	// Wait up to 1s for f.done to be observed under mu (race-clean accessor).
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		done := f.done
+		f.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	f.mu.Lock()
+	done := f.done
+	f.mu.Unlock()
+	if !done {
+		t.Error("OnDestroy: f.done not set to true under mu")
+	}
+
+	// After OnDestroy + goroutine completion, NO dcb callbacks must have
+	// fired (the resume-after-OnDestroy guard short-circuited the resume
+	// goroutine's applyDisposition step).
+	time.Sleep(50 * time.Millisecond) // allow the resume goroutine to observe done=true and return
+	if c := asyncDCB_continueCount(dcb); c != 0 {
+		t.Errorf("resume-after-OnDestroy: ContinueDecoding called %d times, want 0", c)
+	}
+	if r := asyncDCB_localReply(dcb); r != nil {
+		t.Errorf("resume-after-OnDestroy: SendLocalReply fired unexpectedly: %+v", r)
+	}
 }

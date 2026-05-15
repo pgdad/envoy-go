@@ -1,6 +1,7 @@
 package http
 
 import (
+	"net"
 	"net/http"
 
 	"google.golang.org/protobuf/proto"
@@ -81,6 +82,79 @@ type DecoderFilterCallbacks interface {
 	// Cross-phase reusable by future filters (jwt_authn / ext_authz / oauth2
 	// / ext_proc) per ADR-0144 §Consequences.
 	DownstreamPrincipal() []string
+
+	// DownstreamRemoteAddr returns the downstream client connection's remote
+	// address (net.Addr; the IP + port of the connecting peer). Returns nil
+	// for synthetic streams (test harnesses that bypass the HCM dispatch
+	// site without seeding the chain). HCM dispatch seeds the field at chain
+	// build time from the per-connection net.Conn.RemoteAddr() BEFORE
+	// RunDecodeHeaders, so per-stream callbacks observe a stable address for
+	// the request lifetime.
+	//
+	// Per ADR-0165 §Decision (phase-18.2 callback-surface extension; the
+	// ADR-0044 escape-valve fires). Cross-phase reusable by future filters
+	// that need socket-level state — ext_proc / global_ratelimit / future
+	// ext_authz extensions consume the same accessor surface.
+	DownstreamRemoteAddr() net.Addr
+
+	// DownstreamLocalAddr returns the downstream client connection's local
+	// address (net.Addr; the listener's bound IP + port that accepted the
+	// conn). Returns nil for synthetic streams. Seeding discipline mirrors
+	// DownstreamRemoteAddr: set once at HCM dispatch from
+	// net.Conn.LocalAddr() before RunDecodeHeaders.
+	//
+	// Per ADR-0165 §Decision. Cross-phase reusable (ext_proc /
+	// global_ratelimit / future ext_authz extensions).
+	DownstreamLocalAddr() net.Addr
+
+	// DownstreamTLSServerName returns the SNI (Server Name Indication) the
+	// downstream client presented during the TLS handshake, as observed via
+	// tls.ConnectionState.ServerName. Returns the empty string for plaintext
+	// connections, for TLS handshakes without SNI (rare in practice), or for
+	// synthetic streams.
+	//
+	// Per ADR-0165 §Decision. Cross-phase reusable; populates ext_authz
+	// AttributeContext.TLSSession.sni per the §11.P4 in-session SPEC scrape.
+	DownstreamTLSServerName() string
+
+	// DownstreamTLSPeerCertDER returns the raw DER bytes of the downstream
+	// client's leaf X.509 certificate (PeerCertificates[0].Raw on a server-
+	// side *tls.Conn). Returns nil for plaintext connections, for TLS
+	// connections with no client cert, or for synthetic streams. The
+	// returned slice is read-only — callers MUST NOT mutate the underlying
+	// bytes.
+	//
+	// Per ADR-0165 §Decision. Cross-phase reusable; populates ext_authz
+	// AttributeContext.Source.certificate when include_peer_certificate is
+	// enabled per parent §5.P3.
+	DownstreamTLSPeerCertDER() []byte
+
+	// DownstreamProtocol returns a canonical short string identifying the
+	// HTTP protocol version used for the downstream connection:
+	// "HTTP/1.1" for the H1 dispatch path; "HTTP/2" for the H2 dispatch path.
+	// Returns the empty string for synthetic streams that did not exercise
+	// HCM dispatch. Seeded once per chain at HCM dispatch time.
+	//
+	// Per ADR-0165 §Decision. Cross-phase reusable; populates ext_authz
+	// AttributeContext.Request.Http.protocol.
+	DownstreamProtocol() string
+
+	// ListenerPrincipal returns the listener's TLS server-cert principal as
+	// extracted from the listener's *stdtls.Config.Certificates[0] leaf cert
+	// (first URI SAN, then first DNS SAN, then Subject DN Common Name —
+	// mirrors the DownstreamPrincipal extraction ordering on the listener-
+	// cert side). Returns the empty string for plaintext listeners (no TLS
+	// transport_socket on the selected filter_chain) or for synthetic
+	// streams. The plumbing pre-extracts the principal at listener-build
+	// time and threads the string through ListenerCtx → *Filter →
+	// chain.SetListenerPrincipal — distinct from DownstreamPrincipal which
+	// is the CLIENT-cert principal extracted per-connection.
+	//
+	// Per ADR-0165 §Decision. Cross-phase reusable; populates ext_authz
+	// AttributeContext.Destination.principal per the §11.P4 in-session
+	// SPEC scrape (reference Envoy populates this automatically from the
+	// listener cert when TLS terminates at the proxy).
+	ListenerPrincipal() string
 }
 
 // EncoderFilterCallbacks is the framework-supplied callback shape for

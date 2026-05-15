@@ -3,6 +3,7 @@ package listener
 import (
 	"context"
 	stdtls "crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -46,9 +47,18 @@ type filterHandler interface {
 // listenerCtx carries per-chain context that filter constructors consult at
 // build time. Phase 05.1 introduces this to plumb the --allow-h2c flag through
 // to the HCM constructor (per ADR-0049). Future phases may extend.
+//
+// Phase 18.2 Task 4 (ADR-0165): `listenerPrincipal` carries the TLS server
+// principal pre-extracted from the chain's `*stdtls.Config.Certificates[0]`
+// leaf cert (first URI SAN, then first DNS SAN, then Subject DN Common Name)
+// at listener-build time. Empty for plaintext chains. HCM-dispatch consumes
+// this string verbatim via `chain.SetListenerPrincipal` on every per-stream
+// chain — distinct from `DownstreamPrincipal` which extracts the CLIENT cert
+// from the per-connection `*tls.Conn.ConnectionState().PeerCertificates[0]`.
 type listenerCtx struct {
-	hasTLS   bool
-	allowH2C bool
+	hasTLS            bool
+	allowH2C          bool
+	listenerPrincipal string
 }
 
 // filterConstructor builds a filterHandler from a typed_config Any, the
@@ -87,12 +97,64 @@ var filterRegistry = map[string]filterConstructor{
 		// real boot-time population; ADR-0072 freeze-after-boot contract).
 		// Phase 08.2 Task 9: dm is threaded through to hcm.NewFilterWithCtxAndSinksAndRegistry
 		// (replaces the Task 5 _ = dm placeholder per ADR-0096).
-		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C}, registry, accessLogSinks, httpRegistry, dm)
+		// Phase 18.2 Task 4 (ADR-0165): plumb the listener-principal string
+		// extracted from the chain's leaf TLS cert into hcm.ListenerCtx so
+		// the HCM filter retains it for per-stream chain seeding via
+		// chain.SetListenerPrincipal.
+		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C, ListenerPrincipal: lc.listenerPrincipal}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
 		return f, nil
 	},
+}
+
+// extractListenerPrincipal returns the listener TLS server-cert principal
+// extracted from the chain's *stdtls.Config.Certificates[0] leaf certificate
+// (parsed via x509.ParseCertificate on Certificate[0]). Priority order
+// mirrors extractTLSPrincipals (used for the CLIENT-cert side at HCM
+// dispatch — see internal/filter/hcm/connection.go): the FIRST URI SAN, then
+// the FIRST DNS SAN, then the Subject DN Common Name. Returns "" for nil
+// configs (plaintext chains), empty cert chains, parse failures, or certs
+// carrying no matching identity.
+//
+// Per ADR-0165 §Decision (phase-18.2 Task 4 — the ADR-0044 escape-valve
+// firing per planner-time decision D3 + D12). Pre-extracted at listener-
+// build time and threaded through listenerCtx → hcm.ListenerCtx → *Filter →
+// chain.SetListenerPrincipal on every per-stream chain. Distinct from
+// DownstreamPrincipal (which extracts the CLIENT cert at HCM dispatch via
+// *tls.Conn.ConnectionState() — per-connection, not per-listener).
+//
+// Cross-phase reusable; ext_proc / global_ratelimit / future ext_authz
+// extensions consume the same surface via DecoderFilterCallbacks.ListenerPrincipal().
+func extractListenerPrincipal(cfg *stdtls.Config) string {
+	if cfg == nil || len(cfg.Certificates) == 0 {
+		return ""
+	}
+	c := cfg.Certificates[0]
+	// Prefer the pre-parsed Leaf cert when available (some loaders populate
+	// it). Otherwise parse Certificate[0] (the DER-encoded leaf cert).
+	leaf := c.Leaf
+	if leaf == nil {
+		if len(c.Certificate) == 0 {
+			return ""
+		}
+		parsed, err := x509.ParseCertificate(c.Certificate[0])
+		if err != nil || parsed == nil {
+			return ""
+		}
+		leaf = parsed
+	}
+	if len(leaf.URIs) > 0 && leaf.URIs[0] != nil {
+		return leaf.URIs[0].String()
+	}
+	if len(leaf.DNSNames) > 0 {
+		return leaf.DNSNames[0]
+	}
+	if cn := leaf.Subject.CommonName; cn != "" {
+		return cn
+	}
+	return ""
 }
 
 // chainInfo holds the per-chain state built at NewManager time.
@@ -349,7 +411,10 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 
 		// Build the terminal filter (same single-filter rule as phase 02).
-		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C}, registry, accessLogSinks, httpRegistry, dm)
+		// Phase 18.2 Task 4 (ADR-0165): listenerPrincipal pre-extracted from
+		// the chain's leaf TLS cert (URI SAN[0] → DNS SAN[0] → Subject CN);
+		// empty for plaintext chains.
+		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(chainTLS)}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
@@ -408,7 +473,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 		// Per ADR-0080: default_filter_chain has an INDEPENDENT TLS posture
 		// from filter_chains[] — no mixed-TLS-rule cross-check here.
-		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C}, registry, accessLogSinks, httpRegistry, dm)
+		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(dfcTLS)}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, errUnwrapFilterChain(err))
 		}

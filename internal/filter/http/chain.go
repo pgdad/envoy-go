@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -105,6 +106,31 @@ type FilterChain struct {
 	// filter dispatch — the slice is read-only per the single-dispatch-
 	// goroutine invariant (ADR-0071).
 	tlsPrincipals []string
+
+	// ADR-0165 callback-surface extension (phase-18.2 Task 4 — the ADR-0044
+	// escape-valve firing per planner-time decision D3 + D12). The 6 fields
+	// below carry per-stream socket / TLS / listener-cert state needed by
+	// ext_authz gRPC-mode's AttributeContext builder (and cross-phase reusable
+	// by ext_proc + global_ratelimit + future ext_authz extensions). Each
+	// field is set ONCE at chain build time by HCM dispatch (connection.go H1
+	// + h2dispatch.go H2) BEFORE RunDecodeHeaders dispatch; per-stream
+	// decoderCB callback methods read the seeded value verbatim — no copy,
+	// no transformation — per the same ownership-invariant ADR-0071 codifies
+	// for tlsPrincipals (single-dispatch-goroutine read; signal-only
+	// concurrent writes are NOT permitted on these fields).
+	//
+	// Zero-value semantics (no SetX call by HCM dispatch):
+	//   - downstreamRemoteAddr / downstreamLocalAddr: nil (synthetic stream)
+	//   - downstreamTLSServerName: "" (plaintext or SNI-absent handshake)
+	//   - downstreamTLSPeerCertDER: nil (plaintext or no-client-cert)
+	//   - downstreamProtocol: "" (synthetic stream; H1/H2 dispatch always seeds)
+	//   - listenerPrincipal: "" (plaintext listener — no transport_socket)
+	downstreamRemoteAddr     net.Addr
+	downstreamLocalAddr      net.Addr
+	downstreamTLSServerName  string
+	downstreamTLSPeerCertDER []byte
+	downstreamProtocol       string
+	listenerPrincipal        string
 
 	// encodeBodyOverride / encodeBodyOverridden carry the encode-side body
 	// replacement bytes registered via EncoderFilterCallbacks.OverwriteBody.
@@ -484,6 +510,41 @@ func (d *decoderCB) DownstreamPrincipal() []string {
 	return d.c.tlsPrincipals
 }
 
+// The 6 reader methods below are the per-stream filter-facing accessors for
+// the ADR-0165 callback-surface extension (phase-18.2 Task 4 — the ADR-0044
+// escape-valve firing per planner-time decision D3 + D12). Each method
+// returns the chain field verbatim; HCM dispatch seeds the field via the
+// matching SetX primitive BEFORE RunDecodeHeaders. Zero-value returns
+// (nil / "") mirror the chain field's documented zero-value semantics —
+// see chain.FilterChain struct field comments.
+//
+// Per ADR-0165 §Decision. Cross-phase reusable; ext_proc / global_ratelimit /
+// future ext_authz extensions consume the same accessor surface.
+
+func (d *decoderCB) DownstreamRemoteAddr() net.Addr {
+	return d.c.downstreamRemoteAddr
+}
+
+func (d *decoderCB) DownstreamLocalAddr() net.Addr {
+	return d.c.downstreamLocalAddr
+}
+
+func (d *decoderCB) DownstreamTLSServerName() string {
+	return d.c.downstreamTLSServerName
+}
+
+func (d *decoderCB) DownstreamTLSPeerCertDER() []byte {
+	return d.c.downstreamTLSPeerCertDER
+}
+
+func (d *decoderCB) DownstreamProtocol() string {
+	return d.c.downstreamProtocol
+}
+
+func (d *decoderCB) ListenerPrincipal() string {
+	return d.c.listenerPrincipal
+}
+
 // encoderCB is the framework's concrete impl of EncoderFilterCallbacks. Same
 // non-blocking send discipline.
 type encoderCB struct {
@@ -550,6 +611,64 @@ func (c *FilterChain) SetRequestCtx(ctx context.Context, routeIdx int) {
 // dispatch-goroutine invariant per ADR-0071); no synchronization required.
 func (c *FilterChain) SetTLSPrincipals(p []string) {
 	c.tlsPrincipals = p
+}
+
+// SetDownstreamRemoteAddr / SetDownstreamLocalAddr / SetDownstreamTLSServerName /
+// SetDownstreamTLSPeerCertDER / SetDownstreamProtocol / SetListenerPrincipal are
+// the 6 chain-seeding primitives anchored by ADR-0165 (phase-18.2 Task 4 — the
+// ADR-0044 escape-valve firing per planner-time decision D3 + D12). All 6
+// mirror the SetTLSPrincipals discipline (set ONCE at chain build time by HCM
+// dispatch BEFORE RunDecodeHeaders; read concurrently by per-stream
+// callbacks). HCM dispatch sites: connection.go's dispatchRequest (H1) +
+// h2dispatch.go's chainDispatchAction.WriteH2 via chainDispatchAction fields
+// (H2). Zero-value semantics on the chain side are documented inline at the
+// field declarations; HCM dispatch elides the SetX call when the source value
+// is the natural zero (e.g. plaintext listener → no SetListenerPrincipal call,
+// chain field stays "").
+//
+// Per ADR-0165 §Decision. Cross-phase reusable framework primitives (ext_proc
+// / global_ratelimit / future ext_authz extensions).
+
+// SetDownstreamRemoteAddr seeds the downstream remote-address field. Called
+// by HCM dispatch with net.Conn.RemoteAddr() of the downstream conn.
+func (c *FilterChain) SetDownstreamRemoteAddr(a net.Addr) {
+	c.downstreamRemoteAddr = a
+}
+
+// SetDownstreamLocalAddr seeds the downstream local-address field. Called by
+// HCM dispatch with net.Conn.LocalAddr() of the downstream conn.
+func (c *FilterChain) SetDownstreamLocalAddr(a net.Addr) {
+	c.downstreamLocalAddr = a
+}
+
+// SetDownstreamTLSServerName seeds the downstream TLS SNI field. Called by
+// HCM dispatch with tls.ConnectionState.ServerName when the downstream conn
+// is a *tls.Conn with HandshakeComplete; empty string passthrough otherwise.
+func (c *FilterChain) SetDownstreamTLSServerName(s string) {
+	c.downstreamTLSServerName = s
+}
+
+// SetDownstreamTLSPeerCertDER seeds the downstream client-cert leaf DER bytes
+// field. Called by HCM dispatch with tls.ConnectionState.PeerCertificates[0].Raw
+// when len(PeerCertificates) > 0 (mTLS); nil-passthrough otherwise. The
+// callee retains a reference to the supplied slice — callers MUST treat the
+// underlying bytes as immutable for the request lifetime.
+func (c *FilterChain) SetDownstreamTLSPeerCertDER(b []byte) {
+	c.downstreamTLSPeerCertDER = b
+}
+
+// SetDownstreamProtocol seeds the downstream-protocol canonical string field.
+// HCM dispatch passes "HTTP/1.1" (H1 path) or "HTTP/2" (H2 path).
+func (c *FilterChain) SetDownstreamProtocol(p string) {
+	c.downstreamProtocol = p
+}
+
+// SetListenerPrincipal seeds the listener-principal string field. HCM
+// dispatch passes the listener TLS-leaf-cert SAN[0]/CN extracted at listener-
+// build time (plumbed through ListenerCtx → *Filter → here). The empty string
+// passes through unchanged for plaintext listeners.
+func (c *FilterChain) SetListenerPrincipal(p string) {
+	c.listenerPrincipal = p
 }
 
 // SetDiagLogWriter overrides the destination for framework diagnostic log

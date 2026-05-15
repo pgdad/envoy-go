@@ -8376,11 +8376,11 @@ The error-classification boundary in `check.go` is empirically RATIFIED at the p
 
 ### Decision
 
-**Status: Accepted — landed at Task 2 of phase-18.1 PLAN per ADR-0044. §Decision amended at phase-18.2 IMPL to activate the `grpc_service` arm.**
+**Status: Accepted — landed at Task 2 of phase-18.1 PLAN per ADR-0044. §Decision AMENDED in-place at Task 3 of phase-18.2 IMPL (Date: 2026-05-15) to activate the `grpc_service` arm.**
 
-**(i) `compiledConfig` struct shape.** The `compiledConfig` struct carries: `checkFn` (the resolved transport closure), `withRequestBody *bufferSettings` (non-nil when `with_request_body.max_request_bytes > 0`), four error-posture fields (`failureModeAllow bool`, `failureModeAllowHeaderAdd bool`, `statusOnError uint32` default 403, `validateMutations bool`), `clearRouteCache bool`, `allowedHeaders *stringMatcherList` + `disallowedHeaders *stringMatcherList` (nil = all allowed / none denied respectively at Task 2 stub; compiled at Task 4), and `stats *filterStats` (SHARED per ADR-0163; nil-guarded per ADR-0085). No transport-specific fields — mode-agnostic and field-final at 18.1 (18.2 adds no field).
+**(i) `compiledConfig` struct shape.** The `compiledConfig` struct carries: `checkFn` (the resolved transport closure), `withRequestBody *bufferSettings` (non-nil when `with_request_body.max_request_bytes > 0`), four error-posture fields (`failureModeAllow bool`, `failureModeAllowHeaderAdd bool`, `statusOnError uint32` default 403, `validateMutations bool`), `clearRouteCache bool`, `allowedHeaders *stringMatcherList` + `disallowedHeaders *stringMatcherList` (nil = all allowed / none denied respectively at Task 2 stub; compiled at Task 4), and `stats *filterStats` (SHARED per ADR-0163; nil-guarded per ADR-0085). No transport-specific fields — mode-agnostic and field-final at 18.1 (18.2 adds no field; the gRPC-mode-specific config — `include_peer_certificate`, `include_tls_session`, `encode_raw_headers`, `pack_as_bytes` — is captured in the `buildGRPCCheckFn` closure's lexical scope per SPEC §6.5 step 5, NOT promoted to `compiledConfig` fields).
 
-**(ii) `services`-oneof dispatch in `buildCompiledConfig`.** The dispatch fires AFTER the structural checks (`transport_api_version` + `with_request_body`) and follows the deterministic ordering: (1) nil `services` oneof → PARSE-REJECT `"ext_authz: services oneof must be set (neither grpc_service nor http_service is configured)"`. (2) `*ExtAuthz_GrpcService` → PARSE-REJECT `"ext_authz: grpc_service mode not yet supported (lands in phase 18.2)"` in 18.1. (3) `*ExtAuthz_HttpService` → call `buildHTTPCheckFn` (Task 2 stub returns `errHTTPCheckFnStub`; Task 3 replaces with the real HTTP-mode `checkFn`). The 18.2 amendment replaces arm (2) with the gRPC `checkFn` construction consuming ADR-0158.
+**(ii) `services`-oneof dispatch in `buildCompiledConfig` (AMENDED at 18.2 per ADR-0158).** The dispatch fires AFTER the structural checks (`transport_api_version` + `with_request_body`) and follows the deterministic ordering: (1) nil `services` oneof → PARSE-REJECT `"ext_authz: services oneof must be set"`. (2) `*ExtAuthz_GrpcService` → at 18.2 the arm activates `buildGRPCCheckFn(s.GrpcService, ctx, cc.validateMutations, raw.GetIncludePeerCertificate(), raw.GetIncludeTlsSession(), raw.GetEncodeRawHeaders(), packAsBytesFromWRB(cc.withRequestBody))` consuming the ADR-0158 `internal/grpcclient/` primitive; the `core.GrpcService.GoogleGrpc` arm PARSE-REJECTs envoy-go-strict per §4.3 + ADR-0008 (`"ext_authz: grpc_service: google_grpc arm not supported"`); `initial_metadata` + `retry_policy` are SILENT-IGNORED per §2.6 + §8 items 2+3 (the configured-but-unused fields surface no error at parse time and have no runtime effect at 18.2 MVP). The Task-3 wire-up STUBS the `buildGRPCCheckFn` body (returns `"ext_authz: grpc_service: TODO (Task 5)"`); Task 5/6 land the real body. At 18.1 the arm PARSE-REJECTed with `"ext_authz: grpc_service mode not yet supported (lands in phase 18.2)"` — that wording is RETIRED at 18.2 (the divergence window is closed; the existing 18.1 Group-1 test that asserted the retired wording is updated at Task 5). (3) `*ExtAuthz_HttpService` → call `buildHTTPCheckFn` (Task 2 stub returns `errHTTPCheckFnStub`; Task 3 replaces with the real HTTP-mode `checkFn`).
 
 **(iii) `transport_api_version` V3-only PARSE-REJECT.** Non-V3 values (including the zero-value `API_VERSION_UNSPECIFIED` = 0) PARSE-REJECT per ADR-0008. The check fires AFTER the `services`-oneof presence/grpc PARSE-REJECTs (ordering: (1) nil/grpc `services` oneof → PARSE-REJECT, (2) `transport_api_version` V3-only check, (3) `with_request_body` validation, (4) `http_service` dispatch via `buildHTTPCheckFn`). Only `corev3.ApiVersion_V3` (value 2 in `go-control-plane v1.32.4`) is accepted.
 
@@ -8396,9 +8396,9 @@ The error-classification boundary in `check.go` is empirically RATIFIED at the p
 
 **`compiledConfig` landed at Task 2.** The struct is field-final at 18.1 — 18.2 adds no new field (only a second `checkFn` constructor). All Task 2 acceptance tests (Groups 1+2+7) pass with `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0.
 
-**`grpc_service` PARSE-REJECT divergence-window for 18.1.** Configs using `grpc_service` fail to load under 18.1 envoy-go but succeed under reference Envoy v1.37.2. This is an intentional 18.1-scoped divergence window, closed at 18.2 when arm (2) in `buildCompiledConfig` is replaced by the real gRPC `checkFn`. Documented divergence-window (see BEHAVIOR_CONTRACT at Task 14).
+**`grpc_service` PARSE-REJECT divergence-window CLOSED at 18.2.** At 18.1 configs using `grpc_service` failed to load under envoy-go but succeeded under reference Envoy v1.37.2 — an intentional 18.1-scoped divergence window. Task 3 of 18.2 CLOSES this window: arm (2) in `buildCompiledConfig` now activates `buildGRPCCheckFn` (the Task-3 STUB returns `"ext_authz: grpc_service: TODO (Task 5)"` — the divergence window narrows but remains briefly open through Tasks 3+4; Task 5 lands the real body and the window closes entirely at the 18.2 phase-done gate). Documented divergence-window resolution lands in the BEHAVIOR_CONTRACT 8-edit at 18.2 Task 13.
 
-**18.2 amendment forward-pointer.** The `*ExtAuthz_GrpcService` arm in `buildCompiledConfig` is the sole §Decision amendment point for 18.2. The amendment replaces the PARSE-REJECT with `buildGRPCCheckFn(cfg.GrpcService, ctx)` consuming ADR-0158. No other `compiledConfig` field changes at 18.2.
+**18.2 §Decision AMENDMENT landed at Task 3.** The `*ExtAuthz_GrpcService` arm in `buildCompiledConfig` was the sole §Decision amendment point for 18.2. The amendment replaced the PARSE-REJECT with `buildGRPCCheckFn(s.GrpcService, ctx, cc.validateMutations, includePeerCert, includeTlsSession, encodeRawHeaders, packAsBytes)` consuming ADR-0158. No other `compiledConfig` field changes at 18.2 — the struct shape held field-final per the 18.1 §Decision body item (i).
 
 **Consumed-vs-deferred field roster.** 18.1 consumes (per parent SPEC §5.P1 + §6 amendment 1): `http_service`, `transport_api_version`, `failure_mode_allow`, `failure_mode_allow_header_add`, `with_request_body`, `clear_route_cache`, `status_on_error`, `validate_mutations`, `allowed_headers`, `disallowed_headers`, `stat_prefix`. 18.1 PARSE-REJECTs: `grpc_service`. 18.1 silent-ignores ~13 fields (runtime/metadata/TLS families per doc.go §Silent-ignored list).
 
@@ -8406,12 +8406,12 @@ The error-classification boundary in `check.go` is empirically RATIFIED at the p
 
 ---
 
-## ADR-0158: gRPC-client outbound framework primitive at NEW top-level package `internal/grpcclient/` — envoy-go's FIRST gRPC infrastructure of any kind; dial + connection-management over `google.golang.org/grpc` + the `envoy.service.auth.v3.Authorization/Check` client stub (ships in `go-control-plane v1.32.4` — no codegen) + gRPC-status → `{allow, deny, error}` error-classification; couples to envoy-go's cluster manager for `GrpcService.EnvoyGrpc` cluster-name resolution (RATIFIED-PENDING-IMPL-TIME — the most-likely ADR-0044 escape-valve surface); cross-phase-reusable for `ext_proc` + `global_ratelimit`
+## ADR-0158: gRPC-client outbound framework primitive at NEW top-level package `internal/grpcclient/` — envoy-go's FIRST gRPC infrastructure of any kind; dial + connection-management over `google.golang.org/grpc` + the `envoy.service.auth.v3.Authorization/Check` client stub (ships in `go-control-plane v1.32.4` — no codegen) + gRPC-status → `{allow, deny, error}` error-classification; couples to envoy-go's cluster manager for `GrpcService.EnvoyGrpc` cluster-name resolution (RATIFIED at impl-time — no ADR-0044 escape-valve fired); cross-phase-reusable for `ext_proc` + `global_ratelimit`
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.2 IMPL per ADR-0044 ADR-on-impl convention.
-**Date:** 2026-05-14
+**Status:** Accepted — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences landed at Task 3 of phase-18.2 IMPL per ADR-0044 ADR-on-impl convention.
+**Date:** 2026-05-15
 **Doctrine:** Phase 18.2 §9 family-row. ADR-0044 ADR-on-impl convention. The FIRST gRPC-infrastructure ADR in envoy-go. Designed cross-phase-reusable at introduction time per the phase-16 ADR-0142/ADR-0144 + phase-17 ADR-0150/ADR-0151 framework-primitive-introduction discipline.
-**Lands-in:** Task 3 (hypothesis) of phase-18.2 PLAN.
+**Lands-in:** Task 3 of phase-18.2 PLAN.
 
 ### Context
 
@@ -8425,11 +8425,37 @@ The §5.P13 pin — the gRPC dial / TLS-to-auth-cluster plumbing — is RATIFIED
 
 ### Decision
 
-LANDS AT Task 3 (hypothesis) of phase-18.2 PLAN per ADR-0044 ADR-on-impl convention. The §Decision body will codify the `internal/grpcclient/` package API (the dial + connection-management surface, the `Authorization/Check` stub wrapper, the error-classification layer), the cluster-manager coupling for `EnvoyGrpc` cluster-name resolution, and the cross-phase-reuse intent. Authored at phase-18.2 SPEC time; this §Context anchor is drafted at the phase-18 parent SPEC commit so the cross-cutting design is on disk per ADR-0044.
+**Status: Accepted — landed at Task 3 of phase-18.2 PLAN per ADR-0044 ADR-on-impl convention.**
+
+**(i) Package shape — `internal/grpcclient/`.** A NEW top-level package at `internal/grpcclient/` (mirroring phase-17's `internal/jwks/` outbound-HTTP precedent at the package-position level — OUTSIDE `internal/filter/` to anchor cross-phase reuse). The package exports a 2-type, 5-function surface: `Dialer` (the cluster-name → `*grpc.ClientConn` layer), `AuthClient` (the typed `Authorization/Check` wrapper), `New(mgr *cluster.Manager) *Dialer`, `(*Dialer).DialContext(ctx, clusterName) (*grpc.ClientConn, error)`, `NewAuthClient(d *Dialer, clusterName, timeout) (*AuthClient, error)`, `(*AuthClient).Check(ctx, *CheckRequest) (*CheckResponse, error)`, `(*AuthClient).Close() error`. Per-Check timeout is captured at `NewAuthClient` time and applied INSIDE `Check` via `context.WithTimeout`. The `Authorization/Check` typed stub is constructed via `authv3.NewAuthorizationClient(conn)` on the dialed `*grpc.ClientConn` — NO codegen; the `envoy.service.auth.v3` bindings ship in `go-control-plane v1.32.4` and compile in for the first time at Task 2.
+
+**(ii) `grpc.WithContextDialer((*cluster.Cluster).Dial)` + `WithTransportCredentials(insecure.NewCredentials())` integration.** `DialContext` constructs the `*grpc.ClientConn` via `grpc.NewClient("passthrough:///"+clusterName, grpc.WithContextDialer(callback), grpc.WithTransportCredentials(insecure.NewCredentials()))`. The `WithContextDialer` callback closes over the `*cluster.Manager`, re-looks-up the cluster on every gRPC sub-channel dial (`mgr.Get(clusterName)` — defensive against future xDS-CDS hot-reload mutations), and calls `(*Cluster).Dial(ctx)` returning a `(net.Conn, _, error)` triple (the `Endpoint` second return is discarded — gRPC sees only the raw `net.Conn`). TLS terminates at the cluster-manager layer per the cluster's `transport_socket: UpstreamTlsContext` parsing — gRPC sees a TLS-wrapped `net.Conn` already-handshaken and does NOT redo TLS; `WithTransportCredentials(insecure.NewCredentials())` instructs gRPC to treat the supplied conn as plaintext from gRPC's POV. RATIFIED against reference Envoy v1.37.2 per the §11.P13 in-session SPEC scrape — the §5.P13 RATIFIED-PENDING pin is CLOSED at this ADR; the ADR-0044 escape-valve surface anticipated at §Context did NOT fire.
+
+**(iii) `passthrough:///<cluster_name>` resolver target rationale per D4.** gRPC's built-in `passthrough` resolver is a single-endpoint scheme that skips DNS resolution and delegates endpoint selection to the `WithContextDialer` callback. The cluster_name is embedded in the target URL for clean diagnostic logging (gRPC logs the target string on sub-channel failures — the cluster name is the most informative debug anchor). The alternative — using `grpc.Dial("dns:///"+host+":"+port, ...)` — would bypass the cluster manager's endpoint selection + TLS state, which is structurally wrong (the cluster manager owns endpoint health-checking, LB-policy, and TLS handshake). `passthrough:///` is the canonical gRPC idiom for "I have my own dialer; defer endpoint selection to my callback".
+
+**(iv) `AuthClient` typed wrapper — `envoy.service.auth.v3.AuthorizationClient` stub from `go-control-plane v1.32.4`.** The typed `authv3.AuthorizationClient` stub at `service/auth/v3/external_auth_grpc.pb.go` is wrapped via `NewAuthorizationClient(conn)` at `NewAuthClient` time. `AuthClient` carries: the `*grpc.ClientConn` (for `Close`), the typed stub (for `Check`), the cluster name (`target`, for logs/errors), and the per-Check `timeout`. The wrapper is intentionally minimal — `Check` is a single-line delegation to `stub.Check(timedCtx, req)` with the `context.WithTimeout` applied around it (when `timeout > 0`). The `Authorization/Check` RPC is unary (no streaming); no stream-management state is needed at the wrapper level.
+
+**(v) One `*grpc.ClientConn` per (cluster_name, `*compiledConfig`) pair created at config-load time + shared across per-stream Check calls.** Per planner-time decision D2: the `*grpcclient.AuthClient` is allocated ONCE at `buildGRPCCheckFn` (config-load) time and captured in the `checkFn` closure on `*compiledConfig`. All per-stream `Check` invocations on that `compiledConfig` share the same `*grpc.ClientConn`. The `*grpc.ClientConn` is goroutine-safe per the gRPC library and manages its own transport-level reconnect via the sub-channel state machine; no per-stream allocation. Concurrent `Check` calls multiplex over the underlying HTTP/2 transport per the gRPC concurrency model.
+
+**(vi) Leaks-on-exit MVP per D2.** In production the filter NEVER calls `(*AuthClient).Close()` — the `*grpc.ClientConn` is leaked-on-exit; the OS reclaims it. envoy-go has no config hot-reload yet (xDS-CDS is deferred per SPEC §8 item 9); the process lifecycle bounds the connection. `Close()` is authored for the Group 3 unit tests (idempotency + concurrent-Close race-clean) and for future hot-reload phases. The first hot-reload-capable phase will introduce a close-on-replacement discipline via a new ADR (NOT 18.2). Mirrors 18.1's `httpAuthClient` no-shutdown discipline.
+
+**(vii) Per-Check `context.WithTimeout` per D9 (applied INSIDE `(*AuthClient).Check`).** The `timeout` captured at `NewAuthClient` construction is applied INSIDE `Check` via `context.WithTimeout(ctx, timeout)` (deferred cancel). The caller's `ctx` (from the filter's `dispatchOutboundCheck` async goroutine) is the parent — its cancellation (from `OnDestroy` via `callCancel()`) propagates through `context.WithTimeout`'s AND-of-cancellation semantics. Both the per-Check timeout AND the caller-cancel surface as transport errors via the `error` return. A zero `timeout` means "no per-Check timeout" — the caller's `ctx` alone bounds the call.
+
+**(viii) Transport errors propagate verbatim per D7.** gRPC `Unavailable` / `DeadlineExceeded` / `Canceled` (and the raw `context.Canceled` / `context.DeadlineExceeded` Go errors when the parent ctx fires first) propagate VERBATIM from `*grpc.ClientConn.Invoke` flow back through `(*AuthClient).Check`'s `error` return. The wrapper does NOT classify or map them — the filter-layer caller (`buildGRPCCheckFn`'s closure body, lands at Task 5/6) maps transport errors to `dispError` BEFORE inspecting the `*CheckResponse` per the SPEC §5.P10 error-classification boundary. `mapGRPCResponse` operates on the `*CheckResponse`, never on a transport error.
 
 ### Consequences
 
-LANDS AT phase-18.2 IMPL per ADR-0044. Records: envoy-go's FIRST gRPC infrastructure; the `go-control-plane v1.32.4` `envoy.service.auth.v3` bindings compiling in for the first time (the phase-18.2 IMPL must verify the bindings compile before building on them — BRAINSTORM §11 lesson (f)); the cross-phase-reuse anchor for `ext_proc` + `global_ratelimit`; the §5.P13 RATIFIED-PENDING closure + the possible ADR-0044 TLS-plumbing escape-valve.
+**Cross-phase reuse: ext_proc + global_ratelimit consume this primitive.** Future ext_proc (phase ~19+) reuses `(*Dialer).DialContext` and composes its own `*ProcessorClient` wrapping `envoy.service.ext_proc.v3.ExternalProcessor.Process` (bidi-stream — extends the unary Check pattern with stream management). Future global_ratelimit (phase TBD) reuses `(*Dialer).DialContext` and composes a `*RateLimitClient` wrapping `envoy.service.ratelimit.v3.RateLimitService.ShouldRateLimit` (unary — structurally identical to ext_authz's Check). The `Dialer` surface is intentionally minimal; no future client coupling is anticipated to require `Dialer` API changes.
+
+**Test ergonomics: in-test PKI + in-process gRPC server enable Groups 1+2+3 unit testing without external auth-service deps.** The `grpcclient_test.go` helpers (`mkAuthPKI` for ECDSA P-256 CA + leaf, `mkH2ClusterMgr` for a TLS + ALPN h2 + `http2_protocol_options{}` cluster manager, `mkPlainClusterMgr` for a `UseH2()==false` cluster manager, `startTestAuthServer` for a TLS-fronted `*grpc.Server` registered with a scriptable fake `AuthorizationServer`) compose into 13 test functions (Group 1: Dialer surface — 4 tests; Group 2: AuthClient surface — 6 tests; Group 3: Close idempotency — 3 tests). All Groups 1+2+3 PASS under `go test -race -count=1 ./internal/grpcclient/...` at Task 3.
+
+**Coupling: the cluster manager surface required is the existing master-tip surface — no new methods.** The dialer requires: `(*cluster.Manager).Get(name) (*Cluster, bool)` (existing), `(*cluster.Cluster).Dial(ctx) (net.Conn, Endpoint, error)` (existing — phase-15 anchor), `(*cluster.Cluster).UseH2() bool` (existing — phase-15 anchor). The §11.P13 in-session RATIFICATION confirmed no new cluster-manager surface is required for gRPC-aware dialing — TLS handling is already at the cluster-manager layer.
+
+**Future work: graceful-shutdown of `*grpc.ClientConn` (leaks-on-exit MVP) lands at the first hot-reload-capable phase.** The leaks-on-exit MVP discipline (D2) defers `Close()` orchestration to the first xDS-CDS-capable phase. The package's `(*AuthClient).Close()` is sync.Once-guarded and tested for idempotency + concurrent-call race-cleanliness at Groups 3; the close-on-replacement integration is left to the future hot-reload ADR.
+
+**§5.P13 RATIFIED-PENDING → RATIFIED at impl-time; no ADR-0044 escape-valve fired.** The §5.P13 pin (gRPC dial / TLS-to-auth-cluster plumbing) anticipated a possible ADR-0044 TLS-plumbing escape-valve. At Task 3 the in-test TLS handshake against the TLS-fronted gRPC test server passes (Group 1 TestDialer_DialContext_HappyPath + Group 2 TestAuthClient_Check_HappyPath both exercise the TLS-at-cluster-manager-layer path), confirming the §11.P13 in-session SPEC scrape RATIFICATION holds at impl time. No new TLS-layer ADR is required.
+
+**Reference: ADR-0044 ADR-on-impl convention.** §Context drafted at the phase-18 parent SPEC commit `308e9b6` per ADR-0044 (the cross-cutting design is on disk before any code lands); §Decision + §Consequences land here at the Task 3 impl commit. Mirrors phase-16 ADR-0142/ADR-0144 + phase-17 ADR-0150/ADR-0151 cross-phase-reusable-framework-primitive-introduction discipline.
 
 ---
 
@@ -8478,10 +8504,10 @@ The BRAINSTORM §3.2 posed an (a)-vs-(b) disposition for the SPEC author: (a) ge
 
 ## ADR-0160: `AttributeContext` / `AuthorizationRequest` builder — HTTP-mode portion (the `AuthorizationRequest` builder: `headers_to_add` + `path_prefix` prepend + the top-level `ExtAuthz.allowed_headers`/`disallowed_headers` request-side filtering + the deprecated-`AuthorizationRequest.allowed_headers` honored-if-present disposition) lands in 18.1; gRPC-mode portion (the `AttributeContext` builder: source/destination Peers, `request.http` per §5.P4, `request.time` `Timestamp` shape, `principal` via the phase-16 ADR-0144 `DownstreamPrincipal()` reuse, `certificate`/`tls_session` honored as `include_peer_certificate`/`include_tls_session` gates per §5.P3, `context_extensions` merge, the `encode_raw_headers` `headers`-vs-`header_map` discipline) lands in 18.2
 
-**Status:** Accepted (HTTP-mode portion) — §Decision + §Consequences for the HTTP-mode portion landed at Task 4 of phase-18.1 IMPL per ADR-0044. The gRPC-mode portion §Decision + §Consequences land at phase-18.2 IMPL.
-**Date:** 2026-05-14
+**Status:** Accepted (HTTP-mode portion — phase-18.1 Task 4). Accepted (gRPC-mode portion — phase-18.2 Task 5). The HTTP-mode portion §Decision + §Consequences landed at Task 4 of phase-18.1 IMPL per ADR-0044; the gRPC-mode portion §Decision + §Consequences landed in-place at Task 5 of phase-18.2 IMPL (`### gRPC-mode portion (lands at phase-18.2 Task 5)` sub-heading below).
+**Date:** 2026-05-15 (gRPC-mode portion landed; HTTP-mode portion landed 2026-05-14)
 **Doctrine:** Phase 18.1 + 18.2 §9 family-row. ADR-0044 ADR-on-impl convention. The gRPC-mode portion is the SECOND cross-phase reuse of ADR-0144 `DownstreamPrincipal()` (phase-16 rbac was the introducer-and-first-consumer).
-**Lands-in:** Task 4 of phase-18.1 PLAN (HTTP-mode portion). phase-18.2 PLAN (gRPC-mode portion).
+**Lands-in:** Task 4 of phase-18.1 PLAN (HTTP-mode portion). Task 5 of phase-18.2 PLAN (gRPC-mode portion).
 
 ### Context
 
@@ -8521,14 +8547,57 @@ ext_authz must build a request representation to ship to the external auth servi
 
 **gRPC-mode portion (18.2)** — the `AttributeContext` builder + the `DownstreamPrincipal()` reuse + the `include_*` gating + the `encode_raw_headers` discipline + the `tls_session` RATIFIED-PENDING-IMPL-TIME closure all land at phase-18.2 IMPL. This ADR's §Decision is amended at 18.2 to add the gRPC-mode portion.
 
+### gRPC-mode portion (lands at phase-18.2 Task 5)
+
+**Status: Accepted — landed at Task 5 of phase-18.2 IMPL per ADR-0044.** The phase-18.2 SPEC §6.6 (with AMENDMENT cited per ADR-0165 / Amendment date 2026-05-15 — pure-function signature preserved; SOURCE of state capture moves to the 6 new `DecoderFilterCallbacks` methods) + the §11.P4 RATIFIED in-session SPEC scrape are the load-bearing inputs.
+
+**(viii) `buildAttributeContext` signature — pure function of `*authRequest` + 4 booleans.** `buildAttributeContext(req *authRequest, encodeRawHeaders bool, packAsBytes bool, includePeerCert bool, includeTlsSession bool) *authv3.AttributeContext`. ALL per-stream state (socket addresses, TLS state, principal slice, per-route context extensions, request ID, stream-start-time, listener-principal) is READ from the extended `*authRequest`; NO `DecoderFilterCallbacks` parameter (the SPEC §6.5 mode-agnostic-closure invariant + the SPEC §6.6 AMENDMENT — purity preserved). The 10 new `*authRequest` fields (`remoteAddr`, `localAddr`, `tlsServerName`, `peerCertDER`, `listenerPrincipal`, `protocol`, `requestID`, `streamStartTime`, `perRouteContextExtensions`, `downstreamPrincipal`) are populated at `DecodeHeaders` time via the ADR-0165 6-method callback surface (consumer-site seeding lands at Task 8's `dispatchOutboundCheck` extension; Task 5 ships only the field declarations + the consumer `buildAttributeContext`).
+
+**(ix) Populated set faithful to §11.P4 in-session SPEC scrape.** `buildAttributeContext` reproduces the §11.P4 RATIFIED populated set:
+
+  - `source = &Peer{Address: addressFromNetAddr(req.remoteAddr), Principal: firstOrEmpty(req.downstreamPrincipal)}` — `Principal` sourced from the phase-16 ADR-0144 `DownstreamPrincipal()` joined-string slice (first element; "" for empty / plaintext / no-client-cert per ADR-0144 case (c)).
+  - `destination = &Peer{Address: addressFromNetAddr(req.localAddr), Principal: req.listenerPrincipal}` — `Principal` populated **AUTOMATICALLY** from the listener TLS cert's URI SAN[0] / DNS SAN[0] / Subject CN (per `extractListenerPrincipal` in `internal/listener/manager.go`, plumbed via ADR-0165 §Decision). **NOT gated by `include_peer_certificate`** (the §11.P4 in-session SPEC scrape refines parent §5.P3's framing — `include_peer_certificate` gates the CLIENT cert `source.certificate`; `destination.principal` is a separate AUTOMATIC field reflecting the LISTENER cert identity).
+  - `request.http = &AttributeContext_HttpRequest{Id: req.requestID, Method: req.method, Headers: lowercaseHeaderMap(req.headers), Path: req.path, Host: req.headers.Get(":authority"), Scheme: req.headers.Get(":scheme"), Size: int64(len(req.body)), Protocol: req.protocol, Body: bodyStringIfNotBytes(req.body, packAsBytes), RawBody: bodyBytesIfBytes(req.body, packAsBytes)}` — pseudo-headers `:authority`/`:method`/`:path`/`:scheme` **INCLUDED** in the `Headers` map (lowercased; the gRPC-mode map is a proto `map<string,string>` and accepts `:`-prefixed names verbatim per §11.P4 — distinct from HTTP-mode `buildAuthRequest` which strips them because `net/http` rejects `:`-prefixed names); HCM-injected `x-forwarded-proto` / `x-request-id` / `x-envoy-auth-partial-body` are **already present** in `req.headers` by the time `DecodeHeaders` fires (per §11.P4 finding — HCM injects them before ext_authz runs; `buildAttributeContext` does NOT inject them itself).
+  - `request.time = timestamppb.New(req.streamStartTime)` — falls back to `timestamppb.New(time.Now())` when `req.streamStartTime` is the zero value (the IMPL settle per SPEC §6.6 step 4 documented variability; Group 12 `TestBuildAttributeContext_StreamStartTimeZero_FallsBackToNow` empirically pins both arms).
+  - `tls_session.sni` — populated **IFF** `includeTlsSession` AND `req.tlsServerName != ""` (the conditional gate per §11.P4 RATIFICATION). **ONLY `sni`** populated; other `TLSSession` fields (currently only `sni` exists in the proto at v1.32.4) stay empty.
+  - `source.certificate` — populated **IFF** `includePeerCert` AND `len(req.peerCertDER) > 0` (the conditional gate per parent §5.P3). Encoding: the proto field type is `string` and the proto docs say "the certificate contents are encoded in URL and PEM format" — the envoy-go MVP coerces raw DER bytes to `string` (`string(req.peerCertDER)`). The §11.P4 in-session SPEC scrape did NOT exercise this field (curl presented no client cert); the URL+PEM encoding remains a possible IMPL refinement if a behavior delta surfaces vs reference Envoy v1.37.2 in a future TLS-listener-extension differential fixture.
+  - `metadata_context = &corev3.Metadata{}` + `route_metadata_context = &corev3.Metadata{}` — **empty proto messages** (NOT nil pointers) per the §11.P4 in-session evidence (`metadataContext: {}` + `routeMetadataContext: {}` rendered as empty objects). The dynamic-metadata family populated set is **deferred** per SPEC §8 item 1; the empty-message shape is the forward-compat placeholder consistent with the wire-observed default.
+  - `context_extensions = req.perRouteContextExtensions` — the merged per-route + listener-level map from the resolved `CheckSettings.context_extensions`. Empty for MVP-no-per-route per SPEC §5; Task 7 wires the actual per-route merge into `req.perRouteContextExtensions`.
+
+**(x) `encode_raw_headers` D6 closure — DEFERRED for MVP.** The `encode_raw_headers` flag PARSES (config-side, threaded through `buildGRPCCheckFn` per ADR-0157 §Decision AMENDMENT) but produces **no `AttributeContext` difference** at MVP — `request.http.header_map` stays nil; the legacy `request.http.headers` map is always populated. Rationale: (a) reference Envoy v1.37.2 populates `headers` (the legacy field) by default per §11.P4 scrape evidence (the in-session scrape did not toggle `encode_raw_headers: true`); (b) fixture 0021's byte-equivalence assertion is satisfied by the legacy `headers` map alone — there is no scenario in the 8-scenario matrix that requires `header_map` population; (c) the deferral is a per SPEC §8 item 8 documented forward-pointer. A future fixture extension or a phase-19+ trigger may flip the deferral; Group 12 `TestBuildAttributeContext_EncodeRawHeaders_DeferredHeaderMap` pins the MVP behavior (flag-true → `header_map` nil).
+
+**(xi) Helpers consumed by `buildAttributeContext`.** Five helpers landed alongside the function — all package-private in `attributes.go`:
+
+  - `addressFromNetAddr(net.Addr) *corev3.Address` — wraps a `*net.TCPAddr` (canonical type returned by `(*net.TCPConn).RemoteAddr/LocalAddr`) into a `*corev3.Address` with the `SocketAddress` arm + `PortValue` port specifier. Nil input → nil return (the proto accepts an absent field). Non-TCPAddr fallback uses `net.SplitHostPort` for best-effort parsing (unparseable → empty IP + zero port).
+  - `lowercaseHeaderMap(http.Header) map[string]string` — converts a canonicalized-key `http.Header` into a lowercased-key `map[string]string`. Multi-value headers join with `,` per reference Envoy v1.37.2 internal lowercase+comma-join discipline. Pseudo-headers (`:`-prefixed) are INCLUDED (NOT stripped — distinct from HTTP-mode `buildAuthRequest`).
+  - `firstOrEmpty([]string) string` — first element of a string slice, or `""` for empty/nil. Used to extract the `source.principal` from the `req.downstreamPrincipal` ADR-0144 joined-string slice per SPEC §6.6 step 1.
+  - `bodyStringIfNotBytes(body []byte, packAsBytes bool) string` — `string(body)` when `!packAsBytes`, else `""`.
+  - `bodyBytesIfBytes(body []byte, packAsBytes bool) []byte` — `body` when `packAsBytes`, else `nil`.
+
+**(xii) `*authRequest` 10-field extension.** The 18.1 `*authRequest` struct (4 fields: `method`, `path`, `headers`, `body`) is extended at Task 5 with 10 new fields per D3 + ADR-0165: `remoteAddr net.Addr`, `localAddr net.Addr`, `tlsServerName string`, `peerCertDER []byte`, `listenerPrincipal string`, `protocol string`, `requestID string`, `streamStartTime time.Time`, `perRouteContextExtensions map[string]string`, `downstreamPrincipal []string`. The 18.1 fields carry forward unchanged. HTTP-mode `buildAuthRequest` leaves the new fields at zero values (the HTTP-mode `checkFn` closure does not read them); gRPC-mode `buildAttributeContext` reads them. This preserves the ADR-0157 §Decision mode-agnostic closure invariant (`checkFn(ctx, *authRequest)` carries a single struct shape for both modes).
+
+### Consequences (gRPC-mode portion — addenda)
+
+**`attributes.go` extended (~290 LoC net for the Task 5 additions)** — `buildAttributeContext` (~100 LoC body) + 5 helpers (`addressFromNetAddr` ~30 LoC, `lowercaseHeaderMap` ~25 LoC, `firstOrEmpty` ~5 LoC, `bodyStringIfNotBytes` ~5 LoC, `bodyBytesIfBytes` ~5 LoC) + the function-header doc block (~80 LoC). Within the SPEC §6.8 budget guidance (200–350 LoC).
+
+**`extauthz.go` `*authRequest` extended (~50 LoC net for the 10-field addition)** — 4 → 14 fields. The new fields are unconditionally allocated regardless of mode; the mode-agnostic invariant is preserved. The `*authRequest` doc-comment block is extended in-place to record the dual-mode field discipline.
+
+**§11.P4 RATIFIED scrape closures CONFIRMED at Task 5.** The populated set produced by `buildAttributeContext` is asserted byte-by-byte against the §11.P4 in-session evidence in Group 12's `TestBuildAttributeContext_PopulatedSet_18P4` — pseudo-headers + HCM-injected headers + socket addresses + listener-principal automatic population + `tls_session.sni` conditional + `metadata_context` / `route_metadata_context` empty-message-not-nil. Full empirical confirmation against running reference Envoy v1.37.2 is deferred to the Task 12 fixture-0021 differential pass per the SPEC §7.2 scope (the fixture uses a plaintext listener so the `tls_session` + `source.certificate` arms remain unit-test-only — the SPEC §7.2 documented testing gap).
+
+**D6 closure (encode_raw_headers `header_map` arm DEFERRED for MVP) RECORDED.** The 18.2 IMPL settles per cost (no scenario in fixture 0021 requires `header_map` population; reference Envoy populates the legacy `headers` field by default per §11.P4). SPEC §8 item 8 carries the deferral marker forward; a phase-19+ trigger may flip if a behavior delta surfaces.
+
+**Task 6 forward-pointer.** `buildAttributeContext` is the gRPC-mode `AttributeContext` builder; the gRPC-mode `mapGRPCResponse` builder + `buildAllowDispositionGRPC` + `buildDenyDispositionGRPC` land at Task 6 (ADR-0161 gRPC-mode portion). Task 5 ships the inbound-to-auth-server side ONLY; Task 6 ships the outbound-from-auth-server side.
+
+**Task 8 forward-pointer.** The 10 new `*authRequest` fields are POPULATED by `dispatchOutboundCheck`'s seeding extension at Task 8 — via the 6 ADR-0165 `DecoderFilterCallbacks` accessors (`DownstreamRemoteAddr` / `DownstreamLocalAddr` / `DownstreamTLSServerName` / `DownstreamTLSPeerCertDER` / `DownstreamProtocol` / `ListenerPrincipal`) + the existing ADR-0144 `DownstreamPrincipal` reuse + `headers.Get("x-request-id")` for `requestID` + `time.Now()` (or HCM-tracked stream-start) for `streamStartTime` + per-route resolve for `perRouteContextExtensions`. Task 5 ONLY declares the fields + the consumer `buildAttributeContext`; the production-side seeding is Task 8's job.
+
 ---
 
 ## ADR-0161: Bidirectional header-mutation discipline — request-side filtering (top-level `allowed_headers`/`disallowed_headers`) + allow-path upstream injection + deny-path downstream copying + `validate_mutations` gating + the deny-path header-set construction; HTTP-mode portion (`AuthorizationResponse.{allowed_upstream_headers, allowed_upstream_headers_to_append, allowed_client_headers}`) lands in 18.1; gRPC-mode portion (`OkHttpResponse.{headers, headers_to_remove, response_headers_to_add}` + `DeniedHttpResponse.headers`) lands in 18.2; records the `allowed_client_headers_on_success` + `query_parameters` + `dynamic_metadata_from_headers` deferrals + the possible stash-for-HCM revisit
 
-**Status:** Accepted (HTTP-mode portion, Task 5 of phase-18.1 PLAN); Anticipated — gRPC-mode portion lands at phase-18.2 IMPL per ADR-0044.
-**Date:** 2026-05-14
+**Status:** Accepted (HTTP-mode portion, Task 5 of phase-18.1 PLAN; gRPC-mode portion, Task 6 of phase-18.2 PLAN).
+**Date:** 2026-05-15
 **Doctrine:** Phase 18.1 + 18.2 §9 family-row. ADR-0044 ADR-on-impl convention. The `validate_mutations` gating mirrors the phase-10 header_mutation protected-header discipline.
-**Lands-in:** Task 5 of phase-18.1 PLAN (HTTP-mode portion confirmed); phase-18.2 PLAN (gRPC-mode portion).
+**Lands-in:** Task 5 of phase-18.1 PLAN (HTTP-mode portion confirmed); Task 6 of phase-18.2 PLAN (gRPC-mode portion confirmed).
 
 ### Context
 
@@ -8569,6 +8638,61 @@ The deny-path wire shape is empirically RATIFIED at the parent SPEC §5.P11: bod
 **(iv) `allowed_client_headers_on_success` deferred.** envoy-go's decode-side-only filter shape cannot honor the allow-path downstream-response header set without an encode-side leg. The deferral is permanent unless the stash-for-HCM mechanism (§Context above) is later implemented under an escape-valve ADR.
 
 **(v) gRPC-mode portion deferred to phase-18.2.** The `OkHttpResponse.{headers, headers_to_remove, response_headers_to_add}` + `DeniedHttpResponse.headers` mapping lands in 18.2. The `dispAllow.upstreamSet`/`upstreamApp` and `dispDeny.denyHeaders` fields on `checkDisposition` are already the correct shared-shape; the gRPC mapper will populate them following the same downstream consumption path.
+
+### gRPC-mode portion (lands at phase-18.2 Task 6)
+
+**(viii) `mapGRPCResponse` dispatch (SPEC §6.7 6-row table).** `mapGRPCResponse(resp *authv3.CheckResponse, validateMutations bool) checkDisposition` lives in `check.go`. It dispatches on `resp.HttpResponse` oneof + `resp.GetStatus().GetCode()` per the SPEC §6.7 6-row truth table:
+
+| `HttpResponse` oneof | `Status.Code` | Disposition | Rationale |
+|---|---|---|---|
+| nil (empty oneof) | 0 (OK) | `dispAllow` | Implicit allow per SPEC §6.7 (auth service signaled OK without supplying a structured allow response). |
+| nil (empty oneof) | non-zero | `dispDeny` (default 403) | Status-only deny per SPEC §6.7 — no body / no headers. |
+| `*CheckResponse_OkResponse` | 0 (OK) | `dispAllow` via `buildAllowDispositionGRPC` | Canonical allow with mutations. |
+| `*CheckResponse_OkResponse` | non-zero | `dispError` | Structurally inconsistent per SPEC §6.7 commentary — envoy-go-strict catches auth-server bugs. |
+| `*CheckResponse_DeniedResponse` | non-zero | `dispDeny` via `buildDenyDispositionGRPC` | Canonical deny. |
+| `*CheckResponse_DeniedResponse` | 0 (OK) | `dispError` | BEHAVIOR_CONTRACT-documented divergence-window per SPEC §6.7 + §13.4 — envoy-go-strict. |
+
+A nil `*CheckResponse` (defensive only — the grpcclient layer should never return one without an error) is treated as the empty-CheckResponse allow row.
+
+**(ix) `OkHttpResponse.headers` 4-arm `append_action` dispatch (D5).** `buildAllowDispositionGRPC(okResp *authv3.OkHttpResponse, validateMutations bool) checkDisposition` extracts the four `HeaderValueOption.append_action` enum arms into the existing `upstreamSet` / `upstreamApp` fields plus a NEW per-entry `headerKV.action appendDispatch` discriminator field per planner-time decision D5:
+
+| `append_action` enum | Slice | `headerKV.action` |
+|---|---|---|
+| `APPEND_IF_EXISTS_OR_ADD` (0; default) | `upstreamApp` | `appendDispatchDefault` |
+| `OVERWRITE_IF_EXISTS_OR_ADD` (2) | `upstreamSet` | `appendDispatchDefault` |
+| `OVERWRITE_IF_EXISTS` (3) | `upstreamSet` | `appendDispatchOverwriteOnly` (Set-IF-PRESENT) |
+| `ADD_IF_ABSENT` (1) | `upstreamSet` | `appendDispatchAddIfAbsent` (Set-IF-ABSENT) |
+
+The 18.1 HTTP-mode call sites continue to emit `headerKV{name, value}` literals with the zero-value `action` (= `appendDispatchDefault`) — byte-identical behavior preserved. `applyUpstreamMutations` (extauthz.go) is extended with a per-entry `switch kv.action` over the `upstreamSet` loop: `appendDispatchDefault` → unconditional `headers.Set` (18.1 default + gRPC OVERWRITE_IF_EXISTS_OR_ADD); `appendDispatchOverwriteOnly` → `headers.Set` only when `len(headers.Values(name)) > 0`; `appendDispatchAddIfAbsent` → `headers.Set` only when `len(headers.Values(name)) == 0`. An unknown enum value defensively falls back to APPEND semantics (matching reference Envoy's forward-compat behavior).
+
+**(x) `OkHttpResponse.headers_to_remove` → `upstreamDel []string`.** `checkDisposition` is extended with a new `upstreamDel []string` field. Each name in `OkHttpResponse.headers_to_remove` is lowercased (Envoy's internal lowercase-header convention) and appended to `upstreamDel`. `applyUpstreamMutations` is extended with a final step (after `upstreamSet` + `upstreamApp`) that calls `headers.Del(name)` for each entry — applied LAST so a header named in both `upstreamSet`/`upstreamApp` AND `upstreamDel` is deleted (matching reference Envoy's verbatim "set-then-remove" semantics — the auth service has full authority over the final upstream header set). The field is UNUSED in 18.1 HTTP-mode (the HTTP `AuthorizationResponse` proto has no equivalent field).
+
+**(xi) `OkHttpResponse.response_headers_to_add` SILENT-IGNORED (D11).** Per planner-time decision D11 + SPEC §8 item 5: the proto field PARSES (we accept it without error) but the envoy-go filter is decoder-only per ADR-0156 — there is no encode-side leg to inject headers into the downstream RESPONSE on the allow path. The Group 11 unit test `TestBuildAllowDispositionGRPC_ResponseHeadersToAdd_SilentIgnored` pins the silent-ignore behavior (no crash; no `upstreamSet`/`upstreamApp`/`upstreamDel` leakage). Joint divergence-window with the 18.1 HTTP-mode `allowed_client_headers_on_success` deferral (§Decision (iv) Consequences).
+
+**(xii) `DeniedHttpResponse.{status.code, body, headers}` VERBATIM pass-through — UNLIKE HTTP-mode.** `buildDenyDispositionGRPC(deniedResp *authv3.DeniedHttpResponse, validateMutations bool) checkDisposition` extracts:
+  - `status.code` → `denyStatus` (defaulting to 403 when zero per SPEC §6.7 — the proto's zero-enum is `Empty`, not `OK`);
+  - `body` → `denyBody` (verbatim byte copy);
+  - `headers` → `denyHeaders` **VERBATIM** with names lowercased — **NO `allowed_client_headers` filter**, UNLIKE HTTP-mode.
+
+The verbatim discipline is per parent SPEC §5.P11 RATIFIED in-session evidence. The gRPC envelope is structured precisely so the auth service has full authority over the downstream deny response shape; envoy-go does not second-guess. The Group 11 test `TestBuildDenyDispositionGRPC_NoFilterUnlikeHTTPMode` is the load-bearing negative pin (a header that would NOT pass the HTTP-mode `allowed_client_headers` filter still appears verbatim in the gRPC-mode deny output).
+
+**(xiii) `validate_mutations` gating identical to HTTP-mode.** When `validateMutations: true`: `validateMutationHeaders` (mode-agnostic, authored in attributes.go at 18.1 Task 4) runs over the extracted `upstreamSet` + `upstreamApp` on the allow path AND over `denyHeaders` on the deny path. A violation (`:`-prefixed pseudo-header / invalid header-name characters / invalid header-value characters) returns `checkDisposition{class: dispInvalid}` — the same fourth-class discipline as 18.1 §Decision (v). The `invalid` counter increments at `applyDisposition` time per SPEC §6.3. `upstreamDel` is a name-only list; the rejection rule for `:`-prefixed names on the delete path is left unenforced at this layer because `headers.Del(":foo")` is a no-op in net/http (the canonical-form mismatch prevents matching) — defense-in-depth.
+
+**(xiv) `buildGRPCCheckFn` real body lands at Task 6.** The Task-3 sentinel (`"ext_authz: grpc_service: TODO (Task 5)"`) is replaced with the real 6-step body per SPEC §6.5: (1) `GoogleGrpc` arm PARSE-REJECT envoy-go-strict (`"ext_authz: grpc_service: google_grpc arm not supported"`); (2) `EnvoyGrpc.cluster_name` PGV-mirror (`min_len: 1`) — PARSE-REJECT empty; (3) `ctx.ClusterManager.Get(clusterName)` lookup — PARSE-REJECT on unknown / `!UseH2()`; (4) `grpcclient.NewAuthClient(dialer, clusterName, durationpbToGo(gs.Timeout))` construction; (5) `initial_metadata` + `retry_policy` SILENT-IGNORED per SPEC §2.6 + §8 items 2+3; (6) return the per-stream closure `(ctx, req) → mapGRPCResponse(ac.Check(ctx, &authv3.CheckRequest{Attributes: buildAttributeContext(...)}), validateMutations)`. `FactoryCtx` is extended with a `ClusterManager *cluster.Manager` field (Phase-18.2 first-use anchor); the HCM `parseHTTPFiltersChain` threads it from the bootstrap-time cluster manager into the per-filter factories.
+
+**(xv) Envoy-go-strict treatment of inconsistent CheckResponse shapes.** Per SPEC §6.7 commentary + §13.4 divergence-window: `OkResponse + non-zero status` AND `DeniedResponse + zero status` are treated as `dispError` rather than silently resolved. This is the load-bearing envoy-go-strict discipline that surfaces auth-server bugs (e.g. an auth service that returns `CheckResponse_OkResponse{}` with a `Status.Code != 0` is structurally inconsistent; reference Envoy may permissively allow the request — envoy-go raises the error and applies the `failure_mode_allow` posture). The BEHAVIOR_CONTRACT divergence-window is closed in 18.2 IMPL Task 13.
+
+### Consequences (gRPC-mode portion)
+
+**(vi) `headerKV.action` discriminator landing — backward-compat preserved.** The new `appendDispatch` enum field on `headerKV` defaults to `appendDispatchDefault` (the zero value), so all 18.1 HTTP-mode `headerKV{name, value}` struct literals carry the default semantics unchanged. `applyUpstreamMutations`'s 18.1 unconditional `headers.Set` loop becomes a `switch kv.action` dispatch where the default branch is byte-identical to the 18.1 behavior. No 18.1 test was rewritten — only Group 11 + the new D5-dispatch tests in `applyUpstreamMutations_*` exercise the non-default arms.
+
+**(vii) `checkDisposition.upstreamDel` field added — UNUSED in 18.1 HTTP-mode.** The HTTP `AuthorizationResponse` proto has no equivalent field, so HTTP-mode `mapHTTPResponseWithMatchers` does not populate `upstreamDel`. The `applyUpstreamMutations` `upstreamDel` loop is a no-op when the slice is nil/empty (the typical 18.1 HTTP-mode path).
+
+**(viii) `FactoryCtx.ClusterManager` first-use at phase-18.2.** The HTTP factory framework gains its first cluster-manager-bearing factory. ADR-0085 nil-tolerance applies: tests that construct `FactoryCtx{}` (no `ClusterManager`) and exercise the gRPC-mode arm see a PARSE-REJECT with `"cluster manager not available (FactoryCtx.ClusterManager is nil)"`. Production HCM-build-time always threads it in via `parseHTTPFiltersChain`.
+
+**(ix) gRPC-mode deny VERBATIM = no filter latitude.** Operators cannot configure a deny-path allow-list for gRPC-mode (UNLIKE HTTP-mode's `allowed_client_headers`). This is intentional: the gRPC envelope's `DeniedHttpResponse` is precisely the auth service's authoritative downstream-response shape; an envelope-level filter would defeat the purpose. Operators who need filtering must do so in the auth service itself.
+
+**(x) Task 8 + Task 14 forward-pointer.** The `dispatchOutboundCheck` per-stream seeding (Task 8) wires the new `*authRequest` extension fields from the ADR-0165 callback surface — required for `buildAttributeContext` to produce non-zero TLS/peer/principal AttributeContext fields. Task 14 records the fuzz-corpus + end-to-end fixture-0021 differential closure for the gRPC-mode disposition mapping.
 
 ---
 
@@ -8709,6 +8833,142 @@ Cross-references:
 - **ADR-0106** (§9 family-rows are flat top-level rows; sub-phase rows get their own rows).
 - **ADR-0084** (phase-08's documentation-of-application ADR — the precedent ADR-0164 mirrors).
 - **ADR-0156..ADR-0163** (the 8 BRAINSTORM-anticipated phase-18 ADRs the split distributes across 18.1 + 18.2).
+
+---
+
+## ADR-0165: Cross-phase-reusable callback-surface extension on `DecoderFilterCallbacks` — 6 new accessor methods (`DownstreamRemoteAddr`/`DownstreamLocalAddr`/`DownstreamTLSServerName`/`DownstreamTLSPeerCertDER`/`DownstreamProtocol`/`ListenerPrincipal`) seeded at HCM dispatch via 6 new chain primitives mirroring the ADR-0144 `tlsPrincipals`/`SetTLSPrincipals`/`DownstreamPrincipal()` pattern; ADR-0044 escape-valve firing per planner-time decision D3 + D12 of phase-18.2 PLAN; SPEC §13.5 + §6.5 step 5 + §6.6 AMENDED in-place at the same commit — the "NO new callback method" hard constraint is flipped for SPEC internal consistency with §15 item 4 + §11.P4 RATIFICATION
+
+**Status:** Accepted
+**Date:** 2026-05-15
+**Doctrine:** ADR-0044 (ADR-on-impl convention + escape-valve for impl-time-unanticipated decisions — this ADR's §Context is authored from scratch at IMPL time; no pre-SPEC-time draft). ADR-0071 (chain-ownership-invariant — the 6 new chain fields obey the same single-dispatch-goroutine read + signal-only-concurrent-write discipline as `tlsPrincipals`). ADR-0144 (the precedent for the seed-at-HCM-dispatch / read-via-callback pattern; `DownstreamPrincipal()` is the prior framework primitive this ADR generalizes).
+**Lands-in:** Task 4 of phase-18.2 IMPL (this commit).
+
+### Context
+
+The phase-18.2 SPEC §13.5 (BEHAVIOR_CONTRACT integration) stated as a hard constraint:
+
+> **§13.5 — `## HTTPFilterCallbacks` — NO extensions.** 18.2 reuses ADR-0144 `DownstreamPrincipal()` as the sole TLS-aware decoder-callback method; ALL other per-stream state needed by `buildAttributeContext` (`socket_address` source/destination, TLS `ServerName`, peer cert DER, listener-cert-derived principal, stream-start-time, per-route context-extensions) is captured at `DecodeHeaders` time into the extended `*authRequest` struct (per §6.5–§6.6) — mirroring ADR-0144's seed-at-HCM-dispatch plumbing pattern. NO new method on `envoyhttp.DecoderFilterCallbacks` lands at 18.2; the SPEC author verified that the existing callback surface at master tip (`internal/filter/http/callbacks.go`) exposes only `DownstreamPrincipal() []string` for TLS-derived state and the IMPL must NOT extend it.
+
+SPEC §6.5 step 5 and §6.6 carried the same constraint in two more forms ("NO new `DecoderFilterCallbacks` primitive" + "pure function of `*authRequest` + the four config booleans; NO `DecoderFilterCallbacks` parameter"). Three SPEC paragraphs anchor the same "no callback-surface extension" position.
+
+At phase-18.2 PLAN time the planner re-verified the master-tip callback surface (`internal/filter/http/callbacks.go`) and the SPEC's required populated set for `AttributeContext`:
+
+1. **SPEC §15 acceptance item 4** requires the `AttributeContext` populated set to match reference Envoy v1.37.2's §11.P4 in-session scrape — specifically `tls_session.sni`, `source.certificate` (DER bytes), source + destination socket addresses, `destination.principal` (listener cert SAN/CN), `request.http.protocol` ("HTTP/1.1" / "HTTP/2").
+2. **SPEC §11.P4 RATIFICATION** confirms reference Envoy populates `destination.principal` AUTOMATICALLY from the listener's TLS server cert (URI SAN, then DNS SAN, then Subject DN CN) — a parity-load-bearing field for the differential fixture 0021.
+3. **Master-tip callback surface** exposes only `DownstreamPrincipal() []string` for TLS-aware state. The other 6 fields above (`RemoteAddr` / `LocalAddr` / `ServerName` / `PeerCertDER` / `Protocol` / `ListenerPrincipal`) have NO accessor — the only path to reach them is `*tls.Conn.ConnectionState()` (downstream connection state) plus the listener's `*stdtls.Config.Certificates[0]` (server cert side) — neither is reachable from inside a per-stream `DecoderFilterCallbacks` callback method.
+4. **SPEC §6.5 step 5 + §6.6** specify "extracted from connection state at `DecodeHeaders` time when the per-stream `dcb` is in scope" — but that requirement is unsatisfiable without callback extension because `dcb` exposes NO method that reaches connection-level state beyond the existing `DownstreamPrincipal()`.
+
+The two horns of the dilemma at PLAN time:
+
+- **Horn A: respect SPEC §13.5 hard constraint** → leave the callback surface untouched → the `AttributeContext` populated set is UNSATISFIABLE for `tls_session.sni`, `source.certificate`, `destination.principal`, socket addresses, `request.http.protocol` → SPEC §15 acceptance item 4 fails and the differential fixture diverges vs reference Envoy v1.37.2 — a behaviorally significant divergence.
+- **Horn B: extend the callback surface** → 6 new methods on `DecoderFilterCallbacks` → the SPEC §13.5 + §6.5 step 5 + §6.6 hard constraints are flipped → SPEC §15 item 4 satisfied + fixture 0021 differential clean.
+
+The planner-time D3 decision settled on Horn B at PLAN time (D3 + D12 in the planner-time decision ledger of `PLAN.md`). The PLAN's File-structure table anticipated this exact outcome and File-ledger budget for `callbacks.go` (+60–100 LoC) + `chain.go` (+100–150 LoC) + HCM dispatch sites (+30–80 LoC). **The ADR-0044 escape-valve fires at Task 4** — this ADR is authored from scratch at IMPL time per ADR-0044's "impl-time-unanticipated" branch (no pre-SPEC-time §Context draft; the SPEC §13.5 hard constraint was the wrong call at SPEC time, falsified by the PLAN-time verification of SPEC §15 item 4 + §11.P4).
+
+**Cross-phase reuse**: the 6 callback methods are NOT ext_authz-specific — ext_proc (phase ~19+) needs the same per-stream socket + TLS + listener-cert state for its `ProcessingRequest.attributes` envelope; global_ratelimit (phase TBD) needs the same for descriptor matching; future ext_authz extensions (CheckResponse-driven downstream-header-augmentation) need the same. Anchoring the 6 methods as a CROSS-PHASE-REUSABLE framework primitive ensures the seed-at-HCM-dispatch plumbing is paid for ONCE at phase-18.2 and reused thereafter (the ADR-0144 precedent for `DownstreamPrincipal()`: paid for ONCE at phase-16; consumed by phase-18.1 ext_authz HTTP mode + this phase 18.2's gRPC mode + future filters).
+
+### Decision
+
+**Six new methods land on `DecoderFilterCallbacks`** in `internal/filter/http/callbacks.go`, alongside the existing `DownstreamPrincipal() []string` accessor:
+
+1. `DownstreamRemoteAddr() net.Addr` — the downstream conn's `RemoteAddr()`; nil for synthetic streams.
+2. `DownstreamLocalAddr() net.Addr` — the downstream conn's `LocalAddr()`; nil for synthetic streams.
+3. `DownstreamTLSServerName() string` — `tls.ConnectionState.ServerName` (SNI); empty for plaintext / SNI-absent.
+4. `DownstreamTLSPeerCertDER() []byte` — `tls.ConnectionState.PeerCertificates[0].Raw`; nil for plaintext / no-client-cert.
+5. `DownstreamProtocol() string` — canonical short string `"HTTP/1.1"` (H1 dispatch) or `"HTTP/2"` (H2 dispatch); empty for synthetic streams.
+6. `ListenerPrincipal() string` — listener's TLS server-cert principal (URI SAN[0] → DNS SAN[0] → Subject CN of `*stdtls.Config.Certificates[0]`); empty for plaintext listeners.
+
+**The seeding pattern mirrors ADR-0144 / `tlsPrincipals` plumbing** (chain.go:107 + 551 + 483 anchor references):
+
+- **6 new chain fields** on `FilterChain` (`downstreamRemoteAddr` / `downstreamLocalAddr` / `downstreamTLSServerName` / `downstreamTLSPeerCertDER` / `downstreamProtocol` / `listenerPrincipal`). All 6 obey the same ownership invariant ADR-0071 codifies for `tlsPrincipals`: SET ONCE at chain build time by HCM dispatch BEFORE `RunDecodeHeaders` dispatch; READ concurrently by per-stream callbacks (single-dispatch-goroutine read invariant).
+- **6 new chain seeding primitives** (`SetDownstreamRemoteAddr` / `SetDownstreamLocalAddr` / `SetDownstreamTLSServerName` / `SetDownstreamTLSPeerCertDER` / `SetDownstreamProtocol` / `SetListenerPrincipal`). HCM dispatch elides the SetX call when the source value is the natural zero (e.g. plaintext listener → no `SetListenerPrincipal` call; the chain field stays "").
+- **6 new `*decoderCB` reader methods** returning the chain field verbatim — no copy, no transformation.
+
+**HCM dispatch sites**:
+
+- **H1 (`connection.go:dispatchRequest`)**: after the existing `chain.SetTLSPrincipals(downstreamTLSPrincipals(downstream))` call, the 6 seeders fire. `RemoteAddr`/`LocalAddr` come from `downstream.RemoteAddr()`/`downstream.LocalAddr()`. `TLSServerName`/`TLSPeerCertDER` come from the downstream `*tls.Conn.ConnectionState()` when the conn is `*stdtls.Conn` AND the cert chain is non-empty. `Protocol` is the H1 canonical `"HTTP/1.1"`. `ListenerPrincipal` is `f.listenerPrincipal` (the pre-extracted per-Filter listener value — see listener plumbing below). Nil-downstream guard: dispatch-unit-test code paths pass `downstream=nil`; the chain fields stay zero per the documented zero-value semantics.
+- **H2 (`h2dispatch.go`)**: the per-connection `h2Dispatcher` captures `RemoteAddr` / `LocalAddr` / `TLSServerName` / `TLSPeerCertDER` ONCE at `runH2` connection-build time (symmetric to `tlsPrincipals`; per-conn caching since H2 multiplexes many streams over one conn and the conn-level state is invariant for the connection lifetime). The 4 captures thread through `chainDispatchAction` fields into per-stream `chain.SetX` calls in `WriteH2`. `Protocol` is the H2 canonical `"HTTP/2"` (invariant — not captured per-conn). `ListenerPrincipal` is `c.f.listenerPrincipal` (per-Filter value).
+
+**Listener plumbing for `ListenerPrincipal`** (the Step-0 pre-spike Outcome B path):
+
+- `extractListenerPrincipal(*stdtls.Config) string` is added to `internal/listener/manager.go`: parses `Certificates[0].Leaf` (or `x509.ParseCertificate(Certificates[0].Certificate[0])` when `Leaf` is nil); returns the first URI SAN, then the first DNS SAN, then the Subject CN; empty string for nil cfg / empty cert chain / parse failure / cert with no matching identity.
+- `listenerCtx` (manager-local) gains a `listenerPrincipal string` field, populated at chain-build time via `extractListenerPrincipal(chainTLS)` for each `filter_chain` (and `dfcTLS` for `default_filter_chain`).
+- `hcm.ListenerCtx` (the public bridge type) gains a `ListenerPrincipal string` field. The HCM filter constructor reads it and stores it on the `*hcm.Filter.listenerPrincipal` field. HCM dispatch (H1 + H2) seeds it onto every per-stream chain via `chain.SetListenerPrincipal(f.listenerPrincipal)`.
+
+**Group 13 unit tests** in `chain_test.go` cover the 6 round-trip seed-and-read paths (one test per new method asserting `Set(seed) → cb.Get() == seed`) plus 6 nil/empty fall-through tests (no `Set` call → accessor returns zero value). Mirrors the `TestDecoderCB_DownstreamPrincipal_SeededViaSetTLSPrincipals_ReturnsSeed` template at `chain_test.go:1507`.
+
+**SPEC AMENDMENTS land at the same commit** per the planner-time D3 settle (so the SPEC's internal consistency is preserved):
+
+- **SPEC §13.5** — original "NO new method on `envoyhttp.DecoderFilterCallbacks` lands at 18.2" quoted-block preserved + AMENDMENT paragraph flipping the constraint with citation of this ADR + D3.
+- **SPEC §6.5 step 5** — original "NO new `DecoderFilterCallbacks` primitive" wording quoted-block preserved + AMENDMENT paragraph.
+- **SPEC §6.6** — original "pure function of `*authRequest` + the four config booleans; NO `DecoderFilterCallbacks` parameter" quoted-block preserved + AMENDMENT paragraph clarifying that `buildAttributeContext` ITSELF remains a pure function of `*authRequest` + the 4 booleans (the callbacks are NOT passed in directly); the per-stream state is captured into `*authRequest` AT DecodeHeaders time via the new callbacks.
+
+### Consequences
+
+- **Cross-phase reuse**: the 6 callback methods + their chain plumbing are immediately available to phase-18.2 ext_authz gRPC mode's `dispatchOutboundCheck` (Task 8 wires the per-stream `*authRequest` extension from the new accessors). Future filters that need per-stream socket / TLS / listener-cert state — ext_proc (phase ~19+), global_ratelimit (phase TBD), future ext_authz extensions — consume the same accessor surface without re-paying the plumbing cost. Mirrors the ADR-0144 `DownstreamPrincipal()` precedent: paid for ONCE at phase-16; reused at phase-18.1 + 18.2 + future.
+- **SPEC §13.5 + §6.5 step 5 + §6.6 hard constraints are AMENDED in-place** at this same commit (the SPEC sections retain the original wording in a quoted-block + a follow-on AMENDMENT paragraph citing this ADR — the grep-archaeology pattern used by ADR-0157 §Decision AMENDMENT at phase-18.2 Task 3). The original SPEC author's claim that the existing callback surface suffices was falsified by the PLAN-time verification against the SPEC's own §15 item 4 + §11.P4 requirements; the AMENDMENT records the post-PLAN-time settle.
+- **The 18.2 SPEC §15 item 4 populated-set is now achievable** — `tls_session.sni`, `source.certificate`, source + destination socket addresses, `destination.principal`, `request.http.protocol` ALL satisfy the populated-set requirement from the per-stream `*authRequest` (Task 5/8). The differential fixture 0021 can assert byte-equivalent `AttributeContext` shape vs reference Envoy v1.37.2.
+- **ADR-0071 chain-ownership invariant continues to apply** — the 6 new fields use the same SET-once-by-HCM-dispatch + READ-by-callback discipline as `tlsPrincipals`; no new race surface introduced. Race-detector verification at Task 4 green across `./internal/filter/http/... ./internal/filter/hcm/...`.
+- **Listener plumbing extension** (Outcome B per Task 4 Step 0 pre-spike): the PLAN's File-structure table for `connection.go` budgeted +30–80 LoC for the listener-principal sourcing path. Outcome B fires — `listener/manager.go` + `hcm/config.go` + `hcm/filter.go` gain net ~+30 LoC each to plumb `listenerPrincipal` through `listenerCtx` → `hcm.ListenerCtx` → `*hcm.Filter.listenerPrincipal` → `chain.SetListenerPrincipal`. The alternative (lift `*stdtls.Config` through the dispatch chain so HCM can extract per-request) is more invasive and has worse cache locality; the pre-extracted string is the cheaper anchor.
+- **Future filter authors get a stable accessor surface** — no need to grep for `*tls.Conn` or similar across the codebase; the framework primitive is documented + tested + race-clean. The seeding contract (set ONCE at HCM dispatch BEFORE RunDecodeHeaders) is explicit in the doc comments on both the chain seeders and the callback accessors.
+- **No new fuzzer surface** — the 6 accessors return chain-state values verbatim; there is no parsing / validation logic to fuzz.
+
+Cross-references:
+
+- **ADR-0044** — the ADR-on-impl convention + escape-valve discipline this ADR's §Context invokes. The escape-valve fires per planner-time D12.
+- **ADR-0071** — the chain-ownership invariant the 6 new fields obey (SET-once + READ-by-callback discipline; single-dispatch-goroutine read invariant).
+- **ADR-0144** — the prior framework primitive (`DownstreamPrincipal()` at phase-16) this ADR generalizes; same seed-at-HCM-dispatch + read-via-callback pattern + same cross-phase-reuse intent.
+- **ADR-0157** §Decision (AMENDED at phase-18.2 Task 3) + ADR-0160 (gRPC-mode portion at Task 5) + ADR-0161 (gRPC-mode portion at Task 6) — the phase-18.2 ADRs that consume this ADR's framework primitive through the extended `*authRequest`.
+- **ADR-0164** — the phase-18 ADR-0045 split-application ADR (predecessor); this ADR (ADR-0165) is the next-free ADR per ADR-0164's "next-free ADR after phase 18 is ADR-0165" anticipation.
+
+---
+
+## ADR-0166: Permit plaintext h2c upstream clusters — relax `extractH2Mode` TLS-required gate
+
+**Status:** Accepted
+**Date:** 2026-05-15
+**Lands-in:** Task 11 fixup of phase-18.2 IMPL (post-Task-11 cluster-manager-gate-relaxation)
+
+### Context
+
+Phase 05.2's SPEC §5.5 prescribed "TLS required for h2" for any upstream cluster with `http2_protocol_options:{}`. The decision was inherited from master SPEC §5.8 (the bootstrap-era H2 design) without alternatives-considered analysis; no ADR explicitly anchors it.
+
+Phase 18.2's `c_authz_grpc` cluster (fixture-0021's gRPC auth cluster) is plaintext h2c per:
+- SPEC §7.2 (fixture-0021 topology: "plaintext h2c for the auth cluster")
+- Planner-time decision D13 ("Fixture 0021 IS plaintext-only — NO PKI, NO TLS-to-auth fixture coverage")
+- The §11.P13 in-session SPEC scrape that RATIFIED plaintext h2c against reference Envoy v1.37.2
+
+Reference Envoy v1.37.2 accepts plaintext h2c upstream clusters; the gRPC ecosystem norm is plaintext h2c upstream (service-mesh sidecars commonly terminate mTLS at the sidecar and proxy h2c onward). The envoy-go cluster-manager gate is therefore over-restrictive relative to both reference behavior and the project's own §11.P13 evidence.
+
+### Decision
+
+`extractH2Mode` (`internal/cluster/manager.go`) is RELAXED to permit plaintext h2c upstream clusters:
+
+- If a cluster has `http2_protocol_options:{}` AND `transport_socket` is absent → **PERMITTED** as plaintext h2c (h2c prior-knowledge per RFC 7540 §3.4). `useH2 = true`, `parsedTLS = nil`.
+- If a cluster has `http2_protocol_options:{}` AND `transport_socket` is present → existing validation preserved bit-identical (must be `UpstreamTlsContext`; ALPN must include "h2"; otherwise rejected).
+- If a cluster has NO `http2_protocol_options:{}` → existing H1-fallback path preserved.
+
+`dial_h2.go` is updated to skip the TLS-conn assertion when `parsedTLS == nil`; the raw `net.Conn` is handed to `h2.NewClientConn` for h2c prior-knowledge.
+
+### Consequences
+
+- **Reference-Envoy parity:** envoy-go now accepts the same cluster shapes that reference Envoy v1.37.2 accepts.
+- **gRPC ecosystem alignment:** plaintext h2c upstream is the norm for service-mesh sidecars + the default for `grpcurl --plaintext`.
+- **Phase 18.2 fixture-0021 unblocked:** the `c_authz_grpc` plaintext-h2c cluster validates clean; Task 12 can proceed.
+- **05.2 §5.5 amended-by-precedent:** the original "TLS required for h2" rationale is superseded; future work may amend SPEC §5.5 in-place to record the relaxation.
+- **No regression to TLS+h2 path:** the existing transport_socket-present validation branch is preserved bit-identical; all existing 05.2 tests stay green.
+- **No regression to ALPN-h2 enforcement:** when TLS IS configured, ALPN MUST select "h2" — same as before.
+- **Cross-phase reuse:** ext_proc (phase ~19+) + global_ratelimit (phase TBD) + any future gRPC-upstream filters inherit the relaxation; they can configure plaintext-h2c upstream gRPC clusters without further code change.
+- **Cited:** ADR-0044 (ADR-on-impl escape-valve — second 18.2 impl-time ADR after ADR-0165); ADR-0055 (existing flow-control discipline); ADR-0056 (existing per-request dial). No ADRs need amendment.
+
+### References
+
+- `internal/cluster/manager.go:extractH2Mode` (the gate)
+- `internal/cluster/dial_h2.go` (the runtime dial)
+- `docs/envoy-go/phases/05.2-upstream-h2/SPEC.md` §5.5 (the inherited rule — superseded by this ADR)
+- `docs/envoy-go/phases/18.2-ext-authz-grpc/SPEC.md` §7.2 + §11.P13 (the load-bearing fixture-0021 requirement)
+- `docs/envoy-go/phases/18.2-ext-authz-grpc/PLAN.md` D13 (the planner-time settlement)
+- RFC 7540 §3.4 (HTTP/2 prior-knowledge)
 
 ---
 

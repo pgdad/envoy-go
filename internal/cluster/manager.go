@@ -261,19 +261,29 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 // returns whether to enable H2 upstream origination. Per SPEC §5.5's behavior
 // matrix:
 //   - field absent → false (phase-04 baseline; no regression)
-//   - explicit_http_config.http2_protocol_options{} → true (validated; build-time TLS+ALPN check)
+//   - explicit_http_config.http2_protocol_options{} → true (validated; build-time TLS-or-h2c branch)
 //   - explicit_http_config.http_protocol_options{} → false (silent-ignore inner)
 //   - auto_config{} → false (the 05.2 narrowing of master SPEC §5.8)
 //   - nil/empty UpstreamProtocolOptions → false (defensive)
 //
-// When useH2==true: the cluster's transport_socket MUST be present, MUST be
-// type tls, and the parsed TLS config's alpn_protocols MUST include "h2".
-// Validation errors carry the diagnostics enumerated in SPEC §4.1.
+// When useH2==true the gate relaxes into two accepted shapes (ADR-0166):
+//
+//   - transport_socket PRESENT → existing TLS+h2 path bit-identical: the
+//     transport_socket MUST be type tls and the parsed TLS config's
+//     alpn_protocols MUST include "h2". Validation errors carry the
+//     diagnostics enumerated in SPEC §4.1.
+//   - transport_socket ABSENT → plaintext h2c upstream is PERMITTED
+//     (h2c prior-knowledge per RFC 7540 §3.4). Reference Envoy v1.37.2
+//     accepts the same shape; the gRPC ecosystem norm is plaintext h2c
+//     upstream for service-mesh sidecars. ADR-0166 anchors the relaxation;
+//     it supersedes the original phase-05.2 SPEC §5.5 "TLS required for h2"
+//     rule by precedent.
 //
 // parsedTLS is the *stdtls.Config produced by internal/tls.NewUpstreamConfig
 // from the cluster's transport_socket; its NextProtos field is populated from
-// CommonTlsContext.alpn_protocols. Pass nil for plaintext clusters; the
-// transport_socket-required validation will surface the diagnostic.
+// CommonTlsContext.alpn_protocols. Pass nil when the cluster has no
+// transport_socket (plaintext h2c upstream); the runtime dial path (see
+// dial_h2.go) symmetrically skips the TLS-conn assertion when parsedTLS==nil.
 func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, err error) {
 	tepo := c.GetTypedExtensionProtocolOptions()
 	if tepo == nil {
@@ -303,10 +313,14 @@ func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, 
 	if !useH2 {
 		return false, nil
 	}
-	// Validate transport_socket + ALPN.
+	// ADR-0166: transport_socket is OPTIONAL for h2 upstream. When absent,
+	// the cluster originates plaintext h2c (prior-knowledge per RFC 7540 §3.4);
+	// when present, the existing TLS+h2 validation branch applies bit-identical.
 	ts := c.GetTransportSocket()
 	if ts == nil {
-		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket", c.GetName())
+		// Plaintext h2c upstream — PERMITTED (ADR-0166). parsedTLS is nil
+		// by buildCluster's contract (no transport_socket → no cl.upstreamCfg).
+		return true, nil
 	}
 	if ts.GetTypedConfig() == nil {
 		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket of type tls, got transport_socket without typed_config", c.GetName())

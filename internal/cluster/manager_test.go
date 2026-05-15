@@ -495,18 +495,88 @@ func TestBuildCluster_H2Mode_Positive(t *testing.T) {
 	}
 }
 
-func TestBuildCluster_H2Mode_NoTLS(t *testing.T) {
-	c := mkStaticCluster("c_h2_no_tls", mkLbEndpoint("10.0.0.1", 443))
-	// No TransportSocket.
+// TestExtractH2Mode_PlaintextH2C_NoTransportSocket_Accepted verifies ADR-0166:
+// a cluster with http2_protocol_options:{} and NO transport_socket is now
+// PERMITTED as plaintext h2c upstream (prior-knowledge per RFC 7540 §3.4).
+// Reference Envoy v1.37.2 accepts the same shape; phase-18.2 fixture-0021's
+// c_authz_grpc cluster relies on this relaxation. The cluster must build
+// successfully with UseH2()=true and upstreamCfg=nil. Renamed and flipped
+// from the prior TestBuildCluster_H2Mode_NoTLS error-assertion.
+func TestExtractH2Mode_PlaintextH2C_NoTransportSocket_Accepted(t *testing.T) {
+	c := mkStaticCluster("c_h2_plaintext", mkLbEndpoint("10.0.0.1", 8080))
+	// No TransportSocket — plaintext h2c upstream.
 	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
 	}
-	_, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v (ADR-0166: plaintext h2c must be permitted)", err)
 	}
-	if !strings.Contains(err.Error(), "requires transport_socket") {
-		t.Errorf("error %q does not contain %q", err.Error(), "requires transport_socket")
+	got, ok := m.Get("c_h2_plaintext")
+	if !ok {
+		t.Fatal("cluster c_h2_plaintext not found")
+	}
+	if !got.UseH2() {
+		t.Error("UseH2() = false, want true (plaintext h2c upstream)")
+	}
+	if got.upstreamCfg != nil {
+		t.Errorf("upstreamCfg = %v, want nil (no transport_socket → plaintext h2c)", got.upstreamCfg)
+	}
+}
+
+// TestExtractH2Mode_TLSH2_TransportSocketWithALPNH2_AcceptedUnchanged is a
+// regression guard for the TLS+h2 branch preserved bit-identical by ADR-0166.
+// Mirrors TestBuildCluster_H2Mode_Positive — same shape, distinct name so the
+// ADR-0166 acceptance-coverage matrix is auditable in one grep.
+func TestExtractH2Mode_TLSH2_TransportSocketWithALPNH2_AcceptedUnchanged(t *testing.T) {
+	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+	c := mkStaticCluster("c_h2_tls_alpn_h2", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = mkUpstreamTLSTransportSocketWithALPN(t, "alpha.envoy-go.test", caPEM, []string{"h2"})
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+	}
+	m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewManagerWithBaseDir: %v (TLS+h2 path must remain bit-identical post-ADR-0166)", err)
+	}
+	got, ok := m.Get("c_h2_tls_alpn_h2")
+	if !ok {
+		t.Fatal("cluster c_h2_tls_alpn_h2 not found")
+	}
+	if !got.UseH2() {
+		t.Error("UseH2() = false, want true")
+	}
+	if got.upstreamCfg == nil {
+		t.Error("upstreamCfg = nil, want non-nil (TLS+h2 cluster)")
+	}
+}
+
+// TestExtractH2Mode_TLSH2_TransportSocketMissingALPNH2_StillRejected verifies
+// that when transport_socket IS present, the existing ALPN-h2 enforcement
+// remains in force — ADR-0166 relaxes the gate only for transport_socket-
+// absent (plaintext h2c) clusters. Mirrors TestBuildCluster_H2Mode_TLSWithoutALPNH2.
+func TestExtractH2Mode_TLSH2_TransportSocketMissingALPNH2_StillRejected(t *testing.T) {
+	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
+	if err != nil {
+		t.Fatalf("read ca.pem: %v", err)
+	}
+	c := mkStaticCluster("c_h2_tls_no_alpn_h2", mkLbEndpoint("10.0.0.1", 443))
+	c.TransportSocket = mkUpstreamTLSTransportSocketWithALPN(t, "alpha.envoy-go.test", caPEM, []string{"http/1.1"})
+	c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+	}
+	_, err = NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
+	if err == nil {
+		t.Fatal("expected error, got nil (TLS-present + ALPN-missing-h2 must still reject)")
+	}
+	if !strings.Contains(err.Error(), "alpn_protocols to include") {
+		t.Errorf("error %q does not contain %q", err.Error(), "alpn_protocols to include")
+	}
+	if !strings.Contains(err.Error(), `"h2"`) {
+		t.Errorf("error %q does not mention %q", err.Error(), `"h2"`)
 	}
 }
 
