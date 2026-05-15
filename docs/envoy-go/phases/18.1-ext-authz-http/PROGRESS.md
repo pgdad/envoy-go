@@ -361,3 +361,13 @@ $ grep -nE '^## ADR-0156|^## ADR-0157' docs/envoy-go/DECISIONS.md
 ```
 
 2 matches (≥2 required). Both §Decision + §Consequences bodies filled. Status: Accepted.
+
+### Task 2 review-fix (6 issues from code-quality review)
+
+**I1** — `resolvePerRouteConfig` signature changed from `interface{}` to `proto.Message` (extauthz.go:487); `"google.golang.org/protobuf/proto"` + `matcherv3` imports added.
+**I2** — `TestResolvePerRouteConfig_UnknownMsgTypeFallback` fixed to pass `&corev3.GrpcService{}` (a valid `proto.Message` that is NOT `*ExtAuthzPerRoute`) so the `!ok` branch genuinely fires (extauthz_test.go:905–921).
+**I3** — `compileStringMatcherList` parameter changed from `interface{}` to `*matcherv3.ListStringMatcher` (extauthz.go:397).
+**M1** — Comment on `errHTTPCheckFnStub` corrected from "Exported as a package-level error" to "Accessible to package-level tests" (extauthz.go:41).
+**M2** — ADR-0157 §Decision (iii) ordering description corrected: "fires BEFORE the `services`-oneof dispatch" → "fires AFTER the `services`-oneof presence/grpc PARSE-REJECTs" with the actual 4-step ordering (DECISIONS.md ~line 8385).
+**M3** — ADR-0156 §Consequences test count corrected: 39 → 38 (DECISIONS.md ~line 8346); confirmed via `grep -c '^func Test' internal/filter/http/extauthz/extauthz_test.go` = 38.
+All 38 tests still green post-fix. M4/M5 not touched (forward-pointing notes only).

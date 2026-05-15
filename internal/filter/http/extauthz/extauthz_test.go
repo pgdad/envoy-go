@@ -906,19 +906,14 @@ func TestResolvePerRouteConfig_UnknownMsgTypeFallback(t *testing.T) {
 	cc := &compiledConfig{statusOnError: 403}
 	state := &factoryState{listenerRC: cc}
 
-	// Pass a non-*ExtAuthzPerRoute message — should fall back to listenerRC.
-	// We can't call RequestRouteConfig here since we're testing the resolver
-	// directly; this tests the type-assertion defensive path.
-	// The resolvePerRouteConfig function accepts proto.Message; passing a
-	// wrong type should return listenerRC fallback (defensive).
-	//
-	// We simulate by passing a nil proto.Message (already covered) — the
-	// type assertion path is tested by the pointer identity test indirectly.
-	// The real 3-tier TPFC resolution happens via dcb.RequestRouteConfig()
-	// in DecodeHeaders (Task 9); the resolver itself only handles the
-	// *ExtAuthzPerRoute type.
-	result := state.resolvePerRouteConfig(nil)
+	// Pass a non-*ExtAuthzPerRoute proto.Message — exercises the !ok branch of
+	// the type assertion in resolvePerRouteConfig. A *corev3.GrpcService is a
+	// valid proto.Message but is NOT an *ext_authzv3.ExtAuthzPerRoute, so the
+	// type assertion fires the !ok path and returns the listener-level fallback.
+	// This test would fail if the !ok branch were removed or skipped.
+	wrongType := &corev3.GrpcService{}
+	result := state.resolvePerRouteConfig(wrongType)
 	if result == nil || result.cc != cc {
-		t.Error("resolvePerRouteConfig(nil): want listenerRC fallback, got different result")
+		t.Error("resolvePerRouteConfig(wrong type): want listenerRC fallback, got different result")
 	}
 }

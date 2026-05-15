@@ -8343,7 +8343,7 @@ The boot-registration ordering follows ADR-0072 + ADR-0100 §2.2 alphabetical-af
 
 ### Consequences
 
-**Package landing at Task 2.** The `internal/filter/http/extauthz/` package lands with `doc.go` + `extauthz.go` + `extauthz_test.go` (Groups 1+2+7). Acceptance: `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet ./internal/filter/http/extauthz/...` exit 0; 39 tests pass.
+**Package landing at Task 2.** The `internal/filter/http/extauthz/` package lands with `doc.go` + `extauthz.go` + `extauthz_test.go` (Groups 1+2+7). Acceptance: `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet ./internal/filter/http/extauthz/...` exit 0; 38 tests pass.
 
 **6 counters under SN2-reuse namespace.** All 6 publish under `http.<HCM_stat_prefix>.ext_authz.<counter>`. Empty HCM stat_prefix (test code paths) folds to `ext_authz.<counter>` (nameRE discipline). RATIFIED-PENDING-IMPL-TIME via reference Envoy v1.37.2 empirical scrape at Task 8 per §18.P6.
 
@@ -8382,7 +8382,7 @@ The error-classification boundary in `check.go` is empirically RATIFIED at the p
 
 **(ii) `services`-oneof dispatch in `buildCompiledConfig`.** The dispatch fires AFTER the structural checks (`transport_api_version` + `with_request_body`) and follows the deterministic ordering: (1) nil `services` oneof → PARSE-REJECT `"ext_authz: services oneof must be set (neither grpc_service nor http_service is configured)"`. (2) `*ExtAuthz_GrpcService` → PARSE-REJECT `"ext_authz: grpc_service mode not yet supported (lands in phase 18.2)"` in 18.1. (3) `*ExtAuthz_HttpService` → call `buildHTTPCheckFn` (Task 2 stub returns `errHTTPCheckFnStub`; Task 3 replaces with the real HTTP-mode `checkFn`). The 18.2 amendment replaces arm (2) with the gRPC `checkFn` construction consuming ADR-0158.
 
-**(iii) `transport_api_version` V3-only PARSE-REJECT.** Non-V3 values (including the zero-value `API_VERSION_UNSPECIFIED` = 0) PARSE-REJECT per ADR-0008. The check fires BEFORE the `services`-oneof dispatch (ordering: structural field checks first, then service-specific dispatch). Only `corev3.ApiVersion_V3` (value 2 in `go-control-plane v1.32.4`) is accepted.
+**(iii) `transport_api_version` V3-only PARSE-REJECT.** Non-V3 values (including the zero-value `API_VERSION_UNSPECIFIED` = 0) PARSE-REJECT per ADR-0008. The check fires AFTER the `services`-oneof presence/grpc PARSE-REJECTs (ordering: (1) nil/grpc `services` oneof → PARSE-REJECT, (2) `transport_api_version` V3-only check, (3) `with_request_body` validation, (4) `http_service` dispatch via `buildHTTPCheckFn`). Only `corev3.ApiVersion_V3` (value 2 in `go-control-plane v1.32.4`) is accepted.
 
 **(iv) `checkDisposition` convergence value.** The mode-agnostic convergence type `checkDisposition` carries: `class dispositionClass` (`dispAllow` / `dispDeny` / `dispError`); `upstreamSet []headerKV` + `upstreamApp []headerKV` (allow-path upstream header mutations — `allowed_upstream_headers` set/overwrite and `allowed_upstream_headers_to_append` append); `denyStatus uint32` + `denyBody []byte` + `denyHeaders []headerKV` (deny-path verbatim auth response). Both the HTTP-mode (18.1) and gRPC-mode (18.2) `checkFn` implementations produce this struct. The disposition-application logic is mode-agnostic and lives in the `check.go` dispatcher (Task 9).
 

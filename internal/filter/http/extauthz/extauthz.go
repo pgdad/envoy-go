@@ -21,6 +21,8 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
@@ -38,7 +40,7 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.
 const filterName = "envoy.filters.http.ext_authz"
 
 // errHTTPCheckFnStub is the sentinel error returned by the Task 2 stub
-// buildHTTPCheckFn. Exported as a package-level error for test assertions.
+// buildHTTPCheckFn. Accessible to package-level tests for stub-path assertions.
 // At Task 3 this stub is replaced by the real HTTP-mode checkFn construction.
 var errHTTPCheckFnStub = errors.New("ext_authz: buildHTTPCheckFn stub (Task 3 lands the real impl)")
 
@@ -392,7 +394,7 @@ func buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error) {
 // compilation with exact/prefix/suffix/contains/safe_regex/custom arms lands
 // at Task 4 in attributes.go). A nil return means "no matcher" (all-pass for
 // allowed_headers; no-filter for disallowed_headers).
-func compileStringMatcherList(lsm interface{}) *stringMatcherList {
+func compileStringMatcherList(lsm *matcherv3.ListStringMatcher) *stringMatcherList {
 	// Task 4 stub. When lsm is non-nil, a real *stringMatcherList will be built.
 	if lsm == nil {
 		return nil
@@ -481,7 +483,7 @@ func parsePerRoute(raw *ext_authzv3.ExtAuthzPerRoute) (*compiledPerRoute, error)
 //
 // The returned *compiledPerRoute always has .cc set to the listener-level
 // compiledConfig (SHARED-stats per ADR-0163 — no per-route cc instantiation).
-func (s *factoryState) resolvePerRouteConfig(msg interface{}) *compiledPerRoute {
+func (s *factoryState) resolvePerRouteConfig(msg proto.Message) *compiledPerRoute {
 	if msg == nil {
 		return &compiledPerRoute{cc: s.listenerRC, disabled: false, checkSettings: nil}
 	}
