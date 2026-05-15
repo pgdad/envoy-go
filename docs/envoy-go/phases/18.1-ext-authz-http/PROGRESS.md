@@ -371,3 +371,128 @@ $ grep -nE '^## ADR-0156|^## ADR-0157' docs/envoy-go/DECISIONS.md
 **M2** — ADR-0157 §Decision (iii) ordering description corrected: "fires BEFORE the `services`-oneof dispatch" → "fires AFTER the `services`-oneof presence/grpc PARSE-REJECTs" with the actual 4-step ordering (DECISIONS.md ~line 8385).
 **M3** — ADR-0156 §Consequences test count corrected: 39 → 38 (DECISIONS.md ~line 8346); confirmed via `grep -c '^func Test' internal/filter/http/extauthz/extauthz_test.go` = 38.
 All 38 tests still green post-fix. M4/M5 not touched (forward-pointing notes only).
+
+## Task 3 — check.go HTTP-outbound auth-check primitive (`httpAuthClient` + `buildHTTPCheckFn` + the checkFn closure + the HTTP-response → `checkDisposition` mapping + the §5.P10 error-classification boundary) + extauthz_test.go Group 4 + ADR-0159 §Decision+§Consequences
+
+**Files changed:** `internal/filter/http/extauthz/check.go` (new, 289 LoC), `internal/filter/http/extauthz/extauthz.go` (modified — Task 2 `buildHTTPCheckFn` stub removed, replaced by a cross-reference comment; `errHTTPCheckFnStub` retired to a nil-match audit-trail placeholder), `internal/filter/http/extauthz/extauthz_test.go` (modified — Group 4 appended; the 4 Task-2 M4 stub-tolerant tests tightened in place), `docs/envoy-go/DECISIONS.md` (ADR-0159 §Decision+§Consequences filled)
+**Commit SHA:** TBD (SHA-fill follow-up commit lands post-commit)
+**Notes:** Followed `superpowers:test-driven-development` — Group 4 tests written first. The HTTP-outbound auth-check primitive lands per ADR-0159 disposition (b): a thin ext_authz-local `httpAuthClient` in `check.go`, NOT a generalized `internal/httpclient/` package. `httpAuthClient` wraps `*http.Client` (`&http.Client{Timeout: durationpbToGo(server_uri.timeout)}`; ZERO retry per planner-time decision D2) + the parsed base URL + `path_prefix`. The closure builds the outbound POST (`path_prefix` prepended via the double-slash-avoiding `joinPaths`; the `authRequest` headers copied as-is — request-side filtering STUBBED until Task 4; the body as a `bytes.Reader` when non-empty), threads `ctx` through `http.NewRequestWithContext` so `OnDestroy`'s cancel aborts the in-flight call, calls `client.Do`, and maps the response. `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet` exit 0; `go test -count=1 -short ./...` still 48 `ok` / 0 fail. Test count 38 → 52. No ADR-0044 escape-valve triggered. Boot-registration still deferred to Task 10.
+
+### `buildHTTPCheckFn` signature — deviation from the PLAN nominal
+
+The PLAN File-structure-table nominal signature was `buildHTTPCheckFn(hs *ext_authzv3.HttpService, ar *authRequestCfg, validateMutations bool) (checkFn, error)`. The signature settled at Task 3 is **`buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error)`** — taking only the `HttpService`. Rationale: the `authRequestCfg` type + `buildAuthRequest` land at Task 4, and `validate_mutations` gating over the extracted header sets lands at Task 5; neither type exists at Task 3. The reduced signature matches the existing `buildCompiledConfig` call-site (Task 2 already wired it to pass only `hs`). The PLAN Task-3 description explicitly sanctioned this ("check what Task 2's `buildCompiledConfig` currently passes to the stub `buildHTTPCheckFn`"). When Task 4/Task 5 land, the request-side-filtered headers reach the closure via the `*authRequest` argument and the `validate_mutations` gating via the (Task-5) compiled `authorization_response` matcher triple captured in the closure — no `buildHTTPCheckFn` signature change is anticipated. Recorded in ADR-0159 §Decision (iii).
+
+### §5.P10 error-classification boundary — as implemented
+
+`mapHTTPResponse` switches on `resp.StatusCode`:
+- **HTTP `200` → `dispAllow`** — header extraction STUBBED at Task 3 (`upstreamSet`/`upstreamApp` left nil; `allowed_upstream_headers` / `allowed_upstream_headers_to_append` extraction lands at Task 5).
+- **HTTP `401` or `403` → `dispDeny`** — the recognized deny-status set per parent SPEC §5.P10. The response body is read verbatim into `denyBody` per §5.P11; `denyStatus` set to the status code. `allowed_client_headers` extraction STUBBED at Task 3 (`denyHeaders` left nil; lands at Task 5).
+- **any other status → `dispError`** — returns `checkDisposition{class: dispError}` + a descriptive error.
+
+Before `mapHTTPResponse` is reached: a `client.Do` error (connect failure / timeout / `ctx` cancelled) → `dispError` + the wrapped transport error; a `NewRequestWithContext` build error → `dispError`; an IO error reading the deny body → `dispError`. ZERO retry — a single attempt then the error disposition (D2 — `HttpService` has no retry-policy proto field).
+
+### Task-2 M4 stub-test tightening
+
+The 4 Task-2 M4 stub-tolerant tests were **tightened in place** (not via separate `_RealImpl` variants): `TestNew_StatusOnError_Default`, `TestNew_StatusOnError_Explicit`, `TestCompiledConfig_FailureModeAllowConsumed`, `TestCompiledConfig_WithRequestBodyConsumed` — their stub-era `if cc != nil { ... } else if err == nil { ... }` wrappers were replaced with unconditional assertions (`if err != nil { t.Fatalf }` + `if cc == nil { t.Fatal }` + the field assertion) now that `buildHTTPCheckFn` is real. The WIP had initially added separate `_RealImpl` duplicate functions; those 4 duplicates were removed in favor of tightening the named originals in place per the Task 3 instruction (a short NOTE comment marks the tightening). `TestNew_HttpService_ValidConfig_Task2Stub` was likewise tightened in place to assert `factory != nil`; `TestNew_HttpService_ValidConfig_RealImpl` is kept as a distinct Group-4 factory smoke-test.
+
+### Group 4 coverage note — `headers_to_add` / deprecated `allowed_headers`
+
+The PLAN Task-3 Step-1 enumeration lists `headers_to_add` appended + deprecated `AuthorizationRequest.allowed_headers` honored-if-present among the Group 4 cases. Those two are **request-side** `AuthorizationRequest`-builder concerns — they are produced by `buildAuthRequest`, which is STUBBED at Task 3 and lands at Task 4 (ADR-0160). At Task 3 the closure copies the `authRequest` headers as-is; `TestCheckFn_HeadersForwarded` covers the header-forwarding mechanism (the closure faithfully transmits whatever `authRequest.headers` contains). The proto-field-level `headers_to_add` / deprecated-`allowed_headers` assertions land with Group 3 / the `buildAuthRequest` tests at Task 4 — recorded here so the PLAN-vs-impl Group-4 delta is on disk.
+
+**Outputs:**
+
+### Test run — full suite + Group 4 (race detector)
+
+```
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.068s
+
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+```
+
+### Test run — Group 4 verbose (`TestCheckFn|TestBuildHTTPCheckFn`, 13 tests)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestCheckFn|TestBuildHTTPCheckFn' -v
+=== RUN   TestBuildHTTPCheckFn_MissingServerURI
+--- PASS: TestBuildHTTPCheckFn_MissingServerURI (0.00s)
+=== RUN   TestBuildHTTPCheckFn_EmptyURI
+--- PASS: TestBuildHTTPCheckFn_EmptyURI (0.00s)
+=== RUN   TestBuildHTTPCheckFn_ValidConfig_ReturnsNonNilFn
+--- PASS: TestBuildHTTPCheckFn_ValidConfig_ReturnsNonNilFn (0.00s)
+=== RUN   TestCheckFn_Allow_Status200
+--- PASS: TestCheckFn_Allow_Status200 (0.00s)
+=== RUN   TestCheckFn_Deny_Status401
+--- PASS: TestCheckFn_Deny_Status401 (0.00s)
+=== RUN   TestCheckFn_Deny_Status403
+--- PASS: TestCheckFn_Deny_Status403 (0.00s)
+=== RUN   TestCheckFn_Error_UnrecognizedStatus
+--- PASS: TestCheckFn_Error_UnrecognizedStatus (0.00s)
+=== RUN   TestCheckFn_Error_ConnectFailure
+--- PASS: TestCheckFn_Error_ConnectFailure (0.00s)
+=== RUN   TestCheckFn_Error_Timeout
+--- PASS: TestCheckFn_Error_Timeout (0.05s)
+=== RUN   TestCheckFn_Error_ContextCancelled
+--- PASS: TestCheckFn_Error_ContextCancelled (0.00s)
+=== RUN   TestCheckFn_PathPrefix_Prepended
+--- PASS: TestCheckFn_PathPrefix_Prepended (0.00s)
+=== RUN   TestCheckFn_HeadersForwarded
+--- PASS: TestCheckFn_HeadersForwarded (0.00s)
+=== RUN   TestCheckFn_WithRequestBody
+--- PASS: TestCheckFn_WithRequestBody (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	0.056s
+```
+
+### Test run — Groups 1+2+7 regression (no regression)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestNew_|TestCompiledConfig_|TestParsePerRoute|TestResolvePerRoute|TestFilterStats' -v 2>&1 | tail -40
+=== RUN   TestNew_HttpService_ValidConfig_Task2Stub
+--- PASS: TestNew_HttpService_ValidConfig_Task2Stub (0.00s)
+=== RUN   TestNew_StatusOnError_Default
+--- PASS: TestNew_StatusOnError_Default (0.00s)
+=== RUN   TestNew_StatusOnError_Explicit
+--- PASS: TestNew_StatusOnError_Explicit (0.00s)
+=== RUN   TestNew_StatPrefix_Consumed
+--- PASS: TestNew_StatPrefix_Consumed (0.00s)
+=== RUN   TestFilterStats_6Counters
+--- PASS: TestFilterStats_6Counters (0.00s)
+=== RUN   TestFilterStats_CounterNames
+--- PASS: TestFilterStats_CounterNames (0.00s)
+=== RUN   TestFilterStats_NilRegistryTolerance
+--- PASS: TestFilterStats_NilRegistryTolerance (0.00s)
+=== RUN   TestCompiledConfig_FieldFinal
+--- PASS: TestCompiledConfig_FieldFinal (0.00s)
+=== RUN   TestCompiledConfig_FailureModeAllowConsumed
+--- PASS: TestCompiledConfig_FailureModeAllowConsumed (0.00s)
+=== RUN   TestCompiledConfig_WithRequestBodyConsumed
+--- PASS: TestCompiledConfig_WithRequestBodyConsumed (0.00s)
+=== RUN   TestParsePerRoute_EmptyOverride
+--- PASS: TestParsePerRoute_EmptyOverride (0.00s)
+... (all Group 1/2/7 tests PASS) ...
+=== RUN   TestNew_HttpService_ValidConfig_RealImpl
+--- PASS: TestNew_HttpService_ValidConfig_RealImpl (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	0.004s
+```
+
+### Test run — full suite (48 packages, short mode)
+
+```
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^ok'
+48
+
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^(FAIL|---\s+FAIL)'
+0
+```
+
+### ADR acceptance-criteria grep
+
+```
+$ grep -nE '^## ADR-0159' docs/envoy-go/DECISIONS.md
+8436:## ADR-0159: HTTP-outbound auth-check framework primitive — ...
+```
+
+1 match (1 required). §Decision (5-point body (i)–(v)) + §Consequences filled. Status: Accepted; Date: 2026-05-14; Lands-in: Task 3 of phase-18.1 PLAN.

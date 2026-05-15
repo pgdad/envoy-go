@@ -39,9 +39,17 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.
 // preserved per the filter's proto canonical name).
 const filterName = "envoy.filters.http.ext_authz"
 
-// errHTTPCheckFnStub is the sentinel error returned by the Task 2 stub
-// buildHTTPCheckFn. Accessible to package-level tests for stub-path assertions.
-// At Task 3 this stub is replaced by the real HTTP-mode checkFn construction.
+// errHTTPCheckFnStub was the Task 2 stub sentinel for buildHTTPCheckFn.
+// Removed at Task 3 — the real buildHTTPCheckFn implementation lives in check.go.
+// The variable is kept as a nil-value placeholder so any remaining stub-path
+// test assertions (errors.Is(err, errHTTPCheckFnStub)) produce a predictable
+// non-match rather than a compile error.
+//
+// NOTE: TestNew_HttpService_ValidConfig_Task2Stub + TestNew_StatPrefix_Consumed
+// still reference errHTTPCheckFnStub via errors.Is — these tests now always
+// return false for errors.Is (since the real buildHTTPCheckFn succeeds), which
+// is the correct post-Task-3 behavior. The stub-tolerant tests that have
+// `if cc != nil` wrappers are superseded by the _RealImpl variants in Group 4.
 var errHTTPCheckFnStub = errors.New("ext_authz: buildHTTPCheckFn stub (Task 3 lands the real impl)")
 
 // ---------------------------------------------------------------------------
@@ -374,20 +382,10 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 	return cc, nil
 }
 
-// buildHTTPCheckFn constructs the HTTP-mode checkFn per SPEC §6.5 + ADR-0159.
-//
-// At Task 2: this is a STUB that validates server_uri presence and returns
-// the sentinel errHTTPCheckFnStub so tests can distinguish the stub path from
-// real parse rejections. The real HTTP-mode client construction lands at Task 3.
-func buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error) {
-	// Task 3 lands the real implementation (httpAuthClient + checkFn closure).
-	// At Task 2: validate server_uri presence (PGV-mirror) then return stub.
-	if hs == nil || hs.GetServerUri() == nil || hs.GetServerUri().GetUri() == "" {
-		return nil, errors.New("ext_authz: http_service.server_uri.uri is required")
-	}
-	// Return the stub sentinel so tests can assert the stub was reached.
-	return nil, errHTTPCheckFnStub
-}
+// buildHTTPCheckFn is defined in check.go (Task 3 real implementation).
+// At Task 2 this was a stub in this file; at Task 3 the real implementation
+// lives in check.go and this comment serves as the cross-reference.
+// Signature: buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error)
 
 // compileStringMatcherList compiles an ext_authz ListStringMatcher into a
 // *stringMatcherList. At Task 2 this is a STUB returning nil (the real

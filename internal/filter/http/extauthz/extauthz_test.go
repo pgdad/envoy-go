@@ -22,15 +22,20 @@ package extauthz
 //   This design choice is documented per PLAN Group 1 note.
 
 import (
-	"errors"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -271,29 +276,29 @@ func TestNew_HttpServiceEmptyURI(t *testing.T) {
 	_ = err // any error is correct at Task 2
 }
 
-// TestNew_HttpService_ValidConfig_Task2Stub verifies that a valid http_service config
-// reaches the buildHTTPCheckFn stub at Task 2 (not a parse-rejection before it).
-// The test asserts the error is the stub sentinel (errHTTPCheckFnStub) so we can
-// distinguish stub-path from real parse errors.
-// At Task 3 this test will be tightened to assert factory != nil (real impl lands).
+// TestNew_HttpService_ValidConfig_Task2Stub was the Task 2 stub-path test.
+// TIGHTENED at Task 3: the real buildHTTPCheckFn lands in check.go; a valid
+// http_service config now produces a non-nil factory (no stub error).
+// The stub-path assertions are superseded by TestNew_HttpService_ValidConfig_RealImpl
+// in Group 4. This test is RETIRED (kept for audit trail; it now verifies success).
 func TestNew_HttpService_ValidConfig_Task2Stub(t *testing.T) {
+	// Task 3 tightening: assert factory != nil (real impl landed).
 	factory, err := New(mustAny(t, validHTTPServiceConfig()), freshFactoryCtx())
-	// At Task 2 the stub returns errHTTPCheckFnStub.
-	if err == nil {
-		t.Fatal("New(valid http_service, Task 2 stub): want stub error, got nil")
+	if err != nil {
+		t.Fatalf("New(valid http_service): Task 3 real impl: want nil error, got %v", err)
 	}
-	if factory != nil {
-		t.Errorf("New(valid http_service, Task 2 stub): want nil factory (stub), got non-nil")
-	}
-	// Assert that the error IS the stub sentinel (not a parse rejection before it).
-	if !errors.Is(err, errHTTPCheckFnStub) {
-		t.Errorf("New(valid http_service, Task 2 stub): got %q; want errHTTPCheckFnStub (%v)", err.Error(), errHTTPCheckFnStub)
+	if factory == nil {
+		t.Fatal("New(valid http_service): Task 3 real impl: want non-nil factory, got nil")
 	}
 }
 
 // TestNew_StatusOnError_Default verifies the default status_on_error is 403
 // when status_on_error is unset. The compiledConfig.statusOnError field should
 // be 403. Tested via buildCompiledConfig directly.
+//
+// TIGHTENED at Task 3: now that buildHTTPCheckFn is real (check.go), a valid
+// http_service config produces a non-nil cc — the stub-era `if cc != nil`
+// wrapper is removed in favor of unconditional assertions.
 func TestNew_StatusOnError_Default(t *testing.T) {
 	cfg := &ext_authzv3.ExtAuthz{
 		Services: &ext_authzv3.ExtAuthz_HttpService{
@@ -305,26 +310,21 @@ func TestNew_StatusOnError_Default(t *testing.T) {
 		// status_on_error unset → default 403
 	}
 	cc, err := buildCompiledConfig(freshFactoryCtx(), cfg)
-	// At Task 2 buildHTTPCheckFn returns a stub error; buildCompiledConfig
-	// returns that error. We check the status_on_error logic via the
-	// pre-stub portion. Since the stub fires early, we test the default
-	// by calling a proto with nil status_on_error and no other errors.
-	// Since the stub fires at buildHTTPCheckFn, we can't get a cc at Task 2.
-	// Instead: verify the logic by checking the nil case returns 403.
-	// This is a design test — we validate the logic exists.
-	if cc != nil {
-		// If cc is non-nil (post-Task-3), assert statusOnError == 403.
-		if cc.statusOnError != 403 {
-			t.Errorf("statusOnError: got %d, want 403", cc.statusOnError)
-		}
-	} else if err == nil {
-		t.Fatal("buildCompiledConfig: want error (stub), got nil")
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
 	}
-	// At Task 2: stub error is expected; this test serves as documentation.
+	if cc == nil {
+		t.Fatal("buildCompiledConfig: got nil cc, want non-nil")
+	}
+	if cc.statusOnError != 403 {
+		t.Errorf("statusOnError: got %d, want 403", cc.statusOnError)
+	}
 }
 
 // TestNew_StatusOnError_Explicit verifies that an explicit status_on_error is
 // consumed. Tested via buildCompiledConfig.
+//
+// TIGHTENED at Task 3: unconditional assertions (real buildHTTPCheckFn).
 func TestNew_StatusOnError_Explicit(t *testing.T) {
 	cfg := &ext_authzv3.ExtAuthz{
 		Services: &ext_authzv3.ExtAuthz_HttpService{
@@ -336,14 +336,15 @@ func TestNew_StatusOnError_Explicit(t *testing.T) {
 		StatusOnError:       &typev3.HttpStatus{Code: typev3.StatusCode_ServiceUnavailable}, // 503
 	}
 	cc, err := buildCompiledConfig(freshFactoryCtx(), cfg)
-	if cc != nil {
-		if cc.statusOnError != 503 {
-			t.Errorf("statusOnError: got %d, want 503", cc.statusOnError)
-		}
-	} else if err == nil {
-		t.Fatal("buildCompiledConfig: want error (stub), got nil")
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
 	}
-	// At Task 2: stub error is expected; real value tested at Task 3+.
+	if cc == nil {
+		t.Fatal("buildCompiledConfig: got nil cc, want non-nil")
+	}
+	if cc.statusOnError != 503 {
+		t.Errorf("statusOnError: got %d, want 503", cc.statusOnError)
+	}
 }
 
 // TestNew_StatPrefix_Consumed verifies that stat_prefix is consumed (not causing
@@ -360,9 +361,10 @@ func TestNew_StatPrefix_Consumed(t *testing.T) {
 		StatPrefix:          "custom_prefix",
 	}
 	_, err := New(mustAny(t, cfg), freshFactoryCtx())
-	// At Task 2 the stub fires. The stat_prefix must NOT be the source of error.
-	if err != nil && !errors.Is(err, errHTTPCheckFnStub) {
-		t.Errorf("stat_prefix must not cause error beyond stub; got %q", err.Error())
+	// Task 3 tightening: the real buildHTTPCheckFn lands; no error expected.
+	// The stat_prefix must NOT be the source of any error.
+	if err != nil {
+		t.Errorf("stat_prefix must not cause error; got %q", err.Error())
 	}
 }
 
@@ -490,6 +492,8 @@ func TestCompiledConfig_FieldFinal(t *testing.T) {
 
 // TestCompiledConfig_FailureModeAllowConsumed verifies that failure_mode_allow is
 // consumed into compiledConfig.
+//
+// TIGHTENED at Task 3: unconditional assertions (real buildHTTPCheckFn).
 func TestCompiledConfig_FailureModeAllowConsumed(t *testing.T) {
 	cfg := &ext_authzv3.ExtAuthz{
 		Services: &ext_authzv3.ExtAuthz_HttpService{
@@ -501,18 +505,21 @@ func TestCompiledConfig_FailureModeAllowConsumed(t *testing.T) {
 		FailureModeAllow:    true,
 	}
 	cc, err := buildCompiledConfig(freshFactoryCtx(), cfg)
-	if cc != nil {
-		if !cc.failureModeAllow {
-			t.Error("failureModeAllow: got false, want true")
-		}
-	} else if err == nil {
-		t.Fatal("buildCompiledConfig: want error or cc")
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
 	}
-	// At Task 2 stub fires; field tested when cc != nil (post-Task-3).
+	if cc == nil {
+		t.Fatal("buildCompiledConfig: got nil cc, want non-nil")
+	}
+	if !cc.failureModeAllow {
+		t.Error("failureModeAllow: got false, want true")
+	}
 }
 
 // TestCompiledConfig_WithRequestBodyConsumed verifies that a valid with_request_body
 // is consumed into compiledConfig.withRequestBody.
+//
+// TIGHTENED at Task 3: unconditional assertions (real buildHTTPCheckFn).
 func TestCompiledConfig_WithRequestBodyConsumed(t *testing.T) {
 	cfg := &ext_authzv3.ExtAuthz{
 		Services: &ext_authzv3.ExtAuthz_HttpService{
@@ -528,21 +535,21 @@ func TestCompiledConfig_WithRequestBodyConsumed(t *testing.T) {
 		},
 	}
 	cc, err := buildCompiledConfig(freshFactoryCtx(), cfg)
-	if cc != nil {
-		if cc.withRequestBody == nil {
-			t.Error("withRequestBody: got nil, want non-nil")
-		} else {
-			if cc.withRequestBody.maxRequestBytes != 1024 {
-				t.Errorf("maxRequestBytes: got %d, want 1024", cc.withRequestBody.maxRequestBytes)
-			}
-			if !cc.withRequestBody.allowPartialMessage {
-				t.Error("allowPartialMessage: got false, want true")
-			}
-		}
-	} else if err == nil {
-		t.Fatal("buildCompiledConfig: want error or cc")
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
 	}
-	// At Task 2 stub fires; field tested when cc != nil (post-Task-3).
+	if cc == nil {
+		t.Fatal("buildCompiledConfig: got nil cc, want non-nil")
+	}
+	if cc.withRequestBody == nil {
+		t.Fatal("withRequestBody: got nil, want non-nil")
+	}
+	if cc.withRequestBody.maxRequestBytes != 1024 {
+		t.Errorf("maxRequestBytes: got %d, want 1024", cc.withRequestBody.maxRequestBytes)
+	}
+	if !cc.withRequestBody.allowPartialMessage {
+		t.Error("allowPartialMessage: got false, want true")
+	}
 }
 
 // TestDecodeHeadersSkeleton_ReturnsHeaderContinue verifies the DecodeHeaders
@@ -917,3 +924,371 @@ func TestResolvePerRouteConfig_UnknownMsgTypeFallback(t *testing.T) {
 		t.Error("resolvePerRouteConfig(wrong type): want listenerRC fallback, got different result")
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Group 4 — HTTP-mode checkFn: buildHTTPCheckFn + the checkFn closure
+// (Group 4 per SPEC §14.1 + PLAN Task 3)
+//
+// Uses a scriptableAuthServer helper (httptest.NewServer-based) to script
+// the auth-server responses. Each test calls buildHTTPCheckFn directly
+// (or via buildCompiledConfig) and invokes the resulting checkFn closure
+// against the scriptable server.
+// ----------------------------------------------------------------------------
+
+// scriptableAuthServer is a minimal httptest-based scriptable auth server for
+// Group 4 tests. It serves a fixed HTTP response (status + headers + body)
+// supplied at construction time. After one request, records the received
+// request for later inspection.
+type scriptableAuthServer struct {
+	srv      *httptest.Server
+	received *http.Request // set after the first call; guarded by the test's sequential use
+}
+
+// newScriptableAuthServer creates an httptest.Server that returns the given
+// status, headers, and body for every request. The handler captures the last
+// received request in srv.received.
+func newScriptableAuthServer(t *testing.T, status int, headers map[string]string, body string) *scriptableAuthServer {
+	t.Helper()
+	sas := &scriptableAuthServer{}
+	sas.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sas.received = r
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		if body != "" {
+			_, _ = w.Write([]byte(body))
+		}
+	}))
+	t.Cleanup(func() { sas.srv.Close() })
+	return sas
+}
+
+// newSlowAuthServer creates an httptest.Server that hangs until the client
+// times out (or the context is cancelled). Used for timeout tests.
+func newSlowAuthServer(t *testing.T) *scriptableAuthServer {
+	t.Helper()
+	sas := &scriptableAuthServer{}
+	sas.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sas.received = r
+		// Sleep until the request context is done (simulates a slow auth service).
+		<-r.Context().Done()
+		// Drain; don't respond.
+		_ = r.Body.Close()
+	}))
+	t.Cleanup(func() { sas.srv.Close() })
+	return sas
+}
+
+// buildHTTPCheckFnForTest builds an httpAuthClient pointing at the given server URL
+// with an optional timeout, returning the checkFn closure. Convenience wrapper
+// for Group 4 tests.
+func buildHTTPCheckFnForTest(t *testing.T, serverURL string, timeoutMs int64, pathPrefix string) checkFn {
+	t.Helper()
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{
+			Uri: serverURL,
+		},
+		PathPrefix: pathPrefix,
+	}
+	if timeoutMs > 0 {
+		hs.ServerUri.Timeout = durationpb.New(time.Duration(timeoutMs) * time.Millisecond)
+	}
+	fn, err := buildHTTPCheckFn(hs)
+	if err != nil {
+		t.Fatalf("buildHTTPCheckFn: unexpected error: %v", err)
+	}
+	return fn
+}
+
+// minimalAuthRequest returns a minimal *authRequest for use in Group 4 tests.
+// The request-side filtered-headers construction (Task 4) is stubbed; for Task 3
+// we pass a simple header set directly.
+func minimalAuthRequest(path string, headers map[string]string) *authRequest {
+	h := make(http.Header)
+	for k, v := range headers {
+		h.Set(k, v)
+	}
+	return &authRequest{
+		method:  http.MethodPost,
+		path:    path,
+		headers: h,
+		body:    nil,
+	}
+}
+
+// -------------------------------------------------------------------------
+// Group 4 tests — buildHTTPCheckFn construction + checkFn closure behavior
+// -------------------------------------------------------------------------
+
+// TestBuildHTTPCheckFn_MissingServerURI verifies PARSE-REJECT when server_uri
+// is nil. Per SPEC §6.5 (PGV-mirror).
+func TestBuildHTTPCheckFn_MissingServerURI(t *testing.T) {
+	hs := &ext_authzv3.HttpService{
+		// server_uri intentionally nil
+	}
+	fn, err := buildHTTPCheckFn(hs)
+	if err == nil {
+		t.Fatal("buildHTTPCheckFn(nil server_uri): want error, got nil")
+	}
+	if fn != nil {
+		t.Error("buildHTTPCheckFn(nil server_uri): want nil fn, got non-nil")
+	}
+	if !strings.Contains(err.Error(), "server_uri") {
+		t.Errorf("got %q; want substring 'server_uri'", err.Error())
+	}
+}
+
+// TestBuildHTTPCheckFn_EmptyURI verifies PARSE-REJECT when server_uri.uri is empty.
+func TestBuildHTTPCheckFn_EmptyURI(t *testing.T) {
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: ""},
+	}
+	fn, err := buildHTTPCheckFn(hs)
+	if err == nil {
+		t.Fatal("buildHTTPCheckFn(empty uri): want error, got nil")
+	}
+	if fn != nil {
+		t.Error("buildHTTPCheckFn(empty uri): want nil fn, got non-nil")
+	}
+}
+
+// TestBuildHTTPCheckFn_ValidConfig_ReturnsNonNilFn verifies that a valid
+// HttpService config produces a non-nil checkFn (real impl, not stub).
+func TestBuildHTTPCheckFn_ValidConfig_ReturnsNonNilFn(t *testing.T) {
+	fn := buildHTTPCheckFnForTest(t, "http://127.0.0.1:9191/auth", 0, "")
+	if fn == nil {
+		t.Fatal("buildHTTPCheckFn(valid config): got nil fn, want non-nil")
+	}
+}
+
+// TestCheckFn_Allow_Status200 verifies that an auth server HTTP 200 response
+// produces a dispAllow disposition.
+func TestCheckFn_Allow_Status200(t *testing.T) {
+	srv := newScriptableAuthServer(t, http.StatusOK, map[string]string{
+		"x-auth-result": "allowed",
+	}, "")
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 0, "")
+
+	disp, err := fn(context.Background(), minimalAuthRequest("/check", nil))
+	if err != nil {
+		t.Fatalf("checkFn(200): unexpected error: %v", err)
+	}
+	if disp.class != dispAllow {
+		t.Errorf("checkFn(200): got disposition class %v, want dispAllow", disp.class)
+	}
+}
+
+// TestCheckFn_Deny_Status401 verifies that an auth server HTTP 401 response
+// produces a dispDeny disposition with the correct status.
+func TestCheckFn_Deny_Status401(t *testing.T) {
+	denyBody := "unauthorized\n"
+	srv := newScriptableAuthServer(t, http.StatusUnauthorized, map[string]string{
+		"x-deny-reason": "bad-token",
+	}, denyBody)
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 0, "")
+
+	disp, err := fn(context.Background(), minimalAuthRequest("/check", nil))
+	if err != nil {
+		t.Fatalf("checkFn(401): unexpected error: %v", err)
+	}
+	if disp.class != dispDeny {
+		t.Errorf("checkFn(401): got disposition class %v, want dispDeny", disp.class)
+	}
+	if disp.denyStatus != http.StatusUnauthorized {
+		t.Errorf("checkFn(401): denyStatus got %d, want 401", disp.denyStatus)
+	}
+	if string(disp.denyBody) != denyBody {
+		t.Errorf("checkFn(401): denyBody got %q, want %q", disp.denyBody, denyBody)
+	}
+}
+
+// TestCheckFn_Deny_Status403 verifies that an auth server HTTP 403 response
+// produces a dispDeny disposition.
+func TestCheckFn_Deny_Status403(t *testing.T) {
+	denyBody := "forbidden\n"
+	srv := newScriptableAuthServer(t, http.StatusForbidden, map[string]string{
+		"x-deny-reason": "policy",
+	}, denyBody)
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 0, "")
+
+	disp, err := fn(context.Background(), minimalAuthRequest("/check", nil))
+	if err != nil {
+		t.Fatalf("checkFn(403): unexpected error: %v", err)
+	}
+	if disp.class != dispDeny {
+		t.Errorf("checkFn(403): got disposition class %v, want dispDeny", disp.class)
+	}
+	if disp.denyStatus != http.StatusForbidden {
+		t.Errorf("checkFn(403): denyStatus got %d, want 403", disp.denyStatus)
+	}
+	if string(disp.denyBody) != denyBody {
+		t.Errorf("checkFn(403): denyBody got %q, want %q", disp.denyBody, denyBody)
+	}
+}
+
+// TestCheckFn_Error_UnrecognizedStatus verifies that an unrecognized HTTP status
+// (e.g., 555) produces a dispError disposition per §5.P10.
+func TestCheckFn_Error_UnrecognizedStatus(t *testing.T) {
+	srv := newScriptableAuthServer(t, 555, nil, "")
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 0, "")
+
+	disp, err := fn(context.Background(), minimalAuthRequest("/check", nil))
+	if err == nil {
+		t.Fatal("checkFn(555): want error for unrecognized status, got nil")
+	}
+	if disp.class != dispError {
+		t.Errorf("checkFn(555): got disposition class %v, want dispError", disp.class)
+	}
+}
+
+// TestCheckFn_Error_ConnectFailure verifies that a connect failure (auth server
+// closed/unreachable) produces a dispError disposition.
+func TestCheckFn_Error_ConnectFailure(t *testing.T) {
+	// Create a server and close it immediately — so the port is not listening.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	serverURL := srv.URL
+	srv.Close() // closed immediately; connect will fail
+
+	fn := buildHTTPCheckFnForTest(t, serverURL, 2000, "")
+	disp, err := fn(context.Background(), minimalAuthRequest("/check", nil))
+	if err == nil {
+		t.Fatal("checkFn(connect failure): want error, got nil")
+	}
+	if disp.class != dispError {
+		t.Errorf("checkFn(connect failure): got disposition class %v, want dispError", disp.class)
+	}
+}
+
+// TestCheckFn_Error_Timeout verifies that a slow auth server (exceeding the
+// timeout) produces a dispError disposition.
+func TestCheckFn_Error_Timeout(t *testing.T) {
+	srv := newSlowAuthServer(t)
+	// 50ms timeout — the slow server never responds within that window.
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 50, "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	disp, err := fn(ctx, minimalAuthRequest("/check", nil))
+	if err == nil {
+		t.Fatal("checkFn(timeout): want error, got nil")
+	}
+	if disp.class != dispError {
+		t.Errorf("checkFn(timeout): got disposition class %v, want dispError", disp.class)
+	}
+}
+
+// TestCheckFn_Error_ContextCancelled verifies that a context cancellation during
+// an in-flight call produces a dispError disposition.
+func TestCheckFn_Error_ContextCancelled(t *testing.T) {
+	srv := newSlowAuthServer(t)
+	// Use a very long client timeout so only context cancellation fires.
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 30000, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel the context immediately before calling.
+	cancel()
+
+	disp, err := fn(ctx, minimalAuthRequest("/check", nil))
+	if err == nil {
+		t.Fatal("checkFn(ctx cancelled): want error, got nil")
+	}
+	if disp.class != dispError {
+		t.Errorf("checkFn(ctx cancelled): got disposition class %v, want dispError", disp.class)
+	}
+}
+
+// TestCheckFn_PathPrefix_Prepended verifies that the path_prefix is prepended
+// to the authRequest path in the outbound POST.
+func TestCheckFn_PathPrefix_Prepended(t *testing.T) {
+	var capturedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { srv.Close() })
+
+	fn := buildHTTPCheckFnForTest(t, srv.URL, 0, "/auth-prefix")
+	_, err := fn(context.Background(), minimalAuthRequest("/api/resource", nil))
+	if err != nil {
+		t.Fatalf("checkFn(path_prefix): unexpected error: %v", err)
+	}
+	wantPath := "/auth-prefix/api/resource"
+	if capturedPath != wantPath {
+		t.Errorf("path_prefix: captured path %q, want %q", capturedPath, wantPath)
+	}
+}
+
+// TestCheckFn_HeadersForwarded verifies that the authRequest headers are sent
+// in the outbound POST to the auth service.
+func TestCheckFn_HeadersForwarded(t *testing.T) {
+	var capturedHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHeader = r.Header.Get("x-forwarded-for")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { srv.Close() })
+
+	fn := buildHTTPCheckFnForTest(t, srv.URL, 0, "")
+	_, err := fn(context.Background(), minimalAuthRequest("/check", map[string]string{
+		"x-forwarded-for": "10.0.0.1",
+	}))
+	if err != nil {
+		t.Fatalf("checkFn(headers): unexpected error: %v", err)
+	}
+	if capturedHeader != "10.0.0.1" {
+		t.Errorf("headers forwarded: got %q, want %q", capturedHeader, "10.0.0.1")
+	}
+}
+
+// TestCheckFn_WithRequestBody verifies that when the authRequest has a body,
+// it is sent in the outbound POST.
+func TestCheckFn_WithRequestBody(t *testing.T) {
+	var capturedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { srv.Close() })
+
+	fn := buildHTTPCheckFnForTest(t, srv.URL, 0, "")
+	req := &authRequest{
+		method:  http.MethodPost,
+		path:    "/check",
+		headers: make(http.Header),
+		body:    []byte("request-body-data"),
+	}
+	_, err := fn(context.Background(), req)
+	if err != nil {
+		t.Fatalf("checkFn(with body): unexpected error: %v", err)
+	}
+	if string(capturedBody) != "request-body-data" {
+		t.Errorf("request body: got %q, want %q", capturedBody, "request-body-data")
+	}
+}
+
+// TestNew_HttpService_ValidConfig_RealImpl verifies that at Task 3 (real
+// buildHTTPCheckFn) a valid http_service config produces a non-nil factory
+// (no more stub error). This REPLACES / TIGHTENS the Task 2 stub test
+// TestNew_HttpService_ValidConfig_Task2Stub.
+func TestNew_HttpService_ValidConfig_RealImpl(t *testing.T) {
+	factory, err := New(mustAny(t, validHTTPServiceConfig()), freshFactoryCtx())
+	if err != nil {
+		t.Fatalf("New(valid http_service, real impl): want nil error, got %v", err)
+	}
+	if factory == nil {
+		t.Fatal("New(valid http_service, real impl): want non-nil factory, got nil")
+	}
+}
+
+// NOTE: the Task-2 M4 stub-tolerant tests TestNew_StatusOnError_Default,
+// TestNew_StatusOnError_Explicit, TestCompiledConfig_FailureModeAllowConsumed,
+// and TestCompiledConfig_WithRequestBodyConsumed were TIGHTENED IN PLACE at
+// Task 3 (their stub-era `if cc != nil` wrappers replaced with unconditional
+// assertions now that buildHTTPCheckFn is real). No separate `_RealImpl`
+// duplicates are kept — the originals carry the tightened assertions.
