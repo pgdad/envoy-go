@@ -140,6 +140,13 @@ type compiledConfig struct {
 	// surfaces as a PARSE-REJECT at config-load time (not silent-degrade at runtime).
 	deprecatedAllowedHeaders *stringMatcherList
 
+	// headersToAdd is the pre-compiled AuthorizationRequest.headers_to_add static
+	// header list. Compiled ONCE at buildCompiledConfig time (Task 9 review fix —
+	// previously read from hs at request time, requiring a non-nil hs argument to
+	// buildAuthRequest; passing nil silently dropped these headers). Pre-compilation
+	// makes buildAuthRequest hs-independent: no nil/empty argument needed.
+	headersToAdd []headerKV
+
 	// stats is SHARED across listener + all per-route configs (SHARED-stats
 	// discipline per ADR-0163; mirrors phase-12/13/14/17). nil when
 	// ctx.Stats is nil (test path per ADR-0085 nil-tolerance).
@@ -396,13 +403,19 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 	}
 	cc.checkFn = fn
 
-	// Task 5 carried-forward fix: pre-compile the deprecated
-	// AuthorizationRequest.allowed_headers field at config-load time (was
-	// per-request in buildAuthRequest Task 4). Only stored when the top-level
-	// allowed_headers is nil (cc.allowedHeaders is parsed at step 6 below but
-	// we need to compile the deprecated field regardless so malformed configs
-	// surface at parse time). We resolve the cc.allowedHeaders precondition after
-	// step 6 by nulling out deprecatedAllowedHeaders when allowedHeaders is set.
+	// Pre-compile AuthorizationRequest fields from http_service at config-load time
+	// so that buildAuthRequest does not need the *HttpService proto at request time.
+	//
+	// Task 5 carried-forward fix: pre-compile the deprecated allowed_headers field.
+	// Only stored when the top-level allowed_headers is nil (cc.allowedHeaders is
+	// parsed at step 6 below but we need to compile the deprecated field regardless
+	// so malformed configs surface at parse time). We resolve the cc.allowedHeaders
+	// precondition after step 6 by nulling out deprecatedAllowedHeaders when set.
+	//
+	// Task 9 review fix: pre-compile headers_to_add into cc.headersToAdd. The
+	// previous approach passed hs to buildAuthRequest and guarded with hs != nil,
+	// which silently dropped all headers_to_add when dispatchOutboundCheck passed
+	// nil. Pre-compilation makes buildAuthRequest hs-independent.
 	//
 	// Note: this step must run after the http_service validation above (so we have
 	// a valid httpSvc) but before step 6 (cc.allowedHeaders is set there).
@@ -414,6 +427,15 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 					return nil, fmt.Errorf("ext_authz: authorization_request.allowed_headers (deprecated): %w", compErr)
 				}
 				cc.deprecatedAllowedHeaders = compiled
+			}
+			for _, hv := range ar.GetHeadersToAdd() {
+				if hv.GetKey() == "" {
+					continue
+				}
+				cc.headersToAdd = append(cc.headersToAdd, headerKV{
+					name:  http.CanonicalHeaderKey(hv.GetKey()),
+					value: hv.GetValue(),
+				})
 			}
 		}
 	}
@@ -740,14 +762,17 @@ func (f *filter) dispatchOutboundCheck(headers http.Header) {
 	// Build the authRequest with the request-side-filtered headers + buffered body.
 	// f.body is nil when with_request_body is not set (no buffering configured);
 	// non-nil when body buffering has assembled the body via DecodeData.
-	// The HttpService is extracted from cc.checkFn's closure capture — we pass
-	// nil here because buildAuthRequest only needs hs for headers_to_add +
-	// the deprecated allowed_headers field; both are pre-compiled into cc at
-	// buildCompiledConfig time and accessed via cc.deprecatedAllowedHeaders.
-	// Per check.go call-site boundary note: buildAuthRequest uses f.activeRC
-	// (cc) for the pre-compiled matchers; hs nil is handled by buildAuthRequest
-	// (it guards ar := hs.GetAuthorizationRequest() with hs != nil).
-	authReq := buildAuthRequest(f, nil, headers, f.body, "")
+	//
+	// path is extracted from the :path pseudo-header (mirrors jwtauthn.go:759 /
+	// rbac.go:951 pattern). An empty :path results in an empty path string, which
+	// check.go's closure maps to baseURL + pathPrefix — the same behavior as no
+	// path override.
+	//
+	// All config sourced from hs (headers_to_add, deprecated allowed_headers) is
+	// pre-compiled into cc at buildCompiledConfig time (cc.headersToAdd,
+	// cc.deprecatedAllowedHeaders). buildAuthRequest is fully hs-independent.
+	path := headers.Get(":path")
+	authReq := buildAuthRequest(f, headers, f.body, path)
 
 	// Create the per-request cancellable context (D4 + Task-2-M5 forward-pointer).
 	callCtx, callCancel := context.WithCancel(context.Background())
@@ -882,9 +907,10 @@ func headerKVToOrderedHeaders(kvs []headerKV) envoyhttp.OrderedHeaders {
 // The body-buffering branch (step 4) was wired at Task 6. Task 9 adds the
 // full per-route resolve + disabled short-circuit + async dispatch + resume.
 //
-// buildAuthRequest call-site per Task 4 review-fix: dispatchOutboundCheck calls
-// buildAuthRequest(f, nil, headers, f.body, "") to construct the request-side-
-// filtered *authRequest; see dispatchOutboundCheck for the full rationale.
+// buildAuthRequest call-site per Task 4 review-fix + Task 9 review fix:
+// dispatchOutboundCheck calls buildAuthRequest(f, headers, f.body, path) —
+// path extracted from the :path pseudo-header — to construct the
+// request-side-filtered *authRequest; see dispatchOutboundCheck for details.
 func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.FilterHeadersStatus {
 	// Step 1: resolve per-route config + cache on filter state.
 	var pr *compiledPerRoute
@@ -990,25 +1016,14 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	// authRequest construction + goroutine + disposition). Park via
 	// DataStopIterationAndBuffer — the resume goroutine calls ContinueDecoding().
 	if endStream {
-		// The DecodeHeaders headers map is not available here (DecodeData only
-		// receives the body chunk). We pass the accumulated headers from the
-		// upstream request — but since DecodeData doesn't have access to the
-		// original headers, we pass nil and let buildAuthRequest use an empty
-		// header set for the body-path. The allow-path upstream injection lands
-		// on nil headers (a no-op for injection) in the body-complete path.
-		// NOTE: This is a minor limitation — for the body-complete path, upstream
-		// header injection cannot target the original request headers because
-		// DecodeData doesn't hold a reference to them. The endStream=true +
-		// awaitingBody path implies headers were already passed through (Continue
-		// was returned from DecodeHeaders), so the HCM already has those headers.
-		// For the allow-path mutation, we use an empty placeholder header map
-		// that is distinct from the real upstream headers.
-		//
-		// CORRECTION: The correct design is to cache the headers reference at
-		// DecodeHeaders time on the filter (f.cachedHeaders) so DecodeData can
-		// access them. This is wired here — f.cachedHeaders is set at
-		// DecodeHeaders time and used here. If nil (e.g. body-only test setup),
-		// fall back to empty.
+		// Body complete: dispatch the outbound auth check using the cached headers
+		// reference stored by DecodeHeaders (f.cachedHeaders). Caching the headers
+		// at DecodeHeaders time lets the allow-path upstream mutations (injected by
+		// applyUpstreamMutations under mu in the resume goroutine) land on the same
+		// header map that the HCM chain already holds — so the injected headers
+		// are visible to subsequent filters and the upstream request. If cachedHeaders
+		// is nil (degenerate body-only test setup without a DecodeHeaders call),
+		// fall back to an empty header map.
 		hdrs := f.cachedHeaders
 		if hdrs == nil {
 			hdrs = make(http.Header)

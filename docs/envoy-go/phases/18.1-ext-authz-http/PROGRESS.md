@@ -1409,3 +1409,116 @@ $ gofmt -l internal/filter/http/extauthz/
 ### Task 9 commit SHA
 
 `c310d96`
+
+### Task 9 review fixes
+
+Post-landing spec and code-quality reviews identified 7 issues. All fixed in one follow-up commit.
+
+#### Fix 1 (Important) — `path=""` bug
+
+**Root cause:** `dispatchOutboundCheck` was calling `buildAuthRequest(f, nil, headers, f.body, "")` — the empty string `""` meant the auth service received every request at the same URL (`baseURL + pathPrefix`) regardless of the client's actual request path. Auth services cannot make path-based decisions and `path_prefix` prepending was effectively broken.
+
+**Fix:** Extract the client's path from the `:path` pseudo-header in `dispatchOutboundCheck` (mirroring the `jwtauthn.go:759` pattern):
+```go
+path := headers.Get(":path")
+authReq := buildAuthRequest(f, headers, f.body, path)
+```
+
+**Files changed:** `internal/filter/http/extauthz/extauthz.go` (dispatchOutboundCheck — add path extraction + pass to buildAuthRequest; also fix stale comment per Fix 4 below).
+
+**Side discovery:** The `:path` pseudo-header (and any other `:` prefixed HTTP/2 pseudo-headers like `:method`, `:authority`, `:scheme`) must also be stripped from the filtered headers map in `buildAuthRequest` — Go's `net/http` client rejects `:` prefixed header field names as invalid per RFC 7230 §3.2. Added unconditional pseudo-header skip in `buildAuthRequest`'s header-filtering loop:
+```go
+if strings.HasPrefix(name, ":") {
+    continue
+}
+```
+**Files changed:** `internal/filter/http/extauthz/attributes.go` (buildAuthRequest — skip pseudo-headers before allow/disallow filtering).
+
+**New test (TDD):** `TestDecodeHeaders_PathPropagation_AuthServerSeesClientPath` — verified FAIL before fix (`auth server path: got "", want "/api/v1/users"`) and PASS after.
+
+#### Fix 2 (Important) — `hs=nil` → `headers_to_add` silently dropped
+
+**Root cause:** `dispatchOutboundCheck` passed `nil` as the `hs *ext_authzv3.HttpService` argument to `buildAuthRequest`. The `buildAuthRequest` function guarded `headers_to_add` processing with `if hs != nil`, so all `AuthorizationRequest.headers_to_add` static headers were silently dropped from every outbound auth request.
+
+**Fix (Option A — recommended):** Added `headersToAdd []headerKV` field to `compiledConfig`. Pre-compiled from `httpSvc.GetAuthorizationRequest().GetHeadersToAdd()` at `buildCompiledConfig` time (alongside `deprecatedAllowedHeaders`). Updated `buildAuthRequest` to:
+- Remove the `hs *ext_authzv3.HttpService` parameter entirely (buildAuthRequest is now fully hs-independent).
+- Apply `cc.headersToAdd` unconditionally instead of reading from `hs`.
+
+This mirrors the Task-5 `deprecatedAllowedHeaders` pre-compile pattern. The `dispatchOutboundCheck` call becomes `buildAuthRequest(f, headers, f.body, path)` — no nil/empty placeholders.
+
+**Files changed:** `internal/filter/http/extauthz/extauthz.go` (`compiledConfig` — add `headersToAdd []headerKV` field; `buildCompiledConfig` — pre-compile headers_to_add into cc; also extended pre-compile comment block). `internal/filter/http/extauthz/attributes.go` (remove `hs` param from `buildAuthRequest`; consume `cc.headersToAdd`; remove unused `ext_authzv3` import). `internal/filter/http/extauthz/extauthz_test.go` (`buildAuthRequestForTest` helper updated to pre-compile `headersToAdd` from hs into cc, mirroring buildCompiledConfig; `TestBuildAuthRequest_BodyIncluded` updated to drop hs arg; `TestBuildAuthRequest_NilHttpService` renamed to `TestBuildAuthRequest_NoHeadersToAdd` with updated description).
+
+**New test (TDD):** `TestDecodeHeaders_HeadersToAdd_ReachAuthServer` — verified PASS after fix (pre-fix failure confirmed by the structural analysis: the `if hs != nil` guard silently dropped headers_to_add when `nil` was passed).
+
+#### Fix 3 — `clearRouteCacheRequested` test read without lock
+
+**Root cause:** `TestDecodeHeaders_AsyncAllow_ClearRouteCache` read `f.clearRouteCacheRequested` without holding `f.mu`, while the resume goroutine writes it under `f.mu`. This is a data race.
+
+**Fix:** Wrapped the read under `f.mu` (mirrors `TestDecodeHeaders_AsyncAllow_UpstreamMutation` line 4380-4382 which already acquired the lock):
+```go
+f.mu.Lock()
+got := f.clearRouteCacheRequested
+f.mu.Unlock()
+if !got { ... }
+```
+
+**File changed:** `internal/filter/http/extauthz/extauthz_test.go` (TestDecodeHeaders_AsyncAllow_ClearRouteCache — add mu lock/unlock around read).
+
+#### Fix 4 — Stale comment in `dispatchOutboundCheck`
+
+**Root cause:** The comment "The HttpService is extracted from cc.checkFn's closure capture — we pass nil here because buildAuthRequest only needs hs for headers_to_add + the deprecated allowed_headers field; both are pre-compiled into cc at buildCompiledConfig time..." was factually wrong (headers_to_add was NOT pre-compiled, which was exactly the bug fixed in Fix 2).
+
+**Fix:** Rewrote the comment to accurately describe the post-Option-A state (cc pre-compiled approach, hs-independent buildAuthRequest, path extracted from :path pseudo-header).
+
+**File changed:** `internal/filter/http/extauthz/extauthz.go` (dispatchOutboundCheck comment block — accurate post-fix description).
+
+#### Fix 5 — Group 5A disabled test checks only `ok` counter
+
+**Root cause:** `TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters` only asserted `ok == 0` but not the other 5 counters. The "NO counter increments" contract was incompletely tested.
+
+**Fix:** Extended to assert all 6 counters (`ok`, `denied`, `error`, `disabled`, `failure_mode_allowed`, `invalid`) stay at 0 using a table-driven check.
+
+**File changed:** `internal/filter/http/extauthz/extauthz_test.go` (TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters — table-driven all-6-counters assertion).
+
+#### Fix 6 — Group 5E invalid test misses `errored==1`
+
+**Root cause:** The `dispInvalid` path calls `applyErrorPosture` which increments `errored` PLUS the separate `invalid` counter. The test only verified `invalid == 1` and missed the dual-increment behavior.
+
+**Fix:** Added `erroredCtr.Load() == 1` assertion to lock down the dual-increment contract.
+
+**File changed:** `internal/filter/http/extauthz/extauthz_test.go` (TestDecodeHeaders_AsyncInvalid_InvalidCounterAndErrorPosture — add erroredCtr assertion).
+
+#### Fix 7 — Stale self-correction comment in `DecodeData`
+
+**Root cause:** The `DecodeData` `endStream` block had a multi-paragraph comment describing a "wrong design" followed by a "CORRECTION" narrative — implementation history that has no place in production code.
+
+**Fix:** Replaced with a clean comment explaining the `cachedHeaders` design directly, with no design-history narrative.
+
+**File changed:** `internal/filter/http/extauthz/extauthz.go` (DecodeData endStream block — clean comment describing the cachedHeaders approach).
+
+#### Post-fix verification
+
+```
+$ go build ./internal/filter/http/extauthz/...
+(no output — exit 0)
+
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+
+$ gofmt -l internal/filter/http/extauthz/
+(no output — empty)
+
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.307s
+
+$ go test -race -count=10 -run 'TestDecodeHeaders|TestAsyncResume|TestOnDestroy' ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	3.371s
+```
+
+184 PASS, 0 FAIL, 0 SKIP (was 147 after Task 9 landing; +37 includes the new path + headers_to_add + Group 5A/5E test additions, plus the pre-existing counter changes).
+
+**Note on Task 13 impact:** The `path=""` bug (Fix 1) and `headers_to_add` dropped (Fix 2) are behavioral gaps that Task 13's differential test against reference Envoy would have caught. Fixing them now de-risks Task 13 significantly. The pseudo-header strip (Fix 1 side discovery) is also required for correct HTTP/1.1 outbound request construction.
+
+### Task 9 review-fix commit SHA
+
+TBD (filled after commit)

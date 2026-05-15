@@ -52,7 +52,6 @@ import (
 	"regexp"
 	"strings"
 
-	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 )
 
@@ -258,19 +257,19 @@ func (m *smRegex) matches(s string) bool {
 
 // buildAuthRequest constructs the *authRequest for the outbound auth check POST.
 // It filters client request headers through the effective allow-list + disallowed
-// headers, then appends static headers from AuthorizationRequest.headers_to_add.
+// headers, then applies the pre-compiled static headers from cc.headersToAdd
+// (AuthorizationRequest.headers_to_add, pre-compiled at buildCompiledConfig time).
 //
 // Parameters:
 //   - f: the per-stream filter (carries f.activeRC for cc.allowedHeaders /
-//     cc.disallowedHeaders access).
-//   - hs: the parsed HttpService (carries AuthorizationRequest with headers_to_add
-//     deprecated allowed_headers).
+//     cc.disallowedHeaders / cc.headersToAdd access).
 //   - headers: the incoming client request headers (from DecodeHeaders; Task 9
 //     wires this; at Task 4 tests pass it directly).
 //   - body: the buffered request body (nil when with_request_body is unset or
 //     the body is empty). Task 6 wires the real body.
-//   - path: the request path (path_prefix prepend is done in check.go's closure,
-//     NOT here — buildAuthRequest stores the path as-is).
+//   - path: the client's request path extracted from the :path pseudo-header
+//     (path_prefix prepend is done in check.go's closure, NOT here —
+//     buildAuthRequest stores the path as-is).
 //
 // D6 disposition (deprecated AuthorizationRequest.allowed_headers):
 //
@@ -281,7 +280,12 @@ func (m *smRegex) matches(s string) bool {
 //	field is used as the effective allow-list. Compilation is done ONCE at
 //	config-load time in buildCompiledConfig; malformed patterns produce a
 //	PARSE-REJECT at that point, not at request time.
-func buildAuthRequest(f *filter, hs *ext_authzv3.HttpService, headers http.Header, body []byte, path string) *authRequest {
+//
+// Task 9 review fix: removed hs *ext_authzv3.HttpService parameter. All data
+// previously sourced from hs (headers_to_add, deprecated allowed_headers) is now
+// pre-compiled into cc at buildCompiledConfig time and accessed via cc.headersToAdd
+// + cc.deprecatedAllowedHeaders respectively.
+func buildAuthRequest(f *filter, headers http.Header, body []byte, path string) *authRequest {
 	cc := f.activeRC
 
 	// Determine the effective allow-list (D6: top-level primary; deprecated
@@ -301,8 +305,19 @@ func buildAuthRequest(f *filter, hs *ext_authzv3.HttpService, headers http.Heade
 	// `exact: "authorization"` matching the `Authorization` header), we match
 	// against the lowercased header name. This is consistent with reference Envoy
 	// v1.37.2 behavior where all header names are lowercased before matching.
+	//
+	// HTTP/2 pseudo-headers (:path, :method, :authority, :scheme) are skipped
+	// unconditionally. They are NOT forwarded as regular HTTP/1.1 headers to the
+	// auth service: Go's net/http client rejects `:` prefixed header names as
+	// invalid (RFC 7230 §3.2). The path is extracted at the call site and passed
+	// to buildAuthRequest via the path parameter; other pseudo-headers are not
+	// forwarded in the 18.1 HTTP-mode implementation.
 	filtered := make(http.Header)
 	for name, values := range headers {
+		// Skip HTTP/2 pseudo-headers — not valid as HTTP/1.1 header field names.
+		if strings.HasPrefix(name, ":") {
+			continue
+		}
 		// Use the lowercased header name for matcher evaluation to honor the
 		// Envoy convention (header names in configs are lowercase).
 		nameLower := strings.ToLower(name)
@@ -318,18 +333,12 @@ func buildAuthRequest(f *filter, hs *ext_authzv3.HttpService, headers http.Heade
 		filtered[name] = values
 	}
 
-	// Apply headers_to_add from AuthorizationRequest (overwrites same-key headers).
-	if hs != nil {
-		ar := hs.GetAuthorizationRequest()
-		if ar != nil {
-			for _, hv := range ar.GetHeadersToAdd() {
-				if hv.GetKey() == "" {
-					continue
-				}
-				canonical := http.CanonicalHeaderKey(hv.GetKey())
-				filtered.Set(canonical, hv.GetValue())
-			}
-		}
+	// Apply pre-compiled headers_to_add from cc (overwrites same-key headers).
+	// These are pre-compiled from AuthorizationRequest.headers_to_add at
+	// buildCompiledConfig time so they are always present regardless of whether
+	// the hs proto was passed at dispatch time.
+	for _, kv := range cc.headersToAdd {
+		filtered.Set(kv.name, kv.value)
 	}
 
 	return &authRequest{

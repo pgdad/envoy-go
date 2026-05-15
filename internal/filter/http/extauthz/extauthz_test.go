@@ -2030,12 +2030,17 @@ func customPattern() *matcherv3.StringMatcher {
 // buildAuthRequestForTest constructs an *authRequest with the given headers
 // (as a flat k/v list: k1, v1, k2, v2, ...) and calls buildAuthRequest.
 // The filter's compiledConfig carries the supplied allowedHeaders +
-// disallowedHeaders. The HttpService carries the headers_to_add from ar.
+// disallowedHeaders. Mirrors buildCompiledConfig by pre-compiling
+// AuthorizationRequest fields from hs into cc.
 //
-// Task 4 carried-forward (pre-compile fix): mirrors buildCompiledConfig behavior
-// by pre-compiling hs.AuthorizationRequest.AllowedHeaders into
-// cc.deprecatedAllowedHeaders when allowedHeaders is nil (top-level absent).
-// Malformed deprecated patterns are skipped (test helper: use compilable patterns).
+// Task 4 carried-forward (pre-compile fix): pre-compiles the deprecated
+// AuthorizationRequest.allowed_headers into cc.deprecatedAllowedHeaders when
+// the top-level allowedHeaders is absent. Malformed deprecated patterns are
+// skipped (test helper: use compilable patterns).
+//
+// Task 9 review fix: also pre-compiles headers_to_add into cc.headersToAdd,
+// mirroring the buildCompiledConfig Option A pre-compilation. buildAuthRequest
+// no longer accepts hs directly.
 func buildAuthRequestForTest(
 	t *testing.T,
 	allowedHeaders *stringMatcherList,
@@ -2049,15 +2054,27 @@ func buildAuthRequestForTest(
 		allowedHeaders:    allowedHeaders,
 		disallowedHeaders: disallowedHeaders,
 	}
-	// Mirror buildCompiledConfig: pre-compile deprecated AuthorizationRequest.allowed_headers
-	// when the top-level allowedHeaders is absent, and null it out if allowedHeaders is set.
-	if allowedHeaders == nil && hs != nil {
+	// Mirror buildCompiledConfig: pre-compile AuthorizationRequest fields.
+	if hs != nil {
 		if ar := hs.GetAuthorizationRequest(); ar != nil {
-			if deprecated := ar.GetAllowedHeaders(); deprecated != nil {
-				compiled, err := compileStringMatcherList(deprecated)
-				if err == nil {
-					cc.deprecatedAllowedHeaders = compiled
+			// Deprecated allowed_headers: only when top-level allowedHeaders absent.
+			if allowedHeaders == nil {
+				if deprecated := ar.GetAllowedHeaders(); deprecated != nil {
+					compiled, err := compileStringMatcherList(deprecated)
+					if err == nil {
+						cc.deprecatedAllowedHeaders = compiled
+					}
 				}
+			}
+			// headers_to_add pre-compilation (Option A).
+			for _, hv := range ar.GetHeadersToAdd() {
+				if hv.GetKey() == "" {
+					continue
+				}
+				cc.headersToAdd = append(cc.headersToAdd, headerKV{
+					name:  http.CanonicalHeaderKey(hv.GetKey()),
+					value: hv.GetValue(),
+				})
 			}
 		}
 	}
@@ -2066,7 +2083,7 @@ func buildAuthRequestForTest(
 	for k, v := range incomingHeaders {
 		h.Set(k, v)
 	}
-	return buildAuthRequest(f, hs, h, nil, path)
+	return buildAuthRequest(f, h, nil, path)
 }
 
 // -------------------------------------------------------------------------
@@ -2636,11 +2653,8 @@ func TestBuildAuthRequest_PathCarried(t *testing.T) {
 func TestBuildAuthRequest_BodyIncluded(t *testing.T) {
 	cc := &compiledConfig{}
 	f := &filter{state: &factoryState{listenerRC: cc}, activeRC: cc}
-	hs := &ext_authzv3.HttpService{
-		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
-	}
 	body := []byte("request-body-data")
-	req := buildAuthRequest(f, hs, make(http.Header), body, "/api")
+	req := buildAuthRequest(f, make(http.Header), body, "/api")
 	if req == nil {
 		t.Fatal("buildAuthRequest: got nil")
 	}
@@ -2649,16 +2663,17 @@ func TestBuildAuthRequest_BodyIncluded(t *testing.T) {
 	}
 }
 
-// TestBuildAuthRequest_NilHttpService verifies that a nil hs is a valid path:
-// buildAuthRequest guards `hs != nil` at both the deprecated-allowed_headers
-// compilation and the headers_to_add append. With nil hs, all incoming headers
-// pass through (subject to allowed/disallowed filtering) and no static headers
-// are appended.
-func TestBuildAuthRequest_NilHttpService(t *testing.T) {
+// TestBuildAuthRequest_NoHeadersToAdd verifies that when cc.headersToAdd is empty
+// (compiled from a nil or empty AuthorizationRequest.headers_to_add), all incoming
+// headers pass through unfiltered and no static headers are appended.
+//
+// Task 9 review fix: hs parameter removed from buildAuthRequest; this test exercises
+// the equivalent path via buildAuthRequestForTest with hs=nil (→ cc.headersToAdd nil).
+func TestBuildAuthRequest_NoHeadersToAdd(t *testing.T) {
 	req := buildAuthRequestForTest(t,
 		nil, // allowedHeaders: nil = all pass
 		nil, // disallowedHeaders: nil = none removed
-		nil, // hs: nil — valid path
+		nil, // hs: nil → cc.headersToAdd stays nil
 		map[string]string{
 			"authorization": "Bearer tok",
 			"x-request-id":  "abc-123",
@@ -2666,7 +2681,7 @@ func TestBuildAuthRequest_NilHttpService(t *testing.T) {
 		"/api/resource",
 	)
 	if req == nil {
-		t.Fatal("buildAuthRequest(nil hs): got nil authRequest")
+		t.Fatal("buildAuthRequest (no headersToAdd): got nil authRequest")
 	}
 	// Incoming headers pass through unfiltered.
 	if req.headers.Get("Authorization") == "" {
@@ -2675,9 +2690,9 @@ func TestBuildAuthRequest_NilHttpService(t *testing.T) {
 	if req.headers.Get("X-Request-Id") == "" {
 		t.Error("x-request-id header: got empty, want present")
 	}
-	// No headers_to_add appended (hs is nil).
+	// No headers_to_add appended (cc.headersToAdd nil).
 	if got := len(req.headers); got != 2 {
-		t.Errorf("header count: got %d, want 2 (no headers_to_add with nil hs)", got)
+		t.Errorf("header count: got %d, want 2 (no headersToAdd)", got)
 	}
 	if req.path != "/api/resource" {
 		t.Errorf("path: got %q, want %q", req.path, "/api/resource")
@@ -4269,13 +4284,12 @@ func buildDispatchFilter(
 
 // TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters verifies that when the
 // per-route config has disabled:true, DecodeHeaders returns Continue immediately
-// with NO auth call and NO counter increments.
+// with NO auth call and NO counter increments on any of the 6 counters.
 //
 // Per SPEC §6.3 step 2 + parent §6 amendment 7.
 func TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters(t *testing.T) {
 	reg := stats.NewRegistry()
 	fs := newFilterStats(reg, "ingress_http")
-	ok0 := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.ok")
 
 	// Auth server that MUST NOT be called; it counts calls.
 	var authCalled int
@@ -4313,9 +4327,22 @@ func TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters(t *testing.T) {
 	if authCalled > 0 {
 		t.Errorf("disabled: auth server called %d times, want 0", authCalled)
 	}
-	// No counter increments: ok counter must still be 0.
-	if v := ok0.Load(); v != 0 {
-		t.Errorf("disabled: ok counter = %d, want 0 (no counter increments on disabled path)", v)
+	// No counter increments: ALL 6 counters must remain at 0 on the disabled path.
+	for _, tc := range []struct {
+		name  string
+		ctr   *stats.Counter
+		cname string
+	}{
+		{"ok", reg.NewCounterIfAbsent("http.ingress_http.ext_authz.ok"), "ok"},
+		{"denied", reg.NewCounterIfAbsent("http.ingress_http.ext_authz.denied"), "denied"},
+		{"error", reg.NewCounterIfAbsent("http.ingress_http.ext_authz.error"), "error"},
+		{"disabled", reg.NewCounterIfAbsent("http.ingress_http.ext_authz.disabled"), "disabled"},
+		{"failure_mode_allowed", reg.NewCounterIfAbsent("http.ingress_http.ext_authz.failure_mode_allowed"), "failure_mode_allowed"},
+		{"invalid", reg.NewCounterIfAbsent("http.ingress_http.ext_authz.invalid"), "invalid"},
+	} {
+		if v := tc.ctr.Load(); v != 0 {
+			t.Errorf("disabled path: %s counter = %d, want 0 (no counter increments)", tc.name, v)
+		}
 	}
 }
 
@@ -4401,7 +4428,13 @@ func TestDecodeHeaders_AsyncAllow_ClearRouteCache(t *testing.T) {
 		t.Fatal("async allow (clear_route_cache): ContinueDecoding never fired within 2s")
 	}
 
-	if !f.clearRouteCacheRequested {
+	// Read clearRouteCacheRequested under f.mu to satisfy the race detector:
+	// the goroutine writes it under f.mu, so we must acquire the same lock before
+	// reading (mirrors the upstream header read in TestDecodeHeaders_AsyncAllow_UpstreamMutation).
+	f.mu.Lock()
+	got := f.clearRouteCacheRequested
+	f.mu.Unlock()
+	if !got {
 		t.Error("clearRouteCacheRequested: want true when clearRouteCache=true + allow, got false")
 	}
 }
@@ -4584,8 +4617,9 @@ func TestDecodeHeaders_AsyncError_FailureModeAllow_True_HeaderAdd(t *testing.T) 
 // ---------------------------------------------------------------------------
 
 // TestDecodeHeaders_AsyncInvalid_InvalidCounterAndErrorPosture verifies that on
-// the dispInvalid path (validate_mutations rejection), the invalid counter
-// increments and the error posture (statusOnError) is applied.
+// the dispInvalid path (validate_mutations rejection), BOTH the invalid counter
+// AND the errored counter increment (the invalid path calls applyErrorPosture
+// which increments errored), and the error posture (statusOnError) is applied.
 //
 // A fake checkFn is used to directly inject a dispInvalid disposition without
 // relying on a real HTTP server — Go's net/http canonicalizes response headers
@@ -4596,6 +4630,7 @@ func TestDecodeHeaders_AsyncInvalid_InvalidCounterAndErrorPosture(t *testing.T) 
 	reg := stats.NewRegistry()
 	fs := newFilterStats(reg, "ingress_http")
 	invalidCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.invalid")
+	erroredCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.error")
 
 	// Fake checkFn that directly returns dispInvalid (simulates validate_mutations
 	// rejection — same path as mapHTTPResponseWithMatchers returns dispInvalid).
@@ -4620,6 +4655,11 @@ func TestDecodeHeaders_AsyncInvalid_InvalidCounterAndErrorPosture(t *testing.T) 
 
 	if v := invalidCtr.Load(); v != 1 {
 		t.Errorf("invalid counter: got %d, want 1", v)
+	}
+	// dispInvalid increments errored as well as invalid (applyErrorPosture is
+	// called on the invalid path, which increments the errored counter).
+	if v := erroredCtr.Load(); v != 1 {
+		t.Errorf("errored counter (via applyErrorPosture on dispInvalid): got %d, want 1", v)
 	}
 	// Error posture with fma=false: SendLocalReply(statusOnError).
 	r := asyncDCB_localReply(dcb)
@@ -4689,6 +4729,95 @@ func TestDecodeData_BodyComplete_AsyncDispatch(t *testing.T) {
 	// Body was forwarded to auth service.
 	if string(capturedBody) != string(bodyPayload) {
 		t.Errorf("body forwarded: got %q, want %q", capturedBody, bodyPayload)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 5G — path propagation + headers_to_add propagation (Task 9 review fix)
+// ---------------------------------------------------------------------------
+//
+// These tests verify the two production bugs fixed in the Task 9 review:
+//   1. path: dispatchOutboundCheck now extracts the client path from the :path
+//      pseudo-header and passes it to buildAuthRequest. The auth server sees the
+//      client's actual path (+ path_prefix prepend), not a fixed empty string.
+//   2. headers_to_add: cc.headersToAdd is pre-compiled at buildCompiledConfig time
+//      (Option A); buildAuthRequest applies cc.headersToAdd unconditionally, so
+//      static auth-request headers always reach the auth service.
+
+// TestDecodeHeaders_PathPropagation_AuthServerSeesClientPath verifies that the
+// auth service receives the client's request path (from the :path pseudo-header)
+// rather than the empty string that the pre-fix code sent.
+//
+// This test fails BEFORE the fix (path on the auth server is "/" instead of
+// "/api/v1/users") and passes after.
+func TestDecodeHeaders_PathPropagation_AuthServerSeesClientPath(t *testing.T) {
+	var capturedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { srv.Close() })
+
+	fn := buildHTTPCheckFnForTest(t, srv.URL, 0, "")
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	headers := make(http.Header)
+	headers.Set(":path", "/api/v1/users")
+	headers.Set(":method", "GET")
+
+	status := f.DecodeHeaders(headers, true /* endStream */)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("DecodeHeaders: want StopIteration, got %v", status)
+	}
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("path propagation: ContinueDecoding never fired within 2s")
+	}
+
+	if capturedPath != "/api/v1/users" {
+		t.Errorf("auth server path: got %q, want %q", capturedPath, "/api/v1/users")
+	}
+}
+
+// TestDecodeHeaders_HeadersToAdd_ReachAuthServer verifies that static headers
+// configured in AuthorizationRequest.headers_to_add (pre-compiled into
+// cc.headersToAdd at buildCompiledConfig time) are forwarded to the auth service.
+//
+// This test fails BEFORE the fix (cc.headersToAdd was not pre-compiled; passing
+// nil hs to buildAuthRequest silently dropped headers_to_add) and passes after.
+func TestDecodeHeaders_HeadersToAdd_ReachAuthServer(t *testing.T) {
+	var capturedHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHeader = r.Header.Get("X-Auth-Static")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { srv.Close() })
+
+	// Build a compiledConfig with cc.headersToAdd pre-populated (mirroring
+	// what buildCompiledConfig would produce for an HttpService with
+	// AuthorizationRequest.headers_to_add: [{key: "x-auth-static", value: "injected"}]).
+	fn := buildHTTPCheckFnForTest(t, srv.URL, 0, "")
+	cc := &compiledConfig{
+		checkFn:       fn,
+		statusOnError: 403,
+		headersToAdd: []headerKV{
+			{name: "X-Auth-Static", value: "injected"},
+		},
+	}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	status := f.DecodeHeaders(make(http.Header), true /* endStream */)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("DecodeHeaders: want StopIteration, got %v", status)
+	}
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("headers_to_add: ContinueDecoding never fired within 2s")
+	}
+
+	if capturedHeader != "injected" {
+		t.Errorf("auth server X-Auth-Static: got %q, want %q", capturedHeader, "injected")
 	}
 }
 
