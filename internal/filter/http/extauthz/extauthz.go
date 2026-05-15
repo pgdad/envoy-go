@@ -298,8 +298,8 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 //     build *bufferSettings.
 //  4. services oneof http_service dispatch → buildHTTPCheckFn (Task 3 stub at Task 2).
 //  5. status_on_error: default 403 if unset; else code.
-//  6. allowed_headers / disallowed_headers: compile ListStringMatcher (Task 4
-//     stub at Task 2 — returns nil placeholder).
+//  6. allowed_headers / disallowed_headers: compile ListStringMatcher (real
+//     impl in attributes.go as of Task 4).
 //  7. allocate filterStats (guarded `if ctx.Stats != nil`) per ADR-0085.
 //
 // Note on ordering: transport_api_version + with_request_body validation

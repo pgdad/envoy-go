@@ -264,7 +264,7 @@ func (m *smRegex) matches(s string) bool {
 //   - f: the per-stream filter (carries f.activeRC for cc.allowedHeaders /
 //     cc.disallowedHeaders access).
 //   - hs: the parsed HttpService (carries AuthorizationRequest with headers_to_add
-//   - deprecated allowed_headers).
+//     deprecated allowed_headers).
 //   - headers: the incoming client request headers (from DecodeHeaders; Task 9
 //     wires this; at Task 4 tests pass it directly).
 //   - body: the buffered request body (nil when with_request_body is unset or
@@ -433,14 +433,3 @@ func isTokenChar(c byte) bool {
 	}
 	return true
 }
-
-// buildAuthRequest call-site (Task 4 review-fix): buildAuthRequest is called
-// from Task 9's DecodeHeaders dispatch — NOT from check.go's checkFn closure.
-// It needs the per-stream *filter (f.activeRC, resolved per-route at
-// DecodeHeaders) AND the real client request headers from dcb.RequestHeaders(),
-// neither of which is available at config-load time inside buildHTTPCheckFn nor
-// inside the mode-agnostic checkFn closure (which by contract receives an
-// already-built *authRequest). Task 9 wires f.dcb.RequestHeaders() → headers and
-// the body accumulator, then passes the resulting *authRequest into the checkFn
-// closure. See the PROGRESS.md Task 4 "Deviation from PLAN Step 4" note and the
-// call-site-boundary comment in check.go.

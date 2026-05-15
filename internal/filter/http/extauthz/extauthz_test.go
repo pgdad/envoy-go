@@ -1,14 +1,16 @@
 package extauthz
 
-// extauthz_test.go — unit-test Groups 1 + 2 + 7 for Task 2.
+// extauthz_test.go — unit-test Groups 1 + 2 + 3 + 4 + 7 (through Task 4).
 //
-// Test group assignments per PLAN Task 2 / SPEC §14.1:
+// Test group assignments per PLAN / SPEC §14.1:
 //
 //   Group 1 — ExtAuthz parse + services oneof dispatch
 //   Group 2 — compiledConfig shape + filterStats allocation
+//   Group 3 — buildAuthRequest + request-side header filtering (Task 4)
+//   Group 4 — check.go HTTP-outbound auth-check primitive (Task 3)
 //   Group 7 — per-route: parsePerRoute + resolvePerRouteConfig
 //
-// Groups 3/4/5/6/8/9 land at Tasks 3/3/9/6/5/9 respectively per PLAN.
+// Groups 5/6/8/9 land at Tasks 9/6/5/9 respectively per PLAN.
 //
 // Design note (Group 1 "valid http_service" tests):
 //   At Task 2, buildHTTPCheckFn is a STUB returning the sentinel error
@@ -2161,6 +2163,41 @@ func TestBuildAuthRequest_BodyIncluded(t *testing.T) {
 	}
 }
 
+// TestBuildAuthRequest_NilHttpService verifies that a nil hs is a valid path:
+// buildAuthRequest guards `hs != nil` at both the deprecated-allowed_headers
+// compilation and the headers_to_add append. With nil hs, all incoming headers
+// pass through (subject to allowed/disallowed filtering) and no static headers
+// are appended.
+func TestBuildAuthRequest_NilHttpService(t *testing.T) {
+	req := buildAuthRequestForTest(t,
+		nil, // allowedHeaders: nil = all pass
+		nil, // disallowedHeaders: nil = none removed
+		nil, // hs: nil — valid path
+		map[string]string{
+			"authorization": "Bearer tok",
+			"x-request-id":  "abc-123",
+		},
+		"/api/resource",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest(nil hs): got nil authRequest")
+	}
+	// Incoming headers pass through unfiltered.
+	if req.headers.Get("Authorization") == "" {
+		t.Error("authorization header: got empty, want present")
+	}
+	if req.headers.Get("X-Request-Id") == "" {
+		t.Error("x-request-id header: got empty, want present")
+	}
+	// No headers_to_add appended (hs is nil).
+	if got := len(req.headers); got != 2 {
+		t.Errorf("header count: got %d, want 2 (no headers_to_add with nil hs)", got)
+	}
+	if req.path != "/api/resource" {
+		t.Errorf("path: got %q, want %q", req.path, "/api/resource")
+	}
+}
+
 // -------------------------------------------------------------------------
 // Group 3 — validateMutationHeaders tests
 // -------------------------------------------------------------------------
@@ -2215,6 +2252,20 @@ func TestValidateMutationHeaders_InvalidHeaderNameChars(t *testing.T) {
 				t.Errorf("validateMutationHeaders(invalid name chars): want error for %q, got nil", name)
 			}
 		})
+	}
+}
+
+// TestValidateMutationHeaders_EmptyHeaderName verifies that an empty header name
+// is rejected with a descriptive error (validateMutationHeaderName guards
+// len(name) == 0 before the pseudo-header / token-char checks).
+func TestValidateMutationHeaders_EmptyHeaderName(t *testing.T) {
+	hdrs := []headerKV{{name: "", value: "some-value"}}
+	err := validateMutationHeaders(hdrs)
+	if err == nil {
+		t.Fatal("validateMutationHeaders(empty name): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("validateMutationHeaders(empty name): error = %q, want it to mention %q", err.Error(), "empty")
 	}
 }
 
