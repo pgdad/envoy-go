@@ -1924,4 +1924,4 @@ ok  github.com/esalaine/envoy-go/internal/filter/http/extauthz        0.295s
 
 **Concern for Task 13:** The `lookupExtAuthzCounter` helper sums across ALL listeners by label. With three listeners each having its own `hcm_local_{a,b,c}` stat_prefix, the stats will appear under three separate `envoy_http_conn_manager_prefix` labels. The helper's summation logic should handle this correctly (it sums all matching metric lines regardless of label). Task 13 will confirm via the empirical scrape.
 
-**Commit SHA:** TBD (filled post-commit)
+**Commit SHA:** `1bb1cbf`
