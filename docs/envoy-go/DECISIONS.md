@@ -8525,10 +8525,10 @@ ext_authz must build a request representation to ship to the external auth servi
 
 ## ADR-0161: Bidirectional header-mutation discipline — request-side filtering (top-level `allowed_headers`/`disallowed_headers`) + allow-path upstream injection + deny-path downstream copying + `validate_mutations` gating + the deny-path header-set construction; HTTP-mode portion (`AuthorizationResponse.{allowed_upstream_headers, allowed_upstream_headers_to_append, allowed_client_headers}`) lands in 18.1; gRPC-mode portion (`OkHttpResponse.{headers, headers_to_remove, response_headers_to_add}` + `DeniedHttpResponse.headers`) lands in 18.2; records the `allowed_client_headers_on_success` + `query_parameters` + `dynamic_metadata_from_headers` deferrals + the possible stash-for-HCM revisit
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL (HTTP-mode portion) + phase-18.2 IMPL (gRPC-mode portion) per ADR-0044.
+**Status:** Accepted (HTTP-mode portion, Task 5 of phase-18.1 PLAN); Anticipated — gRPC-mode portion lands at phase-18.2 IMPL per ADR-0044.
 **Date:** 2026-05-14
 **Doctrine:** Phase 18.1 + 18.2 §9 family-row. ADR-0044 ADR-on-impl convention. The `validate_mutations` gating mirrors the phase-10 header_mutation protected-header discipline.
-**Lands-in:** Task 5 (hypothesis) of phase-18.1 PLAN (HTTP-mode); phase-18.2 PLAN (gRPC-mode).
+**Lands-in:** Task 5 of phase-18.1 PLAN (HTTP-mode portion confirmed); phase-18.2 PLAN (gRPC-mode portion).
 
 ### Context
 
@@ -8542,11 +8542,33 @@ The deny-path wire shape is empirically RATIFIED at the parent SPEC §5.P11: bod
 
 ### Decision
 
-LANDS AT the respective IMPL tasks per ADR-0044. The 18.1 §Decision codifies the HTTP-mode bidirectional emit-order + per-direction filtering + `validate_mutations` gating + the deny-path `SendLocalReply` header-set construction; the 18.2 §Decision codifies the gRPC-mode `OkHttpResponse`/`DeniedHttpResponse` mutation.
+**(HTTP-mode portion landed at Task 5 of phase-18.1 IMPL. gRPC-mode portion lands at phase-18.2 IMPL.)**
+
+**(i) Response-side matcher compilation at config-load time.** `buildHTTPCheckFn` compiles all three `AuthorizationResponse` `*ListStringMatcher` fields — `allowed_upstream_headers`, `allowed_upstream_headers_to_append`, `allowed_client_headers` — into `*stringMatcherList` values at config-load time via `compileStringMatcherList`. A malformed matcher pattern produces a PARSE-REJECT at `buildHTTPCheckFn` time (no per-request compilation). `validateMutations bool` is threaded in from `compiledConfig.validateMutations` at config-load time. The signature is extended to `buildHTTPCheckFn(hs, validateMutations bool) (checkFn, error)`.
+
+**(ii) Allow-path extraction.** On HTTP 200, `mapHTTPResponseWithMatchers` calls `extractMatchingHeaders(resp.Header, allowedUpstream)` → `upstreamSet` (set/overwrite semantics) and `extractMatchingHeaders(resp.Header, allowedUpstreamApp)` → `upstreamApp` (append semantics). `extractMatchingHeaders` lowercases response header names before matcher evaluation (Envoy's internal lowercase-header convention); it emits one `headerKV` per value for multi-value headers. Nil matcher → nil result (no headers extracted).
+
+**(iii) `applyUpstreamMutations` placement.** The allow-path application helper `applyUpstreamMutations(headers http.Header, disp checkDisposition)` lives in `extauthz.go`; it calls `headers.Set` for each `upstreamSet` entry then `headers.Add` for each `upstreamApp` entry. It is NOT called inside the `checkFn` closure — it is called at the DecodeHeaders dispatch site (Task 9) where the upstream request `http.Header` is available.
+
+**(iv) Deny-path header-set construction.** On HTTP 401/403, `buildDenyHeaders(resp.Header, allowedClient)` extracts decision headers (auth-service-supplied, filtered by `allowed_client_headers`) then appends a `content-type: text/plain` fallback if the auth service did not supply `content-type` in the allowed set. **Decision headers appear FIRST; the housekeeping content-type fallback is LAST.** This ordering is per SPEC §4 + parent §5.P11 RATIFIED.
+
+**(v) `validate_mutations` gating (D7 rule set).** When `validateMutations` is true, `validateMutationHeaders` is called over the extracted header sets (allow-path: `upstreamSet` and `upstreamApp`; deny-path: `denyHeaders`). A violation drives `dispInvalid` — a fourth `dispositionClass` distinct from `dispAllow`/`dispDeny`/`dispError`, treated as error posture per SPEC §6.3 but incrementing the `invalid` counter. The rejection returns `checkDisposition{class: dispInvalid}, nil` (no error returned; the invalid disposition is a valid outcome, not an internal error).
+
+**(vi) `mapHTTPResponse` backward-compat wrapper.** The Task 3 `mapHTTPResponse(resp *http.Response) (checkDisposition, error)` is retained as a thin wrapper that delegates to `mapHTTPResponseWithMatchers(resp, nil, nil, nil, false)`. It is no longer called by the production closure (which calls `mapHTTPResponseWithMatchers` directly) but retained to avoid breaking Group 4 tests that test the closure behavior indirectly.
+
+**(vii) `deprecated allowed_headers` pre-compile fix (Task 4 carried-forward).** `compiledConfig` gains a `deprecatedAllowedHeaders *stringMatcherList` field. `buildCompiledConfig` pre-compiles `AuthorizationRequest.allowed_headers` (deprecated) into this field at config-load time; a malformed pattern is a PARSE-REJECT (not a silent degrade as originally coded). `cc.deprecatedAllowedHeaders` is nulled when `cc.allowedHeaders` is set (top-level wins). `buildAuthRequest` uses `cc.deprecatedAllowedHeaders` directly — no per-request compilation.
 
 ### Consequences
 
-LANDS AT the respective IMPL tasks per ADR-0044. Records: the per-mode mutation landing; the `allowed_client_headers_on_success` divergence-window (envoy-go absent on the allow-path downstream-response header set); the `query_parameters` + `dynamic_metadata_from_headers` deferrals. **§Consequences explicitly records that the 18.1/18.2 IMPL sessions MAY revisit a stash-for-HCM mechanism** for `allowed_client_headers_on_success` if it proves cheap — a decode-side filter stashing headers that HCM applies to the eventual response (analogous to but distinct from the phase-14 ADR-0131 `OverwriteBody` encode-side primitive); if revisited and adopted, that surfaces as an ADR-0044 escape-valve ADR.
+**(i) PARSE-REJECT on malformed response-side matchers.** A bad regex in `allowed_upstream_headers` / `allowed_upstream_headers_to_append` / `allowed_client_headers` fails the `NewPlugin` call at boot. Consistent with the request-side (ADR-0160) compile-once-fail-fast discipline.
+
+**(ii) `deprecated allowed_headers` malformed → PARSE-REJECT.** The Task 4 original "silent-degrade on compile error" behavior is replaced with PARSE-REJECT. The deprecated field is a planner-documented backward-compat path; if it is present and malformed, treating it as all-pass was a latent security concern (all headers would pass through to the auth service). PARSE-REJECT is the safer and consistent choice.
+
+**(iii) `dispInvalid` = fourth disposition class.** The `invalid` counter (SPEC §5.P6) is wired at Task 9 DecodeHeaders dispatch when `disp.class == dispInvalid`; the counter increment and SendLocalReply(403) are applied with error-posture semantics. `dispInvalid` is distinct from `dispError` because SPEC §6.3 explicitly separates the `invalid` counter from the `errored` counter.
+
+**(iv) `allowed_client_headers_on_success` deferred.** envoy-go's decode-side-only filter shape cannot honor the allow-path downstream-response header set without an encode-side leg. The deferral is permanent unless the stash-for-HCM mechanism (§Context above) is later implemented under an escape-valve ADR.
+
+**(v) gRPC-mode portion deferred to phase-18.2.** The `OkHttpResponse.{headers, headers_to_remove, response_headers_to_add}` + `DeniedHttpResponse.headers` mapping lands in 18.2. The `dispAllow.upstreamSet`/`upstreamApp` and `dispDeny.denyHeaders` fields on `checkDisposition` are already the correct shared-shape; the gRPC mapper will populate them following the same downstream consumption path.
 
 ---
 

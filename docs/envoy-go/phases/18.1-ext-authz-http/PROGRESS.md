@@ -656,3 +656,122 @@ $ grep -nE '^## ADR-0160' docs/envoy-go/DECISIONS.md
 ```
 
 1 match (1 required). §Decision (6-point body (i)–(vi)) + §Consequences (5 bullets) filled. Status: Accepted (HTTP-mode portion); Date: 2026-05-14; Lands-in: Task 4 of phase-18.1 PLAN.
+
+---
+
+## Task 5 — Bidirectional header-mutation discipline + `validate_mutations` gating + Group 8 + ADR-0161 §Decision+§Consequences
+
+**Files changed:** `internal/filter/http/extauthz/extauthz.go` (modified — `dispInvalid` added as 4th `dispositionClass` const; `deprecatedAllowedHeaders *stringMatcherList` field added to `compiledConfig`; `applyUpstreamMutations` helper added; `buildCompiledConfig` updated to pre-compile deprecated `AuthorizationRequest.allowed_headers` at config-load time with PARSE-REJECT on malformed pattern, null it out when top-level `allowedHeaders` is set, and call `buildHTTPCheckFn(httpSvc, cc.validateMutations)` with two args), `internal/filter/http/extauthz/check.go` (modified — `buildHTTPCheckFn` signature extended to accept `validateMutations bool`; authorization_response matchers compiled at config-load time; `buildCheckFnClosure` updated to call `mapHTTPResponseWithMatchers`; `mapHTTPResponseWithMatchers` added replacing the Task 3 stub; `extractMatchingHeaders` + `buildDenyHeaders` helpers added; `mapHTTPResponse` kept as thin backward-compat wrapper), `internal/filter/http/extauthz/attributes.go` (modified — `buildAuthRequest` updated to use `cc.deprecatedAllowedHeaders` pre-compiled field instead of per-request compilation; comment block updated), `internal/filter/http/extauthz/extauthz_test.go` (modified — Group 8 tests appended: 18 new `func Test`; `buildHTTPCheckFnForTest` + `TestBuildHTTPCheckFn_MissingServerURI` + `TestBuildHTTPCheckFn_EmptyURI` fixed to pass `false` as second arg; `buildAuthRequestForTest` updated to pre-compile deprecated field mirroring `buildCompiledConfig`), `docs/envoy-go/DECISIONS.md` (ADR-0161 HTTP-mode §Status updated; §Decision 7-point body (i)–(vii) filled; §Consequences 5-bullet body filled)
+
+**Commit SHA:** TBD (filled post-commit)
+
+**Notes:** Followed `superpowers:test-driven-development`. Group 8 tests written first (RED confirmed — build failure on undefined `dispInvalid`, wrong-arity `buildHTTPCheckFn`, undefined `applyUpstreamMutations`, undefined `cc.deprecatedAllowedHeaders`). Production code authored in `extauthz.go`, `check.go`, `attributes.go`. Test count 83 → 103 (20 new `func Test` added; 18 Group 8 + 2 Group 4 fixes; `grep -c '^func Test' …/extauthz_test.go` = 103). `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet` exit 0; `gofmt -l` empty.
+
+**Task 4 carried-forward fix (deprecated `allowed_headers` pre-compile).** The Task 4 original code compiled `AuthorizationRequest.allowed_headers` per-request in `buildAuthRequest` (lines 291–303 of original `attributes.go`). Replaced at Task 5 with: (a) `compiledConfig.deprecatedAllowedHeaders *stringMatcherList` field compiled ONCE at `buildCompiledConfig` time; (b) malformed pattern → PARSE-REJECT (replaces the original "silent-degrade on error"); (c) top-level `cc.allowedHeaders` set → `cc.deprecatedAllowedHeaders` nulled (top-level wins); (d) `buildAuthRequest` reads `cc.deprecatedAllowedHeaders` directly — no per-request `compileStringMatcherList` call. `buildAuthRequestForTest` updated to mirror this pre-compile discipline.
+
+**`dispInvalid` design.** Fourth `dispositionClass` constant (iota = 3, after `dispAllow`/`dispDeny`/`dispError`). SPEC §6.3 separately tracks the `invalid` counter from `errored` — the rejection is error-posture but distinct. The Task 9 dispatch (`disp.class == dispInvalid`) will call `SendLocalReply(403)` and increment the `invalid` counter.
+
+**Pseudo-header test infrastructure note.** `TestValidateMutations_AllowPath_PseudoHeaderRejected` + `TestValidateMutations_DenyPath_PseudoHeaderRejected` call `mapHTTPResponseWithMatchers` directly with a hand-crafted `*http.Response` (bypassing `net/http`'s HTTP/1.1 wire layer which strips `:` pseudo-headers from responses). The test rationale: Go's `net/http` server does not transmit `:status`-prefixed headers over HTTP/1.1; the `validate_mutations` gate operates on already-extracted `headerKV` slices — the unit-level test is most faithful at the `mapHTTPResponseWithMatchers` API boundary rather than through a live server. End-to-end confirmation of the full path (auth server → extraction → validate) is covered by the fixture 0020 differential harness at Task 13.
+
+**D7 `validate_mutations` rule set confirmation.** The rule set authored in `attributes.go` at Task 4 (`:` pseudo-headers REJECTED; invalid RFC 7230 §3.2.6 token chars in name REJECTED; bare CR/LF/NUL in value REJECTED) is wired at Task 5. Full empirical confirmation against v1.37.2 deferred to Task 13 differential fixture pass per D7. Evidence basis: phase-10 header_mutation protected-header discipline + proto-field documentation. No divergence from LOCKED D7 disposition.
+
+**ADR-0161 fill.** §Status updated from "Anticipated" to "Accepted (HTTP-mode portion, Task 5 of phase-18.1 PLAN)"; **Lands-in:** updated from "Task 5 (hypothesis)" to "Task 5 of phase-18.1 PLAN (HTTP-mode portion confirmed)"; §Decision: 7-point body (i)–(vii) covering response-side matcher compilation, allow-path extraction, `applyUpstreamMutations` placement, deny-path header-set construction, `validate_mutations` gating, `mapHTTPResponse` backward-compat wrapper, deprecated `allowed_headers` pre-compile fix; §Consequences: 5 bullets covering PARSE-REJECT on malformed response matchers, deprecated-field PARSE-REJECT flip, `dispInvalid` wiring, `allowed_client_headers_on_success` deferral, gRPC-mode deferred.
+
+**Outputs:**
+
+### Test run — Group 8 (failing before implementation — RED)
+
+```
+$ go build ./internal/filter/http/extauthz/ 2>&1  [before production code]
+internal/filter/http/extauthz/extauthz_test.go:2332:34: too many arguments in call to buildHTTPCheckFn
+internal/filter/http/extauthz/extauthz_test.go:2688:19: undefined: dispInvalid
+internal/filter/http/extauthz/extauthz_test.go:2788:2: undefined: applyUpstreamMutations
+internal/filter/http/extauthz/extauthz_test.go:2913:8: cc.deprecatedAllowedHeaders undefined
+FAIL	github.com/esalaine/envoy-go/internal/filter/http/extauthz [build failed]
+```
+
+### Test run — Group 8 verbose after implementation (GREEN, 18 test functions)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestHeaderMutation|TestValidateMutations|TestApplyUpstreamMutations|TestDeprecatedAllowedHeaders' -v -count=1
+=== RUN   TestHeaderMutation_AllowPath_UpstreamSet
+--- PASS: TestHeaderMutation_AllowPath_UpstreamSet (0.00s)
+=== RUN   TestHeaderMutation_AllowPath_UpstreamApp
+--- PASS: TestHeaderMutation_AllowPath_UpstreamApp (0.00s)
+=== RUN   TestHeaderMutation_AllowPath_SetAndAppend
+--- PASS: TestHeaderMutation_AllowPath_SetAndAppend (0.00s)
+=== RUN   TestHeaderMutation_AllowPath_NilMatcher
+--- PASS: TestHeaderMutation_AllowPath_NilMatcher (0.00s)
+=== RUN   TestHeaderMutation_DenyPath_AllowedClientHeaders
+--- PASS: TestHeaderMutation_DenyPath_AllowedClientHeaders (0.00s)
+=== RUN   TestHeaderMutation_DenyPath_TextPlainFallback
+--- PASS: TestHeaderMutation_DenyPath_TextPlainFallback (0.00s)
+=== RUN   TestHeaderMutation_DenyPath_NilClientHeadersMatcher
+--- PASS: TestHeaderMutation_DenyPath_NilClientHeadersMatcher (0.00s)
+=== RUN   TestHeaderMutation_DenyPath_DecisionHeadersFirst
+--- PASS: TestHeaderMutation_DenyPath_DecisionHeadersFirst (0.00s)
+=== RUN   TestValidateMutations_AllowPath_PseudoHeaderRejected
+--- PASS: TestValidateMutations_AllowPath_PseudoHeaderRejected (0.00s)
+=== RUN   TestValidateMutations_AllowPath_InvalidNameCharsRejected
+--- PASS: TestValidateMutations_AllowPath_InvalidNameCharsRejected (0.00s)
+=== RUN   TestValidateMutations_DenyPath_PseudoHeaderRejected
+--- PASS: TestValidateMutations_DenyPath_PseudoHeaderRejected (0.00s)
+=== RUN   TestValidateMutations_False_PseudoHeaderAllowed
+--- PASS: TestValidateMutations_False_PseudoHeaderAllowed (0.00s)
+=== RUN   TestApplyUpstreamMutations_Set
+--- PASS: TestApplyUpstreamMutations_Set (0.00s)
+=== RUN   TestApplyUpstreamMutations_Append
+--- PASS: TestApplyUpstreamMutations_Append (0.00s)
+=== RUN   TestApplyUpstreamMutations_SetBeforeAppend
+--- PASS: TestApplyUpstreamMutations_SetBeforeAppend (0.00s)
+=== RUN   TestApplyUpstreamMutations_Empty
+--- PASS: TestApplyUpstreamMutations_Empty (0.00s)
+=== RUN   TestDeprecatedAllowedHeaders_PreCompiled
+--- PASS: TestDeprecatedAllowedHeaders_PreCompiled (0.00s)
+=== RUN   TestDeprecatedAllowedHeaders_MalformedParseReject
+--- PASS: TestDeprecatedAllowedHeaders_MalformedParseReject (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	0.006s
+```
+
+### Test run — full suite with race detector
+
+```
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.074s
+```
+
+103 tests PASS (up from 83 at Task 4 end; 20 new `func Test` appended — 18 Group 8 + 2 Group 4 arity-fix). 0 failures.
+
+### Test run — go vet
+
+```
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+```
+
+### Test run — gofmt
+
+```
+$ gofmt -l internal/filter/http/extauthz/
+(no output — empty)
+```
+
+### Test run — full suite (48 packages, short mode)
+
+```
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^ok'
+48
+
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^(FAIL|---\s+FAIL)'
+0
+```
+
+### ADR acceptance-criteria grep
+
+```
+$ grep -nE '^## ADR-0161' docs/envoy-go/DECISIONS.md
+8526:## ADR-0161: Bidirectional header-mutation discipline — ...
+```
+
+1 match (1 required). §Decision (7-point body (i)–(vii)) + §Consequences (5 bullets) filled. Status: Accepted (HTTP-mode portion); Date: 2026-05-14; Lands-in: Task 5 of phase-18.1 PLAN.

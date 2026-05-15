@@ -72,6 +72,10 @@ const (
 	dispDeny
 	// dispError — transport/timeout/unrecognized status; failure_mode_allow applies.
 	dispError
+	// dispInvalid — validate_mutations rejected a header name/value in the
+	// allow-path upstream or deny-path client header set. The invalid counter
+	// increments; the error posture applies per SPEC §6.3 + ADR-0161.
+	dispInvalid
 )
 
 // headerKV is a simple name/value header pair used in checkDisposition.
@@ -127,6 +131,14 @@ type compiledConfig struct {
 	// Full compilation at Task 4 via compileStringMatcherList.
 	allowedHeaders    *stringMatcherList // top-level request-side allow-list; nil = all allowed
 	disallowedHeaders *stringMatcherList // top-level request-side deny-list; nil = none denied
+
+	// deprecatedAllowedHeaders is the pre-compiled AuthorizationRequest.allowed_headers
+	// deprecated field (ADR-0160 D6 path). Compiled ONCE at buildCompiledConfig time
+	// (Task 5 carried-forward fix — previously compiled per-request in buildAuthRequest).
+	// Non-nil only when the deprecated field is present AND cc.allowedHeaders is nil
+	// (top-level allowed_headers takes precedence when set). A malformed deprecated field
+	// surfaces as a PARSE-REJECT at config-load time (not silent-degrade at runtime).
+	deprecatedAllowedHeaders *stringMatcherList
 
 	// stats is SHARED across listener + all per-route configs (SHARED-stats
 	// discipline per ADR-0163; mirrors phase-12/13/14/17). nil when
@@ -296,16 +308,22 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 //  2. transport_api_version: non-V3 → PARSE-REJECT per ADR-0008.
 //  3. with_request_body: if set, validate max_request_bytes > 0 (PGV-mirror);
 //     build *bufferSettings.
-//  4. services oneof http_service dispatch → buildHTTPCheckFn (Task 3 stub at Task 2).
-//  5. status_on_error: default 403 if unset; else code.
+//  4. error-posture fields (failure_mode_allow/failure_mode_allow_header_add/
+//     clear_route_cache/validate_mutations) — parsed before http_service build
+//     so validate_mutations can be threaded into buildHTTPCheckFn.
+//  5. http_service arm → buildHTTPCheckFn (real impl Task 3; authorization_response
+//     matchers + validateMutations closure-capture added at Task 5).
+//     Pre-compile deprecated AuthorizationRequest.allowed_headers at parse time
+//     (Task 5 carried-forward fix from Task 4 code review).
 //  6. allowed_headers / disallowed_headers: compile ListStringMatcher (real
-//     impl in attributes.go as of Task 4).
+//     impl in attributes.go as of Task 4); null out deprecatedAllowedHeaders if
+//     top-level allowedHeaders is set (top-level wins per D6 + ADR-0160).
 //  7. allocate filterStats (guarded `if ctx.Stats != nil`) per ADR-0085.
 //
 // Note on ordering: transport_api_version + with_request_body validation
 // precede the services-specific buildHTTPCheckFn call so that these rejections
-// surface before the stub (and before the real http-client construction at
-// Task 3). This gives operators a deterministic parse-error ordering.
+// surface before the http-client construction. This gives operators a deterministic
+// parse-error ordering.
 func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*compiledConfig, error) {
 	cc := &compiledConfig{}
 
@@ -340,19 +358,43 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 		}
 	}
 
-	// 4. http_service arm → buildHTTPCheckFn (stub at Task 2; real impl Task 3).
+	// 4. error-posture fields (parsed before http_service build so validateMutations
+	//    can be threaded into buildHTTPCheckFn for closure capture).
+	cc.failureModeAllow = raw.GetFailureModeAllow()
+	cc.failureModeAllowHeaderAdd = raw.GetFailureModeAllowHeaderAdd()
+	cc.clearRouteCache = raw.GetClearRouteCache()
+	cc.validateMutations = raw.GetValidateMutations()
+
+	// 5. http_service arm → buildHTTPCheckFn (real impl Task 3; extended Task 5
+	//    to compile authorization_response matchers + accept validateMutations).
 	httpSvc := raw.GetHttpService()
-	fn, err := buildHTTPCheckFn(httpSvc)
+	fn, err := buildHTTPCheckFn(httpSvc, cc.validateMutations)
 	if err != nil {
 		return nil, err
 	}
 	cc.checkFn = fn
 
-	// 5. error-posture fields.
-	cc.failureModeAllow = raw.GetFailureModeAllow()
-	cc.failureModeAllowHeaderAdd = raw.GetFailureModeAllowHeaderAdd()
-	cc.clearRouteCache = raw.GetClearRouteCache()
-	cc.validateMutations = raw.GetValidateMutations()
+	// Task 5 carried-forward fix: pre-compile the deprecated
+	// AuthorizationRequest.allowed_headers field at config-load time (was
+	// per-request in buildAuthRequest Task 4). Only stored when the top-level
+	// allowed_headers is nil (cc.allowedHeaders is parsed at step 6 below but
+	// we need to compile the deprecated field regardless so malformed configs
+	// surface at parse time). We resolve the cc.allowedHeaders precondition after
+	// step 6 by nulling out deprecatedAllowedHeaders when allowedHeaders is set.
+	//
+	// Note: this step must run after the http_service validation above (so we have
+	// a valid httpSvc) but before step 6 (cc.allowedHeaders is set there).
+	if httpSvc != nil {
+		if ar := httpSvc.GetAuthorizationRequest(); ar != nil {
+			if deprecated := ar.GetAllowedHeaders(); deprecated != nil {
+				compiled, compErr := compileStringMatcherList(deprecated)
+				if compErr != nil {
+					return nil, fmt.Errorf("ext_authz: authorization_request.allowed_headers (deprecated): %w", compErr)
+				}
+				cc.deprecatedAllowedHeaders = compiled
+			}
+		}
+	}
 
 	// status_on_error default 403 per SPEC §6.4.
 	if soe := raw.GetStatusOnError(); soe != nil {
@@ -375,6 +417,15 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 		return nil, fmt.Errorf("ext_authz: disallowed_headers: %w", err)
 	}
 	cc.disallowedHeaders = dh
+
+	// Task 5 carried-forward fix (continued): if the top-level allowed_headers
+	// is set (cc.allowedHeaders != nil), the deprecated field is superseded —
+	// null it out so buildAuthRequest uses the top-level field exclusively.
+	// If cc.allowedHeaders is nil, cc.deprecatedAllowedHeaders remains as the
+	// effective allow-list (honored-if-present per D6 + ADR-0160).
+	if cc.allowedHeaders != nil {
+		cc.deprecatedAllowedHeaders = nil
+	}
 
 	// 7. filterStats — guarded `if ctx.Stats != nil` per ADR-0085 nil-tolerance.
 	if ctx.Stats != nil {
@@ -556,6 +607,37 @@ func baseStatPrefix(hcmStatPrefix string) string {
 		return "ext_authz."
 	}
 	return "http." + hcmStatPrefix + ".ext_authz."
+}
+
+// ---------------------------------------------------------------------------
+// applyUpstreamMutations — allow-path upstream header injection helper.
+// Per SPEC §6.3 + ADR-0161. Called from the Task 9 DecodeHeaders dispatch
+// on the allow path after the async outbound check resolves.
+// ---------------------------------------------------------------------------
+
+// applyUpstreamMutations applies the allow-path header mutations from a
+// checkDisposition to the upstream request headers:
+//
+//  1. upstreamSet: for each headerKV, headers.Set(name, value) — overwrites any
+//     existing header with the same canonical key (allowed_upstream_headers).
+//  2. upstreamApp: for each headerKV, headers.Add(name, value) — appends to any
+//     existing values for the same canonical key (allowed_upstream_headers_to_append).
+//
+// Set is applied before Append so that Append can stack on top of the overwritten
+// value. headers is the incoming client request header map (from DecodeHeaders)
+// which is the map forwarded upstream by the HCM chain after the filter returns.
+//
+// Only the allow path calls this helper (disp.class == dispAllow); the deny and
+// error / invalid paths do NOT mutate the upstream headers.
+func applyUpstreamMutations(headers http.Header, disp checkDisposition) {
+	// 1. upstreamSet: overwrite (Set) per allowed_upstream_headers.
+	for _, kv := range disp.upstreamSet {
+		headers.Set(kv.name, kv.value)
+	}
+	// 2. upstreamApp: append (Add) per allowed_upstream_headers_to_append.
+	for _, kv := range disp.upstreamApp {
+		headers.Add(kv.name, kv.value)
+	}
 }
 
 // ---------------------------------------------------------------------------

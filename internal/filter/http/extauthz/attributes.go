@@ -275,30 +275,21 @@ func (m *smRegex) matches(s string) bool {
 // D6 disposition (deprecated AuthorizationRequest.allowed_headers):
 //
 //	When cc.allowedHeaders (top-level primary path) is non-nil, the deprecated
-//	field is ignored (top-level wins). When cc.allowedHeaders is nil AND
-//	hs.AuthorizationRequest.AllowedHeaders is non-nil, the deprecated field is
-//	compiled and used as the effective allow-list (honored-if-present for
-//	backward-compat). If compilation of the deprecated field fails (malformed
-//	pattern), the filter falls through to nil (all-pass) to avoid hard errors
-//	from a deprecated field — consistent with the "honored-if-present /
-//	silent-degrade" intent.
+//	field is ignored (top-level wins — cc.deprecatedAllowedHeaders is nulled
+//	out in buildCompiledConfig when allowedHeaders is set). When cc.allowedHeaders
+//	is nil AND cc.deprecatedAllowedHeaders is non-nil, the pre-compiled deprecated
+//	field is used as the effective allow-list. Compilation is done ONCE at
+//	config-load time in buildCompiledConfig; malformed patterns produce a
+//	PARSE-REJECT at that point, not at request time.
 func buildAuthRequest(f *filter, hs *ext_authzv3.HttpService, headers http.Header, body []byte, path string) *authRequest {
 	cc := f.activeRC
 
 	// Determine the effective allow-list (D6: top-level primary; deprecated
-	// honored-if-present as fallback).
+	// honored-if-present as fallback). Both fields are pre-compiled at
+	// config-load time (buildCompiledConfig). No per-request compilation.
 	effectiveAllowed := cc.allowedHeaders
-	if effectiveAllowed == nil && hs != nil {
-		ar := hs.GetAuthorizationRequest()
-		if ar != nil && ar.GetAllowedHeaders() != nil {
-			// D6: deprecated field present; compile it.
-			compiled, err := compileStringMatcherList(ar.GetAllowedHeaders())
-			if err == nil {
-				effectiveAllowed = compiled
-			}
-			// On error: fall through to nil (all-pass) — deprecated-field
-			// failures should not hard-reject the request at runtime.
-		}
+	if effectiveAllowed == nil {
+		effectiveAllowed = cc.deprecatedAllowedHeaders
 	}
 
 	// Build the filtered header set.

@@ -36,9 +36,15 @@ package extauthz
 //   just transmits the *authRequest it is handed. See the PROGRESS.md Task 4
 //   entry "Deviation from PLAN Step 4" note and ADR-0160 §Decision (v)/(vii).
 //
-// The allowed_upstream_headers / allowed_client_headers extraction is STUBBED
-// at Task 3 — the disposition header fields are populated minimally.
-// Real extraction + validate_mutations gating land at Task 5.
+// Authorization-response header extraction (Task 5 / ADR-0161):
+//   buildHTTPCheckFn compiles the authorization_response matcher triple at
+//   config-load time:
+//     - allowedUpstreamHeaders    → upstreamSet  (overwrite per allow path)
+//     - allowedUpstreamHeadersApp → upstreamApp  (append per allow path)
+//     - allowedClientHeaders      → denyHeaders  (filtered per deny path)
+//   validate_mutations (bool) is threaded into the closure — when true, the
+//   extracted header sets are validated by validateMutationHeaders; a violation
+//   drives dispInvalid.
 
 import (
 	"bytes"
@@ -75,26 +81,22 @@ type httpAuthClient struct {
 
 // buildHTTPCheckFn constructs the HTTP-mode checkFn per SPEC §6.5 + ADR-0159.
 //
-// Steps per SPEC §6.5:
+// Steps per SPEC §6.5 (updated at Task 5 per ADR-0161):
 //  1. Validate server_uri set + non-empty uri (PGV-mirror — HttpService.server_uri
 //     is NOT PGV-required; the factory rejects an empty one).
 //  2. Construct the httpAuthClient: &http.Client{Timeout: hs.server_uri.timeout}
 //     (zero timeout = no timeout; ZERO retry per D2).
-//  3. Compile authorization_response matchers (STUBBED at Task 3 — nil).
-//  4. Return the checkFn closure.
+//  3. Compile authorization_response matchers:
+//     - allowed_upstream_headers     → allowedUpstream (set/overwrite)
+//     - allowed_upstream_headers_to_append → allowedUpstreamApp (append)
+//     - allowed_client_headers       → allowedClient (deny-path filter)
+//  4. Return the checkFn closure capturing the matchers + validateMutations.
 //
-// Signature note: the PLAN's nominal signature is
-//
-//	buildHTTPCheckFn(hs *ext_authzv3.HttpService, ar *authRequestCfg, validateMutations bool)
-//
-// At Task 3, the `authRequestCfg` type is not yet introduced (Task 4 lands
-// buildAuthRequest); the closure uses the authRequest headers directly
-// (STUBBED). The signature used here takes only `hs *ext_authzv3.HttpService`
-// — matching the existing `buildCompiledConfig` call-site in extauthz.go.
-// The PLAN note confirms this is acceptable: "check what Task 2's
-// buildCompiledConfig currently passes to the stub buildHTTPCheckFn".
-// This deviation is documented in PROGRESS.md Task 3.
-func buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error) {
+// Signature note: updated at Task 5 to accept validateMutations bool (threaded
+// into the closure from compiledConfig.validateMutations parsed at config-load
+// time in buildCompiledConfig). The Task 3 signature `(hs) (checkFn, error)` is
+// extended to `(hs, validateMutations) (checkFn, error)` — minimal change.
+func buildHTTPCheckFn(hs *ext_authzv3.HttpService, validateMutations bool) (checkFn, error) {
 	// 1. Validate server_uri.uri (PGV-mirror).
 	if hs == nil || hs.GetServerUri() == nil || hs.GetServerUri().GetUri() == "" {
 		return nil, errors.New("ext_authz: http_service.server_uri.uri is required")
@@ -111,32 +113,47 @@ func buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error) {
 		pathPrefix: hs.GetPathPrefix(),
 	}
 
-	// 3. Compile authorization_response matcher fields (STUBBED at Task 3).
-	//    Real compilation of allowed_upstream_headers /
-	//    allowed_upstream_headers_to_append / allowed_client_headers lands at
-	//    Task 5 (compileStringMatcherList).
-	//    At Task 3: these are all nil (no filtering — headers are passed through
-	//    minimally or left empty in the disposition).
-	//    _ = hs.GetAuthorizationResponse()  // parsed but not compiled at Task 3
+	// 3. Compile authorization_response matchers per SPEC §6.5 + ADR-0161.
+	//    Each ListStringMatcher → *stringMatcherList via compileStringMatcherList
+	//    (attributes.go); nil input → nil return (no filtering).
+	ar := hs.GetAuthorizationResponse()
+	allowedUpstream, err := compileStringMatcherList(ar.GetAllowedUpstreamHeaders())
+	if err != nil {
+		return nil, fmt.Errorf("ext_authz: authorization_response.allowed_upstream_headers: %w", err)
+	}
+	allowedUpstreamApp, err := compileStringMatcherList(ar.GetAllowedUpstreamHeadersToAppend())
+	if err != nil {
+		return nil, fmt.Errorf("ext_authz: authorization_response.allowed_upstream_headers_to_append: %w", err)
+	}
+	allowedClient, err := compileStringMatcherList(ar.GetAllowedClientHeaders())
+	if err != nil {
+		return nil, fmt.Errorf("ext_authz: authorization_response.allowed_client_headers: %w", err)
+	}
 
-	// 4. Return the checkFn closure.
-	return buildCheckFnClosure(hac), nil
+	// 4. Return the checkFn closure capturing the matchers + validateMutations.
+	return buildCheckFnClosure(hac, allowedUpstream, allowedUpstreamApp, allowedClient, validateMutations), nil
 }
 
-// buildCheckFnClosure returns the checkFn closure for the given httpAuthClient.
-// Separated from buildHTTPCheckFn for testability.
+// buildCheckFnClosure returns the checkFn closure for the given httpAuthClient
+// and authorization-response matchers. Separated from buildHTTPCheckFn for testability.
+//
+// Parameters (all captured at config-load time):
+//   - hac: the thin ext_authz-local HTTP client + base URL + path_prefix.
+//   - allowedUpstream: compiled allowed_upstream_headers (set/overwrite per allow path).
+//   - allowedUpstreamApp: compiled allowed_upstream_headers_to_append (append per allow path).
+//   - allowedClient: compiled allowed_client_headers (deny-path filter).
+//   - validateMutations: when true, run validateMutationHeaders over extracted header sets.
 //
 // The closure:
-//  1. Builds the outbound POST URL: hac.baseURL (pre-stripped at build time) +
-//     path_prefix + request path. stripPath runs exactly once per checkFn
-//     lifetime (at buildHTTPCheckFn time), not per request.
-//  2. Creates the POST request with the authRequest headers + optional body.
-//     The *authRequest is built by the caller (buildAuthRequest at the Task 9
-//     DecodeHeaders site); the closure transmits it as-is.
+//  1. Builds the outbound POST URL.
+//  2. Creates the POST request with authRequest headers + optional body.
 //  3. Calls client.Do(req.WithContext(ctx)).
-//  4. Maps the HTTP response → checkDisposition per §5.P10:
-//     200 → dispAllow; 401|403 → dispDeny; anything else → dispError.
-func buildCheckFnClosure(hac *httpAuthClient) checkFn {
+//  4. Maps the HTTP response → checkDisposition per §5.P10 + ADR-0161:
+//     200 → dispAllow (extract upstreamSet/upstreamApp); 401|403 → dispDeny
+//     (extract denyHeaders + text/plain fallback); else → dispError.
+//  5. If validateMutations: run validateMutationHeaders over the extracted
+//     header sets — a violation drives dispInvalid.
+func buildCheckFnClosure(hac *httpAuthClient, allowedUpstream, allowedUpstreamApp, allowedClient *stringMatcherList, validateMutations bool) checkFn {
 	return func(ctx context.Context, req *authRequest) (checkDisposition, error) {
 		// Build the outbound POST target URL.
 		// hac.baseURL is the pre-stripped scheme+host (computed once at
@@ -177,31 +194,57 @@ func buildCheckFnClosure(hac *httpAuthClient) checkFn {
 		}
 		defer func() { _ = resp.Body.Close() }()
 
-		// Map the HTTP response status to a disposition per §5.P10.
-		return mapHTTPResponse(resp)
+		// Map the HTTP response status to a disposition per §5.P10 + ADR-0161.
+		return mapHTTPResponseWithMatchers(resp, allowedUpstream, allowedUpstreamApp, allowedClient, validateMutations)
 	}
 }
 
-// mapHTTPResponse maps an HTTP response from the auth service to a
-// checkDisposition per the §5.P10 error-classification boundary:
+// mapHTTPResponseWithMatchers maps an HTTP response from the auth service to a
+// checkDisposition per the §5.P10 error-classification boundary + ADR-0161
+// bidirectional header-mutation discipline:
 //
-//	200         → dispAllow
-//	401 | 403   → dispDeny   (the recognized deny-status set per parent SPEC §5.P10)
-//	anything else → dispError (unrecognized status)
+//	200           → dispAllow  (extract upstreamSet/upstreamApp via matchers)
+//	401 | 403     → dispDeny   (extract denyHeaders via allowedClient; text/plain fallback)
+//	anything else → dispError  (unrecognized status)
 //
-// Header extraction (allowed_upstream_headers / allowed_client_headers) is
-// STUBBED at Task 3 — the disposition header fields are populated minimally.
-// Real extraction + validate_mutations gating land at Task 5.
-func mapHTTPResponse(resp *http.Response) (checkDisposition, error) {
+// Parameters:
+//   - allowedUpstream: nil = no upstream set headers; non-nil = extract matching response headers.
+//   - allowedUpstreamApp: nil = no upstream append headers; non-nil = extract matching.
+//   - allowedClient: nil = no client headers; non-nil = extract matching response headers.
+//   - validateMutations: when true, run validateMutationHeaders on the extracted sets;
+//     a violation drives dispInvalid (no error returned — the caller increments the invalid counter).
+//
+// Deny-path header-ordering per §5.P11 RATIFIED-PENDING-IMPL-TIME + SPEC §4:
+// decision headers (from allowedClient) appear FIRST; the text/plain fallback
+// content-type is appended AFTER (housekeeping last). The §18.P11 byte-shape
+// confirmation closes at Task 13 fixture-harness diff.
+func mapHTTPResponseWithMatchers(
+	resp *http.Response,
+	allowedUpstream, allowedUpstreamApp, allowedClient *stringMatcherList,
+	validateMutations bool,
+) (checkDisposition, error) {
 	switch resp.StatusCode {
 	case http.StatusOK: // 200
-		// Allow path: minimal stub — no header extraction at Task 3.
-		// Real allowed_upstream_headers / allowed_upstream_headers_to_append
-		// extraction lands at Task 5.
+		// Allow path: extract response headers matching allowed_upstream_headers
+		// (set/overwrite) and allowed_upstream_headers_to_append (append) per ADR-0161.
+		upstreamSet := extractMatchingHeaders(resp.Header, allowedUpstream)
+		upstreamApp := extractMatchingHeaders(resp.Header, allowedUpstreamApp)
+
+		// validate_mutations gate: run validateMutationHeaders if configured.
+		// A rejection drives dispInvalid (treated as error posture per SPEC §6.3).
+		if validateMutations {
+			if err := validateMutationHeaders(upstreamSet); err != nil {
+				return checkDisposition{class: dispInvalid}, nil
+			}
+			if err := validateMutationHeaders(upstreamApp); err != nil {
+				return checkDisposition{class: dispInvalid}, nil
+			}
+		}
+
 		return checkDisposition{
 			class:       dispAllow,
-			upstreamSet: nil, // STUBBED — Task 5 extracts allowed_upstream_headers
-			upstreamApp: nil, // STUBBED — Task 5 extracts allowed_upstream_headers_to_append
+			upstreamSet: upstreamSet,
+			upstreamApp: upstreamApp,
 		}, nil
 
 	case http.StatusUnauthorized, http.StatusForbidden: // 401, 403
@@ -212,14 +255,23 @@ func mapHTTPResponse(resp *http.Response) (checkDisposition, error) {
 			return checkDisposition{class: dispError},
 				fmt.Errorf("ext_authz: read deny body: %w", err)
 		}
-		// Header extraction (allowed_client_headers) is STUBBED at Task 3.
-		// Real allowed_client_headers-filtered extraction + text/plain fallback
-		// lands at Task 5. Minimally: no denyHeaders populated at Task 3.
+
+		// Extract denyHeaders: decision headers first, then text/plain fallback
+		// per SPEC §4 + parent §5.P11 + ADR-0161.
+		denyHeaders := buildDenyHeaders(resp.Header, allowedClient)
+
+		// validate_mutations gate over deny-path headers.
+		if validateMutations {
+			if err := validateMutationHeaders(denyHeaders); err != nil {
+				return checkDisposition{class: dispInvalid}, nil
+			}
+		}
+
 		return checkDisposition{
 			class:       dispDeny,
 			denyStatus:  uint32(resp.StatusCode),
 			denyBody:    body,
-			denyHeaders: nil, // STUBBED — Task 5 extracts allowed_client_headers
+			denyHeaders: denyHeaders,
 		}, nil
 
 	default:
@@ -227,6 +279,76 @@ func mapHTTPResponse(resp *http.Response) (checkDisposition, error) {
 		return checkDisposition{class: dispError},
 			fmt.Errorf("ext_authz: unrecognized auth response status %d", resp.StatusCode)
 	}
+}
+
+// extractMatchingHeaders extracts response headers that match the given
+// stringMatcherList into a []headerKV slice (decision-order: the order the
+// net/http response headers map iterates — Go maps are unordered; for the
+// allow-path upstream injection the ordering is not user-visible). A nil
+// matcher returns nil (no headers extracted). Header names are lowercased
+// for matching (per Envoy's internal lowercase-header convention); the
+// canonical form is stored in the headerKV for consumption by the HCM chain.
+func extractMatchingHeaders(headers http.Header, sml *stringMatcherList) []headerKV {
+	if sml == nil {
+		return nil
+	}
+	var result []headerKV
+	for name, values := range headers {
+		nameLower := strings.ToLower(name)
+		if sml.matchAny(nameLower) {
+			// Emit one headerKV per value (multi-value headers produce multiple entries).
+			for _, v := range values {
+				result = append(result, headerKV{name: nameLower, value: v})
+			}
+		}
+	}
+	return result
+}
+
+// buildDenyHeaders constructs the deny-path header set per SPEC §4 + parent §5.P11
+// + ADR-0161:
+//
+//  1. Extract auth-response headers matching allowedClient (decision headers).
+//  2. If content-type is not already present in the extracted set, append a
+//     "content-type: text/plain" fallback entry.
+//
+// Decision headers appear FIRST; the housekeeping content-type fallback is LAST.
+// Header names are lowercased for matching and storage (Envoy convention).
+func buildDenyHeaders(headers http.Header, allowedClient *stringMatcherList) []headerKV {
+	// Step 1: extract decision headers (allowedClient-filtered).
+	decisionHeaders := extractMatchingHeaders(headers, allowedClient)
+
+	// Step 2: check if content-type was supplied in the allowed set.
+	hasContentType := false
+	for _, kv := range decisionHeaders {
+		if kv.name == "content-type" {
+			hasContentType = true
+			break
+		}
+	}
+
+	// Append text/plain fallback if content-type was NOT supplied by the auth service
+	// in the allowed set per SPEC §4 + parent §5.P11 RATIFIED.
+	if !hasContentType {
+		decisionHeaders = append(decisionHeaders, headerKV{name: "content-type", value: "text/plain"})
+	}
+
+	return decisionHeaders
+}
+
+// mapHTTPResponse maps an HTTP response to a checkDisposition using nil matchers
+// (no header extraction). Kept for backward compatibility with Group 4 tests
+// that call the closure directly without authorization_response configured.
+// This function is no longer called by the production closure — it is replaced
+// by mapHTTPResponseWithMatchers. Retained as a package-internal helper for
+// test infrastructure that calls it via the closure (not directly).
+//
+// NOTE: This function is intentionally kept to avoid breaking the Task 3 tests
+// that test the closure behavior through buildCheckFnClosure. The production path
+// now always goes through mapHTTPResponseWithMatchers (called by buildCheckFnClosure).
+// This wrapper delegates to mapHTTPResponseWithMatchers with all-nil matchers.
+func mapHTTPResponse(resp *http.Response) (checkDisposition, error) {
+	return mapHTTPResponseWithMatchers(resp, nil, nil, nil, false)
 }
 
 // buildTargetURL constructs the outbound POST target URL by combining a
