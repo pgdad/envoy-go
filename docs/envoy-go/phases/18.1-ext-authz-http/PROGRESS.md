@@ -512,3 +512,145 @@ $ grep -nE '^## ADR-0159' docs/envoy-go/DECISIONS.md
 **Issue 6 (Minor)** — Latent unsynchronized `sas.received` write removed. `received *http.Request` field removed from `scriptableAuthServer` struct (extauthz_test.go:943). `sas.received = r` write removed from both `newScriptableAuthServer` handler (extauthz_test.go:942) and `newSlowAuthServer` handler (extauthz_test.go:961). Nothing reads `received`; the field and both writes were dead and would constitute a data-race if a future test read the field unsynchronized.
 
 All 6 fixes: `go build` exit 0, `go vet` exit 0, `gofmt -l` empty, `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0 (ok 1.069s).
+
+## Task 4 — attributes.go AuthorizationRequest builder + request-side header filtering + Group 3 + ADR-0160 §Decision+§Consequences
+
+**Files changed:** `internal/filter/http/extauthz/attributes.go` (new, ~195 LoC), `internal/filter/http/extauthz/extauthz.go` (modified — placeholder `stringMatcherList` type replaced by comment cross-reference; `compileStringMatcherList` stub replaced by comment cross-reference; `buildCompiledConfig` step 6 updated to handle real `(sml, error)` return; `matcherv3` import removed), `internal/filter/http/extauthz/extauthz_test.go` (modified — Group 3 appended; `matcherv3` import added), `docs/envoy-go/DECISIONS.md` (ADR-0160 HTTP-mode §Decision+§Consequences filled)
+**Commit SHA:** TBD
+
+**Notes:** Followed `superpowers:test-driven-development`. Group 3 tests written first (RED confirmed — build failure on undefined `buildAuthRequest` + wrong arity on `compileStringMatcherList`). `attributes.go` authored; `buildCompiledConfig` and the `compileStringMatcherList` stub wired to the real implementation. Test count 52 → 83. `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet` exit 0; `gofmt -l` empty.
+
+**`stringMatcherList` type location:** Moved from the Task 2 placeholder in `extauthz.go` to `attributes.go` — co-located with `compileStringMatcherList` + `matchAny` per the rbac/evaluator.go precedent of keeping a compiled type alongside its constructor and methods. The placeholder in `extauthz.go` is replaced by a comment cross-reference.
+
+**`buildAuthRequest` signature:** `buildAuthRequest(f *filter, hs *ext_authzv3.HttpService, headers http.Header, body []byte, path string) *authRequest`. Filter carries `f.activeRC` for `cc.allowedHeaders`/`cc.disallowedHeaders`; `hs` carries `AuthorizationRequest`; `headers` from DecodeHeaders (Task 9 wires from dcb; tests pass directly); `body` is nil at Task 4 (Task 6 wires); `path` stored as-is (path_prefix prepend done in check.go's closure). Method always POST.
+
+**Header name matching convention:** Header names in `http.Header` are in canonical Title-Case form (e.g. `Authorization`); `buildAuthRequest` lowercases them before calling `matchAny` (e.g. `authorization`) to match Envoy's internal lowercase-header convention. Matchers compiled against lowercase patterns (as typical in Envoy configs) therefore match canonical-form headers correctly.
+
+**D5 confirmation (safe_regex engine-arm subset):** The `google_re2` arm is the only valid arm in the v1.37.2 go-control-plane proto for `RegexMatcher`; Go's `regexp` package is RE2-compatible. `compileOneStringMatcher` compiles the regex via `regexp.Compile` (same as rbac/evaluator.go matchString + internal/matcher compileStringMatcher). Nil `RegexMatcher` → PARSE-REJECT; invalid regex → PARSE-REJECT. Full empirical confirmation against a running v1.37.2 deferred to Task 13 differential fixture pass per Task 4 instruction. Evidence basis: go-control-plane proto field documentation + phase-09/12 RegexMatcher-subset precedent. **No divergence from LOCKED D5 disposition.**
+
+**D6 confirmation (deprecated `AuthorizationRequest.allowed_headers` disposition):** The go-control-plane generated Go code for `AuthorizationRequest.AllowedHeaders` carries the `// Deprecated: Marked as deprecated in ...` annotation at v1.37.2 proto level — the field is deprecated-but-present (not removed). `buildAuthRequest` implements honored-if-present: when `cc.allowedHeaders` (top-level primary, `ExtAuthz.allowed_headers` #17) is nil AND `hs.AuthorizationRequest.AllowedHeaders` (#1) is non-nil, the deprecated field is compiled and used as the effective allow-list; when top-level is set, deprecated field is silently ignored. Full empirical confirmation against a running v1.37.2 deferred to Task 13 differential fixture pass. Evidence basis: proto-field annotation + phase-17 amendment-4 "deprecated-but-honored" precedent. **No flip to silent-ignore — field is not removed in v1.37.2. LOCKED D6 disposition confirmed.**
+
+**`validateMutationHeaders` authored but unconsumed:** D7 rule set authored in `attributes.go` — `:` pseudo-headers REJECTED; invalid RFC 7230 token chars in header name REJECTED; bare CR/LF/NUL in header value REJECTED. Group 3 unit tests cover it. NOT wired into the disposition path — Task 5 (ADR-0161) wires it.
+
+**ADR-0160 fill:** §Status updated from "Anticipated" to "Accepted (HTTP-mode portion)"; **Lands-in:** updated from "Task 4 (hypothesis)" to "Task 4 of phase-18.1 PLAN (HTTP-mode portion)"; §Decision: 6-point body (i)–(vi) covering `stringMatcherList` shape, D5 regex-subset confirmation, D6 deprecated-field confirmation, header-name lowercased matching convention, `buildAuthRequest` signature, `validateMutationHeaders` authored-but-unconsumed; §Consequences: 5 bullets covering `attributes.go` LoC, `extauthz.go` updates, D5/D6 confirmations, D7 authoring, gRPC-mode portion deferred.
+
+**Outputs:**
+
+### Test run — Group 3 (failing before implementation — RED)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestCompileStringMatcherList|TestBuildAuthRequest|TestValidateMutation' -v 2>&1 | head -20
+# github.com/esalaine/envoy-go/internal/filter/http/extauthz [github.com/esalaine/envoy-go/internal/filter/http/extauthz.test]
+internal/filter/http/extauthz/extauthz_test.go:1581:9: undefined: buildAuthRequest
+internal/filter/http/extauthz/extauthz_test.go:1591:17: assignment mismatch: 2 variables but compileStringMatcherList returns 1 value
+...
+FAIL	github.com/esalaine/envoy-go/internal/filter/http/extauthz [build failed]
+```
+
+### Test run — Group 3 verbose after implementation (GREEN, 31 test functions)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestCompileStringMatcherList|TestBuildAuthRequest|TestValidateMutation' -v
+=== RUN   TestCompileStringMatcherList_NilInput
+--- PASS: TestCompileStringMatcherList_NilInput (0.00s)
+=== RUN   TestCompileStringMatcherList_Exact
+--- PASS: TestCompileStringMatcherList_Exact (0.00s)
+=== RUN   TestCompileStringMatcherList_ExactIgnoreCase
+--- PASS: TestCompileStringMatcherList_ExactIgnoreCase (0.00s)
+=== RUN   TestCompileStringMatcherList_Prefix
+--- PASS: TestCompileStringMatcherList_Prefix (0.00s)
+=== RUN   TestCompileStringMatcherList_PrefixIgnoreCase
+--- PASS: TestCompileStringMatcherList_PrefixIgnoreCase (0.00s)
+=== RUN   TestCompileStringMatcherList_Suffix
+--- PASS: TestCompileStringMatcherList_Suffix (0.00s)
+=== RUN   TestCompileStringMatcherList_SuffixIgnoreCase
+--- PASS: TestCompileStringMatcherList_SuffixIgnoreCase (0.00s)
+=== RUN   TestCompileStringMatcherList_Contains
+--- PASS: TestCompileStringMatcherList_Contains (0.00s)
+=== RUN   TestCompileStringMatcherList_ContainsIgnoreCase
+--- PASS: TestCompileStringMatcherList_ContainsIgnoreCase (0.00s)
+=== RUN   TestCompileStringMatcherList_SafeRegex_GoogleRE2
+--- PASS: TestCompileStringMatcherList_SafeRegex_GoogleRE2 (0.00s)
+=== RUN   TestCompileStringMatcherList_SafeRegex_InvalidRegex
+--- PASS: TestCompileStringMatcherList_SafeRegex_InvalidRegex (0.00s)
+=== RUN   TestCompileStringMatcherList_SafeRegex_NilRegexMatcher
+--- PASS: TestCompileStringMatcherList_SafeRegex_NilRegexMatcher (0.00s)
+=== RUN   TestCompileStringMatcherList_Custom_ParseReject
+--- PASS: TestCompileStringMatcherList_Custom_ParseReject (0.00s)
+=== RUN   TestCompileStringMatcherList_MultiplePatterns
+--- PASS: TestCompileStringMatcherList_MultiplePatterns (0.00s)
+=== RUN   TestCompileStringMatcherList_EmptyPatterns
+--- PASS: TestCompileStringMatcherList_EmptyPatterns (0.00s)
+=== RUN   TestBuildAuthRequest_NilAllowedHeaders_AllPass
+--- PASS: TestBuildAuthRequest_NilAllowedHeaders_AllPass (0.00s)
+=== RUN   TestBuildAuthRequest_AllowedHeaders_FiltersHeaders
+--- PASS: TestBuildAuthRequest_AllowedHeaders_FiltersHeaders (0.00s)
+=== RUN   TestBuildAuthRequest_DisallowedHeaders_OverridesAllowed
+--- PASS: TestBuildAuthRequest_DisallowedHeaders_OverridesAllowed (0.00s)
+=== RUN   TestBuildAuthRequest_DisallowedHeaders_NilAllowed
+--- PASS: TestBuildAuthRequest_DisallowedHeaders_NilAllowed (0.00s)
+=== RUN   TestBuildAuthRequest_HeadersToAdd_Appended
+--- PASS: TestBuildAuthRequest_HeadersToAdd_Appended (0.00s)
+=== RUN   TestBuildAuthRequest_DeprecatedAllowedHeaders_HonoredIfPresent
+--- PASS: TestBuildAuthRequest_DeprecatedAllowedHeaders_HonoredIfPresent (0.00s)
+=== RUN   TestBuildAuthRequest_TopLevelAllowedHeadersTakesPrecedence
+--- PASS: TestBuildAuthRequest_TopLevelAllowedHeadersTakesPrecedence (0.00s)
+=== RUN   TestBuildAuthRequest_PathCarried
+--- PASS: TestBuildAuthRequest_PathCarried (0.00s)
+=== RUN   TestBuildAuthRequest_BodyIncluded
+--- PASS: TestBuildAuthRequest_BodyIncluded (0.00s)
+=== RUN   TestValidateMutationHeaders_ValidHeaders
+--- PASS: TestValidateMutationHeaders_ValidHeaders (0.00s)
+=== RUN   TestValidateMutationHeaders_PseudoHeaderReject
+--- PASS: TestValidateMutationHeaders_PseudoHeaderReject (0.00s)
+=== RUN   TestValidateMutationHeaders_InvalidHeaderNameChars
+--- PASS: TestValidateMutationHeaders_InvalidHeaderNameChars (0.00s)
+=== RUN   TestValidateMutationHeaders_InvalidHeaderValueChars
+--- PASS: TestValidateMutationHeaders_InvalidHeaderValueChars (0.00s)
+=== RUN   TestValidateMutationHeaders_EmptySlice
+--- PASS: TestValidateMutationHeaders_EmptySlice (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	0.003s
+```
+
+### Test run — full suite with race detector
+
+```
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.070s
+```
+
+83 tests PASS (up from 52 at Task 3 end). 0 failures.
+
+### Test run — go vet
+
+```
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+```
+
+### Test run — gofmt
+
+```
+$ gofmt -l internal/filter/http/extauthz/
+(no output — empty)
+```
+
+### Test run — full suite (48 packages, short mode)
+
+```
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^ok'
+48
+
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^(FAIL|---\s+FAIL)'
+0
+```
+
+### ADR acceptance-criteria grep
+
+```
+$ grep -nE '^## ADR-0160' docs/envoy-go/DECISIONS.md
+8479:## ADR-0160: `AttributeContext` / `AuthorizationRequest` builder — ...
+```
+
+1 match (1 required). §Decision (6-point body (i)–(vi)) + §Consequences (5 bullets) filled. Status: Accepted (HTTP-mode portion); Date: 2026-05-14; Lands-in: Task 4 of phase-18.1 PLAN.

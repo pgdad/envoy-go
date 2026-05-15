@@ -8478,10 +8478,10 @@ The BRAINSTORM §3.2 posed an (a)-vs-(b) disposition for the SPEC author: (a) ge
 
 ## ADR-0160: `AttributeContext` / `AuthorizationRequest` builder — HTTP-mode portion (the `AuthorizationRequest` builder: `headers_to_add` + `path_prefix` prepend + the top-level `ExtAuthz.allowed_headers`/`disallowed_headers` request-side filtering + the deprecated-`AuthorizationRequest.allowed_headers` honored-if-present disposition) lands in 18.1; gRPC-mode portion (the `AttributeContext` builder: source/destination Peers, `request.http` per §5.P4, `request.time` `Timestamp` shape, `principal` via the phase-16 ADR-0144 `DownstreamPrincipal()` reuse, `certificate`/`tls_session` honored as `include_peer_certificate`/`include_tls_session` gates per §5.P3, `context_extensions` merge, the `encode_raw_headers` `headers`-vs-`header_map` discipline) lands in 18.2
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL (HTTP-mode portion) + phase-18.2 IMPL (gRPC-mode portion) per ADR-0044.
+**Status:** Accepted (HTTP-mode portion) — §Decision + §Consequences for the HTTP-mode portion landed at Task 4 of phase-18.1 IMPL per ADR-0044. The gRPC-mode portion §Decision + §Consequences land at phase-18.2 IMPL.
 **Date:** 2026-05-14
 **Doctrine:** Phase 18.1 + 18.2 §9 family-row. ADR-0044 ADR-on-impl convention. The gRPC-mode portion is the SECOND cross-phase reuse of ADR-0144 `DownstreamPrincipal()` (phase-16 rbac was the introducer-and-first-consumer).
-**Lands-in:** Task 4 (hypothesis) of phase-18.1 PLAN (HTTP-mode); phase-18.2 PLAN (gRPC-mode).
+**Lands-in:** Task 4 of phase-18.1 PLAN (HTTP-mode portion). phase-18.2 PLAN (gRPC-mode portion).
 
 ### Context
 
@@ -8493,11 +8493,31 @@ ext_authz must build a request representation to ship to the external auth servi
 
 ### Decision
 
-LANDS AT the respective IMPL tasks per ADR-0044. The 18.1 §Decision codifies the `AuthorizationRequest` builder + request-side header filtering; the 18.2 §Decision codifies the `AttributeContext` builder + the `DownstreamPrincipal()` reuse + the `include_*` gating + the `encode_raw_headers` discipline.
+**Status: Accepted (HTTP-mode portion) — landed at Task 4 of phase-18.1 PLAN per ADR-0044. gRPC-mode portion LANDS AT phase-18.2 IMPL.**
+
+**(i) `stringMatcherList` + `compileStringMatcherList` shape.** The internal `stringMatcherList` type and its `matchAny(candidate string) bool` method are defined in `attributes.go` alongside `compileStringMatcherList` (the type, constructor, and method co-located per the rbac/evaluator.go precedent). The type definition replaces the Task 2 placeholder in `extauthz.go`. `stringMatcherList` holds a `[]compiledStringMatcher` slice; `matchAny` iterates and short-circuits on first match (OR semantics). An empty slice matches nothing; a nil `*stringMatcherList` pointer is the "no matcher" (all-pass / none-removed) sentinel.
+
+**(ii) D5 confirmation — `safe_regex` engine-arm subset.** The `safe_regex` arm compiles via `regexp.Compile(mp.SafeRegex.GetRegex())` (Go's `regexp` package, RE2-compatible). Evidence basis: (a) the go-control-plane v1.37.2-era proto defines only one `engine_type` arm — `google_re2` (`RegexMatcher_GoogleRe2`); there are no other valid arms in the proto for this version; (b) reference Envoy v1.37.2 uses the RE2 engine natively; Go's `regexp` package is a RE2-compatible implementation; (c) the phase-09/12 RegexMatcher-subset discipline (internal/matcher `compileStringMatcher` + rbac evaluator `matchString`) uses the same `regexp.Compile` approach. Decision: the `google_re2` arm (nil EngineType is treated as implicit google_re2 — the only valid arm) is honored; nil `RegexMatcher` → PARSE-REJECT; invalid regex pattern → PARSE-REJECT with a descriptive error. Full empirical confirmation against a running v1.37.2 is deferred to the Task 13 differential fixture pass (the fixture exercises real Envoy ext_authz with these patterns). No divergence from the LOCKED D5 disposition at Task 4.
+
+**(iii) D6 confirmation — deprecated `AuthorizationRequest.allowed_headers` disposition.** Reference evidence: the go-control-plane proto source for `AuthorizationRequest.allowed_headers` (field #1) carries the Go `// Deprecated: Marked as deprecated in ...` annotation, confirming it is deprecated-but-not-removed at the v1.37.2 proto level. The field is still present and populated by the generated Go accessors (`GetAllowedHeaders()`). Reference Envoy v1.37.2 source inspection and the phase-17 amendment-4 "deprecated-but-honored" precedent both support the honored-if-present disposition. **Decision: HONORED-IF-PRESENT confirmed.** `buildAuthRequest` applies the D6 logic: when `cc.allowedHeaders` (top-level primary path, `ExtAuthz.allowed_headers` #17) is nil AND `hs.AuthorizationRequest.AllowedHeaders` (deprecated #1) is non-nil, the deprecated field is compiled and used as the effective allow-list. When `cc.allowedHeaders` is non-nil, the deprecated field is silently ignored (top-level wins). This mirrors the proto doc direction ("This field has been deprecated in favor of `allowed_headers`"). No flip to silent-ignore — v1.37.2 has not removed the field. Full empirical confirmation against a running v1.37.2 is deferred to the Task 13 differential fixture pass.
+
+**(iv) Header name matching — lowercased comparison convention.** HTTP header names are case-insensitive per RFC 7230; Envoy lowercases header names internally. `buildAuthRequest` matches header names against the `stringMatcherList` using the lowercased form (`strings.ToLower(name)`) so that a config pattern `exact: "authorization"` matches the `Authorization` canonical-form header as stored in Go's `http.Header` map. This is consistent with reference Envoy v1.37.2 behavior. Header values are forwarded as-is (no case transformation).
+
+**(v) `buildAuthRequest` signature.** `buildAuthRequest(f *filter, hs *ext_authzv3.HttpService, headers http.Header, body []byte, path string) *authRequest`. The filter carries `f.activeRC` for `cc.allowedHeaders` / `cc.disallowedHeaders`; `hs` carries `AuthorizationRequest.headers_to_add` + deprecated `allowed_headers`; `headers` is the incoming client request header map (Task 9 wires from `dcb.RequestHeaders()` + `DecodeHeaders` arg; test helpers pass directly); `body` is nil at Task 4 (wired at Task 6); `path` is the request path as-is (path_prefix prepend done in check.go's closure). The method is always `POST` (HTTP-mode auth check always POSTs per SPEC §6.5).
+
+**(vi) `validateMutationHeaders` authored but unconsumed (D7).** `validateMutationHeaders(hdrs []headerKV) error` is authored in `attributes.go` at Task 4 per the planner-time decision D7 plan. It validates: :-prefixed pseudo-headers REJECTED; invalid header-name characters REJECTED (RFC 7230 §3.2.6 token rule); invalid header-value characters REJECTED (bare CR, LF, NUL). It is NOT wired into the disposition path at Task 4 — that lands at Task 5 (ADR-0161). Group 3 unit tests cover it at Task 4.
 
 ### Consequences
 
-LANDS AT the respective IMPL tasks per ADR-0044. Records the per-mode builder landing; the SECOND ADR-0144 cross-phase reuse; the `tls_session` RATIFIED-PENDING-IMPL-TIME closure (parent §5.P4 — the scrape used a plaintext listener; the 18.2 IMPL confirms `tls_session.sni` against a TLS listener).
+**`attributes.go` landed (~200 LoC net, well within the 200–340 LoC range)** — `stringMatcherList` + `compileStringMatcherList` + `compileOneStringMatcher` + the 5 `compiledStringMatcher` implementations (`smExact`, `smPrefix`, `smSuffix`, `smContains`, `smRegex`) + `buildAuthRequest` + `validateMutationHeaders` + `validateMutationHeaderName` + `validateMutationHeaderValue` + `isTokenChar`.
+
+**`extauthz.go` updated** — the Task 2 placeholder `stringMatcherList` type replaced by a comment cross-reference to `attributes.go`; the Task 2 `compileStringMatcherList` stub replaced by a comment cross-reference; `buildCompiledConfig` step 6 updated to handle the real `(sml, error)` return from `compileStringMatcherList` (PARSE-REJECTs on malformed `allowed_headers`/`disallowed_headers` patterns).
+
+**D5 and D6 LOCKED dispositions CONFIRMED at Task 4** via proto-field documentation evidence + the phase-09/12/17 precedent. Full empirical confirmation against a running v1.37.2 is deferred to the Task 13 differential fixture pass per the Task 4 instruction. No divergence recorded.
+
+**`validateMutationHeaders` is authored here, consumed at Task 5.** The D7 rule set (phase-10 header_mutation protected-header discipline: `:` pseudo-headers + invalid token chars + invalid value chars) is authored in `attributes.go` at Task 4; Task 5 wires it into the `validate_mutations` disposition path (ADR-0161).
+
+**gRPC-mode portion (18.2)** — the `AttributeContext` builder + the `DownstreamPrincipal()` reuse + the `include_*` gating + the `encode_raw_headers` discipline + the `tls_session` RATIFIED-PENDING-IMPL-TIME closure all land at phase-18.2 IMPL. This ADR's §Decision is amended at 18.2 to add the gRPC-mode portion.
 
 ---
 

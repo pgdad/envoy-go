@@ -21,7 +21,6 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
-	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -136,12 +135,14 @@ type compiledConfig struct {
 }
 
 // stringMatcherList is the compiled form of a ListStringMatcher proto.
-// Task 4 (attributes.go) wires the full compilation. At Task 2 the
-// compileStringMatcherList helper is a stub (always returns nil).
-type stringMatcherList struct {
-	// Full shape defined at Task 4 when attributes.go lands.
-	// Placeholder: matchers slice added at Task 4.
-}
+// The full type definition lives in attributes.go (Task 4), where it is
+// defined alongside compileStringMatcherList + matchAny per the rbac/evaluator.go
+// precedent of co-locating a compiled type with its constructor + methods.
+// The compiledConfig fields reference *stringMatcherList by pointer (Go allows
+// forward references within a package).
+//
+// This comment replaces the Task 2 placeholder type declaration;
+// the actual type definition is in attributes.go.
 
 // compiledPerRoute is the cached per-route disposition. Keyed by
 // *ExtAuthzPerRoute proto pointer-identity in the factoryState.perRoute
@@ -361,9 +362,19 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 	}
 
 	// 6. allowed_headers / disallowed_headers: compile ListStringMatcher.
-	// Task 4 stub: compileStringMatcherList returns nil placeholder.
-	cc.allowedHeaders = compileStringMatcherList(raw.GetAllowedHeaders())
-	cc.disallowedHeaders = compileStringMatcherList(raw.GetDisallowedHeaders())
+	// Real compilation via compileStringMatcherList (attributes.go, Task 4).
+	// nil lsm → nil sml (no filtering); PARSE-REJECT on invalid pattern.
+	ah, err := compileStringMatcherList(raw.GetAllowedHeaders())
+	if err != nil {
+		return nil, fmt.Errorf("ext_authz: allowed_headers: %w", err)
+	}
+	cc.allowedHeaders = ah
+
+	dh, err := compileStringMatcherList(raw.GetDisallowedHeaders())
+	if err != nil {
+		return nil, fmt.Errorf("ext_authz: disallowed_headers: %w", err)
+	}
+	cc.disallowedHeaders = dh
 
 	// 7. filterStats — guarded `if ctx.Stats != nil` per ADR-0085 nil-tolerance.
 	if ctx.Stats != nil {
@@ -378,19 +389,10 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 // lives in check.go and this comment serves as the cross-reference.
 // Signature: buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error)
 
-// compileStringMatcherList compiles an ext_authz ListStringMatcher into a
-// *stringMatcherList. At Task 2 this is a STUB returning nil (the real
-// compilation with exact/prefix/suffix/contains/safe_regex/custom arms lands
-// at Task 4 in attributes.go). A nil return means "no matcher" (all-pass for
-// allowed_headers; no-filter for disallowed_headers).
-func compileStringMatcherList(lsm *matcherv3.ListStringMatcher) *stringMatcherList {
-	// Task 4 stub. When lsm is non-nil, a real *stringMatcherList will be built.
-	if lsm == nil {
-		return nil
-	}
-	// Return nil placeholder; real compilation at Task 4.
-	return nil
-}
+// compileStringMatcherList is defined in attributes.go (Task 4 real implementation).
+// It compiles a *matcherv3.ListStringMatcher into a *stringMatcherList with error
+// return. Signature: compileStringMatcherList(lsm *matcherv3.ListStringMatcher) (*stringMatcherList, error).
+// This comment serves as the cross-reference; the function body lives in attributes.go.
 
 // ---------------------------------------------------------------------------
 // Per-route helpers per SPEC §6.6 + ADR-0163.

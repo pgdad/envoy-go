@@ -32,6 +32,7 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -1454,5 +1455,800 @@ func TestBuildTargetURL(t *testing.T) {
 					tc.base, tc.pathPrefix, tc.path, got, tc.want)
 			}
 		})
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Group 3 — compileStringMatcherList + buildAuthRequest + validateMutationHeaders
+// (Group 3 per SPEC §14.1 + PLAN Task 4 [ADR-0160])
+//
+// This group covers:
+//   - compileStringMatcherList: all matcher kinds (exact/prefix/suffix/contains/
+//     safe_regex + ignore_case) + custom PARSE-REJECT + nil input → nil
+//   - buildAuthRequest: nil allowedHeaders = all pass; allowedHeaders allow-list;
+//     disallowedHeaders overrides allowedHeaders; headers_to_add appended;
+//     deprecated AuthorizationRequest.allowed_headers honored-if-present
+//   - validateMutationHeaders: :-prefixed pseudo-header reject; invalid header-
+//     name characters reject; invalid header-value characters reject; valid
+//     headers pass
+// ----------------------------------------------------------------------------
+
+// --- helpers for Group 3 ---
+
+// makeListStringMatcher builds a *matcherv3.ListStringMatcher from a slice of
+// *matcherv3.StringMatcher entries. Convenience for Group 3 tests.
+func makeListStringMatcher(patterns ...*matcherv3.StringMatcher) *matcherv3.ListStringMatcher {
+	return &matcherv3.ListStringMatcher{Patterns: patterns}
+}
+
+// exactPattern builds an exact-match StringMatcher.
+func exactPattern(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{MatchPattern: &matcherv3.StringMatcher_Exact{Exact: s}}
+}
+
+// exactPatternIC builds an exact-match StringMatcher with ignore_case=true.
+func exactPatternIC(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_Exact{Exact: s},
+		IgnoreCase:   true,
+	}
+}
+
+// prefixPattern builds a prefix-match StringMatcher.
+func prefixPattern(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: s}}
+}
+
+// prefixPatternIC builds a prefix-match StringMatcher with ignore_case=true.
+func prefixPatternIC(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: s},
+		IgnoreCase:   true,
+	}
+}
+
+// suffixPattern builds a suffix-match StringMatcher.
+func suffixPattern(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{MatchPattern: &matcherv3.StringMatcher_Suffix{Suffix: s}}
+}
+
+// suffixPatternIC builds a suffix-match StringMatcher with ignore_case=true.
+func suffixPatternIC(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_Suffix{Suffix: s},
+		IgnoreCase:   true,
+	}
+}
+
+// containsPattern builds a contains-match StringMatcher.
+func containsPattern(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{MatchPattern: &matcherv3.StringMatcher_Contains{Contains: s}}
+}
+
+// containsPatternIC builds a contains-match StringMatcher with ignore_case=true.
+func containsPatternIC(s string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_Contains{Contains: s},
+		IgnoreCase:   true,
+	}
+}
+
+// safeRegexPattern builds a safe_regex StringMatcher using the google_re2 engine.
+func safeRegexPattern(regex string) *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_SafeRegex{
+			SafeRegex: &matcherv3.RegexMatcher{
+				EngineType: &matcherv3.RegexMatcher_GoogleRe2{
+					GoogleRe2: &matcherv3.RegexMatcher_GoogleRE2{},
+				},
+				Regex: regex,
+			},
+		},
+	}
+}
+
+// customPattern builds a custom StringMatcher (used to test PARSE-REJECT).
+func customPattern() *matcherv3.StringMatcher {
+	return &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_Custom{
+			Custom: nil, // non-nil MatchPattern with nil TypedExtensionConfig
+		},
+	}
+}
+
+// buildAuthRequestForTest constructs an *authRequest with the given headers
+// (as a flat k/v list: k1, v1, k2, v2, ...) and calls buildAuthRequest.
+// The filter's compiledConfig carries the supplied allowedHeaders +
+// disallowedHeaders. The HttpService carries the headers_to_add from ar.
+func buildAuthRequestForTest(
+	t *testing.T,
+	allowedHeaders *stringMatcherList,
+	disallowedHeaders *stringMatcherList,
+	hs *ext_authzv3.HttpService,
+	incomingHeaders map[string]string,
+	path string,
+) *authRequest {
+	t.Helper()
+	cc := &compiledConfig{
+		allowedHeaders:    allowedHeaders,
+		disallowedHeaders: disallowedHeaders,
+	}
+	f := &filter{state: &factoryState{listenerRC: cc}, activeRC: cc}
+	h := make(http.Header)
+	for k, v := range incomingHeaders {
+		h.Set(k, v)
+	}
+	return buildAuthRequest(f, hs, h, nil, path)
+}
+
+// -------------------------------------------------------------------------
+// Group 3 — compileStringMatcherList tests
+// -------------------------------------------------------------------------
+
+// TestCompileStringMatcherList_NilInput verifies that a nil ListStringMatcher
+// returns nil (= all-pass for allowed_headers; no-filter for disallowed_headers).
+func TestCompileStringMatcherList_NilInput(t *testing.T) {
+	result, err := compileStringMatcherList(nil)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(nil): unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("compileStringMatcherList(nil): got non-nil, want nil")
+	}
+}
+
+// TestCompileStringMatcherList_Exact verifies exact-match compilation.
+func TestCompileStringMatcherList_Exact(t *testing.T) {
+	lsm := makeListStringMatcher(exactPattern("authorization"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(exact): unexpected error: %v", err)
+	}
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(exact): got nil, want non-nil")
+	}
+	if !sml.matchAny("authorization") {
+		t.Error("matchAny('authorization'): got false, want true")
+	}
+	if sml.matchAny("Authorization") {
+		t.Error("matchAny('Authorization'): got true, want false (case-sensitive exact)")
+	}
+	if sml.matchAny("x-custom") {
+		t.Error("matchAny('x-custom'): got true, want false")
+	}
+}
+
+// TestCompileStringMatcherList_ExactIgnoreCase verifies exact-match with ignore_case.
+func TestCompileStringMatcherList_ExactIgnoreCase(t *testing.T) {
+	lsm := makeListStringMatcher(exactPatternIC("authorization"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(exact ignore_case): unexpected error: %v", err)
+	}
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(exact ignore_case): got nil, want non-nil")
+	}
+	if !sml.matchAny("authorization") {
+		t.Error("matchAny('authorization'): got false, want true")
+	}
+	if !sml.matchAny("Authorization") {
+		t.Error("matchAny('Authorization'): got false, want true (ignore_case)")
+	}
+	if !sml.matchAny("AUTHORIZATION") {
+		t.Error("matchAny('AUTHORIZATION'): got false, want true (ignore_case)")
+	}
+	if sml.matchAny("x-custom") {
+		t.Error("matchAny('x-custom'): got true, want false")
+	}
+}
+
+// TestCompileStringMatcherList_Prefix verifies prefix-match compilation.
+func TestCompileStringMatcherList_Prefix(t *testing.T) {
+	lsm := makeListStringMatcher(prefixPattern("x-"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(prefix): unexpected error: %v", err)
+	}
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(prefix): got nil, want non-nil")
+	}
+	if !sml.matchAny("x-custom") {
+		t.Error("matchAny('x-custom'): got false, want true")
+	}
+	if !sml.matchAny("x-forwarded-for") {
+		t.Error("matchAny('x-forwarded-for'): got false, want true")
+	}
+	if sml.matchAny("authorization") {
+		t.Error("matchAny('authorization'): got true, want false")
+	}
+}
+
+// TestCompileStringMatcherList_PrefixIgnoreCase verifies prefix-match with ignore_case.
+func TestCompileStringMatcherList_PrefixIgnoreCase(t *testing.T) {
+	lsm := makeListStringMatcher(prefixPatternIC("x-"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(prefix ignore_case): unexpected error: %v", err)
+	}
+	if !sml.matchAny("x-custom") {
+		t.Error("matchAny('x-custom'): got false, want true")
+	}
+	if !sml.matchAny("X-Custom") {
+		t.Error("matchAny('X-Custom'): got false, want true (ignore_case prefix)")
+	}
+}
+
+// TestCompileStringMatcherList_Suffix verifies suffix-match compilation.
+func TestCompileStringMatcherList_Suffix(t *testing.T) {
+	lsm := makeListStringMatcher(suffixPattern("-id"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(suffix): unexpected error: %v", err)
+	}
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(suffix): got nil, want non-nil")
+	}
+	if !sml.matchAny("request-id") {
+		t.Error("matchAny('request-id'): got false, want true")
+	}
+	if !sml.matchAny("trace-id") {
+		t.Error("matchAny('trace-id'): got false, want true")
+	}
+	if sml.matchAny("x-custom") {
+		t.Error("matchAny('x-custom'): got true, want false")
+	}
+}
+
+// TestCompileStringMatcherList_SuffixIgnoreCase verifies suffix-match with ignore_case.
+func TestCompileStringMatcherList_SuffixIgnoreCase(t *testing.T) {
+	lsm := makeListStringMatcher(suffixPatternIC("-ID"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(suffix ignore_case): unexpected error: %v", err)
+	}
+	if !sml.matchAny("request-id") {
+		t.Error("matchAny('request-id'): got false, want true (ignore_case suffix)")
+	}
+	if !sml.matchAny("Request-ID") {
+		t.Error("matchAny('Request-ID'): got false, want true (ignore_case suffix)")
+	}
+}
+
+// TestCompileStringMatcherList_Contains verifies contains-match compilation.
+func TestCompileStringMatcherList_Contains(t *testing.T) {
+	lsm := makeListStringMatcher(containsPattern("auth"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(contains): unexpected error: %v", err)
+	}
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(contains): got nil, want non-nil")
+	}
+	if !sml.matchAny("authorization") {
+		t.Error("matchAny('authorization'): got false, want true")
+	}
+	if !sml.matchAny("x-auth-token") {
+		t.Error("matchAny('x-auth-token'): got false, want true")
+	}
+	if sml.matchAny("x-custom") {
+		t.Error("matchAny('x-custom'): got true, want false")
+	}
+}
+
+// TestCompileStringMatcherList_ContainsIgnoreCase verifies contains-match with ignore_case.
+func TestCompileStringMatcherList_ContainsIgnoreCase(t *testing.T) {
+	lsm := makeListStringMatcher(containsPatternIC("AUTH"))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(contains ignore_case): unexpected error: %v", err)
+	}
+	if !sml.matchAny("authorization") {
+		t.Error("matchAny('authorization'): got false, want true (ignore_case contains)")
+	}
+	if !sml.matchAny("X-Auth-Token") {
+		t.Error("matchAny('X-Auth-Token'): got false, want true (ignore_case contains)")
+	}
+}
+
+// TestCompileStringMatcherList_SafeRegex_GoogleRE2 verifies safe_regex compilation
+// with the google_re2 engine (D5: google_re2 arm honored per phase-09/12 subset).
+func TestCompileStringMatcherList_SafeRegex_GoogleRE2(t *testing.T) {
+	lsm := makeListStringMatcher(safeRegexPattern(`^x-[a-z]+-[a-z]+$`))
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(safe_regex google_re2): unexpected error: %v", err)
+	}
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(safe_regex): got nil, want non-nil")
+	}
+	if !sml.matchAny("x-custom-header") {
+		t.Error("matchAny('x-custom-header'): got false, want true")
+	}
+	if sml.matchAny("X-Custom-Header") {
+		t.Error("matchAny('X-Custom-Header'): got true, want false (regex is case-sensitive)")
+	}
+	if sml.matchAny("authorization") {
+		t.Error("matchAny('authorization'): got true, want false")
+	}
+}
+
+// TestCompileStringMatcherList_SafeRegex_InvalidRegex verifies that an invalid
+// regex pattern returns a PARSE-REJECT error.
+func TestCompileStringMatcherList_SafeRegex_InvalidRegex(t *testing.T) {
+	lsm := makeListStringMatcher(safeRegexPattern(`[invalid(`))
+	_, err := compileStringMatcherList(lsm)
+	if err == nil {
+		t.Fatal("compileStringMatcherList(invalid regex): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "safe_regex") {
+		t.Errorf("error %q: want substring 'safe_regex'", err.Error())
+	}
+}
+
+// TestCompileStringMatcherList_SafeRegex_NilRegexMatcher verifies PARSE-REJECT
+// when safe_regex has a nil RegexMatcher inner field.
+func TestCompileStringMatcherList_SafeRegex_NilRegexMatcher(t *testing.T) {
+	lsm := makeListStringMatcher(&matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_SafeRegex{SafeRegex: nil},
+	})
+	_, err := compileStringMatcherList(lsm)
+	if err == nil {
+		t.Fatal("compileStringMatcherList(safe_regex nil): want error, got nil")
+	}
+}
+
+// TestCompileStringMatcherList_Custom_ParseReject verifies that a custom
+// StringMatcher PARSE-REJECTs per envoy-go-strict (no string-matcher extension
+// registry; D5 companion rule).
+func TestCompileStringMatcherList_Custom_ParseReject(t *testing.T) {
+	lsm := makeListStringMatcher(customPattern())
+	_, err := compileStringMatcherList(lsm)
+	if err == nil {
+		t.Fatal("compileStringMatcherList(custom): want PARSE-REJECT error, got nil")
+	}
+	if !strings.Contains(err.Error(), "custom") {
+		t.Errorf("error %q: want substring 'custom'", err.Error())
+	}
+}
+
+// TestCompileStringMatcherList_MultiplePatterns verifies that a ListStringMatcher
+// with multiple patterns applies OR semantics (matchAny returns true if ANY pattern
+// matches).
+func TestCompileStringMatcherList_MultiplePatterns(t *testing.T) {
+	lsm := makeListStringMatcher(
+		exactPattern("authorization"),
+		prefixPattern("x-"),
+		suffixPattern("-id"),
+	)
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(multiple): unexpected error: %v", err)
+	}
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(multiple): got nil")
+	}
+	if !sml.matchAny("authorization") {
+		t.Error("matchAny('authorization'): got false, want true")
+	}
+	if !sml.matchAny("x-custom") {
+		t.Error("matchAny('x-custom'): got false, want true")
+	}
+	if !sml.matchAny("request-id") {
+		t.Error("matchAny('request-id'): got false, want true")
+	}
+	if sml.matchAny("content-type") {
+		t.Error("matchAny('content-type'): got true, want false")
+	}
+}
+
+// TestCompileStringMatcherList_EmptyPatterns verifies that an empty-patterns
+// ListStringMatcher (non-nil but zero patterns) compiles to a non-nil sml that
+// matches nothing.
+func TestCompileStringMatcherList_EmptyPatterns(t *testing.T) {
+	lsm := &matcherv3.ListStringMatcher{Patterns: nil}
+	sml, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(empty patterns): unexpected error: %v", err)
+	}
+	// A non-nil but empty ListStringMatcher → non-nil sml with no matchers.
+	if sml == nil {
+		t.Fatal("compileStringMatcherList(empty patterns): got nil, want non-nil (matches-nothing)")
+	}
+	if sml.matchAny("anything") {
+		t.Error("matchAny(empty sml): got true, want false (no patterns)")
+	}
+}
+
+// -------------------------------------------------------------------------
+// Group 3 — buildAuthRequest tests
+// -------------------------------------------------------------------------
+
+// TestBuildAuthRequest_NilAllowedHeaders_AllPass verifies that when
+// cc.allowedHeaders is nil, all incoming client request headers pass through.
+func TestBuildAuthRequest_NilAllowedHeaders_AllPass(t *testing.T) {
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+	}
+	req := buildAuthRequestForTest(t,
+		nil, // allowedHeaders: nil = all pass
+		nil, // disallowedHeaders: nil = none removed
+		hs,
+		map[string]string{
+			"authorization":   "Bearer tok",
+			"x-forwarded-for": "10.0.0.1",
+			"content-type":    "application/json",
+		},
+		"/api/resource",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil authRequest")
+	}
+	if req.headers.Get("Authorization") == "" {
+		t.Error("authorization header: got empty, want present")
+	}
+	if req.headers.Get("X-Forwarded-For") == "" {
+		t.Error("x-forwarded-for header: got empty, want present")
+	}
+	if req.headers.Get("Content-Type") == "" {
+		t.Error("content-type header: got empty, want present")
+	}
+}
+
+// TestBuildAuthRequest_AllowedHeaders_FiltersHeaders verifies that when
+// cc.allowedHeaders is set, only matching headers pass through.
+func TestBuildAuthRequest_AllowedHeaders_FiltersHeaders(t *testing.T) {
+	lsm := makeListStringMatcher(
+		exactPattern("authorization"),
+		prefixPatternIC("x-"),
+	)
+	allowed, err := compileStringMatcherList(lsm)
+	if err != nil {
+		t.Fatalf("compileStringMatcherList: %v", err)
+	}
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+	}
+	req := buildAuthRequestForTest(t,
+		allowed,
+		nil, // no disallowedHeaders
+		hs,
+		map[string]string{
+			"authorization":   "Bearer tok",
+			"x-custom":        "custom-val",
+			"content-type":    "application/json", // should be filtered out
+			"accept-encoding": "gzip",             // should be filtered out
+		},
+		"/api/resource",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	// Matching headers present.
+	if req.headers.Get("Authorization") == "" {
+		t.Error("authorization: got empty, want present (exact match)")
+	}
+	if req.headers.Get("X-Custom") == "" {
+		t.Error("x-custom: got empty, want present (prefix x-)")
+	}
+	// Non-matching headers absent.
+	if req.headers.Get("Content-Type") != "" {
+		t.Error("content-type: got present, want absent (not in allowed_headers)")
+	}
+	if req.headers.Get("Accept-Encoding") != "" {
+		t.Error("accept-encoding: got present, want absent (not in allowed_headers)")
+	}
+}
+
+// TestBuildAuthRequest_DisallowedHeaders_OverridesAllowed verifies that headers
+// matching cc.disallowedHeaders are removed even if they match cc.allowedHeaders
+// (disallowed_headers overrides allowed_headers per the proto doc).
+func TestBuildAuthRequest_DisallowedHeaders_OverridesAllowed(t *testing.T) {
+	// allowed_headers: all headers starting with x-
+	allowed, err := compileStringMatcherList(makeListStringMatcher(prefixPatternIC("x-")))
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(allowed): %v", err)
+	}
+	// disallowed_headers: x-secret-token (also starts with x-; overrides allowed)
+	disallowed, err := compileStringMatcherList(makeListStringMatcher(exactPatternIC("x-secret-token")))
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(disallowed): %v", err)
+	}
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+	}
+	req := buildAuthRequestForTest(t,
+		allowed,
+		disallowed,
+		hs,
+		map[string]string{
+			"x-custom":       "custom-val",
+			"x-secret-token": "super-secret", // in both allowed and disallowed → removed
+		},
+		"/api/resource",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	// x-custom passes (allowed, not disallowed).
+	if req.headers.Get("X-Custom") == "" {
+		t.Error("x-custom: got empty, want present")
+	}
+	// x-secret-token removed (disallowed overrides allowed).
+	if req.headers.Get("X-Secret-Token") != "" {
+		t.Errorf("x-secret-token: got %q, want absent (disallowed overrides allowed)",
+			req.headers.Get("X-Secret-Token"))
+	}
+}
+
+// TestBuildAuthRequest_DisallowedHeaders_NilAllowed verifies disallowed_headers
+// removes headers even when allowed_headers is nil (all-pass).
+func TestBuildAuthRequest_DisallowedHeaders_NilAllowed(t *testing.T) {
+	disallowed, err := compileStringMatcherList(makeListStringMatcher(exactPattern("x-internal")))
+	if err != nil {
+		t.Fatalf("compileStringMatcherList(disallowed): %v", err)
+	}
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+	}
+	req := buildAuthRequestForTest(t,
+		nil, // all-pass
+		disallowed,
+		hs,
+		map[string]string{
+			"authorization": "Bearer tok",
+			"x-internal":    "internal-value", // should be removed
+		},
+		"/api/resource",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	if req.headers.Get("Authorization") == "" {
+		t.Error("authorization: got empty, want present")
+	}
+	if req.headers.Get("X-Internal") != "" {
+		t.Errorf("x-internal: got %q, want absent", req.headers.Get("X-Internal"))
+	}
+}
+
+// TestBuildAuthRequest_HeadersToAdd_Appended verifies that
+// AuthorizationRequest.headers_to_add static headers are appended to the
+// filtered header set (and overwrite client headers with the same name per
+// the proto doc "Note that client request of the same key will be overridden").
+func TestBuildAuthRequest_HeadersToAdd_Appended(t *testing.T) {
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+		AuthorizationRequest: &ext_authzv3.AuthorizationRequest{
+			HeadersToAdd: []*corev3.HeaderValue{
+				{Key: "x-envoy-auth-source", Value: "envoy-go"},
+				{Key: "x-request-id", Value: "static-id"},
+			},
+		},
+	}
+	req := buildAuthRequestForTest(t,
+		nil, // all-pass
+		nil,
+		hs,
+		map[string]string{
+			"authorization": "Bearer tok",
+			"x-request-id":  "client-id", // will be overwritten by headers_to_add
+		},
+		"/api",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	if req.headers.Get("X-Envoy-Auth-Source") != "envoy-go" {
+		t.Errorf("x-envoy-auth-source: got %q, want %q",
+			req.headers.Get("X-Envoy-Auth-Source"), "envoy-go")
+	}
+	// x-request-id should be overwritten by headers_to_add.
+	if req.headers.Get("X-Request-Id") != "static-id" {
+		t.Errorf("x-request-id: got %q, want %q (headers_to_add overwrites client)",
+			req.headers.Get("X-Request-Id"), "static-id")
+	}
+}
+
+// TestBuildAuthRequest_DeprecatedAllowedHeaders_HonoredIfPresent verifies D6:
+// the deprecated AuthorizationRequest.allowed_headers (#1) is honored when
+// present (backward-compat, mirrors phase-17 amendment-4 "deprecated-but-honored"
+// disposition). When both the deprecated field AND the top-level
+// cc.allowedHeaders are nil, the deprecated field's matchers gate the headers.
+func TestBuildAuthRequest_DeprecatedAllowedHeaders_HonoredIfPresent(t *testing.T) {
+	// Only the deprecated field is set; top-level cc.allowedHeaders is nil.
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+		AuthorizationRequest: &ext_authzv3.AuthorizationRequest{
+			// Deprecated AllowedHeaders: only let "authorization" through.
+			AllowedHeaders: makeListStringMatcher(exactPattern("authorization")),
+		},
+	}
+	req := buildAuthRequestForTest(t,
+		nil, // cc.allowedHeaders nil — deprecated field should be the effective gate
+		nil,
+		hs,
+		map[string]string{
+			"authorization": "Bearer tok",
+			"x-custom":      "custom-val", // should be filtered by deprecated field
+		},
+		"/api",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	// authorization should pass (deprecated field allows it).
+	if req.headers.Get("Authorization") == "" {
+		t.Error("authorization: got empty, want present (deprecated allowed_headers)")
+	}
+	// x-custom should be filtered (not in deprecated allowed_headers).
+	if req.headers.Get("X-Custom") != "" {
+		t.Errorf("x-custom: got %q, want absent (deprecated allowed_headers filters it)",
+			req.headers.Get("X-Custom"))
+	}
+}
+
+// TestBuildAuthRequest_TopLevelAllowedHeadersTakesPrecedence verifies that the
+// top-level cc.allowedHeaders takes precedence when both it and the deprecated
+// AuthorizationRequest.allowed_headers are set. The top-level primary path wins.
+func TestBuildAuthRequest_TopLevelAllowedHeadersTakesPrecedence(t *testing.T) {
+	// top-level cc.allowedHeaders: only "authorization"
+	topLevel, err := compileStringMatcherList(makeListStringMatcher(exactPattern("authorization")))
+	if err != nil {
+		t.Fatalf("compileStringMatcherList: %v", err)
+	}
+	// deprecated field: only "x-custom" — should NOT take effect when top-level is set
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+		AuthorizationRequest: &ext_authzv3.AuthorizationRequest{
+			AllowedHeaders: makeListStringMatcher(exactPattern("x-custom")),
+		},
+	}
+	req := buildAuthRequestForTest(t,
+		topLevel, // top-level is set → deprecated field is NOT applied
+		nil,
+		hs,
+		map[string]string{
+			"authorization": "Bearer tok",
+			"x-custom":      "val",
+		},
+		"/api",
+	)
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	// authorization passes via top-level allowed_headers.
+	if req.headers.Get("Authorization") == "" {
+		t.Error("authorization: got empty, want present (top-level allows)")
+	}
+	// x-custom does NOT pass: top-level allowed_headers wins over deprecated field.
+	if req.headers.Get("X-Custom") != "" {
+		t.Errorf("x-custom: got %q, want absent (top-level wins over deprecated)",
+			req.headers.Get("X-Custom"))
+	}
+}
+
+// TestBuildAuthRequest_PathCarried verifies that the path is carried in the
+// authRequest (path_prefix prepending is done in check.go's closure, not here;
+// buildAuthRequest just stores the path as-is).
+func TestBuildAuthRequest_PathCarried(t *testing.T) {
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+	}
+	req := buildAuthRequestForTest(t, nil, nil, hs, nil, "/api/resource")
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	if req.path != "/api/resource" {
+		t.Errorf("path: got %q, want %q", req.path, "/api/resource")
+	}
+}
+
+// TestBuildAuthRequest_BodyIncluded verifies that a non-nil body is carried
+// in the authRequest.
+func TestBuildAuthRequest_BodyIncluded(t *testing.T) {
+	cc := &compiledConfig{}
+	f := &filter{state: &factoryState{listenerRC: cc}, activeRC: cc}
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: "http://auth:9191"},
+	}
+	body := []byte("request-body-data")
+	req := buildAuthRequest(f, hs, make(http.Header), body, "/api")
+	if req == nil {
+		t.Fatal("buildAuthRequest: got nil")
+	}
+	if string(req.body) != "request-body-data" {
+		t.Errorf("body: got %q, want %q", req.body, "request-body-data")
+	}
+}
+
+// -------------------------------------------------------------------------
+// Group 3 — validateMutationHeaders tests
+// -------------------------------------------------------------------------
+
+// TestValidateMutationHeaders_ValidHeaders verifies that well-formed header
+// name/value pairs pass validation.
+func TestValidateMutationHeaders_ValidHeaders(t *testing.T) {
+	hdrs := []headerKV{
+		{name: "x-auth-result", value: "allowed"},
+		{name: "x-custom-header", value: "some-value"},
+		{name: "content-type", value: "application/json"},
+	}
+	if err := validateMutationHeaders(hdrs); err != nil {
+		t.Errorf("validateMutationHeaders(valid): unexpected error: %v", err)
+	}
+}
+
+// TestValidateMutationHeaders_PseudoHeaderReject verifies that :-prefixed
+// pseudo-headers are rejected per D7 (mirrors phase-10 header_mutation discipline).
+func TestValidateMutationHeaders_PseudoHeaderReject(t *testing.T) {
+	pseudoHeaders := []string{":method", ":path", ":authority", ":scheme", ":status", ":anything"}
+	for _, name := range pseudoHeaders {
+		t.Run(name, func(t *testing.T) {
+			hdrs := []headerKV{{name: name, value: "value"}}
+			err := validateMutationHeaders(hdrs)
+			if err == nil {
+				t.Errorf("validateMutationHeaders(%q): want error (pseudo-header), got nil", name)
+			}
+		})
+	}
+}
+
+// TestValidateMutationHeaders_InvalidHeaderNameChars verifies that header names
+// with invalid characters (e.g., spaces, control chars) are rejected.
+func TestValidateMutationHeaders_InvalidHeaderNameChars(t *testing.T) {
+	invalidNames := []string{
+		"invalid name",    // space
+		"invalid\x00name", // NUL
+		"invalid\nname",   // newline
+		"invalid\rname",   // carriage return
+	}
+	for _, name := range invalidNames {
+		t.Run("name_"+strings.Map(func(r rune) rune {
+			if r < 0x20 {
+				return '_'
+			}
+			return r
+		}, name), func(t *testing.T) {
+			hdrs := []headerKV{{name: name, value: "value"}}
+			err := validateMutationHeaders(hdrs)
+			if err == nil {
+				t.Errorf("validateMutationHeaders(invalid name chars): want error for %q, got nil", name)
+			}
+		})
+	}
+}
+
+// TestValidateMutationHeaders_InvalidHeaderValueChars verifies that header values
+// with invalid characters (control chars except \t) are rejected.
+func TestValidateMutationHeaders_InvalidHeaderValueChars(t *testing.T) {
+	invalidValues := []string{
+		"invalid\x00value", // NUL
+		"invalid\nvalue",   // bare newline
+		"invalid\rvalue",   // bare carriage return
+	}
+	for _, value := range invalidValues {
+		t.Run("value_"+strings.Map(func(r rune) rune {
+			if r < 0x20 {
+				return '_'
+			}
+			return r
+		}, value), func(t *testing.T) {
+			hdrs := []headerKV{{name: "x-custom", value: value}}
+			err := validateMutationHeaders(hdrs)
+			if err == nil {
+				t.Errorf("validateMutationHeaders(invalid value chars): want error for value %q, got nil", value)
+			}
+		})
+	}
+}
+
+// TestValidateMutationHeaders_EmptySlice verifies that an empty (nil or zero-length)
+// slice passes validation without error.
+func TestValidateMutationHeaders_EmptySlice(t *testing.T) {
+	if err := validateMutationHeaders(nil); err != nil {
+		t.Errorf("validateMutationHeaders(nil): unexpected error: %v", err)
+	}
+	if err := validateMutationHeaders([]headerKV{}); err != nil {
+		t.Errorf("validateMutationHeaders(empty): unexpected error: %v", err)
 	}
 }
