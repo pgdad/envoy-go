@@ -228,8 +228,8 @@ type filter struct {
 	dcb   envoyhttp.DecoderFilterCallbacks
 
 	// Per-stream state cached at DecodeHeaders.
-	activeRC    *compiledConfig    // resolved listener-level config (always listenerRC at 18.1)
-	perRoute    *compiledPerRoute  // resolved per-route config; nil if no per-route TPFC
+	activeRC     *compiledConfig   // resolved listener-level config (always listenerRC at 18.1)
+	perRoute     *compiledPerRoute // resolved per-route config; nil if no per-route TPFC
 	awaitingBody bool              // true when body-buffering wait is in progress (ADR-0128)
 
 	// Per-request body accumulator (ADR-0128 decode-side body-buffering reuse;

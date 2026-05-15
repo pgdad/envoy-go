@@ -258,8 +258,9 @@ func stripPath(uri string) string {
 
 // joinPaths joins a path prefix and a path, avoiding double slashes.
 // E.g. joinPaths("/auth", "/api") → "/auth/api"
-//      joinPaths("", "/api") → "/api"
-//      joinPaths("/auth", "") → "/auth"
+//
+//	joinPaths("", "/api") → "/api"
+//	joinPaths("/auth", "") → "/auth"
 func joinPaths(prefix, path string) string {
 	if prefix == "" {
 		return path
