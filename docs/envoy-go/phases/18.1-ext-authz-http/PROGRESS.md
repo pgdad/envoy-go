@@ -793,7 +793,7 @@ Test count 103 → 104 (+1: the null-out test; the validate_mutations refactor i
 
 **Files changed:** `internal/filter/http/extauthz/extauthz.go` (modified — `filter.bodySettings *bufferSettings` field added; `effectiveWithRequestBody(pr *compiledPerRoute) *bufferSettings` helper added; `DecodeHeaders` body-buffering branch implemented: computes effective `withRequestBody` + sets `awaitingBody=true` + caches `bodySettings`; `DecodeData` body-accumulation + over-limit logic implemented per ADR-0128; `DecodeHeaders`/`DecodeData` doc-comments revised to be accurate), `internal/filter/http/extauthz/extauthz_test.go` (modified — file header comment updated to include Group 6; `fakeExtAuthzDCB` + `localReplyRecord6` + `newFakeExtAuthzDCB` helpers added; `newBodyBufferingFilter` helper added; 16 Group 6 test functions appended: 3 Group 6A DecodeHeaders, 5 Group 6B accumulation, 1 Group 6C over-limit, 1 Group 6C mid-stream, 1 Group 6C no-counter, 2 Group 6D allow-partial, 2 Group 6E pack_as_bytes, 2 Group 6F per-route override), `docs/envoy-go/DECISIONS.md` (ADR-0162 §Status updated from "Anticipated" to "Accepted"; **Lands-in** updated from hypothesis to confirmed "Task 6 of phase-18.1 PLAN"; §Decision 7-point body (i)–(vii) filled; §Consequences 6-bullet body filled)
 
-**Commit SHA:** TBD
+**Commit SHA:** `f27383f`
 
 **Notes:** Followed `superpowers:test-driven-development`. Group 6 tests written first (RED confirmed — 9 failing tests); production code authored in `extauthz.go`; then GREEN. Test count 104 → 120 (16 new `func Test` for Group 6). `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet` exit 0; `gofmt -l` empty. 48/48 packages pass.
 
