@@ -516,7 +516,7 @@ All 6 fixes: `go build` exit 0, `go vet` exit 0, `gofmt -l` empty, `go test -rac
 ## Task 4 — attributes.go AuthorizationRequest builder + request-side header filtering + Group 3 + ADR-0160 §Decision+§Consequences
 
 **Files changed:** `internal/filter/http/extauthz/attributes.go` (new, ~195 LoC), `internal/filter/http/extauthz/extauthz.go` (modified — placeholder `stringMatcherList` type replaced by comment cross-reference; `compileStringMatcherList` stub replaced by comment cross-reference; `buildCompiledConfig` step 6 updated to handle real `(sml, error)` return; `matcherv3` import removed), `internal/filter/http/extauthz/extauthz_test.go` (modified — Group 3 appended; `matcherv3` import added), `docs/envoy-go/DECISIONS.md` (ADR-0160 HTTP-mode §Decision+§Consequences filled)
-**Commit SHA:** TBD
+**Commit SHA:** `26e2e48`
 
 **Notes:** Followed `superpowers:test-driven-development`. Group 3 tests written first (RED confirmed — build failure on undefined `buildAuthRequest` + wrong arity on `compileStringMatcherList`). `attributes.go` authored; `buildCompiledConfig` and the `compileStringMatcherList` stub wired to the real implementation. Test count 52 → 83. `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet` exit 0; `gofmt -l` empty.
 
