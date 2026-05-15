@@ -1331,4 +1331,4 @@ $ gofmt -l internal/filter/http/extauthz/
 
 ### Task 8 commit SHA
 
-`<TBD — fill after commit>`
+`4b672ba`
