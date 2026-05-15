@@ -1522,3 +1522,107 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	3.371s
 ### Task 9 review-fix commit SHA
 
 `1203613`
+
+---
+
+## Task 10 — boot-registration + FuzzExtAuthzConfigParse 22nd fuzzer + test/helpers/extauthzhttp/ + fixture infrastructure
+
+**Files changed:**
+- Modified: `cmd/envoy-go/main.go` (register `extauthz.TypeURL → extauthz.New` + import; alphabetical between `envoygotest` and `fault`)
+- Created: `internal/filter/http/extauthz/fuzz_test.go` (22nd fuzzer `FuzzExtAuthzConfigParse`; 21 corpus seeds)
+- Created: `test/helpers/extauthzhttp/doc.go` (~25 LoC package doc)
+- Created: `test/helpers/extauthzhttp/extauthzhttp.go` (~155 LoC in-process scriptable HTTP auth server)
+- Created: `test/helpers/extauthzhttp/extauthzhttp_test.go` (~200 LoC; 6 unit tests written FIRST per TDD)
+- Modified: `test/differential/fixture/fixture.go` (`HTTPExtAuthzHTTP BackendKind = 17`)
+- Modified: `test/differential/runner_test.go` (switch-case for `HTTPExtAuthzHTTP`)
+- Modified: `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (this entry)
+
+**Blank-import decision (Task 10 judgment call):** The blank import `_ "github.com/esalaine/envoy-go/test/fixtures/0020-http-ext-authz-http/inputs"` is DEFERRED to Task 11. The `inputs` package does not exist yet (Task 11 creates `test/fixtures/0020-http-ext-authz-http/inputs/driver.go`). Landing the blank import now would break `go build`. The `BackendKind = 17` enum value + the switch-case skeleton in `runner_test.go` land now (as the phase-17 Task 10 precedent did for `HTTPJwtAuthn`). The switch-case comment documents this explicitly.
+
+**No ADR landed in Task 10** (ADR-0044 ADR-on-impl convention; boot-registration is covered by existing ADR-0072 + ADR-0156 §Decision already landed at Task 2).
+
+**Outputs:**
+
+### go build ./...
+
+```
+$ go build ./...
+(exit 0 — no output)
+```
+
+### go vet ./...
+
+```
+$ go vet ./...
+(exit 0 — no output)
+```
+
+### gofmt -l
+
+```
+$ gofmt -l ./cmd/envoy-go/main.go ./internal/filter/http/extauthz/fuzz_test.go ./test/helpers/extauthzhttp/ ./test/differential/
+(empty — all files formatted)
+```
+
+### grep -cE 'httpReg.Register' cmd/envoy-go/main.go
+
+```
+$ grep -cE 'httpReg\.Register' cmd/envoy-go/main.go
+13
+```
+
+(Was 12 before Task 10; now 13 per SPEC §1 item 2 + ADR-0072.)
+
+### go test -race -count=1 ./test/helpers/extauthzhttp/...
+
+```
+$ go test -race -count=1 ./test/helpers/extauthzhttp/...
+ok  	github.com/esalaine/envoy-go/test/helpers/extauthzhttp	6.017s
+```
+
+6 tests: `TestNew_StartsServerOnConfiguredAddr`, `TestServer_FixedScript_ReturnsStatusBodyHeaders`, `TestServer_PathMethodMap_Dispatch`, `TestServer_BodyInspectingScript`, `TestServer_Stop_ClosesListener`, `TestServer_Stop_Idempotent`, `TestServer_ConcurrentClient_NoRace`. All PASS, race-clean.
+
+### FuzzExtAuthzConfigParse 30s run
+
+```
+$ go test -run '^$' -fuzz 'FuzzExtAuthzConfigParse' -fuzztime 30s ./internal/filter/http/extauthz/
+fuzz: elapsed: 0s, gathering baseline coverage: 0/22 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 22/22 completed, now fuzzing with 32 workers
+fuzz: elapsed: 3s, execs: 156654 (52203/sec), new interesting: 122 (total: 144)
+fuzz: elapsed: 6s, execs: 566773 (136720/sec), new interesting: 206 (total: 228)
+fuzz: elapsed: 9s, execs: 975578 (136253/sec), new interesting: 240 (total: 262)
+fuzz: elapsed: 12s, execs: 1482873 (169125/sec), new interesting: 289 (total: 311)
+fuzz: elapsed: 15s, execs: 1836976 (118037/sec), new interesting: 310 (total: 332)
+fuzz: elapsed: 18s, execs: 2064550 (75848/sec), new interesting: 337 (total: 359)
+fuzz: elapsed: 21s, execs: 2204133 (46538/sec), new interesting: 342 (total: 364)
+fuzz: elapsed: 24s, execs: 2665910 (153792/sec), new interesting: 358 (total: 380)
+fuzz: elapsed: 27s, execs: 3098453 (144287/sec), new interesting: 401 (total: 423)
+fuzz: elapsed: 30s, execs: 3729963 (210536/sec), new interesting: 406 (total: 428)
+fuzz: elapsed: 31s, execs: 3729963 (0/sec), new interesting: 406 (total: 428)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	31.090s
+```
+
+22 corpus seeds; 3.7M+ executions in 30s; no crashes, no panics, no (nil, nil) violations. PASS.
+
+### Total fuzzer count
+
+```
+$ grep -rE '^func Fuzz' --include='*.go' . | wc -l
+22
+```
+
+(Was 21 after phase 17; now 22 after Task 10.)
+
+### go test -count=1 ./test/differential/ (fixtures 0000-0019 regression)
+
+```
+$ go test -count=1 ./test/differential/ -run 'TestDifferential' -timeout 120s
+ok  	github.com/esalaine/envoy-go/test/differential	56.415s
+```
+
+All 20 pre-existing fixtures (0000–0019) PASS. No regression. Fixture 0020 is skipped (`no driver registered for fixture "0020-http-ext-authz-http"`) since its blank import lands at Task 11.
+
+### Task 10 commit SHA
+
+TBD (filled post-squash)
