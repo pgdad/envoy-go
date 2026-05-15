@@ -913,3 +913,28 @@ $ grep -nE '^## ADR-0162' docs/envoy-go/DECISIONS.md
 ```
 
 1 match (1 required). §Decision (7-point body (i)–(vii)) + §Consequences (6 bullets) filled. Status: Accepted; Date: 2026-05-14; Lands-in: Task 6 of phase-18.1 PLAN.
+
+### Task 6 review-fix
+
+Code-quality review returned "Approve with minor fixes" (2 Important doc-only + 2 Minor). All 4 fixed in a follow-up commit:
+
+1. **(Important) ADR-0162 internal consumer-count inconsistency.** The §Doctrine line said "SECOND consumer of the phase-13 ADR-0128 decode-side body-buffering primitive (after phase-15 bandwidth_limit)" while §Consequences first bullet said "THIRD ADR-0128 consumer (after phase-13 buffer filter + phase-15 bandwidth_limit)". The Consequences bullet is correct (buffer #1, bandwidth_limit #2, ext_authz #3). Doctrine line in `docs/envoy-go/DECISIONS.md` (ADR-0162) updated to "THIRD consumer of the phase-13 ADR-0128 decode-side body-buffering primitive (after phase-13 buffer filter + phase-15 bandwidth_limit)" — now consistent with the Consequences bullet.
+2. **(Important) `effectiveWithRequestBody` missing precondition comment.** When `pr.disabled=true` AND `pr.checkSettings=nil`, `effectiveWithRequestBody` falls through and returns the listener-level `withRequestBody` — but `pr.disabled=true` should short-circuit body buffering too. In Task 6's intermediate state this isn't a production bug because Task 9's disabled short-circuit fires before this helper is called, but the implicit precondition wasn't documented. Doc-comment in `internal/filter/http/extauthz/extauthz.go` extended to state the precondition explicitly: "Precondition: caller has already short-circuited on `pr.disabled=true` (per SPEC §6.3 step 2 — Task 9 wires this). [...] The implicit contract is: callers MUST NOT invoke this helper when `pr.disabled=true`."
+3. **(Minor) Stale `Skeleton` test names + comments renamed.** `TestDecodeHeadersSkeleton_ReturnsHeaderContinue` → `TestDecodeHeaders_EndStreamNoBody_Continue` and `TestDecodeDataSkeleton_Passthrough` → `TestDecodeData_AwaitingBodyFalse_Passthrough` in `internal/filter/http/extauthz/extauthz_test.go`. The implementation now has real body-buffering logic; the "Skeleton" / "pass-through placeholder" comments were misleading. Renamed both tests + rewrote the comments to accurately describe what they assert today (DecodeHeaders endStream=true no-body returns HeaderContinue; DecodeData with `awaitingBody=false` passes through). No behavior change.
+4. **(Minor) Missing test added: allow_partial=true + mid-stream truncation + subsequent chunk.** `TestDecodeData_OverLimit_AllowPartialTrue_MultiChunk` covered chunk 1 (within) + chunk 2 (over-limit, `endStream=true`). It did NOT cover chunk 1 (within) + chunk 2 (over-limit, `endStream=false`) + chunk 3 (`endStream=false`, still over-limit — truncation repeats idempotently) + chunk 4 (`endStream=true`, terminal park). Added `TestDecodeData_OverLimit_AllowPartialTrue_MidStreamTruncationThenChunk` (in `extauthz_test.go`) covering exactly this 4-chunk scenario: chunk 1 = "abc" (within, `DataContinue`); chunk 2 = "defgh" (over-limit, non-terminal, body truncated to maxBytes=5 = "abcde", `DataContinue`); chunk 3 = "ijk" (still over-limit, non-terminal, truncation idempotent — body unchanged at "abcde", `DataContinue`); chunk 4 = "lm" (terminal, over-limit, `DataStopIterationAndBuffer`). Asserts body length == `maxRequestBytes` throughout post-truncation chunks AND content is the unchanged "abcde" prefix.
+
+Test count 120 → 121 (+1: the mid-stream truncation test; the 2 rename refactors are in-place). `go build` / `go vet` / `gofmt -l` (empty) / `go test -race -count=1 ./internal/filter/http/extauthz/...` all green.
+
+```
+$ go build ./internal/filter/http/extauthz/...
+[no output]
+
+$ go vet ./internal/filter/http/extauthz/...
+[no output]
+
+$ gofmt -l ./internal/filter/http/extauthz/
+[no output — empty]
+
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.075s
+```

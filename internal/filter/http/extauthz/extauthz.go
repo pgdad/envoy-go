@@ -664,6 +664,14 @@ func applyUpstreamMutations(headers http.Header, disp checkDisposition) {
 //  3. Otherwise → use listener-level cc.withRequestBody (may be nil = OFF).
 //
 // Called once per stream from DecodeHeaders; result cached on f.bodySettings.
+//
+// Precondition: caller has already short-circuited on pr.disabled=true
+// (per SPEC §6.3 step 2 — Task 9 wires this). When pr.disabled=true and
+// pr.checkSettings=nil, this helper would fall through to the listener-level
+// withRequestBody — but a disabled per-route entry must skip body buffering
+// entirely. Task 9's DecodeHeaders short-circuit fires before this helper is
+// called, so the implicit contract is: callers MUST NOT invoke this helper
+// when pr.disabled=true.
 func (f *filter) effectiveWithRequestBody(pr *compiledPerRoute) *bufferSettings {
 	if pr != nil && pr.checkSettings != nil {
 		if pr.checkSettings.disableRequestBodyBuffering {

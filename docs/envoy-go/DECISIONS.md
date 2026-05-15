@@ -8576,7 +8576,7 @@ The deny-path wire shape is empirically RATIFIED at the parent SPEC §5.P11: bod
 
 **Status:** Accepted
 **Date:** 2026-05-14
-**Doctrine:** Phase 18.1 §9 family-row. ADR-0044 ADR-on-impl convention. The SECOND consumer of the phase-13 ADR-0128 decode-side body-buffering primitive (after phase-15 bandwidth_limit) — and the FIRST to consume it for *outbound transmission* of the body rather than throttling/forwarding.
+**Doctrine:** Phase 18.1 §9 family-row. ADR-0044 ADR-on-impl convention. The THIRD consumer of the phase-13 ADR-0128 decode-side body-buffering primitive (after phase-13 buffer filter + phase-15 bandwidth_limit) — and the FIRST to consume it for *outbound transmission* of the body rather than throttling/forwarding.
 **Lands-in:** Task 6 of phase-18.1 PLAN.
 
 ### Context

@@ -545,12 +545,13 @@ func TestCompiledConfig_WithRequestBodyConsumed(t *testing.T) {
 	}
 }
 
-// TestDecodeHeadersSkeleton_ReturnsHeaderContinue verifies the DecodeHeaders
-// skeleton returns HeaderContinue (the pass-through placeholder until Task 9
-// wires the real dispatch body).
-func TestDecodeHeadersSkeleton_ReturnsHeaderContinue(t *testing.T) {
-	// Build a minimal factoryState with a compiledConfig (no stats needed for
-	// skeleton test).
+// TestDecodeHeaders_EndStreamNoBody_Continue verifies the DecodeHeaders
+// minimal-path: when there is no listener-level with_request_body AND
+// endStream=true, DecodeHeaders returns HeaderContinue (no body-buffering
+// branch fires; Task 9's outbound-check dispatch is not yet wired).
+func TestDecodeHeaders_EndStreamNoBody_Continue(t *testing.T) {
+	// Build a minimal factoryState with a compiledConfig (no stats needed; no
+	// with_request_body → body-buffering branch is skipped).
 	cc := &compiledConfig{
 		statusOnError: 403,
 	}
@@ -560,16 +561,18 @@ func TestDecodeHeadersSkeleton_ReturnsHeaderContinue(t *testing.T) {
 	headers := make(map[string][]string)
 	result := f.DecodeHeaders(headers, true)
 	if result != envoyhttp.Continue {
-		t.Errorf("DecodeHeaders skeleton: got %v, want HeaderContinue", result)
+		t.Errorf("DecodeHeaders endStream=true no-body: got %v, want HeaderContinue", result)
 	}
 }
 
-// TestDecodeDataSkeleton_Passthrough verifies the DecodeData skeleton returns DataContinue.
-func TestDecodeDataSkeleton_Passthrough(t *testing.T) {
+// TestDecodeData_AwaitingBodyFalse_Passthrough verifies the DecodeData
+// pass-through path: when awaitingBody=false (body-buffering not active),
+// DecodeData returns DataContinue regardless of endStream value.
+func TestDecodeData_AwaitingBodyFalse_Passthrough(t *testing.T) {
 	f := &filter{}
 	result := f.DecodeData(nil, true)
 	if result != envoyhttp.DataContinue {
-		t.Errorf("DecodeData skeleton: got %v, want DataContinue", result)
+		t.Errorf("DecodeData awaitingBody=false: got %v, want DataContinue", result)
 	}
 }
 
@@ -3443,6 +3446,80 @@ func TestDecodeData_OverLimit_AllowPartialTrue_MultiChunk(t *testing.T) {
 	}
 	if string(f.body) != "abcde" {
 		t.Errorf("f.body: got %q, want %q (first %d bytes)", f.body, "abcde", maxBytes)
+	}
+}
+
+// TestDecodeData_OverLimit_AllowPartialTrue_MidStreamTruncationThenChunk verifies
+// truncation is idempotent across multiple over-limit chunks: chunk 1 within
+// limit, chunk 2 over-limit mid-stream (endStream=false → DataContinue, body
+// truncated), chunk 3 still arrives non-terminal and over-limit (truncation
+// repeats idempotently, body length unchanged), final chunk lands the terminal
+// DataStopIterationAndBuffer. Body length must equal maxRequestBytes throughout
+// the post-truncation chunks.
+func TestDecodeData_OverLimit_AllowPartialTrue_MidStreamTruncationThenChunk(t *testing.T) {
+	const maxBytes uint32 = 5
+	f, dcb := newBodyBufferingFilter(t, maxBytes, true /* allow_partial=true */, false, nil)
+	f.awaitingBody = true
+
+	// Chunk 1: "abc" (3 bytes, within limit), endStream=false.
+	s1 := f.DecodeData([]byte("abc"), false)
+	if s1 != envoyhttp.DataContinue {
+		t.Errorf("chunk1 (within-limit, non-terminal): want DataContinue, got %v", s1)
+	}
+	if string(f.body) != "abc" {
+		t.Errorf("chunk1: f.body = %q, want %q", f.body, "abc")
+	}
+
+	// Chunk 2: "defgh" (5 more bytes → total 8 > maxBytes=5), endStream=false.
+	// allow_partial=true + over-limit mid-stream → truncate to maxBytes; status
+	// is DataContinue (NOT terminal; not the Task 9 park seam).
+	s2 := f.DecodeData([]byte("defgh"), false)
+	if s2 != envoyhttp.DataContinue {
+		t.Errorf("chunk2 (over-limit, non-terminal, allow_partial): want DataContinue, got %v", s2)
+	}
+	if dcb.localReplyCount != 0 {
+		t.Errorf("chunk2: SendLocalReply count = %d, want 0 (allow_partial=true must NOT fire 413)", dcb.localReplyCount)
+	}
+	if uint32(len(f.body)) != maxBytes {
+		t.Errorf("chunk2: f.body length = %d, want %d (truncated to maxRequestBytes)", len(f.body), maxBytes)
+	}
+	if string(f.body) != "abcde" {
+		t.Errorf("chunk2: f.body = %q, want %q (first %d bytes of accumulated)", f.body, "abcde", maxBytes)
+	}
+
+	// Chunk 3: "ijk" (3 more bytes; still over-limit because f.body is already at
+	// maxBytes), endStream=false. Truncation repeats idempotently: f.body is
+	// re-truncated to the same maxBytes (the first 5 bytes of "abcde"+"ijk" =
+	// "abcdeijk" → "abcde"). Status remains DataContinue.
+	s3 := f.DecodeData([]byte("ijk"), false)
+	if s3 != envoyhttp.DataContinue {
+		t.Errorf("chunk3 (still-over-limit, non-terminal): want DataContinue, got %v", s3)
+	}
+	if dcb.localReplyCount != 0 {
+		t.Errorf("chunk3: SendLocalReply count = %d, want 0", dcb.localReplyCount)
+	}
+	if uint32(len(f.body)) != maxBytes {
+		t.Errorf("chunk3: f.body length = %d, want %d (truncation idempotent)", len(f.body), maxBytes)
+	}
+	if string(f.body) != "abcde" {
+		t.Errorf("chunk3: f.body = %q, want %q (idempotent: prefix unchanged)", f.body, "abcde")
+	}
+
+	// Chunk 4: "lm" (2 more bytes), endStream=true. Terminal over-limit chunk
+	// must return DataStopIterationAndBuffer (the Task 9 park seam) while the
+	// body remains truncated at maxBytes.
+	s4 := f.DecodeData([]byte("lm"), true /* endStream */)
+	if s4 != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("chunk4 (terminal, over-limit, allow_partial): want DataStopIterationAndBuffer, got %v", s4)
+	}
+	if dcb.localReplyCount != 0 {
+		t.Errorf("chunk4: SendLocalReply count = %d, want 0", dcb.localReplyCount)
+	}
+	if uint32(len(f.body)) != maxBytes {
+		t.Errorf("chunk4: f.body length = %d, want %d (still truncated to maxRequestBytes)", len(f.body), maxBytes)
+	}
+	if string(f.body) != "abcde" {
+		t.Errorf("chunk4: f.body = %q, want %q (final truncated prefix)", f.body, "abcde")
 	}
 }
 
