@@ -42,6 +42,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0017-http-bandwidth-limit/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0018-http-rbac/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0019-http-jwt-authn/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0020-http-ext-authz-http/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -423,11 +424,8 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// Plaintext-only per SPEC §7.2 + D12 (no TLS in phase 18.1).
 			// Because the echo backend runs as a subprocess, the runner's
 			// in-process accept counter is NOT incremented.
-			// NOTE: The blank-import for the fixture's inputs package
-			// (test/fixtures/0020-http-ext-authz-http/inputs) is DEFERRED to
-			// Task 11 when the inputs package is authored — at Task 10 the
-			// switch-case skeleton lands ahead of the rollout so the
-			// BackendKind dispatch is complete. Documented in PROGRESS.md.
+			// The blank-import for test/fixtures/0020-http-ext-authz-http/inputs
+			// lands at Task 11 (the inputs package is now authored).
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)

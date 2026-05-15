@@ -1626,3 +1626,99 @@ All 20 pre-existing fixtures (0000–0019) PASS. No regression. Fixture 0020 is 
 ### Task 10 commit SHA
 
 TBD (filled post-squash)
+
+---
+
+## Task 11: fixture 0020 driver.go — 7-scenario differential driver
+
+**Status:** DONE
+
+**What landed:**
+
+- Created `test/fixtures/0020-http-ext-authz-http/inputs/driver.go` — the 7-scenario differential driver per SPEC §7.1. ~430 LoC.
+- Modified `test/differential/runner_test.go` — landed the deferred blank import `_ "github.com/esalaine/envoy-go/test/fixtures/0020-http-ext-authz-http/inputs"` (deferred from Task 10 per the Task 10 PROGRESS entry; now the `inputs` package compiles so the import is safe).
+- Modified `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (this entry).
+
+**Implemented (SPEC §7.1 7-scenario matrix):**
+
+| # | Scenario | Auth-server script | Counter delta |
+|---|---|---|---|
+| 1 | HTTP allow | FixedScript 200 + `x-authz-result: allowed` | `ok=+1` |
+| 2 | HTTP deny | FixedScript 403 + body "access denied" + `x-authz-denied: true` | `denied=+1` |
+| 3 | error → `status_on_error` | server stopped before request; `failure_mode_allow:false`; `status_on_error:503` | `error=+1` |
+| 4 | `failure_mode_allow` | server stopped before request; `failure_mode_allow:true`+`failure_mode_allow_header_add:true` | `error=+1`, `failure_mode_allowed=+1` |
+| 5 | `with_request_body` | InspectScript — allows if body contains "hello"; POST body "hello world" | `ok=+1` |
+| 6 | per-route `disabled` | no auth call (`disabled:true`); server live but irrelevant | NO counter increments |
+| 7 | per-route `check_settings` | FixedScript 200 allow; `disable_request_body_buffering:true` per-route | `ok=+1` |
+
+**Topology decision for scenarios 3+4 (documented for Task 12):**
+
+Single auth server port, restarted per-scenario-group:
+- Scenarios 1+2: server running with appropriate FixedScript.
+- Scenarios 3+4: `d.stopAuthServer()` called before the request — server stopped, conn refused → error disposition.
+- Scenarios 5+7: server restarted on the same port with fresh Script.
+- Scenario 6: server live but irrelevant (no auth call made).
+
+Task 12 MUST wire `envoy.yaml` + `envoy-go.yaml` with a SINGLE `c_authz` cluster pointing at `{{.AuthHost}}:{{.AuthPort}}`. Both failure-mode scenarios (3+4) share the same listener but require DIFFERENT ext_authz configs (`failure_mode_allow:false` vs `true`). Task 12 settles the bootstrap topology: either two separate listeners (l_test_a for S1/2/5/6/7 + l_test_b for S3/4) OR per-route ext_authz overrides. The driver issues requests to discriminated paths (`/scenarios/3-error`, `/scenarios/4-failure-allow`) to allow per-route routing in either topology.
+
+**Blank-import landing:**
+
+`_ "github.com/esalaine/envoy-go/test/fixtures/0020-http-ext-authz-http/inputs"` landed in `test/differential/runner_test.go` immediately (Step 3 recommendation taken — the `inputs` package compiles). The Task 10 deferral note in the switch-case comment was updated to reflect the landing.
+
+**AssertStats expectations (PLAN-time hypotheses; finalized at Task 13):**
+
+| Counter suffix | Expected after 7-scenario run |
+|---|---|
+| `ok` | 3 (scenarios 1, 5, 7) |
+| `denied` | 1 (scenario 2) |
+| `error` | 2 (scenarios 3, 4) |
+| `failure_mode_allowed` | 1 (scenario 4) |
+| `invalid` | 0 |
+| `disabled` | NOT asserted (STRUCTURALLY UNREACHABLE under MVP) |
+
+**Files changed:**
+
+- Created: `test/fixtures/0020-http-ext-authz-http/inputs/driver.go` (~430 LoC; 7-scenario driver + auth-server lifecycle + counter-delta helpers)
+- Modified: `test/differential/runner_test.go` (blank-import landed; switch-case comment updated)
+- Modified: `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (this entry)
+
+**Outputs:**
+
+### go build ./test/fixtures/0020-http-ext-authz-http/...
+
+```
+$ go build ./test/fixtures/0020-http-ext-authz-http/...
+(exit 0 — no output)
+```
+
+### go vet ./test/fixtures/0020-http-ext-authz-http/...
+
+```
+$ go vet ./test/fixtures/0020-http-ext-authz-http/...
+(exit 0 — no output)
+```
+
+### gofmt -l ./test/fixtures/0020-http-ext-authz-http/
+
+```
+$ gofmt -l ./test/fixtures/0020-http-ext-authz-http/
+(empty — all files formatted)
+```
+
+### go build ./... (with blank import landed)
+
+```
+$ go build ./...
+(exit 0 — no output)
+```
+
+### go vet ./...
+
+```
+$ go vet ./...
+(exit 0 — no output)
+```
+
+### Task 11 commit SHA
+
+TBD (filled post-squash)
