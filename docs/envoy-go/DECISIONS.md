@@ -8621,10 +8621,10 @@ The body-buffering interaction makes `DecodeHeaders` return `HeaderStopIteration
 
 ## ADR-0163: Per-route 5th-canonical REUSE classification (explicit no-new-canonical decision; **NO ADR-0125 amendment paragraph** — the FIRST §9 family-row since phase 13 to REUSE an existing ADR-0125 canonical rather than extend the roster) + SHARED-stats discipline + the `CheckSettings` narrower-override surface + the 6-counter stat surface (`ok`/`denied`/`error`/`disabled`/`failure_mode_allowed`/`invalid`; HCM-rooted SN2-reuse `http.<HCM_stat_prefix>.ext_authz.*`; RATIFIED-PENDING-IMPL-TIME per phase-16 §10 lesson (c)) + the PGV wrinkles (`disabled` `const: true`; `override` oneof PGV-required)
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL per ADR-0044 ADR-on-impl convention.
+**Status:** Accepted
 **Date:** 2026-05-14
 **Doctrine:** Phase 18.1 §9 family-row. ADR-0044 ADR-on-impl convention. The FIRST §9 row to REUSE an ADR-0125 canonical — ADR-0125's canonical-pattern roster does NOT grow in phase 18 (BRAINSTORM §11 lesson (d) inverse-confirmation).
-**Lands-in:** Task 7 (hypothesis) of phase-18.1 PLAN.
+**Lands-in:** Task 7 of phase-18.1 PLAN.
 
 ### Context
 
@@ -8638,11 +8638,31 @@ The parent SPEC §5.P2 RATIFIED the `ExtAuthzPerRoute` shape: one PGV-required o
 
 ### Decision
 
-LANDS AT Task 7 (hypothesis) of phase-18.1 PLAN per ADR-0044 ADR-on-impl convention. The §Decision body will codify: the explicit 5th-canonical-REUSE classification + the explicit NO-ADR-0125-amendment decision; the `parsePerRoute` PGV-mirror (`disabled: false` PARSE-REJECT, empty-`override` PARSE-REJECT); the `CheckSettings` narrower-override merge; the SHARED-stats discipline (no per-route `*filterStats`); the 6-counter `filterStats` + the SN2-reuse namespace; the `disabled`-structurally-unreachable disposition.
+Phase 18 ext_authz lands the **5th-canonical REUSE** per ADR-0125 — the FIRST §9 family-row since phase 13 (buffer) to REUSE an existing ADR-0125 canonical rather than extend the roster. **NO ADR-0125 §(xiv) amendment paragraph is introduced.** The absence of §(xiv) is itself the recorded decision: `ExtAuthzPerRoute`'s structure (a PGV-required `override` oneof with a `disabled` bool arm + a `*CheckSettings` narrower-sub-message arm) is a textbook instance of the 5th canonical already codified at ADR-0125 §(ix) for phase-13 buffer + phase-14 compressor.
+
+**(i) `parsePerRoute` PGV-mirror:** Two envoy-go-strict PGV-mirror checks at parse time: (a) the `override` oneof is PGV-required — an empty `ExtAuthzPerRoute` (override not set) PARSE-REJECTs with `"ext_authz: per-route: override oneof is required"`; (b) the `disabled` arm carries PGV `const: true` — `disabled: false` PARSE-REJECTs with `"ext_authz: per-route: disabled must be true (PGV const:true violation; disabled:false is not meaningful)"`. These wrinkles vs the buffer/compressor 5th canonical are minor (buffer's `BufferPerRoute` has the same disabled-bool-in-required-oneof structure per the proto bindings); they do NOT constitute a new canonical.
+
+**(ii) `check_settings` arm — `CheckSettings` narrower-override merge:** The `check_settings` arm carries three fields: `context_extensions` (`map[string]string`), `disable_request_body_buffering` (bool), and `with_request_body` (`*BufferSettings`). `disable_request_body_buffering` and `with_request_body` are mutually exclusive (XOR) — setting both is a PARSE-REJECT. These are compiled into `compiledCheckSettings` at `parsePerRoute` time and stored on `compiledPerRoute.checkSettings`.
+
+**(iii) `context_extensions` — parsed, no HTTP-mode effect in 18.1:** Per the proto doc-note, `context_extensions` is "only applied to a filter configured with a `grpc_service`". In 18.1 HTTP-mode, `context_extensions` PARSES and the map is stored in `compiledCheckSettings.contextExtensions` but has NO HTTP-mode effect. 18.2 consumes it for the gRPC `AttributeContext.context_extensions`. This is the SPEC §8 item 8 documented no-op — parsing is correct for forward-compat; silence in HTTP-mode is the expected behavior.
+
+**(iv) `effectiveWithRequestBody` 3-tier resolution:** The per-stream body-buffering decision follows the most-specific-wins hierarchy (SPEC §6.3 step 3 + ADR-0162 + ADR-0163): (1) per-route `check_settings.disable_request_body_buffering=true` → returns `nil` (body buffering OFF); (2) per-route `check_settings.with_request_body` is set → returns the per-route `*bufferSettings` override; (3) otherwise → returns the listener-level `cc.withRequestBody` (may be nil = OFF).
+
+**(v) SHARED-stats discipline:** The per-route override adjusts `context_extensions`/buffering but still calls the same auth service — it spawns no new stateful policy-evaluation surface. The `compiledPerRoute` carries NO `*filterStats`. The `factoryState.resolvePerRouteConfig` wires `fresh.cc = s.listenerRC` (SHARED-stats: one `filterStats` per listener config; all per-route resolutions share it). MIRRORS phase-12/13/14/17 SHARED-stats discipline; DIVERGES from phase-11/15/16 INDEPENDENT-stats (which had per-route stat scopes because they owned stateful policy-evaluation resources). **NO `hcmStatPrefix` on `factoryState`** (SIMPLIFIED relative to phase-11/15/16 which carried `hcmStatPrefix` for per-route counter registration).
+
+**(vi) `sync.Map` lazy-cache identity (ADR-0117 + ADR-0125 §(v) 5th-canonical resolution):** `factoryState.perRoute` is a `sync.Map` keyed by `*ext_authzv3.ExtAuthzPerRoute` pointer-identity. `resolvePerRouteConfig` uses `LoadOrStore` to ensure exactly ONE `*compiledPerRoute` is stored per proto pointer, even under concurrent access. Type-assertion failure (wrong proto.Message type) returns the listener-level fallback without caching. Parse errors return the listener-level fallback without caching (mirrors the phase-16 rbac pattern — error sentinels must not be cached or they make the parse retry impossible on config-reload).
+
+**(vii) The 6-counter stat surface + SN2-reuse namespace:** `ok`, `denied`, `error`, `disabled`, `failure_mode_allowed`, `invalid` — all counters, all registered unconditionally at `New()` time, all under `http.<HCM_stat_prefix>.ext_authz.*` (SN2-reuse — the existing HCM-stat-prefix Prometheus tag-extractor handles this verbatim; NO new SN-flattening rule). The `disabled` counter is STRUCTURALLY UNREACHABLE under MVP (increments only via the deferred runtime `filter_enabled` gate — parent SPEC §5.P12 + §6 amendment 7). Stat-table 71 → 77 names. **The §18.P6 (6-counter stat surface) + §18.P7 (SN2-reuse Prometheus tag-extractor) RATIFIED-PENDING-IMPL-TIME closures land at Task 8** via the reference Envoy v1.37.2 fixture-harness empirical scrape (D8 planner-time disposition). ADR-0163 §Decision notes the closure-at-Task-8 disposition; if the Task 8 scrape diverges from the 6-counter hypothesis, this §Decision is amended in-place at Task 8 per ADR-0044.
+
+**(viii) NO ADR-0125 §(xiv) amendment:** ADR-0125's canonical-pattern roster stays at 8 entries after phase 18. The `grep -nE '\(xiv\)' docs/envoy-go/DECISIONS.md` command returns 2 matches, but both are explanatory text within ADR-0163 §Context describing the ABSENCE of §(xiv) — confirmed by `grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md` returning 0 (no actual amendment paragraph).
 
 ### Consequences
 
-LANDS AT phase-18.1 IMPL per ADR-0044. Records: ADR-0125's roster staying at 8 (NO §(xiv) growth); the 5th-canonical-REUSE as a notable data point (the roster does not grow monotonically per phase); the stat-table 71 → 77; the §18.P6/§18.P7 RATIFIED-PENDING closures at the 18.1 stat-surface task.
+- **ADR-0125's canonical-pattern roster stays at 8** — the 5th-canonical REUSE breaks the phase-13/14/15/16/17 per-phase-roster-growth streak; the roster does NOT grow monotonically per phase.
+- **SHARED-stats discipline:** All 6 ext_authz counters (`ok`/`denied`/`error`/`disabled`/`failure_mode_allowed`/`invalid`) live at the listener-level stat scope. Per-route-active routes increment the listener-level counters. The `disabled` counter publishes 0 for the listener's lifetime under MVP.
+- **`context_extensions` HTTP-mode no-op:** Operators who set `context_extensions` in a `check_settings` per-route config in HTTP-mode see no effect in 18.1. 18.2 activates this field for the gRPC `AttributeContext`. The parse-and-store behavior (no HTTP-mode effect, no error) is the intended forward-compat posture.
+- **Stat-table extends from 71 to 77 names** (BEHAVIOR_CONTRACT §13.2 + Task 14 6-edit bundle). The 6 new counters are listed alphabetically in the stat-name mapping under `http.<HCM_stat_prefix>.ext_authz.*`.
+- **§18.P6 + §18.P7 RATIFIED-PENDING closures at Task 8.** If the Task 8 empirical scrape confirms the 6-counter / SN2-reuse hypothesis, these pins close as RATIFIED. If it diverges, this ADR is amended in-place and PROGRESS.md records the deviation.
 
 ---
 

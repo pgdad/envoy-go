@@ -938,3 +938,141 @@ $ gofmt -l ./internal/filter/http/extauthz/
 $ go test -race -count=1 ./internal/filter/http/extauthz/...
 ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.075s
 ```
+
+## Task 7 — Per-route 5th-canonical REUSE + SHARED-stats + Group 7 finalization [ADR-0163]
+
+**Files changed:**
+- `internal/filter/http/extauthz/extauthz_test.go` (Group 7 extended: 8 new tests)
+- `docs/envoy-go/DECISIONS.md` (ADR-0163 §Decision + §Consequences filled; Status → Accepted; Lands-in → Task 7 of phase-18.1 PLAN)
+- `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (this entry)
+
+**Commit SHA:** TBD (SHA-fill follow-up per established convention)
+
+**What was implemented vs what was already done:**
+
+Task 2 delivered a COMPLETE skeleton of `parsePerRoute`, `resolvePerRouteConfig`, `compiledCheckSettings`, and `compiledPerRoute` — all logic was already wired including the XOR validation, the disabled-arm PGV-mirror, the SHARED-stats cc-wiring (`fresh.cc = s.listenerRC`), and the `sync.Map` LoadOrStore lazy-cache. Task 6 landed `effectiveWithRequestBody` reading `pr.checkSettings.disableRequestBodyBuffering` and `pr.checkSettings.withRequestBody`. Task 7's production-code contribution is therefore **zero new production lines** — finalization work confirmed the skeleton was complete.
+
+**Task 7 added 8 new Group 7 tests** covering the cases the PLAN specified:
+
+1. `TestResolvePerRouteConfig_SharedStats` — SHARED-stats discipline: `result.cc == listenerRC` pointer assertion for check_settings arm.
+2. `TestResolvePerRouteConfig_DisabledSharedStats` — SHARED-stats discipline: `result.cc == listenerRC` pointer assertion for disabled arm.
+3. `TestParsePerRoute_ContextExtensions_NoopInHTTPMode` — context_extensions parsed + stored, no HTTP-mode side-effects on `disableRequestBodyBuffering` or `withRequestBody`; per SPEC §8 item 8 + ADR-0163 §Decision (iii).
+4. `TestResolvePerRouteConfig_ConcurrentSameProto` — 20 concurrent goroutines resolving the same proto pointer all return pointer-identical `*compiledPerRoute` (sync.Map LoadOrStore identity; ADR-0117 + ADR-0125 §(v)).
+5. `TestEffectiveWithRequestBody_DisableRequestBodyBuffering` — per-route `disableRequestBodyBuffering=true` → `effectiveWithRequestBody` returns nil even with listener-level `withRequestBody` set.
+6. `TestEffectiveWithRequestBody_PerRouteOverride` — per-route `withRequestBody` → `effectiveWithRequestBody` returns per-route pointer, not listener-level.
+7. `TestEffectiveWithRequestBody_ListenerFallback` — three sub-cases: nil per-route, empty checkSettings, nil checkSettings all fall back to listener-level `withRequestBody`.
+8. `TestResolvePerRouteConfig_CCAlwaysListenerRC` — table-driven across disabled arm, empty check_settings arm, check_settings with context_extensions: all produce `result.cc == listenerRC`.
+
+**TDD note:** Task 2's skeleton was already complete, so the new tests passed immediately upon addition. This is an expected TDD outcome for finalization work — the implementation existed, the tests verify the existing behavior is correct and complete.
+
+**ADR-0163 fill:** §Decision (8-point body (i)–(viii)) + §Consequences (5 bullets) filled. Status: Accepted; Date: 2026-05-14; **Lands-in: Task 7 of phase-18.1 PLAN.** Records: 5th-canonical-REUSE (NO §(xiv) amendment); `parsePerRoute` PGV-mirror; `check_settings` narrower-override merge; `context_extensions` HTTP-mode no-op; `effectiveWithRequestBody` 3-tier resolution; SHARED-stats discipline (no per-route `*filterStats`); `sync.Map` lazy-cache identity; the 6-counter stat surface + SN2-reuse + RATIFIED-PENDING-IMPL-TIME closure-at-Task-8 disposition (D8); NO ADR-0125 §(xiv) amendment.
+
+**NO `§(xiv)` amendment verification:**
+
+```
+$ grep -nE '\(xiv\)' docs/envoy-go/DECISIONS.md
+8633:... The absence of a §(xiv) amendment is itself a recorded decision ...
+8641:... NO ADR-0125 §(xiv) amendment paragraph is introduced. ...
+8657:**(viii) NO ADR-0125 §(xiv) amendment:** ADR-0125's canonical-pattern roster stays at 8 entries ...
+```
+
+3 matches — all EXPLANATORY text within ADR-0163 §Context/§Decision describing the ABSENCE of §(xiv). No actual amendment paragraph.
+
+```
+$ grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md
+0
+```
+
+0 matches — no actual `**(xiv)**` amendment paragraph exists.
+
+### Test run — Group 7 (extended)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestParsePerRoute|TestResolvePerRoute|TestCheckSettings|TestEffectiveWithRequestBody' -v
+=== RUN   TestParsePerRoute_EmptyOverride
+--- PASS: TestParsePerRoute_EmptyOverride (0.00s)
+=== RUN   TestParsePerRoute_DisabledFalse
+--- PASS: TestParsePerRoute_DisabledFalse (0.00s)
+=== RUN   TestParsePerRoute_DisabledTrue
+--- PASS: TestParsePerRoute_DisabledTrue (0.00s)
+=== RUN   TestParsePerRoute_CheckSettings_Empty
+--- PASS: TestParsePerRoute_CheckSettings_Empty (0.00s)
+=== RUN   TestParsePerRoute_CheckSettings_WithContextExtensions
+--- PASS: TestParsePerRoute_CheckSettings_WithContextExtensions (0.00s)
+=== RUN   TestParsePerRoute_CheckSettings_DisableRequestBodyBuffering
+--- PASS: TestParsePerRoute_CheckSettings_DisableRequestBodyBuffering (0.00s)
+=== RUN   TestParsePerRoute_CheckSettings_WithRequestBody
+--- PASS: TestParsePerRoute_CheckSettings_WithRequestBody (0.00s)
+=== RUN   TestParsePerRoute_CheckSettings_BothBodySettingsXOR
+--- PASS: TestParsePerRoute_CheckSettings_BothBodySettingsXOR (0.00s)
+=== RUN   TestResolvePerRouteConfig_NilMsg
+--- PASS: TestResolvePerRouteConfig_NilMsg (0.00s)
+=== RUN   TestResolvePerRouteConfig_DisabledTrue
+--- PASS: TestResolvePerRouteConfig_DisabledTrue (0.00s)
+=== RUN   TestResolvePerRouteConfig_CheckSettings
+--- PASS: TestResolvePerRouteConfig_CheckSettings (0.00s)
+=== RUN   TestResolvePerRouteConfig_SyncMapIdentity
+--- PASS: TestResolvePerRouteConfig_SyncMapIdentity (0.00s)
+=== RUN   TestResolvePerRouteConfig_DifferentProtos
+--- PASS: TestResolvePerRouteConfig_DifferentProtos (0.00s)
+=== RUN   TestResolvePerRouteConfig_UnknownMsgTypeFallback
+--- PASS: TestResolvePerRouteConfig_UnknownMsgTypeFallback (0.00s)
+=== RUN   TestResolvePerRouteConfig_SharedStats
+--- PASS: TestResolvePerRouteConfig_SharedStats (0.00s)
+=== RUN   TestResolvePerRouteConfig_DisabledSharedStats
+--- PASS: TestResolvePerRouteConfig_DisabledSharedStats (0.00s)
+=== RUN   TestParsePerRoute_ContextExtensions_NoopInHTTPMode
+--- PASS: TestParsePerRoute_ContextExtensions_NoopInHTTPMode (0.00s)
+=== RUN   TestResolvePerRouteConfig_ConcurrentSameProto
+--- PASS: TestResolvePerRouteConfig_ConcurrentSameProto (0.00s)
+=== RUN   TestEffectiveWithRequestBody_DisableRequestBodyBuffering
+--- PASS: TestEffectiveWithRequestBody_DisableRequestBodyBuffering (0.00s)
+=== RUN   TestEffectiveWithRequestBody_PerRouteOverride
+--- PASS: TestEffectiveWithRequestBody_PerRouteOverride (0.00s)
+=== RUN   TestEffectiveWithRequestBody_ListenerFallback
+--- PASS: TestEffectiveWithRequestBody_ListenerFallback (0.00s)
+=== RUN   TestResolvePerRouteConfig_CCAlwaysListenerRC
+=== RUN   TestResolvePerRouteConfig_CCAlwaysListenerRC/disabled_arm
+=== RUN   TestResolvePerRouteConfig_CCAlwaysListenerRC/check_settings_arm_(empty)
+=== RUN   TestResolvePerRouteConfig_CCAlwaysListenerRC/check_settings_arm_(with_context_extensions)
+--- PASS: TestResolvePerRouteConfig_CCAlwaysListenerRC (0.00s)
+    --- PASS: TestResolvePerRouteConfig_CCAlwaysListenerRC/disabled_arm (0.00s)
+    --- PASS: TestResolvePerRouteConfig_CCAlwaysListenerRC/check_settings_arm_(empty) (0.00s)
+    --- PASS: TestResolvePerRouteConfig_CCAlwaysListenerRC/check_settings_arm_(with_context_extensions) (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	0.004s
+```
+
+22 Group 7 tests PASS (14 existing from Task 2 + 8 new from Task 7).
+
+### Test run — full suite with race detector
+
+```
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.073s
+```
+
+129 tests PASS (up from 121 at Task 6 end; 8 new `func Test` appended). 0 failures.
+
+### Test run — go vet
+
+```
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+```
+
+### Test run — gofmt
+
+```
+$ gofmt -l internal/filter/http/extauthz/
+(no output — empty)
+```
+
+### ADR acceptance-criteria grep
+
+```
+$ grep -nE '^## ADR-0163' docs/envoy-go/DECISIONS.md
+8622:## ADR-0163: Per-route 5th-canonical REUSE classification ...
+```
+
+1 match (1 required). §Decision (8-point body (i)–(viii)) + §Consequences (5 bullets) filled. Status: Accepted; Date: 2026-05-14; Lands-in: Task 7 of phase-18.1 PLAN.

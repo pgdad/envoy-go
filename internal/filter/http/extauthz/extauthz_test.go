@@ -921,6 +921,284 @@ func TestResolvePerRouteConfig_UnknownMsgTypeFallback(t *testing.T) {
 	}
 }
 
+// TestResolvePerRouteConfig_SharedStats verifies SHARED-stats discipline per
+// ADR-0163: the per-route resolution NEVER allocates a fresh *filterStats.
+// The compiledPerRoute.cc must equal the listener-level cc (same pointer), which
+// means the stats field is the shared listener-level stats — not an independent
+// per-route allocation.
+func TestResolvePerRouteConfig_SharedStats(t *testing.T) {
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		statusOnError: 403,
+		stats:         newFilterStats(reg, "ingress_http"),
+	}
+	state := &factoryState{listenerRC: cc}
+
+	pr := &ext_authzv3.ExtAuthzPerRoute{
+		Override: &ext_authzv3.ExtAuthzPerRoute_CheckSettings{
+			CheckSettings: &ext_authzv3.CheckSettings{
+				ContextExtensions: map[string]string{"env": "staging"},
+			},
+		},
+	}
+	result := state.resolvePerRouteConfig(pr)
+	if result == nil {
+		t.Fatal("resolvePerRouteConfig: got nil")
+	}
+	// SHARED-stats discipline: result.cc must be the listener-level cc.
+	if result.cc != cc {
+		t.Error("SHARED-stats violation: result.cc is not the listener-level compiledConfig pointer")
+	}
+	// The per-route compiledPerRoute carries no independent filterStats.
+	// The only stats surface is through result.cc.stats (= cc.stats = listener-level).
+	if result.cc.stats != cc.stats {
+		t.Error("SHARED-stats violation: result.cc.stats is not the listener-level filterStats pointer")
+	}
+}
+
+// TestResolvePerRouteConfig_DisabledSharedStats verifies SHARED-stats discipline
+// for the disabled arm as well: disabled per-route does not get its own stats.
+func TestResolvePerRouteConfig_DisabledSharedStats(t *testing.T) {
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		statusOnError: 403,
+		stats:         newFilterStats(reg, "ingress_http"),
+	}
+	state := &factoryState{listenerRC: cc}
+
+	pr := &ext_authzv3.ExtAuthzPerRoute{
+		Override: &ext_authzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+	}
+	result := state.resolvePerRouteConfig(pr)
+	if result == nil {
+		t.Fatal("resolvePerRouteConfig(disabled): got nil")
+	}
+	if !result.disabled {
+		t.Error("disabled: got false, want true")
+	}
+	// SHARED-stats: cc wired to listenerRC.
+	if result.cc != cc {
+		t.Error("SHARED-stats violation (disabled arm): result.cc is not the listener-level compiledConfig pointer")
+	}
+}
+
+// TestParsePerRoute_ContextExtensions_NoopInHTTPMode verifies that context_extensions
+// PARSES correctly (no error, values stored) but has NO effect on compiledConfig
+// (there is no context_extensions field on compiledConfig or compiledCheckSettings
+// that drives any HTTP-mode behavior). Per SPEC §8 item 8 + ADR-0163: in HTTP-mode
+// context_extensions is a no-op; 18.2 consumes it for the gRPC AttributeContext.
+func TestParsePerRoute_ContextExtensions_NoopInHTTPMode(t *testing.T) {
+	pr := &ext_authzv3.ExtAuthzPerRoute{
+		Override: &ext_authzv3.ExtAuthzPerRoute_CheckSettings{
+			CheckSettings: &ext_authzv3.CheckSettings{
+				ContextExtensions: map[string]string{
+					"vhost":   "my-virtual-host",
+					"service": "payment-svc",
+				},
+			},
+		},
+	}
+	cpr, err := parsePerRoute(pr)
+	if err != nil {
+		t.Fatalf("parsePerRoute(context_extensions): unexpected error: %v", err)
+	}
+	if cpr.checkSettings == nil {
+		t.Fatal("checkSettings: got nil")
+	}
+	// Parsed and stored — the map is accessible for future gRPC-mode use (18.2).
+	if len(cpr.checkSettings.contextExtensions) != 2 {
+		t.Errorf("contextExtensions: got %d entries, want 2", len(cpr.checkSettings.contextExtensions))
+	}
+	// HTTP-mode no-op: compiledCheckSettings carries ONLY disableRequestBodyBuffering
+	// and withRequestBody as HTTP-mode-affecting fields. contextExtensions does NOT
+	// drive any HTTP-mode field.
+	if cpr.checkSettings.disableRequestBodyBuffering {
+		t.Error("context_extensions unexpectedly set disableRequestBodyBuffering")
+	}
+	if cpr.checkSettings.withRequestBody != nil {
+		t.Error("context_extensions unexpectedly set withRequestBody")
+	}
+}
+
+// TestResolvePerRouteConfig_ConcurrentSameProto verifies that concurrent calls to
+// resolvePerRouteConfig with the SAME proto pointer produce a SINGLE *compiledPerRoute
+// per proto pointer (sync.Map LoadOrStore identity per ADR-0117 + ADR-0125 §(v)).
+func TestResolvePerRouteConfig_ConcurrentSameProto(t *testing.T) {
+	cc := &compiledConfig{statusOnError: 403}
+	state := &factoryState{listenerRC: cc}
+
+	pr := &ext_authzv3.ExtAuthzPerRoute{
+		Override: &ext_authzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+	}
+
+	const n = 20
+	results := make([]*compiledPerRoute, n)
+	done := make(chan struct{})
+	for i := range n {
+		go func(idx int) {
+			results[idx] = state.resolvePerRouteConfig(pr)
+			done <- struct{}{}
+		}(i)
+	}
+	for range n {
+		<-done
+	}
+
+	// All goroutines must return the same pointer (sync.Map LoadOrStore ensures
+	// exactly one *compiledPerRoute is stored per proto pointer).
+	first := results[0]
+	if first == nil {
+		t.Fatal("concurrent resolvePerRouteConfig: got nil result")
+	}
+	for i, r := range results[1:] {
+		if r != first {
+			t.Errorf("concurrent resolvePerRouteConfig: goroutine %d got different pointer (%p != %p)", i+1, r, first)
+		}
+	}
+}
+
+// TestEffectiveWithRequestBody_DisableRequestBodyBuffering verifies that a per-route
+// check_settings with disable_request_body_buffering=true causes effectiveWithRequestBody
+// to return nil (body buffering OFF) even when the listener-level withRequestBody is set.
+// Per SPEC §6.3 step 3 + SPEC §8 + ADR-0162 + ADR-0163.
+func TestEffectiveWithRequestBody_DisableRequestBodyBuffering(t *testing.T) {
+	listenerCC := &compiledConfig{
+		withRequestBody: &bufferSettings{maxRequestBytes: 1024},
+	}
+	f := &filter{activeRC: listenerCC}
+
+	// Per-route: disable_request_body_buffering=true overrides listener-level.
+	pr := &compiledPerRoute{
+		cc: listenerCC,
+		checkSettings: &compiledCheckSettings{
+			disableRequestBodyBuffering: true,
+			withRequestBody:             nil,
+		},
+	}
+	got := f.effectiveWithRequestBody(pr)
+	if got != nil {
+		t.Errorf("effectiveWithRequestBody(disableRequestBodyBuffering=true): got non-nil, want nil (body buffering OFF)")
+	}
+}
+
+// TestEffectiveWithRequestBody_PerRouteOverride verifies that a per-route
+// check_settings with_request_body overrides the listener-level withRequestBody
+// (most-specific-wins per SPEC §6.3 step 3 + ADR-0162 + ADR-0163).
+func TestEffectiveWithRequestBody_PerRouteOverride(t *testing.T) {
+	listenerWRB := &bufferSettings{maxRequestBytes: 1024}
+	perRouteWRB := &bufferSettings{maxRequestBytes: 256, allowPartialMessage: true}
+	listenerCC := &compiledConfig{withRequestBody: listenerWRB}
+	f := &filter{activeRC: listenerCC}
+
+	pr := &compiledPerRoute{
+		cc: listenerCC,
+		checkSettings: &compiledCheckSettings{
+			disableRequestBodyBuffering: false,
+			withRequestBody:             perRouteWRB,
+		},
+	}
+	got := f.effectiveWithRequestBody(pr)
+	if got != perRouteWRB {
+		t.Errorf("effectiveWithRequestBody(per-route override): got %v, want per-route *bufferSettings", got)
+	}
+	if got == listenerWRB {
+		t.Error("effectiveWithRequestBody(per-route override): returned listener-level, want per-route override")
+	}
+}
+
+// TestEffectiveWithRequestBody_ListenerFallback verifies that effectiveWithRequestBody
+// falls back to the listener-level withRequestBody when there is no per-route
+// check_settings override (nil per-route or no check_settings set).
+// Per SPEC §6.3 step 3 + ADR-0163.
+func TestEffectiveWithRequestBody_ListenerFallback(t *testing.T) {
+	listenerWRB := &bufferSettings{maxRequestBytes: 512}
+	listenerCC := &compiledConfig{withRequestBody: listenerWRB}
+	f := &filter{activeRC: listenerCC}
+
+	// Case 1: nil per-route → listener fallback.
+	got := f.effectiveWithRequestBody(nil)
+	if got != listenerWRB {
+		t.Errorf("effectiveWithRequestBody(nil pr): got %v, want listener-level *bufferSettings", got)
+	}
+
+	// Case 2: per-route with empty checkSettings (no overrides set) → listener fallback.
+	pr := &compiledPerRoute{
+		cc:            listenerCC,
+		checkSettings: &compiledCheckSettings{},
+	}
+	got2 := f.effectiveWithRequestBody(pr)
+	if got2 != listenerWRB {
+		t.Errorf("effectiveWithRequestBody(empty checkSettings): got %v, want listener-level *bufferSettings", got2)
+	}
+
+	// Case 3: per-route with nil checkSettings → listener fallback.
+	prNoCS := &compiledPerRoute{
+		cc:            listenerCC,
+		checkSettings: nil,
+	}
+	got3 := f.effectiveWithRequestBody(prNoCS)
+	if got3 != listenerWRB {
+		t.Errorf("effectiveWithRequestBody(nil checkSettings): got %v, want listener-level *bufferSettings", got3)
+	}
+}
+
+// TestResolvePerRouteConfig_CCAlwaysListenerRC verifies that the cc field in a
+// resolved compiledPerRoute is ALWAYS the listener-level compiledConfig regardless
+// of which per-route arm is active. This is the SHARED-stats discipline structural
+// assertion: no per-route cc is allocated; all per-route entries share the listener
+// cc (and its stats).
+func TestResolvePerRouteConfig_CCAlwaysListenerRC(t *testing.T) {
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		statusOnError: 403,
+		stats:         newFilterStats(reg, "ingress_http"),
+	}
+	state := &factoryState{listenerRC: cc}
+
+	cases := []struct {
+		name string
+		pr   *ext_authzv3.ExtAuthzPerRoute
+	}{
+		{
+			name: "disabled arm",
+			pr: &ext_authzv3.ExtAuthzPerRoute{
+				Override: &ext_authzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+			},
+		},
+		{
+			name: "check_settings arm (empty)",
+			pr: &ext_authzv3.ExtAuthzPerRoute{
+				Override: &ext_authzv3.ExtAuthzPerRoute_CheckSettings{
+					CheckSettings: &ext_authzv3.CheckSettings{},
+				},
+			},
+		},
+		{
+			name: "check_settings arm (with context_extensions)",
+			pr: &ext_authzv3.ExtAuthzPerRoute{
+				Override: &ext_authzv3.ExtAuthzPerRoute_CheckSettings{
+					CheckSettings: &ext_authzv3.CheckSettings{
+						ContextExtensions: map[string]string{"k": "v"},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := state.resolvePerRouteConfig(tc.pr)
+			if result == nil {
+				t.Fatal("resolvePerRouteConfig: got nil")
+			}
+			if result.cc != cc {
+				t.Errorf("%s: result.cc (%p) != listenerRC (%p) — SHARED-stats discipline violated",
+					tc.name, result.cc, cc)
+			}
+		})
+	}
+}
+
 // ----------------------------------------------------------------------------
 // Group 4 — HTTP-mode checkFn: buildHTTPCheckFn + the checkFn closure
 // (Group 4 per SPEC §14.1 + PLAN Task 3)
