@@ -946,7 +946,7 @@ ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.075s
 - `docs/envoy-go/DECISIONS.md` (ADR-0163 §Decision + §Consequences filled; Status → Accepted; Lands-in → Task 7 of phase-18.1 PLAN)
 - `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (this entry)
 
-**Commit SHA:** TBD (SHA-fill follow-up per established convention)
+**Commit SHA:** `45eb62c` (SHA-fill follow-up at next commit per established convention)
 
 **What was implemented vs what was already done:**
 
