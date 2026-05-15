@@ -236,8 +236,16 @@ type filter struct {
 	perRoute     *compiledPerRoute // resolved per-route config; nil if no per-route TPFC
 	awaitingBody bool              // true when body-buffering wait is in progress (ADR-0128)
 
+	// bodySettings caches the effective bufferSettings for this stream (set in
+	// DecodeHeaders when awaitingBody=true; read in DecodeData). The effective
+	// settings come from the per-route override OR the listener-level
+	// withRequestBody, resolved once per stream in DecodeHeaders. Nil when
+	// awaitingBody=false (not buffering this stream).
+	bodySettings *bufferSettings
+
 	// Per-request body accumulator (ADR-0128 decode-side body-buffering reuse;
-	// wired at Task 6).
+	// wired at Task 6). Appended-to per DecodeData chunk; truncated to
+	// bodySettings.maxRequestBytes when allow_partial_message=true + over-limit.
 	body []byte
 
 	// Async-resume outbound-call leg + per-request cancellable context per
@@ -641,15 +649,50 @@ func applyUpstreamMutations(headers http.Header, disp checkDisposition) {
 }
 
 // ---------------------------------------------------------------------------
-// DecodeHeaders / DecodeData / DecodeTrailers / OnDestroy skeletons.
-// Per SPEC §6.3 + ADR-0156 — real dispatch body lands at Task 9.
+// DecodeHeaders / DecodeData / DecodeTrailers / OnDestroy.
+// Per SPEC §6.3 + ADR-0156 + ADR-0162.
+// Full async-dispatch body (outbound check + resume) lands at Task 9.
+// Task 6 lands: body-buffering branch of DecodeHeaders + DecodeData
+// accumulation + over-limit 413 edge case.
 // ---------------------------------------------------------------------------
 
-// DecodeHeaders is the request-gate entry per ADR-0156. Task 2 skeleton:
-// returns HeaderContinue as a pass-through placeholder. The real dispatch
-// body (per-route resolve → disabled short-circuit → with_request_body wait →
-// async outbound check → disposition application) lands at Task 9 per the
-// phase-09 fault async-resume primitive.
+// effectiveWithRequestBody returns the effective *bufferSettings for this stream
+// per SPEC §6.3 step 3 + SPEC §8 + ADR-0162:
+//
+//  1. If per-route check_settings.disable_request_body_buffering=true → nil (OFF).
+//  2. If per-route check_settings.with_request_body is set → use per-route override.
+//  3. Otherwise → use listener-level cc.withRequestBody (may be nil = OFF).
+//
+// Called once per stream from DecodeHeaders; result cached on f.bodySettings.
+func (f *filter) effectiveWithRequestBody(pr *compiledPerRoute) *bufferSettings {
+	if pr != nil && pr.checkSettings != nil {
+		if pr.checkSettings.disableRequestBodyBuffering {
+			return nil // per-route: body buffering OFF
+		}
+		if pr.checkSettings.withRequestBody != nil {
+			return pr.checkSettings.withRequestBody // per-route: body buffering override
+		}
+	}
+	// Listener-level fallback.
+	if f.activeRC != nil {
+		return f.activeRC.withRequestBody
+	}
+	return nil
+}
+
+// DecodeHeaders is the request-gate entry per ADR-0156 + ADR-0162.
+//
+// Task 6 lands the body-buffering branch of SPEC §6.3 steps 3–4:
+//   - Resolves the effective withRequestBody (per-route override OR listener-level).
+//   - If withRequestBody is set AND endStream=false: sets f.awaitingBody=true +
+//     caches f.bodySettings for DecodeData to read; returns Continue.
+//     IMPORTANT: Continue (NOT StopIteration) per ADR-0128 synchronous-HCM
+//     dispatch constraint — returning StopIteration from DecodeHeaders would
+//     deadlock (the body-read loop is the ContinueDecoding path; both run in
+//     the same HCM dispatch goroutine per ADR-0076 + ADR-0128).
+//
+// Task 9 wires the full dispatch body: per-route resolve → disabled short-circuit
+// → async outbound check → disposition application per SPEC §6.3.
 //
 // Task 9 buildAuthRequest call-site (Task 4 review-fix forward-pointer):
 // before invoking f.activeRC.checkFn, Task 9 MUST call buildAuthRequest(f, hs,
@@ -660,16 +703,102 @@ func applyUpstreamMutations(headers http.Header, disp checkDisposition) {
 // headers, which only exist here at DecodeHeaders, not at config-load time.
 // See the PROGRESS.md Task 4 "Deviation from PLAN Step 4" note + ADR-0160
 // §Decision (v)/(vii) + the call-site-boundary comment in check.go.
-func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersStatus {
+func (f *filter) DecodeHeaders(_ http.Header, endStream bool) envoyhttp.FilterHeadersStatus {
+	// Task 9 wires the per-route resolve (step 1) + disabled short-circuit (step 2)
+	// + async outbound check dispatch (steps 5–7). The body-buffering branch
+	// (steps 3–4) lands here at Task 6.
+
+	// Task 6: compute effective withRequestBody (SPEC §6.3 step 3).
+	// At Task 9, the per-route resolve is done first (f.perRoute = resolvePerRouteConfig(...));
+	// for now, resolve it directly from dcb.RequestRouteConfig() when dcb is set.
+	var pr *compiledPerRoute
+	if f.state != nil && f.dcb != nil {
+		pr = f.state.resolvePerRouteConfig(f.dcb.RequestRouteConfig())
+	}
+
+	effectiveWRB := f.effectiveWithRequestBody(pr)
+
+	// Task 6: body-buffering branch (SPEC §6.3 step 4).
+	// If withRequestBody is set AND !endStream: set awaitingBody + cache bodySettings.
+	// Return Continue (see ADR-0128 note above — NOT StopIteration).
+	if effectiveWRB != nil && !endStream {
+		f.awaitingBody = true
+		f.bodySettings = effectiveWRB
+	}
+
 	// Task 9 wires the real dispatch body per SPEC §6.3 (incl. the
-	// buildAuthRequest call documented above). Task 2 skeleton.
+	// buildAuthRequest call documented above, and the StopIteration for the
+	// async outbound check, and the resume-goroutine dispatch).
 	return envoyhttp.Continue
 }
 
-// DecodeData is pass-through per ADR-0156 §Decision — ext_authz evaluates at
-// DecodeHeaders before body bytes flow (unless with_request_body is set, in
-// which case body accumulation via ADR-0128 wires at Task 6).
-func (f *filter) DecodeData(_ []byte, _ bool) envoyhttp.FilterDataStatus {
+// DecodeData implements the ADR-0128 decode-side body-buffering reuse per
+// SPEC §6.3 + ADR-0162:
+//
+//  1. Pass-through when awaitingBody=false (DataContinue; ext_authz evaluates
+//     at DecodeHeaders before body bytes flow in the non-body-buffering path).
+//  2. Accumulate: f.body = append(f.body, data...).
+//  3. Over-limit check (strict > per buffer filter ADR-0128 §11.2 precedent):
+//     accumulated > maxRequestBytes:
+//     - allow_partial_message=false → SendLocalReply(413, "Payload Too Large",
+//     {Connection: close}) + DataStopIterationNoBuffer. Auth NOT called; NO
+//     ext_authz counter increments (parent SPEC §6 amendment 6 + ADR-0162).
+//     - allow_partial_message=true → truncate f.body to maxRequestBytes prefix;
+//     fall through to endStream handling (the truncated prefix is used in the
+//     auth request; Task 9 adds x-envoy-auth-partial-body: true to auth req).
+//  4. endStream=true: body complete (within limit OR allow_partial prefix).
+//     Park via DataStopIterationAndBuffer — the Task 9 seam:
+//     // Task 9: build authRequest (buildAuthRequest(f, hs, headers, f.body,
+//     //          path)), fire async outbound check via a goroutine, resume with
+//     //          cb.ContinueDecoding() on check completion (per ADR-0159 async-
+//     //          resume discipline + bandwidthlimit Task 4 precedent).
+//  5. Non-terminal chunk within limit: DataContinue per ADR-0128 (envoy-go HCM
+//     accumulates all body bytes in connection.go bodyBuf; DataStopIterationAndBuffer
+//     is not needed mid-stream — see buffer filter §Decision (v) note).
+//
+// envoy-go HCM dispatch reads body chunks sequentially in the same goroutine that
+// runs the chain (ADR-0076 + ADR-0128). DataStopIterationAndBuffer on endStream
+// parks the chain so Task 9's ContinueDecoding-from-goroutine can resume it.
+// DataContinue on mid-stream chunks is safe (framework bodyBuf holds bytes).
+func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataStatus {
+	// Step 1: pass-through when not buffering.
+	if !f.awaitingBody {
+		return envoyhttp.DataContinue
+	}
+
+	// Step 2: accumulate.
+	f.body = append(f.body, data...)
+
+	// Step 3: over-limit check (strict > per ADR-0128 buffer filter §11.2 precedent).
+	if f.bodySettings != nil && uint32(len(f.body)) > f.bodySettings.maxRequestBytes {
+		if !f.bodySettings.allowPartialMessage {
+			// allow_partial_message=false: emit 413 + discard.
+			// Auth NOT called; NO ext_authz counter increments per parent SPEC
+			// §6 amendment 6 + ADR-0162. The stream ends here.
+			f.dcb.SendLocalReply(413, "Payload Too Large", envoyhttp.OrderedHeaders{
+				{Name: "Connection", Value: "close"},
+			})
+			return envoyhttp.DataStopIterationNoBuffer
+		}
+		// allow_partial_message=true: truncate to max_request_bytes prefix.
+		// The truncated prefix goes to the auth service; Task 9 injects
+		// x-envoy-auth-partial-body: true into the auth request headers.
+		f.body = f.body[:f.bodySettings.maxRequestBytes]
+		// Fall through to step 4/5: endStream handling with truncated body.
+	}
+
+	// Step 4: terminal chunk (body complete OR truncated prefix assembled).
+	// Park via DataStopIterationAndBuffer — the Task 9 seam for async check.
+	if endStream {
+		// Task 9: build the authRequest and fire the async outbound check:
+		//   authReq := buildAuthRequest(f, hs, headers, f.body, path)
+		//   go func() { disp, err := f.activeRC.checkFn(ctx, authReq); ... f.dcb.ContinueDecoding() }
+		// Per ADR-0159 async-resume + bandwidthlimit Task 4 DataStopIterationAndBuffer precedent.
+		return envoyhttp.DataStopIterationAndBuffer
+	}
+
+	// Step 5: non-terminal chunk within limit — DataContinue.
+	// (framework bodyBuf holds the bytes; parking mid-stream is not needed.)
 	return envoyhttp.DataContinue
 }
 

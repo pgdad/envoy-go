@@ -1,6 +1,6 @@
 package extauthz
 
-// extauthz_test.go — unit-test Groups 1 + 2 + 3 + 4 + 7 (through Task 4).
+// extauthz_test.go — unit-test Groups 1 + 2 + 3 + 4 + 6 + 7 + 8 (through Task 6).
 //
 // Test group assignments per PLAN / SPEC §14.1:
 //
@@ -8,9 +8,11 @@ package extauthz
 //   Group 2 — compiledConfig shape + filterStats allocation
 //   Group 3 — buildAuthRequest + request-side header filtering (Task 4)
 //   Group 4 — check.go HTTP-outbound auth-check primitive (Task 3)
+//   Group 6 — with_request_body ADR-0128 reuse + over-limit 413 + DecodeData (Task 6)
 //   Group 7 — per-route: parsePerRoute + resolvePerRouteConfig
+//   Group 8 — Bidirectional header-mutation discipline (Task 5)
 //
-// Groups 5/6/8/9 land at Tasks 9/6/5/9 respectively per PLAN.
+// Groups 5/9 land at Task 9 respectively per PLAN.
 //
 // Design note (Group 1 "valid http_service" tests):
 //   At Task 2, buildHTTPCheckFn is a STUB returning the sentinel error
@@ -3019,5 +3021,568 @@ func TestDeprecatedAllowedHeaders_NullOutWhenTopLevelSet(t *testing.T) {
 	}
 	if !cc.allowedHeaders.matchAny("x-top-level") {
 		t.Error("cc.allowedHeaders: does not match 'x-top-level' (top-level allow-list must be effective)")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Group 6 — with_request_body ADR-0128 reuse + over-limit 413 + DecodeData
+// (Group 6 per SPEC §14.1 + PLAN Task 6; ADR-0162)
+//
+// Tests the following surfaces per SPEC §6.3 + parent SPEC §5.P5 + §6 amendment 6:
+//   - DecodeHeaders: awaitingBody set + Continue returned when withRequestBody set + !endStream
+//   - DecodeHeaders: awaitingBody NOT set when endStream=true (header-only request)
+//   - DecodeHeaders: awaitingBody NOT set when withRequestBody is nil
+//   - DecodeData: accumulation via the ADR-0128 primitive (body appended per chunk)
+//   - DecodeData: over-limit + allow_partial_message:false → SendLocalReply(413, "Payload Too
+//     Large", {Connection: close}) + DataStopIterationNoBuffer + NO counter increments
+//   - DecodeData: over-limit + allow_partial_message:true → body truncated to max_request_bytes
+//     prefix + DataStopIterationAndBuffer (Task 9 seam)
+//   - DecodeData: endStream within limit → f.body complete + DataStopIterationAndBuffer (Task 9 seam)
+//   - DecodeData: passthrough when awaitingBody=false (DataContinue)
+//   - bufferSettings.packAsBytes parsed and stored on compiledConfig
+//   - Per-route disable_request_body_buffering: overrides listener-level with_request_body OFF
+//   - Strict > (not >=) cap predicate: accumulated == maxRequestBytes does NOT trip 413
+//   - Multi-chunk accumulation: body assembled across multiple DecodeData calls
+// ----------------------------------------------------------------------------
+
+// fakeExtAuthzDCB is a minimal DecoderFilterCallbacks for Group 6 (and future Group 5/9) tests.
+// It records SendLocalReply calls and provides a configurable per-route config return.
+// Mirrors the buffer_test.go fakeCallbacks pattern.
+type fakeExtAuthzDCB struct {
+	perRoute        proto.Message
+	localReplyCount int
+	localReplyArgs  *localReplyRecord6
+}
+
+// localReplyRecord6 captures a single SendLocalReply invocation.
+type localReplyRecord6 struct {
+	status  int
+	body    string
+	headers envoyhttp.OrderedHeaders
+}
+
+func newFakeExtAuthzDCB() *fakeExtAuthzDCB { return &fakeExtAuthzDCB{} }
+
+func (c *fakeExtAuthzDCB) ContinueDecoding()             {}
+func (c *fakeExtAuthzDCB) DownstreamPrincipal() []string { return nil }
+func (c *fakeExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
+	c.localReplyCount++
+	c.localReplyArgs = &localReplyRecord6{status: status, body: body, headers: headers}
+}
+func (c *fakeExtAuthzDCB) RequestRouteConfig() proto.Message { return c.perRoute }
+func (c *fakeExtAuthzDCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
+	return nil, nil, nil
+}
+func (c *fakeExtAuthzDCB) EncodeHeaders(_ http.Header, _ bool) {}
+func (c *fakeExtAuthzDCB) EncodeData(_ []byte, _ bool)         {}
+func (c *fakeExtAuthzDCB) EncodeTrailers(_ http.Header)        {}
+
+// newBodyBufferingFilter builds a minimal *filter with withRequestBody set on the
+// compiledConfig and a fake DCB attached. It also pre-sets f.bodySettings to the
+// same bufferSettings so tests that call DecodeData directly (without calling
+// DecodeHeaders first) have the effective settings available.
+// stats is optional (may be nil).
+func newBodyBufferingFilter(t *testing.T, maxBytes uint32, allowPartial bool, packAsBytes bool, fs *filterStats) (*filter, *fakeExtAuthzDCB) {
+	t.Helper()
+	dcb := newFakeExtAuthzDCB()
+	bs := &bufferSettings{
+		maxRequestBytes:     maxBytes,
+		allowPartialMessage: allowPartial,
+		packAsBytes:         packAsBytes,
+	}
+	cc := &compiledConfig{
+		withRequestBody: bs,
+		statusOnError:   403,
+		stats:           fs,
+	}
+	f := &filter{
+		state:        &factoryState{listenerRC: cc},
+		dcb:          dcb,
+		activeRC:     cc,
+		bodySettings: bs, // pre-set so DecodeData tests work without calling DecodeHeaders
+	}
+	return f, dcb
+}
+
+// ---------------------------------------------------------------------------
+// Group 6A — DecodeHeaders body-buffering branch
+// ---------------------------------------------------------------------------
+
+// TestDecodeHeaders_WithRequestBody_SetsAwaitingBodyAndContinue verifies that
+// DecodeHeaders sets awaitingBody=true and returns Continue (NOT StopIteration)
+// when withRequestBody is set and endStream=false.
+//
+// Per ADR-0128 synchronous-HCM dispatch constraint: StopIteration from DecodeHeaders
+// would deadlock (body loop is the ContinueDecoding path). Continue is correct.
+func TestDecodeHeaders_WithRequestBody_SetsAwaitingBodyAndContinue(t *testing.T) {
+	f, _ := newBodyBufferingFilter(t, 1024, false, false, nil)
+	headers := http.Header{}
+	headers.Set("Content-Type", "application/json")
+
+	status := f.DecodeHeaders(headers, false /* endStream=false: body will follow */)
+
+	if status != envoyhttp.Continue {
+		t.Errorf("DecodeHeaders(withRequestBody, !endStream): want Continue, got %v", status)
+	}
+	if !f.awaitingBody {
+		t.Error("DecodeHeaders(withRequestBody, !endStream): want awaitingBody=true, got false")
+	}
+}
+
+// TestDecodeHeaders_WithRequestBody_EndStreamSkipsBuffer verifies that when
+// endStream=true (header-only request, no body), DecodeHeaders does NOT set
+// awaitingBody — there is no body to buffer.
+func TestDecodeHeaders_WithRequestBody_EndStreamSkipsBuffer(t *testing.T) {
+	f, _ := newBodyBufferingFilter(t, 1024, false, false, nil)
+	headers := http.Header{}
+
+	status := f.DecodeHeaders(headers, true /* endStream=true: header-only request */)
+
+	if status != envoyhttp.Continue {
+		t.Errorf("DecodeHeaders(withRequestBody, endStream=true): want Continue, got %v", status)
+	}
+	if f.awaitingBody {
+		t.Error("DecodeHeaders(withRequestBody, endStream=true): want awaitingBody=false (no body), got true")
+	}
+}
+
+// TestDecodeHeaders_NoWithRequestBody_AwaitingBodyNotSet verifies that when
+// withRequestBody is nil (body buffering OFF), awaitingBody is never set.
+func TestDecodeHeaders_NoWithRequestBody_AwaitingBodyNotSet(t *testing.T) {
+	dcb := newFakeExtAuthzDCB()
+	cc := &compiledConfig{statusOnError: 403}
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+	headers := http.Header{}
+
+	status := f.DecodeHeaders(headers, false /* body follows, but no buffering configured */)
+
+	// Task 9 will return StopIteration here for the async check dispatch; for now
+	// the skeleton returns Continue. The important assertion is awaitingBody=false.
+	_ = status
+	if f.awaitingBody {
+		t.Error("DecodeHeaders(no withRequestBody): want awaitingBody=false, got true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 6B — DecodeData accumulation (no over-limit)
+// ---------------------------------------------------------------------------
+
+// TestDecodeData_Passthrough_AwaitingBodyFalse verifies that when awaitingBody=false,
+// DecodeData returns DataContinue without accumulating (pure passthrough).
+func TestDecodeData_Passthrough_AwaitingBodyFalse(t *testing.T) {
+	f, _ := newBodyBufferingFilter(t, 100, false, false, nil)
+	f.awaitingBody = false // explicitly off (default)
+
+	status := f.DecodeData([]byte("hello"), false)
+	if status != envoyhttp.DataContinue {
+		t.Errorf("DecodeData(awaitingBody=false): want DataContinue, got %v", status)
+	}
+	if len(f.body) != 0 {
+		t.Errorf("DecodeData(awaitingBody=false): want empty body, got %d bytes", len(f.body))
+	}
+}
+
+// TestDecodeData_SingleChunk_WithinLimit_EndStream_Parks verifies that a single
+// chunk within the limit with endStream=true accumulates the body and parks the
+// chain (DataStopIterationAndBuffer) — the Task 9 seam for firing the async check.
+func TestDecodeData_SingleChunk_WithinLimit_EndStream_Parks(t *testing.T) {
+	f, dcb := newBodyBufferingFilter(t, 100, false, false, nil)
+	f.awaitingBody = true
+	payload := []byte("hello world")
+
+	status := f.DecodeData(payload, true /* endStream=true */)
+
+	if status != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("DecodeData(within limit, endStream=true): want DataStopIterationAndBuffer (Task 9 seam), got %v", status)
+	}
+	if string(f.body) != "hello world" {
+		t.Errorf("body: got %q, want %q", f.body, "hello world")
+	}
+	if dcb.localReplyCount != 0 {
+		t.Errorf("SendLocalReply: got %d calls, want 0 (no 413 on within-limit body)", dcb.localReplyCount)
+	}
+}
+
+// TestDecodeData_MultiChunk_WithinLimit_EndStream_Parks verifies that multiple
+// non-terminal chunks accumulate correctly and the terminal chunk parks the chain.
+func TestDecodeData_MultiChunk_WithinLimit_EndStream_Parks(t *testing.T) {
+	f, dcb := newBodyBufferingFilter(t, 1024, false, false, nil)
+	f.awaitingBody = true
+
+	// Chunk 1: not endStream
+	s1 := f.DecodeData([]byte("chunk1_"), false)
+	if s1 != envoyhttp.DataContinue {
+		t.Errorf("DecodeData(chunk1, !endStream): want DataContinue, got %v", s1)
+	}
+	// Chunk 2: endStream=true
+	s2 := f.DecodeData([]byte("chunk2"), true)
+	if s2 != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("DecodeData(chunk2, endStream=true): want DataStopIterationAndBuffer, got %v", s2)
+	}
+	if string(f.body) != "chunk1_chunk2" {
+		t.Errorf("body: got %q, want %q", f.body, "chunk1_chunk2")
+	}
+	if dcb.localReplyCount != 0 {
+		t.Errorf("SendLocalReply: got %d calls, want 0", dcb.localReplyCount)
+	}
+}
+
+// TestDecodeData_ExactCap_StrictGreaterThan verifies the cap predicate is strict >
+// (not >=): accumulated == maxRequestBytes must NOT fire the 413.
+// Per ADR-0128 buffer filter precedent (§11.2 strict > predicate).
+func TestDecodeData_ExactCap_StrictGreaterThan(t *testing.T) {
+	const maxBytes = 10
+	f, dcb := newBodyBufferingFilter(t, maxBytes, false, false, nil)
+	f.awaitingBody = true
+
+	// Exactly maxBytes — must NOT over-limit.
+	payload := make([]byte, maxBytes)
+	status := f.DecodeData(payload, true /* endStream */)
+
+	if status == envoyhttp.DataStopIterationNoBuffer {
+		t.Error("DecodeData(exact cap): got DataStopIterationNoBuffer (413 fired), want DataStopIterationAndBuffer (no 413 on exact-cap)")
+	}
+	if dcb.localReplyCount != 0 {
+		t.Errorf("SendLocalReply: got %d calls, want 0 (exact cap must NOT fire 413)", dcb.localReplyCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 6C — Over-limit: allow_partial_message=false → 413
+// ---------------------------------------------------------------------------
+
+// TestDecodeData_OverLimit_AllowPartialFalse_413 verifies that when the accumulated
+// body exceeds max_request_bytes and allow_partial_message=false, the filter emits
+// SendLocalReply(413, "Payload Too Large", {Connection: close}) and returns
+// DataStopIterationNoBuffer — the auth service is NEVER contacted.
+//
+// Per parent SPEC §5.P5 + §6 amendment 6 + ADR-0162: the 413 fires BEFORE the
+// outbound check; NO ext_authz counter increments.
+func TestDecodeData_OverLimit_AllowPartialFalse_413(t *testing.T) {
+	const maxBytes uint32 = 10
+	reg := stats.NewRegistry()
+	ctx := freshFactoryCtxWithRegistry(reg)
+	fs := newFilterStats(reg, ctx.StatPrefix)
+
+	f, dcb := newBodyBufferingFilter(t, maxBytes, false /* allow_partial=false */, false, fs)
+	f.awaitingBody = true
+
+	// Send a body that exceeds maxBytes.
+	oversized := make([]byte, int(maxBytes)+1)
+	status := f.DecodeData(oversized, true /* endStream */)
+
+	// Must return DataStopIterationNoBuffer (discard partial buffer).
+	if status != envoyhttp.DataStopIterationNoBuffer {
+		t.Errorf("DecodeData(over-limit, allow_partial=false): want DataStopIterationNoBuffer, got %v", status)
+	}
+
+	// Must emit SendLocalReply(413, "Payload Too Large", ...).
+	if dcb.localReplyCount != 1 {
+		t.Fatalf("SendLocalReply: got %d calls, want 1", dcb.localReplyCount)
+	}
+	if dcb.localReplyArgs.status != 413 {
+		t.Errorf("SendLocalReply status: got %d, want 413", dcb.localReplyArgs.status)
+	}
+	if dcb.localReplyArgs.body != "Payload Too Large" {
+		t.Errorf("SendLocalReply body: got %q, want %q", dcb.localReplyArgs.body, "Payload Too Large")
+	}
+	// Connection: close header required per parent §5.P5.
+	if dcb.localReplyArgs.headers.Get("Connection") != "close" {
+		t.Errorf("SendLocalReply headers: Connection: close missing; headers=%v", dcb.localReplyArgs.headers)
+	}
+
+	// NO ext_authz counter increments on the over-limit 413 path.
+	// The request never reached a disposition; counters must remain at 0.
+	// Per parent SPEC §6 amendment 6: "auth NOT called, NO counters".
+	if got := fs.ok.Load(); got != 0 {
+		t.Errorf("ok counter: got %d, want 0 (413 path must not increment ok)", got)
+	}
+	if got := fs.denied.Load(); got != 0 {
+		t.Errorf("denied counter: got %d, want 0 (413 path must not increment denied)", got)
+	}
+	if got := fs.errored.Load(); got != 0 {
+		t.Errorf("errored counter: got %d, want 0 (413 path must not increment errored)", got)
+	}
+	if got := fs.failureModeAllowed.Load(); got != 0 {
+		t.Errorf("failureModeAllowed counter: got %d, want 0", got)
+	}
+	if got := fs.invalid.Load(); got != 0 {
+		t.Errorf("invalid counter: got %d, want 0", got)
+	}
+}
+
+// TestDecodeData_OverLimit_AllowPartialFalse_MidStream verifies that an over-limit
+// detection on a non-endStream chunk still fires the 413 (the check is on the
+// running accumulated total, not only at endStream).
+func TestDecodeData_OverLimit_AllowPartialFalse_MidStream(t *testing.T) {
+	const maxBytes uint32 = 5
+	f, dcb := newBodyBufferingFilter(t, maxBytes, false, false, nil)
+	f.awaitingBody = true
+
+	// First chunk: 3 bytes (within limit)
+	s1 := f.DecodeData([]byte("abc"), false /* !endStream */)
+	if s1 != envoyhttp.DataContinue {
+		t.Errorf("chunk1: want DataContinue, got %v", s1)
+	}
+	if dcb.localReplyCount != 0 {
+		t.Error("chunk1: unexpected SendLocalReply call")
+	}
+
+	// Second chunk: 3 bytes (total 6 > maxBytes=5) — OVER LIMIT even mid-stream
+	s2 := f.DecodeData([]byte("def"), false /* !endStream */)
+	if s2 != envoyhttp.DataStopIterationNoBuffer {
+		t.Errorf("chunk2 (over-limit mid-stream): want DataStopIterationNoBuffer, got %v", s2)
+	}
+	if dcb.localReplyCount != 1 {
+		t.Fatalf("chunk2: want 1 SendLocalReply call, got %d", dcb.localReplyCount)
+	}
+	if dcb.localReplyArgs.status != 413 {
+		t.Errorf("413 status: got %d, want 413", dcb.localReplyArgs.status)
+	}
+}
+
+// TestDecodeData_OverLimit_NoCounterIncrements verifies the NO-counter-increments
+// invariant explicitly: stats must remain at 0 on the 413 over-limit path.
+// Tests the "auth NOT called, NO counters" assertion from parent §6 amendment 6.
+func TestDecodeData_OverLimit_NoCounterIncrements(t *testing.T) {
+	reg := stats.NewRegistry()
+	ctx := freshFactoryCtxWithRegistry(reg)
+	fs := newFilterStats(reg, ctx.StatPrefix)
+
+	f, _ := newBodyBufferingFilter(t, 5, false, false, fs)
+	f.awaitingBody = true
+
+	// Oversized payload.
+	_ = f.DecodeData(make([]byte, 100), true)
+
+	// All 6 counters must be at 0.
+	for _, tc := range []struct {
+		name    string
+		counter *stats.Counter
+	}{
+		{"ok", fs.ok},
+		{"denied", fs.denied},
+		{"errored", fs.errored},
+		{"disabled", fs.disabled},
+		{"failureModeAllowed", fs.failureModeAllowed},
+		{"invalid", fs.invalid},
+	} {
+		if got := tc.counter.Load(); got != 0 {
+			t.Errorf("counter %q: got %d, want 0 (413 path must not increment any counter)", tc.name, got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 6D — Over-limit: allow_partial_message=true → truncated prefix
+// ---------------------------------------------------------------------------
+
+// TestDecodeData_OverLimit_AllowPartialTrue_TruncatesToMaxBytes verifies that when
+// the body exceeds max_request_bytes and allow_partial_message=true, f.body is
+// truncated to exactly max_request_bytes bytes.
+//
+// Per parent SPEC §5.P5: the auth service receives the truncated max_request_bytes
+// prefix; the Task 9 seam injects x-envoy-auth-partial-body:true into the auth request.
+func TestDecodeData_OverLimit_AllowPartialTrue_TruncatesToMaxBytes(t *testing.T) {
+	const maxBytes uint32 = 10
+	f, dcb := newBodyBufferingFilter(t, maxBytes, true /* allow_partial=true */, false, nil)
+	f.awaitingBody = true
+
+	// Build a payload larger than maxBytes.
+	oversized := make([]byte, int(maxBytes)+50)
+	for i := range oversized {
+		oversized[i] = byte('a' + (i % 26))
+	}
+
+	status := f.DecodeData(oversized, true /* endStream */)
+
+	// Must park (DataStopIterationAndBuffer) for Task 9 async check.
+	if status != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("DecodeData(over-limit, allow_partial=true): want DataStopIterationAndBuffer (park for auth check), got %v", status)
+	}
+	// Must NOT fire 413.
+	if dcb.localReplyCount != 0 {
+		t.Errorf("SendLocalReply: got %d calls, want 0 (allow_partial=true must NOT fire 413)", dcb.localReplyCount)
+	}
+	// f.body must be truncated to exactly maxBytes.
+	if uint32(len(f.body)) != maxBytes {
+		t.Errorf("f.body length: got %d, want %d (truncated to maxRequestBytes)", len(f.body), maxBytes)
+	}
+	// Verify prefix correctness: first maxBytes bytes of oversized.
+	if string(f.body) != string(oversized[:maxBytes]) {
+		t.Errorf("f.body prefix: got %q, want %q", f.body, oversized[:maxBytes])
+	}
+}
+
+// TestDecodeData_OverLimit_AllowPartialTrue_MultiChunk verifies truncation works
+// when the over-limit condition is reached across multiple chunks.
+func TestDecodeData_OverLimit_AllowPartialTrue_MultiChunk(t *testing.T) {
+	const maxBytes uint32 = 5
+	f, dcb := newBodyBufferingFilter(t, maxBytes, true, false, nil)
+	f.awaitingBody = true
+
+	// Chunk 1: 3 bytes (within limit)
+	s1 := f.DecodeData([]byte("abc"), false)
+	if s1 != envoyhttp.DataContinue {
+		t.Errorf("chunk1: want DataContinue, got %v", s1)
+	}
+
+	// Chunk 2: 5 more bytes (total 8 > maxBytes=5). allow_partial=true → truncate.
+	s2 := f.DecodeData([]byte("defgh"), true /* endStream */)
+	if s2 != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("chunk2 (allow_partial, over-limit): want DataStopIterationAndBuffer, got %v", s2)
+	}
+	// No 413.
+	if dcb.localReplyCount != 0 {
+		t.Errorf("SendLocalReply: got %d calls, want 0", dcb.localReplyCount)
+	}
+	// f.body truncated to maxBytes=5: "abcde" (first 5 of "abcdefgh").
+	if uint32(len(f.body)) != maxBytes {
+		t.Errorf("f.body length: got %d, want %d", len(f.body), maxBytes)
+	}
+	if string(f.body) != "abcde" {
+		t.Errorf("f.body: got %q, want %q (first %d bytes)", f.body, "abcde", maxBytes)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 6E — pack_as_bytes parsed + stored
+// ---------------------------------------------------------------------------
+
+// TestWithRequestBody_PackAsBytesStored verifies that the pack_as_bytes field is
+// parsed from the proto and stored on compiledConfig.withRequestBody.packAsBytes.
+// In HTTP-mode (18.1) pack_as_bytes has no effect on the POST body — the body bytes
+// are transmitted verbatim regardless. The field is parsed for gRPC-mode (18.2).
+func TestWithRequestBody_PackAsBytesStored(t *testing.T) {
+	cfg := &ext_authzv3.ExtAuthz{
+		Services: &ext_authzv3.ExtAuthz_HttpService{
+			HttpService: &ext_authzv3.HttpService{
+				ServerUri: &corev3.HttpUri{Uri: "http://127.0.0.1:9191"},
+			},
+		},
+		TransportApiVersion: corev3.ApiVersion_V3,
+		WithRequestBody: &ext_authzv3.BufferSettings{
+			MaxRequestBytes: 512,
+			PackAsBytes:     true,
+		},
+	}
+	cc, err := buildCompiledConfig(freshFactoryCtx(), cfg)
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
+	}
+	if cc.withRequestBody == nil {
+		t.Fatal("cc.withRequestBody: got nil, want non-nil")
+	}
+	if !cc.withRequestBody.packAsBytes {
+		t.Error("cc.withRequestBody.packAsBytes: got false, want true")
+	}
+}
+
+// TestDecodeData_PackAsBytes_BodyVerbatimInHTTPMode verifies that pack_as_bytes=true
+// does NOT change the body bytes stored in f.body — HTTP-mode always transmits the
+// raw bytes verbatim (pack_as_bytes is a gRPC-mode proto differentiation, 18.2).
+func TestDecodeData_PackAsBytes_BodyVerbatimInHTTPMode(t *testing.T) {
+	const maxBytes uint32 = 100
+	f, dcb := newBodyBufferingFilter(t, maxBytes, false, true /* pack_as_bytes=true */, nil)
+	f.awaitingBody = true
+
+	payload := []byte("raw bytes \x00\x01\x02")
+	status := f.DecodeData(payload, true)
+
+	if status != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("DecodeData(pack_as_bytes=true): want DataStopIterationAndBuffer, got %v", status)
+	}
+	if dcb.localReplyCount != 0 {
+		t.Errorf("SendLocalReply: unexpected call (got %d)", dcb.localReplyCount)
+	}
+	if string(f.body) != string(payload) {
+		t.Errorf("f.body: got %v, want %v (verbatim bytes in HTTP mode)", f.body, payload)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 6F — Per-route disable_request_body_buffering override
+// ---------------------------------------------------------------------------
+
+// TestDecodeHeaders_PerRouteDisableBodyBuffering verifies that when per-route
+// check_settings.disable_request_body_buffering=true, the effective withRequestBody
+// is nil (OFF) — body buffering is suppressed even if the listener-level
+// with_request_body is set.
+//
+// Per SPEC §8 + SPEC §6.3 step 3: "effective withRequestBody = perRoute override OR
+// listener-level". disable_request_body_buffering=true forces body-buffering OFF.
+func TestDecodeHeaders_PerRouteDisableBodyBuffering(t *testing.T) {
+	// Listener-level has with_request_body set.
+	cc := &compiledConfig{
+		withRequestBody: &bufferSettings{maxRequestBytes: 1024, allowPartialMessage: false},
+		statusOnError:   403,
+	}
+	state := &factoryState{listenerRC: cc}
+
+	// Per-route: disable_request_body_buffering=true.
+	perRouteProto := &ext_authzv3.ExtAuthzPerRoute{
+		Override: &ext_authzv3.ExtAuthzPerRoute_CheckSettings{
+			CheckSettings: &ext_authzv3.CheckSettings{
+				DisableRequestBodyBuffering: true,
+			},
+		},
+	}
+	dcb := newFakeExtAuthzDCB()
+	dcb.perRoute = perRouteProto
+
+	f := &filter{
+		state:    state,
+		dcb:      dcb,
+		activeRC: cc,
+	}
+
+	// DecodeHeaders with per-route disable: awaitingBody must NOT be set.
+	headers := http.Header{}
+	f.DecodeHeaders(headers, false /* endStream=false: body would follow */)
+
+	if f.awaitingBody {
+		t.Error("DecodeHeaders(per-route disable_request_body_buffering=true): want awaitingBody=false, got true")
+	}
+}
+
+// TestDecodeHeaders_PerRouteWithRequestBodyOverride verifies that per-route
+// check_settings.with_request_body overrides the listener-level with_request_body.
+//
+// Per SPEC §8: if per-route check_settings.with_request_body is set, it replaces
+// the listener-level with_request_body for this request.
+func TestDecodeHeaders_PerRouteWithRequestBodyOverride(t *testing.T) {
+	// Listener-level: no with_request_body (nil).
+	cc := &compiledConfig{
+		withRequestBody: nil, // listener-level: OFF
+		statusOnError:   403,
+	}
+	state := &factoryState{listenerRC: cc}
+
+	// Per-route: with_request_body set to max=64.
+	perRouteProto := &ext_authzv3.ExtAuthzPerRoute{
+		Override: &ext_authzv3.ExtAuthzPerRoute_CheckSettings{
+			CheckSettings: &ext_authzv3.CheckSettings{
+				WithRequestBody: &ext_authzv3.BufferSettings{
+					MaxRequestBytes: 64,
+				},
+			},
+		},
+	}
+	dcb := newFakeExtAuthzDCB()
+	dcb.perRoute = perRouteProto
+
+	f := &filter{
+		state:    state,
+		dcb:      dcb,
+		activeRC: cc,
+	}
+
+	headers := http.Header{}
+	f.DecodeHeaders(headers, false /* body will follow */)
+
+	// Per-route with_request_body=64 must activate body buffering.
+	if !f.awaitingBody {
+		t.Error("DecodeHeaders(per-route with_request_body=64, listener-level nil): want awaitingBody=true, got false")
 	}
 }

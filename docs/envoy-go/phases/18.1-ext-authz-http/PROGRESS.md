@@ -786,3 +786,130 @@ Code-quality review returned "Needs changes" (2 Important + 2 should-fix). All 4
 4. **(should-fix) `TestValidateMutations_AllowPath_InvalidNameCharsRejected` refactored.** Was calling `validateMutationHeaders` directly + a redundant constant-identity check; now hand-crafts an `*http.Response` carrying an invalid-name-char header and drives it through `mapHTTPResponseWithMatchers` (mirroring `TestValidateMutations_AllowPath_PseudoHeaderRejected`), genuinely exercising the `mapHTTPResponseWithMatchers` → `validateMutationHeaders` → `dispInvalid` wiring. Redundant constant-identity check removed.
 
 Test count 103 → 104 (+1: the null-out test; the validate_mutations refactor is in-place). `go build` / `go vet` / `gofmt -l` (empty) / `go test -race -count=1 ./internal/filter/http/extauthz/...` all green.
+
+---
+
+## Task 6 — `with_request_body` ADR-0128 reuse + over-limit 413 edge case + Group 6 tests + ADR-0162 §Decision+§Consequences
+
+**Files changed:** `internal/filter/http/extauthz/extauthz.go` (modified — `filter.bodySettings *bufferSettings` field added; `effectiveWithRequestBody(pr *compiledPerRoute) *bufferSettings` helper added; `DecodeHeaders` body-buffering branch implemented: computes effective `withRequestBody` + sets `awaitingBody=true` + caches `bodySettings`; `DecodeData` body-accumulation + over-limit logic implemented per ADR-0128; `DecodeHeaders`/`DecodeData` doc-comments revised to be accurate), `internal/filter/http/extauthz/extauthz_test.go` (modified — file header comment updated to include Group 6; `fakeExtAuthzDCB` + `localReplyRecord6` + `newFakeExtAuthzDCB` helpers added; `newBodyBufferingFilter` helper added; 16 Group 6 test functions appended: 3 Group 6A DecodeHeaders, 5 Group 6B accumulation, 1 Group 6C over-limit, 1 Group 6C mid-stream, 1 Group 6C no-counter, 2 Group 6D allow-partial, 2 Group 6E pack_as_bytes, 2 Group 6F per-route override), `docs/envoy-go/DECISIONS.md` (ADR-0162 §Status updated from "Anticipated" to "Accepted"; **Lands-in** updated from hypothesis to confirmed "Task 6 of phase-18.1 PLAN"; §Decision 7-point body (i)–(vii) filled; §Consequences 6-bullet body filled)
+
+**Commit SHA:** TBD
+
+**Notes:** Followed `superpowers:test-driven-development`. Group 6 tests written first (RED confirmed — 9 failing tests); production code authored in `extauthz.go`; then GREEN. Test count 104 → 120 (16 new `func Test` for Group 6). `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet` exit 0; `gofmt -l` empty. 48/48 packages pass.
+
+**Task 6 / Task 9 seam.** Task 6 delivers: (a) the `DecodeHeaders` body-buffering branch (effective `withRequestBody` resolve + `awaitingBody=true` + `bodySettings` cache), and (b) the `DecodeData` accumulation + over-limit 413 + allow_partial truncation. Task 9 delivers: the full `DecodeHeaders` dispatch body (per-route resolve → disabled short-circuit → async outbound check goroutine → disposition application) + `OnDestroy` cancellation. The seam is in `DecodeData` at `endStream=true` (within limit): return `DataStopIterationAndBuffer` with a `// Task 9: fire outbound check here` comment — Task 9 replaces this with the `buildAuthRequest` + `checkFn` goroutine + `dcb.ContinueDecoding()` dispatch per ADR-0159.
+
+**ADR-0128 synchronous-HCM dispatch constraint.** `DecodeHeaders` body-buffering branch returns `Continue` (NOT `StopIteration`) per ADR-0128: envoy-go's HCM runs the `RunDecodeHeaders` → body-read loop → `RunDecodeData` → `RunAction` sequence synchronously in one goroutine (ADR-0076 + connection.go). Returning `StopIteration` from `DecodeHeaders` for body buffering would deadlock (body loop IS the `ContinueDecoding` path). The SPEC §6.3 "return `HeaderStopIteration`" is conceptual Envoy semantics; the envoy-go implementation uses `Continue` for the body-buffering phase (same discipline as buffer/bandwidth_limit filters). The `DataStopIterationAndBuffer` at `endStream=true` in `DecodeData` IS the parking mechanism — it runs in the same goroutine AFTER all body bytes are already accumulated (framework bodyBuf guarantees this per ADR-0128).
+
+**`pack_as_bytes` semantics.** `pack_as_bytes` is parsed into `bufferSettings.packAsBytes` (no HTTP-mode effect in 18.1). In HTTP-mode the POST body is the raw `f.body` bytes verbatim regardless of `pack_as_bytes`. The field is stored for 18.2's gRPC-mode `AttributeContext` builder which uses it to choose `body` (string) vs `raw_body` (bytes). Confirmed in `TestDecodeData_PackAsBytes_BodyVerbatimInHTTPMode`.
+
+**`disable_request_body_buffering` precedence.** Per SPEC §8 + §6.3 step 3: (a) per-route `disable_request_body_buffering=true` → nil (OFF), (b) per-route `with_request_body` set → per-route override, (c) listener-level `withRequestBody`. Implemented in `effectiveWithRequestBody(pr *compiledPerRoute)` helper; confirmed in `TestDecodeHeaders_PerRouteDisableBodyBuffering` and `TestDecodeHeaders_PerRouteWithRequestBodyOverride`.
+
+**NO counter increments on 413 path.** `DecodeData` emits the 413 local-reply and returns `DataStopIterationNoBuffer` WITHOUT incrementing any ext_authz counter. The counter-zero invariant is explicitly tested by `TestDecodeData_OverLimit_AllowPartialFalse_413` (reads all 5 non-`disabled` counters) and `TestDecodeData_OverLimit_NoCounterIncrements` (all 6 counters). This is the load-bearing "auth NOT called, NO counters" assertion from parent SPEC §6 amendment 6.
+
+**ADR-0162 fill.** §Status updated from "Anticipated" to "Accepted"; **Lands-in** confirmed "Task 6 of phase-18.1 PLAN"; §Decision: 7-point body covering `bufferSettings` parse, ADR-0128 reuse + the `Continue`-not-`StopIteration` rationale, over-limit 413 edge case + NO-counter invariant, allow_partial truncation, pack_as_bytes HTTP-mode no-op, effective-withRequestBody precedence, Task 6/Task 9 seam; §Consequences: 6 bullets.
+
+**Outputs:**
+
+### Test run — Group 6 (failing before implementation — RED)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestDecodeHeaders_WithRequestBody|TestDecodeData|TestWithRequestBody_PackAsBytes|TestDecodeData_PackAsBytes|TestDecodeHeaders_PerRoute' -v -count=1 [before production code]
+=== RUN   TestDecodeHeaders_WithRequestBody_SetsAwaitingBodyAndContinue
+    extauthz_test.go:3123: DecodeHeaders(withRequestBody, !endStream): want awaitingBody=true, got false
+--- FAIL: TestDecodeHeaders_WithRequestBody_SetsAwaitingBodyAndContinue (0.00s)
+=== RUN   TestDecodeData_SingleChunk_WithinLimit_EndStream_Parks
+    extauthz_test.go:3192: DecodeData(within limit, endStream=true): want DataStopIterationAndBuffer (Task 9 seam), got 0
+    extauthz_test.go:3195: body: got "", want "hello world"
+--- FAIL: TestDecodeData_SingleChunk_WithinLimit_EndStream_Parks (0.00s)
+=== RUN   TestDecodeData_OverLimit_AllowPartialFalse_413
+    extauthz_test.go:3272: DecodeData(over-limit, allow_partial=false): want DataStopIterationNoBuffer, got 0
+    extauthz_test.go:3277: SendLocalReply: got 0 calls, want 1
+--- FAIL: TestDecodeData_OverLimit_AllowPartialFalse_413 (0.00s)
+[... 6 more failures ...]
+FAIL    github.com/esalaine/envoy-go/internal/filter/http/extauthz  0.004s
+```
+
+### Test run — Group 6 verbose after implementation (GREEN, 16 new test functions + pre-existing skeleton)
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestDecodeHeaders_WithRequestBody|TestDecodeData|TestWithRequestBody_PackAsBytes|TestDecodeData_PackAsBytes|TestDecodeHeaders_PerRoute|TestDecodeHeaders_NoWithRequestBody' -v -count=1
+=== RUN   TestDecodeDataSkeleton_Passthrough
+--- PASS: TestDecodeDataSkeleton_Passthrough (0.00s)
+=== RUN   TestDecodeHeaders_WithRequestBody_SetsAwaitingBodyAndContinue
+--- PASS: TestDecodeHeaders_WithRequestBody_SetsAwaitingBodyAndContinue (0.00s)
+=== RUN   TestDecodeHeaders_WithRequestBody_EndStreamSkipsBuffer
+--- PASS: TestDecodeHeaders_WithRequestBody_EndStreamSkipsBuffer (0.00s)
+=== RUN   TestDecodeHeaders_NoWithRequestBody_AwaitingBodyNotSet
+--- PASS: TestDecodeHeaders_NoWithRequestBody_AwaitingBodyNotSet (0.00s)
+=== RUN   TestDecodeData_Passthrough_AwaitingBodyFalse
+--- PASS: TestDecodeData_Passthrough_AwaitingBodyFalse (0.00s)
+=== RUN   TestDecodeData_SingleChunk_WithinLimit_EndStream_Parks
+--- PASS: TestDecodeData_SingleChunk_WithinLimit_EndStream_Parks (0.00s)
+=== RUN   TestDecodeData_MultiChunk_WithinLimit_EndStream_Parks
+--- PASS: TestDecodeData_MultiChunk_WithinLimit_EndStream_Parks (0.00s)
+=== RUN   TestDecodeData_ExactCap_StrictGreaterThan
+--- PASS: TestDecodeData_ExactCap_StrictGreaterThan (0.00s)
+=== RUN   TestDecodeData_OverLimit_AllowPartialFalse_413
+--- PASS: TestDecodeData_OverLimit_AllowPartialFalse_413 (0.00s)
+=== RUN   TestDecodeData_OverLimit_AllowPartialFalse_MidStream
+--- PASS: TestDecodeData_OverLimit_AllowPartialFalse_MidStream (0.00s)
+=== RUN   TestDecodeData_OverLimit_NoCounterIncrements
+--- PASS: TestDecodeData_OverLimit_NoCounterIncrements (0.00s)
+=== RUN   TestDecodeData_OverLimit_AllowPartialTrue_TruncatesToMaxBytes
+--- PASS: TestDecodeData_OverLimit_AllowPartialTrue_TruncatesToMaxBytes (0.00s)
+=== RUN   TestDecodeData_OverLimit_AllowPartialTrue_MultiChunk
+--- PASS: TestDecodeData_OverLimit_AllowPartialTrue_MultiChunk (0.00s)
+=== RUN   TestWithRequestBody_PackAsBytesStored
+--- PASS: TestWithRequestBody_PackAsBytesStored (0.00s)
+=== RUN   TestDecodeData_PackAsBytes_BodyVerbatimInHTTPMode
+--- PASS: TestDecodeData_PackAsBytes_BodyVerbatimInHTTPMode (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteDisableBodyBuffering
+--- PASS: TestDecodeHeaders_PerRouteDisableBodyBuffering (0.00s)
+=== RUN   TestDecodeHeaders_PerRouteWithRequestBodyOverride
+--- PASS: TestDecodeHeaders_PerRouteWithRequestBodyOverride (0.00s)
+PASS
+ok      github.com/esalaine/envoy-go/internal/filter/http/extauthz  0.004s
+```
+
+### Test run — full suite with race detector
+
+```
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok      github.com/esalaine/envoy-go/internal/filter/http/extauthz  1.074s
+```
+
+120 tests PASS (up from 104 at Task 5 end; 16 new `func Test` appended). 0 failures.
+
+### Test run — go vet
+
+```
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+```
+
+### Test run — gofmt
+
+```
+$ gofmt -l internal/filter/http/extauthz/
+(no output — empty)
+```
+
+### Test run — full suite (48 packages, short mode)
+
+```
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^ok'
+48
+
+$ go test -count=1 -short ./... 2>&1 | grep -cE '^(FAIL|---\s+FAIL)'
+0
+```
+
+### ADR acceptance-criteria grep
+
+```
+$ grep -nE '^## ADR-0162' docs/envoy-go/DECISIONS.md
+8575:## ADR-0162: Request-body inclusion — ...
+```
+
+1 match (1 required). §Decision (7-point body (i)–(vii)) + §Consequences (6 bullets) filled. Status: Accepted; Date: 2026-05-14; Lands-in: Task 6 of phase-18.1 PLAN.
