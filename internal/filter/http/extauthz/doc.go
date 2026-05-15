@@ -167,8 +167,8 @@
 // # ADR anchors (per ADR-0044 ADR-on-impl convention)
 //
 //   - ADR-0156: package shape + DECODER-only HTTPFilter + 6-base-counter
-//     filterStats + unconditional allocation + deny-path SendLocalReply mechanism
-//   - boot-registration ordering. Lands Task 2.
+//     filterStats + unconditional allocation + deny-path SendLocalReply mechanism +
+//     boot-registration ordering. Lands Task 2.
 //   - ADR-0157: compiledConfig shape + services-oneof dual-mode dispatch
 //     (grpc_service arm PARSE-REJECTS in 18.1; §Decision amended at 18.2) +
 //     consumed-vs-deferred field discipline + error-posture fields +
@@ -177,8 +177,8 @@
 //   - ADR-0159: HTTP-outbound auth-check framework primitive (thin ext_authz-
 //     local client; disposition (b) per SPEC §3.1; no shared internal/httpclient/).
 //     Lands Task 3.
-//   - ADR-0160: AuthorizationRequest builder (HTTP-mode portion) — headers_to_add
-//   - path_prefix prepend + allowed_headers/disallowed_headers filtering +
+//   - ADR-0160: AuthorizationRequest builder (HTTP-mode portion) — headers_to_add +
+//     path_prefix prepend + allowed_headers/disallowed_headers filtering +
 //     deprecated AuthorizationRequest.allowed_headers honored-if-present. Lands Task 4.
 //   - ADR-0161: bidirectional header-mutation discipline (HTTP-mode portion) —
 //     allowed_upstream_headers + validate_mutations + deny-path wire shape +

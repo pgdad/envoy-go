@@ -276,21 +276,9 @@ func TestNew_HttpServiceEmptyURI(t *testing.T) {
 	_ = err // any error is correct at Task 2
 }
 
-// TestNew_HttpService_ValidConfig_Task2Stub was the Task 2 stub-path test.
-// TIGHTENED at Task 3: the real buildHTTPCheckFn lands in check.go; a valid
-// http_service config now produces a non-nil factory (no stub error).
-// The stub-path assertions are superseded by TestNew_HttpService_ValidConfig_RealImpl
-// in Group 4. This test is RETIRED (kept for audit trail; it now verifies success).
-func TestNew_HttpService_ValidConfig_Task2Stub(t *testing.T) {
-	// Task 3 tightening: assert factory != nil (real impl landed).
-	factory, err := New(mustAny(t, validHTTPServiceConfig()), freshFactoryCtx())
-	if err != nil {
-		t.Fatalf("New(valid http_service): Task 3 real impl: want nil error, got %v", err)
-	}
-	if factory == nil {
-		t.Fatal("New(valid http_service): Task 3 real impl: want non-nil factory, got nil")
-	}
-}
+// TestNew_HttpService_ValidConfig_Task2Stub was deleted at Task 3 review-fix
+// (Issue 5 — duplicate of TestNew_HttpService_ValidConfig below). The
+// _RealImpl variant is now the keeper, renamed to the clean name.
 
 // TestNew_StatusOnError_Default verifies the default status_on_error is 403
 // when status_on_error is unset. The compiledConfig.statusOnError field should
@@ -937,21 +925,17 @@ func TestResolvePerRouteConfig_UnknownMsgTypeFallback(t *testing.T) {
 
 // scriptableAuthServer is a minimal httptest-based scriptable auth server for
 // Group 4 tests. It serves a fixed HTTP response (status + headers + body)
-// supplied at construction time. After one request, records the received
-// request for later inspection.
+// supplied at construction time.
 type scriptableAuthServer struct {
-	srv      *httptest.Server
-	received *http.Request // set after the first call; guarded by the test's sequential use
+	srv *httptest.Server
 }
 
 // newScriptableAuthServer creates an httptest.Server that returns the given
-// status, headers, and body for every request. The handler captures the last
-// received request in srv.received.
+// status, headers, and body for every request.
 func newScriptableAuthServer(t *testing.T, status int, headers map[string]string, body string) *scriptableAuthServer {
 	t.Helper()
 	sas := &scriptableAuthServer{}
 	sas.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sas.received = r
 		for k, v := range headers {
 			w.Header().Set(k, v)
 		}
@@ -970,7 +954,6 @@ func newSlowAuthServer(t *testing.T) *scriptableAuthServer {
 	t.Helper()
 	sas := &scriptableAuthServer{}
 	sas.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sas.received = r
 		// Sleep until the request context is done (simulates a slow auth service).
 		<-r.Context().Done()
 		// Drain; don't respond.
@@ -1272,17 +1255,16 @@ func TestCheckFn_WithRequestBody(t *testing.T) {
 	}
 }
 
-// TestNew_HttpService_ValidConfig_RealImpl verifies that at Task 3 (real
-// buildHTTPCheckFn) a valid http_service config produces a non-nil factory
-// (no more stub error). This REPLACES / TIGHTENS the Task 2 stub test
-// TestNew_HttpService_ValidConfig_Task2Stub.
-func TestNew_HttpService_ValidConfig_RealImpl(t *testing.T) {
+// TestNew_HttpService_ValidConfig verifies that a valid http_service config
+// produces a non-nil factory (real buildHTTPCheckFn in check.go).
+// Replaces the former Task2Stub + RealImpl pair (Task 3 review-fix Issue 5).
+func TestNew_HttpService_ValidConfig(t *testing.T) {
 	factory, err := New(mustAny(t, validHTTPServiceConfig()), freshFactoryCtx())
 	if err != nil {
-		t.Fatalf("New(valid http_service, real impl): want nil error, got %v", err)
+		t.Fatalf("New(valid http_service): want nil error, got %v", err)
 	}
 	if factory == nil {
-		t.Fatal("New(valid http_service, real impl): want non-nil factory, got nil")
+		t.Fatal("New(valid http_service): want non-nil factory, got nil")
 	}
 }
 
@@ -1292,3 +1274,185 @@ func TestNew_HttpService_ValidConfig_RealImpl(t *testing.T) {
 // Task 3 (their stub-era `if cc != nil` wrappers replaced with unconditional
 // assertions now that buildHTTPCheckFn is real). No separate `_RealImpl`
 // duplicates are kept — the originals carry the tightened assertions.
+// TestNew_HttpService_ValidConfig_Task2Stub was also deleted at Task 3
+// review-fix (Issue 5) — the sole keeper is TestNew_HttpService_ValidConfig.
+
+// -------------------------------------------------------------------------
+// Group 4 — stripPath / joinPaths / buildTargetURL unit tests (no server needed)
+// Added at Task 3 review-fix (Issue 4): table-driven tests for the path-strip
+// and path-join surface used by httpAuthClient.
+// -------------------------------------------------------------------------
+
+// TestStripPath verifies stripPath strips the path component from a server URI,
+// leaving only the scheme+host. Covers URIs with and without path components.
+func TestStripPath(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+		want string
+	}{
+		{
+			name: "URI with path component",
+			uri:  "http://auth.example.com:9191/some/path",
+			want: "http://auth.example.com:9191",
+		},
+		{
+			name: "URI without path",
+			uri:  "http://auth.example.com:9191",
+			want: "http://auth.example.com:9191",
+		},
+		{
+			name: "URI with single-segment path",
+			uri:  "http://auth:9191/base",
+			want: "http://auth:9191",
+		},
+		{
+			name: "HTTPS URI with path",
+			uri:  "https://auth.example.com/auth/v1",
+			want: "https://auth.example.com",
+		},
+		{
+			name: "URI with trailing slash (path component)",
+			uri:  "http://auth:9191/",
+			want: "http://auth:9191",
+		},
+		{
+			name: "URI with no scheme separator (returned as-is)",
+			uri:  "auth.example.com:9191/path",
+			want: "auth.example.com:9191/path",
+		},
+		{
+			name: "empty string",
+			uri:  "",
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripPath(tc.uri)
+			if got != tc.want {
+				t.Errorf("stripPath(%q) = %q; want %q", tc.uri, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestJoinPaths verifies joinPaths joins a prefix and path, avoiding
+// double-slashes and handling empty prefix/path cases.
+func TestJoinPaths(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefix string
+		path   string
+		want   string
+	}{
+		{
+			name:   "both non-empty, both with slash boundary",
+			prefix: "/auth",
+			path:   "/api",
+			want:   "/auth/api",
+		},
+		{
+			name:   "prefix trailing slash + path leading slash — no double slash",
+			prefix: "/auth/",
+			path:   "/api",
+			want:   "/auth/api",
+		},
+		{
+			name:   "prefix no trailing slash + path no leading slash — slash added",
+			prefix: "/auth",
+			path:   "api",
+			want:   "/auth/api",
+		},
+		{
+			name:   "empty prefix — returns path",
+			prefix: "",
+			path:   "/api/resource",
+			want:   "/api/resource",
+		},
+		{
+			name:   "empty path — returns prefix",
+			prefix: "/auth-prefix",
+			path:   "",
+			want:   "/auth-prefix",
+		},
+		{
+			name:   "both empty",
+			prefix: "",
+			path:   "",
+			want:   "",
+		},
+		{
+			name:   "prefix with trailing slash, empty path",
+			prefix: "/auth/",
+			path:   "",
+			want:   "/auth/",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := joinPaths(tc.prefix, tc.path)
+			if got != tc.want {
+				t.Errorf("joinPaths(%q, %q) = %q; want %q", tc.prefix, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildTargetURL verifies buildTargetURL combines a pre-stripped base,
+// a path_prefix, and a request path into the correct outbound URL.
+// buildTargetURL now accepts a pre-stripped base (no stripPath inside).
+func TestBuildTargetURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		base       string // pre-stripped scheme+host
+		pathPrefix string
+		path       string
+		want       string
+	}{
+		{
+			name:       "base + prefix + path",
+			base:       "http://auth:9191",
+			pathPrefix: "/auth-prefix",
+			path:       "/api",
+			want:       "http://auth:9191/auth-prefix/api",
+		},
+		{
+			name:       "base without prefix",
+			base:       "http://auth:9191",
+			pathPrefix: "",
+			path:       "/api/resource",
+			want:       "http://auth:9191/api/resource",
+		},
+		{
+			name:       "base + prefix trailing slash + path leading slash — no double slash",
+			base:       "http://auth:9191",
+			pathPrefix: "/auth/",
+			path:       "/api",
+			want:       "http://auth:9191/auth/api",
+		},
+		{
+			name:       "base with empty path and empty prefix",
+			base:       "http://auth:9191",
+			pathPrefix: "",
+			path:       "",
+			want:       "http://auth:9191",
+		},
+		{
+			name:       "serverURI with path component — pre-stripped, replaced by prefix+path",
+			base:       stripPath("http://auth:9191/base"),
+			pathPrefix: "/auth-prefix",
+			path:       "/api",
+			want:       "http://auth:9191/auth-prefix/api",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildTargetURL(tc.base, tc.pathPrefix, tc.path)
+			if got != tc.want {
+				t.Errorf("buildTargetURL(%q, %q, %q) = %q; want %q",
+					tc.base, tc.pathPrefix, tc.path, got, tc.want)
+			}
+		})
+	}
+}

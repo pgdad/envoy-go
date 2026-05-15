@@ -39,18 +39,9 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.
 // preserved per the filter's proto canonical name).
 const filterName = "envoy.filters.http.ext_authz"
 
-// errHTTPCheckFnStub was the Task 2 stub sentinel for buildHTTPCheckFn.
-// Removed at Task 3 — the real buildHTTPCheckFn implementation lives in check.go.
-// The variable is kept as a nil-value placeholder so any remaining stub-path
-// test assertions (errors.Is(err, errHTTPCheckFnStub)) produce a predictable
-// non-match rather than a compile error.
-//
-// NOTE: TestNew_HttpService_ValidConfig_Task2Stub + TestNew_StatPrefix_Consumed
-// still reference errHTTPCheckFnStub via errors.Is — these tests now always
-// return false for errors.Is (since the real buildHTTPCheckFn succeeds), which
-// is the correct post-Task-3 behavior. The stub-tolerant tests that have
-// `if cc != nil` wrappers are superseded by the _RealImpl variants in Group 4.
-var errHTTPCheckFnStub = errors.New("ext_authz: buildHTTPCheckFn stub (Task 3 lands the real impl)")
+// errHTTPCheckFnStub was removed at Task 3 review-fix — buildHTTPCheckFn is now
+// real (see check.go); the sentinel error allocation is no longer needed.
+// See commit 21f0ac0 for the original Task 3 landing.
 
 // ---------------------------------------------------------------------------
 // Core types per SPEC §6.2 + ADR-0156 + ADR-0157.

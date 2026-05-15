@@ -109,23 +109,27 @@ func buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error) {
 	//    _ = hs.GetAuthorizationResponse()  // parsed but not compiled at Task 3
 
 	// 4. Return the checkFn closure.
-	return buildCheckFnClosure(hac, uri), nil
+	return buildCheckFnClosure(hac), nil
 }
 
 // buildCheckFnClosure returns the checkFn closure for the given httpAuthClient.
 // Separated from buildHTTPCheckFn for testability.
 //
 // The closure:
-//  1. Builds the outbound POST URL: base server URI + path_prefix + request path.
+//  1. Builds the outbound POST URL: hac.baseURL (pre-stripped at build time) +
+//     path_prefix + request path. stripPath runs exactly once per checkFn
+//     lifetime (at buildHTTPCheckFn time), not per request.
 //  2. Creates the POST request with the authRequest headers + optional body.
 //  3. Calls client.Do(req.WithContext(ctx)).
 //  4. Maps the HTTP response → checkDisposition per §5.P10:
 //     200 → dispAllow; 401|403 → dispDeny; anything else → dispError.
-func buildCheckFnClosure(hac *httpAuthClient, serverURI string) checkFn {
+func buildCheckFnClosure(hac *httpAuthClient) checkFn {
 	return func(ctx context.Context, req *authRequest) (checkDisposition, error) {
 		// Build the outbound POST target URL.
-		// path_prefix is prepended to the authRequest path per SPEC §6.5.
-		targetURL := buildTargetURL(serverURI, hac.pathPrefix, req.path)
+		// hac.baseURL is the pre-stripped scheme+host (computed once at
+		// buildHTTPCheckFn time). path_prefix is prepended to the authRequest
+		// path per SPEC §6.5.
+		targetURL := hac.baseURL + joinPaths(hac.pathPrefix, req.path)
 
 		// Create the HTTP request body (nil when req.body is empty per SPEC §6.5).
 		var bodyReader io.Reader
@@ -208,29 +212,22 @@ func mapHTTPResponse(resp *http.Response) (checkDisposition, error) {
 	}
 }
 
-// buildTargetURL constructs the outbound POST target URL by combining the
-// server URI, the path_prefix, and the request path. The path_prefix is
-// prepended to the request path per SPEC §6.5 + §18.P4.
+// buildTargetURL constructs the outbound POST target URL by combining a
+// pre-stripped base URL, the path_prefix, and the request path. The
+// path_prefix is prepended to the request path per SPEC §6.5 + §18.P4.
+//
+// base must already have its path component stripped (i.e. scheme+host only,
+// as returned by stripPath). This function is used by unit tests for the
+// path-joining surface; the live closure uses hac.baseURL + joinPaths directly.
 //
 // Rules:
-//   - The base URL is the serverURI (e.g. "http://auth.example.com:9191/auth").
-//   - The path_prefix is prepended to req.path to form the full outbound path.
+//   - base is the scheme+host (e.g. "http://auth.example.com:9191").
+//   - The path_prefix is prepended to path to form the full outbound path.
 //   - Double-slash is avoided (path_prefix trailing slash + path leading slash).
 //
-// Example: serverURI="http://auth:9191", pathPrefix="/auth-prefix", path="/api"
+// Example: base="http://auth:9191", pathPrefix="/auth-prefix", path="/api"
 // → "http://auth:9191/auth-prefix/api"
-//
-// Example: serverURI="http://auth:9191/base", pathPrefix="/auth-prefix", path="/api"
-// → "http://auth:9191/auth-prefix/api"
-// (the URI's path component is replaced by pathPrefix+path per Envoy's semantics
-// — the server_uri.uri path is the base address, path_prefix+request-path
-// forms the outbound path)
-func buildTargetURL(serverURI, pathPrefix, path string) string {
-	// Extract the scheme+host from serverURI: strip the path component.
-	// The auth server's base address is scheme+host; the outbound path is
-	// path_prefix + request path.
-	base := stripPath(serverURI)
-
+func buildTargetURL(base, pathPrefix, path string) string {
 	// Build the outbound path: path_prefix + request path.
 	// Avoid double-slash between prefix and path.
 	outPath := joinPaths(pathPrefix, path)

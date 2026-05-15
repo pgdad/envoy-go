@@ -496,3 +496,19 @@ $ grep -nE '^## ADR-0159' docs/envoy-go/DECISIONS.md
 ```
 
 1 match (1 required). §Decision (5-point body (i)–(v)) + §Consequences filled. Status: Accepted; Date: 2026-05-14; Lands-in: Task 3 of phase-18.1 PLAN.
+
+### Task 3 review-fix (6 issues from code-quality review)
+
+**Issue 1 (Important)** — Dead `httpAuthClient.baseURL` field + double-strip eliminated. `buildCheckFnClosure` signature changed from `(hac *httpAuthClient, serverURI string)` to `(hac *httpAuthClient)` (check.go:124); the closure now uses `hac.baseURL + joinPaths(hac.pathPrefix, req.path)` directly (check.go:132) instead of calling `buildTargetURL(serverURI, ...)` → `stripPath(serverURI)` per request. `buildTargetURL` repurposed to take a pre-stripped `base` string (check.go:213–231) — `stripPath` runs exactly once per checkFn lifetime (at `buildHTTPCheckFn` time, check.go:99). Call site in `buildHTTPCheckFn` updated: `buildCheckFnClosure(hac)` (check.go:112). `uri` local variable is still used for `stripPath(uri)` in the `hac` struct literal.
+
+**Issue 2 (Minor)** — `errHTTPCheckFnStub` dead-code var removed. The `errors.New(...)` allocation (extauthz.go:53) and its factually incorrect comment claiming tests reference it via `errors.Is` are replaced by a single one-line tombstone comment (extauthz.go:42–44).
+
+**Issue 3 (Minor)** — `doc.go` gofmt-broken bullet continuations fixed. Two orphaned fragments in the `# ADR anchors` section repaired: ADR-0156 bullet now ends `…mechanism + boot-registration ordering. Lands Task 2.` (doc.go:170–171 collapsed); ADR-0160 bullet now starts `…headers_to_add +` so the next line is a proper continuation (doc.go:180–182). `go doc ./internal/filter/http/extauthz/ | tail -40` confirms all ADR bullets render as single coherent items.
+
+**Issue 4 (Minor)** — `stripPath` + `joinPaths` + `buildTargetURL` unit tests added. Three table-driven tests in `extauthz_test.go` (appended after Group 4): `TestStripPath` (7 cases: URI with path, without path, single-segment path, HTTPS, trailing slash, no scheme separator, empty), `TestJoinPaths` (7 cases: both non-empty, double-slash avoidance, no-slash-added, empty prefix, empty path, both empty, prefix-trailing-slash-empty-path), `TestBuildTargetURL` (5 cases: base+prefix+path, no prefix, double-slash avoidance, both empty, serverURI-with-path-component pre-stripped). No live server needed.
+
+**Issue 5 (Minor)** — Duplicate test cleaned up. `TestNew_HttpService_ValidConfig_Task2Stub` deleted (extauthz_test.go:284–293 replaced with a tombstone comment). `TestNew_HttpService_ValidConfig_RealImpl` renamed to `TestNew_HttpService_ValidConfig` (extauthz_test.go:1279). One test, cleanly named. NOTE comment updated accordingly.
+
+**Issue 6 (Minor)** — Latent unsynchronized `sas.received` write removed. `received *http.Request` field removed from `scriptableAuthServer` struct (extauthz_test.go:943). `sas.received = r` write removed from both `newScriptableAuthServer` handler (extauthz_test.go:942) and `newSlowAuthServer` handler (extauthz_test.go:961). Nothing reads `received`; the field and both writes were dead and would constitute a data-race if a future test read the field unsynchronized.
+
+All 6 fixes: `go build` exit 0, `go vet` exit 0, `gofmt -l` empty, `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0 (ok 1.069s).
