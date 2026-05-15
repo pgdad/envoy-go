@@ -1,0 +1,221 @@
+# envoy-go bootstrap for fixture 0020-http-ext-authz-http.
+#
+# Functionally equivalent to envoy.yaml modulo:
+#   - cluster type: STATIC (envoy-go convention) vs STRICT_DNS (reference Envoy).
+#   - cluster endpoint addresses: 127.0.0.1 (envoy-go runs on the host loopback)
+#     vs host.docker.internal (reference Envoy runs in a Docker container).
+#   - admin/listener ports independently allocated by the runner per proxy.
+#   - no dns_lookup_family (STATIC clusters do not DNS-resolve).
+#
+# Three-listener plaintext topology per SPEC §7.2 + driver.go topology contract
+# (Task 11 review-fix) — no TLS in phase 18.1 (planner-time decision D12):
+#
+#   l_test_a (port {{.LATestPort}}) — scenarios 1+2+5+6+7.
+#   l_test_b (port {{.LBTestPort}}) — scenario 3.
+#   l_test_c (port {{.LCTestPort}}) — scenario 4.
+#
+# Subject listener ports are runner-allocated at SubjectConfig time:
+#   LA = subjListenerPort, LB = subjListenerPort+1, LC = subjListenerPort+2.
+#
+# Templating: rendered by the driver's mustRender() at SubjectConfig time.
+# Substitution keys (note: NO BackendHost / AuthHost / AuthDownHost;
+# envoy-go always uses 127.0.0.1 for STATIC clusters):
+#   {{.AdminPort}}    — admin endpoint port (runner-allocated).
+#   {{.LATestPort}}   — l_test_a listener port (runner-allocated).
+#   {{.LBTestPort}}   — l_test_b listener port (runner-allocated).
+#   {{.LCTestPort}}   — l_test_c listener port (runner-allocated).
+#   {{.BackendPort}}  — echobackend port (runner-allocated).
+#   {{.AuthPort}}     — live auth server port (driver-allocated).
+#   {{.AuthDownPort}} — unreachable auth port (driver-allocated + immediately closed).
+#
+# Cluster c_backend: STATIC at 127.0.0.1:<BackendPort>.
+# Cluster c_authz:   STATIC at 127.0.0.1:<AuthPort> (live in-process auth server).
+# Cluster c_authz_down: STATIC at 127.0.0.1:<AuthDownPort> (hardcoded unreachable).
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    # === l_test_a — failure_mode_allow:false + live auth (c_authz) ===
+    # Scenarios 1 (HTTP allow), 2 (HTTP deny), 5 (with_request_body),
+    # 6 (per-route disabled), 7 (per-route check_settings).
+    - name: l_test_a
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LATestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_a
+                route_config:
+                  name: rc_test_a
+                  virtual_hosts:
+                    - name: vh_test_a
+                      domains: ["*"]
+                      routes:
+                        # Scenario 1: HTTP allow — auth FixedScript 200 + x-authz-result: allowed.
+                        - match: { path: "/scenarios/1-allow" }
+                          route: { cluster: c_backend }
+                        # Scenario 2: HTTP deny — auth FixedScript 403 + body "access denied".
+                        - match: { path: "/scenarios/2-deny" }
+                          route: { cluster: c_backend }
+                        # Scenario 5: with_request_body — listener-level with_request_body active.
+                        - match: { path: "/scenarios/5-body" }
+                          route: { cluster: c_backend }
+                        # Scenario 6: per-route disabled — ExtAuthzPerRoute{disabled: true}.
+                        # No auth call; no ext_authz counter increments.
+                        - match: { path: "/scenarios/6-disabled" }
+                          route: { cluster: c_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        # Scenario 7: per-route check_settings — disable_request_body_buffering:true.
+                        - match: { path: "/scenarios/7-check-settings" }
+                          route: { cluster: c_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                disable_request_body_buffering: true
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      with_request_body:
+                        max_request_bytes: 4096
+                        allow_partial_message: false
+                      allowed_headers:
+                        patterns:
+                          - exact: "authority"
+                          - prefix: "x-"
+                      http_service:
+                        server_uri:
+                          uri: "http://127.0.0.1:{{.AuthPort}}"
+                          cluster: c_authz
+                          timeout: 10s
+                        path_prefix: "/authcheck"
+                        authorization_request:
+                          headers_to_add:
+                            - key: "x-fixture-fingerprint"
+                              value: "0020"
+                        authorization_response:
+                          allowed_upstream_headers:
+                            patterns:
+                              - exact: "x-authz-result"
+                          allowed_client_headers:
+                            patterns:
+                              - exact: "x-authz-denied"
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_b — failure_mode_allow:false + status_on_error:503 + unreachable auth ===
+    # Scenario 3: auth server unreachable (c_authz_down); 503 returned.
+    - name: l_test_b
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LBTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_b
+                route_config:
+                  name: rc_test_b
+                  virtual_hosts:
+                    - name: vh_test_b
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/scenarios/3-error" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      status_on_error:
+                        code: ServiceUnavailable
+                      http_service:
+                        server_uri:
+                          uri: "http://127.0.0.1:{{.AuthDownPort}}"
+                          cluster: c_authz_down
+                          timeout: 10s
+                        path_prefix: "/authcheck"
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_c — failure_mode_allow:true + failure_mode_allow_header_add:true ===
+    # Scenario 4: auth server unreachable (c_authz_down); allowed through + marker header.
+    - name: l_test_c
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LCTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local_c
+                route_config:
+                  name: rc_test_c
+                  virtual_hosts:
+                    - name: vh_test_c
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/scenarios/4-failure-allow" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      failure_mode_allow: true
+                      failure_mode_allow_header_add: true
+                      http_service:
+                        server_uri:
+                          uri: "http://127.0.0.1:{{.AuthDownPort}}"
+                          cluster: c_authz_down
+                          timeout: 10s
+                        path_prefix: "/authcheck"
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # c_backend: echobackend subprocess on host loopback.
+    - name: c_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }
+    # c_authz: in-process HTTP auth server on host loopback (live; l_test_a).
+    - name: c_authz
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_authz
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.AuthPort}} }
+    # c_authz_down: hardcoded unreachable port on host loopback (l_test_b + l_test_c).
+    - name: c_authz_down
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_authz_down
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.AuthDownPort}} }

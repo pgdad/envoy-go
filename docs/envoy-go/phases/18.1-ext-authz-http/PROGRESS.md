@@ -1809,3 +1809,119 @@ $ gofmt -l /home/esa/git/envoy-go/.worktrees/phase-18.1-ext-authz-http-impl/
 ### Task 11 review-fix commit SHA
 
 TBD (filled post-commit)
+
+---
+
+## Task 12 — Fixture `0020-http-ext-authz-http` — `envoy.yaml` + `envoy-go.yaml` bootstraps
+
+**Files changed:**
+- Created: `test/fixtures/0020-http-ext-authz-http/envoy.yaml` (three-listener bootstrap, reference Envoy STRICT_DNS)
+- Created: `test/fixtures/0020-http-ext-authz-http/envoy-go.yaml` (three-listener bootstrap, envoy-go STATIC)
+- Modified: `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (this entry)
+
+**Key design decisions:**
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `stat_prefix` (HCM) | `hcm_local_a`, `hcm_local_b`, `hcm_local_c` | Per-listener distinct prefix; drives `envoy_http_conn_manager_prefix` label in Prometheus (SN2-reuse) |
+| `with_request_body.max_request_bytes` | 4096 | Covers "hello world" (11 bytes) + "check-settings-body" (19 bytes) well within limit; no 413 on normal traffic |
+| `path_prefix` | `/authcheck` | Exercises path-prefix prepending per SPEC §7.2; non-trivial value |
+| `headers_to_add` | `x-fixture-fingerprint: 0020` | Exercises Task-9 Option-A fix (pre-compiled `cc.headersToAdd`) |
+| `allowed_headers` (top-level) | `exact: authority` + `prefix: x-` | Request-side filtering; exercises Group 3 (allowed_headers) against live scenarios |
+| `allowed_upstream_headers` | `exact: x-authz-result` | S1 allow-path upstream injection; auth server returns this header on 200 |
+| `allowed_client_headers` | `exact: x-authz-denied` | S2 deny-path client header; auth server returns this on 403 |
+| `status_on_error` | `ServiceUnavailable` (503) | l_test_b scenario 3; matches the SPEC §7.1 table and driver expectation |
+| Reference cluster type | `STRICT_DNS` + `dns_lookup_family: V4_ONLY` | Required for Docker container to resolve `host.docker.internal` (ADR-0010) |
+| envoy-go cluster type | `STATIC` | envoy-go convention; 127.0.0.1 loopback; no DNS resolution needed |
+| TLS | None (plaintext) | Planner-time decision D12 |
+| connect_timeout (reference) | 1s | Standard per phase-14/15/16/17 precedent |
+
+**Topology wiring (mirrors driver contract):**
+
+| Listener | stat_prefix | failure_mode_allow | status_on_error | failure_mode_allow_header_add | Auth cluster |
+|---|---|---|---|---|---|
+| l_test_a | hcm_local_a | false (default) | default 403 (N/A) | false | c_authz (LIVE) |
+| l_test_b | hcm_local_b | false | ServiceUnavailable (503) | false | c_authz_down (UNREACHABLE) |
+| l_test_c | hcm_local_c | true | default 403 (N/A) | true | c_authz_down (UNREACHABLE) |
+
+**Per-route overrides (l_test_a only):**
+- `/scenarios/6-disabled` → `ExtAuthzPerRoute{disabled: true}` (5th-canonical disabled arm)
+- `/scenarios/7-check-settings` → `ExtAuthzPerRoute{check_settings{disable_request_body_buffering: true}}` (5th-canonical check_settings arm)
+
+**Note on `AuthHost`/`AuthDownHost` template keys:** `envoy.yaml` uses `{{.AuthHost}}` + `{{.AuthDownHost}}` for the `server_uri.uri` host (reference driver passes `host.docker.internal`); `envoy-go.yaml` hardcodes `127.0.0.1` inline in the URI strings (the driver passes `AuthHost`/`AuthDownHost` but the envoy-go template does not use them — only `AuthPort`/`AuthDownPort` are substituted). This is intentional: reference uses the `{{.AuthHost}}` key so the same template renders correctly in Docker; envoy-go always targets loopback.
+
+**Note on stat_prefix cross-side stats:** The three listeners use distinct HCM `stat_prefix` values (`hcm_local_a/b/c`), which means each listener's ext_authz counters emit under a separate `envoy_http_conn_manager_prefix` label. The `lookupExtAuthzCounter` helper in driver.go sums across all observed label permutations, so the counter assertions in `AssertStats` correctly aggregate ok/denied/error/failure_mode_allowed/invalid across all three listeners. Task 13 confirms the exact Prometheus label shapes empirically.
+
+**Validation outputs:**
+
+### envoy-go.yaml: bootstrap.Load validation
+
+```
+$ go run cmd/validate-fixture/main.go test/fixtures/0020-http-ext-authz-http/envoy-go.yaml
+OK: bootstrap.Load succeeded — no parse errors
+```
+
+(Rendered with synthetic ports: AdminPort=9090, LA=10100, LB=10101, LC=10102,
+BackendPort=8080, AuthPort=12000, AuthDownPort=12001.)
+
+### envoy.yaml: reference Envoy v1.37.2 config-check (--mode validate)
+
+```
+$ docker run --rm \
+  -v /tmp/envoy-0020-ref.yaml:/etc/envoy/envoy.yaml \
+  envoyproxy/envoy:v1.37.2 \
+  --mode validate \
+  -c /etc/envoy/envoy.yaml
+[...][info][config] [...] loading 3 cluster(s)
+[...][info][config] [...] loading 3 listener(s)
+configuration '/etc/envoy/envoy.yaml' OK
+```
+
+(Rendered with synthetic ports: AdminPort=9901, LA=10020, LB=10021, LC=10022,
+BackendHost=host.docker.internal, BackendPort=8080, AuthHost=host.docker.internal,
+AuthPort=12000, AuthDownHost=host.docker.internal, AuthDownPort=12001.)
+
+### go build ./...
+
+```
+$ go build ./...
+(exit 0 — no output)
+```
+
+### go vet ./...
+
+```
+$ go vet ./...
+(exit 0 — no output)
+```
+
+### gofmt -l
+
+```
+$ gofmt -l /home/esa/git/envoy-go/.worktrees/phase-18.1-ext-authz-http-impl/
+(empty — all files formatted)
+```
+
+### go test -count=1 -short ./...
+
+```
+$ go test -count=1 -short ./...
+ok  github.com/esalaine/envoy-go/cmd/envoy-go                          3.911s
+ok  github.com/esalaine/envoy-go/internal/filter/http/extauthz        0.295s
+[... 47 ok packages, 0 failures ...]
+```
+
+**Self-review findings:**
+
+1. Both YAML files render with no undefined `{{.}}` keys — all substitution keys exactly match the driver's `ReferenceBootstrap` / `SubjectConfig` data maps.
+2. envoy-go config validates via `bootstrap.Load` (exercises full filter factory chain including extauthz `New()` + `buildCompiledConfig`).
+3. Reference Envoy config validates via `--mode validate` against v1.37.2.
+4. Three listeners + three clusters wired per driver contract.
+5. Per-route overrides for scenarios 6 (disabled) + 7 (check_settings) on l_test_a.
+6. `with_request_body` is set ONLY on l_test_a (for S5 + S7).
+7. `failure_mode_allow_header_add` is set ONLY on l_test_c (scenario 4).
+8. Both sides use identical ext_authz filter configs (listener-level) — the configs are structurally equivalent except for cluster type (STRICT_DNS vs STATIC) and endpoint addresses (host.docker.internal vs 127.0.0.1).
+
+**Concern for Task 13:** The `lookupExtAuthzCounter` helper sums across ALL listeners by label. With three listeners each having its own `hcm_local_{a,b,c}` stat_prefix, the stats will appear under three separate `envoy_http_conn_manager_prefix` labels. The helper's summation logic should handle this correctly (it sums all matching metric lines regardless of label). Task 13 will confirm via the empirical scrape.
+
+**Commit SHA:** TBD (filled post-commit)
