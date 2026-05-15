@@ -1,6 +1,6 @@
 package extauthz
 
-// extauthz_test.go — unit-test Groups 1 + 2 + 3 + 4 + 6 + 7 + 8 (through Task 6).
+// extauthz_test.go — unit-test Groups 1 + 2 + 3 + 4 + 6 + 7 + 8 (through Task 7).
 //
 // Test group assignments per PLAN / SPEC §14.1:
 //
@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -611,7 +612,7 @@ func TestOnDestroySkeleton_NoOp(t *testing.T) {
 
 // ----------------------------------------------------------------------------
 // Group 7 — per-route: parsePerRoute + resolvePerRouteConfig
-// (Group 7 per SPEC §14.1 + PLAN Task 2)
+// (Group 7 per SPEC §14.1 + PLAN Tasks 2 + 7)
 // ----------------------------------------------------------------------------
 
 // TestParsePerRoute_EmptyOverride verifies PARSE-REJECT when override oneof is not set.
@@ -1032,17 +1033,16 @@ func TestResolvePerRouteConfig_ConcurrentSameProto(t *testing.T) {
 	}
 
 	const n = 20
+	var wg sync.WaitGroup
 	results := make([]*compiledPerRoute, n)
-	done := make(chan struct{})
+	wg.Add(n)
 	for i := range n {
 		go func(idx int) {
+			defer wg.Done()
 			results[idx] = state.resolvePerRouteConfig(pr)
-			done <- struct{}{}
 		}(i)
 	}
-	for range n {
-		<-done
-	}
+	wg.Wait()
 
 	// All goroutines must return the same pointer (sync.Map LoadOrStore ensures
 	// exactly one *compiledPerRoute is stored per proto pointer).

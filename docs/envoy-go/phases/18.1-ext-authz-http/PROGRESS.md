@@ -1076,3 +1076,33 @@ $ grep -nE '^## ADR-0163' docs/envoy-go/DECISIONS.md
 ```
 
 1 match (1 required). §Decision (8-point body (i)–(viii)) + §Consequences (5 bullets) filled. Status: Accepted; Date: 2026-05-14; Lands-in: Task 7 of phase-18.1 PLAN.
+
+### Task 7 review-fix
+
+Code-quality review returned "Approve with minor fixes" (2 Important + 1 Minor). All 3 fixed in a follow-up commit:
+
+1. **(Important) `TestResolvePerRouteConfig_ConcurrentSameProto` should use `sync.WaitGroup` instead of unbuffered channel.** The project precedent for concurrent tests is `sync.WaitGroup` with `wg.Add(N)` before goroutine launch + `defer wg.Done()` in each (see `internal/filter/http/jwtauthn/jwtauthn_test.go:1248`). The original Task 7 test used `done := make(chan struct{})` (unbuffered), which allows goroutines to serialize on the send (each finished goroutine blocks until the previous send is received), narrowing the race-triggering window. Refactored to the established `sync.WaitGroup` pattern in `internal/filter/http/extauthz/extauthz_test.go` (~line 1034): `var wg sync.WaitGroup` + `wg.Add(n)` before the launch loop + `defer wg.Done()` in each goroutine + `wg.Wait()` before assertions. Added `"sync"` to the import block. The test still passes under `-race`.
+2. **(Important) Stale file header + Group 7 section header comments.** `extauthz_test.go` line 3 said "unit-test Groups 1 + 2 + 3 + 4 + 6 + 7 + 8 (through Task 6)" — Task 7 extended Group 7, so updated to "(through Task 7)". `extauthz_test.go` line 614 said "(Group 7 per SPEC §14.1 + PLAN Task 2)" — Task 7 added 8 new Group 7 tests, so updated to "(Group 7 per SPEC §14.1 + PLAN Tasks 2 + 7)".
+3. **(Minor) ADR-0163 §Decision (viii) match count is wrong.** §Decision (viii) in `docs/envoy-go/DECISIONS.md` (~line 8657) said "`grep -nE '\(xiv\)' docs/envoy-go/DECISIONS.md` returns 2 matches, but both are explanatory text within ADR-0163 §Context". Actual count is 3 (lines 8633 + 8641 in §Context plus a third match at line 8657 in §Decision (viii) itself — the §Decision sentence uses `\(xiv\)` in its own explanation). Updated to "returns 3 matches, but all three are explanatory text within ADR-0163 §Context/§Decision describing the ABSENCE of §(xiv)".
+
+Test count unchanged (129; no new tests added — refactor + comment-correctness only). `go build` / `go vet` / `gofmt -l` (empty) / `go test -race -count=1 ./internal/filter/http/extauthz/...` all green.
+
+```
+$ go build ./internal/filter/http/extauthz/...
+[no output]
+
+$ go vet ./internal/filter/http/extauthz/...
+[no output]
+
+$ gofmt -l ./internal/filter/http/extauthz/
+[no output — empty]
+
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.075s
+
+$ go test -race -count=1 -run '^TestResolvePerRouteConfig_ConcurrentSameProto$' -v ./internal/filter/http/extauthz/...
+=== RUN   TestResolvePerRouteConfig_ConcurrentSameProto
+--- PASS: TestResolvePerRouteConfig_ConcurrentSameProto (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.009s
+```
