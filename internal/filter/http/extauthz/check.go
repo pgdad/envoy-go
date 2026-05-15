@@ -336,21 +336,6 @@ func buildDenyHeaders(headers http.Header, allowedClient *stringMatcherList) []h
 	return decisionHeaders
 }
 
-// mapHTTPResponse maps an HTTP response to a checkDisposition using nil matchers
-// (no header extraction). Kept for backward compatibility with Group 4 tests
-// that call the closure directly without authorization_response configured.
-// This function is no longer called by the production closure — it is replaced
-// by mapHTTPResponseWithMatchers. Retained as a package-internal helper for
-// test infrastructure that calls it via the closure (not directly).
-//
-// NOTE: This function is intentionally kept to avoid breaking the Task 3 tests
-// that test the closure behavior through buildCheckFnClosure. The production path
-// now always goes through mapHTTPResponseWithMatchers (called by buildCheckFnClosure).
-// This wrapper delegates to mapHTTPResponseWithMatchers with all-nil matchers.
-func mapHTTPResponse(resp *http.Response) (checkDisposition, error) {
-	return mapHTTPResponseWithMatchers(resp, nil, nil, nil, false)
-}
-
 // buildTargetURL constructs the outbound POST target URL by combining a
 // pre-stripped base URL, the path_prefix, and the request path. The
 // path_prefix is prepended to the request path per SPEC §6.5 + §18.P4.

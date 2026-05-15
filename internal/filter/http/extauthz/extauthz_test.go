@@ -2718,32 +2718,36 @@ func TestValidateMutations_AllowPath_PseudoHeaderRejected(t *testing.T) {
 }
 
 // TestValidateMutations_AllowPath_InvalidNameCharsRejected verifies that when
-// validate_mutations is true and the auth service returns a header with an
-// invalid name character (space), the disposition becomes dispInvalid.
+// validate_mutations is true and the auth service returns an upstream-set header
+// whose name contains an invalid character (space), the disposition becomes
+// dispInvalid.
+//
+// Same net/http limitation as the pseudo-header variant above: net/http's
+// HTTP/1.1 wire layer would reject an invalid header name, so we hand-craft a
+// *http.Response whose Header map already carries the invalid-name header and
+// drive it through mapHTTPResponseWithMatchers — genuinely exercising the
+// mapHTTPResponseWithMatchers → validateMutationHeaders → dispInvalid wiring.
 func TestValidateMutations_AllowPath_InvalidNameCharsRejected(t *testing.T) {
-	// The auth server returns a header "x bad name" (space in name).
-	// We must construct the response manually since httptest cannot set an invalid header name.
-	// Instead: test validate_mutations gating by invoking the underlying
-	// mapHTTPResponse directly (via buildCheckFnClosureWithMatchers) — but
-	// since mapHTTPResponse is now internal, we test at the checkFn level by
-	// using a custom HTTP server that writes raw invalid headers over the wire.
-	// For simplicity, we test validate_mutations indirectly: configure a
-	// pseudo-header pattern that net/http would send literally.
-	//
-	// Actually, test via buildCheckFnClosure with pre-populated upstreamSet.
-	// The cleanest unit-level test is through mapHTTPResponseWithMatchers.
-	// Since that's an internal function, use validateMutationHeaders directly
-	// to cover the rejection cases, and trust the integration from TestValidateMutations_AllowPath_PseudoHeaderRejected
-	// covers the wiring.
-	//
-	// Test the gating function directly for the invalid-name-chars case.
-	hdrs := []headerKV{{name: "invalid name", value: "val"}}
-	if err := validateMutationHeaders(hdrs); err == nil {
-		t.Error("validateMutationHeaders(invalid name chars): want error, got nil")
+	// Match the invalid-name header so extraction pulls it into upstreamSet.
+	allowedUpstream, err := compileStringMatcherList(makeAuthResponseMatcher(t, "invalid name"))
+	if err != nil {
+		t.Fatalf("compileStringMatcherList: %v", err)
 	}
-	// Verify that dispInvalid is 3 (not confused with dispAllow/dispDeny/dispError).
-	if dispInvalid == dispAllow || dispInvalid == dispDeny || dispInvalid == dispError {
-		t.Error("dispInvalid must be distinct from dispAllow/dispDeny/dispError")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			// http.Header is a map[string][]string; keys need not be canonical.
+			// A space in the name is invalid per RFC 7230 §3.2.6.
+			"invalid name": {"val"},
+		},
+		Body: http.NoBody,
+	}
+	disp, err := mapHTTPResponseWithMatchers(resp, allowedUpstream, nil, nil, true /* validateMutations */)
+	if err != nil {
+		t.Fatalf("mapHTTPResponseWithMatchers(validate+invalid-name): unexpected error: %v", err)
+	}
+	if disp.class != dispInvalid {
+		t.Errorf("disposition class: got %v, want dispInvalid (invalid-name header rejected by validate_mutations)", disp.class)
 	}
 }
 
@@ -2970,5 +2974,50 @@ func TestDeprecatedAllowedHeaders_MalformedParseReject(t *testing.T) {
 	// Error must mention the invalid regex or the deprecated field.
 	if !strings.Contains(err.Error(), "allowed_headers") && !strings.Contains(err.Error(), "regex") {
 		t.Errorf("error = %q; want mention of 'allowed_headers' or 'regex'", err.Error())
+	}
+}
+
+// TestDeprecatedAllowedHeaders_NullOutWhenTopLevelSet verifies the security-
+// relevant precedence property on real buildCompiledConfig output: when BOTH the
+// top-level ExtAuthz.AllowedHeaders and the deprecated
+// AuthorizationRequest.AllowedHeaders are set, buildCompiledConfig nulls out
+// cc.deprecatedAllowedHeaders so the deprecated field cannot override (or
+// widen/narrow) the top-level allow-list. The top-level allow-list must remain
+// the sole effective request-side filter.
+func TestDeprecatedAllowedHeaders_NullOutWhenTopLevelSet(t *testing.T) {
+	srv := newScriptableAuthServer(t, http.StatusOK, map[string]string{}, "")
+	cfg := &ext_authzv3.ExtAuthz{
+		// Top-level allow-list (the primary, non-deprecated path).
+		AllowedHeaders: makeListStringMatcher(exactPattern("x-top-level")),
+		Services: &ext_authzv3.ExtAuthz_HttpService{
+			HttpService: &ext_authzv3.HttpService{
+				ServerUri: &corev3.HttpUri{Uri: srv.srv.URL},
+				AuthorizationRequest: &ext_authzv3.AuthorizationRequest{
+					// Deprecated allow-list — must NOT take effect when the
+					// top-level field is present.
+					AllowedHeaders: makeListStringMatcher(exactPattern("authorization")),
+				},
+			},
+		},
+		TransportApiVersion: corev3.ApiVersion_V3,
+	}
+	cc, err := buildCompiledConfig(freshFactoryCtx(), cfg)
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
+	}
+	if cc == nil {
+		t.Fatal("buildCompiledConfig: got nil cc")
+	}
+	// The deprecated field must be nulled out — it must not override the
+	// top-level allow-list.
+	if cc.deprecatedAllowedHeaders != nil {
+		t.Error("cc.deprecatedAllowedHeaders: got non-nil, want nil (top-level AllowedHeaders set → deprecated field nulled)")
+	}
+	// The top-level allow-list must remain the effective filter.
+	if cc.allowedHeaders == nil {
+		t.Fatal("cc.allowedHeaders: got nil, want non-nil (top-level AllowedHeaders set)")
+	}
+	if !cc.allowedHeaders.matchAny("x-top-level") {
+		t.Error("cc.allowedHeaders: does not match 'x-top-level' (top-level allow-list must be effective)")
 	}
 }

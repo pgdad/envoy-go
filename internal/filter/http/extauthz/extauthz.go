@@ -438,7 +438,7 @@ func buildCompiledConfig(ctx envoyhttp.FactoryCtx, raw *ext_authzv3.ExtAuthz) (*
 // buildHTTPCheckFn is defined in check.go (Task 3 real implementation).
 // At Task 2 this was a stub in this file; at Task 3 the real implementation
 // lives in check.go and this comment serves as the cross-reference.
-// Signature: buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error)
+// Signature: buildHTTPCheckFn(hs *ext_authzv3.HttpService, validateMutations bool) (checkFn, error)
 
 // compileStringMatcherList is defined in attributes.go (Task 4 real implementation).
 // It compiles a *matcherv3.ListStringMatcher into a *stringMatcherList with error
