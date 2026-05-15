@@ -23,8 +23,19 @@ package extauthz
 // Zero retry per planner-time decision D2: `HttpService` has no retry-policy
 // proto field; a connect failure / timeout maps directly to dispError.
 //
-// The request-side header filtering (buildAuthRequest / compileStringMatcherList)
-// is STUBBED at Task 3 — the closure uses the authRequest headers as-is.
+// Request-side header filtering — call-site boundary (Task 4 review-fix):
+//   buildAuthRequest (attributes.go, Task 4) performs the request-side header
+//   filtering — allowed_headers / disallowed_headers / headers_to_add. It is
+//   NOT called from this file: buildAuthRequest needs the per-stream *filter
+//   (carrying the per-route-resolved f.activeRC) AND the real client request
+//   headers from dcb.RequestHeaders(), neither of which exists at config-load
+//   time inside buildHTTPCheckFn nor inside the mode-agnostic checkFn closure
+//   (which by contract RECEIVES an already-built *authRequest). buildAuthRequest
+//   is therefore called at the DecodeHeaders dispatch site (Task 9, ADR-0159) —
+//   the only place with both f and the raw headers. The closure below correctly
+//   just transmits the *authRequest it is handed. See the PROGRESS.md Task 4
+//   entry "Deviation from PLAN Step 4" note and ADR-0160 §Decision (v)/(vii).
+//
 // The allowed_upstream_headers / allowed_client_headers extraction is STUBBED
 // at Task 3 — the disposition header fields are populated minimally.
 // Real extraction + validate_mutations gating land at Task 5.
@@ -120,6 +131,8 @@ func buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error) {
 //     path_prefix + request path. stripPath runs exactly once per checkFn
 //     lifetime (at buildHTTPCheckFn time), not per request.
 //  2. Creates the POST request with the authRequest headers + optional body.
+//     The *authRequest is built by the caller (buildAuthRequest at the Task 9
+//     DecodeHeaders site); the closure transmits it as-is.
 //  3. Calls client.Do(req.WithContext(ctx)).
 //  4. Maps the HTTP response → checkDisposition per §5.P10:
 //     200 → dispAllow; 401|403 → dispDeny; anything else → dispError.
@@ -143,8 +156,12 @@ func buildCheckFnClosure(hac *httpAuthClient) checkFn {
 			return checkDisposition{class: dispError}, fmt.Errorf("ext_authz: build request: %w", err)
 		}
 
-		// Copy the authRequest headers (request-side-filtered headers from Task 4;
-		// at Task 3 these are the authRequest headers as-is).
+		// Copy the authRequest headers. req is an already-built *authRequest:
+		// when Task 9 wires DecodeHeaders, req.headers are the request-side-
+		// filtered headers produced by buildAuthRequest (attributes.go); the
+		// closure faithfully transmits whatever it is handed (it does NOT itself
+		// run the allowed_headers/disallowed_headers filtering — see the
+		// call-site-boundary note in this file's header comment).
 		for name, values := range req.headers {
 			for _, v := range values {
 				outReq.Header.Add(name, v)

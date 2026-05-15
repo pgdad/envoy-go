@@ -568,8 +568,19 @@ func baseStatPrefix(hcmStatPrefix string) string {
 // body (per-route resolve → disabled short-circuit → with_request_body wait →
 // async outbound check → disposition application) lands at Task 9 per the
 // phase-09 fault async-resume primitive.
+//
+// Task 9 buildAuthRequest call-site (Task 4 review-fix forward-pointer):
+// before invoking f.activeRC.checkFn, Task 9 MUST call buildAuthRequest(f, hs,
+// dcb.RequestHeaders(), f.body, path) to construct the request-side-filtered
+// *authRequest, then pass that *authRequest into the checkFn closure. The
+// closure (check.go) does NOT do the request-side header filtering itself —
+// buildAuthRequest needs the per-stream f (f.activeRC) + the real request
+// headers, which only exist here at DecodeHeaders, not at config-load time.
+// See the PROGRESS.md Task 4 "Deviation from PLAN Step 4" note + ADR-0160
+// §Decision (v)/(vii) + the call-site-boundary comment in check.go.
 func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	// Task 9 wires the real dispatch body per SPEC §6.3. Task 2 skeleton.
+	// Task 9 wires the real dispatch body per SPEC §6.3 (incl. the
+	// buildAuthRequest call documented above). Task 2 skeleton.
 	return envoyhttp.Continue
 }
 

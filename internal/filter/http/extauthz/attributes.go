@@ -434,8 +434,13 @@ func isTokenChar(c byte) bool {
 	return true
 }
 
-// buildAuthRequest is the entry point called from check.go's closure
-// (and from Task 9's DecodeHeaders dispatch) to construct the *authRequest
-// for the outbound auth check POST. See the function definition above.
-// Task 9 wires f.dcb.RequestHeaders() → headers and the body accumulator;
-// until Task 9 the closure passes the authRequest.headers directly (STUBBED).
+// buildAuthRequest call-site (Task 4 review-fix): buildAuthRequest is called
+// from Task 9's DecodeHeaders dispatch — NOT from check.go's checkFn closure.
+// It needs the per-stream *filter (f.activeRC, resolved per-route at
+// DecodeHeaders) AND the real client request headers from dcb.RequestHeaders(),
+// neither of which is available at config-load time inside buildHTTPCheckFn nor
+// inside the mode-agnostic checkFn closure (which by contract receives an
+// already-built *authRequest). Task 9 wires f.dcb.RequestHeaders() → headers and
+// the body accumulator, then passes the resulting *authRequest into the checkFn
+// closure. See the PROGRESS.md Task 4 "Deviation from PLAN Step 4" note and the
+// call-site-boundary comment in check.go.
