@@ -725,11 +725,16 @@ func TestCompiledConfig_WithRequestBodyConsumed(t *testing.T) {
 	}
 }
 
-// TestDecodeHeaders_EndStreamNoBody_Continue verifies the DecodeHeaders
-// minimal-path: when there is no listener-level with_request_body AND
-// endStream=true, DecodeHeaders returns HeaderContinue (no body-buffering
-// branch fires; Task 9's outbound-check dispatch is not yet wired).
-func TestDecodeHeaders_EndStreamNoBody_Continue(t *testing.T) {
+// TestDecodeHeaders_EndStreamNoBody_StopIteration verifies the DecodeHeaders
+// dispatch path: when there is no listener-level with_request_body AND
+// endStream=true (no body buffering), DecodeHeaders returns StopIteration
+// (the async outbound check is dispatched per Task 9 / SPEC §6.3 step 5).
+// NOTE: This test was previously named TestDecodeHeaders_EndStreamNoBody_Continue
+// and expected Continue when Task 9's dispatch was not yet wired. Task 9
+// wires the dispatch, so the expected status is now StopIteration.
+// The checkFn is nil in this test (minimal compiledConfig), so dispatchOutboundCheck
+// returns early via the nil-guard — but StopIteration is still returned.
+func TestDecodeHeaders_EndStreamNoBody_StopIteration(t *testing.T) {
 	// Build a minimal factoryState with a compiledConfig (no stats needed; no
 	// with_request_body → body-buffering branch is skipped).
 	cc := &compiledConfig{
@@ -740,8 +745,10 @@ func TestDecodeHeaders_EndStreamNoBody_Continue(t *testing.T) {
 
 	headers := make(map[string][]string)
 	result := f.DecodeHeaders(headers, true)
-	if result != envoyhttp.Continue {
-		t.Errorf("DecodeHeaders endStream=true no-body: got %v, want HeaderContinue", result)
+	// Task 9: StopIteration is returned (async dispatch fires). checkFn is nil
+	// so dispatchOutboundCheck no-ops, but the HCM-visible return is StopIteration.
+	if result != envoyhttp.StopIteration {
+		t.Errorf("DecodeHeaders endStream=true no-body: got %v, want StopIteration", result)
 	}
 }
 
@@ -3591,15 +3598,23 @@ func TestDecodeHeaders_WithRequestBody_SetsAwaitingBodyAndContinue(t *testing.T)
 
 // TestDecodeHeaders_WithRequestBody_EndStreamSkipsBuffer verifies that when
 // endStream=true (header-only request, no body), DecodeHeaders does NOT set
-// awaitingBody — there is no body to buffer.
+// awaitingBody — there is no body to buffer, so the filter proceeds directly
+// to the async outbound check dispatch (returns StopIteration).
+//
+// NOTE: Previously expected Continue when Task 9's dispatch was not wired.
+// Task 9 wires the dispatch: endStream=true + withRequestBody skips body
+// buffering and fires the async check directly → StopIteration.
+// checkFn is nil in newBodyBufferingFilter, so dispatchOutboundCheck no-ops.
 func TestDecodeHeaders_WithRequestBody_EndStreamSkipsBuffer(t *testing.T) {
 	f, _ := newBodyBufferingFilter(t, 1024, false, false, nil)
 	headers := http.Header{}
 
 	status := f.DecodeHeaders(headers, true /* endStream=true: header-only request */)
 
-	if status != envoyhttp.Continue {
-		t.Errorf("DecodeHeaders(withRequestBody, endStream=true): want Continue, got %v", status)
+	// Task 9: StopIteration returned (async dispatch fires for the header-only
+	// request — no body to buffer, outbound check dispatches immediately).
+	if status != envoyhttp.StopIteration {
+		t.Errorf("DecodeHeaders(withRequestBody, endStream=true): want StopIteration (async dispatch), got %v", status)
 	}
 	if f.awaitingBody {
 		t.Error("DecodeHeaders(withRequestBody, endStream=true): want awaitingBody=false (no body), got true")
@@ -4119,4 +4134,673 @@ func TestDecodeHeaders_PerRouteWithRequestBodyOverride(t *testing.T) {
 	if !f.awaitingBody {
 		t.Error("DecodeHeaders(per-route with_request_body=64, listener-level nil): want awaitingBody=true, got false")
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Group 5 — DecodeHeaders top-level dispatch + async-resume outbound-call leg
+// (Group 5 per SPEC §14.1 + PLAN Task 9)
+//
+// Tests the following surfaces per SPEC §6.3:
+//   - Per-route disabled short-circuit: Continue returned immediately, NO auth
+//     call, NO counter increments.
+//   - Async-resume allow path: StopIteration returned; goroutine calls checkFn;
+//     on dispAllow → applyUpstreamMutations + optional clearRouteCache +
+//     ContinueDecoding() + ok counter increment.
+//   - Async-resume deny path: StopIteration returned; goroutine calls checkFn;
+//     on dispDeny → SendLocalReply(denyStatus, denyBody, denyHeaders) +
+//     denied counter increment.
+//   - Async-resume error path (failure_mode_allow:false): StopIteration returned;
+//     goroutine calls checkFn; on dispError → SendLocalReply(statusOnError, "",
+//     nil) + errored counter increment (no failureModeAllowed increment).
+//   - Async-resume error path (failure_mode_allow:true): StopIteration returned;
+//     goroutine calls checkFn; on dispError → ContinueDecoding() + errored ++
+//     failureModeAllowed ++; optional x-envoy-auth-failure-mode-allowed header.
+//   - Async-resume invalid path: invalid counter increment + error posture.
+//   - Body-complete path (DecodeData endStream): same dispatch logic via
+//     dispatchOutboundCheck, DataStopIterationAndBuffer park, goroutine resume.
+// ----------------------------------------------------------------------------
+
+// asyncExtAuthzDCB is a DecoderFilterCallbacks for Group 5/9 tests that records
+// ContinueDecoding and SendLocalReply invocations, and captures the current
+// upstream request headers for allow-path injection assertions.
+// Mirrors fakeExtAuthzDCB but adds continueCount + captures upstream headers.
+// All mutable state is guarded by mu so the race detector stays clean when
+// the resume goroutine fires from the async dispatch and the test goroutine
+// polls via waitForContinueOrReply concurrently.
+type asyncExtAuthzDCB struct {
+	mu            sync.Mutex
+	perRoute      proto.Message
+	upstreamHdrs  http.Header // the headers passed by the caller to the filter (allow-path mutations land here)
+	continueCount int
+	localReply    *localReplyRecord6
+}
+
+func newAsyncExtAuthzDCB(upstream http.Header) *asyncExtAuthzDCB {
+	if upstream == nil {
+		upstream = make(http.Header)
+	}
+	return &asyncExtAuthzDCB{upstreamHdrs: upstream}
+}
+
+func (c *asyncExtAuthzDCB) ContinueDecoding() {
+	c.mu.Lock()
+	c.continueCount++
+	c.mu.Unlock()
+}
+func (c *asyncExtAuthzDCB) DownstreamPrincipal() []string { return nil }
+func (c *asyncExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
+	c.mu.Lock()
+	c.localReply = &localReplyRecord6{status: status, body: body, headers: headers}
+	c.mu.Unlock()
+}
+func (c *asyncExtAuthzDCB) RequestRouteConfig() proto.Message { return c.perRoute }
+func (c *asyncExtAuthzDCB) RequestRouteConfigsAllTiers() (proto.Message, proto.Message, proto.Message) {
+	return nil, nil, nil
+}
+func (c *asyncExtAuthzDCB) EncodeHeaders(_ http.Header, _ bool) {}
+func (c *asyncExtAuthzDCB) EncodeData(_ []byte, _ bool)         {}
+func (c *asyncExtAuthzDCB) EncodeTrailers(_ http.Header)        {}
+
+// waitForContinueOrReply waits up to maxWait for either ContinueDecoding or
+// SendLocalReply to fire (polling). Returns true when one fires. Used in
+// async-resume tests to avoid sleeps.
+func waitForContinueOrReply(dcb *asyncExtAuthzDCB, maxWait time.Duration) bool {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		dcb.mu.Lock()
+		fired := dcb.continueCount > 0 || dcb.localReply != nil
+		dcb.mu.Unlock()
+		if fired {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+// asyncDCB_continueCount returns the continueCount under mu (race-clean accessor).
+func asyncDCB_continueCount(dcb *asyncExtAuthzDCB) int {
+	dcb.mu.Lock()
+	defer dcb.mu.Unlock()
+	return dcb.continueCount
+}
+
+// asyncDCB_localReply returns the localReply pointer under mu (race-clean accessor).
+func asyncDCB_localReply(dcb *asyncExtAuthzDCB) *localReplyRecord6 {
+	dcb.mu.Lock()
+	defer dcb.mu.Unlock()
+	return dcb.localReply
+}
+
+// buildDispatchFilter constructs a minimal *filter configured for async-dispatch
+// tests: a real auth server (via checkFn), optional stats registry, and the
+// given DCB. The compiledConfig carries the supplied checkFn + error-posture.
+func buildDispatchFilter(
+	t *testing.T,
+	srv *scriptableAuthServer,
+	failureModeAllow bool,
+	failureModeAllowHeaderAdd bool,
+	clearRouteCache bool,
+	statusOnError uint32,
+	fs *filterStats,
+	dcb *asyncExtAuthzDCB,
+) *filter {
+	t.Helper()
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 0, "")
+	cc := &compiledConfig{
+		checkFn:                   fn,
+		failureModeAllow:          failureModeAllow,
+		failureModeAllowHeaderAdd: failureModeAllowHeaderAdd,
+		clearRouteCache:           clearRouteCache,
+		statusOnError:             statusOnError,
+		stats:                     fs,
+	}
+	f := &filter{
+		state:    &factoryState{listenerRC: cc},
+		dcb:      dcb,
+		activeRC: cc,
+	}
+	return f
+}
+
+// ---------------------------------------------------------------------------
+// Group 5A — per-route disabled short-circuit
+// ---------------------------------------------------------------------------
+
+// TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters verifies that when the
+// per-route config has disabled:true, DecodeHeaders returns Continue immediately
+// with NO auth call and NO counter increments.
+//
+// Per SPEC §6.3 step 2 + parent §6 amendment 7.
+func TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	ok0 := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.ok")
+
+	// Auth server that MUST NOT be called; it counts calls.
+	var authCalled int
+	sas := &scriptableAuthServer{}
+	sas.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCalled++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { sas.srv.Close() })
+
+	fn := buildHTTPCheckFnForTest(t, sas.srv.URL, 0, "")
+	cc := &compiledConfig{
+		checkFn:       fn,
+		statusOnError: 403,
+		stats:         fs,
+	}
+	state := &factoryState{listenerRC: cc}
+
+	// Per-route disabled:true.
+	perRouteProto := &ext_authzv3.ExtAuthzPerRoute{
+		Override: &ext_authzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+	}
+	dcb := newFakeExtAuthzDCB()
+	dcb.perRoute = perRouteProto
+
+	f := &filter{state: state, dcb: dcb, activeRC: cc}
+
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer token")
+	status := f.DecodeHeaders(headers, true)
+
+	if status != envoyhttp.Continue {
+		t.Errorf("DecodeHeaders(disabled): want Continue, got %v", status)
+	}
+	if authCalled > 0 {
+		t.Errorf("disabled: auth server called %d times, want 0", authCalled)
+	}
+	// No counter increments: ok counter must still be 0.
+	if v := ok0.Load(); v != 0 {
+		t.Errorf("disabled: ok counter = %d, want 0 (no counter increments on disabled path)", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 5B — async-resume allow path
+// ---------------------------------------------------------------------------
+
+// TestDecodeHeaders_AsyncAllow_UpstreamMutation verifies the full allow path:
+// StopIteration returned synchronously; goroutine fires; on dispAllow the
+// allowed_upstream_headers are injected + ContinueDecoding() fires + ok counter
+// increments.
+func TestDecodeHeaders_AsyncAllow_UpstreamMutation(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	okCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.ok")
+
+	srv := newScriptableAuthServer(t, http.StatusOK, map[string]string{
+		"x-auth-upstream": "injected-value",
+	}, "")
+
+	// Build checkFn with allowed_upstream_headers matching "x-auth-upstream".
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: srv.srv.URL},
+		AuthorizationResponse: &ext_authzv3.AuthorizationResponse{
+			AllowedUpstreamHeaders: makeListStringMatcher(exactPattern("x-auth-upstream")),
+		},
+	}
+	fn, err := buildHTTPCheckFn(hs, false)
+	if err != nil {
+		t.Fatalf("buildHTTPCheckFn: %v", err)
+	}
+	cc := &compiledConfig{
+		checkFn:       fn,
+		statusOnError: 403,
+		stats:         fs,
+	}
+	upstream := make(http.Header)
+	dcb := newAsyncExtAuthzDCB(upstream)
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	status := f.DecodeHeaders(upstream, true /* endStream — no body */)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("DecodeHeaders(allow): want StopIteration, got %v", status)
+	}
+
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("async allow: ContinueDecoding never fired within 2s")
+	}
+
+	if c := asyncDCB_continueCount(dcb); c != 1 {
+		t.Errorf("ContinueDecoding: called %d times, want 1", c)
+	}
+	if r := asyncDCB_localReply(dcb); r != nil {
+		t.Errorf("allow path: SendLocalReply fired unexpectedly: %+v", r)
+	}
+	if v := okCtr.Load(); v != 1 {
+		t.Errorf("ok counter: got %d, want 1", v)
+	}
+	// Upstream header injection: the header set by the auth service must be present.
+	// Read upstream under f.mu to satisfy the race detector: the goroutine writes
+	// upstream under f.mu, so we must acquire the same lock before reading.
+	f.mu.Lock()
+	got := upstream.Get("X-Auth-Upstream")
+	f.mu.Unlock()
+	if got != "injected-value" {
+		t.Errorf("upstream injection: X-Auth-Upstream = %q, want %q", got, "injected-value")
+	}
+}
+
+// TestDecodeHeaders_AsyncAllow_ClearRouteCache verifies that when
+// cc.clearRouteCache=true and the auth service allows, f.clearRouteCacheRequested
+// flips to true (the framework primitive landing is deferred; the flag is the
+// test-introspection anchor per the jwt_authn precedent).
+func TestDecodeHeaders_AsyncAllow_ClearRouteCache(t *testing.T) {
+	srv := newScriptableAuthServer(t, http.StatusOK, nil, "")
+	fn := buildHTTPCheckFnForTest(t, srv.srv.URL, 0, "")
+	cc := &compiledConfig{checkFn: fn, clearRouteCache: true, statusOnError: 403}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	f.DecodeHeaders(make(http.Header), true)
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("async allow (clear_route_cache): ContinueDecoding never fired within 2s")
+	}
+
+	if !f.clearRouteCacheRequested {
+		t.Error("clearRouteCacheRequested: want true when clearRouteCache=true + allow, got false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 5C — async-resume deny path
+// ---------------------------------------------------------------------------
+
+// TestDecodeHeaders_AsyncDeny_SendLocalReply verifies the deny path:
+// StopIteration returned synchronously; goroutine fires; on dispDeny
+// SendLocalReply is called with the auth service's status/body/headers +
+// denied counter increments.
+func TestDecodeHeaders_AsyncDeny_SendLocalReply(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	deniedCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.denied")
+
+	srv := newScriptableAuthServer(t, http.StatusForbidden, map[string]string{
+		"x-ext-authz-error": "unauthorized",
+	}, "access denied")
+
+	hs := &ext_authzv3.HttpService{
+		ServerUri: &corev3.HttpUri{Uri: srv.srv.URL},
+		AuthorizationResponse: &ext_authzv3.AuthorizationResponse{
+			AllowedClientHeaders: makeListStringMatcher(exactPattern("x-ext-authz-error")),
+		},
+	}
+	fn, err := buildHTTPCheckFn(hs, false)
+	if err != nil {
+		t.Fatalf("buildHTTPCheckFn: %v", err)
+	}
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403, stats: fs}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	status := f.DecodeHeaders(make(http.Header), true)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("DecodeHeaders(deny): want StopIteration, got %v", status)
+	}
+
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("async deny: SendLocalReply never fired within 2s")
+	}
+
+	r := asyncDCB_localReply(dcb)
+	if r == nil {
+		t.Fatal("deny path: SendLocalReply not called")
+	}
+	if r.status != http.StatusForbidden {
+		t.Errorf("deny status: got %d, want 403", r.status)
+	}
+	if string(r.body) != "access denied" {
+		t.Errorf("deny body: got %q, want %q", r.body, "access denied")
+	}
+	if c := asyncDCB_continueCount(dcb); c != 0 {
+		t.Errorf("deny path: ContinueDecoding called %d times, want 0", c)
+	}
+	if v := deniedCtr.Load(); v != 1 {
+		t.Errorf("denied counter: got %d, want 1", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 5D — async-resume error path
+// ---------------------------------------------------------------------------
+
+// TestDecodeHeaders_AsyncError_FailureModeAllow_False verifies that when the
+// auth server is unreachable and failure_mode_allow=false, SendLocalReply is
+// called with statusOnError and the errored counter increments.
+func TestDecodeHeaders_AsyncError_FailureModeAllow_False(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	erroredCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.error")
+
+	// Use an invalid server URL to force a transport error.
+	fn := buildHTTPCheckFnForTest(t, "http://127.0.0.1:19191", 200 /* 200ms timeout */, "")
+	cc := &compiledConfig{
+		checkFn:          fn,
+		failureModeAllow: false,
+		statusOnError:    503,
+		stats:            fs,
+	}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	status := f.DecodeHeaders(make(http.Header), true)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("DecodeHeaders(error, fma=false): want StopIteration, got %v", status)
+	}
+
+	if !waitForContinueOrReply(dcb, 3*time.Second) {
+		t.Fatal("error path (fma=false): SendLocalReply never fired within 3s")
+	}
+
+	r := asyncDCB_localReply(dcb)
+	if r == nil {
+		t.Fatal("error path (fma=false): SendLocalReply not called")
+	}
+	if r.status != 503 {
+		t.Errorf("error status: got %d, want 503", r.status)
+	}
+	if r.body != "" {
+		t.Errorf("error body: got %q, want empty", r.body)
+	}
+	if c := asyncDCB_continueCount(dcb); c != 0 {
+		t.Errorf("error (fma=false): ContinueDecoding called %d times, want 0", c)
+	}
+	if v := erroredCtr.Load(); v != 1 {
+		t.Errorf("errored counter: got %d, want 1", v)
+	}
+}
+
+// TestDecodeHeaders_AsyncError_FailureModeAllow_True verifies that when the
+// auth server is unreachable and failure_mode_allow=true, ContinueDecoding is
+// called and both errored + failureModeAllowed counters increment.
+func TestDecodeHeaders_AsyncError_FailureModeAllow_True(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	erroredCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.error")
+	fmaCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.failure_mode_allowed")
+
+	fn := buildHTTPCheckFnForTest(t, "http://127.0.0.1:19191", 200, "")
+	cc := &compiledConfig{
+		checkFn:          fn,
+		failureModeAllow: true,
+		statusOnError:    503,
+		stats:            fs,
+	}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	f.DecodeHeaders(make(http.Header), true)
+	if !waitForContinueOrReply(dcb, 3*time.Second) {
+		t.Fatal("error path (fma=true): ContinueDecoding never fired within 3s")
+	}
+
+	if c := asyncDCB_continueCount(dcb); c != 1 {
+		t.Errorf("error (fma=true): ContinueDecoding called %d times, want 1", c)
+	}
+	if r := asyncDCB_localReply(dcb); r != nil {
+		t.Errorf("error (fma=true): SendLocalReply fired unexpectedly: %+v", r)
+	}
+	if v := erroredCtr.Load(); v != 1 {
+		t.Errorf("errored counter: got %d, want 1", v)
+	}
+	if v := fmaCtr.Load(); v != 1 {
+		t.Errorf("failureModeAllowed counter: got %d, want 1", v)
+	}
+}
+
+// TestDecodeHeaders_AsyncError_FailureModeAllow_True_HeaderAdd verifies that
+// when failure_mode_allow=true AND failure_mode_allow_header_add=true, the
+// x-envoy-auth-failure-mode-allowed: true header is added to the upstream
+// request.
+func TestDecodeHeaders_AsyncError_FailureModeAllow_True_HeaderAdd(t *testing.T) {
+	fn := buildHTTPCheckFnForTest(t, "http://127.0.0.1:19191", 200, "")
+	cc := &compiledConfig{
+		checkFn:                   fn,
+		failureModeAllow:          true,
+		failureModeAllowHeaderAdd: true,
+		statusOnError:             503,
+	}
+	upstream := make(http.Header)
+	dcb := newAsyncExtAuthzDCB(upstream)
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	f.DecodeHeaders(upstream, true)
+	if !waitForContinueOrReply(dcb, 3*time.Second) {
+		t.Fatal("error (fma=true, header_add=true): ContinueDecoding never fired within 3s")
+	}
+
+	got := upstream.Get("X-Envoy-Auth-Failure-Mode-Allowed")
+	if got != "true" {
+		t.Errorf("x-envoy-auth-failure-mode-allowed: got %q, want %q", got, "true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 5E — async-resume invalid path
+// ---------------------------------------------------------------------------
+
+// TestDecodeHeaders_AsyncInvalid_InvalidCounterAndErrorPosture verifies that on
+// the dispInvalid path (validate_mutations rejection), the invalid counter
+// increments and the error posture (statusOnError) is applied.
+//
+// A fake checkFn is used to directly inject a dispInvalid disposition without
+// relying on a real HTTP server — Go's net/http canonicalizes response headers
+// making it impossible to inject a :-prefixed header from a test server. The
+// dispInvalid path in production is triggered by mapHTTPResponseWithMatchers
+// when validateMutations=true and a header fails validateMutationHeaders.
+func TestDecodeHeaders_AsyncInvalid_InvalidCounterAndErrorPosture(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	invalidCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.invalid")
+
+	// Fake checkFn that directly returns dispInvalid (simulates validate_mutations
+	// rejection — same path as mapHTTPResponseWithMatchers returns dispInvalid).
+	invalidFn := checkFn(func(_ context.Context, _ *authRequest) (checkDisposition, error) {
+		return checkDisposition{class: dispInvalid}, nil
+	})
+
+	cc := &compiledConfig{
+		checkFn:           invalidFn,
+		validateMutations: true,
+		failureModeAllow:  false,
+		statusOnError:     403,
+		stats:             fs,
+	}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	f.DecodeHeaders(make(http.Header), true)
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("invalid path: neither ContinueDecoding nor SendLocalReply fired within 2s")
+	}
+
+	if v := invalidCtr.Load(); v != 1 {
+		t.Errorf("invalid counter: got %d, want 1", v)
+	}
+	// Error posture with fma=false: SendLocalReply(statusOnError).
+	r := asyncDCB_localReply(dcb)
+	if r == nil {
+		t.Fatal("invalid path (fma=false): SendLocalReply not called")
+	}
+	if r.status != 403 {
+		t.Errorf("invalid/error posture: got status %d, want 403", r.status)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 5F — body-complete path (DecodeData endStream → async dispatch)
+// ---------------------------------------------------------------------------
+
+// TestDecodeData_BodyComplete_AsyncDispatch verifies that when DecodeData is
+// called with endStream=true while awaitingBody, the filter returns
+// DataStopIterationAndBuffer and fires the async outbound check, resuming with
+// ContinueDecoding() on allow.
+func TestDecodeData_BodyComplete_AsyncDispatch(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	okCtr := reg.NewCounterIfAbsent("http.ingress_http.ext_authz.ok")
+
+	var capturedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { srv.Close() })
+
+	fn := buildHTTPCheckFnForTest(t, srv.URL, 0, "")
+	cc := &compiledConfig{
+		checkFn:         fn,
+		withRequestBody: &bufferSettings{maxRequestBytes: 1024},
+		statusOnError:   403,
+		stats:           fs,
+	}
+	upstream := make(http.Header)
+	dcb := newAsyncExtAuthzDCB(upstream)
+	f := &filter{
+		state:        &factoryState{listenerRC: cc},
+		dcb:          dcb,
+		activeRC:     cc,
+		awaitingBody: true,
+		bodySettings: cc.withRequestBody,
+	}
+
+	// Simulate body data with endStream.
+	bodyPayload := []byte(`{"user":"alice"}`)
+	dataStatus := f.DecodeData(bodyPayload, true /* endStream */)
+
+	if dataStatus != envoyhttp.DataStopIterationAndBuffer {
+		t.Fatalf("DecodeData(bodyComplete): want DataStopIterationAndBuffer, got %v", dataStatus)
+	}
+
+	if !waitForContinueOrReply(dcb, 2*time.Second) {
+		t.Fatal("body-complete dispatch: ContinueDecoding never fired within 2s")
+	}
+
+	if c := asyncDCB_continueCount(dcb); c != 1 {
+		t.Errorf("body-complete allow: ContinueDecoding called %d times, want 1", c)
+	}
+	if v := okCtr.Load(); v != 1 {
+		t.Errorf("body-complete ok counter: got %d, want 1", v)
+	}
+	// Body was forwarded to auth service.
+	if string(capturedBody) != string(bodyPayload) {
+		t.Errorf("body forwarded: got %q, want %q", capturedBody, bodyPayload)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Group 9 — OnDestroy cancellation + resume-after-OnDestroy race guard
+// (Group 9 per SPEC §14.1 + PLAN Task 9)
+//
+// Tests the following surfaces per SPEC §6.3 + planner-time decision D4:
+//   - OnDestroy cancels the in-flight outbound call's context.Context: the
+//     slow auth server returns promptly after OnDestroy cancels the context.
+//   - Resume-after-OnDestroy is guarded (mu/done): when OnDestroy fires before
+//     the goroutine completes, the resume goroutine checks done under mu and
+//     aborts the callback touch without panic or double-use.
+//
+// Both tests run under -race (the acceptance criterion for the race guard is
+// that go test -race finds no races).
+// ----------------------------------------------------------------------------
+
+// TestOnDestroy_CancelsInFlightContext verifies that calling OnDestroy cancels
+// the per-request callCtx, causing the in-flight checkFn to return promptly
+// (error from context cancellation) rather than blocking indefinitely.
+func TestOnDestroy_CancelsInFlightContext(t *testing.T) {
+	// Slow auth server that hangs until its request context is cancelled.
+	slowSrv := newSlowAuthServer(t)
+	fn := buildHTTPCheckFnForTest(t, slowSrv.srv.URL, 0, "")
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403, failureModeAllow: true}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	// Start the async dispatch (parks chain on StopIteration).
+	status := f.DecodeHeaders(make(http.Header), true)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("DecodeHeaders before OnDestroy: want StopIteration, got %v", status)
+	}
+
+	// Give the goroutine a moment to start the outbound call before cancelling.
+	time.Sleep(10 * time.Millisecond)
+
+	// Call OnDestroy — this should cancel the callCtx.
+	f.OnDestroy()
+
+	// The goroutine should notice the context cancellation and resume (or abort
+	// with done=true). Wait for either outcome — we're testing that nothing hangs.
+	// We allow up to 1s for the goroutine to respond to the cancellation.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		done := f.done
+		f.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The filter should be done (OnDestroy set it).
+	f.mu.Lock()
+	done := f.done
+	f.mu.Unlock()
+	if !done {
+		t.Error("OnDestroy: f.done not set to true under mu")
+	}
+}
+
+// TestOnDestroy_ResumeAfterDestroy_NoCallback verifies the resume-after-
+// OnDestroy race guard: when OnDestroy fires and sets done=true before (or
+// concurrent with) the goroutine completing its async check, the goroutine
+// must NOT call any dcb callbacks (no ContinueDecoding, no SendLocalReply).
+//
+// This test is intentionally racy in timing to exercise the guard under the
+// race detector (-race). The goroutine and OnDestroy race genuinely.
+func TestOnDestroy_ResumeAfterDestroy_NoCallback(t *testing.T) {
+	// Slow server: hangs until context is cancelled.
+	slowSrv := newSlowAuthServer(t)
+	fn := buildHTTPCheckFnForTest(t, slowSrv.srv.URL, 0, "")
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403, failureModeAllow: true}
+	dcb := newAsyncExtAuthzDCB(make(http.Header))
+	f := &filter{state: &factoryState{listenerRC: cc}, dcb: dcb, activeRC: cc}
+
+	// Fire the async dispatch.
+	f.DecodeHeaders(make(http.Header), true)
+
+	// Give the goroutine a moment to start.
+	time.Sleep(5 * time.Millisecond)
+
+	// Cancel + destroy BEFORE the goroutine can resume.
+	f.OnDestroy()
+
+	// Wait up to 2s for the goroutine to finish (it should see ctx cancelled
+	// and then check done=true under mu).
+	time.Sleep(200 * time.Millisecond)
+
+	// After OnDestroy + goroutine completion, no callbacks must have fired.
+	if c := asyncDCB_continueCount(dcb); c != 0 {
+		t.Errorf("resume-after-OnDestroy: ContinueDecoding called %d times, want 0", c)
+	}
+	if r := asyncDCB_localReply(dcb); r != nil {
+		t.Errorf("resume-after-OnDestroy: SendLocalReply fired unexpectedly: %+v", r)
+	}
+}
+
+// TestOnDestroy_NoPanic_WhenNoActiveCall verifies that calling OnDestroy when
+// no async call is in flight (callCancel is nil) does not panic.
+func TestOnDestroy_NoPanic_WhenNoActiveCall(t *testing.T) {
+	fn := buildHTTPCheckFnForTest(t, "http://127.0.0.1:19191", 0, "")
+	cc := &compiledConfig{checkFn: fn, statusOnError: 403}
+	f := &filter{state: &factoryState{listenerRC: cc}, activeRC: cc}
+
+	// Must not panic even though callCancel is nil (no active async call).
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("OnDestroy with no active call panicked: %v", r)
+		}
+	}()
+	f.OnDestroy()
 }

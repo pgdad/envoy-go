@@ -248,6 +248,12 @@ type filter struct {
 	// bodySettings.maxRequestBytes when allow_partial_message=true + over-limit.
 	body []byte
 
+	// cachedHeaders caches the DecodeHeaders headers argument so the
+	// body-complete path in DecodeData can pass the same header map reference
+	// to dispatchOutboundCheck for allow-path upstream injection. Set at
+	// DecodeHeaders time when body buffering is active (awaitingBody=true).
+	cachedHeaders http.Header
+
 	// Async-resume outbound-call leg + per-request cancellable context per
 	// planner-time decision D4 + SPEC §6.3. Full wiring at Task 9 (ADR-0159).
 	callCtx    context.Context
@@ -258,6 +264,14 @@ type filter struct {
 	// goroutine checks done under mu before touching dcb. Full wiring at Task 9.
 	mu   sync.Mutex
 	done bool
+
+	// clearRouteCacheRequested tracks whether the allow path requested a
+	// clear_route_cache() invocation. The actual DecoderFilterCallbacks
+	// primitive cb.ClearRouteCache() is NOT yet exposed on the interface at
+	// phase-18.1 MVP (deferred per ADR-0155 §Consequences, same as phase-17
+	// jwt_authn). This flag is the test-introspection anchor; production sees a
+	// no-op + forward-pointer to the future framework phase.
+	clearRouteCacheRequested bool
 }
 
 // Compile-time assertion: *filter implements the decoder-only filter interface
@@ -688,56 +702,231 @@ func (f *filter) effectiveWithRequestBody(pr *compiledPerRoute) *bufferSettings 
 	return nil
 }
 
+// dispatchOutboundCheck is the ONE source of truth for "build authRequest +
+// launch goroutine + apply disposition under mu/done guard" per SPEC §6.3
+// steps 5–11 + planner-time decision D4. Called from both DecodeHeaders (no-
+// body path or body-complete via endStream=true) and DecodeData (body-complete
+// path). Returns the correct FilterHeadersStatus/FilterDataStatus park signal
+// to the HCM chain (always HeaderStopIteration / DataStopIterationAndBuffer).
+//
+// Design choice (Option B per SPEC §6.3 KEY DESIGN QUESTION): a shared helper
+// so there is ONE source of truth for authRequest construction + goroutine +
+// disposition logic. DecodeHeaders and DecodeData call it identically.
+//
+// Per Task 4 review-fix forward-pointer: buildAuthRequest(f, hs, headers, body,
+// path) constructs the request-side-filtered authRequest; the checkFn closure
+// faithfully transmits whatever it receives. The headers argument is the
+// incoming client request header map (the same map DecodeHeaders receives, so
+// allow-path mutations via applyUpstreamMutations land on the upstream headers
+// the HCM chain forwards after the filter returns Continue).
+//
+// The per-request cancellable context is created here (D4): callCtx +
+// callCancel are stored on f so OnDestroy can cancel them.
+//
+// ADR-0044 escape-valve NOT fired: the mu/done + cancellable-context guard
+// sufficed (see OnDestroy + resume goroutine). ADR-0165 not authored.
+func (f *filter) dispatchOutboundCheck(headers http.Header) {
+	cc := f.activeRC
+
+	// Guard: if checkFn is nil (test construction without a real factory), skip
+	// the dispatch. This is a defensive nil-guard — production code always has
+	// a non-nil checkFn (buildCompiledConfig wires it; New() guarantees it).
+	// In test code that constructs a *compiledConfig directly without a checkFn,
+	// the dispatch is a no-op (no outbound call, no resume).
+	if cc.checkFn == nil {
+		return
+	}
+
+	// Build the authRequest with the request-side-filtered headers + buffered body.
+	// f.body is nil when with_request_body is not set (no buffering configured);
+	// non-nil when body buffering has assembled the body via DecodeData.
+	// The HttpService is extracted from cc.checkFn's closure capture — we pass
+	// nil here because buildAuthRequest only needs hs for headers_to_add +
+	// the deprecated allowed_headers field; both are pre-compiled into cc at
+	// buildCompiledConfig time and accessed via cc.deprecatedAllowedHeaders.
+	// Per check.go call-site boundary note: buildAuthRequest uses f.activeRC
+	// (cc) for the pre-compiled matchers; hs nil is handled by buildAuthRequest
+	// (it guards ar := hs.GetAuthorizationRequest() with hs != nil).
+	authReq := buildAuthRequest(f, nil, headers, f.body, "")
+
+	// Create the per-request cancellable context (D4 + Task-2-M5 forward-pointer).
+	callCtx, callCancel := context.WithCancel(context.Background())
+	f.callCtx = callCtx
+	f.callCancel = callCancel
+
+	// Launch the async goroutine — mirrors phase-09 fault async-resume pattern:
+	// StopIteration returned synchronously; goroutine performs the call;
+	// cb.ContinueDecoding() (or SendLocalReply for deny) on completion.
+	go func() {
+		disp, err := cc.checkFn(callCtx, authReq)
+
+		// Acquire mu before touching any callback or stream state (D4 guard).
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		// If OnDestroy fired before us, the stream is gone — do NOT touch dcb.
+		if f.done {
+			return
+		}
+
+		f.applyDisposition(headers, cc, disp, err)
+	}()
+}
+
+// applyDisposition applies the checkDisposition to the stream per SPEC §6.3
+// steps 7–11. Called from within the resume goroutine under f.mu.
+// headers is the incoming client request header map (allow-path mutations land here).
+//
+// Precondition: f.mu is held by the caller; f.done is false.
+func (f *filter) applyDisposition(headers http.Header, cc *compiledConfig, disp checkDisposition, err error) {
+	fs := cc.stats
+
+	// Normalize: a non-nil err from checkFn that is NOT already an error class
+	// becomes dispError (transport / timeout / context-cancelled).
+	effectiveClass := disp.class
+	if err != nil && effectiveClass == dispAllow {
+		// checkFn returned an error AND dispAllow — treat as dispError.
+		effectiveClass = dispError
+	}
+
+	switch effectiveClass {
+	case dispAllow:
+		// Allow path: inject upstream headers; optional clear_route_cache;
+		// increment ok; resume the chain.
+		if fs != nil && fs.ok != nil {
+			fs.ok.Inc()
+		}
+		applyUpstreamMutations(headers, disp)
+		if cc.clearRouteCache {
+			// cb.ClearRouteCache() is NOT yet on the DecoderFilterCallbacks
+			// interface at phase-18.1 MVP (same deferral as phase-17 jwt_authn
+			// per ADR-0155 §Consequences). Record the request via the tracking
+			// flag; a future framework phase exposes the primitive.
+			f.clearRouteCacheRequested = true
+		}
+		f.dcb.ContinueDecoding()
+
+	case dispDeny:
+		// Deny path: emit auth service's response via SendLocalReply;
+		// increment denied; do NOT call ContinueDecoding.
+		if fs != nil && fs.denied != nil {
+			fs.denied.Inc()
+		}
+		// Convert []headerKV → OrderedHeaders for SendLocalReply.
+		oh := headerKVToOrderedHeaders(disp.denyHeaders)
+		f.dcb.SendLocalReply(int(disp.denyStatus), string(disp.denyBody), oh)
+
+	case dispInvalid:
+		// Invalid path: validate_mutations rejection; increment invalid;
+		// then apply the error posture.
+		if fs != nil && fs.invalid != nil {
+			fs.invalid.Inc()
+		}
+		// Fall through to error-posture logic via a synthetic error disposition.
+		f.applyErrorPosture(headers, cc, fs)
+
+	default: // dispError (or any unrecognized class + non-nil err)
+		f.applyErrorPosture(headers, cc, fs)
+	}
+}
+
+// applyErrorPosture applies the failure_mode_allow / status_on_error posture
+// per SPEC §6.3 + §4. Called from applyDisposition for dispError + dispInvalid.
+// Precondition: f.mu is held; f.done is false.
+func (f *filter) applyErrorPosture(headers http.Header, cc *compiledConfig, fs *filterStats) {
+	if fs != nil && fs.errored != nil {
+		fs.errored.Inc()
+	}
+	if cc.failureModeAllow {
+		// failure_mode_allow:true → allow through; increment failureModeAllowed;
+		// optionally add x-envoy-auth-failure-mode-allowed header.
+		if fs != nil && fs.failureModeAllowed != nil {
+			fs.failureModeAllowed.Inc()
+		}
+		if cc.failureModeAllowHeaderAdd {
+			headers.Set("X-Envoy-Auth-Failure-Mode-Allowed", "true")
+		}
+		f.dcb.ContinueDecoding()
+	} else {
+		// failure_mode_allow:false → deny with statusOnError + empty body.
+		f.dcb.SendLocalReply(int(cc.statusOnError), "", nil)
+	}
+}
+
+// headerKVToOrderedHeaders converts a []headerKV to envoyhttp.OrderedHeaders
+// for the SendLocalReply call-site. Preserves insertion order (decision
+// headers first, housekeeping last — per SPEC §4 + parent §5.P11).
+func headerKVToOrderedHeaders(kvs []headerKV) envoyhttp.OrderedHeaders {
+	if len(kvs) == 0 {
+		return nil
+	}
+	oh := make(envoyhttp.OrderedHeaders, 0, len(kvs))
+	for _, kv := range kvs {
+		oh = append(oh, envoyhttp.HeaderField{Name: kv.name, Value: kv.value})
+	}
+	return oh
+}
+
 // DecodeHeaders is the request-gate entry per ADR-0156 + ADR-0162.
 //
-// Task 6 lands the body-buffering branch of SPEC §6.3 steps 3–4:
-//   - Resolves the effective withRequestBody (per-route override OR listener-level).
-//   - If withRequestBody is set AND endStream=false: sets f.awaitingBody=true +
-//     caches f.bodySettings for DecodeData to read; returns Continue.
-//     IMPORTANT: Continue (NOT StopIteration) per ADR-0128 synchronous-HCM
-//     dispatch constraint — returning StopIteration from DecodeHeaders would
-//     deadlock (the body-read loop is the ContinueDecoding path; both run in
-//     the same HCM dispatch goroutine per ADR-0076 + ADR-0128).
+// Full dispatch body per SPEC §6.3 (Task 9):
+//  1. Resolve per-route → cache *compiledPerRoute on filter state.
+//  2. If perRoute.disabled: return Continue (NO auth call, NO counter increments).
+//  3. Compute effective withRequestBody (per-route override OR listener-level).
+//  4. If withRequestBody != nil AND !endStream: set awaitingBody + cache
+//     bodySettings; return Continue per ADR-0128 synchronous-HCM dispatch
+//     constraint (NOT StopIteration — would deadlock the body-read loop).
+//  5. Else (no body to buffer, OR endStream with body buffering): fire the
+//     async outbound check via dispatchOutboundCheck; return HeaderStopIteration.
 //
-// Task 9 wires the full dispatch body: per-route resolve → disabled short-circuit
-// → async outbound check → disposition application per SPEC §6.3.
+// The body-buffering branch (step 4) was wired at Task 6. Task 9 adds the
+// full per-route resolve + disabled short-circuit + async dispatch + resume.
 //
-// Task 9 buildAuthRequest call-site (Task 4 review-fix forward-pointer):
-// before invoking f.activeRC.checkFn, Task 9 MUST call buildAuthRequest(f, hs,
-// dcb.RequestHeaders(), f.body, path) to construct the request-side-filtered
-// *authRequest, then pass that *authRequest into the checkFn closure. The
-// closure (check.go) does NOT do the request-side header filtering itself —
-// buildAuthRequest needs the per-stream f (f.activeRC) + the real request
-// headers, which only exist here at DecodeHeaders, not at config-load time.
-// See the PROGRESS.md Task 4 "Deviation from PLAN Step 4" note + ADR-0160
-// §Decision (v)/(vii) + the call-site-boundary comment in check.go.
-func (f *filter) DecodeHeaders(_ http.Header, endStream bool) envoyhttp.FilterHeadersStatus {
-	// Task 9 wires the per-route resolve (step 1) + disabled short-circuit (step 2)
-	// + async outbound check dispatch (steps 5–7). The body-buffering branch
-	// (steps 3–4) lands here at Task 6.
-
-	// Task 6: compute effective withRequestBody (SPEC §6.3 step 3).
-	// At Task 9, the per-route resolve is done first (f.perRoute = resolvePerRouteConfig(...));
-	// for now, resolve it directly from dcb.RequestRouteConfig() when dcb is set.
+// buildAuthRequest call-site per Task 4 review-fix: dispatchOutboundCheck calls
+// buildAuthRequest(f, nil, headers, f.body, "") to construct the request-side-
+// filtered *authRequest; see dispatchOutboundCheck for the full rationale.
+func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.FilterHeadersStatus {
+	// Step 1: resolve per-route config + cache on filter state.
 	var pr *compiledPerRoute
 	if f.state != nil && f.dcb != nil {
 		pr = f.state.resolvePerRouteConfig(f.dcb.RequestRouteConfig())
 	}
+	f.perRoute = pr
 
+	// Step 2: per-route disabled short-circuit — no auth call, no counters.
+	// Per SPEC §6.3 step 2 + parent §6 amendment 7.
+	if pr != nil && pr.disabled {
+		return envoyhttp.Continue
+	}
+
+	// Step 3: cache the effective compiledConfig (always listenerRC at 18.1
+	// since SHARED-stats; pr.cc was wired to listenerRC at resolve time).
+	if pr != nil && pr.cc != nil {
+		f.activeRC = pr.cc
+	} else if f.activeRC == nil && f.state != nil {
+		f.activeRC = f.state.listenerRC
+	}
+
+	// Step 4: compute effective withRequestBody.
 	effectiveWRB := f.effectiveWithRequestBody(pr)
 
-	// Task 6: body-buffering branch (SPEC §6.3 step 4).
-	// If withRequestBody is set AND !endStream: set awaitingBody + cache bodySettings.
-	// Return Continue (see ADR-0128 note above — NOT StopIteration).
+	// Step 4b: body-buffering branch — if withRequestBody is set AND !endStream,
+	// set awaitingBody + cache bodySettings and return Continue (ADR-0128
+	// synchronous-HCM constraint: NOT StopIteration here).
 	if effectiveWRB != nil && !endStream {
 		f.awaitingBody = true
 		f.bodySettings = effectiveWRB
+		// Cache headers so the body-complete path in DecodeData can pass them
+		// to dispatchOutboundCheck for allow-path upstream injection.
+		f.cachedHeaders = headers
+		return envoyhttp.Continue
 	}
 
-	// Task 9 wires the real dispatch body per SPEC §6.3 (incl. the
-	// buildAuthRequest call documented above, and the StopIteration for the
-	// async outbound check, and the resume-goroutine dispatch).
-	return envoyhttp.Continue
+	// Step 5: no body to buffer (withRequestBody nil OR endStream=true) — fire
+	// the async outbound check now. Return HeaderStopIteration so the chain
+	// parks; the resume goroutine calls cb.ContinueDecoding() or SendLocalReply.
+	f.dispatchOutboundCheck(headers)
+	return envoyhttp.StopIteration
 }
 
 // DecodeData implements the ADR-0128 decode-side body-buffering reuse per
@@ -796,12 +985,35 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	}
 
 	// Step 4: terminal chunk (body complete OR truncated prefix assembled).
-	// Park via DataStopIterationAndBuffer — the Task 9 seam for async check.
+	// Fire the async outbound check via the shared dispatchOutboundCheck helper
+	// (Option B per SPEC §6.3 KEY DESIGN QUESTION: one source of truth for
+	// authRequest construction + goroutine + disposition). Park via
+	// DataStopIterationAndBuffer — the resume goroutine calls ContinueDecoding().
 	if endStream {
-		// Task 9: build the authRequest and fire the async outbound check:
-		//   authReq := buildAuthRequest(f, hs, headers, f.body, path)
-		//   go func() { disp, err := f.activeRC.checkFn(ctx, authReq); ... f.dcb.ContinueDecoding() }
-		// Per ADR-0159 async-resume + bandwidthlimit Task 4 DataStopIterationAndBuffer precedent.
+		// The DecodeHeaders headers map is not available here (DecodeData only
+		// receives the body chunk). We pass the accumulated headers from the
+		// upstream request — but since DecodeData doesn't have access to the
+		// original headers, we pass nil and let buildAuthRequest use an empty
+		// header set for the body-path. The allow-path upstream injection lands
+		// on nil headers (a no-op for injection) in the body-complete path.
+		// NOTE: This is a minor limitation — for the body-complete path, upstream
+		// header injection cannot target the original request headers because
+		// DecodeData doesn't hold a reference to them. The endStream=true +
+		// awaitingBody path implies headers were already passed through (Continue
+		// was returned from DecodeHeaders), so the HCM already has those headers.
+		// For the allow-path mutation, we use an empty placeholder header map
+		// that is distinct from the real upstream headers.
+		//
+		// CORRECTION: The correct design is to cache the headers reference at
+		// DecodeHeaders time on the filter (f.cachedHeaders) so DecodeData can
+		// access them. This is wired here — f.cachedHeaders is set at
+		// DecodeHeaders time and used here. If nil (e.g. body-only test setup),
+		// fall back to empty.
+		hdrs := f.cachedHeaders
+		if hdrs == nil {
+			hdrs = make(http.Header)
+		}
+		f.dispatchOutboundCheck(hdrs)
 		return envoyhttp.DataStopIterationAndBuffer
 	}
 
@@ -815,9 +1027,28 @@ func (f *filter) DecodeTrailers(_ http.Header) envoyhttp.FilterTrailersStatus {
 	return envoyhttp.TrailersContinue
 }
 
-// OnDestroy is a Task 2 skeleton. Task 9 wires the full cancellation logic:
-// sets done=true under mu, calls callCancel() to cancel the in-flight
-// outbound call's context.Context, per planner-time decision D4 + SPEC §6.3.
+// OnDestroy implements the per-stream teardown per planner-time decision D4
+// + SPEC §6.3 + ADR-0159 async-resume discipline:
+//
+//  1. Acquire f.mu and set f.done = true under the lock. This is the
+//     resume-after-OnDestroy guard: any resume goroutine that acquires f.mu
+//     after OnDestroy will observe done=true and abort the callback touch
+//     without panicking or touching the already-destroyed stream.
+//  2. Call f.callCancel() (if non-nil) to cancel the in-flight checkFn's
+//     context.Context, causing the in-flight client.Do to return promptly
+//     (per the net/http cancellation contract).
+//
+// ADR-0044 escape-valve verdict: the mu/done + cancellable-context guard
+// sufficed. No framework primitive needed. ADR-0165 NOT authored.
 func (f *filter) OnDestroy() {
-	// Task 9 wires: mu.Lock(); f.done = true; mu.Unlock(); if f.callCancel != nil { f.callCancel() }
+	f.mu.Lock()
+	f.done = true
+	cancel := f.callCancel
+	f.mu.Unlock()
+
+	// Cancel the in-flight outbound call's context OUTSIDE the lock to avoid
+	// holding mu during the cancel (which may trigger net/http cleanup).
+	if cancel != nil {
+		cancel()
+	}
 }

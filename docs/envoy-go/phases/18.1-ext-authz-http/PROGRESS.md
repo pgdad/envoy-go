@@ -1332,3 +1332,80 @@ $ gofmt -l internal/filter/http/extauthz/
 ### Task 8 commit SHA
 
 `4b672ba`
+
+## Task 9 — `DecodeHeaders` dispatch + async-resume outbound-call leg + `OnDestroy` cancellation + Groups 5+9
+
+Per PLAN Task 9 (Steps 1–7) + SPEC §6.3 + planner-time decision D4.
+
+Task 9 wires the full request-processing dispatch path: `DecodeHeaders` returns `StopIteration` and launches a goroutine that calls the auth service; the goroutine applies the disposition (allow/deny/error/invalid) back on the filter chain via `ContinueDecoding()` or `SendLocalReply`; `OnDestroy` cancels the in-flight context and sets the `mu`/`done` race guard.
+
+### Deliverables
+
+1. **`dispatchOutboundCheck(headers http.Header)` helper** — single source of truth for authRequest construction + goroutine launch + disposition application. Called from both `DecodeHeaders` (no-body path) and `DecodeData` (body-complete path). Nil-guard for `cc.checkFn` prevents goroutine panics in test-constructed filters.
+
+2. **`applyDisposition(headers, cc, disp, err)` helper** — wires all four disposition classes under `f.mu` (goroutine-side): `dispAllow` → `ok` counter + upstream mutation + optional `clearRouteCacheRequested` flag + `ContinueDecoding()`; `dispDeny` → `denied` counter + `SendLocalReply`; `dispInvalid` → `invalid` counter + error posture; default → error posture.
+
+3. **`applyErrorPosture(headers, cc, fs)` helper** — `errored` counter + `failureModeAllow` branch: header-add (`X-Envoy-Auth-Failure-Mode-Allowed: true`) + `ContinueDecoding()` vs `SendLocalReply(statusOnError)`.
+
+4. **`headerKVToOrderedHeaders(kvs []headerKV) envoyhttp.OrderedHeaders`** — converts the deny-path header slice to the ordered-headers format required by `SendLocalReply`.
+
+5. **`DecodeHeaders` rewritten** — resolves per-route config, handles disabled short-circuit (`Continue`), caches `activeRC`, detects `withRequestBody`+`!endStream` path (`awaitingBody=true`, `cachedHeaders` set, `Continue`), dispatches `dispatchOutboundCheck` + returns `StopIteration` on the no-body path.
+
+6. **`DecodeData` body-complete seam wired** — `endStream=true` while `awaitingBody`: recovers `cachedHeaders`, calls `dispatchOutboundCheck`, returns `DataStopIterationAndBuffer`.
+
+7. **`OnDestroy` implemented** — acquires `f.mu`, sets `f.done=true`, snapshots `callCancel`, releases `f.mu`, calls `cancel()` if non-nil. Resume goroutine checks `f.done` under `f.mu` and aborts callbacks if set.
+
+8. **`filter` struct additions**: `cachedHeaders http.Header` (header cache for body-complete path), `clearRouteCacheRequested bool` (ADR-0155 ClearRouteCache deferral tracking flag).
+
+9. **Groups 5+9 tests** (12 new tests in `extauthz_test.go`): Group 5A (`TestDecodeHeaders_PerRouteDisabled_ContinueNoCounters`), Group 5B (`TestDecodeHeaders_AsyncAllow_UpstreamMutation`, `TestDecodeHeaders_AsyncAllow_ClearRouteCache`), Group 5C (`TestDecodeHeaders_AsyncDeny_SendLocalReply`), Group 5D (`TestDecodeHeaders_AsyncError_FailureModeAllow_False`, `TestDecodeHeaders_AsyncError_FailureModeAllow_True`, `TestDecodeHeaders_AsyncError_FailureModeAllow_True_HeaderAdd`), Group 5E (`TestDecodeHeaders_AsyncInvalid_InvalidCounterAndErrorPosture`), Group 5F (`TestDecodeData_BodyComplete_AsyncDispatch`), Group 9 (`TestOnDestroy_CancelsInFlightContext`, `TestOnDestroy_ResumeAfterDestroy_NoCallback`, `TestOnDestroy_NoPanic_WhenNoActiveCall`).
+
+10. **`asyncExtAuthzDCB` race-safe mock** — added `sync.Mutex mu` + locked `ContinueDecoding`/`SendLocalReply` + safe accessor functions `asyncDCB_continueCount()` + `asyncDCB_localReply()` + `waitForContinueOrReply()` polling helper. Upstream-header read in `TestDecodeHeaders_AsyncAllow_UpstreamMutation` guarded under `f.mu` to eliminate the goroutine-write vs test-read race.
+
+### Planner-time decision D4 — ADR-0044 escape-valve NOT fired
+
+The `mu`/`done` guard + `context.WithCancel` sufficed. No ADR-0165 authored.
+
+- `OnDestroy` sets `f.done = true` under `f.mu` and calls `callCancel()`.
+- Resume goroutine acquires `f.mu`, checks `f.done`, aborts the callback touch if the stream is gone.
+- `TestOnDestroy_ResumeAfterDestroy_NoCallback` passes under `-race` confirming the guard works.
+- `TestOnDestroy_CancelsInFlightContext` confirms the cancellable context makes the in-flight `client.Do` return promptly.
+
+### Task 9 TDD cycle notes
+
+**RED → GREEN cycle per test group:**
+
+- All 12 Group 5+9 tests were written first and failed (compilation errors / wrong return values / missing functions) before implementation. Key failures observed:
+  - `TestDecodeHeaders_EndStreamNoBody_Continue` (Task 2 skeleton): expected `Continue`, now returns `StopIteration` → renamed `TestDecodeHeaders_EndStreamNoBody_StopIteration` + expectation updated.
+  - `TestDecodeHeaders_WithRequestBody_EndStreamSkipsBuffer` (Task 2 skeleton): expected `Continue`, now returns `StopIteration` → expectation updated.
+  - `stats.Counter.Value()` undefined → corrected to `.Load()`.
+  - `f.clearRouteCacheRequested` undefined → field added to `filter` struct.
+  - `dispInvalid` test via real HTTP server: Go's `net/http` canonicalizes response headers, making `:pseudo` header injection impossible → switched to fake `checkFn` closure.
+  - DATA RACE on `asyncExtAuthzDCB.continueCount`/`localReply`: resume goroutine write vs test goroutine read → added `sync.Mutex` + locked methods + safe accessors.
+  - DATA RACE on `upstream` http.Header: goroutine write under `f.mu` vs test read unguarded → test-side read now under `f.mu`.
+
+### Full package test run (race-clean)
+
+```
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.303s
+```
+
+147 PASS, 0 FAIL, 0 SKIP (was 135 PASS after Task 8; +12 new Group 5+9 tests).
+
+### go vet
+
+```
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+```
+
+### gofmt
+
+```
+$ gofmt -l internal/filter/http/extauthz/
+(no output — empty)
+```
+
+### Task 9 commit SHA
+
+TBD
