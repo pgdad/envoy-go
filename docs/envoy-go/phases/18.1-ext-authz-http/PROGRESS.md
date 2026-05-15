@@ -1722,3 +1722,90 @@ $ go vet ./...
 ### Task 11 commit SHA
 
 TBD (filled post-squash)
+
+### Task 11 review fix
+
+**Status:** DONE
+
+The Task 11 review surfaced one HIGH-severity issue and one LOW (cosmetic):
+
+**HIGH — listener-topology miscall in the original driver.** The original driver claimed scenarios 3 + 4 split via "per-route config overrides rather than separate listeners". This is factually incorrect: `failure_mode_allow` is a TOP-LEVEL `ExtAuthz` field, NOT in `ExtAuthzPerRoute.check_settings`. `CheckSettings` carries `context_extensions`, `disable_request_body_buffering`, `with_request_body`, and `service_override` — none of which override `failure_mode_allow`. The envoy-go MVP also does NOT honor `service_override` (extauthz.go parses only the first three CheckSettings fields). Therefore scenarios 3 (failure_mode_allow:false → 503 status_on_error) and 4 (failure_mode_allow:true → 200 + marker header) MUST hit DIFFERENT listener-level configs.
+
+**Investigation result:** Option A (multiple listeners) is the only viable approach. Options B (per-route ext_authz override) and C (per-route service_override) are blocked by the proto + MVP limitations.
+
+**Topology settled — THREE listeners:**
+
+| Listener | Reference port | Subject port | Scenarios | `failure_mode_allow` | Auth cluster |
+|---|---|---|---|---|---|
+| `l_test_a` | 10020 | subjListenerPort+0 | 1, 2, 5, 6, 7 | false (default) | `c_authz` (LIVE auth server on `authPort`) |
+| `l_test_b` | 10021 | subjListenerPort+1 | 3 | false (+ `status_on_error:503`) | `c_authz_down` (unreachable: closed `authDownPort`) |
+| `l_test_c` | 10022 | subjListenerPort+2 | 4 | true (+ `failure_mode_allow_header_add:true`) | `c_authz_down` (unreachable: closed `authDownPort`) |
+
+**Why this topology is the cleanest:**
+
+- The auth server stays running for the entire workload — no stop/restart needed for S3+S4 (the bootstrap's `c_authz_down` is hardcoded unreachable; the driver allocates a TCP port, immediately closes the listener, and the port stays unbound for the fixture lifetime).
+- The driver only restarts the live auth server when the Script must change (S1 → S2 → S5 → S7).
+
+**Driver changes:**
+
+- `test/fixtures/0020-http-ext-authz-http/inputs/driver.go` — refactored to implement `fixture.MultiListenerDriver`:
+  - Added `SubjectListenerNames()` → `["l_test_a", "l_test_b", "l_test_c"]`.
+  - Added `ReferenceListenerPorts()` → `[10020, 10021, 10022]`.
+  - Added `DriveReferenceMulti` / `DriveSubjectMulti` (mirrors fixture-0018 rbac pattern).
+  - Added `deriveAddrsFromRef` / `deriveAddrsFromSubj` for the single-addr fallback path (never invoked at runtime; required for the `fixture.Driver` interface).
+  - Added `allocateAuthDownPort()` — allocates ephemeral TCP port and immediately closes the listener; the port stays unbound for the fixture lifetime.
+  - `driveProxy` now takes `addrs map[string]string` and dispatches each scenario to the appropriate listener: S1+2+5+6+7 → `baseA` (l_test_a), S3 → `baseB` (l_test_b), S4 → `baseC` (l_test_c).
+  - Auth-server lifecycle simplified: no stop/restart for S3+S4 (those listeners point at `c_authz_down` which is unreachable regardless of the live server state).
+- Package doc + AssertStats comment rewritten to document the THREE-listener topology accurately. The misleading "per-route config overrides rather than separate listeners" comment was replaced with the correct "DIFFERENT listeners (l_test_b vs l_test_c) carrying different ext_authz filter configs" wording.
+- Compile-time interface assertion list extended: added `_ fixture.MultiListenerDriver = (*extAuthzHTTPDriver)(nil)`.
+
+**LOW — dead `scenarioDef` type removed.** The `type scenarioDef struct { ... }` declared inside `driveProxy` was never used (the driver dispatches scenarios via direct function calls, not via a scenario-table loop). Removed.
+
+**Forward-pointer to Task 12 — listener topology contract:**
+
+Task 12 wires `envoy.yaml` + `envoy-go.yaml` with:
+
+- Three listeners `l_test_a` (port `{{.LATestPort}}`), `l_test_b` (port `{{.LBTestPort}}`), `l_test_c` (port `{{.LCTestPort}}`).
+- Three clusters:
+  - `c_backend` → `{{.BackendHost}}:{{.BackendPort}}` (live echo backend).
+  - `c_authz` → `{{.AuthHost}}:{{.AuthPort}}` (live in-process auth server).
+  - `c_authz_down` → `{{.AuthDownHost}}:{{.AuthDownPort}}` (hardcoded unreachable; nothing bound).
+- l_test_a's `ext_authz` filter: `http_service.server_uri.cluster = c_authz`; `failure_mode_allow = false` (default).
+- l_test_b's `ext_authz` filter: `http_service.server_uri.cluster = c_authz_down`; `failure_mode_allow = false`; `status_on_error.code = 503`.
+- l_test_c's `ext_authz` filter: `http_service.server_uri.cluster = c_authz_down`; `failure_mode_allow = true`; `failure_mode_allow_header_add = true`.
+- Per-route configs apply on l_test_a routes only:
+  - `/scenarios/6-disabled` carries `ExtAuthzPerRoute{disabled: true}`.
+  - `/scenarios/7-check-settings` carries `ExtAuthzPerRoute{check_settings{disable_request_body_buffering: true}}`.
+- All other listener-level filter settings (allowed_headers, allowed_upstream_headers, allowed_client_headers, with_request_body for S5, validate_mutations, etc.) are set on l_test_a per SPEC §7.2 wiring.
+
+**Files changed (Task 11 review fix):**
+
+- Modified: `test/fixtures/0020-http-ext-authz-http/inputs/driver.go` (~610 LoC; restructured to MultiListenerDriver + new authDownPort allocator + topology-correct doc + dead-code removal).
+- Modified: `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` (this section).
+
+**Outputs:**
+
+### go build ./... (Task 11 review fix)
+
+```
+$ go build ./...
+(exit 0 — no output)
+```
+
+### go vet ./... (Task 11 review fix)
+
+```
+$ go vet ./...
+(exit 0 — no output)
+```
+
+### gofmt -l (Task 11 review fix)
+
+```
+$ gofmt -l /home/esa/git/envoy-go/.worktrees/phase-18.1-ext-authz-http-impl/
+(empty — all files formatted)
+```
+
+### Task 11 review-fix commit SHA
+
+TBD (filled post-commit)
