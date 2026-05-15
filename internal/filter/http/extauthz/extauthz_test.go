@@ -1,6 +1,6 @@
 package extauthz
 
-// extauthz_test.go — unit-test Groups 1 + 2 + 3 + 4 + 6 + 7 + 8 (through Task 7).
+// extauthz_test.go — unit-test Groups 1 + 2 + 3 + 4 + 6 + 7 + 8 (through Task 8).
 //
 // Test group assignments per PLAN / SPEC §14.1:
 //
@@ -441,6 +441,185 @@ func TestFilterStats_NilRegistryTolerance(t *testing.T) {
 		}
 	}()
 	_, _ = buildCompiledConfig(nilCtx, cfg)
+}
+
+// ----------------------------------------------------------------------------
+// Group 2 stats sub-group — SN2-reuse namespace integration tests
+// (Task 8: stat surface finalization + §18.P6 + §18.P7 RATIFIED-PENDING closure)
+//
+// These tests lock down the contract established by newFilterStats + Task 2's
+// implementation. Per the Task 8 TDD discipline (PLAN Step 1 finalization note):
+// the tests are written here at Task 8 to lock down the already-satisfied
+// contract. They pass immediately because Task 2's implementation already
+// satisfies all conditions — documented as a "finalization/locking step" per
+// the PLAN. The empirical scrape (Step 4) closes §18.P6 + §18.P7 externally.
+// ----------------------------------------------------------------------------
+
+// TestFilterStats_ExactlySixCounters_NoExtras verifies that newFilterStats
+// registers EXACTLY 6 counters and no extras in a fresh Registry per ADR-0156
+// §Decision + parent SPEC §6 amendment 8. Mirrors phase-17 jwt_authn
+// TestFilterStats_AllSevenCountersRegistered.
+func TestFilterStats_ExactlySixCounters_NoExtras(t *testing.T) {
+	reg := stats.NewRegistry()
+	_ = newFilterStats(reg, "ingress_http")
+	var names []string
+	reg.Walk(func(m stats.Metric) {
+		names = append(names, m.Name())
+	})
+	if len(names) != 6 {
+		t.Errorf("Registry size = %d; want exactly 6 counters (no extras); got names=%v", len(names), names)
+	}
+}
+
+// TestFilterStats_UnconditionalRegistration_ViaBuildCompiledConfig verifies
+// that buildCompiledConfig registers all 6 counters unconditionally when
+// ctx.Stats is non-nil — i.e., NOT lazy, NOT deferred to first request. The
+// counters must appear in the Registry immediately after buildCompiledConfig
+// returns per ADR-0156 + parent SPEC §6 amendment 8.
+func TestFilterStats_UnconditionalRegistration_ViaBuildCompiledConfig(t *testing.T) {
+	reg := stats.NewRegistry()
+	ctx := freshFactoryCtxWithRegistry(reg)
+	cc, err := buildCompiledConfig(ctx, validHTTPServiceConfig())
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
+	}
+	if cc.stats == nil {
+		t.Fatal("cc.stats: want non-nil when ctx.Stats is non-nil")
+	}
+	// Counters must be present immediately — no deferred / lazy allocation.
+	var names []string
+	reg.Walk(func(m stats.Metric) {
+		names = append(names, m.Name())
+	})
+	want := []string{
+		"http.ingress_http.ext_authz.ok",
+		"http.ingress_http.ext_authz.denied",
+		"http.ingress_http.ext_authz.error",
+		"http.ingress_http.ext_authz.disabled",
+		"http.ingress_http.ext_authz.failure_mode_allowed",
+		"http.ingress_http.ext_authz.invalid",
+	}
+	for _, w := range want {
+		found := false
+		for _, n := range names {
+			if n == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("counter %q not registered immediately after buildCompiledConfig; got names=%v", w, names)
+		}
+	}
+	if len(names) != 6 {
+		t.Errorf("Registry size = %d after buildCompiledConfig; want 6; got names=%v", len(names), names)
+	}
+}
+
+// TestFilterStats_NilStats_CcStatsIsNil verifies that when ctx.Stats is nil,
+// buildCompiledConfig leaves cc.stats as nil (the ADR-0085 nil-tolerance guard:
+// `if ctx.Stats != nil` at buildCompiledConfig step 7). Mirrors phase-17
+// TestFilterStats_NilRegistry_NoPanic SN2-reuse nil-tolerance contract.
+func TestFilterStats_NilStats_CcStatsIsNil(t *testing.T) {
+	nilCtx := envoyhttp.FactoryCtx{Stats: nil, StatPrefix: "ingress_http"}
+	cc, err := buildCompiledConfig(nilCtx, validHTTPServiceConfig())
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: unexpected error: %v", err)
+	}
+	if cc.stats != nil {
+		t.Errorf("cc.stats: want nil when ctx.Stats is nil; got non-nil %v", cc.stats)
+	}
+}
+
+// TestFilterStats_EmptyPrefix_FoldsToBarePrefixShape verifies the empty-HCM-
+// stat_prefix fold per baseStatPrefix: when hcmStatPrefix == "", the counter
+// names use the bare `ext_authz.<counter>` form (no "http.." double-dot) to
+// satisfy the Registry's nameRE (forbids leading dots / double dots).
+// Per ADR-0156 + extauthz.go baseStatPrefix inline comment.
+func TestFilterStats_EmptyPrefix_FoldsToBarePrefixShape(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "") // empty HCM stat_prefix
+	if fs == nil {
+		t.Fatal("newFilterStats with empty prefix: got nil, want non-nil")
+	}
+	// Counter names must use bare ext_authz.<counter> form (no http.. prefix).
+	cases := []struct {
+		handle *stats.Counter
+		want   string
+	}{
+		{fs.ok, "ext_authz.ok"},
+		{fs.denied, "ext_authz.denied"},
+		{fs.errored, "ext_authz.error"}, // "error" on wire; "errored" in Go
+		{fs.disabled, "ext_authz.disabled"},
+		{fs.failureModeAllowed, "ext_authz.failure_mode_allowed"},
+		{fs.invalid, "ext_authz.invalid"},
+	}
+	for _, tc := range cases {
+		if tc.handle == nil {
+			t.Errorf("counter for %q: handle is nil with empty prefix", tc.want)
+			continue
+		}
+		if got := tc.handle.Name(); got != tc.want {
+			t.Errorf("counter Name() = %q; want %q (bare form, no http.. double-dot)", got, tc.want)
+		}
+	}
+}
+
+// TestFilterStats_CounterHandleNames_SN2ReusePins locks down the exact
+// Name() values on each counter handle, confirming the SN2-reuse internal
+// stat-path shape `http.<HCM_stat_prefix>.ext_authz.<counter>` per ADR-0156
+// §Decision (vii) + parent SPEC §18.P6/§18.P7 RATIFIED-PENDING-IMPL-TIME
+// empirical-scrape closure at Task 8.
+func TestFilterStats_CounterHandleNames_SN2ReusePins(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	if fs == nil {
+		t.Fatal("newFilterStats: want non-nil")
+	}
+	cases := []struct {
+		handle *stats.Counter
+		want   string
+	}{
+		{fs.ok, "http.ingress_http.ext_authz.ok"},
+		{fs.denied, "http.ingress_http.ext_authz.denied"},
+		{fs.errored, "http.ingress_http.ext_authz.error"}, // "error" on wire; "errored" in Go
+		{fs.disabled, "http.ingress_http.ext_authz.disabled"},
+		{fs.failureModeAllowed, "http.ingress_http.ext_authz.failure_mode_allowed"},
+		{fs.invalid, "http.ingress_http.ext_authz.invalid"},
+	}
+	for _, tc := range cases {
+		if tc.handle == nil {
+			t.Errorf("counter for %q: handle is nil", tc.want)
+			continue
+		}
+		if got := tc.handle.Name(); got != tc.want {
+			t.Errorf("counter Name() = %q; want %q (SN2-reuse per ADR-0156 + §18.P7)", got, tc.want)
+		}
+	}
+}
+
+// TestFilterStats_DisabledCounter_RegisteredButZero verifies the `disabled`
+// counter is registered (for scrape-stability) but publishes 0 under MVP —
+// it is STRUCTURALLY UNREACHABLE (only the deferred runtime `filter_enabled`
+// gate increments it; no code path in 18.1 increments it directly). Per
+// parent SPEC §6 amendment 7 + ADR-0156 §Decision.
+func TestFilterStats_DisabledCounter_RegisteredButZero(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http")
+	if fs == nil {
+		t.Fatal("newFilterStats: want non-nil")
+	}
+	if fs.disabled == nil {
+		t.Fatal("disabled counter: want registered (non-nil), got nil")
+	}
+	if got := fs.disabled.Name(); got != "http.ingress_http.ext_authz.disabled" {
+		t.Errorf("disabled.Name() = %q; want %q", got, "http.ingress_http.ext_authz.disabled")
+	}
+	// STRUCTURALLY UNREACHABLE: value must be 0 — no code path increments it
+	// under MVP per parent SPEC §6 amendment 7.
+	if v := fs.disabled.Load(); v != 0 {
+		t.Errorf("disabled.Load() = %d; want 0 (STRUCTURALLY UNREACHABLE under MVP per §6 amendment 7)", v)
+	}
 }
 
 // TestCompiledConfig_FieldFinal verifies that compiledConfig is mode-agnostic

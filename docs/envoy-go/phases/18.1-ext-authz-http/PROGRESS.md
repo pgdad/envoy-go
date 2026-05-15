@@ -1106,3 +1106,229 @@ $ go test -race -count=1 -run '^TestResolvePerRouteConfig_ConcurrentSameProto$' 
 PASS
 ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.009s
 ```
+
+## Task 8 — Stat surface finalization + §18.P6 + §18.P7 RATIFIED-PENDING empirical-scrape closures [ADR-0163]
+
+Per PLAN Task 8 (Steps 1–7) + ADR-0163 §Decision (vii) + planner-time decision D8.
+
+The stat-surface machinery — `newFilterStats` + the 6-counter `filterStats` struct + `baseStatPrefix` helper — landed wholly at Task 2 (per ADR-0156). Task 8's substantive deliverables are:
+
+1. **Group 2 stats sub-group tests** — 6 new tests locking down the already-satisfied contract (finalization/locking step).
+2. **§18.P6 + §18.P7 RATIFIED-PENDING-IMPL-TIME empirical scrape** — reference Envoy v1.37.2 run confirming the SN2-reuse hypothesis.
+3. **No source-code amendments to `extauthz.go`** — Task 2's `newFilterStats` implementation was correct; Task 8 locks it down with tests.
+
+### Status: §18.P6 + §18.P7 RATIFIED — SN2-reuse CONFIRMED
+
+### Group 2 stats sub-group — TDD note
+
+Per PLAN Task 8 Step 1: these tests are written at Task 8 to lock down the contract. They passed immediately because Task 2's implementation already satisfies all conditions — this is the documented "finalization/locking step" pattern per the PLAN (identical to Task 7's per-route finalization).
+
+The 6 new tests added to `extauthz_test.go` (9 total stats tests after Task 8; 3 existing from Task 2 + 6 new):
+1. `TestFilterStats_ExactlySixCounters_NoExtras` — exactly 6 counters, no extras in a fresh Registry.
+2. `TestFilterStats_UnconditionalRegistration_ViaBuildCompiledConfig` — integration: all 6 registered immediately after `buildCompiledConfig` (non-lazy; SN2 names verified).
+3. `TestFilterStats_NilStats_CcStatsIsNil` — `cc.stats` is nil when `ctx.Stats` is nil (ADR-0085 nil-tolerance guard).
+4. `TestFilterStats_EmptyPrefix_FoldsToBarePrefixShape` — empty HCM stat_prefix folds to bare `ext_authz.<counter>` (no double-dot).
+5. `TestFilterStats_CounterHandleNames_SN2ReusePins` — pins exact `Name()` values on all 6 counter handles (`http.ingress_http.ext_authz.*`).
+6. `TestFilterStats_DisabledCounter_RegisteredButZero` — `disabled` registered (non-nil handle) but `Load()` == 0 (STRUCTURALLY UNREACHABLE under MVP per parent §6 amendment 7).
+
+All 6 passed immediately confirming Task 2's impl was correct.
+
+### §18.P6 + §18.P7 empirical scrape — reference Envoy v1.37.2
+
+**Envoy image:** `envoyproxy/envoy:v1.37.2` (SHA `c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`)
+
+**Envoy config used (minimal — HCM with ext_authz HTTP filter, dummy auth cluster, admin on :9901):**
+
+```yaml
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: backend
+          http_filters:
+          - name: envoy.filters.http.ext_authz
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+              transport_api_version: V3
+              http_service:
+                server_uri:
+                  uri: http://127.0.0.1:12345
+                  cluster: auth_service
+                  timeout: 0.25s
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: backend
+    connect_timeout: 0.25s
+    type: STATIC
+    load_assignment:
+      cluster_name: backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8080
+  - name: auth_service
+    connect_timeout: 0.25s
+    type: STATIC
+    load_assignment:
+      cluster_name: auth_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 12345
+```
+
+**Docker invocation:**
+
+```
+docker run --rm -d --name envoy-ext-authz-scrape \
+  -p 9901:9901 \
+  -v /tmp/envoy-ext-authz-scrape.yaml:/etc/envoy/envoy.yaml \
+  envoyproxy/envoy:v1.37.2 \
+  -c /etc/envoy/envoy.yaml
+
+sleep 3
+curl -s localhost:9901/stats/prometheus | grep -i ext_authz
+docker stop envoy-ext-authz-scrape
+```
+
+**Verbatim `/stats/prometheus` output filtered to `ext_authz`:**
+
+```
+# TYPE envoy_http_ext_authz_denied counter
+envoy_http_ext_authz_denied{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_disabled counter
+envoy_http_ext_authz_disabled{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_error counter
+envoy_http_ext_authz_error{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_failure_mode_allowed counter
+envoy_http_ext_authz_failure_mode_allowed{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_filter_state_name_collision counter
+envoy_http_ext_authz_filter_state_name_collision{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_ignored_dynamic_metadata counter
+envoy_http_ext_authz_ignored_dynamic_metadata{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_invalid counter
+envoy_http_ext_authz_invalid{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_ok counter
+envoy_http_ext_authz_ok{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_omitted_response_headers counter
+envoy_http_ext_authz_omitted_response_headers{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_request_header_limits_reached counter
+envoy_http_ext_authz_request_header_limits_reached{envoy_http_conn_manager_prefix="ingress_http"} 0
+# TYPE envoy_http_ext_authz_response_header_limits_reached counter
+envoy_http_ext_authz_response_header_limits_reached{envoy_http_conn_manager_prefix="ingress_http"} 0
+```
+
+**Analysis of the scrape evidence:**
+
+The 6 MVP counter names from the scrape:
+- `envoy_http_ext_authz_ok{envoy_http_conn_manager_prefix="ingress_http"} 0`
+- `envoy_http_ext_authz_denied{envoy_http_conn_manager_prefix="ingress_http"} 0`
+- `envoy_http_ext_authz_error{envoy_http_conn_manager_prefix="ingress_http"} 0`
+- `envoy_http_ext_authz_disabled{envoy_http_conn_manager_prefix="ingress_http"} 0`
+- `envoy_http_ext_authz_failure_mode_allowed{envoy_http_conn_manager_prefix="ingress_http"} 0`
+- `envoy_http_ext_authz_invalid{envoy_http_conn_manager_prefix="ingress_http"} 0`
+
+The 5 additional deferred-feature counters (`filter_state_name_collision`, `ignored_dynamic_metadata`, `omitted_response_headers`, `request_header_limits_reached`, `response_header_limits_reached`) also appear — these are the extra v1.37.2 names already documented as DEFERRED in parent SPEC §6 amendment 8. envoy-go does NOT register these 5 (correct per the SPEC).
+
+**SN2-reuse rendering verification:** The internal path `http.ingress_http.ext_authz.<counter>` → Prometheus `envoy_http_ext_authz_<counter>{envoy_http_conn_manager_prefix="ingress_http"}` matches exactly what `internal/stats/name.go`'s SN2 rule produces: the `http.*` prefix-match extracts `ingress_http` as `envoy_http_conn_manager_prefix`; the rest `ext_authz.<counter>` gets dot→underscore transform → `envoy_http_ext_authz_<counter>`. NO new SN-flattening rule needed.
+
+**§18.P6 + §18.P7 VERDICT: CONFIRMED — SN2-reuse hypothesis holds.** No ADR-0163 amendment required.
+
+### File changes (Task 8)
+
+| File | Change | Detail |
+|---|---|---|
+| `internal/filter/http/extauthz/extauthz_test.go` | +143 LoC | File header updated (Task 7 → Task 8); Group 2 stats sub-group comment block + 6 new tests |
+| `docs/envoy-go/phases/18.1-ext-authz-http/PROGRESS.md` | (this entry) | Task 8 narrative + empirical-scrape evidence |
+
+No changes to `docs/envoy-go/DECISIONS.md` (ADR-0163 §Decision already carries the closure-at-Task-8 disposition; no amendment needed since the scrape CONFIRMED the SN2-reuse hypothesis).
+
+### Test runs
+
+#### Targeted stats sub-group run
+
+```
+$ go test ./internal/filter/http/extauthz/ -run 'TestFilterStats' -v
+=== RUN   TestFilterStats_6Counters
+--- PASS: TestFilterStats_6Counters (0.00s)
+=== RUN   TestFilterStats_CounterNames
+--- PASS: TestFilterStats_CounterNames (0.00s)
+=== RUN   TestFilterStats_NilRegistryTolerance
+--- PASS: TestFilterStats_NilRegistryTolerance (0.00s)
+=== RUN   TestFilterStats_ExactlySixCounters_NoExtras
+--- PASS: TestFilterStats_ExactlySixCounters_NoExtras (0.00s)
+=== RUN   TestFilterStats_UnconditionalRegistration_ViaBuildCompiledConfig
+--- PASS: TestFilterStats_UnconditionalRegistration_ViaBuildCompiledConfig (0.00s)
+=== RUN   TestFilterStats_NilStats_CcStatsIsNil
+--- PASS: TestFilterStats_NilStats_CcStatsIsNil (0.00s)
+=== RUN   TestFilterStats_EmptyPrefix_FoldsToBarePrefixShape
+--- PASS: TestFilterStats_EmptyPrefix_FoldsToBarePrefixShape (0.00s)
+=== RUN   TestFilterStats_CounterHandleNames_SN2ReusePins
+--- PASS: TestFilterStats_CounterHandleNames_SN2ReusePins (0.00s)
+=== RUN   TestFilterStats_DisabledCounter_RegisteredButZero
+--- PASS: TestFilterStats_DisabledCounter_RegisteredButZero (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	0.003s
+```
+
+All 9 stats tests PASS (3 from Task 2 + 6 new at Task 8). Tests passed immediately — finalization/locking step confirmed.
+
+#### Full package run
+
+```
+$ go test -race -count=1 ./internal/filter/http/extauthz/...
+ok  	github.com/esalaine/envoy-go/internal/filter/http/extauthz	1.079s
+```
+
+135 PASS, 0 FAIL, 0 SKIP (was 129 PASS after Task 7; +6 new stats sub-group tests).
+
+#### go vet
+
+```
+$ go vet ./internal/filter/http/extauthz/...
+(no output — exit 0)
+```
+
+#### gofmt
+
+```
+$ gofmt -l internal/filter/http/extauthz/
+(no output — empty)
+```
+
+### Task 8 commit SHA
+
+`<TBD — fill after commit>`
