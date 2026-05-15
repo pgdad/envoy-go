@@ -8325,11 +8325,35 @@ The boot-registration ordering follows ADR-0072 + ADR-0100 §2.2 alphabetical-af
 
 ### Decision
 
-LANDS AT Task 2 of phase-18.1 PLAN per ADR-0044 ADR-on-impl convention. The §Decision body will codify: (i) the single-token `internal/filter/http/extauthz/` directory + `TypeURL`/`filterName` consts; (ii) the DECODER-only `HTTPFilter` value + the compile-time `var _ envoyhttp.StreamDecoderFilter` assertion; (iii) the 6-base-counter `filterStats` struct + `newFilterStats` unconditional allocation guarded by `if ctx.Stats != nil`; (iv) `disabled` registered-but-structurally-unreachable; (v) the deny-path / error-path `SendLocalReply` callsite shape; (vi) the boot-registration site in `cmd/envoy-go/main.go`; (vii) the `factoryState` simplification (SHARED-stats means no per-route `*filterStats` — per ADR-0163).
+**Status: Accepted — landed at Task 2 of phase-18.1 PLAN per ADR-0044.**
+
+**(i) Single-token directory + consts.** Package directory and Go-package identifier are both `extauthz` — single token, underscore-stripped per ADR-0114, matching `localratelimit/` + `jwtauthn/`. The internal `filterName` const is `"envoy.filters.http.ext_authz"` (underscore preserved, matching the listener typed_per_filter_config map key). The exported `TypeURL` const is `"type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz"`.
+
+**(ii) DECODER-only HTTPFilter value + compile-time assertion.** The factory returns `envoyhttp.HTTPFilter{Name: filterName, Decoder: f, Encoder: nil}`. Compile-time assertion `var _ envoyhttp.StreamDecoderFilter = (*filter)(nil)` at package scope. Mirrors phase-12 csrf + phase-13 buffer + phase-16 rbac + phase-17 jwt_authn decoder-only precedent (5th §9 row pure decode-side).
+
+**(iii) 6-base-counter `filterStats` + `newFilterStats` unconditional allocation.** The `filterStats` struct carries 6 `*stats.Counter` fields: `ok`, `denied`, `errored` (wire name: `error`), `disabled`, `failureModeAllowed` (wire name: `failure_mode_allowed`), `invalid`. `newFilterStats(reg, hcmStatPrefix)` registers all 6 via `reg.NewCounterIfAbsent` unconditionally (predeclared empty counters for scrape stability; mirrors phase-17 jwt_authn). `buildCompiledConfig` guards `if ctx.Stats != nil` before calling `newFilterStats` per ADR-0085 nil-tolerance.
+
+**(iv) `disabled` registered-but-structurally-unreachable.** The `disabled` counter is registered for scrape-stability but never incremented under MVP: the runtime `filter_enabled` / `filter_enabled_metadata` gate is silent-ignored in 18.1 (parent SPEC §5.P12 + §8 deferral 4). Mirrors phase-17 jwt_authn's `jwtCacheHit`/`jwtCacheMiss` structurally-unreachable discipline. `disabled` publishes 0 for the listener's lifetime.
+
+**(v) Deny-path / error-path `SendLocalReply` callsite shape.** On **deny**: `dcb.SendLocalReply(disp.denyStatus, string(disp.denyBody), filteredHeaders)` where `filteredHeaders` contains the auth service's `allowed_client_headers`-filtered headers + synthesized `content-length` (ADR-0085). On **error + `failure_mode_allow:false`**: `dcb.SendLocalReply(cc.statusOnError, "", nil)`. ext_authz is the FIRST §9 row whose deny-path status is not fixed — it comes from the auth service. The `SendLocalReply` body lands at Task 9 for the real dispatch; Task 2 ships the skeleton.
+
+**(vi) Boot-registration site deferred to Task 10.** The `cmd/envoy-go/main.go` registration (`httpReg.Register(extauthz.TypeURL, extauthz.New)`) alphabetical between `envoygotest` and `fault` lands at Task 10, growing the registry from 13 to 14 entries.
+
+**(vii) `factoryState` simplification.** SHARED-stats discipline per ADR-0163 means no per-route `*filterStats` allocation. `factoryState` carries only `listenerRC *compiledConfig` + `perRoute sync.Map`. Mirrors phase-17 jwtauthn's simplified `factoryState` (no `reg` or `hcmStatPrefix` thread-through).
 
 ### Consequences
 
-LANDS AT Task 2 of phase-18.1 PLAN per ADR-0044. The §Consequences body will record: the package landing at Task 2; the 6 counters publishing under the SN2-reuse namespace `http.<HCM_stat_prefix>.ext_authz.<counter>`; the `disabled` counter publishing 0 indefinitely under MVP (documented divergence-window vs reference Envoy which increments it via the runtime `filter_enabled` gate); the deny-path divergence-window for `response_code_details` (joint with phase-16 ADR-0146 + phase-17 ADR-0155); the boot-registration count 13 → 14; the Task 2 acceptance test groups.
+**Package landing at Task 2.** The `internal/filter/http/extauthz/` package lands with `doc.go` + `extauthz.go` + `extauthz_test.go` (Groups 1+2+7). Acceptance: `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0; `go vet ./internal/filter/http/extauthz/...` exit 0; 38 tests pass.
+
+**6 counters under SN2-reuse namespace.** All 6 publish under `http.<HCM_stat_prefix>.ext_authz.<counter>`. Empty HCM stat_prefix (test code paths) folds to `ext_authz.<counter>` (nameRE discipline). RATIFIED-PENDING-IMPL-TIME via reference Envoy v1.37.2 empirical scrape at Task 8 per §18.P6.
+
+**`disabled` counter divergence-window.** Envoy v1.37.2 increments `disabled` via the runtime `filter_enabled` gate; envoy-go MVP defers that gate entirely → `disabled` publishes 0 indefinitely under 18.1. Documented divergence-window (see BEHAVIOR_CONTRACT §13.2 at Task 14).
+
+**`response_code_details` divergence-window.** Envoy v1.37.2 emits `ext_authz_denied` in `response_code_details` on the deny path; envoy-go's `SendLocalReply` has no `response_code_details` slot (3-arg signature from phase-04 HCM scope). Joint divergence-window with phase-16 ADR-0146 + phase-17 ADR-0155 (forward-pointer to future HCM framework phase).
+
+**Boot-registration count 13 → 14.** Lands at Task 10 (this task deferred per PLAN).
+
+**Task 2 test groups.** Groups 1 (`ExtAuthz` parse), 2 (`compiledConfig` shape), 7 (per-route) PASS. Groups 3/4/5/6/8/9 land at Tasks 4/3/9/6/5/9 respectively.
 
 ---
 
@@ -8352,11 +8376,33 @@ The error-classification boundary in `check.go` is empirically RATIFIED at the p
 
 ### Decision
 
-LANDS AT Task 2 of phase-18.1 PLAN (§Decision) + is AMENDED at phase-18.2 IMPL per ADR-0044. The 18.1 §Decision body will codify: the `compiledConfig` struct (`checkFn` + `withRequestBody` + the 4 error-posture fields + `clearRouteCache` + `allowedHeaders`/`disallowedHeaders` + `stats`); the `services`-oneof dispatch (`nil` → PARSE-REJECT; `*ExtAuthz_GrpcService` → PARSE-REJECT in 18.1; `*ExtAuthz_HttpService` → build the HTTP-mode `checkFn`); the V3-only `transport_api_version` PARSE-REJECT; the `checkDisposition` convergence value; the §5.P10 error-classification boundary in the `check.go` dispatcher. The 18.2 §Decision amendment will replace the `grpc_service` PARSE-REJECT with the gRPC `checkFn` construction.
+**Status: Accepted — landed at Task 2 of phase-18.1 PLAN per ADR-0044. §Decision amended at phase-18.2 IMPL to activate the `grpc_service` arm.**
+
+**(i) `compiledConfig` struct shape.** The `compiledConfig` struct carries: `checkFn` (the resolved transport closure), `withRequestBody *bufferSettings` (non-nil when `with_request_body.max_request_bytes > 0`), four error-posture fields (`failureModeAllow bool`, `failureModeAllowHeaderAdd bool`, `statusOnError uint32` default 403, `validateMutations bool`), `clearRouteCache bool`, `allowedHeaders *stringMatcherList` + `disallowedHeaders *stringMatcherList` (nil = all allowed / none denied respectively at Task 2 stub; compiled at Task 4), and `stats *filterStats` (SHARED per ADR-0163; nil-guarded per ADR-0085). No transport-specific fields — mode-agnostic and field-final at 18.1 (18.2 adds no field).
+
+**(ii) `services`-oneof dispatch in `buildCompiledConfig`.** The dispatch fires AFTER the structural checks (`transport_api_version` + `with_request_body`) and follows the deterministic ordering: (1) nil `services` oneof → PARSE-REJECT `"ext_authz: services oneof must be set (neither grpc_service nor http_service is configured)"`. (2) `*ExtAuthz_GrpcService` → PARSE-REJECT `"ext_authz: grpc_service mode not yet supported (lands in phase 18.2)"` in 18.1. (3) `*ExtAuthz_HttpService` → call `buildHTTPCheckFn` (Task 2 stub returns `errHTTPCheckFnStub`; Task 3 replaces with the real HTTP-mode `checkFn`). The 18.2 amendment replaces arm (2) with the gRPC `checkFn` construction consuming ADR-0158.
+
+**(iii) `transport_api_version` V3-only PARSE-REJECT.** Non-V3 values (including the zero-value `API_VERSION_UNSPECIFIED` = 0) PARSE-REJECT per ADR-0008. The check fires AFTER the `services`-oneof presence/grpc PARSE-REJECTs (ordering: (1) nil/grpc `services` oneof → PARSE-REJECT, (2) `transport_api_version` V3-only check, (3) `with_request_body` validation, (4) `http_service` dispatch via `buildHTTPCheckFn`). Only `corev3.ApiVersion_V3` (value 2 in `go-control-plane v1.32.4`) is accepted.
+
+**(iv) `checkDisposition` convergence value.** The mode-agnostic convergence type `checkDisposition` carries: `class dispositionClass` (`dispAllow` / `dispDeny` / `dispError`); `upstreamSet []headerKV` + `upstreamApp []headerKV` (allow-path upstream header mutations — `allowed_upstream_headers` set/overwrite and `allowed_upstream_headers_to_append` append); `denyStatus uint32` + `denyBody []byte` + `denyHeaders []headerKV` (deny-path verbatim auth response). Both the HTTP-mode (18.1) and gRPC-mode (18.2) `checkFn` implementations produce this struct. The disposition-application logic is mode-agnostic and lives in the `check.go` dispatcher (Task 9).
+
+**(v) Error-classification boundary.** Per parent SPEC §5.P10 empirical ratification: transport/timeout/connect failure or HTTP-mode unrecognized status ⇒ `dispError` → `statusOnError` apply (or `failureModeAllow` pass-through); recognized deny status (`401`/`403` HTTP-mode, any non-OK gRPC `status.code`) ⇒ `dispDeny` → `SendLocalReply(disp.denyStatus, ...)`; empty-but-valid response ⇒ `dispAllow`. `failure_mode_allow` / `status_on_error` act on `dispError` only. Error + `failureModeAllow:true` increments BOTH `errored` AND `failureModeAllowed` counters.
+
+**(vi) `with_request_body` structural validation.** `BufferSettings.max_request_bytes == 0` is a PGV constraint violation treated as a PARSE-REJECT by envoy-go-strict. The check fires before `buildHTTPCheckFn` in `buildCompiledConfig` ordering. A valid `with_request_body` sets `compiledConfig.withRequestBody` to the parsed `*bufferSettings`.
+
+**(vii) `errHTTPCheckFnStub` sentinel at Task 2.** `buildHTTPCheckFn` at Task 2 validates `server_uri` presence then returns `errHTTPCheckFnStub = errors.New("ext_authz: buildHTTPCheckFn stub (Task 3 lands the real impl)")`. This makes Group 1 tests distinguish stub from real parse-rejections via `errors.Is(err, errHTTPCheckFnStub)`. Task 3 replaces this stub with the real HTTP-mode `checkFn`; the Group 1 "valid http_service" tests are tightened to assert `factory != nil` at that point.
 
 ### Consequences
 
-LANDS AT the respective IMPL tasks per ADR-0044. Records: the 18.1 `compiledConfig` landing; the `grpc_service` PARSE-REJECT divergence-window for 18.1 (configs using gRPC-mode fail to load under 18.1 envoy-go but succeed under reference Envoy — closed at 18.2); the 18.2 amendment activating the gRPC arm; the consumed-vs-deferred field roster (parent SPEC §5.P1 + §6 amendment 1).
+**`compiledConfig` landed at Task 2.** The struct is field-final at 18.1 — 18.2 adds no new field (only a second `checkFn` constructor). All Task 2 acceptance tests (Groups 1+2+7) pass with `go test -race -count=1 ./internal/filter/http/extauthz/...` exit 0.
+
+**`grpc_service` PARSE-REJECT divergence-window for 18.1.** Configs using `grpc_service` fail to load under 18.1 envoy-go but succeed under reference Envoy v1.37.2. This is an intentional 18.1-scoped divergence window, closed at 18.2 when arm (2) in `buildCompiledConfig` is replaced by the real gRPC `checkFn`. Documented divergence-window (see BEHAVIOR_CONTRACT at Task 14).
+
+**18.2 amendment forward-pointer.** The `*ExtAuthz_GrpcService` arm in `buildCompiledConfig` is the sole §Decision amendment point for 18.2. The amendment replaces the PARSE-REJECT with `buildGRPCCheckFn(cfg.GrpcService, ctx)` consuming ADR-0158. No other `compiledConfig` field changes at 18.2.
+
+**Consumed-vs-deferred field roster.** 18.1 consumes (per parent SPEC §5.P1 + §6 amendment 1): `http_service`, `transport_api_version`, `failure_mode_allow`, `failure_mode_allow_header_add`, `with_request_body`, `clear_route_cache`, `status_on_error`, `validate_mutations`, `allowed_headers`, `disallowed_headers`, `stat_prefix`. 18.1 PARSE-REJECTs: `grpc_service`. 18.1 silent-ignores ~13 fields (runtime/metadata/TLS families per doc.go §Silent-ignored list).
+
+**Task 2 Groups 1+2 test coverage.** Group 1 covers all `New()` PARSE-REJECT paths + the stub success path (via `errors.Is(err, errHTTPCheckFnStub)`). Group 2 covers `compiledConfig` field values post-parse (error-posture defaults, `with_request_body` validation, `statusOnError` default 403). Groups 3/4/5/6/8/9 land at Tasks 4/3/9/6/5/9 respectively.
 
 ---
 
@@ -8389,10 +8435,10 @@ LANDS AT phase-18.2 IMPL per ADR-0044. Records: envoy-go's FIRST gRPC infrastruc
 
 ## ADR-0159: HTTP-outbound auth-check framework primitive — composes against the phase-17 `internal/jwks/Fetcher` outbound-HTTP `http.Client`/timeout structure; **SPEC author's disposition: (b) — a thin ext_authz-local HTTP client** (an `httpAuthClient` type in `check.go` wrapping an `*http.Client` + the configured `HttpService.server_uri.timeout` + `path_prefix`), NOT generalized into a shared `internal/httpclient/` package; the natural trigger to generalize is the THIRD outbound-HTTP consumer (a future `oauth2` token-endpoint POST)
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL per ADR-0044 ADR-on-impl convention.
+**Status:** Accepted
 **Date:** 2026-05-14
 **Doctrine:** Phase 18.1 §9 family-row. ADR-0044 ADR-on-impl convention. The SECOND outbound-HTTP-from-filter primitive (after phase-17 ADR-0150 `internal/jwks/Fetcher`). Designed cross-phase-reusable-aware at introduction time.
-**Lands-in:** Task 3 (hypothesis) of phase-18.1 PLAN.
+**Lands-in:** Task 3 of phase-18.1 PLAN.
 
 ### Context
 
@@ -8404,20 +8450,38 @@ The BRAINSTORM §3.2 posed an (a)-vs-(b) disposition for the SPEC author: (a) ge
 
 ### Decision
 
-LANDS AT Task 3 (hypothesis) of phase-18.1 PLAN per ADR-0044 ADR-on-impl convention. The §Decision body will codify: disposition (b); the `httpAuthClient` type + its construction from `HttpService.server_uri`; the POST construction (request-side-filtered headers + `path_prefix` + body); the HTTP-response → `checkDisposition` mapping per parent SPEC §5.P10/§5.P11; the async-resume + cancellation discipline; the oauth2-triggers-generalization forward-pointer.
+**Status: Accepted — landed at Task 3 of phase-18.1 PLAN per ADR-0044.**
+
+**(i) Disposition (b) — a thin ext_authz-local HTTP client, NOT a shared `internal/httpclient/` package.** The (a)-vs-(b) disposition posed at BRAINSTORM §3.2 is RESOLVED as **(b)** at impl time, confirming the SPEC author's §Context disposition. The `httpAuthClient` type lives in `check.go` — local to the extauthz package, not promoted to a top-level `internal/httpclient/`. Rationale held at impl time: `internal/jwks/Fetcher` is a cached, async-refreshing, scheduled-refetch fetcher of a long-lived key set; the ext_authz HTTP-mode auth-check is a synchronous-per-request, no-cache, cancellable POST-and-parse. The two consumers' lifecycles barely overlap; a shared abstraction designed against only these two would be premature. `check.go` therefore *composes against* (mirrors the `http.Client`/timeout discipline of) — but does NOT *reuse* — the phase-17 ADR-0150 outbound-HTTP structure.
+
+**(ii) `httpAuthClient` shape + construction.** `httpAuthClient` wraps: `client *http.Client` (constructed `&http.Client{Timeout: hs.server_uri.timeout}` — the proto `durationpb.Duration` converted to `time.Duration`; a nil/zero timeout means no client-imposed timeout), `baseURL string` (the scheme+host of `server_uri.uri`, path component stripped), and `pathPrefix string` (`HttpService.path_prefix`, prepended to each request path). It carries NO cache, NO background-refresh goroutine, NO retry policy (ZERO retry per planner-time decision D2 — `HttpService` has no retry-policy proto field), and NO connection-management state (stateless per-request; the `*http.Client` is goroutine-safe). It is allocated once at `buildHTTPCheckFn` (config-load) time and shared across all per-stream `checkFn` invocations.
+
+**(iii) `buildHTTPCheckFn` signature — impl-time deviation from the PLAN nominal.** The PLAN's File-structure-table nominal signature was `buildHTTPCheckFn(hs *ext_authzv3.HttpService, ar *authRequestCfg, validateMutations bool)`. The signature settled at Task 3 is **`buildHTTPCheckFn(hs *ext_authzv3.HttpService) (checkFn, error)`** — taking only the `HttpService`. Rationale: the `authRequestCfg` type and `buildAuthRequest` land at Task 4, and `validate_mutations` gating over the extracted header sets lands at Task 5; neither exists at Task 3. The reduced signature matches the existing `buildCompiledConfig` call-site (which Task 2 already wired to pass only `hs`). The PLAN explicitly sanctioned this ("check what Task 2's `buildCompiledConfig` currently passes to the stub `buildHTTPCheckFn`"). When Task 4/Task 5 land, the request-side-filtered headers and `validate_mutations` gating thread through the `authRequest` value and the compiled matcher sets respectively — no signature change to `buildHTTPCheckFn` is anticipated, as those concerns reach the closure via the `*authRequest` argument and the (Task-5) compiled `authorization_response` matcher triple captured in the closure.
+
+**(iv) The `checkFn` closure + POST construction.** `buildHTTPCheckFn` validates `server_uri` set + non-empty `uri` (PGV-mirror — `HttpService.server_uri` is NOT PGV-required; the factory rejects an empty one + an empty `uri` with `"ext_authz: http_service.server_uri.uri is required"`), constructs the `httpAuthClient`, and returns the `checkFn` closure. The closure: (1) builds the outbound POST URL = `baseURL` + `joinPaths(pathPrefix, req.path)` (double-slash-avoiding join); (2) creates an `http.NewRequestWithContext(ctx, POST, url, body)` — `body` is a `bytes.Reader` over `req.body` when non-empty, else nil; (3) copies the `authRequest` headers onto the outbound request (at Task 3 these are the `authRequest` headers as-is — request-side filtering via `buildAuthRequest` is STUBBED until Task 4); (4) calls `hac.client.Do(outReq)` — the `ctx` is threaded so `OnDestroy`'s cancel aborts the in-flight call; (5) maps the response via `mapHTTPResponse`.
+
+**(v) The §5.P10 error-classification boundary as implemented.** `mapHTTPResponse` switches on `resp.StatusCode`: **`200` → `dispAllow`** (header-extraction STUBBED at Task 3 — `upstreamSet`/`upstreamApp` left nil; `allowed_upstream_headers` extraction lands at Task 5); **`401` or `403` → `dispDeny`** (the recognized deny-status set per parent SPEC §5.P10 — the response body is read verbatim into `denyBody` per §5.P11, `denyStatus` set to the status code; `allowed_client_headers` extraction STUBBED at Task 3 — `denyHeaders` left nil, lands at Task 5); **any other status → `dispError`** (returns `checkDisposition{class: dispError}` + a descriptive error). Before `mapHTTPResponse` is even reached: a `client.Do` error (connect failure / timeout / `ctx` cancelled) returns `checkDisposition{class: dispError}` + the wrapped transport error; a `NewRequestWithContext` build error likewise returns `dispError`; an IO error reading the deny body returns `dispError`. ZERO retry — a single attempt, then the error disposition (per D2).
 
 ### Consequences
 
-LANDS AT phase-18.1 IMPL per ADR-0044. Records: the thin local client landing in `check.go`; the BEHAVIOR_CONTRACT shape (a thin cross-reference under the phase-17 `## JWKS framework primitive` umbrella, OR a short `## HTTP outbound auth-check` note — the 18.1 IMPL chooses the lighter-touch shape); the deferred `internal/httpclient/` generalization + the oauth2 trigger.
+**The thin local client landed in `check.go`** — `httpAuthClient` + `buildHTTPCheckFn` + `buildCheckFnClosure` + `mapHTTPResponse` + the URL helpers (`buildTargetURL` / `stripPath` / `joinPaths`) + `durationpbToGo`. No new top-level package; no `go.mod` change. The Task 2 `errHTTPCheckFnStub` sentinel is retired — `buildHTTPCheckFn`'s real implementation in `check.go` supersedes the `extauthz.go` stub (the sentinel `var` is kept as a nil-match placeholder for audit-trail; the Group 1 "valid http_service" tests are tightened to assert `factory != nil`).
+
+**FIRST §9 row with a per-request cancellable outbound call.** The `checkFn` closure threads `ctx` through `http.NewRequestWithContext`, so `OnDestroy`'s `callCancel()` (Task 9) aborts an in-flight auth POST — a context cancellation surfaces as `dispError`. Group 4's `TestCheckFn_Error_ContextCancelled` + `TestCheckFn_Error_Timeout` exercise this at Task 3; the full `OnDestroy`-drives-cancel path is exercised by Task 9's Group 9.
+
+**Header-extraction + `validate_mutations` deferred to Task 5.** At Task 3 the allow-path `upstreamSet`/`upstreamApp` and the deny-path `denyHeaders` are populated minimally (nil). The real `allowed_upstream_headers` / `allowed_upstream_headers_to_append` / `allowed_client_headers` extraction (+ the `text/plain` `content-type` fallback + decision-headers-first ordering + `validate_mutations` gating) lands at Task 5 (ADR-0161). Request-side header filtering (`buildAuthRequest`) lands at Task 4 (ADR-0160).
+
+**BEHAVIOR_CONTRACT shape — the lighter-touch cross-reference.** Per the §Context disposition, the 18.1 IMPL chooses the lighter-touch BEHAVIOR_CONTRACT shape: a thin cross-reference under the phase-17 `## JWKS framework primitive` umbrella ("see also: ext_authz HTTP-mode thin outbound client"), NOT a standalone `## HTTP outbound auth-check` section. That patch lands at Task 14 (§13.7 of the 6-edit BEHAVIOR_CONTRACT bundle).
+
+**Deferred `internal/httpclient/` generalization + the oauth2 trigger.** Disposition (b) leaves the `internal/httpclient/` generalization deferred. The natural trigger to reconsider is the THIRD outbound-HTTP consumer — a future `oauth2` phase needs a synchronous-per-request outbound token-endpoint POST that is structurally like ext_authz's HTTP-mode call (unlike the JWKS fetcher's cached/async shape). When oauth2 brainstorms, the `internal/httpclient/` generalization should be reconsidered with three consumers in view; until then, the thin per-consumer client is the correct shape.
 
 ---
 
 ## ADR-0160: `AttributeContext` / `AuthorizationRequest` builder — HTTP-mode portion (the `AuthorizationRequest` builder: `headers_to_add` + `path_prefix` prepend + the top-level `ExtAuthz.allowed_headers`/`disallowed_headers` request-side filtering + the deprecated-`AuthorizationRequest.allowed_headers` honored-if-present disposition) lands in 18.1; gRPC-mode portion (the `AttributeContext` builder: source/destination Peers, `request.http` per §5.P4, `request.time` `Timestamp` shape, `principal` via the phase-16 ADR-0144 `DownstreamPrincipal()` reuse, `certificate`/`tls_session` honored as `include_peer_certificate`/`include_tls_session` gates per §5.P3, `context_extensions` merge, the `encode_raw_headers` `headers`-vs-`header_map` discipline) lands in 18.2
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL (HTTP-mode portion) + phase-18.2 IMPL (gRPC-mode portion) per ADR-0044.
+**Status:** Accepted (HTTP-mode portion) — §Decision + §Consequences for the HTTP-mode portion landed at Task 4 of phase-18.1 IMPL per ADR-0044. The gRPC-mode portion §Decision + §Consequences land at phase-18.2 IMPL.
 **Date:** 2026-05-14
 **Doctrine:** Phase 18.1 + 18.2 §9 family-row. ADR-0044 ADR-on-impl convention. The gRPC-mode portion is the SECOND cross-phase reuse of ADR-0144 `DownstreamPrincipal()` (phase-16 rbac was the introducer-and-first-consumer).
-**Lands-in:** Task 4 (hypothesis) of phase-18.1 PLAN (HTTP-mode); phase-18.2 PLAN (gRPC-mode).
+**Lands-in:** Task 4 of phase-18.1 PLAN (HTTP-mode portion). phase-18.2 PLAN (gRPC-mode portion).
 
 ### Context
 
@@ -8429,20 +8493,42 @@ ext_authz must build a request representation to ship to the external auth servi
 
 ### Decision
 
-LANDS AT the respective IMPL tasks per ADR-0044. The 18.1 §Decision codifies the `AuthorizationRequest` builder + request-side header filtering; the 18.2 §Decision codifies the `AttributeContext` builder + the `DownstreamPrincipal()` reuse + the `include_*` gating + the `encode_raw_headers` discipline.
+**Status: Accepted (HTTP-mode portion) — landed at Task 4 of phase-18.1 PLAN per ADR-0044. gRPC-mode portion LANDS AT phase-18.2 IMPL.**
+
+**(i) `stringMatcherList` + `compileStringMatcherList` shape.** The internal `stringMatcherList` type and its `matchAny(candidate string) bool` method are defined in `attributes.go` alongside `compileStringMatcherList` (the type, constructor, and method co-located per the rbac/evaluator.go precedent). The type definition replaces the Task 2 placeholder in `extauthz.go`. `stringMatcherList` holds a `[]compiledStringMatcher` slice; `matchAny` iterates and short-circuits on first match (OR semantics). An empty slice matches nothing; a nil `*stringMatcherList` pointer is the "no matcher" (all-pass / none-removed) sentinel.
+
+**(ii) D5 confirmation — `safe_regex` engine-arm subset.** The `safe_regex` arm compiles via `regexp.Compile(mp.SafeRegex.GetRegex())` (Go's `regexp` package, RE2-compatible). Evidence basis: (a) the go-control-plane v1.37.2-era proto defines only one `engine_type` arm — `google_re2` (`RegexMatcher_GoogleRe2`); there are no other valid arms in the proto for this version; (b) reference Envoy v1.37.2 uses the RE2 engine natively; Go's `regexp` package is a RE2-compatible implementation; (c) the phase-09/12 RegexMatcher-subset discipline (internal/matcher `compileStringMatcher` + rbac evaluator `matchString`) uses the same `regexp.Compile` approach. Decision: the `google_re2` arm (nil EngineType is treated as implicit google_re2 — the only valid arm) is honored; nil `RegexMatcher` → PARSE-REJECT; invalid regex pattern → PARSE-REJECT with a descriptive error. Full empirical confirmation against a running v1.37.2 is deferred to the Task 13 differential fixture pass (the fixture exercises real Envoy ext_authz with these patterns). No divergence from the LOCKED D5 disposition at Task 4.
+
+**(iii) D6 confirmation — deprecated `AuthorizationRequest.allowed_headers` disposition.** Reference evidence: the go-control-plane proto source for `AuthorizationRequest.allowed_headers` (field #1) carries the Go `// Deprecated: Marked as deprecated in ...` annotation, confirming it is deprecated-but-not-removed at the v1.37.2 proto level. The field is still present and populated by the generated Go accessors (`GetAllowedHeaders()`). Reference Envoy v1.37.2 source inspection and the phase-17 amendment-4 "deprecated-but-honored" precedent both support the honored-if-present disposition. **Decision: HONORED-IF-PRESENT confirmed.** `buildAuthRequest` applies the D6 logic: when `cc.allowedHeaders` (top-level primary path, `ExtAuthz.allowed_headers` #17) is nil AND `hs.AuthorizationRequest.AllowedHeaders` (deprecated #1) is non-nil, the deprecated field is compiled and used as the effective allow-list. When `cc.allowedHeaders` is non-nil, the deprecated field is silently ignored (top-level wins). This mirrors the proto doc direction ("This field has been deprecated in favor of `allowed_headers`"). No flip to silent-ignore — v1.37.2 has not removed the field. Full empirical confirmation against a running v1.37.2 is deferred to the Task 13 differential fixture pass.
+
+**(iv) Header name matching — lowercased comparison convention.** HTTP header names are case-insensitive per RFC 7230; Envoy lowercases header names internally. `buildAuthRequest` matches header names against the `stringMatcherList` using the lowercased form (`strings.ToLower(name)`) so that a config pattern `exact: "authorization"` matches the `Authorization` canonical-form header as stored in Go's `http.Header` map. This is consistent with reference Envoy v1.37.2 behavior. Header values are forwarded as-is (no case transformation).
+
+**(v) `buildAuthRequest` signature.** `buildAuthRequest(f *filter, hs *ext_authzv3.HttpService, headers http.Header, body []byte, path string) *authRequest`. The filter carries `f.activeRC` for `cc.allowedHeaders` / `cc.disallowedHeaders`; `hs` carries `AuthorizationRequest.headers_to_add` + deprecated `allowed_headers`; `headers` is the incoming client request header map (Task 9 wires from `dcb.RequestHeaders()` + `DecodeHeaders` arg; test helpers pass directly); `body` is nil at Task 4 (wired at Task 6); `path` is the request path as-is (path_prefix prepend done in check.go's closure). The method is always `POST` (HTTP-mode auth check always POSTs per SPEC §6.5).
+
+**(vi) `validateMutationHeaders` authored but unconsumed (D7).** `validateMutationHeaders(hdrs []headerKV) error` is authored in `attributes.go` at Task 4 per the planner-time decision D7 plan. It validates: :-prefixed pseudo-headers REJECTED; invalid header-name characters REJECTED (RFC 7230 §3.2.6 token rule); invalid header-value characters REJECTED (bare CR, LF, NUL). It is NOT wired into the disposition path at Task 4 — that lands at Task 5 (ADR-0161). Group 3 unit tests cover it at Task 4.
+
+**(vii) `buildAuthRequest` call-site boundary — Task 9, NOT the `check.go` closure (Task 4 review-fix).** The PLAN Task 4 Step 4 wording ("wire `buildAuthRequest` into `check.go`'s `checkFn` closure") is imprecise. `buildAuthRequest` is called at the Task 9 `DecodeHeaders` dispatch site — NOT from the `checkFn` closure — because it requires the per-stream `*filter` (carrying the per-route-resolved `f.activeRC` for `cc.allowedHeaders`/`cc.disallowedHeaders`) AND the real client request headers from `dcb.RequestHeaders()`. Neither is available at config-load time inside `buildHTTPCheckFn` (which has only `hs`, and runs mid-construction of `cc`), and the `checkFn` closure type is mode-agnostic (shared with the 18.2 gRPC-mode closure) — by contract it RECEIVES an already-built `*authRequest` and just transmits it. Handing the closure `f` + raw headers would couple the mode-agnostic type to the per-stream filter shape and duplicate `buildAuthRequest` inside the closure. Only `DecodeHeaders` has `f`, `dcb.RequestHeaders()`, the buffered body, and the path coexisting — so Task 9's `DecodeHeaders` is the architecturally correct call site. The `check.go` header comment carries the call-site-boundary note; `extauthz.go`'s `DecodeHeaders` skeleton carries the Task-9 forward-pointer. Recorded as a justified deviation in the PROGRESS.md Task 4 entry.
 
 ### Consequences
 
-LANDS AT the respective IMPL tasks per ADR-0044. Records the per-mode builder landing; the SECOND ADR-0144 cross-phase reuse; the `tls_session` RATIFIED-PENDING-IMPL-TIME closure (parent §5.P4 — the scrape used a plaintext listener; the 18.2 IMPL confirms `tls_session.sni` against a TLS listener).
+**`attributes.go` landed (~200 LoC net, well within the 200–340 LoC range)** — `stringMatcherList` + `compileStringMatcherList` + `compileOneStringMatcher` + the 5 `compiledStringMatcher` implementations (`smExact`, `smPrefix`, `smSuffix`, `smContains`, `smRegex`) + `buildAuthRequest` + `validateMutationHeaders` + `validateMutationHeaderName` + `validateMutationHeaderValue` + `isTokenChar`.
+
+**`extauthz.go` updated** — the Task 2 placeholder `stringMatcherList` type replaced by a comment cross-reference to `attributes.go`; the Task 2 `compileStringMatcherList` stub replaced by a comment cross-reference; `buildCompiledConfig` step 6 updated to handle the real `(sml, error)` return from `compileStringMatcherList` (PARSE-REJECTs on malformed `allowed_headers`/`disallowed_headers` patterns).
+
+**D5 and D6 LOCKED dispositions CONFIRMED at Task 4** via proto-field documentation evidence + the phase-09/12/17 precedent. Full empirical confirmation against a running v1.37.2 is deferred to the Task 13 differential fixture pass per the Task 4 instruction. No divergence recorded.
+
+**`validateMutationHeaders` is authored here, consumed at Task 5.** The D7 rule set (phase-10 header_mutation protected-header discipline: `:` pseudo-headers + invalid token chars + invalid value chars) is authored in `attributes.go` at Task 4; Task 5 wires it into the `validate_mutations` disposition path (ADR-0161).
+
+**gRPC-mode portion (18.2)** — the `AttributeContext` builder + the `DownstreamPrincipal()` reuse + the `include_*` gating + the `encode_raw_headers` discipline + the `tls_session` RATIFIED-PENDING-IMPL-TIME closure all land at phase-18.2 IMPL. This ADR's §Decision is amended at 18.2 to add the gRPC-mode portion.
 
 ---
 
 ## ADR-0161: Bidirectional header-mutation discipline — request-side filtering (top-level `allowed_headers`/`disallowed_headers`) + allow-path upstream injection + deny-path downstream copying + `validate_mutations` gating + the deny-path header-set construction; HTTP-mode portion (`AuthorizationResponse.{allowed_upstream_headers, allowed_upstream_headers_to_append, allowed_client_headers}`) lands in 18.1; gRPC-mode portion (`OkHttpResponse.{headers, headers_to_remove, response_headers_to_add}` + `DeniedHttpResponse.headers`) lands in 18.2; records the `allowed_client_headers_on_success` + `query_parameters` + `dynamic_metadata_from_headers` deferrals + the possible stash-for-HCM revisit
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL (HTTP-mode portion) + phase-18.2 IMPL (gRPC-mode portion) per ADR-0044.
+**Status:** Accepted (HTTP-mode portion, Task 5 of phase-18.1 PLAN); Anticipated — gRPC-mode portion lands at phase-18.2 IMPL per ADR-0044.
 **Date:** 2026-05-14
 **Doctrine:** Phase 18.1 + 18.2 §9 family-row. ADR-0044 ADR-on-impl convention. The `validate_mutations` gating mirrors the phase-10 header_mutation protected-header discipline.
-**Lands-in:** Task 5 (hypothesis) of phase-18.1 PLAN (HTTP-mode); phase-18.2 PLAN (gRPC-mode).
+**Lands-in:** Task 5 of phase-18.1 PLAN (HTTP-mode portion confirmed); phase-18.2 PLAN (gRPC-mode portion).
 
 ### Context
 
@@ -8456,20 +8542,42 @@ The deny-path wire shape is empirically RATIFIED at the parent SPEC §5.P11: bod
 
 ### Decision
 
-LANDS AT the respective IMPL tasks per ADR-0044. The 18.1 §Decision codifies the HTTP-mode bidirectional emit-order + per-direction filtering + `validate_mutations` gating + the deny-path `SendLocalReply` header-set construction; the 18.2 §Decision codifies the gRPC-mode `OkHttpResponse`/`DeniedHttpResponse` mutation.
+**(HTTP-mode portion landed at Task 5 of phase-18.1 IMPL. gRPC-mode portion lands at phase-18.2 IMPL.)**
+
+**(i) Response-side matcher compilation at config-load time.** `buildHTTPCheckFn` compiles all three `AuthorizationResponse` `*ListStringMatcher` fields — `allowed_upstream_headers`, `allowed_upstream_headers_to_append`, `allowed_client_headers` — into `*stringMatcherList` values at config-load time via `compileStringMatcherList`. A malformed matcher pattern produces a PARSE-REJECT at `buildHTTPCheckFn` time (no per-request compilation). `validateMutations bool` is threaded in from `compiledConfig.validateMutations` at config-load time. The signature is extended to `buildHTTPCheckFn(hs, validateMutations bool) (checkFn, error)`.
+
+**(ii) Allow-path extraction.** On HTTP 200, `mapHTTPResponseWithMatchers` calls `extractMatchingHeaders(resp.Header, allowedUpstream)` → `upstreamSet` (set/overwrite semantics) and `extractMatchingHeaders(resp.Header, allowedUpstreamApp)` → `upstreamApp` (append semantics). `extractMatchingHeaders` lowercases response header names before matcher evaluation (Envoy's internal lowercase-header convention); it emits one `headerKV` per value for multi-value headers. Nil matcher → nil result (no headers extracted).
+
+**(iii) `applyUpstreamMutations` placement.** The allow-path application helper `applyUpstreamMutations(headers http.Header, disp checkDisposition)` lives in `extauthz.go`; it calls `headers.Set` for each `upstreamSet` entry then `headers.Add` for each `upstreamApp` entry. It is NOT called inside the `checkFn` closure — it is called at the DecodeHeaders dispatch site (Task 9) where the upstream request `http.Header` is available.
+
+**(iv) Deny-path header-set construction.** On HTTP 401/403, `buildDenyHeaders(resp.Header, allowedClient)` extracts decision headers (auth-service-supplied, filtered by `allowed_client_headers`) then appends a `content-type: text/plain` fallback if the auth service did not supply `content-type` in the allowed set. **Decision headers appear FIRST; the housekeeping content-type fallback is LAST.** This ordering is per SPEC §4 + parent §5.P11 RATIFIED.
+
+**(v) `validate_mutations` gating (D7 rule set).** When `validateMutations` is true, `validateMutationHeaders` is called over the extracted header sets (allow-path: `upstreamSet` and `upstreamApp`; deny-path: `denyHeaders`). A violation drives `dispInvalid` — a fourth `dispositionClass` distinct from `dispAllow`/`dispDeny`/`dispError`, treated as error posture per SPEC §6.3 but incrementing the `invalid` counter. The rejection returns `checkDisposition{class: dispInvalid}, nil` (no error returned; the invalid disposition is a valid outcome, not an internal error).
+
+**(vi) `mapHTTPResponse` superseded and removed.** The Task 3 `mapHTTPResponse(resp *http.Response) (checkDisposition, error)` is superseded at Task 5 by `mapHTTPResponseWithMatchers` and **removed** from `check.go`. The production closure calls `mapHTTPResponseWithMatchers` directly (via `buildCheckFnClosure`), and the Group 4 / Group 8 tests exercise that path through the closure built by `buildHTTPCheckFnForTest` — no caller of the old `mapHTTPResponse` wrapper remained, so it was deleted rather than retained as dead code.
+
+**(vii) `deprecated allowed_headers` pre-compile fix (Task 4 carried-forward).** `compiledConfig` gains a `deprecatedAllowedHeaders *stringMatcherList` field. `buildCompiledConfig` pre-compiles `AuthorizationRequest.allowed_headers` (deprecated) into this field at config-load time; a malformed pattern is a PARSE-REJECT (not a silent degrade as originally coded). `cc.deprecatedAllowedHeaders` is nulled when `cc.allowedHeaders` is set (top-level wins). `buildAuthRequest` uses `cc.deprecatedAllowedHeaders` directly — no per-request compilation.
 
 ### Consequences
 
-LANDS AT the respective IMPL tasks per ADR-0044. Records: the per-mode mutation landing; the `allowed_client_headers_on_success` divergence-window (envoy-go absent on the allow-path downstream-response header set); the `query_parameters` + `dynamic_metadata_from_headers` deferrals. **§Consequences explicitly records that the 18.1/18.2 IMPL sessions MAY revisit a stash-for-HCM mechanism** for `allowed_client_headers_on_success` if it proves cheap — a decode-side filter stashing headers that HCM applies to the eventual response (analogous to but distinct from the phase-14 ADR-0131 `OverwriteBody` encode-side primitive); if revisited and adopted, that surfaces as an ADR-0044 escape-valve ADR.
+**(i) PARSE-REJECT on malformed response-side matchers.** A bad regex in `allowed_upstream_headers` / `allowed_upstream_headers_to_append` / `allowed_client_headers` fails the `NewPlugin` call at boot. Consistent with the request-side (ADR-0160) compile-once-fail-fast discipline.
+
+**(ii) `deprecated allowed_headers` malformed → PARSE-REJECT.** The Task 4 original "silent-degrade on compile error" behavior is replaced with PARSE-REJECT. The deprecated field is a planner-documented backward-compat path; if it is present and malformed, treating it as all-pass was a latent security concern (all headers would pass through to the auth service). PARSE-REJECT is the safer and consistent choice.
+
+**(iii) `dispInvalid` = fourth disposition class.** The `invalid` counter (SPEC §5.P6) is wired at Task 9 DecodeHeaders dispatch when `disp.class == dispInvalid`; the counter increment and SendLocalReply(403) are applied with error-posture semantics. `dispInvalid` is distinct from `dispError` because SPEC §6.3 explicitly separates the `invalid` counter from the `errored` counter.
+
+**(iv) `allowed_client_headers_on_success` deferred.** envoy-go's decode-side-only filter shape cannot honor the allow-path downstream-response header set without an encode-side leg. The deferral is permanent unless the stash-for-HCM mechanism (§Context above) is later implemented under an escape-valve ADR.
+
+**(v) gRPC-mode portion deferred to phase-18.2.** The `OkHttpResponse.{headers, headers_to_remove, response_headers_to_add}` + `DeniedHttpResponse.headers` mapping lands in 18.2. The `dispAllow.upstreamSet`/`upstreamApp` and `dispDeny.denyHeaders` fields on `checkDisposition` are already the correct shared-shape; the gRPC mapper will populate them following the same downstream consumption path.
 
 ---
 
 ## ADR-0162: Request-body inclusion — `with_request_body{max_request_bytes, allow_partial_message, pack_as_bytes}` + the phase-13 ADR-0128 decode-side body-buffering reuse + the `allow_partial_message:false` over-limit → local 413 + `connection: close` edge case (parent SPEC §5.P5) + the `body`-vs-`raw_body` `pack_as_bytes` shape + the `DecodeHeaders`-StopIteration / `DecodeData`-resume interaction
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL per ADR-0044 ADR-on-impl convention.
+**Status:** Accepted
 **Date:** 2026-05-14
-**Doctrine:** Phase 18.1 §9 family-row. ADR-0044 ADR-on-impl convention. The SECOND consumer of the phase-13 ADR-0128 decode-side body-buffering primitive (after phase-15 bandwidth_limit) — and the FIRST to consume it for *outbound transmission* of the body rather than throttling/forwarding.
-**Lands-in:** Task 6 (hypothesis) of phase-18.1 PLAN.
+**Doctrine:** Phase 18.1 §9 family-row. ADR-0044 ADR-on-impl convention. The THIRD consumer of the phase-13 ADR-0128 decode-side body-buffering primitive (after phase-13 buffer filter + phase-15 bandwidth_limit) — and the FIRST to consume it for *outbound transmission* of the body rather than throttling/forwarding.
+**Lands-in:** Task 6 of phase-18.1 PLAN.
 
 ### Context
 
@@ -8481,20 +8589,42 @@ The body-buffering interaction makes `DecodeHeaders` return `HeaderStopIteration
 
 ### Decision
 
-LANDS AT Task 6 (hypothesis) of phase-18.1 PLAN per ADR-0044 ADR-on-impl convention. The §Decision body will codify: the `with_request_body` parse → `*bufferSettings`; the ADR-0128 reuse for body materialization; the `DecodeHeaders`-StopIteration / `DecodeData`-resume interaction; the `allow_partial_message:false` over-limit → `SendLocalReply(413, "Payload Too Large", {connection: close})` edge case; the `allow_partial_message:true` truncated-prefix + `x-envoy-auth-partial-body:true` + true-`size` behavior; the `pack_as_bytes` `body`-vs-`raw_body` shape (the gRPC-mode `raw_body` consumption lands in 18.2).
+**(i) `with_request_body` parse → `*bufferSettings`.** At config-load time, `buildCompiledConfig` validates `max_request_bytes > 0` (PGV-mirror) and stores the three fields (`max_request_bytes`, `allow_partial_message`, `pack_as_bytes`) in a `bufferSettings` struct pointer on `compiledConfig.withRequestBody`. A nil `with_request_body` proto → nil pointer (body buffering OFF). Per-route `check_settings.with_request_body` is parsed identically into `compiledCheckSettings.withRequestBody`.
+
+**(ii) ADR-0128 decode-side body-buffering reuse — the `DecodeHeaders` + `DecodeData` interaction.** The body-buffering algorithm mirrors the phase-13 buffer filter (ADR-0128) and phase-15 bandwidth_limit:
+
+- `DecodeHeaders`: computes the effective `withRequestBody` (per-route `disable_request_body_buffering` → nil (OFF); per-route `with_request_body` → per-route override; else listener-level). If effective `withRequestBody != nil` AND `endStream=false`: sets `filter.awaitingBody = true` + caches `filter.bodySettings`. Returns `Continue` — **NOT `StopIteration`** — per the ADR-0128 synchronous-HCM dispatch constraint (returning `StopIteration` from `DecodeHeaders` would deadlock: the body-read loop and the filter chain run in the same HCM dispatch goroutine per ADR-0076; the body loop is the `ContinueDecoding` path — see ADR-0128 §Context). The SPEC §6.3 description "return `HeaderStopIteration`" captures conceptual Envoy semantics; the envoy-go implementation uses `Continue` for the body-buffering phase exactly as the buffer + bandwidth_limit filters do.
+
+- `DecodeData`: when `awaitingBody=false`, pass-through (`DataContinue`). When `awaitingBody=true`: accumulate via `f.body = append(f.body, data...)`. Check over-limit (strict `>` per buffer filter §11.2 precedent). On non-terminal chunk within limit: `DataContinue` (framework `connection.go` bodyBuf holds the bytes — same rationale as buffer/bandwidth_limit). On terminal (`endStream=true`) within limit: return `DataStopIterationAndBuffer` — the Task 9 seam that parks the chain so the async outbound check goroutine can resume via `dcb.ContinueDecoding()`.
+
+**(iii) `allow_partial_message:false` over-limit → 413 local-reply. NO counter increments. Auth NOT called.** When `uint32(len(f.body)) > f.bodySettings.maxRequestBytes` AND `allow_partial_message=false`: call `dcb.SendLocalReply(413, "Payload Too Large", OrderedHeaders{{Name: "Connection", Value: "close"}})` and return `DataStopIterationNoBuffer`. The auth service is NEVER contacted. **NO ext_authz counter increments** — the request never reached a disposition (no `ok` / `denied` / `errored` / `failureModeAllowed` / `invalid` increment). This is the load-bearing "auth NOT called, NO counters" invariant from parent SPEC §6 amendment 6. The over-limit check fires mid-stream (on any chunk that pushes the accumulated total over the limit) — not only on `endStream=true`.
+
+**(iv) `allow_partial_message:true` over-limit → truncated prefix.** When `uint32(len(f.body)) > f.bodySettings.maxRequestBytes` AND `allow_partial_message=true`: truncate `f.body` to exactly `f.bodySettings.maxRequestBytes` bytes (`f.body = f.body[:maxRequestBytes]`). The truncated prefix is used in the auth request. Task 9 injects `x-envoy-auth-partial-body: true` into the auth request headers before the outbound check fires (the injection happens at `buildAuthRequest`/check-dispatch time in Task 9, not in `DecodeData`). The filter does NOT emit 413; it continues to the `endStream` handling and parks with `DataStopIterationAndBuffer`.
+
+**(v) `pack_as_bytes` — parsed, stored, no HTTP-mode effect in 18.1.** `pack_as_bytes` is parsed faithfully into `bufferSettings.packAsBytes`. In HTTP-mode (18.1), the POST body is the raw bytes of `f.body` regardless — there is no `body` (string) vs `raw_body` (bytes) distinction in HTTP-mode (those are gRPC `AttributeContext.request.http` fields). `pack_as_bytes` is a gRPC-mode differentiator; 18.2 honors it for the `AttributeContext` builder. Parsing and storing it in 18.1 is correct (config is shared between modes in the envelope; `compiledConfig` is mode-agnostic per ADR-0157).
+
+**(vi) Effective `withRequestBody` precedence.** Per SPEC §8 + SPEC §6.3 step 3: (a) per-route `disable_request_body_buffering=true` → nil (body buffering OFF for this route); (b) per-route `with_request_body != nil` → use per-route `bufferSettings` (overrides listener-level); (c) listener-level `withRequestBody` (may be nil = OFF). The resolution is done once per stream at `DecodeHeaders` time; the result is cached in `filter.bodySettings` for `DecodeData`.
+
+**(vii) Task 6 / Task 9 seam.** Task 6 delivers the body-buffering machinery + the over-limit 413 edge case. Task 9 completes the `DecodeHeaders` async-dispatch body: per-route resolve (the full `disabled` short-circuit + `f.perRoute` caching) + the outbound check goroutine (`buildAuthRequest` + `checkFn` + `dcb.ContinueDecoding()` on completion) + the `OnDestroy` cancellation. The seam in `DecodeData` at `endStream=true` (within limit OR allow_partial prefix) returns `DataStopIterationAndBuffer` and is marked with a `// Task 9: fire outbound check here` comment — Task 9 replaces this with the goroutine dispatch.
 
 ### Consequences
 
-LANDS AT phase-18.1 IMPL per ADR-0044. Records: the SECOND ADR-0128 consumer + the FIRST outbound-transmission consumer; the over-limit 413 edge case; the per-route `disable_request_body_buffering`/`with_request_body` override interaction.
+- Ext_authz is the **THIRD ADR-0128 consumer** (after phase-13 buffer filter + phase-15 bandwidth_limit) and the **FIRST to consume it for outbound transmission** of the body to a remote service (buffer + bandwidth_limit use it for local body-counting/throttling).
+- The `allow_partial_message:false` over-limit → 413 NO-counter invariant is the **first time a filter's over-limit path emits a local-reply WITHOUT incrementing any filter counter**. This is load-bearing for operator observability: a 413 on the ext_authz path is attributable to the over-limit edge case (not a deny/error from the auth service) precisely because the counters stay at 0.
+- `DecodeHeaders` returning `Continue` (not `StopIteration`) for the body-buffering phase is an envoy-go implementation detail forced by ADR-0128's synchronous-HCM dispatch constraint. The observable wire behavior is identical to reference Envoy's conceptual `HeaderStopIteration` model on every measurable axis — the HCM does not forward headers to the upstream until `RunAction` fires (after body accumulation). Future implementations should NOT assume `StopIteration` from `DecodeHeaders` is usable for body-buffering in envoy-go.
+- `filter.bodySettings` (a cached `*bufferSettings` pointer set at `DecodeHeaders`) is the per-stream body-buffering state used by `DecodeData`. It is nil when `awaitingBody=false` (no buffering active); `DecodeData` guards on `f.bodySettings != nil` before the over-limit check.
+- The `x-envoy-auth-partial-body: true` injection (when `allow_partial_message=true` AND over-limit) happens at Task 9's `buildAuthRequest`/check-dispatch site, not in `DecodeData`. Task 6 only truncates `f.body`; the header injection is the outbound-request-builder's responsibility.
+- `pack_as_bytes` has **no effect on the HTTP-mode POST body in 18.1**. The body bytes are transmitted verbatim (the entire `f.body` slice as the HTTP request body). 18.2's gRPC-mode `AttributeContext` builder will use `pack_as_bytes` to choose between `body` (UTF-8 string) and `raw_body` (bytes).
+- Cross-references: ADR-0128 (phase-13 decode-side body-buffering primitive — reused); ADR-0137 (phase-15 bandwidth_limit body algorithm — parallel ADR-0128 consumer); ADR-0156 (ext_authz package shape + `SendLocalReply` mechanism); ADR-0157 (compiledConfig shape — `withRequestBody` field); ADR-0163 (per-route REUSE — `disable_request_body_buffering` + per-route `with_request_body` override); ADR-0085 (`SendLocalReply` framework primitive).
 
 ---
 
 ## ADR-0163: Per-route 5th-canonical REUSE classification (explicit no-new-canonical decision; **NO ADR-0125 amendment paragraph** — the FIRST §9 family-row since phase 13 to REUSE an existing ADR-0125 canonical rather than extend the roster) + SHARED-stats discipline + the `CheckSettings` narrower-override surface + the 6-counter stat surface (`ok`/`denied`/`error`/`disabled`/`failure_mode_allowed`/`invalid`; HCM-rooted SN2-reuse `http.<HCM_stat_prefix>.ext_authz.*`; RATIFIED-PENDING-IMPL-TIME per phase-16 §10 lesson (c)) + the PGV wrinkles (`disabled` `const: true`; `override` oneof PGV-required)
 
-**Status:** Anticipated — §Context drafted at the phase-18 SPEC commit; §Decision + §Consequences land at phase-18.1 IMPL per ADR-0044 ADR-on-impl convention.
+**Status:** Accepted
 **Date:** 2026-05-14
 **Doctrine:** Phase 18.1 §9 family-row. ADR-0044 ADR-on-impl convention. The FIRST §9 row to REUSE an ADR-0125 canonical — ADR-0125's canonical-pattern roster does NOT grow in phase 18 (BRAINSTORM §11 lesson (d) inverse-confirmation).
-**Lands-in:** Task 7 (hypothesis) of phase-18.1 PLAN.
+**Lands-in:** Task 7 of phase-18.1 PLAN.
 
 ### Context
 
@@ -8508,11 +8638,31 @@ The parent SPEC §5.P2 RATIFIED the `ExtAuthzPerRoute` shape: one PGV-required o
 
 ### Decision
 
-LANDS AT Task 7 (hypothesis) of phase-18.1 PLAN per ADR-0044 ADR-on-impl convention. The §Decision body will codify: the explicit 5th-canonical-REUSE classification + the explicit NO-ADR-0125-amendment decision; the `parsePerRoute` PGV-mirror (`disabled: false` PARSE-REJECT, empty-`override` PARSE-REJECT); the `CheckSettings` narrower-override merge; the SHARED-stats discipline (no per-route `*filterStats`); the 6-counter `filterStats` + the SN2-reuse namespace; the `disabled`-structurally-unreachable disposition.
+Phase 18 ext_authz lands the **5th-canonical REUSE** per ADR-0125 — the FIRST §9 family-row since phase 13 (buffer) to REUSE an existing ADR-0125 canonical rather than extend the roster. **NO ADR-0125 §(xiv) amendment paragraph is introduced.** The absence of §(xiv) is itself the recorded decision: `ExtAuthzPerRoute`'s structure (a PGV-required `override` oneof with a `disabled` bool arm + a `*CheckSettings` narrower-sub-message arm) is a textbook instance of the 5th canonical already codified at ADR-0125 §(ix) for phase-13 buffer + phase-14 compressor.
+
+**(i) `parsePerRoute` PGV-mirror:** Two envoy-go-strict PGV-mirror checks at parse time: (a) the `override` oneof is PGV-required — an empty `ExtAuthzPerRoute` (override not set) PARSE-REJECTs with `"ext_authz: per-route: override oneof is required"`; (b) the `disabled` arm carries PGV `const: true` — `disabled: false` PARSE-REJECTs with `"ext_authz: per-route: disabled must be true (PGV const:true violation; disabled:false is not meaningful)"`. These wrinkles vs the buffer/compressor 5th canonical are minor (buffer's `BufferPerRoute` has the same disabled-bool-in-required-oneof structure per the proto bindings); they do NOT constitute a new canonical.
+
+**(ii) `check_settings` arm — `CheckSettings` narrower-override merge:** The `check_settings` arm carries three fields: `context_extensions` (`map[string]string`), `disable_request_body_buffering` (bool), and `with_request_body` (`*BufferSettings`). `disable_request_body_buffering` and `with_request_body` are mutually exclusive (XOR) — setting both is a PARSE-REJECT. These are compiled into `compiledCheckSettings` at `parsePerRoute` time and stored on `compiledPerRoute.checkSettings`.
+
+**(iii) `context_extensions` — parsed, no HTTP-mode effect in 18.1:** Per the proto doc-note, `context_extensions` is "only applied to a filter configured with a `grpc_service`". In 18.1 HTTP-mode, `context_extensions` PARSES and the map is stored in `compiledCheckSettings.contextExtensions` but has NO HTTP-mode effect. 18.2 consumes it for the gRPC `AttributeContext.context_extensions`. This is the SPEC §8 item 8 documented no-op — parsing is correct for forward-compat; silence in HTTP-mode is the expected behavior.
+
+**(iv) `effectiveWithRequestBody` 3-tier resolution:** The per-stream body-buffering decision follows the most-specific-wins hierarchy (SPEC §6.3 step 3 + ADR-0162 + ADR-0163): (1) per-route `check_settings.disable_request_body_buffering=true` → returns `nil` (body buffering OFF); (2) per-route `check_settings.with_request_body` is set → returns the per-route `*bufferSettings` override; (3) otherwise → returns the listener-level `cc.withRequestBody` (may be nil = OFF).
+
+**(v) SHARED-stats discipline:** The per-route override adjusts `context_extensions`/buffering but still calls the same auth service — it spawns no new stateful policy-evaluation surface. The `compiledPerRoute` carries NO `*filterStats`. The `factoryState.resolvePerRouteConfig` wires `fresh.cc = s.listenerRC` (SHARED-stats: one `filterStats` per listener config; all per-route resolutions share it). MIRRORS phase-12/13/14/17 SHARED-stats discipline; DIVERGES from phase-11/15/16 INDEPENDENT-stats (which had per-route stat scopes because they owned stateful policy-evaluation resources). **NO `hcmStatPrefix` on `factoryState`** (SIMPLIFIED relative to phase-11/15/16 which carried `hcmStatPrefix` for per-route counter registration).
+
+**(vi) `sync.Map` lazy-cache identity (ADR-0117 + ADR-0125 §(v) 5th-canonical resolution):** `factoryState.perRoute` is a `sync.Map` keyed by `*ext_authzv3.ExtAuthzPerRoute` pointer-identity. `resolvePerRouteConfig` uses `LoadOrStore` to ensure exactly ONE `*compiledPerRoute` is stored per proto pointer, even under concurrent access. Type-assertion failure (wrong proto.Message type) returns the listener-level fallback without caching. Parse errors return the listener-level fallback without caching (mirrors the phase-16 rbac pattern — error sentinels must not be cached or they make the parse retry impossible on config-reload).
+
+**(vii) The 6-counter stat surface + SN2-reuse namespace:** `ok`, `denied`, `error`, `disabled`, `failure_mode_allowed`, `invalid` — all counters, all registered unconditionally at `New()` time, all under `http.<HCM_stat_prefix>.ext_authz.*` (SN2-reuse — the existing HCM-stat-prefix Prometheus tag-extractor handles this verbatim; NO new SN-flattening rule). The `disabled` counter is STRUCTURALLY UNREACHABLE under MVP (increments only via the deferred runtime `filter_enabled` gate — parent SPEC §5.P12 + §6 amendment 7). Stat-table 71 → 77 names. **The §18.P6 (6-counter stat surface) + §18.P7 (SN2-reuse Prometheus tag-extractor) RATIFIED-PENDING-IMPL-TIME closures land at Task 8** via the reference Envoy v1.37.2 fixture-harness empirical scrape (D8 planner-time disposition). ADR-0163 §Decision notes the closure-at-Task-8 disposition; if the Task 8 scrape diverges from the 6-counter hypothesis, this §Decision is amended in-place at Task 8 per ADR-0044.
+
+**(viii) NO ADR-0125 §(xiv) amendment:** ADR-0125's canonical-pattern roster stays at 8 entries after phase 18. The `grep -nE '\(xiv\)' docs/envoy-go/DECISIONS.md` command returns 3 matches, but all three are explanatory text within ADR-0163 §Context/§Decision describing the ABSENCE of §(xiv) — confirmed by `grep -cE '^\*\*(xiv)\*\*' docs/envoy-go/DECISIONS.md` returning 0 (no actual amendment paragraph).
 
 ### Consequences
 
-LANDS AT phase-18.1 IMPL per ADR-0044. Records: ADR-0125's roster staying at 8 (NO §(xiv) growth); the 5th-canonical-REUSE as a notable data point (the roster does not grow monotonically per phase); the stat-table 71 → 77; the §18.P6/§18.P7 RATIFIED-PENDING closures at the 18.1 stat-surface task.
+- **ADR-0125's canonical-pattern roster stays at 8** — the 5th-canonical REUSE breaks the phase-13/14/15/16/17 per-phase-roster-growth streak; the roster does NOT grow monotonically per phase.
+- **SHARED-stats discipline:** All 6 ext_authz counters (`ok`/`denied`/`error`/`disabled`/`failure_mode_allowed`/`invalid`) live at the listener-level stat scope. Per-route-active routes increment the listener-level counters. The `disabled` counter publishes 0 for the listener's lifetime under MVP.
+- **`context_extensions` HTTP-mode no-op:** Operators who set `context_extensions` in a `check_settings` per-route config in HTTP-mode see no effect in 18.1. 18.2 activates this field for the gRPC `AttributeContext`. The parse-and-store behavior (no HTTP-mode effect, no error) is the intended forward-compat posture.
+- **Stat-table extends from 71 to 77 names** (BEHAVIOR_CONTRACT §13.2 + Task 14 6-edit bundle). The 6 new counters are listed alphabetically in the stat-name mapping under `http.<HCM_stat_prefix>.ext_authz.*`.
+- **§18.P6 + §18.P7 RATIFIED-PENDING closures at Task 8.** If the Task 8 empirical scrape confirms the 6-counter / SN2-reuse hypothesis, these pins close as RATIFIED. If it diverges, this ADR is amended in-place and PROGRESS.md records the deviation.
 
 ---
 

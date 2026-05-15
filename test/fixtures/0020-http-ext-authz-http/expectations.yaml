@@ -1,0 +1,210 @@
+# Phase 18.1 fixture 0020 expectations (per ADR-0019 — prose; driver enforces).
+#
+# Topology (per SPEC §7.2 + Task-11 review-fix — three-listener plaintext):
+#   l_test_a (hcm_local_a) — failure_mode_allow:false + live auth server
+#                             (cluster c_authz). Scenarios 1+2+5+6+7.
+#                             Listener-level with_request_body (max 4096B),
+#                             allowed_headers (authority + x-* prefix),
+#                             authorization_request.headers_to_add
+#                             (x-fixture-fingerprint: 0020),
+#                             authorization_response.allowed_upstream_headers
+#                             (x-authz-result),
+#                             authorization_response.allowed_client_headers
+#                             (x-authz-denied). Route /scenarios/6-disabled
+#                             carries ExtAuthzPerRoute{disabled: true}.
+#                             Route /scenarios/7-check-settings carries
+#                             ExtAuthzPerRoute{check_settings{
+#                               disable_request_body_buffering: true}}.
+#   l_test_b (hcm_local_b) — failure_mode_allow:false + status_on_error:503 +
+#                             unreachable auth server (cluster c_authz_down).
+#                             Scenario 3.
+#   l_test_c (hcm_local_c) — failure_mode_allow:true +
+#                             failure_mode_allow_header_add:true + unreachable
+#                             auth server (cluster c_authz_down). Scenario 4.
+#   c_backend              — echobackend subprocess
+#                             (test/helpers/echobackend/; phase-14 Task 10).
+#   c_authz                — in-process HTTP auth server
+#                             (test/helpers/extauthzhttp/; phase 18.1) on a
+#                             driver-allocated port.
+#   c_authz_down           — hardcoded unreachable port (allocated + immediately
+#                             closed by the driver so it is guaranteed unbound).
+#
+# Plaintext-only per SPEC §7.2 + planner-time decision D12 — no TLS in
+# phase 18.1. Reference Envoy v1.37.2 (STRICT_DNS via host.docker.internal)
+# vs envoy-go (STATIC, in-process).
+#
+# Per SPEC §7.5 the driver asserts: per-scenario status + body byte-stream
+# equivalence across all 7 scenarios + per-side (cross-side-equivalent)
+# ext_authz counter expectations. Total runtime < 3s wallclock per fixture
+# (7 scenarios sequential + stat scrape; auth server restarts between scenario
+# windows but connections resolve fast on loopback).
+#
+# ## Scenario matrix (per SPEC §7.1 — 7 scenarios)
+#
+# Scenario 1: HTTP allow on l_test_a.
+#   Request:  GET /scenarios/1-allow with x-client-id: scenario-1.
+#   Auth:     FixedScript 200 + x-authz-result: allowed.
+#   Both sides: 200 + echobackend echo body containing the injected
+#   x-authz-result: allowed header (allowed_upstream_headers passthrough).
+#   Counter impact (both sides): ok +1.
+#
+# Scenario 2: HTTP deny on l_test_a.
+#   Request:  POST /scenarios/2-deny with body "request-body",
+#             Content-Type: text/plain.
+#   Auth:     FixedScript 403 + body "access denied" + x-authz-denied: true.
+#   Both sides: 403 + body byte-exact "access denied" (13B). The
+#   x-authz-denied: true response header is present (allowed_client_headers
+#   passthrough). Counter impact (both sides): denied +1.
+#   §18.P11 note: deny-path wire shape CONFIRMED at Task-13 differential —
+#   decision headers (x-authz-denied) appear BEFORE framework housekeeping
+#   (content-length, date, server) on both sides (buildDenyHeaders places
+#   allowedClient-matched headers first, content-type fallback last).
+#
+# Scenario 3: error → status_on_error on l_test_b.
+#   Request:  GET /scenarios/3-error against l_test_b.
+#   Auth:     c_authz_down is unreachable — connection refused fast.
+#   Both sides: 503 + empty body (status_on_error: ServiceUnavailable).
+#   Counter impact (both sides): error +1.
+#
+# Scenario 4: failure_mode_allow on l_test_c.
+#   Request:  GET /scenarios/4-failure-allow against l_test_c.
+#   Auth:     c_authz_down is unreachable — connection refused fast.
+#   Both sides: 200 + echobackend echo body containing the injected
+#   x-envoy-auth-failure-mode-allowed: true header (failure_mode_allow_header_add
+#   passthrough; header arrives upstream and is echoed back by echobackend).
+#   Counter impact (both sides): error +1, failure_mode_allowed +1.
+#
+# Scenario 5: with_request_body on l_test_a.
+#   Request:  POST /scenarios/5-body with body "hello world", Content-Type:
+#             text/plain.
+#   Auth:     InspectScript — allows if POST body contains "hello";
+#             returns 200 + x-authz-result: allowed.
+#   Both sides: 200 + echobackend echo body containing x-authz-result: allowed.
+#   The with_request_body (max 4096B, allow_partial_message:false) gate buffers
+#   the full request body before issuing the auth check; the auth server sees
+#   "hello world" and allows. Counter impact (both sides): ok +1.
+#
+# Scenario 6: per-route disabled on l_test_a.
+#   Request:  GET /scenarios/6-disabled. Route carries ExtAuthzPerRoute{
+#             disabled: true} — ext_authz filter is bypassed for this route.
+#   Both sides: 200 + echobackend echo body (NO auth check; filter bypassed).
+#   Counter impact (both sides): NONE per §6 amendment 7 + SPEC §7.1.
+#
+# Scenario 7: per-route check_settings on l_test_a.
+#   Request:  POST /scenarios/7-check-settings with body "per-route-body-check",
+#             Content-Type: text/plain.
+#   Auth:     FixedScript 200 + x-authz-result: allowed. The per-route override
+#             ExtAuthzPerRoute{check_settings{disable_request_body_buffering:
+#             true}} disables body buffering for this route even though the
+#             listener-level with_request_body is active; the auth server
+#             receives an empty body and allows regardless.
+#   Both sides: 200 + echobackend echo body containing x-authz-result: allowed.
+#   Counter impact (both sides): ok +1.
+#
+# ## Counter-delta map (per side; per SPEC §7.5 + Task-13 empirical scrape)
+#
+# All counters are HCM-rooted under the SN2-reuse namespace
+# `http.<hcm_prefix>.ext_authz.<counter>` (Prometheus form
+# `envoy_http_ext_authz_<counter>{envoy_http_conn_manager_prefix="<hcm>"}`)
+# per ADR-0163 SHARED-stats: three listeners each emit to their own HCM prefix
+# (hcm_local_a/b/c) and the driver's lookupExtAuthzCounter sums across all three.
+#
+# IDENTICAL on BOTH sides (cross-side equivalence enforced by AssertStats):
+#
+#   http.*.ext_authz.ok                  +3  (scenarios 1, 5, 7 → allowed;
+#                                             hcm_local_a counts 3)
+#   http.*.ext_authz.denied              +1  (scenario 2 → 403 deny;
+#                                             hcm_local_a counts 1)
+#   http.*.ext_authz.error               +2  (scenarios 3 + 4 → auth unreachable;
+#                                             hcm_local_b counts 1,
+#                                             hcm_local_c counts 1)
+#   http.*.ext_authz.failure_mode_allowed +1 (scenario 4 → failure_mode_allow:true;
+#                                             hcm_local_c counts 1)
+#   http.*.ext_authz.invalid             +0  (no validate_mutations rejections)
+#
+# NOT ASSERTED (structurally unreachable):
+#
+#   http.*.ext_authz.disabled            +0  (STRUCTURALLY UNREACHABLE under MVP
+#                                             per §6 amendment 7: filter_enabled
+#                                             gate deferred; ExtAuthzPerRoute{
+#                                             disabled:true} suppresses ALL counter
+#                                             increments including disabled)
+#
+# ## Documented divergence-windows
+#
+# 1. **`disabled` counter structurally unreachable (§6 amendment 7).**
+#    envoy-go MVP does not implement the `filter_enabled` / `filter_enabled_metadata`
+#    gate (SPEC §2 deferral, §6 amendment 7). The `disabled` counter is registered
+#    in filterStats (6-counter stat surface completeness) but NEVER incremented
+#    because the only increment site is the `filter_enabled` gate. Per-route
+#    ExtAuthzPerRoute{disabled: true} (scenario 6) bypasses the filter entirely
+#    and increments NO counters. Reference Envoy likewise publishes disabled=0
+#    for this run (the test config does not set filter_enabled). NOT asserted.
+#
+# 2. **request-body-related stat family (§8 deferrals).** Reference Envoy v1.37.2
+#    publishes `request_header_limits_reached`, `response_header_limits_reached`,
+#    `omitted_response_headers`, `ignored_dynamic_metadata`,
+#    `filter_state_name_collision` counters in its ext_authz stat table.
+#    envoy-go MVP does not publish these counters (they are not in the 6-counter
+#    MVP surface). The driver's AssertStats only asserts the 5 cross-side-equivalent
+#    counters listed above and does not enumerate the full reference stat table.
+#
+# 3. **Dynamic metadata family silent-ignored (§8 deferrals).**
+#    `dynamic_metadata_keys`, `filter_state_rules` and related fields are
+#    silent-ignored by envoy-go MVP. Fixture 0020's config does NOT set these
+#    fields, so the divergence-window is not surfaced empirically.
+#
+# 4. **`grpc_service` / `check_grpc_context_extensions` (phase 18.2 scope).**
+#    envoy-go MVP implements HTTP-mode ext_authz only (http_service arm).
+#    gRPC-mode is deferred to phase 18.2. Fixture 0020 uses http_service
+#    exclusively.
+#
+# 5. **Response-code-details on deny / error paths (§8 deferral).**
+#    envoy-go silent (no response_code_details framework primitive in the Go
+#    HttpDecoderCallbacks surface); Envoy emits `ext_authz_error` /
+#    `ext_authz_denied` response_code_details. Fixture 0020 does NOT assert
+#    on response_code_details.
+#
+# ## §18.P11 RATIFIED — deny-path header-ordering CONFIRMED
+#
+# SPEC §5.P11 states: "auth-supplied/decision headers FIRST, Envoy housekeeping
+# (content-length, date, server: envoy) AFTER." buildDenyHeaders in
+# internal/filter/http/extauthz/check.go implements this:
+#   1. Extract allowedClient-matched headers from auth response (decision headers).
+#   2. Append content-type: text/plain fallback ONLY IF no content-type is
+#      present in decision headers (housekeeping-order last).
+# headerKVToOrderedHeaders preserves insertion order when passed to SendLocalReply.
+#
+# Task-13 empirical confirmation (scenario 2 differential — both sides):
+#   Reference Envoy v1.37.2: HTTP/1.1 403 Forbidden, x-authz-denied: true,
+#     content-type: text/plain, content-length: 13, date: ..., server: envoy.
+#     Decision header x-authz-denied arrives before framework housekeeping.
+#   envoy-go: HTTP/1.1 403 Forbidden, x-authz-denied: true,
+#     content-type: text/plain, content-length: 13, date: ..., server: envoy.
+#     Identical ordering — decision header x-authz-denied arrives first.
+#   Differential byte-stream verdict: EQUAL (scenario 2 status=403 body=ok
+#     on both sides). §18.P11 CONFIRMED.
+#
+# ## Wall-clock tolerance
+#
+# Fixture 0020 has no throttle / wait-time scenarios. Per-scenario wall-clock
+# is dominated by the auth server loopback round-trip (< 2ms typical); scenarios
+# 3+4 (auth unreachable) resolve by connection-refused fast on the host loopback
+# (<1ms typical). Total fixture wallclock < 3s (7 scenarios sequential + auth
+# server restarts). NO wall-clock-tolerance assertion is enforced; the
+# per-scenario byte-stream verdict + AssertStats counter checks are the
+# assertions.
+#
+# ## Header allow-list
+#
+# Standard envoy timing/identity headers per BEHAVIOR_CONTRACT.md
+# `## Header allow-list`. The cross-side byte-stream captures status + body
+# (allow-path: echobackend echo classified structurally as JSON with method+path
+# keys; deny-path: byte-exact body; error-path: empty body). General header-level
+# differential is NOT enforced at fixture 0020 (the driver's byte stream omits
+# response headers other than what the echobackend echo body reflects upstream).
+#
+# Cross-refs: SPEC §7.1 + §7.2 + §4 + §5.P11 + §6 amendment 7 + §7.3 + §7.4 +
+#             §7.5 + ADR-0156 + ADR-0157 + ADR-0159 + ADR-0160 + ADR-0161 +
+#             ADR-0162 + ADR-0163 + BEHAVIOR_CONTRACT §13.5 divergence-window
+#             roster + planner-time decisions D2 + D12.

@@ -42,6 +42,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0017-http-bandwidth-limit/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0018-http-rbac/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0019-http-jwt-authn/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0020-http-ext-authz-http/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -396,6 +397,35 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// when the inputs package is authored — at Task 10 the switch-case
 			// is wired ahead of the rollout so the BackendKind dispatch is
 			// complete.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPExtAuthzHTTP:
+			// Fixture 0020-http-ext-authz-http (phase 18.1) reuses the SHARED
+			// echobackend binary (phase-14 Task 10) for the upstream route
+			// (cluster c_backend). The in-process HTTP auth server
+			// (test/helpers/extauthzhttp/) is lifecycle-managed BY THE DRIVER
+			// (Task 11) because it needs per-scenario Script configuration;
+			// this switch-case only allocates the upstream echo backend.
+			// Plaintext-only per SPEC §7.2 + D12 (no TLS in phase 18.1).
+			// Because the echo backend runs as a subprocess, the runner's
+			// in-process accept counter is NOT incremented.
+			// The blank-import for test/fixtures/0020-http-ext-authz-http/inputs
+			// lands at Task 11 (the inputs package is now authored).
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)

@@ -276,6 +276,20 @@ const (
 	// CORS preflight bypass + per-route 8th canonical. Because both helpers run
 	// as subprocesses, the runner's in-process accept counter is NOT incremented.
 	HTTPJwtAuthn BackendKind = 16
+	// HTTPExtAuthzHTTP reuses the existing echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for the upstream route +
+	// the NEW extauthzhttp helper at test/helpers/extauthzhttp/ for the in-process
+	// HTTP auth server. 2-cluster topology (one HCM listener l_test_a plaintext
+	// with ext_authz → router filter chain + cluster c_backend → echobackend
+	// subprocess + cluster c_authz → extauthzhttp subprocess). No mTLS, no TLS,
+	// no PKI — phase 18.1 fixture is HTTP/1.1 plaintext-only (D12). The
+	// extauthzhttp helper is lifecycle-managed BY THE DRIVER (it needs the
+	// per-scenario script); this switch-case only allocates the upstream echo
+	// backend. Scenarios 3+4 (auth-server-unreachable) stop the extauthzhttp
+	// server before the request. Because both helpers run as subprocesses (or
+	// in-process for extauthzhttp), the runner's in-process accept counter is
+	// NOT incremented. Introduced by phase 18.1 Task 10.
+	HTTPExtAuthzHTTP BackendKind = 17
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

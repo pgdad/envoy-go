@@ -37,6 +37,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | HTTP filter `envoy.filters.http.bandwidth_limit` | 0017-http-bandwidth-limit (BOTH-direction Path B-async with kbps-per-tick throttle math; KiB/s units): byte-exact status; byte-exact body (bandwidth_limit does not transform bytes); **±70ms per-side wall-clock tolerance per scenario** per ADR-0137 wire-shape-divergence-window — phase 15 Task 14 empirically refuted the SPEC §11.P9(c) cross-side "total-throttle-time converges within ±70ms" claim for bodies within initial-burst capacity (Envoy's initial-burst-discount + per-request bump-on-active-side-regardless-of-body diverges from envoy-go's deterministic ceil-formula); each side asserted independently within ±70ms of its predicted target. Per-counter delta byte-equivalent on 6 active counters (`*_incoming_total_size`, `*_allowed_total_size` × {request, response} via cross-side delta-equal; `*_enabled` + `*_enforced` × {request, response} via `counterModePerSideExact` per the same initial-burst-discount divergence-window). 6 gauges per stat_prefix (`*_pending`, `*_incoming_size`, `*_allowed_size` × {request, response}) NOT asserted (transient/noisy mid-stream observations). 2 unconditional Envoy histograms (`request_transfer_duration`, `response_transfer_duration`) allow-listed via twin-series-filter divergence-window per §13.4 + `### Twin-series filter discipline` phase-15 extension. INDEPENDENT per-route stats per ADR-0139 (per-route override allocates own `*compiledConfig` + own `*filterStats` keyed by per-route `stat_prefix`). 6 scenarios per phase 15 SPEC §7.1 (response-only throttle, request-only throttle, REQUEST_AND_RESPONSE symmetric, tiny-body within-burst, per-route DISABLED-via-`enable_mode`, per-route override with own stat_prefix). NOT asserted: intra-throttle-window chunk-arrival timing (envoy-go Path B-async silent-then-blast vs Envoy Path A rate-paced chunks at `fill_interval` cadence — deliberate divergence per ADR-0137; couples to future encode-side streaming framework phase); the 4 trailer-mode trailers emitted when `enable_response_trailers: true` (deferred — couples to future trailer-emission framework phase); the 2 unconditional histograms above (twin-series-filter allow-listed); `runtime_enabled` runtime-gate paths (Runtime + hot restart family); H2 differential coverage; `BandwidthLimitPerRoute` wrapper proto (does not exist in Envoy v1.37.2 — per-route uses bare `BandwidthLimit` via TPFC per §11.P1 + ADR-0125 §(xi) NEW 6th canonical). |
 | 0018-http-rbac | envoy.filters.http.rbac (decode-side dual-engine policy gate; rules-engine + matcher-engine + shadow + per-policy stats) | byte-exact status; byte-exact body on allow (passthrough) AND deny (19-byte "RBAC: access denied"); per-counter delta byte-equivalent on 4 base counters per active namespace (allowed/denied/shadow_allowed/shadow_denied); INDEPENDENT per-route stats per ADR-0145 (scenario 8); mTLS scenario 6 exercises ADR-0144 TLS-principal accessor; 7th canonical per-route absent-implies-disabled per ADR-0125 §(xii) (scenario 7) |
 | 0019-http-jwt-authn | envoy.filters.http.jwt_authn (decode-side pre-body JWT bearer-token validation gate; RS+ES algorithm family; RemoteJwks + LocalJwks; Full-6 JwtRequirement; 8th-canonical per-route string-reference-delegation) | byte-exact body on allow paths (echo passthrough) AND deny paths (canonical jwt_verify_lib strings — `Jwt is missing` 14B / `Jwt is expired` 14B / `Jwt verification fails` 22B); status byte-exact (401 default, 403 for JwtAudienceNotAllowed per §11.P1); WWW-Authenticate header byte-exact including conditional `, error="invalid_token"` append per §11.P2 (driver pins `Host: jwt-authn.fixture.test` so the full-URL realm is per-side byte-equivalent); cross-side counter-delta equivalence on `denied` + `cors_preflight_bypassed` + `jwks_fetch_success` + `jwks_fetch_failed`; `allowed` asserted per-side (ref 5 / subj 3 — reference Envoy increments `allowed` on the CORS-bypass + per-route-disabled passthrough paths; envoy-go MVP per SPEC §3 + §1.1 amendment 5 does not — documented divergence-window); 2 `jwt_cache_*` counters STRUCTURALLY UNREACHABLE under MVP, not asserted; `response_code_details` NOT asserted (envoy-go MVP defers per §1.1 amendment 11); SHARED per-route stats per ADR-0154; 8th canonical per-route string-reference-delegation per ADR-0125 §(xiii) (scenarios 7 + 8) |
+| 0020-http-ext-authz-http | envoy.filters.http.ext_authz (decode-side external-authorization gate; HTTP service mode; 5th-canonical per-route REUSE + SHARED-stats; ADR-0156/0157/0159/0160/0161/0162/0163) | byte-exact status; byte-exact body on allow paths (echo passthrough) AND deny paths (verbatim auth-service body — scenario 2 `"access denied"` 13B); `response_code_details` NOT asserted (envoy-go MVP defers per SPEC §2.8 + §8 item 10); cross-side counter-delta equivalence on 5 actively-emitted counters (`ok`, `denied`, `error`, `failure_mode_allowed`, `invalid`); `disabled` counter STRUCTURALLY UNREACHABLE, not asserted; SHARED per-route stats per ADR-0163 (5th-canonical-REUSE; no per-route `*filterStats`); per-route `disabled:true` arm (scenario 6) + `check_settings` arm (scenario 7) exercised; deny-path header-set ordering (decision headers first, framework housekeeping after) confirmed RATIFIED per §18.P11 at Task 13 |
 
 "Semantically equal" is defined per dimension in the subsections below. Where a dimension has no subsection yet, the matrix row is its complete definition and phases may only tighten (not relax) it.
 
@@ -302,7 +303,20 @@ Phase 16 adds 4 new active rows (4 counters) — namespace `http.<HCM_stat_prefi
 
 Phase 17 adds 7 new rows (7 counters; 5 active + 2 structurally-unreachable) — namespace `http.<HCM_stat_prefix>.jwt_authn.<counter>` HCM-rooted (mirrors phase-09 fault, phase-12 csrf, phase-14 compressor, phase-16 rbac; DIVERGES from phase-15 bandwidth_limit's non-HCM-rooted shape). NO new SN flattening rule per phase 17 SPEC §1.1 amendment 9 + §11.P7 + ADR-0154 — SN2-reuse hypothesis RATIFIED at the Task 13 fixture-0019 empirical scrape (both reference Envoy v1.37.2 and envoy-go emit the identical Prometheus form). Per-route stats are SHARED with listener-level per ADR-0153 + ADR-0154 (the 8th canonical per-route is pure string-reference-delegation; spawns no new policy-evaluation state; mirrors phase-12 csrf + phase-13 buffer + phase-14 compressor SHARED-stats discipline). NO per-provider scaling per §1.1 amendment 9 (multiple providers contribute to the same filter-wide counter set). Prometheus rendering via existing `envoy_http_conn_manager_prefix` SN2 extractor + dot→underscore default-branch flatten: `envoy_http_jwt_authn_<counter>{envoy_http_conn_manager_prefix="<HCM_stat_prefix>"}`.
 
-**Total: 71 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12 + 0 from 13 + 17 from 14 + 14 from 15 + 4 from 16 + 7 from 17). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline. The 2 deferred histograms (phase 15) + the per-policy counter family (phase 16; operator-config-driven) are documented separately; they do NOT count in the 71-name base total. Of phase 17's 7 names, 5 actively emit under MVP and 2 (`jwt_cache_hit` / `jwt_cache_miss`) are STRUCTURALLY UNREACHABLE — registered for stat-table completeness but never incremented (publish 0 always) since `jwt_cache_config` is silent-ignored per §8 deferral 8.
+**ext_authz filter — 6 names (introduced by phase 18.1; 5 actively-emitted under MVP + 1 STRUCTURALLY UNREACHABLE):**
+
+| Internal name | Type | Source | Filter | Description |
+|---|---|---|---|---|
+| `http.<HCM_stat_prefix>.ext_authz.ok`                     | counter | filter | ext_authz | increments per request whose auth-check result = ALLOWED (HTTP 200 from auth service; phase 18.1 ADR-0163) |
+| `http.<HCM_stat_prefix>.ext_authz.denied`                 | counter | filter | ext_authz | increments per request denied by the auth service (recognized deny status 401/403; phase 18.1 ADR-0163) |
+| `http.<HCM_stat_prefix>.ext_authz.error`                  | counter | filter | ext_authz | increments per auth-check error (connect failure / timeout / unrecognized status; phase 18.1 ADR-0163) |
+| `http.<HCM_stat_prefix>.ext_authz.disabled`               | counter | filter | ext_authz | STRUCTURALLY UNREACHABLE under MVP — `filter_enabled` silent-ignored per parent §5.P12 + §6 amendment 7; registered but never incremented (publishes 0; couples to deferred Runtime `filter_enabled` gate) |
+| `http.<HCM_stat_prefix>.ext_authz.failure_mode_allowed`   | counter | filter | ext_authz | increments per request where an auth error was bypassed via `failure_mode_allow:true` (phase 18.1 ADR-0163; also increments `error` simultaneously) |
+| `http.<HCM_stat_prefix>.ext_authz.invalid`                | counter | filter | ext_authz | increments per header-mutation rejected by `validate_mutations` gating (phase 18.1 ADR-0161 + ADR-0163) |
+
+Phase 18.1 adds 6 new rows (6 counters; 5 active + 1 structurally-unreachable) — namespace `http.<HCM_stat_prefix>.ext_authz.<counter>` HCM-rooted (mirrors phase-09 fault, phase-12 csrf, phase-14 compressor, phase-16 rbac, phase-17 jwt_authn; DIVERGES from phase-15 bandwidth_limit's non-HCM-rooted shape). NO new SN flattening rule per ADR-0163 — SN2-reuse hypothesis RATIFIED at Task 8 empirical scrape (both reference Envoy v1.37.2 and envoy-go emit the identical Prometheus form). Per-route stats SHARED with listener-level per ADR-0163 (5th-canonical-REUSE; spawns no new policy-evaluation state). Prometheus rendering via existing `envoy_http_conn_manager_prefix` SN2 extractor + dot→underscore default-branch flatten: `envoy_http_ext_authz_<counter>{envoy_http_conn_manager_prefix="<HCM_stat_prefix>"}`.
+
+**Total: 77 internal names** (17 from 06.1 + 5 from 09 + 4 from 11 + 3 from 12 + 0 from 13 + 17 from 14 + 14 from 15 + 4 from 16 + 7 from 17 + 6 from 18.1). The four `downstream_rq_Nxx` and four `upstream_rq_Nxx` Prometheus exposition forms collapse to two base-name groups (one HCM, one cluster) per the Rule SN4 status-class flattening discipline. The 2 deferred histograms (phase 15) + the per-policy counter family (phase 16; operator-config-driven) are documented separately; they do NOT count in the 77-name base total. Of phase 17's 7 names, 5 actively emit under MVP and 2 (`jwt_cache_hit` / `jwt_cache_miss`) are STRUCTURALLY UNREACHABLE. Of phase 18.1's 6 names, 5 actively emit under MVP and 1 (`disabled`) is STRUCTURALLY UNREACHABLE — registered for stat-table completeness but never incremented (publish 0 always) since `filter_enabled` is silent-ignored per parent §6 amendment 7.
 
 **Phase 13 (buffer filter) note:** The `envoy.filters.http.buffer` filter shipped in phase 13 contributes ZERO new entries to this table. The filter has no filter-specific counter namespace at all (confirmed empirically at phase 13 SPEC §11.5 — reference Envoy v1.37.2 emits NO `envoy_http_buffer_*` counter family). Buffer-filter overflow is observable on the envoy-go side via the existing `downstream_rq_4xx` HCM counter (rendered via Rule SN4 status-class flattening as `envoy_http_downstream_rq_xx{envoy_response_code_class="4",envoy_http_conn_manager_prefix="<HCM stat_prefix>"}`). The Envoy-only HCM counters `downstream_rq_too_large` (increments on every 413) and `downstream_rq_completed` (increments on every completed request) are NOT in this table; they are filtered out of the differential per the `### Twin-series filter discipline` allow-list discipline below.
 
@@ -1613,6 +1627,113 @@ Phase 17's per-route TPFC is the `PerRouteConfig` wrapper proto with a REQUIRED 
 
 7 base counters, NO per-provider scaling, NO gauges, NO histograms: `allowed` + `denied` + `cors_preflight_bypassed` + `jwks_fetch_success` + `jwks_fetch_failed` + `jwt_cache_hit` + `jwt_cache_miss`. 5 actively emit under MVP; the last 2 (`jwt_cache_*`) are STRUCTURALLY UNREACHABLE (`jwt_cache_config` silent-ignored per §8 deferral 8 — registered but never incremented). Internal stat path: `http.<HCM_stat_prefix>.jwt_authn.<counter>` — HCM-rooted SN2-reuse (RATIFIED at the Task-13 fixture-0019 empirical scrape; both reference Envoy v1.37.2 and envoy-go emit the identical Prometheus form `envoy_http_jwt_authn_<counter>{envoy_http_conn_manager_prefix="<HCM_stat_prefix>"}`). NO new SN flattening rule; NO new tag-extractor. All 7 counters are registered UNCONDITIONALLY at `New()` time. `cors_preflight_bypassed` is the canonical Envoy name per §1.1 amendment 10 (NOT the BRAINSTORM-hypothesized `bypassed_cors_preflight`). Note: reference Envoy increments `allowed` on the CORS-bypass + per-route-disabled passthrough paths; envoy-go MVP does not — see the `allowed` divergence-window at `### Phase 17 forward-pointer notes`.
 
+### envoy.filters.http.ext_authz
+
+Phase 18.1 ships `envoy.filters.http.ext_authz` in **HTTP service mode** (Envoy v1.37.2 canonical external-authorization filter; decode-side gate delegating the allow/deny decision to an external HTTP service) per the canonical Envoy v1.37.2 filter spec under the 07.1 framework. envoy-go's MVP envelope is the ELEVENTH §9 family-row (after cors @ 07.1, fault @ 09, header_mutation @ 10, local_ratelimit @ 11, csrf @ 12, buffer @ 13, compressor @ 14, bandwidth_limit @ 15, rbac @ 16, jwt_authn @ 17). It is the FIFTH §9 family-row to ship pure decode-side (`Encoder: nil`; mirrors phase-12 csrf + phase-13 buffer + phase-16 rbac + phase-17 jwt_authn). It is the FIRST §9 family-row to REUSE an existing ADR-0125 canonical rather than extend the roster (5th-canonical-REUSE; NO ADR-0125 amendment paragraph — see `### Phase 18.1 forward-pointer notes`). gRPC service mode is OUT OF SCOPE for 18.1 — the `grpc_service` arm PARSE-REJECTs; see phase 18.2. The 7 anchored ADRs are ADR-0156 (package shape + filterStats + DECODER-only) + ADR-0157 (dual-mode compiledConfig + grpc_service PARSE-REJECT) + ADR-0159 (HTTP-outbound auth-check thin local client; disposition (b)) + ADR-0160 (HTTP-mode AuthorizationRequest builder + request-side header filtering) + ADR-0161 (HTTP-mode bidirectional header-mutation discipline) + ADR-0162 (with_request_body ADR-0128 reuse + over-limit 413) + ADR-0163 (per-route 5th-canonical REUSE + SHARED-stats + 6-counter stat surface; NO ADR-0125 amendment).
+
+**INSERTION NOTE (landing-chronological fallback per planner-time decision D10):** SPEC planned alphabetical-after-csrf insertion; BEHAVIOR_CONTRACT.md `## HTTP filter chain` subsections are ordered landing-chronologically (fault@09 → … → jwt_authn@17), so ext_authz lands AFTER jwt_authn per the established fallback.
+
+#### Field decomposition
+
+**Listener-level `envoy.extensions.filters.http.ext_authz.v3.ExtAuthz` — consumed vs deferred:**
+
+| Proto field | envoy-go 18.1 disposition |
+|---|---|
+| `services` oneof | PGV-NOT-REQUIRED — factory PARSE-REJECTs empty `services`; `http_service` arm builds the HTTP-mode `checkFn`; `grpc_service` arm PARSE-REJECTs with `"ext_authz: grpc_service mode not yet supported (lands in phase 18.2)"`. |
+| `http_service.server_uri` | CONSUMED. The outbound POST target. |
+| `http_service.path_prefix` | CONSUMED. Prepended to the request path. |
+| `http_service.authorization_request` | CONSUMED. `headers_to_add` static headers appended to the outbound request; deprecated `allowed_headers` honored-if-present per ADR-0160. |
+| `http_service.authorization_response` | CONSUMED. `allowed_upstream_headers` + `allowed_upstream_headers_to_append` + `allowed_client_headers` per ADR-0161. |
+| `transport_api_version` | CONSUMED (validation only). Non-V3 PARSE-REJECTs. |
+| `with_request_body` | CONSUMED. `BufferSettings{max_request_bytes, allow_partial_message, pack_as_bytes}` — ADR-0128 decode-side body-buffering reuse; `allow_partial_message:false` over-limit → local 413 + `connection: close` per ADR-0162. |
+| `failure_mode_allow` | CONSUMED. When true, errors pass the request through (`HeaderContinue`). |
+| `failure_mode_allow_header_add` | CONSUMED. When true AND `failure_mode_allow:true` AND an error was bypassed: adds `x-envoy-auth-failure-mode-allowed: true` to the upstream request. |
+| `status_on_error` | CONSUMED. `HttpStatus.code` emitted on `failure_mode_allow:false` error path; default `403` if unset. |
+| `clear_route_cache` | CONSUMED. Calls `cb.ClearRouteCache()` on the allow path. |
+| `validate_mutations` | CONSUMED. Gates header-name/value safety validation (pseudo-header + invalid-token-char reject) on the header-mutation paths (allow + deny). Rejected mutations increment the `invalid` counter. |
+| `allowed_headers` | CONSUMED. Top-level `ListStringMatcher` — request-side allow-list applied to outbound auth request headers (both modes). |
+| `disallowed_headers` | CONSUMED. Top-level `ListStringMatcher` — removes headers from the outbound auth request even if `allowed_headers` would have allowed them. |
+| `stat_prefix` | CONSUMED. Extends the stat namespace via `http.<stat_prefix>.ext_authz.*`. |
+| `filter_enabled` / `filter_enabled_metadata` / `deny_at_disable` | SILENT-IGNORED. Runtime family + matcher/metadata family. `disabled` counter STRUCTURALLY UNREACHABLE under MVP (see below). |
+| four `*metadata_context_namespaces` fields | SILENT-IGNORED. Dynamic-metadata family. |
+| `enable_dynamic_metadata_ingestion` / `filter_metadata` / `bootstrap_metadata_labels_key` | SILENT-IGNORED. Dynamic-metadata / node-metadata family. |
+| `charge_cluster_response_stats` | SILENT-IGNORED. Cluster-stat-tree charging family — cluster-scoped stat triple DEFERRED per ADR-0163. |
+| `emit_filter_state_stats` | SILENT-IGNORED. Filter-state/access-log family. |
+| `decoder_header_mutation_rules` | SILENT-IGNORED. Per-rule mutation-rejection surface (distinct from MVP `validate_mutations`). |
+
+**`HttpService` — all 4 active sub-fields consumed:** `server_uri` + `path_prefix` + `authorization_request` + `authorization_response`.
+
+#### HTTP-outbound auth-check (per ADR-0159; disposition (b))
+
+Phase 18.1 introduces a **thin ext_authz-local HTTP client** in `check.go` (an `httpAuthClient` type wrapping `*http.Client` + configured `HttpService.server_uri.timeout` + `path_prefix`). This is a **new one-way framework primitive** — the per-request HTTP-outbound auth-check POST — composing against the phase-17 `internal/jwks/Fetcher` outbound-HTTP structure (same `http.Client` + timeout discipline) WITHOUT generalizing into a shared `internal/httpclient/` package. SPEC author's disposition (b): two consumers whose lifecycles barely overlap (JWKS fetcher is a cached/async-refreshing long-lived fetcher; ext_authz is a synchronous-per-request cancellable POST-and-parse). The natural trigger to generalize into `internal/httpclient/` is the THIRD outbound-HTTP consumer (anticipated: oauth2 token-endpoint flows — same synchronous-per-request POST shape; see `### Phase 18.1 forward-pointer notes`). ADR-0159 records the disposition + the oauth2-generalization forward-pointer.
+
+The outbound check is **async** — `DecodeHeaders` fires a goroutine that POSTs to the auth service; the decode dispatch goroutine parks via `StopIteration` + a per-stream resume channel (mirrors the phase-09 fault async-resume primitive: `StopIteration` + goroutine + `cb.ContinueDecoding()` on completion). `OnDestroy` cancels the in-flight call's `context.Context` (the FIRST §9 row with a per-request cancellable outbound call). **Cross-phase reuse:** see `## JWKS framework primitive` (phase-17) for the outbound-HTTP structural precedent.
+
+#### Request-side header filtering (per ADR-0160)
+
+`allowed_headers` is a `ListStringMatcher` (top-level, both modes) acting as an allow-list applied to the set of client request headers forwarded to the auth service. `disallowed_headers` overrides and removes any header that `allowed_headers` would have allowed. `AuthorizationRequest.headers_to_add` static headers are appended after allow-list filtering. The deprecated `AuthorizationRequest.allowed_headers` (proto-deprecated; `#1`) is honored-if-present (backward-compat per parent SPEC §6 amendment 2 + ADR-0160) when the top-level `allowed_headers` is absent. `path_prefix` is prepended to the `:path` before forwarding.
+
+**StringMatcher subset honored:** `exact` + `prefix` + `suffix` + `contains` (with `ignore_case`) + `safe_regex` (RFC 2396-syntax subset per the phase-09/12 RegexMatcher discipline) — all COMPILED at parse time. `custom` PARSE-REJECTs per parent SPEC §6 amendment 2 + the revive-ADR-0101 discipline.
+
+#### HTTP-mode bidirectional header-mutation discipline (per ADR-0161)
+
+**Allow path (HTTP 200 from the auth service):**
+- `AuthorizationResponse.allowed_upstream_headers` — inject these auth-response headers into the upstream request (set/overwrite).
+- `AuthorizationResponse.allowed_upstream_headers_to_append` — append these auth-response headers to the upstream request.
+- If `failure_mode_allow_header_add: true` AND the auth-error path was bypassed via `failure_mode_allow:true`: inject `x-envoy-auth-failure-mode-allowed: true` into the upstream request.
+- If `clear_route_cache: true`: call `cb.ClearRouteCache()`.
+
+**Deny path (recognized deny status — 401 or 403 from the auth service):**
+- Emit `SendLocalReply(status, body, headers)` where:
+  - `status` — the auth service's HTTP response status (the FIRST §9 row whose deny-path status is NOT fixed by the filter).
+  - `body` — the auth service's HTTP response body, reproduced **verbatim**.
+  - `headers` — auth-service response headers filtered through `AuthorizationResponse.allowed_client_headers`; `content-type: text/plain` synthesized as fallback if not present. Decision headers emitted FIRST; framework housekeeping (`content-length`, `date`, `server: envoy`) appended after by the downstream chain framework. NO `x-envoy-*` added on deny.
+- `content-length` synthesized by the `SendLocalReply` framework primitive (ADR-0085).
+
+**`validate_mutations` gating:** when `validate_mutations: true`, header names and values on the mutation paths are validated — `:` pseudo-headers REJECTED, invalid token chars in names REJECTED, bare CR/LF/NUL in values REJECTED. Rejected mutations increment the `invalid` counter.
+
+**DEFERRED mutations:** `allowed_client_headers_on_success` (decode-side-only filter shape; no encode leg); `query_parameters_to_set` / `query_parameters_to_remove` (path-query subsystem ADR-0112); `dynamic_metadata_from_headers` (dynamic-metadata family). See `### Phase 18.1 forward-pointer notes`.
+
+#### Request body inclusion (per ADR-0162)
+
+`with_request_body{max_request_bytes, allow_partial_message, pack_as_bytes}` materializes the request body via the phase-13 ADR-0128 decode-side body-buffering reuse (SECOND consumer of ADR-0128 after phase-15 bandwidth_limit; FIRST to consume it for outbound transmission). When `with_request_body` is set and the request has a body, `DecodeHeaders` returns `HeaderStopIteration` and the body accumulates via `DecodeData`. `pack_as_bytes: false` (default) sends the body as a string field; `pack_as_bytes: true` sends as raw bytes. `allow_partial_message: false` (default) + an over-`max_request_bytes` body → `SendLocalReply(413, "Payload Too Large", {connection: close})` BEFORE the outbound auth check fires; NO `ext_authz` counter increments (the request never reached a disposition). `allow_partial_message: true` truncates to `max_request_bytes` and continues.
+
+#### Failure mode + error posture
+
+The **error classification boundary** (per parent SPEC §5.P10): connect failure, timeout, context-canceled → `error` disposition. Recognized deny statuses: `401`, `403`. All other HTTP statuses from the auth service → `error`.
+
+- `failure_mode_allow: false` (proto default) + error → `SendLocalReply(status_on_error, "", {})`. `status_on_error.code` default `403` if unset. `error` counter increments.
+- `failure_mode_allow: true` + error → `HeaderContinue` (request passes through). If `failure_mode_allow_header_add: true`: inject `x-envoy-auth-failure-mode-allowed: true` upstream. Both `error` AND `failure_mode_allowed` counters increment.
+
+#### Per-route discipline — 5th-canonical REUSE (NO new canonical) + SHARED-stats (per ADR-0163)
+
+`ExtAuthzPerRoute` carries a **PGV-required** `oneof override` with two arms:
+- `disabled` (bool, PGV `const: true`) — `ExtAuthzPerRoute{disabled: true}` wholly deactivates the filter on this route: `DecodeHeaders` returns `HeaderContinue` immediately, NO auth check, NO counter increments. `disabled: false` is PARSE-REJECTED (PGV `const: true` constraint — records as a minor PGV wrinkle vs the bare buffer/compressor 5th canonical's unconstrained disabled-bool, but does NOT constitute a new canonical per ADR-0163).
+- `check_settings` (`*CheckSettings`, PGV `required` within the arm) — a NARROWER per-route override carrying: `context_extensions` (`map[string]string` — gRPC-mode-only per its proto doc-note; PARSES but has no HTTP-mode effect, documented as no-op-in-HTTP-mode); `disable_request_body_buffering` (`bool` — overrides listener-level `with_request_body` to OFF on this route); `with_request_body` (`*BufferSettings` — per-route body-buffering override; mutually exclusive with `disable_request_body_buffering`).
+
+This maps onto **ADR-0125's existing 5th canonical** (disabled-bool arm + NARROWER override sub-message arm in a oneof). **Phase 18 lands NO ADR-0125 amendment paragraph** — the FIRST §9 family-row since phase 13 to REUSE an existing canonical rather than extend the roster (breaking the phase-13→17 per-phase-roster-growth streak). ADR-0163 records the explicit no-amendment 5th-canonical-REUSE classification.
+
+**Per-route stats SHARED with listener-level** — the per-route override adjusts `context_extensions`/buffering but still calls the same auth service. No new stateful policy-evaluation state; MIRRORS phase-12 csrf + phase-13 buffer + phase-14 compressor + phase-17 jwt_authn SHARED-stats. Scenario 6 (`ExtAuthzPerRoute.disabled:true`) + scenario 7 (`ExtAuthzPerRoute.check_settings`) exercised in fixture 0020.
+
+#### Wire shape
+
+**Allow path:** passthrough — `cb.SendLocalReply` NOT invoked; the request forwards to the next filter (with the post-validation allow-path header mutations applied).
+
+**Deny path wire shape** (per SPEC §4 + parent §5.P11 empirical; see §18.P11 RATIFIED at Task 13):
+- Status: the auth service's HTTP response status (401 or 403).
+- Body: auth service's HTTP response body, reproduced verbatim.
+- Headers (in order): decision headers filtered through `allowed_client_headers` FIRST; framework housekeeping (`content-length`, `date`, `server: envoy`) AFTER.
+- `content-type: text/plain` synthesized as fallback if the auth service did not supply one in the allowed set.
+- NO `x-envoy-*` header added on deny.
+
+**Error path:** `SendLocalReply(status_on_error, "", {})` when `failure_mode_allow: false`; passthrough + `x-envoy-auth-failure-mode-allowed` when `failure_mode_allow: true`.
+
+**`response_code_details` NOT emitted** — envoy-go MVP defers; reference Envoy emits `ext_authz_denied`. Joint divergence-window with phase-16 rbac + phase-17 jwt_authn; see `### Phase 18.1 forward-pointer notes`.
+
+#### Stat surface + Prometheus rendering (per ADR-0163 + parent SPEC §6 amendment 8 + §18.P6 RATIFIED at Task 8)
+
+6 base counters, NO gauges, NO histograms: `ok` + `denied` + `error` + `disabled` + `failure_mode_allowed` + `invalid`. 5 actively emit under MVP; `disabled` is STRUCTURALLY UNREACHABLE under MVP — registered unconditionally at `New()` time for scrape-stability, never incremented (publishes 0; couples to the deferred runtime `filter_enabled` gate). Internal stat path: `http.<HCM_stat_prefix>.ext_authz.<counter>` — HCM-rooted SN2-reuse (RATIFIED at the Task-8 empirical scrape; both reference Envoy v1.37.2 and envoy-go emit the identical Prometheus form `envoy_http_ext_authz_<counter>{envoy_http_conn_manager_prefix="<HCM_stat_prefix>"}`). NO new SN flattening rule; NO new tag-extractor. All 6 counters registered UNCONDITIONALLY at `New()` time. Per-route stats SHARED with listener-level (ADR-0163 SHARED-stats — no per-route `*filterStats`).
+
 ### Applies to
 - Phase 07.1 onward (HTTP filter framework).
 
@@ -1998,6 +2119,20 @@ Phase 17 introduces a new top-level `internal/jwt/` package providing a pure-Go-
 
 ---
 
+## HTTP outbound auth-check framework note (per phase 18.1 ADR-0159)
+
+*Introduced by phase 18.1. Justified by ADR-0159.*
+
+Phase 18.1 introduces a per-request HTTP-outbound auth-check in `internal/filter/http/extauthz/check.go`. This is NOT a new shared cross-phase primitive (unlike phase-17's `internal/jwks/` + `internal/jwt/`); it is ext_authz-local per ADR-0159 disposition (b). The decision rationale: two consumers (`jwt_authn`'s JWKS fetcher + `ext_authz`'s auth-check) whose lifecycles barely overlap do NOT justify a shared `internal/httpclient/` package at this time.
+
+**Structural composition against phase-17 `internal/jwks/Fetcher`:** `check.go` reuses the same `net/http.Client` shape — `Timeout` + `Transport` (default `http.DefaultTransport`) — that `internal/jwks/Fetcher` established as the envoy-go outbound-HTTP idiom. There is no shared type or import; the parallel is structural (same field names, same timeout wiring, same `ctx`-cancel propagation).
+
+**Per-request lifecycle:** each `DecodeHeaders` call fires a goroutine that POSTs to the configured `http_service.server_uri`; the dispatch goroutine parks via `StopIteration` + a per-stream resume channel (mirrors the phase-09 fault async-resume primitive). `OnDestroy` cancels the in-flight call's `context.Context` — the FIRST §9 row with a per-request cancellable outbound call. A canceled context returns a `context.Canceled` error; the filter maps it to the `error` stat counter and applies the configured `failure_mode`.
+
+**`internal/httpclient/` generalization trigger (forward-pointer):** the natural trigger for extracting a shared `internal/httpclient/` package is the THIRD outbound-HTTP consumer — anticipated `oauth2` token-endpoint flows (synchronous-per-request POST; same shape as ext_authz's auth-check). When the `oauth2` phase brainstorms, the generalization should be reconsidered with three consumers in view. See `## JWKS framework primitive (per phase 17 ADR-0150)` above for the outbound-HTTP structural precedent, and `## Forward-pointer notes → Phase 18.1 forward-pointer notes` below for the forward-pointer entry.
+
+---
+
 ## Forward-pointer notes
 
 ### Phase 11 forward-pointer notes
@@ -2179,3 +2314,50 @@ Both orderings are valid; the contract documents the trade-off without prescribi
 **8th canonical per-route pattern (per ADR-0125 §(xiii)):** phase 17 is the FIRST §9 row to use the **string-reference-delegation** per-route discipline — `PerRouteConfig{oneof{disabled(bool) | requirement_name(string)}}`. The per-route entry does NOT carry its own filter config; it references-by-name into the listener-level `requirement_map`. Dangling `requirement_name` references are RUNTIME-RESOLVED (mirrors Envoy `filter_config.cc findPerRouteVerifier` — emits 403 + `"Failed JWT authentication: Wrong requirement_name: <name>"` on miss), NOT parse-rejected. Per-route stats are SHARED with listener-level (pure delegation spawns no new policy-evaluation state). ADR-0125's canonical-pattern roster grows from 7 to 8.
 
 **No new tag-extractor (per §11.P7 RATIFIED at the Task-13 fixture-0019 empirical scrape):** envoy-go's SN2-reuse hypothesis was RATIFIED — `http.<HCM_stat_prefix>.jwt_authn.<counter>` renders via the existing SN2 (`http.*` segment routing) + dot→underscore default-branch flatten as `envoy_http_jwt_authn_<counter>{envoy_http_conn_manager_prefix="<HCM_stat_prefix>"}`. Both reference Envoy v1.37.2 and envoy-go emit the identical Prometheus form. NO new SN10 rule; NO new tag-extractor. ADR-0154 §Decision (vi) codifies the ratification.
+
+### Phase 18.1 forward-pointer notes
+
+**Deferred items — 11 deferrals + 1 joint divergence-window, organized by deferred-cluster family** (per phase 18.1 SPEC §8 + parent SPEC §8; silent-ignored or PARSE-REJECT per ADR-0040 + the ADR-0156..ADR-0163 roster; see `### envoy.filters.http.ext_authz ### Field decomposition` above for the consumed-vs-deferred field map):
+
+- **gRPC service mode (item 1):** `grpc_service` arm PARSE-REJECTs in 18.1 with `"ext_authz: grpc_service mode not yet supported (lands in phase 18.2)"`. Lands in **phase 18.2** — the `internal/grpcclient/` gRPC-client framework primitive (ADR-0158), the `grpc_service` arm activated in the `compiledConfig` dispatch (ADR-0157 §Decision amended), the gRPC-mode `AttributeContext`/`CheckRequest` builder (ADR-0160 gRPC-mode portion), and the `CheckResponse` → disposition mapping including `OkHttpResponse`/`DeniedHttpResponse` header mutation (ADR-0161 gRPC-mode portion). This is not a deferral so much as a sequenced split (18.2 is the explicit next sub-phase).
+
+- **Dynamic-metadata family (item 2):** the four `*metadata_context_namespaces` fields + `AuthorizationResponse.dynamic_metadata_from_headers` + `enable_dynamic_metadata_ingestion` + `filter_metadata` — all SILENT-IGNORED at parse + runtime. envoy-go MVP has no dynamic-metadata-emit framework primitive. ext_authz is the THIRD §9 filter blocked on this family (joint with phase-16 rbac `access_log_hint` + phase-17 jwt_authn `payload_in_metadata` etc.). Re-activation: dynamic-metadata family phase lands `DecoderFilterCallbacks.SetDynamicMetadata(ns, key, value)`.
+
+- **`filter_enabled` / `filter_enabled_metadata` / `deny_at_disable` (item 4):** Runtime family + matcher/metadata family. All three default to no-op when unset (per parent §5.P12), so 18.1 fixture configs need NO explicit settings. Consequence: the `disabled` counter is STRUCTURALLY UNREACHABLE under MVP (parent §6 amendment 7 — the runtime `filter_enabled` gate would be its trigger; envoy-go always-evaluates). Re-activation: Runtime family phase brings `RuntimeFractionalPercent` + `MetadataMatcher` support.
+
+- **`allowed_client_headers_on_success` (item 5):** DEFERRED per parent §5.P9 + §6 amendment 9. The decode-side-only filter shape has no encode leg — copying auth-response headers to the downstream RESPONSE on the allow path requires either an encode-side leg (ADR-0161 §Consequences revisit note) or a HCM stash mechanism. Divergence-window: reference Envoy v1.37.2 supports this; envoy-go MVP silently ignores it. Re-activation: encode-side leg framework phase.
+
+- **`charge_cluster_response_stats` + cluster-scoped stat triple (item 6):** `cluster.<upstream>.ext_authz.{ok,denied,error}` stat triple DEFERRED per parent §6 amendment 8 — a NEW stat-namespace pattern (charging into the cluster stat tree, not the HCM stat tree). Re-activation: a future cluster-stat-charging phase extends the stat surface.
+
+- **`emit_filter_state_stats` + `bootstrap_metadata_labels_key` + `decoder_header_mutation_rules` (item 7):** `emit_filter_state_stats` couples to the filter-state/access-log family; `bootstrap_metadata_labels_key` couples to node-metadata-labels; `decoder_header_mutation_rules` is the per-rule mutation-rejection surface (distinct from the MVP `validate_mutations` correctness checks — `validate_mutations` IS consumed). All SILENT-IGNORED.
+
+- **`OkHttpResponse.query_parameters_to_set` / `query_parameters_to_remove` (item 3):** DEFERRED — path-query rewriting subsystem (ADR-0112; joint with phase-10 header_mutation's `query_parameter_mutations`). NOTE: `OkHttpResponse` is gRPC-mode; the analogous HTTP-mode concern does not arise in 18.1. Re-activation: path-query rewriting phase lands `OkHttpResponse`→`:path` mutation.
+
+- **`context_extensions` HTTP-mode no-op (item 8):** `CheckSettings.context_extensions` is a `map[string]string` field documented in the proto as gRPC-mode-only (carries request attributes to the gRPC auth server via `AttributeContext.context_extensions`). In 18.1 HTTP-mode, it PARSES but has no HTTP-mode effect. Re-activation: when 18.2 activates the gRPC arm, the same `context_extensions` map is forwarded in the gRPC `CheckRequest.attributes.context_extensions`.
+
+- **`response_code_details` emission — `ext_authz_denied` (item 10):** DEFERRED joint divergence-window with phase-16 rbac (`rbac_access_denied_matched_policy[...]`) + phase-17 jwt_authn (`jwt_authn_access_denied{...}`) — envoy-go MVP does NOT emit `response_code_details` on deny (phase-04 HCM does not surface `response_code_details` to local-reply callers). Reference Envoy v1.37.2 emits `ext_authz_denied` on the deny path. This is the THIRD §9 filter contributing to the `response_code_details` joint deferred-cluster. Re-activation: response-code-details framework phase couples HCM local-reply path to a per-filter `SetResponseCodeDetails(string)` accessor.
+
+- **Access-log integration (item 11):** ext_authz decision fields (`%EXT_AUTHZ_*%`-style formatters) are not emitted. Couples to an access-log-extension framework phase (joint with phase-16/17).
+
+- **`internal/httpclient/` generalization forward-pointer (from ADR-0159 disposition (b)):** Phase 18.1 keeps a thin ext_authz-local HTTP client rather than generalizing into a shared `internal/httpclient/` package (two consumers whose lifecycles barely overlap). The natural trigger is the THIRD outbound-HTTP consumer — anticipated `oauth2` token-endpoint flows (synchronous-per-request POST; same shape as ext_authz's auth-check). When oauth2 brainstorms, the `internal/httpclient/` generalization should be reconsidered with three consumers in view. See `## HTTP outbound auth-check framework note (per phase 18.1 ADR-0159)` above.
+
+**`response_code_details` joint divergence-window (phases 16 + 17 + 18.1):** Three §9 filters now contribute to this joint deferred cluster — rbac (`rbac_access_denied_matched_policy[...]`), jwt_authn (`jwt_authn_access_denied{...}`), ext_authz (`ext_authz_denied`). All three envoy-go MVP implementations do NOT emit `response_code_details`. The forward-pointer is now CUMULATIVE — a single response-code-details framework phase would close all three simultaneously.
+
+**No new ADR-0125 canonical pattern — 5th-canonical-REUSE (per ADR-0163):** Phase 18.1 is the FIRST §9 family-row since phase 13 to REUSE an existing ADR-0125 canonical rather than extend the roster (breaking the phase-13-§(ix) / phase-14-§(x) / phase-15-§(xi) / phase-16-§(xii) / phase-17-§(xiii) per-phase-roster-growth streak). ADR-0125's canonical-pattern roster STAYS at 8 entries after phase 18.1. The 5th canonical (disabled-bool arm + NARROWER override sub-message arm in a required oneof) now has THREE consumers: buffer (phase 13) + compressor (phase 14) + ext_authz (phase 18.1). See `## Per-route canonical patterns cross-reference` below for the updated table. (NOTE: the `grep -cE '^\*\*\(xiv\)\*\*' docs/envoy-go/DECISIONS.md = 0` authoritative check confirms NO §(xiv) amendment paragraph exists — the three explanatory-text matches for `\(xiv\)` in DECISIONS.md all describe the ABSENCE of §(xiv), not a new canonical.)
+
+**No new framework primitive from 18.1 (composed-against existing primitives):** Phase 18.1 introduces ONE new one-way framework primitive — the per-request HTTP-outbound auth-check POST in `check.go` (ADR-0159; see `## HTTP outbound auth-check framework note (per phase 18.1 ADR-0159)` above) — composing against phase-09 async-resume + phase-13 ADR-0128 body-buffering + phase-14 ADR-0131 `OverwriteBody` (anticipated NOT invoked) + phase-17 `internal/jwks/Fetcher` outbound-HTTP structure. This is NOT a new SHARED cross-phase primitive (unlike phase-16's `internal/matcher/` + phase-17's `internal/jwks/` + `internal/jwt/`) — it is ext_authz-local per ADR-0159 disposition (b). Phase 18.2 adds the gRPC-client `internal/grpcclient/` primitive (ADR-0158 — the FIRST in-process gRPC infrastructure in the envoy-go test tree).
+
+## Per-route canonical patterns cross-reference (ADR-0125 roster; updated through phase 18.1)
+
+*This section summarizes the ADR-0125 per-route canonical pattern roster as of phase 18.1. ADR-0125 governs `typed_per_filter_config` resolution; each canonical was introduced or extended at a specific phase.*
+
+| Canonical | Shape | Introduced | Consumers (as of 18.1) |
+|---|---|---|---|
+| §(i) 1st — listener-fallback | No per-route key at all → listener-level config applies | phase 07.1 | cors, fault, header_mutation, local_ratelimit, csrf, buffer, compressor, bandwidth_limit, rbac, jwt_authn, ext_authz |
+| §(ii)–§(iv) 2nd–4th | (See ADR-0125 §(ii)–§(iv) for superseded/legacy patterns) | — | — |
+| §(v) 5th — disabled-OR-NARROWER-override | `oneof{disabled(bool) | narrower_config(Message)}` in a PGV-required oneof | phase 13 buffer | buffer (phase 13), compressor (phase 14), **ext_authz (phase 18.1 — FIRST §9 REUSE; NO new amendment)** |
+| §(vi) 6th — bare-message-via-TPFC | Same `BandwidthLimit` proto at per-route level; code-level-required `limit_kbps` | phase 15 | bandwidth_limit (phase 15) |
+| §(vii) 7th — absent-implies-disabled | No per-route key → filter active; per-route key present → filter disabled (inverse of 1st) | phase 16 | rbac (phase 16) |
+| §(viii) 8th — string-reference-delegation | `oneof{disabled(bool) | requirement_name(string)}` → per-route does NOT carry filter config, references-by-name into listener-level map | phase 17 | jwt_authn (phase 17) |
+
+**Phase 18.1 ext_authz cross-reference:** `ExtAuthzPerRoute.oneof override` with `disabled` arm (PGV `const: true` — PARSE-REJECTS `disabled: false`) + `check_settings` arm (narrower `CheckSettings` sub-message). Maps cleanly onto the **existing 5th canonical** (ADR-0125 §(v)). **NO §(xiv) amendment paragraph** — the FIRST §9 row to REUSE the 5th canonical since its introduction at phase 13. ADR-0163 records the explicit no-amendment 5th-canonical-REUSE classification.
