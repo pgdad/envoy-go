@@ -8972,3 +8972,445 @@ Reference Envoy v1.37.2 accepts plaintext h2c upstream clusters; the gRPC ecosys
 
 ---
 
+## ADR-0167: `internal/filter/http/extproc/` package shape — single-token directory + BOTH-DECODE-AND-ENCODE `HTTPFilter` value + 9-counter `filterStats` + boot-registration alphabetical between `extauthz` and `fault` + multi-stage `SendLocalReply` mechanism (FIRST §9 row whose deny-path can fire at request_headers / request_body / response_headers / response_body) + the TWELFTH §9 row + FIRST-cross-phase-consumer-of-ADR-0158/ADR-0165/ADR-0166 framing + the bidi-stream-framework-lift framing
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in:** Task 2 of phase-19.1 PLAN (factory + filterStats + boot-registration; §Decision + §Consequences land at IMPL).
+
+### Context
+
+Phase 19 lands `envoy.filters.http.ext_proc` (the canonical Envoy v1.37.2 external-processor filter) as the TWELFTH production HTTP filter in envoy-go after cors / fault / header_mutation / local_ratelimit / csrf / buffer / compressor / bandwidth_limit / rbac / jwt_authn / ext_authz. The package shape mirrors phase-18.1+18.2 ext_authz's multi-file split (per parent SPEC §6.9 + phase-18.1 SPEC §6.5): `extproc.go` (filter type + factory + decode AND encode methods + `filterStats` + `compiledConfig` + per-route helper); `check.go` (per-stage dispatcher + builders + `applyProcessingResponse` + mutation/immediate-response application); `attributes.go` (`request_attributes` + `response_attributes` allowlist-driven envelope builder); `processor.go` (state-machine model); `json.go` (filter-local `protojson` codec); `extproc_test.go`; `fuzz_test.go` (24th fuzzer `FuzzExtProcConfigParse`); `doc.go`. The package directory + Go identifier are `extproc` (single token underscore-stripped per ADR-0114; matches `localratelimit/` + `jwtauthn/` + `extauthz/`). The package exposes `TypeURL` + `New` (the `HTTPFilterFactory`).
+
+**Phase 19 is the FIRST §9 family-row to ship BOTH `StreamDecoderFilter` AND `StreamEncoderFilter` participation in a single filter package.** Phase-14 compressor's encode-only shape (`Decoder: nil`) is the only prior precedent for encode-side participation; phase-19 spans both. Decoder-side handles request_headers (+ request_body at 19.2); encoder-side handles response_headers (+ response_body at 19.2). Static blank-identifier compile-time checks for BOTH interfaces.
+
+**Phase 19 is the FIRST §9 row whose deny-path can fire at multiple stages** — request_headers + request_body + response_headers + response_body (body-stage variants at 19.2). The framework's `SendLocalReply` primitive per ADR-0085 supports multi-stage emission (the existing decoder + encoder callback surfaces both expose it); ext_proc emits from the encoder side at the response_headers stage when `ImmediateResponse` arrives — a FIRST in envoy-go (prior §9 rows all emit `SendLocalReply` from decode-side only).
+
+**9-counter `filterStats` per parent §5.P4 RATIFIED-PENDING-IMPL-TIME** — registered unconditionally at `New()` time (the IMPL fixture-harness empirical scrape closes the exact roster at 19.1 Task N per phase-16 §10 lesson (c) + phase-18.2 §11.P4 precedent). The 9 hypothesized counters: `streams_started`, `stream_msgs_sent`, `stream_msgs_received`, `spurious_msgs_received`, `streams_failed`, `streams_closed`, `failure_mode_allowed`, `override_message_timeout_received`, `override_message_timeout_ignored` — all under `http.<HCM_stat_prefix>.ext_proc.*`; SHARED with per-route per ADR-0173.
+
+**Boot-registration alphabetical** per ADR-0100 §2.2: `extproc` inserts between `extauthz` and `fault` in `cmd/envoy-go/main.go` (the 15th extension-registry entry after phase-18.2 — the current 14 entries: `router`, `bandwidthlimit`, `buffer`, `compressor`, `cors`, `csrf`, `envoygotest`, `extauthz`, `fault`, `header_mutation`, `jwtauthn`, `localratelimit`, `rbac` + the in-flight 14th `extauthz` insertion that closed phase-18 are the order at master tip `5927b55`).
+
+**Phase 19 is the FIRST cross-phase consumer of ADR-0158 / ADR-0165 / ADR-0166** outside phase-18.2 itself — the load-bearing reusability demonstration of the gRPC-client primitive + the 6 new decoder-callback accessors + the cluster-manager plaintext h2c upstream relaxation. Phase 19 EXTENDS ADR-0158 with the `*ProcessorClient` bidi-stream wrapper (ADR-0169) — same package (`internal/grpcclient/`), same `*Dialer` integration; NO `Dialer` API changes. The framework story for phase 19 is dominated by REUSE rather than NEW (FIVE load-bearing reuses + ONE NEW primitive extending an existing family + ONE NEW filter-local codec + TWO encode-side framework deltas per ADR-0174 + ADR-0175).
+
+References: parent SPEC §1 + §4.1 + §5.P2 + §5.P4 + §5.P11 + §5.P12 + §6 amendments 4 + 11 + 12. ADR-0156 (phase-18.1 package shape precedent). ADR-0072 (extension-registry boot registration). ADR-0085 (`SendLocalReply` framework primitive). ADR-0114 (single-token directory discipline).
+
+---
+
+## ADR-0168: `compiledConfig` shape + the `grpc_service`-vs-`http_service` mutually-exclusive top-level field dispatch (NOT a proto oneof) + http_service proto-constraint (PARSE-REJECT body/trailer modes when http_service is set) + consumed-vs-deferred field discipline + the error-posture fields + 19.1 body-mode PARSE-REJECT (§Decision amended at 19.2 to lift) + the STREAMED-only flag PARSE-REJECT
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention; §Decision lands at 19.1 IMPL; §Decision is amended at 19.2 IMPL to lift the body-mode PARSE-REJECT).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 §9 family-row (§Decision); phase 19.2 §Decision AMENDMENT. ADR-0044 ADR-on-impl convention.
+**Lands-in:** Task 2 of phase-19.1 PLAN (`compiledConfig` shape + `buildCompiledConfig`); §Decision amended at phase-19.2 IMPL (body-mode PARSE-REJECT lift).
+
+### Context
+
+The `ExternalProcessor` proto has 22 top-level fields per parent SPEC §5.P1 (cross-checked against `go-control-plane v1.32.4`'s `ext_proc.pb.go`). The transport-dispatch surface is **two top-level optional fields** (`grpc_service` #1 + `http_service` #20) with operator-side mutual-exclusion — NOT a proto `oneof` (distinct from phase-18 ext_authz which IS a `services` oneof). The factory enforces mutual-exclusion at parse time: both-set OR neither-set → PARSE-REJECT envoy-go-strict (mirrors the phase-18.1 ext_authz empty-services-oneof discipline + extends to a both-set check).
+
+**19.1 MVP envelope** consumes 17 of 22 `ExternalProcessor` fields (per parent SPEC §5.P1 + 19.1 SPEC §1 item 3):
+- Transport: `grpc_service` (#1; with `core.GrpcService.GoogleGrpc` PARSE-REJECT + `initial_metadata`/`retry_policy` SILENT-IGNORE — inherited from ADR-0157 §Decision AMENDMENT) + `http_service` (#20 → `ExtProcHttpService.http_service: *core.v3.HttpService`).
+- Processing: `processing_mode` (#3 — headers-modes consumed; body-modes PARSE-REJECT in 19.1 unless NONE; trailer-modes PARSE-REJECT unless SKIP).
+- Attributes: `request_attributes` (#5) + `response_attributes` (#6).
+- Error posture: `failure_mode_allow` (#2; default false) + `message_timeout` (#7; default 200ms; PGV `gte=0s, lte=1h0m0s`) + `max_message_timeout` (#10; default 0 = override disabled; PGV `gte=0s, lte=1h0m0s`) + `disable_immediate_response` (#15).
+- Mode-override: `allow_mode_override` (#14) + `allowed_override_modes` (#22).
+- Mutation discipline: `mutation_rules` (#9 → `*v31.HeaderMutationRules`).
+- Header forwarding: `forward_rules` (#12 → `*HeaderForwardingRules{allowed_headers, disallowed_headers}`).
+- Route cache: `route_cache_action` (#18) + `disable_clear_route_cache` (#11; mutually exclusive with #18 per parent §5.P5).
+- Stat prefix: `stat_prefix` (#8).
+
+**19.1 PARSE-REJECT envoy-go-strict** (per parent §5.P10 RATIFIED):
+- `observability_mode` (#17) when true (STREAMED-only flag).
+- `send_body_without_waiting_for_header_response` (#21) when true (STREAMED-only flag).
+- `deferred_close_timeout` (#19) when non-zero (observability_mode-coupled).
+- `core.GrpcService.GoogleGrpc` arm (envoy-go uses Go gRPC directly — inherited from ADR-0157 §Decision AMENDMENT).
+- Both-set OR neither-set transport (mutual-exclusion enforcement).
+- `processing_mode.{request,response}_body_mode` != NONE (19.1 only; lifted at 19.2).
+- `processing_mode.{request,response}_trailer_mode` != SKIP (permanently).
+- `processing_mode.{request,response}_body_mode` ∈ {STREAMED, BUFFERED_PARTIAL, FULL_DUPLEX_STREAMED} (permanently out of envelope per Q2).
+- `http_service` + body-mode != NONE simultaneously (per the proto's `ExtProcHttpService.http_service` doc-comment: "if 'http_service' is set, the `processing_mode` can not be configured to send any body or trailers" — quoted at parent §5.P1).
+- Both `disable_clear_route_cache` AND `route_cache_action` set (parent §5.P5 mutual-exclusion).
+
+**19.1 SILENT-IGNORE** (per the inline-deferral discipline, deferred fields auditable in the ADR-0040 trail):
+- `metadata_options` (#16 → `*MetadataOptions{forwarding_namespaces, receiving_namespaces}`) — dynamic-metadata family blocked at phases 16+17+18 forward-pointers.
+- `filter_metadata` (#13 → `*structpb.Struct`) — dynamic-metadata family.
+- `core.GrpcService.{initial_metadata, retry_policy}` — initial-metadata + gRPC retry families.
+
+**Body-mode 19.1 PARSE-REJECT is lifted at 19.2** via §Decision AMENDMENT (`*compiledConfig` struct shape stays UNCHANGED — body-mode-specific config is captured in the closure scope inside `processFn`, NOT promoted to struct fields, mirroring phase-18.2 ADR-0157 §Decision AMENDMENT's field-final discipline). The lift activates `request_body_mode = BUFFERED` (via ADR-0128 decode-side body-buffering reuse) and `response_body_mode = BUFFERED` (via the NEW ADR-0175 encode-side body-buffering primitive).
+
+References: parent SPEC §4.1 + §4.2 + §5.P1 + §5.P10 + §6 amendment 10. 19.1 SPEC §1 item 3 + §6.5. ADR-0157 §Decision AMENDMENT (the GoogleGrpc PARSE-REJECT + initial_metadata/retry_policy SILENT-IGNORE inheritance from phase-18.2).
+
+---
+
+## ADR-0169: `*ProcessorClient` bidi-stream wrapper EXTENDING `internal/grpcclient/Dialer` (ADR-0158 §Consequences anchored this cross-phase shape) — NEW typed wrapper alongside the existing unary `*AuthClient` in the same package; `Process(ctx) (ProcessStream, error)` + bidi-stream lifecycle per HTTP transaction; FIRST cross-phase consumer of ADR-0158 outside phase-18.2 itself; cross-phase-reusable for future bidi-stream gRPC filters
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 §9 family-row. ADR-0044 ADR-on-impl convention. The FIRST §9 row to EXTEND a phase-N-1 framework family (ADR-0158) rather than introduce a brand-new family — the cross-phase-reuse-at-introduction-time intent ADR-0158 codified per its §Consequences ("no future client coupling is anticipated to require `Dialer` API changes").
+**Lands-in:** Task 3 of phase-19.1 PLAN (`internal/grpcclient/processor_client.go` new file alongside `auth_client.go`).
+
+### Context
+
+Phase 19 ships the bidi-stream RPC pattern over the existing `internal/grpcclient/` package — envoy-go's FIRST bidi-stream gRPC consumer (phase-18.2 established the unary RPC pattern with `*AuthClient`). The `envoy.service.ext_proc.v3.ExternalProcessor.Process` RPC is bidirectional streaming per `go-control-plane v1.32.4`'s `external_processor_grpc.pb.go` (parent §5.P10 RATIFIED): the client interface is `Process(ctx) (ExternalProcessor_ProcessClient, error)` returning a stream with `Send(*ProcessingRequest) error` + `Recv() (*ProcessingResponse, error)` + (inherited from `grpc.ClientStream`) `CloseSend() error` + `Context() context.Context`.
+
+The `*ProcessorClient` wrapper composes against the EXISTING `*Dialer` (per ADR-0158 §Decision (i)+(ii)). NO `Dialer` API changes — the ADR-0158 §Consequences explicitly anchored this: "no future client coupling is anticipated to require `Dialer` API changes". Public surface:
+
+```go
+type ProcessorClient struct { /* ... */ }
+func NewProcessorClient(d *Dialer, clusterName string, perMessageTimeout time.Duration) (*ProcessorClient, error)
+func (c *ProcessorClient) Process(ctx context.Context) (ProcessStream, error)
+type ProcessStream interface {
+    Send(*extprocv3.ProcessingRequest) error
+    Recv() (*extprocv3.ProcessingResponse, error)
+    CloseSend() error
+}
+func (c *ProcessorClient) Close() error
+```
+
+`NewProcessorClient` calls `Dialer.DialContext(ctx, clusterName)` → wraps the returned `*grpc.ClientConn` with `extprocv3.NewExternalProcessorClient(conn)` returning the typed stub. The `perMessageTimeout` is applied per-MESSAGE via `context.WithTimeout` around the recv path (the `Send` is non-blocking on the gRPC client stream; the `Recv` blocks until the processor responds). The per-message timer interacts with `override_message_timeout` per parent §5.P10 — the IMPL resets the recv-timer when an `override_message_timeout` ProcessingResponse arrives.
+
+**Connection lifecycle:** one `*grpc.ClientConn` per (cluster_name, `*compiledConfig`) pair (mirrors phase-18.2 ADR-0158 §Decision (v) for `*AuthClient`); created at config-load time via `buildGRPCProcessorClient` in `extproc/check.go`; shared across all per-stream `Process()` invocations on that compiledConfig (gRPC manages transport-level reconnect via its sub-channel state machine).
+
+**Stream lifecycle:** per HTTP transaction (one `Process` stream per request). The state machine at `extproc/processor.go` opens a stream via `ProcessorClient.Process(ctx)` at `DecodeHeaders` time when request_header_mode ∈ {SEND, DEFAULT}; sends ProcessingRequests per stage; receives ProcessingResponses; calls `CloseSend()` after the final response stage OR on `ImmediateResponse` arrival OR on `OnDestroy` cancellation. The stream's `ctx` carries the per-stream cancellation hook so `OnDestroy` aborts in-flight `Send`/`Recv` calls promptly.
+
+**Leaks-on-exit MVP** per phase-18.2 ADR-0158 §Decision (vi) precedent: `Close()` is NOT explicitly called in production (envoy-go has no xDS-CDS hot-reload yet); the `*grpc.ClientConn` is leaked-on-exit. `Close()` is authored for unit tests + future hot-reload phases (sync.Once-guarded idempotency).
+
+**Cross-phase reuse intent:** Future bidi-stream gRPC filters reuse the `ProcessorClient` pattern by composing their own typed wrapper alongside `AuthClient` + `ProcessorClient` using the same `Dialer`. The `*Dialer` API stays minimal (no API changes for 19.1). Possible future consumers: streaming-access-log filter; streaming-rate-limit filter. ext_proc is currently the sole bidi-stream consumer at 19.1.
+
+References: parent SPEC §3 + §5.P1 + §5.P10. 19.1 SPEC §3.1 + §6.8. ADR-0158 §Decision + §Consequences (the parent framework primitive; `Dialer` API stays minimal; cross-phase reuse intent codified). ADR-0166 (plaintext h2c upstream relaxation — reused for the processor cluster).
+
+---
+
+## ADR-0170: `ProcessingRequest`/`ProcessingResponse` JSON codec for http_service mode — uses `protojson` (already in dependency tree); filter-local at `extproc/json.go` for MVP; protojson defaults RATIFIED-PENDING-IMPL-TIME per parent §5.P8; generalization to `internal/jsoncodec/` deferred to the second-consumer trigger per the phase-18.1 ADR-0159 (b)-disposition rationale
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 §9 family-row. ADR-0044 ADR-on-impl convention. The SECOND deferred-generalization decision (after ADR-0159's HTTP-outbound auth-check disposition (b) at phase 18.1) — establishes the discipline of "land filter-local; generalize at the third consumer".
+**Lands-in:** Task 4 of phase-19.1 PLAN (`internal/filter/http/extproc/json.go`).
+
+### Context
+
+The `ExtProcHttpService.http_service` arm of ext_proc POSTs a JSON-encoded `ProcessingRequest` per stage to the configured HTTP service URI and parses the JSON `ProcessingResponse`. Per the proto's `ExtProcHttpService.http_service` doc-comment (quoted at parent §5.P1): "if 'http_service' is set, the `processing_mode` can not be configured to send any body or trailers. i.e, http_service only supports sending request or response headers to the side stream server." — the http_service arm is HEADERS-ONLY by proto constraint; the codec marshals/unmarshals only the headers-stage payloads.
+
+**Codec choice: `protojson`** (`google.golang.org/protobuf/encoding/protojson`), already in the dependency tree via `go-control-plane`. The wire-shape is a single JSON-encoded `ProcessingRequest` per POST body + a single JSON-encoded `ProcessingResponse` per HTTP response body.
+
+**`protojson` MarshalOptions** (per parent §5.P8 hypothesis; RATIFIED-PENDING-IMPL-TIME at 19.1 fixture-harness scrape against reference Envoy v1.37.2):
+- `UseProtoNames: true` — use proto field names (snake_case) rather than the proto3 JSON canonical lowerCamelCase mapping. Hypothesized to match reference Envoy's encoding; the IMPL fixture scrape closes the pin definitively.
+- `EmitUnpopulated: false` — omit zero-valued fields (default).
+- `UseEnumNumbers: false` — render enum values as string names (e.g., `"SEND"`, `"CONTINUE"`, `"BUFFERED"`).
+
+**UnmarshalOptions:**
+- `DiscardUnknown: true` — forward-compat tolerance for proto extensions added in future Envoy versions.
+
+**Public surface** (private to the `extproc` package):
+
+```go
+func marshalProcessingRequest(req *extprocv3.ProcessingRequest) ([]byte, error)
+func unmarshalProcessingResponse(data []byte) (*extprocv3.ProcessingResponse, error)
+```
+
+**Filter-local-vs-shared-package disposition.** The codec is intentionally NOT generalized into `internal/grpcclient/` or a new `internal/jsoncodec/` package at 19.1 — there is no second consumer in-tree, and the codec is structurally tied to the ext_proc proto-binding. Per the phase-18.1 ADR-0159 (b)-disposition rationale, generalization is reconsidered at the SECOND (or third — IMPL's call) consumer trigger. Currently no in-tree consumer needs a generalized protojson-over-HTTP codec; future candidates include any future filter that emits/consumes JSON-transcoded protos (e.g., a future streaming-rate-limit-via-JSON-POST mode — but the gRPC variant is the standard deployment shape for those filters).
+
+**Wire-shape verification** at 19.1 IMPL fixture-harness: capture one ProcessingRequest + one ProcessingResponse from reference Envoy v1.37.2 running http_service mode; assert byte-equivalent JSON output from `marshalProcessingRequest` (and byte-equivalent parse of the inverse via `unmarshalProcessingResponse`). If the empirical scrape surfaces divergences (e.g., reference Envoy uses lowerCamelCase per proto3 JSON canonical, OR emits unpopulated fields, OR uses different well-known-type encodings — Duration/Timestamp formatting), §Decision is amended in-place at 19.1 IMPL per ADR-0044.
+
+References: parent SPEC §3 + §5.P8 + §6 amendment 8. 19.1 SPEC §3.2 + §6 file-layout. ADR-0159 (the phase-18.1 disposition-(b) precedent — filter-local thin client until the second consumer trigger).
+
+---
+
+## ADR-0171: ProcessingMode state-machine + mode-override discipline — per-direction ProcessingMode state; bidi-stream single-in-flight-message correlation; mid-stream mode_override re-eval (header-response paths only per §5.P1); `allow_mode_override` + `allowed_override_modes` validation; `mutation_rules` per-header gating; `max_message_timeout` bounding `override_message_timeout` extensions; STREAMED-only flags PARSE-REJECT; `DEFAULT` translates to SEND for headers / SKIP for trailers per §5.P9
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention; §Decision lands at 19.1 IMPL (header-mode portion); §Decision is amended at 19.2 IMPL to add body-mode state-machine semantics).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 + 19.2 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in:** Task 5 of phase-19.1 PLAN (`processor.go` state machine; header-mode portion); Task N of phase-19.2 IMPL (body-mode AMENDMENT).
+
+### Context
+
+The ext_proc filter is structurally distinct from prior §9 filters in that it operates as a per-stage state machine over a bidi-stream gRPC `Process` RPC (or per-stage HTTP-JSON POSTs in http_service mode). The state machine carries per-direction `ProcessingMode` state — at any time the filter has an "active" ProcessingMode determining whether the request_headers / request_body / response_headers / response_body stages fire as outbound ProcessingRequests.
+
+**ProcessingMode parse-and-resolve** (parent §5.P9 RATIFIED): the proto's `HeaderSendMode.DEFAULT (0)` is context-sensitive — the envoy-go IMPL translates DEFAULT → SEND for `*_header_mode` fields at parse time; DEFAULT → SKIP for `*_trailer_mode` fields. `BodySendMode` has no DEFAULT enum value; the zero value is `NONE`. Phase 19 19.1 PARSE-REJECTs body-modes != NONE (lifted at 19.2 for BUFFERED only); STREAMED + BUFFERED_PARTIAL + FULL_DUPLEX_STREAMED PARSE-REJECT envoy-go-strict permanently; trailer-modes != SKIP PARSE-REJECT envoy-go-strict permanently.
+
+**State-machine invariants** (per the proto's bidi-stream protocol design + parent §5.P10):
+- **Single-in-flight per-stage**: at most one outstanding ProcessingRequest at any time. Each `Send` is followed by a `Recv` before the next stage's `Send`. (No STREAMED interleaving in the MVP envelope.)
+- **Per-direction state**: request-side state (request_header_mode + request_body_mode) and response-side state (response_header_mode + response_body_mode) are TRACKED INDEPENDENTLY — a mode_override on a request_headers response affects request-side state for SUBSEQUENT request-side stages (and the response-side stages if mode_override updates the full ProcessingMode); the response-side state is unaffected by request-side stages' mode_overrides until they explicitly update the response-side modes.
+- **Stage order**: request_headers → (request_body if BUFFERED at 19.2) → upstream → response_headers → (response_body if BUFFERED at 19.2) → downstream. Body-stages PARSE-REJECT in 19.1.
+
+**Mode-override discipline** (per parent §5.P1 RATIFIED-AND-REFINED):
+- `mode_override` is honored ONLY when arriving in response to `request_headers` or `response_headers` ProcessingRequests — `mode_override` arriving in a body-stage or trailer-stage response is IGNORED (silently dropped per proto doc; NOT classified as `spurious_msgs_received`).
+- `mode_override` is also ignored when `allow_mode_override=false`.
+- The third gate (`send_body_without_waiting_for_header_response=true`) is irrelevant for envoy-go since that flag PARSE-REJECTs per §5.P10.
+- When `allowed_override_modes` is non-empty, the override mode is validated against the allow-list (exact ProcessingMode value match required); a mode_override outside the allow-list is classified as `spurious_msgs_received` per the canonical Envoy counter (distinct from the proto-doc silent-ignore disposition for non-header-stage mode_overrides).
+- The override's effect propagates to SUBSEQUENT stages.
+
+**`override_message_timeout` discipline** (per parent §5.P10 RATIFIED):
+- The `ProcessingResponse.override_message_timeout` field is a `*durationpb.Duration` that, when received, RESETS the per-stage timer to the new duration.
+- Takes effect ONLY if `ExternalProcessor.max_message_timeout >= 1ms` (otherwise the entire override-timer API is disabled per proto doc); when disabled, an `override_message_timeout` arrival increments `override_message_timeout_ignored` counter.
+- The new timeout must be in `[1ms, max_message_timeout]` (out-of-range → `override_message_timeout_ignored` counter increment).
+- At most ONCE per stage's processing state (subsequent `override_message_timeout` arrivals in the same stage are classified as `spurious_msgs_received`).
+- The `ProcessingResponse` carrying `override_message_timeout` has its OTHER fields IGNORED (the CommonResponse, ImmediateResponse, mode_override fields on the same response are NOT consumed); the IMPL handles this special-case by checking `override_message_timeout` FIRST in `applyProcessingResponse` and short-circuiting if present.
+
+**`mutation_rules` per-header gating** (per parent §5.P3 RATIFIED): when a `CommonResponse.header_mutation` arrives, each set/remove operation is independently validated against the resolved `mutation_rules` allow/deny matchers. Allowed mutations apply; rejected mutations are dropped silently AND set a per-stage flag so `spurious_msgs_received` increments ONCE per stage with any rejection.
+
+**Bidi-stream half-close + `CloseSend` discipline** (per parent §5.P10 RATIFIED): the client calls `CloseSend()` after the final stage's response completes OR on `ImmediateResponse` arrival (the stream is terminated; subsequent ProcessingResponses ignored) OR on `OnDestroy` cancellation (the in-flight Send/Recv aborts; `streamCancel()` propagates).
+
+References: parent SPEC §4.1 + §5.P1 + §5.P9 + §5.P10 + §6 amendments 1 + 9 + 10. 19.1 SPEC §6.3 + §6.4 + §6.5 + §6.6 + §6.7 + §6.8. ADR-0085 (`SendLocalReply` framework primitive).
+
+---
+
+## ADR-0172: CommonResponse mutation + ImmediateResponse multi-stage deny discipline — `header_mutation` set/remove per direction per stage (HEADER-MODE PORTION); `body_mutation` body/clear via ADR-0128 decode-side + NEW ADR-0175 encode-side at 19.2 (BODY-MODE PORTION); `status` CONTINUE/CONTINUE_AND_REPLACE (CONTINUE_AND_REPLACE at 19.2); `clear_route_cache` + `route_cache_action` precedence (request-headers stage only per §5.P5); `ImmediateResponse{status, headers, body, grpc_status, details}` multi-stage deny via `SendLocalReply` + grpc_status content-type sniff per §5.P2; `mutation_rules` per-header gating per §5.P3; records `CommonResponse.dynamic_metadata` + `CommonResponse.trailers` deferrals
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention; §Decision lands at 19.1 IMPL (header-mode portion); §Decision is amended at 19.2 IMPL to add body-mode portion).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 + 19.2 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in:** Task 6 of phase-19.1 PLAN (header_mutation + ImmediateResponse-at-headers portion); Task N of phase-19.2 IMPL (body_mutation + CONTINUE_AND_REPLACE + body-stage ImmediateResponse AMENDMENT).
+
+### Context
+
+`ProcessingResponse` carries the processor's per-stage response. The `CommonResponse` substructure has 5 fields per parent SPEC §5.P1: `status` (CONTINUE / CONTINUE_AND_REPLACE enum), `header_mutation` (set_headers + remove_headers), `body_mutation` (oneof body bytes / clear_body bool / streamed_response — the last arm PARSE-REJECT envoy-go-strict permanently since STREAMED is out of envelope), `trailers` (HeaderMap — `[#not-implemented-hide:]` per the proto; DEFERRED), `clear_route_cache` (bool).
+
+**`header_mutation` per-direction per-stage application** (HEADER-MODE PORTION in 19.1):
+- request_headers stage's CommonResponse.header_mutation applies to the DECODE-side request headers via `f.dcb.RequestHeaders().Set/Add/Del` (or framework analog).
+- response_headers stage's CommonResponse.header_mutation applies to the ENCODE-side response headers via `f.ecb.ResponseHeaders().Set/Add/Del`.
+- `set_headers` is `[]*core.HeaderValueOption` carrying an `append_action` enum (`APPEND_IF_EXISTS_OR_ADD`, `OVERWRITE_IF_EXISTS_OR_ADD`, `OVERWRITE_IF_EXISTS`, `ADD_IF_ABSENT`) — the IMPL settles the 4-arm dispatch per the phase-18.2 ext_authz `OkHttpResponse.headers` precedent + the phase-10 header_mutation enum-handling.
+- `remove_headers` is `[]string` — drop wholesale.
+- `mutation_rules` per-header gating applies (parent §5.P3): each individual mutation is validated; rejected mutations dropped + `spurious_msgs_received` counter increment ONCE per stage with any rejection.
+
+**`body_mutation` per-direction per-stage application** (BODY-MODE PORTION at 19.2):
+- `body_mutation.body` (bytes): REPLACE the body wholesale (only valid when the corresponding body_mode is BUFFERED; combined with `status = CONTINUE_AND_REPLACE` for full-message-replacement).
+- `body_mutation.clear_body` (bool): CLEAR the body wholesale.
+- `body_mutation.streamed_response`: PARSE-REJECT envoy-go-strict (STREAMED is out of envelope per Q2; the FULL_DUPLEX_STREAMED arm of BodySendMode is also out of envelope; the proto doc explicitly couples this body_mutation arm to FULL_DUPLEX_STREAMED).
+- Decode-side body replacement uses the existing phase-13 ADR-0128 body-buffering primitive (already accumulates request body in `DataStopIterationAndBuffer`).
+- Encode-side body replacement uses the NEW ADR-0175 encode-side body-buffering primitive (§5.P11 REFUTED at SPEC time — the framework gap is confirmed).
+
+**`status` CONTINUE_AND_REPLACE handling** (at 19.2):
+- `CONTINUE` (default): apply header_mutation + body_mutation in the standard way; the stream continues.
+- `CONTINUE_AND_REPLACE`: full replacement — the processor has built a complete substitute message; header_mutation set_headers becomes the FULL header set (existing headers other than those preserved by allow-list are dropped); body_mutation.body becomes the FULL body. Effectively: turn a GET into a POST/PUT/PATCH, or build a synthetic response. Honored ONLY at the header stages (request_headers / response_headers); body-stage CONTINUE_AND_REPLACE is structurally invalid (the body has already been consumed; classified as `spurious_msgs_received`). 19.1 PARSE-REJECTs the CONTINUE_AND_REPLACE status (silent-classify as `spurious_msgs_received` + dispError) since body-mode is OUT in 19.1; 19.2 IMPL activates the proper handling.
+
+**`clear_route_cache` + `route_cache_action` precedence** (per parent §5.P5 RATIFIED):
+- The two top-level fields (`disable_clear_route_cache` + `route_cache_action`) are mutually exclusive at parse time → PARSE-REJECT.
+- `route_cache_action` enum: `DEFAULT (0)` = clear-only-if-`CommonResponse.clear_route_cache`-set; `CLEAR (1)` = always-clear; `RETAIN (2)` = never-clear.
+- `disable_clear_route_cache: true` is equivalent to `route_cache_action: RETAIN` (per proto enum doc); IMPL translates at parse time.
+- **Applied ONLY at the request_headers stage** (per the `RouteCacheAction` enum doc + the proto-doc "This field is ignored in the response direction" on `CommonResponse.clear_route_cache`); body-stage and response-stage `CommonResponse.clear_route_cache` arrivals are silently dropped.
+- The route-cache-clear emission goes through the existing `cb.ClearRouteCache()` HCM-side primitive (already used by phase-10 header_mutation + phase-17 jwt_authn).
+
+**`ImmediateResponse` multi-stage deny discipline** (per parent §5.P2 RATIFIED):
+- `ImmediateResponse` can arrive in response to ANY stage's ProcessingRequest — request_headers + (request_body at 19.2) + response_headers + (response_body at 19.2). FIRST §9 row whose deny-path is multi-stage.
+- `status` (`*type.v3.HttpStatus`, PGV-required) — the response code (e.g., 403, 500).
+- `headers` is `*HeaderMutation` (NOT a plain `[]HeaderValueOption` like phase-18.2 `DeniedHttpResponse.headers`) — the IMPL applies SET+REMOVE via `set_headers` + `remove_headers`. `mutation_rules` per-header gating applies.
+- `body` (`[]byte`) — the response body. The proto doc states "sent using the text/plain content type, or encoded in the grpc-message header" — the IMPL applies content-type discipline based on a `content-type: application/grpc` request-header sniff (NOT via `DownstreamProtocol()` which returns HTTP/1.1 or HTTP/2): non-gRPC downstream → body with `content-type: text/plain` (unless overridden); gRPC downstream → body encoded into the `grpc-message` response header.
+- `grpc_status` (`*GrpcStatus{status uint32}`) — when non-nil AND the downstream is gRPC, add a `grpc-status: <status>` response trailer; when downstream is non-gRPC, IGNORED.
+- `details` (`string`) — maps to `response_code_details` — DEFERRED (envoy-go HCM does not surface response_code_details; joint divergence-window with phase-16/17/18 forward-pointers).
+- The local-reply emission goes through `SendLocalReply` per ADR-0085 + the per-direction callback surface (`f.dcb.SendLocalReply` for decode stages; `f.ecb.SendLocalReply` for encode stages). The framework's `SendLocalReply` enters the encode chain at `filter[len-1]` per ADR-0075, supporting multi-stage emission seamlessly.
+- `disable_immediate_response: true` configuration silently drops ImmediateResponse messages (treated as protocol violation; `spurious_msgs_received` increments; stream continues without local reply emission).
+
+**DEFERRED fields recorded:**
+- `CommonResponse.trailers` (`[#not-implemented-hide:]` proto-flag) — silent-ignore per the not-implemented convention.
+- `ProcessingResponse.dynamic_metadata` — dynamic-metadata family (blocked at phases 16+17+18 forward-pointers; ext_proc EXTENDS the cluster).
+
+References: parent SPEC §4.1 + §5.P2 + §5.P3 + §5.P5 + §6 amendments 2 + 3 + 5. 19.1 SPEC §4 + §6.7. ADR-0085 (`SendLocalReply` framework primitive). ADR-0128 (decode-side body-buffering — reused for `request_body_mode = BUFFERED` at 19.2). ADR-0175 (encode-side body-buffering — fires at 19.2).
+
+---
+
+## ADR-0173: Per-route 5th-canonical REUSE classification (explicit no-new-canonical decision; **NO ADR-0125 amendment paragraph** — SECOND CONSECUTIVE §9 family-row after phase 18 to REUSE; the absence of a §(xiv) amendment is itself a recorded decision — strengthens the ADR-0125 roster-not-monotonic lesson) + SHARED-stats discipline + the `ExtProcOverrides` narrower-override surface + the 9-counter stat surface (`streams_started`/`stream_msgs_sent`/`stream_msgs_received`/`spurious_msgs_received`/`streams_failed`/`streams_closed`/`failure_mode_allowed`/`override_message_timeout_received`/`override_message_timeout_ignored`; HCM-rooted SN2-reuse `http.<HCM_stat_prefix>.ext_proc.*`; RATIFIED-PENDING-IMPL-TIME per phase-16 §10 lesson (c)) + the PGV wrinkles (`disabled` `const: true`; `override` oneof PGV-required)
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 §9 family-row. ADR-0044 ADR-on-impl convention. The SECOND CONSECUTIVE §9 row to REUSE an ADR-0125 canonical (after phase 18 per ADR-0163) — strengthens the BRAINSTORM §11 lesson (d) inverse-confirmation: ADR-0125's canonical roster does NOT grow monotonically.
+**Lands-in:** Task 7 of phase-19.1 PLAN.
+
+### Context
+
+Parent SPEC §5.P6 RATIFIED `ExtProcPerRoute` carries one PGV-required oneof `override` with two arms: `disabled` (bool, PGV `const: true`) and `overrides` (`*ExtProcOverrides`, PGV `required` within the arm + embedded validation). This maps cleanly onto ADR-0125's existing **5th canonical** (a oneof with a disabled-bool arm + a NARROWER override sub-message arm — the pattern phase-13 buffer + phase-14 compressor + phase-18 ext_authz already use). The two PGV wrinkles vs the bare buffer/compressor 5th canonical are recorded: `disabled` PGV `const: true` (envoy-go PARSE-REJECTs `disabled: false`); the `override` oneof is itself PGV-required (envoy-go PARSE-REJECTs an empty `ExtProcPerRoute`). These wrinkles do not constitute a new canonical — phase-18 ext_authz had the SAME wrinkles and was classified as 5th-canonical REUSE per ADR-0163. **Phase 19 lands NO ADR-0125 §(xiv) amendment paragraph** — the SECOND CONSECUTIVE §9 family-row (after phase 18 per ADR-0163) to REUSE an existing canonical rather than extend the roster.
+
+**`ExtProcOverrides` 7-field narrower-override surface** (parent §5.P6 RATIFIED — the BRAINSTORM §2.6 hypothesis is confirmed; `request_attributes`/`response_attributes` exist on the per-route override AS WELL AS top-level on `ExternalProcessor` — the two surfaces are independent at `go-control-plane v1.32.4`):
+
+- `processing_mode` (#1, `*ProcessingMode`) — per-route override of the listener-level `processing_mode`. **MVP-CONSUMED.**
+- `async_mode` (#2, bool) — proto-flagged `[#not-implemented-hide:]` upstream. **DEFERRED — silent-ignore per the not-implemented convention.**
+- `request_attributes` (#3, `[]string`) — proto-flagged `[#not-implemented-hide:]` upstream. **DEFERRED — silent-ignore per the not-implemented convention.** Distinct from TOP-LEVEL `ExternalProcessor.request_attributes` (#5) which IS MVP-consumed for the listener-level request_headers attribute envelope.
+- `response_attributes` (#4, `[]string`) — proto-flagged `[#not-implemented-hide:]` upstream. **DEFERRED — silent-ignore per the not-implemented convention.** Distinct from TOP-LEVEL `ExternalProcessor.response_attributes` (#6) which IS MVP-consumed for the listener-level response_headers attribute envelope.
+- `grpc_service` (#5, `*v3.GrpcService`) — per-route override of the listener-level `grpc_service`. **MVP-CONSUMED** (useful for routing different paths to different processor backends). The per-route override of `grpc_service` requires the listener-level mode to also be gRPC (cross-mode override from HTTP → gRPC PARSE-REJECT envoy-go-strict).
+- `metadata_options` (#6, `*MetadataOptions`) — dynamic-metadata family. **DEFERRED.**
+- `grpc_initial_metadata` (#7, `[]*v3.HeaderValue`) — initial-metadata family. **DEFERRED per phase-18.2 SPEC §2.6 carry-forward.**
+
+**Per-route stats SHARED with listener-level** (per parent §6 amendment 4 + ADR-0173): the per-route override adjusts `processing_mode`/`grpc_service` but still hits the same external processor; it spawns no new stateful policy-evaluation surface. SHARED-stats; MIRRORS phase-12/13/14/17/18 SHARED-stats discipline; DIVERGES from phase-11/15/16 INDEPENDENT-stats. The 3-tier `PerRouteConfig.Resolve` (Route > VirtualHost > RouteConfiguration > listener fallback) selects the most-specific per-route entry per request via the existing TPFC resolution machinery; the IMPL caches-on-first-use per parent §5.P7 RATIFIED-PENDING-IMPL-TIME (the per-route config resolved at `DecodeHeaders` time stays in effect for the entire bidi-stream's lifetime, even across `ClearRouteCache` invocations — mirrors phase-10/17 precedents).
+
+**9-counter stat surface** (per parent §5.P4 hypothesis; RATIFIED-PENDING-IMPL-TIME at 19.1 fixture-harness):
+- `streams_started`, `stream_msgs_sent`, `stream_msgs_received`, `spurious_msgs_received`, `streams_failed`, `streams_closed`, `failure_mode_allowed`, `override_message_timeout_received`, `override_message_timeout_ignored` — all counters, all registered unconditionally at `New()` time, all under `http.<HCM_stat_prefix>.ext_proc.*` (SN2-reuse — the existing HCM-stat-prefix Prometheus tag-extractor handles this verbatim; NO new SN-flattening rule). Stat-table extends from 77 names (post-phase-18.2) to ~86 names (+9). The IMPL fixture-harness empirical scrape against reference Envoy v1.37.2 closes the pin RATIFIED at 19.1 Task N. If the scrape diverges from the 9-counter hypothesis, this §Decision is amended in-place at 19.1 IMPL per ADR-0044.
+
+References: parent SPEC §5.P2 + §5.P4 + §5.P6 + §5.P7 + §6 amendments 4 + 6 + 7. 19.1 SPEC §5. ADR-0125 §(i) through §(xiii) (the 8-canonical roster; phase 19 REUSES the 5th, adds NONE). ADR-0163 (the phase-18 precedent for 5th-canonical REUSE).
+
+---
+
+## ADR-0174: Cross-phase-reusable symmetric `EncoderFilterCallbacks` extension — 6 new accessor methods (`DownstreamRemoteAddr`/`DownstreamLocalAddr`/`DownstreamTLSServerName`/`DownstreamTLSPeerCertDER`/`DownstreamProtocol`/`ListenerPrincipal`) mirroring ADR-0165's `DecoderFilterCallbacks` additions; reuses ADR-0165's chain-field plumbing (SET-once at HCM dispatch BEFORE either decode or encode dispatch; NO new chain primitives); REFUTED at SPEC §5.P12 in-session scrape → fires load-bearing at 19.1 IMPL; ADR-0044 escape-valve firing at SPEC time per BRAINSTORM §11 lesson (h)
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.1 §9 family-row. ADR-0044 (ADR-on-impl convention + escape-valve for impl-time-unanticipated decisions — this ADR's §Context is authored at SPEC time from the in-session §5.P12 REFUTED scrape, per the phase-18.2 ADR-0165 precedent and the BRAINSTORM §11 lesson (h) discipline). ADR-0071 (chain-ownership-invariant — the 6 reader methods read existing chain fields with the same SET-once-by-HCM-dispatch + READ-by-callback discipline as `tlsPrincipals`). ADR-0165 (the precedent for the seed-at-HCM-dispatch / read-via-callback pattern; ADR-0174 EXTENDS the same 6 chain fields to the encoder-side callback surface).
+**Lands-in:** Task 4 of phase-19.1 PLAN (PRE-REQUISITE — must land before Task 5 since `attributes.go` consumes the new encoder-side accessors).
+
+### Context
+
+The phase-19 SPEC's §5.P12 in-session empirical scrape REFUTED the BRAINSTORM §3.3 CONDITIONAL hypothesis for encode-side callback symmetry — confirming the framework gap on master tip `5927b55`:
+
+**`internal/filter/http/callbacks.go:160-184` (master tip) `EncoderFilterCallbacks` carries ONLY**:
+- `ContinueEncoding()`
+- `EncodeHeaders(headers http.Header, endStream bool)` / `EncodeData(data []byte, endStream bool)` / `EncodeTrailers(trailers http.Header)` (encode-side injection methods — rare; intended for filters like header_manipulation that need to inject encode-side material from a decode-side context)
+- `OverwriteBody(b []byte)` (per ADR-0131 §Decision (vi) — first encode-side framework primitive, phase 14)
+
+**NO socket / TLS / listener accessors** — the 7 ADR-0144 + ADR-0165 methods (`DownstreamPrincipal`, `DownstreamRemoteAddr`, `DownstreamLocalAddr`, `DownstreamTLSServerName`, `DownstreamTLSPeerCertDER`, `DownstreamProtocol`, `ListenerPrincipal`) are decode-side only at master tip.
+
+**Phase 19's `response_attributes` envelope** (populated at the response_headers stage per the proto's `ExternalProcessor.response_attributes` doc-comment: *"Each attribute name provided in this field will be matched against that list and populated in the response_headers message"*) requires encode-side access to the same socket/TLS/listener state that decode-side `request_attributes` consumes. The response_headers stage fires from the encode-side of the filter chain — `EncodeHeaders` returns `StopIteration`, the encode-side goroutine builds the response_headers ProcessingRequest with `attributes` populated, sends it via the bidi-stream, receives the ProcessingResponse, applies the `CommonResponse.header_mutation`, then `ContinueEncoding()`s. Without encode-side accessors, the response_attributes population is structurally unsatisfiable — the encoder-side filter cannot reach the per-stream socket/TLS state.
+
+**The fix lands at 19.1 IMPL Task 4** — six new methods on `EncoderFilterCallbacks`:
+
+```go
+type EncoderFilterCallbacks interface {
+    // ... existing 5 methods (ContinueEncoding, EncodeHeaders/Data/Trailers, OverwriteBody) ...
+
+    // NEW per ADR-0174.
+    DownstreamRemoteAddr() net.Addr
+    DownstreamLocalAddr() net.Addr
+    DownstreamTLSServerName() string
+    DownstreamTLSPeerCertDER() []byte
+    DownstreamProtocol() string
+    ListenerPrincipal() string
+}
+```
+
+**Seeding discipline mirrors ADR-0165** (the chain.go `tlsPrincipals`/`SetTLSPrincipals`/`DownstreamPrincipal()` pattern):
+- The 6 chain fields (`downstreamRemoteAddr` / `downstreamLocalAddr` / `downstreamTLSServerName` / `downstreamTLSPeerCertDER` / `downstreamProtocol` / `listenerPrincipal`) ALREADY exist per ADR-0165's plumbing — they are SET ONCE at chain build time by HCM dispatch (H1 `connection.go:dispatchRequest` + H2 `h2dispatch.go:WriteH2`) BEFORE either `RunDecodeHeaders` or `RunEncodeHeaders` dispatch.
+- **NO new chain plumbing primitives** — the chain fields are shared; the encoder-side reader methods access the same chain pointer via `*encoderCB`.
+- 6 NEW `*encoderCB` reader methods (added at 19.1 IMPL Task 4) return the chain field verbatim — no copy, no transformation.
+- ADR-0071's chain-ownership invariant continues to apply: SET-once at HCM dispatch BEFORE any dispatch path runs; READ concurrently from either decode-side or encode-side callbacks.
+
+**NO `DownstreamPrincipal()` extension** to the encoder-side callbacks at 19.1 — `DownstreamPrincipal` is decode-side-specific in the ADR-0144 framing ("decode-side discovers the principal candidates at dispatch"). If `response_attributes` allowlist requires `source.principal` at the response_headers stage, the IMPL adds a 7th method at IMPL time (mirroring the phase-18.2 ADR-0165 D3+D12 settle pattern). Current hypothesis (parent §6.6 attribute-map table): the 6 socket/TLS/listener accessors suffice for the canonical response-side attribute envelope; `source.principal` is request-side-specific.
+
+**The IMPL lands ~50-100 LoC**: ~30-50 LoC interface extension + reader methods in `internal/filter/http/callbacks.go`; ~30-50 LoC unit tests (the round-trip seed-and-read pattern per the phase-18.2 `chain_test.go:1507` ADR-0165 Group 13 template).
+
+**Cross-phase reuse intent.** The encode-side accessor extension is generally useful for any future filter participating on the encode side — ext_proc is the sole consumer at 19.1, but any future response-mutating filter or response-stage-attribute-emitting filter reuses the same accessor surface. Anchoring the methods at 19.1 IMPL ensures the cost is paid ONCE.
+
+**ADR-0044 escape-valve fires at SPEC time** per BRAINSTORM §11 lesson (h) — IN-SESSION SPEC scrape closure of the most-likely escape-valve surface. The brainstorm's CONDITIONAL hypothesis at §3.3 + §10 is empirically confirmed at SPEC time; the IMPL session does NOT need to discover this gap mid-impl. Mirrors the phase-18.2 ADR-0165 firing at PLAN-time D3+D12 — except the phase-19 surface is now empirically established at SPEC time rather than discovered at PLAN time, REMOVING the ADR-0044 surprise-at-PLAN-time risk.
+
+References: parent SPEC §3 + §5.P12 + §6 amendment 12. 19.1 SPEC §3.3 + §13.5. ADR-0044 (the ADR-on-impl + escape-valve discipline). ADR-0071 (chain-ownership invariant). ADR-0144 (the seed-at-HCM-dispatch / read-via-callback precedent). ADR-0165 (the phase-18.2 decoder-side callback-surface extension — ADR-0174 EXTENDS the same 6 methods to the encoder-side).
+
+---
+
+## ADR-0175: NEW encode-side body-buffering framework primitive analogous to ADR-0128 decode-side — buffers response body across `EncodeData` calls until end_stream; exposes the buffered bytes via a new `EncoderFilterCallbacks` method (`BufferEncodedBody()` or similar — IMPL settles); releases the buffered-and-possibly-mutated body to the downstream wire-write path after the filter's response; REFUTED at SPEC §5.P11 in-session scrape → fires load-bearing at 19.2 IMPL; ADR-0044 escape-valve firing at SPEC time per BRAINSTORM §11 lesson (h); cross-phase-reusable for any future filter needing encode-side body accumulation
+
+**Status:** Accepted (§Context drafted at the phase-19 parent SPEC commit per ADR-0044 ADR-on-impl convention).
+**Date:** 2026-05-15
+**Doctrine:** Phase 19.2 §9 family-row. ADR-0044 (ADR-on-impl convention + escape-valve discipline — this ADR's §Context is authored at SPEC time from the in-session §5.P11 REFUTED scrape). The SYMMETRIC counterpart to ADR-0128 (the phase-13 decode-side body-buffering primitive); the SECOND envoy-go framework primitive in the body-handling family (after ADR-0128); the SECOND encode-side framework primitive (after ADR-0131 `OverwriteBody` — distinct from this primitive in semantics: `OverwriteBody` is a per-call replacement, ADR-0175 is buffer-and-hold).
+**Lands-in:** Task N of phase-19.2 PLAN (the encode-side body-buffering primitive's framework introduction; consumed at the same task or follow-up task by the ext_proc filter's response_body stage dispatch).
+
+### Context
+
+The phase-19 SPEC's §5.P11 in-session empirical scrape REFUTED the BRAINSTORM §3.3 CONDITIONAL hypothesis for encode-side body-buffering — confirming the framework gap on master tip `5927b55`:
+
+**`internal/filter/http/chain.go:373-405` (master tip) `RunEncodeData`** dispatches `DataStopIterationAndBuffer` as **park-only** — the chain parks (resume signal advances) but does NOT accumulate body bytes across `EncodeData` calls. The chain.go:400-404 comment is load-bearing:
+
+```go
+// Iteration completed; record the chunk's size for the encode-side cap.
+// Only the running total is tracked — the bytes have already been
+// forwarded down the encode chain on this call, so no replay buffer is
+// needed (encode-side StopIterationAndBuffer is park-only per Task 6).
+c.encodeBufLen += len(data)
+```
+
+**The phase-14 `OverwriteBody` primitive (ADR-0131 §Decision (vi))** is a **per-call replacement** — called from inside `EncodeData(data, endStream)`, the call substitutes the response body on that single call BEFORE the wire-write path consumes it. It is NOT a buffer-and-hold-until-end-of-stream primitive. ADR-0131's `OverwriteBody` was designed for the compressor use-case (full-body replacement on the FIRST EncodeData call when endStream is true) — not for ext_proc's "buffer the full body across multiple EncodeData calls, ship it to the processor as a single ProcessingRequest, receive a possibly-mutated body, release the mutated body to the wire-write path".
+
+**Phase 19's `response_body_mode = BUFFERED`** (at 19.2 — body-mode arms PARSE-REJECT in 19.1) requires the filter to hold the response body across multiple `EncodeData` calls until end-of-stream, then ship the full body in the `response_body` ProcessingRequest stage, then receive the `BodyResponse.CommonResponse.body_mutation` (if any), then apply the mutation (replace or clear), then release the buffered-and-possibly-mutated body to the downstream wire-write path. This is the EXACT symmetric pattern of phase-13 ADR-0128 decode-side body-buffering — except on the encode side.
+
+**The fix lands at 19.2 IMPL** — a NEW encode-side body-buffering primitive analogous to ADR-0128. Anticipated shape (IMPL settles the exact API):
+
+```go
+// EncoderFilterCallbacks gains a new method at 19.2 IMPL per ADR-0175.
+type EncoderFilterCallbacks interface {
+    // ... existing methods including OverwriteBody (ADR-0131) ...
+
+    // BufferEncodedBody returns the buffered encode-side body bytes
+    // accumulated by the chain when the filter has returned
+    // DataStopIterationAndBuffer on prior EncodeData calls. The bytes
+    // are valid until the filter calls ContinueEncoding(). After
+    // ContinueEncoding(), the buffer is released to the downstream
+    // wire-write path; a subsequent BufferEncodedBody() returns nil.
+    //
+    // Per ADR-0175 §Decision; symmetric to phase-13 ADR-0128 decode-side
+    // body-buffering. Cross-phase-reusable for any encode-side filter
+    // needing body accumulation.
+    BufferEncodedBody() []byte
+}
+```
+
+**Chain-side changes** to `RunEncodeData` at `chain.go:373-405`: replace the "park-only" disposition with a proper buffer-accumulation discipline mirroring the decode-side at `RunDecodeData` (which uses `c.decodeBuf` to accumulate). Add an `encodeBuf []byte` field to the chain struct; on `DataStopIterationAndBuffer`, accumulate the bytes into `encodeBuf` AND DO NOT forward downstream; on resume (via `ContinueEncoding()`), forward `encodeBuf` downstream + clear it. The chain's existing `encodeBufLen` running total can stay as the size cap (same `filterBufferLimitBytes` enforcement). The IMPL settles whether to overflow-error symmetrically to the decode side (via `errEncodeBufferOverflow` + connection reset) or allow up to the cap. Mirror the existing decode-side discipline.
+
+**LoC estimate**: ~150-300 LoC chain-side changes + ~30-50 LoC `EncoderFilterCallbacks` extension + ~30-50 LoC `*encoderCB` reader method + ~150-250 LoC unit tests (mirroring the decode-side ADR-0128 test coverage).
+
+**Cross-phase reuse intent.** Any future encode-side filter that needs to inspect or mutate the FULL response body (rather than per-chunk replacement) consumes ADR-0175's buffer-and-hold primitive. Current ext_proc is the sole consumer at 19.2 — anchoring the primitive at this phase ensures the cost is paid ONCE; the second consumer would be a future encode-side filter analogous to a hypothetical response-content-rewrite filter.
+
+**ADR-0044 escape-valve fires at SPEC time** per BRAINSTORM §11 lesson (h) — IN-SESSION SPEC scrape closure of the most-likely escape-valve surface. The brainstorm's CONDITIONAL hypothesis at §3.3 + §10 is empirically confirmed at SPEC time; the 19.2 IMPL session does NOT need to discover this gap mid-impl. Mirrors the phase-18.2 ADR-0165 firing — except the phase-19 surface is now empirically established at SPEC time.
+
+References: parent SPEC §3 + §5.P11 + §6 amendment 11. 19.2 README §Scope. ADR-0044 (the ADR-on-impl + escape-valve discipline). ADR-0128 (the phase-13 decode-side body-buffering primitive — ADR-0175 is its encode-side mirror). ADR-0131 (the phase-14 `OverwriteBody` encode-side primitive — distinct from ADR-0175's buffer-and-hold semantics).
+
+---
+
+## ADR-0176: ADR-0045 split-application for phase 19 — phase 19 (`http-filter-ext-proc`) is SPLIT into sub-phases `19.1-http-filter-ext-proc-headers` + `19.2-http-filter-ext-proc-body` at the phase-19 SPEC commit; the split is by feature-class; the SPEC §5 empirical-pin resolution + the in-session SPEC-time REFUTATION of §5.P11 + §5.P12 (both fire ADR-0174 + ADR-0175 load-bearing rather than provisionally) ENLARGED the BRAINSTORM's HIGH split-readiness leaning beyond the single-row threshold
+
+**Status:** Accepted
+**Date:** 2026-05-15
+**Doctrine:** Phase 19 §9 family-row. ADR-0045 (surface-split release valve) + `BOOTSTRAP_PROMPT.md` §6.2 (planner-time / SPEC-time split discipline) + ADR-0044 (SPEC-time-anticipation-revision of the ADR count). Documentation-of-application ADR — mirrors phase-08's ADR-0084 + phase-18's ADR-0164.
+**Lands-in:** This phase-19 parent SPEC commit (landed IN FULL — the split decision is complete at SPEC time).
+
+### Context
+
+The phase-19 BRAINSTORM §1.4 flagged ADR-0045 split-readiness **HIGH** — the SECOND §9 family-row to flag HIGH after phase 18 — and surveyed three candidate splits (split-by-feature-class RECOMMENDED, split-by-service-mode, single-row). The brainstorm instructed the SPEC author to treat single-row as the exception requiring justification, not the default — per the phase-18 precedent (HIGH leaning + DID split + clean rollup). The phase-19 SPEC session's §5 empirical-pin resolution (all 13 §10 pins resolved IN-SESSION against `go-control-plane v1.32.4` + reference Envoy v1.37.2 per ADR-0004) CONFIRMS the HIGH leaning AND ENLARGES it:
+
+1. **§5.P1** enumerated a **22-field `ExternalProcessor` message** + `ProcessingMode` (6 fields) + `ExtProcPerRoute` (oneof 2 arms) + `ExtProcOverrides` (5 fields) + `ExtProcHttpService` (1 field) + `HeaderForwardingRules` (2 fields) + `MetadataOptions` (nested) + the `service/ext_proc/v3` proto package's `ProcessingRequest` (6-arm oneof + 3 top-level) + `ProcessingResponse` (7-arm oneof + 3 top-level) + `HttpHeaders` / `HttpBody` / `HttpTrailers` / `HeadersResponse` / `BodyResponse` / `TrailersResponse` / `CommonResponse` (5 fields incl. ResponseStatus enum) / `BodyMutation` (3-arm oneof) / `ImmediateResponse` (5) / `HeaderMutation` / `GrpcStatus`. The proto surface spans TWO proto packages and is **larger than phase 18's** (phase 18 spanned `ext_authz/v3` + `auth/v3` of similar shape; phase 19 spans `ext_proc/v3` + `service/ext_proc/v3` with higher cardinality).
+
+2. **§5.P10** confirmed the `grpc_service` (bidi-stream `Process`) and `http_service` (per-stage JSON POST) arms diverge entirely in the call-and-marshal layer + the bidi-stream lifecycle adds a half-close + CloseSend discipline NEW for envoy-go.
+
+3. **§5.P9** + the `ProcessingMode` BodySendMode enum walk confirmed the headers-only and BUFFERED-body envelopes are structurally distinct sub-surfaces — the headers stages run synchronously per-stage; the BUFFERED-body stages add the decode-side ADR-0128 reuse + the NEW encode-side body-buffering primitive ADR-0175.
+
+4. **§5.P11 REFUTED** at SPEC time — the encode-side body-buffering primitive does NOT exist on master tip (`chain.go:403` "encode-side StopIterationAndBuffer is park-only" + reads of `RunEncodeData` confirm no replay buffer). **ADR-0175 fires load-bearing in 19.2** — a NEW framework primitive analogous to ADR-0128 lands. The brainstorm's CONDITIONAL hypothesis is empirically confirmed at SPEC time, not deferred to IMPL discovery.
+
+5. **§5.P12 REFUTED** at SPEC time — the encode-side filter callback extension surface does NOT exist on master tip (`callbacks.go:160-184` — `EncoderFilterCallbacks` has only `ContinueEncoding` + `EncodeHeaders/Data/Trailers` + `OverwriteBody`; the 6 ADR-0165 accessors are decode-side only). **ADR-0174 fires load-bearing in 19.1** — a NEW symmetric `EncoderFilterCallbacks` extension lands. The brainstorm's CONDITIONAL hypothesis is empirically confirmed at SPEC time.
+
+Refined post-§5 LoC estimate: ~5500–7000 LoC production (filter package ~2500–3500 + `*ProcessorClient` bidi-stream wrapper ~250–400 + JSON codec ~400–700 + ADR-0174 callback-surface extension ~250–400 + ADR-0175 encode-side body-buffering primitive ~400–700 + two test-helpers + fixture drivers ~700–1100). **Well above the ADR-0045 1500-LoC trigger.** Combined task count estimated at ~35–45 across both sub-phases — crosses both ADR-0045 thresholds (~25 tasks, ~1500 LoC) EMPHATICALLY. Single-row landing is NOT viable.
+
+### Decision
+
+**Phase 19 is SPLIT into two sub-phases at the phase-19 SPEC commit, per ADR-0045 + `BOOTSTRAP_PROMPT.md` §6.2.** The split is **by feature-class** — the structurally clean cut RECOMMENDED by the BRAINSTORM §1.4 and confirmed by the empirical pin findings. Rationale for choosing split-by-feature-class over split-by-service-mode (the phase-18 precedent):
+
+- **Two framework deltas at distinct sub-phase boundaries.** ADR-0174 (encode-side callback symmetry) is needed for `response_attributes` population at the response_headers stage → lands at 19.1. ADR-0175 (encode-side body-buffering) is needed for `response_body_mode = BUFFERED` → lands at 19.2. Each sub-phase's framework lift is bounded and reviewable independently.
+- **gRPC is the "real" deployment shape for ext_proc.** The `http_service` arm is a proto-constrained-to-headers-only secondary mode (per `ExtProcHttpService.http_service` doc-comment). Splitting by service-mode would put the major surface (gRPC bidi-stream + body modes) in 19.2 and the minor (headers-only HTTP) in 19.1 — inverted from phase 18.x where the HTTP arm was the foundational larger half.
+- **Headers-stage MVP is operationally useful in itself.** 19.1 alone delivers a usable ext_proc filter (header injection, mutation, immediate_response deny, mode-override). 19.2 extends to body manipulation. Mirrors the phase-13 buffer + phase-14 compressor + phase-18.1 ext_authz pattern (foundational scaffold first, feature-extension second).
+- **The body-stage framework primitives (ADR-0175) land alongside their consumers** at 19.2, avoiding the "framework introduced at sub-phase N, first consumer at sub-phase N+M" anti-pattern.
+
+**Sub-phase scope:**
+
+- **19.1 (`http-filter-ext-proc-headers`)** — the foundational filter: the NEW `internal/filter/http/extproc/` package, the dual-mode `compiledConfig` envelope (BOTH `grpc_service` AND `http_service` arms ACTIVATED in 19.1 — body-mode arms PARSE-REJECT in 19.1 and 19.2 activates them), the bidi-stream framework primitive at `internal/grpcclient/` extension (ADR-0169), the JSON codec for `ProcessingRequest`/`ProcessingResponse` (ADR-0170 — filter-local), the headers stages (request_headers + response_headers), the per-stage `CommonResponse.header_mutation` application, the multi-stage `ImmediateResponse` deny path (request_headers + response_headers stages), the ProcessingMode state machine + mode-override re-eval, the `clear_route_cache` + `route_cache_action` precedence + `cb.ClearRouteCache()` reuse, the per-route 5th-canonical REUSE + SHARED-stats + the 9-counter filter stat surface, the error posture, the bidi-stream lifecycle, the async-resume outbound-call leg, boot-registration, the BOTH-DECODE-AND-ENCODE filter shape + `filterStats` + the deny-path `SendLocalReply` mechanism, **ADR-0174 (symmetric `EncoderFilterCallbacks` extension)**. 19.1-landing ADRs: ADR-0167 + ADR-0168 + ADR-0169 + ADR-0170 + ADR-0171 (header-mode portion) + ADR-0172 (header_mutation + ImmediateResponse-at-headers portion) + ADR-0173 + ADR-0174. Differential fixture `0022-http-ext-proc-grpc`. 24th fuzzer `FuzzExtProcConfigParse`.
+
+- **19.2 (`http-filter-ext-proc-body`)** — the body-stage extension: within the existing `internal/filter/http/extproc/` package, the body-stage activation (ADR-0168 §Decision AMENDMENT — body-mode PARSE-REJECT lift), the body-stage dispatch + `body_mutation` discipline (ADR-0172 body-mode AMENDMENT — body_mutation body/clear; request_body via ADR-0128 decode-side body-buffering reuse; response_body via NEW ADR-0175 encode-side body-buffering primitive; `CommonResponse.status = CONTINUE_AND_REPLACE` handling), the multi-stage `ImmediateResponse` extension to body stages (request_body + response_body stages), **ADR-0175 (NEW encode-side body-buffering framework primitive)**. 19.2-landing ADRs: ADR-0175 + ADR-0168 §Decision AMENDMENT + ADR-0171 body-mode AMENDMENT + ADR-0172 body-mode AMENDMENT. Differential fixture `0023-http-ext-proc-body`. 25th fuzzer `FuzzProcessingResponseMapping`.
+
+**19.1 ships first.** ROADMAP row `19` flips `planned → in-progress` at the phase-19 SPEC commit with `sub-phases: 19.1, 19.2`; row `19.1` is added `in-progress` (its SPEC is authored at this commit); row `19.2` is added `planned` (depends-on `19.1`; its SPEC is drafted at 19.2's lifecycle-state 1). The parent row `19` flips `in-progress → done` AT THE SAME COMMIT as `19.2`'s phase-done — the 19.2 phase-done commit closes both rows in one operation, and its commit-message body names both transitions for grep-verifiability (mirrors the phase-05/06/07/08/18 parent-rollup discipline).
+
+**SPEC-time ADR-count revision:** the BRAINSTORM §7 anticipated 7-9 ADRs (ADR-0167..ADR-0173 + CONDITIONAL ADR-0174/0175). This SPEC lands **10 ADRs total** (ADR-0167..ADR-0175 — both conditionals fire load-bearing per the SPEC-time scrape closure of §5.P11/§5.P12 — plus ADR-0176 the split-application ADR added per ADR-0044's SPEC-time-anticipation-revision discipline, mirroring phase-08 ADR-0084 + phase-18 ADR-0164). **Next-free ADR after phase 19 is ADR-0177.** NO ADR-0125 amendment paragraph (ADR-0173 records the explicit no-amendment 5th-canonical-REUSE decision — SECOND CONSECUTIVE §9 row after phase 18 to do so).
+
+### Consequences
+
+- **The phase-19 directory structure** is the parent `docs/envoy-go/phases/19-http-filter-ext-proc/` (BRAINSTORM.md + the parent master SPEC.md) + `docs/envoy-go/phases/19.1-http-filter-ext-proc-headers/` (full sub-phase SPEC.md authored at this commit; PLAN.md + PROGRESS.md + REVIEW.md follow) + `docs/envoy-go/phases/19.2-http-filter-ext-proc-body/` (sibling SPEC stub README.md authored at this commit; superseded by the full SPEC.md at 19.2's lifecycle-state 1). Mirrors the phase-08 + phase-18 structures.
+- **The next session is the phase-19.1 PLAN session** (next-skill `superpowers:writing-plans`) authoring `docs/envoy-go/phases/19.1-http-filter-ext-proc-headers/PLAN.md` from the 19.1 SPEC.
+- **The §9 HTTP filters family** gains rows 19.1 + 19.2 (flat per ADR-0106 — sub-phase rows get their own ROADMAP rows per the ADR-0045 + `BOOTSTRAP_PROMPT.md` §6 discipline). After 19.2's phase-done closes the parent row 19, the §9 family has 12 rows landed (07.1 + 09 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19); the next §9 family-row is numbered `20`.
+- **NO new splitting-discipline ADR** — ADR-0045 already authorizes the discipline; ADR-0176 is its documentation-of-application for phase 19 (the same role phase-08's ADR-0084 + phase-18's ADR-0164 played).
+
+Cross-references:
+
+- **ADR-0045** (surface-split release valve — the discipline this ADR applies).
+- **ADR-0044** (ADR-on-impl convention + SPEC-time-anticipation-revision — authorizes the 7-9 → 10 ADR-count revision).
+- **ADR-0005** §Decision 4 (BRAINSTORM/SPEC/PLAN/IMPL/REVIEW separate sessions — the 19.1 PLAN is the next session).
+- **ADR-0106** (§9 family-rows are flat top-level rows; sub-phase rows get their own rows).
+- **ADR-0084** (phase-08's documentation-of-application ADR — one of the precedents ADR-0176 mirrors).
+- **ADR-0164** (phase-18's documentation-of-application ADR — the closest precedent ADR-0176 mirrors).
+- **ADR-0167..ADR-0175** (the 9 BRAINSTORM-anticipated + SPEC-time-confirmed phase-19 ADRs the split distributes across 19.1 + 19.2).
+
+---
+
