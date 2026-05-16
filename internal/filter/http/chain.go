@@ -575,6 +575,51 @@ func (e *encoderCB) OverwriteBody(b []byte) {
 	e.c.encodeBodyOverridden = true
 }
 
+// The 6 reader methods below are the per-stream filter-facing accessors for
+// the ADR-0174 symmetric encoder-side extension of ADR-0165's callback-
+// surface family (phase-19.1 Task 5 — the ADR-0044 escape-valve firing at
+// SPEC time per BRAINSTORM §11 lesson (h); planner-time D10 settles 6
+// methods, NOT 7, DownstreamPrincipal staying decode-side-specific per
+// ADR-0144's framing). Each method returns the SAME chain field the
+// decoderCB readers at chain.go:524-546 return — verbatim, no copy, no
+// transformation. NO new chain fields, NO new seeding primitives, NO new
+// HCM dispatch wiring; the 6 chain fields are SET-once at HCM dispatch
+// BEFORE either decode or encode dispatch (the existing SetDownstreamRemoteAddr
+// / SetDownstreamLocalAddr / SetDownstreamTLSServerName /
+// SetDownstreamTLSPeerCertDER / SetDownstreamProtocol / SetListenerPrincipal
+// setters at chain.go:633+ are reused). Zero-value returns (nil / "")
+// mirror the chain field's documented zero-value semantics — see
+// FilterChain struct field comments.
+//
+// Per ADR-0174 §Decision. PRE-REQUISITE for phase-19.1 attributes.go (Task 9)
+// encoder-side response_attributes envelope population. Cross-phase reusable
+// for any future encode-side filter needing socket / TLS / listener-cert
+// state.
+
+func (e *encoderCB) DownstreamRemoteAddr() net.Addr {
+	return e.c.downstreamRemoteAddr
+}
+
+func (e *encoderCB) DownstreamLocalAddr() net.Addr {
+	return e.c.downstreamLocalAddr
+}
+
+func (e *encoderCB) DownstreamTLSServerName() string {
+	return e.c.downstreamTLSServerName
+}
+
+func (e *encoderCB) DownstreamTLSPeerCertDER() []byte {
+	return e.c.downstreamTLSPeerCertDER
+}
+
+func (e *encoderCB) DownstreamProtocol() string {
+	return e.c.downstreamProtocol
+}
+
+func (e *encoderCB) ListenerPrincipal() string {
+	return e.c.listenerPrincipal
+}
+
 // EncodeBodyOverride returns the registered encode-side body override (if any).
 // Returns (override, true) if a filter called cb.OverwriteBody during the
 // encode chain; (nil, false) otherwise. Callers (HCM dispatch) use this to

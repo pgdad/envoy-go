@@ -1804,3 +1804,265 @@ func TestDecoderCB_ListenerPrincipal_NoSeed_EmptyString(t *testing.T) {
 		t.Errorf("expected empty listenerPrincipal on no-seed chain; got %q", probe.listenerPrinc)
 	}
 }
+
+// --- ADR-0174 EncoderFilterCallbacks symmetric extension Group 12 tests ---
+//
+// Per planner-time decision D10 of phase-19.1 PLAN (ADR-0044 escape-valve
+// fires at SPEC time per BRAINSTORM §11 lesson (h)), 6 new
+// EncoderFilterCallbacks methods land at phase-19.1 Task 5 — the symmetric
+// mirror of ADR-0165's DecoderFilterCallbacks additions:
+//
+//   DownstreamRemoteAddr()       net.Addr
+//   DownstreamLocalAddr()        net.Addr
+//   DownstreamTLSServerName()    string
+//   DownstreamTLSPeerCertDER()   []byte
+//   DownstreamProtocol()         string
+//   ListenerPrincipal()          string
+//
+// The 6 chain fields ALREADY exist per ADR-0165 plumbing (SET-once at HCM
+// dispatch BEFORE either RunDecodeHeaders or RunEncodeHeaders dispatch); the
+// new *encoderCB reader methods consume the SAME chain fields verbatim. NO
+// new chain fields, NO new seeding primitives, NO new HCM dispatch wiring —
+// only the interface extension + reader methods.
+//
+// The Group 12 tests pin the round-trip (seed via SetX, observe via cb.X on
+// the encoder-side callback) plus the nil/empty fall-through (no seed → zero
+// value). The tests mirror the decoder-side Group 13 template above
+// verbatim, substituting RunEncodeHeaders for RunDecodeHeaders and
+// encoderCallbackProbe for callbackProbe.
+//
+// SPEC §14.1 names callbacks_test.go as the Group 12 location; this file
+// (chain_test.go) is the empirically-correct location to match the existing
+// ADR-0165 decoder-side template at chain_test.go:1618 — the PLAN's
+// File-structure table makes this departure explicit.
+
+// encoderCallbackProbe is a test-only StreamEncoderFilter that captures the
+// result of all 6 new ADR-0174 callback accessors during EncodeHeaders.
+// Mirrors callbackProbe verbatim with encoder-side substitutions.
+type encoderCallbackProbe struct {
+	cb             EncoderFilterCallbacks
+	remoteAddr     net.Addr
+	localAddr      net.Addr
+	tlsServerName  string
+	tlsPeerCertDER []byte
+	protocol       string
+	listenerPrinc  string
+	captured       bool
+}
+
+func (p *encoderCallbackProbe) EncodeHeaders(http.Header, bool) FilterHeadersStatus {
+	p.remoteAddr = p.cb.DownstreamRemoteAddr()
+	p.localAddr = p.cb.DownstreamLocalAddr()
+	p.tlsServerName = p.cb.DownstreamTLSServerName()
+	p.tlsPeerCertDER = p.cb.DownstreamTLSPeerCertDER()
+	p.protocol = p.cb.DownstreamProtocol()
+	p.listenerPrinc = p.cb.ListenerPrincipal()
+	p.captured = true
+	return Continue
+}
+func (p *encoderCallbackProbe) EncodeData([]byte, bool) FilterDataStatus { return DataContinue }
+func (p *encoderCallbackProbe) EncodeTrailers(http.Header) FilterTrailersStatus {
+	return TrailersContinue
+}
+func (p *encoderCallbackProbe) SetEncoderCallbacks(cb EncoderFilterCallbacks) { p.cb = cb }
+func (p *encoderCallbackProbe) OnDestroy()                                    {}
+
+// newEncoderCallbackProbeChain wires a single-filter chain whose only filter
+// is the supplied encoderCallbackProbe (encode-only, no decode side). Mirrors
+// newCallbackProbeChain.
+func newEncoderCallbackProbeChain(p *encoderCallbackProbe) *FilterChain {
+	return NewFilterChain([]HTTPFilter{{Name: "probe", Encoder: p}}, nil)
+}
+
+func TestEncoderCB_DownstreamRemoteAddr_SeededViaSetDownstreamRemoteAddr_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamRemoteAddr seeds the chain with the downstream
+	// conn's RemoteAddr (per ADR-0165 + ADR-0174). The encoder-side accessor
+	// returns the same value the encoder-side filter callbacks see verbatim —
+	// no transformation in the plumbing path (mirrors ADR-0165's decoder-side
+	// seed-and-read).
+	seed := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 7), Port: 51514}
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	chain.SetDownstreamRemoteAddr(seed)
+	terminated, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunEncodeHeaders to terminate")
+	}
+	if !probe.captured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.remoteAddr != seed {
+		t.Errorf("expected remoteAddr == seed (%v); got %v", seed, probe.remoteAddr)
+	}
+}
+
+func TestEncoderCB_DownstreamRemoteAddr_NotSeeded_ReturnsNil(t *testing.T) {
+	// Default chain (no SetDownstreamRemoteAddr call) → accessor returns nil.
+	// Mirrors the plaintext / synthetic-stream fallback per ADR-0165 (the
+	// chain-field zero-value semantics apply identically to the encoder-side
+	// reader).
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	_, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.remoteAddr != nil {
+		t.Errorf("expected nil remoteAddr on no-seed chain; got %v", probe.remoteAddr)
+	}
+}
+
+func TestEncoderCB_DownstreamLocalAddr_SeededViaSetDownstreamLocalAddr_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamLocalAddr seeds the chain with the downstream
+	// conn's LocalAddr (the listener's bound address per ADR-0165 + ADR-0174).
+	seed := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 18443}
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	chain.SetDownstreamLocalAddr(seed)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.localAddr != seed {
+		t.Errorf("expected localAddr == seed (%v); got %v", seed, probe.localAddr)
+	}
+}
+
+func TestEncoderCB_DownstreamLocalAddr_NotSeeded_ReturnsNil(t *testing.T) {
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if probe.localAddr != nil {
+		t.Errorf("expected nil localAddr on no-seed chain; got %v", probe.localAddr)
+	}
+}
+
+func TestEncoderCB_DownstreamTLSServerName_SeededViaSetDownstreamTLSServerName_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamTLSServerName seeds the chain with the downstream
+	// TLS ConnectionState.ServerName (SNI per ADR-0165 + ADR-0174). Empty for
+	// plaintext or SNI-absent handshakes.
+	seed := "alpha.example.com"
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	chain.SetDownstreamTLSServerName(seed)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.tlsServerName != seed {
+		t.Errorf("expected tlsServerName=%q; got %q", seed, probe.tlsServerName)
+	}
+}
+
+func TestEncoderCB_DownstreamTLSServerName_NotSeeded_ReturnsEmpty(t *testing.T) {
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if probe.tlsServerName != "" {
+		t.Errorf("expected empty tlsServerName on no-seed chain; got %q", probe.tlsServerName)
+	}
+}
+
+func TestEncoderCB_DownstreamTLSPeerCertDER_SeededViaSetDownstreamTLSPeerCertDER_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamTLSPeerCertDER seeds the chain with the raw DER
+	// bytes of the downstream client's leaf certificate (per ADR-0165 +
+	// ADR-0174). nil for plaintext / no-client-cert connections.
+	seed := []byte{0x30, 0x82, 0x01, 0x22, 0x30, 0x0d, 0x06, 0x09, 0xde, 0xad}
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	chain.SetDownstreamTLSPeerCertDER(seed)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if !bytes.Equal(probe.tlsPeerCertDER, seed) {
+		t.Errorf("expected tlsPeerCertDER=%x; got %x", seed, probe.tlsPeerCertDER)
+	}
+}
+
+func TestEncoderCB_DownstreamTLSPeerCertDER_NotSeeded_ReturnsNil(t *testing.T) {
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if probe.tlsPeerCertDER != nil {
+		t.Errorf("expected nil tlsPeerCertDER on no-seed chain; got %x", probe.tlsPeerCertDER)
+	}
+}
+
+func TestEncoderCB_DownstreamProtocol_SeededViaSetDownstreamProtocol_ReturnsSeed(t *testing.T) {
+	// HCM-side SetDownstreamProtocol seeds the chain with "HTTP/1.1" (H1
+	// dispatch) or "HTTP/2" (H2 dispatch) per ADR-0165 + ADR-0174.
+	seed := "HTTP/2"
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	chain.SetDownstreamProtocol(seed)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.protocol != seed {
+		t.Errorf("expected protocol=%q; got %q", seed, probe.protocol)
+	}
+}
+
+func TestEncoderCB_DownstreamProtocol_NotSeeded_ReturnsEmpty(t *testing.T) {
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if probe.protocol != "" {
+		t.Errorf("expected empty protocol on no-seed chain; got %q", probe.protocol)
+	}
+}
+
+func TestEncoderCB_ListenerPrincipal_SeededViaSetListenerPrincipal_ReturnsSeed(t *testing.T) {
+	// HCM-side SetListenerPrincipal seeds the chain with the listener's leaf
+	// cert SAN[0]/CN (the server-cert principal — distinct from
+	// DownstreamPrincipal which is the client-cert SAN) per ADR-0165 +
+	// ADR-0174. Empty for plaintext listeners.
+	seed := "spiffe://example.com/listener-a"
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	chain.SetListenerPrincipal(seed)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !probe.captured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.listenerPrinc != seed {
+		t.Errorf("expected listenerPrincipal=%q; got %q", seed, probe.listenerPrinc)
+	}
+}
+
+func TestEncoderCB_ListenerPrincipal_NotSeeded_ReturnsEmpty(t *testing.T) {
+	probe := &encoderCallbackProbe{}
+	chain := newEncoderCallbackProbeChain(probe)
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if probe.listenerPrinc != "" {
+		t.Errorf("expected empty listenerPrincipal on no-seed chain; got %q", probe.listenerPrinc)
+	}
+}

@@ -1,0 +1,188 @@
+# Differential expectations for fixture 0022-http-ext-proc-grpc.
+# Phase 19.1 — headers-only ext_proc. Per SPEC §7.1 (8-scenario matrix).
+#
+# Per-scenario allow-list + counter-delta map + documented divergence window
+# against reference Envoy v1.37.2.
+#
+# ---------------------------------------------------------------------------
+# Scenarios (per SPEC §7.1)
+# ---------------------------------------------------------------------------
+scenarios:
+  - id: 1
+    name: "gRPC allow + request-header set"
+    listener: l_test_a
+    path: /scenario1
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta:
+      streams_started: 1
+      stream_msgs_sent: 2
+      stream_msgs_received: 2
+      streams_closed: 1
+    notes: |
+      processor returns HeadersResponse{CommonResponse{header_mutation{set_headers}}}
+      at request_headers stage; CommonResponse{} (continue) at response_headers
+      stage. The injected header arrives at the backend.
+
+  - id: 2
+    name: "gRPC immediate_response at request_headers"
+    listener: l_test_a
+    path: /scenario2
+    expect_status: 403
+    expect_body: "denied"
+    counter_delta:
+      streams_started: 1
+      stream_msgs_sent: 1
+      stream_msgs_received: 1
+      streams_closed: 1
+    notes: |
+      processor returns ImmediateResponse at request_headers stage with
+      status 403 + body "denied" + header mutation. The filter
+      short-circuits via SendLocalReply.
+
+  - id: 3
+    name: "gRPC response_headers mutation"
+    listener: l_test_a
+    path: /scenario3
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta:
+      streams_started: 1
+      stream_msgs_sent: 2
+      stream_msgs_received: 2
+      streams_closed: 1
+    notes: |
+      processor returns CommonResponse{} at request_headers; returns
+      CommonResponse{header_mutation{set_headers}} at response_headers.
+      Mutation visible in downstream response headers.
+
+  - id: 4
+    name: "gRPC mode_override mid-stream (response_header_mode: SKIP)"
+    listener: l_test_a
+    path: /scenario4
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta:
+      streams_started: 1
+      stream_msgs_sent: 1
+      stream_msgs_received: 1
+      streams_closed: 1
+    notes: |
+      processor returns CommonResponse{} + mode_override with
+      response_header_mode: SKIP. response_headers stage is SKIPPED
+      (no second ProcessingRequest sent).
+
+  - id: 5
+    name: "gRPC failure_mode_allow (processor down)"
+    listener: l_test_b
+    path: /scenario5
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta:
+      streams_failed: 1
+      failure_mode_allowed: 1
+    notes: |
+      Driver stops the processor server BEFORE this request. gRPC dial
+      fails → dispError → failure_mode_allow:true → request proceeds to
+      backend. streams_failed AND failure_mode_allowed both increment.
+
+  - id: 6
+    name: "HTTP allow (headers-only)"
+    listener: l_test_c
+    path: /scenario6
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta:
+      stream_msgs_sent: 2
+      stream_msgs_received: 2
+    notes: |
+      HTTP-service mode. Per-stage POST/Response round-trips against the
+      HTTP processor endpoint. JSON wire-shape per ADR-0170 protojson
+      defaults (§19.P8 closure scenario).
+
+  - id: 7
+    name: "per-route disabled"
+    listener: l_test_a
+    path: /disabled
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta: {}
+    notes: |
+      ExtProcPerRoute{disabled:true} bypasses the filter entirely. NO
+      ext_proc counter increments. Per-route 5th-canonical disabled arm
+      (REUSED per ADR-0173 — no new canonical).
+
+  - id: 8
+    name: "per-route processing_mode override (request_header_mode: SKIP)"
+    listener: l_test_a
+    path: /override
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta:
+      streams_started: 1
+      stream_msgs_sent: 1
+      stream_msgs_received: 1
+      streams_closed: 1
+    notes: |
+      ExtProcPerRoute{overrides{processing_mode{request_header_mode:SKIP,
+      response_header_mode:SEND}}}. request_headers SKIPPED;
+      response_headers SENT. Drives the §19.P7 cache-on-first-use closure:
+      the per-route config resolved at DecodeHeaders time stays in effect
+      for the entire bidi-stream's lifetime even across ClearRouteCache
+      invocations.
+
+# ---------------------------------------------------------------------------
+# Documented divergence window (RATIFIED-PENDING-IMPL-TIME pins + permanent
+# deferrals).
+# ---------------------------------------------------------------------------
+divergence_window:
+  # Per parent §5.P11 — response_code_details emission is DEFERRED in 19.1.
+  # The ImmediateResponse.details field is silent-dropped on the envoy-go side.
+  - field: ImmediateResponse.details
+    disposition: silent-dropped envoy-go side; reference Envoy populates
+      %RESPONSE_CODE_DETAILS% access-log token. Documented per parent §5.P11
+      forward-pointer.
+
+  # 19.1 PARSE-REJECTs per ADR-0168 §Decision:
+  - field: ProcessingMode body/trailer/STREAMED variants
+    disposition: PARSE-REJECT in 19.1 (body lifts at 19.2 per AMENDMENT).
+  - field: GoogleGrpc arm
+    disposition: PARSE-REJECT permanently (envoy-go uses google.golang.org/grpc
+      directly).
+  - field: CommonResponse status CONTINUE_AND_REPLACE
+    disposition: classified as spuriousMsgsReceived++ in 19.1 (body-mode-dependent;
+      lifts at 19.2).
+
+  # Silent-ignored fields per parent §8 (dynamic-metadata family etc.):
+  - field: metadata_options / filter_metadata / ProcessingResponse.dynamic_metadata
+    disposition: SILENT-IGNORED MVP. Forward-pointer to dynamic-metadata phase.
+  - field: HttpHeaders.attributes (deprecated [#not-implemented-hide:])
+    disposition: SILENT-IGNORED per proto convention.
+  - field: ExtProcOverrides.{async_mode, request_attributes, response_attributes,
+      metadata_options, grpc_initial_metadata}
+    disposition: SILENT-IGNORED per ADR-0173 (the 3 [#not-implemented-hide:]
+      fields + dynamic-metadata + initial-metadata families).
+  - field: GrpcService.{initial_metadata, retry_policy}
+    disposition: SILENT-IGNORED MVP.
+
+# ---------------------------------------------------------------------------
+# RATIFIED-PENDING-IMPL-TIME pin closures captured by the driver.
+# Per SPEC §15 item 9 + 10. Outputs recorded verbatim in PROGRESS.md Task 13
+# entry.
+# ---------------------------------------------------------------------------
+pin_closures:
+  - pin: §19.P4
+    description: "9-counter stat-surface roster + canonical names"
+    closure_method: driver scrapes /stats/prometheus from both sides
+      post-scenario-1; cross-side delta equivalence + 9-counter hypothesis
+      verbatim match (RATIFIED) OR ADR-0173 §Decision in-place AMENDMENT.
+  - pin: §19.P7
+    description: "cache-on-first-use per-route after ClearRouteCache"
+    closure_method: scenario 8 carries the mid-stream clear_route_cache
+      processor response; assert the per-route stays at DecodeHeaders-time
+      resolved value (RATIFIED) OR ADR-0173 §Decision AMENDMENT.
+  - pin: §19.P8
+    description: "JSON codec wire-shape vs protojson defaults"
+    closure_method: scenario 6 driver captures one ProcessingRequest +
+      ProcessingResponse pair from both sides; byte-equivalent JSON
+      rendering (RATIFIED) OR ADR-0170 §Decision in-place AMENDMENT.

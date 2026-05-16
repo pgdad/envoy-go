@@ -307,6 +307,24 @@ const (
 	// runner's in-process accept counter is NOT incremented. Introduced by
 	// phase 18.2 Task 9 / fixture 0021.
 	HTTPExtAuthzGRPC BackendKind = 18
+	// HTTPExtProcGRPC reuses the existing echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for the upstream route
+	// + the NEW extprocgrpc helper at test/helpers/extprocgrpc/ for the
+	// in-process bidi-stream gRPC processor server. 2-cluster topology (three
+	// HCM listeners l_test_a/b/c plaintext with `ext_proc → router` filter
+	// chain + cluster c_backend → echobackend subprocess + cluster c_ext_proc
+	// → extprocgrpc subprocess with `http2_protocol_options: {}`). No TLS —
+	// phase 19.1 fixture is HTTP/1.1 plaintext downstream + plaintext h2c
+	// processor cluster per SPEC §7.2 + parent §8 item 17 (TLS-fronted
+	// processor cluster DEFERRED). The extprocgrpc helper is lifecycle-managed
+	// BY THE DRIVER (it needs the per-scenario Script registrations); this
+	// switch-case only allocates the upstream echo backend. Scenario 5
+	// (failure_mode_allow:true) stops the extprocgrpc server before the
+	// request to force a transport failure. Because both helpers run as
+	// subprocesses (echobackend) or in-process (extprocgrpc), the runner's
+	// in-process accept counter is NOT incremented. Introduced by phase 19.1
+	// Task 13 / fixture 0022.
+	HTTPExtProcGRPC BackendKind = 19
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

@@ -181,6 +181,104 @@ type EncoderFilterCallbacks interface {
 	// envoy-go (phase 14; symmetric to phase-13 ADR-0128 decode-side
 	// primitives).
 	OverwriteBody(b []byte)
+
+	// The 6 methods below are the symmetric encoder-side mirror of the
+	// ADR-0165 DecoderFilterCallbacks extension. They land at phase-19.1
+	// Task 5 per ADR-0174 (the ADR-0044 escape-valve firing at SPEC time per
+	// BRAINSTORM §11 lesson (h); planner-time decision D10 settles 6 — NOT
+	// 7 — methods, DownstreamPrincipal staying decode-side-specific per
+	// ADR-0144's framing).
+	//
+	// The 6 underlying chain fields ALREADY exist per ADR-0165's plumbing
+	// (downstreamRemoteAddr / downstreamLocalAddr / downstreamTLSServerName /
+	// downstreamTLSPeerCertDER / downstreamProtocol / listenerPrincipal); HCM
+	// dispatch SETs them ONCE at chain build time BEFORE either RunDecodeHeaders
+	// OR RunEncodeHeaders dispatch via the existing SetX primitives. The
+	// encoder-side reader methods consume the SAME chain fields the decoder-
+	// side accessors consume — no new chain plumbing, no new seeding primitive,
+	// no new HCM dispatch wiring. ADR-0071's chain-ownership invariant
+	// continues to apply: the chain owns the fields, the callbacks are read-
+	// only consumers, and the read happens after the SET completes (no race
+	// surface introduced).
+	//
+	// PRE-REQUISITE for the ext_proc response_attributes envelope at the
+	// response_headers stage (phase-19.1 attributes.go Task 9 — encoder-side
+	// consumption from the ext_proc filter's EncodeHeaders callback). Cross-
+	// phase reusable: any future encode-side filter that needs socket / TLS /
+	// listener state (response-mutating filters, response-stage-attribute-
+	// emitting filters) consumes the same accessor surface without re-paying
+	// the plumbing cost.
+
+	// DownstreamRemoteAddr returns the downstream client connection's remote
+	// address (net.Addr; the IP + port of the connecting peer). Returns nil
+	// for synthetic streams (test harnesses that bypass the HCM dispatch
+	// site without seeding the chain). HCM dispatch seeds the field at chain
+	// build time from the per-connection net.Conn.RemoteAddr() BEFORE
+	// RunDecodeHeaders / RunEncodeHeaders, so per-stream callbacks observe a
+	// stable address for the request lifetime.
+	//
+	// Per ADR-0174 §Decision (the symmetric encoder-side mirror of ADR-0165).
+	// Cross-phase reusable by future encode-side filters that need socket-
+	// level state.
+	DownstreamRemoteAddr() net.Addr
+
+	// DownstreamLocalAddr returns the downstream client connection's local
+	// address (net.Addr; the listener's bound IP + port that accepted the
+	// conn). Returns nil for synthetic streams. Seeding discipline mirrors
+	// DownstreamRemoteAddr: set once at HCM dispatch from
+	// net.Conn.LocalAddr() before RunDecodeHeaders / RunEncodeHeaders.
+	//
+	// Per ADR-0174 §Decision. Cross-phase reusable.
+	DownstreamLocalAddr() net.Addr
+
+	// DownstreamTLSServerName returns the SNI (Server Name Indication) the
+	// downstream client presented during the TLS handshake, as observed via
+	// tls.ConnectionState.ServerName. Returns the empty string for plaintext
+	// connections, for TLS handshakes without SNI (rare in practice), or for
+	// synthetic streams.
+	//
+	// Per ADR-0174 §Decision. Cross-phase reusable; populates ext_proc
+	// response_attributes envelope's tls_session.sni field at the response_
+	// headers stage.
+	DownstreamTLSServerName() string
+
+	// DownstreamTLSPeerCertDER returns the raw DER bytes of the downstream
+	// client's leaf X.509 certificate (PeerCertificates[0].Raw on a server-
+	// side *tls.Conn). Returns nil for plaintext connections, for TLS
+	// connections with no client cert, or for synthetic streams. The
+	// returned slice is read-only — callers MUST NOT mutate the underlying
+	// bytes.
+	//
+	// Per ADR-0174 §Decision. Cross-phase reusable; populates ext_proc
+	// response_attributes envelope's source.certificate field when
+	// configured by the response_attributes allowlist.
+	DownstreamTLSPeerCertDER() []byte
+
+	// DownstreamProtocol returns a canonical short string identifying the
+	// HTTP protocol version used for the downstream connection:
+	// "HTTP/1.1" for the H1 dispatch path; "HTTP/2" for the H2 dispatch path.
+	// Returns the empty string for synthetic streams that did not exercise
+	// HCM dispatch. Seeded once per chain at HCM dispatch time.
+	//
+	// Per ADR-0174 §Decision. Cross-phase reusable; populates ext_proc
+	// response_attributes envelope's request.http.protocol field.
+	DownstreamProtocol() string
+
+	// ListenerPrincipal returns the listener's TLS server-cert principal as
+	// extracted from the listener's *stdtls.Config.Certificates[0] leaf cert
+	// (first URI SAN, then first DNS SAN, then Subject DN Common Name —
+	// mirrors the DownstreamPrincipal extraction ordering on the listener-
+	// cert side). Returns the empty string for plaintext listeners (no TLS
+	// transport_socket on the selected filter_chain) or for synthetic
+	// streams. The plumbing pre-extracts the principal at listener-build
+	// time and threads the string through ListenerCtx → *Filter →
+	// chain.SetListenerPrincipal — distinct from DownstreamPrincipal which
+	// is the CLIENT-cert principal (and remains decoder-side-only per
+	// ADR-0144's framing + ADR-0174 planner-time D10).
+	//
+	// Per ADR-0174 §Decision. Cross-phase reusable; populates ext_proc
+	// response_attributes envelope's destination.principal field.
+	ListenerPrincipal() string
 }
 
 // Compile-time assertion: a real concrete proto type satisfies proto.Message,

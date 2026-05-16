@@ -942,6 +942,17 @@ func (e *fakeEncoderCB) OverwriteBody(b []byte) {
 	e.overwriteBuffer = append(e.overwriteBuffer[:0], b...)
 }
 
+// ADR-0174 callback-surface extension stubs (phase-19.1 Task 5 — symmetric
+// encoder-side mirror of ADR-0165's 6 decoder-side accessors). Zero-value
+// returns satisfy the extended EncoderFilterCallbacks interface required by
+// fl.SetEncoderCallbacks; bandwidth_limit does not consume the accessors.
+func (e *fakeEncoderCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (e *fakeEncoderCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (e *fakeEncoderCB) DownstreamTLSServerName() string  { return "" }
+func (e *fakeEncoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (e *fakeEncoderCB) DownstreamProtocol() string       { return "" }
+func (e *fakeEncoderCB) ListenerPrincipal() string        { return "" }
+
 // makeFilterWithModeBothCB constructs a *filter wired with BOTH a
 // fakeDecoderCB and a fakeEncoderCB. Required for Group 5 since EncodeData
 // needs the responseActive cascade populated via DecodeHeaders FIRST + the

@@ -50,6 +50,17 @@ func (c *fakeEncoderCB) EncodeData([]byte, bool)         {}
 func (c *fakeEncoderCB) EncodeTrailers(http.Header)      {}
 func (c *fakeEncoderCB) OverwriteBody([]byte)            {}
 
+// ADR-0174 callback-surface extension stubs (phase-19.1 Task 5 — the
+// symmetric encoder-side mirror of ADR-0165's 6 decoder-side accessors).
+// Zero-value returns keep the existing TestEncoderFilterCallbacks_Compile
+// compile-time conformance assertion green.
+func (c *fakeEncoderCB) DownstreamRemoteAddr() net.Addr   { return nil }
+func (c *fakeEncoderCB) DownstreamLocalAddr() net.Addr    { return nil }
+func (c *fakeEncoderCB) DownstreamTLSServerName() string  { return "" }
+func (c *fakeEncoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
+func (c *fakeEncoderCB) DownstreamProtocol() string       { return "" }
+func (c *fakeEncoderCB) ListenerPrincipal() string        { return "" }
+
 func TestEncoderFilterCallbacks_Compile(t *testing.T) {
 	var _ EncoderFilterCallbacks = (*fakeEncoderCB)(nil)
 }

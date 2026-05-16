@@ -44,6 +44,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0019-http-jwt-authn/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0020-http-ext-authz-http/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0021-http-ext-authz-grpc/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0022-http-ext-proc-grpc/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -460,6 +461,36 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// of the rollout at Task 9 so the BackendKind dispatch is
 			// complete — Task 10 lands the real driver.go alongside the stub
 			// init.go this switch-case currently fires against.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPExtProcGRPC:
+			// Fixture 0022-http-ext-proc-grpc (phase 19.1) reuses the SHARED
+			// echobackend binary (phase-14 Task 10) for the upstream route
+			// (cluster c_backend). The in-process bidi-stream gRPC processor
+			// server (test/helpers/extprocgrpc/) is lifecycle-managed BY THE
+			// DRIVER (Task 13) because it needs per-scenario Script
+			// registrations; this switch-case only allocates the upstream
+			// echo backend. Plaintext-only per SPEC §7.2 + parent §8 item 17
+			// (no TLS in phase 19.1 downstream + h2c-plaintext processor
+			// cluster). Because the echo backend runs as a subprocess and the
+			// extprocgrpc helper runs in-process, the runner's in-process
+			// accept counter is NOT incremented. Scenario 5 (failure_mode_allow)
+			// stops the extprocgrpc server before the request.
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)
