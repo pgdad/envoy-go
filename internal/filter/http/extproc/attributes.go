@@ -282,6 +282,175 @@ func buildResponseHeadersProcessingRequest(
 }
 
 // ---------------------------------------------------------------------------
+// buildRequestBodyProcessingRequest — decode-side body stage per SPEC §6.5 +
+// §6.6 + planner-time D5 (Task 5).
+// ---------------------------------------------------------------------------
+
+// buildRequestBodyProcessingRequest constructs the *ProcessingRequest sent at
+// the request_body stage. Populates the request_body oneof with the
+// HttpBody{body, end_of_stream} carrier + an attributes envelope per
+// planner-time D5 — header-stage SUPERSET (same CEL-attribute-name → accessor
+// mapping the request_headers stage carries; reads per-stream state from
+// f.dcb via the same ADR-0165 + ADR-0144 closures used by
+// buildRequestHeadersProcessingRequest) PLUS the body-stage-natural
+// `request.size` attribute populated from `int64(len(body))` (per planner-time
+// D5; populated accurately from the body bytes rather than Content-Length-
+// derived — the header-stage envelope cannot supply this since it has no
+// access to the body buffer).
+//
+// The exact body-stage attribute roster crystallizes empirically at Task 9
+// fixture-harness scrape against reference Envoy v1.37.2's CEL attribute
+// registry; this Task 5 lands the PLAN-time hypothesis (header-stage roster
+// + `request.size`). If the Task 9 scrape surfaces additional body-stage-only
+// attributes (e.g. hypothetical `request.body_md5`), the
+// buildBodyAttributeEnvelope helper below extends per the Task 9 PLAN Step 5.
+//
+// Per ADR-0167: f is non-nil on the decode side. f.dcb nil-tolerance carries
+// from the header-stage builder unchanged (the helper is pure-function-
+// testable via the buildAttributeEnvelope direct call path).
+func buildRequestBodyProcessingRequest(
+	f *filter,
+	body []byte,
+	endStream bool,
+	allowlist []string,
+) *extprocsvcv3.ProcessingRequest {
+	req := &extprocsvcv3.ProcessingRequest{
+		Request: &extprocsvcv3.ProcessingRequest_RequestBody{
+			RequestBody: &extprocsvcv3.HttpBody{
+				Body:        body,
+				EndOfStream: endStream,
+			},
+		},
+	}
+
+	// Bind the per-side accessor closures via f.dcb. Identical to the closure
+	// set used by buildRequestHeadersProcessingRequest — the body-stage
+	// envelope MIRRORS the header-stage roster per D5 SUPERSET.
+	dcb := f.dcb
+	envelope := buildBodyAttributeEnvelope(allowlist,
+		func() net.Addr {
+			if dcb == nil {
+				return nil
+			}
+			return dcb.DownstreamRemoteAddr()
+		},
+		func() net.Addr {
+			if dcb == nil {
+				return nil
+			}
+			return dcb.DownstreamLocalAddr()
+		},
+		func() string {
+			if dcb == nil {
+				return ""
+			}
+			return dcb.DownstreamTLSServerName()
+		},
+		func() string {
+			if dcb == nil {
+				return ""
+			}
+			return dcb.DownstreamProtocol()
+		},
+		func() string {
+			if dcb == nil {
+				return ""
+			}
+			return dcb.ListenerPrincipal()
+		},
+		func() string {
+			if dcb == nil {
+				return ""
+			}
+			return sourcePrincipalFirstOrEmpty(dcb.DownstreamPrincipal())
+		},
+		"request.size",
+		int64(len(body)),
+	)
+	if len(envelope) > 0 {
+		req.Attributes = envelope
+	}
+	return req
+}
+
+// ---------------------------------------------------------------------------
+// buildResponseBodyProcessingRequest — encode-side body stage per SPEC §6.5 +
+// §6.6 + planner-time D5 (Task 5).
+// ---------------------------------------------------------------------------
+
+// buildResponseBodyProcessingRequest constructs the *ProcessingRequest sent at
+// the response_body stage. Symmetric to the decode-side body-stage helper —
+// reads per-stream state from f.ecb (the ADR-0174 6-method encoder-side
+// accessor surface) + populates `response.size` from `int64(len(body))`.
+//
+// **D10 hypothesis HELD**: the encoder-side accessor surface OMITS
+// DownstreamPrincipal (no 7th method on EncoderFilterCallbacks per ADR-0174
+// §Decision). The `source.principal` attribute closure returns "" — gated
+// by the empty-value-skip discipline in buildAttributeEnvelope below, the
+// attribute is SKIPPED from the envelope. Closure of the D10 hypothesis fires
+// at Task 9 fixture-harness scrape per parent §5.P4-class.
+func buildResponseBodyProcessingRequest(
+	f *filter,
+	body []byte,
+	endStream bool,
+	allowlist []string,
+) *extprocsvcv3.ProcessingRequest {
+	req := &extprocsvcv3.ProcessingRequest{
+		Request: &extprocsvcv3.ProcessingRequest_ResponseBody{
+			ResponseBody: &extprocsvcv3.HttpBody{
+				Body:        body,
+				EndOfStream: endStream,
+			},
+		},
+	}
+
+	ecb := f.ecb
+	envelope := buildBodyAttributeEnvelope(allowlist,
+		func() net.Addr {
+			if ecb == nil {
+				return nil
+			}
+			return ecb.DownstreamRemoteAddr()
+		},
+		func() net.Addr {
+			if ecb == nil {
+				return nil
+			}
+			return ecb.DownstreamLocalAddr()
+		},
+		func() string {
+			if ecb == nil {
+				return ""
+			}
+			return ecb.DownstreamTLSServerName()
+		},
+		func() string {
+			if ecb == nil {
+				return ""
+			}
+			return ecb.DownstreamProtocol()
+		},
+		func() string {
+			if ecb == nil {
+				return ""
+			}
+			return ecb.ListenerPrincipal()
+		},
+		// D10: encoder-side has NO DownstreamPrincipal accessor. The closure
+		// returns "" verbatim — the empty-value-skip discipline silently
+		// drops the `source.principal` attribute even when listed in the
+		// allowlist.
+		func() string { return "" },
+		"response.size",
+		int64(len(body)),
+	)
+	if len(envelope) > 0 {
+		req.Attributes = envelope
+	}
+	return req
+}
+
+// ---------------------------------------------------------------------------
 // buildAttributeEnvelope — pluggable-accessor envelope builder per SPEC §6.6.
 // ---------------------------------------------------------------------------
 
@@ -374,6 +543,83 @@ func buildAttributeEnvelope(
 		default:
 			// Unrecognized attribute name — silently dropped (forward-
 			// compat per parent §5.P4-class).
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// buildBodyAttributeEnvelope — body-stage wrapper per planner-time D5 (Task 5).
+// ---------------------------------------------------------------------------
+
+// buildBodyAttributeEnvelope is the body-stage analog of buildAttributeEnvelope.
+// Delegates to buildAttributeEnvelope for the 7 header-stage CEL attributes
+// (the D5 SUPERSET inheritance — same CEL-attribute-name → accessor mapping)
+// and ADDS the body-stage-natural numeric attribute named by `bodySizeAttrName`
+// (= "request.size" on the decode side, "response.size" on the encode side)
+// populated from `bodySize` (= int64(len(body)) at the call site).
+//
+// **Empty-body populate property**: the body-size attribute populates as 0
+// for an empty body (bodySize == 0). The header-stage empty-value-skip
+// discipline does NOT apply to the body-size attribute — a numeric 0 is a
+// SUBSTANTIVE value ("this stage carried an empty body" is information-
+// bearing per D5, distinct from "the accessor returned no value"). The
+// attribute is therefore populated whenever the allowlist lists it, regardless
+// of body length.
+//
+// **CEL numeric scalar encoding**: the body-size attribute value is wrapped
+// in a `*structpb.Struct{fields: {"value": <NumberValue>}}` shape. structpb
+// has no native int64 scalar — the wire encoding settles a `NumberValue`
+// (float64-typed) at 19.2 per the proto convention. Closure at Task 9 fixture
+// scrape against reference Envoy v1.37.2 (a divergent encoding would adjust
+// the scalarNumberStruct helper below).
+//
+// **Wrapper choice rationale (Task 5 PLAN §"How to handle request.size/
+// response.size")**: keeping buildAttributeEnvelope's signature unchanged
+// (NOT adding a 7th bodySizeFn closure parameter) preserves the 19.1
+// header-stage call sites + the 5 existing TestBuildAttributeEnvelope_* tests
+// unchanged. The body-stage wrapper isolates the body-stage-specific
+// attribute(s) cleanly + future-proofs for the Task 9 fixture-scrape
+// extension (additional body-stage-only attributes — e.g. hypothetical
+// `request.body_md5` — land here without rippling to the header-stage
+// builder's call sites).
+func buildBodyAttributeEnvelope(
+	allowlist []string,
+	addressFn func() net.Addr,
+	localAddressFn func() net.Addr,
+	tlsServerNameFn func() string,
+	protocolFn func() string,
+	listenerPrincFn func() string,
+	sourcePrincFn func() string,
+	bodySizeAttrName string,
+	bodySize int64,
+) map[string]*structpb.Struct {
+	// Delegate to the header-stage envelope builder for the 7 SUPERSET
+	// attributes (per D5 inheritance).
+	out := buildAttributeEnvelope(allowlist,
+		addressFn,
+		localAddressFn,
+		tlsServerNameFn,
+		protocolFn,
+		listenerPrincFn,
+		sourcePrincFn,
+	)
+
+	// Add the body-stage-natural body-size attribute if listed in the
+	// allowlist. The numeric 0 case populates (substantive empty-body
+	// signal); the header-stage empty-value-skip discipline does not apply
+	// to the body-size attribute per the GoDoc above.
+	for _, name := range allowlist {
+		if name == bodySizeAttrName {
+			if out == nil {
+				out = make(map[string]*structpb.Struct, 1)
+			}
+			out[bodySizeAttrName] = scalarNumberStruct(bodySize)
+			break
 		}
 	}
 
@@ -493,6 +739,22 @@ func scalarStringStruct(s string) *structpb.Struct {
 	return &structpb.Struct{
 		Fields: map[string]*structpb.Value{
 			"value": structpb.NewStringValue(s),
+		},
+	}
+}
+
+// scalarNumberStruct wraps an int64 scalar into the
+// `*structpb.Struct{fields: {"value": <NumberValue>}}` shape used by the
+// body-stage numeric attributes (`request.size` / `response.size`). structpb
+// has no native int64 scalar — the wire encoding settles a `NumberValue`
+// (float64-typed) at 19.2 per the proto convention. Closure at Task 9 fixture
+// scrape against reference Envoy v1.37.2's CEL attribute registry; a
+// divergent reference-Envoy encoding (e.g. a wrapped `int64` Struct field)
+// would adjust this helper in-place at Task 9 per the PLAN Task 9 Step 5.
+func scalarNumberStruct(n int64) *structpb.Struct {
+	return &structpb.Struct{
+		Fields: map[string]*structpb.Value{
+			"value": structpb.NewNumberValue(float64(n)),
 		},
 	}
 }

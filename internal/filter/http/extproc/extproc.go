@@ -30,6 +30,7 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
+	extprocsvcv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -127,22 +128,34 @@ func (c *httpProcessorClient) Close() error {
 }
 
 // resolvedProcessingMode is the parsed-and-validated form of
-// *extprocv3.ProcessingMode (per SPEC §6.2 + parent §5.P9). DEFAULT
-// translates to SEND for header-modes; trailer-modes are restricted to SKIP
-// (PARSE-REJECT permanently); body-modes are restricted to NONE in 19.1
-// (PARSE-REJECT lifts at 19.2 per ADR-0168 + ADR-0171 §Decision AMENDMENTS).
+// *extprocv3.ProcessingMode (per SPEC §6.2 + parent §5.P9 + ADR-0168
+// §Decision AMENDMENT). DEFAULT translates to SEND for header-modes;
+// trailer-modes are restricted to SKIP (PARSE-REJECT permanently);
+// body-modes are restricted to NONE or BUFFERED (gRPC-service arm only —
+// HTTP-service arm forces NONE per the proto's ExtProcHttpService
+// constraint). The STREAMED-class arms (STREAMED + BUFFERED_PARTIAL +
+// FULL_DUPLEX_STREAMED) PARSE-REJECT PERMANENTLY per parent §4.4.
 //
-// The real validation + translation logic lives in resolveProcessingMode
-// (lands at Task 11 per SPEC §6.5 buildCompiledConfig step 3).
+// The struct shape is UNCHANGED from 19.1 per ADR-0168 §Decision (xi)
+// field-final invariant. The 19.2 §Decision AMENDMENT only flips the
+// resolver to populate the RequestBodyMode + ResponseBodyMode fields with
+// the actual enum (BUFFERED is now load-bearing for the body-stage
+// dispatch — Task 7 integration); pre-AMENDMENT the resolver hardcoded
+// NONE here since any non-NONE input PARSE-REJECTed at the gate.
+//
+// The validation + translation logic lives in resolveProcessingMode.
 type resolvedProcessingMode struct {
 	// Header-modes — consumed in 19.1. SEND fires the stage; SKIP bypasses.
 	// DEFAULT is translated to SEND at parse time per parent §5.P9.
 	RequestHeaderMode  extprocv3.ProcessingMode_HeaderSendMode
 	ResponseHeaderMode extprocv3.ProcessingMode_HeaderSendMode
 
-	// Body-modes — must equal NONE in 19.1 (PARSE-REJECT otherwise). The
-	// fields are retained on the struct for 19.2 forward-compat (the struct
-	// shape stays UNCHANGED at 19.2; body-mode validation lifts).
+	// Body-modes — must equal NONE or BUFFERED (post-19.2 §Decision
+	// AMENDMENT; gRPC-service arm only). The HTTP-service arm forces NONE
+	// per the proto's ExtProcHttpService constraint (PARSE-REJECT otherwise).
+	// The STREAMED-class arms PARSE-REJECT permanently per parent §4.4.
+	// BUFFERED activates the body-stage dispatch wires at Task 7 integration
+	// (ADR-0128 reuse on decode + ADR-0175 primitive on encode).
 	RequestBodyMode  extprocv3.ProcessingMode_BodySendMode
 	ResponseBodyMode extprocv3.ProcessingMode_BodySendMode
 
@@ -502,8 +515,16 @@ type filter struct {
 	// message timeout currently in force (starts at cc.messageTimeout; reset
 	// by handleOverrideMessageTimeout to the override value per D6 cancel-
 	// and-rebuild discipline).
+	//
+	// At 19.2 IMPL Task 4 (ADR-0171 §Decision AMENDMENT — per-message timer
+	// behavioral enforcement): numStages lifts from 2 → 4 so the
+	// overrideApplied array auto-resizes; activeMsgCancel captures the
+	// in-flight per-message timer's cancel func so handleOverrideMessageTimeout
+	// can fire it on override-accept (single rolling timer per direction per
+	// planner-time D4). nil when no dispatchStage is in-flight.
 	overrideApplied  [numStages]bool
 	activeMsgTimeout time.Duration
+	activeMsgCancel  context.CancelFunc
 
 	// streamStartTime is the wall-clock instant of DecodeHeaders entry —
 	// the canonical anchor for ProcessingRequest.attributes.request.time
@@ -571,7 +592,55 @@ type filter struct {
 	// (response-side).
 	decodeHeaders http.Header
 	encodeHeaders http.Header
+
+	// decodeBodyBuf / encodeBodyBuf stash the in-flight buffered request /
+	// response body bytes for the per-direction body_mutation arm of
+	// applyProcessingResponse (Task 6 ADR-0172 §Decision AMENDMENT). At Task 7
+	// (body-stage integration) the DecodeData / EncodeData endStream entry
+	// stashes the accumulated body bytes (decode side: via the ADR-0128
+	// chain-level accumulation reader; encode side: via the Task 2 ADR-0175
+	// `ecb.BufferEncodedBody()` reader) onto these fields BEFORE invoking
+	// dispatchStage. The dispatcher goroutine's body_mutation Body / ClearBody
+	// arms OVERWRITE the slice in-place + reconcile Content-Length on the
+	// corresponding header set (decodeHeaders / encodeHeaders). Task 7's
+	// post-resume path consumes the (possibly-mutated) buffer when releasing
+	// the body downstream via `f.ecb.OverwriteBody(encodeBodyBuf)` (encode
+	// side) or the analogous decode-side handoff.
+	//
+	// At Task 6 the fields are unit-test populated directly (the body_mutation
+	// arm has no decode-side framework primitive for pre-mutation buffer
+	// injection in unit tests — the test fixture stubs the field then drives
+	// applyProcessingResponse + asserts the field post-mutation). The Task 7
+	// integration replaces the test-fixture stub with the real DecodeData /
+	// EncodeData endStream stash site.
+	decodeBodyBuf []byte
+	encodeBodyBuf []byte
+
+	// skipBodyStageDispatch carries a per-direction flag indicating the
+	// body-stage outbound dispatch should be SKIPPED — set by the Task 6
+	// CONTINUE_AND_REPLACE arm in applyProcessingResponse at header stages
+	// when body-mode = BUFFERED + the processor returned a combined
+	// header+body replacement (per SPEC §4.3). Task 7's DecodeData /
+	// EncodeData endStream path checks this flag BEFORE invoking the body-
+	// stage dispatchStage; when set, the body-stage outbound call is skipped
+	// + the (pre-replaced) body buffer is released directly to the chain.
+	// Indexed by direction: [directionRequest]=request (decode side, set on
+	// stageRequestHeaders); [directionResponse]=response (encode side, set on
+	// stageResponseHeaders).
+	skipBodyStageDispatch [2]bool
 }
+
+// Per-direction index constants for the `f.skipBodyStageDispatch` array per
+// Task 6 reviewer carry-forward I-1 (named direction constants). Replaces
+// bare `[0]` / `[1]` literal indices at the Task 6 set-site + the Task 7
+// consumer sites. The two-direction model (decode / encode) is anchored by
+// the BOTH-decode-and-encode filter shape per ADR-0167 §Decision; the array
+// size stays 2 because trailer stages PARSE-REJECT permanently per parent
+// §5.P9 + ADR-0168 §Decision (no third direction enters the dispatch path).
+const (
+	directionRequest  = 0 // decode side (request_headers / request_body)
+	directionResponse = 1 // encode side (response_headers / response_body)
+)
 
 // Compile-time assertions per SPEC §6.10 — the filter satisfies BOTH sides
 // of the iteration protocol + the HTTPFilter tagged-union value. Per ADR-0167
@@ -899,17 +968,129 @@ func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.Fi
 	return envoyhttp.StopIteration
 }
 
-// DecodeData is a pass-through in 19.1: body-mode arms PARSE-REJECT at
-// parse-time per ADR-0168 §Decision (body-mode != NONE → PARSE-REJECT),
-// so any well-formed 19.1 config never reaches a state where DecodeData
-// has substantive work. The DataContinue return is kept for
-// code-completeness (the encoder/decoder interfaces require the method to
-// exist). 19.2 replaces this body with the BUFFERED-arm body-stage logic
-// per ADR-0168 + ADR-0171 + ADR-0172 §Decision AMENDMENTS.
+// DecodeData is the request_body-stage entry point per SPEC §6.3.
+//
+// **Task 7 body-stage integration (post-AMENDMENT):** wires the body-stage
+// dispatch envelope per the SPEC §6.3 pseudocode + planner-time D2 closure-
+// capture pattern. Composes the Tasks 2-6 primitive set:
+//
+//   - Task 2 ADR-0175 `BufferEncodedBody` (encode-side analog; the decode side
+//     accumulates into `f.decodeBodyBuf` directly per the synchronous-HCM
+//     dispatch model — ADR-0128 §Decision + the ext_authz precedent).
+//   - Task 4 4-stage state machine — `stageRequestBody` enum value + the
+//     `dispatchStage` per-stage entry.
+//   - Task 5 attribute envelope builders — `buildRequestBodyProcessingRequest`
+//     constructs the `ProcessingRequest{request_body: HttpBody{body,
+//     end_of_stream}}` envelope with the body-stage attribute roster (per
+//     planner-time D5).
+//   - Task 6 body-mode arms of `applyProcessingResponse` — `body_mutation`
+//     dispatch + `skipBodyStageDispatch[direction]` consumer.
+//
+// **Dispatch algorithm (per SPEC §6.3 pseudocode):**
+//
+//  1. body-mode inactive (`activeProcessingMode.RequestBodyMode != BUFFERED`)
+//     → DataContinue verbatim. The Task 3 lift in `resolveProcessingMode`
+//     allows the config to LOAD with BUFFERED without error; the runtime
+//     check here gates the dispatch.
+//
+//  2. body-mode active + `!endStream`: accumulate via `f.decodeBodyBuf =
+//     append(f.decodeBodyBuf, data...)` + return DataContinue. Per the
+//     ext_authz / buffer-filter precedent (ADR-0128 synchronous-HCM dispatch
+//     constraint): envoy-go's HCM accumulates body bytes upstream + the
+//     terminal endStream=true chunk reaches the filter with the FULL
+//     accumulated body in `data` (H2 path) OR with the LAST chunk (H1 path);
+//     the filter-side `f.decodeBodyBuf` accumulation is the union across all
+//     chunks. Mid-stream parking via `DataStopIterationAndBuffer` would
+//     deadlock the synchronous-HCM dispatch goroutine (per ADR-0128
+//     §Context).
+//
+//  3. body-mode active + `endStream` + `f.skipBodyStageDispatch[directionRequest]`
+//     SET (combined-replacement from CONTINUE_AND_REPLACE at request_headers
+//     per Task 6): SKIP the body-stage outbound dispatch — the body buffer
+//     was already mutated at the header stage; release verbatim via
+//     DataContinue. The decode-side body-mutation-delivery limitation
+//     (documented at the §Consequences refresh) applies: the mutated bytes
+//     in `f.decodeBodyBuf` are NOT delivered to the upstream — the HCM
+//     bodyBuf path captured the pre-mutation bytes. The skip-flag path is
+//     still structurally consumed (matches SPEC §4.3 row 2 — the body-stage
+//     outbound is suppressed); the actual mutated-body delivery is a
+//     19.2 known limitation pending a future decode-side primitive (likely a
+//     future ADR).
+//
+//  4. body-mode active + `endStream` + skip-flag CLEAR: stash the FULL
+//     accumulated body onto `f.decodeBodyBuf`, build the request_body
+//     envelope, dispatch via `f.dispatchStage(stageRequestBody, req)`, park
+//     via DataStopIteration (the async dispatch goroutine signals resume via
+//     `f.dcb.ContinueDecoding` on completion).
+//
+// **OnDestroy discipline per planner-time D7:** the dispatch goroutine's
+// `completeStage` D9 race-guard (`f.mu` + `f.done` check before
+// `signalResume`) covers the OnDestroy-during-body-stage-outbound race. If
+// OnDestroy fires while the dispatch goroutine is in-flight, the streamCancel
+// cascade unblocks the Recv + `completeStage` observes `f.done = true` and
+// drops the resume signal — the parked decode goroutine unparks via the
+// chain's ctx.Done branch.
+//
+// **Decode-side body-mutation delivery — KNOWN LIMITATION at 19.2.** The
+// `body_mutation` arm of `applyProcessingResponse` (per Task 6) writes new
+// bytes to `f.decodeBodyBuf` + reconciles Content-Length on `f.decodeHeaders`.
+// The header reconciliation IS delivered to the upstream (the HCM's
+// `req.Header` is the same map as `f.decodeHeaders`). However, the body
+// bytes themselves are NOT delivered upstream because envoy-go has no
+// decode-side analog of `OverwriteBody` (which is encode-side per ADR-0131);
+// the HCM at `connection.go`/`h2dispatch.go` reads the upstream-bound bytes
+// from its own `bodyBuf` (H1) or `h2req.Body` (H2), both of which are
+// captured BEFORE the filter chain mutation lands. The processor SEES the
+// body + can request mutation; the mutation arm runs + mutates the filter-
+// side buffer; but the upstream-bound bytes stay the original. Closure
+// deferred to a future phase that adds the decode-side body-mutation
+// primitive (likely a future ADR). The encode-side delivery WORKS via
+// `f.ecb.OverwriteBody(f.encodeBodyBuf)` (ADR-0131 reuse) — see EncodeData
+// below.
 func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataStatus {
-	_ = data
-	_ = endStream
-	return envoyhttp.DataContinue
+	return f.bodyStageEntry(
+		directionRequest,
+		&f.decodeBodyBuf,
+		stageRequestBody,
+		f.cc.requestAttributes,
+		buildRequestBodyProcessingRequest,
+		nil, // decode side has NO OverwriteBody analog per the KNOWN LIMITATION above.
+		data,
+		endStream,
+	)
+}
+
+// bodyModeActive reports whether the body-stage dispatch is active for the
+// given direction per the effective activeProcessingMode. Returns false when
+// (a) the effective mode is nil (defensive — the resolver populates a
+// non-nil mode at parse time per ADR-0168 §Decision); (b) the per-direction
+// body mode != BUFFERED. Any non-BUFFERED value returns false: NONE is the
+// production-default per parent §4.4 + ADR-0168 §Decision (iv); STREAMED-
+// class variants (STREAMED / BUFFERED_PARTIAL / FULL_DUPLEX_STREAMED) are
+// parse-time rejected per parent §4.4 + ADR-0168 §Decision (iv) post-
+// AMENDMENT, so the runtime is NOT expected to observe those values. If one
+// ever leaks past the parser, the switch falls through to `return false` as
+// a defensive fallthrough — treating leaked-STREAMED as passthrough rather
+// than panicking. The fallthrough is intentional + silent (no log / no
+// assert): the parser is the canonical enforcement point + a panic here
+// would convert a parser bug into a stream-fatal at runtime.
+//
+// Per planner-time D2 closure-capture pattern: this helper reads the
+// per-stream `f.activeProcessingMode` (which may be mutated mid-stream by a
+// validated `mode_override` per parent §5.P1 + ADR-0171 §Decision header-mode
+// portion). The framework's sequential decode→encode dispatch provides
+// happens-before ordering per D9 — no atomic load/store needed.
+func (f *filter) bodyModeActive(direction int) bool {
+	if f == nil || f.activeProcessingMode == nil {
+		return false
+	}
+	switch direction {
+	case directionRequest:
+		return f.activeProcessingMode.RequestBodyMode == extprocv3.ProcessingMode_BUFFERED
+	case directionResponse:
+		return f.activeProcessingMode.ResponseBodyMode == extprocv3.ProcessingMode_BUFFERED
+	}
+	return false
 }
 
 // DecodeTrailers is a pass-through per the trailer-mode != SKIP PARSE-REJECT
@@ -1002,15 +1183,224 @@ func (f *filter) EncodeHeaders(headers http.Header, endStream bool) envoyhttp.Fi
 	return envoyhttp.StopIteration
 }
 
-// EncodeData is a pass-through in 19.1 per the body-mode != NONE PARSE-REJECT
-// at parse-time (mirrors DecodeData rationale). 19.2 activates the
-// response_body BUFFERED arm via ADR-0175 (encode-side body-buffering
-// primitive) — at that point the body bytes are buffered before the
-// response_body ProcessingRequest fires.
+// EncodeData is the response_body-stage entry point per SPEC §6.3.
+//
+// **Task 7 body-stage integration (post-AMENDMENT):** symmetric to DecodeData.
+// Composes the Tasks 2-6 primitive set with the additional encode-side
+// `OverwriteBody` delivery mechanism per ADR-0131:
+//
+//   - Task 2 ADR-0175 — the chain-side `BufferEncodedBody` reader is
+//     anchored for the multi-chunk case (HCM normally delivers the full
+//     response body in ONE call per `connection.go` H1 + `h2dispatch.go` H2
+//     post-19.2 + post-Task-2; the chain-accumulation primitive is
+//     structurally available + exercised by Task 8 race tests for the
+//     multi-chunk synthetic case).
+//   - Task 4 4-stage state machine — `stageResponseBody` enum value.
+//   - Task 5 attribute envelope builders — `buildResponseBodyProcessingRequest`.
+//   - Task 6 body-mode arms of `applyProcessingResponse` — `body_mutation`
+//     dispatch (mutates `f.encodeBodyBuf` in place) +
+//     `skipBodyStageDispatch[directionResponse]` consumer.
+//   - ADR-0131 `EncoderFilterCallbacks.OverwriteBody` — registers the
+//     (possibly-mutated) `f.encodeBodyBuf` as the encode-side body override;
+//     HCM at `connection.go` H1 line 595 + `h2dispatch.go` H2 line 406
+//     reads `chain.EncodeBodyOverride()` post-RunEncodeData + substitutes
+//     `resp.Body` before the wire-write path consumes it.
+//
+// **Encode-side body-mutation delivery — WORKS via ADR-0131 reuse.** Per
+// Task 6 hand-off contract item 3: the post-resume body-write site reads
+// the (possibly-mutated) `f.encodeBodyBuf` + invokes `f.ecb.OverwriteBody`
+// which stores the bytes on `c.encodeBodyOverride`; HCM substitutes
+// `resp.Body` post-chain. The encode-side delivery is structurally
+// SYMMETRIC to the decode-side (both run the body-mutation arm in
+// `applyProcessingResponse`); the encode side gains the upstream-delivery
+// path via ADR-0131 reuse — NO new framework primitive consumed (D10
+// hypothesis HOLDS; ADR-0177 stays unconsumed). Contrast with the decode
+// side which lacks the delivery primitive — see DecodeData KNOWN LIMITATION
+// note above.
+//
+// **Sequencing with Task 2's chain accumulation:** the chain's encodeBuf
+// accumulation (via DataStopIterationAndBuffer at chain.go:421-457) and
+// ADR-0131's OverwriteBody are COMPLEMENTARY per ADR-0175 §Decision (the
+// encodeBuf release-as-data flows the bytes through subsequent filters in
+// the encode chain; OverwriteBody supersedes the wire-write resp.Body at
+// HCM substitution time). For ext_proc the body-stage filter is the SOLE
+// body-mutation source per parent §5.P3 — calling OverwriteBody from the
+// post-resume site directly registers the body override; the chain's
+// encodeBuf path is not exercised when HCM passes the full body in one
+// EncodeData call (the post-19.2 default per connection.go H1 line 591 +
+// h2dispatch.go H2 line 398). The Task 8 race tests exercise the chain-
+// accumulation path independently.
+//
+// **OnDestroy discipline per planner-time D7:** symmetric to DecodeData —
+// the dispatch goroutine's `completeStage` D9 race-guard covers the
+// OnDestroy-during-body-stage-outbound race. The streamCancel cascade
+// unblocks Recv + completeStage drops the resume signal when `f.done` is
+// set + the parked encode goroutine unparks via the chain's ctx.Done branch.
 func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataStatus {
-	_ = data
-	_ = endStream
-	return envoyhttp.DataContinue
+	return f.bodyStageEntry(
+		directionResponse,
+		&f.encodeBodyBuf,
+		stageResponseBody,
+		f.cc.responseAttributes,
+		buildResponseBodyProcessingRequest,
+		// Encode-side skip-path delivery via ADR-0131 OverwriteBody — releases
+		// the pre-mutated f.encodeBodyBuf to HCM's encodeBodyOverride. nil-
+		// tolerant on f.ecb (synthetic / test paths). Per C-1 rework: this
+		// closure observes the CURRENT (already-pre-mutated by Task 6 at
+		// header stage) buffer state; the helper fires it BEFORE accumulating
+		// the incoming HCM chunk so the replacement bytes are delivered
+		// intact rather than corrupted by HCM-bytes append.
+		func() {
+			if f.ecb != nil {
+				f.ecb.OverwriteBody(f.encodeBodyBuf)
+			}
+		},
+		data,
+		endStream,
+	)
+}
+
+// bodyStageEntry consolidates the body-mode dispatch for either direction.
+// The two-direction methods (DecodeData / EncodeData) collapse to thin
+// adapters that pass per-direction state + a per-direction envelope builder
+// + a per-direction skip-path delivery closure (encode side only; nil on
+// decode side per the KNOWN LIMITATION).
+//
+// Parameters:
+//   - direction        directionRequest or directionResponse — keys the
+//     skipBodyStageDispatch flag + selects per-direction logging context.
+//   - bufPtr           pointer to the per-direction body-buffer field
+//     (&f.decodeBodyBuf or &f.encodeBodyBuf) so the helper can append +
+//     read the buffer in place.
+//   - stage            the per-direction stage enum (stageRequestBody /
+//     stageResponseBody) handed to dispatchStage.
+//   - allowlist        the per-direction CEL attribute roster (empty slices
+//     are tolerated by buildAttributeEnvelope).
+//   - buildFn          the per-direction envelope builder (Task 5).
+//   - skipDeliverFn    encode-side delivery closure (OverwriteBody-bound);
+//     nil on decode side per the KNOWN LIMITATION documented at DecodeData.
+//     Invoked from the skip-flag short-circuit BEFORE the incoming chunk is
+//     accumulated so the pre-mutated buffer is delivered intact (C-1 fix).
+//   - data, endStream  the framework-supplied chunk bytes + end-of-stream
+//     marker.
+//
+// Algorithm per SPEC §6.3 pseudocode (unified — the two directions follow
+// the SAME step sequence; the only delta is the skip-path delivery closure):
+//
+//  1. body-mode inactive → DataContinue verbatim. Task 3 lift in
+//     resolveProcessingMode allows the config to LOAD with BUFFERED without
+//     error; the runtime check here gates the dispatch.
+//
+//  2. skip-flag SHORT-CIRCUIT — fires FIRST, BEFORE the accumulator append.
+//     When CONTINUE_AND_REPLACE at the header stage with body-mode=BUFFERED
+//     pre-replaced *bufPtr (per Task 6 hand-off), the skip path must deliver
+//     the replacement bytes WITHOUT appending the incoming HCM chunk. The
+//     skip-flag check runs on EVERY entry (both mid-stream + endStream
+//     chunks) — a mid-stream chunk arriving WHILE the skip-flag is set must
+//     not corrupt the pre-mutated buffer.
+//
+//     ROOT CAUSE — C-1 rework: pre-rework the sequence was
+//     (a) append data → (b) check skip-flag → (c) OverwriteBody. With a
+//     non-empty incoming chunk, OverwriteBody saw "REPLACEMENT" +
+//     "real-upstream-bytes" concatenated → HCM substituted resp.Body with
+//     the corrupted concatenation. The fix moves the skip-flag check + the
+//     OverwriteBody delivery BEFORE the append. The decode-side equivalent
+//     of OverwriteBody does not exist (KNOWN LIMITATION); the decode-side
+//     skipDeliverFn parameter is nil + the structural skip is still honored.
+//
+//  3. accumulate the incoming chunk onto *bufPtr — common to mid-stream +
+//     endStream entry. Per the synchronous-HCM dispatch model (ADR-0128
+//     §Context): mid-stream parking would deadlock the dispatch goroutine.
+//
+//  4. mid-stream chunk → DataContinue (after accumulate). Lets HCM continue
+//     feeding chunks until endStream.
+//
+//  5. endStream chunk → build the per-direction envelope via buildFn +
+//     dispatchStage(stage, req) + park via DataStopIterationAndBuffer.
+//     completeStage's resume signal fires ContinueDecoding /
+//     ContinueEncoding on completion.
+//
+// **OnDestroy discipline (planner-time D7):** unchanged by the C-1 rework.
+// The dispatch goroutine's completeStage D9 race-guard covers the OnDestroy-
+// during-body-stage-outbound race; the streamCancel cascade unblocks Recv +
+// completeStage drops the resume signal when f.done is set.
+func (f *filter) bodyStageEntry(
+	direction int,
+	bufPtr *[]byte,
+	stage stage,
+	allowlist []string,
+	buildFn func(*filter, []byte, bool, []string) *extprocsvcv3.ProcessingRequest,
+	skipDeliverFn func(),
+	data []byte,
+	endStream bool,
+) envoyhttp.FilterDataStatus {
+	// Step 1: gate on body-mode active for this direction. Inactive (NONE
+	// is the proto-default per parent §4.4 + ADR-0168 §Decision (iv)) →
+	// pure passthrough per the 19.1 envelope.
+	if !f.bodyModeActive(direction) {
+		return envoyhttp.DataContinue
+	}
+
+	// Step 2: skip-flag SHORT-CIRCUIT — MUST fire BEFORE accumulating the
+	// incoming chunk so the pre-mutated buffer is delivered intact per the
+	// C-1 rework. Runs on every entry (mid-stream + endStream) so a chunk
+	// arriving while the skip-flag is set does NOT corrupt the buffer via
+	// the unconditional append below.
+	if f.skipBodyStageDispatch[direction] {
+		if skipDeliverFn != nil {
+			skipDeliverFn()
+		}
+		return envoyhttp.DataContinue
+	}
+
+	// Step 3: accumulate the incoming chunk onto the per-direction buffer.
+	// Common to mid-stream + endStream entry (the endStream chunk's bytes
+	// belong on the accumulator too).
+	*bufPtr = append(*bufPtr, data...)
+
+	// Step 4: mid-stream chunk → DataContinue. The filter-side accumulator
+	// provides the body-stage endStream entry with a single contiguous byte
+	// slice for dispatch; mid-stream parking via DataStopIterationAndBuffer
+	// would deadlock the synchronous-HCM dispatch goroutine per ADR-0128
+	// §Context.
+	if !endStream {
+		return envoyhttp.DataContinue
+	}
+
+	// Step 5: endStream chunk → build envelope + dispatch + park. The async
+	// dispatch goroutine spawned by dispatchStage performs Send + Recv on
+	// the bidi-stream (gRPC mode); body-stage dispatch on HTTP-mode is
+	// unreachable per ADR-0168 §Decision (iii). On completion, completeStage's
+	// resume signal fires ContinueDecoding (decode side) or ContinueEncoding
+	// (encode side via deliverEncodeBodyMutation → OverwriteBody → signalResume).
+	req := buildFn(f, *bufPtr, true, allowlist)
+	f.dispatchStage(stage, req)
+	return envoyhttp.DataStopIterationAndBuffer
+}
+
+// deliverEncodeBodyMutation registers the encode-side body buffer with the
+// chain via ADR-0131 `OverwriteBody`. Invoked from the dispatch goroutine's
+// `completeStage` path after the body-stage `applyProcessingResponse` has
+// mutated (or left intact) `f.encodeBodyBuf`. The OverwriteBody call MUST
+// land BEFORE the resume signal unparks the EncodeData return — otherwise
+// the chain unwinds + HCM reads `chain.EncodeBodyOverride()` before the
+// override is registered, missing the mutation.
+//
+// Race discipline per ADR-0167 § Decision + ADR-0131 §Decision (vi): the
+// dispatch goroutine + the parked HCM goroutine are sequenced by the
+// resume-channel send (parkEncode blocks on encodeResumeCh; ContinueEncoding
+// sends to it). All writes to chain.encodeBodyOverride from the dispatch
+// goroutine happen-before the resume-channel send via the call-ordering
+// inside completeStage (OverwriteBody → signalResume).
+//
+// Nil-tolerant on f.ecb (synthetic / test paths). Called ONLY for
+// stageResponseBody (the request_body analog has no decode-side delivery
+// primitive per the KNOWN LIMITATION in DecodeData).
+func (f *filter) deliverEncodeBodyMutation() {
+	if f == nil || f.ecb == nil {
+		return
+	}
+	f.ecb.OverwriteBody(f.encodeBodyBuf)
 }
 
 // EncodeTrailers is a pass-through per the trailer-mode != SKIP PARSE-REJECT

@@ -45,6 +45,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0020-http-ext-authz-http/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0021-http-ext-authz-grpc/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0022-http-ext-proc-grpc/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0023-http-ext-proc-body/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 

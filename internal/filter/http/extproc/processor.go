@@ -62,13 +62,26 @@ import (
 // stage — per-direction per-message-type discriminator per ADR-0171.
 // ---------------------------------------------------------------------------
 
-// stage enumerates the per-direction stages the filter dispatches. 19.1
-// activates ONLY the two header stages; the body + trailer stages are
-// reserved (declared as `numStages` count tracks the array size for
-// `f.overrideApplied`) for the 19.2 AMENDMENT per ADR-0171 §Consequences.
+// stage enumerates the per-direction stages the filter dispatches. Phase
+// 19.1 activated ONLY the two header stages; the phase-19.2 ADR-0171
+// §Decision AMENDMENT (Task 4) extends to FOUR stages by adding
+// `stageRequestBody` + `stageResponseBody`. The per-direction
+// at-most-once-per-stage discipline (parent §5.P10 + ADR-0171 §Decision (v))
+// EXTENDS unchanged at 19.2 — the `f.overrideApplied [numStages]bool` array
+// auto-resizes via the sentinel constant.
+//
+// Trailer stages remain RESERVED-BUT-OUT-OF-ENVELOPE per parent §5.P9 +
+// ADR-0168 §Decision (trailer arms PARSE-REJECT permanently — trailers never
+// reach the dispatch path); no enum entries land for trailers at 19.2.
 type stage int
 
-// stage enum values — header stages active in 19.1; body + trailer reserved.
+// stage enum values — at 19.2 IMPL (Task 4) extends from 2 → 4. The
+// flat 4-value enum is the natural data model; the SPLIT-BY-DIRECTION
+// discipline per planner-time D3 is enforced at the dispatch site (decode
+// side tracks `stageRequestHeaders` + `stageRequestBody`; encode side tracks
+// `stageResponseHeaders` + `stageResponseBody`) by the existing per-stage
+// transition logic — the enum itself stays flat for index simplicity on the
+// `f.overrideApplied` array + the `signalResume` switch.
 const (
 	// stageRequestHeaders fires on DecodeHeaders entry when
 	// f.activeProcessingMode.RequestHeaderMode != SKIP.
@@ -76,8 +89,20 @@ const (
 	// stageResponseHeaders fires on EncodeHeaders entry when
 	// f.activeProcessingMode.ResponseHeaderMode != SKIP.
 	stageResponseHeaders
-	// Sentinel — bounds the f.overrideApplied array. Body + trailer stages
-	// reserve indices [numStages..numStages+4) at the 19.2 AMENDMENT.
+	// stageRequestBody fires on DecodeData endStream when
+	// f.activeProcessingMode.RequestBodyMode == BUFFERED. Lands at 19.2
+	// IMPL Task 4 per ADR-0171 §Decision AMENDMENT (body-mode portion).
+	stageRequestBody
+	// stageResponseBody fires on EncodeData endStream when
+	// f.activeProcessingMode.ResponseBodyMode == BUFFERED. Lands at 19.2
+	// IMPL Task 4 per ADR-0171 §Decision AMENDMENT (body-mode portion).
+	stageResponseBody
+	// Sentinel — bounds the `f.overrideApplied [numStages]bool` array. At
+	// 19.2 IMPL Task 4 lifts from 2 → 4 (the 19.1 forward-pointer comment
+	// "[numStages..numStages+4)" anticipated trailers + body together; the
+	// actual Task 4 lift is 2 → 4 since trailers stay reserved-but-out-of-
+	// envelope per parent §5.P9 + ADR-0168 §Decision — see ADR-0171
+	// §Consequences refresh for the reconciliation).
 	numStages
 )
 
@@ -89,6 +114,10 @@ func (s stage) String() string {
 		return "request_headers"
 	case stageResponseHeaders:
 		return "response_headers"
+	case stageRequestBody:
+		return "request_body"
+	case stageResponseBody:
+		return "response_body"
 	default:
 		return fmt.Sprintf("stage(%d)", int(s))
 	}
@@ -204,21 +233,31 @@ var errProcessorStub = errors.New("extproc: applyProcessingResponse stub at Task
 
 // Sentinel errors for resolveProcessingMode PARSE-REJECT paths. Tests assert
 // on the prefix `"ext_proc: processing_mode: "` via errors.Is / strings.Contains.
+//
+// Post-19.2 §Decision AMENDMENT (ADR-0168): the body-mode gate flips from
+// "must be NONE" (the 19.1 wording) to "must be NONE or BUFFERED" — the
+// STREAMED-class arms (STREAMED + BUFFERED_PARTIAL + FULL_DUPLEX_STREAMED)
+// continue PARSE-REJECT permanently per parent §4.4. The BUFFERED arm
+// ACCEPTS for gRPC-service mode (the http_service arm continues
+// PARSE-REJECT via errProcessingModeHTTPServiceBody — that gate now
+// load-bearing post-lift; pre-lift it was subsumed by the listener-level
+// body-mode-NONE check firing first).
 var (
-	errProcessingModeRequestBodyNotNONE = errors.New(
-		"ext_proc: processing_mode: request_body_mode must be NONE in 19.1 (BUFFERED activates at 19.2; STREAMED+BUFFERED_PARTIAL+FULL_DUPLEX_STREAMED permanently out of envelope)")
-	errProcessingModeResponseBodyNotNONE = errors.New(
-		"ext_proc: processing_mode: response_body_mode must be NONE in 19.1 (BUFFERED activates at 19.2; STREAMED+BUFFERED_PARTIAL+FULL_DUPLEX_STREAMED permanently out of envelope)")
+	errProcessingModeRequestBodyStreamedClass = errors.New(
+		"ext_proc: processing_mode: request_body_mode must be NONE or BUFFERED (STREAMED + BUFFERED_PARTIAL + FULL_DUPLEX_STREAMED permanently out of envelope per parent §4.4 + ADR-0168 §Decision AMENDMENT)")
+	errProcessingModeResponseBodyStreamedClass = errors.New(
+		"ext_proc: processing_mode: response_body_mode must be NONE or BUFFERED (STREAMED + BUFFERED_PARTIAL + FULL_DUPLEX_STREAMED permanently out of envelope per parent §4.4 + ADR-0168 §Decision AMENDMENT)")
 	errProcessingModeRequestTrailerNotSKIP = errors.New(
 		"ext_proc: processing_mode: request_trailer_mode must be SKIP (trailers permanently out of envelope)")
 	errProcessingModeResponseTrailerNotSKIP = errors.New(
 		"ext_proc: processing_mode: response_trailer_mode must be SKIP (trailers permanently out of envelope)")
 	errProcessingModeHTTPServiceBody = errors.New(
-		"ext_proc: processing_mode: http_service mode requires request_body_mode=NONE + response_body_mode=NONE (per proto's ExtProcHttpService constraint)")
+		"ext_proc: processing_mode: http_service mode requires request_body_mode=NONE + response_body_mode=NONE (per proto's ExtProcHttpService constraint; PERMANENT — the 19.2 §Decision AMENDMENT lift applies to the gRPC-service arm only)")
 )
 
 // resolveProcessingMode parses + validates an *extprocv3.ProcessingMode per
-// parent §5.P9 + ADR-0171 §Decision header-mode portion. Translates per the
+// parent §5.P9 + ADR-0171 §Decision header-mode portion + ADR-0168 §Decision
+// AMENDMENT (phase-19.2 body-mode PARSE-REJECT lift). Translates per the
 // proto-doc default semantics:
 //
 //   - HeaderSendMode.DEFAULT (0) → SEND for *_header_mode fields (request +
@@ -226,13 +265,17 @@ var (
 //   - HeaderSendMode.DEFAULT (0) → SKIP for *_trailer_mode fields (request +
 //     response).
 //   - BodySendMode has no DEFAULT — zero value is NONE. Phase 19.1 PARSE-
-//     REJECTs body-mode != NONE; phase 19.2 lifts the PARSE-REJECT for
-//     BUFFERED only.
+//     REJECTed body-mode != NONE; phase 19.2 §Decision AMENDMENT lifts the
+//     PARSE-REJECT for BUFFERED only (gRPC-service arm); the STREAMED-class
+//     arms (STREAMED + BUFFERED_PARTIAL + FULL_DUPLEX_STREAMED) continue
+//     PARSE-REJECT PERMANENTLY per parent §4.4.
 //
 // `httpServiceMode` (true when the listener's transport is http_service) adds
 // the proto's ExtProcHttpService constraint: HTTP mode forces body-mode
-// NONE (PARSE-REJECT otherwise). The trailer-mode + DEFAULT translation
-// disciplines are the SAME across both transport modes.
+// NONE (PARSE-REJECT otherwise). The httpServiceMode gate is LOAD-BEARING
+// post-19.2 §Decision AMENDMENT — pre-AMENDMENT it was masked by the
+// listener-level body-mode-NONE check firing first. The trailer-mode +
+// DEFAULT translation disciplines are the SAME across both transport modes.
 //
 // A nil ProcessingMode input yields the all-defaults resolved value (matches
 // the proto-doc behavior: a missing ProcessingMode field defaults to "send
@@ -240,7 +283,7 @@ var (
 //
 // Returns nil + a sentinel error on PARSE-REJECT; the error wording starts
 // with `"ext_proc: processing_mode: "` for grep-discoverability at the
-// Task 11 buildCompiledConfig call site.
+// buildCompiledConfig call site.
 func resolveProcessingMode(pm *extprocv3.ProcessingMode, httpServiceMode bool) (*resolvedProcessingMode, error) {
 	// Capture raw enum values (allow nil pm — defaults to all-zero).
 	var (
@@ -257,22 +300,24 @@ func resolveProcessingMode(pm *extprocv3.ProcessingMode, httpServiceMode bool) (
 		rawRespTrail = pm.GetResponseTrailerMode()
 	}
 
-	// Body-mode validation per parent §5.P9 + ADR-0168 §Decision body-mode
-	// PARSE-REJECT (lifts at 19.2 for BUFFERED only).
-	if rawReqBody != extprocv3.ProcessingMode_NONE {
-		return nil, errProcessingModeRequestBodyNotNONE
-	}
-	if rawRespBody != extprocv3.ProcessingMode_NONE {
-		return nil, errProcessingModeResponseBodyNotNONE
-	}
-	// http_service + body-mode != NONE PARSE-REJECT per proto constraint.
-	// (The body checks above already cover this for ANY mode; the explicit
-	// httpServiceMode-gated check below is RESERVED for 19.2 when the
-	// listener-level body-mode PARSE-REJECT lifts but the http_service body
-	// PARSE-REJECT remains. At 19.1 the listener-level check above subsumes
-	// this — we keep the parameter consumed for symmetry + grep-anchor.)
+	// http_service + body-mode != NONE PARSE-REJECT per the proto's
+	// ExtProcHttpService constraint (PERMANENT — the 19.2 §Decision
+	// AMENDMENT body-mode lift applies to the gRPC-service arm only).
+	// Fires BEFORE the gRPC-arm STREAMED-class check below so the more
+	// specific PARSE-REJECT wording (the http_service constraint) wins.
 	if httpServiceMode && (rawReqBody != extprocv3.ProcessingMode_NONE || rawRespBody != extprocv3.ProcessingMode_NONE) {
 		return nil, errProcessingModeHTTPServiceBody
+	}
+
+	// Body-mode validation per parent §4.4 + ADR-0168 §Decision AMENDMENT
+	// (phase-19.2 lift). NONE + BUFFERED ACCEPT for gRPC-service mode;
+	// STREAMED + BUFFERED_PARTIAL + FULL_DUPLEX_STREAMED PARSE-REJECT
+	// PERMANENTLY (out of envelope per parent §4.4).
+	if !bodyModeIsNoneOrBuffered(rawReqBody) {
+		return nil, errProcessingModeRequestBodyStreamedClass
+	}
+	if !bodyModeIsNoneOrBuffered(rawRespBody) {
+		return nil, errProcessingModeResponseBodyStreamedClass
 	}
 
 	// Trailer-mode validation per parent §5.P9 — DEFAULT translates to SKIP;
@@ -288,11 +333,21 @@ func resolveProcessingMode(pm *extprocv3.ProcessingMode, httpServiceMode bool) (
 	return &resolvedProcessingMode{
 		RequestHeaderMode:   headerModeTranslate(rawReqHdr),
 		ResponseHeaderMode:  headerModeTranslate(rawRespHdr),
-		RequestBodyMode:     extprocv3.ProcessingMode_NONE,
-		ResponseBodyMode:    extprocv3.ProcessingMode_NONE,
+		RequestBodyMode:     rawReqBody,
+		ResponseBodyMode:    rawRespBody,
 		RequestTrailerMode:  extprocv3.ProcessingMode_SKIP,
 		ResponseTrailerMode: extprocv3.ProcessingMode_SKIP,
 	}, nil
+}
+
+// bodyModeIsNoneOrBuffered returns true iff the raw body-mode enum value is
+// in the post-§Decision AMENDMENT ACCEPT set: NONE (the zero value; body-stage
+// inactive) or BUFFERED (full-body inspection per ADR-0128 reuse on decode +
+// ADR-0175 primitive on encode). STREAMED, BUFFERED_PARTIAL, and
+// FULL_DUPLEX_STREAMED return false — these are PERMANENTLY out of envelope
+// per parent §4.4 (STREAMED-class body modes; envoy-go-strict exclusion).
+func bodyModeIsNoneOrBuffered(m extprocv3.ProcessingMode_BodySendMode) bool {
+	return m == extprocv3.ProcessingMode_NONE || m == extprocv3.ProcessingMode_BUFFERED
 }
 
 // headerModeTranslate maps a HeaderSendMode to the resolved enum per parent
@@ -464,6 +519,16 @@ func (f *filter) dispatchStage(s stage, req *extprocsvcv3.ProcessingRequest) {
 		// Send/Recv pair. The deferred cancel guarantees the per-message
 		// timer is released regardless of return path (success / error /
 		// override_message_timeout reset rebuild).
+		//
+		// **19.2 Task 4 ADR-0171 §Decision AMENDMENT behavioral lift** per
+		// planner-time D4: the per-message timer is consumed BEHAVIORALLY
+		// (NOT structural-only as at 19.1) via a select on msgCtx.Done in
+		// the Recv leg. msgCancel is captured on f.activeMsgCancel so
+		// handleOverrideMessageTimeout can fire it on override-accept (single
+		// rolling timer per direction — at-most-one-in-flight per ADR-0171
+		// §Decision (v) makes per-stage timers redundant). On goroutine exit
+		// the deferred msgCancel + activeMsgCancel-clear pair ensure the
+		// in-flight cancel hook does NOT leak past the per-stage lifetime.
 		msgTimeout := f.activeMsgTimeout
 		// Defensive: streamCtx may be nil on an HTTP-mode misroute or test
 		// path that bypasses openProcessorStream. Fall back to the parent
@@ -485,8 +550,23 @@ func (f *filter) dispatchStage(s stage, req *extprocsvcv3.ProcessingRequest) {
 			// alone (still cancelable via streamCancel on OnDestroy).
 			msgCtx, msgCancel = context.WithCancel(parent)
 		}
-		defer msgCancel()
-		_ = msgCtx // reserved for Task 11 Send/Recv wiring per SPEC §6.8 sketch
+		// Publish the per-message cancel on the filter so
+		// handleOverrideMessageTimeout can fire it on override-accept per
+		// planner-time D4. Cleared on goroutine exit.
+		f.mu.Lock()
+		f.activeMsgCancel = msgCancel
+		f.mu.Unlock()
+		defer func() {
+			msgCancel()
+			// handleOverrideMessageTimeout CLEARS activeMsgCancel itself on
+			// fire (cascading stream-fatal per the per-message-timer
+			// behavioral lift); by the time this defer runs we either own
+			// the slot or it was already cleared — unconditional nil
+			// assignment is race-safe + idempotent.
+			f.mu.Lock()
+			f.activeMsgCancel = nil
+			f.mu.Unlock()
+		}()
 
 		// Send the request. The gRPC client stream's Send is non-blocking
 		// per the SPEC §6.8 + ADR-0169 §Decision narrative — the per-message
@@ -505,18 +585,59 @@ func (f *filter) dispatchStage(s stage, req *extprocsvcv3.ProcessingRequest) {
 		}
 
 		// Recv blocks until a ProcessingResponse arrives, the per-message
-		// timer fires, or the stream is canceled. The per-message timer's
-		// firing is observable here as ctx.Err() == context.DeadlineExceeded
-		// on the next Recv loop iteration. (For Task 7 the gRPC ClientStream
-		// returns the timeout-derived error directly on Recv; per-message
-		// timer reset on override_message_timeout arrival is handled by
-		// handleOverrideMessageTimeout which mutates f.activeMsgTimeout for
-		// the NEXT dispatchStage goroutine — the in-flight Recv on the
-		// CURRENT goroutine cannot be reset mid-Recv without canceling the
-		// streamCtx, which would terminate the whole stream. The
-		// continue-but-still-waiting semantics for override_message_timeout
-		// are handled in completeStage via the action enum.)
+		// timer fires (cascade-cancels the stream via watchdog below), OR
+		// the stream is canceled (OnDestroy + streamCancel).
+		//
+		// **19.2 Task 4 behavioral lift** per planner-time D4 + ADR-0171
+		// §Decision AMENDMENT clause (vi): the per-message timer
+		// enforcement runs as a WATCHDOG goroutine that observes
+		// msgCtx.Done and invokes streamCancel on per-message deadline
+		// expiry — terminating the bidi-stream which unblocks the in-flight
+		// Recv on THIS goroutine with the stream-context error (per the
+		// gRPC ClientStream contract). The trade-off (per-message timer
+		// fail-fast terminates the WHOLE stream rather than only the
+		// per-stage Recv) is accepted because:
+		//
+		//   - At-most-one-in-flight per direction per ADR-0171 §Decision
+		//     (v) — only ONE stage is parked on Recv at any time; the
+		//     per-message timer expiry IS the per-stream failure surface.
+		//
+		//   - The bidi-stream is one-shot per HTTP transaction (one stream
+		//     per filter lifetime); a per-message timeout signals the
+		//     processor has stalled or is unreachable, which is a
+		//     stream-level failure.
+		//
+		//   - The same Send/Recv goroutine constraint (parent §5.P10 +
+		//     ADR-0171 §Decision (iii) single-in-flight-message correlation)
+		//     mandates Send + Recv on the SAME goroutine — no per-message
+		//     interruption via Recv-leg goroutine substitution.
+		//
+		// The watchdog goroutine returns promptly when EITHER msgCtx.Done
+		// fires (per-message deadline OR override-driven cancel — see
+		// handleOverrideMessageTimeout) OR doneCh closes (Recv completed
+		// normally + the dispatch goroutine signals the watchdog to exit).
+		// The watchdog NEVER blocks past the per-stage lifetime.
+		doneCh := make(chan struct{})
+		go func() {
+			select {
+			case <-msgCtx.Done():
+				// Per-message timer expired (deadline) OR
+				// override_message_timeout cascade-canceled the per-message
+				// timer. Cascade-cancel the stream so the in-flight Recv
+				// unblocks. On normal Recv completion the doneCh closes
+				// FIRST and msgCtx.Done is observed only by the goroutine
+				// exit path (no streamCancel fires).
+				if f.streamCancel != nil {
+					f.streamCancel()
+				}
+			case <-doneCh:
+				// Recv completed normally — exit the watchdog without
+				// touching streamCancel.
+			}
+		}()
+
 		resp, err := f.stream.Recv()
+		close(doneCh)
 		if err != nil {
 			if f.cc != nil && f.cc.stats != nil {
 				f.cc.stats.streamsFailed.Inc()
@@ -715,6 +836,28 @@ func (f *filter) completeStage(s stage, resp *extprocsvcv3.ProcessingResponse, r
 	// returns for completeStage assertions.
 	act, _ := applyProcessingResponseFn(f, s, resp)
 
+	// **19.2 Task 7 body-mutation delivery (encode side):** when the
+	// just-completed stage is stageResponseBody, the applyProcessingResponse
+	// arm may have mutated f.encodeBodyBuf via the body_mutation switch.
+	// Register the (possibly-mutated) buffer with the chain via ADR-0131
+	// OverwriteBody BEFORE signalResume — otherwise the chain unwinds + HCM
+	// reads chain.EncodeBodyOverride() before the override is registered,
+	// missing the mutation. Per ADR-0131 §Decision (vi): OverwriteBody is
+	// safe to call from the dispatch goroutine prior to the resume signal
+	// (the dispatch goroutine is the SOLE writer to the chain's
+	// encodeBodyOverride at this moment; the parked HCM dispatch is
+	// happens-before-ordered after the resume-channel send).
+	//
+	// The request_body analog is OMITTED — the decode side has no
+	// OverwriteBody equivalent (the KNOWN LIMITATION documented at
+	// (*filter).DecodeData). The decode-side body-mutation arm writes to
+	// f.decodeBodyBuf which is visible to the per-stream filter but does
+	// NOT reach the upstream; only the Content-Length header reconciliation
+	// (via the f.decodeHeaders live map shared with HCM) is delivered.
+	if s == stageResponseBody {
+		f.deliverEncodeBodyMutation()
+	}
+
 	switch act {
 	case actContinue, actError, actContinueButStillWaiting, actImmediate:
 		// actImmediate REQUIRES the resume signal per the
@@ -743,13 +886,21 @@ func (f *filter) completeStage(s stage, resp *extprocsvcv3.ProcessingResponse, r
 // completeStage switch above + any future direct-resume call sites share a
 // single implementation. Nil-tolerant on dcb/ecb (test code paths may not
 // have populated either).
+//
+// Per ADR-0171 §Decision AMENDMENT (phase-19.2 Task 4): the 4-stage extension
+// keeps the per-direction discipline — decode stages (`stageRequestHeaders` +
+// `stageRequestBody`) signal `ContinueDecoding`; encode stages
+// (`stageResponseHeaders` + `stageResponseBody`) signal `ContinueEncoding`.
+// Body stages reuse the SAME resume primitive as their header counterpart
+// per the parent §5.P10 SPEC §6.8 invariant (one resume signal per parked
+// stage's outbound).
 func (f *filter) signalResume(s stage) {
 	switch s {
-	case stageRequestHeaders:
+	case stageRequestHeaders, stageRequestBody:
 		if f.dcb != nil {
 			f.dcb.ContinueDecoding()
 		}
-	case stageResponseHeaders:
+	case stageResponseHeaders, stageResponseBody:
 		if f.ecb != nil {
 			f.ecb.ContinueEncoding()
 		}
@@ -763,9 +914,8 @@ func (f *filter) signalResume(s stage) {
 
 // handleOverrideMessageTimeout consumes a ProcessingResponse.override_message_timeout
 // per the parent §5.P10 RATIFIED discipline + ADR-0171 §Decision header-mode
-// portion. Returns true iff the override was accepted (the timer reset
-// scheduled for the NEXT dispatchStage Send/Recv pair via f.activeMsgTimeout
-// mutation per D6 cancel-and-rebuild discipline).
+// portion. Returns true iff the override was accepted (gating + per-stage
+// idempotency tracking per parent §5.P10).
 //
 // Gating per parent §5.P10:
 //
@@ -780,8 +930,29 @@ func (f *filter) signalResume(s stage) {
 //
 //   - overrideMessageTimeoutReceived++.
 //   - f.overrideApplied[stage] = true.
-//   - f.activeMsgTimeout = duration (consumed by the NEXT dispatchStage per
-//     the D6 cancel-and-rebuild discipline — see ADR-0171 §Decision (vi)).
+//   - f.activeMsgTimeout = duration (consumed by any FUTURE dispatchStage
+//     invocation on a freshly-opened stream — see stream-fatal note below).
+//   - f.activeMsgCancel fired (if non-nil) → cascades stream-fatal.
+//
+// **Stream-fatal cascade per Task 4 watchdog pattern (ADR-0171 §Decision
+// AMENDMENT bullet 5).** Invoking the in-flight `activeMsgCancel` triggers
+// `msgCtx.Done()` in the dispatchStage watchdog goroutine, which fires
+// `f.streamCancel()` and cascade-terminates the WHOLE bidi-stream
+// (the in-flight Recv unblocks with context.Canceled per the gRPC
+// ClientStream contract). The "rebuild with override duration" semantic
+// therefore applies ONLY to a future-stream lifecycle (if the stream is
+// reopened by a subsequent request — a per-listener scope, not a
+// continuation of the current in-flight stage): the
+// override_message_timeout-driven cancel is effectively a stream-fatal
+// classification. Per parent §5.P10 + ADR-0171 §Decision (v)
+// at-most-one-in-flight + the bidi-stream's one-shot-per-HTTP-transaction
+// lifetime (ADR-0167 §Decision), this is the intended behavior: an
+// operator who configures override_message_timeout for tighter mid-stream
+// bounds accepts the all-or-nothing stream-fatal classification on cancel.
+// The alternative (per-stage Recv interruption without canceling the
+// stream) would break the Send/Recv-same-goroutine invariant that 19.1's
+// TestSequentialDecodeEncodeDispatchNoRace +
+// TestBidiStreamSendRecvDiscipline assert.
 //
 // Per parent §5.P10 the override_message_timeout ProcessingResponse has its
 // OTHER fields IGNORED; the caller (applyProcessingResponse) short-circuits
@@ -815,14 +986,33 @@ func (f *filter) handleOverrideMessageTimeout(s stage, ot *durationpb.Duration) 
 		}
 		return false
 	}
-	// Accept: reset the per-stage timer for the NEXT Send/Recv pair via
-	// f.activeMsgTimeout mutation per D6 cancel-and-rebuild discipline.
+	// Accept: mutate f.activeMsgTimeout (consumed by any FUTURE dispatchStage
+	// on a freshly-opened stream — the in-flight cancel below cascades
+	// stream-fatal, so there is NO continuation of the current stream
+	// observing the new duration).
 	if s >= 0 && int(s) < len(f.overrideApplied) {
 		f.overrideApplied[s] = true
 	}
 	f.activeMsgTimeout = d
 	if f.cc.stats != nil {
 		f.cc.stats.overrideMessageTimeoutReceived.Inc()
+	}
+	// **19.2 Task 4 ADR-0171 §Decision AMENDMENT behavioral lift** per
+	// planner-time D4: fire the in-flight per-message cancel (if captured by
+	// the dispatchStage goroutine). The cancel triggers msgCtx.Done() in the
+	// dispatchStage watchdog goroutine → watchdog fires f.streamCancel() →
+	// whole bidi-stream terminates (in-flight Recv unblocks with
+	// context.Canceled per the gRPC ClientStream contract). This is
+	// STREAM-FATAL by design — see the docstring "Stream-fatal cascade" note
+	// for the trade-off justification. CLEAR f.activeMsgCancel after fire so
+	// the deferred clear in dispatchStage does not double-fire on a
+	// non-owner slot.
+	f.mu.Lock()
+	cancel := f.activeMsgCancel
+	f.activeMsgCancel = nil
+	f.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	return true
 }

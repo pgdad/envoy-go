@@ -96,6 +96,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -136,13 +137,28 @@ func init() {
 var errStageMismatch = errors.New(
 	"ext_proc: stage-mismatch: processor returned a ProcessingResponse for a different stage than the filter dispatched")
 
-// errContinueAndReplaceNot19_1 is returned by applyProcessingResponse when a
-// CommonResponse with status=CONTINUE_AND_REPLACE arrives in 19.1. Per
-// ADR-0172 §Decision header-mode portion + D7: classified as spurious +
-// dispError. Lifts at 19.2 with body-mode activation per the ADR-0172
-// AMENDMENT path.
-var errContinueAndReplaceNot19_1 = errors.New(
-	"ext_proc: CONTINUE_AND_REPLACE not supported in 19.1 (header-mode portion); lands at 19.2 with body-mode activation per ADR-0172 §Decision AMENDMENT")
+// errContinueAndReplaceNot19_1 was the 19.1 sentinel for the spurious-dispatch
+// of CONTINUE_AND_REPLACE at header stages. It is RETIRED at Task 6 per the
+// ADR-0172 §Decision AMENDMENT (phase 19.2) — the 19.1 spurious-dispatch
+// LIFTS at 19.2 to a per-SPEC-§4.3-table stage-aware dispatch (header stage
+// + body-mode = NONE → CONSUMED as no-op for body / actContinue; header
+// stage + body-mode = BUFFERED → combined replacement / actContinueButStill-
+// Waiting; body stage → TREATED AS CONTINUE / actContinue). No sentinel
+// error is returned at any of the three dispositions, so the identifier is
+// fully removed at Task 6 (the 19.1 §Decision body's reference to the
+// sentinel is superseded by the §Decision AMENDMENT body).
+
+// errStreamedResponseBodyMutationUnsupported is returned by applyProcessingResponse
+// when a CommonResponse.body_mutation arrives carrying the STREAMED_RESPONSE
+// oneof arm (StreamedBodyResponse). Per ADR-0172 §Decision AMENDMENT (phase
+// 19.2) + SPEC §4.2 table row 3 + planner-time D6: STREAMED-class body modes
+// are out-of-envelope permanently (per parent §4.4 deferred-field discipline)
+// — the IMPL increments `spurious_msgs_received` + classifies the response as
+// malformed per ADR-0172 §Decision (iv) discipline + returns actError with
+// this sentinel for caller-visible failure-mode dispatch. The error wording
+// is the verbatim D6 string anchored at the planner-time decision.
+var errStreamedResponseBodyMutationUnsupported = errors.New(
+	"ext_proc: streamed_response body mutation not supported (STREAMED body modes out-of-envelope per parent §4.4)")
 
 // ---------------------------------------------------------------------------
 // resolvedMutationRules — pre-compiled per-header gating per parent §5.P3 +
@@ -531,28 +547,35 @@ func emitImmediateResponse(f *filter, ir *extprocsvcv3.ImmediateResponse, s stag
 	// Emit per-stage. Decode-stage: f.dcb.SendLocalReply.
 	// Encode-stage: f.ecb.SendLocalReply (FIRST §9 row to emit SendLocalReply
 	// from the encode side at response_headers per ADR-0167 + ADR-0075).
+	//
+	// At phase 19.2 the body stages (stageRequestBody / stageResponseBody)
+	// are added per ADR-0172 §Decision AMENDMENT + SPEC §4.4 — body-stage
+	// ImmediateResponse fires SendLocalReply via the SAME multi-stage
+	// infrastructure (the deny-path wire shape is identical at all four
+	// stages). Each direction routes through dcb.SendLocalReply per ADR-0075
+	// (the framework's encode-side local-reply path enters via dcb regardless
+	// of the originating stage — the encode chain enters at filter[len-1]).
 	switch s {
-	case stageRequestHeaders:
+	case stageRequestHeaders, stageRequestBody:
+		// Decode side (request_headers / request_body): emit via
+		// dcb.SendLocalReply. The 19.2 body-stage extension reuses the
+		// existing dcb path verbatim per SPEC §4.4.
 		if f.dcb != nil {
 			f.dcb.SendLocalReply(status, body, headers)
 		}
-	case stageResponseHeaders:
-		if f.ecb != nil {
-			// Encoder-side SendLocalReply per ADR-0174 + ADR-0167. The
-			// existing EncoderFilterCallbacks at 19.1 does NOT carry
-			// SendLocalReply (the framework's encode-side local-reply path
-			// uses the decoder-side dcb.SendLocalReply per ADR-0085; the
-			// encode-chain enters at filter[len-1]). The 19.1 emission
-			// path therefore routes ALSO through f.dcb.SendLocalReply when
-			// f.ecb is the only non-nil callback — but the BOTH-decode-and-
-			// encode filter at ADR-0167 carries f.dcb non-nil throughout
-			// the per-stream lifetime, so the dcb-based emission below
-			// covers BOTH stages reliably. The structural switch above
-			// remains for future-proofing if/when the EncoderFilterCallbacks
-			// grows its own SendLocalReply primitive.
-			if f.dcb != nil {
-				f.dcb.SendLocalReply(status, body, headers)
-			}
+	case stageResponseHeaders, stageResponseBody:
+		// Encode side (response_headers / response_body): the BOTH-decode-
+		// and-encode filter at ADR-0167 carries f.dcb non-nil throughout
+		// the per-stream lifetime; the framework's encode-side local-reply
+		// path enters via dcb per ADR-0075 (the encode chain enters at
+		// filter[len-1]). The 19.2 response_body stage activation reuses
+		// the SAME dcb path per SPEC §4.4 ("the deny-path wire shape is
+		// identical at all four stages"). The presence of f.ecb is checked
+		// for forward-compat if/when EncoderFilterCallbacks grows its own
+		// SendLocalReply primitive, but the emission still routes through
+		// dcb for protocol-faithful behavior.
+		if f.dcb != nil {
+			f.dcb.SendLocalReply(status, body, headers)
 		}
 	}
 	return actImmediate
@@ -665,7 +688,13 @@ func applyProcessingResponse(f *filter, s stage, resp *extprocsvcv3.ProcessingRe
 		// classified as spurious). Body / trailer stages reserved for 19.2.
 	}
 
-	// Step 4: CommonResponse extraction per stage.
+	// Step 4: CommonResponse extraction per stage. Body-stage oneof arms
+	// (request_body / response_body) extracted via BodyResponse.Response per
+	// the ADR-0171 §Decision AMENDMENT (phase-19.2 Task 4 — 4-stage state
+	// machine extension). The body_mutation arm of CommonResponse is
+	// CONSUMED at Task 6 (ADR-0172 §Decision AMENDMENT); at Task 4 the
+	// extraction itself extends so body-stage ProcessingResponses are NOT
+	// mis-classified as stage-mismatch.
 	var cr *extprocsvcv3.CommonResponse
 	switch s {
 	case stageRequestHeaders:
@@ -675,6 +704,14 @@ func applyProcessingResponse(f *filter, s stage, resp *extprocsvcv3.ProcessingRe
 	case stageResponseHeaders:
 		if hr := resp.GetResponseHeaders(); hr != nil {
 			cr = hr.GetResponse()
+		}
+	case stageRequestBody:
+		if br := resp.GetRequestBody(); br != nil {
+			cr = br.GetResponse()
+		}
+	case stageResponseBody:
+		if br := resp.GetResponseBody(); br != nil {
+			cr = br.GetResponse()
 		}
 	}
 	if cr == nil {
@@ -705,6 +742,26 @@ func applyProcessingResponse(f *filter, s stage, resp *extprocsvcv3.ProcessingRe
 		}
 	}
 
+	// Step 5.5: body_mutation arm per ADR-0172 §Decision AMENDMENT (phase
+	// 19.2) + SPEC §4.2 table. Applies at body stages (request_body /
+	// response_body) AND at header stages when CONTINUE_AND_REPLACE is in
+	// flight with body-mode = BUFFERED (the combined-replacement case at
+	// Step 7 — body_mutation runs as part of that bundle). At header stages
+	// WITHOUT CONTINUE_AND_REPLACE the body_mutation arm is structurally
+	// applied iff present (defensive — the proto does not formally constrain
+	// body_mutation to body stages, but in practice processors emit it only
+	// at body stages OR alongside CONTINUE_AND_REPLACE at header stages).
+	//
+	// The PARSE-REJECT for body_mutation.streamed_response per D6 returns
+	// actError + sentinel + spurious++ BEFORE Step 6/7 — the malformed
+	// response disposition supersedes the rest of the dispatcher per the
+	// ADR-0172 §Decision (iv) "treated as malformed" discipline.
+	if bm := cr.GetBodyMutation(); bm != nil {
+		if act, err := applyBodyMutation(f, s, bm); err != nil {
+			return act, err
+		}
+	}
+
 	// Step 6: clear_route_cache / route_cache_action precedence per parent §5.P5.
 	if s == stageRequestHeaders && f.cc != nil {
 		shouldClear := shouldClearRouteCache(cr.GetClearRouteCache(), f.cc.routeCacheAction)
@@ -717,16 +774,180 @@ func applyProcessingResponse(f *filter, s stage, resp *extprocsvcv3.ProcessingRe
 		// Task 11 integration site.
 		_ = shouldClear
 	}
+	// At body stages (request_body / response_body): clear_route_cache is
+	// IGNORED per SPEC §4.4 + the proto's "ignored in the response direction"
+	// wording (the route-cache is moot once the upstream call has begun). No
+	// counter increment + no special handling — the cr.GetClearRouteCache()
+	// value is silently dropped (the `s == stageRequestHeaders` guard above
+	// already enforces this; this comment pins the discipline for grep-
+	// discoverability post-19.2 §Decision AMENDMENT).
 
-	// Step 7: CONTINUE_AND_REPLACE per ADR-0172 §Decision D7.
+	// Step 7: CONTINUE_AND_REPLACE per ADR-0172 §Decision AMENDMENT (phase
+	// 19.2) + SPEC §4.3 table. Stage-aware dispatch supersedes the 19.1
+	// spurious-dispatch (the errContinueAndReplaceNot19_1 sentinel is
+	// RETIRED — see its tombstone doc-comment above):
+	//
+	//   - Header stages WITH body-mode = NONE: CONSUMED as no-op for body
+	//     (header_mutation at Step 5 already applied; no body to replace;
+	//     the spurious-dispatch LIFTS — no counter increment). Returns
+	//     actContinue.
+	//
+	//   - Header stages WITH body-mode = BUFFERED: CONSUMED as combined
+	//     header+body replacement (header_mutation at Step 5 already applied;
+	//     body_mutation at Step 5.5 already applied; the body-stage outbound
+	//     dispatch MUST be SKIPPED on the next DecodeData/EncodeData entry
+	//     since the body is already in flight via the header-stage response).
+	//     Sets f.skipBodyStageDispatch[direction] = true so Task 7's body-
+	//     stage entry checks the flag + bypasses the body-stage outbound
+	//     dispatch. Returns actContinueButStillWaiting per SPEC §4.3 row 2
+	//     transition note (the header-stage dispatcher signals "continue
+	//     to the next stage but the next stage's outbound is suppressed").
+	//
+	//   - Body stages (request_body / response_body): TREATED AS CONTINUE
+	//     per the proto's "ignored at body stages" wording + the race-
+	//     avoidance rationale at SPEC §1 item 4 (the body is already in
+	//     flight; replacement would race with the buffered-body release
+	//     path). No counter increment — proto silently ignores. Returns
+	//     actContinue.
 	if cr.GetStatus() == extprocsvcv3.CommonResponse_CONTINUE_AND_REPLACE {
-		if f.cc != nil && f.cc.stats != nil {
-			f.cc.stats.spuriousMsgsReceived.Inc()
+		switch s {
+		case stageRequestHeaders, stageResponseHeaders:
+			// Determine the body-mode for this direction from
+			// f.activeProcessingMode. nil-tolerant — falls back to NONE
+			// (which exits the BUFFERED branch via the default case below).
+			bufferedHere := false
+			if f.activeProcessingMode != nil {
+				switch s {
+				case stageRequestHeaders:
+					bufferedHere = f.activeProcessingMode.RequestBodyMode ==
+						extprocv3.ProcessingMode_BUFFERED
+				case stageResponseHeaders:
+					bufferedHere = f.activeProcessingMode.ResponseBodyMode ==
+						extprocv3.ProcessingMode_BUFFERED
+				}
+			}
+			if bufferedHere {
+				// Combined header+body replacement. Set the per-direction
+				// skip flag so Task 7's body-stage entry bypasses the body-
+				// stage outbound dispatch. The substantive header_mutation +
+				// body_mutation already applied at Step 5 + Step 5.5 above.
+				switch s {
+				case stageRequestHeaders:
+					f.skipBodyStageDispatch[directionRequest] = true
+				case stageResponseHeaders:
+					f.skipBodyStageDispatch[directionResponse] = true
+				}
+				return actContinueButStillWaiting, nil
+			}
+			// body-mode = NONE: CONSUMED as no-op for body (19.1 spurious-
+			// dispatch LIFTS). Falls through to actContinue at the bottom.
+		case stageRequestBody, stageResponseBody:
+			// TREATED AS CONTINUE — the proto silently ignores at body
+			// stages (no counter increment). Falls through to actContinue
+			// at the bottom.
 		}
-		return actError, errContinueAndReplaceNot19_1
 	}
 
 	return actContinue, nil
+}
+
+// applyBodyMutation implements the body_mutation oneof discipline per
+// ADR-0172 §Decision AMENDMENT (phase 19.2) + SPEC §4.2:
+//
+//   - *BodyMutation_Body: REPLACE the per-direction body buffer
+//     (decodeBodyBuf / encodeBodyBuf depending on `s`) + reconcile
+//     Content-Length on the corresponding header set (decodeHeaders /
+//     encodeHeaders).
+//   - *BodyMutation_ClearBody (true): empty the body buffer + Content-Length: 0.
+//   - *BodyMutation_ClearBody (false): no-op (the buffer + headers
+//     unchanged).
+//   - *BodyMutation_StreamedResponse: PARSE-REJECT per D6 — increment
+//     spurious_msgs_received + return actError + errStreamedResponseBody-
+//     MutationUnsupported with the D6 wording.
+//
+// The Content-Length reconciliation uses direct `header.Set` on the stashed
+// header map (decodeHeaders / encodeHeaders) per the established Task 8
+// applyHeaderMutation live-set pattern. nil-tolerant on the header carrier
+// (synthetic / test paths that did not invoke DecodeHeaders / EncodeHeaders).
+//
+// Per stage:
+//
+//   - stageRequestHeaders / stageRequestBody: writes f.decodeBodyBuf +
+//     f.decodeHeaders.
+//   - stageResponseHeaders / stageResponseBody: writes f.encodeBodyBuf +
+//     f.encodeHeaders.
+//
+// The body-buffer write happens IN-PLACE on the per-direction byte slice
+// field (replacing the entire slice header — len + cap + ptr). At Task 7
+// the DecodeData / EncodeData endStream entry stashes the accumulated body
+// onto the field BEFORE invoking dispatchStage; the dispatcher mutates the
+// stashed field; the post-resume path consumes the (possibly-mutated) buffer
+// when releasing the body downstream. At Task 6 the field is unit-test
+// populated directly + asserted post-mutation; the integration site (the
+// DecodeData / EncodeData → dispatchStage → resume → release-downstream
+// path) lands at Task 7.
+//
+// Returns (actContinue, nil) for body / clear_body arms (happy path); only
+// the streamed_response arm returns (actError, err).
+func applyBodyMutation(f *filter, s stage, bm *extprocsvcv3.BodyMutation) (action, error) {
+	if f == nil || bm == nil {
+		return actContinue, nil
+	}
+	switch bm.GetMutation().(type) {
+	case *extprocsvcv3.BodyMutation_Body:
+		newBody := bm.GetBody()
+		writeBodyMutation(f, s, newBody)
+	case *extprocsvcv3.BodyMutation_ClearBody:
+		if bm.GetClearBody() {
+			writeBodyMutation(f, s, nil)
+		}
+		// clear_body=false: no-op per SPEC §4.2 row 2.
+	case *extprocsvcv3.BodyMutation_StreamedResponse:
+		// PARSE-REJECT per D6 + SPEC §4.2 row 3.
+		if f.cc != nil && f.cc.stats != nil {
+			f.cc.stats.spuriousMsgsReceived.Inc()
+		}
+		return actError, errStreamedResponseBodyMutationUnsupported
+	default:
+		// Unknown / nil oneof discriminator: no-op (the Mutation field may
+		// be nil if the proto carries an empty BodyMutation{}; the body
+		// buffer + headers are left untouched). NOT classified as spurious
+		// — an empty BodyMutation is structurally valid + means "no body
+		// changes" per the proto's oneof default.
+	}
+	return actContinue, nil
+}
+
+// writeBodyMutation replaces the per-direction body buffer + reconciles
+// Content-Length on the corresponding header set. nil-tolerant on the
+// header carrier (synthetic / test paths that did not invoke DecodeHeaders /
+// EncodeHeaders). `newBody` may be nil (treated as zero-length).
+//
+// Per ADR-0128 §Decision (decode side) + ADR-0175 §Decision (encode side)
+// the Content-Length reconciliation is a strict equality with the
+// post-mutation body length — the proto-faithful behavior on body-mutation
+// is "the processor takes ownership of the body bytes; reconcile the
+// Content-Length to reflect the new size". Transfer-Encoding: chunked is
+// NOT handled here (the framework's wire-write layer is chunked-aware per
+// phase-04; at 19.2 the body-mutation surface assumes a Content-Length
+// header set since the chain accumulation discipline requires bounded
+// bodies — BUFFERED mode by definition).
+func writeBodyMutation(f *filter, s stage, newBody []byte) {
+	if f == nil {
+		return
+	}
+	switch s {
+	case stageRequestHeaders, stageRequestBody:
+		f.decodeBodyBuf = newBody
+		if f.decodeHeaders != nil {
+			f.decodeHeaders.Set("content-length", strconv.Itoa(len(newBody)))
+		}
+	case stageResponseHeaders, stageResponseBody:
+		f.encodeBodyBuf = newBody
+		if f.encodeHeaders != nil {
+			f.encodeHeaders.Set("content-length", strconv.Itoa(len(newBody)))
+		}
+	}
 }
 
 // isHeaderResponseStage reports whether the stage is a header-response stage

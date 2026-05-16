@@ -2066,3 +2066,386 @@ func TestEncoderCB_ListenerPrincipal_NotSeeded_ReturnsEmpty(t *testing.T) {
 		t.Errorf("expected empty listenerPrincipal on no-seed chain; got %q", probe.listenerPrinc)
 	}
 }
+
+// --- ADR-0175 encode-side body-buffering framework primitive Group N+4 tests ---
+//
+// Phase-19.2 Task 2 introduces envoy-go's FIRST encode-side body-buffering
+// primitive: EncoderFilterCallbacks.BufferEncodedBody() []byte. The chain-side
+// extension extends RunEncodeData to ACCUMULATE bytes on the
+// DataStopIterationAndBuffer disposition (mirrors the decode-side
+// c.decodeBuf accumulation at RunDecodeData) into c.encodeBuf; on resume at
+// end_stream the chain releases the accumulated (possibly-mutated) buffer
+// downstream + clears c.encodeBuf, closing the buffering window per ADR-0175
+// §Decision. The DataStopIterationNoBuffer disposition stays park-only — no
+// accumulation, no release. Overflow handling is SYMMETRIC to the decode-side
+// errDecodeBufferOverflow path via the existing filterBufferLimitBytes cap +
+// errEncodeBufferOverflow sentinel.
+
+// bufferEncodedBodyProbe is a test-only StreamEncoderFilter that, on its
+// FIRST EncodeData call, returns DataStopIterationAndBuffer + records the
+// chain-accumulated bytes visible via BufferEncodedBody() at the moment of
+// the callback's return path (the chain has appended `data` to its encodeBuf
+// BEFORE parking — so the buffered slice should reflect the freshly-appended
+// chunk). On the SECOND and subsequent EncodeData calls, returns
+// DataContinue + records the visible buffered state. Drives the
+// AccumulatesAcrossMultipleEncodeData test by being invoked on multiple
+// RunEncodeData chunks; the async resume between calls is fired by the test
+// harness via ContinueEncoding from a goroutine.
+type bufferEncodedBodyProbe struct {
+	cb               EncoderFilterCallbacks
+	callCount        int                // number of EncodeData invocations
+	bufferedSnapshot [][]byte           // chain-buffered bytes observed AFTER chain accumulation per call
+	dispositions     []FilterDataStatus // disposition returned on each call (Buffer or Continue)
+	bufferOnLastN    int                // number of leading calls that should return Buffer (rest Continue)
+	// captureAfterPark is the body the test wants the probe to observe at the
+	// end of each call — only meaningful when the chain releases the buffer
+	// downstream (end_stream + post-resume reset).
+}
+
+func (p *bufferEncodedBodyProbe) EncodeHeaders(http.Header, bool) FilterHeadersStatus {
+	return Continue
+}
+func (p *bufferEncodedBodyProbe) EncodeData(d []byte, end bool) FilterDataStatus {
+	p.callCount++
+	// Snapshot the chain-visible buffered state EARLY — the chain's
+	// RunEncodeData appends `d` to c.encodeBuf BEFORE parking, so a snapshot
+	// taken before returning Buffer reflects the pre-append state. We want
+	// the POST-append state, so we leverage the fact that the chain's
+	// accumulate-then-park happens AFTER EncodeData returns. The cleanest
+	// observation point is via a goroutine that races the park — but for the
+	// non-race accumulation test we accept that the in-callback snapshot
+	// shows the prior buffered state (before THIS chunk is appended) and
+	// assert against that. For the AccumulatesAcrossMultipleEncodeData test
+	// we observe the snapshot on call N+1 to see the accumulation from
+	// call N.
+	snap := p.cb.BufferEncodedBody()
+	if snap != nil {
+		cp := make([]byte, len(snap))
+		copy(cp, snap)
+		p.bufferedSnapshot = append(p.bufferedSnapshot, cp)
+	} else {
+		p.bufferedSnapshot = append(p.bufferedSnapshot, nil)
+	}
+	if p.callCount <= p.bufferOnLastN {
+		p.dispositions = append(p.dispositions, DataStopIterationAndBuffer)
+		return DataStopIterationAndBuffer
+	}
+	p.dispositions = append(p.dispositions, DataContinue)
+	return DataContinue
+}
+func (p *bufferEncodedBodyProbe) EncodeTrailers(http.Header) FilterTrailersStatus {
+	return TrailersContinue
+}
+func (p *bufferEncodedBodyProbe) SetEncoderCallbacks(cb EncoderFilterCallbacks) { p.cb = cb }
+func (p *bufferEncodedBodyProbe) OnDestroy()                                    {}
+
+// downstreamCaptureFilter is a test-only StreamEncoderFilter that records
+// the `data` passed to EncodeData. Used to assert the chain's
+// "release-the-buffered-downstream" semantic on end_stream — the next
+// (downstream) filter in REVERSE-iteration order should observe the
+// accumulated buffer as its `data` argument, NOT the per-call chunk.
+type downstreamCaptureFilter struct {
+	cb            EncoderFilterCallbacks
+	captured      [][]byte // copies of the `data` slice as received on each EncodeData
+	endStreamSeen []bool
+}
+
+func (p *downstreamCaptureFilter) EncodeHeaders(http.Header, bool) FilterHeadersStatus {
+	return Continue
+}
+func (p *downstreamCaptureFilter) EncodeData(d []byte, end bool) FilterDataStatus {
+	cp := append([]byte(nil), d...)
+	p.captured = append(p.captured, cp)
+	p.endStreamSeen = append(p.endStreamSeen, end)
+	return DataContinue
+}
+func (p *downstreamCaptureFilter) EncodeTrailers(http.Header) FilterTrailersStatus {
+	return TrailersContinue
+}
+func (p *downstreamCaptureFilter) SetEncoderCallbacks(cb EncoderFilterCallbacks) { p.cb = cb }
+func (p *downstreamCaptureFilter) OnDestroy()                                    {}
+
+// TestEncoderCB_BufferEncodedBody_AccumulatesAcrossMultipleEncodeData asserts
+// ADR-0175 §Decision accumulation: when a filter returns
+// DataStopIterationAndBuffer across N RunEncodeData calls (each chunk parked
+// + unparked via ContinueEncoding before the next chunk arrives), the chain's
+// c.encodeBuf accumulates the union of all buffered chunks. Cleared at
+// end_stream on the LAST RunEncodeData call per the release-and-clear
+// discipline.
+func TestEncoderCB_BufferEncodedBody_AccumulatesAcrossMultipleEncodeData(t *testing.T) {
+	probe := &bufferEncodedBodyProbe{
+		// Buffer on the first 3 chunks; the 4th chunk (end_stream) buffers + releases.
+		bufferOnLastN: 4,
+	}
+	hf := []HTTPFilter{{Name: "probe", Encoder: probe}}
+	chain := NewFilterChain(hf, nil)
+
+	// 4 chunks ABCD; the filter buffers on each; a goroutine unparks
+	// the chain after each chunk's park via ContinueEncoding.
+	chunks := [][]byte{[]byte("A"), []byte("B"), []byte("C"), []byte("D")}
+	for i, ch := range chunks {
+		endStream := i == len(chunks)-1
+		// Async resume — gives the chain time to enter park before the unpark fires.
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			probe.cb.ContinueEncoding()
+		}()
+		terminated, err := chain.RunEncodeData(context.Background(), ch, endStream)
+		if err != nil {
+			t.Fatalf("RunEncodeData chunk %d: %v", i, err)
+		}
+		if !terminated {
+			t.Fatalf("expected RunEncodeData chunk %d to complete (terminated=true); got false", i)
+		}
+	}
+
+	// The probe must have been invoked exactly 4 times (one per chunk).
+	if probe.callCount != 4 {
+		t.Fatalf("expected probe.EncodeData called 4 times; got %d", probe.callCount)
+	}
+
+	// In-callback snapshots (taken BEFORE the chain appends the current
+	// chunk) should reflect the prior accumulation:
+	//   call 1: snapshot = nil   (no prior buffering)
+	//   call 2: snapshot = "A"   (call 1 appended A before parking)
+	//   call 3: snapshot = "AB"  (call 2 appended B; call 1 already had A)
+	//   call 4: snapshot = "ABC"
+	wantSnapshots := [][]byte{nil, []byte("A"), []byte("AB"), []byte("ABC")}
+	if len(probe.bufferedSnapshot) != len(wantSnapshots) {
+		t.Fatalf("expected %d snapshots; got %d", len(wantSnapshots), len(probe.bufferedSnapshot))
+	}
+	for i, want := range wantSnapshots {
+		got := probe.bufferedSnapshot[i]
+		if !bytes.Equal(got, want) {
+			t.Errorf("call %d snapshot: got %q; want %q", i+1, got, want)
+		}
+	}
+
+	// After end_stream the chain RELEASES the buffer downstream — for a
+	// single-filter chain the release replaces the local `data` payload and
+	// then iteration completes (no further filters). The chain-level
+	// encodeBuf must be cleared.
+	if chain.encodeBuf != nil {
+		t.Errorf("expected chain.encodeBuf cleared after end_stream release; got %q (len=%d)", chain.encodeBuf, len(chain.encodeBuf))
+	}
+}
+
+// TestEncoderCB_ContinueEncoding_ReleasesAccumulatedBufferAndClears asserts
+// ADR-0175 §Decision release-and-clear: a 2-filter chain [upstream, probe]
+// (reverse encode order: probe → upstream) where probe buffers on the final
+// (end_stream=true) chunk and upstream captures `data`. On resume the chain
+// must replace the local `data` payload with the (possibly-mutated)
+// accumulated encodeBuf + clear encodeBuf — so upstream observes the
+// buffered bytes (not the per-call chunk) AND the post-call chain.encodeBuf
+// is nil.
+func TestEncoderCB_ContinueEncoding_ReleasesAccumulatedBufferAndClears(t *testing.T) {
+	probe := &bufferEncodedBodyProbe{bufferOnLastN: 1}
+	upstream := &downstreamCaptureFilter{}
+	// Declaration order [upstream, probe]; reverse encode iteration: probe first, then upstream.
+	hf := []HTTPFilter{
+		{Name: "upstream", Encoder: upstream},
+		{Name: "probe", Encoder: probe},
+	}
+	chain := NewFilterChain(hf, nil)
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		probe.cb.ContinueEncoding()
+	}()
+	terminated, err := chain.RunEncodeData(context.Background(), []byte("HELLO"), true)
+	if err != nil {
+		t.Fatalf("RunEncodeData: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunEncodeData to complete (terminated=true); got false")
+	}
+
+	// probe must have been invoked once with the original chunk.
+	if probe.callCount != 1 {
+		t.Errorf("expected probe.EncodeData called once; got %d", probe.callCount)
+	}
+	// upstream must have been invoked once — with the RELEASED accumulated
+	// buffer (which equals "HELLO" since the probe buffered exactly that
+	// chunk).
+	if len(upstream.captured) != 1 {
+		t.Fatalf("expected upstream.EncodeData called once; got %d", len(upstream.captured))
+	}
+	if got := string(upstream.captured[0]); got != "HELLO" {
+		t.Errorf("expected upstream to receive released buffer %q; got %q", "HELLO", got)
+	}
+	// end_stream propagates through to upstream.
+	if !upstream.endStreamSeen[0] {
+		t.Error("expected upstream to observe end_stream=true on the released payload")
+	}
+	// Chain's encodeBuf must be cleared.
+	if chain.encodeBuf != nil {
+		t.Errorf("expected chain.encodeBuf cleared after release; got %q (len=%d)", chain.encodeBuf, len(chain.encodeBuf))
+	}
+}
+
+// TestEncoderCB_RunEncodeData_OverflowEmitsErrEncodeBufferOverflow asserts the
+// ADR-0175 D7 (planner-time) SYMMETRY: encode-side overflow uses the existing
+// filterBufferLimitBytes cap + errEncodeBufferOverflow sentinel — same as
+// the decode-side errDecodeBufferOverflow discipline. The cap-check at the
+// top of RunEncodeData stays valid post-ADR-0175 (encodeBufLen accumulates
+// the per-call sizes across all RunEncodeData invocations; overflow on cap-
+// exceeding returns the sentinel BEFORE iterating any filter).
+func TestEncoderCB_RunEncodeData_OverflowEmitsErrEncodeBufferOverflow(t *testing.T) {
+	// 2-filter chain — buffering probe + a no-op upstream. We're asserting the
+	// cap-check fires regardless of buffering disposition (the encodeBufLen
+	// running total is the source of truth; bringing in the buffering probe
+	// confirms the sentinel fires uniformly).
+	probe := &bufferEncodedBodyProbe{bufferOnLastN: 0} // never buffer
+	hf := []HTTPFilter{{Name: "probe", Encoder: probe}}
+	chain := NewFilterChain(hf, nil)
+
+	// First call: exactly at the cap — passes (encodeBufLen+len == cap; the check is "> cap").
+	first := make([]byte, filterBufferLimitBytes)
+	terminated, err := chain.RunEncodeData(context.Background(), first, false)
+	if err != nil {
+		t.Fatalf("RunEncodeData(first): %v", err)
+	}
+	if !terminated {
+		t.Fatalf("expected first chunk to complete; got terminated=false")
+	}
+	// Second call: pushes over the cap → sentinel.
+	overflow := make([]byte, 1)
+	terminated, err = chain.RunEncodeData(context.Background(), overflow, true)
+	if err == nil {
+		t.Fatal("expected errEncodeBufferOverflow on encode-side overflow; got nil")
+	}
+	if !errors.Is(err, errEncodeBufferOverflow) {
+		t.Fatalf("expected errEncodeBufferOverflow sentinel; got %v", err)
+	}
+	if terminated {
+		t.Fatal("expected terminated=false on overflow sentinel; got true")
+	}
+}
+
+// TestEncoderCB_BufferEncodedBody_RaceDetectorCleanUnderConcurrentEncodeDataAndContinueEncoding
+// asserts ADR-0175's concurrency contract holds under -race: a single
+// dispatch goroutine drives RunEncodeData (the chain's
+// single-dispatch-goroutine invariant per ADR-0071) while a separate goroutine
+// fires ContinueEncoding from outside the EncodeData callback — the
+// established discipline for any async-resume primitive. The accumulation +
+// release path must produce no race-detector findings across N iterations.
+//
+// Race surface: c.encodeBuf is read by the buffering filter's
+// BufferEncodedBody() reader from inside its EncodeData callback (dispatch
+// goroutine) while c.encodeBuf is appended-to / released-and-cleared by the
+// chain's RunEncodeData (same dispatch goroutine). The ContinueEncoding
+// signal arrives from a separate goroutine via the channel-1 buffered
+// encodeResumeCh. The discipline is: the reader observation happens BEFORE
+// the chain returns from EncodeData; the unpark happens via channel signal
+// (no shared-memory write to encodeBuf from the unpark goroutine). This test
+// repeatedly exercises the path under -race to catch any future regression.
+func TestEncoderCB_BufferEncodedBody_RaceDetectorCleanUnderConcurrentEncodeDataAndContinueEncoding(t *testing.T) {
+	const iterations = 50
+	for iter := 0; iter < iterations; iter++ {
+		probe := &bufferEncodedBodyProbe{bufferOnLastN: 1}
+		hf := []HTTPFilter{{Name: "probe", Encoder: probe}}
+		chain := NewFilterChain(hf, nil)
+
+		// Concurrent unpark from a separate goroutine. The race-detector is
+		// the load-bearing observation.
+		go func() {
+			// Small sleep so the dispatch goroutine has a chance to park;
+			// but the buffered-1 channel coalesces if the dispatch hasn't
+			// parked yet (per ADR-0071) so this is safety-belt only.
+			time.Sleep(1 * time.Millisecond)
+			probe.cb.ContinueEncoding()
+		}()
+		terminated, err := chain.RunEncodeData(context.Background(), []byte("x"), true)
+		if err != nil {
+			t.Fatalf("iter %d: RunEncodeData: %v", iter, err)
+		}
+		if !terminated {
+			t.Fatalf("iter %d: expected terminated=true; got false", iter)
+		}
+		// Post-iteration state must show the buffer was released-and-cleared.
+		if chain.encodeBuf != nil {
+			t.Fatalf("iter %d: expected encodeBuf cleared post-release; got len=%d", iter, len(chain.encodeBuf))
+		}
+	}
+}
+
+// TestEncoderCB_RunEncodeData_MultiChunkAccumulationAndRelease_EncodeBufLenCountsEachByteOnce
+// pins the ADR-0175 cap-counter discipline (phase-19.2 Task 2 rework): when a
+// buffering filter accumulates N chunks across N RunEncodeData calls and the
+// chain releases the union buffer at end_stream, the running c.encodeBufLen
+// counter MUST reflect cumulative DISTINCT body bytes — each byte counted
+// EXACTLY ONCE. The original Task 2 IMPL (commit 3f292e9) double-counted the
+// accumulated portion on the release call: it reassigned `data = c.encodeBuf`
+// (the union) and the post-loop `c.encodeBufLen += len(data)` then added the
+// union-length on top of the prior per-chunk bumps. This test drives a
+// 2-chunk multi-chunk encode (A=300 bytes endStream=false + B=400 bytes
+// endStream=true) and asserts encodeBufLen == 700 (NOT 1000 — which is what
+// the pre-rework double-count would yield). Benign in the HCM-single-chunk-
+// per-stream wire path of today; load-bearing for Task 7 + future
+// streaming-encode phases that may dispatch multi-chunk encodes.
+//
+// Cross-reference: chain.go's RunEncodeData DataStopIterationAndBuffer release
+// branch (priorAccum subtract) + the post-loop encodeBufLen cap-counter
+// comment. The reviewer's I1 finding against commit 3f292e9.
+func TestEncoderCB_RunEncodeData_MultiChunkAccumulationAndRelease_EncodeBufLenCountsEachByteOnce(t *testing.T) {
+	// Single-buffer-filter chain. The probe returns DataStopIterationAndBuffer
+	// on EVERY EncodeData call (bufferOnLastN >= number of chunks) so the
+	// chain accumulates both chunks and then releases the union at end_stream.
+	probe := &bufferEncodedBodyProbe{bufferOnLastN: 2}
+	hf := []HTTPFilter{{Name: "probe", Encoder: probe}}
+	chain := NewFilterChain(hf, nil)
+
+	// Chunk A: 300 bytes, !end_stream — accumulates A into encodeBuf, parks,
+	// resumes, completes iteration; post-loop bumps encodeBufLen by 300.
+	chunkA := make([]byte, 300)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		probe.cb.ContinueEncoding()
+	}()
+	terminated, err := chain.RunEncodeData(context.Background(), chunkA, false)
+	if err != nil {
+		t.Fatalf("RunEncodeData(chunkA): %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected chunkA RunEncodeData to complete; got terminated=false")
+	}
+	// Mid-stream invariant: encodeBuf retains the accumulated A; encodeBufLen
+	// reflects the single per-call bump.
+	if got, want := len(chain.encodeBuf), 300; got != want {
+		t.Fatalf("after chunkA: expected chain.encodeBuf len=%d; got %d", want, got)
+	}
+	if got, want := chain.encodeBufLen, 300; got != want {
+		t.Fatalf("after chunkA: expected chain.encodeBufLen=%d; got %d", want, got)
+	}
+
+	// Chunk B: 400 bytes, end_stream=true — the chain appends B to encodeBuf
+	// (union grows to 700), parks, resumes, then takes the release branch:
+	// `data = c.encodeBuf` (700 bytes) + `c.encodeBuf = nil` + subtracts
+	// priorAccum (300 — the union length minus this call's 400-byte data arg)
+	// from encodeBufLen so the post-loop `encodeBufLen += len(data)` bump
+	// (now bumping by 700) yields a NET +400 contribution to encodeBufLen.
+	// Final cumulative encodeBufLen MUST equal 700 (chunkA 300 + chunkB 400).
+	// Pre-rework: encodeBufLen would be 300 + 700 = 1000 (the union double-
+	// counted alongside the prior per-chunk bump). Post-rework: 700.
+	chunkB := make([]byte, 400)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		probe.cb.ContinueEncoding()
+	}()
+	terminated, err = chain.RunEncodeData(context.Background(), chunkB, true)
+	if err != nil {
+		t.Fatalf("RunEncodeData(chunkB): %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected chunkB RunEncodeData to complete; got terminated=false")
+	}
+
+	// Post-release invariants.
+	if chain.encodeBuf != nil {
+		t.Errorf("expected chain.encodeBuf cleared after end_stream release; got len=%d", len(chain.encodeBuf))
+	}
+	// THE LOAD-BEARING ASSERTION: cumulative distinct bytes == 700, NOT 1000.
+	if got, want := chain.encodeBufLen, 700; got != want {
+		t.Fatalf("encodeBufLen double-count regression: expected cumulative distinct bytes %d (chunkA 300 + chunkB 400 — each counted exactly once); got %d (would be 1000 under the pre-rework double-count of the released union)", want, got)
+	}
+}

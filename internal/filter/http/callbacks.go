@@ -182,6 +182,45 @@ type EncoderFilterCallbacks interface {
 	// primitives).
 	OverwriteBody(b []byte)
 
+	// BufferEncodedBody returns the chain-accumulated encode-side body bytes
+	// the chain has appended on prior EncodeData(data, endStream) calls where
+	// this (or another encode-side) filter returned DataStopIterationAndBuffer.
+	// Returns nil before any buffering has occurred OR after the chain has
+	// released the buffer downstream at end_stream (see ADR-0175 §Decision
+	// release-and-clear discipline). The returned slice aliases the chain's
+	// internal buffer; callers MUST NOT mutate beyond its capacity (append is
+	// the recommended mutation API — re-set via subsequent OverwriteBody or
+	// in-place edit through the slice header is permitted only inside an
+	// EncodeData callback when the calling filter holds the dispatch
+	// goroutine, never concurrently). Not goroutine-safe — the encode chain
+	// runs synchronously in the dispatch goroutine per ADR-0071.
+	//
+	// Per ADR-0175 §Decision; envoy-go's FIRST encode-side body-buffering
+	// framework primitive — the symmetric mirror of phase-13 ADR-0128
+	// decode-side body-accumulation (the decode side accumulates on
+	// DataStopIterationAndBuffer into chain.decodeBuf; the encode side
+	// mirrors via chain.encodeBuf accessed through this reader). Distinct
+	// from ADR-0131's OverwriteBody (per-call replacement; the chain
+	// substitutes the supplied bytes verbatim on the SAME EncodeData call)
+	// in semantics: BufferEncodedBody is buffer-and-hold — the chain
+	// accumulates bytes across calls + releases at end_stream. The two
+	// primitives are COMPLEMENTARY and BOTH live on EncoderFilterCallbacks
+	// post-19.2 (phase 14 compressor uses OverwriteBody for per-call
+	// replacement; phase 19.2 ext_proc uses BufferEncodedBody for full-body
+	// inspection-then-mutate against the external processor).
+	//
+	// Cross-phase reuse intent (per ADR-0175 §Decision + §Consequences): any
+	// future encode-side filter needing full-body inspection or mutation
+	// consumes this primitive without re-paying the chain-side plumbing
+	// cost. Specifically anticipated cross-phase consumers: a hypothetical
+	// encode-side lua body-callback filter (response-body Lua transforms);
+	// an encode-side content-injection filter (HTML-rewrite / response-
+	// header-driven body splice). Neither consumer exists at 19.2 — the
+	// primitive is anchored once at 19.2 IMPL to amortize the framework
+	// surgery against the SINGLE current consumer (ext_proc body-mode) AND
+	// the named-forward-pointer future consumers above.
+	BufferEncodedBody() []byte
+
 	// The 6 methods below are the symmetric encoder-side mirror of the
 	// ADR-0165 DecoderFilterCallbacks extension. They land at phase-19.1
 	// Task 5 per ADR-0174 (the ADR-0044 escape-valve firing at SPEC time per

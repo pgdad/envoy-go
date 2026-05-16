@@ -1107,6 +1107,12 @@ func (c *fakeCallbacks) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *fakeCallbacks) DownstreamProtocol() string       { return "" }
 func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
 
+// ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
+// body-buffering framework primitive). Zero-value return; compressor does
+// NOT consume BufferEncodedBody (Path B per ADR-0131 uses OverwriteBody
+// for per-call replacement, not the buffer-and-hold primitive).
+func (c *fakeCallbacks) BufferEncodedBody() []byte { return nil }
+
 // OverwriteBody captures b (defensive copy — the EncodeData implementation
 // passes buf.Bytes() which aliases its bytes.Buffer's internal slice; capturing
 // a copy is the safer assertion surface). Increments overwriteBodyCallCount.

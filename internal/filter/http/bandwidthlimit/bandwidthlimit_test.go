@@ -953,6 +953,12 @@ func (e *fakeEncoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (e *fakeEncoderCB) DownstreamProtocol() string       { return "" }
 func (e *fakeEncoderCB) ListenerPrincipal() string        { return "" }
 
+// ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
+// body-buffering framework primitive). Zero-value return preserves the
+// extended EncoderFilterCallbacks compile-time conformance assertion green;
+// bandwidth_limit does not consume the accessor.
+func (e *fakeEncoderCB) BufferEncodedBody() []byte { return nil }
+
 // makeFilterWithModeBothCB constructs a *filter wired with BOTH a
 // fakeDecoderCB and a fakeEncoderCB. Required for Group 5 since EncodeData
 // needs the responseActive cascade populated via DecodeHeaders FIRST + the

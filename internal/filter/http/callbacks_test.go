@@ -61,6 +61,12 @@ func (c *fakeEncoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *fakeEncoderCB) DownstreamProtocol() string       { return "" }
 func (c *fakeEncoderCB) ListenerPrincipal() string        { return "" }
 
+// ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
+// body-buffering framework primitive). Zero-value return preserves the
+// existing TestEncoderFilterCallbacks_Compile compile-time conformance
+// assertion green.
+func (c *fakeEncoderCB) BufferEncodedBody() []byte { return nil }
+
 func TestEncoderFilterCallbacks_Compile(t *testing.T) {
 	var _ EncoderFilterCallbacks = (*fakeEncoderCB)(nil)
 }

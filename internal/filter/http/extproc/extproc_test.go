@@ -579,11 +579,14 @@ func TestResolveProcessingMode_ExplicitSKIP(t *testing.T) {
 	}
 }
 
-// TestResolveProcessingMode_BodyModeNotNONE_ParseReject asserts the 19.1
-// PARSE-REJECT discipline for *_body_mode != NONE per ADR-0168 §Decision +
-// ADR-0171 §Decision header-mode portion. The PARSE-REJECT lifts at 19.2
-// for BUFFERED only.
-func TestResolveProcessingMode_BodyModeNotNONE_ParseReject(t *testing.T) {
+// TestResolveProcessingMode_BodyModeStreamedClass_ParseReject asserts the
+// PERMANENT PARSE-REJECT discipline for *_body_mode ∈ {STREAMED,
+// BUFFERED_PARTIAL, FULL_DUPLEX_STREAMED} per ADR-0168 §Decision +
+// ADR-0171 §Decision (parent §4.4: STREAMED-class body modes permanently
+// out of envelope). The BUFFERED arm ACCEPTS post-19.2 §Decision AMENDMENT
+// for the gRPC-service arm (see TestResolveProcessingMode_BodyModeBuffered_AcceptsForGRPCService);
+// the STREAMED-class arms continue PARSE-REJECT permanently.
+func TestResolveProcessingMode_BodyModeStreamedClass_ParseReject(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name     string
@@ -591,25 +594,39 @@ func TestResolveProcessingMode_BodyModeNotNONE_ParseReject(t *testing.T) {
 		wantPart string
 	}{
 		{
-			name: "request_body_mode_BUFFERED",
-			mode: &extprocv3.ProcessingMode{
-				RequestBodyMode: extprocv3.ProcessingMode_BUFFERED,
-			},
-			wantPart: "request_body_mode must be NONE",
-		},
-		{
 			name: "request_body_mode_STREAMED",
 			mode: &extprocv3.ProcessingMode{
 				RequestBodyMode: extprocv3.ProcessingMode_STREAMED,
 			},
-			wantPart: "request_body_mode must be NONE",
+			wantPart: "request_body_mode",
 		},
 		{
-			name: "response_body_mode_BUFFERED",
+			name: "request_body_mode_BUFFERED_PARTIAL",
 			mode: &extprocv3.ProcessingMode{
-				ResponseBodyMode: extprocv3.ProcessingMode_BUFFERED,
+				RequestBodyMode: extprocv3.ProcessingMode_BUFFERED_PARTIAL,
 			},
-			wantPart: "response_body_mode must be NONE",
+			wantPart: "request_body_mode",
+		},
+		{
+			name: "request_body_mode_FULL_DUPLEX_STREAMED",
+			mode: &extprocv3.ProcessingMode{
+				RequestBodyMode: extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED,
+			},
+			wantPart: "request_body_mode",
+		},
+		{
+			name: "response_body_mode_STREAMED",
+			mode: &extprocv3.ProcessingMode{
+				ResponseBodyMode: extprocv3.ProcessingMode_STREAMED,
+			},
+			wantPart: "response_body_mode",
+		},
+		{
+			name: "response_body_mode_FULL_DUPLEX_STREAMED",
+			mode: &extprocv3.ProcessingMode{
+				ResponseBodyMode: extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED,
+			},
+			wantPart: "response_body_mode",
 		},
 	}
 	for _, tc := range cases {
@@ -695,16 +712,17 @@ func TestResolveProcessingMode_TrailerModeSKIP_OK(t *testing.T) {
 
 // TestResolveProcessingMode_HTTPServiceBody_ParseReject asserts the proto-
 // level ExtProcHttpService constraint: when http_service is the configured
-// transport, body-mode != NONE PARSE-REJECT. (At 19.1 this is subsumed by
-// the listener-level body-mode != NONE PARSE-REJECT; the explicit gate
-// pre-positions the 19.2 AMENDMENT path where the listener-level check
-// lifts but http_service-mode body PARSE-REJECT remains.)
+// transport, body-mode != NONE PARSE-REJECT — including BUFFERED which the
+// 19.2 §Decision AMENDMENT lifts for the gRPC-service arm only. The
+// http_service body PARSE-REJECT continues PERMANENTLY (per ADR-0168
+// §Decision (iii); see SPEC §2 item 1).
 func TestResolveProcessingMode_HTTPServiceBody_ParseReject(t *testing.T) {
 	t.Parallel()
-	// We use BUFFERED here — the listener-level body-mode PARSE-REJECT fires
-	// FIRST in 19.1 (so we observe the same error string as the BUFFERED
-	// test above). The explicit httpServiceMode=true gate is exercised as a
-	// pre-positioning anchor; the gating-distinction test lands at 19.2.
+	// BUFFERED is the post-§Decision AMENDMENT activation case for the
+	// gRPC-service arm. For http_service mode the BUFFERED arm continues
+	// PARSE-REJECT via the httpServiceMode-gated branch (now load-bearing
+	// — pre-AMENDMENT it was masked by the listener-level body-mode-NONE
+	// PARSE-REJECT firing first).
 	pm := &extprocv3.ProcessingMode{
 		RequestBodyMode: extprocv3.ProcessingMode_BUFFERED,
 	}
@@ -714,6 +732,9 @@ func TestResolveProcessingMode_HTTPServiceBody_ParseReject(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("got = %+v; want nil on PARSE-REJECT", got)
+	}
+	if !strings.Contains(err.Error(), "http_service") {
+		t.Errorf("err = %q; want substring 'http_service' (httpServiceMode-gated PARSE-REJECT)", err.Error())
 	}
 }
 
@@ -1004,6 +1025,7 @@ func (f *fakeECB) DownstreamTLSServerName() string  { return "" }
 func (f *fakeECB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (f *fakeECB) DownstreamProtocol() string       { return "" }
 func (f *fakeECB) ListenerPrincipal() string        { return "" }
+func (f *fakeECB) BufferEncodedBody() []byte        { return nil } // ADR-0175 (phase-19.2 Task 2); fake returns nil — Task 7 wires the real consumer.
 
 func (f *fakeECB) calls() int {
 	f.mu.Lock()
@@ -2082,25 +2104,36 @@ func TestApplyProcessingResponse_StageMismatch_SpuriousDispError(t *testing.T) {
 	}
 }
 
-// TestApplyProcessingResponse_ContinueAndReplace_SpuriousDispError — 19.1
-// PARSE-REJECT (status CONTINUE_AND_REPLACE not supported in header-mode
-// portion).
-func TestApplyProcessingResponse_ContinueAndReplace_SpuriousDispError(t *testing.T) {
+// TestApplyProcessingResponse_ContinueAndReplace_HeaderStageWithBodyModeNONE_NoOp
+// — per Task 6 ADR-0172 §Decision AMENDMENT (SPEC §4.3 row 1): at header
+// stages WITH body-mode = NONE, CONTINUE_AND_REPLACE is CONSUMED as a no-op
+// for body (header_mutation still applies; the 19.1 spurious-dispatch LIFTS).
+// No counter increment + no error + actContinue.
+func TestApplyProcessingResponse_ContinueAndReplace_HeaderStageWithBodyModeNONE_NoOp(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := &compiledConfig{stats: newFilterStats(reg, "t")}
-	f := &filter{cc: cc}
+	// body-mode = NONE per the active processing mode.
+	f := &filter{cc: cc, activeProcessingMode: &resolvedProcessingMode{
+		RequestBodyMode:  extprocv3.ProcessingMode_NONE,
+		ResponseBodyMode: extprocv3.ProcessingMode_NONE,
+	}}
 	cr := &extprocsvcv3.CommonResponse{Status: extprocsvcv3.CommonResponse_CONTINUE_AND_REPLACE}
 	resp := mkProcessingResponseRequestHeaders(cr)
 	act, err := applyProcessingResponse(f, stageRequestHeaders, resp)
-	if act != actError {
-		t.Errorf("act = %v; want actError", act)
+	if err != nil {
+		t.Errorf("err = %v; want nil (CONSUMED as no-op for body when body-mode = NONE per SPEC §4.3)", err)
 	}
-	if !errors.Is(err, errContinueAndReplaceNot19_1) {
-		t.Errorf("err = %v; want errContinueAndReplaceNot19_1", err)
+	if act != actContinue {
+		t.Errorf("act = %v; want actContinue (CONSUMED as no-op per SPEC §4.3 row 1)", act)
 	}
-	if got := cc.stats.spuriousMsgsReceived.Load(); got != 1 {
-		t.Errorf("spuriousMsgsReceived = %d; want 1", got)
+	if got := cc.stats.spuriousMsgsReceived.Load(); got != 0 {
+		t.Errorf("spuriousMsgsReceived = %d; want 0 (19.1 spurious-dispatch LIFTS at 19.2 per SPEC §4.3)", got)
+	}
+	// The body-stage outbound skip flag MUST NOT fire when body-mode = NONE
+	// (no body dispatch will happen anyway).
+	if f.skipBodyStageDispatch[directionRequest] || f.skipBodyStageDispatch[directionResponse] {
+		t.Errorf("skipBodyStageDispatch = %v; want both false (body-mode = NONE → no skip needed)", f.skipBodyStageDispatch)
 	}
 }
 
@@ -2297,19 +2330,54 @@ func TestIsModeInAllowlist_MatchAndMismatch(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // recordingDCB captures SendLocalReply args for assertions.
+//
+// **Task 7 race safety**: the Task 7 integration tests
+// (`TestExtProc_BodyStageImmediateResponse_EndToEnd` +
+// `TestExtProc_OnDestroy_DuringBodyStageOutbound_NoBufferReleaseFires`) invoke
+// SendLocalReply from the async dispatch goroutine — the test's main
+// goroutine polls the fields via `waitForCondition`. The lrMu mutex protects
+// the per-field writes + the matching `lrCallsSafe` / `lrStatusSafe` /
+// `lrBodySafe` accessors used by the Task 7 tests. The existing 19.1-era
+// tests that read fields directly (without mutex) are race-safe because
+// they invoke SendLocalReply synchronously from the test goroutine.
 type recordingDCB struct {
 	fakeDCB
 	lrStatus  int
 	lrBody    string
 	lrHeaders envoyhttp.OrderedHeaders
 	lrCalls   int
+	lrMu      sync.Mutex
 }
 
 func (r *recordingDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
+	r.lrMu.Lock()
 	r.lrCalls++
 	r.lrStatus = status
 	r.lrBody = body
 	r.lrHeaders = headers
+	r.lrMu.Unlock()
+}
+
+// lrCallsSafe + lrStatusSafe + lrBodySafe return the recorded
+// SendLocalReply args under the lrMu mutex; consumed by Task 7 integration
+// tests that poll fields from the test goroutine while the dispatch
+// goroutine writes them.
+func (r *recordingDCB) lrCallsSafe() int {
+	r.lrMu.Lock()
+	defer r.lrMu.Unlock()
+	return r.lrCalls
+}
+
+func (r *recordingDCB) lrStatusSafe() int {
+	r.lrMu.Lock()
+	defer r.lrMu.Unlock()
+	return r.lrStatus
+}
+
+func (r *recordingDCB) lrBodySafe() string {
+	r.lrMu.Lock()
+	defer r.lrMu.Unlock()
+	return r.lrBody
 }
 
 // TestEmitImmediateResponse_DecodeStage_NonGRPC_TextPlain — body + no
@@ -3187,6 +3255,229 @@ func TestBuildResponseHeadersProcessingRequest_D10_SourcePrincipalEmpty(t *testi
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Group N+3 — body-stage attribute envelope builders (Task 5).
+//
+// Tests the buildRequestBodyProcessingRequest + buildResponseBodyProcessingRequest
+// surface per parent SPEC §6.5 + §6.6 + planner-time D5 (header-stage SUPERSET;
+// adds body-stage-natural `request.size` / `response.size` populated from
+// `len(body)` rather than Content-Length-derived). The exact body-stage
+// attribute roster crystallizes empirically at Task 9 fixture-harness scrape
+// against reference Envoy v1.37.2; this group lands the PLAN-time hypothesis.
+// ---------------------------------------------------------------------------
+
+// TestBuildBodyProcessingRequest_PopulatesRequestBodyField asserts the
+// request_body oneof + HttpBody.Body bytes + end_of_stream flag survive intact
+// at the body stage (the body-stage analog of
+// TestBuildRequestHeadersProcessingRequest_PopulatesRequestHeaders).
+func TestBuildBodyProcessingRequest_PopulatesRequestBodyField(t *testing.T) {
+	t.Parallel()
+	dcb := &dcbStub{
+		remoteAddr:    &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1234},
+		tlsServerName: "example.com",
+	}
+	f := &filter{dcb: dcb}
+	body := []byte(`{"hello":"world"}`)
+
+	req := buildRequestBodyProcessingRequest(f, body, true, nil)
+
+	if req == nil {
+		t.Fatalf("req = nil; want non-nil *ProcessingRequest")
+	}
+	rb := req.GetRequestBody()
+	if rb == nil {
+		t.Fatalf("RequestBody oneof not set; got Request = %T", req.GetRequest())
+	}
+	if got := rb.GetBody(); !bytes.Equal(got, body) {
+		t.Errorf("Body = %q; want %q", got, body)
+	}
+	if !rb.GetEndOfStream() {
+		t.Errorf("EndOfStream = false; want true")
+	}
+	// Empty allowlist → no attributes envelope (per D5 + the header-stage
+	// no-attributes-when-nothing-configured discipline).
+	if req.GetAttributes() != nil {
+		t.Errorf("Attributes = %v; want nil (empty allowlist)", req.GetAttributes())
+	}
+}
+
+// TestBuildBodyProcessingRequest_AttributesEnvelopeMirrorsHeaderStage asserts
+// the body-stage attribute envelope MIRRORS the header-stage envelope when
+// driven against the same f.dcb + the same allowlist (excluding the body-stage-
+// only `request.size` attribute). The D5 SUPERSET property — header-stage
+// roster carries to body stage unchanged.
+func TestBuildBodyProcessingRequest_AttributesEnvelopeMirrorsHeaderStage(t *testing.T) {
+	t.Parallel()
+	dcb := &dcbStub{
+		remoteAddr:           &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1234},
+		localAddr:            &net.TCPAddr{IP: net.ParseIP("10.0.0.2"), Port: 8080},
+		tlsServerName:        "example.com",
+		protocol:             "HTTP/2",
+		listenerPrincipal:    "spiffe://cluster.local/listener",
+		downstreamPrincipals: []string{"spiffe://cluster.local/client"},
+	}
+	f := &filter{dcb: dcb}
+	allowlist := []string{
+		"source.address",
+		"destination.address",
+		"connection.requested_server_name",
+		"connection.subject_local_certificate",
+		"request.protocol",
+		"connection.principal",
+		"source.principal",
+	}
+
+	headerReq := buildRequestHeadersProcessingRequest(f, http.Header{}, false, allowlist)
+	bodyReq := buildRequestBodyProcessingRequest(f, []byte("ignored"), false, allowlist)
+
+	headerAttrs := headerReq.GetAttributes()
+	bodyAttrs := bodyReq.GetAttributes()
+	if headerAttrs == nil || bodyAttrs == nil {
+		t.Fatalf("nil attrs: headerAttrs=%v bodyAttrs=%v", headerAttrs, bodyAttrs)
+	}
+	if len(headerAttrs) != len(bodyAttrs) {
+		t.Errorf("len(headerAttrs) = %d; len(bodyAttrs) = %d; want equal (D5 SUPERSET property — header-stage roster carries unchanged at body stage when request.size is excluded from the allowlist)",
+			len(headerAttrs), len(bodyAttrs))
+	}
+	for _, name := range allowlist {
+		hv, hok := headerAttrs[name]
+		bv, bok := bodyAttrs[name]
+		if hok != bok {
+			t.Errorf("presence mismatch for %q: header=%v body=%v", name, hok, bok)
+			continue
+		}
+		if !hok {
+			continue
+		}
+		// Compare the scalar string values (the {value: <StringValue>} shape).
+		hs := hv.GetFields()["value"].GetStringValue()
+		bs := bv.GetFields()["value"].GetStringValue()
+		if hs != bs {
+			t.Errorf("value mismatch for %q: header=%q body=%q", name, hs, bs)
+		}
+	}
+}
+
+// TestBuildBodyProcessingRequest_RequestSizePopulatesFromBodyLength asserts
+// the body-stage-only `request.size` attribute populates from `len(body)`
+// (per planner-time D5 — populated accurately from the body bytes rather than
+// Content-Length-derived; the body-stage natural attribute the header-stage
+// envelope cannot carry).
+func TestBuildBodyProcessingRequest_RequestSizePopulatesFromBodyLength(t *testing.T) {
+	t.Parallel()
+	f := &filter{dcb: &dcbStub{}}
+	body := bytes.Repeat([]byte("x"), 1024) // 1024 bytes.
+
+	req := buildRequestBodyProcessingRequest(f, body, true, []string{"request.size"})
+
+	attrs := req.GetAttributes()
+	if attrs == nil {
+		t.Fatalf("Attributes = nil; want 1-entry envelope")
+	}
+	if len(attrs) != 1 {
+		t.Errorf("len(attrs) = %d; want 1 (only request.size)", len(attrs))
+	}
+	entry, ok := attrs["request.size"]
+	if !ok {
+		t.Fatalf("request.size missing; keys = %v", attrKeysOf(attrs))
+	}
+	fv, fok := entry.GetFields()["value"]
+	if !fok {
+		t.Fatalf("Struct.fields[\"value\"] missing; fields = %v", entry.GetFields())
+	}
+	// `request.size` is a numeric attribute — encoded as a NumberValue (float64
+	// wire representation) per the structpb scalar conventions. The IMPL
+	// settles a NumberValue at 19.2 since structpb has no native int64 scalar;
+	// closure at Task 9 fixture scrape against reference Envoy v1.37.2.
+	if got := int64(fv.GetNumberValue()); got != int64(len(body)) {
+		t.Errorf("request.size = %d; want %d (len(body))", got, len(body))
+	}
+
+	// Zero-length body case — the empty-value-skip discipline allows the
+	// attribute to populate as 0 (numeric zero is a SUBSTANTIVE value: "this
+	// stage carried an empty body" is information-bearing per D5 — distinct
+	// from "the accessor returned no value"). Documented at the body-stage
+	// wrapper's GoDoc.
+	emptyReq := buildRequestBodyProcessingRequest(f, []byte{}, true, []string{"request.size"})
+	emptyAttrs := emptyReq.GetAttributes()
+	if emptyAttrs == nil {
+		t.Fatalf("empty-body Attributes = nil; want 1-entry envelope with request.size=0")
+	}
+	emptyEntry, ok := emptyAttrs["request.size"]
+	if !ok {
+		t.Fatalf("empty-body request.size missing")
+	}
+	if got := int64(emptyEntry.GetFields()["value"].GetNumberValue()); got != 0 {
+		t.Errorf("empty-body request.size = %d; want 0", got)
+	}
+}
+
+// TestBuildResponseBodyProcessingRequest_Symmetric asserts the encode-side
+// body-stage builder mirrors the decode-side: response_body oneof + HttpBody
+// + attributes envelope sourced from f.ecb (ADR-0174 surface; D10 hypothesis
+// HELD — no source.principal on encode side) + `response.size` populates
+// from `len(body)`.
+func TestBuildResponseBodyProcessingRequest_Symmetric(t *testing.T) {
+	t.Parallel()
+	ecb := &ecbStub{
+		remoteAddr:        &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1234},
+		localAddr:         &net.TCPAddr{IP: net.ParseIP("10.0.0.2"), Port: 8080},
+		tlsServerName:     "example.com",
+		protocol:          "HTTP/2",
+		listenerPrincipal: "spiffe://cluster.local/listener",
+	}
+	f := &filter{ecb: ecb}
+	body := []byte(`{"result":"ok"}`)
+	allowlist := []string{
+		"source.address",
+		"destination.address",
+		"connection.requested_server_name",
+		"connection.subject_local_certificate",
+		"request.protocol",
+		"connection.principal",
+		"source.principal", // D10: empty on encode side → SKIPPED.
+		"response.size",
+	}
+
+	req := buildResponseBodyProcessingRequest(f, body, true, allowlist)
+
+	if req == nil {
+		t.Fatalf("req = nil")
+	}
+	rb := req.GetResponseBody()
+	if rb == nil {
+		t.Fatalf("ResponseBody oneof not set; got Request = %T", req.GetRequest())
+	}
+	if got := rb.GetBody(); !bytes.Equal(got, body) {
+		t.Errorf("Body = %q; want %q", got, body)
+	}
+	if !rb.GetEndOfStream() {
+		t.Errorf("EndOfStream = false; want true")
+	}
+
+	attrs := req.GetAttributes()
+	if attrs == nil {
+		t.Fatalf("Attributes = nil")
+	}
+	// D10: source.principal is EMPTY on the encode side (no DownstreamPrincipal
+	// on EncoderFilterCallbacks per ADR-0174). 6 header-stage attributes
+	// populate + `response.size` = 7 total.
+	if _, ok := attrs["source.principal"]; ok {
+		t.Errorf("source.principal unexpectedly present on encode side; D10 hypothesis FALSIFIED")
+	}
+	if len(attrs) != 7 {
+		t.Errorf("len(attrs) = %d; want 7 (6 header-stage + response.size; D10 source.principal skipped); keys = %v",
+			len(attrs), attrKeysOf(attrs))
+	}
+	respSize, ok := attrs["response.size"]
+	if !ok {
+		t.Fatalf("response.size missing; keys = %v", attrKeysOf(attrs))
+	}
+	if got := int64(respSize.GetFields()["value"].GetNumberValue()); got != int64(len(body)) {
+		t.Errorf("response.size = %d; want %d (len(body))", got, len(body))
+	}
+}
+
 // keysOf returns the sorted keys of a map[string]*structpb.Struct for
 // stable assertion error output.
 func keysOf(m map[string]*structpb.Struct) []string {
@@ -3333,26 +3624,28 @@ func TestParseExtProcPerRoute_Overrides_ProcessingMode(t *testing.T) {
 }
 
 // TestParseExtProcPerRoute_Overrides_ProcessingMode_BodyModeRejected asserts
-// that per-route processing_mode overrides obey the SAME 19.1 PARSE-REJECT
-// discipline as the listener-level processing_mode — body-mode != NONE
-// PARSE-REJECTs per ADR-0168 §Decision.
+// that per-route processing_mode overrides obey the SAME PARSE-REJECT
+// discipline as the listener-level processing_mode — STREAMED-class body
+// modes PARSE-REJECT permanently per ADR-0168 §Decision. (The BUFFERED arm
+// ACCEPTS post-19.2 §Decision AMENDMENT — see
+// TestBuildCompiledConfig_BodyMode_BUFFERED_PerRoute_AcceptsForGRPCService.)
 func TestParseExtProcPerRoute_Overrides_ProcessingMode_BodyModeRejected(t *testing.T) {
 	t.Parallel()
 	pr := &extprocv3.ExtProcPerRoute{
 		Override: &extprocv3.ExtProcPerRoute_Overrides{
 			Overrides: &extprocv3.ExtProcOverrides{
 				ProcessingMode: &extprocv3.ProcessingMode{
-					RequestBodyMode: extprocv3.ProcessingMode_BUFFERED,
+					RequestBodyMode: extprocv3.ProcessingMode_STREAMED,
 				},
 			},
 		},
 	}
 	got, err := parseExtProcPerRoute(pr, false /*httpServiceMode*/)
 	if err == nil {
-		t.Fatalf("parseExtProcPerRoute(per-route body-mode != NONE): err = nil; want PARSE-REJECT")
+		t.Fatalf("parseExtProcPerRoute(per-route body-mode STREAMED): err = nil; want PARSE-REJECT")
 	}
 	if got != nil {
-		t.Errorf("parseExtProcPerRoute(per-route body-mode != NONE): got = %v; want nil", got)
+		t.Errorf("parseExtProcPerRoute(per-route body-mode STREAMED): got = %v; want nil", got)
 	}
 }
 
@@ -4068,9 +4361,13 @@ func TestBuildCompiledConfig_NilClusterManager_ParseReject(t *testing.T) {
 	}
 }
 
-// TestBuildCompiledConfig_BodyModeNotNone_ParseReject — request/response_body_mode
-// != NONE PARSE-REJECT in 19.1.
-func TestBuildCompiledConfig_BodyModeNotNone_ParseReject(t *testing.T) {
+// TestBuildCompiledConfig_BodyMode_STREAMED_PARSE_REJECT_Permanent — request/
+// response_body_mode ∈ {STREAMED, BUFFERED_PARTIAL, FULL_DUPLEX_STREAMED}
+// continue PARSE-REJECT PERMANENTLY per ADR-0168 §Decision + parent §4.4
+// (STREAMED-class body modes out of envelope). The BUFFERED arm ACCEPTS post-
+// 19.2 §Decision AMENDMENT for the gRPC-service arm (see
+// TestBuildCompiledConfig_BodyMode_BUFFERED_AcceptsForGRPCService).
+func TestBuildCompiledConfig_BodyMode_STREAMED_PARSE_REJECT_Permanent(t *testing.T) {
 	t.Parallel()
 	cm := mkExtprocH2ClusterMgr(t, "c_extproc", 9999)
 	cases := []struct {
@@ -4078,9 +4375,11 @@ func TestBuildCompiledConfig_BodyModeNotNone_ParseReject(t *testing.T) {
 		pm   *extprocv3.ProcessingMode
 		want string
 	}{
-		{"request_body_buffered", &extprocv3.ProcessingMode{RequestBodyMode: extprocv3.ProcessingMode_BUFFERED}, "request_body_mode"},
-		{"response_body_buffered", &extprocv3.ProcessingMode{ResponseBodyMode: extprocv3.ProcessingMode_BUFFERED}, "response_body_mode"},
 		{"request_body_streamed", &extprocv3.ProcessingMode{RequestBodyMode: extprocv3.ProcessingMode_STREAMED}, "request_body_mode"},
+		{"request_body_buffered_partial", &extprocv3.ProcessingMode{RequestBodyMode: extprocv3.ProcessingMode_BUFFERED_PARTIAL}, "request_body_mode"},
+		{"request_body_full_duplex", &extprocv3.ProcessingMode{RequestBodyMode: extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED}, "request_body_mode"},
+		{"response_body_streamed", &extprocv3.ProcessingMode{ResponseBodyMode: extprocv3.ProcessingMode_STREAMED}, "response_body_mode"},
+		{"response_body_buffered_partial", &extprocv3.ProcessingMode{ResponseBodyMode: extprocv3.ProcessingMode_BUFFERED_PARTIAL}, "response_body_mode"},
 		{"response_body_full_duplex", &extprocv3.ProcessingMode{ResponseBodyMode: extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED}, "response_body_mode"},
 	}
 	for _, tc := range cases {
@@ -4097,6 +4396,134 @@ func TestBuildCompiledConfig_BodyModeNotNone_ParseReject(t *testing.T) {
 				t.Fatalf("err = %v; want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestBuildCompiledConfig_BodyMode_BUFFERED_AcceptsForGRPCService — Group N:
+// the 19.2 §Decision AMENDMENT lifts the body-mode PARSE-REJECT for the
+// gRPC-service arm of `request_body_mode = BUFFERED` + `response_body_mode =
+// BUFFERED`. The compiledConfig builds successfully + the resolved processing
+// mode carries the raw BUFFERED enum (not silently rewritten to NONE per the
+// pre-AMENDMENT hardcoding).
+func TestBuildCompiledConfig_BodyMode_BUFFERED_AcceptsForGRPCService(t *testing.T) {
+	t.Parallel()
+	cm := mkExtprocH2ClusterMgr(t, "c_extproc", 9999)
+	cases := []struct {
+		name         string
+		pm           *extprocv3.ProcessingMode
+		wantReqBody  extprocv3.ProcessingMode_BodySendMode
+		wantRespBody extprocv3.ProcessingMode_BodySendMode
+	}{
+		{
+			name:         "request_body_buffered",
+			pm:           &extprocv3.ProcessingMode{RequestBodyMode: extprocv3.ProcessingMode_BUFFERED},
+			wantReqBody:  extprocv3.ProcessingMode_BUFFERED,
+			wantRespBody: extprocv3.ProcessingMode_NONE,
+		},
+		{
+			name:         "response_body_buffered",
+			pm:           &extprocv3.ProcessingMode{ResponseBodyMode: extprocv3.ProcessingMode_BUFFERED},
+			wantReqBody:  extprocv3.ProcessingMode_NONE,
+			wantRespBody: extprocv3.ProcessingMode_BUFFERED,
+		},
+		{
+			name: "both_directions_buffered",
+			pm: &extprocv3.ProcessingMode{
+				RequestBodyMode:  extprocv3.ProcessingMode_BUFFERED,
+				ResponseBodyMode: extprocv3.ProcessingMode_BUFFERED,
+			},
+			wantReqBody:  extprocv3.ProcessingMode_BUFFERED,
+			wantRespBody: extprocv3.ProcessingMode_BUFFERED,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := mkValidGRPCExtProc("c_extproc")
+			raw.ProcessingMode = tc.pm
+			cc, err := buildCompiledConfig(raw, envoyhttp.FactoryCtx{ClusterManager: cm})
+			if err != nil {
+				t.Fatalf("buildCompiledConfig(BUFFERED gRPC): err = %v; want nil (post-19.2 §Decision AMENDMENT)", err)
+			}
+			if cc == nil {
+				t.Fatalf("cc = nil; want non-nil")
+			}
+			defer func() {
+				if cc.grpcClient != nil {
+					_ = cc.grpcClient.Close()
+				}
+			}()
+			if cc.processingMode == nil {
+				t.Fatalf("cc.processingMode = nil; want non-nil")
+			}
+			if cc.processingMode.RequestBodyMode != tc.wantReqBody {
+				t.Errorf("RequestBodyMode = %v; want %v (raw enum populated, not hardcoded NONE)",
+					cc.processingMode.RequestBodyMode, tc.wantReqBody)
+			}
+			if cc.processingMode.ResponseBodyMode != tc.wantRespBody {
+				t.Errorf("ResponseBodyMode = %v; want %v (raw enum populated, not hardcoded NONE)",
+					cc.processingMode.ResponseBodyMode, tc.wantRespBody)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_BodyMode_HTTPService_PARSE_REJECT_Continues —
+// Group N: HTTP-service-mode body PARSE-REJECT continues PERMANENTLY per
+// ADR-0168 §Decision (iii) + SPEC §2 item 1. The 19.2 §Decision AMENDMENT
+// applies ONLY to the gRPC-service arm; HTTP-service stays headers-only
+// (per the proto's ExtProcHttpService constraint).
+func TestBuildCompiledConfig_BodyMode_HTTPService_PARSE_REJECT_Continues(t *testing.T) {
+	t.Parallel()
+	raw := mkValidHTTPExtProc("http://processor.local:8080/process")
+	raw.ProcessingMode = &extprocv3.ProcessingMode{
+		RequestBodyMode: extprocv3.ProcessingMode_BUFFERED,
+	}
+	cc, err := buildCompiledConfig(raw, envoyhttp.FactoryCtx{})
+	if cc != nil {
+		t.Fatalf("cc = %v; want nil (http_service + BUFFERED must PARSE-REJECT)", cc)
+	}
+	if err == nil || !strings.Contains(err.Error(), "http_service") {
+		t.Fatalf("err = %v; want substring 'http_service' (httpServiceMode-gated PARSE-REJECT)", err)
+	}
+}
+
+// TestBuildCompiledConfig_BodyMode_BUFFERED_PerRoute_AcceptsForGRPCService —
+// Group N: the per-route ExtProcOverrides.processing_mode body-mode arm
+// inherits the §Decision AMENDMENT via the shared resolveProcessingMode
+// call site at parseExtProcPerRoute (per planner-time D12: per-route 5th-
+// canonical body-mode arm activation LOCKS at 19.2 — no ADR-0173 amendment
+// fires).
+func TestBuildCompiledConfig_BodyMode_BUFFERED_PerRoute_AcceptsForGRPCService(t *testing.T) {
+	t.Parallel()
+	prMsg := &extprocv3.ExtProcPerRoute{
+		Override: &extprocv3.ExtProcPerRoute_Overrides{
+			Overrides: &extprocv3.ExtProcOverrides{
+				ProcessingMode: &extprocv3.ProcessingMode{
+					RequestBodyMode:  extprocv3.ProcessingMode_BUFFERED,
+					ResponseBodyMode: extprocv3.ProcessingMode_BUFFERED,
+				},
+			},
+		},
+	}
+	got, err := parseExtProcPerRoute(prMsg, false /*httpServiceMode=gRPC arm*/)
+	if err != nil {
+		t.Fatalf("parseExtProcPerRoute(per-route BUFFERED, gRPC arm): err = %v; want nil (post-§Decision AMENDMENT)", err)
+	}
+	if got == nil {
+		t.Fatalf("got = nil; want non-nil")
+	}
+	if got.effectiveProcessingMode == nil {
+		t.Fatalf(".effectiveProcessingMode = nil; want non-nil (per-route processing_mode override)")
+	}
+	if got.effectiveProcessingMode.RequestBodyMode != extprocv3.ProcessingMode_BUFFERED {
+		t.Errorf(".effectiveProcessingMode.RequestBodyMode = %v; want BUFFERED",
+			got.effectiveProcessingMode.RequestBodyMode)
+	}
+	if got.effectiveProcessingMode.ResponseBodyMode != extprocv3.ProcessingMode_BUFFERED {
+		t.Errorf(".effectiveProcessingMode.ResponseBodyMode = %v; want BUFFERED",
+			got.effectiveProcessingMode.ResponseBodyMode)
 	}
 }
 
@@ -4185,13 +4612,17 @@ func TestBuildCompiledConfig_DisableClearRouteCacheAlone_TranslatesRetain(t *tes
 
 // TestBuildCompiledConfig_AllowedOverrideModes_BodyMode_ParseReject — every
 // entry in allowed_override_modes is validated through resolveProcessingMode.
+// Post-19.2 §Decision AMENDMENT the BUFFERED arm is ACCEPTED; the STREAMED-
+// class arms continue PARSE-REJECT permanently. We exercise STREAMED here
+// (still load-bearing — the per-entry validation must reject STREAMED-class
+// body modes even when the listener-level mode is valid).
 func TestBuildCompiledConfig_AllowedOverrideModes_BodyMode_ParseReject(t *testing.T) {
 	t.Parallel()
 	cm := mkExtprocH2ClusterMgr(t, "c_extproc", 9999)
 	raw := mkValidGRPCExtProc("c_extproc")
 	raw.AllowedOverrideModes = []*extprocv3.ProcessingMode{
 		{RequestHeaderMode: extprocv3.ProcessingMode_SEND},   // valid
-		{RequestBodyMode: extprocv3.ProcessingMode_BUFFERED}, // invalid in 19.1
+		{RequestBodyMode: extprocv3.ProcessingMode_STREAMED}, // STREAMED-class continues PARSE-REJECT permanently
 	}
 	cc, err := buildCompiledConfig(raw, envoyhttp.FactoryCtx{ClusterManager: cm})
 	if cc != nil {
@@ -5552,4 +5983,2198 @@ func TestBidiStreamSendRecvDiscipline(t *testing.T) {
 			t.Errorf("iter %d: Send GID %d != Recv GID %d; want same goroutine per dispatchStage", i, sendGIDs[i], recvGIDs[i])
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Group N+2 — 4-stage state-machine extension per ADR-0171 §Decision AMENDMENT
+// (Task 4 of phase-19.2 IMPL).
+//
+// Tests cover:
+//   - numStages 2 → 4: stageRequestBody + stageResponseBody now valid enum
+//     values; stage.String() returns the canonical "request_body" /
+//     "response_body" labels.
+//   - At-most-once-per-stage discipline EXTENDS to body stages: the
+//     f.overrideApplied[numStages] array sizes correctly + handleOverrideMessageTimeout
+//     enforces at-most-once per body stage.
+//   - Decode-side dispatch transitions: stageRequestHeaders → stageRequestBody
+//     (if request_body_mode == BUFFERED) → done.
+//   - Encode-side dispatch transitions: stageResponseHeaders → stageResponseBody
+//     (if response_body_mode == BUFFERED) → done.
+//   - Spurious body-stage entry (e.g., a body-stage callback firing when the
+//     prior stage was not yet completed) increments spurious_msgs_received per
+//     the existing 19.1 discipline.
+// ---------------------------------------------------------------------------
+
+// TestStateMachine_FourStage_AtMostOncePerStage asserts the at-most-once-per-stage
+// override-tracking discipline extends naturally to the 4 stages — each of
+// stageRequestHeaders / stageRequestBody / stageResponseHeaders /
+// stageResponseBody accepts at most ONE override_message_timeout per stream;
+// a second override at the SAME stage increments overrideMessageTimeoutIgnored;
+// per-stage independence preserved across all 4 stages.
+func TestStateMachine_FourStage_AtMostOncePerStage(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		maxMessageTimeout: 10 * time.Second,
+		stats:             newFilterStats(reg, "fourstage"),
+	}
+	f := &filter{cc: cc}
+
+	// First override at each of the 4 stages: accepted.
+	stages := []stage{stageRequestHeaders, stageResponseHeaders, stageRequestBody, stageResponseBody}
+	for _, s := range stages {
+		if !f.handleOverrideMessageTimeout(s, durationpb.New(500*time.Millisecond)) {
+			t.Fatalf("first override at %s rejected; want accepted (per-stage independent across all 4 stages)", s)
+		}
+	}
+	// Second override at each stage: rejected.
+	for _, s := range stages {
+		if f.handleOverrideMessageTimeout(s, durationpb.New(time.Second)) {
+			t.Errorf("second override at %s accepted; want rejected (at-most-once-per-stage)", s)
+		}
+	}
+	if got := cc.stats.overrideMessageTimeoutReceived.Load(); got != 4 {
+		t.Errorf("overrideMessageTimeoutReceived = %d; want 4 (one per stage)", got)
+	}
+	if got := cc.stats.overrideMessageTimeoutIgnored.Load(); got != 4 {
+		t.Errorf("overrideMessageTimeoutIgnored = %d; want 4 (second per stage)", got)
+	}
+	// numStages == 4 (the f.overrideApplied array bounds match the 4-stage extension).
+	if numStages != 4 {
+		t.Errorf("numStages = %d; want 4 (ADR-0171 §Decision AMENDMENT)", numStages)
+	}
+	if len(f.overrideApplied) != int(numStages) {
+		t.Errorf("len(f.overrideApplied) = %d; want %d (auto-resized via sentinel)", len(f.overrideApplied), numStages)
+	}
+	// stage.String coverage for the 2 NEW stages.
+	if got := stageRequestBody.String(); got != "request_body" {
+		t.Errorf("stageRequestBody.String() = %q; want %q", got, "request_body")
+	}
+	if got := stageResponseBody.String(); got != "response_body" {
+		t.Errorf("stageResponseBody.String() = %q; want %q", got, "response_body")
+	}
+}
+
+// TestStateMachine_DecodeStageTransitions_HeadersToBodyToDone asserts the
+// decode-side stage progression: stageRequestHeaders dispatch + completeStage
+// is followed by stageRequestBody dispatch + completeStage; each fires
+// ContinueDecoding exactly once when applyProcessingResponseFn returns
+// actContinue. Together the two stages count as 2 ContinueDecoding invocations
+// — the per-stage resume signal discipline.
+func TestStateMachine_DecodeStageTransitions_HeadersToBodyToDone(t *testing.T) {
+	withApplyOverride(t, func(*filter, stage, *extprocsvcv3.ProcessingResponse) (action, error) {
+		return actContinue, nil
+	})
+	dcb := &fakeDCB{}
+	f := &filter{dcb: dcb}
+
+	// Stage 1: request_headers → resume on decode side.
+	f.completeStage(stageRequestHeaders, &extprocsvcv3.ProcessingResponse{}, nil)
+	if got := dcb.calls(); got != 1 {
+		t.Fatalf("after request_headers: dcb.calls = %d; want 1", got)
+	}
+	// Stage 2: request_body → resume on decode side again (body stage routes
+	// through signalResume's decode-side arm — same as request_headers).
+	f.completeStage(stageRequestBody, &extprocsvcv3.ProcessingResponse{}, nil)
+	if got := dcb.calls(); got != 2 {
+		t.Errorf("after request_body: dcb.calls = %d; want 2 (decode-side body stage signals ContinueDecoding)", got)
+	}
+}
+
+// TestStateMachine_EncodeStageTransitions_HeadersToBodyToDone asserts the
+// encode-side analog: response_headers + response_body each fire
+// ContinueEncoding exactly once when applyProcessingResponseFn returns
+// actContinue.
+func TestStateMachine_EncodeStageTransitions_HeadersToBodyToDone(t *testing.T) {
+	withApplyOverride(t, func(*filter, stage, *extprocsvcv3.ProcessingResponse) (action, error) {
+		return actContinue, nil
+	})
+	ecb := &fakeECB{}
+	f := &filter{ecb: ecb}
+
+	// Stage 1: response_headers → resume on encode side.
+	f.completeStage(stageResponseHeaders, &extprocsvcv3.ProcessingResponse{}, nil)
+	if got := ecb.calls(); got != 1 {
+		t.Fatalf("after response_headers: ecb.calls = %d; want 1", got)
+	}
+	// Stage 2: response_body → resume on encode side again.
+	f.completeStage(stageResponseBody, &extprocsvcv3.ProcessingResponse{}, nil)
+	if got := ecb.calls(); got != 2 {
+		t.Errorf("after response_body: ecb.calls = %d; want 2 (encode-side body stage signals ContinueEncoding)", got)
+	}
+}
+
+// TestStateMachine_SpuriousBodyStageEntry_IncrementsSpuriousMsgsReceived
+// asserts that a stage-mismatch ProcessingResponse arriving at the body stage
+// (e.g., the processor returned a response_headers ProcessingResponse when we
+// expected request_body) is classified as spurious per the existing 19.1
+// applyProcessingResponse stage-mismatch discipline + the body-stage extension.
+//
+// This exercises check.go's applyProcessingResponse (the real body — NOT the
+// stub — installed by the package init() per Carryforward C) with a stage =
+// stageRequestBody but the response carrying a request_headers arm (oneof
+// mismatch). The dispatcher classifies spurious + dispError.
+func TestStateMachine_SpuriousBodyStageEntry_IncrementsSpuriousMsgsReceived(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{stats: newFilterStats(reg, "spurious_body")}
+	f := &filter{cc: cc}
+	// Build a ProcessingResponse with the wrong oneof arm: server returned
+	// request_headers but we expected request_body.
+	resp := &extprocsvcv3.ProcessingResponse{
+		Response: &extprocsvcv3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &extprocsvcv3.HeadersResponse{},
+		},
+	}
+	act, err := applyProcessingResponse(f, stageRequestBody, resp)
+	if act != actError {
+		t.Errorf("act = %v; want actError (stage-mismatch at body stage)", act)
+	}
+	if err == nil {
+		t.Errorf("err = nil; want non-nil sentinel (stage-mismatch)")
+	}
+	if got := cc.stats.spuriousMsgsReceived.Load(); got != 1 {
+		t.Errorf("spuriousMsgsReceived = %d; want 1 (spurious body-stage entry)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group N+6 — Per-message timer behavioral enforcement per ADR-0171
+// §Decision AMENDMENT clause (vi) + planner-time D4 (Task 4 of phase-19.2 IMPL).
+//
+// Tests cover:
+//   - Single rolling timer per direction (NOT per-stage): the dispatchStage
+//     goroutine's msgCtx is consumed by Send/Recv via context.WithTimeout
+//     cancel-and-rebuild; a per-message timeout fires the Recv-leg cancel and
+//     returns context.DeadlineExceeded → completeStage signals resume on the
+//     deadline-exceeded path.
+//   - context.WithTimeout cancel-and-rebuild on each stage's Send: the
+//     msgCancel fires (deferred) at the end of each dispatchStage goroutine.
+//   - override_message_timeout resets in-flight: when an override arrives via
+//     handleOverrideMessageTimeout mid-flight, the in-flight msgCancel fires
+//     so the parked Recv unblocks; the NEXT dispatchStage uses the override
+//     duration.
+//   - mode_override on body-stage responses silently IGNORED (not spurious)
+//     per parent §5.P1 RATIFIED-AND-REFINED.
+// ---------------------------------------------------------------------------
+
+// TestPerMessageTimer_Behavioral_SingleRollingTimerPerDirection asserts the
+// per-message timer is consumed BEHAVIORALLY by the dispatchStage Send/Recv
+// goroutine + the watchdog cascade-cancels the stream on per-message timer
+// expiry per ADR-0171 §Decision AMENDMENT clause (vi) + planner-time D4:
+//
+//   - The dispatchStage goroutine builds msgCtx via context.WithTimeout(streamCtx,
+//     f.activeMsgTimeout).
+//   - The fake stream's Recv blocks on the streamCtx (via recvBlockCtx).
+//   - At the 50ms per-message timeout, the watchdog goroutine fires
+//     f.streamCancel which cancels streamCtx → the fake's Recv unblocks with
+//     context.Canceled (per the parent §5.P10 single-in-flight-message
+//     correlation rule + the bidi-stream cascade-cancel discipline; the
+//     per-message timer expiry IS the stream-level failure surface).
+//   - completeStage signals resume on the recvErr path + streamsFailed
+//     increments.
+func TestPerMessageTimer_Behavioral_SingleRollingTimerPerDirection(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		messageTimeout: 50 * time.Millisecond,
+		stats:          newFilterStats(reg, "rolling"),
+	}
+	dcb := &fakeDCB{}
+	// Fake stream: Recv blocks on blockCh — only the streamCtx cancel can
+	// unblock it (via recvBlockCtx) once the watchdog fires.
+	blockCh := make(chan struct{})
+	defer close(blockCh)
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+	stream := &fakeProcessStream{
+		recvBlockCh:  blockCh,   // never closed during the test
+		recvBlockCtx: parentCtx, // streamCtx — canceled by the watchdog on per-message timeout
+	}
+	f := &filter{
+		cc:               cc,
+		dcb:              dcb,
+		stream:           stream,
+		streamCtx:        parentCtx,
+		streamCancel:     parentCancel, // watchdog fires this on msgCtx.Done
+		activeMsgTimeout: 50 * time.Millisecond,
+	}
+
+	// dispatchStage spawns the dispatch + watchdog goroutines.
+	f.dispatchStage(stageRequestHeaders, &extprocsvcv3.ProcessingRequest{})
+
+	// Wait up to 1s for the resume signal — should fire well within (timer
+	// is 50ms; allow 950ms slack for watchdog + Recv-unblock scheduling).
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if dcb.calls() >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if dcb.calls() != 1 {
+		t.Errorf("ContinueDecoding called %d times; want 1 (per-message timer must fire + resume)", dcb.calls())
+	}
+	if got := cc.stats.streamsFailed.Load(); got != 1 {
+		t.Errorf("streamsFailed = %d; want 1 (per-message timer expiry = transport-class failure)", got)
+	}
+}
+
+// TestPerMessageTimer_ContextWithTimeout_CancelAndRebuildOnEachStageSend
+// asserts the per-message timer is REBUILT (NOT reused) on each dispatchStage
+// invocation — each Send/Recv pair gets a fresh context.WithTimeout(streamCtx,
+// f.activeMsgTimeout). After the first stage completes (cancel deferred at
+// goroutine exit), a SECOND dispatchStage invocation succeeds with a fresh
+// timer + fresh deadline.
+func TestPerMessageTimer_ContextWithTimeout_CancelAndRebuildOnEachStageSend(t *testing.T) {
+	withApplyOverride(t, func(*filter, stage, *extprocsvcv3.ProcessingResponse) (action, error) {
+		return actContinue, nil
+	})
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		messageTimeout: 500 * time.Millisecond,
+		stats:          newFilterStats(reg, "rebuild"),
+	}
+	dcb := &fakeDCB{}
+	stream := &fakeProcessStream{
+		recvResp: &extprocsvcv3.ProcessingResponse{
+			Response: &extprocsvcv3.ProcessingResponse_RequestHeaders{
+				RequestHeaders: &extprocsvcv3.HeadersResponse{},
+			},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := &filter{
+		cc:               cc,
+		dcb:              dcb,
+		stream:           stream,
+		streamCtx:        ctx,
+		streamCancel:     cancel,
+		activeMsgTimeout: 500 * time.Millisecond,
+	}
+
+	// Two sequential dispatchStage invocations — the second only fires AFTER
+	// the first completes (resume signal observed).
+	const stages = 2
+	for i := 0; i < stages; i++ {
+		f.dispatchStage(stageRequestHeaders, &extprocsvcv3.ProcessingRequest{})
+		// Wait for resume.
+		deadline := time.Now().Add(1 * time.Second)
+		for time.Now().Before(deadline) {
+			if dcb.calls() >= i+1 {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if got := dcb.calls(); got != i+1 {
+			t.Fatalf("iter %d: dcb.calls = %d; want %d (each stage rebuilds the per-message timer)", i, got, i+1)
+		}
+	}
+	// Both stages succeeded (no streamsFailed) — the second stage's fresh
+	// timer worked (no deadline carryover from the first stage's expired timer).
+	if got := cc.stats.streamsFailed.Load(); got != 0 {
+		t.Errorf("streamsFailed = %d; want 0 (rebuild discipline: each stage gets a fresh timer)", got)
+	}
+	if got := cc.stats.streamMsgsSent.Load(); got != stages {
+		t.Errorf("streamMsgsSent = %d; want %d", got, stages)
+	}
+	if got := cc.stats.streamMsgsReceived.Load(); got != stages {
+		t.Errorf("streamMsgsReceived = %d; want %d", got, stages)
+	}
+}
+
+// TestPerMessageTimer_OverrideMessageTimeoutResetsInFlight asserts the
+// handleOverrideMessageTimeout + the in-flight msgCancel discipline per
+// planner-time D4: when an override arrives mid-flight (the dispatchStage
+// goroutine is parked on Recv waiting for the SUBSTANTIVE response), the
+// handler cancels the in-flight per-message timer + the NEXT dispatchStage
+// observes the override duration via f.activeMsgTimeout.
+//
+// At Task 4 the in-flight per-message timer cancellation is mechanically
+// effected by mutating f.activeMsgTimeout for the NEXT stage's Send/Recv +
+// (optionally) firing the msgCancel hook captured on the filter — the test
+// asserts the post-override f.activeMsgTimeout reflects the override.
+func TestPerMessageTimer_OverrideMessageTimeoutResetsInFlight(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		messageTimeout:    200 * time.Millisecond,
+		maxMessageTimeout: 10 * time.Second,
+		stats:             newFilterStats(reg, "reset"),
+	}
+	f := &filter{cc: cc, activeMsgTimeout: 200 * time.Millisecond}
+
+	// Initially the in-flight per-message timer = 200ms (cc.messageTimeout).
+	if f.activeMsgTimeout != 200*time.Millisecond {
+		t.Fatalf("pre-override: f.activeMsgTimeout = %v; want 200ms", f.activeMsgTimeout)
+	}
+	// Override arrives at request_headers stage: 1s.
+	if !f.handleOverrideMessageTimeout(stageRequestHeaders, durationpb.New(time.Second)) {
+		t.Fatalf("override rejected; want accepted")
+	}
+	// f.activeMsgTimeout is RESET to the override duration — the NEXT
+	// dispatchStage's context.WithTimeout consumes this fresh value.
+	if f.activeMsgTimeout != time.Second {
+		t.Errorf("post-override: f.activeMsgTimeout = %v; want 1s (reset for NEXT dispatchStage)", f.activeMsgTimeout)
+	}
+	if got := cc.stats.overrideMessageTimeoutReceived.Load(); got != 1 {
+		t.Errorf("overrideMessageTimeoutReceived = %d; want 1", got)
+	}
+
+	// IF the filter has an in-flight msgCancel captured (Task 4 IMPL settle:
+	// the dispatchStage goroutine stores its msgCancel on f.activeMsgCancel
+	// while parked; handleOverrideMessageTimeout fires it on accept), the
+	// override path also invalidates the in-flight per-message timer so the
+	// Recv unblocks promptly. We assert the captured cancel was invoked when
+	// non-nil; nil-tolerant for the test path where no dispatch is in flight.
+	canceled := make(chan struct{})
+	cancelHook := func() { close(canceled) }
+	f.activeMsgCancel = cancelHook
+	if !f.handleOverrideMessageTimeout(stageResponseHeaders, durationpb.New(2*time.Second)) {
+		t.Fatalf("second override (different stage) rejected; want accepted")
+	}
+	// The cancel hook must have fired (per D4 in-flight cancel-and-rebuild).
+	select {
+	case <-canceled:
+		// ok — the in-flight per-message timer was canceled.
+	case <-time.After(100 * time.Millisecond):
+		t.Errorf("activeMsgCancel was NOT invoked by handleOverrideMessageTimeout; want invoked (D4 cancel-and-rebuild)")
+	}
+	// activeMsgCancel cleared post-fire so a SECOND override at the same stage
+	// (rejected via at-most-once) does NOT re-fire a stale cancel.
+	if f.activeMsgCancel != nil {
+		t.Errorf("f.activeMsgCancel = non-nil after fire; want nil (cleared post-cancel)")
+	}
+}
+
+// TestModeOverride_BodyStageResponse_SilentlyIgnoredNotSpurious asserts the
+// parent §5.P1 RATIFIED-AND-REFINED discipline carry-forward at 19.2: a
+// ProcessingResponse arriving at the body stage WITH a mode_override field is
+// silently dropped (the mode_override is ignored — only header-response paths
+// re-eval mode_override) AND is NOT classified as spurious_msgs_received. The
+// body-stage CommonResponse arm still applies normally.
+//
+// This exercises applyProcessingResponse (the real check.go body — installed
+// via Carryforward C package init reassignment) with stage == stageRequestBody
+// + resp carrying both mode_override AND request_body CommonResponse arms.
+// Expected: actContinue + NO spurious increment + f.activeProcessingMode
+// UNCHANGED.
+func TestModeOverride_BodyStageResponse_SilentlyIgnoredNotSpurious(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	priorMode := &resolvedProcessingMode{
+		RequestHeaderMode:  extprocv3.ProcessingMode_SEND,
+		ResponseHeaderMode: extprocv3.ProcessingMode_SEND,
+		RequestBodyMode:    extprocv3.ProcessingMode_BUFFERED,
+		ResponseBodyMode:   extprocv3.ProcessingMode_BUFFERED,
+	}
+	cc := &compiledConfig{
+		allowModeOverride: true, // would otherwise be load-bearing
+		processingMode:    priorMode,
+		stats:             newFilterStats(reg, "modeoverride_body"),
+	}
+	f := &filter{cc: cc, activeProcessingMode: priorMode}
+
+	// ProcessingResponse at stage=stageRequestBody with BOTH mode_override AND
+	// request_body CommonResponse — per parent §5.P1 RATIFIED-AND-REFINED the
+	// mode_override on body stages is silently ignored (NOT spurious).
+	resp := &extprocsvcv3.ProcessingResponse{
+		Response: &extprocsvcv3.ProcessingResponse_RequestBody{
+			RequestBody: &extprocsvcv3.BodyResponse{
+				Response: &extprocsvcv3.CommonResponse{},
+			},
+		},
+		ModeOverride: &extprocv3.ProcessingMode{
+			RequestHeaderMode:  extprocv3.ProcessingMode_SKIP,
+			ResponseHeaderMode: extprocv3.ProcessingMode_SKIP,
+		},
+	}
+	act, err := applyProcessingResponse(f, stageRequestBody, resp)
+	if err != nil {
+		t.Errorf("err = %v; want nil (body-stage mode_override silently ignored, not spurious)", err)
+	}
+	if act != actContinue {
+		t.Errorf("act = %v; want actContinue", act)
+	}
+	if got := cc.stats.spuriousMsgsReceived.Load(); got != 0 {
+		t.Errorf("spuriousMsgsReceived = %d; want 0 (body-stage mode_override is silent-drop per parent §5.P1 RATIFIED-AND-REFINED, NOT spurious)", got)
+	}
+	// activeProcessingMode UNCHANGED — the body-stage mode_override was IGNORED.
+	if f.activeProcessingMode != priorMode {
+		t.Errorf("f.activeProcessingMode mutated by body-stage mode_override; want unchanged (silent-ignore discipline)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group N+1 — body-stage applyProcessingResponse arms per ADR-0172 §Decision
+// AMENDMENT (Task 6).
+//
+// Activates three previously-spurious arms per SPEC §4.2 + §4.3 + §4.4:
+//
+//   (a) body_mutation oneof switch: body / clear_body CONSUMED;
+//       streamed_response PARSE-REJECT per D6 with spurious_msgs_received
+//       increment.
+//   (b) CONTINUE_AND_REPLACE at header stages with body-mode = BUFFERED →
+//       COMBINED REPLACEMENT (header_mutation + body_mutation both apply;
+//       sets f.skipBodyStageDispatch so the body-stage outbound is SKIPPED
+//       on Task 7's body-stage entry); at header stages with body-mode =
+//       NONE → CONSUMED as no-op for body (lifts 19.1 spurious-dispatch);
+//       at body stages → TREATED AS CONTINUE (no counter increment).
+//   (c) body-stage ImmediateResponse fires SendLocalReply via the existing
+//       multi-stage emitImmediateResponse infrastructure. clear_route_cache
+//       at body stages continues IGNORED per the proto's "ignored in the
+//       response direction" wording.
+// ---------------------------------------------------------------------------
+
+// mkProcessingResponseRequestBody constructs a *ProcessingResponse with a
+// request_body oneof arm carrying the given CommonResponse.
+func mkProcessingResponseRequestBody(cr *extprocsvcv3.CommonResponse) *extprocsvcv3.ProcessingResponse {
+	return &extprocsvcv3.ProcessingResponse{
+		Response: &extprocsvcv3.ProcessingResponse_RequestBody{
+			RequestBody: &extprocsvcv3.BodyResponse{Response: cr},
+		},
+	}
+}
+
+// mkProcessingResponseResponseBody constructs a *ProcessingResponse with a
+// response_body oneof arm carrying the given CommonResponse.
+func mkProcessingResponseResponseBody(cr *extprocsvcv3.CommonResponse) *extprocsvcv3.ProcessingResponse {
+	return &extprocsvcv3.ProcessingResponse{
+		Response: &extprocsvcv3.ProcessingResponse_ResponseBody{
+			ResponseBody: &extprocsvcv3.BodyResponse{Response: cr},
+		},
+	}
+}
+
+// TestApplyProcessingResponse_BodyMutation_Body_ReplacesBufferAndReconcilesContentLength
+// — per SPEC §4.2 table row 1: BodyMutation_Body replaces the buffered body
+// bytes with the processor-supplied bytes + reconciles Content-Length on the
+// corresponding header set. Exercises BOTH directions (decode + encode) via
+// sub-tests asserting the per-direction buffer mutation + Content-Length
+// header update via the directly-stashed f.decodeBodyBuf / f.encodeBodyBuf
+// (Task 7 stashes these at DecodeData / EncodeData endStream; at Task 6
+// the test stubs the field directly to drive the dispatcher).
+func TestApplyProcessingResponse_BodyMutation_Body_ReplacesBufferAndReconcilesContentLength(t *testing.T) {
+	t.Parallel()
+	t.Run("decode_side_request_body", func(t *testing.T) {
+		t.Parallel()
+		reg := stats.NewRegistry()
+		cc := &compiledConfig{stats: newFilterStats(reg, "t")}
+		// Stash the pre-mutation body buffer + the headers carrier (decode side).
+		hdrs := http.Header{}
+		hdrs.Set("content-length", "5")
+		f := &filter{
+			cc:            cc,
+			decodeHeaders: hdrs,
+			decodeBodyBuf: []byte("hello"),
+		}
+		newBody := []byte("rewritten body bytes")
+		cr := &extprocsvcv3.CommonResponse{
+			BodyMutation: &extprocsvcv3.BodyMutation{
+				Mutation: &extprocsvcv3.BodyMutation_Body{Body: newBody},
+			},
+		}
+		resp := mkProcessingResponseRequestBody(cr)
+		act, err := applyProcessingResponse(f, stageRequestBody, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil", err)
+		}
+		if act != actContinue {
+			t.Errorf("act = %v; want actContinue", act)
+		}
+		if string(f.decodeBodyBuf) != string(newBody) {
+			t.Errorf("decodeBodyBuf = %q; want %q (body_mutation Body replace)", f.decodeBodyBuf, newBody)
+		}
+		if got := hdrs.Get("content-length"); got != strconv.Itoa(len(newBody)) {
+			t.Errorf("content-length = %q; want %d (reconciled per ADR-0128)", got, len(newBody))
+		}
+		if got := cc.stats.spuriousMsgsReceived.Load(); got != 0 {
+			t.Errorf("spuriousMsgsReceived = %d; want 0 (happy-path body replacement)", got)
+		}
+	})
+	t.Run("encode_side_response_body", func(t *testing.T) {
+		t.Parallel()
+		reg := stats.NewRegistry()
+		cc := &compiledConfig{stats: newFilterStats(reg, "t")}
+		hdrs := http.Header{}
+		hdrs.Set("content-length", "3")
+		f := &filter{
+			cc:            cc,
+			encodeHeaders: hdrs,
+			encodeBodyBuf: []byte("foo"),
+		}
+		newBody := []byte("rewritten response payload")
+		cr := &extprocsvcv3.CommonResponse{
+			BodyMutation: &extprocsvcv3.BodyMutation{
+				Mutation: &extprocsvcv3.BodyMutation_Body{Body: newBody},
+			},
+		}
+		resp := mkProcessingResponseResponseBody(cr)
+		act, err := applyProcessingResponse(f, stageResponseBody, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil", err)
+		}
+		if act != actContinue {
+			t.Errorf("act = %v; want actContinue", act)
+		}
+		if string(f.encodeBodyBuf) != string(newBody) {
+			t.Errorf("encodeBodyBuf = %q; want %q (body_mutation Body replace)", f.encodeBodyBuf, newBody)
+		}
+		if got := hdrs.Get("content-length"); got != strconv.Itoa(len(newBody)) {
+			t.Errorf("content-length = %q; want %d (reconciled per ADR-0175)", got, len(newBody))
+		}
+	})
+}
+
+// TestApplyProcessingResponse_BodyMutation_ClearBody_EmptiesBuffer — per SPEC
+// §4.2 table row 2: BodyMutation_ClearBody (true) empties the buffer +
+// Content-Length: 0; ClearBody (false) is a no-op. Exercises both arms.
+func TestApplyProcessingResponse_BodyMutation_ClearBody_EmptiesBuffer(t *testing.T) {
+	t.Parallel()
+	t.Run("clear_body_true_empties_decode_buffer", func(t *testing.T) {
+		t.Parallel()
+		reg := stats.NewRegistry()
+		cc := &compiledConfig{stats: newFilterStats(reg, "t")}
+		hdrs := http.Header{}
+		hdrs.Set("content-length", "11")
+		f := &filter{
+			cc:            cc,
+			decodeHeaders: hdrs,
+			decodeBodyBuf: []byte("hello world"),
+		}
+		cr := &extprocsvcv3.CommonResponse{
+			BodyMutation: &extprocsvcv3.BodyMutation{
+				Mutation: &extprocsvcv3.BodyMutation_ClearBody{ClearBody: true},
+			},
+		}
+		resp := mkProcessingResponseRequestBody(cr)
+		act, err := applyProcessingResponse(f, stageRequestBody, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil", err)
+		}
+		if act != actContinue {
+			t.Errorf("act = %v; want actContinue", act)
+		}
+		if len(f.decodeBodyBuf) != 0 {
+			t.Errorf("decodeBodyBuf = %q; want empty (clear_body=true)", f.decodeBodyBuf)
+		}
+		if got := hdrs.Get("content-length"); got != "0" {
+			t.Errorf("content-length = %q; want 0 (clear_body reconciliation)", got)
+		}
+	})
+	t.Run("clear_body_false_is_noop", func(t *testing.T) {
+		t.Parallel()
+		reg := stats.NewRegistry()
+		cc := &compiledConfig{stats: newFilterStats(reg, "t")}
+		hdrs := http.Header{}
+		hdrs.Set("content-length", "5")
+		original := []byte("hello")
+		f := &filter{
+			cc:            cc,
+			decodeHeaders: hdrs,
+			decodeBodyBuf: original,
+		}
+		cr := &extprocsvcv3.CommonResponse{
+			BodyMutation: &extprocsvcv3.BodyMutation{
+				Mutation: &extprocsvcv3.BodyMutation_ClearBody{ClearBody: false},
+			},
+		}
+		resp := mkProcessingResponseRequestBody(cr)
+		act, err := applyProcessingResponse(f, stageRequestBody, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil", err)
+		}
+		if act != actContinue {
+			t.Errorf("act = %v; want actContinue", act)
+		}
+		if string(f.decodeBodyBuf) != "hello" {
+			t.Errorf("decodeBodyBuf = %q; want %q (clear_body=false is no-op)", f.decodeBodyBuf, "hello")
+		}
+		if got := hdrs.Get("content-length"); got != "5" {
+			t.Errorf("content-length = %q; want 5 (no reconciliation when clear_body=false)", got)
+		}
+	})
+}
+
+// TestApplyProcessingResponse_BodyMutation_StreamedResponse_PARSE_REJECT_SpuriousMsgsReceivedIncrement
+// — per SPEC §4.2 table row 3 + planner-time D6: BodyMutation_StreamedResponse
+// PARSE-REJECTs (STREAMED out-of-envelope per parent §4.4) — increment
+// spurious_msgs_received + return actError + sentinel error with the D6
+// wording.
+func TestApplyProcessingResponse_BodyMutation_StreamedResponse_PARSE_REJECT_SpuriousMsgsReceivedIncrement(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{stats: newFilterStats(reg, "t")}
+	f := &filter{cc: cc, decodeBodyBuf: []byte("original")}
+	cr := &extprocsvcv3.CommonResponse{
+		BodyMutation: &extprocsvcv3.BodyMutation{
+			Mutation: &extprocsvcv3.BodyMutation_StreamedResponse{
+				StreamedResponse: &extprocsvcv3.StreamedBodyResponse{Body: []byte("nope")},
+			},
+		},
+	}
+	resp := mkProcessingResponseRequestBody(cr)
+	act, err := applyProcessingResponse(f, stageRequestBody, resp)
+	if act != actError {
+		t.Errorf("act = %v; want actError", act)
+	}
+	if !errors.Is(err, errStreamedResponseBodyMutationUnsupported) {
+		t.Errorf("err = %v; want errStreamedResponseBodyMutationUnsupported", err)
+	}
+	// Sanity-check the D6 verbatim wording.
+	if err == nil || !strings.Contains(err.Error(), "streamed_response body mutation not supported") {
+		t.Errorf("err = %v; want substring 'streamed_response body mutation not supported' (D6 wording)", err)
+	}
+	if !strings.Contains(err.Error(), "STREAMED body modes out-of-envelope per parent §4.4") {
+		t.Errorf("err = %v; want substring 'STREAMED body modes out-of-envelope per parent §4.4' (D6 wording)", err)
+	}
+	if got := cc.stats.spuriousMsgsReceived.Load(); got != 1 {
+		t.Errorf("spuriousMsgsReceived = %d; want 1 (PARSE-REJECT increment per D6)", got)
+	}
+	// The buffer MUST NOT have been mutated by the rejected arm.
+	if string(f.decodeBodyBuf) != "original" {
+		t.Errorf("decodeBodyBuf = %q; want %q (PARSE-REJECT does NOT mutate)", f.decodeBodyBuf, "original")
+	}
+}
+
+// TestApplyProcessingResponse_ContinueAndReplace_HeaderStageWithBodyModeBUFFERED_CombinedReplacement_BodyStageOutboundSKIPPED
+// — per SPEC §4.3 table row 2: at header stages WITH body-mode = BUFFERED,
+// CONTINUE_AND_REPLACE is CONSUMED as a combined header+body replacement
+// (header_mutation + body_mutation both apply); sets f.skipBodyStageDispatch
+// so Task 7's body-stage entry SKIPs the body-stage outbound. The dispatcher
+// returns actContinueButStillWaiting (per SPEC §4.3 row 2 transition note).
+// No spurious increment.
+func TestApplyProcessingResponse_ContinueAndReplace_HeaderStageWithBodyModeBUFFERED_CombinedReplacement_BodyStageOutboundSKIPPED(t *testing.T) {
+	t.Parallel()
+	t.Run("decode_side_request_headers_buffered_request_body", func(t *testing.T) {
+		t.Parallel()
+		reg := stats.NewRegistry()
+		cc := &compiledConfig{
+			stats:         newFilterStats(reg, "t"),
+			mutationRules: resolveMutationRules(nil),
+		}
+		hdrs := http.Header{}
+		hdrs.Set("content-length", "5")
+		hdrs.Set("x-original", "yes")
+		f := &filter{
+			cc:            cc,
+			decodeHeaders: hdrs,
+			decodeBodyBuf: []byte("hello"),
+			activeProcessingMode: &resolvedProcessingMode{
+				RequestBodyMode: extprocv3.ProcessingMode_BUFFERED,
+			},
+		}
+		newBody := []byte("replaced request body")
+		cr := &extprocsvcv3.CommonResponse{
+			Status: extprocsvcv3.CommonResponse_CONTINUE_AND_REPLACE,
+			HeaderMutation: &extprocsvcv3.HeaderMutation{
+				SetHeaders: []*corev3.HeaderValueOption{
+					{Header: &corev3.HeaderValue{Key: "x-replaced", Value: "true"}},
+				},
+			},
+			BodyMutation: &extprocsvcv3.BodyMutation{
+				Mutation: &extprocsvcv3.BodyMutation_Body{Body: newBody},
+			},
+		}
+		resp := mkProcessingResponseRequestHeaders(cr)
+		act, err := applyProcessingResponse(f, stageRequestHeaders, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil (CONSUMED as combined replacement per SPEC §4.3 row 2)", err)
+		}
+		if act != actContinueButStillWaiting {
+			t.Errorf("act = %v; want actContinueButStillWaiting (per SPEC §4.3 row 2 transition note)", act)
+		}
+		// header_mutation applied.
+		if got := hdrs.Get("x-replaced"); got != "true" {
+			t.Errorf("x-replaced header = %q; want %q (header_mutation applied)", got, "true")
+		}
+		// body_mutation applied.
+		if string(f.decodeBodyBuf) != string(newBody) {
+			t.Errorf("decodeBodyBuf = %q; want %q (body_mutation applied)", f.decodeBodyBuf, newBody)
+		}
+		// Content-Length reconciled to the new body length.
+		if got := hdrs.Get("content-length"); got != strconv.Itoa(len(newBody)) {
+			t.Errorf("content-length = %q; want %d (reconciled)", got, len(newBody))
+		}
+		// Body-stage outbound SKIP flag set on the request direction.
+		if !f.skipBodyStageDispatch[directionRequest] {
+			t.Errorf("skipBodyStageDispatch[directionRequest] = false; want true (Task 7 contract)")
+		}
+		if f.skipBodyStageDispatch[directionResponse] {
+			t.Errorf("skipBodyStageDispatch[directionResponse] = true; want false (only request-side skip set)")
+		}
+		if got := cc.stats.spuriousMsgsReceived.Load(); got != 0 {
+			t.Errorf("spuriousMsgsReceived = %d; want 0 (CONSUMED — not spurious)", got)
+		}
+	})
+	t.Run("encode_side_response_headers_buffered_response_body", func(t *testing.T) {
+		t.Parallel()
+		reg := stats.NewRegistry()
+		cc := &compiledConfig{
+			stats:         newFilterStats(reg, "t"),
+			mutationRules: resolveMutationRules(nil),
+		}
+		hdrs := http.Header{}
+		hdrs.Set("content-length", "3")
+		f := &filter{
+			cc:            cc,
+			encodeHeaders: hdrs,
+			encodeBodyBuf: []byte("foo"),
+			activeProcessingMode: &resolvedProcessingMode{
+				ResponseBodyMode: extprocv3.ProcessingMode_BUFFERED,
+			},
+		}
+		newBody := []byte("replaced response body")
+		cr := &extprocsvcv3.CommonResponse{
+			Status: extprocsvcv3.CommonResponse_CONTINUE_AND_REPLACE,
+			BodyMutation: &extprocsvcv3.BodyMutation{
+				Mutation: &extprocsvcv3.BodyMutation_Body{Body: newBody},
+			},
+		}
+		resp := mkProcessingResponseResponseHeaders(cr)
+		act, err := applyProcessingResponse(f, stageResponseHeaders, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil", err)
+		}
+		if act != actContinueButStillWaiting {
+			t.Errorf("act = %v; want actContinueButStillWaiting", act)
+		}
+		if string(f.encodeBodyBuf) != string(newBody) {
+			t.Errorf("encodeBodyBuf = %q; want %q", f.encodeBodyBuf, newBody)
+		}
+		if !f.skipBodyStageDispatch[directionResponse] {
+			t.Errorf("skipBodyStageDispatch[directionResponse] = false; want true")
+		}
+		if f.skipBodyStageDispatch[directionRequest] {
+			t.Errorf("skipBodyStageDispatch[directionRequest] = true; want false (only response-side skip set)")
+		}
+	})
+}
+
+// TestApplyProcessingResponse_ContinueAndReplace_BodyStage_TreatedAsContinue_NoCounterIncrement
+// — per SPEC §4.3 table row 3: at body stages, CONTINUE_AND_REPLACE is
+// TREATED AS CONTINUE (the proto silently ignores at body stages). No
+// counter increment + no error + actContinue. body_mutation (when present)
+// still applies; header_mutation still applies; the SKIP flag does NOT fire
+// (body stages don't have a body-stage-outbound to skip).
+func TestApplyProcessingResponse_ContinueAndReplace_BodyStage_TreatedAsContinue_NoCounterIncrement(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		stats:         newFilterStats(reg, "t"),
+		mutationRules: resolveMutationRules(nil),
+	}
+	f := &filter{cc: cc, decodeBodyBuf: []byte("original")}
+	cr := &extprocsvcv3.CommonResponse{
+		Status: extprocsvcv3.CommonResponse_CONTINUE_AND_REPLACE,
+	}
+	resp := mkProcessingResponseRequestBody(cr)
+	act, err := applyProcessingResponse(f, stageRequestBody, resp)
+	if err != nil {
+		t.Errorf("err = %v; want nil (TREATED AS CONTINUE per SPEC §4.3 row 3)", err)
+	}
+	if act != actContinue {
+		t.Errorf("act = %v; want actContinue", act)
+	}
+	if got := cc.stats.spuriousMsgsReceived.Load(); got != 0 {
+		t.Errorf("spuriousMsgsReceived = %d; want 0 (proto silently ignores at body stages — NOT spurious)", got)
+	}
+	if f.skipBodyStageDispatch[directionRequest] || f.skipBodyStageDispatch[directionResponse] {
+		t.Errorf("skipBodyStageDispatch = %v; want both false (body-stage CONTINUE_AND_REPLACE does NOT set the skip flag)", f.skipBodyStageDispatch)
+	}
+}
+
+// TestApplyProcessingResponse_BodyStageImmediateResponse_FiresSendLocalReply
+// — per SPEC §4.4: body-stage ImmediateResponse fires SendLocalReply via the
+// existing multi-stage emitImmediateResponse infrastructure. Verifies that
+// the Task 4 4-stage extension allows body-stage ImmediateResponse to route
+// through the SAME emitImmediateResponse → dcb.SendLocalReply pathway used
+// at header stages.
+func TestApplyProcessingResponse_BodyStageImmediateResponse_FiresSendLocalReply(t *testing.T) {
+	t.Parallel()
+	t.Run("request_body_stage", func(t *testing.T) {
+		t.Parallel()
+		dcb := &recordingDCB{}
+		cc := &compiledConfig{stats: newFilterStats(stats.NewRegistry(), "t")}
+		f := &filter{cc: cc, dcb: dcb}
+		ir := &extprocsvcv3.ImmediateResponse{
+			Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+			Body:   []byte("denied at body stage"),
+		}
+		resp := &extprocsvcv3.ProcessingResponse{
+			Response: &extprocsvcv3.ProcessingResponse_ImmediateResponse{ImmediateResponse: ir},
+		}
+		act, err := applyProcessingResponse(f, stageRequestBody, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil", err)
+		}
+		if act != actImmediate {
+			t.Errorf("act = %v; want actImmediate", act)
+		}
+		if dcb.lrCalls != 1 {
+			t.Fatalf("dcb.SendLocalReply calls = %d; want 1 (body-stage ImmediateResponse fires SendLocalReply)", dcb.lrCalls)
+		}
+		if dcb.lrStatus != 403 {
+			t.Errorf("status = %d; want 403", dcb.lrStatus)
+		}
+		if dcb.lrBody != "denied at body stage" {
+			t.Errorf("body = %q; want %q", dcb.lrBody, "denied at body stage")
+		}
+		if !f.immediateResponseEmitted {
+			t.Errorf("f.immediateResponseEmitted = false; want true (multi-stage deny one-shot)")
+		}
+	})
+	t.Run("response_body_stage", func(t *testing.T) {
+		t.Parallel()
+		dcb := &recordingDCB{}
+		ecb := &fakeECB{}
+		cc := &compiledConfig{stats: newFilterStats(stats.NewRegistry(), "t")}
+		f := &filter{cc: cc, dcb: dcb, ecb: ecb}
+		ir := &extprocsvcv3.ImmediateResponse{
+			Status: &typev3.HttpStatus{Code: typev3.StatusCode_InternalServerError},
+			Body:   []byte("denied at response body stage"),
+		}
+		resp := &extprocsvcv3.ProcessingResponse{
+			Response: &extprocsvcv3.ProcessingResponse_ImmediateResponse{ImmediateResponse: ir},
+		}
+		act, err := applyProcessingResponse(f, stageResponseBody, resp)
+		if err != nil {
+			t.Errorf("err = %v; want nil", err)
+		}
+		if act != actImmediate {
+			t.Errorf("act = %v; want actImmediate", act)
+		}
+		if dcb.lrCalls != 1 {
+			t.Fatalf("dcb.SendLocalReply calls = %d; want 1 (response_body-stage ImmediateResponse fires SendLocalReply via dcb per ADR-0075)", dcb.lrCalls)
+		}
+		if dcb.lrStatus != 500 {
+			t.Errorf("status = %d; want 500", dcb.lrStatus)
+		}
+	})
+}
+
+// TestApplyProcessingResponse_ClearRouteCacheAtBodyStage_Ignored — per
+// SPEC §4.4: clear_route_cache at body stages continues IGNORED (per the
+// proto's "ignored in the response direction" wording). The existing
+// `s == stageRequestHeaders` guard in Step 6 enforces this; Task 6 adds
+// this regression-anchor test to pin the discipline post-AMENDMENT.
+func TestApplyProcessingResponse_ClearRouteCacheAtBodyStage_Ignored(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		stats:            newFilterStats(reg, "t"),
+		routeCacheAction: extprocv3.ExternalProcessor_CLEAR, // would clear at request_headers
+	}
+	f := &filter{cc: cc, decodeBodyBuf: []byte("body")}
+	cr := &extprocsvcv3.CommonResponse{
+		ClearRouteCache: true, // would clear at request_headers
+	}
+	resp := mkProcessingResponseRequestBody(cr)
+	act, err := applyProcessingResponse(f, stageRequestBody, resp)
+	if err != nil {
+		t.Errorf("err = %v; want nil", err)
+	}
+	if act != actContinue {
+		t.Errorf("act = %v; want actContinue", act)
+	}
+	// No spurious increment (clear_route_cache at body stage is IGNORED, not spurious).
+	if got := cc.stats.spuriousMsgsReceived.Load(); got != 0 {
+		t.Errorf("spuriousMsgsReceived = %d; want 0 (clear_route_cache at body stage is IGNORED per SPEC §4.4)", got)
+	}
+}
+
+// TestApplyProcessingResponse_BodyMutation_EmptyOneof_NoOp — per Task 6
+// reviewer carry-forward I-2: an empty BodyMutation oneof (Mutation field
+// nil; the proto carries `BodyMutation{}` with no oneof arm set) is
+// silently a NO-OP per the oneof-default discipline at applyBodyMutation
+// switch's `default` arm. Pins the contract:
+//
+//   - actContinue (NOT actError + sentinel).
+//   - spurious_msgs_received NOT incremented (NOT classified as spurious —
+//     an empty BodyMutation is structurally valid + means "no body changes").
+//   - decodeBodyBuf NOT mutated (left intact).
+//
+// This anchor test prevents regression if a future maintainer refactors the
+// applyBodyMutation switch and inadvertently classifies the empty-oneof case
+// as malformed (which would surface as either a spurious counter increment
+// OR an actError return — both would break the proto's oneof-default
+// semantics).
+func TestApplyProcessingResponse_BodyMutation_EmptyOneof_NoOp(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{stats: newFilterStats(reg, "t")}
+	hdrs := http.Header{}
+	hdrs.Set("content-length", "8")
+	original := []byte("original")
+	f := &filter{
+		cc:            cc,
+		decodeHeaders: hdrs,
+		decodeBodyBuf: original,
+	}
+	// Empty BodyMutation — the Mutation oneof is nil.
+	cr := &extprocsvcv3.CommonResponse{
+		BodyMutation: &extprocsvcv3.BodyMutation{},
+	}
+	resp := mkProcessingResponseRequestBody(cr)
+	act, err := applyProcessingResponse(f, stageRequestBody, resp)
+	if err != nil {
+		t.Errorf("err = %v; want nil (empty BodyMutation oneof is structurally valid no-op)", err)
+	}
+	if act != actContinue {
+		t.Errorf("act = %v; want actContinue", act)
+	}
+	if got := cc.stats.spuriousMsgsReceived.Load(); got != 0 {
+		t.Errorf("spuriousMsgsReceived = %d; want 0 (empty BodyMutation oneof is NOT spurious — proto oneof-default discipline)", got)
+	}
+	if string(f.decodeBodyBuf) != "original" {
+		t.Errorf("decodeBodyBuf = %q; want %q (empty-oneof must NOT mutate the buffer)", f.decodeBodyBuf, "original")
+	}
+	if got := hdrs.Get("content-length"); got != "8" {
+		t.Errorf("content-length = %q; want 8 (empty-oneof must NOT reconcile Content-Length)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 body-stage integration tests — end-to-end DecodeData / EncodeData
+// dispatch wiring per PLAN Task 7 Step 1 (TDD). Drive the body-stage
+// integration through the full chain: DecodeData / EncodeData entry →
+// dispatchStage (via fakeProcessStream) → applyProcessingResponse →
+// (possibly mutate buffer) → signalResume → assert observed effects.
+// ---------------------------------------------------------------------------
+
+// makeIntegrationFilter constructs a *filter wired for Task 7 integration
+// tests: dcb + ecb + stream + body-mode BUFFERED in BOTH directions + the
+// minimal cc.stats + cc.messageTimeout for dispatchStage. The returned
+// filter is ready for DecodeData / EncodeData entry-point invocation.
+func makeIntegrationFilter(t *testing.T, stream *fakeProcessStream) (*filter, *recordingDCB, *recordingECB) {
+	t.Helper()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		messageTimeout: 5 * time.Second,
+		stats:          newFilterStats(reg, "integration"),
+		mutationRules:  resolveMutationRules(nil),
+	}
+	dcb := &recordingDCB{}
+	ecb := &recordingECB{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	f := &filter{
+		cc:           cc,
+		dcb:          dcb,
+		ecb:          ecb,
+		stream:       stream,
+		streamCtx:    ctx,
+		streamCancel: cancel,
+		parentCtx:    ctx,
+		activeProcessingMode: &resolvedProcessingMode{
+			RequestHeaderMode:  extprocv3.ProcessingMode_SEND,
+			ResponseHeaderMode: extprocv3.ProcessingMode_SEND,
+			RequestBodyMode:    extprocv3.ProcessingMode_BUFFERED,
+			ResponseBodyMode:   extprocv3.ProcessingMode_BUFFERED,
+		},
+		activeMsgTimeout: 5 * time.Second,
+	}
+	return f, dcb, ecb
+}
+
+// recordingECB extends fakeECB to record OverwriteBody invocations + their
+// payload for Task 7 encode-side body-mutation delivery assertions.
+type recordingECB struct {
+	fakeECB
+	overwriteCalls int
+	overwriteBody  []byte
+	mu             sync.Mutex
+}
+
+func (r *recordingECB) OverwriteBody(b []byte) {
+	r.mu.Lock()
+	r.overwriteCalls++
+	r.overwriteBody = append([]byte{}, b...)
+	r.mu.Unlock()
+}
+
+func (r *recordingECB) overwriteCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.overwriteCalls
+}
+
+func (r *recordingECB) overwriteBytes() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.overwriteBody
+}
+
+// Compile-time conformance — fail fast if recordingECB drifts from the
+// framework's EncoderFilterCallbacks interface.
+var _ envoyhttp.EncoderFilterCallbacks = (*recordingECB)(nil)
+
+// waitForCondition polls a condition function with a per-iteration short sleep
+// up to a bounded deadline. Returns true if the condition fired before the
+// deadline, false otherwise. Used by the Task 7 integration tests to await
+// the async dispatch goroutine's resume signal.
+func waitForCondition(deadline time.Duration, cond func() bool) bool {
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+// TestExtProc_RequestBodyBuffered_EndToEnd_WithMutation — request-side
+// body-stage integration end-to-end. The fakeProcessStream returns a
+// ProcessingResponse{request_body} with a body_mutation arm; the
+// dispatcher fires applyProcessingResponse which mutates f.decodeBodyBuf;
+// the resume signal fires ContinueDecoding.
+//
+// **Asserts the decode-side body-mutation-delivery KNOWN LIMITATION**: the
+// f.decodeBodyBuf IS mutated (the processor's mutation lands) but there is
+// NO equivalent of OverwriteBody on the decode side — the mutated body is
+// observable in the filter's buffer + the Content-Length header reconciles
+// on f.decodeHeaders, but envoy-go has no upstream-body-delivery primitive
+// for the decode side (documented in DecodeData's KNOWN LIMITATION
+// comment).
+func TestExtProc_RequestBodyBuffered_EndToEnd_WithMutation(t *testing.T) {
+	t.Parallel()
+	newBody := []byte("mutated upstream body bytes")
+	stream := &fakeProcessStream{
+		recvResp: &extprocsvcv3.ProcessingResponse{
+			Response: &extprocsvcv3.ProcessingResponse_RequestBody{
+				RequestBody: &extprocsvcv3.BodyResponse{
+					Response: &extprocsvcv3.CommonResponse{
+						BodyMutation: &extprocsvcv3.BodyMutation{
+							Mutation: &extprocsvcv3.BodyMutation_Body{Body: newBody},
+						},
+					},
+				},
+			},
+		},
+	}
+	f, dcb, _ := makeIntegrationFilter(t, stream)
+	// Stash headers so the body_mutation arm can reconcile Content-Length.
+	hdrs := http.Header{}
+	hdrs.Set("content-length", "11")
+	f.decodeHeaders = hdrs
+
+	// Mid-stream chunk first — should accumulate + DataContinue (no dispatch).
+	st1 := f.DecodeData([]byte("hello "), false)
+	if st1 != envoyhttp.DataContinue {
+		t.Errorf("mid-stream status = %v; want DataContinue", st1)
+	}
+	if string(f.decodeBodyBuf) != "hello " {
+		t.Errorf("after mid-stream chunk: decodeBodyBuf = %q; want %q", f.decodeBodyBuf, "hello ")
+	}
+	// streamMsgsSent stays 0 (no dispatch yet).
+	if got := f.cc.stats.streamMsgsSent.Load(); got != 0 {
+		t.Errorf("streamMsgsSent after mid-stream = %d; want 0", got)
+	}
+
+	// Terminal chunk — dispatches + parks via DataStopIterationAndBuffer.
+	st2 := f.DecodeData([]byte("world"), true)
+	if st2 != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("end-stream status = %v; want DataStopIterationAndBuffer", st2)
+	}
+
+	// Wait for the async dispatch to complete + signal resume.
+	if !waitForCondition(2*time.Second, func() bool { return dcb.calls() >= 1 }) {
+		t.Fatalf("ContinueDecoding never fired; dcb.calls=%d", dcb.calls())
+	}
+
+	// Body buffer mutated (decode-side: observable in the filter buffer).
+	if string(f.decodeBodyBuf) != string(newBody) {
+		t.Errorf("post-mutation decodeBodyBuf = %q; want %q (decode-side body_mutation lands in buffer)", f.decodeBodyBuf, newBody)
+	}
+	// Content-Length reconciled on the live header map.
+	if got := hdrs.Get("content-length"); got != strconv.Itoa(len(newBody)) {
+		t.Errorf("content-length = %q; want %d (decode-side reconciliation lands via f.decodeHeaders)", got, len(newBody))
+	}
+	// Stat counters increment for the per-stage Send + Recv.
+	if got := f.cc.stats.streamMsgsSent.Load(); got != 1 {
+		t.Errorf("streamMsgsSent = %d; want 1", got)
+	}
+	if got := f.cc.stats.streamMsgsReceived.Load(); got != 1 {
+		t.Errorf("streamMsgsReceived = %d; want 1", got)
+	}
+}
+
+// TestExtProc_ResponseBodyBuffered_EndToEnd_WithMutation — encode-side
+// body-stage integration end-to-end. The processor returns a body_mutation;
+// f.encodeBodyBuf is mutated; the dispatch goroutine fires OverwriteBody
+// BEFORE the resume signal so the chain's encodeBodyOverride is set when
+// HCM substitutes resp.Body post-RunEncodeData. The resume signal fires
+// ContinueEncoding.
+//
+// **Asserts the encode-side body-mutation-delivery WORKS path** per
+// ADR-0131 OverwriteBody reuse — D10 hypothesis HOLDS (no new framework
+// primitive consumed).
+func TestExtProc_ResponseBodyBuffered_EndToEnd_WithMutation(t *testing.T) {
+	t.Parallel()
+	newBody := []byte("rewritten response body via ext_proc")
+	stream := &fakeProcessStream{
+		recvResp: &extprocsvcv3.ProcessingResponse{
+			Response: &extprocsvcv3.ProcessingResponse_ResponseBody{
+				ResponseBody: &extprocsvcv3.BodyResponse{
+					Response: &extprocsvcv3.CommonResponse{
+						BodyMutation: &extprocsvcv3.BodyMutation{
+							Mutation: &extprocsvcv3.BodyMutation_Body{Body: newBody},
+						},
+					},
+				},
+			},
+		},
+	}
+	f, _, ecb := makeIntegrationFilter(t, stream)
+	hdrs := http.Header{}
+	hdrs.Set("content-length", "3")
+	f.encodeHeaders = hdrs
+
+	// Terminal chunk in one call (HCM-passes-full-body-in-one-call default).
+	st := f.EncodeData([]byte("foo"), true)
+	if st != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("end-stream status = %v; want DataStopIterationAndBuffer", st)
+	}
+
+	// Wait for resume signal.
+	if !waitForCondition(2*time.Second, func() bool { return ecb.calls() >= 1 }) {
+		t.Fatalf("ContinueEncoding never fired; ecb.calls=%d", ecb.calls())
+	}
+	// Body buffer mutated.
+	if string(f.encodeBodyBuf) != string(newBody) {
+		t.Errorf("post-mutation encodeBodyBuf = %q; want %q", f.encodeBodyBuf, newBody)
+	}
+	// Content-Length reconciled.
+	if got := hdrs.Get("content-length"); got != strconv.Itoa(len(newBody)) {
+		t.Errorf("content-length = %q; want %d", got, len(newBody))
+	}
+	// OverwriteBody fired with the mutated bytes.
+	if got := ecb.overwriteCount(); got != 1 {
+		t.Errorf("OverwriteBody calls = %d; want 1 (encode-side body-mutation delivery via ADR-0131)", got)
+	}
+	if got := ecb.overwriteBytes(); string(got) != string(newBody) {
+		t.Errorf("OverwriteBody bytes = %q; want %q (the mutated buffer is delivered to HCM via encodeBodyOverride)", got, newBody)
+	}
+	// Counter check.
+	if got := f.cc.stats.streamMsgsSent.Load(); got != 1 {
+		t.Errorf("streamMsgsSent = %d; want 1", got)
+	}
+}
+
+// TestExtProc_BodyStageImmediateResponse_EndToEnd — ImmediateResponse at the
+// body stage. The processor returns ImmediateResponse{status: 403, body:
+// "denied at body stage"}; emitImmediateResponse fires SendLocalReply via
+// dcb (per ADR-0075 — even encode-side ImmediateResponse routes through
+// dcb). The dispatch goroutine returns actImmediate; completeStage fires
+// signalResume.
+func TestExtProc_BodyStageImmediateResponse_EndToEnd(t *testing.T) {
+	t.Parallel()
+	t.Run("request_body_stage", func(t *testing.T) {
+		t.Parallel()
+		stream := &fakeProcessStream{
+			recvResp: &extprocsvcv3.ProcessingResponse{
+				Response: &extprocsvcv3.ProcessingResponse_ImmediateResponse{
+					ImmediateResponse: &extprocsvcv3.ImmediateResponse{
+						Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+						Body:   []byte("denied at body stage"),
+					},
+				},
+			},
+		}
+		f, dcb, _ := makeIntegrationFilter(t, stream)
+		st := f.DecodeData([]byte("payload"), true)
+		if st != envoyhttp.DataStopIterationAndBuffer {
+			t.Errorf("end-stream status = %v; want DataStopIterationAndBuffer", st)
+		}
+		// Wait for dispatch + ImmediateResponse + resume.
+		if !waitForCondition(2*time.Second, func() bool { return dcb.lrCallsSafe() >= 1 }) {
+			t.Fatalf("SendLocalReply never fired; dcb.lrCalls=%d", dcb.lrCallsSafe())
+		}
+		// Wait for resume.
+		if !waitForCondition(2*time.Second, func() bool { return dcb.calls() >= 1 }) {
+			t.Fatalf("ContinueDecoding never fired post-immediate-response; dcb.calls=%d", dcb.calls())
+		}
+		if dcb.lrStatusSafe() != 403 {
+			t.Errorf("SendLocalReply status = %d; want 403", dcb.lrStatusSafe())
+		}
+		if dcb.lrBodySafe() != "denied at body stage" {
+			t.Errorf("SendLocalReply body = %q; want %q", dcb.lrBodySafe(), "denied at body stage")
+		}
+		if !f.immediateResponseEmitted {
+			t.Errorf("immediateResponseEmitted = false; want true (one-shot deny flag set)")
+		}
+	})
+	t.Run("response_body_stage", func(t *testing.T) {
+		t.Parallel()
+		stream := &fakeProcessStream{
+			recvResp: &extprocsvcv3.ProcessingResponse{
+				Response: &extprocsvcv3.ProcessingResponse_ImmediateResponse{
+					ImmediateResponse: &extprocsvcv3.ImmediateResponse{
+						Status: &typev3.HttpStatus{Code: typev3.StatusCode_InternalServerError},
+						Body:   []byte("denied at response body stage"),
+					},
+				},
+			},
+		}
+		f, dcb, ecb := makeIntegrationFilter(t, stream)
+		st := f.EncodeData([]byte("orig"), true)
+		if st != envoyhttp.DataStopIterationAndBuffer {
+			t.Errorf("end-stream status = %v; want DataStopIterationAndBuffer", st)
+		}
+		if !waitForCondition(2*time.Second, func() bool { return dcb.lrCallsSafe() >= 1 }) {
+			t.Fatalf("SendLocalReply never fired; dcb.lrCalls=%d", dcb.lrCallsSafe())
+		}
+		if !waitForCondition(2*time.Second, func() bool { return ecb.calls() >= 1 }) {
+			t.Fatalf("ContinueEncoding never fired; ecb.calls=%d", ecb.calls())
+		}
+		if dcb.lrStatusSafe() != 500 {
+			t.Errorf("SendLocalReply status = %d; want 500", dcb.lrStatusSafe())
+		}
+	})
+}
+
+// TestExtProc_ContinueAndReplace_HeaderStageWithBodyModeBUFFERED_EndToEnd_BodyStageOutboundSKIPPED
+// — verifies the Task 6 skip-flag consumer at Task 7's DecodeData /
+// EncodeData entry. Simulates the post-CONTINUE_AND_REPLACE state at body
+// stage entry: f.skipBodyStageDispatch[direction] = true + the buffer has
+// been pre-mutated by the header-stage applyProcessingResponse. The
+// body-stage entry MUST skip the outbound dispatch + release the mutated
+// buffer (encode side: via OverwriteBody; decode side: via DataContinue
+// per the documented limitation).
+func TestExtProc_ContinueAndReplace_HeaderStageWithBodyModeBUFFERED_EndToEnd_BodyStageOutboundSKIPPED(t *testing.T) {
+	t.Parallel()
+	t.Run("decode_side_request_body_SKIPPED", func(t *testing.T) {
+		t.Parallel()
+		// Stream is set up but should NEVER be invoked — the skip flag
+		// short-circuits before dispatch.
+		stream := &fakeProcessStream{
+			recvResp: &extprocsvcv3.ProcessingResponse{
+				Response: &extprocsvcv3.ProcessingResponse_RequestBody{
+					RequestBody: &extprocsvcv3.BodyResponse{Response: &extprocsvcv3.CommonResponse{}},
+				},
+			},
+		}
+		f, _, _ := makeIntegrationFilter(t, stream)
+		// Simulate the post-CONTINUE_AND_REPLACE state set by Task 6 at the
+		// header-stage applyProcessingResponse: skip flag set + buffer
+		// pre-mutated.
+		f.skipBodyStageDispatch[directionRequest] = true
+		preMutated := []byte("pre-mutated request body bytes")
+		f.decodeBodyBuf = preMutated
+
+		st := f.DecodeData([]byte("ignored-incoming-chunk"), true)
+		if st != envoyhttp.DataContinue {
+			t.Errorf("skip-flag end-stream status = %v; want DataContinue (body-stage outbound SKIPPED)", st)
+		}
+		// Stream Send NEVER called (skip flag short-circuited).
+		stream.mu.Lock()
+		sendCalls := stream.sendCalls
+		stream.mu.Unlock()
+		if sendCalls != 0 {
+			t.Errorf("stream.Send called %d times; want 0 (body-stage outbound MUST be skipped)", sendCalls)
+		}
+		// Counter NOT incremented.
+		if got := f.cc.stats.streamMsgsSent.Load(); got != 0 {
+			t.Errorf("streamMsgsSent = %d; want 0 (skip-flag suppresses dispatch)", got)
+		}
+		// Per C-1 rework: the pre-mutated buffer is preserved INTACT.
+		// The skip-flag short-circuit fires BEFORE the incoming chunk is
+		// appended to the accumulator, so f.decodeBodyBuf retains the
+		// header-stage replacement bytes verbatim. (Pre-rework the chunk
+		// was appended unconditionally before the skip check, which
+		// corrupted the buffer; the empty incoming chunk in this test
+		// masked the bug. The new TestExtProc_BodyStage_SkipFlag_PreservesPreMutatedBuffer_C1Regression
+		// exercises the path with a non-empty chunk + mid-stream chunks.)
+		if string(f.decodeBodyBuf) != string(preMutated) {
+			t.Errorf("decodeBodyBuf = %q; want %q (skip-flag must NOT append incoming chunk)", f.decodeBodyBuf, preMutated)
+		}
+	})
+	t.Run("encode_side_response_body_SKIPPED_OverwriteBodyFiresWithPreMutatedBuffer", func(t *testing.T) {
+		t.Parallel()
+		stream := &fakeProcessStream{}
+		f, _, ecb := makeIntegrationFilter(t, stream)
+		f.skipBodyStageDispatch[directionResponse] = true
+		preMutated := []byte("pre-mutated response body bytes")
+		f.encodeBodyBuf = preMutated
+
+		// EncodeData with a "remaining" chunk (in practice the HCM passes
+		// the full body once; this terminal chunk is what would arrive
+		// post-header-stage CONTINUE_AND_REPLACE in the body-mode-BUFFERED
+		// case).
+		st := f.EncodeData([]byte(""), true)
+		if st != envoyhttp.DataContinue {
+			t.Errorf("skip-flag end-stream status = %v; want DataContinue (body-stage outbound SKIPPED)", st)
+		}
+		// Stream Send NEVER called.
+		stream.mu.Lock()
+		sendCalls := stream.sendCalls
+		stream.mu.Unlock()
+		if sendCalls != 0 {
+			t.Errorf("stream.Send called %d times; want 0 (body-stage outbound MUST be skipped)", sendCalls)
+		}
+		// OverwriteBody fired with the pre-mutated buffer (so HCM
+		// substitutes resp.Body with the header-stage replacement).
+		if got := ecb.overwriteCount(); got != 1 {
+			t.Errorf("OverwriteBody calls = %d; want 1 (encode-side skip path releases buffer via OverwriteBody)", got)
+		}
+		if got := ecb.overwriteBytes(); string(got) != string(preMutated) {
+			t.Errorf("OverwriteBody bytes = %q; want %q (the pre-mutated buffer flows downstream via OverwriteBody)", got, preMutated)
+		}
+	})
+}
+
+// TestExtProc_BodyStage_SkipFlag_PreservesPreMutatedBuffer_C1Regression — C-1
+// regression test (code-quality reviewer a06aa6c8e7db06ecf, Task 7 rework).
+//
+// **The bug**: pre-rework, DecodeData / EncodeData unconditionally appended
+// the incoming HCM chunk to f.{decode,encode}BodyBuf BEFORE checking the
+// skipBodyStageDispatch flag. For CONTINUE_AND_REPLACE+body-mode=BUFFERED
+// scenarios, Task 6 pre-populated the buffer with the header-stage
+// replacement bytes; the unconditional append corrupted the buffer to
+// "REPLACEMENT" + "real-upstream-bytes". On the encode side, this corrupt
+// concatenation was then passed to f.ecb.OverwriteBody — HCM substituted
+// resp.Body with the corrupted bytes. The existing skip-flag test masked
+// the bug by passing an EMPTY incoming chunk.
+//
+// **The fix**: move the skip-flag short-circuit BEFORE the accumulator
+// append. The check runs on EVERY entry (mid-stream + endStream chunks)
+// so a chunk arriving WHILE the skip-flag is set does NOT corrupt the
+// pre-mutated buffer.
+//
+// **What this regression exercises**:
+//   - Encode-side terminal chunk: non-empty incoming bytes — OverwriteBody
+//     must receive the REPLACEMENT bytes, NOT REPLACEMENT+incoming.
+//   - Encode-side mid-stream chunk followed by terminal chunk: same skip
+//     flag held throughout — buffer + OverwriteBody payload stay intact.
+//   - Decode-side mirror: f.decodeBodyBuf must remain the pre-mutated bytes
+//     after non-empty chunk + after mid-stream-then-terminal sequence.
+func TestExtProc_BodyStage_SkipFlag_PreservesPreMutatedBuffer_C1Regression(t *testing.T) {
+	t.Parallel()
+
+	t.Run("encode_side_terminal_chunk_nonEmpty_OverwriteBodyGetsReplacementIntact", func(t *testing.T) {
+		t.Parallel()
+		stream := &fakeProcessStream{}
+		f, _, ecb := makeIntegrationFilter(t, stream)
+		f.skipBodyStageDispatch[directionResponse] = true
+		preMutated := []byte("REPLACEMENT")
+		f.encodeBodyBuf = preMutated
+
+		// Non-empty incoming chunk: simulates HCM delivering the actual
+		// upstream response body bytes AFTER Task 6 pre-populated the
+		// buffer with the header-stage replacement. Pre-C-1-rework this
+		// would have produced "REPLACEMENTreal-body-bytes-from-upstream".
+		st := f.EncodeData([]byte("real-body-bytes-from-upstream"), true)
+		if st != envoyhttp.DataContinue {
+			t.Errorf("status = %v; want DataContinue", st)
+		}
+		// Stream Send NEVER called — skip-flag short-circuited.
+		stream.mu.Lock()
+		sendCalls := stream.sendCalls
+		stream.mu.Unlock()
+		if sendCalls != 0 {
+			t.Errorf("stream.Send called %d times; want 0", sendCalls)
+		}
+		// OverwriteBody fired EXACTLY ONCE with the pre-mutated buffer
+		// — NOT including the incoming chunk.
+		if got := ecb.overwriteCount(); got != 1 {
+			t.Errorf("OverwriteBody calls = %d; want 1", got)
+		}
+		if got := ecb.overwriteBytes(); string(got) != "REPLACEMENT" {
+			t.Errorf("OverwriteBody bytes = %q; want %q (C-1 regression: incoming chunk must NOT be appended)", got, "REPLACEMENT")
+		}
+		// Buffer itself stays the pre-mutated replacement.
+		if string(f.encodeBodyBuf) != "REPLACEMENT" {
+			t.Errorf("encodeBodyBuf = %q; want %q", f.encodeBodyBuf, "REPLACEMENT")
+		}
+	})
+
+	t.Run("encode_side_midStream_then_terminal_skipFlagHeldThroughout", func(t *testing.T) {
+		t.Parallel()
+		stream := &fakeProcessStream{}
+		f, _, ecb := makeIntegrationFilter(t, stream)
+		f.skipBodyStageDispatch[directionResponse] = true
+		preMutated := []byte("REPLACEMENT")
+		f.encodeBodyBuf = preMutated
+
+		// Mid-stream chunk arrives — skip-flag must short-circuit and
+		// NOT append to the pre-mutated buffer.
+		st1 := f.EncodeData([]byte("chunk1"), false)
+		if st1 != envoyhttp.DataContinue {
+			t.Errorf("mid-stream status = %v; want DataContinue", st1)
+		}
+		if string(f.encodeBodyBuf) != "REPLACEMENT" {
+			t.Errorf("after mid-stream chunk: encodeBodyBuf = %q; want %q (chunk1 must not be appended)", f.encodeBodyBuf, "REPLACEMENT")
+		}
+		// Terminal chunk — same skip-flag.
+		st2 := f.EncodeData([]byte("chunk2"), true)
+		if st2 != envoyhttp.DataContinue {
+			t.Errorf("terminal status = %v; want DataContinue", st2)
+		}
+		// OverwriteBody fired BOTH times the skip path triggered.
+		// The KEY invariant is that the most-recent OverwriteBody payload
+		// is the unmutated REPLACEMENT — chunk1+chunk2 never landed in
+		// the buffer.
+		if got := ecb.overwriteCount(); got != 2 {
+			t.Errorf("OverwriteBody calls = %d; want 2 (mid-stream + terminal both hit the skip path)", got)
+		}
+		if got := ecb.overwriteBytes(); string(got) != "REPLACEMENT" {
+			t.Errorf("final OverwriteBody bytes = %q; want %q (C-1 regression: chunks must NOT corrupt the buffer)", got, "REPLACEMENT")
+		}
+		if string(f.encodeBodyBuf) != "REPLACEMENT" {
+			t.Errorf("final encodeBodyBuf = %q; want %q", f.encodeBodyBuf, "REPLACEMENT")
+		}
+		// Stream Send NEVER called — body-stage outbound stays suppressed
+		// across the entire chunk sequence.
+		stream.mu.Lock()
+		sendCalls := stream.sendCalls
+		stream.mu.Unlock()
+		if sendCalls != 0 {
+			t.Errorf("stream.Send called %d times; want 0", sendCalls)
+		}
+	})
+
+	t.Run("decode_side_terminal_chunk_nonEmpty_BufferStaysIntact", func(t *testing.T) {
+		t.Parallel()
+		stream := &fakeProcessStream{}
+		f, _, _ := makeIntegrationFilter(t, stream)
+		f.skipBodyStageDispatch[directionRequest] = true
+		preMutated := []byte("REPLACEMENT")
+		f.decodeBodyBuf = preMutated
+
+		st := f.DecodeData([]byte("real-body-bytes-from-downstream"), true)
+		if st != envoyhttp.DataContinue {
+			t.Errorf("status = %v; want DataContinue", st)
+		}
+		// Stream Send NEVER called.
+		stream.mu.Lock()
+		sendCalls := stream.sendCalls
+		stream.mu.Unlock()
+		if sendCalls != 0 {
+			t.Errorf("stream.Send called %d times; want 0", sendCalls)
+		}
+		// Decode-side has NO OverwriteBody analog (KNOWN LIMITATION); the
+		// invariant is that f.decodeBodyBuf stays the pre-mutated bytes.
+		if string(f.decodeBodyBuf) != "REPLACEMENT" {
+			t.Errorf("decodeBodyBuf = %q; want %q (C-1 regression: incoming chunk must NOT be appended on decode side either)", f.decodeBodyBuf, "REPLACEMENT")
+		}
+	})
+
+	t.Run("decode_side_midStream_then_terminal_skipFlagHeldThroughout", func(t *testing.T) {
+		t.Parallel()
+		stream := &fakeProcessStream{}
+		f, _, _ := makeIntegrationFilter(t, stream)
+		f.skipBodyStageDispatch[directionRequest] = true
+		preMutated := []byte("REPLACEMENT")
+		f.decodeBodyBuf = preMutated
+
+		st1 := f.DecodeData([]byte("chunk1"), false)
+		if st1 != envoyhttp.DataContinue {
+			t.Errorf("mid-stream status = %v; want DataContinue", st1)
+		}
+		if string(f.decodeBodyBuf) != "REPLACEMENT" {
+			t.Errorf("after mid-stream: decodeBodyBuf = %q; want %q", f.decodeBodyBuf, "REPLACEMENT")
+		}
+		st2 := f.DecodeData([]byte("chunk2"), true)
+		if st2 != envoyhttp.DataContinue {
+			t.Errorf("terminal status = %v; want DataContinue", st2)
+		}
+		if string(f.decodeBodyBuf) != "REPLACEMENT" {
+			t.Errorf("final decodeBodyBuf = %q; want %q (C-1 regression: chunks must NOT corrupt the buffer)", f.decodeBodyBuf, "REPLACEMENT")
+		}
+		stream.mu.Lock()
+		sendCalls := stream.sendCalls
+		stream.mu.Unlock()
+		if sendCalls != 0 {
+			t.Errorf("stream.Send called %d times; want 0", sendCalls)
+		}
+	})
+}
+
+// TestExtProc_OnDestroy_DuringBodyStageOutbound_NoBufferReleaseFires — per
+// planner-time D7 OnDestroy discipline. Asserts the OnDestroy-during-body-
+// stage-outbound race resolves deterministically: the dispatch goroutine
+// observes f.done = true via completeStage's mu-guarded check + drops the
+// resume signal + the encode-side OverwriteBody NEVER fires (the
+// deliverEncodeBodyMutation site runs INSIDE the completeStage path; the
+// completeStage early-return on f.done short-circuits before reaching the
+// stageResponseBody arm).
+//
+// Wait — completeStage's check is BEFORE applyProcessingResponseFn; the
+// deliverEncodeBodyMutation call is AFTER it. Let me re-check the order:
+// looking at processor.go's completeStage:
+//
+//  1. mu.Lock + check f.done (drop if true).
+//  2. mu.Unlock.
+//  3. applyProcessingResponseFn(f, s, resp) (returns action + maybe mutates buffer).
+//  4. deliverEncodeBodyMutation if s == stageResponseBody.
+//  5. signalResume.
+//
+// So if OnDestroy fires AFTER step 2 but BEFORE step 4, the
+// deliverEncodeBodyMutation could fire on an already-destroyed filter. The
+// race-guard pattern is the f.done check at step 1; OnDestroy itself sets
+// f.done = true under f.mu (per processor.go OnDestroy). The race window is
+// narrow but acceptable per the planner-time D9 discipline (the encode-side
+// OverwriteBody on a destroyed filter is a no-op anyway since the chain is
+// already torn down). This test exercises the COMMON case: OnDestroy fires
+// BEFORE the dispatch goroutine completes the recv-side processing, so the
+// completeStage early-return at step 1 fires + neither the buffer mutation
+// NOR the OverwriteBody land.
+func TestExtProc_OnDestroy_DuringBodyStageOutbound_NoBufferReleaseFires(t *testing.T) {
+	t.Parallel()
+	// fakeProcessStream blocks Recv until we close the blockCh — simulates
+	// the dispatch goroutine parked on Recv when OnDestroy fires.
+	blockCh := make(chan struct{})
+	stream := &fakeProcessStream{
+		recvBlockCh: blockCh,
+		recvResp: &extprocsvcv3.ProcessingResponse{
+			Response: &extprocsvcv3.ProcessingResponse_ResponseBody{
+				ResponseBody: &extprocsvcv3.BodyResponse{
+					Response: &extprocsvcv3.CommonResponse{
+						BodyMutation: &extprocsvcv3.BodyMutation{
+							Mutation: &extprocsvcv3.BodyMutation_Body{Body: []byte("would-replace")},
+						},
+					},
+				},
+			},
+		},
+	}
+	f, _, ecb := makeIntegrationFilter(t, stream)
+	stream.recvBlockCtx = f.streamCtx
+	original := []byte("original encode body")
+	st := f.EncodeData(original, true)
+	if st != envoyhttp.DataStopIterationAndBuffer {
+		t.Errorf("status = %v; want DataStopIterationAndBuffer", st)
+	}
+	// Give the dispatch goroutine a moment to enter Recv (block).
+	time.Sleep(20 * time.Millisecond)
+
+	// OnDestroy fires — sets f.done + cancels the stream context (which
+	// unblocks Recv via the blockCtx select). The dispatch goroutine wakes
+	// + completeStage's mu-guarded f.done check fires + drops the response.
+	f.OnDestroy()
+
+	// Unblock the channel (defensive — the recvBlockCtx already unblocked
+	// the goroutine via ctx.Done; closing the channel is a safety net for
+	// the recvBlockCh-only path).
+	close(blockCh)
+
+	// Wait long enough for the goroutine to fully exit (it may take a few
+	// scheduler ticks). After exit:
+	//   - OverwriteBody NEVER fires (the completeStage early-return on
+	//     f.done short-circuits before deliverEncodeBodyMutation).
+	//   - encodeBodyBuf NOT mutated (the applyProcessingResponse mutation
+	//     arm never runs).
+	//   - ContinueEncoding NEVER fires (signalResume short-circuits).
+	time.Sleep(150 * time.Millisecond)
+
+	if got := ecb.overwriteCount(); got != 0 {
+		t.Errorf("OverwriteBody calls = %d; want 0 (D7: no body-buffer release on OnDestroy-during-body-stage-outbound)", got)
+	}
+	if string(f.encodeBodyBuf) != string(original) {
+		t.Errorf("encodeBodyBuf = %q; want %q (body buffer must NOT be mutated when OnDestroy fires first)", f.encodeBodyBuf, original)
+	}
+	if got := ecb.calls(); got != 0 {
+		t.Errorf("ContinueEncoding calls = %d; want 0 (D9: completeStage drops resume signal when f.done set)", got)
+	}
+	if !f.done {
+		t.Errorf("f.done = false after OnDestroy; want true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Group N+8 — Phase-19.2 Task 8 body-stage race tests per PLAN Task 8 +
+// SPEC §14.2.
+//
+// The 4 race tests below exercise the body-stage race surfaces under -race:
+//
+//   - TestRace_OnDestroyDuringBodyStageOutbound_DecodeAndEncode — per D7
+//     OnDestroy-during-body-stage-outbound: same primitive 19.1 ratified for
+//     header-stage outbound; the body-stage Send/Recv loop honors ctx.Done()
+//     and returns promptly + completeStage drops the resume signal under the
+//     f.done race-guard. Two parallel sub-tests cover the decode + encode
+//     sides; the race detector observes no data race on f.decodeBodyBuf /
+//     f.encodeBodyBuf / f.activeMsgCancel under the concurrent
+//     OnDestroy + dispatch-goroutine completion sequence.
+//
+//   - TestRace_EncodeBufConcurrentWithContinueEncoding_EndToEnd — end-to-end
+//     analog of chain_test.go's
+//     TestEncoderCB_BufferEncodedBody_RaceDetectorCleanUnderConcurrentEncodeDataAndContinueEncoding
+//     exercised at the body-stage filter level: drives EncodeData (which
+//     accumulates onto f.encodeBodyBuf via bodyStageEntry) + the dispatch
+//     goroutine fires ContinueEncoding from off-dispatch via the resume
+//     channel. Race detector observes no data race on the f.encodeBodyBuf
+//     accumulator under the dispatch-goroutine vs HCM-dispatch-goroutine
+//     concurrency. The chain-side c.encodeBuf race surface is exercised
+//     end-to-end indirectly through the same dispatch pathway.
+//
+//   - TestRace_PerMessageTimerCancelRebuild_AgainstInFlightSendRecv — per
+//     D4 behavioral lift: dispatch goroutine spawns the watchdog +
+//     publishes f.activeMsgCancel under f.mu; concurrent
+//     handleOverrideMessageTimeout fires the captured cancel → watchdog
+//     fires streamCancel → in-flight Recv unblocks with
+//     context.Canceled. Race detector observes no race on f.activeMsgCancel
+//     (the mu-protected read+clear pattern in handleOverrideMessageTimeout +
+//     the dispatch goroutine's mu-protected set+clear).
+//
+//   - TestRace_ModeOverrideHeaderStageResponse_VsBodyStageDispatch —
+//     header-stage dispatcher's recv goroutine fires the mode_override
+//     mutation onto f.activeProcessingMode (under the D9 happens-before
+//     ordering); the body-stage dispatch reads f.activeProcessingMode via
+//     bodyModeActive() at the EncodeData entry. The test exercises the
+//     post-resume happens-before ordering — once the encode-side resume
+//     signal fires (after applyProcessingResponse mutated the mode), a
+//     subsequent EncodeData read observes the post-override mode without a
+//     torn read or data-race detector finding.
+// ---------------------------------------------------------------------------
+
+// TestRace_OnDestroyDuringBodyStageOutbound_DecodeAndEncode — Task 8 Test 1.
+//
+// Two parallel sub-tests cover the decode + encode sides. Each:
+//
+//  1. Wires an integration filter with a fakeProcessStream whose Recv blocks
+//     on streamCtx.Done (the dispatch goroutine parks on Recv after Send).
+//  2. Issues DecodeData / EncodeData with endStream=true → spawns the dispatch
+//     goroutine via dispatchStage; the goroutine fires Send + parks on Recv.
+//  3. Concurrently invokes f.OnDestroy() — cancels streamCtx → Recv returns
+//     context.Canceled → dispatch goroutine's completeStage early-returns on
+//     the f.done race-guard → no resume signal fires + no body-buffer
+//     mutation lands.
+//
+// Race-detector clean under the concurrent OnDestroy + dispatch-goroutine
+// completion sequence. Asserts:
+//
+//   - dcb.calls() == 0 (decode) / ecb.calls() == 0 (encode): the resume
+//     signal is dropped by the D9 race-guard.
+//   - For the encode side: ecb.overwriteCount() == 0 — the
+//     deliverEncodeBodyMutation path short-circuits via the f.done check at
+//     the top of completeStage.
+//   - f.done == true post-OnDestroy.
+//   - cc.stats.streamsFailed >= 1 (cancel-induced Recv error path).
+func TestRace_OnDestroyDuringBodyStageOutbound_DecodeAndEncode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("decode_side", func(t *testing.T) {
+		t.Parallel()
+		// fakeProcessStream's Recv blocks until blockCh closes OR ctx cancels.
+		// We never close blockCh — only OnDestroy's streamCancel unblocks Recv.
+		blockCh := make(chan struct{})
+		stream := &fakeProcessStream{
+			recvBlockCh: blockCh,
+			recvResp: &extprocsvcv3.ProcessingResponse{
+				Response: &extprocsvcv3.ProcessingResponse_RequestBody{
+					RequestBody: &extprocsvcv3.BodyResponse{
+						Response: &extprocsvcv3.CommonResponse{
+							BodyMutation: &extprocsvcv3.BodyMutation{
+								Mutation: &extprocsvcv3.BodyMutation_Body{Body: []byte("would-mutate")},
+							},
+						},
+					},
+				},
+			},
+		}
+		f, dcb, _ := makeIntegrationFilter(t, stream)
+		stream.recvBlockCtx = f.streamCtx
+		original := []byte("original request body")
+		f.decodeBodyBuf = nil // ensure clean baseline
+
+		// Dispatch goroutine parks on Recv.
+		st := f.DecodeData(original, true)
+		if st != envoyhttp.DataStopIterationAndBuffer {
+			t.Errorf("DecodeData status = %v; want DataStopIterationAndBuffer", st)
+		}
+		// Wait for the goroutine to enter Recv (race-detector cares about the
+		// goroutine actually being parked when OnDestroy fires concurrently).
+		if !waitForCondition(500*time.Millisecond, func() bool {
+			stream.mu.Lock()
+			defer stream.mu.Unlock()
+			return stream.recvCalls >= 1
+		}) {
+			t.Fatalf("dispatch goroutine did not enter Recv within 500ms")
+		}
+
+		// Concurrent OnDestroy — race surface: streamCancel races with the
+		// dispatch goroutine's Recv unblock + completeStage's f.done check.
+		f.OnDestroy()
+
+		// Wait for the dispatch goroutine to observe ctx cancel + complete
+		// (streamsFailed increments via the recvErr path in dispatchStage).
+		if !waitForCondition(1*time.Second, func() bool {
+			return f.cc.stats.streamsFailed.Load() >= 1
+		}) {
+			t.Fatalf("dispatch goroutine did not unblock within 1s of OnDestroy; streamsFailed=%d",
+				f.cc.stats.streamsFailed.Load())
+		}
+
+		// D9 invariants post-OnDestroy:
+		if dcb.calls() != 0 {
+			t.Errorf("ContinueDecoding calls = %d; want 0 (D9: completeStage drops resume signal when f.done set)", dcb.calls())
+		}
+		// The decode-side body buffer was set by bodyStageEntry's accumulator
+		// (original bytes) BEFORE OnDestroy fired; the body_mutation arm
+		// inside applyProcessingResponse never ran (completeStage short-
+		// circuits on f.done). So the buffer stays the ACCUMULATED original
+		// bytes — NOT the would-mutate replacement.
+		if string(f.decodeBodyBuf) != string(original) {
+			t.Errorf("decodeBodyBuf = %q; want %q (body buffer must NOT be mutated when OnDestroy fires first)", f.decodeBodyBuf, original)
+		}
+		if !f.done {
+			t.Errorf("f.done = false after OnDestroy; want true")
+		}
+		// Defensive close — Recv has already unblocked via streamCancel; this
+		// is a safety net for the recvBlockCh-only path.
+		close(blockCh)
+	})
+
+	t.Run("encode_side", func(t *testing.T) {
+		t.Parallel()
+		blockCh := make(chan struct{})
+		stream := &fakeProcessStream{
+			recvBlockCh: blockCh,
+			recvResp: &extprocsvcv3.ProcessingResponse{
+				Response: &extprocsvcv3.ProcessingResponse_ResponseBody{
+					ResponseBody: &extprocsvcv3.BodyResponse{
+						Response: &extprocsvcv3.CommonResponse{
+							BodyMutation: &extprocsvcv3.BodyMutation{
+								Mutation: &extprocsvcv3.BodyMutation_Body{Body: []byte("would-replace")},
+							},
+						},
+					},
+				},
+			},
+		}
+		f, _, ecb := makeIntegrationFilter(t, stream)
+		stream.recvBlockCtx = f.streamCtx
+		original := []byte("original encode body")
+
+		st := f.EncodeData(original, true)
+		if st != envoyhttp.DataStopIterationAndBuffer {
+			t.Errorf("EncodeData status = %v; want DataStopIterationAndBuffer", st)
+		}
+		// Wait for the goroutine to enter Recv.
+		if !waitForCondition(500*time.Millisecond, func() bool {
+			stream.mu.Lock()
+			defer stream.mu.Unlock()
+			return stream.recvCalls >= 1
+		}) {
+			t.Fatalf("dispatch goroutine did not enter Recv within 500ms")
+		}
+
+		// Concurrent OnDestroy.
+		f.OnDestroy()
+
+		if !waitForCondition(1*time.Second, func() bool {
+			return f.cc.stats.streamsFailed.Load() >= 1
+		}) {
+			t.Fatalf("dispatch goroutine did not unblock within 1s of OnDestroy; streamsFailed=%d",
+				f.cc.stats.streamsFailed.Load())
+		}
+
+		// Encode-side D9 invariants:
+		if ecb.calls() != 0 {
+			t.Errorf("ContinueEncoding calls = %d; want 0", ecb.calls())
+		}
+		if got := ecb.overwriteCount(); got != 0 {
+			t.Errorf("OverwriteBody calls = %d; want 0 (D7: deliverEncodeBodyMutation must NOT fire post-OnDestroy)", got)
+		}
+		if string(f.encodeBodyBuf) != string(original) {
+			t.Errorf("encodeBodyBuf = %q; want %q", f.encodeBodyBuf, original)
+		}
+		if !f.done {
+			t.Errorf("f.done = false after OnDestroy; want true")
+		}
+		close(blockCh)
+	})
+}
+
+// TestRace_EncodeBufConcurrentWithContinueEncoding_EndToEnd — Task 8 Test 2.
+//
+// End-to-end body-stage analog of chain_test.go's
+// TestEncoderCB_BufferEncodedBody_RaceDetectorCleanUnderConcurrentEncodeDataAndContinueEncoding
+// (chain-level encodeBuf race surface). The body-stage dispatch path drives:
+//
+//   - bodyStageEntry's accumulator append onto f.encodeBodyBuf in the
+//     EncodeData call (HCM-side / test-side goroutine).
+//   - The dispatch goroutine's completeStage path firing ContinueEncoding
+//     (via ecb.ContinueEncoding) from the OFF-dispatch async goroutine
+//     spawned by dispatchStage.
+//
+// The HCM-side EncodeData call returns DataStopIterationAndBuffer; the
+// parked HCM goroutine is unparked by the dispatch goroutine's
+// ContinueEncoding via the encodeResumeCh primitive (the chain-level
+// primitive that chain_test.go exercises). End-to-end at the body-stage
+// filter level: the f.encodeBodyBuf accumulator + the dispatch goroutine's
+// resume signal must produce zero race-detector findings across N
+// iterations. The race surface that this test pins is: the write to
+// f.encodeBodyBuf (HCM goroutine, inside bodyStageEntry) happens-before the
+// dispatch goroutine's Send (which reads f.encodeBodyBuf via the envelope
+// builder) per the synchronous chain — there is no concurrent write/read on
+// f.encodeBodyBuf, but the test exercises the full path repeatedly under
+// -race to catch any future regression in that ordering. The
+// applyProcessingResponse mutation arm (writes to f.encodeBodyBuf from the
+// dispatch goroutine) happens-before the ecb.ContinueEncoding signal which
+// happens-before the parked HCM goroutine's unpark.
+func TestRace_EncodeBufConcurrentWithContinueEncoding_EndToEnd(t *testing.T) {
+	t.Parallel()
+	const iterations = 25
+	mutatedBody := []byte("body bytes mutated by processor")
+	for iter := 0; iter < iterations; iter++ {
+		stream := &fakeProcessStream{
+			recvResp: &extprocsvcv3.ProcessingResponse{
+				Response: &extprocsvcv3.ProcessingResponse_ResponseBody{
+					ResponseBody: &extprocsvcv3.BodyResponse{
+						Response: &extprocsvcv3.CommonResponse{
+							BodyMutation: &extprocsvcv3.BodyMutation{
+								Mutation: &extprocsvcv3.BodyMutation_Body{Body: mutatedBody},
+							},
+						},
+					},
+				},
+			},
+		}
+		f, _, ecb := makeIntegrationFilter(t, stream)
+		hdrs := http.Header{}
+		hdrs.Set("content-length", "3")
+		f.encodeHeaders = hdrs
+
+		// EncodeData with endStream=true — appends to f.encodeBodyBuf via
+		// bodyStageEntry's accumulator (HCM-side goroutine) + dispatches the
+		// body-stage Send/Recv on the OFF-dispatch goroutine which mutates
+		// f.encodeBodyBuf via applyProcessingResponse + signals
+		// ContinueEncoding. The race-detector observes the full path.
+		st := f.EncodeData([]byte("xyz"), true)
+		if st != envoyhttp.DataStopIterationAndBuffer {
+			t.Fatalf("iter %d: EncodeData status = %v; want DataStopIterationAndBuffer", iter, st)
+		}
+
+		// Wait for the dispatch goroutine's resume signal — the
+		// ContinueEncoding call is the chain-level unpark primitive that
+		// would, in production, unblock the parked HCM goroutine. In this
+		// test we observe its arrival via ecb.calls() reaching 1.
+		if !waitForCondition(2*time.Second, func() bool { return ecb.calls() >= 1 }) {
+			t.Fatalf("iter %d: ContinueEncoding never fired; ecb.calls=%d", iter, ecb.calls())
+		}
+		// Post-resume: the encode buffer has been mutated by the dispatch
+		// goroutine + OverwriteBody fired with the mutated bytes.
+		if string(f.encodeBodyBuf) != string(mutatedBody) {
+			t.Fatalf("iter %d: encodeBodyBuf = %q; want %q", iter, f.encodeBodyBuf, mutatedBody)
+		}
+		if got := ecb.overwriteCount(); got != 1 {
+			t.Fatalf("iter %d: OverwriteBody calls = %d; want 1", iter, got)
+		}
+		if got := ecb.overwriteBytes(); string(got) != string(mutatedBody) {
+			t.Fatalf("iter %d: OverwriteBody bytes = %q; want %q", iter, got, mutatedBody)
+		}
+	}
+}
+
+// TestRace_PerMessageTimerCancelRebuild_AgainstInFlightSendRecv — Task 8
+// Test 3.
+//
+// Per D4 behavioral lift (ADR-0171 §Decision AMENDMENT bullet 5): the
+// per-message timer is consumed BEHAVIORALLY via context.WithTimeout
+// cancel-and-rebuild on each stage's Send. The dispatchStage publishes the
+// per-message cancel hook on f.activeMsgCancel under f.mu; the watchdog
+// goroutine selects on msgCtx.Done vs doneCh + fires f.streamCancel on
+// per-message deadline expiry (cascade-cancels the bidi-stream so the
+// in-flight Recv unblocks).
+//
+// This test races a concurrent handleOverrideMessageTimeout call against
+// the in-flight Send/Recv: the override fires the captured
+// f.activeMsgCancel → watchdog observes msgCtx.Done → watchdog fires
+// streamCancel → Recv unblocks with context.Canceled → dispatch goroutine's
+// completeStage handles the recvErr path → streamsFailed increments.
+//
+// Race-detector clean under the concurrent activeMsgCancel set (dispatch
+// goroutine, under f.mu) + read+clear (handleOverrideMessageTimeout, under
+// f.mu) + the deferred clear at goroutine exit (also under f.mu). The
+// stream-fatal cascade is the intended behavior per the D4 docstring's
+// "Stream-fatal cascade" note.
+func TestRace_PerMessageTimerCancelRebuild_AgainstInFlightSendRecv(t *testing.T) {
+	t.Parallel()
+	// fakeProcessStream's Recv blocks until ctx cancels.
+	blockCh := make(chan struct{})
+	stream := &fakeProcessStream{
+		recvBlockCh: blockCh,
+		recvResp: &extprocsvcv3.ProcessingResponse{
+			Response: &extprocsvcv3.ProcessingResponse_ResponseBody{
+				ResponseBody: &extprocsvcv3.BodyResponse{
+					Response: &extprocsvcv3.CommonResponse{},
+				},
+			},
+		},
+	}
+	f, _, _ := makeIntegrationFilter(t, stream)
+	stream.recvBlockCtx = f.streamCtx
+	// Override-API needs maxMessageTimeout >= 1ms.
+	f.cc.maxMessageTimeout = 5 * time.Second
+	// Trigger body-stage dispatch (encode side) — parks on Recv.
+	st := f.EncodeData([]byte("payload"), true)
+	if st != envoyhttp.DataStopIterationAndBuffer {
+		t.Fatalf("EncodeData status = %v; want DataStopIterationAndBuffer", st)
+	}
+	// Wait for the dispatch goroutine to publish f.activeMsgCancel +
+	// enter Recv. The activeMsgCancel publish happens BEFORE the Send call
+	// per dispatchStage's code ordering; observing recvCalls >= 1 is
+	// therefore a sufficient barrier for the cancel-hook visibility.
+	if !waitForCondition(500*time.Millisecond, func() bool {
+		stream.mu.Lock()
+		defer stream.mu.Unlock()
+		return stream.recvCalls >= 1
+	}) {
+		t.Fatalf("dispatch goroutine did not enter Recv within 500ms")
+	}
+	// Verify the cancel hook is published.
+	f.mu.Lock()
+	gotCancel := f.activeMsgCancel != nil
+	f.mu.Unlock()
+	if !gotCancel {
+		t.Fatalf("f.activeMsgCancel not published after Recv entry; expected dispatchStage to set it under f.mu")
+	}
+
+	// Concurrent handleOverrideMessageTimeout — race surface: read+clear of
+	// f.activeMsgCancel under f.mu (handleOverrideMessageTimeout) vs the
+	// dispatch goroutine's deferred clear-under-f.mu at goroutine exit + the
+	// set-under-f.mu at goroutine entry. Per ADR-0171 §Decision AMENDMENT
+	// bullet 5: the override accept fires the captured cancel → watchdog
+	// fires streamCancel → Recv unblocks → dispatch goroutine exits.
+	accepted := f.handleOverrideMessageTimeout(stageResponseBody, durationpb.New(50*time.Millisecond))
+	if !accepted {
+		t.Fatalf("handleOverrideMessageTimeout returned false; want true (override should be accepted)")
+	}
+
+	// Wait for the dispatch goroutine to complete — streamsFailed
+	// increments via the recvErr path under the cancel-induced Recv unblock.
+	if !waitForCondition(1*time.Second, func() bool {
+		return f.cc.stats.streamsFailed.Load() >= 1
+	}) {
+		t.Fatalf("dispatch goroutine did not unblock within 1s of override-timeout; streamsFailed=%d",
+			f.cc.stats.streamsFailed.Load())
+	}
+
+	// Post-race: f.activeMsgCancel is cleared (the override path set it nil
+	// before firing; the deferred clear at goroutine exit is idempotent).
+	f.mu.Lock()
+	stillSet := f.activeMsgCancel != nil
+	f.mu.Unlock()
+	if stillSet {
+		t.Errorf("f.activeMsgCancel still set after override-timeout + dispatch exit; want nil (idempotent clear)")
+	}
+	// The override counter must have incremented exactly once.
+	if got := f.cc.stats.overrideMessageTimeoutReceived.Load(); got != 1 {
+		t.Errorf("overrideMessageTimeoutReceived = %d; want 1", got)
+	}
+	// Defensive close — Recv already unblocked via streamCancel.
+	close(blockCh)
+}
+
+// TestRace_ModeOverrideHeaderStageResponse_VsBodyStageDispatch — Task 8 Test
+// 4.
+//
+// Per parent §5.P1 + ADR-0171: mode_override on a header-stage response
+// mutates f.activeProcessingMode on the dispatch goroutine's recv-side
+// completion (applyProcessingResponse Step 3); the body-stage dispatch at
+// the subsequent EncodeData entry reads f.activeProcessingMode via
+// bodyModeActive(). The D9 happens-before ordering is: header-stage resume
+// signal happens-before the encode-side EncodeData entry; therefore the
+// body-stage read observes the post-override mode without a torn read.
+//
+// This test pins the ordering under -race across the
+// header-response-arrival + body-stage-dispatch sequence. The flow:
+//
+//   - First call: EncodeHeaders → header-stage dispatch fires; the response
+//     carries mode_override flipping ResponseBodyMode → BUFFERED (was NONE
+//     at the cc default). applyProcessingResponse mutates
+//     f.activeProcessingMode on the dispatch goroutine. The
+//     ContinueEncoding signal fires (D9 happens-before).
+//
+//   - Second call: EncodeData (the body-stage entry) reads
+//     f.activeProcessingMode via bodyModeActive() — observes BUFFERED →
+//     proceeds with body-stage dispatch. The race detector observes no
+//     race on f.activeProcessingMode.
+//
+// This is the natural production sequence (mode_override flips the mode on
+// the header response; the body stage follows). The race-clean property
+// follows from the D9 framework-sequential-dispatch invariant: the dispatch
+// goroutine completes (signals resume) BEFORE the encode-side body
+// dispatch begins.
+func TestRace_ModeOverrideHeaderStageResponse_VsBodyStageDispatch(t *testing.T) {
+	t.Parallel()
+	// Stream sequence: first Recv (header stage) returns mode_override flipping
+	// ResponseBodyMode → BUFFERED; second Recv (body stage) returns a clean
+	// body response. We use a custom recv-sequence stream below to deliver
+	// both responses in order.
+	stream := &sequencedRecvStream{
+		responses: []*extprocsvcv3.ProcessingResponse{
+			// Header-stage: mode_override + valid response_headers.
+			{
+				ModeOverride: &extprocv3.ProcessingMode{
+					RequestHeaderMode:  extprocv3.ProcessingMode_SEND,
+					ResponseHeaderMode: extprocv3.ProcessingMode_SEND,
+					ResponseBodyMode:   extprocv3.ProcessingMode_BUFFERED,
+				},
+				Response: &extprocsvcv3.ProcessingResponse_ResponseHeaders{
+					ResponseHeaders: &extprocsvcv3.HeadersResponse{
+						Response: &extprocsvcv3.CommonResponse{
+							Status: extprocsvcv3.CommonResponse_CONTINUE,
+						},
+					},
+				},
+			},
+			// Body-stage: clean response_body.
+			{
+				Response: &extprocsvcv3.ProcessingResponse_ResponseBody{
+					ResponseBody: &extprocsvcv3.BodyResponse{
+						Response: &extprocsvcv3.CommonResponse{},
+					},
+				},
+			},
+		},
+	}
+	// Build the filter directly (sequencedRecvStream doesn't fit
+	// makeIntegrationFilter's *fakeProcessStream parameter). Mirrors
+	// makeIntegrationFilter's defaults: messageTimeout 5s, mutationRules
+	// resolved, parentCtx == streamCtx, recordingDCB / recordingECB.
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		messageTimeout: 5 * time.Second,
+		stats:          newFilterStats(reg, "mode_override_vs_body"),
+		mutationRules:  resolveMutationRules(nil),
+		// allowModeOverride must be true for applyProcessingResponse Step 3 to
+		// mutate f.activeProcessingMode.
+		allowModeOverride: true,
+	}
+	ecb := &recordingECB{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	f := &filter{
+		cc:           cc,
+		dcb:          &recordingDCB{},
+		ecb:          ecb,
+		stream:       stream,
+		streamCtx:    ctx,
+		streamCancel: cancel,
+		parentCtx:    ctx,
+		// Start with ResponseBodyMode = NONE so the mode_override actually
+		// flips state observably (mode_override sets it to BUFFERED).
+		activeProcessingMode: &resolvedProcessingMode{
+			RequestHeaderMode:  extprocv3.ProcessingMode_SEND,
+			ResponseHeaderMode: extprocv3.ProcessingMode_SEND,
+			RequestBodyMode:    extprocv3.ProcessingMode_NONE,
+			ResponseBodyMode:   extprocv3.ProcessingMode_NONE,
+		},
+		activeMsgTimeout: 5 * time.Second,
+	}
+
+	// Sanity: pre-call, body mode is NONE (encode-side body-stage dispatch
+	// would be inactive).
+	if f.bodyModeActive(directionResponse) {
+		t.Fatalf("pre-call: bodyModeActive(response) = true; want false (NONE baseline)")
+	}
+
+	// Step 1: EncodeHeaders fires the header-stage dispatch → recv returns
+	// the mode_override → applyProcessingResponse mutates
+	// f.activeProcessingMode under the dispatch goroutine → signalResume
+	// fires ContinueEncoding.
+	hdrs := http.Header{"X-Foo": []string{"bar"}}
+	status := f.EncodeHeaders(hdrs, false)
+	if status != envoyhttp.StopIteration {
+		t.Fatalf("EncodeHeaders status = %v; want StopIteration", status)
+	}
+	// Wait for the header-stage resume signal — the D9 happens-before
+	// barrier that publishes the mode_override mutation to subsequent reads.
+	if !waitForCondition(2*time.Second, func() bool { return ecb.calls() >= 1 }) {
+		t.Fatalf("ContinueEncoding (header stage) never fired; ecb.calls=%d", ecb.calls())
+	}
+
+	// Post-header-stage: the mode_override mutation is observable via the
+	// happens-before ordering of the resume signal.
+	if f.activeProcessingMode == nil ||
+		f.activeProcessingMode.ResponseBodyMode != extprocv3.ProcessingMode_BUFFERED {
+		t.Fatalf("post-header: ResponseBodyMode = %v; want BUFFERED (mode_override should have flipped it)",
+			f.activeProcessingMode.ResponseBodyMode)
+	}
+	if !f.bodyModeActive(directionResponse) {
+		t.Errorf("post-header: bodyModeActive(response) = false; want true (post-override BUFFERED)")
+	}
+
+	// Step 2: EncodeData fires the body-stage entry → bodyStageEntry's
+	// bodyModeActive() reads f.activeProcessingMode (the post-override
+	// value) → proceeds with body-stage dispatch. The race detector
+	// observes no race on f.activeProcessingMode between the dispatch
+	// goroutine's mutation (Step 1) and this read (Step 2).
+	headers := http.Header{}
+	headers.Set("content-length", "7")
+	f.encodeHeaders = headers
+	bodySt := f.EncodeData([]byte("payload"), true)
+	if bodySt != envoyhttp.DataStopIterationAndBuffer {
+		t.Fatalf("EncodeData status = %v; want DataStopIterationAndBuffer (body-stage dispatch should proceed under post-override BUFFERED)", bodySt)
+	}
+	// Wait for the body-stage resume signal.
+	if !waitForCondition(2*time.Second, func() bool { return ecb.calls() >= 2 }) {
+		t.Fatalf("ContinueEncoding (body stage) never fired; ecb.calls=%d", ecb.calls())
+	}
+	// Sanity: 2 Send calls (header + body), 2 Recv calls.
+	if got := stream.sendCount(); got != 2 {
+		t.Errorf("Send count = %d; want 2 (one per stage)", got)
+	}
+	if got := stream.recvCount(); got != 2 {
+		t.Errorf("Recv count = %d; want 2 (one per stage)", got)
+	}
+}
+
+// sequencedRecvStream is a deterministic test fake that returns a sequence
+// of pre-recorded ProcessingResponses on consecutive Recv calls. Used by
+// TestRace_ModeOverrideHeaderStageResponse_VsBodyStageDispatch which needs
+// distinct responses for the header stage (carrying mode_override) and the
+// body stage (clean response).
+type sequencedRecvStream struct {
+	mu sync.Mutex
+
+	sendCalls    int
+	recvCalls    int
+	closeSendCnt int
+	responses    []*extprocsvcv3.ProcessingResponse
+}
+
+func (s *sequencedRecvStream) Send(_ *extprocsvcv3.ProcessingRequest) error {
+	s.mu.Lock()
+	s.sendCalls++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *sequencedRecvStream) Recv() (*extprocsvcv3.ProcessingResponse, error) {
+	s.mu.Lock()
+	idx := s.recvCalls
+	s.recvCalls++
+	var resp *extprocsvcv3.ProcessingResponse
+	if idx < len(s.responses) {
+		resp = s.responses[idx]
+	}
+	s.mu.Unlock()
+	if resp == nil {
+		return nil, errors.New("sequencedRecvStream: no response at index")
+	}
+	return resp, nil
+}
+
+func (s *sequencedRecvStream) CloseSend() error {
+	s.mu.Lock()
+	s.closeSendCnt++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *sequencedRecvStream) sendCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sendCalls
+}
+
+func (s *sequencedRecvStream) recvCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recvCalls
 }

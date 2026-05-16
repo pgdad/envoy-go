@@ -58,11 +58,19 @@ type FilterChain struct {
 	// errEncodeBufferOverflow sentinel from RunEncodeData (HCM dispatch resets
 	// the connection — Tasks 15 + 16). decodeBufOver is set when the decode-side
 	// cap is crossed and gates the overflow path; the framework's behavior is
-	// driven by the local-reply path / sentinel return. Encode-side tracks only
-	// the running byte count (encodeBufLen) because the chunk has already been
-	// forwarded down the encode chain — no replay buffer is needed.
+	// driven by the local-reply path / sentinel return. Encode-side tracks both
+	// the running byte count (encodeBufLen — cap-check) AND the chain-level
+	// accumulated buffer (encodeBuf — the ADR-0175 buffer-and-hold primitive
+	// landed at phase-19.2 Task 2). encodeBuf accumulates incoming EncodeData
+	// chunks whenever an encode-side filter returns DataStopIterationAndBuffer;
+	// on resume at end_stream the chain releases the (possibly-mutated)
+	// accumulated buffer downstream as the new payload for the remaining
+	// encoders + clears encodeBuf. Pre-ADR-0175 the encode-side StopIterationAndBuffer
+	// disposition was park-only (no replay buffer existed); ADR-0175 closes
+	// the encode-side gap symmetrically to ADR-0128 decode-side.
 	decodeBuf     []byte
 	decodeBufOver bool
+	encodeBuf     []byte
 	encodeBufLen  int
 
 	// SendLocalReply guard (Task 7).
@@ -370,10 +378,32 @@ func (c *FilterChain) RunEncodeHeaders(ctx context.Context, headers http.Header,
 // cap, returns errEncodeBufferOverflow without iterating any filter on that
 // chunk. The HCM dispatch path resets the connection (H1 close, H2 RST_STREAM)
 // on this sentinel — wired in Tasks 15 + 16.
+//
+// Per ADR-0175 (phase-19.2 Task 2 — envoy-go's FIRST encode-side body-
+// buffering framework primitive): when an encoder filter returns
+// DataStopIterationAndBuffer, the chain ACCUMULATES the current chunk into
+// c.encodeBuf (analogous to the decode-side c.decodeBuf at RunDecodeData)
+// AND parks the dispatch goroutine on encodeResumeCh. The buffering filter
+// inspects the accumulated bytes via EncoderFilterCallbacks.BufferEncodedBody()
+// and unparks via ContinueEncoding(). On resume at end_stream, the chain
+// RELEASES the (possibly-mutated) accumulated buffer downstream as the new
+// `data` payload for the remaining encoders (i.e., the next filters in the
+// reverse-iteration order see the buffered bytes rather than the original
+// chunk) AND CLEARS c.encodeBuf — closing the buffering window per ADR-0175
+// §Decision. Mid-stream chunks (endStream=false on the buffering call)
+// accumulate-and-park without releasing; the buffer persists across
+// RunEncodeData invocations until end_stream closes the window. This
+// diverges DataStopIterationAndBuffer from DataStopIterationNoBuffer (the
+// latter stays park-only / continue-iteration on this same chunk — no
+// accumulation, no release).
 func (c *FilterChain) RunEncodeData(ctx context.Context, data []byte, endStream bool) (bool, error) {
 	// Buffer-cap check up front: the sentinel is returned BEFORE iterating any
 	// filter, so the connection-reset wire path never observes a partially-
 	// emitted overflowing chunk. Per ADR-0076 + SPEC §15 acceptance bullet 2.
+	// Per ADR-0175 D7 (planner-time): overflow handling is SYMMETRIC to the
+	// decode-side errDecodeBufferOverflow path — the same filterBufferLimitBytes
+	// cap governs encode-side accumulation; once exceeded, the chain returns
+	// errEncodeBufferOverflow + HCM dispatch resets the connection.
 	if c.encodeBufLen+len(data) > filterBufferLimitBytes {
 		return false, errEncodeBufferOverflow
 	}
@@ -388,7 +418,45 @@ func (c *FilterChain) RunEncodeData(ctx context.Context, data []byte, endStream 
 		switch status {
 		case DataContinue:
 			c.encodeIdx--
-		case DataStopIterationAndBuffer, DataStopIterationNoBuffer:
+		case DataStopIterationAndBuffer:
+			// ADR-0175 §Decision accumulation: append the current chunk into
+			// the chain-level encodeBuf BEFORE parking — so the filter can
+			// inspect via BufferEncodedBody() from inside its EncodeData
+			// callback OR from a concurrent goroutine that wakes the dispatch
+			// via ContinueEncoding. The accumulation is in-place via append;
+			// the chain owns the backing array, callers MUST treat the slice
+			// returned from BufferEncodedBody as read-aliased.
+			c.encodeBuf = append(c.encodeBuf, data...)
+			if err := c.parkEncode(ctx); err != nil {
+				return false, err
+			}
+			// ADR-0175 §Decision release-and-clear at end_stream: the buffering
+			// window closes on the last EncodeData call (endStream=true). The
+			// chain releases the (possibly-mutated by the filter via the
+			// reader-aliased slice OR via OverwriteBody) accumulated buffer
+			// downstream as the new `data` payload for the remaining filters
+			// in this reverse-iteration. Mid-stream chunks (endStream=false)
+			// leave the buffer intact + advance to the next filter with the
+			// ORIGINAL chunk — preserving the cross-call accumulation
+			// invariant (the filter MAY return DataStopIterationAndBuffer
+			// across multiple RunEncodeData invocations and the buffer
+			// accumulates across all of them until end_stream closes the
+			// window).
+			//
+			// Cap-counter discipline (phase-19.2 Task 2 rework): on release we
+			// reassign `data` to the UNION buffer (c.encodeBuf — already counts
+			// the prior-chunk per-call bumps the post-loop encodeBufLen += len(data)
+			// recorded on previous RunEncodeData calls). Subtract that prior
+			// accumulation here so the post-loop bump below counts each byte
+			// exactly once. See the cap-counter comment at the post-loop site.
+			if endStream {
+				priorAccum := len(c.encodeBuf) - len(data)
+				data = c.encodeBuf
+				c.encodeBuf = nil
+				c.encodeBufLen -= priorAccum
+			}
+			c.encodeIdx--
+		case DataStopIterationNoBuffer:
 			if err := c.parkEncode(ctx); err != nil {
 				return false, err
 			}
@@ -397,10 +465,16 @@ func (c *FilterChain) RunEncodeData(ctx context.Context, data []byte, endStream 
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterDataStatus %d on encode", c.filters[c.encodeIdx].Name, status)
 		}
 	}
-	// Iteration completed; record the chunk's size for the encode-side cap.
-	// Only the running total is tracked — the bytes have already been
-	// forwarded down the encode chain on this call, so no replay buffer is
-	// needed (encode-side StopIterationAndBuffer is park-only per Task 6).
+	// Iteration completed; record this call's contribution to the encode-side
+	// cap. Per ADR-0175 the cap tracks CUMULATIVE DISTINCT BODY BYTES seen by
+	// the chain — each byte counted EXACTLY ONCE whether it transited as a
+	// per-call `data` argument or as part of an accumulated-then-released
+	// buffer. The release-at-end_stream branch above subtracts the prior
+	// accumulation from encodeBufLen BEFORE we reassign `data = c.encodeBuf`,
+	// so the bump below does not double-count the previously-buffered chunks
+	// (those bytes were already counted on their original RunEncodeData calls).
+	// The running total is the source of truth for the cap-vs-overflow check
+	// at the top of the next RunEncodeData call.
 	c.encodeBufLen += len(data)
 	return true, nil
 }
@@ -573,6 +647,23 @@ func (e *encoderCB) EncodeTrailers(http.Header)      {}
 func (e *encoderCB) OverwriteBody(b []byte) {
 	e.c.encodeBodyOverride = b
 	e.c.encodeBodyOverridden = true
+}
+
+// BufferEncodedBody returns the chain-accumulated encode-side body bytes the
+// chain has appended on prior EncodeData calls where this (or another encode-
+// side) filter returned DataStopIterationAndBuffer. Returns nil before any
+// buffering has occurred AND nil after the chain has released the buffer
+// downstream at end_stream (see ADR-0175 §Decision release-and-clear
+// discipline in RunEncodeData). The returned slice ALIASES the chain's
+// internal encodeBuf — callers MUST treat the underlying bytes as read-aliased;
+// in-place mutation through the slice header is permitted only while the
+// dispatch goroutine is parked on encodeResumeCh AND only when the calling
+// filter is the (presumed-unique) buffering filter holding the resume signal
+// (ADR-0175 §Decision discipline; per-stream single-goroutine invariant per
+// ADR-0071). Per ADR-0175 (envoy-go's FIRST encode-side body-buffering
+// framework primitive; phase-19.2 Task 2 anchor).
+func (e *encoderCB) BufferEncodedBody() []byte {
+	return e.c.encodeBuf
 }
 
 // The 6 reader methods below are the per-stream filter-facing accessors for

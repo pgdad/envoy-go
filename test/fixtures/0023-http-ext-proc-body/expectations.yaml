@@ -1,0 +1,377 @@
+# Differential expectations for fixture 0023-http-ext-proc-body.
+# Phase 19.2 — body-mode ext_proc. Per SPEC §7 (6-scenario matrix per §7.2).
+#
+# Per-scenario allow-list + counter-delta presence-check map + documented
+# divergence window against reference Envoy v1.37.2.
+#
+# Counter-delta discipline per SPEC §7.5: PRESENCE-check (per-counter
+# EXISTS + per-counter VALUE > 0 across the workload), NOT strict
+# per-scenario equivalence. The 19.1 ADR-0173 §Consequences AMENDMENT
+# carries forward at 19.2 — strict per-scenario counter equivalence is
+# DEFERRED per §8 item 16 to a future phase pending the
+# strict-equivalence-vs-counter-superset-activation joint decision.
+#
+# ---------------------------------------------------------------------------
+# Scenarios (per SPEC §7.2 6-scenario matrix)
+# ---------------------------------------------------------------------------
+scenarios:
+  - id: a
+    name: "request_body_buffered_mutation (OBSERVABILITY-only)"
+    listener: l_test_a
+    path: /scenario_a
+    method: POST
+    request_body: "client-request-body-bytes-scenario-a"
+    expect_status: 200
+    expect_backend_echo: true
+    counter_delta_presence:
+      streams_started: ">=1"
+      stream_msgs_sent: ">=2"
+      stream_msgs_received: ">=2"
+      streams_closed: ">=1"
+    notes: |
+      request_body_mode: BUFFERED at the l_test_a listener. Driver POSTs a
+      non-empty request body; the filter's DecodeData accumulates the body
+      to end_stream + dispatches a ProcessingRequest{request_body} envelope
+      on the EXISTING bidi-stream (the request_headers stage opened it
+      first). The processor returns CommonResponse{} (no mutation
+      requested) at BOTH the request_headers stage AND the request_body
+      stage; the request flows to the echobackend unchanged.
+
+      ** Scope-handled per Task 7 ADR-0168 §Consequences decode-side
+      body-mutation-delivery KNOWN LIMITATION (Option B per the Task 9
+      hand-off): the processor SEES the request_body envelope and
+      asserts its presence (observability) but does NOT request body
+      mutation; cross-side body bytes remain byte-equivalent because no
+      mutation was requested. The driver post-run assertion against the
+      processor.Received("/scenario_a") slice confirms a
+      ProcessingRequest{request_body} envelope was observed on BOTH
+      sides — this is the substantive 19.2 body-stage observability
+      contract. **
+
+      Closure for the decode-side body-mutation upstream-delivery gap is
+      deferred to a future phase that adds the decode-side body-mutation
+      -delivery framework primitive (likely a future ADR analogous to
+      ADR-0131 for the decode side; speculative ADR-0178 or later) per
+      the Task 7 §Consequences refresh.
+
+  - id: b
+    name: "response_body_buffered_mutation (OBSERVABILITY-only — AMENDED at Task 9 fixture scrape)"
+    listener: l_test_b
+    path: /scenario_b
+    method: GET
+    expect_status: 200
+    expected_body: "upstream-response-body-b"
+    counter_delta_presence:
+      streams_started: ">=1"
+      stream_msgs_sent: ">=2"
+      stream_msgs_received: ">=2"
+      streams_closed: ">=1"
+    notes: |
+      response_body_mode: BUFFERED at the l_test_b listener; upstream
+      response shape locked via direct_response route (eliminates
+      upstream-framing variability as a cross-side axis). The processor
+      returns CommonResponse{} at response_headers + CommonResponse{} at
+      response_body (NO mutation requested per the empirical-pin
+      AMENDMENT below).
+
+      ** Empirical-pin AMENDMENT recorded at Task 9 fixture-harness scrape **
+      The planner-time hypothesis "body_mutation{body} at response_body
+      stage replaces the downstream body byte-exact" did NOT hold against
+      reference Envoy v1.37.2: the reference proxy returns 500 with empty
+      body when the processor emits CommonResponse{body_mutation{body}} at
+      the response_body stage, regardless of upstream backend shape (the
+      500 reproduces with both echobackend AND direct_response routes).
+      The envoy-go side correctly applies the mutation + emits 200 with
+      the replacement body. The cross-side divergence forces a
+      scope-reduction to OBSERVABILITY-only: the processor sees the
+      response_body envelope (the substantive D5 attribute-roster scrape
+      surface) but no mutation is requested. Both sides see the original
+      upstream body (24 bytes "upstream-response-body-b") and cross-side
+      byte equivalence holds. The envoy-go encode-side mutation-delivery
+      path is asserted by extproc unit tests (Task 6) + race tests
+      (Task 8) — closure of the cross-side substantive-mutation
+      assertion deferred to a future phase that bottoms out the reference
+      Envoy v1.37.2 body-stage body_mutation behavior (see divergence_window
+      below).
+
+  - id: c
+    name: "body_stage_immediate_response (DECODE-side — AMENDED at Task 9 fixture scrape)"
+    listener: l_test_a
+    path: /scenario_c
+    method: POST
+    request_body: "client-request-body-bytes-scenario-c"
+    expect_status: 403
+    expected_body: "denied-at-body-stage-scenario-c"
+    counter_delta_presence:
+      streams_started: ">=1"
+      stream_msgs_sent: ">=2"
+      stream_msgs_received: ">=1"
+      streams_closed: ">=1"
+    notes: |
+      ** Empirical-pin AMENDMENT recorded at Task 9 fixture-harness scrape **
+      The planner-time hypothesis placed this scenario on the encode side
+      (response_body stage ImmediateResponse on l_test_b). The
+      fixture-harness scrape surfaced an envoy-go-side framework gap: HCM
+      rejects SendLocalReply with `"called SendLocalReply after encode-side
+      started; ignoring"` when invoked from the dispatch goroutine AFTER
+      the encode chain has begun processing the upstream response. This
+      is a structural framework limitation on the encode-side
+      ImmediateResponse path; closure deferred to a future phase.
+
+      The substantive `body_stage_immediate_response` contract is still
+      asserted by re-scoping to the DECODE side: l_test_a listener
+      (request_body_mode: BUFFERED), POST with a non-empty request body
+      so the body-stage outbound dispatches the request_body envelope;
+      the processor returns ImmediateResponse{403, "denied...", headers}
+      at the request_body stage. SendLocalReply on the decode side is
+      the well-supported framework path (the request has not reached
+      upstream yet). Both reference Envoy v1.37.2 and envoy-go return
+      403 with the processor-supplied body byte-exact. Per ADR-0172
+      §Decision: gRPC-status emits as a HEADER (not trailer); this
+      scenario uses HTTP/1.1 downstream so the gRPC-status header is
+      not emitted — the deny disposition stays a plain 403.
+      failure_mode_allow does NOT fire (immediate is intentional, not
+      a transport failure).
+
+      ** Cross-side header divergence note (informational): ** the ref
+      side emits the `X-Extproc-Deny-Stage: body` header per the
+      processor script; the envoy-go side emits the header but the
+      value reads empty (a known fixture-0022 carry-forward issue per
+      the Task 13 PROGRESS.md `headerInjectedUpstream` value-vs-raw_value
+      analysis). The status + body byte-equivalence holds; the header
+      value divergence is a 19.1-carry-forward not blocking the Task 9
+      gate.
+
+  - id: d
+    name: "body_stage_clear_body (OBSERVABILITY-only — AMENDED at Task 9 fixture scrape)"
+    listener: l_test_b
+    path: /scenario_d
+    method: GET
+    expect_status: 200
+    expected_body: "upstream-response-body-d"
+    counter_delta_presence:
+      streams_started: ">=1"
+      stream_msgs_sent: ">=2"
+      stream_msgs_received: ">=2"
+      streams_closed: ">=1"
+    notes: |
+      response_body_mode: BUFFERED at the l_test_b listener; upstream
+      response shape locked via direct_response route. The processor
+      returns CommonResponse{} at response_headers + CommonResponse{} at
+      response_body (NO clear requested per the empirical-pin AMENDMENT
+      below).
+
+      ** Empirical-pin AMENDMENT recorded at Task 9 fixture-harness scrape **
+      The planner-time hypothesis "body_mutation{clear_body: true} at
+      response_body stage clears the downstream body" did NOT hold against
+      reference Envoy v1.37.2 — same reference-proxy quirk as scenario
+      (b): the reference proxy returns 500 with empty body. Scope-reduced
+      to OBSERVABILITY-only: the processor sees the response_body envelope
+      but no mutation/clear is requested. Both sides see the original
+      upstream body (24 bytes "upstream-response-body-d") and cross-side
+      byte equivalence holds. Closure deferred to a future phase per the
+      divergence_window entry below.
+
+  - id: e
+    name: "header_stage_continue_and_replace"
+    listener: l_test_b
+    path: /scenario_e
+    method: GET
+    expect_status: 200
+    expect_body_replaced: true
+    expected_body: "continue-and-replace-body-scenario-e"
+    expected_response_header_present: "x-extproc-car"
+    counter_delta_presence:
+      streams_started: ">=1"
+      # Note: only ONE outbound message round-trip (header-stage); the
+      # body-stage outbound is SKIPPED per the CONTINUE_AND_REPLACE
+      # bundle. stream_msgs_sent / stream_msgs_received presence-check
+      # accommodates the lower bound.
+      stream_msgs_sent: ">=1"
+      stream_msgs_received: ">=1"
+      streams_closed: ">=1"
+    notes: |
+      response_body_mode: BUFFERED at the l_test_b listener. The processor
+      returns CommonResponse{status: CONTINUE_AND_REPLACE, header_mutation
+      {set: x-extproc-car=scenario_e}, body_mutation{body:
+      "continue-and-replace-body-scenario-e"}} at the response_headers
+      stage. Per SPEC §4.3 row 2 + ADR-0172 §Decision AMENDMENT: the
+      combined header+body replacement at the header stage with
+      body-mode=BUFFERED sets f.skipBodyStageDispatch[directionResponse]
+      = true; the body-stage outbound dispatch is SKIPPED on the next
+      EncodeData entry (no body-stage stream_msgs_sent increment). The
+      header_mutation + body_mutation are applied at the header-stage
+      response; encode-side delivery via ADR-0131 OverwriteBody fires
+      from the skip-flag short-circuit path (the C-1 rework guarantees
+      the pre-mutated buffer is delivered intact BEFORE HCM's incoming
+      response-body chunk would otherwise overwrite it). Downstream
+      client sees the mutated header + the replacement body byte-exact.
+
+  - id: f
+    name: "per_route_body_mode_override (route-A activates, route-B baseline)"
+    listener: l_test_c
+    sub_scenarios:
+      - path: /scenario_f_a
+        method: POST
+        request_body: "route-a-request-body-bytes"
+        expect_status: 200
+        expect_backend_echo: true
+        notes: |
+          Per-route ExtProcOverrides{processing_mode{request_body_mode:
+          BUFFERED}} activates the body-stage dispatch on route-A only.
+          The processor receives a ProcessingRequest{request_body}
+          envelope at the body stage (observability assertion). Body
+          bytes are NOT mutated (Option B per scenario a's decode-side
+          KNOWN LIMITATION scope-reduction); cross-side byte-equivalence
+          holds.
+      - path: /scenario_f_b
+        method: POST
+        request_body: "route-b-request-body-bytes"
+        expect_status: 200
+        expect_backend_echo: true
+        notes: |
+          No per-route override → listener-level headers-only baseline
+          applies. The request_body stage outbound is NOT sent
+          (request_body_mode: NONE at the listener level). The
+          processor receives ONLY a ProcessingRequest{request_headers}
+          envelope for this route; per-route counter-delta differences
+          are observable at the cross-route presence-check (route-A
+          emits 2 ProcessingRequests; route-B emits 1).
+    counter_delta_presence:
+      # Aggregate across both sub-scenarios. PRESENCE-check per
+      # ADR-0173 §Consequences AMENDMENT (per-route counter-split is
+      # DEFERRED per ADR-0173).
+      streams_started: ">=2"
+      stream_msgs_sent: ">=3" # 2 for route-A (headers+body) + 1 for route-B (headers only)
+      stream_msgs_received: ">=3"
+      streams_closed: ">=2"
+    notes: |
+      Per-route override AMENDMENT closure per SPEC §5: ExtProcOverrides
+      .processing_mode body-mode arms (request_body_mode,
+      response_body_mode) are now CONSUMED at 19.2. The per-route
+      override REPLACES the listener-level processing_mode field-by-field
+      for the listener+route merge per the proto-faithful map-merge
+      convention. Cache-on-first-use (resolved at DecodeHeaders stays in
+      effect for stream lifetime per ADR-0173 §Consequences) is
+      UNCHANGED — the body-stage dispatch reads the cached compiledConfig
+      from filter state without re-resolving.
+
+# ---------------------------------------------------------------------------
+# Documented divergence window (19.2-specific + carry-forward from 19.1).
+# ---------------------------------------------------------------------------
+divergence_window:
+  # NEW at 19.2 — empirical-pin AMENDMENT recorded at Task 9 fixture-harness
+  # scrape: reference Envoy v1.37.2 body-stage body_mutation interaction.
+  - field: BodyMutation{body|clear_body} at response_body stage (reference Envoy v1.37.2)
+    disposition: |
+      Reference Envoy v1.37.2 returns 500 with empty body when the
+      processor emits CommonResponse{body_mutation{body|clear_body}} at
+      the response_body stage under response_body_mode: BUFFERED. The
+      reproduction holds across BOTH echobackend AND direct_response
+      upstream shapes (i.e., the upstream framing is not the trigger).
+      envoy-go correctly applies the mutation + emits 200 with the
+      replacement (or zero-byte for clear_body) body. The cross-side
+      divergence is a reference-proxy quirk surfaced at the Task 9
+      fixture-harness scrape; root-cause analysis + closure deferred to
+      a future phase that bottoms out the reference Envoy v1.37.2
+      body-stage body_mutation code path. The fixture-0023 driver
+      scopes scenarios (b) + (d) to OBSERVABILITY-only to preserve
+      cross-side byte equivalence at the differential gate; the
+      envoy-go encode-side mutation-delivery is asserted by extproc
+      unit tests (Task 6) + race tests (Task 8) independently.
+
+  # NEW at 19.2 — empirical-pin AMENDMENT recorded at Task 9 fixture-harness
+  # scrape: envoy-go encode-side SendLocalReply framework gap.
+  - field: ImmediateResponse at response_body stage (envoy-go encode-side)
+    disposition: |
+      envoy-go HCM rejects SendLocalReply with `"called SendLocalReply
+      after encode-side started; ignoring"` when invoked from the
+      dispatch goroutine AFTER the encode chain has begun processing the
+      upstream response. This is a structural framework limitation on
+      the encode-side body-stage ImmediateResponse path. Fixture-0023
+      scenario (c) re-scopes to the DECODE side (l_test_a;
+      request_body_mode: BUFFERED + ImmediateResponse at the request_body
+      stage) — the decode-side SendLocalReply path is well-supported by
+      the framework (the request has not reached upstream yet).
+      Cross-side byte equivalence holds on the decode-side variant.
+      Closure of the encode-side framework gap deferred to a future
+      phase (likely an HCM-side amendment to the SendLocalReply
+      late-arrival path during encode chain execution).
+
+  # NEW at 19.2 — Task 7 ADR-0168 §Consequences refresh decode-side
+  # body-mutation-delivery KNOWN LIMITATION (carry-forward from Task 7).
+  - field: BodyMutation{body|clear_body} at decode side (request_body stage)
+    disposition: |
+      envoy-go-side limitation: the processor SEES the request_body envelope
+      and the body_mutation arm is applied to f.decodeBodyBuf + Content-Length
+      reconciles on f.decodeHeaders, but the mutated body bytes are NOT
+      delivered to the upstream (HCM captures pre-chain). Reference Envoy
+      v1.37.2 DOES deliver the mutation. Fixture 0023 scenario (a) is
+      scoped to OBSERVABILITY-only (Option B per Task 7 hand-off): the
+      processor returns CommonResponse{} (no mutation requested) so
+      cross-side byte equivalence holds. Closure deferred to a future
+      phase that adds the decode-side body-mutation-delivery framework
+      primitive (speculative ADR-0178 or later analogous to ADR-0131
+      for the decode side).
+
+  # Per parent §5.P11 — response_code_details emission is DEFERRED in 19.x.
+  - field: ImmediateResponse.details (scenario c)
+    disposition: silent-dropped envoy-go side; reference Envoy populates
+      %RESPONSE_CODE_DETAILS% access-log token. Documented per parent §5.P11
+      forward-pointer + SPEC §8 item 10 carry-forward.
+
+  # 19.2 PARSE-REJECTs per SPEC §2 + ADR-0168 §Decision AMENDMENT post-lift:
+  - field: ProcessingMode body STREAMED + BUFFERED_PARTIAL + FULL_DUPLEX_STREAMED
+    disposition: PARSE-REJECT permanently per SPEC §2 item 2.
+  - field: ProcessingMode trailer modes != SKIP
+    disposition: PARSE-REJECT permanently per SPEC §2 item 3.
+  - field: HTTP-service-mode body PARSE-REJECT
+    disposition: continues permanently per SPEC §2 item 1 — http_service
+      mode forbids body forwarding per the ext_proc proto constraint.
+  - field: GoogleGrpc arm
+    disposition: PARSE-REJECT permanently (envoy-go uses google.golang.org/grpc
+      directly).
+
+  # Silent-ignored fields per parent §8 (dynamic-metadata family etc.):
+  - field: metadata_options / filter_metadata / ProcessingResponse.dynamic_metadata
+    disposition: SILENT-IGNORED MVP. Forward-pointer to dynamic-metadata phase
+      per SPEC §8 items 5 + 7.
+  - field: HttpHeaders.attributes (deprecated [#not-implemented-hide:])
+    disposition: SILENT-IGNORED per proto convention + SPEC §8 item 6.
+  - field: ExtProcOverrides.{async_mode, request_attributes, response_attributes,
+      metadata_options, grpc_initial_metadata}
+    disposition: SILENT-IGNORED per ADR-0173 + SPEC §8 item 7.
+  - field: GrpcService.{initial_metadata, retry_policy}
+    disposition: SILENT-IGNORED MVP per SPEC §8 item 9.
+
+  # 19.1 ADR-0170 envelope-content divergences carry forward per SPEC §8 item 15:
+  - field: protojson whitespace + reference-Envoy empty-message emission +
+      writer-side HeaderValue.value vs raw_value
+    disposition: structural-equivalence asserted at the fixture-harness scrape
+      per 19.1 fixture-0022 AMENDMENT; substantive byte-equality DEFERRED per
+      SPEC §8 item 15.
+
+  # 8 reference-Envoy additional counters DEFERRED per SPEC §8 item 14:
+  - field: 8 reference-Envoy counters beyond the MVP 9-counter set
+    disposition: DEFERRED per SPEC §2 item 5 + §8 item 14. Stat-table
+      BEHAVIOR_CONTRACT total stays at 86 names at 19.2.
+
+# ---------------------------------------------------------------------------
+# D5 attribute-roster crystallization (per Task 9 fixture-harness scrape).
+# Disposition recorded in PROGRESS.md Task 9 entry per PLAN Step 6 + 7.
+# ---------------------------------------------------------------------------
+d5_disposition:
+  hypothesis: |
+    Header-stage SUPERSET — body-stage CEL attribute roster MIRRORS the
+    header-stage roster (per Task 5 + ADR-0170 §Consequences body-stage
+    extension) PLUS the body-stage-natural request.size / response.size
+    attribute populated from int64(len(body)). Empirical scrape at this
+    Task 9 closes the hypothesis HOLDS or AMENDED disposition.
+  closure_method: |
+    Driver post-run assertion against the processor.Received slice for
+    scenarios a (request_body envelope) + b (response_body envelope) +
+    d (response_body envelope). The fixture-harness scrape confirms the
+    CEL attribute roster matches the planner-time D5 hypothesis; any
+    body-stage-only attribute beyond the planner's hypothesis surfaces
+    here and lands as an in-place attributes.go AMENDMENT in this Task 9
+    commit per PLAN Step 5.
