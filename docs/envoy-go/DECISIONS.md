@@ -7694,6 +7694,10 @@ The cross-phase-reusability is genuine — the strategic positioning at `interna
 - **The silent-skip-unsupported-kty discipline diverges from a strict-reject alternative.** Operators wiring JWK Sets with mixed RSA + EC + oct (HMAC) keys see the supported subset retained; pure-oct sets yield `ErrJwksNoValidKeys` at parse. This matches Envoy's `Jwks::CreateFrom` semantic. A future hardening pass could surface a "warning" log line at silent-skip; phase-17 MVP omits the log for the framework-primitive-purity reason (no logger dependency in `internal/jwks/`).
 - **Cross-references:** ADR-0148 (jwt_authn package shape — Task 2; RemoteJwks branch wires `*jwks.Fetcher` into `compiledProvider.jwksFetcher`); ADR-0149 (compiledConfig shape — `jwksFetcher any` placeholder typed at Task 3 as `*jwks.Fetcher`); ADR-0151 (jwt verifier — Task 4 consumes `*jwks.JWKSet` directly per the §Decision (vii) cross-package handshake); ADR-0044 (ADR-on-impl convention); ADR-0072 (boot-time fail-fast — `New` failure on blocking initial fetch propagates to listener-load failure); ADR-0085 (nil-tolerance — `Get` on a closed fetcher yields ErrJwksClosed, not a panic); ADR-0142 (`internal/matcher/` cross-phase-reusable framework primitive precedent); ADR-0144 (DownstreamPrincipal accessor cross-phase-reuse precedent); ADR-0125 §(xiii) (8th canonical per-route — does not directly interact with the JWKS fetcher).
 
+### §Decision AMENDMENT — anticipated at phase-20 IMPL Task 2 per ADR-0044 (paragraph anchors at phase-20 SPEC commit 2026-05-17; AMENDMENT body lands at phase-20 IMPL Task 2)
+
+**Phase 20 (`http-filter-oauth2`) refactors `internal/jwks/Fetcher` in-place to consume the NEW `*httpclient.Client` framework primitive (ADR-0177) instead of owning its own `*http.Client`.** Per ADR-0044 in-place edit discipline + the phase-20 SPEC §3.4 framework-survey result. The refactor delta is ~40-60 LoC in `internal/jwks/` — the `New` constructor signature gains a `*httpclient.Client` parameter (replacing the internal `http.Client` instantiation); the `doFetch` inner-HTTP-request loop (§Decision (vi)) delegates to `Client.Do` rather than `client.Get`. The retry-policy + timeout discipline preserved verbatim — ADR-0177's `Options{Timeout, RetryPolicy}` carry the phase-17-pinned semantics. Cross-phase-consumer disposition at this AMENDMENT: phase 17 jwks (this refactor) + phase 18.1 ext_authz (paired ADR-0159 AMENDMENT) + phase 20 oauth2 token_endpoint POST (NEW). The third-consumer-trigger paragraph **CLOSES the implicit forward-pointer** at §Context above ("Future ext_authz HTTP-mode + future oauth2 token-endpoint flow") — the trigger event fires exactly as the SPEC author anticipated at phase 17. **AMENDMENT body + §Consequences refresh land at phase-20 IMPL Task 2** alongside the ADR-0177 introduction; the SPEC-commit phase 20 SPEC.md §3.4 + the phase-20 SPEC §10 ADR anchor map record the anticipation.
+
 ---
 
 ## ADR-0151: JWT verifier framework primitive at NEW top-level package `internal/jwt/` — `Parse(raw)` parses 3-part JWT structure; `Token.VerifySignature(key, alg)` with RS+ES algorithm allow-list per §11.P1 (PARSE-REJECT unsupported algs); `Token.ValidateClaims(opts)` checks exp + nbf + iss + aud with clock-skew tolerance per §11.P16 + §1.1 amendment 7; `Token.PayloadClaim(path)` dot-notation extractor with array-claim rejection per §11.P10 + §1.1 amendment 10; ~20 canonical error sentinels mirroring jwt_verify_lib status codes; pure-Go stdlib (`crypto/rsa.VerifyPKCS1v15` + `crypto/ecdsa.Verify` + `encoding/base64.RawURLEncoding`); cross-phase-reusable for future filters consuming JWT semantics (jwt_claim_router, oauth2 token validation)
@@ -8499,6 +8503,16 @@ The BRAINSTORM §3.2 posed an (a)-vs-(b) disposition for the SPEC author: (a) ge
 **BEHAVIOR_CONTRACT shape — the lighter-touch cross-reference.** Per the §Context disposition, the 18.1 IMPL chooses the lighter-touch BEHAVIOR_CONTRACT shape: a thin cross-reference under the phase-17 `## JWKS framework primitive` umbrella ("see also: ext_authz HTTP-mode thin outbound client"), NOT a standalone `## HTTP outbound auth-check` section. That patch lands at Task 14 (§13.7 of the 6-edit BEHAVIOR_CONTRACT bundle).
 
 **Deferred `internal/httpclient/` generalization + the oauth2 trigger.** Disposition (b) leaves the `internal/httpclient/` generalization deferred. The natural trigger to reconsider is the THIRD outbound-HTTP consumer — a future `oauth2` phase needs a synchronous-per-request outbound token-endpoint POST that is structurally like ext_authz's HTTP-mode call (unlike the JWKS fetcher's cached/async shape). When oauth2 brainstorms, the `internal/httpclient/` generalization should be reconsidered with three consumers in view; until then, the thin per-consumer client is the correct shape.
+
+### §Decision AMENDMENT + §Future Work CLOSURE — anticipated at phase-20 IMPL Task 2 per ADR-0044 (paragraph anchors at phase-20 SPEC commit 2026-05-17; AMENDMENT body + §Future Work closure-paragraph land at phase-20 IMPL Task 2)
+
+**Phase 20 (`http-filter-oauth2`) FIRES THE THIRD-CONSUMER TRIGGER + closes the §Context + §Consequences forward-pointer load-bearing.** Per ADR-0044 in-place edit discipline + the phase-20 SPEC §3.5 framework-survey result + the phase-20 Q2 settled answer (EXTRACT NOW). At phase-20 IMPL Task 2, ADR-0159 evolves in-place with two AMENDMENT paragraphs:
+
+- **§Decision AMENDMENT** — the `httpAuthClient` is refactored in-place to consume the NEW `*httpclient.Client` framework primitive (ADR-0177) instead of owning its own `*http.Client`. Refactor delta ~50-80 LoC in `internal/filter/http/extauthz/check.go` — the `httpAuthClient` constructor signature gains a `*httpclient.Client` parameter (replacing the internal `&http.Client{Timeout: ...}` instantiation); the `checkFn` closure's `hac.client.Do(outReq)` invocation delegates to the new primitive's `Do` method. The per-request cancellable semantics + the zero-retry-default discipline + the `OnDestroy`-drives-cancel path PRESERVED VERBATIM (ADR-0177's `Options{Timeout}` carries the `HttpService.server_uri.timeout`; the per-request `ctx` thread is unchanged). This is the SECOND in-place §Decision AMENDMENT consuming ADR-0177 (the first is ADR-0150 jwks Fetcher — paired refactor landing at the same IMPL Task 2).
+
+- **§Future Work CLOSURE paragraph** — appended to the existing §Consequences "Deferred `internal/httpclient/` generalization + the oauth2 trigger" paragraph immediately above. Records that the **third-consumer trigger condition fires exactly as anticipated at phase 18.1**: phase 20 oauth2's token_endpoint POST is structurally a synchronous-per-request outbound POST (matches ext_authz's HTTP-mode shape; differs from JWKS's cached/async shape per the §Context (a)-vs-(b) framing). The 3-consumer view (jwks + ext_authz + oauth2) is achieved; the generalization fires per ADR-0177 introduction. **PHASE 20 IS THE FIRST §9 FAMILY-ROW TO CLOSE A PRIOR-PHASE LOAD-BEARING FORWARD-POINTER** — a structurally important demonstration that the ADR-0044 §Future-Work forward-pointer-and-close discipline functions across phase boundaries (per phase-20 SPEC §9 item 1 + BRAINSTORM §11 Lesson (d)).
+
+Cross-references at the AMENDMENT: ADR-0177 (NEW `internal/httpclient/` primitive — the closure source); ADR-0150 (paired in-place §Decision AMENDMENT — jwks Fetcher refactor); ADR-0044 (in-place edit discipline). The SPEC-commit phase 20 SPEC.md §3.5 + the phase-20 SPEC §10 ADR anchor map record the anticipation.
 
 ---
 
@@ -10023,6 +10037,372 @@ Cross-references:
 - **ADR-0084** (phase-08's documentation-of-application ADR — one of the precedents ADR-0176 mirrors).
 - **ADR-0164** (phase-18's documentation-of-application ADR — the closest precedent ADR-0176 mirrors).
 - **ADR-0167..ADR-0175** (the 9 BRAINSTORM-anticipated + SPEC-time-confirmed phase-19 ADRs the split distributes across 19.1 + 19.2).
+
+---
+
+## ADR-0177: NEW `internal/httpclient/` framework primitive — Options struct (Timeout + RetryPolicy + TLSConfig) + `Client.Do` synchronous wrapper over `*http.Client`; **CLOSES ADR-0159 §Future Work forward-pointer load-bearing** (third-consumer trigger fired per phase-20 Q2 EXTRACT NOW); 3 consumers at introduction time (jwks Fetcher post-ADR-0150 AMENDMENT + extauthz httpAuthClient post-ADR-0159 AMENDMENT + oauth2 token_endpoint POST NEW); cross-phase-reusable for any future outbound-HTTP consumer
+
+**Status:** §Context drafted at phase-20 SPEC commit (this commit); §Decision + §Consequences anchor at phase-20 IMPL Task 2 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention. Closes the ADR-0159 §Future Work forward-pointer load-bearing — FIRST §9 family-row to close a prior-phase load-bearing forward-pointer. Cross-phase-reusable framework primitive per the phase-16 ADR-0142 + ADR-0144 + phase-17 ADR-0150 cross-phase-reuse-at-introduction-time discipline.
+**Lands-in:** Task 2 of phase-20 PLAN (NEW `internal/httpclient/` package + paired in-place ADR-0150 + ADR-0159 §Decision AMENDMENTs).
+
+### Context
+
+Phase 20 fires the **third-consumer trigger condition** for the shared `internal/httpclient/` package extraction. The trigger was planted at phase 18.1 ADR-0159 §Context + §Consequences + §Future Work: "the natural trigger to generalize into `internal/httpclient/` is the THIRD outbound-HTTP consumer — a future `oauth2` phase needs an outbound token-endpoint POST that IS synchronous-per-request like ext_authz's; when oauth2 brainstorms, the `internal/httpclient/` generalization should be reconsidered with three consumers in view." Phase 20 oauth2's token_endpoint POST is exactly that structural shape (synchronous-per-request POST; matches ext_authz HTTP-mode; differs from jwks's cached/async shape).
+
+**Phase-20 SPEC-time scoping (per BRAINSTORM Q2 EXTRACT NOW + phase-20 SPEC §3.1):** the SPEC author resolves Q2 as **EXTRACT NOW** (vs DEFER-to-fourth-consumer). The 3-consumer view (jwks Fetcher + extauthz httpAuthClient + oauth2 token_endpoint POST) is sufficient design-pressure to motivate the shared abstraction without over-fitting to any single consumer's lifecycle.
+
+**Public surface** (settled at phase-20 SPEC §3.1; the IMPL confirms the exact signature at Task 2):
+
+```go
+type Options struct {
+    Timeout     time.Duration
+    RetryPolicy RetryPolicy
+    TLSConfig   *tls.Config
+}
+
+type RetryPolicy struct {
+    Attempts        int           // 0 = no retries (matches upstream Envoy v1.37.2 wire default per phase-20 §20.P1)
+    PerAttemptDelay time.Duration
+    RetryOnStatus   []int
+}
+
+type Client struct { /* *http.Client + Options */ }
+
+func New(opts Options) *Client
+func (c *Client) Do(req *http.Request) (*http.Response, error)
+```
+
+**3 consumers at introduction time** (each gets a paired refactor at this IMPL Task 2):
+
+1. **jwks Fetcher refactor** (paired ADR-0150 §Decision AMENDMENT) — REPLACES the inline `http.Client` ownership at `internal/jwks/fetcher.go` with a `*httpclient.Client` constructor argument. ~40-60 LoC delta. Preserves the phase-17 retry-policy + timeout discipline verbatim.
+2. **extauthz httpAuthClient refactor** (paired ADR-0159 §Decision AMENDMENT + §Future Work CLOSURE) — REPLACES the inline `http.Client` ownership at `internal/filter/http/extauthz/check.go` with a `*httpclient.Client` constructor argument. ~50-80 LoC delta. Preserves the phase-18.1 per-request cancellable + zero-retry semantics. **§Future Work CLOSED-AT-PHASE-20 paragraph appended.**
+3. **oauth2 token_endpoint POST** (NEW at phase 20) — consumes the new primitive at `internal/filter/http/oauth2/oauth_client.go::postTokenEndpoint`. Synchronous-per-request POST with the 4-field auth-code template byte-exact per AMEND-5 (phase-20 ADR-0185) + 3-field refresh-token template.
+
+**Zero-retry default per §20.P1 RATIFIED.** Upstream Envoy v1.37.2 applies zero-retry default at the oauth2 token_endpoint POST (no automatic retry; explicit operator config required). The Options struct's `RetryPolicy{Attempts: 0}` zero-value mirrors this. The phase-17 jwks Fetcher's per-refresh-cycle retry is preserved via its caller passing `Options{RetryPolicy: RetryPolicy{...}}` non-zero; phase-18.1 ext_authz preserves zero-retry semantics via the zero-value default.
+
+**Cross-phase reuse intent** (§Future Work plant at this ADR's §Future Work):
+- Future ext_authz mTLS — consumes Options.TLSConfig
+- Future jwt_authn alternative-issuer fetch — second-level cross-consumer of the jwks Fetcher refactor
+- Future ratelimit gRPC TLS — TBD; mTLS-config wiring
+- Other outbound-HTTP-from-filter primitives — each evaluated against the 3-consumer-baseline at their introduction time
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 2
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 2 per ADR-0044. The §Decision body settles the exact Options-struct field roster + the `Client.Do` retry-loop discipline + the cross-phase-consumer integration paths. The §Consequences body documents the cross-package regression-window discipline (jwks + extauthz refactors must produce zero observable wire delta per phase-20 SPEC §12 item C8 + §14.5 D-gate).
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0150 §Decision AMENDMENT-anticipation paragraph (paired jwks refactor); ADR-0159 §Decision AMENDMENT + §Future Work CLOSURE-anticipation paragraph (paired extauthz refactor + first-§9-row-to-close-prior-phase-load-bearing-forward-pointer); ADR-0177 NEW; phase-20 SPEC §3.1 (framework-survey result); phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0178: NEW `internal/sdsfile/` framework primitive — filesystem-path SDS Secret reader + fsnotify hot-reload + atomic-swap discipline; consumes `generic_secret.inline_string` ONLY; PARSE-REJECT for non-filesystem `core.ConfigSource` oneof arms + the deprecated `core.ConfigSource.path` field 1 + the inner `generic_secret.secret_file` indirect-arm; NEW go.mod dependency on `github.com/fsnotify/fsnotify`
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 3 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention. Cross-phase-reusable framework primitive per the phase-17 ADR-0150 + phase-18.2 ADR-0158 + phase-19.1 ADR-0169 cross-phase-reuse-at-introduction-time discipline.
+**Lands-in:** Task 3 of phase-20 PLAN.
+
+### Context
+
+Phase 20 oauth2's `hmac_secret` + `client_secret` + AES-256-CBC-key-derivation-source come from SDS secrets (per the `OAuth2Credentials` proto's `*v3.SdsSecretConfig` fields). Per phase-20 BRAINSTORM Q3 + Q7 + Q8 (settled together at the BRAINSTORM commit) + the phase-20 SPEC §3.2 framework-survey result, the SDS consumption is constrained to **filesystem-path SDS only** (the other `core.ConfigSource` oneof arms — `ApiConfigSource` + `Ads` — PARSE-REJECT envoy-go-strict for MVP; couples to a future xDS-control-plane-landing phase) + **fsnotify hot-reload** (per Q8) + **atomic-swap discipline** (per Q7 NEW shared package).
+
+**Phase-20 SPEC-time scoping (per BRAINSTORM Q7 + Q8 bundled + phase-20 SPEC §3.2):** the SPEC author bundles the filesystem-path reader + the fsnotify watcher + the atomic-swap into a single shared package `internal/sdsfile/` (vs filter-local OR fold-into-existing-internal). The cross-phase reuse forward-pointer is plausible (future jwt_authn TLS-trust-store reload, future ext_authz mTLS, future ratelimit gRPC TLS); the shared package shape is structurally cleaner.
+
+**§20.P6 RATIFIED disposition** (phase-20 SPEC §11 §20.P6): `core.ConfigSource.PathConfigSource` (oneof arm field 8) wraps `{path, watched_directory}` — this is the NEW non-deprecated arm. The deprecated `core.ConfigSource.path` field 1 is the LEGACY shape (in the same message but pre-watched_directory). NEW `internal/sdsfile/` consumes the field-8 wrapper ONLY; the deprecated field-1 PARSE-REJECTs at compile time (envoy-go-strict per ADR-0080 discipline). The inner `generic_secret.secret_file` indirect-arm (filesystem alternative to `inline_string`) also PARSE-REJECTs at MVP (double-indirection — the framework watches the OUTER Secret-proto JSON/YAML file via fsnotify; the inner `secret_file` indirect-loading-from-another-file path is not modeled at MVP per phase-20 SPEC §8 item 14).
+
+**Public surface** (settled at phase-20 SPEC §3.2; the IMPL confirms the exact signature at Task 3):
+
+```go
+type Watcher struct { /* atomic.Pointer[[]byte] + *fsnotify.Watcher + debounce timer */ }
+
+func New(path string) (*Watcher, error)
+func (w *Watcher) Start() error
+func (w *Watcher) Current() []byte
+func (w *Watcher) Close() error
+```
+
+**~100ms debounce** captures both atomic-rename-via-mv + in-place-write-via-truncate-and-rewrite event sequences without false-positive reloads (per phase-20 SPEC §12 item B7 RATIFIED-PENDING-IMPL-TIME; closed at IMPL Task 3 + Task 8 race-tests). **Atomic-swap discipline** via `atomic.Pointer[[]byte]` ensures concurrent readers observe consistent bytes across the reload boundary (the swap is atomic; readers either see the pre-reload bytes or the post-reload bytes, never a torn read).
+
+**MVP consumer: oauth2** (the only in-tree consumer at phase 20). Cross-phase-reusable for any future filesystem-SDS consumer (anticipated future jwt_authn TLS-trust-store reload, future ext_authz mTLS, future ratelimit gRPC TLS — each at its own future trigger condition).
+
+**NEW go.mod dependency on `github.com/fsnotify/fsnotify`** (the de facto Go file-event watching library; cross-platform; pure Go). First filesystem-watching dependency in the envoy-go go.mod. Documented at phase-20 SPEC §3.2 + §3.8 framework-footprint table.
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 3
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 3 per ADR-0044. The §Decision body settles the exact debounce-window + the atomic.Pointer swap discipline + the PARSE-REJECT roster (non-filesystem ConfigSource arms + deprecated path field 1 + inner secret_file indirect-arm). The §Consequences body documents the cross-phase reuse forward-pointer envelope + the operator-facing semantics (file-change-triggers-reload; ~100ms debounce; atomic-swap-consistent-reads).
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0080 (envoy-go-strict discipline — PARSE-REJECT roster); phase-20 SPEC §3.2 (framework-survey result); phase-20 SPEC §8 items 13 + 14 (SDS / proto-shape deferrals); phase-20 SPEC §11 §20.P6 (PathConfigSource RATIFIED disposition); phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0179: oauth2 HMAC cookie composition — 5-input newline-joined `HMAC-SHA256(hmac_secret, StrJoin({domain, expires, token, id_token, refresh_token}, "\n"))` per phase-20 AMEND-2 + §20.P4 REFUTED (BRAINSTORM Q9 incomplete — 3-input hypothesis REFUTED at empirical scrape); id_token + refresh_token participate as empty strings when absent; dual-encoding read per S4 (emit Base64; accept BOTH Base64 + HexBase64); constant-time-compare via `crypto/hmac.Equal`
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 4 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention. REFUTES the BRAINSTORM Q9 3-input HMAC composition hypothesis per the SPEC §11 §20.P4 in-session empirical scrape against reference Envoy v1.37.2.
+**Lands-in:** Task 4 of phase-20 PLAN.
+
+### Context
+
+The phase-20 BRAINSTORM Q9 hypothesized a 3-input HMAC composition (`HMAC-SHA256(hmac_secret, host + BearerToken + OauthExpires)`). The SPEC §11 §20.P4 empirical scrape against reference Envoy v1.37.2 source REFUTED — the upstream composition is 5-input newline-joined: `HMAC-SHA256(hmac_secret, StrJoin({domain, expires, token, id_token, refresh_token}, "\n"))`. The id_token + refresh_token inputs participate as **empty strings when absent** (not skipped). Per phase-20 SPEC §1.1 AMEND-2 (the §1.1 amendment-block channel entry).
+
+**S4 dual-encoding (settled inline at SPEC; not user-asked):** Upstream emits Base64 BUT accepts BOTH Base64 + HexBase64 on read (the latter for cross-deployment migration wire-compat). MVP mirrors — emit Base64; accept dual-encoding at validation time (~30 LoC extra at `hmac.go::hmacValidate`). The dual-encoding read discipline is documented at phase-20 SPEC §6.4 + the §1.1 AMEND-2 entry.
+
+**Constant-time-compare via `crypto/hmac.Equal`** per timing-attack hardening discipline. The HMAC envelope value is parsed (dual-encoding decode); the result is `crypto/hmac.Equal`-compared against the computed HMAC. The dual-encoding read does NOT compromise constant-time semantics (each candidate encoding is decoded + compared independently; the first match wins; the second comparison runs in constant time relative to its own envelope, not relative to the first).
+
+**Domain input semantics:** the `domain` input is the request `host` header (parsed verbatim; lowercased per RFC 7230). The host-binding rationale: prevents cross-host cookie reuse (an envelope HMAC-bound to one host cannot validate at another).
+
+**Empty-string-when-absent semantics:** when the request envelope lacks IdToken (MVP — id_token deferred per phase-20 SPEC §2.2) OR RefreshToken (MVP — when `use_refresh_token=false` OR after refresh-token rotation completes), the corresponding input is the empty string. The `StrJoin` produces `domain + "\n" + expires + "\n" + token + "\n" + "\n" + ""` for the (no-IdToken, no-RefreshToken) case. The "\n\n" double-separator IS DELIBERATE — it's the upstream byte-exact composition.
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 4
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 4 per ADR-0044. The §Decision body settles the exact StrJoin separator + the dual-encoding read switching discipline + the constant-time-compare invariant. The §Consequences body documents the BRAINSTORM Q9 correction trail + the wire-compat implications + the future PKCE/id_token-enabling-phase reactivation path (5th input `id_token` becomes non-empty when id_token lands).
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); phase-20 SPEC §6.4 + §6.5 (cookie envelope reader + writer); phase-20 SPEC §1.1 AMEND-2; phase-20 SPEC §11 §20.P4 (HMAC composition REFUTED); phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0180: oauth2 state-machine + deny-path wire shape (302+401 only; NO 500 anywhere per phase-20 AMEND-3 + §20.P9 REFUTED) + listener-scoped-only enforcement via HCM-parse-time PARSE-REJECT + the explicit NO-ADR-0125-AMENDMENT REUSE-by-absence classification (THIRD CONSECUTIVE §9 row after phase 18 + phase 19 to skip ADR-0125 roster extension)
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 5 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention. REFUTES the BRAINSTORM §5 deny-path-with-500 hypothesis per the SPEC §11 §20.P9 in-session empirical scrape. Records the listener-scoped-only REUSE-by-absence per §20.P7 RATIFIED.
+**Lands-in:** Task 5 of phase-20 PLAN.
+
+### Context
+
+ADR-0180 anchors three load-bearing oauth2 design decisions: (1) the **3-flow state-machine** (sign-in / refresh / sign-out + pass_through); (2) the **deny-path wire shape** — 302 + 401 only; NO 500 anywhere per AMEND-3 + §20.P9 REFUTED; (3) the **listener-scoped-only enforcement** via HCM-parse-time PARSE-REJECT per §20.P7 RATIFIED + the explicit NO-ADR-0125-AMENDMENT REUSE-by-absence classification.
+
+**3-flow state-machine** (phase-20 SPEC §6.3 + §4 + ADR-0180): `DecodeHeaders` priority order: (1) signout_path match → handleSignout; (2) redirect_path_matcher match → handleCallback (async token_endpoint POST); (3) pass_through_matcher match → handlePassThrough (bypass); (4) else handleCookieValidate → ContinueDecoding (valid envelope) OR handleRefresh (expired BearerToken + valid RefreshToken — async refresh-token POST) OR handleUnauthenticated (category (a) 302 challenge). The async legs (callback + refresh) park the decode goroutine on the phase-09 async-resume primitive.
+
+**Deny-path 302+401 only — NO 500 anywhere** (phase-20 SPEC §4 + AMEND-3 + §20.P9 REFUTED): upstream Envoy v1.37.2 token_endpoint failure path emits 302 (redirect-retry-eligible) OR 401 (terminal-with-constant-body `"OAuth flow failed."` 18 bytes). NEVER 500. envoy-go-strict simplification: token_endpoint non-2xx retry-eligible (5xx) → emit (a) 302 challenge; non-2xx terminal (4xx) → emit (d) 401. Recorded as envoy-go-strict departure at BEHAVIOR_CONTRACT.md `### Phase 20 forward-pointer notes` (per phase-20 SPEC §13 item C7).
+
+**Listener-scoped-only enforcement via HCM-parse-time PARSE-REJECT** (phase-20 SPEC §5 + §20.P7 RATIFIED): the v1.37.x oauth2 proto has NO `OAuth2PerRoute` message at all (strongest-form evidence — the proto file has no per-route-override message arm). Any oauth2 `typed_per_filter_config` (TPFC) entry at route or virtualHost level PARSE-REJECTs at HCM-parse-time with byte-stable error message per ADR-0110 single-chokepoint discipline + the `RegisterPerRouteValidator` factory hook per phase-20 SPEC §6.1. Recorded as envoy-go-strict departure at BEHAVIOR_CONTRACT.md per phase-20 SPEC §13.
+
+**Explicit NO-ADR-0125-AMENDMENT classification** (phase-20 SPEC §5.4): after phase 18 (ADR-0163 — REUSED 5th canonical; no amendment) + phase 19 (ADR-0173 — REUSED 5th canonical; no amendment), phase 20 is the THIRD CONSECUTIVE §9 family-row to NOT extend the ADR-0125 roster. Phase 20's REUSE-by-absence is a **STRONGER form of the lesson** than the prior two phases' 5th-canonical REUSE — there is no per-route surface at all, so the listener-scoped-only enforcement is itself a parse-time PARSE-REJECT discipline rather than a roster-REUSE classification. The ADR-0125 roster does NOT grow monotonically; phase 20 strengthens the lesson WITHOUT amendment (the absence itself is the lesson).
+
+**Cross-phase NOT-CONSUMED dispositions recorded** (phase-20 SPEC §3.6): ADR-0144 `DownstreamPrincipal()` (no TLS-principal interaction); ADR-0150 jwks (id_token deferred — but REFACTORED per ADR-0150 §Decision AMENDMENT); ADR-0151 jwt verifier (id_token deferred); ADR-0165 callback-surface extension (no TLS/principal-attribute envelope).
+
+**POST callback method PARSE-REJECT per §20.P3 + AMEND-3 + phase-20 SPEC §2.14**: envoy-go-strict simplification — GET-only callback at MVP; POST callbacks (the `response_mode=form_post` OAuth-extension variant) PARSE-REJECT at the callback-flow dispatch in `DecodeHeaders`. NEW envoy-go-strict departure recorded at BEHAVIOR_CONTRACT.md per phase-20 SPEC §13 item C8.
+
+**AMEND-6 field-locus corrections recorded** (phase-20 SPEC §1.1 AMEND-6): C1 (`cookie_domain` is on OAuth2Credentials field 5, NOT OAuth2Config); C2 (`cookie_configs` is `*CookieConfigs` wrapper); C3 (`forward_bearer_token` MVP-CONSUMED).
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 5
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 5 per ADR-0044. The §Decision body settles the exact dispatch-priority order + the per-trigger 302/401 emission discipline + the HCM-parse-time PARSE-REJECT byte-stable error messages + the cross-phase NOT-CONSUMED disposition records. The §Consequences body documents the envoy-go-strict departures + the cross-phase forward-pointer extensions (response_code_details cluster; id_token-and-jwks-and-jwt-verifier NEW cluster).
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0110 (single-chokepoint per-route enforcement); ADR-0125 (canonical per-route roster — NO new amendment); ADR-0080 (envoy-go-strict discipline); ADR-0163 + ADR-0173 (prior §9 rows skipping ADR-0125 amendment — REUSE precedent); phase-20 SPEC §4 + §5 + §6.3 + §3.6; phase-20 SPEC §1.1 AMEND-3 + AMEND-6 + AMEND-7; phase-20 SPEC §11 §20.P3 + §20.P7 + §20.P9; phase-20 SPEC §9 items 4 + 5 (cross-phase cluster extensions); phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0181: oauth2 cookie envelope + stat surface — 5-of-7 `CookieNames` consumed at MVP (BearerToken / OauthHMAC / OauthExpires / IdToken-deferred / RefreshToken; oauth_nonce + code_verifier deferred-with-PKCE); Set-Cookie attribute discipline RATIFIED-PENDING-IMPL-TIME (Secure / HttpOnly / SameSite=Lax / Path=/); stat surface 86 → 92 names per phase-20 AMEND-4 + S5 (6 counters wire-exact upstream — `oauth_unauthorized_rq` / `oauth_failure` / `oauth_passthrough` / `oauth_success` / `oauth_refreshtoken_success` / `oauth_refreshtoken_failure`); HCM-rooted SN2-reuse per ADR-0143; **CLOSES §20.P11 envoy-go-strict departure flag as RATIFIED-AS-ABSENT** (no `cookie_decrypt_failure` counter); the `Partitioned` cookie attribute deferred per AMEND-7 + SPEC §8 item 15
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 6 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention. REFUTES the BRAINSTORM 8-counter stat surface hypothesis (over-counted) per the SPEC §11 §20.P8 + §20.P11 in-session empirical scrape. Closes §20.P11 envoy-go-strict departure flag as RATIFIED-AS-ABSENT.
+**Lands-in:** Task 6 of phase-20 PLAN.
+
+### Context
+
+ADR-0181 anchors two load-bearing oauth2 envelope decisions: (1) the **5-cookie envelope** discipline (5-of-7 `CookieNames` consumed at MVP); (2) the **6-counter stat surface** (86 → 92 names; wire-exact upstream per AMEND-4 + §20.P8 REFUTED).
+
+**5-of-7 `CookieNames` consumed at MVP** (phase-20 SPEC §6.4 + §6.5):
+- **BearerToken** — AES-256-CBC-encrypted access_token (per ADR-0182 + AMEND-1)
+- **OauthHMAC** — 5-input HMAC over the envelope per ADR-0179 + AMEND-2
+- **OauthExpires** — epoch-seconds-as-decimal-string per §12 item A3 RATIFIED-PENDING-IMPL-TIME
+- **IdToken** — deferred per SPEC §2.2 (id_token consumption deferred); parsed but neither emitted nor honored at MVP
+- **RefreshToken** — AES-256-CBC-encrypted refresh_token; emitted when `use_refresh_token=true`
+
+2-of-7 deferred-with-PKCE per SPEC §8 item 5: **oauth_nonce** + **code_verifier**.
+
+**Set-Cookie attribute discipline RATIFIED-PENDING-IMPL-TIME** (phase-20 SPEC §4.5 + §12 item A2): MVP-default Set-Cookie attributes are `Path=/; Secure; HttpOnly; SameSite=Lax`. The exact attribute ordering + the SameSite default (Lax vs Strict — BRAINSTORM Q1 hypothesized Strict; the empirical scrape needs to confirm v1.37.2 emits Lax — RFC 6265bis-default in modern browsers and reference Envoy mirrors this) settled at IMPL Task 13 fixture-0024 scenario (a) cross-side Set-Cookie byte-comparison. The `Partitioned` cookie attribute (CHIPS-style; per AMEND-7) deferred per SPEC §8 item 15 (depends on `cookie_configs`).
+
+**6-counter stat surface wire-exact upstream** (phase-20 SPEC §4.6 + AMEND-4 + §20.P8 REFUTED — BRAINSTORM over-counted at 8):
+- `oauth_unauthorized_rq` — per bad/missing state cookie at callback path → 401 (category d)
+- `oauth_failure` — per token_endpoint POST terminal-failure → 401 (category d)
+- `oauth_passthrough` — per `pass_through_matcher` hit (bypass)
+- `oauth_success` — per successful sign-in completion (callback-flow + token_endpoint POST returns 2xx → category b 302)
+- `oauth_refreshtoken_success` — per refresh-token rotation OK (CONTINUE with deferred Set-Cookie)
+- `oauth_refreshtoken_failure` — per refresh-token rotation failed → 302 challenge (NOT also `oauth_failure` per phase-20 SPEC §4.6 + ADR-0183)
+
+**ABSENT counters verified** (phase-20 SPEC §15 item C8 + §20.P11 + S5):
+- `signout_completed` ABSENT — sign-out completion IS the 302 emission per AMEND-4; no separate counter
+- `cookie_decrypt_failure` ABSENT — decryption-failure fall-back returns ciphertext-as-plaintext per AMEND-3 + §20.P11 RATIFIED-AS-ABSENT; downstream HMAC validation rejects naturally; no separate counter
+
+**Stat surface 86 → 92 names** (NOT 94 per BRAINSTORM §5 hypothesis). HCM-rooted SN2-reuse per ADR-0143 (no new SN-flattening rule). Internal stat path: `http.<HCM_stat_prefix>.oauth2.<counter>`. SN2 stat-name compile-time guards per phase-20 SPEC §6.12 (each of the 6 counter names asserted at compile time via the package's stat-registration constructor pattern).
+
+**CLOSES §20.P11 envoy-go-strict departure flag as RATIFIED-AS-ABSENT** (phase-20 SPEC §11 §20.P11): the BRAINSTORM §5 hypothesized a NEW envoy-go-strict `cookie_decrypt_failure` counter (departure from reference Envoy); the empirical scrape revealed upstream's decryption-failure fall-back semantics (return ciphertext-as-plaintext; no counter). envoy-go-strict departure flag CLOSED — we do NOT add the counter. Mirrors upstream wire-compat fully.
+
+**Field-locus corrections** (phase-20 SPEC §1.1 AMEND-6): `cookie_domain` is on `OAuth2Credentials` field 5 (NOT `OAuth2Config` per BRAINSTORM C1 correction); MVP defaults to empty (host-only cookies; no `Domain=` attribute per §20.P2 RATIFIED + SPEC §8 item 12).
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 6
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 6 per ADR-0044. The §Decision body settles the exact 5-cookie envelope shape + the 6-counter stat-name byte-exact roster + the HCM-rooted SN2-reuse Prometheus tag-extractor + the compile-time SN2 stat-name guard pattern. The §Consequences body documents the BRAINSTORM 8-counter over-count correction trail + the §20.P11 RATIFIED-AS-ABSENT closure + the future operator-ergonomics-phase reactivation paths (per-cookie Set-Cookie attribute customization via `cookie_configs`; CHIPS via `Partitioned`).
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0143 (SN2-reuse Prometheus tag-extractor); ADR-0080 (envoy-go-strict discipline — §20.P11 CLOSED); ADR-0182 (NEW AES-256-CBC token-encryption — paired primitive); ADR-0179 (HMAC composition — paired primitive); phase-20 SPEC §4.5 + §4.6 + §6.4 + §6.5 + §6.11 + §6.12; phase-20 SPEC §1.1 AMEND-4 + AMEND-6 + AMEND-7; phase-20 SPEC §11 §20.P2 + §20.P8 + §20.P11; phase-20 SPEC §8 items 12 + 15; phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0182: NEW filter-local AES-256-CBC token-encryption helper at `oauth2/tokens.go` per phase-20 AMEND-1 + §20.P5 REFUTED (algorithm swap from BRAINSTORM Q4-anticipated AES-GCM to upstream-byte-exact AES-256-CBC); SHA-256(hmac_secret)[:32] key derivation; random 16-byte IV per encryption (prepended); PKCS#7 padding; Base64URL(IV ‖ CT) envelope; `disable_token_encryption=true` skip-path (plaintext storage; explicit MVP-CONSUMED per S2 NO-runtime-gate decision); decryption-failure fall-back returns ciphertext-as-plaintext per AMEND-3 (no `cookie_decrypt_failure` counter per §20.P11 RATIFIED-AS-ABSENT)
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 7 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention. REFUTES the BRAINSTORM Q4 AES-GCM algorithm hypothesis per the SPEC §11 §20.P5 in-session empirical scrape against reference Envoy v1.37.2.
+**Lands-in:** Task 7 of phase-20 PLAN.
+
+### Context
+
+The phase-20 BRAINSTORM Q4 hypothesized AES-256-GCM with random 12-byte nonce + integrated AEAD MAC. The SPEC §11 §20.P5 empirical scrape against reference Envoy v1.37.2 REFUTED — the upstream algorithm is **AES-256-CBC** (NOT GCM). The algorithm swap is recorded as phase-20 SPEC §1.1 AMEND-1.
+
+**AES-256-CBC specifics** (phase-20 SPEC §3.3):
+- **Key derivation**: `SHA-256(hmac_secret)[:32]` → 32-byte AES-256 key (single-pass SHA-256 hash; mirrors upstream `Encryptor::createKey`)
+- **IV**: random 16 bytes per encryption (prepended to ciphertext; mirrors upstream `Encryptor::encrypt`)
+- **Padding**: PKCS#7 (the standard block-mode padding; stdlib `crypto/cipher` does not provide it directly — phase-20 implements ~10-15 LoC helper at `tokens.go`)
+- **Wire envelope**: `Base64URL(IV ‖ CT)` (standard URL-safe-base64; no padding chars; matches upstream wire emission)
+
+**Public surface** (filter-local — NOT extracted to shared package at phase 20; second-consumer-trigger deferral):
+
+```go
+// encryptToken encrypts plaintext under AES-256-CBC with a random 16-byte IV.
+// Returns Base64URL(IV ‖ CT) per upstream wire shape.
+func encryptToken(plaintext, hmacSecret []byte) string
+
+// decryptToken decrypts Base64URL(IV ‖ CT) back to plaintext.
+// On failure: returns the original ciphertext bytes (NOT an error) per AMEND-3 fall-back.
+// Downstream HMAC validation then rejects the cookie naturally. NO cookie_decrypt_failure counter.
+func decryptToken(envelope string, hmacSecret []byte) []byte
+```
+
+**`disable_token_encryption=true` skip-path** (phase-20 SPEC §2.15 + S2): when the operator-config flag is true, the encrypt/decrypt path is bypassed entirely; cookies store + return plaintext values verbatim. Explicit MVP-CONSUMED per phase-20 SPEC §2 (the field is part of the MVP envelope; the runtime gate is dropped per S2 since envoy-go has no runtime-features layer — the proto field default `false` is the sole switch).
+
+**Decryption-failure fall-back per AMEND-3** (phase-20 SPEC §3.3 + §6.4 + §11 §20.P11): on decryption failure (malformed envelope; bad padding; etc.), `decryptToken` returns the original ciphertext bytes (NOT an error). The downstream HMAC validation at `hmac.go::hmacValidate` then rejects the cookie naturally (the HMAC over the returned-as-plaintext ciphertext cannot match the expected HMAC). **NO `cookie_decrypt_failure` counter** per §20.P11 RATIFIED-AS-ABSENT + AMEND-4. Mirrors upstream wire behavior fully; envoy-go-strict departure flag CLOSED.
+
+**Filter-local — NOT extracted to shared package at phase 20** (phase-20 SPEC §3.3 + ADR-0159 (b)-disposition rationale precedent): no other in-tree filter needs AES-CBC at MVP. Future second-consumer trigger (anticipated: a hypothetical future cookie-encrypting filter; speculation only) would motivate extraction to `internal/aescbc/` or `internal/cookiecrypt/`; phase 20 holds at filter-local.
+
+**Library-behavioral confirmation deferred to §12 item B6** (phase-20 SPEC §12 RATIFIED-PENDING-IMPL-TIME): the PKCS#7 padding behavior under decrypt-failure surfaces at IMPL Task 7 unit-tests + Task 13 fixture-0024 decrypt-failure path coverage. Most-likely outcome: Go's `crypto/cipher.NewCBCDecrypter` surfaces padding errors as garbage; the fall-back wrap at `tokens.go::decryptToken` catches the error and returns the original ciphertext bytes (mirrors upstream wire behavior).
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 7
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 7 per ADR-0044. The §Decision body settles the exact KDF + IV-generation + PKCS#7-padding + Base64URL-encoding discipline + the decrypt-failure fall-back semantics + the `disable_token_encryption=true` skip-path branching. The §Consequences body documents the BRAINSTORM Q4 GCM-to-CBC correction trail + the §20.P11 RATIFIED-AS-ABSENT closure + the filter-local-vs-extracted disposition rationale + the future second-consumer-trigger forward-pointer.
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0080 (envoy-go-strict discipline — §20.P11 CLOSED); ADR-0159 (b)-disposition precedent (filter-local-vs-shared-package rationale); ADR-0181 (cookie envelope + stat surface — paired primitive; the encrypted/decrypted bytes flow through the 5-cookie envelope); ADR-0179 (HMAC composition — paired primitive; the AES-derived key + the HMAC-secret share the `hmac_secret` source); phase-20 SPEC §3.3 + §6.4 + §6.5; phase-20 SPEC §1.1 AMEND-1 + AMEND-3; phase-20 SPEC §11 §20.P5 + §20.P11; phase-20 SPEC §12 item B6; phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0183: oauth2 refresh-token rotation timing + race-vs-rotation discipline — `default_refresh_token_expires_in` semantics + concurrent-request-with-same-expired-BearerToken-plus-valid-RefreshToken disposition (envoy-go-strict: no per-stream serialization; each in-flight request POSTs the refresh independently; the LATEST `Set-Cookie` envelope wins via the deferred Set-Cookie discipline); counter increment matrix (refresh-failure → 302 challenge, NOT also `oauth_failure` per AMEND-3 + phase-20 SPEC §4.6)
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 8 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in:** Task 8 of phase-20 PLAN.
+
+### Context
+
+ADR-0183 anchors the refresh-token rotation behavioral discipline. When `DecodeHeaders` classifies an inbound request as "expired BearerToken + valid RefreshToken" (per phase-20 SPEC §6.3 dispatch step 4), the dispatcher invokes `handleRefresh` (per phase-20 SPEC §6.8) — a silent refresh-token POST to the configured `token_endpoint` using the 3-field refresh-token template byte-exact per AMEND-5 + ADR-0185.
+
+**On success (2xx response)**: the dispatcher CONTINUES the request to the upstream + emits a deferred Set-Cookie envelope per phase-20 SPEC §6.8 (the cookies update on the eventual response). `oauth_refreshtoken_success` counter increments. Wire shape: the request flows through to the upstream with the (decrypted) NEW BearerToken Authorization-header injection per `forward_bearer_token=true` (per AMEND-6 C3); the response gets the NEW 5-cookie envelope via Set-Cookie response-side mutation.
+
+**On failure (non-2xx response)**: the dispatcher falls through to handleUnauthenticated → emit (a) 302 challenge. `oauth_refreshtoken_failure` counter increments. **CRITICAL: `oauth_failure` does NOT also increment** per AMEND-3 + phase-20 SPEC §4.6 (refresh-failure path is distinct from token_endpoint-terminal-failure path; the counter discipline is one-counter-per-event, not stacked). The 302 challenge then proceeds via the normal sign-in flow (state-cookie + authorization_endpoint redirect).
+
+**Race-vs-rotation discipline** (envoy-go-strict simplification): when MULTIPLE concurrent requests arrive with the same expired BearerToken + valid RefreshToken, each request independently invokes `handleRefresh` (no per-stream serialization; no token-endpoint POST deduplication). Each POST returns its own 2xx response with a (possibly identical, possibly newly-rotated) refresh_token; each request emits its own Set-Cookie envelope. The LATEST `Set-Cookie` envelope wins via the downstream HTTP cookie-handling semantics (later Set-Cookie headers in the same response stream override earlier ones; across multiple response streams the browser's per-request Set-Cookie absorption decides). This is OPERATIONALLY ACCEPTABLE — the worst-case is a few extra refresh-token POSTs in the concurrent-burst scenario; the authoritative cookie state converges within the response window. **NO mutex** at the filter level for refresh-token rotation per phase-20 SPEC §14.2 race-detector verification.
+
+**`default_refresh_token_expires_in` semantics** (phase-20 SPEC §2 + §6.2): the proto field carries the operator-default refresh_token TTL (used when the token_endpoint POST response does not include an explicit `expires_in` for the refresh_token). MVP-CONSUMED per phase-20 SPEC §2.15. The OauthExpires cookie value (per phase-20 SPEC §6.4 + §6.5) records the BearerToken's expiry; the RefreshToken cookie has no separate expires-record (relies on the cookie's own Max-Age attribute set to `default_refresh_token_expires_in`).
+
+**Counter increment matrix recap** (phase-20 SPEC §4.6):
+- Refresh-success: `oauth_refreshtoken_success += 1`; NO other counters increment
+- Refresh-failure: `oauth_refreshtoken_failure += 1`; NO other counters increment (NOT also `oauth_failure`)
+- The 302 challenge fall-through after refresh-failure: NO category-(a)-level counter (the (a) 302 challenge is the deny-path emission; the only counter that increments on category-(a) emissions is the upstream `oauth_refreshtoken_failure` / `oauth_unauthorized_rq` per the trigger path)
+
+**Concurrency-test surface at phase-20 SPEC §14.2**: `TestRefreshTokenRotation_Concurrent_*` race-test group verifies zero data-race violations on the deferred-Set-Cookie path under `-race`.
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 8
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 8 per ADR-0044. The §Decision body settles the exact refresh-trigger condition + the deferred-Set-Cookie emission discipline + the race-vs-rotation semantic + the counter-increment-once-per-event invariant. The §Consequences body documents the envoy-go-strict race-vs-rotation simplification + the operator-facing semantics (concurrent-burst tolerance; LATEST-wins cookie convergence).
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0185 (refresh-token template byte-exact wire shape); ADR-0181 (cookie envelope — the deferred Set-Cookie emission flows through); ADR-0180 (state-machine — the handleRefresh dispatch step); phase-20 SPEC §6.3 + §6.8 + §4.6; phase-20 SPEC §1.1 AMEND-3; phase-20 SPEC §2.15 (MVP-CONSUMED `default_refresh_token_expires_in` + `use_refresh_token`); phase-20 SPEC §14.2 race-detector tests; phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0184: oauth2 sign-out flow — `signout_path` handling + full envelope clearing (Max-Age=0 for all 5 cookies) + `deny_redirect_matcher` integration; category (c) 302 emission per phase-20 SPEC §4.1; NO separate `signout_completed` counter per AMEND-4 + S5 (sign-out completion IS the 302 emission; 6-counter wire-exact upstream)
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 9 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention.
+**Lands-in:** Task 9 of phase-20 PLAN.
+
+### Context
+
+ADR-0184 anchors the sign-out flow behavioral discipline. When `DecodeHeaders` classifies an inbound request as matching `signout_path` (per phase-20 SPEC §6.3 dispatch step 1 — the highest-priority dispatch case), the dispatcher invokes `handleSignout` (per phase-20 SPEC §6.9).
+
+**Sign-out emission**: category (c) 302 per phase-20 SPEC §4.1 + §4.5:
+- Status: 302
+- Location: per `deny_redirect_matcher` integration (when sign-out POST matches a deny-redirect-matcher hit, the 302 destination is per the matcher; otherwise empty Location for browser-default — the operator typically configures the sign-out destination via `deny_redirect_matcher` to the post-sign-out landing page)
+- Set-Cookie: **Max-Age=0 for ALL 5 cookies** (BearerToken / OauthHMAC / OauthExpires / IdToken / RefreshToken) — full envelope clearing per phase-20 SPEC §4.5 category (c)
+- Body: empty
+
+**NO separate `signout_completed` counter** per AMEND-4 + S5 + phase-20 SPEC §15 item C8 + ADR-0181: the 6-counter wire-exact upstream roster does NOT include a sign-out-completion counter; the sign-out-completed event IS the 302 emission (operator observability via downstream access-logs records the 302 emission with the signout_path-match URL; no per-filter counter needed). Phase 20 mirrors upstream wire-compat fully.
+
+**`deny_redirect_matcher` integration** (phase-20 SPEC §2.15 MVP-CONSUMED): the proto field carries a list of header-matchers; when a request matches AND the dispatcher would otherwise emit a 401 (deny path), the dispatcher INSTEAD emits a 302 to the matched URL. Per phase-20 SPEC §4.1 + §4.4 category (c), the sign-out flow integrates with `deny_redirect_matcher` as the redirect-after-clearing destination.
+
+**Flow-cookie cleanup**: per AMEND-3 + phase-20 SPEC §4.3 + §6.6, the deny-path 401 emissions invoke `addFlowCookieDeletionHeaders(headers, flow_id_)` for in-flight-flow cleanup. The sign-out flow (category c — NOT a 401) does NOT invoke this helper — the full envelope clearing via Max-Age=0 supersedes the per-flow cleanup.
+
+**Sign-out vs Sign-out + new-sign-in**: the sign-out flow CLEARS the envelope but does NOT redirect to the authorization_endpoint. If the operator wants sign-out-followed-by-new-sign-in behavior, the operator configures the sign-out's redirect destination (via `deny_redirect_matcher` or via the eventual unauthenticated browser request after sign-out — which then triggers category (a) 302 challenge per phase-20 SPEC §4.1 + §6.6).
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 9
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 9 per ADR-0044. The §Decision body settles the exact category (c) emission discipline + the Max-Age=0 envelope-clearing roster + the `deny_redirect_matcher` integration semantics. The §Consequences body documents the no-`signout_completed`-counter rationale (wire-exact upstream; no envoy-go-strict departure) + the operator-facing sign-out vs sign-out-and-resume semantics.
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0181 (cookie envelope + stat surface — paired primitive; the 6-counter roster ABSENT signout_completed); ADR-0180 (state-machine — the handleSignout dispatch step at priority 1); phase-20 SPEC §4.1 category (c) + §4.5 + §6.3 + §6.9; phase-20 SPEC §1.1 AMEND-3 + AMEND-4; phase-20 SPEC §2.15 MVP-CONSUMED `deny_redirect_matcher`; phase-20 SPEC §10 ADR anchor map.
+
+---
+
+## ADR-0185: oauth2 token_endpoint POST body templates per phase-20 AMEND-5 + §20.P10 RATIFIED — byte-exact 4-field auth-code template for MVP (`grant_type=authorization_code&code={0}&client_id={1}&client_secret={2}&redirect_uri={3}`; PKCE-gated 5th field `&code_verifier={4}` for future per S3) + 3-field refresh-token template (`grant_type=refresh_token&refresh_token={0}&client_id={1}&client_secret={2}`); spaces as `%20`; PercentEncoding charset includes `:/=&?`; NEW `urlEncode` custom helper at `oauth2/oauth_client.go` (stdlib `url.PathEscape` does NOT match upstream byte-exact behavior)
+
+**Status:** §Context drafted at phase-20 SPEC commit; §Decision + §Consequences anchor at phase-20 IMPL Task 10 per ADR-0044
+**Date:** 2026-05-17 (§Context anchor)
+**Doctrine:** Phase 20 §9 family-row. ADR-0044 ADR-on-impl convention. RATIFIES the BRAINSTORM Q10 `client_secret_post` direction per the SPEC §11 §20.P10 in-session empirical scrape against reference Envoy v1.37.2.
+**Lands-in:** Task 10 of phase-20 PLAN.
+
+### Context
+
+ADR-0185 anchors the byte-exact token_endpoint POST body templates per the §11 §20.P10 RATIFIED disposition. The empirical scrape confirmed BOTH templates byte-for-byte from reference Envoy v1.37.2 source (`source/extensions/filters/http/oauth2/oauth_client.cc` + `oauth_client_test.cc`).
+
+**4-field auth-code template (MVP)**:
+```
+grant_type=authorization_code&code={0}&client_id={1}&client_secret={2}&redirect_uri={3}
+```
+- `{0}` = the `code` query parameter from the callback URL
+- `{1}` = the operator-configured `OAuth2Credentials.client_id` (per phase-20 SPEC §2)
+- `{2}` = the operator-configured `OAuth2Credentials.token_secret` (the SDS-supplied `client_secret`)
+- `{3}` = the operator-configured `OAuth2Config.redirect_uri`
+- **5th field PKCE-gated per S3**: `&code_verifier={4}` is appended ONLY when PKCE is enabled; MVP omits per phase-20 SPEC §2.1 (PKCE deferred). The PKCE-gated template-selection-rule departure from upstream's unconditional-5-field shape is recorded as phase-20 SPEC §1.1 AMEND-5.
+
+**3-field refresh-token template (MVP)**:
+```
+grant_type=refresh_token&refresh_token={0}&client_id={1}&client_secret={2}
+```
+- `{0}` = the decrypted RefreshToken cookie value
+- `{1}` = the operator-configured `client_id`
+- `{2}` = the operator-configured `client_secret`
+
+**Content-Type header**: `application/x-www-form-urlencoded` (per RFC 6749 §4.1.3 + RFC 6749 §6 — the OAuth 2.0 token_endpoint requirement).
+
+**PercentEncoding charset** per §20.P10 RATIFIED: `:/=&?` are percent-encoded in addition to the default URL-unsafe-charset (Go's `url.PathEscape` does NOT percent-encode these — it considers them URL-safe under the path-segment-encoding discipline; the upstream Envoy emits them percent-encoded for the body-parameter discipline). **Spaces emitted as `%20`** (NOT `+`; matches upstream + RFC 3986 percent-encoding discipline).
+
+**NEW `urlEncode` custom helper at `oauth2/oauth_client.go`** (phase-20 SPEC §6.7): the stdlib `url.PathEscape` is not a byte-exact match for upstream's behavior (per §20.P10 RATIFIED + §12 item A5 RATIFIED-PENDING-IMPL-TIME). The phase-20 implementation provides a custom percent-encoding helper that handles the `:/=&?` charset explicitly + emits spaces as `%20`. ~15-25 LoC. Tested via the `TestUrlEncode_*` vector-test group per phase-20 SPEC §14.1 group 5.
+
+**Non-ASCII byte edge-case** (phase-20 SPEC §12 item A5 RATIFIED-PENDING-IMPL-TIME): operators typically have ASCII-only `client_secret` + `code` values; the helper's behavior for non-ASCII bytes is wire-pinnable via vector-tests at IMPL Task 4 unit-test + Task 13 fixture-0024 byte-comparison. Most-likely outcome: stdlib UTF-8 escaping for non-ASCII bytes (matches Go's default behavior; vector-test confirms upstream byte-exact).
+
+**PKCE-gating gating-rule** (phase-20 SPEC §6.7 + AMEND-5 + S3): the SPEC author resolves S3 as **gated template** (4-field for PKCE-disabled MVP; 5-field for PKCE-enabled future). MVP exercises 4-field only; the IMPL conditional at `buildTokenRequestBody` toggles between the two templates based on the (currently always-zero) PKCE-enabled state.
+
+**Cross-deployment migration scenario**: operators migrating from a 5-field PKCE-enabled deployment to a 4-field PKCE-disabled deployment SHOULD update both the listener config (drop `use_pkce`) AND the upstream authorization-server registration (drop the `code_verifier` parameter expectation). Envoy v1.37.2's unconditional-5-field-with-empty-code_verifier shape vs phase-20's gated-4-field-only shape is the **envoy-go-strict departure** recorded at phase-20 SPEC §13 (anticipated; not yet plumbed since PKCE itself is deferred).
+
+### §Decision + §Consequences ANTICIPATED AT IMPL Task 10
+
+Anchored at this SPEC commit; written in full at phase-20 IMPL Task 10 per ADR-0044. The §Decision body settles the exact byte-for-byte template strings + the urlEncode-helper charset + the PKCE-gated template-selection-rule. The §Consequences body documents the BRAINSTORM Q10 RATIFIED-with-template-revision trail + the operator-facing wire-shape commitment + the future PKCE-enabling-phase template-toggle activation.
+
+**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0177 (`internal/httpclient/` primitive — the POST request flows through `Client.Do`); ADR-0183 (refresh-token rotation — the 3-field refresh-token template consumer); ADR-0180 (state-machine — the handleCallback + handleRefresh dispatch steps); phase-20 SPEC §6.7 (buildTokenRequestBody + urlEncode helper); phase-20 SPEC §1.1 AMEND-5; phase-20 SPEC §11 §20.P10; phase-20 SPEC §12 item A5; phase-20 SPEC §2.1 (PKCE deferred); phase-20 SPEC §10 ADR anchor map.
 
 ---
 
