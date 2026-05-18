@@ -506,13 +506,24 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 
 	a.cluster.IncUpstreamRqTotal()
 
-	upstream, ep, err := a.cluster.Dial(ctx)
+	pooled, err := a.cluster.AcquireH1(ctx)
 	if err != nil {
 		a.cluster.IncStatusClass(503)
 		return ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
-	defer func() { _ = upstream.Close() }()
-	picked = ep
+	upstream := pooled.Conn
+	// reusable is flipped to true on the happy path right before return; on
+	// every error/early-exit path the deferred drop closes the conn instead
+	// of returning it to the keep-alive pool.
+	reusable := false
+	defer func() {
+		if reusable {
+			a.cluster.PutIdleH1(pooled)
+		} else {
+			_ = upstream.Close()
+		}
+	}()
+	picked = pooled.Endpoint()
 
 	// Propagate the downstream ctx deadline (if any) to the upstream socket
 	// so a stalled upstream cannot hold the action past the ctx's deadline
@@ -527,7 +538,13 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
+	// Reuse the pooled bufio.Reader so that any read-ahead buffered bytes
+	// (e.g. start of the next response on a pipelined-but-not-here connection)
+	// are not silently discarded; for the simple sequential-keep-alive case
+	// the reader's internal buffer just persists with empty state after each
+	// drain.
+	br := pooled.BufioReader()
+	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		a.cluster.IncStatusClass(502)
 		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
@@ -539,6 +556,20 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return ActionResponse{Status: resp.StatusCode}, picked, err
+	}
+
+	// Decide pool reuse eligibility. Keep-alive applies when:
+	//   - the upstream did NOT signal Close (resp.Close is set when either the
+	//     response uses HTTP/1.0 without keep-alive, or carries
+	//     "Connection: close")
+	//   - the request itself did not request close (req.Close)
+	//   - the protocol is HTTP/1.1+ (resp.ProtoMajor==1 && ProtoMinor>=1)
+	//   - the body was successfully drained above (no read error)
+	if !resp.Close && !req.Close && resp.ProtoMajor == 1 && resp.ProtoMinor >= 1 {
+		// Clear the per-request deadline before parking the conn in the pool
+		// so a stale deadline doesn't fire on the next caller's I/O.
+		_ = upstream.SetDeadline(time.Time{})
+		reusable = true
 	}
 
 	// Build the response headers from the upstream response. Phase 07.1 Task 19

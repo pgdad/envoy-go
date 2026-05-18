@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bufio"
 	"context"
 	stdtls "crypto/tls"
 	"errors"
@@ -39,6 +40,34 @@ func (e Endpoint) Addr() string {
 	return fmt.Sprintf("%s:%d", e.Host, e.Port)
 }
 
+// PooledH1Conn bundles a pooled HTTP/1.1 upstream connection with its
+// bufio.Reader so the next request can resume parsing the response stream
+// without losing bytes already buffered (e.g. read-ahead of the next
+// response's :status line). The reader is created at first use and reused
+// for the lifetime of the pooled connection.
+type PooledH1Conn struct {
+	Conn net.Conn
+	Br   *Bufio  // opaque wrapper (cluster owns the bufio.Reader type alias)
+	ep   Endpoint
+}
+
+// Endpoint returns the upstream endpoint this connection is dialed to.
+func (p *PooledH1Conn) Endpoint() Endpoint { return p.ep }
+
+// Bufio is an opaque alias for *bufio.Reader so the cluster package doesn't
+// have to expose bufio in its exported API; router/router.go uses the
+// helper PooledH1Conn.BufioReader() to retrieve it as a *bufio.Reader.
+type Bufio = bufio.Reader
+
+// BufioReader returns the bufio.Reader for resumable response parsing.
+func (p *PooledH1Conn) BufioReader() *bufio.Reader { return p.Br }
+
+// h1PoolMaxPerEndpoint caps idle conn count per endpoint. 1024 is generous
+// for the high-concurrency benchmark workloads we care about; for typical
+// production usage 64-256 is plenty. Bursts above this cap simply drop the
+// extra connection rather than queue it.
+const h1PoolMaxPerEndpoint = 1024
+
 // Cluster is a named pool of endpoints with a load-balancing policy. Phase 02
 // supports only round-robin; future phases may grow the LB family.
 // upstreamCfg is nil for plaintext clusters and non-nil for TLS clusters.
@@ -48,6 +77,13 @@ type Cluster struct {
 	connectTimeout time.Duration
 	lb             loadBalancer
 	upstreamCfg    *stdtls.Config
+
+	// h1Pool is a per-endpoint LIFO of idle keep-alive HTTP/1.1 connections.
+	// Keyed by endpoint Addr(). AcquireH1 pops one (or dials fresh);
+	// PutIdleH1 pushes back at end-of-response if reusable. Capped at
+	// h1PoolMaxPerEndpoint per endpoint to avoid unbounded growth.
+	h1PoolMu sync.Mutex
+	h1Pool   map[string][]*PooledH1Conn
 	// useH2 reports whether this cluster's HttpProtocolOptions selects H2
 	// upstream origination. Set by Manager.buildCluster (Task 10) from the
 	// typed_extension_protocol_options entry; defaults to false for every
@@ -173,6 +209,107 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	return &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}, ep, nil
 }
 
+// AcquireH1 returns an HTTP/1.1 upstream connection ready to write a request
+// on. It first tries to pop an idle keep-alive connection from the per-
+// endpoint pool; on miss it dials fresh via the same code path as Dial. The
+// returned *PooledH1Conn carries both the net.Conn and a bufio.Reader for
+// resumable response parsing across consecutive requests on the same conn.
+//
+// The caller MUST either:
+//   - call PutIdleH1 after a successful response read with keep-alive
+//     semantics (response not Close, body fully drained), to return it to
+//     the pool for reuse; OR
+//   - call (*PooledH1Conn).Conn.Close() on any failure path, to drop the
+//     connection (the Dial-time *connWithGauge wrapper decrements the
+//     upstream_cx_active gauge exactly once via sync.Once).
+//
+// AcquireH1 is the high-throughput replacement for Dial in the router H1
+// upstream-dispatch hot path. Dial remains for non-pooled use sites (TCP
+// proxy, single-shot upstream calls).
+func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ep, err := c.PickEndpoint()
+	if err != nil {
+		return nil, err
+	}
+	addr := ep.Addr()
+
+	// Fast path: pop an idle pooled conn for this endpoint.
+	c.h1PoolMu.Lock()
+	list := c.h1Pool[addr]
+	n := len(list)
+	if n > 0 {
+		p := list[n-1]
+		c.h1Pool[addr] = list[:n-1]
+		c.h1PoolMu.Unlock()
+		// Clear any stale deadline left by the prior request before handing
+		// back to the caller (the caller will reset its own deadline anyway,
+		// but this defends against the SetDeadline-after-Close pattern).
+		_ = p.Conn.SetDeadline(time.Time{})
+		// Reset endpoint to the freshly-picked one for consistent observability,
+		// though for a single-endpoint cluster they are identical. (For multi-
+		// endpoint LB the pooled conn carries its dial-time ep, so use that.)
+		return p, nil
+	}
+	c.h1PoolMu.Unlock()
+
+	// Slow path: dial fresh (mirrors the Dial code path verbatim so the
+	// connWithGauge / TLS handshake / counters semantics stay aligned).
+	d := &net.Dialer{Timeout: c.connectTimeout}
+	raw, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: dial: %w", err)
+	}
+	var final net.Conn = raw
+	if c.upstreamCfg != nil {
+		conn := stdtls.Client(raw, c.upstreamCfg)
+		if err := conn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("cluster: tls: handshake: %w", err)
+		}
+		final = conn
+	}
+	c.upstreamCxTotal.Inc()
+	c.upstreamCxActive.Inc()
+	wrapped := &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}
+	return &PooledH1Conn{
+		Conn: wrapped,
+		Br:   bufio.NewReaderSize(wrapped, 4096),
+		ep:   ep,
+	}, nil
+}
+
+// PutIdleH1 returns a keep-alive HTTP/1.1 connection to the per-endpoint
+// idle pool for reuse by the next AcquireH1 call. The caller MUST have
+// fully drained the response body before calling this (otherwise the next
+// reader would see stale bytes from the previous response).
+//
+// If the pool for the endpoint is full (>= h1PoolMaxPerEndpoint) the
+// connection is closed instead. Best-effort; never blocks.
+func (c *Cluster) PutIdleH1(p *PooledH1Conn) {
+	if p == nil || p.Conn == nil {
+		return
+	}
+	addr := p.ep.Addr()
+	c.h1PoolMu.Lock()
+	if c.h1Pool == nil {
+		c.h1Pool = make(map[string][]*PooledH1Conn)
+	}
+	list := c.h1Pool[addr]
+	if len(list) >= h1PoolMaxPerEndpoint {
+		c.h1PoolMu.Unlock()
+		_ = p.Conn.Close()
+		return
+	}
+	// Clear deadlines while idle so a stale per-request deadline doesn't fire
+	// while the conn sits in the pool waiting for the next caller.
+	_ = p.Conn.SetDeadline(time.Time{})
+	c.h1Pool[addr] = append(list, p)
+	c.h1PoolMu.Unlock()
+}
+
 // connWithGauge wraps a net.Conn so its Close decrements an upstream-cx-active
 // gauge exactly once (sync.Once-guarded) regardless of how many Close calls
 // the wrapper sees. Per the settled SPEC §12 deferred-decision #10 the type
@@ -215,10 +352,20 @@ func (c *connWithGauge) Close() error {
 // runs) provides the architectural call-site for future expansion per
 // SPEC §2.1 deferral note. Per planner-time decision 6.
 func (c *Cluster) closePool() {
-	// Future: iterate c.h1Pool / c.h2ClientConns / c.tlsUpstreamConns when
-	// those fields exist. For now, a best-effort log indicating the cluster
-	// is being drained at the cluster-pool layer.
-	// log.Printf("cluster %q: closePool (drain hook)", c.name)
+	// Drain the per-endpoint HTTP/1.1 idle conn pool. Each pooled conn's
+	// Close decrements upstream_cx_active via the connWithGauge wrapper
+	// (sync.Once-guarded; safe).
+	c.h1PoolMu.Lock()
+	pool := c.h1Pool
+	c.h1Pool = nil
+	c.h1PoolMu.Unlock()
+	for _, list := range pool {
+		for _, p := range list {
+			if p != nil && p.Conn != nil {
+				_ = p.Conn.Close()
+			}
+		}
+	}
 }
 
 // CloseWrite delegates the half-close to the underlying *net.TCPConn or
