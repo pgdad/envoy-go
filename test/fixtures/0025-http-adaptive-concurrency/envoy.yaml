@@ -1,0 +1,23 @@
+# Reference Envoy bootstrap for fixture 0025-http-adaptive-concurrency.
+#
+# DEFERRED — fixture 0025 is REFERENCE-LESS per the phase-20 oauth2 +
+# phase-07.1 iteration-probe single-directory precedent. The driver
+# returns RequiresReference() == false, so the runner SKIPS the
+# reference-Envoy container spawn + DriveReference + byte-stream
+# CompareBytes. This file is preserved as a skeleton for a future
+# cross-side byte-exact extension of scenario (b) per the Task 10
+# PROGRESS.md "RATIFIED-PENDING-FUTURE-CROSS-SIDE-EXTENSION" note.
+#
+# When that extension lands, the skeleton below is the starting point —
+# the 3-listener layout mirrors envoy-go.yaml exactly so the cross-side
+# diff can land scenario (b) (overflow_503) byte-exact against Envoy
+# v1.32.4. Until then, the file is INERT (not consumed by the runner).
+#
+# See README.md "Scope deviation from PLAN §10" for the full rationale.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners: []
+  clusters: []

@@ -1,0 +1,85 @@
+# Fixture 0025-http-adaptive-concurrency — per-scenario subject-only
+# expectations.
+#
+# REFERENCE-LESS subject-only fixture per phase-20 oauth2 + phase-07.1
+# iteration-probe single-directory precedent. The expectations below
+# describe the wire-shape invariants the driver's SubjectAsserter
+# validates against subjBytes (the byte stream DriveSubject emits).
+# They are NOT cross-side byte-equal expectations — the fixture does
+# not spawn a reference Envoy at IMPL time. The AMEND-6 cross-side
+# byte-exact promise for scenario (b) is deferred to a future
+# cross-side extension per Task 10 PROGRESS.md note
+# (RATIFIED-PENDING-FUTURE-CROSS-SIDE-EXTENSION).
+#
+# Per SPEC §12 ratification anchors:
+#   A1 + A2 — RATIFIED at envoy-go-side at scenario (b) (503 status +
+#             "reached concurrency limit" 25-byte body + content-type:
+#             text/plain). Cross-side extension deferred.
+#   A3 — RATIFIED-by-absence (response_code_details is ABSENT-by-config —
+#        envoy-go has no access-log surface per SPEC §6.4 doc).
+#   A4 — RATIFIED forward-pointer to Task 13 BEHAVIOR_CONTRACT.md
+#        envoy-go-strict departure record per planner-time D14
+#        (sample_rtt_msecs / min_rtt_msecs unit divergence — name
+#        byte-exact upstream, value encoded as nanoseconds rather than
+#        milliseconds per ADR-0059 §Decision AMENDMENT).
+#
+# Each scenario block:
+#   - id        — short identifier per SPEC §7
+#   - listener  — l_a_default | l_b_overflow | l_d_disabled
+#   - request   — driver-issued request shape
+#   - assertions — substrings asserted against the encoded probe block
+#
+scenarios:
+  - id: a_parse_ok
+    listener: l_a_default
+    request: GET / (single)
+    assertions:
+      status: 200
+      rq_blocked_after: 0
+
+  - id: b_overflow_503
+    listener: l_b_overflow
+    request: 2 concurrent GET /slow (5s slow stream backend; first
+      request fills the single-slot in-flight; second hits
+      forwardingDecision Block-leg → 503)
+    assertions:
+      first_status: 200
+      second_status: 503
+      second_body: "reached concurrency limit"
+      second_body_bytes: 25
+      second_content_type: text/plain
+      rq_blocked_after: 1
+
+  - id: c_stat_surface
+    listener: l_a_default
+    request: GET / (single) + scrape admin /stats?format=prometheus
+    assertions:
+      status: 200
+      # 7-name stat surface per SPEC §6.6 + AMEND-3 (1 counter +
+      # 6 gauges):
+      stat_names_present:
+        - rq_blocked
+        - concurrency_limit
+        - gradient
+        - burst_queue_size
+        - sample_rtt_msecs
+        - min_rtt_msecs
+        - min_rtt_calculation_active
+      # Initial-state pin per SPEC §4.6 + AMEND-2 C4: at construction
+      # the controller sets concurrencyLimit = minConcurrency (default
+      # 3) AND immediately enters the minRTT sampling window
+      # (min_rtt_calculation_active = 1). A single fast request does
+      # not perturb either (the window needs 50 samples to close per
+      # request_count default).
+      concurrency_limit: 3
+      min_rtt_calculation_active: 1
+
+  - id: d_pass_through_when_disabled
+    listener: l_d_disabled
+    request: GET / (single)
+    assertions:
+      status: 200
+      rq_blocked_after: 0
+      # filter is OFF per AMEND-4 default (`enabled` field ABSENT in
+      # the listener config). decode_headers.go leg-1 pass-through
+      # fires; the controller is NEVER consulted.

@@ -346,6 +346,27 @@ const (
 	// (oauthbackend); the runner's in-process accept counter is NOT
 	// incremented. Introduced by phase 20 Task 12 / fixture 0024.
 	HTTPOAuth2 BackendKind = 20
+	// HTTPAdaptiveConcurrency reuses the existing HTTPSlowStream backend
+	// (fixture-0010 backend at test/fixtures/0010-graceful-drain/backends/)
+	// for fixture 0025-http-adaptive-concurrency (phase 21 Task 10). The
+	// slow-stream backend serves "/" with a fast 200 response (body
+	// "backend1\n") for scenarios (a) parse_ok, (c) stat_surface, and
+	// (d) pass_through_when_disabled, and "/slow" which streams 5KB over
+	// 5 seconds for scenario (b) overflow_503 (two concurrent /slow
+	// requests against a listener configured with min_concurrency=1 +
+	// max_concurrency_limit=1 cause the second to be rejected with a
+	// 503 + "reached concurrency limit" body per AMEND-6 byte-pinned
+	// wire shape). The fixture is REFERENCE-LESS per the phase-20 oauth2
+	// + phase-07.1 iteration-probe single-directory precedent — the
+	// AMEND-6 cross-side byte-exact promise for scenario (b) is deferred
+	// to a future cross-side extension per Task 10 PROGRESS.md
+	// (RATIFIED-PENDING-FUTURE-CROSS-SIDE-EXTENSION); envoy-go-side
+	// byte-exact pinning of the 503 + 25-byte body + content-type:
+	// text/plain still lands at scenario (b) per AMEND-6 wire-shape
+	// invariants — only the cross-side comparison is deferred. Because
+	// the backend is a subprocess, the runner's in-process accept counter
+	// is NOT incremented. Introduced by phase 21 Task 10 / fixture 0025.
+	HTTPAdaptiveConcurrency BackendKind = 21
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

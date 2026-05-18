@@ -47,6 +47,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0022-http-ext-proc-grpc/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0023-http-ext-proc-body/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0024-http-oauth2/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0025-http-adaptive-concurrency/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -529,6 +530,38 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPAdaptiveConcurrency:
+			// Fixture 0025-http-adaptive-concurrency (phase 21 Task 10)
+			// REUSES the fixture-0010 HTTPSlowStream backend binary at
+			// test/fixtures/0010-graceful-drain/backends/backend.go. The
+			// slow-stream backend serves "/" as a fast 200 response (body
+			// "backend1\n") for scenarios (a) parse_ok, (c) stat_surface,
+			// and (d) pass_through_when_disabled, and "/slow" which streams
+			// 5 KB over 5 seconds for scenario (b) overflow_503 (two
+			// concurrent /slow requests against a listener configured with
+			// min_concurrency=1 + max_concurrency_limit=1 cause the second
+			// to be rejected with a 503 + "reached concurrency limit" body
+			// per AMEND-6). REFERENCE-LESS subject-only fixture per the
+			// phase-20 oauth2 + phase-07.1 iteration-probe single-directory
+			// precedent. Because the backend is a subprocess, the runner's
+			// in-process accept counter is NOT incremented.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPSlowStreamBackend(ctx, root, port)
 			if err != nil {
 				t.Fatalf("backend[%d] start: %v", i, err)
 			}

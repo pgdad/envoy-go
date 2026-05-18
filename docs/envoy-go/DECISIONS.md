@@ -2106,13 +2106,24 @@ Alternatives considered:
 - **(B) `expvar` + custom serializer.** Rejected because `expvar` lacks a histogram primitive (and while ADR-0060 defers histograms from 06.1, it does not preclude them from later sub-phases — choosing `expvar` would make that future work harder).
 - **(C) Build the in-tree Registry as a thin wrapper around `prometheus/client_golang`'s primitives.** Rejected for the same reason as (A): the dependency is still there, just with a façade.
 
-**Amendment (per phase 21 ADR-0186) — ANTICIPATION paragraph anchored at phase-21 SPEC commit; AMENDMENT body lands at phase-21 IMPL Task 4 per ADR-0044 in-place edit discipline.** The `*stats.Gauge` primitive is int64-only by §Decision above (Counter is uint64; Gauge is int64; both lock-free atomics); phase-21's `gradient_controller` surface introduces three value-classes that are not int64-natural and require an operator-readable encoding convention layered atop the unchanged primitive. The convention (codified at IMPL Task 4 alongside `internal/filter/http/adaptive_concurrency/stats.go` materialization):
+**Amendment (per phase 21 ADR-0186) — landed at IMPL Task 4, dated 2026-05-18 (commit `4a8f9c4 post-Task-4`); REPLACES the SPEC-commit ANTICIPATION paragraph per ADR-0044 in-place edit discipline.** The `*stats.Gauge` primitive is int64-only by §Decision above (Counter is uint64; Gauge is int64; both lock-free atomics); phase-21's `gradient_controller` surface introduces three value-classes that are not int64-natural and require an operator-readable encoding convention layered atop the unchanged primitive. The convention (codified at IMPL Task 4 alongside `internal/filter/http/adaptive_concurrency/stats.go` materialization):
 
-- **Time-typed gauges** (e.g., `sample_rtt_msecs`, `min_rtt_msecs` — `time.Duration` in envoy-go; `std::chrono::nanoseconds` upstream): encode as **int64 nanoseconds direct** in envoy-go via `Gauge.Set(rtt.Nanoseconds())`. Operators divide by 1e9 for seconds. **NOTE on envoy-go-strict departure**: upstream encodes time-typed gauges as milliseconds via `duration_cast<milliseconds>` per `gradient_controller.cc:75-76, 154-155`; envoy-go uses nanoseconds for Go-stdlib-naturalness (Go's `time.Duration.Nanoseconds()` is the idiomatic int64 conversion). The byte-exact stat NAME is preserved (`sample_rtt_msecs` / `min_rtt_msecs` per upstream `ALL_GRADIENT_CONTROLLER_STATS`); the per-metric `# HELP` text documents the unit divergence so operators consulting both proxies see the same stat name with explicit-unit-disambiguation. Documented as envoy-go-strict departure record at BEHAVIOR_CONTRACT.md (phase-21 SPEC §13 item C4).
+- **Time-typed gauges** (e.g., `sample_rtt_msecs`, `min_rtt_msecs` — `time.Duration` in envoy-go; `std::chrono::nanoseconds` upstream): encode as **int64 nanoseconds direct** in envoy-go via `Gauge.Set(rtt.Nanoseconds())`. Operators divide by 1e9 for seconds. **NOTE on envoy-go-strict departure**: upstream encodes time-typed gauges as milliseconds via `duration_cast<milliseconds>` per `gradient_controller.cc:75-76, 154-155`; envoy-go uses nanoseconds for Go-stdlib-naturalness (Go's `time.Duration.Nanoseconds()` is the idiomatic int64 conversion). The byte-exact stat NAME is preserved (`sample_rtt_msecs` / `min_rtt_msecs` per upstream `ALL_GRADIENT_CONTROLLER_STATS`); the per-metric `# HELP` text documents the unit divergence so operators consulting both proxies see the same stat name with explicit-unit-disambiguation. Operator migration note: BEHAVIOR_CONTRACT.md AMEND-7 envoy-go-strict departure record (phase-21 SPEC §13 item C4; lands at IMPL Task 13).
 - **Ratio-typed gauges** (e.g., `gradient` — double bounded `[0.5, 2.0]` upstream): encode as **int64 ×1000** via `Gauge.Set(int64(gradient * 1000))`; gradient=1.5 → stored 1500. Operators divide by 1000 to recover the ratio. The ×1000 scale matches upstream Envoy's `gradient_controller.cc:176` integer-millis convention (`stats_.gradient_.set(gradient * 1000)`) and gives 3 decimal places of precision over the bounded domain.
-- **Bool-typed gauges** (e.g., `min_rtt_calculation_active`): encode as **int64 0/1** via `Gauge.Set(boolToInt(b))` where `boolToInt(b bool) int64` is a sibling helper at **NEW** `internal/stats/conv.go` (~10-15 LoC). The helper is the canonical project-wide bool→int64 conversion for any future bool-typed gauge.
+- **Bool-typed gauges** (e.g., `min_rtt_calculation_active`): encode as **int64 0/1** via `Gauge.Set(stats.BoolToInt(b))` where `stats.BoolToInt(b bool) int64` is the canonical project-wide bool→int64 conversion helper, package-public so any future cross-package consumer can reuse it.
 
-Operator-readability footnote: all three classes scrape as Prometheus integers via the unchanged `Gauge.Format()` int64-text path; the per-class divisor is documented at each metric's `# HELP` text (Rule SN6 best-effort English). The AMENDMENT introduces ~20-30 LoC delta in `internal/stats/` (NEW `conv.go` `boolToInt` helper + comment-only `gauge.go` doc-comment cross-reference); **no signature change to `*stats.Gauge`**. Cross-phase reusable for any future float-or-non-int64-natural gauge consumer (anticipated: admission_control + global rate limit + circuit-breakers per ROADMAP §9 / cluster-manager families).
+**IMPL landings at Task 4:**
+
+- **NEW** `internal/stats/conv.go` (~15 LoC): the package-public `BoolToInt(b bool) int64` helper. Sibling to `gauge.go`; sits in `internal/stats/` rather than at the filter package so any future bool-typed-gauge consumer (across the §9 family-row + cluster-manager + admission-control families) has a single canonical home for the conversion.
+- **MODIFY** `internal/stats/gauge.go` (comment-only doc-extension; ~+20 LoC; NO signature change to `*stats.Gauge`): the `Gauge` type doc-comment gains a cross-reference paragraph documenting the three-class encoding convention (time-typed ns; ratio-typed ×1000; bool-typed 0/1 via `BoolToInt`). Operators reading the godoc see the convention without consulting DECISIONS.md.
+- **NEW** `internal/filter/http/adaptive_concurrency/stats.go` (~210 LoC including extensive package-level + per-stat doc comments): consumes the convention at `filterStats`'s 7-name roster construction. Per-stat `const statName*` declarations pin the byte-exact wire names at compile time (per planner-time D5 stat-name compile-time guard pattern). The `newFilterStats(reg *stats.Registry, hcmPrefix string)` constructor builds the 7-name roster under the HCM-rooted prefix per AMEND-3 C2: `http.<HCM_stat_prefix>.adaptive_concurrency.gradient_controller.<stat>`.
+- **WILL-LAND at Task 3** `internal/filter/http/adaptive_concurrency/controller.go`: consumes the convention at the recalc-tick callsites via `gradient.Set(int64(gradient * 1000))`, `sampleRTTMsecs.Set(rtt.Nanoseconds())`, `minRTTMsecs.Set(minRTT.Nanoseconds())`, and `minRTTCalculationActive.Set(stats.BoolToInt(active))`. The `concurrencyLimit` gauge (int64 raw uint32) and `burstQueueSize` gauge (int64 signed) consume the unchanged `Gauge.Set(int64)` path without encoding-divisor since they are int64-natural.
+
+**Cross-package regression check (per planner-time D4 + D16):** at IMPL Task 4 the AMENDMENT lands paired with the regression command `go test -count=1 -race ./internal/stats/...` → GREEN. The AMENDMENT is pure convention-extension; the `*stats.Gauge` signature is unchanged; the existing `internal/stats/` test surface (registry / counter / gauge / prom / name / fuzz tests) passes without modification post-AMENDMENT. Full closure of the cross-phase regression matrix at Task 12 (sibling cross-package regression command spanning all `internal/{stats,filter,cluster,listener}/...` callers) and Task 14 Gate D (27-fixture differential regression). Zero regression expected (the AMENDMENT documents an encoding convention that callsites already follow implicitly; the IMPL just makes it explicit + reusable).
+
+**Operator-readability footnote:** all three classes scrape as Prometheus integers via the unchanged `Gauge.Format()` int64-text path; the per-class divisor is documented at each metric's `# HELP` text (Rule SN6 best-effort English). The AMENDMENT introduces ~20-30 LoC delta in `internal/stats/` (NEW `conv.go` `BoolToInt` helper + comment-only `gauge.go` doc-comment cross-reference); **no signature change to `*stats.Gauge`**. Cross-phase reusable for any future float-or-non-int64-natural gauge consumer (anticipated: admission_control + global rate limit + circuit-breakers per ROADMAP §9 / cluster-manager families).
+
+**Operator-facing migration note forward-pointer:** the BEHAVIOR_CONTRACT.md AMEND-7 edit at IMPL Task 13 documents the envoy-go-strict departure for the two time-typed gauges (`sample_rtt_msecs` + `min_rtt_msecs` NAMES preserve upstream byte-exact while the unit is nanoseconds in envoy-go vs milliseconds upstream), giving operators consulting both proxies a single canonical reference for the unit-divergence resolution path. The two ratio-typed and one bool-typed gauges follow upstream's exact integer-encoding semantics so require no migration note.
 
 ### Consequences
 
@@ -11073,8 +11084,8 @@ Field ORDER fixed (matches upstream); each value urlEncode-processed.
 
 ## ADR-0186: Gradient-1 controller state machine + inline `Clock` seam (NOT framework primitive) + FAKE-TIME differential strategy + sorted-slice percentile aggregation (NOT CircllHist; ≤ 1 bin-width divergence acceptable) + gradient formula + new-limit calculation + minRTT recalc with `sample_aggregate_percentile`-quantile (NOT MIN per phase-21 AMEND-2 C1) + jitter additive-to-next-interval-delay (per AMEND-2 C2) + 5-consecutive-min forced-recalc trigger (per AMEND-2 C3) + first-tick semantics (per AMEND-2 C4) + line-cited algorithmic lemmata against upstream `gradient_controller.cc` per §21.P-D3 RATIFIED + `min_rtt_calc_params.fixed_value` PARSE-REJECT (deferring the static-minRTT alternative path per AMEND-1 C4)
 
-**Status:** §Context drafted at phase-21 SPEC commit; §Decision + §Consequences anchor at phase-21 IMPL Task 3 per ADR-0044
-**Date:** 2026-05-18 (§Context anchor)
+**Status:** Landed at phase-21 IMPL Task 3 (commit `84e317f post-Task-3`)
+**Date:** 2026-05-18 (§Context anchor; §Decision + §Consequences body landed at IMPL Task 3)
 **Doctrine:** Phase 21 §9 family-row. ADR-0044 ADR-on-impl convention.
 **Lands-in:** Task 3 (controller materialization) of phase-21 PLAN.
 
@@ -11098,18 +11109,110 @@ ADR-0186 anchors the FOURTEENTH §9 family-row filter — `envoy.filters.http.ad
 
 **`fixed_value` PARSE-REJECT** per AMEND-1 C4 + phase-21 SPEC §5.3 + §Consequences (d) at IMPL Task 3. The `min_rtt_calc_params.fixed_value` field is an alternative-to-`interval` path (controller uses the configured fixed value as constant minRTT; skips dynamic recalc entirely). envoy-go phase-21 PARSE-REJECTs `fixed_value` set (stricter than upstream — operators who want static-minRTT behavior must wait for a future phase). Rationale: (a) the static-path controller-state-machine shape is materially different; (b) the operator surface is small (~50-100 LoC) but warrants its own brainstorm; (c) PARSE-REJECT-now-defer-the-brainstorm matches the BRAINSTORM Q1 Pragmatic-middle posture for proto-defined-but-not-MVP fields.
 
-### §Decision + §Consequences ANTICIPATED AT IMPL Task 3
+### Decision
 
-Anchored at this SPEC commit; written in full at phase-21 IMPL Task 3 per ADR-0044. The §Decision body settles: (i) the exact `gradientController` Go-struct shape with atomic.Uint32 hot-path fields + sync.Mutex cold-path-state separation per phase-21 SPEC §6.2; (ii) the `Clock` interface signature + `defaultClock` production-wiring + `fakeClock` test-scope-only invariants; (iii) the line-exact lemmata citation table against upstream `gradient_controller.cc` (the 11-citation roster per §21.P-D3 disposition report); (iv) the sorted-slice percentile aggregation algorithm (`percentile.go` + the empty-slice + single-sample + boundary-quantile edge cases); (v) the FAKE-TIME differential test taxonomy (Layer A `TestController_FAKE_TIME_*` families + Layer B `0025-http-adaptive-concurrency` fixture scenarios); (vi) the `fixed_value` PARSE-REJECT discipline. The §Consequences body documents: (a) the in-package Clock seam → forward-pointer EXTRACT-NOW trigger; (b) the sorted-slice-vs-CircllHist acceptable divergence as a documented BEHAVIOR_CONTRACT envoy-go-strict departure record; (c) the FAKE-TIME determinism invariants for race-test reproducibility; (d) the `fixed_value` deferred-future-extension forward-pointer; (e) the 5-consecutive-min forced-recalc trigger as a stale-high-minRTT guard; (f) the first-tick-semantics no-gradient-during-initial-window invariant; (g) the future EXTRACT-NOW Clock trigger when a second timer-driven filter materializes.
+Phase-21 IMPL Task 3 materializes the Gradient-1 controller state machine at `internal/filter/http/adaptive_concurrency/controller.go` (~427 LoC) + the inline `Clock` interface seam at `internal/filter/http/adaptive_concurrency/clock.go` (~84 LoC) + the test-scope `fakeClock` step-driven implementation at `internal/filter/http/adaptive_concurrency/clock_test.go` (~313 LoC) + the Layer A FAKE-TIME algorithmic-fidelity tests + race tests at `internal/filter/http/adaptive_concurrency/controller_test.go` (~582 LoC).
 
-**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0059 (Internal Stats Store architecture + the phase-21 SPEC §3.2 + ADR-0059 §Decision AMENDMENT-anticipation paragraph for float-valued-gauge int64 encoding convention); ADR-0080 (envoy-go-strict departure discipline — RTT-ms-vs-ns per AMEND-3 C3; sorted-slice-vs-CircllHist per BRAINSTORM §8 item 4); ADR-0114 (Go-package identifier underscored stylistic license); ADR-0125 (per-route canonical roster — NO amendment fires at Task 3; phase-21 strengthens the FOURTH CONSECUTIVE §9 row REUSE-by-absence lesson per phase-21 SPEC §5.4); ADR-0143 (HCM-rooted SN2-reuse stat-prefix convention — phase-21 stat-prefix mirrors `http.<HCM_stat_prefix>.adaptive_concurrency.gradient_controller.*` per AMEND-3 C2); ADR-0051 (h2spec pin — Gate F at phase-done); ADR-0052 (BEHAVIOR_CONTRACT atomic landing per phase-21 SPEC §13); ADR-0187 (RTDS deferral PARSE-REJECT — paired ADR at the same SPEC commit anchor); phase-21 SPEC §1.1 AMEND-1 + AMEND-2 + AMEND-3 + AMEND-5 + AMEND-6; phase-21 SPEC §3.1 + §3.2 + §3.3 + §4 + §6.1 + §6.2 + §6.3 + §6.4 + §6.5 + §6.6 + §6.7 + §6.8 + §7 + §8 + §11 §21.P-D2 + §21.P-D3 + §21.P-D4 + §11.A pin disposition matrix; phase-21 BRAINSTORM Q1 + Q2 + Q3 + Q5 + §3 framework-survey + §8 deferred-items register + §10 D-questions slate; phase-21 PLAN-time tasks Task 3 (controller materialization) + Task 12 (fixture-0025 landing per AMEND-6) + Task 13 (BEHAVIOR_CONTRACT.md 7-edit bundle per phase-21 SPEC §13).
+**(i) `gradientController` Go-struct shape (per planner-time D17 + SPEC §6.2).** Hot-path (lock-free) fields:
+
+- `concurrencyLimit atomic.Uint32` — current limit; init = `cfg.minRTTMinConcurrency` per §4.6
+- `numRqOutstanding atomic.Uint32` — current in-flight count; init = 0
+
+Cold-path fields (under `mu sync.Mutex`):
+
+- `latencySamples []time.Duration` — appended on encodeComplete when NOT in minRTT window
+- `minRTTSamples  []time.Duration` — appended on encodeComplete when IN minRTT window
+- `minRTT         time.Duration`   — last computed minRTT
+- `deferredLimitValue uint32`      — saved limit during minRTT window; 0 == NOT in window
+- `consecutiveMinConcurrencySet uint32` — 5-consecutive-min counter per AMEND-2 C3
+- `sampleResetTimer Stop`          — periodic concurrency-update tick handle
+- `minRTTCalcTimer  Stop`          — periodic minRTT-recalc trigger handle
+- `rng *rand.Rand`                 — per-controller jitter source per planner-time D18; mu-protected
+
+The hot-path-vs-cold-path separation per planner-time D17 keeps `forwardingDecision()` lock-free (atomic CAS only on `numRqOutstanding`; atomic `Load` on `concurrencyLimit`) and `releaseInFlight()` lock-free (atomic `Add(^uint32(0))` on `numRqOutstanding`). All sample-mutation + minRTT-state-machine transitions run under `mu` — the cold-path side carries the state-machine complexity without polluting the hot path.
+
+**(ii) `Clock` interface signature + production wiring + test-scope `fakeClock`.** The `Clock` interface at `clock.go` exposes two methods:
+
+```go
+type Clock interface {
+    Now() time.Time
+    AfterFunc(d time.Duration, fn func()) Stop
+}
+type Stop interface {
+    Stop() bool
+}
+```
+
+Production wiring uses `defaultClock` (wraps `time.Now` + `time.AfterFunc`; `timerStop` adapts `*time.Timer.Stop` to the `Stop` interface). Test-scope `fakeClock` (at `clock_test.go`, NOT compiled into production) step-drives time via an explicit `Advance(d time.Duration)` method that synchronously fires all timers whose deadlines fall within `[old now, old now + d]` in deadline-ascending order, with insertion-sequence tiebreak for same-deadline timers per planner-time D9. The fakeClock supports re-entrant `AfterFunc(0, ...)` calls from inside a callback (drained in the same `Advance` pass) — load-bearing for the AMEND-2 C3 5-consecutive-min force-arm path.
+
+**(iii) Line-exact lemmata citation table** (anchored against upstream `gradient_controller.cc` at v1.37.2 per §21.P-D3 RATIFIED). All 7 lemmata land in `controller.go` with the cc-line cross-reference in the per-function doc-comment:
+
+| Lemma | controller.go callsite | gradient_controller.cc line |
+|---|---|---|
+| `forwardingDecision` CAS loop | `forwardingDecision()` | `cc:209-233` |
+| `computeGradient` (clamp 0.5/2.0) | `computeGradient()` | `cc:190-192` |
+| `calculateNewLimit` (sqrt + double-clamp) | `calculateNewLimitLocked()` | `cc:198-206` |
+| minRTT recalc (percentile NOT MIN per AMEND-2 C1) | `updateMinRTTLocked()` | `cc:176-182` |
+| jitter (additive-to-next-interval-delay per AMEND-2 C2) | `applyJitterLocked()` | `cc:152-160` |
+| 5-consecutive-min forced-recalc trigger (per AMEND-2 C3) | `updateConcurrencyLimitLocked()` | `cc:281-283` |
+| first-tick-immediate-window-entry semantics (per AMEND-2 C4) | `newGradientController()` + `enterMinRTTSamplingWindowLocked()` | `cc:55-92, 66-80, 149` |
+
+**(iv) Sorted-slice percentile aggregation.** Landed at Task 7 (`percentile.go` + `Quantile(samples []time.Duration, p float64) time.Duration`). Task 3 consumes the helper at two callsites: (a) `concurrencyUpdateTick` aggregates per-tick `latencySamples` via `Quantile(latencySamples, cfg.sampleAggregatePercentile)`; (b) `updateMinRTTLocked` aggregates per-window `minRTTSamples` via the same helper with the same percentile (p50 default). The ≤ 1 bin-width divergence vs upstream CircllHist is acceptable per BRAINSTORM §8 item 4 + AMEND-3.
+
+**(v) FAKE-TIME differential test taxonomy** (Layer A subject-only step-driven). Task 3 lands 10 test families at `controller_test.go` (~28 sub-tests + 9 fakeClock determinism tests at `clock_test.go`):
+
+- `TestController_FAKE_TIME_FirstTickSemantics` + `..._ConcurrencyUpdateTickShortCircuitsInWindow` — AMEND-2 C4
+- `TestController_FAKE_TIME_GradientFormula_*` (5 sub-tests: NoBuffer / 25PctBuffer / ClampLow / ClampHigh / ZeroSampleRTT) — §4.3 + AMEND-2
+- `TestController_FAKE_TIME_NewLimitCalculation_*` (3 sub-tests: NoChange / ClampMin / ClampMax) — §4.4
+- `TestController_FAKE_TIME_MinRTTRecalcWindow_PercentileNotMin` — AMEND-2 C1 (the load-bearing "p50 NOT MIN" lemma test)
+- `TestController_FAKE_TIME_JitterApplication_*` (2 sub-tests: InRange / ZeroPct) — AMEND-2 C2
+- `TestController_FAKE_TIME_FiveConsecutiveMinForcedRecalc` — AMEND-2 C3
+- `TestController_ConcurrentForwardingDecision_NConcurrent` (N=1000, K=100) + `..._NoDeadlockAtN1000` (N=1000, K=1) — race tests per §12 B7 + D17
+- `TestController_FAKE_TIME_RecordLatencySample_RoutesToMinRTTSamplesInWindow` + `..._RoutesToLatencySamplesOutOfWindow` — sample-slice routing
+- `TestController_FAKE_TIME_ConcurrencyUpdateTick_EmitsGaugesAfterWindowClose` — end-to-end tick driver
+
+The `clock_test.go` adds 9 fakeClock determinism tests (Now/Advance/AfterFunc fire-at-deadline/Stop before+after fire/multi-timer determinism/same-deadline insertion-order/re-entrant AfterFunc) — closes SPEC §12 item B6 per planner-time D15.
+
+**(vi) `fixed_value` PARSE-REJECT discipline (per AMEND-1 C4).** The static-minRTT alternative path is PARSE-REJECTed at compiled_config.go Arm 13 per Task 2 landing. Discovery at Task 2: the v1.32.4 go-control-plane Go binding does NOT expose `GradientControllerConfig_MinimumRTTCalculationParams.FixedValue` (the field surfaced in proto v1.37.x). The byte-stable wording constant `parseRejectFixedValueDeferred` is preserved verbatim at `compiled_config.go` per Task 2 entry + the proto-bump migration forward-pointer (a commented call-site sketch at the Arm 8 ordering position). When the go-control-plane bumps to v1.37.x, the Arm 13 path lifts to a behavioral PARSE-REJECT WITHOUT requiring an ADR-0186 amendment — the §Decision body already anticipates the deferral; the §Consequences (d) forward-pointer covers the lift.
+
+**Note on v1.32.4 proto-binding deviation discovered at Task 2** — the `fixed_value` field is NOT exposed in v1.32.4's Go binding (only v1.37.0+); the SPEC §5.3 + AMEND-1 C4 + ADR-0186 §Consequences (d) PARSE-REJECT-arm 13 is documented byte-stable but structurally unreachable until a proto-bump. The forward-pointer is in place (`compiled_config.go` has the call-site sketch + the byte-stable wording constant); the Arm-13 behavioral test row is deferred to the future proto-bump phase per Task 2 PROGRESS entry §"Deviation note — Arm 13 `fixed_value` is STRUCTURALLY UNREACHABLE in v1.32.4 go-control-plane bindings".
+
+**(vii) 7-name stat-surface emission discipline (consumer-side landing).** All 7 fields on `*filterStats` (1 counter + 6 gauges per Task 4 landing) are consumed at the controller's emission sites:
+
+- `rqBlocked` (counter): `Inc` on Block return from `forwardingDecision`
+- `concurrencyLimit` (gauge): `Set` on every limit change (construction + minRTT-window-entry + minRTT-window-close + every concurrency-update tick)
+- `gradient` (gauge): `Set` per concurrency-update tick; `int64(gradient × 1000)` per ADR-0059 §Decision AMENDMENT
+- `burstQueueSize` (gauge): `Set` per concurrency-update tick; `int64(sqrt(limit × gradient))`
+- `sampleRTTMsecs` (gauge): `Set` per concurrency-update tick; `int64(sampleRTT.Nanoseconds())` per AMEND-3 C3 envoy-go-strict departure (NAME byte-exact upstream `sample_rtt_msecs`)
+- `minRTTMsecs` (gauge): `Set` on minRTT recalc; same int64-ns encoding
+- `minRTTCalculationActive` (gauge): `Set(stats.BoolToInt(true))` on window-entry; `Set(stats.BoolToInt(false))` on window-close
+
+The `//nolint:unused` directives on the 7 `statName*` consts + the `filterStats` type + `newFilterStats` constructor are CLEARED at Task 3 since the consumer (controller.go) is now landed — the lint forward-progress signal flips per the Task 2/4 contract.
+
+### Consequences
+
+**(a) Hot-path lock-free invariant** — `forwardingDecision()` performs zero mutex acquisitions on the request path; the CAS loop over `numRqOutstanding < concurrencyLimit` (both `atomic.Uint32`) closes both the limit-check + the in-flight-increment atomically per `gradient_controller.cc:209-233`. The race-test surface `TestController_ConcurrentForwardingDecision_NConcurrent` (N=1000 + K=100) closes SPEC §12 item B7 RATIFIED-PENDING-IMPL-TIME per D15 — clean under `-race`; exactly K forwarders return true + N-K return false + `numRqOutstanding == K` post-test + `rqBlocked counter == N-K`. Per planner-time D17.
+
+**(b) Cold-path mu discipline** — all sample-mutation (`latencySamples` / `minRTTSamples` appends + clears) + minRTT-state-machine transitions (`deferredLimitValue` writes + `consecutiveMinConcurrencySet` updates + `rng` reads) run under `mu`. Timer callbacks (`concurrencyUpdateTick`, `updateMinRTTTick`) acquire `mu` for state mutation; re-arm `AfterFunc` calls happen with `mu` released (the fakeClock supports re-entrant registrations from inside a callback per `clock_test.go::TestFakeClock_ReentrantAfterFunc` — load-bearing for the AMEND-2 C3 force-arm path which calls `AfterFunc(0, ...)` from inside `updateConcurrencyLimitLocked`).
+
+**(c) 7-name stat-surface emission** per §6.6 + AMEND-3 — all 7 fields driven from the controller (Task 4 landed the registration; Task 3 lands the consumer). The wire-exact stat NAMES preserve upstream byte-exact (`rq_blocked` + `concurrency_limit` + `gradient` + `burst_queue_size` + `sample_rtt_msecs` + `min_rtt_msecs` + `min_rtt_calculation_active`); operator-readable encoding per ADR-0059 §Decision AMENDMENT (ns for time-typed; ×1000 for ratio-typed; 0/1 for bool-typed). The `TestController_FAKE_TIME_ConcurrencyUpdateTick_EmitsGaugesAfterWindowClose` test verifies the gradient + burst_queue_size + sample_rtt_msecs gauges update on a post-window tick.
+
+**(d) `min_rtt_calc_params.fixed_value` PARSE-REJECT deferred-future-extension forward-pointer** per AMEND-1 C4 + SPEC §5.3. The PARSE-REJECT arm 13 lands at `compiled_config.go` (Task 2) byte-stable + structurally unreachable in v1.32.4 (the proto field is not exposed in the Go binding at this revision). When the proto bumps to v1.37.x, the Arm 13 path lifts to a behavioral PARSE-REJECT via the commented call-site sketch in `compiled_config.go` — no ADR-0186 amendment required (the §Decision (vi) above already anticipates the deferral). When a future phase lands the static-minRTT alternative controller path (per SPEC §8 item 5), the §Decision will gain a paragraph covering the alt-controller state-machine shape (no minRTT recalc window; no 5-consecutive-min trigger; no jitter) — that future amendment will be in-place per ADR-0044 (no ADR-0186-bis).
+
+**(e) Race-test surface** per §14.2 — `TestController_ConcurrentForwardingDecision_NConcurrent` + `..._NoDeadlockAtN1000` + `TestController_ReleaseInFlight_Decrements` all clean under `go test -race -count=1 ./internal/filter/http/adaptive_concurrency/...`. Zero data-race violations across all 91 tests in the package. Closes SPEC §12 item B7 per planner-time D15.
+
+**(f) FAKE-TIME determinism** per planner-time D9 + SPEC §12 item B6. The fakeClock's `Advance` synchronously fires all ready timers in deadline-asc order with insertion-sequence tiebreak (`sort.SliceStable`) under documented single-`Advance`-caller discipline; the re-entrant AfterFunc(0, ...) pattern is supported via a drain loop in `Advance`. Determinism verified by 9 dedicated tests at `clock_test.go` including `TestFakeClock_MultiTimer_DeterministicOrder` + `TestFakeClock_MultiTimer_SameDeadlineInsertionOrder` + `TestFakeClock_ReentrantAfterFunc`. Closes SPEC §12 item B6 per planner-time D15.
+
+**(g) Forward-pointer to EXTRACT-NOW Clock seam when a second timer-driven filter materializes.** The `Clock` interface stays inline at `internal/filter/http/adaptive_concurrency/clock.go` per ADR-0186 §Context (consumer count 1 at introduction time; phase-17 jwt_authn EXTRACT-NOW-only-when-trigger-fires lesson). When a second timer-driven filter lands — candidates: `envoy.filters.http.admission_control` (per ROADMAP §9), a future global rate limit row, or any §9 row that needs deterministic FAKE-TIME testing — the seam EXTRACTs to `internal/clock/` (or equivalent framework path) with `defaultClock` + the `Clock` interface moving verbatim; the per-filter consumer's `Clock`-typed field stays unchanged. NO behavioral change to the controller proper; the EXTRACT-NOW trigger is purely a code-organization lift per the established framework-primitive-when-trigger-fires discipline.
+
+**(h) Cross-references at IMPL Task 3 landing:** ADR-0044 (in-place edit discipline — this §Decision + §Consequences REPLACES the SPEC-commit anticipation block in this same commit); ADR-0059 §Decision AMENDMENT (Task 4 landing; the float-valued-gauge int64 encoding convention this controller consumes — `int64(gradient * 1000)` + `int64(rtt.Nanoseconds())` + `stats.BoolToInt(active)`); ADR-0080 (envoy-go-strict departure discipline — RTT-ms-vs-ns per AMEND-3 C3; sorted-slice-vs-CircllHist per BRAINSTORM §8 item 4; CAS-vs-upstream-impl); ADR-0114 (Go-package identifier underscored stylistic license — `adaptive_concurrency`); ADR-0125 (per-route canonical roster — NO amendment fires; phase-21 strengthens the FOURTH CONSECUTIVE §9 row REUSE-by-absence lesson); ADR-0143 (HCM-rooted SN2-reuse stat-prefix convention); ADR-0186 §Context (paired with this §Decision body); ADR-0187 (RTDS deferral PARSE-REJECT — paired ADR at same SPEC commit anchor; Task 2 landed); phase-21 SPEC §1.1 AMEND-1 + AMEND-2 + AMEND-3 + AMEND-6; phase-21 SPEC §3.1 + §3.2 + §3.3 + §4 (§4.1-§4.6) + §6.1-§6.8; phase-21 SPEC §12 items B6 + B7 (closed at this Task per D15); phase-21 BRAINSTORM Q1 + Q2 + Q3 + §8 item 4 carve-out; phase-21 PLAN-time tasks Task 3 (THIS landing) + Task 5 (decode_headers.go consumer of `forwardingDecision`) + Task 6 (encode_complete.go consumer of `recordLatencySample` + `releaseInFlight` + D11 OnDestroy token-release) + Task 7 (`percentile.go` consumed at this Task) + Task 9 (boot-registration wiring `defaultClock` to `newGradientController`); upstream Envoy v1.37.2 `source/extensions/filters/http/adaptive_concurrency/controller/gradient_controller.cc` (lemmata-anchor per §21.P-D3 RATIFIED — 7 cc-line citations table in §Decision (iii) above).
 
 ---
 
 ## ADR-0187: adaptive_concurrency `enabled.RuntimeFeatureFlag` deferral PARSE-REJECT — `enabled.runtime_key != ""` triggers HCM-parse-time PARSE-REJECT with forward-pointer to the future Runtime/RTDS family phase; static-default-enabled honored; absent `enabled` field treats filter as OFF (REFUTES phase-21 BRAINSTORM §2.1 hypothesis — per AMEND-4 + §21.P-PARSE-REJECT empirical scrape, the `RuntimeFeatureFlag.default_enabled` proto-default is `BoolValue{value: false}` so absent `enabled` ⇒ filter OFF)
 
-**Status:** §Context drafted at phase-21 SPEC commit; §Decision + §Consequences anchor at phase-21 IMPL Task 2 per ADR-0044
-**Date:** 2026-05-18 (§Context anchor)
+**Status:** Landed at phase-21 IMPL Task 2 (commit `5a0a720 post-Task-2`)
+**Date:** 2026-05-18 (§Context anchor; §Decision + §Consequences body landed at IMPL Task 2)
 **Doctrine:** Phase 21 §9 family-row. ADR-0044 ADR-on-impl convention.
 **Lands-in:** Task 2 (compiled_config + PARSE-REJECT roster materialization) of phase-21 PLAN.
 
@@ -11133,11 +11236,73 @@ Cases 1 + 2 + 3 are honored at MVP. Cases 4 + 5 PARSE-REJECT with byte-stable er
 
 **Cross-filter consistency**: phase-21 is the FOURTEENTH §9 row to defer a runtime-features-coupled subfield with a PARSE-REJECT and a forward-pointer ADR (matching the phase-17/18/19/20 jwt_authn + ext_authz + ext_proc + oauth2 RTDS-deferral precedent). The recurring pattern strengthens the "RTDS-coupled subfields defer to the Runtime/RTDS family phase" project-wide convention; phase-21 anchors this convention explicitly in ADR-0187 §Consequences (b).
 
-### §Decision + §Consequences ANTICIPATED AT IMPL Task 2
+### Decision
 
-Anchored at this SPEC commit; written in full at phase-21 IMPL Task 2 per ADR-0044. The §Decision body settles: (i) the exact PARSE-REJECT call-site at `compiled_config.go::buildCompiledConfig` for cases 4 + 5 with byte-stable error wording per ADR-0080; (ii) the 3-case behavioral matrix for cases 1 + 2 + 3 (filter ON/OFF disposition); (iii) the byte-stable error wording verbatim; (iv) the unit-test coverage for all 5 cases at `TestBuildCompiledConfig_PARSE_REJECT_EnabledRuntimeKey_*`. The §Consequences body documents: (a) the AMEND-4 REFUTATION of BRAINSTORM §2.1 — operators must explicitly set `enabled.default_enabled = true` for the filter to be ON; (b) the cross-filter-consistent RTDS-deferral convention strengthening; (c) the future-Runtime/RTDS-family-phase forward-pointer in §Future Work; (d) the operator-facing migration note (at BEHAVIOR_CONTRACT.md phase-21 forward-pointer notes per phase-21 SPEC §13 item D6) flagging the absent-`enabled`-defaults-OFF semantics for operators copy-pasting upstream configs that omit the `enabled` field.
+Phase-21 IMPL Task 2 materializes the `enabled.RuntimeFeatureFlag` deferral PARSE-REJECT at the EXACT call-site `internal/filter/http/adaptive_concurrency/compiled_config.go::buildCompiledConfig` — Arm 12 of the 13-arm PARSE-REJECT roster per planner-time D2. The IN-CODE check is one line of Go:
 
-**Cross-references at the SPEC commit anchor:** ADR-0044 (in-place edit discipline); ADR-0080 (envoy-go-strict departure discipline + byte-stable error wording); ADR-0186 (paired ADR at same SPEC commit anchor — controller state machine that the `enabled` flag gates); ADR-0142 (Matcher framework primitive — NOT consumed at phase-21; the `enabled` field is not a matcher); phase-20 ADR-0182 (precedent — the `disable_token_encryption` proto-field default-false-defaults-encryption-ON is the inverse pattern; here we have `enabled.default_enabled` default-false-defaults-filter-OFF, mirrored); phase-21 SPEC §1.1 AMEND-4; phase-21 SPEC §2.1 (RTDS deferral non-purpose); phase-21 SPEC §5.2 envoy-go-strict project-local arms; phase-21 SPEC §11 §21.P-PARSE-REJECT empirical pin; phase-21 BRAINSTORM Q1 + §10 D-question slate (D4 superset); phase-21 PLAN-time Task 2 (compiled_config + PARSE-REJECT materialization); BEHAVIOR_CONTRACT.md phase-21 forward-pointer notes (per phase-21 SPEC §13 item D6 — operator migration note for `enabled`-absent-defaults-OFF).
+```go
+if en := ac.GetEnabled(); en != nil && en.GetRuntimeKey() != "" {
+    return nil, errors.New(parseRejectEnabledRuntimeKey)
+}
+```
+
+where `parseRejectEnabledRuntimeKey` is the package-level `const` declared verbatim per the byte-stable wording:
+
+```go
+parseRejectEnabledRuntimeKey = "adaptive_concurrency: enabled.runtime_key is not yet supported; use enabled.default_enabled"
+```
+
+The constant-declaration discipline (NOT a `fmt.Errorf` format-string) is enforced by `TestParseRejectConstants_ByteStable/Arm12` which asserts the constant matches the planner-time D2 reference string byte-exact; any drift from the reference string fails the assertion. Per ADR-0080 envoy-go-strict departure discipline: operators relying on upstream's `runtime_key` semantics MUST migrate to `default_enabled` at phase-21; the deferral is operator-visible via the exact byte-stable wording quoted above.
+
+**Three-case honored matrix (filter ON/OFF disposition):** the §Context table enumerates the 5-case full matrix; cases 1 + 2 + 3 are honored at MVP via the default-application step at `buildCompiledConfig`:
+
+| Case | `enabled` field | `default_enabled` | `runtime_key` | envoy-go behavior |
+|---|---|---|---|---|
+| 1 | absent entirely | n/a | n/a | filter OFF (`cc.enabled = false` — proto-zero default per AMEND-4) |
+| 2 | present | false | `""` | filter OFF (`cc.enabled = false`) |
+| 3 | present | true | `""` | filter ON (`cc.enabled = true`) |
+
+The implementation:
+
+```go
+if en := ac.GetEnabled(); en != nil {
+    if dv := en.GetDefaultValue(); dv != nil {
+        cc.enabled = dv.GetValue()
+    }
+}
+// (else cc.enabled is the zero-value false — case 1)
+```
+
+`cc.enabled` is the Go-level `bool` consumed at request-eval time by the per-stream `decodeHeaders` dispatcher (Task 5): when `false`, the filter pass-through Continues without consulting the controller (per SPEC §6.4 "disabled pass-through"); when `true`, the filter participates fully in the gradient-controller forwarding decision.
+
+**Cases 4 + 5 PARSE-REJECT (envoy-go-strict per Q1 Pragmatic-middle + this ADR):** any `enabled.runtime_key != ""` surfaces at HCM-build time as the byte-stable Arm-12 error string above — regardless of `default_enabled`'s truth value. The HCM-parse-time error propagates per ADR-0072 boot-time-fail-fast; operators see a single, grep-friendly error string identifying the deferred field.
+
+**Unit-test coverage:** Task 2 lands two table-driven test rows for Arm 12 at `compiled_config_test.go::testBuildCompiledConfigParseReject`:
+
+- `Arm12_EnabledRuntimeKey_DefaultFalse` — `RuntimeFeatureFlag{DefaultValue: BoolValue{false}, RuntimeKey: "adaptive_concurrency.enabled"}` ⇒ PARSE-REJECT (case 4)
+- `Arm12_EnabledRuntimeKey_DefaultTrue` — `RuntimeFeatureFlag{DefaultValue: BoolValue{true}, RuntimeKey: "adaptive_concurrency.enabled"}` ⇒ PARSE-REJECT (case 5)
+
+Plus three table-driven default-applied rows at `testBuildCompiledConfigDefaults` for cases 1 + 2 + 3:
+
+- `Enabled_Absent_DefaultsToFalse` — case 1 (`ac.Enabled = nil` ⇒ `cc.enabled = false`)
+- `Enabled_DefaultValueFalse_StaysFalse` — case 2 (`default_value = BoolValue{false}` ⇒ `cc.enabled = false`)
+- `Enabled_DefaultValueAbsent_DefaultsToFalse` — case 1 boundary (`default_value = nil` even with `enabled != nil` ⇒ `cc.enabled = false`)
+
+The happy-path `testBuildCompiledConfigHappyPath` exercises case 3 (`default_value = BoolValue{true}` ⇒ `cc.enabled = true`) as part of the fully-populated baseline assertion.
+
+**Cross-reference to ADR-0044 + ADR-0080.** Per ADR-0044 in-place edit discipline, the §Decision + §Consequences bodies REPLACE the SPEC-commit `### §Decision + §Consequences ANTICIPATED AT IMPL Task 2` anticipation block in this same commit — no separate ADR-0187a / ADR-0187b sequel; the ADR ID stays stable as ADR-0187. Per ADR-0080 the byte-stable wording is enforced at the test layer (`TestParseRejectConstants_ByteStable`) so future refactors cannot accidentally drift the string. The Arm-12 row in the §5.1+§5.2 PARSE-REJECT roster table (SPEC §5.2 row 1) is the canonical operator-facing landing of the deferral; this ADR's §Decision body is the implementer-facing landing covering the exact call-site location + the test-layer enforcement.
+
+### Consequences
+
+**(a) AMEND-4 REFUTATION of BRAINSTORM §2.1 materialized at code-level.** BRAINSTORM §2.1 hypothesized that "absent `enabled` field treats filter as enabled per upstream"; the SPEC AMEND-4 REFUTED this per the §21.P-PARSE-REJECT empirical scrape (the upstream `RuntimeFeatureFlag.default_value` proto-zero is `BoolValue{value: false}`). At IMPL Task 2 the REFUTATION is now load-bearing in code: the default-application `if en := ac.GetEnabled(); en != nil { ... }` block leaves `cc.enabled` at its Go zero-value `false` when the proto's `enabled` field is absent, when `enabled.default_value` is nil, and when `enabled.default_value.value` is `false`. Operators **MUST** explicitly set `enabled.default_enabled = true` (proto: `RuntimeFeatureFlag.default_value = BoolValue{value: true}`) for the filter to be ON. This is a behavioral departure from the operator's natural intuition that "configuring a filter implies enabling it" — the upstream proto's design deliberately separates filter-presence from filter-enablement via the `RuntimeFeatureFlag` indirection, and envoy-go matches that upstream behavior byte-equivalently at the default-application step. The migration note at BEHAVIOR_CONTRACT.md phase-21 forward-pointer notes (Task 13) will flag this for operators copy-pasting upstream `adaptive_concurrency` configs that omit `enabled` entirely.
+
+**(b) Cross-filter-consistent RTDS-deferral convention STRENGTHENED.** Phase-21 is the **FIFTH CONSECUTIVE §9 family-row** to defer a runtime-features-coupled subfield via PARSE-REJECT-with-byte-stable-wording + forward-pointer ADR (matching phase-17 jwt_authn + phase-18 ext_authz + phase-19 ext_proc + phase-20 oauth2 RTDS-deferral precedents). The convention is now load-bearing across the §9 surface: any §9 row with a `RuntimeFeatureFlag` / `RuntimeFractionalPercent` / `RuntimePercent` proto field uses the same PARSE-REJECT-on-non-empty-runtime_key arm with byte-stable wording prefixed by the filter's short name. The 5-consecutive-row run is no longer an accident — it is the project-wide RTDS-deferral convention until the future Runtime/RTDS family phase lands. Future §9 rows authoring a fresh `*.RuntimeFeatureFlag` consumer SHOULD follow this convention without further ADR ceremony (the convention is now sufficiently established that an ADR-0125-style canonical roster amendment is the appropriate next step IF the Runtime/RTDS family phase does not absorb the convention first).
+
+**(c) Forward-pointer to the future Runtime/RTDS family phase.** When the Runtime/RTDS family phase lands (per ROADMAP "Runtime + hot restart family" row), the PARSE-REJECT Arm 12 lifts to a real runtime consultation: the `runtime_key != ""` path becomes a call to the runtime layer's `GetBoolean(key, defaultValue)` accessor; the default-application step extends to consult the runtime first + fall back to `default_value` on runtime miss. The byte-stable wording disappears from `compiled_config.go::parseRejectEnabledRuntimeKey` constant + the `Arm12_EnabledRuntimeKey_*` test rows convert to `Arm12_RuntimeConsult_*` behavioral tests asserting the runtime-driven enable/disable transitions. The forward-pointer is intentionally NOT placed in a §Future Work paragraph here (the deferral lives in the SPEC §8 "Items deferred to future phases" item 1; this ADR's §Consequences cross-references but does not duplicate the SPEC-level forward-pointer).
+
+**(d) Operator-facing migration note (forward-pointer to BEHAVIOR_CONTRACT.md).** The phase-21 BEHAVIOR_CONTRACT.md 7-edit bundle (Task 13 per SPEC §13 item D6) will land a `### Phase 21 forward-pointer notes` subsection covering this absent-`enabled`-defaults-OFF semantics — specifically the operator-readable wording "if your `adaptive_concurrency` filter config omits the `enabled` field entirely, OR sets `enabled.default_value` to `false`, OR sets `enabled.default_value.value` to `false`, the filter is OFF and pass-through Continues without consulting the gradient controller — this matches upstream byte-equivalently and is a deliberate departure from the natural 'configuring a filter implies enabling it' intuition". Until Task 13 lands the BEHAVIOR_CONTRACT.md edit, this ADR's §Consequences (a) above is the canonical operator-facing landing; Task 13 will move the operator-readable wording to BEHAVIOR_CONTRACT.md + leave the implementer-facing details here.
+
+**Cross-references at IMPL Task 2 landing:** ADR-0044 (in-place edit discipline — this §Decision+§Consequences REPLACES the SPEC-commit anticipation block in this same commit); ADR-0072 (boot-time-fail-fast — Arm 12's HCM-parse-time error path); ADR-0080 (envoy-go-strict departure discipline + byte-stable error wording — the `TestParseRejectConstants_ByteStable/Arm12` enforcement); ADR-0186 (paired ADR at same SPEC commit anchor — the controller-state-machine consumer of `cc.enabled` at Task 3 controller materialization); phase-17 ADR-0146 + phase-18 ADR-0156 + phase-19 ADR-0163 + phase-20 ADR-0179 (the 4 prior consecutive §9-row RTDS-deferral precedents this ADR extends to 5-consecutive); phase-21 SPEC §1.1 AMEND-4 (the REFUTATION-of-BRAINSTORM-§2.1 source); phase-21 SPEC §5.2 row 1 (the canonical Arm-12 operator-facing landing); phase-21 SPEC §8 item 1 (the §Future Work-equivalent forward-pointer); phase-21 SPEC §13 item D6 (the BEHAVIOR_CONTRACT.md forward-pointer to Task 13); phase-21 BRAINSTORM Q1 (Pragmatic-middle posture); phase-21 PLAN D2 (the byte-stable wording reference roster); phase-21 IMPL Task 2 `internal/filter/http/adaptive_concurrency/compiled_config.go` (the Arm-12 call-site + the `parseRejectEnabledRuntimeKey` constant declaration); phase-21 IMPL Task 2 `internal/filter/http/adaptive_concurrency/compiled_config_test.go` (the `Arm12_EnabledRuntimeKey_DefaultFalse` + `Arm12_EnabledRuntimeKey_DefaultTrue` + `Enabled_Absent_DefaultsToFalse` + `Enabled_DefaultValueFalse_StaysFalse` + `Enabled_DefaultValueAbsent_DefaultsToFalse` + `TestParseRejectConstants_ByteStable/Arm12` test rows).
 
 ---
 

@@ -25,6 +25,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/http/adaptive_concurrency"
 	"github.com/esalaine/envoy-go/internal/filter/http/bandwidthlimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/buffer"
 	"github.com/esalaine/envoy-go/internal/filter/http/compressor"
@@ -122,6 +123,7 @@ func main() {
 	// wiring per PLAN.
 	httpReg := filter_http.NewHTTPRegistry()
 	httpReg.Register(router.TypeURL, router.New)
+	httpReg.Register(adaptive_concurrency.TypeURL, adaptive_concurrency.New)
 	httpReg.Register(bandwidthlimit.TypeURL, bandwidthlimit.New)
 	httpReg.Register(buffer.TypeURL, buffer.New)
 	httpReg.Register(compressor.TypeURL, compressor.New)
