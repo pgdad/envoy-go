@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/jwks"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -315,9 +316,17 @@ func buildCompiledConfig(c *jwt_authnv3.JwtAuthentication, ctx envoyhttp.Factory
 	}
 
 	// Parse providers map.
+	//
+	// Per ADR-0150 §Decision AMENDMENT (phase-20 IMPL Task 2b): the shared
+	// `*httpclient.Client` (FactoryCtx.HTTPClient) is threaded into
+	// buildCompiledProvider for the RemoteJwks path's `jwks.New` constructor.
+	// Nil-tolerant: when FactoryCtx.HTTPClient is nil (test code), the jwks
+	// Fetcher allocates its own per-Fetcher default `*httpclient.Client`
+	// preserving the phase-17-pinned 30-second per-request timeout per
+	// ADR-0150 §Decision AMENDMENT + ADR-0085 nil-tolerance.
 	providers := make(map[string]*compiledProvider, len(c.GetProviders()))
 	for name, p := range c.GetProviders() {
-		cp, err := buildCompiledProvider(name, p)
+		cp, err := buildCompiledProvider(name, p, ctx.HTTPClient)
 		if err != nil {
 			return nil, fmt.Errorf("jwt_authn: provider %q: %w", name, err)
 		}
@@ -375,7 +384,14 @@ func buildCompiledConfig(c *jwt_authnv3.JwtAuthentication, ctx envoyhttp.Factory
 // Task 3 per ADR-0150) and LocalJwks (lands Task 4 per ADR-0151) paths return
 // sentinel errors; the neither-set case PARSE-REJECTS per §11.P9 defensive
 // PGV-mirror.
-func buildCompiledProvider(name string, p *jwt_authnv3.JwtProvider) (*compiledProvider, error) {
+//
+// Per ADR-0150 §Decision AMENDMENT (phase-20 IMPL Task 2b): the `httpClient`
+// parameter is the shared `*httpclient.Client` framework primitive
+// (ADR-0177) threaded from FactoryCtx.HTTPClient. The RemoteJwks branch
+// passes it to `jwks.New` per ADR-0150 §Decision AMENDMENT. Nil-tolerant:
+// nil httpClient lets the jwks Fetcher allocate its own per-Fetcher default
+// preserving the phase-17-pinned 30-second per-request timeout.
+func buildCompiledProvider(name string, p *jwt_authnv3.JwtProvider, httpClient *httpclient.Client) (*compiledProvider, error) {
 	_ = name // currently unused in the Task 2 stub; reserved for richer error wording at Task 3+4.
 	cp := &compiledProvider{
 		issuer:               p.GetIssuer(),
@@ -421,11 +437,18 @@ func buildCompiledProvider(name string, p *jwt_authnv3.JwtProvider) (*compiledPr
 		}
 		// Translate proto → jwks types. The task 7 provider.go refactor MAY
 		// migrate these helpers; at Task 3 they live inline here.
+		//
+		// Per ADR-0150 §Decision AMENDMENT (phase-20 IMPL Task 2b): the
+		// shared `*httpclient.Client` framework primitive is threaded as
+		// the 5th constructor argument. Nil-tolerant per the AMENDMENT —
+		// nil lets the Fetcher allocate its own per-Fetcher default
+		// preserving the phase-17-pinned 30-second per-request timeout.
 		fetcher, err := jwks.New(
 			src.RemoteJwks.GetHttpUri().GetUri(),
 			cacheDurationFromProto(src.RemoteJwks.GetCacheDuration()),
 			asyncFetchFromProto(src.RemoteJwks.GetAsyncFetch()),
 			retryPolicyFromProto(src.RemoteJwks.GetRetryPolicy()),
+			httpClient,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("remote_jwks fetcher init: %w", err)

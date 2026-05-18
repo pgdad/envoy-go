@@ -13,6 +13,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -54,6 +55,14 @@ type ListenerCtx struct {
 	HasTLS            bool
 	AllowH2C          bool
 	ListenerPrincipal string
+	// HTTPClient is the shared `*httpclient.Client` framework primitive
+	// (ADR-0177) threaded into per-filter factories via FactoryCtx.HTTPClient
+	// at parseHTTPFiltersChain time. Nil-tolerant — per-consumer defaults
+	// apply (jwks Fetcher allocates its own per-Fetcher default preserving
+	// the phase-17-pinned 30s per-request timeout; extauthz httpAuthClient
+	// does likewise). Phase 20 first-use anchor per ADR-0150 §Decision
+	// AMENDMENT + ADR-0159 §Decision AMENDMENT.
+	HTTPClient *httpclient.Client
 }
 
 // Filter is the per-listener HTTP connection manager. It owns the resolved
@@ -214,7 +223,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, fmt.Errorf("hcm: route_config: virtual_hosts[0]: domains: got %v, want [\"*\"]", domains)
 	}
 
-	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), clusters, httpRegistry, registry, statPrefix)
+	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), clusters, lc.HTTPClient, httpRegistry, registry, statPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +307,7 @@ func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteC
 // fields gracefully (per ADR-0085 nil-tolerance pattern); registry may be
 // non-nil unconditionally — non-stat-bearing factories simply do not consume
 // it.
-func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, clusters *cluster.Manager, httpRegistry *filter_http.HTTPRegistry, registry *stats.Registry, statPrefix string) ([]chainEntry, error) {
+func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, clusters *cluster.Manager, httpClient *httpclient.Client, httpRegistry *filter_http.HTTPRegistry, registry *stats.Registry, statPrefix string) ([]chainEntry, error) {
 	// Build the (name, type_url) entries for ValidateChainShape. Defensive
 	// nil-typed_config handling: the empty-string TypeURL never matches a
 	// registered factory, so the rule-#4 branch fires with a clear message.
@@ -322,7 +331,7 @@ func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, clusters *cluster.Manage
 		if tc, ok := f.GetConfigType().(*hcmv3.HttpFilter_TypedConfig); ok {
 			tcAny = tc.TypedConfig
 		}
-		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry, Stats: registry, StatPrefix: statPrefix, ClusterManager: clusters})
+		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry, Stats: registry, StatPrefix: statPrefix, ClusterManager: clusters, HTTPClient: httpClient})
 		if err != nil {
 			return nil, fmt.Errorf("hcm: http_filters[%d]: factory: %w", i, err)
 		}

@@ -2280,7 +2280,7 @@ func TestEvaluateProvider_RemoteJwks_FetchSuccess_Counter(t *testing.T) {
 		_, _ = w.Write([]byte(jwksJSON))
 	}))
 	defer srv.Close()
-	fetcher, err := jwks.New(srv.URL, 5*time.Minute, nil, nil)
+	fetcher, err := jwks.New(srv.URL, 5*time.Minute, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("jwks.New: %v", err)
 	}
@@ -2341,6 +2341,7 @@ func TestEvaluateProvider_RemoteJwks_FetchFailure_Counter(t *testing.T) {
 		5*time.Minute,
 		&jwks.AsyncFetch{FastListener: true, FailedRefetchDuration: 30 * time.Second},
 		&jwks.RetryPolicy{NumRetries: 0, BaseInterval: 10 * time.Millisecond, MaxInterval: 20 * time.Millisecond},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("jwks.New: %v", err)
@@ -2395,7 +2396,7 @@ func TestEvaluateProvider_RemoteJwks_KidMismatch_Denied(t *testing.T) {
 		_, _ = w.Write([]byte(jwksJSON))
 	}))
 	defer srv.Close()
-	fetcher, err := jwks.New(srv.URL, 5*time.Minute, nil, nil)
+	fetcher, err := jwks.New(srv.URL, 5*time.Minute, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("jwks.New: %v", err)
 	}

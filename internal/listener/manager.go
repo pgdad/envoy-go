@@ -25,6 +25,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/hcm"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
+	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
 	"github.com/esalaine/envoy-go/internal/stats"
 	internaltls "github.com/esalaine/envoy-go/internal/tls"
@@ -59,6 +60,15 @@ type listenerCtx struct {
 	hasTLS            bool
 	allowH2C          bool
 	listenerPrincipal string
+	// httpClient is the shared `*httpclient.Client` framework primitive
+	// (ADR-0177) threaded from main.go through buildListenerRuntimeWithCtx
+	// + buildTerminalFilter into the hcm.TypeURL filterConstructor closure.
+	// Plumbed onward as hcm.ListenerCtx.HTTPClient → parseHTTPFiltersChain's
+	// FactoryCtx.HTTPClient. Nil-tolerant: nil at boot for non-outbound-HTTP
+	// listeners; per-consumer defaults apply at each filter's factory site.
+	// Phase 20 first-use anchor per ADR-0150 §Decision AMENDMENT + ADR-0159
+	// §Decision AMENDMENT.
+	httpClient *httpclient.Client
 }
 
 // filterConstructor builds a filterHandler from a typed_config Any, the
@@ -101,7 +111,7 @@ var filterRegistry = map[string]filterConstructor{
 		// extracted from the chain's leaf TLS cert into hcm.ListenerCtx so
 		// the HCM filter retains it for per-stream chain seeding via
 		// chain.SetListenerPrincipal.
-		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C, ListenerPrincipal: lc.listenerPrincipal}, registry, accessLogSinks, httpRegistry, dm)
+		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C, ListenerPrincipal: lc.listenerPrincipal, HTTPClient: lc.httpClient}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
@@ -238,7 +248,7 @@ type Manager struct {
 // freeze-after-boot). Task 20 wires the real boot-time population; until then
 // callers (test bootstraps) build a router-only frozen registry.
 func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.Registry, httpRegistry *filter_http.HTTPRegistry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil, nil)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil, nil, nil)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
@@ -250,7 +260,7 @@ func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.
 // Phase 06.1 (Task 10): see NewManager doc — same Registry contract applies.
 // Phase 07.1 (Task 14): see NewManager doc — same HTTPRegistry contract applies.
 func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, registry *stats.Registry, httpRegistry *filter_http.HTTPRegistry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil, nil)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil, nil, nil)
 }
 
 // NewManagerWithBaseDirAndAllowH2C is the phase-05.1 constructor variant. It
@@ -278,7 +288,7 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 // resolution. May be nil — but if any listener in bs has a non-empty
 // `listener_filters[]`, a non-nil frozen registry is required (the parser
 // errors otherwise).
-func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager) (*Manager, error) {
+func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client) (*Manager, error) {
 	ls := bs.GetStaticResources().GetListeners()
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
@@ -286,7 +296,7 @@ func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Man
 	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry, dm: dm}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm, httpClient)
 		if err != nil {
 			return nil, err
 		}
@@ -358,7 +368,7 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 // per SPEC §12. The phase-03 parse-time errors on `default_filter_chain` and
 // `listener_filters[]` (ADR-0033 clauses 3 and 8) are also superseded; both
 // fields are now honored.
-func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager) (*listenerRuntime, error) {
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -414,7 +424,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		// Phase 18.2 Task 4 (ADR-0165): listenerPrincipal pre-extracted from
 		// the chain's leaf TLS cert (URI SAN[0] → DNS SAN[0] → Subject CN);
 		// empty for plaintext chains.
-		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(chainTLS)}, registry, accessLogSinks, httpRegistry, dm)
+		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(chainTLS), httpClient: httpClient}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
@@ -473,7 +483,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 		// Per ADR-0080: default_filter_chain has an INDEPENDENT TLS posture
 		// from filter_chains[] — no mixed-TLS-rule cross-check here.
-		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(dfcTLS)}, registry, accessLogSinks, httpRegistry, dm)
+		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(dfcTLS), httpClient: httpClient}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, errUnwrapFilterChain(err))
 		}

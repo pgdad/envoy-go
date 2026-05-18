@@ -1,0 +1,79 @@
+# Fixture 0024-http-oauth2 — per-scenario wire-shape expectations.
+#
+# REFERENCE-LESS subject-only fixture per Task 12 scope decision. The
+# expectations below describe the wire-shape invariants the driver's
+# SubjectAsserter validates against subjBytes (the byte stream
+# DriveSubject emits). They are NOT cross-side byte-equal expectations
+# — the fixture does not spawn a reference Envoy at IMPL time.
+#
+# Each scenario block:
+#   - id        — short identifier per SPEC §7.1
+#   - listener  — l_test_a (default-enc) or l_test_c (forward_bearer_token=true)
+#   - request   — driver-issued request shape
+#   - assertions — substrings asserted against the encoded probe block
+#
+scenarios:
+  - id: c_pass_through
+    listener: l_test_a
+    request: GET / with X-Bypass-OAuth2: true
+    assertions:
+      status: 200
+      body_contains: '"path":"/"'
+      headers_present: []
+      counter_delta:
+        oauth_passthrough: 1
+
+  - id: e_signout
+    listener: l_test_a
+    request: GET /oauth/signout
+    assertions:
+      status: 302
+      body: ""
+      headers_present:
+        - 'set-cookie: BearerToken=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+        - 'set-cookie: OauthHMAC=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+        - 'set-cookie: OauthExpires=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+        - 'set-cookie: IdToken=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+        - 'set-cookie: RefreshToken=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+
+  - id: f_bad_state_401
+    listener: l_test_a
+    request: GET /oauth/callback?code=c&state=mismatched
+    assertions:
+      status: 401
+      body: "OAuth flow failed."
+      headers_present:
+        - 'set-cookie: BearerToken=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+      counter_delta:
+        oauth_unauthorized_rq: 1
+
+  - id: f2_post_callback_parse_reject
+    listener: l_test_a
+    request: POST /oauth/callback?code=c&state=s
+    assertions:
+      status: 401
+      body: "OAuth flow failed."
+      counter_delta:
+        oauth_unauthorized_rq: 1
+
+  - id: a_sign_in_challenge_wire_shape
+    listener: l_test_a
+    request: GET / (no cookies)
+    assertions:
+      status: 302
+      body: ""
+      headers_present:
+        - 'set-cookie: BearerToken=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+        - 'location: http://127.0.0.1:%OAUTHPORT%/authorize'
+
+  - id: b1_cookie_passthrough_forward_bearer_token
+    listener: l_test_c
+    request: GET / with valid 5-cookie envelope
+    assertions:
+      status: 200
+      body_contains: '"path":"/"'
+      # The forward_bearer_token=true wire shape injects an
+      # Authorization: Bearer <plaintext> header onto the upstream
+      # request; the echobackend reflects request headers in its JSON
+      # response body — the body should contain "authorization":"Bearer ...".
+      body_contains_authorization: true

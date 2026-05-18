@@ -37,8 +37,10 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"
 	"github.com/esalaine/envoy-go/internal/filter/http/jwtauthn"
 	"github.com/esalaine/envoy-go/internal/filter/http/localratelimit"
+	"github.com/esalaine/envoy-go/internal/filter/http/oauth2"
 	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
@@ -132,11 +134,18 @@ func main() {
 	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
 	httpReg.Register(jwtauthn.TypeURL, jwtauthn.New)
 	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
+	httpReg.Register(oauth2.TypeURL, oauth2.New)
 	httpReg.Register(rbac.TypeURL, rbac.New)
 	// Register header_mutation per-route validator before Freeze (the registry
 	// rejects registrations after Freeze; New is called post-Freeze during
 	// listener construction, so it cannot call RegisterPerRouteValidator itself).
 	header_mutation.RegisterPerRouteValidator(httpReg)
+	// Phase-20 Task 11: register the oauth2 per-route validator BEFORE Freeze
+	// per SPEC §5.2 + planner-time D2 (HCM-parse-time PARSE-REJECT for any
+	// TPFC placement at route or virtualHost level). The v1.37.x oauth2 proto
+	// has NO OAuth2PerRoute message at all per §20.P7 RATIFIED — the validator
+	// rejects UNCONDITIONALLY with the byte-stable D2 wording.
+	oauth2.RegisterPerRouteValidator(httpReg)
 	httpReg.Freeze()
 
 	// Phase 07.2 Task 11 boot wiring: build the
@@ -156,7 +165,18 @@ func main() {
 	lfReg.Register(tls_inspector.TypeURL, tls_inspector.New)
 	lfReg.Freeze()
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr)
+	// Phase-20 Task 2b (ADR-0177 + ADR-0150 §Decision AMENDMENT): construct
+	// the shared *httpclient.Client singleton AT BOOT for cross-phase reuse
+	// by jwks Fetcher (this Task 2b) + extauthz httpAuthClient (Task 2c) +
+	// oauth2 token_endpoint POST (Task 10). Per planner-time D8 the
+	// singleton uses Options{Timeout: 30s} — matches the phase-17-pinned
+	// per-request timeout discipline preserved by ADR-0150 §Decision
+	// AMENDMENT + the phase-18.1 zero-retry posture preserved by ADR-0159
+	// §Decision AMENDMENT. Threaded into the listener manager + via
+	// hcm.ListenerCtx{HTTPClient: ...} into per-filter FactoryCtx.HTTPClient.
+	httpClient := httpclient.New(httpclient.Options{Timeout: 30 * time.Second})
+
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr, httpClient)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

@@ -120,7 +120,7 @@ func rsaJWKSetJSON(t *testing.T) []byte {
 // ----------------------------------------------------------------------------
 
 func TestNew_MissingURI_ReturnsError(t *testing.T) {
-	f, err := New("", 1*time.Minute, nil, nil)
+	f, err := New("", 1*time.Minute, nil, nil, nil)
 	if err == nil {
 		t.Fatalf("New(\"\"): want error, got nil")
 	}
@@ -139,7 +139,7 @@ func TestNew_BlockingInitialFetch_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 1*time.Minute, nil, nil)
+	f, err := New(srv.URL, 1*time.Minute, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestNew_BlockingInitialFetch_HTTPFailure_ReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(srv.URL, 1*time.Minute, nil, &RetryPolicy{NumRetries: 0, BaseInterval: 10 * time.Millisecond, MaxInterval: 20 * time.Millisecond})
+	_, err := New(srv.URL, 1*time.Minute, nil, &RetryPolicy{NumRetries: 0, BaseInterval: 10 * time.Millisecond, MaxInterval: 20 * time.Millisecond}, nil)
 	if err == nil {
 		t.Fatalf("New: want error on persistent 500, got nil")
 	}
@@ -178,7 +178,7 @@ func TestNew_BlockingInitialFetch_BadJSON_ReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(srv.URL, 1*time.Minute, nil, &RetryPolicy{NumRetries: 0, BaseInterval: 10 * time.Millisecond})
+	_, err := New(srv.URL, 1*time.Minute, nil, &RetryPolicy{NumRetries: 0, BaseInterval: 10 * time.Millisecond}, nil)
 	if err == nil {
 		t.Fatalf("New: want error on garbage JSON, got nil")
 	}
@@ -199,7 +199,7 @@ func TestNew_NonBlockingInitialFetch_ReturnsImmediately(t *testing.T) {
 	defer close(gate)
 
 	start := time.Now()
-	f, err := New(srv.URL, 1*time.Minute, &AsyncFetch{FastListener: true}, nil)
+	f, err := New(srv.URL, 1*time.Minute, &AsyncFetch{FastListener: true}, nil, nil)
 	if err != nil {
 		t.Fatalf("New(fast_listener=true): %v", err)
 	}
@@ -221,7 +221,7 @@ func TestNew_NonBlockingInitialFetch_AfterCompletes_Get_ReturnsCached(t *testing
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 1*time.Minute, &AsyncFetch{FastListener: true}, nil)
+	f, err := New(srv.URL, 1*time.Minute, &AsyncFetch{FastListener: true}, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestGet_AfterClose_ReturnsErrJwksClosed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 1*time.Minute, nil, nil)
+	f, err := New(srv.URL, 1*time.Minute, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestRefresh_FiresAtCacheDurationMinus5s(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 100*time.Millisecond, nil, nil)
+	f, err := New(srv.URL, 100*time.Millisecond, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestRefresh_CacheDurationUnderFiveSeconds_RefreshesImmediately(t *testing.T
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 1*time.Second, nil, nil)
+	f, err := New(srv.URL, 1*time.Second, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -332,7 +332,8 @@ func TestFailedRefetch_FiresAtFixedInterval_NotExponential(t *testing.T) {
 	// having no retries lets us observe the fixed-interval pacing.
 	f, err := New(srv.URL, 100*time.Millisecond,
 		&AsyncFetch{FailedRefetchDuration: 50 * time.Millisecond},
-		&RetryPolicy{NumRetries: 0, BaseInterval: 5 * time.Millisecond})
+		&RetryPolicy{NumRetries: 0, BaseInterval: 5 * time.Millisecond},
+		nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -590,7 +591,7 @@ func TestClose_StopsRefreshGoroutine(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 100*time.Millisecond, nil, nil)
+	f, err := New(srv.URL, 100*time.Millisecond, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -616,7 +617,7 @@ func TestClose_Idempotent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 1*time.Minute, nil, nil)
+	f, err := New(srv.URL, 1*time.Minute, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -637,7 +638,7 @@ func TestConcurrent_GetAndRefresh_NoRace(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 50*time.Millisecond, nil, nil)
+	f, err := New(srv.URL, 50*time.Millisecond, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -683,7 +684,7 @@ func TestRetryPolicy_InnerHTTPRequest_RetriedOnFailure(t *testing.T) {
 		NumRetries:   2,
 		BaseInterval: 10 * time.Millisecond,
 		MaxInterval:  20 * time.Millisecond,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -706,7 +707,7 @@ func TestRetryPolicy_NumRetriesExhausted_FetchFails(t *testing.T) {
 		NumRetries:   2,
 		BaseInterval: 5 * time.Millisecond,
 		MaxInterval:  10 * time.Millisecond,
-	})
+	}, nil)
 	if err == nil {
 		t.Fatalf("New: want error after retries exhausted, got nil")
 	}
@@ -734,7 +735,7 @@ func TestRetryPolicy_Nil_UsesDefaults(t *testing.T) {
 	// real 1s by using a very short upstream-deadline strategy is not
 	// possible here. Accept the cost OR document that the test uses an
 	// override. We override here for speed.
-	_, err := New(srv.URL, 1*time.Minute, nil, &RetryPolicy{NumRetries: 1, BaseInterval: 5 * time.Millisecond, MaxInterval: 10 * time.Millisecond})
+	_, err := New(srv.URL, 1*time.Minute, nil, &RetryPolicy{NumRetries: 1, BaseInterval: 5 * time.Millisecond, MaxInterval: 10 * time.Millisecond}, nil)
 	if err == nil {
 		t.Fatalf("New: want error, got nil")
 	}
@@ -752,7 +753,7 @@ func TestNew_DefaultCacheDuration_TenMinutes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := New(srv.URL, 0, nil, nil)
+	f, err := New(srv.URL, 0, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

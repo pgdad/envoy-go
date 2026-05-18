@@ -1334,7 +1334,7 @@ func TestNewManager_ChainSelectionPropagation(t *testing.T) {
 	// bootstrap to declare the filter so SelectChain sees inputs.ServerName.
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1502,7 +1502,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1522,7 +1522,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
@@ -1682,7 +1682,7 @@ func TestParseListenerFiltersResolvesViaRegistry(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1712,7 +1712,7 @@ func TestParseListenerFiltersUnknownTypeURLErrors(t *testing.T) {
 		}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown listener-filter type_url, got nil")
 	}
@@ -2089,7 +2089,7 @@ func TestParseListenerFiltersNilRegistryErrors(t *testing.T) {
 		ListenerFilters: []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for non-empty listener_filters[] with nil lfRegistry, got nil")
 	}
@@ -2317,7 +2317,7 @@ func TestUnifiedDispatchTLSWithSNI(t *testing.T) {
 	})
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2581,7 +2581,7 @@ func TestManager_Drain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2600,7 +2600,7 @@ func TestManager_DrainIdempotent(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
 	m.Drain()
 	m.Drain()
 	m.Drain()
@@ -2617,7 +2617,7 @@ func TestManager_AcceptDuringDrainClosesConn(t *testing.T) {
 		mkListener("l_tcp_drain", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(1 * time.Hour)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := m.Start(ctx); err != nil {
@@ -2646,7 +2646,7 @@ func TestManager_StopAfterDrain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_ = m.Start(ctx)

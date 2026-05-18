@@ -325,6 +325,27 @@ const (
 	// in-process accept counter is NOT incremented. Introduced by phase 19.1
 	// Task 13 / fixture 0022.
 	HTTPExtProcGRPC BackendKind = 19
+	// HTTPOAuth2 reuses the existing echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for the upstream route
+	// (cluster c_backend; cookie-passthrough scenarios + sign-in success leg
+	// proxy through this backend) + the NEW oauthbackend helper at
+	// test/helpers/oauthbackend/ for the in-process OAuth 2.0 authorization-
+	// server mock (token_endpoint POST + authorization_endpoint 302). 2- or
+	// 3-listener topology depending on the IMPL-time `disable_token_encryption`
+	// disposition: at phase 20 the go-control-plane v1.32.4 proto lacks the
+	// field so only `l_test_a` (default-encryption) + `l_test_c`
+	// (forward_bearer_token=true) are exercised; `l_test_b`
+	// (disable_token_encryption=true) is DEFERRED to a future
+	// go-control-plane bump per the Task 12 scope decision documented in
+	// fixture 0024 README + PROGRESS. No TLS — phase 20 fixture is HTTP/1.1
+	// plaintext downstream + plaintext h2c absent (the token_endpoint POST is
+	// HTTP/1.1 per RFC 6749 + ADR-0185). The oauthbackend helper is lifecycle-
+	// managed BY THE DRIVER because it needs per-scenario Script registrations
+	// + per-scenario teardown for the 5xx / 4xx error legs (scenarios g + h).
+	// Both helpers run as subprocesses (echobackend) or in-process
+	// (oauthbackend); the runner's in-process accept counter is NOT
+	// incremented. Introduced by phase 20 Task 12 / fixture 0024.
+	HTTPOAuth2 BackendKind = 20
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

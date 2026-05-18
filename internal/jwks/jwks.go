@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/esalaine/envoy-go/internal/httpclient"
 )
 
 // ----------------------------------------------------------------------------
@@ -145,12 +147,21 @@ type JWK struct {
 
 // Fetcher is an opaque HTTP-outbound JWKS fetcher with async background
 // refresh and thread-safe cache. One per RemoteJwks JwtProvider.
+//
+// Per ADR-0150 §Decision AMENDMENT (phase-20 IMPL Task 2b): the Fetcher no
+// longer owns its own `*http.Client`; it consumes the shared
+// `*httpclient.Client` framework primitive (ADR-0177). The inner-HTTP retry
+// loop (the jwks-internal exponential `BaseInterval * 2^attempt` schedule)
+// is PRESERVED VERBATIM at the jwks consumer layer — `Options.RetryPolicy`
+// is left zero at the httpclient site because jwks's retry shape (exponential
+// per §11.P4 REFUTES BRAINSTORM) diverges from httpclient's fixed-
+// `PerAttemptDelay` shape (a deliberate consumer-layer choice).
 type Fetcher struct {
 	uri                   string
 	cacheDuration         time.Duration
 	failedRefetchDuration time.Duration
 	retryPolicy           *RetryPolicy
-	client                *http.Client
+	client                *httpclient.Client
 
 	mu           sync.Mutex
 	keys         *JWKSet
@@ -179,7 +190,16 @@ type Fetcher struct {
 // cacheDuration defaults to 10 minutes if zero (DefaultCacheExpirationSec).
 // retryPolicy is honored on each HTTP request via a retry loop honoring
 // NumRetries + BaseInterval + MaxInterval; nil retryPolicy uses defaults.
-func New(uri string, cacheDuration time.Duration, asyncFetch *AsyncFetch, retryPolicy *RetryPolicy) (*Fetcher, error) {
+//
+// Per ADR-0150 §Decision AMENDMENT (phase-20 IMPL Task 2b): `httpClient` is
+// the shared `*httpclient.Client` framework primitive (ADR-0177). A nil
+// `httpClient` allocates a per-Fetcher default `httpclient.New(httpclient.
+// Options{Timeout: defaultHTTPClientTimeout})` preserving the phase-17-pinned
+// 30-second per-request timeout — supports test ergonomics (test sites pass
+// nil) AND the boot-time consumer's threading of the shared singleton (the
+// jwtauthn factory threads the shared `*httpclient.Client` from
+// `cmd/envoy-go/main.go` per the introduction-time-3-consumer pattern).
+func New(uri string, cacheDuration time.Duration, asyncFetch *AsyncFetch, retryPolicy *RetryPolicy, httpClient *httpclient.Client) (*Fetcher, error) {
 	if uri == "" {
 		return nil, ErrJwksMissingURI
 	}
@@ -195,12 +215,19 @@ func New(uri string, cacheDuration time.Duration, asyncFetch *AsyncFetch, retryP
 		fastListener = asyncFetch.FastListener
 	}
 
+	// Per ADR-0150 §Decision AMENDMENT: nil-tolerant default allocation
+	// preserves the phase-17-pinned per-request timeout when callers omit
+	// the shared singleton (test ergonomics + nil-tolerance per ADR-0085).
+	if httpClient == nil {
+		httpClient = httpclient.New(httpclient.Options{Timeout: defaultHTTPClientTimeout})
+	}
+
 	f := &Fetcher{
 		uri:                   uri,
 		cacheDuration:         cacheDuration,
 		failedRefetchDuration: failedRefetch,
 		retryPolicy:           retryPolicy,
-		client:                &http.Client{Timeout: defaultHTTPClientTimeout},
+		client:                httpClient,
 		ready:                 make(chan struct{}),
 	}
 
@@ -439,6 +466,14 @@ func (f *Fetcher) doFetch(ctx context.Context) (*JWKSet, error) {
 
 // doHTTPGet performs one HTTP GET against f.uri; returns body bytes on 2xx or
 // an error.
+//
+// Per ADR-0150 §Decision AMENDMENT (phase-20 IMPL Task 2b): delegates to the
+// shared `*httpclient.Client.Do` method (ADR-0177). The `Do` signature is
+// bit-for-bit identical to `(*http.Client).Do` so the call-site shape is
+// unchanged; only the receiver type changed (from `*http.Client` to
+// `*httpclient.Client`). The jwks-internal exponential retry schedule
+// (§11.P4 REFUTES BRAINSTORM) is preserved in `doFetch` above; the
+// httpclient `Options.RetryPolicy` is left zero at the jwks consumer site.
 func (f *Fetcher) doHTTPGet(ctx context.Context) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.uri, nil)
 	if err != nil {

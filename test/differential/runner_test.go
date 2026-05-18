@@ -46,6 +46,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0021-http-ext-authz-grpc/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0022-http-ext-proc-grpc/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0023-http-ext-proc-body/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0024-http-oauth2/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 )
 
@@ -492,6 +493,39 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// extprocgrpc helper runs in-process, the runner's in-process
 			// accept counter is NOT incremented. Scenario 5 (failure_mode_allow)
 			// stops the extprocgrpc server before the request.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPOAuth2:
+			// Fixture 0024-http-oauth2 (phase 20) reuses the SHARED
+			// echobackend binary (phase-14 Task 10) for the upstream route
+			// (cluster c_backend; cookie-passthrough scenarios b1 + b2 +
+			// sign-in success leg proxy through this backend). The
+			// in-process OAuth 2.0 authorization-server mock
+			// (test/helpers/oauthbackend/) is lifecycle-managed BY THE
+			// DRIVER (Task 12) because it needs per-scenario Script
+			// registrations (token_endpoint POST 200/4xx/5xx variants +
+			// authorization_endpoint 302); this switch-case only allocates
+			// the upstream echo backend. Plaintext-only per phase-20 SPEC
+			// §7 (no TLS in phase 20 downstream + plaintext h2c absent —
+			// the token_endpoint POST is HTTP/1.1 per RFC 6749 + ADR-0185).
+			// Because the echo backend runs as a subprocess and the
+			// oauthbackend helper runs in-process, the runner's in-process
+			// accept counter is NOT incremented.
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)

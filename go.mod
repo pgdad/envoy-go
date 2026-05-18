@@ -7,6 +7,7 @@ require (
 	github.com/docker/docker v24.0.7+incompatible
 	github.com/docker/go-connections v0.4.0
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/testcontainers/testcontainers-go v0.27.0
 	golang.org/x/net v0.34.0
 	golang.org/x/sys v0.31.0

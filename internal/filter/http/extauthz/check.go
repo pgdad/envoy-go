@@ -3,15 +3,36 @@ package extauthz
 // check.go — HTTP-outbound auth-check primitive per ADR-0159 disposition (b).
 //
 // This file lands the thin ext_authz-local HTTP client — an `httpAuthClient`
-// type wrapping `*http.Client` + the configured `HttpService.server_uri.timeout`
-// + `path_prefix` — and the `checkFn` closure that performs the outbound POST
-// and maps the HTTP response to a `checkDisposition`.
+// type wrapping a `*httpclient.Client` (phase-20 ADR-0177 framework primitive)
+// configured with the proto `HttpService.server_uri.timeout` + `path_prefix`
+// — and the `checkFn` closure that performs the outbound POST and maps the
+// HTTP response to a `checkDisposition`.
 //
-// Design: disposition (b) per SPEC §3.1 + ADR-0159 — a thin local client that
-// mirrors the phase-17 `internal/jwks/Fetcher` outbound-HTTP `http.Client`/
-// timeout discipline WITHOUT the cache/async-refresh machinery. The two consumers
-// have structurally different lifecycles; generalizing into `internal/httpclient/`
-// is deferred to the THIRD outbound-HTTP consumer (a future `oauth2` phase).
+// Design history:
+//
+//  - Phase-18.1 (ADR-0159 §Decision (i)+(ii)): disposition (b) — a thin local
+//    client wrapping `*http.Client` directly, deferring the shared-primitive
+//    extraction to the THIRD outbound-HTTP consumer (a future `oauth2` phase).
+//    The two consumers (jwks Fetcher + ext_authz httpAuthClient) had
+//    structurally different lifecycles; generalizing then would have been
+//    premature.
+//
+//  - Phase-20 (ADR-0159 §Decision AMENDMENT + §Future Work CLOSURE-AT-PHASE-20):
+//    the THIRD outbound-HTTP consumer arrives (oauth2 token_endpoint POST at
+//    phase-20 IMPL Task 10 per ADR-0185). The phase-18.1 §Future Work
+//    forward-pointer ("third-consumer trigger condition") FIRES exactly as
+//    anticipated. Per ADR-0044 in-place edit discipline + the phase-20 SPEC
+//    §3.5 framework-survey result + ADR-0177 introduction: `httpAuthClient`
+//    refactors in-place to consume `*httpclient.Client` instead of owning its
+//    own `*http.Client`. The refactor is bit-for-bit BEHAVIORALLY EQUIVALENT
+//    — `*httpclient.Client.Do` has the same `(*http.Request) (*http.Response,
+//    error)` signature; per-request cancellable + zero-retry-default +
+//    OnDestroy-drives-cancel disciplines all preserved.
+//
+//  - **Phase-20 is the FIRST §9 family-row to CLOSE a prior-phase load-bearing
+//    forward-pointer per BRAINSTORM §11 Lesson (d).** Structurally important
+//    demonstration that the ADR-0044 §Future-Work forward-pointer-and-close
+//    discipline functions across phase boundaries.
 //
 // §5.P10 error-classification boundary:
 //   - HTTP 200              → dispAllow
@@ -63,34 +84,54 @@ import (
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/grpcclient"
+	"github.com/esalaine/envoy-go/internal/httpclient"
 )
 
 // httpAuthClient is the thin ext_authz-local HTTP client per ADR-0159
-// disposition (b). It wraps an `*http.Client` configured with the
-// `HttpService.server_uri.timeout` + the parsed `path_prefix`.
+// disposition (b). It wraps a `*httpclient.Client` (the phase-20 ADR-0177
+// framework primitive) configured with the `HttpService.server_uri.timeout`
+// + the parsed `path_prefix`.
+//
+// Per ADR-0159 §Decision AMENDMENT + §Future Work CLOSURE-AT-PHASE-20 (phase-20
+// IMPL Task 2c): the `httpAuthClient` no longer owns its own `*http.Client` —
+// it composes against the shared `*httpclient.Client` framework primitive
+// (ADR-0177). The refactor is bit-for-bit BEHAVIORALLY EQUIVALENT to the
+// phase-18.1 inline `&http.Client{Timeout: timeout}` — the `*httpclient.
+// Client.Do` signature is identical to `(*http.Client).Do`; the per-request
+// cancellable + zero-retry-default + OnDestroy-drives-cancel disciplines are
+// preserved verbatim (Options.RetryPolicy left zero at the consumer site per
+// SPEC §20.P1 + planner-time D2).
 //
 // It does NOT carry:
 //   - a cache (unlike `internal/jwks/Fetcher`)
 //   - a background-refresh goroutine (unlike `internal/jwks/Fetcher`)
-//   - a retry policy (zero retry per D2)
+//   - a retry policy (zero retry per D2 — ADR-0177's Options.RetryPolicy
+//     zero-value preserves the upstream Envoy v1.37.2 wire default)
 //   - connection-management state (stateless per-request)
 //
-// The `httpAuthClient` is allocated once at `buildHTTPCheckFn` time (config-load
-// time) and is safely shared across all per-stream `checkFn` invocations (the
-// `*http.Client` is goroutine-safe per the net/http documentation).
+// The `httpAuthClient` is allocated once at `buildHTTPCheckFn` time (config-
+// load time) and is safely shared across all per-stream `checkFn` invocations
+// (the `*httpclient.Client` is goroutine-safe per ADR-0177 §Decision (iii)).
 type httpAuthClient struct {
-	client     *http.Client
+	client     *httpclient.Client
 	baseURL    string // the parsed base URL from server_uri.uri (scheme + host)
 	pathPrefix string // the path_prefix string (prepended to each request path)
 }
 
 // buildHTTPCheckFn constructs the HTTP-mode checkFn per SPEC §6.5 + ADR-0159.
 //
-// Steps per SPEC §6.5 (updated at Task 5 per ADR-0161):
+// Steps per SPEC §6.5 (updated at Task 5 per ADR-0161; refactored at phase-20
+// IMPL Task 2c per ADR-0159 §Decision AMENDMENT — see step 2):
 //  1. Validate server_uri set + non-empty uri (PGV-mirror — HttpService.server_uri
 //     is NOT PGV-required; the factory rejects an empty one).
-//  2. Construct the httpAuthClient: &http.Client{Timeout: hs.server_uri.timeout}
-//     (zero timeout = no timeout; ZERO retry per D2).
+//  2. Construct the httpAuthClient via the shared `*httpclient.Client` framework
+//     primitive (ADR-0177) — `client: httpclient.New(httpclient.Options{Timeout:
+//     hs.server_uri.timeout})` (zero timeout = no timeout; ZERO retry per D2).
+//     Per ADR-0159 §Decision AMENDMENT: the per-call Options-construction
+//     pattern keeps the per-server-URI timeout discipline intact (each
+//     HttpService config gets its own `*httpclient.Client` carrying the
+//     proto-configured timeout — semantically identical to the phase-18.1
+//     `&http.Client{Timeout: timeout}` per-call construction).
 //  3. Compile authorization_response matchers:
 //     - allowed_upstream_headers     → allowedUpstream (set/overwrite)
 //     - allowed_upstream_headers_to_append → allowedUpstreamApp (append)
@@ -99,8 +140,16 @@ type httpAuthClient struct {
 //
 // Signature note: updated at Task 5 to accept validateMutations bool (threaded
 // into the closure from compiledConfig.validateMutations parsed at config-load
-// time in buildCompiledConfig). The Task 3 signature `(hs) (checkFn, error)` is
-// extended to `(hs, validateMutations) (checkFn, error)` — minimal change.
+// time in buildCompiledConfig). The Task 3 signature `(hs) (checkFn, error)`
+// extended to `(hs, validateMutations) (checkFn, error)` at phase-18.1 Task 5;
+// further unchanged at phase-20 Task 2c (the *httpclient.Client lives at the
+// httpAuthClient level — the per-call Options-construction pattern keeps the
+// per-server-URI timeout local to buildHTTPCheckFn time, so no shared-singleton
+// thread is needed at this signature level. The shared singleton at FactoryCtx
+// is referenced indirectly — see the call-site at extauthz.go which receives
+// FactoryCtx but does not currently thread the shared singleton here; the
+// per-call construction discipline is the structurally cleaner choice given the
+// per-server-URI timeout binding).
 func buildHTTPCheckFn(hs *ext_authzv3.HttpService, validateMutations bool) (checkFn, error) {
 	// 1. Validate server_uri.uri (PGV-mirror).
 	if hs == nil || hs.GetServerUri() == nil || hs.GetServerUri().GetUri() == "" {
@@ -109,11 +158,16 @@ func buildHTTPCheckFn(hs *ext_authzv3.HttpService, validateMutations bool) (chec
 
 	uri := hs.GetServerUri().GetUri()
 
-	// 2. Construct the httpAuthClient.
+	// 2. Construct the httpAuthClient via httpclient.New (ADR-0177).
 	//    Timeout: use the proto durationpb.Duration if set; zero = no timeout.
+	//    RetryPolicy left zero per SPEC §20.P1 + planner-time D2 — upstream
+	//    Envoy v1.37.2 wire default is zero retry; ext_authz HttpService has
+	//    no retry-policy proto field. TLSConfig nil — TLS posture stays at
+	//    stdlib default (future mTLS extension fires per ADR-0177 §Consequences
+	//    forward-pointer).
 	timeout := durationpbToGo(hs.GetServerUri().GetTimeout())
 	hac := &httpAuthClient{
-		client:     &http.Client{Timeout: timeout},
+		client:     httpclient.New(httpclient.Options{Timeout: timeout}),
 		baseURL:    stripPath(uri),
 		pathPrefix: hs.GetPathPrefix(),
 	}

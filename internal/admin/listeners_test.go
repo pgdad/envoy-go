@@ -343,7 +343,7 @@ func mustLMFromBs(t *testing.T, bs *bootstrap.Bootstrap, cm *cluster.Manager) *l
 	httpReg.Freeze()
 	lfReg := listenerfilter.NewListenerFilterRegistry()
 	lfReg.Freeze()
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, "", false, bs.Stats, nil, httpReg, lfReg, nil)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, "", false, bs.Stats, nil, httpReg, lfReg, nil, nil)
 	if err != nil {
 		t.Fatalf("listener.NewManagerWithBaseDirAndAllowH2C: %v", err)
 	}

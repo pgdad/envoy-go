@@ -6,6 +6,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -269,6 +270,17 @@ type FactoryCtx struct {
 	// filters (per ADR-0085 nil-tolerance — the filter factory checks for nil
 	// before calling Get/Drain). Phase 18.2 first-use anchor.
 	ClusterManager *cluster.Manager
+	// HTTPClient is the shared `*httpclient.Client` framework primitive (per
+	// ADR-0177) threaded into per-filter factories that need to issue outbound
+	// HTTP requests (jwks Fetcher post-ADR-0150 §Decision AMENDMENT;
+	// extauthz httpAuthClient post-ADR-0159 §Decision AMENDMENT + §Future
+	// Work CLOSURE; oauth2 token_endpoint POST per ADR-0185). Non-nil at
+	// HCM-build time per the phase-20 IMPL landing; may be nil in test code
+	// that does not exercise outbound-HTTP-bearing filters (per ADR-0085
+	// nil-tolerance — each consumer applies its own per-consumer default per
+	// ADR-0150 §Decision AMENDMENT / ADR-0159 §Decision AMENDMENT).
+	// Phase 20 first-use anchor.
+	HTTPClient *httpclient.Client
 	// Future extensions (accesslog sinks) added per-family-phase as filter
 	// implementations require them.
 }
