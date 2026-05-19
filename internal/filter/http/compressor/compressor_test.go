@@ -3,6 +3,7 @@ package compressor
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -1106,6 +1108,10 @@ func (c *fakeCallbacks) DownstreamTLSServerName() string  { return "" }
 func (c *fakeCallbacks) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *fakeCallbacks) DownstreamProtocol() string       { return "" }
 func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *fakeCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
 // body-buffering framework primitive). Zero-value return; compressor does

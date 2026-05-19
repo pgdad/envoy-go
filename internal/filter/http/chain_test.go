@@ -3,6 +3,7 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -11,6 +12,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 )
 
 // recordingFilter logs each callback for assertion.
@@ -2447,5 +2452,297 @@ func TestEncoderCB_RunEncodeData_MultiChunkAccumulationAndRelease_EncodeBufLenCo
 	// THE LOAD-BEARING ASSERTION: cumulative distinct bytes == 700, NOT 1000.
 	if got, want := chain.encodeBufLen, 700; got != want {
 		t.Fatalf("encodeBufLen double-count regression: expected cumulative distinct bytes %d (chunkA 300 + chunkB 400 — each counted exactly once); got %d (would be 1000 under the pre-rework double-count of the released union)", want, got)
+	}
+}
+
+// --- ADR-0192 chain-side extension Group: tlsConnectionState + dynamicMetadata ---
+//
+// Phase-22.2 Task 5 adds 2 NEW chain fields per SPEC §3 + §3.4 + §11.5 + ADR-0192
+// §Decision body anticipation (the chain-side extension lives INSIDE ADR-0192
+// per Q13 WEAK HOLD — no separate ADR for chain-side extension):
+//
+//   tlsConnectionState  *tls.ConnectionState        (set-once BEFORE RunDecodeHeaders per ADR-0071)
+//   dynamicMetadata     *dynamicmetadata.Bucket     (initialized at chain construction; Reset at Destroy)
+//
+// NEW chain setters: SetTLSConnectionState, SetDynamicMetadata.
+// NEW callback accessors (decoder + encoder both): DownstreamTLSConnectionState, DynamicMetadata.
+//
+// Pattern: mirrors ADR-0144 / ADR-0165 plumbing — HCM dispatch (H1 connection.go
+// + H2 h2dispatch.go) seeds the chain via SetX before RunDecodeHeaders;
+// per-stream filter callbacks read the chain field verbatim.
+
+// adr0192Probe is a test-only StreamDecoderFilter + StreamEncoderFilter that
+// captures the result of the 2 new ADR-0192 callback accessors during
+// DecodeHeaders / EncodeHeaders. Mirrors callbackProbe.
+type adr0192Probe struct {
+	dcb DecoderFilterCallbacks
+	ecb EncoderFilterCallbacks
+
+	// Captured on the decode side.
+	decTLS      *tls.ConnectionState
+	decBucket   *dynamicmetadata.Bucket
+	decCaptured bool
+	// Captured on the encode side.
+	encTLS      *tls.ConnectionState
+	encBucket   *dynamicmetadata.Bucket
+	encCaptured bool
+}
+
+func (p *adr0192Probe) DecodeHeaders(http.Header, bool) FilterHeadersStatus {
+	p.decTLS = p.dcb.DownstreamTLSConnectionState()
+	p.decBucket = p.dcb.DynamicMetadata()
+	p.decCaptured = true
+	return Continue
+}
+func (p *adr0192Probe) DecodeData([]byte, bool) FilterDataStatus        { return DataContinue }
+func (p *adr0192Probe) DecodeTrailers(http.Header) FilterTrailersStatus { return TrailersContinue }
+func (p *adr0192Probe) SetDecoderCallbacks(cb DecoderFilterCallbacks)   { p.dcb = cb }
+
+func (p *adr0192Probe) EncodeHeaders(http.Header, bool) FilterHeadersStatus {
+	p.encTLS = p.ecb.DownstreamTLSConnectionState()
+	p.encBucket = p.ecb.DynamicMetadata()
+	p.encCaptured = true
+	return Continue
+}
+func (p *adr0192Probe) EncodeData([]byte, bool) FilterDataStatus        { return DataContinue }
+func (p *adr0192Probe) EncodeTrailers(http.Header) FilterTrailersStatus { return TrailersContinue }
+func (p *adr0192Probe) SetEncoderCallbacks(cb EncoderFilterCallbacks)   { p.ecb = cb }
+func (p *adr0192Probe) OnDestroy()                                      {}
+
+// newADR0192ProbeChain wires a single-filter chain (probe both decode + encode).
+func newADR0192ProbeChain(p *adr0192Probe) *FilterChain {
+	return NewFilterChain([]HTTPFilter{{Name: "probe", Decoder: p, Encoder: p}}, nil)
+}
+
+func TestFilterChain_SetTLSConnectionState_roundtrip(t *testing.T) {
+	// SetTLSConnectionState seeds the chain; the field is observable via the
+	// decoder + encoder callbacks verbatim. Pattern mirrors ADR-0144
+	// SetTLSPrincipals → DownstreamPrincipal().
+	seed := &tls.ConnectionState{
+		Version:    tls.VersionTLS13,
+		ServerName: "alpha.example.com",
+	}
+	chain := NewFilterChain([]HTTPFilter{}, nil)
+	chain.SetTLSConnectionState(seed)
+	if got := chain.tlsConnectionState; got != seed {
+		t.Errorf("expected chain.tlsConnectionState == seed; got %v", got)
+	}
+}
+
+func TestFilterChain_SetDynamicMetadata_roundtrip(t *testing.T) {
+	// SetDynamicMetadata overrides the chain-construction-initialized bucket.
+	// Useful for tests that want to inject a pre-populated bucket OR a
+	// shared bucket reference across chains.
+	chain := NewFilterChain([]HTTPFilter{}, nil)
+	newBucket := dynamicmetadata.NewBucket()
+	newBucket.Set("test.filter", "key", structpb.NewStringValue("value"))
+	chain.SetDynamicMetadata(newBucket)
+	if got := chain.dynamicMetadata; got != newBucket {
+		t.Errorf("expected chain.dynamicMetadata == newBucket; got %v", got)
+	}
+	// And the bucket carries its pre-set value through.
+	v, ok := chain.dynamicMetadata.Get("test.filter", "key")
+	if !ok {
+		t.Fatal("expected pre-set value to survive SetDynamicMetadata override")
+	}
+	if v.GetStringValue() != "value" {
+		t.Errorf("expected value=%q; got %q", "value", v.GetStringValue())
+	}
+}
+
+func TestFilterChain_constructor_initializes_dynamicMetadata_nonnil(t *testing.T) {
+	// NewFilterChain MUST initialize the dynamicMetadata bucket to a non-nil
+	// empty Bucket (per the Task 5 chain-construction discipline — the bucket
+	// is owned by the chain; filters/bridge consume it via the callback
+	// accessor). Per ADR-0190 NewBucket: returns an empty *Bucket with an
+	// allocated inner map.
+	chain := NewFilterChain([]HTTPFilter{}, nil)
+	if chain.dynamicMetadata == nil {
+		t.Fatal("expected chain.dynamicMetadata to be non-nil after NewFilterChain")
+	}
+	// Empty bucket — no entries.
+	_, ok := chain.dynamicMetadata.Get("any.filter", "key")
+	if ok {
+		t.Errorf("expected freshly-constructed bucket to be empty")
+	}
+	// Write + read round-trip to confirm the bucket is usable post-construction.
+	chain.dynamicMetadata.Set("test.filter", "k1", structpb.NewStringValue("v1"))
+	v, ok := chain.dynamicMetadata.Get("test.filter", "k1")
+	if !ok || v.GetStringValue() != "v1" {
+		t.Errorf("expected bucket to be usable post-construction; got ok=%v v=%v", ok, v)
+	}
+}
+
+func TestFilterChain_Destroy_resets_bucket(t *testing.T) {
+	// Destroy MUST clear the bucket's entries (per ADR-0190 Reset discipline)
+	// then nil out the chain's bucket field so subsequent accessors return
+	// nil. Per ADR-0085, the bucket's Reset is nil-tolerant — calling Reset
+	// after the field is nil-out (re-Destroy) is safe.
+	chain := NewFilterChain([]HTTPFilter{}, nil)
+	chain.dynamicMetadata.Set("test.filter", "k1", structpb.NewStringValue("v1"))
+	chain.dynamicMetadata.Set("test.filter", "k2", structpb.NewStringValue("v2"))
+
+	chain.Destroy()
+
+	if chain.dynamicMetadata != nil {
+		t.Fatalf("expected chain.dynamicMetadata nil-out after Destroy; got %v", chain.dynamicMetadata)
+	}
+	// Re-Destroy is idempotent (destroyOnce guard + nil-tolerant Reset).
+	chain.Destroy()
+	if chain.dynamicMetadata != nil {
+		t.Errorf("expected idempotent Destroy to keep dynamicMetadata nil; got %v", chain.dynamicMetadata)
+	}
+}
+
+func TestDecoderCB_DownstreamTLSConnectionState_returns_field(t *testing.T) {
+	// Decoder callback's DownstreamTLSConnectionState returns the chain's
+	// HCM-seeded *tls.ConnectionState verbatim. Mirrors ADR-0144's
+	// DownstreamPrincipal accessor pattern.
+	seed := &tls.ConnectionState{
+		Version:    tls.VersionTLS13,
+		ServerName: "beta.example.com",
+	}
+	probe := &adr0192Probe{}
+	chain := newADR0192ProbeChain(probe)
+	chain.SetTLSConnectionState(seed)
+	terminated, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunDecodeHeaders to terminate")
+	}
+	if !probe.decCaptured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.decTLS != seed {
+		t.Errorf("expected decoder DownstreamTLSConnectionState == seed; got %v", probe.decTLS)
+	}
+}
+
+func TestDecoderCB_DynamicMetadata_returns_field(t *testing.T) {
+	// Decoder callback's DynamicMetadata returns the chain's
+	// construction-initialized (or HCM/test-overridden) *Bucket verbatim.
+	// Pre-populated via Set before RunDecodeHeaders; the probe observes
+	// the same Bucket pointer.
+	probe := &adr0192Probe{}
+	chain := newADR0192ProbeChain(probe)
+	chain.dynamicMetadata.Set("filter.x", "key.y", structpb.NewStringValue("z"))
+	_, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.decCaptured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.decBucket != chain.dynamicMetadata {
+		t.Errorf("expected decoder DynamicMetadata == chain.dynamicMetadata; got %v vs %v", probe.decBucket, chain.dynamicMetadata)
+	}
+	v, ok := probe.decBucket.Get("filter.x", "key.y")
+	if !ok {
+		t.Fatal("expected probe bucket to carry the pre-set entry")
+	}
+	if v.GetStringValue() != "z" {
+		t.Errorf("expected value=%q; got %q", "z", v.GetStringValue())
+	}
+}
+
+func TestEncoderCB_DownstreamTLSConnectionState_returns_field(t *testing.T) {
+	// Encoder callback's DownstreamTLSConnectionState reads the SAME chain
+	// field the decoder side reads (per ADR-0033 shared-state discipline —
+	// the chain owns the field; both sides observe it).
+	seed := &tls.ConnectionState{
+		Version:    tls.VersionTLS12,
+		ServerName: "gamma.example.com",
+	}
+	probe := &adr0192Probe{}
+	chain := newADR0192ProbeChain(probe)
+	chain.SetTLSConnectionState(seed)
+	terminated, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true)
+	if err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !terminated {
+		t.Fatal("expected RunEncodeHeaders to terminate")
+	}
+	if !probe.encCaptured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.encTLS != seed {
+		t.Errorf("expected encoder DownstreamTLSConnectionState == seed; got %v", probe.encTLS)
+	}
+}
+
+func TestEncoderCB_DynamicMetadata_returns_field(t *testing.T) {
+	// Encoder callback's DynamicMetadata reads the SAME bucket the decoder
+	// side reads — cross-side bucket sharing within a single stream per
+	// ADR-0033 (per-stream sequential, no cross-filter concurrency).
+	probe := &adr0192Probe{}
+	chain := newADR0192ProbeChain(probe)
+	chain.dynamicMetadata.Set("filter.enc", "k", structpb.NewBoolValue(true))
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if !probe.encCaptured {
+		t.Fatal("expected probe EncodeHeaders to have run")
+	}
+	if probe.encBucket != chain.dynamicMetadata {
+		t.Errorf("expected encoder DynamicMetadata == chain.dynamicMetadata; got %v vs %v", probe.encBucket, chain.dynamicMetadata)
+	}
+	v, ok := probe.encBucket.Get("filter.enc", "k")
+	if !ok {
+		t.Fatal("expected encoder bucket to carry the pre-set entry")
+	}
+	if v.GetBoolValue() != true {
+		t.Errorf("expected value=true; got %v", v.GetBoolValue())
+	}
+}
+
+func TestChain_nil_tlsConnectionState_returns_nil_via_accessor(t *testing.T) {
+	// Default chain (no SetTLSConnectionState call) → accessors return nil.
+	// Mirrors the plaintext / non-mTLS connection semantic per SPEC §11.5
+	// + ADR-0144 §Decision (iii) lift: HCM dispatch does NOT seed
+	// tlsConnectionState on plaintext connections; the chain field stays nil.
+	probe := &adr0192Probe{}
+	chain := newADR0192ProbeChain(probe)
+	if _, err := chain.RunDecodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunDecodeHeaders: %v", err)
+	}
+	if !probe.decCaptured {
+		t.Fatal("expected probe DecodeHeaders to have run")
+	}
+	if probe.decTLS != nil {
+		t.Errorf("expected nil DownstreamTLSConnectionState on no-seed chain; got %v", probe.decTLS)
+	}
+	// Encoder side — same field, same nil semantic.
+	if _, err := chain.RunEncodeHeaders(context.Background(), http.Header{}, true); err != nil {
+		t.Fatalf("RunEncodeHeaders: %v", err)
+	}
+	if probe.encTLS != nil {
+		t.Errorf("expected nil encoder DownstreamTLSConnectionState on no-seed chain; got %v", probe.encTLS)
+	}
+}
+
+func TestChain_post_Destroy_DynamicMetadata_returns_nil(t *testing.T) {
+	// After Destroy, the chain's dynamicMetadata field is nil-out (per the
+	// Reset-then-nil-out Destroy discipline). The accessors on cached
+	// callback structs (held by tests) MUST return nil — which the
+	// ADR-0085 nil-tolerance discipline on Bucket consumers makes safe.
+	chain := NewFilterChain([]HTTPFilter{}, nil)
+	cbd := &decoderCB{c: chain, idx: 0}
+	cbe := &encoderCB{c: chain, idx: 0}
+	// Pre-Destroy: non-nil bucket.
+	if cbd.DynamicMetadata() == nil {
+		t.Fatal("expected non-nil DynamicMetadata pre-Destroy")
+	}
+	if cbe.DynamicMetadata() == nil {
+		t.Fatal("expected non-nil encoder DynamicMetadata pre-Destroy")
+	}
+	chain.Destroy()
+	if cbd.DynamicMetadata() != nil {
+		t.Errorf("expected nil DynamicMetadata post-Destroy; got %v", cbd.DynamicMetadata())
+	}
+	if cbe.DynamicMetadata() != nil {
+		t.Errorf("expected nil encoder DynamicMetadata post-Destroy; got %v", cbe.DynamicMetadata())
 	}
 }

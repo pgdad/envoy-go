@@ -1,12 +1,18 @@
 package hcm
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"math/big"
 	"net"
 	"net/url"
+	"sync"
 	"testing"
+	"time"
 )
 
 // Phase 16 Task 6 (ADR-0144): extractTLSPrincipals helper unit tests. Mirrors
@@ -197,5 +203,156 @@ func TestDownstreamTLSPrincipals_NilConn_ReturnsNil(t *testing.T) {
 	// (chain_dispatch_test + chain_integration_test + connection_test).
 	if got := downstreamTLSPrincipals(nil); got != nil {
 		t.Errorf("nil conn: want nil; got %#v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 22.2 Task 6 (ADR-0192) — downstreamTLSConnectionState helper-isolation
+// tests. Mirror the existing downstreamTLSPrincipals helper-in-isolation
+// strategy in this file (a Group-7 extraction-helper-in-isolation suite per
+// BOOTSTRAP_PROMPT). These tests exercise the new helper against the same set
+// of conn-state shapes the H1 + H2 dispatch paths produce in production:
+//   - nil conn               → nil
+//   - non-*tls.Conn          → nil
+//   - *tls.Conn pre-handshake → nil (HandshakeComplete=false guard)
+//   - *tls.Conn post-handshake (server-auth-only) → non-nil pointer carrying the
+//     handshake state (SNI, peer cert chain on the client side, etc.)
+//
+// Per SPEC §11.5.3 the helper does NOT gate on PeerCertificates length —
+// server-auth-only (non-mTLS) handshakes still produce a usable
+// *tls.ConnectionState (SNI / cipher suite / version are valid even without a
+// client cert). That contrasts with extractTLSPrincipals which gates on
+// len(PeerCertificates)==0 per ADR-0144.
+// ---------------------------------------------------------------------------
+
+func TestDownstreamTLSConnectionState_NilConn_ReturnsNil(t *testing.T) {
+	if got := downstreamTLSConnectionState(nil); got != nil {
+		t.Errorf("nil conn: want nil; got %#v", got)
+	}
+}
+
+func TestDownstreamTLSConnectionState_NonTLSConn_ReturnsNil(t *testing.T) {
+	// Non-*tls.Conn (plain net.Pipe pair) → nil. Plaintext listener / test
+	// conn-pair path produces this shape.
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
+	if got := downstreamTLSConnectionState(c1); got != nil {
+		t.Errorf("non-tls conn: want nil; got %#v", got)
+	}
+}
+
+func TestDownstreamTLSConnectionState_TLSConn_HandshakeIncomplete_ReturnsNil(t *testing.T) {
+	// *tls.Conn that has not yet completed its handshake → nil. Mirrors the
+	// extractTLSPrincipals HandshakeComplete guard so the bridge surface does
+	// NOT observe an unverified state.
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
+	tlsConn := stdtls.Server(c1, &stdtls.Config{})
+	// No Handshake() invocation; tlsConn.ConnectionState().HandshakeComplete
+	// is false.
+	if got := downstreamTLSConnectionState(tlsConn); got != nil {
+		t.Errorf("pre-handshake *tls.Conn: want nil; got HandshakeComplete=%v", got.HandshakeComplete)
+	}
+}
+
+// runInProcessTLSHandshake spins up a *tls.Server / *tls.Client over a
+// net.Pipe pair with a self-signed RSA / ECDSA leaf cert and drives the
+// handshake to completion. Returns the server-side *tls.Conn (post-handshake)
+// + a cleanup function. The server certificate's Subject.CommonName is
+// `serverCN`, the SNI presented by the client is `clientSNI`. Used by the
+// dispatchRequest end-to-end seeding tests.
+//
+// The helper is intentionally self-contained — no shared PKI fixtures — so
+// each test runs in <10ms with no external file dependencies.
+func runInProcessTLSHandshake(t *testing.T, serverCN string, clientSNI string) (*stdtls.Conn, func()) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: serverCN},
+		DNSNames:     []string{clientSNI},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("self-signed cert: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+	cert := stdtls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  key,
+		Leaf:        leaf,
+	}
+
+	serverConn, clientConn := net.Pipe()
+	serverTLS := stdtls.Server(serverConn, &stdtls.Config{
+		Certificates: []stdtls.Certificate{cert},
+		MinVersion:   stdtls.VersionTLS12,
+	})
+	clientTLS := stdtls.Client(clientConn, &stdtls.Config{
+		ServerName:         clientSNI,
+		InsecureSkipVerify: true, // self-signed test cert
+		MinVersion:         stdtls.VersionTLS12,
+	})
+
+	var wg sync.WaitGroup
+	var clientErr, serverErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		clientErr = clientTLS.Handshake()
+	}()
+	go func() {
+		defer wg.Done()
+		serverErr = serverTLS.Handshake()
+	}()
+	wg.Wait()
+	if clientErr != nil {
+		t.Fatalf("client handshake: %v", clientErr)
+	}
+	if serverErr != nil {
+		t.Fatalf("server handshake: %v", serverErr)
+	}
+	// Cleanup discipline: close the raw net.Pipe conns directly (NOT the
+	// stdtls.Conn wrappers). The tls.Conn.Close() path writes a close_notify
+	// alert and blocks waiting for the peer's close_notify; on a synchronous
+	// net.Pipe pair both sides block simultaneously and the test stalls 5s
+	// per dispatch waiting on the read deadline. Closing the raw pipe forces
+	// EOF on both readers immediately so the tls.Conn writers/readers
+	// terminate without waiting for the alert exchange.
+	cleanup := func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	}
+	return serverTLS, cleanup
+}
+
+func TestDownstreamTLSConnectionState_TLSConn_HandshakeComplete_ReturnsState(t *testing.T) {
+	// *tls.Conn post-handshake → non-nil pointer; ServerName carries the SNI
+	// presented by the client; HandshakeComplete is true. Per SPEC §11.5.3 the
+	// state is non-nil even for server-auth-only TLS (no client cert).
+	serverTLS, cleanup := runInProcessTLSHandshake(t, "server-cn-test", "sni.envoy-go.test")
+	defer cleanup()
+
+	got := downstreamTLSConnectionState(serverTLS)
+	if got == nil {
+		t.Fatal("post-handshake *tls.Conn: want non-nil *tls.ConnectionState; got nil")
+	}
+	if !got.HandshakeComplete {
+		t.Errorf("HandshakeComplete = false; want true")
+	}
+	if got.ServerName != "sni.envoy-go.test" {
+		t.Errorf("ServerName = %q; want %q", got.ServerName, "sni.envoy-go.test")
 	}
 }

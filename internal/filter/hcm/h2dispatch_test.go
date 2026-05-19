@@ -384,3 +384,122 @@ func TestH2Dispatcher_Match_IncDownstreamRqTotal(t *testing.T) {
 		t.Errorf("downstream_rq_total = %d, want 3 (one per Match call)", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 22.2 Task 6 (ADR-0192) — H2 tlsConnectionState seeding symmetric to H1
+// ---------------------------------------------------------------------------
+
+// h2TLSStateChainConfig wires a chainConfig=[capture, router] for the H2
+// seeding tests. Symmetric to the H1 mkTLSStateCapturingFilterForTable helper
+// in connection_test.go (uses the same *tlsStateCapturingFilter test-double
+// + shared-instance factory pattern).
+func h2TLSStateChainConfig(t *testing.T) (*tlsStateCapturingFilter, []chainEntry) {
+	t.Helper()
+	capture := &tlsStateCapturingFilter{}
+	captureFactory := func() filter_http.HTTPFilter {
+		return filter_http.HTTPFilter{
+			Name:    "tls-state-capture",
+			Decoder: capture,
+			Encoder: capture,
+		}
+	}
+	rfFactory, err := router.New(nil, filter_http.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	return capture, []chainEntry{
+		{name: "tls-state-capture", factory: captureFactory},
+		{name: "envoy.filters.http.router", factory: rfFactory},
+	}
+}
+
+// TestH2Dispatch_runH2_seeds_tlsConnectionState_symmetric drives the H2
+// dispatch path's chainDispatchAction.WriteH2 with the h2Dispatcher's
+// tlsConnectionState field pre-seeded (mirroring the runH2 connection-build-time
+// extraction). Asserts the chain's tlsConnectionState surfaces through to the
+// per-stream filter via decoderCB.DownstreamTLSConnectionState().
+//
+// Test mechanism: build the in-process TLS handshake-complete state via
+// runInProcessTLSHandshake (shared with the H1 connection_test path), pin its
+// *tls.ConnectionState onto a fresh h2Dispatcher.tlsConnectionState, run
+// Match → WriteH2 once, then assert capture.captured == the same
+// *tls.ConnectionState. Symmetric to the H1 seeding test.
+//
+// The runH2 helper itself is exercised separately (filter_test.go covers the
+// connection-build-time extraction at the runH2 site); this test asserts the
+// chainDispatchAction.WriteH2 SEAM seeds the chain field correctly given a
+// pre-populated dispatcher.
+func TestH2Dispatch_runH2_seeds_tlsConnectionState_symmetric(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	capture, chainCfg := h2TLSStateChainConfig(t)
+	f := newH2DispatchFilter(t, tt, chainCfg, nil /* no sinks */)
+
+	serverTLS, cleanup := runInProcessTLSHandshake(t, "h2-server-test", "h2.sni.envoy-go.test")
+	defer cleanup()
+	// Pre-extract the state once (mirrors runH2's connection-build-time
+	// extraction). The pointer identity is what we'll assert downstream.
+	state := downstreamTLSConnectionState(serverTLS)
+	if state == nil {
+		t.Fatal("downstreamTLSConnectionState returned nil on post-handshake conn; helper invariant violated")
+	}
+
+	disp := newH2Dispatcher(f)
+	disp.tlsConnectionState = state // simulates the runH2 connection-build seed
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/2.0"
+	action, ok := disp.Match(req)
+	if !ok {
+		t.Fatal("Match returned ok=false; want true on matched route")
+	}
+
+	w := &captureH2Writer{}
+	h2req := h2.H2Request{Method: "GET", Path: "/health", Authority: "h2.sni.envoy-go.test"}
+	if err := action.WriteH2(context.Background(), h2req, w); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	if capture.captured == nil {
+		t.Fatal("H2 path: captured = nil; want non-nil seeded *tls.ConnectionState")
+	}
+	if capture.captured != state {
+		t.Errorf("H2 path: captured pointer = %p; want %p (verbatim threading from dispatcher → chainDispatchAction → chain.SetTLSConnectionState)", capture.captured, state)
+	}
+	if capture.captured.ServerName != "h2.sni.envoy-go.test" {
+		t.Errorf("H2 path: captured.ServerName = %q; want %q", capture.captured.ServerName, "h2.sni.envoy-go.test")
+	}
+}
+
+// TestH2Dispatch_runH2_seeds_nil_for_plaintext_symmetric exercises the H2 plaintext
+// path: an h2Dispatcher with tlsConnectionState=nil (mirroring runH2 when the
+// downstream conn is not a *tls.Conn). The chain's tlsConnectionState stays
+// nil — symmetric to the H1 plaintext path in connection_test.go.
+func TestH2Dispatch_runH2_seeds_nil_for_plaintext_symmetric(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	capture, chainCfg := h2TLSStateChainConfig(t)
+	f := newH2DispatchFilter(t, tt, chainCfg, nil)
+
+	disp := newH2Dispatcher(f)
+	// disp.tlsConnectionState stays nil — plaintext.
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/2.0"
+	action, ok := disp.Match(req)
+	if !ok {
+		t.Fatal("Match: ok=false")
+	}
+
+	w := &captureH2Writer{}
+	h2req := h2.H2Request{Method: "GET", Path: "/health"}
+	if err := action.WriteH2(context.Background(), h2req, w); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	if capture.captured != nil {
+		t.Errorf("plaintext H2: captured = %#v; want nil", capture.captured)
+	}
+}

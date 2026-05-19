@@ -1,6 +1,7 @@
 package buffer
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
@@ -322,6 +324,10 @@ func (c *fakeCallbacks) DownstreamTLSServerName() string  { return "" }
 func (c *fakeCallbacks) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *fakeCallbacks) DownstreamProtocol() string       { return "" }
 func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *fakeCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // newBuffer constructs a []byte body chunk for DecodeData tests. nil → empty body (§11.11).
 func newBuffer(b []byte) []byte {

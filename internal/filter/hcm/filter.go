@@ -107,6 +107,17 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 func (f *Filter) runH2(ctx context.Context, downstream net.Conn) {
 	disp := newH2Dispatcher(f)
 	disp.tlsPrincipals = downstreamTLSPrincipals(downstream)
+	// Phase 22.2 Task 6 (ADR-0192): capture the FULL *tls.ConnectionState ONCE
+	// at H2 connection build time — symmetric to tlsPrincipals above and to
+	// the H1 path's per-request capture in dispatchRequest. The snapshot
+	// pointer threads into every per-stream chain via chainDispatchAction →
+	// chain.SetTLSConnectionState before RunDecodeHeaders dispatch.
+	// downstreamTLSConnectionState returns nil for plaintext / non-*tls.Conn /
+	// pre-handshake conns; the dispatcher field stays nil and the per-stream
+	// SetTLSConnectionState(nil) call is the documented nil-passthrough.
+	// Per SPEC §11.5.3 + ADR-0192 §Decision body anticipation (chain-side
+	// extension lives INSIDE ADR-0192 per Q13 WEAK HOLD).
+	disp.tlsConnectionState = downstreamTLSConnectionState(downstream)
 	// Phase 18.2 Task 4 (ADR-0165): capture the 4 per-connection callback-
 	// surface-extension fields ONCE at H2 connection build time — symmetric
 	// to tlsPrincipals + the H1 path's per-request capture in dispatchRequest.

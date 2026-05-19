@@ -17,6 +17,7 @@ package lua
 
 import (
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	luaprim "github.com/esalaine/envoy-go/internal/lua"
 )
@@ -719,6 +721,11 @@ func TestBridge_Log_EmptyMsg(t *testing.T) {
 // fakeCallbacks is a test-double satisfying RequestHandleCallbacks for
 // Task 8. Each field maps 1:1 to a method on the interface; tests
 // construct an instance with the canned values they want surfaced.
+// Task 9 (22.2) adds DynamicMetadata() — returns nil by default so the
+// existing Task 8 tests continue exercising the 4-method streamInfo
+// surface without dynamic-metadata interference; the metadata_test.go
+// fakeCallbacksWithBucket embeds this struct + overrides DynamicMetadata
+// to return a per-test *dynamicmetadata.Bucket.
 type fakeCallbacks struct {
 	proto      string
 	route      string
@@ -726,10 +733,24 @@ type fakeCallbacks struct {
 	remoteAddr string
 }
 
-func (f *fakeCallbacks) Protocol() string                      { return f.proto }
-func (f *fakeCallbacks) RouteName() string                     { return f.route }
-func (f *fakeCallbacks) DownstreamLocalAddress() string        { return f.localAddr }
-func (f *fakeCallbacks) DownstreamDirectRemoteAddress() string { return f.remoteAddr }
+func (f *fakeCallbacks) Protocol() string                                   { return f.proto }
+func (f *fakeCallbacks) RouteName() string                                  { return f.route }
+func (f *fakeCallbacks) DownstreamLocalAddress() string                     { return f.localAddr }
+func (f *fakeCallbacks) DownstreamDirectRemoteAddress() string              { return f.remoteAddr }
+func (f *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+func (f *fakeCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+
+// Task 13 (phase 22.2 IMPL) — RequestHandleCallbacks extension: 4 NEW
+// accessors (UpstreamHost / UpstreamCluster / RequestedServerName /
+// FilterState) + SetFilterState writeback. The base fakeCallbacks
+// type returns zero values for all 4 (sufficient for the Task 8 4-
+// method + Task 9 2-method tests; the Task 13 streamInfo_test.go +
+// filterstate_test.go consume the extended fakeCallbacksFull type).
+func (f *fakeCallbacks) UpstreamHost() string            { return "" }
+func (f *fakeCallbacks) UpstreamCluster() string         { return "" }
+func (f *fakeCallbacks) RequestedServerName() string     { return "" }
+func (f *fakeCallbacks) FilterState() map[string]any     { return nil }
+func (f *fakeCallbacks) SetFilterState(_ map[string]any) {}
 
 // newBridgedVMWithCallbacks is the per-test helper that constructs a VM
 // with the streamInfo metatable installed in addition to the request_handle
@@ -1291,9 +1312,427 @@ var (
 	_ func(*lua.LState) *lua.LTable = installResponseHandleMetatable
 	_ func(*lua.LState) *lua.LTable = installHeadersMetatable
 	_ func(*lua.LState) *lua.LTable = installStreamInfoMetatable
+	_ func(*lua.LState) *lua.LTable = installTrailersMetatable
 	_ func(*lua.LState)             = installPairsShim
 )
 
 // Avoid unused-import warning for fmt — used in the test descriptor
 // strings for sub-test enumeration (see future Task 7/8/9 tests).
 var _ = fmt.Sprintf
+
+// ----------------------------------------------------------------------
+// Task 8 (phase 22.2 IMPL) — trailers bridge tests per SPEC §3.4 + §2.2
+// + PLAN Task 8.
+// ----------------------------------------------------------------------
+//
+// Trailers bridge mirrors 22.1's headers metatable shape: 8 operator-
+// visible mutation methods (:get / :getAtIndex / :getNumValues / :add /
+// :append (alias of :add) / :remove / :replace + __pairs alphabetical-
+// snapshot reusing 22.1's installPairsShim discipline) + lazy-available
+// `request_handle:trailers()` returning nil if no trailers were attached
+// to the per-stream context (mirrors upstream Lua filter's `trailers()`
+// behavior of returning nil pre-trailers-arrival).
+//
+// All tests parallel the 22.1 headers tests at this file:
+//   - 8 mutation method tests (1 per method, including the :append alias)
+//   - __pairs alphabetical-order + cross-run-determinism (N=100) +
+//     multi-value + empty
+//   - nil-trailers-returns-nil on both request_handle + response_handle
+//   - Encode-side parity verification (response_handle:trailers())
+//   - Metatable identity (envoy_trailers != envoy_headers in registry)
+
+// newBridgedVMWithTrailers constructs a per-test VM with both rh
+// (request_handle) AND resp (response_handle) globals — each carrying a
+// distinct headers map AND a distinct trailers map. The trailers maps
+// are attached via the new requestHandleContext.trailers /
+// responseHandleContext.trailers fields landing at Task 8.
+//
+// If trailers is nil, the corresponding handle's :trailers() bridge
+// method returns lua.LNil (lazy-availability discipline per SPEC §2.2 +
+// PLAN Q2).
+func newBridgedVMWithTrailers(t *testing.T, h, reqTrailers, respTrailers http.Header) *luaprim.VM {
+	t.Helper()
+	vm := luaprim.NewVM()
+	t.Cleanup(vm.Close)
+	L := vm.State()
+	installRequestHandleMetatable(L)
+	installResponseHandleMetatable(L)
+	installHeadersMetatable(L)
+	installTrailersMetatable(L)
+	installPairsShim(L)
+
+	rctx := &requestHandleContext{headers: h, trailers: reqTrailers}
+	rud := L.NewUserData()
+	rud.Value = rctx
+	L.SetMetatable(rud, L.GetTypeMetatable(requestHandleTypeName))
+	L.SetGlobal("rh", rud)
+
+	pctx := &responseHandleContext{headers: h, trailers: respTrailers}
+	pud := L.NewUserData()
+	pud.Value = pctx
+	L.SetMetatable(pud, L.GetTypeMetatable(responseHandleTypeName))
+	L.SetGlobal("resp", pud)
+	return vm
+}
+
+// ----------------------------------------------------------------------
+// Task 8 — :trailers() lazy-availability (nil if no trailers received)
+// ----------------------------------------------------------------------
+
+// TestBridge_Trailers_ReturnsNil_WhenNotReceived verifies that
+// request_handle:trailers() returns nil when the per-stream context has
+// no trailers attached (lazy-availability per SPEC §2.2 + PLAN Q2 +
+// upstream Lua filter behavior pre-trailers-arrival).
+func TestBridge_Trailers_ReturnsNil_WhenNotReceived(t *testing.T) {
+	vm := newBridgedVMWithTrailers(t, http.Header{}, nil, nil)
+	runScript(t, vm, `t = rh:trailers(); is_nil = (t == nil)`)
+	if !isGlobalNil(vm, "t") {
+		t.Errorf("rh:trailers() global t = %v; want nil", vm.State().GetGlobal("t"))
+	}
+	v := vm.State().GetGlobal("is_nil")
+	b, ok := v.(lua.LBool)
+	if !ok || !bool(b) {
+		t.Errorf("is_nil global = %v; want true", v)
+	}
+}
+
+// TestBridge_Trailers_ResponseHandle_ReturnsNil_WhenNotReceived verifies
+// the encode-side parity: response_handle:trailers() returns nil when
+// the per-stream context has no trailers attached.
+func TestBridge_Trailers_ResponseHandle_ReturnsNil_WhenNotReceived(t *testing.T) {
+	vm := newBridgedVMWithTrailers(t, http.Header{}, nil, nil)
+	runScript(t, vm, `t = resp:trailers(); is_nil = (t == nil)`)
+	if !isGlobalNil(vm, "t") {
+		t.Errorf("resp:trailers() global t = %v; want nil", vm.State().GetGlobal("t"))
+	}
+}
+
+// TestBridge_Trailers_Returns_UserData_WhenPresent verifies that
+// request_handle:trailers() returns a non-nil userdata once trailers have
+// been attached. The returned userdata is iterable (via pairs) + accepts
+// the 7 mutation methods.
+func TestBridge_Trailers_Returns_UserData_WhenPresent(t *testing.T) {
+	tr := http.Header{"Grpc-Status": []string{"0"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `t = rh:trailers(); ty = type(t)`)
+	if isGlobalNil(vm, "t") {
+		t.Fatal("rh:trailers() = nil; want non-nil userdata")
+	}
+	got := getGlobalString(t, vm, "ty")
+	if got != "userdata" {
+		t.Errorf("type(rh:trailers()) = %q; want %q", got, "userdata")
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 8 — 7 distinct trailers methods (8th = :append alias for :add)
+// ----------------------------------------------------------------------
+
+// TestBridge_Trailers_Get_Hit verifies :get returns the first value for
+// an existing trailer entry (case-canonical lookup via http.Header.Get).
+func TestBridge_Trailers_Get_Hit(t *testing.T) {
+	tr := http.Header{"Grpc-Status": []string{"0"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `result = rh:trailers():get("Grpc-Status")`)
+	if got := getGlobalString(t, vm, "result"); got != "0" {
+		t.Errorf("trailers:get = %q; want %q", got, "0")
+	}
+}
+
+// TestBridge_Trailers_Get_Miss verifies :get returns nil for an absent
+// trailer (parallels TestBridge_Headers_Get_Miss).
+func TestBridge_Trailers_Get_Miss(t *testing.T) {
+	tr := http.Header{"Grpc-Status": []string{"0"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `result = rh:trailers():get("absent")`)
+	if !isGlobalNil(vm, "result") {
+		t.Errorf("trailers:get(absent) = %v; want nil", vm.State().GetGlobal("result"))
+	}
+}
+
+// TestBridge_Trailers_GetAtIndex_SecondValue verifies the 1-indexed
+// second value matches the underlying slice's [1] entry.
+func TestBridge_Trailers_GetAtIndex_SecondValue(t *testing.T) {
+	tr := http.Header{"X-Multi": []string{"v1", "v2"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `result = rh:trailers():getAtIndex("X-Multi", 2)`)
+	if got := getGlobalString(t, vm, "result"); got != "v2" {
+		t.Errorf("trailers:getAtIndex = %q; want %q", got, "v2")
+	}
+}
+
+// TestBridge_Trailers_GetNumValues_Multi verifies the count of values
+// for a multi-valued trailer matches the underlying slice length.
+func TestBridge_Trailers_GetNumValues_Multi(t *testing.T) {
+	tr := http.Header{"X-Multi": []string{"a", "b", "c"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `result = rh:trailers():getNumValues("X-Multi")`)
+	if got := getGlobalInt(t, vm, "result"); got != 3 {
+		t.Errorf("trailers:getNumValues = %d; want 3", got)
+	}
+}
+
+// TestBridge_Trailers_Add_Appends verifies :add appends a new value to
+// an existing trailer (does NOT replace existing values; mirrors
+// upstream HeaderMap::addCopy semantics).
+func TestBridge_Trailers_Add_Appends(t *testing.T) {
+	tr := http.Header{"X-Foo": []string{"a"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `rh:trailers():add("X-Foo", "b")`)
+	got := tr.Values("X-Foo")
+	want := []string{"a", "b"}
+	if !equalSlices(got, want) {
+		t.Errorf("trailers values after add = %v; want %v", got, want)
+	}
+}
+
+// TestBridge_Trailers_Append_AliasForAdd verifies :append IS the same Go
+// function as :add per upstream wrappers.cc HeaderMapWrapper::luaAdd /
+// luaAppend collapse to HeaderMap::addCopy (this is the 8th operator-
+// visible surface entry per PLAN Task 8 "exactly 8 total; verify roster
+// against 22.1 IMPL").
+func TestBridge_Trailers_Append_AliasForAdd(t *testing.T) {
+	tr := http.Header{"X-Foo": []string{"a"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `rh:trailers():append("X-Foo", "b")`)
+	got := tr.Values("X-Foo")
+	want := []string{"a", "b"}
+	if !equalSlices(got, want) {
+		t.Errorf("trailers values after append = %v; want %v", got, want)
+	}
+}
+
+// TestBridge_Trailers_Remove_Deletes verifies :remove deletes the entire
+// trailer entry (all values, not just the first).
+func TestBridge_Trailers_Remove_Deletes(t *testing.T) {
+	tr := http.Header{"X-Foo": []string{"a", "b"}, "X-Keep": []string{"k"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `rh:trailers():remove("X-Foo")`)
+	if got := tr.Values("X-Foo"); len(got) != 0 {
+		t.Errorf("trailers values after remove = %v; want empty", got)
+	}
+	if got := tr.Values("X-Keep"); !equalSlices(got, []string{"k"}) {
+		t.Errorf("X-Keep collateral-damaged: %v", got)
+	}
+}
+
+// TestBridge_Trailers_Replace_RemovesThenAdds verifies :replace removes
+// existing values + adds the single new value (single-value replace
+// semantics; mirrors http.Header.Set).
+func TestBridge_Trailers_Replace_RemovesThenAdds(t *testing.T) {
+	tr := http.Header{"X-Foo": []string{"a", "b", "c"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `rh:trailers():replace("X-Foo", "new")`)
+	got := tr.Values("X-Foo")
+	want := []string{"new"}
+	if !equalSlices(got, want) {
+		t.Errorf("trailers values after replace = %v; want %v", got, want)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 8 — __pairs alphabetical-snapshot iterator (parallels 22.1
+// headers __pairs tests; reuses installPairsShim discipline)
+// ----------------------------------------------------------------------
+
+// TestBridge_Trailers_Pairs_AlphabeticalOrder verifies that iterating
+// the trailers via `for k,v in pairs(rh:trailers()) do ... end` walks the
+// keys in alphabetical (case-insensitive) order.
+func TestBridge_Trailers_Pairs_AlphabeticalOrder(t *testing.T) {
+	tr := http.Header{
+		"Zeta":  []string{"3"},
+		"Alpha": []string{"1"},
+		"Mango": []string{"2"},
+	}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `
+		order = ""
+		for k, v in pairs(rh:trailers()) do
+			order = order .. k .. "=" .. v .. ";"
+		end
+	`)
+	got := getGlobalString(t, vm, "order")
+	want := "Alpha=1;Mango=2;Zeta=3;"
+	if got != want {
+		t.Fatalf("trailers __pairs order = %q; want %q", got, want)
+	}
+}
+
+// TestBridge_Trailers_Pairs_CrossRunDeterminism verifies the __pairs
+// iteration order is byte-identical across N=100 runs of the same
+// trailers map (closes the trailers __pairs cross-run-determinism
+// per PLAN Task 8 acceptance).
+func TestBridge_Trailers_Pairs_CrossRunDeterminism(t *testing.T) {
+	const N = 100
+	tr := http.Header{
+		"a-key": []string{"av"},
+		"b-key": []string{"bv"},
+		"c-key": []string{"cv"},
+		"d-key": []string{"dv"},
+		"e-key": []string{"ev"},
+		"f-key": []string{"fv"},
+		"g-key": []string{"gv"},
+		"h-key": []string{"hv"},
+	}
+	var first string
+	for i := 0; i < N; i++ {
+		vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+		runScript(t, vm, `
+			out = ""
+			for k, v in pairs(rh:trailers()) do
+				out = out .. k .. "=" .. v .. ";"
+			end
+		`)
+		got := getGlobalString(t, vm, "out")
+		if i == 0 {
+			first = got
+			continue
+		}
+		if got != first {
+			t.Fatalf("trailers __pairs iteration %d differs from first; got=%q first=%q", i, got, first)
+		}
+	}
+	if !strings.Contains(first, "a-key=av;") || !strings.Contains(first, "h-key=hv;") {
+		t.Fatalf("trailers first iteration output missing expected entries; got %q", first)
+	}
+}
+
+// TestBridge_Trailers_Pairs_MultiValueSameKey verifies that multi-value
+// trailers surface as one (k, v) pair per value, ordered alphabetically
+// by key then lexicographically by value (parallels headers test).
+func TestBridge_Trailers_Pairs_MultiValueSameKey(t *testing.T) {
+	tr := http.Header{
+		"X-Multi": []string{"v1", "v2", "v3"},
+		"X-One":   []string{"only"},
+	}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `
+		out = ""
+		for k, v in pairs(rh:trailers()) do
+			out = out .. k .. "=" .. v .. ";"
+		end
+	`)
+	got := getGlobalString(t, vm, "out")
+	want := "X-Multi=v1;X-Multi=v2;X-Multi=v3;X-One=only;"
+	if got != want {
+		t.Fatalf("trailers __pairs multi-value = %q; want %q", got, want)
+	}
+}
+
+// TestBridge_Trailers_Pairs_Empty verifies iterating an empty trailers
+// map produces an empty output (no panic, no spurious iterations).
+func TestBridge_Trailers_Pairs_Empty(t *testing.T) {
+	tr := http.Header{}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, tr, nil)
+	runScript(t, vm, `
+		count = 0
+		for k, v in pairs(rh:trailers()) do
+			count = count + 1
+		end
+	`)
+	if got := getGlobalInt(t, vm, "count"); got != 0 {
+		t.Fatalf("trailers __pairs empty count = %d; want 0", got)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 8 — encode-side :trailers() parity + metatable identity
+// ----------------------------------------------------------------------
+
+// TestBridge_Trailers_ResponseHandle_Get verifies the encode-side
+// :trailers():get round-trip when trailers ARE attached.
+func TestBridge_Trailers_ResponseHandle_Get(t *testing.T) {
+	respTrailers := http.Header{"Grpc-Message": []string{"ok"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{}, nil, respTrailers)
+	runScript(t, vm, `result = resp:trailers():get("Grpc-Message")`)
+	if got := getGlobalString(t, vm, "result"); got != "ok" {
+		t.Errorf("resp:trailers():get = %q; want %q", got, "ok")
+	}
+}
+
+// TestBridge_Trailers_MetatableDistinctFromHeaders verifies that the
+// trailers metatable is registered under a DISTINCT registry key from
+// the headers metatable (envoy_trailers vs envoy_headers) — even though
+// both metatables dispatch the same underlying 7-method set, they are
+// distinct types in Lua's userdata-type registry so script-side
+// `getmetatable(rh:trailers()) ~= getmetatable(rh:headers())` holds.
+func TestBridge_Trailers_MetatableDistinctFromHeaders(t *testing.T) {
+	if trailersTypeName == headersTypeName {
+		t.Fatalf("trailersTypeName %q == headersTypeName %q; want distinct registry keys",
+			trailersTypeName, headersTypeName)
+	}
+	tr := http.Header{"K": []string{"v"}}
+	vm := newBridgedVMWithTrailers(t, http.Header{"K": []string{"v"}}, tr, nil)
+	runScript(t, vm, `
+		mt_h = getmetatable(rh:headers())
+		mt_t = getmetatable(rh:trailers())
+		distinct = (mt_h ~= mt_t)
+	`)
+	v := vm.State().GetGlobal("distinct")
+	b, ok := v.(lua.LBool)
+	if !ok || !bool(b) {
+		t.Errorf("distinct = %v; want true (headers vs trailers metatable identity)", v)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 8 — trailers-bridge wiring at DecodeTrailers / EncodeTrailers
+// terminal-state (per PLAN Task 8 decode_headers + encode_headers
+// trailers-bridge wiring at terminal-state)
+// ----------------------------------------------------------------------
+
+// TestBridge_Trailers_DecodeTrailers_AttachesToReqCtx verifies the
+// terminal-state wiring: when DecodeTrailers fires with a non-nil
+// trailers map AND f.reqCtx is non-nil (the DecodeHeaders dispatcher has
+// already constructed it), the trailers map is attached onto
+// f.reqCtx.trailers so subsequent :trailers() bridge calls return non-
+// nil.
+func TestBridge_Trailers_DecodeTrailers_AttachesToReqCtx(t *testing.T) {
+	f := &filter{}
+	f.reqCtx = &requestHandleContext{headers: http.Header{}}
+	if f.reqCtx.trailers != nil {
+		t.Fatal("precondition: trailers should be nil before DecodeTrailers")
+	}
+	tr := http.Header{"K": []string{"v"}}
+	f.DecodeTrailers(tr)
+	if f.reqCtx.trailers == nil {
+		t.Fatal("DecodeTrailers did not attach trailers onto reqCtx.trailers")
+	}
+	if got := f.reqCtx.trailers.Get("K"); got != "v" {
+		t.Errorf("reqCtx.trailers.Get(K) = %q; want %q", got, "v")
+	}
+}
+
+// TestBridge_Trailers_EncodeTrailers_AttachesToRespCtx is the encode-
+// side parity assertion.
+func TestBridge_Trailers_EncodeTrailers_AttachesToRespCtx(t *testing.T) {
+	f := &filter{}
+	f.respCtx = &responseHandleContext{headers: http.Header{}}
+	if f.respCtx.trailers != nil {
+		t.Fatal("precondition: respCtx.trailers should be nil before EncodeTrailers")
+	}
+	tr := http.Header{"K": []string{"v"}}
+	f.EncodeTrailers(tr)
+	if f.respCtx.trailers == nil {
+		t.Fatal("EncodeTrailers did not attach trailers onto respCtx.trailers")
+	}
+	if got := f.respCtx.trailers.Get("K"); got != "v" {
+		t.Errorf("respCtx.trailers.Get(K) = %q; want %q", got, "v")
+	}
+}
+
+// TestBridge_Trailers_DecodeTrailers_NilReqCtx_NoOp verifies that when
+// f.reqCtx is nil (DecodeHeaders never constructed it — nil-chunk pass-
+// through path), DecodeTrailers does NOT panic + just returns Continue.
+func TestBridge_Trailers_DecodeTrailers_NilReqCtx_NoOp(t *testing.T) {
+	f := &filter{}
+	// f.reqCtx left nil — simulates the DecodeHeaders nil-chunk pass-
+	// through where no per-stream context exists.
+	tr := http.Header{"K": []string{"v"}}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("DecodeTrailers with nil reqCtx panicked: %v", r)
+		}
+	}()
+	_ = f.DecodeTrailers(tr)
+}

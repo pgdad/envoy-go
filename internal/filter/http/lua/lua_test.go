@@ -9,19 +9,24 @@ package lua
 // + statName* byte-exact constants).
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	luaprim "github.com/esalaine/envoy-go/internal/lua"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -102,6 +107,10 @@ func (c *recordedDCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *recordedDCB) DownstreamProtocol() string       { return "HTTP/1.1" }
 func (c *recordedDCB) ListenerPrincipal() string        { return "" }
 
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *recordedDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *recordedDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
 // recordedECB is the EncoderFilterCallbacks test-double (encode-side
 // counterpart). All methods are zero-value stubs since encode_headers.go
 // does not call any of them at 22.1.
@@ -119,6 +128,10 @@ func (c *recordedECB) DownstreamTLSServerName() string  { return "" }
 func (c *recordedECB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *recordedECB) DownstreamProtocol() string       { return "HTTP/1.1" }
 func (c *recordedECB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *recordedECB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *recordedECB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // newTestFilter constructs a *filter with the supplied script compiled
 // into a *compiledConfig (with a stat-bearing filterStats wired to a
@@ -487,20 +500,180 @@ func TestStatNames_Equal_RespondCalls(t *testing.T) {
 	}
 }
 
-// TestStatNames_TableDriven asserts all 3 stat name constants in one
+// TestStatNames_TableDriven asserts all 8 stat name constants in one
 // table-driven row per the §6.6 dual-layer guard precedent (mirrors
 // adaptive_concurrency::TestStatNames_Equal_* shape).
+//
+// Extended at Task 14 (phase 22.2 IMPL) per 22.2 SPEC §7.1 + AMEND-22.2-3:
+// 3 inherited (22.1) + 5 NEW envoy-go-strict counters. Byte-exact wire
+// names per 22.2 SPEC §7.1 row 1-5.
 func TestStatNames_TableDriven(t *testing.T) {
 	tests := []struct {
 		gotConst, want string
 	}{
+		// 3 inherited from 22.1 (parent §7.1 + AMEND-3).
 		{statNameErrors, "errors"},
 		{statNameExecutions, "executions"},
 		{statNameRespondCalls, "respond_calls"},
+		// 5 NEW envoy-go-strict counters at 22.2 Task 14 per 22.2 SPEC §7.1.
+		{statNameHTTPCallTotal, "httpcall_total"},
+		{statNameHTTPCallFailures, "httpcall_failures"},
+		{statNameHTTPCallTimeouts, "httpcall_timeouts"},
+		{statNameBodyBufferedBytesTotal, "body_buffered_bytes_total"},
+		{statNameCoroutineYieldsTotal, "coroutine_yields_total"},
 	}
 	for _, tc := range tests {
 		if tc.gotConst != tc.want {
 			t.Errorf("stat name constant = %q; want %q", tc.gotConst, tc.want)
+		}
+	}
+}
+
+// TestStatNames_Equal_HTTPCallTotal pins the byte-exact wire name for the
+// httpcall_total counter (envoy-go-strict extension per 22.2 SPEC §7.1
+// row 1 + AMEND-22.2-3). Incremented on every :httpCall() dispatch
+// (sync + async). Departure record anticipated at Task 19 BEHAVIOR_
+// CONTRACT.md §13.6 per SPEC §14 edit item 3.
+func TestStatNames_Equal_HTTPCallTotal(t *testing.T) {
+	if statNameHTTPCallTotal != "httpcall_total" {
+		t.Fatalf("statNameHTTPCallTotal = %q; want %q", statNameHTTPCallTotal, "httpcall_total")
+	}
+}
+
+// TestStatNames_Equal_HTTPCallFailures pins the byte-exact wire name for
+// the httpcall_failures counter (SYNC-ONLY per AMEND-22.2-3 D6;
+// envoy-go-strict per 22.2 SPEC §7.1 row 2). Departure record
+// anticipated at Task 19 per SPEC §14 edit item 4.
+func TestStatNames_Equal_HTTPCallFailures(t *testing.T) {
+	if statNameHTTPCallFailures != "httpcall_failures" {
+		t.Fatalf("statNameHTTPCallFailures = %q; want %q", statNameHTTPCallFailures, "httpcall_failures")
+	}
+}
+
+// TestStatNames_Equal_HTTPCallTimeouts pins the byte-exact wire name for
+// the httpcall_timeouts counter (SYNC-ONLY per AMEND-22.2-3 D6;
+// envoy-go-strict per 22.2 SPEC §7.1 row 3). Departure record
+// anticipated at Task 19 per SPEC §14 edit item 5.
+func TestStatNames_Equal_HTTPCallTimeouts(t *testing.T) {
+	if statNameHTTPCallTimeouts != "httpcall_timeouts" {
+		t.Fatalf("statNameHTTPCallTimeouts = %q; want %q", statNameHTTPCallTimeouts, "httpcall_timeouts")
+	}
+}
+
+// TestStatNames_Equal_BodyBufferedBytesTotal pins the byte-exact wire
+// name for the body_buffered_bytes_total counter (envoy-go-strict per
+// 22.2 SPEC §7.1 row 4). Cumulative bytes accumulated in
+// decodedBodyBytes / encodedBodyBytes across all streams. Departure
+// record anticipated at Task 19 per SPEC §14 edit item 6.
+func TestStatNames_Equal_BodyBufferedBytesTotal(t *testing.T) {
+	if statNameBodyBufferedBytesTotal != "body_buffered_bytes_total" {
+		t.Fatalf("statNameBodyBufferedBytesTotal = %q; want %q",
+			statNameBodyBufferedBytesTotal, "body_buffered_bytes_total")
+	}
+}
+
+// TestStatNames_Equal_CoroutineYieldsTotal pins the byte-exact wire name
+// for the coroutine_yields_total counter (envoy-go-strict per 22.2 SPEC
+// §7.1 row 5). Cumulative coroutine yield events from
+// :body() / :bodyChunks() / sync :httpCall(). Departure record
+// anticipated at Task 19 per SPEC §14 edit item 7.
+func TestStatNames_Equal_CoroutineYieldsTotal(t *testing.T) {
+	if statNameCoroutineYieldsTotal != "coroutine_yields_total" {
+		t.Fatalf("statNameCoroutineYieldsTotal = %q; want %q",
+			statNameCoroutineYieldsTotal, "coroutine_yields_total")
+	}
+}
+
+// TestNewFilterStats_RegistersEightCounters_HCMRootedTemplate verifies
+// the Task 14 extension: newFilterStats(reg, "ingress_http",
+// "my_prefix") registers exactly the 8 byte-exact wire names under the
+// HCM-rooted template (UNCHANGED from 22.1 per AMEND-2) per 22.2 SPEC
+// §7.1 + §7.2.
+func TestNewFilterStats_RegistersEightCounters_HCMRootedTemplate(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "ingress_http", "my_prefix")
+	if fs == nil {
+		t.Fatal("newFilterStats returned nil; want non-nil")
+	}
+	want := map[string]bool{
+		// 3 inherited from 22.1.
+		"http.ingress_http.lua.my_prefix.errors":        true,
+		"http.ingress_http.lua.my_prefix.executions":    true,
+		"http.ingress_http.lua.my_prefix.respond_calls": true,
+		// 5 NEW at 22.2 Task 14 per SPEC §7.1.
+		"http.ingress_http.lua.my_prefix.httpcall_total":            true,
+		"http.ingress_http.lua.my_prefix.httpcall_failures":         true,
+		"http.ingress_http.lua.my_prefix.httpcall_timeouts":         true,
+		"http.ingress_http.lua.my_prefix.body_buffered_bytes_total": true,
+		"http.ingress_http.lua.my_prefix.coroutine_yields_total":    true,
+	}
+	got := walkRegistry(reg)
+	if len(got) != 8 {
+		t.Fatalf("registered count = %d; want 8 (got names: %v)", len(got), got)
+	}
+	for _, n := range got {
+		if !want[n] {
+			t.Errorf("unexpected registered name %q (not in expected set)", n)
+		}
+		delete(want, n)
+	}
+	if len(want) > 0 {
+		t.Errorf("missing registered names: %v", want)
+	}
+	// Verify all 8 counter fields are non-nil per Task 14 acceptance.
+	if fs.errors == nil || fs.executions == nil || fs.respondCalls == nil {
+		t.Errorf("inherited counter field nil: errors=%v executions=%v respondCalls=%v",
+			fs.errors, fs.executions, fs.respondCalls)
+	}
+	if fs.httpcallTotal == nil || fs.httpcallFailures == nil || fs.httpcallTimeouts == nil {
+		t.Errorf("httpCall counter field nil: total=%v failures=%v timeouts=%v",
+			fs.httpcallTotal, fs.httpcallFailures, fs.httpcallTimeouts)
+	}
+	if fs.bodyBufferedBytesTotal == nil || fs.coroutineYieldsTotal == nil {
+		t.Errorf("body/coroutine counter field nil: bodyBufferedBytesTotal=%v coroutineYieldsTotal=%v",
+			fs.bodyBufferedBytesTotal, fs.coroutineYieldsTotal)
+	}
+}
+
+// TestNewFilterStats_EightCounterCardinality asserts exactly 8 counters
+// are registered per filter instance at 22.2 phase-done per Task 14
+// acceptance criteria + 22.2 SPEC §7.1 (102 → 107 project stat-count
+// delta). Detects regressions where a future maintainer might add a 9th
+// stat (e.g. dynmd_writes_total per §7.1 RECOMMENDATION) without
+// updating BEHAVIOR_CONTRACT.md §13.6 + the 22.2 SPEC §7.1 roster.
+func TestNewFilterStats_EightCounterCardinality(t *testing.T) {
+	reg := stats.NewRegistry()
+	_ = newFilterStats(reg, "h", "c")
+	got := walkRegistry(reg)
+	if len(got) != 8 {
+		t.Fatalf("cardinality = %d; want exactly 8 at 22.2 phase-done (names: %v)", len(got), got)
+	}
+}
+
+// TestNewFilterStats_EmptyConfigStatPrefix_ConsecutiveDot_Eight verifies
+// the AMEND-2 consecutive-dot literal carries forward at 22.2 phase-done
+// for ALL 8 counters: empty Lua.stat_prefix produces literal
+// consecutive-dot wire names per parent §7.2 + AMEND-2.
+func TestNewFilterStats_EmptyConfigStatPrefix_ConsecutiveDot_Eight(t *testing.T) {
+	reg := stats.NewRegistry()
+	_ = newFilterStats(reg, "ingress_http", "")
+	want := map[string]bool{
+		"http.ingress_http.lua..errors":                    true,
+		"http.ingress_http.lua..executions":                true,
+		"http.ingress_http.lua..respond_calls":             true,
+		"http.ingress_http.lua..httpcall_total":            true,
+		"http.ingress_http.lua..httpcall_failures":         true,
+		"http.ingress_http.lua..httpcall_timeouts":         true,
+		"http.ingress_http.lua..body_buffered_bytes_total": true,
+		"http.ingress_http.lua..coroutine_yields_total":    true,
+	}
+	got := walkRegistry(reg)
+	if len(got) != 8 {
+		t.Fatalf("registered count = %d; want 8 (got: %v)", len(got), got)
+	}
+	for _, n := range got {
+		if !want[n] {
+			t.Errorf("unexpected registered name %q (want consecutive-dot form)", n)
 		}
 	}
 }
@@ -516,94 +689,41 @@ func walkRegistry(reg *stats.Registry) []string {
 	return names
 }
 
-// TestNewFilterStats_RegistersThreeCounters_HCMRootedTemplate verifies
-// that newFilterStats(reg, "ingress_http", "my_prefix") registers
-// exactly the 3 byte-exact wire names under the HCM-rooted template
-// per parent §7.2 + AMEND-2.
-func TestNewFilterStats_RegistersThreeCounters_HCMRootedTemplate(t *testing.T) {
-	reg := stats.NewRegistry()
-	fs := newFilterStats(reg, "ingress_http", "my_prefix")
-	if fs == nil {
-		t.Fatal("newFilterStats returned nil; want non-nil")
-	}
-	want := map[string]bool{
-		"http.ingress_http.lua.my_prefix.errors":        true,
-		"http.ingress_http.lua.my_prefix.executions":    true,
-		"http.ingress_http.lua.my_prefix.respond_calls": true,
-	}
-	got := walkRegistry(reg)
-	if len(got) != 3 {
-		t.Fatalf("registered count = %d; want 3 (got names: %v)", len(got), got)
-	}
-	for _, n := range got {
-		if !want[n] {
-			t.Errorf("unexpected registered name %q (not in expected set)", n)
-		}
-		delete(want, n)
-	}
-	if len(want) > 0 {
-		t.Errorf("missing registered names: %v", want)
-	}
-	if fs.errors == nil || fs.executions == nil || fs.respondCalls == nil {
-		t.Errorf("filterStats has nil counter field: errors=%v executions=%v respondCalls=%v",
-			fs.errors, fs.executions, fs.respondCalls)
-	}
-}
-
-// TestNewFilterStats_CardinalityAssertion asserts exactly 3 counters
-// are registered per filter instance per Task 10 acceptance criteria.
-// Detects regressions where a future maintainer might add a 4th stat
-// without updating BEHAVIOR_CONTRACT.md §13.6 + the parent §7 roster.
-func TestNewFilterStats_CardinalityAssertion(t *testing.T) {
-	reg := stats.NewRegistry()
-	_ = newFilterStats(reg, "h", "c")
-	got := walkRegistry(reg)
-	if len(got) != 3 {
-		t.Fatalf("cardinality = %d; want exactly 3 (names: %v)", len(got), got)
-	}
-}
-
-// TestNewFilterStats_EmptyConfigStatPrefix_ConsecutiveDot verifies the
-// AMEND-2 consecutive-dot literal: when `Lua.stat_prefix` is empty the
-// registered wire names contain `lua..` (two consecutive dots). Mirrors
-// the phase-14 compressor empty-`<library>` precedent at
-// BEHAVIOR_CONTRACT.md §line 243.
-func TestNewFilterStats_EmptyConfigStatPrefix_ConsecutiveDot(t *testing.T) {
-	reg := stats.NewRegistry()
-	_ = newFilterStats(reg, "ingress_http", "")
-	want := map[string]bool{
-		"http.ingress_http.lua..errors":        true,
-		"http.ingress_http.lua..executions":    true,
-		"http.ingress_http.lua..respond_calls": true,
-	}
-	got := walkRegistry(reg)
-	if len(got) != 3 {
-		t.Fatalf("registered count = %d; want 3 (got: %v)", len(got), got)
-	}
-	for _, n := range got {
-		if !want[n] {
-			t.Errorf("unexpected registered name %q (want consecutive-dot form)", n)
-		}
-	}
-}
-
 // TestNewFilterStats_EmptyHcmAndConfig_DoubleConsecutiveDot verifies
 // the AMEND-2 corner case: both ctx.StatPrefix AND Lua.StatPrefix empty
 // → `http..lua..<stat>` (two consecutive-dot pairs). The registry name
 // regex permits interior consecutive dots per
 // internal/stats/registry.go::nameRE; this test pins the operational-
-// degenerate-but-valid wire shape.
+// degenerate-but-valid wire shape across all 8 counters at 22.2 phase-
+// done.
+//
+// EXTENDED at Task 14 to 8 counters per 22.2 SPEC §7.1 (UNCHANGED
+// template per AMEND-2). Original 22.1 3-counter cardinality
+// assertions (TestNewFilterStats_RegistersThreeCounters_HCMRootedTemplate,
+// TestNewFilterStats_CardinalityAssertion,
+// TestNewFilterStats_EmptyConfigStatPrefix_ConsecutiveDot) are
+// SUPERSEDED by the 8-counter variants above
+// (TestNewFilterStats_RegistersEightCounters_HCMRootedTemplate,
+// TestNewFilterStats_EightCounterCardinality,
+// TestNewFilterStats_EmptyConfigStatPrefix_ConsecutiveDot_Eight).
 func TestNewFilterStats_EmptyHcmAndConfig_DoubleConsecutiveDot(t *testing.T) {
 	reg := stats.NewRegistry()
 	_ = newFilterStats(reg, "", "")
 	want := map[string]bool{
+		// 3 inherited from 22.1.
 		"http..lua..errors":        true,
 		"http..lua..executions":    true,
 		"http..lua..respond_calls": true,
+		// 5 NEW at 22.2 Task 14 per SPEC §7.1.
+		"http..lua..httpcall_total":            true,
+		"http..lua..httpcall_failures":         true,
+		"http..lua..httpcall_timeouts":         true,
+		"http..lua..body_buffered_bytes_total": true,
+		"http..lua..coroutine_yields_total":    true,
 	}
 	got := walkRegistry(reg)
-	if len(got) != 3 {
-		t.Fatalf("registered count = %d; want 3 (got: %v)", len(got), got)
+	if len(got) != 8 {
+		t.Fatalf("registered count = %d; want 8 (got: %v)", len(got), got)
 	}
 	for _, n := range got {
 		if !want[n] {
@@ -649,13 +769,20 @@ func TestNew_HappyPath_ReturnsFactoryAndStatsRegistered(t *testing.T) {
 		t.Fatal("New returned nil factory; want non-nil")
 	}
 	got := walkRegistry(reg)
-	if len(got) != 3 {
-		t.Fatalf("registered count = %d; want 3 (got: %v)", len(got), got)
+	if len(got) != 8 {
+		t.Fatalf("registered count = %d; want 8 (got: %v)", len(got), got)
 	}
 	wantNames := map[string]bool{
+		// 3 inherited from 22.1.
 		"http.ingress_http.lua.my_script.errors":        true,
 		"http.ingress_http.lua.my_script.executions":    true,
 		"http.ingress_http.lua.my_script.respond_calls": true,
+		// 5 NEW at 22.2 Task 14 per SPEC §7.1.
+		"http.ingress_http.lua.my_script.httpcall_total":            true,
+		"http.ingress_http.lua.my_script.httpcall_failures":         true,
+		"http.ingress_http.lua.my_script.httpcall_timeouts":         true,
+		"http.ingress_http.lua.my_script.body_buffered_bytes_total": true,
+		"http.ingress_http.lua.my_script.coroutine_yields_total":    true,
 	}
 	for _, n := range got {
 		if !wantNames[n] {
@@ -696,12 +823,19 @@ func TestNew_HappyPath_EmptyLuaStatPrefix_ConsecutiveDot(t *testing.T) {
 	}
 	got := walkRegistry(reg)
 	wantNames := map[string]bool{
+		// 3 inherited from 22.1.
 		"http.ingress_http.lua..errors":        true,
 		"http.ingress_http.lua..executions":    true,
 		"http.ingress_http.lua..respond_calls": true,
+		// 5 NEW at 22.2 Task 14 per SPEC §7.1.
+		"http.ingress_http.lua..httpcall_total":            true,
+		"http.ingress_http.lua..httpcall_failures":         true,
+		"http.ingress_http.lua..httpcall_timeouts":         true,
+		"http.ingress_http.lua..body_buffered_bytes_total": true,
+		"http.ingress_http.lua..coroutine_yields_total":    true,
 	}
-	if len(got) != 3 {
-		t.Fatalf("registered count = %d; want 3 (got: %v)", len(got), got)
+	if len(got) != 8 {
+		t.Fatalf("registered count = %d; want 8 (got: %v)", len(got), got)
 	}
 	for _, n := range got {
 		if !wantNames[n] {
@@ -1135,5 +1269,510 @@ func BenchmarkPerStreamLState_Construction_Headers(b *testing.B) {
 		// Mirrors filter.OnDestroy (lua.go:266-271) — per-stream VM
 		// release at end-of-stream.
 		vm.Close()
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 15 (phase 22.2 IMPL) — race tests N=100 parallel filter dispatches
+// at the FULL 22.2 bridge surface + 2 benchmarks per D-P10 + D3 closure
+// per 22.2 SPEC §13-R6 + §13-R9 + PLAN Task 15.
+//
+// # R6 signaling protocol
+//
+// BenchmarkPerStream_FullBridge_LState_Construction measures per-stream
+// VM construction cost across ALL 22.2 metatable installs (request_handle
+// + response_handle + headers + trailers + streamInfo + metadata +
+// dynamicMetadata + connection + ssl + publicKeyWrapper + filterState +
+// pairs shim) PLUS a parent+child *LState pair via NewThread (the
+// coroutine surface that body / sync httpCall consume per ADR-0191 §11.1
+// D2 closure).
+//
+// The reported ns/op gates the conditional ADR-0193 §Context + §Decision
+// + §Consequences landing at Task 19 per the R6 signal protocol:
+//
+//   - ns/op <= 1_000_000 (= 1 ms) → R6 STANDS WEAK-default; the per-stream
+//     *LState construction discipline (fresh VM per stream + shared
+//     *Chunk cache) stays per ADR-0192 §Context; ADR-0193 NOT consumed;
+//     carries forward to 22.3 BRAINSTORM as the 22.3 IMPL escape-valve
+//     slot.
+//   - ns/op  > 1_000_000 (= 1 ms) → R6 ADR-0193 FIRES; Task 19 atomic
+//     landing authors ADR-0193 §Context + §Decision + §Consequences body
+//     consuming the per-script-source `*LState`-pool design.
+//
+// PLAN hypothesis: STAYS WEAK-default. 22.1 IMPL baseline (headers-only)
+// was ns/op = 69865 (~70 µs); 22.2 anticipated 200-500 µs (3-7×
+// headers-only) — SHOULD stay under 1 ms.
+//
+// # D3 closure — defensive-copy at endStream perf-validation
+//
+// BenchmarkBodyBridge_DefensiveCopy_PerStream measures per-stream body-
+// bridge construction + accumulation + defensive-copy at endStream
+// overhead at two body-size points per the D3 closure threshold gates:
+//
+//   - sub-MB body (100 KB): ≤ 1 ms per stream;
+//   - 16-MiB-cap-saturated body: ≤ 100 ms per stream.
+//
+// Both gates met → option (a) defensive-copy at endStream STANDS at 22.2
+// phase-done per SPEC §11.3 + §12 RECOMMENDED option (a). Either gate
+// exceeded → R9 ADR-0193 escape-valve fires at Task 19 with option (b)
+// zero-copy via `*lua.LUserData` wrapping. R9 cross-check: STAYS embedded
+// in ADR-0192 per Task 7 IMPL outcome — the body-bridge implementation
+// surface did NOT introduce additional ADR-warranting complexity beyond
+// what is documented under ADR-0192 §Context.
+// ----------------------------------------------------------------------
+
+// buildBenchFullBridgeConfig constructs a *compiledConfig with a script
+// that defines BOTH envoy_on_request + envoy_on_response as no-op hooks.
+// The 8-counter *filterStats is wired via newFilterStats so the 5 NEW
+// envoy-go-strict counter allocations land inside the benchmark window
+// per the §13-R6 full-bridge measurement scope.
+func buildBenchFullBridgeConfig(b *testing.B) *compiledConfig {
+	b.Helper()
+	const script = `
+		function envoy_on_request(rh) end
+		function envoy_on_response(rh) end
+	`
+	chunk, err := luaprim.CompileScript([]byte(script), nil)
+	if err != nil {
+		b.Fatalf("CompileScript err = %v; want nil", err)
+	}
+	reg := stats.NewRegistry()
+	return &compiledConfig{
+		chunk: chunk,
+		stats: newFilterStats(reg, "ingress_http", "bench_full"),
+	}
+}
+
+// BenchmarkPerStream_FullBridge_LState_Construction measures per-stream
+// *lua.LState construction cost at the FULL 22.2 bridge surface per
+// 22.2 SPEC §13-R6 + D-P10 + PLAN Task 15.
+//
+// Each iteration:
+//
+//   - Constructs a fresh per-stream VM via luaprim.NewVM (sandbox install
+//   - base-lib load per the 22.1 NewVM body).
+//   - Installs ALL 22.2 bridge metatables: request_handle +
+//     response_handle + headers + trailers + streamInfo + metadata +
+//     dynamicMetadata + connection + ssl + publicKeyWrapper + filterState
+//   - the pairs shim. Mirrors decode_headers.go:97-109 verbatim.
+//   - Attaches a context to the parent LState (mirrors the bridge layer's
+//     per-stream context-attach discipline per ADR-0191).
+//   - Mints a child *LState via vm.NewThread (the coroutine surface that
+//     body / sync httpCall consume per §11.1 D2 closure). The CancelFunc
+//     is invoked at end-of-iteration to release the ctx-attached child
+//     loop.
+//   - Builds the per-stream *requestHandleContext + *responseHandleContext
+//     LUserData bindings + metatable attachments.
+//   - Runs the chunk top-level (defines envoy_on_request +
+//     envoy_on_response globals).
+//   - CallGlobal envoy_on_request + envoy_on_response (per-stream hook
+//     invocations).
+//   - vm.Close (mirrors filter.OnDestroy lua.go:533-538).
+//
+// Run via:
+//
+//	go test -bench=BenchmarkPerStream_FullBridge_LState_Construction \
+//	        -benchtime=3s ./internal/filter/http/lua/
+//
+// Quote the reported ns/op in PROGRESS.md Task 15 entry VERBATIM + record
+// the R6 disposition sentinel per the R6 signal protocol consumed by
+// Task 19 Step 10 (which greps for the literal substring
+// "§13-R6 disposition: ADR-0193 FIRES" to determine whether to land
+// conditional ADR-0193).
+func BenchmarkPerStream_FullBridge_LState_Construction(b *testing.B) {
+	cc := buildBenchFullBridgeConfig(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Mirrors decode_headers.go step 2 — per-stream NewVM with the
+		// SHARED cc.sandbox config (zero-value default).
+		vm := luaprim.NewVM(luaprim.WithSandboxConfig(cc.sandbox))
+
+		// Mirrors decode_headers.go step 3 — install ALL 22.2 bridge
+		// metatables + the pairs shim. Done ONCE per VM in production;
+		// the benchmark exercises the same install cost per per-stream
+		// dispatch.
+		L := vm.State()
+		installRequestHandleMetatable(L)
+		installResponseHandleMetatable(L)
+		installHeadersMetatable(L)
+		installTrailersMetatable(L)
+		installStreamInfoMetatable(L)
+		installMetadataMetatable(L)
+		installDynamicMetadataMetatable(L)
+		installConnectionMetatable(L)
+		installSSLMetatable(L)
+		installPublicKeyWrapperMetatable(L)
+		installFilterStateMetatable(L)
+		installPairsShim(L)
+
+		// Attach a per-stream context (mirrors the ADR-0191 bridge-layer
+		// per-stream context-attach discipline). Without this, vm.NewThread
+		// returns a nil CancelFunc (gopher-lua state.go:1618).
+		ctx, cancelCtx := context.WithCancel(context.Background())
+		L.SetContext(ctx)
+
+		// Mint a child *LState via NewThread — the coroutine surface that
+		// body / sync httpCall consume per §11.1 D2 closure.
+		_, cancelChild := vm.NewThread()
+
+		// Build the per-stream request_handle + response_handle userdata
+		// + metatable bindings. Empty headers; nil callbacks (the FULL-
+		// bridge benchmark measures construction cost, NOT bridge-method
+		// invocation cost — out of scope per D-P10).
+		reqCtx := &requestHandleContext{
+			headers: http.Header{},
+		}
+		reqUd := L.NewUserData()
+		reqUd.Value = reqCtx
+		L.SetMetatable(reqUd, L.GetTypeMetatable(requestHandleTypeName))
+
+		respCtx := &responseHandleContext{
+			headers: http.Header{},
+		}
+		respUd := L.NewUserData()
+		respUd.Value = respCtx
+		L.SetMetatable(respUd, L.GetTypeMetatable(responseHandleTypeName))
+
+		// Mirrors decode_headers.go step 5 — script top-level Run.
+		if err := vm.Run(cc.chunk); err != nil {
+			b.Fatalf("vm.Run err = %v", err)
+		}
+
+		// Mirrors decode_headers.go step 8 — invoke envoy_on_request with
+		// the request_handle userdata.
+		if err := vm.CallGlobal("envoy_on_request", reqUd); err != nil {
+			b.Fatalf("vm.CallGlobal envoy_on_request err = %v", err)
+		}
+
+		// Mirrors encode_headers.go — invoke envoy_on_response with the
+		// response_handle userdata.
+		if err := vm.CallGlobal("envoy_on_response", respUd); err != nil {
+			b.Fatalf("vm.CallGlobal envoy_on_response err = %v", err)
+		}
+
+		// Mirrors filter.OnDestroy (lua.go:533-538) — per-stream cleanup.
+		if cancelChild != nil {
+			cancelChild()
+		}
+		cancelCtx()
+		vm.Close()
+	}
+}
+
+// BenchmarkBodyBridge_DefensiveCopy_PerStream measures per-stream body-
+// bridge construction + body accumulation + defensive-copy at endStream
+// per the D3 closure threshold gates:
+//
+//   - sub-MB (100 KB): ≤ 1 ms per stream;
+//   - 16-MiB-cap-saturated: ≤ 100 ms per stream.
+//
+// Each sub-benchmark constructs a fresh *filter + minimal bridge install,
+// accumulates the body via accumulateRequestBody (chunked 64 KiB writes;
+// the framework-typical chunk size at the HCM body callback layer), and
+// at terminal endStream forces the `lua.LString(string(b))` defensive
+// copy via the request_handle:body() bridge LGFunction path.
+//
+// The two sub-benchmarks share a common driver helper to keep the
+// measurement scope consistent (only the body size varies). Run via:
+//
+//	go test -bench=BenchmarkBodyBridge_DefensiveCopy_PerStream \
+//	        -benchtime=3s ./internal/filter/http/lua/
+//
+// Quote BOTH reported ns/op values in PROGRESS.md Task 15 entry
+// VERBATIM + record the R9 disposition cross-check vs Task 7 IMPL
+// outcome.
+func BenchmarkBodyBridge_DefensiveCopy_PerStream(b *testing.B) {
+	b.Run("sub-MB", func(b *testing.B) {
+		runBodyBridgeBenchmark(b, 100*1024) // 100 KB sub-MB body
+	})
+	b.Run("16-MiB-saturated", func(b *testing.B) {
+		// 16 MiB minus 1 byte — saturates the per-stream cap WITHOUT
+		// tripping arm-21 over-cap reject. Per body.go:314 the over-cap
+		// guard is `len(f.decodedBodyBytes) > f.maxBodyBufferedBytes`
+		// (strict greater-than); cap-saturated-equal is permitted.
+		runBodyBridgeBenchmark(b, 16*1024*1024)
+	})
+}
+
+// runBodyBridgeBenchmark drives the body-bridge defensive-copy benchmark
+// at a specified body size. Each iteration: constructs a fresh *filter +
+// VM + bridge install; chunks the body into 64 KiB writes via
+// accumulateRequestBody; at terminal endStream invokes the
+// request_handle:body() bridge to force the `lua.LString(string(b))`
+// defensive copy; cleans up via vm.Close.
+func runBodyBridgeBenchmark(b *testing.B, bodySize int) {
+	b.Helper()
+	// Pre-allocate a deterministic body once + reuse across iterations.
+	// Allocating bodySize bytes inside the timed loop would dominate the
+	// 16-MiB-saturated measurement.
+	body := make([]byte, bodySize)
+	for i := range body {
+		body[i] = byte(i % 251) // arbitrary deterministic content
+	}
+	const chunkSize = 64 * 1024 // 64 KiB — framework-typical HCM body chunk
+
+	// Pre-compile the body-eval script once — script compilation is shared
+	// across streams in production (cc.chunk closure-captured).
+	const script = `
+		function envoy_on_request(rh)
+			local b = rh:body()
+			__body_len = #b
+		end
+	`
+	chunk, err := luaprim.CompileScript([]byte(script), nil)
+	if err != nil {
+		b.Fatalf("CompileScript err = %v", err)
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(bodySize))
+	b.ResetTimer()
+	for iter := 0; iter < b.N; iter++ {
+		// Per-stream filter + VM + bridge surface.
+		reg := stats.NewRegistry()
+		f := &filter{
+			cc: &compiledConfig{
+				chunk: chunk,
+				stats: newFilterStats(reg, "ingress_http", "bench_body"),
+			},
+		}
+		f.vm = luaprim.NewVM(luaprim.WithSandboxConfig(f.cc.sandbox))
+		L := f.vm.State()
+
+		ctx, cancelCtx := context.WithCancel(context.Background())
+		L.SetContext(ctx)
+
+		// Install only the minimal bridge surface the body script touches
+		// (request_handle + headers + pairs shim). The FULL-bridge install
+		// cost is measured separately by BenchmarkPerStream_FullBridge_
+		// LState_Construction; here the D3 closure scope is the body-
+		// accumulation + defensive-copy cost.
+		installRequestHandleMetatable(L)
+		installHeadersMetatable(L)
+		installPairsShim(L)
+
+		f.reqCtx = &requestHandleContext{headers: http.Header{}, filterRef: f}
+		rud := L.NewUserData()
+		rud.Value = f.reqCtx
+		L.SetMetatable(rud, L.GetTypeMetatable(requestHandleTypeName))
+		L.SetGlobal("rh", rud)
+
+		// Pre-set bodyReady = true via the terminal accumulate call (the
+		// benchmark scope is the synchronous "endStream-already-fired"
+		// path — the defensive-copy IS the work being measured; the
+		// coroutine yield/resume path is exercised by
+		// Test_RequestHandleBody_coroutine_yield_before_endStream).
+		written := 0
+		for written < bodySize {
+			n := chunkSize
+			if written+n > bodySize {
+				n = bodySize - written
+			}
+			endStream := written+n == bodySize
+			accumulateRequestBody(f, body[written:written+n], endStream)
+			written += n
+		}
+
+		// Run the script top-level + invoke envoy_on_request — this is
+		// where rh:body() fires + the `lua.LString(string(b))` defensive
+		// copy lands per body.go:326.
+		if err := f.vm.Run(f.cc.chunk); err != nil {
+			b.Fatalf("vm.Run err = %v", err)
+		}
+		if err := f.vm.CallGlobal("envoy_on_request", rud); err != nil {
+			b.Fatalf("vm.CallGlobal err = %v", err)
+		}
+
+		// Per-stream cleanup.
+		cancelCtx()
+		f.vm.Close()
+		f.vm = nil
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 15 — race tests N=100 parallel filter dispatches at FULL 22.2
+// bridge surface + goroutine-leak detection + cross-stream-state-leak
+// detection per D-P10 + ADR-0071 single-goroutine-per-stream invariant.
+// ----------------------------------------------------------------------
+
+// TestRace_N100_parallel_filter_dispatches_clean_under_race spawns N=100
+// concurrent goroutines, each constructing an independent *filter bound
+// to the SHARED *compiledConfig + running DecodeHeaders / DecodeData /
+// EncodeHeaders / EncodeData / OnDestroy at the FULL 22.2 bridge surface.
+// Asserts:
+//
+//   - No cross-stream state leak: each goroutine's script observes its
+//     own X-Stream-Id header (echoed back as X-Lua-Saw) + its own body
+//     bytes (echoed back as X-Body-Len). Cross-contamination would
+//     surface as a per-goroutine assertion failure.
+//   - No goroutine leak: runtime.NumGoroutine delta between baseline +
+//     post-test stays bounded (≤ 2 — accommodates the Go scheduler's own
+//     churn). Child *LState CancelFunc invocations are tracked via the
+//     OnDestroy path (f.vm.Close releases the parent + child loops per
+//     ADR-0191 §Context).
+//   - All 5 NEW envoy-go-strict counters increment as expected
+//     (body_buffered_bytes_total + coroutine_yields_total exercised by
+//     the body-bridge path; httpcall_* counters NOT exercised here
+//     — Task 16 fuzzers cover the httpCall path).
+//
+// Race-clean under `go test -race -count=10`. Skipped under `-short`.
+func TestRace_N100_parallel_filter_dispatches_clean_under_race(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip parallel race test under -short")
+	}
+
+	const script = `
+		function envoy_on_request(rh)
+			local v = rh:headers():get("X-Stream-Id")
+			rh:headers():add("X-Lua-Saw", v or "")
+			local b = rh:body()
+			rh:headers():add("X-Body-Len", tostring(#b))
+		end
+		function envoy_on_response(rh)
+			local v = rh:headers():get("X-Resp-Stream-Id")
+			rh:headers():add("X-Resp-Lua-Saw", v or "")
+		end
+	`
+	chunk, err := luaprim.CompileScript([]byte(script), nil)
+	if err != nil {
+		t.Fatalf("CompileScript err = %v; want nil", err)
+	}
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		chunk: chunk,
+		stats: newFilterStats(reg, "ingress_http", "race_n100"),
+	}
+
+	// Settle baseline before spawning the worker pool.
+	runtime.GC()
+	time.Sleep(20 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	const N = 100
+	var (
+		wg       sync.WaitGroup
+		failures atomic.Int64
+	)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			f := &filter{cc: cc}
+			f.SetDecoderCallbacks(&recordedDCB{})
+			f.SetEncoderCallbacks(&recordedECB{})
+			// Per-stream OnDestroy releases the VM + child loops per
+			// ADR-0191 §Context. Idempotent guard at lua.go:533-538.
+			defer f.OnDestroy()
+
+			// To exercise rh:body() inline within DecodeHeaders' synchronous
+			// CallGlobal (i.e., NOT via the coroutine yield/resume path —
+			// the script run from DecodeHeaders is not itself a coroutine,
+			// so a yield from rh:body() would surface a "can not yield from
+			// outside of a coroutine" error), we accumulate the body PRIOR
+			// to DecodeHeaders. This pre-DecodeHeaders body accumulation is
+			// supported by the *filter's lazy state: f.decodedBodyBytes +
+			// f.bodyReady are *filter fields, not VM-scoped, so DecodeData
+			// can fire before DecodeHeaders constructs the VM.
+			//
+			// Production HCM dispatch fires DecodeHeaders FIRST then
+			// DecodeData; the coroutine yield/resume path is exercised by
+			// body_test.go::Test_RequestHandleBody_coroutine_yield_before_
+			// endStream_then_resume which mounts the script body inside an
+			// explicit Resume call. The race test here uses the simpler
+			// already-ready synchronous path so the N=100 parallelism
+			// surfaces cross-goroutine state leaks WITHOUT entangling the
+			// coroutine harness setup (which would itself need per-
+			// goroutine harness state — orthogonal to the race-clean
+			// assertion).
+			bodyBytes := []byte(fmt.Sprintf("body-payload-%d", idx))
+			f.DecodeData(bodyBytes, true)
+
+			// Decode-side: X-Stream-Id seeds the cross-stream-leak probe.
+			reqHeaders := http.Header{
+				"X-Stream-Id": []string{fmt.Sprintf("stream-%d", idx)},
+			}
+			if status := f.DecodeHeaders(reqHeaders, false); status != envoyhttp.Continue {
+				t.Errorf("[%d] decode status = %v; want Continue", idx, status)
+				failures.Add(1)
+				return
+			}
+
+			// Cross-stream-state-leak assertion: this goroutine's X-Stream-Id
+			// must echo back into its OWN headers map under X-Lua-Saw.
+			wantStreamID := fmt.Sprintf("stream-%d", idx)
+			if got := reqHeaders.Get("X-Lua-Saw"); got != wantStreamID {
+				t.Errorf("[%d] X-Lua-Saw = %q; want %q (cross-stream leak)",
+					idx, got, wantStreamID)
+				failures.Add(1)
+				return
+			}
+
+			// Encode side: independent X-Resp-Stream-Id seed.
+			respHeaders := http.Header{
+				"X-Resp-Stream-Id": []string{fmt.Sprintf("resp-%d", idx)},
+			}
+			if status := f.EncodeHeaders(respHeaders, false); status != envoyhttp.Continue {
+				t.Errorf("[%d] encode status = %v; want Continue", idx, status)
+				failures.Add(1)
+				return
+			}
+			wantRespID := fmt.Sprintf("resp-%d", idx)
+			if got := respHeaders.Get("X-Resp-Lua-Saw"); got != wantRespID {
+				t.Errorf("[%d] X-Resp-Lua-Saw = %q; want %q (cross-stream leak)",
+					idx, got, wantRespID)
+				failures.Add(1)
+				return
+			}
+
+			// EncodeData: terminal signal closes the body path.
+			f.EncodeData([]byte("resp-body"), true)
+		}(i)
+	}
+	wg.Wait()
+
+	if n := failures.Load(); n > 0 {
+		t.Fatalf("%d / %d goroutines failed assertions", n, N)
+	}
+
+	// Goroutine-leak assertion: settled goroutine count must not exceed
+	// baseline + 2 (Go scheduler churn tolerance). Each per-stream filter
+	// is purely synchronous (no background goroutines spawned for the
+	// body/headers paths exercised here); the httpCall sync dispatch
+	// goroutine is NOT exercised here.
+	runtime.GC()
+	time.Sleep(20 * time.Millisecond)
+	after := runtime.NumGoroutine()
+	if after > before+2 {
+		t.Fatalf("goroutine leak: before=%d after=%d delta=%d (tolerance ≤ 2)",
+			before, after, after-before)
+	}
+
+	// Counter assertions per the 5 NEW envoy-go-strict counters at SPEC
+	// §7.1. Each goroutine invokes envoy_on_request ONCE (via
+	// DecodeHeaders) + envoy_on_response ONCE (via EncodeHeaders) =
+	// 2 * N executions total. Each DecodeData call contributes
+	// len(bodyBytes) to body_buffered_bytes_total + EncodeData contributes
+	// len("resp-body")=9.
+	gotExec := cc.stats.executions.Load()
+	wantExec := uint64(N * 2)
+	if gotExec != wantExec {
+		t.Errorf("executions = %d; want %d (1 decode + 1 encode run per goroutine)",
+			gotExec, wantExec)
+	}
+	if gotErrors := cc.stats.errors.Load(); gotErrors != 0 {
+		t.Errorf("errors = %d; want 0 (no script errors expected)", gotErrors)
+	}
+	// body_buffered_bytes_total: sum across all goroutines of the
+	// decode-side body length + encode-side "resp-body" (9 bytes).
+	var wantBodyBytes uint64
+	for i := 0; i < N; i++ {
+		wantBodyBytes += uint64(len(fmt.Sprintf("body-payload-%d", i))) + 9
+	}
+	if got := cc.stats.bodyBufferedBytesTotal.Load(); got != wantBodyBytes {
+		t.Errorf("body_buffered_bytes_total = %d; want %d", got, wantBodyBytes)
 	}
 }

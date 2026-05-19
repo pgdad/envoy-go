@@ -74,6 +74,7 @@ package lua
 //    without an extra indirection. getHeadersFromUD just casts back.
 
 import (
+	"crypto/tls"
 	"log"
 	"net/http"
 	"sort"
@@ -82,6 +83,7 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
@@ -95,6 +97,31 @@ const (
 	responseHandleTypeName = "envoy_response_handle"
 	headersTypeName        = "envoy_headers"
 	streamInfoTypeName     = "envoy_stream_info"
+	// Task 8 (phase 22.2 IMPL) — distinct metatable registry-key for the
+	// trailers userdata per SPEC §3.4 + §2.2. The trailers metatable
+	// dispatches the SAME 7 mutation methods as the headers metatable +
+	// the SAME __pairs alphabetical-snapshot iterator (reuses
+	// installPairsShim discipline UNCHANGED from 22.1 per SPEC §11.2.2),
+	// but is registered under a distinct registry key so Lua-side
+	// `getmetatable(rh:trailers()) ~= getmetatable(rh:headers())` holds
+	// (preserves type-distinct identity for script authors who care).
+	trailersTypeName = "envoy_trailers"
+	// Task 9 (phase 22.2 IMPL) — distinct metatable registry-keys for the
+	// :metadata() callable-empty-userdata + :dynamicMetadata() Bucket
+	// wrapper per SPEC §3.4 + §11.6 D1 closure + ADR-0192. See metadata.go
+	// for the wrapper construction + the structpb.Value ↔ Lua-value
+	// marshaling helpers.
+	//
+	//   - metadataTypeName — the :metadata() userdata. ALWAYS-CALLABLE
+	//     EMPTY per §11.6 D1 closure: `:get(k)` returns lua.LNil for any
+	//     key; pairs() yields zero iterations. Matches upstream
+	//     MetadataMapWrapper always-non-nil pattern at v1.32.4 binding-gap.
+	//   - dynamicMetadataTypeName — the :streamInfo():dynamicMetadata()
+	//     userdata wrapping a *dynamicmetadata.Bucket. `:get(filterName,
+	//     key)` + `:set(filterName, key, value)` round-trip via structpb.
+	//     Value marshaling helpers (structpbToLua + luaToStructpb).
+	metadataTypeName        = "envoy_metadata"
+	dynamicMetadataTypeName = "envoy_dynamic_metadata"
 )
 
 // ---------------------------------------------------------------------
@@ -149,26 +176,143 @@ type RequestHandleCallbacks interface {
 	// (envoy-go has no proxy-chain origin distinction yet, so "remote" ==
 	// "direct remote"). Empty string for synthetic streams.
 	DownstreamDirectRemoteAddress() string
+
+	// DynamicMetadata returns the per-stream cross-filter dynamic-metadata
+	// Bucket (per ADR-0190). Consumed by Task 9 (phase 22.2 IMPL) bridge
+	// methods :streamInfo():dynamicMetadata() + :dynamicTypedMetadata() —
+	// the streamInfo userdata's dispatch tables (streamInfoMethods) route
+	// through this accessor to land the bucket pointer in the metadata-
+	// bridge LGFunctions in metadata.go.
+	//
+	// Nil-tolerant per ADR-0085 — a nil *Bucket return surfaces at the
+	// bridge as a no-op :set + nil :get (the bucket type itself is nil-
+	// receiver-tolerant; the metadata-bridge LGFunctions additionally
+	// short-circuit on nil to avoid pushing useless userdata into the Lua
+	// stack — see dynamicMetadataFromUD in metadata.go).
+	//
+	// Task 13 (streaminfo.go extraction) extends this same dispatch surface
+	// with 5 additional methods (:upstreamHost / :upstreamCluster /
+	// :requestedServerName / :filterState / :downstreamSslConnection)
+	// without re-touching this interface — the bridge:adapter contract is
+	// stable at Task 9's addition.
+	DynamicMetadata() *dynamicmetadata.Bucket
+
+	// DownstreamTLSConnectionState returns the per-stream
+	// *tls.ConnectionState observed by HCM dispatch at chain build time
+	// (per Task 5 callbacks.go extension + Task 6 H1/H2 seeding). Returns
+	// nil for plaintext / non-TLS / pre-handshake connections per ADR-0144
+	// plumbing pattern.
+	//
+	// Consumed by the phase-22.2 lua bridge's :connection():ssl() surface
+	// (Task 10) — the connection wrapper holds the state pointer; :ssl()
+	// returns lua.LNil when the pointer is nil (plaintext) OR the 12-method
+	// ssl userdata when non-nil (TLS). Task 13 additionally reuses this
+	// accessor for :streamInfo():downstreamSslConnection() (symmetric
+	// dispatch path).
+	//
+	// Per ADR-0192 §Decision body anticipation + SPEC §11.5.3 (chain-side
+	// extension lives INSIDE ADR-0192 per Q13 WEAK HOLD — no separate ADR).
+	// Cross-phase reusable for any future filter needing full TLS handshake
+	// state.
+	DownstreamTLSConnectionState() *tls.ConnectionState
+
+	// UpstreamHost returns the resolved upstream endpoint formatted as
+	// "host:port" (or just "host" when no port surface is available).
+	// Empty string when no upstream has been selected (pre-router
+	// dispatch / decode-only filters / local-reply paths). At phase 22.2
+	// the framework adapter stubs this as "" because the project's
+	// DecoderFilterCallbacks does NOT expose an upstream-host accessor
+	// (framework gap; matches the RouteName pattern). Future framework
+	// extension may light up the real value.
+	//
+	// Consumed by :streamInfo():upstreamHost() (Task 13).
+	UpstreamHost() string
+
+	// UpstreamCluster returns the cluster name from which the upstream
+	// endpoint was selected. Same framework-gap disposition as
+	// UpstreamHost — empty string at phase 22.2.
+	//
+	// Consumed by :streamInfo():upstreamCluster() (Task 13).
+	UpstreamCluster() string
+
+	// RequestedServerName returns the TLS SNI value surfaced by the
+	// downstream handshake. The adapter sources this from the per-stream
+	// *tls.ConnectionState.ServerName field (when the connection is TLS)
+	// OR the empty string (plaintext / pre-handshake). Per SPEC §3.4 +
+	// §11.5.3 ADR-0144 plumbing pattern.
+	//
+	// Consumed by :streamInfo():requestedServerName() (Task 13).
+	RequestedServerName() string
+
+	// FilterState returns the per-stream string-keyed `map[string]any`
+	// stored on *filter (lua.go) per SPEC §11.8 D4 closure + AMEND-22.2-4.
+	// May be nil at the start of a stream (lazy-allocated on first :set
+	// from the bridge LGFunction). The adapter wires this to *filter's
+	// filterState field via a closure capture at adapter construction
+	// time (see newRequestHandleCallbacksAdapter + the *filter back-
+	// pointer plumbing in decode_headers.go).
+	//
+	// Consumed by :streamInfo():filterState() (Task 13). The bridge
+	// LGFunction (filterstate.go) wraps the returned map (via
+	// filterStateRef) into a filterstate userdata exposing :get + :set
+	// with the typed Lua-value marshaling table per AMEND-22.2-4.
+	FilterState() map[string]any
+
+	// SetFilterState installs a freshly-allocated map[string]any onto
+	// the per-stream filterState field (lazy-allocation path from the
+	// bridge LGFunction's :set on a nil map). The freshly-allocated
+	// map is then observable via subsequent FilterState() calls (the
+	// adapter writes it through to *filter.filterState).
+	//
+	// nil-tolerant on the underlying *filter back-pointer (synthetic
+	// test path) — silent no-op.
+	//
+	// Consumed by the filterstate.go bridge LGFunction (filterStateSet)
+	// for the lazy-allocation discipline.
+	SetFilterState(m map[string]any)
 }
 
 // requestHandleContext is the Go-side state backing a request_handle
 // userdata. One per per-stream filter dispatch (decode side). Task 8
 // adds the cb field consumed by :streamInfo(); Task 9 extends with
-// respond-state capture consumed by decode_headers.go.
+// respond-state capture consumed by decode_headers.go. Task 7 (phase
+// 22.2 IMPL) adds the filterRef back-pointer consumed by the body-
+// bridge LGFunctions (:body() / :bodyChunks()) to resolve the owning
+// *filter for body-buffer access + counter increments + coroutine
+// suspend/resume orchestration.
 type requestHandleContext struct {
 	headers         http.Header
 	cb              RequestHandleCallbacks // Task 8 — :streamInfo() accessor surface
 	respondCaptured *respondState          // Task 9 — :respond() capture; nil = no respond fired
+	filterRef       *filter                // Task 7 (22.2) — body-bridge back-pointer to *filter
+
+	// trailers holds the per-stream request-side trailers map per Task 8
+	// (phase 22.2 IMPL). Nil-valued until DecodeTrailers fires (lazy-
+	// availability per SPEC §2.2 + PLAN Q2 — upstream Lua filter's
+	// `trailers()` returns nil pre-trailers-arrival). When non-nil,
+	// `request_handle:trailers()` returns a userdata wrapping this map
+	// with the 7 mutation methods + __pairs alphabetical-snapshot
+	// iterator.
+	trailers http.Header
 }
 
 // responseHandleContext is the Go-side state backing a response_handle
 // userdata. Symmetric to requestHandleContext for the encode side. Task
 // 8 adds the cb field (response-side parity for :streamInfo()); Task 9
 // adds NO respond-state capture (the encode-side :respond() raises a
-// runtime error per AMEND-8 — no capture surface needed).
+// runtime error per AMEND-8 — no capture surface needed). Task 7 (phase
+// 22.2 IMPL) adds the filterRef back-pointer for the body-bridge
+// LGFunctions on the encode side (symmetric to requestHandleContext).
 type responseHandleContext struct {
-	headers http.Header
-	cb      RequestHandleCallbacks // Task 8 — :streamInfo() accessor surface (encode-side parity)
+	headers   http.Header
+	cb        RequestHandleCallbacks // Task 8 — :streamInfo() accessor surface (encode-side parity)
+	filterRef *filter                // Task 7 (22.2) — body-bridge back-pointer to *filter (encode side)
+
+	// trailers holds the per-stream response-side trailers map per Task 8
+	// (phase 22.2 IMPL). Symmetric to requestHandleContext.trailers —
+	// nil until EncodeTrailers fires. When non-nil,
+	// `response_handle:trailers()` returns a userdata wrapping this map.
+	trailers http.Header
 }
 
 // respondState captures the result of a successful
@@ -284,21 +428,63 @@ func installHeadersMetatable(L *lua.LState) *lua.LTable {
 	return mt
 }
 
-// installStreamInfoMetatable registers the metatable for the streamInfo
-// userdata under streamInfoTypeName. The metatable holds:
-//   - __index → table of 4 streamInfo methods (:protocol / :routeName /
-//     :downstreamLocalAddress / :downstreamDirectRemoteAddress)
+// installTrailersMetatable registers the metatable for the trailers
+// userdata under trailersTypeName per Task 8 (phase 22.2 IMPL) + SPEC
+// §3.4 + §2.2. The metatable shape MIRRORS the headers metatable
+// exactly (per BRAINSTORM §2.2 + SPEC §11.2.2 "trailers `pairs(udata)`
+// CONFIRMED-IDENTICAL via 22.1 installPairsShim discipline"):
 //
-// Per 22.1 SPEC §6 Task 8 + parent §11.6, the per-stream-VM setup (Task 9
-// decode_headers.go) calls this helper once at NewVM time alongside
-// installRequestHandleMetatable + installResponseHandleMetatable +
-// installHeadersMetatable. The streamInfo userdata is allocated on-demand
-// inside request_handle:streamInfo() — it wraps a RequestHandleCallbacks
-// (the interface the adapter satisfies), NOT a *requestHandleContext —
-// since the 4 accessor methods consume the callback shape exclusively.
-func installStreamInfoMetatable(L *lua.LState) *lua.LTable {
-	mt := L.NewTypeMetatable(streamInfoTypeName)
-	L.SetField(mt, "__index", L.SetFuncs(L.NewTable(), streamInfoMethods))
+//   - __index → table of 7 trailers methods (the same headersMethods
+//     dispatch table; trailers map values are http.Header so the methods
+//     work identically — the type-distinct metatable just marks the
+//     userdata as a trailers object at the Lua-script visible layer).
+//   - __pairs → alphabetical-snapshot iterator (the same headersPairs
+//     LGFunction; reads the underlying http.Header via the SAME
+//     getHeadersFromUD helper).
+//
+// The pairs-shim (installPairsShim) is shared with headers — installed
+// once per VM and dispatches __pairs for both envoy_headers AND
+// envoy_trailers userdata.
+func installTrailersMetatable(L *lua.LState) *lua.LTable {
+	mt := L.NewTypeMetatable(trailersTypeName)
+	L.SetField(mt, "__index", L.SetFuncs(L.NewTable(), headersMethods))
+	L.SetField(mt, "__pairs", L.NewFunction(headersPairs))
+	return mt
+}
+
+// installStreamInfoMetatable lives at streaminfo.go (Task 13 extraction).
+
+// installMetadataMetatable registers the metatable for the metadata
+// userdata under metadataTypeName per Task 9 (phase 22.2 IMPL) + SPEC
+// §3.4 + §11.6 D1 closure. The metatable holds:
+//   - __index → table of 1 metadata method (:get)
+//   - __pairs → zero-iteration iterator (empty-source per binding-gap)
+//
+// Per §11.6 D1 CLOSURE the metadata userdata is ALWAYS callable + ALWAYS
+// returns empty (`:get(k)` returns lua.LNil for any k; pairs() yields
+// zero iterations). Matches upstream MetadataMapWrapper always-non-nil
+// pattern at v1.32.4 binding-gap. Source-of-data flips on at v1.32.4 →
+// v1.37.x binding bump per parent AMEND-12 (future phase).
+func installMetadataMetatable(L *lua.LState) *lua.LTable {
+	mt := L.NewTypeMetatable(metadataTypeName)
+	L.SetField(mt, "__index", L.SetFuncs(L.NewTable(), metadataMethods))
+	L.SetField(mt, "__pairs", L.NewFunction(metadataPairs))
+	return mt
+}
+
+// installDynamicMetadataMetatable registers the metatable for the
+// :streamInfo():dynamicMetadata() userdata under dynamicMetadataTypeName
+// per Task 9 (phase 22.2 IMPL) + SPEC §3.4. The metatable holds:
+//   - __index → table of 2 dynamicMetadata methods (:get / :set)
+//
+// The userdata wraps a *dynamicmetadata.Bucket. :get(filterName, key)
+// returns the structpb.Value-marshaled Lua value or lua.LNil; :set(
+// filterName, key, value) marshals the Lua value back to *structpb.Value
+// and stores in the bucket. Both methods tolerate a nil Bucket per
+// ADR-0085 (nil-receiver discipline).
+func installDynamicMetadataMetatable(L *lua.LState) *lua.LTable {
+	mt := L.NewTypeMetatable(dynamicMetadataTypeName)
+	L.SetField(mt, "__index", L.SetFuncs(L.NewTable(), dynamicMetadataMethods))
 	return mt
 }
 
@@ -378,6 +564,81 @@ var requestHandleMethods = map[string]lua.LGFunction{
 	// :status [200, 600) validation. The captured respondState is read
 	// by decode_headers.go after envoy_on_request returns.
 	"respond": requestHandleRespond,
+	// Task 7 (phase 22.2 IMPL) — :body() whole-buffer + :bodyChunks()
+	// chunked iterator per SPEC §3.4 + §4.1 + §11.3 D3 closure (option
+	// (a) defensive copy at endStream). Pre-endStream :body() suspends
+	// via YieldFromBridge per §11.1 D2 closure; DecodeData at endStream
+	// resumes with the accumulated bytes. Over-cap raises arm-21
+	// runtime-reject byte-stable wording per W2.
+	"body":       requestHandleBody,
+	"bodyChunks": requestHandleBodyChunks,
+	// Task 8 (phase 22.2 IMPL) — :trailers() returns a userdata wrapping
+	// the request-side trailers map (envoy_trailers metatable) or nil if
+	// trailers have not yet been received (lazy-availability per SPEC
+	// §2.2 + PLAN Q2). The userdata exposes the SAME 7 mutation methods
+	// + __pairs alphabetical-snapshot as the headers metatable, but is a
+	// distinct Lua-side type. See trailers.go for the LGFunction body +
+	// the trailersMethods dispatch table.
+	"trailers": requestHandleTrailers,
+	// Task 9 (phase 22.2 IMPL) — :metadata() returns ALWAYS-CALLABLE
+	// EMPTY USERDATA per SPEC §11.6 D1 closure (NEVER nil; matches
+	// upstream MetadataMapWrapper always-non-nil pattern at v1.32.4
+	// binding-gap). The wrapper's :get(k) returns lua.LNil for any key;
+	// pairs() yields zero iterations. See metadata.go.
+	"metadata": requestHandleMetadata,
+	// Task 10 (phase 22.2 IMPL) — :connection() returns a connection
+	// userdata wrapping the per-stream *tls.ConnectionState (may be nil
+	// for plaintext). The wrapper exposes a single primary :ssl()
+	// method that returns lua.LNil on plaintext OR the 12-method ssl
+	// userdata on TLS. Per BRAINSTORM §2.4 Q4 closure: :connection() is
+	// scoped to the SSL accessor only (per-connection address surface
+	// lives on :streamInfo() per SPEC §2.11). See connection.go + ssl.go.
+	"connection": requestHandleConnection,
+	// Task 11 (phase 22.2 IMPL) — :httpCall(cluster, headers, body,
+	// timeout_ms, asynchronous?) cluster-based outbound HTTP dispatch
+	// per SPEC §3.4 + §11.7 D6 closure + AMEND-22.2-3. FIRST CO-CONSUMER
+	// of Task 4's ADR-0177 IN-PLACE AMENDMENT ClusterDispatch (R5
+	// RATIFIED at Task 4 + actualized here). Sync path: coroutine yield +
+	// Go-side dispatch + resume with (headers_table, body_string) on
+	// success OR (nil, err_string) on failure. Async path (asynchronous=
+	// true): PURE FIRE-AND-FORGET — spawns goroutine, returns 0 values
+	// immediately, NO yield, response/error discarded per upstream
+	// lua_filter.cc:400-416 noopCallbacks parity. Counters: httpcall_total
+	// increments on every dispatch (sync + async); httpcall_failures +
+	// httpcall_timeouts SYNC-ONLY per AMEND-22.2-3 (async failures
+	// invisible at filter-stats per upstream parity). Arm-20 runtime-
+	// reject byte-stable wording if cluster == "" per SPEC §6 + W2.
+	// See httpcall.go.
+	"httpCall": requestHandleHttpCall,
+	// Task 12 (phase 22.2 IMPL) — 6 crypto methods + 2 misc methods
+	// (:fileBytes + :timestamp) per SPEC §3.4 + §6 arm-22 + AMEND-22.2-1
+	// + AMEND-22.2-2 + D8 closure at PLAN session. See crypto.go + misc.go.
+	//
+	// Classification per D8 PLAN closure:
+	//   - :base64Escape    — upstream-parity (per AMEND-22.2-1)
+	//   - :base64Decode    — envoy-go-strict (per D8 PLAN scrape)
+	//   - :sha256          — envoy-go-strict (per D8 PLAN scrape)
+	//   - :sha512          — envoy-go-strict (per D8 PLAN scrape)
+	//   - :importPublicKey — upstream-parity (MIMICKING wrappers.h:415-427)
+	//   - :verifySignature — upstream-parity (calling convention pinned
+	//                        to upstream lua_filter.cc:611; 4 args ordered
+	//                        as hash_algo, pubkey_wrapper, sig, text)
+	//   - :fileBytes       — envoy-go-strict (per D8; NOT in upstream)
+	//   - :timestamp       — envoy-go-strict (NOT in upstream
+	//                        StreamHandleWrapper)
+	//
+	// 4 NEW envoy-go-strict BEHAVIOR_CONTRACT.md departure records
+	// anticipated at Task 19 atomic landing for :base64Decode + :sha256 +
+	// :sha512 + :fileBytes (bundle 7 → 11; :timestamp may also warrant a
+	// record per Task 19 final scrape — PLAN settles).
+	"base64Escape":    requestHandleBase64Escape,
+	"base64Decode":    requestHandleBase64Decode,
+	"sha256":          requestHandleSha256,
+	"sha512":          requestHandleSha512,
+	"importPublicKey": requestHandleImportPublicKey,
+	"verifySignature": requestHandleVerifySignature,
+	"fileBytes":       requestHandleFileBytes,
+	"timestamp":       requestHandleTimestamp,
 }
 
 // responseHandleMethods mirrors requestHandleMethods for the response
@@ -406,21 +667,53 @@ var responseHandleMethods = map[string]lua.LGFunction{
 	// through PCall + surfaces as *lua.ApiError to encode_headers.go,
 	// which increments cc.stats.errors + logs.
 	"respond": responseHandleRespond,
+	// Task 7 (phase 22.2 IMPL) — encode-side :body() + :bodyChunks()
+	// symmetric to the request side. EncodeData accumulates response-
+	// body bytes; pre-endStream :body() suspends via YieldFromBridge;
+	// EncodeData at endStream resumes.
+	"body":       responseHandleBody,
+	"bodyChunks": responseHandleBodyChunks,
+	// Task 8 (phase 22.2 IMPL) — encode-side :trailers() parity. Returns
+	// the response-side trailers userdata or nil pre-EncodeTrailers
+	// firing.
+	"trailers": responseHandleTrailers,
+	// Task 9 (phase 22.2 IMPL) — encode-side :metadata() parity. Symmetric
+	// to the request-side; returns the same ALWAYS-CALLABLE EMPTY USERDATA
+	// per §11.6 D1 closure.
+	"metadata": responseHandleMetadata,
+	// Task 10 (phase 22.2 IMPL) — encode-side :connection() parity.
+	// Symmetric to the request-side; returns the same connection userdata
+	// wrapping per-stream *tls.ConnectionState; :ssl() exposes the same 12
+	// method surface. See connection.go + ssl.go.
+	"connection": responseHandleConnection,
+	// Task 11 (phase 22.2 IMPL) — encode-side :httpCall() parity. Symmetric
+	// to the request-side; same cluster-based dispatch + sync/async
+	// semantics + counter discipline. See httpcall.go.
+	"httpCall": responseHandleHttpCall,
+	// Task 12 (phase 22.2 IMPL) — encode-side crypto + misc parity per
+	// SPEC §3.4. Symmetric to the request-side; same stateless dispatch
+	// (the receiver type-check at index 1 is only a sanity-check — these
+	// methods do not consult the handle context). See crypto.go + misc.go.
+	"base64Escape":    responseHandleBase64Escape,
+	"base64Decode":    responseHandleBase64Decode,
+	"sha256":          responseHandleSha256,
+	"sha512":          responseHandleSha512,
+	"importPublicKey": responseHandleImportPublicKey,
+	"verifySignature": responseHandleVerifySignature,
+	"fileBytes":       responseHandleFileBytes,
+	"timestamp":       responseHandleTimestamp,
 }
 
-// streamInfoMethods is the method-name → LGFunction dispatch table for
-// the streamInfo userdata's __index metafield. 4 methods per BRAINSTORM
-// Q6 pragmatic-middle bridge surface + parent §11.6 + 22.1 SPEC §6 Task 8.
-// Future tasks (22.2 phase) extend with the deferred methods
-// (:upstreamHost / :upstreamCluster / :dynamicMetadata /
-// :dynamicTypedMetadata / :requestedServerName / :filterState /
-// :downstreamSslConnection) per parent §2.11.
-var streamInfoMethods = map[string]lua.LGFunction{
-	"protocol":                      streamInfoProtocol,
-	"routeName":                     streamInfoRouteName,
-	"downstreamLocalAddress":        streamInfoDownstreamLocalAddress,
-	"downstreamDirectRemoteAddress": streamInfoDownstreamDirectRemoteAddress,
-}
+// streamInfoMethods + installStreamInfoMetatable + the streamInfo
+// userdata helpers (requestHandleStreamInfo / responseHandleStreamInfo
+// / pushStreamInfoUD / streamInfoCallbacksFromUD) + the 11 LGFunction
+// implementations all live at streaminfo.go (Task 13 phase 22.2 IMPL —
+// extracted from this file as the streamInfo surface grew from 4
+// methods (22.1) to 11 methods (22.2 phase-done) per SPEC §3.4 + PLAN
+// Task 13). The metadata-bridge LGFunctions
+// (streamInfoDynamicMetadata + streamInfoDynamicTypedMetadata) live at
+// metadata.go since they consume the *dynamicmetadata.Bucket primitive
+// from Task 1.
 
 // headersMethods is the method-name → LGFunction dispatch table for
 // the headers userdata's __index metafield. 7 methods per BRAINSTORM
@@ -747,164 +1040,15 @@ func headersPairs(L *lua.LState) int {
 }
 
 // ---------------------------------------------------------------------
-// Task 8 — :streamInfo() 4-method subset per BRAINSTORM Q6 + parent §11.6
-// + 22.1 SPEC §6 Task 8
+// Task 8 — :streamInfo() bridge extracted to streaminfo.go (Task 13)
 // ---------------------------------------------------------------------
 //
-// `request_handle:streamInfo()` (and the symmetric
-// `response_handle:streamInfo()`) returns a streamInfo userdata exposing
-// 4 accessor methods sourced from the per-context cb field
-// (RequestHandleCallbacks interface — see the interface definition at the
-// top of this file for the framework-gap insulation rationale).
-//
-// The 4 methods return strings ready to push onto the Lua stack (the
-// callback interface handles net.Addr → "ip:port" formatting + stubbing
-// of framework gaps). Per the "always-string, never-nil" contract
-// anchored at parent §11.6 (matching upstream's std::string return
-// shape), each method emits an empty Lua-string when the underlying
-// callback returns "" — never lua.LNil.
-//
-// Defensive nil-cb handling: if the context's cb field is nil (e.g.
-// synthetic test invocation that did not wire the adapter), each accessor
-// pushes the empty string rather than panicking on a nil-interface
-// dereference. The 2 helper functions
-// (streamInfoCallbacksFromUD + pushStreamInfoString) centralize the
-// nil-cb fallback and the string-push convention.
-
-// requestHandleStreamInfo implements request_handle:streamInfo().
-// Returns a streamInfo userdata that wraps the per-context
-// RequestHandleCallbacks. The returned userdata shares the same cb
-// pointer — calling :protocol() / :routeName() / etc. on the userdata
-// is observationally equivalent to calling the corresponding callback
-// method on the request_handle's adapter.
-func requestHandleStreamInfo(L *lua.LState) int {
-	ud := L.CheckUserData(1)
-	ctx, ok := ud.Value.(*requestHandleContext)
-	if !ok {
-		L.ArgError(1, "expected request_handle")
-		return 0
-	}
-	return pushStreamInfoUD(L, ctx.cb)
-}
-
-// responseHandleStreamInfo implements response_handle:streamInfo().
-// Symmetric to requestHandleStreamInfo — wraps the response-handle's
-// per-context callbacks. Script authors writing envoy_on_response may
-// reasonably want to read stream metadata; the encode-side parity keeps
-// the API symmetric. Both sides expose the same 4-method surface; the
-// adapter in Task 9 wires the same per-stream callbacks for both
-// handles.
-func responseHandleStreamInfo(L *lua.LState) int {
-	ud := L.CheckUserData(1)
-	ctx, ok := ud.Value.(*responseHandleContext)
-	if !ok {
-		L.ArgError(1, "expected response_handle")
-		return 0
-	}
-	return pushStreamInfoUD(L, ctx.cb)
-}
-
-// pushStreamInfoUD allocates a fresh LUserData wrapping the supplied
-// RequestHandleCallbacks + attaches the envoy_stream_info metatable +
-// pushes it onto the stack. Returns 1 (number of pushed return values
-// per LGFunction convention).
-//
-// The cb argument may be nil — the per-method accessor helpers
-// (streamInfoCallbacksFromUD) tolerate a nil interface and surface
-// empty strings for all 4 methods (per the defensive-nil discipline
-// described in the section header).
-func pushStreamInfoUD(L *lua.LState, cb RequestHandleCallbacks) int {
-	ud := L.NewUserData()
-	ud.Value = cb
-	L.SetMetatable(ud, L.GetTypeMetatable(streamInfoTypeName))
-	L.Push(ud)
-	return 1
-}
-
-// streamInfoCallbacksFromUD type-checks + extracts the
-// RequestHandleCallbacks from the userdata at the supplied stack index.
-// Returns nil on nil cb (the wrapping userdata exists but holds a nil
-// callbacks interface — synthetic test path). ArgError + nil-return on
-// type mismatch (e.g. caller passed a request_handle userdata where a
-// stream_info userdata was expected).
-//
-// Per the "always-string, never-nil" contract anchored at parent §11.6,
-// the 4 accessor methods unconditionally push a string onto the stack —
-// either the callback's value or the empty string when cb is nil.
-func streamInfoCallbacksFromUD(L *lua.LState, idx int) RequestHandleCallbacks {
-	ud := L.CheckUserData(idx)
-	// nil interface case: the userdata was constructed with cb=nil
-	// (e.g. test that did not wire the adapter). Return nil so the
-	// per-method accessor pushes the empty string.
-	if ud.Value == nil {
-		return nil
-	}
-	cb, ok := ud.Value.(RequestHandleCallbacks)
-	if !ok {
-		L.ArgError(idx, "expected stream_info")
-		return nil
-	}
-	return cb
-}
-
-// streamInfoProtocol implements streamInfo:protocol() — returns the
-// HTTP protocol version string ("HTTP/1.0" / "HTTP/1.1" / "HTTP/2" /
-// "HTTP/3" per upstream-parity literals; "" for synthetic streams that
-// did not exercise HCM dispatch).
-func streamInfoProtocol(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.Protocol()))
-	return 1
-}
-
-// streamInfoRouteName implements streamInfo:routeName() — returns the
-// resolved route name string or "" if no route is selected / the
-// framework adapter has no RouteName accessor (the phase-22.1
-// condition — framework gap to be closed in a future phase per the
-// RequestHandleCallbacks interface docstring).
-func streamInfoRouteName(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.RouteName()))
-	return 1
-}
-
-// streamInfoDownstreamLocalAddress implements
-// streamInfo:downstreamLocalAddress() — returns the listener's bound
-// "ip:port" formatted via net.Addr.String() (the Task 9 adapter handles
-// the formatting); "" for synthetic streams.
-func streamInfoDownstreamLocalAddress(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.DownstreamLocalAddress()))
-	return 1
-}
-
-// streamInfoDownstreamDirectRemoteAddress implements
-// streamInfo:downstreamDirectRemoteAddress() — returns the connecting
-// peer's "ip:port" formatted via net.Addr.String() (the Task 9 adapter
-// wires this to DownstreamRemoteAddr at phase 22.1; envoy-go has no
-// proxy-chain origin distinction yet, so "remote" == "direct remote").
-// "" for synthetic streams.
-func streamInfoDownstreamDirectRemoteAddress(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.DownstreamDirectRemoteAddress()))
-	return 1
-}
+// requestHandleStreamInfo + responseHandleStreamInfo +
+// pushStreamInfoUD + streamInfoCallbacksFromUD + the 11 per-method
+// LGFunctions all live at streaminfo.go (per PLAN Task 13 extraction).
+// The RequestHandleCallbacks interface definition (the bridge contract
+// consumed by those LGFunctions) stays in bridge.go since it doubles as
+// the framework:bridge seam (consumed by the adapters below).
 
 // ---------------------------------------------------------------------
 // Task 9 — :respond byte-pin per parent §11.6.7 + AMEND-7 + AMEND-8
@@ -1110,17 +1254,35 @@ func parseRespondStatus(lv lua.LValue) (int, bool) {
 //   - DownstreamDirectRemoteAddress — re-uses DownstreamRemoteAddr (no
 //     proxy-chain origin distinction in envoy-go yet, so "remote" ==
 //     "direct remote").
+//   - UpstreamHost / UpstreamCluster — no DecoderFilterCallbacks
+//     accessor at phase 22.2; return "" (Task 13 framework gap; matches
+//     the RouteName pattern).
+//   - RequestedServerName — derived from
+//     DownstreamTLSConnectionState().ServerName when non-nil; empty
+//     for plaintext.
+//   - FilterState — per-stream string-keyed `map[string]any` on the
+//     *filter back-pointer (Task 13). Lazily-allocated on first :set
+//     from the bridge LGFunction.
 type requestHandleCallbacksAdapter struct {
 	dcb envoyhttp.DecoderFilterCallbacks
+	// filter is the per-stream *filter back-pointer for FilterState
+	// access (Task 13). May be nil under ADR-0085 nil-tolerance at the
+	// synthetic test path (the adapter's FilterState accessor returns
+	// nil on nil filter — the bridge LGFunction tolerates the nil map).
+	filter *filter
 }
 
 // newRequestHandleCallbacksAdapter constructs an adapter wrapping the
-// supplied DecoderFilterCallbacks. The adapter satisfies the bridge's
-// RequestHandleCallbacks interface; nil-tolerant — a nil dcb produces
-// an adapter whose accessors all return the empty string (matches the
-// "always-string, never-nil" contract at parent §11.6).
-func newRequestHandleCallbacksAdapter(dcb envoyhttp.DecoderFilterCallbacks) RequestHandleCallbacks {
-	return &requestHandleCallbacksAdapter{dcb: dcb}
+// supplied DecoderFilterCallbacks + *filter back-pointer for FilterState
+// access. The adapter satisfies the bridge's RequestHandleCallbacks
+// interface; nil-tolerant — a nil dcb produces an adapter whose
+// accessors all return the empty string (matches the "always-string,
+// never-nil" contract at parent §11.6). A nil *filter produces an
+// adapter whose FilterState returns nil (defensive — the bridge
+// LGFunction tolerates the nil map via filterStateRef.get returning
+// nil).
+func newRequestHandleCallbacksAdapter(dcb envoyhttp.DecoderFilterCallbacks, f *filter) RequestHandleCallbacks {
+	return &requestHandleCallbacksAdapter{dcb: dcb, filter: f}
 }
 
 // Protocol returns the framework's DownstreamProtocol verbatim.
@@ -1162,6 +1324,78 @@ func (a *requestHandleCallbacksAdapter) DownstreamDirectRemoteAddress() string {
 	return addr.String()
 }
 
+// DynamicMetadata returns the per-stream cross-filter Bucket via the
+// framework's DecoderFilterCallbacks.DynamicMetadata accessor (per Task 5
+// callbacks.go extension + ADR-0190). Returns nil when the underlying
+// dcb is nil (synthetic test path) — the bridge metadata.go LGFunctions
+// tolerate the nil-bucket case per ADR-0085 nil-receiver discipline.
+func (a *requestHandleCallbacksAdapter) DynamicMetadata() *dynamicmetadata.Bucket {
+	if a.dcb == nil {
+		return nil
+	}
+	return a.dcb.DynamicMetadata()
+}
+
+// DownstreamTLSConnectionState returns the per-stream *tls.ConnectionState
+// via the framework's DecoderFilterCallbacks.DownstreamTLSConnectionState
+// accessor (per Task 5 callbacks.go extension + Task 6 H1/H2 seeding).
+// Returns nil for plaintext / non-TLS / pre-handshake connections AND
+// when the underlying dcb is nil (synthetic test path) — the bridge
+// connection.go + ssl.go LGFunctions short-circuit to lua.LNil at
+// connection:ssl() on nil-state.
+func (a *requestHandleCallbacksAdapter) DownstreamTLSConnectionState() *tls.ConnectionState {
+	if a.dcb == nil {
+		return nil
+	}
+	return a.dcb.DownstreamTLSConnectionState()
+}
+
+// UpstreamHost returns "" — Task 13 framework gap. The project's
+// DecoderFilterCallbacks does NOT expose an upstream-host accessor at
+// phase 22.2. Future framework extension may add it.
+func (a *requestHandleCallbacksAdapter) UpstreamHost() string { return "" }
+
+// UpstreamCluster returns "" — Task 13 framework gap (same as
+// UpstreamHost).
+func (a *requestHandleCallbacksAdapter) UpstreamCluster() string { return "" }
+
+// RequestedServerName derives the TLS SNI value from the per-stream
+// *tls.ConnectionState.ServerName field. Returns "" for plaintext /
+// pre-handshake connections per ADR-0144 plumbing pattern.
+func (a *requestHandleCallbacksAdapter) RequestedServerName() string {
+	if a.dcb == nil {
+		return ""
+	}
+	state := a.dcb.DownstreamTLSConnectionState()
+	if state == nil {
+		return ""
+	}
+	return state.ServerName
+}
+
+// FilterState returns the per-stream `map[string]any` from the *filter
+// back-pointer. May be nil (lazy-allocation discipline — the bridge
+// LGFunction's :set lazy-init path makes the freshly-allocated map
+// observable via subsequent :get calls on the same filterstate
+// userdata). Returns nil if the back-pointer is nil (synthetic test
+// path).
+func (a *requestHandleCallbacksAdapter) FilterState() map[string]any {
+	if a.filter == nil {
+		return nil
+	}
+	return a.filter.filterState
+}
+
+// SetFilterState installs a freshly-allocated map onto the *filter's
+// filterState field (lazy-allocation path from the bridge :set on a
+// previously-nil map). Silent no-op on nil back-pointer.
+func (a *requestHandleCallbacksAdapter) SetFilterState(m map[string]any) {
+	if a.filter == nil {
+		return
+	}
+	a.filter.filterState = m
+}
+
 // responseHandleCallbacksAdapter projects an envoyhttp.EncoderFilterCallbacks
 // (with a fallback DecoderFilterCallbacks for RouteName-style accessors
 // not present on the encoder side) onto the RequestHandleCallbacks
@@ -1176,16 +1410,25 @@ func (a *requestHandleCallbacksAdapter) DownstreamDirectRemoteAddress() string {
 // and ecb (the ADR-0174 callback-surface extension landed at phase-19.1),
 // so the dcb fallback is purely defensive for the (rare) test case
 // where dcb is wired but ecb is not.
+//
+// Task 13 adds a *filter back-pointer for FilterState access — same
+// per-stream map shared across both encode + decode adapters (the
+// *filter struct holds a single filterState field).
 type responseHandleCallbacksAdapter struct {
 	ecb envoyhttp.EncoderFilterCallbacks
 	dcb envoyhttp.DecoderFilterCallbacks // fallback for framework gaps
+	// filter is the per-stream *filter back-pointer for FilterState
+	// access (Task 13). May be nil under ADR-0085 nil-tolerance at the
+	// synthetic test path.
+	filter *filter
 }
 
 // newResponseHandleCallbacksAdapter constructs an adapter wrapping the
 // supplied EncoderFilterCallbacks (+ optional DecoderFilterCallbacks
-// fallback for framework gaps). Nil-tolerant on both arguments.
-func newResponseHandleCallbacksAdapter(ecb envoyhttp.EncoderFilterCallbacks, dcb envoyhttp.DecoderFilterCallbacks) RequestHandleCallbacks {
-	return &responseHandleCallbacksAdapter{ecb: ecb, dcb: dcb}
+// fallback for framework gaps + *filter back-pointer for FilterState).
+// Nil-tolerant on all three arguments.
+func newResponseHandleCallbacksAdapter(ecb envoyhttp.EncoderFilterCallbacks, dcb envoyhttp.DecoderFilterCallbacks, f *filter) RequestHandleCallbacks {
+	return &responseHandleCallbacksAdapter{ecb: ecb, dcb: dcb, filter: f}
 }
 
 // Protocol returns the framework's DownstreamProtocol (encoder-side per
@@ -1235,4 +1478,75 @@ func (a *responseHandleCallbacksAdapter) DownstreamDirectRemoteAddress() string 
 		}
 	}
 	return ""
+}
+
+// DynamicMetadata returns the per-stream cross-filter Bucket. Symmetric
+// to the decode-side adapter; ecb preferred, dcb fallback (both return
+// the SAME per-stream bucket per ADR-0190 §Decision body — per-stream
+// shared across decode + encode).
+func (a *responseHandleCallbacksAdapter) DynamicMetadata() *dynamicmetadata.Bucket {
+	if a.ecb != nil {
+		if b := a.ecb.DynamicMetadata(); b != nil {
+			return b
+		}
+	}
+	if a.dcb != nil {
+		return a.dcb.DynamicMetadata()
+	}
+	return nil
+}
+
+// DownstreamTLSConnectionState returns the per-stream *tls.ConnectionState.
+// Symmetric to the decode-side adapter; ecb preferred, dcb fallback (both
+// return the SAME per-stream state per ADR-0144 plumbing pattern — the
+// chain-side tlsConnectionState field is set once at chain build time
+// before either DecodeHeaders or EncodeHeaders fires). nil for plaintext.
+func (a *responseHandleCallbacksAdapter) DownstreamTLSConnectionState() *tls.ConnectionState {
+	if a.ecb != nil {
+		if s := a.ecb.DownstreamTLSConnectionState(); s != nil {
+			return s
+		}
+	}
+	if a.dcb != nil {
+		return a.dcb.DownstreamTLSConnectionState()
+	}
+	return nil
+}
+
+// UpstreamHost returns "" — Task 13 framework gap (encode-side parity).
+func (a *responseHandleCallbacksAdapter) UpstreamHost() string { return "" }
+
+// UpstreamCluster returns "" — Task 13 framework gap (encode-side parity).
+func (a *responseHandleCallbacksAdapter) UpstreamCluster() string { return "" }
+
+// RequestedServerName derives the TLS SNI value from the per-stream
+// *tls.ConnectionState.ServerName field. Symmetric to the decode-side
+// adapter — same plumbing per ADR-0144. Returns "" for plaintext.
+func (a *responseHandleCallbacksAdapter) RequestedServerName() string {
+	state := a.DownstreamTLSConnectionState()
+	if state == nil {
+		return ""
+	}
+	return state.ServerName
+}
+
+// FilterState returns the per-stream `map[string]any` from the *filter
+// back-pointer. Same map shared across decode + encode adapters per the
+// per-stream *filter discipline. Returns nil on nil back-pointer
+// (synthetic test path).
+func (a *responseHandleCallbacksAdapter) FilterState() map[string]any {
+	if a.filter == nil {
+		return nil
+	}
+	return a.filter.filterState
+}
+
+// SetFilterState installs a freshly-allocated map onto the *filter's
+// filterState field (lazy-allocation path symmetric to the decode-side
+// adapter). Silent no-op on nil back-pointer.
+func (a *responseHandleCallbacksAdapter) SetFilterState(m map[string]any) {
+	if a.filter == nil {
+		return
+	}
+	a.filter.filterState = m
 }

@@ -30,6 +30,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	stdtls "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -59,6 +60,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -3581,6 +3583,11 @@ func (c *fakeExtAuthzDCB) DownstreamTLSServerName() string  { return "" }
 func (c *fakeExtAuthzDCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *fakeExtAuthzDCB) DownstreamProtocol() string       { return "" }
 func (c *fakeExtAuthzDCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *fakeExtAuthzDCB) DownstreamTLSConnectionState() *stdtls.ConnectionState { return nil }
+func (c *fakeExtAuthzDCB) DynamicMetadata() *dynamicmetadata.Bucket              { return nil }
+
 func (c *fakeExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++
 	c.localReplyArgs = &localReplyRecord6{status: status, body: body, headers: headers}
@@ -4245,6 +4252,11 @@ func (c *asyncExtAuthzDCB) DownstreamTLSServerName() string  { return "" }
 func (c *asyncExtAuthzDCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *asyncExtAuthzDCB) DownstreamProtocol() string       { return "" }
 func (c *asyncExtAuthzDCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *asyncExtAuthzDCB) DownstreamTLSConnectionState() *stdtls.ConnectionState { return nil }
+func (c *asyncExtAuthzDCB) DynamicMetadata() *dynamicmetadata.Bucket              { return nil }
+
 func (c *asyncExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.mu.Lock()
 	c.localReply = &localReplyRecord6{status: status, body: body, headers: headers}

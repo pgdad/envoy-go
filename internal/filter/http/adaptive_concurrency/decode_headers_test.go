@@ -26,6 +26,7 @@ package adaptive_concurrency
 // Task 3 entry.
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"sync"
@@ -34,6 +35,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
@@ -84,6 +86,10 @@ func (c *recordedCallbacks) DownstreamTLSServerName() string  { return "" }
 func (c *recordedCallbacks) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *recordedCallbacks) DownstreamProtocol() string       { return "" }
 func (c *recordedCallbacks) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *recordedCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *recordedCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // -----------------------------------------------------------------------------
 // Test-scope filter helpers

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	stdtls "crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -446,5 +447,198 @@ func TestDispatchRequest_ChainMediatedAccessLogEmit(t *testing.T) {
 	}
 	if r.UpstreamHost != "" {
 		t.Errorf("UpstreamHost = %q, want empty (direct_response)", r.UpstreamHost)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 22.2 Task 6 (ADR-0192) — H1 dispatchRequest tlsConnectionState seeding
+// ---------------------------------------------------------------------------
+
+// tlsStateCapturingFilter is a decode-only HTTPFilter test-double that records
+// the *tls.ConnectionState observed via dcb.DownstreamTLSConnectionState() at
+// DecodeHeaders time. The capture happens at DecodeHeaders (not at
+// SetDecoderCallbacks) because the seeded value lives on the chain BEFORE
+// RunDecodeHeaders dispatch but AFTER NewFilterChain wires callbacks — i.e.,
+// the dispatch ordering is `NewFilterChain (wires callbacks)` →
+// `chain.SetTLSConnectionState(state)` → `RunDecodeHeaders → DecodeHeaders`.
+// Reading at SetDecoderCallbacks time would observe a stale nil; reading at
+// DecodeHeaders observes the freshly-seeded value per SPEC §11.5.3 set-once-
+// BEFORE-RunDecodeHeaders discipline. Used by both H1 (connection_test) + H2
+// (h2dispatch_test) seeding-assertion tests.
+//
+// Encode-side methods are no-op pass-throughs; the chain framework requires
+// both sides on filters that participate in the both-sides envelope.
+type tlsStateCapturingFilter struct {
+	// captured is the *tls.ConnectionState observed at DecodeHeaders entry
+	// time via dcb.DownstreamTLSConnectionState(). nil when the HCM dispatch
+	// path elided the SetTLSConnectionState call (plaintext / pre-handshake);
+	// non-nil + bound to the HCM-seeded pointer otherwise.
+	captured *stdtls.ConnectionState
+	cbs      filter_http.DecoderFilterCallbacks
+}
+
+func (f *tlsStateCapturingFilter) DecodeHeaders(http.Header, bool) filter_http.FilterHeadersStatus {
+	if f.cbs != nil {
+		f.captured = f.cbs.DownstreamTLSConnectionState()
+	}
+	return filter_http.Continue
+}
+func (f *tlsStateCapturingFilter) DecodeData([]byte, bool) filter_http.FilterDataStatus {
+	return filter_http.DataContinue
+}
+func (f *tlsStateCapturingFilter) DecodeTrailers(http.Header) filter_http.FilterTrailersStatus {
+	return filter_http.TrailersContinue
+}
+func (f *tlsStateCapturingFilter) SetDecoderCallbacks(cbs filter_http.DecoderFilterCallbacks) {
+	f.cbs = cbs
+}
+func (f *tlsStateCapturingFilter) OnDestroy() {}
+
+func (f *tlsStateCapturingFilter) EncodeHeaders(http.Header, bool) filter_http.FilterHeadersStatus {
+	return filter_http.Continue
+}
+func (f *tlsStateCapturingFilter) EncodeData([]byte, bool) filter_http.FilterDataStatus {
+	return filter_http.DataContinue
+}
+func (f *tlsStateCapturingFilter) EncodeTrailers(http.Header) filter_http.FilterTrailersStatus {
+	return filter_http.TrailersContinue
+}
+func (f *tlsStateCapturingFilter) SetEncoderCallbacks(filter_http.EncoderFilterCallbacks) {}
+
+// mkTLSStateCapturingFilterForTable wires a *Filter with chainConfig=[capture,
+// router] where capture is the tlsStateCapturingFilter wired ahead of the
+// terminal router. The captured *tlsStateCapturingFilter pointer is returned
+// so the test can read back the observed state(s) after dispatchRequest.
+//
+// Per-request factory returns a SHARED capture instance (not a fresh per-request
+// instance) so tests observe the captured value verbatim after the single
+// dispatchRequest call. Production code uses fresh per-request instances per
+// ADR-0071's two-step factory; this test fixture takes the simpler shared-instance
+// route since each test drives exactly one request.
+func mkTLSStateCapturingFilterForTable(t *testing.T, tt *routeTable) (*Filter, *tlsStateCapturingFilter) {
+	t.Helper()
+	capture := &tlsStateCapturingFilter{}
+	captureFactory := func() filter_http.HTTPFilter {
+		return filter_http.HTTPFilter{
+			Name:    "tls-state-capture",
+			Decoder: capture,
+			Encoder: capture,
+		}
+	}
+	rfFactory, err := router.New(nil, filter_http.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	r := stats.NewRegistry()
+	prefix := "http.ingress_http."
+	f := &Filter{
+		table:             tt,
+		statPrefix:        "ingress_http",
+		downstreamRqTotal: r.NewCounter(prefix + "downstream_rq_total"),
+		downstreamRq2xx:   r.NewCounter(prefix + "downstream_rq_2xx"),
+		downstreamRq3xx:   r.NewCounter(prefix + "downstream_rq_3xx"),
+		downstreamRq4xx:   r.NewCounter(prefix + "downstream_rq_4xx"),
+		downstreamRq5xx:   r.NewCounter(prefix + "downstream_rq_5xx"),
+		chainConfig: []chainEntry{
+			{name: "tls-state-capture", factory: captureFactory},
+			{name: "envoy.filters.http.router", factory: rfFactory},
+		},
+	}
+	return f, capture
+}
+
+// TestConnection_dispatchRequest_seeds_nil_for_plaintext exercises the
+// plaintext path: a nil downstream conn (mirroring test-paths that drive
+// dispatchRequest without a real listener). The chain's tlsConnectionState
+// stays nil — downstreamTLSConnectionState(nil) returns nil, and the seeding
+// call SetTLSConnectionState(nil) is the documented nil-passthrough.
+func TestConnection_dispatchRequest_seeds_nil_for_plaintext(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, capture := mkTLSStateCapturingFilterForTable(t, tt)
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := f.dispatchRequest(context.Background(), nil, req, bw); err != nil {
+		t.Fatalf("dispatchRequest: %v", err)
+	}
+
+	if capture.captured != nil {
+		t.Errorf("plaintext: captured = %#v; want nil", capture.captured)
+	}
+}
+
+// TestConnection_dispatchRequest_seeds_nil_for_non_TLS_handshake_complete
+// exercises the *tls.Conn-but-pre-handshake path: a tls.Server wrapper over a
+// net.Pipe pair where Handshake() has NOT been called. downstreamTLSConnectionState
+// returns nil per the HandshakeComplete guard so the chain's tlsConnectionState
+// stays nil.
+//
+// Production analog: a *tls.Conn that errored during the handshake before the
+// dispatch driver reached the chain. The driver never reaches dispatchRequest
+// on such a conn in production (the codec drops it earlier), so this is a
+// defensive shape proof — the helper does not panic / misreport on a partially-
+// initialized conn-state.
+func TestConnection_dispatchRequest_seeds_nil_for_non_TLS_handshake_complete(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, capture := mkTLSStateCapturingFilterForTable(t, tt)
+
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
+	tlsConn := stdtls.Server(c1, &stdtls.Config{})
+	// No Handshake().
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := f.dispatchRequest(context.Background(), tlsConn, req, bw); err != nil {
+		t.Fatalf("dispatchRequest: %v", err)
+	}
+
+	if capture.captured != nil {
+		t.Errorf("pre-handshake *tls.Conn: captured = %#v; want nil (HandshakeComplete=false guard)", capture.captured)
+	}
+}
+
+// TestConnection_dispatchRequest_seeds_tlsConnectionState_for_TLS_handshake_complete
+// exercises the TLS-handshake-complete happy path: an in-process *tls.Conn
+// pair where both sides drove Handshake() to completion. The chain's
+// tlsConnectionState is non-nil + carries the SNI from the client side.
+//
+// Per SPEC §11.5.3 the state is seeded even for server-auth-only handshakes
+// (no client cert) — distinct from tlsPrincipals (ADR-0144) which fires only
+// on mTLS handshakes with len(PeerCertificates)>0.
+func TestConnection_dispatchRequest_seeds_tlsConnectionState_for_TLS_handshake_complete(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, capture := mkTLSStateCapturingFilterForTable(t, tt)
+
+	serverTLS, cleanup := runInProcessTLSHandshake(t, "h1-server-test", "h1.sni.envoy-go.test")
+	defer cleanup()
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := f.dispatchRequest(context.Background(), serverTLS, req, bw); err != nil {
+		t.Fatalf("dispatchRequest: %v", err)
+	}
+
+	if capture.captured == nil {
+		t.Fatal("post-handshake *tls.Conn: captured = nil; want non-nil *tls.ConnectionState seeded BEFORE RunDecodeHeaders")
+	}
+	if !capture.captured.HandshakeComplete {
+		t.Errorf("captured.HandshakeComplete = false; want true")
+	}
+	if capture.captured.ServerName != "h1.sni.envoy-go.test" {
+		t.Errorf("captured.ServerName = %q; want %q", capture.captured.ServerName, "h1.sni.envoy-go.test")
 	}
 }

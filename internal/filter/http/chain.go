@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"sync/atomic"
 
 	"google.golang.org/protobuf/proto"
+
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 )
 
 // filterBufferLimitBytes is the per-stream body-buffer cap matching Envoy's
@@ -140,6 +143,42 @@ type FilterChain struct {
 	downstreamProtocol       string
 	listenerPrincipal        string
 
+	// tlsConnectionState carries the FULL *tls.ConnectionState extracted by
+	// HCM dispatch from the downstream *tls.Conn at chain build time. Nil
+	// for plaintext / non-mTLS connections (HCM dispatch elides
+	// SetTLSConnectionState on those paths). Set ONCE BEFORE RunDecodeHeaders
+	// per ADR-0071 set-once discipline; read concurrently by per-stream
+	// decoderCB.DownstreamTLSConnectionState() / encoderCB.DownstreamTLS
+	// ConnectionState() callbacks during filter iteration.
+	//
+	// Distinct from the ADR-0165 derived projections (downstreamTLSServerName /
+	// downstreamTLSPeerCertDER) — those carry pre-extracted scalar fields for
+	// the ext_authz/ext_proc AttributeContext envelope. The full state is
+	// needed by the phase-22.2 lua bridge's :connection():ssl() surface (12
+	// ssl methods consume PEM-encoded certs + cert chain + cipher suite +
+	// tls version + verification details directly from the state per SPEC
+	// §11.5.4 wire-format conventions).
+	//
+	// Per ADR-0192 §Decision body anticipation + SPEC §11.5.3 (chain-side
+	// extension lives INSIDE ADR-0192 per Q13 WEAK HOLD — no separate ADR
+	// for chain-side extension). Cross-phase reusable framework primitive.
+	tlsConnectionState *tls.ConnectionState
+
+	// dynamicMetadata is the per-stream cross-filter dynamic-metadata Bucket
+	// (per ADR-0190 + SPEC §3 + §3.1). Initialized at chain construction via
+	// dynamicmetadata.NewBucket(); Reset + nil-out at Destroy. Per-stream
+	// sequential per ADR-0033 (no cross-filter concurrency within a stream;
+	// no mutex required). All Bucket methods are nil-receiver tolerant per
+	// ADR-0085 — post-Destroy reads through the callback accessor return
+	// nil-tolerantly.
+	//
+	// Per ADR-0192 §Decision body anticipation. Cross-phase reusable
+	// framework primitive (consumed by the phase-22.2 lua
+	// :dynamicMetadata() / :dynamicTypedMetadata() / :setDynamicMetadata()
+	// surface; future filters may consume the same accessor for cross-filter
+	// state propagation per ADR-0190 §Consequences).
+	dynamicMetadata *dynamicmetadata.Bucket
+
 	// encodeBodyOverride / encodeBodyOverridden carry the encode-side body
 	// replacement bytes registered via EncoderFilterCallbacks.OverwriteBody.
 	// The sentinel discriminates (override is nil bytes + set) from (no
@@ -174,6 +213,11 @@ func NewFilterChain(filters []HTTPFilter, perRoute *PerRouteConfig) *FilterChain
 		// where `<-ctx.Done()` on a nil interface would panic. SetRequestCtx
 		// overwrites this in production. Per code-quality review on a03a1d3.
 		ambientCtx: context.Background(),
+		// Initialize the per-stream dynamic-metadata Bucket at chain
+		// construction per ADR-0190 + ADR-0192 §Decision body anticipation.
+		// The chain owns the bucket lifecycle: created here, Reset + nil-out
+		// at Destroy. Per-stream sequential per ADR-0033 — no mutex required.
+		dynamicMetadata: dynamicmetadata.NewBucket(),
 	}
 	// Wire per-filter callback structs (concrete impl tied to this chain).
 	for i := range filters {
@@ -517,6 +561,13 @@ func (c *FilterChain) parkEncode(ctx context.Context) error {
 
 // Destroy fires OnDestroy on every filter exactly once. Safe to call multiple
 // times; idempotent.
+//
+// Per ADR-0192 §Decision body anticipation: Destroy ALSO Reset+nil-outs the
+// per-stream dynamicMetadata bucket — Reset clears the bucket's entries (per
+// ADR-0190 Reset discipline; nil-tolerant per ADR-0085) and the nil-out
+// invalidates subsequent DynamicMetadata() accessor calls on cached callback
+// structs so post-Destroy reads return nil (the bucket consumer surface is
+// nil-tolerant per ADR-0085, making this safe).
 func (c *FilterChain) Destroy() {
 	c.destroyOnce.Do(func() {
 		for _, f := range c.filters {
@@ -526,6 +577,10 @@ func (c *FilterChain) Destroy() {
 				f.Encoder.OnDestroy()
 			}
 		}
+		// Bucket Reset + nil-out per ADR-0192. Reset is nil-tolerant per
+		// ADR-0085 (safe even though destroyOnce guards re-entry; defensive).
+		c.dynamicMetadata.Reset()
+		c.dynamicMetadata = nil
 	})
 }
 
@@ -617,6 +672,34 @@ func (d *decoderCB) DownstreamProtocol() string {
 
 func (d *decoderCB) ListenerPrincipal() string {
 	return d.c.listenerPrincipal
+}
+
+// DownstreamTLSConnectionState returns the chain's HCM-seeded FULL
+// *tls.ConnectionState (set once via SetTLSConnectionState before
+// RunDecodeHeaders). Returns nil for plaintext / non-mTLS / no-client-cert
+// connections — HCM dispatch elides SetTLSConnectionState on those paths per
+// the same discipline as ADR-0144 §Decision (iii). Per ADR-0192 §Decision
+// body anticipation + SPEC §11.5.3.
+//
+// Consumed by the phase-22.2 lua bridge's :connection():ssl() metatable
+// (12 ssl methods extract PEM-encoded certs, cipher suite, TLS version, etc.
+// from the state per SPEC §11.5.4). Cross-phase reusable for any future
+// filter needing access to the full TLS handshake state.
+func (d *decoderCB) DownstreamTLSConnectionState() *tls.ConnectionState {
+	return d.c.tlsConnectionState
+}
+
+// DynamicMetadata returns the chain's per-stream dynamic-metadata Bucket.
+// Initialized non-nil at chain construction via dynamicmetadata.NewBucket();
+// Reset+nil-out at Destroy. Post-Destroy returns nil — consumers are
+// nil-tolerant per ADR-0085 Bucket discipline. Per ADR-0192 §Decision body
+// anticipation + ADR-0190 §Context.
+//
+// Consumed by the phase-22.2 lua bridge's :dynamicMetadata() / :dynamic
+// TypedMetadata() / :setDynamicMetadata() surface. Cross-phase reusable for
+// cross-filter state propagation per ADR-0190 §Consequences.
+func (d *decoderCB) DynamicMetadata() *dynamicmetadata.Bucket {
+	return d.c.dynamicMetadata
 }
 
 // encoderCB is the framework's concrete impl of EncoderFilterCallbacks. Same
@@ -711,6 +794,35 @@ func (e *encoderCB) ListenerPrincipal() string {
 	return e.c.listenerPrincipal
 }
 
+// DownstreamTLSConnectionState (encoder side) reads the SAME chain field the
+// decoder side reads — no separate chain field, no separate seeding. HCM
+// dispatch sets via SetTLSConnectionState BEFORE either RunDecodeHeaders OR
+// RunEncodeHeaders dispatch; both callback sides observe the same value.
+// Per ADR-0192 §Decision body anticipation; symmetric to the encoder-side
+// mirror of ADR-0165's DecoderFilterCallbacks accessors landed at phase-19.1
+// per ADR-0174.
+//
+// Cross-phase reusable for any encode-side filter needing access to the full
+// TLS handshake state (response-mutating filters; response-stage attribute
+// emission against TLS-session metadata).
+func (e *encoderCB) DownstreamTLSConnectionState() *tls.ConnectionState {
+	return e.c.tlsConnectionState
+}
+
+// DynamicMetadata (encoder side) returns the chain's per-stream dynamic-
+// metadata Bucket — the SAME pointer the decoder side observes (per-stream
+// sequential per ADR-0033; no cross-side concurrency). Post-Destroy returns
+// nil; consumers are nil-tolerant per ADR-0085. Per ADR-0192 §Decision body
+// anticipation.
+//
+// Consumed by the phase-22.2 encode-side lua bridge's :dynamicMetadata() /
+// :setDynamicMetadata() surface (the same Bucket accessed via the decode side
+// surface — bucket entries persist across decode → encode iteration within a
+// stream per ADR-0190 §Consequences).
+func (e *encoderCB) DynamicMetadata() *dynamicmetadata.Bucket {
+	return e.c.dynamicMetadata
+}
+
 // EncodeBodyOverride returns the registered encode-side body override (if any).
 // Returns (override, true) if a filter called cb.OverwriteBody during the
 // encode chain; (nil, false) otherwise. Callers (HCM dispatch) use this to
@@ -726,6 +838,40 @@ func (c *FilterChain) EncodeBodyOverride() ([]byte, bool) {
 func (c *FilterChain) SetRequestCtx(ctx context.Context, routeIdx int) {
 	c.ambientCtx = ctx
 	c.routeIdx = routeIdx
+}
+
+// SetTLSConnectionState seeds the chain's per-stream FULL *tls.ConnectionState.
+// Called by HCM dispatch (connection.go H1 / h2dispatch.go H2) at chain build
+// time BEFORE RunDecodeHeaders dispatch when the downstream conn is a
+// *tls.Conn with HandshakeComplete. Nil-passthrough for plaintext / non-mTLS
+// connections — HCM dispatch elides the SetTLSConnectionState call on those
+// paths.
+//
+// Per ADR-0192 §Decision body anticipation + SPEC §11.5.3 (chain-side
+// extension lives INSIDE ADR-0192 per Q13 WEAK HOLD; no separate ADR for
+// chain-side extension). Mirrors the ADR-0144 SetTLSPrincipals plumbing
+// pattern. The seeded state is read by per-stream decoderCB.DownstreamTLS
+// ConnectionState() / encoderCB.DownstreamTLSConnectionState() callbacks.
+//
+// Concurrency: called once per request before filter iteration starts (single
+// dispatch-goroutine invariant per ADR-0071); no synchronization required.
+func (c *FilterChain) SetTLSConnectionState(state *tls.ConnectionState) {
+	c.tlsConnectionState = state
+}
+
+// SetDynamicMetadata replaces the chain's per-stream dynamic-metadata Bucket
+// with the supplied bucket. Per ADR-0192 §Decision body anticipation.
+//
+// The chain auto-initializes a non-nil Bucket at NewFilterChain construction
+// (via dynamicmetadata.NewBucket()), so production HCM dispatch typically
+// does NOT call this setter; the setter is provided for tests + advanced
+// scenarios that want to inject a pre-populated Bucket OR share a Bucket
+// reference across chains (e.g., shadowing/replay test fixtures).
+//
+// Concurrency: called once per request before filter iteration starts (single
+// dispatch-goroutine invariant per ADR-0071); no synchronization required.
+func (c *FilterChain) SetDynamicMetadata(b *dynamicmetadata.Bucket) {
+	c.dynamicMetadata = b
 }
 
 // SetTLSPrincipals seeds the chain's per-stream TLS principal-name candidate

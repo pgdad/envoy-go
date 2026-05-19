@@ -1,6 +1,7 @@
 package header_mutation
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
@@ -433,6 +435,10 @@ func (f *fakeDecoderCB) DownstreamTLSServerName() string  { return "" }
 func (f *fakeDecoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (f *fakeDecoderCB) DownstreamProtocol() string       { return "" }
 func (f *fakeDecoderCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (f *fakeDecoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (f *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 func mkPerRoute(req, resp []*commonmutationrulesv3.HeaderMutation) *headermutationv3.HeaderMutationPerRoute {
 	return &headermutationv3.HeaderMutationPerRoute{

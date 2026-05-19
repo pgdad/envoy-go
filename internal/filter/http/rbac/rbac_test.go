@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/matcher"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -2187,6 +2189,10 @@ func (c *rbacFakeCB) DownstreamTLSServerName() string  { return "" }
 func (c *rbacFakeCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *rbacFakeCB) DownstreamProtocol() string       { return "" }
 func (c *rbacFakeCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *rbacFakeCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *rbacFakeCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // newFilterWithRBAC constructs a *filter wrapping the supplied *rbacv3.RBAC
 // listener-level proto + freshly attached rbacFakeCB. Used by Group 6 +

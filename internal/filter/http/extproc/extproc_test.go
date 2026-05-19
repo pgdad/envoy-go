@@ -27,6 +27,7 @@ package extproc
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -56,6 +57,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -998,6 +1000,12 @@ func (f *fakeDCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (f *fakeDCB) DownstreamProtocol() string       { return "" }
 func (f *fakeDCB) ListenerPrincipal() string        { return "" }
 
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5). Zero-value
+// returns satisfy the interface for tests that don't need the TLS-state /
+// dynamic-metadata surface.
+func (f *fakeDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (f *fakeDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
 func (f *fakeDCB) calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1026,6 +1034,10 @@ func (f *fakeECB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (f *fakeECB) DownstreamProtocol() string       { return "" }
 func (f *fakeECB) ListenerPrincipal() string        { return "" }
 func (f *fakeECB) BufferEncodedBody() []byte        { return nil } // ADR-0175 (phase-19.2 Task 2); fake returns nil — Task 7 wires the real consumer.
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (f *fakeECB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (f *fakeECB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 func (f *fakeECB) calls() int {
 	f.mu.Lock()
@@ -3989,6 +4001,10 @@ func (d *perRouteSwapDCB) DownstreamTLSServerName() string  { return "" }
 func (d *perRouteSwapDCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (d *perRouteSwapDCB) DownstreamProtocol() string       { return "" }
 func (d *perRouteSwapDCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (d *perRouteSwapDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (d *perRouteSwapDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 var _ envoyhttp.DecoderFilterCallbacks = (*perRouteSwapDCB)(nil)
 

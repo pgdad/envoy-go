@@ -1,7 +1,26 @@
 package lua
 
-// fuzz_test.go — 28th project-wide fuzzer `FuzzLuaConfigParse` per ADR-0018
-// baseline + 22.1 SPEC §6 Task 11 + PLAN Task 11 + D-P7.
+// fuzz_test.go — 28th + 29th + 30th project-wide fuzzers per ADR-0018
+// baseline.
+//
+//   - `FuzzLuaConfigParse` (28th; 22.1 SPEC §6 Task 11 + PLAN Task 11 +
+//     D-P7) — typed_config envelope fuzzer; drives arbitrary byte
+//     sequences as the typed_config Any.Value payload to `lua.New(tc, ctx)`.
+//   - `FuzzLuaBodyBridge` (29th; 22.2 PLAN Task 16 + SPEC §11.9 D7 +
+//     §13-R10 + D-P7) — body bridge fuzzer; drives arbitrary body bytes
+//     through `accumulateRequestBody` + `accumulateResponseBody` then
+//     invokes `:body()` / `:bodyChunks()` from a small Lua script.
+//   - `FuzzLuaHTTPCallConfig` (30th; 22.2 PLAN Task 16 + SPEC §11.9 D7 +
+//     §13-R10 + D-P7) — httpCall bridge config-surface fuzzer; drives
+//     arbitrary cluster name + headers + body + timeout_ms + async flag
+//     parameters through `:httpCall(...)`. Uses the no-plumbing guard
+//     (httpClient + clusterMgr nil) so the dispatch goroutine is NEVER
+//     spawned — the fuzzer only exercises argument validation +
+//     buildHTTPCallRequest + the arm-20 byte-stable wording surface.
+//
+// Both 22.2 fuzzers must-never-panic per ADR-0018. The fuzz body's
+// recover() trap converts any panic into a test fatal with the input
+// inputs printed for reproduction.
 //
 // Drives arbitrary byte sequences as the typed_config Any.Value payload to
 // `lua.New(tc, ctx)`. Asserts the structural contract: must-never-panic
@@ -43,14 +62,17 @@ package lua
 // 30s runtime envelope per SPEC §14.3 + ADR-0018 short-mode CI policy.
 
 import (
+	"context"
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
+	lua "github.com/yuin/gopher-lua"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	luaprim "github.com/esalaine/envoy-go/internal/lua"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -463,4 +485,625 @@ func strRepeat(s string, n int) string {
 		out = append(out, s...)
 	}
 	return string(out)
+}
+
+// =========================================================================
+// FuzzLuaBodyBridge — 29th project-wide fuzzer per 22.2 PLAN Task 16 + SPEC
+// §11.9 D7 + §13-R10 + ADR-0018 + D-P7 corpus roster.
+//
+// Drives arbitrary body bytes through the body-bridge accumulators
+// (`accumulateRequestBody` + `accumulateResponseBody`) then invokes
+// `:body()` / `:bodyChunks()` from a small Lua script. Asserts the
+// structural contract: must-never-panic across body accumulation +
+// :body() retrieval + arm-21 over-cap runtime-reject + :bodyChunks()
+// iterator drain.
+//
+// Two parameters: body []byte (the data fed into one or more DecodeData /
+// EncodeData calls) + script string (the Lua-script invocation pattern;
+// the fuzzer constrains this to a small enumerated set of "modes" via a
+// modulo dispatch so the fuzz engine doesn't waste time on arbitrary Lua
+// source-code mutations — those are already covered by
+// FuzzLuaConfigParse's compile-failure seed roster).
+//
+// # Seed corpus per D-P7 (~15-20 seeds)
+//
+// Per the PLAN Task 16 dispatch outline: empty body / small body
+// (10-100 bytes) / medium body (10 KB-100 KB) / large body (1 MB-15 MB)
+// / over-cap body (17 MB; must runtime-reject not panic) / chunked body
+// (multi-call DecodeData accumulation patterns) / script-patterns that
+// yield/resume in pathological orderings.
+//
+// # No-panic invariants asserted
+//
+//   - body accumulation must-never-panic on arbitrary input bytes
+//     (defensive-copy at chunk-time is the only allocator).
+//   - :body() on the ready-state must-never-panic; over-cap raises a
+//     Lua runtime-error which is caught by f.vm.Run's error return (NOT
+//     a Go panic).
+//   - :bodyChunks() iterator drain must-never-panic on any chunk-count.
+//
+// The fuzzer constructs a fresh filter per fuzz iteration via the
+// `newFuzzBodyBridgeFilter` helper. The maxBodyBufferedBytes is set to
+// a small testable value (4 KiB) for the over-cap arm + small enough
+// to ensure 16 MiB+ inputs don't allocate runaway memory during the
+// fuzz loop.
+// =========================================================================
+
+// newFuzzBodyBridgeFilter constructs a per-fuzz-iteration *filter with
+// the body-bridge scaffolding wired. Mirrors body_test.go::
+// newBodyBridgeFilter but standalone in the fuzz file so the fuzzer
+// doesn't depend on _test.go helper visibility across test/fuzz
+// boundaries. Returns the *filter + a cleanup function (caller defers).
+func newFuzzBodyBridgeFilter(t *testing.T) (*filter, func()) {
+	t.Helper()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		stats: &filterStats{
+			errors:                 reg.NewCounter("fuzz.errors"),
+			executions:             reg.NewCounter("fuzz.executions"),
+			respondCalls:           reg.NewCounter("fuzz.respond_calls"),
+			bodyBufferedBytesTotal: reg.NewCounter("fuzz.body_buffered_bytes_total"),
+			coroutineYieldsTotal:   reg.NewCounter("fuzz.coroutine_yields_total"),
+			httpcallTotal:          reg.NewCounter("fuzz.httpcall_total"),
+			httpcallFailures:       reg.NewCounter("fuzz.httpcall_failures"),
+			httpcallTimeouts:       reg.NewCounter("fuzz.httpcall_timeouts"),
+		},
+	}
+	f := &filter{cc: cc}
+	vm := luaprim.NewVM()
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	vm.State().SetContext(ctx)
+	f.vm = vm
+
+	L := vm.State()
+	installRequestHandleMetatable(L)
+	installResponseHandleMetatable(L)
+	installHeadersMetatable(L)
+	installPairsShim(L)
+
+	f.reqCtx = &requestHandleContext{headers: nil, filterRef: f}
+	rud := L.NewUserData()
+	rud.Value = f.reqCtx
+	L.SetMetatable(rud, L.GetTypeMetatable(requestHandleTypeName))
+	L.SetGlobal("rh", rud)
+
+	f.respCtx = &responseHandleContext{headers: nil, filterRef: f}
+	pud := L.NewUserData()
+	pud.Value = f.respCtx
+	L.SetMetatable(pud, L.GetTypeMetatable(responseHandleTypeName))
+	L.SetGlobal("resp", pud)
+
+	// Cap body buffer at 4 KiB so the over-cap arm fires deterministically
+	// for any input > 4 KiB (the corpus seeds include 10 KB-100 KB +
+	// 1 MB-15 MB + 17 MB which all exceed this cap). Note: the cap is in
+	// bytes; arm-21 fires when accumulated > cap (strict inequality per
+	// body.go:314).
+	f.maxBodyBufferedBytes = 4096
+
+	cleanup := func() {
+		cancelCtx()
+		vm.Close()
+	}
+	return f, cleanup
+}
+
+// fuzzBodyScripts is the closed enumeration of body-bridge invocation
+// patterns the fuzzer can dispatch over. Indexed by mode % len(scripts);
+// kept to a small enumerated set so the fuzz engine spends its budget
+// exploring body-byte inputs (where the actual must-never-panic surface
+// lives) rather than arbitrary Lua source-code mutations.
+var fuzzBodyScripts = []string{
+	// Mode 0 — plain :body() on the request side after DecodeData has
+	// fired (the post-endStream synchronous path).
+	`pcall(function() result = rh:body() end)`,
+
+	// Mode 1 — :bodyChunks() iterator drain on the request side.
+	`pcall(function()
+		local iter = rh:bodyChunks()
+		local n = 0
+		while true do
+			local c = iter()
+			if c == nil then break end
+			n = n + 1
+		end
+		chunks_seen = n
+	end)`,
+
+	// Mode 2 — response-side :body() after EncodeData has fired.
+	`pcall(function() result = resp:body() end)`,
+
+	// Mode 3 — response-side :bodyChunks() iterator drain.
+	`pcall(function()
+		local iter = resp:bodyChunks()
+		local n = 0
+		while true do
+			local c = iter()
+			if c == nil then break end
+			n = n + 1
+		end
+		chunks_seen = n
+	end)`,
+
+	// Mode 4 — :body() called twice (defensive: second call must return
+	// the same bytes via the same defensive-copy discipline; second :body()
+	// MUST NOT panic on the post-yield state).
+	`pcall(function()
+		local a = rh:body()
+		local b = rh:body()
+		double_body_match = (a == b)
+	end)`,
+
+	// Mode 5 — :body() then string operations on the result (exercises
+	// the Lua-side string-as-bytes contract under arbitrary input bytes
+	// including embedded NULs).
+	`pcall(function()
+		local b = rh:body()
+		body_len = #b
+		body_byte_at_0 = b:byte(1) or -1
+	end)`,
+
+	// Mode 6 — :bodyChunks() iterator partial drain (stop after first
+	// chunk; exercises the closure-state lifecycle when not fully drained).
+	`pcall(function()
+		local iter = rh:bodyChunks()
+		local c = iter()
+		first_chunk_len = c and #c or -1
+	end)`,
+
+	// Mode 7 — :body() on both request + response sides in one script.
+	`pcall(function()
+		local rb = rh:body()
+		local pb = resp:body()
+		both_body_len = #rb + #pb
+	end)`,
+}
+
+// FuzzLuaBodyBridge — 29th project-wide fuzzer per 22.2 PLAN Task 16 +
+// SPEC §11.9 D7 + §13-R10. Must-never-panic across body accumulation +
+// :body() / :bodyChunks() invocation under arbitrary input bytes +
+// arbitrary script-mode dispatch.
+func FuzzLuaBodyBridge(f *testing.F) {
+	// ---------------------------------------------------------------------
+	// Seed corpus per D-P7 (~15-20 seeds).
+	// ---------------------------------------------------------------------
+
+	// Seed 1 — empty body, mode 0 (:body() on empty body).
+	f.Add([]byte{}, uint8(0))
+
+	// Seed 2 — small body 10 bytes, mode 0.
+	f.Add([]byte("0123456789"), uint8(0))
+
+	// Seed 3 — small body 100 bytes, mode 0.
+	f.Add(bodyFuzzBytesOfLen(100, 'a'), uint8(0))
+
+	// Seed 4 — medium body 10 KiB, mode 0 (over-cap at 4 KiB; must
+	// runtime-reject not panic).
+	f.Add(bodyFuzzBytesOfLen(10*1024, 'b'), uint8(0))
+
+	// Seed 5 — medium body 100 KiB, mode 0 (over-cap).
+	f.Add(bodyFuzzBytesOfLen(100*1024, 'c'), uint8(0))
+
+	// Seed 6 — large body 1 MiB, mode 0 (over-cap).
+	f.Add(bodyFuzzBytesOfLen(1024*1024, 'd'), uint8(0))
+
+	// Seed 7 — large body 15 MiB, mode 0 (over-cap; just under the
+	// production 16 MiB cap default but well over the 4 KiB test cap).
+	f.Add(bodyFuzzBytesOfLen(15*1024*1024, 'e'), uint8(0))
+
+	// Seed 8 — over-cap body 17 MiB, mode 0 (over BOTH the test cap +
+	// the production cap; must runtime-reject not panic per arm-21).
+	f.Add(bodyFuzzBytesOfLen(17*1024*1024, 'f'), uint8(0))
+
+	// Seed 9 — small body, mode 1 (:bodyChunks() drain). Note: the fuzz
+	// harness splits the input bytes into 1-3 chunks based on length so
+	// the multi-call DecodeData accumulation pattern is exercised.
+	f.Add([]byte("chunk-1-chunk-2-chunk-3"), uint8(1))
+
+	// Seed 10 — small body, mode 2 (response-side :body()).
+	f.Add([]byte("response-body"), uint8(2))
+
+	// Seed 11 — small body, mode 3 (response-side :bodyChunks() drain).
+	f.Add([]byte("response-chunks"), uint8(3))
+
+	// Seed 12 — body with embedded NULs, mode 0. Exercises the
+	// gopher-lua LString-binary-safe contract under random binary bytes.
+	f.Add([]byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd, 0x00, 0x80, 0x7f}, uint8(0))
+
+	// Seed 13 — body with UTF-8 BOM + high-byte sequence, mode 5
+	// (exercises the byte-at-index contract).
+	f.Add([]byte("\xef\xbb\xbf\xc3\xa9\xc3\xa8\xc3\xaa"), uint8(5))
+
+	// Seed 14 — small body, mode 4 (double-:body() call; defensive-copy
+	// contract under repeated invocation).
+	f.Add([]byte("double-body-test"), uint8(4))
+
+	// Seed 15 — empty body, mode 1 (:bodyChunks() drain on empty body;
+	// iterator must terminate via nil on first call).
+	f.Add([]byte{}, uint8(1))
+
+	// Seed 16 — single byte, mode 6 (partial-drain iterator; one chunk
+	// then break).
+	f.Add([]byte{0x7f}, uint8(6))
+
+	// Seed 17 — small body, mode 7 (both request + response :body() in
+	// one script).
+	f.Add([]byte("both-sides"), uint8(7))
+
+	// Seed 18 — body at exactly cap boundary (4096 bytes); not over-cap
+	// per body.go:314 strict inequality, so :body() returns successfully.
+	f.Add(bodyFuzzBytesOfLen(4096, 'g'), uint8(0))
+
+	// Seed 19 — body at cap + 1 (4097 bytes); over-cap → arm-21 fires.
+	f.Add(bodyFuzzBytesOfLen(4097, 'h'), uint8(0))
+
+	// Seed 20 — body with all high bytes (0xff), mode 0.
+	f.Add(bodyFuzzBytesOfLen(256, 0xff), uint8(0))
+
+	// ---------------------------------------------------------------------
+	// Fuzz body — must-never-panic structural assertion per ADR-0018.
+	//
+	// The fuzzer constructs a fresh filter per iteration, splits the
+	// input body into 1-3 chunks (so the multi-call DecodeData
+	// accumulation pattern is exercised), feeds via DecodeData /
+	// EncodeData with endStream=true on the final chunk, then dispatches
+	// to one of the enumerated body-bridge invocation patterns.
+	//
+	// pcall() wraps the Lua-side invocation so over-cap arm-21
+	// runtime-errors are caught Lua-side (they're Lua runtime-errors
+	// raised via L.RaiseError, NOT Go panics — but pcall() makes the
+	// fuzz body more robust against future signature changes).
+	// f.vm.Run's outer error return is intentionally ignored — a Go
+	// error from the Run is fine (over-cap raise + script error are
+	// expected on many inputs); a Go panic is not (caught by the defer).
+	// ---------------------------------------------------------------------
+	f.Fuzz(func(t *testing.T, body []byte, mode uint8) {
+		// Cap input size at 32 MiB to bound per-iteration allocation
+		// during the fuzz loop. The 16 MiB production cap + the 4 KiB
+		// test cap surfaces remain exercised; inputs larger than 32 MiB
+		// are truncated to keep the fuzz engine's memory footprint
+		// bounded. This is a fuzz-harness pragmatism — NOT a relaxation
+		// of the must-never-panic invariant (the invariant holds for ANY
+		// input size; we just don't OOM the test runner exploring
+		// gigabyte-scale inputs).
+		if len(body) > 32*1024*1024 {
+			body = body[:32*1024*1024]
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("body bridge panicked: %v\nbody.len=%d mode=%d head=%x",
+					r, len(body), mode, headHex(body, 64))
+			}
+		}()
+
+		fil, cleanup := newFuzzBodyBridgeFilter(t)
+		defer cleanup()
+
+		// Split the body into 1-3 chunks so the multi-call DecodeData
+		// accumulation path is exercised in addition to single-shot
+		// delivery. The chunk count is derived from the mode to keep
+		// the dispatch deterministic per (body, mode) pair.
+		chunks := splitFuzzBody(body, int(mode%3)+1)
+		for i, c := range chunks {
+			endStream := (i == len(chunks)-1)
+			// Symmetric: feed BOTH decode + encode side accumulators so
+			// the response-side bridge modes have data to read.
+			fil.DecodeData(c, endStream)
+			fil.EncodeData(c, endStream)
+		}
+
+		// Dispatch to the enumerated script mode.
+		script := fuzzBodyScripts[int(mode)%len(fuzzBodyScripts)]
+		chunk, err := luaprim.CompileScript([]byte(script), nil)
+		if err != nil {
+			// Compile failure on a literal-string mode script is a fuzz-
+			// harness bug, not a production defect. Surface it loudly.
+			t.Fatalf("compile of fuzz mode script failed: %v\nscript=%s",
+				err, script)
+		}
+		// f.vm.Run's error return is fine (script's pcall() catches the
+		// Lua-side error; we just need no Go panic).
+		_ = fil.vm.Run(chunk)
+	})
+}
+
+// bodyFuzzBytesOfLen returns a deterministic []byte of length n filled
+// with the supplied byte b. Used by the FuzzLuaBodyBridge seed roster.
+func bodyFuzzBytesOfLen(n int, b byte) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = b
+	}
+	return out
+}
+
+// splitFuzzBody splits body into roughly-equal n chunks. n is clamped to
+// [1, len(body)] (an empty body returns a single empty chunk so the
+// fuzzer's endStream=true fires exactly once). Used by FuzzLuaBodyBridge
+// to exercise multi-call DecodeData/EncodeData accumulation.
+func splitFuzzBody(body []byte, n int) [][]byte {
+	if n < 1 {
+		n = 1
+	}
+	if len(body) == 0 {
+		// Empty body: single empty chunk so endStream fires once.
+		return [][]byte{{}}
+	}
+	if n > len(body) {
+		n = len(body)
+	}
+	chunks := make([][]byte, 0, n)
+	step := len(body) / n
+	for i := 0; i < n-1; i++ {
+		chunks = append(chunks, body[i*step:(i+1)*step])
+	}
+	chunks = append(chunks, body[(n-1)*step:])
+	return chunks
+}
+
+// headHex returns the hex-encoded head of b (up to maxBytes). Used by
+// fuzz panic-trap messages to keep the failure message bounded under
+// arbitrary-size input.
+func headHex(b []byte, maxBytes int) []byte {
+	if len(b) <= maxBytes {
+		return b
+	}
+	return b[:maxBytes]
+}
+
+// =========================================================================
+// FuzzLuaHTTPCallConfig — 30th project-wide fuzzer per 22.2 PLAN Task 16 +
+// SPEC §11.9 D7 + §13-R10 + ADR-0018 + D-P7 corpus roster.
+//
+// Drives arbitrary cluster name + headers + body + timeout_ms + async
+// flag parameters through `:httpCall(cluster, headers, body, timeout_ms,
+// asynchronous)` from a Lua script. Uses the no-plumbing guard
+// (httpClient + clusterMgr nil) so the dispatch goroutine is NEVER
+// spawned — the fuzzer exercises only argument validation +
+// buildHTTPCallRequest + the arm-20 byte-stable wording surface +
+// the no-plumbing fallthrough (the latter yields (nil, error) cleanly
+// without dispatch).
+//
+// Five parameters: cluster string + method string + path string + body
+// string + flags uint8 (encodes timeout_ms range + async flag). The
+// flags byte is decoded as:
+//
+//   - flags & 0x01 → asynchronous bool
+//   - flags & 0x06 (bits 1-2) → timeout_ms variant:
+//     0 = 0 (use default)
+//     1 = 1000
+//     2 = -1 (negative; uses default)
+//     3 = 2^31 (extreme)
+//   - flags & 0x18 (bits 3-4) → which side dispatches (rh vs resp).
+//   - flags & 0x60 (bits 5-6) → reserved for future extension.
+//
+// # Seed corpus per D-P7 (~10-15 seeds)
+//
+// Per the PLAN Task 16 dispatch outline: empty cluster name / valid
+// cluster + headers + body + timeout / missing-cluster fallthrough /
+// transport-failure simulation / oversized headers / oversized body /
+// invalid timeout values / async-flag variations.
+// =========================================================================
+
+// newFuzzHTTPCallFilter constructs a per-fuzz-iteration *filter for the
+// httpCall fuzzer. httpClient + clusterMgr are nil — the no-plumbing
+// guard at runHTTPCall:280 catches this BEFORE the dispatch goroutine
+// spawn + returns (nil, error_string) cleanly. The fuzzer exercises only
+// the argument-parse + validation + buildHTTPCallRequest surface; the
+// actual dispatch path is covered by httpcall_test.go's table tests.
+func newFuzzHTTPCallFilter(t *testing.T) (*filter, func()) {
+	t.Helper()
+	reg := stats.NewRegistry()
+	cc := &compiledConfig{
+		stats: &filterStats{
+			errors:                 reg.NewCounter("fuzz.errors"),
+			executions:             reg.NewCounter("fuzz.executions"),
+			respondCalls:           reg.NewCounter("fuzz.respond_calls"),
+			bodyBufferedBytesTotal: reg.NewCounter("fuzz.body_buffered_bytes_total"),
+			coroutineYieldsTotal:   reg.NewCounter("fuzz.coroutine_yields_total"),
+			httpcallTotal:          reg.NewCounter("fuzz.httpcall_total"),
+			httpcallFailures:       reg.NewCounter("fuzz.httpcall_failures"),
+			httpcallTimeouts:       reg.NewCounter("fuzz.httpcall_timeouts"),
+		},
+	}
+	// httpClient + clusterMgr deliberately nil — no-plumbing guard fires
+	// at runHTTPCall:280 + returns (nil, error_string) cleanly. No
+	// dispatch goroutine spawned.
+	f := &filter{cc: cc}
+	vm := luaprim.NewVM()
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	vm.State().SetContext(ctx)
+	f.vm = vm
+
+	L := vm.State()
+	installRequestHandleMetatable(L)
+	installResponseHandleMetatable(L)
+	installHeadersMetatable(L)
+	installPairsShim(L)
+
+	f.reqCtx = &requestHandleContext{headers: nil, filterRef: f}
+	rud := L.NewUserData()
+	rud.Value = f.reqCtx
+	L.SetMetatable(rud, L.GetTypeMetatable(requestHandleTypeName))
+	L.SetGlobal("rh", rud)
+
+	f.respCtx = &responseHandleContext{headers: nil, filterRef: f}
+	pud := L.NewUserData()
+	pud.Value = f.respCtx
+	L.SetMetatable(pud, L.GetTypeMetatable(responseHandleTypeName))
+	L.SetGlobal("resp", pud)
+
+	cleanup := func() {
+		cancelCtx()
+		vm.Close()
+	}
+	return f, cleanup
+}
+
+// fuzzHTTPCallTimeouts is the enumerated set of timeout_ms values
+// dispatched over by the flags byte. Covers zero (default), positive,
+// negative (default), and extreme values.
+var fuzzHTTPCallTimeouts = [4]int64{0, 1000, -1, 1 << 31}
+
+// FuzzLuaHTTPCallConfig — 30th project-wide fuzzer per 22.2 PLAN Task 16
+// + SPEC §11.9 D7 + §13-R10. Must-never-panic across :httpCall(...)
+// argument validation + buildHTTPCallRequest + no-plumbing-guard
+// fallthrough under arbitrary inputs.
+func FuzzLuaHTTPCallConfig(f *testing.F) {
+	// ---------------------------------------------------------------------
+	// Seed corpus per D-P7 (~10-15 seeds).
+	// ---------------------------------------------------------------------
+
+	// Seed 1 — empty cluster name (arm-20 byte-stable runtime-reject).
+	f.Add("", "GET", "/", "", uint8(0))
+
+	// Seed 2 — valid cluster + GET + path + empty body + default
+	// timeout + sync.
+	f.Add("cluster_a", "GET", "/", "", uint8(0))
+
+	// Seed 3 — valid cluster + POST + body + 1000ms timeout + sync.
+	f.Add("cluster_b", "POST", "/api/v1", "payload", uint8(0b010))
+
+	// Seed 4 — valid cluster + async flag set + extreme timeout.
+	f.Add("cluster_c", "GET", "/", "", uint8(0b111))
+
+	// Seed 5 — valid cluster + negative timeout (uses default) + sync.
+	f.Add("cluster_d", "PUT", "/x", "body", uint8(0b100))
+
+	// Seed 6 — empty cluster + async flag set (still arm-20; async
+	// flag doesn't bypass cluster-required check).
+	f.Add("", "GET", "/", "", uint8(0b001))
+
+	// Seed 7 — long cluster name (255 chars).
+	f.Add(strRepeat("a", 255), "GET", "/", "", uint8(0))
+
+	// Seed 8 — oversized body (1 MiB; exercise body-string-into-request
+	// path without OOM).
+	f.Add("cluster_e", "POST", "/upload", strRepeat("x", 1024*1024), uint8(0))
+
+	// Seed 9 — body with embedded NULs + high bytes (binary-safe
+	// body-string contract).
+	f.Add("cluster_f", "POST", "/", string([]byte{0x00, 0x01, 0xff, 0xfe}), uint8(0))
+
+	// Seed 10 — invalid path (no leading slash; exercises http.NewRequest
+	// URL-parse path). buildHTTPCallRequest uses scheme://authority +
+	// path so a path without leading slash composes as
+	// "http://cluster" + "broken-path" → URL.Path = "broken-path".
+	f.Add("cluster_g", "GET", "broken-path", "", uint8(0))
+
+	// Seed 11 — method with unusual characters (lowercased; the bridge
+	// uppercases via strings.ToUpper per httpcall.go:377).
+	f.Add("cluster_h", "patch", "/", "", uint8(0))
+
+	// Seed 12 — empty method string (defaults to GET via the bridge's
+	// pseudo-header-absent fallback).
+	f.Add("cluster_i", "", "/", "", uint8(0))
+
+	// Seed 13 — empty path string (defaults to "/" via the bridge's
+	// pseudo-header-absent fallback). Empty :path pseudo-header set in
+	// the headers table → present-but-empty → bridge uses "" + path
+	// composition produces "http://cluster" which http.NewRequest
+	// parses as URL.Path = "".
+	f.Add("cluster_j", "GET", "", "", uint8(0))
+
+	// Seed 14 — async + 1000ms timeout + small body (the async path is
+	// pure fire-and-forget; with nil httpClient the goroutine returns
+	// immediately via the nil-guard at httpcall.go:238).
+	f.Add("cluster_k", "POST", "/async", "fire-and-forget", uint8(0b011))
+
+	// Seed 15 — response-side dispatch (flags bit 3 set; uses
+	// resp:httpCall instead of rh:httpCall).
+	f.Add("cluster_l", "GET", "/resp-side", "", uint8(0b01000))
+
+	// ---------------------------------------------------------------------
+	// Fuzz body — must-never-panic structural assertion per ADR-0018.
+	//
+	// The fuzzer constructs a fresh filter per iteration (no httpClient +
+	// no clusterMgr → no-plumbing guard fires + dispatch goroutine NEVER
+	// spawned), builds a Lua script that calls :httpCall(...) with the
+	// fuzz-supplied parameters via a pcall() wrapper, and runs it. Any
+	// Go panic surfaces via the defer-recover trap.
+	//
+	// The headers table is constructed Lua-side from the fuzz-supplied
+	// method/path strings; the script uses the timeout_ms variant
+	// dispatched by the flags byte. async flag + side (rh vs resp) are
+	// dispatched by flags bits.
+	//
+	// pcall() wraps the :httpCall(...) invocation so arm-20 byte-stable
+	// runtime-errors are caught Lua-side (NOT Go panics — but pcall()
+	// makes the fuzz body more robust against future signature changes).
+	// ---------------------------------------------------------------------
+	f.Fuzz(func(t *testing.T, cluster, method, path, body string, flags uint8) {
+		// Cap body input to 4 MiB to bound per-iteration allocation
+		// during the fuzz loop. The httpCall surface is exercised
+		// regardless of body length; we just don't OOM the runner
+		// exploring gigabyte-scale bodies.
+		if len(body) > 4*1024*1024 {
+			body = body[:4*1024*1024]
+		}
+		// Bound cluster + method + path inputs similarly to avoid
+		// pathological-length URL composition in http.NewRequest.
+		if len(cluster) > 4096 {
+			cluster = cluster[:4096]
+		}
+		if len(method) > 1024 {
+			method = method[:1024]
+		}
+		if len(path) > 4096 {
+			path = path[:4096]
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("httpCall fuzz panicked: %v\ncluster=%q method=%q path=%q body.len=%d flags=%#x",
+					r, cluster, method, path, len(body), flags)
+			}
+		}()
+
+		fil, cleanup := newFuzzHTTPCallFilter(t)
+		defer cleanup()
+
+		// Decode the flags byte.
+		async := (flags & 0x01) != 0
+		timeoutMs := fuzzHTTPCallTimeouts[(flags>>1)&0x03]
+		useResp := (flags & 0x08) != 0
+
+		// Push the parameters as Lua globals so the script can read
+		// them without sprintf-into-source (avoids interaction issues
+		// where the cluster/method/path/body strings contain Lua
+		// special characters like backslash, quote, embedded NUL).
+		L := fil.vm.State()
+		L.SetGlobal("fz_cluster", lua.LString(cluster))
+		L.SetGlobal("fz_method", lua.LString(method))
+		L.SetGlobal("fz_path", lua.LString(path))
+		L.SetGlobal("fz_body", lua.LString(body))
+		L.SetGlobal("fz_timeout_ms", lua.LNumber(timeoutMs))
+		L.SetGlobal("fz_async", lua.LBool(async))
+		receiver := "rh"
+		if useResp {
+			receiver = "resp"
+		}
+
+		// The script builds the headers table from globals (with
+		// :method + :path pseudo-headers) + calls :httpCall(...) under
+		// pcall(). Both rh + resp sides are equivalent in the
+		// no-plumbing fallthrough path; the side dispatched is
+		// controlled by `receiver`.
+		script := `
+local ok, err = pcall(function()
+	local h = {[":method"] = fz_method, [":path"] = fz_path}
+	local _, _ = ` + receiver + `:httpCall(fz_cluster, h, fz_body, fz_timeout_ms, fz_async)
+end)
+fz_ok = ok
+fz_err = err
+`
+		chunk, err := luaprim.CompileScript([]byte(script), nil)
+		if err != nil {
+			t.Fatalf("compile of fuzz httpcall script failed: %v\nscript=%s", err, script)
+		}
+		// f.vm.Run's error return is fine; arm-20 + buildHTTPCallRequest
+		// errors are Lua runtime-errors caught by pcall(). Any Go panic
+		// surfaces via the defer-recover above.
+		_ = fil.vm.Run(chunk)
+	})
 }

@@ -21,17 +21,36 @@ package httpclient_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/httpclient"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 // ----------------------------------------------------------------------------
@@ -433,5 +452,443 @@ func TestDo_PostBody(t *testing.T) {
 	}
 	if string(got) != payload {
 		t.Errorf("body: want %q, got %q", payload, string(got))
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Phase 22.2 Task 4 — ClusterDispatch tests per SPEC §3.3 + §11.4 (IN-PLACE
+// AMENDMENT on ADR-0177). The 6 test functions below exercise the NEW
+// ClusterDispatch method covering cluster lookup, endpoint resolution, per-
+// cluster TLS, retry inheritance from receiver's Options, context-driven
+// timeout, and explicit context cancellation.
+// ----------------------------------------------------------------------------
+
+// splitHostPort parses a "host:port" into (host, portUint32) for plumbing into
+// the cluster manager bootstrap proto.
+func splitHostPort(t *testing.T, addr string) (string, uint32) {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort %q: %v", addr, err)
+	}
+	p, err := strconv.ParseUint(portStr, 10, 32)
+	if err != nil {
+		t.Fatalf("ParseUint %q: %v", portStr, err)
+	}
+	return host, uint32(p)
+}
+
+// mkPlainClusterMgr builds a *cluster.Manager containing a single plaintext
+// STATIC cluster `name` pointing at host:port. Mirrors the established pattern
+// used in internal/grpcclient/grpcclient_test.go and internal/filter/http/
+// extauthz/extauthz_test.go.
+func mkPlainClusterMgr(t *testing.T, name, host string, port uint32) *cluster.Manager {
+	t.Helper()
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{{
+				Name:                 name,
+				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+				ConnectTimeout:       durationpb.New(time.Second),
+				LoadAssignment: &endpointv3.ClusterLoadAssignment{
+					ClusterName: name,
+					Endpoints: []*endpointv3.LocalityLbEndpoints{{
+						LbEndpoints: []*endpointv3.LbEndpoint{{
+							HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+									SocketAddress: &corev3.SocketAddress{
+										Address:       host,
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+									},
+								}},
+							}},
+						}},
+					}},
+				},
+			}},
+		},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("cluster.NewManager: %v", err)
+	}
+	return cm
+}
+
+// httpclientTestPKI is a minimal in-memory CA + leaf keypair for TLS tests.
+// Mirrors internal/grpcclient/grpcclient_test.go authTestPKI.
+type httpclientTestPKI struct {
+	caPEM       []byte
+	caPool      *x509.CertPool
+	leafCertPEM []byte
+	leafKeyPEM  []byte
+	serverCert  tls.Certificate // ready-to-serve for httptest.Server.TLS
+}
+
+// mkHTTPClientTestPKI creates a fresh in-memory CA + leaf keypair signed by
+// the CA. The leaf is valid for "alpha.envoy-go.test" SNI and 127.0.0.1.
+func mkHTTPClientTestPKI(t *testing.T) *httpclientTestPKI {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ca key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "httpclient test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("ca cert: %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("leaf key: %v", err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "alpha.envoy-go.test"},
+		DNSNames:     []string{"alpha.envoy-go.test"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caTmpl, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("leaf cert: %v", err)
+	}
+	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatalf("leaf key marshal: %v", err)
+	}
+	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: leafKeyDER})
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEM)
+
+	serverCert, err := tls.X509KeyPair(leafCertPEM, leafKeyPEM)
+	if err != nil {
+		t.Fatalf("server cert: %v", err)
+	}
+	return &httpclientTestPKI{
+		caPEM:       caPEM,
+		caPool:      pool,
+		leafCertPEM: leafCertPEM,
+		leafKeyPEM:  leafKeyPEM,
+		serverCert:  serverCert,
+	}
+}
+
+// mkTLSClusterMgr builds a *cluster.Manager containing a single plaintext-on-
+// the-wire-but-TLS-on-the-cluster STATIC cluster `name` pointing at host:port,
+// with `validation_context.trusted_ca` set to pki.caPEM and SNI
+// "alpha.envoy-go.test".
+func mkTLSClusterMgr(t *testing.T, pki *httpclientTestPKI, name, host string, port uint32) *cluster.Manager {
+	t.Helper()
+	ctx := &tlsv3.UpstreamTlsContext{
+		Sni: "alpha.envoy-go.test",
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: &corev3.DataSource{
+						Specifier: &corev3.DataSource_InlineBytes{InlineBytes: pki.caPEM},
+					},
+				},
+			},
+		},
+	}
+	tsAny, err := anypb.New(ctx)
+	if err != nil {
+		t.Fatalf("anypb.New(UpstreamTlsContext): %v", err)
+	}
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{{
+				Name:                 name,
+				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+				ConnectTimeout:       durationpb.New(time.Second),
+				LoadAssignment: &endpointv3.ClusterLoadAssignment{
+					ClusterName: name,
+					Endpoints: []*endpointv3.LocalityLbEndpoints{{
+						LbEndpoints: []*endpointv3.LbEndpoint{{
+							HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+									SocketAddress: &corev3.SocketAddress{
+										Address:       host,
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+									},
+								}},
+							}},
+						}},
+					}},
+				},
+				TransportSocket: &corev3.TransportSocket{
+					Name:       "envoy.transport_sockets.tls",
+					ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: tsAny},
+				},
+			}},
+		},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("cluster.NewManager(tls): %v", err)
+	}
+	return cm
+}
+
+// TestClient_ClusterDispatch_cluster_not_found_returns_error verifies that
+// ClusterDispatch returns an error when the named cluster is absent from the
+// manager. The error MUST be non-nil and the returned *http.Response MUST be
+// nil; no upstream dial is attempted.
+func TestClient_ClusterDispatch_cluster_not_found_returns_error(t *testing.T) {
+	t.Parallel()
+	// Build a manager with cluster "exists" — we'll look up "missing".
+	cm := mkPlainClusterMgr(t, "exists", "127.0.0.1", 1)
+
+	c := httpclient.New(httpclient.Options{Timeout: time.Second})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://placeholder/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := c.ClusterDispatch(req.Context(), "missing", req, cm)
+	if err == nil {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatal("ClusterDispatch(missing): want error, got nil")
+	}
+	if resp != nil {
+		t.Errorf("ClusterDispatch(missing): want nil response, got %v", resp)
+	}
+	if !strings.Contains(err.Error(), "missing") && !strings.Contains(err.Error(), "not found") {
+		t.Errorf("err: want substring 'missing' or 'not found', got %q", err.Error())
+	}
+}
+
+// TestClient_ClusterDispatch_endpoint_resolution_success exercises the happy
+// path: a real cluster pointing at an httptest.Server; ClusterDispatch resolves
+// the endpoint and round-trips the request. Asserts the response body verbatim.
+func TestClient_ClusterDispatch_endpoint_resolution_success(t *testing.T) {
+	t.Parallel()
+	const wantBody = "cluster-dispatch-ok"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, wantBody)
+	}))
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.Listener.Addr().String())
+	cm := mkPlainClusterMgr(t, "c_happy", host, port)
+
+	c := httpclient.New(httpclient.Options{Timeout: 5 * time.Second})
+	// URL.Host is rewritten by ClusterDispatch to the picked endpoint's
+	// host:port. We use a placeholder host here on purpose to verify rewrite.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://placeholder.invalid/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := c.ClusterDispatch(req.Context(), "c_happy", req, cm)
+	if err != nil {
+		t.Fatalf("ClusterDispatch: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: want 200, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(body) != wantBody {
+		t.Errorf("body: want %q, got %q", wantBody, string(body))
+	}
+}
+
+// TestClient_ClusterDispatch_per_cluster_TLS_honored verifies that the per-
+// cluster TLS config supplied via cluster.UpstreamTLSConfig() is honored at
+// dispatch time. The TLS upstream uses a cert signed by the cluster's
+// trusted_ca; the receiver's Options.TLSConfig is NIL so a default-TLS path
+// would reject the leaf cert (no trust root); a SUCCESS therefore proves the
+// per-cluster TLS config is the one that was applied.
+func TestClient_ClusterDispatch_per_cluster_TLS_honored(t *testing.T) {
+	t.Parallel()
+	pki := mkHTTPClientTestPKI(t)
+
+	const wantBody = "tls-cluster-ok"
+	// Start a TLS server using OUR test CA's leaf cert; configure SNI hostname
+	// "alpha.envoy-go.test" matching the cluster's SNI.
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, wantBody)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{pki.serverCert}}
+	srv.StartTLS()
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.Listener.Addr().String())
+	cm := mkTLSClusterMgr(t, pki, "c_tls", host, port)
+
+	// Receiver has NO TLS config — only the cluster's TLS config is in play.
+	c := httpclient.New(httpclient.Options{Timeout: 5 * time.Second})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://placeholder/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := c.ClusterDispatch(req.Context(), "c_tls", req, cm)
+	if err != nil {
+		t.Fatalf("ClusterDispatch(tls): %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: want 200, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(body) != wantBody {
+		t.Errorf("body: want %q, got %q", wantBody, string(body))
+	}
+
+	// Negative-control: a Client with NO TLS config dispatching to the SAME
+	// TLS server via a PLAINTEXT cluster MUST NOT return wantBody — the
+	// server either rejects (TLS handshake error → dispatch err) OR replies
+	// with the stdlib's "client sent an HTTP request to an HTTPS server"
+	// 400-class response. Either outcome refutes the alternative hypothesis
+	// that the TLS path was unused above.
+	cmPlain := mkPlainClusterMgr(t, "c_plain", host, port)
+	req2, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://placeholder/x", nil)
+	resp2, err := c.ClusterDispatch(req2.Context(), "c_plain", req2, cmPlain)
+	if err == nil {
+		defer func() { _ = resp2.Body.Close() }()
+		body2, _ := io.ReadAll(resp2.Body)
+		if resp2.StatusCode == http.StatusOK && string(body2) == wantBody {
+			t.Fatalf("negative-control: plaintext cluster against TLS server unexpectedly returned 200 OK with wantBody (proves TLS path is not honoring per-cluster config)")
+		}
+	}
+}
+
+// TestClient_ClusterDispatch_retry_inherits_Options verifies that
+// ClusterDispatch's retry loop honors the receiver's Options.RetryPolicy —
+// specifically that a status-driven retry on RetryOnStatus drives Attempts+1
+// total attempts. Mirrors TestRetry_StatusDriven_AttemptCount for the Do path.
+func TestClient_ClusterDispatch_retry_inherits_Options(t *testing.T) {
+	t.Parallel()
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.Listener.Addr().String())
+	cm := mkPlainClusterMgr(t, "c_retry", host, port)
+
+	c := httpclient.New(httpclient.Options{
+		Timeout: 5 * time.Second,
+		RetryPolicy: httpclient.RetryPolicy{
+			Attempts:        2, // 2 retries → 3 total attempts
+			PerAttemptDelay: 1 * time.Millisecond,
+			RetryOnStatus:   []int{503},
+		},
+	})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://placeholder/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := c.ClusterDispatch(req.Context(), "c_retry", req, cm)
+	if err != nil {
+		t.Fatalf("ClusterDispatch: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status: want 503, got %d", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Errorf("attempts: want 3 (Attempts=2 ⇒ Attempts+1 total), got %d", got)
+	}
+}
+
+// TestClient_ClusterDispatch_timeout_via_context verifies that an in-flight
+// ClusterDispatch whose request context expires mid-call returns a non-nil
+// error and does not hang. Mirrors TestCtxCancellation_MidDo_ReturnsDeadlineExceeded
+// for the Do path.
+func TestClient_ClusterDispatch_timeout_via_context(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Sleep longer than the request ctx deadline.
+		select {
+		case <-time.After(2 * time.Second):
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+			return
+		}
+	}))
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.Listener.Addr().String())
+	cm := mkPlainClusterMgr(t, "c_timeout", host, port)
+
+	c := httpclient.New(httpclient.Options{Timeout: 0}) // rely on req ctx
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://placeholder/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := c.ClusterDispatch(ctx, "c_timeout", req, cm)
+	if err == nil {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatal("ClusterDispatch: want error from ctx timeout, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		if !strings.Contains(err.Error(), "deadline exceeded") &&
+			!strings.Contains(err.Error(), "context canceled") &&
+			!strings.Contains(err.Error(), "Client.Timeout") {
+			t.Errorf("err: want DeadlineExceeded-equivalent, got %v", err)
+		}
+	}
+}
+
+// TestClient_ClusterDispatch_context_cancellation_propagates verifies that
+// context.WithCancel() + cancel() prior to the call surfaces the cancellation
+// (no upstream dial succeeds; the error chain unwraps to context.Canceled).
+func TestClient_ClusterDispatch_context_cancellation_propagates(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.Listener.Addr().String())
+	cm := mkPlainClusterMgr(t, "c_cancel", host, port)
+
+	c := httpclient.New(httpclient.Options{Timeout: 0})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already-canceled before dispatch
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://placeholder/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := c.ClusterDispatch(ctx, "c_cancel", req, cm)
+	if err == nil {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatal("ClusterDispatch: want error from canceled ctx, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		if !strings.Contains(err.Error(), "context canceled") {
+			t.Errorf("err: want context.Canceled-equivalent, got %v", err)
+		}
 	}
 }

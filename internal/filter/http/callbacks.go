@@ -1,11 +1,14 @@
 package http
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 )
 
 // DecoderFilterCallbacks is the framework-supplied callback shape for
@@ -155,6 +158,41 @@ type DecoderFilterCallbacks interface {
 	// SPEC scrape (reference Envoy populates this automatically from the
 	// listener cert when TLS terminates at the proxy).
 	ListenerPrincipal() string
+
+	// DownstreamTLSConnectionState returns the FULL *tls.ConnectionState of
+	// the downstream client connection, as observed by HCM dispatch at chain
+	// build time. Returns nil for plaintext connections (no TLS handshake)
+	// or for synthetic streams. The returned pointer is read-only — callers
+	// MUST NOT mutate the underlying state.
+	//
+	// Distinct from the ADR-0165 derived projections (DownstreamTLSServerName
+	// scalar / DownstreamTLSPeerCertDER raw bytes) — the full state is needed
+	// by the phase-22.2 lua bridge's :connection():ssl() surface (12 ssl
+	// methods consume PEM-encoded certs + cert chain + cipher suite + tls
+	// version + verification details directly from the state per SPEC §11.5.4
+	// wire-format conventions).
+	//
+	// Per ADR-0192 §Decision body anticipation + SPEC §11.5.3 (chain-side
+	// extension lives INSIDE ADR-0192 per Q13 WEAK HOLD — no separate ADR).
+	// Cross-phase reusable for any future filter needing full TLS handshake
+	// state.
+	DownstreamTLSConnectionState() *tls.ConnectionState
+
+	// DynamicMetadata returns the per-stream cross-filter dynamic-metadata
+	// Bucket (per ADR-0190). The Bucket is initialized at chain construction
+	// (non-nil empty); Reset+nil-out at Destroy. Post-Destroy returns nil —
+	// consumers are nil-tolerant per ADR-0085 (the Bucket Get/Set/Snapshot/
+	// Reset methods all tolerate nil-receiver).
+	//
+	// Consumed by the phase-22.2 lua bridge's :dynamicMetadata() /
+	// :dynamicTypedMetadata() / :setDynamicMetadata() surface. The Bucket is
+	// per-stream sequential per ADR-0033 (no cross-filter concurrency within
+	// a stream); cross-phase reusable for cross-filter state propagation per
+	// ADR-0190 §Consequences.
+	//
+	// Per ADR-0192 §Decision body anticipation. Cross-phase reusable
+	// framework primitive.
+	DynamicMetadata() *dynamicmetadata.Bucket
 }
 
 // EncoderFilterCallbacks is the framework-supplied callback shape for
@@ -318,6 +356,34 @@ type EncoderFilterCallbacks interface {
 	// Per ADR-0174 §Decision. Cross-phase reusable; populates ext_proc
 	// response_attributes envelope's destination.principal field.
 	ListenerPrincipal() string
+
+	// DownstreamTLSConnectionState (encoder side) returns the SAME
+	// *tls.ConnectionState the decoder side observes — no separate chain
+	// field, no separate seeding. HCM dispatch SETs once via
+	// SetTLSConnectionState BEFORE either RunDecodeHeaders OR RunEncodeHeaders
+	// dispatch; both callback sides observe the same value. Nil for
+	// plaintext / synthetic streams.
+	//
+	// Per ADR-0192 §Decision body anticipation. Symmetric to the encoder-side
+	// mirror of ADR-0165's DecoderFilterCallbacks accessors landed at
+	// phase-19.1 per ADR-0174. Cross-phase reusable for encode-side filters
+	// needing access to the full TLS handshake state (response-mutating
+	// filters; response-stage attribute emission against TLS-session
+	// metadata).
+	DownstreamTLSConnectionState() *tls.ConnectionState
+
+	// DynamicMetadata (encoder side) returns the SAME per-stream cross-
+	// filter dynamic-metadata Bucket the decoder side observes (per-stream
+	// sequential per ADR-0033 — no cross-side concurrency; bucket entries
+	// persist across decode → encode iteration within a stream per ADR-0190
+	// §Consequences). Post-Destroy returns nil; consumers are nil-tolerant
+	// per ADR-0085.
+	//
+	// Per ADR-0192 §Decision body anticipation. Consumed by the phase-22.2
+	// encode-side lua bridge's :dynamicMetadata() / :setDynamicMetadata()
+	// surface. Cross-phase reusable for cross-filter encode-side state
+	// propagation.
+	DynamicMetadata() *dynamicmetadata.Bucket
 }
 
 // Compile-time assertion: a real concrete proto type satisfies proto.Message,

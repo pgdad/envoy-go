@@ -1,0 +1,243 @@
+# Human-readable scenario expectations for fixture 0027-http-lua-full-bridge.
+# Per phase 22.2 SPEC §8.2 13-scenario table + D5 closure option (f-B)
+# cert-fingerprint-only + D8 closure (fileBytes envoy-go-strict per
+# §13-R8 PLAN-scrape outcome) + D-P11 closure (REUSE existing
+# runReferenceLessFixture; NO NEW driver-helper).
+#
+# NOT consumed by the differential runner — the runner's CompareBytes
+# branch drives the cross-side assertions; REFERENCE-LESS scenarios use
+# a normalized constant token (driver-internal classification) so the
+# byte stream stays cross-side identical. This file is a documentation
+# aid for fixture readers + reviewers.
+#
+# Fixture topology:
+#   13 listeners (l_test_a..l_test_m) — one per scenario. Plaintext for
+#   a/b/c/d/e/g/h/i/j/k/l/m; TLS for f (cert mount via Task 17 pair).
+#   Backend: shared echobackend on cluster c_backend; mirror cluster
+#   c_httpcall (used by :httpCall scenarios j+k).
+#
+# Cross-side discipline:
+#   Scenarios (a)/(b)/(c)/(d)/(e)/(f)/(g)/(i): deterministic cross-side
+#     via CompareBytes byte-exact assertion. Both sides drive the same
+#     listener + the driver classifies the echobackend-reflected JSON
+#     into a normalized verdict token.
+#   Scenarios (h)/(j)/(k)/(l)/(m): REFERENCE-LESS subject-only. The
+#     driver probes ONLY the subject side; both DriveReference and
+#     DriveSubject emit a constant normalized token (`subject-only=ok`)
+#     so the byte stream stays cross-side identical. Subject-side real
+#     verdict is captured via t.Logf side-channel (NOT byte-stream).
+
+scenarios:
+  - id: a
+    name: a_body_whole
+    listener: l_test_a
+    mode: cross-side
+    description: |
+      Lua reads the decode-side body via `:body()` (defensive Go string
+      copy per §11.3 D3 RECOMMENDED) and stamps `x-body-len: tostring(#body)`
+      on the request envelope. echobackend reflects the request JSON; the
+      driver asserts `x-body-len` is present + value equals the issued
+      body length on both sides.
+    request:
+      method: POST
+      path: /scenario_a
+      body: fixture-0027-body
+    expected_response_body_classification: ok
+
+  - id: b
+    name: b_body_chunks
+    listener: l_test_b
+    mode: cross-side
+    description: |
+      Lua iterates `:bodyChunks()` counting chunk iterations + stamps
+      `x-chunk-count: tostring(n)`. echobackend reflects; driver asserts
+      `x-chunk-count` is present + numeric on both sides (the value may
+      differ across sides due to chunking-strategy divergence, but
+      presence + numeric-shape is byte-stable; driver normalizes to
+      `chunk-count=N>=0`).
+    request:
+      method: POST
+      path: /scenario_b
+      body: fixture-0027-chunked-body
+    expected_response_body_classification: ok
+
+  - id: c
+    name: c_trailers
+    listener: l_test_c
+    mode: cross-side
+    description: |
+      Lua calls `:trailers()` (returns nil if downstream sent no
+      trailers; userdata otherwise). If non-nil exercises the 8-method
+      mutation surface. Stamps `x-trailers-status: nil|present`. Both
+      sides agree on the nil/non-nil verdict (HTTP/1.1 GET without
+      trailers → both return nil).
+    request:
+      method: GET
+      path: /scenario_c
+    expected_response_body_classification: ok
+
+  - id: d
+    name: d_metadata_empty
+    listener: l_test_d
+    mode: cross-side
+    description: |
+      Lua calls `:metadata():get("k")` per §11.6 D1 closure (empty
+      userdata at v1.32.4 binding-gap). Returns nil. pairs() yields 0
+      iterations. Driver asserts `x-md-get: nil` + `x-md-pairs: 0`
+      cross-side byte-exact.
+    request:
+      method: GET
+      path: /scenario_d
+    expected_response_body_classification: ok
+
+  - id: e
+    name: e_dynamic_metadata
+    listener: l_test_e
+    mode: cross-side
+    description: |
+      Lua writes `:streamInfo():dynamicMetadata():set("envoy.test", "k", "v-fixture27")`
+      then reads back `:get("envoy.test"):get("k")`. Stamps `x-dynmd: v-fixture27`.
+      Intra-stream round-trip is deterministic on both sides; the value
+      is byte-stable cross-side because the script literal does not
+      depend on runtime state.
+    request:
+      method: GET
+      path: /scenario_e
+    expected_response_body_classification: ok
+
+  - id: f
+    name: f_connection_ssl_fp
+    listener: l_test_f
+    mode: cross-side (f-B fingerprint-only per D5)
+    description: |
+      Lua calls `:connection():ssl():sha256PeerCertificateDigest()` on the
+      TLS listener. Both sides present the SAME PEM (Task 17 certs/cert.pem)
+      → digest is byte-identical lowercase-hex 64-char string:
+      `6b42889959f3130c809ca84549f4e3bbf39c84263a24e5aae63c9ad029f42841`.
+      Stamps `x-ssl-fp: <digest>` for cross-side CompareBytes.
+    request:
+      method: GET
+      path: /scenario_f
+      scheme: https
+      tls_ca: certs/cert.pem (self-signed; client must skip verification)
+    expected_response_header_x_ssl_fp: 6b42889959f3130c809ca84549f4e3bbf39c84263a24e5aae63c9ad029f42841
+    expected_response_body_classification: ok
+
+  - id: g
+    name: g_crypto
+    listener: l_test_g
+    mode: cross-side
+    description: |
+      Lua calls `:sha256("fixture-0027")` + `:base64Escape("fixture-0027")`.
+      Both methods produce byte-identical output across sides for the
+      same input. Expected sha256 (lowercase hex, no separators):
+      sha256(fixture-0027) = 31...64chars. Expected base64Escape: standard
+      base64 padded.
+    request:
+      method: GET
+      path: /scenario_g
+    expected_response_body_classification: ok
+
+  - id: h
+    name: h_filebytes
+    listener: l_test_h
+    mode: REFERENCE-LESS subject-only (per D8)
+    description: |
+      Lua calls `:fileBytes("/etc/hostname")` per §13-R8 PLAN-scrape
+      outcome — envoy-go-strict (upstream Envoy v1.37.2 does NOT expose
+      `:fileBytes` on the request_handle bridge per the BEHAVIOR_CONTRACT.md
+      §13.6 departure record landing at Task 19). Reference Envoy would
+      raise nil-callable; the driver probes ONLY the subject side and
+      emits a normalized constant token both sides → byte-equal stream.
+      Subject-side: `x-file-bytes: present|absent`.
+    request:
+      method: GET
+      path: /scenario_h
+    expected_response_body_classification: subject-only
+
+  - id: i
+    name: i_streaminfo_upstream
+    listener: l_test_i
+    mode: cross-side
+    description: |
+      Lua reads `:streamInfo():upstreamCluster()` after the request is
+      routed (executes on the encode/response side; but accessing during
+      decode is also valid — the cluster name is set at route resolution).
+      Stamps `x-up-cluster-empty: yes|no`. Both sides resolve the same
+      cluster (`c_backend`) so the value is byte-stable cross-side.
+    request:
+      method: GET
+      path: /scenario_i
+    expected_response_body_classification: ok
+
+  - id: j
+    name: j_httpcall_sync
+    listener: l_test_j
+    mode: REFERENCE-LESS subject-only
+    description: |
+      Lua calls `:httpCall("c_httpcall", headers, "", 1000)` — sync arm,
+      coroutine yields + resumes. Non-deterministic transport (response
+      timing differs across sides). Subject-side probe captures
+      `x-httpcall-sync: true|false`. Driver normalizes both sides to a
+      constant token.
+    request:
+      method: GET
+      path: /scenario_j
+    expected_response_body_classification: subject-only
+
+  - id: k
+    name: k_httpcall_async
+    listener: l_test_k
+    mode: REFERENCE-LESS subject-only
+    description: |
+      Lua calls `:httpCall(..., async=true)` — async fire-and-forget per
+      AMEND-22.2-3 D6 closure. Returns 0 values; no yield; response
+      discarded. Script body runs synchronously. Subject-side:
+      `x-httpcall-async: true|false`.
+    request:
+      method: GET
+      path: /scenario_k
+    expected_response_body_classification: subject-only
+
+  - id: l
+    name: l_timestamp
+    listener: l_test_l
+    mode: REFERENCE-LESS subject-only
+    description: |
+      Lua reads `:timestamp('milliseconds')` — non-deterministic wall-
+      clock. Subject-side: `x-ts-present: yes|no`. Driver normalizes both
+      sides to a constant token (the numeric ms value is discarded for
+      cross-side purposes).
+    request:
+      method: GET
+      path: /scenario_l
+    expected_response_body_classification: subject-only
+
+  - id: m
+    name: m_filterstate
+    listener: l_test_m
+    mode: REFERENCE-LESS subject-only
+    description: |
+      Lua calls `:streamInfo():filterState():set("fixture27.key", "v")`
+      then `:get("fixture27.key")` — intra-stream round-trip; cross-
+      stream isolated. envoy-go-strict `:set` surface per §11.8 D4 +
+      AMEND-22.2-4 (upstream Envoy is strictly read-only). Subject-side:
+      `x-fs-roundtrip: v`.
+    request:
+      method: GET
+      path: /scenario_m
+    expected_response_body_classification: subject-only
+
+# Cross-side scope summary:
+#   Cross-side via CompareBytes:        a, b, c, d, e, f, g, i (8 scenarios)
+#   REFERENCE-LESS subject-only:        h, j, k, l, m         (5 scenarios)
+#   Total:                              13 scenarios
+#
+# Cross-references:
+#   - 22.2 SPEC §8 fixture-0027 disposition + §8.2 scenario taxonomy.
+#   - 22.2 SPEC §11.5 D5 closure option (f-B) cert-fingerprint-only.
+#   - 22.2 SPEC §11.6 D1 closure (metadata empty-userdata at binding-gap).
+#   - 22.2 SPEC §13-R11 closure (REUSE runReferenceLessFixture per D-P11).
+#   - 22.2 SPEC §13-R8 PLAN-scrape outcome (fileBytes envoy-go-strict per D8).
+#   - Task 17 cert plumbing (certs/cert.pem + certs/key.pem; sha256 digest
+#     anchor `6b42889959f3130c809ca84549f4e3bbf39c84263a24e5aae63c9ad029f42841`).

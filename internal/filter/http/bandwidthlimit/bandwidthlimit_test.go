@@ -1,6 +1,7 @@
 package bandwidthlimit
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -588,6 +590,10 @@ func (f *fakeDecoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (f *fakeDecoderCB) DownstreamProtocol() string       { return "" }
 func (f *fakeDecoderCB) ListenerPrincipal() string        { return "" }
 
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (f *fakeDecoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (f *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
 // makeFilterWithMode constructs a *filter with the given enable_mode +
 // limit_kbps + fill_interval and a freshly-attached fakeDecoderCB. Used
 // across the Group 4 (and Group 5) tests; returns the filter + the dcb so
@@ -952,6 +958,10 @@ func (e *fakeEncoderCB) DownstreamTLSServerName() string  { return "" }
 func (e *fakeEncoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (e *fakeEncoderCB) DownstreamProtocol() string       { return "" }
 func (e *fakeEncoderCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (e *fakeEncoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (e *fakeEncoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
 // body-buffering framework primitive). Zero-value return preserves the

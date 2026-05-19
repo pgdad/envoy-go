@@ -1,6 +1,7 @@
 package localratelimit
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -241,6 +243,10 @@ func (f *fakeDecoderCB) DownstreamTLSServerName() string  { return "" }
 func (f *fakeDecoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (f *fakeDecoderCB) DownstreamProtocol() string       { return "" }
 func (f *fakeDecoderCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (f *fakeDecoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (f *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // TestDecodeHeaders_AllowPath_CountersIncremented verifies that on the allow path
 // (bucket has tokens) DecodeHeaders returns Continue, increments enabled + ok,

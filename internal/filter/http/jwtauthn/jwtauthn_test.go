@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/jwks"
 	"github.com/esalaine/envoy-go/internal/jwt"
@@ -935,6 +937,10 @@ func (c *jwtFakeCB) DownstreamTLSServerName() string  { return "" }
 func (c *jwtFakeCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *jwtFakeCB) DownstreamProtocol() string       { return "" }
 func (c *jwtFakeCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *jwtFakeCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *jwtFakeCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // newFilterWithListenerRC wires a *filter against the supplied listener-level
 // *compiledConfig + per-route *compiledPerRoute + fresh jwtFakeCB. Used by

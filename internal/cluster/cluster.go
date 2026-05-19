@@ -155,6 +155,19 @@ func (c *Cluster) Name() string { return c.name }
 // the actual setter from typed_extension_protocol_options parsing.
 func (c *Cluster) UseH2() bool { return c.useH2 }
 
+// UpstreamTLSConfig returns the per-cluster upstream *tls.Config for TLS
+// clusters, or nil for plaintext clusters. The returned pointer is shared with
+// the cluster's internal state — callers MUST NOT mutate fields on it; they
+// should treat the value as read-only or .Clone() it before mutation.
+//
+// Phase 22.2 (ADR-0177 IN-PLACE AMENDMENT per SPEC §3.3 + §11.4): the
+// internal/httpclient/ ClusterDispatch consumer reads this to wire the per-
+// cluster TLS posture into its temporary *http.Client without owning a copy
+// of the cluster's TLS state. The cluster manager remains the single source
+// of truth for upstream TLS configuration; ClusterDispatch is a read-only
+// consumer.
+func (c *Cluster) UpstreamTLSConfig() *stdtls.Config { return c.upstreamCfg }
+
 // PickEndpoint selects the next upstream endpoint per the cluster's LB policy.
 // Safe for concurrent use.
 func (c *Cluster) PickEndpoint() (Endpoint, error) {

@@ -9,6 +9,7 @@ package hcm
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"log"
 	"net"
 	"net/http"
@@ -46,6 +47,22 @@ type h2Dispatcher struct {
 	// chainDispatchAction.tlsPrincipals → chain.SetTLSPrincipals before
 	// RunDecodeHeaders dispatch. Phase 16 Task 6 (ADR-0144 §Decision (iii)).
 	tlsPrincipals []string
+
+	// tlsConnectionState is the FULL *tls.ConnectionState extracted once at
+	// connection build time by runH2 via downstreamTLSConnectionState(downstream).
+	// nil for plaintext / non-*tls.Conn / pre-handshake connections. Threaded
+	// into every per-stream chain via chainDispatchAction.tlsConnectionState →
+	// chain.SetTLSConnectionState before RunDecodeHeaders dispatch — symmetric
+	// to tlsPrincipals plumbing.
+	//
+	// Per ADR-0192 §Decision body anticipation + SPEC §11.5.3 (chain-side
+	// extension lives INSIDE ADR-0192 per Q13 WEAK HOLD). All H2 streams on
+	// this conn share the same connection-snapshot pointer — mirrors the H1
+	// path's per-request extraction (the H1 conn is also pinned to a single
+	// TLS state for the connection lifetime). Per-conn caching avoids the
+	// per-stream ConnectionState() call cost on the many-streams-per-conn
+	// H2 shape.
+	tlsConnectionState *stdtls.ConnectionState
 
 	// Phase 18.2 Task 4 (ADR-0165): the 4 per-connection callback-surface-
 	// extension fields below carry per-stream state captured ONCE at H2
@@ -105,6 +122,7 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 			routeIdx:                 -1,
 			status:                   404,
 			tlsPrincipals:            d.tlsPrincipals,
+			tlsConnectionState:       d.tlsConnectionState,
 			downstreamRemoteAddr:     d.downstreamRemoteAddr,
 			downstreamLocalAddr:      d.downstreamLocalAddr,
 			downstreamTLSServerName:  d.downstreamTLSServerName,
@@ -118,6 +136,7 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 		req:                      req,
 		routeIdx:                 routeIdx,
 		tlsPrincipals:            d.tlsPrincipals,
+		tlsConnectionState:       d.tlsConnectionState,
 		downstreamRemoteAddr:     d.downstreamRemoteAddr,
 		downstreamLocalAddr:      d.downstreamLocalAddr,
 		downstreamTLSServerName:  d.downstreamTLSServerName,
@@ -171,6 +190,15 @@ type chainDispatchAction struct {
 	// Threaded into the per-stream chain via chain.SetTLSPrincipals before
 	// RunDecodeHeaders dispatch. Phase 16 Task 6 (ADR-0144 §Decision (iii)).
 	tlsPrincipals []string
+
+	// tlsConnectionState is the FULL *tls.ConnectionState snapshot from the
+	// parent h2Dispatcher (extracted once at connection build time by runH2 via
+	// downstreamTLSConnectionState). nil for plaintext / non-*tls.Conn /
+	// pre-handshake conns. Threaded into the per-stream chain via
+	// chain.SetTLSConnectionState before RunDecodeHeaders dispatch — symmetric
+	// to tlsPrincipals plumbing per ADR-0192 §Decision body anticipation +
+	// SPEC §11.5.3.
+	tlsConnectionState *stdtls.ConnectionState
 
 	// Phase 18.2 Task 4 (ADR-0165): the 4 per-connection state fields below
 	// thread from the parent h2Dispatcher (captured at runH2 connection-build
@@ -239,6 +267,20 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// chainDispatchAction.tlsPrincipals here; nil for plaintext / non-mTLS /
 	// no-client-cert connections.
 	chain.SetTLSPrincipals(c.tlsPrincipals)
+	// Phase 22.2 Task 6 (ADR-0192): seed the per-stream FULL *tls.ConnectionState
+	// BEFORE RunDecodeHeaders dispatch — symmetric to SetTLSPrincipals above and
+	// to the H1 path in connection.go's dispatchRequest. The snapshot was
+	// extracted once at H2 connection-build time by runH2 →
+	// h2Dispatcher.tlsConnectionState → chainDispatchAction.tlsConnectionState
+	// here; nil for plaintext / non-*tls.Conn / pre-handshake conns. Per
+	// SPEC §11.5.3 + ADR-0192 §Decision body anticipation (chain-side extension
+	// lives INSIDE ADR-0192 per Q13 WEAK HOLD).
+	//
+	// dynamicMetadata is NOT seeded here — chain.go's NewFilterChain
+	// constructor initializes it at chain build time per ADR-0190 + ADR-0192
+	// §Decision body anticipation (chain.go owns the bucket lifecycle). HCM
+	// does NOT touch dynamicMetadata directly.
+	chain.SetTLSConnectionState(c.tlsConnectionState)
 	// Phase 18.2 Task 4 (ADR-0165): seed the 6 per-stream callback-surface
 	// extension fields BEFORE RunDecodeHeaders dispatch — symmetric to the
 	// H1 path in connection.go. RemoteAddr/LocalAddr/SNI/PeerCertDER come

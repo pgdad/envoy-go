@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"testing"
@@ -9,6 +10,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 )
 
 type fakeDecoderCB struct {
@@ -38,6 +41,13 @@ func (c *fakeDecoderCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *fakeDecoderCB) DownstreamProtocol() string       { return "" }
 func (c *fakeDecoderCB) ListenerPrincipal() string        { return "" }
 
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5 — chain-side
+// extension lives inside ADR-0192 per Q13 WEAK HOLD). Zero-value returns
+// keep the existing TestDecoderFilterCallbacks_Compile compile-time
+// conformance assertion green.
+func (c *fakeDecoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
 func TestDecoderFilterCallbacks_Compile(t *testing.T) {
 	var _ DecoderFilterCallbacks = (*fakeDecoderCB)(nil)
 }
@@ -66,6 +76,13 @@ func (c *fakeEncoderCB) ListenerPrincipal() string        { return "" }
 // existing TestEncoderFilterCallbacks_Compile compile-time conformance
 // assertion green.
 func (c *fakeEncoderCB) BufferEncodedBody() []byte { return nil }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5 — encoder-side
+// symmetric mirror of the decoder-side accessors). Zero-value returns keep
+// the existing TestEncoderFilterCallbacks_Compile compile-time conformance
+// assertion green.
+func (c *fakeEncoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (c *fakeEncoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 func TestEncoderFilterCallbacks_Compile(t *testing.T) {
 	var _ EncoderFilterCallbacks = (*fakeEncoderCB)(nil)

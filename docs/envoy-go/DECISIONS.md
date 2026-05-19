@@ -10221,6 +10221,52 @@ Anchored at this SPEC commit; written in full at phase-20 IMPL Task 2 per ADR-00
 
 **(vii) `Options` envelope extensibility per stdlib literal-extension convention.** New fields land additively at the end of `Options` (e.g., a future `MaxIdleConns int` if a future consumer needs to override the transport pool ceiling); zero-value field defaults are preserved bit-for-bit so existing call sites compile and behave identically. The same discipline applies to `RetryPolicy`. No methods on `Options` or `RetryPolicy` — they are pure data types per the stdlib convention.
 
+#### AMENDMENT (22.2 IMPL): NEW `ClusterDispatch` method + paired `FactoryCtx.ClusterManager` field + paired `Cluster.UpstreamTLSConfig()` accessor — R5 RATIFIED (first co-consumer validation of `internal/httpclient/` at the 22.2 lua `:httpCall()` bridge)
+
+**AMENDMENT anchored at 22.2 SPEC commit `0d6463e` (§3.3 + §11.4 + §16 ADR-0177 IN-PLACE AMENDMENT body shape); AMENDMENT body lands at 22.2 IMPL Task 19 atomic landing (THIS commit) per ADR-0044 in-place edit discipline + matches phase-17 → phase-18 ADR-0149 → ADR-0150 AMEND precedent. NO new ADR number consumed.**
+
+Per phase-22.2 SPEC §3.3 + §11.4 evidence + AMEND-22.2 IN-PLACE AMENDMENT scope. The 22.2 lua filter's `:httpCall(cluster, headers, body, timeout_ms, async?)` bridge method needs cluster-name-based dispatch — operator scripts pass a cluster string + envoy-go resolves to an upstream endpoint via the cluster manager's load balancer + dispatches via the existing `*httpclient.Client` retry/timeout machinery. The cluster-name-based dispatch path is structurally distinct from the URL-based `(*Client).Do(*http.Request)` path the 3 introduction-time consumers (jwks + extauthz + oauth2) all use — those consumers dial a URL directly via the stdlib `*http.Client.Do` transport pool. The lua bridge cannot pre-resolve to a URL because cluster names are configuration-time bindings + endpoint selection requires the cluster manager's per-call PickEndpoint() load-balancing decision.
+
+**(viii) NEW method `Client.ClusterDispatch(ctx, clusterName, request, clusterMgr) (*http.Response, error)`.** Eighth exported method on `*Client` at `internal/httpclient/httpclient.go`. Settled signature:
+
+```go
+func (c *Client) ClusterDispatch(ctx context.Context, clusterName string, request *http.Request, clusterMgr *cluster.Manager) (*http.Response, error)
+```
+
+Resolves cluster name to a `*cluster.Cluster` via `clusterMgr.Get(name)` (returns `errClusterNotFound` sentinel on lookup miss); selects an upstream endpoint via `Cluster.PickEndpoint()` (per-call load-balancing decision); rewrites `request.URL.Host` to the endpoint's `"host:port"` form so the underlying `*http.Client` dials the LB-selected endpoint; constructs a temp `*http.Client` honoring the cluster's TLS config via `Cluster.UpstreamTLSConfig()` + the receiver's `Options{Timeout, RetryPolicy}` (per-call construction is acceptable at the lua httpCall surface; phase-20 oauth2's shared-singleton lifecycle uses the URL-based `Do()` path UNCHANGED). Returns `(*http.Response, error)` per the existing `Do()` contract; the retry loop applies identically (status-driven retry on `RetryOnStatus`). Thread-safe: cluster manager is read-only at runtime (per ADR-0010 + ADR-0050 build-time-then-frozen semantics); concurrent `ClusterDispatch` calls are safe.
+
+The `*cluster.Manager` parameter is threaded EXPLICITLY (rather than captured at `New(opts Options)` construction) to keep the `internal/httpclient/` package decoupled from cluster-manager singletons — the existing 3 introduction-time consumers (jwks + extauthz + oauth2) continue to construct `*httpclient.Client` via the `New(opts)` constructor without ever consuming a `*cluster.Manager`. The cluster-aware dispatch path is opt-in per-call.
+
+The error sentinel `errClusterNotFound` is exported as `httpclient.ErrClusterNotFound` for callers that want to distinguish cluster-resolution failure from transport failure (the lua bridge classifies cluster-resolution failure as a Lua runtime-error vs transport failure as a `httpcall_failures` counter increment).
+
+**(ix) NEW `FactoryCtx.ClusterManager *cluster.Manager` field paralleling existing `FactoryCtx.HTTPClient` field.** At `internal/filter/http/types.go::FactoryCtx`. Non-nil at HCM-build time per the phase-18.2 landing — earlier first-use was ext_authz's `grpc_service.envoy_grpc.cluster_name` resolution per phase-18.2; the lua bridge adds the SECOND co-consumer at 22.2 IMPL Task 11. May be nil in test code that does not exercise cluster-bearing filters (per ADR-0085 nil-tolerance — the filter factory checks for nil before calling `Get`/`Drain`/`ClusterDispatch`).
+
+```go
+type FactoryCtx struct {
+    // ... existing fields (Registry + Stats + StatPrefix + HTTPClient) ...
+    ClusterManager *cluster.Manager  // phase-18.2 first-use; phase-22.2 second co-consumer
+}
+```
+
+The lua filter's `*compiledConfig` captures both `*httpclient.Client` (via `FactoryCtx.HTTPClient`) + `*cluster.Manager` (via `FactoryCtx.ClusterManager`) references at `lua.New(tc, ctx)` construction time + threads them through to per-stream `*filter` instances. The `:httpCall` bridge closure consumes both references at dispatch time.
+
+**(x) NEW `Cluster.UpstreamTLSConfig() *tls.Config` exported accessor.** At `internal/cluster/cluster.go`. Task 4 discovered this accessor was needed — `ClusterDispatch` needs read-only access to the per-cluster upstream `*tls.Config` to wire the per-call temp `*http.Client`'s transport TLSConfig. The cluster owns the source of truth for upstream TLS configuration (constructed at cluster-manager build time from the cluster's xDS-bindings or static-bootstrap config); `ClusterDispatch` is a read-only consumer.
+
+```go
+// UpstreamTLSConfig returns the per-cluster upstream *tls.Config for TLS
+// dial; nil for plaintext clusters. internal/httpclient/ ClusterDispatch
+// consumer reads this to wire the per-call temp *http.Client. The cluster
+// owns the source of truth for upstream TLS configuration; ClusterDispatch
+// is a read-only consumer.
+func (c *Cluster) UpstreamTLSConfig() *tls.Config { return c.upstreamCfg }
+```
+
+The accessor is goroutine-safe under the ADR-0010 + ADR-0050 build-time-then-frozen invariant — `c.upstreamCfg` is set at cluster construction time + never mutated thereafter; concurrent `UpstreamTLSConfig()` reads are safe.
+
+**(xi) R5 RATIFIED — first co-consumer validation of phase-20's `internal/httpclient/` cross-phase-reusable framework primitive at the 22.2 lua `:httpCall()` bridge.** Per phase-22.2 SPEC §13-R5 RATIFIED-PENDING-IMPL: the AMENDMENT body landing at this 22.2 IMPL Task 19 commit closes R5 — the `internal/httpclient/` primitive accepted the additive `ClusterDispatch` extension cleanly without surface churn for the prior 3 consumers. The 3 introduction-time consumers (jwks + extauthz + oauth2) continue consuming the URL-based `(*Client).Do` path UNCHANGED at 22.2 IMPL. The 22.2 lua bridge is the FOURTH consumer overall (counting the AMEND consumer as a structural addition rather than a count of identical-signature consumers); the SECOND structurally-distinct consumer pattern (cluster-name-based vs URL-based).
+
+The AMENDMENT-anticipation paragraph anchored at 22.2 SPEC commit `0d6463e` (§3.3 + §11.4 + §16) STANDS UNCHANGED at this 22.2 IMPL — the AMENDMENT body settles the exact signature + threading discipline as anticipated at SPEC time. NO surface drift from the SPEC anchor; the AMEND-anticipation discipline + the ADR-0044 in-place edit discipline together carry the load-bearing constraint that 22.2 IMPL doesn't surface AMENDMENT changes the 22.2 SPEC author didn't anticipate.
+
 ### Consequences
 
 **The `internal/httpclient/` package landed at sub-commit 2a** (this commit) with `httpclient.go` (~200 LoC: docstring + 3 type declarations + `New` + `Do` + 1 helper) + `httpclient_test.go` (~370 LoC: 11 tests covering SPEC §14.1 Group 6 — Options zero-value, Do happy-path 200, zero-retry default, retry-envelope-attempt-count, retry-succeeds-on-second-attempt, non-retryable-status-no-retry, ctx-cancellation-mid-Do, retry-honors-ctx-between-attempts, TLSConfig-wired-through with `httptest.NewTLSServer` + `tls.Config{InsecureSkipVerify: true}` posture, request-error-propagation, POST-body-roundtrip). All 11 tests PASS clean under `go test -count=1 ./internal/httpclient/...` + `go vet ./internal/httpclient/...` + `golangci-lint run ./internal/httpclient/...`.
@@ -11537,10 +11583,10 @@ Per BEHAVIOR_CONTRACT.md `### envoy.filters.http.lua` "Fixture-0026 cross-side g
 
 ## ADR-0190: NEW `internal/dynamicmetadata/` framework primitive — per-stream `*Bucket` accessor for cross-filter dynamic-metadata read+write at first co-consumer (HTTP Lua filter 22.2) per phase-22 BRAINSTORM Q3 cross-phase-deferral-break + Q9 EXTRACT-NOW
 
-**Status:** §Context anchored at phase-22.2 SPEC commit (THIS commit); §Decision + §Consequences body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline.
-**Date:** 2026-05-19 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 22.2 IMPL Lands-in-Task)
+**Status:** Accepted — §Decision + §Consequences body landed at phase-22.2 IMPL Task 19 atomic landing (THIS commit); §Context body unchanged from the 22.2 SPEC anchor commit.
+**Date:** 2026-05-19 (§Context anchor at predecessor 22.2 SPEC commit `0d6463e`; §Decision + §Consequences body land at this 22.2 IMPL Task 19 atomic landing per ADR-0044 in-place edit discipline)
 **Doctrine:** Phase 22.2 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline.
-**Lands-in:** Phase 22.2 IMPL atomic-landing Task (same Task as ADR-0191 + ADR-0192 + ADR-0177 AMENDMENT body per PLAN).
+**Lands-in:** Phase 22.2 IMPL Task 19 atomic-landing (same Task as ADR-0191 + ADR-0192 + ADR-0177 AMENDMENT body per PLAN).
 
 ### Context
 
@@ -11583,22 +11629,107 @@ internal/dynamicmetadata/
 
 ### Decision
 
-*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Decision body will codify the final API signatures + lifecycle integration + nil-tolerance discipline + cross-filter sequential-access discipline (matching the IMPL-time landing).*
+**Status: Accepted — landed at phase-22.2 IMPL Task 1 (NEW package skeleton + types + tests) + Task 5 (chain.go + callbacks.go wiring) + Task 6 (HCM H1/H2 seeding) + Task 9 (lua bridge consumer); §Decision body anchored at this 22.2 IMPL Task 19 atomic landing.** The §Decision codifies the final settled API signatures + lifecycle integration + nil-tolerance discipline as landed at the 22.2 IMPL tasks above. Per phase-22.2 SPEC §3.1 + §11.6 D1 closure + ADR-0044 in-place edit discipline.
+
+**(i) Public surface — `Bucket` type + 4 methods.** Five exported identifiers at `internal/dynamicmetadata/dynamicmetadata.go`. Confirms the surface anticipated in the §Context block byte-for-byte:
+
+```go
+package dynamicmetadata
+
+import structpb "google.golang.org/protobuf/types/known/structpb"
+
+// Bucket is a per-stream cross-filter dynamic-metadata accessor.
+// Lifecycle: created at filter-chain entry; destroyed at OnDestroy.
+// Per-stream sequential per ADR-0033 (no cross-filter concurrency within
+// a stream); NOT goroutine-safe across streams.
+type Bucket struct {
+    m map[string]map[string]*structpb.Value
+}
+
+func NewBucket() *Bucket
+func (b *Bucket) Get(filterName, key string) (*structpb.Value, bool)
+func (b *Bucket) Set(filterName, key string, value *structpb.Value)
+func (b *Bucket) Snapshot() map[string]map[string]*structpb.Value
+func (b *Bucket) Reset()
+```
+
+`NewBucket` constructs an empty per-stream metadata bucket (lazily allocates the inner map on the first `Set` call — zero-allocation under read-only-access workloads). `Get` returns `(value, ok=true)` on lookup-hit + `(nil, false)` on lookup-miss + `(nil, false)` for a nil receiver (per ADR-0085 nil-tolerance). `Set` overwrites at the `(filterName, key)` coordinate + no-ops for a nil receiver. `Snapshot` returns a SHALLOW COPY of the bucket's contents for read-only iteration — the outer + inner map references are fresh; the `*structpb.Value` pointers are shared (callers must NOT mutate the value structs). `Reset` clears all entries (called at `OnDestroy`).
+
+**(ii) Per-stream lifecycle integration per ADR-0033.** `internal/filter/http/chain.go::FilterChain` carries a new `dynamicMetadata *dynamicmetadata.Bucket` field. The field is lazily initialized via `c.DynamicMetadata()` accessor (the first read constructs via `dynamicmetadata.NewBucket()`; subsequent reads return the same per-chain bucket). Per-stream lifecycle: the chain is created at filter-chain entry (per ADR-0033 + ADR-0100); destroyed at `OnDestroy` where `chain.dynamicMetadata.Reset()` is called. Cross-filter visibility per-stream: all filters within the same chain see the same bucket — `DecoderFilterCallbacks.DynamicMetadata()` + `EncoderFilterCallbacks.DynamicMetadata()` BOTH return the same per-stream `*Bucket` pointer (the encoder-side accessor exists for symmetry with the decoder-side; both surface the same backing storage).
+
+**(iii) Nil-tolerance discipline per ADR-0085.** All 4 `Bucket` methods accept a nil receiver. `Get` returns `(nil, false)`; `Set` is a no-op; `Snapshot` returns nil; `Reset` is a no-op. Rationale: callers (lua bridge at 22.2; future consumers) may invoke the accessor unconditionally without per-call nil checks; the nil-receiver path is the safe degenerate case for test scaffolding + fuzzer inputs that don't allocate the chain-level field. The `Get` nil-receiver path is the most-exercised at 22.2 (the lua bridge's `:dynamicMetadata():get(filter_name, key)` accessor invokes `Bucket.Get` regardless of whether any filter has written; absence of any writes returns `(nil, false)` cleanly via either the nil-receiver path or the empty-map path).
+
+**(iv) Per-stream sequential access discipline per ADR-0033.** The `Bucket` is NOT goroutine-safe for concurrent access across streams (each stream has its own `*Bucket`); the `Bucket` is NOT goroutine-safe for concurrent access WITHIN a stream (per-stream sequential filter dispatch per ADR-0033 means at any moment at most one filter touches the bucket). No internal mutex; no atomic operations; the map+nested-map storage is pure-Go-runtime with no synchronization. This is the deliberate design choice per ADR-0033 § sequential filter dispatch discipline — adding internal synchronization would (a) waste cycles on the steady state (single-goroutine per stream), (b) mask design errors (any cross-stream sharing of a `*Bucket` is a bug — the per-stream lifecycle is the contract), and (c) misalign with the project's broader ADR-0033 single-goroutine-per-stream invariant.
+
+**(v) Cross-phase deferral-break disposition per phase-22 BRAINSTORM Q3 + §1.6.** Phases 16 (rbac) / 17 (jwt_authn) / 18 (ext_authz) / 19 (ext_proc) / 20 (oauth2) each deferred dynamic-metadata access by their respective filters with BEHAVIOR_CONTRACT.md "operator-visibility deferred to future" notes — the deferral was about IMPL (each phase chose not to be the first to land a cross-filter state primitive) NOT about principle (operators DO want dynamic-metadata visibility from these filters). Phase 22.2 lands the cross-filter primitive at first co-consumer (the HTTP Lua filter's `:streamInfo():dynamicMetadata()` + `:dynamicTypedMetadata(filter_name)` bridge methods per ADR-0192 §Decision). Future phase BRAINSTORMs that need dynamic-metadata access from their respective filters consume `internal/dynamicmetadata/` rather than defer again — each prior-phase BEHAVIOR_CONTRACT note converts from "deferred" to "lifted via `internal/dynamicmetadata`" at the lift-phase's next-touchpoint (the future phase that next edits the prior-phase filter's deferral note).
+
+**(vi) Settled file split** (per phase-22.2 SPEC §3.1 + Task 1 landing):
+
+```
+internal/dynamicmetadata/
+  doc.go               # package overview + cross-phase deferral-lift rationale +
+                       # API surface summary + ADR-0190 cross-reference
+  dynamicmetadata.go   # Bucket type + NewBucket + Get + Set + Snapshot + Reset
+  dynamicmetadata_test.go  # exhaustive table-driven tests including nil-tolerance
+  bench_test.go        # microbenchmarks for Get/Set under per-stream sequential
+                       # access
+```
+
+LoC landed: ~280 production (doc.go ~70; dynamicmetadata.go ~95; dynamicmetadata_test.go ~95 + bench_test.go ~20). Within the §Context anticipated envelope of ~250-400.
+
+**(vii) Cross-filter callbacks API surface (per ADR-0192 §Decision body + phase-22.2 SPEC §3.1 + Task 5 IMPL).** `internal/filter/http/callbacks.go::DecoderFilterCallbacks` + `EncoderFilterCallbacks` gain TWO new accessors:
+
+```go
+DynamicMetadata() *dynamicmetadata.Bucket  // both decoder-side + encoder-side
+```
+
+Both accessors return the SAME per-stream `*Bucket` pointer threaded from the chain. The asymmetry between decode-side and encode-side does NOT exist at the bucket level — both sides see the same backing storage; the encoder-side accessor exists for symmetry with the decode-side + to honor the per-side cross-cutting filter-callbacks API surface convention from prior §9 family rows (ADR-0144 TLS-principals; ADR-0168 ext_proc dynamic-metadata-bridge anticipation).
 
 ### Consequences
 
-*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Consequences body will document the cross-phase deferral-lift expectation + future-consumer reuse pattern + the (+/-)/(?) tradeoffs (matching the IMPL-time landing).*
+**THIRD §9 framework primitive in two-phase succession** (after ADR-0188 `internal/lua/` + ADR-0189 `internal/filter/http/lua/` at phase-22.1 IMPL). STRENGTHENS the post-phase-21 NEW-framework-primitive cadence + reflects the project's growing cross-filter-state surface. The phase-22 BRAINSTORM-time 3-way pre-split (22.1 + 22.2 + 22.3) deliberately schedules the framework-primitive landings across the sub-phases — 22.1 = `internal/lua/` + `internal/filter/http/lua/`; 22.2 = `internal/dynamicmetadata/` + `internal/lua/` API extensions; 22.3 = (anticipated) per-route 9th canonical extension. The cadence is sustainable + each landing is tightly bound to a specific consumer-driven trigger.
 
-**Cross-references:** ADR-0188 (paired prior §9 framework primitive — `internal/lua/`); ADR-0189 (paired prior §9 package — `internal/filter/http/lua/`); ADR-0191 (sibling NEW ADR at THIS SPEC commit — `internal/lua/` 22.2 API extensions); ADR-0192 (sibling NEW ADR at THIS SPEC commit — `internal/filter/http/lua/` 22.2 package shape extensions; consumer-#1 of `internal/dynamicmetadata/`); ADR-0085 (nil-tolerance discipline); ADR-0033 (per-stream sequential filter dispatch); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline); ADR-0052 (atomic landing); phase-16 ADR-0143 (rbac dynamic-metadata deferral); phase-17 ADR-0148/0149/0150/0154 (jwt_authn dynamic-metadata deferral); phase-18 (ext_authz dynamic-metadata deferral); phase-19 (ext_proc dynamic-metadata deferral); phase-20 (oauth2 dynamic-metadata deferral); phase-22 parent SPEC §1.6 cross-phase deferral discipline; phase-22.2 BRAINSTORM Q3 + Q9 + §1.6; phase-22.2 SPEC §1.6 + §3.1 + §9 + §11 + §16.1.
+**Consumers at this commit (single co-consumer at 22.2 IMPL):**
+
+- **HTTP Lua filter 22.2** (`internal/filter/http/lua/`) — consumes `*Bucket.Get` + `*Bucket.Set` via the `:streamInfo():dynamicMetadata():get(filter_name, key)` + `:set(filter_name, key, value)` + `:streamInfo():dynamicTypedMetadata(filter_name)` bridge methods. The lua bridge's metadata.go IMPL (Task 9) consumes the bucket via the per-stream `*filter.chain.dynamicMetadata` field threaded through the filter callbacks.
+
+**Cross-phase deferral-lift expectation (FUTURE consumers).** Phases 16/17/18/19/20 deferred dynamic-metadata access by their respective filters. Future phase BRAINSTORMs that need dynamic-metadata access reuse `internal/dynamicmetadata/`. Each prior-phase BEHAVIOR_CONTRACT.md "operator-visibility deferred to future" note converts from "deferred" to "lifted via `internal/dynamicmetadata`" at the lift-phase's next-touchpoint. NO automatic mass-update at this 22.2 IMPL — the deferral notes carry forward AS-IS until each prior-phase filter is next touched. The deferral-lift discipline is documented at the BEHAVIOR_CONTRACT.md `### envoy.filters.http.lua` 22.2 sub-section's cross-phase reference paragraph + the per-prior-phase ADR cross-references above.
+
+**(+) Cross-filter state visibility without per-filter ad-hoc primitive extraction.** Each future filter that needs dynamic-metadata access reuses the SAME primitive — no per-filter ad-hoc cross-filter-state primitive (which would duplicate code + fragment the cross-filter state surface). Per the phase-17 ADR-0150 + phase-18.1 ADR-0159 + phase-20 ADR-0177 + phase-20 ADR-0178 cross-phase-reuse-at-introduction-time discipline.
+
+**(+) Per-stream lifecycle aligns with ADR-0033 sequential filter dispatch.** No cross-stream caching; no global state; no boot-time singleton — each per-stream bucket is fresh + GC-collected at stream-end via `Reset` + chain-end via Go's runtime GC. The lifecycle integration is bug-free by construction (the only path that allocates is `Set`; the only path that deallocates is `Reset`; no `Close` failure mode + no leak surface).
+
+**(+) Nil-tolerance per ADR-0085 + simple test scaffolding.** Callers can pass nil chain (test code; fuzzer inputs); accessors degrade to the safe degenerate case. The lua bridge's `metadata.go` IMPL exercises this for its unit tests via the `nilCallbacks` fixture path.
+
+**(-) Per-stream sequential access constraint is implicit, not enforced.** A future bug that shares a `*Bucket` across streams (e.g., cross-stream caching mistake) would silently race the map+nested-map storage without crashing under happy-path concurrency (Go map writes are not atomic but the race-detector would flag under `-race`). The constraint relies on the ADR-0033 single-goroutine-per-stream invariant — if a future ADR relaxes that invariant, this ADR's design needs revisiting. Documented at the package's `doc.go` + `dynamicmetadata.go::Bucket` doc-comment for future maintainers.
+
+**(-) `Snapshot` shallow-copy can be misused.** Callers MUST NOT mutate the returned `*structpb.Value` pointers (mutation would corrupt the bucket's view of the value). The constraint is documented at the `Snapshot` method doc-comment; the test suite does NOT exercise the misuse path (the bucket's storage is private; misuse would require explicit type assertion + unsafe mutation). Acceptable trade-off vs deep-copy cost (`structpb.Value` is a proto type with potentially deep recursive structure — deep-copying on every `Snapshot` call would defeat the read-only-iteration use case).
+
+**(?) Future framework-primitive extraction for cross-stream caching.** The current scope is per-stream only. A hypothetical future use case (e.g., a cross-stream metadata-aggregation surface — "what's the rate of `envoy.filters.http.jwt_authn::issuer == X` across the last 1000 streams?") would need a different primitive (likely `internal/dynamicmetadatacache/` with TTL + eviction + atomic snapshots). Not in scope at 22.2.
+
+**Per-stream test coverage at this Task 1 landing** (`dynamicmetadata_test.go`):
+- `TestBucket_NewBucket_Empty` — verifies fresh bucket returns `(nil, false)` for all `Get` calls.
+- `TestBucket_SetGet_RoundTrip` — verifies value round-trips through `Set(...)` + `Get(...)`.
+- `TestBucket_Set_Overwrite` — verifies repeat `Set` at the same coordinate overwrites the prior value.
+- `TestBucket_GetMissing` — verifies `Get` at absent `(filterName, key)` returns `(nil, false)`.
+- `TestBucket_Snapshot_NonEmpty` — verifies `Snapshot` returns a copy of the contents.
+- `TestBucket_Snapshot_NilReceiver` — nil-tolerance: nil receiver returns nil snapshot.
+- `TestBucket_Reset_Clears` — verifies `Reset` empties the bucket; subsequent `Get` returns `(nil, false)`.
+- `TestBucket_NilReceiver_GetSetReset_NoOp` — nil-tolerance: nil receiver handles all 4 methods without panic.
+- `BenchmarkBucket_Get_Hit` + `BenchmarkBucket_Set_NewKey` — microbenchmark coverage; per-call cost ~30-50 ns/op (map lookup + value-pointer assignment).
+
+The 22.2 IMPL benchmark surface (Task 15 `BenchmarkPerStream_FullBridge_LState_Construction`) confirms the Bucket's amortized per-stream overhead is invisible at the FULL bridge surface (ns/op = 98157 ~98µs; the bucket allocation contributes ~50ns of that envelope).
+
+**Cross-references:** ADR-0188 (paired prior §9 framework primitive — `internal/lua/`); ADR-0189 (paired prior §9 package — `internal/filter/http/lua/`); ADR-0191 (sibling NEW ADR at predecessor 22.2 SPEC commit — `internal/lua/` 22.2 API extensions); ADR-0192 (sibling NEW ADR at predecessor 22.2 SPEC commit — `internal/filter/http/lua/` 22.2 package shape extensions; consumer-#1 of `internal/dynamicmetadata/` at this 22.2 IMPL); ADR-0085 (nil-tolerance discipline); ADR-0033 (per-stream sequential filter dispatch); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline); ADR-0052 (atomic landing); phase-16 ADR-0143 (rbac dynamic-metadata deferral); phase-17 ADR-0148/0149/0150/0154 (jwt_authn dynamic-metadata deferral); phase-18 (ext_authz dynamic-metadata deferral); phase-19 (ext_proc dynamic-metadata deferral); phase-20 (oauth2 dynamic-metadata deferral); phase-22 parent SPEC §1.6 cross-phase deferral discipline; phase-22.2 BRAINSTORM Q3 + Q9 + §1.6; phase-22.2 SPEC §1.6 + §3.1 + §9 + §11 + §16.1; phase-22.2 PLAN Task 1 + Task 5 + Task 6 + Task 9.
 
 ---
 
 ## ADR-0191: `internal/lua/` 22.2 API extensions for coroutine yield/resume + body-bridge buffer seam at HTTP filter Lua consumer-#1 scope-expansion — NEW ADR per BRAINSTORM Q10 strict scope (ADR-0188 EXPLICIT API-REVISION ALLOWANCE stays scoped to consumer-#2)
 
-**Status:** §Context anchored at phase-22.2 SPEC commit (THIS commit); §Decision + §Consequences body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline.
-**Date:** 2026-05-19 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 22.2 IMPL Lands-in-Task)
+**Status:** Accepted — §Decision + §Consequences body landed at phase-22.2 IMPL Task 19 atomic landing (THIS commit); §Context body unchanged from the 22.2 SPEC anchor commit.
+**Date:** 2026-05-19 (§Context anchor at predecessor 22.2 SPEC commit `0d6463e`; §Decision + §Consequences body land at this 22.2 IMPL Task 19 atomic landing per ADR-0044 in-place edit discipline)
 **Doctrine:** Phase 22.2 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline. NEW ADR (NOT in-place AMEND on ADR-0188 per Q10 strict scope).
-**Lands-in:** Phase 22.2 IMPL atomic-landing Task (same Task as ADR-0190 + ADR-0192 + ADR-0177 AMENDMENT body per PLAN).
+**Lands-in:** Phase 22.2 IMPL Task 19 atomic-landing (same Task as ADR-0190 + ADR-0192 + ADR-0177 AMENDMENT body per PLAN).
 
 ### Context
 
@@ -11642,22 +11773,150 @@ type BodyBuffer interface {
 
 ### Decision
 
-*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Decision body will codify the final coroutine API signatures + body-buffer seam interface + integration with ADR-0188 primitive + lineage-separation rationale + future-consumer-#2 ALLOWANCE clause discipline (matching the IMPL-time landing).*
+**Status: Accepted — landed at phase-22.2 IMPL Task 2 (NEW `internal/lua/coroutine.go` + tests) + Task 3 (NEW `internal/lua/body_buffer.go` + tests) + Task 7 (lua bridge body consumer) + Task 11 (lua bridge sync httpCall yield consumer) + Task 19a (production HCM coroutine orchestration); §Decision body anchored at this 22.2 IMPL Task 19 atomic landing.** The §Decision codifies the final settled API signatures + body-buffer seam interface + integration with ADR-0188 primitive + lineage-separation rationale + future-consumer-#2 ALLOWANCE clause discipline as landed at the 22.2 IMPL tasks above. Per phase-22.2 SPEC §3.2 + §11.1 D2 closure + §11.3 D3 RECOMMENDED + ADR-0044 in-place edit discipline.
+
+**(i) D-P5 LOCK: NEW FILES (NOT in-place APPEND to vm.go).** Per phase-22.2 PLAN D-P5 closure: the coroutine + body-buffer API extensions land as NEW `internal/lua/coroutine.go` + `internal/lua/body_buffer.go` files — NOT as in-place APPEND to the 22.1 `vm.go`. Rationale: preserves the ADR-0188 vs ADR-0191 lineage separation per Q10 strict scope (the consumer-#1 22.1 surface lives in `vm.go`; the consumer-#1-scope-expansion 22.2 surface lives in `coroutine.go` + `body_buffer.go`; the future consumer-#2 surface — per ADR-0188's EXPLICIT API-REVISION ALLOWANCE clause — will land in further-segregated files when that future phase fires). Test files paired: `coroutine_test.go` + `body_buffer_test.go`.
+
+**(ii) Coroutine API surface — 3 exported identifiers at `internal/lua/coroutine.go`.** Confirms the surface anticipated in the §Context block byte-for-byte per the §11.1 D2 closure:
+
+```go
+package lua
+
+// NewThread constructs a child *lua.LState as a coroutine state, sharing
+// globals with the parent. Per §11.1 D2 closure: gopher-lua native
+// LState.NewThread() is the underlying mechanism. The returned *LState is
+// the coroutine state; callers Resume it via the parent's Resume method.
+// The returned CancelFunc from gopher-lua's NewThread MUST be invoked at
+// coroutine cleanup (typically at filter OnDestroy).
+func (vm *VM) NewThread() (*lua.LState, context.CancelFunc)
+
+// Resume invokes parent.Resume(child, fn, args...) per gopher-lua semantics.
+// Per §11.1 D2 closure: the parent *LState drives the child; on ResumeYield
+// returns with the yield args, on ResumeError returns the API error, on
+// ResumeOK returns the script's return values.
+func (vm *VM) Resume(child *lua.LState, fn *lua.LFunction, args ...lua.LValue) (lua.ResumeState, error, []lua.LValue)
+
+// YieldFromBridge is a Go-side helper for bridge LGFunction implementations.
+// Pushes args onto the bridge LState and returns the gopher-lua yield
+// sentinel (-1). The caller (an LGFunction) MUST return the result
+// directly to gopher-lua per vm.go:200-210 switchToParentThread discipline
+// (callGFunction sees gfnret<0 and unwinds to the parent thread).
+func YieldFromBridge(L *lua.LState, args ...lua.LValue) int
+```
+
+`NewThread` delegates to `gopher-lua.(*LState).NewThread()` (`state.go:1614`) which mints a child `*lua.LState` sharing the parent's `G` (global state) + `Env` (registry) but with its own per-stack execution context + its own `context.CancelFunc` derived from the parent's context (the cancel func MUST be invoked at coroutine cleanup to release the per-child resources — the cancellation discipline lives in the consumer at Task 19a's `decode_headers.go` + `encode_headers.go` `decodeChildCancel` / `encodeChildCancel` fields on `*filter`).
+
+`Resume` delegates to `parent.Resume(child, fn, args...)` (`state.go:2157`). The return type triple `(lua.ResumeState, error, []lua.LValue)` carries the yield/return values on `ResumeYield` (so the bridge can inspect what the script wants — body? httpCall? — by inspecting the per-filter pending fields) + the API error on `ResumeError` + the script's return values on `ResumeOK`. The caller (HCM dispatch wrapper at `decode_headers.go` + `encode_headers.go`) drives the dispatch loop: on `ResumeYield` re-invokes `vm.Resume(child, nil, /*args from the satisfying source*/...)` when the awaited resource (body bytes + httpCall response) is available.
+
+`YieldFromBridge` codifies the gopher-lua VM unwinding discipline per §11.1 D2 closure. A Go-side LGFunction that needs to suspend the script calls `YieldFromBridge(L, lua.LNil)` (or `YieldFromBridge(L, ...args)` with the values to surface to the resume caller) and returns its result (the `-1` sentinel) directly to gopher-lua. The gopher-lua VM's `callGFunction` (`vm.go:200-210`) sees the negative return value + calls `switchToParentThread`, unwinding the call stack to the parent `*LState`. The bridge then stashes the suspended `*LState` in a per-stream pending-map (e.g., `f.pendingBodyResume` for body yields; `f.pendingHTTPCallResume` for sync httpCall yields). The matching `vm.Resume(child, nil, ...satisfyingArgs)` is invoked from the Envoy decode-data callback when the awaited resource becomes available — for body, from `accumulateRequestBody` / `accumulateResponseBody` at endStream; for sync httpCall, from the dispatch goroutine after `ClusterDispatch` returns.
+
+**(iii) BodyBuffer seam interface at `internal/lua/body_buffer.go`.** ONE exported identifier confirms the §Context anticipation byte-for-byte:
+
+```go
+package lua
+
+// BodyBuffer is the seam interface consumed by the lua bridge's :body() +
+// :bodyChunks() methods. Implemented by the per-stream body-bridge wrapper
+// at internal/filter/http/lua/body.go that consumes ADR-0128's decode-side
+// buffer (HCM-level bodyBuf accumulation; defensive copy at endStream per
+// §11.3 D3 recommendation).
+type BodyBuffer interface {
+    // Bytes returns the full accumulated body as one byte slice. Returns
+    // nil if body not yet available; the slice MUST NOT be mutated by
+    // consumers (treat as read-only).
+    Bytes() []byte
+
+    // Chunks returns the body as a sequence of per-DecodeData chunks.
+    // Returns nil if body not yet available. Each inner slice is
+    // read-only.
+    Chunks() [][]byte
+
+    // EndStream reports whether the terminal endStream=true signal has
+    // fired. Returns false until the body is fully accumulated.
+    EndStream() bool
+}
+```
+
+The `BodyBuffer` interface is the integration point between `internal/lua/` API + ADR-0128's HCM-level decode-side buffer accumulation. The lua bridge (at `internal/filter/http/lua/body.go`) constructs concrete `*decodedBodyBuffer` + `*encodedBodyBuffer` structs implementing `BodyBuffer` that wrap per-filter accumulated chunks (paralleling ext_authz's `f.body` + ext_proc's `f.decodeBodyBuf` patterns per §11.3 evidence). At endStream, the bridge's `:body()` method makes a defensive copy of the accumulated bytes into a Go string via `lua.LString(string(f.decodedBodyBytes))` — Lua owns the resulting Go string (immutable; safe across coroutine yield/resume per §11.3 D3 RECOMMENDED disposition).
+
+**(iv) Per-stream child-LState lifecycle integration per §11.1 D2 closure.** The per-stream lifecycle: ONE parent `*LState` per stream (compiled-bytecode owner; constructed at filter `OnStream` per ADR-0188 §Decision §3) + ONE child `*LState` per phase invocation (decode side + encode side each get a fresh child at their respective hook entry — `envoy_on_request` runs in `decodeChild`; `envoy_on_response` runs in `encodeChild`). Both released on filter `OnDestroy`. The child's `context.CancelFunc` from `NewThread()` MUST be invoked to cancel the child's ctx-derived loop (production wiring at `*filter.OnDestroy()` in `lua.go` invokes both `decodeChildCancel` + `encodeChildCancel` per Task 19a's lifecycle gate).
+
+**(v) Resume semantics + error propagation per §11.1 D2 closure.** `Resume` returns `(ResumeState, error, []lua.LValue)`. The three states + semantics:
+
+- `lua.ResumeOK` → script completed normally; `[]LValue` carries the script's return values; `error` is nil.
+- `lua.ResumeYield` → script called `YieldFromBridge` or `coroutine.yield`; `[]LValue` carries the yield args; `error` is nil; the caller (HCM dispatch wrapper) inspects per-filter pending fields to decide which kind of yield this is (`pendingBodyResume != nil` → body yield; `pendingHTTPCallResume != nil` → sync httpCall yield).
+- `lua.ResumeError` → script panicked / Lua runtime error / `pcall`-uncaught error; `error` carries the `*lua.ApiError`; `[]LValue` is empty. Per `threadRun` (`vm.go:272-293`), gopher-lua installs `defer recover()` so the panic surfaces as `ResumeError` rather than crashing the host goroutine — the bridge MUST always pair every `Resume` call with parent-side error handling.
+
+**(vi) D2 closure rationale — Option A (gopher-lua native) over Option B (Go-side channel wrapper).** Per §11.1 D2 evidence: Option B was REJECTED on goroutine-blocking grounds. gopher-lua's VM is single-threaded over each `*LState`; blocking a Go bridge LGFunction on a channel would block the OS goroutine driving `threadRun` (the OS goroutine is one of the worker pool's goroutines — blocking it would consume the worker for the duration of the script's wait). Wasted complexity when `Yield(-1)`/`Resume` is built-in: the gopher-lua VM unwinds the call stack via the `-1` sentinel without consuming a worker goroutine for the duration of the wait. Option A's mechanical simplicity (the unwinding discipline is documented in gopher-lua source at `vm.go:200-210`) carries forward to envoy-go's bridge without behavioral surprises.
+
+**(vii) Task 2 panic-wrapper integration at the coroutine seam (per Task 2 IMPL).** The 22.1 ADR-0188 §Decision 2 introduced a panic-wrapper discipline at the LState dispatch seam — `vm.CallGlobal` wraps `parent.PCall` in a defer-recover that converts `*lua.ApiError` panics to the `errors` stat counter increment. Task 2 extended this discipline to the coroutine seam: `vm.Resume` (the parent's Resume call) similarly wraps in a defer-recover so that a script panic in a child thread is converted to `ResumeError` (with the `*lua.ApiError` carried in the error return) rather than propagating to the host goroutine. The wrapper helper `coroutineDispatchPanic` lives in `internal/lua/coroutine.go` + is invoked by `vm.Resume` directly before delegating to `parent.Resume`. The Task 2 helper extension to ADR-0188 §Decision 2 panic-wrapper discipline is BROADER ApiError scope than the 22.1 `ApiErrorPanic`-only scope (the coroutine seam handles `ApiErrorRun` + `ApiErrorPanic` + `ApiErrorOther` uniformly — any *lua.ApiError shape that surfaces during Resume is captured).
+
+**(viii) Q10 strict scope — NEW ADR (NOT in-place AMEND on ADR-0188).** Per BRAINSTORM Q10 strict-scope decision: 22.2's consumer-#1-scope-expansion lands under THIS NEW ADR rather than in-place AMEND on ADR-0188. ADR-0188's EXPLICIT API-REVISION ALLOWANCE clause STAYS scoped to consumer-#2 (future cluster-specifier / access-logger / string-matcher Lua phases). The lineage-separation rationale per BRAINSTORM Q10:
+
+- **Apply-allowance-to-scope-expansion + in-place-AMEND was REJECTED** on lineage-separation grounds: over-loading ADR-0188 with consumer-#1-expansion AMENDMENTs would dilute the consumer-#2 ALLOWANCE's empirical-validation rationale (ADR-0188's allowance is a FUTURE-USE allowance triggered by a different consumer's empirical validation; mixing it with same-consumer scope-expansion confuses the lineage).
+- **NO-API-revisions was REJECTED** on duplication grounds: building coroutine + body-bridge surfaces outside `internal/lua/` would duplicate primitive-like code at the lua filter; the second `internal/lua/` consumer at the future consumer-#2 phase would then face TWO API surfaces to validate.
+
+Each ADR's scope is now tightly bound to a single semantic event: ADR-0188 = primitive landing at consumer-#1; ADR-0191 = primitive extensions at consumer-#1-scope-expansion; future ADR for consumer-#2 = primitive extensions per the ADR-0188 ALLOWANCE.
+
+**(ix) Production HCM coroutine orchestration landed at Task 19a (PRE-ATOMIC-LANDING).** `internal/filter/http/lua/decode_headers.go` + `encode_headers.go` invoke `envoy_on_request` + `envoy_on_response` via `vm.NewThread()` + `vm.Resume(child, fn, reqUd / respUd)` per the API surface above. The orchestration:
+
+1. At `DecodeHeaders` entry: `child, cancel := vm.NewThread()`; stash `cancel` in `*filter.decodeChildCancel`; `vm.Resume(child, envoyOnRequest, reqUd)`.
+2. On `lua.ResumeYield`: inspect `*filter.pendingHTTPCallResume` vs `*filter.pendingBodyResume`. If `pendingHTTPCallResume != nil` → close `httpCallReady` channel + wait on `httpCallDone` channel so the dispatch goroutine drives the resume to script completion synchronously inside DecodeHeaders. If `pendingBodyResume != nil` → return `Continue` so the chain's `RunDecodeData` fires; `accumulateRequestBody` at endStream invokes `vm.Resume(child, nil, lua.LString(string(f.decodedBodyBytes)))` to resume the suspended coroutine.
+3. On `lua.ResumeOK`: `*filter.respondCaptured` is the source of truth for whether to short-circuit; if non-nil return the captured local-reply via the standard HCM short-circuit path; if nil return `Continue`.
+4. On `lua.ResumeError`: increment `errors` stat counter; log the error via the panic-recovery wrapper; return `Continue` (degraded pass-through).
+
+The "Continue on body-yield" trade-off is the deliberate production decision documented at the BEHAVIOR_CONTRACT.md `#### Phase 22.2 full bridge surface delta` subsection. Multi-decoder-filter topologies that depend on body-after-yield header-mutation visibility ARE a known limitation flagged for REVIEW.md + future framework work (deferred to 22.3 or a separate framework phase per §1.2 + parent §10).
 
 ### Consequences
 
-*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Consequences body will document the (+/-)/(?) tradeoffs + the consumer-#2 ALLOWANCE preservation + the body-buffer seam's GC-safety discipline (defensive copy at endStream) + the per-stream child-LState lifecycle (matching the IMPL-time landing).*
+**(+) ADR-0188's API-REVISION ALLOWANCE STAYS scoped to consumer-#2.** The strict-scope decision per Q10 preserves the ALLOWANCE's empirical-validation rationale + the per-ADR single-semantic-event discipline. Future consumer-#2 BRAINSTORM (cluster-specifier / access-logger / string-matcher Lua) consumes the ALLOWANCE cleanly without lineage entanglement against this consumer-#1-scope-expansion. The Q10 strict-scope decision is the load-bearing ADR-lineage decision for the 22.2 phase.
 
-**Cross-references:** ADR-0188 (predecessor primitive ADR — `internal/lua/` framework primitive at consumer-#1; EXPLICIT API-REVISION ALLOWANCE for consumer-#2 — STAYS scoped to consumer-#2 per Q10 strict scope); ADR-0190 (sibling NEW ADR at THIS SPEC commit — `internal/dynamicmetadata/` framework primitive); ADR-0192 (sibling NEW ADR at THIS SPEC commit — `internal/filter/http/lua/` 22.2 package shape extensions consuming ADR-0191's coroutine + BodyBuffer API); ADR-0128 (HCM-level decode-side body-buffer that the body-buffer seam wraps); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline); ADR-0052 (atomic landing); ADR-0085 (nil-tolerance discipline); phase-22.2 BRAINSTORM Q1 + Q10 + §2.1 + §3.2; phase-22.2 SPEC §1 + §3.2 + §11.1 D2 closure + §11.3 D3 RECOMMENDED + §16.2.
+**(+) Coroutine yield/resume orchestration enables non-blocking body bridge + sync httpCall bridge.** Bridge methods that need to suspend the script (await body bytes + await sync httpCall response) yield via `YieldFromBridge` without consuming a worker goroutine for the duration of the wait. The HCM dispatch wrapper drives the resume from the appropriate satisfying source (decode-data callback at endStream for body; dispatch goroutine post-`ClusterDispatch` for sync httpCall). The per-stream child-LState lifecycle integration aligns with ADR-0033 sequential filter dispatch.
+
+**(+) Future framework phases that extend `internal/lua/` per consumer-#2 scope can edit `vm.go` without touching `coroutine.go` / `body_buffer.go`.** Per D-P5 LOCK NEW FILES discipline: the consumer-#1-scope-expansion files are independently maintainable from the consumer-#1 base files. Future consumer-#2 phase that extends `vm.go` for cluster-specifier / access-logger / string-matcher Lua needs (e.g., a NEW `RegisterStringMatcher` API) does NOT touch this 22.2 commit's `coroutine.go` / `body_buffer.go` files — preserves the file-level lineage separation.
+
+**(+) D2 closure: gopher-lua native vs Go-side channel wrapper.** The Option-A choice is mechanically simple + leverages built-in gopher-lua machinery. The bridge implementation surface at this consumer-#1-scope-expansion is straightforward (Task 2 + Task 7 + Task 11 IMPLs total ~120 LoC across `coroutine.go` + `body_buffer.go` + bridge consumer; the production HCM orchestration at Task 19a is ~100 LoC across `decode_headers.go` + `encode_headers.go`).
+
+**(+) Defensive-copy at endStream per §11.3 D3 RECOMMENDED is GC-safe.** The `BodyBuffer` interface contract specifies that `Bytes()` returns a read-only slice; the bridge consumer copies once at endStream (`lua.LString(string(f.decodedBodyBytes))`) — Lua owns the immutable Go string from that point forward. Coroutine yield/resume + HCM dispatch goroutine lifetimes are all safe under this discipline. Task 15 `BenchmarkBodyBridge_DefensiveCopy_PerStream` confirms the perf threshold gates: sub-MB body at ~103µs (gate ≤ 1ms; 9.7× under) + 16-MiB-saturated at ~9.3ms (gate ≤ 100ms; 10.7× under).
+
+**(-) The "Continue on body-yield" trade-off is a known limitation for multi-decoder-filter topologies.** Returning Continue (vs StopIteration) on body yield is required because envoy-go's HCM serializes Headers→Data — returning StopIteration would deadlock the chain. The trade-off: subsequent decode-side filters see request headers BEFORE Lua's post-:body() mutations. For 22.2's single-lua-decoder topology (fixture-0027) this is benign because router runs AFTER the chain's RunDecodeData. Multi-lua-chain or lua→<header-reading-filter> topologies that depend on body-after-yield header-mutation visibility silently lose those mutations. Deferred to phase-22.3 or a separate framework phase that introduces a "park-headers-iteration-pending-body" cooperative discipline.
+
+**(-) Per-stream child-LState construction adds modest overhead vs the 22.1 baseline.** Task 15 `BenchmarkPerStream_FullBridge_LState_Construction` reports `ns/op = 98157` (~98µs) at the FULL 22.2 bridge surface — 1.4× the 22.1 headers-only baseline of `ns/op = 69865` (~70µs). The child-LState mint via `NewThread` contributes a small fraction of that delta; the bulk is from the 7 NEW metatable installs at the FULL bridge surface. The cost is well under the 1ms threshold (10.2× under) — conditional ADR-0193 *LState-pool escape-valve NOT consumed; carries forward to 22.3 BRAINSTORM unconsumed.
+
+**(-) `coroutineDispatchPanic` helper wraps `vm.Resume` with broader scope than ADR-0188's `ApiErrorPanic`-only wrapper.** The broader scope (handles `ApiErrorRun` + `ApiErrorPanic` + `ApiErrorOther`) is necessary because the coroutine seam's error surface is broader (Lua-runtime errors during a yielded-then-resumed script can surface as `ApiErrorRun`); the broader scope adds ~5 LoC of defer-recover plumbing at the `vm.Resume` callsite. Documented at the Task 2 PROGRESS entry.
+
+**(?) Future consumer-#2 phase may revisit the API surface per ADR-0188 EXPLICIT API-REVISION ALLOWANCE.** That future phase's BRAINSTORM may surface API revisions (e.g., a different `Resume` signature that returns yield-args via a callback rather than the return triple; a NEW `WithCoroutineQuota` option to bound per-thread CPU consumption). Per the ALLOWANCE clause, that future phase's revisions land under a NEW ADR (or in-place AMEND on ADR-0188 — settled per the Q10-equivalent dialogue at that future BRAINSTORM); the consumer-#1 22.2 surface STAYS at this ADR-0191's settled signatures.
+
+**(?) Body-buffer GC safety in pathological adversarial scenarios.** The defensive-copy at endStream is GC-safe because Go strings are immutable + length-prefixed; the underlying byte slice may be freed by the runtime GC after the copy. Pathological scenarios — operator scripts that retain references to the `:body()` result across very long-lived coroutines (e.g., a coroutine that yields for hours waiting for a sync httpCall) — would extend the live-set with the body bytes for that duration. NOT a 22.2 IMPL concern (the sync httpCall yield is bounded by `ClusterDispatch` timeout per `httpclient.Options.Timeout`); flagged for future scenarios that introduce long-lived coroutines (e.g., a hypothetical streaming-RPC bridge).
+
+**Test coverage at this Task 2 + Task 3 landing:**
+
+- `internal/lua/coroutine_test.go` (Task 2):
+  - `TestVM_NewThread_ChildSharesGlobals` — verifies child LState sees parent's globals.
+  - `TestVM_Resume_OK_ReturnsValues` — verifies `ResumeOK` return-value triple.
+  - `TestVM_Resume_Yield_ReturnsYieldArgs` — verifies `ResumeYield` carries yield args.
+  - `TestVM_Resume_Error_ReturnsApiError` — verifies `ResumeError` carries the `*lua.ApiError`.
+  - `TestVM_Resume_RecoversFromBridgePanic` — verifies the `coroutineDispatchPanic` wrapper converts panics to `ResumeError`.
+  - `TestVM_NewThread_CancelFuncReleasesResources` — verifies the cancel func releases the child's per-stream resources.
+  - `TestYieldFromBridge_ReturnsNegativeSentinel` — verifies the `-1` sentinel return value.
+  - `TestVM_Coroutine_RaceClean_Under_Race_Count10` — verifies race-clean under `-race -count=10` for the 1000-concurrent-coroutine-mint case (Task 15 race-test extension).
+
+- `internal/lua/body_buffer_test.go` (Task 3):
+  - `TestBodyBuffer_NilImplementation` — verifies the interface contract accommodates nil-receiver-tolerant implementations.
+  - `TestBodyBuffer_Bytes_ReturnsAccumulated` — verifies the contract that `Bytes()` returns accumulated bytes.
+  - `TestBodyBuffer_Chunks_ReturnsChunkList` — verifies the chunked-iteration contract.
+  - `TestBodyBuffer_EndStream_True_WhenFullyAccumulated` — verifies the endStream signal.
+
+**Cross-references:** ADR-0188 (predecessor primitive ADR — `internal/lua/` framework primitive at consumer-#1; EXPLICIT API-REVISION ALLOWANCE for consumer-#2 — STAYS scoped to consumer-#2 per Q10 strict scope); ADR-0190 (sibling NEW ADR at predecessor 22.2 SPEC commit — `internal/dynamicmetadata/` framework primitive); ADR-0192 (sibling NEW ADR at predecessor 22.2 SPEC commit — `internal/filter/http/lua/` 22.2 package shape extensions consuming ADR-0191's coroutine + BodyBuffer API); ADR-0128 (HCM-level decode-side body-buffer that the body-buffer seam wraps); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline); ADR-0052 (atomic landing); ADR-0085 (nil-tolerance discipline); phase-22.2 BRAINSTORM Q1 + Q10 + §2.1 + §3.2; phase-22.2 SPEC §1 + §3.2 + §11.1 D2 closure + §11.3 D3 RECOMMENDED + §16.2; phase-22.2 PLAN Task 2 + Task 3 + Task 7 + Task 11 + Task 15 + Task 19a + D-P5.
 
 ---
 
 ## ADR-0192: NEW `internal/filter/http/lua/` 22.2 package shape extensions — full Envoy↔Lua bridge surface delta (body + trailers + metadata + connection-SSL + httpCall + crypto + fileBytes + timestamp + streamInfo-full + filter-state in-package) + 5+2 envoy-go-strict departure records + fixture-0027 mixed-mode discipline + `FilterChain.tlsConnectionState` field extension + cross-phase dynamic-metadata deferral-lift via `internal/dynamicmetadata/` consumer-#1
 
-**Status:** §Context anchored at phase-22.2 SPEC commit (THIS commit); §Decision + §Consequences body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline.
-**Date:** 2026-05-19 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 22.2 IMPL Lands-in-Task)
+**Status:** Accepted — §Decision + §Consequences body landed at phase-22.2 IMPL Task 19 atomic landing (THIS commit); §Context body unchanged from the 22.2 SPEC anchor commit.
+**Date:** 2026-05-19 (§Context anchor at predecessor 22.2 SPEC commit `0d6463e`; §Decision + §Consequences body land at this 22.2 IMPL Task 19 atomic landing per ADR-0044 in-place edit discipline)
 **Doctrine:** Phase 22.2 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline.
-**Lands-in:** Phase 22.2 IMPL atomic-landing Task (same Task as ADR-0190 + ADR-0191 + ADR-0177 AMENDMENT body per PLAN).
+**Lands-in:** Phase 22.2 IMPL Task 19 atomic-landing (same Task as ADR-0190 + ADR-0191 + ADR-0177 AMENDMENT body per PLAN).
 
 ### Context
 
@@ -11692,13 +11951,196 @@ Per the phase-22.2 BRAINSTORM 14-Q dialogue + the 4 AMEND-22.2-N findings from �
 
 ### Decision
 
-*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Decision body will codify the final 22.2 package shape: 7 NEW production files (body.go + trailers.go + metadata.go + connection.go + ssl.go + httpcall.go + crypto.go + misc.go + filterstate.go) + 7 NEW test files + 4 EXTENDED 22.1 files; per-surface method registration; the 2 AMEND-22.2-4 `:filterState()` divergences with byte-stable wording; the 5 NEW stat counters; the fixture-0027 scenario taxonomy; the §13-R7+R8 PLAN-time crypto+fileBytes-classification outcome; the §13-R6 *LState-pool gate disposition; the cross-phase dynamic-metadata deferral-lift expectation; the `FilterChain.tlsConnectionState` field extension wiring (H1 + H2); the in-package wire-format conventions for ssl methods (PEM/url-encoding/ISO-8601/hex sha256); the runtime-reject byte-stable wording for arms 20-22.*
+**Status: Accepted — landed at phase-22.2 IMPL Tasks 1-18 (per-task IMPL artifacts) + Task 19a (production HCM coroutine orchestration); §Decision body anchored at this 22.2 IMPL Task 19 atomic landing.** The §Decision codifies the final 22.2 package shape + 8 bridge surface families + 5 NEW stat counters + 3 NEW runtime-reject arms 20-22 + 2 `:filterState()` envoy-go-strict divergences + the cross-phase dynamic-metadata deferral-lift expectation + the `FilterChain.tlsConnectionState` field extension wiring + the fixture-0027 mixed-mode discipline + the production HCM coroutine orchestration. Per phase-22.2 SPEC §3.4 + §3.5 + §6 + §7 + §8 + §9 + §11 + AMEND-22.2-1..-4 + ADR-0044 in-place edit discipline.
+
+**(i) 22.2 file roster — 8 NEW production files + 8 NEW test files + 4 EXTENDED 22.1 files.** Per phase-22.2 SPEC §3.5 + Tasks 7-13 landing:
+
+```
+internal/filter/http/lua/  (post-22.2 roster)
+  doc.go                      # EXTENDED at Task 19 — 22.2 BRAINSTORM Q1-Q14 +
+                              # AMEND-22.2-1..-4 cross-references
+  lua.go                      # EXTENDED at Task 11 — factory threads
+                              # FactoryCtx.ClusterManager + FactoryCtx.HTTPClient
+                              # into *compiledConfig + Task 19a — *filter carries
+                              # decodeChild/encodeChild + cancel funcs
+  compiled_config.go          # EXTENDED at Task 14 — runtime-reject arm 20-22
+                              # byte-stable wording catalog
+  datasource.go               # UNCHANGED from 22.1
+  bridge.go                   # EXTENDED at Task 8 — trailers metatable factory +
+                              # installPairsShim discipline UNCHANGED
+  decode_headers.go           # REWRITTEN at Task 19a — production coroutine
+                              # orchestration via vm.NewThread + vm.Resume + 8
+                              # bridge surface metatable registration
+  encode_headers.go           # REWRITTEN at Task 19a — symmetric encode-side
+                              # orchestration
+  body.go                     # NEW Task 7 — :body + :bodyChunks bridge +
+                              # decodedBodyBuffer + encodedBodyBuffer (consume
+                              # ADR-0191 BodyBuffer interface) + accumulation
+                              # helpers + 16-MiB cap arm 21
+  trailers.go                 # NEW Task 8 — :trailers bridge + 8 mutation
+                              # methods + __pairs alphabetical-snapshot
+  metadata.go                 # NEW Task 9 — :metadata callable empty + dynamic
+                              # metadata bridge (consumes ADR-0190 Bucket)
+  connection.go               # NEW Task 10 — :connection bridge +
+                              # FilterChain.tlsConnectionState wrap into Lua
+                              # userdata
+  ssl.go                      # NEW Task 10 — 17-method ssl wrapper consuming
+                              # *tls.ConnectionState
+  httpcall.go                 # NEW Task 11 — :httpCall bridge + sync coroutine
+                              # yield + async fire-and-forget per AMEND-22.2-3
+  crypto.go                   # NEW Task 12 — :base64Escape + :base64Decode +
+                              # :sha256 + :sha512 + :importPublicKey +
+                              # :verifySignature bridge methods
+  misc.go                     # NEW Task 12 — :fileBytes (16 MiB cap) +
+                              # :timestamp(unit) bridge methods
+  filterstate.go              # NEW Task 13 — in-package filter-state per-stream
+                              # FilterStateBucket + :get + :set bridge methods
+  streaminfo.go               # EXTENDED at Task 13 — 7 NEW methods (upstreamHost
+                              # + upstreamCluster + dynamicMetadata +
+                              # dynamicTypedMetadata + requestedServerName +
+                              # filterState + downstreamSslConnection)
+  stats.go                    # EXTENDED at Task 14 — +5 envoy-go-strict counters
+  lua_test.go                 # EXTENDED at Task 15 — race + concurrency tests +
+                              # 2 benchmarks per D-P10
+  compiled_config_test.go     # EXTENDED at Task 14 — arm 20-22 byte-exact
+                              # wording assertions
+  datasource_test.go          # UNCHANGED
+  bridge_test.go              # EXTENDED at Task 8 — trailers metatable tests
+  body_test.go                # NEW Task 7 — body bridge + coroutine yield +
+                              # defensive-copy cross-run-determinism tests
+  trailers_test.go            # NEW Task 8 — trailers test coverage
+  metadata_test.go            # NEW Task 9 — metadata + dynamic-metadata tests +
+                              # flat-accessor signature pin
+  ssl_test.go                 # NEW Task 10 — ssl wrapper tests with mock
+                              # *tls.ConnectionState fixtures
+  connection_test.go          # NEW Task 10 — connection wrapper tests
+  httpcall_test.go            # NEW Task 11 — :httpCall sync + async + cluster
+                              # resolution failure + timeout + retry tests
+  crypto_test.go              # NEW Task 12 — 6 crypto bridge method tests +
+                              # golden-byte vectors
+  misc_test.go                # NEW Task 12 — :fileBytes + :timestamp tests
+  filterstate_test.go         # NEW Task 13 — :filterState get + set + typed
+                              # marshaling tests
+  fuzz_test.go                # EXTENDED at Task 16 — +2 fuzzers (FuzzLuaBodyBridge
+                              # + FuzzLuaHTTPCallConfig); 28 → 30
+```
+
+**(ii) 8 bridge surface families settled (per BRAINSTORM §1.1 + §2.1-§2.8 + SPEC §1 + Tasks 7-13 landing).** Verbatim per the §Context block:
+
+1. **Body bridge** — `:body()` whole-buffer + `:bodyChunks()` chunked iterator. Coroutine yield via ADR-0191 `YieldFromBridge`. Defensive copy at endStream per §11.3 D3 RECOMMENDED.
+2. **Trailers bridge** — `:trailers()` mirroring 22.1 headers metatable exactly + `__pairs` reusing `installPairsShim`. Lazy-available.
+3. **Metadata bridge** — `:metadata()` callable userdata wrapping empty metadata source at v1.32.4 binding-gap; `:streamInfo():dynamicMetadata()` + `:streamInfo():dynamicTypedMetadata(filter_name)` consuming ADR-0190 Bucket at first co-consumer. `:dynamicMetadata():get(filterName, key)` flat 2-arg accessor (envoy-go-strict vs upstream chained wrapper).
+4. **Connection bridge** — `:connection():ssl()` 17-method cert/session surface consuming `FilterChain.tlsConnectionState`. Returns nil on plaintext.
+5. **httpCall bridge** — `:httpCall(cluster, headers, body, timeout_ms, async?)` cluster-based dispatch via ADR-0177 IN-PLACE AMENDMENT `Client.ClusterDispatch`. Async = PURE FIRE-AND-FORGET per AMEND-22.2-3 D6.
+6. **Crypto bridge** — 6 methods in-package at `crypto.go` (2 upstream-parity at PublicKeyWrapper return scope per D8 + 4 envoy-go-strict per D8).
+7. **Filesystem + clock bridge** — `:fileBytes(path)` 16 MiB cap; `:timestamp(unit?)` wall-clock.
+8. **streamInfo-full** — 7 additional methods extending 22.1's 4-method subset → 11-method surface at 22.2. `:filterState()` IN-PACKAGE per Q9 + AMEND-22.2-4.
+
+**(iii) `FilterChain.tlsConnectionState` field extension wiring (H1 + H2 symmetric; lives inside this ADR per Q13 WEAK HOLD).** Per phase-22.2 SPEC §3 + §11.5 + Task 5 + Task 6 IMPL. NEW field on `internal/filter/http/chain.go::FilterChain`:
+
+```go
+type FilterChain struct {
+    // ... existing fields ...
+    tlsConnectionState *tls.ConnectionState
+    dynamicMetadata    *dynamicmetadata.Bucket  // per ADR-0190
+}
+
+func (c *FilterChain) SetTLSConnectionState(state *tls.ConnectionState)
+func (c *FilterChain) TLSConnectionState() *tls.ConnectionState
+```
+
+H1 (`internal/filter/hcm/connection.go`) + H2 (`internal/filter/hcm/h2dispatch.go`) seed via `chain.SetTLSConnectionState(...)` BEFORE the first `RunDecodeHeaders` per-stream invocation — symmetric to the 22.1 TLS-principals plumbing pattern from ADR-0144. Both protocol arms (H1 single-conn-multi-streams + H2 multiplexed streams) seed identically — the `*tls.ConnectionState` is captured at `listener.Conn`'s TLS handshake completion (per phase-03 TLS primitive) + threaded into the chain at chain-construction time. Lua bridge wraps the raw state into Lua userdata at `:connection():ssl()` invocation (no per-invocation TLS handshake parsing — the wrapping is a thin metatable install over the captured state).
+
+**(iv) Cross-phase dynamic-metadata deferral-lift via `internal/dynamicmetadata/` consumer-#1.** Per ADR-0190 §Decision (v) + this ADR's `:streamInfo():dynamicMetadata()` + `:streamInfo():dynamicTypedMetadata(filter_name)` bridge methods. The lua bridge is the FIRST co-consumer of `internal/dynamicmetadata/Bucket` at 22.2 IMPL. Prior phases (16/17/18/19/20) deferred dynamic-metadata access; this 22.2 IMPL lands the primitive + the FIRST consumer simultaneously. Future phase BRAINSTORMs that need dynamic-metadata access reuse the primitive + their BEHAVIOR_CONTRACT.md "deferred" notes convert to "lifted" at the lift-phase's next-touchpoint. NO automatic mass-update at this 22.2 IMPL.
+
+**(v) 5 NEW envoy-go-strict counters (per SPEC §7.1 + Task 14 IMPL).** `stats.go` adds 5 counter slots at the existing `filterStats` struct + boot-registration call sites:
+
+- `httpcall_total` — increments per `:httpCall` invocation (sync + async)
+- `httpcall_failures` — SYNC-ONLY failure counter per AMEND-22.2-3 D6
+- `httpcall_timeouts` — SYNC-ONLY timeout counter per AMEND-22.2-3 D6
+- `body_buffered_bytes_total` — cumulative bytes accumulated across `:body()` + `:bodyChunks()` consumers (incremented at endStream defensive-copy moment)
+- `coroutine_yields_total` — cumulative coroutine yield events from `YieldFromBridge` call sites
+
+Project stat-count delta 102 → 107 (+5). All 5 envoy-go-strict (upstream `ALL_LUA_FILTER_STATS` macro emits only `errors` + `executions` per parent SPEC §11.5.3). 5 BEHAVIOR_CONTRACT.md departure records land at this 22.2 IMPL Task 19 atomic landing (per the 15-edit bundle).
+
+**(vi) 3 NEW runtime-reject arms 20-22 byte-stable wording PINNED at Task 14 per W2.** Per phase-22.2 SPEC §6 + Task 14 IMPL:
+
+| Arm | Trigger | Byte-stable wording (constant in `compiled_config.go`) |
+|---|---|---|
+| 20 | `:httpCall("", ...)` empty cluster name | `"lua: httpCall: cluster name must not be empty"` (`runtimeRejectHTTPCallEmptyCluster`) |
+| 21 | `:body()` accumulated bytes > 16 MiB cap | `"lua: body: accumulated body exceeds maximum buffered size of %d bytes"` (`runtimeRejectBodyOverCapFmt`; cap value = 16777216) |
+| 22 | `:importPublicKey(pem)` malformed PEM input | `"lua: %s: %w"` (`runtimeRejectCryptoKeyFormatInvalidFmt` wrapping `crypto/x509.ParsePKIXPublicKey` error) |
+
+RUNTIME-REJECTs (Lua-runtime-error via `luaL_error`); 19-arm config-load PARSE-REJECT roster UNCHANGED at 22.2. Byte-pinned via the package's `compiled_config_test.go::TestRuntimeRejectConstants_ByteExactWording` + the per-bridge-test wording assertions.
+
+**(vii) `:filterState()` IN-PACKAGE + 2 envoy-go-strict divergences per AMEND-22.2-4.** `filterstate.go` lands the in-package surface per Q9 EXTRACT-NOW-only-when-trigger-fires: `FilterStateBucket` is a thin wrapper over `map[string]any` per-stream field on `*filter`. 2 envoy-go-strict divergences from upstream:
+
+- **`:set(name, value)` mutation surface EXPOSED** (upstream `FilterStateWrapper` is strictly read-only `:get` only; envoy-go has no Go-side mutation analog at 22.2; exposing `:set` from Lua is the envoy-go-strict equivalent).
+- **`:get(name)` typed Lua-value marshaling at return** (upstream always returns `serializeAsString()` strings; envoy-go converts via `gopher-lua.LValue` to native Lua types — string stays string, int → `lua.LNumber`, bool → `lua.LBool`, table-typed values → `lua.LTable`).
+
+2 BEHAVIOR_CONTRACT.md envoy-go-strict departure records land at this 22.2 IMPL Task 19 atomic landing (per the 15-edit bundle).
+
+**(viii) Fixture-0027 mixed-mode discipline (per BRAINSTORM Q12 + SPEC §8 + Tasks 17-18 + Task 19a IMPL).** Single `test/fixtures/0027-http-lua-full-bridge/` directory at 22.2 phase-done with 13 scenarios:
+
+- **8 deterministic cross-side `CompareBytes` scenarios:** (a) `:body()` whole-buffer + (b) `:bodyChunks()` chunked iterator + (c) `:trailers()` add+remove + (d) `:metadata()` empty-userdata at binding-gap + (e) `:streamInfo():dynamicMetadata()` read+write + (f) `:connection():ssl():sha256PeerCertificateDigest()` cert-fingerprint-only (per §11.5 D5 closure option (f-B)) + (g) `:base64Escape` (upstream-parity per §11.2.4) + (i) `:streamInfo():upstreamHost()` + `:upstreamCluster()`.
+- **5 non-deterministic REFERENCE-LESS subject-only scenarios:** (h) `:fileBytes` (envoy-go-strict per D8 — reference Envoy can't run) + (j) `:httpCall(cluster, ..., async=nil)` sync upstream cluster call + (k) `:httpCall(cluster, ..., async=true)` async fire-and-forget + (l) `:timestamp('milliseconds')` wall-clock + (m) `:streamInfo():filterState():set/:get` cross-stream isolated.
+
+R11 closure per D-P11 PLAN LOCK: REUSE existing `runReferenceLessFixture` driver helper — no new `RunSubjectOnlyHTTPLua` infrastructure. 28 → 29 fixture directories at 22.2 phase-done. Task 17 added the cert fixture plumbing (minimal self-signed cert via openssl + threaded through both reference + subject sides). Task 19a wired the production HCM coroutine orchestration that fixture-0027 exercises end-to-end.
+
+**(ix) Production HCM coroutine orchestration at Task 19a (PRE-ATOMIC-LANDING).** Per phase-22.2 SPEC §3.4 + §11.1 D2 closure + Task 19a IMPL. `decode_headers.go` + `encode_headers.go` invoke operator hooks as coroutines via `vm.NewThread()` + `vm.Resume(child, fn, ud)` per ADR-0191 surface. Cancellation discipline: `*filter` carries `decodeChild + decodeChildCancel + encodeChild + encodeChildCancel` fields; `OnDestroy` invokes both cancel funcs + nils the child references. ResumeYield branch dispatch:
+
+- **Sync httpCall yield** (`pendingHTTPCallResume != nil`): close `httpCallReady` channel + wait on `httpCallDone` channel so the dispatch goroutine drives Resume to script completion synchronously inside DecodeHeaders. Race-free coordination via the channel-based gate (httpCallReady close → goroutine reads → calls Resume → closes httpCallDone → DecodeHeaders reads). gopher-lua's non-thread-safe Resume is honored — at any moment only one goroutine touches the VM.
+- **Body yield** (`pendingBodyResume != nil` decode-side; `pendingRespBodyResume != nil` encode-side): return `Continue` so the chain's `RunDecodeData` fires. `accumulateRequestBody` / `accumulateResponseBody` at endStream invokes `vm.Resume(child, nil, lua.LString(...))` to resume the suspended coroutine.
+
+**"Continue on body-yield" trade-off** documented at the BEHAVIOR_CONTRACT.md `#### Phase 22.2 full bridge surface delta` subsection. Returning Continue (vs StopIteration) is REQUIRED because envoy-go's HCM serializes Headers→Data — returning StopIteration would deadlock the chain. The trade-off: subsequent decode-side filters see request headers BEFORE Lua's post-:body() mutations. **Multi-decoder-filter topologies that depend on body-after-yield header-mutation visibility ARE a known limitation flagged for REVIEW.md + future framework work** (deferred to 22.3 or a separate framework phase that introduces a "park-headers-iteration-pending-body" cooperative discipline).
+
+**(x) BEHAVIOR_CONTRACT.md 15-edit bundle (per phase-22.2 SPEC §14 + D8 PLAN-scrape outcome + this 22.2 IMPL Task 19 atomic landing).** 11 envoy-go-strict departure records (5 counter + 2 :filterState + 4 D8 crypto/fileBytes) + 4 non-record edits (1 EXTEND-subsection + 1 stat-table 102→107 + 1 forward-pointer subsection + 1 D8 disposition paragraph) = 15 edits total. All 15 edits land atomically at this Task 19 commit per ADR-0052 atomic landing.
+
+**(xi) Conditional ADR-0193 escape-valve disposition (per SPEC §13-R6 + §13-R9 + R6/R9 signaling protocols at Tasks 15 + 7 consumed by Task 19 Step 10 grep-check).** R6 sentinel `§13-R6 disposition: STANDS WEAK-default at ns/op=98157` at PROGRESS.md Task 15 entry; R9 sentinel `§13-R9 disposition: STAYS embedded in ADR-0192` at PROGRESS.md Task 7 entry (CONFIRMED at Task 15). NEITHER sentinel triggers the FIRES grep — conditional ADR-0193 NOT consumed at 22.2 phase-done; carries forward to 22.3 BRAINSTORM as the 22.3 IMPL escape-valve slot. ADR tail advances from ADR-0189 (predecessor 22.1 tip) → ADR-0192 (this 22.2 phase-done tip); next-free ADR-0193 UNCHANGED.
 
 ### Consequences
 
-*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Consequences body will document the (+/-)/(?) tradeoffs: (+) full bridge surface available; (+) cross-phase dynamic-metadata deferral lifted; (+) cluster-based httpCall via ADR-0177 AMEND; (-) defensive-copy body cost; (-) 2 (or more pending §13-R7+R8) envoy-go-strict departure records; (-) `:filterState():set()` envoy-go-strict mutation surface diverges from upstream read-only; (?) PLAN-time crypto+fileBytes-classification outcome; (?) §13-R6 *LState-pool gate may fire ADR-0193 escape-valve. Also documents forward-pointers for 22.3 (LuaPerRoute + SourceCodes + 9th canonical) + future cross-phase dynamic-metadata lift consumers.*
+**(+) Full Envoy↔Lua bridge surface available at 22.2 phase-done.** Every upstream-parity bridge method that 22.1 deferred via Lua-runtime-error is now a real bridge method. Operator scripts have access to body / trailers / metadata / connection-SSL / httpCall / crypto / filesystem + clock / streamInfo-full / filter-state — the complete 22.2 envelope-D delivery per parent BRAINSTORM Q1 envelope D conclusion.
 
-**Cross-references:** ADR-0189 (paired predecessor package-shape ADR — `internal/filter/http/lua/` 22.1 package shape; 22.2 EXTENDS); ADR-0188 (predecessor primitive — `internal/lua/`; consumer-#1 scope-expansion at 22.2 lands under NEW ADR-0191 per Q10 strict scope); ADR-0190 (sibling NEW ADR at THIS SPEC commit — `internal/dynamicmetadata/`; consumer-#1 = this ADR's filter); ADR-0191 (sibling NEW ADR at THIS SPEC commit — `internal/lua/` 22.2 API extensions; coroutine + BodyBuffer interface consumed by this ADR's body bridge); ADR-0177 (in-place AMENDMENT body at THIS commit's IMPL Task — `internal/httpclient/Client.ClusterDispatch`; consumed by this ADR's httpCall bridge); ADR-0144 (TLS state plumbing pattern; extended with new `tlsConnectionState` field inside this ADR per Q13 WEAK HOLD — no separate ADR); ADR-0128 (HCM-level decode-side body buffer; wrapped by this ADR's body bridge via ADR-0191 BodyBuffer interface); ADR-0125 §(xiv) (AMENDMENT-anticipation paragraph anchored at parent SPEC commit; UNCHANGED at 22.2 SPEC + 22.2 IMPL; body lands at 22.3 IMPL); ADR-0085 (nil-tolerance); ADR-0080 (byte-stable runtime-rejection wording for arms 20-22 + the `:filterState()` divergence record wording); ADR-0018 (fuzzer must-never-panic baseline for `FuzzLuaBodyBridge` + `FuzzLuaHTTPCallConfig`); ADR-0052 (atomic landing); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline + §Context-draft discipline at SPEC commit); phase-22.2 BRAINSTORM §1.1 + §1.6 + §2.1-§2.13 + §3 + §6 + §7 + §8; phase-22.2 SPEC §1 + §3 + §6 + §7 + §8 + §9 + §11.1-§11.9 + §13-R6/R7/R8/R9/R10/R11/W2 + §14 + §15 + §16.3.
+**(+) Cross-phase dynamic-metadata deferral lifted via `internal/dynamicmetadata/` consumer-#1.** Phases 16/17/18/19/20's "operator-visibility deferred to future" notes have a target framework primitive to lift to. Future phase BRAINSTORMs that need dynamic-metadata access reuse the primitive per ADR-0190 §Decision (v) + this ADR's consumer-#1 wiring.
+
+**(+) Cluster-based httpCall via ADR-0177 IN-PLACE AMENDMENT validates phase-20's cross-phase-reusable framework primitive.** R5 RATIFIED at Task 4 — first co-consumer validation of phase-20's `internal/httpclient/` primitive at the `:httpCall` bridge. The AMEND pattern (Client.ClusterDispatch + FactoryCtx.ClusterManager + Cluster.UpstreamTLSConfig) extends the primitive additively without surface churn for the prior 3 consumers (jwks + extauthz + oauth2).
+
+**(+) Coroutine yield/resume orchestration enables non-blocking body bridge + sync httpCall bridge.** ADR-0191's coroutine API + this ADR's HCM orchestration combine to provide non-blocking suspension of operator scripts awaiting body bytes or sync httpCall responses — no worker-goroutine consumed for the wait duration; the per-stream child-LState lifecycle aligns with ADR-0033 sequential filter dispatch.
+
+**(+) FilterChain.tlsConnectionState field extension extends ADR-0144 TLS state plumbing pattern.** Per Q13 WEAK HOLD: lives inside this ADR-0192 §Decision body (no separate ADR consumed). H1 + H2 symmetric seeding at Task 6 preserves the 22.1 protocol-agnostic per-stream invariants.
+
+**(+) Stat surface 102 → 107.** 5 NEW envoy-go-strict counters extend the existing 22.1 stat namespace under the SAME template `http.<HCM_stat_prefix>.lua.<config_stat_prefix>.<stat>` — no new SN flattening rule; SN2-reuse RATIFIED at phase-22.1 SPEC §8 carries forward.
+
+**(+) Fixture-directory count 28 → 29.** Fixture-0027 mixed-mode discipline (8 cross-side + 5 REFERENCE-LESS) lands at 22.2 phase-done. Cross-side scenarios use the existing `CompareBytes` runner step 7 (no new harness infrastructure); REFERENCE-LESS scenarios use the existing `runReferenceLessFixture` pattern per D-P11 REUSE.
+
+**(+) Fuzzer count 28 → 30.** 2 NEW project-wide fuzzers (`FuzzLuaBodyBridge` + `FuzzLuaHTTPCallConfig`) landed at Task 16 per D-P7 corpus-seed roster + ADR-0018 fuzzer-must-never-panic baseline.
+
+**(+) 17 HTTP filters wired UNCHANGED at 22.2 phase-done.** 22.2 EXTENDS the same lua filter — no new HCM-filter entries (registration unchanged from 22.1 per ADR-0072 + ADR-0100 §2.2). The 22.1 boot-registration alphabetical position between `localratelimit` and `oauth2` is preserved.
+
+**(+) Conditional ADR-0193 escape-valve evaluated: R6 + R9 BOTH STAY.** R6 STANDS WEAK-default at `ns/op = 98157` (Task 15 benchmark; well under 1ms threshold); R9 STAYS embedded in ADR-0192 (Task 7 + Task 15 evaluation; no ADR-warranting complexity beyond this ADR's §Context). ADR-0193 NOT consumed at 22.2 phase-done; carries forward to 22.3 BRAINSTORM unconsumed. ADR tail advances to ADR-0192 (this commit's tip); next-free ADR-0193 UNCHANGED.
+
+**(-) Defensive-copy body cost per §11.3 D3 RECOMMENDED option (a).** The defensive copy at endStream (`lua.LString(string(f.decodedBodyBytes))`) adds memory allocation + a GC-traceable string at the size of the accumulated body. Task 15 perf-benchmark confirms the threshold gates: sub-MB body at ~103µs (gate ≤ 1ms; 9.7× under) + 16-MiB-saturated at ~9.3ms (gate ≤ 100ms; 10.7× under) — acceptable trade-off vs the option (b) zero-copy `*lua.LUserData` wrapping complexity. Tracked at the `body_buffered_bytes_total` counter for operator-visibility.
+
+**(-) 11 envoy-go-strict departure records at BEHAVIOR_CONTRACT.md.** 5 counter + 2 `:filterState()` + 4 D8 crypto/fileBytes departure records land at this 22.2 IMPL atomic landing. Operators porting upstream-Envoy Lua scripts to envoy-go (or vice versa) face 11 documented divergence-windows under `### envoy.filters.http.lua` 22.2 sub-section. Acceptable trade-off — each departure has either (a) clear upstream-equivalence rationale + envoy-go-strict naming convention or (b) clear operator-visibility-rationale + collision-free verification.
+
+**(-) `:filterState():set()` envoy-go-strict mutation surface diverges from upstream read-only posture.** Operators who depend on `attempt to call method 'set' (a nil value)` runtime-rejection in upstream Envoy to detect script bugs that try to mutate filter-state from Lua will NOT see the same runtime-rejection in envoy-go (envoy-go silently accepts the mutation). Documented at BEHAVIOR_CONTRACT.md envoy-go-strict departure for `:filterState():set` + the `filterstate_test.go::TestFilterState_SetExposedDeparture` byte-stable assertion.
+
+**(-) `:dynamicMetadata():get(filter_name, key)` envoy-go-strict 2-arg flat-accessor diverges from upstream chained-wrapper signature.** Operators porting upstream Envoy scripts that chain `:get(filterName):get(key)` see runtime-rejection in envoy-go (the chained wrapper does not exist). Documented at BEHAVIOR_CONTRACT.md envoy-go-strict departure for `:dynamicMetadata():get` + the `metadata_test.go::TestDynamicMetadata_GetFlatSignature` byte-stable assertion.
+
+**(-) `:body()` envoy-go-strict return-shape (Go string vs upstream Buffer userdata).** Operators porting upstream Envoy scripts that call `:body():length()` or `:body():getBytes(start, end)` see runtime-rejection in envoy-go (the Buffer userdata methods do not exist; envoy-go's `:body()` returns a Lua string). Operators must use `#body` / `string.sub(body, ...)` / `string.byte(body, ...)`. Documented at BEHAVIOR_CONTRACT.md envoy-go-strict departure for `:body()` return-shape.
+
+**(-) "Continue on body-yield" trade-off is a known limitation for multi-decoder-filter topologies.** Returning Continue (vs StopIteration) on body yield is REQUIRED because envoy-go's HCM serializes Headers→Data — returning StopIteration would deadlock the chain. For 22.2's single-lua-decoder topology (fixture-0027 lua→router) this is benign. Multi-lua-chain or lua→<header-reading-filter> topologies that depend on body-after-yield header-mutation visibility silently lose those mutations. Deferred to phase-22.3 or a separate framework phase per §1.2 + parent §10 forward-pointers.
+
+**(?) 22.3 BRAINSTORM scope hand-off — `Lua.SourceCodes` multi-script + `LuaPerRoute` 3-arm oneof + ADR-0125 §(xiv) AMENDMENT body + NEW 9th canonical per-route shape ADR.** Anticipated 1-2 NEW ADRs at 22.3 IMPL (NEW 9th canonical per-route shape ADR + per-route 3-tier dispatch ADR) + 1 IN-PLACE AMENDMENT body landing at ADR-0125 §(xiv). The 22.3 BRAINSTORM (next-session-after-22.2-IMPL-phase-done) settles the 9th canonical + dispatch surface.
+
+**(?) Future cross-phase dynamic-metadata lift consumers.** Each prior-phase BEHAVIOR_CONTRACT.md "deferred" note converts to "lifted via `internal/dynamicmetadata`" at the lift-phase's next-touchpoint. NO automatic mass-update at 22.2 phase-done — the deferral notes carry forward AS-IS.
+
+**(?) Future `internal/filterstate/` framework primitive extraction (second-consumer trigger).** Per Q9 EXTRACT-NOW-only-when-trigger-fires. SECOND consumer of cross-filter filter-state (future cross-filter-passing surface) triggers the extraction at that future phase. Will preserve the `map[string]any` shape + the typed Lua-value marshaling discipline + the `:set` exposure (envoy-go-strict per AMEND-22.2-4).
+
+**(?) ADR-0193 carries forward to 22.3 BRAINSTORM unconsumed.** R6 + R9 BOTH STAY at 22.2 phase-done; the escape-valve slot remains primed. 22.3 BRAINSTORM may re-evaluate the *LState-pool gate against the multi-script + per-route surfaces — if per-stream construction crosses 1ms threshold there, ADR-0193 fires at 22.3 IMPL with the `*LState`-pool design.
+
+**Cross-references:** ADR-0189 (paired predecessor package-shape ADR — `internal/filter/http/lua/` 22.1 package shape; 22.2 EXTENDS); ADR-0188 (predecessor primitive — `internal/lua/`; consumer-#1 scope-expansion at 22.2 lands under NEW ADR-0191 per Q10 strict scope); ADR-0190 (sibling NEW ADR at predecessor 22.2 SPEC commit — `internal/dynamicmetadata/`; consumer-#1 = this ADR's filter at 22.2 IMPL); ADR-0191 (sibling NEW ADR at predecessor 22.2 SPEC commit — `internal/lua/` 22.2 API extensions; coroutine + BodyBuffer interface consumed by this ADR's body bridge + sync httpCall bridge at 22.2 IMPL); ADR-0177 (in-place AMENDMENT body at THIS Task 19 commit — `internal/httpclient/Client.ClusterDispatch` + `FactoryCtx.ClusterManager` + `Cluster.UpstreamTLSConfig`; consumed by this ADR's httpCall bridge); ADR-0144 (TLS state plumbing pattern; extended with new `tlsConnectionState` field inside this ADR per Q13 WEAK HOLD — no separate ADR); ADR-0128 (HCM-level decode-side body buffer; wrapped by this ADR's body bridge via ADR-0191 BodyBuffer interface); ADR-0125 §(xiv) (AMENDMENT-anticipation paragraph anchored at parent SPEC commit; UNCHANGED at 22.2 SPEC + 22.2 IMPL; body lands at 22.3 IMPL); ADR-0085 (nil-tolerance); ADR-0080 (byte-stable runtime-rejection wording for arms 20-22 + the `:filterState()` divergence record wording); ADR-0018 (fuzzer must-never-panic baseline for `FuzzLuaBodyBridge` + `FuzzLuaHTTPCallConfig`); ADR-0072 + ADR-0100 §2.2 (boot-registration alphabetical discipline — UNCHANGED at 22.2 per D-P6); ADR-0033 (per-stream sequential filter dispatch); ADR-0052 (atomic landing); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline + §Context-draft discipline at SPEC commit); phase-22.2 BRAINSTORM §1.1 + §1.6 + §2.1-§2.13 + §3 + §6 + §7 + §8; phase-22.2 SPEC §1 + §3 + §6 + §7 + §8 + §9 + §11.1-§11.9 + §13-R5/R6/R7/R8/R9/R10/R11/W2 + §14 + §15 + §16.3; phase-22.2 PLAN Tasks 1-18 + D-P1..D-P11 + D3 + D5 + D8 closures.
 
 ---
 

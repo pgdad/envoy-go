@@ -265,10 +265,14 @@ type FactoryCtx struct {
 	// ClusterManager is the bootstrap-time cluster manager (per ADR-0158)
 	// threaded into per-filter factories that need to resolve an upstream
 	// cluster name to a `*cluster.Cluster` (e.g. ext_authz `grpc_service.
-	// envoy_grpc.cluster_name`). Non-nil at HCM-build time per the phase-18.2
-	// landing; may be nil in test code that does not exercise cluster-bearing
-	// filters (per ADR-0085 nil-tolerance — the filter factory checks for nil
-	// before calling Get/Drain). Phase 18.2 first-use anchor.
+	// envoy_grpc.cluster_name`; phase-22.2 lua `:httpCall()` bridge via
+	// httpclient.Client.ClusterDispatch per ADR-0177 IN-PLACE AMENDMENT).
+	// Non-nil at HCM-build time per the phase-18.2 landing; may be nil in
+	// test code that does not exercise cluster-bearing filters (per ADR-0085
+	// nil-tolerance — the filter factory checks for nil before calling
+	// Get/Drain/ClusterDispatch). Phase 18.2 first-use anchor; phase-22.2
+	// adds the lua `:httpCall()` bridge as the second co-consumer (R5
+	// RATIFIED at 22.2 Task 4 per SPEC §11.4).
 	ClusterManager *cluster.Manager
 	// HTTPClient is the shared `*httpclient.Client` framework primitive (per
 	// ADR-0177) threaded into per-filter factories that need to issue outbound

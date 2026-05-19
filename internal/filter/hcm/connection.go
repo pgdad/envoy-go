@@ -75,6 +75,46 @@ func downstreamTLSPrincipals(downstream net.Conn) []string {
 	return extractTLSPrincipals(&state)
 }
 
+// downstreamTLSConnectionState returns the FULL *tls.ConnectionState extracted
+// from the downstream connection's *tls.Conn, or nil if:
+//   - the conn is nil OR not a *tls.Conn (plaintext listener / test path), OR
+//   - the conn IS a *tls.Conn but the handshake has not completed (defensive —
+//     production code reaches dispatchRequest only after the codec layer has
+//     read at least one byte off the conn, which implies handshake completion
+//     for a *tls.Conn; but tests can drive the helper with a pre-handshake
+//     state and the bridge surface MUST NOT observe an unverified handshake).
+//
+// Per ADR-0192 §Decision body anticipation + SPEC §11.5.3 (chain-side
+// tlsConnectionState extension lives INSIDE ADR-0192 per Q13 WEAK HOLD).
+// Mirrors the downstreamTLSPrincipals plumbing pattern (type-assert *tls.Conn,
+// read ConnectionState by value, &state out the address) — same shape, same
+// nil-tolerance discipline. Returns a fresh pointer to a heap-allocated copy
+// of the conn-state value so the chain field is stable for the request
+// lifetime (the *tls.Conn's internal state may continue to evolve on later
+// renegotiations / session-resumption events; the chain holds the value
+// snapshotted at dispatch time).
+//
+// Distinct from downstreamTLSPrincipals in ONE semantic axis: this helper
+// does NOT gate on len(PeerCertificates)==0. Server-auth-only TLS (no client
+// cert) produces a usable *tls.ConnectionState — SNI / cipher suite / version
+// are valid even without a client cert. tlsPrincipals (ADR-0144) requires
+// mTLS by contrast; tlsConnectionState (ADR-0192) is the full handshake state
+// for the 12 lua bridge ssl methods per SPEC §11.5.4.
+//
+// Used by both H1 (connection.go dispatchRequest) and H2 (h2dispatch.go via
+// the per-connection dispatcher) paths — symmetric to downstreamTLSPrincipals.
+func downstreamTLSConnectionState(downstream net.Conn) *stdtls.ConnectionState {
+	tc, ok := downstream.(*stdtls.Conn)
+	if !ok {
+		return nil
+	}
+	state := tc.ConnectionState()
+	if !state.HandshakeComplete {
+		return nil
+	}
+	return &state
+}
+
 // runConnection drives one downstream HTTP/1.1 connection from acceptance to
 // close. The loop reads requests via http.ReadRequest off a bufio.Reader
 // over downstream, applies phase-04 out-of-scope guards (Expect:→417,
@@ -309,6 +349,22 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// no-client-cert connections (the chain field stays nil; the accessor
 	// returns nil per ADR-0143 §Decision (vi) case (c)).
 	chain.SetTLSPrincipals(downstreamTLSPrincipals(downstream))
+	// Phase 22.2 Task 6 (ADR-0192): seed the per-stream FULL *tls.ConnectionState
+	// BEFORE RunDecodeHeaders dispatch — symmetric to SetTLSPrincipals above per
+	// SPEC §11.5.3 + ADR-0144 plumbing-pattern extension. The state powers the
+	// phase-22.2 lua bridge's 12 ssl methods (PEM-encoded certs, cipher suite,
+	// TLS version, etc. per SPEC §11.5.4) and is observable from all decode +
+	// encode filters via {decoder,encoder}CB.DownstreamTLSConnectionState().
+	// Returns nil for plaintext / non-*tls.Conn / pre-handshake — the
+	// SetTLSConnectionState(nil) call is the documented nil-passthrough so the
+	// chain field stays nil and consumers nil-tolerate per ADR-0085. Per Q13
+	// WEAK HOLD the chain-side extension lives INSIDE ADR-0192; no separate ADR.
+	//
+	// dynamicMetadata is NOT seeded here — chain.go's NewFilterChain
+	// constructor initializes it at chain build time per ADR-0190 + ADR-0192
+	// §Decision body anticipation (chain.go owns the bucket lifecycle). HCM
+	// does NOT touch dynamicMetadata directly.
+	chain.SetTLSConnectionState(downstreamTLSConnectionState(downstream))
 	// Phase 18.2 Task 4 (ADR-0165): seed the 6 per-stream callback-surface
 	// extension fields BEFORE RunDecodeHeaders dispatch — the cross-phase
 	// reusable framework primitives for ext_authz gRPC-mode AttributeContext

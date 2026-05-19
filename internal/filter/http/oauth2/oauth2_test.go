@@ -32,6 +32,7 @@ package oauth2
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -52,6 +53,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -82,6 +84,10 @@ func (c *fakeOAuth2DCB) DownstreamTLSServerName() string  { return "" }
 func (c *fakeOAuth2DCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (c *fakeOAuth2DCB) DownstreamProtocol() string       { return "" }
 func (c *fakeOAuth2DCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (c *fakeOAuth2DCB) DownstreamTLSConnectionState() *stdtls.ConnectionState { return nil }
+func (c *fakeOAuth2DCB) DynamicMetadata() *dynamicmetadata.Bucket              { return nil }
 
 func (c *fakeOAuth2DCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++

@@ -49,6 +49,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0024-http-oauth2/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0025-http-adaptive-concurrency/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0026-http-lua-headers-bridge/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0027-http-lua-full-bridge/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

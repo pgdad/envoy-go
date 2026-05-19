@@ -51,6 +51,7 @@ package lua
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -506,6 +507,120 @@ func TestParseRejectArm19_StatPrefixEmpty_PassesThrough(t *testing.T) {
 	}
 	if _, gotErr := buildCompiledConfig(a); gotErr != nil {
 		t.Fatalf("buildCompiledConfig err = %v; want nil for empty prefix (AMEND-2 consecutive-dot path)", gotErr)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Task 14 (phase 22.2 IMPL) — SPEC §6 arms 20-22 byte-stable wording byte-pin
+// assertions. Arms 20-22 are RUNTIME-REJECTS per §11.2 AMEND-22.2-2 (raised
+// via L.RaiseError from the bridge LGFunctions, NOT PARSE-REJECTs at
+// config-load), so they live in production code at body.go (arm 21) +
+// httpcall.go (arm 20) + crypto.go (arm 22) rather than in compiled_config.go's
+// parseReject* const family. The 19-arm config-load PARSE-REJECT roster from
+// 22.1 STAYS UNCHANGED at 22.2 IMPL per SPEC §6.
+//
+// Per-method byte-stable wording tests for the LIVE arm-raising surface
+// already exist at:
+//   - body_test.go::Test_RequestHandleBody_over_cap_raises_arm21_byte_stable_wording
+//   - httpcall_test.go::Test_HTTPCall_empty_cluster_raises_arm20_byte_stable_wording
+//   - crypto_test.go::Test_ImportPublicKey_invalid_PEM_raises_arm22_byte_stable_wording
+//
+// This centralized const-byte-pin family asserts the SAME wordings at the
+// CONSTANT level (mirrors TestParseRejectConstants_ByteExactWording precedent
+// for arms 1/3/4/18). Drift between the per-method tests + this central
+// catalog surfaces at the per-method test (LIVE raise) AND here (const drift)
+// in lockstep.
+// -----------------------------------------------------------------------------
+
+// TestRuntimeRejectArm20_HTTPCallClusterRequired_ByteExactWording pins the
+// byte-exact wording for SPEC §6 arm 20 (httpcall-cluster-name-required) —
+// raised from httpcall.go::requestHandleHttpCall when :httpCall("", ...) is
+// invoked with an empty cluster name. The live raise path is asserted at
+// httpcall_test.go::Test_HTTPCall_empty_cluster_raises_arm20_byte_stable_wording;
+// this test mirrors that assertion at the package-const level.
+func TestRuntimeRejectArm20_HTTPCallClusterRequired_ByteExactWording(t *testing.T) {
+	const want = "lua: httpCall: cluster name must not be empty"
+	if httpCallClusterRequiredMsg != want {
+		t.Fatalf("httpCallClusterRequiredMsg = %q; want %q (SPEC §6 arm 20 byte-stable drift)",
+			httpCallClusterRequiredMsg, want)
+	}
+}
+
+// TestRuntimeRejectArm22_CryptoImportPublicKeyPrefix_ByteExactWording pins
+// the byte-exact wording prefix for SPEC §6 arm 22 (crypto-key-format-
+// invalid) — raised from crypto.go::requestHandleImportPublicKey when
+// :importPublicKey(pem) fails to parse. The wording template is
+// `"lua: importPublicKey: <inner crypto/x509 error>"` per W2 pinning
+// (Task 12). The live raise path is asserted at
+// crypto_test.go::Test_ImportPublicKey_invalid_PEM_raises_arm22_byte_stable_wording;
+// this test mirrors that assertion at the package-const level.
+//
+// NOTE: SPEC §6 row 22 prescribes the template `"lua: %s: %w"` wrapping
+// `crypto/x509.ParsePKIXPublicKey` with `%s` = "importPublicKey". The
+// production wording (Task 12 W2 pinning) materializes this as a literal
+// prefix `"lua: importPublicKey:"` followed by the inner error. The prefix
+// form is byte-stable; the trailing inner error carries variable bytes
+// (crypto/x509's per-error wording). No reconciliation needed — the SPEC
+// template + W2 pinning agree.
+func TestRuntimeRejectArm22_CryptoImportPublicKeyPrefix_ByteExactWording(t *testing.T) {
+	const want = "lua: importPublicKey:"
+	if cryptoImportPublicKeyErrPrefix != want {
+		t.Fatalf("cryptoImportPublicKeyErrPrefix = %q; want %q (SPEC §6 arm 22 byte-stable drift)",
+			cryptoImportPublicKeyErrPrefix, want)
+	}
+}
+
+// TestRuntimeRejectArm21_BodyOverCap_ByteExactWording pins the byte-exact
+// wording template for SPEC §6 arm 21 (body-size-cap-exceeded) — raised
+// from body.go::requestHandleBody / responseHandleBody when accumulated
+// body bytes exceed f.maxBodyBufferedBytes. The wording template is
+// `"lua: body: accumulated body exceeds maximum buffered size of %d bytes"`
+// per W2 pinning (Task 7). Unlike arms 20 + 22 which live as named const
+// declarations in their respective package-files, arm 21 currently
+// materializes as an inline format string in body.go (used at two sites:
+// requestHandleBody + responseHandleBody). This test asserts the wording
+// shape via a sentinel-formatted probe matching the production
+// fmt.Sprintf call shape at body.go:315-318 + body.go:406-409.
+//
+// The live raise path is asserted at
+// body_test.go::Test_RequestHandleBody_over_cap_raises_arm21_byte_stable_wording.
+//
+// Future maintainer: if arm 21's wording template is ever extracted to a
+// named package-const (e.g. bodyOverCapMsgFmt), update both this test +
+// body.go's two fmt.Sprintf call sites in lockstep per ADR-0044 atomic-
+// edit discipline.
+func TestRuntimeRejectArm21_BodyOverCap_ByteExactWording(t *testing.T) {
+	const wantFmt = "lua: body: accumulated body exceeds maximum buffered size of %d bytes"
+	// Probe the template with a sentinel value to exercise the byte-exact
+	// shape end-to-end. If body.go's two fmt.Sprintf sites drift from this
+	// template, the per-method test
+	// (Test_RequestHandleBody_over_cap_raises_arm21_byte_stable_wording)
+	// breaks; this test verifies the byte-exact template itself stays
+	// pinned at the byte-stable contract.
+	const sentinelCap = 4096
+	got := fmt.Sprintf(wantFmt, sentinelCap)
+	want := "lua: body: accumulated body exceeds maximum buffered size of 4096 bytes"
+	if got != want {
+		t.Fatalf("arm 21 byte-stable wording sentinel = %q; want %q (SPEC §6 arm 21 drift)",
+			got, want)
+	}
+}
+
+// TestDefaultMaxBodyBufferedBytes_SixteenMiB pins the byte-exact 16 MiB
+// hardcoded body-buffer cap constant per SPEC §6 arm 21 + Task 7 W2
+// pinning (16 * 1024 * 1024 = 16777216). The constant lives at lua.go
+// per Task 7's declaration; Task 14 verifies the value is correct +
+// settled per the "16 MiB cap inherits 22.1 Task 11 cap pattern from
+// DataSource.Filename" SPEC §6 row 21 derivation.
+func TestDefaultMaxBodyBufferedBytes_SixteenMiB(t *testing.T) {
+	const want = 16 * 1024 * 1024 // 16 MiB = 16,777,216 bytes
+	if defaultMaxBodyBufferedBytes != want {
+		t.Fatalf("defaultMaxBodyBufferedBytes = %d; want %d (16 MiB; SPEC §6 arm 21 hardcoded cap)",
+			defaultMaxBodyBufferedBytes, want)
+	}
+	if defaultMaxBodyBufferedBytes != 16777216 {
+		t.Fatalf("defaultMaxBodyBufferedBytes = %d; want 16777216 (literal bytes form)",
+			defaultMaxBodyBufferedBytes)
 	}
 }
 

@@ -1,6 +1,7 @@
 package fault
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"strconv"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -240,6 +242,10 @@ func (r *recordingDCB) DownstreamTLSServerName() string  { return "" }
 func (r *recordingDCB) DownstreamTLSPeerCertDER() []byte { return nil }
 func (r *recordingDCB) DownstreamProtocol() string       { return "" }
 func (r *recordingDCB) ListenerPrincipal() string        { return "" }
+
+// ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
+func (r *recordingDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
+func (r *recordingDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
 // makeFilter constructs a fault filter with the supplied abort.http_status,
 // abort.percentage, and headers-field shape, returning the *filter and the
