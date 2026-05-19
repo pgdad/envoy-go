@@ -11535,3 +11535,170 @@ Per BEHAVIOR_CONTRACT.md `### envoy.filters.http.lua` "Fixture-0026 cross-side g
 
 ---
 
+## ADR-0190: NEW `internal/dynamicmetadata/` framework primitive — per-stream `*Bucket` accessor for cross-filter dynamic-metadata read+write at first co-consumer (HTTP Lua filter 22.2) per phase-22 BRAINSTORM Q3 cross-phase-deferral-break + Q9 EXTRACT-NOW
+
+**Status:** §Context anchored at phase-22.2 SPEC commit (THIS commit); §Decision + §Consequences body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-19 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 22.2 IMPL Lands-in-Task)
+**Doctrine:** Phase 22.2 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline.
+**Lands-in:** Phase 22.2 IMPL atomic-landing Task (same Task as ADR-0191 + ADR-0192 + ADR-0177 AMENDMENT body per PLAN).
+
+### Context
+
+ADR-0190 anchors the NEW `internal/dynamicmetadata/` framework primitive — a per-stream cross-filter dynamic-metadata accessor. It is the THIRD §9 family-row framework primitive of substantial scope landing in two-phase succession (after ADR-0188 `internal/lua/` + ADR-0189 `internal/filter/http/lua/` at phase-22.1 IMPL), STRENGTHENING the post-phase-21 NEW-framework-primitive cadence and reflecting the project's growing cross-filter-state surface.
+
+**Cross-phase deferral-break trigger per BRAINSTORM Q3 + §1.6.** Phases 16 (rbac) / 17 (jwt_authn) / 18 (ext_authz) / 19 (ext_proc) / 20 (oauth2) each deferred dynamic-metadata access by their respective filters with BEHAVIOR_CONTRACT.md "operator-visibility deferred to future" notes. The deferral was about IMPL — each phase chose not to be the first to land a cross-filter state primitive — NOT about principle (operators DO want dynamic-metadata visibility from these filters). Phase 22.2 lands the cross-filter primitive at first co-consumer (the HTTP Lua filter's `:streamInfo():dynamicMetadata()` + `:dynamicTypedMetadata(filter_name)` bridge methods). Future phase BRAINSTORMs that need dynamic-metadata access from their respective filters consume `internal/dynamicmetadata/` rather than defer again — each prior-phase BEHAVIOR_CONTRACT note converts from "deferred" to "lifted via `internal/dynamicmetadata`" at the lift-phase's next-touchpoint.
+
+**Primitive shape per phase-22.2 SPEC §3.1 + §11.6 D1 closure.** Package boundary: `internal/dynamicmetadata/` hosts the per-stream `*Bucket` accessor + map keyed by `(filter_name string, key string) → *structpb.Value`; consumers consume the API via their per-stream context. Per-stream lifecycle (created at filter-chain entry per ADR-0033; destroyed at OnDestroy); per-stream sequential per ADR-0033 (no cross-filter concurrency within a stream); NOT goroutine-safe across streams. nil-bucket tolerant per ADR-0085: `Get(filterName, key)` returns `(nil, false)`; `Set` is no-op; `Snapshot` returns nil.
+
+**Anticipated API surface** (per 22.2 SPEC §3.1):
+
+```go
+package dynamicmetadata
+
+type Bucket struct { /* unexported: m map[string]map[string]*structpb.Value */ }
+
+func NewBucket() *Bucket
+func (b *Bucket) Get(filterName, key string) (*structpb.Value, bool)
+func (b *Bucket) Set(filterName, key string, value *structpb.Value)
+func (b *Bucket) Snapshot() map[string]map[string]*structpb.Value
+func (b *Bucket) Reset()
+```
+
+**Lifecycle integration:** the FilterChain (`internal/filter/http/chain.go`) gains a new `dynamicMetadata *dynamicmetadata.Bucket` field. At chain construction (per-stream entry), the field is initialized via `dynamicmetadata.NewBucket()`. At OnDestroy, `chain.dynamicMetadata.Reset()` is called. The filter-callback API surface (`internal/filter/http/callbacks.go`) gains two new accessors: `DecoderFilterCallbacks.DynamicMetadata() *dynamicmetadata.Bucket` + `EncoderFilterCallbacks.DynamicMetadata() *dynamicmetadata.Bucket` (returns same bucket per-stream shared across decode + encode).
+
+**Anticipated `internal/dynamicmetadata/` package shape:**
+
+```
+internal/dynamicmetadata/
+  doc.go               # package overview + cross-phase deferral-lift rationale +
+                       # API surface summary + ADR-0190 cross-reference
+  dynamicmetadata.go   # Bucket type + NewBucket + Get + Set + Snapshot + Reset
+  dynamicmetadata_test.go  # exhaustive table-driven tests including nil-tolerance
+  bench_test.go        # microbenchmarks for Get/Set under per-stream sequential access
+```
+
+**Anticipated LoC: ~250-400** (Bucket type + 4 methods ~80-120 + doc.go + tests ~150-250).
+
+**Cross-phase deferral-lift expectation** documented in this ADR's §Consequences body at 22.2 IMPL: prior-phase BEHAVIOR_CONTRACT.md "operator-visibility deferred to future" notes (phases 16-20) carry forward AS-IS until their respective lift-phase converts the note from "deferred" to "lifted via `internal/dynamicmetadata`". 22.2 lands the primitive + the FIRST consumer (HTTP Lua filter). The cross-phase reference paragraph at BEHAVIOR_CONTRACT.md's `### envoy.filters.http.lua` 22.2 sub-section + cross-phase note records the discipline.
+
+### Decision
+
+*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Decision body will codify the final API signatures + lifecycle integration + nil-tolerance discipline + cross-filter sequential-access discipline (matching the IMPL-time landing).*
+
+### Consequences
+
+*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Consequences body will document the cross-phase deferral-lift expectation + future-consumer reuse pattern + the (+/-)/(?) tradeoffs (matching the IMPL-time landing).*
+
+**Cross-references:** ADR-0188 (paired prior §9 framework primitive — `internal/lua/`); ADR-0189 (paired prior §9 package — `internal/filter/http/lua/`); ADR-0191 (sibling NEW ADR at THIS SPEC commit — `internal/lua/` 22.2 API extensions); ADR-0192 (sibling NEW ADR at THIS SPEC commit — `internal/filter/http/lua/` 22.2 package shape extensions; consumer-#1 of `internal/dynamicmetadata/`); ADR-0085 (nil-tolerance discipline); ADR-0033 (per-stream sequential filter dispatch); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline); ADR-0052 (atomic landing); phase-16 ADR-0143 (rbac dynamic-metadata deferral); phase-17 ADR-0148/0149/0150/0154 (jwt_authn dynamic-metadata deferral); phase-18 (ext_authz dynamic-metadata deferral); phase-19 (ext_proc dynamic-metadata deferral); phase-20 (oauth2 dynamic-metadata deferral); phase-22 parent SPEC §1.6 cross-phase deferral discipline; phase-22.2 BRAINSTORM Q3 + Q9 + §1.6; phase-22.2 SPEC §1.6 + §3.1 + §9 + §11 + §16.1.
+
+---
+
+## ADR-0191: `internal/lua/` 22.2 API extensions for coroutine yield/resume + body-bridge buffer seam at HTTP filter Lua consumer-#1 scope-expansion — NEW ADR per BRAINSTORM Q10 strict scope (ADR-0188 EXPLICIT API-REVISION ALLOWANCE stays scoped to consumer-#2)
+
+**Status:** §Context anchored at phase-22.2 SPEC commit (THIS commit); §Decision + §Consequences body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-19 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 22.2 IMPL Lands-in-Task)
+**Doctrine:** Phase 22.2 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline. NEW ADR (NOT in-place AMEND on ADR-0188 per Q10 strict scope).
+**Lands-in:** Phase 22.2 IMPL atomic-landing Task (same Task as ADR-0190 + ADR-0192 + ADR-0177 AMENDMENT body per PLAN).
+
+### Context
+
+ADR-0191 anchors the NEW `internal/lua/` API extensions at 22.2 — coroutine yield/resume support + body-bridge buffer seam interface. Per BRAINSTORM Q10 strict scope: NEW ADR (NOT in-place AMEND on ADR-0188). ADR-0188's EXPLICIT API-REVISION ALLOWANCE clause STAYS scoped to consumer-#2 (future cluster-specifier / access-logger / string-matcher Lua phases per ADR-0188 §Decision §5). 22.2 is consumer-#1-scope-expanded (still HTTP filter Lua); the scope-expansion API revisions land under NEW ADR-0191 instead of in-place AMEND on ADR-0188.
+
+**Lineage-separation rationale (per BRAINSTORM Q10).** Apply-allowance-to-scope-expansion + in-place-AMEND was REJECTED on lineage-separation grounds: over-loading ADR-0188 with consumer-#1-expansion AMENDMENTs would dilute the consumer-#2 ALLOWANCE's empirical-validation rationale (ADR-0188's allowance is a FUTURE-USE allowance triggered by a different consumer's empirical validation; mixing it with same-consumer scope-expansion confuses the lineage). NO-API-revisions was REJECTED on duplication grounds: building coroutine + body-bridge surfaces outside `internal/lua/` would duplicate primitive-like code at the lua filter; the second `internal/lua/` consumer at the future consumer-#2 phase would then face TWO API surfaces to validate.
+
+The strict-scope decision is the load-bearing ADR-lineage decision: each ADR's scope tightly bound to a single semantic event (ADR-0188 = primitive landing at consumer-#1; ADR-0191 = primitive extensions at consumer-#1-scope-expansion; future ADR for consumer-#2 = primitive extensions per the ADR-0188 ALLOWANCE).
+
+**Coroutine API per §11.1 D2 closure** — gopher-lua native via `(*LState).NewThread() (*LState, context.CancelFunc)` (`state.go:1614`) + `(*LState).Resume(th, fn, args...) (ResumeState, error, []LValue)` (`state.go:2157`) + `(*LState).Yield(values...) int` (`state.go:2217` — returns sentinel `-1`). The yield mechanism: a Go-side LGFunction yields by returning a negative value — exactly what `LState.Yield()` returns. The bridge implements `:body()` (and similar async-suspended methods) by stashing the `*LState` in a per-stream pending-map; returning `L.Yield(lua.LNil)` from the LGFunction. The matching resume happens from the Envoy data callback via `parent.Resume(th, nil, lua.LString(bodyBytes))`. Per-stream lifecycle: 1 parent `*LState` per stream (compiled-bytecode owner; lives for filter lifetime) + 1 child `*LState` per phase invocation (the coroutine; cheap to construct — shares `G`+`Env`). Both released on stream destroy; child's `context.CancelFunc` from `NewThread()` MUST be invoked to cancel the child's ctx-derived loop.
+
+**Body-buffer seam interface** — `BodyBuffer interface { Bytes() []byte; Chunks() [][]byte; EndStream() bool }`. Consumed by the lua bridge's `:body()` + `:bodyChunks()` LGFunction methods. Implemented by the per-stream body-bridge wrapper at `internal/filter/http/lua/body.go` (consuming ADR-0128's HCM-level decode-side `bodyBuf` accumulation; defensive copy at endStream per §11.3 D3 recommendation; matching ext_authz `f.body` + ext_proc `f.decodeBodyBuf` per-filter accumulation patterns).
+
+**Anticipated API surface** (per 22.2 SPEC §3.2):
+
+```go
+package lua  // EXTENDS the 22.1 internal/lua/ package
+
+// In vm.go (appended):
+func (vm *VM) NewThread() (*lua.LState, context.CancelFunc)
+func (vm *VM) Resume(child *lua.LState, fn *lua.LFunction, args ...lua.LValue) (lua.ResumeState, error, []lua.LValue)
+func YieldFromBridge(L *lua.LState, args ...lua.LValue) int
+
+// In body_buffer.go (NEW):
+type BodyBuffer interface {
+    Bytes() []byte
+    Chunks() [][]byte
+    EndStream() bool
+}
+```
+
+`YieldFromBridge` codifies the gopher-lua VM unwinding discipline per §11.1 D2 closure — bridge LGFunctions that need to suspend the script call `YieldFromBridge(L, lua.LNil)` and return its result; the gopher-lua VM's `callGFunction` (`vm.go:200-210`) sees the `-1` sentinel and calls `switchToParentThread`. The bridge then stashes the suspended `*LState` in a per-stream pending-map.
+
+**File split** (~150-300 LoC additions to existing `internal/lua/`):
+- `vm.go` — APPEND: `NewThread` + `Resume` methods on `*VM` + the panic-wrapper integration for child LState.
+- `body_buffer.go` — NEW: `BodyBuffer` interface + helper functions if needed.
+- `bridge_helpers.go` (or appended to `vm.go`) — NEW: `YieldFromBridge` helper.
+- Tests: `coroutine_test.go` (NEW: NewThread + Resume + YieldFromBridge integration tests; race-clean under -race -count=10) + `body_buffer_test.go` (NEW: BodyBuffer interface conformance tests).
+
+**Anticipated LoC: ~300-500** (vm.go append + body_buffer.go + bridge_helpers.go + 2-3 NEW test files).
+
+### Decision
+
+*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Decision body will codify the final coroutine API signatures + body-buffer seam interface + integration with ADR-0188 primitive + lineage-separation rationale + future-consumer-#2 ALLOWANCE clause discipline (matching the IMPL-time landing).*
+
+### Consequences
+
+*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Consequences body will document the (+/-)/(?) tradeoffs + the consumer-#2 ALLOWANCE preservation + the body-buffer seam's GC-safety discipline (defensive copy at endStream) + the per-stream child-LState lifecycle (matching the IMPL-time landing).*
+
+**Cross-references:** ADR-0188 (predecessor primitive ADR — `internal/lua/` framework primitive at consumer-#1; EXPLICIT API-REVISION ALLOWANCE for consumer-#2 — STAYS scoped to consumer-#2 per Q10 strict scope); ADR-0190 (sibling NEW ADR at THIS SPEC commit — `internal/dynamicmetadata/` framework primitive); ADR-0192 (sibling NEW ADR at THIS SPEC commit — `internal/filter/http/lua/` 22.2 package shape extensions consuming ADR-0191's coroutine + BodyBuffer API); ADR-0128 (HCM-level decode-side body-buffer that the body-buffer seam wraps); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline); ADR-0052 (atomic landing); ADR-0085 (nil-tolerance discipline); phase-22.2 BRAINSTORM Q1 + Q10 + §2.1 + §3.2; phase-22.2 SPEC §1 + §3.2 + §11.1 D2 closure + §11.3 D3 RECOMMENDED + §16.2.
+
+---
+
+## ADR-0192: NEW `internal/filter/http/lua/` 22.2 package shape extensions — full Envoy↔Lua bridge surface delta (body + trailers + metadata + connection-SSL + httpCall + crypto + fileBytes + timestamp + streamInfo-full + filter-state in-package) + 5+2 envoy-go-strict departure records + fixture-0027 mixed-mode discipline + `FilterChain.tlsConnectionState` field extension + cross-phase dynamic-metadata deferral-lift via `internal/dynamicmetadata/` consumer-#1
+
+**Status:** §Context anchored at phase-22.2 SPEC commit (THIS commit); §Decision + §Consequences body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-19 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 22.2 IMPL Lands-in-Task)
+**Doctrine:** Phase 22.2 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline.
+**Lands-in:** Phase 22.2 IMPL atomic-landing Task (same Task as ADR-0190 + ADR-0191 + ADR-0177 AMENDMENT body per PLAN).
+
+### Context
+
+ADR-0192 anchors the NEW `internal/filter/http/lua/` 22.2 package shape extensions — extending the 22.1 ADR-0189 package shape with the full Envoy↔Lua bridge surface delta + the 4 IN-PACKAGE landings (filter-state + body-buffer seam consumer + crypto + connection-SSL + fileBytes + timestamp) + the 5 NEW envoy-go-strict stat counters + the 2 NEW envoy-go-strict `:filterState()` divergences (per AMEND-22.2-4) + the conditional crypto+fileBytes envoy-go-strict records (per §13-R7+R8 PLAN-time scrape) + the NEW `FilterChain.tlsConnectionState` field extension (lives inside this ADR per Q13 WEAK HOLD; no separate ADR for the chain-side extension) + the fixture-0027 mixed-mode discipline.
+
+Per the phase-22.2 BRAINSTORM 14-Q dialogue + the 4 AMEND-22.2-N findings from §11 empirical-pin scrape, this ADR captures the SPEC-anchored production shape that lands at 22.2 IMPL atomic-landing Task. The 22.2 SPEC §3.5 file split (7 NEW production files + 7 NEW test files + 4 EXTENDED existing files) is anticipated; PLAN session may refine.
+
+**8 bridge surface families landing at 22.2 phase-done** (per BRAINSTORM §1.1 + §2.1-§2.8 + 22.2 SPEC §1 + §3.5):
+
+1. **Body bridge** — `:body()` whole-buffer + `:bodyChunks()` chunked iterator. Lua coroutine yield/resume via ADR-0191 `YieldFromBridge`. Defensive copy at endStream per §11.3 D3 RECOMMENDED (Lua owns Go string via `lua.LString(string(f.decodedBodyBytes))`).
+2. **Trailers bridge** — `:trailers()` mirroring 22.1 headers metatable exactly (8 mutation methods + `__pairs` reusing 22.1's `installPairsShim` discipline); lazy-available (nil if no trailers).
+3. **Metadata bridge** — `:metadata()` callable userdata wrapping empty metadata source at v1.32.4 binding-gap (per §11.6 D1 closure; NEVER nil per upstream `MetadataMapWrapper` pattern). `:streamInfo():dynamicMetadata()` + `:streamInfo():dynamicTypedMetadata(filter_name)` consuming ADR-0190's `internal/dynamicmetadata/` primitive at first co-consumer.
+4. **Connection bridge** — `:connection():ssl()` 12-method cert/session surface consuming NEW `FilterChain.tlsConnectionState *tls.ConnectionState` field (extends ADR-0144 pattern; lives in this ADR per Q13 WEAK HOLD).
+5. **httpCall bridge** — `:httpCall(cluster, headers, body, timeout_ms, asynchronous?)` cluster-based dispatch via ADR-0177 IN-PLACE AMENDMENT `Client.ClusterDispatch`. Async = PURE FIRE-AND-FORGET per §11.7 D6 closure.
+6. **Crypto bridge** — 6 methods in-package at `crypto.go` (`:base64Escape` upstream-parity per §11.2.4; the other 5 RATIFIED-PENDING-PLAN per §13-R7 + AMEND-22.2-2).
+7. **Filesystem + clock bridge** — `:fileBytes(path)` 16 MiB cap inheriting 22.1 Task 11 pattern; `:timestamp(unit?)` wall-clock via `time.Now()`. `:fileBytes` RATIFIED-PENDING-PLAN per §13-R8 + AMEND-22.2-2.
+8. **streamInfo-full** — 7 additional methods extending 22.1's 4-method subset → 11-method surface at 22.2 phase-done. `:filterState()` IN-PACKAGE per Q9 + AMEND-22.2-4 (string-keyed + `:set` + typed marshaling — 2 envoy-go-strict divergences).
+
+**`FilterChain.tlsConnectionState` field extension** (per 22.2 SPEC §3 + §11.5): adds new `tlsConnectionState *tls.ConnectionState` field to `FilterChain` (`internal/filter/http/chain.go`) + setter `SetTLSConnectionState(state *tls.ConnectionState)` + accessors `DecoderFilterCallbacks.DownstreamTLSConnectionState()` + symmetric encoder. H1 (`internal/filter/hcm/connection.go`) + H2 (`internal/filter/hcm/h2dispatch.go`) seed the field before `RunDecodeHeaders` symmetric to existing TLS-principals plumbing. Lua bridge wraps the raw state into Lua userdata at `:connection():ssl()`. No separate ADR for the chain-side extension per Q13 WEAK HOLD — lives inside ADR-0192 §Decision body.
+
+**5 NEW envoy-go-strict counters** (per 22.2 SPEC §7.1) — `httpcall_total` + `httpcall_failures` (SYNC-ONLY per §11.7 D6) + `httpcall_timeouts` (SYNC-ONLY) + `body_buffered_bytes_total` + `coroutine_yields_total`. Project stat-count delta 102 → 107 (+5).
+
+**2 NEW envoy-go-strict `:filterState()` departure records** (per AMEND-22.2-4 + §11.8): `:filterState():set(name, value)` mutation surface exposed (upstream is strictly read-only) + `:filterState():get(name)` typed Lua-value marshaling (upstream returns `serializeAsString()` strings).
+
+**Conditional crypto+fileBytes departure records** (per §13-R7 + §13-R8 PLAN-time scrape per AMEND-22.2-2): 0-6 additional records pending PLAN scrape of upstream Envoy's crypto-exposure-scope (PublicKeyWrapper / CryptoUtility / script-global helpers). Total BEHAVIOR_CONTRACT.md edit bundle at 22.2 IMPL: 10 baseline + 0-6 conditional = 10-16 records.
+
+**Fixture-0027 mixed-mode discipline** (per BRAINSTORM Q12 + 22.2 SPEC §8) — single `test/fixtures/0027-http-lua-full-bridge/` directory with ~9-10 deterministic cross-side scenarios (a/b/c/d/e/f-cert-fingerprint/g/h/i) + ~3-4 non-deterministic REFERENCE-LESS subject-only scenarios (j/k/l/m). 28 → 29 fixture directories at 22.2 phase-done.
+
+**1-2 NEW project-wide fuzzers** anticipated (per BRAINSTORM §3.7 + 22.2 SPEC §13-R10): `FuzzLuaBodyBridge` + `FuzzLuaHTTPCallConfig`. Project-wide fuzzer count 28 → 29-30 at 22.2 phase-done (D7 CLOSED at 22.2 SPEC §11.9).
+
+**3 NEW RUNTIME-REJECT arms** (per 22.2 SPEC §6) — `httpcall-cluster-name-required` + `body-size-cap-exceeded` + `crypto-key-format-invalid` (arms 20-22). RUNTIME-REJECT (via `luaL_error`), NOT PARSE-REJECT (config-load roster stays at 19 from 22.1).
+
+### Decision
+
+*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Decision body will codify the final 22.2 package shape: 7 NEW production files (body.go + trailers.go + metadata.go + connection.go + ssl.go + httpcall.go + crypto.go + misc.go + filterstate.go) + 7 NEW test files + 4 EXTENDED 22.1 files; per-surface method registration; the 2 AMEND-22.2-4 `:filterState()` divergences with byte-stable wording; the 5 NEW stat counters; the fixture-0027 scenario taxonomy; the §13-R7+R8 PLAN-time crypto+fileBytes-classification outcome; the §13-R6 *LState-pool gate disposition; the cross-phase dynamic-metadata deferral-lift expectation; the `FilterChain.tlsConnectionState` field extension wiring (H1 + H2); the in-package wire-format conventions for ssl methods (PEM/url-encoding/ISO-8601/hex sha256); the runtime-reject byte-stable wording for arms 20-22.*
+
+### Consequences
+
+*Body lands at phase-22.2 IMPL atomic-landing Task per ADR-0044 in-place edit discipline. The §Consequences body will document the (+/-)/(?) tradeoffs: (+) full bridge surface available; (+) cross-phase dynamic-metadata deferral lifted; (+) cluster-based httpCall via ADR-0177 AMEND; (-) defensive-copy body cost; (-) 2 (or more pending §13-R7+R8) envoy-go-strict departure records; (-) `:filterState():set()` envoy-go-strict mutation surface diverges from upstream read-only; (?) PLAN-time crypto+fileBytes-classification outcome; (?) §13-R6 *LState-pool gate may fire ADR-0193 escape-valve. Also documents forward-pointers for 22.3 (LuaPerRoute + SourceCodes + 9th canonical) + future cross-phase dynamic-metadata lift consumers.*
+
+**Cross-references:** ADR-0189 (paired predecessor package-shape ADR — `internal/filter/http/lua/` 22.1 package shape; 22.2 EXTENDS); ADR-0188 (predecessor primitive — `internal/lua/`; consumer-#1 scope-expansion at 22.2 lands under NEW ADR-0191 per Q10 strict scope); ADR-0190 (sibling NEW ADR at THIS SPEC commit — `internal/dynamicmetadata/`; consumer-#1 = this ADR's filter); ADR-0191 (sibling NEW ADR at THIS SPEC commit — `internal/lua/` 22.2 API extensions; coroutine + BodyBuffer interface consumed by this ADR's body bridge); ADR-0177 (in-place AMENDMENT body at THIS commit's IMPL Task — `internal/httpclient/Client.ClusterDispatch`; consumed by this ADR's httpCall bridge); ADR-0144 (TLS state plumbing pattern; extended with new `tlsConnectionState` field inside this ADR per Q13 WEAK HOLD — no separate ADR); ADR-0128 (HCM-level decode-side body buffer; wrapped by this ADR's body bridge via ADR-0191 BodyBuffer interface); ADR-0125 §(xiv) (AMENDMENT-anticipation paragraph anchored at parent SPEC commit; UNCHANGED at 22.2 SPEC + 22.2 IMPL; body lands at 22.3 IMPL); ADR-0085 (nil-tolerance); ADR-0080 (byte-stable runtime-rejection wording for arms 20-22 + the `:filterState()` divergence record wording); ADR-0018 (fuzzer must-never-panic baseline for `FuzzLuaBodyBridge` + `FuzzLuaHTTPCallConfig`); ADR-0052 (atomic landing); ADR-0044 (ADR §Decision + §Consequences in-place body landing discipline + §Context-draft discipline at SPEC commit); phase-22.2 BRAINSTORM §1.1 + §1.6 + §2.1-§2.13 + §3 + §6 + §7 + §8; phase-22.2 SPEC §1 + §3 + §6 + §7 + §8 + §9 + §11.1-§11.9 + §13-R6/R7/R8/R9/R10/R11/W2 + §14 + §15 + §16.3.
+
+---
+
