@@ -48,7 +48,18 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0023-http-ext-proc-body/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0024-http-oauth2/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0025-http-adaptive-concurrency/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0026-http-lua-headers-bridge/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
+
+	// Blank-imported so the lua filter's init() boot-registration fires for
+	// the differential subject's bootstrap parsing path. Mirrors the existing
+	// blank-import discipline for the per-fixture driver packages above.
+	// Fixture-0026's driver package lives at
+	// test/fixtures/0026-http-lua-headers-bridge/inputs/ and lands at Task 14;
+	// this internal-package blank-import lands here at Task 13 so the
+	// HTTPLua switch-case + BootRejectFixture infrastructure compile cleanly
+	// without a forward-reference to the Task 14 inputs package.
+	_ "github.com/esalaine/envoy-go/internal/filter/http/lua"
 )
 
 // TestDifferential is the differential suite entry point. It discovers
@@ -576,6 +587,42 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
+		case fixture.HTTPLua:
+			// Fixture 0026-http-lua-headers-bridge (phase 22.1 Task 14)
+			// REUSES the SHARED echobackend binary at
+			// test/helpers/echobackend/cmd/echobackend/ (phase-14 Task 10).
+			// The echobackend reflects request headers as a JSON body —
+			// scenarios (a) add_header, (b) replace_header, (c) remove_header,
+			// and (f) headers_iter assert the Lua-mutated header set arrived
+			// at the upstream by classifying the reflected body. Scenarios
+			// (d) respond + (e) log_only do NOT round-trip through the
+			// backend ((d) short-circuits at the lua filter; (e) is a
+			// no-op log + pass-through). Scenario (g) compile_error never
+			// reaches this dispatch — it asserts boot rejection via the
+			// OPTIONAL BootRejectFixture driver interface at harness.go
+			// + the runBootRejectFixture branch below. Because the backend
+			// is a subprocess, the runner's in-process accept counter is
+			// NOT incremented. The blank-import for the fixture's inputs
+			// package lands at Task 14; at Task 13 this switch-case is
+			// wired ahead of the rollout so the BackendKind dispatch is
+			// complete for Task 14. Per parent §8.5 + AMEND-11.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
 		}
 		backends[i] = bo
 	}
@@ -598,6 +645,22 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	// = true and stay on the differential path unchanged.
 	if rl, ok := d.(fixture.ReferenceLessFixture); ok && !rl.RequiresReference() {
 		runReferenceLessFixture(ctx, t, root, d, backendPorts)
+		return
+	}
+
+	// 1c. Boot-reject fast path. Drivers that implement
+	// differential.BootRejectFixture signal to the runner that BOTH
+	// reference + subject MUST reject boot when fed the broken script path
+	// returned by BootRejectScript(). The runner asserts both sides exit
+	// non-zero AND both sides' stderr contains the substring returned by
+	// ExpectedBootErrorSubstring(). Per parent §13-R1 + §11.7.3 + AMEND-10
+	// option 2 + 22.1 SPEC §6 Task 13. Used by fixture
+	// 0026-http-lua-headers-bridge scenario (g) g_compile_error (driver
+	// lands at Task 14). Pre-existing fixtures 0000-0025 do NOT implement
+	// BootRejectFixture so they default to bypassing this branch and stay
+	// on the differential / reference-less paths unchanged.
+	if brf, ok := d.(BootRejectFixture); ok {
+		runBootRejectFixture(ctx, t, root, pin, d, brf, backendPorts)
 		return
 	}
 
@@ -1291,6 +1354,92 @@ func runReferenceLessFixture(ctx context.Context, t *testing.T, root string, d F
 	// in that case (driver-internal t.Errorf via captured *testing.T).
 	if sa, ok := d.(fixture.SubjectAsserter); ok {
 		sa.AssertSubject(t, subjBytes)
+	}
+}
+
+// runBootRejectFixture is the runner's per-fixture loop variant for drivers
+// that implement differential.BootRejectFixture (per parent §13-R1 + §11.7.3
+// + 22.1 SPEC §6 Task 13 + AMEND-10 option 2). Used by fixture
+// 0026-http-lua-headers-bridge scenario (g) g_compile_error.lua at Task 14.
+//
+// Discipline:
+//  1. Renders the reference + subject bootstraps via the driver's existing
+//     ReferenceBootstrap + SubjectConfig templates. The driver is responsible
+//     for splicing BootRejectScript() into those templates as the lua
+//     filter's DataSource Filename source (the same template path the
+//     non-reject scenarios use, just pointing at the intentionally-broken
+//     script).
+//  2. Calls tryStartReferenceProxy + tryStartSubjectProxy (NOT the
+//     t.Fatalf-on-failure StartReferenceProxy / StartSubjectProxy variants).
+//  3. Asserts BOTH calls return a non-nil err (boot rejection on both sides).
+//     If either succeeds (i.e., boot DID NOT reject), t.Fatalf — the driver's
+//     broken script failed to reject.
+//  4. Asserts BOTH captured stderr buffers contain ExpectedBootErrorSubstring()
+//     as a SUBSTRING (case-sensitive, anywhere in stderr — matches AMEND-10
+//     option 2 cross-side carve-out at parent §13.7).
+//
+// Substring match discipline: case-sensitive `strings.Contains` on the full
+// captured stderr buffer for each side. NOT a prefix match, NOT a regex, NOT
+// case-insensitive. Per parent §11.7.5 the upstream wording is
+// `"script load error: <detail>"` from
+// source/extensions/filters/common/lua/lua.cc; the envoy-go-side wrapping
+// `"script load error"` substring landing happens at Task 15
+// cmd/envoy-go/main.go. The substring assertion does NOT pin the bytes
+// AROUND the substring (gopher-lua vs LuaJIT detail wording diverges per
+// AMEND-9; the wire NEVER carries the detail string).
+//
+// The BackendPorts argument is currently unused — the boot-reject fires
+// BEFORE the listener binds, so the backend never receives a request. The
+// argument is threaded through for symmetry with the differential and
+// reference-less branches; future boot-reject fixtures may need backend
+// addressability (e.g., the bootstrap references a backend cluster port).
+func runBootRejectFixture(ctx context.Context, t *testing.T, root string, pin *EnvoyPin, d FixtureDriver, brf BootRejectFixture, backendPorts []int) {
+	t.Helper()
+	_ = brf.BootRejectScript() // driver-side: spliced into the bootstrap templates by ReferenceBootstrap / SubjectConfig.
+	wantSubstring := brf.ExpectedBootErrorSubstring()
+	if wantSubstring == "" {
+		t.Fatalf("BootRejectFixture: ExpectedBootErrorSubstring() returned empty string — substring assertion requires a non-empty needle")
+	}
+
+	// Reference side — render the bootstrap then try to start it.
+	bootstrap := d.ReferenceBootstrap(backendPorts)
+	refPort := d.ReferenceListenerPort()
+	refCancel, refStderr, refErr := tryStartReferenceProxy(ctx, pin, bootstrap, refPort)
+	if refCancel != nil {
+		// Surprising success path: the reference DID come up. Tear it down
+		// + fail the test — the broken script failed to reject.
+		refCancel()
+	}
+	if refErr == nil {
+		t.Fatalf("BootRejectFixture: reference proxy started cleanly — expected boot rejection for broken script %q", brf.BootRejectScript())
+	}
+
+	// Subject side — render the subject config then try to start it. The
+	// subject's listener port is freshly allocated (the boot-reject fires
+	// before the listener binds; the port value is supplied for template
+	// completeness but never consumed).
+	subjPort := freeTCPPort(t)
+	subjAdminPort := freeTCPPort(t)
+	subjCfg := d.SubjectConfig(refPort, subjPort, backendPorts, subjAdminPort)
+	subjCancel, subjStderr, subjErr := tryStartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
+	if subjCancel != nil {
+		// Surprising success path: the subject DID come up. Tear it down
+		// + fail the test — the broken script failed to reject.
+		subjCancel()
+	}
+	if subjErr == nil {
+		t.Fatalf("BootRejectFixture: subject proxy started cleanly — expected boot rejection for broken script %q", brf.BootRejectScript())
+	}
+
+	// Substring assertions — case-sensitive Contains against both stderr
+	// buffers. The captured boot-reject error string from tryStart*
+	// (refErr / subjErr) is informational only; the AMEND-10 option 2
+	// carve-out asserts the substring in stderr, not in the error string.
+	if !strings.Contains(refStderr.String(), wantSubstring) {
+		t.Fatalf("BootRejectFixture: reference stderr does NOT contain %q\n--- reference err: %v\n--- reference stderr (%d bytes):\n%s", wantSubstring, refErr, refStderr.Len(), refStderr.String())
+	}
+	if !strings.Contains(subjStderr.String(), wantSubstring) {
+		t.Fatalf("BootRejectFixture: subject stderr does NOT contain %q\n--- subject err: %v\n--- subject stderr (%d bytes):\n%s", wantSubstring, subjErr, subjStderr.Len(), subjStderr.String())
 	}
 }
 

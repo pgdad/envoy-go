@@ -2,6 +2,7 @@ package differential
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -307,3 +308,214 @@ type FixtureDriver = fixture.Driver
 
 // RegisterFixture re-exports fixture.RegisterFixture for backward compat.
 func RegisterFixture(name string, d FixtureDriver) { fixture.RegisterFixture(name, d) }
+
+// BootRejectFixture is an OPTIONAL driver-side interface that signals the
+// runner to assert BOTH the reference Envoy AND the envoy-go subject REJECT
+// boot when fed an intentionally broken filter-config (e.g., a Lua script
+// with a compile error). Per parent SPEC §13-R1 + §11.7.3 + phase-22.1 SPEC
+// §6 Task 13 + AMEND-10 (option 2 substring-match).
+//
+// The runner's runBootRejectFixture branch (paralleling runReferenceLessFixture
+// at runner_test.go) does the following:
+//  1. Renders the per-side bootstrap with the broken script path interpolated
+//     (the driver's existing ReferenceBootstrap + SubjectConfig templates point
+//     at the path returned by BootRejectScript()).
+//  2. Invokes tryStartReferenceProxy + tryStartSubjectProxy (NOT the
+//     t.Fatalf-on-failure StartReferenceProxy / StartSubjectProxy variants).
+//  3. Asserts BOTH calls return a non-nil err (boot rejection on both sides).
+//  4. Asserts BOTH captured stderr buffers contain ExpectedBootErrorSubstring()
+//     as a SUBSTRING (case-sensitive, anywhere in stderr — matches the AMEND-10
+//     option 2 "both sides exit non-zero AND both sides' stderr contains the
+//     substring `\"script load error\"`" promise).
+//
+// Used by fixture-0026-http-lua-headers-bridge scenario (g) g_compile_error.lua
+// (lands at Task 14). Drivers that do NOT implement this interface bypass the
+// boot-reject branch entirely.
+//
+// The BootRejectScript path is relative to the fixture directory (e.g.,
+// "scripts/g_compile_error.lua") — matches the §9.4 scripts/ subdirectory
+// convention. The driver is responsible for splicing this path into the
+// ReferenceBootstrap + SubjectConfig templates as the lua filter's DataSource
+// Filename source. Introduced by phase 22.1 Task 13.
+type BootRejectFixture interface {
+	// BootRejectScript returns the path (relative to the fixture directory)
+	// to the broken Lua script the runner uses to drive the boot-reject
+	// assertion. Per §9.4 the path SHOULD live under scripts/ — e.g.,
+	// "scripts/g_compile_error.lua".
+	BootRejectScript() string
+
+	// ExpectedBootErrorSubstring returns the substring the runner asserts is
+	// present (case-sensitive) in BOTH reference + subject stderr after the
+	// boot-reject. For fixture-0026 scenario (g) this is the literal string
+	// "script load error" per parent §11.7.5 + AMEND-10 option 2.
+	ExpectedBootErrorSubstring() string
+}
+
+// bootRejectTimeout is the wall-clock budget the harness gives each proxy to
+// exit with a boot-reject before tryStart* gives up. Generous: the reference
+// container exits within a few seconds typically; the subject subprocess exits
+// within hundreds of milliseconds. The harness surfaces timeouts as errors
+// without retrying.
+const bootRejectTimeout = 20 * time.Second
+
+// tryStartReferenceProxy is the NON-t.Fatalf-ing variant of StartReferenceProxy
+// for the runBootRejectFixture branch (per parent §11.7.3 + §13-R1). Instead
+// of t.Fatalf-ing on container-start failure or admin /ready timeout, it
+// returns the boot error + a captured stderr buffer for substring assertion
+// against ExpectedBootErrorSubstring().
+//
+// On success (the container DID come up — surprising for a boot-reject fixture
+// but tolerated for symmetry with tryStartSubjectProxy below), it returns a
+// non-nil cancel func that terminates the container and a nil err. The
+// caller MUST invoke cancel even on success to release the container.
+//
+// On boot-reject (the expected path for fixture-0026 scenario (g)), it returns
+// a nil cancel func + the captured stderr buffer + a non-nil err describing
+// the boot-reject (typically the wait-for-/ready timeout the testcontainers
+// startup probe surfaces when Envoy exits before binding admin). The caller
+// inspects err + scans the stderr buffer for ExpectedBootErrorSubstring().
+//
+// The stderr buffer captures the reference container's complete stderr stream
+// from container start through container exit (or the bootRejectTimeout
+// deadline, whichever fires first). The capture is best-effort — Docker's log
+// retrieval can lag a moment after the container exits; the harness reads
+// until EOF or context cancellation.
+func tryStartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, listenerPorts ...int) (cancel func(), stderrBuf *bytes.Buffer, err error) {
+	exposed := []string{"9901/tcp"}
+	for _, p := range listenerPorts {
+		exposed = append(exposed, fmt.Sprintf("%d/tcp", p))
+	}
+	// AutoRemove is OFF so we can pull logs after the container exits.
+	req := testcontainers.ContainerRequest{
+		Image:        pin.SHA256,
+		ExposedPorts: exposed,
+		Cmd:          []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn", "--concurrency", "1"},
+		// We deliberately use a short WaitingFor so the testcontainers
+		// startup path fails fast when the container exits without binding
+		// admin (the boot-reject path). The substring-match assertion lives
+		// in the caller against the captured stderr buffer.
+		WaitingFor: wait.ForHTTP("/ready").WithPort("9901/tcp").WithStartupTimeout(bootRejectTimeout),
+		HostConfigModifier: func(hc *container.HostConfig) {
+			hc.ExtraHosts = []string{"host.docker.internal:host-gateway"}
+			hc.AutoRemove = false
+		},
+	}
+	startCtx, startCancel := context.WithTimeout(ctx, bootRejectTimeout+5*time.Second)
+	defer startCancel()
+	c, startErr := testcontainers.GenericContainer(startCtx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+
+	stderrBuf = &bytes.Buffer{}
+	// Regardless of start success/failure, attempt to drain the container
+	// logs into stderrBuf so the caller can substring-assert. Some failure
+	// paths (image-pull failure, port-conflict) yield no container handle —
+	// in those cases the buffer stays empty and the caller falls back to
+	// the err string for diagnostic.
+	if c != nil {
+		// Drain logs with a short timeout — we want stderr, not to block.
+		drainCtx, drainCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer drainCancel()
+		if rc, lerr := c.Logs(drainCtx); lerr == nil {
+			_, _ = io.Copy(stderrBuf, rc)
+			_ = rc.Close()
+		}
+	}
+
+	if startErr != nil {
+		// Boot-reject path: terminate the container if it exists + return
+		// the error + captured stderr.
+		if c != nil {
+			_ = c.Terminate(context.Background())
+		}
+		return nil, stderrBuf, fmt.Errorf("reference boot-reject: %w", startErr)
+	}
+
+	// Surprising success path: the container DID come up. Return a cancel
+	// func that terminates it, and a nil err.
+	return func() { _ = c.Terminate(context.Background()) }, stderrBuf, nil
+}
+
+// tryStartSubjectProxy is the NON-t.Fatalf-ing variant of StartSubjectProxy
+// for the runBootRejectFixture branch (per parent §11.7.3 + §13-R1). Instead
+// of t.Fatalf-ing on subprocess-start failure or ready-sentinel timeout, it
+// returns the boot error + a captured stderr buffer for substring assertion
+// against ExpectedBootErrorSubstring().
+//
+// On success (the subject DID come up — surprising for a boot-reject fixture
+// but tolerated for symmetry with tryStartReferenceProxy above), it returns a
+// non-nil cancel func that kills + reaps the subprocess and a nil err. The
+// caller MUST invoke cancel even on success to release the subprocess.
+//
+// On boot-reject (the expected path for fixture-0026 scenario (g)), it returns
+// a nil cancel func + the captured stderr buffer + a non-nil err describing
+// the boot-reject (typically subprocess exit-status-non-zero before the ready
+// sentinel fires). The caller inspects err + scans the stderr buffer for
+// ExpectedBootErrorSubstring().
+//
+// The stderr buffer captures the subject subprocess's complete stderr stream
+// from start through exit (or the bootRejectTimeout deadline). Build failures
+// (`go build` non-zero exit) are returned as errors with the build output in
+// the err message — the stderr buffer remains empty in that case.
+func tryStartSubjectProxy(ctx context.Context, repoRoot, cfg, subjAdminAddr string) (cancel func(), stderrBuf *bytes.Buffer, err error) {
+	stderrBuf = &bytes.Buffer{}
+	tmp, terr := os.MkdirTemp("", "envoy-go-subject-bootreject-*")
+	if terr != nil {
+		return nil, stderrBuf, terr
+	}
+	bin := filepath.Join(tmp, "envoy-go")
+	build := exec.CommandContext(ctx, "go", "build", "-o", bin, "./cmd/envoy-go")
+	build.Dir = repoRoot
+	if out, berr := build.CombinedOutput(); berr != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, stderrBuf, fmt.Errorf("build subject: %w\n%s", berr, out)
+	}
+	cfgPath := filepath.Join(tmp, "envoy-go.yaml")
+	if werr := os.WriteFile(cfgPath, []byte(cfg), 0o600); werr != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, stderrBuf, werr
+	}
+
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	stdout, perr := cmd.StdoutPipe()
+	if perr != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, stderrBuf, perr
+	}
+	// Capture stderr into the buffer for substring assertion. We tee to
+	// os.Stderr as well so the test author can see the rejection wording
+	// during local iteration; the substring assertion runs against stderrBuf.
+	cmd.Stderr = io.MultiWriter(stderrBuf, os.Stderr)
+	if serr := cmd.Start(); serr != nil {
+		_ = os.RemoveAll(tmp)
+		return nil, stderrBuf, fmt.Errorf("start subject: %w", serr)
+	}
+
+	// Race the ready sentinel against subprocess exit. For a boot-reject the
+	// subprocess exits before "envoy-go ready" appears on stdout — the
+	// readyListenerAddrs goroutine returns io.EOF (or similar) which we
+	// surface as the boot-reject error.
+	readyCtx, readyCancel := context.WithTimeout(ctx, bootRejectTimeout)
+	defer readyCancel()
+	addrs, rerr := readyListenerAddrs(readyCtx, stdout)
+	if rerr != nil {
+		// Boot-reject path: kill (in case it's still alive) + reap + clean up.
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		_ = os.RemoveAll(tmp)
+		return nil, stderrBuf, fmt.Errorf("subject boot-reject: %w", rerr)
+	}
+
+	// Surprising success path: the subject DID come up. Return a cancel func
+	// that kills+reaps+cleans the temp dir, and a nil err. addrs / subjAdminAddr
+	// are intentionally unused on this path — the caller's boot-reject
+	// assertion is going to t.Fatalf because boot did NOT reject.
+	_ = addrs
+	_ = subjAdminAddr
+	return func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		_ = os.RemoveAll(tmp)
+	}, stderrBuf, nil
+}

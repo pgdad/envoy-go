@@ -367,6 +367,25 @@ const (
 	// the backend is a subprocess, the runner's in-process accept counter
 	// is NOT incremented. Introduced by phase 21 Task 10 / fixture 0025.
 	HTTPAdaptiveConcurrency BackendKind = 21
+	// HTTPLua reuses the shared echobackend (test/helpers/echobackend/
+	// cmd/echobackend) for fixture 0026-http-lua-headers-bridge (phase
+	// 22.1 Task 14). The echobackend reflects request headers as JSON in
+	// the response body — needed for scenarios (a) add_header, (b)
+	// replace_header, (c) remove_header, and (f) headers_iter where the
+	// driver classifies the reflected body to confirm the Lua-mutated
+	// header set arrived at the upstream. Scenarios (d) respond and (e)
+	// log_only do NOT round-trip through the backend ((d) short-circuits
+	// at the lua filter; (e) is a no-op log + pass-through but the
+	// driver asserts the request was unchanged at upstream via the same
+	// echo reflection). Scenario (g) compile_error never reaches the
+	// backend — it asserts boot rejection via the OPTIONAL
+	// BootRejectFixture driver interface at harness.go. Because the
+	// backend is a subprocess, the runner's in-process accept counter
+	// is NOT incremented. Introduced by phase 22.1 Task 13 per parent
+	// §8.5 + AMEND-11. The differential dispatch at
+	// runner_test.go:547+ mirrors HTTPCsrf / HTTPCompressor /
+	// HTTPAdaptiveConcurrency precedent.
+	HTTPLua BackendKind = 22
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

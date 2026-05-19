@@ -9,6 +9,7 @@ require (
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/testcontainers/testcontainers-go v0.27.0
+	github.com/yuin/gopher-lua v1.1.2
 	golang.org/x/net v0.34.0
 	golang.org/x/sys v0.31.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241202173237-19429a94021a

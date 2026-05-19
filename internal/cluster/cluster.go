@@ -47,7 +47,7 @@ func (e Endpoint) Addr() string {
 // for the lifetime of the pooled connection.
 type PooledH1Conn struct {
 	Conn net.Conn
-	Br   *Bufio  // opaque wrapper (cluster owns the bufio.Reader type alias)
+	Br   *Bufio // opaque wrapper (cluster owns the bufio.Reader type alias)
 	ep   Endpoint
 }
 

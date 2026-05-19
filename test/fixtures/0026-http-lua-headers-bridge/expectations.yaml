@@ -1,0 +1,166 @@
+# Human-readable scenario expectations for fixture 0026-http-lua-headers-
+# bridge. Per phase 22 parent SPEC §8.2 + phase 22.1 SPEC §9.1 7-scenario
+# table. NOT consumed by the differential runner — the runner's
+# CompareBytes / BootRejectFixture branches drive the actual assertions.
+# This file is a documentation aid for fixture readers + reviewers.
+#
+# Fixture topology:
+#   6 listeners (l_test_a..l_test_f) — one per wire-interactive scenario.
+#   Each listener carries one envoy.filters.http.lua filter consuming a
+#   per-scenario .lua source file via the DataSource.Filename arm.
+#   Backend: shared echobackend (reflects request headers as JSON body).
+#
+# Scenario (g) script-compile-error is wire-orthogonal: the runner's
+# BootRejectFixture branch asserts both proxies exit non-zero at config
+# load with stderr substring "script load error" (NOT a wire round-trip).
+
+scenarios:
+  - id: a
+    name: a_add_header
+    listener: l_test_a
+    description: |
+      Lua adds the header pair `x-lua-injected: hello` at the decode
+      side (envoy_on_request). The request reaches echobackend with the
+      injected header present in the request envelope; echobackend
+      reflects all request headers as the JSON response body. The driver
+      classifies the reflected JSON to assert the `x-lua-injected` key
+      = `hello` is present on both ref + subj sides.
+    request:
+      method: GET
+      path: /scenario_a
+    expected_upstream_request_headers:
+      x-lua-injected: hello
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: b
+    name: b_replace_header
+    listener: l_test_b
+    description: |
+      Lua replaces the `user-agent` header value with the literal
+      `envoy-go-lua/1.0` at the decode side (`rh:headers():replace(...)`).
+      echobackend reflects the replaced value in the JSON body. The
+      driver asserts `user-agent: envoy-go-lua/1.0` on both sides.
+    request:
+      method: GET
+      path: /scenario_b
+      headers:
+        user-agent: integration-test/0.1
+    expected_upstream_request_headers:
+      user-agent: envoy-go-lua/1.0
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: c
+    name: c_remove_header
+    listener: l_test_c
+    description: |
+      Lua removes the `x-blocked` header at the decode side (`rh:headers():
+      remove(...)`). The driver supplies `x-blocked: yes` in the request;
+      echobackend's reflected JSON must NOT contain the `x-blocked` key
+      after the removal on either side.
+    request:
+      method: GET
+      path: /scenario_c
+      headers:
+        x-blocked: "yes"
+    expected_upstream_request_headers_absent:
+      - x-blocked
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: d
+    name: d_respond
+    listener: l_test_d
+    description: |
+      Lua short-circuits the request via `rh:respond({[':status']='403'},
+      'denied')`. Per parent §11.6.7 + AMEND-7 byte-pin: status 403;
+      body "denied" (6 bytes verbatim, no trailing newline); content-
+      length: 6 auto-set; content-type: text/plain default; NO upstream
+      request initiated (echobackend never sees the round-trip).
+    request:
+      method: GET
+      path: /scenario_d
+    expected_downstream_response_status: 403
+    expected_downstream_response_headers:
+      content-length: "6"
+      content-type: text/plain
+    expected_downstream_response_body: denied
+    expected_upstream_round_trip: false
+
+  - id: e
+    name: e_log_only
+    listener: l_test_e
+    description: |
+      Lua invokes `rh:logInfo("lua hit")` at the decode side; no headers
+      mutated, request passes through to echobackend unchanged. Per
+      D3 closure at PLAN session + parent §11.7.7 RECOMMENDED option (a):
+      the literal log line is NOT cross-side asserted (envoy-go logs to
+      stderr with a different format vs reference Envoy's spdlog); the
+      **stat-counter delta** `lua.scenario_e.executions` is the "Lua ran"
+      assertion. The driver scrapes /stats?format=text pre + post each
+      probe + emits `scenario e executions_delta=N` into the byte-stream;
+      both sides must agree on N.
+    request:
+      method: GET
+      path: /scenario_e
+    expected_upstream_request_unchanged: true
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+    expected_executions_delta_per_probe: 1
+
+  - id: f
+    name: f_headers_iter
+    listener: l_test_f
+    description: |
+      Lua iterates the request-handle headers via `pairs(rh:headers())`
+      counting entries, then adds `x-headers-count: tostring(n)` at the
+      decode side. Per §11.2 D7 closure: bridge `__pairs` snapshots
+      `http.Header` into an alphabetically-sorted slice + walks by index;
+      the count is order-independent + deterministic across runs on both
+      sides. The driver asserts `x-headers-count` is present in the
+      echobackend-reflected JSON + has the same value on ref + subj.
+    request:
+      method: GET
+      path: /scenario_f
+    expected_upstream_request_headers_present:
+      - x-headers-count
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: g
+    name: g_compile_error
+    description: |
+      Lua source contains intentional syntax error (`function envoy_on_
+      request(rh) end this-is-not-valid-lua-syntax`). Both ref + subj
+      MUST exit non-zero at config load (PARSE-REJECT at arm 16 of the
+      18-arm roster per parent §6.2). The runner's BootRejectFixture
+      branch (test/differential/harness.go) renders both bootstraps via
+      ReferenceBootstrap + SubjectConfig — the driver splices the
+      g_compile_error.lua path into ALL 6 listener script slots — then
+      asserts BOTH calls return non-nil err AND BOTH captured stderr
+      buffers contain the literal substring `"script load error"`
+      (case-sensitive Contains) per AMEND-10 option 2.
+      Reference Envoy raises `LuaException(fmt::format("script load
+      error: {}", lua_tostring(state.get(), -1)))` at source/extensions/
+      filters/common/lua/lua.cc.
+      envoy-go (Task 15) wraps gopher-lua's compile error with the same
+      `"script load error: "` prefix at cmd/envoy-go/main.go's boot-
+      reject path per parent §13-W.
+    boot_reject:
+      script: scripts/g_compile_error.lua
+      expected_stderr_substring: script load error
+    expected_wire_traffic: none
+
+# Cross-side scope summary:
+#   Scenarios (a)-(f): full cross-side byte-exact via CompareBytes.
+#   Scenario (g):      substring-match `"script load error"` in stderr
+#                      via BootRejectFixture (NOT byte-exact stderr).
+#
+# Cross-references:
+#   - 22.1 SPEC §9 7-scenario table + driver impl shape.
+#   - parent §8 fixture-0026 disposition + AMEND-10 substring-match.
+#   - parent §11.6.7 + AMEND-7 respond byte-pin (scenario d).
+#   - parent §11.7.7 option (a) + D3 closure (scenario e).
+#   - parent §13-R1 BootRejectFixture infra (Task 13) + §13-W envoy-go
+#     wording-pinning (Task 15).

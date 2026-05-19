@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"
 	"github.com/esalaine/envoy-go/internal/filter/http/jwtauthn"
 	"github.com/esalaine/envoy-go/internal/filter/http/localratelimit"
+	"github.com/esalaine/envoy-go/internal/filter/http/lua"
 	"github.com/esalaine/envoy-go/internal/filter/http/oauth2"
 	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
@@ -136,6 +138,7 @@ func main() {
 	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
 	httpReg.Register(jwtauthn.TypeURL, jwtauthn.New)
 	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
+	httpReg.Register(lua.TypeURL, lua.New)
 	httpReg.Register(oauth2.TypeURL, oauth2.New)
 	httpReg.Register(rbac.TypeURL, rbac.New)
 	// Register header_mutation per-route validator before Freeze (the registry
@@ -148,6 +151,12 @@ func main() {
 	// has NO OAuth2PerRoute message at all per §20.P7 RATIFIED — the validator
 	// rejects UNCONDITIONALLY with the byte-stable D2 wording.
 	oauth2.RegisterPerRouteValidator(httpReg)
+	// Phase-22.1 Task 10: register the lua per-route validator BEFORE Freeze
+	// per parent §6.2 arm 18 + 22.1 PLAN D-P6 + ADR-0110 single-chokepoint.
+	// The validator one-liner returns "lua: per-route configuration is not
+	// yet supported (lands in phase 22.3)"; the 9th canonical per-route shape
+	// validator replaces the body at 22.3 IMPL.
+	lua.RegisterPerRouteValidator(httpReg)
 	httpReg.Freeze()
 
 	// Phase 07.2 Task 11 boot wiring: build the
@@ -180,7 +189,7 @@ func main() {
 
 	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr, httpClient)
 	if err != nil {
-		log.Fatalf("listener manager: %v", err)
+		log.Fatalf("listener manager: %v", maybeWrapLuaScriptLoadError(err))
 	}
 
 	// Phase 08.1: admin.New is constructed AFTER cm + lm so the four new
@@ -244,4 +253,55 @@ func main() {
 	// Best-effort upstream-pool close per ADR-0096.
 	cm.Drain()
 	// Existing deferred-stop chain runs as the function unwinds.
+}
+
+// luaCompileErrorSubstring is the byte-stable arm-16 wrap prefix emitted by
+// internal/filter/http/lua/compiled_config.go::wrapParseRejectScriptCompileFailed
+// (`"lua: default_source_code: compile: %w"`). Detecting this substring lets
+// the boot-reject sink at main.go identify a Lua script-compile failure that
+// surfaced through the HCM filter-factory error chain
+// (`listener: %q: filter_chains[%d]: hcm: http_filters[%d]: factory: <inner>`).
+// Phase 22.1 Task 15 + parent §13-W + 22.1 SPEC §6 Task 15.
+const luaCompileErrorSubstring = "lua: default_source_code: compile:"
+
+// scriptLoadErrorWrapPrefix is the literal wording prefix the upstream
+// Envoy v1.37.2 lua filter prints to stderr on script-compile failure per
+// `source/extensions/filters/common/lua/lua.cc` (parent §11.7.5). The
+// envoy-go-side boot-reject path wraps the surfaced error with this prefix
+// so the cross-side substring assertion at fixture-0026 scenario (g) (per
+// AMEND-10 option 2 + parent §13-R1) lands on both proxies.
+//
+// The trailing colon + space match upstream's wording byte-exactly; the
+// substring assertion in test/differential/runner_test.go::runBootRejectFixture
+// only checks for `"script load error"` (no colon) per AMEND-10 wording
+// discipline — the colon is preserved here for upstream-parity readability
+// of operator-facing stderr.
+const scriptLoadErrorWrapPrefix = "script load error: "
+
+// maybeWrapLuaScriptLoadError inspects the supplied error for the arm-16
+// Lua compile-failure substring (the byte-stable wrap emitted by the lua
+// filter's `buildCompiledConfig` per `compiled_config.go::wrapParseReject
+// ScriptCompileFailed`). When matched, returns a new error wrapping the
+// original with the upstream-parity prefix `"script load error: "` per
+// parent §11.7.5 + §13-W + 22.1 SPEC §6 Task 15.
+//
+// When the substring is NOT present (i.e., the listener-manager error is
+// from a NON-lua filter / a non-compile lua failure / a NON-filter source
+// such as bind / cluster construction), the original error is returned
+// unchanged — the wrap is filter-scoped, not generic.
+//
+// The match is a `strings.Contains` (case-sensitive) against the error's
+// `Error()` string rather than `errors.As` against a typed sentinel
+// because the arm-16 wrap is a string-format chain — the wrapped inner is
+// a `*lua.ApiError` value but the prefix lives in the wrap layer, not in
+// a typed wrapper. The substring is the contract per parent §6.1
+// byte-stable PARSE-REJECT wording discipline.
+func maybeWrapLuaScriptLoadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if !strings.Contains(err.Error(), luaCompileErrorSubstring) {
+		return err
+	}
+	return fmt.Errorf("%s%w", scriptLoadErrorWrapPrefix, err)
 }
