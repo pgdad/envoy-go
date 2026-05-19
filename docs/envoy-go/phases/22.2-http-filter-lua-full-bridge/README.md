@@ -1,6 +1,6 @@
 # Phase 22.2 — `http-filter-lua-full-bridge` (placeholder)
 
-**Status:** Sub-phase directory pre-created at the **phase-22 parent BRAINSTORM** per Q12 (see `../22-http-filter-lua/BRAINSTORM.md`). This sub-phase is **not yet opened** — opening happens at the dedicated 22.2 SPEC session after the 22.1 IMPL squash-merges to master + the parent SPEC at `../22-http-filter-lua/SPEC.md` lands.
+**Status:** **22.2 BRAINSTORM done at 2026-05-18** — see `./BRAINSTORM.md` (~700 LoC; 14-Q dialogue across 12 §2 numbered sub-sections; full bridge surface delta + envelope D maximal scope + cross-phase dynamic-metadata deferral break + 3 anticipated NEW ADRs at 22.2 IMPL + in-place AMEND on ADR-0177 + conditional ADR-0193 per WEAK HOLD escape-valve). Sub-phase directory pre-created at the **phase-22 parent BRAINSTORM** per Q12 (see `../22-http-filter-lua/BRAINSTORM.md`). Next-skill: `superpowers:brainstorming` scoped to 22.2 SPEC per SKILL_ROUTING state-1 entry.
 
 **Parent row:** `22 | http-filter-lua` (status `in-progress` per ROADMAP).
 **This sub-row:** `22.2 | http-filter-lua-full-bridge` (status `planned` per ROADMAP; depends-on `22.1`).
