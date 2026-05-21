@@ -1,9 +1,9 @@
 # Phase 22.3 — `http-filter-lua-multi-script-and-per-route` (placeholder)
 
-**Status:** Sub-phase directory pre-created at the **phase-22 parent BRAINSTORM** per Q12 (see `../22-http-filter-lua/BRAINSTORM.md`). This sub-phase is **not yet opened** — opening happens at the dedicated 22.3 SPEC session after the 22.2 IMPL squash-merges to master.
+**Status:** **22.3 BRAINSTORM done at 2026-05-21** — see `./BRAINSTORM.md` (multi-script + per-route surface; settles the genuinely-open decisions the parent left to this session: 1 combined NEW ADR-0193 + ADR-0125 §(xiv) AMENDMENT + no-reserved-name discipline + HCM-build-time dangling-reference cross-resolution + fixture-0028 5-tier cross-side + `FuzzLuaPerRouteConfig` + WEAK HOLD escape-valve at conditional ADR-0194 + single-phase). Sub-phase directory pre-created at the **phase-22 parent BRAINSTORM** per Q12 (see `../22-http-filter-lua/BRAINSTORM.md`). Next-skill: `superpowers:brainstorming` scoped to 22.3 SPEC per SKILL_ROUTING state-1 entry (BRAINSTORM → SPEC two-session split per the phase-22.1 + phase-22.2 precedent).
 
-**Parent row:** `22 | http-filter-lua` (status `in-progress` per ROADMAP).
-**This sub-row:** `22.3 | http-filter-lua-multi-script-and-per-route` (status `planned` per ROADMAP; depends-on `22.2`).
+**Parent row:** `22 | http-filter-lua` (status `in-progress` per ROADMAP; closes at 22.3 IMPL phase-done).
+**This sub-row:** `22.3 | http-filter-lua-multi-script-and-per-route` (status `in-progress` per ROADMAP at 22.3 BRAINSTORM-done; depends-on `22.2`).
 
 ## Anticipated scope (per parent BRAINSTORM §11.3)
 
