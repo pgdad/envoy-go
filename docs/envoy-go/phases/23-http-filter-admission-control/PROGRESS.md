@@ -71,6 +71,122 @@ All 15 preconditions GREEN. Proceeding to the 12 PLAN tasks.
 
 ---
 
+## Task 2 — `compiled_config.go` + 9-arm PARSE-REJECT roster + ADR-0195 §Decision + §Consequences
+
+**Commit SHA:** `75eb811`
+**Status:** DONE.
+
+**Files landed:**
+- `internal/filter/http/admission_control/compiled_config.go` (NEW; ~290 LoC including package-level doc + per-arm comments + helper functions)
+- `internal/filter/http/admission_control/compiled_config_test.go` (NEW; ~490 LoC: 15 PARSE-REJECT rows + 13 default-applied rows + happy-path + nil-typed-config + unmarshal-failure + 5 TestEnabledMatrix rows + TestIsHTTPSuccess + TestIsGRPCSuccess + 9 byte-stable constant rows)
+- `docs/envoy-go/DECISIONS.md` (MODIFY; ADR-0195 §Decision + §Consequences bodies anchored — REPLACES the SPEC-commit `_(Lands at phase-23 IMPL…)_` anticipation blocks per ADR-0044; **Status:** header updated from `§Context anchored…§Decision + §Consequences bodies land at phase-23 IMPL` → `Accepted — landed at phase-23 IMPL Task 2`; +~90 LoC net delta)
+- `docs/envoy-go/phases/23-http-filter-admission-control/PROGRESS.md` (THIS Task 2 entry; ~80 LoC append)
+
+**ADR landings:** ADR-0195 §Decision + §Consequences bodies (EXTENDS SPEC-commit §Context draft per ADR-0044 in-place edit discipline).
+
+**D-questions closed:** PD-2 (9-arm PARSE-REJECT byte-stable roster materialized as `const` declarations + asserted byte-exact at `TestParseRejectConstants_ByteStable`).
+
+### Build / test outputs (verbatim)
+
+```
+$ go build ./internal/filter/http/admission_control/...
+(no output — clean)
+
+$ go vet ./...
+(no output — clean)
+
+$ golangci-lint run ./internal/filter/http/admission_control/...
+(no output — clean)
+
+$ go test -count=1 ./internal/filter/http/admission_control/... -run 'TestBuildCompiledConfig|TestEnabledMatrix|TestParseRejectConstants'
+ok  	github.com/esalaine/envoy-go/internal/filter/http/admission_control	0.003s
+
+$ grep -cE '^## ADR-0195' docs/envoy-go/DECISIONS.md
+1
+```
+
+Verbose form (all sub-tests):
+
+```
+$ go test -count=1 ./internal/filter/http/admission_control/... -v
+=== RUN   TestBuildCompiledConfig
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm01_EvaluationCriteria_Absent
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm02_SrThreshold_BelowOnePercent
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm02_SrThreshold_ExactlyZero
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm03_HttpRange_StartBelowMin
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm03_HttpRange_EndAtOrAboveCeiling
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm03_HttpRange_StartGreaterThanEnd
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm04_GrpcCodes_MoreThan16
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm04_GrpcCodes_Exactly17
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm05_EnabledRuntimeKey_DefaultTrue
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm05_EnabledRuntimeKey_DefaultFalse
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm06_AggressionRuntimeKey
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm07_SrThresholdRuntimeKey
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm08_MaxRejectionProbabilityRuntimeKey
+=== RUN   TestBuildCompiledConfig/PARSE_REJECT/Arm09_RpsThresholdRuntimeKey
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm01_EvaluationCriteria_Absent (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm02_SrThreshold_BelowOnePercent (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm02_SrThreshold_ExactlyZero (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm03_HttpRange_StartBelowMin (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm03_HttpRange_EndAtOrAboveCeiling (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm03_HttpRange_StartGreaterThanEnd (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm04_GrpcCodes_MoreThan16 (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm04_GrpcCodes_Exactly17 (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm05_EnabledRuntimeKey_DefaultTrue (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm05_EnabledRuntimeKey_DefaultFalse (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm06_AggressionRuntimeKey (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm07_SrThresholdRuntimeKey (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm08_MaxRejectionProbabilityRuntimeKey (0.00s)
+    --- PASS: TestBuildCompiledConfig/PARSE_REJECT/Arm09_RpsThresholdRuntimeKey (0.00s)
+=== RUN   TestBuildCompiledConfig/Defaults
+    --- PASS: TestBuildCompiledConfig/Defaults/SamplingWindow_Absent_Defaults30s (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/SamplingWindow_60s_Preserved (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/SamplingWindow_1500ms_Truncated1s (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/Aggression_Absent_Defaults1_0 (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/Aggression_BelowFloor_ClampsTo1_0 (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/Aggression_2_0_Preserved (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/SrThreshold_Absent_Defaults0_95 (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/SrThreshold_95pct_Fraction (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/SrThreshold_Above100pct_Clamped1_0 (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/RpsThreshold_Absent_Defaults0 (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/RpsThreshold_100_Preserved (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/MaxRejectionProbability_Absent_Defaults0_80 (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/MaxRejectionProbability_50pct_Fraction (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/HttpCriteria_Absent_DefaultRange100_500 (0.00s)
+    --- PASS: TestBuildCompiledConfig/Defaults/GrpcCriteria_Absent_Default11Codes (0.00s)
+--- PASS: TestBuildCompiledConfig/HappyPath (0.00s)
+--- PASS: TestBuildCompiledConfig/NilTypedConfig (0.00s)
+--- PASS: TestBuildCompiledConfig/UnmarshalFailure (0.00s)
+--- PASS: TestBuildCompiledConfig (0.00s)
+=== RUN   TestEnabledMatrix
+    --- PASS: TestEnabledMatrix/Case1_Absent_ENABLED (0.00s)
+    --- PASS: TestEnabledMatrix/Case2_Present_DefaultFalse_DISABLED (0.00s)
+    --- PASS: TestEnabledMatrix/Case3_Present_DefaultTrue_ENABLED (0.00s)
+    --- PASS: TestEnabledMatrix/Case4_RuntimeKey_PARSE_REJECT (0.00s)
+    --- PASS: TestEnabledMatrix/Case1b_Present_DefaultValueAbsent_ENABLED (0.00s)
+--- PASS: TestEnabledMatrix (0.00s)
+=== RUN   TestIsHTTPSuccess
+--- PASS: TestIsHTTPSuccess (0.00s)
+=== RUN   TestIsGRPCSuccess
+--- PASS: TestIsGRPCSuccess (0.00s)
+=== RUN   TestParseRejectConstants_ByteStable
+    --- PASS: TestParseRejectConstants_ByteStable/Arm01_EvalCriteriaRequired (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm02_SrThresholdTooLow (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm03_HttpRangeInvalid (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm04_GrpcCodesExceed16 (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm05_EnabledRuntimeKey (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm06_AggressionRuntimeKey (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm07_SrThresholdRuntimeKey (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm08_MaxRejectionProbabilityRuntimeKey (0.00s)
+    --- PASS: TestParseRejectConstants_ByteStable/Arm09_RpsThresholdRuntimeKey (0.00s)
+--- PASS: TestParseRejectConstants_ByteStable (0.00s)
+PASS
+ok  	github.com/esalaine/envoy-go/internal/filter/http/admission_control	0.003s
+```
+
+---
+
 ## ADRs introduced / landed by this plan (reproduced verbatim from PLAN)
 
 | ADR | Disposition | §Context anchored | §Decision + §Consequences body lands | Lands-in-Task |

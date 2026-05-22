@@ -12292,8 +12292,8 @@ _(Lands at phase-23 IMPL. Will record: ZERO new framework primitive; the Clock-s
 
 ## ADR-0195: admission_control RTDS `runtime_key` deferral PARSE-REJECT — every `Runtime{FeatureFlag,Double,Percent,UInt32}` wrapper honored only for its static `default_value`; any non-empty `runtime_key` triggers HCM-parse-time PARSE-REJECT; `enabled`-absent ⇒ ENABLED (OPPOSITE of phase-21 adaptive_concurrency's ADR-0187 enabled-default-OFF)
 
-**Status:** §Context anchored at the phase-23 SPEC commit per ADR-0044 §Context-draft discipline; **§Decision + §Consequences bodies land at phase-23 IMPL** (the compiled_config + PARSE-REJECT roster Task) per ADR-0044 ADR-on-impl convention.
-**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit; §Decision + §Consequences body land at phase-23 IMPL).
+**Status:** Accepted — landed at phase-23 IMPL Task 2 (compiled_config + PARSE-REJECT roster materialization); §Context body unchanged from the phase-23 SPEC anchor commit `a64ee71` per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit `a64ee71`; §Decision + §Consequences body landed at phase-23 IMPL Task 2).
 **Doctrine:** Phase 23 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline. ADR-0080 byte-stable config-load wording. The phase-17/18/19/20/21 RTDS-deferral precedent (ADR-0187 nearest).
 **Lands-in:** Phase 23 IMPL compiled_config + PARSE-REJECT roster Task per PLAN.
 
@@ -12316,11 +12316,69 @@ Phase-21 ADR-0187 settled adaptive_concurrency as absent⇒OFF (because its `Run
 
 ### Decision
 
-_(Lands at phase-23 IMPL — the compiled_config + PARSE-REJECT roster Task. Will codify: the five `runtime_key`-non-empty PARSE-REJECT arms with byte-stable wording per SPEC §5.2; the `enabled` honored-matrix default-application per SPEC §5.3; the `default_value`-honoring of the numeric knobs. Per ADR-0044 in-place edit discipline.)_
+**Status: Accepted — landed at phase-23 IMPL Task 2 (this commit); §Context body unchanged from the phase-23 SPEC anchor commit `a64ee71` per ADR-0044 in-place edit discipline.**
+
+Phase-23 IMPL Task 2 materializes the admission_control RTDS `runtime_key` deferral PARSE-REJECT + `enabled`-field default-application at the exact call-site `internal/filter/http/admission_control/compiled_config.go::buildCompiledConfig`. The 5 envoy-go-strict §5.2 arms are checked in order after the 4 RATIFIED-from-config §5.1 arms.
+
+**Five envoy-go-strict PARSE-REJECT arms (§5.2 + ADR-0195) — byte-stable wording per ADR-0080:**
+
+| Arm | Trigger | Byte-stable error constant |
+|---|---|---|
+| 5 | `enabled.runtime_key != ""` | `parseRejectEnabledRuntimeKey` = `"admission_control: enabled.runtime_key is not yet supported; use enabled.default_value"` |
+| 6 | `aggression.runtime_key != ""` | `parseRejectAggressionRuntimeKey` = `"admission_control: aggression.runtime_key is not yet supported; use aggression.default_value"` |
+| 7 | `sr_threshold.runtime_key != ""` | `parseRejectSrThresholdRuntimeKey` = `"admission_control: sr_threshold.runtime_key is not yet supported; use sr_threshold.default_value"` |
+| 8 | `max_rejection_probability.runtime_key != ""` | `parseRejectMaxRejectionProbabilityRuntimeKey` = `"admission_control: max_rejection_probability.runtime_key is not yet supported; use max_rejection_probability.default_value"` |
+| 9 | `rps_threshold.runtime_key != ""` | `parseRejectRpsThresholdRuntimeKey` = `"admission_control: rps_threshold.runtime_key is not yet supported; use rps_threshold.default_value"` |
+
+Each constant is a package-level `const` string (NOT a `fmt.Errorf` format-string); `TestParseRejectConstants_ByteStable` asserts all 9 constants byte-exact against the PD-2 reference roster per ADR-0080. Each arm fires at HCM-build time per ADR-0072 boot-fail-fast; operators see a single, grep-friendly error string identifying the deferred field. The check is a two-liner per arm:
+
+```go
+if agg := ac.GetAggression(); agg != nil && agg.GetRuntimeKey() != "" {
+    return nil, errors.New(parseRejectAggressionRuntimeKey)
+}
+```
+
+**`enabled` honored-matrix default-application (per SPEC §5.3 + AMEND-4):**
+
+`cc.enabled` defaults to `true` at buildCompiledConfig entry (the AMEND-4 INVERSION vs phase-21 adaptive_concurrency which defaults `false`). The implementation:
+
+```go
+cc.enabled = true // AMEND-4 default: true when absent
+if en := ac.GetEnabled(); en != nil {
+    if dv := en.GetDefaultValue(); dv != nil {
+        cc.enabled = dv.GetValue()
+    }
+    // If default_value BoolValue is nil but enabled message is present,
+    // cc.enabled stays true (upstream PROTOBUF_GET_WRAPPED_OR_DEFAULT(...,true) fallback).
+}
+```
+
+The four-case honored matrix:
+
+| Case | `enabled` field | `default_value` | `runtime_key` | upstream | envoy-go |
+|---|---|---|---|---|---|
+| 1 | absent entirely | n/a | n/a | ENABLED (`…,true` fallback) | ENABLED (`cc.enabled=true` default — matches) |
+| 2 | present | `false` | `""` | DISABLED | DISABLED (`cc.enabled=false` — matches) |
+| 3 | present | `true` | `""` | ENABLED | ENABLED (`cc.enabled=true` — matches) |
+| 4 | present | any | `"key"` | runtime consults; falls back | **PARSE-REJECT** (arm 5 above) |
+
+Case 1b (enabled message present, BoolValue nil): `cc.enabled` stays `true` — same `…,true` fallback semantics per `runtime_protos.h:46`. `TestEnabledMatrix_Case1b_Present_DefaultValueAbsent_ENABLED` covers this boundary.
+
+**`default_value`-honoring for the numeric knobs:** each numeric wrapper (`aggression`, `sr_threshold`, `max_rejection_probability`, `rps_threshold`) is read via `GetDefaultValue()` when present; absent field ⇒ project-constant default applied. `sr_threshold` is clamped via `min(pct,100)/100` (mirrors upstream `admission_control.cc:61-64`); `aggression` is floored to 1.0 (mirrors `admission_control.cc:57-59`). `sampling_window` is rounded to whole seconds via integer `ms/1000` (mirrors `config.cc:33-35`).
+
+**Unit-test coverage:** `TestBuildCompiledConfig/PARSE_REJECT` (15 rows: 9 arms × 1-2 triggering variants); `TestBuildCompiledConfig/Defaults` (13 rows: sampling_window/aggression/sr_threshold/rps_threshold/max_rejection_probability/http_criteria/grpc_criteria absent + boundary variants); `TestBuildCompiledConfig/HappyPath` (1 row, fully-populated baseline); `TestBuildCompiledConfig/NilTypedConfig`; `TestBuildCompiledConfig/UnmarshalFailure`; `TestEnabledMatrix` (5 rows: the 4-case matrix + case 1b boundary); `TestIsHTTPSuccess` + `TestIsGRPCSuccess` (predicate coverage); `TestParseRejectConstants_ByteStable` (9 rows, byte-exact assertions on all 9 constants).
 
 ### Consequences
 
-_(Lands at phase-23 IMPL. Will record: operators configure static thresholds via the wrapper `default_value`s; runtime keying is a forward-pointer to the Runtime/RTDS family phase; the SINGLE envoy-go-strict departure record at BEHAVIOR_CONTRACT `### envoy.filters.http.admission_control` — the RTDS `runtime_key` PARSE-REJECT departure, count 14 → 15; the absent⇒ENABLED upstream-parity matrix.)_
+**(a) Operator migration path:** operators currently relying on upstream's `runtime_key` semantics for any of the five Runtime-keyed wrappers MUST migrate to the corresponding static `default_value` field at phase-23. The byte-stable PARSE-REJECT wording is grep-friendly and identifies the exact field to migrate. When the Runtime/RTDS family phase lands, the 5 PARSE-REJECT arms lift to behavioral paths that consult the runtime layer + fall back to `default_value`; the error constants are preserved verbatim for the migration path.
+
+**(b) Static-threshold configuration:** operators configure `aggression`, `sr_threshold`, `max_rejection_probability`, and `rps_threshold` via their wrapper `default_value` fields. `sampling_window` is a plain Duration proto with no runtime wrapper. All knobs are honored in their static form at phase-23 MVP.
+
+**(c) SINGLE envoy-go-strict departure record (count 14 → 15):** the 5-arm `runtime_key` PARSE-REJECT block is the SINGLE envoy-go-strict departure added at phase-23. It lands at BEHAVIOR_CONTRACT `### envoy.filters.http.admission_control` at Task 11 (the 4-edit BEHAVIOR_CONTRACT bundle per ADR-0052). Departure count 14 → 15. The departure is stricter than upstream (which honors `runtime_key`); it is NOT a cross-side differential fixture candidate (upstream ACCEPTS `runtime_key`, so a matching boot-reject diverges by design — it is unit-tested + BEHAVIOR_CONTRACT-recorded, per SPEC §5.2 + §7.2).
+
+**(d) Absent⇒ENABLED upstream-parity:** `cc.enabled = true` as the buildCompiledConfig default is upstream-parity (matches upstream's `PROTOBUF_GET_WRAPPED_OR_DEFAULT(…,true)` mechanism per `runtime_protos.h:46`). This is NOT an envoy-go divergence — both upstream and envoy-go agree that absent `enabled` ⇒ filter ON. It IS an inversion relative to phase-21 adaptive_concurrency's ADR-0187 (which uses absent⇒OFF because adaptive_concurrency does not use the `…,true` fallback macro); the two are both upstream-parity for their respective filters.
+
+**(e) Forward-pointer to the Runtime/RTDS family phase:** when the Runtime/RTDS family phase lands, the 5 envoy-go-strict PARSE-REJECT arms are the exact call-sites to lift. Each arm is a two-line check (`if field != nil && field.GetRuntimeKey() != "" { return nil, errors.New(…) }`); the lift replaces each check with a runtime-layer consultation + `default_value` fallback. No new `compiledConfig` fields are needed (the runtime layer provides the live value at request time, not at parse time).
 
 **Cross-references:** ADR-0194 (paired algorithm + package-shape ADR); ADR-0187 (phase-21 adaptive_concurrency RTDS-deferral precedent — nearest; the `enabled`-default INVERTS at phase-23 per AMEND-4); ADR-0080 (byte-stable config-load wording); ADR-0052 (atomic BEHAVIOR_CONTRACT landing); ADR-0044 (§Context-draft discipline + ADR-on-impl convention); phase-23 BRAINSTORM §2.1 + §7.2 + §8 item 1; phase-23 SPEC §2.1 + §5.2 + §5.3 + §11 (D-followup A) + §13.
 
