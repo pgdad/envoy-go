@@ -384,6 +384,18 @@ type EncoderFilterCallbacks interface {
 	// surface. Cross-phase reusable for cross-filter encode-side state
 	// propagation.
 	DynamicMetadata() *dynamicmetadata.Bucket
+
+	// ResponseStatus returns the HTTP response status code for the stream
+	// being encoded (e.g. 200, 503), as set by HCM dispatch before the encode
+	// chain runs. Returns 0 if unset (e.g. a synthetic stream with no status).
+	// Mirrors the set-once-by-dispatch / read-via-accessor discipline used for
+	// DownstreamRemoteAddr et al. (ADR-0165). Added per ADR-0196.
+	//
+	// Seeded once per stream by HCM dispatch (connection.go H1 /
+	// h2dispatch.go H2 / chain.go beginLocalReply) via SetEncodeResponseStatus
+	// BEFORE RunEncodeHeaders. Cross-phase reusable: any encode-side filter that
+	// classifies or gates on the HTTP response status reads it here.
+	ResponseStatus() int
 }
 
 // Compile-time assertion: a real concrete proto type satisfies proto.Message,

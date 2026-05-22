@@ -962,6 +962,7 @@ func (e *fakeEncoderCB) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (e *fakeEncoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (e *fakeEncoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+func (e *fakeEncoderCB) ResponseStatus() int                                { return 0 } // ADR-0196; bandwidthlimit does not consume the encode-side status.
 
 // ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
 // body-buffering framework primitive). Zero-value return preserves the

@@ -431,6 +431,10 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// after the original carrier.
 	if rf.ActionRan() && status > 0 && actionErr == nil {
 		merged := resp.Headers.ToHTTPHeader()
+		// Seed the encode-side response-status accessor (ADR-0196) so encode-
+		// side classifying filters (e.g. admission_control) observe resp.Status,
+		// which the encode header map does not carry (:status is not present).
+		chain.SetEncodeResponseStatus(status)
 		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
 			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime)
 			return err

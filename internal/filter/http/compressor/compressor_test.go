@@ -1112,6 +1112,7 @@ func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (c *fakeCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+func (c *fakeCallbacks) ResponseStatus() int                                { return 0 } // ADR-0196; compressor reads :status via its best-effort header bucket, not this accessor.
 
 // ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
 // body-buffering framework primitive). Zero-value return; compressor does

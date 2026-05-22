@@ -84,6 +84,10 @@ func (c *fakeEncoderCB) BufferEncodedBody() []byte { return nil }
 func (c *fakeEncoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *fakeEncoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
+// ADR-0196 encode-side response-status accessor stub. Zero-value return keeps
+// the TestEncoderFilterCallbacks_Compile compile-time conformance assertion green.
+func (c *fakeEncoderCB) ResponseStatus() int { return 0 }
+
 func TestEncoderFilterCallbacks_Compile(t *testing.T) {
 	var _ EncoderFilterCallbacks = (*fakeEncoderCB)(nil)
 }

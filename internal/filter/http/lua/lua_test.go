@@ -132,6 +132,7 @@ func (c *recordedECB) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (c *recordedECB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *recordedECB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+func (c *recordedECB) ResponseStatus() int                                { return 0 } // ADR-0196; lua does not consume the encode-side status.
 
 // newTestFilter constructs a *filter with the supplied script compiled
 // into a *compiledConfig (with a stat-bearing filterStats wired to a

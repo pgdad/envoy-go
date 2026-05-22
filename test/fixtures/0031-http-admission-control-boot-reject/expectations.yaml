@@ -1,0 +1,31 @@
+# Fixture 0031-http-admission-control-boot-reject — boot-reject expectations.
+#
+# Per phase-23 SPEC §7.2 + §5.1 row 2 + AMEND-8 + Task 9 brief.
+#
+# Fixture type: BOOT-REJECT (BootRejectFixture interface). The runner's
+# runBootRejectFixture branch asserts:
+#   1. Both reference Envoy v1.37.2 AND envoy-go fail to boot (exit non-zero).
+#   2. BOTH captured stderr buffers contain the common substring
+#      "cannot be less than 1.0%" (case-sensitive Contains).
+#
+# Boot-reject trigger:
+#   sr_threshold.default_value.value = 0.5 (< 1.0%)
+#
+# §5.1 arm 2 wording per SPEC table:
+#   upstream: "Success rate threshold cannot be less than 1.0%."  (config.cc:25-27)
+#   envoy-go: "admission_control: sr_threshold cannot be less than 1.0%"
+#
+# Common substring in both stderr outputs: "cannot be less than 1.0%"
+#
+boot_reject:
+  trigger: "sr_threshold.default_value.value: 0.5  (< 1.0%)"
+  expected_substring: "cannot be less than 1.0%"
+  upstream_stderr_excerpt: "Success rate threshold cannot be less than 1.0%."
+  envoy_go_stderr_excerpt: "admission_control: sr_threshold cannot be less than 1.0%"
+  rationale: >
+    SPEC §5.1 arm 2 (config.cc:25-27 per AMEND-8): the sr_threshold
+    value 0.5 is less than 1.0 (the threshold is the raw percentage value
+    — 0.5 means 0.5%, which is less than the 1.0% minimum). Both upstream
+    Envoy and envoy-go reject this at config-load with distinctive stderr
+    messages sharing the substring "cannot be less than 1.0%". This is the
+    cleanest shared boot-reject for the admission_control filter per SPEC §7.2.

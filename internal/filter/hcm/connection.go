@@ -639,6 +639,10 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	status := resp.Status
 	if rf.ActionRan() && status > 0 && actionErr == nil {
 		merged := resp.Headers.ToHTTPHeader()
+		// Seed the encode-side response-status accessor (ADR-0196) so encode-
+		// side classifying filters (e.g. admission_control) observe resp.Status,
+		// which the encode header map does not carry (:status is not present).
+		chain.SetEncodeResponseStatus(status)
 		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
 			return status, err
 		}

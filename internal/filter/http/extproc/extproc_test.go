@@ -1038,6 +1038,7 @@ func (f *fakeECB) BufferEncodedBody() []byte        { return nil } // ADR-0175 (
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (f *fakeECB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (f *fakeECB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+func (f *fakeECB) ResponseStatus() int                                { return 0 } // ADR-0196; extproc does not consume the encode-side status.
 
 func (f *fakeECB) calls() int {
 	f.mu.Lock()

@@ -27,6 +27,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/adaptive_concurrency"
+	"github.com/esalaine/envoy-go/internal/filter/http/admission_control"
 	"github.com/esalaine/envoy-go/internal/filter/http/bandwidthlimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/buffer"
 	"github.com/esalaine/envoy-go/internal/filter/http/compressor"
@@ -126,6 +127,7 @@ func main() {
 	httpReg := filter_http.NewHTTPRegistry()
 	httpReg.Register(router.TypeURL, router.New)
 	httpReg.Register(adaptive_concurrency.TypeURL, adaptive_concurrency.New)
+	httpReg.Register(admission_control.TypeURL, admission_control.New)
 	httpReg.Register(bandwidthlimit.TypeURL, bandwidthlimit.New)
 	httpReg.Register(buffer.TypeURL, buffer.New)
 	httpReg.Register(compressor.TypeURL, compressor.New)

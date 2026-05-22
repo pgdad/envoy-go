@@ -143,6 +143,18 @@ type FilterChain struct {
 	downstreamProtocol       string
 	listenerPrincipal        string
 
+	// encodeResponseStatus carries the HTTP response status code (e.g. 200,
+	// 503) for the stream being encoded. Set ONCE by HCM dispatch via
+	// SetEncodeResponseStatus (connection.go H1 + h2dispatch.go H2 from
+	// resp.Status, and the beginLocalReply path from the local-reply status)
+	// BEFORE RunEncodeHeaders dispatch; read by per-stream
+	// encoderCB.ResponseStatus() callbacks during encode-filter iteration.
+	// Zero-value 0 = unset (synthetic stream with no status). Mirrors the
+	// set-once-by-dispatch / read-via-accessor discipline of downstreamProtocol
+	// et al. (ADR-0165); the single-dispatch-goroutine invariant (ADR-0071)
+	// applies — no mutation across filter dispatch. Added per ADR-0196.
+	encodeResponseStatus int
+
 	// tlsConnectionState carries the FULL *tls.ConnectionState extracted by
 	// HCM dispatch from the downstream *tls.Conn at chain build time. Nil
 	// for plaintext / non-mTLS connections (HCM dispatch elides
@@ -794,6 +806,11 @@ func (e *encoderCB) ListenerPrincipal() string {
 	return e.c.listenerPrincipal
 }
 
+// ResponseStatus reads the chain's encodeResponseStatus field per ADR-0196.
+func (e *encoderCB) ResponseStatus() int {
+	return e.c.encodeResponseStatus
+}
+
 // DownstreamTLSConnectionState (encoder side) reads the SAME chain field the
 // decoder side reads — no separate chain field, no separate seeding. HCM
 // dispatch sets via SetTLSConnectionState BEFORE either RunDecodeHeaders OR
@@ -953,6 +970,17 @@ func (c *FilterChain) SetListenerPrincipal(p string) {
 	c.listenerPrincipal = p
 }
 
+// SetEncodeResponseStatus seeds the chain's per-stream HTTP response status
+// code field. Called by HCM dispatch (connection.go H1 / h2dispatch.go H2 from
+// resp.Status, and the beginLocalReply path from the local-reply status) ONCE
+// BEFORE RunEncodeHeaders dispatch; read by per-stream encoderCB.ResponseStatus()
+// callbacks during encode-filter iteration. Mirrors the SetDownstreamProtocol
+// set-once discipline (ADR-0165): single dispatch-goroutine invariant per
+// ADR-0071, no synchronization required. Added per ADR-0196.
+func (c *FilterChain) SetEncodeResponseStatus(status int) {
+	c.encodeResponseStatus = status
+}
+
 // SetDiagLogWriter overrides the destination for framework diagnostic log
 // lines. Test-only helper: production callers leave this unset (the default
 // destination is os.Stderr). The TestChain_SendLocalReply_SecondCallAfterEncodeStartedLogs
@@ -1017,6 +1045,11 @@ func (c *FilterChain) beginLocalReply(ctx context.Context, callerIdx int, status
 		// The status int is consumed by the HCM wire-write layer (Task 13) on
 		// the response status-line; the framework's beginLocalReply does not
 		// emit a status code itself, only the response headers + body.
+		// Seed the encode-side response-status accessor (ADR-0196) from the
+		// local-reply status so encode-side classifying filters (e.g.
+		// admission_control) observe the same status the wire will carry —
+		// e.g. a 503 SendLocalReply from another filter classifies as failure.
+		c.SetEncodeResponseStatus(status)
 		// Run the encode chain. Errors here propagate to logs only — at this
 		// point the request has already reached SendLocalReply and there is
 		// no upstream to report failure to.

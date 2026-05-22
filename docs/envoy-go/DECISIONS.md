@@ -12267,10 +12267,10 @@ internal/filter/http/lua/  (post-22.3 roster delta)
 
 ## ADR-0194: NEW `internal/filter/http/admission_control/` package — SRE-book client-side admission-control algorithm + inline `Rand` (`Uint64()`) + inline `Clock` (`Now()`) seams (NOT framework primitives) + deque-of-per-second-buckets sliding window + integer-modulo reject decision + deterministic-regime differential strategy
 
-**Status:** §Context anchored at the phase-23 SPEC commit per ADR-0044 §Context-draft discipline; **§Decision + §Consequences bodies land at phase-23 IMPL** (the controller + filter materialization Task) per ADR-0044 ADR-on-impl convention.
-**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit; §Decision + §Consequences body land at phase-23 IMPL).
+**Status:** Accepted — landed at phase-23 IMPL Task 4 (controller + formula + integer-modulo decision materialization); §Context body unchanged from the phase-23 SPEC anchor commit `a64ee71` per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit `a64ee71`; §Decision + §Consequences body landed at phase-23 IMPL Task 4).
 **Doctrine:** Phase 23 §9 family-row (SIXTEENTH). ADR-0044 ADR-on-impl convention + §Context-draft discipline. ADR-0072 HTTPRegistry boot-fail-fast. ADR-0114 single-token-package precedent.
-**Lands-in:** Phase 23 IMPL controller + filter materialization Task per PLAN.
+**Lands-in:** Phase 23 IMPL Task 4 (controller + filter materialization) per PLAN.
 
 ### Context
 
@@ -12280,11 +12280,121 @@ The package owns: (a) the per-HCM-instance sliding-window success-rate controlle
 
 ### Decision
 
-_(Lands at phase-23 IMPL — the controller + filter materialization Task. Will codify: the package shape + `TypeURL` + `New` factory; the `controller` state machine + the formula + the integer-modulo decision with line-exact lemmata; the inline `Rand`/`Clock` seam signatures; the success/error classification; the deque-window mechanics. Per ADR-0044 in-place edit discipline.)_
+**Status: Accepted — landed at phase-23 IMPL Task 4 (this commit); §Context body unchanged from the phase-23 SPEC anchor commit `a64ee71` per ADR-0044 in-place edit discipline.**
+
+Phase-23 IMPL Task 4 materializes the admission-control algorithm at `internal/filter/http/admission_control/controller.go` (~220 LoC) + the Layer A FAKE-TIME algorithmic-fidelity tests at `internal/filter/http/admission_control/controller_test.go` (~600 LoC).
+
+**(i) Package shape + `TypeURL` + `New` factory (PD-1).** The package identifier is `admission_control` (Go-style underscored per ADR-0114 + `header_mutation` / `adaptive_concurrency` precedent). `TypeURL = "type.googleapis.com/envoy.extensions.filters.http.admission_control.v3.AdmissionControl"`. The `New` factory signature matches the `HTTPFilterFactory` shape per `internal/filter/http/types.go:245`:
+
+```go
+func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFactory, error)
+```
+
+`ctx.Stats` is the `*stats.Registry`; `ctx.StatPrefix` is the HCM `http.<stat_prefix>` root; matches the `adaptive_concurrency.go:108` precedent verbatim (PD-1 settled at Task 5 + Task 8).
+
+**(ii) `controller` + `bucket` Go-struct shape (per SPEC §6.2).** All window state is held under `mu sync.Mutex`:
+
+```go
+type controller struct {
+    cfg   *compiledConfig
+    stats *filterStats
+    clock Clock
+    rand  Rand
+
+    mu      sync.Mutex
+    buckets []bucket // per-second deque (oldest..newest) per AMEND-6
+    global  struct{ requests, successes uint64 }
+}
+
+type bucket struct {
+    ts        time.Time
+    requests  uint64
+    successes uint64
+}
+```
+
+`newController(cfg, stats, clock, rand)` constructs the zero-state controller. Unlike phase-21 adaptive_concurrency, admission_control has no hot-path lock-free atomics — upstream's `thread_local_controller` is thread-local-per-worker (no contention by design); envoy-go's single-controller-per-HCM-instance model uses `mu` for all access.
+
+**(iii) Sliding-window mechanics (AMEND-6 + PD-7), line-cited against `thread_local_controller.cc`.** Three methods mirror upstream:
+
+`recordRequest(success bool)` (`:30-54`):
+1. Purge stale buckets from the front whose `age > samplingWindow`, decrementing `global` by each purged bucket's totals (mirrors `maybeUpdateHistoricalData` purge loop `:30-44`).
+2. Roll a new bucket if the newest bucket's `ts` is ≥ 1s older than `clock.Now()` (1s granularity per `defaultHistoryGranularity{1}` at `:14`; mirrors `:45-50`).
+3. Increment the back bucket's `requests` (+ `successes` if success) and `global` correspondingly (`:51-54`).
+
+`requestCounts() (n, s uint64)` (`:67-70`): purges stale buckets then returns `global.requests, global.successes`.
+
+`averageRps() uint32` (`:20-28`): returns 0 if window empty; else computes `denomSecs = max(samplingWindow_secs, age_of_oldest_bucket_secs)` (truncating to whole seconds via `int64(duration.Seconds())`); returns `uint32(global.requests / uint64(denomSecs))`. Mirrors upstream:
+```cpp
+auto window_length = std::max(sampling_window_,
+    time_source_.monotonicTime() - buckets_.front().first);
+return global_data_.requests / duration_cast<seconds>(window_length).count();
+```
+
+**(iv) Rejection-probability formula (AMEND-1), line-cited against `admission_control.cc:161-179`.** `shouldReject()` calls `requestCounts()` then:
+
+```go
+inner := (totalRequests - successfulRequests/cfg.srThreshold) / (totalRequests + 1)  // :167-168
+var p float64
+if cfg.aggression == 1.0 {
+    p = inner                                       // :170-171 guard — skip Pow at default
+} else {
+    p = math.Pow(inner, 1.0/cfg.aggression)         // :170-171
+}
+p = math.Min(cfg.maxRejectionProbability, p)        // :173
+```
+
+Three AMEND-1 lemmata faithfully mirrored:
+- `sr_threshold` DIVIDES the success count: `successful/srThreshold` in the numerator (`:167`) — NOT a separate gate.
+- `aggression` is an EXPONENT floored to 1.0 at config-time (Task 2 `buildCompiledConfig`): `math.Pow(inner, 1/aggression)` applied to the whole clamped fraction, skipped when `aggression == 1.0` (the `if (aggression != 1.0)` guard at `:170-171`).
+- `maxRejectionProbability` clamps via `math.Min` (`:173`); the `max(0,·)` floor is applied inline at the decision site.
+
+**(v) Integer-modulo reject decision (AMEND-2 + PD-6), line-cited against `admission_control.cc:175-178`.** After computing `p`:
+
+```go
+r := c.rand.Uint64()
+return float64(10000)*math.Max(p, 0.0) > float64(r%10000)
+```
+
+Mirrors upstream exactly:
+```cpp
+static constexpr uint64_t accuracy = 1e4;          // :176
+auto r = config_->random().random();               // :177
+return (accuracy * std::max(probability, 0.0)) > (r % accuracy);  // :178
+```
+
+STRICT `>`. Boundary lemmata (SPEC §12 B4 RATIFIED):
+- `r%10000 == floor(10000·P)` where `10000·P` is an exact integer → `10000·P > floor(10000·P)` is FALSE → **ADMIT** (equality).
+- `r%10000 == floor(10000·P)−1` → `10000·P > floor(10000·P)−1` is TRUE → **REJECT**.
+- P=0 → `0 > (r%10000)` is FALSE for every `r` → **NEVER REJECT** — the RNG-independent all-admit leg (cross-side byte-exact per AMEND-2 + SPEC §7.1).
+
+**(vi) Inline `Rand` (`Uint64()`) + `Clock` (`Now()`) seam signatures (NOT framework primitives, per SPEC §3.1 + §3.2).** `Rand` interface exposes `Uint64() uint64` (mirroring `Random::RandomGenerator::random()`; `Uint64` NOT `Float64` per AMEND-2); `defaultRand` wraps `math/rand/v2`. `Clock` interface exposes `Now() time.Time` (for bucket rollover/expiry reads; `Now()`-ONLY, no `AfterFunc`); `defaultClock` wraps `time.Now`. Both seams land at `rand.go` + `clock.go`. Consumer counts: `Rand` = 1 (stays inline trivially); `Clock`-shaped = 2 (phase-21 + phase-23) but shapes differ (phase-21 = `Now()`+`AfterFunc`; phase-23 = `Now()`-only), so shared extraction would over-fit — forward-pointer at SPEC §8 item 8.
+
+**(vii) Success/error classification discipline (AMEND-5 + AMEND-10 + AMEND-11).** `classify(success bool)` calls `recordRequest(success)` then increments `stats.rqSuccess.Inc()` (success) or `stats.rqFailure.Inc()` (failure). Called by `EncodeHeaders` + `EncodeTrailers` (Tasks 5/6). The deliberately-NOT-recorded cases (per AMEND-11): rejected requests (`record_request_ = false` set at the reject site, `:98`), health-check requests (`:81-85`; NOT-MODELED at MVP per PD-3 — no `IsHealthCheck()` on envoy-go `DecoderFilterCallbacks`), and disabled-filter requests (`:81-83`). The distinction between `classify` (called by encode hooks on admitted requests) and `recordRequest` (internal; called by `classify`) is the key AMEND-11 surface: `recordRequest` updates the window only; `classify` updates the window AND the stat counters.
+
+**(viii) `classify` vs `recordRequest` stat-counter discipline.** `recordRequest` is called by `classify`; it updates the window but does NOT touch the stat counters. `classify` is the only entry point that increments `rqSuccess` / `rqFailure`. The decode-side reject path (Task 5) increments `rqRejected` directly at the reject site and does NOT call `classify`.
+
+**(ix) Both-sides decode-gate/encode-classify discipline (SPEC §4.1 + §4.4).** `DecodeHeaders` gates in order: (1) `!cc.enabled` → pass-through (not recorded per AMEND-11; health-check NOT-MODELED at MVP per PD-3); (2) `averageRps() < rpsThreshold` → pass-through (IS recorded at encode; RPS suppression does not block classification per upstream `:87-91`); (3) `shouldReject()` → `rqRejected.Inc()` + `SendLocalReply(503, "", nil)` + `StopIteration` (not recorded per AMEND-11). `EncodeHeaders`/`EncodeTrailers` call `classify` for admitted non-rejected requests only (guarded by `f.record` per AMEND-11). Lands at Tasks 5/6.
+
+**(x) Layer A FAKE-TIME test taxonomy (SPEC §14.1).** `controller_test.go` lands 6 families:
+- `TestShouldReject_Boundary_*` — P=0.80 knife-edge at `r%10000==8000` (ADMIT at equality per strict `>`); one-below-knife-edge REJECTS; P=0 never rejects for all r values (cross-side byte-exact leg, SPEC §12 B4 RATIFIED).
+- `TestProbabilityFormula_*` — formula vector tests: default params; aggression-exponent skipped at 1.0; sr_threshold-divides-successes; maxRejP clamp; max(0,·) floor.
+- `TestController_FAKE_TIME_Window_*` — per-second bucket rollover + stale-purge over `samplingWindow` via `fakeClock.Advance`; `requestCounts()` aggregate; `averageRps()` (0 empty; n/secs denominator).
+- `TestRpsSuppression_*` — `averageRps()` denominator correctness (sampling-window vs age-of-oldest-bucket).
+- `TestRecordDiscipline_*` — `classify(true/false)` increments the right counter AND the window; `recordRequest` does NOT increment counters.
+- `TestController_Concurrent_*` — race tests: concurrent `recordRequest`/`classify`/`shouldReject`/`averageRps` under `mu`; no data race; no deadlock.
 
 ### Consequences
 
-_(Lands at phase-23 IMPL. Will record: ZERO new framework primitive; the Clock-shaped EXTRACT-NOW forward-pointer (consumer count 2; shapes differ; deferred per SPEC §8 item 8); the 3-counter byte-exact stat surface (107 → 110, no gauges); the deterministic-regime differential coverage; the D-style hypothesis disposition — ADR-0196 UNCONSUMED at phase-done, HOLD-with-known-risk.)_
+**(a) ZERO new `internal/` framework primitives.** Phase-23 returns to phase-21's LEAN posture — no new `internal/` packages. Both `Rand` and `Clock` seams stay inline in `internal/filter/http/admission_control/`. `internal/stats/` consumed read-only (existing Counter support; no new primitives). Gate A build + Gate B vet/lint + Gate C race confirm zero framework regression.
+
+**(b) Clock-shaped EXTRACT-NOW forward-pointer (consumer count 2; shapes differ; deferred).** The `Clock` seam consumer count is now 2 (phase-21 `adaptive_concurrency/clock.go` + phase-23 `admission_control/clock.go`), which meets the documented EXTRACT-NOW trigger threshold. However, the two shapes differ materially: phase-21 requires `Now()` + `AfterFunc(d, fn) Stop` (timer cascade for the `sampleResetTimer` + `minRTTCalcTimer` periodic callbacks); phase-23 requires `Now()` ONLY (per-call reads to drive bucket rollover/expiry, no background timers). A shared `internal/clock/` extraction would over-fit to the divergent shapes (producing a two-method interface that phase-23 would implement with a no-op `AfterFunc`). Phase-23 records the convergence question as a forward-pointer (SPEC §8 item 8) and defers extraction until a third timer/clock-driven filter with a convergent shape lands. Per phase-17 jwt_authn EXTRACT-NOW-only-when-trigger-genuinely-fires lesson.
+
+**(c) 3-counter byte-exact stat surface (107 → 110, no gauges).** The `filterStats` type holds exactly 3 `*stats.Counter` fields: `rqRejected` / `rqSuccess` / `rqFailure` (NOT `rq_error` per AMEND-3 D1). The `ALL_ADMISSION_CONTROL_STATS(COUNTER)` macro at `admission_control.h:35-38` takes ONLY a `COUNTER` argument — no `GAUGE`/`HISTOGRAM` parameters — so ZERO gauges, ZERO histograms. Project stat count advances 107 → 110 (+3 counters). Stat-prefix template `http.<HCM_stat_prefix>.admission_control.<stat>` (the `admission_control.` literal infix per `config.cc:29`; no sub-infix like `gradient_controller.`).
+
+**(d) Deterministic-regime differential coverage (all-admit P=0 cross-side; forced-reject subject-only).** The all-admit `P=0` healthy-backend leg is fully RNG-independent: `0 > (r%10000)` is FALSE for every `r` ∈ [0, 10000) ⇒ cross-side byte-exact against reference Envoy v1.37.2 (fixture `0030` scenario (b)). The forced-reject leg stays SUBJECT-ONLY structural: byte-exact forced-reject requires `P > 0.9999` (i.e., `10000·P > 9999`), achievable with N≥10000 primed failures in one window on one worker — impractical/fragile in a differential harness (per AMEND-2 + SPEC §11 D2). Reject-path byte shape (503 / empty body / `denied_by_admission_control` rc-details) asserted subject-only against the D4 SPEC-time capture at Task 5.
+
+**(e) ~~ADR-0196 UNCONSUMED at phase-done — HOLD-with-known-risk.~~ SUPERSEDED — see ADR-0196 + Task 9a + Task 10.** The planner-time D-style hypothesis per SPEC §10 predicted ADR-0196 would stay unconsumed. That hypothesis BROKE during differential testing at Task 9: the PD-5 `:status`-via-header assumption was proven INVALID by fixture 0030, and the project owner approved the `ResponseStatus()` encode-side framework accessor fix. ADR-0196 was CONSUMED at Task 9a; next-free advances to **ADR-0197**. The "ZERO new framework primitives" claim is REVISED: phase-23 introduces ONE new encode-side callback primitive (ADR-0196). See ADR-0196 §Consequences (a)+(b) for the authoritative record.
 
 **Cross-references:** ADR-0195 (paired RTDS `runtime_key` deferral PARSE-REJECT + enabled-absent-ENABLED semantics); ADR-0186 + ADR-0187 (phase-21 adaptive_concurrency precedent — inline `Clock` seam + RTDS deferral; phase-23 mirrors the inline-seam discipline but the `enabled`-default INVERTS — adaptive_concurrency absent⇒OFF vs admission_control absent⇒ON per AMEND-4); ADR-0143 (SN2 HCM-injected stat-prefix reuse); ADR-0080 (byte-stable PARSE-REJECT wording); ADR-0052 (atomic BEHAVIOR_CONTRACT landing); ADR-0072 + ADR-0100 §2.2 (boot-registration alphabetical discipline); ADR-0114 (underscored single-token package identifier); ADR-0044 (§Context-draft discipline + ADR-on-impl convention); ADR-0045 (split-gate — single-row landing); ADR-0125 (per-route canonical roster — NOT amended at phase 23; REUSE-by-absence; roster STAYS 9); phase-23 BRAINSTORM §1.1 + §2.2 + §2.3 + §2.5 + §5 + §6 + §10; phase-23 SPEC §1 + §3 + §4 + §5 + §6 + §7 + §11 + §13 + §15.
 
@@ -12292,8 +12402,8 @@ _(Lands at phase-23 IMPL. Will record: ZERO new framework primitive; the Clock-s
 
 ## ADR-0195: admission_control RTDS `runtime_key` deferral PARSE-REJECT — every `Runtime{FeatureFlag,Double,Percent,UInt32}` wrapper honored only for its static `default_value`; any non-empty `runtime_key` triggers HCM-parse-time PARSE-REJECT; `enabled`-absent ⇒ ENABLED (OPPOSITE of phase-21 adaptive_concurrency's ADR-0187 enabled-default-OFF)
 
-**Status:** §Context anchored at the phase-23 SPEC commit per ADR-0044 §Context-draft discipline; **§Decision + §Consequences bodies land at phase-23 IMPL** (the compiled_config + PARSE-REJECT roster Task) per ADR-0044 ADR-on-impl convention.
-**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit; §Decision + §Consequences body land at phase-23 IMPL).
+**Status:** Accepted — landed at phase-23 IMPL Task 2 (compiled_config + PARSE-REJECT roster materialization); §Context body unchanged from the phase-23 SPEC anchor commit `a64ee71` per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit `a64ee71`; §Decision + §Consequences body landed at phase-23 IMPL Task 2).
 **Doctrine:** Phase 23 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline. ADR-0080 byte-stable config-load wording. The phase-17/18/19/20/21 RTDS-deferral precedent (ADR-0187 nearest).
 **Lands-in:** Phase 23 IMPL compiled_config + PARSE-REJECT roster Task per PLAN.
 
@@ -12316,13 +12426,114 @@ Phase-21 ADR-0187 settled adaptive_concurrency as absent⇒OFF (because its `Run
 
 ### Decision
 
-_(Lands at phase-23 IMPL — the compiled_config + PARSE-REJECT roster Task. Will codify: the five `runtime_key`-non-empty PARSE-REJECT arms with byte-stable wording per SPEC §5.2; the `enabled` honored-matrix default-application per SPEC §5.3; the `default_value`-honoring of the numeric knobs. Per ADR-0044 in-place edit discipline.)_
+**Status: Accepted — landed at phase-23 IMPL Task 2 (this commit); §Context body unchanged from the phase-23 SPEC anchor commit `a64ee71` per ADR-0044 in-place edit discipline.**
+
+Phase-23 IMPL Task 2 materializes the admission_control RTDS `runtime_key` deferral PARSE-REJECT + `enabled`-field default-application at the exact call-site `internal/filter/http/admission_control/compiled_config.go::buildCompiledConfig`. The 5 envoy-go-strict §5.2 arms are checked in order after the 4 RATIFIED-from-config §5.1 arms.
+
+**Five envoy-go-strict PARSE-REJECT arms (§5.2 + ADR-0195) — byte-stable wording per ADR-0080:**
+
+| Arm | Trigger | Byte-stable error constant |
+|---|---|---|
+| 5 | `enabled.runtime_key != ""` | `parseRejectEnabledRuntimeKey` = `"admission_control: enabled.runtime_key is not yet supported; use enabled.default_value"` |
+| 6 | `aggression.runtime_key != ""` | `parseRejectAggressionRuntimeKey` = `"admission_control: aggression.runtime_key is not yet supported; use aggression.default_value"` |
+| 7 | `sr_threshold.runtime_key != ""` | `parseRejectSrThresholdRuntimeKey` = `"admission_control: sr_threshold.runtime_key is not yet supported; use sr_threshold.default_value"` |
+| 8 | `max_rejection_probability.runtime_key != ""` | `parseRejectMaxRejectionProbabilityRuntimeKey` = `"admission_control: max_rejection_probability.runtime_key is not yet supported; use max_rejection_probability.default_value"` |
+| 9 | `rps_threshold.runtime_key != ""` | `parseRejectRpsThresholdRuntimeKey` = `"admission_control: rps_threshold.runtime_key is not yet supported; use rps_threshold.default_value"` |
+
+Each constant is a package-level `const` string (NOT a `fmt.Errorf` format-string); `TestParseRejectConstants_ByteStable` asserts all 9 constants byte-exact against the PD-2 reference roster per ADR-0080. Each arm fires at HCM-build time per ADR-0072 boot-fail-fast; operators see a single, grep-friendly error string identifying the deferred field. The check is a two-liner per arm:
+
+```go
+if agg := ac.GetAggression(); agg != nil && agg.GetRuntimeKey() != "" {
+    return nil, errors.New(parseRejectAggressionRuntimeKey)
+}
+```
+
+**`enabled` honored-matrix default-application (per SPEC §5.3 + AMEND-4):**
+
+`cc.enabled` defaults to `true` at buildCompiledConfig entry (the AMEND-4 INVERSION vs phase-21 adaptive_concurrency which defaults `false`). The implementation:
+
+```go
+cc.enabled = true // AMEND-4 default: true when absent
+if en := ac.GetEnabled(); en != nil {
+    if dv := en.GetDefaultValue(); dv != nil {
+        cc.enabled = dv.GetValue()
+    }
+    // If default_value BoolValue is nil but enabled message is present,
+    // cc.enabled stays true (upstream PROTOBUF_GET_WRAPPED_OR_DEFAULT(...,true) fallback).
+}
+```
+
+The four-case honored matrix:
+
+| Case | `enabled` field | `default_value` | `runtime_key` | upstream | envoy-go |
+|---|---|---|---|---|---|
+| 1 | absent entirely | n/a | n/a | ENABLED (`…,true` fallback) | ENABLED (`cc.enabled=true` default — matches) |
+| 2 | present | `false` | `""` | DISABLED | DISABLED (`cc.enabled=false` — matches) |
+| 3 | present | `true` | `""` | ENABLED | ENABLED (`cc.enabled=true` — matches) |
+| 4 | present | any | `"key"` | runtime consults; falls back | **PARSE-REJECT** (arm 5 above) |
+
+Case 1b (enabled message present, BoolValue nil): `cc.enabled` stays `true` — same `…,true` fallback semantics per `runtime_protos.h:46`. `TestEnabledMatrix_Case1b_Present_DefaultValueAbsent_ENABLED` covers this boundary.
+
+**`default_value`-honoring for the numeric knobs:** each numeric wrapper (`aggression`, `sr_threshold`, `max_rejection_probability`, `rps_threshold`) is read via `GetDefaultValue()` when present; absent field ⇒ project-constant default applied. `sr_threshold` is clamped via `min(pct,100)/100` (mirrors upstream `admission_control.cc:61-64`); `aggression` is floored to 1.0 (mirrors `admission_control.cc:57-59`). `sampling_window` is rounded to whole seconds via integer `ms/1000` (mirrors `config.cc:33-35`).
+
+**Unit-test coverage:** `TestBuildCompiledConfig/PARSE_REJECT` (15 rows: 9 arms × 1-2 triggering variants); `TestBuildCompiledConfig/Defaults` (13 rows: sampling_window/aggression/sr_threshold/rps_threshold/max_rejection_probability/http_criteria/grpc_criteria absent + boundary variants); `TestBuildCompiledConfig/HappyPath` (1 row, fully-populated baseline); `TestBuildCompiledConfig/NilTypedConfig`; `TestBuildCompiledConfig/UnmarshalFailure`; `TestEnabledMatrix` (5 rows: the 4-case matrix + case 1b boundary); `TestIsHTTPSuccess` + `TestIsGRPCSuccess` (predicate coverage); `TestParseRejectConstants_ByteStable` (9 rows, byte-exact assertions on all 9 constants).
 
 ### Consequences
 
-_(Lands at phase-23 IMPL. Will record: operators configure static thresholds via the wrapper `default_value`s; runtime keying is a forward-pointer to the Runtime/RTDS family phase; the SINGLE envoy-go-strict departure record at BEHAVIOR_CONTRACT `### envoy.filters.http.admission_control` — the RTDS `runtime_key` PARSE-REJECT departure, count 14 → 15; the absent⇒ENABLED upstream-parity matrix.)_
+**(a) Operator migration path:** operators currently relying on upstream's `runtime_key` semantics for any of the five Runtime-keyed wrappers MUST migrate to the corresponding static `default_value` field at phase-23. The byte-stable PARSE-REJECT wording is grep-friendly and identifies the exact field to migrate. When the Runtime/RTDS family phase lands, the 5 PARSE-REJECT arms lift to behavioral paths that consult the runtime layer + fall back to `default_value`; the error constants are preserved verbatim for the migration path.
+
+**(b) Static-threshold configuration:** operators configure `aggression`, `sr_threshold`, `max_rejection_probability`, and `rps_threshold` via their wrapper `default_value` fields. `sampling_window` is a plain Duration proto with no runtime wrapper. All knobs are honored in their static form at phase-23 MVP.
+
+**(c) SINGLE envoy-go-strict departure record (count 14 → 15):** the 5-arm `runtime_key` PARSE-REJECT block is the SINGLE envoy-go-strict departure added at phase-23. It lands at BEHAVIOR_CONTRACT `### envoy.filters.http.admission_control` at Task 11 (the 4-edit BEHAVIOR_CONTRACT bundle per ADR-0052). Departure count 14 → 15. The departure is stricter than upstream (which honors `runtime_key`); it is NOT a cross-side differential fixture candidate (upstream ACCEPTS `runtime_key`, so a matching boot-reject diverges by design — it is unit-tested + BEHAVIOR_CONTRACT-recorded, per SPEC §5.2 + §7.2).
+
+**(d) Absent⇒ENABLED upstream-parity:** `cc.enabled = true` as the buildCompiledConfig default is upstream-parity (matches upstream's `PROTOBUF_GET_WRAPPED_OR_DEFAULT(…,true)` mechanism per `runtime_protos.h:46`). This is NOT an envoy-go divergence — both upstream and envoy-go agree that absent `enabled` ⇒ filter ON. It IS an inversion relative to phase-21 adaptive_concurrency's ADR-0187 (which uses absent⇒OFF because adaptive_concurrency does not use the `…,true` fallback macro); the two are both upstream-parity for their respective filters.
+
+**(e) Forward-pointer to the Runtime/RTDS family phase:** when the Runtime/RTDS family phase lands, the 5 envoy-go-strict PARSE-REJECT arms are the exact call-sites to lift. Each arm is a two-line check (`if field != nil && field.GetRuntimeKey() != "" { return nil, errors.New(…) }`); the lift replaces each check with a runtime-layer consultation + `default_value` fallback. No new `compiledConfig` fields are needed (the runtime layer provides the live value at request time, not at parse time).
 
 **Cross-references:** ADR-0194 (paired algorithm + package-shape ADR); ADR-0187 (phase-21 adaptive_concurrency RTDS-deferral precedent — nearest; the `enabled`-default INVERTS at phase-23 per AMEND-4); ADR-0080 (byte-stable config-load wording); ADR-0052 (atomic BEHAVIOR_CONTRACT landing); ADR-0044 (§Context-draft discipline + ADR-on-impl convention); phase-23 BRAINSTORM §2.1 + §7.2 + §8 item 1; phase-23 SPEC §2.1 + §5.2 + §5.3 + §11 (D-followup A) + §13.
+
+---
+
+## ADR-0196: NEW `EncoderFilterCallbacks.ResponseStatus() int` framework accessor — encode-side HTTP response-status code (set-once by HCM dispatch, read-via-accessor; mirrors ADR-0165/ADR-0174) — root-cause fix for phase-23 PD-5's INVALID `:status`-via-header assumption surfaced by differential fixture 0030
+
+**Status:** Accepted — landed at phase-23 IMPL Task 9a (the encode-side response-status framework accessor + admission_control encode-path fix). Consumes the reserved-but-unconsumed ADR-0196 slot; next-free advances to ADR-0197.
+**Date:** 2026-05-22 (root-cause discovery during phase-23 Task 9 differential bring-up; framework + filter fix landed at Task 9a).
+**Doctrine:** ADR-0044 ADR-on-impl convention + escape-valve firing (a planner-time "ZERO new framework primitives" claim is REVISED by the systematic-debugging root cause). ADR-0165 / ADR-0174 set-once-by-dispatch / read-via-accessor framework-primitive precedent. ADR-0071 chain-ownership + single-dispatch-goroutine invariant.
+**Lands-in:** Phase 23 IMPL Task 9a (`internal/filter/http/callbacks.go` interface + `internal/filter/http/chain.go` field/setter/accessor + `internal/filter/hcm/connection.go` + `internal/filter/hcm/h2dispatch.go` dispatch seeding + the `chain.go` `beginLocalReply` path + `internal/filter/http/admission_control/encode.go` consumption).
+
+### Context
+
+Phase-23 SPEC's planner-time decision **PD-5** assumed the encode-side HTTP response status was available to encode-side filters via `headers.Get(":status")` — modeled on a (mis)reading of the phase-14 compressor's `compressor.go` `:status` access. Differential testing of the phase-23 `admission_control` fixture **0030-http-admission-control** (the `all_admit_healthy` (b) cross-side leg) refuted PD-5: envoy-go's encode chain does **NOT** convey the HTTP response status to encode-side filters.
+
+The mechanism: at HCM dispatch the response status lives in `resp.Status` (an `int`) and is written to the wire status-line **separately** from the header map. The `http.Header` map handed to `FilterChain.RunEncodeHeaders(ctx, headers, endStream)` never contains a `:status` pseudo-header — encode-side filters operate on the response **header** map, not the status-line. The phase-14 compressor reads `:status` only as a best-effort optimization bucket (compressor bucket-6: skip compression for some status classes); when `:status` is absent the compressor's read is a silent no-op, so the gap never surfaced there. `admission_control`, by contrast, requires the status for its **core** success/failure classification (SPEC §4.4 + AMEND-5): with PD-5's absent-`:status` read, *every* HTTP response misclassified as failure (status "" → unparsable → safe-default failure), collapsing the success-rate window and producing spurious 503 rejects — the exact 0030 (b) cross-side divergence.
+
+The gRPC classification path is **unaffected**: gRPC detection via the `Content-Type` header and the gRPC status via the `Grpc-Status` header/trailer are REAL headers/trailers that ARE present on the encode side. Only the HTTP status-code path was broken.
+
+The project owner APPROVED adding a new framework accessor to fix the gap at its root rather than working around it in the filter.
+
+### Decision
+
+Add **`ResponseStatus() int`** to the `EncoderFilterCallbacks` interface (`internal/filter/http/callbacks.go`), following the ADR-0165 / ADR-0174 **set-once-by-dispatch / read-via-accessor** framework-primitive pattern:
+
+**(i) Chain field + setter + accessor (`internal/filter/http/chain.go`).** A new `FilterChain.encodeResponseStatus int` field (zero-value 0 = unset, e.g. a synthetic stream with no status). Set ONCE by HCM dispatch via `func (c *FilterChain) SetEncodeResponseStatus(status int)` BEFORE `RunEncodeHeaders` dispatch. Read by the per-stream `func (e *encoderCB) ResponseStatus() int { return e.c.encodeResponseStatus }` accessor during encode-filter iteration. The single-dispatch-goroutine invariant (ADR-0071) applies — no mutation across filter dispatch; mirrors the existing `downstreamProtocol` / `tlsPrincipals` set-once fields.
+
+**(ii) HCM dispatch seeding (both H1 + H2 + the local-reply path).** `internal/filter/hcm/connection.go` (H1 action path) and `internal/filter/hcm/h2dispatch.go` (H2 action path) call `chain.SetEncodeResponseStatus(status)` (where `status := resp.Status` is already in scope) immediately before their `chain.RunEncodeHeaders(...)` call. The `chain.go` `beginLocalReply` path sets `c.encodeResponseStatus = status` (the local-reply status) before its `RunEncodeHeaders` call, so a local-reply response (e.g. a 503 `SendLocalReply` from another filter) classifies consistently on the encode side.
+
+**(iii) admission_control consumption (`internal/filter/http/admission_control/encode.go` + `admission_control.go`).** The `*filter` struct gains an `ecb envoyhttp.EncoderFilterCallbacks` field; `SetEncoderCallbacks` (formerly a no-op) now stores it. The encode-path HTTP classification reads `code := f.ecb.ResponseStatus()` (an `int`) → `f.cc.isHTTPSuccess(code)` → `f.controller.classify(success)`, replacing the absent `headers.Get(":status")` + `strconv.ParseInt` read. A defensive `f.ecb == nil` guard (should-not-happen in production — the chain always calls `SetEncoderCallbacks` before `EncodeHeaders`) and a zero/unset status both default to **failure**, preserving PD-5's prior missing-status safe-default semantics. The gRPC path is UNCHANGED.
+
+### Consequences
+
+**(a) REVISES the phase-23 headline "ZERO new framework primitives" claim.** Phase-23 was planned (and ADR-0194 §Consequences framed) as introducing zero new framework primitives. The PD-5 root cause forces ONE new encode-side callback primitive — `ResponseStatus()`. This is recorded here as the ADR-0044 escape-valve firing: the planner-time framing did not survive the differential-testing reality, and the headline is corrected to "phase-23 introduces ONE new encode-side framework callback primitive (ADR-0196)".
+
+**(b) ADR-0196 CONSUMED; next-free advances to ADR-0197.** The previously reserved-but-unconsumed ADR-0196 slot is now consumed by this ADR. The phase-23 ADR tail advances from ADR-0195 (Task 2 tip) → ADR-0196 (this Task 9a tip); next-free ADR after phase-23 is **ADR-0197**.
+
+**(c) The differential 0030 (b) cross-side leg PASSES.** With the status conveyed via `ResponseStatus()`, HTTP responses classify correctly (success for <500 / configured ranges; failure otherwise), the success-rate window tracks reality, and the spurious-503-reject regime is gone. `go test -count=1 -run 'TestDifferential/0030' ./test/differential/` PASSES.
+
+**(d) Supersedes PD-5's `:status`-via-header assumption.** PD-5 stands corrected: the encode-side HTTP status is sourced from `ResponseStatus()` (ADR-0196), NOT `headers.Get(":status")`. The phase-23 SPEC §6.5 / §4.4 / PD-5 references in `encode.go` are updated to point at ADR-0196; the gRPC `Grpc-Status` header/trailer path is documented as the real-header path that remains valid.
+
+**(e) Cross-phase reusable.** `ResponseStatus()` is a general encode-side framework primitive: the phase-14 compressor's latent `:status`-bucket-6 logic could adopt it (eliminating its best-effort header read), and any future status-classifying encode-side filter benefits. The ~12 test-double `EncoderFilterCallbacks` implementations across the codebase gained a zero-returning (or settable) `ResponseStatus()` stub; a missing stub is a compile error, so the conformance is mechanically enforced.
+
+**Cross-references:** ADR-0165 (the 6-field decode-side set-once-by-dispatch / read-via-accessor precedent); ADR-0174 (the symmetric encoder-side mirror of ADR-0165 — nearest precedent for an encode-side accessor); ADR-0071 (chain-ownership + single-dispatch-goroutine invariant); ADR-0044 (escape-valve firing — the planner-time ZERO-new-primitives claim REVISED); ADR-0131 / ADR-0175 (prior encode-side framework primitives `OverwriteBody` / `BufferEncodedBody`); ADR-0194 (the phase-23 paired algorithm + package-shape ADR whose §Consequences ZERO-new-primitives framing this ADR revises); phase-23 SPEC PD-5 (the INVALID assumption this ADR supersedes) + §4.4 + §6.5 + AMEND-5; phase-23 differential fixture 0030-http-admission-control (the (b) cross-side leg that surfaced the gap).
 
 ---
 

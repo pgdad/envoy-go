@@ -386,6 +386,27 @@ const (
 	// runner_test.go:547+ mirrors HTTPCsrf / HTTPCompressor /
 	// HTTPAdaptiveConcurrency precedent.
 	HTTPLua BackendKind = 22
+	// HTTPAdmissionControl reuses the fixture-0010 HTTPSlowStream backend
+	// (test/fixtures/0010-graceful-drain/backends/backend.go) for fixtures
+	// 0030-http-admission-control (cross-side, 4 scenarios) and
+	// 0031-http-admission-control-boot-reject (boot-reject). The slow-stream
+	// backend serves GET / with a fast 200 OK response (body "backend1\n",
+	// 8 bytes; Content-Type: text/plain; Content-Length: 8) — the fixed-body
+	// guarantee is load-bearing for the cross-side byte-exact comparison in
+	// scenario (b) all_admit_healthy: because the body is fixed (NOT an
+	// echobackend that reflects request headers), both reference Envoy v1.37.2
+	// and envoy-go produce identical response bodies despite Envoy adding
+	// x-forwarded-for and x-request-id headers when forwarding upstream. The
+	// admission_control filter admits every request (P_reject=0 for healthy
+	// window per AMEND-2 RNG-independence) so both sides pass through
+	// identically. Scenario (a) parse_ok + (b) all_admit_healthy (CROSS-SIDE
+	// byte-exact per AMEND-2) + (c) stat_surface use this backend; scenario
+	// (d) pass_through_disabled also passes through to it. The boot-reject
+	// fixture (0031) never reaches this backend — the config-load reject fires
+	// before the listener binds. Because the backend is a subprocess, the
+	// runner's in-process accept counter is NOT incremented. Introduced by
+	// phase 23 Task 9 / fixtures 0030 + 0031.
+	HTTPAdmissionControl BackendKind = 23
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

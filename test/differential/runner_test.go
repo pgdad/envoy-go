@@ -52,6 +52,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0027-http-lua-full-bridge/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0028-http-lua-multi-script-and-per-route/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0029-http-lua-source-codes-boot-reject/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0030-http-admission-control/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0031-http-admission-control-boot-reject/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -612,6 +614,41 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPAdmissionControl:
+			// Fixtures 0030-http-admission-control (phase 23 Task 9, cross-side
+			// 4-scenario) and 0031-http-admission-control-boot-reject (boot-reject)
+			// REUSE the fixture-0010 HTTPSlowStream backend at
+			// test/fixtures/0010-graceful-drain/backends/backend.go. The slow-
+			// stream backend serves GET / with a fast 200 OK response (body
+			// "backend1\n", 8 bytes; fixed Content-Length: 8) — the fixed-body
+			// guarantee is load-bearing for the cross-side byte-exact comparison
+			// in scenario (b) all_admit_healthy: because the body is fixed (NOT
+			// an echobackend that reflects request headers), both reference Envoy
+			// v1.37.2 and envoy-go produce identical response bodies despite Envoy
+			// adding x-forwarded-for and x-request-id headers when forwarding.
+			// The admission_control filter admits every request (P_reject=0 for
+			// healthy window per AMEND-2 RNG-independence), so both sides pass
+			// through identically. The boot-reject fixture (0031) never reaches
+			// this backend — the config-load reject fires before the listener
+			// binds. Because the backend is a subprocess, the runner's in-process
+			// accept counter is NOT incremented.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startHTTPSlowStreamBackend(ctx, root, port)
 			if err != nil {
 				t.Fatalf("backend[%d] start: %v", i, err)
 			}

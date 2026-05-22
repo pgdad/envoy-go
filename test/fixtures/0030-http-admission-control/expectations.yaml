@@ -1,0 +1,73 @@
+# Fixture 0030-http-admission-control — per-scenario expectations.
+#
+# Per phase-23 SPEC §7.1 + AMEND-2 + AMEND-3 + Task 9 brief.
+#
+# Fixture type: CROSS-SIDE (RequiresReference=true). The runner spawns
+# reference Envoy v1.37.2 + envoy-go, drives both sides, and performs a
+# byte-stream CompareBytes for scenario (b) all_admit_healthy. Scenarios
+# (a)/(c)/(d) are subject-only structural assertions via SubjectAsserter.
+#
+# AMEND-2 RNG-independence at P=0: when the backend always returns 200
+# (success), the success-rate window accumulates successes only; the
+# numerator n − s/sr_threshold → 0 (or below) ⇒ P_reject = max(0, …) = 0
+# ⇒ the integer-modulo decision `0 > (r % 1e4)` is false for every r ⇒
+# every request admitted, no RNG dependence ⇒ byte-exact cross-side.
+#
+# SPEC §7.4 gateway (Gate D):
+#   - scenario (b) all_admit_healthy: CROSS-SIDE byte-exact (RNG-independent)
+#   - scenarios (a)/(c)/(d): REFERENCE-LESS subject-only structural assertions
+#
+scenarios:
+  - id: a_parse_ok
+    type: reference_less_structural
+    listener: l_test_a
+    request: GET / (single)
+    assertions:
+      status: 200
+      # rq_rejected counter = 0 after single healthy request
+      rq_rejected_after: 0
+
+  - id: b_all_admit_healthy
+    type: cross_side_byte_exact
+    listener: l_test_a
+    request: 5x GET / (sequential, always-200 backend)
+    rationale: >
+      P_reject=0 for all requests because backend always returns HTTP 200
+      (success per default [100,500) criteria). With a healthy window
+      (success rate = 1.0 > sr_threshold=0.95), the formula numerator
+      n - s/0.95 ≤ 0, so P = max(0, …) = 0. The integer-modulo decision
+      `float64(10000)*0.0 > float64(r%10000)` = `0 > [0,9999]` is false
+      for every r — RNG-independent. Both reference Envoy v1.37.2 and
+      envoy-go admit every request. rq_success increments each request;
+      rq_rejected stays 0.
+    assertions:
+      all_status: 200
+      rq_rejected: 0
+      rq_success_min: 1
+
+  - id: c_stat_surface
+    type: reference_less_structural
+    listener: l_test_a
+    request: 3x GET / (sequential, healthy burst) + admin /stats scrape
+    assertions:
+      status: 200
+      # 3-counter stat surface per SPEC §6.6 + AMEND-3 (counters ONLY):
+      stat_names_present:
+        - rq_rejected
+        - rq_success
+        - rq_failure
+      # After a healthy burst: rq_success > 0; rq_rejected = 0; rq_failure = 0
+      rq_rejected: 0
+      rq_failure: 0
+
+  - id: d_pass_through_disabled
+    type: reference_less_structural
+    listener: l_test_d
+    request: GET / (single, enabled=false config)
+    assertions:
+      status: 200
+      # Filter disabled (enabled.default_value=false per AMEND-4 §5.3 case 2).
+      # Decode-headers gate 1 fires; controller never consulted; counters = 0.
+      rq_rejected: 0
+      rq_success: 0
+      rq_failure: 0
