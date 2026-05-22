@@ -1,49 +1,39 @@
-START a fresh post-phase-23-PLAN IMPL-execution session for envoy-go.
+START a fresh post-phase-23-IMPL session for envoy-go.
 
-This is a fresh-session prompt for the post-phase-23-PLAN cold-start. **Phase 23 (`http-filter-admission-control`, `envoy.filters.http.admission_control`) PLAN is DONE.** It landed at master via squash-merge `af4a0fe` + SHA-fill follow-up `7fa89a4` (pushed to origin). ROADMAP row 23 stays `in-progress` (flips to `done` only at IMPL phase-done with all 6 gates GREEN). The natural next-skill per STATE.md + SKILL_ROUTING state 3 is **`superpowers:subagent-driven-development`** (per project memory `feedback_execution_style.md` + ADR-0005 §Decision 4 default-executor preference) — execute the 12-task PLAN at `docs/envoy-go/phases/23-http-filter-admission-control/PLAN.md` task-by-task with TDD on every task (per `superpowers:test-driven-development`) and append to PROGRESS.md on each task completion.
+This is a fresh-session prompt for the post-phase-23-IMPL cold-start. **Phase 23 (`http-filter-admission-control`, `envoy.filters.http.admission_control`) IMPL is DONE.** It landed at master via squash-merge `577be97` + SHA-fill follow-up `ee2c656` (pushed to origin). ROADMAP row 23 is now `done`. All six phase-done gates were GREEN (build / vet+lint / race / differential 33/33 / fuzz / h2spec 53/53); REVIEW.md authored + Approved. The natural next step per STATE.md + SKILL_ROUTING is to **identify and BRAINSTORM the next phase** — the §9 HTTP-filters family has **2 remaining rows: `wasm` and `global rate limit`** (the user picks which at this cold-start; the next phase is NOT yet pre-determined).
 
-## What this session must do: execute the phase-23 PLAN (IMPL)
+## What this session must do: identify + brainstorm the next phase
 
-Per SKILL_ROUTING state 3, the post-PLAN session executes PLAN.md task-by-task. The session must:
+Per SKILL_ROUTING state 0/1, this session does NOT execute code — it opens the next phase:
 
-1. **Create a fresh worktree** per `feedback_git_worktrees.md` (branch `phase-23-http-filter-admission-control-impl`, off master tip `4cd46a8`).
-2. **Run the §Execution-preconditions block** in the PLAN (15 preconditions) at cold-start before Task 1.
-3. **Execute the 12 Tasks** via subagent-driven dispatch (a fresh subagent per Task + two-stage review between tasks). Task graph: **Tasks 2+3 parallelize** (then Task 7 once Task 2 lands); **Tasks 4→5→6→8→9→10/11→12** are the critical path. TDD discipline per task: write the failing test → verify it fails → minimal impl → verify it passes → commit.
-4. **Land the 2 ADR §Decision+§Consequences bodies** at their Lands-in-Task per ADR-0044: **ADR-0194** at Task 4 (controller materialization); **ADR-0195** at Task 2 (compiled_config + PARSE-REJECT roster). Next-free ADR-0196 hypothesized UNCONSUMED at phase-done (D-style HOLD-with-known-risk; one-slot escape-valve buffer).
-5. **Honor the 11-AMEND implementation contract** (SPEC §1.1 — SETTLED; do NOT re-litigate) AND **the 10 planner-time decisions PD-1..PD-10** in the PLAN, especially the THREE SPEC-pseudocode-vs-reality gaps the PLAN grounded against the real filter framework:
-   - **PD-1:** real factory signature `New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (FilterInstanceFactory, error)` (NOT the SPEC §6 illustrative `New(message proto.Message)`).
-   - **PD-2.503:** the framework `SendLocalReply(status int, body string, headers OrderedHeaders)` is 3-arg — the AMEND-7 `denied_by_admission_control` rc-details is NOT surfaceable through the API (ABSENT-by-API; byte-pin reduces to 503 + empty body + nil headers).
-   - **PD-3:** `DecoderFilterCallbacks` exposes NO `StreamInfo()`/`HealthCheck()` accessor — the AMEND-4 health-check gate arm is NOT-MODELED at MVP (decode-gate implements only `!enabled`; AMEND-11 health-check-not-recorded is vacuous; documented deferral + BEHAVIOR_CONTRACT note at Task 11; does NOT consume ADR-0196).
-6. **Run the six-gate phase-done verification (A/B/C/D/E/F)** at Task 12 per `superpowers:verification-before-completion` + author REVIEW.md per `superpowers:requesting-code-review` (if issues → back to the relevant Task, NOT Task 12, until approved) + re-advance STATE.md + flip ROADMAP row 23 to `done` + push to origin per `feedback_push_to_origin.md`.
+1. **The user names the next phase** (e.g. the §9 row `wasm` or `global rate limit`, or another roadmap item). Do NOT presume; ask/confirm which row to open.
+2. **Invoke `superpowers:brainstorming`** scoped to that phase (per project memory + ADR-0005). Create `docs/envoy-go/phases/NN-slug/` and produce `SPEC.md` (or refine the ROADMAP row first if the row needs adding/splitting). Use a fresh worktree per `feedback_git_worktrees.md`.
+3. Follow the BOOTSTRAP §5 state machine from state 0/1 onward (brainstorm → SPEC → PLAN → IMPL across separate sessions, per the phase-09..23 precedent).
 
 ## Pre-existing settled context (DO NOT re-litigate)
 
-The phase-23 SPEC + PLAN are DONE and CANONICAL at master tip `4cd46a8`. Do NOT reopen the SPEC decisions, the 11 empirical AMENDs, the BRAINSTORM Q-decisions, or the PLAN's task decomposition / 10 PD decisions. The plan-document-reviewer Approved the PLAN on iteration 1 (all framework-grounding claims independently verified).
+Phase 23 is DONE and CANONICAL at master tip `ee2c656`. Do NOT reopen the admission_control filter, its SPEC/PLAN, the 11 AMENDs, or the ADRs. **Notable IMPL outcome to carry forward:**
 
-- **The PLAN settled SINGLE-ROW landing** (ADR-0045 split-gate: 12 tasks ≤ 25 AND ~1250-1800 LoC grand-total; natural split axes don't carve). Do NOT re-split.
-- **ZERO new framework primitives + ZERO in-place §Decision AMENDMENTs + ZERO ADR-0125 amendments** (REUSE-by-absence per-route; canonical-per-route roster STAYS 9; FIRST ADR-0125-skip since phase-22). Both seams (`Clock`=`Now()` + `Rand`=`Uint64()`) inline in-package. LEAN posture (matches phase-21).
-- **Two-directory differential STANDS** per `reference_differential_fixture_dispatch_constraint`: `0030-http-admission-control` (cross-side — (b) all-admit P=0 byte-exact + (a)/(c)/(d) subject-only structural) + `0031-http-admission-control-boot-reject` (`sr_threshold < 1.0%` shared reject). Fixtures 31 → 33; fuzzer `FuzzAdmissionControlConfigParse` 31 → 32. The RTDS `runtime_key` reject is NOT a boot-reject fixture (upstream accepts it; that departure is unit-tested + BEHAVIOR_CONTRACT-recorded, count 14 → 15).
-- **Downstream HCM filter only** at MVP (AMEND-9). Boot-registration alphabetical between `adaptive_concurrency` and `bandwidthlimit` (18 HTTP filters post-phase-23-IMPL). 107 → 110 stats (3 counters, no gauges).
+- **ADR-0196 was CONSUMED at IMPL (the SPEC §10 D-hypothesis BROKE).** Differential testing found planner-decision PD-5 invalid: envoy-go's encode filter chain did NOT expose the HTTP response status to filters (`:status` is not in the encode header map). The user-approved fix added a NEW encode-side framework primitive — **`ResponseStatus() int` on `EncoderFilterCallbacks`** (set-once by HCM dispatch via `SetEncodeResponseStatus`, read via accessor; mirrors the ADR-0165 set-once-by-dispatch pattern; cross-phase reusable). So phase-23 introduced ONE new framework primitive (NOT zero, contrary to the original plan claim). **next-free is now ADR-0197.** Future encode-side filters that classify on response status should read `f.ecb.ResponseStatus()`, NOT a `:status` header — see ADR-0196 + memory.
+- **Differential-harness gotcha (now a project memory):** the cross-side runner branch invokes `StatsAsserter.AssertStats`, NOT `SubjectAsserter.AssertSubject` (the latter runs only on the reference-less branch). Cross-side fixtures must put subject-side stat/structural assertions in `StatsAsserter` and prove them live (deliberate-break → expect FAIL → restore). See `reference_differential_asserter_dispatch.md`.
 
-## Base + invariants at master tip `4cd46a8`
+## Base + invariants at master tip `ee2c656`
 
-- **Master tip:** `4cd46a8` (next-prompt.txt: advance to post-phase-23-PLAN IMPL cold-start; docs-only, atop the PLAN SHA-fill `7fa89a4` → squash `af4a0fe`). Pushed to origin.
+- **Master tip:** `ee2c656` (phase 23 IMPL follow-up: STATE.md SHA-fill → 577be97 post-squash; docs-only). Pushed to origin.
 - **Master tail:**
+  - `ee2c656 phase 23 IMPL follow-up: STATE.md SHA-fill (TBD -> 577be97 post-squash)`
+  - `577be97 Squash merge phase-23-http-filter-admission-control-impl`
+  - `99c8fef next-prompt.txt: repoint master-tip references to 4cd46a8 (actual HEAD)`
   - `4cd46a8 next-prompt.txt: advance to post-phase-23-PLAN IMPL cold-start`
-  - `7fa89a4 phase 23 PLAN follow-up: STATE.md SHA-fill (TBD -> af4a0fe post-squash)`
-  - `af4a0fe Squash merge phase-23-http-filter-admission-control-plan`
-  - `9d6e876 next-prompt.txt: advance to post-phase-23-SPEC PLAN cold-start`
-- Baseline at master tip (UNCHANGED by the docs-only PLAN commit): **31 differential fixture directories** GREEN (0000-0029; lua 0026-0029 GREEN in isolation; combined runs may hit the documented `freeTCPPort` flake per 22.2 REVIEW §7.4 — not a defect); **31 fuzzers** green; h2spec 53/53 PASS at ADR-0051 v1.32.4 pin; build/vet/lint clean; race-tests clean; **17 HTTP filters wired** (18 anticipated post-phase-23 IMPL); **107 stat names** (110 anticipated post-IMPL); **14 envoy-go-strict departure records** at BEHAVIOR_CONTRACT (15 anticipated post-IMPL). DECISIONS.md tail at **ADR-0195 §Context stub** (ADR-0194 + ADR-0195 §Context drafts landed; §Decision+§Consequences bodies land at IMPL Tasks 4 + 2); **next-free ADR-0196**.
-- Project memories ALL apply: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md` (subagent-driven AT THIS IMPL EXECUTION session), `reference_differential_fixture_dispatch_constraint.md`.
+- Baseline at master tip: **33 differential fixture directories** GREEN (0000-0031; the lua 0026-0029 + any multi-listener combined run may hit the documented `freeTCPPort` flake per 22.2 REVIEW §7.4 — re-run in isolation; not a defect); **32 fuzzers** green; h2spec 53/53 PASS at ADR-0051 v1.32.4 pin; build/vet/lint clean; race-tests clean; **18 HTTP filters wired**; **110 stat names**; **15 envoy-go-strict departure records** at BEHAVIOR_CONTRACT. DECISIONS.md tail at **ADR-0196** (full §Decision+§Consequences body); ADR-0194 + ADR-0195 + ADR-0196 all CONSUMED; **next-free ADR-0197** (unconsumed). §9 HTTP-filters family: **2 remaining rows (`wasm`, `global rate limit`)**.
+- Project memories ALL apply: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md`, `reference_differential_fixture_dispatch_constraint.md`, `reference_differential_asserter_dispatch.md`.
 
 ## Read first (in order)
 
-1. THIS FILE — post-phase-23-PLAN cold-start + the IMPL-execution obligations.
-2. `docs/envoy-go/STATE.md` — current state (phase 23 PLAN done; next-skill `superpowers:subagent-driven-development`; next-free ADR-0196).
-3. `docs/envoy-go/phases/23-http-filter-admission-control/PLAN.md` — the authoritative task-by-task input (§Execution-preconditions + the 12 Tasks + the 10 planner-time decisions PD-1..PD-10 + the ADR-lands-in-Task table + the §Notes-for-the-executor).
-4. `docs/envoy-go/phases/23-http-filter-admission-control/SPEC.md` — the 11-AMEND implementation contract (§1.1 AMEND catalog; §4 algorithm; §5 PARSE-REJECT roster; §6 code shapes + §6.8 file roster; §7 fixtures; §11 empirical pins; §14 testing taxonomy; §15 acceptance checklist).
-5. `docs/envoy-go/DECISIONS.md` tail — ADR-0194 + ADR-0195 §Context stubs (the §Decision+§Consequences bodies you land at IMPL Tasks 4 + 2); ADR-0044 (ADR-on-impl convention); ADR-0005 (autonomous-planning adaptation); ADR-0080 (byte-stable PARSE-REJECT wording); ADR-0052 (atomic BEHAVIOR_CONTRACT landing).
-6. `docs/envoy-go/phases/21-http-filter-adaptive-concurrency/PROGRESS.md` + `REVIEW.md` — the nearest single-filter IMPL precedent (per-task PROGRESS shape; six-gate REVIEW shape).
-7. `BOOTSTRAP_PROMPT.md` (repo root) — §4.1 STATE-update invariant + §5 state machine (step 3 → 6) + §7.6 phase-done reviewer obligations.
-8. `docs/envoy-go/SKILL_ROUTING.md` — confirm state 3 (`PLAN.md` exists, implementation incomplete → `superpowers:subagent-driven-development`).
-9. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/`: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md`, `reference_differential_fixture_dispatch_constraint.md`.
+1. THIS FILE — post-phase-23-IMPL cold-start + the next-phase obligations.
+2. `docs/envoy-go/STATE.md` — the authoritative "what next" (phase 23 IMPL done; next-skill `superpowers:brainstorming`; next-free ADR-0197; §9 family 2 remaining).
+3. `docs/envoy-go/ROADMAP.md` — row 23 `done`; the remaining §9 rows (`wasm`, `global rate limit`) + their dependency/sizing notes; pick + open the next row here.
+4. `docs/envoy-go/SKILL_ROUTING.md` — confirm state 0/1 (phase not yet in directory → `superpowers:brainstorming`).
+5. `BOOTSTRAP_PROMPT.md` (repo root) — §4.1 STATE-update invariant + §5 state machine (state 0/1 → brainstorm → SPEC).
+6. `docs/envoy-go/phases/23-http-filter-admission-control/` (BRAINSTORM/SPEC/PLAN/PROGRESS/REVIEW) — the nearest just-completed single-filter precedent for the brainstorm/SPEC shape; and `docs/envoy-go/DECISIONS.md` ADR-0196 for the new encode-side `ResponseStatus()` primitive.
+7. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/`: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md`, `reference_differential_fixture_dispatch_constraint.md`, `reference_differential_asserter_dispatch.md`.
