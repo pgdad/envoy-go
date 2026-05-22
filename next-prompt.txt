@@ -1,39 +1,52 @@
-START a fresh post-phase-23-IMPL session for envoy-go.
+START a fresh post-phase-24-BRAINSTORM session for envoy-go.
 
-This is a fresh-session prompt for the post-phase-23-IMPL cold-start. **Phase 23 (`http-filter-admission-control`, `envoy.filters.http.admission_control`) IMPL is DONE.** It landed at master via squash-merge `577be97` + SHA-fill follow-up `ee2c656` (pushed to origin). ROADMAP row 23 is now `done`. All six phase-done gates were GREEN (build / vet+lint / race / differential 33/33 / fuzz / h2spec 53/53); REVIEW.md authored + Approved. The natural next step per STATE.md + SKILL_ROUTING is to **identify and BRAINSTORM the next phase** — the §9 HTTP-filters family has **2 remaining rows: `wasm` and `global rate limit`** (the user picks which at this cold-start; the next phase is NOT yet pre-determined).
+This is a fresh-session prompt for the post-phase-24-BRAINSTORM cold-start. **Phase 24 (`http-filter-global-ratelimit`, `envoy.filters.http.ratelimit` — the GLOBAL rate-limit filter) BRAINSTORM is DONE.** It landed at master via squash-merge `75fcfb4` + this SHA-fill follow-up (pushed to origin). ROADMAP row 24 is now `in-progress`. The natural next step per STATE.md + SKILL_ROUTING state 1 is to **author the phase-24 SPEC** via `superpowers:writing-plans` scoped to SPEC authoring (the phase-09..23 precedent: SPEC is its own session, distinct from PLAN).
 
-## What this session must do: identify + brainstorm the next phase
+## What this session must do: author the phase-24 SPEC
 
-Per SKILL_ROUTING state 0/1, this session does NOT execute code — it opens the next phase:
+Per SKILL_ROUTING state 1 → 2, this session does NOT execute filter code — it authors the SPEC:
 
-1. **The user names the next phase** (e.g. the §9 row `wasm` or `global rate limit`, or another roadmap item). Do NOT presume; ask/confirm which row to open.
-2. **Invoke `superpowers:brainstorming`** scoped to that phase (per project memory + ADR-0005). Create `docs/envoy-go/phases/NN-slug/` and produce `SPEC.md` (or refine the ROADMAP row first if the row needs adding/splitting). Use a fresh worktree per `feedback_git_worktrees.md`.
-3. Follow the BOOTSTRAP §5 state machine from state 0/1 onward (brainstorm → SPEC → PLAN → IMPL across separate sessions, per the phase-09..23 precedent).
+1. **Invoke `superpowers:writing-plans` scoped to SPEC authoring** (per the phase-09..23 precedent + ADR-0005). Author `docs/envoy-go/phases/24-http-filter-global-ratelimit/SPEC.md` based on the BRAINSTORM. Use a fresh worktree per `feedback_git_worktrees.md`.
+2. **Execute the BRAINSTORM §10 D1–D7 empirical-pin obligations IN-SESSION against reference Envoy v1.37.2 + go-control-plane v1.32.4 per ADR-0004** — the SPEC author resolves these (parallel-subagent fan-out vs the v1.37.2 C++ source + the v1.32.4 proto bindings, per the phase-23 SPEC precedent):
+   - **D1** — `RateLimit` filter-config field roster + defaults (`domain` required; `timeout` 20ms; `failure_mode_deny` false ⇒ fail-open; `request_type`; `rate_limited_status`; `enable_x_ratelimit_headers` enum; `disable_x_envoy_ratelimited_header`; `stage`; `rate_limited_as_resource_exhausted`; `response_headers_to_add`).
+   - **D2** — stat counter roster (`ok`/`over_limit`/`error`/`failure_mode_allowed` + any `cluster_not_found`) + the `ratelimit.<stat_prefix>.<stat>` prefix template + whether stats anchor at a filter `stat_prefix` or the HCM stat_prefix.
+   - **D3** — the exact `RateLimitPerRoute` shape (`vh_rate_limits` enum values OVERRIDE/INCLUDE/IGNORE + `override_option` + route-additional `rate_limits[]`); ratify the 10th-canonical wording + the ADR-0125 amendment.
+   - **D4** — the `enable_x_ratelimit_headers` DRAFT_VERSION_03 header set wire shape + the OVER_LIMIT 429 local-reply body + header set (incl. `x-envoy-ratelimited`) byte-pin.
+   - **D5** — the shared fake gRPC `RateLimitService` wire contract (deterministic descriptor → response map + the shared-cluster config both sides reference).
+   - **D6** — the `RateLimitRequest{domain, descriptors[], hits_addend}` wire shape + descriptor entry `{key, value}` ordering.
+   - **D7** — the SPEC's task/LoC estimate feeds the PLAN-time ADR-0045 split-gate; record the candidate 24.1/24.2 split axis as a planning anchor.
+3. **Anchor the ADR §Context drafts at the SPEC commit per ADR-0044** (ADR-0197..ADR-0200 §Context-draft discipline; the §Decision + §Consequences bodies land at IMPL). The SPEC may REFUTE BRAINSTORM hypotheses (the phase-23 SPEC produced an 11-entry AMEND catalog with 5 substantive refutations — expect similar) — record an AMEND catalog.
+4. Follow the BOOTSTRAP §5 state machine from state 1/2 onward (SPEC → PLAN → IMPL across separate sessions, per the phase-09..23 precedent).
 
 ## Pre-existing settled context (DO NOT re-litigate)
 
-Phase 23 is DONE and CANONICAL at master tip `ee2c656`. Do NOT reopen the admission_control filter, its SPEC/PLAN, the 11 AMENDs, or the ADRs. **Notable IMPL outcome to carry forward:**
+Phase 24 BRAINSTORM is DONE and CANONICAL at master tip `75fcfb4` (+ this SHA-fill follow-up). Do NOT reopen the brainstorm Q-decisions:
 
-- **ADR-0196 was CONSUMED at IMPL (the SPEC §10 D-hypothesis BROKE).** Differential testing found planner-decision PD-5 invalid: envoy-go's encode filter chain did NOT expose the HTTP response status to filters (`:status` is not in the encode header map). The user-approved fix added a NEW encode-side framework primitive — **`ResponseStatus() int` on `EncoderFilterCallbacks`** (set-once by HCM dispatch via `SetEncodeResponseStatus`, read via accessor; mirrors the ADR-0165 set-once-by-dispatch pattern; cross-phase reusable). So phase-23 introduced ONE new framework primitive (NOT zero, contrary to the original plan claim). **next-free is now ADR-0197.** Future encode-side filters that classify on response status should read `f.ecb.ResponseStatus()`, NOT a `:status` header — see ADR-0196 + memory.
-- **Differential-harness gotcha (now a project memory):** the cross-side runner branch invokes `StatsAsserter.AssertStats`, NOT `SubjectAsserter.AssertSubject` (the latter runs only on the reference-less branch). Cross-side fixtures must put subject-side stat/structural assertions in `StatsAsserter` and prove them live (deliberate-break → expect FAIL → restore). See `reference_differential_asserter_dispatch.md`.
+- **Q1 (scope/phasing) — SETTLED:** FULL operator surface, SINGLE PHASE through SPEC; the ADR-0045 split-gate is DEFERRED to PLAN time (split-readiness anticipated HIGH; candidate axis 24.1 gRPC client + filter config + descriptor engine for a core action subset + ShouldRateLimit + dispositions + failure modes + cross-side differential / 24.2 remaining actions + X-RateLimit headers + RateLimitPerRoute + stage + vh-override). The SPEC author writes a single full-surface SPEC; the PLAN author applies the split-gate.
+- **Q2 (action roster) — SETTLED:** land the 10 canonical descriptor actions (`source_cluster`, `destination_cluster`, `request_headers`, `remote_address`, `masked_remote_address`, `generic_key`, `header_value_match`, `metadata`, `query_parameters`, `query_parameter_value_match`); PARSE-REJECT the `extension` action (no descriptor-producer extension-point framework) + the deprecated `dynamic_metadata` action.
+- **Framework deltas — SETTLED (2):** (1) a NEW `internal/grpcclient` `RateLimitClient` typed wrapper composing the existing generic `Dialer` per ADR-0158 (the 3rd two-tier typed wrapper after `AuthClient` + `ProcessorClient`; `envoy.service.ratelimit.v3` stubs vendored in go-control-plane v1.32.4); (2) a NEW HCM route-table capability — the FIRST framework exposure of route-level NON-`typed_per_filter_config` policy data to a filter (parse + retain + expose the matched Route's + VirtualHost's `rate_limits` policies via NEW decoder-callback accessors; narrow exposure; NOT a new `internal/` package). DO NOT propose a new top-level `internal/` package for the route-table delta.
+- **RTDS/runtime — SETTLED:** PARSE-REJECT static-only per the phase-17..23 standard.
+- **Per-route — SETTLED:** `RateLimitPerRoute` anticipated NEW 10th canonical + ADR-0125 amendment 9 → 10 (RE-AMENDS after phase-23's REUSE-by-absence skip); exact shape confirmed at SPEC-time per D3.
+- **Test taxonomy — SETTLED:** FULLY-DETERMINISTIC two-directory differential — a SHARED fake gRPC `RateLimitService` dialed by BOTH sides makes the full path cross-side byte-exact (UNLIKE phase-23's un-matchable RNG; the ext_authz fake-service precedent). `00NN-http-ratelimit` cross-side + `00NN+1-http-ratelimit-boot-reject`; subject-side assertions in `StatsAsserter` per `reference_differential_asserter_dispatch`.
 
-## Base + invariants at master tip `ee2c656`
+## Base + invariants at master tip `75fcfb4`
 
-- **Master tip:** `ee2c656` (phase 23 IMPL follow-up: STATE.md SHA-fill → 577be97 post-squash; docs-only). Pushed to origin.
+- **Master tip:** `75fcfb4` (squash-merge phase-24-http-filter-global-ratelimit-brainstorm) + this SHA-fill follow-up. Pushed to origin.
 - **Master tail:**
+  - `<this SHA-fill follow-up> phase 24 BRAINSTORM follow-up: STATE.md SHA-fill + next-prompt advance`
+  - `75fcfb4 Squash merge phase-24-http-filter-global-ratelimit-brainstorm`
+  - `88101a7 next-prompt.txt: advance to post-phase-23-IMPL cold-start`
   - `ee2c656 phase 23 IMPL follow-up: STATE.md SHA-fill (TBD -> 577be97 post-squash)`
-  - `577be97 Squash merge phase-23-http-filter-admission-control-impl`
-  - `99c8fef next-prompt.txt: repoint master-tip references to 4cd46a8 (actual HEAD)`
-  - `4cd46a8 next-prompt.txt: advance to post-phase-23-PLAN IMPL cold-start`
-- Baseline at master tip: **33 differential fixture directories** GREEN (0000-0031; the lua 0026-0029 + any multi-listener combined run may hit the documented `freeTCPPort` flake per 22.2 REVIEW §7.4 — re-run in isolation; not a defect); **32 fuzzers** green; h2spec 53/53 PASS at ADR-0051 v1.32.4 pin; build/vet/lint clean; race-tests clean; **18 HTTP filters wired**; **110 stat names**; **15 envoy-go-strict departure records** at BEHAVIOR_CONTRACT. DECISIONS.md tail at **ADR-0196** (full §Decision+§Consequences body); ADR-0194 + ADR-0195 + ADR-0196 all CONSUMED; **next-free ADR-0197** (unconsumed). §9 HTTP-filters family: **2 remaining rows (`wasm`, `global rate limit`)**.
+- Baseline at master tip (UNCHANGED by the brainstorm — docs-only): **33 differential fixture directories** GREEN (0000-0031; the lua 0026-0029 + any multi-listener combined run may hit the documented `freeTCPPort` flake per 22.2 REVIEW §7.4 — re-run in isolation; not a defect); **32 fuzzers** green; h2spec 53/53 PASS at ADR-0051 v1.32.4 pin; build/vet/lint clean; race-tests clean; **18 HTTP filters wired**; **110 stat names**; **15 envoy-go-strict departure records** at BEHAVIOR_CONTRACT. DECISIONS.md tail at **ADR-0196** (full §Decision+§Consequences body); ADR-0194 + ADR-0195 + ADR-0196 all CONSUMED; **next-free ADR-0197** (unconsumed; ADR-0197..ADR-0200 ANTICIPATED for phase 24). Canonical-per-route roster **STAYS 9** (phase-24 anticipates the 9 → 10 amendment at SPEC/IMPL via ADR-0199). §9 HTTP-filters family: **1 remaining row post-phase-24** (`wasm`); phase 24 opened `global rate limit`.
 - Project memories ALL apply: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md`, `reference_differential_fixture_dispatch_constraint.md`, `reference_differential_asserter_dispatch.md`.
 
 ## Read first (in order)
 
-1. THIS FILE — post-phase-23-IMPL cold-start + the next-phase obligations.
-2. `docs/envoy-go/STATE.md` — the authoritative "what next" (phase 23 IMPL done; next-skill `superpowers:brainstorming`; next-free ADR-0197; §9 family 2 remaining).
-3. `docs/envoy-go/ROADMAP.md` — row 23 `done`; the remaining §9 rows (`wasm`, `global rate limit`) + their dependency/sizing notes; pick + open the next row here.
-4. `docs/envoy-go/SKILL_ROUTING.md` — confirm state 0/1 (phase not yet in directory → `superpowers:brainstorming`).
-5. `BOOTSTRAP_PROMPT.md` (repo root) — §4.1 STATE-update invariant + §5 state machine (state 0/1 → brainstorm → SPEC).
-6. `docs/envoy-go/phases/23-http-filter-admission-control/` (BRAINSTORM/SPEC/PLAN/PROGRESS/REVIEW) — the nearest just-completed single-filter precedent for the brainstorm/SPEC shape; and `docs/envoy-go/DECISIONS.md` ADR-0196 for the new encode-side `ResponseStatus()` primitive.
-7. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/`: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md`, `reference_differential_fixture_dispatch_constraint.md`, `reference_differential_asserter_dispatch.md`.
+1. THIS FILE — post-phase-24-BRAINSTORM cold-start + the SPEC-authoring obligations (D1–D7).
+2. `docs/envoy-go/phases/24-http-filter-global-ratelimit/BRAINSTORM.md` — the authoritative phase-24 design (the 2 Q-decisions, the 2 framework deltas, the §10 D1–D7 SPEC-time pins, the anticipated ADRs 0197..0200).
+3. `docs/envoy-go/STATE.md` — the authoritative "what next" (phase 24 BRAINSTORM done; next-skill `superpowers:writing-plans` scoped to SPEC; next-free ADR-0197).
+4. `docs/envoy-go/ROADMAP.md` — row 24 `in-progress` (the brainstorm-scoped cell).
+5. `docs/envoy-go/SKILL_ROUTING.md` — confirm state 1 → 2 (SPEC.md exists? no → author it).
+6. `BOOTSTRAP_PROMPT.md` (repo root) — §4.1 STATE-update invariant + §5 state machine (state 1/2 → SPEC).
+7. `docs/envoy-go/phases/23-http-filter-admission-control/SPEC.md` — the nearest just-completed single-filter SPEC precedent for the SPEC shape (16 §-numbered sections + §15 acceptance checklist + the §10 empirical-pin → AMEND-catalog discipline); and `docs/envoy-go/phases/18-http-filter-ext-authz/` (the ext_authz gRPC-service + fake-service differential precedent — closest analog for the external-gRPC + shared-fake-service surface).
+8. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/`: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md`, `reference_differential_fixture_dispatch_constraint.md`, `reference_differential_asserter_dispatch.md`.
