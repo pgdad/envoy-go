@@ -8,7 +8,9 @@ package lua
 //   - Arm 1  (typed-config-required)              — PARSE-REJECT byte-exact
 //   - Arm 2  (typed-config-unmarshal)             — PARSE-REJECT byte-exact prefix
 //   - Arm 3  (inline-code-deprecated-rejected)    — PARSE-REJECT byte-exact
-//   - Arm 4  (source-codes-deferred-to-22-3)      — PARSE-REJECT byte-exact
+//   - Arm 4  (source-codes-consume-22-3)           — CONSUME path (key-empty
+//                                                    PARSE-REJECT byte-exact;
+//                                                    value-error wrapped)
 //   - Arm 5  (default-source-code-required)       — **silent no-op** (D1-REFUTED;
 //                                                    upstream Envoy v1.37.2
 //                                                    lua_filter.cc:1463-1474
@@ -98,11 +100,14 @@ func TestBuildCompiledConfig(t *testing.T) {
 	t.Run("D1_REFUTED_SilentNoop", testBuildCompiledConfigD1SilentNoop)
 	t.Run("HappyPath", testBuildCompiledConfigHappyPath)
 	t.Run("Arm18_PerRoute_Validator", testBuildCompiledConfigArm18PerRoute)
+	t.Run("SourceCodes", testBuildCompiledConfigSourceCodes)
 }
 
 // testBuildCompiledConfigParseReject covers the Task-2-reachable PARSE-REJECT
-// arms (1, 2, 3, 4). Arms 5 + 17 are D1-REFUTED (covered separately under
-// "D1_REFUTED_SilentNoop"). Arms 6-15 land at Task 3 (datasource.go full IMPL).
+// arms (1, 2, 3) and the Task-1 (phase 22.3) arm-4 consume path's new
+// PARSE-REJECT leaves (source-codes-key-empty + bad-value prefix).
+// Arms 5 + 17 are D1-REFUTED (covered separately under "D1_REFUTED_SilentNoop").
+// Arms 6-15 land at Task 3 (datasource.go full IMPL).
 // Arm 16 lands at Task 4 (internal/lua/compile.go full IMPL).
 func testBuildCompiledConfigParseReject(t *testing.T) {
 	cases := []struct {
@@ -151,13 +156,14 @@ func testBuildCompiledConfigParseReject(t *testing.T) {
 			},
 			wantErrEq: parseRejectInlineCodeDeprecated,
 		},
-		// ---- Arm 4: source_codes map deferred to 22.3 ----
+		// ---- source_codes key-empty PARSE-REJECT (arm-group 1 of the 22.3
+		// consume path) — replaces the old Arm04_SourceCodes_DeferredTo223 rows.
 		{
-			name: "Arm04_SourceCodes_DeferredTo223",
+			name: "SourceCodes_KeyEmpty_Rejected",
 			typedConfig: func(t *testing.T) *anypb.Any {
 				m := validLuaConfig()
 				m.SourceCodes = map[string]*corev3.DataSource{
-					"hello.lua": {
+					"": {
 						Specifier: &corev3.DataSource_InlineString{
 							InlineString: "function envoy_on_request(rh) end\n",
 						},
@@ -165,28 +171,25 @@ func testBuildCompiledConfigParseReject(t *testing.T) {
 				}
 				return toAny(t, m)
 			},
-			wantErrEq: parseRejectSourceCodesDeferred,
+			wantErrEq: parseRejectSourceCodesKeyEmpty,
 		},
-		// Arm 4 fires even if SourceCodes is the SOLE source path (no
-		// default_source_code) — the SourceCodes presence is itself rejected
-		// regardless of the default_source_code arm; PARSE-REJECT ordering
-		// puts arm 4 BEFORE arm 5 (REFUTED) so the SourceCodes-only config
-		// surfaces arm 4, not the silent-no-op path.
+		// ---- source_codes bad-value (arm-group 2 of the 22.3 consume path):
+		// Filename ENOENT — the error must be wrapped with the source_codes[%q]:
+		// prefix. ----
 		{
-			name: "Arm04_SourceCodes_AloneNoDefault_Rejected",
+			name: "SourceCodes_BadValue_FilenameEnoent",
 			typedConfig: func(t *testing.T) *anypb.Any {
-				m := &luav3.Lua{
-					SourceCodes: map[string]*corev3.DataSource{
-						"hello.lua": {
-							Specifier: &corev3.DataSource_InlineString{
-								InlineString: "function envoy_on_request(rh) end\n",
-							},
+				m := validLuaConfig()
+				m.SourceCodes = map[string]*corev3.DataSource{
+					"a": {
+						Specifier: &corev3.DataSource_Filename{
+							Filename: "/nonexistent/path/xyzzy_22_3.lua",
 						},
 					},
 				}
 				return toAny(t, m)
 			},
-			wantErrEq: parseRejectSourceCodesDeferred,
+			wantErrHasPrefix: `lua: source_codes["a"]: `,
 		},
 	}
 
@@ -367,21 +370,165 @@ func testBuildCompiledConfigHappyPath(t *testing.T) {
 	}
 }
 
-// testBuildCompiledConfigArm18PerRoute re-asserts the arm-18 PARSE-REJECT
-// wording surfaced by the existing Task 1 skeleton's validatePerRouteLua
-// (declared in lua.go). The wording constant is the canonical
-// parseRejectPerRouteDeferred in compiled_config.go — this test asserts that
-// the validator returns the byte-exact same string. Mirrors the ADR-0110
-// single-chokepoint discipline + parent §6.2 arm 18.
+// testBuildCompiledConfigArm18PerRoute exercises the arm-18 per-route
+// validator (phase 22.3 Task 2 real implementation). The deferred one-liner
+// wording was retired; the real validator in perroute.go enforces the 3-arm
+// oneof dispatch. This test covers the two most common misconfiguration
+// surfaces via validatePerRouteLua (the ADR-0110 single-chokepoint) to
+// maintain cross-package regression visibility per parent §6.2 arm 18.
 func testBuildCompiledConfigArm18PerRoute(t *testing.T) {
 	t.Parallel()
-	err := validatePerRouteLua(nil)
-	if err == nil {
-		t.Fatalf("validatePerRouteLua: want error; got nil")
-	}
-	if err.Error() != parseRejectPerRouteDeferred {
-		t.Fatalf("validatePerRouteLua err = %q; want %q", err.Error(), parseRejectPerRouteDeferred)
-	}
+
+	// wrong type → type-assert error (not a *LuaPerRoute).
+	t.Run("WrongType_TypeAssertError", func(t *testing.T) {
+		t.Parallel()
+		err := validatePerRouteLua(&luav3.Lua{})
+		if err == nil {
+			t.Fatal("validatePerRouteLua(wrong type): want error; got nil")
+		}
+		const wantPrefix = "lua: per-route: expected *luav3.LuaPerRoute, got "
+		if !strings.HasPrefix(err.Error(), wantPrefix) {
+			t.Fatalf("validatePerRouteLua err = %q; want prefix %q", err.Error(), wantPrefix)
+		}
+	})
+
+	// nil oneof → byte-exact parseRejectPerRouteOneofRequired.
+	t.Run("NilOneof_OneofRequired", func(t *testing.T) {
+		t.Parallel()
+		err := validatePerRouteLua(&luav3.LuaPerRoute{})
+		if err == nil {
+			t.Fatal("validatePerRouteLua(&LuaPerRoute{}): want error; got nil")
+		}
+		if err.Error() != parseRejectPerRouteOneofRequired {
+			t.Fatalf("validatePerRouteLua err = %q; want %q", err.Error(), parseRejectPerRouteOneofRequired)
+		}
+	})
+}
+
+// testBuildCompiledConfigSourceCodes covers the phase 22.3 Task 1 SourceCodes
+// consume path: registry population, content-hash dedup, and error leaves.
+func testBuildCompiledConfigSourceCodes(t *testing.T) {
+	// ---- single entry: InlineString → cc.sourceCodes["a"] non-nil ----
+	t.Run("SingleEntry_InlineString", func(t *testing.T) {
+		t.Parallel()
+		m := validLuaConfig()
+		m.SourceCodes = map[string]*corev3.DataSource{
+			"a": {
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: "function envoy_on_request(rh) end\n",
+				},
+			},
+		}
+		cc, err := buildCompiledConfig(toAny(t, m))
+		if err != nil {
+			t.Fatalf("buildCompiledConfig: want nil error; got %v", err)
+		}
+		if cc == nil {
+			t.Fatal("buildCompiledConfig: want non-nil *compiledConfig; got nil")
+		}
+		if cc.sourceCodes == nil {
+			t.Fatal("cc.sourceCodes: want non-nil map; got nil")
+		}
+		chunk := cc.sourceCodes["a"]
+		if chunk == nil {
+			t.Fatal(`cc.sourceCodes["a"]: want non-nil *Chunk; got nil`)
+		}
+	})
+
+	// ---- two distinct entries → two distinct *Chunk pointers ----
+	t.Run("TwoEntries_TwoDistinctChunks", func(t *testing.T) {
+		t.Parallel()
+		m := validLuaConfig()
+		m.SourceCodes = map[string]*corev3.DataSource{
+			"alpha": {
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: "function envoy_on_request(rh) end\n",
+				},
+			},
+			"beta": {
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: "function envoy_on_response(rh) end\n",
+				},
+			},
+		}
+		cc, err := buildCompiledConfig(toAny(t, m))
+		if err != nil {
+			t.Fatalf("buildCompiledConfig: want nil error; got %v", err)
+		}
+		chunkAlpha := cc.sourceCodes["alpha"]
+		chunkBeta := cc.sourceCodes["beta"]
+		if chunkAlpha == nil {
+			t.Fatal(`cc.sourceCodes["alpha"]: want non-nil *Chunk; got nil`)
+		}
+		if chunkBeta == nil {
+			t.Fatal(`cc.sourceCodes["beta"]: want non-nil *Chunk; got nil`)
+		}
+		if chunkAlpha == chunkBeta {
+			t.Fatal("cc.sourceCodes[alpha] == cc.sourceCodes[beta]: want distinct *Chunk pointers for distinct content")
+		}
+	})
+
+	// ---- source_codes only (no default_source_code) → cc.chunk == nil AND
+	// cc.sourceCodes non-nil. Exercises the nil-default early-return path in
+	// buildCompiledConfig (the arm-5 D1-REFUTED branch that returns before
+	// resolveDataSource + CompileScript for default_source_code). ----
+	t.Run("SourceCodesOnly_NoDefault_ChunkNilSourceCodesPopulated", func(t *testing.T) {
+		t.Parallel()
+		// Deliberately omit DefaultSourceCode — use a bare *luav3.Lua with only
+		// SourceCodes populated (no default_source_code field set).
+		m := &luav3.Lua{
+			SourceCodes: map[string]*corev3.DataSource{
+				"only": {
+					Specifier: &corev3.DataSource_InlineString{
+						InlineString: "function envoy_on_request(rh) end\n",
+					},
+				},
+			},
+		}
+		cc, err := buildCompiledConfig(toAny(t, m))
+		if err != nil {
+			t.Fatalf("buildCompiledConfig: want nil error; got %v", err)
+		}
+		if cc == nil {
+			t.Fatal("buildCompiledConfig: want non-nil *compiledConfig; got nil")
+		}
+		// nil-default early-return path: cc.chunk MUST be nil.
+		if cc.chunk != nil {
+			t.Fatalf("cc.chunk: want nil (no default_source_code); got %#v", cc.chunk)
+		}
+		// sourceCodes MUST be non-nil and populated simultaneously.
+		if cc.sourceCodes == nil {
+			t.Fatal("cc.sourceCodes: want non-nil map; got nil")
+		}
+		if cc.sourceCodes["only"] == nil {
+			t.Fatal(`cc.sourceCodes["only"]: want non-nil *Chunk; got nil`)
+		}
+	})
+
+	// ---- two entries with byte-identical content → SAME *Chunk pointer
+	// (content-hash dedup via shared CompileCache). ----
+	t.Run("TwoEntries_IdenticalContent_SameChunkPointer", func(t *testing.T) {
+		t.Parallel()
+		script := "function envoy_on_request(rh) end\n"
+		m := validLuaConfig()
+		m.SourceCodes = map[string]*corev3.DataSource{
+			"x": {Specifier: &corev3.DataSource_InlineString{InlineString: script}},
+			"y": {Specifier: &corev3.DataSource_InlineString{InlineString: script}},
+		}
+		cc, err := buildCompiledConfig(toAny(t, m))
+		if err != nil {
+			t.Fatalf("buildCompiledConfig: want nil error; got %v", err)
+		}
+		cx := cc.sourceCodes["x"]
+		cy := cc.sourceCodes["y"]
+		if cx == nil || cy == nil {
+			t.Fatalf("cc.sourceCodes: want both non-nil; got x=%v y=%v", cx, cy)
+		}
+		// Content-hash dedup: identical bytes MUST yield the same *Chunk pointer.
+		if cx != cy {
+			t.Fatalf("cc.sourceCodes[x] != cc.sourceCodes[y]: want SAME *Chunk pointer for byte-identical content (content-hash dedup via shared CompileCache)")
+		}
+	})
 }
 
 // -----------------------------------------------------------------------------
@@ -399,8 +546,19 @@ func TestParseRejectConstants_ByteExactWording(t *testing.T) {
 	}{
 		{"Arm01", parseRejectTypedConfigRequired, "lua: typed_config required"},
 		{"Arm03", parseRejectInlineCodeDeprecated, "lua: inline_code is deprecated; use default_source_code"},
-		{"Arm04", parseRejectSourceCodesDeferred, "lua: source_codes map is not yet supported (lands in phase 22.3)"},
-		{"Arm18", parseRejectPerRouteDeferred, "lua: per-route configuration is not yet supported (lands in phase 22.3)"},
+		// Arm04 deferred const (parseRejectSourceCodesDeferred) retired at phase
+		// 22.3 Task 1 — the arm-4 reject is replaced by the consume path. The
+		// new constants for the consume path error leaves are pinned here:
+		{"SourceCodesKeyEmpty", parseRejectSourceCodesKeyEmpty, "lua: source_codes: key must be non-empty"},
+		{"SourceCodesValueFmt", wrapParseRejectSourceCodesValueFmt, `lua: source_codes[%q]: %w`},
+		// Arm18 per-route const family — retired deferred wording;
+		// real 4 consts live in perroute.go + pinned at
+		// perroute_test.go::TestParsePerRouteConsts_ByteExactWording.
+		// Representative spot-checks here for cross-package visibility:
+		{"Arm18_OneofRequired", parseRejectPerRouteOneofRequired, "lua: per-route: override oneof is required"},
+		{"Arm18_DisabledFalse", parseRejectPerRouteDisabledFalse, "lua: per-route: disabled must be true (PGV const:true violation)"},
+		{"Arm18_NameEmpty", parseRejectPerRouteNameEmpty, "lua: per-route: name length must be at least 1 rune"},
+		{"Arm18_SourceCodeWrap", wrapParseRejectPerRouteSourceCodeFmt, "lua: per-route: source_code: %w"},
 	}
 	for _, tc := range cases {
 		if tc.got != tc.want {

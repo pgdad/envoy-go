@@ -1,0 +1,38 @@
+# Human-readable scenario expectations for fixture
+# 0029-http-lua-source-codes-boot-reject (phase 22.3 IMPL Task 5).
+#
+# NOT consumed by the differential runner — the runner's runBootRejectFixture
+# branch drives the assertion. This file is a documentation aid.
+#
+# This is a BOOT-REJECT fixture (BootRejectFixture interface). It has ONE
+# scenario (g): a source_codes entry carrying a COMPILE-ERROR script must
+# fail-closed at config-load on BOTH reference Envoy v1.37.2 and envoy-go.
+
+scenarios:
+  - id: g
+    name: source_codes-compile-error-boot-reject
+    listener: l_test_a
+    mode: boot-reject (cross-side both-fail)
+    description: |
+      The listener Lua filter has a VALID no-op default_source_code plus a
+      source_codes{bad: <compile-error script>} entry. At config-load BOTH
+      sides eagerly compile every source_codes entry:
+        - reference Envoy: FilterConfig ctor compiles each entry (LuaJIT) →
+          parse error → boot reject.
+        - envoy-go: Task 1 consume path calls internallua.CompileScript on
+          each entry (gopher-lua) → parse error → boot reject.
+      The runner asserts BOTH proxies exit non-zero AND BOTH stderr buffers
+      contain the common substring ExpectedBootErrorSubstring() (determined
+      empirically; see README + driver.go).
+    expected: both-fail-to-boot
+
+# The broken Lua source (inline_string in the source_codes{bad} entry):
+#   function envoy_on_request(handle) end this-is-not-valid-lua-syntax
+# The trailing tokens after `end` are NOT valid Lua 5.1 syntax.
+#
+# NOT built here (covered elsewhere):
+#   (f) source_codes key-empty — subject-only (upstream ACCEPTS an empty key,
+#       so it cannot be a both-fail BootRejectFixture); covered by Task 1 unit
+#       PARSE-REJECT tests.
+#   (h) per-route source_code DataSource-failure — covered by Task 2 unit
+#       PARSE-REJECT tests + Task 4 fuzzing.

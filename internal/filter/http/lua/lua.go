@@ -29,9 +29,10 @@ package lua
 // cmd/envoy-go/main.go via the exported RegisterPerRouteValidator
 // function (mirrors header_mutation + oauth2 precedent). Do NOT call
 // it inside New: New is invoked by the listener constructor which
-// runs AFTER Freeze, so any call here would panic. The validator
-// one-liner returns the arm-18 PARSE-REJECT "lua: per-route
-// configuration is not yet supported (lands in phase 22.3)".
+// runs AFTER Freeze, so any call here would panic. Per-route
+// validation is the real 3-arm LuaPerRoute validator landed at
+// phase 22.3 (parsePerRouteLua in perroute.go); it enforces the
+// disabled / name / source_code oneof at HCM-build time.
 
 import (
 	"context"
@@ -228,24 +229,26 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 // Freeze, and New is called during listener construction (after Freeze).
 // Mirrors the header_mutation + oauth2 precedent.
 //
-// TASK 1 SKELETON: declared so that the Task 10 boot-registration step
-// can wire `lua.RegisterPerRouteValidator(httpReg)` before
-// httpReg.Register(lua.TypeURL, lua.New). The validator body itself
-// returns the arm-18 PARSE-REJECT at 22.1; 22.3 IMPL replaces the body
-// with the 9th-canonical per-route shape validator.
+// The validator is the real 3-arm LuaPerRoute shape validator landed at
+// phase 22.3; see validatePerRouteLua + parsePerRouteLua in perroute.go.
+// Registration ordering: wire RegisterPerRouteValidator before
+// httpReg.Register(lua.TypeURL, lua.New) — the registry rejects
+// registrations after Freeze, and New runs post-Freeze.
 func RegisterPerRouteValidator(reg interface {
 	RegisterPerRouteValidator(filterName string, validator func(proto.Message) error)
 }) {
 	reg.RegisterPerRouteValidator(filterName, validatePerRouteLua)
 }
 
-// validatePerRouteLua is the per-route arm-18 PARSE-REJECT one-liner
-// per ADR-0110 single-chokepoint + parent §6.2 arm 18 + PLAN D-P6.
-// Wording is byte-pinned for the regression-asserted error-string
-// surface at Task 11 fuzzer + cross-side fixture coverage; 22.3 IMPL
-// replaces the body with the 9th-canonical per-route shape validator.
-func validatePerRouteLua(_ proto.Message) error {
-	return errors.New("lua: per-route configuration is not yet supported (lands in phase 22.3)")
+// validatePerRouteLua is the ADR-0110 single-chokepoint per-route
+// validator for the envoy.filters.http.lua filter. Delegates to
+// parsePerRouteLua (perroute.go) which enforces the 3-arm oneof
+// dispatch: disabled (bool must be true) / name (non-empty string) /
+// source_code (DataSource gauntlet + compile-to-validate). Landed at
+// phase 22.3 Task 2 IMPL.
+func validatePerRouteLua(m proto.Message) error {
+	_, err := parsePerRouteLua(m)
+	return err
 }
 
 // filter is the per-stream lua filter instance per 22.1 SPEC §3.1 #6.

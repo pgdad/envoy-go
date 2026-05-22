@@ -15,7 +15,10 @@ package lua
 //   - Arm 1  (typed-config-required)           — IMPL HERE — parseRejectTypedConfigRequired
 //   - Arm 2  (typed-config-unmarshal)          — IMPL HERE — wrapParseRejectTypedConfigUnmarshal
 //   - Arm 3  (inline-code-deprecated-rejected) — IMPL HERE — parseRejectInlineCodeDeprecated
-//   - Arm 4  (source-codes-deferred-to-22-3)   — IMPL HERE — parseRejectSourceCodesDeferred
+//   - Arm 4  (source-codes-consume-22-3)       — IMPL HERE — parseRejectSourceCodesKeyEmpty +
+//                                                wrapParseRejectSourceCodesValueFmt (phase 22.3
+//                                                Task 1 lifts the deferred reject to a full
+//                                                consume path)
 //   - Arm 5  (default-source-code-required)    — D1-REFUTED; SILENT NO-OP (see §D1 below).
 //                                                The wording constant
 //                                                parseRejectDefaultSourceCodeRequired is
@@ -49,13 +52,13 @@ package lua
 //                                                parseRejectScriptMissingHooks is
 //                                                reserved verbatim for the same proto/
 //                                                policy evolution path as arm 5.
-//   - Arm 18 (per-route-deferred-to-22-3)      — IMPL AT TASK 1 — already in lua.go's
-//                                                validatePerRouteLua one-liner (the
-//                                                wording constant
-//                                                parseRejectPerRouteDeferred lives HERE
-//                                                for cross-package regression visibility;
-//                                                lua.go's validator returns the same
-//                                                byte-exact string).
+//   - Arm 18 (per-route validation)             — IMPL AT PHASE 22.3 TASK 2 — the real
+//                                                3-arm LuaPerRoute validator lives in
+//                                                perroute.go::parsePerRouteLua. The
+//                                                wording constants for the 4 per-route
+//                                                reject arms live in perroute.go. The
+//                                                deferred const parseRejectPerRouteDeferred
+//                                                was retired at Task 2.
 //
 // # D1 closure (per 22.1 SPEC §12-D1 + parent §12-D1)
 //
@@ -114,6 +117,8 @@ package lua
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -151,6 +156,27 @@ type compiledConfig struct {
 	// as "no script defined → pass through" without invoking the gopher-lua
 	// VM. Single chunk at 22.1; SourceCodes map adds 22.3.
 	chunk *internallua.Chunk
+
+	// sourceCodes is the name → *Chunk registry populated from
+	// Lua.source_codes at parse time (phase 22.3 Task 1). NIL when the
+	// proto has no source_codes entries (zero-overhead nil-map read). The
+	// map is immutable post-construction; no synchronization required for
+	// reads from the decode/encode hot path.
+	sourceCodes map[string]*internallua.Chunk
+
+	// perRouteChunks is the D-P1 b' per-route source_code override memo,
+	// keyed by the stable *LuaPerRoute proto pointer and populated lazily by
+	// resolveDecodeScript (via resolvePerRouteSourceCode) on first per-route
+	// dispatch. Guarded by perRouteMu. Declared at Task 1 so the
+	// compiledConfig shape was settled for Tasks 2-3 without a struct-layout
+	// churn; consumed by the Task 3 per-route override dispatch.
+	perRouteChunks map[*luav3.LuaPerRoute]*internallua.Chunk
+
+	// perRouteMu guards perRouteChunks (lazy allocation + concurrent
+	// per-route override compilation from multiple stream goroutines).
+	// Declared at Task 1; locked by Task 3. sync.Mutex zero value is valid
+	// (unlocked); no init required.
+	perRouteMu sync.Mutex
 
 	// compileCache is the content-addressed chunk cache (per 22.1 SPEC §3.1).
 	// Held by the compiledConfig so its lifetime matches the listener-config
@@ -191,8 +217,9 @@ const (
 	// precedent).
 	parseRejectInlineCodeDeprecated = "lua: inline_code is deprecated; use default_source_code"
 
-	// Arm 4: source_codes map deferred to phase 22.3.
-	parseRejectSourceCodesDeferred = "lua: source_codes map is not yet supported (lands in phase 22.3)"
+	// source_codes key-empty (arm-group 1 of the phase 22.3 consume path).
+	// Fires when a source_codes map entry has an empty-string key.
+	parseRejectSourceCodesKeyEmpty = "lua: source_codes: key must be non-empty"
 
 	// Arm 5: default_source_code required.
 	//
@@ -224,10 +251,10 @@ const (
 	//nolint:unused // reserved verbatim for D1-REFUTED policy-bump migration path
 	parseRejectScriptMissingHooks = "lua: default_source_code: script defines neither envoy_on_request nor envoy_on_response"
 
-	// Arm 18: per-route configuration deferred to phase 22.3 (registered via
-	// ADR-0110 single-chokepoint validatePerRouteLua in lua.go; the constant
-	// lives here for cross-package regression visibility).
-	parseRejectPerRouteDeferred = "lua: per-route configuration is not yet supported (lands in phase 22.3)"
+	// source_codes value error wrap format (arm-group 2 of the phase 22.3
+	// consume path). Applied when resolveDataSource or CompileScript fails
+	// for a named entry. Verbs: %q (key name) + %w (wrapped inner error).
+	wrapParseRejectSourceCodesValueFmt = "lua: source_codes[%q]: %w"
 
 	// Arm 19: stat_prefix contains characters outside the
 	// `internal/stats/registry.go::nameRE` permitted class. Without this
@@ -290,7 +317,10 @@ func wrapParseRejectScriptCompileFailed(inner error) error {
 //  1. arm 1  — typedConfig nil (PARSE-REJECT)
 //  2. arm 2  — typedConfig.UnmarshalTo(*Lua) fails (PARSE-REJECT, wrapped)
 //  3. arm 3  — InlineCode != "" (PARSE-REJECT)
-//  4. arm 4  — len(SourceCodes) > 0 (PARSE-REJECT)
+//  4. arm 4  — source_codes consume path (phase 22.3 Task 1): sorted-key
+//     iteration; reject empty keys (arm-group 1); resolveDataSource +
+//     CompileScript each value (arm-group 2, prefix source_codes[%q]:);
+//     populate cc.sourceCodes registry into SHARED compileCache.
 //  5. arm 5  — DefaultSourceCode == nil → silent no-op (D1-REFUTED). Returns
 //     *compiledConfig with chunk == nil; runtime hot path treats
 //     nil-chunk as "no script defined → pass through."
@@ -346,16 +376,47 @@ func buildCompiledConfig(typedConfig *anypb.Any) (*compiledConfig, error) {
 		return nil, errors.New(parseRejectInlineCodeDeprecated)
 	}
 
-	// Arm 4: source_codes map deferred to phase 22.3.
-	if len(m.GetSourceCodes()) > 0 {
-		return nil, errors.New(parseRejectSourceCodesDeferred)
-	}
-
 	// Compile cache lives for the compiledConfig lifetime per 22.1 SPEC §4.2
 	// + PLAN D-P5 (GC-driven eviction; no cross-listener / cross-process
 	// global cache). Allocated even on the silent-no-op path so the cache
 	// holder shape is uniform; the (zero-content) cache costs ~few bytes.
 	compileCache := internallua.NewCompileCache()
+
+	// Phase 22.3 Task 1: consume source_codes → name→*Chunk registry.
+	// Iterate in sorted-key order for deterministic compile ordering +
+	// deterministic error reporting. Reject empty-string keys (arm-group 1).
+	// Wrap DataSource resolution + compile errors with the source_codes[%q]:
+	// prefix (arm-group 2). Compile into the SHARED compileCache so
+	// byte-identical entries across source_codes AND default_source_code
+	// dedup to the same *Chunk pointer via content-hash.
+	var sourceCodes map[string]*internallua.Chunk
+	if rawMap := m.GetSourceCodes(); len(rawMap) > 0 {
+		// Sort keys for deterministic iteration.
+		keys := make([]string, 0, len(rawMap))
+		for k := range rawMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		sourceCodes = make(map[string]*internallua.Chunk, len(rawMap))
+		for _, name := range keys {
+			// Arm-group 1: empty key is a misconfiguration — reject immediately.
+			if name == "" {
+				return nil, errors.New(parseRejectSourceCodesKeyEmpty)
+			}
+			// Arms 6-15: DataSource resolution for this entry.
+			src, dsErr := resolveDataSource(rawMap[name])
+			if dsErr != nil {
+				return nil, fmt.Errorf(wrapParseRejectSourceCodesValueFmt, name, dsErr)
+			}
+			// Arm 16: compile into the shared cache.
+			ch, compErr := internallua.CompileScript(src, compileCache)
+			if compErr != nil {
+				return nil, fmt.Errorf(wrapParseRejectSourceCodesValueFmt, name, compErr)
+			}
+			sourceCodes[name] = ch
+		}
+	}
 
 	// Arm 5 (D1-REFUTED): default_source_code absent → silent no-op (degraded
 	// pass-through). Returns *compiledConfig with chunk == nil; the runtime
@@ -366,6 +427,7 @@ func buildCompiledConfig(typedConfig *anypb.Any) (*compiledConfig, error) {
 	if m.GetDefaultSourceCode() == nil {
 		return &compiledConfig{
 			chunk:        nil,
+			sourceCodes:  sourceCodes,
 			compileCache: compileCache,
 			sandbox:      internallua.SandboxConfig{}, // zero-value = StrictUpstreamParity per AMEND-1
 		}, nil
@@ -397,6 +459,7 @@ func buildCompiledConfig(typedConfig *anypb.Any) (*compiledConfig, error) {
 
 	return &compiledConfig{
 		chunk:        chunk,
+		sourceCodes:  sourceCodes,
 		compileCache: compileCache,
 		sandbox:      internallua.SandboxConfig{}, // zero-value = StrictUpstreamParity per AMEND-1
 	}, nil

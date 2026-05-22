@@ -101,8 +101,19 @@ import (
 // §4.3 + 22.2 production coroutine orchestration (Task 19a closure of
 // Task 7 deferred production-HCM-orchestration gap).
 func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	// Step 1: nil-chunk pass-through (D1-REFUTED arm-5 silent-no-op).
-	if f.cc == nil || f.cc.chunk == nil {
+	// Step 1: nil-cc pass-through (defensive) + per-route 3-tier dispatch
+	// (phase 22.3 Task 3). resolveDecodeScript selects the chunk ONCE for this
+	// stream per the load-bearing dispatch invariant: it resolves the matched
+	// route's per-route override (disabled / name / source_code) or falls back
+	// to the listener default (f.cc.chunk). A disabled route OR a nil chunk
+	// (nil listener default, dangling name, or D1-REFUTED arm-5 silent-no-op)
+	// short-circuits BEFORE VM construction → no VM is built → encode's
+	// f.vm == nil guard naturally skips both hooks (upstream nullptr parity).
+	if f.cc == nil {
+		return envoyhttp.Continue
+	}
+	chunk, disabled := f.resolveDecodeScript()
+	if disabled || chunk == nil {
 		return envoyhttp.Continue
 	}
 
@@ -136,9 +147,9 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 	reqUd.Value = f.reqCtx
 	L.SetMetatable(reqUd, L.GetTypeMetatable(requestHandleTypeName))
 
-	// Step 5: execute script top-level. Errors → stats.errors + log +
-	// Continue.
-	if err := f.vm.Run(f.cc.chunk); err != nil {
+	// Step 5: execute the per-route-RESOLVED script top-level. Errors →
+	// stats.errors + log + Continue.
+	if err := f.vm.Run(chunk); err != nil {
 		if f.cc.stats != nil && f.cc.stats.errors != nil {
 			f.cc.stats.errors.Inc()
 		}

@@ -166,6 +166,79 @@
 //   - Task 10: stats.go (3-counter HCM-rooted registration).
 //   - Task 11: fuzz_test.go (28th project-wide fuzzer).
 //
+// # Phase 22.3 — multi-script SourceCodes + per-route LuaPerRoute
+//
+// Phase 22.3 lands the LAST two PARSE-REJECT surfaces (arm 4 + arm 18)
+// + the NEW 9th canonical per-route shape. CONSUME + DISPATCH only:
+// 0 new framework primitives, 0 net-new stats (count STAYS 107), 0
+// net-new bridge methods, 0 net-new BEHAVIOR_CONTRACT departure records
+// (all 22.3 dispositions are upstream-parity).
+//
+//   - SourceCodes registry (Task 1) — buildCompiledConfig consumes
+//     Lua.SourceCodes in SORTED-key order into
+//     cc.sourceCodes map[string]*internallua.Chunk (the name → *Chunk
+//     registry; nil when the proto has no source_codes); each value
+//     resolves via the 22.1 resolveDataSource + compiles via
+//     CompileScript into the SHARED per-listener content-hash
+//     CompileCache (byte-identical named scripts dedup to one *Chunk).
+//     Named scripts are dispatch TARGETS only; default_source_code stays
+//     the sole listener default. Sole SourceCodes-key arm:
+//     "lua: source_codes: key must be non-empty". The arm-4
+//     source_codes-deferred reject is RETIRED.
+//   - LuaPerRoute 3-arm validator (Task 2) — NEW perroute.go
+//     parsePerRouteLua replaces the arm-18 one-liner: oneof-required /
+//     disabled-must-be-true (PGV const:true) / name-min-1-rune (PGV
+//     min_len:1) / source_code DataSource gauntlet (compile-to-validate,
+//     chunk discarded) + defensive default arm (ADR-0018). lua.go's
+//     validatePerRouteLua delegates. 6 net-new config-load arm-groups
+//     (D-P3); arms 3 (reserved-name) + 7 (dangling-name) DROPPED.
+//   - Per-route 3-tier dispatch (Task 3) — (*filter).resolveDecodeScript:
+//     disabled → skip both hooks (no VM built); name → cc.sourceCodes
+//     lookup (hit → run; miss → upstream-parity SILENT NO-OP per
+//     AMEND-22.3-1); source_code → resolvePerRouteSourceCode memo
+//     override; fall through to listener default; else no-op. Matches
+//     upstream getPerLuaCodeSetup() precedence.
+//   - D-P1(b') no-re-read memo — per-route source_code override compiles
+//     with a content-hash cache HIT at bind, proto-pointer-memoized via
+//     cc.perRouteChunks map[*luav3.LuaPerRoute]*Chunk guarded by
+//     cc.perRouteMu. resolveDecodeScript switches GetOverride() DIRECTLY
+//     (does NOT call parsePerRouteLua per stream) so the source_code
+//     Filename DataSource is read ONCE per route, never re-read per
+//     stream. (The PLAN's literal "call parsePerRouteLua at dispatch"
+//     wording would have defeated the no-re-read guarantee; a
+//     read-counting Filename test surfaced + pins the correction. See
+//     REVIEW.md + PROGRESS.md Task 3.)
+//   - Encode-guard fix (Task 3) — encode_headers.go gates on f.vm==nil
+//     (the f.cc.chunk==nil clause DROPPED) so a per-route override on a
+//     default-less listener still fires envoy_on_response.
+//   - 9th canonical (ADR-0125 §(xiv) AMENDMENT, roster 8 → 9) — 3-arm
+//     hybrid combining the 5th canonical's disabled-bool + the 8th
+//     canonical's string-reference-delegation + a NOVEL DataSource-typed
+//     wholesale-override; SHARED stat-discipline (per-route errors charge
+//     to listener-level lua.<prefix>.errors; SHARED-vacuous). Lands at
+//     22.3 IMPL Task 6 per ADR-0193.
+//   - R6 disposition (Task 4) — BenchmarkPerStream_PerRoute_Resolution
+//     resolution-only 10.46 ns/op (0 allocs) + per-stream 31.47 ns/op,
+//     both ~5 orders of magnitude under the 1ms gate. WEAK-default
+//     STANDS; conditional ADR-0194 NOT consumed (STAYS next-free).
+//   - Fuzzer (Task 4) — NEW FuzzLuaPerRouteConfig (30 → 31 project-wide);
+//     FuzzLuaConfigParse corpus extended with source_codes seeds.
+//   - Differential (Task 5) — fixtures 29 → 31 (AUTHORIZED two-directory
+//     amendment, NOT 30): 0028 cross-side multi-listener (5 per-route
+//     scenarios + dangling-name no-op) + 0029 source_codes-boot-reject.
+//     The framework dispatches one branch per directory (cross-side XOR
+//     boot-reject), so the SPEC single-fixture shape split into two dirs.
+//
+// AMEND-22.3-1: a dangling per-route name is an upstream-parity SILENT
+// NO-OP at per-stream dispatch, NOT a config-load PARSE-REJECT (mirrors
+// upstream perLuaCodeSetup() → nullptr → LUA_REFNIL). No reserved-name
+// discipline: default_source_code + source_codes are independent fields.
+// Both are upstream-parity → 0 net-new departure records.
+//
+// 22.3 cross-references: ADR-0193 (NEW combined 22.3 package-shape
+// extension §Decision + §Consequences) + ADR-0125 §(xiv) (9th canonical
+// roster 8 → 9). Parent row 22 closes at 22.3 IMPL phase-done.
+//
 // # Cross-references
 //
 //   - ADR-0188 (NEW internal/lua/ framework primitive; bodies land at

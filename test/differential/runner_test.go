@@ -50,6 +50,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0025-http-adaptive-concurrency/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0026-http-lua-headers-bridge/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0027-http-lua-full-bridge/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0028-http-lua-multi-script-and-per-route/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0029-http-lua-source-codes-boot-reject/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

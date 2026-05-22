@@ -1,0 +1,15 @@
+-- fixture-0029 source_codes compile-error script (scenario g) per phase
+-- 22.3 IMPL Task 5. This is the on-disk symmetry artifact; the actual wire
+-- payload is the inline_string embedded in the boot-reject bootstrap (see
+-- driver.go bootRejectInlineSource) — the runner's runBootRejectFixture
+-- branch does NOT consult ReferenceLogMounter, so a Filename-arm bootstrap
+-- would fail with "Invalid path" before the lua filter ever PARSE-REJECTed
+-- (same harness gap fixture-0026 sidesteps with inline_string).
+--
+-- The trailing tokens after `end` are NOT valid Lua 5.1 syntax — both
+-- LuaJIT (reference Envoy) and gopher-lua (envoy-go) PARSE-REJECT at
+-- config-load when this is placed in a source_codes{} entry. Reference
+-- Envoy's FilterConfig ctor eagerly compiles each source_codes entry;
+-- envoy-go's Task 1 consume path calls CompileScript on each entry — both
+-- fail closed → both boot-reject.
+function envoy_on_request(handle) end this-is-not-valid-lua-syntax

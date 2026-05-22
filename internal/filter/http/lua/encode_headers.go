@@ -60,8 +60,16 @@ import (
 // §4.3 + 22.2 production coroutine orchestration (Task 19a closure of
 // Task 7 deferred production-HCM-orchestration gap).
 func (f *filter) EncodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	// Step 1: nil-prerequisites pass-through.
-	if f.cc == nil || f.cc.chunk == nil || f.vm == nil {
+	// Step 1: nil-prerequisites pass-through. Gated ONLY on f.vm == nil per
+	// the phase 22.3 Task 3 encode-guard fix (load-bearing): a per-route
+	// source_code (or name) override on a DEFAULT-LESS listener means
+	// f.cc.chunk == nil but f.vm != nil (decode built + ran the override VM,
+	// registering envoy_on_response). The old f.cc.chunk == nil guard would
+	// WRONGLY skip envoy_on_response. The per-route SELECTION already happened
+	// ONCE at decode (the matched route does not change mid-stream), so encode
+	// reuses the VM and gates only on VM-presence — observably equivalent to
+	// upstream's per-phase re-resolution.
+	if f.cc == nil || f.vm == nil {
 		return envoyhttp.Continue
 	}
 

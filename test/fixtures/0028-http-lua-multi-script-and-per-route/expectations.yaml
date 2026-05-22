@@ -1,0 +1,88 @@
+# Human-readable scenario expectations for fixture
+# 0028-http-lua-multi-script-and-per-route (phase 22.3 IMPL Task 5).
+#
+# NOT consumed by the differential runner — the runner's CompareBytes branch
+# drives the cross-side assertions. This file is a documentation aid for
+# fixture readers + reviewers.
+#
+# Fixture topology: 6 listeners (l_test_a / l_test_b / l_test_b2 / l_test_c /
+# l_test_d / l_test_e), one per scenario. Shared echobackend on cluster
+# c_backend reflects request headers as JSON; the driver classifies the
+# reflected x-lua-script header into a normalized verdict token. All 6
+# scenarios are CROSS-SIDE byte-exact via CompareBytes. Scripts perform
+# deterministic header mutations ONLY.
+
+scenarios:
+  - id: a
+    name: listener-default
+    listener: l_test_a
+    mode: cross-side
+    description: |
+      Listener Lua filter has default_source_code=default.lua; the route has
+      NO per-route config. The default script runs and adds
+      x-lua-script=default. Both sides reflect the same header.
+    request: { method: GET, path: /scenario_a }
+    expected_x_lua_script: default
+
+  - id: b
+    name: per-route-name-named_a
+    listener: l_test_b
+    mode: cross-side
+    description: |
+      Listener Lua filter has source_codes{named_a,named_b}+default; the route
+      has typed_per_filter_config LuaPerRoute{name:named_a}. The named_a
+      registry script runs → x-lua-script=named_a (NOT the default).
+    request: { method: GET, path: /scenario_b }
+    expected_x_lua_script: named_a
+
+  - id: b2
+    name: per-route-name-dangling-noop
+    listener: l_test_b2
+    mode: cross-side
+    description: |
+      Listener has source_codes{named_a,named_b}+default; the route references
+      LuaPerRoute{name:ghost} — a key NOT present in the registry. Per
+      AMEND-22.3-1 this is a SILENT NO-OP (upstream-parity pass-through; NOT
+      an error; the default does NOT fall through). x-lua-script is ABSENT on
+      both sides → identical pass-through bytes.
+    request: { method: GET, path: /scenario_b2 }
+    expected_x_lua_script: absent
+
+  - id: c
+    name: per-route-source_code-override
+    listener: l_test_c
+    mode: cross-side
+    description: |
+      Listener has default_source_code=default.lua; the route has
+      LuaPerRoute{source_code: <override.lua>}. The inline per-route override
+      runs INSTEAD of the listener default → x-lua-script=override.
+    request: { method: GET, path: /scenario_c }
+    expected_x_lua_script: override
+
+  - id: d
+    name: per-route-disabled
+    listener: l_test_d
+    mode: cross-side
+    description: |
+      Listener has default_source_code=default.lua; the route has
+      LuaPerRoute{disabled:true}. Both decode + encode hooks are skipped — the
+      default script does NOT run → x-lua-script ABSENT on both sides.
+    request: { method: GET, path: /scenario_d }
+    expected_x_lua_script: absent
+
+  - id: e
+    name: multi-script-selection-named_b
+    listener: l_test_e
+    mode: cross-side
+    description: |
+      Listener has source_codes{named_a,named_b}+default; the route selects
+      LuaPerRoute{name:named_b} → x-lua-script=named_b. Paired with scenario
+      (b)'s named_a selection, proves DISTINCT registry entries are picked
+      from the same source_codes map.
+    request: { method: GET, path: /scenario_e }
+    expected_x_lua_script: named_b
+
+# Cross-side scope summary:
+#   Cross-side via CompareBytes: a, b, b2, c, d, e (6 scenarios)
+#   REFERENCE-LESS:              none
+#   Total:                       6 scenarios

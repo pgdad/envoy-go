@@ -468,6 +468,104 @@ func TestFilter_DecodeHeaders_Then_EncodeHeaders_BothHooksFire(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------
+// Task 3 (phase 22.3) — per-route override decode→encode integration
+// ----------------------------------------------------------------------
+
+// newPerRouteTestStats builds a fresh stat-bearing *filterStats with a unique
+// registry prefix so parallel tests do not collide on counter names.
+func newPerRouteTestStats(t *testing.T, prefix string) *filterStats {
+	t.Helper()
+	reg := stats.NewRegistry()
+	return &filterStats{
+		errors:       reg.NewCounter(prefix + ".errors"),
+		executions:   reg.NewCounter(prefix + ".executions"),
+		respondCalls: reg.NewCounter(prefix + ".respond_calls"),
+	}
+}
+
+// TestFilter_PerRoute_SourceCodeOverride_DefaultLessListener_EncodeFires is the
+// encode-guard regression pin (AMEND-22.3 + the load-bearing encode-guard fix):
+// a per-route source_code override defining envoy_on_response on a DEFAULT-LESS
+// listener (cc.chunk == nil) builds + runs the override VM at DecodeHeaders, so
+// f.vm != nil at EncodeHeaders even though cc.chunk == nil. The new encode guard
+// gates only on f.vm == nil, so envoy_on_response MUST fire. The OLD guard
+// (cc.chunk == nil) would wrongly skip it.
+func TestFilter_PerRoute_SourceCodeOverride_DefaultLessListener_EncodeFires(t *testing.T) {
+	fs := newPerRouteTestStats(t, "perroute_sc")
+	cc := &compiledConfig{chunk: nil, compileCache: luaprim.NewCompileCache(), stats: fs}
+	pr := &luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: `function envoy_on_response(rh) rh:headers():add("X-PR-Resp", "1") end`,
+				},
+			},
+		},
+	}
+	f, _ := newResolveTestFilter(cc, pr)
+	t.Cleanup(f.OnDestroy)
+
+	if status := f.DecodeHeaders(http.Header{}, false); status != envoyhttp.Continue {
+		t.Fatalf("decode status = %v; want Continue", status)
+	}
+	if f.vm == nil {
+		t.Fatal("f.vm == nil after DecodeHeaders with source_code override; want non-nil VM")
+	}
+
+	respH := http.Header{}
+	if status := f.EncodeHeaders(respH, false); status != envoyhttp.Continue {
+		t.Fatalf("encode status = %v; want Continue", status)
+	}
+	if got := respH.Get("X-PR-Resp"); got != "1" {
+		t.Errorf("X-PR-Resp = %q; want %q (envoy_on_response must fire despite nil cc.chunk)", got, "1")
+	}
+	if fs.executions.Load() != 1 {
+		t.Errorf("executions = %d; want 1 (only envoy_on_response defined)", fs.executions.Load())
+	}
+}
+
+// TestFilter_PerRoute_Disabled_BuildsNoVM_SkipsBothHooks verifies that a
+// per-route `disabled: true` override builds NO VM at DecodeHeaders (the
+// disabled early-return happens BEFORE VM construction) and consequently skips
+// BOTH the decode + encode hooks (encode is gated by f.vm == nil).
+func TestFilter_PerRoute_Disabled_BuildsNoVM_SkipsBothHooks(t *testing.T) {
+	fs := newPerRouteTestStats(t, "perroute_disabled")
+	defChunk, err := luaprim.CompileScript([]byte(`
+		function envoy_on_request(rh) rh:headers():add("X-Req", "1") end
+		function envoy_on_response(rh) rh:headers():add("X-Resp", "1") end
+	`), nil)
+	if err != nil {
+		t.Fatalf("CompileScript err = %v", err)
+	}
+	cc := &compiledConfig{chunk: defChunk, compileCache: luaprim.NewCompileCache(), stats: fs}
+	pr := &luav3.LuaPerRoute{Override: &luav3.LuaPerRoute_Disabled{Disabled: true}}
+	f, _ := newResolveTestFilter(cc, pr)
+	t.Cleanup(f.OnDestroy)
+
+	reqH := http.Header{}
+	if status := f.DecodeHeaders(reqH, false); status != envoyhttp.Continue {
+		t.Fatalf("decode status = %v; want Continue", status)
+	}
+	if f.vm != nil {
+		t.Fatalf("f.vm = %v; want nil (disabled → no VM construction)", f.vm)
+	}
+	if got := reqH.Get("X-Req"); got != "" {
+		t.Errorf("X-Req = %q; want empty (decode hook must NOT fire on disabled route)", got)
+	}
+
+	respH := http.Header{}
+	if status := f.EncodeHeaders(respH, false); status != envoyhttp.Continue {
+		t.Fatalf("encode status = %v; want Continue", status)
+	}
+	if got := respH.Get("X-Resp"); got != "" {
+		t.Errorf("X-Resp = %q; want empty (encode hook must NOT fire on disabled route)", got)
+	}
+	if fs.executions.Load() != 0 {
+		t.Errorf("executions = %d; want 0 (both hooks skipped on disabled route)", fs.executions.Load())
+	}
+}
+
+// ----------------------------------------------------------------------
 // Task 10 — stats.go statName* byte-exact constants + newFilterStats
 // HCM-rooted registration + cardinality + empty-prefix consecutive-dot
 // + New full-body factory tests
@@ -896,12 +994,14 @@ func (f *fakeRegistry) RegisterPerRouteValidator(filterName string, validator fu
 	f.registered[filterName] = validator
 }
 
-// TestRegisterPerRouteValidator_WiresArmEighteenRejection verifies the
-// exported RegisterPerRouteValidator wires `validatePerRouteLua`
-// (returning the arm-18 PARSE-REJECT) under the canonical filterName
-// `envoy.filters.http.lua`. Pattern mirrors header_mutation +
-// oauth2's `TestRegisterPerRouteValidator` regression precedent.
-func TestRegisterPerRouteValidator_WiresArmEighteenRejection(t *testing.T) {
+// TestRegisterPerRouteValidator_WiresRealValidator verifies the exported
+// RegisterPerRouteValidator wires validatePerRouteLua (delegating to
+// parsePerRouteLua — the real 3-arm LuaPerRoute validator landed at phase
+// 22.3 Task 2) under the canonical filterName `envoy.filters.http.lua`.
+// Pattern mirrors header_mutation + oauth2's TestRegisterPerRouteValidator
+// regression precedent. The deferred one-liner was retired; the validator
+// now enforces the full oneof shape.
+func TestRegisterPerRouteValidator_WiresRealValidator(t *testing.T) {
 	fr := &fakeRegistry{}
 	RegisterPerRouteValidator(fr)
 	v, ok := fr.registered[filterName]
@@ -911,13 +1011,28 @@ func TestRegisterPerRouteValidator_WiresArmEighteenRejection(t *testing.T) {
 	if v == nil {
 		t.Fatal("registered validator is nil; want non-nil")
 	}
-	// Wired validator must return the arm-18 PARSE-REJECT byte-exact.
-	err := v(&luav3.Lua{}) // any non-nil proto.Message; validator ignores body at 22.1.
-	if err == nil {
-		t.Fatal("validator returned nil err; want arm-18 PARSE-REJECT")
+	// Wrong type (non-*LuaPerRoute) → type-assert error (no longer a
+	// "deferred" one-liner; the real validator distinguishes wrong-type vs
+	// nil-oneof vs arm-level rejects).
+	errWrongType := v(&luav3.Lua{})
+	if errWrongType == nil {
+		t.Fatal("validator(*Lua): want error; got nil")
 	}
-	if err.Error() != parseRejectPerRouteDeferred {
-		t.Fatalf("validator err = %q; want %q", err.Error(), parseRejectPerRouteDeferred)
+	if !strings.HasPrefix(errWrongType.Error(), "lua: per-route: expected *luav3.LuaPerRoute, got ") {
+		t.Fatalf("validator(*Lua) err = %q; want prefix %q", errWrongType.Error(), "lua: per-route: expected *luav3.LuaPerRoute, got ")
+	}
+	// Nil-oneof (&LuaPerRoute{}) → byte-exact oneof-required error.
+	errNilOneof := v(&luav3.LuaPerRoute{})
+	if errNilOneof == nil {
+		t.Fatal("validator(&LuaPerRoute{}): want error; got nil")
+	}
+	if errNilOneof.Error() != parseRejectPerRouteOneofRequired {
+		t.Fatalf("validator(&LuaPerRoute{}) err = %q; want %q", errNilOneof.Error(), parseRejectPerRouteOneofRequired)
+	}
+	// Valid per-route → no error.
+	errValid := v(&luav3.LuaPerRoute{Override: &luav3.LuaPerRoute_Name{Name: "myscript"}})
+	if errValid != nil {
+		t.Fatalf("validator(valid Name): want nil error; got %v", errValid)
 	}
 }
 
@@ -1590,6 +1705,122 @@ func runBodyBridgeBenchmark(b *testing.B, bodySize int) {
 		f.vm.Close()
 		f.vm = nil
 	}
+}
+
+// ----------------------------------------------------------------------
+// Task 4 (phase 22.3 IMPL) — R6 per-route resolution benchmark.
+//
+// BenchmarkPerStream_PerRoute_Resolution measures the per-stream cost the
+// multi-script + per-route surface adds at DecodeHeaders: the per-route
+// chunk selection (resolveDecodeScript) including the source_code-override
+// memo hot path (resolvePerRouteSourceCode under cc.perRouteMu). The R6
+// disposition question is "is per-route resolution O(1) and well under
+// 1 ms/stream" — i.e. the reported ns/op for the resolution call should
+// be << 1_000_000 ns (1 ms).
+//
+// Two sub-benchmarks (per the PLAN Task 4 "measure BOTH" provision when
+// the resolution-alone vs full-per-stream choice is a judgment call):
+//
+//   - "resolution-only" — measures resolveDecodeScript() repeatedly on a
+//     fixed *filter wired with a source_code per-route override. After the
+//     first call the override chunk is memoized in cc.perRouteChunks, so
+//     every subsequent call exercises the memo-HIT hot path: a single
+//     RequestRouteConfig() + type-assert + oneof switch + mutex-guarded
+//     map lookup. This is the load-bearing R6 measurement — the per-stream
+//     marginal cost of the per-route dispatch once the memo is warm.
+//   - "per-stream" — measures a fresh *filter per iteration resolving a
+//     source_code override against a SHARED *compiledConfig (the memo is
+//     shared across streams keyed by the stable *LuaPerRoute pointer). This
+//     models the realistic per-stream path where each stream constructs its
+//     own filter but the source_code read+compile happens ONCE (memoized);
+//     all subsequent streams hit the warm memo. Excludes VM construction
+//     (measured by BenchmarkPerStream_FullBridge_LState_Construction) so
+//     the number isolates the per-route resolution marginal cost.
+// ----------------------------------------------------------------------
+
+// buildBenchPerRouteConfig constructs a *compiledConfig + a source_code
+// *LuaPerRoute override for the R6 per-route resolution benchmark. The
+// compiledConfig carries a listener-default chunk + a live compileCache so
+// the memo's first-miss compile lands in the shared cache (content-hash
+// dedup), matching the production buildCompiledConfig wiring.
+func buildBenchPerRouteConfig(b *testing.B) (*compiledConfig, *luav3.LuaPerRoute) {
+	b.Helper()
+	defChunk, err := luaprim.CompileScript([]byte(`function envoy_on_request(rh) end`), nil)
+	if err != nil {
+		b.Fatalf("CompileScript err = %v; want nil", err)
+	}
+	cc := &compiledConfig{
+		chunk:        defChunk,
+		compileCache: luaprim.NewCompileCache(),
+	}
+	pr := &luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: `function envoy_on_response(rh) end`,
+				},
+			},
+		},
+	}
+	return cc, pr
+}
+
+// BenchmarkPerStream_PerRoute_Resolution measures the R6 per-route
+// resolution per-stream marginal cost per phase 22.3 PLAN Task 4. Reports
+// ns/op + allocs/op. The disposition gate: << 1_000_000 ns (1 ms).
+func BenchmarkPerStream_PerRoute_Resolution(b *testing.B) {
+	// resolution-only — fixed filter, repeated resolveDecodeScript calls.
+	// After the first call the source_code override chunk is memoized in
+	// cc.perRouteChunks, so the timed loop exercises the memo-HIT hot path:
+	// RequestRouteConfig() + type-assert + oneof switch + mutex-guarded map
+	// lookup. This isolates the steady-state per-stream resolution cost.
+	b.Run("resolution-only", func(b *testing.B) {
+		cc, pr := buildBenchPerRouteConfig(b)
+		f, _ := newResolveTestFilter(cc, pr)
+		// Warm the memo once outside the timed loop so the first-miss
+		// resolveDataSource + CompileScript cost is excluded — the R6
+		// question is the steady-state O(1) memo-HIT cost per stream.
+		if ch, _ := f.resolveDecodeScript(); ch == nil {
+			b.Fatalf("resolveDecodeScript returned nil chunk for source_code override; want non-nil")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			ch, disabled := f.resolveDecodeScript()
+			if ch == nil || disabled {
+				b.Fatalf("resolveDecodeScript = (%v, %v); want (non-nil, false)", ch, disabled)
+			}
+		}
+	})
+
+	// per-stream — fresh filter per iteration against a SHARED *compiledConfig.
+	// Models the realistic per-stream path: each stream builds its own
+	// *filter (bound to the shared cc) and resolves the per-route override.
+	// The source_code read+compile happens ONCE (memoized keyed by the
+	// stable *LuaPerRoute pointer); all subsequent iterations hit the warm
+	// memo. Excludes VM construction (measured separately) to isolate the
+	// per-route resolution marginal cost a stream pays at DecodeHeaders.
+	b.Run("per-stream", func(b *testing.B) {
+		cc, pr := buildBenchPerRouteConfig(b)
+		// Warm the shared memo once so the per-iteration filter resolves
+		// against a populated cc.perRouteChunks (the realistic steady state
+		// after the first stream on a route has run).
+		{
+			warm, _ := newResolveTestFilter(cc, pr)
+			if ch, _ := warm.resolveDecodeScript(); ch == nil {
+				b.Fatalf("warm resolveDecodeScript returned nil chunk; want non-nil")
+			}
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			f, _ := newResolveTestFilter(cc, pr)
+			ch, disabled := f.resolveDecodeScript()
+			if ch == nil || disabled {
+				b.Fatalf("resolveDecodeScript = (%v, %v); want (non-nil, false)", ch, disabled)
+			}
+		}
+	})
 }
 
 // ----------------------------------------------------------------------

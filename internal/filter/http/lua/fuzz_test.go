@@ -438,6 +438,88 @@ func FuzzLuaConfigParse(f *testing.F) {
 	})
 
 	// -------------------------------------------------------------------------
+	// phase 22.3 Task 4 — source_codes map corpus extension. 22.3 promotes
+	// the source_codes map from the arm-4 PARSE-REJECT (deferred) to a
+	// consumed multi-script registry (compiled_config.go Task 2 consume
+	// path). These seeds drive the New() → buildCompiledConfig source_codes
+	// branch with single-entry / multi-entry / empty-key / bad-value
+	// shapes. Must-never-panic per ADR-0018 (an empty-key or bad-value
+	// entry returning a PARSE-REJECT error is correct behavior; the
+	// property is no-panic).
+	// -------------------------------------------------------------------------
+
+	// Seed 31 — source_codes single-entry (valid InlineString). The
+	// canonical multi-script happy path: one named script compiled into
+	// the registry.
+	addSeed(&luav3.Lua{
+		SourceCodes: map[string]*corev3.DataSource{
+			"hello.lua": {Specifier: &corev3.DataSource_InlineString{
+				InlineString: "function envoy_on_request(rh) end",
+			}},
+		},
+	})
+
+	// Seed 32 — source_codes multi-entry (two valid scripts). Exercises
+	// the map-iteration compile loop across multiple named entries.
+	addSeed(&luav3.Lua{
+		SourceCodes: map[string]*corev3.DataSource{
+			"req.lua": {Specifier: &corev3.DataSource_InlineString{
+				InlineString: "function envoy_on_request(rh) end",
+			}},
+			"resp.lua": {Specifier: &corev3.DataSource_InlineString{
+				InlineString: "function envoy_on_response(rh) end",
+			}},
+		},
+	})
+
+	// Seed 33 — source_codes empty-key entry (the map key is ""). An
+	// empty registry name is a misconfiguration; the consume path must
+	// PARSE-REJECT (or no-op) without panicking.
+	addSeed(&luav3.Lua{
+		SourceCodes: map[string]*corev3.DataSource{
+			"": {Specifier: &corev3.DataSource_InlineString{
+				InlineString: "function envoy_on_request(rh) end",
+			}},
+		},
+	})
+
+	// Seed 34 — source_codes bad-value entry (a named entry whose
+	// DataSource fails the resolve/compile gauntlet: compile error). The
+	// consume path must surface a clean error, not panic.
+	addSeed(&luav3.Lua{
+		SourceCodes: map[string]*corev3.DataSource{
+			"broken.lua": {Specifier: &corev3.DataSource_InlineString{
+				InlineString: "function broken_paren(",
+			}},
+		},
+	})
+
+	// Seed 35 — source_codes bad-value entry (nil DataSource specifier
+	// oneof: bare DataSource{}). Exercises the resolveDataSource arm-6
+	// oneof-unset leaf inside the source_codes loop.
+	addSeed(&luav3.Lua{
+		SourceCodes: map[string]*corev3.DataSource{
+			"empty.lua": {},
+		},
+	})
+
+	// Seed 36 — source_codes + default_source_code BOTH set (the combined
+	// multi-script-plus-listener-default shape). Exercises the consume
+	// path's interaction with the default chunk build.
+	addSeed(&luav3.Lua{
+		DefaultSourceCode: &corev3.DataSource{
+			Specifier: &corev3.DataSource_InlineString{
+				InlineString: "function envoy_on_request(rh) end",
+			},
+		},
+		SourceCodes: map[string]*corev3.DataSource{
+			"override.lua": {Specifier: &corev3.DataSource_InlineString{
+				InlineString: "function envoy_on_response(rh) end",
+			}},
+		},
+	})
+
+	// -------------------------------------------------------------------------
 	// Bonus seed: raw garbage bytes — verifies the arm-2 proto-Unmarshal
 	// failure path returns (nil, error) cleanly via
 	// wrapParseRejectTypedConfigUnmarshal. Not counted in the 30-seed
@@ -1105,5 +1187,223 @@ fz_err = err
 		// errors are Lua runtime-errors caught by pcall(). Any Go panic
 		// surfaces via the defer-recover above.
 		_ = fil.vm.Run(chunk)
+	})
+}
+
+// =========================================================================
+// FuzzLuaPerRouteConfig — 31st project-wide fuzzer per phase 22.3 PLAN
+// Task 4 + ADR-0018 baseline + parent SPEC §6.2 arm 18.
+//
+// Drives arbitrary byte sequences as a marshaled *luav3.LuaPerRoute proto
+// through the HCM-build per-route validator `parsePerRouteLua` (the
+// ADR-0110 single-chokepoint behind validatePerRouteLua). Mirrors
+// FuzzLuaConfigParse's unmarshal-then-validate idiom: the fuzzed bytes are
+// proto-Unmarshaled into a *luav3.LuaPerRoute; an Unmarshal failure is
+// skipped (return) so only successfully-decoded protos reach the
+// validator. parsePerRouteLua is then run.
+//
+// Must-never-panic per ADR-0018 — NOT must-never-error. A PARSE-REJECT
+// (nil-oneof / disabled:false / name:"" / source_code resolve+compile
+// failure) returning (nil, error) is CORRECT behavior; the structural
+// invariant asserted here is the no-panic property. The precise
+// byte-stable PARSE-REJECT wording is asserted by the table-driven rows
+// in perroute_test.go (TestParsePerRouteConsts_ByteExactWording + the
+// arm-dispatch tests), NOT here.
+//
+// # Seed corpus per the PLAN Task 4 roster
+//
+// Authored as in-test `f.Add` seeds (over a testdata/fuzz/ corpus dir)
+// per the established FuzzLuaConfigParse + phase-21/20 precedent. One seed
+// per PGV-mirror arm: nil-oneof / disabled:true / disabled:false / name:"a"
+// / name:"" / source_code InlineString-valid / source_code Filename-ENOENT
+// / source_code compile-error + adversarial DataSource paths
+// (WatchedDirectory, oneof-unset, /dev/null zero-byte, EnvironmentVariable
+// unset). Plus a raw-garbage bonus seed validating the Unmarshal-failure
+// skip path.
+func FuzzLuaPerRouteConfig(f *testing.F) {
+	addSeed := func(m *luav3.LuaPerRoute) {
+		f.Helper()
+		b, err := proto.Marshal(m)
+		if err != nil {
+			f.Fatalf("seed marshal: %v", err)
+		}
+		f.Add(b)
+	}
+
+	// Seed 1 — nil-oneof (bare LuaPerRoute{}; override unset →
+	// parseRejectPerRouteOneofRequired). Marshals to empty bytes; the
+	// fuzz body's Unmarshal succeeds into a proto with nil override.
+	addSeed(&luav3.LuaPerRoute{})
+
+	// Seed 2 — disabled:true (the valid disabled arm → returns the proto
+	// cleanly, no error).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_Disabled{Disabled: true},
+	})
+
+	// Seed 3 — disabled:false (PGV const:true violation →
+	// parseRejectPerRouteDisabledFalse).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_Disabled{Disabled: false},
+	})
+
+	// Seed 4 — name:"a" (the valid name arm → returns the proto cleanly;
+	// the validator does NOT check name-resolves-to-an-entry, that's a
+	// runtime silent-no-op per AMEND-22.3-1).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_Name{Name: "a"},
+	})
+
+	// Seed 5 — name:"" (PGV min_len:1 violation → parseRejectPerRouteNameEmpty).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_Name{Name: ""},
+	})
+
+	// Seed 6 — source_code InlineString valid (resolve + compile-validate
+	// happy path → returns the proto cleanly).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: "function envoy_on_request(rh) end",
+				},
+			},
+		},
+	})
+
+	// Seed 7 — source_code Filename ENOENT (resolveDataSource arm-9 →
+	// wrapped via wrapParseRejectPerRouteSourceCodeFmt).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_Filename{
+					Filename: "/nonexistent/path/to/lua/script/xyzzy.lua",
+				},
+			},
+		},
+	})
+
+	// Seed 8 — source_code compile-error (resolve succeeds, CompileScript
+	// fails on unclosed function → wrapped via the source_code fmt).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: "function broken_paren(",
+				},
+			},
+		},
+	})
+
+	// -------------------------------------------------------------------------
+	// Adversarial DataSource seeds — exercise the source_code arm's full
+	// resolveDataSource gauntlet leaves.
+	// -------------------------------------------------------------------------
+
+	// Seed 9 — source_code with nil specifier oneof (bare DataSource{};
+	// resolveDataSource arm-6 oneof-unset).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{},
+		},
+	})
+
+	// Seed 10 — source_code with WatchedDirectory present (arm-7 deferred
+	// to Runtime/RTDS → wrapped error).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				WatchedDirectory: &corev3.WatchedDirectory{Path: "/tmp/watched"},
+				Specifier: &corev3.DataSource_InlineString{
+					InlineString: "function envoy_on_request(rh) end",
+				},
+			},
+		},
+	})
+
+	// Seed 11 — source_code Filename empty (arm-8 empty-filename leaf).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_Filename{Filename: ""},
+			},
+		},
+	})
+
+	// Seed 12 — source_code Filename zero-byte (/dev/null; arm-10 leaf).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_Filename{Filename: "/dev/null"},
+			},
+		},
+	})
+
+	// Seed 13 — source_code InlineBytes empty (arm-11 leaf).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineBytes{InlineBytes: nil},
+			},
+		},
+	})
+
+	// Seed 14 — source_code EnvironmentVariable unset (arm-14 leaf).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_EnvironmentVariable{
+					EnvironmentVariable: "LUA_PERROUTE_FUZZ_UNSET_XYZZY_789",
+				},
+			},
+		},
+	})
+
+	// Seed 15 — source_code InlineBytes valid (the InlineBytes happy
+	// path; compile-validate succeeds).
+	addSeed(&luav3.LuaPerRoute{
+		Override: &luav3.LuaPerRoute_SourceCode{
+			SourceCode: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineBytes{
+					InlineBytes: []byte("function envoy_on_response(rh) end"),
+				},
+			},
+		},
+	})
+
+	// -------------------------------------------------------------------------
+	// Bonus seed: raw garbage bytes — verifies the proto-Unmarshal failure
+	// path is SKIPPED cleanly (the fuzz body returns without invoking the
+	// validator on un-decodable bytes). Not counted in the per-arm roster.
+	// -------------------------------------------------------------------------
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+
+	// -------------------------------------------------------------------------
+	// Fuzz body — must-never-panic structural assertion per ADR-0018.
+	//
+	// Mirror FuzzLuaConfigParse: unmarshal the fuzzed bytes into the proto
+	// type; on Unmarshal failure SKIP (only validate successfully-decoded
+	// protos). Then run parsePerRouteLua. An error return is fine
+	// (PARSE-REJECT on adversarial input is correct); a Go panic is not.
+	// -------------------------------------------------------------------------
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("parsePerRouteLua panicked: %v\nInput: %x", r, data)
+			}
+		}()
+		pr := &luav3.LuaPerRoute{}
+		if err := proto.Unmarshal(data, pr); err != nil {
+			// Un-decodable bytes: skip. The validator is only exercised on
+			// successfully-decoded protos (mirrors FuzzLuaConfigParse's
+			// arm-2 contract — though here we skip rather than feed the
+			// validator garbage, since parsePerRouteLua takes a typed
+			// proto.Message, not raw bytes).
+			return
+		}
+		// err is fine (PARSE-REJECT is expected on many adversarial inputs);
+		// a panic is not. The two-valued return is discarded because the
+		// structural contract assertion is the no-panic invariant.
+		_, _ = parsePerRouteLua(pr)
 	})
 }
