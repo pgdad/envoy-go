@@ -12265,3 +12265,64 @@ internal/filter/http/lua/  (post-22.3 roster delta)
 
 ---
 
+## ADR-0194: NEW `internal/filter/http/admission_control/` package — SRE-book client-side admission-control algorithm + inline `Rand` (`Uint64()`) + inline `Clock` (`Now()`) seams (NOT framework primitives) + deque-of-per-second-buckets sliding window + integer-modulo reject decision + deterministic-regime differential strategy
+
+**Status:** §Context anchored at the phase-23 SPEC commit per ADR-0044 §Context-draft discipline; **§Decision + §Consequences bodies land at phase-23 IMPL** (the controller + filter materialization Task) per ADR-0044 ADR-on-impl convention.
+**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit; §Decision + §Consequences body land at phase-23 IMPL).
+**Doctrine:** Phase 23 §9 family-row (SIXTEENTH). ADR-0044 ADR-on-impl convention + §Context-draft discipline. ADR-0072 HTTPRegistry boot-fail-fast. ADR-0114 single-token-package precedent.
+**Lands-in:** Phase 23 IMPL controller + filter materialization Task per PLAN.
+
+### Context
+
+ADR-0194 anchors the NEW `internal/filter/http/admission_control/` package landing `envoy.extensions.filters.http.admission_control.v3.AdmissionControl` (the canonical Envoy v1.37.2 SRE-book client-side admission-control filter) as the SIXTEENTH §9 family-row. Phase 23 returns to phase-21's LEAN framework-delta posture (ZERO new `internal/` primitives) after phase-22's substantial `internal/lua/` + `internal/dynamicmetadata/` primitives.
+
+The package owns: (a) the per-HCM-instance sliding-window success-rate controller — a `std::deque`-of-per-second-buckets mirror per SPEC §1.1 AMEND-6 (`thread_local_controller.{h,cc}` v1.37.2; granularity 1s; default `sampling_window` 30s rounded via integer `ms/1000`); (b) the empirically-pinned rejection-probability formula `P_reject = max(0, min(max_rejection_probability, ((n − s/sr_threshold) / (n + 1))^(1/aggression)))` line-cited against `admission_control.cc:161-179` (per SPEC §11 D3 — REFUTES the BRAINSTORM formula on three counts per AMEND-1: `aggression` is an EXPONENT floored to 1.0, NOT a multiplier; `sr_threshold` DIVIDES the success count, NOT a separate gate; the aggression floor `std::max(1.0,·)`); (c) the integer-modulo reject decision `(1e4 · max(P,0)) > (r % 1e4)` (`admission_control.cc:175-178`; per AMEND-2 — REFUTES the BRAINSTORM's float `random()<P` hypothesis); (d) two inline interface seams — `Rand` (`Uint64()`, mirroring `Random::RandomGenerator::random()`; NOT `Float64()` per AMEND-2) + `Clock` (`Now()` over a monotonic clock; the Clock-shaped consumer count reaches 2 with phase-21 but the shapes differ, so it stays inline per SPEC §2.5); (e) the both-sides decode-gate/encode-classify discipline — `DecodeHeaders` gates on `filterEnabled()` + `healthCheck()` (per AMEND-4) then the `averageRps() < rps_threshold` suppression gate (`:87-91`) then the reject decision; `EncodeHeaders`/`EncodeTrailers` classify per `success_criteria` (HTTP default all codes `<500`; gRPC default the 11-code well-known set per AMEND-5; gRPC-status-in-trailers per AMEND-10) and record into the window EXCEPT for rejected/health-check/disabled requests (per AMEND-11); (f) the 503 reject local reply — status 503, EMPTY body, `response_code_details = "denied_by_admission_control"`, no added headers, no grpc_status (per AMEND-7 + D4; the BRAINSTORM "upstream-exact body" implication is refuted — the body is empty); (g) the 3-counter byte-exact stat surface `rq_rejected` / `rq_success` / `rq_failure` (NOT `rq_error` per AMEND-3 D1) under `http.<HCM_stat_prefix>.admission_control.<stat>`, NO gauges (the `ALL_ADMISSION_CONTROL_STATS` macro is `COUNTER`-only); (h) the deterministic-regime differential strategy — the all-admit `P_reject=0` healthy-backend leg is cross-side byte-exact (RNG-independent: `0 > (r%1e4)` is false for every `r`), the forced-reject leg stays subject-only structural (byte-exact promotion requires ≥10000 primed failures in one window/worker per AMEND-2 + D2 — impractical/fragile). The filter is the downstream HCM filter only at MVP (the dual-factory upstream registration deferred per AMEND-9). Boot registration is alphabetical between `adaptive_concurrency` and `bandwidthlimit` (18 HTTP filters post-phase-23). Per SPEC §1, §3.1, §3.2, §4, §6, §7, §11.
+
+### Decision
+
+_(Lands at phase-23 IMPL — the controller + filter materialization Task. Will codify: the package shape + `TypeURL` + `New` factory; the `controller` state machine + the formula + the integer-modulo decision with line-exact lemmata; the inline `Rand`/`Clock` seam signatures; the success/error classification; the deque-window mechanics. Per ADR-0044 in-place edit discipline.)_
+
+### Consequences
+
+_(Lands at phase-23 IMPL. Will record: ZERO new framework primitive; the Clock-shaped EXTRACT-NOW forward-pointer (consumer count 2; shapes differ; deferred per SPEC §8 item 8); the 3-counter byte-exact stat surface (107 → 110, no gauges); the deterministic-regime differential coverage; the D-style hypothesis disposition — ADR-0196 UNCONSUMED at phase-done, HOLD-with-known-risk.)_
+
+**Cross-references:** ADR-0195 (paired RTDS `runtime_key` deferral PARSE-REJECT + enabled-absent-ENABLED semantics); ADR-0186 + ADR-0187 (phase-21 adaptive_concurrency precedent — inline `Clock` seam + RTDS deferral; phase-23 mirrors the inline-seam discipline but the `enabled`-default INVERTS — adaptive_concurrency absent⇒OFF vs admission_control absent⇒ON per AMEND-4); ADR-0143 (SN2 HCM-injected stat-prefix reuse); ADR-0080 (byte-stable PARSE-REJECT wording); ADR-0052 (atomic BEHAVIOR_CONTRACT landing); ADR-0072 + ADR-0100 §2.2 (boot-registration alphabetical discipline); ADR-0114 (underscored single-token package identifier); ADR-0044 (§Context-draft discipline + ADR-on-impl convention); ADR-0045 (split-gate — single-row landing); ADR-0125 (per-route canonical roster — NOT amended at phase 23; REUSE-by-absence; roster STAYS 9); phase-23 BRAINSTORM §1.1 + §2.2 + §2.3 + §2.5 + §5 + §6 + §10; phase-23 SPEC §1 + §3 + §4 + §5 + §6 + §7 + §11 + §13 + §15.
+
+---
+
+## ADR-0195: admission_control RTDS `runtime_key` deferral PARSE-REJECT — every `Runtime{FeatureFlag,Double,Percent,UInt32}` wrapper honored only for its static `default_value`; any non-empty `runtime_key` triggers HCM-parse-time PARSE-REJECT; `enabled`-absent ⇒ ENABLED (OPPOSITE of phase-21 adaptive_concurrency's ADR-0187 enabled-default-OFF)
+
+**Status:** §Context anchored at the phase-23 SPEC commit per ADR-0044 §Context-draft discipline; **§Decision + §Consequences bodies land at phase-23 IMPL** (the compiled_config + PARSE-REJECT roster Task) per ADR-0044 ADR-on-impl convention.
+**Date:** 2026-05-21 (§Context anchor at the phase-23 SPEC commit; §Decision + §Consequences body land at phase-23 IMPL).
+**Doctrine:** Phase 23 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline. ADR-0080 byte-stable config-load wording. The phase-17/18/19/20/21 RTDS-deferral precedent (ADR-0187 nearest).
+**Lands-in:** Phase 23 IMPL compiled_config + PARSE-REJECT roster Task per PLAN.
+
+### Context
+
+ADR-0195 anchors the admission_control RTDS `runtime_key` deferral PARSE-REJECT + the `enabled`-field behavioral semantics, per phase-23 BRAINSTORM Q1 (FULL operator surface minus RTDS) + SPEC §5.2 + §5.3.
+
+The `AdmissionControl` proto v1.37.2 wraps four operator knobs in Runtime-keyed wrappers: `enabled` (`RuntimeFeatureFlag`), `aggression` (`RuntimeDouble`), `sr_threshold` + `max_rejection_probability` (`RuntimePercent`), `rps_threshold` (`RuntimeUInt32`). Each wrapper carries a static `default_value` + a `runtime_key` string; upstream consults the runtime layer when `runtime_key` is non-empty, falling back to `default_value`. envoy-go has no runtime-features layer at MVP (phase-20 S2 settled). Phase-23 MVP per BRAINSTORM Q1: honor each wrapper's static `default_value`; **PARSE-REJECT any non-empty `runtime_key`** (the five arms per SPEC §5.2) with byte-stable wording per ADR-0080 + a forward-pointer to the future Runtime/RTDS family phase. This mirrors the phase-17/18/19/20/21 RTDS-deferral precedent (ADR-0187 nearest — the FOURTEENTH such deferral; phase-23 is the FIFTEENTH).
+
+**`enabled` empty-default semantics (per SPEC §1.1 AMEND-4 + §11 D-followup A — the INVERSION vs phase-21):** the empirical scrape establishes that admission_control's `enabled`-absent semantics are the OPPOSITE of adaptive_concurrency's. The mechanism is `Runtime::FeatureFlag`'s `default_value_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(feature_flag_proto, default_value, true))` (`source/common/runtime/runtime_protos.h:46`): when the `default_value` `BoolValue` wrapper is absent, the hard-coded fallback is **`true`** (NOT the `BoolValue` proto-zero `false`). Combined with the proto doc comment ("If the message is unspecified, the filter will be enabled"), the honored matrix is:
+
+| Case | `enabled` field | `default_value` | `runtime_key` | upstream | envoy-go |
+|---|---|---|---|---|---|
+| 1 | absent entirely | n/a | n/a | ENABLED | ENABLED (matches) |
+| 2 | present | `false` | `""` | DISABLED (pass-through) | DISABLED (matches) |
+| 3 | present | `true` | `""` | ENABLED | ENABLED |
+| 4 | present | any | `"key"` | runtime consults; falls back | **PARSE-REJECT** (this ADR) |
+
+Phase-21 ADR-0187 settled adaptive_concurrency as absent⇒OFF (because its `RuntimeFeatureFlag.default_value` BoolValue proto-zero is `false` and adaptive_concurrency does NOT use the `…,true` fallback macro); admission_control INVERTS to absent⇒ON via the `…,true` fallback. Both are upstream-parity (each matches its own filter's upstream semantics) — NOT a divergence; the `cc.enabled` default in envoy-go's `buildCompiledConfig` is `true` when `enabled` is absent.
+
+### Decision
+
+_(Lands at phase-23 IMPL — the compiled_config + PARSE-REJECT roster Task. Will codify: the five `runtime_key`-non-empty PARSE-REJECT arms with byte-stable wording per SPEC §5.2; the `enabled` honored-matrix default-application per SPEC §5.3; the `default_value`-honoring of the numeric knobs. Per ADR-0044 in-place edit discipline.)_
+
+### Consequences
+
+_(Lands at phase-23 IMPL. Will record: operators configure static thresholds via the wrapper `default_value`s; runtime keying is a forward-pointer to the Runtime/RTDS family phase; the SINGLE envoy-go-strict departure record at BEHAVIOR_CONTRACT `### envoy.filters.http.admission_control` — the RTDS `runtime_key` PARSE-REJECT departure, count 14 → 15; the absent⇒ENABLED upstream-parity matrix.)_
+
+**Cross-references:** ADR-0194 (paired algorithm + package-shape ADR); ADR-0187 (phase-21 adaptive_concurrency RTDS-deferral precedent — nearest; the `enabled`-default INVERTS at phase-23 per AMEND-4); ADR-0080 (byte-stable config-load wording); ADR-0052 (atomic BEHAVIOR_CONTRACT landing); ADR-0044 (§Context-draft discipline + ADR-on-impl convention); phase-23 BRAINSTORM §2.1 + §7.2 + §8 item 1; phase-23 SPEC §2.1 + §5.2 + §5.3 + §11 (D-followup A) + §13.
+
+---
+
