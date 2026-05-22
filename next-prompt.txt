@@ -20,7 +20,7 @@ Per SKILL_ROUTING state 1 → 2, this session does NOT execute filter code — i
 
 ## Pre-existing settled context (DO NOT re-litigate)
 
-Phase 24 BRAINSTORM is DONE and CANONICAL at master tip `75fcfb4` (+ this SHA-fill follow-up). Do NOT reopen the brainstorm Q-decisions:
+Phase 24 BRAINSTORM is DONE and CANONICAL at master tip `8466bab` (brainstorm squash-merge `75fcfb4` + this docs-only SHA-fill follow-up). Do NOT reopen the brainstorm Q-decisions:
 
 - **Q1 (scope/phasing) — SETTLED:** FULL operator surface, SINGLE PHASE through SPEC; the ADR-0045 split-gate is DEFERRED to PLAN time (split-readiness anticipated HIGH; candidate axis 24.1 gRPC client + filter config + descriptor engine for a core action subset + ShouldRateLimit + dispositions + failure modes + cross-side differential / 24.2 remaining actions + X-RateLimit headers + RateLimitPerRoute + stage + vh-override). The SPEC author writes a single full-surface SPEC; the PLAN author applies the split-gate.
 - **Q2 (action roster) — SETTLED:** land the 10 canonical descriptor actions (`source_cluster`, `destination_cluster`, `request_headers`, `remote_address`, `masked_remote_address`, `generic_key`, `header_value_match`, `metadata`, `query_parameters`, `query_parameter_value_match`); PARSE-REJECT the `extension` action (no descriptor-producer extension-point framework) + the deprecated `dynamic_metadata` action.
@@ -29,11 +29,11 @@ Phase 24 BRAINSTORM is DONE and CANONICAL at master tip `75fcfb4` (+ this SHA-fi
 - **Per-route — SETTLED:** `RateLimitPerRoute` anticipated NEW 10th canonical + ADR-0125 amendment 9 → 10 (RE-AMENDS after phase-23's REUSE-by-absence skip); exact shape confirmed at SPEC-time per D3.
 - **Test taxonomy — SETTLED:** FULLY-DETERMINISTIC two-directory differential — a SHARED fake gRPC `RateLimitService` dialed by BOTH sides makes the full path cross-side byte-exact (UNLIKE phase-23's un-matchable RNG; the ext_authz fake-service precedent). `00NN-http-ratelimit` cross-side + `00NN+1-http-ratelimit-boot-reject`; subject-side assertions in `StatsAsserter` per `reference_differential_asserter_dispatch`.
 
-## Base + invariants at master tip `75fcfb4`
+## Base + invariants at master tip `8466bab`
 
-- **Master tip:** `75fcfb4` (squash-merge phase-24-http-filter-global-ratelimit-brainstorm) + this SHA-fill follow-up. Pushed to origin.
+- **Master tip:** `8466bab` (phase 24 BRAINSTORM follow-up: STATE.md SHA-fill + next-prompt advance; docs-only). Predecessor: `75fcfb4` — squash-merge phase-24-http-filter-global-ratelimit-brainstorm. Pushed to origin.
 - **Master tail:**
-  - `<this SHA-fill follow-up> phase 24 BRAINSTORM follow-up: STATE.md SHA-fill + next-prompt advance`
+  - `8466bab phase 24 BRAINSTORM follow-up: STATE.md SHA-fill + next-prompt advance` (this file's commit; master tip)
   - `75fcfb4 Squash merge phase-24-http-filter-global-ratelimit-brainstorm`
   - `88101a7 next-prompt.txt: advance to post-phase-23-IMPL cold-start`
   - `ee2c656 phase 23 IMPL follow-up: STATE.md SHA-fill (TBD -> 577be97 post-squash)`
