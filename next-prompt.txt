@@ -6,7 +6,7 @@ This is a fresh-session prompt for the post-phase-23-PLAN cold-start. **Phase 23
 
 Per SKILL_ROUTING state 3, the post-PLAN session executes PLAN.md task-by-task. The session must:
 
-1. **Create a fresh worktree** per `feedback_git_worktrees.md` (branch `phase-23-http-filter-admission-control-impl`, off master tip `7fa89a4`).
+1. **Create a fresh worktree** per `feedback_git_worktrees.md` (branch `phase-23-http-filter-admission-control-impl`, off master tip `4cd46a8`).
 2. **Run the §Execution-preconditions block** in the PLAN (15 preconditions) at cold-start before Task 1.
 3. **Execute the 12 Tasks** via subagent-driven dispatch (a fresh subagent per Task + two-stage review between tasks). Task graph: **Tasks 2+3 parallelize** (then Task 7 once Task 2 lands); **Tasks 4→5→6→8→9→10/11→12** are the critical path. TDD discipline per task: write the failing test → verify it fails → minimal impl → verify it passes → commit.
 4. **Land the 2 ADR §Decision+§Consequences bodies** at their Lands-in-Task per ADR-0044: **ADR-0194** at Task 4 (controller materialization); **ADR-0195** at Task 2 (compiled_config + PARSE-REJECT roster). Next-free ADR-0196 hypothesized UNCONSUMED at phase-done (D-style HOLD-with-known-risk; one-slot escape-valve buffer).
@@ -18,21 +18,21 @@ Per SKILL_ROUTING state 3, the post-PLAN session executes PLAN.md task-by-task. 
 
 ## Pre-existing settled context (DO NOT re-litigate)
 
-The phase-23 SPEC + PLAN are DONE and CANONICAL at master tip `7fa89a4`. Do NOT reopen the SPEC decisions, the 11 empirical AMENDs, the BRAINSTORM Q-decisions, or the PLAN's task decomposition / 10 PD decisions. The plan-document-reviewer Approved the PLAN on iteration 1 (all framework-grounding claims independently verified).
+The phase-23 SPEC + PLAN are DONE and CANONICAL at master tip `4cd46a8`. Do NOT reopen the SPEC decisions, the 11 empirical AMENDs, the BRAINSTORM Q-decisions, or the PLAN's task decomposition / 10 PD decisions. The plan-document-reviewer Approved the PLAN on iteration 1 (all framework-grounding claims independently verified).
 
 - **The PLAN settled SINGLE-ROW landing** (ADR-0045 split-gate: 12 tasks ≤ 25 AND ~1250-1800 LoC grand-total; natural split axes don't carve). Do NOT re-split.
 - **ZERO new framework primitives + ZERO in-place §Decision AMENDMENTs + ZERO ADR-0125 amendments** (REUSE-by-absence per-route; canonical-per-route roster STAYS 9; FIRST ADR-0125-skip since phase-22). Both seams (`Clock`=`Now()` + `Rand`=`Uint64()`) inline in-package. LEAN posture (matches phase-21).
 - **Two-directory differential STANDS** per `reference_differential_fixture_dispatch_constraint`: `0030-http-admission-control` (cross-side — (b) all-admit P=0 byte-exact + (a)/(c)/(d) subject-only structural) + `0031-http-admission-control-boot-reject` (`sr_threshold < 1.0%` shared reject). Fixtures 31 → 33; fuzzer `FuzzAdmissionControlConfigParse` 31 → 32. The RTDS `runtime_key` reject is NOT a boot-reject fixture (upstream accepts it; that departure is unit-tested + BEHAVIOR_CONTRACT-recorded, count 14 → 15).
 - **Downstream HCM filter only** at MVP (AMEND-9). Boot-registration alphabetical between `adaptive_concurrency` and `bandwidthlimit` (18 HTTP filters post-phase-23-IMPL). 107 → 110 stats (3 counters, no gauges).
 
-## Base + invariants at master tip `7fa89a4`
+## Base + invariants at master tip `4cd46a8`
 
-- **Master tip:** `7fa89a4` (phase 23 PLAN follow-up: STATE.md SHA-fill → `af4a0fe`). Pushed to origin.
+- **Master tip:** `4cd46a8` (next-prompt.txt: advance to post-phase-23-PLAN IMPL cold-start; docs-only, atop the PLAN SHA-fill `7fa89a4` → squash `af4a0fe`). Pushed to origin.
 - **Master tail:**
+  - `4cd46a8 next-prompt.txt: advance to post-phase-23-PLAN IMPL cold-start`
   - `7fa89a4 phase 23 PLAN follow-up: STATE.md SHA-fill (TBD -> af4a0fe post-squash)`
   - `af4a0fe Squash merge phase-23-http-filter-admission-control-plan`
   - `9d6e876 next-prompt.txt: advance to post-phase-23-SPEC PLAN cold-start`
-  - `ec68627 phase 23 SPEC follow-up: STATE.md SHA-fill (TBD → a64ee71 post-squash)`
 - Baseline at master tip (UNCHANGED by the docs-only PLAN commit): **31 differential fixture directories** GREEN (0000-0029; lua 0026-0029 GREEN in isolation; combined runs may hit the documented `freeTCPPort` flake per 22.2 REVIEW §7.4 — not a defect); **31 fuzzers** green; h2spec 53/53 PASS at ADR-0051 v1.32.4 pin; build/vet/lint clean; race-tests clean; **17 HTTP filters wired** (18 anticipated post-phase-23 IMPL); **107 stat names** (110 anticipated post-IMPL); **14 envoy-go-strict departure records** at BEHAVIOR_CONTRACT (15 anticipated post-IMPL). DECISIONS.md tail at **ADR-0195 §Context stub** (ADR-0194 + ADR-0195 §Context drafts landed; §Decision+§Consequences bodies land at IMPL Tasks 4 + 2); **next-free ADR-0196**.
 - Project memories ALL apply: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md` (subagent-driven AT THIS IMPL EXECUTION session), `reference_differential_fixture_dispatch_constraint.md`.
 
