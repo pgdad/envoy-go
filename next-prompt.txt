@@ -21,7 +21,7 @@ Per SKILL_ROUTING state 3, run `superpowers:subagent-driven-development`: a fres
 
 ## Base + invariants at master tip
 
-- **Master tip:** the 24.1 PLAN squash-merge + SHA-fill follow-up (run `git log --oneline -1` to confirm the actual tip SHA for the IMPL worktree base). Predecessors include `5a83fad`/`9e5de25`/`5d0c601`/`bf868a6` (the split squash). Pushed to origin.
+- **Master tip:** `64078a3` (`phase 24.1 PLAN stage-close: STATE.md SHA-fill (TBD-24.1-PLAN-SQUASH -> 1350e69)`; docs-only). Predecessors: `1350e69` (squash-merge of `phase-24.1-global-ratelimit-core-and-route-table-plan` — the 24.1 PLAN.md + STATE state-2→3 advance + ROADMAP row-24.1 annotation + next-prompt repoint; docs-only); `5a83fad`/`9e5de25`/`5d0c601`/`bf868a6` (the split squash + its repoints). Run `git log --oneline -1` to confirm the actual tip SHA for the IMPL worktree base. Pushed to origin.
 - **Baseline at master tip (docs-only since the split):** **33 differential fixture directories** GREEN (0000-0031; lua 0026-0029 + multi-listener combined runs may hit the documented `freeTCPPort` flake per 22.2 REVIEW §7.4 — re-run in isolation); **32 fuzzers** green; h2spec 53/53 at the ADR-0051 v1.32.4 pin; build/vet/lint/race clean; **18 HTTP filters wired** (→ 19 after Task 7 boot-reg); **110 stat names** (→ 114); **15 envoy-go-strict departure records** (→ 18). DECISIONS.md tail at **ADR-0201**; ADR-0197..0200 §Context-anchored; **next-free ADR-0202**.
 - Project memories ALL apply: `feedback_git_worktrees.md`, `feedback_push_to_origin.md`, `feedback_execution_style.md`, `reference_differential_fixture_dispatch_constraint.md`, `reference_differential_asserter_dispatch.md` (scenario h `0032` uses `StatsAsserter`, proven live via deliberate-break).
 
