@@ -407,6 +407,33 @@ const (
 	// runner's in-process accept counter is NOT incremented. Introduced by
 	// phase 23 Task 9 / fixtures 0030 + 0031.
 	HTTPAdmissionControl BackendKind = 23
+	// HTTPGlobalRateLimitGRPC reuses the SHARED echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for the upstream
+	// route + the NEW ratelimitgrpc helper at test/helpers/ratelimitgrpc/
+	// for the in-process gRPC rate-limit service. 2-cluster topology
+	// (one HCM listener l_test_a plaintext with `ratelimit → router`
+	// filter chain + cluster c_backend → echobackend subprocess +
+	// cluster c_ratelimit → ratelimitgrpc subprocess with
+	// `http2_protocol_options: {}`). No TLS — phase 24.1 fixture is
+	// HTTP/1.1 plaintext downstream + plaintext h2c rls cluster per
+	// parent SPEC §7.2. The ratelimitgrpc helper is lifecycle-managed
+	// BY THE DRIVER (it needs the per-scenario Script registrations);
+	// this switch-case only allocates the upstream echo backend. Because
+	// both helpers run as subprocesses (echobackend) or in-process
+	// (ratelimitgrpc), the runner's in-process accept counter is NOT
+	// incremented. The shared fake RateLimitService emits
+	// `RateLimitResponse` by proto field NUMBER + omits unset optionals
+	// (`raw_body`/`dynamic_metadata`/`quota`/per-descriptor
+	// `current_limit`/`limit_remaining`/`duration_until_reset`/`quota`)
+	// per planner-time decisions D-RL5 + AMEND-6 — load-bearing for the
+	// cross-side byte-exact OVER_LIMIT comparison in fixture-0032
+	// scenarios (c) over_limit_429 + (d) descriptors_core_actions.
+	// The blank-import for fixture 0032's driver package lands at
+	// Task 10; this switch-case at runner_test.go is wired ahead of
+	// the rollout at Task 9 so the BackendKind dispatch is complete
+	// for the Task 10 + 11 fixtures. Introduced by phase 24.1 Task 9 /
+	// fixtures 0032 + 0033.
+	HTTPGlobalRateLimitGRPC BackendKind = 24
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

@@ -48,6 +48,7 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	ext_authzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
@@ -3588,6 +3589,10 @@ func (c *fakeExtAuthzDCB) ListenerPrincipal() string        { return "" }
 func (c *fakeExtAuthzDCB) DownstreamTLSConnectionState() *stdtls.ConnectionState { return nil }
 func (c *fakeExtAuthzDCB) DynamicMetadata() *dynamicmetadata.Bucket              { return nil }
 
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (c *fakeExtAuthzDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *fakeExtAuthzDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+
 func (c *fakeExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++
 	c.localReplyArgs = &localReplyRecord6{status: status, body: body, headers: headers}
@@ -4256,6 +4261,10 @@ func (c *asyncExtAuthzDCB) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (c *asyncExtAuthzDCB) DownstreamTLSConnectionState() *stdtls.ConnectionState { return nil }
 func (c *asyncExtAuthzDCB) DynamicMetadata() *dynamicmetadata.Bucket              { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (c *asyncExtAuthzDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *asyncExtAuthzDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 func (c *asyncExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.mu.Lock()

@@ -247,6 +247,10 @@ func (r *recordingDCB) ListenerPrincipal() string        { return "" }
 func (r *recordingDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (r *recordingDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (r *recordingDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (r *recordingDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+
 // makeFilter constructs a fault filter with the supplied abort.http_status,
 // abort.percentage, and headers-field shape, returning the *filter and the
 // attached *recordingDCB. Used by the Task-4 abort-only / headers / percentage

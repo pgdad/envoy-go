@@ -1,0 +1,89 @@
+# Reference Envoy bootstrap for fixture 0033-http-ratelimit-boot-reject.
+#
+# Per phase 24.1 SPEC §7.2 + §5.1 row 1 + PLAN Task 11 + D-RL4.
+# This file is a DOCUMENTATION ARTIFACT — the actual boot-reject bootstrap
+# is synthesized inline in renderBootRejectBootstrap() (driver.go) per
+# Option B2 (fixture-0029 / 0031 precedent). The runner's
+# tryStartReferenceProxy does NOT consult ReferenceLogMounter, so a
+# file-based bootstrap would fail with "Invalid path" before the filter
+# ever PARSE-REJECTed.
+#
+# The boot-reject trigger: `domain` field omitted / empty (§5.1 arm 1):
+#   reference Envoy: "Proto constraint validation failed
+#     (RateLimitValidationError.Domain: value length must be at least 1 characters)"
+#   envoy-go: "ratelimit: domain is required"
+# Common substring (D-RL4): "omain" (case-folded fragment of `domain` /
+# `Domain` — the case-sensitive runner.Contains() assertion requires a
+# fragment shared by both case forms because upstream emits the proto
+# camel-case `Domain` while envoy-go emits the wire-name lowercase
+# `domain`).
+#
+# NOTE: The driver's renderBootRejectBootstrap() is the authoritative
+# source. This file documents the intended shape for operator reference.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: l_test_a
+      address: { socket_address: { address: 0.0.0.0, port_value: 10133 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_bootreject
+                route_config:
+                  name: rc_bootreject
+                  virtual_hosts:
+                    - name: vh_bootreject
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_unused }
+                http_filters:
+                  - name: envoy.filters.http.ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+                      # domain field intentionally OMITTED (empty string) —
+                      # triggers §5.1 arm 1 PARSE-REJECT on both sides.
+                      rate_limit_service:
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: c_ratelimit
+                          timeout: 1s
+                        transport_api_version: V3
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 0.25s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+    - name: c_ratelimit
+      type: STATIC
+      connect_timeout: 0.25s
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: c_ratelimit
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }

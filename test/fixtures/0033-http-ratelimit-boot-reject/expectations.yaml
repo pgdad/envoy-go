@@ -1,0 +1,58 @@
+# Fixture 0033-http-ratelimit-boot-reject — boot-reject expectations.
+#
+# Per phase 24.1 SPEC §7.2 + §5.1 row 1 + PLAN Task 11 + D-RL4.
+#
+# Fixture type: BOOT-REJECT (BootRejectFixture interface). The runner's
+# runBootRejectFixture branch asserts:
+#   1. Both reference Envoy v1.37.2 AND envoy-go fail to boot (exit non-zero).
+#   2. BOTH captured stderr buffers contain the common substring
+#      "omain" (case-sensitive Contains).
+#
+# Boot-reject trigger:
+#   envoy.filters.http.ratelimit filter config with the `domain` field
+#   omitted (empty string default per proto3).
+#
+# §5.1 arm 1 wording (per SPEC §5.1 table; captured empirically at Task 11):
+#   upstream: "Proto constraint validation failed
+#             (RateLimitValidationError.Domain: value length must be at
+#              least 1 characters)"
+#             (PGV validate.rules.string.min_len = 1 on the `domain` field;
+#              Go-protoc emits the validation-error type name in proto
+#              camel-case → `Domain` with capital D)
+#   envoy-go: "listener manager: listener: 'l_test_a': filter_chains[0]:
+#             hcm: http_filters[0]: factory: ratelimit: domain is required"
+#             (parseRejectDomainRequired const in compiled_config.go;
+#              envoy-go emits the wire-name lowercase form → `domain`)
+#
+# Common substring in both stderr outputs: "omain"
+#
+# Why "omain" and not "domain": the runner's substring assertion is
+# CASE-SENSITIVE (`strings.Contains`). Upstream emits the proto camel-case
+# form `Domain` (capital D); envoy-go emits the wire-name lowercase form
+# `domain`. Neither full-case spelling appears in BOTH stderr buffers.
+# The 5-character fragment `omain` IS shared (present in both `Domain`
+# and `domain`), is distinctive (no unrelated tokens contain it in either
+# stderr), and satisfies the AMEND-10 option 2 "substring anywhere in
+# stderr" discipline.
+#
+boot_reject:
+  trigger: "envoy.filters.http.ratelimit filter config with empty `domain` (§5.1 arm 1)"
+  expected_substring: "omain"
+  upstream_stderr_excerpt: "Proto constraint validation failed (RateLimitValidationError.Domain: value length must be at least 1 characters)"
+  envoy_go_stderr_excerpt: "listener manager: listener: 'l_test_a': filter_chains[0]: hcm: http_filters[0]: factory: ratelimit: domain is required"
+  rationale: >
+    SPEC §5.1 arm 1 (the upstream RateLimit proto pins
+    validate.rules.string.min_len = 1 on the `domain` field; envoy-go's
+    compiled_config.go arm 1 mirrors the constraint with the byte-stable
+    wording "ratelimit: domain is required"). Both implementations reject
+    at config-load with distinctive stderr messages sharing the substring
+    "omain" (a case-folded fragment of `domain` / `Domain`). This is the
+    canonical boot-reject for the global ratelimit filter per SPEC §7.2
+    + D-RL4.
+
+# Per §7.2: the §5.2 envoy-go-strict route-level PARSE-REJECTs
+# (disable_key non-empty, extension action, dynamic_metadata action) are
+# NOT boot-reject fixtures because upstream Envoy ACCEPTS those configs
+# (the wording is envoy-go-strict). They are covered by the Task 3 unit
+# PARSE-REJECT tests + ADR-0200 + the BEHAVIOR_CONTRACT partial bundle
+# landing at Task 12.

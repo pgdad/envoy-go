@@ -45,6 +45,7 @@ import (
 	commonmutationv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	extprocsvcv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -1005,6 +1006,10 @@ func (f *fakeDCB) ListenerPrincipal() string        { return "" }
 // dynamic-metadata surface.
 func (f *fakeDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (f *fakeDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (f *fakeDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (f *fakeDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 func (f *fakeDCB) calls() int {
 	f.mu.Lock()
@@ -4006,6 +4011,10 @@ func (d *perRouteSwapDCB) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (d *perRouteSwapDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (d *perRouteSwapDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (d *perRouteSwapDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (d *perRouteSwapDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 var _ envoyhttp.DecoderFilterCallbacks = (*perRouteSwapDCB)(nil)
 

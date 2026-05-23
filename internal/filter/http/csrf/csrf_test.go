@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	csrfv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/csrf/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -569,3 +570,7 @@ func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (c *fakeCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (c *fakeCallbacks) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *fakeCallbacks) VirtualHostRateLimits() []*routev3.RateLimit { return nil }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"testing"
 
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -47,6 +48,12 @@ func (c *fakeDecoderCB) ListenerPrincipal() string        { return "" }
 // conformance assertion green.
 func (c *fakeDecoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2 HCM
+// route-table rate_limits exposure). Zero-value returns keep the
+// TestDecoderFilterCallbacks_Compile compile-time conformance assertion green.
+func (c *fakeDecoderCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *fakeDecoderCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 func TestDecoderFilterCallbacks_Compile(t *testing.T) {
 	var _ DecoderFilterCallbacks = (*fakeDecoderCB)(nil)

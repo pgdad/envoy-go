@@ -89,6 +89,10 @@ func (c *fakeOAuth2DCB) ListenerPrincipal() string        { return "" }
 func (c *fakeOAuth2DCB) DownstreamTLSConnectionState() *stdtls.ConnectionState { return nil }
 func (c *fakeOAuth2DCB) DynamicMetadata() *dynamicmetadata.Bucket              { return nil }
 
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (c *fakeOAuth2DCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *fakeOAuth2DCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+
 func (c *fakeOAuth2DCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++
 	c.lastStatus = status

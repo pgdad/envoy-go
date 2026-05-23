@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -110,6 +111,10 @@ func (c *recordedDCB) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (c *recordedDCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *recordedDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (c *recordedDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *recordedDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 // recordedECB is the EncoderFilterCallbacks test-double (encode-side
 // counterpart). All methods are zero-value stubs since encode_headers.go

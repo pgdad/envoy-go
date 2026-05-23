@@ -42,6 +42,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/localratelimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/lua"
 	"github.com/esalaine/envoy-go/internal/filter/http/oauth2"
+	"github.com/esalaine/envoy-go/internal/filter/http/ratelimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/httpclient"
@@ -142,6 +143,7 @@ func main() {
 	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
 	httpReg.Register(lua.TypeURL, lua.New)
 	httpReg.Register(oauth2.TypeURL, oauth2.New)
+	httpReg.Register(ratelimit.TypeURL, ratelimit.New) // phase-24.1 Task 7 (ADR-0197 core); 18 → 19 HTTP filters
 	httpReg.Register(rbac.TypeURL, rbac.New)
 	// Register header_mutation per-route validator before Freeze (the registry
 	// rejects registrations after Freeze; New is called post-Freeze during

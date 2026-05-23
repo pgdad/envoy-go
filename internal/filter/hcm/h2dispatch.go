@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
@@ -141,6 +142,14 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 		downstreamLocalAddr:      d.downstreamLocalAddr,
 		downstreamTLSServerName:  d.downstreamTLSServerName,
 		downstreamTLSPeerCertDER: d.downstreamTLSPeerCertDER,
+		// Phase 24.1 Task 5 (ADR-0198 / DELTA-2): thread the matched route's
+		// raw rate_limits[] from the routeEntry into the per-stream dispatch
+		// envelope. The vhost-level slice is sourced directly from
+		// c.f.table.vhostRateLimits at WriteH2 time (no per-stream snapshot
+		// needed — the single-vhost discipline pins it for the Filter
+		// lifetime). nil for routes with no rate_limits[] (the zero-regression
+		// path; chain accessor returns nil).
+		routeRateLimits: entry.rateLimits,
 	}, true
 }
 
@@ -211,6 +220,16 @@ type chainDispatchAction struct {
 	downstreamLocalAddr      net.Addr
 	downstreamTLSServerName  string
 	downstreamTLSPeerCertDER []byte
+
+	// Phase 24.1 Task 5 (ADR-0198 / DELTA-2): the matched route's raw
+	// rate_limits[] threaded from h2Dispatcher.Match's routeEntry capture
+	// into chain.SetRouteRateLimits below in WriteH2. The vhost-level slice
+	// is NOT captured here — it is sourced from c.f.table.vhostRateLimits
+	// directly at WriteH2 time (the single-vhost discipline pins it for the
+	// Filter lifetime; no per-stream snapshot needed). nil for routes with
+	// no rate_limits[] (the zero-regression path) and for the no-match-route
+	// 404 path (the no-chain branch elides the seed entirely).
+	routeRateLimits []*routev3.RateLimit
 }
 
 func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, sw h2.StreamWriter) error {
@@ -294,6 +313,14 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	chain.SetDownstreamTLSPeerCertDER(c.downstreamTLSPeerCertDER)
 	chain.SetDownstreamProtocol("HTTP/2")
 	chain.SetListenerPrincipal(c.f.listenerPrincipal)
+	// Phase 24.1 Task 5 (ADR-0198 / DELTA-2): seed the matched route's + the
+	// parent vhost's raw []*routev3.RateLimit policy slices onto the per-stream
+	// FilterChain BEFORE RunDecodeHeaders. Mirrors the H1 path's seed in
+	// connection.go and the ADR-0165 SetDownstreamRemoteAddr set-once-by-
+	// dispatch discipline; the single-dispatch-goroutine invariant per ADR-0071
+	// applies. nil-passthrough when either slice is empty.
+	chain.SetRouteRateLimits(c.routeRateLimits)
+	chain.SetVirtualHostRateLimits(c.f.table.vhostRateLimits)
 	defer chain.Destroy()
 
 	// Locate the terminal router filter and inject the per-request H2

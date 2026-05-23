@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	gzipv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/compression/gzip/compressor/v3"
 	compressorv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/compressor/v3"
 	"google.golang.org/protobuf/proto"
@@ -1113,6 +1114,10 @@ func (c *fakeCallbacks) ListenerPrincipal() string        { return "" }
 func (c *fakeCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
 func (c *fakeCallbacks) ResponseStatus() int                                { return 0 } // ADR-0196; compressor reads :status via its best-effort header bucket, not this accessor.
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (c *fakeCallbacks) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *fakeCallbacks) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 // ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
 // body-buffering framework primitive). Zero-value return; compressor does

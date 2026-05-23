@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
@@ -142,6 +143,36 @@ type FilterChain struct {
 	downstreamTLSPeerCertDER []byte
 	downstreamProtocol       string
 	listenerPrincipal        string
+
+	// Phase 24.1 Task 5 (ADR-0198 — the route-table rate_limits exposure
+	// framework primitive). routeRateLimits + virtualHostRateLimits carry the
+	// matched route's + parent virtual_host's RAW
+	// []*routev3.RateLimit policy slices seeded by HCM dispatch at chain build
+	// time (BEFORE RunDecodeHeaders). Filter callbacks read via
+	// decoderCB.RouteRateLimits() / VirtualHostRateLimits(); the
+	// descriptor-action INTERPRETATION stays filter-owned (the ratelimit
+	// filter's engine consumes the policies — the framework surfaces RAW
+	// proto slices).
+	//
+	// Zero-value semantics (no SetX call by HCM dispatch):
+	//   - routeRateLimits: nil (route has no rate_limits[], or the
+	//     no-match-route 404 path where HCM elides the seed; or a synthetic
+	//     stream test that bypasses HCM dispatch entirely)
+	//   - virtualHostRateLimits: nil (vhost has no rate_limits[], or the
+	//     same no-match / synthetic paths above)
+	//
+	// Set-once invariant per ADR-0071: the single dispatch goroutine writes
+	// these fields ONCE before filter iteration; filter callbacks are
+	// read-only. No mutex required. Mirrors the ADR-0165 DownstreamRemoteAddr
+	// plumbing template — the D-RL1 byte-confirmation outcome at phase-24.1
+	// Task 5 IMPL: the raw-proto seed fits the existing chain primitive
+	// without divergence (ADR-0202 UNCONSUMED).
+	//
+	// Narrow-exposure / YAGNI: ONLY rate_limits is exposed here; other
+	// route-level data (cors, retry, etc.) stays on the
+	// RequestRouteConfig() / typed_per_filter_config path per ADR-0073.
+	routeRateLimits       []*routev3.RateLimit
+	virtualHostRateLimits []*routev3.RateLimit
 
 	// encodeResponseStatus carries the HTTP response status code (e.g. 200,
 	// 503) for the stream being encoded. Set ONCE by HCM dispatch via
@@ -686,6 +717,23 @@ func (d *decoderCB) ListenerPrincipal() string {
 	return d.c.listenerPrincipal
 }
 
+// RouteRateLimits returns the matched route's HCM-seeded raw
+// []*routev3.RateLimit policy slice (set via SetRouteRateLimits before
+// RunDecodeHeaders). Returns nil for synthetic streams, for routes with no
+// rate_limits[], or for the no-match-route 404 path where HCM elides the
+// seed. Per ADR-0198 §Decision (phase-24.1 Task 5 / DELTA-2).
+func (d *decoderCB) RouteRateLimits() []*routev3.RateLimit {
+	return d.c.routeRateLimits
+}
+
+// VirtualHostRateLimits returns the matched route's parent virtual_host's
+// HCM-seeded raw []*routev3.RateLimit policy slice (set via
+// SetVirtualHostRateLimits before RunDecodeHeaders). Same zero-value
+// semantics as RouteRateLimits. Per ADR-0198 §Decision.
+func (d *decoderCB) VirtualHostRateLimits() []*routev3.RateLimit {
+	return d.c.virtualHostRateLimits
+}
+
 // DownstreamTLSConnectionState returns the chain's HCM-seeded FULL
 // *tls.ConnectionState (set once via SetTLSConnectionState before
 // RunDecodeHeaders). Returns nil for plaintext / non-mTLS / no-client-cert
@@ -968,6 +1016,44 @@ func (c *FilterChain) SetDownstreamProtocol(p string) {
 // passes through unchanged for plaintext listeners.
 func (c *FilterChain) SetListenerPrincipal(p string) {
 	c.listenerPrincipal = p
+}
+
+// SetRouteRateLimits seeds the matched route's raw []*routev3.RateLimit policy
+// slice. Called by HCM dispatch (connection.go H1 / h2dispatch.go H2) at chain
+// build time BEFORE RunDecodeHeaders when the matched routeEntry carries a
+// non-empty rateLimits slice. nil-passthrough for routes with no rate_limits[]
+// (the zero-regression path) — the chain field stays nil, the accessor
+// returns nil. Per ADR-0198 §Decision (phase-24.1 Task 5 / DELTA-2). Mirrors
+// the ADR-0165 SetDownstreamRemoteAddr set-once-by-dispatch discipline; the
+// single-dispatch-goroutine invariant per ADR-0071 applies.
+func (c *FilterChain) SetRouteRateLimits(rls []*routev3.RateLimit) {
+	c.routeRateLimits = rls
+}
+
+// SetVirtualHostRateLimits seeds the matched route's parent virtual_host's
+// raw []*routev3.RateLimit policy slice. Same seeding discipline as
+// SetRouteRateLimits — called by HCM dispatch at chain build time BEFORE
+// RunDecodeHeaders when the parent vhost carries a non-empty rate_limits
+// slice. nil-passthrough for vhosts with no rate_limits[]. Per ADR-0198
+// §Decision.
+func (c *FilterChain) SetVirtualHostRateLimits(rls []*routev3.RateLimit) {
+	c.virtualHostRateLimits = rls
+}
+
+// RouteRateLimits returns the chain's seeded matched-route raw
+// []*routev3.RateLimit policy slice. Test-readable companion to the
+// per-filter decoderCB.RouteRateLimits accessor — production filters read via
+// the callback surface; tests use this chain-level accessor when the filter-
+// instance machinery is not in play (e.g., assertions on chain state after a
+// dispatch-time seed). Per ADR-0198 §Decision.
+func (c *FilterChain) RouteRateLimits() []*routev3.RateLimit {
+	return c.routeRateLimits
+}
+
+// VirtualHostRateLimits is the chain-level test-readable companion to
+// decoderCB.VirtualHostRateLimits. Per ADR-0198 §Decision.
+func (c *FilterChain) VirtualHostRateLimits() []*routev3.RateLimit {
+	return c.virtualHostRateLimits
 }
 
 // SetEncodeResponseStatus seeds the chain's per-stream HTTP response status

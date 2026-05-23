@@ -12,6 +12,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/http/ratelimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -237,10 +238,24 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, err
 	}
 
+	// Phase 24.1 Task 5 (DELTA-2 / ADR-0198): parse + validate the parent
+	// virtual_host's rate_limits[] and propagate them through buildRouteTable
+	// so the resolved routeTable retains the raw slice (the framework's first
+	// exposure of route-level NON-typed_per_filter_config policy data per
+	// ADR-0198). The §5.2 PARSE-REJECT roster (disable_key / extension /
+	// dynamic_metadata) fires here via ratelimit.ValidateRouteRateLimits per
+	// D-RL2 — boot-time fail-fast per ADR-0072, byte-stable wording per
+	// ADR-0080 + Task 3's wording consts.
+	vhostRateLimits := vh.GetRateLimits()
+	if err := ratelimit.ValidateRouteRateLimits(vhostRateLimits); err != nil {
+		return nil, fmt.Errorf("hcm: route_config: virtual_hosts[0]: %w", err)
+	}
+
 	table, err := buildRouteTable(vh.GetRoutes(), clusters)
 	if err != nil {
 		return nil, err
 	}
+	table.vhostRateLimits = vhostRateLimits
 
 	prefix := "http." + statPrefix + "."
 	f := &Filter{
@@ -387,7 +402,21 @@ func buildRouteTable(routes []*routev3.Route, clusters *cluster.Manager) (*route
 		if err != nil {
 			return nil, fmt.Errorf("hcm: route %d: %w", i, err)
 		}
-		t.routes = append(t.routes, routeEntry{match: match, action: action})
+		// Phase 24.1 Task 5 (DELTA-2 / ADR-0198): extract + validate the
+		// route's RouteAction.rate_limits[] when the action arm is Route_Route
+		// (the only arm carrying RouteAction). Direct-response routes have no
+		// RouteAction and therefore no rate_limits — the rateLimits field stays
+		// nil. §5.2 PARSE-REJECT (disable_key / extension / dynamic_metadata)
+		// fires here via ratelimit.ValidateRouteRateLimits per D-RL2; byte-stable
+		// wording per ADR-0080 + Task 3 wording consts.
+		var routeRateLimits []*routev3.RateLimit
+		if rr, ok := r.GetAction().(*routev3.Route_Route); ok {
+			routeRateLimits = rr.Route.GetRateLimits()
+			if err := ratelimit.ValidateRouteRateLimits(routeRateLimits); err != nil {
+				return nil, fmt.Errorf("hcm: route %d: %w", i, err)
+			}
+		}
+		t.routes = append(t.routes, routeEntry{match: match, action: action, rateLimits: routeRateLimits})
 	}
 	return t, nil
 }

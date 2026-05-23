@@ -1,0 +1,221 @@
+# Phase 24.1 fixture 0032 expectations (per ADR-0019 — prose; the driver
+# enforces). Six scenarios per parent SPEC §7.1 (24.1 scope: a/b/c/d-core/e/h).
+#
+# Topology (per parent SPEC §7.3 single-listener; ADR-0166 plaintext h2c rls
+# cluster):
+#
+#   l_test_a (hcm_a)
+#     domain: domain_b
+#     failure_mode_deny: false (AMEND-3 proto-zero default)
+#     rate_limit_service.grpc_service.envoy_grpc.cluster_name: c_ratelimit
+#
+#   c_backend      — synthetic always-200 echobackend subprocess (reused from
+#                    the shared test/helpers/echobackend; Task 9 wiring).
+#   c_ratelimit    — in-process gRPC RateLimitService fake on a driver-
+#                    allocated pre-bound 127.0.0.1:<port> (per the 0021
+#                    extauthzgrpc.NewAtAddr precedent); the cluster carries
+#                    the mandatory http2_protocol_options:{} for gRPC framing.
+#
+# Reference Envoy v1.37.2 (STRICT_DNS via host.docker.internal) vs envoy-go
+# (STATIC, in-process on host loopback).
+#
+# Per parent SPEC §7.1 the cross-side gate is CompareBytes on the driver's
+# emitted per-scenario byte stream (status + body-classification). Subject-
+# side counter assertions for scenario (h) live in StatsAsserter.AssertStats
+# per reference_differential_asserter_dispatch (the runner's runFixture
+# dispatch only invokes SubjectAsserter on the reference-less path; this
+# fixture is cross-side ⇒ SubjectAsserter is NEVER called; subject-side
+# assertions MUST go through StatsAsserter).
+#
+# ## Scenario matrix (24.1 scope)
+#
+# Scenario (a) parse_ok — subject-only structural via cross-side byte stream.
+#   Request:  GET /scenario_a on l_test_a.
+#   Route:    NO rate_limits[] → zero-descriptor short-circuit at the
+#             ratelimit filter (DecodeHeaders Continue).
+#   Both sides: 200 + echo body. The driver emits
+#             "scenario a status=200 body=ok" into the cross-side byte
+#             stream; CompareBytes confirms byte-equivalence.
+#   Counter impact: none (RLS not called).
+#
+# Scenario (b) ok_admit — cross-side byte-exact.
+#   Request:  GET /scenario_b on l_test_a.
+#   Descriptors: [{scenario:b}] (single-action generic_key policy).
+#   RLS script: domain_b|scenario=b → OK (AMEND-6: per-descriptor OK
+#               status; no per-descriptor optionals set).
+#   Both sides: 200 + echo body. CompareBytes on
+#               "scenario b status=200 body=ok".
+#   Counter impact: cluster.c_ratelimit.ratelimit.ok +1 (per side).
+#
+# Scenario (c) over_limit_429 — cross-side byte-exact.
+#   Request:  GET /scenario_c on l_test_a.
+#   Descriptors: [{scenario:c}].
+#   RLS script: domain_b|scenario=c → OVER_LIMIT (proto-number-faithful,
+#               AMEND-6: no RawBody, no Quota, no per-descriptor optionals;
+#               OverallCode=OVER_LIMIT + per-descriptor OVER_LIMIT statuses).
+#   Both sides: 429 + empty body + x-envoy-ratelimited:true header
+#               (AMEND-8 header [a] — emitted because
+#               disable_x_envoy_ratelimited_header is false / absent).
+#   Driver byte stream: "scenario c status=429 body=ok" — body=ok signals
+#               an empty body (no RawBody on the scripted response).
+#   Counter impact: cluster.c_ratelimit.ratelimit.over_limit +1 (per side).
+#
+# Scenario (d) descriptor_actions — cross-side byte-exact (4 core actions).
+#   Request:  GET /scenario_d on l_test_a with
+#             x-tenant: tenant-x, x-canary: true headers.
+#   Descriptors: [{
+#       scenario=d,                  (generic_key)
+#       tenant=tenant-x,             (request_headers; descriptor_key=tenant)
+#       remote_address=127.0.0.1,    (remote_address; loopback peer)
+#       header_match=canaried        (header_value_match with descriptor_value=canaried;
+#                                     headers:[present_match:true on x-canary])
+#   }]
+#   AMEND-6 action-list order is load-bearing: the fake's CanonicalKey
+#   carries entries in the order the engine appended them
+#   (generic_key → request_headers → remote_address → header_value_match).
+#   RLS script: domain_b|scenario=d;tenant=tenant-x;remote_address=127.0.0.1;
+#               header_match=canaried → OK.
+#   Both sides: 200 + echo body. CompareBytes on
+#               "scenario d status=200 body=ok".
+#   Counter impact: cluster.c_ratelimit.ratelimit.ok +1 (per side).
+#   NOTE: destination_cluster is INTENTIONALLY EXCLUDED from this chain
+#         per Task 7 framework-limitation note (no MatchedClusterName()
+#         accessor on DecoderFilterCallbacks at master tip → engine drops
+#         any descriptor whose chain includes the action under empty
+#         cluster-name input). 24.2 may close this gap if a future
+#         framework primitive lands.
+#
+# Scenario (e) failure_mode_open — cross-side byte-exact.
+#   Setup:    driver STOPS the RLS fake BEFORE issuing the request.
+#   Request:  GET /scenario_e on l_test_a.
+#   Descriptors: [{scenario:e}].
+#   RLS dial: fails fast on loopback connection-refused → applyError arm
+#             with failure_mode_deny:false (the AMEND-3 default) →
+#             increment error + failure_mode_allowed → ContinueDecoding
+#             (fail-open admit).
+#   Both sides: 200 + echo body. CompareBytes on
+#               "scenario e status=200 body=ok".
+#   Counter impact:
+#     cluster.c_ratelimit.ratelimit.error                +1 (per side)
+#     cluster.c_ratelimit.ratelimit.failure_mode_allowed +1 (per side)
+#   Driver does NOT restart the fake — scenario (h) is OBSERVATIONAL (no
+#   additional probes) so the fake stays stopped through the end of the run.
+#
+# Scenario (h) stat_surface — subject-only via StatsAsserter.AssertStats.
+#   OBSERVATIONAL — no additional probe burst; (h) asserts the counter
+#   deltas accumulated by the preceding b/c/d/e probes. StatsAsserter.
+#   AssertStats scrapes the SUBJECT admin /stats/prometheus and asserts:
+#
+#     envoy_cluster_ratelimit_ok                  {envoy_cluster_name="c_ratelimit"} = 2
+#     envoy_cluster_ratelimit_over_limit          {envoy_cluster_name="c_ratelimit"} = 1
+#     envoy_cluster_ratelimit_error               {envoy_cluster_name="c_ratelimit"} = 1
+#     envoy_cluster_ratelimit_failure_mode_allowed{envoy_cluster_name="c_ratelimit"} = 1
+#
+#   NOTE: the lines above show the underscore-normalized form (the SN2
+#   dot→underscore transform shape that a future stats-cleanup phase MAY
+#   land). The driver matches BOTH dot-form (SN1 as-implemented:
+#   `envoy_cluster_ratelimit.<stat>`) AND underscore-form
+#   (`envoy_cluster_ratelimit_<stat>`) per the dual-prefix lookup in
+#   driver.go:649-666 (clusterRatelimitCounter + needlePrefixes) — so this
+#   fixture survives a stats-cleanup phase without churn. The current
+#   envoy-go emit shape is the literal-dot form per SN1.
+#
+#   Source:
+#     ok=2                    — scenario (b) + scenario (d) admit arms
+#     over_limit=1            — scenario (c)
+#     error=1                 — scenario (e) RLS unreachable → applyError
+#     failure_mode_allowed=1  — scenario (e) failure_mode_deny:false (the
+#                                AMEND-3 proto-zero default; applyError's
+#                                fail-open arm increments this counter
+#                                INSIDE the error path per dispositions.go).
+#
+#   The observational shape (vs a separate burst phase) is INTENTIONAL —
+#   the in-process fake stops cleanly but the subject's gRPC sub-channel
+#   manages reconnect state per ADR-0158, and a stop-then-restart-on-the-
+#   same-port within a single fixture run is NOT a pattern the existing
+#   fake-toggle fixtures exercise (0021 puts the STOPPED state at the END
+#   of the live batch; never a mid-stream restart). Observational (h)
+#   avoids the reconnect edge AND keeps the per-scenario counter deltas
+#   pinned 1:1 to scenarios (b)/(c)/(d)/(e).
+#
+#   The reference-side counter values are NOT asserted at 24.1 (the
+#   primary cross-side gate is the byte-stream CompareBytes on b/c/d/e).
+#   PROVEN LIVE per reference_differential_asserter_dispatch via the
+#   Task 10 PROGRESS deliberate-break recipe.
+#
+# ## Documented divergence-windows
+#
+# 1. **destination_cluster action — engine-drop under empty cluster-name input.**
+#    The DecoderFilterCallbacks surface has NO MatchedClusterName() accessor
+#    at master tip; decode_headers.go threads clusterName="" to the engine.
+#    The actionDestinationCluster arm at descriptors.go drops the whole
+#    descriptor on empty input (per §4.5 behavior 1). Fixture 0032 does NOT
+#    exercise this action at 24.1 (scenario (d) restricts to the 4 framework-
+#    reachable actions). 24.2 may close this gap if a future framework
+#    primitive lands.
+#
+# 2. **rc-details ABSENT-BY-API on the 3-arg SendLocalReply.**
+#    Parent SPEC §4.7 specifies response_code_details="request_rate_limited"
+#    on OVER_LIMIT replies + "rate_limiter_error" on error/fail-closed. The
+#    3-arg envoyhttp SendLocalReply API carries no rc-details slot; the
+#    constants are pinned at dispositions.go for forward 24.2 consumption
+#    when/if the API extends to a 4-arg variant. Fixture 0032 does NOT
+#    assert rc-details (parent §4.7 documented).
+#
+# 3. **gRPC trailer envelope (8 RESOURCE_EXHAUSTED vs 14 UNAVAILABLE) ABSENT-BY-API.**
+#    Parent §4.7 specifies a gRPC trailer envelope on OVER_LIMIT replies for
+#    gRPC-shaped downstream requests. The 3-arg SendLocalReply has no trailer
+#    slot; cc.rateLimitedAsResourceExhausted is consumed by the
+#    rateLimitedAsResourceExhaustedGrpcCode helper but not emitted at 24.1.
+#    Fixture 0032 does NOT exercise gRPC-shaped downstream requests.
+#
+# 4. **X-RateLimit DRAFT_VERSION_03 headers DEFERRED to 24.2.**
+#    cc.enableXRateLimitHeaders is parsed at 24.1 but the encode-side header
+#    injection (parent §6.6) lands at 24.2 per D-RL7. Fixture 0032 does NOT
+#    set enable_x_ratelimit_headers; scenario (g) at 24.2 will exercise the
+#    field in this same directory.
+#
+# 5. **Stats values asserted SUBJECT-ONLY at 24.1.**
+#    AssertStats reads the SUBJECT counters only; the reference counters are
+#    NOT asserted (the primary cross-side gate is CompareBytes on the
+#    per-scenario byte stream). Reference Envoy v1.37.2 emits the same four
+#    `cluster.<rls>.ratelimit.*` counter names; their values are not pinned
+#    here (24.1 scope).
+#
+# 6. **Cross-side body comparison via STATUS + structural body classification
+#    only — NOT the full echo body.** The cross-side byte stream emits
+#    "scenario <id> status=<code> body=<ok|mismatch(...)>" lines; the body
+#    classification is structural ("ok" iff the response body matches the
+#    per-scenario shape expectation: echo JSON containing method+path keys
+#    for the allow scenarios; empty body for the over_limit scenario). The
+#    full echo body is NOT emitted because reference Envoy adds per-hop
+#    headers (x-forwarded-for, x-request-id, x-envoy-*) that the echobackend
+#    reflects back into its JSON body — those headers diverge from the
+#    envoy-go side. Same discipline as fixtures 0021 + 0030.
+#
+# ## Wall-clock tolerance
+#
+# Fixture 0032 has no throttle / wait-time scenarios. Per-scenario wall-clock
+# is dominated by the gRPC RLS loopback round-trip (< 1ms typical for the
+# success scenarios) + the connection-refused fail-fast on scenario (e)
+# (also < 1ms typical on the host loopback). Total fixture wallclock ~1.5s
+# (5 sequential scenarios + a single fake stop before scenario (e); scenario
+# (h) is OBSERVATIONAL — no additional probes, no fake restart). NO wall-clock-
+# tolerance assertion is enforced.
+#
+# ## Header allow-list
+#
+# Per BEHAVIOR_CONTRACT.md `## Header allow-list`. The cross-side byte stream
+# captures status + body classification (no per-hop header set diff). The
+# OVER_LIMIT scenario does NOT assert the x-envoy-ratelimited header set
+# explicitly in the byte stream — the empty-body assertion + the 429 status
+# carry the load-bearing AMEND-8 emission proof (a regression dropping the
+# header would still emit status 429 + body, but the over_limit counter
+# would still increment — so the cross-side gate is the status + body
+# classification combined with the StatsAsserter on (h)).
+#
+# Cross-refs:
+#   parent SPEC §4.5 + §4.6 + §4.7 + §7.1 + §7.3 + §11.P13 +
+#   AMEND-1 + AMEND-3 + AMEND-6 + AMEND-8 + AMEND-10 + AMEND-11 +
+#   ADR-0010 + ADR-0166 + ADR-0197 + ADR-0198 + ADR-0200 + ADR-0201 +
+#   reference_differential_asserter_dispatch

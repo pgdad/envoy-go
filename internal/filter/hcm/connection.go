@@ -386,6 +386,15 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	}
 	chain.SetDownstreamProtocol("HTTP/1.1")
 	chain.SetListenerPrincipal(f.listenerPrincipal)
+	// Phase 24.1 Task 5 (ADR-0198 / DELTA-2): seed the matched route's + the
+	// parent vhost's raw []*routev3.RateLimit policy slices onto the per-stream
+	// FilterChain BEFORE RunDecodeHeaders. Mirrors the ADR-0165
+	// SetDownstreamRemoteAddr et al. set-once-by-dispatch discipline; the
+	// single-dispatch-goroutine invariant per ADR-0071 applies. nil-passthrough
+	// when either slice is empty — the chain accessor returns nil and the
+	// ratelimit filter's engine reads zero policies (zero-regression path).
+	chain.SetRouteRateLimits(entry.rateLimits)
+	chain.SetVirtualHostRateLimits(f.table.vhostRateLimits)
 	if tlsConn, ok := downstream.(*stdtls.Conn); ok {
 		state := tlsConn.ConnectionState()
 		chain.SetDownstreamTLSServerName(state.ServerName)

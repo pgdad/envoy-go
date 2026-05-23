@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 )
 
@@ -70,15 +72,41 @@ type routeAction interface {
 // routeEntry pairs a match predicate with the action to invoke on a hit. The
 // action interface is defined above; implementations live in actions.go to
 // keep route.go free of any dependency on the cluster manager.
+//
+// Phase 24.1 Task 5 (DELTA-2 / ADR-0198): rateLimits carries the matched
+// route's RAW route.v3.RateLimit policy slice as parsed from
+// RouteAction.rate_limits at HCM build time. The framework retains the raw
+// proto slice — descriptor-action INTERPRETATION stays filter-owned (the
+// ratelimit filter's engine consumes the slice through
+// DecoderFilterCallbacks.RouteRateLimits() after HCM dispatch seeds the
+// per-stream chain). nil when the route has no rate_limits[] (the
+// zero-regression path; chain accessor returns nil). Per ADR-0198 §Decision —
+// the FIRST exposure of route-level NON-typed_per_filter_config policy data
+// to a filter (distinct from RequestRouteConfig per ADR-0073). The §5.2
+// strict-reject roster (disable_key / extension / dynamic_metadata) is
+// applied at HCM parse-time via ratelimit.ValidateRouteRateLimits per D-RL2;
+// any retained slice has already passed the validator.
 type routeEntry struct {
-	match  routeMatch
-	action routeAction
+	match      routeMatch
+	action     routeAction
+	rateLimits []*routev3.RateLimit
 }
 
 // routeTable is the resolved route_config. Routes are evaluated in
 // declaration order; first match wins.
+//
+// Phase 24.1 Task 5 (DELTA-2 / ADR-0198): vhostRateLimits carries the parent
+// virtual_host's RAW route.v3.RateLimit policy slice as parsed from
+// VirtualHost.rate_limits at HCM build time. envoy-go's phase-04 envelope
+// requires exactly one virtual_host per RouteConfiguration, so the vhost-
+// level slice has a SINGLE owning routeTable (the storage shape parallels
+// the single-vhost discipline). nil when the vhost has no rate_limits[].
+// Seeded onto the per-stream FilterChain at HCM dispatch via
+// chain.SetVirtualHostRateLimits, exposed to filters via
+// DecoderFilterCallbacks.VirtualHostRateLimits(). Per ADR-0198 §Decision.
 type routeTable struct {
-	routes []routeEntry
+	routes          []routeEntry
+	vhostRateLimits []*routev3.RateLimit
 }
 
 // match walks the routes in declaration order, returning the first entry

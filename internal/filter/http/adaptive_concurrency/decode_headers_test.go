@@ -33,6 +33,7 @@ import (
 	"testing"
 	"time"
 
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
@@ -90,6 +91,10 @@ func (c *recordedCallbacks) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (c *recordedCallbacks) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (c *recordedCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (c *recordedCallbacks) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (c *recordedCallbacks) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 // -----------------------------------------------------------------------------
 // Test-scope filter helpers

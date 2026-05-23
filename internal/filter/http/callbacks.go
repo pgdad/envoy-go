@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -109,6 +110,49 @@ type DecoderFilterCallbacks interface {
 	// Per ADR-0165 §Decision. Cross-phase reusable (ext_proc /
 	// global_ratelimit / future ext_authz extensions).
 	DownstreamLocalAddr() net.Addr
+
+	// RouteRateLimits returns the matched route's RAW config.route.v3.RateLimit
+	// policy slice (RouteAction.rate_limits) seeded onto the per-stream chain
+	// by HCM dispatch at chain build time. Returns nil for synthetic streams,
+	// for routes with no rate_limits[] (the zero-regression path), or for the
+	// no-match-route 404 path (HCM elides the seed). The framework surfaces
+	// the RAW proto slice — descriptor-action INTERPRETATION stays filter-
+	// owned (the ratelimit filter's engine consumes the policies through this
+	// accessor).
+	//
+	// Per ADR-0198 §Decision (phase-24.1 Task 5 / DELTA-2) — the FIRST exposure
+	// of route-level NON-typed_per_filter_config policy data to a filter
+	// (distinct from RequestRouteConfig per ADR-0073 — that path carries
+	// typed_per_filter_config keyed by FILTER NAME; this carries first-class
+	// RouteAction proto fields). Mirrors the ADR-0165 set-once-by-dispatch /
+	// read-via-accessor plumbing template; the single-dispatch-goroutine
+	// invariant per ADR-0071 applies — no mutation across filter dispatch.
+	//
+	// Cross-phase reusable: future filters needing route-level rate-limit
+	// policy data consume this accessor without re-paying the plumbing cost.
+	// Narrow-exposure / YAGNI: ONLY rate_limits is exposed here — other
+	// route-level data (cors, retry, etc.) stays on RequestRouteConfig().
+	// Filter package owns ALL descriptor interpretation; the exposure is RAW.
+	//
+	// Strict-reject: HCM parse-time rejects RateLimit policies carrying
+	// disable_key / extension / dynamic_metadata via
+	// ratelimit.ValidateRouteRateLimits per ADR-0200 §5.2 — any retained slice
+	// has already passed the validator (D-RL2 per parent SPEC §5.2).
+	RouteRateLimits() []*routev3.RateLimit
+
+	// VirtualHostRateLimits returns the matched route's parent virtual_host's
+	// RAW config.route.v3.RateLimit policy slice (VirtualHost.rate_limits)
+	// seeded onto the per-stream chain by HCM dispatch at chain build time.
+	// Returns nil for synthetic streams, for vhosts with no rate_limits[]
+	// (the zero-regression path), or for the no-match-route 404 path (HCM
+	// elides the seed). Same RAW-proto + filter-owns-interpretation
+	// discipline as RouteRateLimits.
+	//
+	// Per ADR-0198 §Decision (phase-24.1 Task 5 / DELTA-2). Mirrors the
+	// ADR-0165 set-once-by-dispatch / read-via-accessor plumbing template.
+	// Cross-phase reusable; narrow-exposure / YAGNI; strict-reject at HCM
+	// parse-time per the same ratelimit.ValidateRouteRateLimits call site.
+	VirtualHostRateLimits() []*routev3.RateLimit
 
 	// DownstreamTLSServerName returns the SNI (Server Name Indication) the
 	// downstream client presented during the TLS handshake, as observed via

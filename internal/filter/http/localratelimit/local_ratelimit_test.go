@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	localratelimitv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/local_ratelimit/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
@@ -247,6 +248,10 @@ func (f *fakeDecoderCB) ListenerPrincipal() string        { return "" }
 // ADR-0192 callback-surface extension stubs (phase-22.2 Task 5).
 func (f *fakeDecoderCB) DownstreamTLSConnectionState() *tls.ConnectionState { return nil }
 func (f *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { return nil }
+
+// ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
+func (f *fakeDecoderCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
+func (f *fakeDecoderCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
 
 // TestDecodeHeaders_AllowPath_CountersIncremented verifies that on the allow path
 // (bucket has tokens) DecodeHeaders returns Continue, increments enabled + ok,

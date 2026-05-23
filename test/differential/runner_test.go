@@ -54,6 +54,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0029-http-lua-source-codes-boot-reject/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0030-http-admission-control/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0031-http-admission-control-boot-reject/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0032-http-ratelimit/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0033-http-ratelimit-boot-reject/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -65,6 +67,17 @@ import (
 	// HTTPLua switch-case + BootRejectFixture infrastructure compile cleanly
 	// without a forward-reference to the Task 14 inputs package.
 	_ "github.com/esalaine/envoy-go/internal/filter/http/lua"
+
+	// Blank-imported so the ratelimit filter's init() boot-registration fires
+	// for the differential subject's bootstrap parsing path. Mirrors the
+	// HTTPLua precedent above (the per-fixture inputs packages at
+	// test/fixtures/0032-http-ratelimit/inputs/ +
+	// test/fixtures/0033-http-ratelimit-boot-reject/inputs/ land at Tasks 10
+	// + 11; this internal-package blank-import lands here at Task 9 so the
+	// HTTPGlobalRateLimitGRPC switch-case + the Task-11 BootRejectFixture
+	// infrastructure compile cleanly without a forward-reference to the
+	// later-task inputs packages).
+	_ "github.com/esalaine/envoy-go/internal/filter/http/ratelimit"
 )
 
 // TestDifferential is the differential suite entry point. It discovers
@@ -649,6 +662,47 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startHTTPSlowStreamBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPGlobalRateLimitGRPC:
+			// Fixtures 0032-http-ratelimit (phase 24.1 Task 10, cross-side
+			// 6-scenario a/b/c/d-core/e/h) and 0033-http-ratelimit-boot-reject
+			// (phase 24.1 Task 11, boot-reject) REUSE the SHARED echobackend
+			// binary at test/helpers/echobackend/cmd/echobackend/main.go for the
+			// upstream route (cluster c_backend). The in-process gRPC rate-limit
+			// service (test/helpers/ratelimitgrpc/) is lifecycle-managed BY THE
+			// DRIVER (Tasks 10 + 11) because it needs per-scenario Script
+			// registrations (OK / OVER_LIMIT / error responses keyed on
+			// canonical descriptor-list strings); this switch-case only
+			// allocates the upstream echo backend. Plaintext-only per parent
+			// SPEC §7.2 (no TLS in phase 24.1 downstream + h2c-plaintext
+			// rls cluster). Because the echo backend runs as a subprocess and
+			// the ratelimitgrpc helper runs in-process, the runner's in-process
+			// accept counter is NOT incremented. The fake's
+			// RateLimitResponse encoding obeys D-RL5 / AMEND-6
+			// (proto-number-faithful; omit unset optionals) — load-bearing for
+			// the cross-side byte-exact OVER_LIMIT comparison. The
+			// blank-import for fixtures 0032/0033's inputs packages lands at
+			// Tasks 10 + 11; this switch-case + the internal-package blank
+			// import below land at Task 9 so the BackendKind dispatch is
+			// complete + the ratelimit filter's init() boot-registration fires
+			// for the differential subject's bootstrap parsing path ahead of
+			// the rollout.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
 			if err != nil {
 				t.Fatalf("backend[%d] start: %v", i, err)
 			}
