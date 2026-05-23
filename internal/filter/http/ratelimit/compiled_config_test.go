@@ -16,6 +16,7 @@ import (
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 
@@ -695,6 +696,59 @@ func TestValidateRouteRateLimits(t *testing.T) {
 				}},
 			}},
 			wantErr: parseRejectRouteRateLimitActionDynamicMetadata,
+		},
+		// Phase 24.2 Task 2: per-policy `stage > 10` PARSE-REJECT (parent §4.4 +
+		// upstream PGV `lte:10`). Mirrors the filter-envelope arm at
+		// `buildCompiledConfig` (§5.1 Arm 3); the route-level arm fires at the
+		// HCM route-table parse via this validator.
+		{
+			name: "Stage_TooHigh_PerPolicy_11",
+			rls: []*routev3.RateLimit{{
+				Stage: wrapperspb.UInt32(11),
+				Actions: []*routev3.RateLimit_Action{{
+					ActionSpecifier: &routev3.RateLimit_Action_GenericKey_{
+						GenericKey: &routev3.RateLimit_Action_GenericKey{DescriptorValue: "v"},
+					},
+				}},
+			}},
+			wantErr: parseRejectStageTooHigh,
+		},
+		{
+			name: "Stage_TooHigh_PerPolicy_42",
+			rls: []*routev3.RateLimit{{
+				Stage: wrapperspb.UInt32(42),
+				Actions: []*routev3.RateLimit_Action{{
+					ActionSpecifier: &routev3.RateLimit_Action_GenericKey_{
+						GenericKey: &routev3.RateLimit_Action_GenericKey{DescriptorValue: "v"},
+					},
+				}},
+			}},
+			wantErr: parseRejectStageTooHigh,
+		},
+		// Happy path: per-policy stage in [0,10] is accepted.
+		{
+			name: "Stage_AtBound10_Pass",
+			rls: []*routev3.RateLimit{{
+				Stage: wrapperspb.UInt32(10),
+				Actions: []*routev3.RateLimit_Action{{
+					ActionSpecifier: &routev3.RateLimit_Action_GenericKey_{
+						GenericKey: &routev3.RateLimit_Action_GenericKey{DescriptorValue: "v"},
+					},
+				}},
+			}},
+			wantNil: true,
+		},
+		{
+			name: "Stage_AtBound0_Pass",
+			rls: []*routev3.RateLimit{{
+				Stage: wrapperspb.UInt32(0),
+				Actions: []*routev3.RateLimit_Action{{
+					ActionSpecifier: &routev3.RateLimit_Action_GenericKey_{
+						GenericKey: &routev3.RateLimit_Action_GenericKey{DescriptorValue: "v"},
+					},
+				}},
+			}},
+			wantNil: true,
 		},
 	}
 

@@ -1,10 +1,12 @@
 package ratelimit
 
 // fuzz_test.go — 33rd project-wide fuzzer `FuzzRateLimitConfigParse` per
-// phase-24.1 PLAN Task 8 + parent SPEC §6.9 + ADR-0018 baseline.
+// phase-24.1 PLAN Task 8 + parent SPEC §6.9 + ADR-0018 baseline; extended at
+// phase-24.2 PLAN Task 7 per D-RL16 (corpus extension only — no new fuzzer;
+// project count stays at 33).
 //
 // Drives arbitrary byte sequences as the typed_config Any.Value payload
-// through TWO surfaces:
+// through THREE surfaces:
 //
 //  1. `buildCompiledConfig` — the §5.1 PARSE-REJECT roster + AMEND-3
 //     defaults/clamps body (compiled_config.go). The fuzz body uses an empty
@@ -22,9 +24,18 @@ package ratelimit
 //     through both surfaces. This covers the case where random fuzz inputs
 //     happen to decode coherently into the route-table-side proto.
 //
-// # Seed corpus per PLAN Task 8 + parent §6.9
+//  3. `validatePerRouteRateLimit` + `compilePerRouteForRequest` — the 24.2
+//     Task-3 per-route TPFC compile surface (compiled_perroute.go). The
+//     fuzz body ALSO attempts to interpret the raw bytes as a
+//     `*ratelimitfilterv3.RateLimitPerRoute` proto and drives both the
+//     ADR-0110 single-chokepoint validator AND the request-time projection
+//     against the random shape. Covers the case where random fuzz inputs
+//     happen to decode coherently into the 10th canonical TPFC shape.
 //
-// 31 hand-curated `f.Add` seeds covering:
+// # Seed corpus per PLAN Task 8 (24.1) + Task 7 (24.2) + parent §6.9
+//
+// 31 hand-curated `f.Add` seeds at 24.1 phase-done; extended at 24.2 Task 7
+// with 15 additional seeds (46 total) covering:
 //
 //   - Valid full config — all 13 AMEND-3 fields populated (1 seed)
 //
@@ -58,6 +69,37 @@ package ratelimit
 //
 //   - Raw garbage bytes — verifies proto-Unmarshal-failure path (1 seed)
 //
+// 24.2 Task 7 extension (15 new seeds; corpus only — no new fuzzer):
+//
+//   - 5 remaining §4 action arms — one seed each as a single-policy
+//     `routev3.RateLimit` proto (source_cluster / masked_remote_address /
+//     metadata / query_parameters / query_parameter_value_match — drives the
+//     full 10-action dispatch in `buildDescriptors` for the route-shape
+//     interpretation)
+//
+//   - 6 `RateLimitPerRoute` seeds (Surface 3 — TPFC compile):
+//     · vh_rate_limits = OVERRIDE / INCLUDE / IGNORE (3 seeds — Axis-B
+//       inclusion enum bounds)
+//     · override_option = OVERRIDE_POLICY / INCLUDE_POLICY / IGNORE_POLICY
+//       (3 seeds — AMEND-4 PARSE-ACCEPTED-but-IGNORED arm; DEFAULT=0 is the
+//       proto-zero shape already covered by the OVERRIDE seed)
+//
+//   - Stage boundary arms — per-policy `stage=5` (new arm under 24.2 Task 2
+//     multi-stage bucketing) + per-policy `stage=11` (the new Task 2
+//     per-policy PARSE-REJECT arm — `ValidateRouteRateLimits` must reject)
+//
+//   - Per-route `domain` non-empty (AMEND-4 PARSE-ACCEPT — request-time
+//     wins-discipline at Task 4)
+//
+//   - Legacy `RouteAction` proto bytes carrying `include_vh_rate_limits=true`
+//     (the byte shape — the fuzz body cannot type-assert through a
+//     RouteAction, but the bytes still exercise the proto-Unmarshal-mismatch
+//     defensive paths in all 3 surfaces)
+//
+//   - X-RateLimit DRAFT_VERSION_03 paired with a 24.2 Task 5 emit-arm shape
+//     (variant of the 24.1 seed 28 with stat_prefix populated — exercises
+//     the cluster-scoped modulator + X-RateLimit toggle together)
+//
 // 30s runtime envelope per SPEC §14.3 + ADR-0018 short-mode CI policy.
 //
 // # Seed authoring strategy
@@ -77,10 +119,12 @@ import (
 	rlsv3 "github.com/envoyproxy/go-control-plane/envoy/config/ratelimit/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	ratelimitfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ratelimit/v3"
+	metadatav3 "github.com/envoyproxy/go-control-plane/envoy/type/metadata/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
@@ -423,6 +467,178 @@ func FuzzRateLimitConfigParse(f *testing.F) {
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff})
 
 	// -------------------------------------------------------------------------
+	// 24.2 Task 7 extension — Seeds 32-46 (corpus only; no new fuzzer).
+	// Cross-references parent SPEC §6.9 + PLAN.md D-RL16 corpus delta.
+	// -------------------------------------------------------------------------
+
+	// Seed 32 — source_cluster action (24.2 Task 1; AMEND-11 node-cluster
+	// threading). Single-policy route-shape proto bytes.
+	addSeed(&routev3.RateLimit{
+		Actions: []*routev3.RateLimit_Action{{
+			ActionSpecifier: &routev3.RateLimit_Action_SourceCluster_{
+				SourceCluster: &routev3.RateLimit_Action_SourceCluster{},
+			},
+		}},
+	})
+
+	// Seed 33 — masked_remote_address action (24.2 Task 1). v4/v6 mask lengths
+	// left absent ⇒ proto defaults (32 / 128) fire.
+	addSeed(&routev3.RateLimit{
+		Actions: []*routev3.RateLimit_Action{{
+			ActionSpecifier: &routev3.RateLimit_Action_MaskedRemoteAddress_{
+				MaskedRemoteAddress: &routev3.RateLimit_Action_MaskedRemoteAddress{
+					V4PrefixMaskLen: wrapperspb.UInt32(24),
+					V6PrefixMaskLen: wrapperspb.UInt32(64),
+				},
+			},
+		}},
+	})
+
+	// Seed 34 — metadata action (24.2 Task 1; D-RL8 accessor). DYNAMIC source +
+	// single-segment path + default_value populated.
+	addSeed(&routev3.RateLimit{
+		Actions: []*routev3.RateLimit_Action{{
+			ActionSpecifier: &routev3.RateLimit_Action_Metadata{
+				Metadata: &routev3.RateLimit_Action_MetaData{
+					DescriptorKey: "tenant",
+					MetadataKey: &metadatav3.MetadataKey{
+						Key: "envoy.filters.http.jwt_authn",
+						Path: []*metadatav3.MetadataKey_PathSegment{{
+							Segment: &metadatav3.MetadataKey_PathSegment_Key{Key: "tenant"},
+						}},
+					},
+					DefaultValue: "anon",
+					Source:       routev3.RateLimit_Action_MetaData_DYNAMIC,
+					SkipIfAbsent: false,
+				},
+			},
+		}},
+	})
+
+	// Seed 35 — query_parameters action (24.2 Task 1). Skip-if-absent false ⇒
+	// missing query-param drops the descriptor entry (§4.5).
+	addSeed(&routev3.RateLimit{
+		Actions: []*routev3.RateLimit_Action{{
+			ActionSpecifier: &routev3.RateLimit_Action_QueryParameters_{
+				QueryParameters: &routev3.RateLimit_Action_QueryParameters{
+					QueryParameterName: "api_key",
+					DescriptorKey:      "key",
+					SkipIfAbsent:       false,
+				},
+			},
+		}},
+	})
+
+	// Seed 36 — query_parameter_value_match action (24.2 Task 1). PresentMatch
+	// on a single qp name; descriptor_value populated; expect_match left nil
+	// ⇒ engine defaults to true.
+	addSeed(&routev3.RateLimit{
+		Actions: []*routev3.RateLimit_Action{{
+			ActionSpecifier: &routev3.RateLimit_Action_QueryParameterValueMatch_{
+				QueryParameterValueMatch: &routev3.RateLimit_Action_QueryParameterValueMatch{
+					DescriptorKey:   "qpm",
+					DescriptorValue: "v",
+					QueryParameters: []*routev3.QueryParameterMatcher{{
+						Name: "tag",
+						QueryParameterMatchSpecifier: &routev3.QueryParameterMatcher_PresentMatch{
+							PresentMatch: true,
+						},
+					}},
+				},
+			},
+		}},
+	})
+
+	// Seed 37 — RateLimitPerRoute with vh_rate_limits=OVERRIDE (proto-zero
+	// default; AMEND-5). Exercises Surface 3 happy-path validator + projection.
+	addSeed(&ratelimitfilterv3.RateLimitPerRoute{
+		VhRateLimits: ratelimitfilterv3.RateLimitPerRoute_OVERRIDE,
+	})
+
+	// Seed 38 — RateLimitPerRoute with vh_rate_limits=INCLUDE (Axis-B
+	// cross-tier-include arm; Task 4 consumer).
+	addSeed(&ratelimitfilterv3.RateLimitPerRoute{
+		VhRateLimits: ratelimitfilterv3.RateLimitPerRoute_INCLUDE,
+	})
+
+	// Seed 39 — RateLimitPerRoute with vh_rate_limits=IGNORE (Axis-B
+	// vhost-suppression arm; Task 4 consumer).
+	addSeed(&ratelimitfilterv3.RateLimitPerRoute{
+		VhRateLimits: ratelimitfilterv3.RateLimitPerRoute_IGNORE,
+	})
+
+	// Seed 40 — RateLimitPerRoute with override_option=OVERRIDE_POLICY
+	// (AMEND-4 PARSE-ACCEPTED-but-IGNORED arm; validator must not error).
+	addSeed(&ratelimitfilterv3.RateLimitPerRoute{
+		OverrideOption: ratelimitfilterv3.RateLimitPerRoute_OVERRIDE_POLICY,
+	})
+
+	// Seed 41 — RateLimitPerRoute with override_option=INCLUDE_POLICY
+	// (AMEND-4 PARSE-ACCEPTED-but-IGNORED arm).
+	addSeed(&ratelimitfilterv3.RateLimitPerRoute{
+		OverrideOption: ratelimitfilterv3.RateLimitPerRoute_INCLUDE_POLICY,
+	})
+
+	// Seed 42 — RateLimitPerRoute with override_option=IGNORE_POLICY +
+	// non-empty domain (AMEND-4 PARSE-ACCEPTED-but-IGNORED arm + per-route
+	// domain override). Domain wins-discipline at Task 4.
+	addSeed(&ratelimitfilterv3.RateLimitPerRoute{
+		OverrideOption: ratelimitfilterv3.RateLimitPerRoute_IGNORE_POLICY,
+		Domain:         "tenant-override",
+	})
+
+	// Seed 43 — per-policy stage=5 (24.2 Task 2 multi-stage bucketing; the
+	// new arm under §4.4). Surface 2 ValidateRouteRateLimits must accept;
+	// engine `bucketRateLimitsByStage` slot 5 holds the policy.
+	addSeed(&routev3.RateLimit{
+		Stage: wrapperspb.UInt32(5),
+		Actions: []*routev3.RateLimit_Action{{
+			ActionSpecifier: &routev3.RateLimit_Action_GenericKey_{
+				GenericKey: &routev3.RateLimit_Action_GenericKey{DescriptorValue: "s5"},
+			},
+		}},
+	})
+
+	// Seed 44 — per-policy stage=11 (24.2 Task 2 PARSE-REJECT arm; the new
+	// per-policy stage > 10 arm under §4.4 + §5.1 Arm 3 mirror). Surface 2
+	// ValidateRouteRateLimits must reject byte-stable.
+	addSeed(&routev3.RateLimit{
+		Stage: wrapperspb.UInt32(11),
+		Actions: []*routev3.RateLimit_Action{{
+			ActionSpecifier: &routev3.RateLimit_Action_GenericKey_{
+				GenericKey: &routev3.RateLimit_Action_GenericKey{DescriptorValue: "s11"},
+			},
+		}},
+	})
+
+	// Seed 45 — X-RateLimit DRAFT_VERSION_03 + stat_prefix populated +
+	// disable_x_envoy_ratelimited_header=true (24.2 Task 5 toggle arm). The
+	// 24.1 Seed 28 covers the toggle in isolation; this seed pairs it with
+	// the cluster-scoped modulator + the legacy x-envoy-ratelimited
+	// disable-flag to exercise the full headers-side combination.
+	{
+		c := validRateLimitConfig()
+		c.EnableXRatelimitHeaders = ratelimitfilterv3.RateLimit_DRAFT_VERSION_03
+		c.StatPrefix = "ingress"
+		c.DisableXEnvoyRatelimitedHeader = true
+		addSeed(c)
+	}
+
+	// Seed 46 — legacy `RouteAction.include_vh_rate_limits=true` proto bytes
+	// (AMEND-5 legacy force-include arm; D-RL10). The fuzz body cannot
+	// type-assert through a `routev3.RouteAction` (the legacy bool is
+	// threaded via the DCB at request time, not through a TypeURL envelope),
+	// but the byte shape still exercises the proto-Unmarshal-mismatch
+	// defensive paths in all 3 surfaces — must-never-panic on a coherently-
+	// shaped proto whose wire-tags happen to overlap with the 3 target
+	// shapes' fields (e.g., the bool's varint may collide with another
+	// field's varint at the same tag number).
+	addSeed(&routev3.RouteAction{
+		ClusterSpecifier:    &routev3.RouteAction_Cluster{Cluster: "upstream_xyz"},
+		IncludeVhRateLimits: wrapperspb.Bool(true),
+	})
+
+	// -------------------------------------------------------------------------
 	// Fixed engine inputs for the §4 surface coverage. The engine is pure;
 	// these fixed inputs exercise the 5 CORE actions on every fuzz iteration
 	// while the variable input is the route-shape unmarshal attempt below.
@@ -463,12 +679,34 @@ func FuzzRateLimitConfigParse(f *testing.F) {
 		if err := proto.Unmarshal(data, &rl); err == nil {
 			rls := []*routev3.RateLimit{&rl}
 			_ = ValidateRouteRateLimits(rls)
-			// Engine call — drives the 5 CORE-action dispatch + the
-			// vacuous-true matcher AND-fold + the §4.5 drop/skip discipline.
-			// The fixed inputs exercise the generic_key happy path; the
-			// variable rl exercises arbitrary action shapes.
+			// Engine call — drives the FULL 10-action dispatch (24.2 Task 1
+			// extended the §4 action roster from the 24.1 CORE-5 to the
+			// full 10) + the vacuous-true matcher AND-fold + the §4.5
+			// drop/skip discipline. The fixed inputs exercise the
+			// generic_key happy path; the variable rl exercises arbitrary
+			// action shapes.
 			_ = buildDescriptors(rls, nil, fixedHeaders, fixedRemoteAddr, fixedClusterName)
 			_ = buildDescriptors(fixedRouteRLs, rls, fixedHeaders, fixedRemoteAddr, fixedClusterName)
+		}
+
+		// Surface 3: validatePerRouteRateLimit + compilePerRouteForRequest
+		// over a per-route-shape interpretation of the same bytes (24.2
+		// Task 3 — the 10th canonical TPFC compile per ADR-0199). Many
+		// random inputs will fail to unmarshal as
+		// `ratelimitfilterv3.RateLimitPerRoute` — that's fine; the no-panic
+		// invariant is the only contract. When unmarshal succeeds, drive
+		// the ADR-0110 single-chokepoint validator AND the request-time
+		// projection — both must tolerate arbitrary input shapes (including
+		// embedded `rate_limits[]` slices with §5.2 PARSE-REJECT arms +
+		// per-policy stage > 10 + arbitrary `vh_rate_limits` /
+		// `override_option` enum varints).
+		var pr ratelimitfilterv3.RateLimitPerRoute
+		if err := proto.Unmarshal(data, &pr); err == nil {
+			_ = validatePerRouteRateLimit(&pr)
+			// Projection is independent of validator — must-never-panic
+			// even when the validator would reject (defensive contract per
+			// ADR-0085 nil-tolerance + ADR-0018 never-panic).
+			_ = compilePerRouteForRequest(&pr)
 		}
 	})
 }

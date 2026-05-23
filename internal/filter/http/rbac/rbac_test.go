@@ -2197,6 +2197,8 @@ func (c *rbacFakeCB) DynamicMetadata() *dynamicmetadata.Bucket           { retur
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *rbacFakeCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *rbacFakeCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *rbacFakeCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *rbacFakeCB) RouteIncludeVhRateLimits() bool              { return false }
 
 // newFilterWithRBAC constructs a *filter wrapping the supplied *rbacv3.RBAC
 // listener-level proto + freshly attached rbacFakeCB. Used by Group 6 +

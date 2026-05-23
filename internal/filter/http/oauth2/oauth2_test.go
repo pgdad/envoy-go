@@ -92,6 +92,8 @@ func (c *fakeOAuth2DCB) DynamicMetadata() *dynamicmetadata.Bucket              {
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *fakeOAuth2DCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *fakeOAuth2DCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *fakeOAuth2DCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *fakeOAuth2DCB) RouteIncludeVhRateLimits() bool              { return false }
 
 func (c *fakeOAuth2DCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++

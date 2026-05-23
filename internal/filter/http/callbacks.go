@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -153,6 +154,51 @@ type DecoderFilterCallbacks interface {
 	// Cross-phase reusable; narrow-exposure / YAGNI; strict-reject at HCM
 	// parse-time per the same ratelimit.ValidateRouteRateLimits call site.
 	VirtualHostRateLimits() []*routev3.RateLimit
+
+	// RouteMetadata returns the matched route's RAW *corev3.Metadata
+	// (Route.metadata) seeded onto the per-stream chain by HCM dispatch at
+	// chain build time. Returns nil for synthetic streams, for routes with no
+	// metadata, or for the no-match-route 404 path (HCM elides the seed). The
+	// framework surfaces the RAW proto value — INTERPRETATION stays filter-
+	// owned (the ratelimit filter's `metadata` descriptor action consumes the
+	// metadata through this accessor under MetadataSource_ROUTE_ENTRY=1 per
+	// parent SPEC §4.1 row 8).
+	//
+	// Per phase 24.2 Task 1 (D-RL8) — extension of the ADR-0165 set-once-by-
+	// dispatch + ADR-0198 DELTA-2 chain-field plumbing template. The
+	// MetadataSource_DYNAMIC=0 source is satisfied by the EXISTING
+	// DynamicMetadata() accessor (no new plumbing needed); the
+	// MetadataSource_ROUTE_ENTRY=1 source needs this NEW accessor — the D-RL8
+	// survey outcome (clean ADR-0165 extension; ADR-0202 UNCONSUMED).
+	//
+	// Cross-phase reusable: future filters needing route-level metadata access
+	// can consume this accessor without re-paying the plumbing cost. Narrow-
+	// exposure / YAGNI: ONLY Route.metadata is exposed here; other route-level
+	// metadata access stays on RequestRouteConfig() / typed_per_filter_config
+	// per ADR-0073.
+	RouteMetadata() *corev3.Metadata
+
+	// RouteIncludeVhRateLimits returns the matched route's legacy
+	// `RouteAction.include_vh_rate_limits` bool seeded onto the per-stream
+	// chain by HCM dispatch at chain build time. Returns false for synthetic
+	// streams, for routes without the field set, or for the no-match-route
+	// 404 path (HCM elides the seed). The framework surfaces the RAW proto
+	// bool — INTERPRETATION stays filter-owned (the ratelimit filter's §4.3
+	// Axis-B vhost-walk composition table consumes the bool to honor the
+	// legacy force-include override).
+	//
+	// Per phase 24.2 Task 4 (D-RL11) — extension of the ADR-0165 set-once-by-
+	// dispatch + ADR-0198 DELTA-2 chain-field plumbing template. Mirrors the
+	// RouteMetadata accessor pattern landed at Task 1. Per parent SPEC §4.3 +
+	// AMEND-5: the legacy bool, when true, forces the vhost-level RateLimit
+	// policy slice to be walked alongside the route's, regardless of
+	// `RateLimitPerRoute.vh_rate_limits` (the enum, when set, otherwise
+	// gates vhost walking).
+	//
+	// Narrow-exposure / YAGNI: ONLY the ratelimit filter's §4.3 Axis-B
+	// composition table consumes this — the legacy bool is a route-level
+	// RouteAction field with no other consumer.
+	RouteIncludeVhRateLimits() bool
 
 	// DownstreamTLSServerName returns the SNI (Server Name Indication) the
 	// downstream client presented during the TLS handshake, as observed via

@@ -9,24 +9,57 @@
 #                   host.docker.internal from the reference container; plaintext
 #                   h2c per parent SPEC §7.2 + ADR-0166).
 #
+# Single virtual_host (vh_a, domains: ["*"]) per envoy-go's HCM constraint
+# at internal/filter/hcm/config.go (single-vh canonical per ADR-0019/0072).
+# The vhost carries a vhost-level rate_limits emitting generic_key{vh:vh_a};
+# the (f) sub-scenarios under /scenario_f_* exercise the §4.3 Axis-B
+# cross-tier composition table against this single vh-policy. Per
+# OVERRIDE-default semantics, when a route HAS rate_limits the vhost is
+# SKIPPED — so the 24.1 scenarios (b/c/d/e/g) each carry their own route
+# rate_limits AND inherit the OVERRIDE-default behavior → vh is SKIPPED →
+# 24.1 byte-shape preserved. Scenario (a) is the EXCEPTION (NO route
+# rate_limits → OVERRIDE-default would walk vh): scenario (a) carries
+# typed_per_filter_config[envoy.filters.http.ratelimit] with
+# RateLimitPerRoute.vh_rate_limits=IGNORE to preserve the 24.1 zero-
+# descriptor short-circuit semantics.
+#
 # Per-scenario routes (matched by exact :path) — each carries its own
 # route_action.rate_limits[] policy producing per-scenario descriptors:
 #
-#   /scenario_a — NO rate_limits → zero-descriptor short-circuit → echo 200.
-#   /scenario_b — generic_key{scenario:b}                       → OK admit.
-#   /scenario_c — generic_key{scenario:c}                       → OVER_LIMIT 429.
-#   /scenario_d — 4-action chain: generic_key{scenario:d} +
-#                  request_headers{x-tenant→tenant} +
-#                  remote_address +
-#                  header_value_match{descriptor_value:canaried,
-#                                    headers:[present_match x-canary]}.
-#   /scenario_e — generic_key{scenario:e} (RLS server stopped by driver
-#                  before the request → transport error → fail-open admit).
+#   /scenario_a — NO rate_limits + vh_rate_limits=IGNORE TPFC →
+#                  zero-descriptor short-circuit → echo 200.
+#   /scenario_b — generic_key{scenario:b} (OVERRIDE-default → vh skipped) → OK admit.
+#   /scenario_c — generic_key{scenario:c} (OVERRIDE-default → vh skipped) → OVER_LIMIT 429.
+#   /scenario_d — 9-action chain (24.2 Task 6 extension); OVERRIDE-default
+#                  → vh skipped. destination_cluster OMITTED per framework
+#                  limitation.
+#   /scenario_e — generic_key{scenario:e} (OVERRIDE-default → vh skipped;
+#                  RLS server stopped by driver before the request →
+#                  transport error → fail-open admit).
+#   /scenario_f_override — generic_key{scenario:f_override}; NO TPFC ⇒
+#                  proto-zero vh_rate_limits=OVERRIDE; route non-empty ⇒
+#                  vh SKIPPED ⇒ 1 descriptor.
+#   /scenario_f_include — generic_key{scenario:f_include}; TPFC vh_rate_limits=INCLUDE
+#                  ⇒ BOTH route + vh walked ⇒ 2 descriptors (route first).
+#   /scenario_f_ignore — generic_key{scenario:f_ignore}; TPFC vh_rate_limits=IGNORE
+#                  ⇒ vh SKIPPED unconditionally ⇒ 1 descriptor.
+#   /scenario_g — 2 single-action policies emitting 2 descriptors
+#                  (tier:bronze + scope:burst); OVERRIDE-default → vh skipped.
+#                  RLS scripted to OVER_LIMIT with per-descriptor CurrentLimit /
+#                  LimitRemaining / DurationUntilReset populated for X-RateLimit
+#                  byte-pin.
 #
 # The filter's domain is "domain_b" so the fake's CanonicalKey lookups
 # carry the domain prefix; the driver's setupRLS builds keys matching
 # exactly what the engine emits at descriptor-build time (AMEND-6
 # action-list order; per-action key defaults per AMEND-11).
+#
+# Node service-cluster is set to "rls_test_cluster" so the (d) extension
+# source_cluster action emits a deterministic (source_cluster,
+# rls_test_cluster) entry. Without a node.cluster the entry would be
+# (source_cluster, "") — still emitted per AMEND-11 ALWAYS-TRUE drop
+# discipline — but the explicit non-empty value is a TIGHTER cross-side
+# assertion.
 #
 # Templating: rendered by the driver's ReferenceBootstrap() at runtime.
 # Substitution keys:
@@ -37,6 +70,10 @@
 #   {{.RLSHost}}      — RLS fake host (host.docker.internal for reference).
 #   {{.RLSPort}}      — RLS fake port (driver-allocated; pre-bound by the
 #                       in-process server before any request fires).
+node:
+  cluster: rls_test_cluster
+  id: ref_node
+
 admin:
   address:
     socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
@@ -57,11 +94,35 @@ static_resources:
                   virtual_hosts:
                     - name: vh_a
                       domains: ["*"]
+                      # Phase 24.2 Task 6: vh-level rate_limits emits
+                      # generic_key{vh:vh_a} — consumed by the §4.3 Axis-B
+                      # sub-scenarios under /scenario_f_*. The 24.1 scenarios
+                      # (b/c/d/e) all carry their own route-level rate_limits
+                      # ⇒ OVERRIDE-default vhost SKIP arm fires ⇒ this vh-
+                      # policy is INVISIBLE on 24.1 scenarios (zero byte-
+                      # stream impact). Scenario (a) is the EXCEPTION (NO
+                      # route rate_limits → OVERRIDE-default would walk vh);
+                      # (a) carries a vh_rate_limits=IGNORE TPFC to preserve
+                      # 24.1 zero-descriptor semantics.
+                      rate_limits:
+                        - actions:
+                            - generic_key:
+                                descriptor_key: vh
+                                descriptor_value: vh_a
                       routes:
-                        # (a) parse_ok — NO rate_limits → zero-descriptor short-circuit.
+                        # (a) parse_ok — NO route rate_limits +
+                        # typed_per_filter_config[ratelimit].vh_rate_limits=IGNORE
+                        # forces vhost SKIP → engine emits zero descriptors →
+                        # DecodeHeaders Continue → echo 200. Preserves the
+                        # 24.1 "parse_ok subject-only structural" semantics.
                         - match: { path: "/scenario_a" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimitPerRoute
+                              vh_rate_limits: IGNORE
                           route: { cluster: c_backend }
                         # (b) ok_admit — single generic_key policy → OK.
+                        # Route has rate_limits → OVERRIDE-default skips vh.
                         - match: { path: "/scenario_b" }
                           route:
                             cluster: c_backend
@@ -71,6 +132,7 @@ static_resources:
                                       descriptor_key: scenario
                                       descriptor_value: b
                         # (c) over_limit_429 — single generic_key policy → OVER_LIMIT.
+                        # Route has rate_limits → OVERRIDE-default skips vh.
                         - match: { path: "/scenario_c" }
                           route:
                             cluster: c_backend
@@ -79,12 +141,25 @@ static_resources:
                                   - generic_key:
                                       descriptor_key: scenario
                                       descriptor_value: c
-                        # (d) descriptor_actions — 4-action core-action chain.
-                        # The action order is the AMEND-6 entries-in-action-list
-                        # order: generic_key → request_headers → remote_address
-                        # → header_value_match. The fake's script key MUST
-                        # carry the entries in this exact order.
+                        # (d) descriptor_actions — 9-action chain (24.1 4 core +
+                        # 5 24.2 Task 1 remaining). destination_cluster OMITTED
+                        # per the 24.1 framework-limitation note. Route has
+                        # metadata.filter_metadata so the metadata action's
+                        # ROUTE_ENTRY lookup yields a deterministic value.
+                        # Action order is the AMEND-6 entries-in-action-list
+                        # order; the fake's CanonicalKey carries entries in
+                        # this exact order:
+                        #   generic_key → request_headers → remote_address →
+                        #   header_value_match (24.1 core) →
+                        #   source_cluster → masked_remote_address →
+                        #   metadata → query_parameters →
+                        #   query_parameter_value_match (24.2 Task 6).
+                        # Route has rate_limits → OVERRIDE-default skips vh.
                         - match: { path: "/scenario_d" }
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.ratelimit:
+                                tier: gold
                           route:
                             cluster: c_backend
                             rate_limits:
@@ -101,12 +176,32 @@ static_resources:
                                       headers:
                                         - name: x-canary
                                           present_match: true
+                                  - source_cluster: {}
+                                  - masked_remote_address:
+                                      v4_prefix_mask_len: 24
+                                  - metadata:
+                                      descriptor_key: tier
+                                      metadata_key:
+                                        key: envoy.filters.http.ratelimit
+                                        path:
+                                          - key: tier
+                                      source: ROUTE_ENTRY
+                                  - query_parameters:
+                                      query_parameter_name: region
+                                      descriptor_key: region
+                                  - query_parameter_value_match:
+                                      descriptor_value: premium_plan
+                                      query_parameters:
+                                        - name: plan
+                                          string_match:
+                                            exact: premium
                         # (e) failure_mode_open — single generic_key policy;
                         # the driver stops the RLS server before this request
                         # → ShouldRateLimit dial fails fast → fail-open admit
                         # via cc.failureModeDeny=false (the AMEND-3 proto-zero
                         # default; no failure_mode_deny field on the filter
                         # config below).
+                        # Route has rate_limits → OVERRIDE-default skips vh.
                         - match: { path: "/scenario_e" }
                           route:
                             cluster: c_backend
@@ -115,6 +210,75 @@ static_resources:
                                   - generic_key:
                                       descriptor_key: scenario
                                       descriptor_value: e
+                        # (f-override) Phase 24.2 Task 6 §4.3 Axis-B:
+                        # OVERRIDE-default (no typed_per_filter_config —
+                        # proto-zero VhRateLimitsOptions=OVERRIDE). Route has
+                        # rate_limits ⇒ vh policy SKIPPED; ONLY route
+                        # descriptor emitted.
+                        - match: { path: "/scenario_f_override" }
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scenario
+                                      descriptor_value: f_override
+                        # (f-include) Phase 24.2 Task 6 §4.3 Axis-B:
+                        # per-route RateLimitPerRoute.vh_rate_limits=INCLUDE
+                        # ⇒ BOTH route AND vhost descriptors emitted (route
+                        # first per AMEND-6 walk order).
+                        - match: { path: "/scenario_f_include" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimitPerRoute
+                              vh_rate_limits: INCLUDE
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scenario
+                                      descriptor_value: f_include
+                        # (f-ignore) Phase 24.2 Task 6 §4.3 Axis-B:
+                        # per-route RateLimitPerRoute.vh_rate_limits=IGNORE
+                        # ⇒ vhost SKIPPED unconditionally; ONLY route
+                        # descriptor emitted.
+                        - match: { path: "/scenario_f_ignore" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimitPerRoute
+                              vh_rate_limits: IGNORE
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scenario
+                                      descriptor_value: f_ignore
+                        # (g) x_ratelimit_headers — Phase 24.2 Task 6:
+                        # TWO policies → TWO descriptors at request time
+                        # (the engine appends one descriptor per surviving
+                        # policy in input-slice order per AMEND-6). Each
+                        # policy has ONE action → ONE entry per descriptor.
+                        # Distinct policy descriptors are load-bearing for
+                        # the X-RateLimit MIN-status selection: each
+                        # DescriptorStatus carries its own CurrentLimit /
+                        # LimitRemaining / DurationUntilReset, and the
+                        # status with the SMALLEST LimitRemaining wins
+                        # (first-equal-min per insertion order).
+                        # Route has rate_limits → OVERRIDE-default skips vh.
+                        - match: { path: "/scenario_g" }
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: tier
+                                      descriptor_value: bronze
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scope
+                                      descriptor_value: burst
                 http_filters:
                   - name: envoy.filters.http.ratelimit
                     typed_config:
@@ -125,6 +289,25 @@ static_resources:
                       # failure_mode_deny absent → false (the AMEND-3 proto-zero
                       # default; scenario (e) relies on this for fail-open
                       # admit on RLS-transport-error).
+                      # Phase 24.2 Task 6: enable_x_ratelimit_headers
+                      # DRAFT_VERSION_03 triggers the X-RateLimit triple
+                      # emission on OK / OVER_LIMIT / fail-OPEN per §4.7 +
+                      # AMEND-8. Zero byte-impact on 24.1 scenarios — the 24.1
+                      # scripts do NOT populate CurrentLimit on any status,
+                      # so buildXRateLimitHeaders returns ok=false ⇒ no
+                      # headers emitted. ONLY scenario (g) exercises emission.
+                      enable_x_ratelimit_headers: DRAFT_VERSION_03
+                      # Phase 24.2 Task 6: filter-config response_headers_to_add
+                      # is applied AFTER the X-RateLimit triple on OVER_LIMIT
+                      # replies per the Task 5 follow-up wire-order discipline.
+                      # ONLY OVER_LIMIT replies see this header (scenarios (c)
+                      # + (g) — only (g) has X-RateLimit emission). (c) sees
+                      # the header but its byte stream only captures
+                      # status+body, no header divergence.
+                      response_headers_to_add:
+                        - header:
+                            key: x-from-config
+                            value: filtercfg
                       rate_limit_service:
                         grpc_service:
                           envoy_grpc:

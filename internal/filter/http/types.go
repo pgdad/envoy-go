@@ -285,6 +285,20 @@ type FactoryCtx struct {
 	// ADR-0150 §Decision AMENDMENT / ADR-0159 §Decision AMENDMENT).
 	// Phase 20 first-use anchor.
 	HTTPClient *httpclient.Client
+	// NodeServiceCluster is the Envoy NODE's `service-cluster` name as
+	// extracted from the bootstrap (`node.cluster` field). Threaded into per-
+	// filter factories that need to populate descriptor entries with the local
+	// service-cluster name — at phase 24.2 the only consumer is the ratelimit
+	// filter's `source_cluster` descriptor action per parent SPEC §4.1 row 1
+	// (upstream router_ratelimit.cc:89-90). Empty string is the documented
+	// nil-passthrough for test paths that do not exercise node-bearing
+	// behavior (per ADR-0085 nil-tolerance — the consumer treats empty as
+	// "node service-cluster unavailable" and emits an empty-value descriptor
+	// entry per upstream's always-true source_cluster semantics).
+	//
+	// Phase 24.2 Task 1 first-use anchor. Cross-phase reusable for any future
+	// filter that needs the Envoy NODE's service-cluster identity.
+	NodeServiceCluster string
 	// Future extensions (accesslog sinks) added per-family-phase as filter
 	// implementations require them.
 }

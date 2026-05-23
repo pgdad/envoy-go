@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	commonfaultv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/common/fault/v3"
 	faultv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/fault/v3"
@@ -250,6 +251,8 @@ func (r *recordingDCB) DynamicMetadata() *dynamicmetadata.Bucket           { ret
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (r *recordingDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (r *recordingDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (r *recordingDCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (r *recordingDCB) RouteIncludeVhRateLimits() bool              { return false }
 
 // makeFilter constructs a fault filter with the supplied abort.http_status,
 // abort.percentage, and headers-field shape, returning the *filter and the

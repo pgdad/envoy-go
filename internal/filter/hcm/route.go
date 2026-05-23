@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
@@ -90,6 +91,24 @@ type routeEntry struct {
 	match      routeMatch
 	action     routeAction
 	rateLimits []*routev3.RateLimit
+	// Phase 24.2 Task 1 (D-RL8 — RouteMetadata accessor extension; ADR-0165
+	// set-once-by-dispatch + ADR-0198 DELTA-2 chain-field plumbing template).
+	// metadata carries the matched route's RAW *corev3.Metadata as parsed
+	// from `Route.metadata` at HCM build time. Consumed by the `ratelimit`
+	// filter's `metadata` descriptor action under MetadataSource_ROUTE_ENTRY=1
+	// per parent SPEC §4.1 row 8. nil when the route has no metadata
+	// (zero-regression path).
+	metadata *corev3.Metadata
+
+	// Phase 24.2 Task 4 (D-RL11 — RouteIncludeVhRateLimits accessor extension;
+	// ADR-0165 set-once-by-dispatch + ADR-0198 DELTA-2 chain-field plumbing
+	// template). includeVhRateLimits carries the matched route's legacy
+	// `RouteAction.include_vh_rate_limits` bool as parsed at HCM build time.
+	// Consumed by the `ratelimit` filter's §4.3 Axis-B vhost-walk composition
+	// table per parent SPEC §4.3 + AMEND-5. false (default) when the route
+	// has no include_vh_rate_limits OR when the route has a direct_response
+	// action (no RouteAction).
+	includeVhRateLimits bool
 }
 
 // routeTable is the resolved route_config. Routes are evaluated in

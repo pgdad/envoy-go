@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	bufferv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/buffer/v3"
 	"google.golang.org/protobuf/proto"
@@ -333,6 +334,8 @@ func (c *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { re
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *fakeCallbacks) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *fakeCallbacks) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *fakeCallbacks) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *fakeCallbacks) RouteIncludeVhRateLimits() bool              { return false }
 
 // newBuffer constructs a []byte body chunk for DecodeData tests. nil → empty body (§11.11).
 func newBuffer(b []byte) []byte {

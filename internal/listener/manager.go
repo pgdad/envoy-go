@@ -69,6 +69,17 @@ type listenerCtx struct {
 	// Phase 20 first-use anchor per ADR-0150 §Decision AMENDMENT + ADR-0159
 	// §Decision AMENDMENT.
 	httpClient *httpclient.Client
+	// nodeServiceCluster is the Envoy NODE's `service-cluster` name as
+	// extracted from the bootstrap (`node.cluster` field). Threaded from
+	// NewManagerWithBaseDirAndAllowH2C through buildListenerRuntimeWithCtx +
+	// buildTerminalFilter into the hcm.TypeURL filterConstructor closure.
+	// Plumbed onward as hcm.ListenerCtx.NodeServiceCluster →
+	// parseHTTPFiltersChain's FactoryCtx.NodeServiceCluster. Consumed by the
+	// ratelimit filter's `source_cluster` descriptor action per parent SPEC
+	// §4.1 row 1 (upstream router_ratelimit.cc:89-90). Empty string is the
+	// documented nil-passthrough — see FactoryCtx.NodeServiceCluster.
+	// Phase 24.2 Task 1 first-use anchor.
+	nodeServiceCluster string
 }
 
 // filterConstructor builds a filterHandler from a typed_config Any, the
@@ -111,7 +122,7 @@ var filterRegistry = map[string]filterConstructor{
 		// extracted from the chain's leaf TLS cert into hcm.ListenerCtx so
 		// the HCM filter retains it for per-stream chain seeding via
 		// chain.SetListenerPrincipal.
-		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C, ListenerPrincipal: lc.listenerPrincipal, HTTPClient: lc.httpClient}, registry, accessLogSinks, httpRegistry, dm)
+		f, err := hcm.NewFilterWithCtxAndSinksAndRegistry(tc, cm, hcm.ListenerCtx{HasTLS: lc.hasTLS, AllowH2C: lc.allowH2C, ListenerPrincipal: lc.listenerPrincipal, HTTPClient: lc.httpClient, NodeServiceCluster: lc.nodeServiceCluster}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
@@ -293,10 +304,16 @@ func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Man
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
 	}
+	// Phase 24.2 Task 1: extract the NODE's service-cluster name once at
+	// manager-construction time and thread it through into each listener's
+	// HCM filter via listenerCtx → hcm.ListenerCtx → FactoryCtx. Empty when
+	// the bootstrap omits `node.cluster`. Consumed by the ratelimit filter's
+	// `source_cluster` descriptor action per parent SPEC §4.1 row 1.
+	nodeServiceCluster := bs.GetNode().GetCluster()
 	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry, dm: dm}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm, httpClient)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm, httpClient, nodeServiceCluster)
 		if err != nil {
 			return nil, err
 		}
@@ -368,7 +385,7 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 // per SPEC §12. The phase-03 parse-time errors on `default_filter_chain` and
 // `listener_filters[]` (ADR-0033 clauses 3 and 8) are also superseded; both
 // fields are now honored.
-func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client) (*listenerRuntime, error) {
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, nodeServiceCluster string) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -424,7 +441,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		// Phase 18.2 Task 4 (ADR-0165): listenerPrincipal pre-extracted from
 		// the chain's leaf TLS cert (URI SAN[0] → DNS SAN[0] → Subject CN);
 		// empty for plaintext chains.
-		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(chainTLS), httpClient: httpClient}, registry, accessLogSinks, httpRegistry, dm)
+		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(chainTLS), httpClient: httpClient, nodeServiceCluster: nodeServiceCluster}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, err
 		}
@@ -483,7 +500,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 		// Per ADR-0080: default_filter_chain has an INDEPENDENT TLS posture
 		// from filter_chains[] — no mixed-TLS-rule cross-check here.
-		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(dfcTLS), httpClient: httpClient}, registry, accessLogSinks, httpRegistry, dm)
+		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(dfcTLS), httpClient: httpClient, nodeServiceCluster: nodeServiceCluster}, registry, accessLogSinks, httpRegistry, dm)
 		if err != nil {
 			return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, errUnwrapFilterChain(err))
 		}

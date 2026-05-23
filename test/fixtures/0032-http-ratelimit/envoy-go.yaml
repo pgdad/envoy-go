@@ -8,10 +8,26 @@
 #   - admin/listener ports independently allocated by the runner per proxy.
 #   - no dns_lookup_family (STATIC clusters do not DNS-resolve).
 #
-# Single-listener topology per parent SPEC §7.3 — see envoy.yaml header for
-# the per-scenario route table; the route policies + the filter config are
-# byte-identical between the two YAMLs (so both sides build the same
-# descriptors at runtime).
+# Single-vhost topology per envoy-go's HCM constraint at
+# internal/filter/hcm/config.go (single-vh canonical per ADR-0019/0072) —
+# see envoy.yaml header for the per-scenario route table; the route policies
+# + the filter config + the vh-level rate_limits are byte-identical between
+# the two YAMLs (so both sides build the same descriptors at runtime).
+#
+# Phase 24.2 Task 6 additions mirror envoy.yaml verbatim:
+#   - node.cluster: rls_test_cluster — for the (d) extension source_cluster
+#     action's deterministic value.
+#   - vh_a vhost-level rate_limits emits generic_key{vh:vh_a} (consumed by
+#     the (f) sub-scenarios; SKIPPED on 24.1 scenarios via OVERRIDE-default
+#     when route has rate_limits, or via vh_rate_limits=IGNORE TPFC for (a)).
+#   - scenario (a) carries vh_rate_limits=IGNORE TPFC to preserve 24.1
+#     zero-descriptor semantics.
+#   - (d) extension actions appended to /scenario_d (5 NEW actions; total 9).
+#   - 3 NEW (f) sub-scenario routes (override/include/ignore) with their
+#     respective RateLimitPerRoute TPFCs.
+#   - /scenario_g route with 2-policy (single-action each) config.
+#   - filter config: enable_x_ratelimit_headers: DRAFT_VERSION_03 +
+#     response_headers_to_add: [{key: x-from-config, value: filtercfg}].
 #
 # Templating: rendered by the driver's SubjectConfig() at runtime.
 # Substitution keys:
@@ -20,6 +36,10 @@
 #   {{.BackendPort}}  — echobackend port (runner-allocated).
 #   {{.RLSHost}}      — RLS fake host (127.0.0.1 for envoy-go on the host).
 #   {{.RLSPort}}      — RLS fake port (driver-allocated; pre-bound).
+node:
+  cluster: rls_test_cluster
+  id: subj_node
+
 admin:
   address:
     socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
@@ -40,8 +60,17 @@ static_resources:
                   virtual_hosts:
                     - name: vh_a
                       domains: ["*"]
+                      rate_limits:
+                        - actions:
+                            - generic_key:
+                                descriptor_key: vh
+                                descriptor_value: vh_a
                       routes:
                         - match: { path: "/scenario_a" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimitPerRoute
+                              vh_rate_limits: IGNORE
                           route: { cluster: c_backend }
                         - match: { path: "/scenario_b" }
                           route:
@@ -60,6 +89,10 @@ static_resources:
                                       descriptor_key: scenario
                                       descriptor_value: c
                         - match: { path: "/scenario_d" }
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.ratelimit:
+                                tier: gold
                           route:
                             cluster: c_backend
                             rate_limits:
@@ -76,6 +109,25 @@ static_resources:
                                       headers:
                                         - name: x-canary
                                           present_match: true
+                                  - source_cluster: {}
+                                  - masked_remote_address:
+                                      v4_prefix_mask_len: 24
+                                  - metadata:
+                                      descriptor_key: tier
+                                      metadata_key:
+                                        key: envoy.filters.http.ratelimit
+                                        path:
+                                          - key: tier
+                                      source: ROUTE_ENTRY
+                                  - query_parameters:
+                                      query_parameter_name: region
+                                      descriptor_key: region
+                                  - query_parameter_value_match:
+                                      descriptor_value: premium_plan
+                                      query_parameters:
+                                        - name: plan
+                                          string_match:
+                                            exact: premium
                         - match: { path: "/scenario_e" }
                           route:
                             cluster: c_backend
@@ -84,11 +136,60 @@ static_resources:
                                   - generic_key:
                                       descriptor_key: scenario
                                       descriptor_value: e
+                        - match: { path: "/scenario_f_override" }
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scenario
+                                      descriptor_value: f_override
+                        - match: { path: "/scenario_f_include" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimitPerRoute
+                              vh_rate_limits: INCLUDE
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scenario
+                                      descriptor_value: f_include
+                        - match: { path: "/scenario_f_ignore" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimitPerRoute
+                              vh_rate_limits: IGNORE
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scenario
+                                      descriptor_value: f_ignore
+                        - match: { path: "/scenario_g" }
+                          route:
+                            cluster: c_backend
+                            rate_limits:
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: tier
+                                      descriptor_value: bronze
+                              - actions:
+                                  - generic_key:
+                                      descriptor_key: scope
+                                      descriptor_value: burst
                 http_filters:
                   - name: envoy.filters.http.ratelimit
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
                       domain: domain_b
+                      enable_x_ratelimit_headers: DRAFT_VERSION_03
+                      response_headers_to_add:
+                        - header:
+                            key: x-from-config
+                            value: filtercfg
                       rate_limit_service:
                         grpc_service:
                           envoy_grpc:

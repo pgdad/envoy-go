@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"golang.org/x/net/http2/hpack"
 
@@ -150,6 +151,16 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 		// lifetime). nil for routes with no rate_limits[] (the zero-regression
 		// path; chain accessor returns nil).
 		routeRateLimits: entry.rateLimits,
+		// Phase 24.2 Task 1 (D-RL8): thread the matched route's metadata
+		// for the ratelimit filter's metadata descriptor action under
+		// MetadataSource_ROUTE_ENTRY=1. nil-passthrough when the route has
+		// no metadata field.
+		routeMetadata: entry.metadata,
+		// Phase 24.2 Task 4 (D-RL11): thread the matched route's legacy
+		// `RouteAction.include_vh_rate_limits` bool for the ratelimit
+		// filter's §4.3 Axis-B force-include arm. false-passthrough when
+		// the route does not carry the legacy bool.
+		routeIncludeVhRateLimits: entry.includeVhRateLimits,
 	}, true
 }
 
@@ -230,6 +241,22 @@ type chainDispatchAction struct {
 	// no rate_limits[] (the zero-regression path) and for the no-match-route
 	// 404 path (the no-chain branch elides the seed entirely).
 	routeRateLimits []*routev3.RateLimit
+
+	// Phase 24.2 Task 1 (D-RL8): the matched route's *corev3.Metadata
+	// threaded from h2Dispatcher.Match's routeEntry capture into
+	// chain.SetRouteMetadata below in WriteH2. Same dispatch-envelope
+	// discipline as routeRateLimits above. Consumed by the ratelimit
+	// filter's `metadata` descriptor action under MetadataSource_ROUTE_ENTRY=1.
+	routeMetadata *corev3.Metadata
+
+	// Phase 24.2 Task 4 (D-RL11): the matched route's legacy
+	// `RouteAction.include_vh_rate_limits` bool threaded from
+	// h2Dispatcher.Match's routeEntry capture into
+	// chain.SetRouteIncludeVhRateLimits below in WriteH2. Same dispatch-
+	// envelope discipline as routeRateLimits/routeMetadata above. Consumed by
+	// the ratelimit filter's §4.3 Axis-B vhost-walk composition table per
+	// parent SPEC §4.3 + AMEND-5 (the legacy force-include override).
+	routeIncludeVhRateLimits bool
 }
 
 func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, sw h2.StreamWriter) error {
@@ -321,6 +348,18 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// applies. nil-passthrough when either slice is empty.
 	chain.SetRouteRateLimits(c.routeRateLimits)
 	chain.SetVirtualHostRateLimits(c.f.table.vhostRateLimits)
+	// Phase 24.2 Task 1 (D-RL8): seed the matched route's *corev3.Metadata
+	// onto the chain BEFORE RunDecodeHeaders for the ratelimit filter's
+	// `metadata` descriptor action under MetadataSource_ROUTE_ENTRY=1. nil-
+	// passthrough when the route has no metadata (zero-regression).
+	chain.SetRouteMetadata(c.routeMetadata)
+	// Phase 24.2 Task 4 (D-RL11): seed the matched route's legacy
+	// `RouteAction.include_vh_rate_limits` bool onto the chain BEFORE
+	// RunDecodeHeaders so the ratelimit filter's §4.3 Axis-B composition table
+	// can honor the legacy force-include override (per parent SPEC §4.3 +
+	// AMEND-5). Mirrors the SetRouteMetadata set-once-by-dispatch discipline;
+	// false-passthrough when the route does not carry the legacy bool.
+	chain.SetRouteIncludeVhRateLimits(c.routeIncludeVhRateLimits)
 	defer chain.Destroy()
 
 	// Locate the terminal router filter and inject the per-request H2

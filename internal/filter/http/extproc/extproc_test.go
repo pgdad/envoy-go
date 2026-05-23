@@ -1010,6 +1010,8 @@ func (f *fakeDCB) DynamicMetadata() *dynamicmetadata.Bucket           { return n
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (f *fakeDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (f *fakeDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (f *fakeDCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (f *fakeDCB) RouteIncludeVhRateLimits() bool              { return false }
 
 func (f *fakeDCB) calls() int {
 	f.mu.Lock()
@@ -4015,6 +4017,8 @@ func (d *perRouteSwapDCB) DynamicMetadata() *dynamicmetadata.Bucket           { 
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (d *perRouteSwapDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (d *perRouteSwapDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (d *perRouteSwapDCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (d *perRouteSwapDCB) RouteIncludeVhRateLimits() bool              { return false }
 
 var _ envoyhttp.DecoderFilterCallbacks = (*perRouteSwapDCB)(nil)
 

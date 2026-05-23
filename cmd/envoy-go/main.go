@@ -161,6 +161,15 @@ func main() {
 	// yet supported (lands in phase 22.3)"; the 9th canonical per-route shape
 	// validator replaces the body at 22.3 IMPL.
 	lua.RegisterPerRouteValidator(httpReg)
+	// Phase-24.2 Task 3: register the ratelimit per-route validator BEFORE Freeze
+	// per parent §5.3 + ADR-0199 (the 10th canonical per-route shape) + ADR-0110
+	// single-chokepoint. The validator enforces the embedded rate_limits[]
+	// §5.2 PARSE-REJECT arms (REUSES ValidateRouteRateLimits from 24.1 Task 3 —
+	// disable_key / extension / dynamic_metadata + per-policy stage > 10) and
+	// the vh_rate_limits enum-bounds check; override_option + domain are
+	// PARSE-ACCEPTED (override_option is INERT per AMEND-4; empty domain
+	// defers to the filter-config domain).
+	ratelimit.RegisterPerRouteValidator(httpReg)
 	httpReg.Freeze()
 
 	// Phase 07.2 Task 11 boot wiring: build the

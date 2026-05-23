@@ -598,6 +598,8 @@ func (f *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { re
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (f *fakeDecoderCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (f *fakeDecoderCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (f *fakeDecoderCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (f *fakeDecoderCB) RouteIncludeVhRateLimits() bool              { return false }
 
 // makeFilterWithMode constructs a *filter with the given enable_mode +
 // limit_kbps + fill_interval and a freshly-attached fakeDecoderCB. Used

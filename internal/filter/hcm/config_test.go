@@ -727,7 +727,7 @@ func TestParseHTTPFiltersChain_FactoryCtxThreading(t *testing.T) {
 		{Name: "test.factoryctx", ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: &anypb.Any{TypeUrl: "type.googleapis.com/test.FactoryCtxProbe"}}},
 		{Name: "envoy.filters.http.router", ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouter()}},
 	}
-	_, err := parseHTTPFiltersChain(filters, nil /*clusters — not exercised by FactoryCtxProbe*/, nil /*httpClient — not exercised by FactoryCtxProbe*/, httpReg, reg, statPrefix)
+	_, err := parseHTTPFiltersChain(filters, nil /*clusters — not exercised by FactoryCtxProbe*/, nil /*httpClient — not exercised by FactoryCtxProbe*/, httpReg, reg, statPrefix, "" /*nodeServiceCluster — not exercised by FactoryCtxProbe*/)
 	if err != nil {
 		t.Fatalf("parseHTTPFiltersChain: %v", err)
 	}

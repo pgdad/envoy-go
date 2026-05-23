@@ -147,19 +147,40 @@ func (f *filter) applyDisposition(headers http.Header, resp *ratelimitservicev3.
 	// OverallCode (UNKNOWN = 0 — the proto-zero default; signals the RLS
 	// returned a malformed envelope).
 	if err != nil || resp == nil || resp.GetOverallCode() == ratelimitservicev3.RateLimitResponse_UNKNOWN {
-		f.applyError()
+		// Phase 24.2 Task 5 (D-RL12 + ADR-0197 X-RateLimit slice): the
+		// transport-error + UNKNOWN-OverallCode arms feed through
+		// applyError. The store-statuses-on-failOpen branch is INSIDE
+		// applyError so the failure_mode_deny gate properly suppresses the
+		// store on fail-CLOSED (the nullptr-mutate 500 path emits NO
+		// X-RateLimit headers per D-RL12). For nil-resp the slice is nil
+		// anyway; no store occurs on either side.
+		f.applyError(resp)
 		return
 	}
 
 	switch resp.GetOverallCode() {
 	case ratelimitservicev3.RateLimitResponse_OK:
+		// Phase 24.2 Task 5: store the per-descriptor statuses for the
+		// encode-side X-RateLimit DRAFT_VERSION_03 emission (ADR-0197
+		// X-RateLimit slice + D-RL12). Read by encode.go::encodeHeaders.
+		// Stored UNDER f.mu (the caller holds it via the resume-after-
+		// OnDestroy guard at decode_headers.go:261-263).
+		f.responseStatuses = resp.GetStatuses()
 		f.applyOK(headers, resp)
 	case ratelimitservicev3.RateLimitResponse_OVER_LIMIT:
+		// Phase 24.2 Task 5: store statuses BEFORE SendLocalReply. The
+		// applyOverLimit path calls dcb.SendLocalReply which synchronously
+		// enters the encode chain (chain.go::beginLocalReply at chain.go:1214)
+		// + invokes this filter's EncodeHeaders inline; encodeHeaders reads
+		// f.responseStatuses (lock-free — the store is sequenced before
+		// SendLocalReply on the same goroutine per encode.go's re-entrancy
+		// note).
+		f.responseStatuses = resp.GetStatuses()
 		f.applyOverLimit(resp)
 	default:
 		// Defensive — any future-added OverallCode value falls through to the
 		// error arm. The proto today only defines {UNKNOWN, OK, OVER_LIMIT}.
-		f.applyError()
+		f.applyError(resp)
 	}
 }
 
@@ -214,8 +235,23 @@ func (f *filter) applyOK(headers http.Header, resp *ratelimitservicev3.RateLimit
 //  2. Build the AMEND-8-ordered headers slice:
 //     [a] `x-envoy-ratelimited: true` (UNLESS cc.disableXEnvoyRateLimitedHeader)
 //     [b] RLS resp.ResponseHeadersToAdd (in RLS-given order)
+//     [c-pre] X-RateLimit DRAFT_VERSION_03 triple (UNLESS OFF / no current_limit)
 //     [c] cc.responseHeadersToAdd (in config order)
 //  3. SendLocalReply(cc.rateLimitedStatus, resp.RawBody, headers).
+//
+// Phase 24.2 Task 5 follow-up (AMEND-8 wire-order I-1 — parent SPEC §4.7
+// line 214): the X-RateLimit triple is applied INLINE here BETWEEN the
+// `x-envoy-ratelimited` slot and the filter-config `response_headers_to_add`
+// slot — NOT later via the encode-side hook. The encode-side
+// `encode.go::encodeHeaders` hook still runs synchronously via
+// `chain.go::beginLocalReply → RunEncodeHeaders`, but its `headers.Set`
+// becomes a no-op-set-equal idempotent overwrite (the same
+// `buildXRateLimitHeaders` source produces byte-identical values; HTTP
+// header keys canonicalize identically under `http.Header.Set` /
+// `http.Header.Add`). On OK / fail-OPEN dispositions the encode-side hook
+// remains the SOLE emission point (no inline emission on the admit path —
+// the upstream provides the response headers and X-RateLimit layers on top
+// via encode-side Set).
 //
 // The rc-details ("request_rate_limited") + the gRPC status code (8/14) are
 // ABSENT-BY-API at 24.1 (see file-header).
@@ -224,8 +260,9 @@ func (f *filter) applyOverLimit(resp *ratelimitservicev3.RateLimitResponse) {
 		c.Inc()
 	}
 
-	// Capacity hint: 1 (x-envoy-ratelimited slot) + RLS slice + config slice.
-	headers := make(envoyhttp.OrderedHeaders, 0, 1+len(resp.GetResponseHeadersToAdd())+len(f.cc.responseHeadersToAdd))
+	// Capacity hint: 1 (x-envoy-ratelimited slot) + RLS slice + 3 (X-RateLimit
+	// triple) + config slice.
+	headers := make(envoyhttp.OrderedHeaders, 0, 1+len(resp.GetResponseHeadersToAdd())+3+len(f.cc.responseHeadersToAdd))
 
 	// [a] x-envoy-ratelimited: true — unless suppressed.
 	if !f.cc.disableXEnvoyRateLimitedHeader {
@@ -246,6 +283,27 @@ func (f *filter) applyOverLimit(resp *ratelimitservicev3.RateLimitResponse) {
 			Name:  hv.GetKey(),
 			Value: hv.GetValue(),
 		})
+	}
+
+	// [c-pre] X-RateLimit DRAFT_VERSION_03 triple — inlined here per parent
+	// SPEC §4.7 line 214 wire-order discipline (Task 5 follow-up; spec +
+	// code-quality I-1 fix). Gated on the same two predicates as the encode-
+	// side hook:
+	//   - cc.enableXRateLimitHeaders == true (DRAFT_VERSION_03 enabled)
+	//   - buildXRateLimitHeaders returns ok=true (≥1 status carries current_limit)
+	// The encode-side hook (encode.go::encodeHeaders) reads f.responseStatuses
+	// (stored at applyDisposition) and performs the SAME computation; on the
+	// OVER_LIMIT path its `headers.Set` becomes a no-op-set-equal idempotent
+	// overwrite of these inline-applied values (byte-identical via the shared
+	// buildXRateLimitHeaders source).
+	if f.cc.enableXRateLimitHeaders {
+		if limit, remaining, reset, ok := buildXRateLimitHeaders(resp.GetStatuses()); ok {
+			headers = append(headers,
+				envoyhttp.HeaderField{Name: headerXRateLimitLimit, Value: limit},
+				envoyhttp.HeaderField{Name: headerXRateLimitRemaining, Value: remaining},
+				envoyhttp.HeaderField{Name: headerXRateLimitReset, Value: reset},
+			)
+		}
 	}
 
 	// [c] Filter-config response headers, in config order. Pre-canonicalized
@@ -285,7 +343,13 @@ func (f *filter) applyOverLimit(resp *ratelimitservicev3.RateLimitResponse) {
 //   - true  (fail-CLOSED): SendLocalReply(cc.statusOnError, "", nil) — no
 //     body, no headers (the "nullptr-mutate" shape per upstream ratelimit.cc
 //     error codepath; ABSENT-BY-API rc-details "rate_limiter_error").
-func (f *filter) applyError() {
+//
+// Phase 24.2 Task 5 (D-RL12 + ADR-0197 X-RateLimit slice): the optional
+// `resp` argument carries the (possibly nil) RLS response so the fail-OPEN
+// branch can capture per-descriptor statuses for X-RateLimit emission on the
+// upstream-then-encode admit path. The fail-CLOSED branch MUST NOT store —
+// the 500 nullptr-mutate path emits NO X-RateLimit per D-RL12.
+func (f *filter) applyError(resp *ratelimitservicev3.RateLimitResponse) {
 	if c := f.cc.stats.error; c != nil {
 		c.Inc()
 	}
@@ -295,6 +359,13 @@ func (f *filter) applyError() {
 		if c := f.cc.stats.failureModeAllowed; c != nil {
 			c.Inc()
 		}
+		// Phase 24.2 Task 5: store statuses on fail-OPEN when the RLS
+		// returned a non-nil response (a partial-success / UNKNOWN-overall
+		// envelope may still carry per-descriptor statuses). The upstream-
+		// produced response then carries X-RateLimit at the encode phase.
+		// On transport error (nil resp) the GetStatuses() reflection-safe
+		// accessor returns nil — clean no-op.
+		f.responseStatuses = resp.GetStatuses()
 		f.dcb.ContinueDecoding()
 		return
 	}

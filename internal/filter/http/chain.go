@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 
@@ -173,6 +174,56 @@ type FilterChain struct {
 	// RequestRouteConfig() / typed_per_filter_config path per ADR-0073.
 	routeRateLimits       []*routev3.RateLimit
 	virtualHostRateLimits []*routev3.RateLimit
+
+	// Phase 24.2 Task 1 (D-RL8 — RouteMetadata accessor extension; ADR-0165
+	// set-once-by-dispatch + ADR-0198 DELTA-2 chain-field plumbing template).
+	// routeMetadata carries the matched route's RAW *corev3.Metadata as parsed
+	// from `Route.metadata` at HCM build time. Consumed by the `ratelimit`
+	// filter's `metadata` descriptor action under MetadataSource_ROUTE_ENTRY=1
+	// per parent SPEC §4.1 row 8. nil for synthetic streams, for routes with
+	// no metadata, or for the no-match-route 404 path (HCM elides the seed).
+	//
+	// Zero-value semantics (no SetX call by HCM dispatch):
+	//   - routeMetadata: nil (route has no metadata, or the no-match-route 404
+	//     path where HCM elides the seed; or a synthetic stream test that
+	//     bypasses HCM dispatch entirely)
+	//
+	// Set-once invariant per ADR-0071: HCM dispatch writes the field ONCE
+	// before filter iteration; filter callbacks are read-only. No mutex
+	// required. Mirrors the 24.1 DELTA-2 RouteRateLimits plumbing template.
+	//
+	// Narrow-exposure / YAGNI: ONLY the ratelimit filter's `metadata` action
+	// (MetadataSource_ROUTE_ENTRY=1) consumes this at 24.2; other route-level
+	// metadata access (cors, retry, etc.) stays on the RequestRouteConfig() /
+	// typed_per_filter_config path per ADR-0073.
+	routeMetadata *corev3.Metadata
+
+	// Phase 24.2 Task 4 (D-RL11 — RouteIncludeVhRateLimits legacy-bool accessor
+	// extension; ADR-0165 set-once-by-dispatch + ADR-0198 DELTA-2 chain-field
+	// plumbing template). routeIncludeVhRateLimits carries the matched route's
+	// legacy `RouteAction.include_vh_rate_limits` bool as parsed at HCM build
+	// time. Consumed by the `ratelimit` filter's §4.3 Axis-B vhost-walk
+	// composition table per parent SPEC §4.3 + AMEND-5: when true, the vhost-
+	// level RateLimit policy slice is ALWAYS walked regardless of
+	// `RateLimitPerRoute.vh_rate_limits` (the legacy force-include override
+	// trumps the enum). Default false ⇒ honor the enum (OVERRIDE / INCLUDE /
+	// IGNORE per §4.3).
+	//
+	// Zero-value semantics (no SetX call by HCM dispatch):
+	//   - routeIncludeVhRateLimits: false (route has no
+	//     include_vh_rate_limits, or the no-match-route 404 path where HCM
+	//     elides the seed; or a synthetic stream test that bypasses HCM
+	//     dispatch entirely)
+	//
+	// Set-once invariant per ADR-0071: HCM dispatch writes the field ONCE
+	// before filter iteration; filter callbacks are read-only. No mutex
+	// required. Mirrors the 24.1 DELTA-2 RouteRateLimits + 24.2 Task 1
+	// RouteMetadata plumbing template.
+	//
+	// Narrow-exposure / YAGNI: ONLY the ratelimit filter's §4.3 Axis-B
+	// composition table consumes this at 24.2 — the legacy bool is a
+	// route-level RouteAction field with no other consumer.
+	routeIncludeVhRateLimits bool
 
 	// encodeResponseStatus carries the HTTP response status code (e.g. 200,
 	// 503) for the stream being encoded. Set ONCE by HCM dispatch via
@@ -734,6 +785,31 @@ func (d *decoderCB) VirtualHostRateLimits() []*routev3.RateLimit {
 	return d.c.virtualHostRateLimits
 }
 
+// RouteMetadata returns the matched route's HCM-seeded RAW *corev3.Metadata
+// (set via SetRouteMetadata before RunDecodeHeaders). Returns nil for
+// synthetic streams, for routes with no metadata, or for the no-match-route
+// 404 path where HCM elides the seed. Per phase 24.2 Task 1 (D-RL8) —
+// extension of the ADR-0165 set-once-by-dispatch + ADR-0198 DELTA-2 plumbing
+// template. Consumed by the ratelimit filter's `metadata` descriptor action
+// under MetadataSource_ROUTE_ENTRY=1 per parent SPEC §4.1 row 8.
+func (d *decoderCB) RouteMetadata() *corev3.Metadata {
+	return d.c.routeMetadata
+}
+
+// RouteIncludeVhRateLimits returns the matched route's HCM-seeded legacy
+// `RouteAction.include_vh_rate_limits` bool (set via SetRouteIncludeVhRateLimits
+// before RunDecodeHeaders). Returns false for synthetic streams, for routes
+// without the field set, or for the no-match-route 404 path where HCM elides
+// the seed. Per phase 24.2 Task 4 (D-RL11) — extension of the ADR-0165
+// set-once-by-dispatch + ADR-0198 DELTA-2 plumbing template. Consumed by the
+// ratelimit filter's §4.3 Axis-B vhost-walk composition table per parent SPEC
+// §4.3 + AMEND-5: when true, the vhost-level RateLimit policy slice is ALWAYS
+// walked regardless of `RateLimitPerRoute.vh_rate_limits` (the legacy force-
+// include override trumps the enum).
+func (d *decoderCB) RouteIncludeVhRateLimits() bool {
+	return d.c.routeIncludeVhRateLimits
+}
+
 // DownstreamTLSConnectionState returns the chain's HCM-seeded FULL
 // *tls.ConnectionState (set once via SetTLSConnectionState before
 // RunDecodeHeaders). Returns nil for plaintext / non-mTLS / no-client-cert
@@ -1054,6 +1130,42 @@ func (c *FilterChain) RouteRateLimits() []*routev3.RateLimit {
 // decoderCB.VirtualHostRateLimits. Per ADR-0198 §Decision.
 func (c *FilterChain) VirtualHostRateLimits() []*routev3.RateLimit {
 	return c.virtualHostRateLimits
+}
+
+// SetRouteMetadata seeds the matched route's RAW *corev3.Metadata. Called by
+// HCM dispatch (connection.go H1 / h2dispatch.go H2) at chain build time
+// BEFORE RunDecodeHeaders when the matched routeEntry carries a non-nil
+// metadata. nil-passthrough when the route has no metadata (the chain field
+// stays nil; the accessor returns nil). Per phase 24.2 Task 1 (D-RL8) —
+// extension of the ADR-0165 set-once-by-dispatch + ADR-0198 DELTA-2 plumbing
+// template; the single-dispatch-goroutine invariant per ADR-0071 applies.
+func (c *FilterChain) SetRouteMetadata(md *corev3.Metadata) {
+	c.routeMetadata = md
+}
+
+// RouteMetadata is the chain-level test-readable companion to
+// decoderCB.RouteMetadata. Per phase 24.2 Task 1 (D-RL8).
+func (c *FilterChain) RouteMetadata() *corev3.Metadata {
+	return c.routeMetadata
+}
+
+// SetRouteIncludeVhRateLimits seeds the matched route's legacy
+// `RouteAction.include_vh_rate_limits` bool. Called by HCM dispatch
+// (connection.go H1 / h2dispatch.go H2) at chain build time BEFORE
+// RunDecodeHeaders when the matched routeEntry carries the legacy bool.
+// false-passthrough when the route has no include_vh_rate_limits (the chain
+// field stays false; the accessor returns false). Per phase 24.2 Task 4
+// (D-RL11) — extension of the ADR-0165 set-once-by-dispatch + ADR-0198
+// DELTA-2 plumbing template; the single-dispatch-goroutine invariant per
+// ADR-0071 applies.
+func (c *FilterChain) SetRouteIncludeVhRateLimits(v bool) {
+	c.routeIncludeVhRateLimits = v
+}
+
+// RouteIncludeVhRateLimits is the chain-level test-readable companion to
+// decoderCB.RouteIncludeVhRateLimits. Per phase 24.2 Task 4 (D-RL11).
+func (c *FilterChain) RouteIncludeVhRateLimits() bool {
+	return c.routeIncludeVhRateLimits
 }
 
 // SetEncodeResponseStatus seeds the chain's per-stream HTTP response status

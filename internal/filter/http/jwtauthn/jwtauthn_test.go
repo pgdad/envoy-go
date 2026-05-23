@@ -945,6 +945,8 @@ func (c *jwtFakeCB) DynamicMetadata() *dynamicmetadata.Bucket           { return
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *jwtFakeCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *jwtFakeCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *jwtFakeCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *jwtFakeCB) RouteIncludeVhRateLimits() bool              { return false }
 
 // newFilterWithListenerRC wires a *filter against the supplied listener-level
 // *compiledConfig + per-route *compiledPerRoute + fresh jwtFakeCB. Used by

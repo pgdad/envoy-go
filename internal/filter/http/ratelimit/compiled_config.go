@@ -238,13 +238,16 @@ type compiledConfig struct {
 	domain string
 
 	// stage selects the route/vhost RateLimit-policy stage bucket (range
-	// 0..10 per §5.1 arm 3). 24.1 honors the stage value but stage filtering
-	// of route/vhost descriptors lands at 24.2 per D-RL split-boundary
-	// (24.1's engine evaluates only the default stage-0 bucket per
-	// descriptors.go).
+	// 0..10 per §5.1 arm 3). At 24.1 the engine evaluated only the default
+	// stage-0 bucket; phase-24.2 Task 2 generalizes — at request time the
+	// walker filters by `p.GetStage().GetValue() == cc.stage` (descriptors.go
+	// :336), whose observable semantics are equivalent to indexing
+	// `bucketRateLimitsByStage(...)[cc.stage]` per §4.4 upstream
+	// `getApplicableRateLimit(stage)`. The `bucketRateLimitsByStage` helper
+	// itself is exposed for parse-time occupancy assertions + future
+	// composition reuse (Task 3 per-route, Task 4 Axis-B). Accessed via the
+	// nil-safe `cc.getStage()` accessor on the decode-headers path.
 	// Derived from proto field 2 (stage).
-	//
-	//nolint:unused // parsed at 24.1; stage multi-bucket filtering deferred to 24.2
 	stage uint32
 
 	// requestType is the internal/external classification filter. Empty proto
@@ -326,6 +329,16 @@ type compiledConfig struct {
 	// `cluster.<rls>.ratelimit.<stat>`). Empty ⇒ no per-filter modulator.
 	// Derived from proto field 13 (stat_prefix).
 	statPrefix string
+
+	// nodeServiceCluster is the Envoy NODE's `service-cluster` name as
+	// captured at New-factory time from FactoryCtx.NodeServiceCluster. Phase
+	// 24.2 Task 1 first-use anchor: consumed by the `source_cluster`
+	// descriptor action per parent SPEC §4.1 row 1 (upstream
+	// router_ratelimit.cc:89-90 always-true semantics). Empty string is the
+	// documented nil-passthrough — the action then emits an empty-value
+	// descriptor entry (descriptor survives; the key "source_cluster" is
+	// non-empty so the §4.5 push_back fires).
+	nodeServiceCluster string
 
 	// responseHeadersToAdd is the pre-compiled list of filter-config headers
 	// appended to OVER_LIMIT replies (per ratelimit.cc:278-283 + AMEND-8).
@@ -452,6 +465,7 @@ func buildCompiledConfig(typedConfig *anypb.Any, ctx envoyhttp.FactoryCtx) (*com
 		rateLimitedStatus:              rateLimitedStatusOrClamp(raw.GetRateLimitedStatus()),
 		statusOnError:                  statusOnErrorOrClamp(raw.GetStatusOnError()),
 		statPrefix:                     raw.GetStatPrefix(),
+		nodeServiceCluster:             ctx.NodeServiceCluster,
 		responseHeadersToAdd:           compileResponseHeaders(raw.GetResponseHeadersToAdd()),
 	}
 
@@ -626,6 +640,12 @@ func compileResponseHeaders(opts []*corev3.HeaderValueOption) []headerKV {
 //  3. RateLimit_Action.dynamic_metadata arm set (deprecated in-proto; use
 //     'metadata' per AMEND-11)
 //
+// Also enforces the §5.1 Arm 3 PGV `lte:10` mirror against the per-POLICY
+// stage (phase-24.2 Task 2). The filter-envelope `stage > 10` arm already
+// fires at `buildCompiledConfig`; here the SAME byte-stable wording fires
+// against any route/vhost policy whose `stage.value > 10`. Mirrors upstream
+// PGV `lte:10` on `config.route.v3.RateLimit.stage` (route_components.pb.go:3275).
+//
 // Returns the FIRST violation encountered (slice-order then action-order
 // within each *RateLimit). nil input + empty input both return nil.
 //
@@ -646,6 +666,12 @@ func ValidateRouteRateLimits(rls []*routev3.RateLimit) error {
 		if rl.GetDisableKey() != "" {
 			return errors.New(parseRejectRouteRateLimitDisableKey)
 		}
+		// Phase-24.2 Task 2: per-policy stage > 10 PARSE-REJECT (PGV `lte:10`
+		// mirror; parent §4.4 + §5.1 Arm 3). `rl.GetStage()` is a
+		// `*wrapperspb.UInt32Value`; .GetValue() is nil-safe (returns 0).
+		if rl.GetStage().GetValue() > maxStage {
+			return errors.New(parseRejectStageTooHigh)
+		}
 		for _, action := range rl.GetActions() {
 			if action == nil {
 				continue
@@ -661,4 +687,57 @@ func ValidateRouteRateLimits(rls []*routev3.RateLimit) error {
 		}
 	}
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// bucketRateLimitsByStage — the §4.4 parse-time stage bucketing helper.
+// ----------------------------------------------------------------------------
+
+// bucketRateLimitsByStage partitions a slice of *routev3.RateLimit into
+// `maxStage+1 = 11` slots indexed by `policy.GetStage().GetValue()` (nil
+// UInt32Value ⇒ 0; the upstream proto default per PGV `lte:10` invariant on
+// `config.route.v3.RateLimit.stage`).
+//
+// Mirrors the upstream `RateLimitConfigImpl::references[stage]` table sized
+// `MAX_STAGE_NUMBER + 1 = 11` (rl.cc:539-550 + parent SPEC §4.4). Out-of-
+// range policies (stage > maxStage) are SKIPPED here defensively;
+// `ValidateRouteRateLimits` rejects them at HCM-parse-time per the byte-
+// stable `parseRejectStageTooHigh` arm — this helper trusts the input has
+// passed validation but does not panic on stragglers.
+//
+// At request time, the engine consults `buckets[filterStage]` per the
+// `getApplicableRateLimit(stage)` upstream semantics — see
+// `buildDescriptorsExt` in descriptors.go for the per-request selection.
+//
+// nil + empty inputs return an all-empty 11-slot array (each slot nil/empty);
+// the engine then walks ZERO policies at the selected bucket which the §4.6
+// zero-descriptor-short-circuit handles uniformly.
+func bucketRateLimitsByStage(rls []*routev3.RateLimit) [maxStage + 1][]*routev3.RateLimit {
+	var buckets [maxStage + 1][]*routev3.RateLimit
+	for _, rl := range rls {
+		if rl == nil {
+			continue
+		}
+		// rl.GetStage() is a *wrapperspb.UInt32Value; nil ⇒ stage 0 (proto default).
+		// .GetValue() is nil-safe.
+		stage := rl.GetStage().GetValue()
+		if stage > maxStage {
+			// Out-of-range — would have been PARSE-REJECTed by
+			// `ValidateRouteRateLimits`; defensive skip here.
+			continue
+		}
+		buckets[stage] = append(buckets[stage], rl)
+	}
+	return buckets
+}
+
+// getStage is a nil-safe accessor for cc.stage. Test paths may construct a
+// *filter without a compiledConfig (the synthetic-stream dispatch path);
+// returns 0 (the default stage) in that case. The 0 fallback aligns with the
+// proto-zero default — same bucket the 24.1 baseline walked.
+func (c *compiledConfig) getStage() uint32 {
+	if c == nil {
+		return 0
+	}
+	return c.stage
 }

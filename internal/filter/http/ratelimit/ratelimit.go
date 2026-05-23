@@ -97,9 +97,8 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.
 //     precedent at extauthz.go:1048/1343).
 type filter struct {
 	cc  *compiledConfig
-	dcb envoyhttp.DecoderFilterCallbacks
-	//nolint:unused // ecb is set via SetEncoderCallbacks; encode-side body STUBBED at 24.1 per D-RL7 (X-RateLimit injection lands at 24.2)
 	ecb envoyhttp.EncoderFilterCallbacks
+	dcb envoyhttp.DecoderFilterCallbacks
 
 	// Async-dispatch state per planner-time decision + the ext_authz precedent.
 	callCtx    context.Context //nolint:containedctx // stored for OnDestroy cancellation per the ext_authz callCancel precedent (extauthz.go:1037-1039)
@@ -109,6 +108,26 @@ type filter struct {
 	// precedent (extauthz.go:1048 / 1343).
 	mu   sync.Mutex
 	done bool
+
+	// responseStatuses is the per-stream X-RateLimit DRAFT_VERSION_03 capture
+	// surface (parent SPEC §4.7 + AMEND-8 + D-RL12; ADR-0197 X-RateLimit slice
+	// at phase-24.2 Task 5). Stored by dispositions.go on the three "store"
+	// arms — OK / OVER_LIMIT / fail-OPEN with a non-nil response — and read by
+	// encode.go::encodeHeaders to compute the byte-shape.
+	//
+	// Lock discipline: WRITTEN under f.mu in dispositions.go::applyDisposition
+	// (always under mu — the async-goroutine holds f.mu when it calls
+	// applyDisposition; the OVER_LIMIT path's downstream SendLocalReply runs
+	// the encode chain synchronously in the same goroutine). READ in
+	// encode.go::encodeHeaders WITHOUT acquiring f.mu — re-entrant mu would
+	// deadlock the synchronous SendLocalReply→RunEncodeHeaders path. The store
+	// completes BEFORE SendLocalReply / ContinueDecoding signals the chain, so
+	// happens-before is supplied by the chain dispatch sequencing.
+	//
+	// fail-CLOSED MUST NOT store per D-RL12 (the 500 path emits no
+	// X-RateLimit). A nil/empty responseStatuses on read makes encodeHeaders a
+	// clean no-op.
+	responseStatuses []*ratelimitservicev3.RateLimitResponse_DescriptorStatus
 }
 
 // Static interface conformance assertions. The *filter implements BOTH the
@@ -209,9 +228,13 @@ func New(typedConfig *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInst
 func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.dcb = cb }
 
 // SetEncoderCallbacks stores the framework-supplied encoder callbacks per
-// ADR-0071. 24.2 wires the X-RateLimit injection path through ecb (parent
-// SPEC §6.6 + D-RL7).
-func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb } //nolint:unused // 24.1 stores ecb but encode-side body is STUBBED per D-RL7
+// ADR-0071. The 24.2 X-RateLimit DRAFT_VERSION_03 emission path mutates the
+// response header map directly via the `headers http.Header` argument passed
+// to EncodeHeaders (cors precedent at cors.go:138); the ecb is retained for
+// any future encode-side primitive that requires callback-side mutation
+// (e.g. mid-encode StopIteration → ContinueEncoding park-resume coordination
+// — not used at 24.2).
+func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb }
 
 // ----------------------------------------------------------------------------
 // Pass-through bodies — decode-side body/trailers + encode-side ALL methods.
@@ -230,15 +253,17 @@ func (f *filter) DecodeTrailers(http.Header) envoyhttp.FilterTrailersStatus {
 	return envoyhttp.TrailersContinue
 }
 
-// EncodeHeaders is a STUB at 24.1 per D-RL7. 24.2 lands the X-RateLimit
-// DRAFT_VERSION_03 response-header injection (parent SPEC §6.6) keyed off
-// the response descriptor statuses captured on the decode side.
-//
-// 24.2: X-RateLimit DRAFT_VERSION_03 injection point (parent §6.6 + ADR-0197
-// X-RateLimit slice). At 24.1: x-ratelimit-limit / -remaining / -reset
-// headers are NOT emitted; cc.enableXRateLimitHeaders is parsed but ignored.
-func (f *filter) EncodeHeaders(http.Header, bool) envoyhttp.FilterHeadersStatus {
-	return envoyhttp.Continue
+// EncodeHeaders dispatches to the per-stream X-RateLimit DRAFT_VERSION_03
+// emission body in encode.go::encodeHeaders per phase-24.2 Task 5 (parent
+// SPEC §6.6 + AMEND-8 + ADR-0197 X-RateLimit slice). The body reads
+// f.responseStatuses (stored by dispositions.go on OK / OVER_LIMIT / fail-
+// OPEN), builds the byte-shape per headers.go::buildXRateLimitHeaders, and
+// mutates the response header map. No-ops cleanly when
+// cc.enableXRateLimitHeaders is false (OFF), when f.cc is nil (test-shape),
+// or when responseStatuses is nil/empty (zero-descriptor short-circuit OR
+// fail-CLOSED nullptr-mutate D-RL12).
+func (f *filter) EncodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
+	return f.encodeHeaders(headers)
 }
 
 // EncodeData is a stub.

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"testing"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -54,6 +55,8 @@ func (c *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { re
 // TestDecoderFilterCallbacks_Compile compile-time conformance assertion green.
 func (c *fakeDecoderCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *fakeDecoderCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *fakeDecoderCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *fakeDecoderCB) RouteIncludeVhRateLimits() bool              { return false }
 
 func TestDecoderFilterCallbacks_Compile(t *testing.T) {
 	var _ DecoderFilterCallbacks = (*fakeDecoderCB)(nil)

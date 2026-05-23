@@ -444,6 +444,8 @@ func (f *fakeDecoderCB) DynamicMetadata() *dynamicmetadata.Bucket           { re
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (f *fakeDecoderCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (f *fakeDecoderCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (f *fakeDecoderCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (f *fakeDecoderCB) RouteIncludeVhRateLimits() bool              { return false }
 
 func mkPerRoute(req, resp []*commonmutationrulesv3.HeaderMutation) *headermutationv3.HeaderMutationPerRoute {
 	return &headermutationv3.HeaderMutationPerRoute{

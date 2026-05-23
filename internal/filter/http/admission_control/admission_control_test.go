@@ -38,6 +38,7 @@ import (
 	"testing"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 
@@ -100,6 +101,8 @@ func (c *acCallbacks) DynamicMetadata() *dynamicmetadata.Bucket           { retu
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *acCallbacks) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *acCallbacks) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *acCallbacks) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *acCallbacks) RouteIncludeVhRateLimits() bool              { return false }
 
 // -----------------------------------------------------------------------------
 // Test helpers

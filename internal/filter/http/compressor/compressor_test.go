@@ -1118,6 +1118,8 @@ func (c *fakeCallbacks) ResponseStatus() int                                { re
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *fakeCallbacks) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *fakeCallbacks) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *fakeCallbacks) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *fakeCallbacks) RouteIncludeVhRateLimits() bool              { return false }
 
 // ADR-0175 callback-surface extension stub (phase-19.2 Task 2 — encode-side
 // body-buffering framework primitive). Zero-value return; compressor does

@@ -395,6 +395,20 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// ratelimit filter's engine reads zero policies (zero-regression path).
 	chain.SetRouteRateLimits(entry.rateLimits)
 	chain.SetVirtualHostRateLimits(f.table.vhostRateLimits)
+	// Phase 24.2 Task 1 (D-RL8): seed the matched route's *corev3.Metadata onto
+	// the chain BEFORE RunDecodeHeaders so the ratelimit filter's `metadata`
+	// descriptor action (MetadataSource_ROUTE_ENTRY=1) can read it through
+	// decoderCB.RouteMetadata(). Mirrors the SetRouteRateLimits / SetX set-
+	// once-by-dispatch discipline; nil-passthrough when the route has no
+	// metadata (zero-regression).
+	chain.SetRouteMetadata(entry.metadata)
+	// Phase 24.2 Task 4 (D-RL11): seed the matched route's legacy
+	// `RouteAction.include_vh_rate_limits` bool onto the chain BEFORE
+	// RunDecodeHeaders so the ratelimit filter's §4.3 Axis-B composition table
+	// can honor the legacy force-include override (per parent SPEC §4.3 +
+	// AMEND-5). Mirrors the SetRouteMetadata set-once-by-dispatch discipline;
+	// false-passthrough when the route does not carry the legacy bool.
+	chain.SetRouteIncludeVhRateLimits(entry.includeVhRateLimits)
 	if tlsConn, ok := downstream.(*stdtls.Conn); ok {
 		state := tlsConn.ConnectionState()
 		chain.SetDownstreamTLSServerName(state.ServerName)

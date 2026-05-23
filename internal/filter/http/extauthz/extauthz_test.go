@@ -3592,6 +3592,8 @@ func (c *fakeExtAuthzDCB) DynamicMetadata() *dynamicmetadata.Bucket             
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *fakeExtAuthzDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *fakeExtAuthzDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *fakeExtAuthzDCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *fakeExtAuthzDCB) RouteIncludeVhRateLimits() bool              { return false }
 
 func (c *fakeExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.localReplyCount++
@@ -4265,6 +4267,8 @@ func (c *asyncExtAuthzDCB) DynamicMetadata() *dynamicmetadata.Bucket            
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *asyncExtAuthzDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *asyncExtAuthzDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *asyncExtAuthzDCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *asyncExtAuthzDCB) RouteIncludeVhRateLimits() bool              { return false }
 
 func (c *asyncExtAuthzDCB) SendLocalReply(status int, body string, headers envoyhttp.OrderedHeaders) {
 	c.mu.Lock()

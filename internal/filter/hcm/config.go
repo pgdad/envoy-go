@@ -64,6 +64,14 @@ type ListenerCtx struct {
 	// does likewise). Phase 20 first-use anchor per ADR-0150 §Decision
 	// AMENDMENT + ADR-0159 §Decision AMENDMENT.
 	HTTPClient *httpclient.Client
+	// NodeServiceCluster is the Envoy NODE's `service-cluster` name as
+	// extracted from the bootstrap (`node.cluster` field). Threaded into per-
+	// filter factories via FactoryCtx.NodeServiceCluster at parseHTTPFiltersChain
+	// time. Consumed by the ratelimit filter's `source_cluster` descriptor
+	// action per parent SPEC §4.1 row 1. Empty string is the documented nil-
+	// passthrough (test paths that do not exercise node-bearing behavior).
+	// Phase 24.2 Task 1 first-use anchor.
+	NodeServiceCluster string
 }
 
 // Filter is the per-listener HTTP connection manager. It owns the resolved
@@ -224,7 +232,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, fmt.Errorf("hcm: route_config: virtual_hosts[0]: domains: got %v, want [\"*\"]", domains)
 	}
 
-	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), clusters, lc.HTTPClient, httpRegistry, registry, statPrefix)
+	chainConfig, err := parseHTTPFiltersChain(msg.GetHttpFilters(), clusters, lc.HTTPClient, httpRegistry, registry, statPrefix, lc.NodeServiceCluster)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +330,7 @@ func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteC
 // fields gracefully (per ADR-0085 nil-tolerance pattern); registry may be
 // non-nil unconditionally — non-stat-bearing factories simply do not consume
 // it.
-func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, clusters *cluster.Manager, httpClient *httpclient.Client, httpRegistry *filter_http.HTTPRegistry, registry *stats.Registry, statPrefix string) ([]chainEntry, error) {
+func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, clusters *cluster.Manager, httpClient *httpclient.Client, httpRegistry *filter_http.HTTPRegistry, registry *stats.Registry, statPrefix, nodeServiceCluster string) ([]chainEntry, error) {
 	// Build the (name, type_url) entries for ValidateChainShape. Defensive
 	// nil-typed_config handling: the empty-string TypeURL never matches a
 	// registered factory, so the rule-#4 branch fires with a clear message.
@@ -346,7 +354,7 @@ func parseHTTPFiltersChain(filters []*hcmv3.HttpFilter, clusters *cluster.Manage
 		if tc, ok := f.GetConfigType().(*hcmv3.HttpFilter_TypedConfig); ok {
 			tcAny = tc.TypedConfig
 		}
-		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry, Stats: registry, StatPrefix: statPrefix, ClusterManager: clusters, HTTPClient: httpClient})
+		instanceFactory, err := factories[i](tcAny, filter_http.FactoryCtx{Registry: httpRegistry, Stats: registry, StatPrefix: statPrefix, ClusterManager: clusters, HTTPClient: httpClient, NodeServiceCluster: nodeServiceCluster})
 		if err != nil {
 			return nil, fmt.Errorf("hcm: http_filters[%d]: factory: %w", i, err)
 		}
@@ -410,13 +418,40 @@ func buildRouteTable(routes []*routev3.Route, clusters *cluster.Manager) (*route
 		// fires here via ratelimit.ValidateRouteRateLimits per D-RL2; byte-stable
 		// wording per ADR-0080 + Task 3 wording consts.
 		var routeRateLimits []*routev3.RateLimit
+		var includeVhRateLimits bool
 		if rr, ok := r.GetAction().(*routev3.Route_Route); ok {
 			routeRateLimits = rr.Route.GetRateLimits()
 			if err := ratelimit.ValidateRouteRateLimits(routeRateLimits); err != nil {
 				return nil, fmt.Errorf("hcm: route %d: %w", i, err)
 			}
+			// Phase 24.2 Task 4 (D-RL11): capture the legacy
+			// `RouteAction.include_vh_rate_limits` bool for the ratelimit
+			// filter's §4.3 Axis-B force-include arm (parent SPEC §4.3 +
+			// AMEND-5). The proto field is a *wrapperspb.BoolValue; .GetValue()
+			// is nil-safe (returns false when the wrapper is absent — the
+			// proto-zero default). false when the route has no
+			// include_vh_rate_limits OR when the action is direct_response
+			// (no RouteAction).
+			//
+			// The proto field is marked deprecated upstream — but it is the
+			// ONLY accessor for the AMEND-5 legacy force-include override
+			// (Envoy still honors it at v1.37.2). Per ADR-0080 byte-stable
+			// deprecated-arm-honor discipline (mirrors the
+			// HeaderMatcher.ExactMatch et al. deprecation arm in
+			// descriptors.go::evaluateOneHeaderMatcher).
+			includeVhRateLimits = rr.Route.GetIncludeVhRateLimits().GetValue() //nolint:staticcheck // intentional: deprecated AMEND-5 legacy force-include arm honored per ADR-0080
 		}
-		t.routes = append(t.routes, routeEntry{match: match, action: action, rateLimits: routeRateLimits})
+		// Phase 24.2 Task 1 (D-RL8): capture the matched route's
+		// *corev3.Metadata for the ratelimit filter's `metadata` descriptor
+		// action under MetadataSource_ROUTE_ENTRY=1 (parent SPEC §4.1 row 8).
+		// nil when the route has no metadata field (zero-regression path).
+		t.routes = append(t.routes, routeEntry{
+			match:               match,
+			action:              action,
+			rateLimits:          routeRateLimits,
+			metadata:            r.GetMetadata(),
+			includeVhRateLimits: includeVhRateLimits,
+		})
 	}
 	return t, nil
 }

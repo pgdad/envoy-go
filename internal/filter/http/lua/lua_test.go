@@ -115,6 +115,8 @@ func (c *recordedDCB) DynamicMetadata() *dynamicmetadata.Bucket           { retu
 // ADR-0198 callback-surface extension stubs (phase-24.1 Task 5 — DELTA-2).
 func (c *recordedDCB) RouteRateLimits() []*routev3.RateLimit       { return nil }
 func (c *recordedDCB) VirtualHostRateLimits() []*routev3.RateLimit { return nil }
+func (c *recordedDCB) RouteMetadata() *corev3.Metadata             { return nil }
+func (c *recordedDCB) RouteIncludeVhRateLimits() bool              { return false }
 
 // recordedECB is the EncoderFilterCallbacks test-double (encode-side
 // counterpart). All methods are zero-value stubs since encode_headers.go
