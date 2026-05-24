@@ -1,0 +1,21 @@
+# Phase 25.3 — `http-filter-wasm-perroute-and-conformance`
+
+**Status:** planned (lifecycle-state 0; pre-created at parent BRAINSTORM per phase-22 precedent). This sub-phase directory was pre-created at the phase-25 parent BRAINSTORM session (commit landing this file). No SPEC / PLAN / PROGRESS / REVIEW artifact exists yet — they land when this sub-phase enters lifecycle.
+
+**Parent:** [`../25-http-filter-wasm/BRAINSTORM.md`](../25-http-filter-wasm/BRAINSTORM.md) — read first; this README is a forward-pointer.
+
+**Scope at 25.3** (per parent BRAINSTORM §1.1 sub-phase 25.3): per-route `typed_per_filter_config` wholesale-override (BRAINSTORM hypothesis: 5th-canonical REUSE per Q5; SPEC empirically pins against v1.37.2 + go-control-plane v1.32.4; if confirmed, ADR-0125 roster STAYS at 10 per the phase-23 + phase-24.1 REUSE-by-absence precedent; if SPEC surfaces a dedicated `WasmPerRoute` proto with novel shape, escalates to NEW 11th canonical + ADR-0125 amendment 10 → 11) + multi-plugin-per-VM (`vm_id`-keyed VM sharing across PluginConfigs) + `VmConfig.environment_variables` + `VmConfig.fail_open` semantics + cross-side fixture `0038-http-wasm-perroute-and-multi-plugin` + boot-reject fixture `0039-http-wasm-perroute-boot-reject` + 36th project-wide fuzzer `FuzzWasmPerRouteConfig` + **seed `test/conformance/proxy-wasm/` conformance harness** per `BOOTSTRAP_PROMPT.md §7.3` anticipation (runs proxy-wasm spec v0.2.1 conformance bytecode against envoy-go subject-only at a declared pass threshold; INDEPENDENT of the differential harness).
+
+**Anticipated artifacts at 25.3 IMPL phase-done:**
+- `docs/envoy-go/phases/25.3-http-filter-wasm-perroute-and-conformance/SPEC.md` + PLAN.md + PROGRESS.md + REVIEW.md (lifecycle states 1 → 5 → 6)
+- `internal/wasm/` 25.3 multi-plugin VM-sharing API + `internal/filter/http/wasm/` 25.3 per-route TPFC + multi-plugin registration
+- `test/fixtures/0038-http-wasm-perroute-and-multi-plugin/` + `test/fixtures/0039-http-wasm-perroute-boot-reject/`
+- `test/conformance/proxy-wasm/` (NEW conformance harness directory + driver + vendored proxy-wasm spec conformance bytecode + pass-threshold gate)
+- ADR landings: ADR-0210 (per-route classification: REUSE-by-absence OR NEW 11th canonical + ADR-0125 amendment 10 → 11) + ADR-0211 (multi-plugin VM-sharing semantics) + ADR-0212 (conformance harness seed + pass-threshold disposition) + escape-valve ADR-0213
+- BEHAVIOR_CONTRACT.md 25.3 completion bundle per ADR-0052 atomic landing (incl. the conformance-harness pass-threshold disposition note)
+- **Parent row 25 flipped `in-progress → done`** AT THIS COMMIT (the rollup per the 18/19/22/24 precedent — both row 25.3 `planned → done` AND row 25 `in-progress → done` named in the SAME commit-message body for grep-verifiability)
+- §9 HTTP-filters family closes to **0 remaining rows** post-phase-25.3 — phase 25 is the FINAL §9 HTTP-filters-family row
+
+**Predecessor:** Phase 25.2 DONE.
+
+**Successor:** None within §9 HTTP-filters family — closes the family. The next §9 work transitions to OTHER §9 families (Network filters, Load balancing, Upstream robustness, HTTP/3 + QUIC, gRPC, xDS / dynamic config, Observability, Runtime + hot restart, **WASM host family** — which consumes the `internal/wasm/` primitive landed at 25.1 at multi-consumer scope).
