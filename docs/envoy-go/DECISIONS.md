@@ -12858,3 +12858,185 @@ Cross-references:
 
 ---
 
+
+## ADR-0202: NEW `internal/wasm/` framework primitive — wazero VM lifecycle + per-stream `*Runtime` construction + per-module `*Module` compile cache + in-house proxy-wasm v0.2.1 host ABI surface (47 hostcalls + 30 guest-exported callbacks) + WasmResult/WasmBufferType/WasmHeaderMapType/LogLevel/StreamType/MetricType/ProxyAction/WasiErrno type definitions (value-gap-preserving per AMEND-A7) + ABI-registration interface + EXPLICIT API-REVISION ALLOWANCE clause for consumer #2 (WASM host family phases) + wazero v1.10.1 go.mod direct dependency + proxy-wasm-rust-sdk =0.2.4 test-bytecode pin + `wasm32-wasip1` target
+
+**Status:** §Context anchored at phase-25 parent SPEC commit (this commit); §Decision + §Consequences body lands at phase-25.1 IMPL Lands-in-Task (the primitive's first commit) per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-24 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 25.1 IMPL Lands-in-Task)
+**Doctrine:** Phase 25 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline.
+**Lands-in:** Phase 25.1 IMPL first task that materializes `internal/wasm/` (anticipated Task 1-3 per the phase-22.1 + phase-17 framework-primitive-first-task precedent).
+
+### Context
+
+ADR-0202 anchors the NEW `internal/wasm/` framework primitive — the SECOND occurrence of EXTRACT-NOW-at-first-consumer (after phase-22.1 ADR-0188 `internal/lua/`) and the FIRST §9 family-row framework primitive of substantial scope since phase 22 (ENDS the phase-24 ZERO-NEW-package-level-primitive disposition). Per phase-25 BRAINSTORM Q3 + Q4 EXTRACT-NOW decision + parent SPEC §4.1 + §11.5 D4 empirical scrape, the primitive hosts the GENERIC wazero VM lifecycle (init, sandbox config, panic-recovery, per-stream execution context, module-compilation cache, ABI-registration interface) + the in-house proxy-wasm v0.2.1 host ABI implementation (47 hostcalls: 40 `proxy_*` env-namespace + 7 mandatory `wasi_snapshot_preview1.*` shims) + the 30 guest-exported callback dispatch layer + the in-house ABI type definitions (WasmResult/WasmBufferType/WasmHeaderMapType/LogLevel/StreamType/MetricType/ProxyAction/WasiErrno).
+
+**Framework-primitive trigger per Q3 + Q4 EXTRACT-NOW (SECOND occurrence — phase-22.1 ADR-0188 was the first).** The 25.1 IMPL extracts the primitive at consumer #1 (HTTP WebAssembly filter) — first-of-kind for the wasm row. The future-consumer roster is **structurally MORE committed than phase-22.1 lua's speculative future-consumer roster** because the broader §9 WASM host family is EXPLICITLY listed at `BOOTSTRAP_PROMPT.md §9` line 116: cluster-specifier-wasm at `envoy.router.cluster_specifiers.wasm`, access-logger-wasm at `envoy.access_loggers.wasm`, network-filter-wasm at `envoy.filters.network.wasm`, WasmService singleton plugin loaders. The bolder extraction at consumer #1 carries higher abstraction-shape revision risk than phase-22.1's first-consumer extraction; ADR-0202 anchors the abstraction shape WITH an EXPLICIT API-REVISION ALLOWANCE clause for consumer #2 — mirrors phase-22.1 ADR-0188's allowance pattern but with the family-level roadmap commitment reducing the API-revision risk envelope.
+
+**WASM runtime library = `github.com/tetratelabs/wazero` v1.10.1** per phase-25 BRAINSTORM Q2 + parent SPEC AMEND-A1 pin. Pure-Go WebAssembly 1.0+2.0 conformant; **Apache-2.0-licensed** (NOT MIT as the BRAINSTORM §2.3 narrative claimed — AMEND-A1 REFUTES the MIT typo); CNCF Sandbox project; Tetrate-maintained; floor Go 1.23.0 (matches envoy-go's `go 1.23.0` floor at `go.mod` line 3). v1.10.1 (2025-11-11; tag commit `ee3f9d9c5c6689bbf30824aec049371aaa239f4c`) carries the v1.10.0-line features (concurrent compilation #2381; tail-call proposal opt-in #2403; W^X security default #2429) without bumping envoy-go's Go floor (v1.11.0 bumps to Go 1.24.0 + adds `golang.org/x/sys` direct dep — incompatible). Fallback ordering: v1.9.0 (2025-02-19) → v1.8.2 (2024-11-25). DO NOT fall forward to v1.11.0 without a separate envoy-go Go-floor-bump phase. Alternative WASM runtimes rejected per BRAINSTORM Q2 + §11.5 D5 scrape: `wasmer-go` (CGO; portability cost grounds); `wasmtime-go` (CGO; same rationale); phase-22 lua's gopher-lua pure-Go discipline is consistent across the project.
+
+**proxy-wasm host ABI source = in-house at `internal/wasm/abi/`** per phase-25 BRAINSTORM Q3 + parent SPEC §4.1 + §11.5 D4. envoy-go owns the full 47-hostcall + 30-callback ABI implementation. NO `github.com/tetratelabs/proxy-wasm-go-host` dependency or similar second-third-party-dep adoption. Per §11.5 D4 scrape + AMEND-A6: upstream Envoy v1.37.2 accepts ALL three proxy-wasm ABI versions (v0.1.0 + v0.2.0 + v0.2.1) and version-dispatches the registered hostcall + callback sets via `registerCallbacks` (`proxy-wasm-cpp-host:wasm.cc:286-293`) + `getFunctions` (`wasm.cc:298-302`); only `AbiVersion::Unknown` (absent sentinel export) is rejected at upstream. envoy-go-strict targets v0.2.1 EXCLUSIVELY and PARSE-REJECTs v0.1.0 + v0.2.0 modules at `internal/wasm/bytecode_util.go` — this is an envoy-go-strict-stricter departure (NOT parity) per AMEND-A6. Detection point: scan the wasm module export section type 7 for a function-kind export named `proxy_abi_version_0_2_1` (24 UTF-8 ASCII bytes); reimplement `BytecodeUtil::getAbiVersion` (`proxy-wasm-cpp-host:bytecode_util.cc:32-97`) byte-faithfully.
+
+**WasmResult + WasmBufferType + WasmHeaderMapType enum value-gap-preserving encoding** per AMEND-A7 + §11.5 D4. The BRAINSTORM §10 D4 placeholder enumerated 13 WasmResult values; the actual spec README (`proxy-wasm/spec@main:abi-versions/v0.2.1/README.md`) defines **10 named values with VALUE GAPS at positions 5, 9, 11**: `Ok=0`, `NotFound=1`, `BadArgument=2`, `SerializationFailure=3`, `ParseFailure=4`, `InvalidMemoryAccess=6`, `Empty=7`, `CasMismatch=8`, `InternalFailure=10`, `Unimplemented=12`. The BRAINSTORM-hypothesized `BadExpression=5`, `ResultMismatch=9`, `BrokenConnection=11` do NOT exist in v0.2.1. The value gaps MUST be preserved byte-faithfully — guest modules check specific integer values; remapping `Unimplemented` to a different integer would break wire compatibility. WasmBufferType value 8 is `FOREIGN_FUNCTION_ARGUMENTS` (NOT BRAINSTORM-hypothesized `CallData`). WasmHeaderMapType 8-value roster CONFIRMS.
+
+**WASI shim custom 8-stub implementation** per §11.5 D4 wazero-divergence guardrail. Do NOT use wazero's built-in `imports/wasi_snapshot_preview1` package — its `fd_write` routes to host stdout/stderr rather than through `proxy_log` (the proxy-wasm-expected semantic). `internal/wasm/wasi.go` implements the 8 stubs with proxy-wasm semantics: `fd_write(fd=1, ...)` → `proxy_log(LogLevel::INFO, ...)`; `fd_write(fd=2, ...)` → `proxy_log(LogLevel::ERROR, ...)`; `clock_time_get` returns wall-clock + monotonic-clock; `random_get` fills from `crypto/rand.Read`; `environ_*` returns zeros at 25.1+25.2 (25.3 feeds from `VmConfig.environment_variables` per phase-25 parent SPEC §3.1); `args_*` returns zeros (always); `proc_exit` traps via wazero (MUST NOT be called by well-behaved guests).
+
+**Pairs wire format byte-faithful reimplementation** per parent SPEC R3 at `internal/wasm/pairs.go`. The wire format is `u32 num_pairs / num_pairs × (u32 key_len, u32 value_len) / num_pairs × (key_bytes NUL value_bytes NUL)` — transcribed byte-faithfully from `proxy-wasm-cpp-host:pairs_util.h` + `pairs_util.cc`. Load-bearing for all header-map hostcalls' cross-side byte-exact parity at fixture-0034.
+
+**Per-stream `*VM` construction + per-module `*Module` compile cache discipline** per parent SPEC §4.2. WEAK-default: per-stream wazero Runtime construction with shared per-module `*wazero.CompiledModule` cache. Cache key: sha256(wasm bytes). 25.1 IMPL `BenchmarkPerStreamVM_Construction_Headers` measures the per-stream construction cost; threshold gate per parent SPEC R8 + D-P4: fires the ADR-0205 escape-valve only if `ns/op > 1_000_000` (1ms). Phase-22.1 `*LState` benchmark observed 70µs; wazero compiler-mode initialization is anticipated comparable.
+
+**Anticipated `internal/wasm/` package shape:**
+
+```
+internal/wasm/
+  doc.go             # package overview + wazero v1.10.1 pin + proxy-wasm v0.2.1 ABI reference + AMEND-A1..A9 cross-references
+  vm.go              # VM type + NewVM + VMOption + WithSandboxConfig + WithPanicHandler + WithLogSink + Run + CallProxyOn* + Close
+  compile.go         # Module type + CompileCache + NewCompileCache + CompileModule
+  sandbox.go         # SandboxConfig type + capability roster + applySandbox helper
+  registration.go    # ABICallbacks interface + RegisterABICallbacks
+  bytecode_util.go   # BytecodeUtil::getAbiVersion byte-faithful reimplementation per AMEND-A6
+  pairs.go           # pairs wire format serialization per R3
+  wasi.go            # 8-stub WASI custom implementation per §4.2 + R4
+  abi/
+    types.go         # WasmResult + WasmBufferType + WasmHeaderMapType + LogLevel + StreamType + MetricType + ProxyAction + WasiErrno (value-gap-preserving per AMEND-A7)
+    headers_bridge.go # 7-hostcall headers-bridge family at 25.1
+    log.go           # 2-hostcall log family at 25.1 (proxy_log + proxy_get_log_level)
+    local_response.go # 1-hostcall send_local_response at 25.1
+    property.go      # 2-hostcall property family at 25.1 (get + set; minimal tree)
+    status.go        # 1-hostcall proxy_get_status at 25.1
+    time.go          # 1-hostcall proxy_get_current_time_nanoseconds at 25.1 (deprecated in v0.2.1 but trivial)
+    context.go       # 2-hostcall context-lifecycle at 25.1 (set_effective_context + done)
+    body_bridge.go   # body+buffer hostcalls (stub-Unimplemented at 25.1; full at 25.2)
+    timer.go         # tick_period hostcall (stub at 25.1; full at 25.2)
+    metrics.go       # metric hostcalls (stub at 25.1; full at 25.2)
+    shared_data.go   # shared_data hostcalls (stub at 25.1; full at 25.2)
+    http_call.go     # http_call hostcall (stub at 25.1; full at 25.2 — RE-CONSUMES internal/httpclient/)
+    foreign.go       # ForeignFunctionRegistry + proxy_call_foreign_function shim (stub at 25.1; full at 25.2 per AMEND-A9)
+    stream_control.go # continue_stream + close_stream (stub at 25.1; full at 25.2)
+  vm_test.go + compile_test.go + sandbox_test.go + bytecode_util_test.go + pairs_test.go + wasi_test.go + abi/*_test.go
+```
+
+**Anticipated LoC: ~1,750-2,600 LIVE + ~2,050-3,000 TEST** at 25.1 IMPL per parent SPEC §11.8 D8 envelope estimate (substantially larger than phase-22.1's `internal/lua/` 1,150 LIVE LoC because proxy-wasm v0.2.1 is a much larger ABI than the gopher-lua bridge surface).
+
+### Decision
+
+(Body lands at 25.1 IMPL Lands-in-Task per ADR-0044 in-place edit discipline.)
+
+### Consequences
+
+(Body lands at 25.1 IMPL Lands-in-Task.)
+
+**Cross-references:** ADR-0203 (paired consumer-side ADR — `internal/filter/http/wasm/` package shape); ADR-0204 (paired sandbox + capability-restriction ADR); ADR-0125 (per-route canonical patterns — 5th-canonical REUSE-by-absence per AMEND-A3; NO §(xvi) amendment); phase-25 parent SPEC §4 + §11.5 D4 + AMEND-A1 + A4 + A6 + A7; phase-22.1 ADR-0188 (the prior NEW-framework-primitive-of-substantial-scope precedent — `internal/lua/` with EXPLICIT API-REVISION ALLOWANCE clause); phase-17 ADR-0148 + ADR-0149 (`internal/jwks/Fetcher` + `internal/jwt/` verifier — earlier NEW-framework-primitive precedent).
+
+---
+
+## ADR-0203: NEW `internal/filter/http/wasm/` package shape — HTTP-filter-specific config parse + 4-arm AsyncDataSource Local resolution + 18-arm PARSE-REJECT roster + 5-counter envoy-go-strict stat surface per parent SPEC AMEND-A2 (tri-group prefix structure; HCM-stats_prefix DROPPED) + filter-callback wiring + fixture-0034 full-cross-side discipline with §4.5 D6 guardrails + envoy-go-strict-stricter ABI v0.1.0+v0.2.0 PARSE-REJECT per AMEND-A6 + 4-5 envoy-go-strict departure records
+
+**Status:** §Context anchored at phase-25 parent SPEC commit (this commit); §Decision + §Consequences body lands at phase-25.1 IMPL Lands-in-Task (the filter package's first commit) per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-24
+**Doctrine:** Phase 25 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline.
+**Lands-in:** Phase 25.1 IMPL first task that materializes `internal/filter/http/wasm/` (anticipated Task 1-3 per phase-22.1 ADR-0189 + phase-17 first-package-first-task precedent; paired with ADR-0202 at the same SPEC commit and lands at the same IMPL phase though potentially at different IMPL tasks).
+
+### Context
+
+ADR-0203 anchors the NEW `internal/filter/http/wasm/` package shape — the HTTP-filter-specific config parse + 4-arm AsyncDataSource Local resolution (4 sub-arms per parent SPEC §5.4) + the 18-arm PARSE-REJECT roster per parent SPEC §6.2 + the 5-counter envoy-go-strict stat surface per parent SPEC §7 + AMEND-A2 + the filter-callback wiring (`StreamDecoderFilter` + `StreamEncoderFilter` both-sides shape per phase-19 ext_proc precedent) + the fixture-0034 full-cross-side discipline per parent SPEC §8.1 + §4.5 D6 guardrails + the envoy-go-strict departure records.
+
+**Package shape** per parent SPEC §4.4. Package directory + Go-package identifier are both `wasm` (single token; matches `cors`/`fault`/`csrf`/`buffer`/`compressor`/`oauth2`/`rbac`/`lua` precedent — no underscore needed). Files: `doc.go` + `wasm.go` + `compiled_config.go` + `datasource.go` + `abi_callbacks.go` + `decode_headers.go` + `encode_headers.go` + `stats.go` + 4 test files + 1 fuzz_test per §4.4. The package exposes `TypeURL` (`"type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm"`) + `New` (the `HTTPFilterFactory`) per the cors/fault/.../lua precedent.
+
+**Extension-registry registration** at boot per ADR-0072. `cmd/envoy-go/main.go` (currently registering 19 HTTP-filter entries at master tip) gains a twentieth `httpReg.Register(wasm.TypeURL, wasm.New)` call before the freeze. Insertion alphabetical per ADR-0100 §2.2: `wasm` inserts after `router` and any preceding alphabetical entries. Per ADR-0072, registration order does NOT affect runtime behavior; stylistic discipline only. **20 HTTP filters wired post-phase-25.1** (19 → 20).
+
+**`Wasm` proto parsing + 4-arm in-package AsyncDataSource Local resolution + 18-arm PARSE-REJECT roster** per parent SPEC §5 + §6 + AMEND-A1 binding refinements + AMEND-A6 envoy-go-strict-stricter ABI-version PARSE-REJECT. Resolution at config-load: `VmConfig.code.local.specifier` oneof dispatched across 4 arms (`Filename` → `os.ReadFile`; `InlineBytes` → verbatim; `InlineString` → byte-cast; `EnvironmentVariable` → `os.LookupEnv`); `WatchedDirectory` sibling field PARSE-REJECTed; empty `specifier` oneof PARSE-REJECTed; `AsyncDataSource.Remote` arm PARSE-REJECTed (envoy-go-strict departure per parent SPEC §2.1); per-arm empty-content PARSE-REJECTs (filename name-empty / ENOENT / zero-byte; env-var name-empty / unset / empty-value). Resolved bytes fed to the `internal/wasm/` primitive's `CompileModule(ctx, src, cache)` API → returns `*Module` cached by sha256 content-hash; compile failures surface as PARSE-REJECT arm 17. ABI-version detection inside `CompileModule` rejects non-`proxy_abi_version_0_2_1` modules at PARSE-REJECT arm 16 per AMEND-A6.
+
+**Both-sides filter-callback shape** per parent SPEC §4.2 + phase-19 ext_proc precedent. `Decoder: non-nil; Encoder: non-nil`. The decode-side surface: `DecodeHeaders(headers, endStream)` constructs the per-stream `*wasm.VM` via `wasm.NewVM(opts...)`; registers the HTTP-filter-specific `ABICallbacks` via `vm.RegisterABICallbacks(abiCallbacksImpl)`; calls `vm.Run(ctx, cfg.module, rootContextID)` which executes `_initialize` + `proxy_on_vm_start` + `proxy_on_configure`; if `vm.HasGlobalFunc("proxy_on_request_headers")` then `vm.CallProxyOnRequestHeaders(ctx, streamCtxID, numHeaders, endOfStream) → ProxyAction`. After the call returns: if action is `PAUSE` (=1), return `StopIteration` (forward-pointer to 25.2 + the v1.37.2 binding-gap `allow_on_headers_stop_iteration` per parent SPEC §5.7 — at 25.1 `PAUSE` returns are treated as `CONTINUE` because the binding-gap field is absent); otherwise return `Continue`. If `proxy_send_local_response` fired during the call, return `StopIteration` + `cb.SendLocalReply(status, body, headers)` per the deferred-state captured on the filter struct via the headers-bridge hostcall. `DecodeData` + `DecodeTrailers` pass-through (no body access at 25.1 per parent SPEC §2.11; 25.2 activates). The encode-side surface mirrors decode for `proxy_on_response_headers`. `OnDestroy` calls `vm.Close()` releasing the wazero Runtime.
+
+**5-counter stat surface** per parent SPEC §7 + AMEND-A2 structural REFUTATION:
+- `wasm.wazero.created` (counter; upstream-parity; Group B per AMEND-A2 — uniform `<runtime>` = `"wazero"` because PARSE-REJECT all other discriminators per parent SPEC §6.2 arm 11)
+- `wasm.wazero.active` (gauge; upstream-parity; Group B)
+- `wasm.<plugin_name>.executions` (counter; envoy-go-strict extension)
+- `wasm.<plugin_name>.hostcall_denied` (counter; envoy-go-strict extension; paired with ADR-0204 default-deny denial path)
+- `wasm.<plugin_name>.envoy_go.failures` (counter; envoy-go-strict extension — single observable counter for VM-failure events; replaces upstream's `FailState`-via-event surface without recreating the `vm_reload_*` Group-C mechanism deferred to 25.3)
+
+**Stat-prefix template DIVERGES from §9 family-row pattern per AMEND-A2.** The wasm filter row uses tri-group prefix structure rather than the dominant HCM-rooted SN2-reuse `http.<HCM_stat_prefix>.<filter>.*` per ADR-0143. This divergence is a property of upstream Envoy v1.37.2 (`source/extensions/filters/http/wasm/config.h:51-53` drops the HCM-injected stats_prefix); upstream-parity preservation — NOT an envoy-go-strict departure. Recorded at BEHAVIOR_CONTRACT.md stat-name mapping section as a special-case row.
+
+**Project stat count 114 → 119 at 25.1 (+5).**
+
+**4-5 envoy-go-strict departure records at IMPL** per parent SPEC §13 + ADR-0052 atomic landing:
+- **departure record #1: default-deny capability sandbox** per AMEND-A5 + ADR-0204.
+- **departure record #2: ABI v0.1.0 + v0.2.0 PARSE-REJECT** per AMEND-A6 + §6.2 arm 16.
+- **departure record #3: `AsyncDataSource.Remote` PARSE-REJECT** per §6.2 arm 6.
+- **departure record #4: runtime-name discriminator PARSE-REJECT** per §6.2 arm 11.
+- **departure record #5: envoy-go-strict counters consolidated** (`executions` + `hostcall_denied` + `envoy_go.failures`) per AMEND-A2 + §7.4.
+
+Plus additional 25.1-related minor entries (deprecation rejection for `fail_open` + `allow_precompiled` + `nack_on_code_cache_miss`; deferred-to-25.3 PARSE-REJECTs for `failure_policy = FAIL_RELOAD` + `reload_config` + `environment_variables` + multi-plugin VM-sharing + per-route TPFC) — likely consolidated into one "phase-25 sub-phase deferral" record at IMPL.
+
+**Fixture-0034 full-cross-side discipline** per parent SPEC §8.1 + AMEND-A4 D6 CONFIRMS + §4.5 D6 guardrails. 7 scenarios (a)-(g) full cross-side byte-exact via existing `CompareBytes`. Vendored Rust-sourced `.wasm` bytecode under `bytecode/` per Q9 + AMEND-A1 (`proxy-wasm-rust-sdk =0.2.4` + `wasm32-wasip1` target). NEW `BackendKind=HTTPWasm` constant at `test/differential/runner_test.go`.
+
+**Anticipated LoC: ~1,650-2,550 LIVE + ~1,850-2,900 TEST** at 25.1 IMPL per parent SPEC §11.8 D8 envelope estimate.
+
+### Decision
+
+(Body lands at 25.1 IMPL Lands-in-Task per ADR-0044 in-place edit discipline.)
+
+### Consequences
+
+(Body lands at 25.1 IMPL Lands-in-Task.)
+
+**Cross-references:** ADR-0202 (paired primitive-side ADR — `internal/wasm/` framework primitive); ADR-0204 (paired sandbox + capability-restriction ADR); phase-25 parent SPEC §1 + §4.4 + §5 + §6 + §7 + §8 + §1.1 AMEND-A1 + A2 + A4 + A6; phase-22.1 ADR-0189 (the prior NEW HTTP-filter-package-paired-with-primitive precedent); phase-23 ADR-0196 (`EncoderFilterCallbacks.ResponseStatus()` — anticipated first co-consumer at 25.1 IMPL `proxy_get_status` hostcall per parent SPEC §2.28 + R7).
+
+---
+
+## ADR-0204: proxy-wasm capability-restriction default-deny + envoy-go-strict sandbox posture — empty `allowed_capabilities` ⇒ DENY-ALL (departure from upstream allow-all per parent SPEC AMEND-A5) + capability key roster (~80 keys; 25.1 covers 24 hostcall keys + 13 module-getter callbacks) + denial semantic (`WasmResult::InternalFailure` + integration error log + `hostcall_denied` counter increment) + accept-empty-SanitizationConfig discipline per parent SPEC AMEND-A1 §11.4 + BEHAVIOR_CONTRACT departure record
+
+**Status:** §Context anchored at phase-25 parent SPEC commit (this commit); §Decision + §Consequences body lands at phase-25.1 IMPL Lands-in-Task at sandbox-config materialization (paired with ADR-0202 + ADR-0203).
+**Date:** 2026-05-24
+**Doctrine:** Phase 25 §9 family-row. ADR-0044 ADR-on-impl convention + §Context-draft discipline.
+**Lands-in:** Phase 25.1 IMPL Lands-in-Task at `internal/wasm/sandbox.go` materialization.
+
+### Context
+
+ADR-0204 anchors the envoy-go-strict default-deny capability sandbox posture for the wasm filter row. Per phase-25 BRAINSTORM Q4 + parent SPEC §2.5 + §4.3 + §11.4 D7 empirical scrape + AMEND-A5.
+
+**Upstream Envoy v1.37.2 default-allow gate** per `proxy-wasm/proxy-wasm-cpp-host@main:include/proxy-wasm/wasm.h:103-106` (the `capabilityAllowed` gate function):
+
+```cpp
+bool capabilityAllowed(std::string capability_name) {
+  return allowed_capabilities_.empty() ||
+         allowed_capabilities_.find(capability_name) != allowed_capabilities_.end();
+}
+```
+
+When `allowed_capabilities_` is empty (the default — also the result of unset `capability_restriction_config` OR its `allowed_capabilities` map empty), ALL hostcalls ALLOWED. Map non-empty → only capabilities whose names appear as keys are allowed; all others denied with `WasmResult::InternalFailure` (=10) + integration error log per `proxy_wasm_exports.h:217-226`.
+
+**envoy-go-strict departure: invert empty-map semantic to DENY-ALL.** Operators MUST explicitly enable each capability via `PluginConfig.capability_restriction_config.allowed_capabilities[<capability_name>] = SanitizationConfig{}`. Rationale: WASM has a substantially larger and riskier hostcall surface than Lua (proxy_call_foreign_function for arbitrary host-side dispatch; proxy_dispatch_http_call for outbound network; proxy_set_shared_data for cross-stream state; proxy_define_metric for unbounded dynamic-stat namespace creation); upstream Envoy v1.37.2 marks its 3 sandbox runtimes (V8, WAMR, Wasmtime) as `status: alpha` + `security_posture: unknown` (per `source/extensions/extensions_metadata.yaml:1631-1635`) — the alpha-status posture is incompatible with envoy-go's safe-by-default discipline. Matches phase-22 lua's default-deny `SandboxConfig` posture (ADR-0188) at the analogous semantic + the project's security-first defaults pattern.
+
+**Capability key roster (~80 keys).** Per §11.4 D7 scrape:
+- **Core hostcalls (37 keys):** `proxy_log`, `proxy_get_status`, `proxy_set_property`, `proxy_get_property`, `proxy_send_local_response`, `proxy_get_shared_data`, `proxy_set_shared_data`, `proxy_register_shared_queue`, `proxy_resolve_shared_queue`, `proxy_dequeue_shared_queue`, `proxy_enqueue_shared_queue`, `proxy_get_header_map_value`, `proxy_add_header_map_value`, `proxy_replace_header_map_value`, `proxy_remove_header_map_value`, `proxy_get_header_map_pairs`, `proxy_set_header_map_pairs`, `proxy_get_header_map_size`, `proxy_get_buffer_status`, `proxy_get_buffer_bytes`, `proxy_set_buffer_bytes`, `proxy_http_call`, `proxy_grpc_call`, `proxy_grpc_stream`, `proxy_grpc_close`, `proxy_grpc_cancel`, `proxy_grpc_send`, `proxy_set_tick_period_milliseconds`, `proxy_get_current_time_nanoseconds`, `proxy_define_metric`, `proxy_increment_metric`, `proxy_record_metric`, `proxy_get_metric`, `proxy_set_effective_context`, `proxy_done`, `proxy_call_foreign_function`, `proxy_get_log_level`.
+- **ABI-versioned hostcalls (7 keys):** `proxy_continue_stream` (v0.2.0/v0.2.1), `proxy_close_stream` (v0.2.0/v0.2.1), `proxy_get_log_level` (v0.2.1 only) — plus v0.1.0-only `proxy_get_configuration`, `proxy_continue_request`, `proxy_continue_response`, `proxy_clear_route_cache` (envoy-go PARSE-REJECTs v0.1.0 modules per AMEND-A6 + §6.2 arm 16 so these keys never reach the gate at envoy-go).
+- **WASI hostcalls (bare names, no `proxy_` prefix; 12 implemented keys):** `fd_write`, `fd_read`, `fd_seek`, `fd_close`, `fd_fdstat_get`, `environ_get`, `environ_sizes_get`, `args_get`, `args_sizes_get`, `proc_exit`, `clock_time_get`, `random_get`. Other ~30 WASI keys exist but are stubbed to return `WasiErrno::ENOTCAPABLE` regardless of configuration.
+- **Module-function getter keys (24 keys; gated at `getFunction` lookup side):** `proxy_validate_configuration`, `proxy_on_vm_start`, `proxy_on_configure`, `proxy_on_tick`, `proxy_on_context_create`, `proxy_on_new_connection`, `proxy_on_downstream_data`, `proxy_on_upstream_data`, `proxy_on_downstream_connection_close`, `proxy_on_upstream_connection_close`, `proxy_on_request_body`, `proxy_on_request_trailers`, `proxy_on_request_metadata`, `proxy_on_response_body`, `proxy_on_response_trailers`, `proxy_on_response_metadata`, `proxy_on_http_call_response`, `proxy_on_grpc_receive`, `proxy_on_grpc_close`, `proxy_on_grpc_receive_initial_metadata`, `proxy_on_grpc_receive_trailing_metadata`, `proxy_on_queue_ready`, `proxy_on_done`, `proxy_on_log`, `proxy_on_delete` — plus ABI-versioned `proxy_on_request_headers` (v0.1 vs v0.2 variants) + `proxy_on_response_headers` + `proxy_on_foreign_function` (v0.2.0+).
+
+**25.1 closed-world capability subset (24 hostcall keys + 13 module-getter callback keys).** Per parent SPEC §4.3.4. 25.1 envoy-go-strict gate accepts only the listed 24+13 = 37 keys; configs naming keys outside the closed-world set fail validation (TBD-25.1-IMPL: settle whether the unknown-key validation is PARSE-REJECT at config-load OR silent no-op matching upstream's silent-ignore-of-unimplemented-keys per `proxy-wasm-cpp-host:wasm.cc:248-249` — the gate function itself is silent-ignore; PARSE-REJECT at config-load is the envoy-go-strict-stricter alternative).
+
+**Denial semantic** per `proxy-wasm-cpp-host:proxy_wasm_exports.h:217-226`:
+
+```cpp
+return Word(WasmResult::InternalFailure);  // returns InternalFailure (=10) to the guest
+context->wasmVm()->integration()->error("Attempted call to restricted proxy-wasm capability: proxy_" #_fn);  // logs an integration error
+```
+
+envoy-go MUST mirror upstream byte-faithfully: return `WasmResult::InternalFailure` (=10) + emit an integration error log via `slog.Error("Attempted call to restricted proxy-wasm capability: <name>")` + increment the `wasm.<plugin_name>.hostcall_denied` envoy-go-strict counter per ADR-0203 + AMEND-A2. WASI denials use a separate stub returning `WasiErrno::ENOTCAPABLE` (=76) per `proxy_wasm_exports.h:232-249` — TBD-25.1-IMPL per parent SPEC D-P1: settle whether to mirror `ENOTCAPABLE` exactly OR fall back to `NOTSUP` (=58) if wazero's WASI semantics prevent the exact upstream return code (envoy-go-strict departure if fallback fires).
+
+**Accept-empty-SanitizationConfig discipline** per parent SPEC AMEND-A1 §11.4. Upstream's `SanitizationConfig` proto is EMPTY (no fields) + upstream marks the per-capability sanitization layer "currently unimplemented and ignored, and so should be left empty" (`source/extensions/common/wasm/plugin.cc:14`). envoy-go matches upstream byte-faithfully — accept empty `SanitizationConfig{}` values (parse-and-discard non-empty mirrors phase-24's `override_option` INERT acceptance per ADR-0199 AMEND-4). NO PARSE-REJECT on non-empty SanitizationConfig; NO IMPL surface beyond the accept-empty discipline.
+
+**envoy-go-strict departure record at BEHAVIOR_CONTRACT.md** per parent SPEC §13 edit #3. One of 4-5 envoy-go-strict departure records at the 25.1 IMPL final Task bundle.
+
+### Decision
+
+(Body lands at 25.1 IMPL Lands-in-Task per ADR-0044 in-place edit discipline.)
+
+### Consequences
+
+(Body lands at 25.1 IMPL Lands-in-Task.)
+
+**Cross-references:** ADR-0202 (paired primitive-side ADR — `internal/wasm/` framework primitive; `SandboxConfig` lives at `internal/wasm/sandbox.go`); ADR-0203 (paired HTTP-filter-package ADR; the `hostcall_denied` counter lives at `internal/filter/http/wasm/stats.go`); ADR-0125 (per-route canonical patterns — 5th-canonical REUSE-by-absence per AMEND-A3); phase-25 parent SPEC §2.5 + §4.3 + §11.4 D7 + §1.1 AMEND-A5; phase-22.1 ADR-0188 §Decision body (the prior default-deny `SandboxConfig` precedent — different runtime + different stdlib roster but identical strict-by-default rationale).
+
+---
