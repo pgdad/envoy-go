@@ -56,6 +56,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0031-http-admission-control-boot-reject/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0032-http-ratelimit/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0033-http-ratelimit-boot-reject/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0034-http-wasm-headers-bridge/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0035-http-wasm-boot-reject/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -700,6 +702,41 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// complete + the ratelimit filter's init() boot-registration fires
 			// for the differential subject's bootstrap parsing path ahead of
 			// the rollout.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPWasm:
+			// Fixture 0034-http-wasm-headers-bridge (phase 25.1 Task 15)
+			// REUSES the SHARED echobackend binary at
+			// test/helpers/echobackend/cmd/echobackend/ (phase-14 Task 10).
+			// The echobackend reflects request headers as a JSON body —
+			// scenarios (a) add-fixed-header, (b) replace-header, (c)
+			// remove-header, (f) header-iteration-count, and (g) property-
+			// read-method assert the WASM-mutated header set arrived at
+			// the upstream by classifying the reflected body. Scenario
+			// (d) respond-shortcircuit does NOT round-trip through the
+			// backend (it short-circuits at the wasm filter via
+			// proxy_send_local_response). Scenario (e) log-only-
+			// passthrough is a no-op log + pass-through; the cross-side
+			// stat-counter delta `wasm.<plugin>.executions` is the
+			// "wasm ran" assertion + lives in StatsAsserter.AssertStats
+			// (mirrors fixture-0026 D3 closure for lua). Because the
+			// backend is a subprocess, the runner's in-process accept
+			// counter is NOT incremented. Per parent §8.5 + AMEND-A1.
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)

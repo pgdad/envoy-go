@@ -1,0 +1,8 @@
+# Cargo build artifacts — the vendored .wasm blobs live under
+# ../bytecode/ (committed to git per Q9 + AMEND-A1); the per-scenario
+# Cargo.toml + src/lib.rs are committed for operator-reproducibility
+# per Task 15 PLAN, but the per-crate target/ + Cargo.lock are NOT
+# checked in (mirrors standard Rust gitignore + keeps the diff
+# auditable).
+target/
+Cargo.lock

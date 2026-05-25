@@ -1,0 +1,156 @@
+# Human-readable scenario expectations for fixture 0034-http-wasm-
+# headers-bridge. Per phase 25.1 SPEC §9.1 7-scenario table. NOT
+# consumed by the differential runner — the runner's CompareBytes +
+# StatsAsserter branches drive the actual assertions. This file is a
+# documentation aid for fixture readers + reviewers.
+#
+# Fixture topology:
+#   7 listeners (l_test_a..l_test_g) — one per scenario.
+#   Each listener carries one envoy.filters.http.wasm filter consuming
+#   a per-scenario .wasm blob via the DataSource.Filename arm.
+#   Backend: shared echobackend (reflects request headers as JSON body).
+
+scenarios:
+  - id: a
+    name: a_add_header
+    listener: l_test_a
+    description: |
+      Wasm plugin calls `proxy_add_header_map_value(HTTP_REQUEST_
+      HEADERS, "x-wasm-injected", "hello")` at on_http_request_headers.
+      The request reaches echobackend with the injected header; the
+      driver classifies the reflected JSON to assert the
+      `x-wasm-injected` key = `hello` is present on both ref + subj.
+    request:
+      method: GET
+      path: /scenario_a
+    expected_upstream_request_headers:
+      x-wasm-injected: hello
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: b
+    name: b_replace_header
+    listener: l_test_b
+    description: |
+      Wasm plugin calls `proxy_replace_header_map_value(HTTP_REQUEST_
+      HEADERS, "user-agent", "envoy-go-wasm/1.0")` at decode.
+      echobackend reflects the replaced value in the JSON body. The
+      driver injects baseline `user-agent: integration-test/0.1` so
+      the replace has something to replace; asserts `user-agent:
+      envoy-go-wasm/1.0` on both sides.
+    request:
+      method: GET
+      path: /scenario_b
+      headers:
+        user-agent: integration-test/0.1
+    expected_upstream_request_headers:
+      user-agent: envoy-go-wasm/1.0
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: c
+    name: c_remove_header
+    listener: l_test_c
+    description: |
+      Wasm plugin calls `proxy_remove_header_map_value(HTTP_REQUEST_
+      HEADERS, "x-blocked")` at decode. The driver supplies
+      `x-blocked: yes` in the request; echobackend's reflected JSON
+      must NOT contain the `x-blocked` key after the removal.
+    request:
+      method: GET
+      path: /scenario_c
+      headers:
+        x-blocked: "yes"
+    expected_upstream_request_headers_absent:
+      - x-blocked
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: d
+    name: d_respond_shortcircuit
+    listener: l_test_d
+    description: |
+      Wasm plugin calls `proxy_send_local_response(403, "", "denied",
+      &[], 0)` and returns Action::Pause. Per parent SPEC byte-pin:
+      status 403; body "denied" (6 bytes, no trailing newline);
+      content-length: 6 auto-set; NO upstream request initiated
+      (echobackend never sees the round-trip).
+    request:
+      method: GET
+      path: /scenario_d
+    expected_downstream_response_status: 403
+    expected_downstream_response_headers:
+      content-length: "6"
+    expected_downstream_response_body: denied
+    expected_upstream_round_trip: false
+
+  - id: e
+    name: e_log_only
+    listener: l_test_e
+    description: |
+      Wasm plugin calls `hostcalls::log(LogLevel::Info, "wasm hit")`
+      at decode; no headers mutated, request passes through to
+      echobackend unchanged. Per fixture-0026 D3 closure mirror: the
+      literal log line is NOT cross-side asserted (wazero log sink
+      format vs reference Envoy's spdlog format diverges); the
+      **stat-counter delta** `wasm.plugin_e.executions` is the
+      "wasm ran" assertion. The driver's StatsAsserter scrapes
+      /stats/prometheus on both sides post-Drive + asserts both
+      sides incremented the counter by 1.
+    request:
+      method: GET
+      path: /scenario_e
+    expected_upstream_request_unchanged: true
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+    expected_executions_delta_per_probe: 1
+
+  - id: f
+    name: f_header_iter
+    listener: l_test_f
+    description: |
+      Wasm plugin calls `proxy_get_header_map_pairs(HTTP_REQUEST_
+      HEADERS)` + counts entries + adds `x-headers-count: tostring(n)`
+      at decode. Per parent §4.5 D6 guardrail (b): the pair list is
+      sorted-by-name on both runtimes (envoy-go's GetHeaderMap sorts;
+      reference Envoy's native iteration is name-sorted) — the COUNT
+      N is order-independent so cross-side byte-exact holds. The
+      driver asserts `x-headers-count` is present in the reflected
+      JSON + has the same value on ref + subj.
+    request:
+      method: GET
+      path: /scenario_f
+    expected_upstream_request_headers_present:
+      - x-headers-count
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+  - id: g
+    name: g_property_method
+    listener: l_test_g
+    description: |
+      Wasm plugin calls `proxy_get_property(["request", "method"])` +
+      adds `x-request-method: GET` at decode. The driver always
+      issues GET so both sides produce the same string. envoy-go's
+      GetProperty (abi_callbacks.go getRequestProperty) returns the
+      :method pseudo-header bytes; reference Envoy's V8 host
+      implements the standard CEL `request.method` accessor.
+    request:
+      method: GET
+      path: /scenario_g
+    expected_upstream_request_headers:
+      x-request-method: GET
+    expected_downstream_response_status: 200
+    expected_response_body_classification: ok
+
+# Cross-side scope summary:
+#   Scenarios (a)-(g): full cross-side byte-exact via CompareBytes.
+#   Scenario (e):      stat-counter delta assertion via StatsAsserter
+#                      (cross-side delta + per-probe absolute value).
+#
+# Cross-references:
+#   - 25.1 SPEC §9.1 7-scenario table + driver impl shape.
+#   - 25.1 SPEC §4.5 D6 guardrail (24-hostcall surface).
+#   - 25.1 PLAN Task 15 file roster.
+#   - AMEND-A2 (executions counter surface).
+#   - AMEND-A6 (proxy_abi_version_0_2_1 only on envoy-go side).

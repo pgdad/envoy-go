@@ -434,6 +434,26 @@ const (
 	// for the Task 10 + 11 fixtures. Introduced by phase 24.1 Task 9 /
 	// fixtures 0032 + 0033.
 	HTTPGlobalRateLimitGRPC BackendKind = 24
+	// HTTPWasm reuses the SHARED echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for fixture
+	// 0034-http-wasm-headers-bridge (phase 25.1 Task 15). The echobackend
+	// reflects request headers as a JSON body — scenarios (a) add-fixed-
+	// header, (b) replace-header, (c) remove-header, (f) header-iteration-
+	// count, and (g) property-read-method assert the WASM-mutated header
+	// set arrived at the upstream by classifying the reflected body.
+	// Scenario (d) respond-shortcircuit does NOT round-trip through the
+	// backend (it short-circuits at the wasm filter via
+	// proxy_send_local_response). Scenario (e) log-only-passthrough is a
+	// no-op log + pass-through; the cross-side stat-counter delta
+	// `wasm.<plugin>.executions` is the "wasm ran" assertion + lives in
+	// StatsAsserter.AssertStats (mirrors fixture-0026 D3 closure for lua).
+	// Because the backend is a subprocess, the runner's in-process accept
+	// counter is NOT incremented. The blank-import for fixture 0034's
+	// inputs package lands at Task 15 alongside this switch-case + the
+	// BackendKind constant per parent §8.5. The differential dispatch at
+	// runner_test.go mirrors HTTPLua precedent (fixture-0026 phase 22.1
+	// Task 13 / 14).
+	HTTPWasm BackendKind = 25
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

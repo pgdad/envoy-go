@@ -1,0 +1,23 @@
+# Cargo manifest for scenario (a) — add-fixed-header.
+#
+# Per phase 25.1 SPEC §9.1 row (a) + Task 15 PLAN AMEND-A1:
+# proxy-wasm-rust-sdk =0.2.4 (pinned exact). Builds to
+# target/wasm32-wasip1/release/a_add_header.wasm. The resulting blob is
+# vendored at ../../bytecode/a_add_header.wasm + consumed by BOTH
+# reference Envoy v1.34.0 (V8 runtime) AND envoy-go (wazero runtime)
+# via DataSource.Filename → on-disk read. The wasm file exports
+# proxy_abi_version_0_2_1 per AMEND-A6 envoy-go-strict-stricter.
+[package]
+name = "a_add_header"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

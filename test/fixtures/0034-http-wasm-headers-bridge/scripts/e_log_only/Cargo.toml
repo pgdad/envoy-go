@@ -1,0 +1,17 @@
+# Cargo manifest for scenario (e) — log-only-passthrough.
+# Per phase 25.1 SPEC §9.1 row (e) + Task 15 PLAN AMEND-A1.
+# Builds to target/wasm32-wasip1/release/e_log_only.wasm.
+[package]
+name = "e_log_only"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

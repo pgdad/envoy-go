@@ -1,0 +1,466 @@
+# envoy-go subject bootstrap for fixture 0034-http-wasm-headers-bridge.
+#
+# Per phase 25.1 SPEC §9 + Task 15 PLAN. Same seven-listener topology
+# as envoy.yaml; runtime is `envoy.wasm.runtime.wazero` per AMEND-A1.
+# Each listener consumes `Wasm.config.vm_config.code.local.filename`
+# pointing at a host-side absolute path under the fixture directory's
+# bytecode/ subdirectory.
+#
+# CAPABILITY RESTRICTION discipline (envoy-go cross-side symmetry):
+# envoy-go is `StrictDefaultDeny` per AMEND-A5 — an empty
+# `allowed_capabilities` map ⇒ DENY all hostcalls. We list the full
+# 24-hostcall superset to allow the per-scenario .wasm to dispatch
+# the headers-bridge + property + send-local-response + log surface.
+# The identical block is also present in envoy.yaml for cross-side
+# symmetry (reference Envoy upstream treats the populated list as a
+# positive allow-list).
+#
+# Runtime: `envoy.wasm.runtime.wazero` per AMEND-A1; envoy-go's
+# compiled_config.go arm 11 PARSE-REJECTS any other runtime string.
+# The .wasm blobs export `proxy_abi_version_0_2_1` per AMEND-A6
+# envoy-go-strict-stricter.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    # === l_test_a (scenario a) - add fixed header ===
+    - name: l_test_a
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LATestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_a
+                route_config:
+                  name: rc_a
+                  virtual_hosts:
+                    - name: vh_a
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_a
+                        root_id: scenario_a
+                        vm_config:
+                          vm_id: vm_a
+                          runtime: envoy.wasm.runtime.wazero
+                          code:
+                            local:
+                              filename: "{{.WasmA}}"
+                        capability_restriction_config:
+                          allowed_capabilities:
+                            proxy_log: {}
+                            proxy_get_log_level: {}
+                            proxy_get_header_map_pairs: {}
+                            proxy_get_header_map_value: {}
+                            proxy_get_header_map_size: {}
+                            proxy_set_header_map_pairs: {}
+                            proxy_add_header_map_value: {}
+                            proxy_replace_header_map_value: {}
+                            proxy_remove_header_map_value: {}
+                            proxy_send_local_response: {}
+                            proxy_get_property: {}
+                            proxy_set_property: {}
+                            proxy_get_status: {}
+                            proxy_get_current_time_nanoseconds: {}
+                            proxy_set_effective_context: {}
+                            proxy_done: {}
+                            proxy_on_context_create: {}
+                            proxy_on_vm_start: {}
+                            proxy_on_configure: {}
+                            proxy_on_done: {}
+                            proxy_on_delete: {}
+                            proxy_on_log: {}
+                            proxy_on_request_headers: {}
+                            proxy_on_response_headers: {}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_b (scenario b) - replace user-agent header ===
+    - name: l_test_b
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LBTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_b
+                route_config:
+                  name: rc_b
+                  virtual_hosts:
+                    - name: vh_b
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_b
+                        root_id: scenario_b
+                        vm_config:
+                          vm_id: vm_b
+                          runtime: envoy.wasm.runtime.wazero
+                          code:
+                            local:
+                              filename: "{{.WasmB}}"
+                        capability_restriction_config:
+                          allowed_capabilities:
+                            proxy_log: {}
+                            proxy_get_log_level: {}
+                            proxy_get_header_map_pairs: {}
+                            proxy_get_header_map_value: {}
+                            proxy_get_header_map_size: {}
+                            proxy_set_header_map_pairs: {}
+                            proxy_add_header_map_value: {}
+                            proxy_replace_header_map_value: {}
+                            proxy_remove_header_map_value: {}
+                            proxy_send_local_response: {}
+                            proxy_get_property: {}
+                            proxy_set_property: {}
+                            proxy_get_status: {}
+                            proxy_get_current_time_nanoseconds: {}
+                            proxy_set_effective_context: {}
+                            proxy_done: {}
+                            proxy_on_context_create: {}
+                            proxy_on_vm_start: {}
+                            proxy_on_configure: {}
+                            proxy_on_done: {}
+                            proxy_on_delete: {}
+                            proxy_on_log: {}
+                            proxy_on_request_headers: {}
+                            proxy_on_response_headers: {}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_c (scenario c) - remove header ===
+    - name: l_test_c
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LCTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_c
+                route_config:
+                  name: rc_c
+                  virtual_hosts:
+                    - name: vh_c
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_c
+                        root_id: scenario_c
+                        vm_config:
+                          vm_id: vm_c
+                          runtime: envoy.wasm.runtime.wazero
+                          code:
+                            local:
+                              filename: "{{.WasmC}}"
+                        capability_restriction_config:
+                          allowed_capabilities:
+                            proxy_log: {}
+                            proxy_get_log_level: {}
+                            proxy_get_header_map_pairs: {}
+                            proxy_get_header_map_value: {}
+                            proxy_get_header_map_size: {}
+                            proxy_set_header_map_pairs: {}
+                            proxy_add_header_map_value: {}
+                            proxy_replace_header_map_value: {}
+                            proxy_remove_header_map_value: {}
+                            proxy_send_local_response: {}
+                            proxy_get_property: {}
+                            proxy_set_property: {}
+                            proxy_get_status: {}
+                            proxy_get_current_time_nanoseconds: {}
+                            proxy_set_effective_context: {}
+                            proxy_done: {}
+                            proxy_on_context_create: {}
+                            proxy_on_vm_start: {}
+                            proxy_on_configure: {}
+                            proxy_on_done: {}
+                            proxy_on_delete: {}
+                            proxy_on_log: {}
+                            proxy_on_request_headers: {}
+                            proxy_on_response_headers: {}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_d (scenario d) - send-local-response short-circuit (403/denied) ===
+    - name: l_test_d
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LDTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_d
+                route_config:
+                  name: rc_d
+                  virtual_hosts:
+                    - name: vh_d
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_d
+                        root_id: scenario_d
+                        vm_config:
+                          vm_id: vm_d
+                          runtime: envoy.wasm.runtime.wazero
+                          code:
+                            local:
+                              filename: "{{.WasmD}}"
+                        capability_restriction_config:
+                          allowed_capabilities:
+                            proxy_log: {}
+                            proxy_get_log_level: {}
+                            proxy_get_header_map_pairs: {}
+                            proxy_get_header_map_value: {}
+                            proxy_get_header_map_size: {}
+                            proxy_set_header_map_pairs: {}
+                            proxy_add_header_map_value: {}
+                            proxy_replace_header_map_value: {}
+                            proxy_remove_header_map_value: {}
+                            proxy_send_local_response: {}
+                            proxy_get_property: {}
+                            proxy_set_property: {}
+                            proxy_get_status: {}
+                            proxy_get_current_time_nanoseconds: {}
+                            proxy_set_effective_context: {}
+                            proxy_done: {}
+                            proxy_on_context_create: {}
+                            proxy_on_vm_start: {}
+                            proxy_on_configure: {}
+                            proxy_on_done: {}
+                            proxy_on_delete: {}
+                            proxy_on_log: {}
+                            proxy_on_request_headers: {}
+                            proxy_on_response_headers: {}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_e (scenario e) - log-only pass-through ===
+    - name: l_test_e
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LETestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_e
+                route_config:
+                  name: rc_e
+                  virtual_hosts:
+                    - name: vh_e
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_e
+                        root_id: scenario_e
+                        vm_config:
+                          vm_id: vm_e
+                          runtime: envoy.wasm.runtime.wazero
+                          code:
+                            local:
+                              filename: "{{.WasmE}}"
+                        capability_restriction_config:
+                          allowed_capabilities:
+                            proxy_log: {}
+                            proxy_get_log_level: {}
+                            proxy_get_header_map_pairs: {}
+                            proxy_get_header_map_value: {}
+                            proxy_get_header_map_size: {}
+                            proxy_set_header_map_pairs: {}
+                            proxy_add_header_map_value: {}
+                            proxy_replace_header_map_value: {}
+                            proxy_remove_header_map_value: {}
+                            proxy_send_local_response: {}
+                            proxy_get_property: {}
+                            proxy_set_property: {}
+                            proxy_get_status: {}
+                            proxy_get_current_time_nanoseconds: {}
+                            proxy_set_effective_context: {}
+                            proxy_done: {}
+                            proxy_on_context_create: {}
+                            proxy_on_vm_start: {}
+                            proxy_on_configure: {}
+                            proxy_on_done: {}
+                            proxy_on_delete: {}
+                            proxy_on_log: {}
+                            proxy_on_request_headers: {}
+                            proxy_on_response_headers: {}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_f (scenario f) - header-map-pairs iteration count ===
+    - name: l_test_f
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LFTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_f
+                route_config:
+                  name: rc_f
+                  virtual_hosts:
+                    - name: vh_f
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_f
+                        root_id: scenario_f
+                        vm_config:
+                          vm_id: vm_f
+                          runtime: envoy.wasm.runtime.wazero
+                          code:
+                            local:
+                              filename: "{{.WasmF}}"
+                        capability_restriction_config:
+                          allowed_capabilities:
+                            proxy_log: {}
+                            proxy_get_log_level: {}
+                            proxy_get_header_map_pairs: {}
+                            proxy_get_header_map_value: {}
+                            proxy_get_header_map_size: {}
+                            proxy_set_header_map_pairs: {}
+                            proxy_add_header_map_value: {}
+                            proxy_replace_header_map_value: {}
+                            proxy_remove_header_map_value: {}
+                            proxy_send_local_response: {}
+                            proxy_get_property: {}
+                            proxy_set_property: {}
+                            proxy_get_status: {}
+                            proxy_get_current_time_nanoseconds: {}
+                            proxy_set_effective_context: {}
+                            proxy_done: {}
+                            proxy_on_context_create: {}
+                            proxy_on_vm_start: {}
+                            proxy_on_configure: {}
+                            proxy_on_done: {}
+                            proxy_on_delete: {}
+                            proxy_on_log: {}
+                            proxy_on_request_headers: {}
+                            proxy_on_response_headers: {}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # === l_test_g (scenario g) - property-tree read of request.method ===
+    - name: l_test_g
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.LGTestPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_g
+                route_config:
+                  name: rc_g
+                  virtual_hosts:
+                    - name: vh_g
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_g
+                        root_id: scenario_g
+                        vm_config:
+                          vm_id: vm_g
+                          runtime: envoy.wasm.runtime.wazero
+                          code:
+                            local:
+                              filename: "{{.WasmG}}"
+                        capability_restriction_config:
+                          allowed_capabilities:
+                            proxy_log: {}
+                            proxy_get_log_level: {}
+                            proxy_get_header_map_pairs: {}
+                            proxy_get_header_map_value: {}
+                            proxy_get_header_map_size: {}
+                            proxy_set_header_map_pairs: {}
+                            proxy_add_header_map_value: {}
+                            proxy_replace_header_map_value: {}
+                            proxy_remove_header_map_value: {}
+                            proxy_send_local_response: {}
+                            proxy_get_property: {}
+                            proxy_set_property: {}
+                            proxy_get_status: {}
+                            proxy_get_current_time_nanoseconds: {}
+                            proxy_set_effective_context: {}
+                            proxy_done: {}
+                            proxy_on_context_create: {}
+                            proxy_on_vm_start: {}
+                            proxy_on_configure: {}
+                            proxy_on_done: {}
+                            proxy_on_delete: {}
+                            proxy_on_log: {}
+                            proxy_on_request_headers: {}
+                            proxy_on_response_headers: {}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: c_backend
+      type: STATIC
+      connect_timeout: 0.25s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }

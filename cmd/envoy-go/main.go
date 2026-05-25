@@ -45,6 +45,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/ratelimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/filter/http/wasm"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
@@ -145,6 +146,7 @@ func main() {
 	httpReg.Register(oauth2.TypeURL, oauth2.New)
 	httpReg.Register(ratelimit.TypeURL, ratelimit.New) // phase-24.1 Task 7 (ADR-0197 core); 18 → 19 HTTP filters
 	httpReg.Register(rbac.TypeURL, rbac.New)
+	httpReg.Register(wasm.TypeURL, wasm.New) // phase-25.1 Task 13 (ADR-0202/0203/0204); 19 → 20 HTTP filters
 	// Register header_mutation per-route validator before Freeze (the registry
 	// rejects registrations after Freeze; New is called post-Freeze during
 	// listener construction, so it cannot call RegisterPerRouteValidator itself).
@@ -170,6 +172,14 @@ func main() {
 	// PARSE-ACCEPTED (override_option is INERT per AMEND-4; empty domain
 	// defers to the filter-config domain).
 	ratelimit.RegisterPerRouteValidator(httpReg)
+	// Phase-25.1 Task 13: register the wasm per-route validator BEFORE Freeze
+	// per parent §6.2 arm 18 + AMEND-A3 REUSE-by-absence (5th-canonical
+	// PARSE-REJECT-by-presence) + ADR-0110 single-chokepoint. The validator
+	// rejects UNCONDITIONALLY at 25.1+25.2 with the byte-stable wording
+	// "wasm: per-route configuration is not yet supported (lands in phase 25.3)";
+	// the 5th canonical per-route shape (`WasmPerRoute` wholesale-override)
+	// replaces the body at 25.3 IMPL.
+	wasm.RegisterPerRouteValidator(httpReg)
 	httpReg.Freeze()
 
 	// Phase 07.2 Task 11 boot wiring: build the

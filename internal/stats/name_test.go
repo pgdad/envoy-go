@@ -391,3 +391,95 @@ func TestFlattenToProm_BandwidthLimit_RejectsDoublyNestedSegment(t *testing.T) {
 		t.Error("flattenToProm with multi-segment prefix: want error, got nil")
 	}
 }
+
+// Phase 25.1 / Task 15 follow-up: wasm.* inline-prefix detection tests per
+// AMEND-A2 + ADR-0202 + ADR-0203. Mirrors phase-15's bandwidth_limit inline-
+// prefix discipline (NO label promotion; <scope> INLINED into base; internal
+// dots in <rest> converted to underscores).
+//
+// Without this rule the wasm filter's 5-counter surface (registered as
+// `wasm.<scope>.<rest>` per stats.go) would fail flattenToProm and be
+// silently dropped from the /stats/prometheus exposition (per prom.go
+// WriteProm's err-skip discipline). The fixture-0034 scenario (e) cross-side
+// stats assertion REQUIRES the subject side to expose
+// `envoy_wasm_plugin_e_executions` after one probe — the projection below
+// is the load-bearing path for that assertion.
+
+func TestFlattenToProm_Wasm_GroupB_Created(t *testing.T) {
+	base, labels, err := flattenToProm("wasm.wazero.created")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_wasm_wazero_created" {
+		t.Errorf("base: got %q, want %q", base, "envoy_wasm_wazero_created")
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels: got %v, want [] (inline-prefix: <scope> INLINED, no label promotion)", labels)
+	}
+}
+
+func TestFlattenToProm_Wasm_GroupB_Active(t *testing.T) {
+	base, labels, err := flattenToProm("wasm.wazero.active")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_wasm_wazero_active" {
+		t.Errorf("base: got %q, want %q", base, "envoy_wasm_wazero_active")
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels: got %v, want []", labels)
+	}
+}
+
+func TestFlattenToProm_Wasm_GroupC_PerPluginExecutions(t *testing.T) {
+	base, labels, err := flattenToProm("wasm.plugin_e.executions")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_wasm_plugin_e_executions" {
+		t.Errorf("base: got %q, want %q", base, "envoy_wasm_plugin_e_executions")
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels: got %v, want []", labels)
+	}
+}
+
+func TestFlattenToProm_Wasm_GroupC_PerPluginHostcallDenied(t *testing.T) {
+	base, labels, err := flattenToProm("wasm.plugin_a.hostcall_denied")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_wasm_plugin_a_hostcall_denied" {
+		t.Errorf("base: got %q, want %q", base, "envoy_wasm_plugin_a_hostcall_denied")
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels: got %v, want []", labels)
+	}
+}
+
+// TestFlattenToProm_Wasm_GroupC_InternalDotInRest covers the
+// `wasm.<plugin>.envoy_go.failures` counter — its <rest> segment carries
+// an internal `.` (`envoy_go.failures`) marking the envoy-go-strict origin
+// of the metric per AMEND-A2. The internal dot MUST be converted to `_` so
+// the projected Prometheus name is valid.
+func TestFlattenToProm_Wasm_GroupC_InternalDotInRest(t *testing.T) {
+	base, labels, err := flattenToProm("wasm.plugin_e.envoy_go.failures")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_wasm_plugin_e_envoy_go_failures" {
+		t.Errorf("base: got %q, want %q", base, "envoy_wasm_plugin_e_envoy_go_failures")
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels: got %v, want []", labels)
+	}
+}
+
+func TestFlattenToProm_Wasm_RejectsEmptyScope(t *testing.T) {
+	// `wasm.` alone with no scope segment falls through to the explicit
+	// no-scope error.
+	_, _, err := flattenToProm("wasm.")
+	if err == nil {
+		t.Error("flattenToProm(\"wasm.\"): want error, got nil")
+	}
+}

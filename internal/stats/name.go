@@ -85,6 +85,41 @@ func flattenToProm(internal string) (string, []Label, error) {
 		// Rule SN5
 		rest = strings.TrimPrefix(internal, "server.")
 		base = "envoy_server_" + rest
+	case strings.HasPrefix(internal, "wasm."):
+		// Phase 25.1 / Task 15 follow-up: wasm filter inline-prefix detection
+		// per AMEND-A2 + ADR-0202 + ADR-0203 (mirrors phase-15 bandwidth_limit's
+		// inline-prefix shape — NO label promotion, stat_scope INLINED into
+		// the Prometheus base name). The wasm filter's stat-name shape is:
+		//
+		//   wasm.<scope>.<rest>
+		//
+		// where <scope> is either the Group-B runtime token (`wazero` at 25.1
+		// per AMEND-A1) or the Group-C envoy-go-strict per-plugin token
+		// (`<plugin_name>` from the PluginConfig). Internal dots in <rest>
+		// (e.g. `envoy_go.failures` segment) are converted to `_` so the
+		// projected Prometheus name is valid.
+		//
+		// Examples:
+		//
+		//   wasm.wazero.created               → envoy_wasm_wazero_created
+		//   wasm.wazero.active                → envoy_wasm_wazero_active
+		//   wasm.plugin_e.executions          → envoy_wasm_plugin_e_executions
+		//   wasm.plugin_e.hostcall_denied     → envoy_wasm_plugin_e_hostcall_denied
+		//   wasm.plugin_e.envoy_go.failures   → envoy_wasm_plugin_e_envoy_go_failures
+		//
+		// KEEP IN SYNC with newFilterStats in internal/filter/http/wasm/stats.go
+		// (the 5-counter surface per AMEND-A2 tri-group prefix structure). If a
+		// future task adds new wasm.* stat names, this rule accepts them
+		// uniformly without additional code changes — the rule is intentionally
+		// permissive (no per-counter allow-list, unlike SN9 / bandwidth_limit).
+		//
+		// Per AMEND-A2 + ADR-0202 + ADR-0203.
+		tail := strings.TrimPrefix(internal, "wasm.")
+		if tail == "" {
+			return "", nil, fmt.Errorf("stats: name %q matches wasm.* but has no <scope> segment", internal)
+		}
+		base = "envoy_wasm_" + strings.ReplaceAll(tail, ".", "_")
+		return base, nil, nil
 	default:
 		// Rule SN9 (added per phase 11 ADR-0118 + ADR-0061 amendment): the
 		// local_ratelimit filter-specific tag-extractor matches names of the

@@ -1,0 +1,17 @@
+# Cargo manifest for scenario (f) — header-iteration-count.
+# Per phase 25.1 SPEC §9.1 row (f) + Task 15 PLAN AMEND-A1.
+# Builds to target/wasm32-wasip1/release/f_header_iter.wasm.
+[package]
+name = "f_header_iter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
