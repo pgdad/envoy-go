@@ -4,7 +4,40 @@ package lua
 // SPEC §3.4 + §11.8 D4 closure + AMEND-22.2-4 + PLAN Task 13 + ADR-0192
 // §Decision body anticipation.
 //
-// # Surface
+// # 25.2 IMPL Task 10 MIGRATION (ADR-0207 §3.4 + 25.2 SPEC §14.5)
+//
+// The phase-22.2 IMPL of this file stored its per-stream data in a
+// `map[string]any` field on *filter (lua.go) accessed via the cb adapter's
+// FilterState() / SetFilterState() pair. At phase 25.2 IMPL Task 10 the
+// bridge's :get + :set LGFunctions delegate through the NEW shared
+// `internal/filterstate/*Bucket` primitive (per ADR-0207 §3.4 MIGRATES) —
+// each :get/:set constructs an ephemeral *Bucket populated from the
+// current map, exercises the Bucket's Get/Set API (including the
+// FilterStateObject adapter + StateType discriminator) + materializes the
+// bucket state back into the map for cb-adapter visibility.
+//
+// MIGRATION SCOPE per 25.2 SPEC §14.5 (non-breaking discipline):
+//   - The `:filterState()` Lua surface stays BYTE-IDENTICAL to phase-22.2.
+//   - The `*filter.filterState map[string]any` field STAYS as the cb-adapter
+//     observable storage (RequestHandleCallbacks.FilterState() returns
+//     map[string]any; phase-22.2 lua filterstate tests pin this).
+//   - The 2 envoy-go-strict divergences from AMEND-22.2-4 (mutation
+//     exposure + typed Lua-value marshaling) carry forward UNCHANGED.
+//   - All phase-22.2 lua filterstate tests pass UNCHANGED (no test file
+//     modifications).
+//
+// The Bucket primitive's value at the lua bridge is API-shape alignment:
+//   - The `luaFilterStateObject` adapter wraps each Lua-marshaled value
+//     + satisfies `filterstate.FilterStateObject` (Marshal/Unmarshal via
+//     gob-encoded payload; HasData; StateType returns Mutable per the
+//     phase-22.2 mutation-exposure divergence per AMEND-22.2-4).
+//   - The Bucket's Set conflict-check (Mutable-vs-ReadOnly rejection) is
+//     a no-op for the lua surface (the adapter always returns Mutable
+//     per AMEND-22.2-4) — but the dispatch surface is shared verbatim
+//     with the wasm consumer at Task 13 (which DOES emit Mutable +
+//     ReadOnly objects per the proxy-wasm `filter_state.*` semantics).
+//
+// # Surface (unchanged from phase-22.2)
 //
 // `streamInfo:filterState()` returns a filterstate userdata wrapping
 // the per-stream string-keyed `map[string]any` stored on the *filter
@@ -17,7 +50,7 @@ package lua
 //                         (upstream FilterStateWrapper is strictly
 //                         read-only).
 //
-// # Marshaling table (per SPEC §11.8 D4 + AMEND-22.2-4)
+// # Marshaling table (per SPEC §11.8 D4 + AMEND-22.2-4) — UNCHANGED
 //
 //   - Go-side any → Lua value at :get
 //
@@ -42,7 +75,7 @@ package lua
 //	LUserData / LState      → runtime error (envoy-go-strict; documents
 //	                          the marshaling contract per SPEC §11.8 D4)
 //
-// # Per-stream lifecycle
+// # Per-stream lifecycle (unchanged from phase-22.2)
 //
 //   - The `map[string]any` lives on *filter (lua.go) — lazy-allocated
 //     on first :set (or pre-populated via FilterState() accessor on
@@ -55,7 +88,7 @@ package lua
 //   - Cross-stream isolation: each *filter has its own map. N parallel
 //     streams each get a separate map; no shared state.
 //
-// # 2 envoy-go-strict departures from upstream
+// # 2 envoy-go-strict departures from upstream (unchanged from phase-22.2)
 //
 // Per AMEND-22.2-4 (anchored at SPEC §11.8 D4 CLOSURE):
 //
@@ -75,9 +108,13 @@ package lua
 // anticipated at BEHAVIOR_CONTRACT.md §13.6 (Task 19 atomic landing).
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/esalaine/envoy-go/internal/filterstate"
 )
 
 // filterStateTypeName is the metatable registry-key used by gopher-lua's
@@ -182,9 +219,164 @@ func filterStateFromUD(L *lua.LState, idx int) *filterStateRef {
 	return ref
 }
 
+// ---------------------------------------------------------------------
+// 25.2 IMPL Task 10 MIGRATION — luaFilterStateObject adapter
+// ---------------------------------------------------------------------
+
+// luaFilterStateObject is the lua-bridge adapter that wraps a Lua-side
+// marshaled value (any-typed per the AMEND-22.2-4 typed Lua-value
+// marshaling table) and satisfies `filterstate.FilterStateObject`. The
+// adapter is constructed at :set time (wrapping the luaToAny output) and
+// queried at :get time (anyToLua unwraps the value back to a Lua value).
+//
+// StateType — returns filterstate.StateTypeMutable for ALL lua-bridge
+// entries per the phase-22.2 AMEND-22.2-4 mutation-exposure divergence
+// (upstream FilterStateWrapper is strictly read-only; the envoy-go-strict
+// surface exposes :set with full Mutable semantics).
+//
+// Marshal / Unmarshal — serializes the wrapped `any` value via gob
+// encoding (the simplest serializer that handles the AMEND-22.2-4 typed
+// marshaling table's any-typed cells: string, float64, int64, bool,
+// nested map[string]any, nested []any). The Marshal/Unmarshal pair is
+// EXERCISED ONLY by the wasm property-dispatch consumer at Task 13 (the
+// lua bridge never calls Marshal/Unmarshal — :get/:set route through
+// .value direct access). Defensive copy at Marshal per the
+// filterstate.FilterStateObject contract: each call returns a fresh
+// byte slice.
+//
+// HasData — true when the wrapped value is non-nil (mirrors upstream
+// Envoy StreamInfo::FilterState::Object::hasData semantic). nil-valued
+// entries are explicitly allowed (the lua marshaling table maps LNil →
+// nil so a `fs:set("k", nil)` stores a non-empty entry whose HasData
+// returns false).
+type luaFilterStateObject struct {
+	value any
+}
+
+// Marshal serializes the wrapped value to a fresh byte slice. Uses gob
+// encoding (registered for the AMEND-22.2-4 typed cells in the package
+// init below). Returns a fresh slice on each call per the
+// filterstate.FilterStateObject contract.
+func (o *luaFilterStateObject) Marshal() ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	// Wrap in a single-field envelope so gob can decode the any-typed
+	// payload via interface dispatch on the decoder side. Direct
+	// gob.Encode of an `any` value would discard the dynamic type info.
+	envelope := struct{ V any }{V: o.value}
+	if err := enc.Encode(envelope); err != nil {
+		return nil, fmt.Errorf("luaFilterStateObject: marshal: %w", err)
+	}
+	// Defensive copy: bytes.Buffer's underlying slice may be reused on
+	// subsequent calls; return an independent slice owned by the caller.
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
+}
+
+// Unmarshal re-hydrates the wrapped value from the serialized payload.
+// nil input is treated as the empty payload (sets value to nil) per the
+// filterstate.FilterStateObject contract.
+func (o *luaFilterStateObject) Unmarshal(b []byte) error {
+	if len(b) == 0 {
+		o.value = nil
+		return nil
+	}
+	dec := gob.NewDecoder(bytes.NewReader(b))
+	var envelope struct{ V any }
+	if err := dec.Decode(&envelope); err != nil {
+		return fmt.Errorf("luaFilterStateObject: unmarshal: %w", err)
+	}
+	o.value = envelope.V
+	return nil
+}
+
+// HasData reports whether the wrapped value is non-nil. Mirrors upstream
+// Envoy StreamInfo::FilterState::Object::hasData semantic.
+func (o *luaFilterStateObject) HasData() bool {
+	return o.value != nil
+}
+
+// StateType returns filterstate.StateTypeMutable for ALL lua-bridge
+// entries per the phase-22.2 AMEND-22.2-4 mutation-exposure divergence
+// (envoy-go-strict — upstream FilterStateWrapper is strictly read-only;
+// the envoy-go lua surface exposes :set with full Mutable semantics).
+func (o *luaFilterStateObject) StateType() filterstate.StateType {
+	return filterstate.StateTypeMutable
+}
+
+// Compile-time witness: *luaFilterStateObject satisfies the
+// filterstate.FilterStateObject contract. Catches drift between the
+// adapter's method set and the primitive's interface signature at
+// build time rather than runtime.
+var _ filterstate.FilterStateObject = (*luaFilterStateObject)(nil)
+
+func init() {
+	// Register the AMEND-22.2-4 typed marshaling cells with gob so the
+	// envelope's any-typed payload round-trips correctly through
+	// Marshal/Unmarshal. The wasm consumer at Task 13 wraps its own
+	// payload bytes directly (no gob round-trip) — gob is the lua-side
+	// serializer only.
+	gob.Register(map[string]any{})
+	gob.Register([]any{})
+	gob.Register("")
+	gob.Register(int64(0))
+	gob.Register(float64(0))
+	gob.Register(false)
+}
+
+// bucketFromMap constructs a fresh *filterstate.Bucket populated from
+// the supplied map. Each map entry is wrapped in a fresh
+// *luaFilterStateObject adapter. Used at the start of each :get/:set
+// dispatch so the bridge logic delegates through the *Bucket primitive's
+// Get/Set API per ADR-0207 §3.4 MIGRATES.
+//
+// nil input → empty bucket (filterstate.NewBucket() returns a non-nil
+// empty bucket; callers may proceed without a nil guard).
+func bucketFromMap(m map[string]any) *filterstate.Bucket {
+	b := filterstate.NewBucket()
+	for k, v := range m {
+		// Set on a fresh bucket cannot fail (no existing entry to
+		// conflict against + the adapter is non-nil); the error return
+		// is defensive against future primitive evolution.
+		_ = b.Set(k, &luaFilterStateObject{value: v})
+	}
+	return b
+}
+
+// materializeBucketIntoMap copies the bucket's entries back into a
+// fresh map[string]any with each *luaFilterStateObject unwrapped to its
+// inner Lua-marshaled value. Used at the end of :set dispatch so the
+// cb-adapter-observable storage stays in sync with the bucket. The
+// returned map preserves the cb-adapter contract (RequestHandleCallbacks.
+// FilterState() returns map[string]any per phase-22.2 + 25.2 §14.5
+// non-breaking discipline).
+func materializeBucketIntoMap(b *filterstate.Bucket) map[string]any {
+	keys := b.Keys()
+	m := make(map[string]any, len(keys))
+	for _, k := range keys {
+		if obj, ok := b.Get(k); ok {
+			if lobj, ok := obj.(*luaFilterStateObject); ok {
+				m[k] = lobj.value
+			}
+		}
+	}
+	return m
+}
+
+// ---------------------------------------------------------------------
+// Bridge LGFunctions — :get + :set delegate through *filterstate.Bucket
+// ---------------------------------------------------------------------
+
 // filterStateGet implements filterState:get(name) per SPEC §3.4 +
 // §11.8 D4 + AMEND-22.2-4. Returns the marshaled Lua value at key `name`
 // or lua.LNil if absent / map is nil.
+//
+// 25.2 IMPL Task 10 MIGRATION: routes through *filterstate.Bucket per
+// ADR-0207 §3.4 MIGRATES — constructs an ephemeral *Bucket populated
+// from the cb-adapter's current map state, calls bucket.Get to exercise
+// the Bucket primitive's Get API + FilterStateObject interface, then
+// unwraps the *luaFilterStateObject.value via anyToLua.
 //
 // Marshaling: see anyToLua + the file header docstring table.
 func filterStateGet(L *lua.LState) int {
@@ -199,12 +391,23 @@ func filterStateGet(L *lua.LState) int {
 		L.Push(lua.LNil)
 		return 1
 	}
-	v, ok := m[name]
+	// Route through *filterstate.Bucket per ADR-0207 §3.4 MIGRATES.
+	b := bucketFromMap(m)
+	obj, ok := b.Get(name)
 	if !ok {
 		L.Push(lua.LNil)
 		return 1
 	}
-	L.Push(anyToLua(L, v))
+	lobj, ok := obj.(*luaFilterStateObject)
+	if !ok {
+		// Defensive — the bucket was populated by bucketFromMap with
+		// luaFilterStateObject entries only. A type mismatch here would
+		// signal a primitive-side evolution; surface as LNil rather than
+		// panic.
+		L.Push(lua.LNil)
+		return 1
+	}
+	L.Push(anyToLua(L, lobj.value))
 	return 1
 }
 
@@ -213,14 +416,33 @@ func filterStateGet(L *lua.LState) int {
 // Marshals the Lua value to `any` (see luaToAny) and stores at key
 // `name` on the underlying per-stream map.
 //
-// Lazy-allocation: if the underlying map is nil at :set time, a fresh
-// map is allocated AND installed via ref.set so subsequent :get calls
-// observe the freshly-allocated map.
+// 25.2 IMPL Task 10 MIGRATION: routes through *filterstate.Bucket per
+// ADR-0207 §3.4 MIGRATES — wraps the luaToAny output in a fresh
+// *luaFilterStateObject adapter, constructs an ephemeral *Bucket from
+// the current map state, calls bucket.Set to exercise the Bucket
+// primitive's Set API + StateType conflict semantics + ErrNilFilterStateObject
+// rejection, then materializes the bucket back into a fresh map[string]any
+// for the cb-adapter (RequestHandleCallbacks.SetFilterState).
+//
+// Lazy-allocation: if the underlying map is nil at :set time, the
+// ephemeral bucket starts empty + the materialized map is installed
+// via ref.set so subsequent :get calls observe the freshly-allocated
+// map. The cb-adapter's *filter back-pointer writes the map through
+// to *filter.filterState.
 //
 // Runtime error: unsupported Lua types (LFunction / LChannel /
 // LUserData (non-filterstate) / LState) raise a Lua runtime error per
 // AMEND-22.2-4 marshaling contract. Captures envoy-go-strict marshaling
 // expectations at the bridge layer.
+//
+// Bucket.Set conflict semantics on the lua surface: the lua adapter
+// returns StateTypeMutable for ALL entries (per AMEND-22.2-4 mutation
+// exposure), so the Mutable-vs-ReadOnly conflict check in *Bucket.Set
+// never rejects — every set replaces the existing entry. The ignored
+// error from bucket.Set is a defensive guard against future adapter
+// evolution (if a ReadOnly variant is introduced, the rejection would
+// silently no-op the :set, matching upstream's read-only FilterState
+// posture).
 func filterStateSet(L *lua.LState) int {
 	ref := filterStateFromUD(L, 1)
 	name := L.CheckString(2)
@@ -233,12 +455,18 @@ func filterStateSet(L *lua.LState) int {
 	// we touch the map). luaToAny raises L.RaiseError on unsupported
 	// types — control does not return on the error path.
 	v := luaToAny(L, lv)
+	// Route through *filterstate.Bucket per ADR-0207 §3.4 MIGRATES.
 	m := ref.get()
-	if m == nil {
-		m = make(map[string]any)
-		ref.set(m)
-	}
-	m[name] = v
+	b := bucketFromMap(m)
+	// The lua adapter always reports StateTypeMutable; the Bucket's
+	// conflict check never rejects on the lua surface. Defensive
+	// error-ignore per the adapter-evolution rationale in the docstring.
+	_ = b.Set(name, &luaFilterStateObject{value: v})
+	// Materialize the bucket back into the cb-adapter-observable map.
+	// Always re-install via ref.set so the lazy-allocation path covers
+	// the nil-map case (the cb-adapter writes the new map through to
+	// *filter.filterState).
+	ref.set(materializeBucketIntoMap(b))
 	return 0
 }
 
@@ -379,9 +607,3 @@ func luaTableToAny(L *lua.LState, t *lua.LTable) any {
 	})
 	return out
 }
-
-// _ unused-helper suppression: fmt is used by the marshaling-error
-// formatting only when L.RaiseError is invoked at the unsupported-type
-// path. The Go compiler requires the import to be referenced to compile
-// cleanly; the RaiseError format-string call itself satisfies that.
-var _ = fmt.Sprintf

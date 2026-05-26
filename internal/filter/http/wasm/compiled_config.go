@@ -1,11 +1,13 @@
 package wasm
 
 // compiled_config.go — `compiledConfig` per-listener immutable post-parse
-// config + `buildCompiledConfig` 18-arm PARSE-REJECT roster per parent SPEC
-// §6.2 + D-P5 closure (byte-stable wording finalization at Task 9). Lands
-// the per-listener config struct that Task 12's decode_headers.go /
-// encode_headers.go hot-path consumes via the per-stream *filter.cfg
-// pointer closure-captured at the (Task 12) New factory body.
+// config + `buildCompiledConfig` PARSE-REJECT roster per parent SPEC §6.2 +
+// 25.2 SPEC §6 + D-P5 closure (25.1 byte-stable wording finalization at
+// 25.1 Task 9) + 25.2 D-25.2-P5 closure (6 NEW arms wording finalization at
+// 25.2 Task 14). Lands the per-listener config struct that Task 12 (25.1)
+// + Tasks 15-18 (25.2) decode_headers.go / encode_headers.go hot-path
+// consume via the per-stream *filter.cfg pointer closure-captured at the
+// New factory body.
 //
 // # 18-arm PARSE-REJECT roster (per parent §6.2 + D-P5 byte-stable wording)
 //
@@ -60,14 +62,54 @@ package wasm
 //                                                            AliasedFromWasmGo
 //                                                            pins the byte-identity).
 //
-// # D-P5 closure (per 25.1 SPEC §12-D-P5 + parent §6.2)
+// # 6 NEW 25.2 PARSE-REJECT arms (per 25.2 SPEC §6.2 + D-25.2-P5 closure)
 //
-// At this Task 9, the byte-stable wording for ALL 18 arms is pinned via the
-// package-private `parseReject*` constants below. `TestParseRejectConstants_
+// The 25.2 EXTENSION adds 6 NEW arms covering 25.2-introduced surfaces (the
+// 4 envoy-go-strict-only `PluginConfig` config fields per Qs 2/6/9 + the
+// cross-PluginConfig duplicate-name validator that the 5-counter envoy-go-
+// strict tri-group bundle + per-plugin dynamic-stats Registry both depend
+// on). The 25.1 18-arm roster STAYS active at 25.2 verbatim per ADR-0080
+// byte-stable wording discipline.
+//
+//   - Arm 19 (envoy-go-strict-body-buffer-cap-bytes-zero)         — IMPL HERE
+//   - Arm 20 (envoy-go-strict-shared-data-value-cap-bytes-zero)   — IMPL HERE
+//   - Arm 21 (envoy-go-strict-shared-data-max-entries-zero)       — IMPL HERE
+//   - Arm 22 (envoy-go-strict-dynamic-stats-max-entries-zero)     — IMPL HERE
+//   - Arm 23 (envoy-go-strict-body-buffer-cap-bytes-overlarge)    — IMPL HERE
+//                                                                   (>1 GiB ceiling
+//                                                                   per defense-in-
+//                                                                   depth; operators
+//                                                                   wanting >1 GiB
+//                                                                   body buffers
+//                                                                   should re-architect
+//                                                                   via body-streaming
+//                                                                   rather than buffer-
+//                                                                   and-process)
+//   - Arm 26 (cross-pluginconfig-duplicate-pluginconfig-name)     — IMPL HERE
+//                                                                   (process-wide
+//                                                                   registry consulted
+//                                                                   at buildCompiledConfig
+//                                                                   per-plugin scope-
+//                                                                   uniqueness; the
+//                                                                   5-counter envoy-go-
+//                                                                   strict tri-group
+//                                                                   bundle + the per-
+//                                                                   plugin *dynamic.
+//                                                                   Registry both key
+//                                                                   off PluginConfig.
+//                                                                   name)
+//
+// # D-P5 + D-25.2-P5 closure (per 25.1 SPEC §12-D-P5 + parent §6.2 + 25.2 §6.2)
+//
+// At 25.1 Task 9, the byte-stable wording for the original 18 arms was pinned
+// via the package-private `parseReject*` constants below. At 25.2 Task 14
+// (D-25.2-P5 closure), the byte-stable wording for the 6 NEW arms is pinned
+// via the same constant-as-source-of-truth discipline. `TestParseRejectConstants_
 // ByteStable` (compiled_config_test.go) is a table-driven test that asserts
-// each constant byte-exact against the SPEC wording. Per ADR-0044 atomic-edit
-// discipline: any wording change touches both this file + the byte-exact
-// roster in parent SPEC §6.2 in a single commit.
+// each of the 24 constants (18 from 25.1 + 6 NEW from 25.2) byte-exact against
+// the SPEC wording. Per ADR-0044 atomic-edit discipline: any wording change
+// touches both this file + the byte-exact roster in parent SPEC §6.2 / 25.2
+// SPEC §6.2 in a single commit.
 //
 // # CompileCache scope per D-P-PLAN-5
 //
@@ -101,6 +143,12 @@ package wasm
 //     records the 18-arm D-P5 wording finalization at Task 17)
 //   - ADR-0204 (default-deny capability sandbox — anchors buildSandboxConfig
 //     zero-value StrictDefaultDeny)
+//   - ADR-0205 (root-VM lifecycle evolution; rootVM field + NewRootVM at New)
+//   - ADR-0206 (25.2 ABI extensions; cap fields + foreignReg field + dynStats field)
+//   - ADR-0208 (NEW internal/filter/http/wasm/ 25.2 package extensions — 4
+//     envoy-go-strict-only config fields + 6 NEW PARSE-REJECT arms + per-
+//     plugin *dynamic.Registry wiring; §Decision body records the D-25.2-P5
+//     6-NEW-arm wording finalization at Task 14)
 //   - AMEND-A1 (SanitizationConfig accept-empty discipline; ignored at 25.1)
 //   - AMEND-A2 (5-counter stat surface; HCM-stats_prefix DROPPED — pluginName
 //     drives Group-C envoy-go-strict per-plugin keys)
@@ -108,21 +156,32 @@ package wasm
 //     allow-all)
 //   - AMEND-A6 (envoy-go-strict-stricter ABI rejection — v0.1.0 + v0.2.0 +
 //     missing-sentinel surfaces as arm 16)
+//   - AMEND-A9 (foreign-function 0-vs-10 default registry — foreignReg field
+//     points at wasm.DefaultForeignFunctionRegistry by default)
+//   - AMEND-B2 (signed-i64 increment + unsigned-u64 record; dynamic-stats
+//     namespace `wasmcustom.<custom_name>` via per-plugin Registry SCOPE)
 //   - parent SPEC §6.1 (wording discipline) + §6.2 (18-arm roster) + §12-D-P5
-//     (D-P5 closure anchor at this Task)
+//     (D-P5 closure anchor at 25.1 Task 9)
 //   - 25.1 SPEC §4.2 (compiledConfig + filterStats wiring)
+//   - 25.2 SPEC §4.2 (compiledConfig EXTENDED with rootVM + 4 envoy-go-strict-
+//     only cap fields + dynStats + foreignReg) + §6.2 (6 NEW PARSE-REJECT
+//     arms) + §7.4 (4 envoy-go-strict-only PluginConfig config fields per Qs
+//     2/6/9) + §12-D-25.2-P5 (6 NEW arm byte-stable wording closure at Task 14)
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	wasmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/wasm/v3"
 	wasmcommonv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/wasm/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/stats/dynamic"
 	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
 )
 
@@ -226,6 +285,80 @@ const (
 	// parseRejectPerRouteUnsupported constant in wasm.go is byte-equal (pinned
 	// by TestParseRejectArm18_AliasedFromWasmGo).
 	parseRejectPerRouteDeferredTo253 = "wasm: per-route configuration is not yet supported (lands in phase 25.3)"
+
+	// -------------------------------------------------------------------------
+	// 25.2 NEW PARSE-REJECT arms (per 25.2 SPEC §6.2 + D-25.2-P5 closure at
+	// Task 14). 6 arms cover the 4 envoy-go-strict-only PluginConfig config
+	// fields (zero-validators + body-buffer overlarge ceiling) + cross-
+	// PluginConfig duplicate name registry.
+	// -------------------------------------------------------------------------
+
+	// Arm 19: envoy_go_strict_body_buffer_cap_bytes is 0. Triggered by the
+	// envoy-go-strict-only field-validator at parse time. envoy-go-strict
+	// departure: upstream Envoy has no equivalent in-filter body buffer cap;
+	// upstream relies on HCM-level + listener-level memory ceilings. envoy-
+	// go-strict adds defense-in-depth against PAUSE-loop guest patterns per
+	// Q2 + 25.2 SPEC §2.3 + parent §6.2 25.2 forward-pointer.
+	parseRejectEnvoyGoStrictBodyBufferCapBytesZero = "wasm: config.envoy_go_strict_body_buffer_cap_bytes must be > 0 (envoy-go-strict)"
+
+	// Arm 20: envoy_go_strict_shared_data_value_cap_bytes is 0. Triggered by
+	// the envoy-go-strict-only field-validator at parse time. envoy-go-strict
+	// departure: upstream Envoy has no equivalent per-value cap on the shared-
+	// data map; envoy-go-strict adds defense-in-depth against unbounded value
+	// growth per Q6 + 25.2 SPEC §3.1 internal/wasm/shared_data.go.
+	parseRejectEnvoyGoStrictSharedDataValueCapBytesZero = "wasm: config.envoy_go_strict_shared_data_value_cap_bytes must be > 0 (envoy-go-strict)"
+
+	// Arm 21: envoy_go_strict_shared_data_max_entries is 0. Triggered by the
+	// envoy-go-strict-only field-validator at parse time. envoy-go-strict
+	// departure: upstream Envoy has no equivalent entry-count cap on the
+	// shared-data map; envoy-go-strict adds defense-in-depth against
+	// unbounded map-entry growth per Q6.
+	parseRejectEnvoyGoStrictSharedDataMaxEntriesZero = "wasm: config.envoy_go_strict_shared_data_max_entries must be > 0 (envoy-go-strict)"
+
+	// Arm 22: envoy_go_strict_dynamic_stats_max_entries is 0. Triggered by
+	// the envoy-go-strict-only field-validator at parse time. envoy-go-strict
+	// departure: upstream Envoy has no equivalent entry-count cap on the
+	// dynamic-stats `wasmcustom.<custom_name>` namespace; envoy-go-strict
+	// adds defense-in-depth against unbounded metric-name growth per Q9 +
+	// AMEND-B2 + 25.2 SPEC §3.3 internal/stats/dynamic/.
+	parseRejectEnvoyGoStrictDynamicStatsMaxEntriesZero = "wasm: config.envoy_go_strict_dynamic_stats_max_entries must be > 0 (envoy-go-strict)"
+
+	// Arm 23: envoy_go_strict_body_buffer_cap_bytes > 1 GiB (1<<30 = 1073741824
+	// bytes). %d-formatted at the use site with the offending value. Triggered
+	// by the envoy-go-strict-only field-validator at parse time. envoy-go-
+	// strict ceiling defense-in-depth: operators wanting >1 GiB body buffers
+	// should re-architect via body-streaming rather than buffer-and-process
+	// per Q2 + 25.2 SPEC §2.3.
+	parseRejectEnvoyGoStrictBodyBufferCapBytesOverlarge = "wasm: config.envoy_go_strict_body_buffer_cap_bytes %d exceeds 1 GiB ceiling (envoy-go-strict)"
+
+	// Arm 26: cross-PluginConfig duplicate PluginConfig.name. Two PluginConfig
+	// entries within the same listener (or across listeners within the same
+	// process) carry the same non-empty PluginConfig.name. envoy-go-strict
+	// requires per-plugin scope uniqueness because the 5-counter envoy-go-
+	// strict tri-group bundle (per AMEND-A2 Group-C) + the per-plugin *dynamic.
+	// Registry (per AMEND-B2) both key off `wasm.<plugin_name>.*`; duplicate
+	// names would collide at stat-name registration time AND obscure operator
+	// metrics. %q-formatted at the use site with the offending name. Per
+	// 25.2 SPEC §6.2 arm 26.
+	//
+	// Implementation: process-wide registered names map under a small mutex;
+	// buildCompiledConfig consults the registry at parse time + adds on
+	// success. Listener-drain time the compiledConfig's release path SHOULD
+	// remove the entry; at 25.2 a release hook is NOT yet wired (the listener
+	// lifecycle hook from the framework lands at 25.3 multi-plugin VM-sharing).
+	// At 25.2 a process-wide append-only registry is acceptable — operator
+	// reconfigs that rename a plugin will incur a cap-exhaustion-style growth
+	// in the registry (one entry per unique name ever observed); for typical
+	// operator workflows (steady-state plugin names) this is benign.
+	//
+	// Empty PluginConfig.name is NOT considered a collision trigger — the
+	// empty name produces literal consecutive-dot wire names (per AMEND-A2
+	// stat-name discipline) and the stats registry tolerates the form;
+	// duplicate-empty-name collisions would surface at the underlying stats
+	// registration layer as a duplicate-counter panic per ADR-0072 boot-time-
+	// fail-fast. The arm-26 validator focuses on non-empty names where the
+	// operator's intent is unambiguous.
+	parseRejectCrossPluginConfigDuplicatePluginConfigName = "wasm: config.name %q is duplicated across PluginConfig entries (per-plugin stat-scope uniqueness; envoy-go-strict)"
 )
 
 // -----------------------------------------------------------------------------
@@ -233,13 +366,31 @@ const (
 // -----------------------------------------------------------------------------
 
 // compiledConfig is the per-listener immutable post-parse Wasm filter config
-// per 25.1 SPEC §4.2. Populated by buildCompiledConfig at HCM-build time per
-// ADR-0072 boot-time-fail-fast. Closure-captured by the per-stream *filter.cfg
-// pointer allocated at the (Task 12) New factory body.
+// per 25.1 SPEC §4.2 + 25.2 SPEC §4.2. Populated by buildCompiledConfig at
+// HCM-build time per ADR-0072 boot-time-fail-fast. Closure-captured by the
+// per-stream *filter.cfg pointer allocated at the New factory body.
 //
-// Field-final at 25.1; 25.2 extends with body/trailer/property-tree state;
-// 25.3 extends with per-route + multi-plugin VM-sharing state. 25.1
-// reserves no fields for future deltas; field-additive growth at 25.2 + 25.3.
+// 25.2 EXTENSIONS (per 25.2 SPEC §4.2 + ADR-0205 + ADR-0206 + ADR-0208):
+//
+//   - rootVM: long-lived per-compiledConfig VM (replaces 25.1 per-stream
+//     *wasm.VM construction); constructed at New() via wasm.NewRootVM;
+//     shared across all per-stream contexts; owns tick goroutine + shared-
+//     data map + httpCall routing + foreign-function view + dynamic-stats
+//     Registry.
+//   - bodyBufferCapBytes / sharedDataValueCapBytes / sharedDataMaxEntries /
+//     dynStatsMaxEntries: 4 envoy-go-strict-only cap fields per Qs 2/6/9 +
+//     25.2 SPEC §7.4 parsed from PluginConfig.configuration via the
+//     `envoy_go_strict` typed sub-Struct.
+//   - dynStats: per-plugin *dynamic.Registry (per Q9 + AMEND-B2) rooted at
+//     pluginScope `wasm.<pluginName>`; produces `wasmcustom.<custom_name>`
+//     dynamic-stats names.
+//   - foreignReg: per-plugin foreign-function registry view (per AMEND-A9);
+//     points at wasm.DefaultForeignFunctionRegistry by default (EMPTY at
+//     boot per envoy-go-strict departure record #4); testable seam.
+//
+// Field-additive growth: 25.1 → 25.2 adds 8 fields (rootVM + 4 caps +
+// dynStats + foreignReg). 25.3 extends with per-route + multi-plugin VM-
+// sharing state.
 type compiledConfig struct {
 	// module is the wazero-compiled wasm bytecode + ABI-version sentinel +
 	// content-hash key. Returned by wasm.CompileModule; cross-VM-reusable
@@ -282,11 +433,90 @@ type compiledConfig struct {
 	// (PluginConfig.configuration unset).
 	pluginConfig []byte
 
-	// stats is the SHARED 5-counter stat-surface per AMEND-A2. Populated by
-	// newFilterStats(reg, pluginName) inside buildCompiledConfig when
-	// factoryCtx.Stats is non-nil (per ADR-0085 nil-tolerance); nil under
-	// test-double paths.
+	// stats is the SHARED 5-counter stat-surface per AMEND-A2 (EXTENDED to
+	// 14 counters at 25.2 per Q9 + AMEND-B3 — extension lands at Task 17
+	// stats.go body). Populated by newFilterStats(reg, pluginName) inside
+	// buildCompiledConfig when factoryCtx.Stats is non-nil (per ADR-0085
+	// nil-tolerance); nil under test-double paths.
 	stats *filterStats
+
+	// -------------------------------------------------------------------------
+	// 25.2 EXTENSIONS (per 25.2 SPEC §4.2 + ADR-0205 + ADR-0206 + ADR-0208).
+	// -------------------------------------------------------------------------
+
+	// rootVM is the long-lived per-compiledConfig *wasm.RootVM per Q3 +
+	// ADR-0205. Replaces 25.1's per-stream *wasm.VM construction (the per-
+	// stream lazy-VM-construction path in decode_headers.go is RETIRED at
+	// Task 18 which closes the whole-repo build per D-P-PLAN-6). Constructed
+	// at New() via wasm.NewRootVM; owns the tick goroutine + shared-data
+	// map + httpCall routing + foreign-function view + dynamic-stats Registry;
+	// shared (read-only after Configure) across all per-stream contexts. May
+	// be nil in test-double paths that exercise compiledConfig pre-RootVM-
+	// construction (e.g. PARSE-REJECT-arm tests that fail BEFORE the RootVM
+	// allocation site below).
+	rootVM *internalwasm.RootVM
+
+	// bodyBufferCapBytes — default 16 MiB (16777216) per Q2 + 25.2 SPEC §7.4.
+	// Parsed from PluginConfig.configuration → envoy_go_strict sub-Struct →
+	// "body_buffer_cap_bytes" key. Consumed by the per-stream body
+	// accumulator at Task 16 body.go (cap-exceeded → 413 + body_buffer_cap_
+	// exceeded counter + envoy_go.failures counter per §2.25). PARSE-REJECT
+	// arm 19 (==0) + arm 23 (>1<<30).
+	bodyBufferCapBytes uint32
+
+	// sharedDataValueCapBytes — default 1 MiB (1048576) per Q6 + 25.2 SPEC
+	// §7.4. Parsed from PluginConfig.configuration → envoy_go_strict sub-
+	// Struct → "shared_data_value_cap_bytes" key. Threaded to the *RootVM
+	// via wasm.WithRootSharedDataCaps. PARSE-REJECT arm 20 (==0).
+	sharedDataValueCapBytes uint32
+
+	// sharedDataMaxEntries — default 1024 per Q6 + 25.2 SPEC §7.4. Parsed
+	// from PluginConfig.configuration → envoy_go_strict sub-Struct →
+	// "shared_data_max_entries" key. Threaded to the *RootVM via
+	// wasm.WithRootSharedDataCaps. PARSE-REJECT arm 21 (==0).
+	sharedDataMaxEntries uint32
+
+	// dynStatsMaxEntries — default 1024 per Q9 + 25.2 SPEC §7.4. Parsed from
+	// PluginConfig.configuration → envoy_go_strict sub-Struct →
+	// "dynamic_stats_max_entries" key. Passed to dynamic.NewRegistry as the
+	// maxEntries cap argument. PARSE-REJECT arm 22 (==0).
+	dynStatsMaxEntries uint32
+
+	// dynStats is the per-plugin *dynamic.Registry per Q9 + AMEND-B2 +
+	// ADR-0208. Constructed at New() via dynamic.NewRegistry(factoryCtx.Stats,
+	// "wasm."+pluginName, dynStatsMaxEntries). The Registry produces stat
+	// names `wasmcustom.<custom_name>` under the per-plugin scope; admin
+	// `/stats` enumerates as `wasm.<pluginName>.wasmcustom.<custom_name>`.
+	// Threaded to the *RootVM via wasm.WithRootDynamicStats; consumed by
+	// proxy_define_metric / proxy_increment_metric / proxy_record_metric /
+	// proxy_get_metric host shims (Task 12). May be nil in test-double paths
+	// where factoryCtx.Stats is nil (per ADR-0085 nil-tolerance — dynamic.
+	// NewRegistry(nil, ...) returns nil).
+	dynStats *dynamic.Registry
+
+	// foreignReg is the per-plugin foreign-function registry view per AMEND-A9
+	// + Task 7 internal/wasm/foreign.go. Points at the process-global
+	// wasm.DefaultForeignFunctionRegistry by default (EMPTY at boot per
+	// envoy-go-strict departure record #4 — operators register via
+	// wasm.RegisterForeignFunction at boot). The per-plugin field exists as
+	// a testable seam (test fixtures can construct a per-plugin Registry
+	// without touching the process-global state). Threaded to the *RootVM
+	// via wasm.WithRootForeignRegistry; consumed by proxy_call_foreign_function
+	// host shim (Task 7).
+	foreignReg *internalwasm.ForeignFunctionRegistry
+
+	// rootCB is the per-RootVM rootABICallbacks multiplexer registered at
+	// buildCompiledConfig time via rootVM.RegisterABICallbacks per Task 18
+	// closure of D-P-PLAN-6. The multiplexer holds a streamCtxID → per-
+	// stream *abiCallbacks map; per-stream filters register themselves at
+	// decode_headers.go initStreamContext (after rootVM.NewStreamContext
+	// returns the StreamContext) + deregister at encode_headers.go
+	// OnDestroy (after streamCtx.Close). Per ADR-0205 the rootABICallbacks
+	// is per-RootVM; each compiledConfig owns one. May be nil in test-
+	// double paths that bypass buildCompiledConfig (e.g.
+	// body_test.go's newBodyTestCompiledConfig); production callers always
+	// populate via buildCompiledConfig.
+	rootCB *rootABICallbacks
 }
 
 // rootContextIDCounter allocates fresh u32 root context IDs at compiledConfig
@@ -297,17 +527,163 @@ type compiledConfig struct {
 var rootContextIDCounter atomic.Uint32
 
 // -----------------------------------------------------------------------------
+// 25.2 envoy-go-strict-only cap defaults + ceilings (per Qs 2/6/9 + 25.2 SPEC
+// §7.4 + ADR-0208).
+// -----------------------------------------------------------------------------
+
+const (
+	// defaultBodyBufferCapBytes is the 16 MiB envoy-go-strict default body
+	// buffer cap per Q2 + 25.2 SPEC §7.4. Operator-overridable via the
+	// envoy_go_strict.body_buffer_cap_bytes config field (PARSE-REJECT arm
+	// 19 + arm 23 enforce 0 < value ≤ bodyBufferCapBytesCeiling).
+	defaultBodyBufferCapBytes uint32 = 16 * 1024 * 1024 // 16777216
+
+	// defaultSharedDataValueCapBytes is the 1 MiB envoy-go-strict default
+	// per-value cap on the shared-data map per Q6 + 25.2 SPEC §7.4.
+	defaultSharedDataValueCapBytes uint32 = 1024 * 1024 // 1048576
+
+	// defaultSharedDataMaxEntries is the 1024-entry envoy-go-strict default
+	// cap on the shared-data map's entry count per Q6 + 25.2 SPEC §7.4.
+	defaultSharedDataMaxEntries uint32 = 1024
+
+	// defaultDynamicStatsMaxEntries is the 1024-entry envoy-go-strict
+	// default cap on the per-plugin dynamic-stats namespace per Q9 +
+	// AMEND-B2 + 25.2 SPEC §7.4.
+	defaultDynamicStatsMaxEntries uint32 = 1024
+
+	// bodyBufferCapBytesCeiling is the 1 GiB ceiling (1<<30 = 1073741824
+	// bytes) for the envoy-go-strict body buffer cap field per arm 23 +
+	// 25.2 SPEC §6.2. Operators wanting >1 GiB body buffers should re-
+	// architect via body-streaming rather than buffer-and-process per the
+	// rationale at 25.2 SPEC §6.2 arm 23.
+	bodyBufferCapBytesCeiling uint32 = 1 << 30 // 1073741824
+)
+
+// -----------------------------------------------------------------------------
+// envoy-go-strict sub-Struct key names (per 25.2 SPEC §7.4 + ADR-0208).
+//
+// Parsing mechanism (D-25.2-P5 first-action choice; per 25.2 SPEC §7.4
+// anticipation): the 4 envoy-go-strict-only PluginConfig config fields are
+// carried inside a typed structpb.Struct at PluginConfig.configuration.Any.
+// The Any TypeURL must be "type.googleapis.com/google.protobuf.Struct" (the
+// well-known Struct wire-URL). The Struct's top-level Fields map carries an
+// "envoy_go_strict" key whose StructValue holds the 4 cap subfields:
+//
+//   envoy_go_strict:
+//     body_buffer_cap_bytes:        <number> (uint32 default 16777216 = 16 MiB)
+//     shared_data_value_cap_bytes:  <number> (uint32 default 1048576 = 1 MiB)
+//     shared_data_max_entries:      <number> (uint32 default 1024)
+//     dynamic_stats_max_entries:    <number> (uint32 default 1024)
+//
+// Rationale (D-25.2-P5 partial closure): mirrors the phase-22.2 lua
+// `:filterState()` precedent for typed-Struct-in-Any configuration carriage
+// + works with any operator wire format (YAML / JSON / xDS) that emits a
+// Struct. NO custom envoy-go protobuf extension required at 25.2.
+//
+// PluginConfig.configuration is OPTIONAL: when unset, the 4 cap fields take
+// their defaults (no PARSE-REJECT arm fires). When set but the Any TypeURL
+// is NOT google.protobuf.Struct, the envoy-go-strict block is silently
+// ignored (preserves operator flexibility to carry a non-Struct guest-side
+// configuration payload — the guest reads cfg.pluginConfig raw bytes via
+// proxy_on_configure at Task 12). When set AND the Any unwraps to a Struct
+// but lacks the "envoy_go_strict" key, the 4 cap fields take their defaults.
+// When set AND the "envoy_go_strict" subobject is present but a specific
+// cap field is missing, that field takes its default; only EXPLICITLY-SET
+// fields trigger PARSE-REJECT arms 19-23.
+//
+// Wire-key strings are byte-stable; renames require a parent-SPEC + ADR-0208
+// lockstep edit per ADR-0044 atomic-edit discipline. Pinned via
+// TestEnvoyGoStrictKeyConstants_ByteStable at compiled_config_test.go.
+// -----------------------------------------------------------------------------
+
+const (
+	// envoyGoStrictKey is the top-level Struct field name carrying the
+	// envoy-go-strict-only PluginConfig extensions.
+	envoyGoStrictKey = "envoy_go_strict"
+
+	// envoyGoStrictBodyBufferCapBytesKey carries the 16 MiB-default body
+	// buffer cap (Q2).
+	envoyGoStrictBodyBufferCapBytesKey = "body_buffer_cap_bytes"
+
+	// envoyGoStrictSharedDataValueCapBytesKey carries the 1 MiB-default
+	// per-value shared-data cap (Q6).
+	envoyGoStrictSharedDataValueCapBytesKey = "shared_data_value_cap_bytes"
+
+	// envoyGoStrictSharedDataMaxEntriesKey carries the 1024-default entry-
+	// count shared-data cap (Q6).
+	envoyGoStrictSharedDataMaxEntriesKey = "shared_data_max_entries"
+
+	// envoyGoStrictDynamicStatsMaxEntriesKey carries the 1024-default
+	// dynamic-stats namespace entry-count cap (Q9 + AMEND-B2).
+	envoyGoStrictDynamicStatsMaxEntriesKey = "dynamic_stats_max_entries"
+)
+
+// -----------------------------------------------------------------------------
+// Process-wide PluginConfig.name registry (per arm 26 + 25.2 SPEC §6.2).
+//
+// Cross-PluginConfig duplicate-name detection at parse time per arm 26.
+// The 5-counter envoy-go-strict tri-group bundle (AMEND-A2 Group-C) + the
+// per-plugin *dynamic.Registry both key off `wasm.<plugin_name>.*`; duplicate
+// names would collide at stat-name registration time AND obscure operator
+// metrics. The registry is process-wide + append-only at 25.2; the listener-
+// release hook that removes entries lands at 25.3 multi-plugin VM-sharing.
+//
+// Empty PluginConfig.name skips the duplicate-check (zero-value names produce
+// literal consecutive-dot wire names per AMEND-A2 — they collide elsewhere
+// at the underlying stats registration layer via ADR-0072 boot-time-fail-
+// fast). The arm-26 validator focuses on non-empty names where operator
+// intent is unambiguous.
+// -----------------------------------------------------------------------------
+
+var (
+	pluginNameRegistryMu sync.Mutex
+	pluginNameRegistry   = make(map[string]struct{})
+)
+
+// registerPluginConfigName claims the given non-empty pluginConfigName
+// process-wide. Returns nil on first claim; returns the arm-26 PARSE-REJECT
+// error on duplicate. Empty pluginConfigName always returns nil (no
+// claim, no check) per the empty-name carve-out documented above.
+//
+// Per ADR-0072 boot-time-fail-fast: any PARSE-REJECT surfaces at HCM-build
+// time + bubbles out the New factory to the operator.
+func registerPluginConfigName(pluginConfigName string) error {
+	if pluginConfigName == "" {
+		return nil
+	}
+	pluginNameRegistryMu.Lock()
+	defer pluginNameRegistryMu.Unlock()
+	if _, dup := pluginNameRegistry[pluginConfigName]; dup {
+		return fmt.Errorf(parseRejectCrossPluginConfigDuplicatePluginConfigName, pluginConfigName)
+	}
+	pluginNameRegistry[pluginConfigName] = struct{}{}
+	return nil
+}
+
+// resetPluginConfigNameRegistry clears the process-wide PluginConfig.name
+// registry. Test-only helper; NOT exported. Production code never calls
+// this — the registry is append-only at 25.2 per the comment block above.
+// Test code (compiled_config_test.go) MUST call this between subtests that
+// exercise duplicate-name paths to keep cross-test state clean.
+func resetPluginConfigNameRegistry() {
+	pluginNameRegistryMu.Lock()
+	defer pluginNameRegistryMu.Unlock()
+	pluginNameRegistry = make(map[string]struct{})
+}
+
+// -----------------------------------------------------------------------------
 // buildCompiledConfig — full proto-parser body per 25.1 SPEC §6 Task 9 +
 // parent §6.2 18-arm PARSE-REJECT roster.
 // -----------------------------------------------------------------------------
 
 // buildCompiledConfig parses the Wasm proto envelope (wrapped in *anypb.Any) +
-// constructs the per-listener compiledConfig per 25.1 SPEC §4.2 + parent §6.2
-// 18-arm PARSE-REJECT roster. Per ADR-0072 boot-time-fail-fast: any validation
-// failure returns the byte-stable error string verbatim (or %w-wrapped for
-// arms 2 + 17).
+// constructs the per-listener compiledConfig per 25.1 SPEC §4.2 + 25.2 SPEC
+// §4.2 + parent §6.2 18-arm + 25.2 §6.2 6-NEW-arm PARSE-REJECT roster (24
+// arms cumulative). Per ADR-0072 boot-time-fail-fast: any validation failure
+// returns the byte-stable error string verbatim (or %w-wrapped for arms 2 +
+// 17; %d-formatted for arm 23; %q-formatted for arms 11 + 26).
 //
-// Arm ordering (parent §6.2):
+// Arm ordering (parent §6.2 + 25.2 §6.2 EXTENSION):
 //
 //  1. arm 1  — typedConfig nil
 //  2. arm 2  — typedConfig.UnmarshalTo(*Wasm) fails (wrapped)
@@ -324,19 +700,32 @@ var rootContextIDCounter atomic.Uint32
 //  13. arm 6  — AsyncDataSource.Remote set
 //  14. arm 7  — DataSource.watched_directory set
 //  15. arm 8  — DataSource specifier oneof unset
-//  16. resolveDataSource (Task 10): produces wasm src bytes OR arms 6-15
-//     DataSource-resolution sub-arms (lands at Task 10)
-//  17. arm 16 — wasm.CompileModule fails with errors.Is(err, ErrUnsupportedAbiVersion)
-//  18. arm 17 — wasm.CompileModule fails with any other error (wrapped)
+//  16. arms 19-23 (25.2 NEW) — envoy-go-strict-only PluginConfig cap field
+//     validators. Parse PluginConfig.configuration → envoy_go_strict sub-
+//     Struct + apply defaults. Arms ordered by field appearance in the
+//     parse-envoy-go-strict pipeline (body-buffer-zero → shared-data-value-
+//     cap-zero → shared-data-max-entries-zero → dynamic-stats-max-entries-
+//     zero → body-buffer-overlarge).
+//  17. arm 26 (25.2 NEW) — cross-PluginConfig duplicate PluginConfig.name.
+//     Fires AFTER cap validators succeed so the byte-stable wording for
+//     arms 19-23 wins on configs that trigger BOTH a cap-failure AND a
+//     duplicate name (arms 19-23 are the more-actionable error; arm 26
+//     would mask a config typo if it fired first). Ordered BEFORE the
+//     resolveDataSource pipeline so the duplicate-name registry isn't
+//     polluted by a name that later fails arm-16/17 ABI compilation.
+//  18. resolveDataSource (Task 10): produces wasm src bytes OR arms 6-15
+//     DataSource-resolution sub-arms.
+//  19. arm 16 — wasm.CompileModule fails with errors.Is(err, ErrUnsupportedAbiVersion)
+//  20. arm 17 — wasm.CompileModule fails with any other error (wrapped)
+//  21. wasm.NewRootVM construction (25.2 NEW): replaces 25.1's per-stream
+//     wasm.NewVM. Failure surfaces as a non-byte-stable wrapped error (the
+//     RootVM construction path is not in the PARSE-REJECT byte-stable roster;
+//     a failure here indicates a runtime issue + an unwrapped error from
+//     wasm.NewRootVM is returned).
 //
 // arm 18 (per-route) is enforced via the separate HCM RegisterPerRouteValidator
 // path in wasm.go::validatePerRouteWasm per ADR-0110 single-chokepoint; not a
 // buildCompiledConfig concern.
-//
-// At Task 9 `resolveDataSource` is a FORWARD STUB returning a sentinel error
-// so the buildCompiledConfig pipeline compiles + the pre-resolveDataSource
-// arms can be tested in isolation. Task 10 (`datasource.go`) replaces the
-// stub with the full 4-arm body.
 func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx envoyhttp.FactoryCtx) (*compiledConfig, error) {
 	// Arm 1: typed_config required.
 	if typedConfig == nil {
@@ -435,6 +824,36 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 		return nil, errors.New(parseRejectDataSourceSpecifierRequired)
 	}
 
+	// -------------------------------------------------------------------------
+	// 25.2 EXTENSION — envoy-go-strict-only cap fields + cross-PluginConfig
+	// duplicate-name validators (arms 19-23 + arm 26 per 25.2 SPEC §6.2 +
+	// D-25.2-P5).
+	//
+	// Parsing order:
+	//
+	//  (a) Parse PluginConfig.configuration → envoy_go_strict sub-Struct +
+	//      apply defaults (arms 19-23 fire if EXPLICITLY-SET fields are out
+	//      of range; defaults skip the arms).
+	//
+	//  (b) Cross-PluginConfig duplicate-name registry consult (arm 26).
+	//      Ordered AFTER cap validators so the more-actionable cap-error
+	//      surfaces first on configs that trigger BOTH a cap-failure AND a
+	//      duplicate name.
+	// -------------------------------------------------------------------------
+
+	bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries, dynStatsMaxEntries, err := parseEnvoyGoStrictFields(pc.GetConfiguration())
+	if err != nil {
+		// PARSE-REJECT arms 19-23 bubble up byte-stable per D-25.2-P5.
+		return nil, err
+	}
+
+	// Arm 26: cross-PluginConfig duplicate PluginConfig.name registry consult.
+	// Empty pluginName skips the check per the empty-name carve-out at
+	// registerPluginConfigName + the comment block at the registry decl.
+	if err := registerPluginConfigName(pc.GetName()); err != nil {
+		return nil, err
+	}
+
 	// Resolve DataSource bytes — DELEGATED to datasource.go at Task 10.
 	// At Task 9 this is a forward stub returning a sentinel error; Task 10
 	// implements the real 4-arm body (InlineBytes / InlineString / Filename /
@@ -444,7 +863,12 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 	if err != nil {
 		// PARSE-REJECT bubbles up. Task 10's resolveDataSource arms each
 		// already carry the byte-stable parseRejectDataSource* wording; at
-		// Task 9 the stub-error sentinel surfaces verbatim.
+		// Task 9 the stub-error sentinel surfaces verbatim. Unregister the
+		// PluginConfig.name from the cross-plugin registry so a subsequent
+		// retry with the same name (after the operator fixes the data-source
+		// resolution failure) doesn't phantom-trigger arm 26 per the same
+		// rollback discipline applied at the NewRootVM failure path below.
+		unregisterPluginConfigName(pc.GetName())
 		return nil, err
 	}
 
@@ -463,12 +887,14 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 			// Release the cache before returning — the listener never gets
 			// a compiledConfig back, so nothing else will Close it.
 			_ = cache.Close()
+			unregisterPluginConfigName(pc.GetName())
 			return nil, errors.New(parseRejectModuleAbiVersionRejected)
 		}
 		// Arm 17: any other compile failure (wazero parse error, bad section
 		// header, malformed import, etc.). Wrap with the byte-stable arm-17
 		// prefix; the inner error carries wazero-level context.
 		_ = cache.Close()
+		unregisterPluginConfigName(pc.GetName())
 		return nil, fmt.Errorf(parseRejectModuleCompileFailed, err)
 	}
 
@@ -484,16 +910,306 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 	// newFilterStats handles nil-registry by returning nil.
 	stats := newFilterStats(factoryCtx.Stats, pc.GetName())
 
+	// -------------------------------------------------------------------------
+	// 25.2 EXTENSION — per-plugin *dynamic.Registry + per-plugin
+	// *ForeignFunctionRegistry view + long-lived *RootVM construction (per
+	// 25.2 SPEC §4.2 + ADR-0205 + ADR-0206 + ADR-0208 + Tasks 1 / 7 / 11).
+	// -------------------------------------------------------------------------
+
+	// dynStats — per-plugin Registry per Q9 + AMEND-B2. Per ADR-0085 nil-
+	// tolerance: factoryCtx.Stats may be nil under test-double paths;
+	// dynamic.NewRegistry(nil, ...) returns nil (consumers nil-check).
+	// pluginScopePrefix is `wasm.<pluginName>` per AMEND-B2 (the per-plugin
+	// scope under which the `wasmcustom.<custom_name>` namespace lives —
+	// admin /stats enumerates as `wasm.<pluginName>.wasmcustom.<custom_name>`
+	// while the wire-shape from the proxy-wasm perspective is byte-faithful
+	// to `wasmcustom.<custom_name>`).
+	dynStats := dynamic.NewRegistry(factoryCtx.Stats, "wasm."+pc.GetName(), dynStatsMaxEntries)
+
+	// foreignReg — per-plugin view of the process-global ForeignFunctionRegistry
+	// per AMEND-A9 + Task 7. EMPTY default registry at boot per envoy-go-
+	// strict departure record #4; operators register via
+	// wasm.RegisterForeignFunction at boot. The per-plugin field exists as
+	// a testable seam.
+	foreignReg := internalwasm.DefaultForeignFunctionRegistry
+
+	// rootVM — long-lived per-compiledConfig VM per Q3 + ADR-0205. Replaces
+	// 25.1's per-stream wasm.NewVM. Constructed ONCE at New() per
+	// compiledConfig; the tick goroutine starts immediately (idle until
+	// proxy_set_tick_period_milliseconds fires); the shared-data map is
+	// initialized empty; the httpCall routing state is empty; the foreign-
+	// function registry view + dynamic-stats Registry are wired via the
+	// per-option setters below. The wazero.CompilationCache from the per-
+	// compiledConfig CompileCache (Task 5) is wired in via
+	// WithRootCompilationCache so the RootVM's internal re-compile of
+	// module.Source against the runtime hits the shared codegen cache as a
+	// sub-ms lookup.
+	rootOpts := []internalwasm.RootVMOption{
+		internalwasm.WithRootSandboxConfig(sandbox),
+		internalwasm.WithRootSharedDataCaps(sharedDataValueCap, sharedDataMaxEntries),
+		internalwasm.WithRootForeignRegistry(foreignReg),
+	}
+	if dynStats != nil {
+		rootOpts = append(rootOpts, internalwasm.WithRootDynamicStats(dynStats))
+	}
+	// Wire the per-plugin RootStatsRecorder per 25.2 IMPL Task 20 follow-up
+	// (Concern 2 — counter-glue wiring gap). *filterStats satisfies the
+	// internalwasm.RootStatsRecorder interface via thin per-counter wrapper
+	// methods at internal/filter/http/wasm/stats.go; the wasm package holds
+	// the recorder reference indirectly so it can bump the 9 NEW envoy-go-
+	// strict counters per §7.1 + AMEND-B3 from its hostcall bodies without
+	// importing the filter package (avoids cycle). Per ADR-0085 nil-
+	// tolerance: when stats is nil (test-double paths), WithRootStats
+	// converts internally to noopStatsRecorder; the hostcall bodies' .Inc()
+	// calls become zero-cost no-ops.
+	if stats != nil {
+		rootOpts = append(rootOpts, internalwasm.WithRootStats(stats))
+	}
+	// Wire the production HTTPDispatcher adapter per 25.2 IMPL Task 20 fix-up
+	// #2 (closes the wiring gap that blocked fixture-0036 arms (l) httpCall-
+	// success + (m) httpCall-unknown-cluster). The adapter wraps the per-
+	// listener *cluster.Manager + the shared *httpclient.Client framework
+	// primitive (the SAME phase-20 ADR-0177 surface consumed by phase-22.2
+	// lua's :httpCall() at the 2nd co-consumer). Per ADR-0085 nil-tolerance:
+	// when EITHER FactoryCtx pointer is nil (test-double paths that bypass
+	// full FactoryCtx wiring), the dispatcher is NOT wired + proxy_http_call
+	// returns WasmResultInternalFailure per the documented no-dispatcher
+	// contract. Production callers always supply both pointers per the
+	// phase-18.2 + phase-20 first-use anchors.
+	if factoryCtx.ClusterManager != nil && factoryCtx.HTTPClient != nil {
+		rootOpts = append(rootOpts, internalwasm.WithRootHTTPDispatcher(
+			newWasmHTTPDispatcher(factoryCtx.ClusterManager, factoryCtx.HTTPClient),
+		))
+	}
+	if wc := cache.WazeroCompilationCache(); wc != nil {
+		rootOpts = append(rootOpts, internalwasm.WithRootCompilationCache(wc))
+	}
+	// Clock seam injection per 25.2 IMPL Task 16 tick_clock.go. The package-
+	// level resolveClock() returns nil under production callers (the
+	// framework-layer default at wasm.NewRootVM fires + rv.clk = clock.
+	// RealClock{}); test callers inject a clock.FakeClock via withTestClock
+	// for deterministic fixture-0036 tick-fires-counter coverage.
+	if clk := resolveClock(); clk != nil {
+		rootOpts = append(rootOpts, internalwasm.WithRootClock(clk))
+	}
+	rootVM, err := internalwasm.NewRootVM(ctx, mod, rootCtxID, rootOpts...)
+	if err != nil {
+		// Release the cache before returning — the listener never gets a
+		// compiledConfig back, so nothing else will Close it. Also unregister
+		// the PluginConfig.name from the cross-plugin registry to keep the
+		// retry path clean (operator re-applies the same config after fixing
+		// a runtime issue + would otherwise see a phantom arm-26 dupe).
+		_ = cache.Close()
+		unregisterPluginConfigName(pc.GetName())
+		return nil, fmt.Errorf("wasm: NewRootVM: %w", err)
+	}
+
+	// Per Task 18 closure of D-P-PLAN-6: construct the per-RootVM
+	// rootABICallbacks multiplexer + register it on the RootVM so guest
+	// hostcalls route through the multiplexer's streamCtxID lookup. The
+	// per-stream *abiCallbacks are registered into the multiplexer at
+	// decode_headers.go initStreamContext (per stream) + deregistered at
+	// encode_headers.go OnDestroy.
+	rootCB := newRootABICallbacks(rootVM)
+	rootVM.RegisterABICallbacks(rootCB)
+
+	// Drive the per-RootVM Configure lifecycle (_initialize/_start +
+	// proxy_on_context_create(rootCtxID, 0) + proxy_on_vm_start +
+	// proxy_on_configure per 25.2 SPEC §3.1). The root context is the
+	// SHARED context across all per-stream children; the guest's
+	// per-stream contexts are seeded by NewStreamContext (per Task 1) at
+	// decode_headers.go init time. A Configure failure aborts the
+	// compiledConfig construction + tears down the RootVM + releases the
+	// cache.
+	if err := rootVM.Configure(ctx, vm.GetConfiguration().GetValue(), pc.GetConfiguration().GetValue()); err != nil {
+		_ = rootVM.Close()
+		_ = cache.Close()
+		unregisterPluginConfigName(pc.GetName())
+		return nil, fmt.Errorf("wasm: RootVM.Configure: %w", err)
+	}
+
 	return &compiledConfig{
-		module:        mod,
-		compileCache:  cache,
-		sandbox:       sandbox,
-		pluginName:    pc.GetName(),
-		rootContextID: rootCtxID,
-		vmConfig:      vm.GetConfiguration().GetValue(),
-		pluginConfig:  pc.GetConfiguration().GetValue(),
-		stats:         stats,
+		module:                  mod,
+		compileCache:            cache,
+		sandbox:                 sandbox,
+		pluginName:              pc.GetName(),
+		rootContextID:           rootCtxID,
+		vmConfig:                vm.GetConfiguration().GetValue(),
+		pluginConfig:            pc.GetConfiguration().GetValue(),
+		stats:                   stats,
+		rootVM:                  rootVM,
+		bodyBufferCapBytes:      bodyBufferCap,
+		sharedDataValueCapBytes: sharedDataValueCap,
+		sharedDataMaxEntries:    sharedDataMaxEntries,
+		dynStatsMaxEntries:      dynStatsMaxEntries,
+		dynStats:                dynStats,
+		foreignReg:              foreignReg,
+		rootCB:                  rootCB,
 	}, nil
+}
+
+// unregisterPluginConfigName releases the given pluginConfigName from the
+// process-wide registry. Called on the construction-failure rollback path
+// (arm 16/17 OR the wasm.NewRootVM error path) so a subsequent retry with
+// the SAME name doesn't phantom-trigger arm 26.
+//
+// Empty pluginConfigName is a no-op (the empty-name carve-out at
+// registerPluginConfigName means the entry was never claimed).
+func unregisterPluginConfigName(pluginConfigName string) {
+	if pluginConfigName == "" {
+		return
+	}
+	pluginNameRegistryMu.Lock()
+	defer pluginNameRegistryMu.Unlock()
+	delete(pluginNameRegistry, pluginConfigName)
+}
+
+// -----------------------------------------------------------------------------
+// parseEnvoyGoStrictFields — PluginConfig.configuration → 4 envoy-go-strict-
+// only cap fields per 25.2 SPEC §7.4 + ADR-0208 + Qs 2/6/9. Lands PARSE-
+// REJECT arms 19-23 byte-stable per D-25.2-P5.
+// -----------------------------------------------------------------------------
+
+// parseEnvoyGoStrictFields extracts the 4 envoy-go-strict-only cap fields
+// from PluginConfig.configuration and returns them with defaults applied for
+// missing keys. Returns the byte-stable PARSE-REJECT arm-19/20/21/22/23
+// error when a field is EXPLICITLY-SET out of range.
+//
+// Parsing mechanism (per the constants block above):
+//
+//  1. If PluginConfig.configuration is nil (unset), all 4 fields take their
+//     defaults; no PARSE-REJECT fires.
+//  2. If PluginConfig.configuration is set but its Any TypeURL is NOT
+//     "type.googleapis.com/google.protobuf.Struct", the envoy-go-strict
+//     block is silently ignored (operator may carry a guest-only payload
+//     in PluginConfig.configuration); all 4 fields take their defaults.
+//  3. If the Any unwraps to a Struct but lacks the "envoy_go_strict" top-
+//     level key, all 4 fields take their defaults.
+//  4. If the "envoy_go_strict" sub-Struct is present, each of the 4 cap
+//     subkeys is read INDIVIDUALLY: missing keys take defaults; PRESENT
+//     keys validate against arms 19-23 (zero → arm 19/20/21/22; >1<<30
+//     → arm 23 for body_buffer_cap_bytes).
+//  5. Non-number value-types under recognized keys are PARSE-REJECTed via
+//     the same zero-arm path (the typed-Struct → uint32 conversion below
+//     produces 0 for non-number wrappers, which then trips the
+//     "must be > 0" arm). This is a deliberate carve-out: operators who
+//     pass a string instead of a number get the "must be > 0" wording.
+//
+// Returns (bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries,
+// dynStatsMaxEntries, err).
+func parseEnvoyGoStrictFields(any *anypb.Any) (uint32, uint32, uint32, uint32, error) {
+	// Defaults applied unconditionally first; explicit subkey values
+	// overwrite below.
+	bodyBufferCap := defaultBodyBufferCapBytes
+	sharedDataValueCap := defaultSharedDataValueCapBytes
+	sharedDataMaxEntries := defaultSharedDataMaxEntries
+	dynStatsMaxEntries := defaultDynamicStatsMaxEntries
+
+	// Step 1: PluginConfig.configuration unset ⇒ defaults.
+	if any == nil {
+		return bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries, dynStatsMaxEntries, nil
+	}
+
+	// Step 2: PluginConfig.configuration set; unwrap to Struct OR ignore.
+	// MessageIs short-circuits if the TypeURL doesn't match google.protobuf.
+	// Struct. The non-Struct path returns defaults (operator's guest-only
+	// payload).
+	if !any.MessageIs(&structpb.Struct{}) {
+		return bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries, dynStatsMaxEntries, nil
+	}
+	configStruct := &structpb.Struct{}
+	if err := any.UnmarshalTo(configStruct); err != nil {
+		// Defensive: a TypeURL match should always unmarshal, but the
+		// payload may be truncated/corrupted. Silently ignore the envoy-
+		// go-strict block on unmarshal failure (the same envelope still
+		// flows downstream to the guest via pluginConfig bytes).
+		return bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries, dynStatsMaxEntries, nil
+	}
+
+	// Step 3: top-level "envoy_go_strict" key. Missing ⇒ defaults.
+	rawStrict, ok := configStruct.GetFields()[envoyGoStrictKey]
+	if !ok || rawStrict == nil {
+		return bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries, dynStatsMaxEntries, nil
+	}
+	strictStruct := rawStrict.GetStructValue()
+	if strictStruct == nil {
+		// "envoy_go_strict" key present but not a StructValue (operator
+		// passed e.g. a number or a string). Silently take defaults rather
+		// than reject — the operator intent is ambiguous + the arms fire
+		// on the per-subkey validation below if the value were a number-
+		// containing Struct.
+		return bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries, dynStatsMaxEntries, nil
+	}
+	strictFields := strictStruct.GetFields()
+
+	// Step 4: per-subkey extraction with PARSE-REJECT arms 19-23.
+
+	// Arm 19: body_buffer_cap_bytes (zero); Arm 23: body_buffer_cap_bytes
+	// (overlarge).
+	if v, present := strictFields[envoyGoStrictBodyBufferCapBytesKey]; present {
+		bodyBufferCap = structValueToUint32(v)
+		if bodyBufferCap == 0 {
+			return 0, 0, 0, 0, errors.New(parseRejectEnvoyGoStrictBodyBufferCapBytesZero)
+		}
+		if bodyBufferCap > bodyBufferCapBytesCeiling {
+			return 0, 0, 0, 0, fmt.Errorf(parseRejectEnvoyGoStrictBodyBufferCapBytesOverlarge, bodyBufferCap)
+		}
+	}
+
+	// Arm 20: shared_data_value_cap_bytes (zero).
+	if v, present := strictFields[envoyGoStrictSharedDataValueCapBytesKey]; present {
+		sharedDataValueCap = structValueToUint32(v)
+		if sharedDataValueCap == 0 {
+			return 0, 0, 0, 0, errors.New(parseRejectEnvoyGoStrictSharedDataValueCapBytesZero)
+		}
+	}
+
+	// Arm 21: shared_data_max_entries (zero).
+	if v, present := strictFields[envoyGoStrictSharedDataMaxEntriesKey]; present {
+		sharedDataMaxEntries = structValueToUint32(v)
+		if sharedDataMaxEntries == 0 {
+			return 0, 0, 0, 0, errors.New(parseRejectEnvoyGoStrictSharedDataMaxEntriesZero)
+		}
+	}
+
+	// Arm 22: dynamic_stats_max_entries (zero).
+	if v, present := strictFields[envoyGoStrictDynamicStatsMaxEntriesKey]; present {
+		dynStatsMaxEntries = structValueToUint32(v)
+		if dynStatsMaxEntries == 0 {
+			return 0, 0, 0, 0, errors.New(parseRejectEnvoyGoStrictDynamicStatsMaxEntriesZero)
+		}
+	}
+
+	return bodyBufferCap, sharedDataValueCap, sharedDataMaxEntries, dynStatsMaxEntries, nil
+}
+
+// structValueToUint32 projects a *structpb.Value to uint32. Returns 0 if the
+// value is nil OR not a NumberValue OR the NumberValue is negative OR exceeds
+// the uint32 ceiling. The 0-on-malformed convention pairs with the per-arm
+// "must be > 0" validators above — a non-number wrapper trips the same arm
+// as a literal 0, surfacing a uniform operator wording.
+//
+// Per ADR-0080 byte-stable wording: the per-arm constants do NOT mention
+// "wrong type" because the structpb.Value spec is sufficiently weakly-typed
+// (NumberValue is a float64) that the operator intent is "I tried to pass
+// a number"; "must be > 0" is the most actionable wording across both the
+// literal-zero path and the wrong-type path.
+//
+// Overflow case (NumberValue > 2^32 - 1): converts to 0 (truncation would
+// fire wrong PARSE-REJECT arms; cap-the-ceiling is the safer disposition).
+func structValueToUint32(v *structpb.Value) uint32 {
+	if v == nil {
+		return 0
+	}
+	n := v.GetNumberValue()
+	if n <= 0 {
+		return 0
+	}
+	if n > float64(^uint32(0)) {
+		return 0
+	}
+	//nolint:gosec // float64 → uint32 with bounds-checked guards immediately above
+	return uint32(n)
 }
 
 // -----------------------------------------------------------------------------

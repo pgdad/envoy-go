@@ -41,6 +41,7 @@ import (
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/esalaine/envoy-go/internal/wasm/abi"
 )
 
 // -----------------------------------------------------------------------------
@@ -142,8 +143,8 @@ func TestFilter_DecodeHeaders_EndToEnd(t *testing.T) {
 		t.Fatalf("DecodeHeaders = %v; want Continue", got)
 	}
 
-	if f.vm == nil {
-		t.Errorf("filter.vm = nil after DecodeHeaders; want non-nil per initVM")
+	if f.streamCtx == nil {
+		t.Errorf("filter.streamCtx = nil after DecodeHeaders; want non-nil per initStreamContext (Task 18 root-VM model)")
 	}
 	if f.streamContextID == 0 {
 		t.Errorf("filter.streamContextID = 0 after DecodeHeaders; want non-zero (allocated by streamContextIDCounter)")
@@ -162,10 +163,10 @@ func TestFilter_DecodeHeaders_EndToEnd(t *testing.T) {
 		t.Errorf("envoy_go.failures = %d; want 0 (happy path)", got)
 	}
 
-	// Cleanup: OnDestroy releases the VM.
+	// Cleanup: OnDestroy releases the per-stream StreamContext.
 	f.OnDestroy()
-	if f.vm != nil {
-		t.Errorf("filter.vm != nil after OnDestroy; want nil")
+	if f.streamCtx != nil {
+		t.Errorf("filter.streamCtx != nil after OnDestroy; want nil (Task 18 root-VM model)")
 	}
 	if got := findStatGaugeValue(reg, "wasm.wazero.active"); got != 0 {
 		t.Errorf("active after OnDestroy = %d; want 0", got)
@@ -243,8 +244,8 @@ func TestFilter_EncodeHeaders_WithoutDecode_ContinuePassthrough(t *testing.T) {
 	if got != envoyhttp.Continue {
 		t.Fatalf("EncodeHeaders (no prior Decode) = %v; want Continue", got)
 	}
-	if f.vm != nil {
-		t.Errorf("filter.vm != nil; want nil (no VM construction on encode-only path)")
+	if f.streamCtx != nil {
+		t.Errorf("filter.streamCtx != nil; want nil (no per-stream context construction on encode-only path)")
 	}
 	// No executions / created bumps — the encode side never reached the
 	// CallProxyOnResponseHeaders dispatch because vm was nil.
@@ -278,16 +279,16 @@ func TestFilter_OnDestroy_ReleasesVM(t *testing.T) {
 	if got := f.DecodeHeaders(headers, true); got != envoyhttp.Continue {
 		t.Fatalf("DecodeHeaders = %v; want Continue", got)
 	}
-	if f.vm == nil {
-		t.Fatalf("vm == nil after DecodeHeaders; should be non-nil")
+	if f.streamCtx == nil {
+		t.Fatalf("streamCtx == nil after DecodeHeaders; should be non-nil (Task 18 root-VM model)")
 	}
 	if got := findStatGaugeValue(reg, "wasm.wazero.active"); got != 1 {
 		t.Errorf("active = %d; want 1", got)
 	}
 
 	f.OnDestroy()
-	if f.vm != nil {
-		t.Errorf("vm != nil after OnDestroy; want nil")
+	if f.streamCtx != nil {
+		t.Errorf("streamCtx != nil after OnDestroy; want nil (Task 18 root-VM model)")
 	}
 	if got := findStatGaugeValue(reg, "wasm.wazero.active"); got != 0 {
 		t.Errorf("active = %d; want 0 after OnDestroy", got)
@@ -632,5 +633,347 @@ func TestNew_ReturnsWorkingFactory(t *testing.T) {
 	f2 := hf2.Decoder.(*filter)
 	if f1.cfg != f2.cfg {
 		t.Errorf("f1.cfg != f2.cfg; want shared *compiledConfig across filters")
+	}
+}
+
+// =============================================================================
+// 25.2 IMPL Task 18 — root-VM-model integration tests.
+//
+// These tests exercise the per-stream context lifecycle under the SHARED
+// per-compiledConfig *RootVM model (post-Task-1 + post-Task-18 closure of
+// D-P-PLAN-6). The 25.1 per-stream wasm.NewVM construction is GONE; the
+// per-stream cost is now microseconds (just NewStreamContext bookkeeping
+// + a proxy_on_context_create dispatch on the shared module instance).
+//
+// Test surface:
+//
+//   - TestFilter_RootVM_SharedAcrossStreams_NoCrossStreamLeak: N=100 streams
+//     on one *compiledConfig share the same *RootVM; per-stream contexts
+//     have distinct streamContextID; cleanup leaves active=0 + the
+//     rootABICallbacks multiplexer map empty.
+//
+//   - TestFilter_RootVM_LifecycleViaStreamContext: end-to-end DecodeHeaders
+//     → EncodeHeaders → DecodeData (under cap) → EncodeData (under cap) →
+//     DecodeTrailers → EncodeTrailers → OnDestroy on a single stream; the
+//     streamCtx is the same instance throughout + closes cleanly.
+//
+//   - TestFilter_RootVM_BodyCapEnforcement_DecodeSide: body chunk over cap
+//     fires the 413 SendLocalReply + body_buffer_cap_exceeded counter +
+//     envoy_go.failures co-increment; subsequent chunks short-circuit
+//     without re-incrementing.
+//
+//   - TestFilter_RootVM_OnDestroyUnregistersFromMultiplexer: after OnDestroy
+//     the rootCB.lookup(streamContextID) returns false.
+// =============================================================================
+
+// TestFilter_RootVM_SharedAcrossStreams_NoCrossStreamLeak spins up N=100
+// per-stream filters bound to the SAME *compiledConfig (and thus the SAME
+// *RootVM). Verifies:
+//
+//   - Each stream allocates a unique streamContextID via
+//     rootVM.NewStreamContext (no two streams share an ID).
+//   - The Group-B created counter == N (one per-stream-context construction
+//     per stream).
+//   - The Group-B active gauge == 0 after all streams have OnDestroyed
+//     (cleanup is correct + the multiplexer entries are released).
+//   - The rootABICallbacks multiplexer map is empty post-cleanup (no
+//     leaked per-stream entries).
+//
+// Run with -race to surface any cross-stream state leak in the
+// rootABICallbacks multiplexer or the per-stream *abiCallbacks.
+func TestFilter_RootVM_SharedAcrossStreams_NoCrossStreamLeak(t *testing.T) {
+	t.Parallel()
+	const N = 100
+	reg := stats.NewRegistry()
+	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_concurrent", reg)
+	t.Cleanup(func() { _ = cc.compileCache.Close() })
+
+	var wg sync.WaitGroup
+	wg.Add(N)
+	streamIDs := make([]uint32, N)
+
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			f := &filter{cfg: cc}
+			f.SetDecoderCallbacks(fakeDecoderCb{})
+			f.SetEncoderCallbacks(fakeEncoderCb{})
+			req := gohttp.Header{}
+			req.Set(":method", "GET")
+			if got := f.DecodeHeaders(req, true); got != envoyhttp.Continue {
+				t.Errorf("goroutine %d: DecodeHeaders = %v; want Continue", i, got)
+			}
+			atomic.StoreUint32(&streamIDs[i], f.streamContextID)
+			resp := gohttp.Header{}
+			resp.Set(":status", "200")
+			if got := f.EncodeHeaders(resp, true); got != envoyhttp.Continue {
+				t.Errorf("goroutine %d: EncodeHeaders = %v; want Continue", i, got)
+			}
+			f.OnDestroy()
+		}()
+	}
+	wg.Wait()
+
+	// All streamContextIDs must be unique (no two streams share an ID).
+	seen := make(map[uint32]bool, N)
+	for i, id := range streamIDs {
+		if id == 0 {
+			t.Errorf("goroutine %d: streamContextID = 0 (uninitialized)", i)
+		}
+		if seen[id] {
+			t.Errorf("streamContextID %d allocated to multiple goroutines (cross-stream leak)", id)
+		}
+		seen[id] = true
+	}
+
+	// Group-B counters: N created, 0 active at end (all OnDestroyed).
+	if got := findStatCounterValue(reg, "wasm.wazero.created"); got != N {
+		t.Errorf("created = %d; want %d", got, N)
+	}
+	if got := findStatGaugeValue(reg, "wasm.wazero.active"); got != 0 {
+		t.Errorf("active = %d; want 0 (all OnDestroyed; no leaked stream contexts)", got)
+	}
+	// executions = N (one Inc per decode-side dispatch).
+	if got := findStatCounterValue(reg, "wasm.plugin_rootvm_concurrent.executions"); got != N {
+		t.Errorf("executions = %d; want %d", got, N)
+	}
+
+	// rootABICallbacks multiplexer map should be empty post-cleanup —
+	// every OnDestroy unregisters its per-stream entry.
+	cc.rootCB.mu.RLock()
+	mapSize := len(cc.rootCB.perCB)
+	cc.rootCB.mu.RUnlock()
+	if mapSize != 0 {
+		t.Errorf("rootABICallbacks map size post-cleanup = %d; want 0 (leaked per-stream entries)", mapSize)
+	}
+}
+
+// TestFilter_RootVM_LifecycleViaStreamContext exercises the full per-
+// stream lifecycle under the root-VM model: DecodeHeaders → EncodeHeaders
+// → DecodeData → EncodeData → DecodeTrailers → EncodeTrailers → OnDestroy.
+// Asserts the streamCtx is the same instance throughout (no per-callback
+// re-construction); OnDestroy releases cleanly + the multiplexer entry
+// is unregistered.
+func TestFilter_RootVM_LifecycleViaStreamContext(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_lifecycle", reg)
+	t.Cleanup(func() { _ = cc.compileCache.Close() })
+
+	f := &filter{cfg: cc}
+	f.SetDecoderCallbacks(fakeDecoderCb{})
+	f.SetEncoderCallbacks(fakeEncoderCb{})
+
+	// 1. DecodeHeaders constructs the StreamContext.
+	reqHdr := gohttp.Header{}
+	reqHdr.Set(":method", "POST")
+	if got := f.DecodeHeaders(reqHdr, false); got != envoyhttp.Continue {
+		t.Fatalf("DecodeHeaders = %v; want Continue", got)
+	}
+	sc1 := f.streamCtx
+	if sc1 == nil {
+		t.Fatal("streamCtx nil after DecodeHeaders")
+	}
+
+	// 2. DecodeData under cap — NO-op (guest doesn't export proxy_on_request_body).
+	if got := f.DecodeData([]byte("hello"), false); got != envoyhttp.DataContinue {
+		t.Errorf("DecodeData = %v; want DataContinue", got)
+	}
+	if f.streamCtx != sc1 {
+		t.Errorf("streamCtx changed after DecodeData; want same instance")
+	}
+
+	// 3. DecodeTrailers — NO-op (guest doesn't export proxy_on_request_trailers).
+	trl := gohttp.Header{}
+	trl.Set("Grpc-Status", "0")
+	if got := f.DecodeTrailers(trl); got != envoyhttp.TrailersContinue {
+		t.Errorf("DecodeTrailers = %v; want TrailersContinue", got)
+	}
+
+	// 4. EncodeHeaders — REUSES the same streamCtx (NO re-construction).
+	respHdr := gohttp.Header{}
+	respHdr.Set(":status", "200")
+	if got := f.EncodeHeaders(respHdr, false); got != envoyhttp.Continue {
+		t.Errorf("EncodeHeaders = %v; want Continue", got)
+	}
+	if f.streamCtx != sc1 {
+		t.Errorf("streamCtx changed after EncodeHeaders; want same instance")
+	}
+
+	// 5. EncodeData — NO-op.
+	if got := f.EncodeData([]byte("world"), false); got != envoyhttp.DataContinue {
+		t.Errorf("EncodeData = %v; want DataContinue", got)
+	}
+
+	// 6. EncodeTrailers — NO-op.
+	if got := f.EncodeTrailers(trl); got != envoyhttp.TrailersContinue {
+		t.Errorf("EncodeTrailers = %v; want TrailersContinue", got)
+	}
+
+	// 7. OnDestroy — releases the StreamContext + unregisters from
+	// multiplexer.
+	streamID := f.streamContextID
+	f.OnDestroy()
+	if f.streamCtx != nil {
+		t.Errorf("streamCtx != nil after OnDestroy")
+	}
+
+	// Multiplexer entry unregistered.
+	if _, ok := cc.rootCB.lookup(streamID); ok {
+		t.Errorf("rootCB.lookup(streamID=%d) = true after OnDestroy; want false (entry should be unregistered)", streamID)
+	}
+
+	// active gauge decremented to 0.
+	if got := findStatGaugeValue(reg, "wasm.wazero.active"); got != 0 {
+		t.Errorf("active = %d post-OnDestroy; want 0", got)
+	}
+}
+
+// TestFilter_RootVM_BodyCapEnforcement_DecodeSide exercises the body
+// cap-enforcement path under the root-VM model: a body chunk over the
+// 16-byte cap fires SendLocalReply(413) + body_buffer_cap_exceeded +
+// envoy_go.failures + DataStopIterationNoBuffer. Subsequent chunks
+// short-circuit via the sticky flag.
+func TestFilter_RootVM_BodyCapEnforcement_DecodeSide(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	// Build a real compiledConfig with a 16-byte cap override via the
+	// envoy_go_strict Struct.
+	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_bodycap", reg)
+	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	cc.bodyBufferCapBytes = 16 // override for test
+
+	rec := &recordingDecoderCb{}
+	f := &filter{cfg: cc}
+	f.SetDecoderCallbacks(rec)
+	f.SetEncoderCallbacks(fakeEncoderCb{})
+
+	// DecodeHeaders constructs the streamCtx.
+	hdr := gohttp.Header{}
+	hdr.Set(":method", "POST")
+	if got := f.DecodeHeaders(hdr, false); got != envoyhttp.Continue {
+		t.Fatalf("DecodeHeaders = %v; want Continue", got)
+	}
+
+	// 32-byte chunk exceeds the 16-byte cap → 413 + counters + StopIter.
+	oversize := make([]byte, 32)
+	got := f.DecodeData(oversize, false)
+	if got != envoyhttp.DataStopIterationNoBuffer {
+		t.Errorf("DecodeData (over-cap) = %v; want DataStopIterationNoBuffer", got)
+	}
+	rec.mu.Lock()
+	calls := rec.calls
+	status := rec.status
+	rec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("SendLocalReply calls = %d; want 1", calls)
+	}
+	if status != 413 {
+		t.Errorf("SendLocalReply status = %d; want 413", status)
+	}
+	if got := findStatCounterValue(reg, "wasm.plugin_rootvm_bodycap.body_buffer_cap_exceeded"); got != 1 {
+		t.Errorf("body_buffer_cap_exceeded = %d; want 1", got)
+	}
+	if got := findStatCounterValue(reg, "wasm.plugin_rootvm_bodycap.envoy_go.failures"); got != 1 {
+		t.Errorf("envoy_go.failures co-increment = %d; want 1", got)
+	}
+
+	// Subsequent chunk short-circuits via sticky flag — NO re-bump of
+	// counters or re-invoke of SendLocalReply.
+	if got := f.DecodeData(oversize, true); got != envoyhttp.DataStopIterationNoBuffer {
+		t.Errorf("DecodeData (post-sticky) = %v; want DataStopIterationNoBuffer", got)
+	}
+	rec.mu.Lock()
+	calls = rec.calls
+	rec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("SendLocalReply calls post-sticky = %d; want 1 (sticky flag prevents re-invoke)", calls)
+	}
+	if got := findStatCounterValue(reg, "wasm.plugin_rootvm_bodycap.body_buffer_cap_exceeded"); got != 1 {
+		t.Errorf("body_buffer_cap_exceeded post-sticky = %d; want 1 (sticky flag prevents re-bump)", got)
+	}
+
+	f.OnDestroy()
+}
+
+// TestFilter_RootVM_HostcallRoutesToOriginatingStream exercises the
+// rootABICallbacks multiplexer's per-stream dispatch isolation. Two
+// concurrent streams construct distinct *abiCallbacks; a hostcall fired
+// with stream A's context ID returns stream A's per-stream state (e.g.,
+// request headers); a hostcall with stream B's context ID returns stream
+// B's state. NO cross-stream bleeding.
+//
+// This is the load-bearing test for the per-RootVM multiplexer design:
+// without the streamCtxID-keyed lookup, hostcalls would always read the
+// LAST registered *abiCallbacks (last-call-wins on rv.cb), producing
+// silent data corruption across streams.
+func TestFilter_RootVM_HostcallRoutesToOriginatingStream(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_isolation", reg)
+	t.Cleanup(func() { _ = cc.compileCache.Close() })
+
+	// Stream A.
+	fA := &filter{cfg: cc}
+	fA.SetDecoderCallbacks(fakeDecoderCb{})
+	fA.SetEncoderCallbacks(fakeEncoderCb{})
+	hdrA := gohttp.Header{}
+	hdrA.Set(":method", "GET")
+	hdrA.Set("X-Stream-Tag", "alpha")
+	if got := fA.DecodeHeaders(hdrA, true); got != envoyhttp.Continue {
+		t.Fatalf("stream A DecodeHeaders = %v; want Continue", got)
+	}
+
+	// Stream B.
+	fB := &filter{cfg: cc}
+	fB.SetDecoderCallbacks(fakeDecoderCb{})
+	fB.SetEncoderCallbacks(fakeEncoderCb{})
+	hdrB := gohttp.Header{}
+	hdrB.Set(":method", "POST")
+	hdrB.Set("X-Stream-Tag", "beta")
+	if got := fB.DecodeHeaders(hdrB, true); got != envoyhttp.Continue {
+		t.Fatalf("stream B DecodeHeaders = %v; want Continue", got)
+	}
+
+	// Verify the multiplexer routes stream A's context ID to fA's cb.
+	cbA, okA := cc.rootCB.lookup(fA.streamContextID)
+	if !okA {
+		t.Fatalf("multiplexer lookup for stream A id=%d failed", fA.streamContextID)
+	}
+	if cbA.filter != fA {
+		t.Errorf("multiplexer for stream A returned cb bound to wrong filter (cross-stream leak)")
+	}
+	// Probe per-stream state via the per-stream *abiCallbacks.
+	if v, _ := cbA.GetHeaderMapValue(context.Background(), fA.streamContextID, abi.WasmHeaderMapTypeHttpRequestHeaders, "X-Stream-Tag"); v != "alpha" {
+		t.Errorf("stream A GetHeaderMapValue(X-Stream-Tag) = %q; want \"alpha\"", v)
+	}
+
+	// Verify stream B routes to fB's cb.
+	cbB, okB := cc.rootCB.lookup(fB.streamContextID)
+	if !okB {
+		t.Fatalf("multiplexer lookup for stream B id=%d failed", fB.streamContextID)
+	}
+	if cbB.filter != fB {
+		t.Errorf("multiplexer for stream B returned cb bound to wrong filter (cross-stream leak)")
+	}
+	if v, _ := cbB.GetHeaderMapValue(context.Background(), fB.streamContextID, abi.WasmHeaderMapTypeHttpRequestHeaders, "X-Stream-Tag"); v != "beta" {
+		t.Errorf("stream B GetHeaderMapValue(X-Stream-Tag) = %q; want \"beta\"", v)
+	}
+
+	// Stream A ID != Stream B ID (independent allocations).
+	if fA.streamContextID == fB.streamContextID {
+		t.Errorf("streamContextID collision: fA=%d, fB=%d", fA.streamContextID, fB.streamContextID)
+	}
+
+	fA.OnDestroy()
+	fB.OnDestroy()
+
+	// Post-cleanup: both entries unregistered.
+	if _, ok := cc.rootCB.lookup(fA.streamContextID); ok {
+		t.Errorf("multiplexer entry for stream A leaked post-OnDestroy")
+	}
+	if _, ok := cc.rootCB.lookup(fB.streamContextID); ok {
+		t.Errorf("multiplexer entry for stream B leaked post-OnDestroy")
 	}
 }

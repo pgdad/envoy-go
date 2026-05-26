@@ -1,0 +1,121 @@
+# Human-readable expectations for fixture 0036-http-wasm-body-and-advanced.
+# This file is documentation only; the runner does NOT parse it. Per
+# phase 25.2 SPEC §8.1.1 + Task 20 PLAN.
+
+scenarios:
+  - id: a
+    crate: a_body_read_only
+    kind: cross_side
+    probe: POST /scenario_a body=hello-body
+    plugin_call: get_http_request_body + add_request_header x-body-len
+    cross_side_assertion: |
+      Reflected request header x-body-len arrives at echobackend with
+      value matching len("hello-body") = 10.
+
+  - id: b
+    crate: b_body_mutate_passthrough
+    kind: cross_side
+    probe: POST /scenario_b body=ab
+    plugin_call: parity(body_size) -> add_request_header x-body-tag
+    cross_side_assertion: |
+      Reflected x-body-tag = "even" for body of length 2.
+
+  - id: c
+    crate: c_body_mutate_replace
+    kind: cross_side
+    probe: POST /scenario_c body=hello
+    plugin_call: uppercase body via set_http_request_body
+    cross_side_assertion: |
+      Reflected request header x-body-mutated=1 arrives at upstream.
+
+  - id: d
+    crate: d_trailers_add
+    kind: cross_side
+    probe: GET /scenario_d
+    plugin_call: set_http_response_header x-trailers-added=1
+    cross_side_assertion: |
+      Response header x-trailers-added=1 arrives at downstream.
+
+  - id: e
+    crate: e_trailers_read
+    kind: cross_side
+    probe: GET /scenario_e
+    plugin_call: get_http_request_trailers().len() -> x-trailer-count
+    cross_side_assertion: |
+      Response header x-trailer-count=0 (HTTP/1.1 chunked-trailer-less GET).
+
+  - id: f
+    crate: f_shared_data_read_after_write
+    kind: cross_side
+    probe: 2x GET /scenario_f (warmup + observed)
+    plugin_call: CAS-loop on shared_data key "counter"
+    cross_side_assertion: |
+      Second response carries x-shared-data-counter=2 (first request
+      incremented from 0 to 1; second from 1 to 2).
+
+  - id: g
+    crate: g_foreign_function_deny_default
+    kind: cross_side
+    probe: GET /scenario_g
+    plugin_call: call_foreign_function("verify_signature")
+    cross_side_assertion: |
+      Response header x-foreign-result reflects WasmResult::NotFound (1) on
+      both sides per AMEND-A9 empty-default registry.
+
+  - id: h
+    crate: h_property_stream_info
+    kind: cross_side
+    probe: GET /scenario_h
+    plugin_call: get_property(["request","method"]) + get_property(["request","path"])
+    cross_side_assertion: |
+      Response headers x-prop-method=GET + x-prop-path=/scenario_h.
+
+  - id: i
+    crate: i_metric_define_only
+    kind: cross_side
+    probe: GET /scenario_i
+    plugin_call: define_metric + increment_metric + tag x-metric-defined=1
+    cross_side_assertion: |
+      Reflected x-metric-defined=1 (the dynamic stat is subject-only —
+      this scenario's CompareBytes asserts only the header).
+
+  - id: j
+    crate: j_env_vars_rejected_passthrough
+    kind: cross_side
+    probe: GET /scenario_j
+    plugin_call: std::env::vars().count() -> x-env-keys
+    cross_side_assertion: |
+      Both sides return x-env-keys=0 (AMEND-A6 defers env_vars to 25.3;
+      both runtimes expose an empty WASI environ).
+
+  - id: k
+    crate: k_tick_fires_counter
+    kind: subject_only
+    probe: GET /scenario_k + sleep 300ms
+    plugin_call: set_tick_period(50ms) + on_tick increment metric
+    subject_assertion: |
+      wasm.plugin_k.tick_invocations >= 5 (50ms tick * 250ms wait).
+
+  - id: l
+    crate: l_httpcall_success
+    kind: subject_only
+    probe: GET /scenario_l
+    plugin_call: dispatch_http_call("cluster_b", ...)
+    subject_assertion: |
+      wasm.plugin_l.http_call_dispatched >= 1 + wasm.plugin_l.http_call_response >= 1.
+
+  - id: m
+    crate: m_httpcall_unknown_cluster
+    kind: subject_only
+    probe: GET /scenario_m
+    plugin_call: dispatch_http_call("nonexistent_cluster", ...)
+    subject_assertion: |
+      wasm.plugin_m.http_call_dispatch_unknown_cluster >= 1.
+
+  - id: n
+    crate: n_body_cap_exceeded
+    kind: subject_only
+    probe: POST /scenario_n body=2 KiB (cap=1 KiB on subject)
+    plugin_call: Action::Pause on body callbacks
+    subject_assertion: |
+      wasm.plugin_n.body_buffer_cap_exceeded >= 1 + wasm.envoy_go.failures >= 1.

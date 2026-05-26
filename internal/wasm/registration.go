@@ -1,22 +1,38 @@
 // ABICallbacks interface + host-module wiring for the 47 proxy-wasm v0.2.1
 // hostcalls per 25.1 SPEC §3.1 + §5 + parent §4.2 Option B.
 //
+// AT 25.2 (Task 3): the host-module wiring EXTENDED with 14 NEW
+// env-namespace hostcalls per §5.1 + the gate-at-registration discipline
+// per AMEND-B5 (denied capabilities → NOT registered on wazero Runtime;
+// mirrors upstream cpp-host `wasm.cc:176-189` `_REGISTER_PROXY` macro). The
+// 25.1 16 active hostcalls KEEP their gate-at-call-site discipline (denied
+// returns WasmResult::InternalFailure; preserves byte-stable 25.1 behavior
+// per the no-break invariant); the 14 NEW 25.2 hostcalls use the
+// gate-at-registration discipline (denied → unknown-import-failure at
+// module-instantiation OR wazero-trap on call). The 7 NEW callbacks (per
+// §5.3) gate at `HasGlobalFunc` lookup time per `wasm.cc:238-247`
+// `_GET_PROXY` macro — denied → reported as missing even if the guest
+// exports the function.
+//
 // The host-module wiring registers two wazero host modules onto the VM's
 // runtime:
 //
 //   - `env` namespace — the 16 active `proxy_*` env-namespace hostcalls
-//     (§5.1) + the 23 deferred-25.2/25.3 stub-Unimplemented hostcalls
-//     (§5.4). All 39 register against the `env` module per upstream
-//     proxy-wasm convention (`#define _GET_PROXY(_fn) ... getFunction("proxy_" #_fn, ...)`
-//     — the bare `proxy_*` names go under `env` in the import section).
+//     (§5.1 25.1) + the 14 NEW gated `proxy_*` env-namespace hostcalls
+//     (§5.1 25.2) + the 9 STILL stub-Unimplemented hostcalls (§5.4;
+//     shared-queue 4 + gRPC 5). Total registered when ALL 14 NEW
+//     capabilities ALLOWED: 39 (16 + 14 + 9). The 23-stub roster at 25.1
+//     SHRINKS to 9 at 25.2 — 14 stubs LIFT to gated active per §5.1.
 //
 //   - `wasi_snapshot_preview1` namespace — the 8 active WASI custom-shim
 //     hostcalls (§5.2). Each wraps the corresponding `wasiXxx` free
 //     function from `wasi.go` (Task 4); the VM satisfies the `wasiHost`
 //     interface so the shims can route logs + check capabilities through
-//     it.
+//     it. UNCHANGED at 25.2.
 //
-// Each active hostcall body:
+// # 25.1 active hostcall body (gate-at-call-site discipline; UNCHANGED)
+//
+// Each 25.1 active hostcall body:
 //
 //	1. Checks vm.sandbox.IsAllowed(<cap_key>); if false:
 //	   - proxy_* hostcalls: return uint32(abi.WasmResultInternalFailure) (=10)
@@ -28,7 +44,27 @@
 //	   memory read/write that returns ok=false converts to
 //	   abi.WasmResultInvalidMemoryAccess (=6).
 //
-// Each deferred-stub hostcall body just returns
+// # 25.2 NEW active hostcall body (gate-at-registration discipline)
+//
+// Each 25.2 NEW hostcall body:
+//
+//	1. The IsAllowed check fires at REGISTRATION time (registerProxyHostcalls25_2):
+//	   if denied, the host function is NOT registered on the `env` module.
+//	   Guest modules importing the denied hostcall fail at module-
+//	   instantiation with "unknown import" OR (if a different builder
+//	   provided a partial registration) the call traps. NO runtime-deny
+//	   sentinel is emitted (in contrast to 25.1's WasmResultInternalFailure).
+//	2. If registered, the body delegates to a per-family abi/* dispatch
+//	   shim (e.g. `abi.GetBufferBytesShim` for proxy_get_buffer_bytes).
+//	   At Task 3 the shims are PLACEHOLDERS that panic — replaced with real
+//	   impls at Tasks 4/5/6/7/8/12 as each family lands.
+//	3. The shim invocation is wrapped in vm.runWithPanicWrapper so the
+//	   Task 3-window panic surfaces as WasmResultInternalFailure (=10) +
+//	   invokes vm.panicH — the same recovery discipline as the 25.1 shims.
+//
+// # Stub hostcall body (UNCHANGED)
+//
+// Each STILL-stub hostcall body (9 entries at 25.2) just returns
 // `uint32(abi.WasmResultUnimplemented)` (=12) without consulting the
 // sandbox — the import-section type-signature is what matters for module
 // instantiation; the runtime behavior is a stub per parent §4.2 Option B.
@@ -50,7 +86,16 @@
 // `abi.WasmResultInvalidMemoryAccess` (=6) — the guest cannot receive the
 // data without an allocator.
 //
-// # Hostcall roster (47 total = 16 + 8 + 23)
+// # Hostcall roster
+//
+// At 25.1: 47 total = 16 active proxy_* + 8 active wasi_* + 23 deferred stubs.
+// At 25.2: 47 total = 30 active proxy_* (16 25.1 + 14 NEW gated) + 8 active
+// wasi_* + 9 STILL stub-Unimplemented (shared-queue 4 + gRPC 5). The
+// register-count is INVARIANT (Option B per parent §4.2) — what changes at
+// 25.2 is the 14-stub LIFT to gated-active, plus the conditional skip on
+// the 14 NEW when their capability is denied (gate-at-registration per
+// AMEND-B5). The maximum-allowed registered count is 47; the minimum
+// (deny-all 14 NEW) is 33.
 //
 // The package-private `cap*` constants for the gated hostcalls live in
 // sandbox.go (proxy_*) + wasi.go (wasi_*). Capability keys are referenced
@@ -145,6 +190,59 @@ type ABICallbacks interface {
 
 	// Done signals the guest is done with the named context.
 	Done(ctx context.Context, contextID uint32) abi.WasmResult
+
+	// --- 25.2 NEW (Task 4) body+buffer + stream-control surface ---------
+	//
+	// The accessors below carry the body+buffer hostcall dispatch
+	// (proxy_get_buffer_bytes + proxy_set_buffer_bytes +
+	// proxy_get_buffer_status per §5.1 #25-27) + the stream-control
+	// dispatch (proxy_continue_stream + proxy_close_stream per §5.1
+	// #28-29) into the consumer-side body accumulation. The
+	// implementations land at Tasks 15 + 16 (HTTP-filter consumer);
+	// Task 4 lands the interface signatures + the abi/* shim wire-up.
+
+	// GetBuffer returns the current bytes of the buffer identified by
+	// (streamContextID, bufferType). Returns a nil slice + nil error for
+	// "empty buffer" (e.g., before any body chunk has arrived) — the
+	// abi/body_bridge.go clamp logic treats a nil/empty slice as length
+	// 0. A non-nil error signals an out-of-range bufferType or other
+	// dispatch-layer failure that the host shim converts to
+	// abi.WasmResultBadArgument per §11.1 clamp wire-contract.
+	GetBuffer(ctx context.Context, streamContextID uint32, bufferType abi.WasmBufferType) ([]byte, error)
+
+	// SetBuffer replaces a slice of the buffer identified by
+	// (streamContextID, bufferType) starting at `start` with `data`.
+	// Per cpp-host src/exports.cc:set_buffer_bytes semantics, the
+	// consumer-side impl is responsible for the splice (extend / truncate
+	// when start+len(data) extends past the buffer end). A non-nil error
+	// from the consumer converts to abi.WasmResultBadArgument at the host
+	// shim.
+	SetBuffer(ctx context.Context, streamContextID uint32, bufferType abi.WasmBufferType, start uint32, data []byte) abi.WasmResult
+
+	// GetBufferStatus returns the current size + flag bits for the buffer
+	// identified by (streamContextID, bufferType). Flag bits per
+	// proxy-wasm v0.2.1 spec README §proxy_get_buffer_status (e.g., end-
+	// of-stream, paused). A non-nil error from the consumer converts to
+	// abi.WasmResultBadArgument at the host shim.
+	GetBufferStatus(ctx context.Context, streamContextID uint32, bufferType abi.WasmBufferType) (size, flags uint32, err error)
+
+	// ContinueStream resumes the named stream (request/response/upstream
+	// per the streamType discriminator) after a prior PAUSE return from
+	// proxy_on_*_body / proxy_on_*_trailers. The consumer-side impl
+	// re-fires the corresponding filter-chain continue (e.g.,
+	// FilterCallbacks.ContinueDecoding for request-stream type=0). A
+	// non-nil error converts to WasmResultInternalFailure at the host
+	// shim (continuation failures are exceptional + non-recoverable; the
+	// guest can observe via the result code but no per-error sentinel
+	// exists in v0.2.1).
+	ContinueStream(ctx context.Context, streamContextID uint32, streamType uint32) abi.WasmResult
+
+	// CloseStream tears down the named stream early. Mirrors the cpp-host
+	// proxy_close_stream wire-contract — typically used to half-close the
+	// upstream side or short-circuit out of the body-callback dispatch.
+	// A non-nil error from the consumer converts to
+	// WasmResultInternalFailure at the host shim.
+	CloseStream(ctx context.Context, streamContextID uint32, streamType uint32) abi.WasmResult
 }
 
 // registerHostModules registers the 16 active proxy_* env-namespace
@@ -156,9 +254,10 @@ type ABICallbacks interface {
 // instantiations resolve the import section against the registered modules.
 // Returns a wrapped wazero error on registration failure (would indicate
 // a programmer error — a malformed function signature).
-func registerHostModules(ctx context.Context, vm *VM) error {
+func registerHostModules(ctx context.Context, vm *RootVM) error {
 	envBuilder := vm.runtime.NewHostModuleBuilder("env")
 	registerProxyHostcalls(envBuilder, vm)
+	registerProxyHostcalls25_2(envBuilder, vm)
 	registerDeferredStubs(envBuilder)
 	if _, err := envBuilder.Instantiate(ctx); err != nil {
 		return fmt.Errorf("instantiate env host module: %w", err)
@@ -176,7 +275,7 @@ func registerHostModules(ctx context.Context, vm *VM) error {
 // registerProxyHostcalls registers the 16 active proxy_* env-namespace
 // hostcalls per §5.1. Each body checks sandbox.IsAllowed + invokes the
 // ABICallbacks under the panic-wrapper.
-func registerProxyHostcalls(b wazero.HostModuleBuilder, vm *VM) {
+func registerProxyHostcalls(b wazero.HostModuleBuilder, vm *RootVM) {
 	// 1. proxy_log(level, msg_ptr, msg_size) -> i32
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, level, msgPtr, msgSize uint32) uint32 {
@@ -495,7 +594,7 @@ func registerProxyHostcalls(b wazero.HostModuleBuilder, vm *VM) {
 // registerWasiHostcalls registers the 8 wasi_snapshot_preview1.* shims per
 // §5.2. Each wraps the corresponding `wasiXxx` free function from wasi.go
 // (Task 4) with vm-as-wasiHost adapter; the shims own the IsAllowed check.
-func registerWasiHostcalls(b wazero.HostModuleBuilder, vm *VM) {
+func registerWasiHostcalls(b wazero.HostModuleBuilder, vm *RootVM) {
 	// 17. fd_write(fd, iovec, iovec_size, nwritten_ptr) -> i32
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, fd, iovsPtr, iovsLen, nwrittenPtr uint32) uint32 {
@@ -576,72 +675,212 @@ func registerWasiHostcalls(b wazero.HostModuleBuilder, vm *VM) {
 		Export("proc_exit")
 }
 
-// registerDeferredStubs registers the 23 deferred-25.2/25.3 hostcalls per
-// §5.4 + parent §4.2 Option B. Each returns
+// registerProxyHostcalls25_2 registers the 14 NEW 25.2 env-namespace proxy_*
+// hostcalls per §5.1 + AMEND-B1..B5. EACH hostcall is GATED at registration
+// time per AMEND-B5: if `vm.sandbox.IsAllowed(<cap>)` returns false the
+// host function is NOT registered on the wazero Runtime; guests importing
+// the denied hostcall fail at module-instantiation OR (if a different
+// path provides a partial registration) the call traps. Mirrors upstream
+// cpp-host `wasm.cc:176-189` `_REGISTER_PROXY` macro discipline.
+//
+// Each function body delegates to a forward-decl shim in `internal/wasm/abi/
+// stubs_25_2.go`. At Task 3 the shims PANIC with "Task N not yet landed"
+// — the real impls land at Tasks 4/5/6/7/8/12 (each Task DELETES its
+// placeholder line from stubs_25_2.go + adds the real impl).
+//
+// Wire signatures pinned per 25.2 SPEC §11.1 (body+buffer+trailers) +
+// §11.2 (metrics) + §11.3 (proxy_http_call) + §11.5 (capability gating).
+//
+// obscure the gate-at-registration discipline (each entry is the
+// SAME 5-line structure: cap-check, NewFunctionBuilder, WithFunc shim,
+// Export). Per-family file extraction belongs at Tasks 4-12 when each
+// abi/* family file lands its real impl.
+//
+//nolint:funlen // 14 hostcall envelopes; splitting per-family would
+func registerProxyHostcalls25_2(b wazero.HostModuleBuilder, vm *RootVM) {
+	// 25. proxy_get_buffer_bytes(buffer_type, start, max_size, ret_data_ptr,
+	//     ret_size_ptr) -> i32 — Task 4 lands real impl (AMEND-B1 clamp).
+	if vm.sandbox.IsAllowed(capProxyGetBufferBytes) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, bufferType, start, maxSize, retDataPtr, retSizePtr uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.GetBufferBytesShim(ctx, mod, vm, bufferType, start, maxSize, retDataPtr, retSizePtr)
+				}))
+			}).
+			Export("proxy_get_buffer_bytes")
+	}
+
+	// 26. proxy_set_buffer_bytes(buffer_type, start, size, data_ptr,
+	//     data_size) -> i32 — Task 4.
+	if vm.sandbox.IsAllowed(capProxySetBufferBytes) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, bufferType, start, size, dataPtr, dataSize uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.SetBufferBytesShim(ctx, mod, vm, bufferType, start, size, dataPtr, dataSize)
+				}))
+			}).
+			Export("proxy_set_buffer_bytes")
+	}
+
+	// 27. proxy_get_buffer_status(buffer_type, ret_size_ptr, ret_flags_ptr)
+	//     -> i32 — Task 4.
+	if vm.sandbox.IsAllowed(capProxyGetBufferStatus) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, bufferType, retSizePtr, retFlagsPtr uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.GetBufferStatusShim(ctx, mod, vm, bufferType, retSizePtr, retFlagsPtr)
+				}))
+			}).
+			Export("proxy_get_buffer_status")
+	}
+
+	// 28. proxy_continue_stream(stream_type) -> i32 — Task 4 (paired with
+	//     PAUSE-buffer dispatch on body callbacks).
+	if vm.sandbox.IsAllowed(capProxyContinueStream) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, streamType uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.ContinueStreamShim(ctx, mod, vm, streamType)
+				}))
+			}).
+			Export("proxy_continue_stream")
+	}
+
+	// 29. proxy_close_stream(stream_type) -> i32 — Task 4.
+	if vm.sandbox.IsAllowed(capProxyCloseStream) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, streamType uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.CloseStreamShim(ctx, mod, vm, streamType)
+				}))
+			}).
+			Export("proxy_close_stream")
+	}
+
+	// 30. proxy_set_tick_period_milliseconds(period_ms) -> i32 — Task 5
+	//     (Q5 10ms envoy-go-strict floor; Clock seam FIRST co-consumer).
+	if vm.sandbox.IsAllowed(capProxySetTickPeriodMilliseconds) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, periodMs uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.SetTickPeriodMillisecondsShim(ctx, mod, vm, periodMs)
+				}))
+			}).
+			Export("proxy_set_tick_period_milliseconds")
+	}
+
+	// 31. proxy_define_metric(metric_type, name_data, name_size,
+	//     ret_metric_id_ptr) -> i32 — Task 12 (AMEND-B2: Counter=0/Gauge=1/
+	//     Histogram=2; namespace wasmcustom.<name>).
+	if vm.sandbox.IsAllowed(capProxyDefineMetric) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, metricType, nameData, nameSize, retMetricIDPtr uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.DefineMetricShim(ctx, mod, vm, metricType, nameData, nameSize, retMetricIDPtr)
+				}))
+			}).
+			Export("proxy_define_metric")
+	}
+
+	// 32. proxy_increment_metric(metric_id, delta:int64 SIGNED) -> i32
+	//     — Task 12 (AMEND-B2 signed-i64 delta).
+	if vm.sandbox.IsAllowed(capProxyIncrementMetric) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, metricID uint32, delta int64) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.IncrementMetricShim(ctx, mod, vm, metricID, delta)
+				}))
+			}).
+			Export("proxy_increment_metric")
+	}
+
+	// 33. proxy_record_metric(metric_id, value:uint64 UNSIGNED) -> i32
+	//     — Task 12 (AMEND-B2 unsigned-u64 value).
+	if vm.sandbox.IsAllowed(capProxyRecordMetric) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, metricID uint32, value uint64) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.RecordMetricShim(ctx, mod, vm, metricID, value)
+				}))
+			}).
+			Export("proxy_record_metric")
+	}
+
+	// 34. proxy_get_metric(metric_id, ret_value_ptr) -> i32 — Task 12.
+	if vm.sandbox.IsAllowed(capProxyGetMetric) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, metricID, retValuePtr uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.GetMetricShim(ctx, mod, vm, metricID, retValuePtr)
+				}))
+			}).
+			Export("proxy_get_metric")
+	}
+
+	// 35. proxy_set_shared_data(key_ptr, key_size, value_ptr, value_size,
+	//     cas) -> i32 — Task 6 (Q6 CAS + 1 MiB value cap + 1024-entry cap).
+	if vm.sandbox.IsAllowed(capProxySetSharedData) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, keyPtr, keySize, valuePtr, valueSize, cas uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.SetSharedDataShim(ctx, mod, vm, keyPtr, keySize, valuePtr, valueSize, cas)
+				}))
+			}).
+			Export("proxy_set_shared_data")
+	}
+
+	// 36. proxy_get_shared_data(key_ptr, key_size, ret_value_ptr_ptr,
+	//     ret_value_size_ptr, ret_cas_ptr) -> i32 — Task 6.
+	if vm.sandbox.IsAllowed(capProxyGetSharedData) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, keyPtr, keySize, retValuePtrPtr, retValueSizePtr, retCASPtr uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.GetSharedDataShim(ctx, mod, vm, keyPtr, keySize, retValuePtrPtr, retValueSizePtr, retCASPtr)
+				}))
+			}).
+			Export("proxy_get_shared_data")
+	}
+
+	// 37. proxy_http_call(cluster_data, cluster_size, headers_data,
+	//     headers_size, body_data, body_size, trailers_data, trailers_size,
+	//     timeout_ms, ret_call_id_ptr) -> i32 (10 args; timeout_ms = uint32)
+	//     — Task 8 (Q4 + AMEND-B3: BadArgument-on-unknown-cluster;
+	//     cancel-at-destruction; http_call_response_after_close counter).
+	if vm.sandbox.IsAllowed(capProxyHttpCall) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, clusterData, clusterSize, headersData, headersSize, bodyData, bodySize, trailersData, trailersSize, timeoutMs, retCallIDPtr uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.HttpCallShim(ctx, mod, vm, clusterData, clusterSize, headersData, headersSize, bodyData, bodySize, trailersData, trailersSize, timeoutMs, retCallIDPtr)
+				}))
+			}).
+			Export("proxy_http_call")
+	}
+
+	// 38. proxy_call_foreign_function(name_data, name_size, args_data,
+	//     args_size, ret_results_data_ptr, ret_results_size_ptr) -> i32
+	//     — Task 7 (AMEND-A9: NotFound for unregistered; EMPTY default
+	//     registry; envoy-go-strict departure record #4).
+	if vm.sandbox.IsAllowed(capProxyCallForeignFunction) {
+		b.NewFunctionBuilder().
+			WithFunc(func(ctx context.Context, mod api.Module, nameData, nameSize, argsData, argsSize, retResultsDataPtr, retResultsSizePtr uint32) uint32 {
+				return uint32(vm.runWithPanicWrapper(func() abi.WasmResult {
+					return abi.CallForeignFunctionShim(ctx, mod, vm, nameData, nameSize, argsData, argsSize, retResultsDataPtr, retResultsSizePtr)
+				}))
+			}).
+			Export("proxy_call_foreign_function")
+	}
+}
+
+// registerDeferredStubs registers the 9 STILL-deferred hostcalls per §5.4
+// + parent §4.2 Option B. At 25.1 this was 23 stubs; 14 of those LIFTED at
+// 25.2 (registered via registerProxyHostcalls25_2 above) leaving 9 stubs:
+// shared-queue family (4) + gRPC family (5). Each returns
 // uint32(abi.WasmResultUnimplemented) (=12) without consulting the sandbox.
 // The import-section type-signature is what matters for module instantiation;
 // the runtime behavior is a stub. The signatures match upstream proxy-wasm-
 // cpp-host's include/proxy-wasm/exports.h at SHA da3ce05d.
 func registerDeferredStubs(b wazero.HostModuleBuilder) {
 	stub := func() uint32 { return uint32(abi.WasmResultUnimplemented) }
-
-	// body+buffer (3)
-	// proxy_get_buffer_bytes(type, start, length, ptr_ptr, size_ptr) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_get_buffer_bytes")
-	// proxy_set_buffer_bytes(type, start, length, data_ptr, data_size) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_set_buffer_bytes")
-	// proxy_get_buffer_status(type, length_ptr, flags_ptr) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_get_buffer_status")
-
-	// stream-control (2)
-	// proxy_continue_stream(stream_type) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_ uint32) uint32 { return stub() }).
-		Export("proxy_continue_stream")
-	// proxy_close_stream(stream_type) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_ uint32) uint32 { return stub() }).
-		Export("proxy_close_stream")
-
-	// timer (1)
-	// proxy_set_tick_period_milliseconds(tick_period_milliseconds) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_ uint32) uint32 { return stub() }).
-		Export("proxy_set_tick_period_milliseconds")
-
-	// metric (4)
-	// proxy_define_metric(metric_type, name_ptr, name_size, metric_id_ptr) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_define_metric")
-	// proxy_get_metric(metric_id, result_uint64_ptr) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _ uint32) uint32 { return stub() }).
-		Export("proxy_get_metric")
-	// proxy_increment_metric(metric_id, offset:int64) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_ uint32, _ int64) uint32 { return stub() }).
-		Export("proxy_increment_metric")
-	// proxy_record_metric(metric_id, value:uint64) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_ uint32, _ uint64) uint32 { return stub() }).
-		Export("proxy_record_metric")
-
-	// shared-data (2)
-	// proxy_get_shared_data(key_ptr, key_size, value_ptr_ptr, value_size_ptr, cas_ptr) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_get_shared_data")
-	// proxy_set_shared_data(key_ptr, key_size, value_ptr, value_size, cas) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_set_shared_data")
 
 	// shared-queue (4)
 	// proxy_register_shared_queue(queue_name_ptr, queue_name_size, token_ptr) -> i32
@@ -660,14 +899,6 @@ func registerDeferredStubs(b wazero.HostModuleBuilder) {
 	b.NewFunctionBuilder().
 		WithFunc(func(_, _, _ uint32) uint32 { return stub() }).
 		Export("proxy_enqueue_shared_queue")
-
-	// outbound HTTP (1)
-	// proxy_http_call(uri_ptr, uri_size, header_pairs_ptr, header_pairs_size,
-	//                 body_ptr, body_size, trailer_pairs_ptr, trailer_pairs_size,
-	//                 timeout_milliseconds, token_ptr) -> i32  (10 args)
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _, _, _, _, _, _, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_http_call")
 
 	// outbound gRPC (5)
 	// proxy_grpc_call(service_ptr, service_size, service_name_ptr, service_name_size,
@@ -694,12 +925,6 @@ func registerDeferredStubs(b wazero.HostModuleBuilder) {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ uint32) uint32 { return stub() }).
 		Export("proxy_grpc_close")
-
-	// foreign-function (1)
-	// proxy_call_foreign_function(function_name, function_name_size, arguments, arguments_size, results, results_size) -> i32
-	b.NewFunctionBuilder().
-		WithFunc(func(_, _, _, _, _, _ uint32) uint32 { return stub() }).
-		Export("proxy_call_foreign_function")
 }
 
 // --- helpers --------------------------------------------------------------
@@ -797,9 +1022,10 @@ func writeReturnBuffer(ctx context.Context, mod api.Module, data []byte, ptrPtr,
 	return abi.WasmResultOk
 }
 
-// Compile-time guard: ensure *VM satisfies the wasiHost interface required
-// by the wasi.go shims at Task 4 (IsAllowed + LogProxy methods).
-var _ wasiHost = (*VM)(nil)
+// Compile-time guard: ensure *RootVM satisfies the wasiHost interface
+// required by the wasi.go shims (IsAllowed + LogProxy methods). The 25.1
+// *VM equivalent guard moved here as part of D-P-PLAN-6.
+var _ wasiHost = (*RootVM)(nil)
 
 // Compile-time guard: ensure HeaderPair is the shared type from pairs.go
 // (Task 3) — re-confirms cross-file identity for the ABICallbacks interface.

@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\x04')
+byte('\x03')
+uint32(0)
+uint64(0)
+[]byte("cap_boundary_trigger")

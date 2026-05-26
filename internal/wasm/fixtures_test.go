@@ -83,12 +83,13 @@ const (
 
 // WASM opcode encodings used in this file.
 const (
-	opEnd      = 0x0b
-	opCall     = 0x10
-	opLocalGet = 0x20 // not used yet — reserved for future fixtures
-	opI32Const = 0x41
-	opI32Store = 0x36
-	opDrop     = 0x1a
+	opUnreachable = 0x00
+	opEnd         = 0x0b
+	opCall        = 0x10
+	opLocalGet    = 0x20 // not used yet — reserved for future fixtures
+	opI32Const    = 0x41
+	opI32Store    = 0x36
+	opDrop        = 0x1a
 )
 
 // funcType encodes a (params, results) type signature.
@@ -263,6 +264,10 @@ var minimalInitModule = buildModule(
 //
 // Exports a 1-page memory + a non-init function + the ABI sentinel. Used
 // to verify Run handles modules without _initialize / _start gracefully.
+// (Held for use by future Tasks 2-22 lifecycle tests; the 25.1 vm_test.go
+// consumer is gone after Task 1's vm.go DELETE per D-P-PLAN-6.)
+//
+//nolint:unused // retained for forward Task 2-22 lifecycle tests
 var noInitModule = buildModule(
 	typeSection([2][]byte{
 		nil, nil, // () -> ()
@@ -381,32 +386,231 @@ var onRequestHeadersInvokesLogModule = buildModule(
 	}),
 )
 
-// --- Fixture: invokeContinueStreamModule ----------------------------------
+// --- Fixture: invokeSetTickPeriodModule -----------------------------------
 //
-// Imports `env.proxy_continue_stream(i32) -> i32` (a deferred-stub hostcall)
-// and exports `invoke_continue_stream() -> i32` that calls
-// proxy_continue_stream(0) + returns its result. Used to verify the
-// deferred-stub returns WasmResultUnimplemented (=12).
-var invokeContinueStreamModule = buildModule(
+// Imports `env.proxy_set_tick_period_milliseconds(i32) -> i32` (a 25.2 NEW
+// gated hostcall per AMEND-B5 that LANDED its real impl at Task 5) and
+// exports `invoke_set_tick_period() -> i32` that calls
+// proxy_set_tick_period_milliseconds(100) + returns its result.
+//
+// AT TASK 5: this fixture is no longer used by the panic-discipline test
+// (the real impl returns Ok now); RETAINED here for use by future Task 14
+// configure-time tests that exercise the per-RootVM SetTickPeriod hostcall
+// via the guest. The panic-discipline coverage migrated to
+// invokeGetSharedDataModule below (which targets the still-Task-6-deferred
+// proxy_get_shared_data placeholder).
+//
+//nolint:unused // retained for forward Task 14 configure-time tests
+var invokeSetTickPeriodModule = buildModule(
 	typeSection(
-		[2][]byte{{wasmTypeI32}, {wasmTypeI32}}, // type 0: (i32) -> i32 (proxy_continue_stream)
-		[2][]byte{nil, {wasmTypeI32}},           // type 1: () -> i32 (invoke_continue_stream)
+		[2][]byte{{wasmTypeI32}, {wasmTypeI32}}, // type 0: (i32) -> i32 (proxy_set_tick_period_milliseconds)
+		[2][]byte{nil, {wasmTypeI32}},           // type 1: () -> i32 (invoke_set_tick_period)
 		[2][]byte{nil, nil},                     // type 2: () -> () (sentinel)
 	),
 	importSection([]importEntry{
-		{module: "env", name: "proxy_continue_stream", kind: wasmExtFunction, idx: 0},
+		{module: "env", name: "proxy_set_tick_period_milliseconds", kind: wasmExtFunction, idx: 0},
 	}),
 	functionSection([]uint32{1, 2}),
 	memorySection(1),
 	exportSection([]exportEntry{
-		{name: "invoke_continue_stream", kind: wasmExtFunction, idx: 1},
+		{name: "invoke_set_tick_period", kind: wasmExtFunction, idx: 1},
 		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 2},
 		{name: "memory", kind: wasmExtMemory, idx: 0},
 	}),
 	codeSection([][]byte{
 		funcBody(
-			i32Const(0), // stream_type
-			call(0),     // proxy_continue_stream → returns i32 on stack (the function result)
+			i32Const(100), // period_ms = 100
+			call(0),       // proxy_set_tick_period_milliseconds → returns i32 on stack
+		),
+		funcBody(),
+	}),
+)
+
+// --- Fixture: invokeGetSharedDataModule -----------------------------------
+//
+// Imports `env.proxy_get_shared_data(5 × i32) -> i32` (a 25.2 NEW gated
+// hostcall per AMEND-B5 that LANDED its real impl at Task 6) and exports
+// `invoke_get_shared_data() -> i32` that calls proxy_get_shared_data(0,0,
+// 0,0,0) + returns its result.
+//
+// AT TASK 6: this fixture is no longer used by the panic-discipline test
+// (the real impl returns NotFound on an empty/zero-key Get now); RETAINED
+// here for use by future Task 14+ tests that exercise the per-RootVM
+// SetSharedData / GetSharedData hostcalls via the guest. The panic-
+// discipline coverage migrated to invokeCallForeignFunctionModule below
+// (which targets the still-Task-7-deferred proxy_call_foreign_function
+// placeholder).
+//
+//nolint:unused // retained for forward Task 14+ shared-data guest-side tests
+var invokeGetSharedDataModule = buildModule(
+	typeSection(
+		[2][]byte{nI32Params(5), {wasmTypeI32}}, // type 0: (5 × i32) -> i32 (proxy_get_shared_data)
+		[2][]byte{nil, {wasmTypeI32}},           // type 1: () -> i32 (invoke_get_shared_data)
+		[2][]byte{nil, nil},                     // type 2: () -> () (sentinel)
+	),
+	importSection([]importEntry{
+		{module: "env", name: "proxy_get_shared_data", kind: wasmExtFunction, idx: 0},
+	}),
+	functionSection([]uint32{1, 2}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "invoke_get_shared_data", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 2},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(
+			i32Const(0), // key_data
+			i32Const(0), // key_size
+			i32Const(0), // ret_value_data
+			i32Const(0), // ret_value_size
+			i32Const(0), // ret_cas
+			call(0),     // proxy_get_shared_data → returns i32 on stack
+		),
+		funcBody(),
+	}),
+)
+
+// --- Fixture: invokeCallForeignFunctionModule -----------------------------
+//
+// Imports `env.proxy_call_foreign_function(6 × i32) -> i32` (a 25.2 NEW
+// gated hostcall per AMEND-B5 that LANDED its real impl at Task 7) and
+// exports `invoke_call_foreign_function() -> i32` that calls
+// proxy_call_foreign_function(0,0,0,0,0,0) + returns its result.
+//
+// AT TASK 7: this fixture is no longer used by the panic-discipline test
+// (the real impl returns NotFound on an empty/zero-name Get against the
+// EMPTY default registry now); RETAINED here for use by future Task 14+
+// tests that exercise the per-RootVM CallForeignFunction hostcall via the
+// guest. The panic-discipline coverage migrated to invokeHttpCallModule
+// below (which targets the still-Task-8-deferred proxy_http_call
+// placeholder).
+//
+//nolint:unused // retained for forward Task 14+ foreign-function guest-side tests
+var invokeCallForeignFunctionModule = buildModule(
+	typeSection(
+		[2][]byte{nI32Params(6), {wasmTypeI32}}, // type 0: (6 × i32) -> i32 (proxy_call_foreign_function)
+		[2][]byte{nil, {wasmTypeI32}},           // type 1: () -> i32 (invoke_call_foreign_function)
+		[2][]byte{nil, nil},                     // type 2: () -> () (sentinel)
+	),
+	importSection([]importEntry{
+		{module: "env", name: "proxy_call_foreign_function", kind: wasmExtFunction, idx: 0},
+	}),
+	functionSection([]uint32{1, 2}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "invoke_call_foreign_function", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 2},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(
+			i32Const(0), // name_data
+			i32Const(0), // name_size
+			i32Const(0), // args_data
+			i32Const(0), // args_size
+			i32Const(0), // ret_results_data
+			i32Const(0), // ret_results_size
+			call(0),     // proxy_call_foreign_function → returns i32 on stack
+		),
+		funcBody(),
+	}),
+)
+
+// --- Fixture: invokeHttpCallModule ----------------------------------------
+//
+// Imports `env.proxy_http_call(10 × i32) -> i32` (a 25.2 NEW gated hostcall
+// per AMEND-B5 that LANDED its real impl at Task 8) and exports
+// `invoke_http_call() -> i32` that calls proxy_http_call(0,...,0) +
+// returns its result.
+//
+// AT TASK 8: this fixture is no longer used by the panic-discipline test
+// (the real impl returns InternalFailure on no-dispatcher-wired now);
+// RETAINED here for use by future Task 14+ tests that exercise the
+// per-RootVM DispatchHttpCall hostcall via the guest. The panic-discipline
+// coverage migrated to invokeDefineMetricModule below (which targets the
+// still-Task-12-deferred proxy_define_metric placeholder).
+//
+// Re-target trail: panic-discipline test originally hit
+// proxy_continue_stream (LIFTED at Task 4) → proxy_set_tick_period_milliseconds
+// (LIFTED at Task 5) → proxy_get_shared_data (LIFTED at Task 6) →
+// proxy_call_foreign_function (LIFTED at Task 7) → proxy_http_call
+// (LIFTED at Task 8) → proxy_define_metric (still pending at Task 12 —
+// see invokeDefineMetricModule below).
+//
+//nolint:unused // retained for forward Task 14+ http_call guest-side tests
+var invokeHttpCallModule = buildModule(
+	typeSection(
+		[2][]byte{nI32Params(10), {wasmTypeI32}}, // type 0: (10 × i32) -> i32 (proxy_http_call)
+		[2][]byte{nil, {wasmTypeI32}},            // type 1: () -> i32 (invoke_http_call)
+		[2][]byte{nil, nil},                      // type 2: () -> () (sentinel)
+	),
+	importSection([]importEntry{
+		{module: "env", name: "proxy_http_call", kind: wasmExtFunction, idx: 0},
+	}),
+	functionSection([]uint32{1, 2}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "invoke_http_call", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 2},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(
+			i32Const(0), // cluster_data
+			i32Const(0), // cluster_size
+			i32Const(0), // headers_data
+			i32Const(0), // headers_size
+			i32Const(0), // body_data
+			i32Const(0), // body_size
+			i32Const(0), // trailers_data
+			i32Const(0), // trailers_size
+			i32Const(0), // timeout_ms
+			i32Const(0), // ret_call_id_ptr
+			call(0),     // proxy_http_call → returns i32 on stack
+		),
+		funcBody(),
+	}),
+)
+
+// --- Fixture: invokeDefineMetricModule — RETIRED at Task 12 ---------------
+//
+// This fixture supported the placeholder-panic-discipline test re-targeted
+// across Tasks 4-8 to point at the still-stub hostcall (last re-target
+// pointed at proxy_define_metric). With Task 12 landing the real metric
+// shims (abi/metrics.go), no Task-3 forward-decl placeholders remain in
+// abi/stubs_25_2.go — the placeholder-panic discipline is RETIRED. The
+// general panic-wrapper invariant remains covered by the per-family abi
+// non-Host-value tests + stream_context_test.go panic-recovery patterns
+// (see registration_test.go panic-discipline-test history doc).
+
+// --- Fixture: invokeGrpcCancelModule --------------------------------------
+//
+// Imports `env.proxy_grpc_cancel(i32) -> i32` (a STILL-deferred stub at
+// 25.2 per §5.4 — gRPC family deferred to WASM host family per §2.8) and
+// exports `invoke_grpc_cancel() -> i32` that calls proxy_grpc_cancel(0) +
+// returns its result. Used by TestRegistration_DeferredStub_Unimplemented
+// to verify the still-deferred stub returns WasmResultUnimplemented (=12).
+var invokeGrpcCancelModule = buildModule(
+	typeSection(
+		[2][]byte{{wasmTypeI32}, {wasmTypeI32}}, // type 0: (i32) -> i32 (proxy_grpc_cancel)
+		[2][]byte{nil, {wasmTypeI32}},           // type 1: () -> i32 (invoke_grpc_cancel)
+		[2][]byte{nil, nil},                     // type 2: () -> () (sentinel)
+	),
+	importSection([]importEntry{
+		{module: "env", name: "proxy_grpc_cancel", kind: wasmExtFunction, idx: 0},
+	}),
+	functionSection([]uint32{1, 2}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "invoke_grpc_cancel", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 2},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(
+			i32Const(0), // token
+			call(0),     // proxy_grpc_cancel → returns i32 on stack (the function result)
 		),
 		funcBody(),
 	}),
@@ -492,6 +696,37 @@ var lifecycleOrderModule = buildModule(
 		),
 		funcBody(), // _initialize: no-op
 		funcBody(), // proxy_abi_version_0_2_1: no-op
+	}),
+)
+
+// --- Fixture: contextCreateTrapsModule ------------------------------------
+//
+// Exports `proxy_on_context_create(ctx_id, parent_ctx_id) -> ()` whose body
+// is a single `unreachable` opcode (0x00) — the canonical wazero-trap
+// instruction. Used to verify RootVM.NewStreamContext's rollback path
+// (delete(rv.streamCtxs, id) on dispatch failure per SHOULD-FIX-5 review
+// finding). Also exports the ABI sentinel + a 1-page memory; _initialize
+// is intentionally OMITTED so Configure-time proxy_on_context_create (root
+// seeding) ALSO traps — the test constructs the RootVM but does NOT call
+// Configure (it exercises NewStreamContext directly).
+var contextCreateTrapsModule = buildModule(
+	typeSection(
+		[2][]byte{{wasmTypeI32, wasmTypeI32}, nil}, // type 0: (i32,i32) -> ()  — proxy_on_context_create
+		[2][]byte{nil, nil},                        // type 1: () -> ()         — sentinel
+	),
+	functionSection([]uint32{0, 1}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "proxy_on_context_create", kind: wasmExtFunction, idx: 0},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 1},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		// proxy_on_context_create body: single `unreachable` opcode -> wazero trap.
+		funcBody(
+			[]byte{opUnreachable},
+		),
+		funcBody(), // sentinel: no-op
 	}),
 )
 
@@ -678,6 +913,108 @@ var fullRosterImporterModule = func() []byte {
 		}),
 	)
 }()
+
+// --- Fixture: importerSetTickPeriodModule ---------------------------------
+//
+// Imports `env.proxy_set_tick_period_milliseconds(i32) -> i32` but does
+// NOT call it. Used by TestRegistration_NewHostcall_DenyRejectsGuest-
+// Instantiation_25_2 to verify the gate-at-registration deny-path
+// observable from a guest: under a sandbox that denies
+// `proxy_set_tick_period_milliseconds`, `runtime.Instantiate` of this
+// fixture FAILS with an "unknown import" error per AMEND-B5.
+var importerSetTickPeriodModule = buildModule(
+	typeSection(
+		[2][]byte{{wasmTypeI32}, {wasmTypeI32}}, // type 0: (i32) -> i32 — proxy_set_tick_period_milliseconds
+		[2][]byte{nil, nil},                     // type 1: () -> () — sentinel + _initialize
+	),
+	importSection([]importEntry{
+		{module: "env", name: "proxy_set_tick_period_milliseconds", kind: wasmExtFunction, idx: 0},
+	}),
+	functionSection([]uint32{1, 1}), // local fn 0 = _initialize; local fn 1 = sentinel
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "_initialize", kind: wasmExtFunction, idx: 1},             // global fn idx 1 (after 1 import)
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 2}, // global fn idx 2
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(), // _initialize: no-op
+		funcBody(), // sentinel: no-op
+	}),
+)
+
+// --- Fixture: exportsAll25_2CallbacksModule -------------------------------
+//
+// Exports all 7 NEW 25.2 lifecycle callbacks per §5.3 (rows C14-C20). Each
+// body is empty (returns the default zero — ProxyActionContinue for body+
+// trailer callbacks; void for tick + httpCallResponse + foreignFunction).
+// Used by TestGateAtRegistration_NewCallback_HasGlobalFunc_{Allow,Deny}
+// to verify the gate-at-getFunction discipline per AMEND-B5: when the
+// capability is denied, HasGlobalFunc returns false EVEN THOUGH the guest
+// exports the function.
+//
+// Type indices:
+//
+//	0: (i32, i32, i32) -> i32   — proxy_on_request_body / response_body
+//	1: (i32, i32) -> i32        — proxy_on_request_trailers / response_trailers
+//	2: (i32) -> ()              — proxy_on_tick
+//	3: (i32, i32, i32, i32, i32) -> ()  — proxy_on_http_call_response
+//	4: (i32, i32, i32) -> ()    — proxy_on_foreign_function
+//	5: () -> ()                 — _initialize + sentinel
+var exportsAll25_2CallbacksModule = buildModule(
+	typeSection(
+		[2][]byte{{wasmTypeI32, wasmTypeI32, wasmTypeI32}, {wasmTypeI32}},                 // type 0: request_body / response_body
+		[2][]byte{{wasmTypeI32, wasmTypeI32}, {wasmTypeI32}},                              // type 1: request_trailers / response_trailers
+		[2][]byte{{wasmTypeI32}, nil},                                                     // type 2: proxy_on_tick (void)
+		[2][]byte{{wasmTypeI32, wasmTypeI32, wasmTypeI32, wasmTypeI32, wasmTypeI32}, nil}, // type 3: proxy_on_http_call_response (void, 5 args)
+		[2][]byte{{wasmTypeI32, wasmTypeI32, wasmTypeI32}, nil},                           // type 4: proxy_on_foreign_function (void, 3 args)
+		[2][]byte{nil, nil}, // type 5: () -> () — _initialize + sentinel
+	),
+	functionSection([]uint32{
+		0, // fn 0: proxy_on_request_body  (type 0)
+		0, // fn 1: proxy_on_response_body (type 0)
+		1, // fn 2: proxy_on_request_trailers  (type 1)
+		1, // fn 3: proxy_on_response_trailers (type 1)
+		2, // fn 4: proxy_on_tick           (type 2)
+		3, // fn 5: proxy_on_http_call_response (type 3)
+		4, // fn 6: proxy_on_foreign_function   (type 4)
+		5, // fn 7: _initialize             (type 5)
+		5, // fn 8: proxy_abi_version_0_2_1 (type 5)
+	}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "proxy_on_request_body", kind: wasmExtFunction, idx: 0},
+		{name: "proxy_on_response_body", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_on_request_trailers", kind: wasmExtFunction, idx: 2},
+		{name: "proxy_on_response_trailers", kind: wasmExtFunction, idx: 3},
+		{name: "proxy_on_tick", kind: wasmExtFunction, idx: 4},
+		{name: "proxy_on_http_call_response", kind: wasmExtFunction, idx: 5},
+		{name: "proxy_on_foreign_function", kind: wasmExtFunction, idx: 6},
+		{name: "_initialize", kind: wasmExtFunction, idx: 7},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 8},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		// proxy_on_request_body: return 0 (Continue)
+		funcBody(i32Const(0)),
+		// proxy_on_response_body: return 0
+		funcBody(i32Const(0)),
+		// proxy_on_request_trailers: return 0
+		funcBody(i32Const(0)),
+		// proxy_on_response_trailers: return 0
+		funcBody(i32Const(0)),
+		// proxy_on_tick: void
+		funcBody(),
+		// proxy_on_http_call_response: void
+		funcBody(),
+		// proxy_on_foreign_function: void
+		funcBody(),
+		// _initialize: no-op
+		funcBody(),
+		// sentinel: no-op
+		funcBody(),
+	}),
+)
 
 // --- silence-unused guards ------------------------------------------------
 

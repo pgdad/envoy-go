@@ -1,35 +1,40 @@
 package wasm
 
-// encode_headers.go — EncodeHeaders dispatcher per 25.1 SPEC §4.3 +
-// OnDestroy lifecycle per parent SPEC §3.5.
+// encode_headers.go — EncodeHeaders dispatcher per 25.2 SPEC §4.3 +
+// OnDestroy lifecycle per parent SPEC §3.5 (REVISED at Task 18 for root-VM
+// model).
 //
 // Mirrors DecodeHeaders for the encode side; RE-USES the per-stream
-// *wasm.VM allocated at DecodeHeaders (the *filter holds vm; encode just
-// dispatches proxy_on_response_headers + handles the captured-local-
-// response / ProxyAction return shapes identically).
+// *wasm.StreamContext allocated at DecodeHeaders (the *filter holds streamCtx;
+// encode just dispatches proxy_on_response_headers + handles the captured-
+// local-response / ProxyAction return shapes identically).
 //
-// At 25.1 there is NO encode-side VM construction path: if DecodeHeaders
-// bailed at the nil-cfg pass-through OR at the initVM error fail-OPEN,
-// f.vm is nil and EncodeHeaders short-circuits to Continue. Matches
-// upstream wasm's encode-side null-vm parity.
+// At 25.2 there is NO encode-side StreamContext construction path: if
+// DecodeHeaders bailed at the nil-cfg pass-through OR at the initStreamContext
+// error fail-OPEN, f.streamCtx is nil and EncodeHeaders short-circuits to
+// Continue. Matches upstream wasm's encode-side null-vm parity.
 //
-// # OnDestroy lifecycle (per 25.1 SPEC §4.3 step list + parent §3.5)
+// # OnDestroy lifecycle (per 25.2 SPEC §4.3 step list + parent §3.5 +
+// # AMEND-B3 cancel-at-destruction)
 //
 // OnDestroy is the per-stream finalize callback per ADR-0071. The shape is:
 //
-//   1. CallProxyOnDone(streamContextID): guest's chance to signal it is
-//      done (returning false would defer finalize per SPEC §3.1; at 25.1
-//      we don't honor the defer — proceed to teardown unconditionally
-//      because the framework's per-stream OnDestroy IS the teardown).
-//   2. CallProxyOnLog(streamContextID): guest's last per-stream log point.
-//   3. CallProxyOnDelete(streamContextID): context teardown on the guest.
-//   4. vm.Close(): releases the wazero.Runtime.
-//   5. Decrement the Group-B active gauge.
+//   1. streamCtx.Close(ctx) — fires the 3 lifecycle teardown callbacks
+//      (proxy_on_done → proxy_on_log → proxy_on_delete) + cancels any
+//      outstanding httpCalls dispatched from this stream context
+//      (cancel-at-destruction per AMEND-B3 + R-25.2-3; the cancel walk
+//      lives at internal/wasm/stream_context.go Close).
+//   2. cfg.rootCB.unregister(streamContextID) — removes the per-stream
+//      *abiCallbacks from the per-RootVM multiplexer so stray late
+//      hostcalls route to the no-op fallback rather than the freed
+//      per-stream state.
+//   3. Decrement the Group-B active gauge.
 //
 // All errors during teardown are logged + counted (envoy_go.failures.Inc())
-// but do not abort the teardown — the runtime MUST be released even if a
-// guest callback errors. Idempotent — second OnDestroy against a nil vm
-// is a no-op.
+// but do not abort the teardown — the per-stream context MUST be released
+// even if a guest callback errors. Idempotent — second OnDestroy against a
+// nil streamCtx is a no-op (streamCtx.Close is itself idempotent via
+// sync.Once).
 
 import (
 	"context"
@@ -39,16 +44,16 @@ import (
 	"github.com/esalaine/envoy-go/internal/wasm/abi"
 )
 
-// EncodeHeaders implements envoyhttp.StreamEncoderFilter per 25.1 SPEC §4.3.
+// EncodeHeaders implements envoyhttp.StreamEncoderFilter per 25.2 SPEC §4.3.
 // Symmetric to DecodeHeaders for the encode side; reuses the per-stream
-// *wasm.VM constructed at DecodeHeaders entry.
+// *wasm.StreamContext constructed at DecodeHeaders entry.
 func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.FilterHeadersStatus {
-	// Defensive nil-cfg / nil-vm short-circuit. nil-vm fires when
-	// DecodeHeaders bailed at the nil-cfg pass-through OR at the initVM
-	// error fail-OPEN; in either case the encode side has no per-stream
-	// VM to dispatch + must pass through. Matches upstream wasm's
-	// encode-side null-vm parity.
-	if f.cfg == nil || f.vm == nil {
+	// Defensive nil-cfg / nil-streamCtx short-circuit. nil-streamCtx fires
+	// when DecodeHeaders bailed at the nil-cfg pass-through OR at the
+	// initStreamContext error fail-OPEN; in either case the encode side has
+	// no per-stream context to dispatch + must pass through. Matches
+	// upstream wasm's encode-side null-vm parity.
+	if f.cfg == nil || f.streamCtx == nil {
 		return envoyhttp.Continue
 	}
 
@@ -70,7 +75,7 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	// post-l_test_e probe).
 
 	numHeaders := numHeaderValues(headers)
-	action, err := f.vm.CallProxyOnResponseHeaders(ctx, f.streamContextID, numHeaders, endStream)
+	action, err := f.streamCtx.CallProxyOnResponseHeaders(ctx, numHeaders, endStream)
 	if err != nil {
 		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
 			f.cfg.stats.envoyGoFailures.Inc()
@@ -84,14 +89,14 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	// EncoderFilterCallbacks does NOT expose SendLocalReply (only the
 	// decode side does, per the upstream contract: local replies entering
 	// from the encode side would loop back through the encode chain).
-	// At 25.1 we consume the capture + log a warning; the StopIteration
+	// At 25.2 we consume the capture + log a warning; the StopIteration
 	// return prevents the response from continuing through the chain so
 	// the guest's intent (do not emit this response) is honored even if
 	// the SendLocalReply itself is not.
 	if f.sentLocalResponse != nil {
 		captured := f.sentLocalResponse
 		f.sentLocalResponse = nil // consume; idempotent against double-dispatch
-		logf("WARN wasm: proxy_send_local_response from proxy_on_response_headers (stream=%d, status=%d) — EncoderFilterCallbacks does not expose SendLocalReply at 25.1; stopping iteration",
+		logf("WARN wasm: proxy_send_local_response from proxy_on_response_headers (stream=%d, status=%d) — EncoderFilterCallbacks does not expose SendLocalReply at 25.2; stopping iteration",
 			f.streamContextID, captured.statusCode)
 		return envoyhttp.StopIteration
 	}
@@ -99,7 +104,7 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	// ProxyAction handling — identical to the decode side.
 	switch action {
 	case abi.ProxyActionPause:
-		logf("INFO wasm: proxy_on_response_headers returned PAUSE without captured local response — stream-control deferred to 25.2 (parent §1 architectural primitive 6); continuing")
+		logf("INFO wasm: proxy_on_response_headers returned PAUSE without captured local response — stream-control deferred (parent §1 architectural primitive 6); continuing")
 		return envoyhttp.Continue
 	case abi.ProxyActionContinue:
 		fallthrough
@@ -108,17 +113,9 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	}
 }
 
-// EncodeData is a no-op pass-through at 25.1 per parent SPEC §3.5 +
-// 25.1 SPEC §4.3 (headers-bridge subset only). Body bridge lands at 25.2.
-func (f *filter) EncodeData(_ []byte, _ bool) envoyhttp.FilterDataStatus {
-	return envoyhttp.DataContinue
-}
-
-// EncodeTrailers is a no-op pass-through at 25.1 per parent SPEC §3.5 +
-// 25.1 SPEC §4.3 (headers-bridge subset only). Trailers bridge lands at 25.2.
-func (f *filter) EncodeTrailers(_ gohttp.Header) envoyhttp.FilterTrailersStatus {
-	return envoyhttp.TrailersContinue
-}
+// EncodeData + EncodeTrailers landed at 25.2 IMPL Task 16 — see body.go +
+// trailers.go for the per-stream body-buffer accumulator + cap-enforcement
+// + trailer-dispatch shape per 25.2 SPEC §4.3 + Q1 + Q2.
 
 // SetEncoderCallbacks stores the framework-supplied per-stream callback
 // reference for the encode-side per ADR-0196 D-P3 first co-consumer — the
@@ -126,53 +123,58 @@ func (f *filter) EncodeTrailers(_ gohttp.Header) envoyhttp.FilterTrailersStatus 
 // the guest's proxy_get_status hostcall (Task 11).
 func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.encoderCb = cb }
 
-// OnDestroy is the per-stream finalize callback per ADR-0071 + 25.1 SPEC §4.3.
-// Idempotent — second OnDestroy is a no-op against a nil vm. See the file-
-// header comment for the full step list + error-handling disposition.
+// OnDestroy is the per-stream finalize callback per ADR-0071 + 25.2 SPEC §4.3.
+// Idempotent — second OnDestroy is a no-op against a nil streamCtx. See the
+// file-header comment for the full step list + error-handling disposition.
+//
+// REVISED at Task 18 for the root-VM model:
+//
+//   - Replaces the 25.1 manual CallProxyOnDone + CallProxyOnLog +
+//     CallProxyOnDelete + vm.Close sequence with a single streamCtx.Close
+//     call which encapsulates all 4 lifecycle steps + cancel-at-destruction
+//     per AMEND-B3.
+//   - Unregisters the per-stream *abiCallbacks from the per-RootVM
+//     multiplexer so stray hostcalls route to the no-op fallback.
+//   - Group-B active gauge decrements at the same site.
 func (f *filter) OnDestroy() {
-	if f.vm == nil {
+	if f.streamCtx == nil {
 		return
 	}
 
 	ctx := context.Background()
 
-	// Step 1: CallProxyOnDone — guest signals done. Defer-finalize is
-	// not honored at 25.1 (proceed to teardown regardless).
-	if _, err := f.vm.CallProxyOnDone(ctx, f.streamContextID); err != nil {
+	// streamCtx.Close fires (in order, idempotent via sync.Once):
+	//   - CallProxyOnDone (guest's chance to signal done; defer-finalize
+	//     not honored at 25.2)
+	//   - CallProxyOnLog (guest's last per-stream log point)
+	//   - CallProxyOnDelete (context teardown on the guest)
+	//   - cancelOutstandingHttpCalls(streamCtxID) per AMEND-B3 + R-25.2-3
+	//   - removes the streamCtxID entry from rv.streamCtxs
+	//
+	// Errors are logged + counted but do not abort the teardown — the
+	// per-stream context MUST be released even if a guest callback errors.
+	if err := f.streamCtx.Close(ctx); err != nil {
 		if f.cfg != nil && f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
 			f.cfg.stats.envoyGoFailures.Inc()
 		}
-		logf("ERROR wasm: CallProxyOnDone(stream=%d): %v", f.streamContextID, err)
-		// Continue teardown — the runtime MUST be released.
+		logf("ERROR wasm: streamCtx.Close(stream=%d): %v", f.streamContextID, err)
 	}
 
-	// Step 2: CallProxyOnLog — guest's last per-stream log point.
-	if err := f.vm.CallProxyOnLog(ctx, f.streamContextID); err != nil {
-		if f.cfg != nil && f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
-		}
-		logf("ERROR wasm: CallProxyOnLog(stream=%d): %v", f.streamContextID, err)
+	// Unregister from the per-RootVM rootABICallbacks multiplexer. After
+	// this point, any stray hostcalls fired against streamContextID route
+	// to the multiplexer's no-op fallback rather than the freed per-stream
+	// *abiCallbacks / *filter state. Per AMEND-B3: the cancel-at-
+	// destruction walk inside streamCtx.Close above cancels outstanding
+	// httpCalls; any response that slipped through (the cancel race) is
+	// counted via the http_call_response_after_close counter at the
+	// http_call.go response-dispatch path.
+	if f.cfg != nil && f.cfg.rootCB != nil {
+		f.cfg.rootCB.unregister(f.streamContextID)
 	}
 
-	// Step 3: CallProxyOnDelete — context teardown on the guest.
-	if err := f.vm.CallProxyOnDelete(ctx, f.streamContextID); err != nil {
-		if f.cfg != nil && f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
-		}
-		logf("ERROR wasm: CallProxyOnDelete(stream=%d): %v", f.streamContextID, err)
-	}
+	f.streamCtx = nil
 
-	// Step 4: vm.Close — releases the wazero.Runtime. Idempotent at the
-	// vm.Close level (second Close returns nil with no side effects).
-	if err := f.vm.Close(); err != nil {
-		if f.cfg != nil && f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
-		}
-		logf("ERROR wasm: vm.Close(stream=%d): %v", f.streamContextID, err)
-	}
-	f.vm = nil
-
-	// Step 5: Group-B active gauge decrement per AMEND-A2.
+	// Group-B active gauge decrement per AMEND-A2.
 	if f.cfg != nil && f.cfg.stats != nil && f.cfg.stats.active != nil {
 		f.cfg.stats.active.Dec()
 	}

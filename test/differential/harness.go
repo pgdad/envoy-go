@@ -351,6 +351,42 @@ type BootRejectFixture interface {
 	ExpectedBootErrorSubstring() string
 }
 
+// SubjectOnlyBootRejectFixture is an OPTIONAL sibling-interface extension to
+// BootRejectFixture, introduced at phase 25.2 IMPL Task 21 for fixture-0037
+// per 25.2 SPEC §8.2 + D-25.2-P1 closure. It signals the runner that the
+// boot-reject is SUBJECT-ONLY — the envoy-go subject MUST boot-reject with
+// the substring (ExpectedBootErrorSubstring()) in its stderr, but the
+// reference Envoy v1.37.2 MUST boot SUCCESSFULLY because the trigger is an
+// envoy-go-strict-only validator (e.g., arm 19 envoy_go_strict_body_buffer_
+// cap_bytes = 0) for which upstream Envoy has NO equivalent field — the
+// unknown extension field is silently dropped by upstream's protobuf parser.
+//
+// Drivers that implement BootRejectFixture but NOT this interface default to
+// the SYMMETRIC boot-reject discipline (both sides must boot-reject with the
+// substring; the existing fixture-0026/0029/0031/0033/0035 precedent).
+//
+// Drivers that implement BOTH interfaces and return true from SubjectOnly()
+// get the asymmetric discipline:
+//  1. Render the reference bootstrap via ReferenceBootstrap(); start the
+//     reference proxy via tryStartReferenceProxy; assert it boots SUCCESSFULLY
+//     (cancel returned non-nil, err is nil). Tear down the reference proxy.
+//  2. Render the subject config via SubjectConfig(); start the subject via
+//     tryStartSubjectProxy; assert it boot-REJECTS (cancel is nil, err is
+//     non-nil) with the substring in its stderr.
+//  3. Skip the cross-side request/response phase entirely (no driving of
+//     either side; this is a config-load-only fixture).
+//
+// Per reference_differential_fixture_dispatch_constraint: one fixture dir =
+// ONE runner branch. Fixture-0037 occupies the subject-only-boot-reject
+// branch; the existing fixture-0035 occupies the symmetric-boot-reject
+// branch; the cross-side fixture-0036 occupies the cross-side branch.
+type SubjectOnlyBootRejectFixture interface {
+	// SubjectOnly returns true to opt into the asymmetric subject-only-boot-
+	// reject discipline. Drivers returning false (or not implementing this
+	// interface) default to the symmetric boot-reject discipline.
+	SubjectOnly() bool
+}
+
 // bootRejectTimeout is the wall-clock budget the harness gives each proxy to
 // exit with a boot-reject before tryStart* gives up. Generous: the reference
 // container exits within a few seconds typically; the subject subprocess exits
@@ -380,10 +416,19 @@ const bootRejectTimeout = 20 * time.Second
 // deadline, whichever fires first). The capture is best-effort — Docker's log
 // retrieval can lag a moment after the container exits; the harness reads
 // until EOF or context cancellation.
-func tryStartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, listenerPorts ...int) (cancel func(), stderrBuf *bytes.Buffer, err error) {
+func tryStartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, hostMounts []fixture.HostMount, listenerPorts ...int) (cancel func(), stderrBuf *bytes.Buffer, err error) {
 	exposed := []string{"9901/tcp"}
 	for _, p := range listenerPorts {
 		exposed = append(exposed, fmt.Sprintf("%d/tcp", p))
+	}
+	// Build the Binds slice in Docker bind format: "hostPath:containerPath".
+	// Mirrors StartReferenceProxyWithMounts. Required for subject-only boot-
+	// reject fixtures (e.g., fixture-0037) where the REFERENCE side MUST boot
+	// successfully — its wasm filter needs the on-disk .wasm blob accessible
+	// inside the container.
+	binds := make([]string, 0, len(hostMounts))
+	for _, m := range hostMounts {
+		binds = append(binds, m.HostPath+":"+m.ContainerPath)
 	}
 	// AutoRemove is OFF so we can pull logs after the container exits.
 	req := testcontainers.ContainerRequest{
@@ -398,6 +443,7 @@ func tryStartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string
 		HostConfigModifier: func(hc *container.HostConfig) {
 			hc.ExtraHosts = []string{"host.docker.internal:host-gateway"}
 			hc.AutoRemove = false
+			hc.Binds = append(hc.Binds, binds...)
 		},
 	}
 	startCtx, startCancel := context.WithTimeout(ctx, bootRejectTimeout+5*time.Second)

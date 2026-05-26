@@ -181,6 +181,48 @@
 // Project-wide stat-count delta: 114 → 119 per parent §7. Verified at the
 // `+5 per-call delta` test in wasm_test.go (TestNewFilterStats_ProjectStatCountDelta).
 //
+// # 25.2 EXTENSION: compiledConfig 4 envoy-go-strict-only cap fields + 6 NEW PARSE-REJECT arms + RootVM construction at New (per ADR-0208 + 25.2 SPEC §4.2 + §6.2 + §7.4)
+//
+// At 25.2 Task 14 (D-25.2-P5 closure at 25.2 IMPL), `compiledConfig` is
+// EXTENDED with 4 envoy-go-strict-only `PluginConfig` config fields per Qs
+// 2/6/9 + 25.2 SPEC §7.4 (defaults 16 MiB / 1 MiB / 1024 / 1024), the
+// long-lived per-compiledConfig `*wasm.RootVM` (constructed at New() via
+// `wasm.NewRootVM`; replaces 25.1's per-stream `wasm.NewVM` call which is
+// retired at Task 18 per D-P-PLAN-6), the per-plugin `*dynamic.Registry`
+// (per AMEND-B2 + Q9), and the per-plugin `*ForeignFunctionRegistry` view
+// (per AMEND-A9 — points at the EMPTY process-global default at boot).
+// `buildCompiledConfig` adds 6 NEW PARSE-REJECT arms per 25.2 SPEC §6.2 to
+// the 25.1 18-arm roster (24 arms cumulative at 25.2):
+//
+//   - Arm 19: envoy_go_strict_body_buffer_cap_bytes = 0
+//   - Arm 20: envoy_go_strict_shared_data_value_cap_bytes = 0
+//   - Arm 21: envoy_go_strict_shared_data_max_entries = 0
+//   - Arm 22: envoy_go_strict_dynamic_stats_max_entries = 0
+//   - Arm 23: envoy_go_strict_body_buffer_cap_bytes > 1 GiB ceiling (1<<30)
+//   - Arm 26: cross-PluginConfig duplicate PluginConfig.name
+//
+// Parsing mechanism (per D-25.2-P5 first-action choice at 25.2 Task 14):
+// the 4 envoy-go-strict-only config fields are carried inside a typed
+// `structpb.Struct` at `PluginConfig.configuration`. The Any TypeURL must
+// be `type.googleapis.com/google.protobuf.Struct`; the Struct's top-level
+// `Fields` map carries an `envoy_go_strict` key whose StructValue holds the
+// 4 cap subfields (`body_buffer_cap_bytes`, `shared_data_value_cap_bytes`,
+// `shared_data_max_entries`, `dynamic_stats_max_entries`). Unset
+// `PluginConfig.configuration` OR a non-Struct Any OR a missing
+// `envoy_go_strict` key all take defaults; PRESENT keys are validated +
+// trigger arms 19-23 on out-of-range values. See `compiled_config.go`
+// (constants block + `parseEnvoyGoStrictFields` body) for the full
+// mechanism rationale.
+//
+// # 25.2 D-25.2-P5 partial closure: 6 NEW arm byte-stable wording
+//
+// The 6 NEW arm wordings are pinned by the `parseReject*` constants in
+// compiled_config.go + asserted byte-exact by `TestParseRejectConstants_
+// ByteStable` (EXTENDED to 24 rows). Final D-25.2-P5 closure is at the
+// Task 22 atomic-landing BEHAVIOR_CONTRACT.md bundle landing (which
+// records the 6 NEW arms as part of the envoy-go-strict departure record
+// bundle per 25.2 SPEC §13.4).
+//
 // # Cross-references
 //
 //   - ADR-0202 (NEW internal/wasm/ framework primitive; bodies land at

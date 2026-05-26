@@ -190,6 +190,151 @@ const (
 	capProxyOnResponseHeaders = "proxy_on_response_headers"
 )
 
+// ----------------------------------------------------------------------------
+// 25.2 capability extensions per AMEND-B5 + 25.2 SPEC §11.5 D-25.2-5
+// ----------------------------------------------------------------------------
+//
+// Phase 25.2 EXTENDS the capability roster from 37 keys (25.1 cumulative) to
+// 58 keys: 14 NEW env-namespace hostcall keys + 7 NEW lifecycle (proxy_on_*)
+// keys. The 25.1 default-deny posture per AMEND-A5 + ADR-0204 INHERITS
+// unchanged — empty `AllowedCapabilities` map → DENY ALL (including all 21
+// NEW keys).
+//
+// Two distinct gate-sites per upstream `proxy-wasm-cpp-host@da3ce05d` (see
+// 25.2 SPEC §11.5 D-25.2-5 evidence):
+//
+//   - **Env-namespace hostcalls** (14 NEW keys below) — gated at
+//     `registerCallback` TIME via `src/wasm.cc:176-189` `_REGISTER_PROXY`
+//     macro. The macro expands to `if (capabilityAllowed("proxy_" #_fn))
+//     wasm_vm_->registerCallback(...)`. envoy-go mirrors at Task 3
+//     `registration.go`: for a denied capability, the host function is NOT
+//     registered on the wazero Runtime; the guest's import resolution fails
+//     at module-instantiation OR the runtime trap fires on call (depending
+//     on whether the guest declared the import). This AMPLIFIES the default-
+//     deny posture — a denied hostcall is INVISIBLE to the guest from
+//     instantiation, not merely rejected at call time.
+//
+//   - **Lifecycle (proxy_on_*) keys** (7 NEW keys below) — gated at
+//     `getFunction` TIME via `src/wasm.cc:238-247` `_GET_PROXY` macro. The
+//     macro expands to `if (capabilityAllowed("proxy_" #_fn))
+//     wasm_vm_->getFunction(#_fn, &_fn##_);` — denied capability ⇒ function
+//     pointer left null; dispatch skips. envoy-go mirrors at Task 3:
+//     `*StreamContext`/`*RootVM` callback dispatchers consult `IsAllowed`
+//     before lookup + Call.
+//
+// Both gate-sites consult THIS file's `IsAllowed` semantic — the
+// capability-key strings below are the SOLE source of truth for both
+// `registration.go` (Task 3) + every consumer that constructs a
+// `SandboxConfig` allowlist.
+
+// 25.2 body / buffer capability keys (3 keys per AMEND-B1 + §11.5 D-25.2-5
+// hostcall-keys table entries 1..3). Body/buffer hostcalls implement the
+// clamp-on-overflow wire-contract per AMEND-B1: when the requested
+// `start+length` exceeds the buffer extent, the hostcall returns the
+// truncated slice (NOT WasmResult::BadArgument). The 16-MiB envoy-go-strict
+// body-buffer cap per ADR-0208 is enforced at the consumer (`internal/
+// filter/http/wasm/body.go` Task 16), not at the hostcall shim.
+const (
+	capProxyGetBufferBytes  = "proxy_get_buffer_bytes"
+	capProxySetBufferBytes  = "proxy_set_buffer_bytes"
+	capProxyGetBufferStatus = "proxy_get_buffer_status"
+)
+
+// 25.2 stream-control capability keys (2 keys per §11.5 D-25.2-5 hostcall-
+// keys table entries 4..5). ABI-specific per upstream `include/proxy-wasm/
+// exports.h:154-156`. `proxy_continue_stream` un-pauses a previously-paused
+// phase (driven by guest returning `Pause`/`StopIteration*` from a callback);
+// `proxy_close_stream` closes the stream side (request or response) per
+// the WasmStreamType arg.
+const (
+	capProxyContinueStream = "proxy_continue_stream"
+	capProxyCloseStream    = "proxy_close_stream"
+)
+
+// 25.2 timer capability key (1 key per §11.5 D-25.2-5 hostcall-keys table
+// entry 6). Paired with the `proxy_on_tick` lifecycle key below. Per
+// envoy-go-strict Q5 + R-25.2-9 a 10ms tick-period floor is enforced at
+// the shim (Task 5 `internal/wasm/tick.go`); the upstream cpp-host has no
+// floor (any positive ms accepted).
+const capProxySetTickPeriodMilliseconds = "proxy_set_tick_period_milliseconds"
+
+// 25.2 metrics capability keys (4 keys per AMEND-B2 + §11.5 D-25.2-5
+// hostcall-keys table entries 7..10). Per AMEND-B2: `proxy_increment_metric`
+// takes a SIGNED i64 delta (upstream cpp-host signature; per-metric
+// type-based clamping at the consumer per Task 12). Metric names land
+// under the `wasmcustom.<custom_name>` namespace per AMEND-B2 via NEW
+// `internal/stats/dynamic/` infrastructure (Task 11). The 1024-entry cap
+// is enforced at the `*dynamic.Registry` per ADR-0208.
+const (
+	capProxyDefineMetric    = "proxy_define_metric"
+	capProxyIncrementMetric = "proxy_increment_metric"
+	capProxyRecordMetric    = "proxy_record_metric"
+	capProxyGetMetric       = "proxy_get_metric"
+)
+
+// 25.2 shared-data capability keys (2 keys per Q6 + §11.5 D-25.2-5 hostcall-
+// keys table entries 11..12). Per-`*RootVM` CAS-protected K-V map per Q6 +
+// R-25.2-10 (Task 6 `internal/wasm/shared_data.go`). envoy-go-strict caps:
+// 1 MiB per value + 1024 entries per `*RootVM`. CAS semantics byte-faithful
+// to upstream cpp-host (`proxy_set_shared_data` with `cas=0` writes
+// unconditionally; non-zero `cas` requires match-or-CasMismatch).
+const (
+	capProxySetSharedData = "proxy_set_shared_data"
+	capProxyGetSharedData = "proxy_get_shared_data"
+)
+
+// 25.2 outbound-HTTP capability key (1 key per AMEND-B3 + §11.5 D-25.2-5
+// hostcall-keys table entry 13). Paired with the `proxy_on_http_call_
+// response` lifecycle key below. Per AMEND-B3: at-destruction cancel
+// discipline — pending httpCalls are CANCELED (NOT dropped silently)
+// when the originating `*StreamContext` closes; the late-arrival case
+// increments the envoy-go-strict counter `http_call_response_after_close`
+// (counter 14 per ADR-0208).
+const capProxyHttpCall = "proxy_http_call"
+
+// 25.2 foreign-function capability key (1 key per AMEND-A9 + §11.5 D-25.2-5
+// hostcall-keys table entry 14). Per AMEND-A9: EMPTY default registry —
+// `proxy_call_foreign_function` returns `WasmResult::NotFound (=1)` for any
+// unregistered name (byte-faithful to upstream cpp-host `src/exports.cc:
+// 147-184`). Per D-P-PLAN-9: mutex-per-RootVM dispatch concurrency (sync.
+// RWMutex on registry; synchronous dispatch inside per-stream call frame;
+// panic-recovery wrapper). envoy-go-strict departure record #4 (0-vs-10
+// default registrations vs upstream's 10 demo entries).
+const capProxyCallForeignFunction = "proxy_call_foreign_function"
+
+// 25.2 lifecycle (proxy_on_*) capability keys (7 keys per §11.5 D-25.2-5
+// lifecycle-keys table entries 15..21). Gated at `getFunction` time per
+// upstream `src/wasm.cc:238-247` `_GET_PROXY` macro (denied capability ⇒
+// function pointer left null; dispatch path skips).
+//
+//	`proxy_on_request_body`        — HTTP request-body phase callback
+//	                                  (per AMEND-B1; envoy-go-strict
+//	                                  body-buffer cap enforced at consumer).
+//	`proxy_on_response_body`       — HTTP response-body phase callback.
+//	`proxy_on_request_trailers`    — HTTP request-trailers phase callback
+//	                                  (reuses 25.1 header-map family with
+//	                                  WasmHeaderMapType=1 activated).
+//	`proxy_on_response_trailers`   — HTTP response-trailers phase callback
+//	                                  (WasmHeaderMapType=3 activated).
+//	`proxy_on_tick`                — root-context tick callback (per Q5
+//	                                  10ms floor + Clock seam first
+//	                                  co-consumer per phase-21 ADR-0186).
+//	`proxy_on_http_call_response`  — outbound-HTTP response callback
+//	                                  (per AMEND-B3 cancel-at-destruction).
+//	`proxy_on_foreign_function`    — foreign-function callback (gated
+//	                                  separately via `_GET_PROXY` per
+//	                                  ABI 0.2.0/0.2.1 branch in upstream
+//	                                  `wasm.cc`).
+const (
+	capProxyOnRequestBody      = "proxy_on_request_body"
+	capProxyOnResponseBody     = "proxy_on_response_body"
+	capProxyOnRequestTrailers  = "proxy_on_request_trailers"
+	capProxyOnResponseTrailers = "proxy_on_response_trailers"
+	capProxyOnTick             = "proxy_on_tick"
+	capProxyOnHttpCallResponse = "proxy_on_http_call_response"
+	capProxyOnForeignFunction  = "proxy_on_foreign_function"
+)
+
 // SanitizationConfig is the per-capability host-side sanitization policy.
 //
 // Per AMEND-A1 §11.4 + parent §4.3.5: upstream's `SanitizationConfig` proto

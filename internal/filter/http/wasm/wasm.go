@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filterstate"
 	"github.com/esalaine/envoy-go/internal/wasm"
 )
 
@@ -98,10 +99,14 @@ type filter struct {
 	// `*compiledConfig` and points to nil until the type lands.
 	cfg *compiledConfig //nolint:unused // closure-captured at Task 9 New's FilterInstanceFactory
 
-	// vm is the per-stream wazero VM. Allocated at DecodeHeaders entry per
-	// 25.1 SPEC §4.3 (Task 12); released at OnDestroy via vm.Close. May be
-	// nil if DecodeHeaders short-circuited (defensive nil-tolerance).
-	vm *wasm.VM //nolint:unused // allocated at Task 12 DecodeHeaders entry
+	// NOTE: the 25.1 `vm *wasm.VM` field was REMOVED at 25.2 IMPL Task 18
+	// alongside the deletion of internal/wasm/vm.go (Task 1 per D-P-PLAN-6).
+	// The replacement is the `streamCtx *wasm.StreamContext` field below
+	// (added at Task 16) which is bound to the shared per-compiledConfig
+	// *RootVM. The per-stream wazero.Runtime construction path is GONE;
+	// the per-stream lifecycle now goes through cfg.rootVM.NewStreamContext
+	// (microseconds per stream) → streamCtx.Close (cancel-at-destruction
+	// per AMEND-B3).
 
 	// streamContextID is the per-stream context discriminator passed to the
 	// proxy-wasm callbacks. Allocated at DecodeHeaders entry (Task 12) as a
@@ -137,6 +142,70 @@ type filter struct {
 	// (encode-only / decode-only filter shapes).
 	decoderCb envoyhttp.DecoderFilterCallbacks //nolint:unused // populated at Task 12 SetDecoderCallbacks; consumed by Task 11 abi_callbacks
 	encoderCb envoyhttp.EncoderFilterCallbacks //nolint:unused // populated at Task 12 SetEncoderCallbacks; consumed by Task 11 abi_callbacks GetStatus (ADR-0196 D-P3 first co-consumer)
+
+	// downstreamFilterState + upstreamFilterState hold the per-stream
+	// filterstate.Bucket references per ADR-0207 + 25.2 SPEC §3.2 + AMEND-B4.
+	// CONSUMED at 25.2 IMPL Task 15 by abi_callbacks.GetProperty's filterPropertyResolver
+	// for the filter_state.<key> + upstream_filter_state.<key> + wasm.<key>
+	// property-tree branches (consumer #2 of NEW internal/filterstate/ —
+	// phase-22.2 lua is consumer #1 via Task 10 MIGRATION). Allocated at
+	// per-stream construction at Task 18 decode_headers.go (one Bucket per
+	// stream per root — downstream is the chain-side bucket; upstream is the
+	// upstream-binding-side bucket). May be nil at Task 15 in test-double
+	// paths AND in pre-Task-18 wiring — the abi_callbacks resolver is
+	// nil-tolerant per ADR-0085 (nil bucket → NotFound for every
+	// filter_state.<key> probe).
+	downstreamFilterState *filterstate.Bucket //nolint:unused // populated at Task 18 per-stream construction; consumed by Task 15 abi_callbacks filterPropertyResolver
+	upstreamFilterState   *filterstate.Bucket //nolint:unused // populated at Task 18 per-stream construction; consumed by Task 15 abi_callbacks filterPropertyResolver
+
+	// -------------------------------------------------------------------------
+	// 25.2 IMPL Task 16 EXTENSIONS (per 25.2 SPEC §4.3 + Q1 + Q2).
+	// -------------------------------------------------------------------------
+
+	// streamCtx is the per-stream context handle bound to the SHARED *RootVM
+	// owned by *compiledConfig (per ADR-0205 root-VM lifecycle evolution +
+	// 25.2 SPEC §4.3). Allocated at Task 18 decode_headers.go via
+	// `cfg.rootVM.NewStreamContext(ctx)`; RELEASED at OnDestroy via
+	// `streamCtx.Close(ctx)` (which fires proxy_on_done + proxy_on_log +
+	// proxy_on_delete + cancels outstanding httpCalls per AMEND-B3).
+	//
+	// REPLACES the 25.1 `vm *wasm.VM` field above (Task 18 deletes the obsolete
+	// vm field + the per-stream wasm.NewVM construction; the package compile-
+	// break since Task 1 closes at Task 18 per D-P-PLAN-6). At Task 16 the
+	// field is added IN ADDITION TO the obsolete vm field — body.go +
+	// trailers.go consume `streamCtx.CallProxyOn{Request,Response}{Body,
+	// Trailers}` via the NEW *StreamContext methods landed at Task 16
+	// stream_context.go EXTEND. Production callers populate the field at
+	// Task 18; test callers populate it directly in body_test.go +
+	// trailers_test.go.
+	streamCtx *wasm.StreamContext //nolint:unused // populated at Task 18 decode_headers.go; consumed by Task 16 body.go + trailers.go
+
+	// decodeBody + encodeBody hold the per-stream accumulated body bytes per
+	// 25.2 SPEC §4.3 + Q1. Grow on each DecodeData / EncodeData call BEFORE
+	// the cap-enforcement check + the proxy_on_*_body dispatch. The guest
+	// reads via proxy_get_buffer_bytes(HttpRequestBody | HttpResponseBody,
+	// start, max_size) which dispatches through abi_callbacks.GetBuffer
+	// (Task 15 stub ACTIVATED at Task 16 to read from these fields).
+	//
+	// Per Q1: body_size passed to proxy_on_*_body is the ACCUMULATED total
+	// (uint32(len(decodeBody)) / uint32(len(encodeBody))), NOT the just-new-
+	// chunk delta. The proxy-wasm v0.2.1 contract is per-chunk-invoke +
+	// guest reads the accumulated buffer; envoy-go follows this verbatim.
+	decodeBody []byte //nolint:unused // populated at Task 16 body.go DecodeData; consumed at Task 16 abi_callbacks.GetBuffer
+	encodeBody []byte //nolint:unused // populated at Task 16 body.go EncodeData; consumed at Task 16 abi_callbacks.GetBuffer
+
+	// decodeBodyCapExceeded + encodeBodyCapExceeded are sticky flags set to
+	// true on the FIRST cap-exceeded event per Q2 + 25.2 SPEC §4.3. Once set,
+	// subsequent DecodeData / EncodeData calls on the same stream do NOT
+	// re-invoke SendLocalReply (decoderCb.SendLocalReply is idempotent at the
+	// chain level but re-invoking would re-bump the body_buffer_cap_exceeded
+	// counter on every chunk past the cap — the sticky flag ensures the
+	// counter increments exactly once per stream). On the encode side
+	// SendLocalReply is unavailable (EncoderFilterCallbacks does not expose
+	// it); the sticky flag short-circuits to StopAllIteration so the chain
+	// terminates the response early.
+	decodeBodyCapExceeded bool //nolint:unused // populated at Task 16 body.go DecodeData on first cap-exceeded
+	encodeBodyCapExceeded bool //nolint:unused // populated at Task 16 body.go EncodeData on first cap-exceeded
 }
 
 // capturedLocalResponse holds the proxy_send_local_response payload until the

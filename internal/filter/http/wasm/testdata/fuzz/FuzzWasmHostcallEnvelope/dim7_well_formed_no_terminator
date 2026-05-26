@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\a')
+byte('\x00')
+uint32(0)
+uint64(0)
+[]byte("request\x00headers\x00x-foo")

@@ -1,93 +1,101 @@
 package wasm
 
-// decode_headers.go — DecodeHeaders dispatcher per 25.1 SPEC §4.3.
+// decode_headers.go — DecodeHeaders dispatcher per 25.2 SPEC §4.3 + Task 18
+// closure of D-P-PLAN-6.
 //
-// Lifecycle (per 25.1 SPEC §4.3 step list):
+// Lifecycle (per 25.2 SPEC §4.3 step list — REVISED at Task 18 for root-VM model):
 //
-//  1. Lazy per-stream VM construction at first DecodeHeaders entry. The VM
-//     is built via wasm.NewVM(WithSandboxConfig, WithCompilationCache),
-//     registered with an *abiCallbacks bundle (Task 11) bound to this
-//     *filter, then driven through the module-init lifecycle via
-//     vm.Run(ctx, module, rootContextID) — re-compiles module.Source()
-//     against the per-stream runtime (sub-ms cache hit via the shared
-//     wazero.CompilationCache), instantiates, runs _initialize OR _start
-//     (mutually exclusive per proxy-wasm v0.2.1), then proxy_on_vm_start
-//     + proxy_on_configure.
+//  1. Lazy per-stream context construction at first DecodeHeaders entry. The
+//     per-stream StreamContext is allocated via
+//     `cfg.rootVM.NewStreamContext(ctx)` — the shared long-lived *RootVM
+//     owned by *compiledConfig (per ADR-0205) supplies the wazero.Runtime +
+//     instantiated module; the per-stream StreamContext is just bookkeeping +
+//     a `proxy_on_context_create(streamCtxID, rootCtxID)` invocation. NO
+//     per-stream wazero.Runtime construction (Task 1 + 18 RETIRED the 25.1
+//     per-stream `wasm.NewVM` pattern; the cost moved from ~61µs/stream to
+//     microseconds per stream).
 //
-//  2. Per-stream context-ID allocation via the package-level atomic
-//     streamContextIDCounter. CallProxyOnContextCreate(streamContextID,
-//     rootContextID) seeds the per-stream context on the guest side.
+//  2. The per-stream *abiCallbacks is constructed + registered into the
+//     per-RootVM rootABICallbacks multiplexer at the streamCtxID returned by
+//     NewStreamContext. Hostcall dispatch from the guest routes through
+//     rv.cb (the multiplexer) → multiplexer.lookup(streamCtxID) → per-stream
+//     *abiCallbacks → per-stream filter state (decoderCb, encoderCb,
+//     requestHeaders, etc.).
 //
-//  3. Capture headers on f.requestHeaders for abiCallbacks (Task 11
-//     pattern — the *abiCallbacks back-pointer reads f.requestHeaders /
-//     f.responseHeaders directly to route guest header-map hostcalls).
+//  3. Capture headers on f.requestHeaders for the per-stream abiCallbacks
+//     back-pointer.
 //
-//  4. stats.executions.Inc() per AMEND-A2 Group-C envoy-go-strict
-//     per-`proxy_on_request_headers`-invocation counter.
+//  4. Per-stream filterstate.Bucket pair (downstream + upstream) lazy-init
+//     for the ADR-0207 filter_state.* / upstream_filter_state.* / wasm.<key>
+//     property branches consumed by abi_callbacks.GetProperty's
+//     filterPropertyResolver (per 25.2 IMPL Task 15 + AMEND-B4).
 //
-//  5. CallProxyOnRequestHeaders → abi.ProxyAction. Per 25.1 SPEC §4.3:
+//  5. stats.executions.Inc() per AMEND-A2 Group-C envoy-go-strict per-
+//     `proxy_on_request_headers`-invocation counter.
+//
+//  6. CallProxyOnRequestHeaders → abi.ProxyAction. Per 25.2 SPEC §4.3:
 //       - ProxyActionContinue → http.Continue
 //       - ProxyActionPause without captured-local-response → log +
-//         http.Continue (stream-control deferred to 25.2 per parent §1
-//         architectural primitive 6)
+//         http.Continue (stream-control deferred per parent §1 architectural
+//         primitive 6)
 //       - sentLocalResponse non-nil → decoderCb.SendLocalReply +
 //         http.StopIteration (REUSE 5 per parent §3.3)
 //
-//  6. On error (wazero trap, hostcall-denial chain, or panic-wrapped Go
+//  7. On error (wazero trap, hostcall-denial chain, or panic-wrapped Go
 //     panic from a bridge callback) → envoy_go.failures.Inc() + log +
 //     http.Continue per ADR-0072 boot-time-fail-fast (fail-OPEN on
 //     per-stream runtime errors so the request still serves).
 //
-// # OnDestroy lifecycle (per 25.1 SPEC §4.3 last step + parent §3.5)
+// # OnDestroy lifecycle (per 25.2 SPEC §4.3 last step + parent §3.5)
 //
-// OnDestroy releases the per-stream VM via CallProxyOnDone (guest's
-// chance to defer finalize per SPEC §3.1) + CallProxyOnLog (guest's
-// last per-stream log point) + CallProxyOnDelete (context teardown) +
-// vm.Close (releases the wazero.Runtime). The Group-B active gauge
-// decrements at the same site. Idempotent — second OnDestroy is a
-// no-op against a nil vm.
+// OnDestroy delegates to streamCtx.Close(ctx) which fires proxy_on_done +
+// proxy_on_log + proxy_on_delete + cancels outstanding httpCalls per
+// AMEND-B3. The per-stream entry is unregistered from the per-RootVM
+// rootABICallbacks multiplexer so subsequent hostcalls (stray late
+// responses, etc.) route to the no-op fallback rather than the freed
+// per-stream state. The Group-B active gauge decrements at the same site.
+// Idempotent — second OnDestroy is a no-op against a nil streamCtx.
+// OnDestroy body lives at encode_headers.go (per the encode-side mirror
+// pattern; OnDestroy + EncodeHeaders + SetEncoderCallbacks all colocate
+// per the 25.1 file-split convention).
 //
 // # Cross-references
 //
-//   - 25.1 SPEC §4.3 (per-stream dispatch shape)
+//   - 25.2 SPEC §4.3 (per-stream dispatch shape — REVISED for root-VM model)
+//   - ADR-0205 (root-VM lifecycle evolution; *RootVM long-lived per
+//     *compiledConfig; per-stream StreamContext children share runtime +
+//     module)
 //   - parent §1 architectural primitive 6 (stream-control deferred to 25.2)
 //   - parent §3.5 (per-stream lifecycle)
 //   - ADR-0071 (single-goroutine-per-stream invariant — no synchronization
-//     on f.vm / f.streamContextID / f.sentLocalResponse / f.requestHeaders)
+//     on f.streamCtx / f.streamContextID / f.sentLocalResponse /
+//     f.requestHeaders)
 //   - ADR-0072 (boot-time-fail-fast — per-stream fail-OPEN is the runtime
 //     posture; parse-time fail-CLOSED is the New factory posture)
 //   - ADR-0085 (nil-tolerance — stats nil-checks on every increment)
 //   - ADR-0196 D-P3 (encoderCb seeded at SetEncoderCallbacks per Task 12)
+//   - ADR-0207 (NEW internal/filterstate/ — per-stream Bucket pair
+//     allocated here per AMEND-B4)
+//   - AMEND-B3 (cancel-at-destruction for outstanding httpCalls fires
+//     inside streamCtx.Close at internal/wasm/stream_context.go Close path)
 
 import (
 	"context"
 	"log"
 	gohttp "net/http"
-	"sync/atomic"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filterstate"
 	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
 	"github.com/esalaine/envoy-go/internal/wasm/abi"
 )
-
-// streamContextIDCounter allocates fresh per-stream u32 context IDs at
-// DecodeHeaders entry per 25.1 SPEC §4.3. Per-process monotonic; atomic
-// load/store is safe across all per-stream-goroutine call sites (each
-// stream allocates exactly one ID at its first DecodeHeaders call).
-//
-// Per upstream proxy-wasm convention root context IDs are typically 1
-// and stream context IDs start at 2; envoy-go uses a single monotonic
-// counter per kind (rootContextIDCounter in compiled_config.go for root;
-// this counter for stream) — collisions between the two namespaces are
-// harmless because the guest sees them via distinct proxy_on_* callbacks.
-var streamContextIDCounter atomic.Uint32
 
 // logf is the package-level logger for decode/encode-side diagnostics.
 // Indirected via a package var to make test-side capture trivial.
 // Mirrors the phase-22.1 lua `logf` precedent.
 var logf = log.Printf
 
-// DecodeHeaders implements envoyhttp.StreamDecoderFilter per 25.1 SPEC §4.3.
+// DecodeHeaders implements envoyhttp.StreamDecoderFilter per 25.2 SPEC §4.3.
 // See the file-header comment for the full step list + error-handling
 // disposition.
 func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.FilterHeadersStatus {
@@ -99,21 +107,21 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	}
 
 	// Capture request headers on the *filter so the per-stream *abiCallbacks
-	// (Task 11) can route guest header-map hostcalls to the request side.
+	// (Task 11/15) can route guest header-map hostcalls to the request side.
 	// Per ADR-0071 single-goroutine-per-stream invariant: no synchronization
 	// needed; the same goroutine writes here and reads via the abiCallbacks
 	// back-pointer during the CallProxyOnRequestHeaders dispatch below.
 	f.requestHeaders = headers
 
-	// Lazy per-stream VM construction at first DecodeHeaders entry. The
-	// nil-check guards a defensive double-call (HCM dispatch is single-
+	// Lazy per-stream StreamContext construction at first DecodeHeaders entry.
+	// The nil-check guards a defensive double-call (HCM dispatch is single-
 	// shot per stream, but tests may exercise pre-construction paths).
-	if f.vm == nil {
-		if err := f.initVM(context.Background()); err != nil {
+	if f.streamCtx == nil {
+		if err := f.initStreamContext(context.Background()); err != nil {
 			if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
 				f.cfg.stats.envoyGoFailures.Inc()
 			}
-			logf("ERROR wasm: VM construction failed: %v", err)
+			logf("ERROR wasm: StreamContext construction failed: %v", err)
 			// Fail-OPEN on per-stream runtime errors — the request still
 			// serves, just without wasm processing. Matches the ADR-0072
 			// per-stream fail-OPEN runtime posture (parse-time fail-CLOSED
@@ -130,26 +138,17 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 		f.cfg.stats.executions.Inc()
 	}
 
-	// CallProxyOnContextCreate seeds the per-stream context on the guest
-	// side. Idempotent — the guest may not export proxy_on_context_create
-	// (VM helper returns nil + no-op in that case). On error: count it as
-	// a failure but proceed to dispatch (the guest may still handle
-	// proxy_on_request_headers correctly without a context-create hook).
-	if err := f.vm.CallProxyOnContextCreate(ctx, f.streamContextID, f.cfg.rootContextID); err != nil {
-		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
-		}
-		logf("ERROR wasm: CallProxyOnContextCreate(stream=%d, root=%d): %v",
-			f.streamContextID, f.cfg.rootContextID, err)
-		return envoyhttp.Continue
-	}
-
 	// CallProxyOnRequestHeaders dispatches the guest's request-headers
 	// hook. The result is a ProxyAction (Continue/Pause). On wazero trap
 	// or panic-wrapped Go-side panic the error path bumps envoy_go.failures
 	// and returns Continue (fail-OPEN per ADR-0072 per-stream posture).
+	//
+	// Per 25.2 ADR-0205: the per-stream context_create dispatch already
+	// fired inside RootVM.NewStreamContext above — no separate
+	// CallProxyOnContextCreate call here (the 25.1 separate-call pattern
+	// is RETIRED).
 	numHeaders := numHeaderValues(headers)
-	action, err := f.vm.CallProxyOnRequestHeaders(ctx, f.streamContextID, numHeaders, endStream)
+	action, err := f.streamCtx.CallProxyOnRequestHeaders(ctx, numHeaders, endStream)
 	if err != nil {
 		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
 			f.cfg.stats.envoyGoFailures.Inc()
@@ -175,16 +174,16 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 		return envoyhttp.StopIteration
 	}
 
-	// ProxyAction handling per 25.1 SPEC §4.3:
+	// ProxyAction handling per 25.2 SPEC §4.3:
 	//   - Continue → http.Continue
 	//   - Pause w/o captured-local-response → log + http.Continue
 	//     (stream-control deferred to 25.2 per parent §1 architectural
-	//     primitive 6 — at 25.1 the wasm filter has no pause/resume
-	//     plumbing; the guest's request to pause is logged + ignored so
-	//     the stream continues).
+	//     primitive 6 — at 25.2 the wasm filter has no pause/resume
+	//     plumbing on headers; the guest's request to pause is logged +
+	//     ignored so the stream continues).
 	switch action {
 	case abi.ProxyActionPause:
-		logf("INFO wasm: proxy_on_request_headers returned PAUSE without captured local response — stream-control deferred to 25.2 (parent §1 architectural primitive 6); continuing")
+		logf("INFO wasm: proxy_on_request_headers returned PAUSE without captured local response — stream-control deferred (parent §1 architectural primitive 6); continuing")
 		return envoyhttp.Continue
 	case abi.ProxyActionContinue:
 		fallthrough
@@ -193,32 +192,54 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	}
 }
 
-// initVM constructs the per-stream wazero VM + registers the per-stream
-// abiCallbacks bundle + runs the module-init lifecycle per 25.1 SPEC §4.3
-// step 1. Called once per stream at the first DecodeHeaders entry.
+// initStreamContext constructs the per-stream StreamContext via
+// `cfg.rootVM.NewStreamContext` + registers the per-stream *abiCallbacks
+// into the rootABICallbacks multiplexer per 25.2 SPEC §4.3 + Task 18
+// closure of D-P-PLAN-6. Called once per stream at the first DecodeHeaders
+// entry.
 //
-// The shared wazero.CompilationCache from the *compiledConfig is wired
-// in via WithCompilationCache so the per-stream vm.Run re-compile of
-// module.Source() against the per-stream runtime hits the shared codegen
-// cache as a sub-ms cache lookup (per wazero v1.10.1's
-// CompiledModule-bound-to-runtime cross-runtime fix at Task 7 follow-up).
-func (f *filter) initVM(ctx context.Context) error {
-	opts := []internalwasm.VMOption{
-		internalwasm.WithSandboxConfig(f.cfg.sandbox),
+// REPLACES the 25.1 initVM body (deleted at Task 18 alongside the obsolete
+// per-stream wasm.NewVM call). The shared *RootVM in cfg.rootVM was
+// constructed at buildCompiledConfig (Task 14); the wazero.Runtime + the
+// instantiated module live on the *RootVM, not on the per-stream
+// StreamContext. Per-stream-context construction cost is microseconds.
+func (f *filter) initStreamContext(ctx context.Context) error {
+	if f.cfg.rootVM == nil {
+		// Defensive: production callers always populate cfg.rootVM at
+		// buildCompiledConfig (Task 14). Test-double paths that bypass
+		// buildCompiledConfig (e.g. body_test.go's newBodyTestCompiledConfig)
+		// may leave it nil; in that case the per-stream callbacks short-
+		// circuit per the gate-at-getFunction / nil-streamCtx defensive
+		// guards in body.go / trailers.go.
+		return errNilRootVM
 	}
-	if f.cfg.compileCache != nil {
-		if wc := f.cfg.compileCache.WazeroCompilationCache(); wc != nil {
-			opts = append(opts, internalwasm.WithCompilationCache(wc))
-		}
-	}
-	f.vm = internalwasm.NewVM(ctx, opts...)
 
-	// Register the per-stream ABICallbacks bundle (Task 11). The bundle
-	// holds only a back-pointer to *filter; all per-stream state
-	// (requestHeaders, responseHeaders, decoderCb, encoderCb,
-	// sentLocalResponse) lives on the *filter.
+	streamCtx, err := f.cfg.rootVM.NewStreamContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Allocate per-stream filterstate.Bucket pair for the ADR-0207
+	// filter_state.* + upstream_filter_state.* + wasm.<key> property
+	// branches consumed by abi_callbacks.GetProperty's
+	// filterPropertyResolver (per 25.2 IMPL Task 15 + AMEND-B4).
+	f.downstreamFilterState = filterstate.NewBucket()
+	f.upstreamFilterState = filterstate.NewBucket()
+
+	f.streamCtx = streamCtx
+	f.streamContextID = streamCtx.ContextID()
+
+	// Allocate the per-stream *abiCallbacks bound to *filter + register it
+	// into the rootABICallbacks multiplexer so hostcalls fired from the
+	// guest dispatch route back to this per-stream filter state. The
+	// multiplexer's lookup-by-streamCtxID covers cross-stream isolation
+	// (N parallel streams + N independent *abiCallbacks bound to N
+	// distinct *filters; each guest hostcall routes to the originating
+	// stream).
 	cb := &abiCallbacks{filter: f}
-	f.vm.RegisterABICallbacks(cb)
+	if f.cfg.rootCB != nil {
+		f.cfg.rootCB.register(f.streamContextID, cb)
+	}
 
 	// Group-B upstream-parity counters: incr created on construction;
 	// incr active gauge (decr at OnDestroy).
@@ -231,39 +252,25 @@ func (f *filter) initVM(ctx context.Context) error {
 		}
 	}
 
-	// Allocate a fresh per-stream context ID. Monotonic per process; the
-	// counter never wraps within a realistic process lifetime (u32 ≈ 4G).
-	f.streamContextID = streamContextIDCounter.Add(1)
-
-	// Run the module-init lifecycle: re-compile module.Source against the
-	// per-stream runtime → instantiate → _initialize or _start →
-	// proxy_on_vm_start → proxy_on_configure.
-	if err := f.vm.Run(ctx, f.cfg.module, f.cfg.rootContextID); err != nil {
-		// Release the VM on init failure — the caller's nil-vm check
-		// guards against double-init attempts.
-		_ = f.vm.Close()
-		f.vm = nil
-		// Decrement the active gauge we just incremented.
-		if f.cfg.stats != nil && f.cfg.stats.active != nil {
-			f.cfg.stats.active.Dec()
-		}
-		return err
-	}
-
 	return nil
 }
 
-// DecodeData is a no-op pass-through at 25.1 per parent SPEC §3.5 +
-// 25.1 SPEC §4.3 (headers-bridge subset only). Body bridge lands at 25.2.
-func (f *filter) DecodeData(_ []byte, _ bool) envoyhttp.FilterDataStatus {
-	return envoyhttp.DataContinue
-}
+// errNilRootVM signals a *filter constructed against a *compiledConfig
+// whose rootVM field is nil (test-double path). The filter dispatch fails
+// open per ADR-0072 per-stream posture; the production New factory always
+// populates rootVM via buildCompiledConfig's NewRootVM at Task 14.
+var errNilRootVM = errStaticString("wasm: cfg.rootVM is nil (test-double path)")
 
-// DecodeTrailers is a no-op pass-through at 25.1 per parent SPEC §3.5 +
-// 25.1 SPEC §4.3 (headers-bridge subset only). Trailers bridge lands at 25.2.
-func (f *filter) DecodeTrailers(_ gohttp.Header) envoyhttp.FilterTrailersStatus {
-	return envoyhttp.TrailersContinue
-}
+// errStaticString is a minimal error type that wraps a constant string
+// without depending on errors.New (which would force the package to
+// import "errors" again in this file).
+type errStaticString string
+
+func (e errStaticString) Error() string { return string(e) }
+
+// DecodeData + DecodeTrailers landed at 25.2 IMPL Task 16 — see body.go +
+// trailers.go for the per-stream body-buffer accumulator + cap-enforcement
+// + trailer-dispatch shape per 25.2 SPEC §4.3 + Q1 + Q2.
 
 // SetDecoderCallbacks stores the framework-supplied per-stream callback
 // reference for the decode-side SendLocalReply path consumed at the

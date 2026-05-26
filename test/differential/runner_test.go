@@ -58,6 +58,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0033-http-ratelimit-boot-reject/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0034-http-wasm-headers-bridge/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0035-http-wasm-boot-reject/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0036-http-wasm-body-and-advanced/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0037-http-wasm-body-and-advanced-boot-reject/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -702,6 +704,34 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// complete + the ratelimit filter's init() boot-registration fires
 			// for the differential subject's bootstrap parsing path ahead of
 			// the rollout.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPWasmAdvanced:
+			// Fixture 0036-http-wasm-body-and-advanced (phase 25.2 Task 20)
+			// REUSES the SHARED echobackend binary at
+			// test/helpers/echobackend/cmd/echobackend/ (phase-14 Task 10).
+			// The fixture has 2 upstream cluster definitions (cluster_a
+			// primary + cluster_b httpCall target) but BOTH point at the
+			// SAME backend per phase-22.2 REVIEW §7.4 freeTCPPort flake
+			// mitigation — so this switch-case allocates ONE backend that
+			// both clusters dial. 14 scenarios per §8.1.1: 10 cross-side
+			// via CompareBytes + 4 subject-only via StatsAsserter per
+			// reference_differential_asserter_dispatch. Per parent §8.5.
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)
@@ -1532,17 +1562,72 @@ func runBootRejectFixture(ctx context.Context, t *testing.T, root string, pin *E
 		t.Fatalf("BootRejectFixture: ExpectedBootErrorSubstring() returned empty string — substring assertion requires a non-empty needle")
 	}
 
-	// Reference side — render the bootstrap then try to start it.
+	// Subject-only dispatch — per 25.2 fixture-0037 + SubjectOnlyBootRejectFixture
+	// sibling interface at harness.go. The reference Envoy v1.37.2 MUST boot
+	// SUCCESSFULLY (the trigger is an envoy-go-strict-only validator with no
+	// upstream-equivalent; the unknown extension field is silently dropped by
+	// upstream's protobuf parser), and only the subject envoy-go boot-REJECTS
+	// with the substring in stderr. Per D-25.2-P1 closure at 25.2 IMPL Task 21
+	// first-action + reference_differential_fixture_dispatch_constraint (one
+	// fixture dir = ONE runner branch — fixture-0037 occupies this branch).
+	subjectOnly := false
+	if sob, ok := d.(SubjectOnlyBootRejectFixture); ok {
+		subjectOnly = sob.SubjectOnly()
+	}
+
+	// Reference side — render the bootstrap then try to start it. If the
+	// driver implements fixture.ReferenceLogMounter, pre-create the host-side
+	// files + pass bind-mounts to tryStartReferenceProxy (needed by subject-
+	// only boot-reject fixtures whose reference MUST boot successfully — its
+	// wasm filter needs the on-disk .wasm blob inside the container).
 	bootstrap := d.ReferenceBootstrap(backendPorts)
 	refPort := d.ReferenceListenerPort()
-	refCancel, refStderr, refErr := tryStartReferenceProxy(ctx, pin, bootstrap, refPort)
-	if refCancel != nil {
-		// Surprising success path: the reference DID come up. Tear it down
-		// + fail the test — the broken script failed to reject.
-		refCancel()
+	var hostMounts []fixture.HostMount
+	if rlm, ok := d.(fixture.ReferenceLogMounter); ok {
+		hostMounts = rlm.ReferenceHostMounts()
+		for _, hm := range hostMounts {
+			// Pre-create the host file ONLY if it does not already exist;
+			// 0037's bind-mount points at a real (pre-existing) .wasm blob
+			// borrowed from fixture-0036/bytecode and we MUST NOT truncate it.
+			// 0029/0031/0033/0035 boot-reject fixtures do not implement
+			// ReferenceLogMounter so this branch is moot for them.
+			if _, statErr := os.Stat(hm.HostPath); statErr == nil {
+				continue
+			}
+			f, ferr := os.OpenFile(hm.HostPath, os.O_CREATE|os.O_WRONLY, 0o666)
+			if ferr != nil {
+				t.Fatalf("ref mount pre-create %s: %v", hm.HostPath, ferr)
+			}
+			_ = f.Close()
+			if ferr = os.Chmod(hm.HostPath, 0o666); ferr != nil {
+				t.Fatalf("ref mount chmod %s: %v", hm.HostPath, ferr)
+			}
+		}
 	}
-	if refErr == nil {
-		t.Fatalf("BootRejectFixture: reference proxy started cleanly — expected boot rejection for broken script %q", brf.BootRejectScript())
+	refCancel, refStderr, refErr := tryStartReferenceProxy(ctx, pin, bootstrap, hostMounts, refPort)
+	if subjectOnly {
+		// Subject-only discipline: the reference MUST boot SUCCESSFULLY.
+		// If the reference rejected boot, that means our "reference accepts
+		// the unknown extension field silently" assumption is wrong — fail
+		// the test with the captured stderr for diagnostic.
+		if refCancel != nil {
+			// Reference DID come up — tear it down + continue to subject-side.
+			refCancel()
+		}
+		if refErr != nil {
+			t.Fatalf("SubjectOnlyBootRejectFixture: reference proxy FAILED to boot — expected SUCCESS (the trigger is an envoy-go-strict-only validator with no upstream-equivalent; the unknown extension field should be silently dropped by upstream's protobuf parser)\n--- reference err: %v\n--- reference stderr (%d bytes):\n%s", refErr, refStderr.Len(), refStderr.String())
+		}
+	} else {
+		// Symmetric discipline (fixture-0026/0029/0031/0033/0035 precedent):
+		// the reference MUST boot-reject with the substring in stderr.
+		if refCancel != nil {
+			// Surprising success path: the reference DID come up. Tear it
+			// down + fail the test — the broken script failed to reject.
+			refCancel()
+		}
+		if refErr == nil {
+			t.Fatalf("BootRejectFixture: reference proxy started cleanly — expected boot rejection for broken script %q", brf.BootRejectScript())
+		}
 	}
 
 	// Subject side — render the subject config then try to start it. The
@@ -1562,12 +1647,17 @@ func runBootRejectFixture(ctx context.Context, t *testing.T, root string, pin *E
 		t.Fatalf("BootRejectFixture: subject proxy started cleanly — expected boot rejection for broken script %q", brf.BootRejectScript())
 	}
 
-	// Substring assertions — case-sensitive Contains against both stderr
-	// buffers. The captured boot-reject error string from tryStart*
-	// (refErr / subjErr) is informational only; the AMEND-10 option 2
-	// carve-out asserts the substring in stderr, not in the error string.
-	if !strings.Contains(refStderr.String(), wantSubstring) {
-		t.Fatalf("BootRejectFixture: reference stderr does NOT contain %q\n--- reference err: %v\n--- reference stderr (%d bytes):\n%s", wantSubstring, refErr, refStderr.Len(), refStderr.String())
+	// Substring assertions — case-sensitive Contains against stderr buffers.
+	// For subject-only discipline only the subject stderr is checked (the
+	// reference booted successfully so there's no error wording to match).
+	// For symmetric discipline both stderr buffers are checked. The captured
+	// boot-reject error string from tryStart* (refErr / subjErr) is
+	// informational only; the AMEND-10 option 2 carve-out asserts the
+	// substring in stderr, not in the error string.
+	if !subjectOnly {
+		if !strings.Contains(refStderr.String(), wantSubstring) {
+			t.Fatalf("BootRejectFixture: reference stderr does NOT contain %q\n--- reference err: %v\n--- reference stderr (%d bytes):\n%s", wantSubstring, refErr, refStderr.Len(), refStderr.String())
+		}
 	}
 	if !strings.Contains(subjStderr.String(), wantSubstring) {
 		t.Fatalf("BootRejectFixture: subject stderr does NOT contain %q\n--- subject err: %v\n--- subject stderr (%d bytes):\n%s", wantSubstring, subjErr, subjStderr.Len(), subjStderr.String())

@@ -1,0 +1,22 @@
+# Cargo manifest for scenario e_trailers_read — fixture 0036-http-wasm-body-and-advanced.
+#
+# Per phase 25.2 SPEC §8.1.1 + Task 20 PLAN + AMEND-A1:
+# proxy-wasm-rust-sdk =0.2.4 (pinned exact). Builds to
+# target/wasm32-wasip1/release/e_trailers_read.wasm. The resulting blob is vendored
+# at ../../bytecode/e_trailers_read.wasm + consumed by BOTH reference Envoy v1.37.2
+# (V8 runtime) AND envoy-go (wazero runtime) via DataSource.Filename →
+# on-disk read. Exports proxy_abi_version_0_2_1 per AMEND-A6.
+[package]
+name = "e_trailers_read"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

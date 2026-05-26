@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\n')
+byte('\x01')
+uint32(0)
+uint64(9223372036854775808)
+[]byte("min_delta_metric")

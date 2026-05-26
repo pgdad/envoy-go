@@ -104,6 +104,96 @@ func TestStatNames_Equal_EnvoyGoFailures_Suffix(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// 25.2 IMPL Task 17 — 8 NEW envoy-go-strict counter byte-exact pins per
+// 25.2 SPEC §7.1 + AMEND-B3 (combined with statNameBodyBufferCapExceeded
+// landed at Task 16, these complete the 9-counter delta). Each test mirrors
+// the Task-8 5-counter pattern: a single const != literal assertion.
+// -----------------------------------------------------------------------------
+
+// TestStatNames_Equal_Wasm_BodyBufferCapExceeded pins the byte-exact
+// envoy-go-strict suffix landed at Task 16 (the FIRST of the 9 counters).
+// Included in the Task-17 pin block for the consolidated 9-counter coverage.
+func TestStatNames_Equal_Wasm_BodyBufferCapExceeded(t *testing.T) {
+	const expected = "body_buffer_cap_exceeded"
+	if statNameBodyBufferCapExceeded != expected {
+		t.Fatalf("statNameBodyBufferCapExceeded = %q; want %q", statNameBodyBufferCapExceeded, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_TickInvocations pins the byte-exact envoy-go-strict
+// suffix for counter 6 per 25.2 SPEC §7.1 + Q5.
+func TestStatNames_Equal_Wasm_TickInvocations(t *testing.T) {
+	const expected = "tick_invocations"
+	if statNameTickInvocations != expected {
+		t.Fatalf("statNameTickInvocations = %q; want %q", statNameTickInvocations, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_HttpCallDispatched pins the byte-exact envoy-go-
+// strict suffix for counter 7 per 25.2 SPEC §7.1 + Q4 + AMEND-B3.
+func TestStatNames_Equal_Wasm_HttpCallDispatched(t *testing.T) {
+	const expected = "http_call_dispatched"
+	if statNameHttpCallDispatched != expected {
+		t.Fatalf("statNameHttpCallDispatched = %q; want %q", statNameHttpCallDispatched, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_HttpCallResponse pins the byte-exact envoy-go-
+// strict suffix for counter 8 per 25.2 SPEC §7.1 + Q4.
+func TestStatNames_Equal_Wasm_HttpCallResponse(t *testing.T) {
+	const expected = "http_call_response"
+	if statNameHttpCallResponse != expected {
+		t.Fatalf("statNameHttpCallResponse = %q; want %q", statNameHttpCallResponse, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_ForeignFunctionDenied pins the byte-exact envoy-
+// go-strict suffix for counter 9 per 25.2 SPEC §7.1 + AMEND-A9.
+func TestStatNames_Equal_Wasm_ForeignFunctionDenied(t *testing.T) {
+	const expected = "foreign_function_denied"
+	if statNameForeignFunctionDenied != expected {
+		t.Fatalf("statNameForeignFunctionDenied = %q; want %q", statNameForeignFunctionDenied, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_HttpCallDispatchUnknownCluster pins the byte-
+// exact envoy-go-strict suffix for counter 11 per 25.2 SPEC §7.1 + Q4.
+func TestStatNames_Equal_Wasm_HttpCallDispatchUnknownCluster(t *testing.T) {
+	const expected = "http_call_dispatch_unknown_cluster"
+	if statNameHttpCallDispatchUnknownCluster != expected {
+		t.Fatalf("statNameHttpCallDispatchUnknownCluster = %q; want %q", statNameHttpCallDispatchUnknownCluster, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_SharedDataCapExceeded pins the byte-exact
+// envoy-go-strict suffix for counter 12 per 25.2 SPEC §7.1 + Q6.
+func TestStatNames_Equal_Wasm_SharedDataCapExceeded(t *testing.T) {
+	const expected = "shared_data_cap_exceeded"
+	if statNameSharedDataCapExceeded != expected {
+		t.Fatalf("statNameSharedDataCapExceeded = %q; want %q", statNameSharedDataCapExceeded, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_DynamicStatsCapExceeded pins the byte-exact
+// envoy-go-strict suffix for counter 13 per 25.2 SPEC §7.1 + Q9.
+func TestStatNames_Equal_Wasm_DynamicStatsCapExceeded(t *testing.T) {
+	const expected = "dynamic_stats_cap_exceeded"
+	if statNameDynamicStatsCapExceeded != expected {
+		t.Fatalf("statNameDynamicStatsCapExceeded = %q; want %q", statNameDynamicStatsCapExceeded, expected)
+	}
+}
+
+// TestStatNames_Equal_Wasm_HttpCallResponseAfterClose pins the byte-exact
+// envoy-go-strict suffix for counter 14 per 25.2 SPEC §7.1 + AMEND-B3 (the
+// AMEND-B3-added defensive observability counter; NEW vs BRAINSTORM Q9).
+func TestStatNames_Equal_Wasm_HttpCallResponseAfterClose(t *testing.T) {
+	const expected = "http_call_response_after_close"
+	if statNameHttpCallResponseAfterClose != expected {
+		t.Fatalf("statNameHttpCallResponseAfterClose = %q; want %q", statNameHttpCallResponseAfterClose, expected)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // New() arm-1 PARSE-REJECT contract (PLAN Task 12; replaces Task 8 skeleton).
 // -----------------------------------------------------------------------------
 
@@ -178,9 +268,12 @@ func TestValidatePerRouteWasm_RejectsWithArm18Wording(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // TestNewFilterStats_AllocatesFiveCounters verifies that newFilterStats
-// constructs all 5 fields non-nil + registers them under the tri-group
-// template (Group B wasm.wazero.* upstream-parity + envoy-go-strict
-// wasm.<plugin>.*).
+// constructs all 5 of the 25.1-era fields non-nil + registers them under
+// the tri-group template (Group B wasm.wazero.* upstream-parity +
+// envoy-go-strict wasm.<plugin>.*). Test name kept stable across phases
+// for git-blame continuity; the 25.2 EXTENSIONS (9 NEW envoy-go-strict
+// counters) are exercised at TestNewFilterStats_AllocatesAll14Counters
+// + TestNewFilterStats_ProjectStatCountDelta below.
 func TestNewFilterStats_AllocatesFiveCounters(t *testing.T) {
 	reg := stats.NewRegistry()
 	fs := newFilterStats(reg, "myplugin")
@@ -203,7 +296,8 @@ func TestNewFilterStats_AllocatesFiveCounters(t *testing.T) {
 		t.Error("filterStats.envoyGoFailures is nil; want non-nil counter")
 	}
 
-	// Pin the exact registered wire names via Walk-introspection.
+	// Pin the exact registered wire names via Walk-introspection — the
+	// 25.1 5-stat baseline (the 9 NEW 25.2 counters are pinned below).
 	wantNames := map[string]bool{
 		"wasm.wazero.created":             false,
 		"wasm.wazero.active":              false,
@@ -223,6 +317,75 @@ func TestNewFilterStats_AllocatesFiveCounters(t *testing.T) {
 	}
 }
 
+// TestNewFilterStats_AllocatesAll14Counters verifies that newFilterStats
+// constructs ALL 14 stat fields non-nil at 25.2 phase-done (2 shared
+// Group-B + 12 envoy-go-strict per-plugin = 3 from 25.1 + 9 NEW from 25.2
+// §7.1 + AMEND-B3) + registers the 9 NEW envoy-go-strict wire names.
+// Companion to TestStatNames_Equal_Wasm_* (each constant byte-pinned
+// individually) + TestNewFilterStats_ProjectStatCountDelta (per-call
+// stat-count delta verified).
+func TestNewFilterStats_AllocatesAll14Counters(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "myplugin")
+	if fs == nil {
+		t.Fatal("newFilterStats returned nil with non-nil registry")
+	}
+	// 25.2-era counter fields (Task 16 + Task 17). Field nil-checks ensure
+	// each counter is constructed; a regression that skips a counter
+	// surfaces here immediately.
+	if fs.bodyBufferCapExceeded == nil {
+		t.Error("filterStats.bodyBufferCapExceeded is nil; want non-nil counter (Task 16)")
+	}
+	if fs.tickInvocations == nil {
+		t.Error("filterStats.tickInvocations is nil; want non-nil counter (Task 17)")
+	}
+	if fs.httpCallDispatched == nil {
+		t.Error("filterStats.httpCallDispatched is nil; want non-nil counter (Task 17)")
+	}
+	if fs.httpCallResponse == nil {
+		t.Error("filterStats.httpCallResponse is nil; want non-nil counter (Task 17)")
+	}
+	if fs.foreignFunctionDenied == nil {
+		t.Error("filterStats.foreignFunctionDenied is nil; want non-nil counter (Task 17)")
+	}
+	if fs.httpCallDispatchUnknownCluster == nil {
+		t.Error("filterStats.httpCallDispatchUnknownCluster is nil; want non-nil counter (Task 17)")
+	}
+	if fs.sharedDataCapExceeded == nil {
+		t.Error("filterStats.sharedDataCapExceeded is nil; want non-nil counter (Task 17)")
+	}
+	if fs.dynamicStatsCapExceeded == nil {
+		t.Error("filterStats.dynamicStatsCapExceeded is nil; want non-nil counter (Task 17)")
+	}
+	if fs.httpCallResponseAfterClose == nil {
+		t.Error("filterStats.httpCallResponseAfterClose is nil; want non-nil counter (Task 17, AMEND-B3)")
+	}
+
+	// Pin the 9 NEW envoy-go-strict wire names (full wire form for the
+	// "myplugin" plugin discriminator).
+	want := map[string]bool{
+		"wasm.myplugin.body_buffer_cap_exceeded":           false,
+		"wasm.myplugin.tick_invocations":                   false,
+		"wasm.myplugin.http_call_dispatched":               false,
+		"wasm.myplugin.http_call_response":                 false,
+		"wasm.myplugin.foreign_function_denied":            false,
+		"wasm.myplugin.http_call_dispatch_unknown_cluster": false,
+		"wasm.myplugin.shared_data_cap_exceeded":           false,
+		"wasm.myplugin.dynamic_stats_cap_exceeded":         false,
+		"wasm.myplugin.http_call_response_after_close":     false,
+	}
+	reg.Walk(func(m stats.Metric) {
+		if _, ok := want[m.Name()]; ok {
+			want[m.Name()] = true
+		}
+	})
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("registry missing expected 25.2 stat name %q", name)
+		}
+	}
+}
+
 // TestNewFilterStats_NilRegistry_ReturnsNil verifies ADR-0085 nil-tolerance:
 // a nil registry produces a nil *filterStats (consumers nil-check before
 // incrementing per the family-wide pattern).
@@ -233,11 +396,23 @@ func TestNewFilterStats_NilRegistry_ReturnsNil(t *testing.T) {
 	}
 }
 
-// TestNewFilterStats_ProjectStatCountDelta verifies the +5 stat-count delta
-// per call against a fresh registry (the 114 → 119 phase-level project
-// delta is the sum of this +5 over the single 25.1 wasm-filter call site).
-// Verifies via Walk-count introspection (the registry exposes Walk but no
-// direct Count; we use a closure counter).
+// TestNewFilterStats_ProjectStatCountDelta verifies the +14 stat-count delta
+// per call against a fresh registry at 25.2 phase-done (the 119 → 128
+// project-level delta is the sum of this +14 minus the 5 already accounted
+// at 25.1 — i.e., the per-call delta on a FRESH registry is +14 = 2 Group-B
+// (created counter + active gauge) + 12 envoy-go-strict per-plugin
+// (executions + hostcall_denied + envoy_go.failures + body_buffer_cap_exceeded
+// + tick_invocations + http_call_dispatched + http_call_response +
+// foreign_function_denied + http_call_dispatch_unknown_cluster +
+// shared_data_cap_exceeded + dynamic_stats_cap_exceeded +
+// http_call_response_after_close)). The 25.1 +5 baseline → 25.2 +14 reflects
+// the +9 NEW envoy-go-strict counters per 25.2 SPEC §7.1 + AMEND-B3
+// (counter 14 added by AMEND-B3 over BRAINSTORM Q9's 8-counter tally).
+//
+// Project stat count assertion: 25.1 baseline 119 (the wasm filter accounts
+// for +5 of that) → 25.2 baseline 128 (the wasm filter accounts for +14 of
+// that, since the 25.1 +5 stays + the 25.2 +9 lands). Verified at this
+// per-call delta + at the wire-name pins above.
 func TestNewFilterStats_ProjectStatCountDelta(t *testing.T) {
 	reg := stats.NewRegistry()
 
@@ -254,9 +429,62 @@ func TestNewFilterStats_ProjectStatCountDelta(t *testing.T) {
 
 	post := 0
 	reg.Walk(func(stats.Metric) { post++ })
-	const wantDelta = 5
+	const wantDelta = 14 // 25.2 phase-done; was 5 at 25.1 — +9 from §7.1
 	if post-baseline != wantDelta {
-		t.Errorf("stat-count delta = %d; want +%d (per AMEND-A2 5-counter surface)", post-baseline, wantDelta)
+		t.Errorf("stat-count delta = %d; want +%d (25.2 per AMEND-A2 + §7.1 14-stat surface = 2 Group B + 12 envoy-go-strict per plugin)", post-baseline, wantDelta)
+	}
+}
+
+// TestProjectStatCount_Wasm25_2 asserts the project-level stat-count
+// contribution of the wasm filter at 25.2 phase-done is exactly 14 per
+// plugin instance (2 shared Group-B + 12 envoy-go-strict per-plugin),
+// rolling up to the 119 → 128 project total per 25.2 SPEC §7 + AMEND-B3.
+// This is the byte-exact pin for the AMEND-B3 + Q9 9-counter tally — a
+// regression that adds/removes a counter surfaces here before propagating
+// to the project-wide BEHAVIOR_CONTRACT.md stat tally row.
+func TestProjectStatCount_Wasm25_2(t *testing.T) {
+	reg := stats.NewRegistry()
+	_ = newFilterStats(reg, "plugin_assert")
+
+	const wantTotal = 14 // 2 Group-B + 12 envoy-go-strict per plugin
+	got := 0
+	reg.Walk(func(stats.Metric) { got++ })
+	if got != wantTotal {
+		t.Errorf("wasm filter stat-count = %d; want %d (25.2 §7.1 9-counter delta over 25.1 5-baseline)", got, wantTotal)
+	}
+
+	// Also assert the 9 envoy-go-strict + 3 25.1-baseline + 2 Group-B
+	// shape — i.e., 14 = 2 + 3 + 9. A delta on any sub-group bumps the
+	// assertion-failure with a discriminating message via the wantNames
+	// table pinned below (12 envoy-go-strict per-plugin + 2 Group B).
+	wantNames := map[string]bool{
+		// Group B (2):
+		"wasm.wazero.created": false,
+		"wasm.wazero.active":  false,
+		// 25.1 envoy-go-strict (3):
+		"wasm.plugin_assert.executions":        false,
+		"wasm.plugin_assert.hostcall_denied":   false,
+		"wasm.plugin_assert.envoy_go.failures": false,
+		// 25.2 envoy-go-strict §7.1 + AMEND-B3 (9):
+		"wasm.plugin_assert.body_buffer_cap_exceeded":           false,
+		"wasm.plugin_assert.tick_invocations":                   false,
+		"wasm.plugin_assert.http_call_dispatched":               false,
+		"wasm.plugin_assert.http_call_response":                 false,
+		"wasm.plugin_assert.foreign_function_denied":            false,
+		"wasm.plugin_assert.http_call_dispatch_unknown_cluster": false,
+		"wasm.plugin_assert.shared_data_cap_exceeded":           false,
+		"wasm.plugin_assert.dynamic_stats_cap_exceeded":         false,
+		"wasm.plugin_assert.http_call_response_after_close":     false,
+	}
+	reg.Walk(func(m stats.Metric) {
+		if _, ok := wantNames[m.Name()]; ok {
+			wantNames[m.Name()] = true
+		}
+	})
+	for name, seen := range wantNames {
+		if !seen {
+			t.Errorf("registry missing expected stat name %q (25.2 §7.1 + AMEND-B3 14-stat surface)", name)
+		}
 	}
 }
 

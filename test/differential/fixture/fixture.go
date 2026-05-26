@@ -454,6 +454,24 @@ const (
 	// runner_test.go mirrors HTTPLua precedent (fixture-0026 phase 22.1
 	// Task 13 / 14).
 	HTTPWasm BackendKind = 25
+	// HTTPWasmAdvanced reuses the SHARED echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for fixture
+	// 0036-http-wasm-body-and-advanced (phase 25.2 Task 20). The
+	// echobackend reflects request method + path + headers + body as
+	// JSON — the per-scenario cross-side assertions classify the
+	// reflected body for header presence/value or body-length
+	// assertions. TWO upstream clusters (cluster_a primary + cluster_b
+	// httpCall target) BOTH point at the SAME echobackend per phase-22.2
+	// REVIEW §7.4 freeTCPPort flake mitigation; the switch-case
+	// allocates ONE backend that both clusters dial. Because the
+	// backend is a subprocess, the runner's in-process accept counter
+	// is NOT incremented. NEW BackendKind value distinct from
+	// HTTPWasm=25 per `reference_differential_fixture_dispatch_constraint`
+	// (one fixture dir = one runner branch; fixture-0036's 14-scenario
+	// mixed-mode partition + 2-cluster topology + 4-arm StatsAsserter
+	// dispatch differs structurally from 25.1 fixture-0034's
+	// headers-bridge MVP). Introduced by phase 25.2 Task 20.
+	HTTPWasmAdvanced BackendKind = 26
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

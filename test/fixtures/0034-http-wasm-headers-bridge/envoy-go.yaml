@@ -82,6 +82,34 @@ static_resources:
                             proxy_on_log: {}
                             proxy_on_request_headers: {}
                             proxy_on_response_headers: {}
+                            # 25.2 IMPL Task 22 fix-up: 14 NEW hostcalls + 5 NEW callbacks
+                            # added per AMEND-B5 gate-at-registration discipline. The Rust SDK
+                            # v0.2.4 auto-imports all proxy-wasm hostcalls regardless of guest
+                            # usage; per AMEND-B5 denied caps are NOT registered on wazero,
+                            # which fails guest module instantiation. The 0034 plugins do NOT
+                            # invoke these caps; allowing them only resolves the import
+                            # resolution at instantiation time.
+                            proxy_get_buffer_bytes: {}
+                            proxy_set_buffer_bytes: {}
+                            proxy_get_buffer_status: {}
+                            proxy_continue_stream: {}
+                            proxy_close_stream: {}
+                            proxy_set_tick_period_milliseconds: {}
+                            proxy_http_call: {}
+                            proxy_call_foreign_function: {}
+                            proxy_define_metric: {}
+                            proxy_increment_metric: {}
+                            proxy_record_metric: {}
+                            proxy_get_metric: {}
+                            proxy_set_shared_data: {}
+                            proxy_get_shared_data: {}
+                            proxy_on_request_body: {}
+                            proxy_on_response_body: {}
+                            proxy_on_request_trailers: {}
+                            proxy_on_response_trailers: {}
+                            proxy_on_tick: {}
+                            proxy_on_http_call_response: {}
+                            proxy_on_foreign_function: {}
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -143,6 +171,34 @@ static_resources:
                             proxy_on_log: {}
                             proxy_on_request_headers: {}
                             proxy_on_response_headers: {}
+                            # 25.2 IMPL Task 22 fix-up: 14 NEW hostcalls + 5 NEW callbacks
+                            # added per AMEND-B5 gate-at-registration discipline. The Rust SDK
+                            # v0.2.4 auto-imports all proxy-wasm hostcalls regardless of guest
+                            # usage; per AMEND-B5 denied caps are NOT registered on wazero,
+                            # which fails guest module instantiation. The 0034 plugins do NOT
+                            # invoke these caps; allowing them only resolves the import
+                            # resolution at instantiation time.
+                            proxy_get_buffer_bytes: {}
+                            proxy_set_buffer_bytes: {}
+                            proxy_get_buffer_status: {}
+                            proxy_continue_stream: {}
+                            proxy_close_stream: {}
+                            proxy_set_tick_period_milliseconds: {}
+                            proxy_http_call: {}
+                            proxy_call_foreign_function: {}
+                            proxy_define_metric: {}
+                            proxy_increment_metric: {}
+                            proxy_record_metric: {}
+                            proxy_get_metric: {}
+                            proxy_set_shared_data: {}
+                            proxy_get_shared_data: {}
+                            proxy_on_request_body: {}
+                            proxy_on_response_body: {}
+                            proxy_on_request_trailers: {}
+                            proxy_on_response_trailers: {}
+                            proxy_on_tick: {}
+                            proxy_on_http_call_response: {}
+                            proxy_on_foreign_function: {}
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -204,6 +260,34 @@ static_resources:
                             proxy_on_log: {}
                             proxy_on_request_headers: {}
                             proxy_on_response_headers: {}
+                            # 25.2 IMPL Task 22 fix-up: 14 NEW hostcalls + 5 NEW callbacks
+                            # added per AMEND-B5 gate-at-registration discipline. The Rust SDK
+                            # v0.2.4 auto-imports all proxy-wasm hostcalls regardless of guest
+                            # usage; per AMEND-B5 denied caps are NOT registered on wazero,
+                            # which fails guest module instantiation. The 0034 plugins do NOT
+                            # invoke these caps; allowing them only resolves the import
+                            # resolution at instantiation time.
+                            proxy_get_buffer_bytes: {}
+                            proxy_set_buffer_bytes: {}
+                            proxy_get_buffer_status: {}
+                            proxy_continue_stream: {}
+                            proxy_close_stream: {}
+                            proxy_set_tick_period_milliseconds: {}
+                            proxy_http_call: {}
+                            proxy_call_foreign_function: {}
+                            proxy_define_metric: {}
+                            proxy_increment_metric: {}
+                            proxy_record_metric: {}
+                            proxy_get_metric: {}
+                            proxy_set_shared_data: {}
+                            proxy_get_shared_data: {}
+                            proxy_on_request_body: {}
+                            proxy_on_response_body: {}
+                            proxy_on_request_trailers: {}
+                            proxy_on_response_trailers: {}
+                            proxy_on_tick: {}
+                            proxy_on_http_call_response: {}
+                            proxy_on_foreign_function: {}
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -265,6 +349,34 @@ static_resources:
                             proxy_on_log: {}
                             proxy_on_request_headers: {}
                             proxy_on_response_headers: {}
+                            # 25.2 IMPL Task 22 fix-up: 14 NEW hostcalls + 5 NEW callbacks
+                            # added per AMEND-B5 gate-at-registration discipline. The Rust SDK
+                            # v0.2.4 auto-imports all proxy-wasm hostcalls regardless of guest
+                            # usage; per AMEND-B5 denied caps are NOT registered on wazero,
+                            # which fails guest module instantiation. The 0034 plugins do NOT
+                            # invoke these caps; allowing them only resolves the import
+                            # resolution at instantiation time.
+                            proxy_get_buffer_bytes: {}
+                            proxy_set_buffer_bytes: {}
+                            proxy_get_buffer_status: {}
+                            proxy_continue_stream: {}
+                            proxy_close_stream: {}
+                            proxy_set_tick_period_milliseconds: {}
+                            proxy_http_call: {}
+                            proxy_call_foreign_function: {}
+                            proxy_define_metric: {}
+                            proxy_increment_metric: {}
+                            proxy_record_metric: {}
+                            proxy_get_metric: {}
+                            proxy_set_shared_data: {}
+                            proxy_get_shared_data: {}
+                            proxy_on_request_body: {}
+                            proxy_on_response_body: {}
+                            proxy_on_request_trailers: {}
+                            proxy_on_response_trailers: {}
+                            proxy_on_tick: {}
+                            proxy_on_http_call_response: {}
+                            proxy_on_foreign_function: {}
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -326,6 +438,34 @@ static_resources:
                             proxy_on_log: {}
                             proxy_on_request_headers: {}
                             proxy_on_response_headers: {}
+                            # 25.2 IMPL Task 22 fix-up: 14 NEW hostcalls + 5 NEW callbacks
+                            # added per AMEND-B5 gate-at-registration discipline. The Rust SDK
+                            # v0.2.4 auto-imports all proxy-wasm hostcalls regardless of guest
+                            # usage; per AMEND-B5 denied caps are NOT registered on wazero,
+                            # which fails guest module instantiation. The 0034 plugins do NOT
+                            # invoke these caps; allowing them only resolves the import
+                            # resolution at instantiation time.
+                            proxy_get_buffer_bytes: {}
+                            proxy_set_buffer_bytes: {}
+                            proxy_get_buffer_status: {}
+                            proxy_continue_stream: {}
+                            proxy_close_stream: {}
+                            proxy_set_tick_period_milliseconds: {}
+                            proxy_http_call: {}
+                            proxy_call_foreign_function: {}
+                            proxy_define_metric: {}
+                            proxy_increment_metric: {}
+                            proxy_record_metric: {}
+                            proxy_get_metric: {}
+                            proxy_set_shared_data: {}
+                            proxy_get_shared_data: {}
+                            proxy_on_request_body: {}
+                            proxy_on_response_body: {}
+                            proxy_on_request_trailers: {}
+                            proxy_on_response_trailers: {}
+                            proxy_on_tick: {}
+                            proxy_on_http_call_response: {}
+                            proxy_on_foreign_function: {}
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -387,6 +527,34 @@ static_resources:
                             proxy_on_log: {}
                             proxy_on_request_headers: {}
                             proxy_on_response_headers: {}
+                            # 25.2 IMPL Task 22 fix-up: 14 NEW hostcalls + 5 NEW callbacks
+                            # added per AMEND-B5 gate-at-registration discipline. The Rust SDK
+                            # v0.2.4 auto-imports all proxy-wasm hostcalls regardless of guest
+                            # usage; per AMEND-B5 denied caps are NOT registered on wazero,
+                            # which fails guest module instantiation. The 0034 plugins do NOT
+                            # invoke these caps; allowing them only resolves the import
+                            # resolution at instantiation time.
+                            proxy_get_buffer_bytes: {}
+                            proxy_set_buffer_bytes: {}
+                            proxy_get_buffer_status: {}
+                            proxy_continue_stream: {}
+                            proxy_close_stream: {}
+                            proxy_set_tick_period_milliseconds: {}
+                            proxy_http_call: {}
+                            proxy_call_foreign_function: {}
+                            proxy_define_metric: {}
+                            proxy_increment_metric: {}
+                            proxy_record_metric: {}
+                            proxy_get_metric: {}
+                            proxy_set_shared_data: {}
+                            proxy_get_shared_data: {}
+                            proxy_on_request_body: {}
+                            proxy_on_response_body: {}
+                            proxy_on_request_trailers: {}
+                            proxy_on_response_trailers: {}
+                            proxy_on_tick: {}
+                            proxy_on_http_call_response: {}
+                            proxy_on_foreign_function: {}
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -448,6 +616,34 @@ static_resources:
                             proxy_on_log: {}
                             proxy_on_request_headers: {}
                             proxy_on_response_headers: {}
+                            # 25.2 IMPL Task 22 fix-up: 14 NEW hostcalls + 5 NEW callbacks
+                            # added per AMEND-B5 gate-at-registration discipline. The Rust SDK
+                            # v0.2.4 auto-imports all proxy-wasm hostcalls regardless of guest
+                            # usage; per AMEND-B5 denied caps are NOT registered on wazero,
+                            # which fails guest module instantiation. The 0034 plugins do NOT
+                            # invoke these caps; allowing them only resolves the import
+                            # resolution at instantiation time.
+                            proxy_get_buffer_bytes: {}
+                            proxy_set_buffer_bytes: {}
+                            proxy_get_buffer_status: {}
+                            proxy_continue_stream: {}
+                            proxy_close_stream: {}
+                            proxy_set_tick_period_milliseconds: {}
+                            proxy_http_call: {}
+                            proxy_call_foreign_function: {}
+                            proxy_define_metric: {}
+                            proxy_increment_metric: {}
+                            proxy_record_metric: {}
+                            proxy_get_metric: {}
+                            proxy_set_shared_data: {}
+                            proxy_get_shared_data: {}
+                            proxy_on_request_body: {}
+                            proxy_on_response_body: {}
+                            proxy_on_request_trailers: {}
+                            proxy_on_response_trailers: {}
+                            proxy_on_tick: {}
+                            proxy_on_http_call_response: {}
+                            proxy_on_foreign_function: {}
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
