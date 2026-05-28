@@ -4,7 +4,7 @@ This is a fresh-session prompt for the **`wasm` 25.3 sub-phase BRAINSTORM** — 
 
 ## What this session must do: AUTHOR the 25.3 BRAINSTORM doc (or annotate BRAINSTORM-skip)
 
-Per BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING state 5 → state 1 transition + the 25.2 phase-done handoff at master tip `5629408`, the 25.3 BRAINSTORM session:
+Per BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING state 5 → state 1 transition + the 25.2 phase-done handoff at master tip `75e43d8`, the 25.3 BRAINSTORM session:
 
 1. **Spawns a fresh worktree** at `.worktrees/phase-25.3-http-filter-wasm-perroute-and-conformance-brainstorm` branching off master tip per ADR-0003 + project memory `feedback_git_worktrees.md` (always use worktrees).
 
@@ -96,7 +96,7 @@ Key anchors not to re-litigate at 25.3 BRAINSTORM:
 
 ## Base + invariants at master tip
 
-- **Master tip:** `5629408` (`phase 25.2 IMPL stage-close: STATE.md SHA-fill (TBD-25.2-IMPL-SQUASH -> 368bc9f)` — the stage-close SHA-fill follow-up commit). Predecessor `368bc9f` is the 25.2 IMPL squash-merge commit landing the 22-task atomic landing + 4 NEW ADR bodies + ADR-0202 AMEND + REVIEW.md + STATE.md re-advance + ROADMAP row 25.2 flip. Earlier predecessors: `d9951c1` + `da84557` docs-only next-prompt.txt repoints; `bf6b3a5` + `defdc9b` 25.2 PLAN stage-close + squash; `ec50365` + `f0eae39` 25.2 SPEC stage-close + squash. All pushed to origin (`origin/master` at `5629408`). Run `git log --oneline -1` to confirm the actual tip SHA (subsequent docs-only repoint commits between this commit and session start may have advanced the tip past `5629408`).
+- **Master tip:** `75e43d8` (`next-prompt.txt: rewrite for 25.3 BRAINSTORM cold-start (post-25.2-IMPL 368bc9f/5629408)` — the docs-only next-prompt.txt rewrite commit). Predecessor `5629408` is the 25.2 IMPL stage-close SHA-fill commit (`phase 25.2 IMPL stage-close: STATE.md SHA-fill (TBD-25.2-IMPL-SQUASH -> 368bc9f)`). Predecessor `368bc9f` is the 25.2 IMPL squash-merge commit landing the 22-task atomic landing + 4 NEW ADR bodies + ADR-0202 AMEND + REVIEW.md + STATE.md re-advance + ROADMAP row 25.2 flip. Earlier predecessors: `d9951c1` + `da84557` docs-only next-prompt.txt repoints; `bf6b3a5` + `defdc9b` 25.2 PLAN stage-close + squash; `ec50365` + `f0eae39` 25.2 SPEC stage-close + squash. All pushed to origin (`origin/master` at `75e43d8`). Run `git log --oneline -1` to confirm the actual tip SHA (subsequent docs-only repoint commits between this commit and session start may have advanced the tip past `75e43d8`).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008 / ENVOY_TARGET.md). h2spec 53/53 at the ADR-0051 v1.32.4 pin. Rust toolchain `rustc 1.94.0` + `cargo 1.94.0` + `wasm32-wasip1` target installed (per 25.1 Task 15 + 25.2 Task 20 scripts/README.md pinning).
 - **Build + vet + lint + race + 39/39 differential + 35 fuzzers + h2spec 53/53 ALL GREEN** at master tip post-25.2-IMPL.
 - **Phase 25.3 BRAINSTORM (or SPEC if BRAINSTORM-skip) artifacts NOT yet authored:** `docs/envoy-go/phases/25.3-http-filter-wasm-perroute-and-conformance/` currently holds README.md only (pre-created forward-pointer); BRAINSTORM.md (or BRAINSTORM-skip rationale in extended README.md) + SPEC.md + PLAN.md + PROGRESS.md + REVIEW.md await 25.3 work.
