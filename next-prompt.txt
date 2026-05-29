@@ -4,7 +4,7 @@ This is a fresh-session prompt for the **`wasm` 25.3 sub-phase SPEC** — the TH
 
 ## What this session must do: AUTHOR the 25.3 SPEC doc
 
-Per BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING state 2 transition + the 25.3 BRAINSTORM phase-done handoff at master tip `1cda294`, the 25.3 SPEC session:
+Per BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING state 2 transition + the 25.3 BRAINSTORM phase-done handoff at master tip `032fb7a`, the 25.3 SPEC session:
 
 1. **Spawns a fresh worktree** at `.worktrees/phase-25.3-http-filter-wasm-perroute-and-conformance-spec` branching off master tip per ADR-0003 + project memory `feedback_git_worktrees.md` (always use worktrees).
 
@@ -102,7 +102,7 @@ Key anchors not to re-litigate at 25.3 SPEC:
 
 ## Base + invariants at master tip
 
-- **Master tip:** `1cda294` (`phase 25.3 BRAINSTORM stage-close: STATE.md SHA-fill (TBD-25.3-BRAINSTORM-SQUASH -> 8d64f4d)` — the SHA-fill stage-close commit). Predecessor `8d64f4d` is the 25.3 BRAINSTORM squash-merge commit landing BRAINSTORM.md authoring + STATE.md re-advance + README.md status banner extension. Earlier predecessors: `3214ee1` + `75e43d8` docs-only next-prompt.txt rewrites; `5629408` 25.2 IMPL SHA-fill; `368bc9f` 25.2 IMPL squash; etc. All pushed to origin (`origin/master` at `1cda294`). Run `git log --oneline -1` to confirm the actual tip SHA (subsequent docs-only repoint commits between this commit and session start may have advanced the tip past `1cda294`).
+- **Master tip:** `032fb7a` (`next-prompt.txt: rewrite for 25.3 SPEC cold-start (post-25.3-BRAINSTORM 8d64f4d/1cda294)` — the docs-only next-prompt.txt rewrite commit). Predecessor `1cda294` is the 25.3 BRAINSTORM stage-close SHA-fill commit (`phase 25.3 BRAINSTORM stage-close: STATE.md SHA-fill (TBD-25.3-BRAINSTORM-SQUASH -> 8d64f4d)`). Predecessor `8d64f4d` is the 25.3 BRAINSTORM squash-merge commit landing BRAINSTORM.md authoring + STATE.md re-advance + README.md status banner extension. Earlier predecessors: `3214ee1` + `75e43d8` docs-only next-prompt.txt rewrites; `5629408` 25.2 IMPL SHA-fill; `368bc9f` 25.2 IMPL squash; etc. All pushed to origin (`origin/master` at `032fb7a`). Run `git log --oneline -1` to confirm the actual tip SHA (subsequent docs-only repoint commits between this commit and session start may have advanced the tip past `032fb7a`).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008 / ENVOY_TARGET.md). h2spec 53/53 at the ADR-0051 v1.32.4 pin. Rust toolchain `rustc 1.94.0` + `cargo 1.94.0` + `wasm32-wasip1` target installed (per 25.1 Task 15 + 25.2 Task 20 scripts/README.md pinning).
 - **Build + vet + lint + race + 39/39 differential + 35 fuzzers + h2spec 53/53 ALL GREEN** at master tip post-25.2-IMPL (25.3 BRAINSTORM is docs-only; no code changes; all gates STAY GREEN).
 - **Phase 25.3 SPEC artifact NOT yet authored:** `docs/envoy-go/phases/25.3-http-filter-wasm-perroute-and-conformance/` currently holds README.md + BRAINSTORM.md (the 25.3 BRAINSTORM authored at the predecessor BRAINSTORM commit); SPEC.md + PLAN.md + PROGRESS.md + REVIEW.md await 25.3 SPEC + PLAN + IMPL sessions.
