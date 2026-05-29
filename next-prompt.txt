@@ -4,7 +4,7 @@ This is a fresh-session prompt for the **`wasm` 25.3 sub-phase IMPL** — the IM
 
 ## What this session must do: EXECUTE the 25.3 PLAN's 15-task TDD task graph
 
-Per BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING state 4 transition + the 25.3 PLAN hand-off at master tip `99519f0`, the 25.3 IMPL session:
+Per BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING state 4 transition + the 25.3 PLAN hand-off at master tip `4afb89a`, the 25.3 IMPL session:
 
 1. **Spawns a fresh worktree** at `.worktrees/phase-25.3-http-filter-wasm-perroute-and-conformance-impl` branching off master tip per ADR-0003 + project memory `feedback_git_worktrees.md` (always use worktrees). Confirm baseline GREEN at entry per PLAN "Execution preconditions" (`go build ./... && go vet ./... && golangci-lint run && go test -race -short ./...` + differential 39/39 + h2spec 53/53) and record it in PROGRESS.md.
 
@@ -58,7 +58,7 @@ The parent BRAINSTORM + parent SPEC (AMEND-A1..A9) + 25.1 (SPEC+PLAN+IMPL) + 25.
 
 ## Base + invariants at master tip
 
-- **Master tip:** `99519f0` (`phase 25.3 PLAN stage-close: STATE.md SHA-fill (TBD-25.3-PLAN-SQUASH -> 1aec3fc)`). Predecessor `1aec3fc` is the 25.3 PLAN squash-merge commit (lands PLAN.md + ROADMAP row-25.3 PLAN annotation + STATE.md re-advance). Earlier predecessors: `f01f0aa`/`8d08bb9` docs-only next-prompt repoints; `85a89f7`/`60a6773` 25.3 SPEC; `8d64f4d`/`1cda294` 25.3 BRAINSTORM. All pushed to origin (`origin/master` at `99519f0`). Run `git log --oneline -1` to confirm the actual tip SHA (subsequent docs-only repoint commits may have advanced the tip past `99519f0`).
+- **Master tip:** `4afb89a` (`next-prompt.txt: rewrite for 25.3 IMPL cold-start (post-25.3-PLAN 1aec3fc/99519f0)`; docs-only next-prompt rewrite commit). Predecessor `99519f0` is the 25.3 PLAN stage-close STATE.md SHA-fill (`TBD-25.3-PLAN-SQUASH -> 1aec3fc`); `1aec3fc` is the 25.3 PLAN squash-merge commit (lands PLAN.md + ROADMAP row-25.3 PLAN annotation + STATE.md re-advance). Earlier predecessors: `f01f0aa`/`8d08bb9` docs-only next-prompt repoints; `85a89f7`/`60a6773` 25.3 SPEC; `8d64f4d`/`1cda294` 25.3 BRAINSTORM. All pushed to origin (`origin/master` at `4afb89a`). Run `git log --oneline -1` to confirm the actual tip SHA (subsequent docs-only repoint commits may have advanced the tip past `4afb89a`).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008 / ENVOY_TARGET.md). h2spec 53/53 at the ADR-0051 v1.32.4 pin. Rust toolchain + `wasm32-wasip1` target installed (per 25.1 Task 15 + 25.2 Task 20) — used to BUILD the fixture-0038 + conformance `.wasm` blobs OFFLINE; vendored blobs committed so CI needs NO Rust.
 - **Build + vet + lint + race + 39/39 differential + 35 fuzzers + h2spec 53/53 ALL GREEN** at master tip post-25.3-PLAN (25.3 PLAN is docs-only; no code changes; all gates STAY GREEN).
 - **Phase 25.3 IMPL artifacts NOT yet authored:** `docs/envoy-go/phases/25.3-http-filter-wasm-perroute-and-conformance/` holds README.md + BRAINSTORM.md + SPEC.md + PLAN.md; PROGRESS.md + REVIEW.md await this 25.3 IMPL session.
