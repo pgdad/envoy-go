@@ -260,6 +260,15 @@ type RootVM struct {
 	//     path.
 	dynStats *dynamic.Registry
 
+	// env is the assembled environment-variable map fed to the guest's WASI
+	// environ_get / environ_sizes_get shims as KEY=VALUE\0 entries per
+	// AMEND-C4. Set once at NewRootVM via WithRootEnv (after AssembleEnvVars
+	// collision/cap validation at Task 7 from VmConfig.environment_variables).
+	// nil/empty ⇒ the guest sees zero env entries (the 25.1/25.2 behavior).
+	// Read unlocked from WASIEnviron (called during guest dispatch; no
+	// mutation after construction).
+	env map[string]string
+
 	// stats is the per-*RootVM RootStatsRecorder counter sink per 25.2 IMPL
 	// Task 20 follow-up (Concern 2 — counter-glue wiring gap). Wired ONCE at
 	// NewRootVM via WithRootStats; defaults to noopStatsRecorder if no
@@ -445,6 +454,13 @@ func WithRootSharedDataCaps(valCap, maxEntries uint32) RootVMOption {
 func WithSharedDataStore(store *sharedDataStore) RootVMOption {
 	return func(rv *RootVM) { rv.sharedData = store }
 }
+
+// WithRootEnv sets the assembled environment-variable map fed to the guest's
+// WASI environ_get/environ_sizes_get shims as KEY=VALUE\0 entries per AMEND-C4.
+// Wired by compiledConfig at Task 7 from VmConfig.environment_variables (after
+// AssembleEnvVars collision/cap validation). Unset ⇒ the guest sees zero env
+// entries (the 25.1/25.2 behavior).
+func WithRootEnv(env map[string]string) RootVMOption { return func(rv *RootVM) { rv.env = env } }
 
 // PanicHandlerFn is invoked after `recover()` in the RootVM's panic-wrapper.
 // `recovered` is the value returned by recover() (typically the panic value).
@@ -879,6 +895,12 @@ var newCallbackCapability25_2 = map[string]string{
 func (rv *RootVM) IsAllowed(capabilityName string) bool {
 	return rv.sandbox.IsAllowed(capabilityName)
 }
+
+// WASIEnviron returns the guest-visible environment as KEY=VALUE\0 entries
+// (sorted-key order for determinism) per AMEND-C4. Satisfies wasiHost.
+// Delegates to encodeWASIEnviron(rv.env) — nil/empty env ⇒ nil (zero
+// entries advertised; the 25.1/25.2 behavior).
+func (rv *RootVM) WASIEnviron() [][]byte { return encodeWASIEnviron(rv.env) }
 
 // LogProxy routes a log line to rv.logSink (if set); satisfies the wasiHost
 // interface (wasi.go). Default nil sink ⇒ drop, matching the

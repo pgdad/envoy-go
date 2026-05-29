@@ -59,6 +59,17 @@ type wasiHost interface {
 	// to forward fd=1 / fd=2 stream-writes through the proxy-wasm
 	// integration logger (NOT the host process's stdout / stderr).
 	LogProxy(level abi.LogLevel, msg string)
+
+	// WASIEnviron returns the guest-visible environment as KEY=VALUE\0
+	// entries (sorted-key order for determinism per AMEND-C4). Each entry
+	// is a single []byte of the form `KEY=VALUE\0`. Empty return (nil or
+	// zero-len slice) means the guest sees zero environment entries — the
+	// 25.1/25.2 behavior for plugins without env config.
+	//
+	// Implemented by *RootVM via encodeWASIEnviron(rv.env) in env_vars.go;
+	// fed by WithRootEnv (Task 4) from VmConfig.environment_variables after
+	// AssembleEnvVars collision/cap validation (Task 7 wiring).
+	WASIEnviron() [][]byte
 }
 
 // Capability keys for the 8 WASI shims. Bare names (no `wasi_` prefix —
@@ -212,29 +223,73 @@ func wasiRandomGet(_ context.Context, mod api.Module, host wasiHost, bufferPtr, 
 }
 
 // wasiEnvironSizesGet implements `wasi_snapshot_preview1.environ_sizes_get`.
-// At 25.1 + 25.2 the proxy-wasm host advertises zero environment variables;
-// the 25.3 sub-phase will populate from `VmConfig.environment_variables`.
-// Writes 0 (u32 LE) to both `numElementsPtr` and `bufferSizePtr`.
+// Reports the number of environment entries + total byte count of the packed
+// KEY=VALUE\0 buffer the guest must allocate before calling environ_get.
+//
+// The entries are obtained from `host.WASIEnviron()` (KEY=VALUE\0 slices in
+// sorted-key order per AMEND-C4). For a plugin with no env config the method
+// returns an empty slice and the shim writes 0/0 — the 25.1/25.2 behavior.
+//
+// Writes count (u32 LE) to `numElementsPtr` and total byte-size (u32 LE) to
+// `bufferSizePtr`. Returns WasiErrnoInval on a failed memory write.
 func wasiEnvironSizesGet(_ context.Context, mod api.Module, host wasiHost, numElementsPtr, bufferSizePtr uint32) abi.WasiErrno {
 	if !host.IsAllowed(capWasiEnvironSizesGet) {
 		return abi.WasiErrnoNotcapable
 	}
+	entries := host.WASIEnviron()
+	//nolint:gosec // entry count is bounded by envVarsMaxEntries (64); uint32 cast is safe.
+	count := uint32(len(entries))
+	var bufSize uint32
+	for _, e := range entries {
+		//nolint:gosec // entry length ≤ len(key)+1+envVarsMaxValueBytes+1 ≤ 4160; uint32 cast is safe.
+		bufSize += uint32(len(e))
+	}
 	mem := mod.Memory()
-	if !mem.WriteUint32Le(numElementsPtr, 0) {
+	if !mem.WriteUint32Le(numElementsPtr, count) {
 		return abi.WasiErrnoInval
 	}
-	if !mem.WriteUint32Le(bufferSizePtr, 0) {
+	if !mem.WriteUint32Le(bufferSizePtr, bufSize) {
 		return abi.WasiErrnoInval
 	}
 	return abi.WasiErrnoSuccess
 }
 
-// wasiEnvironGet implements `wasi_snapshot_preview1.environ_get`. Pairs
-// with `wasiEnvironSizesGet` (which advertises 0 environ entries at 25.1);
-// writes nothing and returns `abi.WasiErrnoSuccess` on allow.
-func wasiEnvironGet(_ context.Context, _ api.Module, host wasiHost, _, _ uint32) abi.WasiErrno {
+// wasiEnvironGet implements `wasi_snapshot_preview1.environ_get`. Lays out
+// the KEY=VALUE\0 entries (from `host.WASIEnviron()`) into guest memory per
+// the WASI snapshot-preview1 ABI:
+//
+//	environ_ptr[i]   — u32 LE pointer to the start of entry i in the buffer
+//	environ_buf_ptr  — packed KEY=VALUE\0 bytes for all entries (contiguous)
+//
+// The caller is responsible for allocating `environ_ptr` (count × 4 bytes)
+// and `environ_buf_ptr` (total byte count) using the sizes from a preceding
+// environ_sizes_get call.
+//
+// Empty env → writes nothing, returns WasiErrnoSuccess. Any failed memory
+// write returns WasiErrnoInval.
+func wasiEnvironGet(_ context.Context, mod api.Module, host wasiHost, environPtr, environBufPtr uint32) abi.WasiErrno {
 	if !host.IsAllowed(capWasiEnvironGet) {
 		return abi.WasiErrnoNotcapable
+	}
+	entries := host.WASIEnviron()
+	if len(entries) == 0 {
+		return abi.WasiErrnoSuccess
+	}
+	mem := mod.Memory()
+	offset := environBufPtr
+	for i, entry := range entries {
+		// Write the raw entry bytes into the packed buffer.
+		if !mem.Write(offset, entry) {
+			return abi.WasiErrnoInval
+		}
+		// Write this entry's pointer into the pointer-table slot.
+		//nolint:gosec // i < envVarsMaxEntries (64); i*4 ≤ 252; uint32 cast is safe.
+		ptrSlot := environPtr + uint32(i)*4
+		if !mem.WriteUint32Le(ptrSlot, offset) {
+			return abi.WasiErrnoInval
+		}
+		//nolint:gosec // entry length ≤ len(key)+1+envVarsMaxValueBytes+1 ≤ 4160; uint32 cast is safe.
+		offset += uint32(len(entry))
 	}
 	return abi.WasiErrnoSuccess
 }

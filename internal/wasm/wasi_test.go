@@ -50,6 +50,10 @@ func (m *mockWasiHost) LogProxy(lvl abi.LogLevel, msg string) {
 	m.logs = append(m.logs, logEntry{Level: lvl, Msg: msg})
 }
 
+// WASIEnviron returns nil (zero env entries) for the base mock. Tests that
+// need non-empty environ use mockWasiHostWithEnv (env_vars_test.go).
+func (m *mockWasiHost) WASIEnviron() [][]byte { return nil }
+
 // allowAll returns a mockWasiHost with every WASI capability allowed.
 func allowAll() *mockWasiHost {
 	return &mockWasiHost{
