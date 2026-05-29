@@ -114,7 +114,8 @@ type RootVM struct {
 	// the shared cache sub-ms.
 	compilationCache wazero.CompilationCache
 
-	// shared-data state (activated at Task 6 per Q6 + R-25.2-10):
+	// shared-data state (activated at Task 6 per Q6 + R-25.2-10; broadened
+	// to vm_id scope at Task 2 per AMEND-C2):
 	//
 	//   - sharedDataValCap / sharedDataMaxEntries: envoy-go-strict caps per
 	//     AMEND-B5. Zero ⇒ defaults applied at first use (1 MiB / 1024 per
@@ -122,19 +123,16 @@ type RootVM struct {
 	//     Operator overrides flow via WithRootSharedDataCaps OR the Task 14
 	//     per-plugin Configure-time field-set.
 	//
-	//   - sharedData: the per-*RootVM CAS-protected K-V map. Lazy-init on
-	//     first SetSharedData (avoids a NewRootVM-time allocation for
-	//     plugins that never touch shared-data). The entry struct +
-	//     SetSharedData / GetSharedData methods live at shared_data.go.
-	//
-	//   - sharedDataMu: sync.RWMutex guarding the map + cap-check
-	//     critical sections. Multiple-reader concurrency for Get; exclusive
-	//     for Set. SAFE to call from any goroutine independently of
-	//     dispatchMu (see shared_data.go doc).
+	//   - sharedData: the *sharedDataStore backing this RootVM. By default
+	//     (no WithSharedDataStore option) NewRootVM allocates a private store
+	//     so each *RootVM is isolated (pre-25.3 behavior). Task 7 wires the
+	//     registry-provided vm_id-scoped store here so plugins sharing a
+	//     vm_id observe one namespace (AMEND-C2). The entry struct + store
+	//     methods + SetSharedData / GetSharedData thin wrappers live at
+	//     shared_data.go.
 	sharedDataValCap     uint32 // from PluginConfig envoy_go_strict_shared_data_value_cap_bytes; 0 ⇒ default
 	sharedDataMaxEntries uint32 // from PluginConfig envoy_go_strict_shared_data_max_entries; 0 ⇒ default
-	sharedData           map[string]sharedDataEntry
-	sharedDataMu         sync.RWMutex
+	sharedData           *sharedDataStore
 
 	// tick state (per Q5 + ADR-0186 Clock seam; activated at Task 5):
 	//
@@ -392,6 +390,14 @@ func WithRootSharedDataCaps(valCap, maxEntries uint32) RootVMOption {
 	}
 }
 
+// WithSharedDataStore injects a shared (registry-owned, vm_id-scoped)
+// shared-data store. When unset, NewRootVM allocates a private store so
+// each *RootVM is isolated (the pre-25.3 behavior). Task 7 wires the
+// registry-provided store here so plugins under one vm_id share a namespace.
+func WithSharedDataStore(store *sharedDataStore) RootVMOption {
+	return func(rv *RootVM) { rv.sharedData = store }
+}
+
 // PanicHandlerFn is invoked after `recover()` in the RootVM's panic-wrapper.
 // `recovered` is the value returned by recover() (typically the panic value).
 type PanicHandlerFn func(recovered any)
@@ -452,6 +458,13 @@ func NewRootVM(ctx context.Context, module *Module, rootCtxID uint32, opts ...Ro
 	// *filterStats satisfies the interface via thin wrappers.
 	if rv.stats == nil {
 		rv.stats = noopStatsRecorder{}
+	}
+	// Default the shared-data store to a fresh private store if no
+	// WithSharedDataStore option was applied. This preserves the pre-25.3
+	// per-RootVM isolation so all existing tests stay green. Task 7 wires
+	// the registry-provided vm_id-scoped store here (AMEND-C2).
+	if rv.sharedData == nil {
+		rv.sharedData = newSharedDataStore()
 	}
 
 	runtimeConfig := wazero.NewRuntimeConfigInterpreter()

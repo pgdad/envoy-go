@@ -6,6 +6,8 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	"github.com/esalaine/envoy-go/internal/wasm/abi"
 )
 
 // TestMakeVMKey_ByteStable pins the registry key to cpp-host makeVmKey
@@ -130,5 +132,56 @@ func TestRegistry_ConcurrentAcquireRelease(t *testing.T) {
 	wg.Wait()
 	if r.has(key) {
 		t.Fatal("registry must be empty after balanced acquire/release")
+	}
+}
+
+// Two *RootVM under the SAME vm_id but DIFFERENT composite keys MUST observe
+// ONE shared-data namespace per AMEND-C2.
+func TestRegistry_SharedDataAtVMIDScope(t *testing.T) {
+	r := NewRegistry()
+	s1 := r.AcquireSharedData("vmid-shared")
+	s2 := r.AcquireSharedData("vmid-shared")
+	if s1 != s2 {
+		t.Fatal("same vm_id must yield the same shared-data store")
+	}
+	s3 := r.AcquireSharedData("vmid-other")
+	if s1 == s3 {
+		t.Fatal("distinct vm_id must yield distinct stores")
+	}
+}
+
+// Two RootVMs constructed with the SAME injected store see each other's
+// writes; a RootVM with its own (default) store does NOT.
+//
+// Step-3 variant choice: RootVM-level test via newRootVMForSharedData (defined
+// in shared_data_test.go). The helper accepts variadic RootVMOption so
+// WithSharedDataStore wires cleanly; no awkward plumbing needed.
+func TestRootVM_SharedDataStoreSharing(t *testing.T) {
+	store := newSharedDataStore()
+
+	// rvA and rvB share the injected store.
+	rvA := newRootVMForSharedData(t, WithSharedDataStore(store))
+	rvB := newRootVMForSharedData(t, WithSharedDataStore(store))
+	// rvC has its own default (private) store — must NOT see rvA's writes.
+	rvC := newRootVMForSharedData(t)
+
+	// Write via rvA.
+	if res := rvA.SetSharedData("cross-vm-key", []byte("hello"), 0); res != abi.WasmResultOk {
+		t.Fatalf("rvA.SetSharedData: got %v; want Ok", res)
+	}
+
+	// rvB must see the write (shared store).
+	gotV, gotCAS, gotStatus := rvB.GetSharedData("cross-vm-key")
+	if gotStatus != abi.WasmResultOk {
+		t.Fatalf("rvB.GetSharedData: status=%v; want Ok (shared store)", gotStatus)
+	}
+	if string(gotV) != "hello" || gotCAS != 1 {
+		t.Errorf("rvB.GetSharedData: got (%q, cas=%d); want (\"hello\", cas=1)", gotV, gotCAS)
+	}
+
+	// rvC must NOT see the write (private store).
+	_, _, statusC := rvC.GetSharedData("cross-vm-key")
+	if statusC != abi.WasmResultNotFound {
+		t.Errorf("rvC.GetSharedData (isolated store): status=%v; want NotFound", statusC)
 	}
 }

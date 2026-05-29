@@ -1,5 +1,6 @@
-// Tests for the per-*RootVM CAS-protected shared-data K-V map per Q6 +
-// R-25.2-10 + 25.2 SPEC §3.1 shared_data.go + §5.1 #35-36.
+// Tests for the registry-owned sharedDataStore (shared at raw-vm_id scope)
+// per Q6 + R-25.2-10 + 25.2 SPEC §3.1 shared_data.go + §5.1 #35-36.
+// The tests exercise the RootVM-level SetSharedData/GetSharedData wrappers.
 //
 // Coverage (golden table per R-25.2-10):
 //

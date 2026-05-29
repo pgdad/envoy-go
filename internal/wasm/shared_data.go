@@ -1,12 +1,12 @@
-// shared_data.go — per-*RootVM CAS-protected shared-data K-V map per Q6 +
-// R-25.2-10 + 25.2 SPEC §3.1 + §5.1 #35-36.
+// shared_data.go — CAS-protected shared-data K-V store per Q6 +
+// R-25.2-10 + 25.2 SPEC §3.1 + §5.1 #35-36 + AMEND-C2 (vm_id-scope).
 //
 // # Design (per Q6 + R-25.2-10 + cpp-host byte-faithful)
 //
-// Each *RootVM owns ONE shared-data store — a `map[string]sharedDataEntry`
-// guarded by sync.RWMutex. The entry carries the value bytes + a monotonic
-// CAS counter. The CAS semantic is byte-exact from upstream proxy-wasm-cpp-
-// host (src/exports.cc:set_shared_data):
+// Each *sharedDataStore is a `map[string]sharedDataEntry` guarded by
+// sync.RWMutex. The entry carries the value bytes + a monotonic CAS counter.
+// The CAS semantic is byte-exact from upstream proxy-wasm-cpp-host
+// (src/exports.cc:set_shared_data):
 //
 //	cas == 0           ⇒ UNCONDITIONAL write (returns Ok, increments CAS)
 //	cas > 0 + match    ⇒ CONDITIONAL write succeeds (returns Ok, increments CAS)
@@ -40,16 +40,13 @@
 // NewRootVM's option-list small (no required cap-init) and matches the
 // "envoy-go-strict envelope as the implicit default" pattern.
 //
-// # Counter integration (deferred to Task 17)
+// # Counter integration (cap-exceeded)
 //
-// On a cap-exceeded path the SPEC mandates a `wasm.<plugin>.shared_data_
-// cap_exceeded` envoy-go-strict counter increment + an `envoy_go.failures`
-// co-increment per §2.25. The per-plugin stats wiring lands at Task 17
-// (stats.go EXTEND); at Task 6 the cap-exceeded path returns the
-// load-bearing WasmResult::InternalFailure but does NOT yet invoke a
-// counter (the per-RootVM stats reference is not yet wired). The
-// integration touchpoint is marked with a `TODO Task 17` reference in the
-// cap-exceeded branches below.
+// On a cap-exceeded path the store's `set` returns
+// WasmResult::InternalFailure. `SetSharedData` (the RootVM-level wrapper)
+// maps that result to a `shared_data_cap_exceeded` envoy-go-strict counter
+// increment + an `envoy_go.failures` co-increment per §2.25 — wired live
+// via RootStatsRecorder (no longer deferred).
 //
 // # Goroutine-safety
 //
@@ -74,6 +71,8 @@
 package wasm
 
 import (
+	"sync"
+
 	"github.com/esalaine/envoy-go/internal/wasm/abi"
 )
 
@@ -89,12 +88,89 @@ const SharedDataValueCapDefault uint32 = 1024 * 1024 // 1 MiB
 // envoy_go_strict_shared_data_max_entries config field.
 const SharedDataMaxEntriesDefault uint32 = 1024
 
-// sharedDataEntry is one slot in the per-*RootVM shared-data store. The
-// CAS counter is monotonic per entry — starts at 1 for newly-created
-// entries (matches cpp-host) and increments on every successful write.
+// sharedDataEntry is one slot in the shared-data store. The CAS counter is
+// monotonic per entry — starts at 1 for newly-created entries (matches
+// cpp-host) and increments on every successful write.
 type sharedDataEntry struct {
 	value []byte
 	cas   uint32
+}
+
+// sharedDataStore is the CAS-protected K-V store. Owned by the registry and
+// shared across all *RootVM under one raw vm_id per AMEND-C2 (so distinct
+// composite-key VMs sharing a vm_id observe one namespace). The caps + stats
+// stay a *RootVM concern (passed in / handled by the caller) because distinct
+// plugins under one vm_id may configure different caps/recorders.
+type sharedDataStore struct {
+	mu   sync.RWMutex
+	data map[string]sharedDataEntry
+}
+
+func newSharedDataStore() *sharedDataStore { return &sharedDataStore{} }
+
+// set performs the value-cap + entry-cap + CAS logic ATOMICALLY under the
+// write lock (moved verbatim from the old SetSharedData body). valCap and
+// maxEntries are passed by the caller. Returns abi.WasmResultInternalFailure
+// ONLY on a cap-exceeded path (value-cap OR entry-cap) — the caller maps that
+// to the stats increments. NO stats calls inside the store.
+func (s *sharedDataStore) set(key string, value []byte, cas, valCap, maxEntries uint32) abi.WasmResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Value-cap check (applies to BOTH new + in-place updates).
+	//nolint:gosec // len(value) is bounded by the guest's actual payload; the cap-check IS the bound.
+	if uint32(len(value)) > valCap {
+		return abi.WasmResultInternalFailure
+	}
+
+	// Lazy-init the map on first write. Avoids a newSharedDataStore-time
+	// allocation for stores that never receive a write.
+	if s.data == nil {
+		s.data = make(map[string]sharedDataEntry)
+	}
+
+	if existing, ok := s.data[key]; ok {
+		// CAS check (cpp-host byte-faithful: cas=0 unconditionally writes;
+		// cas>0 must match the existing entry's CAS).
+		if cas != 0 && existing.cas != cas {
+			return abi.WasmResultCasMismatch
+		}
+		// Defensive copy of `value` so a subsequent guest-side mutation of
+		// the source bytes does NOT silently mutate the stored entry.
+		newVal := append([]byte(nil), value...)
+		existing.value = newVal
+		existing.cas++
+		s.data[key] = existing
+		return abi.WasmResultOk
+	}
+
+	// New entry. Entry-cap check.
+	//nolint:gosec // len(data) bounded by past-set successes; well within uint32.
+	if uint32(len(s.data)) >= maxEntries {
+		return abi.WasmResultInternalFailure
+	}
+	newVal := append([]byte(nil), value...)
+	s.data[key] = sharedDataEntry{value: newVal, cas: 1}
+	return abi.WasmResultOk
+}
+
+// get is the old GetSharedData body (RLock; defensive copy; NotFound on miss).
+func (s *sharedDataStore) get(key string) ([]byte, uint32, abi.WasmResult) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.data == nil {
+		return nil, 0, abi.WasmResultNotFound
+	}
+	entry, ok := s.data[key]
+	if !ok {
+		return nil, 0, abi.WasmResultNotFound
+	}
+	// Defensive copy: do NOT hand the caller a reference to our internal
+	// slice (a Get-then-mutate pattern would otherwise corrupt the store
+	// without going through the CAS check).
+	out := append([]byte(nil), entry.value...)
+	return out, entry.cas, abi.WasmResultOk
 }
 
 // effectiveSharedDataValCap returns the value-cap to apply for this *RootVM:
@@ -129,72 +205,27 @@ func (rv *RootVM) effectiveSharedDataMaxEntries() uint32 {
 //   - WasmResultCasMismatch on `cas > 0 && existing.cas != cas`. The entry
 //     is UNCHANGED.
 //   - WasmResultInternalFailure on a cap-exceeded write (value-cap OR
-//     entry-cap). The store is UNCHANGED. Per §2.25 this ALSO increments
-//     `envoy_go.failures` + the `shared_data_cap_exceeded` envoy-go-strict
-//     counter — wiring deferred to Task 17 (per-plugin stats.go EXTEND).
+//     entry-cap). The store is UNCHANGED. This wrapper then increments
+//     `shared_data_cap_exceeded` + `envoy_go.failures` per §2.25
+//     (cap-exceeded counter wiring, live).
 //
 // `value == nil` (or len == 0) is a valid empty-value write (matches
 // cpp-host). The empty value still occupies one entry slot and counts
 // against the entry-cap.
 //
-// Concurrency: acquires sharedDataMu Lock. The cap-check + the map
-// mutation are performed under the same lock so concurrent racing Sets
-// cannot overflow the entry-cap by interleaving.
+// Concurrency: the underlying sharedDataStore acquires its own write lock.
+// The cap-check + the map mutation are performed under the same lock so
+// concurrent racing Sets cannot overflow the entry-cap by interleaving.
 func (rv *RootVM) SetSharedData(key string, value []byte, cas uint32) abi.WasmResult {
-	rv.sharedDataMu.Lock()
-	defer rv.sharedDataMu.Unlock()
-
-	valCap := rv.effectiveSharedDataValCap()
-	maxEntries := rv.effectiveSharedDataMaxEntries()
-
-	// Value-cap check (applies to BOTH new + in-place updates).
-	//nolint:gosec // len(value) is bounded by the guest's actual payload; the cap-check IS the bound.
-	if uint32(len(value)) > valCap {
+	res := rv.sharedData.set(key, value, cas, rv.effectiveSharedDataValCap(), rv.effectiveSharedDataMaxEntries())
+	if res == abi.WasmResultInternalFailure {
 		// envoy-go-strict counter increment per Q6 (counter 12 of 14 in
 		// §7.1) + envoy_go.failures co-increment per §2.25. Wired via
 		// RootStatsRecorder per 25.2 IMPL Task 20 follow-up (Concern 2).
 		rv.stats.SharedDataCapExceededInc()
 		rv.stats.EnvoyGoFailuresInc()
-		return abi.WasmResultInternalFailure
 	}
-
-	// Lazy-init the map on first write. Avoids a NewRootVM-time allocation
-	// for plugins that never touch shared-data.
-	if rv.sharedData == nil {
-		rv.sharedData = make(map[string]sharedDataEntry)
-	}
-
-	if existing, ok := rv.sharedData[key]; ok {
-		// CAS check (cpp-host byte-faithful: cas=0 unconditionally writes;
-		// cas>0 must match the existing entry's CAS).
-		if cas != 0 && existing.cas != cas {
-			return abi.WasmResultCasMismatch
-		}
-		// Defensive copy of `value` so a subsequent guest-side mutation of
-		// the source bytes does NOT silently mutate the stored entry (the
-		// shim's caller already copies the wasm-memory slice, but call
-		// sites from Go-side code (Task 17 stats, future direct callers)
-		// MAY pass a non-copied slice).
-		newVal := append([]byte(nil), value...)
-		existing.value = newVal
-		existing.cas++
-		rv.sharedData[key] = existing
-		return abi.WasmResultOk
-	}
-
-	// New entry. Entry-cap check.
-	//nolint:gosec // len(sharedData) bounded by past-Set successes; well within uint32.
-	if uint32(len(rv.sharedData)) >= maxEntries {
-		// envoy-go-strict counter increment per Q6 (counter 12 of 14 in
-		// §7.1) + envoy_go.failures co-increment per §2.25. Wired via
-		// RootStatsRecorder per 25.2 IMPL Task 20 follow-up (Concern 2).
-		rv.stats.SharedDataCapExceededInc()
-		rv.stats.EnvoyGoFailuresInc()
-		return abi.WasmResultInternalFailure
-	}
-	newVal := append([]byte(nil), value...)
-	rv.sharedData[key] = sharedDataEntry{value: newVal, cas: 1}
-	return abi.WasmResultOk
+	return res
 }
 
 // GetSharedData returns the value + current CAS counter for the entry at
@@ -205,22 +236,9 @@ func (rv *RootVM) SetSharedData(key string, value []byte, cas uint32) abi.WasmRe
 //     store.
 //   - (nil, 0, WasmResultNotFound) when the entry does not exist.
 //
-// Concurrency: acquires sharedDataMu RLock. Multiple readers can proceed
-// concurrently; a concurrent Set blocks until they all complete.
+// Concurrency: delegates to the underlying sharedDataStore which acquires
+// its own RLock. Multiple readers can proceed concurrently; a concurrent
+// Set blocks until they all complete.
 func (rv *RootVM) GetSharedData(key string) ([]byte, uint32, abi.WasmResult) {
-	rv.sharedDataMu.RLock()
-	defer rv.sharedDataMu.RUnlock()
-
-	if rv.sharedData == nil {
-		return nil, 0, abi.WasmResultNotFound
-	}
-	entry, ok := rv.sharedData[key]
-	if !ok {
-		return nil, 0, abi.WasmResultNotFound
-	}
-	// Defensive copy: do NOT hand the caller a reference to our internal
-	// slice (a Get-then-mutate pattern would otherwise corrupt the store
-	// without going through the CAS check).
-	out := append([]byte(nil), entry.value...)
-	return out, entry.cas, abi.WasmResultOk
+	return rv.sharedData.get(key)
 }

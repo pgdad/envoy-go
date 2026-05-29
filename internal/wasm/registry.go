@@ -62,15 +62,21 @@ type registryEntry struct {
 // local_wasms) into ONE process-global map because Go has no Envoy thread-local
 // worker model.
 type Registry struct {
-	mu      sync.Mutex
-	entries map[string]*registryEntry
+	mu         sync.Mutex
+	entries    map[string]*registryEntry
+	sharedData map[string]*sharedDataStore
 }
 
 // DefaultRegistry is the process-global singleton consumed by compiledConfig.
 var DefaultRegistry = NewRegistry()
 
 // NewRegistry creates a new empty Registry.
-func NewRegistry() *Registry { return &Registry{entries: map[string]*registryEntry{}} }
+func NewRegistry() *Registry {
+	return &Registry{
+		entries:    map[string]*registryEntry{},
+		sharedData: map[string]*sharedDataStore{},
+	}
+}
 
 // AcquireRootVM returns the *RootVM for key, incrementing its refcount. On a
 // cache miss the factory is called to construct a new *RootVM (refcount starts
@@ -130,4 +136,21 @@ func (r *Registry) has(key string) bool {
 	defer r.mu.Unlock()
 	_, ok := r.entries[key]
 	return ok
+}
+
+// AcquireSharedData returns the shared-data store for the given raw vm_id,
+// constructing it on first use. Distinct vm_ids get distinct stores; the
+// same vm_id always yields the same store (AMEND-C2 vm_id-scope). The store
+// outlives individual *RootVM lifecycles (it is keyed by vm_id, not by the
+// composite VM key) — there is no refcount-driven teardown for shared-data,
+// matching cpp-host (SharedData persists for the process).
+func (r *Registry) AcquireSharedData(vmID string) *sharedDataStore {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.sharedData[vmID]; ok {
+		return s
+	}
+	s := newSharedDataStore()
+	r.sharedData[vmID] = s
+	return s
 }
