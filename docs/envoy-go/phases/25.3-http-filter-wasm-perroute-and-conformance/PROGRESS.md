@@ -690,7 +690,7 @@ under `-count=5`.
 
 STATE.md re-advanced: active-phase + lifecycle-state → `phase 25.3 IMPL done; §9
 HTTP-filters family CLOSED`; next-skill → `superpowers:brainstorming` (family closed; next
-§9-line family = Network filters); last-commit → TBD-25.3-IMPL-SQUASH (SHA-fill at
+§9-line family = Network filters); last-commit → 57c7c4d (SHA-fill at
 stage-close); next-free ADR-0213. ROADMAP: sub-row 25.3 `in-progress → done` + parent row 25
 `in-progress → done` flipped ATOMICALLY; BOTH lifecycle annotations placed in the
 commit-message body for grep-verifiability per ADR-0106 + the 18/19/22/24 ROLLUP precedent.
