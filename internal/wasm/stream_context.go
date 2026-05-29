@@ -54,6 +54,21 @@ type StreamContext struct {
 	// than dereferencing the cleared rv.instance). atomic.Bool removes the
 	// data race + mirrors the RootVM.closed precedent at root_vm.go.
 	closed atomic.Bool
+
+	// trapped marks the shared instance as POISONED by a guest trap (a wazero
+	// RuntimeError surfaced from a proxy_on_* dispatch — e.g. a Rust panic!
+	// that aborts to `unreachable`, which leaves the proxy-wasm-rust-sdk
+	// dispatcher's RefCell borrowed). Set by any CallProxyOnX method whose
+	// underlying guest call returns a non-nil error (BUG-3 fix, phase-25.3 Task
+	// 11-fix). Read by Close: a trapped instance MUST NOT be re-entered via the
+	// proxy_on_done/log/delete teardown triplet — re-entering a poisoned guest
+	// cascades (the second dispatch hits the still-borrowed RefCell →
+	// panic_already_borrowed). The shared *RootVM is separately marked Failed
+	// (NoteReloadRuntimeError under FAIL_RELOAD) so the next request
+	// reinstantiates a fresh instance, clearing the poison for future streams.
+	// atomic.Bool because RootVM.Close may observe it cross-goroutine, mirroring
+	// the `closed` precedent.
+	trapped atomic.Bool
 }
 
 // ContextID returns the per-stream context ID allocated by RootVM at
@@ -113,6 +128,7 @@ func (sc *StreamContext) CallProxyOnRequestHeaders(ctx context.Context, numHeade
 		}
 		return nil
 	})
+	sc.noteTrapOnError(err)
 	return action, err
 }
 
@@ -153,6 +169,7 @@ func (sc *StreamContext) CallProxyOnResponseHeaders(ctx context.Context, numHead
 		}
 		return nil
 	})
+	sc.noteTrapOnError(err)
 	return action, err
 }
 
@@ -200,6 +217,7 @@ func (sc *StreamContext) CallProxyOnRequestBody(ctx context.Context, bodySize ui
 		}
 		return nil
 	})
+	sc.noteTrapOnError(err)
 	return action, err
 }
 
@@ -240,6 +258,7 @@ func (sc *StreamContext) CallProxyOnResponseBody(ctx context.Context, bodySize u
 		}
 		return nil
 	})
+	sc.noteTrapOnError(err)
 	return action, err
 }
 
@@ -279,6 +298,7 @@ func (sc *StreamContext) CallProxyOnRequestTrailers(ctx context.Context, numTrai
 		}
 		return nil
 	})
+	sc.noteTrapOnError(err)
 	return action, err
 }
 
@@ -314,6 +334,7 @@ func (sc *StreamContext) CallProxyOnResponseTrailers(ctx context.Context, numTra
 		}
 		return nil
 	})
+	sc.noteTrapOnError(err)
 	return action, err
 }
 
@@ -351,16 +372,18 @@ func (sc *StreamContext) CallProxyOnHttpCallResponse(ctx context.Context, callID
 	defer rv.dispatchMu.Unlock()
 	rv.currentCtxID.Store(sc.streamCtxID)
 
-	return rv.runCallWithPanicWrapper(func() error {
-		_, err := fn.Call(ctx,
+	err := rv.runCallWithPanicWrapper(func() error {
+		_, callErr := fn.Call(ctx,
 			uint64(sc.streamCtxID),
 			uint64(callID),
 			uint64(numHeaders),
 			uint64(bodySize),
 			uint64(numTrailers),
 		)
-		return err
+		return callErr
 	})
+	sc.noteTrapOnError(err)
+	return err
 }
 
 // CallProxyOnDone invokes `proxy_on_done(streamCtxID)` → bool. Returning
@@ -397,6 +420,7 @@ func (sc *StreamContext) CallProxyOnDone(ctx context.Context) (bool, error) {
 		}
 		return nil
 	})
+	sc.noteTrapOnError(err)
 	return done, err
 }
 
@@ -420,10 +444,12 @@ func (sc *StreamContext) CallProxyOnLog(ctx context.Context) error {
 	defer rv.dispatchMu.Unlock()
 	rv.currentCtxID.Store(sc.streamCtxID)
 
-	return rv.runCallWithPanicWrapper(func() error {
-		_, err := fn.Call(ctx, uint64(sc.streamCtxID))
-		return err
+	err := rv.runCallWithPanicWrapper(func() error {
+		_, callErr := fn.Call(ctx, uint64(sc.streamCtxID))
+		return callErr
 	})
+	sc.noteTrapOnError(err)
+	return err
 }
 
 // CallProxyOnDelete invokes `proxy_on_delete(streamCtxID)`. Gated by
@@ -446,10 +472,27 @@ func (sc *StreamContext) CallProxyOnDelete(ctx context.Context) error {
 	defer rv.dispatchMu.Unlock()
 	rv.currentCtxID.Store(sc.streamCtxID)
 
-	return rv.runCallWithPanicWrapper(func() error {
-		_, err := fn.Call(ctx, uint64(sc.streamCtxID))
-		return err
+	err := rv.runCallWithPanicWrapper(func() error {
+		_, callErr := fn.Call(ctx, uint64(sc.streamCtxID))
+		return callErr
 	})
+	sc.noteTrapOnError(err)
+	return err
+}
+
+// noteTrapOnError records a guest dispatch trap on the StreamContext per the
+// BUG-3 fix (phase-25.3 Task 11-fix). Any non-nil error from a CallProxyOnX
+// guest dispatch (a wazero RuntimeError trap, or a panic-wrapped Go panic from
+// a bridge callback) marks the shared instance POISONED so Close skips the
+// teardown triplet rather than re-entering a poisoned guest (which cascades —
+// see the `trapped` field doc). Setting the flag on ANY dispatch error is the
+// robust, conservative choice: a spurious skip of teardown on a non-trap error
+// is harmless (the *RootVM is torn down or reinstantiated regardless), whereas
+// re-entering a genuinely poisoned guest is the cascade we must prevent.
+func (sc *StreamContext) noteTrapOnError(err error) {
+	if err != nil {
+		sc.trapped.Store(true)
+	}
 }
 
 // Close fires proxy_on_done + proxy_on_log + proxy_on_delete on the stream
@@ -460,21 +503,43 @@ func (sc *StreamContext) CallProxyOnDelete(ctx context.Context) error {
 // The streamCtxID entry is removed from rootVM.streamCtxs at Close. Errors
 // from the per-callback invocations are joined (first non-nil wins); the
 // cleanup still proceeds on error so the stream context teardown completes.
+//
+// # Trap-poison guard (BUG-3 fix, phase-25.3 Task 11-fix)
+//
+// If a prior guest dispatch on this stream TRAPPED (sc.trapped is set — a
+// wazero RuntimeError, e.g. a Rust panic! that left the proxy-wasm-rust-sdk
+// dispatcher's RefCell borrowed), the shared instance is POISONED. Close MUST
+// NOT re-enter it via the proxy_on_done/log/delete teardown triplet: a second
+// dispatch into the poisoned guest cascades (panic_already_borrowed in the
+// Rust SDK; a redundant re-trap + spurious failures-counter bump in our host).
+// On a trapped instance Close SKIPS the three teardown callbacks but still
+// performs the rest of teardown (flip closed, remove from the streamCtxs map,
+// cancel outstanding httpCalls). The shared *RootVM is separately marked Failed
+// (NoteReloadRuntimeError under FAIL_RELOAD) so the next request reinstantiates
+// a FRESH instance — clearing the poison for future streams. Under non-
+// FAIL_RELOAD policies (FAIL_CLOSED / FAIL_OPEN) the *RootVM is NOT
+// reinstantiated, so the poisoned shared instance persists for the lifetime of
+// the *RootVM (a known limitation — upstream Envoy under non-reload policies
+// likewise does not recover a trapped VM); the Close-skip nonetheless prevents
+// the IMMEDIATE per-stream cascade on this stream's teardown.
 func (sc *StreamContext) Close(ctx context.Context) error {
 	var firstErr error
 	sc.closeOnce.Do(func() {
-		// Fire the three lifecycle teardown callbacks. Each is gated +
-		// guest-export-tolerant per the per-callback method's contract; we
-		// invoke through the public methods to retain the dispatch-lock
-		// + panic-wrapper discipline.
-		if _, err := sc.CallProxyOnDone(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if err := sc.CallProxyOnLog(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if err := sc.CallProxyOnDelete(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		// Fire the three lifecycle teardown callbacks — UNLESS the instance is
+		// poisoned by a prior trap (sc.trapped), in which case re-entering it
+		// would cascade. Each is gated + guest-export-tolerant per the per-
+		// callback method's contract; we invoke through the public methods to
+		// retain the dispatch-lock + panic-wrapper discipline.
+		if !sc.trapped.Load() {
+			if _, err := sc.CallProxyOnDone(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if err := sc.CallProxyOnLog(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if err := sc.CallProxyOnDelete(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 
 		// Flip closed AFTER firing the three callbacks (they early-return

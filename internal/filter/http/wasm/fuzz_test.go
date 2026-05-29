@@ -39,17 +39,21 @@ package wasm
 
 import (
 	"context"
+	"fmt"
 	"runtime/debug"
 	"strings"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	wasmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/wasm/v3"
 	wasmcommonv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/wasm/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
 )
 
 // FuzzWasmConfigParse fuzzes arbitrary byte sequences as the typed_config
@@ -534,11 +538,257 @@ func FuzzWasmConfigParse(f *testing.F) {
 	})
 
 	// -------------------------------------------------------------------------
+	// 25.3 NEW seeds — FOLD per-route / reload / env_vars / failure_policy
+	// surface added at phase-25.3 Task 7 (15 seeds, per D-25.3-6).
+	// -------------------------------------------------------------------------
+
+	// --- failure_policy enum values ---
+
+	// (fp-1) failure_policy = FAIL_RELOAD on a valid-ish config.
+	// NOTE: arm 9 in the PRE-25.3 sense was "FAIL_RELOAD deferred"; at 25.3
+	// that arm is LIFTED (failure_policy is now PARSED + CONSUMED). This seed
+	// reaches parseFailurePolicy, sets FailurePolicyFailReload, then continues
+	// to arm 17 (compile-failed on inline-string stub).
+	{
+		base := minValidWasm("fp_fail_reload_plugin")
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_RELOAD
+		addSeed(base)
+	}
+
+	// (fp-2) failure_policy = FAIL_CLOSED explicit (default alias; valid parse).
+	{
+		base := minValidWasm("fp_fail_closed_plugin")
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_CLOSED
+		addSeed(base)
+	}
+
+	// (fp-3) failure_policy = FAIL_OPEN explicit (25.3 lifted arm 10 variant).
+	// At 25.3 fail_open==false here, so arm B mutual-exclusivity does NOT fire;
+	// this seeds FailurePolicyFailOpen and continues to arm 17.
+	{
+		base := minValidWasm("fp_fail_open_enum_plugin")
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_OPEN
+		addSeed(base)
+	}
+
+	// --- reload_config.backoff.base_interval variants ---
+
+	// (rc-1) reload_config with base_interval = 0 (unset/zero durationpb).
+	{
+		base := minValidWasm("reload_cfg_zero_interval_plugin")
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_RELOAD
+		base.Config.ReloadConfig = &wasmcommonv3.ReloadConfig{
+			Backoff: &corev3.BackoffStrategy{
+				BaseInterval: durationpb.New(0),
+			},
+		}
+		addSeed(base)
+	}
+
+	// (rc-2) reload_config with base_interval = 50ms (sub-100ms; valid for
+	// parseFailurePolicy since no proto-level lower-bound; exercises the
+	// durationpb.AsDuration() path).
+	{
+		base := minValidWasm("reload_cfg_50ms_interval_plugin")
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_RELOAD
+		base.Config.ReloadConfig = &wasmcommonv3.ReloadConfig{
+			Backoff: &corev3.BackoffStrategy{
+				BaseInterval: durationpb.New(50 * time.Millisecond),
+			},
+		}
+		addSeed(base)
+	}
+
+	// (rc-3) reload_config with base_interval = 250ms (typical valid value).
+	{
+		base := minValidWasm("reload_cfg_250ms_interval_plugin")
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_RELOAD
+		base.Config.ReloadConfig = &wasmcommonv3.ReloadConfig{
+			Backoff: &corev3.BackoffStrategy{
+				BaseInterval: durationpb.New(250 * time.Millisecond),
+			},
+		}
+		addSeed(base)
+	}
+
+	// --- fail_open + failure_policy mutual-exclusivity (arm B reject) ---
+
+	// (me-1) fail_open=true AND failure_policy=FAIL_CLOSED → arm B reject
+	// (parseRejectFailOpenAndFailurePolicyBothSet). This fires BEFORE code
+	// resolution, so InlineString stub is fine.
+	{
+		base := minValidWasm("mutual_excl_fail_open_closed_plugin")
+		base.Config.FailOpen = true //nolint:staticcheck // SA1019: arm B mutual-exclusivity seed; intentional.
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_CLOSED
+		addSeed(base)
+	}
+
+	// (me-2) fail_open=true AND failure_policy=FAIL_RELOAD → arm B reject.
+	{
+		base := minValidWasm("mutual_excl_fail_open_reload_plugin")
+		base.Config.FailOpen = true //nolint:staticcheck // SA1019: arm B mutual-exclusivity seed; intentional.
+		base.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_RELOAD
+		addSeed(base)
+	}
+
+	// --- environment_variables seeds ---
+
+	// (ev-1) Collision: same key in BOTH host_env_keys AND key_values → arm A
+	// reject (parseRejectEnvVarsKeyCollision). Fires at parseEnvVars before
+	// code resolution.
+	{
+		base := minValidWasm("ev_collision_plugin")
+		base.Config.GetVmConfig().EnvironmentVariables = &wasmcommonv3.EnvironmentVariables{
+			HostEnvKeys: []string{"COLLIDING_KEY"},
+			KeyValues:   map[string]string{"COLLIDING_KEY": "value"},
+		}
+		addSeed(base)
+	}
+
+	// (ev-2) Cap-by-entry-count: >64 key_values entries → arm C reject
+	// (parseRejectEnvVarsCapExceeded).
+	{
+		base := minValidWasm("ev_cap_entries_plugin")
+		kv := make(map[string]string, 65)
+		for i := 0; i < 65; i++ {
+			kv[fmt.Sprintf("KEY_%03d", i)] = "v"
+		}
+		base.Config.GetVmConfig().EnvironmentVariables = &wasmcommonv3.EnvironmentVariables{
+			KeyValues: kv,
+		}
+		addSeed(base)
+	}
+
+	// (ev-3) Cap-by-value-size: one value > 4096 bytes → arm C reject.
+	{
+		base := minValidWasm("ev_cap_value_size_plugin")
+		bigVal := strings.Repeat("x", 4097)
+		base.Config.GetVmConfig().EnvironmentVariables = &wasmcommonv3.EnvironmentVariables{
+			KeyValues: map[string]string{"BIG_KEY": bigVal},
+		}
+		addSeed(base)
+	}
+
+	// (ev-4) Valid env_vars: a few key_values + a host_env_key that does NOT
+	// collide. Passes parseEnvVars, then continues to arm 17 (compile-failed
+	// on the InlineString stub content).
+	{
+		base := minValidWasm("ev_valid_plugin")
+		base.Config.GetVmConfig().EnvironmentVariables = &wasmcommonv3.EnvironmentVariables{
+			HostEnvKeys: []string{"PATH"},
+			KeyValues:   map[string]string{"MY_KEY": "my_value", "OTHER": "42"},
+		}
+		addSeed(base)
+	}
+
+	// --- vm_id set (shared-registry surface) ---
+
+	// (vm-1) vm_id set on a valid-ish config. The single-input fuzzer cannot
+	// express the two-config vm_id SHARING scenario, but seeding with vm_id
+	// set exercises the vm_id field path through compiled_config + the
+	// DefaultRegistry.AcquireSharedData(vm_id) call at the tail (if compile
+	// succeeds; otherwise surfaces at arm 17).
+	{
+		base := minValidWasm("vm_id_set_plugin")
+		base.Config.GetVmConfig().VmId = "shared_vm_123"
+		addSeed(base)
+	}
+
+	// (vm-2) vm_id set AND valid wasm bytecode to exercise the registry-acquire
+	// path fully (reaches DefaultRegistry.AcquireSharedData post-compile).
+	addSeed(&wasmv3.Wasm{
+		Config: &wasmcommonv3.PluginConfig{
+			Name: "vm_id_valid_wasm_plugin",
+			Vm: &wasmcommonv3.PluginConfig_VmConfig{
+				VmConfig: &wasmcommonv3.VmConfig{
+					VmId:    "shared_vm_456",
+					Runtime: "envoy.wasm.runtime.wazero",
+					Code: &corev3.AsyncDataSource{
+						Specifier: &corev3.AsyncDataSource_Local{
+							Local: &corev3.DataSource{
+								Specifier: &corev3.DataSource_InlineBytes{
+									InlineBytes: buildContinueProxyWasm(),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	// --- per-route-shaped wholesale Wasm variants ---
+
+	// (pr-1) Per-route path uses the SAME buildCompiledConfig; a complete valid
+	// Wasm message with failure_policy + env_vars set exercises both surfaces
+	// through the single code path.
+	addSeed(&wasmv3.Wasm{
+		Config: &wasmcommonv3.PluginConfig{
+			Name:          "perroute_valid_plugin",
+			FailurePolicy: wasmcommonv3.FailurePolicy_FAIL_OPEN,
+			Vm: &wasmcommonv3.PluginConfig_VmConfig{
+				VmConfig: &wasmcommonv3.VmConfig{
+					Runtime: "envoy.wasm.runtime.wazero",
+					EnvironmentVariables: &wasmcommonv3.EnvironmentVariables{
+						KeyValues: map[string]string{"ROUTE_KEY": "route_value"},
+					},
+					Code: &corev3.AsyncDataSource{
+						Specifier: &corev3.AsyncDataSource_Local{
+							Local: &corev3.DataSource{
+								Specifier: &corev3.DataSource_InlineBytes{
+									InlineBytes: buildContinueProxyWasm(),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	// (pr-2) Per-route-shaped Wasm with reload_config set (FAIL_RELOAD +
+	// backoff) to exercise the reload-path through buildCompiledConfig at the
+	// per-route parse surface.
+	addSeed(&wasmv3.Wasm{
+		Config: &wasmcommonv3.PluginConfig{
+			Name:          "perroute_reload_plugin",
+			FailurePolicy: wasmcommonv3.FailurePolicy_FAIL_RELOAD,
+			ReloadConfig: &wasmcommonv3.ReloadConfig{
+				Backoff: &corev3.BackoffStrategy{
+					BaseInterval: durationpb.New(100 * time.Millisecond),
+				},
+			},
+			Vm: &wasmcommonv3.PluginConfig_VmConfig{
+				VmConfig: &wasmcommonv3.VmConfig{
+					Runtime: "envoy.wasm.runtime.wazero",
+					Code: &corev3.AsyncDataSource{
+						Specifier: &corev3.AsyncDataSource_Local{
+							Local: &corev3.DataSource{
+								Specifier: &corev3.DataSource_InlineString{
+									InlineString: "perroute-stub-bytes",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	// -------------------------------------------------------------------------
 	// Fuzz body: must-never-panic assertion only (per ADR-0018 + 25.1 PLAN
-	// Task 14). The fuzz engine derives further inputs from the ~30 seeds at
+	// Task 14). The fuzz engine derives further inputs from the ~45 seeds at
 	// the 30s budget per ADR-0018 short-mode CI policy.
 	// -------------------------------------------------------------------------
 	f.Fuzz(func(t *testing.T, raw []byte) {
+		// Per-iteration state reset (phase-25.3 Task 10 hygiene): a VALID fuzz
+		// input acquires a registry *RootVM + registers the plugin name in the
+		// process-global DefaultRegistry + pluginNameRegistry. Resetting at the
+		// top of each iteration ensures independent evaluation (no refcount /
+		// goroutine accumulation, no cross-input arm-26 false-rejects).
+		internalwasm.DefaultRegistry.ResetForTest()
+		resetPluginConfigNameRegistry()
+
 		// Defer-recover catches any panic + records as test failure. The
 		// must-never-panic contract holds across the full parse pipeline:
 		// typed_config.UnmarshalTo, the 18-arm PARSE-REJECT roster, the

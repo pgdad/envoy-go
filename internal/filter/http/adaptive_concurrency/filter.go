@@ -64,6 +64,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/esalaine/envoy-go/internal/clock"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
@@ -82,7 +83,7 @@ import (
 type filter struct {
 	cc         *compiledConfig
 	controller *gradientController
-	clock      Clock
+	clock      clock.Clock
 	dcb        envoyhttp.DecoderFilterCallbacks
 
 	// entryTime is set on Forward at DecodeHeaders via clock.Now(); consumed

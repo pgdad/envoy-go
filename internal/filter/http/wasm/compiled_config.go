@@ -19,48 +19,44 @@ package wasm
 //   - Arm 6  (vm-config-code-remote-deferred)              — IMPL HERE
 //   - Arm 7  (data-source-watched-directory-deferred)      — IMPL HERE
 //   - Arm 8  (data-source-specifier-required)              — IMPL HERE
-//   - Arm 9  (plugin-failure-policy-fail-reload-deferred)  — IMPL HERE
-//   - Arm 10 (plugin-fail-open-deferred)                   — IMPL HERE
+//   - Arm 9  (plugin-failure-policy / reload_config)       — LIFTED at 25.3 Task 7:
+//                                                            failure_policy +
+//                                                            reload_config now
+//                                                            PARSED + CONSUMED via
+//                                                            parseFailurePolicy.
+//   - Arm 10 (plugin-fail-open)                            — LIFTED at 25.3 Task 7:
+//                                                            fail_open now maps to
+//                                                            FailurePolicyFailOpen.
 //   - Arm 11 (vm-config-runtime-discriminator)             — IMPL HERE (%q-formatted)
-//   - Arm 12 (vm-config-vm-id-duplicate)                   — RESERVED at 25.1
-//                                                            (single-plugin-per-
-//                                                            listener model;
-//                                                            arm activates at
-//                                                            25.3 multi-plugin
-//                                                            VM-sharing registry).
-//                                                            Constant byte-stable
-//                                                            pinned by
-//                                                            TestParseRejectConstants_
-//                                                            ByteStable; no
-//                                                            production trigger
-//                                                            path at 25.1.
-//   - Arm 13 (vm-config-environment-variables-deferred)    — IMPL HERE
+//   - Arm 12 (vm-config-vm-id-duplicate)                   — RETIRED at 25.3 Task 7:
+//                                                            duplicate vm_id now
+//                                                            SHARES one *RootVM via
+//                                                            the registry refcount
+//                                                            (AcquireFor). No reject.
+//   - Arm 13 (vm-config-environment-variables)             — LIFTED at 25.3 Task 7:
+//                                                            now PARSED + CONSUMED via
+//                                                            wasm.AssembleEnvVars +
+//                                                            WithRootEnv.
 //   - Arm 14 (vm-config-allow-precompiled-rejected)        — IMPL HERE
 //   - Arm 15 (vm-config-nack-on-code-cache-miss-rejected)  — IMPL HERE
 //   - Arm 16 (module-abi-version-rejected)                 — IMPL HERE (via
 //                                                            errors.Is on
-//                                                            wasm.ErrUnsupportedAbiVersion;
-//                                                            requires real wasm
-//                                                            bytecode at Task
-//                                                            10 / Task 15 fixture-
-//                                                            0034 integration)
+//                                                            wasm.ErrUnsupportedAbiVersion)
 //   - Arm 17 (module-compile-failed)                       — IMPL HERE (%w-wrapped
-//                                                            wazero compile error;
-//                                                            requires real wasm
-//                                                            bytecode at Task 10)
-//   - Arm 18 (per-route-deferred-to-25-3)                  — IMPL VIA
-//                                                            validatePerRouteWasm
-//                                                            in wasm.go per ADR-0110
-//                                                            single-chokepoint
-//                                                            (constant
-//                                                            parseRejectPerRouteDeferredTo253
-//                                                            here is the canonical
-//                                                            source-of-truth alias
-//                                                            of parseRejectPerRouteUnsupported
-//                                                            consumed by wasm.go;
-//                                                            TestParseRejectArm18_
-//                                                            AliasedFromWasmGo
-//                                                            pins the byte-identity).
+//                                                            wazero compile error)
+//   - Arm 18 (per-route)                                   — LIFTED at 25.3 Task 7:
+//                                                            validatePerRouteWasm now
+//                                                            validates the per-route
+//                                                            Wasm shape via
+//                                                            validateWasmConfigShape
+//                                                            (validate-only run; no
+//                                                            name-claim, no refcount).
+//
+// # 3 NEW 25.3 PARSE-REJECT arms (per phase-25.3 Task 7 + D-25.3-P2 closure)
+//
+//   - Arm A  (env-vars-key-collision)                      — IMPL HERE (%q-formatted)
+//   - Arm B  (fail-open-and-failure-policy-both-set)       — IMPL HERE
+//   - Arm C  (env-vars-cap-exceeded)                       — IMPL HERE
 //
 // # 6 NEW 25.2 PARSE-REJECT arms (per 25.2 SPEC §6.2 + D-25.2-P5 closure)
 //
@@ -174,9 +170,11 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	wasmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/wasm/v3"
 	wasmcommonv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/wasm/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -227,14 +225,13 @@ const (
 	// EnvironmentVariable) is unset.
 	parseRejectDataSourceSpecifierRequired = "wasm: config.vm_config.code.local: specifier oneof required"
 
-	// Arm 9: PluginConfig.failure_policy = FAIL_RELOAD (or reload_config set).
-	// FAIL_RELOAD + the paired reload_config lands at 25.3 alongside multi-
-	// plugin VM-sharing per Q3 BRAINSTORM phasing.
-	parseRejectPluginFailurePolicyFailReloadDeferred = "wasm: config.failure_policy = FAIL_RELOAD (or reload_config set) is not yet supported (lands in phase 25.3)"
-
-	// Arm 10: PluginConfig.fail_open. The fail_open knob is upstream-deprecated
-	// in favor of failure_policy = FAIL_OPEN; at 25.1 BOTH are deferred to 25.3.
-	parseRejectPluginFailOpenDeferred = "wasm: config.fail_open is not yet supported (deprecated upstream; lands in phase 25.3 via failure_policy = FAIL_OPEN)"
+	// Arm 9 / arm 10 (LIFTED at phase-25.3 Task 7): the 25.1/25.2 deferral
+	// constants parseRejectPluginFailurePolicyFailReloadDeferred (failure_policy
+	// = FAIL_RELOAD or reload_config set) + parseRejectPluginFailOpenDeferred
+	// (fail_open) are RETIRED. failure_policy / reload_config / fail_open are
+	// now PARSED + CONSUMED (see buildCompiledConfig). The only residual
+	// reject on these surfaces is the NEW arm B mutual-exclusivity check
+	// (parseRejectFailOpenAndFailurePolicyBothSet below).
 
 	// Arm 11: VmConfig.runtime discriminator. envoy-go uses wazero exclusively
 	// per AMEND-A1; upstream values "envoy.wasm.runtime.v8" / ".wasmtime" /
@@ -243,17 +240,19 @@ const (
 	// runtime name for operator diagnostics.
 	parseRejectVmConfigRuntimeDiscriminator = "wasm: config.vm_config.runtime %q is not supported (envoy-go uses wazero exclusively; envoy-go-strict departure)"
 
-	// Arm 12: VmConfig.vm_id duplicate across PluginConfig entries. RESERVED
-	// at 25.1: the single-plugin-per-listener model has no duplicate trigger
-	// path; 25.3 multi-plugin VM-sharing wires the process-wide vm_id registry
-	// that activates this arm. Constant byte-stable pinned for forward-compat
-	// per ADR-0044 atomic-edit discipline.
-	//nolint:unused // reserved for 25.3 multi-plugin VM-sharing registry; arm 12 has no production trigger at 25.1
-	parseRejectVmConfigVmIdDuplicate = "wasm: config.vm_config.vm_id %q is duplicated across PluginConfig entries (multi-plugin VM-sharing lands in phase 25.3)"
+	// Arm 12 (RETIRED at phase-25.3 Task 7): the reserved RESERVED-at-25.1
+	// duplicate-vm_id reject constant parseRejectVmConfigVmIdDuplicate is GONE.
+	// 25.3 multi-plugin VM-sharing INVERTS the semantic: a duplicate
+	// (vm_id, vm_configuration, code) now SHARES one *RootVM via the registry
+	// refcount (wasm.DefaultRegistry.AcquireFor) rather than being rejected.
+	// There is no production reject path for duplicate vm_id at 25.3.
 
-	// Arm 13: VmConfig.environment_variables is not yet supported. The full
-	// host-env / key-value injection surface lands at 25.3.
-	parseRejectVmConfigEnvironmentVariablesDeferred = "wasm: config.vm_config.environment_variables is not yet supported (lands in phase 25.3)"
+	// Arm 13 (LIFTED at phase-25.3 Task 7): the 25.1/25.2 deferral constant
+	// parseRejectVmConfigEnvironmentVariablesDeferred is RETIRED.
+	// VmConfig.environment_variables is now PARSED + CONSUMED via
+	// wasm.AssembleEnvVars (see buildCompiledConfig). The residual rejects on
+	// this surface are the NEW arms A + C (env-vars key collision +
+	// envoy-go-strict cap exceeded) below.
 
 	// Arm 14: VmConfig.allow_precompiled. envoy-go-strict DEPARTURE: incompatible
 	// with wazero's interpreter-default semantic (wazero supports precompiled
@@ -278,13 +277,14 @@ const (
 	// malformed import, etc.). Applied via fmt.Errorf at the use site.
 	parseRejectModuleCompileFailed = "wasm: config.vm_config.code: compile: %w"
 
-	// Arm 18: per-route configuration deferred to 25.3. The ACTUAL trigger
-	// path is the validatePerRouteWasm one-liner in wasm.go (registered via
-	// RegisterPerRouteValidator at boot per ADR-0110 single-chokepoint). This
-	// constant is the canonical source-of-truth for the wording; the
-	// parseRejectPerRouteUnsupported constant in wasm.go is byte-equal (pinned
-	// by TestParseRejectArm18_AliasedFromWasmGo).
-	parseRejectPerRouteDeferredTo253 = "wasm: per-route configuration is not yet supported (lands in phase 25.3)"
+	// Arm 18 (LIFTED at phase-25.3 Task 7): per-route configuration is now
+	// SUPPORTED. The 25.1/25.2 deferral constant parseRejectPerRouteDeferredTo253
+	// (and its byte-equal alias parseRejectPerRouteUnsupported in wasm.go) are
+	// RETIRED. validatePerRouteWasm now validates the per-route Wasm shape via
+	// validateWasmConfigShape (a parse-only run of arms 1-23 + A/B/C that does NOT
+	// mutate the process-wide name registry NOR acquire a registry RootVM
+	// refcount); a valid per-route config ACCEPTS, an invalid one rejects with
+	// the SAME byte-stable buildCompiledConfig wording (single source of truth).
 
 	// -------------------------------------------------------------------------
 	// 25.2 NEW PARSE-REJECT arms (per 25.2 SPEC §6.2 + D-25.2-P5 closure at
@@ -359,6 +359,36 @@ const (
 	// fail-fast. The arm-26 validator focuses on non-empty names where the
 	// operator's intent is unambiguous.
 	parseRejectCrossPluginConfigDuplicatePluginConfigName = "wasm: config.name %q is duplicated across PluginConfig entries (per-plugin stat-scope uniqueness; envoy-go-strict)"
+
+	// -------------------------------------------------------------------------
+	// 25.3 NEW PARSE-REJECT arms (per phase-25.3 Task 7 + D-25.3-P2 closure).
+	// 3 arms cover the env_vars cross-field collision (arm A), the fail_open /
+	// failure_policy mutual-exclusivity (arm B), and the env_vars envoy-go-
+	// strict cap (arm C). Pinned byte-stable by TestParseRejectConstants_
+	// ByteStable.
+	// -------------------------------------------------------------------------
+
+	// Arm A: VmConfig.environment_variables cross-field key collision. A key
+	// present in BOTH host_env_keys AND key_values is REJECTED (NOT overridden)
+	// per upstream cpp-host plugin.cc:30-42 parity. %q-formatted at the use
+	// site with the colliding key. Surfaced when wasm.AssembleEnvVars returns
+	// an error matching errors.Is(err, wasm.ErrEnvVarsKeyCollision).
+	parseRejectEnvVarsKeyCollision = "wasm: config.vm_config.environment_variables: key %q is duplicated across host_env_keys and key_values (all keys must be unique)"
+
+	// Arm B: PluginConfig.fail_open AND PluginConfig.failure_policy both set.
+	// The deprecated fail_open knob + the modern failure_policy enum are
+	// mutually exclusive — setting BOTH is ambiguous. envoy-go-strict rejects
+	// rather than silently preferring one. Fires when fail_open == true AND
+	// failure_policy != UNSPECIFIED.
+	parseRejectFailOpenAndFailurePolicyBothSet = "wasm: only one of config.fail_open or config.failure_policy can be set"
+
+	// Arm C: VmConfig.environment_variables exceeds the envoy-go-strict cap
+	// (max 64 entries total OR any value > 4096 bytes) per AMEND-C4. Surfaced
+	// when wasm.AssembleEnvVars returns an error matching
+	// errors.Is(err, wasm.ErrEnvVarsCapExceeded). Task 8 adds the paired
+	// env_vars_cap_exceeded counter on this reject path; Task 7 lands the
+	// reject only.
+	parseRejectEnvVarsCapExceeded = "wasm: config.vm_config.environment_variables exceeds the envoy-go-strict cap (max 64 entries, max 4096 bytes per value)"
 )
 
 // -----------------------------------------------------------------------------
@@ -433,9 +463,10 @@ type compiledConfig struct {
 	// (PluginConfig.configuration unset).
 	pluginConfig []byte
 
-	// stats is the SHARED 5-counter stat-surface per AMEND-A2 (EXTENDED to
-	// 14 counters at 25.2 per Q9 + AMEND-B3 — extension lands at Task 17
-	// stats.go body). Populated by newFilterStats(reg, pluginName) inside
+	// stats is the SHARED stat-surface per AMEND-A2 (origin: 5 counters at
+	// 25.1; EXTENDED to 14 at 25.2 per Q9 + AMEND-B3; EXTENDED to 18 counters
+	// at 25.3 — the vm_reload_* Group-C triplet + env_vars_cap_exceeded per
+	// ADR-0211). Populated by newFilterStats(reg, pluginName) inside
 	// buildCompiledConfig when factoryCtx.Stats is non-nil (per ADR-0085
 	// nil-tolerance); nil under test-double paths.
 	stats *filterStats
@@ -504,6 +535,65 @@ type compiledConfig struct {
 	// via wasm.WithRootForeignRegistry; consumed by proxy_call_foreign_function
 	// host shim (Task 7).
 	foreignReg *internalwasm.ForeignFunctionRegistry
+
+	// -------------------------------------------------------------------------
+	// 25.3 EXTENSIONS (per phase-25.3 Task 7 + AMEND-C2/C3/C4 + R-25.3-2/3).
+	// -------------------------------------------------------------------------
+
+	// failurePolicy is the parsed + mapped wasm.FailurePolicy per AMEND-C3 +
+	// R-25.3-3. Maps PluginConfig.failure_policy (UNSPECIFIED→FailClosed
+	// default; FAIL_RELOAD; FAIL_CLOSED; FAIL_OPEN) WITH the fail_open override
+	// (fail_open==true ⇒ FailOpen). Consumed at Task 9 dispatch to gate the
+	// RuntimeError disposition (FAIL_RELOAD → reload; FAIL_CLOSED → 503;
+	// FAIL_OPEN → bypass). Task 7 stores it; Task 9 reads it.
+	failurePolicy internalwasm.FailurePolicy //nolint:unused // stored at Task 7; consumed at Task 9 RuntimeError-gating dispatch
+
+	// reloadBaseInterval is the operator-configured FAIL_RELOAD backoff base
+	// interval parsed from PluginConfig.reload_config.backoff.base_interval per
+	// AMEND-C3 + R-25.3-2. 0 ⇒ the wasm.newReloadBackoff default (1s); the
+	// 100ms floor / 1s default are applied by the RootVM's reload machine at
+	// construction via WithReloadConfig. Stored here for documentation /
+	// future-dispatch observability.
+	reloadBaseInterval time.Duration //nolint:unused // stored at Task 7; the RootVM consumes it via WithReloadConfig
+
+	// vmKey is the composite registry key (Sha256(vm_id||vm_configuration||
+	// code)) returned by wasm.DefaultRegistry.AcquireFor per AMEND-C2. The
+	// compiledConfig retains it to Release (refcount--) the shared *RootVM at
+	// teardown via Close(). Empty in test-double / non-registry paths.
+	vmKey string
+
+	// envVars is the assembled guest environment map (post-collision/cap
+	// validation via wasm.AssembleEnvVars) per AMEND-C4. Fed to the *RootVM
+	// via WithRootEnv at construction; retained here as a testable seam. Nil
+	// when VmConfig.environment_variables is unset.
+	envVars map[string]string //nolint:unused // fed to the RootVM via WithRootEnv; retained as a testable seam
+
+	// factoryCtx retains the live envoyhttp.FactoryCtx supplied at the
+	// listener buildCompiledConfig per phase-25.3 Task 9. The per-route
+	// dispatch-time build (resolveEffective → parsePerRouteWasm) reuses it so
+	// per-route *RootVMs get the SAME live ClusterManager / HTTPClient
+	// dispatcher (else proxy_http_call silently fails per the Task-6 review
+	// carried-concern #1). Stored by value (FactoryCtx is a struct of
+	// pointers + scalars). Zero-value on test-double paths that bypass
+	// buildCompiledConfig.
+	factoryCtx envoyhttp.FactoryCtx
+
+	// perRouteMu guards perRouteCache (lazy allocation + concurrent per-stream
+	// resolveEffective lookups). Mirrors the phase-22.2 lua perRouteMu/
+	// perRouteChunks memoization precedent.
+	perRouteMu sync.Mutex
+
+	// perRouteCache is the per-LISTENER memo of per-route override
+	// *compiledConfigs, keyed by the stable per-route proto.Message pointer
+	// (the framework's PerRouteConfig.ResolveAllTiers returns a stable pointer
+	// per route). Built EXACTLY ONCE per unique per-route proto (arm-26 +
+	// registry-refcount discipline — building the same override twice would
+	// arm-26-false-reject + leak a refcount per the Task-6 review carried-
+	// concern #2). Lives on the listener cfg (shared across streams), NOT the
+	// per-stream filter. Lazily allocated on first resolveEffective miss.
+	// Each entry holds its own *RootVM registry refcount; Close() Releases
+	// every entry per carried-concern #3.
+	perRouteCache map[proto.Message]*compiledConfig
 
 	// rootCB is the per-RootVM rootABICallbacks multiplexer registered at
 	// buildCompiledConfig time via rootVM.RegisterABICallbacks per Task 18
@@ -723,10 +813,38 @@ func resetPluginConfigNameRegistry() {
 //     a failure here indicates a runtime issue + an unwrapped error from
 //     wasm.NewRootVM is returned).
 //
-// arm 18 (per-route) is enforced via the separate HCM RegisterPerRouteValidator
-// path in wasm.go::validatePerRouteWasm per ADR-0110 single-chokepoint; not a
-// buildCompiledConfig concern.
+// arm 18 (per-route, LIFTED at phase-25.3 Task 7) is enforced via the separate
+// HCM RegisterPerRouteValidator path in wasm.go::validatePerRouteWasm per
+// ADR-0110 single-chokepoint, which delegates to validateWasmConfigShape (a
+// validate-only run of this body); the full build below is the listener +
+// per-route-dispatch (Task 9) path.
 func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx envoyhttp.FactoryCtx) (*compiledConfig, error) {
+	return buildCompiledConfigImpl(ctx, typedConfig, factoryCtx, false)
+}
+
+// validateWasmConfigShape runs every PARSE-REJECT arm (1-23 + the NEW
+// failure_policy/fail_open/env_vars arms A/B/C) against a typed_config WITHOUT
+// permanently mutating any process-wide state: it does NOT call
+// registerPluginConfigName (so a valid config can be re-validated / used on a
+// second route without arm-26-FALSE-rejecting) and it does NOT acquire a
+// registry *RootVM refcount (no VM instantiation, no goroutine, no leak).
+//
+// This is the per-route HCM-build shape-check chokepoint per ADR-0072 fail-
+// fast (lifted arm 18). A valid per-route Wasm config returns nil; an invalid
+// one returns the SAME byte-stable wording as the listener build path (single
+// source of truth = buildCompiledConfigImpl). The ACTUAL per-route
+// compiledConfig + VM build happens at Task 9 dispatch resolution.
+//
+// arm 26 (cross-PluginConfig duplicate name) is DELIBERATELY NOT enforced
+// here: it is a cross-config global-uniqueness check that requires CLAIMING
+// the name, which a pure validation pass must not do. The real build (listener
+// or per-route at Task 9) is the arm-26 enforcement point.
+func validateWasmConfigShape(typedConfig *anypb.Any) error {
+	_, err := buildCompiledConfigImpl(context.Background(), typedConfig, envoyhttp.FactoryCtx{}, true)
+	return err
+}
+
+func buildCompiledConfigImpl(ctx context.Context, typedConfig *anypb.Any, factoryCtx envoyhttp.FactoryCtx, validateOnly bool) (*compiledConfig, error) {
 	// Arm 1: typed_config required.
 	if typedConfig == nil {
 		return nil, errors.New(parseRejectTypedConfigRequired)
@@ -744,16 +862,13 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 		return nil, errors.New(parseRejectConfigRequired)
 	}
 
-	// Arm 9: plugin-failure-policy = FAIL_RELOAD (or reload_config set).
-	// Both triggers funnel to the same deferred wording per parent §6.2 arm 9.
-	if pc.GetFailurePolicy() == wasmcommonv3.FailurePolicy_FAIL_RELOAD || pc.GetReloadConfig() != nil {
-		return nil, errors.New(parseRejectPluginFailurePolicyFailReloadDeferred)
-	}
-
-	// Arm 10: plugin-fail-open deferred. SA1019 deliberate: this arm EXISTS
-	// to PARSE-REJECT the deprecated proto field per parent §6.2 arm 10.
-	if pc.GetFailOpen() { //nolint:staticcheck // SA1019: arm 10 EXISTS to PARSE-REJECT this deprecated proto field; intentional access.
-		return nil, errors.New(parseRejectPluginFailOpenDeferred)
+	// Arms 9/10 LIFTED (phase-25.3 Task 7): failure_policy / reload_config /
+	// fail_open are now PARSED + CONSUMED. Map them to the wasm-package
+	// FailurePolicy + the reload base interval, applying the NEW arm B
+	// mutual-exclusivity reject (fail_open AND failure_policy both set).
+	failurePolicy, reloadBaseInterval, err := parseFailurePolicy(pc)
+	if err != nil {
+		return nil, err
 	}
 
 	// Arm 4: vm_config is required.
@@ -771,9 +886,14 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 		return nil, fmt.Errorf(parseRejectVmConfigRuntimeDiscriminator, runtime)
 	}
 
-	// Arm 13: VmConfig.environment_variables deferred to 25.3.
-	if vm.GetEnvironmentVariables() != nil {
-		return nil, errors.New(parseRejectVmConfigEnvironmentVariablesDeferred)
+	// Arm 13 LIFTED (phase-25.3 Task 7): VmConfig.environment_variables is now
+	// PARSED + CONSUMED via wasm.AssembleEnvVars. The NEW arm A (cross-field
+	// key collision) + arm C (envoy-go-strict cap exceeded) are the residual
+	// rejects on this surface. On success the assembled map is fed to the
+	// RootVM via WithRootEnv at construction.
+	envVars, err := parseEnvVars(vm.GetEnvironmentVariables())
+	if err != nil {
+		return nil, err
 	}
 
 	// Arm 14: VmConfig.allow_precompiled rejected (envoy-go-strict).
@@ -787,12 +907,10 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 		return nil, errors.New(parseRejectVmConfigNackOnCodeCacheMissRejected)
 	}
 
-	// Arm 12: VmConfig.vm_id duplicate. RESERVED at 25.1: the single-plugin-
-	// per-listener model has no duplicate trigger path. 25.3 multi-plugin
-	// VM-sharing wires the process-wide vm_id registry that activates this
-	// arm. No production check at 25.1; the constant byte-stability is
-	// pinned by TestParseRejectConstants_ByteStable.
-	// (Intentional no-op; documented for forward-compat.)
+	// Arm 12 RETIRED (phase-25.3 Task 7): a duplicate (vm_id, vm_configuration,
+	// code) no longer rejects — it SHARES one *RootVM via the registry
+	// refcount at the AcquireFor construction site below (AMEND-C2). No
+	// production reject path for duplicate vm_id at 25.3.
 
 	// Arm 5: VmConfig.code is required.
 	code := vm.GetCode()
@@ -850,8 +968,16 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 	// Arm 26: cross-PluginConfig duplicate PluginConfig.name registry consult.
 	// Empty pluginName skips the check per the empty-name carve-out at
 	// registerPluginConfigName + the comment block at the registry decl.
-	if err := registerPluginConfigName(pc.GetName()); err != nil {
-		return nil, err
+	//
+	// SKIPPED in validate-only mode (per-route shape-check): claiming the name
+	// would FALSE-reject a legitimate second use of the same override, and a
+	// pure validation pass must not permanently mutate the process-wide
+	// registry. The real build (listener or per-route at Task 9) is the arm-26
+	// enforcement point.
+	if !validateOnly {
+		if err := registerPluginConfigName(pc.GetName()); err != nil {
+			return nil, err
+		}
 	}
 
 	// Resolve DataSource bytes — DELEGATED to datasource.go at Task 10.
@@ -896,6 +1022,17 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 		_ = cache.Close()
 		unregisterPluginConfigName(pc.GetName())
 		return nil, fmt.Errorf(parseRejectModuleCompileFailed, err)
+	}
+
+	// Validate-only short-circuit (per-route shape-check via lifted arm 18):
+	// every PARSE-REJECT arm 1-23 + A/B/C has fired by now + the module compiled
+	// (arms 16/17). We do NOT instantiate a *RootVM (no AcquireFor refcount, no
+	// goroutine), and we DID NOT register the plugin name (arm 26 skipped
+	// above). Close the freshly-built cache + return nil — the config shape is
+	// valid. The real per-route build happens at Task 9 dispatch.
+	if validateOnly {
+		_ = cache.Close()
+		return nil, nil
 	}
 
 	// Build SandboxConfig from PluginConfig.capability_restriction_config.
@@ -992,40 +1129,93 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 	if clk := resolveClock(); clk != nil {
 		rootOpts = append(rootOpts, internalwasm.WithRootClock(clk))
 	}
-	rootVM, err := internalwasm.NewRootVM(ctx, mod, rootCtxID, rootOpts...)
-	if err != nil {
-		// Release the cache before returning — the listener never gets a
-		// compiledConfig back, so nothing else will Close it. Also unregister
-		// the PluginConfig.name from the cross-plugin registry to keep the
-		// retry path clean (operator re-applies the same config after fixing
-		// a runtime issue + would otherwise see a phantom arm-26 dupe).
-		_ = cache.Close()
-		unregisterPluginConfigName(pc.GetName())
-		return nil, fmt.Errorf("wasm: NewRootVM: %w", err)
+
+	// 25.3 EXTENSION wiring (AMEND-C2/C3/C4):
+	//
+	//   - WithRootEnv:        feeds the assembled VmConfig.environment_variables
+	//     map (post collision/cap validation) to the guest's WASI environ shims.
+	//   - WithReloadConfig:   sets the FAIL_RELOAD backoff base interval; the
+	//     100ms floor / 1s default are applied inside newReloadBackoff.
+	//   - WithReloadStats:    wires the vm_reload triplet counters (Task 8
+	//     Group C) into the reload state machine via the reloadStatsHook seam
+	//     (Task 3). *filterStats satisfies reloadStatsHook structurally via
+	//     VmReloadSuccessInc / VmReloadRuntimeFailureInc / VmReloadBackoffInc.
+	//     Guarded by stats != nil per ADR-0085 nil-tolerance.
+	//   - WithSharedDataStore: injects the vm_id-scoped registry-owned shared-
+	//     data store so plugins under the SAME vm_id share one namespace.
+	if len(envVars) > 0 {
+		rootOpts = append(rootOpts, internalwasm.WithRootEnv(envVars))
+	}
+	rootOpts = append(rootOpts, internalwasm.WithReloadConfig(reloadBaseInterval))
+	if stats != nil {
+		rootOpts = append(rootOpts, internalwasm.WithReloadStats(stats))
+	}
+	rootOpts = append(rootOpts, internalwasm.WithSharedDataStore(
+		internalwasm.DefaultRegistry.AcquireSharedData(vm.GetVmId()),
+	))
+
+	// Multi-plugin VM-sharing per AMEND-C2: acquire (refcount++) or construct
+	// the SHARED *RootVM keyed by (vm_id, vm_configuration, code). The factory
+	// closure runs ONLY on a registry miss; on a hit it is NOT called + the
+	// existing *RootVM (already Configured, with its rootABICallbacks
+	// multiplexer + tick goroutine) is reused.
+	//
+	// vm-key byte-source decision (D-25.3 first-action): `vmConfig` component
+	// is vm.GetConfiguration().GetValue() (the serialized VmConfig.configuration
+	// bytes — the SAME bytes stored on cfg.vmConfig + fed to RootVM.Configure);
+	// `code` component is the resolved module source bytes `src` (the SAME
+	// bytes fed to CompileModule + re-compiled inside NewRootVM). vm_id is the
+	// raw VmConfig.vm_id string.
+	var (
+		rootCB     *rootABICallbacks
+		factoryRan bool
+	)
+	factory := func() (*internalwasm.RootVM, error) {
+		factoryRan = true
+		rv, err := internalwasm.NewRootVM(ctx, mod, rootCtxID, rootOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("wasm: NewRootVM: %w", err)
+		}
+		// Per Task 18 closure of D-P-PLAN-6: construct the per-RootVM
+		// rootABICallbacks multiplexer + register it so guest hostcalls route
+		// through the multiplexer's streamCtxID lookup. One multiplexer per
+		// shared *RootVM (streamCtxIDs are per-RootVM, so configs sharing the
+		// VM share this multiplexer too).
+		rootCB = newRootABICallbacks(rv)
+		rv.RegisterABICallbacks(rootCB)
+		// Drive the per-RootVM Configure lifecycle (_initialize/_start +
+		// proxy_on_context_create(rootCtxID, 0) + proxy_on_vm_start +
+		// proxy_on_configure). A Configure failure tears down the RootVM so
+		// the registry never caches a half-built VM.
+		if cerr := rv.Configure(ctx, vm.GetConfiguration().GetValue(), pc.GetConfiguration().GetValue()); cerr != nil {
+			_ = rv.Close()
+			return nil, fmt.Errorf("wasm: RootVM.Configure: %w", cerr)
+		}
+		return rv, nil
 	}
 
-	// Per Task 18 closure of D-P-PLAN-6: construct the per-RootVM
-	// rootABICallbacks multiplexer + register it on the RootVM so guest
-	// hostcalls route through the multiplexer's streamCtxID lookup. The
-	// per-stream *abiCallbacks are registered into the multiplexer at
-	// decode_headers.go initStreamContext (per stream) + deregistered at
-	// encode_headers.go OnDestroy.
-	rootCB := newRootABICallbacks(rootVM)
-	rootVM.RegisterABICallbacks(rootCB)
-
-	// Drive the per-RootVM Configure lifecycle (_initialize/_start +
-	// proxy_on_context_create(rootCtxID, 0) + proxy_on_vm_start +
-	// proxy_on_configure per 25.2 SPEC §3.1). The root context is the
-	// SHARED context across all per-stream children; the guest's
-	// per-stream contexts are seeded by NewStreamContext (per Task 1) at
-	// decode_headers.go init time. A Configure failure aborts the
-	// compiledConfig construction + tears down the RootVM + releases the
-	// cache.
-	if err := rootVM.Configure(ctx, vm.GetConfiguration().GetValue(), pc.GetConfiguration().GetValue()); err != nil {
-		_ = rootVM.Close()
+	rootVM, vmKey, err := internalwasm.DefaultRegistry.AcquireFor(
+		vm.GetVmId(), vm.GetConfiguration().GetValue(), src, factory)
+	if err != nil {
+		// Construction failed (NewRootVM or Configure). Release the freshly-
+		// built cache + unregister the PluginConfig.name so a retry with the
+		// same name doesn't phantom-trigger arm 26.
 		_ = cache.Close()
 		unregisterPluginConfigName(pc.GetName())
-		return nil, fmt.Errorf("wasm: RootVM.Configure: %w", err)
+		return nil, err
+	}
+
+	if !factoryRan {
+		// Registry HIT: the shared *RootVM already exists (built by an earlier
+		// compiledConfig). The freshly-compiled cache/module for THIS call are
+		// redundant — the shared VM owns its own compile cache. Close this
+		// orphan cache to avoid leaking the wazero compilation cache, and
+		// retrieve the SHARED multiplexer the original config registered so
+		// per-stream registrations route through the one table the VM knows.
+		_ = cache.Close()
+		if rb, ok := rootVM.RegisteredABICallbacks().(*rootABICallbacks); ok {
+			rootCB = rb
+		}
 	}
 
 	return &compiledConfig{
@@ -1045,7 +1235,236 @@ func buildCompiledConfig(ctx context.Context, typedConfig *anypb.Any, factoryCtx
 		dynStats:                dynStats,
 		foreignReg:              foreignReg,
 		rootCB:                  rootCB,
+		failurePolicy:           failurePolicy,
+		reloadBaseInterval:      reloadBaseInterval,
+		vmKey:                   vmKey,
+		envVars:                 envVars,
+		factoryCtx:              factoryCtx,
 	}, nil
+}
+
+// Close releases the compiledConfig's hold on the SHARED *RootVM (refcount--
+// via wasm.DefaultRegistry.Release) + closes the per-compiledConfig compile
+// cache. The registry closes the underlying *RootVM only when its refcount
+// reaches 0 (the last sharing compiledConfig releases). Per AMEND-C2 the
+// compiledConfig MUST NOT call rootVM.Close() directly — that would double-
+// close a *RootVM still in use by another sharing compiledConfig. Release is
+// the single teardown chokepoint.
+//
+// Lifecycle note: at phase-25.3 there is NO per-config production teardown
+// hook in the New factory (shared listener configs live for process/listener
+// lifetime); Close exists so the lifecycle is correct + testable. Per-route
+// compiledConfigs (Task 9) that swap per-request DO have a teardown seam that
+// will call Close. Idempotency: a compiledConfig with an empty vmKey (test-
+// double / non-registry path) skips the Release; the compileCache.Close is
+// idempotent at the cache layer.
+func (cc *compiledConfig) Close() error {
+	if cc == nil {
+		return nil
+	}
+
+	// Tear down every memo'd per-route compiledConfig FIRST (per the Task-9
+	// carried-concern #3). Each per-route entry holds its OWN registry refcount
+	// (its own *RootVM via the AcquireFor in buildCompiledConfig); Close()
+	// Releases that refcount + closes that entry's compile cache. Done under
+	// perRouteMu + the cache is niled to guard against a double-close (a second
+	// listener-cfg Close is then a no-op over an empty map). The per-route
+	// entries have an empty perRouteCache themselves (per-route configs never
+	// resolve further per-route overrides), so the recursion bottoms out in one
+	// level.
+	cc.perRouteMu.Lock()
+	prCache := cc.perRouteCache
+	cc.perRouteCache = nil
+	cc.perRouteMu.Unlock()
+	for _, prCfg := range prCache {
+		if prCfg != nil && prCfg != cc {
+			_ = prCfg.Close()
+		}
+	}
+
+	var relErr error
+	if cc.vmKey != "" {
+		relErr = internalwasm.DefaultRegistry.Release(cc.vmKey)
+	}
+	if cc.compileCache != nil {
+		_ = cc.compileCache.Close()
+	}
+	return relErr
+}
+
+// resolveEffective returns the effective *compiledConfig for a stream given
+// the framework's 3-tier-resolved per-route proto (or nil) per phase-25.3 Task
+// 9 + AMEND-C1 (wholesale Wasm override; the ENTIRE compiledConfig, hence its
+// *RootVM, swaps per-route). The receiver cc is the LISTENER config.
+//
+//   - routeCfgProto == nil → the listener cfg itself (cc), nil error. The
+//     common path (no per-route override) is behavior-identical.
+//   - else → the memoized per-route *compiledConfig built EXACTLY ONCE per
+//     unique per-route proto pointer (carried-concern #2: building twice would
+//     arm-26-false-reject the duplicate PluginConfig.name + leak a registry
+//     refcount). The memo lives on the LISTENER cfg (cc.perRouteCache), shared
+//     across streams. The per-route build reuses cc.factoryCtx (carried-
+//     concern #1: the live ClusterManager / HTTPClient dispatcher).
+//
+// A dispatch-time build error is UNEXPECTED (the per-route proto was already
+// shape-validated at HCM-build via validatePerRouteWasm → validateWasmConfigShape);
+// it is surfaced to the caller rather than swallowed.
+func (cc *compiledConfig) resolveEffective(routeCfgProto proto.Message) (*compiledConfig, error) {
+	if routeCfgProto == nil {
+		return cc, nil
+	}
+
+	// TODO(25.3-followup): a cold per-route miss builds (registry AcquireFor +
+	// wazero compile) while holding perRouteMu, head-of-line-blocking other
+	// streams hitting per-route routes on this listener during the first build.
+	// Per-route overrides are rare; a sentry-based double-checked build is the
+	// mitigation if this becomes hot.
+	cc.perRouteMu.Lock()
+	defer cc.perRouteMu.Unlock()
+
+	if cc.perRouteCache != nil {
+		if prCfg, ok := cc.perRouteCache[routeCfgProto]; ok {
+			return resolvePerRoute(prCfg, cc), nil
+		}
+	}
+
+	// Memo miss → build EXACTLY ONCE, reusing the listener's live FactoryCtx so
+	// the per-route *RootVM gets the live dispatcher (carried-concern #1).
+	prCfg, err := parsePerRouteWasm(routeCfgProto, cc.factoryCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	if cc.perRouteCache == nil {
+		cc.perRouteCache = make(map[proto.Message]*compiledConfig)
+	}
+	cc.perRouteCache[routeCfgProto] = prCfg
+	return resolvePerRoute(prCfg, cc), nil
+}
+
+// -----------------------------------------------------------------------------
+// parseFailurePolicy — PluginConfig.failure_policy / reload_config / fail_open
+// → wasm.FailurePolicy + reload base interval per phase-25.3 Task 7
+// (AMEND-C3 + R-25.3-2/3). Lands the NEW arm B (mutual-exclusivity reject).
+// -----------------------------------------------------------------------------
+
+// parseFailurePolicy maps the proto failure surfaces to the wasm-package
+// FailurePolicy + the operator-configured reload backoff base interval.
+//
+// Mapping (per AMEND-C3 + R-25.3-3):
+//
+//   - fail_open == true AND failure_policy != UNSPECIFIED → arm B PARSE-REJECT
+//     (parseRejectFailOpenAndFailurePolicyBothSet): the deprecated fail_open
+//     knob + the modern failure_policy enum are mutually exclusive.
+//   - fail_open == true (failure_policy UNSPECIFIED) → FailurePolicyFailOpen.
+//   - else map failure_policy: UNSPECIFIED → FailurePolicyFailClosed (the
+//     proto-documented default); FAIL_RELOAD / FAIL_CLOSED / FAIL_OPEN map
+//     1:1.
+//
+// reload base interval: reload_config.backoff.base_interval (a durationpb)
+// → time.Duration. 0 / nil ⇒ 0 (the RootVM's newReloadBackoff applies the
+// 100ms floor / 1s default). Only meaningful under FAIL_RELOAD but parsed
+// unconditionally (a base_interval set without FAIL_RELOAD is harmless — the
+// reload machine is never consulted unless the policy is FAIL_RELOAD).
+func parseFailurePolicy(pc *wasmcommonv3.PluginConfig) (internalwasm.FailurePolicy, time.Duration, error) {
+	//nolint:staticcheck // SA1019: fail_open is upstream-deprecated; envoy-go
+	// still PARSES it (mapping it to FAIL_OPEN) for upstream config-compat per
+	// AMEND-C3. Intentional access.
+	failOpen := pc.GetFailOpen()
+	protoPolicy := pc.GetFailurePolicy()
+
+	// Arm B: mutual-exclusivity. Both the deprecated knob + the modern enum set.
+	if failOpen && protoPolicy != wasmcommonv3.FailurePolicy_UNSPECIFIED {
+		return 0, 0, errors.New(parseRejectFailOpenAndFailurePolicyBothSet)
+	}
+
+	var policy internalwasm.FailurePolicy
+	switch {
+	case failOpen:
+		policy = internalwasm.FailurePolicyFailOpen
+	default:
+		switch protoPolicy {
+		case wasmcommonv3.FailurePolicy_FAIL_RELOAD:
+			policy = internalwasm.FailurePolicyFailReload
+		case wasmcommonv3.FailurePolicy_FAIL_OPEN:
+			policy = internalwasm.FailurePolicyFailOpen
+		case wasmcommonv3.FailurePolicy_FAIL_CLOSED, wasmcommonv3.FailurePolicy_UNSPECIFIED:
+			// UNSPECIFIED defaults to FAIL_CLOSED per the proto documentation.
+			policy = internalwasm.FailurePolicyFailClosed
+		default:
+			policy = internalwasm.FailurePolicyFailClosed
+		}
+	}
+
+	var base time.Duration
+	if rc := pc.GetReloadConfig(); rc != nil {
+		if bi := rc.GetBackoff().GetBaseInterval(); bi != nil {
+			base = bi.AsDuration()
+		}
+	}
+
+	return policy, base, nil
+}
+
+// -----------------------------------------------------------------------------
+// parseEnvVars — VmConfig.environment_variables → assembled guest env per
+// phase-25.3 Task 7 (AMEND-C4). Lands the NEW arms A (key collision) + C
+// (envoy-go-strict cap exceeded).
+// -----------------------------------------------------------------------------
+
+// parseEnvVars extracts host_env_keys + key_values from the proto
+// EnvironmentVariables and assembles the guest-visible env map via
+// wasm.AssembleEnvVars. Returns:
+//
+//   - nil, nil                              when ev is nil (no env block).
+//   - nil, arm-A error  (key collision)     when a key appears in BOTH
+//     host_env_keys AND key_values (errors.Is ErrEnvVarsKeyCollision). The
+//     colliding key is %q-formatted into the arm-A wording.
+//   - nil, arm-C error  (cap exceeded)       when the assembled env exceeds
+//     the envoy-go-strict cap (errors.Is ErrEnvVarsCapExceeded). Task 8 adds
+//     the env_vars_cap_exceeded counter on this path.
+//   - assembled-map, nil                     on success.
+func parseEnvVars(ev *wasmcommonv3.EnvironmentVariables) (map[string]string, error) {
+	if ev == nil {
+		return nil, nil
+	}
+	hostEnvKeys := ev.GetHostEnvKeys()
+	keyValues := ev.GetKeyValues()
+
+	assembled, err := internalwasm.AssembleEnvVars(hostEnvKeys, keyValues)
+	if err != nil {
+		switch {
+		case errors.Is(err, internalwasm.ErrEnvVarsKeyCollision):
+			// Arm A: extract the colliding key for the %q-formatted wording.
+			// The colliding key is the first host_env_key that also appears in
+			// key_values (matching AssembleEnvVars's detection order).
+			collidingKey := firstEnvVarsCollision(hostEnvKeys, keyValues)
+			return nil, fmt.Errorf(parseRejectEnvVarsKeyCollision, collidingKey)
+		case errors.Is(err, internalwasm.ErrEnvVarsCapExceeded):
+			// Arm C: envoy-go-strict cap (Task 8 adds the counter here).
+			return nil, errors.New(parseRejectEnvVarsCapExceeded)
+		default:
+			// Defensive: AssembleEnvVars only returns the two sentinels above;
+			// any other error surfaces verbatim (non-byte-stable) rather than
+			// being swallowed.
+			return nil, err
+		}
+	}
+	return assembled, nil
+}
+
+// firstEnvVarsCollision returns the first key in hostEnvKeys that also appears
+// in keyValues (matching wasm.AssembleEnvVars's collision-detection order so
+// the arm-A %q wording names the same key the assembler tripped on). Returns
+// "" when there is no collision (caller only invokes this on the collision
+// error path).
+func firstEnvVarsCollision(hostEnvKeys []string, keyValues map[string]string) string {
+	for _, k := range hostEnvKeys {
+		if _, ok := keyValues[k]; ok {
+			return k
+		}
+	}
+	return ""
 }
 
 // unregisterPluginConfigName releases the given pluginConfigName from the

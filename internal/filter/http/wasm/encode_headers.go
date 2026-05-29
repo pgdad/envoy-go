@@ -57,6 +57,16 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 		return envoyhttp.Continue
 	}
 
+	// Use the SAME effective config resolved at DecodeHeaders (per-route
+	// override > listener default) per phase-25.3 Task 9 — the per-stream
+	// StreamContext belongs to eff.rootVM. Fall back to f.cfg on the encode-
+	// only edge (DecodeHeaders never ran; f.eff nil) — though that edge is
+	// already short-circuited by the f.streamCtx==nil guard above.
+	eff := f.eff
+	if eff == nil {
+		eff = f.cfg
+	}
+
 	// Capture response headers for the *abiCallbacks back-pointer per
 	// ADR-0071 single-goroutine-per-stream invariant.
 	f.responseHeaders = headers
@@ -77,8 +87,8 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	numHeaders := numHeaderValues(headers)
 	action, err := f.streamCtx.CallProxyOnResponseHeaders(ctx, numHeaders, endStream)
 	if err != nil {
-		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
+		if eff.stats != nil && eff.stats.envoyGoFailures != nil {
+			eff.stats.envoyGoFailures.Inc()
 		}
 		logf("ERROR wasm: CallProxyOnResponseHeaders(stream=%d): %v",
 			f.streamContextID, err)
@@ -141,6 +151,15 @@ func (f *filter) OnDestroy() {
 		return
 	}
 
+	// Use the SAME effective config resolved at DecodeHeaders (the per-stream
+	// StreamContext + its multiplexer registration belong to eff.rootVM /
+	// eff.rootCB) per phase-25.3 Task 9. Fall back to f.cfg if DecodeHeaders
+	// never ran (defensive; f.streamCtx would be nil on that edge anyway).
+	eff := f.eff
+	if eff == nil {
+		eff = f.cfg
+	}
+
 	ctx := context.Background()
 
 	// streamCtx.Close fires (in order, idempotent via sync.Once):
@@ -154,8 +173,8 @@ func (f *filter) OnDestroy() {
 	// Errors are logged + counted but do not abort the teardown — the
 	// per-stream context MUST be released even if a guest callback errors.
 	if err := f.streamCtx.Close(ctx); err != nil {
-		if f.cfg != nil && f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
+		if eff != nil && eff.stats != nil && eff.stats.envoyGoFailures != nil {
+			eff.stats.envoyGoFailures.Inc()
 		}
 		logf("ERROR wasm: streamCtx.Close(stream=%d): %v", f.streamContextID, err)
 	}
@@ -168,14 +187,14 @@ func (f *filter) OnDestroy() {
 	// httpCalls; any response that slipped through (the cancel race) is
 	// counted via the http_call_response_after_close counter at the
 	// http_call.go response-dispatch path.
-	if f.cfg != nil && f.cfg.rootCB != nil {
-		f.cfg.rootCB.unregister(f.streamContextID)
+	if eff != nil && eff.rootCB != nil {
+		eff.rootCB.unregister(f.streamContextID)
 	}
 
 	f.streamCtx = nil
 
 	// Group-B active gauge decrement per AMEND-A2.
-	if f.cfg != nil && f.cfg.stats != nil && f.cfg.stats.active != nil {
-		f.cfg.stats.active.Dec()
+	if eff != nil && eff.stats != nil && eff.stats.active != nil {
+		eff.stats.active.Dec()
 	}
 }

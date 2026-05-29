@@ -172,3 +172,106 @@ func BenchmarkPerStreamModule_Instantiation(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkPerStreamPluginContextLookup is a NEW 25.3 R8-supplementary
+// benchmark per BRAINSTORM Q6 + 25.3 SPEC D-25.3-5 (SAME 1ms per-stream-cost
+// threshold). It measures the per-stream context-creation cost on a *RootVM
+// that was acquired through the process-global registry (ADR-0211 multi-plugin
+// VM-sharing) — the path a multi-plugin chain takes where several PluginConfigs
+// share one registry-keyed *RootVM and each request creates a fresh per-stream
+// child context against the shared instance. The registry AcquireFor lookup
+// (composite Sha256(vm_id‖vm_configuration‖code) key + refcount) runs ONCE
+// outside the timed loop (it is a per-compiledConfig operation, not per-stream);
+// the timed loop is the per-stream NewStreamContext + Close on the shared VM.
+//
+// R8 threshold gate (SAME 1ms per D-25.3-5):
+//
+//   - ns/op <= 1_000_000 (1ms) → WEAK-default STANDS; ADR-0209 + ADR-0213
+//     escape-valve reserves STAY UNCONSUMED.
+//   - ns/op  > 1_000_000 (1ms) → escape-valve FIRES (ADR-0209/0213).
+//
+// Anticipated: WELL UNDER 1ms (the registry only changes WHERE the shared VM
+// comes from; the per-stream cost is identical bookkeeping + dispatch).
+//
+// Run via:
+//
+//	go test -count=1 -benchmem -run=^$ \
+//	        -bench=BenchmarkPerStreamPluginContextLookup \
+//	        ./internal/filter/http/wasm/
+func BenchmarkPerStreamPluginContextLookup(b *testing.B) {
+	ctx := context.Background()
+	cache := internalwasm.NewCompileCache(ctx)
+	defer func() { _ = cache.Close() }()
+
+	src := buildMinimalProxyWasm()
+	mod, err := internalwasm.CompileModule(ctx, src, cache)
+	if err != nil {
+		b.Fatalf("CompileModule err = %v; want nil", err)
+	}
+
+	reg := internalwasm.NewRegistry()
+	rv, key, err := reg.AcquireFor("bench-vm", nil, src, func() (*internalwasm.RootVM, error) {
+		return internalwasm.NewRootVM(ctx, mod, 1,
+			internalwasm.WithRootCompilationCache(cache.WazeroCompilationCache()),
+		)
+	})
+	if err != nil {
+		b.Fatalf("AcquireFor err = %v; want nil", err)
+	}
+	defer func() { _ = reg.Release(key) }()
+
+	if err := rv.Configure(ctx, nil, nil); err != nil {
+		b.Fatalf("rv.Configure err = %v; want nil", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sc, err := rv.NewStreamContext(ctx)
+		if err != nil {
+			b.Fatalf("NewStreamContext err = %v; want nil", err)
+		}
+		if err := sc.Close(ctx); err != nil {
+			b.Fatalf("sc.Close err = %v; want nil", err)
+		}
+	}
+}
+
+// BenchmarkPerRouteResolve is a NEW 25.3 R8-supplementary benchmark per
+// BRAINSTORM Q6 + 25.3 SPEC D-25.3-5. It measures the per-request per-route
+// resolution selection cost (ADR-0210 per-route wholesale Wasm TPFC override)
+// — the 3-tier resolver (per-route override → listener-level → no-op) that
+// runs at DecodeHeaders for every request. resolvePerRoute itself is a pure
+// pointer-select over the pre-built per-route and listener-level
+// *compiledConfig; the benchmark confirms the per-request resolution cost is
+// negligible (the EXPENSIVE per-route compiledConfig build is amortized
+// out-of-band, not per-request, per the BUG-1 fix discipline).
+//
+// SAME 1ms per-stream-cost threshold per D-25.3-5. Anticipated: a handful of
+// nanoseconds (pointer comparison + return) — orders of magnitude under 1ms.
+//
+// Run via:
+//
+//	go test -count=1 -benchmem -run=^$ \
+//	        -bench=BenchmarkPerRouteResolve \
+//	        ./internal/filter/http/wasm/
+func BenchmarkPerRouteResolve(b *testing.B) {
+	routeCfg := &compiledConfig{}
+	listenerCfg := &compiledConfig{}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	var sink *compiledConfig
+	for i := 0; i < b.N; i++ {
+		// Alternate the per-route presence so neither branch of the 3-tier
+		// resolver is dead-code-eliminated by the compiler.
+		if i&1 == 0 {
+			sink = resolvePerRoute(routeCfg, listenerCfg)
+		} else {
+			sink = resolvePerRoute(nil, listenerCfg)
+		}
+	}
+	if sink == nil {
+		b.Fatal("resolvePerRoute returned nil; want non-nil")
+	}
+}

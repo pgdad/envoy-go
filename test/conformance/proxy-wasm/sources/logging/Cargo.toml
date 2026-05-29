@@ -1,0 +1,26 @@
+# Conformance family `logging` — proxy_log at every severity.
+#
+# Mirrors the cpp-host logging_test.cc: the guest emits a distinctive message
+# at each of the five proxy-wasm severities (trace/debug/info/warn/error) via
+# direct hostcalls::log (bypassing the SDK's client-side level filter so ALL
+# levels reach the host regardless of proxy_get_log_level). The harness
+# captures them via the recording ABICallbacks Log forwarder + asserts each
+# message landed in the captured-log buffer.
+#
+# proxy-wasm-rust-sdk =0.2.4 (pinned exact, AMEND-A1). Builds to
+# target/wasm32-wasip1/release/logging.wasm; vendored at ../../bytecode/logging.wasm.
+# Exports proxy_abi_version_0_2_1 per AMEND-A6.
+[package]
+name = "logging"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

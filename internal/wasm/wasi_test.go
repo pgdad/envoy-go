@@ -50,6 +50,10 @@ func (m *mockWasiHost) LogProxy(lvl abi.LogLevel, msg string) {
 	m.logs = append(m.logs, logEntry{Level: lvl, Msg: msg})
 }
 
+// WASIEnviron returns nil (zero env entries) for the base mock. Tests that
+// need non-empty environ use mockWasiHostWithEnv (env_vars_test.go).
+func (m *mockWasiHost) WASIEnviron() [][]byte { return nil }
+
 // allowAll returns a mockWasiHost with every WASI capability allowed.
 func allowAll() *mockWasiHost {
 	return &mockWasiHost{
@@ -495,7 +499,7 @@ func TestWasiEnvironGet(t *testing.T) {
 		defer cleanup()
 		host := allowAll()
 
-		// Sentinel; environ_get writes nothing at 25.1, so sentinel should survive.
+		// Sentinel; with an empty environ the shim writes nothing, so the sentinel should survive.
 		writeU32(t, mod.Memory(), 0x700, 0x11111111)
 		writeU32(t, mod.Memory(), 0x710, 0x22222222)
 
@@ -504,7 +508,7 @@ func TestWasiEnvironGet(t *testing.T) {
 			t.Fatalf("errno = %d, want success", errno)
 		}
 		if got := readU32(t, mod.Memory(), 0x700); got != 0x11111111 {
-			t.Errorf("argv_ptr region clobbered: %#x", got)
+			t.Errorf("environ_ptr region clobbered: %#x", got)
 		}
 		if got := readU32(t, mod.Memory(), 0x710); got != 0x22222222 {
 			t.Errorf("buffer_ptr region clobbered: %#x", got)

@@ -1,0 +1,28 @@
+# Conformance family `endianness` — little-endian ABI value/buffer marshalling.
+#
+# Mirrors the cpp-host endianness_test.cc ABI value/buffer ordering checks.
+# The guest writes two known multi-byte integers as their little-endian byte
+# representations into shared-data:
+#   key "conformance-le-u32" = 0x01020304u32.to_le_bytes()  -> [04 03 02 01]
+#   key "conformance-le-u64" = 0x0102030405060708u64.to_le_bytes()
+#                                                  -> [08 07 06 05 04 03 02 01]
+# The harness reads the raw shared-data bytes via RootVM.GetSharedData + asserts
+# they are in little-endian order (the byte the guest placed lowest-address-first
+# is the least-significant byte), proving the guest<->host buffer marshalling
+# preserves LE byte order across the ABI boundary.
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/endianness.wasm.
+[package]
+name = "endianness"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

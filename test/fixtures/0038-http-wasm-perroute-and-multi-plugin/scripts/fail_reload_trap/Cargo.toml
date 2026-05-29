@@ -1,0 +1,21 @@
+# Cargo manifest for fail_reload_trap — fixture 0038-http-wasm-perroute-and-multi-plugin.
+#
+# Per phase 25.3 Task 11 + AMEND-A1: proxy-wasm-rust-sdk =0.2.4 (pinned
+# exact). Builds to target/wasm32-wasip1/release/fail_reload_trap.wasm. The resulting
+# blob is vendored at ../../bytecode/fail_reload_trap.wasm + consumed by BOTH reference
+# Envoy v1.37.2 (V8 runtime) AND envoy-go (wazero runtime) via
+# DataSource.Filename. Exports proxy_abi_version_0_2_1.
+[package]
+name = "fail_reload_trap"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

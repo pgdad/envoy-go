@@ -24,6 +24,164 @@ func TestRealClock_SatisfiesClock(t *testing.T) {
 	var _ Clock = RealClock{}
 }
 
+func TestRealClock_AfterFunc_Fires(t *testing.T) {
+	done := make(chan struct{})
+	RealClock{}.AfterFunc(1*time.Millisecond, func() { close(done) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AfterFunc fn did not fire")
+	}
+}
+
+func TestFakeClock_AfterFunc_FiresOnAdvance_AndStop(t *testing.T) {
+	fc := NewFakeClock(time.Unix(0, 0))
+	var fired int
+	st := fc.AfterFunc(10*time.Millisecond, func() { fired++ })
+	fc.Advance(5 * time.Millisecond)
+	if fired != 0 {
+		t.Fatal("must not fire before deadline")
+	}
+	fc.Advance(5 * time.Millisecond)
+	if fired != 1 {
+		t.Fatalf("fired=%d want 1 at deadline", fired)
+	}
+	if st.Stop() {
+		t.Fatal("Stop after fire must return false")
+	}
+	st2 := fc.AfterFunc(10*time.Millisecond, func() { fired++ })
+	if !st2.Stop() {
+		t.Fatal("Stop before fire must return true")
+	}
+	fc.Advance(20 * time.Millisecond)
+	if fired != 1 {
+		t.Fatalf("stopped timer fired: fired=%d want 1", fired)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// AfterFunc determinism tests ported from phase-21
+// adaptive_concurrency/clock_test.go (D9 determinism contract now lives here).
+// -----------------------------------------------------------------------------
+
+// TestFakeClock_AfterFunc_FiresAtDeadline verifies the basic timer-fire path.
+func TestFakeClock_AfterFunc_FiresAtDeadline(t *testing.T) {
+	c := NewFakeClock(time.Unix(0, 0))
+	var fired bool
+	c.AfterFunc(50*time.Millisecond, func() { fired = true })
+	c.Advance(49 * time.Millisecond)
+	if fired {
+		t.Errorf("fired prematurely at +49ms")
+	}
+	c.Advance(1 * time.Millisecond) // total 50ms
+	if !fired {
+		t.Errorf("did NOT fire at +50ms")
+	}
+}
+
+// TestFakeClock_AfterFunc_DoesNotFireBefore confirms strict deadline boundary.
+func TestFakeClock_AfterFunc_DoesNotFireBefore(t *testing.T) {
+	c := NewFakeClock(time.Unix(0, 0))
+	var fired bool
+	c.AfterFunc(100*time.Millisecond, func() { fired = true })
+	c.Advance(99 * time.Millisecond)
+	if fired {
+		t.Errorf("fired at +99ms (deadline was 100ms)")
+	}
+}
+
+// TestFakeClock_AfterFunc_Stop_PreventsFire verifies cancel semantics.
+func TestFakeClock_AfterFunc_Stop_PreventsFire(t *testing.T) {
+	c := NewFakeClock(time.Unix(0, 0))
+	var fired bool
+	s := c.AfterFunc(50*time.Millisecond, func() { fired = true })
+	if !s.Stop() {
+		t.Errorf("Stop() returned false on first call (should return true)")
+	}
+	c.Advance(100 * time.Millisecond)
+	if fired {
+		t.Errorf("fired after Stop()")
+	}
+}
+
+// TestFakeClock_AfterFunc_Stop_AfterFireReturnsFalse verifies the post-fire
+// Stop branch.
+func TestFakeClock_AfterFunc_Stop_AfterFireReturnsFalse(t *testing.T) {
+	c := NewFakeClock(time.Unix(0, 0))
+	s := c.AfterFunc(10*time.Millisecond, func() {})
+	c.Advance(10 * time.Millisecond)
+	if s.Stop() {
+		t.Errorf("Stop() after fire returned true; want false")
+	}
+}
+
+// TestFakeClock_AfterFunc_MultiTimer_DeterministicOrder: 3 timers registered at
+// distinct intervals fire in deadline-asc order when Advance covers all 3.
+func TestFakeClock_AfterFunc_MultiTimer_DeterministicOrder(t *testing.T) {
+	c := NewFakeClock(time.Unix(0, 0))
+	var order []int
+	c.AfterFunc(30*time.Millisecond, func() { order = append(order, 30) })
+	c.AfterFunc(10*time.Millisecond, func() { order = append(order, 10) })
+	c.AfterFunc(20*time.Millisecond, func() { order = append(order, 20) })
+	c.Advance(100 * time.Millisecond)
+	want := []int{10, 20, 30}
+	if len(order) != 3 {
+		t.Fatalf("len(order) = %d; want 3", len(order))
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Errorf("order[%d] = %d; want %d (full order=%v)", i, order[i], want[i], order)
+		}
+	}
+}
+
+// TestFakeClock_AfterFunc_MultiTimer_SameDeadlineInsertionOrder verifies
+// tie-break determinism per planner-time D9: same-deadline timers fire in
+// registration order.
+func TestFakeClock_AfterFunc_MultiTimer_SameDeadlineInsertionOrder(t *testing.T) {
+	c := NewFakeClock(time.Unix(0, 0))
+	var order []string
+	c.AfterFunc(10*time.Millisecond, func() { order = append(order, "first") })
+	c.AfterFunc(10*time.Millisecond, func() { order = append(order, "second") })
+	c.AfterFunc(10*time.Millisecond, func() { order = append(order, "third") })
+	c.Advance(10 * time.Millisecond)
+	if len(order) != 3 {
+		t.Fatalf("len(order) = %d; want 3", len(order))
+	}
+	want := []string{"first", "second", "third"}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Errorf("order[%d] = %q; want %q (full order=%v)", i, order[i], want[i], order)
+		}
+	}
+}
+
+// TestFakeClock_ReentrantAfterFunc verifies that re-entrant AfterFunc calls
+// from inside a callback are safe (no deadlock) and that an AfterFunc(0, ...)
+// self-rearm from inside a callback fires in the SAME Advance pass (the
+// AMEND-2 C3 force-arm pattern used by the adaptive_concurrency controller).
+func TestFakeClock_ReentrantAfterFunc(t *testing.T) {
+	c := NewFakeClock(time.Unix(0, 0))
+	var fires int
+	var s Stop
+	s = c.AfterFunc(10*time.Millisecond, func() {
+		fires++
+		if fires < 3 {
+			s = c.AfterFunc(0, func() {
+				fires++
+				if fires < 3 {
+					s = c.AfterFunc(0, func() { fires++ })
+				}
+			})
+		}
+	})
+	_ = s // silence unused
+	c.Advance(10 * time.Millisecond)
+	if fires != 3 {
+		t.Errorf("re-entrant AfterFunc chain fired %d times; want 3", fires)
+	}
+}
+
 func TestRealClock_NowAdvances(t *testing.T) {
 	c := RealClock{}
 	a := c.Now()

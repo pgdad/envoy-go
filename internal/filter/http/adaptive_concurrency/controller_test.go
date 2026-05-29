@@ -16,7 +16,7 @@ package adaptive_concurrency
 //  7. TestController_ConcurrentForwardingDecision_NConcurrent — race per §12 B7
 //  8. TestController_ConcurrentForwardingDecision_NoDeadlockAtN1000 — race
 //  9. TestController_FAKE_TIME_TimerOrdering_Deterministic — per D9 (delegated to
-//     clock_test.go which has the dedicated multi-timer determinism tests)
+//     internal/clock which has the dedicated multi-timer determinism tests)
 //  10. TestController_FAKE_TIME_RecordLatencySample_Routing — sample-slice routing
 //
 // # Deferred tests (per Task 5 + Task 6 split)
@@ -39,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/esalaine/envoy-go/internal/clock"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -74,12 +75,12 @@ func testFilterStats() *filterStats {
 
 // newTestController is the standard test-scope constructor combining the
 // three helpers above with the fakeClock anchored at time.Unix(0, 0).
-func newTestController(t *testing.T) (*gradientController, *fakeClock) {
+func newTestController(t *testing.T) (*gradientController, *clock.FakeClock) {
 	t.Helper()
 	cfg := testCompiledConfig()
-	clock := newFakeClock(time.Unix(0, 0))
-	c := newGradientController(cfg, testFilterStats(), clock)
-	return c, clock
+	clk := clock.NewFakeClock(time.Unix(0, 0))
+	c := newGradientController(cfg, testFilterStats(), clk)
+	return c, clk
 }
 
 // -----------------------------------------------------------------------------
@@ -123,11 +124,11 @@ func TestController_FAKE_TIME_FirstTickSemantics(t *testing.T) {
 // limit change). Per AMEND-2 C4 + §4.5 (no re-arm here; updateMinRTT re-arms
 // at window close).
 func TestController_FAKE_TIME_ConcurrencyUpdateTickShortCircuitsInWindow(t *testing.T) {
-	c, clock := newTestController(t)
+	c, clk := newTestController(t)
 	// Record limit before advance; advance past the concurrency-update
 	// interval; verify limit unchanged.
 	limitBefore := c.concurrencyLimit.Load()
-	clock.Advance(c.cfg.concurrencyUpdateInterval + 1*time.Millisecond)
+	clk.Advance(c.cfg.concurrencyUpdateInterval + 1*time.Millisecond)
 	if got := c.concurrencyLimit.Load(); got != limitBefore {
 		t.Errorf("concurrencyLimit changed during minRTT window: before=%d after=%d", limitBefore, got)
 	}
@@ -327,7 +328,7 @@ func TestController_FAKE_TIME_JitterApplication_ZeroPct(t *testing.T) {
 // newLimit == minConcurrency outside the window; verify the 5th call
 // force-arms a 0ms timer which fires updateMinRTTTick → re-enters window.
 func TestController_FAKE_TIME_FiveConsecutiveMinForcedRecalc(t *testing.T) {
-	c, clock := newTestController(t)
+	c, clk := newTestController(t)
 	c.cfg.minRTTRequestCount = 3
 	c.cfg.sampleAggregatePercentile = 0.5
 	// Close the initial window by feeding enough samples.
@@ -348,8 +349,8 @@ func TestController_FAKE_TIME_FiveConsecutiveMinForcedRecalc(t *testing.T) {
 	}
 	// The 5th call should have force-armed minRTTCalcTimer at 0ms. Advance
 	// the clock by 0 — the re-entrant AfterFunc(0, ...) fires in the same
-	// Advance pass per clock_test.go::TestFakeClock_ReentrantAfterFunc.
-	clock.Advance(1 * time.Microsecond) // tiny step to trigger pending 0ms timer
+	// Advance pass per internal/clock::TestFakeClock_ReentrantAfterFunc.
+	clk.Advance(1 * time.Microsecond) // tiny step to trigger pending 0ms timer
 	// Verify the force-armed minRTTCalcTimer fired updateMinRTTTick which
 	// entered a fresh minRTT window.
 	c.mu.Lock()
@@ -542,7 +543,7 @@ func TestController_FAKE_TIME_RecordLatencySample_RoutesToLatencySamplesOutOfWin
 // post-window concurrency-update tick fires + emits gradient + burst_queue_size
 // + sample_rtt_msecs gauges.
 func TestController_FAKE_TIME_ConcurrencyUpdateTick_EmitsGaugesAfterWindowClose(t *testing.T) {
-	c, clock := newTestController(t)
+	c, clk := newTestController(t)
 	c.cfg.minRTTRequestCount = 3
 	c.cfg.sampleAggregatePercentile = 0.5
 	c.cfg.concurrencyUpdateInterval = 100 * time.Millisecond
@@ -561,7 +562,7 @@ func TestController_FAKE_TIME_ConcurrencyUpdateTick_EmitsGaugesAfterWindowClose(
 	c.recordLatencySample(60 * time.Millisecond)
 	c.recordLatencySample(80 * time.Millisecond)
 	// Advance past concurrency-update interval — the tick fires.
-	clock.Advance(101 * time.Millisecond)
+	clk.Advance(101 * time.Millisecond)
 	// Verify: sample_rtt_msecs gauge updated to 60ms (p50 of [40,60,80] = idx 1).
 	if got, want := c.stats.sampleRTTMsecs.Load(), int64((60 * time.Millisecond).Nanoseconds()); got != want {
 		t.Errorf("sampleRTTMsecs gauge = %d ns; want %d ns (60ms p50 of [40,60,80])", got, want)

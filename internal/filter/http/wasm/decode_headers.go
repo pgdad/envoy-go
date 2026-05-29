@@ -84,6 +84,8 @@ import (
 	"log"
 	gohttp "net/http"
 
+	"google.golang.org/protobuf/proto"
+
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filterstate"
 	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
@@ -113,13 +115,73 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	// back-pointer during the CallProxyOnRequestHeaders dispatch below.
 	f.requestHeaders = headers
 
-	// Lazy per-stream StreamContext construction at first DecodeHeaders entry.
-	// The nil-check guards a defensive double-call (HCM dispatch is single-
-	// shot per stream, but tests may exercise pre-construction paths).
+	ctx := context.Background()
+
+	// Per-route resolution per phase-25.3 Task 9 + AMEND-C1. Resolve the
+	// EFFECTIVE compiledConfig ONCE here (per-route override > listener
+	// default) + reuse it for the WHOLE per-stream lifecycle (this dispatch +
+	// EncodeHeaders + OnDestroy) so a per-route override swaps the entire VM
+	// consistently. The framework's RequestRouteConfig returns the 3-tier-
+	// resolved per-route proto (or nil); decoderCb may be nil in test-double
+	// paths (guard). A dispatch-time per-route build error is UNEXPECTED (the
+	// proto was shape-validated at HCM-build); fail-OPEN per the ADR-0072 per-
+	// stream runtime posture.
+	var routeProto proto.Message
+	if f.decoderCb != nil {
+		routeProto = f.decoderCb.RequestRouteConfig()
+	}
+	eff, err := f.cfg.resolveEffective(routeProto)
+	if err != nil {
+		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
+			f.cfg.stats.envoyGoFailures.Inc()
+		}
+		logf("ERROR wasm: per-route resolveEffective failed: %v", err)
+		return envoyhttp.Continue
+	}
+	f.eff = eff
+
+	// Reload integration per phase-25.3 Task 9 (FAIL_RELOAD) + BUG-4 reorder.
+	// BEFORE constructing the per-stream StreamContext (which fires
+	// proxy_on_context_create on the shared instance), consult the reload state
+	// machine of eff.rootVM. ReloadDispatch is serialized (dispatchMu) + advances
+	// the machine: it serves Running, attempts a reload past the backoff window,
+	// or reports Backoff within the window. The vm_reload triplet counters are
+	// incremented INSIDE ReloadDispatch (via the WithReloadStats seam wired at
+	// Task 8) — we do NOT double-increment. nil rootVM (test-double) →
+	// ReloadAvailable benign pass-through.
+	//
+	// BUG-4: this MUST run BEFORE initStreamContext. When a prior guest trap has
+	// POISONED the shared proxy-wasm instance (a Rust-SDK RefCell left borrowed
+	// on panic — ANY subsequent entry into the instance re-traps), constructing
+	// the per-stream context FIRST would fire proxy_on_context_create on the
+	// poisoned instance → that traps → initStreamContext returns an error →
+	// DecodeHeaders fail-OPENs at the initStreamContext branch → ReloadDispatch
+	// is NEVER reached → the Failed VM never reinstantiates (vm_reload_backoff /
+	// vm_reload_success stay 0 forever). Running ReloadDispatch first means a
+	// Failed VM within backoff → 503/bypass WITHOUT touching the poisoned
+	// instance, and a Failed VM past backoff → reinstantiate (FRESH, un-poisoned
+	// instance) so the subsequent context-create lands on clean state.
+	if eff.rootVM != nil {
+		if avail := eff.rootVM.ReloadDispatch(ctx); avail == internalwasm.ReloadUnavailable {
+			// The VM is unavailable (Failed within backoff OR a reload attempt
+			// just failed). Apply the failure-policy disposition WITHOUT
+			// constructing a per-stream context on / dispatching the guest of
+			// the poisoned instance.
+			return f.applyFailureDisposition(eff)
+		}
+	}
+
+	// Lazy per-stream StreamContext construction at first DecodeHeaders entry,
+	// bound to the EFFECTIVE config's *RootVM. The nil-check guards a defensive
+	// double-call (HCM dispatch is single-shot per stream, but tests may
+	// exercise pre-construction paths). Per the BUG-4 reorder above this now runs
+	// AFTER ReloadDispatch, so proxy_on_context_create fires on a VM that is
+	// confirmed available (Running, or freshly reinstantiated post-backoff) —
+	// never on a poisoned-but-Failed instance.
 	if f.streamCtx == nil {
-		if err := f.initStreamContext(context.Background()); err != nil {
-			if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-				f.cfg.stats.envoyGoFailures.Inc()
+		if err := f.initStreamContext(ctx, eff); err != nil {
+			if eff.stats != nil && eff.stats.envoyGoFailures != nil {
+				eff.stats.envoyGoFailures.Inc()
 			}
 			logf("ERROR wasm: StreamContext construction failed: %v", err)
 			// Fail-OPEN on per-stream runtime errors — the request still
@@ -130,18 +192,17 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 		}
 	}
 
-	ctx := context.Background()
-
 	// stats.executions.Inc() per AMEND-A2 Group-C envoy-go-strict per-
-	// `proxy_on_request_headers`-invocation counter.
-	if f.cfg.stats != nil && f.cfg.stats.executions != nil {
-		f.cfg.stats.executions.Inc()
+	// `proxy_on_request_headers`-invocation counter. Counts every dispatch
+	// ATTEMPT that reached the guest, INCLUDING ones where the guest subsequently
+	// traps — incremented BEFORE CallProxyOnRequestHeaders returns.
+	if eff.stats != nil && eff.stats.executions != nil {
+		eff.stats.executions.Inc()
 	}
 
 	// CallProxyOnRequestHeaders dispatches the guest's request-headers
 	// hook. The result is a ProxyAction (Continue/Pause). On wazero trap
-	// or panic-wrapped Go-side panic the error path bumps envoy_go.failures
-	// and returns Continue (fail-OPEN per ADR-0072 per-stream posture).
+	// or panic-wrapped Go-side panic err is non-nil.
 	//
 	// Per 25.2 ADR-0205: the per-stream context_create dispatch already
 	// fired inside RootVM.NewStreamContext above — no separate
@@ -150,12 +211,24 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	numHeaders := numHeaderValues(headers)
 	action, err := f.streamCtx.CallProxyOnRequestHeaders(ctx, numHeaders, endStream)
 	if err != nil {
-		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
-		}
 		logf("ERROR wasm: CallProxyOnRequestHeaders(stream=%d): %v",
 			f.streamContextID, err)
-		return envoyhttp.Continue
+		// Reload-on-RuntimeError per phase-25.3 Task 9: the guest TRAPPED. If
+		// the effective policy is FAIL_RELOAD (reload-eligible for a runtime
+		// error), arm the reload machine so the NEXT request drives a reload-
+		// or-backoff. Then apply the failure-policy disposition for THIS
+		// request (FAIL_CLOSED → 503; FAIL_OPEN → bypass; FAIL_RELOAD serves
+		// FAIL_CLOSED for the trapping request itself + reloads next time).
+		//
+		// ALL non-nil dispatch errors arm the reload machine under FAIL_RELOAD,
+		// not only confirmed wazero RuntimeErrors — host-side errors are rare
+		// and a spurious reload is benign (matches the pre-25.3 "any error =
+		// failure" stance). applyFailureDisposition is the SINGLE
+		// envoy_go.failures increment site for this path (no pre-call inc here).
+		if eff.rootVM != nil && internalwasm.ReloadEligible(eff.failurePolicy, internalwasm.FailStateRuntimeError) {
+			eff.rootVM.NoteReloadRuntimeError()
+		}
+		return f.applyFailureDisposition(eff)
 	}
 
 	// REUSE 5 (parent §3.3): captured-local-response short-circuits the
@@ -203,9 +276,9 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 // constructed at buildCompiledConfig (Task 14); the wazero.Runtime + the
 // instantiated module live on the *RootVM, not on the per-stream
 // StreamContext. Per-stream-context construction cost is microseconds.
-func (f *filter) initStreamContext(ctx context.Context) error {
-	if f.cfg.rootVM == nil {
-		// Defensive: production callers always populate cfg.rootVM at
+func (f *filter) initStreamContext(ctx context.Context, eff *compiledConfig) error {
+	if eff.rootVM == nil {
+		// Defensive: production callers always populate rootVM at
 		// buildCompiledConfig (Task 14). Test-double paths that bypass
 		// buildCompiledConfig (e.g. body_test.go's newBodyTestCompiledConfig)
 		// may leave it nil; in that case the per-stream callbacks short-
@@ -214,7 +287,7 @@ func (f *filter) initStreamContext(ctx context.Context) error {
 		return errNilRootVM
 	}
 
-	streamCtx, err := f.cfg.rootVM.NewStreamContext(ctx)
+	streamCtx, err := eff.rootVM.NewStreamContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -237,22 +310,61 @@ func (f *filter) initStreamContext(ctx context.Context) error {
 	// distinct *filters; each guest hostcall routes to the originating
 	// stream).
 	cb := &abiCallbacks{filter: f}
-	if f.cfg.rootCB != nil {
-		f.cfg.rootCB.register(f.streamContextID, cb)
+	if eff.rootCB != nil {
+		eff.rootCB.register(f.streamContextID, cb)
 	}
 
 	// Group-B upstream-parity counters: incr created on construction;
 	// incr active gauge (decr at OnDestroy).
-	if f.cfg.stats != nil {
-		if f.cfg.stats.created != nil {
-			f.cfg.stats.created.Inc()
+	if eff.stats != nil {
+		if eff.stats.created != nil {
+			eff.stats.created.Inc()
 		}
-		if f.cfg.stats.active != nil {
-			f.cfg.stats.active.Inc()
+		if eff.stats.active != nil {
+			eff.stats.active.Inc()
 		}
 	}
 
 	return nil
+}
+
+// applyFailureDisposition returns the per-request FilterHeadersStatus when the
+// guest is unavailable (the reload machine reported the VM unavailable) OR the
+// guest dispatch TRAPPED, per the effective failure policy (phase-25.3 Task 9 +
+// AMEND-C3 + R-25.3-3):
+//
+//   - FAIL_OPEN → bypass the filter: Continue, no local reply. The stream
+//     proceeds as if the wasm filter weren't present. NOT treated as an error.
+//   - FAIL_CLOSED / FAIL_RELOAD (and the proto-default UNSPECIFIED→FailClosed)
+//     → fail the stream: send a 503 local reply via decoderCb.SendLocalReply
+//     (matching the REUSE-5 captured-local-response SendLocalReply path) +
+//     StopIteration. envoy_go.failures is bumped (the request did not serve the
+//     guest's intended processing — per §2.25 failure-path stat discipline).
+//
+// The vm_reload triplet counters are NOT touched here (ReloadDispatch owns
+// them). decoderCb may be nil on test-double / encode-only paths — the 503
+// branch then degrades to StopIteration without the reply (the chain still
+// stops). FAIL_RELOAD shares the FAIL_CLOSED disposition for the unavailable /
+// trapping request itself; the reload-or-backoff happens on the NEXT request.
+func (f *filter) applyFailureDisposition(eff *compiledConfig) envoyhttp.FilterHeadersStatus {
+	if eff.failurePolicy == internalwasm.FailurePolicyFailOpen {
+		// Bypass — the stream proceeds without wasm processing. No failure
+		// counter (an intentional bypass is not a failure).
+		logf("INFO wasm: FAIL_OPEN bypass (stream=%d) — VM unavailable/trapped; continuing without wasm processing",
+			f.streamContextID)
+		return envoyhttp.Continue
+	}
+
+	// FAIL_CLOSED / FAIL_RELOAD-within-backoff / UNSPECIFIED → 503.
+	if eff.stats != nil && eff.stats.envoyGoFailures != nil {
+		eff.stats.envoyGoFailures.Inc()
+	}
+	logf("INFO wasm: FAIL_CLOSED 503 (stream=%d) — VM unavailable/trapped under failure_policy=%d",
+		f.streamContextID, eff.failurePolicy)
+	if f.decoderCb != nil {
+		f.decoderCb.SendLocalReply(gohttp.StatusServiceUnavailable, "", nil)
+	}
+	return envoyhttp.StopIteration
 }
 
 // errNilRootVM signals a *filter constructed against a *compiledConfig

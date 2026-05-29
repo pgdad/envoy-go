@@ -76,19 +76,26 @@ func fixSection(id byte, payload []byte) []byte {
 }
 
 const (
-	fixTypeI32     = 0x7f
-	fixExtFunction = 0x00
-	fixExtMemory   = 0x02
-	fixOpEnd       = 0x0b
-	fixOpCall      = 0x10
-	fixOpI32Const  = 0x41
-	fixOpDrop      = 0x1a
-	fixSectionType = 0x01
-	fixSectionImp  = 0x02
-	fixSectionFunc = 0x03
-	fixSectionMem  = 0x05
-	fixSectionExp  = 0x07
-	fixSectionCode = 0x0a
+	fixTypeI32       = 0x7f
+	fixExtFunction   = 0x00
+	fixExtMemory     = 0x02
+	fixOpUnreachable = 0x00
+	fixOpEnd         = 0x0b
+	fixOpCall        = 0x10
+	fixOpI32Const    = 0x41
+	fixOpDrop        = 0x1a
+	fixOpIf          = 0x04
+	fixOpGlobalGet   = 0x23
+	fixOpGlobalSet   = 0x24
+	fixBlockTypeVoid = 0x40
+	fixGlobalMutable = 0x01
+	fixSectionType   = 0x01
+	fixSectionImp    = 0x02
+	fixSectionFunc   = 0x03
+	fixSectionMem    = 0x05
+	fixSectionGlobal = 0x06
+	fixSectionExp    = 0x07
+	fixSectionCode   = 0x0a
 )
 
 // fixFuncType encodes a (params, results) type signature.
@@ -145,6 +152,40 @@ func fixMemorySection(minPages uint32) []byte {
 	payload = append(payload, 0x00) // limits flag: no max
 	payload = append(payload, fixUleb128(minPages)...)
 	return fixSection(fixSectionMem, payload)
+}
+
+// fixGlobalSection encodes a global section of mutable i32 globals, each
+// initialized to 0 via a constant init-expr (i32.const 0; end). One entry per
+// `count`. Section id 0x06 must appear after the memory section (0x05) and
+// before the export section (0x07) per the WebAssembly module section ordering.
+func fixGlobalSection(count uint32) []byte {
+	payload := fixUleb128(count)
+	for i := uint32(0); i < count; i++ {
+		payload = append(payload, fixTypeI32)        // valtype i32
+		payload = append(payload, fixGlobalMutable)  // mutability: mutable
+		payload = append(payload, fixI32Const(0)...) // init expr
+		payload = append(payload, fixOpEnd)
+	}
+	return fixSection(fixSectionGlobal, payload)
+}
+
+func fixGlobalGet(idx uint32) []byte {
+	return append([]byte{fixOpGlobalGet}, fixUleb128(idx)...)
+}
+
+func fixGlobalSet(idx uint32) []byte {
+	return append([]byte{fixOpGlobalSet}, fixUleb128(idx)...)
+}
+
+// fixIfVoid wraps the supplied body instructions in `if (void) <body> end` —
+// pops one i32 from the stack; executes body when non-zero. No else arm.
+func fixIfVoid(body ...[]byte) []byte {
+	out := []byte{fixOpIf, fixBlockTypeVoid}
+	for _, b := range body {
+		out = append(out, b...)
+	}
+	out = append(out, fixOpEnd)
+	return out
 }
 
 type fixExport struct {
@@ -294,6 +335,136 @@ func buildPauseProxyWasm() []byte {
 			fixFuncBody(),
 			fixFuncBody(),
 			fixFuncBody(fixI32Const(1)), // return ProxyActionPause
+		}),
+	)
+}
+
+// buildTrappingProxyWasm constructs a module whose proxy_on_request_headers
+// executes the `unreachable` instruction (opcode 0x00) — a guest TRAP. wazero
+// surfaces this as a RuntimeError from fn.Call, which the host catches as a
+// non-nil error on the CallProxyOnRequestHeaders return. This is the REAL
+// guest-trap condition the differential test surfaced (a Rust panic! in the
+// proxy-wasm-rust-sdk dispatcher leaves the RefCell borrowed; the host catches
+// the trap but must NOT re-enter the poisoned instance on teardown — see
+// BUG-3). proxy_on_response_headers + proxy_on_done/log/delete are ALSO
+// trapping so any re-entry of the poisoned instance would cascade (which the
+// trapped-instance guard must prevent).
+//
+// Exports _initialize + proxy_abi_version_0_2_1 (no-op) + a 1-page memory +
+// the five trapping callbacks. No imports.
+func buildTrappingProxyWasm() []byte {
+	// trap body: a single `unreachable` then `end`.
+	trapBody := fixFuncBody([]byte{fixOpUnreachable})
+	return fixBuildModule(
+		fixTypeSection(
+			[2][]byte{nil, nil}, // type 0: () -> ()
+			[2][]byte{{fixTypeI32, fixTypeI32, fixTypeI32}, {fixTypeI32}}, // type 1: (i32,i32,i32) -> i32
+			[2][]byte{{fixTypeI32}, {fixTypeI32}},                         // type 2: (i32) -> i32  (proxy_on_done)
+			[2][]byte{{fixTypeI32}, nil},                                  // type 3: (i32) -> ()   (proxy_on_log / proxy_on_delete)
+		),
+		// fn 0: _initialize (type 0)
+		// fn 1: proxy_abi_version_0_2_1 (type 0)
+		// fn 2: proxy_on_request_headers (type 1) — TRAPS
+		// fn 3: proxy_on_response_headers (type 1) — TRAPS
+		// fn 4: proxy_on_done (type 2) — TRAPS
+		// fn 5: proxy_on_log (type 3) — TRAPS
+		// fn 6: proxy_on_delete (type 3) — TRAPS
+		fixFunctionSection([]uint32{0, 0, 1, 1, 2, 3, 3}),
+		fixMemorySection(1),
+		fixExportSection([]fixExport{
+			{name: "_initialize", kind: fixExtFunction, idx: 0},
+			{name: "proxy_abi_version_0_2_1", kind: fixExtFunction, idx: 1},
+			{name: "proxy_on_request_headers", kind: fixExtFunction, idx: 2},
+			{name: "proxy_on_response_headers", kind: fixExtFunction, idx: 3},
+			{name: "proxy_on_done", kind: fixExtFunction, idx: 4},
+			{name: "proxy_on_log", kind: fixExtFunction, idx: 5},
+			{name: "proxy_on_delete", kind: fixExtFunction, idx: 6},
+			{name: "memory", kind: fixExtMemory, idx: 0},
+		}),
+		fixCodeSection([][]byte{
+			fixFuncBody(), // _initialize
+			fixFuncBody(), // proxy_abi_version_0_2_1
+			trapBody,      // proxy_on_request_headers TRAPS
+			trapBody,      // proxy_on_response_headers TRAPS
+			trapBody,      // proxy_on_done TRAPS
+			trapBody,      // proxy_on_log TRAPS
+			trapBody,      // proxy_on_delete TRAPS
+		}),
+	)
+}
+
+// buildContextCreatePoisonProxyWasm constructs a module that replicates the
+// BUG-4 "poisoned-instance context-create trap" condition self-contained (no
+// Rust-SDK blob). It carries ONE mutable i32 wasm global `poisoned` (global 0,
+// init 0):
+//
+//   - proxy_on_context_create (global 0 == 0 on a fresh instance) → NO trap;
+//     when global 0 != 0 (the instance has been poisoned by a prior header
+//     trap) → `unreachable` (TRAP). This is the BUG-4 condition: once the shared
+//     instance is poisoned, EVERY subsequent proxy_on_context_create traps.
+//   - proxy_on_request_headers → `global.set 0 = 1` (POISON the instance — the
+//     write persists in wazero linear/global state across the trap unwind) then
+//     `unreachable` (TRAP). Mirrors a Rust-SDK guest that leaves a RefCell
+//     borrowed on panic so any subsequent entry into the instance re-traps.
+//
+// A `reinstantiate` (fresh InstantiateModule) resets global 0 back to its init
+// value (0), so proxy_on_context_create on the FRESH instance succeeds — which
+// is exactly what the reload machine must reach (BUG-4 fix: ReloadDispatch must
+// run BEFORE initStreamContext so context-create lands on the fresh instance).
+//
+// Exports _initialize + proxy_abi_version_0_2_1 (no-op) + a 1-page memory +
+// proxy_on_context_create + proxy_on_request_headers + proxy_on_response_headers
+// + the teardown triplet (proxy_on_done/log/delete are NO-OP here so OnDestroy's
+// trapped-instance guard is not the subject under test). No imports.
+func buildContextCreatePoisonProxyWasm() []byte {
+	return fixBuildModule(
+		fixTypeSection(
+			[2][]byte{nil, nil}, // type 0: () -> ()
+			[2][]byte{{fixTypeI32, fixTypeI32, fixTypeI32}, {fixTypeI32}}, // type 1: (i32,i32,i32) -> i32
+			[2][]byte{{fixTypeI32, fixTypeI32}, nil},                      // type 2: (i32,i32) -> ()  proxy_on_context_create
+			[2][]byte{{fixTypeI32}, {fixTypeI32}},                         // type 3: (i32) -> i32     proxy_on_done
+			[2][]byte{{fixTypeI32}, nil},                                  // type 4: (i32) -> ()      proxy_on_log / proxy_on_delete
+		),
+		// fn 0: _initialize (type 0)
+		// fn 1: proxy_abi_version_0_2_1 (type 0)
+		// fn 2: proxy_on_context_create (type 2) — TRAPS IFF poisoned
+		// fn 3: proxy_on_request_headers (type 1) — POISONS then TRAPS
+		// fn 4: proxy_on_response_headers (type 1) — returns Continue
+		// fn 5: proxy_on_done (type 3) — no-op (returns 0)
+		// fn 6: proxy_on_log (type 4) — no-op
+		// fn 7: proxy_on_delete (type 4) — no-op
+		fixFunctionSection([]uint32{0, 0, 2, 1, 1, 3, 4, 4}),
+		fixMemorySection(1),
+		fixGlobalSection(1), // global 0: mutable i32 `poisoned`, init 0
+		fixExportSection([]fixExport{
+			{name: "_initialize", kind: fixExtFunction, idx: 0},
+			{name: "proxy_abi_version_0_2_1", kind: fixExtFunction, idx: 1},
+			{name: "proxy_on_context_create", kind: fixExtFunction, idx: 2},
+			{name: "proxy_on_request_headers", kind: fixExtFunction, idx: 3},
+			{name: "proxy_on_response_headers", kind: fixExtFunction, idx: 4},
+			{name: "proxy_on_done", kind: fixExtFunction, idx: 5},
+			{name: "proxy_on_log", kind: fixExtFunction, idx: 6},
+			{name: "proxy_on_delete", kind: fixExtFunction, idx: 7},
+			{name: "memory", kind: fixExtMemory, idx: 0},
+		}),
+		fixCodeSection([][]byte{
+			fixFuncBody(), // _initialize
+			fixFuncBody(), // proxy_abi_version_0_2_1
+			// proxy_on_context_create: if poisoned (global 0 != 0) → unreachable.
+			fixFuncBody(
+				fixGlobalGet(0),
+				fixIfVoid([]byte{fixOpUnreachable}),
+			),
+			// proxy_on_request_headers: poison (global 0 = 1) then trap.
+			fixFuncBody(
+				fixI32Const(1),
+				fixGlobalSet(0),
+				[]byte{fixOpUnreachable},
+			),
+			fixFuncBody(fixI32Const(0)), // proxy_on_response_headers → Continue
+			fixFuncBody(fixI32Const(0)), // proxy_on_done → 0
+			fixFuncBody(),               // proxy_on_log
+			fixFuncBody(),               // proxy_on_delete
 		}),
 	)
 }

@@ -1,0 +1,59 @@
+# Human-readable expectations for fixture 0038-http-wasm-perroute-and-multi-plugin.
+# This file is documentation only; the runner does NOT parse it. Per phase
+# 25.3 Task 11.
+
+arms:
+  - id: perroute_override_applies
+    crate: perroute_override
+    kind: cross_side
+    listener: l_perroute
+    probe: GET /override
+    plugin_call: set_http_response_header x-wasm-variant=override (per-route wholesale Wasm TPFC override)
+    cross_side_assertion: |
+      Response header x-wasm-variant=override on BOTH reference Envoy
+      (cpp-host wholesale per-route Wasm) and envoy-go. The OVERRIDE plugin
+      replaces the listener default for this route (AMEND-C1: the entire
+      Wasm message — VM included — swaps).
+
+  - id: perroute_listener_default
+    crate: listener_default
+    kind: cross_side
+    listener: l_perroute
+    probe: GET /default
+    plugin_call: set_http_response_header x-wasm-variant=listener (listener default; no per-route TPFC)
+    cross_side_assertion: |
+      Response header x-wasm-variant=listener on BOTH sides (no per-route
+      override → the listener default plugin applies).
+
+  - id: multiplugin_shared_data
+    crate: shared_data_combined
+    kind: cross_side + subject_only
+    listener: l_multiplugin
+    probe: GET /multi
+    plugin_call: |
+      Filter A (configuration=writer) set_shared_data x0038-shared=written-by-A
+      on the request path; filter B (configuration=reader) get_shared_data +
+      set_http_response_header x-shared on the response path. Both filters
+      share vm_id=vm_shared → ONE RootVM + ONE shared-data namespace.
+    cross_side_assertion: |
+      Response header x-shared=written-by-A on BOTH sides (vm_id-scoped
+      shared data is visible across the two plugins; cpp-host shares by
+      vm_id). DISCRIMINATING: a non-shared namespace reflects x-shared=absent.
+    subject_assertion: |
+      wasm.plugin_multi_a.executions >= 1 AND wasm.plugin_multi_b.executions
+      >= 1 (both filters of the shared-VM chain dispatched their guest).
+
+  - id: reload_fail_reload_recovers
+    crate: fail_reload_trap
+    kind: subject_only
+    listener: l_reload
+    probe: |
+      req1 GET /reload x-trigger-trap=1 (trap → 503 + arm reload)
+      req2 GET /reload x-trigger-trap=1 (within ~1s backoff → 503 + backoff)
+      sleep 1.3s (> backoff window)
+      req3 GET /reload (no trigger → reload → 200)
+    plugin_call: panic on x-trigger-trap=1; else x-reload=ok
+    subject_assertion: |
+      wasm.plugin_reload.vm_reload_runtime_failure >= 1 +
+      wasm.plugin_reload.vm_reload_backoff >= 1 +
+      wasm.plugin_reload.vm_reload_success >= 1.

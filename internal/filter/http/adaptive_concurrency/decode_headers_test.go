@@ -37,6 +37,7 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/esalaine/envoy-go/internal/clock"
 	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
@@ -109,19 +110,19 @@ func (c *recordedCallbacks) RouteIncludeVhRateLimits() bool              { retur
 //
 // Mirrors newTestController at controller_test.go (same cfg + same clock
 // anchor at time.Unix(0, 0)).
-func newTestFilter(t *testing.T) (*filter, *fakeClock, *recordedCallbacks) {
+func newTestFilter(t *testing.T) (*filter, *clock.FakeClock, *recordedCallbacks) {
 	t.Helper()
 	cfg := testCompiledConfig()
-	clock := newFakeClock(time.Unix(0, 0))
-	ctrl := newGradientController(cfg, testFilterStats(), clock)
+	clk := clock.NewFakeClock(time.Unix(0, 0))
+	ctrl := newGradientController(cfg, testFilterStats(), clk)
 	cb := &recordedCallbacks{}
 	f := &filter{
 		cc:         cfg,
 		controller: ctrl,
-		clock:      clock,
+		clock:      clk,
 	}
 	f.SetDecoderCallbacks(cb)
-	return f, clock, cb
+	return f, clk, cb
 }
 
 // -----------------------------------------------------------------------------
@@ -165,10 +166,10 @@ func TestFilter_DecodeHeaders_Disabled_PassThrough(t *testing.T) {
 // returns Continue + sets f.acquired = true + records f.entryTime = clock.Now().
 // Per SPEC §6.4 Forward leg.
 func TestFilter_DecodeHeaders_Forward_AcquiresToken(t *testing.T) {
-	f, clock, cb := newTestFilter(t)
+	f, clk, cb := newTestFilter(t)
 	// At construction, limit = minConcurrency = 3 + numRqOutstanding = 0 ⇒
 	// capacity available.
-	expectedEntryTime := clock.Now()
+	expectedEntryTime := clk.Now()
 
 	status := f.DecodeHeaders(http.Header{}, false)
 

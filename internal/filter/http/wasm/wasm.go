@@ -26,8 +26,10 @@ package wasm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
+	wasmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/wasm/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -63,13 +65,12 @@ const filterName = "envoy.filters.http.wasm"
 // below continues to reference *compiledConfig — that type now resolves
 // to the canonical declaration in compiled_config.go.
 
-// parseRejectPerRouteUnsupported is the byte-stable arm-18 PARSE-REJECT
-// wording per parent §6.2 arm 18 + AMEND-A3 5th-canonical REUSE-by-absence.
-// 25.3 IMPL replaces the validatePerRouteWasm one-liner with the real per-
-// route shape validator (`WasmPerRoute` 5th-canonical wholesale-override);
-// at 25.1 + 25.2 ANY input rejects with this wording. Test-pinned at
-// TestValidatePerRouteWasm_RejectsWithArm18Wording (wasm_test.go).
-const parseRejectPerRouteUnsupported = "wasm: per-route configuration is not yet supported (lands in phase 25.3)"
+// Arm 18 LIFTED (phase-25.3 Task 7): the 25.1/25.2 arm-18 deferral constant
+// parseRejectPerRouteUnsupported is RETIRED. validatePerRouteWasm now validates
+// the per-route Wasm shape (see below); a valid per-route config ACCEPTS, an
+// invalid one rejects with the SAME byte-stable buildCompiledConfig wording
+// (single source of truth). There is no longer a standalone "per-route not yet
+// supported" wording.
 
 // -----------------------------------------------------------------------------
 // filter struct + capturedLocalResponse — per-stream state shape per §4.3.
@@ -98,6 +99,18 @@ type filter struct {
 	// Type added at Task 9 (compiled_config.go); at Task 8 the field is typed
 	// `*compiledConfig` and points to nil until the type lands.
 	cfg *compiledConfig //nolint:unused // closure-captured at Task 9 New's FilterInstanceFactory
+
+	// eff is the EFFECTIVE per-stream compiledConfig resolved ONCE at
+	// DecodeHeaders entry (per-route override > listener default) per phase-25.3
+	// Task 9 + AMEND-C1. The whole per-stream lifecycle (NewStreamContext /
+	// rootCB.register / the guest dispatch / stats / failurePolicy / the reload
+	// machine / EncodeHeaders / OnDestroy) binds to eff.rootVM — NOT f.cfg —
+	// so a per-route override swaps the ENTIRE VM consistently across decode +
+	// encode + destroy. Resolved once + reused (the framework's per-route proto
+	// pointer is stable per route; resolving per-callback would risk a split
+	// decode/encode VM). nil until DecodeHeaders runs; EncodeHeaders / OnDestroy
+	// fall back to f.cfg on the encode-only / never-decoded edge.
+	eff *compiledConfig //nolint:unused // resolved at Task 9 DecodeHeaders; consumed by EncodeHeaders + OnDestroy
 
 	// NOTE: the 25.1 `vm *wasm.VM` field was REMOVED at 25.2 IMPL Task 18
 	// alongside the deletion of internal/wasm/vm.go (Task 1 per D-P-PLAN-6).
@@ -324,12 +337,11 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 // New is called during listener construction (after Freeze). Mirrors the
 // header_mutation + oauth2 + lua precedent.
 //
-// At 25.1 + 25.2, the validator returns the arm-18 PARSE-REJECT
-// `parseRejectPerRouteUnsupported` for ANY input per parent §6.2 arm 18 +
-// AMEND-A3 5th-canonical REUSE-by-absence. 25.3 IMPL replaces the body with
-// the real per-route shape validator (`WasmPerRoute` 5th-canonical
-// wholesale-override; ADR-0125 STAYS at 10 canonicals; NO §(xvi) amendment
-// per AMEND-A3).
+// At phase-25.3 (arm 18 LIFTED) the validator validates the per-route
+// wholesale Wasm TPFC override shape via validateWasmConfigShape (AMEND-C1 +
+// ADR-0210 5th-canonical wholesale-override; ADR-0125 STAYS at 10 canonicals;
+// NO §(xvi) amendment per AMEND-A3). A valid per-route config ACCEPTS; an
+// invalid one rejects with the SAME byte-stable buildCompiledConfig wording.
 //
 // The exported function takes the same interface shape as phase-22.1 lua's
 // RegisterPerRouteValidator (a structural-typed interface accepting any
@@ -347,15 +359,39 @@ func RegisterPerRouteValidator(reg interface {
 }
 
 // validatePerRouteWasm is the ADR-0110 single-chokepoint per-route validator
-// for the envoy.filters.http.wasm filter. At 25.1 + 25.2 the body returns the
-// arm-18 PARSE-REJECT per parent §6.2 arm 18 + AMEND-A3 5th-canonical
-// REUSE-by-absence; 25.3 IMPL replaces the body with the real per-route
-// shape validator (`WasmPerRoute` 5th-canonical wholesale-override).
+// for the envoy.filters.http.wasm filter. At phase-25.3 (arm 18 LIFTED) it
+// validates the per-route wholesale Wasm TPFC override shape per AMEND-C1 +
+// ADR-0210 (the per-route override is a full *wasmv3.Wasm message — there is
+// NO WasmPerRoute type; the entire compiledConfig, hence its *RootVM, swaps
+// per-route).
 //
 // The validator is invoked by BuildPerRouteConfig at HCM-build time for each
 // parsed proto.Message at each tier (Route, VirtualHost, RouteConfiguration,
-// listener-typed_per_filter_config). At 25.1 ANY input rejects — the wasm
-// filter has NO per-route configuration support at this phase.
-func validatePerRouteWasm(_ proto.Message) error {
-	return errors.New(parseRejectPerRouteUnsupported)
+// listener-typed_per_filter_config). It type-asserts to *wasmv3.Wasm, round-
+// trips into an *anypb.Any, and runs validateWasmConfigShape — a validate-only
+// pass of buildCompiledConfig that fires every PARSE-REJECT arm WITHOUT
+// claiming the process-wide plugin name (arm 26) NOR acquiring a registry
+// *RootVM refcount (no VM instantiation / goroutine / leak). A valid per-route
+// config returns nil; an invalid one returns the SAME byte-stable wording as
+// the listener build path (single source of truth = buildCompiledConfig).
+//
+// Per-route validation design decision (recorded in PROGRESS.md): validate-
+// only mode, NOT build-then-discard. A build-then-discard would (a) leak the
+// registry *RootVM refcount + goroutine and (b) permanently claim the plugin
+// name via arm-26's append-only registry — so a legitimate second use of the
+// same override on another route would FALSE-reject. validate-only avoids both
+// while still fail-fast-rejecting every malformed per-route config at HCM-build.
+//
+// The real per-route compiledConfig + *RootVM build happens at Task 9 dispatch
+// resolution (parsePerRouteWasm + resolvePerRoute), not here.
+func validatePerRouteWasm(m proto.Message) error {
+	w, ok := m.(*wasmv3.Wasm)
+	if !ok {
+		return fmt.Errorf("wasm: per-route: expected *wasmv3.Wasm, got %T", m)
+	}
+	tc, err := anypb.New(w)
+	if err != nil {
+		return err
+	}
+	return validateWasmConfigShape(tc)
 }

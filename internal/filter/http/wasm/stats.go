@@ -200,14 +200,58 @@ const statNameDynamicStatsCapExceeded = "dynamic_stats_cap_exceeded"
 const statNameHttpCallResponseAfterClose = "http_call_response_after_close"
 
 // -----------------------------------------------------------------------------
-// filterStats — 5-counter holder per AMEND-A2 tri-group prefix structure.
+// 25.3 IMPL Task 8 — 4 NEW stat-name suffixes per phase-25.3 AMEND-C3 +
+// AMEND-C4. Group C = vm_reload triplet (3) + env_vars_cap_exceeded (1).
+// Combined these push the project-wide stat-count from 128 → 132. Full wire
+// names assembled at registry-call time: `wasm.<plugin_name>.<suffix>`.
 // -----------------------------------------------------------------------------
 
-// filterStats is the 5-counter per-listener stat-surface holder per
-// AMEND-A2 + 25.1 SPEC §4.2 + parent §7. Allocated at `wasm.New` time via
+// statNameVmReloadSuccess pins the byte-exact envoy-go-strict suffix for the
+// per-successful-reload counter per phase-25.3 AMEND-C3 (FAIL_RELOAD reload
+// triplet). Full wire name: `wasm.<plugin_name>.vm_reload_success`.
+// Incremented by the reload state machine via the reloadStatsHook seam
+// (Task 3) when a re-instantiation succeeds (Running ← Failed transition).
+// Departure record at Task 15 BEHAVIOR_CONTRACT.md.
+const statNameVmReloadSuccess = "vm_reload_success"
+
+// statNameVmReloadRuntimeFailure pins the byte-exact envoy-go-strict suffix
+// for the per-reload-attempt-that-failed counter per phase-25.3 AMEND-C3.
+// Full wire name: `wasm.<plugin_name>.vm_reload_runtime_failure`. Incremented
+// when a re-instantiation attempt fails (the VM stays Failed). Departure
+// record at Task 15 BEHAVIOR_CONTRACT.md.
+const statNameVmReloadRuntimeFailure = "vm_reload_runtime_failure"
+
+// statNameVmReloadBackoff pins the byte-exact envoy-go-strict suffix for the
+// per-dispatch-blocked-by-backoff counter per phase-25.3 AMEND-C3. Full wire
+// name: `wasm.<plugin_name>.vm_reload_backoff`. Incremented at each dispatch
+// entry where the VM is Failed and still inside the backoff window (no
+// reload attempt on that dispatch). Departure record at Task 15.
+const statNameVmReloadBackoff = "vm_reload_backoff"
+
+// statNameEnvVarsCapExceeded pins the byte-exact envoy-go-strict suffix for
+// the env-vars-cap-exceeded parse-reject counter per phase-25.3 AMEND-C4.
+// Full wire name: `wasm.<plugin_name>.env_vars_cap_exceeded`. Intended to be
+// incremented at the arm-C env_vars cap-reject path in compiled_config.go;
+// see ordering note at compiled_config.go parseEnvVars call site (the stats
+// object is constructed AFTER the arm-C check, so the increment is a
+// documented limitation — the counter is allocated per plugin but cannot be
+// bumped on the arm-C reject since no compiledConfig is built). Departure
+// record at Task 15 BEHAVIOR_CONTRACT.md.
+const statNameEnvVarsCapExceeded = "env_vars_cap_exceeded"
+
+// -----------------------------------------------------------------------------
+// filterStats — 18-counter holder per AMEND-A2 tri-group prefix structure
+// (origin: 5 at 25.1; +9 at 25.2; +4 at 25.3).
+// -----------------------------------------------------------------------------
+
+// filterStats is the per-listener stat-surface holder per AMEND-A2 + 25.1
+// SPEC §4.2 + parent §7 (origin: 5 counters at 25.1; EXTENDED to 14 at 25.2
+// per Q9 + AMEND-B3; EXTENDED to 18 at 25.3 — the vm_reload_* Group-C triplet
+// + env_vars_cap_exceeded per ADR-0211). Allocated at `wasm.New` time via
 // `newFilterStats(reg, pluginName)`; SHARED across the listener's per-stream
-// `*filter` instances (no per-route stats at 25.1; per-route PARSE-REJECTs
-// per parent §6.2 arm 18).
+// `*filter` instances. Per-route overrides (ADR-0210; landed at 25.3) build
+// their own per-route `filterStats` via `NewCounterIfAbsent` (post-freeze
+// tolerant — the BUG-1 fix).
 //
 // Field grouping mirrors the AMEND-A2 tri-group prefix structure:
 //
@@ -303,14 +347,46 @@ type filterStats struct {
 	// envoy-go's cancellation path has a bug. Wire name:
 	// `wasm.<plugin>.http_call_response_after_close`.
 	httpCallResponseAfterClose *stats.Counter
+
+	// -------------------------------------------------------------------------
+	// 25.3 IMPL Task 8 EXTENSIONS — Group C: vm_reload triplet + env_vars_cap_exceeded
+	// (4 NEW envoy-go-strict counters per phase-25.3 AMEND-C3/C4). These push
+	// the project-wide stat-count from 128 → 132.
+	// -------------------------------------------------------------------------
+
+	// vmReloadSuccess — per successful VM re-instantiation under FAIL_RELOAD
+	// (Running ← Failed transition). Incremented via the reloadStatsHook seam
+	// at Task 3 (WithReloadStats). Wire name:
+	// `wasm.<plugin>.vm_reload_success`.
+	vmReloadSuccess *stats.Counter
+
+	// vmReloadRuntimeFailure — per failed VM re-instantiation attempt under
+	// FAIL_RELOAD (VM stays Failed). Incremented via the reloadStatsHook seam.
+	// Wire name: `wasm.<plugin>.vm_reload_runtime_failure`.
+	vmReloadRuntimeFailure *stats.Counter
+
+	// vmReloadBackoff — per dispatch blocked by the reload backoff window (VM
+	// is Failed but still within the backoff interval; no reload attempt on
+	// that dispatch). Incremented via the reloadStatsHook seam. Wire name:
+	// `wasm.<plugin>.vm_reload_backoff`.
+	vmReloadBackoff *stats.Counter
+
+	// envVarsCapExceeded — per arm-C env_vars cap-exceeded parse-reject event
+	// per AMEND-C4. Allocated per-plugin; intended to be incremented at the
+	// arm-C cap-reject path in compiled_config.go (see ordering note at the
+	// parseEnvVars call site — the stats object is not yet constructed at the
+	// arm-C check point). Wire name: `wasm.<plugin>.env_vars_cap_exceeded`.
+	envVarsCapExceeded *stats.Counter
 }
 
 // -----------------------------------------------------------------------------
-// newFilterStats — 5-counter registration per AMEND-A2 tri-group structure.
+// newFilterStats — 18-counter registration per AMEND-A2 tri-group structure
+// (origin: 5 at 25.1; +9 at 25.2; +4 at 25.3).
 // -----------------------------------------------------------------------------
 
-// newFilterStats constructs the 5-counter surface under the AMEND-A2 tri-
-// group prefix structure:
+// newFilterStats constructs the 18-counter surface under the AMEND-A2 tri-
+// group prefix structure (the 5 origin 25.1 counters shown below, plus the
+// 25.2 +9 and 25.3 +4 extensions registered in the same constructor):
 //
 //   - Group B (shared per-runtime; runtime = "wazero" uniformly at 25.1):
 //     `wasm.wazero.created` + `wasm.wazero.active`. Registered via
@@ -344,10 +420,16 @@ type filterStats struct {
 // shared Group-B + 3 envoy-go-strict per-plugin). The project-wide stat-count
 // delta was 114 → 119.
 //
-// Cardinality at 25.2 phase-done (this Task 17 + Task 16 wiring): exactly 14
+// Cardinality at 25.2 phase-done (Task 17 + Task 16 wiring): exactly 14
 // stats per plugin instance — 2 shared Group-B + 12 envoy-go-strict per-plugin
 // (3 from 25.1 + 9 NEW per 25.2 SPEC §7.1 + AMEND-B3). The project-wide
-// stat-count delta is 119 → 128 (+9 per fresh-registry call; verified at
+// stat-count delta is 119 → 128 (+9 per fresh-registry call).
+//
+// Cardinality at 25.3 Task 8 phase-done (this Task 8): exactly 18 stats per
+// plugin instance — 2 shared Group-B + 16 envoy-go-strict per-plugin (12 from
+// 25.2 + 4 NEW per AMEND-C3/C4: vm_reload_success + vm_reload_runtime_failure
+// + vm_reload_backoff + env_vars_cap_exceeded). The project-wide stat-count
+// delta is 128 → 132 (+4 per fresh-registry call; verified at
 // TestNewFilterStats_ProjectStatCountDelta in wasm_test.go).
 func newFilterStats(reg *stats.Registry, pluginName string) *filterStats {
 	if reg == nil {
@@ -360,26 +442,47 @@ func newFilterStats(reg *stats.Registry, pluginName string) *filterStats {
 	active := reg.NewGaugeIfAbsent(statNameActive)
 
 	// envoy-go-strict per-plugin (`wasm.<pluginName>.*`).
+	//
+	// BUG-1 fix (phase-25.3 Task 11-fix): these per-plugin counters are
+	// registered via NewCounterIfAbsent rather than NewCounter so the
+	// registration is FREEZE-TOLERANT. The per-route HTTP filter build path
+	// (DecodeHeaders → resolveEffective → parsePerRouteWasm →
+	// buildCompiledConfig → newFilterStats) runs POST-BOOT, when the shared
+	// *stats.Registry is already frozen — NewCounter would panic via
+	// checkFrozenLocked ("stats: registry frozen: cannot register %q
+	// post-boot"). NewCounterIfAbsent is documented (registry.go) as PERMITTED
+	// post-Freeze for exactly this data-driven-per-route case; it appends under
+	// r.mu even when frozen. The per-plugin names are unique (discriminated by
+	// `<pluginName>`), so idempotent registration is harmless on the normal
+	// boot path AND safe on the post-freeze per-route path.
 	base := "wasm." + pluginName + "."
 	return &filterStats{
 		created:               created,
 		active:                active,
-		executions:            reg.NewCounter(base + statNameExecutions),
-		hostcallDenied:        reg.NewCounter(base + statNameHostcallDenied),
-		envoyGoFailures:       reg.NewCounter(base + statNameEnvoyGoFailures),
-		bodyBufferCapExceeded: reg.NewCounter(base + statNameBodyBufferCapExceeded),
+		executions:            reg.NewCounterIfAbsent(base + statNameExecutions),
+		hostcallDenied:        reg.NewCounterIfAbsent(base + statNameHostcallDenied),
+		envoyGoFailures:       reg.NewCounterIfAbsent(base + statNameEnvoyGoFailures),
+		bodyBufferCapExceeded: reg.NewCounterIfAbsent(base + statNameBodyBufferCapExceeded),
 
 		// 25.2 IMPL Task 17 — 8 NEW envoy-go-strict counters per §7.1 +
 		// AMEND-B3 (combined with bodyBufferCapExceeded above completes the
 		// 9-counter delta; project total 119 → 128 per AMEND-B3).
-		tickInvocations:                reg.NewCounter(base + statNameTickInvocations),
-		httpCallDispatched:             reg.NewCounter(base + statNameHttpCallDispatched),
-		httpCallResponse:               reg.NewCounter(base + statNameHttpCallResponse),
-		foreignFunctionDenied:          reg.NewCounter(base + statNameForeignFunctionDenied),
-		httpCallDispatchUnknownCluster: reg.NewCounter(base + statNameHttpCallDispatchUnknownCluster),
-		sharedDataCapExceeded:          reg.NewCounter(base + statNameSharedDataCapExceeded),
-		dynamicStatsCapExceeded:        reg.NewCounter(base + statNameDynamicStatsCapExceeded),
-		httpCallResponseAfterClose:     reg.NewCounter(base + statNameHttpCallResponseAfterClose),
+		tickInvocations:                reg.NewCounterIfAbsent(base + statNameTickInvocations),
+		httpCallDispatched:             reg.NewCounterIfAbsent(base + statNameHttpCallDispatched),
+		httpCallResponse:               reg.NewCounterIfAbsent(base + statNameHttpCallResponse),
+		foreignFunctionDenied:          reg.NewCounterIfAbsent(base + statNameForeignFunctionDenied),
+		httpCallDispatchUnknownCluster: reg.NewCounterIfAbsent(base + statNameHttpCallDispatchUnknownCluster),
+		sharedDataCapExceeded:          reg.NewCounterIfAbsent(base + statNameSharedDataCapExceeded),
+		dynamicStatsCapExceeded:        reg.NewCounterIfAbsent(base + statNameDynamicStatsCapExceeded),
+		httpCallResponseAfterClose:     reg.NewCounterIfAbsent(base + statNameHttpCallResponseAfterClose),
+
+		// 25.3 IMPL Task 8 — 4 NEW envoy-go-strict counters per AMEND-C3/C4
+		// (Group C: vm_reload triplet + env_vars_cap_exceeded; project total
+		// 128 → 132).
+		vmReloadSuccess:        reg.NewCounterIfAbsent(base + statNameVmReloadSuccess),
+		vmReloadRuntimeFailure: reg.NewCounterIfAbsent(base + statNameVmReloadRuntimeFailure),
+		vmReloadBackoff:        reg.NewCounterIfAbsent(base + statNameVmReloadBackoff),
+		envVarsCapExceeded:     reg.NewCounterIfAbsent(base + statNameEnvVarsCapExceeded),
 	}
 }
 
@@ -397,7 +500,7 @@ func newFilterStats(reg *stats.Registry, pluginName string) *filterStats {
 // Each wrapper guards against a nil counter field via a nil-check (per
 // ADR-0085 nil-tolerance — test-double paths may construct a partial
 // *filterStats with some counter fields unset; production wiring at
-// newFilterStats always populates all 10 fields).
+// newFilterStats always populates all 18 fields at 25.3 Task 8).
 //
 // Per 25.2 IMPL Task 20 follow-up the production wiring path is:
 //
@@ -518,8 +621,63 @@ func (fs *filterStats) EnvoyGoFailuresInc() {
 	fs.envoyGoFailures.Inc()
 }
 
+// -----------------------------------------------------------------------------
+// 25.3 IMPL Task 8 — 4 NEW Inc methods (Group C: vm_reload triplet +
+// env_vars_cap_exceeded). The first 3 satisfy the internal/wasm.reloadStatsHook
+// interface so *filterStats can be passed via WithReloadStats(cfg.stats) to
+// wire the reload state machine counters. All follow the ADR-0085 nil-
+// tolerance pattern.
+// -----------------------------------------------------------------------------
+
+// VmReloadSuccessInc increments the vm_reload_success counter per phase-25.3
+// AMEND-C3. Wired via WithReloadStats into the reload state machine's
+// Running ← Failed success branch (dispatchReload in root_vm.go).
+func (fs *filterStats) VmReloadSuccessInc() {
+	if fs == nil || fs.vmReloadSuccess == nil {
+		return
+	}
+	fs.vmReloadSuccess.Inc()
+}
+
+// VmReloadRuntimeFailureInc increments the vm_reload_runtime_failure counter
+// per phase-25.3 AMEND-C3. Wired via WithReloadStats into the reload state
+// machine's re-instantiation-failed branch (dispatchReload in root_vm.go).
+func (fs *filterStats) VmReloadRuntimeFailureInc() {
+	if fs == nil || fs.vmReloadRuntimeFailure == nil {
+		return
+	}
+	fs.vmReloadRuntimeFailure.Inc()
+}
+
+// VmReloadBackoffInc increments the vm_reload_backoff counter per phase-25.3
+// AMEND-C3. Wired via WithReloadStats into the reload state machine's
+// dispatch-blocked-by-backoff path (dispatchReload in root_vm.go).
+func (fs *filterStats) VmReloadBackoffInc() {
+	if fs == nil || fs.vmReloadBackoff == nil {
+		return
+	}
+	fs.vmReloadBackoff.Inc()
+}
+
+// EnvVarsCapExceededInc increments the env_vars_cap_exceeded counter per
+// phase-25.3 AMEND-C4. Intended for the arm-C cap-reject path in
+// compiled_config.go; see ordering note at the parseEnvVars call site (the
+// stats object is not yet constructed at arm-C check time, so this increment
+// is a documented limitation on that path). Available for future call sites
+// where stats are live.
+func (fs *filterStats) EnvVarsCapExceededInc() {
+	if fs == nil || fs.envVarsCapExceeded == nil {
+		return
+	}
+	fs.envVarsCapExceeded.Inc()
+}
+
 // Compile-time guard: *filterStats satisfies internalwasm.RootStatsRecorder.
 // Surfaces a build error immediately if the interface roster drifts or if
-// any of the 10 wrapper methods are renamed without coordinating with the
-// interface declaration in internal/wasm/stats_recorder.go.
+// any of the 10 RootStatsRecorder wrapper methods are renamed without
+// coordinating with the interface declaration in
+// internal/wasm/stats_recorder.go. (The 25.3 vm_reload_* triplet +
+// env_vars_cap_exceeded wrappers are filter-package-only — they do NOT flow
+// through the RootStatsRecorder interface, so the interface roster stays at
+// 10 methods.)
 var _ internalwasm.RootStatsRecorder = (*filterStats)(nil)

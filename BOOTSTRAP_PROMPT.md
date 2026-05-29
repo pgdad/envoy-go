@@ -348,7 +348,7 @@ Separate from the differential harness. These test absolute protocol correctness
 - `test/conformance/h2spec/` — runs once HTTP/2 lands; pass threshold is a phase gate.
 - `test/conformance/h3spec/` — runs once HTTP/3 lands.
 - `test/conformance/grpc/` — gRPC interop client.
-- `test/conformance/proxy-wasm/` — proxy-wasm ABI conformance once the WASM host lands.
+- `test/conformance/proxy-wasm/` — proxy-wasm ABI conformance once the WASM host lands. SEEDED at phase 25.3 (in-process `go test` over vendored `.wasm`; NO Docker/Rust-in-CI). **10 of the 16** `proxy-wasm-cpp-host@da3ce05d` unit-test families are PORTED (logging, stop_iteration, shared_data, endianness, exports, security, runtime, wasm_vm, bytecode_util, pairs_util; 62.5% threshold; phase-done gate = all 10 PASS). **6 families DEFERRED** as forward-pointers to a future §9 WASM-host phase: **shared_queue** (WasmService cross-VM queues + `proxy_on_queue_ready`), **signature_util** (Ed25519 signed/remote code fetch), **wasm** (thread-local WasmHandle TLS-cache + canary; presupposes the WasmService singleton model), **vm_id_handle** (cross-VM scoping substrate), **null_vm** (compiled-in NullVM engine — N/A for a Go host), **fuzz** (libFuzzer harnesses — covered by envoy-go's own Go fuzzers). Re-evaluated when the WasmService singleton / cross-VM-queue substrate lands.
 
 ### 7.4 Negative and fuzz testing
 

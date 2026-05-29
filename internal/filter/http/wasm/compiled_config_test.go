@@ -53,14 +53,17 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	wasmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/wasm/v3"
 	wasmcommonv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/wasm/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/stats"
 	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
 )
 
@@ -127,16 +130,15 @@ func TestParseRejectConstants_ByteStable(t *testing.T) {
 		{"Arm06_VmConfigCodeRemoteDeferred", parseRejectVmConfigCodeRemoteDeferred, "wasm: config.vm_config.code.remote is not yet supported (lands in a future Runtime/RTDS family phase)"},
 		{"Arm07_DataSourceWatchedDirectoryDeferred", parseRejectDataSourceWatchedDirectoryDeferred, "wasm: config.vm_config.code.local.watched_directory is not yet supported (lands in a future Runtime/hot-reload phase)"},
 		{"Arm08_DataSourceSpecifierRequired", parseRejectDataSourceSpecifierRequired, "wasm: config.vm_config.code.local: specifier oneof required"},
-		{"Arm09_PluginFailurePolicyFailReloadDeferred", parseRejectPluginFailurePolicyFailReloadDeferred, "wasm: config.failure_policy = FAIL_RELOAD (or reload_config set) is not yet supported (lands in phase 25.3)"},
-		{"Arm10_PluginFailOpenDeferred", parseRejectPluginFailOpenDeferred, "wasm: config.fail_open is not yet supported (deprecated upstream; lands in phase 25.3 via failure_policy = FAIL_OPEN)"},
+		// Arms 9, 10, 12, 13, 18 LIFTED at phase-25.3 Task 7 (failure_policy /
+		// reload_config / fail_open / environment_variables / per-route now
+		// CONSUMED); their deferral constants are RETIRED + dropped from the
+		// roster. The residual rejects on those surfaces are the NEW arms A/B/C.
 		{"Arm11_VmConfigRuntimeDiscriminator", parseRejectVmConfigRuntimeDiscriminator, "wasm: config.vm_config.runtime %q is not supported (envoy-go uses wazero exclusively; envoy-go-strict departure)"},
-		{"Arm12_VmConfigVmIdDuplicate", parseRejectVmConfigVmIdDuplicate, "wasm: config.vm_config.vm_id %q is duplicated across PluginConfig entries (multi-plugin VM-sharing lands in phase 25.3)"},
-		{"Arm13_VmConfigEnvironmentVariablesDeferred", parseRejectVmConfigEnvironmentVariablesDeferred, "wasm: config.vm_config.environment_variables is not yet supported (lands in phase 25.3)"},
 		{"Arm14_VmConfigAllowPrecompiledRejected", parseRejectVmConfigAllowPrecompiledRejected, "wasm: config.vm_config.allow_precompiled is not supported (incompatible with wazero interpreter-default; envoy-go-strict departure)"},
 		{"Arm15_VmConfigNackOnCodeCacheMissRejected", parseRejectVmConfigNackOnCodeCacheMissRejected, "wasm: config.vm_config.nack_on_code_cache_miss is not supported (paired with code.remote; envoy-go-strict departure)"},
 		{"Arm16_ModuleAbiVersionRejected", parseRejectModuleAbiVersionRejected, "wasm: module: required proxy_abi_version_0_2_1 export not found (envoy-go-strict targets ABI v0.2.1 only; v0.1.0 + v0.2.0 + missing sentinel rejected)"},
 		{"Arm17_ModuleCompileFailed", parseRejectModuleCompileFailed, "wasm: config.vm_config.code: compile: %w"},
-		{"Arm18_PerRouteDeferredTo253", parseRejectPerRouteDeferredTo253, "wasm: per-route configuration is not yet supported (lands in phase 25.3)"},
 
 		// 25.2 NEW arms 19-23 + 26 per D-25.2-P5 closure at Task 14.
 		{"Arm19_EnvoyGoStrictBodyBufferCapBytesZero", parseRejectEnvoyGoStrictBodyBufferCapBytesZero, "wasm: config.envoy_go_strict_body_buffer_cap_bytes must be > 0 (envoy-go-strict)"},
@@ -145,10 +147,17 @@ func TestParseRejectConstants_ByteStable(t *testing.T) {
 		{"Arm22_EnvoyGoStrictDynamicStatsMaxEntriesZero", parseRejectEnvoyGoStrictDynamicStatsMaxEntriesZero, "wasm: config.envoy_go_strict_dynamic_stats_max_entries must be > 0 (envoy-go-strict)"},
 		{"Arm23_EnvoyGoStrictBodyBufferCapBytesOverlarge", parseRejectEnvoyGoStrictBodyBufferCapBytesOverlarge, "wasm: config.envoy_go_strict_body_buffer_cap_bytes %d exceeds 1 GiB ceiling (envoy-go-strict)"},
 		{"Arm26_CrossPluginConfigDuplicatePluginConfigName", parseRejectCrossPluginConfigDuplicatePluginConfigName, "wasm: config.name %q is duplicated across PluginConfig entries (per-plugin stat-scope uniqueness; envoy-go-strict)"},
+
+		// 25.3 NEW arms A/B/C per D-25.3-P2 closure at Task 7.
+		{"ArmA_EnvVarsKeyCollision", parseRejectEnvVarsKeyCollision, "wasm: config.vm_config.environment_variables: key %q is duplicated across host_env_keys and key_values (all keys must be unique)"},
+		{"ArmB_FailOpenAndFailurePolicyBothSet", parseRejectFailOpenAndFailurePolicyBothSet, "wasm: only one of config.fail_open or config.failure_policy can be set"},
+		{"ArmC_EnvVarsCapExceeded", parseRejectEnvVarsCapExceeded, "wasm: config.vm_config.environment_variables exceeds the envoy-go-strict cap (max 64 entries, max 4096 bytes per value)"},
 	}
 
-	if len(cases) != 24 {
-		t.Fatalf("TestParseRejectConstants_ByteStable: expected 24 rows (18 from 25.1 + 6 from 25.2); got %d", len(cases))
+	// Roster size: 24 (18 from 25.1 + 6 from 25.2) − 5 LIFTED (arms 9, 10, 12,
+	// 13, 18) + 3 NEW 25.3 arms (A, B, C) = 22.
+	if len(cases) != 22 {
+		t.Fatalf("TestParseRejectConstants_ByteStable: expected 22 rows (24 − 5 lifted at 25.3 Task 7 + 3 NEW arms A/B/C); got %d", len(cases))
 	}
 
 	for _, tc := range cases {
@@ -209,16 +218,70 @@ func TestEnvoyGoStrictDefaults_ByteStable(t *testing.T) {
 	}
 }
 
-// TestParseRejectArm18_AliasedFromWasmGo verifies that the shared arm-18
-// constant declared in compiled_config.go is the SAME byte-string as the
-// one already consumed by validatePerRouteWasm in wasm.go (Task 8). If the
-// Task 8 implementer used a DIFFERENT constant name (parseRejectPerRouteUnsupported),
-// the body of validatePerRouteWasm must continue to return the SAME byte-
-// string — this test pins that invariant.
-func TestParseRejectArm18_AliasedFromWasmGo(t *testing.T) {
-	if parseRejectPerRouteDeferredTo253 != parseRejectPerRouteUnsupported {
-		t.Fatalf("parseRejectPerRouteDeferredTo253 = %q must equal parseRejectPerRouteUnsupported = %q (single source of truth for arm 18)", parseRejectPerRouteDeferredTo253, parseRejectPerRouteUnsupported)
-	}
+// TestValidatePerRouteWasm_LiftedArm18 verifies that arm 18 is LIFTED at
+// phase-25.3 Task 7: validatePerRouteWasm now validates the per-route Wasm
+// shape (a valid per-route override ACCEPTS; an invalid one rejects with the
+// SAME byte-stable buildCompiledConfig wording — single source of truth).
+// The old "per-route not yet supported" deferral wording is RETIRED.
+func TestValidatePerRouteWasm_LiftedArm18(t *testing.T) {
+	t.Run("invalid_missing_config_delegates_arm3", func(t *testing.T) {
+		// A *wasmv3.Wasm with Config=nil must reject with arm-3 wording,
+		// proving the validate-only delegation to buildCompiledConfig.
+		err := validatePerRouteWasm(&wasmv3.Wasm{Config: nil})
+		if err == nil {
+			t.Fatal("validatePerRouteWasm(invalid) returned nil; want arm-3 PARSE-REJECT")
+		}
+		if err.Error() != parseRejectConfigRequired {
+			t.Fatalf("validatePerRouteWasm err = %q; want %q (arm-3, single source of truth)", err.Error(), parseRejectConfigRequired)
+		}
+	})
+
+	t.Run("valid_shape_accepts_and_does_not_leak", func(t *testing.T) {
+		// A valid per-route Wasm (real bytecode) must ACCEPT (nil error) +
+		// must NOT acquire a registry refcount NOR claim the plugin name (so a
+		// second validation of the SAME name does not arm-26-FALSE-reject).
+		modBytes := buildContinueProxyWasm()
+		name := "perroute_validate_only_plugin"
+		w := &wasmv3.Wasm{
+			Config: &wasmcommonv3.PluginConfig{
+				Name: name,
+				Vm: &wasmcommonv3.PluginConfig_VmConfig{
+					VmConfig: &wasmcommonv3.VmConfig{
+						VmId:    "perroute_validate_vm",
+						Runtime: "envoy.wasm.runtime.wazero",
+						Code: &corev3.AsyncDataSource{
+							Specifier: &corev3.AsyncDataSource_Local{
+								Local: &corev3.DataSource{
+									Specifier: &corev3.DataSource_InlineBytes{InlineBytes: modBytes},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		if err := validatePerRouteWasm(w); err != nil {
+			t.Fatalf("validatePerRouteWasm(valid) = %v; want nil (lifted arm 18 accepts valid shape)", err)
+		}
+		// Re-validate the SAME name: must still ACCEPT (no arm-26 claim leaked).
+		// A build-then-discard validator would have claimed `name` in the
+		// process-wide append-only registry on the first call; the second call
+		// would then arm-26-FALSE-reject. validate-only skips the claim, so the
+		// second call accepts — this is the load-bearing leak-avoidance check.
+		if err := validatePerRouteWasm(w); err != nil {
+			t.Fatalf("validatePerRouteWasm(valid, 2nd time same name) = %v; want nil (validate-only must NOT claim the plugin name)", err)
+		}
+	})
+
+	t.Run("wrong_proto_type", func(t *testing.T) {
+		err := validatePerRouteWasm(nil)
+		if err == nil {
+			t.Fatal("validatePerRouteWasm(nil) returned nil; want type-assert error")
+		}
+		if !strings.Contains(err.Error(), "expected *wasmv3.Wasm") {
+			t.Fatalf("validatePerRouteWasm(nil) err = %q; want type-mismatch wording", err.Error())
+		}
+	})
 }
 
 // -----------------------------------------------------------------------------
@@ -359,35 +422,42 @@ func testBuildCompiledConfigParseReject(t *testing.T) {
 			},
 			wantErrEq: parseRejectDataSourceSpecifierRequired,
 		},
-		// ---- Arm 9: failure_policy = FAIL_RELOAD deferred ----
+		// ---- Arm 9 LIFTED: failure_policy = FAIL_RELOAD now CONSUMED ----
+		// The config is otherwise valid, so it flows THROUGH to arm-17
+		// (compile-failed) since the InlineString is not valid wasm. (The
+		// FAIL_RELOAD → wasm.FailurePolicyFailReload mapping itself is covered
+		// by TestFailurePolicy_Mapping.)
 		{
-			name: "Arm09_FailurePolicy_FailReload_Deferred",
+			name: "Arm09_FailurePolicy_FailReload_Consumed",
 			typedConfig: func(t *testing.T) *anypb.Any {
 				m := validWasmConfig()
+				m.Config.Name = "Arm09_FailurePolicy_FailReload_Consumed"
 				m.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_RELOAD
 				return toAny(t, m)
 			},
-			wantErrEq: parseRejectPluginFailurePolicyFailReloadDeferred,
+			wantErrHasPrefix: "wasm: config.vm_config.code: compile: ",
 		},
-		// ---- Arm 9 variant: reload_config set (independent trigger) ----
+		// ---- Arm 9 variant LIFTED: reload_config set now CONSUMED ----
 		{
-			name: "Arm09_ReloadConfig_Set_Deferred",
+			name: "Arm09_ReloadConfig_Set_Consumed",
 			typedConfig: func(t *testing.T) *anypb.Any {
 				m := validWasmConfig()
+				m.Config.Name = "Arm09_ReloadConfig_Set_Consumed"
 				m.Config.ReloadConfig = &wasmcommonv3.ReloadConfig{}
 				return toAny(t, m)
 			},
-			wantErrEq: parseRejectPluginFailurePolicyFailReloadDeferred,
+			wantErrHasPrefix: "wasm: config.vm_config.code: compile: ",
 		},
-		// ---- Arm 10: fail_open deferred ----
+		// ---- Arm 10 LIFTED: fail_open now CONSUMED (→ FAIL_OPEN) ----
 		{
-			name: "Arm10_FailOpen_Deferred",
+			name: "Arm10_FailOpen_Consumed",
 			typedConfig: func(t *testing.T) *anypb.Any {
 				m := validWasmConfig()
-				m.Config.FailOpen = true //nolint:staticcheck // SA1019: arm 10 EXISTS to PARSE-REJECT this deprecated proto field; intentional access.
+				m.Config.Name = "Arm10_FailOpen_Consumed"
+				m.Config.FailOpen = true //nolint:staticcheck // SA1019: fail_open is deprecated but envoy-go still PARSES it (→ FAIL_OPEN) per AMEND-C3.
 				return toAny(t, m)
 			},
-			wantErrEq: parseRejectPluginFailOpenDeferred,
+			wantErrHasPrefix: "wasm: config.vm_config.code: compile: ",
 		},
 		// ---- Arm 11: vm_config.runtime discriminator (only wazero supported) ----
 		{
@@ -399,17 +469,23 @@ func testBuildCompiledConfigParseReject(t *testing.T) {
 			},
 			wantErrContains: `"envoy.wasm.runtime.v8"`,
 		},
-		// ---- Arm 13: vm_config.environment_variables deferred ----
+		// ---- Arm 13 LIFTED: environment_variables now CONSUMED ----
+		// A well-formed (non-colliding, under-cap) env block is assembled +
+		// fed to the RootVM; the config then flows THROUGH to arm-17 since the
+		// InlineString is not valid wasm. (Collision + cap rejects are covered
+		// by TestParse_EnvVarsCollisionReject + TestParse_EnvVarsCapExceededReject.)
 		{
-			name: "Arm13_EnvironmentVariables_Deferred",
+			name: "Arm13_EnvironmentVariables_Consumed",
 			typedConfig: func(t *testing.T) *anypb.Any {
 				m := validWasmConfig()
+				m.Config.Name = "Arm13_EnvironmentVariables_Consumed"
 				m.Config.GetVmConfig().EnvironmentVariables = &wasmcommonv3.EnvironmentVariables{
 					HostEnvKeys: []string{"PATH"},
+					KeyValues:   map[string]string{"GUEST_KEY": "guest_value"},
 				}
 				return toAny(t, m)
 			},
-			wantErrEq: parseRejectVmConfigEnvironmentVariablesDeferred,
+			wantErrHasPrefix: "wasm: config.vm_config.code: compile: ",
 		},
 		// ---- Arm 14: vm_config.allow_precompiled rejected ----
 		{
@@ -599,19 +675,254 @@ func TestRootContextIDCounter_Concurrent(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Arm-12 unreachability documentation.
+// Arm-12 RETIRED → multi-plugin VM-sharing (phase-25.3 Task 7).
 // -----------------------------------------------------------------------------
 
-// TestParseRejectArm12_UnreachableByDesignAt251 documents the arm-12
-// "unreachable-by-design at 25.1" disposition. The constant exists +
-// is byte-stable (asserted by TestParseRejectConstants_ByteStable), but
-// there is no production trigger path in buildCompiledConfig at the
-// single-plugin-per-listener model. Phase 25.3 wires the multi-plugin
-// VM-sharing registry that activates this arm. The test merely asserts
-// the constant is non-empty so any future deletion surfaces here.
-func TestParseRejectArm12_UnreachableByDesignAt251(t *testing.T) {
-	if parseRejectVmConfigVmIdDuplicate == "" {
-		t.Fatal("parseRejectVmConfigVmIdDuplicate is empty; constant MUST exist (reserved for 25.3 multi-plugin VM-sharing registry)")
+// TestMultiPlugin_SameVmIdSharesRootVM verifies the arm-12 INVERSION: two
+// compiledConfigs with the SAME (vm_id, vm_configuration, code) no longer
+// reject — they SHARE one *RootVM via the registry refcount (AMEND-C2). Asserts
+// pointer identity of the shared *RootVM + that the second build did NOT
+// construct a fresh VM.
+func TestMultiPlugin_SameVmIdSharesRootVM(t *testing.T) {
+	modBytes := buildContinueProxyWasm()
+	reg := stats.NewRegistry()
+
+	// Two DISTINCT plugin names (arm 26 keys off name, not vm_id) but the SAME
+	// vm_id + code → same composite VM key → shared *RootVM.
+	cc1 := newTestCompiledConfigVmId(t, modBytes, "share_plugin_A", "shared_vm_id", reg)
+	cc2 := newTestCompiledConfigVmId(t, modBytes, "share_plugin_B", "shared_vm_id", reg)
+	t.Cleanup(func() {
+		_ = cc1.Close()
+		_ = cc2.Close()
+	})
+
+	if cc1.rootVM == nil || cc2.rootVM == nil {
+		t.Fatal("both compiledConfigs must have a non-nil rootVM")
+	}
+	if cc1.rootVM != cc2.rootVM {
+		t.Fatal("same (vm_id, vm_configuration, code) must SHARE one *RootVM (arm-12 INVERSION)")
+	}
+	if cc1.vmKey != cc2.vmKey {
+		t.Fatalf("shared configs must carry the same vmKey; got %q vs %q", cc1.vmKey, cc2.vmKey)
+	}
+	if cc1.rootCB != cc2.rootCB {
+		t.Fatal("shared configs must reference the SAME rootABICallbacks multiplexer (per-RootVM)")
+	}
+}
+
+// TestMultiPlugin_DistinctVmIdDistinctRootVM is the negation: distinct vm_ids
+// (otherwise identical config) get DISTINCT *RootVMs (the key differs by vm_id).
+func TestMultiPlugin_DistinctVmIdDistinctRootVM(t *testing.T) {
+	modBytes := buildContinueProxyWasm()
+	reg := stats.NewRegistry()
+
+	cc1 := newTestCompiledConfigVmId(t, modBytes, "distinct_plugin_A", "vm_id_one", reg)
+	cc2 := newTestCompiledConfigVmId(t, modBytes, "distinct_plugin_B", "vm_id_two", reg)
+	t.Cleanup(func() {
+		_ = cc1.Close()
+		_ = cc2.Close()
+	})
+
+	if cc1.rootVM == cc2.rootVM {
+		t.Fatal("distinct vm_ids must get distinct *RootVMs")
+	}
+	if cc1.vmKey == cc2.vmKey {
+		t.Fatal("distinct vm_ids must produce distinct vmKeys")
+	}
+}
+
+// newTestCompiledConfigVmId builds a *compiledConfig with an explicit vm_id +
+// plugin name + InlineBytes module (mirrors newTestCompiledConfig but exposes
+// vm_id for the VM-sharing tests).
+func newTestCompiledConfigVmId(t *testing.T, modBytes []byte, pluginName, vmID string, reg *stats.Registry) *compiledConfig {
+	t.Helper()
+	cfg := &wasmv3.Wasm{
+		Config: &wasmcommonv3.PluginConfig{
+			Name:   pluginName,
+			RootId: "test_root",
+			Vm: &wasmcommonv3.PluginConfig_VmConfig{
+				VmConfig: &wasmcommonv3.VmConfig{
+					VmId:    vmID,
+					Runtime: "envoy.wasm.runtime.wazero",
+					Code: &corev3.AsyncDataSource{
+						Specifier: &corev3.AsyncDataSource_Local{
+							Local: &corev3.DataSource{
+								Specifier: &corev3.DataSource_InlineBytes{InlineBytes: modBytes},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	cc, err := buildCompiledConfig(context.Background(), toAny(t, cfg), envoyhttp.FactoryCtx{Stats: reg})
+	if err != nil {
+		t.Fatalf("buildCompiledConfig(vm_id=%q): %v", vmID, err)
+	}
+	return cc
+}
+
+// -----------------------------------------------------------------------------
+// phase-25.3 Task 7: failure_policy / reload_config / fail_open + env_vars.
+// -----------------------------------------------------------------------------
+
+// TestFailurePolicy_Mapping verifies the proto FailurePolicy → wasm.FailurePolicy
+// mapping (UNSPECIFIED → FailClosed default; FAIL_RELOAD; FAIL_CLOSED; FAIL_OPEN)
+// + the reload base interval parse from reload_config.backoff.base_interval.
+func TestFailurePolicy_Mapping(t *testing.T) {
+	cases := []struct {
+		name       string
+		proto      wasmcommonv3.FailurePolicy
+		wantPolicy internalwasm.FailurePolicy
+	}{
+		{"unspecified_defaults_failclosed", wasmcommonv3.FailurePolicy_UNSPECIFIED, internalwasm.FailurePolicyFailClosed},
+		{"fail_reload", wasmcommonv3.FailurePolicy_FAIL_RELOAD, internalwasm.FailurePolicyFailReload},
+		{"fail_closed", wasmcommonv3.FailurePolicy_FAIL_CLOSED, internalwasm.FailurePolicyFailClosed},
+		{"fail_open", wasmcommonv3.FailurePolicy_FAIL_OPEN, internalwasm.FailurePolicyFailOpen},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			pc := &wasmcommonv3.PluginConfig{FailurePolicy: tc.proto}
+			got, base, err := parseFailurePolicy(pc)
+			if err != nil {
+				t.Fatalf("parseFailurePolicy: unexpected error: %v", err)
+			}
+			if got != tc.wantPolicy {
+				t.Fatalf("policy = %v; want %v", got, tc.wantPolicy)
+			}
+			if base != 0 {
+				t.Fatalf("base interval = %v; want 0 (no reload_config)", base)
+			}
+		})
+	}
+
+	t.Run("reload_config_base_interval_parsed", func(t *testing.T) {
+		pc := &wasmcommonv3.PluginConfig{
+			FailurePolicy: wasmcommonv3.FailurePolicy_FAIL_RELOAD,
+			ReloadConfig: &wasmcommonv3.ReloadConfig{
+				Backoff: &corev3.BackoffStrategy{
+					BaseInterval: durationpb.New(250 * time.Millisecond),
+				},
+			},
+		}
+		got, base, err := parseFailurePolicy(pc)
+		if err != nil {
+			t.Fatalf("parseFailurePolicy: unexpected error: %v", err)
+		}
+		if got != internalwasm.FailurePolicyFailReload {
+			t.Fatalf("policy = %v; want FailReload", got)
+		}
+		if base != 250*time.Millisecond {
+			t.Fatalf("base interval = %v; want 250ms", base)
+		}
+	})
+}
+
+// TestFailOpen_MapsToFailOpen verifies the deprecated fail_open knob maps to
+// FailurePolicyFailOpen (when failure_policy is UNSPECIFIED).
+func TestFailOpen_MapsToFailOpen(t *testing.T) {
+	pc := &wasmcommonv3.PluginConfig{
+		FailOpen: true, //nolint:staticcheck // SA1019: fail_open deprecated but PARSED per AMEND-C3.
+	}
+	got, _, err := parseFailurePolicy(pc)
+	if err != nil {
+		t.Fatalf("parseFailurePolicy: unexpected error: %v", err)
+	}
+	if got != internalwasm.FailurePolicyFailOpen {
+		t.Fatalf("policy = %v; want FailOpen (fail_open=true)", got)
+	}
+}
+
+// TestFailurePolicy_FailOpenAndFailurePolicyBothSet_Reject verifies the NEW
+// arm B mutual-exclusivity reject: fail_open AND failure_policy both set.
+func TestFailurePolicy_FailOpenAndFailurePolicyBothSet_Reject(t *testing.T) {
+	pc := &wasmcommonv3.PluginConfig{
+		FailOpen:      true, //nolint:staticcheck // SA1019: deprecated; arm B asserts the both-set reject.
+		FailurePolicy: wasmcommonv3.FailurePolicy_FAIL_CLOSED,
+	}
+	_, _, err := parseFailurePolicy(pc)
+	if err == nil {
+		t.Fatal("parseFailurePolicy(both set) = nil; want arm-B PARSE-REJECT")
+	}
+	if err.Error() != parseRejectFailOpenAndFailurePolicyBothSet {
+		t.Fatalf("err = %q; want %q (arm B)", err.Error(), parseRejectFailOpenAndFailurePolicyBothSet)
+	}
+
+	// End-to-end through buildCompiledConfig: the both-set config must reject
+	// with arm-B wording (fires BEFORE the compile/arm-17 flow-through).
+	m := validWasmConfig()
+	m.Config.FailOpen = true //nolint:staticcheck // SA1019: deprecated; arm B both-set reject.
+	m.Config.FailurePolicy = wasmcommonv3.FailurePolicy_FAIL_CLOSED
+	_, err = buildCompiledConfig(context.Background(), toAny(t, m), envoyhttp.FactoryCtx{})
+	if err == nil {
+		t.Fatal("buildCompiledConfig(both set) = nil; want arm-B PARSE-REJECT")
+	}
+	if err.Error() != parseRejectFailOpenAndFailurePolicyBothSet {
+		t.Fatalf("buildCompiledConfig err = %q; want %q (arm B)", err.Error(), parseRejectFailOpenAndFailurePolicyBothSet)
+	}
+}
+
+// TestParse_EnvVarsCollisionReject verifies the NEW arm A: a key present in
+// BOTH host_env_keys AND key_values rejects with the %q-formatted arm-A wording.
+func TestParse_EnvVarsCollisionReject(t *testing.T) {
+	ev := &wasmcommonv3.EnvironmentVariables{
+		HostEnvKeys: []string{"DUPED_KEY"},
+		KeyValues:   map[string]string{"DUPED_KEY": "v"},
+	}
+	_, err := parseEnvVars(ev)
+	if err == nil {
+		t.Fatal("parseEnvVars(collision) = nil; want arm-A PARSE-REJECT")
+	}
+	want := fmt.Sprintf(parseRejectEnvVarsKeyCollision, "DUPED_KEY")
+	if err.Error() != want {
+		t.Fatalf("err = %q; want %q (arm A)", err.Error(), want)
+	}
+
+	// End-to-end through buildCompiledConfig.
+	m := validWasmConfig()
+	m.Config.GetVmConfig().EnvironmentVariables = ev
+	_, err = buildCompiledConfig(context.Background(), toAny(t, m), envoyhttp.FactoryCtx{})
+	if err == nil || err.Error() != want {
+		t.Fatalf("buildCompiledConfig env-collision err = %v; want %q (arm A)", err, want)
+	}
+}
+
+// TestParse_EnvVarsCapExceededReject verifies the NEW arm C: an env block
+// exceeding the envoy-go-strict entry cap (65 > 64) rejects with arm-C wording.
+func TestParse_EnvVarsCapExceededReject(t *testing.T) {
+	kv := make(map[string]string, 65)
+	for i := 0; i < 65; i++ {
+		kv[fmt.Sprintf("K%d", i)] = "v"
+	}
+	ev := &wasmcommonv3.EnvironmentVariables{KeyValues: kv}
+	_, err := parseEnvVars(ev)
+	if err == nil {
+		t.Fatal("parseEnvVars(cap exceeded) = nil; want arm-C PARSE-REJECT")
+	}
+	if err.Error() != parseRejectEnvVarsCapExceeded {
+		t.Fatalf("err = %q; want %q (arm C)", err.Error(), parseRejectEnvVarsCapExceeded)
+	}
+}
+
+// TestParse_EnvVarsValid_Consumed verifies a well-formed env block assembles
+// successfully (the consumed/happy path of arm 13 LIFTED).
+func TestParse_EnvVarsValid_Consumed(t *testing.T) {
+	ev := &wasmcommonv3.EnvironmentVariables{
+		KeyValues: map[string]string{"A": "1", "B": "2"},
+	}
+	got, err := parseEnvVars(ev)
+	if err != nil {
+		t.Fatalf("parseEnvVars(valid): unexpected error: %v", err)
+	}
+	if got["A"] != "1" || got["B"] != "2" {
+		t.Fatalf("assembled env = %v; want A=1 B=2", got)
+	}
+
+	// Nil env block → nil map, no error.
+	gotNil, err := parseEnvVars(nil)
+	if err != nil || gotNil != nil {
+		t.Fatalf("parseEnvVars(nil) = (%v, %v); want (nil, nil)", gotNil, err)
 	}
 }
 

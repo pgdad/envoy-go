@@ -730,6 +730,54 @@ var contextCreateTrapsModule = buildModule(
 	}),
 )
 
+// --- Fixture: requestHeadersTrapsModule -----------------------------------
+//
+// Exports proxy_on_request_headers(ctx_id, num_headers, eos) -> i32 whose
+// body is a single `unreachable` (a wazero trap) — modeling a guest panic
+// (e.g. a Rust panic! that aborts to `unreachable`). The teardown triplet
+// (proxy_on_done -> i32, proxy_on_log -> (), proxy_on_delete -> ()) ALSO
+// traps, so re-entering the poisoned instance during Close cascades a second
+// trap (BUG-3). _initialize + proxy_abi_version_0_2_1 (no-op) + a 1-page
+// memory let NewRootVM instantiate + Configure cleanly; only the per-stream
+// dispatch + teardown callbacks trap.
+//
+// Used by TestStreamContext_TrapPoison_SkipsTeardown to verify that after a
+// trap, sc.trapped is set + Close SKIPS the teardown triplet (returns nil
+// instead of cascading the re-entry trap).
+var requestHeadersTrapsModule = buildModule(
+	typeSection(
+		[2][]byte{nil, nil}, // type 0: () -> ()
+		[2][]byte{{wasmTypeI32, wasmTypeI32, wasmTypeI32}, {wasmTypeI32}}, // type 1: (i32,i32,i32) -> i32  (on_request_headers)
+		[2][]byte{{wasmTypeI32}, {wasmTypeI32}},                           // type 2: (i32) -> i32          (on_done)
+		[2][]byte{{wasmTypeI32}, nil},                                     // type 3: (i32) -> ()           (on_log / on_delete)
+	),
+	// fn 0: _initialize (type 0)
+	// fn 1: proxy_abi_version_0_2_1 (type 0)
+	// fn 2: proxy_on_request_headers (type 1) — TRAPS
+	// fn 3: proxy_on_done (type 2) — TRAPS
+	// fn 4: proxy_on_log (type 3) — TRAPS
+	// fn 5: proxy_on_delete (type 3) — TRAPS
+	functionSection([]uint32{0, 0, 1, 2, 3, 3}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "_initialize", kind: wasmExtFunction, idx: 0},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_on_request_headers", kind: wasmExtFunction, idx: 2},
+		{name: "proxy_on_done", kind: wasmExtFunction, idx: 3},
+		{name: "proxy_on_log", kind: wasmExtFunction, idx: 4},
+		{name: "proxy_on_delete", kind: wasmExtFunction, idx: 5},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(),                      // _initialize
+		funcBody(),                      // proxy_abi_version_0_2_1
+		funcBody([]byte{opUnreachable}), // proxy_on_request_headers TRAPS
+		funcBody([]byte{opUnreachable}), // proxy_on_done TRAPS
+		funcBody([]byte{opUnreachable}), // proxy_on_log TRAPS
+		funcBody([]byte{opUnreachable}), // proxy_on_delete TRAPS
+	}),
+)
+
 // --- Fixture: vmStartOnlyModule -------------------------------------------
 //
 // Exports `proxy_on_vm_start(ctx_id, vm_config_size) -> i32` and a marker

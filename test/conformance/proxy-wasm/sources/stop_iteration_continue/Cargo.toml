@@ -1,0 +1,22 @@
+# Conformance family `stop_iteration` (Continue variant).
+#
+# Sibling to stop_iteration_pause: returns Action::Continue (wire value 0)
+# from proxy_on_request_headers. The harness asserts the host sees
+# abi.ProxyActionContinue from CallProxyOnRequestHeaders — proving the
+# Pause/Continue distinction is faithfully carried over the wire.
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/stop_iteration_continue.wasm.
+[package]
+name = "stop_iteration_continue"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,30 @@
+# Conformance family `pairs_util` — header-map pairs wire-format round-trip.
+#
+# Mirrors the cpp-host pairs_util_test.cc exportPairs/importPairs encoding:
+# the guest reads the FULL request-header map via get_map (the
+# proxy_get_header_map_pairs hostcall, whose host side serializes the map
+# with the count-prefixed length-delimited pairs wire format — envoy-go's
+# EncodePairs in internal/wasm/pairs.go), then writes back two response
+# headers derived from what it decoded:
+#   x-pairs-count: <number of request-header pairs the guest decoded>
+#   x-pairs-echo:  <value of the seeded "x-probe" request header>
+#
+# The harness seeds the request-header map (via the recording ABICallbacks
+# GetHeaderMap) + asserts the guest reported the correct count + echoed the
+# seeded value, proving the pairs (de)serialization is byte-faithful end to end.
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/pairs_util.wasm.
+[package]
+name = "pairs_util"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

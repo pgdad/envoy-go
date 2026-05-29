@@ -1,0 +1,30 @@
+# Conformance family `exports` — WASI exports surface (env / clock / random).
+#
+# Mirrors the cpp-host exports_test.cc WASI-shim exercise. The guest, on
+# on_vm_start, calls the three WASI exports the harness can host-observe and
+# records each result into shared-data (raw-bytes hostcall, no string coercion):
+#   "conformance-exports-env"    = std::env::var("CONFORMANCE_EXPORTS")  (environ_get / environ_sizes_get)
+#   "conformance-exports-clock"  = SystemTime::now() nanos as u64 LE     (clock_time_get)
+#   "conformance-exports-random" = 16 random bytes                        (random_get)
+#
+# The harness seeds CONFORMANCE_EXPORTS via WithRootEnv + reads shared-data via
+# RootVM.GetSharedData, asserting: the env value round-trips byte-faithfully
+# (the DETERMINISTIC observable), the clock nanos are non-zero + plausibly
+# recent, and the random buffer is the requested length + not all-zero. Proves
+# the WASI clock/random/environ exports are wired + host-observable.
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/exports.wasm.
+[package]
+name = "exports"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

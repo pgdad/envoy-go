@@ -1,0 +1,6 @@
+# Per-crate build artifacts + lockfiles are gitignored; only the vendored
+# .wasm blobs (under ../bytecode/) + the Cargo.toml / src/lib.rs sources are
+# committed. Mirrors the fixture-0036 scripts/.gitignore reproduction
+# discipline.
+*/target/
+*/Cargo.lock

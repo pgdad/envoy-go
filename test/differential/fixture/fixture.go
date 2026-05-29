@@ -472,6 +472,24 @@ const (
 	// dispatch differs structurally from 25.1 fixture-0034's
 	// headers-bridge MVP). Introduced by phase 25.2 Task 20.
 	HTTPWasmAdvanced BackendKind = 26
+	// HTTPWasmPerRoute reuses the SHARED echobackend helper at
+	// test/helpers/echobackend/cmd/echobackend/main.go for fixture
+	// 0038-http-wasm-perroute-and-multi-plugin (phase 25.3 Task 11). The
+	// echobackend reflects the request as JSON, but this fixture's
+	// cross-side assertions classify RESPONSE HEADERS the wasm guests set
+	// (x-wasm-variant on the per-route arms; x-shared on the multi-plugin
+	// arm) rather than the reflected body. A SINGLE upstream cluster
+	// (cluster_a) backs all three listeners (perroute / multiplugin /
+	// reload) per phase-22.2 REVIEW §7.4 freeTCPPort flake mitigation — so
+	// this switch-case allocates ONE backend. Because the backend is a
+	// subprocess, the runner's in-process accept counter is NOT
+	// incremented. NEW BackendKind value distinct from HTTPWasm=25 /
+	// HTTPWasmAdvanced=26 per `reference_differential_fixture_dispatch_constraint`
+	// (one fixture dir = one runner branch): fixture-0038's per-route
+	// wholesale-Wasm-override + vm_id-shared multi-plugin + FAIL_RELOAD
+	// reload topology differs structurally from 0036's 14-scenario
+	// body/advanced partition. Introduced by phase 25.3 Task 11.
+	HTTPWasmPerRoute BackendKind = 27
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

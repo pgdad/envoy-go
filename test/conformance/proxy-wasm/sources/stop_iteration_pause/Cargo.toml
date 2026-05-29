@@ -1,0 +1,22 @@
+# Conformance family `stop_iteration` (Pause variant).
+#
+# Mirrors the cpp-host stop_iteration_test.cc continue/stop behavior: the
+# guest returns Action::Pause (StopIteration, wire value 1) from
+# proxy_on_request_headers. The harness asserts CallProxyOnRequestHeaders
+# returns abi.ProxyActionPause. (The Continue variant is a sibling crate.)
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/stop_iteration_pause.wasm.
+[package]
+name = "stop_iteration_pause"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -248,18 +248,18 @@ func TestNew_WrongTypeURL_ReturnsArm2Unmarshal(t *testing.T) {
 // validatePerRouteWasm arm-18 PARSE-REJECT (Task 8 skeleton).
 // -----------------------------------------------------------------------------
 
-// TestValidatePerRouteWasm_RejectsWithArm18Wording pins the byte-stable
-// arm-18 PARSE-REJECT wording per parent §6.2 arm 18 + AMEND-A3 5th-
-// canonical REUSE-by-absence. 25.3 IMPL replaces the body with the real
-// per-route shape validator; at 25.1 ANY input rejects.
-func TestValidatePerRouteWasm_RejectsWithArm18Wording(t *testing.T) {
-	const expectedWording = "wasm: per-route configuration is not yet supported (lands in phase 25.3)"
+// TestValidatePerRouteWasm_LiftedArm18_RejectsInvalidShape verifies that the
+// phase-25.3 LIFTED arm 18 validator rejects an INVALID per-route Wasm config
+// (wrong proto type here) — the old "per-route not yet supported" deferral
+// wording is RETIRED. Valid-shape ACCEPT + leak-avoidance are covered by
+// TestValidatePerRouteWasm_LiftedArm18 (compiled_config_test.go).
+func TestValidatePerRouteWasm_LiftedArm18_RejectsInvalidShape(t *testing.T) {
 	err := validatePerRouteWasm(nil)
 	if err == nil {
-		t.Fatal("validatePerRouteWasm(nil) returned nil; want arm-18 PARSE-REJECT")
+		t.Fatal("validatePerRouteWasm(nil) returned nil; want type-assert PARSE-REJECT")
 	}
-	if err.Error() != expectedWording {
-		t.Fatalf("validatePerRouteWasm err = %q; want %q", err.Error(), expectedWording)
+	if !strings.Contains(err.Error(), "expected *wasmv3.Wasm") {
+		t.Fatalf("validatePerRouteWasm err = %q; want type-mismatch wording (arm 18 lifted)", err.Error())
 	}
 }
 
@@ -272,7 +272,7 @@ func TestValidatePerRouteWasm_RejectsWithArm18Wording(t *testing.T) {
 // the tri-group template (Group B wasm.wazero.* upstream-parity +
 // envoy-go-strict wasm.<plugin>.*). Test name kept stable across phases
 // for git-blame continuity; the 25.2 EXTENSIONS (9 NEW envoy-go-strict
-// counters) are exercised at TestNewFilterStats_AllocatesAll14Counters
+// counters) are exercised at TestNewFilterStats_AllocatesAll18Counters
 // + TestNewFilterStats_ProjectStatCountDelta below.
 func TestNewFilterStats_AllocatesFiveCounters(t *testing.T) {
 	reg := stats.NewRegistry()
@@ -317,14 +317,14 @@ func TestNewFilterStats_AllocatesFiveCounters(t *testing.T) {
 	}
 }
 
-// TestNewFilterStats_AllocatesAll14Counters verifies that newFilterStats
-// constructs ALL 14 stat fields non-nil at 25.2 phase-done (2 shared
-// Group-B + 12 envoy-go-strict per-plugin = 3 from 25.1 + 9 NEW from 25.2
-// §7.1 + AMEND-B3) + registers the 9 NEW envoy-go-strict wire names.
-// Companion to TestStatNames_Equal_Wasm_* (each constant byte-pinned
-// individually) + TestNewFilterStats_ProjectStatCountDelta (per-call
-// stat-count delta verified).
-func TestNewFilterStats_AllocatesAll14Counters(t *testing.T) {
+// TestNewFilterStats_AllocatesAll18Counters verifies that newFilterStats
+// constructs ALL 18 stat fields non-nil at 25.3 phase-done Task 8 (2 shared
+// Group-B + 16 envoy-go-strict per-plugin = 3 from 25.1 + 9 NEW from 25.2
+// §7.1 + AMEND-B3 + 4 NEW from 25.3 AMEND-C3/C4) + registers the 4 NEW
+// 25.3 envoy-go-strict wire names. Companion to TestStatNames_Equal_Wasm_*
+// (each constant byte-pinned individually) + TestNewFilterStats_ProjectStatCountDelta
+// (per-call stat-count delta verified).
+func TestNewFilterStats_AllocatesAll18Counters(t *testing.T) {
 	reg := stats.NewRegistry()
 	fs := newFilterStats(reg, "myplugin")
 	if fs == nil {
@@ -360,8 +360,21 @@ func TestNewFilterStats_AllocatesAll14Counters(t *testing.T) {
 	if fs.httpCallResponseAfterClose == nil {
 		t.Error("filterStats.httpCallResponseAfterClose is nil; want non-nil counter (Task 17, AMEND-B3)")
 	}
+	// 25.3 Task 8 Group C — vm_reload triplet + env_vars_cap_exceeded.
+	if fs.vmReloadSuccess == nil {
+		t.Error("filterStats.vmReloadSuccess is nil; want non-nil counter (Task 8, AMEND-C3)")
+	}
+	if fs.vmReloadRuntimeFailure == nil {
+		t.Error("filterStats.vmReloadRuntimeFailure is nil; want non-nil counter (Task 8, AMEND-C3)")
+	}
+	if fs.vmReloadBackoff == nil {
+		t.Error("filterStats.vmReloadBackoff is nil; want non-nil counter (Task 8, AMEND-C3)")
+	}
+	if fs.envVarsCapExceeded == nil {
+		t.Error("filterStats.envVarsCapExceeded is nil; want non-nil counter (Task 8, AMEND-C4)")
+	}
 
-	// Pin the 9 NEW envoy-go-strict wire names (full wire form for the
+	// Pin the 9 NEW 25.2 envoy-go-strict wire names (full wire form for the
 	// "myplugin" plugin discriminator).
 	want := map[string]bool{
 		"wasm.myplugin.body_buffer_cap_exceeded":           false,
@@ -373,6 +386,11 @@ func TestNewFilterStats_AllocatesAll14Counters(t *testing.T) {
 		"wasm.myplugin.shared_data_cap_exceeded":           false,
 		"wasm.myplugin.dynamic_stats_cap_exceeded":         false,
 		"wasm.myplugin.http_call_response_after_close":     false,
+		// 25.3 Task 8 Group C (4):
+		"wasm.myplugin.vm_reload_success":         false,
+		"wasm.myplugin.vm_reload_runtime_failure": false,
+		"wasm.myplugin.vm_reload_backoff":         false,
+		"wasm.myplugin.env_vars_cap_exceeded":     false,
 	}
 	reg.Walk(func(m stats.Metric) {
 		if _, ok := want[m.Name()]; ok {
@@ -381,7 +399,7 @@ func TestNewFilterStats_AllocatesAll14Counters(t *testing.T) {
 	})
 	for name, seen := range want {
 		if !seen {
-			t.Errorf("registry missing expected 25.2 stat name %q", name)
+			t.Errorf("registry missing expected stat name %q", name)
 		}
 	}
 }
@@ -396,23 +414,26 @@ func TestNewFilterStats_NilRegistry_ReturnsNil(t *testing.T) {
 	}
 }
 
-// TestNewFilterStats_ProjectStatCountDelta verifies the +14 stat-count delta
-// per call against a fresh registry at 25.2 phase-done (the 119 → 128
-// project-level delta is the sum of this +14 minus the 5 already accounted
-// at 25.1 — i.e., the per-call delta on a FRESH registry is +14 = 2 Group-B
-// (created counter + active gauge) + 12 envoy-go-strict per-plugin
+// TestNewFilterStats_ProjectStatCountDelta verifies the +18 stat-count delta
+// per call against a fresh registry at 25.3 Task 8 phase-done (the 119 → 132
+// project-level delta is the sum of this +18 minus the 5 already accounted
+// at 25.1 — i.e., the per-call delta on a FRESH registry is +18 = 2 Group-B
+// (created counter + active gauge) + 16 envoy-go-strict per-plugin
 // (executions + hostcall_denied + envoy_go.failures + body_buffer_cap_exceeded
 // + tick_invocations + http_call_dispatched + http_call_response +
 // foreign_function_denied + http_call_dispatch_unknown_cluster +
 // shared_data_cap_exceeded + dynamic_stats_cap_exceeded +
-// http_call_response_after_close)). The 25.1 +5 baseline → 25.2 +14 reflects
-// the +9 NEW envoy-go-strict counters per 25.2 SPEC §7.1 + AMEND-B3
-// (counter 14 added by AMEND-B3 over BRAINSTORM Q9's 8-counter tally).
+// http_call_response_after_close + vm_reload_success + vm_reload_runtime_failure
+// + vm_reload_backoff + env_vars_cap_exceeded)). The 25.1 +5 baseline → 25.2
+// +14 reflects the +9 NEW envoy-go-strict counters per 25.2 SPEC §7.1 +
+// AMEND-B3 (counter 14 added by AMEND-B3 over BRAINSTORM Q9's 8-counter
+// tally); the 25.3 Task 8 +4 pushes the per-call delta to +18.
 //
 // Project stat count assertion: 25.1 baseline 119 (the wasm filter accounts
 // for +5 of that) → 25.2 baseline 128 (the wasm filter accounts for +14 of
-// that, since the 25.1 +5 stays + the 25.2 +9 lands). Verified at this
-// per-call delta + at the wire-name pins above.
+// that) → 25.3 Task 8 baseline 132 (the wasm filter accounts for +18 of
+// that, since the 25.2 +14 stays + the 25.3 Task 8 +4 lands). Verified at
+// this per-call delta + at the wire-name pins above.
 func TestNewFilterStats_ProjectStatCountDelta(t *testing.T) {
 	reg := stats.NewRegistry()
 
@@ -429,34 +450,35 @@ func TestNewFilterStats_ProjectStatCountDelta(t *testing.T) {
 
 	post := 0
 	reg.Walk(func(stats.Metric) { post++ })
-	const wantDelta = 14 // 25.2 phase-done; was 5 at 25.1 — +9 from §7.1
+	const wantDelta = 18 // 25.3 Task 8 phase-done; was 14 at 25.2 — +4 from AMEND-C3/C4
 	if post-baseline != wantDelta {
-		t.Errorf("stat-count delta = %d; want +%d (25.2 per AMEND-A2 + §7.1 14-stat surface = 2 Group B + 12 envoy-go-strict per plugin)", post-baseline, wantDelta)
+		t.Errorf("stat-count delta = %d; want +%d (25.3 Task 8 per AMEND-A2 + AMEND-C3/C4 18-stat surface = 2 Group B + 16 envoy-go-strict per plugin)", post-baseline, wantDelta)
 	}
 }
 
-// TestProjectStatCount_Wasm25_2 asserts the project-level stat-count
-// contribution of the wasm filter at 25.2 phase-done is exactly 14 per
-// plugin instance (2 shared Group-B + 12 envoy-go-strict per-plugin),
-// rolling up to the 119 → 128 project total per 25.2 SPEC §7 + AMEND-B3.
-// This is the byte-exact pin for the AMEND-B3 + Q9 9-counter tally — a
+// TestProjectStatCount_Wasm25_3 asserts the project-level stat-count
+// contribution of the wasm filter at 25.3 Task 8 phase-done is exactly 18
+// per plugin instance (2 shared Group-B + 16 envoy-go-strict per-plugin),
+// rolling up to the 119 → 132 project total per 25.3 Task 8 + AMEND-C3/C4.
+// This is the byte-exact pin for the AMEND-C3/C4 4-counter tally — a
 // regression that adds/removes a counter surfaces here before propagating
 // to the project-wide BEHAVIOR_CONTRACT.md stat tally row.
-func TestProjectStatCount_Wasm25_2(t *testing.T) {
+func TestProjectStatCount_Wasm25_3(t *testing.T) {
 	reg := stats.NewRegistry()
 	_ = newFilterStats(reg, "plugin_assert")
 
-	const wantTotal = 14 // 2 Group-B + 12 envoy-go-strict per plugin
+	const wantTotal = 18 // 2 Group-B + 16 envoy-go-strict per plugin
 	got := 0
 	reg.Walk(func(stats.Metric) { got++ })
 	if got != wantTotal {
-		t.Errorf("wasm filter stat-count = %d; want %d (25.2 §7.1 9-counter delta over 25.1 5-baseline)", got, wantTotal)
+		t.Errorf("wasm filter stat-count = %d; want %d (25.3 Task 8 AMEND-C3/C4 4-counter delta over 25.2 14-baseline)", got, wantTotal)
 	}
 
-	// Also assert the 9 envoy-go-strict + 3 25.1-baseline + 2 Group-B
-	// shape — i.e., 14 = 2 + 3 + 9. A delta on any sub-group bumps the
-	// assertion-failure with a discriminating message via the wantNames
-	// table pinned below (12 envoy-go-strict per-plugin + 2 Group B).
+	// Also assert the 9 envoy-go-strict (25.2) + 4 envoy-go-strict (25.3) +
+	// 3 25.1-baseline + 2 Group-B shape — i.e., 18 = 2 + 3 + 9 + 4. A delta
+	// on any sub-group bumps the assertion-failure with a discriminating
+	// message via the wantNames table pinned below (16 envoy-go-strict
+	// per-plugin + 2 Group B).
 	wantNames := map[string]bool{
 		// Group B (2):
 		"wasm.wazero.created": false,
@@ -475,6 +497,11 @@ func TestProjectStatCount_Wasm25_2(t *testing.T) {
 		"wasm.plugin_assert.shared_data_cap_exceeded":           false,
 		"wasm.plugin_assert.dynamic_stats_cap_exceeded":         false,
 		"wasm.plugin_assert.http_call_response_after_close":     false,
+		// 25.3 Task 8 Group C — vm_reload triplet + env_vars_cap_exceeded (4):
+		"wasm.plugin_assert.vm_reload_success":         false,
+		"wasm.plugin_assert.vm_reload_runtime_failure": false,
+		"wasm.plugin_assert.vm_reload_backoff":         false,
+		"wasm.plugin_assert.env_vars_cap_exceeded":     false,
 	}
 	reg.Walk(func(m stats.Metric) {
 		if _, ok := wantNames[m.Name()]; ok {
@@ -483,7 +510,7 @@ func TestProjectStatCount_Wasm25_2(t *testing.T) {
 	})
 	for name, seen := range wantNames {
 		if !seen {
-			t.Errorf("registry missing expected stat name %q (25.2 §7.1 + AMEND-B3 14-stat surface)", name)
+			t.Errorf("registry missing expected stat name %q (25.3 Task 8 AMEND-C3/C4 18-stat surface)", name)
 		}
 	}
 }
@@ -522,6 +549,41 @@ func TestNewFilterStats_PluginNameInterpolation(t *testing.T) {
 	for name, seen := range want {
 		if !seen {
 			t.Errorf("registry missing expected stat name %q", name)
+		}
+	}
+}
+
+// TestStats_VmReloadTripletAndEnvVarsCap verifies that the 4 NEW 25.3 Task 8
+// Inc methods each increment their respective counters to exactly 1. Proves
+// the counters are allocated AND that the Inc methods are wired to the
+// correct fields (not swapped / nil-returning). Uses the findStatCounterValue
+// registry-walk helper (defined in dispatch_test.go) to read back values.
+func TestStats_VmReloadTripletAndEnvVarsCap(t *testing.T) {
+	reg := stats.NewRegistry()
+	fs := newFilterStats(reg, "reload_test")
+	if fs == nil {
+		t.Fatal("newFilterStats returned nil with non-nil registry")
+	}
+
+	fs.VmReloadSuccessInc()
+	fs.VmReloadRuntimeFailureInc()
+	fs.VmReloadBackoffInc()
+	fs.EnvVarsCapExceededInc()
+
+	type check struct {
+		name string
+		want uint64
+	}
+	checks := []check{
+		{"wasm.reload_test.vm_reload_success", 1},
+		{"wasm.reload_test.vm_reload_runtime_failure", 1},
+		{"wasm.reload_test.vm_reload_backoff", 1},
+		{"wasm.reload_test.env_vars_cap_exceeded", 1},
+	}
+	for _, c := range checks {
+		got := findStatCounterValue(reg, c.name)
+		if got != c.want {
+			t.Errorf("counter %q = %d; want %d", c.name, got, c.want)
 		}
 	}
 }

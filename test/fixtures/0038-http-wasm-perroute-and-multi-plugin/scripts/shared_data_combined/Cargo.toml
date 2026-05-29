@@ -1,0 +1,27 @@
+# Cargo manifest for shared_data_combined — fixture 0038-http-wasm-perroute-and-multi-plugin.
+#
+# Per phase 25.3 Task 11 + AMEND-A1: proxy-wasm-rust-sdk =0.2.4 (pinned
+# exact). Builds to target/wasm32-wasip1/release/shared_data_combined.wasm.
+# Vendored at ../../bytecode/shared_data_combined.wasm + consumed by BOTH
+# reference Envoy v1.37.2 (V8) AND envoy-go (wazero) via DataSource.Filename.
+# Exports proxy_abi_version_0_2_1.
+#
+# This ONE crate serves BOTH filters of the multi-plugin vm_id-shared chain
+# (the SAME .wasm — identical code — is required for the (vm_id, code,
+# vm_configuration) tuple to share a RootVM). The per-filter role (writer
+# vs reader) is selected by the plugin `configuration` bytes ("writer" /
+# "reader") delivered to on_configure.
+[package]
+name = "shared_data_combined"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

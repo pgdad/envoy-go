@@ -118,7 +118,7 @@ func TestNew_HappyPath_ReturnsFactory(t *testing.T) {
 		t.Error("*filter.controller: got nil; want non-nil *gradientController")
 	}
 	if df.clock == nil {
-		t.Error("*filter.clock: got nil; want defaultClock{}")
+		t.Error("*filter.clock: got nil; want clock.RealClock{}")
 	}
 	// Second invocation of the factory should produce a DIFFERENT *filter
 	// instance (per-stream allocation) but the SAME shared *controller pointer

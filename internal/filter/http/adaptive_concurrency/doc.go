@@ -52,7 +52,8 @@
 // # Cross-references
 //
 //   - ADR-0186 (§Decision + §Consequences anchored at IMPL Task 3 —
-//     Gradient-1 controller state machine + the inline Clock seam).
+//     Gradient-1 controller state machine + the Clock seam, migrated to the
+//     unified internal/clock superset per §Consequences (g) EXTRACT-NOW).
 //   - ADR-0187 (§Decision + §Consequences anchored at IMPL Task 2 —
 //     enabled.runtime_key deferral PARSE-REJECT).
 //   - ADR-0059 (§Decision AMENDMENT body anchored at IMPL Task 4 —

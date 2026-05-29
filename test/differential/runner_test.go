@@ -60,6 +60,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0035-http-wasm-boot-reject/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0036-http-wasm-body-and-advanced/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0037-http-wasm-body-and-advanced-boot-reject/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0038-http-wasm-perroute-and-multi-plugin/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0039-http-wasm-perroute-boot-reject/inputs"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -732,6 +734,36 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			// both clusters dial. 14 scenarios per §8.1.1: 10 cross-side
 			// via CompareBytes + 4 subject-only via StatsAsserter per
 			// reference_differential_asserter_dispatch. Per parent §8.5.
+			port := freeTCPPort(t)
+			bo.port = port
+			cmd, err := startEchoBackend(ctx, root, port)
+			if err != nil {
+				t.Fatalf("backend[%d] start: %v", i, err)
+			}
+			bo.proc = cmd
+			defer func(cmd *exec.Cmd) {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}(cmd)
+			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
+				t.Fatalf("backend[%d] not ready: %v", i, err)
+			}
+		case fixture.HTTPWasmPerRoute:
+			// Fixture 0038-http-wasm-perroute-and-multi-plugin (phase 25.3
+			// Task 11) REUSES the SHARED echobackend binary at
+			// test/helpers/echobackend/cmd/echobackend/ (phase-14 Task 10).
+			// THREE listeners (perroute / multiplugin / reload) all back
+			// onto ONE upstream cluster (cluster_a) per phase-22.2 REVIEW
+			// §7.4 freeTCPPort flake mitigation — so this switch-case
+			// allocates ONE backend. Cross-side arms classify response
+			// headers (x-wasm-variant / x-shared) set by the wasm guests;
+			// the reload arm is subject-only via StatsAsserter (vm_reload
+			// triplet) per reference_differential_asserter_dispatch.
+			// Because the backend is a subprocess, the runner's in-process
+			// accept counter is NOT incremented.
 			port := freeTCPPort(t)
 			bo.port = port
 			cmd, err := startEchoBackend(ctx, root, port)

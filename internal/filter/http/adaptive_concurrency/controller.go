@@ -63,6 +63,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/esalaine/envoy-go/internal/clock"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -80,12 +81,17 @@ import (
 //   - recordLatencySample acquires mu for sample-slice mutation + minRTT
 //     state-machine transitions.
 //   - Timer callbacks (concurrencyUpdateTick, updateMinRTTTick) acquire mu
-//     for state mutation; their re-arm AfterFunc calls happen with mu
-//     released (per the fakeClock re-entrancy contract at clock_test.go).
+//     for state mutation; re-arm AfterFunc calls in the concurrencyUpdateTick
+//     path happen with mu released, while re-arm calls in the
+//     updateMinRTTLocked path happen while controller.mu is held — safe
+//     because FakeClock.mu is a SEPARATE mutex (no deadlock risk). The
+//     FakeClock re-entrancy/drain-loop contract is documented at
+//     internal/clock (Advance doc-comment + internal/clock/clock_test.go's
+//     reentrant-AfterFunc test).
 type gradientController struct {
 	cfg   *compiledConfig
 	stats *filterStats
-	clock Clock
+	clock clock.Clock
 
 	// Hot-path atomics (lock-free) per planner-time D17.
 	concurrencyLimit atomic.Uint32 // current limit; init = cfg.minRTTMinConcurrency per §4.6
@@ -98,8 +104,8 @@ type gradientController struct {
 	minRTT                       time.Duration   // last computed minRTT
 	deferredLimitValue           uint32          // saved limit during minRTT window; 0 == NOT in window
 	consecutiveMinConcurrencySet uint32          // 5-consecutive-min counter per AMEND-2 C3
-	sampleResetTimer             Stop            // periodic concurrency-update tick
-	minRTTCalcTimer              Stop            // periodic minRTT-recalc trigger
+	sampleResetTimer             clock.Stop      // periodic concurrency-update tick
+	minRTTCalcTimer              clock.Stop      // periodic minRTT-recalc trigger
 	rng                          *rand.Rand      // jitter source per planner-time D18; mu-protected
 }
 
@@ -110,13 +116,13 @@ type gradientController struct {
 // Per AMEND-2 C4: at phase-21 MVP isMinRTTSamplingEnabled is always TRUE
 // (fixed_value PARSE-REJECTed per ADR-0186 §Consequences (d) + §5.3), so
 // the constructor unconditionally calls enterMinRTTSamplingWindowLocked.
-func newGradientController(cfg *compiledConfig, st *filterStats, clock Clock) *gradientController {
+func newGradientController(cfg *compiledConfig, st *filterStats, clk clock.Clock) *gradientController {
 	c := &gradientController{
 		cfg:   cfg,
 		stats: st,
-		clock: clock,
+		clock: clk,
 		//nolint:gosec // jitter is non-crypto; per-controller seed via clock.Now per D18
-		rng: rand.New(rand.NewSource(clock.Now().UnixNano())),
+		rng: rand.New(rand.NewSource(clk.Now().UnixNano())),
 	}
 	// Initial state per §4.6: concurrencyLimit = minConcurrency; numRqOutstanding = 0.
 	c.concurrencyLimit.Store(cfg.minRTTMinConcurrency)
@@ -134,8 +140,8 @@ func newGradientController(cfg *compiledConfig, st *filterStats, clock Clock) *g
 	// initial minRTT window (deferredLimitValue != 0). minRTTCalcTimer's
 	// callback would normally enter a window, but the controller is already
 	// in-window, so it short-circuits too — re-arm happens at window close.
-	c.sampleResetTimer = clock.AfterFunc(cfg.concurrencyUpdateInterval, c.concurrencyUpdateTick)
-	c.minRTTCalcTimer = clock.AfterFunc(cfg.minRTTCalcInterval, c.updateMinRTTTick)
+	c.sampleResetTimer = clk.AfterFunc(cfg.concurrencyUpdateInterval, c.concurrencyUpdateTick)
+	c.minRTTCalcTimer = clk.AfterFunc(cfg.minRTTCalcInterval, c.updateMinRTTTick)
 
 	return c
 }
@@ -370,9 +376,11 @@ func (c *gradientController) updateConcurrencyLimitLocked(newLimit uint32) {
 		c.consecutiveMinConcurrencySet++
 		if c.consecutiveMinConcurrencySet >= 5 && c.deferredLimitValue == 0 {
 			// Force-arm minRTTCalcTimer at 0ms — fires updateMinRTTTick
-			// in the SAME Advance pass (fakeClock supports this re-entrancy
-			// per clock_test.go::TestFakeClock_ReentrantAfterFunc; production
-			// time.AfterFunc(0, ...) fires "immediately" per stdlib).
+			// in the SAME Advance pass (clock.FakeClock supports this
+			// re-entrancy via the drain-loop in clock.FakeClock.Advance,
+			// tested by internal/clock/clock_test.go's reentrant-AfterFunc
+			// test; production time.AfterFunc(0, ...) fires "immediately"
+			// per stdlib).
 			if c.minRTTCalcTimer != nil {
 				c.minRTTCalcTimer.Stop()
 			}

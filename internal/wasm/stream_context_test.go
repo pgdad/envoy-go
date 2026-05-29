@@ -224,3 +224,75 @@ func TestStreamContext_Close_FiresLifecycleCallbacks(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 }
+
+// --- TestStreamContext_TrapPoison_SkipsTeardown (BUG-3 regression) ---------
+//
+// A guest TRAP in proxy_on_request_headers poisons the shared instance (a
+// real Rust panic! leaves the proxy-wasm-rust-sdk dispatcher RefCell
+// borrowed; re-entry cascades panic_already_borrowed). The host catches the
+// trap on the request path, but (*StreamContext).Close MUST NOT re-enter the
+// poisoned instance via the proxy_on_done/log/delete teardown triplet.
+//
+// This is the REAL-trap repro (an `unreachable` guest), NOT injected state:
+//  1. CallProxyOnRequestHeaders → expect a non-nil trap error.
+//  2. sc.trapped must be set true by the trap.
+//  3. sc.Close() → expect NO panic + nil error (the teardown triplet —
+//     which ALSO traps in this fixture — is SKIPPED because the instance is
+//     poisoned). Before the fix, Close fired proxy_on_done into the poisoned
+//     instance → a second trap → the cascade.
+//
+// Run under -race.
+func TestStreamContext_TrapPoison_SkipsTeardown(t *testing.T) {
+	ctx := context.Background()
+	mod := mustCompileForRootVM(t, ctx, requestHeadersTrapsModule)
+	rv, err := NewRootVM(ctx, mod, 1, WithRootSandboxConfig(allowAllSandbox()))
+	if err != nil {
+		t.Fatalf("NewRootVM: %v", err)
+	}
+	defer func() { _ = rv.Close() }()
+	if err := rv.Configure(ctx, nil, nil); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	sc, err := rv.NewStreamContext(ctx)
+	if err != nil {
+		t.Fatalf("NewStreamContext: %v", err)
+	}
+
+	// 1. The guest traps in proxy_on_request_headers.
+	_, callErr := sc.CallProxyOnRequestHeaders(ctx, 1, true)
+	if callErr == nil {
+		t.Fatal("CallProxyOnRequestHeaders returned nil err; want a trap error (the guest executes `unreachable`)")
+	}
+
+	// 2. The trap must have flagged the instance poisoned.
+	if !sc.trapped.Load() {
+		t.Fatal("sc.trapped = false after a guest trap; want true (BUG-3: a trap must poison the StreamContext)")
+	}
+
+	// 3. Close must skip the teardown triplet (which also traps) — no cascade,
+	// no re-entry error.
+	var closeErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Close cascaded a panic on a trapped instance (BUG-3): %v", r)
+			}
+		}()
+		closeErr = sc.Close(ctx)
+	}()
+	if closeErr != nil {
+		t.Errorf("Close on a trapped instance returned err=%v; want nil (teardown triplet must be SKIPPED, not re-entered)", closeErr)
+	}
+
+	// Close must still have completed its non-guest teardown: the streamCtx
+	// entry is removed + the context is flagged closed.
+	if !sc.closed.Load() {
+		t.Error("sc.closed = false after Close; want true (Close must still flip closed even when skipping teardown)")
+	}
+	rv.streamCtxsMu.RLock()
+	_, stillPresent := rv.streamCtxs[sc.streamCtxID]
+	rv.streamCtxsMu.RUnlock()
+	if stillPresent {
+		t.Error("streamCtx entry still present after Close; want removed (Close must still perform map cleanup)")
+	}
+}

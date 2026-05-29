@@ -1,0 +1,28 @@
+# Conformance family `wasm_vm` — VM init + per-stream context isolation.
+#
+# Mirrors the cpp-host wasm_vm context-isolation checks. Each HTTP stream gets
+# its OWN Filter (HttpContext) instance carrying a private call counter. On
+# every request-headers call the guest increments its counter and writes the
+# current value to the response header x-stream-count.
+#
+# The harness creates TWO StreamContexts (asserting distinct ContextID()s),
+# drives stream A's request-headers TWICE (counter -> 1, then 2) and stream B's
+# ONCE (counter -> 1). If per-stream state leaked into a shared global, B would
+# report 3; the harness asserts B reports 1, proving per-stream context
+# isolation (and that VM memory init produced independent per-context state).
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/wasm_vm.wasm.
+[package]
+name = "wasm_vm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

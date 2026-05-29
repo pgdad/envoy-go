@@ -1,0 +1,152 @@
+# Reference Envoy bootstrap for fixture 0039-http-wasm-perroute-boot-reject.
+#
+# Per phase 25.3 Task 12 + D-25.3-P1 closure at 25.3 IMPL Task 12 first-action.
+# This file is a DOCUMENTATION ARTIFACT — the actual bootstrap is
+# synthesized inline in renderBootRejectBootstrap() (inputs/driver.go) per
+# Option B2 (fixture-0029 / 0031 / 0033 / 0035 / 0037 precedent).
+#
+# # Subject-only boot-reject arm (C — env_vars cap-exceeded)
+#
+# The subject-side trigger is the envoy-go-strict 64-entry env_vars cap
+# (parseRejectEnvVarsCapExceeded) at
+# internal/filter/http/wasm/compiled_config.go:
+#   "wasm: config.vm_config.environment_variables exceeds the
+#   envoy-go-strict cap (max 64 entries, max 4096 bytes per value)"
+#
+# The reference Envoy v1.37.2 side BOOTS SUCCESSFULLY against the SAME
+# config — upstream has NO env_vars entry cap, so all 65 key_values
+# entries are accepted. The wasm filter then loads the bind-mounted .wasm
+# blob at /bytecode/probe.wasm + admin /ready returns 200.
+#
+# # Bytecode
+#
+# Self-contained: the reference side bind-mounts this fixture's own
+# bytecode/probe.wasm (copied from sibling fixture-0038's
+# listener_default.wasm) at /bytecode/probe.wasm. The subject never reads
+# it (arm C fires at parseEnvVars before resolveDataSource).
+#
+# NOTE: inputs/driver.go::renderBootRejectBootstrap() is the authoritative
+# source. This file documents the intended shape for operator reference.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: l_test_a
+      address: { socket_address: { address: 0.0.0.0, port_value: 10139 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_bootreject_39
+                route_config:
+                  name: rc_bootreject_39
+                  virtual_hosts:
+                    - name: vh_bootreject_39
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_unused }
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: plugin_bootreject_39
+                        root_id: rootid_bootreject_39
+                        vm_config:
+                          vm_id: vm_bootreject_39
+                          runtime: envoy.wasm.runtime.v8
+                          code:
+                            local:
+                              filename: /bytecode/probe.wasm
+                          environment_variables:
+                            # 65 entries (k0..k64) — one over the
+                            # envoy-go-strict 64-entry cap. Reference Envoy
+                            # v1.37.2 accepts all 65 (no upstream cap); the
+                            # envoy-go subject boot-REJECTS on arm C.
+                            key_values:
+                              k0: v0
+                              k1: v1
+                              k2: v2
+                              k3: v3
+                              k4: v4
+                              k5: v5
+                              k6: v6
+                              k7: v7
+                              k8: v8
+                              k9: v9
+                              k10: v10
+                              k11: v11
+                              k12: v12
+                              k13: v13
+                              k14: v14
+                              k15: v15
+                              k16: v16
+                              k17: v17
+                              k18: v18
+                              k19: v19
+                              k20: v20
+                              k21: v21
+                              k22: v22
+                              k23: v23
+                              k24: v24
+                              k25: v25
+                              k26: v26
+                              k27: v27
+                              k28: v28
+                              k29: v29
+                              k30: v30
+                              k31: v31
+                              k32: v32
+                              k33: v33
+                              k34: v34
+                              k35: v35
+                              k36: v36
+                              k37: v37
+                              k38: v38
+                              k39: v39
+                              k40: v40
+                              k41: v41
+                              k42: v42
+                              k43: v43
+                              k44: v44
+                              k45: v45
+                              k46: v46
+                              k47: v47
+                              k48: v48
+                              k49: v49
+                              k50: v50
+                              k51: v51
+                              k52: v52
+                              k53: v53
+                              k54: v54
+                              k55: v55
+                              k56: v56
+                              k57: v57
+                              k58: v58
+                              k59: v59
+                              k60: v60
+                              k61: v61
+                              k62: v62
+                              k63: v63
+                              k64: v64
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 0.25s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }

@@ -1,0 +1,28 @@
+# Conformance family `runtime` — VM runtime trap surfacing.
+#
+# Mirrors the cpp-host runtime traps/lifecycle checks. On request headers the
+# guest deliberately traps (panic -> wasm `unreachable`). The harness asserts
+# the trap surfaces as a NON-NIL error from CallProxyOnRequestHeaders (the host
+# runtime catches the wazero trap and returns it rather than silently
+# continuing). Run on its OWN fresh RootVM so the poisoned instance does not
+# leak into other families.
+#
+# panic = "abort" so the panic lowers to a wasm trap (unreachable) instead of
+# unwinding, matching how a real guest fault surfaces to the host.
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/runtime.wasm.
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

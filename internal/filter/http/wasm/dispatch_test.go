@@ -29,6 +29,7 @@ package wasm
 
 import (
 	"context"
+	"fmt"
 	gohttp "net/http"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,7 @@ import (
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
+	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
 	"github.com/esalaine/envoy-go/internal/wasm/abi"
 )
 
@@ -49,10 +51,21 @@ import (
 // registry; build a *filter ready for DecodeHeaders / EncodeHeaders.
 // -----------------------------------------------------------------------------
 
+// testVMIDCounter hands out a unique vm_id per generic test-config build so
+// independent tests do NOT collide on a single process-global registry key.
+// The DefaultRegistry SHARES *RootVM by (vm_id, vm_config, code); a fixed vm_id
+// here would make the suite ordering-dependent (a stale shared VM wired to the
+// first test's stats/dispatcher served on a later same-key acquire), which is
+// the exact -count=2 contamination this counter prevents. Tests that
+// DELIBERATELY exercise vm_id SHARING use newTestCompiledConfigVmId with an
+// explicit vm_id instead.
+var testVMIDCounter atomic.Uint64
+
 // newTestCompiledConfig wraps the supplied wasm module bytes in a *anypb.Any
 // envelope + drives buildCompiledConfig through the full parse pipeline.
 // Returns the SHARED *compiledConfig that per-stream filters bind to via
-// closure capture.
+// closure capture. The vm_id is made unique per call (testVMIDCounter) so the
+// process-global registry never shares a *RootVM across unrelated tests.
 func newTestCompiledConfig(t *testing.T, modBytes []byte, pluginName string, reg *stats.Registry) *compiledConfig {
 	t.Helper()
 	cfg := &wasmv3.Wasm{
@@ -61,7 +74,7 @@ func newTestCompiledConfig(t *testing.T, modBytes []byte, pluginName string, reg
 			RootId: "test_root",
 			Vm: &wasmcommonv3.PluginConfig_VmConfig{
 				VmConfig: &wasmcommonv3.VmConfig{
-					VmId:    "test_vm",
+					VmId:    fmt.Sprintf("test_vm_%d", testVMIDCounter.Add(1)),
 					Runtime: "envoy.wasm.runtime.wazero",
 					Code: &corev3.AsyncDataSource{
 						Specifier: &corev3.AsyncDataSource_Local{
@@ -128,7 +141,7 @@ func TestFilter_DecodeHeaders_EndToEnd(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_decode", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	f := &filter{cfg: cc}
 	f.SetDecoderCallbacks(fakeDecoderCb{})
@@ -184,7 +197,7 @@ func TestFilter_EncodeHeaders_EndToEnd(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_encode", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	f := &filter{cfg: cc}
 	f.SetDecoderCallbacks(fakeDecoderCb{})
@@ -233,7 +246,7 @@ func TestFilter_EncodeHeaders_WithoutDecode_ContinuePassthrough(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_enc_only", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	f := &filter{cfg: cc}
 	f.SetEncoderCallbacks(fakeEncoderCb{})
@@ -268,7 +281,7 @@ func TestFilter_OnDestroy_ReleasesVM(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_destroy", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	f := &filter{cfg: cc}
 	f.SetDecoderCallbacks(fakeDecoderCb{})
@@ -351,7 +364,7 @@ func TestFilter_SendLocalResponse_TriggersStopIteration(t *testing.T) {
 			RootId: "test_root",
 			Vm: &wasmcommonv3.PluginConfig_VmConfig{
 				VmConfig: &wasmcommonv3.VmConfig{
-					VmId:    "test_vm",
+					VmId:    fmt.Sprintf("test_vm_%d", testVMIDCounter.Add(1)),
 					Runtime: "envoy.wasm.runtime.wazero",
 					Code: &corev3.AsyncDataSource{
 						Specifier: &corev3.AsyncDataSource_Local{
@@ -389,7 +402,7 @@ func TestFilter_SendLocalResponse_TriggersStopIteration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildCompiledConfig: %v", err)
 	}
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	rec := &recordingDecoderCb{}
 	f := &filter{cfg: cc}
@@ -436,7 +449,7 @@ func TestFilter_ConcurrentStreams_NoSharedState(t *testing.T) {
 	const N = 8
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_concurrent", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	var wg sync.WaitGroup
 	wg.Add(N)
@@ -512,7 +525,7 @@ func TestFilter_DecodeHeaders_Pause_LogAndContinue(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildPauseProxyWasm(), "plugin_pause", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	rec := &recordingDecoderCb{}
 	f := &filter{cfg: cc}
@@ -550,7 +563,7 @@ func TestFilter_DecodeHeaders_MissingExports_ContinueNoOp(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildMinimalProxyWasm(), "plugin_minimal", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	f := &filter{cfg: cc}
 	f.SetDecoderCallbacks(fakeDecoderCb{})
@@ -586,7 +599,7 @@ func TestNew_ReturnsWorkingFactory(t *testing.T) {
 			RootId: "test_root",
 			Vm: &wasmcommonv3.PluginConfig_VmConfig{
 				VmConfig: &wasmcommonv3.VmConfig{
-					VmId:    "test_vm",
+					VmId:    fmt.Sprintf("test_vm_%d", testVMIDCounter.Add(1)),
 					Runtime: "envoy.wasm.runtime.wazero",
 					Code: &corev3.AsyncDataSource{
 						Specifier: &corev3.AsyncDataSource_Local{
@@ -612,6 +625,10 @@ func TestNew_ReturnsWorkingFactory(t *testing.T) {
 	if factory == nil {
 		t.Fatal("New returned nil factory; want non-nil")
 	}
+	// New holds the compiledConfig only via the factory closure (no exposed
+	// Close), so the registry-acquired *RootVM would leak past this test.
+	// Drop it via the test-only reset hook (safety net for the non-helper path).
+	t.Cleanup(func() { internalwasm.DefaultRegistry.ResetForTest() })
 
 	// The closure produces fresh HTTPFilter instances on each call.
 	hf1 := factory()
@@ -685,8 +702,12 @@ func TestFilter_RootVM_SharedAcrossStreams_NoCrossStreamLeak(t *testing.T) {
 	t.Parallel()
 	const N = 100
 	reg := stats.NewRegistry()
-	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_concurrent", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	// Unique plugin name per invocation so the process-global arm-26 name claim
+	// does not collide under -count>1 (the vm_id is already counter-unique via
+	// newTestCompiledConfig; the plugin name is the remaining shared-process key).
+	pluginName := fmt.Sprintf("plugin_rootvm_concurrent_%d", testVMIDCounter.Add(1))
+	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), pluginName, reg)
+	t.Cleanup(func() { _ = cc.Close() })
 
 	var wg sync.WaitGroup
 	wg.Add(N)
@@ -735,7 +756,7 @@ func TestFilter_RootVM_SharedAcrossStreams_NoCrossStreamLeak(t *testing.T) {
 		t.Errorf("active = %d; want 0 (all OnDestroyed; no leaked stream contexts)", got)
 	}
 	// executions = N (one Inc per decode-side dispatch).
-	if got := findStatCounterValue(reg, "wasm.plugin_rootvm_concurrent.executions"); got != N {
+	if got := findStatCounterValue(reg, "wasm."+pluginName+".executions"); got != N {
 		t.Errorf("executions = %d; want %d", got, N)
 	}
 
@@ -759,7 +780,7 @@ func TestFilter_RootVM_LifecycleViaStreamContext(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_lifecycle", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	f := &filter{cfg: cc}
 	f.SetDecoderCallbacks(fakeDecoderCb{})
@@ -841,7 +862,7 @@ func TestFilter_RootVM_BodyCapEnforcement_DecodeSide(t *testing.T) {
 	// Build a real compiledConfig with a 16-byte cap override via the
 	// envoy_go_strict Struct.
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_bodycap", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 	cc.bodyBufferCapBytes = 16 // override for test
 
 	rec := &recordingDecoderCb{}
@@ -912,7 +933,7 @@ func TestFilter_RootVM_HostcallRoutesToOriginatingStream(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
 	cc := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_rootvm_isolation", reg)
-	t.Cleanup(func() { _ = cc.compileCache.Close() })
+	t.Cleanup(func() { _ = cc.Close() })
 
 	// Stream A.
 	fA := &filter{cfg: cc}

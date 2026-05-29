@@ -57,6 +57,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/esalaine/envoy-go/internal/clock"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
@@ -86,12 +87,12 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.adaptive_conc
 //     ADR-0061 LBP-1; tests that exercise New() supply a fresh
 //     `stats.NewRegistry()` cheaply.
 //  4. newFilterStats(ctx.Stats, ctx.StatPrefix) — Task 4 7-name registration.
-//  5. newGradientController(cc, stats, defaultClock{}) — Task 3 controller
+//  5. newGradientController(cc, stats, clock.RealClock{}) — Task 3 controller
 //     construction. ONE controller per HCM filter chain mounting an
 //     adaptive_concurrency filter (captured into the closure).
 //  6. Return the per-stream FilterInstanceFactory closure that allocates a
 //     fresh *filter per stream bound to the SHARED *compiledConfig +
-//     *gradientController + defaultClock{}.
+//     *gradientController + clock.RealClock{}.
 //
 // Per SPEC §3.4 the returned HTTPFilter has Decoder=f AND Encoder=f — the
 // adaptive_concurrency filter participates on BOTH decode (forwardingDecision
@@ -138,13 +139,13 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	// loop by prepending here at the factory boundary, preserving the
 	// Task 4 stats.go newFilterStats body byte-for-byte).
 	stats := newFilterStats(ctx.Stats, "http."+ctx.StatPrefix)
-	clock := defaultClock{}
-	controller := newGradientController(cc, stats, clock)
+	clk := clock.RealClock{}
+	controller := newGradientController(cc, stats, clk)
 	return func() envoyhttp.HTTPFilter {
 		f := &filter{
 			cc:         cc,
 			controller: controller,
-			clock:      clock,
+			clock:      clk,
 		}
 		return envoyhttp.HTTPFilter{
 			Name:    filterName,

@@ -85,6 +85,14 @@ type RootVM struct {
 	instance api.Module            // instantiated once at NewRootVM
 	src      []byte                // retained for cross-runtime re-compile (from *Module.Source())
 
+	// vmConfigBytes / pluginConfigBytes: the Configure-time argument bytes,
+	// retained so a FAIL_RELOAD re-instantiation (reinstantiate) can replay
+	// proxy_on_vm_start / proxy_on_configure with the same config. Stored by
+	// Configure; read by reinstantiate. Both run under dispatchMu so the
+	// fields need no separate guard (phase-25.3 Task 3).
+	vmConfigBytes     []byte
+	pluginConfigBytes []byte
+
 	sandbox   SandboxConfig
 	panicH    PanicHandlerFn
 	logSink   io.Writer
@@ -114,7 +122,8 @@ type RootVM struct {
 	// the shared cache sub-ms.
 	compilationCache wazero.CompilationCache
 
-	// shared-data state (activated at Task 6 per Q6 + R-25.2-10):
+	// shared-data state (activated at Task 6 per Q6 + R-25.2-10; broadened
+	// to vm_id scope at Task 2 per AMEND-C2):
 	//
 	//   - sharedDataValCap / sharedDataMaxEntries: envoy-go-strict caps per
 	//     AMEND-B5. Zero ⇒ defaults applied at first use (1 MiB / 1024 per
@@ -122,19 +131,16 @@ type RootVM struct {
 	//     Operator overrides flow via WithRootSharedDataCaps OR the Task 14
 	//     per-plugin Configure-time field-set.
 	//
-	//   - sharedData: the per-*RootVM CAS-protected K-V map. Lazy-init on
-	//     first SetSharedData (avoids a NewRootVM-time allocation for
-	//     plugins that never touch shared-data). The entry struct +
-	//     SetSharedData / GetSharedData methods live at shared_data.go.
-	//
-	//   - sharedDataMu: sync.RWMutex guarding the map + cap-check
-	//     critical sections. Multiple-reader concurrency for Get; exclusive
-	//     for Set. SAFE to call from any goroutine independently of
-	//     dispatchMu (see shared_data.go doc).
+	//   - sharedData: the *sharedDataStore backing this RootVM. By default
+	//     (no WithSharedDataStore option) NewRootVM allocates a private store
+	//     so each *RootVM is isolated (pre-25.3 behavior). Task 7 wires the
+	//     registry-provided vm_id-scoped store here so plugins sharing a
+	//     vm_id observe one namespace (AMEND-C2). The entry struct + store
+	//     methods + SetSharedData / GetSharedData thin wrappers live at
+	//     shared_data.go.
 	sharedDataValCap     uint32 // from PluginConfig envoy_go_strict_shared_data_value_cap_bytes; 0 ⇒ default
 	sharedDataMaxEntries uint32 // from PluginConfig envoy_go_strict_shared_data_max_entries; 0 ⇒ default
-	sharedData           map[string]sharedDataEntry
-	sharedDataMu         sync.RWMutex
+	sharedData           *sharedDataStore
 
 	// tick state (per Q5 + ADR-0186 Clock seam; activated at Task 5):
 	//
@@ -162,6 +168,27 @@ type RootVM struct {
 	tickStop    chan struct{} // nil when no tick goroutine alive
 	tickMu      sync.Mutex    // serializes SetTickPeriod re-schedule
 	tickWG      sync.WaitGroup
+
+	// reload state (phase-25.3 Task 3 per AMEND-C3 + R-25.3-2/5 + D-25.3-P3):
+	//
+	//   - reload: the per-*RootVM reload state machine (reload.go). Models the
+	//     Running → Failed → (backoff | attempt) → Running transitions for
+	//     failure_policy = FAIL_RELOAD. Constructed in NewRootVM from rv.clk +
+	//     rv.reloadBaseInterval AFTER the clk default is applied. The
+	//     dispatchReload hook (serialized by dispatchMu) drives it; the
+	//     reinstantiate primitive is the production reattempt. The END-TO-END
+	//     trigger from the filter DecodeHeaders dispatch path lands at Task 9.
+	//
+	//   - reloadBaseInterval: the operator-configured backoff base interval
+	//     (0 ⇒ 1s default; <100ms ⇒ 100ms floor). Set via WithReloadConfig;
+	//     read once in NewRootVM to build rv.reload.
+	//
+	//   - reloadStats: the optional vm_reload counter seam (reload.go
+	//     reloadStatsHook). nil-default; set via WithReloadStats so tests +
+	//     Task 9 can inject the triplet. dispatchReload guards with a nil-check.
+	reload             *reloadState
+	reloadBaseInterval time.Duration
+	reloadStats        reloadStatsHook
 
 	// per-stream-context map (per Q3 — children sharing root VM):
 	streamCtxsMu    sync.RWMutex
@@ -232,6 +259,15 @@ type RootVM struct {
 	//     mutations + lock-free atomics on the Increment/Record/Get hot
 	//     path.
 	dynStats *dynamic.Registry
+
+	// env is the assembled environment-variable map fed to the guest's WASI
+	// environ_get / environ_sizes_get shims as KEY=VALUE\0 entries per
+	// AMEND-C4. Set once at NewRootVM via WithRootEnv (after AssembleEnvVars
+	// collision/cap validation at Task 7 from VmConfig.environment_variables).
+	// nil/empty ⇒ the guest sees zero env entries (the 25.1/25.2 behavior).
+	// Read unlocked from WASIEnviron (called during guest dispatch; no
+	// mutation after construction).
+	env map[string]string
 
 	// stats is the per-*RootVM RootStatsRecorder counter sink per 25.2 IMPL
 	// Task 20 follow-up (Concern 2 — counter-glue wiring gap). Wired ONCE at
@@ -327,6 +363,25 @@ func WithRootClock(c clock.Clock) RootVMOption {
 	return func(rv *RootVM) { rv.clk = c }
 }
 
+// WithReloadConfig sets the FAIL_RELOAD backoff base interval per phase-25.3
+// Task 3 (AMEND-C3 + R-25.3-2/5). 0 (default) ⇒ 1s; 0 < base < 100ms ⇒ 100ms
+// floor; base >= 100ms ⇒ base verbatim. Read once in NewRootVM to build the
+// per-*RootVM reload state machine (reload.go). Production wiring lands at
+// Task 7/9 from the parsed PluginConfig.
+func WithReloadConfig(base time.Duration) RootVMOption {
+	return func(rv *RootVM) { rv.reloadBaseInterval = base }
+}
+
+// WithReloadStats installs the optional vm_reload counter seam (reload.go
+// reloadStatsHook: VmReloadSuccessInc / VmReloadRuntimeFailureInc /
+// VmReloadBackoffInc) per phase-25.3 Task 3. nil-default; dispatchReload
+// guards with a nil-check. Tests + Task 9 inject the triplet; the LOCAL hook
+// interface keeps this Task from forcing RootStatsRecorder to grow before
+// Task 8.
+func WithReloadStats(h reloadStatsHook) RootVMOption {
+	return func(rv *RootVM) { rv.reloadStats = h }
+}
+
 // WithRootTickHandler installs an optional Go-side per-tick hook fired from
 // inside the dispatchMu frame on every tick fire, BEFORE the proxy_on_tick
 // guest dispatch. The handler runs under panic-recovery (a handler panic
@@ -392,6 +447,21 @@ func WithRootSharedDataCaps(valCap, maxEntries uint32) RootVMOption {
 	}
 }
 
+// WithSharedDataStore injects a shared (registry-owned, vm_id-scoped)
+// shared-data store. When unset, NewRootVM allocates a private store so
+// each *RootVM is isolated (the pre-25.3 behavior). Task 7 wires the
+// registry-provided store here so plugins under one vm_id share a namespace.
+func WithSharedDataStore(store *sharedDataStore) RootVMOption {
+	return func(rv *RootVM) { rv.sharedData = store }
+}
+
+// WithRootEnv sets the assembled environment-variable map fed to the guest's
+// WASI environ_get/environ_sizes_get shims as KEY=VALUE\0 entries per AMEND-C4.
+// Wired by compiledConfig at Task 7 from VmConfig.environment_variables (after
+// AssembleEnvVars collision/cap validation). Unset ⇒ the guest sees zero env
+// entries (the 25.1/25.2 behavior).
+func WithRootEnv(env map[string]string) RootVMOption { return func(rv *RootVM) { rv.env = env } }
+
 // PanicHandlerFn is invoked after `recover()` in the RootVM's panic-wrapper.
 // `recovered` is the value returned by recover() (typically the panic value).
 type PanicHandlerFn func(recovered any)
@@ -436,6 +506,11 @@ func NewRootVM(ctx context.Context, module *Module, rootCtxID uint32, opts ...Ro
 	if rv.clk == nil {
 		rv.clk = clock.RealClock{}
 	}
+	// Construct the reload state machine AFTER the clk default is applied so
+	// it shares the (possibly fake) clock. Per phase-25.3 Task 3 + D-25.3-P3.
+	if rv.reload == nil {
+		rv.reload = newReloadState(rv.clk, rv.reloadBaseInterval)
+	}
 	// Default the foreign-function registry to the process-global EMPTY
 	// registry if no WithRootForeignRegistry option was applied. Per AMEND-A9
 	// + D-P-PLAN-9: envoy-go ships ZERO default foreign functions; operators
@@ -452,6 +527,13 @@ func NewRootVM(ctx context.Context, module *Module, rootCtxID uint32, opts ...Ro
 	// *filterStats satisfies the interface via thin wrappers.
 	if rv.stats == nil {
 		rv.stats = noopStatsRecorder{}
+	}
+	// Default the shared-data store to a fresh private store if no
+	// WithSharedDataStore option was applied. This preserves the pre-25.3
+	// per-RootVM isolation so all existing tests stay green. Task 7 wires
+	// the registry-provided vm_id-scoped store here (AMEND-C2).
+	if rv.sharedData == nil {
+		rv.sharedData = newSharedDataStore()
 	}
 
 	runtimeConfig := wazero.NewRuntimeConfigInterpreter()
@@ -508,6 +590,15 @@ func (rv *RootVM) RegisterABICallbacks(cb ABICallbacks) {
 	rv.cb = cb
 }
 
+// RegisteredABICallbacks returns the ABICallbacks previously registered via
+// RegisterABICallbacks (nil if none). Consumed by the filter package's
+// multi-plugin VM-sharing path (compiled_config.go): when two compiledConfigs
+// share one *RootVM via the registry, the second (registry-hit) compiledConfig
+// retrieves the SAME multiplexer the first registered, rather than building +
+// registering a fresh one that would clobber the shared per-stream routing
+// table. Read unlocked, mirroring the RegisterABICallbacks concurrency note.
+func (rv *RootVM) RegisteredABICallbacks() ABICallbacks { return rv.cb }
+
 // Configure invokes the canonical proxy-wasm host-side root-context
 // lifecycle on the instantiated module:
 //
@@ -538,9 +629,38 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 	rv.dispatchMu.Lock()
 	defer rv.dispatchMu.Unlock()
 
-	// Restore + set currentCtxID for the duration of Configure. The pre-seed
-	// at NewRootVM already points at rootCtxID, but we re-set defensively for
-	// the case where the caller has issued earlier per-stream callbacks.
+	// Retain the config bytes so a FAIL_RELOAD re-instantiation (reinstantiate)
+	// can replay proxy_on_vm_start / proxy_on_configure with the same config
+	// per phase-25.3 Task 3. Stored under dispatchMu (read by reinstantiate
+	// under the same lock).
+	rv.vmConfigBytes = vmConfigBytes
+	rv.pluginConfigBytes = pluginConfigBytes
+
+	return rv.runRootLifecycle(ctx)
+}
+
+// runRootLifecycle invokes steps (a)-(d) of the canonical proxy-wasm root-
+// context lifecycle on the CURRENT rv.instance. Shared by Configure (first
+// configuration) + reinstantiate (FAIL_RELOAD replay) per phase-25.3 Task 3
+// so the gating/no-op-skip discipline stays byte-identical across both paths.
+//
+//	(a) _initialize OR _start (mutually exclusive). UNGATED.
+//	(b) proxy_on_context_create(rootCtxID, 0). Gated by capProxyOnContextCreate.
+//	(c) proxy_on_vm_start(rootCtxID, vm_config_size). Gated by capProxyOnVmStart.
+//	(d) proxy_on_configure(rootCtxID, plugin_config_size). Gated by capProxyOnConfigure.
+//
+// MUST be called with dispatchMu held. Sets currentCtxID = rootCtxID for the
+// duration. Cap-denied + guest-not-exported steps are no-op skips (NOT
+// errors); only a non-nil Call error surfaces as a wrapped error.
+//
+// At this Task the byte-size passed to (c)/(d) is 0 even when the retained
+// bytes are non-nil — the VmConfig/PluginConfig data-source resolution +
+// memory-copy lands at Task 14. The bytes are nonetheless retained for the
+// replay-with-same-config contract.
+func (rv *RootVM) runRootLifecycle(ctx context.Context) error {
+	// Restore + set currentCtxID for the duration. The pre-seed at NewRootVM
+	// already points at rootCtxID, but we re-set defensively for the case
+	// where the caller has issued earlier per-stream callbacks.
 	rv.currentCtxID.Store(rv.rootCtxID)
 
 	// (a) _initialize OR _start. Mutually exclusive — per proxy-wasm v0.2.1
@@ -567,9 +687,8 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 
 	// (c) proxy_on_vm_start(rootCtxID, vm_config_size).
 	//
-	// At Task 1 we pass byte-size 0 even when vmConfigBytes is non-nil — the
+	// At this Task we pass byte-size 0 even when vmConfigBytes is non-nil — the
 	// VmConfig data-source resolution + memory-copy lands at Task 14.
-	_ = vmConfigBytes // silence unused at Task 1; activation at Task 14
 	if rv.sandbox.IsAllowed(capProxyOnVmStart) {
 		if fn := rv.instance.ExportedFunction("proxy_on_vm_start"); fn != nil {
 			if _, err := fn.Call(ctx, uint64(rv.rootCtxID), 0); err != nil {
@@ -579,7 +698,6 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 	}
 
 	// (d) proxy_on_configure(rootCtxID, plugin_config_size).
-	_ = pluginConfigBytes // silence unused at Task 1; activation at Task 14
 	if rv.sandbox.IsAllowed(capProxyOnConfigure) {
 		if fn := rv.instance.ExportedFunction("proxy_on_configure"); fn != nil {
 			if _, err := fn.Call(ctx, uint64(rv.rootCtxID), 0); err != nil {
@@ -589,6 +707,92 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 	}
 
 	return nil
+}
+
+// reinstantiate is the production FAIL_RELOAD re-instantiation primitive per
+// phase-25.3 Task 3 (AMEND-C3 + R-25.3-2/5 + D-25.3-P3). It re-instantiates
+// the already-compiled rv.module into a fresh api.Module + replays the root-
+// context lifecycle (steps (a)-(d) via runRootLifecycle) using the retained
+// vm/plugin config bytes.
+//
+// MUST be called with dispatchMu held (dispatchReload holds it across the
+// whole decide+attempt sequence, so exactly one goroutine ever reaches here
+// for a given VM). On a closed RootVM it returns an error without touching
+// the cleared runtime/module. The old rv.instance is closed before the new
+// one is installed; on a re-instantiation or replay error rv.instance is left
+// pointing at whatever was last successfully installed (the caller marks the
+// reload failed + the next attempt re-tries past the backoff window).
+func (rv *RootVM) reinstantiate(ctx context.Context) error {
+	if rv.closed.Load() || rv.runtime == nil || rv.module == nil {
+		return errors.New("wasm: reinstantiate on closed RootVM")
+	}
+
+	// Close the old instance first so the fresh InstantiateModule starts from
+	// clean module state (the wazero runtime keeps the compiled module; only
+	// the live instance is replaced).
+	if rv.instance != nil {
+		_ = rv.instance.Close(ctx)
+		rv.instance = nil
+	}
+
+	instance, err := rv.runtime.InstantiateModule(ctx, rv.module, wazero.NewModuleConfig().WithName(""))
+	if err != nil {
+		return fmt.Errorf("wasm: reinstantiate: %w", err)
+	}
+	rv.instance = instance
+
+	// Replay the lifecycle on the fresh instance with the retained config
+	// bytes. runRootLifecycle sets currentCtxID = rootCtxID as its first step.
+	if err := rv.runRootLifecycle(ctx); err != nil {
+		return fmt.Errorf("wasm: reinstantiate replay: %w", err)
+	}
+	return nil
+}
+
+// dispatchReload is the dispatch-entry hook for the FAIL_RELOAD state machine
+// per phase-25.3 Task 3 + D-25.3-P3. It acquires dispatchMu (NOT reentrant —
+// callers MUST NOT already hold it) so the whole decide+attempt sequence is
+// serialized: exactly one goroutine ever reloads a given VM; concurrent
+// goroutines block, then observe the post-reload Running state + get Serve.
+//
+//   - reloadDecisionAttempt: invoke reattempt(ctx). On nil err →
+//     markReloaded() + VmReloadSuccessInc; on error → markReloadFailed() +
+//     VmReloadRuntimeFailureInc.
+//   - reloadDecisionBackoff: VmReloadBackoffInc (no reattempt).
+//   - reloadDecisionServe: no-op.
+//
+// Returns the decision so the caller (Task 9 filter dispatch) can branch the
+// stream disposition. The injectable reattempt param lets tests count
+// attempts; production callers pass rv.reinstantiate.
+//
+// Lock order: dispatchMu → reload.mu (reload.decide / mark* acquire their own
+// mu under the held dispatchMu — safe + non-reentrant).
+func (rv *RootVM) dispatchReload(ctx context.Context, reattempt func(context.Context) error) reloadDecision {
+	rv.dispatchMu.Lock()
+	defer rv.dispatchMu.Unlock()
+
+	decision := rv.reload.decide()
+	switch decision {
+	case reloadDecisionAttempt:
+		if err := reattempt(ctx); err != nil {
+			rv.reload.markReloadFailed()
+			if rv.reloadStats != nil {
+				rv.reloadStats.VmReloadRuntimeFailureInc()
+			}
+		} else {
+			rv.reload.markReloaded()
+			if rv.reloadStats != nil {
+				rv.reloadStats.VmReloadSuccessInc()
+			}
+		}
+	case reloadDecisionBackoff:
+		if rv.reloadStats != nil {
+			rv.reloadStats.VmReloadBackoffInc()
+		}
+	case reloadDecisionServe:
+		// no-op — VM is Running.
+	}
+	return decision
 }
 
 // NewStreamContext allocates a fresh per-stream context. Monotonic
@@ -700,6 +904,12 @@ var newCallbackCapability25_2 = map[string]string{
 func (rv *RootVM) IsAllowed(capabilityName string) bool {
 	return rv.sandbox.IsAllowed(capabilityName)
 }
+
+// WASIEnviron returns the guest-visible environment as KEY=VALUE\0 entries
+// (sorted-key order for determinism) per AMEND-C4. Satisfies wasiHost.
+// Delegates to encodeWASIEnviron(rv.env) — nil/empty env ⇒ nil (zero
+// entries advertised; the 25.1/25.2 behavior).
+func (rv *RootVM) WASIEnviron() [][]byte { return encodeWASIEnviron(rv.env) }
 
 // LogProxy routes a log line to rv.logSink (if set); satisfies the wasiHost
 // interface (wasi.go). Default nil sink ⇒ drop, matching the

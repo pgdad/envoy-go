@@ -19,3 +19,18 @@ Per doctrine D-3.7, the pin is changed only via a dedicated phase that re-baseli
 6. Land as a single commit on the pin-refresh phase branch.
 
 The pin is never changed ad-hoc — every change is a phase with a green differential surface.
+
+## Deferred proxy-wasm conformance families (forward-pointers)
+
+The `test/conformance/proxy-wasm/` harness was seeded at phase 25.3 against `proxy-wasm-cpp-host@da3ce05d` (16 unit-test families). **10 are PORTED** and pass at phase-done (logging, stop_iteration, shared_data, endianness, exports, security, runtime, wasm_vm, bytecode_util, pairs_util — 62.5%). **6 are DEFERRED** because they presuppose substrate not implemented at the HTTP-filter scope; documented here + in `BOOTSTRAP_PROMPT.md §7.3` + `BEHAVIOR_CONTRACT.md` as forward-pointers for a future §9 WASM-host-family phase:
+
+| Deferred family | Reason deferred |
+|---|---|
+| `shared_queue` | WasmService cross-VM message queues + `proxy_on_queue_ready`; not implemented at the HTTP-filter scope. |
+| `signature_util` | Ed25519 signed / remote code fetch; not implemented (remote code fetch is PARSE-REJECT per the 25.1 `AsyncDataSource.Remote` envoy-go-strict departure). |
+| `wasm` (TLS-cache) | Thread-local WasmHandle cache + canary; presupposes the WasmService singleton model. |
+| `vm_id_handle` | Cross-VM scoping substrate; deferred with `shared_queue`/WasmService. |
+| `null_vm` | Compiled-in NullVM engine; N/A for a Go host with no NullVM engine (envoy-go ships only wazero). |
+| `fuzz` | libFuzzer harnesses (not gtest); covered by envoy-go's own `FuzzWasmConfigParse` + `FuzzWasmHostcallEnvelope` Go fuzzers. |
+
+These re-enter scope when the WasmService singleton / cross-VM-queue substrate lands in a future §9 WASM-host phase (cluster-specifier-wasm, access-logger-wasm, network-filter-wasm, WasmService plugin loaders).

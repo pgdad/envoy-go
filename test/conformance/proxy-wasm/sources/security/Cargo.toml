@@ -1,0 +1,31 @@
+# Conformance family `security` — hostcall capability gating (allow vs deny).
+#
+# Mirrors the cpp-host security-posture checks: a guest's hostcalls are gated
+# by the host sandbox allow-list. On request headers the guest issues TWO
+# hostcalls and logs the OUTCOME of each via the always-allowed proxy_log:
+#   - proxy_log               -> the gate is exercised by the log line landing
+#   - proxy_get_current_time  -> Ok => logs "time-ok", Err => logs "time-DENIED"
+#
+# The harness runs the SAME guest twice:
+#   1. permissive sandbox  -> log shows "log-ok" AND "time-ok"
+#   2. restricted sandbox (proxy_get_current_time_nanoseconds DENIED) ->
+#      log STILL shows "log-ok" (proxy_log allowed) but "time-DENIED"
+# proving the host enforces the per-capability gate: the allowed cap succeeds,
+# the denied cap returns the host's deny sentinel (WasmResult::InternalFailure)
+# which the SDK surfaces as Err.
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/security.wasm.
+[package]
+name = "security"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,24 @@
+# Conformance family `shared_data` — CAS round-trip.
+#
+# Mirrors the cpp-host shared_data semantics + the 25.2 shared-data CAS
+# golden: on_vm_start the guest does set(key, v1, cas=0) -> get -> CAS-matched
+# set -> CAS-mismatched set, logging each outcome. The harness asserts the
+# host-side store (RootVM.GetSharedData) reflects the final value + the CAS
+# counter progression (1 after first write, 2 after the matched update; the
+# stale-cas write is rejected and leaves the entry unchanged).
+#
+# proxy-wasm-rust-sdk =0.2.4. Vendored at ../../bytecode/shared_data.wasm.
+[package]
+name = "shared_data"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "=0.2.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
