@@ -13,7 +13,7 @@ This session:
 
 ## Project state at master tip (`24c8fe1`)
 
-- **Master tip:** `6175672` (`next-prompt.txt: rewrite for §9-HTTP-filters-family-close cold-start`; docs-only next-prompt commit); predecessor `24c8fe1` (the 25.3 IMPL stage-close STATE/PROGRESS SHA-fill `TBD-25.3-IMPL-SQUASH -> 57c7c4d`); substantive predecessor `57c7c4d` (the 25.3 IMPL squash-merge — all 15 tasks). origin/master at `6175672`. Run `git log --oneline -1` to confirm the actual tip (a subsequent docs-only repoint may have advanced it).
+- **Master tip:** `3bda442` (`next-prompt.txt: repoint master-tip references to 6175672`; docs-only repoint commit); predecessor `6175672` (the §9-family-close next-prompt rewrite); earlier `24c8fe1` (the 25.3 IMPL stage-close STATE/PROGRESS SHA-fill `TBD-25.3-IMPL-SQUASH -> 57c7c4d`); substantive predecessor `57c7c4d` (the 25.3 IMPL squash-merge — all 15 tasks). origin/master at `3bda442`. Run `git log --oneline -1` to confirm the actual tip (this docs-only repoint commit advances the tip one past the SHA named here; the caveat is expected).
 - **§9 HTTP-filters family CLOSED:** 20 production HTTP filters wired (phases 7.1 / 9-24 / 25.1 / 25.2 / 25.3). `envoy.filters.http.wasm` (phase 25, 3 sub-phases) was the final row.
 - **Counts at master tip:** stat surface **132**; differential fixtures **41**; fuzzers **35**; capability keys 58; conformance families **10/10** (NEW `test/conformance/proxy-wasm/` in-process harness); ADR tail **ADR-0212**, next-free **ADR-0213** (ADR-0209 + ADR-0213 escape-valve reserves UNCONSUMED).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); h2spec 53/53 at the ADR-0051 v1.32.4 pin; Rust + `wasm32-wasip1` installed (for any future vendored-bytecode fixtures).
