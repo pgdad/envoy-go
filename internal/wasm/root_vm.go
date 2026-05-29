@@ -85,6 +85,14 @@ type RootVM struct {
 	instance api.Module            // instantiated once at NewRootVM
 	src      []byte                // retained for cross-runtime re-compile (from *Module.Source())
 
+	// vmConfigBytes / pluginConfigBytes: the Configure-time argument bytes,
+	// retained so a FAIL_RELOAD re-instantiation (reinstantiate) can replay
+	// proxy_on_vm_start / proxy_on_configure with the same config. Stored by
+	// Configure; read by reinstantiate. Both run under dispatchMu so the
+	// fields need no separate guard (phase-25.3 Task 3).
+	vmConfigBytes     []byte
+	pluginConfigBytes []byte
+
 	sandbox   SandboxConfig
 	panicH    PanicHandlerFn
 	logSink   io.Writer
@@ -160,6 +168,27 @@ type RootVM struct {
 	tickStop    chan struct{} // nil when no tick goroutine alive
 	tickMu      sync.Mutex    // serializes SetTickPeriod re-schedule
 	tickWG      sync.WaitGroup
+
+	// reload state (phase-25.3 Task 3 per AMEND-C3 + R-25.3-2/5 + D-25.3-P3):
+	//
+	//   - reload: the per-*RootVM reload state machine (reload.go). Models the
+	//     Running → Failed → (backoff | attempt) → Running transitions for
+	//     failure_policy = FAIL_RELOAD. Constructed in NewRootVM from rv.clk +
+	//     rv.reloadBaseInterval AFTER the clk default is applied. The
+	//     dispatchReload hook (serialized by dispatchMu) drives it; the
+	//     reinstantiate primitive is the production reattempt. The END-TO-END
+	//     trigger from the filter DecodeHeaders dispatch path lands at Task 9.
+	//
+	//   - reloadBaseInterval: the operator-configured backoff base interval
+	//     (0 ⇒ 1s default; <100ms ⇒ 100ms floor). Set via WithReloadConfig;
+	//     read once in NewRootVM to build rv.reload.
+	//
+	//   - reloadStats: the optional vm_reload counter seam (reload.go
+	//     reloadStatsHook). nil-default; set via WithReloadStats so tests +
+	//     Task 9 can inject the triplet. dispatchReload guards with a nil-check.
+	reload             *reloadState
+	reloadBaseInterval time.Duration
+	reloadStats        reloadStatsHook
 
 	// per-stream-context map (per Q3 — children sharing root VM):
 	streamCtxsMu    sync.RWMutex
@@ -325,6 +354,25 @@ func WithRootClock(c clock.Clock) RootVMOption {
 	return func(rv *RootVM) { rv.clk = c }
 }
 
+// WithReloadConfig sets the FAIL_RELOAD backoff base interval per phase-25.3
+// Task 3 (AMEND-C3 + R-25.3-2/5). 0 (default) ⇒ 1s; 0 < base < 100ms ⇒ 100ms
+// floor; base >= 100ms ⇒ base verbatim. Read once in NewRootVM to build the
+// per-*RootVM reload state machine (reload.go). Production wiring lands at
+// Task 7/9 from the parsed PluginConfig.
+func WithReloadConfig(base time.Duration) RootVMOption {
+	return func(rv *RootVM) { rv.reloadBaseInterval = base }
+}
+
+// WithReloadStats installs the optional vm_reload counter seam (reload.go
+// reloadStatsHook: VmReloadSuccessInc / VmReloadRuntimeFailureInc /
+// VmReloadBackoffInc) per phase-25.3 Task 3. nil-default; dispatchReload
+// guards with a nil-check. Tests + Task 9 inject the triplet; the LOCAL hook
+// interface keeps this Task from forcing RootStatsRecorder to grow before
+// Task 8.
+func WithReloadStats(h reloadStatsHook) RootVMOption {
+	return func(rv *RootVM) { rv.reloadStats = h }
+}
+
 // WithRootTickHandler installs an optional Go-side per-tick hook fired from
 // inside the dispatchMu frame on every tick fire, BEFORE the proxy_on_tick
 // guest dispatch. The handler runs under panic-recovery (a handler panic
@@ -442,6 +490,11 @@ func NewRootVM(ctx context.Context, module *Module, rootCtxID uint32, opts ...Ro
 	if rv.clk == nil {
 		rv.clk = clock.RealClock{}
 	}
+	// Construct the reload state machine AFTER the clk default is applied so
+	// it shares the (possibly fake) clock. Per phase-25.3 Task 3 + D-25.3-P3.
+	if rv.reload == nil {
+		rv.reload = newReloadState(rv.clk, rv.reloadBaseInterval)
+	}
 	// Default the foreign-function registry to the process-global EMPTY
 	// registry if no WithRootForeignRegistry option was applied. Per AMEND-A9
 	// + D-P-PLAN-9: envoy-go ships ZERO default foreign functions; operators
@@ -551,9 +604,38 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 	rv.dispatchMu.Lock()
 	defer rv.dispatchMu.Unlock()
 
-	// Restore + set currentCtxID for the duration of Configure. The pre-seed
-	// at NewRootVM already points at rootCtxID, but we re-set defensively for
-	// the case where the caller has issued earlier per-stream callbacks.
+	// Retain the config bytes so a FAIL_RELOAD re-instantiation (reinstantiate)
+	// can replay proxy_on_vm_start / proxy_on_configure with the same config
+	// per phase-25.3 Task 3. Stored under dispatchMu (read by reinstantiate
+	// under the same lock).
+	rv.vmConfigBytes = vmConfigBytes
+	rv.pluginConfigBytes = pluginConfigBytes
+
+	return rv.runRootLifecycle(ctx)
+}
+
+// runRootLifecycle invokes steps (a)-(d) of the canonical proxy-wasm root-
+// context lifecycle on the CURRENT rv.instance. Shared by Configure (first
+// configuration) + reinstantiate (FAIL_RELOAD replay) per phase-25.3 Task 3
+// so the gating/no-op-skip discipline stays byte-identical across both paths.
+//
+//	(a) _initialize OR _start (mutually exclusive). UNGATED.
+//	(b) proxy_on_context_create(rootCtxID, 0). Gated by capProxyOnContextCreate.
+//	(c) proxy_on_vm_start(rootCtxID, vm_config_size). Gated by capProxyOnVmStart.
+//	(d) proxy_on_configure(rootCtxID, plugin_config_size). Gated by capProxyOnConfigure.
+//
+// MUST be called with dispatchMu held. Sets currentCtxID = rootCtxID for the
+// duration. Cap-denied + guest-not-exported steps are no-op skips (NOT
+// errors); only a non-nil Call error surfaces as a wrapped error.
+//
+// At this Task the byte-size passed to (c)/(d) is 0 even when the retained
+// bytes are non-nil — the VmConfig/PluginConfig data-source resolution +
+// memory-copy lands at Task 14. The bytes are nonetheless retained for the
+// replay-with-same-config contract.
+func (rv *RootVM) runRootLifecycle(ctx context.Context) error {
+	// Restore + set currentCtxID for the duration. The pre-seed at NewRootVM
+	// already points at rootCtxID, but we re-set defensively for the case
+	// where the caller has issued earlier per-stream callbacks.
 	rv.currentCtxID.Store(rv.rootCtxID)
 
 	// (a) _initialize OR _start. Mutually exclusive — per proxy-wasm v0.2.1
@@ -580,9 +662,8 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 
 	// (c) proxy_on_vm_start(rootCtxID, vm_config_size).
 	//
-	// At Task 1 we pass byte-size 0 even when vmConfigBytes is non-nil — the
+	// At this Task we pass byte-size 0 even when vmConfigBytes is non-nil — the
 	// VmConfig data-source resolution + memory-copy lands at Task 14.
-	_ = vmConfigBytes // silence unused at Task 1; activation at Task 14
 	if rv.sandbox.IsAllowed(capProxyOnVmStart) {
 		if fn := rv.instance.ExportedFunction("proxy_on_vm_start"); fn != nil {
 			if _, err := fn.Call(ctx, uint64(rv.rootCtxID), 0); err != nil {
@@ -592,7 +673,6 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 	}
 
 	// (d) proxy_on_configure(rootCtxID, plugin_config_size).
-	_ = pluginConfigBytes // silence unused at Task 1; activation at Task 14
 	if rv.sandbox.IsAllowed(capProxyOnConfigure) {
 		if fn := rv.instance.ExportedFunction("proxy_on_configure"); fn != nil {
 			if _, err := fn.Call(ctx, uint64(rv.rootCtxID), 0); err != nil {
@@ -602,6 +682,92 @@ func (rv *RootVM) Configure(ctx context.Context, vmConfigBytes, pluginConfigByte
 	}
 
 	return nil
+}
+
+// reinstantiate is the production FAIL_RELOAD re-instantiation primitive per
+// phase-25.3 Task 3 (AMEND-C3 + R-25.3-2/5 + D-25.3-P3). It re-instantiates
+// the already-compiled rv.module into a fresh api.Module + replays the root-
+// context lifecycle (steps (a)-(d) via runRootLifecycle) using the retained
+// vm/plugin config bytes.
+//
+// MUST be called with dispatchMu held (dispatchReload holds it across the
+// whole decide+attempt sequence, so exactly one goroutine ever reaches here
+// for a given VM). On a closed RootVM it returns an error without touching
+// the cleared runtime/module. The old rv.instance is closed before the new
+// one is installed; on a re-instantiation or replay error rv.instance is left
+// pointing at whatever was last successfully installed (the caller marks the
+// reload failed + the next attempt re-tries past the backoff window).
+func (rv *RootVM) reinstantiate(ctx context.Context) error {
+	if rv.closed.Load() || rv.runtime == nil || rv.module == nil {
+		return errors.New("wasm: reinstantiate on closed RootVM")
+	}
+
+	// Close the old instance first so the fresh InstantiateModule starts from
+	// clean module state (the wazero runtime keeps the compiled module; only
+	// the live instance is replaced).
+	if rv.instance != nil {
+		_ = rv.instance.Close(ctx)
+		rv.instance = nil
+	}
+
+	instance, err := rv.runtime.InstantiateModule(ctx, rv.module, wazero.NewModuleConfig().WithName(""))
+	if err != nil {
+		return fmt.Errorf("wasm: reinstantiate: %w", err)
+	}
+	rv.instance = instance
+
+	// Replay the lifecycle on the fresh instance with the retained config
+	// bytes. runRootLifecycle sets currentCtxID = rootCtxID as its first step.
+	if err := rv.runRootLifecycle(ctx); err != nil {
+		return fmt.Errorf("wasm: reinstantiate replay: %w", err)
+	}
+	return nil
+}
+
+// dispatchReload is the dispatch-entry hook for the FAIL_RELOAD state machine
+// per phase-25.3 Task 3 + D-25.3-P3. It acquires dispatchMu (NOT reentrant —
+// callers MUST NOT already hold it) so the whole decide+attempt sequence is
+// serialized: exactly one goroutine ever reloads a given VM; concurrent
+// goroutines block, then observe the post-reload Running state + get Serve.
+//
+//   - reloadDecisionAttempt: invoke reattempt(ctx). On nil err →
+//     markReloaded() + VmReloadSuccessInc; on error → markReloadFailed() +
+//     VmReloadRuntimeFailureInc.
+//   - reloadDecisionBackoff: VmReloadBackoffInc (no reattempt).
+//   - reloadDecisionServe: no-op.
+//
+// Returns the decision so the caller (Task 9 filter dispatch) can branch the
+// stream disposition. The injectable reattempt param lets tests count
+// attempts; production callers pass rv.reinstantiate.
+//
+// Lock order: dispatchMu → reload.mu (reload.decide / mark* acquire their own
+// mu under the held dispatchMu — safe + non-reentrant).
+func (rv *RootVM) dispatchReload(ctx context.Context, reattempt func(context.Context) error) reloadDecision {
+	rv.dispatchMu.Lock()
+	defer rv.dispatchMu.Unlock()
+
+	decision := rv.reload.decide()
+	switch decision {
+	case reloadDecisionAttempt:
+		if err := reattempt(ctx); err != nil {
+			rv.reload.markReloadFailed()
+			if rv.reloadStats != nil {
+				rv.reloadStats.VmReloadRuntimeFailureInc()
+			}
+		} else {
+			rv.reload.markReloaded()
+			if rv.reloadStats != nil {
+				rv.reloadStats.VmReloadSuccessInc()
+			}
+		}
+	case reloadDecisionBackoff:
+		if rv.reloadStats != nil {
+			rv.reloadStats.VmReloadBackoffInc()
+		}
+	case reloadDecisionServe:
+		// no-op — VM is Running.
+	}
+	return decision
 }
 
 // NewStreamContext allocates a fresh per-stream context. Monotonic
