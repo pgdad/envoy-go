@@ -1,6 +1,6 @@
 START a fresh cold-start session for envoy-go — phase 26 (`network-filter-chain-and-rbac`) BRAINSTORM is DONE; author the parent SPEC.
 
-This is a parent-SPEC cold-start. **Phase 26 BRAINSTORM is DONE + squash-merged to master + pushed to origin** (BRAINSTORM squash `TBD-26-BRAINSTORM-SQUASH`; origin/master at the same). Phase 26 OPENS the §9 **Network filters family** — the first new §9 feature family since the HTTP-filters family closed at 25.3. The BRAINSTORM (a 6-question user dialogue) settled the family-bootstrap scope + a BRAINSTORM-time 3-way pre-split. STATE.md points at `phase 26 BRAINSTORM done; Network-filters family OPEN`, next-skill `superpowers:writing-plans` (scoped to parent SPEC), next-free `ADR-0213`.
+This is a parent-SPEC cold-start. **Phase 26 BRAINSTORM is DONE + squash-merged to master + pushed to origin** (BRAINSTORM squash `77d6a01`; origin/master at the same). Phase 26 OPENS the §9 **Network filters family** — the first new §9 feature family since the HTTP-filters family closed at 25.3. The BRAINSTORM (a 6-question user dialogue) settled the family-bootstrap scope + a BRAINSTORM-time 3-way pre-split. STATE.md points at `phase 26 BRAINSTORM done; Network-filters family OPEN`, next-skill `superpowers:writing-plans` (scoped to parent SPEC), next-free `ADR-0213`.
 
 ## What this session must do: author the phase-26 parent SPEC per BOOTSTRAP §5 routing
 
@@ -23,9 +23,9 @@ Phase 26 bootstraps the L4 network read-filter chain framework (the network-laye
 
 Self-answered per §9 precedent (SPEC confirms): full cross-side byte-exact differential fixtures; upstream-parity + envoy-go-strict stat surface; ZERO new third-party go.mod deps. Network filters have NO per-route `typed_per_filter_config` (BRAINSTORM §4; ADR-0125 roster untouched — SPEC confirms by absence).
 
-## Project state at master tip (`TBD-26-BRAINSTORM-SQUASH`)
+## Project state at master tip (`77d6a01`)
 
-- **Master tip:** `TBD-26-BRAINSTORM-SQUASH` (the phase-26 BRAINSTORM squash — BRAINSTORM.md + 4 ROADMAP rows + STATE advance + this next-prompt rewrite). Predecessor `b0007a4` (the §9-family-close docs-only repoint). origin/master at the squash. Run `git log --oneline -1` to confirm the actual tip (a stage-close SHA-fill follow-up may advance the tip one past the squash; the caveat is expected).
+- **Master tip:** `77d6a01` (the phase-26 BRAINSTORM squash — BRAINSTORM.md + 4 ROADMAP rows + STATE advance + this next-prompt rewrite). Predecessor `b0007a4` (the §9-family-close docs-only repoint). origin/master at the squash. Run `git log --oneline -1` to confirm the actual tip (a stage-close SHA-fill follow-up may advance the tip one past the squash; the caveat is expected).
 - **§9 HTTP-filters family CLOSED at 25.3** (commit `57c7c4d` IMPL squash; SHA-fill `24c8fe1`); 20 production HTTP filters wired. DO NOT reopen.
 - **Network filters family OPEN:** parent row 26 `in-progress`; sub-rows 26.1/26.2/26.3 `planned`. 6 family candidates remain after phase 26 (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster).
 - **Counts at master tip (carried from 25.3):** stat surface **132**; differential fixtures **41**; fuzzers **35**; conformance **10/10**; ADR tail **ADR-0212**, next-free **ADR-0213**. Anticipated phase-26 family deltas (SPEC pins): fixtures 41 → ~46–47; stats 132 → ~136–138; fuzzers 35 → ~37–38; ADRs 0213 → ~0218.
@@ -44,7 +44,7 @@ Self-answered per §9 precedent (SPEC confirms): full cross-side byte-exact diff
 ## Read first (in order)
 
 1. THIS FILE — the phase-26 parent-SPEC cold-start.
-2. `docs/envoy-go/STATE.md` — active-phase `phase 26 BRAINSTORM done; Network-filters family OPEN`; next-skill `superpowers:writing-plans` (parent SPEC); next-free `ADR-0213`; last-commit `TBD-26-BRAINSTORM-SQUASH`.
+2. `docs/envoy-go/STATE.md` — active-phase `phase 26 BRAINSTORM done; Network-filters family OPEN`; next-skill `superpowers:writing-plans` (parent SPEC); next-free `ADR-0213`; last-commit `77d6a01`.
 3. `docs/envoy-go/phases/26-network-filter-chain-and-rbac/BRAINSTORM.md` — the full settled design (§1–§12; the 6 Q-decisions; §7 locked ADR numbering; §10 D1–D8 empirical-pin obligations with D4 SPEC-BLOCKING).
 4. `docs/envoy-go/ROADMAP.md` — rows 26 / 26.1 / 26.2 / 26.3.
 5. `BOOTSTRAP_PROMPT.md` §5 (state machine; BRAINSTORM→SPEC routing) + §4.1 STATE-update invariant + ADR-0004 (SPEC-time empirical-pin hard-gate).
