@@ -30,9 +30,9 @@ This session:
 
 Read-filter-ONLY (write-filter deferred + API-revision allowance, ADR-0213). NO per-route surface (SPEC §2.4 / parent D6).
 
-## Project state at master tip (`ea77585`)
+## Project state at master tip (`50ede88`)
 
-- **Master tip:** `ea77585` (the phase-26.1-SPEC squash; the stage-close follow-up commit — STATE SHA-fill + this next-prompt rewrite — may advance the tip one further; run `git log --oneline -1` to confirm the actual tip; this repoint caveat is expected). Predecessor `89fc507` (phase-26 parent-SPEC squash; SHA-filled at `607cb74`; tip-repoint trail `073dd7e`/`9429983`). origin/master in sync after push.
+- **Master tip:** `50ede88` (the phase-26.1-SPEC stage-close follow-up — STATE.md SHA-fill + next-prompt.txt repoint). Substantive predecessor `ea77585` (the phase-26.1-SPEC squash; the SHA STATE.md `last-commit` points at). Earlier predecessor `89fc507` (phase-26 parent-SPEC squash; SHA-filled at `607cb74`; tip-repoint trail `073dd7e`/`9429983`). origin/master in sync at `50ede88` after push. (This next-prompt was repointed `ea77585` → `50ede88` to match the actual HEAD per the repoint precedent; run `git log --oneline -1` to confirm.)
 - **§9 Network-filters family OPEN:** parent row 26 `in-progress`; sub-row 26.1 `in-progress` (SPEC done); 26.2/26.3 `planned`. 6 family candidates remain after phase 26 (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster).
 - **Counts at master tip:** stat surface **132**; differential fixtures **41** (numbering tail **0039**); fuzzers **34**; conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0214**, next-free **ADR-0215**. Anticipated 26.1 deltas (at IMPL, NOT at PLAN): fixtures 41 → 44 (0040/0041/0042); fuzzers 34 → 35; stats unchanged at 132; ADR-0213+0214 §Decision/§Consequences bodies land.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
