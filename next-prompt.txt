@@ -27,7 +27,7 @@ This is a MIGRATION/refactor at byte-exact parity (R3 paramount). NO new operato
 
 ## Project state at master tip
 
-- **Master tip:** `9a61788` (the 26.2-PLAN squash). Confirm via `git log --oneline -1` — the commit landing this STATE/next-prompt advance will itself advance the tip +1 (expected, not chased). origin/master in sync after push. STATE.md `last-commit` points at the substantive squash `9a61788` (not the advance commit).
+- **Master tip:** `9fc4735` (the 26.2-PLAN stage-close: STATE advance + next-prompt rewrite; trails the substantive 26.2-PLAN squash `9a61788`). Confirm via `git log --oneline -1` — the commit landing this repoint will itself advance the tip +1 (expected, not chased further). origin/master in sync after push. STATE.md `last-commit` points at the substantive squash `9a61788` (not the stage-close/repoint commits).
 - **§9 Network-filters family OPEN:** parent row 26 `in-progress`; sub-row 26.1 `done`; 26.2 `in-progress` (flips `in-progress → done` at 26.2 IMPL phase-done); 26.3 `planned`. Parent row 26 flips `in-progress → done` at 26.3 phase-done (ROLLUP precedent 18/19/22/24/25).
 - **Counts at master tip:** stat surface **132**; differential numbered-fixtures **44** (tail **0042**); fuzzers **35**; conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0215** (the §Decision/§Consequences bodies land at 26.2 IMPL Task 12 in place per ADR-0044 — tail STAYS ADR-0215), next-free **ADR-0216**. 26.2 is a migration: anticipated NO new fixtures/fuzzers/stats deltas (the IMPL Task-1 re-verifies the baselines).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
