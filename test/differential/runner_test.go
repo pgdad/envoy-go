@@ -62,6 +62,9 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0037-http-wasm-body-and-advanced-boot-reject/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0038-http-wasm-perroute-and-multi-plugin/inputs"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0039-http-wasm-perroute-boot-reject/inputs"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0040-network-echo/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0041-network-direct-response/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0042-network-direct-response-boot-reject/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

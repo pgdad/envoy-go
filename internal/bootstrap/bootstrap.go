@@ -65,6 +65,16 @@ import (
 	// amendment policy this addition is documented in PROGRESS, not as a
 	// new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
+
+	// Phase-26.1 registers the echo + direct_response network-filter extension
+	// protos so protojson round-trips bootstraps carrying
+	// filter_chains[].filters[].typed_config of those types (the 26.1 network
+	// read-filter chain). Registered transitively by the echo/directresponse
+	// filter packages too; the explicit blank-imports here guarantee resolution
+	// in any bootstrap-parsing context. Per ADR-0016 amendment policy, documented
+	// in PROGRESS, not a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/direct_response/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/echo/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"

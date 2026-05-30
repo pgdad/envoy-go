@@ -18,7 +18,7 @@ Phase 26.1 lands the foundational L4 **read-filter chain framework** — the mis
 
 1. **NEW `internal/filter/network/` framework package** — the read-filter iteration protocol (`ReadFilter` interface + two-value `Status` enum), `ReadFilterCallbacks` (the `Connection()` accessor + `ContinueReading()` + `DynamicMetadata()`), the per-connection drainable read `Buffer` with connection-level buffering on `StopIteration`, the per-connection read-filter **chain runner** (sequential dispatch mirroring `internal/listener/listenerfilter/pipeline.go` + the upstream `filter_manager_impl.cc` semantics per parent §11.5), the per-connection **runtime context** (owns the `*dynamicmetadata.Bucket`), and the freeze-after-boot threaded-constructor `*network.Registry` (byte-identical discipline to `internal/listener/listenerfilter/registry.go:19-58` + `internal/filter/http/registry.go:17-110`; ADR-0072/0079). Anchored at **ADR-0213** (chain framework) + **ADR-0214** (registry + boot-wiring + dual-dispatch). API surface refined at §3.1 below from the parent SPEC §4.1 sketch.
 
-2. **NEW `internal/filter/network/echo/` package** — `envoy.filters.network.echo.v3.Echo` (EMPTY config per parent AMEND-A2). `OnData` writes the received bytes back via `callbacks.Connection().Write(...)`, drains the read buffer, returns `StopIteration` (mirrors `echo.cc` per parent §11.7 D7). No `OnNewConnection` override (default `Continue`).
+2. **NEW `internal/filter/network/echo/` package** — `envoy.extensions.filters.network.echo.v3.Echo` (EMPTY config per parent AMEND-A2; the proto full-name carries the `extensions.` segment — corrected at 26.1 IMPL, see §3.6/§4.1). `OnData` writes the received bytes back via `callbacks.Connection().Write(...)`, drains the read buffer, returns `StopIteration` (mirrors `echo.cc` per parent §11.7 D7). No `OnNewConnection` override (default `Continue`).
 
 3. **NEW `internal/filter/network/directresponse/` package** — `envoy.extensions.filters.network.direct_response.v3.Config` (message name `Config`, NOT `DirectResponse`, per parent AMEND-A1). Logic in `OnNewConnection` (NOT `OnData`, per parent §11.7 D7): write the configured `response` DataSource bytes with `endStream=true`, set response-code-details `DirectResponse`, close the connection with `FlushWrite` semantics, return `StopIteration`. No configurable delay in v1.37.2. Single config field `response` (`DataSource`); `DataSource.specifier` oneof PGV-required if `response` present (parent §5.2).
 
@@ -328,7 +328,7 @@ Threaded into the manager constructor as the new `netReg` argument:
 lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr, httpClient, netReg)
 ```
 
-`echo.TypeURL` = `"type.googleapis.com/envoy.filters.network.echo.v3.Echo"`; `directresponse.TypeURL` = `"type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config"` (note `Config`, per AMEND-A1). Registration order does NOT affect runtime behavior (ADR-0072); stylistic discipline only — the PLAN pins the exact insertion position relative to the `lfReg` block.
+`echo.TypeURL` = `"type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo"` (corrected at 26.1 IMPL: the go-control-plane v1.32.4 proto full-name carries the `extensions.` segment; verified vs upstream v1.37.2 by fixture 0040); `directresponse.TypeURL` = `"type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config"` (note `Config`, per AMEND-A1). Registration order does NOT affect runtime behavior (ADR-0072); stylistic discipline only — the PLAN pins the exact insertion position relative to the `lfReg` block.
 
 ---
 
@@ -336,7 +336,7 @@ lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(
 
 ### 4.1 `echo` (`internal/filter/network/echo/`)
 
-- **TypeURL** — `type.googleapis.com/envoy.filters.network.echo.v3.Echo`.
+- **TypeURL** — `type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo` (corrected at 26.1 IMPL: the go-control-plane v1.32.4 proto full-name carries the `extensions.` segment; verified vs upstream v1.37.2 by fixture 0040).
 - **Config** — EMPTY message (parent AMEND-A2; `echo.pb.go` zero user fields; VACUOUS `echo.pb.validate.go`). `New(tc, ctx)` parses the empty `Echo{}` (accept empty/absent `typed_config` body), returns a `FilterInstanceFactory` allocating a fresh `*echoFilter` per connection. No field-level PARSE-REJECT.
 - **`OnNewConnection`** — not overridden / returns `Continue` (no-op; mirrors `echo.cc` which has no `onNewConnection` override).
 - **`OnData(buf, endStream)`** — `cb.Connection().Write(buf.Bytes(), endStream)` then `buf.Drain(buf.Len())` then `return StopIteration` (mirrors `echo.cc`: `connection().write(data, end_stream)` + `ASSERT(0 == data.length())` + `FilterStatus::StopIteration`). Echoes downstream bytes back over the same connection; the read loop continues until the downstream closes (EOF).

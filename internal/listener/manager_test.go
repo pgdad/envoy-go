@@ -18,6 +18,7 @@ import (
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	drv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/direct_response/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -29,6 +30,9 @@ import (
 	"github.com/esalaine/envoy-go/internal/drain"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
+	"github.com/esalaine/envoy-go/internal/filter/network/echo"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -1334,7 +1338,7 @@ func TestNewManager_ChainSelectionPropagation(t *testing.T) {
 	// bootstrap to declare the filter so SelectChain sees inputs.ServerName.
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1502,7 +1506,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1522,7 +1526,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
@@ -1682,7 +1686,7 @@ func TestParseListenerFiltersResolvesViaRegistry(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1712,7 +1716,7 @@ func TestParseListenerFiltersUnknownTypeURLErrors(t *testing.T) {
 		}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown listener-filter type_url, got nil")
 	}
@@ -2089,7 +2093,7 @@ func TestParseListenerFiltersNilRegistryErrors(t *testing.T) {
 		ListenerFilters: []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for non-empty listener_filters[] with nil lfRegistry, got nil")
 	}
@@ -2317,7 +2321,7 @@ func TestUnifiedDispatchTLSWithSNI(t *testing.T) {
 	})
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2581,7 +2585,7 @@ func TestManager_Drain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2600,7 +2604,7 @@ func TestManager_DrainIdempotent(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
 	m.Drain()
 	m.Drain()
 	m.Drain()
@@ -2617,7 +2621,7 @@ func TestManager_AcceptDuringDrainClosesConn(t *testing.T) {
 		mkListener("l_tcp_drain", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(1 * time.Hour)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := m.Start(ctx); err != nil {
@@ -2646,11 +2650,243 @@ func TestManager_StopAfterDrain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_ = m.Start(ctx)
 	m.Drain() // sets dm.IsDraining=true
 	m.Stop()  // closes listening sockets (post-drain teardown)
 	m.Stop()  // idempotent
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26.1 (Task 10/11): network read-filter-chain dual-dispatch
+// ---------------------------------------------------------------------------
+
+// mkEchoNetFilter builds a *listenerv3.Filter whose typed_config is the
+// network echo filter (empty body — echo has no fields).
+func mkEchoNetFilter(t *testing.T) *listenerv3.Filter {
+	t.Helper()
+	a := &anypb.Any{TypeUrl: echo.TypeURL}
+	return &listenerv3.Filter{Name: "envoy.filters.network.echo", ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: a}}
+}
+
+// mkDirectResponseNetFilter builds a *listenerv3.Filter whose typed_config is
+// the network direct_response filter with an inline_string response body.
+func mkDirectResponseNetFilter(t *testing.T, body string) *listenerv3.Filter {
+	t.Helper()
+	msg := &drv3.Config{Response: &corev3.DataSource{Specifier: &corev3.DataSource_InlineString{InlineString: body}}}
+	a, err := anypb.New(msg)
+	if err != nil {
+		t.Fatalf("anypb.New(direct_response): %v", err)
+	}
+	return &listenerv3.Filter{Name: "envoy.filters.network.direct_response", ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: a}}
+}
+
+// testNetRegistry returns a freshly-allocated, frozen *network.Registry with
+// echo + direct_response registered. Mirrors the testHTTPRegistry / testLFRegistry
+// boot-populated-then-frozen pattern.
+func testNetRegistry() *network.Registry {
+	r := network.NewRegistry()
+	r.Register(echo.TypeURL, echo.New)
+	r.Register(directresponse.TypeURL, directresponse.New)
+	r.Freeze()
+	return r
+}
+
+// firstChain returns the single built chainInfo of mgr's first runtime (the
+// catch-all/default chain a single-chain bootstrap produces). Tests assert on
+// .filter vs .netChainFactory to verify the dual-dispatch build decision.
+func firstChain(t *testing.T, mgr *Manager) *chainInfo {
+	t.Helper()
+	if len(mgr.runtimes) == 0 {
+		t.Fatal("Manager has no runtimes")
+	}
+	rt := mgr.runtimes[0]
+	if len(rt.chainSpecs) != 1 {
+		t.Fatalf("expected exactly 1 chainSpec, got %d", len(rt.chainSpecs))
+	}
+	ci := rt.chainByName[rt.chainSpecs[0].Name]
+	if ci == nil {
+		t.Fatalf("chainByName[%q] missing (logic bug)", rt.chainSpecs[0].Name)
+	}
+	return ci
+}
+
+func TestBuildNewPathChainWhenFilterInNetReg(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_net_echo", "127.0.0.1", 0, mkEchoNetFilter(t)),
+	}, nil)
+
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(net echo chain): %v", err)
+	}
+	ci := firstChain(t, mgr)
+	if ci.netChainFactory == nil {
+		t.Error("netChainFactory is nil; expected new read-filter-chain path for echo filters[0]")
+	}
+	if ci.filter != nil {
+		t.Error("filter is non-nil; expected nil on the new read-filter-chain path")
+	}
+	// The factory must allocate fresh instances per call (one per connection).
+	a, b := ci.netChainFactory(), ci.netChainFactory()
+	if len(a) != 1 || len(b) != 1 {
+		t.Fatalf("netChainFactory returned len %d/%d, want 1/1", len(a), len(b))
+	}
+	if &a[0] == &b[0] {
+		t.Error("netChainFactory returned the same backing array across calls (instances not fresh)")
+	}
+}
+
+func TestMixedChainRejectedAt261(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	// chain = [echo (network), tcp_proxy (terminal)] — echo resolves in netReg,
+	// tcp_proxy does not → mixed read+terminal chain → boot-reject.
+	l := &listenerv3.Listener{
+		Name: "l_mixed",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0}},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{
+			Filters: []*listenerv3.Filter{mkEchoNetFilter(t), mkTcpProxyFilter(t, "c_echo")},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	if err == nil {
+		t.Fatal("NewManager(mixed chain) returned nil error; expected mixed-chain boot-reject")
+	}
+	if !strings.Contains(err.Error(), "network-filter-mixed-chain-unsupported") {
+		t.Errorf("error = %q; want it to mention network-filter-mixed-chain-unsupported", err.Error())
+	}
+}
+
+func TestOldPathUnaffectedWhenNetRegNilOrMiss(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+
+	// (a) nil netReg + tcp_proxy chain → old terminal-filter path.
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewManager(nil netReg, tcp_proxy): %v", err)
+	}
+	ci := firstChain(t, mgr)
+	if ci.filter == nil || ci.netChainFactory != nil {
+		t.Errorf("nil netReg: filter=%v netChainFactory!=nil=%v; want filter set + netChainFactory nil", ci.filter != nil, ci.netChainFactory != nil)
+	}
+
+	// (b) non-nil netReg but filters[0]=tcp_proxy (not in netReg) → old path.
+	boot2 := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_tcp2", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	mgr2, err := NewManagerWithBaseDirAndAllowH2C(boot2, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(netReg, tcp_proxy miss): %v", err)
+	}
+	ci2 := firstChain(t, mgr2)
+	if ci2.filter == nil || ci2.netChainFactory != nil {
+		t.Errorf("netReg miss: filter=%v netChainFactory!=nil=%v; want filter set + netChainFactory nil", ci2.filter != nil, ci2.netChainFactory != nil)
+	}
+}
+
+// startNetChainListener boots + starts a single-listener manager whose only
+// filter_chain is the supplied network read-filter chain, and returns the
+// bound address. The manager is Stop()'d via t.Cleanup.
+func startNetChainListener(t *testing.T, filters ...*listenerv3.Filter) string {
+	t.Helper()
+	cm := mkClusterMgr(t, "c_unused", "127.0.0.1", 9999)
+	l := &listenerv3.Listener{
+		Name: "l_net",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0}},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{Filters: filters}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(net chain): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { mgr.Stop(); cancel() })
+	ls := mgr.Listeners()
+	if len(ls) != 1 || ls[0].Addr == "" {
+		t.Fatalf("expected 1 bound listener, got %+v", ls)
+	}
+	return ls[0].Addr
+}
+
+func TestServeReadFilterChainEcho(t *testing.T) {
+	addr := startNetChainListener(t, mkEchoNetFilter(t))
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Write SEVERAL SEPARATE payloads over the same connection, reading each
+	// echo back before sending the next. Upstream echo re-iterates the chain on
+	// every socket read, so EVERY write must be echoed — not just the first.
+	// (Regression: the old sticky-halt chain swallowed writes 2+ after the first
+	// StopIteration, so this read-back of write #2 timed out.)
+	for _, want := range [][]byte{
+		[]byte("hello echo 26.1"),
+		[]byte("second write"),
+		[]byte("third write"),
+	} {
+		if _, err := conn.Write(want); err != nil {
+			t.Fatalf("write %q: %v", want, err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		got := make([]byte, len(want))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("read echoed bytes for %q: %v", want, err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("echo = %q, want %q", got, want)
+		}
+	}
+
+	// Half-close the write side → server observes EOF and closes its side. A
+	// subsequent read on the connection must hit EOF.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		if err := tc.CloseWrite(); err != nil {
+			t.Fatalf("CloseWrite: %v", err)
+		}
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 8)); err != io.EOF {
+		t.Errorf("after half-close, read err = %v, want io.EOF (server closed)", err)
+	}
+}
+
+func TestServeReadFilterChainDirectResponse(t *testing.T) {
+	const body = "go away (direct_response 26.1)"
+	addr := startNetChainListener(t, mkDirectResponseNetFilter(t, body))
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// direct_response writes the body in OnNewConnection then closes; the client
+	// reads the body followed by EOF without sending anything.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("direct_response body = %q, want %q", got, body)
+	}
 }

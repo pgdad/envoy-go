@@ -46,6 +46,9 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/filter/http/wasm"
+	network "github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
+	"github.com/esalaine/envoy-go/internal/filter/network/echo"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
@@ -199,6 +202,19 @@ func main() {
 	lfReg.Register(tls_inspector.TypeURL, tls_inspector.New)
 	lfReg.Freeze()
 
+	// Phase-26.1: build the *network.Registry and register the two network read
+	// filters envoy-go ships at 26.1 — echo + direct_response. Per ADR-0072/0079
+	// + ADR-0214 the registry is freeze-after-boot: Freeze MUST be invoked after
+	// all Register calls and BEFORE the listener manager is constructed (the
+	// per-listener parser inside NewManagerWithBaseDirAndAllowH2C resolves
+	// filter_chains[].filters[].type_urls against the frozen registry for the
+	// dual-dispatch decision). tcp_proxy/HCM are NOT registered here at 26.1 —
+	// they keep the existing manager.go terminal-filter path (migration is 26.2).
+	netReg := network.NewRegistry()
+	netReg.Register(echo.TypeURL, echo.New)
+	netReg.Register(directresponse.TypeURL, directresponse.New)
+	netReg.Freeze()
+
 	// Phase-20 Task 2b (ADR-0177 + ADR-0150 §Decision AMENDMENT): construct
 	// the shared *httpclient.Client singleton AT BOOT for cross-phase reuse
 	// by jwks Fetcher (this Task 2b) + extauthz httpAuthClient (Task 2c) +
@@ -210,7 +226,7 @@ func main() {
 	// hcm.ListenerCtx{HTTPClient: ...} into per-filter FactoryCtx.HTTPClient.
 	httpClient := httpclient.New(httpclient.Options{Timeout: 30 * time.Second})
 
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr, httpClient)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr, httpClient, netReg)
 	if err != nil {
 		log.Fatalf("listener manager: %v", maybeWrapLuaScriptLoadError(err))
 	}

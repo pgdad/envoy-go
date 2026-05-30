@@ -3496,6 +3496,83 @@ tls_inspector.bytes_processed: P0(nan,1400) P25(nan,1425) P50(nan,1450) P75(nan,
 
 ---
 
+## Network filters
+
+*Introduced by phase 26.1 — the FIRST §9 Network-filters-family row, opening the first new §9 feature family since the §9 HTTP-filters family closed at phase 25. Justified by ADR-0213 (L4 read-filter chain framework) + ADR-0214 (network-filter registry + boot-wiring + 26.1 dual-dispatch).*
+
+Phase 26.1 lands the NEW `internal/filter/network/` read-filter chain framework — the L4 analogue of phase 07.1's HTTP filter framework, and the first new filter-category framework primitive since phase 07.1 — plus its first two consumers (`echo` + `direct_response`). This subsection codifies the read-filter iteration contract and the two filters' wire behavior against reference Envoy v1.37.2.
+
+At master tip the only network filters (`tcp_proxy` + HCM) were terminal-only, selected one-per-chain via a hardcoded `map` in `internal/listener/manager.go` with a private `Handle(ctx, conn)` interface — no iteration, no callbacks, no read-filter protocol. Phase 26.1 introduces the missing chain framework alongside the untouched terminal path (the **dual-dispatch**, below); `tcp_proxy`/HCM migrate onto the read-filter interface and the hardcoded registry retires at 26.2.
+
+### Network filter chain framework
+
+The read-filter chain runner (`internal/filter/network/`) iterates read filters over an accepted downstream connection, mirroring Envoy v1.37.2 `source/common/network/filter_manager_impl.cc` at L4.
+
+- **Iteration-status protocol.** The `ReadFilter` interface is `OnNewConnection() Status` + `OnData(buf []byte, endStream bool) Status` (+ `SetReadFilterCallbacks(cb)` + `OnDestroy()`), returning a **TWO-value** `Status` enum (`Continue` / `StopIteration`). There is NO `StopIterationAndBuffer` / `StopAllIteration` variant (unlike the HTTP chain's `FilterDataStatus`) because L4 buffering is CONNECTION-level, not filter-level (empirical scrape of `envoy/network/filter.h` — the network `FilterStatus` enum has exactly two values).
+- **`OnNewConnection`** is called eagerly per filter at connection accept (before any data), in registration order, stopping on `StopIteration` (mirrors upstream `initializeReadFilters()`).
+- **`OnData`** is called with the connection read buffer when `length > 0 || endStream`.
+- **Connection-level buffering + re-iteration semantics.** On `StopIteration` the chain runner stops at the current filter and leaves the undrained bytes in the connection read buffer. There are TWO distinct halt behaviors: an `OnNewConnection`-`StopIteration` is **sticky across reads** (the only cross-read-persistent halt; cleared only by `ContinueReading()`); an `OnData`-`StopIteration` is **NOT sticky** — it stops the current pass only, and the NEXT socket read re-delivers the accumulated buffer from the stopping filter (upstream `onRead` re-iteration). This distinction is load-bearing: `echo` returns `StopIteration` from every `OnData` (without `ContinueReading`) yet must echo EVERY subsequent read, not just the first.
+- **`ContinueReading()`** resumes at the NEXT filter with the currently-available buffered bytes (upstream `onContinueReading(...)` resuming at `std::next(filter->entry())`).
+- **`ReadFilterCallbacks` surface:** a `Connection()` accessor (`Write([]byte, endStream)`, `Close(CloseType)`, `LocalAddr()/RemoteAddr() net.Addr`, `RequestedServerName() string`, `DownstreamPrincipals() []string` — the full L4 accessor surface shaped at 26.1 so 26.3 `rbac_network` needs no callbacks revision), `ContinueReading()`, and `DynamicMetadata() *dynamicmetadata.Bucket`.
+- **`CloseType`** enum has `FlushWrite` / `NoFlush` at 26.1 (no other variants needed by the first consumers).
+- **Per-connection runtime context** — the genuinely-new L4 primitive (analogue of the HTTP chain's per-stream state). It owns the reused `*dynamicmetadata.Bucket` (`internal/dynamicmetadata/`; constructed via `NewBucket()` at connection entry, `Reset()`+nil at `OnDestroy`) and is threaded into each filter's callbacks. NO filter writes to the Bucket at 26.1 (the first real `Set` lands at 26.3 `rbac_network`); it round-trips a unit-test `Set`/`Get` for accessor readiness.
+- **Single-goroutine-per-connection** — the chain runner dispatches synchronously on the connection goroutine (`internal/listener/manager.go serveReadFilterChain`), consistent with the existing model. No per-filter goroutine; cross-goroutine async read-filter resume is deferred.
+- **Drainable `Buffer`** — the read buffer models upstream's `Buffer::Instance` drain semantics (`Append`/`Bytes`/`Len`/`Drain`; over-drain clamped) that `echo`'s write-back-then-drain relies on.
+- **Freeze-after-boot `*network.Registry`** — boot-populated, frozen before serving, lock-free post-Freeze lookup (see ADR-0214 below).
+- **Dual-dispatch in `manager.go`** — a build-time pre-check: a filter chain whose `filters[0]` type_url resolves in the frozen `*network.Registry` (and whose every filter resolves) dispatches via the new read-filter chain runner; otherwise the EXISTING `tcp_proxy`/HCM terminal path is taken UNTOUCHED. R4 back-compat is intrinsic (when `netReg == nil`, or the chain's leading filter is not registered, the pre-check is skipped and the old path is byte-identical) — proven by the existing `0000-tcp-echo` + `0002-tls-tcp` + HCM differential fixtures staying byte-exact green.
+
+**envoy-go-strict departure records (joint divergence-window with the prior §9 family rows):**
+
+- **Write-filter ABSENT (ADR-0213).** Only read filters are supported at 26.1; the `WriteFilter` / `onWrite` surface is DEFERRED with an EXPLICIT API-REVISION ALLOWANCE clause (every near-term Network-family filter — `echo`, `direct_response`, `tcp_proxy`, `rbac_network`, `sni_cluster` — is a read filter; write filters appear only in deferred protocol proxies). Building unexercised write-filter plumbing would violate the every-surface-exercised discipline.
+- **`network-filter-mixed-chain-unsupported` — 26.1-transitional boot-reject (lifted at 26.2).** A chain whose `filters[0]` resolves in `netReg` but whose subsequent `filters[1..]` do NOT all resolve in `netReg` (a new-path chain mixing `echo`/`direct_response` with `tcp_proxy`/HCM) is REJECTED at boot. This is an envoy-go-strict 26.1-only transitional reject (upstream supports mixed chains); it is a UNIT-TEST-only boot-reject (no cross-side differential fixture — covered by a `manager.go` build-path unit test) and is LIFTED at 26.2 when `tcp_proxy`/HCM become read filters and the dispatch unifies.
+- **Read-filter-ONLY scope.** No L4 write filter, no `tcp_proxy`/HCM-as-read-filter (26.2), no `rbac_network` connection-metadata writes (26.3) at 26.1.
+
+### envoy.filters.network.echo
+
+`echo` (`@type` `type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo` — see the type-URL note below) reflects downstream bytes back over the same connection. Config is the EMPTY `Echo` message (zero user fields; vacuous PGV); an empty or absent `typed_config` body is accepted (no field-level PARSE-REJECT; no echo PARSE-REJECT arms).
+
+- **`OnNewConnection`** — not overridden / returns `Continue` (mirrors `echo.cc`, which has no `onNewConnection` override).
+- **`OnData(buf, endStream)`** — `Connection().Write(buf.Bytes(), endStream)` then `buf.Drain(buf.Len())` then `return StopIteration` (mirrors `echo.cc`: `connection().write(data, end_stream)` + `ASSERT(0 == data.length())` + `FilterStatus::StopIteration`). Echoes downstream bytes verbatim; the read loop continues (re-delivering each subsequent read per the non-sticky `OnData`-`StopIteration` semantics above) until the downstream closes (EOF).
+- **`SetReadFilterCallbacks` / `OnDestroy`** — store cb; `OnDestroy` is a no-op (no per-connection resources).
+- **Stats:** 0 built-in counters (upstream parity).
+- **Differential:** cross-side fixture `0040-network-echo` — a multi-write payload echoed byte-exact vs reference Envoy v1.37.2 (the empirical confirmation that the corrected `@type` boots on real upstream).
+
+### envoy.extensions.filters.network.direct_response
+
+`direct_response` (`@type` `type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config`) writes a static configured response and closes the connection. NOTE the proto message is named **`Config`** (not `DirectResponse`).
+
+- **Config — single field `response`** (`config.core.v3.DataSource`, tag 1). `New(tc, ctx)` resolves the `response` DataSource at config-load (boot) into the static response bytes, via the 4-arm `DataSource.specifier` oneof: `inline_string` → byte-cast; `inline_bytes` → verbatim; `filename` → `os.ReadFile` relative to the bootstrap base dir (`FactoryCtx.BaseDir`); `environment_variable` → `os.LookupEnv`. A bad `filename` / unset env-var rejects at boot.
+- **`OnNewConnection`** — the logic lives HERE (NOT `OnData`): `Connection().Write(responseBytes, true)` (endStream=true) + set the internal response-code-details string `DirectResponse` (below) + `Connection().Close(FlushWrite)` + `return StopIteration`. Mirrors `direct_response/filter.cc`: `connection.write(data, true); connection.close(FlushWrite); return StopIteration`. NO configurable delay (v1.37.2).
+- **`OnData`** — not exercised in the normal path (the connection closes in `OnNewConnection` before any data iteration); returns `StopIteration` defensively.
+- **Internal `DirectResponse` response-code-details string — NO operator-visible surface (envoy-go-strict, set-but-unread).** Unlike the HTTP path there is no `streamInfo`-equivalent sink on an L4 connection at master tip, so the string has no existing operator-visible surface. envoy-go sets it (on the per-connection runtime context's RCD sink) for upstream-parity + forward-consumer readiness; it is set-but-unread at 26.1, with no fixture assertion (joint divergence-window with the prior §9 rows).
+- **Boot-reject parity (`response.specifier` required).** A `direct_response` config whose `response.specifier` oneof is unset rejects at boot in BOTH binaries. envoy-go's byte-stable wording is `direct_response: response.specifier is required`; reference Envoy v1.37.2 emits `ConfigValidationError.Response: ... field: "specifier", reason: is required` — the shared case-sensitive substring is **`specifier`** (cross-side fixture `0042-network-direct-response-boot-reject`). The `response`-ABSENT arm does NOT reject upstream (boots), so `response: {}` (specifier unset) is the only symmetric boot-reject arm.
+- **Stats:** 0 built-in counters (upstream parity).
+
+### Type-URL correction (echo `@type`)
+
+The phase-26.1 SPEC §3.6/§4.1 originally pinned echo's type URL as `type.googleapis.com/envoy.filters.network.echo.v3.Echo`. The ACTUAL go-control-plane v1.32.4 proto full-name carries the `extensions.` segment: **`type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo`** (verified at 26.1 IMPL via `proto.MessageName`, the boot smoke, and fixture `0040` against real upstream Envoy v1.37.2 — without `extensions.` the binary cannot boot an echo config: `protojson: ... "not found"`). `echo.TypeURL` was corrected to the `extensions.` form (and the SPEC §3.6/§4.1 lines corrected in-place at 26.1 IMPL Task 17). `direct_response`'s type URL (`...envoy.extensions.filters.network.direct_response.v3.Config`) already carried `extensions.` and was correct.
+
+### Stat surface
+
+`echo`: 0 built-in stats. `direct_response`: 0 built-in stats. The framework adds 0 counters. Project stat surface stays **132** at 26.1 phase-done (the `rbac_network` 4-counter roster landing 132 → 136 is 26.3).
+
+### Forward-pointer note (26.2 / 26.3)
+
+- **26.2** migrates `tcp_proxy` (`internal/filter/tcpproxy/`) + HCM (`internal/filter/hcm/`) onto the read-filter interface + the extensible `*network.Registry`, and RETIRES the hardcoded `filterRegistry` map + `filterHandler`/`filterConstructor` types in `internal/listener/manager.go` — unifying the dispatch (the `network-filter-mixed-chain-unsupported` transitional reject is lifted) and proving the 26.1 framework on the load-bearing path (back-compat via the existing fixtures staying byte-exact green).
+- **26.3** lands `rbac_network` (`envoy.extensions.filters.network.rbac.v3.RBAC`) at full upstream parity (enforced + shadow rules + connection-level dynamic-metadata emission + the `allowed`/`denied`/`shadow_allowed`/`shadow_denied` stat roster) + extracts the shared `internal/rbac/` engine (HTTP rbac migrated as consumer #1, network rbac as consumer #2) + the first real connection-level `*dynamicmetadata.Bucket` writes.
+
+### Applies to
+- Phase 26.1 onward (L4 read-filter chain framework + `echo` + `direct_response`).
+
+### Does not yet apply to
+- L4 write filters (`WriteFilter` / `onWrite`) — deferred with API-revision allowance (ADR-0213).
+- `tcp_proxy` / HCM as read filters + hardcoded-registry retirement (26.2).
+- `rbac_network` + the shared `internal/rbac/` engine + connection-level dynamic-metadata writes (26.3).
+- Multi-read-filter chains terminating in `tcp_proxy`/HCM (the `network-filter-mixed-chain-unsupported` reject; lifted at 26.2).
+- Other Network-family filters (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster).
+
+---
+
 ## HTTPFilterCallbacks
 
 *Introduced by phase 16. Justified by ADR-0144 (TLS-principal accessor framework primitive).*

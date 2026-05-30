@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sort"
@@ -24,6 +25,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/filter/hcm"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
@@ -182,7 +184,15 @@ func extractListenerPrincipal(cfg *stdtls.Config) string {
 type chainInfo struct {
 	serverNames []string       // from filter_chain_match.server_names; nil/empty = catch-all
 	tlsCfg      *stdtls.Config // nil if plaintext chain
-	filter      filterHandler  // exactly one terminal filter (phase-02 registry)
+	filter      filterHandler  // exactly one terminal filter (phase-02 registry); nil on the new read-filter path
+	// netChainFactory is the phase-26.1 (§3.5) read-filter-chain path: a
+	// closure capturing the boot-resolved []network.FilterInstanceFactory that
+	// allocates a fresh []network.ReadFilter per accepted connection. Non-nil
+	// ONLY when filters[0]'s type_url resolved in the network Registry at build
+	// time; nil for the terminal-filter (tcp_proxy/HCM) path. Exactly one of
+	// `filter` / `netChainFactory` is non-nil per chain (the build-time
+	// pre-check at the buildTerminalFilter call sites enforces this).
+	netChainFactory func() []network.ReadFilter
 }
 
 // listenerRuntime is the phase-03 replacement for builtListener. It holds
@@ -259,7 +269,7 @@ type Manager struct {
 // freeze-after-boot). Task 20 wires the real boot-time population; until then
 // callers (test bootstraps) build a router-only frozen registry.
 func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.Registry, httpRegistry *filter_http.HTTPRegistry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil, nil, nil)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil, nil, nil, nil)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
@@ -271,7 +281,7 @@ func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.
 // Phase 06.1 (Task 10): see NewManager doc — same Registry contract applies.
 // Phase 07.1 (Task 14): see NewManager doc — same HTTPRegistry contract applies.
 func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, registry *stats.Registry, httpRegistry *filter_http.HTTPRegistry) (*Manager, error) {
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil, nil, nil)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil, nil, nil, nil)
 }
 
 // NewManagerWithBaseDirAndAllowH2C is the phase-05.1 constructor variant. It
@@ -299,7 +309,14 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 // resolution. May be nil — but if any listener in bs has a non-empty
 // `listener_filters[]`, a non-nil frozen registry is required (the parser
 // errors otherwise).
-func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client) (*Manager, error) {
+// Phase 26.1 (Task 10, §3.5): netReg is the boot-populated, frozen network
+// read-filter *network.Registry consulted by the build-time dual-dispatch
+// pre-check at each filter-chain. When non-nil and a chain's filters[0]
+// type_url resolves in netReg, the chain is built on the new read-filter path
+// (chainInfo.netChainFactory) instead of the terminal-filter path; mixed
+// read+terminal chains are boot-rejected. May be nil — the old terminal-filter
+// path (tcp_proxy/HCM) is then taken for every chain (R4 back-compat).
+func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, netReg *network.Registry) (*Manager, error) {
 	ls := bs.GetStaticResources().GetListeners()
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
@@ -313,7 +330,7 @@ func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Man
 	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry, dm: dm}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm, httpClient, nodeServiceCluster)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm, httpClient, nodeServiceCluster, netReg)
 		if err != nil {
 			return nil, err
 		}
@@ -385,7 +402,7 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 // per SPEC §12. The phase-03 parse-time errors on `default_filter_chain` and
 // `listener_filters[]` (ADR-0033 clauses 3 and 8) are also superseded; both
 // fields are now honored.
-func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, nodeServiceCluster string) (*listenerRuntime, error) {
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, nodeServiceCluster string, netReg *network.Registry) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -437,19 +454,33 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 			anyPlaintext = true
 		}
 
-		// Build the terminal filter (same single-filter rule as phase 02).
-		// Phase 18.2 Task 4 (ADR-0165): listenerPrincipal pre-extracted from
-		// the chain's leaf TLS cert (URI SAN[0] → DNS SAN[0] → Subject CN);
-		// empty for plaintext chains.
-		fh, err := buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(chainTLS), httpClient: httpClient, nodeServiceCluster: nodeServiceCluster}, registry, accessLogSinks, httpRegistry, dm)
+		// Phase 26.1 (Task 10, §3.5): build-time dual-dispatch pre-check. If
+		// filters[0]'s type_url resolves in netReg, build the new read-filter
+		// chain (mixed read+terminal chains are boot-rejected here) and SKIP
+		// buildTerminalFilter; otherwise fall through to the unchanged
+		// terminal-filter path.
+		ncfPrefix := fmt.Sprintf("listener: %q: filter_chains[%d]", name, i)
+		netChainFactory, isNetChain, err := buildNetChainFactory(ncfPrefix, fc.GetFilters(), netReg, baseDir)
 		if err != nil {
 			return nil, err
+		}
+
+		var fh filterHandler
+		if !isNetChain {
+			// Build the terminal filter (same single-filter rule as phase 02).
+			// Phase 18.2 Task 4 (ADR-0165): listenerPrincipal pre-extracted from
+			// the chain's leaf TLS cert (URI SAN[0] → DNS SAN[0] → Subject CN);
+			// empty for plaintext chains.
+			fh, err = buildTerminalFilter(name, i, fc.GetFilters(), cm, listenerCtx{hasTLS: chainTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(chainTLS), httpClient: httpClient, nodeServiceCluster: nodeServiceCluster}, registry, accessLogSinks, httpRegistry, dm)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if spec.Empty {
 			catchAllCount++
 		}
-		ci := &chainInfo{serverNames: serverNames, tlsCfg: chainTLS, filter: fh}
+		ci := &chainInfo{serverNames: serverNames, tlsCfg: chainTLS, filter: fh, netChainFactory: netChainFactory}
 		cis = append(cis, ci)
 		chainSpecs = append(chainSpecs, spec)
 		chainByName[spec.Name] = ci
@@ -500,12 +531,24 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 		// Per ADR-0080: default_filter_chain has an INDEPENDENT TLS posture
 		// from filter_chains[] — no mixed-TLS-rule cross-check here.
-		fh, err := buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(dfcTLS), httpClient: httpClient, nodeServiceCluster: nodeServiceCluster}, registry, accessLogSinks, httpRegistry, dm)
+		// Phase 26.1 (Task 10, §3.5): build-time dual-dispatch pre-check on the
+		// default_filter_chain's filters, mirroring the per-chain path above.
+		// The net-chain error already carries the full prefix (no
+		// errUnwrapFilterChain re-wrap on this arm).
+		dfcNetPrefix := fmt.Sprintf("listener: %q: default_filter_chain", name)
+		dfcNetFactory, dfcIsNetChain, err := buildNetChainFactory(dfcNetPrefix, dfc.GetFilters(), netReg, baseDir)
 		if err != nil {
-			return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, errUnwrapFilterChain(err))
+			return nil, err
+		}
+		var fh filterHandler
+		if !dfcIsNetChain {
+			fh, err = buildTerminalFilter(name+"/default", -1, dfc.GetFilters(), cm, listenerCtx{hasTLS: dfcTLS != nil, allowH2C: allowH2C, listenerPrincipal: extractListenerPrincipal(dfcTLS), httpClient: httpClient, nodeServiceCluster: nodeServiceCluster}, registry, accessLogSinks, httpRegistry, dm)
+			if err != nil {
+				return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, errUnwrapFilterChain(err))
+			}
 		}
 		defaultSpec = &listenerfilter.ChainSpec{Name: name + "/default_filter_chain", Empty: true}
-		defaultChain = &chainInfo{serverNames: nil, tlsCfg: dfcTLS, filter: fh}
+		defaultChain = &chainInfo{serverNames: nil, tlsCfg: dfcTLS, filter: fh, netChainFactory: dfcNetFactory}
 		chainByName[defaultSpec.Name] = defaultChain
 	}
 
@@ -589,6 +632,63 @@ func buildTerminalFilter(name string, chainIdx int, filters []*listenerv3.Filter
 		return nil, fmt.Errorf("%s: %w", prefix, err)
 	}
 	return fh, nil
+}
+
+// buildNetChainFactory is the phase-26.1 (§3.5) build-time dual-dispatch
+// pre-check + new-path factory builder. It is called at each filter-chain
+// BEFORE buildTerminalFilter when netReg is non-nil. prefix is the chain's
+// error prefix (e.g. `listener: %q: filter_chains[%d]` or
+// `listener: %q: default_filter_chain`).
+//
+// Decision: if netReg == nil OR filters is empty OR filters[0]'s type_url does
+// NOT resolve in netReg, it returns (nil, false, nil) — the caller takes the
+// UNCHANGED terminal-filter path. Otherwise the chain is a new read-filter
+// chain: EVERY filter in filters is resolved against netReg, each
+// NetworkFilterFactory is invoked ONCE at boot (validating typed_config and
+// yielding a per-conn FilterInstanceFactory). If ANY filter's type_url does
+// not resolve in netReg, the mixed read+terminal chain is boot-rejected
+// (network-filter-mixed-chain-unsupported; mixed chains are not supported
+// until 26.2). On success it returns (netChainFactory, true, nil) where the
+// returned closure allocates a fresh []network.ReadFilter per accepted
+// connection.
+func buildNetChainFactory(prefix string, filters []*listenerv3.Filter, netReg *network.Registry, baseDir string) (func() []network.ReadFilter, bool, error) {
+	if netReg == nil || len(filters) == 0 {
+		return nil, false, nil
+	}
+	tc0 := filters[0].GetTypedConfig()
+	if tc0 == nil {
+		return nil, false, nil
+	}
+	if _, ok := netReg.Lookup(tc0.GetTypeUrl()); !ok {
+		// filters[0] is not a network read filter → existing terminal-filter
+		// path (the old-path unknown-type reject @buildTerminalFilter handles a
+		// type_url in neither registry).
+		return nil, false, nil
+	}
+	// filters[0] IS a network read filter: this is a new read-filter chain.
+	// Resolve EVERY filter against netReg; any miss is a mixed chain (rejected).
+	instFactories := make([]network.FilterInstanceFactory, 0, len(filters))
+	for idx, f := range filters {
+		tc := f.GetTypedConfig()
+		tu := tc.GetTypeUrl()
+		factory, ok := netReg.Lookup(tu)
+		if !ok {
+			return nil, true, fmt.Errorf("%s: network-filter-mixed-chain-unsupported: filters[%d] type_url %q is not a network read filter (mixed read+terminal chains are not supported until 26.2)", prefix, idx, tu)
+		}
+		instFactory, err := factory(tc, network.FactoryCtx{BaseDir: baseDir})
+		if err != nil {
+			return nil, true, fmt.Errorf("%s: filters[%d]: %w", prefix, idx, err)
+		}
+		instFactories = append(instFactories, instFactory)
+	}
+	netChainFactory := func() []network.ReadFilter {
+		rf := make([]network.ReadFilter, len(instFactories))
+		for i, mk := range instFactories {
+			rf[i] = mk()
+		}
+		return rf
+	}
+	return netChainFactory, true, nil
 }
 
 // errUnwrapFilterChain peels the inner buildTerminalFilter prefix when the
@@ -1001,8 +1101,106 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 		dispatchConn = tlsConn
 	}
 
-	// (7) Dispatch to terminal filter.
-	selected.filter.Handle(ctx, dispatchConn)
+	// (7) Dispatch: new read-filter chain path OR existing terminal path.
+	if selected.netChainFactory != nil {
+		rt.serveReadFilterChain(ctx, dispatchConn, *selected)
+	} else {
+		selected.filter.Handle(ctx, dispatchConn)
+	}
+}
+
+// serveReadFilterChain drives the phase-26.1 (§3.5) read-filter chain over the
+// dispatch net.Conn: it builds the per-connection ReadFilter instances from the
+// chain's boot-resolved factory, constructs the exported network.ChainRuntime
+// with the connection's extracted SNI / mTLS principals / addresses, runs the
+// eager OnNewConnection pass, then loops feeding socket reads into OnData until
+// a filter requests close (D-P26.1-5a) or the downstream EOFs/errors. It owns
+// the socket-close lifecycle (mirroring the terminal-filter path's Handle
+// contract).
+//
+// The CloseRequested() check appears twice per iteration so a filter that
+// closes in OnNewConnection (direct_response) exits before the first blocking
+// Read, and a filter that closes during OnData (after writing its response)
+// exits before the next Read. echo never closes, so its loop runs until the
+// downstream half-closes (EOF → OnData(nil, true) → break).
+func (rt *listenerRuntime) serveReadFilterChain(_ context.Context, dispatchConn net.Conn, selected chainInfo) {
+	facts := network.ConnFacts{
+		ServerName: requestedServerName(dispatchConn, selected),
+		Principals: downstreamPrincipals(dispatchConn),
+		Local:      dispatchConn.LocalAddr(),
+		Remote:     dispatchConn.RemoteAddr(),
+	}
+	filters := selected.netChainFactory()
+	rtChain := network.NewChainRuntime(filters, dispatchConn, facts)
+	defer rtChain.OnDestroy()
+
+	rtChain.OnNewConnection()
+
+	buf := make([]byte, 16*1024)
+	for {
+		if rtChain.CloseRequested() {
+			break
+		}
+		n, err := dispatchConn.Read(buf)
+		if n > 0 {
+			rtChain.OnData(buf[:n], false)
+		}
+		if rtChain.CloseRequested() {
+			break
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				rtChain.OnData(nil, true)
+			}
+			break
+		}
+	}
+	_ = dispatchConn.Close()
+}
+
+// requestedServerName returns the SNI for the new-path ConnFacts. On a TLS
+// chain the dispatch conn is a *stdtls.Conn whose ConnectionState().ServerName
+// is the client-offered SNI; on plaintext it is the empty string (no SNI). The
+// chain's static server_names[] (the filter_chain_match SNI requirement) is NOT
+// the connection's SNI, so it is only used as a fallback when the conn is not a
+// *stdtls.Conn but the chain matched on a single server_name.
+func requestedServerName(conn net.Conn, selected chainInfo) string {
+	if tc, ok := conn.(*stdtls.Conn); ok {
+		return tc.ConnectionState().ServerName
+	}
+	if len(selected.serverNames) == 1 {
+		return selected.serverNames[0]
+	}
+	return ""
+}
+
+// downstreamPrincipals returns the priority-ordered mTLS peer principals (URI
+// SANs → DNS SANs → Subject CN) from the dispatch conn's *stdtls.Conn client
+// certificate, or nil for plaintext / no-client-cert. Mirrors the HCM-path
+// extraction (internal/filter/hcm/connection.go extractTLSPrincipals) so the
+// L4 Connection().DownstreamPrincipals surface matches the L7 one.
+func downstreamPrincipals(conn net.Conn) []string {
+	tc, ok := conn.(*stdtls.Conn)
+	if !ok {
+		return nil
+	}
+	state := tc.ConnectionState()
+	if !state.HandshakeComplete || len(state.PeerCertificates) == 0 {
+		return nil
+	}
+	cert := state.PeerCertificates[0]
+	var principals []string
+	for _, u := range cert.URIs {
+		if u == nil {
+			continue
+		}
+		principals = append(principals, u.String())
+	}
+	principals = append(principals, cert.DNSNames...)
+	if cn := cert.Subject.CommonName; cn != "" {
+		principals = append(principals, cn)
+	}
+	return principals
 }
 
 // localIP / localPort / remoteIP / remotePort extract the IP+port pieces from
