@@ -72,7 +72,7 @@ The differential harness uses **driver packages** that self-register via `init()
 | File | Change |
 |---|---|
 | `internal/listener/manager.go` | `chainInfo.netChainFactory` field (4th); `netReg *network.Registry` 11th ctor param + `nil` in thinner variants; build-time dual-dispatch pre-check at the two `buildTerminalFilter` call sites (@444/@503); `network-filter-mixed-chain-unsupported` arm; `serveReadFilterChain` read loop; `serveConnection` step-7 dual-branch (@1004-1005) |
-| `internal/listener/manager_test.go`, `internal/admin/admin_helpers_test.go`, `internal/admin/listeners_test.go` | the OTHER direct callers of `NewManagerWithBaseDirAndAllowH2C` (verified via `git grep`) — each gains the new `netReg` arg (`nil` where no network filters) so the build gate stays green |
+| `internal/listener/manager_test.go`, `internal/admin/admin_helpers_test.go`, `internal/admin/listeners_test.go`, `cmd/envoy-go/main_test.go` | the OTHER direct callers of `NewManagerWithBaseDirAndAllowH2C` (verified via `git grep`) — each gains the new `netReg` arg (`nil` where no network filters) so the build gate stays green |
 | `test/differential/runner_test.go` | 3 blank-import lines for the new driver packages |
 | `cmd/envoy-go/main.go` | `netReg` construct+Register+Freeze block (after `lfReg` @198-200); append `netReg` to the `NewManagerWithBaseDirAndAllowH2C(...)` call @213 |
 | `docs/envoy-go/BEHAVIOR_CONTRACT.md` | 26.1 bundle (Task 17) |
@@ -96,7 +96,7 @@ cd "$(git rev-parse --show-toplevel)"
 echo "fuzzers:";      git ls-files '*fuzz_test.go' | xargs grep -h "^func Fuzz" | wc -l   # expect 34
 echo "fixture dirs:"; ls test/fixtures/ | grep -E '^[0-9]' | wc -l                          # expect 41
 echo "fixture tail:"; ls test/fixtures/ | grep -E '^[0-9]' | sort | tail -1                 # expect 0039-...
-echo "ADR tail:";     grep -oE 'ADR-0[0-9]{3}' docs/envoy-go/DECISIONS.md | sort -u | tail -1   # expect ADR-0214
+echo "ADR tail:";     grep -nE '^#+ +ADR-0[0-9]{3}' docs/envoy-go/DECISIONS.md | tail -1            # expect ADR-0214 (grep HEADINGS, not prose: a naive `grep -oE 'ADR-0[0-9]{3}' | sort -u | tail -1` matches PLANNED forward-references like 0215/0216/0217 in the §provisional-span text and falsely reports a higher tail)
 ```
 
 Expected: `34`, `41`, `0039-…`, `ADR-0214`. **If any differ**, STOP and reconcile the deltas (the SPEC numbering 0040/0041/0042 + "35th fuzzer" + "stays 132" assume these baselines) before proceeding — adjust fixture numbers / counts to the new tip and note the drift in PROGRESS.md. Also re-pin the `manager.go` line numbers cited in Tasks 10/11 (@182/@261/@273/@302/@444/@503/@585/@1004-1005), since `manager.go` may have shifted since the SPEC's `9429983` pin.
@@ -1024,6 +1024,7 @@ git commit -m "phase 26.1 Task 11: serveReadFilterChain read loop + serveConnect
 
 **Files:**
 - Modify: `cmd/envoy-go/main.go` (add `netReg` block after `lfReg` @198-200; append `netReg` to ctor call @213)
+- Modify (build-fix): `cmd/envoy-go/main_test.go` — also a direct caller of `NewManagerWithBaseDirAndAllowH2C` (per `git grep`); add the new `netReg` arg (`nil` or a test registry) so the build gate stays green
 
 - [ ] **Step 1: Write the failing test / gate.** main.go has no unit test; the gate is `go build ./...` + a boot smoke. Add (or extend) a boot smoke test that starts the binary with an `[echo]`-chain config and confirms it accepts (no boot reject). If a main-package test harness does not exist, rely on the differential fixtures (Task 14/15) as the live proof and gate this task on `go build ./...` + `go vet`.
 
@@ -1126,7 +1127,7 @@ The harness is **Docker-driven** (the real `fixture.Driver` interface, `test/dif
 - Create: `test/fixtures/0040-network-echo/README.md`
 - Modify: `test/differential/runner_test.go` (add the blank-import line)
 
-- [ ] **Step 1: Write the driver + register it + blank-import it.** Implement the full 8-method `fixture.Driver`. echo has NO upstream cluster (`BackendCount()==0`). Bootstraps are container-shaped (admin block; reference binds `0.0.0.0:15000`; subject binds `subjListenerPort` + admin `subjAdminPort`):
+- [ ] **Step 1: Write the driver + register it + blank-import it.** Implement the full 8-method `fixture.Driver`. echo has no upstream cluster, but the runner's `runFixture` fatals on `BackendCount() < 1` (`test/differential/runner_test.go` ~line 123) — so return `BackendCount() == 1` and simply ignore the spare TCP-echo backend the runner spawns (no zero-backend precedent exists; boot-reject fixture `0033` likewise returns `1` without round-tripping). Bootstraps are container-shaped (admin block; reference binds `0.0.0.0:15000`; subject binds `subjListenerPort` + admin `subjAdminPort`):
 
 ```go
 // test/fixtures/0040-network-echo/driver/driver.go
