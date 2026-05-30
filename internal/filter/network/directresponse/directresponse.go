@@ -49,7 +49,7 @@ func New(tc *anypb.Any, ctx network.FactoryCtx) (network.FilterInstanceFactory, 
 		return nil, err
 	}
 	cc := &compiledConfig{body: body}
-	return func() network.ReadFilter { return &filter{cfg: cc} }, nil
+	return func() network.NetworkFilter { return &filter{cfg: cc} }, nil
 }
 
 // resolveDataSource mirrors internal/tls/datasource.go:loadDataSource (baseDir-
@@ -88,6 +88,7 @@ func resolveDataSource(ds *corev3.DataSource, baseDir string) ([]byte, error) {
 
 // filter is the per-connection direct_response read-filter instance.
 type filter struct {
+	network.Marker
 	cfg *compiledConfig
 	cb  network.ReadFilterCallbacks
 }

@@ -8,8 +8,21 @@ func TestStatusValues(t *testing.T) {
 	}
 }
 
+func TestFactoryCtxPerChainFields(t *testing.T) {
+	ctx := FactoryCtx{
+		BaseDir:            "/cfg",
+		HasTLS:             true,
+		AllowH2C:           true,
+		ListenerPrincipal:  "spiffe://x",
+		NodeServiceCluster: "svc-a",
+	}
+	if !ctx.HasTLS || !ctx.AllowH2C || ctx.ListenerPrincipal != "spiffe://x" || ctx.NodeServiceCluster != "svc-a" || ctx.BaseDir != "/cfg" {
+		t.Fatalf("FactoryCtx field round-trip failed: %+v", ctx)
+	}
+}
+
 // Compile-time assertion that a minimal ReadFilter satisfies the interface.
-type noopFilter struct{}
+type noopFilter struct{ Marker }
 
 func (noopFilter) OnNewConnection() Status                      { return Continue }
 func (noopFilter) OnData(_ *Buffer, _ bool) Status              { return Continue }

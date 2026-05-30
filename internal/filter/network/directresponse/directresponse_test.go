@@ -63,7 +63,7 @@ func TestDirectResponseInlineStringWritesAndCloses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New = %v", err)
 	}
-	rf := fif()
+	rf := fif().(network.ReadFilter)
 	cb := &fakeCallbacks{}
 	rf.SetReadFilterCallbacks(cb)
 	st := rf.OnNewConnection()
@@ -103,7 +103,7 @@ func TestDirectResponseFilenameRelativeToBaseDir(t *testing.T) {
 		t.Fatalf("New(Filename) = %v", err)
 	}
 	cb := &fakeCallbacks{}
-	rf := fif()
+	rf := fif().(network.ReadFilter)
 	rf.SetReadFilterCallbacks(cb)
 	rf.OnNewConnection()
 	if string(cb.conn.written) != "FILE-BODY" {

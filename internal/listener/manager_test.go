@@ -31,6 +31,7 @@ import (
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/esalaine/envoy-go/internal/filter/network/builtins"
 	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
@@ -326,6 +327,10 @@ func TestManager_NonEmptyFilterChainMatch_DestinationPort_Accepted(t *testing.T)
 	}
 }
 
+// TestManager_Error_TwoFilters: a chain carrying two terminal filters
+// [tcp_proxy, tcp_proxy]. Phase-26.2 Task 10 retired the old single-filter rule
+// ("expected exactly one filter"); the unified builder now permits multi-filter
+// chains but rejects a second terminal with network-filter-multiple-terminals.
 func TestManager_Error_TwoFilters(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
@@ -344,8 +349,8 @@ func TestManager_Error_TwoFilters(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "expected exactly one filter") {
-		t.Errorf("error %q does not contain %q", err.Error(), "expected exactly one filter")
+	if !strings.Contains(err.Error(), "network-filter-multiple-terminals") {
+		t.Errorf("error %q does not contain %q", err.Error(), "network-filter-multiple-terminals")
 	}
 }
 
@@ -385,10 +390,10 @@ func TestManager_Error_UnknownFilterTypeURL(t *testing.T) {
 		}},
 		FilterChains: []*listenerv3.FilterChain{{
 			Filters: []*listenerv3.Filter{{
-				Name: "envoy.filters.network.echo",
+				Name: "envoy.filters.network.does_not_exist",
 				ConfigType: &listenerv3.Filter_TypedConfig{
 					TypedConfig: &anypb.Any{
-						TypeUrl: "type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo",
+						TypeUrl: "type.googleapis.com/envoy.extensions.filters.network.does_not_exist.v3.Nope",
 						Value:   nil,
 					},
 				},
@@ -1338,7 +1343,7 @@ func TestNewManager_ChainSelectionPropagation(t *testing.T) {
 	// bootstrap to declare the filter so SelectChain sees inputs.ServerName.
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1443,8 +1448,8 @@ func mkHCMFilter(t *testing.T) *listenerv3.Filter {
 }
 
 // TestNewManager_HCMRegistration verifies that a listener using the
-// HCM type_url is accepted by NewManager after the hcm.TypeURL entry
-// was added to filterRegistry (Task 8).
+// HCM type_url is accepted by NewManager — the HCM network-filter factory is
+// registered into netReg via the builtins seam (Task 9/10).
 func TestNewManager_HCMRegistration(t *testing.T) {
 	cm := mkClusterMgr(t, "c_test", "127.0.0.1", 1)
 	boot := mkBoot(0, []*listenerv3.Listener{
@@ -1506,7 +1511,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1526,7 +1531,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
@@ -1555,8 +1560,9 @@ func TestNewManager_BackwardsCompat_DefaultsAllowH2CFalse(t *testing.T) {
 }
 
 // TestNewManager_HCMBuildErrorWrapsAsListenerFilter verifies that a parse
-// error from the HCM constructor is wrapped with the standard listener prefix:
-// listener: "<name>": filter_chains[<i>]: hcm: ...
+// error from the HCM network-filter factory is wrapped with the standard
+// listener prefix plus the per-filter index segment introduced by the unified
+// builder: listener: "<name>": filter_chains[<i>]: filters[<j>]: hcm: ...
 func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 	// HTTP2 codec_type is the cheapest trigger for an hcm: error.
 	hcmProto := &hcmv3.HttpConnectionManager{
@@ -1587,8 +1593,8 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 	if buildErr == nil {
 		t.Fatal("expected build error, got nil")
 	}
-	// The error must be wrapped: listener: "l_http": filter_chains[0]: hcm: codec_type HTTP2 ...
-	want := `listener: "l_http": filter_chains[0]: hcm: codec_type HTTP2`
+	// The error must be wrapped: listener: "l_http": filter_chains[0]: filters[0]: hcm: codec_type HTTP2 ...
+	want := `listener: "l_http": filter_chains[0]: filters[0]: hcm: codec_type HTTP2`
 	if !strings.Contains(buildErr.Error(), want) {
 		t.Errorf("error %q does not contain %q", buildErr.Error(), want)
 	}
@@ -1686,7 +1692,7 @@ func TestParseListenerFiltersResolvesViaRegistry(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1716,7 +1722,7 @@ func TestParseListenerFiltersUnknownTypeURLErrors(t *testing.T) {
 		}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err == nil {
 		t.Fatal("expected error for unknown listener-filter type_url, got nil")
 	}
@@ -2031,15 +2037,15 @@ func TestIdenticalFilterChainsAmbiguousSelectionDetectedDespiteSlicePermutation(
 	}
 }
 
-// TestParseDefaultFilterChainBuildErrorIsSinglePrefixed is a code-review-driven
-// follow-up on Task 9: errUnwrapFilterChain peels the inner
-// `listener: %q: default_filter_chain: ` prefix that buildTerminalFilter emits
-// so the caller-side wrap does not double-prefix. Without the unwrap, the
-// surfaced message would be
-// `listener: "x": default_filter_chain: listener: "x": default_filter_chain: <inner>`.
-// This test exercises the path by building a default_filter_chain with two
-// filters (buildTerminalFilter rejects len != 1) and asserts the
-// `default_filter_chain: ` prefix appears exactly once.
+// TestParseDefaultFilterChainBuildErrorIsSinglePrefixed asserts the
+// default_filter_chain build error carries the
+// `listener: %q: default_filter_chain: ` prefix exactly once. Phase-26.2
+// Task 10 retired the old buildTerminalFilter path (and its
+// errUnwrapFilterChain double-prefix peeler); buildNetworkChainFactory now
+// emits the full single prefix directly via dfcNetPrefix. This test exercises
+// the path with a default_filter_chain carrying two terminal filters
+// ([tcp_proxy, tcp_proxy] → network-filter-multiple-terminals reject) and
+// asserts the prefix appears exactly once.
 func TestParseDefaultFilterChainBuildErrorIsSinglePrefixed(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
@@ -2055,22 +2061,21 @@ func TestParseDefaultFilterChainBuildErrorIsSinglePrefixed(t *testing.T) {
 			{Filters: []*listenerv3.Filter{filter}},
 		},
 		DefaultFilterChain: &listenerv3.FilterChain{
-			// Two filters → buildTerminalFilter errors with "expected exactly
-			// one filter, got 2".
+			// Two terminal filters → network-filter-multiple-terminals reject.
 			Filters: []*listenerv3.Filter{filter, filter},
 		},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
-		t.Fatal("expected error from default_filter_chain with two filters, got nil")
+		t.Fatal("expected error from default_filter_chain with two terminal filters, got nil")
 	}
 	const marker = "default_filter_chain: "
 	if got := strings.Count(err.Error(), marker); got != 1 {
-		t.Errorf("error %q contains %q %d times, want exactly 1 (errUnwrapFilterChain regression)", err.Error(), marker, got)
+		t.Errorf("error %q contains %q %d times, want exactly 1 (single-prefix regression)", err.Error(), marker, got)
 	}
-	if !strings.Contains(err.Error(), "expected exactly one filter") {
-		t.Errorf("error %q does not contain inner build-error text", err.Error())
+	if !strings.Contains(err.Error(), "network-filter-multiple-terminals") {
+		t.Errorf("error %q does not contain the expected reject text", err.Error())
 	}
 }
 
@@ -2093,7 +2098,7 @@ func TestParseListenerFiltersNilRegistryErrors(t *testing.T) {
 		ListenerFilters: []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil, nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err == nil {
 		t.Fatal("expected error for non-empty listener_filters[] with nil lfRegistry, got nil")
 	}
@@ -2321,7 +2326,7 @@ func TestUnifiedDispatchTLSWithSNI(t *testing.T) {
 	})
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2585,7 +2590,7 @@ func TestManager_Drain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2604,7 +2609,7 @@ func TestManager_DrainIdempotent(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
 	m.Drain()
 	m.Drain()
 	m.Drain()
@@ -2621,7 +2626,7 @@ func TestManager_AcceptDuringDrainClosesConn(t *testing.T) {
 		mkListener("l_tcp_drain", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(1 * time.Hour)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := m.Start(ctx); err != nil {
@@ -2650,7 +2655,7 @@ func TestManager_StopAfterDrain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, nil)
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_ = m.Start(ctx)
@@ -2695,8 +2700,9 @@ func testNetRegistry() *network.Registry {
 }
 
 // firstChain returns the single built chainInfo of mgr's first runtime (the
-// catch-all/default chain a single-chain bootstrap produces). Tests assert on
-// .filter vs .netChainFactory to verify the dual-dispatch build decision.
+// catch-all/default chain a single-chain bootstrap produces). Post-Task-10 every
+// chain carries a non-nil .netChainFactory (netReg is the SOLE registry); tests
+// assert on it to verify the unified chain build.
 func firstChain(t *testing.T, mgr *Manager) *chainInfo {
 	t.Helper()
 	if len(mgr.runtimes) == 0 {
@@ -2713,6 +2719,118 @@ func firstChain(t *testing.T, mgr *Manager) *chainInfo {
 	return ci
 }
 
+// testNetRegistryWithTerminals returns a frozen *network.Registry with all four
+// built-in network filters (echo, direct_response, tcp_proxy, HCM) registered
+// via the Task-9 builtins seam (builtins.RegisterBuiltins). This is the SOLE
+// registry the unified chain builder resolves every filter against post-Task-10;
+// the shared DRY helper for terminal-filter test bootstraps.
+func testNetRegistryWithTerminals(t *testing.T, cm *cluster.Manager) *network.Registry {
+	t.Helper()
+	r := network.NewRegistry()
+	builtins.RegisterBuiltins(r, builtins.Deps{ClusterManager: cm, StatsRegistry: stats.NewRegistry(), HTTPRegistry: testHTTPRegistry()})
+	r.Freeze()
+	return r
+}
+
+// TestBuildChainPureTerminalThroughNetReg: with tcp_proxy registered in netReg,
+// a [tcp_proxy] chain builds through the unified chain builder (filters[0]
+// resolves in netReg → netChainFactory set).
+func TestBuildChainPureTerminalThroughNetReg(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_tcp_net", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err != nil {
+		t.Fatalf("NewManager([tcp_proxy] via netReg): %v", err)
+	}
+	ci := firstChain(t, mgr)
+	if ci.netChainFactory == nil {
+		t.Error("netChainFactory is nil; expected new chain path for tcp_proxy filters[0]")
+	}
+	if got := len(ci.netChainFactory()); got != 1 {
+		t.Errorf("netChainFactory() len = %d, want 1", got)
+	}
+}
+
+// TestBuildChainMixedReadTerminalNowValid: [echo, tcp_proxy] — the 26.1
+// mixed-chain reject is LIFTED. echo is a read filter, tcp_proxy a terminal-last
+// → valid [read*, terminal?] shape → builds.
+func TestBuildChainMixedReadTerminalNowValid(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	l := &listenerv3.Listener{
+		Name: "l_mixed_valid",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0}},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{
+			Filters: []*listenerv3.Filter{mkEchoNetFilter(t), mkTcpProxyFilter(t, "c_echo")},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err != nil {
+		t.Fatalf("NewManager([echo, tcp_proxy]): %v (mixed read+terminal chain must now build)", err)
+	}
+	ci := firstChain(t, mgr)
+	if ci.netChainFactory == nil {
+		t.Fatal("netChainFactory is nil; expected new chain path for [echo, tcp_proxy]")
+	}
+	if got := len(ci.netChainFactory()); got != 2 {
+		t.Errorf("netChainFactory() len = %d, want 2 (echo read + tcp_proxy terminal)", got)
+	}
+}
+
+// TestBuildChainTerminalNotLastRejected: [tcp_proxy, echo] — a terminal filter
+// not at the tail → boot-reject containing "network-filter-terminal-not-last".
+func TestBuildChainTerminalNotLastRejected(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	l := &listenerv3.Listener{
+		Name: "l_terminal_not_last",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0}},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{
+			Filters: []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo"), mkEchoNetFilter(t)},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err == nil {
+		t.Fatal("NewManager([tcp_proxy, echo]) returned nil error; expected terminal-not-last boot-reject")
+	}
+	if !strings.Contains(err.Error(), "network-filter-terminal-not-last") {
+		t.Errorf("error = %q; want it to mention network-filter-terminal-not-last", err.Error())
+	}
+}
+
+// TestBuildChainMultipleTerminalsRejected: [tcp_proxy, hcm] — two terminal
+// filters → boot-reject containing "network-filter-multiple-terminals".
+func TestBuildChainMultipleTerminalsRejected(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	l := &listenerv3.Listener{
+		Name: "l_multi_terminal",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0}},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{
+			Filters: []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo"), mkHCMFilter(t)},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err == nil {
+		t.Fatal("NewManager([tcp_proxy, hcm]) returned nil error; expected multiple-terminals boot-reject")
+	}
+	if !strings.Contains(err.Error(), "network-filter-multiple-terminals") {
+		t.Errorf("error = %q; want it to mention network-filter-multiple-terminals", err.Error())
+	}
+}
+
 func TestBuildNewPathChainWhenFilterInNetReg(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	boot := mkBoot(0, []*listenerv3.Listener{
@@ -2727,9 +2845,6 @@ func TestBuildNewPathChainWhenFilterInNetReg(t *testing.T) {
 	if ci.netChainFactory == nil {
 		t.Error("netChainFactory is nil; expected new read-filter-chain path for echo filters[0]")
 	}
-	if ci.filter != nil {
-		t.Error("filter is non-nil; expected nil on the new read-filter-chain path")
-	}
 	// The factory must allocate fresh instances per call (one per connection).
 	a, b := ci.netChainFactory(), ci.netChainFactory()
 	if len(a) != 1 || len(b) != 1 {
@@ -2740,12 +2855,17 @@ func TestBuildNewPathChainWhenFilterInNetReg(t *testing.T) {
 	}
 }
 
-func TestMixedChainRejectedAt261(t *testing.T) {
+// TestNetChainLaterIndexNetRegMiss: with a netReg holding only echo+dr (NOT
+// tcp_proxy), the chain [echo, tcp_proxy] resolves filters[0]=echo in netReg
+// (committing to the net-chain path) but tcp_proxy at index 1 misses netReg.
+// Phase-26.2 Task 7 LIFTED the 26.1 mixed-chain reject; a later-index miss is
+// now the UNIFIED unknown-type-url form — byte-identical to the old terminal
+// path's wording.
+func TestNetChainLaterIndexNetRegMiss(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
-	// chain = [echo (network), tcp_proxy (terminal)] — echo resolves in netReg,
-	// tcp_proxy does not → mixed read+terminal chain → boot-reject.
+	// chain = [echo (in netReg), tcp_proxy (NOT in this netReg)].
 	l := &listenerv3.Listener{
-		Name: "l_mixed",
+		Name: "l_later_miss",
 		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
 			SocketAddress: &corev3.SocketAddress{Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0}},
 		}},
@@ -2757,40 +2877,89 @@ func TestMixedChainRejectedAt261(t *testing.T) {
 
 	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
 	if err == nil {
-		t.Fatal("NewManager(mixed chain) returned nil error; expected mixed-chain boot-reject")
+		t.Fatal("NewManager(later-index miss) returned nil error; expected unknown-type-url boot-reject")
 	}
-	if !strings.Contains(err.Error(), "network-filter-mixed-chain-unsupported") {
-		t.Errorf("error = %q; want it to mention network-filter-mixed-chain-unsupported", err.Error())
+	if !strings.Contains(err.Error(), "unknown filter type_url") {
+		t.Errorf("error = %q; want unified unknown-type-url wording", err.Error())
+	}
+	if strings.Contains(err.Error(), "network-filter-mixed-chain-unsupported") {
+		t.Errorf("error = %q; the 26.1 mixed-chain reject must be DELETED", err.Error())
 	}
 }
 
-func TestOldPathUnaffectedWhenNetRegNilOrMiss(t *testing.T) {
+// TestOldTerminalRegistryRetired: Task 10 retired the old terminal-filter path
+// (buildTerminalFilter / filterRegistry). netReg is now the SOLE registry, so a
+// chain whose filters[0] is NOT in netReg no longer falls back to a terminal
+// path — it is the unified unknown-type-url boot-reject.
+func TestOldTerminalRegistryRetired(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 
-	// (a) nil netReg + tcp_proxy chain → old terminal-filter path.
+	// A netReg holding only echo+dr (NOT tcp_proxy); a [tcp_proxy] chain's
+	// filters[0] misses netReg → unified unknown-type-url reject (no old path).
 	boot := mkBoot(0, []*listenerv3.Listener{
-		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+		mkListener("l_tcp_miss", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
-	if err != nil {
-		t.Fatalf("NewManager(nil netReg, tcp_proxy): %v", err)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	if err == nil {
+		t.Fatal("NewManager(netReg without tcp_proxy, [tcp_proxy]) returned nil; expected unknown-type-url boot-reject (old terminal path retired)")
 	}
-	ci := firstChain(t, mgr)
-	if ci.filter == nil || ci.netChainFactory != nil {
-		t.Errorf("nil netReg: filter=%v netChainFactory!=nil=%v; want filter set + netChainFactory nil", ci.filter != nil, ci.netChainFactory != nil)
+	if !strings.Contains(err.Error(), "unknown filter type_url") {
+		t.Errorf("error = %q; want unified unknown-type-url wording", err.Error())
 	}
 
-	// (b) non-nil netReg but filters[0]=tcp_proxy (not in netReg) → old path.
+	// With all four built-ins registered (builtins seam), the same [tcp_proxy]
+	// chain dispatches correctly through the unified netReg path.
 	boot2 := mkBoot(0, []*listenerv3.Listener{
-		mkListener("l_tcp2", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+		mkListener("l_tcp_ok", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	mgr2, err := NewManagerWithBaseDirAndAllowH2C(boot2, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	mgr2, err := NewManagerWithBaseDirAndAllowH2C(boot2, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
 	if err != nil {
-		t.Fatalf("NewManager(netReg, tcp_proxy miss): %v", err)
+		t.Fatalf("NewManager(builtins netReg, [tcp_proxy]): %v", err)
 	}
 	ci2 := firstChain(t, mgr2)
-	if ci2.filter == nil || ci2.netChainFactory != nil {
-		t.Errorf("netReg miss: filter=%v netChainFactory!=nil=%v; want filter set + netChainFactory nil", ci2.filter != nil, ci2.netChainFactory != nil)
+	if ci2.netChainFactory == nil {
+		t.Error("netChainFactory is nil; expected unified chain path for tcp_proxy via builtins netReg")
+	}
+}
+
+// TestNilNetRegRejectsFilterChain: netReg == nil + a filter chain → boot error.
+// Post-Task-10 there is no old terminal path to fall back to; a nil registry is
+// a clear boot error (R-U).
+func TestNilNetRegRejectsFilterChain(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_tcp_nilreg", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	if err == nil {
+		t.Fatal("NewManager(nil netReg, [tcp_proxy]) returned nil error; expected a boot error (no old terminal path)")
+	}
+	if !strings.Contains(err.Error(), "no network-filter registry") {
+		t.Errorf("error = %q; want a clear nil-registry boot error", err.Error())
+	}
+}
+
+// TestBuildChainUnknownTypeWordingPreserved (R-S / D-26.2-6): a filters[0]
+// type_url in NEITHER built-in resolves through the unified builder (now the
+// SOLE path; buildTerminalFilter deleted) to the EXISTING wording byte-for-byte:
+// "...: unknown filter type_url %q".
+func TestBuildChainUnknownTypeWordingPreserved(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	const badType = "type.googleapis.com/envoy.extensions.filters.network.does_not_exist.v3.Nope"
+	bad := &listenerv3.Filter{
+		Name:       "envoy.filters.network.does_not_exist",
+		ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: &anypb.Any{TypeUrl: badType}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_unknown", "127.0.0.1", 0, bad),
+	}, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err == nil {
+		t.Fatal("NewManager(unknown filters[0] type_url) returned nil error; expected unknown-type-url boot-reject")
+	}
+	want := `unknown filter type_url "` + badType + `"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q; want it to contain byte-stable wording %q", err.Error(), want)
 	}
 }
 
@@ -2881,6 +3050,165 @@ func TestServeReadFilterChainDirectResponse(t *testing.T) {
 
 	// direct_response writes the body in OnNewConnection then closes; the client
 	// reads the body followed by EOF without sending anything.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("direct_response body = %q, want %q", got, body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-26.2 Task 8 — serveConnection step-7 → unified serveNetworkChain.
+//
+// These four dispatch-shape tests drive REAL localhost connections through a
+// Manager whose netReg has ALL FOUR filters registered (echo, direct_response,
+// tcp_proxy, HCM). Because filters[0] resolves in netReg for every chain, EVERY
+// connection dispatches through the NEW unified serveNetworkChain path (rather
+// than the transitional old selected.filter.Handle branch, which only runs for
+// nil-netChainFactory chains — deleted in Task 10):
+//   - tcp_proxy → pure-terminal: immediate HandleTerminal (R3 byte-identical to
+//     the retired selected.filter.Handle path — L4 pump to an upstream backend).
+//   - HCM       → pure-terminal: HandleTerminal drives an HTTP/1 round-trip.
+//   - echo      → pure-read: the 26.1 read loop, unchanged.
+//   - direct_response → pure-read: static body then close, unchanged.
+// ---------------------------------------------------------------------------
+
+// startNetChainListenerWithReg boots + starts a single-listener Manager whose
+// only filter_chain is the supplied network filter chain, threading the given
+// cluster.Manager and netReg so terminal filters (tcp_proxy / HCM) resolve in
+// netReg and dispatch through serveNetworkChain. Returns the bound address.
+func startNetChainListenerWithReg(t *testing.T, cm *cluster.Manager, netReg *network.Registry, filters ...*listenerv3.Filter) string {
+	t.Helper()
+	l := &listenerv3.Listener{
+		Name: "l_net",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0}},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{Filters: filters}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, netReg)
+	if err != nil {
+		t.Fatalf("NewManager(net chain w/ terminals): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { mgr.Stop(); cancel() })
+	ls := mgr.Listeners()
+	if len(ls) != 1 || ls[0].Addr == "" {
+		t.Fatalf("expected 1 bound listener, got %+v", ls)
+	}
+	return ls[0].Addr
+}
+
+// TestServeNetworkChainTCPProxy: a [tcp_proxy] chain with tcp_proxy registered
+// in netReg dispatches through serveNetworkChain as a PURE-TERMINAL chain
+// (immediate HandleTerminal). R3: byte-identical to the pre-migration terminal
+// path — the L4 pump round-trips a tagged byte from the upstream backend.
+func TestServeNetworkChainTCPProxy(t *testing.T) {
+	addrA, cleanA := startTaggedBackend(t, 'A')
+	defer cleanA()
+	cm := mkClusterMgr(t, "c_a", "127.0.0.1", uint32(addrA.Port))
+	netReg := testNetRegistryWithTerminals(t, cm)
+
+	addr := startNetChainListenerWithReg(t, cm, netReg, mkTcpProxyFilter(t, "c_a"))
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// The upstream echo backend writes its tag byte on accept; the L4 pump must
+	// deliver it downstream through the tcp_proxy terminal.
+	if got := readByteWithTimeout(t, conn, 4*time.Second); got != 'A' {
+		t.Errorf("tag byte = %q, want 'A' (tcp_proxy terminal via serveNetworkChain)", got)
+	}
+}
+
+// TestServeNetworkChainHCM: a [hcm] chain with HCM registered in netReg
+// dispatches through serveNetworkChain as a PURE-TERMINAL chain. R3: an HTTP/1
+// request to the /health route round-trips a 200 response.
+func TestServeNetworkChainHCM(t *testing.T) {
+	cm := mkClusterMgr(t, "c_unused", "127.0.0.1", 9999)
+	netReg := testNetRegistryWithTerminals(t, cm)
+
+	addr := startNetChainListenerWithReg(t, cm, netReg, mkHCMFilter(t))
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write([]byte("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp := string(got)
+	if !strings.Contains(resp, "200") {
+		t.Errorf("HCM response = %q, want a 200 status line (HCM terminal via serveNetworkChain)", resp)
+	}
+	if !strings.Contains(resp, "OK") {
+		t.Errorf("HCM response = %q, want the /health body 'OK'", resp)
+	}
+}
+
+// TestServeNetworkChainEchoStillReadLoop: with echo registered in netReg, the
+// [echo] chain dispatches through serveNetworkChain as a PURE-READ chain — the
+// 26.1 read loop is unchanged, so bytes are echoed back.
+func TestServeNetworkChainEchoStillReadLoop(t *testing.T) {
+	cm := mkClusterMgr(t, "c_unused", "127.0.0.1", 9999)
+	netReg := testNetRegistryWithTerminals(t, cm)
+
+	addr := startNetChainListenerWithReg(t, cm, netReg, mkEchoNetFilter(t))
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	want := []byte("echo via serveNetworkChain")
+	if _, err := conn.Write(want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read echoed bytes: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("echo = %q, want %q", got, want)
+	}
+}
+
+// TestServeNetworkChainDirectResponse: with direct_response registered in
+// netReg, the [direct_response] chain dispatches through serveNetworkChain as a
+// PURE-READ chain — static body written in OnNewConnection, then close. The
+// 26.1 path is unchanged.
+func TestServeNetworkChainDirectResponse(t *testing.T) {
+	const body = "go away (direct_response via serveNetworkChain)"
+	cm := mkClusterMgr(t, "c_unused", "127.0.0.1", 9999)
+	netReg := testNetRegistryWithTerminals(t, cm)
+
+	addr := startNetChainListenerWithReg(t, cm, netReg, mkDirectResponseNetFilter(t, body))
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	got, err := io.ReadAll(conn)
 	if err != nil {

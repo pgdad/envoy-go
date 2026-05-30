@@ -4,7 +4,9 @@
 // factory types (types.go), the per-connection ReadFilterCallbacks + Connection
 // accessor surface (callbacks.go), the drainable connection read Buffer
 // (buffer.go), the freeze-after-boot type_url → factory Registry (registry.go),
-// and the per-connection chain runner + runtime context (chain.go).
+// the per-connection chain runner + runtime context (chain.go), and the
+// NetworkFilter/Marker sealed-marker + TerminalFilter connection-takeover seam
+// (terminal.go).
 //
 // The framework deliberately mirrors internal/listener/listenerfilter/ (the
 // closest structural analog — a per-connection sequential-dispatch pipeline

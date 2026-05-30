@@ -13,6 +13,7 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/drain"
+	"github.com/esalaine/envoy-go/internal/filter/network"
 )
 
 // TypeURL is the proto type URL phase 02 registers in the listener's inline
@@ -23,10 +24,16 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.
 // Filter is one TCP proxy filter instance, bound at construction time to the
 // resolved cluster it dispatches to. Immutable after NewFilter returns.
 type Filter struct {
-	cluster    *cluster.Cluster
-	statPrefix string         // unread at phase 02; SPEC §10 #8 settled — stored for forward-compat
-	dm         *drain.Manager // 08.2 Task 10: nil-tolerant drain manager for in-flight Inc/Dec
+	network.Marker // sealed-marker embed: grants isNetworkFilter() so *Filter satisfies network.TerminalFilter (26.2 Task 5; R-T)
+	cluster        *cluster.Cluster
+	statPrefix     string         // unread at phase 02; SPEC §10 #8 settled — stored for forward-compat
+	dm             *drain.Manager // 08.2 Task 10: nil-tolerant drain manager for in-flight Inc/Dec
 }
+
+// Compile-time assertion: *Filter is a network.TerminalFilter (R-T). Its
+// existing Handle(ctx, net.Conn) is byte-identical to the TerminalFilter
+// signature; only the network.Marker embed was added to seal it.
+var _ network.TerminalFilter = (*Filter)(nil)
 
 // NewFilter parses tc as a TcpProxy proto and resolves its cluster reference
 // against cm. dm is the drain manager used for per-connection in-flight
@@ -60,6 +67,24 @@ func NewFilter(tc *anypb.Any, cm *cluster.Manager, dm *drain.Manager) (*Filter, 
 		return nil, fmt.Errorf("tcpproxy: weighted_clusters is not supported in phase 02")
 	default:
 		return nil, fmt.Errorf("tcpproxy: cluster_specifier is missing or of unsupported type %T", cs)
+	}
+}
+
+// NewNetworkFactory returns a network.NetworkFilterFactory that builds the
+// tcp_proxy terminal filter once per chain at boot (capturing cm + dm) and
+// yields that SHARED *Filter per accepted connection. tcp_proxy is
+// conn-stateless (per-connection state lives on Handle's stack), so the
+// shared instance preserves the retired chainInfo.filter semantic. The
+// FactoryCtx per-chain fields are ignored (tcp_proxy has no listener-ctx
+// dependency). The existing NewFilter parse-reject errors surface verbatim
+// (byte-stable; R-S).
+func NewNetworkFactory(cm *cluster.Manager, dm *drain.Manager) network.NetworkFilterFactory {
+	return func(tc *anypb.Any, _ network.FactoryCtx) (network.FilterInstanceFactory, error) {
+		f, err := NewFilter(tc, cm, dm)
+		if err != nil {
+			return nil, err
+		}
+		return func() network.NetworkFilter { return f }, nil
 	}
 }
 

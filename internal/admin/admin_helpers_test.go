@@ -8,9 +8,24 @@ import (
 	"github.com/esalaine/envoy-go/internal/cluster"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/esalaine/envoy-go/internal/filter/network/builtins"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
+	"github.com/esalaine/envoy-go/internal/stats"
 )
+
+// mustBuiltinsNetReg returns a frozen *network.Registry with the four built-in
+// network filters (echo, direct_response, tcp_proxy, HCM) registered via the
+// Task-9 builtins seam. Post-Task-10 the listener manager requires a populated
+// netReg to build tcp_proxy / HCM filter chains. Shared by the admin tests'
+// listener-manager bootstraps.
+func mustBuiltinsNetReg(cm *cluster.Manager, registry *stats.Registry, httpReg *filter_http.HTTPRegistry) *network.Registry {
+	r := network.NewRegistry()
+	builtins.RegisterBuiltins(r, builtins.Deps{ClusterManager: cm, StatsRegistry: registry, HTTPRegistry: httpReg})
+	r.Freeze()
+	return r
+}
 
 // minimalBootstrapYAML is the SPEC §7.3 fixture bootstrap (admin :9901,
 // listener :10000, cluster c_backend with 2 endpoints :18001 + :18002).
@@ -95,7 +110,8 @@ func mustMinimalLM(t *testing.T, bs *bootstrap.Bootstrap, cm *cluster.Manager) *
 	httpReg.Freeze()
 	lfReg := listenerfilter.NewListenerFilterRegistry()
 	lfReg.Freeze()
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, "", false, bs.Stats, nil, httpReg, lfReg, nil, nil, nil)
+	netReg := mustBuiltinsNetReg(cm, bs.Stats, httpReg)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, "", false, bs.Stats, nil, httpReg, lfReg, nil, nil, netReg)
 	if err != nil {
 		t.Fatalf("listener.NewManagerWithBaseDirAndAllowH2C: %v", err)
 	}

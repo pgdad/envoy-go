@@ -4,6 +4,7 @@
 package network
 
 import (
+	"context"
 	"net"
 
 	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
@@ -46,17 +47,50 @@ type ChainRuntime struct {
 	rt *chainRuntime
 }
 
-// NewChainRuntime constructs the per-connection chain driver over filters +
-// the downstream conn + the manager-extracted facts (SPEC §3.5 construction
-// step). It injects the per-connection callbacks into each filter once.
-func NewChainRuntime(filters []ReadFilter, conn net.Conn, facts ConnFacts) *ChainRuntime {
-	return &ChainRuntime{rt: newChainRuntime(filters, conn, connFacts{
+// NewChainRuntime constructs the per-connection chain driver over a
+// []NetworkFilter + the downstream conn + the manager-extracted facts (SPEC
+// §3.5 construction step). It CLASSIFIES the filters into a read-filter prefix
+// and an optional trailing TerminalFilter: the read prefix drives the existing
+// OnData iteration; the terminal (if any) takes over the conn once the prefix
+// has Continued past it (TerminalReady → HandleTerminal). It injects the
+// per-connection callbacks into each read filter once.
+func NewChainRuntime(filters []NetworkFilter, conn net.Conn, facts ConnFacts) *ChainRuntime {
+	var (
+		read     []ReadFilter
+		terminal TerminalFilter
+	)
+	for _, f := range filters {
+		switch nf := f.(type) {
+		case TerminalFilter:
+			// Keep the LAST terminal if more than one is present (boot
+			// validation in Task 7 prevents that shape from reaching here).
+			terminal = nf
+		case ReadFilter:
+			read = append(read, nf)
+		default:
+			// Defensively ignore any NetworkFilter that is neither (the sealed
+			// marker should make this unreachable).
+		}
+	}
+	rt := newChainRuntime(read, conn, connFacts{
 		serverName: facts.ServerName,
 		principals: facts.Principals,
 		local:      facts.Local,
 		remote:     facts.Remote,
-	})}
+	})
+	rt.terminal = terminal
+	return &ChainRuntime{rt: rt}
 }
+
+// TerminalReady reports whether the chain's trailing terminal filter is ready
+// to take over the downstream conn (the read-filter prefix, if any, has
+// Continued past its last filter without halting).
+func (c *ChainRuntime) TerminalReady() bool { return c.rt.terminalReady() }
+
+// HandleTerminal hands the downstream conn to the trailing terminal filter,
+// replaying any undrained buffered prefix before the live conn (R-M). Caller
+// must check TerminalReady first.
+func (c *ChainRuntime) HandleTerminal(ctx context.Context) { c.rt.handleTerminal(ctx) }
 
 // OnNewConnection runs the eager OnNewConnection pass in chain order before any
 // downstream data (SPEC §3.3).
@@ -83,9 +117,10 @@ func (c *ChainRuntime) CloseRequested() bool { return c.rt.closeRequested() }
 // read-filter iteration (SPEC §3.3). Single-goroutine-per-connection
 // (ADR-0213): no locks beyond the registry's RWMutex.
 type chainRuntime struct {
-	filters []ReadFilter
-	conn    net.Conn
-	facts   connFacts
+	filters  []ReadFilter
+	terminal TerminalFilter // optional trailing connection-takeover filter (26.2)
+	conn     net.Conn
+	facts    connFacts
 
 	buf    *Buffer
 	bucket *dynamicmetadata.Bucket
@@ -140,6 +175,32 @@ func (rt *chainRuntime) callbacks() ReadFilterCallbacks { return rt.cb }
 // closeRequested reports whether a filter called Connection().Close (the read
 // loop checks it to exit; D-P26.1-5a).
 func (rt *chainRuntime) closeRequested() bool { return rt.closeReq }
+
+// terminalReady reports whether the trailing terminal filter may take over the
+// downstream conn: the chain has a terminal, the read-filter prefix has not
+// halted (connHalted), and iteration has advanced past the last read filter
+// (resumeIdx >= len(filters)). Pure-terminal (0 read filters, resumeIdx 0) is
+// ready immediately; mixed becomes ready once every read filter Continued;
+// pure-read (terminal == nil) is never ready.
+func (rt *chainRuntime) terminalReady() bool {
+	return rt.terminal != nil && !rt.connHalted && rt.resumeIdx >= len(rt.filters)
+}
+
+// handleTerminal hands the downstream conn to the terminal filter. If the
+// read-filter prefix left undrained bytes in the connection buffer, those are
+// replayed to the terminal BEFORE the live conn via a prefixConn (R-M). For a
+// pure-terminal chain the buffer is empty → conn == rt.conn → byte-identical to
+// a direct Handle of the raw conn.
+func (rt *chainRuntime) handleTerminal(ctx context.Context) {
+	conn := rt.conn
+	if rt.buf.Len() > 0 {
+		prefix := make([]byte, rt.buf.Len())
+		copy(prefix, rt.buf.Bytes())
+		rt.buf.Drain(rt.buf.Len())
+		conn = newPrefixConn(rt.conn, prefix)
+	}
+	rt.terminal.Handle(ctx, conn)
+}
 
 // responseCodeDetails returns the response-code-details string set via the sink
 // (D-P26.1-5b). direct_response sets "DirectResponse"; "" otherwise.

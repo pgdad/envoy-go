@@ -23,11 +23,14 @@ func New(tc *anypb.Any, _ network.FactoryCtx) (network.FilterInstanceFactory, er
 			return nil, fmt.Errorf("echo: invalid typed_config: %w", err)
 		}
 	}
-	return func() network.ReadFilter { return &echoFilter{} }, nil
+	return func() network.NetworkFilter { return &echoFilter{} }, nil
 }
 
 // echoFilter reflects every received byte back to the downstream connection.
-type echoFilter struct{ cb network.ReadFilterCallbacks }
+type echoFilter struct {
+	network.Marker
+	cb network.ReadFilterCallbacks
+}
 
 // OnNewConnection returns Continue — echo has nothing to do at connection open.
 func (f *echoFilter) OnNewConnection() network.Status { return network.Continue }

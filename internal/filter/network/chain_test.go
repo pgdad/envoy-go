@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"io"
 	"net"
 	"testing"
@@ -8,6 +9,153 @@ import (
 
 	"google.golang.org/protobuf/types/known/structpb"
 )
+
+// scriptedConn returns a net.Conn whose first Read yields live then io.EOF,
+// capturing writes. net.Pipe is deliberately avoided: it lacks CloseWrite and
+// would not exercise the live-tail read after the buffered prefix.
+func scriptedConn(live []byte) net.Conn { return &scriptConn{live: live} }
+
+type scriptConn struct {
+	live   []byte
+	read   bool
+	writes []byte
+}
+
+func (c *scriptConn) Read(b []byte) (int, error) {
+	if c.read {
+		return 0, io.EOF
+	}
+	c.read = true
+	n := copy(b, c.live)
+	return n, nil
+}
+func (c *scriptConn) Write(b []byte) (int, error) {
+	c.writes = append(c.writes, b...)
+	return len(b), nil
+}
+func (c *scriptConn) Close() error                       { return nil }
+func (c *scriptConn) LocalAddr() net.Addr                { return nil }
+func (c *scriptConn) RemoteAddr() net.Addr               { return nil }
+func (c *scriptConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *scriptConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (c *scriptConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+// recordTerminal captures the bytes Handle reads off the handed-over conn.
+type recordTerminal struct {
+	Marker
+	got []byte
+}
+
+func (rt *recordTerminal) Handle(_ context.Context, c net.Conn) {
+	rt.got, _ = io.ReadAll(c)
+}
+
+// alwaysContinue drains NOTHING and Continues — the synthetic read filter that
+// hands the buffered prefix to the terminal (R-M).
+type alwaysContinue struct {
+	Marker
+	cb ReadFilterCallbacks
+}
+
+func (f *alwaysContinue) OnNewConnection() Status                       { return Continue }
+func (f *alwaysContinue) OnData(_ *Buffer, _ bool) Status               { return Continue }
+func (f *alwaysContinue) SetReadFilterCallbacks(cb ReadFilterCallbacks) { f.cb = cb }
+func (f *alwaysContinue) OnDestroy()                                    {}
+
+func TestPureTerminalImmediateHandoff(t *testing.T) {
+	term := &recordTerminal{}
+	conn := scriptedConn([]byte("RAW"))
+	rt := NewChainRuntime([]NetworkFilter{term}, conn, ConnFacts{})
+	if !rt.TerminalReady() {
+		t.Fatal("pure-terminal chain not TerminalReady at construction")
+	}
+	rt.HandleTerminal(context.Background())
+	if string(term.got) != "RAW" {
+		t.Fatalf("pure-terminal handoff: terminal saw %q, want RAW", term.got)
+	}
+}
+
+func TestMixedChainBufferedPrefixHandoff(t *testing.T) { // R-M
+	term := &recordTerminal{}
+	rf := &alwaysContinue{}
+	conn := scriptedConn([]byte("LIVE"))
+	rt := NewChainRuntime([]NetworkFilter{rf, term}, conn, ConnFacts{})
+	rt.OnNewConnection()
+	rt.OnData([]byte("PREFIX"), false) // rf Continues without draining → prefix retained
+	if !rt.TerminalReady() {
+		t.Fatal("mixed chain not TerminalReady after read filter Continued")
+	}
+	rt.HandleTerminal(context.Background())
+	if string(term.got) != "PREFIXLIVE" {
+		t.Fatalf("buffered-prefix handoff: terminal saw %q, want PREFIXLIVE", term.got)
+	}
+}
+
+// stopThenContinue Continues OnNewConnection (so OnData flows — an
+// OnNewConnection StopIteration is a sticky connHalted that would block OnData
+// entirely), then stays in the chain via StopIteration on the FIRST OnData
+// (buffering, no ContinueReading), and Continues to the terminal on the SECOND
+// OnData. This is the mid-loop TerminalReady transition the post-OnData
+// serveNetworkChain handoff branch relies on (rbac_network, 26.3: decide
+// allow/deny after inspecting buffered bytes). It drains nothing, so the
+// buffered prefix is retained for the terminal handoff.
+type stopThenContinue struct {
+	Marker
+	cb        ReadFilterCallbacks
+	continued bool
+}
+
+func (f *stopThenContinue) OnNewConnection() Status { return Continue }
+func (f *stopThenContinue) OnData(_ *Buffer, _ bool) Status {
+	if !f.continued {
+		f.continued = true
+		return StopIteration // first OnData: keep buffering, stay in the chain
+	}
+	return Continue // second OnData: release to the terminal
+}
+func (f *stopThenContinue) SetReadFilterCallbacks(cb ReadFilterCallbacks) { f.cb = cb }
+func (f *stopThenContinue) OnDestroy()                                    {}
+
+// TestMixedChainPostOnDataHandoff covers the THIRD terminal-handoff site: a read
+// filter that does NOT release in OnNewConnection but Continues to the terminal
+// during a LATER OnData, so TerminalReady flips true AFTER an OnData (inside the
+// read loop), not before. The post-OnData serveNetworkChain branch depends on
+// this transition (rbac_network 26.3). It also proves the buffered prefix
+// accumulated across the multi-OnData stop/continue reaches the terminal ahead
+// of the live tail.
+func TestMixedChainPostOnDataHandoff(t *testing.T) {
+	term := &recordTerminal{}
+	rf := &stopThenContinue{}
+	conn := scriptedConn([]byte("LIVE"))
+	rt := NewChainRuntime([]NetworkFilter{rf, term}, conn, ConnFacts{})
+	rt.OnNewConnection()
+	if rt.TerminalReady() {
+		t.Fatal("terminal ready before read filter Continued (should still be buffering)")
+	}
+	rt.OnData([]byte("PRE"), false) // first OnData: filter StopIteration → not ready
+	if rt.TerminalReady() {
+		t.Fatal("terminal ready after first OnData but filter has not Continued")
+	}
+	rt.OnData([]byte("FIX"), false) // second OnData: filter Continues → ready now (post-OnData transition)
+	if !rt.TerminalReady() {
+		t.Fatal("terminal not ready after read filter Continued mid-OnData")
+	}
+	rt.HandleTerminal(context.Background())
+	// The filter drained nothing, so both undrained reads ("PRE"+"FIX") remain
+	// in the connection buffer and are replayed before the live conn tail.
+	if string(term.got) != "PREFIXLIVE" {
+		t.Fatalf("post-OnData handoff: terminal saw %q, want PREFIXLIVE (buffered prefix then live tail)", term.got)
+	}
+}
+
+func TestPureReadNeverTerminalReady(t *testing.T) {
+	conn := scriptedConn(nil)
+	rt := NewChainRuntime([]NetworkFilter{&filterB{}}, conn, ConnFacts{})
+	rt.OnNewConnection()
+	if rt.TerminalReady() {
+		t.Fatal("pure-read chain reported TerminalReady")
+	}
+}
 
 // fakeConn implements net.Conn capturing writes + close.
 type fakeConn struct {
@@ -32,6 +180,7 @@ func (c *fakeConn) SetWriteDeadline(_ time.Time) error { return nil }
 // the next filter via ContinueReading (the StopIteration-then-resume contract,
 // SPEC §3.3). filterB then sees the connection-level buffered bytes.
 type filterA struct {
+	Marker
 	cb          ReadFilterCallbacks
 	stoppedOnce bool
 	onDataCalls int
@@ -51,6 +200,7 @@ func (f *filterA) SetReadFilterCallbacks(cb ReadFilterCallbacks) { f.cb = cb }
 func (f *filterA) OnDestroy()                                    {}
 
 type filterB struct {
+	Marker
 	saw           string
 	newConnCalled bool
 }
@@ -89,6 +239,7 @@ func TestChainContinueReadingResumesAtNextFilter(t *testing.T) {
 // stopConnFilter halts the chain at OnNewConnection (returns StopIteration);
 // its own OnData must never run (ContinueReading resumes at the NEXT filter).
 type stopConnFilter struct {
+	Marker
 	newConnCalled bool
 	dataCalled    bool
 }
@@ -101,6 +252,7 @@ func (f *stopConnFilter) OnDestroy()                                 {}
 // lazyConnFilter has OnNewConnection called LAZILY (only when the chain reaches
 // it after a ContinueReading jump), proving the §3.3 lazy-OnNewConnection path.
 type lazyConnFilter struct {
+	Marker
 	newConnCalled bool
 	dataSaw       string
 }
@@ -157,6 +309,7 @@ func TestChainOnNewConnectionStopHaltsThenResumesLazily(t *testing.T) {
 // accumulated bytes to OnData (upstream FilterManagerImpl::onRead re-iterates the
 // chain on every read).
 type echoStyleFilter struct {
+	Marker
 	seen []string
 }
 
@@ -246,7 +399,10 @@ func TestChainOnDestroyCallsAllFilters(t *testing.T) {
 	}
 }
 
-type destroyFilter struct{ destroyed bool }
+type destroyFilter struct {
+	Marker
+	destroyed bool
+}
 
 func (f *destroyFilter) OnNewConnection() Status                    { return Continue }
 func (f *destroyFilter) OnData(*Buffer, bool) Status                { return Continue }

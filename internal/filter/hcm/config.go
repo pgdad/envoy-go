@@ -14,6 +14,7 @@ import (
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/ratelimit"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -85,6 +86,8 @@ type ListenerCtx struct {
 // §5.4 boot ordering); incremented from the H1 connection.go and H2 h2dispatch.go
 // hot paths per SPEC §5.5.
 type Filter struct {
+	network.Marker // sealed-marker embed: grants isNetworkFilter() so *Filter satisfies network.TerminalFilter (26.2 Task 6; R-T). Handle is byte-identical to TerminalFilter.Handle — no method change.
+
 	table      *routeTable
 	clusters   *cluster.Manager
 	statPrefix string

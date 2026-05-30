@@ -74,7 +74,7 @@ func TestEchoRejectsInvalidTypedConfig(t *testing.T) {
 
 func TestEchoOnNewConnectionContinues(t *testing.T) {
 	fif, _ := echo.New(&anypb.Any{TypeUrl: echo.TypeURL}, network.FactoryCtx{})
-	rf := fif()
+	rf := fif().(network.ReadFilter)
 	if st := rf.OnNewConnection(); st != network.Continue {
 		t.Errorf("OnNewConnection()=%v want Continue", st)
 	}
@@ -82,7 +82,7 @@ func TestEchoOnNewConnectionContinues(t *testing.T) {
 
 func TestEchoOnDataWritesBackAndDrains(t *testing.T) {
 	fif, _ := echo.New(&anypb.Any{TypeUrl: echo.TypeURL}, network.FactoryCtx{}) // empty body accepted
-	rf := fif()
+	rf := fif().(network.ReadFilter)
 	cb := &fakeCallbacks{}
 	rf.SetReadFilterCallbacks(cb)
 
@@ -105,7 +105,7 @@ func TestEchoOnDataWritesBackAndDrains(t *testing.T) {
 
 	// endStream=true: echo must forward the downstream end_stream flag.
 	cb2 := &fakeCallbacks{}
-	rf2 := fif()
+	rf2 := fif().(network.ReadFilter)
 	rf2.SetReadFilterCallbacks(cb2)
 	buf2 := &network.Buffer{}
 	buf2.Append([]byte("fin"))

@@ -14,8 +14,51 @@ import (
 	"github.com/esalaine/envoy-go/internal/drain"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
+
+// Compile-time assertion that *Filter satisfies network.TerminalFilter (26.2
+// Task 6; R-T). The sealed isNetworkFilter() comes from the network.Marker
+// embed on Filter (config.go); Handle below is byte-identical to
+// TerminalFilter.Handle — only the marker embed was added to seal it.
+var _ network.TerminalFilter = (*Filter)(nil)
+
+// NewNetworkFactory returns a network.NetworkFilterFactory that builds the HCM
+// terminal filter once per chain at boot, capturing the boot singletons (cm,
+// registry, accessLogSinks, httpRegistry, dm, httpClient) and bridging the
+// per-chain network.FactoryCtx into hcm.ListenerCtx. It yields the SHARED
+// *Filter per accepted connection (HCM is conn-stateless across its Handle
+// serve loop). This is the bridge the retired manager.go filterRegistry HCM
+// closure performed (manager.go:112-131), moved into the hcm package; Task 10
+// deletes that closure as a true no-op.
+func NewNetworkFactory(
+	cm *cluster.Manager,
+	registry *stats.Registry,
+	accessLogSinks []accesslog.Sink,
+	httpRegistry *filter_http.HTTPRegistry,
+	dm *drain.Manager,
+	httpClient *httpclient.Client,
+) network.NetworkFilterFactory {
+	return func(tc *anypb.Any, ctx network.FactoryCtx) (network.FilterInstanceFactory, error) {
+		f, err := NewFilterWithCtxAndSinksAndRegistry(
+			tc, cm,
+			ListenerCtx{
+				HasTLS:             ctx.HasTLS,
+				AllowH2C:           ctx.AllowH2C,
+				ListenerPrincipal:  ctx.ListenerPrincipal,
+				HTTPClient:         httpClient,
+				NodeServiceCluster: ctx.NodeServiceCluster,
+			},
+			registry, accessLogSinks, httpRegistry, dm,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return func() network.NetworkFilter { return f }, nil
+	}
+}
 
 // NewFilterWithCtxAndSinksAndRegistry parses the typed_config Any into a
 // *Filter. Errors begin with "hcm: "; the listener manager wraps them with
