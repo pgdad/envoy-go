@@ -1,56 +1,55 @@
-START a fresh cold-start session for envoy-go — phase 26 (`network-filter-chain-and-rbac`) BRAINSTORM is DONE; author the parent SPEC.
+START a fresh cold-start session for envoy-go — phase 26 (`network-filter-chain-and-rbac`) PARENT SPEC is DONE; author the 26.1 sub-phase SPEC.
 
-This is a parent-SPEC cold-start. **Phase 26 BRAINSTORM is DONE + squash-merged to master + pushed to origin** (BRAINSTORM squash `77d6a01`; origin/master at the same). Phase 26 OPENS the §9 **Network filters family** — the first new §9 feature family since the HTTP-filters family closed at 25.3. The BRAINSTORM (a 6-question user dialogue) settled the family-bootstrap scope + a BRAINSTORM-time 3-way pre-split. STATE.md points at `phase 26 BRAINSTORM done; Network-filters family OPEN`, next-skill `superpowers:writing-plans` (scoped to parent SPEC), next-free `ADR-0213`.
+This is a per-sub-phase SPEC cold-start. **Phase 26 PARENT SPEC is DONE + squash-merged to master + pushed to origin** (parent-SPEC squash `89fc507`; origin/master at the same after the stage-close follow-up). The parent SPEC resolved the BRAINSTORM §10 D1–D8 empirical pins IN-SESSION against Envoy v1.37.2 + go-control-plane v1.32.4, formalized the 3-way split surface-mapping, and anchored the ADR-0213 + ADR-0214 §Context drafts in DECISIONS.md. STATE.md points at `phase 26 parent SPEC done; awaiting 26.1 SPEC`, next-skill `superpowers:writing-plans` (scoped to 26.1 SPEC), next-free `ADR-0215` (DECISIONS.md tail at ADR-0214).
 
-## What this session must do: author the phase-26 parent SPEC per BOOTSTRAP §5 routing
+## What this session must do: author the phase-26.1 sub-phase SPEC
 
-Per SKILL_ROUTING state 1→2 (SPEC.md does not yet exist), the next-skill is **`superpowers:writing-plans` scoped to PARENT-SPEC authoring** (`docs/envoy-go/phases/26-network-filter-chain-and-rbac/SPEC.md`), per the phase-22/24/25 parent-row precedent. The parent SPEC:
-1. Executes the BRAINSTORM §10 D1–D8 empirical-pin obligations IN-SESSION against reference Envoy v1.37.2 + go-control-plane v1.32.4 per ADR-0004 (parallel-subagent fan-out per the phase-25 SPEC precedent). **D4 (connection-metadata-sink primitive shape: extend `internal/dynamicmetadata/` vs new package) is SPEC-BLOCKING** — it must be settled here because the 26.1 `ReadFilterCallbacks` interface is shaped to accommodate it and ADR-0217 anchors it.
-2. Anchors the phase-26 ADR §Context drafts beginning at ADR-0213 (clean span ADR-0213..~ADR-0218 per the BRAINSTORM §7 locked numbering: 26.1 = 0213 chain-framework + 0214 registry; 26.2 = 0215 migration; 26.3 = 0216 internal/rbac + 0217 conn-metadata-sink + 0218 rbac_network).
-3. Formalizes the 3-way split surface-mapping + per-sub-phase scope boundaries (26.1 framework+echo+direct_response / 26.2 migrate tcp_proxy+HCM+retire-hardcoded-registry / 26.3 rbac_network+internal/rbac-extraction+conn-metadata-sink).
+Per SKILL_ROUTING state 1 (sub-row 26.1 in ROADMAP, its directory does not yet exist), the next-skill is **`superpowers:writing-plans` scoped to 26.1 SPEC authoring** (`docs/envoy-go/phases/26.1-network-filter-chain-framework-and-echo/SPEC.md`), per the phase-22.1/25.1 per-sub-phase-SPEC precedent. A 26.1 BRAINSTORM is NOT needed — the parent BRAINSTORM + parent SPEC settled the design (Q1-Q6 locked; AMEND-A1..A11 anchored; ADR-0213+0214 §Context drafted). The 26.1 SPEC:
+1. INHERITS the parent SPEC's §5 proto roster + §6 PARSE-REJECT roster + §7 stat surface + §8 fixture taxonomy + §11 empirical-pin block + §12 D-questions + §13 RATIFIED-PENDING items. It refines per-Task-level surface only; it does NOT re-execute the empirical pins.
+2. Creates the `docs/envoy-go/phases/26.1-network-filter-chain-framework-and-echo/` directory + opens sub-row 26.1 (`planned → in-progress` per ADR-0106).
+3. Anchors the 26.1 task breakdown for the NEW `internal/filter/network/` framework + `echo` + `direct_response` + the dual-dispatch wiring in `manager.go` + the `cmd/envoy-go/main.go` boot-wiring.
 
 This session:
-1. Reads STATE.md + the phase-26 BRAINSTORM.md + ROADMAP.md (rows 26 / 26.1 / 26.2 / 26.3) + BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING.md to confirm the BRAINSTORM→SPEC routing.
-2. Confirms baseline GREEN at master tip (`go build ./... && go vet ./... && golangci-lint run && go test -race -short ./...` + differential 41/41 + h2spec 53/53 + proxy-wasm conformance 10/10).
-3. Invokes `superpowers:writing-plans` scoped to parent SPEC authoring (in a worktree per the standing worktree preference; the SPEC stage is doc-authoring + empirical pins, no production code).
+1. Reads STATE.md + the parent SPEC + the BRAINSTORM + ROADMAP rows 26/26.1 + BOOTSTRAP_PROMPT.md §5 + SKILL_ROUTING.md to confirm the parent-SPEC→26.1-SPEC routing.
+2. Confirms baseline GREEN at master tip (`go build ./... && go vet ./... && golangci-lint run && go test -race -short ./...` + the differential/h2spec/conformance gates carried from 25.3 — the phase-26 parent SPEC is docs-only).
+3. Invokes `superpowers:writing-plans` scoped to 26.1 SPEC authoring (in a worktree per the standing preference; the SPEC stage is doc-authoring, no production code).
 
-## Phase 26 design (settled at BRAINSTORM; DO NOT re-litigate the 6 Q-decisions)
+## Phase 26.1 scope (settled at parent SPEC §3.2 + §4.1 + §4.2; ADR-0213 + ADR-0214)
 
-Phase 26 bootstraps the L4 network read-filter chain framework (the network-layer analogue of phase 07.1's HTTP filter framework) + lands the family's first 3 filters across a 3-way pre-split:
-- **26.1 `network-filter-chain-framework-and-echo`** — NEW `internal/filter/network/` read-filter chain: iteration-status protocol (`OnNewConnection`/`OnData` → `Continue`/`StopIteration`), `ReadFilterCallbacks` (connection accessor + `ContinueReading()`), per-connection read buffering on `StopIteration`, extensible freeze-after-boot threaded-constructor registry (mirrors ADR-0072/0079) boot-wired in `cmd/envoy-go/main.go`; + `echo` (`envoy.filters.network.echo`) + `direct_response` (`envoy.filters.network.direct_response`) as first consumers. Read-filter-ONLY (Q4; write-filter deferred + API-revision allowance). tcp_proxy/HCM untouched at 26.1.
-- **26.2 `network-filter-registry-migration`** — migrate `tcp_proxy` (`internal/filter/tcpproxy/`) + HCM (`internal/filter/hcm/`) onto the new read-filter interface + registry; RETIRE the hardcoded `filterRegistry` map + `filterHandler`/`filterConstructor` in `internal/listener/manager.go`. Back-compat proven by EXISTING fixtures (0000-tcp-echo + TLS-TCP + HCM) staying byte-exact green. NO new operator-visible filter.
-- **26.3 `network-filter-rbac`** — `rbac_network` (`envoy.extensions.filters.network.rbac.v3.RBAC`) FULL upstream parity (enforced + shadow rules + connection-level dynamic-metadata + allowed/denied/shadow_* stats); extract the phase-16 RBAC policy engine into shared `internal/rbac/` (abstract matchable-context interface; HTTP rbac = consumer #1 migrated + re-verified by its phase-16 fixtures; network = #2; API-revision-allowance clause); NEW connection-level dynamic-metadata sink. L4 inputs (source/dest IP+port, SNI/`requested_server_name`, downstream-cert principals); HTTP-only matchers (header/path/url) PARSE-REJECT.
+26.1 `network-filter-chain-framework-and-echo` lands the NEW L4 read-filter chain framework + the family's first two trivial filters:
+- **NEW `internal/filter/network/`**: the `ReadFilter` interface (`OnNewConnection() Status` + `OnData(buf, endStream) Status` → `Continue`/`StopIteration` — TWO-value enum per §11.5 D5, because L4 buffering is connection-level not filter-level); `ReadFilterCallbacks` (a `Connection()` accessor with `Write`/`Close`/local+remote addr/`RequestedServerName`/`DownstreamPrincipals`, `ContinueReading()`, and **`DynamicMetadata() *dynamicmetadata.Bucket`** — shaped NOW so 26.3 needs no revision, per the SPEC-BLOCKING D4 resolution AMEND-A5); the per-connection read-filter chain runner (sequential dispatch + connection-level read buffering on `StopIteration`, mirroring `internal/listener/listenerfilter/pipeline.go`); the per-connection runtime context (owns the `*dynamicmetadata.Bucket`); the freeze-after-boot threaded-constructor `*network.Registry` (mirrors `internal/listener/listenerfilter/registry.go` + ADR-0072/0079).
+- **`echo`** (`envoy.filters.network.echo.v3.Echo`, EMPTY config) — `OnData` writes bytes back, drains, returns `StopIteration`.
+- **`direct_response`** (`envoy.extensions.filters.network.direct_response.v3.Config` — note `Config`, NOT `DirectResponse`, per AMEND-A1; field `response` DataSource) — logic in `OnNewConnection`: write response + `endStream=true`, set ResponseCodeDetails `DirectResponse`, close `FlushWrite`, return `StopIteration`; no delay.
+- **Dual-dispatch in `manager.go`** (per ADR-0214 + parent SPEC §3.2): the NEW read-filter chain dispatch is wired ALONGSIDE the existing terminal-filter path — a chain whose `filters[0]` resolves in the frozen `*network.Registry` uses the new chain; `tcp_proxy`/HCM keep the EXISTING `buildTerminalFilter`+`Handle` path UNTOUCHED (the migration is 26.2). This confines 26.1's blast radius to new code.
+- **Boot-wiring in `cmd/envoy-go/main.go`**: construct `*network.Registry` → Register echo + direct_response → Freeze → thread into `listener.NewManagerWithBaseDirAndAllowH2C(...)`.
+- **Fixtures (+3)**: echo cross-side + direct_response cross-side + a direct_response boot-reject (empty `response.specifier` PGV-mirror, per AMEND-A2). **Fuzzer (+1)**: the 35th project fuzzer (master tip = 34, per AMEND/§11.8 — REFUTES the BRAINSTORM's 35).
+- **ADR-0213 + ADR-0214 §Decision/§Consequences bodies** land at 26.1 IMPL (§Context already drafted in DECISIONS.md at the parent SPEC).
 
-Self-answered per §9 precedent (SPEC confirms): full cross-side byte-exact differential fixtures; upstream-parity + envoy-go-strict stat surface; ZERO new third-party go.mod deps. Network filters have NO per-route `typed_per_filter_config` (BRAINSTORM §4; ADR-0125 roster untouched — SPEC confirms by absence).
+Read-filter-ONLY (write-filter deferred + API-revision allowance, ADR-0213). NO per-route surface (§2.2 / D6).
 
-## Project state at master tip (`6f68d81`)
+## Key empirical pins ALREADY RESOLVED at the parent SPEC (DO NOT re-litigate; see parent SPEC §11)
 
-- **Master tip:** `6f68d81` (a docs-only `next-prompt.txt: repoint master-tip references` commit). Predecessor `6319671` (the phase-26 BRAINSTORM stage-close SHA-fill `TBD-26-BRAINSTORM-SQUASH -> 77d6a01`). Substantive predecessor `77d6a01` (the phase-26 BRAINSTORM squash — BRAINSTORM.md + 4 ROADMAP rows + STATE advance + the next-prompt rewrite). Earlier `b0007a4` (the §9-family-close docs-only repoint). origin/master at `6f68d81`. Run `git log --oneline -1` to confirm the actual tip (this repoint commit itself advances the tip one past the SHA named here; the caveat is expected).
-- **§9 HTTP-filters family CLOSED at 25.3** (commit `57c7c4d` IMPL squash; SHA-fill `24c8fe1`); 20 production HTTP filters wired. DO NOT reopen.
-- **Network filters family OPEN:** parent row 26 `in-progress`; sub-rows 26.1/26.2/26.3 `planned`. 6 family candidates remain after phase 26 (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster).
-- **Counts at master tip (carried from 25.3):** stat surface **132**; differential fixtures **41**; fuzzers **35**; conformance **10/10**; ADR tail **ADR-0212**, next-free **ADR-0213**. Anticipated phase-26 family deltas (SPEC pins): fixtures 41 → ~46–47; stats 132 → ~136–138; fuzzers 35 → ~37–38; ADRs 0213 → ~0218.
-- **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); h2spec 53/53 at the ADR-0051 v1.32.4 pin.
-- **Six gates GREEN at master tip** (carried from the 25.3 IMPL phase-done evidence; the phase-26 BRAINSTORM is docs-only).
+- direct_response message = `Config` (AMEND-A1); echo empty + vacuous PGV (AMEND-A2); two-value Status enum + connection-level buffering + onNewConnection-eager-at-accept + ContinueReading-resumes-at-NEXT-filter (D5); echo/direct_response semantics (D7); no per-route (D6); D4 SPEC-BLOCKING resolved → conn-metadata sink REUSES `internal/dynamicmetadata/` at connection scope (NOT a new package), `ReadFilterCallbacks.DynamicMetadata()` shaped at 26.1 (AMEND-A5). The 26.1 SPEC inherits all of these.
 
-## Reuse precedent the SPEC inherits (the network framework deliberately mirrors the HTTP framework)
+## Project state at master tip (`89fc507`)
 
-- ADR-0038 — HTTP-filter iteration-status protocol (the model the 26.1 read-filter iteration mirrors).
-- ADR-0072 (HTTPRegistry) + ADR-0079 (listener-filter registry) + ADR-0059 (stats-registry LBP-1) — the freeze-after-boot threaded-constructor registry discipline the 26.1 network registry mirrors; ADR-0079 also gives the two-step factory pattern.
-- ADR-0071 — single-goroutine-per-stream concurrency + chain discipline (the 26.1 single-goroutine-per-connection spirit).
-- phase-22.1 `internal/lua` (ADR-0188) + phase-25.1 `internal/wasm` (ADR-0202) — the extract-at-Nth-consumer-with-API-revision-allowance pattern the 26.3 `internal/rbac/` extraction follows (with the added discipline of re-verifying the LIVE phase-16 first consumer).
-- phase-16 `internal/matcher/` + the HTTP-local RBAC engine at `internal/filter/http/rbac/` — the direct reuse/extraction target of 26.3.
-- ADR-0207 — the per-stream `internal/filterstate/` (HTTP-scoped); 26.3's connection-metadata sink is its connection-scoped sibling.
+- **Master tip:** `89fc507` (the phase-26 parent-SPEC squash) + the stage-close follow-up (STATE SHA-fill + this next-prompt rewrite). Run `git log --oneline -1` to confirm the actual tip (the follow-up commit advances the tip one past `89fc507`; the caveat is expected). origin/master at the follow-up tip after push.
+- **§9 Network-filters family OPEN:** parent row 26 `in-progress`; sub-rows 26.1/26.2/26.3 `planned`. 6 family candidates remain after phase 26 (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster).
+- **Counts at master tip (carried from 25.3):** stat surface **132**; differential fixtures **41**; fuzzers **34** (NOT 35 — the parent SPEC §11.8 refuted the BRAINSTORM hypothesis); conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0214** (ADR-0213+0214 §Context drafts landed at the parent SPEC), next-free **ADR-0215**. Anticipated 26.1 deltas: fixtures 41 → 44; fuzzers 34 → 35; stats unchanged at 132; ADR-0213+0214 §Decision/§Consequences bodies land.
+- **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
+- **Six gates GREEN at master tip** (the phase-26 parent SPEC is docs-only; code is unchanged since 25.3 IMPL phase-done).
 
 ## Read first (in order)
 
-1. THIS FILE — the phase-26 parent-SPEC cold-start.
-2. `docs/envoy-go/STATE.md` — active-phase `phase 26 BRAINSTORM done; Network-filters family OPEN`; next-skill `superpowers:writing-plans` (parent SPEC); next-free `ADR-0213`; last-commit `77d6a01`.
-3. `docs/envoy-go/phases/26-network-filter-chain-and-rbac/BRAINSTORM.md` — the full settled design (§1–§12; the 6 Q-decisions; §7 locked ADR numbering; §10 D1–D8 empirical-pin obligations with D4 SPEC-BLOCKING).
-4. `docs/envoy-go/ROADMAP.md` — rows 26 / 26.1 / 26.2 / 26.3.
-5. `BOOTSTRAP_PROMPT.md` §5 (state machine; BRAINSTORM→SPEC routing) + §4.1 STATE-update invariant + ADR-0004 (SPEC-time empirical-pin hard-gate).
-6. `docs/envoy-go/SKILL_ROUTING.md` — confirm state-1→2 → `superpowers:writing-plans` (SPEC).
-7. The existing network/L4 code the SPEC must pin against: `internal/listener/manager.go` (the hardcoded `filterRegistry` + `filterHandler` to be migrated at 26.2), `internal/filter/tcpproxy/`, `internal/filter/hcm/`, `internal/filter/http/` (the HTTP framework being mirrored), `internal/filter/http/rbac/` (the engine being extracted), `internal/matcher/`, `internal/listener/listenerfilter/` (the listener-filter pipeline + registry precedent).
-8. `docs/envoy-go/DECISIONS.md` — ADR tail ADR-0212; the framework-chain + registry + extract-at-consumer ADR lineage cited above.
-9. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + differential-asserter-dispatch + fixture-dispatch-constraint memories all apply to phase 26.
+1. THIS FILE — the phase-26.1 SPEC cold-start.
+2. `docs/envoy-go/STATE.md` — active-phase `phase 26 parent SPEC done; awaiting 26.1 SPEC`; next-skill `superpowers:writing-plans` (26.1 SPEC); next-free `ADR-0215`; last-commit `89fc507`.
+3. `docs/envoy-go/phases/26-network-filter-chain-and-rbac/SPEC.md` — the PARENT SPEC (the §3.1 surface-mapping, §4.1 framework primitive, §4.2 echo+direct_response, §5/§6/§7/§8 rosters, §10 ADR map, §11 empirical-pin block, §12 D-questions, §13/§14/§15). The 26.1 SPEC inherits this.
+4. `docs/envoy-go/phases/26-network-filter-chain-and-rbac/BRAINSTORM.md` — the settled design (Q1-Q6; §7 ADR numbering).
+5. `docs/envoy-go/ROADMAP.md` — rows 26 / 26.1.
+6. `BOOTSTRAP_PROMPT.md` §5 (state machine) + §4.1 STATE-update invariant + ADR-0004/0005 (autonomous SPEC/PLAN adaptation).
+7. `docs/envoy-go/SKILL_ROUTING.md` — confirm state-1 → `superpowers:writing-plans` (SPEC) for sub-row 26.1.
+8. `docs/envoy-go/DECISIONS.md` — ADR-0213 + ADR-0214 §Context drafts (tail); the registry/iteration/extraction ADR lineage (ADR-0038/0059/0071/0072/0079/0207).
+9. The existing code the 26.1 SPEC pins against: `internal/listener/manager.go` (the dual-dispatch wiring target: `filterHandler`@44, `filterRegistry`@102, `buildTerminalFilter`@569, `Handle`@1005, `serveConnection`), `internal/filter/http/{types,registry,callbacks,chain}.go` (the HTTP framework being mirrored), `internal/listener/listenerfilter/{registry,pipeline,types}.go` (the closest structural analogue), `internal/dynamicmetadata/dynamicmetadata.go` (the REUSED sink), `cmd/envoy-go/main.go` (boot-wiring pattern @129-213).
+10. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + differential-asserter-dispatch + fixture-dispatch-constraint memories all apply to 26.1.
 
-After the parent SPEC is authored + reviewed + committed + squash-merged + pushed, advance STATE.md per BOOTSTRAP §5 and rewrite next-prompt.txt for the next-stage cold-start (26.1 SPEC, or 26.1 PLAN, per the per-sub-phase precedent).
+After the 26.1 SPEC is authored + reviewed + committed + squash-merged + pushed, advance STATE.md per BOOTSTRAP §5 and rewrite next-prompt.txt for the 26.1 PLAN cold-start.
