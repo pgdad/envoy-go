@@ -18,7 +18,7 @@ This is a MIGRATION/refactor sub-phase (move existing behavior onto the new fram
 
 ## Project state at master tip
 
-- **Master tip:** `92af220` (the 26.1-IMPL stage-close commit — STATE SHA-fill + this next-prompt rewrite; trails the IMPL squash `3ee1955`). Confirm via `git log --oneline -1`; any further next-prompt repoint commit advances the tip +1, expected and not chased. origin/master in sync after push. STATE.md `last-commit` points at the substantive squash `3ee1955` (not the repoint tip).
+- **Master tip:** `964fd26` (a next-prompt.txt repoint commit; trails the 26.1-IMPL stage-close `92af220` and the IMPL squash `3ee1955`). Confirm via `git log --oneline -1` — the commit landing any further next-prompt repoint will itself advance the tip +1, expected and not chased. origin/master in sync after push. STATE.md `last-commit` points at the substantive squash `3ee1955` (not the repoint tip).
 - **§9 Network-filters family OPEN:** parent row 26 `in-progress`; sub-row 26.1 `done`; 26.2 `planned` (flips `planned → in-progress` at the 26.2 SPEC commit per ADR-0106); 26.3 `planned`. Parent row 26 flips `in-progress → done` at 26.3 phase-done (ROLLUP precedent 18/19/22/24/25).
 - **Counts at master tip:** stat surface **132**; differential numbered-fixtures **44** (tail **0042**); fuzzers **35**; conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0214**, next-free **ADR-0215**. 26.2 is a migration: anticipated NO new fixtures/fuzzers/stats deltas (verify at the 26.2 SPEC §11 D-S1 baselines; the migration may ADD a mixed-chain fixture once the restriction lifts — a 26.2 SPEC decision).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
