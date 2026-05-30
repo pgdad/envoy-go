@@ -23,9 +23,9 @@ Phase 26 bootstraps the L4 network read-filter chain framework (the network-laye
 
 Self-answered per §9 precedent (SPEC confirms): full cross-side byte-exact differential fixtures; upstream-parity + envoy-go-strict stat surface; ZERO new third-party go.mod deps. Network filters have NO per-route `typed_per_filter_config` (BRAINSTORM §4; ADR-0125 roster untouched — SPEC confirms by absence).
 
-## Project state at master tip (`6319671`)
+## Project state at master tip (`6f68d81`)
 
-- **Master tip:** `6319671` (the phase-26 BRAINSTORM stage-close SHA-fill `TBD-26-BRAINSTORM-SQUASH -> 77d6a01` — docs-only follow-up). Substantive predecessor `77d6a01` (the phase-26 BRAINSTORM squash — BRAINSTORM.md + 4 ROADMAP rows + STATE advance + the next-prompt rewrite). Earlier `b0007a4` (the §9-family-close docs-only repoint). origin/master at `6319671`. Run `git log --oneline -1` to confirm the actual tip (a further docs-only repoint may advance the tip one more; the caveat is expected).
+- **Master tip:** `6f68d81` (a docs-only `next-prompt.txt: repoint master-tip references` commit). Predecessor `6319671` (the phase-26 BRAINSTORM stage-close SHA-fill `TBD-26-BRAINSTORM-SQUASH -> 77d6a01`). Substantive predecessor `77d6a01` (the phase-26 BRAINSTORM squash — BRAINSTORM.md + 4 ROADMAP rows + STATE advance + the next-prompt rewrite). Earlier `b0007a4` (the §9-family-close docs-only repoint). origin/master at `6f68d81`. Run `git log --oneline -1` to confirm the actual tip (this repoint commit itself advances the tip one past the SHA named here; the caveat is expected).
 - **§9 HTTP-filters family CLOSED at 25.3** (commit `57c7c4d` IMPL squash; SHA-fill `24c8fe1`); 20 production HTTP filters wired. DO NOT reopen.
 - **Network filters family OPEN:** parent row 26 `in-progress`; sub-rows 26.1/26.2/26.3 `planned`. 6 family candidates remain after phase 26 (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster).
 - **Counts at master tip (carried from 25.3):** stat surface **132**; differential fixtures **41**; fuzzers **35**; conformance **10/10**; ADR tail **ADR-0212**, next-free **ADR-0213**. Anticipated phase-26 family deltas (SPEC pins): fixtures 41 → ~46–47; stats 132 → ~136–138; fuzzers 35 → ~37–38; ADRs 0213 → ~0218.
