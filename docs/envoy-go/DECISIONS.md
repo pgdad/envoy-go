@@ -13864,3 +13864,67 @@ The `test/conformance/proxy-wasm/` conformance harness is a NEW Go-test package,
 - **The 6 deferred families** are the §9-WASM-host-family forward-pointer roster; their absence is documented, not a regression. Re-evaluated when the WasmService singleton / cross-VM-queue substrate lands in a future §9 WASM-host phase.
 
 ---
+
+## ADR-0213: NEW `internal/filter/network/` read-filter chain framework — L4 read-filter iteration-status protocol (`OnNewConnection`/`OnData` → `Continue`/`StopIteration`, two-value enum) + `ReadFilterCallbacks` (connection accessor + `ContinueReading()` + `DynamicMetadata() *dynamicmetadata.Bucket`) + connection-level read buffering on `StopIteration` + per-connection runtime context + single-goroutine-per-connection concurrency + read-filter-ONLY scope (write-filter deferred) + EXPLICIT API-REVISION ALLOWANCE clause for a future write-filter / connection-metadata-storage addition
+
+**Status:** §Context anchored at phase-26 parent SPEC commit (this commit); §Decision + §Consequences body lands at phase-26.1 IMPL Lands-in-Task (the primitive's first commit) per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-30 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 26.1 IMPL Lands-in-Task).
+**Doctrine:** Phase 26 §9 Network-filters-family row (FIRST). ADR-0044 ADR-on-impl convention + §Context-draft discipline.
+**Lands-in:** Phase 26.1 IMPL first task that materializes `internal/filter/network/` (anticipated Task 1-3 per the phase-07.1 + phase-22.1 framework-primitive-first-task precedent).
+
+### Context
+
+ADR-0213 anchors the NEW `internal/filter/network/` read-filter chain framework — the L4 analogue of the phase-07.1 `internal/filter/http/` HTTP filter framework, and the FIRST new filter-category framework primitive since phase-07.1. At master tip the only network filters (`tcp_proxy` + HCM) are terminal-only, selected one-per-chain via a hardcoded `map[string]filterConstructor` in `internal/listener/manager.go:102` with a private `filterHandler { Handle(ctx, conn) }` interface (`manager.go:44-46`) — no iteration, no callbacks, no read/write-filter protocol, no extensible registration. ADR-0213 establishes the missing chain framework; ADR-0214 establishes its registry.
+
+**Iteration-status protocol mirrors ADR-0038 at L4.** The `ReadFilter` interface is `OnNewConnection() Status` + `OnData(buf []byte, endStream bool) Status` returning a TWO-value `Status` enum (`Continue` / `StopIteration`). Per the §11.5 D5 empirical scrape against Envoy v1.37.2 `envoy/network/filter.h` + `source/common/network/filter_manager_impl.cc`, the network filter manager's `FilterStatus` enum has exactly two values (no `StopIterationAndBuffer`/`StopAllIteration` variants — unlike the HTTP chain's `FilterDataStatus`) because L4 buffering is CONNECTION-level, not filter-level. `OnNewConnection` is called eagerly per filter at connection accept (before any data), in registration order, stopping on `StopIteration` (upstream `initializeReadFilters()`); `OnData` is called with the connection read buffer when `length>0 || endStream`. On `StopIteration` the chain runner stops at the current filter and leaves undrained bytes in the connection read buffer; `ContinueReading()` resumes at the NEXT filter with the currently-available buffered bytes (upstream `onContinueReading(this, connection_)` resuming at `std::next(filter->entry())`). This is the byte-faithful iteration contract the runner mirrors.
+
+**`ReadFilterCallbacks` shaped at 26.1 to need NO 26.3 revision (per parent SPEC §11.4 D4 SPEC-BLOCKING resolution + AMEND-A5).** The callbacks expose: a `Connection()` accessor (`Write([]byte, endStream)`, `Close(closeType)`, `LocalAddr()/RemoteAddr() net.Addr`, `RequestedServerName() string`, `DownstreamPrincipals() []string` — the L4 inputs the §11.3 D3 RBAC matcher subset needs), `ContinueReading()`, and `DynamicMetadata() *dynamicmetadata.Bucket`. The `DynamicMetadata()` accessor is shaped at 26.1 (returning the per-connection runtime context's `*dynamicmetadata.Bucket`, constructed via `dynamicmetadata.NewBucket()` at connection entry) even though only `rbac_network` (26.3) writes to it — this is exactly why D4 was SPEC-blocking: shaping the accessor now avoids a post-hoc 26.1 callbacks-API revision when 26.3 lands the storage. Mirrors the HTTP decoder/encoder callbacks' `DynamicMetadata() *dynamicmetadata.Bucket` at `internal/filter/http/callbacks.go:285,476`.
+
+**Per-connection runtime context = the genuinely-NEW primitive (the L4 analogue of the HTTP chain's per-stream `FilterChain` state).** It owns the `*dynamicmetadata.Bucket` (lifetime = connection; `Reset()`+nil at close, mirroring `internal/filter/http/chain.go:314,676`) and is threaded into each filter's `ReadFilterCallbacks`. Unused by echo/direct_response at 26.1; consumed by rbac_network at 26.3.
+
+**Read-filter-ONLY scope + write-filter deferral (per BRAINSTORM Q4).** Every near-term Network-family filter (`echo`, `direct_response`, `tcp_proxy`, `rbac`, `sni_cluster`) is a read filter; write filters (`onWrite` / `WriteFilter`) appear only in deferred protocol proxies. Building unexercised write-filter plumbing would violate the deliberate-break / every-surface-exercised discipline. ADR-0213 carries an EXPLICIT API-REVISION ALLOWANCE clause (mirrors phase-22.1 ADR-0188 + phase-25.1 ADR-0202) for a future write-filter addition.
+
+**Single-goroutine-per-connection concurrency (ADR-0071 spirit).** The chain runner dispatches synchronously on the connection goroutine (`internal/listener/manager.go` `serveConnection`), consistent with the existing `Handle(ctx, conn)` model. Cross-goroutine async read-filter resume is deferred (parent SPEC §2.1).
+
+**First consumers echo + direct_response (per §11.7 D7).** `echo` (`envoy.filters.network.echo.v3.Echo`, empty config) — `OnData` writes bytes back via `Connection().Write(buf, endStream)`, drains the buffer, returns `StopIteration`. `direct_response` (`envoy.extensions.filters.network.direct_response.v3.Config`, field `response` DataSource) — logic in `OnNewConnection` (not `OnData`): write the configured response with `endStream=true`, set response-code-details `DirectResponse`, close with `FlushWrite`, return `StopIteration`; no configurable delay in v1.37.2.
+
+### Decision
+
+(Body lands at 26.1 IMPL Lands-in-Task per ADR-0044 in-place edit discipline.)
+
+### Consequences
+
+(Body lands at 26.1 IMPL Lands-in-Task.)
+
+**Cross-references:** ADR-0214 (paired registry + boot-wiring ADR); ADR-0038 (HTTP iteration-status protocol — the L4 model); ADR-0071 (single-goroutine-per-stream concurrency — the per-connection spirit); ADR-0072 + ADR-0079 (freeze-after-boot registry discipline — mirrored by ADR-0214); ADR-0207 (per-stream `internal/filterstate/` — the per-stream sibling of the per-connection runtime context); phase-07.1 (the HTTP filter framework this mirrors); phase-26 parent SPEC §4.1 + §4.2 + §11.5 D5 + §11.7 D7 + AMEND-A5; provisional ADR-0217 (the connection-metadata sink whose storage the `DynamicMetadata()` accessor anticipates).
+
+---
+
+## ADR-0214: extensible freeze-after-boot threaded-constructor network-filter registry `*network.Registry` (mirrors ADR-0072 HTTPRegistry + ADR-0079 listener-filter registry; no package-global `init()`; late-`Register` panics; lock-free post-Freeze lookup; two-step factory) + `cmd/envoy-go/main.go` boot-wiring + 26.1 dual-dispatch (new read-filter chain path alongside the untouched terminal-filter path) + planned 26.2 hardcoded-registry retirement
+
+**Status:** §Context anchored at phase-26 parent SPEC commit (this commit); §Decision + §Consequences body lands at phase-26.1 IMPL Lands-in-Task per ADR-0044 in-place edit discipline.
+**Date:** 2026-05-30 (§Context anchor at this SPEC commit; §Decision + §Consequences body lands at 26.1 IMPL Lands-in-Task).
+**Doctrine:** Phase 26 §9 Network-filters-family row (FIRST). ADR-0044 ADR-on-impl convention + §Context-draft discipline. ADR-0059 stats-registry LBP-1 root.
+**Lands-in:** Phase 26.1 IMPL task that materializes `internal/filter/network/registry.go` + the `cmd/envoy-go/main.go` boot-wiring (anticipated Task 3-6).
+
+### Context
+
+ADR-0214 anchors the extensible network-filter registry that the ADR-0213 chain consumes, plus its boot-wiring and the 26.1 dual-dispatch strategy. It mirrors the project's established freeze-after-boot threaded-constructor registry discipline byte-for-byte.
+
+**Registry shape = byte-identical discipline to `internal/listener/listenerfilter/registry.go:19-58` + `internal/filter/http/registry.go:17-110` (ADR-0072/0079).** `*network.Registry` carries `sync.RWMutex` + `byTypeURL map[string]NetworkFilterFactory` + `frozen atomic.Bool`. `Register(typeURL, factory)` panics if `frozen.Load()` ("registry frozen: cannot register %q post-boot") or on duplicate registration; `Lookup(typeURL)` takes `RLock` (lock-free in practice post-Freeze); `Freeze()` is idempotent (`frozen.Store(true)`); `KnownTypeURLs()` supplies error-message context. NO package-global `init()` — registration is explicit at boot. The two-step factory pattern (parse `typed_config` once at boot → per-connection instance factory) mirrors `listenerfilter/types.go:91-96`: `NetworkFilterFactory func(tc *anypb.Any, ctx FactoryCtx) (FilterInstanceFactory, error)` + `FilterInstanceFactory func() ReadFilter`.
+
+**Boot-wiring in `cmd/envoy-go/main.go` (mirrors the HTTP + listener-filter registry wiring at `main.go:129-183,198-200`).** Construct `*network.Registry` → `Register(echo.TypeURL, echo.New)` + `Register(directresponse.TypeURL, directresponse.New)` → `Freeze()` BEFORE manager construction → thread as a NEW argument into `listener.NewManagerWithBaseDirAndAllowH2C(...)` (alongside the existing `httpReg` + `lfReg` arguments).
+
+**26.1 dual-dispatch confines blast radius to NEW code (per BRAINSTORM §1.1.1(d) + parent SPEC §3.2 + D-P2).** At 26.1 the new read-filter chain dispatch is wired into `manager.go` as a NEW path ALONGSIDE the existing terminal-filter path: a filter chain whose `filters[0]` type_url resolves in the frozen `*network.Registry` dispatches via the new read-filter chain runner; a chain whose terminal filter is `tcp_proxy`/HCM keeps the EXISTING `buildTerminalFilter` (`manager.go:569`) + `Handle` (`manager.go:1005`) path UNTOUCHED. This keeps 26.1's blast radius confined to new code (`tcp_proxy`/HCM are not yet on the read-filter interface — that is 26.2's job). The hardcoded `filterRegistry`/`filterHandler`/`filterConstructor`/`buildTerminalFilter` are RETIRED at 26.2 (ADR-0215), when `tcp_proxy`/HCM migrate onto the read-filter interface and the dispatch unifies; back-compat is proven by the EXISTING `0000-tcp-echo` + TLS-TCP + HCM differential fixtures staying byte-exact green.
+
+### Decision
+
+(Body lands at 26.1 IMPL Lands-in-Task per ADR-0044 in-place edit discipline.)
+
+### Consequences
+
+(Body lands at 26.1 IMPL Lands-in-Task.)
+
+**Cross-references:** ADR-0213 (paired framework ADR — the chain the registry feeds); ADR-0072 (HTTPRegistry freeze-after-boot — the direct model); ADR-0079 (listener-filter registry + two-step factory — the closest structural analogue); ADR-0059 (stats-registry LBP-1 freeze-after-boot root); provisional ADR-0215 (the 26.2 hardcoded-registry retirement + dispatch unification this dual-dispatch plans for); phase-26 parent SPEC §4.1 + §3.2 + §11.8 D8 + D-P2.
+
+---
