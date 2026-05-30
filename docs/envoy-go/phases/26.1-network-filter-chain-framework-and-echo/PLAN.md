@@ -1146,7 +1146,7 @@ func init() { fixture.RegisterFixture("0040-network-echo", driver{}) }
 
 type driver struct{}
 
-func (driver) BackendCount() int          { return 0 }
+func (driver) BackendCount() int          { return 1 } // runner fatals on n<1; spare TCP-echo backend unused
 func (driver) SubjectListenerName() string { return "l_echo" }
 func (driver) ReferenceListenerPort() int  { return 15000 }
 
@@ -1228,7 +1228,7 @@ git commit -m "phase 26.1 Task 14: differential fixture 0040-network-echo (cross
 - Create: `test/fixtures/0041-network-direct-response/README.md`
 - Modify: `test/differential/runner_test.go` (add the blank-import line)
 
-- [ ] **Step 1: Write the driver + register + blank-import.** Single `[direct_response]` chain with an `inline_string` response; `BackendCount()==0`; Drive connects, reads until EOF (server closes after `FlushWrite`):
+- [ ] **Step 1: Write the driver + register + blank-import.** Single `[direct_response]` chain with an `inline_string` response; `BackendCount()==1` (runner fatals on n<1; the spare backend is unused); Drive connects, reads until EOF (server closes after `FlushWrite`):
 
 ```go
 // test/fixtures/0041-network-direct-response/driver/driver.go
@@ -1247,7 +1247,7 @@ func init() { fixture.RegisterFixture("0041-network-direct-response", driver{}) 
 
 type driver struct{}
 
-func (driver) BackendCount() int           { return 0 }
+func (driver) BackendCount() int           { return 1 } // runner fatals on n<1; spare TCP-echo backend unused
 func (driver) SubjectListenerName() string { return "l_dr" }
 func (driver) ReferenceListenerPort() int  { return 15000 }
 func (driver) ReferenceBootstrap(_ []int) string { return bootstrap(15000, 0) }
@@ -1343,7 +1343,7 @@ func init() { fixture.RegisterFixture("0042-network-direct-response-boot-reject"
 
 type driver struct{}
 
-func (driver) BackendCount() int           { return 0 }
+func (driver) BackendCount() int           { return 1 } // runner fatals on n<1; spare TCP-echo backend unused
 func (driver) SubjectListenerName() string { return "l_dr" }
 func (driver) ReferenceListenerPort() int  { return 15000 }
 func (driver) ReferenceBootstrap(_ []int) string { return bootstrap(15000, 0) }
