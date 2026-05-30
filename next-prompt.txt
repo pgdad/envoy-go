@@ -31,9 +31,9 @@ Read-filter-ONLY (write-filter deferred + API-revision allowance, ADR-0213). NO 
 
 - direct_response message = `Config` (AMEND-A1); echo empty + vacuous PGV (AMEND-A2); two-value Status enum + connection-level buffering + onNewConnection-eager-at-accept + ContinueReading-resumes-at-NEXT-filter (D5); echo/direct_response semantics (D7); no per-route (D6); D4 SPEC-BLOCKING resolved → conn-metadata sink REUSES `internal/dynamicmetadata/` at connection scope (NOT a new package), `ReadFilterCallbacks.DynamicMetadata()` shaped at 26.1 (AMEND-A5). The 26.1 SPEC inherits all of these.
 
-## Project state at master tip (`89fc507`)
+## Project state at master tip (`607cb74`)
 
-- **Master tip:** `89fc507` (the phase-26 parent-SPEC squash) + the stage-close follow-up (STATE SHA-fill + this next-prompt rewrite). Run `git log --oneline -1` to confirm the actual tip (the follow-up commit advances the tip one past `89fc507`; the caveat is expected). origin/master at the follow-up tip after push.
+- **Master tip:** `607cb74` (the phase-26 parent-SPEC stage-close follow-up: STATE SHA-fill + the 26.1-SPEC next-prompt rewrite + this repoint). Substantive predecessor `89fc507` (the phase-26 parent-SPEC squash — SPEC.md + ADR-0213/0214 §Context drafts + STATE advance). origin/master at `607cb74` (in sync). Run `git log --oneline -1` to confirm the actual tip (this repoint may itself advance the tip one further; the caveat is expected).
 - **§9 Network-filters family OPEN:** parent row 26 `in-progress`; sub-rows 26.1/26.2/26.3 `planned`. 6 family candidates remain after phase 26 (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster).
 - **Counts at master tip (carried from 25.3):** stat surface **132**; differential fixtures **41**; fuzzers **34** (NOT 35 — the parent SPEC §11.8 refuted the BRAINSTORM hypothesis); conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0214** (ADR-0213+0214 §Context drafts landed at the parent SPEC), next-free **ADR-0215**. Anticipated 26.1 deltas: fixtures 41 → 44; fuzzers 34 → 35; stats unchanged at 132; ADR-0213+0214 §Decision/§Consequences bodies land.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
