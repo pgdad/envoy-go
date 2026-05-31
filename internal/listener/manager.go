@@ -1077,6 +1077,16 @@ func (rt *listenerRuntime) serveNetworkChain(ctx context.Context, dispatchConn n
 			break
 		}
 	}
+	// Honor the close semantics the filter requested (F3, D-26.3-2).
+	// FlushWrite (the zero value) drains then closes; NoFlush is
+	// minimal-correct per D-26.3-2 (SO_LINGER 0 → RST, discarding any pending
+	// write), set best-effort on a *net.TCPConn before Close. Socket-level
+	// parity is fixture-verified by the Task-14 differential.
+	if rtChain.CloseType() == network.NoFlush {
+		if tc, ok := dispatchConn.(interface{ SetLinger(int) error }); ok {
+			_ = tc.SetLinger(0)
+		}
+	}
 	_ = dispatchConn.Close() // pure-read close (echo/direct_response); terminal path returned above
 }
 

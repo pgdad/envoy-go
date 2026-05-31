@@ -483,3 +483,150 @@ func TestFlattenToProm_Wasm_RejectsEmptyScope(t *testing.T) {
 		t.Error("flattenToProm(\"wasm.\"): want error, got nil")
 	}
 }
+
+// Phase 26.3 network-rbac tag-extractor tests (ADR-0218 + SPEC §7 + §7.1).
+// The network rbac_network filter roots its four counters on a single-segment
+// stat_prefix: `<stat_prefix>.rbac.{allowed,denied}` and
+// `<stat_prefix>.rbac.[<shadow_prefix>.]shadow_{allowed,denied}`.
+// The stat_prefix is promoted to `envoy_rbac_prefix=<stat_prefix>`; the rest
+// flattens to `envoy_rbac_<rest>` (dots→underscores).
+//
+// These tests mirror the SN9 guard discipline: each test would FAIL if the
+// corresponding guard (idx>0, !ContainsRune(prefix,'.'), suffix allowlist)
+// were removed.
+
+func TestFlattenToProm_NetworkRBAC_AllFourCounters(t *testing.T) {
+	// POSITIVE: all four base counter names match and produce the expected base +
+	// label. Per SPEC §7 / ADR-0218: enforced counters use the plain
+	// `<sp>.rbac.<counter>` shape; shadow counters are also confirmed here
+	// (without a shadow_rules_stat_prefix middle segment, i.e. empty prefix path).
+	cases := []struct {
+		input    string
+		wantBase string
+		wantPfx  string
+	}{
+		{"rbac_allow.rbac.allowed", "envoy_rbac_allowed", "rbac_allow"},
+		{"rbac_deny.rbac.denied", "envoy_rbac_denied", "rbac_deny"},
+		{"rbac_shadow.rbac.shadow_allowed", "envoy_rbac_shadow_allowed", "rbac_shadow"},
+		{"rbac_shadow.rbac.shadow_denied", "envoy_rbac_shadow_denied", "rbac_shadow"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.input, func(t *testing.T) {
+			base, labels, err := flattenToProm(tc.input)
+			if err != nil {
+				t.Fatalf("flattenToProm(%q): %v", tc.input, err)
+			}
+			if base != tc.wantBase {
+				t.Errorf("base: got %q, want %q", base, tc.wantBase)
+			}
+			if len(labels) != 1 || labels[0].Key != "envoy_rbac_prefix" || labels[0].Value != tc.wantPfx {
+				t.Errorf("labels: got %v, want [envoy_rbac_prefix=%s]", labels, tc.wantPfx)
+			}
+		})
+	}
+}
+
+func TestFlattenToProm_NetworkRBAC_ShadowRulesStatPrefix(t *testing.T) {
+	// POSITIVE (shadow_rules_stat_prefix): the optional middle segment between
+	// `rbac.` and the shadow_* counter is preserved in the flattened base name
+	// (dots→underscores), and the outer stat_prefix is still extracted as the
+	// label. Per SPEC §7.1.
+	//
+	//   rbac_shadow.rbac.myshadow.shadow_allowed →
+	//       envoy_rbac_myshadow_shadow_allowed{envoy_rbac_prefix="rbac_shadow"}
+	base, labels, err := flattenToProm("rbac_shadow.rbac.myshadow.shadow_allowed")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	wantBase := "envoy_rbac_myshadow_shadow_allowed"
+	if base != wantBase {
+		t.Errorf("base: got %q, want %q", base, wantBase)
+	}
+	if len(labels) != 1 || labels[0].Key != "envoy_rbac_prefix" || labels[0].Value != "rbac_shadow" {
+		t.Errorf("labels: got %v, want [envoy_rbac_prefix=rbac_shadow]", labels)
+	}
+}
+
+func TestFlattenToProm_NetworkRBAC_ShadowRulesStatPrefix_Denied(t *testing.T) {
+	// POSITIVE (shadow_rules_stat_prefix with shadow_denied counter).
+	//   sp.rbac.ns.shadow_denied → envoy_rbac_ns_shadow_denied{envoy_rbac_prefix="sp"}
+	base, labels, err := flattenToProm("sp.rbac.ns.shadow_denied")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	wantBase := "envoy_rbac_ns_shadow_denied"
+	if base != wantBase {
+		t.Errorf("base: got %q, want %q", base, wantBase)
+	}
+	if len(labels) != 1 || labels[0].Key != "envoy_rbac_prefix" || labels[0].Value != "sp" {
+		t.Errorf("labels: got %v, want [envoy_rbac_prefix=sp]", labels)
+	}
+}
+
+func TestFlattenToProm_NetworkRBAC_RejectsUnknownCounter(t *testing.T) {
+	// REJECT unknown counter: `foo.rbac.bogus` does NOT match the rbac rule
+	// (suffix check rejects "rbac.bogus") and falls through to the error return.
+	// Guard: the strings.HasSuffix allowlist in the rbacSegment block.
+	_, _, err := flattenToProm("foo.rbac.bogus")
+	if err == nil {
+		t.Error("flattenToProm with unknown rbac counter: want error, got nil")
+	}
+}
+
+func TestFlattenToProm_NetworkRBAC_RejectsLeadingDot(t *testing.T) {
+	// REJECT leading dot: `.rbac.allowed` — the idx>0 guard rejects idx==0 so
+	// prefix can never be empty. The name falls through to the error return.
+	// Guard: `idx > 0` in the rbacSegment block.
+	_, _, err := flattenToProm(".rbac.allowed")
+	if err == nil {
+		t.Error("flattenToProm with leading-dot prefix: want error, got nil (idx==0 must reject)")
+	}
+}
+
+func TestFlattenToProm_NetworkRBAC_RejectsDottedPrefix(t *testing.T) {
+	// REJECT dotted prefix: `a.b.rbac.allowed` — the first occurrence of
+	// `.rbac.` is at position 1, giving prefix="a" and the suffix check passes,
+	// BUT strings.Index on "a.b.rbac.allowed" finds `.rbac.` at index 3, giving
+	// prefix="a.b" which ContainsRune('.') → the no-dot-prefix guard rejects it.
+	// Confirm it does NOT produce envoy_rbac_allowed.
+	// Guard: `!strings.ContainsRune(prefix, '.')` in the rbacSegment block.
+	_, _, err := flattenToProm("a.b.rbac.allowed")
+	if err == nil {
+		t.Error("flattenToProm with dotted prefix: want error, got nil (dotted stat_prefix must reject)")
+	}
+}
+
+func TestFlattenToProm_NetworkRBAC_DoesNotConflictWithSN1234(t *testing.T) {
+	// NON-CONFLICT with SN1 (cluster.): a name starting with `cluster.` enters
+	// the SN1 case before the default branch, so the rbac rule is never reached.
+	// Load-bearing: SN1 wins → base starts with envoy_cluster_, NOT envoy_rbac_.
+	base, labels, err := flattenToProm("cluster.foo.rbac.allowed")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if !strings.HasPrefix(base, "envoy_cluster_") {
+		t.Errorf("base: got %q, want SN1-prefixed envoy_cluster_* (rbac rule must not fire for cluster. names)", base)
+	}
+	if len(labels) == 0 || labels[0].Key != "envoy_cluster_name" {
+		t.Errorf("labels: got %v, want envoy_cluster_name=foo (SN1 wins)", labels)
+	}
+}
+
+func TestFlattenToProm_NetworkRBAC_DoesNotConflictWithSN2_HTTP(t *testing.T) {
+	// NON-CONFLICT with SN2 (http.): the HTTP rbac filter's stats flow through
+	// the SN2 `http.<hcm>.rbac.*` path (dots→underscores) and NEVER reach the
+	// default branch. Confirm that `http.ingress.rbac.allowed` produces the
+	// SN2 HTTP shape (envoy_http_rbac_allowed), NOT envoy_rbac_allowed.
+	base, labels, err := flattenToProm("http.ingress.rbac.allowed")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	wantBase := "envoy_http_rbac_allowed"
+	if base != wantBase {
+		t.Errorf("base: got %q, want %q (SN2 wins; rbac rule must not fire for http. names)", base, wantBase)
+	}
+	if len(labels) == 0 || labels[0].Key != "envoy_http_conn_manager_prefix" {
+		t.Errorf("labels: got %v, want envoy_http_conn_manager_prefix=ingress (SN2 wins)", labels)
+	}
+}

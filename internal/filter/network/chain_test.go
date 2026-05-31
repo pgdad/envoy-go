@@ -378,6 +378,54 @@ func TestConnectionAccessorSurface(t *testing.T) { // R2 readiness — prove eac
 	}
 }
 
+// closeFilter closes the connection with a configured CloseType from
+// OnNewConnection, then halts. Used to prove connection.Close records the
+// requested CloseType distinctly (FlushWrite vs NoFlush; F3).
+type closeFilter struct {
+	Marker
+	cb ReadFilterCallbacks
+	ct CloseType
+}
+
+func (f *closeFilter) OnNewConnection() Status {
+	f.cb.Connection().Close(f.ct)
+	return StopIteration
+}
+func (f *closeFilter) OnData(*Buffer, bool) Status                   { return StopIteration }
+func (f *closeFilter) SetReadFilterCallbacks(cb ReadFilterCallbacks) { f.cb = cb }
+func (f *closeFilter) OnDestroy()                                    {}
+
+func TestConnectionCloseRecordsCloseType(t *testing.T) {
+	// FlushWrite (default, zero value) path.
+	rtF := NewChainRuntime([]NetworkFilter{&closeFilter{ct: FlushWrite}}, scriptedConn(nil), ConnFacts{})
+	rtF.OnNewConnection()
+	if !rtF.CloseRequested() {
+		t.Fatal("FlushWrite close not requested")
+	}
+	if rtF.CloseType() != FlushWrite {
+		t.Fatalf("CloseType = %v, want FlushWrite", rtF.CloseType())
+	}
+	// NoFlush path.
+	rtN := NewChainRuntime([]NetworkFilter{&closeFilter{ct: NoFlush}}, scriptedConn(nil), ConnFacts{})
+	rtN.OnNewConnection()
+	if !rtN.CloseRequested() {
+		t.Fatal("NoFlush close not requested")
+	}
+	if rtN.CloseType() != NoFlush {
+		t.Fatalf("CloseType = %v, want NoFlush", rtN.CloseType())
+	}
+}
+
+// TestCloseTypeDefaultsToFlushWrite pins that an un-closed runtime reports the
+// zero value FlushWrite, so the serveNetworkChain default close path is
+// unchanged from the pre-26.3 behavior (R: back-compat).
+func TestCloseTypeDefaultsToFlushWrite(t *testing.T) {
+	rt := NewChainRuntime(nil, scriptedConn(nil), ConnFacts{})
+	if rt.CloseType() != FlushWrite {
+		t.Fatalf("default CloseType = %v, want FlushWrite (zero value)", rt.CloseType())
+	}
+}
+
 func TestResponseCodeDetailsSink(t *testing.T) { // D-P26.1-5b — prove the sink is live before direct_response uses it
 	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
 	setter, ok := rt.callbacks().(interface{ SetResponseCodeDetails(string) })

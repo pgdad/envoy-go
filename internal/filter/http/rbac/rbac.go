@@ -6,17 +6,14 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sort"
 	"sync"
 
-	matchv3 "github.com/cncf/xds/go/xds/type/matcher/v3"
-	rbacconfigv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/matcher"
+	rbacengine "github.com/esalaine/envoy-go/internal/rbac"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -28,12 +25,6 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC"
 // filterName is the canonical http_filters[].name string for rbac
 // (matches the listener config typed_per_filter_config map keys).
 const filterName = "envoy.filters.http.rbac"
-
-// actionTypeURL is the canonical matcher-engine terminal action TypeURL
-// per §11.P3 + §2.6 + ADR-0142. buildCompiledMatcherEngine passes it as the
-// sole entry of matcher.New's supportedActionTypes allow-list; non-canonical
-// terminal TypeURLs PARSE-REJECT at config-load time.
-const actionTypeURL = "type.googleapis.com/envoy.config.rbac.v3.Action"
 
 // denyBody is the 19-byte ASCII deny-path body per §1.1 amendment 10 + §11.P5.
 // Byte-exact verbatim with reference Envoy v1.37.2's SendLocalReply path.
@@ -49,13 +40,13 @@ const denyBody = "RBAC: access denied"
 type compiledConfig struct {
 	// Primary engine (rules or matcher; mutually exclusive; rules wins if both
 	// set per §1.1 amendment 2 + rbac.pb.go:38).
-	rules   *compiledRulesEngine   // nil when matcher set (or both unset → wholly inactive)
-	matcher *compiledMatcherEngine // nil when rules set or wholly inactive
+	rules   *rbacengine.CompiledRulesEngine   // nil when matcher set (or both unset → wholly inactive)
+	matcher *rbacengine.CompiledMatcherEngine // nil when rules set or wholly inactive
 
 	// Shadow engine (shadow_rules or shadow_matcher; mutually exclusive;
 	// shadow_rules wins per §1.1 amendment 2).
-	shadowRules   *compiledRulesEngine
-	shadowMatcher *compiledMatcherEngine
+	shadowRules   *rbacengine.CompiledRulesEngine
+	shadowMatcher *rbacengine.CompiledMatcherEngine
 
 	// Stat namespacing (proto fields; empty default permitted per §1.1
 	// amendment 3).
@@ -67,35 +58,6 @@ type compiledConfig struct {
 	// 4 base counters per active stat_prefix combination per ADR-0140 +
 	// ADR-0145; full registration lands at Task 8.
 	stats *filterStats
-}
-
-// compiledRulesEngine carries the parsed config.rbac.v3.RBAC sub-message for
-// either primary or shadow. CEL fields (condition / checked_condition /
-// cel_config) are NOT cached — silent-ignored at parse + runtime per §1.1
-// amendment 6 + Q7. audit_logging_options similarly silent-ignored per §2.1.1.
-type compiledRulesEngine struct {
-	action   rbacconfigv3.RBAC_Action // ALLOW=0 / DENY=1 / LOG=2 (PGV defined_only)
-	policies []*compiledPolicy        // lexicographic-order-of-policy-name (sorted at parse per rbac.pb.go:268-269)
-}
-
-// compiledMatcherEngine wraps the parsed xds.type.matcher.v3.Matcher tree via
-// the internal/matcher framework primitive per ADR-0142. The tree is parsed +
-// validated at config-load time inside matcher.New (PARSE-REJECT for unknown
-// terminal Any.TypeUrl per §11.P3 + §2.6); Task 7 wires the matcher-engine
-// path into DecodeHeaders dispatch via the (matcher.Matcher).Evaluate walker.
-type compiledMatcherEngine struct {
-	// tree is the parsed match-tree wrapper. Read-only post-buildCompiled-
-	// MatcherEngine; Evaluate calls are concurrent-safe.
-	tree *matcher.Matcher
-}
-
-// compiledPolicy is one entry from config.rbac.v3.RBAC.policies. Permission +
-// Principal evaluator trees are pre-compiled at parse time per ADR-0143;
-// the evaluator surface lands at Tasks 4 + 5.
-type compiledPolicy struct {
-	name        string                // map key from policies map; preserved verbatim
-	permissions []permissionEvaluator // OR-semantic at runtime (per Policy proto comment)
-	principals  []principalEvaluator  // OR-semantic at runtime
 }
 
 // compiledPerRoute wraps the per-route TPFC disposition per §5.1 +
@@ -130,7 +92,7 @@ type factoryState struct {
 // Decoder-only per ADR-0140 §Decision (iv) + §1 item 5; no encode-side state.
 // Mirrors phase-12 csrf + phase-13 buffer decoder-only precedent.
 //
-// *filter implements evalContext per CF-6 (Task 5 notes F-1/F-2) — the
+// *filter implements rbacengine.EvalContext per CF-6 (Task 5 notes F-1/F-2) — the
 // per-stream accessors (Header / URLPath / Method / etc.) consult f.headers
 // (and f.dcb for the DownstreamPrincipal accessor). Connection-info accessors
 // (DestinationIP/Port, SNI, DirectRemoteIP, RemoteIP) return nil/empty at
@@ -141,7 +103,7 @@ type filter struct {
 	dcb   envoyhttp.DecoderFilterCallbacks
 
 	// Per-stream state cached at DecodeHeaders. Per SPEC §6.7.
-	headers     http.Header     // request headers; consulted by evalContext accessors
+	headers     http.Header     // request headers; consulted by rbacengine.EvalContext accessors
 	activeRC    *compiledConfig // resolved at DecodeHeaders; may be listener-level OR per-route overrideConfig
 	passthrough bool            // true when per-route disabled=true OR active engines both nil
 }
@@ -172,10 +134,12 @@ type filterStats struct {
 
 	// Per-policy lazy-cache (allocated only when trackPerRuleStats=true; keyed
 	// by the full counter name e.g. `http.<HCM>.rbac.<rules_prefix>.policy.
-	// <policy_name>.allowed`). Lazy allocation via incPolicy → sync.Map
-	// LoadOrStore + NewCounterIfAbsent on first match per ADR-0145. Per-policy
-	// emission (when trackPerRuleStats=true) wires fully at Task 9 (ADR-0146).
-	perPolicy *sync.Map // map[string]*stats.Counter
+	// <policy_name>.allowed`). Lazy allocation via (*PerPolicyCounters).Inc →
+	// sync.Map LoadOrStore + NewCounterIfAbsent on first match per ADR-0145.
+	// The cache type moved to internal/rbac at phase-26.3 Task 5 (D-26.3-7);
+	// the consumer holds a pointer + supplies the Registry + base prefix at
+	// emit time (byte-identical counter names, R4).
+	perPolicy *rbacengine.PerPolicyCounters
 
 	// reg is captured at New time for lazy per-policy NewCounterIfAbsent at
 	// request-time match per ADR-0117 post-Freeze idempotency. Per-route
@@ -183,42 +147,11 @@ type filterStats struct {
 	reg *stats.Registry
 
 	// primaryBase + shadowBase cache the per-counter HCM-rooted base prefix
-	// (e.g., `http.<HCM>.rbac.<rules_prefix>`) so incPolicy can construct the
-	// per-policy counter name without recomputing the prefix on every call.
+	// (e.g., `http.<HCM>.rbac.<rules_prefix>`) so (*rbacengine.PerPolicyCounters).Inc
+	// can construct the per-policy counter name without recomputing the prefix on every call.
 	// Per ADR-0145.
 	primaryBase string
 	shadowBase  string
-}
-
-// incPolicy lazy-allocates + increments a per-policy counter per ADR-0145 +
-// §11.P10. The empirical scrape against reference Envoy v1.37.2 observed the
-// per-policy counter shape `<base_prefix>.policy.<policy_name>.<suffix>` —
-// NOTE the inserted `.policy.` segment between the base prefix and the policy
-// name (the SPEC line 1842 hypothesis `<base_prefix>.<policy_name>.<suffix>`
-// is REFINED here per the scrape; the SPEC stat-table will be amended at the
-// Task 9 commit when per-policy emission ships fully via ADR-0146).
-//
-// Key into the perPolicy sync.Map is the full counter name (which doubles as
-// the Registry name on first-allocation); LoadOrStore is race-safe for
-// concurrent first-emission across goroutines. NewCounterIfAbsent on the
-// Registry side is also race-safe + idempotent.
-//
-// Per ADR-0145 §Decision (iii): per-policy emission is gated by the caller's
-// `cc.trackPerRuleStats` check; this helper is unconditionally callable but
-// only invoked from the trackPerRuleStats-true branch in emit*Counters
-// (lands fully at Task 9 per ADR-0146).
-func (s *filterStats) incPolicy(base, policyName, suffix string) {
-	if s == nil || s.reg == nil || policyName == "" {
-		return
-	}
-	key := base + ".policy." + policyName + "." + suffix
-	if cached, ok := s.perPolicy.Load(key); ok {
-		cached.(*stats.Counter).Inc()
-		return
-	}
-	c := s.reg.NewCounterIfAbsent(key)
-	actual, _ := s.perPolicy.LoadOrStore(key, c)
-	actual.(*stats.Counter).Inc()
 }
 
 // Statically assert the decoder-only interface conformance. Per ADR-0140
@@ -299,13 +232,13 @@ func buildCompiledConfig(c *rbacv3.RBAC, ctx envoyhttp.FactoryCtx, isPerRoute bo
 	// passes every request through with no counter activity.
 	switch {
 	case c.GetRules() != nil:
-		rulesEngine, err := buildCompiledRulesEngine(c.GetRules())
+		rulesEngine, err := rbacengine.BuildRulesEngine(c.GetRules(), rbacengine.ProfileHTTP)
 		if err != nil {
 			return nil, err
 		}
 		cc.rules = rulesEngine
 	case c.GetMatcher() != nil:
-		matcherEngine, err := buildCompiledMatcherEngine(c.GetMatcher())
+		matcherEngine, err := rbacengine.BuildMatcherEngine(c.GetMatcher(), rbacengine.ProfileHTTP)
 		if err != nil {
 			return nil, err
 		}
@@ -318,13 +251,13 @@ func buildCompiledConfig(c *rbacv3.RBAC, ctx envoyhttp.FactoryCtx, isPerRoute bo
 	// both shadow_rules + shadow_matcher are set. Both unset → no shadow walk.
 	switch {
 	case c.GetShadowRules() != nil:
-		shadowEngine, err := buildCompiledRulesEngine(c.GetShadowRules())
+		shadowEngine, err := rbacengine.BuildRulesEngine(c.GetShadowRules(), rbacengine.ProfileHTTP)
 		if err != nil {
 			return nil, err
 		}
 		cc.shadowRules = shadowEngine
 	case c.GetShadowMatcher() != nil:
-		shadowMatcherEngine, err := buildCompiledMatcherEngine(c.GetShadowMatcher())
+		shadowMatcherEngine, err := rbacengine.BuildMatcherEngine(c.GetShadowMatcher(), rbacengine.ProfileHTTP)
 		if err != nil {
 			return nil, err
 		}
@@ -356,98 +289,6 @@ func buildCompiledConfig(c *rbacv3.RBAC, ctx envoyhttp.FactoryCtx, isPerRoute bo
 	}
 
 	return cc, nil
-}
-
-// buildCompiledRulesEngine parses one config.rbac.v3.RBAC sub-message per
-// SPEC §6.5 + ADR-0141. Validates the action enum (defensive PGV-mirror per
-// amendment 4 — defined_only); sorts policy names lexicographically per
-// rbac.pb.go:268-269; recursively builds per-policy permission + principal
-// evaluators via the buildPermissionEvaluators / buildPrincipalEvaluators
-// entry points. audit_logging_options + 3 CEL fields silent-ignored per
-// §2.1.1 + §2.1.2 + amendment 6 + Q7.
-//
-// CF-Task7-M3 (Task 8 cleanup): the speculative `role` parameter previously
-// reserved for error-wrapping discipline was dropped at Task 8 — Tasks 4/5
-// landed without it and the per-engine role context is unambiguous at the
-// caller site (buildCompiledConfig's switch on c.GetRules() / c.GetShadowRules()).
-func buildCompiledRulesEngine(r *rbacconfigv3.RBAC) (*compiledRulesEngine, error) {
-	// Defensive PGV-mirror per §1.1 amendment 4: action enum defined_only.
-	// Although the proto-typed enum can hold only values in the .pb.go
-	// generated set after a successful Unmarshal, the defensive check guards
-	// against future enum extensions + makes the invariant explicit at the
-	// envoy-go boundary.
-	action := r.GetAction()
-	switch action {
-	case rbacconfigv3.RBAC_ALLOW, rbacconfigv3.RBAC_DENY, rbacconfigv3.RBAC_LOG:
-		// OK.
-	default:
-		return nil, fmt.Errorf("rbac: invalid action %v (must be ALLOW/DENY/LOG)", action)
-	}
-
-	// Sort policy names lexicographically per rbac.pb.go:268-269 proto comment.
-	// Determines per-stream walk order at request time (first-match wins per
-	// SPEC §6.9).
-	names := make([]string, 0, len(r.GetPolicies()))
-	for name := range r.GetPolicies() {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	policies := make([]*compiledPolicy, 0, len(names))
-	for _, name := range names {
-		p := r.GetPolicies()[name]
-		// Defensive PGV-mirror per amendment 4: permissions + principals
-		// each min_items=1.
-		if len(p.GetPermissions()) == 0 {
-			return nil, fmt.Errorf("rbac: policy %q must have at least one permission", name)
-		}
-		if len(p.GetPrincipals()) == 0 {
-			return nil, fmt.Errorf("rbac: policy %q must have at least one principal", name)
-		}
-		perms, err := buildPermissionEvaluators(p.GetPermissions())
-		if err != nil {
-			return nil, fmt.Errorf("rbac: policy %q permissions: %w", name, err)
-		}
-		prins, err := buildPrincipalEvaluators(p.GetPrincipals())
-		if err != nil {
-			return nil, fmt.Errorf("rbac: policy %q principals: %w", name, err)
-		}
-		policies = append(policies, &compiledPolicy{
-			name:        name,
-			permissions: perms,
-			principals:  prins,
-		})
-		// audit_logging_options + Policy.condition + Policy.checked_condition
-		// + Policy.cel_config are NOT extracted here — silent-ignored per
-		// §2.1.1 + §2.1.2 + amendment 6 + Q7. The compiledPolicy struct has
-		// NO slot for them (the silent-ignore is structural).
-	}
-
-	return &compiledRulesEngine{
-		action:   action,
-		policies: policies,
-	}, nil
-}
-
-// buildCompiledMatcherEngine wraps a parsed xds.type.matcher.v3.Matcher tree
-// via the internal/matcher framework primitive per ADR-0142. The
-// supportedActionTypes allow-list is the canonical RBAC Action TypeURL only
-// per §2.6 + §11.P3; non-canonical terminal TypeURLs PARSE-REJECT inside
-// matcher.New with envoy-go-only error wording, which this helper wraps with
-// the `rbac: matcher:` prefix for caller-side error chains.
-//
-// The dual-engine dispatch path in buildCompiledConfig invokes this helper
-// only when the relevant matcher proto field is set AND the corresponding
-// rules field is nil (rules wins per amendment 2). Group 5's
-// TestEvaluateMatcherEngine_CanonicalActionTerminal_Honored +
-// TestEvaluateMatcherEngine_UnknownTerminalTypeURL_ParseRejected (landing at
-// Task 7) exercise the canonical-acceptance + unknown-TypeURL-rejection paths.
-func buildCompiledMatcherEngine(m *matchv3.Matcher) (*compiledMatcherEngine, error) {
-	tree, err := matcher.New(m, []string{actionTypeURL})
-	if err != nil {
-		return nil, fmt.Errorf("rbac: matcher: %w", err)
-	}
-	return &compiledMatcherEngine{tree: tree}, nil
 }
 
 // parsePerRoute unmarshals the typed_per_filter_config Any into an
@@ -592,7 +433,7 @@ func buildCompiledPerRoute(p *rbacv3.RBACPerRoute, reg *stats.Registry, hcmStatP
 // regardless of which engines the proto carries; shadow counters publish 0
 // when no shadow engine is configured). Per-policy counters (when
 // track_per_rule_stats=true) are lazy-allocated at request-time match via
-// filterStats.incPolicy (sync.Map LoadOrStore + NewCounterIfAbsent post-Freeze
+// (*rbacengine.PerPolicyCounters).Inc (sync.Map LoadOrStore + NewCounterIfAbsent post-Freeze
 // idempotent per ADR-0117 + ADR-0139).
 //
 // Internal stat path per ADR-0145 + §1.1 amendment 9 + §11.P7 (HCM-rooted
@@ -649,7 +490,7 @@ func newFilterStatsIfAbsent(reg *stats.Registry, hcmPrefix, primaryPrefix, shado
 		denied:        reg.NewCounterIfAbsent(primaryBase + ".denied"),
 		shadowAllowed: reg.NewCounterIfAbsent(shadowBase + ".shadow_allowed"),
 		shadowDenied:  reg.NewCounterIfAbsent(shadowBase + ".shadow_denied"),
-		perPolicy:     &sync.Map{},
+		perPolicy:     &rbacengine.PerPolicyCounters{},
 		reg:           reg,
 		primaryBase:   primaryBase,
 		shadowBase:    shadowBase,
@@ -688,44 +529,30 @@ func baseStatPrefix(hcmPrefix, rulesPrefix string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Dual-engine dispatch helpers per SPEC §6.9 + ADR-0141. evaluateEngine
-// dispatches into evaluateRulesEngine or evaluateMatcherEngine based on which
-// engine the *compiledConfig carries. evaluateRulesEngine walks the policies
-// in lexicographic-sorted order (first match wins; SPEC §6.9 + amendment 5).
-// evaluateMatcherEngine delegates to the framework primitive (ADR-0142) via
-// the matcherCtxAdapter (ADR-0142 §Decision (iii)).
+// Dual-engine dispatch helper per SPEC §6.9 + ADR-0141. evaluateEngine
+// dispatches into the shared engine's per-engine Evaluate (internal/rbac) based
+// on which engine the *compiledConfig carries. The rules-engine walks policies
+// in lexicographic-sorted order (first match wins; SPEC §6.9 + amendment 5);
+// the matcher-engine delegates to the framework primitive (ADR-0142). Both
+// concrete engine bodies + the matcher bridge moved to internal/rbac at
+// phase-26.3 (D-26.3-6); the consumer keeps only the compiledConfig-shaped
+// primary-vs-shadow dispatch.
 // ---------------------------------------------------------------------------
-
-// engineResult is the disposition produced by evaluateEngine. Allowed and
-// Denied are the only states per SPEC §6.9; LOG-partial folds into Allowed
-// per §1.1 amendment 5.
-type engineResult int
-
-// engineResult enum values per SPEC §6.9.
-const (
-	// engineResultAllowed is the post-walk disposition that passes the request
-	// through. Covers ALLOW-matched, DENY-no-match, and LOG-anything paths.
-	engineResultAllowed engineResult = iota
-	// engineResultDenied is the post-walk disposition that triggers
-	// SendLocalReply(403, ...) at the caller. Covers ALLOW-no-match,
-	// DENY-matched, and matcher-engine no-match per rbac.pb.go:43-46.
-	engineResultDenied
-)
 
 // evaluateEngine walks the primary (when shadow=false) or shadow (when
 // shadow=true) engine. Per SPEC §6.9 + ADR-0141 dual-engine dispatch:
 //
 //   - If the (primary|shadow) rules engine is set, walk it.
 //   - Else if the matcher engine is set, walk it.
-//   - Else defensive engineResultAllowed (e.g., shadow=true called when no
+//   - Else defensive rbacengine.Allowed (e.g., shadow=true called when no
 //     shadow engine configured — the caller's gate at SPEC §6.7 should
 //     prevent this, but the helper is defensive).
 //
 // Returns the engine result + matched policy name (or "" if no policy matched
 // OR matcher-engine no-match).
-func evaluateEngine(cc *compiledConfig, ctx evalContext, shadow bool) (engineResult, string) {
-	var rules *compiledRulesEngine
-	var matcherEng *compiledMatcherEngine
+func evaluateEngine(cc *compiledConfig, ctx rbacengine.EvalContext, shadow bool) (rbacengine.EngineResult, string) {
+	var rules *rbacengine.CompiledRulesEngine
+	var matcherEng *rbacengine.CompiledMatcherEngine
 	if shadow {
 		rules = cc.shadowRules
 		matcherEng = cc.shadowMatcher
@@ -734,170 +561,17 @@ func evaluateEngine(cc *compiledConfig, ctx evalContext, shadow bool) (engineRes
 		matcherEng = cc.matcher
 	}
 	if rules != nil {
-		return evaluateRulesEngine(rules, ctx)
+		return rules.Evaluate(ctx)
 	}
 	if matcherEng != nil {
-		return evaluateMatcherEngine(matcherEng, ctx)
+		return matcherEng.Evaluate(ctx)
 	}
 	// Defensive: no engine configured. Per SPEC §6.9 final fall-through.
-	return engineResultAllowed, ""
-}
-
-// evaluateRulesEngine walks policies in lexicographic-sorted order; first
-// match wins. Per SPEC §6.9 + rbac.pb.go:268-269.
-//
-// Action mapping (per SPEC §6.9 + §1.1 amendment 5):
-//   - ALLOW + match     → engineResultAllowed + matchedPolicyName
-//   - ALLOW + no-match  → engineResultDenied + ""
-//   - DENY + match      → engineResultDenied + matchedPolicyName
-//   - DENY + no-match   → engineResultAllowed + ""
-//   - LOG + match       → engineResultAllowed + matchedPolicyName (LOG always-allows;
-//     matched-policy captured for per-policy emission per amendment 5)
-//   - LOG + no-match    → engineResultAllowed + ""
-func evaluateRulesEngine(re *compiledRulesEngine, ctx evalContext) (engineResult, string) {
-	var matchedPolicy string
-	for _, p := range re.policies {
-		if policyMatches(p, ctx) {
-			matchedPolicy = p.name
-			break
-		}
-	}
-	matched := matchedPolicy != ""
-	switch re.action {
-	case rbacconfigv3.RBAC_ALLOW:
-		if matched {
-			return engineResultAllowed, matchedPolicy
-		}
-		return engineResultDenied, ""
-	case rbacconfigv3.RBAC_DENY:
-		if matched {
-			return engineResultDenied, matchedPolicy
-		}
-		return engineResultAllowed, ""
-	case rbacconfigv3.RBAC_LOG:
-		// Always-allow per §1.1 amendment 5; matchedPolicy captured for
-		// per-policy counter emission. access_log_hint dynamic metadata NOT
-		// emitted in envoy-go MVP per amendment 5 divergence-window.
-		return engineResultAllowed, matchedPolicy
-	}
-	// Defensive: PGV-mirror at parse time ensures action ∈ {ALLOW, DENY, LOG};
-	// this branch is structurally unreachable.
-	return engineResultDenied, ""
-}
-
-// policyMatches evaluates one *compiledPolicy against ctx. Per SPEC §6.5 +
-// §6.9: permissions[] OR-semantic AND principals[] OR-semantic. Short-circuit
-// on first match on each side; the side-AND structure means a non-matching
-// permissions-side short-circuits before iterating principals.
-func policyMatches(p *compiledPolicy, ctx evalContext) bool {
-	permMatch := false
-	for _, perm := range p.permissions {
-		if perm.evaluatePermission(ctx) {
-			permMatch = true
-			break
-		}
-	}
-	if !permMatch {
-		return false
-	}
-	for _, prin := range p.principals {
-		if prin.evaluatePrincipal(ctx) {
-			return true
-		}
-	}
-	return false
-}
-
-// evaluateMatcherEngine walks the matcher tree via the framework primitive
-// (ADR-0142) + maps the terminal Any (canonical rbac.v3.Action) back to an
-// engineResult. Per SPEC §6.9:
-//
-//   - tree.Evaluate returns (nil, nil) on no-match per rbac.pb.go:43-46 →
-//     caller interprets as DENY.
-//   - tree.Evaluate returns a terminal Any wrapping rbacconfigv3.Action;
-//     defensive-unmarshal (the PARSE-REJECT at buildCompiledMatcherEngine
-//     guarantees the TypeURL is canonical, but unmarshal can still fail
-//     theoretically on malformed Any bytes).
-//   - action.action ∈ {ALLOW, LOG} → engineResultAllowed + action.GetName().
-//   - action.action == DENY → engineResultDenied + action.GetName().
-//   - any other action enum (future variant; defensive) → engineResultDenied.
-func evaluateMatcherEngine(me *compiledMatcherEngine, ctx evalContext) (engineResult, string) {
-	actionAny, err := me.tree.Evaluate(&matcherCtxAdapter{ctx: ctx})
-	if err != nil || actionAny == nil {
-		// No-match per rbac.pb.go:43-46 proto comment "Requests not matching
-		// any matcher will be denied."
-		return engineResultDenied, ""
-	}
-	var action rbacconfigv3.Action
-	if err := actionAny.UnmarshalTo(&action); err != nil {
-		// Defensive: PARSE-REJECT at buildCompiledMatcherEngine should have
-		// caught any non-canonical TypeURL. Reaching this branch implies
-		// malformed Any bytes inside a canonical TypeURL — treat as DENY.
-		return engineResultDenied, ""
-	}
-	switch action.GetAction() {
-	case rbacconfigv3.RBAC_ALLOW, rbacconfigv3.RBAC_LOG:
-		return engineResultAllowed, action.GetName()
-	case rbacconfigv3.RBAC_DENY:
-		return engineResultDenied, action.GetName()
-	}
-	return engineResultDenied, ""
+	return rbacengine.Allowed, ""
 }
 
 // ---------------------------------------------------------------------------
-// matcherCtxAdapter — rbac↔matcher bridge per ADR-0142 §Decision (iii).
-//
-// Adapts the rbac-side evalContext to the matcher-engine framework primitive's
-// MatchContext. Each method delegates to the underlying evalContext.
-//
-// CF-2 (Task 3 spec review I-1): SourceIP() → DirectRemoteIP() mapping is
-// load-bearing. The xds.type.matcher.v3.SourceIPInput proto semantics are
-// peer-source-pre-XFF (NOT XFF-resolved); evalContext's DirectRemoteIP() is
-// the matching accessor. RemoteIP() (XFF-resolved) is NOT exposed via the
-// MatchContext surface — matcher-engine predicates filtering on XFF-resolved
-// IP would need a future MatchContext widening per ADR-0142 §Decision (iii)
-// additive-extension contract.
-// ---------------------------------------------------------------------------
-
-// matcherCtxAdapter wraps an evalContext for consumption by the internal/
-// matcher framework primitive. Per CF-2: SourceIP() returns DirectRemoteIP()
-// (peer-source-pre-XFF per xds.type.matcher.v3.SourceIPInput semantics), NOT
-// RemoteIP() (XFF-resolved).
-type matcherCtxAdapter struct {
-	ctx evalContext
-}
-
-// Compile-time assertion: matcherCtxAdapter implements matcher.MatchContext.
-var _ matcher.MatchContext = (*matcherCtxAdapter)(nil)
-
-// Header delegates to evalContext.Header(name) verbatim.
-func (a *matcherCtxAdapter) Header(name string) (string, bool) { return a.ctx.Header(name) }
-
-// Path returns evalContext.URLPath() (the `:path` H2 pseudo-header). The
-// MatchContext API uses Path() naming; the rbac-side evalContext uses
-// URLPath() for naming-parity with the rbac.v3 proto field name (UrlPath).
-func (a *matcherCtxAdapter) Path() string { return a.ctx.URLPath() }
-
-// Method returns evalContext.Method() (the `:method` H2 pseudo-header).
-func (a *matcherCtxAdapter) Method() string { return a.ctx.Method() }
-
-// SourceIP returns evalContext.DirectRemoteIP() per CF-2 (Task 3 spec review
-// I-1): the matcher's SourceIP semantic is peer-source-pre-XFF per
-// xds.type.matcher.v3.SourceIPInput; DirectRemoteIP() is the matching rbac-
-// side accessor.
-func (a *matcherCtxAdapter) SourceIP() net.IP { return a.ctx.DirectRemoteIP() }
-
-// DestinationIP delegates verbatim.
-func (a *matcherCtxAdapter) DestinationIP() net.IP { return a.ctx.DestinationIP() }
-
-// DestinationPort delegates verbatim.
-func (a *matcherCtxAdapter) DestinationPort() uint32 { return a.ctx.DestinationPort() }
-
-// RequestedServerName delegates verbatim (TLS SNI).
-func (a *matcherCtxAdapter) RequestedServerName() string { return a.ctx.RequestedServerName() }
-
-// ---------------------------------------------------------------------------
-// *filter implements evalContext per CF-6 (Task 5 notes F-1/F-2).
+// *filter implements rbacengine.EvalContext per CF-6 (Task 5 notes F-1/F-2).
 //
 // Accessors that read per-stream state (headers, method, path) consult the
 // per-stream headers map cached at DecodeHeaders time. Accessors that read
@@ -905,7 +579,7 @@ func (a *matcherCtxAdapter) RequestedServerName() string { return a.ctx.Requeste
 // fall back to nil/empty at phase-16 MVP — the framework's connection-info
 // surface is NOT yet plumbed onto DecoderFilterCallbacks per phase-16
 // scope. Future framework primitives (analogous to ADR-0144's
-// DownstreamPrincipal) would extend DecoderFilterCallbacks; rbac's evalContext
+// DownstreamPrincipal) would extend DecoderFilterCallbacks; rbac's rbacengine.EvalContext
 // surface would then route through. Documented forward-pointer at
 // BEHAVIOR_CONTRACT phase-16 forward-pointer notes (lands at Task 15).
 //
@@ -916,8 +590,8 @@ func (a *matcherCtxAdapter) RequestedServerName() string { return a.ctx.Requeste
 // runtimes per §2.5 + §8.10).
 // ---------------------------------------------------------------------------
 
-// Compile-time assertion: *filter implements evalContext.
-var _ evalContext = (*filter)(nil)
+// Compile-time assertion: *filter implements rbacengine.EvalContext.
+var _ rbacengine.EvalContext = (*filter)(nil)
 
 // Header returns the request header value for name + a presence flag. Uses
 // http.Header semantics (canonical key lookup); empty-string-with-present
@@ -960,7 +634,7 @@ func (f *filter) Method() string {
 
 // DestinationIP returns nil at phase-16 MVP — the framework's connection-info
 // accessor is not yet exposed via DecoderFilterCallbacks. Future framework
-// primitive lands; rbac's evalContext widens accordingly. permDestIP evaluates
+// primitive lands; rbac's rbacengine.EvalContext widens accordingly. permDestIP evaluates
 // to false until the primitive lands. Documented forward-pointer.
 func (f *filter) DestinationIP() net.IP { return nil }
 
@@ -1004,7 +678,7 @@ func (f *filter) FilterState() any { return nil }
 // Counter emission per ADR-0145 + ADR-0146. The 4 base counters
 // (allowed/denied/shadow_allowed/shadow_denied) tick unconditionally per
 // disposition. Per-policy emission (when `cc.trackPerRuleStats=true` AND a
-// policy matched) is wired through filterStats.incPolicy — lazy
+// policy matched) is wired through (*rbacengine.PerPolicyCounters).Inc — lazy
 // NewCounterIfAbsent over a sync.Map per ADR-0145 §Decision (iii); the
 // emission discipline (which side's base prefix; which suffix) is fixed at
 // ADR-0146 §Decision (i)+(ii)+(iii).
@@ -1032,18 +706,18 @@ func (f *filter) FilterState() any { return nil }
 // into engineResultAllowed; the base allowed counter ticks AND (when
 // track_per_rule_stats=true) the per-policy `.allowed` counter ticks. NO
 // separate `logged` counter exists.
-func emitPrimaryCounters(cc *compiledConfig, result engineResult, policyName string) {
+func emitPrimaryCounters(cc *compiledConfig, result rbacengine.EngineResult, policyName string) {
 	if cc == nil || cc.stats == nil {
 		return
 	}
 	var suffix string
 	switch result {
-	case engineResultAllowed:
+	case rbacengine.Allowed:
 		if cc.stats.allowed != nil {
 			cc.stats.allowed.Inc()
 		}
 		suffix = "allowed"
-	case engineResultDenied:
+	case rbacengine.Denied:
 		if cc.stats.denied != nil {
 			cc.stats.denied.Inc()
 		}
@@ -1051,10 +725,11 @@ func emitPrimaryCounters(cc *compiledConfig, result engineResult, policyName str
 	}
 	// Per-policy emission gated on track_per_rule_stats AND a matched policy
 	// (no-match disposition has policyName == "" — skip per-policy emission).
-	// Lazy NewCounterIfAbsent via incPolicy per ADR-0145 §Decision (iii) +
-	// ADR-0146 §Decision (iii).
+	// Lazy NewCounterIfAbsent via (*PerPolicyCounters).Inc per ADR-0145
+	// §Decision (iii) + ADR-0146 §Decision (iii). Base prefix + policyName +
+	// suffix args are byte-identical to the pre-extraction perPolicy.Inc call (R4).
 	if cc.trackPerRuleStats && policyName != "" && suffix != "" {
-		cc.stats.incPolicy(cc.stats.primaryBase, policyName, suffix)
+		cc.stats.perPolicy.Inc(cc.stats.reg, cc.stats.primaryBase, policyName, suffix)
 	}
 }
 
@@ -1064,25 +739,25 @@ func emitPrimaryCounters(cc *compiledConfig, result engineResult, policyName str
 // counters parallel to the primary walk. Per-policy emission uses
 // cc.stats.shadowBase + the shadow-suffix family (`shadow_allowed` /
 // `shadow_denied`) per ADR-0146 §Decision (iii).
-func emitShadowCounters(cc *compiledConfig, result engineResult, policyName string) {
+func emitShadowCounters(cc *compiledConfig, result rbacengine.EngineResult, policyName string) {
 	if cc == nil || cc.stats == nil {
 		return
 	}
 	var suffix string
 	switch result {
-	case engineResultAllowed:
+	case rbacengine.Allowed:
 		if cc.stats.shadowAllowed != nil {
 			cc.stats.shadowAllowed.Inc()
 		}
 		suffix = "shadow_allowed"
-	case engineResultDenied:
+	case rbacengine.Denied:
 		if cc.stats.shadowDenied != nil {
 			cc.stats.shadowDenied.Inc()
 		}
 		suffix = "shadow_denied"
 	}
 	if cc.trackPerRuleStats && policyName != "" && suffix != "" {
-		cc.stats.incPolicy(cc.stats.shadowBase, policyName, suffix)
+		cc.stats.perPolicy.Inc(cc.stats.reg, cc.stats.shadowBase, policyName, suffix)
 	}
 }
 
@@ -1094,7 +769,7 @@ func emitShadowCounters(cc *compiledConfig, result engineResult, policyName stri
 // DecodeHeaders is the request-gate entry per ADR-0140 §Decision (iv) +
 // SPEC §6.7. The body:
 //
-//  1. Caches the headers map on f.headers for per-stream evalContext access.
+//  1. Caches the headers map on f.headers for per-stream rbacengine.EvalContext access.
 //  2. Resolves per-route TPFC via f.dcb.RequestRouteConfig(); the
 //     resolvePerRouteConfig accessor returns (rc, isDisabled). On
 //     isDisabled=true → passthrough fast-path (no counters); rc is nil. On
@@ -1143,7 +818,7 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 		return envoyhttp.Continue
 	}
 
-	// 3. Primary engine evaluation. *filter is the evalContext (CF-6).
+	// 3. Primary engine evaluation. *filter is the rbacengine.EvalContext (CF-6).
 	primaryResult, primaryPolicyName := evaluateEngine(rc, f, false /*shadow*/)
 
 	// 4. Shadow engine evaluation (if configured). Shadow disposition does
@@ -1159,9 +834,9 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 
 	// 6. Apply disposition.
 	switch primaryResult {
-	case engineResultAllowed:
+	case rbacengine.Allowed:
 		return envoyhttp.Continue
-	case engineResultDenied:
+	case rbacengine.Denied:
 		// Per §1.1 amendment 10 + §11.P5: byte-exact 19-byte body; the
 		// framework's local-reply path injects content-length + date + server
 		// to round out the 4-header set.
@@ -1170,8 +845,8 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 		})
 		return envoyhttp.StopIteration
 	}
-	// Defensive: engineResult invariant maintained by evaluateRulesEngine /
-	// evaluateMatcherEngine; this branch is structurally unreachable.
+	// Defensive: EngineResult invariant maintained by the shared engine's
+	// Evaluate methods (internal/rbac); this branch is structurally unreachable.
 	return envoyhttp.Continue
 }
 

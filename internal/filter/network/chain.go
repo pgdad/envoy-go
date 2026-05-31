@@ -110,6 +110,14 @@ func (c *ChainRuntime) OnDestroy() { c.rt.onDestroy() }
 // loop checks it to exit (D-P26.1-5a).
 func (c *ChainRuntime) CloseRequested() bool { return c.rt.closeRequested() }
 
+// CloseType reports the close semantics the closing filter requested via
+// Connection().Close (F3, D-26.3-2). It is FlushWrite (the zero value) until a
+// filter closes the connection; serveNetworkChain reads it at the pure-read
+// close site to honor NoFlush (RST via SO_LINGER 0) distinctly from
+// FlushWrite (rbac_network enforced-deny uses NoFlush). Only meaningful once
+// CloseRequested is true.
+func (c *ChainRuntime) CloseType() CloseType { return c.rt.closeType }
+
 // chainRuntime is the per-connection runtime context: it owns the single
 // drainable read Buffer (connection-level buffering per SPEC §3.3), the REUSED
 // per-connection *dynamicmetadata.Bucket (SPEC §3.4 / AMEND-A5), the
@@ -144,6 +152,13 @@ type chainRuntime struct {
 	resumeRequested bool // a filter called ContinueReading during the current OnData
 	lastEndStream   bool // endStream of the most recent onData (replayed on resume)
 	closeReq        bool // Connection.Close was called (D-P26.1-5a)
+	// closeType records the CloseType the closing filter requested (F3,
+	// D-26.3-2). Zero value is FlushWrite, so an un-closed runtime reports the
+	// pre-26.3 default; connection.Close overwrites it with the requested
+	// semantics. serveNetworkChain honors it at the pure-read close site
+	// (NoFlush closes immediately via SO_LINGER 0 → RST; rbac_network
+	// enforced-deny uses NoFlush).
+	closeType CloseType
 }
 
 // newChainRuntime constructs the per-connection runtime over filters + conn +
@@ -355,19 +370,22 @@ func (c *connection) Write(data []byte, _ bool) {
 	_, _ = c.rt.conn.Write(data)
 }
 
-// Close records the close request + semantics (D-P26.1-5a). The read loop
-// checks closeRequested() to exit and performs the actual socket close (with
-// FlushWrite/NoFlush handling) so the chain stays single-goroutine.
+// Close records the close request + the requested semantics (D-P26.1-5a; F3,
+// D-26.3-2). The read loop checks closeRequested() to exit and performs the
+// actual socket close, honoring the recorded CloseType (FlushWrite vs NoFlush),
+// so the chain stays single-goroutine.
 //
-// The CloseType (FlushWrite vs NoFlush) is intentionally ignored at 26.1: the
-// only closing filter shipped is direct_response, which writes its body
-// SYNCHRONOUSLY (via Connection().Write, already flushed on the blocking
-// socket) BEFORE calling Close, so FlushWrite ≡ a plain close and there is no
-// pending write to flush. NoFlush (drop-buffered-writes-then-close) only
-// becomes observable with the 26.3 enforced-deny path and MUST be honored
-// (distinguished from FlushWrite) when 26.3 lands.
-func (c *connection) Close(_ CloseType) {
+// As of 26.3 the CloseType is RECORDED + reaches serveNetworkChain distinctly:
+// FlushWrite (the zero value / pre-26.3 default) drains then closes; NoFlush
+// closes immediately, discarding any pending downstream write (RST semantics
+// via SO_LINGER 0; rbac_network enforced-deny uses NoFlush). For
+// direct_response — which writes its body SYNCHRONOUSLY
+// (Connection().Write, already flushed on the blocking socket) BEFORE Close —
+// FlushWrite remains operationally a plain close with no pending write, so its
+// byte behavior is unchanged.
+func (c *connection) Close(ct CloseType) {
 	c.rt.closeReq = true
+	c.rt.closeType = ct
 }
 
 func (c *connection) LocalAddr() net.Addr {

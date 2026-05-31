@@ -15,49 +15,51 @@ import (
 )
 
 // permissionEvaluator is the per-Permission evaluator interface. Concrete
-// implementations land at Task 4 (Permission Large 11 + AND/OR/NOT + 3
-// PARSE-REJECT per ADR-0143).
+// implementations cover Permission Large 11 + AND/OR/NOT combinators + 3
+// PARSE-REJECT cases per ADR-0143.
 //
 // evaluatePermission returns true iff the permission matches the request.
 // ctx provides per-stream accessors (headers / path / IP / destination port /
 // SNI / sourced-metadata) per SPEC §6.2.
 type permissionEvaluator interface {
-	evaluatePermission(ctx evalContext) bool
+	evaluatePermission(ctx EvalContext) bool
 }
 
 // principalEvaluator is the per-Principal evaluator interface. Concrete
-// implementations land at Task 5 (Principal Large 11 + prinAuthenticated
-// three-case + 3 PARSE-REJECT per ADR-0143). At Task 4 the interface is
-// declared so compiledPolicy + buildPrincipalEvaluators can refer to it.
+// implementations cover Principal Large 11 + prinAuthenticated three-case +
+// 3 PARSE-REJECT cases per ADR-0143.
 //
 // evaluatePrincipal returns true iff the principal matches the request. ctx
 // provides per-stream accessors (TLS principal candidates / headers / IP /
 // sourced-metadata / filter-state).
 type principalEvaluator interface {
-	evaluatePrincipal(ctx evalContext) bool
+	evaluatePrincipal(ctx EvalContext) bool
 }
 
-// evalContext is the per-stream accessor abstraction the evaluators consume.
-// The *filter implements this at runtime; the full surface (Header / URLPath /
-// Method / DirectRemoteIP / RemoteIP / DestinationIP / DestinationPort /
+// EvalContext is the per-request/connection accessor abstraction the evaluators
+// consume. It is implemented by BOTH consumers of this shared engine: the HTTP
+// consumer (the *filter in internal/filter/http/rbac, sourcing per-stream facts
+// from DecoderFilterCallbacks + the request headers) AND the L4 consumer (the
+// l4EvalContext in internal/filter/network/rbac, sourcing connection facts from
+// a network.Connection). The full surface (Header / URLPath / Method /
+// DirectRemoteIP / RemoteIP / DestinationIP / DestinationPort /
 // RequestedServerName / DownstreamPrincipal / SourcedMetadata / FilterState)
-// lands across Tasks 4 + 5 + 6 + 7 per SPEC §6.2.
+// per SPEC §6.2; the SOURCE of each production accessor is consumer-specific.
 //
-// At Task 4 the interface carried only the Permission-relevant accessors per
-// SPEC §6.5 + ADR-0143 §Decision (Permission section). Task 5 widens with
-// Principal-side accessors (DirectRemoteIP / RemoteIP / DownstreamPrincipal /
-// SourcedMetadata / FilterState) per ADR-0143 §Decision (iii). Task 7 widens
-// with Method() to feed the matcherCtxAdapter's MatchContext.Method() bridge
-// (the matcher framework primitive ships a Method accessor per ADR-0142 §
-// Decision (iii) initial-surface). None of the Permission/Principal Large 11+11
-// evaluators consume Method directly; it surfaces only through the matcher-
-// engine bridge.
+// The interface covers Permission-relevant accessors per SPEC §6.5 + ADR-0143
+// §Decision (Permission section), Principal-side accessors (DirectRemoteIP /
+// RemoteIP / DownstreamPrincipal / SourcedMetadata / FilterState) per
+// ADR-0143 §Decision (iii), and Method() to feed the matcherCtxAdapter's
+// MatchContext.Method() bridge (the matcher framework primitive ships a Method
+// accessor per ADR-0142 §Decision (iii) initial-surface). None of the
+// Permission/Principal Large 11+11 evaluators consume Method directly; it
+// surfaces only through the matcher-engine bridge.
 //
 // SourcedMetadata() + FilterState() accessor shapes are FORWARD-COMPAT-ONLY
 // placeholders (both runtimes are always-FALSE per §2.5 + §8.10). The
 // `any`-typed returns let future dynamic-metadata + filter-state phases
 // finalize the shape without breaking the interface contract.
-type evalContext interface {
+type EvalContext interface {
 	// Header returns the request header value for name + a presence flag.
 	// Empty values with present=true are distinct from absent (present=false).
 	// Consumed by permHeader + prinHeader.
@@ -90,10 +92,11 @@ type evalContext interface {
 	DirectRemoteIP() net.IP
 
 	// RemoteIP returns the XFF-resolved remote IP per §11.P18. When the
-	// framework does not yet expose a callable XFF resolver to filters
-	// (phase-16 MVP), the production *filter returns the peer addr verbatim;
-	// the distinction with DirectRemoteIP is interface-level forward-compat.
-	// Consumed by prinRemoteIP.
+	// consumer does not expose a callable XFF resolver, the production accessor
+	// returns the peer addr verbatim (the HTTP consumer at MVP; the L4 consumer
+	// always, since a raw connection carries no XFF layer); the distinction with
+	// DirectRemoteIP is then interface-level forward-compat. Consumed by
+	// prinRemoteIP.
 	RemoteIP() net.IP
 
 	// DownstreamPrincipal returns the TLS principal candidates in priority
@@ -101,9 +104,9 @@ type evalContext interface {
 	// per §1.1 amendment 12 + ADR-0144. Returns nil/empty for plaintext or
 	// non-mTLS connections. Consumed by prinAuthenticated.
 	//
-	// The production-side accessor on `DecoderFilterCallbacks` lands at
-	// Task 6 per ADR-0144; at Task 5 the *filter STUBs return nil pending
-	// the framework-primitive landing.
+	// The production-side source is consumer-specific: the HTTP consumer reads
+	// it from DecoderFilterCallbacks (the ADR-0144 framework primitive), the L4
+	// consumer reads it from network.Connection.DownstreamPrincipals().
 	DownstreamPrincipal() []string
 
 	// SourcedMetadata is a forward-compat placeholder returning the dynamic-
@@ -144,20 +147,20 @@ type evalContext interface {
 // at parse time by buildOnePermission rejecting val=false. Per SPEC §6.5.
 type permAny struct{ val bool }
 
-func (e *permAny) evaluatePermission(_ evalContext) bool { return e.val }
+func (e *permAny) evaluatePermission(_ EvalContext) bool { return e.val }
 
 // permHeader wraps a parsed HeaderMatcher. Per SPEC §6.5; uses the
 // matchHeader local adapter (see Shared infrastructure adapters below).
 type permHeader struct{ matcher *routev3.HeaderMatcher }
 
-func (e *permHeader) evaluatePermission(ctx evalContext) bool {
+func (e *permHeader) evaluatePermission(ctx EvalContext) bool {
 	return matchHeader(e.matcher, ctx)
 }
 
 // permURLPath wraps a parsed PathMatcher. Per SPEC §6.5; uses matchPath.
 type permURLPath struct{ matcher *matcherv3.PathMatcher }
 
-func (e *permURLPath) evaluatePermission(ctx evalContext) bool {
+func (e *permURLPath) evaluatePermission(ctx EvalContext) bool {
 	return matchPath(e.matcher, ctx.URLPath())
 }
 
@@ -165,14 +168,14 @@ func (e *permURLPath) evaluatePermission(ctx evalContext) bool {
 // ctx.DestinationIP() per SPEC §6.5.
 type permDestIP struct{ cidr *corev3.CidrRange }
 
-func (e *permDestIP) evaluatePermission(ctx evalContext) bool {
+func (e *permDestIP) evaluatePermission(ctx EvalContext) bool {
 	return matchCidr(e.cidr, ctx.DestinationIP())
 }
 
 // permDestPort exact-matches a single uint32 port. Per SPEC §6.5.
 type permDestPort struct{ port uint32 }
 
-func (e *permDestPort) evaluatePermission(ctx evalContext) bool {
+func (e *permDestPort) evaluatePermission(ctx EvalContext) bool {
 	return ctx.DestinationPort() == e.port
 }
 
@@ -184,7 +187,7 @@ type permDestPortRange struct {
 	end   int32
 }
 
-func (e *permDestPortRange) evaluatePermission(ctx evalContext) bool {
+func (e *permDestPortRange) evaluatePermission(ctx EvalContext) bool {
 	p := int64(ctx.DestinationPort())
 	return p >= int64(e.start) && p < int64(e.end)
 }
@@ -193,7 +196,7 @@ func (e *permDestPortRange) evaluatePermission(ctx evalContext) bool {
 // SPEC §6.5.
 type permSNI struct{ matcher *matcherv3.StringMatcher }
 
-func (e *permSNI) evaluatePermission(ctx evalContext) bool {
+func (e *permSNI) evaluatePermission(ctx EvalContext) bool {
 	return matchString(e.matcher, ctx.RequestedServerName())
 }
 
@@ -202,7 +205,7 @@ func (e *permSNI) evaluatePermission(ctx evalContext) bool {
 // Empty children → TRUE (consistent with conjunction over empty set).
 type permAnd struct{ children []permissionEvaluator }
 
-func (e *permAnd) evaluatePermission(ctx evalContext) bool {
+func (e *permAnd) evaluatePermission(ctx EvalContext) bool {
 	for _, c := range e.children {
 		if !c.evaluatePermission(ctx) {
 			return false
@@ -216,7 +219,7 @@ func (e *permAnd) evaluatePermission(ctx evalContext) bool {
 // children → FALSE (consistent with disjunction over empty set).
 type permOr struct{ children []permissionEvaluator }
 
-func (e *permOr) evaluatePermission(ctx evalContext) bool {
+func (e *permOr) evaluatePermission(ctx EvalContext) bool {
 	for _, c := range e.children {
 		if c.evaluatePermission(ctx) {
 			return true
@@ -228,7 +231,7 @@ func (e *permOr) evaluatePermission(ctx evalContext) bool {
 // permNot is the recursive logical-negate combinator.
 type permNot struct{ child permissionEvaluator }
 
-func (e *permNot) evaluatePermission(ctx evalContext) bool {
+func (e *permNot) evaluatePermission(ctx EvalContext) bool {
 	return !e.child.evaluatePermission(ctx)
 }
 
@@ -243,7 +246,7 @@ type permSourcedMetadata struct {
 	matcher *rbacconfigv3.SourcedMetadata
 }
 
-func (e *permSourcedMetadata) evaluatePermission(_ evalContext) bool {
+func (e *permSourcedMetadata) evaluatePermission(_ EvalContext) bool {
 	// MVP always-no-match per §2.5. Future phase reads e.matcher.
 	return false
 }
@@ -254,10 +257,10 @@ func (e *permSourcedMetadata) evaluatePermission(_ evalContext) bool {
 
 // buildPermissionEvaluators iterates calling buildOnePermission, wrapping
 // errors with `permission[%d]:` prefix per SPEC §6.5 + ADR-0143.
-func buildPermissionEvaluators(perms []*rbacconfigv3.Permission) ([]permissionEvaluator, error) {
+func buildPermissionEvaluators(perms []*rbacconfigv3.Permission, profile Profile) ([]permissionEvaluator, error) {
 	out := make([]permissionEvaluator, 0, len(perms))
 	for i, perm := range perms {
-		ev, err := buildOnePermission(perm)
+		ev, err := buildOnePermission(perm, profile)
 		if err != nil {
 			return nil, fmt.Errorf("permission[%d]: %w", i, err)
 		}
@@ -272,7 +275,11 @@ func buildPermissionEvaluators(perms []*rbacconfigv3.Permission) ([]permissionEv
 //   - 3 PARSE-REJECT variants (Metadata + Matcher + UriTemplate per §2.3 +
 //     §11.P12 + planner-time decisions D3 + D6).
 //   - nil-rule defensive PARSE-REJECT.
-func buildOnePermission(p *rbacconfigv3.Permission) (permissionEvaluator, error) {
+//
+// ProfileL4 gates the HTTP-only arms (header + url_path) at entry per
+// D-26.3-1: an L4 consumer PARSE-REJECTs these arms at compile time.
+// ProfileHTTP permits all arms (byte-identical to pre-Profile behavior, R4).
+func buildOnePermission(p *rbacconfigv3.Permission, profile Profile) (permissionEvaluator, error) {
 	switch r := p.GetRule().(type) {
 	case *rbacconfigv3.Permission_Any:
 		// PGV `const=true` mirror per §1.1 amendment 4 + planner-time D7 (defensive
@@ -282,11 +289,17 @@ func buildOnePermission(p *rbacconfigv3.Permission) (permissionEvaluator, error)
 		}
 		return &permAny{val: r.Any}, nil
 	case *rbacconfigv3.Permission_Header:
+		if !profile.permits(armHeader) {
+			return nil, errors.New("rbac: permission.header is HTTP-only (unsupported for L4 network RBAC)")
+		}
 		if r.Header == nil {
 			return nil, errors.New("rbac: permission.header is nil")
 		}
 		return &permHeader{matcher: r.Header}, nil
 	case *rbacconfigv3.Permission_UrlPath:
+		if !profile.permits(armURLPath) {
+			return nil, errors.New("rbac: permission.url_path is HTTP-only (unsupported for L4 network RBAC)")
+		}
 		if r.UrlPath == nil {
 			return nil, errors.New("rbac: permission.url_path is nil")
 		}
@@ -320,7 +333,7 @@ func buildOnePermission(p *rbacconfigv3.Permission) (permissionEvaluator, error)
 		if r.AndRules == nil {
 			return nil, errors.New("rbac: permission.and_rules is nil")
 		}
-		children, err := buildPermissionEvaluators(r.AndRules.GetRules())
+		children, err := buildPermissionEvaluators(r.AndRules.GetRules(), profile)
 		if err != nil {
 			return nil, err
 		}
@@ -329,7 +342,7 @@ func buildOnePermission(p *rbacconfigv3.Permission) (permissionEvaluator, error)
 		if r.OrRules == nil {
 			return nil, errors.New("rbac: permission.or_rules is nil")
 		}
-		children, err := buildPermissionEvaluators(r.OrRules.GetRules())
+		children, err := buildPermissionEvaluators(r.OrRules.GetRules(), profile)
 		if err != nil {
 			return nil, err
 		}
@@ -338,7 +351,7 @@ func buildOnePermission(p *rbacconfigv3.Permission) (permissionEvaluator, error)
 		if r.NotRule == nil {
 			return nil, errors.New("rbac: permission.not_rule is nil")
 		}
-		child, err := buildOnePermission(r.NotRule)
+		child, err := buildOnePermission(r.NotRule, profile)
 		if err != nil {
 			return nil, err
 		}
@@ -396,7 +409,7 @@ func buildOnePermission(p *rbacconfigv3.Permission) (permissionEvaluator, error)
 // Per ADR-0143 §Decision (iii).
 type prinAny struct{ val bool }
 
-func (e *prinAny) evaluatePrincipal(_ evalContext) bool { return e.val }
+func (e *prinAny) evaluatePrincipal(_ EvalContext) bool { return e.val }
 
 // prinAuthenticated implements the three-case algorithm per §1.1 amendment 12
 // + SPEC §6.6 + ADR-0143 §Decision (vi). The nameMatcher field is the
@@ -413,7 +426,7 @@ type prinAuthenticated struct {
 	nameMatcher *matcherv3.StringMatcher // nil for case (a)
 }
 
-func (e *prinAuthenticated) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinAuthenticated) evaluatePrincipal(ctx EvalContext) bool {
 	candidates := ctx.DownstreamPrincipal()
 	if len(candidates) == 0 {
 		// Case (c): plaintext / no client cert.
@@ -436,34 +449,34 @@ func (e *prinAuthenticated) evaluatePrincipal(ctx evalContext) bool {
 // Distinct from prinRemoteIP: NO XFF resolution.
 type prinDirectRemoteIP struct{ cidr *corev3.CidrRange }
 
-func (e *prinDirectRemoteIP) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinDirectRemoteIP) evaluatePrincipal(ctx EvalContext) bool {
 	return matchCidr(e.cidr, ctx.DirectRemoteIP())
 }
 
 // prinRemoteIP CIDR-matches the XFF-resolved remote IP per §11.P18. The
 // production *filter's RemoteIP() accessor uses the framework's XFF resolver
 // when one is exposed; phase-16 MVP MAY return the peer addr verbatim when
-// the framework primitive is not yet surfaced (documented at the evalContext
+// the framework primitive is not yet surfaced (documented at the EvalContext
 // interface comment).
 type prinRemoteIP struct{ cidr *corev3.CidrRange }
 
-func (e *prinRemoteIP) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinRemoteIP) evaluatePrincipal(ctx EvalContext) bool {
 	return matchCidr(e.cidr, ctx.RemoteIP())
 }
 
 // prinHeader wraps a routev3.HeaderMatcher; reuses the matchHeader local
-// adapter from Task 4 (the matcher type is the same as Permission.Header per
-// the proto binding).
+// adapter (the matcher type is the same as Permission.Header per the proto
+// binding).
 type prinHeader struct{ matcher *routev3.HeaderMatcher }
 
-func (e *prinHeader) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinHeader) evaluatePrincipal(ctx EvalContext) bool {
 	return matchHeader(e.matcher, ctx)
 }
 
-// prinURLPath wraps a matcherv3.PathMatcher; reuses matchPath from Task 4.
+// prinURLPath wraps a matcherv3.PathMatcher; reuses the matchPath local adapter.
 type prinURLPath struct{ matcher *matcherv3.PathMatcher }
 
-func (e *prinURLPath) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinURLPath) evaluatePrincipal(ctx EvalContext) bool {
 	return matchPath(e.matcher, ctx.URLPath())
 }
 
@@ -472,7 +485,7 @@ func (e *prinURLPath) evaluatePrincipal(ctx evalContext) bool {
 // TRUE (conjunction-over-empty-set).
 type prinAnd struct{ children []principalEvaluator }
 
-func (e *prinAnd) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinAnd) evaluatePrincipal(ctx EvalContext) bool {
 	for _, c := range e.children {
 		if !c.evaluatePrincipal(ctx) {
 			return false
@@ -486,7 +499,7 @@ func (e *prinAnd) evaluatePrincipal(ctx evalContext) bool {
 // (disjunction-over-empty-set).
 type prinOr struct{ children []principalEvaluator }
 
-func (e *prinOr) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinOr) evaluatePrincipal(ctx EvalContext) bool {
 	for _, c := range e.children {
 		if c.evaluatePrincipal(ctx) {
 			return true
@@ -498,7 +511,7 @@ func (e *prinOr) evaluatePrincipal(ctx evalContext) bool {
 // prinNot is the recursive logical-negate combinator.
 type prinNot struct{ child principalEvaluator }
 
-func (e *prinNot) evaluatePrincipal(ctx evalContext) bool {
+func (e *prinNot) evaluatePrincipal(ctx EvalContext) bool {
 	return !e.child.evaluatePrincipal(ctx)
 }
 
@@ -511,7 +524,7 @@ type prinSourcedMetadata struct {
 	matcher *rbacconfigv3.SourcedMetadata
 }
 
-func (e *prinSourcedMetadata) evaluatePrincipal(_ evalContext) bool {
+func (e *prinSourcedMetadata) evaluatePrincipal(_ EvalContext) bool {
 	// MVP always-no-match per §2.5. Future phase reads e.matcher.
 	return false
 }
@@ -525,7 +538,7 @@ type prinFilterState struct {
 	matcher *matcherv3.FilterStateMatcher
 }
 
-func (e *prinFilterState) evaluatePrincipal(_ evalContext) bool {
+func (e *prinFilterState) evaluatePrincipal(_ EvalContext) bool {
 	// MVP always-no-match per §2.5. Future phase reads e.matcher.
 	return false
 }
@@ -535,13 +548,11 @@ func (e *prinFilterState) evaluatePrincipal(_ evalContext) bool {
 // ----------------------------------------------------------------------------
 
 // buildPrincipalEvaluators iterates calling buildOnePrincipal, wrapping errors
-// with `principal[%d]:` prefix per SPEC §6.5 + ADR-0143 §Decision (iii). Real
-// implementation lands at Task 5 (replacing the Task-2 STUB per
-// ADR-0143 §Consequences).
-func buildPrincipalEvaluators(prins []*rbacconfigv3.Principal) ([]principalEvaluator, error) {
+// with `principal[%d]:` prefix per SPEC §6.5 + ADR-0143 §Decision (iii).
+func buildPrincipalEvaluators(prins []*rbacconfigv3.Principal, profile Profile) ([]principalEvaluator, error) {
 	out := make([]principalEvaluator, 0, len(prins))
 	for i, prin := range prins {
-		ev, err := buildOnePrincipal(prin)
+		ev, err := buildOnePrincipal(prin, profile)
 		if err != nil {
 			return nil, fmt.Errorf("principal[%d]: %w", i, err)
 		}
@@ -562,7 +573,11 @@ func buildPrincipalEvaluators(prins []*rbacconfigv3.Principal) ([]principalEvalu
 // disposition is encoded in the `default:` arm via the type-name-string check
 // (the future v1.37.2-bump-time activation lifts the check to a typed case).
 // The verbatim error wording is locked at ADR-0143 §Decision (iv).
-func buildOnePrincipal(p *rbacconfigv3.Principal) (principalEvaluator, error) {
+//
+// ProfileL4 gates the HTTP-only arms (header + url_path) at entry per
+// D-26.3-1: an L4 consumer PARSE-REJECTs these arms at compile time.
+// ProfileHTTP permits all arms (byte-identical to pre-Profile behavior, R4).
+func buildOnePrincipal(p *rbacconfigv3.Principal, profile Profile) (principalEvaluator, error) {
 	switch id := p.GetIdentifier().(type) {
 	case *rbacconfigv3.Principal_Any:
 		// PGV const=true mirror per §1.1 amendment 4 + planner-time discipline.
@@ -589,11 +604,17 @@ func buildOnePrincipal(p *rbacconfigv3.Principal) (principalEvaluator, error) {
 		}
 		return &prinRemoteIP{cidr: id.RemoteIp}, nil
 	case *rbacconfigv3.Principal_Header:
+		if !profile.permits(armHeader) {
+			return nil, errors.New("rbac: principal.header is HTTP-only (unsupported for L4 network RBAC)")
+		}
 		if id.Header == nil {
 			return nil, errors.New("rbac: principal.header is nil")
 		}
 		return &prinHeader{matcher: id.Header}, nil
 	case *rbacconfigv3.Principal_UrlPath:
+		if !profile.permits(armURLPath) {
+			return nil, errors.New("rbac: principal.url_path is HTTP-only (unsupported for L4 network RBAC)")
+		}
 		if id.UrlPath == nil {
 			return nil, errors.New("rbac: principal.url_path is nil")
 		}
@@ -602,7 +623,7 @@ func buildOnePrincipal(p *rbacconfigv3.Principal) (principalEvaluator, error) {
 		if id.AndIds == nil {
 			return nil, errors.New("rbac: principal.and_ids is nil")
 		}
-		children, err := buildPrincipalEvaluators(id.AndIds.GetIds())
+		children, err := buildPrincipalEvaluators(id.AndIds.GetIds(), profile)
 		if err != nil {
 			return nil, err
 		}
@@ -611,7 +632,7 @@ func buildOnePrincipal(p *rbacconfigv3.Principal) (principalEvaluator, error) {
 		if id.OrIds == nil {
 			return nil, errors.New("rbac: principal.or_ids is nil")
 		}
-		children, err := buildPrincipalEvaluators(id.OrIds.GetIds())
+		children, err := buildPrincipalEvaluators(id.OrIds.GetIds(), profile)
 		if err != nil {
 			return nil, err
 		}
@@ -620,7 +641,7 @@ func buildOnePrincipal(p *rbacconfigv3.Principal) (principalEvaluator, error) {
 		if id.NotId == nil {
 			return nil, errors.New("rbac: principal.not_id is nil")
 		}
-		child, err := buildOnePrincipal(id.NotId)
+		child, err := buildOnePrincipal(id.NotId, profile)
 		if err != nil {
 			return nil, err
 		}
@@ -660,8 +681,7 @@ func buildOnePrincipal(p *rbacconfigv3.Principal) (principalEvaluator, error) {
 
 // ----------------------------------------------------------------------------
 // Shared infrastructure adapters — local impl in evaluator.go per ADR-0143
-// + PLAN.md line 65. Cors precedent has NO extractable matcher helpers
-// (verified at Task 3 spec review per REVIEW.md M-5 forward-pointer);
+// + PLAN.md line 65. The cors filter has NO extractable matcher helpers;
 // internal/matcher's StringMatcher impl uses the cncf/xds variant
 // (matchv3.StringMatcher) NOT the envoy variant (matcherv3.StringMatcher),
 // so reuse is not type-compatible. Local impl mirrors the canonical
@@ -669,8 +689,7 @@ func buildOnePrincipal(p *rbacconfigv3.Principal) (principalEvaluator, error) {
 //
 // **TECH-DEBT** — future operator-ergonomics phase MAY extract these adapters
 // to a top-level `internal/stringmatcher/` (or analogous) package for
-// cross-filter reuse. Noted at PROGRESS.md Task 4 entry per REVIEW.md
-// forward-pointer convention.
+// cross-filter reuse.
 // ----------------------------------------------------------------------------
 
 // matchString evaluates a matcherv3.StringMatcher against a candidate string.
@@ -710,9 +729,8 @@ func matchString(sm *matcherv3.StringMatcher, candidate string) bool {
 		if mp.SafeRegex == nil {
 			return false
 		}
-		// Re-compile per call: parse-time helpers (Task 5/7) may pre-cache;
-		// at Task 4 the runtime cost is acceptable for the canonical subset.
-		// TECH-DEBT: pre-compile at buildOnePermission time per future
+		// Re-compile per call: the runtime cost is acceptable for the canonical
+		// subset. TECH-DEBT: pre-compile at buildOnePermission time per future
 		// optimization phase.
 		re, err := regexp.Compile(mp.SafeRegex.GetRegex())
 		if err != nil {
@@ -742,9 +760,9 @@ func matchPath(pm *matcherv3.PathMatcher, candidate string) bool {
 }
 
 // matchHeader evaluates a routev3.HeaderMatcher against the per-stream header
-// state exposed via evalContext.Header(name).
+// state exposed via EvalContext.Header(name).
 //
-// HeaderMatcher subset honored at Task 4:
+// HeaderMatcher subset honored:
 //   - PresentMatch     — match when header present (treat_missing_header_as_empty respected).
 //   - ExactMatch       — DEPRECATED upstream but still in proto; exact-equal.
 //   - PrefixMatch      — DEPRECATED upstream; HasPrefix.
@@ -764,7 +782,7 @@ func matchPath(pm *matcherv3.PathMatcher, candidate string) bool {
 // surprising.
 //
 //nolint:staticcheck // proto-faithful support for deprecated HeaderMatchSpecifier variants per ADR-0143 §Decision (vii) — operators may still configure them
-func matchHeader(hm *routev3.HeaderMatcher, ctx evalContext) bool {
+func matchHeader(hm *routev3.HeaderMatcher, ctx EvalContext) bool {
 	if hm == nil {
 		return false
 	}

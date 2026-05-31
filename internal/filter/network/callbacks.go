@@ -31,7 +31,10 @@ type ReadFilterCallbacks interface {
 
 // CloseType selects the connection-close semantics. FlushWrite (flush pending
 // write then close) is used by direct_response (parent §11.7 D7); NoFlush
-// (close immediately) is shaped for 26.3 rbac enforced-deny (parent AMEND-A7).
+// (close immediately, dropping any pending downstream write) is used by 26.3
+// rbac enforced-deny (parent AMEND-A7). As of 26.3 (F3, D-26.3-2) the two are
+// RECORDED + honored distinctly by the framework: connection.Close records the
+// requested type and serveNetworkChain honors it at the pure-read close site.
 // Upstream's FlushWriteAndDelay/Abort/AbortReset are a documented forward-
 // extension under the ADR-0213 API-revision allowance.
 type CloseType int
@@ -40,7 +43,8 @@ const (
 	// FlushWrite flushes any pending write buffer to the downstream socket,
 	// then closes the connection.
 	FlushWrite CloseType = iota
-	// NoFlush closes the connection immediately without flushing.
+	// NoFlush closes immediately, discarding any pending downstream write
+	// (RST semantics via SO_LINGER 0).
 	NoFlush
 )
 
@@ -52,7 +56,11 @@ type Connection interface {
 	// no further writes follow (direct_response sets it; echo propagates the
 	// downstream end_stream).
 	Write(data []byte, endStream bool)
-	// Close closes the downstream connection with the given semantics.
+	// Close closes the downstream connection with the given semantics. The
+	// CloseType (FlushWrite vs NoFlush) is recorded and honored by the framework
+	// as of 26.3 (F3, D-26.3-2): NoFlush closes immediately, discarding any
+	// pending downstream write (RST semantics via SO_LINGER 0); FlushWrite
+	// drains then closes.
 	Close(ct CloseType)
 	// LocalAddr / RemoteAddr return the connection's bound / peer address.
 	LocalAddr() net.Addr

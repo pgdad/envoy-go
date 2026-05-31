@@ -195,6 +195,51 @@ func flattenToProm(internal string) (string, []Label, error) {
 				}
 			}
 		}
+		// Network rbac_network filter tag-extractor (phase 26.3 / ADR-0218). The
+		// envoy.filters.network.rbac filter roots its four counters on the
+		// PGV-required `stat_prefix` (NOT an HCM — the HTTP rbac filter's stats
+		// flow through the SN2 `http.<hcm>.rbac.*` path and never reach this
+		// default branch). The internal stat path is:
+		//
+		//   <stat_prefix>.rbac.{allowed,denied}
+		//   <stat_prefix>.rbac.[<shadow_rules_stat_prefix>.]{shadow_allowed,shadow_denied}
+		//
+		// where <stat_prefix> is a single segment (no dots). This mirrors
+		// reference Envoy v1.37.2's tag-extractor for the network rbac filter
+		// (empirically captured at phase-26.3 Task 14 via the dockerized
+		// differential): the stat_prefix is promoted to a LABEL
+		// (`envoy_rbac_prefix=<stat_prefix>`) and the remainder
+		// (`rbac.[<shadow_prefix>.]<counter>`) flattens to the base name
+		// `envoy_rbac_<rest>` (dots→underscores). Examples (ref-parity):
+		//
+		//   rbac_allow.rbac.allowed                  → envoy_rbac_allowed{envoy_rbac_prefix="rbac_allow"}
+		//   rbac_deny.rbac.denied                    → envoy_rbac_denied{envoy_rbac_prefix="rbac_deny"}
+		//   rbac_shadow.rbac.shadow_ns.shadow_denied → envoy_rbac_shadow_ns_shadow_denied{envoy_rbac_prefix="rbac_shadow"}
+		//
+		// KEEP IN SYNC with newFilterStats in
+		// internal/filter/network/rbac/rbac.go (the four-counter surface). Adding
+		// a 5th counter requires editing BOTH this suffix allowlist (the
+		// strings.HasSuffix chain below) AND the filterStats struct +
+		// newFilterStats registration in rbac.go in lockstep. The detection is a
+		// second-pass on the unmatched-prefix path (after the SN1-SN5 switch
+		// fails); the SN1-SN5 hot-path is unchanged.
+		const rbacSegment = ".rbac."
+		if idx := strings.Index(internal, rbacSegment); idx > 0 {
+			prefix := internal[:idx]
+			rest := internal[idx+1:] // "rbac.<...>" — keep the literal rbac. segment in the base
+			// Validate: prefix has no dots (single stat_prefix segment); rest
+			// ends in one of the four known network-rbac counter names (the
+			// optional shadow_rules_stat_prefix segment sits between `rbac.` and
+			// the shadow_* counter — accepted by the suffix check).
+			if !strings.ContainsRune(prefix, '.') &&
+				(strings.HasSuffix(rest, ".allowed") || strings.HasSuffix(rest, ".denied") ||
+					strings.HasSuffix(rest, ".shadow_allowed") || strings.HasSuffix(rest, ".shadow_denied")) {
+				labels = append(labels, Label{Key: "envoy_rbac_prefix", Value: prefix})
+				base = "envoy_" + strings.ReplaceAll(rest, ".", "_")
+				// Skip SN4 status-class collapse (rbac names have no _Nxx suffix).
+				return base, labels, nil
+			}
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 

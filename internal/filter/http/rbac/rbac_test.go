@@ -8,21 +8,18 @@ import (
 	"sync"
 	"testing"
 
-	xdscorev3 "github.com/cncf/xds/go/xds/core/v3"
 	xdsmatcherv3 "github.com/cncf/xds/go/xds/type/matcher/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	rbacconfigv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
-	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/matcher"
+	rbacengine "github.com/esalaine/envoy-go/internal/rbac"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -243,8 +240,13 @@ func TestBuildCompiledConfig_AllThreeActionEnumValues_Accepted(t *testing.T) {
 			if err != nil {
 				t.Fatalf("buildCompiledConfig(action=%v): want success, got %v", action, err)
 			}
-			if cc.rules.action != action {
-				t.Errorf("action = %v; want %v", cc.rules.action, action)
+			// The action enum is captured into the (unexported) engine field;
+			// that capture is pinned engine-side at internal/rbac/rbac_test.go
+			// (TestBuildRulesEngine_AllThreeActionEnumValues_Accepted). The
+			// consumer-relevant assertion is that all three actions are accepted
+			// and produce a non-nil primary rules engine.
+			if cc.rules == nil {
+				t.Errorf("action=%v: cc.rules = nil; want non-nil rules engine", action)
 			}
 		})
 	}
@@ -264,166 +266,6 @@ func TestBuildCompiledConfig_InvalidActionEnum_Rejected(t *testing.T) {
 	if !strings.Contains(err.Error(), "invalid action") {
 		t.Errorf("got %q; want substring 'invalid action'", err.Error())
 	}
-}
-
-func TestBuildCompiledRulesEngine_EmptyPermissions_Rejected(t *testing.T) {
-	// Per §1.1 amendment 4 (PGV min_items=1 mirror). Per-policy permissions
-	// list must be non-empty.
-	c := &rbacv3.RBAC{Rules: &rbacconfigv3.RBAC{
-		Action: rbacconfigv3.RBAC_ALLOW,
-		Policies: map[string]*rbacconfigv3.Policy{
-			"p": {
-				Permissions: nil, // empty
-				Principals: []*rbacconfigv3.Principal{
-					{Identifier: &rbacconfigv3.Principal_Any{Any: true}},
-				},
-			},
-		},
-	}}
-	_, err := buildCompiledConfig(c, freshFactoryCtx(), false /*isPerRoute*/)
-	if err == nil {
-		t.Fatal("buildCompiledConfig: empty permissions; want error, got nil")
-	}
-	if !strings.Contains(err.Error(), "permission") {
-		t.Errorf("got %q; want substring 'permission'", err.Error())
-	}
-}
-
-func TestBuildCompiledRulesEngine_EmptyPrincipals_Rejected(t *testing.T) {
-	c := &rbacv3.RBAC{Rules: &rbacconfigv3.RBAC{
-		Action: rbacconfigv3.RBAC_ALLOW,
-		Policies: map[string]*rbacconfigv3.Policy{
-			"p": {
-				Permissions: []*rbacconfigv3.Permission{
-					{Rule: &rbacconfigv3.Permission_Any{Any: true}},
-				},
-				Principals: nil, // empty
-			},
-		},
-	}}
-	_, err := buildCompiledConfig(c, freshFactoryCtx(), false /*isPerRoute*/)
-	if err == nil {
-		t.Fatal("buildCompiledConfig: empty principals; want error, got nil")
-	}
-	if !strings.Contains(err.Error(), "principal") {
-		t.Errorf("got %q; want substring 'principal'", err.Error())
-	}
-}
-
-func TestBuildCompiledRulesEngine_LexicographicPolicyOrder_Preserved(t *testing.T) {
-	// Per rbac.pb.go:268-269 "The policies are evaluated in lexicographic order
-	// of the policy name." parsePerRoute compiles to a slice ordered by sorted
-	// policy name.
-	names := []string{"zeta", "alpha", "mike", "beta"}
-	policies := make(map[string]*rbacconfigv3.Policy, len(names))
-	for _, n := range names {
-		policies[n] = &rbacconfigv3.Policy{
-			Permissions: []*rbacconfigv3.Permission{
-				{Rule: &rbacconfigv3.Permission_Any{Any: true}},
-			},
-			Principals: []*rbacconfigv3.Principal{
-				{Identifier: &rbacconfigv3.Principal_Any{Any: true}},
-			},
-		}
-	}
-	c := &rbacv3.RBAC{Rules: &rbacconfigv3.RBAC{
-		Action:   rbacconfigv3.RBAC_ALLOW,
-		Policies: policies,
-	}}
-	cc, err := buildCompiledConfig(c, freshFactoryCtx(), false /*isPerRoute*/)
-	if err != nil {
-		t.Fatalf("buildCompiledConfig: want success, got %v", err)
-	}
-	want := []string{"alpha", "beta", "mike", "zeta"}
-	got := make([]string, 0, len(cc.rules.policies))
-	for _, p := range cc.rules.policies {
-		got = append(got, p.name)
-	}
-	if len(got) != len(want) {
-		t.Fatalf("policy count = %d; want %d", len(got), len(want))
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("policy[%d] = %q; want %q (lexicographic)", i, got[i], want[i])
-		}
-	}
-}
-
-func TestBuildCompiledRulesEngine_AuditLoggingOptions_SilentIgnored(t *testing.T) {
-	// Per §2.1.1: audit_logging_options carries `[#not-implemented-hide:]` in
-	// upstream Envoy. envoy-go silent-ignores at parse + runtime. Setting it
-	// does NOT produce an error.
-	c := &rbacv3.RBAC{Rules: &rbacconfigv3.RBAC{
-		Action:   rbacconfigv3.RBAC_ALLOW,
-		Policies: allowAnyPolicy("p"),
-		AuditLoggingOptions: &rbacconfigv3.RBAC_AuditLoggingOptions{
-			AuditCondition: rbacconfigv3.RBAC_AuditLoggingOptions_ON_DENY,
-		},
-	}}
-	_, err := buildCompiledConfig(c, freshFactoryCtx(), false /*isPerRoute*/)
-	if err != nil {
-		t.Fatalf("buildCompiledConfig: audit_logging_options set; want silent-ignore (success), got %v", err)
-	}
-}
-
-func TestBuildCompiledRulesEngine_ConditionField_SilentIgnored(t *testing.T) {
-	// Per §1.1 amendment 6 + Q7: Policy.condition is silent-ignored at parse +
-	// runtime. We cannot use the cel-spec Expr type without pulling a heavy
-	// dep; the silent-ignore is verified by setting the proto field via the
-	// .pb.go binding's reflective accessor and asserting no error. The
-	// concrete `Condition *v1alpha1.Expr` field is left nil here — the
-	// behavioral assertion is that even setting CEL-bearing policies does NOT
-	// alter parse outcomes (the silent-ignore is straight-line).
-	//
-	// Approach (a) per BOOTSTRAP_PROMPT: minimal input (nil Condition) suffices
-	// to demonstrate that the parser does NOT consult / branch on CEL fields.
-	// Test ratifies the structural invariant: parse succeeds; compiled output
-	// has no condition slot to inspect (deliberate omission from
-	// compiledPolicy per SPEC §6.2 "CEL fields are NOT cached").
-	c := &rbacv3.RBAC{Rules: &rbacconfigv3.RBAC{
-		Action:   rbacconfigv3.RBAC_ALLOW,
-		Policies: allowAnyPolicy("p"),
-	}}
-	cc, err := buildCompiledConfig(c, freshFactoryCtx(), false /*isPerRoute*/)
-	if err != nil {
-		t.Fatalf("buildCompiledConfig: condition; want silent-ignore (success), got %v", err)
-	}
-	// compiledPolicy carries name + permissions + principals only — no
-	// condition slot. Structural assertion.
-	if len(cc.rules.policies) != 1 {
-		t.Fatalf("compiled policies len = %d; want 1", len(cc.rules.policies))
-	}
-}
-
-func TestBuildCompiledRulesEngine_CheckedConditionField_SilentIgnored(t *testing.T) {
-	// Per §1.1 amendment 6 + Q7: Policy.checked_condition is silent-ignored
-	// at parse + runtime. Same structural assertion as above; the
-	// compiledPolicy carries NO checked_condition slot.
-	c := &rbacv3.RBAC{Rules: &rbacconfigv3.RBAC{
-		Action:   rbacconfigv3.RBAC_ALLOW,
-		Policies: allowAnyPolicy("p"),
-	}}
-	cc, err := buildCompiledConfig(c, freshFactoryCtx(), false /*isPerRoute*/)
-	if err != nil {
-		t.Fatalf("buildCompiledConfig: checked_condition; want silent-ignore (success), got %v", err)
-	}
-	if len(cc.rules.policies) != 1 {
-		t.Fatalf("compiled policies len = %d; want 1", len(cc.rules.policies))
-	}
-}
-
-func TestBuildCompiledRulesEngine_CelConfigField_SilentIgnored(t *testing.T) {
-	// Per §1.1 amendment 6 NEW: Policy.cel_config (the THIRD CEL field
-	// introduced post-v1.32.x) is silent-ignored at parse + runtime.
-	//
-	// NOTE: envoy-go pins to go-control-plane v1.32.4 (per go.mod) which does
-	// NOT carry the cel_config field on Policy. The field is structurally
-	// absent from the proto binding visible at this build. Approach (b) per
-	// BOOTSTRAP_PROMPT: SKIP this case at Task 2; if the module bumps to a
-	// version that exposes cel_config, the silent-ignore disposition is
-	// already encoded in buildCompiledRulesEngine's "no CEL slot extracted"
-	// shape (the parser simply never reads CEL fields).
-	t.Skip("rbac: cel_config field not present in go-control-plane v1.32.4 proto binding; silent-ignore disposition is structural — buildCompiledRulesEngine reads NO CEL fields. Test re-activates when module bumps expose the field.")
 }
 
 // ----------------------------------------------------------------------------
@@ -591,42 +433,11 @@ func TestResolvePerRouteConfig_LazyCacheSyncMap_PointerIdentityKey(t *testing.T)
 	}
 }
 
-// ----------------------------------------------------------------------------
-// Group 3 — Permission evaluators (per SPEC §14.1 #3 + §6.5). 15 test cases.
-//
-// Each test exercises one Permission variant (or one PARSE-REJECT) by:
-//
-//  1. Building an *rbacconfigv3.Permission proto carrying the variant's
-//     payload.
-//  2. Calling buildOnePermission(perm) → asserting either (a) the returned
-//     evaluator's evaluatePermission(ctx) disposition against a stub
-//     evalContext, OR (b) the parse error wording verbatim for the 3 deferred
-//     variants + the const=true PGV mirror.
-//
-// The 15 test cases per PLAN.md line 66 + SPEC §14.1 #3:
-//   - TestPermAny_True_Matches
-//   - TestPermAny_FalseValue_Rejected            (PGV const=true mirror)
-//   - TestPermHeader_Match                       (exact / prefix / safe-regex)
-//   - TestPermURLPath_PathMatcher                (exact / prefix / safe-regex)
-//   - TestPermDestIP_CIDR
-//   - TestPermDestPort_Exact
-//   - TestPermDestPortRange_StartLEPortLTEnd
-//   - TestPermSNI_StringMatcher
-//   - TestPermAndRules_Recursive_AllMatch
-//   - TestPermOrRules_Recursive_AnyMatch
-//   - TestPermNotRule_Recursive_Negate
-//   - TestPermSourcedMetadata_ParseSupported_RuntimeFalse
-//   - TestPermMetadata_PARSE_REJECT
-//   - TestPermMatcher_PARSE_REJECT
-//   - TestPermUriTemplate_PARSE_REJECT
-// ----------------------------------------------------------------------------
-
-// stubEvalContext is a test-only evalContext implementation. Each field is a
-// pre-populated value the per-test set-up writes; the per-method accessors
-// return the field verbatim. Permission accessors landed at Task 4; Principal
-// accessors (DirectRemoteIP, RemoteIP, DownstreamPrincipal, SourcedMetadata,
-// FilterState) landed at Task 5 per ADR-0143 §Decision (i) evalContext
-// widening discipline.
+// stubEvalContext is a test-only rbacengine.EvalContext implementation. Each
+// field is a pre-populated value the per-test set-up writes; the per-method
+// accessors return the field verbatim. The EvalContext interface moved to
+// internal/rbac at phase-26.3; this stub satisfies it structurally and feeds
+// the consumer-side evaluateEngine dispatcher tests.
 type stubEvalContext struct {
 	headers             map[string]string // single-value per name (canonical-cased keys)
 	urlPath             string
@@ -656,1422 +467,51 @@ func (s *stubEvalContext) DownstreamPrincipal() []string {
 func (s *stubEvalContext) SourcedMetadata() any { return nil }
 func (s *stubEvalContext) FilterState() any     { return nil }
 
-func TestPermAny_True_Matches(t *testing.T) {
-	// Per SPEC §6.5 + ADR-0143: permAny{val: true} matches any request.
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_Any{Any: true}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(any=true): want success, got %v", err)
-	}
-	if !ev.evaluatePermission(&stubEvalContext{}) {
-		t.Error("permAny{val:true}.evaluatePermission(empty ctx): want true; got false")
-	}
-}
-
-func TestPermAny_FalseValue_Rejected(t *testing.T) {
-	// Per §1.1 amendment 4 PGV const=true mirror: Permission_Any{Any: false}
-	// is rejected at parse time. envoy-go-only defensive check (Envoy would
-	// PGV-validate at proto-decode boundary).
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_Any{Any: false}}
-	_, err := buildOnePermission(p)
-	if err == nil {
-		t.Fatal("buildOnePermission(any=false): want error, got nil")
-	}
-	if !strings.Contains(err.Error(), "any") {
-		t.Errorf("got %q; want substring 'any'", err.Error())
-	}
-}
-
-func TestPermHeader_Match(t *testing.T) {
-	// Per SPEC §6.5: Permission_Header wraps *routev3.HeaderMatcher. Tests
-	// exact-match + prefix-match + safe-regex-match dispositions.
-	cases := []struct {
-		name       string
-		matcher    *routev3.HeaderMatcher
-		headers    map[string]string
-		wantResult bool
-	}{
-		{
-			name: "exact_match_hits",
-			matcher: &routev3.HeaderMatcher{
-				Name: "x-user",
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "admin"},
-					},
-				},
-			},
-			headers:    map[string]string{"x-user": "admin"},
-			wantResult: true,
-		},
-		{
-			name: "exact_match_misses",
-			matcher: &routev3.HeaderMatcher{
-				Name: "x-user",
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "admin"},
-					},
-				},
-			},
-			headers:    map[string]string{"x-user": "guest"},
-			wantResult: false,
-		},
-		{
-			name: "prefix_match_hits",
-			matcher: &routev3.HeaderMatcher{
-				Name: "x-tenant",
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: "acme-"},
-					},
-				},
-			},
-			headers:    map[string]string{"x-tenant": "acme-prod"},
-			wantResult: true,
-		},
-		{
-			name: "header_absent_returns_false",
-			matcher: &routev3.HeaderMatcher{
-				Name: "x-user",
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "admin"},
-					},
-				},
-			},
-			headers:    map[string]string{},
-			wantResult: false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_Header{Header: tc.matcher}}
-			ev, err := buildOnePermission(p)
-			if err != nil {
-				t.Fatalf("buildOnePermission(header): want success, got %v", err)
-			}
-			got := ev.evaluatePermission(&stubEvalContext{headers: tc.headers})
-			if got != tc.wantResult {
-				t.Errorf("evaluatePermission: got %v; want %v", got, tc.wantResult)
-			}
-		})
-	}
-}
-
-func TestPermURLPath_PathMatcher(t *testing.T) {
-	// Per SPEC §6.5: Permission_UrlPath wraps *matcherv3.PathMatcher whose
-	// inner Path field is a StringMatcher. Tests exact + prefix + safe-regex.
-	cases := []struct {
-		name        string
-		pathMatcher *matcherv3.PathMatcher
-		urlPath     string
-		wantResult  bool
-	}{
-		{
-			name: "exact_path_hits",
-			pathMatcher: &matcherv3.PathMatcher{
-				Rule: &matcherv3.PathMatcher_Path{
-					Path: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "/admin"},
-					},
-				},
-			},
-			urlPath:    "/admin",
-			wantResult: true,
-		},
-		{
-			name: "prefix_path_hits",
-			pathMatcher: &matcherv3.PathMatcher{
-				Rule: &matcherv3.PathMatcher_Path{
-					Path: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: "/api/"},
-					},
-				},
-			},
-			urlPath:    "/api/users",
-			wantResult: true,
-		},
-		{
-			name: "prefix_path_misses",
-			pathMatcher: &matcherv3.PathMatcher{
-				Rule: &matcherv3.PathMatcher_Path{
-					Path: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: "/api/"},
-					},
-				},
-			},
-			urlPath:    "/public/index",
-			wantResult: false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_UrlPath{UrlPath: tc.pathMatcher}}
-			ev, err := buildOnePermission(p)
-			if err != nil {
-				t.Fatalf("buildOnePermission(url_path): want success, got %v", err)
-			}
-			got := ev.evaluatePermission(&stubEvalContext{urlPath: tc.urlPath})
-			if got != tc.wantResult {
-				t.Errorf("evaluatePermission: got %v; want %v", got, tc.wantResult)
-			}
-		})
-	}
-}
-
-func TestPermDestIP_CIDR(t *testing.T) {
-	// Per SPEC §6.5: Permission_DestinationIp wraps *corev3.CidrRange.
-	// CIDR-range match against ctx.DestinationIP().
-	cidr := &corev3.CidrRange{
-		AddressPrefix: "10.0.0.0",
-		PrefixLen:     &wrapperspb.UInt32Value{Value: 8},
-	}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_DestinationIp{DestinationIp: cidr}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(destination_ip): want success, got %v", err)
-	}
-	cases := []struct {
-		ip   string
-		want bool
-	}{
-		{"10.0.0.1", true},
-		{"10.255.255.255", true},
-		{"192.168.1.1", false},
-		{"127.0.0.1", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.ip, func(t *testing.T) {
-			got := ev.evaluatePermission(&stubEvalContext{destIP: net.ParseIP(tc.ip)})
-			if got != tc.want {
-				t.Errorf("destIP %s: got %v; want %v", tc.ip, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestPermDestIP_CIDR_PrefixLenZero_MatchesAll exercises the documented
-// matchCidr semantic: a CidrRange with PrefixLen unset (nil wrapperspb)
-// defaults to 0, which means "the prefix matches all addresses" per the
-// canonical Envoy semantic recorded in matchCidr's doc-comment.
-func TestPermDestIP_CIDR_PrefixLenZero_MatchesAll(t *testing.T) {
-	// PrefixLen left nil → defaults to 0 → matches every IP of the same family.
-	cidr := &corev3.CidrRange{AddressPrefix: "0.0.0.0"}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_DestinationIp{DestinationIp: cidr}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(destination_ip prefix_len=0): want success, got %v", err)
-	}
-	cases := []string{"10.0.0.1", "192.168.1.1", "127.0.0.1", "8.8.8.8", "0.0.0.0"}
-	for _, ip := range cases {
-		t.Run(ip, func(t *testing.T) {
-			got := ev.evaluatePermission(&stubEvalContext{destIP: net.ParseIP(ip)})
-			if !got {
-				t.Errorf("destIP %s with PrefixLen=0: got false; want true (matches all)", ip)
-			}
-		})
-	}
-}
-
-func TestPermDestPort_Exact(t *testing.T) {
-	// Per SPEC §6.5: Permission_DestinationPort uint32 exact-match.
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_DestinationPort{DestinationPort: 8443}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(destination_port): want success, got %v", err)
-	}
-	if !ev.evaluatePermission(&stubEvalContext{destPort: 8443}) {
-		t.Error("destPort=8443 against permDestPort{port:8443}: want true")
-	}
-	if ev.evaluatePermission(&stubEvalContext{destPort: 80}) {
-		t.Error("destPort=80 against permDestPort{port:8443}: want false")
-	}
-}
-
-func TestPermDestPortRange_StartLEPortLTEnd(t *testing.T) {
-	// Per SPEC §6.5: Permission_DestinationPortRange wraps *typev3.Int32Range
-	// with half-open interval semantics [start, end).
-	rng := &typev3.Int32Range{Start: 8000, End: 9000}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_DestinationPortRange{DestinationPortRange: rng}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(destination_port_range): want success, got %v", err)
-	}
-	cases := []struct {
-		port uint32
-		want bool
-	}{
-		{8000, true},  // start inclusive
-		{8500, true},  // mid
-		{8999, true},  // end-1 inclusive
-		{9000, false}, // end exclusive
-		{7999, false}, // before start
-	}
-	for _, tc := range cases {
-		got := ev.evaluatePermission(&stubEvalContext{destPort: tc.port})
-		if got != tc.want {
-			t.Errorf("port=%d range[8000,9000): got %v; want %v", tc.port, got, tc.want)
-		}
-	}
-}
-
-func TestPermSNI_StringMatcher(t *testing.T) {
-	// Per SPEC §6.5: Permission_RequestedServerName wraps *matcherv3.StringMatcher.
-	// Match against ctx.RequestedServerName().
-	sm := &matcherv3.StringMatcher{
-		MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "example.com"},
-	}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_RequestedServerName{RequestedServerName: sm}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(requested_server_name): want success, got %v", err)
-	}
-	if !ev.evaluatePermission(&stubEvalContext{serverName: "example.com"}) {
-		t.Error("SNI=example.com: want match true")
-	}
-	if ev.evaluatePermission(&stubEvalContext{serverName: "other.com"}) {
-		t.Error("SNI=other.com: want match false")
-	}
-	if ev.evaluatePermission(&stubEvalContext{serverName: ""}) {
-		t.Error("plaintext (empty SNI): want match false")
-	}
-}
-
-func TestPermAndRules_Recursive_AllMatch(t *testing.T) {
-	// Per SPEC §6.5: Permission_AndRules{rules: [...]} short-circuits to FALSE
-	// on first child returning FALSE. Test exercises a 4-level deep AND chain:
-	// AND(any, AND(any, AND(any, any))). All-true → TRUE; any-false → FALSE.
-	innermost := &rbacconfigv3.Permission_Set{Rules: []*rbacconfigv3.Permission{
-		{Rule: &rbacconfigv3.Permission_Any{Any: true}},
-		{Rule: &rbacconfigv3.Permission_Any{Any: true}},
-	}}
-	level3 := &rbacconfigv3.Permission_Set{Rules: []*rbacconfigv3.Permission{
-		{Rule: &rbacconfigv3.Permission_Any{Any: true}},
-		{Rule: &rbacconfigv3.Permission_AndRules{AndRules: innermost}},
-	}}
-	level2 := &rbacconfigv3.Permission_Set{Rules: []*rbacconfigv3.Permission{
-		{Rule: &rbacconfigv3.Permission_Any{Any: true}},
-		{Rule: &rbacconfigv3.Permission_AndRules{AndRules: level3}},
-	}}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_AndRules{AndRules: level2}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(and 4-level): want success, got %v", err)
-	}
-	if !ev.evaluatePermission(&stubEvalContext{}) {
-		t.Error("AND(any...any) 4-deep: want true (all-match)")
-	}
-
-	// Now flip the innermost to a port-exact mismatch to verify short-circuit.
-	innermost.Rules = []*rbacconfigv3.Permission{
-		{Rule: &rbacconfigv3.Permission_Any{Any: true}},
-		{Rule: &rbacconfigv3.Permission_DestinationPort{DestinationPort: 99}},
-	}
-	evMix, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("rebuild after mixin: %v", err)
-	}
-	if evMix.evaluatePermission(&stubEvalContext{destPort: 80}) {
-		t.Error("AND with port-mismatch deep child: want false")
-	}
-}
-
-func TestPermOrRules_Recursive_AnyMatch(t *testing.T) {
-	// Per SPEC §6.5: Permission_OrRules short-circuits to TRUE on first child
-	// returning TRUE. Test a 3-deep OR with a permAny{val:true} buried.
-	innermost := &rbacconfigv3.Permission_Set{Rules: []*rbacconfigv3.Permission{
-		{Rule: &rbacconfigv3.Permission_DestinationPort{DestinationPort: 99}},
-		{Rule: &rbacconfigv3.Permission_Any{Any: true}}, // wins
-	}}
-	level2 := &rbacconfigv3.Permission_Set{Rules: []*rbacconfigv3.Permission{
-		{Rule: &rbacconfigv3.Permission_DestinationPort{DestinationPort: 88}},
-		{Rule: &rbacconfigv3.Permission_OrRules{OrRules: innermost}},
-	}}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_OrRules{OrRules: level2}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(or 3-level): want success, got %v", err)
-	}
-	if !ev.evaluatePermission(&stubEvalContext{destPort: 80}) {
-		t.Error("OR with any:true inside: want true")
-	}
-
-	// All-false short-circuit.
-	innermost.Rules = []*rbacconfigv3.Permission{
-		{Rule: &rbacconfigv3.Permission_DestinationPort{DestinationPort: 99}},
-		{Rule: &rbacconfigv3.Permission_DestinationPort{DestinationPort: 77}},
-	}
-	evMiss, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
-	if evMiss.evaluatePermission(&stubEvalContext{destPort: 80}) {
-		t.Error("OR with no matching child: want false")
-	}
-}
-
-func TestPermNotRule_Recursive_Negate(t *testing.T) {
-	// Per SPEC §6.5: Permission_NotRule logically negates its child.
-	inner := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_DestinationPort{DestinationPort: 80}}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_NotRule{NotRule: inner}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(not): want success, got %v", err)
-	}
-	if ev.evaluatePermission(&stubEvalContext{destPort: 80}) {
-		t.Error("NOT(port=80) against port=80: want false")
-	}
-	if !ev.evaluatePermission(&stubEvalContext{destPort: 81}) {
-		t.Error("NOT(port=80) against port=81: want true")
-	}
-}
-
-func TestPermSourcedMetadata_ParseSupported_RuntimeFalse(t *testing.T) {
-	// Per §2.5 + §8.10: Permission_SourcedMetadata is parse-supported (no
-	// error from buildOnePermission); evaluator ALWAYS returns FALSE at runtime
-	// (the dynamic-metadata subsystem is not yet wired in envoy-go MVP).
-	sm := &rbacconfigv3.SourcedMetadata{}
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_SourcedMetadata{SourcedMetadata: sm}}
-	ev, err := buildOnePermission(p)
-	if err != nil {
-		t.Fatalf("buildOnePermission(sourced_metadata): want success (parse-supported), got %v", err)
-	}
-	if ev.evaluatePermission(&stubEvalContext{}) {
-		t.Error("permSourcedMetadata.evaluatePermission: want false (always-no-match MVP)")
-	}
-}
-
-func TestPermMetadata_PARSE_REJECT(t *testing.T) {
-	// Per §2.3 + §11.P12 + planner-time D3: Permission_Metadata is deprecated
-	// upstream. envoy-go-only PARSE-REJECT with the specified error wording.
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_Metadata{}}
-	_, err := buildOnePermission(p)
-	if err == nil {
-		t.Fatal("buildOnePermission(metadata): want error, got nil")
-	}
-	want := "rbac: permission.metadata deprecated; use sourced_metadata"
-	if err.Error() != want {
-		t.Errorf("got %q; want %q", err.Error(), want)
-	}
-}
-
-func TestPermMatcher_PARSE_REJECT(t *testing.T) {
-	// Per §2.3 + §8.8 + planner-time D6: Permission_Matcher is an extension
-	// TypedExtensionConfig variant; envoy-go MVP PARSE-REJECTs with the
-	// specified error wording.
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_Matcher{}}
-	_, err := buildOnePermission(p)
-	if err == nil {
-		t.Fatal("buildOnePermission(matcher): want error, got nil")
-	}
-	want := "rbac: permission.matcher extension types unsupported in this build"
-	if err.Error() != want {
-		t.Errorf("got %q; want %q", err.Error(), want)
-	}
-}
-
-func TestPermUriTemplate_PARSE_REJECT(t *testing.T) {
-	// Per §2.3 + §8.8 + planner-time D6: Permission_UriTemplate is an extension
-	// TypedExtensionConfig variant; envoy-go MVP PARSE-REJECTs.
-	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_UriTemplate{}}
-	_, err := buildOnePermission(p)
-	if err == nil {
-		t.Fatal("buildOnePermission(uri_template): want error, got nil")
-	}
-	want := "rbac: permission.uri_template extension types unsupported in this build"
-	if err.Error() != want {
-		t.Errorf("got %q; want %q", err.Error(), want)
-	}
-}
+// Compile-time assertion: *stubEvalContext satisfies rbacengine.EvalContext
+// (catches interface drift during the phase-26.3 migration).
+var _ rbacengine.EvalContext = (*stubEvalContext)(nil)
 
 // ----------------------------------------------------------------------------
-// Group 4 — Principal evaluators (per SPEC §14.1 #4 + §6.5 + §1.1 amendment 7).
-// 14 test cases.
-//
-// Each test exercises one Principal variant (or one PARSE-REJECT) by:
-//
-//  1. Building an *rbacconfigv3.Principal proto carrying the variant's payload.
-//  2. Calling buildOnePrincipal(p) → asserting either (a) the returned
-//     evaluator's evaluatePrincipal(ctx) disposition against a stub evalContext,
-//     OR (b) the parse error wording verbatim for the 3 deferred variants.
-//
-// The 14 test cases per PLAN.md line 66 + SPEC §14.1 #4:
-//   - TestPrinAny_True_Matches
-//   - TestPrinDirectRemoteIP_CIDR_PeerSource
-//   - TestPrinRemoteIP_CIDR_XFFResolved
-//   - TestPrinHeader_HeaderMatcher
-//   - TestPrinURLPath_PathMatcher
-//   - TestPrinAndIds_Recursive_AllMatch
-//   - TestPrinOrIds_Recursive_AnyMatch
-//   - TestPrinNotId_Recursive_Negate
-//   - TestPrinSourcedMetadata_RuntimeFalse
-//   - TestPrinFilterState_RuntimeFalse
-//   - TestPrinAuthenticated_ThreeCaseAlgorithm (cases (a)/(b)/(c) per §1.1 amendment 12 + §6.6)
-//   - TestPrinSourceIp_PARSE_REJECT
-//   - TestPrinMetadata_PARSE_REJECT
-//   - TestPrinCustom_PARSE_REJECT (NEW 14th variant per §1.1 amendment 7)
+// Group 5 — evaluateEngine dispatcher (per SPEC §14.1 #5 + §6.9). 2 test
+// cases remain. Rules-engine + matcher-engine evaluate tests moved to
+// internal/rbac/rbac_test.go (Task 3); evaluateEngine (compiledConfig-shaped
+// dispatcher) stays here (Task 5).
 // ----------------------------------------------------------------------------
 
-func TestPrinAny_True_Matches(t *testing.T) {
-	// Per SPEC §6.5 + ADR-0143: prinAny{val: true} matches any request.
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Any{Any: true}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(any=true): want success, got %v", err)
-	}
-	if !ev.evaluatePrincipal(&stubEvalContext{}) {
-		t.Error("prinAny{val:true}.evaluatePrincipal(empty ctx): want true; got false")
-	}
-
-	// PGV const=true mirror per §1.1 amendment 4 — defensive at Principal_Any
-	// (Permission_Any has the analogous PGV const=true; the Principal proto
-	// scrape at rbac.pb.go does NOT carry an analogous annotation on
-	// Principal.any, but envoy-go matches the Permission discipline for
-	// symmetry — the parse-time rejection on `any: false` lives at
-	// buildOnePrincipal).
-	pFalse := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Any{Any: false}}
-	_, errFalse := buildOnePrincipal(pFalse)
-	if errFalse == nil {
-		t.Error("buildOnePrincipal(any=false): want error (PGV const=true mirror), got nil")
-	}
-}
-
-func TestPrinDirectRemoteIP_CIDR_PeerSource(t *testing.T) {
-	// Per SPEC §6.5 + §11.P18: Principal_DirectRemoteIp wraps *corev3.CidrRange.
-	// CIDR-range match against the PEER connection source IP (no XFF
-	// resolution; that's prinRemoteIP).
-	cidr := &corev3.CidrRange{
-		AddressPrefix: "10.0.0.0",
-		PrefixLen:     &wrapperspb.UInt32Value{Value: 8},
-	}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_DirectRemoteIp{DirectRemoteIp: cidr}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(direct_remote_ip): want success, got %v", err)
-	}
-	cases := []struct {
-		ip   string
-		want bool
-	}{
-		{"10.0.0.1", true},
-		{"10.255.255.255", true},
-		{"192.168.1.1", false},
-		{"127.0.0.1", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.ip, func(t *testing.T) {
-			got := ev.evaluatePrincipal(&stubEvalContext{directRemoteIP: net.ParseIP(tc.ip)})
-			if got != tc.want {
-				t.Errorf("directRemoteIP %s: got %v; want %v", tc.ip, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestPrinRemoteIP_CIDR_XFFResolved(t *testing.T) {
-	// Per SPEC §6.5 + §11.P18: Principal_RemoteIp wraps *corev3.CidrRange.
-	// CIDR-range match against the XFF-RESOLVED remote IP.
-	//
-	// XFF resolver discipline: Task 5 declares the evalContext.RemoteIP()
-	// accessor; phase-16 MVP does NOT yet ship a callable XFF resolver
-	// primitive at the rbac level (the framework-side XFF resolution lives
-	// in phase-04/05 HCM internals + has not been surfaced to the filter
-	// callbacks layer at this commit). Task 7 wires the production *filter's
-	// RemoteIP() against whatever XFF accessor lands; at Task 5 the test
-	// uses the stub's pre-populated remoteIP field verbatim, demonstrating
-	// the CIDR match semantic over an XFF-resolved value.
-	cidr := &corev3.CidrRange{
-		AddressPrefix: "203.0.113.0",
-		PrefixLen:     &wrapperspb.UInt32Value{Value: 24},
-	}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_RemoteIp{RemoteIp: cidr}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(remote_ip): want success, got %v", err)
-	}
-	cases := []struct {
-		ip   string
-		want bool
-	}{
-		{"203.0.113.5", true},   // XFF-resolved client IP in 203.0.113.0/24
-		{"203.0.113.255", true}, // upper bound
-		{"203.0.114.0", false},  // adjacent /24, miss
-		{"10.0.0.1", false},     // unrelated peer addr
-	}
-	for _, tc := range cases {
-		t.Run(tc.ip, func(t *testing.T) {
-			// Note: directRemoteIP intentionally differs from remoteIP to
-			// confirm prinRemoteIP consumes the XFF-resolved value (RemoteIP)
-			// NOT the peer addr (DirectRemoteIP).
-			got := ev.evaluatePrincipal(&stubEvalContext{
-				directRemoteIP: net.ParseIP("10.0.0.1"),
-				remoteIP:       net.ParseIP(tc.ip),
-			})
-			if got != tc.want {
-				t.Errorf("remoteIP %s: got %v; want %v", tc.ip, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestPrinHeader_HeaderMatcher(t *testing.T) {
-	// Per SPEC §6.5: Principal_Header wraps *routev3.HeaderMatcher — SAME
-	// typing as Permission.Header per Task 4 spec reviewer note. Reuses the
-	// local matchHeader adapter from Task 4.
-	cases := []struct {
-		name       string
-		matcher    *routev3.HeaderMatcher
-		headers    map[string]string
-		wantResult bool
-	}{
-		{
-			name: "exact_match_hits",
-			matcher: &routev3.HeaderMatcher{
-				Name: "x-user",
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "admin"},
-					},
-				},
-			},
-			headers:    map[string]string{"x-user": "admin"},
-			wantResult: true,
-		},
-		{
-			name: "exact_match_misses",
-			matcher: &routev3.HeaderMatcher{
-				Name: "x-user",
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "admin"},
-					},
-				},
-			},
-			headers:    map[string]string{"x-user": "guest"},
-			wantResult: false,
-		},
-		{
-			name: "prefix_match_hits",
-			matcher: &routev3.HeaderMatcher{
-				Name: "x-tenant",
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: "acme-"},
-					},
-				},
-			},
-			headers:    map[string]string{"x-tenant": "acme-prod"},
-			wantResult: true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Header{Header: tc.matcher}}
-			ev, err := buildOnePrincipal(p)
-			if err != nil {
-				t.Fatalf("buildOnePrincipal(header): want success, got %v", err)
-			}
-			got := ev.evaluatePrincipal(&stubEvalContext{headers: tc.headers})
-			if got != tc.wantResult {
-				t.Errorf("evaluatePrincipal: got %v; want %v", got, tc.wantResult)
-			}
-		})
-	}
-}
-
-func TestPrinURLPath_PathMatcher(t *testing.T) {
-	// Per SPEC §6.5: Principal_UrlPath wraps *matcherv3.PathMatcher.
-	// Reuses the matchPath local adapter from Task 4.
-	pm := &matcherv3.PathMatcher{
-		Rule: &matcherv3.PathMatcher_Path{
-			Path: &matcherv3.StringMatcher{
-				MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: "/admin/"},
-			},
-		},
-	}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_UrlPath{UrlPath: pm}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(url_path): want success, got %v", err)
-	}
-	if !ev.evaluatePrincipal(&stubEvalContext{urlPath: "/admin/users"}) {
-		t.Error("prinURLPath prefix /admin/ against /admin/users: want true")
-	}
-	if ev.evaluatePrincipal(&stubEvalContext{urlPath: "/public/index"}) {
-		t.Error("prinURLPath prefix /admin/ against /public/index: want false")
-	}
-}
-
-func TestPrinAndIds_Recursive_AllMatch(t *testing.T) {
-	// Per SPEC §6.5: Principal_AndIds short-circuits to FALSE on first child
-	// returning FALSE.
-	inner := &rbacconfigv3.Principal_Set{Ids: []*rbacconfigv3.Principal{
-		{Identifier: &rbacconfigv3.Principal_Any{Any: true}},
-		{Identifier: &rbacconfigv3.Principal_DirectRemoteIp{DirectRemoteIp: &corev3.CidrRange{
-			AddressPrefix: "10.0.0.0",
-			PrefixLen:     &wrapperspb.UInt32Value{Value: 8},
-		}}},
-	}}
-	outer := &rbacconfigv3.Principal_Set{Ids: []*rbacconfigv3.Principal{
-		{Identifier: &rbacconfigv3.Principal_Any{Any: true}},
-		{Identifier: &rbacconfigv3.Principal_AndIds{AndIds: inner}},
-	}}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_AndIds{AndIds: outer}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(and 2-level): want success, got %v", err)
-	}
-	// All-match (any + IP-in-CIDR + any).
-	if !ev.evaluatePrincipal(&stubEvalContext{directRemoteIP: net.ParseIP("10.5.5.5")}) {
-		t.Error("AND(any, AND(any, CIDR-match)): want true")
-	}
-	// IP outside CIDR → AND fails on the deep CIDR child.
-	if ev.evaluatePrincipal(&stubEvalContext{directRemoteIP: net.ParseIP("192.168.1.1")}) {
-		t.Error("AND with CIDR-miss deep child: want false")
-	}
-}
-
-func TestPrinOrIds_Recursive_AnyMatch(t *testing.T) {
-	// Per SPEC §6.5: Principal_OrIds short-circuits to TRUE on first match.
-	inner := &rbacconfigv3.Principal_Set{Ids: []*rbacconfigv3.Principal{
-		{Identifier: &rbacconfigv3.Principal_DirectRemoteIp{DirectRemoteIp: &corev3.CidrRange{
-			AddressPrefix: "127.0.0.0",
-			PrefixLen:     &wrapperspb.UInt32Value{Value: 8},
-		}}},
-		{Identifier: &rbacconfigv3.Principal_Any{Any: true}}, // wins
-	}}
-	outer := &rbacconfigv3.Principal_Set{Ids: []*rbacconfigv3.Principal{
-		{Identifier: &rbacconfigv3.Principal_DirectRemoteIp{DirectRemoteIp: &corev3.CidrRange{
-			AddressPrefix: "8.8.8.8",
-			PrefixLen:     &wrapperspb.UInt32Value{Value: 32},
-		}}},
-		{Identifier: &rbacconfigv3.Principal_OrIds{OrIds: inner}},
-	}}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_OrIds{OrIds: outer}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(or 2-level): want success, got %v", err)
-	}
-	if !ev.evaluatePrincipal(&stubEvalContext{directRemoteIP: net.ParseIP("192.168.1.1")}) {
-		t.Error("OR with any:true inside: want true")
-	}
-
-	// All-false short-circuit: neither outer CIDR-A nor inner CIDR-B match;
-	// inner any:true was the only match path — flip it to a 127 CIDR-only.
-	inner.Ids = []*rbacconfigv3.Principal{
-		{Identifier: &rbacconfigv3.Principal_DirectRemoteIp{DirectRemoteIp: &corev3.CidrRange{
-			AddressPrefix: "127.0.0.0",
-			PrefixLen:     &wrapperspb.UInt32Value{Value: 8},
-		}}},
-	}
-	evMiss, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
-	if evMiss.evaluatePrincipal(&stubEvalContext{directRemoteIP: net.ParseIP("192.168.1.1")}) {
-		t.Error("OR with no matching child: want false")
-	}
-}
-
-func TestPrinNotId_Recursive_Negate(t *testing.T) {
-	// Per SPEC §6.5: Principal_NotId logically negates its child.
-	inner := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_DirectRemoteIp{DirectRemoteIp: &corev3.CidrRange{
-		AddressPrefix: "10.0.0.0",
-		PrefixLen:     &wrapperspb.UInt32Value{Value: 8},
-	}}}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_NotId{NotId: inner}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(not): want success, got %v", err)
-	}
-	if ev.evaluatePrincipal(&stubEvalContext{directRemoteIP: net.ParseIP("10.5.5.5")}) {
-		t.Error("NOT(CIDR 10/8) against 10.5.5.5: want false")
-	}
-	if !ev.evaluatePrincipal(&stubEvalContext{directRemoteIP: net.ParseIP("192.168.1.1")}) {
-		t.Error("NOT(CIDR 10/8) against 192.168.1.1: want true")
-	}
-}
-
-func TestPrinSourcedMetadata_RuntimeFalse(t *testing.T) {
-	// Per §2.5 + §8.10: Principal_SourcedMetadata is parse-supported (no error
-	// from buildOnePrincipal); evaluator ALWAYS returns FALSE at runtime (the
-	// dynamic-metadata subsystem is not yet wired in envoy-go MVP).
-	sm := &rbacconfigv3.SourcedMetadata{}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_SourcedMetadata{SourcedMetadata: sm}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(sourced_metadata): want success (parse-supported), got %v", err)
-	}
-	if ev.evaluatePrincipal(&stubEvalContext{}) {
-		t.Error("prinSourcedMetadata.evaluatePrincipal: want false (always-no-match MVP)")
-	}
-}
-
-func TestPrinFilterState_RuntimeFalse(t *testing.T) {
-	// Per §2.5 + §8.10: Principal_FilterState is parse-supported (no error);
-	// evaluator ALWAYS returns FALSE at runtime (filter-state subsystem not
-	// yet wired in envoy-go MVP).
-	fsm := &matcherv3.FilterStateMatcher{Key: "test"}
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_FilterState{FilterState: fsm}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal(filter_state): want success (parse-supported), got %v", err)
-	}
-	if ev.evaluatePrincipal(&stubEvalContext{}) {
-		t.Error("prinFilterState.evaluatePrincipal: want false (always-no-match MVP)")
-	}
-}
-
-func TestPrinAuthenticated_ThreeCaseAlgorithm(t *testing.T) {
-	// Per §1.1 amendment 12 + SPEC §6.6: three-case algorithm.
-	//
-	// Case (a): nameMatcher == nil + len(DownstreamPrincipal()) > 0 → TRUE
-	//           (match-any-authenticated-user).
-	// Case (b): non-nil StringMatcher iterates over DownstreamPrincipal()
-	//           candidates in priority order (URI SAN → DNS SAN → Subject DN
-	//           CN); TRUE on first match.
-	// Case (c): plaintext / no client cert → len(DownstreamPrincipal()) == 0
-	//           → FALSE (regardless of nameMatcher).
-
-	t.Run("case_a_nil_matcher_authenticated_user", func(t *testing.T) {
-		// principal_name unset; mTLS connection present (DownstreamPrincipal
-		// returns at least one candidate).
-		p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-			Authenticated: &rbacconfigv3.Principal_Authenticated{}, // PrincipalName: nil
-		}}
-		ev, err := buildOnePrincipal(p)
-		if err != nil {
-			t.Fatalf("buildOnePrincipal(authenticated nil-matcher): want success, got %v", err)
-		}
-		ctx := &stubEvalContext{
-			downstreamPrincipal: []string{"spiffe://example.com/admin", "admin.example.com"},
-		}
-		if !ev.evaluatePrincipal(ctx) {
-			t.Error("case (a) nil-matcher + len(DownstreamPrincipal)>0: want true")
-		}
-	})
-
-	t.Run("case_b_string_matcher_iteration", func(t *testing.T) {
-		// principal_name set to Exact("admin.example.com"); candidates =
-		// [URI SAN spiffe://..., DNS SAN admin.example.com, ...]. The DNS SAN
-		// (second candidate) matches.
-		p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-			Authenticated: &rbacconfigv3.Principal_Authenticated{
-				PrincipalName: &matcherv3.StringMatcher{
-					MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "admin.example.com"},
-				},
-			},
-		}}
-		ev, err := buildOnePrincipal(p)
-		if err != nil {
-			t.Fatalf("buildOnePrincipal(authenticated string-matcher): want success, got %v", err)
-		}
-		ctx := &stubEvalContext{
-			downstreamPrincipal: []string{
-				"spiffe://example.com/other", // URI SAN, doesn't match
-				"admin.example.com",          // DNS SAN, matches
-			},
-		}
-		if !ev.evaluatePrincipal(ctx) {
-			t.Error("case (b) StringMatcher iterates over candidates: want true (matches DNS SAN)")
-		}
-
-		// No candidate matches → FALSE.
-		ctxNoMatch := &stubEvalContext{
-			downstreamPrincipal: []string{
-				"spiffe://example.com/other",
-				"other.example.com",
-			},
-		}
-		if ev.evaluatePrincipal(ctxNoMatch) {
-			t.Error("case (b) StringMatcher with no matching candidate: want false")
-		}
-	})
-
-	t.Run("case_b_uri_san_priority_first", func(t *testing.T) {
-		// Verifies URI SAN (first candidate) is consulted first; a matching
-		// URI SAN returns TRUE even when DNS SAN would not match.
-		p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-			Authenticated: &rbacconfigv3.Principal_Authenticated{
-				PrincipalName: &matcherv3.StringMatcher{
-					MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "spiffe://example.com/admin"},
-				},
-			},
-		}}
-		ev, err := buildOnePrincipal(p)
-		if err != nil {
-			t.Fatalf("buildOnePrincipal: %v", err)
-		}
-		ctx := &stubEvalContext{
-			downstreamPrincipal: []string{
-				"spiffe://example.com/admin", // URI SAN (priority first)
-				"other.example.com",          // DNS SAN
-				"CN=Admin",                   // Subject DN CN
-			},
-		}
-		if !ev.evaluatePrincipal(ctx) {
-			t.Error("case (b) URI SAN priority first: want true")
-		}
-	})
-
-	t.Run("case_c_plaintext_empty_candidates", func(t *testing.T) {
-		// Plaintext / no client cert: DownstreamPrincipal returns nil. ALL
-		// Principal_Authenticated evaluations return FALSE (regardless of
-		// whether nameMatcher is set).
-
-		// (c1) nil-matcher + empty principals → FALSE
-		pNilMatcher := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-			Authenticated: &rbacconfigv3.Principal_Authenticated{},
-		}}
-		evNilMatcher, err := buildOnePrincipal(pNilMatcher)
-		if err != nil {
-			t.Fatalf("buildOnePrincipal: %v", err)
-		}
-		if evNilMatcher.evaluatePrincipal(&stubEvalContext{downstreamPrincipal: nil}) {
-			t.Error("case (c) nil-matcher + nil principals: want false")
-		}
-		if evNilMatcher.evaluatePrincipal(&stubEvalContext{downstreamPrincipal: []string{}}) {
-			t.Error("case (c) nil-matcher + empty principals: want false")
-		}
-
-		// (c2) non-nil matcher + empty principals → FALSE
-		pWithMatcher := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-			Authenticated: &rbacconfigv3.Principal_Authenticated{
-				PrincipalName: &matcherv3.StringMatcher{
-					MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "anything"},
-				},
-			},
-		}}
-		evWithMatcher, err := buildOnePrincipal(pWithMatcher)
-		if err != nil {
-			t.Fatalf("buildOnePrincipal: %v", err)
-		}
-		if evWithMatcher.evaluatePrincipal(&stubEvalContext{downstreamPrincipal: nil}) {
-			t.Error("case (c) StringMatcher + nil principals: want false")
-		}
-	})
-}
-
-func TestPrinSourceIp_PARSE_REJECT(t *testing.T) {
-	// Per §2.4 + §11.P12 + planner-time D4: Principal_SourceIp is deprecated
-	// upstream. envoy-go-only PARSE-REJECT with verbatim error wording.
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_SourceIp{}}
-	_, err := buildOnePrincipal(p)
-	if err == nil {
-		t.Fatal("buildOnePrincipal(source_ip): want error, got nil")
-	}
-	want := "rbac: principal.source_ip deprecated; use direct_remote_ip or remote_ip"
-	if err.Error() != want {
-		t.Errorf("got %q; want %q", err.Error(), want)
-	}
-}
-
-func TestPrinMetadata_PARSE_REJECT(t *testing.T) {
-	// Per §2.4 + §11.P12 + planner-time D4: Principal_Metadata is deprecated
-	// upstream. envoy-go-only PARSE-REJECT.
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Metadata{}}
-	_, err := buildOnePrincipal(p)
-	if err == nil {
-		t.Fatal("buildOnePrincipal(metadata): want error, got nil")
-	}
-	want := "rbac: principal.metadata deprecated; use sourced_metadata"
-	if err.Error() != want {
-		t.Errorf("got %q; want %q", err.Error(), want)
-	}
-}
-
-func TestPrinCustom_PARSE_REJECT(t *testing.T) {
-	// Per §1.1 amendment 7 + §8.11 NEW + planner-time D5: Principal_Custom is
-	// the 14th Principal variant discovered post-BRAINSTORM. The variant is
-	// a TypedExtensionConfig extension; envoy-go MVP PARSE-REJECTs with
-	// verbatim error wording.
-	//
-	// NOTE: envoy-go pins to go-control-plane v1.32.4 (per go.mod) which does
-	// NOT carry the `custom` field on Principal (the field landed in Envoy
-	// post-v1.32.x; visible in v1.37.2 per amendment 7 verbatim scrape at
-	// rbac.pb.go:1144 + 1112). The variant is structurally absent from the
-	// proto binding visible at this build. Approach (b) per BOOTSTRAP_PROMPT:
-	// SKIP this case at Task 5; the PARSE-REJECT disposition is encoded in
-	// buildOnePrincipal's `default:` arm + the `Principal_Custom` case is
-	// pre-staged (commented out) for activation when the module bumps to a
-	// version that exposes the variant. The verbatim error wording stays
-	// locked at this ADR-0143 §Decision (iv) row per amendment 7.
-	t.Skip("rbac: Principal_Custom field not present in go-control-plane v1.32.4 proto binding (amendment 7 finding lands at v1.37.2). PARSE-REJECT disposition is structurally encoded in buildOnePrincipal's default arm; the explicit Principal_Custom case + this test re-activates when the module bumps expose the variant. Verbatim error wording 'rbac: principal.custom extension types unsupported in this build' stays locked at ADR-0143 §Decision (iv).")
-}
-
-// ----------------------------------------------------------------------------
-// Group 7 — DownstreamPrincipal accessor framework-primitive consumption tests
-// (per SPEC §14.1 #7 + §3.1 + §11.P14 + §1.1 amendment 12 + ADR-0144).
-//
-// Group 7 exercises the prinAuthenticated three-case algorithm THROUGH the
-// stubEvalContext.DownstreamPrincipal() accessor seeded with the candidate
-// shapes the production ADR-0144 plumbing surfaces from a downstream
-// *tls.Conn's ConnectionState:
-//
-//   - plaintext / non-mTLS / no-client-cert → empty/nil slice → case (c) → FALSE.
-//   - URI SAN candidate first (priority order URI SAN → DNS SAN → Subject DN CN).
-//   - DNS SAN candidate second (matches when URI SAN doesn't match).
-//   - Subject DN CN candidate third (fallback when URI + DNS don't match).
-//   - Full priority ordering preserved across all three slots.
-//
-// Per BOOTSTRAP_PROMPT.md recommendation: extraction-helper-in-isolation —
-// the end-to-end mTLS path is fixture 0018 scenario 6 (Task 12-14). At Task 6
-// the unit tests cover the prinAuthenticated consumption via stubEvalContext
-// + the hcm-side extractTLSPrincipals helper unit-tests in
-// internal/filter/hcm/tls_test.go. The chain.go plumbing
-// (SetTLSPrincipals → decoderCB.DownstreamPrincipal()) is covered by the
-// chain_test.go probe-filter integration tests in internal/filter/http/.
-// ----------------------------------------------------------------------------
-
-func TestDownstreamPrincipal_PlaintextConnection_NilSlice(t *testing.T) {
-	// Per ADR-0144 §Consequences + ADR-0143 §Decision (vi) case (c):
-	// plaintext / non-mTLS / no-client-cert → DownstreamPrincipal() returns
-	// nil/empty → prinAuthenticated.evaluatePrincipal returns FALSE (regardless
-	// of whether nameMatcher is set).
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-		Authenticated: &rbacconfigv3.Principal_Authenticated{}, // nil principal_name
-	}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal: %v", err)
-	}
-	// nil downstreamPrincipal (zero-value stub) → case (c) → FALSE.
-	if ev.evaluatePrincipal(&stubEvalContext{downstreamPrincipal: nil}) {
-		t.Error("plaintext (nil DownstreamPrincipal): want false; got true")
-	}
-	// Empty slice (non-nil but len==0) is also case (c) → FALSE.
-	if ev.evaluatePrincipal(&stubEvalContext{downstreamPrincipal: []string{}}) {
-		t.Error("plaintext (empty DownstreamPrincipal): want false; got true")
-	}
-}
-
-func TestDownstreamPrincipal_mTLSConnection_URISANs_FirstPriority(t *testing.T) {
-	// Per ADR-0144 §Decision (iii) priority order URI SAN first; per §6.6
-	// case (b): a StringMatcher matching the URI SAN candidate (the first
-	// element of the candidate slice) returns TRUE before DNS SAN / Subject
-	// DN CN are consulted. The candidate slice mirrors the production
-	// extractTLSPrincipals output: URI SANs first, DNS SANs second, Subject
-	// DN CN third.
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-		Authenticated: &rbacconfigv3.Principal_Authenticated{
-			PrincipalName: &matcherv3.StringMatcher{
-				MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "spiffe://example.com/admin"},
-			},
-		},
-	}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal: %v", err)
-	}
-	ctx := &stubEvalContext{
-		downstreamPrincipal: []string{
-			"spiffe://example.com/admin", // URI SAN — first priority
-			"other.example.com",          // DNS SAN — second priority (would NOT match)
-			"CN=Other",                   // Subject DN CN — third priority (would NOT match)
-		},
-	}
-	if !ev.evaluatePrincipal(ctx) {
-		t.Error("URI SAN first-priority match: want true; got false")
-	}
-}
-
-func TestDownstreamPrincipal_mTLSConnection_DNSSANs_SecondPriority(t *testing.T) {
-	// Per ADR-0144 §Decision (iii) priority order DNS SAN second; matches
-	// only when URI SAN does NOT match the StringMatcher.
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-		Authenticated: &rbacconfigv3.Principal_Authenticated{
-			PrincipalName: &matcherv3.StringMatcher{
-				MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "admin.example.com"},
-			},
-		},
-	}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal: %v", err)
-	}
-	ctx := &stubEvalContext{
-		downstreamPrincipal: []string{
-			"spiffe://example.com/other", // URI SAN — does NOT match
-			"admin.example.com",          // DNS SAN — matches (second priority)
-			"CN=Other",                   // Subject DN CN — third priority (would NOT match)
-		},
-	}
-	if !ev.evaluatePrincipal(ctx) {
-		t.Error("DNS SAN second-priority match: want true; got false")
-	}
-}
-
-func TestDownstreamPrincipal_mTLSConnection_SubjectDNCommonName_ThirdPriority(t *testing.T) {
-	// Per ADR-0144 §Decision (iii) priority order Subject DN CN third;
-	// matches only when neither URI SAN nor DNS SAN match the StringMatcher.
-	// The production extractTLSPrincipals helper extracts only the Common
-	// Name string from the Subject DN (per D11 canonical 3 cert fields; Issuer
-	// DN + Serial + fingerprints DEFERRED to future TLS-context-extension phase).
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-		Authenticated: &rbacconfigv3.Principal_Authenticated{
-			PrincipalName: &matcherv3.StringMatcher{
-				MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "client.example.com"},
-			},
-		},
-	}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal: %v", err)
-	}
-	ctx := &stubEvalContext{
-		downstreamPrincipal: []string{
-			"spiffe://example.com/other", // URI SAN — does NOT match
-			"other.example.com",          // DNS SAN — does NOT match
-			"client.example.com",         // Subject DN CN — matches (third priority)
-		},
-	}
-	if !ev.evaluatePrincipal(ctx) {
-		t.Error("Subject DN CN third-priority match: want true; got false")
-	}
-}
-
-func TestDownstreamPrincipal_OrderingPreserved(t *testing.T) {
-	// Per ADR-0144 §Decision (iii): the priority order URI SAN → DNS SAN →
-	// Subject DN CN must be preserved end-to-end. This test exercises the
-	// EARLIEST-candidate-wins property of prinAuthenticated case (b)
-	// iteration: when a StringMatcher would match MULTIPLE candidates in the
-	// slice, the HIGHEST-PRIORITY (earliest) candidate wins. With a Prefix
-	// matcher whose pattern matches multiple candidates, the iteration
-	// returns TRUE on the first match — but the test confirms the slice
-	// itself carries the priority order URI SAN first.
-	//
-	// Mirrors the production extractTLSPrincipals output for a cert carrying
-	// all three fields: [URI SAN, DNS SAN, Subject DN CN] verbatim.
-	full := []string{
-		"spiffe://example.com/admin", // URI SAN — first
-		"admin.example.com",          // DNS SAN — second
-		"client.example.com",         // Subject DN CN — third
-	}
-	// Prefix matcher matches all three (each candidate contains a substring
-	// of the pattern's domain root).
-	p := &rbacconfigv3.Principal{Identifier: &rbacconfigv3.Principal_Authenticated_{
-		Authenticated: &rbacconfigv3.Principal_Authenticated{
-			PrincipalName: &matcherv3.StringMatcher{
-				MatchPattern: &matcherv3.StringMatcher_Prefix{Prefix: "spiffe://"},
-			},
-		},
-	}}
-	ev, err := buildOnePrincipal(p)
-	if err != nil {
-		t.Fatalf("buildOnePrincipal: %v", err)
-	}
-	// URI SAN first → Prefix "spiffe://" matches it first → TRUE.
-	if !ev.evaluatePrincipal(&stubEvalContext{downstreamPrincipal: full}) {
-		t.Error("URI SAN earliest candidate matches Prefix \"spiffe://\": want true; got false")
-	}
-
-	// Confirm slot-by-slot ordering: a permuted slice where Subject DN CN
-	// is in position 0 (NOT mirroring the production extractor's priority)
-	// would NOT match the URI SAN-targeted matcher. This pins the ordering
-	// invariant: the priority order is the SLICE ORDER (caller's
-	// responsibility to seed in priority order — chain.SetTLSPrincipals
-	// trusts the caller's ordering).
-	permuted := []string{
-		"client.example.com",         // out-of-order Subject DN CN
-		"admin.example.com",          // out-of-order DNS SAN
-		"spiffe://example.com/admin", // out-of-order URI SAN
-	}
-	// Prefix "spiffe://" still matches via case-b iteration (TRUE on first
-	// candidate that satisfies the matcher); the iteration finds the URI
-	// SAN at slot index 2, NOT slot index 0. The accessor returns the slice
-	// in the order seeded by HCM dispatch; the iteration honors that order.
-	if !ev.evaluatePrincipal(&stubEvalContext{downstreamPrincipal: permuted}) {
-		t.Error("Prefix matcher finds URI SAN in permuted slice via iteration: want true; got false")
-	}
-}
-
-// ----------------------------------------------------------------------------
-// Group 5 — Dual-engine dispatch (per SPEC §14.1 #5 + §6.9). 12 test cases.
-//
-// Exercises evaluateRulesEngine + evaluateMatcherEngine + evaluateEngine
-// dispatcher per SPEC §6.9 + ADR-0141 dual-engine semantics + ADR-0142
-// matcher-engine integration.
-// ----------------------------------------------------------------------------
-
-// rbacActionAnyForTest packages a canonical RBAC Action proto into *anypb.Any.
-// Mirrors the matcher_test.go helper of the same role; duplicated here to keep
-// rbac_test.go self-contained (Group 5/8 needs canonical-Action-terminal Any
-// values to seed matcher trees).
-func rbacActionAnyForTest(t *testing.T, name string, act rbacconfigv3.RBAC_Action) *anypb.Any {
+// headerEqRulesEngine builds a *rbacengine.CompiledRulesEngine with the given
+// action + one policy whose single permission is header(name == value) and
+// single principal is any. Built via the shared engine's public
+// BuildRulesEngine constructor (the engine struct fields are unexported after
+// the phase-26.3 move) with ProfileHTTP. Used by the evaluateEngine dispatcher
+// tests (the dispatcher itself stays consumer-side).
+func headerEqRulesEngine(t *testing.T, action rbacconfigv3.RBAC_Action, policyName, headerName, headerValue string) *rbacengine.CompiledRulesEngine {
 	t.Helper()
-	return mustAny(t, &rbacconfigv3.Action{Name: name, Action: act})
-}
-
-// headerInputTECForTest builds a TypedExtensionConfig wrapping
-// HttpRequestHeaderMatchInput{HeaderName: name}. Used as SinglePredicate.Input
-// on matcher tree FieldMatcher entries.
-func headerInputTECForTest(t *testing.T, headerName string) *xdscorev3.TypedExtensionConfig {
-	t.Helper()
-	return &xdscorev3.TypedExtensionConfig{
-		Name:        "header-input-" + headerName,
-		TypedConfig: mustAny(t, &matcherv3.HttpRequestHeaderMatchInput{HeaderName: headerName}),
-	}
-}
-
-// fieldMatcherHeaderExactForTest returns a FieldMatcher with a SinglePredicate
-// of (header == exact-value) + supplied on_match leaf. Mirrors matcher_test.go.
-func fieldMatcherHeaderExactForTest(t *testing.T, headerName, exact string, onMatch *xdsmatcherv3.Matcher_OnMatch) *xdsmatcherv3.Matcher_MatcherList_FieldMatcher {
-	t.Helper()
-	return &xdsmatcherv3.Matcher_MatcherList_FieldMatcher{
-		Predicate: &xdsmatcherv3.Matcher_MatcherList_Predicate{
-			MatchType: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_{
-				SinglePredicate: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate{
-					Input: headerInputTECForTest(t, headerName),
-					Matcher: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_ValueMatch{
-						ValueMatch: &xdsmatcherv3.StringMatcher{
-							MatchPattern: &xdsmatcherv3.StringMatcher_Exact{Exact: exact},
+	re, err := rbacengine.BuildRulesEngine(&rbacconfigv3.RBAC{
+		Action: action,
+		Policies: map[string]*rbacconfigv3.Policy{
+			policyName: {
+				Permissions: []*rbacconfigv3.Permission{{
+					Rule: &rbacconfigv3.Permission_Header{
+						Header: &routev3.HeaderMatcher{
+							Name: headerName,
+							HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
+								StringMatch: &matcherv3.StringMatcher{
+									MatchPattern: &matcherv3.StringMatcher_Exact{Exact: headerValue},
+								},
+							},
 						},
 					},
+				}},
+				Principals: []*rbacconfigv3.Principal{
+					{Identifier: &rbacconfigv3.Principal_Any{Any: true}},
 				},
 			},
 		},
-		OnMatch: onMatch,
-	}
-}
-
-// onMatchActionForTest wraps an *anypb.Any in the OnMatch.Action shape.
-func onMatchActionForTest(t *testing.T, a *anypb.Any) *xdsmatcherv3.Matcher_OnMatch {
-	t.Helper()
-	return &xdsmatcherv3.Matcher_OnMatch{
-		OnMatch: &xdsmatcherv3.Matcher_OnMatch_Action{
-			Action: &xdscorev3.TypedExtensionConfig{Name: "action", TypedConfig: a},
-		},
-	}
-}
-
-// singleHeaderMatcherTreeAllow returns a one-FieldMatcher matcher tree:
-// (header X-User == "alice") → terminal Action{name:"p1", action:ALLOW}.
-func singleHeaderMatcherTreeAllow(t *testing.T) *xdsmatcherv3.Matcher {
-	t.Helper()
-	return &xdsmatcherv3.Matcher{
-		MatcherType: &xdsmatcherv3.Matcher_MatcherList_{
-			MatcherList: &xdsmatcherv3.Matcher_MatcherList{
-				Matchers: []*xdsmatcherv3.Matcher_MatcherList_FieldMatcher{
-					fieldMatcherHeaderExactForTest(t, "x-user", "alice",
-						onMatchActionForTest(t, rbacActionAnyForTest(t, "p1", rbacconfigv3.RBAC_ALLOW))),
-				},
-			},
-		},
-	}
-}
-
-// headerEqPolicies returns a slice of compiledPolicy with one policy whose
-// single permission is header(name == value) and single principal is any.
-// Used by Group 5 rules-engine match/no-match tests.
-func headerEqPolicies(t *testing.T, policyName, headerName, headerValue string) []*compiledPolicy {
-	t.Helper()
-	perms, err := buildPermissionEvaluators([]*rbacconfigv3.Permission{{
-		Rule: &rbacconfigv3.Permission_Header{
-			Header: &routev3.HeaderMatcher{
-				Name: headerName,
-				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
-					StringMatch: &matcherv3.StringMatcher{
-						MatchPattern: &matcherv3.StringMatcher_Exact{Exact: headerValue},
-					},
-				},
-			},
-		},
-	}})
+	}, rbacengine.ProfileHTTP)
 	if err != nil {
-		t.Fatalf("buildPermissionEvaluators: %v", err)
+		t.Fatalf("rbacengine.BuildRulesEngine: %v", err)
 	}
-	prins, err := buildPrincipalEvaluators([]*rbacconfigv3.Principal{
-		{Identifier: &rbacconfigv3.Principal_Any{Any: true}},
-	})
-	if err != nil {
-		t.Fatalf("buildPrincipalEvaluators: %v", err)
-	}
-	return []*compiledPolicy{{name: policyName, permissions: perms, principals: prins}}
-}
-
-func TestEvaluateRulesEngine_AllowMatch_Allowed(t *testing.T) {
-	// Per SPEC §6.9: ALLOW + match → engineResultAllowed + matchedPolicyName.
-	re := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_ALLOW,
-		policies: headerEqPolicies(t, "p_admin", "x-user", "admin"),
-	}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "admin"}}
-	result, name := evaluateRulesEngine(re, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("result: got %v, want engineResultAllowed", result)
-	}
-	if name != "p_admin" {
-		t.Errorf("name: got %q, want %q", name, "p_admin")
-	}
-}
-
-func TestEvaluateRulesEngine_AllowNoMatch_Denied(t *testing.T) {
-	// Per SPEC §6.9: ALLOW + no-match → engineResultDenied + "".
-	re := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_ALLOW,
-		policies: headerEqPolicies(t, "p_admin", "x-user", "admin"),
-	}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "guest"}}
-	result, name := evaluateRulesEngine(re, ctx)
-	if result != engineResultDenied {
-		t.Errorf("result: got %v, want engineResultDenied", result)
-	}
-	if name != "" {
-		t.Errorf("name: got %q, want \"\"", name)
-	}
-}
-
-func TestEvaluateRulesEngine_DenyMatch_Denied(t *testing.T) {
-	// Per SPEC §6.9: DENY + match → engineResultDenied + matchedPolicyName.
-	re := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_DENY,
-		policies: headerEqPolicies(t, "p_block", "x-user", "evil"),
-	}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "evil"}}
-	result, name := evaluateRulesEngine(re, ctx)
-	if result != engineResultDenied {
-		t.Errorf("result: got %v, want engineResultDenied", result)
-	}
-	if name != "p_block" {
-		t.Errorf("name: got %q, want %q", name, "p_block")
-	}
-}
-
-func TestEvaluateRulesEngine_DenyNoMatch_Allowed(t *testing.T) {
-	// Per SPEC §6.9: DENY + no-match → engineResultAllowed + "".
-	re := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_DENY,
-		policies: headerEqPolicies(t, "p_block", "x-user", "evil"),
-	}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "alice"}}
-	result, name := evaluateRulesEngine(re, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("result: got %v, want engineResultAllowed", result)
-	}
-	if name != "" {
-		t.Errorf("name: got %q, want \"\"", name)
-	}
-}
-
-func TestEvaluateRulesEngine_LogMatch_AllowedWithPolicyName(t *testing.T) {
-	// Per §1.1 amendment 5 + SPEC §6.9: LOG + match → engineResultAllowed
-	// + matchedPolicyName captured for per-policy counter emission.
-	re := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_LOG,
-		policies: headerEqPolicies(t, "p_log", "x-user", "admin"),
-	}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "admin"}}
-	result, name := evaluateRulesEngine(re, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("result: got %v, want engineResultAllowed (LOG always-allow)", result)
-	}
-	if name != "p_log" {
-		t.Errorf("name: got %q, want %q (matched-policy captured for per-policy emission)", name, "p_log")
-	}
-}
-
-func TestEvaluateRulesEngine_LogNoMatch_Allowed(t *testing.T) {
-	// Per §1.1 amendment 5: LOG always-allows regardless of match disposition.
-	re := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_LOG,
-		policies: headerEqPolicies(t, "p_log", "x-user", "admin"),
-	}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "guest"}}
-	result, name := evaluateRulesEngine(re, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("result: got %v, want engineResultAllowed (LOG always-allows)", result)
-	}
-	if name != "" {
-		t.Errorf("name: got %q, want \"\" (no policy matched on LOG no-match)", name)
-	}
-}
-
-func TestEvaluateRulesEngine_LexicographicOrderShortCircuit(t *testing.T) {
-	// Per SPEC §6.9 + rbac.pb.go:268-269: policies walk in lexicographic order;
-	// first match wins. Set up two policies; both could match; verify the
-	// lexicographic-first one wins.
-	policies := append(
-		headerEqPolicies(t, "p_alpha", "x-user", "admin"),
-		headerEqPolicies(t, "p_beta", "x-user", "admin")...,
-	)
-	re := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_ALLOW,
-		policies: policies, // already in lexicographic order: p_alpha < p_beta
-	}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "admin"}}
-	_, name := evaluateRulesEngine(re, ctx)
-	if name != "p_alpha" {
-		t.Errorf("name: got %q, want %q (lexicographic first-match wins)", name, "p_alpha")
-	}
-}
-
-func TestEvaluateMatcherEngine_CanonicalActionTerminal_Honored(t *testing.T) {
-	// Per ADR-0142 + SPEC §6.9: matcher-engine returns the canonical RBAC
-	// Action terminal Any; evaluateMatcherEngine unmarshals + maps to engine
-	// result. ALLOW → engineResultAllowed; matchedName = action.GetName().
-	tree, err := matcherNewForTest(t, singleHeaderMatcherTreeAllow(t))
-	if err != nil {
-		t.Fatalf("matcher.New: %v", err)
-	}
-	me := &compiledMatcherEngine{tree: tree}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "alice"}}
-	result, name := evaluateMatcherEngine(me, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("result: got %v, want engineResultAllowed", result)
-	}
-	if name != "p1" {
-		t.Errorf("name: got %q, want %q", name, "p1")
-	}
-}
-
-func TestEvaluateMatcherEngine_NoMatch_Denied(t *testing.T) {
-	// Per rbac.pb.go:43-46 + SPEC §6.9: matcher-engine no-match → caller
-	// interprets as DENY. evaluateMatcherEngine returns (engineResultDenied, "").
-	tree, err := matcherNewForTest(t, singleHeaderMatcherTreeAllow(t))
-	if err != nil {
-		t.Fatalf("matcher.New: %v", err)
-	}
-	me := &compiledMatcherEngine{tree: tree}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "bob"}}
-	result, name := evaluateMatcherEngine(me, ctx)
-	if result != engineResultDenied {
-		t.Errorf("result: got %v, want engineResultDenied (no-match)", result)
-	}
-	if name != "" {
-		t.Errorf("name: got %q, want \"\"", name)
-	}
-}
-
-func TestEvaluateMatcherEngine_UnknownTerminalTypeURL_ParseRejected(t *testing.T) {
-	// Per ADR-0142 + §2.6: non-canonical terminal Any.TypeUrl PARSE-REJECTS at
-	// buildCompiledMatcherEngine; the inner error from internal/matcher is
-	// wrapped with the "rbac: matcher:" prefix per the rbac.go contract.
-	bogus := mustAny(t, &matcherv3.StringMatcher{
-		MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "x"},
-	})
-	tree := &xdsmatcherv3.Matcher{
-		MatcherType: &xdsmatcherv3.Matcher_MatcherList_{
-			MatcherList: &xdsmatcherv3.Matcher_MatcherList{
-				Matchers: []*xdsmatcherv3.Matcher_MatcherList_FieldMatcher{
-					fieldMatcherHeaderExactForTest(t, "x-user", "alice",
-						onMatchActionForTest(t, bogus)),
-				},
-			},
-		},
-	}
-	_, err := buildCompiledMatcherEngine(tree)
-	if err == nil {
-		t.Fatal("buildCompiledMatcherEngine: want PARSE-REJECT on non-canonical terminal, got nil")
-	}
-	// Must carry the rbac wrap-prefix.
-	if !strings.HasPrefix(err.Error(), "rbac: matcher:") {
-		t.Errorf("error wording want prefix 'rbac: matcher:', got %q", err.Error())
-	}
-	// Must surface the inner matcher-engine wording.
-	if !strings.Contains(err.Error(), "terminal action type") {
-		t.Errorf("error wording want substring 'terminal action type', got %q", err.Error())
-	}
+	return re
 }
 
 func TestEvaluateEngine_BothPrimaryAndShadowConfigured_PrimaryDispositionWinsShadowEmitsCounter(t *testing.T) {
@@ -2079,26 +519,20 @@ func TestEvaluateEngine_BothPrimaryAndShadowConfigured_PrimaryDispositionWinsSha
 	// configured, the primary disposition wins. The shadow walks but does NOT
 	// affect the dispatch outcome. evaluateEngine(shadow=true) returns the
 	// shadow's own result for counter emission purposes.
-	primary := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_ALLOW,
-		policies: headerEqPolicies(t, "p_admin", "x-user", "admin"),
-	}
-	shadow := &compiledRulesEngine{
-		action:   rbacconfigv3.RBAC_DENY,
-		policies: headerEqPolicies(t, "p_admin", "x-user", "admin"),
-	}
+	primary := headerEqRulesEngine(t, rbacconfigv3.RBAC_ALLOW, "p_admin", "x-user", "admin")
+	shadow := headerEqRulesEngine(t, rbacconfigv3.RBAC_DENY, "p_admin", "x-user", "admin")
 	cc := &compiledConfig{rules: primary, shadowRules: shadow}
 	ctx := &stubEvalContext{headers: map[string]string{"x-user": "admin"}}
 	primaryResult, primaryName := evaluateEngine(cc, ctx, false /*shadow*/)
 	shadowResult, shadowName := evaluateEngine(cc, ctx, true /*shadow*/)
-	if primaryResult != engineResultAllowed {
-		t.Errorf("primary: got %v, want engineResultAllowed (ALLOW + match)", primaryResult)
+	if primaryResult != rbacengine.Allowed {
+		t.Errorf("primary: got %v, want rbacengine.Allowed (ALLOW + match)", primaryResult)
 	}
 	if primaryName != "p_admin" {
 		t.Errorf("primary name: got %q, want %q", primaryName, "p_admin")
 	}
-	if shadowResult != engineResultDenied {
-		t.Errorf("shadow: got %v, want engineResultDenied (DENY + match — independent of primary)", shadowResult)
+	if shadowResult != rbacengine.Denied {
+		t.Errorf("shadow: got %v, want rbacengine.Denied (DENY + match — independent of primary)", shadowResult)
 	}
 	if shadowName != "p_admin" {
 		t.Errorf("shadow name: got %q, want %q", shadowName, "p_admin")
@@ -2109,21 +543,21 @@ func TestEvaluateEngine_BothEnginesUnset_DefensiveAllowed(t *testing.T) {
 	// Per SPEC §6.9: defensive ALLOWED when both engines (rules + matcher) are
 	// nil. The DecodeHeaders body's "both engines unset" fast-path triggers
 	// passthrough BEFORE evaluateEngine is called in production; but the
-	// evaluateEngine helper itself returns engineResultAllowed defensively if
+	// evaluateEngine helper itself returns rbacengine.Allowed defensively if
 	// called with neither set (e.g., shadow=true when no shadow configured).
 	cc := &compiledConfig{}
 	ctx := &stubEvalContext{}
 	result, name := evaluateEngine(cc, ctx, false /*shadow*/)
-	if result != engineResultAllowed {
-		t.Errorf("result: got %v, want engineResultAllowed (defensive)", result)
+	if result != rbacengine.Allowed {
+		t.Errorf("result: got %v, want rbacengine.Allowed (defensive)", result)
 	}
 	if name != "" {
 		t.Errorf("name: got %q, want \"\"", name)
 	}
 	// Shadow path with no shadow configured — same defensive ALLOWED.
 	result, name = evaluateEngine(cc, ctx, true /*shadow*/)
-	if result != engineResultAllowed {
-		t.Errorf("shadow result: got %v, want engineResultAllowed (defensive)", result)
+	if result != rbacengine.Allowed {
+		t.Errorf("shadow result: got %v, want rbacengine.Allowed (defensive)", result)
 	}
 	if name != "" {
 		t.Errorf("shadow name: got %q, want \"\"", name)
@@ -2514,319 +948,8 @@ func TestDecodeHeaders_BothEnginesUnset_PassthroughNoCounters(t *testing.T) {
 	}
 }
 
-// ----------------------------------------------------------------------------
-// Group 8 — Matcher-engine framework primitive integration (per SPEC §14.1 #8
-// + ADR-0142). 9 test cases exercising the rbac↔matcher boundary through
-// buildCompiledMatcherEngine + matcherCtxAdapter.
-//
-// The matcher_test.go file (Task 3) covers the matcher-engine package's
-// surface in isolation; rbac_test.go's Group 8 verifies the rbac-side
-// integration of the framework primitive (canonical-acceptance + reject of
-// non-canonical terminals + adapter delegation).
-// ----------------------------------------------------------------------------
-
-// matcherNewForTest is a thin shim that exercises buildCompiledMatcherEngine
-// for Group 5 helper setup. Returns the underlying tree for direct evaluator
-// invocation paths.
-func matcherNewForTest(t *testing.T, m *xdsmatcherv3.Matcher) (*matcher.Matcher, error) {
-	t.Helper()
-	cme, err := buildCompiledMatcherEngine(m)
-	if err != nil {
-		return nil, err
-	}
-	return cme.tree, nil
-}
-
-func TestMatcherNew_CanonicalRBACActionTerminal_Accepted(t *testing.T) {
-	// Per ADR-0142 + SPEC §11.P3: buildCompiledMatcherEngine accepts trees
-	// whose terminal Any.TypeUrl == canonical RBAC Action TypeURL.
-	tree := singleHeaderMatcherTreeAllow(t)
-	cme, err := buildCompiledMatcherEngine(tree)
-	if err != nil {
-		t.Fatalf("buildCompiledMatcherEngine: want success on canonical Action terminal; got %v", err)
-	}
-	if cme == nil || cme.tree == nil {
-		t.Fatal("buildCompiledMatcherEngine: want non-nil *compiledMatcherEngine + tree")
-	}
-}
-
-func TestMatcherNew_UnknownTypeURL_PARSE_REJECT(t *testing.T) {
-	// Per ADR-0142 + §2.6: non-canonical terminal Any.TypeUrl PARSE-REJECTs at
-	// buildCompiledMatcherEngine with the "rbac: matcher:" wrap-prefix.
-	bogus := mustAny(t, &matcherv3.StringMatcher{
-		MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "x"},
-	})
-	tree := &xdsmatcherv3.Matcher{
-		MatcherType: &xdsmatcherv3.Matcher_MatcherList_{
-			MatcherList: &xdsmatcherv3.Matcher_MatcherList{
-				Matchers: []*xdsmatcherv3.Matcher_MatcherList_FieldMatcher{
-					fieldMatcherHeaderExactForTest(t, "x-user", "alice",
-						onMatchActionForTest(t, bogus)),
-				},
-			},
-		},
-	}
-	_, err := buildCompiledMatcherEngine(tree)
-	if err == nil {
-		t.Fatal("buildCompiledMatcherEngine: want PARSE-REJECT on non-canonical terminal, got nil")
-	}
-	if !strings.HasPrefix(err.Error(), "rbac: matcher:") {
-		t.Errorf("error wording want prefix 'rbac: matcher:', got %q", err.Error())
-	}
-}
-
-func TestMatcherEvaluate_FirstMatchingPredicate_ReturnsTerminalAny(t *testing.T) {
-	// Per ADR-0142 + SPEC §6.9: the matcher tree walker returns the matched
-	// terminal Any on first-predicate match; the rbac-side evaluator unmarshals
-	// it as rbacconfigv3.Action and maps to engineResult.
-	tree, err := matcherNewForTest(t, singleHeaderMatcherTreeAllow(t))
-	if err != nil {
-		t.Fatalf("matcherNewForTest: %v", err)
-	}
-	me := &compiledMatcherEngine{tree: tree}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "alice"}}
-	result, name := evaluateMatcherEngine(me, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("result: got %v, want engineResultAllowed", result)
-	}
-	if name != "p1" {
-		t.Errorf("name: got %q, want %q", name, "p1")
-	}
-}
-
-func TestMatcherEvaluate_NoMatchingPredicate_ReturnsNilNil(t *testing.T) {
-	// Per rbac.pb.go:43-46: no-match → matcher.Evaluate returns (nil, nil);
-	// the rbac-side evaluator maps nil-result to engineResultDenied.
-	tree, err := matcherNewForTest(t, singleHeaderMatcherTreeAllow(t))
-	if err != nil {
-		t.Fatalf("matcherNewForTest: %v", err)
-	}
-	me := &compiledMatcherEngine{tree: tree}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "bob"}}
-	result, _ := evaluateMatcherEngine(me, ctx)
-	if result != engineResultDenied {
-		t.Errorf("result: got %v, want engineResultDenied (no-match)", result)
-	}
-}
-
-func TestMatcherEvaluate_HeaderPredicate_Match(t *testing.T) {
-	// Per ADR-0142 §Decision (iii): the matcher's headerPredicate matches via
-	// the rbac-side matcherCtxAdapter.Header() routing through *filter's
-	// evalContext.Header().
-	tree, err := matcherNewForTest(t, singleHeaderMatcherTreeAllow(t))
-	if err != nil {
-		t.Fatalf("matcherNewForTest: %v", err)
-	}
-	me := &compiledMatcherEngine{tree: tree}
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "alice"}}
-	result, _ := evaluateMatcherEngine(me, ctx)
-	if result != engineResultAllowed {
-		t.Error("header-predicate match (X-User=alice): want engineResultAllowed")
-	}
-}
-
-func TestMatcherEvaluate_PathPredicate_Match(t *testing.T) {
-	// Per ADR-0142 + matcher_test.go: the matcher's predicate input may be
-	// :path (the H2 pseudo-header); the rbac-side matcherCtxAdapter routes
-	// Header(":path") through the *filter's evalContext (which surfaces
-	// :path via the headers map at DecodeHeaders body construction time).
-	tree := &xdsmatcherv3.Matcher{
-		MatcherType: &xdsmatcherv3.Matcher_MatcherList_{
-			MatcherList: &xdsmatcherv3.Matcher_MatcherList{
-				Matchers: []*xdsmatcherv3.Matcher_MatcherList_FieldMatcher{
-					{
-						Predicate: &xdsmatcherv3.Matcher_MatcherList_Predicate{
-							MatchType: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_{
-								SinglePredicate: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate{
-									Input: headerInputTECForTest(t, ":path"),
-									Matcher: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_ValueMatch{
-										ValueMatch: &xdsmatcherv3.StringMatcher{
-											MatchPattern: &xdsmatcherv3.StringMatcher_Prefix{Prefix: "/public"},
-										},
-									},
-								},
-							},
-						},
-						OnMatch: onMatchActionForTest(t, rbacActionAnyForTest(t, "p_public", rbacconfigv3.RBAC_ALLOW)),
-					},
-				},
-			},
-		},
-	}
-	cme, err := buildCompiledMatcherEngine(tree)
-	if err != nil {
-		t.Fatalf("buildCompiledMatcherEngine: %v", err)
-	}
-	ctx := &stubEvalContext{
-		headers: map[string]string{":path": "/public/x"},
-		urlPath: "/public/x",
-	}
-	result, name := evaluateMatcherEngine(cme, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("path-predicate match (/public/x): want engineResultAllowed, got %v", result)
-	}
-	if name != "p_public" {
-		t.Errorf("name: got %q, want %q", name, "p_public")
-	}
-}
-
-func TestMatcherEvaluate_AndPredicate_AllMatch(t *testing.T) {
-	// Per ADR-0142: AndPredicate matches when ALL child predicates match.
-	// Compose (X-User=alice) AND (X-Tenant=acme).
-	headerExact := func(name, val string) *xdsmatcherv3.Matcher_MatcherList_Predicate {
-		return &xdsmatcherv3.Matcher_MatcherList_Predicate{
-			MatchType: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_{
-				SinglePredicate: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate{
-					Input: headerInputTECForTest(t, name),
-					Matcher: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_ValueMatch{
-						ValueMatch: &xdsmatcherv3.StringMatcher{
-							MatchPattern: &xdsmatcherv3.StringMatcher_Exact{Exact: val},
-						},
-					},
-				},
-			},
-		}
-	}
-	andPred := &xdsmatcherv3.Matcher_MatcherList_Predicate{
-		MatchType: &xdsmatcherv3.Matcher_MatcherList_Predicate_AndMatcher{
-			AndMatcher: &xdsmatcherv3.Matcher_MatcherList_Predicate_PredicateList{
-				Predicate: []*xdsmatcherv3.Matcher_MatcherList_Predicate{
-					headerExact("x-user", "alice"),
-					headerExact("x-tenant", "acme"),
-				},
-			},
-		},
-	}
-	tree := &xdsmatcherv3.Matcher{
-		MatcherType: &xdsmatcherv3.Matcher_MatcherList_{
-			MatcherList: &xdsmatcherv3.Matcher_MatcherList{
-				Matchers: []*xdsmatcherv3.Matcher_MatcherList_FieldMatcher{{
-					Predicate: andPred,
-					OnMatch:   onMatchActionForTest(t, rbacActionAnyForTest(t, "p_and", rbacconfigv3.RBAC_ALLOW)),
-				}},
-			},
-		},
-	}
-	cme, err := buildCompiledMatcherEngine(tree)
-	if err != nil {
-		t.Fatalf("buildCompiledMatcherEngine: %v", err)
-	}
-	// Both headers present + match → ALLOW.
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "alice", "x-tenant": "acme"}}
-	result, _ := evaluateMatcherEngine(cme, ctx)
-	if result != engineResultAllowed {
-		t.Errorf("AND-match: got %v, want engineResultAllowed", result)
-	}
-	// Only one header matches → no-match → DENY.
-	ctx = &stubEvalContext{headers: map[string]string{"x-user": "alice", "x-tenant": "other"}}
-	result, _ = evaluateMatcherEngine(cme, ctx)
-	if result != engineResultDenied {
-		t.Errorf("AND-partial-match: got %v, want engineResultDenied", result)
-	}
-}
-
-func TestMatcherEvaluate_OrPredicate_AnyMatch(t *testing.T) {
-	// Per ADR-0142: OrPredicate matches when ANY child predicate matches.
-	headerExact := func(name, val string) *xdsmatcherv3.Matcher_MatcherList_Predicate {
-		return &xdsmatcherv3.Matcher_MatcherList_Predicate{
-			MatchType: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_{
-				SinglePredicate: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate{
-					Input: headerInputTECForTest(t, name),
-					Matcher: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_ValueMatch{
-						ValueMatch: &xdsmatcherv3.StringMatcher{
-							MatchPattern: &xdsmatcherv3.StringMatcher_Exact{Exact: val},
-						},
-					},
-				},
-			},
-		}
-	}
-	orPred := &xdsmatcherv3.Matcher_MatcherList_Predicate{
-		MatchType: &xdsmatcherv3.Matcher_MatcherList_Predicate_OrMatcher{
-			OrMatcher: &xdsmatcherv3.Matcher_MatcherList_Predicate_PredicateList{
-				Predicate: []*xdsmatcherv3.Matcher_MatcherList_Predicate{
-					headerExact("x-user", "alice"),
-					headerExact("x-user", "bob"),
-				},
-			},
-		},
-	}
-	tree := &xdsmatcherv3.Matcher{
-		MatcherType: &xdsmatcherv3.Matcher_MatcherList_{
-			MatcherList: &xdsmatcherv3.Matcher_MatcherList{
-				Matchers: []*xdsmatcherv3.Matcher_MatcherList_FieldMatcher{{
-					Predicate: orPred,
-					OnMatch:   onMatchActionForTest(t, rbacActionAnyForTest(t, "p_or", rbacconfigv3.RBAC_ALLOW)),
-				}},
-			},
-		},
-	}
-	cme, err := buildCompiledMatcherEngine(tree)
-	if err != nil {
-		t.Fatalf("buildCompiledMatcherEngine: %v", err)
-	}
-	// X-User=alice → first child matches → ALLOW.
-	ctx := &stubEvalContext{headers: map[string]string{"x-user": "alice"}}
-	if r, _ := evaluateMatcherEngine(cme, ctx); r != engineResultAllowed {
-		t.Errorf("OR (alice): want engineResultAllowed, got %v", r)
-	}
-	// X-User=bob → second child matches → ALLOW.
-	ctx = &stubEvalContext{headers: map[string]string{"x-user": "bob"}}
-	if r, _ := evaluateMatcherEngine(cme, ctx); r != engineResultAllowed {
-		t.Errorf("OR (bob): want engineResultAllowed, got %v", r)
-	}
-	// X-User=eve → no child matches → DENY.
-	ctx = &stubEvalContext{headers: map[string]string{"x-user": "eve"}}
-	if r, _ := evaluateMatcherEngine(cme, ctx); r != engineResultDenied {
-		t.Errorf("OR (eve): want engineResultDenied (no-match), got %v", r)
-	}
-}
-
-func TestMatchContext_AccessorAdapter_DelegatesToFilter(t *testing.T) {
-	// Per ADR-0142 §Decision (iii) + CF-2 (Task 3 spec review): the
-	// matcherCtxAdapter delegates each MatchContext accessor to the underlying
-	// evalContext. The CRITICAL mapping is SourceIP() → DirectRemoteIP() per
-	// xds.type.matcher.v3.SourceIPInput semantics (peer-source-pre-XFF, NOT
-	// XFF-resolved). This test pins the mapping.
-	ec := &stubEvalContext{
-		headers:        map[string]string{"x-test": "v1", ":method": "PUT"},
-		urlPath:        "/abc",
-		method:         "PUT",
-		destIP:         net.ParseIP("10.0.0.1"),
-		destPort:       8080,
-		serverName:     "sni.example",
-		directRemoteIP: net.ParseIP("10.1.1.1"), // peer-source-pre-XFF
-		remoteIP:       net.ParseIP("10.2.2.2"), // XFF-resolved
-	}
-	a := &matcherCtxAdapter{ctx: ec}
-	if v, ok := a.Header("x-test"); !ok || v != "v1" {
-		t.Errorf("Header(x-test): got (%q, %v), want (\"v1\", true)", v, ok)
-	}
-	if a.Path() != "/abc" {
-		t.Errorf("Path: got %q, want %q", a.Path(), "/abc")
-	}
-	if a.Method() != "PUT" {
-		t.Errorf("Method: got %q, want %q", a.Method(), "PUT")
-	}
-	// CF-2 mapping: SourceIP must return DirectRemoteIP (peer-source-pre-XFF),
-	// NOT RemoteIP (XFF-resolved).
-	got := a.SourceIP()
-	if !got.Equal(ec.directRemoteIP) {
-		t.Errorf("SourceIP: got %v, want %v (DirectRemoteIP — peer-source-pre-XFF per CF-2)", got, ec.directRemoteIP)
-	}
-	if got.Equal(ec.remoteIP) {
-		t.Error("SourceIP MUST NOT return RemoteIP (XFF-resolved); CF-2 mapping")
-	}
-	if !a.DestinationIP().Equal(ec.destIP) {
-		t.Errorf("DestinationIP: got %v, want %v", a.DestinationIP(), ec.destIP)
-	}
-	if a.DestinationPort() != ec.destPort {
-		t.Errorf("DestinationPort: got %d, want %d", a.DestinationPort(), ec.destPort)
-	}
-	if a.RequestedServerName() != ec.serverName {
-		t.Errorf("RequestedServerName: got %q, want %q", a.RequestedServerName(), ec.serverName)
-	}
-}
+// Group 8 tests (matcher-engine framework primitive integration) moved to
+// internal/rbac/rbac_test.go (Task 3).
 
 // ----------------------------------------------------------------------------
 // Group 9 — Stats namespace integration (per PLAN line 66 + SPEC §14.1 #9 +
@@ -2844,7 +967,7 @@ func TestMatchContext_AccessorAdapter_DelegatesToFilter(t *testing.T) {
 //     was assembled correctly (empirically RATIFIED at Task 8 via Envoy
 //     v1.37.2 scrape).
 //   - TestStatsNamespace_PerPolicyLazyAllocation_OnFirstMatch — verifies the
-//     filterStats.incPolicy lazy-cache contract (sync.Map LoadOrStore +
+//     (*rbacengine.PerPolicyCounters).Inc lazy-cache contract (sync.Map LoadOrStore +
 //     NewCounterIfAbsent post-Freeze idempotent).
 //   - TestStatsNamespace_NewFilterStatsIfAbsent_Idempotent — verifies two
 //     resolve passes against the same (hcmPrefix, primaryPrefix, shadowPrefix)
@@ -2978,16 +1101,18 @@ func TestStatsNamespace_HCMRootedPath_HttpHCMRbacPrefixCounter(t *testing.T) {
 
 func TestStatsNamespace_PerPolicyLazyAllocation_OnFirstMatch(t *testing.T) {
 	// Per ADR-0145 §Decision (iii) + §11.P10: per-policy counters are
-	// lazy-allocated on first match via filterStats.incPolicy → sync.Map
+	// lazy-allocated on first match via filterStats.perPolicy.Inc → sync.Map
 	// LoadOrStore + NewCounterIfAbsent. The counter name shape per the Task 8
 	// empirical scrape is `<base_prefix>.policy.<policy_name>.<suffix>`
 	// (REFINES the SPEC line 1842 hypothesis which omitted the `.policy.`
 	// segment infix — SPEC stat-table amends at Task 9 alongside ADR-0146).
 	//
-	// At Task 8 the per-policy emission helper exists but is not yet wired
-	// into emit*Counters (Task 9 / ADR-0146 ships the full track_per_rule_stats
-	// emission). This test exercises filterStats.incPolicy directly to pin
-	// the lazy-allocation contract.
+	// The per-policy lazy-cache type moved to internal/rbac at phase-26.3
+	// (PerPolicyCounters, D-26.3-7); the sync.Map entry-count contract is pinned
+	// in internal/rbac/perpolicy_test.go. This consumer test pins the
+	// operator-visible Registry surface: lazy allocation (no counter pre-
+	// emission) + idempotent registration (a single Registry counter after two
+	// increments, value = 2) through the consumer's base-prefix wiring.
 	reg := stats.NewRegistry()
 	c := &rbacv3.RBAC{
 		Rules:             happyRulesEngine(),
@@ -3002,24 +1127,26 @@ func TestStatsNamespace_PerPolicyLazyAllocation_OnFirstMatch(t *testing.T) {
 	if cc.stats == nil {
 		t.Fatal("cc.stats: want non-nil")
 	}
-	// Pre-emission: sync.Map empty.
-	count := 0
-	cc.stats.perPolicy.Range(func(_, _ any) bool { count++; return true })
-	if count != 0 {
-		t.Errorf("perPolicy pre-emission count = %d; want 0 (lazy)", count)
-	}
-	// First emission: allocates + increments.
-	cc.stats.incPolicy(cc.stats.primaryBase, "p_admin", "allowed")
+	// Pre-emission: no per-policy counter registered (lazy).
 	want := "http.hcm.rbac.rp.policy.p_admin.allowed"
-	if !containsString(collectMetricNames(reg), want) {
-		t.Errorf("missing per-policy counter %q after first incPolicy", want)
+	if containsString(collectMetricNames(reg), want) {
+		t.Errorf("per-policy counter %q present before any emission (want lazy)", want)
 	}
-	// Second emission: cache HIT (sync.Map count must NOT grow).
-	cc.stats.incPolicy(cc.stats.primaryBase, "p_admin", "allowed")
-	count = 0
-	cc.stats.perPolicy.Range(func(_, _ any) bool { count++; return true })
-	if count != 1 {
-		t.Errorf("perPolicy after 2 emissions for same key: count = %d; want 1 (cache hit)", count)
+	// First emission: allocates + increments via the consumer's base prefix.
+	cc.stats.perPolicy.Inc(cc.stats.reg, cc.stats.primaryBase, "p_admin", "allowed")
+	if !containsString(collectMetricNames(reg), want) {
+		t.Errorf("missing per-policy counter %q after first Inc", want)
+	}
+	// Second emission: idempotent registration (no duplicate Registry entry).
+	cc.stats.perPolicy.Inc(cc.stats.reg, cc.stats.primaryBase, "p_admin", "allowed")
+	regCount := 0
+	for _, n := range collectMetricNames(reg) {
+		if n == want {
+			regCount++
+		}
+	}
+	if regCount != 1 {
+		t.Errorf("Registry entries for %q after 2 emissions: got %d, want 1 (idempotent)", want, regCount)
 	}
 	// Verify both increments landed (counter value = 2).
 	var found *stats.Counter
@@ -3182,7 +1309,7 @@ func TestStatsNamespace_PerRouteINDEPENDENT_ListenerCountersUnaffected(t *testin
 // track_per_rule_stats per-policy emission discipline.
 //
 // At Task 8 the lazy-allocation contract for per-policy counters landed via
-// filterStats.incPolicy (sync.Map LoadOrStore + NewCounterIfAbsent); the
+// (*rbacengine.PerPolicyCounters).Inc (sync.Map LoadOrStore + NewCounterIfAbsent); the
 // emit*Counters call-sites were STUBs that incremented base counters only.
 // Task 9 wires per-policy emission into emit*Counters (gated by
 // trackPerRuleStats) + finalizes the shadow-path orchestration per ADR-0146.
@@ -3391,17 +1518,13 @@ func TestDecodeHeaders_PerPolicyEmission_TrackPerRuleStatsFalse_NoPerPolicyCount
 	if got := fl.state.listenerRC.stats.allowed.Load(); got != 1 {
 		t.Errorf("base allowed: got %d, want 1", got)
 	}
-	// No per-policy counter must be registered.
+	// No per-policy counter must be registered (operator-visible Registry
+	// surface — the sync.Map entry-count contract moved to internal/rbac with
+	// PerPolicyCounters at phase-26.3 / D-26.3-7).
 	for _, n := range collectMetricNames(reg) {
 		if strings.Contains(n, ".policy.") {
 			t.Errorf("track_per_rule_stats=false but per-policy counter present: %q", n)
 		}
-	}
-	// sync.Map.perPolicy must be empty.
-	count := 0
-	fl.state.listenerRC.stats.perPolicy.Range(func(_, _ any) bool { count++; return true })
-	if count != 0 {
-		t.Errorf("perPolicy count: got %d, want 0 (track_per_rule_stats=false)", count)
 	}
 }
 
@@ -3472,7 +1595,7 @@ func TestDecodeHeaders_ShadowEnabled_PrimaryDispositionWins_ShadowCountersIncrem
 func TestDecodeHeaders_ShadowEnabled_TrackPerRuleStats_PerPolicyShadowCountersIncrement(t *testing.T) {
 	// Per ADR-0146 §Decision (i) + (iii): shadow + track_per_rule_stats →
 	// per-policy shadow counter increments under the SHADOW base prefix (NOT
-	// the primary prefix). Verifies the shadowBase wiring through incPolicy.
+	// the primary prefix). Verifies the shadowBase wiring through (*rbacengine.PerPolicyCounters).Inc.
 	headerMatchAdmin := func() *rbacconfigv3.Policy {
 		return &rbacconfigv3.Policy{
 			Permissions: []*rbacconfigv3.Permission{{

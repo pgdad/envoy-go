@@ -1,6 +1,6 @@
-// Package builtins registers the four built-in network filters (echo,
-// direct_response, tcp_proxy, HCM) into a *network.Registry with their boot
-// singletons captured. It lives OUTSIDE internal/filter/network (which the
+// Package builtins registers the five built-in network filters (echo,
+// direct_response, tcp_proxy, HCM, rbac_network) into a *network.Registry with
+// their boot singletons captured. It lives OUTSIDE internal/filter/network (which the
 // filters import) and outside internal/listener (whose tests import this), so
 // no import cycle forms (D-26.2-5 / D-26.2-7). Consumed by cmd/envoy-go/main.go
 // + the listener manager's thinner constructors + the admin/manager/main test
@@ -16,6 +16,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
+	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -33,10 +34,11 @@ type Deps struct {
 	HTTPClient     *httpclient.Client
 }
 
-// RegisterBuiltins registers echo, direct_response, tcp_proxy, and HCM into reg.
-// It mirrors the registration calls in cmd/envoy-go/main.go and does NOT Freeze
-// (the caller freezes after any additional registration). reg.Register is void
-// (it panics on a frozen or duplicate registry), so there is no error to thread.
+// RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM, and
+// rbac_network into reg. It mirrors the registration calls in
+// cmd/envoy-go/main.go and does NOT Freeze (the caller freezes after any
+// additional registration). reg.Register is void (it panics on a frozen or
+// duplicate registry), so there is no error to thread.
 func RegisterBuiltins(reg *network.Registry, deps Deps) {
 	reg.Register(echo.TypeURL, echo.New)
 	reg.Register(directresponse.TypeURL, directresponse.New)
@@ -49,4 +51,8 @@ func RegisterBuiltins(reg *network.Registry, deps Deps) {
 		deps.DrainManager,
 		deps.HTTPClient,
 	))
+	// rbac_network: the 5th built-in (D-26.3-3). The stats Registry is
+	// closure-captured from deps.StatsRegistry (the network FactoryCtx carries no
+	// stats registry), mirroring tcpproxy.NewNetworkFactory / hcm.NewNetworkFactory.
+	reg.Register(networkrbac.TypeURL, networkrbac.NewFactory(deps.StatsRegistry))
 }

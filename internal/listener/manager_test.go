@@ -20,6 +20,7 @@ import (
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	drv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/direct_response/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	networkrbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/rbac/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -351,6 +352,66 @@ func TestManager_Error_TwoFilters(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "network-filter-multiple-terminals") {
 		t.Errorf("error %q does not contain %q", err.Error(), "network-filter-multiple-terminals")
+	}
+}
+
+// mkRBACNetworkFilter builds a minimal valid rbac_network filter config (only
+// stat_prefix is required; a wholly-inactive engine is a valid passthrough
+// read filter). The Name matches upstream's canonical name; resolution is by
+// type_url, so Name is cosmetic.
+func mkRBACNetworkFilter(t *testing.T) *listenerv3.Filter {
+	t.Helper()
+	a, err := anypb.New(&networkrbacv3.RBAC{StatPrefix: "lis_rbac"})
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	return &listenerv3.Filter{Name: "envoy.filters.network.rbac", ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: a}}
+}
+
+// TestBuildNetworkChainFactory_RBACThenTCPProxy_MixedChain is the boot-smoke for
+// the FIRST production mixed read→terminal network chain: [rbac_network,
+// tcp_proxy]. It exercises the SOLE chain-build path (buildNetworkChainFactory)
+// fed by a registry populated through builtins.RegisterBuiltins (which now wires
+// rbac_network as the 5th built-in), and proves:
+//
+//  1. the chain BUILDS with no chain-shape reject (no network-filter-terminal-not-last,
+//     no network-filter-multiple-terminals) — the 26.2 framework lifted the
+//     mixed-chain-unsupported reject; this proves a real consumer flows through it; and
+//  2. the chain CLASSIFIES correctly: filters[0] is a read-prefix rbac_network
+//     (a network.ReadFilter, NOT a TerminalFilter) and filters[1] is the terminal
+//     tcp_proxy (a network.TerminalFilter, last in the chain).
+func TestBuildNetworkChainFactory_RBACThenTCPProxy_MixedChain(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	netReg := network.NewRegistry()
+	builtins.RegisterBuiltins(netReg, builtins.Deps{ClusterManager: cm, StatsRegistry: stats.NewRegistry()})
+	netReg.Freeze()
+
+	filters := []*listenerv3.Filter{mkRBACNetworkFilter(t), mkTcpProxyFilter(t, "c_echo")}
+	factory, err := buildNetworkChainFactory("test", filters, netReg, network.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("mixed [rbac_network, tcp_proxy] chain must build with no chain-shape reject: %v", err)
+	}
+	if factory == nil {
+		t.Fatal("nil netChainFactory for a valid mixed chain")
+	}
+
+	// Classify a sample chain: rbac_network is a read-prefix (read, not terminal);
+	// tcp_proxy is the single terminal and is last.
+	chain := factory()
+	if len(chain) != 2 {
+		t.Fatalf("chain length = %d; want 2", len(chain))
+	}
+	if _, isTerminal := chain[0].(network.TerminalFilter); isTerminal {
+		t.Error("filters[0] (rbac_network) must NOT be a terminal filter — it is a read-prefix")
+	}
+	if _, isRead := chain[0].(network.ReadFilter); !isRead {
+		t.Error("filters[0] (rbac_network) must be a read filter (read-prefix)")
+	}
+	if _, isTerminal := chain[1].(network.TerminalFilter); !isTerminal {
+		t.Error("filters[1] (tcp_proxy) must be the terminal filter (last in the chain)")
+	}
+	if _, isRead := chain[1].(network.ReadFilter); isRead {
+		t.Error("filters[1] (tcp_proxy) must NOT be a read filter — it is a pure terminal")
 	}
 }
 

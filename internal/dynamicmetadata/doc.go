@@ -1,9 +1,23 @@
-// Package dynamicmetadata is the NEW per-stream cross-filter dynamic-
-// metadata accessor framework primitive at the NEW top-level package
-// `internal/dynamicmetadata/` per ADR-0190 (§Context anchored at phase
-// 22.2 SPEC `0d6463e`; §Decision + §Consequences body lands at phase
-// 22.2 IMPL atomic-landing Task 19 per ADR-0044 in-place edit
-// discipline).
+// Package dynamicmetadata is the cross-filter dynamic-metadata accessor
+// framework primitive at the top-level package `internal/dynamicmetadata/`
+// per ADR-0190 (§Context anchored at phase 22.2 SPEC `0d6463e`; §Decision +
+// §Consequences body lands at phase 22.2 IMPL atomic-landing Task 19 per
+// ADR-0044 in-place edit discipline).
+//
+// # Scope-agnostic Bucket lifetime (per ADR-0217)
+//
+// The Bucket is SCOPE-AGNOSTIC: it carries an owner-determined lifetime —
+// per-stream (HTTP filter chain) OR per-connection (network filter chain).
+// The owner constructs the Bucket at its scope's entry, hands it to the
+// filters via the callback accessor (HTTP: DecoderFilterCallbacks /
+// EncoderFilterCallbacks.DynamicMetadata(); network:
+// ReadFilterCallbacks.DynamicMetadata()), and Resets it at OnDestroy. The
+// package logic is identical at either scope — there is NO per-scope code
+// branch (R5: the per-connection consumer REUSES the package unchanged; the
+// only difference is which owner constructs + owns the Bucket). The first
+// per-connection production consumer is the rbac_network L4 filter's
+// shadow-pair writes (shadow_engine_result + shadow_effective_policy_id;
+// internal/filter/network/rbac, ADR-0217).
 //
 // # Cross-phase deferral-break rationale
 //
@@ -23,11 +37,11 @@
 //
 // # API surface (per 22.2 SPEC §3.1 production signatures)
 //
-//   - Bucket — opaque per-stream cross-filter dynamic-metadata accessor;
-//     unexported map keyed by (filterName string, key string) →
-//     *structpb.Value; NOT goroutine-safe across streams.
-//   - NewBucket() *Bucket — constructs an initialized empty per-stream
-//     metadata bucket.
+//   - Bucket — opaque scope-agnostic cross-filter dynamic-metadata
+//     accessor; unexported map keyed by (filterName string, key string) →
+//     *structpb.Value; NOT goroutine-safe across owning scopes.
+//   - NewBucket() *Bucket — constructs an initialized empty metadata
+//     bucket (per-stream OR per-connection, owner's choice).
 //   - (*Bucket).Get(filterName, key) (*structpb.Value, bool) — returns
 //     the value at (filterName, key); ok=false if absent. Nil-receiver
 //     tolerant: returns (nil, false) per ADR-0085.
@@ -45,10 +59,10 @@
 //
 // # Lifecycle integration
 //
-// The FilterChain (internal/filter/http/chain.go) gains a new
-// dynamicMetadata *dynamicmetadata.Bucket field. At chain construction
-// (per-stream entry per ADR-0033), the field is initialized via
-// NewBucket. At OnDestroy, chain.dynamicMetadata.Reset() is called.
+// HTTP (per-stream): The FilterChain (internal/filter/http/chain.go) gains
+// a new dynamicMetadata *dynamicmetadata.Bucket field. At chain
+// construction (per-stream entry per ADR-0033), the field is initialized
+// via NewBucket. At OnDestroy, chain.dynamicMetadata.Reset() is called.
 // The filter-callback API surface (internal/filter/http/callbacks.go)
 // gains two new accessors:
 //
@@ -58,15 +72,26 @@
 //     (returns the SAME bucket — per-stream shared across decode +
 //     encode dispatch).
 //
+// Network (per-connection, ADR-0217): the per-connection runtime context
+// owns a Bucket constructed at connection entry; the network read-filter
+// callback surface (internal/filter/network/callbacks.go) exposes it via
+// ReadFilterCallbacks.DynamicMetadata() *dynamicmetadata.Bucket. The
+// rbac_network filter is the first per-connection production WRITER
+// (shadow-pair writes). The package logic is unchanged — only the owning
+// scope differs (R5).
+//
 // # Thread-safety contract
 //
 // Per-stream sequential per ADR-0033 (Envoy HCM dispatches the filter
 // chain on a single worker thread per stream; no cross-filter
 // concurrency within a stream). The Bucket is therefore NOT goroutine-
-// safe across streams — each stream owns its own Bucket. Within a
-// stream, sequential dispatch implies no mutex is required at the
-// Bucket level (matching the upstream Envoy CommonComponents
-// PerFilterStateImpl pattern); confirmed in SPEC §3.1 paragraph 2.
+// safe across streams (or connections) — each stream (or connection)
+// owns its own Bucket. Network filter chains are likewise sequentially
+// dispatched per connection (no cross-filter concurrency within a
+// connection). Within a stream (or connection), sequential dispatch
+// implies no mutex is required at the Bucket level (matching the
+// upstream Envoy CommonComponents PerFilterStateImpl pattern);
+// confirmed in SPEC §3.1 paragraph 2.
 //
 // # Nil-tolerance discipline (per ADR-0085)
 //
@@ -82,6 +107,8 @@
 //
 //   - ADR-0190 (NEW internal/dynamicmetadata/ framework primitive;
 //     §Decision + §Consequences body lands at 22.2 IMPL Task 19).
+//   - ADR-0217 (scope-agnostic Bucket lifetime; per-connection reuse at
+//     the network filter chain — rbac_network shadow-pair writes, R5).
 //   - ADR-0188 (paired prior §9 framework primitive — internal/lua/).
 //   - ADR-0189 (paired prior §9 package — internal/filter/http/lua/).
 //   - ADR-0033 (per-stream sequential filter dispatch).

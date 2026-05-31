@@ -72,7 +72,7 @@
 // computed at DecodeHeaders BEFORE the request body is forwarded.
 //
 // Iteration protocol:
-//   - DecodeHeaders: resolve per-route TPFC; build evalContext from headers
+//   - DecodeHeaders: resolve per-route TPFC; build rbacengine.EvalContext from headers
 //   - connection state; run primary engine + (if configured) shadow engine;
 //     dispatch ALLOWED → HeaderContinue; DENIED → SendLocalReply(403, "RBAC:
 //     access denied", text/plain) + HeaderStopIteration; LOG-partial folds

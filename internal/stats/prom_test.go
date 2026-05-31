@@ -129,3 +129,30 @@ func TestWriteProm_EscapesLabelValues(t *testing.T) {
 		t.Errorf("WriteProm did not escape double-quote in label value\n--- output ---\n%s", buf.String())
 	}
 }
+
+// TestWriteProm_NetworkRBACTagExtractor pins the phase-26.3 rbac_network
+// flattenToProm rule: the `<stat_prefix>.rbac.*` internal names project to the
+// reference-Envoy-parity tag-extractor shape `envoy_rbac_<rest>{envoy_rbac_prefix="<stat_prefix>"}`
+// (stat_prefix promoted to a label; the literal `rbac.` segment + the optional
+// shadow_rules_stat_prefix segment inline into the base with dots→underscores).
+func TestWriteProm_NetworkRBACTagExtractor(t *testing.T) {
+	r := NewRegistry()
+	r.NewCounter("rbac_allow.rbac.allowed").Add(1)
+	r.NewCounter("rbac_deny.rbac.denied").Add(2)
+	r.NewCounter("rbac_shadow.rbac.shadow_ns.shadow_denied").Add(3)
+	var buf bytes.Buffer
+	if err := WriteProm(&buf, r); err != nil {
+		t.Fatalf("WriteProm: %v", err)
+	}
+	out := buf.String()
+	want := []string{
+		`envoy_rbac_allowed{envoy_rbac_prefix="rbac_allow"} 1`,
+		`envoy_rbac_denied{envoy_rbac_prefix="rbac_deny"} 2`,
+		`envoy_rbac_shadow_ns_shadow_denied{envoy_rbac_prefix="rbac_shadow"} 3`,
+	}
+	for _, w := range want {
+		if !strings.Contains(out, w) {
+			t.Errorf("WriteProm output missing line %q\n--- output ---\n%s", w, out)
+		}
+	}
+}
