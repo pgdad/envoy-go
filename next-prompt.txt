@@ -18,7 +18,7 @@ Per SKILL_ROUTING (sub-row 26.3 at state 0/1 — `planned`, no SPEC yet; the pha
 
 ## Project state at master tip
 
-- **Master tip:** `b5b8d8e` (the 26.2 IMPL stage-close commit — STATE `last-commit` repoint + this next-prompt rewrite — on top of the substantive 26.2 IMPL squash `24f9b13`). A further next-prompt master-tip repoint (if any) advances the tip +1; confirm the live tip via `git log --oneline -1`. origin/master in sync after push.
+- **Master tip:** `4de810d` (a next-prompt master-tip repoint; trails the 26.2 IMPL stage-close `b5b8d8e` + the substantive 26.2 IMPL squash `24f9b13`). Confirm the live tip via `git log --oneline -1` — any further next-prompt repoint advances the tip +1 (expected, not chased). origin/master in sync after push. STATE.md `last-commit` points at the substantive squash `24f9b13` (not the stage-close/repoint commits).
 - **§9 Network-filters family:** parent row 26 `in-progress`; 26.1 `done`; 26.2 `done`; 26.3 `planned` (flips `planned → in-progress` at the 26.3 SPEC commit per ADR-0106). Parent row 26 flips `in-progress → done` ATOMICALLY with 26.3 at 26.3 phase-done (ROLLUP precedent 18/19/22/24/25).
 - **Counts at master tip:** stat surface **132**; differential fixtures **44** (tail **0042**); fuzzers **35**; conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0215**; next-free **ADR-0216**.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
