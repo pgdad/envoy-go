@@ -14,7 +14,7 @@ Per SKILL_ROUTING (sub-row 26.3 at state 2 — SPEC.md exists, PLAN.md does not 
 
 ## Project state at master tip
 
-- **Master tip:** `c4e5f20` (a next-prompt SHA-fill repoint; trails the substantive 26.3 SPEC squash `ef22eb7` by +1). Confirm the live tip via `git log --oneline -1` — any further next-prompt repoint advances the tip +1 (expected, not chased). origin/master in sync after push. STATE.md `last-commit` points at the substantive SPEC squash `ef22eb7` (not the repoint).
+- **Master tip:** `0814ef4` (a next-prompt master-tip repoint; trails the substantive 26.3 SPEC squash `ef22eb7` by +2 repoints). Confirm the live tip via `git log --oneline -1` — any further next-prompt repoint advances the tip +1 (expected, not chased). origin/master in sync after push. STATE.md `last-commit` points at the substantive SPEC squash `ef22eb7` (not the repoint).
 - **§9 Network-filters family:** parent row 26 `in-progress`; 26.1 `done`; 26.2 `done`; 26.3 `in-progress` (flipped `planned → in-progress` at the 26.3 SPEC commit per ADR-0106). Parent row 26 flips `in-progress → done` ATOMICALLY with 26.3 at 26.3 phase-done (ROLLUP 18/19/22/24/25).
 - **Counts at master tip:** stat surface **132** (→136 at 26.3 IMPL); differential fixtures **44** tail **0042** (→46); fuzzers **35** (→36); conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0218** (§Context for 0216/0217/0218 drafted; §Decision/§Consequences bodies land at 26.3 IMPL); next-free **ADR-0219**.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
