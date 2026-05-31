@@ -19,7 +19,7 @@ There IS an active phase (27, `in-progress`, BRAINSTORM done). Per SKILL_ROUTING
 
 ## Project state at master tip
 
-- **Master tip:** `d13bd9c` (the phase-27 BRAINSTORM squash). This `last-commit` fill + this next-prompt rewrite land in the immediately-following commit (expected, not chased; per the 26.3 `72dc36d`←`7d1b7c6` precedent). STATE.md `last-commit` points at `d13bd9c`. origin/master in sync after push.
+- **Master tip:** `f76f78b` (the `last-commit`-fill + next-prompt 27-SPEC cold-start rewrite), which trails the substantive phase-27 BRAINSTORM squash `d13bd9c` by +1. Confirm the live tip via `git log --oneline -1`; this master-tip-repoint commit itself advances the tip +1 (expected, not chased; per the 26.3 `72dc36d`←`7d1b7c6`←`ec66a87` precedent). STATE.md `last-commit` points at the substantive BRAINSTORM squash `d13bd9c`. origin/master in sync after push.
 - **§9 Network-filters family:** parent row 26 DONE; row 27 (`network-filter-sni-cluster`) `in-progress` (BRAINSTORM done). The family stays OPEN — after phase-27 phase-done, 5 candidates remain (`redis`/`mongo`/`kafka_broker`/`thrift`/`zookeeper`).
 - **Counts at master tip (unchanged by BRAINSTORM):** stat surface **136**; differential fixtures **46** (tail `0044`); fuzzers **36**; conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0218**; next-free **ADR-0219** (ADR-0219 [override seam] + ADR-0220 [sni_cluster filter] ANTICIPATED; ADR-0209 escape-valve reserve STANDS-UNCONSUMED).
 - **Anticipated phase-27 deltas at IMPL:** fixtures 46 → 47 (one cross-side multi-cluster TLS dir; NO boot-reject — config-less); stat surface 136 (+0); fuzzers 36 (→37 only if SPEC adds the low-value config-less-parse fuzzer); ADRs +2 (ADR-0219 + ADR-0220).
