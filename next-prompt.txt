@@ -15,7 +15,7 @@ Author the **28.1 PLAN** via `superpowers:writing-plans`:
 
 ## Project state at master tip
 
-- **Master tip:** `8368ade` (the substantive 28.1-SPEC squash; trailed by the docs-only SHA-fill commit +1; confirm the live tip via `git log --oneline -1`; any further docs-only repoint advances the tip +1 — expected, not chased). STATE.md `last-commit` points at the 28.1-SPEC squash. origin/master in sync after push.
+- **Master tip:** `6ecb3d2` (the docs-only SHA-fill/next-prompt commit that trails the substantive 28.1-SPEC squash `8368ade` by +1). Confirm the live tip via `git log --oneline -1`; any further next-prompt repoint advances the tip +1 (expected, not chased). STATE.md `last-commit` points at the substantive 28.1-SPEC squash `8368ade`. origin/master in sync after push.
 - **§9 Network-filters family:** rows 26 (parent + 26.1/26.2/26.3) + 27 DONE; row 28 `in-progress` (parent; 28.1 `in-progress`, 28.2 `planned`). After phase 28, 4 candidates remain (`redis`/`mongo`/`kafka_broker`/`thrift`).
 - **Counts at master tip:** stat surface **136** [→337 at 28.1 IMPL]; differential fixtures **47** (tail `0045-sni-cluster`) [→49]; fuzzers **36** (recipe scoped to `./internal`) [→37]; conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0223** (§Context drafts; next-free **ADR-0224** — no new number consumed at the SPEC). ADR-0209 escape-valve reserve STANDS-UNCONSUMED.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
