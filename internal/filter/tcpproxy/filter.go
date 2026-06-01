@@ -21,13 +21,15 @@ import (
 // it without re-stringifying.
 const TypeURL = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy"
 
-// Filter is one TCP proxy filter instance, bound at construction time to the
-// resolved cluster it dispatches to. Immutable after NewFilter returns.
+// Filter is one TCP proxy filter instance. It retains both the cluster manager
+// (for per-connection override resolution, ADR-0219) and the boot-resolved
+// default cluster (no-override fallback). Immutable after NewFilter returns.
 type Filter struct {
-	network.Marker // sealed-marker embed: grants isNetworkFilter() so *Filter satisfies network.TerminalFilter (26.2 Task 5; R-T)
-	cluster        *cluster.Cluster
-	statPrefix     string         // unread at phase 02; SPEC §10 #8 settled — stored for forward-compat
-	dm             *drain.Manager // 08.2 Task 10: nil-tolerant drain manager for in-flight Inc/Dec
+	network.Marker                  // sealed-marker embed: grants isNetworkFilter() so *Filter satisfies network.TerminalFilter (26.2 Task 5; R-T)
+	cm             *cluster.Manager // retained for per-connection override resolution (ADR-0219)
+	defaultCluster *cluster.Cluster // the boot-resolved configured cluster (no-override fallback)
+	statPrefix     string           // unread at phase 02; SPEC §10 #8 settled — stored for forward-compat
+	dm             *drain.Manager   // 08.2 Task 10: nil-tolerant drain manager for in-flight Inc/Dec
 }
 
 // Compile-time assertion: *Filter is a network.TerminalFilter (R-T). Its
@@ -62,7 +64,7 @@ func NewFilter(tc *anypb.Any, cm *cluster.Manager, dm *drain.Manager) (*Filter, 
 		if !ok {
 			return nil, fmt.Errorf("tcpproxy: cluster %q not found", name)
 		}
-		return &Filter{cluster: c, statPrefix: msg.GetStatPrefix(), dm: dm}, nil
+		return &Filter{cm: cm, defaultCluster: c, statPrefix: msg.GetStatPrefix(), dm: dm}, nil
 	case *tcpproxyv3.TcpProxy_WeightedClusters:
 		return nil, fmt.Errorf("tcpproxy: weighted_clusters is not supported in phase 02")
 	default:
@@ -89,12 +91,30 @@ func NewNetworkFactory(cm *cluster.Manager, dm *drain.Manager) network.NetworkFi
 }
 
 // Handle pumps bytes bidirectionally between downstream and a freshly-dialed
-// upstream picked via the cluster's LB. Closes downstream and upstream when
-// the pump completes (or on dial failure). Logs but does not return errors.
+// upstream picked via the effective cluster's LB. The effective cluster is
+// resolved per-connection: if ctx carries an upstream-cluster override
+// (published by sni_cluster via network.UpstreamClusterOverride, ADR-0219)
+// that names a known cluster, it is used; otherwise the boot-resolved default
+// cluster is used. An unknown override cluster → close downstream with zero
+// bytes (F-NOROUTE, D27-4). Closes downstream and upstream when the pump
+// completes (or on dial failure). Logs but does not return errors.
 func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 	defer func() { _ = downstream.Close() }()
 	if err := ctx.Err(); err != nil {
 		return
+	}
+	eff := f.defaultCluster
+	if override, ok := network.UpstreamClusterOverride(ctx); ok && override != "" {
+		c, found := f.cm.Get(override)
+		if !found {
+			// F-NOROUTE (D27-4): unknown override cluster → close downstream, zero
+			// bytes. Envoy increments downstream_cx_no_route + NoFlush-closes; that
+			// counter family is NOT mirrored (§7.2). The deferred downstream.Close()
+			// (FIN) yields zero-byte body parity regardless of FIN-vs-RST (D27-S3).
+			log.Printf("tcpproxy: per-connection override cluster %q not found", override)
+			return
+		}
+		eff = c
 	}
 	// 08.2 (Task 10) drain Inc/Dec per ADR-0096 + planner-time decision 5:
 	// per-connection granularity (TCP-proxy has no per-request semantic).
@@ -104,9 +124,9 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 		f.dm.Inc()
 		defer f.dm.Dec()
 	}
-	upstream, _, err := f.cluster.Dial(ctx)
+	upstream, _, err := eff.Dial(ctx)
 	if err != nil {
-		log.Printf("tcpproxy: dial cluster %q: %v", f.cluster.Name(), err)
+		log.Printf("tcpproxy: dial cluster %q: %v", eff.Name(), err)
 		return
 	}
 	defer func() { _ = upstream.Close() }()

@@ -27,6 +27,14 @@ type ReadFilterCallbacks interface {
 	// internal/dynamicmetadata/ at connection scope per parent AMEND-A5).
 	// Unused by echo/direct_response at 26.1; consumed by rbac_network at 26.3.
 	DynamicMetadata() *dynamicmetadata.Bucket
+	// SetUpstreamCluster publishes a per-connection upstream-cluster-override that
+	// the terminal filter (tcp_proxy) consumes to replace its configured cluster
+	// (ADR-0219). The NARROW typed stand-in for Envoy's
+	// connection().streamInfo().filterState()->setData("envoy.tcp_proxy.cluster", …)
+	// (Q2 — no general filter-state primitive). Set by sni_cluster (27) in
+	// OnNewConnection with the verbatim SNI; "" is a no-op (leaves the configured
+	// cluster). Last writer wins (Envoy's PerConnectionCluster is Mutable).
+	SetUpstreamCluster(name string)
 }
 
 // CloseType selects the connection-close semantics. FlushWrite (flush pending

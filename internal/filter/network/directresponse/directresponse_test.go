@@ -42,11 +42,10 @@ type fakeCallbacks struct {
 	rcd  string
 }
 
-func (cb *fakeCallbacks) Connection() network.Connection { return &cb.conn }
-func (cb *fakeCallbacks) ContinueReading()               {}
-func (cb *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket {
-	return nil
-}
+func (cb *fakeCallbacks) Connection() network.Connection           { return &cb.conn }
+func (cb *fakeCallbacks) ContinueReading()                         {}
+func (cb *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket { return nil }
+func (cb *fakeCallbacks) SetUpstreamCluster(_ string)              {}
 
 // SetResponseCodeDetails is the optional RCD sink the filter type-asserts for.
 // Recording it here proves the assertion path is live in tests.

@@ -236,6 +236,7 @@ func (cb *fakeCallbacks) Connection() network.Connection           { return cb.c
 func (cb *fakeCallbacks) ContinueReading()                         {}
 func (cb *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket { return cb.dm }
 func (cb *fakeCallbacks) SetResponseCodeDetails(s string)          { cb.rcd = s }
+func (cb *fakeCallbacks) SetUpstreamCluster(_ string)              {}
 
 var _ network.ReadFilterCallbacks = (*fakeCallbacks)(nil)
 

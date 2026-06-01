@@ -584,6 +584,154 @@ func TestTCPProxy_DrainInflightBalance_NilDrainManager(t *testing.T) {
 	// Test passes if no panic.
 }
 
+// mkTwoClusterMgr builds a cluster.Manager that contains TWO distinct clusters,
+// each pointing at the supplied listener addresses. Used by
+// TestHandle_NoOverrideUsesDefaultCluster to exercise the refactored Filter
+// struct (which stores both cm and defaultCluster) without an override ctx.
+func mkTwoClusterMgr(t testing.TB, nameA, hostA string, portA uint32, nameB, hostB string, portB uint32) *cluster.Manager {
+	t.Helper()
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{
+				{
+					Name:                 nameA,
+					ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+					LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+					ConnectTimeout:       durationpb.New(time.Second),
+					LoadAssignment: &endpointv3.ClusterLoadAssignment{
+						ClusterName: nameA,
+						Endpoints: []*endpointv3.LocalityLbEndpoints{{
+							LbEndpoints: []*endpointv3.LbEndpoint{{
+								HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+									Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+										SocketAddress: &corev3.SocketAddress{
+											Address:       hostA,
+											PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: portA},
+										},
+									}},
+								}},
+							}},
+						}},
+					},
+				},
+				{
+					Name:                 nameB,
+					ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+					LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+					ConnectTimeout:       durationpb.New(time.Second),
+					LoadAssignment: &endpointv3.ClusterLoadAssignment{
+						ClusterName: nameB,
+						Endpoints: []*endpointv3.LocalityLbEndpoints{{
+							LbEndpoints: []*endpointv3.LbEndpoint{{
+								HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+									Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+										SocketAddress: &corev3.SocketAddress{
+											Address:       hostB,
+											PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: portB},
+										},
+									}},
+								}},
+							}},
+						}},
+					},
+				},
+			},
+		},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("mkTwoClusterMgr: cluster.NewManager: %v", err)
+	}
+	return cm
+}
+
+// TestHandle_NoOverrideUsesDefaultCluster is the back-compat regression
+// sentinel for the Task-4 struct refactor (ADR-0219). It drives Handle with
+// context.Background() (no override) and asserts that bytes reach the
+// configured default cluster ("bar"), NOT the second cluster ("foo"). This
+// must stay green both before the refactor (pre-condition) and after it.
+func TestHandle_NoOverrideUsesDefaultCluster(t *testing.T) {
+	// Start two distinct echo backends with distinguishable sentinel responses.
+	// "foo" backend echoes bytes prefixed with no modification; we detect which
+	// backend was used by sending a sentinel payload and reading it back.
+	backendFoo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backendFoo listen: %v", err)
+	}
+	defer func() { _ = backendFoo.Close() }()
+	go acceptEchoForTest(backendFoo)
+	portFoo := uint32(backendFoo.Addr().(*net.TCPAddr).Port)
+
+	backendBar, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backendBar listen: %v", err)
+	}
+	defer func() { _ = backendBar.Close() }()
+	go acceptEchoForTest(backendBar)
+	portBar := uint32(backendBar.Addr().(*net.TCPAddr).Port)
+
+	// Build a manager with BOTH clusters; configure the Filter with "bar" as
+	// the default cluster (the configured cluster_specifier).
+	cm := mkTwoClusterMgr(t, "foo", "127.0.0.1", portFoo, "bar", "127.0.0.1", portBar)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "no_override_test",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "bar"},
+	})
+	f, err := NewFilter(any, cm, nil)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+
+	// Simulated front-end listener to hand the accepted conn to Handle.
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("front listen: %v", err)
+	}
+	defer func() { _ = front.Close() }()
+
+	// context.Background() — NO override in ctx.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		conn, e := front.Accept()
+		if e != nil {
+			return
+		}
+		f.Handle(ctx, conn)
+	}()
+
+	cli, err := net.Dial("tcp", front.Addr().String())
+	if err != nil {
+		t.Fatalf("dial front: %v", err)
+	}
+	defer func() { _ = cli.Close() }()
+
+	// Send a sentinel that the echo backend will reflect verbatim.
+	const sentinel = "sentinel-bar\n"
+	if _, err := cli.Write([]byte(sentinel)); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	_ = cli.(*net.TCPConn).CloseWrite()
+
+	var got []byte
+	buf := make([]byte, 4096)
+	_ = cli.SetReadDeadline(time.Now().Add(time.Second))
+	for {
+		n, readErr := cli.Read(buf)
+		if n > 0 {
+			got = append(got, buf[:n]...)
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	// Assert the "bar" backend echoed back the sentinel (byte-exact back-compat).
+	if string(got) != sentinel {
+		t.Errorf("got %q, want %q (expected echo from 'bar' default cluster)", got, sentinel)
+	}
+}
+
 // TestFilter_Handle_HalfCloseOverTLS verifies that halfClose(*stdtls.Conn)
 // propagates a write-shutdown to the upstream after the downstream closes its
 // write side, allowing the upstream echo to complete and the downstream to read

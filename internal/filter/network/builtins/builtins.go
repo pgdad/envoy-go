@@ -1,10 +1,11 @@
-// Package builtins registers the five built-in network filters (echo,
-// direct_response, tcp_proxy, HCM, rbac_network) into a *network.Registry with
-// their boot singletons captured. It lives OUTSIDE internal/filter/network (which the
-// filters import) and outside internal/listener (whose tests import this), so
-// no import cycle forms (D-26.2-5 / D-26.2-7). Consumed by cmd/envoy-go/main.go
-// + the listener manager's thinner constructors + the admin/manager/main test
-// callers — the single place the boot-singleton wiring lives.
+// Package builtins registers the six built-in network filters (echo,
+// direct_response, tcp_proxy, HCM, rbac_network, sni_cluster) into a
+// *network.Registry with their boot singletons captured. It lives OUTSIDE
+// internal/filter/network (which the filters import) and outside
+// internal/listener (whose tests import this), so no import cycle forms
+// (D-26.2-5 / D-26.2-7). Consumed by cmd/envoy-go/main.go + the listener
+// manager's thinner constructors + the admin/manager/main test callers — the
+// single place the boot-singleton wiring lives.
 package builtins
 
 import (
@@ -17,6 +18,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
+	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -34,8 +36,8 @@ type Deps struct {
 	HTTPClient     *httpclient.Client
 }
 
-// RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM, and
-// rbac_network into reg. It mirrors the registration calls in
+// RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM,
+// rbac_network, and sni_cluster into reg. It mirrors the registration calls in
 // cmd/envoy-go/main.go and does NOT Freeze (the caller freezes after any
 // additional registration). reg.Register is void (it panics on a frozen or
 // duplicate registry), so there is no error to thread.
@@ -55,4 +57,7 @@ func RegisterBuiltins(reg *network.Registry, deps Deps) {
 	// closure-captured from deps.StatsRegistry (the network FactoryCtx carries no
 	// stats registry), mirroring tcpproxy.NewNetworkFactory / hcm.NewNetworkFactory.
 	reg.Register(networkrbac.TypeURL, networkrbac.NewFactory(deps.StatsRegistry))
+	// sni_cluster: the 6th built-in (config-less, no boot singletons — like
+	// echo/direct_response; ADR-0220). No Deps needed.
+	reg.Register(snicluster.TypeURL, snicluster.New)
 }

@@ -75,6 +75,16 @@ import (
 	// in PROGRESS, not a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/direct_response/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/echo/v3"
+
+	// Phase-27 registers the sni_cluster network-filter extension proto so
+	// protojson round-trips bootstraps carrying
+	// filter_chains[].filters[].typed_config of that type (the 27 sni_cluster
+	// read filter). Registered transitively by the snicluster filter package
+	// too; the explicit blank-import here guarantees resolution in any
+	// bootstrap-parsing context (e.g. the differential harness, which parses
+	// the rendered YAML before the binary's filter registry is fully wired).
+	// Per ADR-0016 amendment policy, documented in PROGRESS, not a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/sni_cluster/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"

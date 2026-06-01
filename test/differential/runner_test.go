@@ -67,6 +67,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0042-network-direct-response-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0043-network-rbac/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0044-network-rbac-boot-reject/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0045-sni-cluster/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

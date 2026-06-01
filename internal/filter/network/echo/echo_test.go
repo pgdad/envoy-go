@@ -42,6 +42,7 @@ func (cb *fakeCallbacks) ContinueReading() {}
 func (cb *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket {
 	return dynamicmetadata.NewBucket()
 }
+func (cb *fakeCallbacks) SetUpstreamCluster(_ string) {}
 
 // ---------------------------------------------------------------------------
 // Tests

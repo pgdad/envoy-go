@@ -133,6 +133,12 @@ type chainRuntime struct {
 	buf    *Buffer
 	bucket *dynamicmetadata.Bucket
 	rcd    string // response_code_details sink (D-P26.1-5b)
+	// upstreamClusterOverride is the per-connection upstream-cluster-override a
+	// read filter (sni_cluster, 27) publishes; "" = no override. It is the NARROW
+	// typed stand-in for Envoy's PerConnectionCluster filter-state entry (key
+	// "envoy.tcp_proxy.cluster"; ADR-0219) — NOT a general filter-state primitive
+	// (Q2/YAGNI). handleTerminal threads it to the terminal filter via the call ctx.
+	upstreamClusterOverride string
 
 	cb   *callbacks
 	cxn  *connection
@@ -213,6 +219,9 @@ func (rt *chainRuntime) handleTerminal(ctx context.Context) {
 		copy(prefix, rt.buf.Bytes())
 		rt.buf.Drain(rt.buf.Len())
 		conn = newPrefixConn(rt.conn, prefix)
+	}
+	if rt.upstreamClusterOverride != "" {
+		ctx = withUpstreamClusterOverride(ctx, rt.upstreamClusterOverride)
 	}
 	rt.terminal.Handle(ctx, conn)
 }
@@ -353,6 +362,11 @@ func (c *callbacks) DynamicMetadata() *dynamicmetadata.Bucket { return c.rt.buck
 // ReadFilterCallbacks to interface{ SetResponseCodeDetails(string) } and calls
 // this to set "DirectResponse"; no operator-visible surface emits it at 26.1.
 func (c *callbacks) SetResponseCodeDetails(s string) { c.rt.rcd = s }
+
+// SetUpstreamCluster records the per-connection upstream-cluster-override on the
+// runtime (ADR-0219). sni_cluster (27) calls it from OnNewConnection with the
+// verbatim SNI; handleTerminal threads it to the terminal filter via the ctx.
+func (c *callbacks) SetUpstreamCluster(name string) { c.rt.upstreamClusterOverride = name }
 
 // connection is the concrete Connection accessor over the dispatch net.Conn +
 // the manager-extracted L4 facts.

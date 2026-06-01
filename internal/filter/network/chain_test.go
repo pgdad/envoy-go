@@ -438,6 +438,14 @@ func TestResponseCodeDetailsSink(t *testing.T) { // D-P26.1-5b — prove the sin
 	}
 }
 
+func TestSetUpstreamClusterStoresOverride(t *testing.T) {
+	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
+	rt.cb.SetUpstreamCluster("foo.example.com")
+	if got := rt.upstreamClusterOverride; got != "foo.example.com" {
+		t.Fatalf("upstreamClusterOverride = %q, want %q", got, "foo.example.com")
+	}
+}
+
 func TestChainOnDestroyCallsAllFilters(t *testing.T) {
 	a, b := &destroyFilter{}, &destroyFilter{}
 	rt := newChainRuntime([]ReadFilter{a, b}, &fakeConn{}, connFacts{})
