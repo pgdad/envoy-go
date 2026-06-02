@@ -240,6 +240,26 @@ func flattenToProm(internal string) (string, []Label, error) {
 				return base, labels, nil
 			}
 		}
+		// Phase-28.1 zookeeper_proxy INLINE-PREFIX detection (ADR-0222; parent AMEND-A4;
+		// the ADR-0138 bandwidth_limit + wasm.* permissive-shape precedents). Internal
+		// name <stat_prefix>.zookeeper.<counter> (counter MAY contain dots — the dynamic
+		// auth.<scheme>_rq family) flattens to envoy_<stat_prefix>_zookeeper_<counter>
+		// with NO label promotion (upstream applies no tag extraction to this filter;
+		// its Prometheus exposition is flat with an empty label set).
+		// Validation is the SHAPE (D-P8): a .zookeeper. segment with a dot-free head —
+		// no per-counter allowlist (201 static names + an open-ended dynamic family
+		// make an allowlist unmaintainable; the wasm. arm at :88-122 is the
+		// established permissive precedent). Documented acceptance: any future stat
+		// named <x>.zookeeper.<y> from another subsystem matches this arm.
+		// KEEP-IN-SYNC: internal/filter/network/zookeeperproxy/stats.go (the roster).
+		const zkSegment = ".zookeeper."
+		if idx := strings.Index(internal, zkSegment); idx > 0 {
+			prefix := internal[:idx]
+			if !strings.ContainsRune(prefix, '.') {
+				base = "envoy_" + strings.ReplaceAll(internal, ".", "_")
+				return base, nil, nil
+			}
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 

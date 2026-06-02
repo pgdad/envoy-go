@@ -49,28 +49,39 @@ type ChainRuntime struct {
 
 // NewChainRuntime constructs the per-connection chain driver over a
 // []NetworkFilter + the downstream conn + the manager-extracted facts (SPEC
-// §3.5 construction step). It CLASSIFIES the filters into a read-filter prefix
-// and an optional trailing TerminalFilter: the read prefix drives the existing
-// OnData iteration; the terminal (if any) takes over the conn once the prefix
-// has Continued past it (TerminalReady → HandleTerminal). It injects the
-// per-connection callbacks into each read filter once.
+// §3.5 construction step). It CLASSIFIES the filters into a read-filter prefix,
+// a write-filter set, and an optional trailing TerminalFilter: the read prefix
+// drives the OnData iteration; the write set intercepts terminal writes before
+// they reach the downstream socket (AMEND-A11); the terminal (if any) takes
+// over the conn once the prefix has Continued past it (TerminalReady →
+// HandleTerminal). It injects the per-connection callbacks into each read filter
+// and each write filter once (D-P2: a both-directions filter receives BOTH
+// injections — the SAME instance appears in both sets).
 func NewChainRuntime(filters []NetworkFilter, conn net.Conn, facts ConnFacts) *ChainRuntime {
 	var (
 		read     []ReadFilter
+		write    []WriteFilter // CHAIN order; dispatch reverses (handleTerminal — AMEND-A11)
 		terminal TerminalFilter
 	)
 	for _, f := range filters {
-		switch nf := f.(type) {
-		case TerminalFilter:
+		// Independent type-asserts (NOT a type-switch): a filter implementing
+		// BOTH ReadFilter and WriteFilter must land in BOTH sets — the SAME
+		// instance (upstream addFilter parity; D-P2). zookeeperproxy (28.1) is
+		// the first such filter. A type-switch's first-match-wins cannot express this.
+		if t, ok := f.(TerminalFilter); ok {
 			// Keep the LAST terminal if more than one is present (boot
 			// validation in Task 7 prevents that shape from reaching here).
-			terminal = nf
-		case ReadFilter:
-			read = append(read, nf)
-		default:
-			// Defensively ignore any NetworkFilter that is neither (the sealed
-			// marker should make this unreachable).
+			terminal = t
+			continue
 		}
+		if rf, ok := f.(ReadFilter); ok {
+			read = append(read, rf)
+		}
+		if wf, ok := f.(WriteFilter); ok {
+			write = append(write, wf)
+		}
+		// A NetworkFilter that is neither (sealed-marker-only) is defensively
+		// ignored, exactly as today.
 	}
 	rt := newChainRuntime(read, conn, connFacts{
 		serverName: facts.ServerName,
@@ -79,6 +90,14 @@ func NewChainRuntime(filters []NetworkFilter, conn net.Conn, facts ConnFacts) *C
 		remote:     facts.Remote,
 	})
 	rt.terminal = terminal
+	rt.writeFilters = write
+	// Write-callbacks injection (mirrors the read-callbacks loop in
+	// newChainRuntime): every WriteFilter receives
+	// SetWriteFilterCallbacks exactly once at construction. A both-directions
+	// filter therefore receives BOTH injections (D-P2).
+	for _, wf := range write {
+		wf.SetWriteFilterCallbacks(&writeCallbacks{rt: rt})
+	}
 	return &ChainRuntime{rt: rt}
 }
 
@@ -127,8 +146,13 @@ func (c *ChainRuntime) CloseType() CloseType { return c.rt.closeType }
 type chainRuntime struct {
 	filters  []ReadFilter
 	terminal TerminalFilter // optional trailing connection-takeover filter (26.2)
-	conn     net.Conn
-	facts    connFacts
+	// writeFilters is the write-direction half of the chain in CHAIN order
+	// (ADR-0221). handleTerminal hands a REVERSED copy (dispatch order) to the
+	// writeChainConn (AMEND-A11 LIFO parity). A both-directions filter appears
+	// here AND in filters — the same instance.
+	writeFilters []WriteFilter
+	conn         net.Conn
+	facts        connFacts
 
 	buf    *Buffer
 	bucket *dynamicmetadata.Bucket
@@ -219,6 +243,22 @@ func (rt *chainRuntime) handleTerminal(ctx context.Context) {
 		copy(prefix, rt.buf.Bytes())
 		rt.buf.Drain(rt.buf.Len())
 		conn = newPrefixConn(rt.conn, prefix)
+	}
+	// WriteFilter seam (ADR-0221): wrap the conn handed to the terminal in a
+	// writeChainConn IFF the chain has ≥1 write filter, so terminal-originated
+	// downstream writes run the write chain BEFORE reaching the socket.
+	// Composition: writeChainConn OUTER, prefixConn INNER (reads promote through
+	// to the buffered-prefix replay; writes run the chain then hit the inner
+	// conn). Zero-write-filter chains get NO wrap → byte-identical to the
+	// pre-28.1 path (R1 back-compat over all 47 existing fixtures).
+	// The dispatch slice is a REVERSED COPY of the chain-order writeFilters
+	// (AMEND-A11 LIFO parity: config [A, B, C] ⇒ write dispatch C → B → A).
+	if len(rt.writeFilters) > 0 {
+		dispatch := make([]WriteFilter, len(rt.writeFilters))
+		for i, wf := range rt.writeFilters {
+			dispatch[len(rt.writeFilters)-1-i] = wf
+		}
+		conn = newWriteChainConn(conn, dispatch)
 	}
 	if rt.upstreamClusterOverride != "" {
 		ctx = withUpstreamClusterOverride(ctx, rt.upstreamClusterOverride)
@@ -318,9 +358,24 @@ func (rt *chainRuntime) runData() {
 // onDestroy calls every filter's OnDestroy in chain order (mirroring
 // pipeline.go's defer-OnDestroy discipline) and resets the dynamic-metadata
 // bucket (SPEC §3.3 / §3.4).
+//
+// Once-per-instance dedupe (D-P2): a both-directions filter appears in BOTH
+// rt.filters and rt.writeFilters as the SAME instance; its OnDestroy must run
+// exactly once. Filter instances are pointers (interface identity comparison
+// is well-defined), hence usable as map keys.
 func (rt *chainRuntime) onDestroy() {
+	destroyed := make(map[NetworkFilter]bool, len(rt.filters)+len(rt.writeFilters))
 	for _, f := range rt.filters {
-		f.OnDestroy()
+		if !destroyed[f] {
+			destroyed[f] = true
+			f.OnDestroy()
+		}
+	}
+	for _, f := range rt.writeFilters {
+		if !destroyed[f] {
+			destroyed[f] = true
+			f.OnDestroy()
+		}
 	}
 	rt.bucket.Reset()
 }
@@ -367,6 +422,16 @@ func (c *callbacks) SetResponseCodeDetails(s string) { c.rt.rcd = s }
 // runtime (ADR-0219). sni_cluster (27) calls it from OnNewConnection with the
 // verbatim SNI; handleTerminal threads it to the terminal filter via the ctx.
 func (c *callbacks) SetUpstreamCluster(name string) { c.rt.upstreamClusterOverride = name }
+
+// writeCallbacks is the concrete WriteFilterCallbacks injected into every
+// WriteFilter at chain construction (ADR-0221; D-P2 — a both-directions filter
+// receives BOTH a *callbacks and a *writeCallbacks injection). Connection()
+// returns the SAME per-connection accessor the read callbacks expose.
+type writeCallbacks struct {
+	rt *chainRuntime
+}
+
+func (w *writeCallbacks) Connection() Connection { return w.rt.cxn }
 
 // connection is the concrete Connection accessor over the dispatch net.Conn +
 // the manager-extracted L4 facts.

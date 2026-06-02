@@ -446,6 +446,47 @@ func TestSetUpstreamClusterStoresOverride(t *testing.T) {
 	}
 }
 
+// fakeWriteFilter is a synthetic WriteFilter recording OnWrite calls + injections.
+// status controls the per-call return; calls records the buffer contents seen.
+// order is an optional shared recorder: when non-nil, OnWrite appends f.name to
+// *order (used by TestWriteChainConnDispatchOrder to assert strict front-to-back
+// ordering over the dispatch slice).
+// Reused by Tasks 3–5.
+type fakeWriteFilter struct {
+	Marker
+	name      string
+	status    Status
+	calls     []string
+	order     *[]string
+	wcb       WriteFilterCallbacks
+	wcbCalls  int
+	destroyed int
+}
+
+func (f *fakeWriteFilter) OnWrite(buf *Buffer, _ bool) Status {
+	f.calls = append(f.calls, f.name+":"+string(buf.Bytes()))
+	if f.order != nil {
+		*f.order = append(*f.order, f.name)
+	}
+	return f.status
+}
+func (f *fakeWriteFilter) SetWriteFilterCallbacks(cb WriteFilterCallbacks) { f.wcb = cb; f.wcbCalls++ }
+func (f *fakeWriteFilter) OnDestroy()                                      { f.destroyed++ }
+
+// Compile-time assertion: fakeWriteFilter must satisfy WriteFilter (Tasks 3–5 use it).
+var _ WriteFilter = (*fakeWriteFilter)(nil)
+
+// TestWriteCallbacksConnectionAccessor proves the concrete writeCallbacks
+// Connection() returns the SAME per-connection accessor the read callbacks
+// return (SPEC §3.1 — one connection, two views).
+func TestWriteCallbacksConnectionAccessor(t *testing.T) {
+	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
+	wcb := &writeCallbacks{rt: rt}
+	if wcb.Connection() != Connection(rt.cxn) {
+		t.Fatal("writeCallbacks.Connection() != rt.cxn (must be the same accessor as read callbacks)")
+	}
+}
+
 func TestChainOnDestroyCallsAllFilters(t *testing.T) {
 	a, b := &destroyFilter{}, &destroyFilter{}
 	rt := newChainRuntime([]ReadFilter{a, b}, &fakeConn{}, connFacts{})
@@ -464,3 +505,175 @@ func (f *destroyFilter) OnNewConnection() Status                    { return Con
 func (f *destroyFilter) OnData(*Buffer, bool) Status                { return Continue }
 func (f *destroyFilter) SetReadFilterCallbacks(ReadFilterCallbacks) {}
 func (f *destroyFilter) OnDestroy()                                 { f.destroyed = true }
+
+// fakeBothFilter implements BOTH ReadFilter and WriteFilter (the zookeeperproxy
+// shape — one instance, both directions; upstream addFilter parity).
+type fakeBothFilter struct {
+	Marker
+	rcb       ReadFilterCallbacks
+	wcb       WriteFilterCallbacks
+	rcbCalls  int
+	wcbCalls  int
+	destroyed int
+}
+
+func (f *fakeBothFilter) OnNewConnection() Status                         { return Continue }
+func (f *fakeBothFilter) OnData(*Buffer, bool) Status                     { return Continue }
+func (f *fakeBothFilter) SetReadFilterCallbacks(cb ReadFilterCallbacks)   { f.rcb = cb; f.rcbCalls++ }
+func (f *fakeBothFilter) OnWrite(*Buffer, bool) Status                    { return Continue }
+func (f *fakeBothFilter) SetWriteFilterCallbacks(cb WriteFilterCallbacks) { f.wcb = cb; f.wcbCalls++ }
+func (f *fakeBothFilter) OnDestroy()                                      { f.destroyed++ }
+
+// Compile-time assertion: fakeBothFilter must satisfy both ReadFilter and WriteFilter.
+var _ ReadFilter = (*fakeBothFilter)(nil)
+var _ WriteFilter = (*fakeBothFilter)(nil)
+
+// A both-directions filter lands in BOTH the read and write sets — SAME instance.
+func TestClassificationBothDirectionsFilter(t *testing.T) {
+	both := &fakeBothFilter{}
+	term := &recordTerminal{}
+	crt := NewChainRuntime([]NetworkFilter{both, term}, &fakeConn{}, ConnFacts{})
+	rt := crt.rt
+	if len(rt.filters) != 1 || rt.filters[0].(*fakeBothFilter) != both {
+		t.Fatalf("read set = %v, want [both]", rt.filters)
+	}
+	if len(rt.writeFilters) != 1 || rt.writeFilters[0].(*fakeBothFilter) != both {
+		t.Fatalf("write set = %v, want [both]", rt.writeFilters)
+	}
+}
+
+// A write-only filter lands ONLY in the write set (framework-level; boot still
+// rejects it — manager.go untouched, SPEC §3.6).
+func TestClassificationWriteOnlyFilter(t *testing.T) {
+	wf := &fakeWriteFilter{name: "w", status: Continue}
+	crt := NewChainRuntime([]NetworkFilter{wf}, &fakeConn{}, ConnFacts{})
+	rt := crt.rt
+	if len(rt.filters) != 0 {
+		t.Fatalf("read set = %v, want empty", rt.filters)
+	}
+	if len(rt.writeFilters) != 1 {
+		t.Fatalf("write set len = %d, want 1", len(rt.writeFilters))
+	}
+}
+
+// Both-directions filter receives BOTH callback injections, each exactly once (D-P2).
+func TestBothFilterDualCallbackInjection(t *testing.T) {
+	both := &fakeBothFilter{}
+	NewChainRuntime([]NetworkFilter{both}, &fakeConn{}, ConnFacts{})
+	if both.rcbCalls != 1 || both.wcbCalls != 1 {
+		t.Fatalf("injections (read=%d, write=%d), want (1, 1)", both.rcbCalls, both.wcbCalls)
+	}
+	if both.rcb == nil || both.wcb == nil {
+		t.Fatal("callbacks not stored")
+	}
+	if both.wcb.Connection() != both.rcb.Connection() {
+		t.Fatal("write and read callbacks must expose the SAME Connection accessor")
+	}
+}
+
+// countingReadFilter is a minimal read-only double that counts OnDestroy calls.
+type countingReadFilter struct {
+	Marker
+	destroyed int
+}
+
+func (f *countingReadFilter) OnNewConnection() Status                    { return Continue }
+func (f *countingReadFilter) OnData(*Buffer, bool) Status                { return Continue }
+func (f *countingReadFilter) SetReadFilterCallbacks(ReadFilterCallbacks) {}
+func (f *countingReadFilter) OnDestroy()                                 { f.destroyed++ }
+
+// Compile-time assertion: countingReadFilter must satisfy ReadFilter.
+var _ ReadFilter = (*countingReadFilter)(nil)
+
+// --- Task 5: handleTerminal writeChainConn wrap ---
+
+// Zero-write-filter chains get NO writeChainConn wrap (R1 back-compat): the
+// terminal receives the raw conn (or prefixConn) — never a writeChainConn.
+func TestHandleTerminalZeroWriteFiltersUnwrapped(t *testing.T) {
+	rec := &recordingTerminal{} // upstreamcluster_test.go double (records ctx + conn)
+	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
+	rt.terminal = rec
+	rt.handleTerminal(context.Background())
+	if _, isWrap := rec.gotConn.(*writeChainConn); isWrap {
+		t.Fatal("zero-write-filter chain must NOT wrap the terminal conn (R1 back-compat)")
+	}
+}
+
+// ≥1 write filter: the terminal receives a writeChainConn; composition is
+// writeChainConn(prefixConn(conn)) when a buffered prefix exists — prefixConn
+// INNER so reads still replay the prefix.
+func TestHandleTerminalWrapComposition(t *testing.T) {
+	rec := &recordingTerminal{}
+	wf := &fakeWriteFilter{name: "w", status: Continue}
+	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
+	rt.terminal = rec
+	rt.writeFilters = []WriteFilter{wf}
+	rt.buf.Append([]byte("prefix")) // simulate undrained buffered prefix
+	rt.handleTerminal(context.Background())
+	wrap, ok := rec.gotConn.(*writeChainConn)
+	if !ok {
+		t.Fatalf("terminal conn = %T, want *writeChainConn", rec.gotConn)
+	}
+	if _, ok := wrap.Conn.(*prefixConn); !ok {
+		t.Fatalf("writeChainConn wraps %T, want *prefixConn (prefix INNER)", wrap.Conn)
+	}
+	// Reads promote through writeChainConn to the prefix replay:
+	got := make([]byte, 6)
+	n, _ := wrap.Read(got)
+	if string(got[:n]) != "prefix" {
+		t.Fatalf("Read through writeChainConn = %q, want prefix replay", got[:n])
+	}
+}
+
+// Write dispatch through handleTerminal is REVERSE chain order (AMEND-A11):
+// chain [A, B] ⇒ terminal write dispatch B → A.
+func TestHandleTerminalReverseWriteDispatch(t *testing.T) {
+	var order []string
+	mk := func(name string) *fakeWriteFilter {
+		return &fakeWriteFilter{name: name, status: Continue, order: &order}
+	}
+	a, b := mk("A"), mk("B")
+	rec := &recordingTerminal{}
+	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
+	rt.terminal = rec
+	rt.writeFilters = []WriteFilter{a, b} // CHAIN order
+	rt.handleTerminal(context.Background())
+	_, _ = rec.gotConn.Write([]byte("x"))
+	if len(order) != 2 || order[0] != "B" || order[1] != "A" {
+		t.Fatalf("write dispatch order = %v, want [B A] (reverse chain order)", order)
+	}
+}
+
+// The chain-order slice on the runtime is NOT mutated by the reversal (the
+// dispatch slice is a copy).
+func TestHandleTerminalDoesNotMutateChainOrder(t *testing.T) {
+	a := &fakeWriteFilter{name: "A", status: Continue}
+	b := &fakeWriteFilter{name: "B", status: Continue}
+	rec := &recordingTerminal{}
+	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
+	rt.terminal = rec
+	rt.writeFilters = []WriteFilter{a, b}
+	rt.handleTerminal(context.Background())
+	if rt.writeFilters[0].(*fakeWriteFilter).name != "A" {
+		t.Fatal("handleTerminal mutated chainRuntime.writeFilters (must reverse a COPY)")
+	}
+}
+
+// OnDestroy runs exactly ONCE per instance for a both-directions filter (D-P2 dedupe);
+// read-only and write-only filters each get exactly one call too.
+func TestOnDestroyOncePerInstance(t *testing.T) {
+	both := &fakeBothFilter{}
+	ro := &countingReadFilter{}
+	wo := &fakeWriteFilter{name: "w", status: Continue}
+	crt := NewChainRuntime([]NetworkFilter{ro, both, wo}, &fakeConn{}, ConnFacts{})
+	crt.rt.onDestroy()
+	if both.destroyed != 1 {
+		t.Fatalf("both-directions filter destroyed %d times, want exactly 1", both.destroyed)
+	}
+	if ro.destroyed != 1 {
+		t.Fatalf("read-only filter destroyed %d times, want 1", ro.destroyed)
+	}
+	if wo.destroyed != 1 {
+		t.Fatalf("write-only filter destroyed %d times, want 1", wo.destroyed)
+	}
+}

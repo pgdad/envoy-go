@@ -630,3 +630,61 @@ func TestFlattenToProm_NetworkRBAC_DoesNotConflictWithSN2_HTTP(t *testing.T) {
 		t.Errorf("labels: got %v, want envoy_http_conn_manager_prefix=ingress (SN2 wins)", labels)
 	}
 }
+
+// Phase-28.1 .zookeeper. INLINE-PREFIX arm (ADR-0222; AMEND-A4; D-P8 shape-based).
+// Internal <stat_prefix>.zookeeper.<counter> → envoy_<flat>, NO labels (the
+// reference's Prometheus exposition is flat with an empty label set).
+
+func TestFlattenToProm_Zookeeper_Basic(t *testing.T) {
+	base, labels, err := flattenToProm("zk.zookeeper.getdata_rq")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_zk_zookeeper_getdata_rq" {
+		t.Errorf("base = %q, want envoy_zk_zookeeper_getdata_rq", base)
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels = %v, want EMPTY (no label promotion — AMEND-A4)", labels)
+	}
+}
+
+// The dotted dynamic auth.<scheme>_rq family flattens via full-string
+// dot→underscore (counter names MAY contain dots — D-P8).
+func TestFlattenToProm_Zookeeper_DottedDynamicAuth(t *testing.T) {
+	base, labels, err := flattenToProm("zk.zookeeper.auth.digest_rq")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_zk_zookeeper_auth_digest_rq" || len(labels) != 0 {
+		t.Errorf("(%q, %v), want (envoy_zk_zookeeper_auth_digest_rq, [])", base, labels)
+	}
+}
+
+// Digit-suffixed counter names flatten intact (the digits guard).
+func TestFlattenToProm_Zookeeper_DigitSuffixed(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"zk.zookeeper.create2_rq", "envoy_zk_zookeeper_create2_rq"},
+		{"zk.zookeeper.getallchildrennumber_rq", "envoy_zk_zookeeper_getallchildrennumber_rq"},
+	} {
+		base, _, err := flattenToProm(tc.in)
+		if err != nil || base != tc.want {
+			t.Errorf("flattenToProm(%q) = (%q, %v), want %q", tc.in, base, err, tc.want)
+		}
+	}
+}
+
+// The dot-free-prefix guard: a dotted head before .zookeeper. does NOT match
+// the arm — falls through to the default unrecognized-prefix error.
+func TestFlattenToProm_Zookeeper_DottedPrefixRejected(t *testing.T) {
+	if _, _, err := flattenToProm("a.b.zookeeper.getdata_rq"); err == nil {
+		t.Fatal("dotted prefix must NOT match the .zookeeper. arm (D-P8 shape guard)")
+	}
+}
+
+// Underscore-bearing stat_prefixes are fine (the prefix lands in the metric name).
+func TestFlattenToProm_Zookeeper_UnderscorePrefix(t *testing.T) {
+	base, _, err := flattenToProm("zk_flags.zookeeper.getdata_rq_bytes")
+	if err != nil || base != "envoy_zk_flags_zookeeper_getdata_rq_bytes" {
+		t.Errorf("got (%q, %v)", base, err)
+	}
+}

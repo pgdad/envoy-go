@@ -13,6 +13,8 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	zookeeper_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -23,22 +25,35 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
+	"github.com/esalaine/envoy-go/internal/filter/network/zookeeperproxy"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
-// TestRegisterBuiltinsRegistersAllSix proves RegisterBuiltins wires all six
+// mustAny marshals a proto message into *anypb.Any (mirrors the zookeeperproxy_test.go
+// and rbac_test.go shape; generic proto.Message to remain usable for any typed_config).
+func mustAny(t *testing.T, msg proto.Message) *anypb.Any {
+	t.Helper()
+	a, err := anypb.New(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// TestRegisterBuiltinsRegistersAllSeven proves RegisterBuiltins wires all seven
 // built-in network filters (echo, direct_response, tcp_proxy, HCM,
-// rbac_network, sni_cluster) into a fresh Registry. Registration only stores
-// factory closures (it builds no filter), so a zero-valued Deps{} is
-// sufficient — rbac_network's StatsRegistry is nil here, which is fine because
-// registration only captures the closure. reg.Freeze() is called to exercise
-// the post-boot lookup path, consistent with the sibling registration tests.
-func TestRegisterBuiltinsRegistersAllSix(t *testing.T) {
+// rbac_network, sni_cluster, zookeeper_proxy) into a fresh Registry.
+// Registration only stores factory closures (it builds no filter), so a
+// zero-valued Deps{} is sufficient — rbac_network's and zookeeper_proxy's
+// StatsRegistry are nil here, which is fine because registration only captures
+// the closure. reg.Freeze() is called to exercise the post-boot lookup path,
+// consistent with the sibling registration tests.
+func TestRegisterBuiltinsRegistersAllSeven(t *testing.T) {
 	reg := network.NewRegistry()
 	RegisterBuiltins(reg, Deps{})
 	reg.Freeze()
-	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL} {
+	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL} {
 		if _, ok := reg.Lookup(tu); !ok {
 			t.Errorf("RegisterBuiltins did not register %q", tu)
 		}
@@ -69,6 +84,56 @@ func TestRegisterBuiltins_RegistersSniCluster(t *testing.T) {
 	reg.Freeze()
 	if _, ok := reg.Lookup(snicluster.TypeURL); !ok {
 		t.Fatal("sni_cluster not registered as the 6th built-in")
+	}
+}
+
+// TestRegisterBuiltins_RegistersZookeeperProxy proves zookeeper_proxy is wired
+// as the 7th built-in network filter (28.1; ADR-0222). A non-nil StatsRegistry
+// is supplied because zookeeper_proxy's factory eagerly creates the 201-counter
+// roster at parse; registration only stores the closure here, but a real
+// registry mirrors the boot wiring.
+func TestRegisterBuiltins_RegistersZookeeperProxy(t *testing.T) {
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{StatsRegistry: stats.NewRegistry()})
+	reg.Freeze()
+	if _, ok := reg.Lookup(zookeeperproxy.TypeURL); !ok {
+		t.Fatal("zookeeper_proxy not registered as the 7th built-in")
+	}
+}
+
+// TestZookeeperProxyBootSmoke is the boot-smoke for the [zookeeper_proxy,
+// tcp_proxy] chain: a zookeeper_proxy filter chain resolves through the
+// registry; parsing the zookeeper config eagerly creates the 201 counters at 0
+// (mirrors the 26.3 Task-12 [rbac_network, tcp_proxy] boot-smoke shape).
+func TestZookeeperProxyBootSmoke(t *testing.T) {
+	sreg := stats.NewRegistry()
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{StatsRegistry: sreg})
+	reg.Freeze()
+
+	factory, ok := reg.Lookup(zookeeperproxy.TypeURL)
+	if !ok {
+		t.Fatal("zookeeper_proxy factory not found")
+	}
+	tc := mustAny(t, &zookeeper_proxyv3.ZooKeeperProxy{StatPrefix: "zkboot"})
+	instFactory, err := factory(tc, network.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	inst := instFactory()
+	// Both-directions classification: the instance satisfies BOTH interfaces.
+	if _, isRead := inst.(network.ReadFilter); !isRead {
+		t.Fatal("zookeeper_proxy instance must be a ReadFilter")
+	}
+	if _, isWrite := inst.(network.WriteFilter); !isWrite {
+		t.Fatal("zookeeper_proxy instance must be a WriteFilter")
+	}
+	// Eager roster: 201 counters exist at 0 (spot-check response-side names).
+	for _, name := range []string{"zkboot.zookeeper.getdata_resp", "zkboot.zookeeper.watch_event",
+		"zkboot.zookeeper.connect_rq", "zkboot.zookeeper.decoder_error"} {
+		if got := sreg.NewCounterIfAbsent(name).Load(); got != 0 {
+			t.Errorf("counter %s = %d at boot, want 0", name, got)
+		}
 	}
 }
 

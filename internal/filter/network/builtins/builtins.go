@@ -1,6 +1,6 @@
-// Package builtins registers the six built-in network filters (echo,
-// direct_response, tcp_proxy, HCM, rbac_network, sni_cluster) into a
-// *network.Registry with their boot singletons captured. It lives OUTSIDE
+// Package builtins registers the seven built-in network filters (echo,
+// direct_response, tcp_proxy, HCM, rbac_network, sni_cluster, zookeeper_proxy)
+// into a *network.Registry with their boot singletons captured. It lives OUTSIDE
 // internal/filter/network (which the filters import) and outside
 // internal/listener (whose tests import this), so no import cycle forms
 // (D-26.2-5 / D-26.2-7). Consumed by cmd/envoy-go/main.go + the listener
@@ -19,6 +19,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
+	"github.com/esalaine/envoy-go/internal/filter/network/zookeeperproxy"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -37,10 +38,10 @@ type Deps struct {
 }
 
 // RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM,
-// rbac_network, and sni_cluster into reg. It mirrors the registration calls in
-// cmd/envoy-go/main.go and does NOT Freeze (the caller freezes after any
-// additional registration). reg.Register is void (it panics on a frozen or
-// duplicate registry), so there is no error to thread.
+// rbac_network, sni_cluster, and zookeeper_proxy into reg. It mirrors the
+// registration calls in cmd/envoy-go/main.go and does NOT Freeze (the caller
+// freezes after any additional registration). reg.Register is void (it panics
+// on a frozen or duplicate registry), so there is no error to thread.
 func RegisterBuiltins(reg *network.Registry, deps Deps) {
 	reg.Register(echo.TypeURL, echo.New)
 	reg.Register(directresponse.TypeURL, directresponse.New)
@@ -60,4 +61,9 @@ func RegisterBuiltins(reg *network.Registry, deps Deps) {
 	// sni_cluster: the 6th built-in (config-less, no boot singletons — like
 	// echo/direct_response; ADR-0220). No Deps needed.
 	reg.Register(snicluster.TypeURL, snicluster.New)
+	// zookeeper_proxy: the 7th built-in (28.1; ADR-0222). Stats-PRIMARY filter:
+	// the registry is closure-captured (the rbac_network/D-26.3-3 precedent —
+	// FactoryCtx carries no stats registry). The first both-directions
+	// (ReadFilter + WriteFilter) production filter (ADR-0221 consumer #1).
+	reg.Register(zookeeperproxy.TypeURL, zookeeperproxy.NewFactory(deps.StatsRegistry))
 }

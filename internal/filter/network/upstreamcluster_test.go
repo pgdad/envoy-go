@@ -6,14 +6,19 @@ import (
 	"testing"
 )
 
-// recordingTerminal captures the ctx passed to Handle for override inspection.
+// recordingTerminal captures the ctx and conn passed to Handle for override
+// inspection and write-seam composition assertions (Task 5).
 // (Distinct from recordTerminal in chain_test.go, which captures bytes not ctx.)
 type recordingTerminal struct {
 	Marker
-	gotCtx context.Context
+	gotCtx  context.Context
+	gotConn net.Conn
 }
 
-func (r *recordingTerminal) Handle(ctx context.Context, _ net.Conn) { r.gotCtx = ctx }
+func (r *recordingTerminal) Handle(ctx context.Context, c net.Conn) {
+	r.gotCtx = ctx
+	r.gotConn = c
+}
 
 func TestUpstreamClusterOverrideRoundTrip(t *testing.T) {
 	ctx := withUpstreamClusterOverride(context.Background(), "foo.example.com")

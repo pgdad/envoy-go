@@ -490,6 +490,16 @@ const (
 	// reload topology differs structurally from 0036's 14-scenario
 	// body/advanced partition. Introduced by phase 25.3 Task 11.
 	HTTPWasmPerRoute BackendKind = 27
+	// TCPSink is a SILENT TCP backend: it accepts connections, drains all reads
+	// (io.Copy(io.Discard, conn)), NEVER writes, and closes when the client
+	// closes (read-until-EOF; D-S28.1-5). Added at 28.1 for
+	// 0046-zookeeper-requests (SPEC §8.1.1): an echoing backend would push the
+	// echoed ZK request bytes back through reference Envoy's onWrite response
+	// decoder — counting *_resp/decoder_error increments that envoy-go's 28.1
+	// OnWrite no-op stub never mirrors → cross-side stat divergence. The 0046
+	// backend MUST be silent. (28.2's 0048 uses a driver-controlled responder —
+	// a separate kind; TCPSink stays request-side-only.)
+	TCPSink BackendKind = 28
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

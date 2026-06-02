@@ -68,6 +68,13 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0043-network-rbac/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0044-network-rbac-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0045-sni-cluster/driver"
+
+	// 0046-zookeeper-requests is committed but DISABLED at 28.1a (the ADR-0045
+	// 28.1a/28.1b split, user-approved 2026-06-02): its multi-frame arms require
+	// the read-side seam that 28.1b designs (the chain runtime's terminal handoff
+	// ends OnData delivery — see PROGRESS.md Task 16 BLOCKED analysis). 28.1b
+	// re-enables this import once the read seam lands and the fixture goes green.
+	// _ "github.com/esalaine/envoy-go/test/fixtures/0046-zookeeper-requests/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -822,6 +829,20 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			if err := waitTCPDial(ctx, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second); err != nil {
 				t.Fatalf("backend[%d] not ready: %v", i, err)
 			}
+		case fixture.TCPSink:
+			// Silent sink backend (28.1 §8.1.1): accept + drain + never write.
+			// An echoing backend would push the echoed ZK request bytes back
+			// through reference Envoy's onWrite response decoder — counting
+			// *_resp/decoder_error increments that envoy-go's 28.1 OnWrite
+			// no-op stub never mirrors → cross-side stat divergence (D-S28.1-5).
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptSinkCounting(ln, bo.accepts)
 		}
 		backends[i] = bo
 	}
@@ -1235,6 +1256,26 @@ func acceptEchoCounting(ln net.Listener, counter *atomic.Uint64) {
 					return
 				}
 			}
+		}(c)
+	}
+}
+
+// acceptSinkCounting accepts connections, counts them, drains all reads, and
+// NEVER writes (the TCPSink backend — 28.1 §8.1.1; D-S28.1-5 read-until-EOF).
+// A silent sink is required for 0046-zookeeper-requests: an echoing backend
+// would push the echoed ZK request bytes back through reference Envoy's onWrite
+// response decoder, counting *_resp/decoder_error increments that envoy-go's
+// 28.1 OnWrite no-op stub never mirrors → cross-side stat divergence.
+func acceptSinkCounting(ln net.Listener, counter *atomic.Uint64) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		counter.Add(1)
+		go func(c net.Conn) {
+			defer func() { _ = c.Close() }()
+			_, _ = io.Copy(io.Discard, c)
 		}(c)
 	}
 }

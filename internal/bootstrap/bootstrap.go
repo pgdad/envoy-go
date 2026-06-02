@@ -85,6 +85,14 @@ import (
 	// the rendered YAML before the binary's filter registry is fully wired).
 	// Per ADR-0016 amendment policy, documented in PROGRESS, not a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/sni_cluster/v3"
+	// Phase-28.1 registers the zookeeper_proxy network-filter extension proto so
+	// protojson round-trips bootstraps carrying
+	// filter_chains[].filters[].typed_config of that type. Registered
+	// transitively by the zookeeperproxy filter package too; the explicit
+	// blank-import here guarantees resolution in any bootstrap-parsing context
+	// (e.g. the differential harness). Per ADR-0016 amendment policy, documented
+	// in PROGRESS, not a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
