@@ -1,51 +1,49 @@
-START a fresh cold-start session for envoy-go — **the phase 28.2 SPEC is DONE + spec-document-reviewer APPROVED + squash-merged + pushed** (the squash SHA is recorded in `docs/envoy-go/STATE.md` last-commit). The active phase is **phase 28** (parent `in-progress`; sub-rows `28.1a` `done`, `28.1b` `done`, `28.2` `in-progress`). This session authors the **28.2 PLAN** — per SKILL_ROUTING **state 2** (SPEC.md exists, PLAN.md does not → `superpowers:writing-plans` scoped to the 28.2 PLAN).
+START a fresh cold-start session for envoy-go — **the phase 28.2 PLAN is DONE + plan-document-reviewer APPROVED + squash-merged + pushed** (the squash SHA is recorded in `docs/envoy-go/STATE.md` last-commit). The active phase is **phase 28** (parent `in-progress`; sub-rows `28.1a` `done`, `28.1b` `done`, `28.2` `in-progress`). This session executes the **28.2 IMPL** — per SKILL_ROUTING **state 3** (PLAN.md exists, implementation incomplete → `superpowers:subagent-driven-development` per `feedback_execution_style`).
 
-Phase 28 (`network-filter-zookeeper-proxy`) lands `zookeeper_proxy` at both-direction COUNTER parity. 28.1a (write seam + request package; squash `8703aeb`) + 28.1b (read seam + cross-side proof; squash `fdf40ea`) are DONE. **28.2 is the FINAL sub-phase**: the response decoder + latency-threshold counters + fixture `0048` + the phase-28 completion bundle incl. the ATOMIC parent-row-28 ROLLUP. The 28.2 SPEC (`docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/SPEC.md`) is this session's master document.
+Phase 28 (`network-filter-zookeeper-proxy`) lands `zookeeper_proxy` at both-direction COUNTER parity. 28.1a (write seam + request package; squash `8703aeb`) + 28.1b (read seam + cross-side proof; squash `fdf40ea`) are DONE; the 28.2 SPEC (squash `11920be`) + PLAN are DONE. **28.2 is the FINAL sub-phase**: this IMPL session lands the response decoder + the per-connection mutex + latency-threshold counters + `TCPZKResponder`/`0048` + the phase-28 completion bundle incl. the ATOMIC parent-row-28 ROLLUP, and CLOSES phase 28. The 28.2 PLAN (`docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/PLAN.md`) is this session's master document; the 28.2 SPEC stays the design authority behind it.
 
 ## What this session must do
 
-Author the **28.2 PLAN** via `superpowers:writing-plans` (self-driven per `feedback_execution_style`; the subsequent IMPL executes via `superpowers:subagent-driven-development`). Output: `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/PLAN.md` — the bite-sized TDD decomposition of the SPEC §11 task spine (~11 tasks):
+Execute the **11-task 28.2 PLAN** via `superpowers:subagent-driven-development`: one fresh subagent per task, controller reviews between tasks. Work in a git worktree (`feedback_git_worktrees`); subagents commit **LOCAL-ONLY** (`feedback_subagents_no_push`); the controller squash-merges to master + pushes at stage-close (`feedback_push_to_origin`). The 11 tasks:
 
-1. First-action baselines/anchors gate (SPEC §8.1 recipes re-run against the live IMPL tip).
-2. Decoder rename (`requestDecoder` → `decoder`) + `writeBuf`/`mu` fields + request-path lock acquisition + mechanical test updates.
-3. Response framing + dispatch (`decodeOnWrite`/`nextWriteFrame`/`decodeResponseFrame`: connect / watch / control / data / unknown / oversized / short) + unit tests.
-4. Correlation consumption (erase-on-lookup + FIFO pop + empty/missing → `decoder_error` + **the connect_readonly→connect mapping** — SPEC §3.4 item 4, the closed-roster panic trap) + byte accounting + unit tests.
-5. Latency-threshold counters (SPEC §4.1: `<=` INCLUSIVE; wire-opcode-keyed overrides; injected-timestamp boundary tests).
-6. `OnWrite` glue (replace the 28.1 no-op) + the §3.6 concurrent request/response race test (`-race -count=5`).
+1. First-action baselines/anchors gate (counts: 49 dirs / 37 fuzzers / 337 stats / tail ADR-0223; ports 15050–15053 free; the 31-row anchor table).
+2. Decoder rename (`requestDecoder` → `decoder`) + `writeBuf`/`mu` fields + request-path locking (existing tests stay green, assertions UNCHANGED).
+3. Write-side reassembly (`decodeOnWrite`/`nextWriteFrame`/`responseError`) + the UNCORRELATED dispatch rows (watch event / unknown / short / oversized) + unit tests.
+4. CORRELATED dispatch (connect / control / data) + correlation consumption (erase-on-lookup + FIFO pop + **the connect_readonly→connect mapping** — the closed-roster panic trap) + byte accounting + unit tests.
+5. Latency-threshold counters (`recordLatency`: `<=` INCLUSIVE; wire-opcode-keyed overrides; flag-gated; injectable-duration boundary tests).
+6. `OnWrite` glue (replaces the 28.1 no-op) + the §3.6 concurrent request/response race test (`-race -count=5`).
 7. The 38th fuzzer (`FuzzZookeeperResponseDecode`).
-8. `TCPZKResponder BackendKind = 29` + the runner backend arm (`acceptZKResponder`).
-9. `0048-zookeeper-responses` driver (4 listeners `l_resp`/`l_fast`/`l_slow`/`l_rflags`; 8 arms) + cross-side GREEN + R4 (`-count=1`) + fixture README.
-10. Completion bundle: ADR-0223 §Decision/§Consequences body (MUST record the per-connection mutex) + BEHAVIOR_CONTRACT 28.2 bundle.
-11. Six-gate (50-dir differential) + STATE.md + **the ROADMAP ATOMIC rollup (sub-row 28.2 AND parent row 28 → done)** + next-prompt.txt for the next-phase cold-start.
+8. `TCPZKResponder BackendKind = 29` + `acceptZKResponder` runner arm + unit test (D-S28.2-2: `getacl` wrong-xid / `exists` watch-push triggers; fixed 10 ms delay).
+9. `0048-zookeeper-responses` 4-listener/8-arm cross-side fixture + GREEN + R4 deliberate-break (`-count=1`) + README.
+10. ADR-0223 §Decision/§Consequences body + the BEHAVIOR_CONTRACT 28.2 bundle.
+11. Six-gate (50-dir differential `-count=1`; h2spec; proxy-wasm) + STATE.md + **the ROADMAP ATOMIC rollup (sub-row 28.2 AND parent row 28 → done)** + next-prompt.txt for the next-phase (state 0) cold-start.
 
-The PLAN re-checks the ADR-0045 split-gate (SPEC §11.1 estimate: ~360–490 production LoC / ~11 tasks → NO split anticipated) and resolves D-S28.2-2 (the `TCPZKResponder` trigger-opcode encoding [anticipated: `getacl` → wrong-xid, `exists` → watch-event push] + the delay constant [anticipated 10 ms]).
+## Load-bearing pins the IMPL MUST honor (from the SPEC + PLAN)
 
-## Load-bearing pins the 28.2 PLAN MUST carry (from the SPEC)
-
-1. **The §3.6 synchronization design.** A per-connection `sync.Mutex` on the decoder guarding EXACTLY the two correlation maps (`requestsByXid` + `controlRequestsByXid`); reassembly buffers (`readBuf`/`writeBuf`) + `chainConsumed` stay lock-free (single-goroutine-owned); entries copied out under the lock; the pre-handoff request path locks too (uniformity). This discharges the ADR-0221 §Consequences forward-pointer; ADR-0223's body records it.
-2. **The connect_readonly → connect response mapping (SPEC §3.4 item 4).** `respOpNames` has NO `connect_readonly_resp` — a naive `inc(entry.opname + "_resp")` PANICS on the closed roster. Connect responses always use opname `connect`.
-3. **No write-side TotalAppended.** `writeChainConn.Write` allocates a fresh per-Write `Buffer` (`writeconn.go:35`) — `OnWrite` appends `buf.Bytes()` to `writeBuf` directly; the read-side §3.3 re-base machinery is NOT mirrored (the asymmetry is structural, recorded in ADR-0223's body).
-4. **The deterministic-threshold discipline.** ONE `TCPZKResponder` backend with a fixed ~10 ms delay serves BOTH threshold arms (3600s → all fast; 1ms → all slow); the `l_slow` listener also carries the GetData 3600s override (the override arm). Cross-side timing equality is otherwise nondeterministic.
-5. **R4 deliberate-breaks use `-count=1`** (`reference_differential_break_protocol_count1` — go test caching serves stale PASSes otherwise).
-6. **No framework changes** (SPEC §2.4): `chain.go`/`readconn.go`/`writeconn.go`/`buffer.go`/`manager.go`/`tcp_proxy`/HCM untouched; `config.go`/`stats.go` untouched (all config fields + all 201 counters already exist). 28.2 is a zookeeperproxy-package + test-surface change ONLY.
-7. **Counts at 28.2 open:** active fixtures **49** (tail `0047`); fuzzers **37**; stat surface **337**; DECISIONS tail **ADR-0223** / next-free **ADR-0224**. After 28.2 IMPL: fixtures → 50, fuzzers → 38, stat surface → 337 (UNCHANGED — increments only), ADR tail/next-free UNCHANGED.
-8. **The ATOMIC parent rollup** (SPEC §7.3): sub-row 28.2 AND parent row 28 flip `→ done` in the SAME commit at IMPL phase-done; family candidates 5 → 4.
+1. **The §3.6 mutex scope:** one per-connection `sync.Mutex` guarding EXACTLY the two correlation maps; `readBuf`/`writeBuf`/`chainConsumed` stay lock-free (single-goroutine-owned); entries copied out under the lock; counter increments + latency math OUTSIDE the lock; the pre-handoff request path locks too. ADR-0223's body records this as the discharged ADR-0221 forward-pointer.
+2. **The connect_readonly → connect response mapping** (SPEC §3.4 item 4): connect responses ALWAYS use opname `connect`. A naive `inc(entry.opname + "_resp")` PANICS on the closed roster.
+3. **No write-side TotalAppended:** `OnWrite` appends `buf.Bytes()` to `writeBuf` directly (fresh per-Write Buffer — `writeconn.go:35`).
+4. **Correlate-then-validate** (PLAN refinement 2 — upstream parity): correlation pops/erases BEFORE framing validation; post-correlation failures fire the flag-gated `<opname>_decoder_error`.
+5. **The deterministic-threshold discipline:** ONE `TCPZKResponder` (fixed 10 ms delay) serves BOTH threshold arms (3600s → all fast; 0.001s → all slow); `l_slow` also carries the GetData 3600s override arm.
+6. **ALL differential runs use `-count=1`** (`reference_differential_break_protocol_count1`); R4 breaks are recorded + reverted; per-task `gofmt -l` + `golangci-lint` (`feedback_pertask_gofmt_lint`).
+7. **No framework changes** (SPEC §2.4): `chain.go`/`readconn.go`/`writeconn.go`/`buffer.go`/`manager.go`/`tcp_proxy`/HCM/`config.go`/`stats.go`/`name.go` ALL untouched.
+8. **Counts after IMPL:** fixtures 49 → **50**; fuzzers 37 → **38**; stat surface **337** (UNCHANGED — increments only); DECISIONS tail **ADR-0223** / next-free **ADR-0224** (UNCHANGED — no new ADR number; the ADR-0223 body lands in place per ADR-0044).
+9. **The ATOMIC parent rollup** (SPEC §7.3): sub-row 28.2 AND parent row 28 flip `→ done` in the SAME commit at Task 11; family candidates 5 → 4; STATE advances to SKILL_ROUTING state 0.
 
 ## Project state at master tip
 
-- **Master tip:** `a7852f7` (the SHA-fill docs commit; actual HEAD at repoint time, trails the substantive 28.2-SPEC squash `11920be` by +1). This repoint itself advances the tip +1 (expected, not chased); confirm the live tip via `git log --oneline -1`. Substantive predecessors: the 28.2-SPEC squash `11920be`, the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
+- **Master tip:** the 28.2-PLAN squash (see STATE.md last-commit; this repoint itself advances the tip — confirm the live tip via `git log --oneline -1`). Substantive predecessors: the 28.2-SPEC squash `11920be`, the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
 - **§9 Network-filters family:** rows 26 (parent + sub-rows) + 27 DONE; row 28 `in-progress` (28.1a `done`, 28.1b `done`, 28.2 `in-progress`). After phase 28 phase-done, 4 family candidates remain (`redis`/`mongo`/`kafka_broker`/`thrift`).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
 - **Known coverage boundaries (carried, non-blocking):** D-26.3-4; the `tcp_proxy` `downstream_cx_*` family unmirrored; histograms deferred (ADR-0060 — incl. the `*_response_latency` family 28.2 keeps deferred); zookeeper dynamic-metadata deferred (AMEND-A9) + shallow-decode leniency (extends to the response side at 28.2) + terminal-originated-writes-only + the write-only-filter boot boundary + the post-handoff observational boundaries (28.1b SPEC §3.5).
 
 ## Read first (in order)
 
-1. THIS FILE — the 28.2-PLAN cold-start.
-2. `docs/envoy-go/STATE.md` — active-phase `phase 28.2 SPEC done`; next-skill `superpowers:writing-plans` (the 28.2 PLAN); the squash SHA in last-commit.
-3. `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/SPEC.md` — THE master document for this session (all 13 sections + Appendix A; esp. §3 the response decoder + §3.6 the mutex + §4 latency + §5 the fixture/backend + §9.2 the open PLAN-time D-questions + §11 the task spine).
-4. `docs/envoy-go/phases/28-network-filter-zookeeper-proxy/SPEC.md` §11.4/§11.5/§11.7 (the response-framing/decoder-error/latency empirical pins the 28.2 SPEC §8.2 inherits).
-5. `docs/envoy-go/DECISIONS.md` ADR-0221 (the seam + the §Consequences forward-pointer) + ADR-0222 (the request package) + ADR-0223 (§Context + the 28.2-SPEC §AMEND; body lands at the 28.2 IMPL).
-6. The as-built code 28.2 extends: `internal/filter/network/zookeeperproxy/` (`decoder.go` — the rename/extension target; `zookeeperproxy.go:76` — the no-op OnWrite to replace; `stats.go` — `respOpNames` + the closed-roster panic; `config.go` — the parsed-not-consumed latency fields); `internal/filter/network/writeconn.go` (the fresh-Buffer-per-Write basis); `test/differential/fixture/fixture.go:493-510` + `test/differential/runner_test.go:827-840,1258-1269` (the BackendKind insertion sites); `test/fixtures/0046-zookeeper-requests/driver/driver.go` (the 0048 driver template).
-7. `docs/envoy-go/phases/28.1b-network-filter-read-seam-and-zookeeper-requests-proof/PLAN.md` — the PLAN-document template (structure + per-task TDD step shape + subagent dispatch outlines).
-8. `docs/envoy-go/SKILL_ROUTING.md` (state 2 = SPEC exists, no PLAN → writing-plans) + the BOOTSTRAP §4/§5 cold-start invariants.
-9. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + subagents-no-push + per-task gofmt/lint + the network-filter constraints + the differential dispatch/asserter/break-protocol constraints all carry forward.
+1. THIS FILE — the 28.2-IMPL cold-start.
+2. `docs/envoy-go/STATE.md` — active-phase `phase 28.2 PLAN done`; next-skill `superpowers:subagent-driven-development`; the squash SHA in last-commit.
+3. `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/PLAN.md` — THE master document for this session (11 tasks; complete TDD steps + code; the File Structure untouched-files pin; the acceptance checklist).
+4. `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/SPEC.md` — the design authority (esp. §3 response decoder + §3.6 mutex + §4 latency + §5 fixture/backend + §12 acceptance).
+5. `docs/envoy-go/DECISIONS.md` ADR-0221 (the discharged-at-28.2 forward-pointer) + ADR-0222 (the request package) + ADR-0223 (§Context + §AMEND; body lands at Task 10).
+6. The as-built code the PLAN extends: `internal/filter/network/zookeeperproxy/` + `internal/filter/network/writeconn.go` + `test/differential/fixture/fixture.go:493-510` + `test/differential/runner_test.go:827-841,1258-1276` + `test/fixtures/0046-zookeeper-requests/driver/driver.go` (the 0048 template).
+7. `docs/envoy-go/SKILL_ROUTING.md` (state 3) + the BOOTSTRAP §4/§5 cold-start invariants.
+8. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + subagents-no-push + per-task gofmt/lint + the network-filter constraints + the differential dispatch/asserter/break-protocol (`-count=1`) constraints all carry forward.
