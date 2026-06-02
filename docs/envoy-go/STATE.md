@@ -8,7 +8,7 @@ This file is the single source of truth for "what next" (see `BOOTSTRAP_PROMPT.m
 - **phase-directory:** `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/` holds README.md + SPEC.md + PLAN.md + PROGRESS.md. The 28/28.1a/28.1b directories stay the durable records of their phases.
 - **lifecycle-state:** `phase 28 DONE` — SKILL_ROUTING **state 0** (no phase in flight → `superpowers:brainstorming` for the next phase).
 - **next-skill:** `superpowers:brainstorming` (the next §9 Network-filters-family candidate or any other ROADMAP row; mongo_proxy is the natural next [consumer #2 of the conn-wrap seam, per ADR-0221 anticipation] but the choice is the brainstorm's; 4 candidates remain: redis/mongo/kafka_broker/thrift).
-- **last-commit:** `(filled at squash — the controller fills the squash SHA post-merge)`
+- **last-commit:** `fde21c9` — `phase 28.2: zookeeper_proxy response decoder + per-connection mutex (ADR-0221 forward-pointer discharged) + latency fast/slow counters + TCPZKResponder/0048 cross-side GREEN + 38th fuzzer + phase-28 ATOMIC rollup [ADR-0223]`. Substantive predecessors on master: the 28.2-PLAN squash `6c60d36`, the 28.2-SPEC squash `11920be`, the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
 - **last-updated:** 2026-06-02
 - **next-free ADR:** `ADR-0224` (UNCHANGED — DECISIONS.md tail STAYS **ADR-0223**; the 28.2 IMPL minted NO new ADR number; the ADR-0223 body landed in-place at Task 10).
 
