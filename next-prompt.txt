@@ -1,6 +1,6 @@
 START a fresh cold-start session for envoy-go — **the phase 28.1b PLAN is DONE + squash-merged + pushed**. The active phase is **phase 28** (parent `in-progress`; sub-rows `28.1a` `done`, `28.1b` `in-progress`, `28.2` `planned`). This session executes the **28.1b IMPL** — per SKILL_ROUTING state 3 (PLAN.md exists, implementation incomplete → `superpowers:subagent-driven-development` per `feedback_execution_style`), running the PLAN's 10 TDD tasks.
 
-Phase 28.1b (`network-filter-read-seam-and-zookeeper-requests-proof`) is the second/closing half of the user-approved ADR-0045 28.1a/28.1b invoked split (DECISIONS.md ADR-0045 §AMEND). 28.1a (squash `8703aeb`) landed the WriteFilter seam + the complete zookeeperproxy request package + the DISABLED `0046` driver. The 28.1b SPEC (squash `baf02ed`) designed the read-side seam; the 28.1b PLAN (squash FILLED-AT-SQUASH) decomposed it into 10 tasks. **This session implements them.**
+Phase 28.1b (`network-filter-read-seam-and-zookeeper-requests-proof`) is the second/closing half of the user-approved ADR-0045 28.1a/28.1b invoked split (DECISIONS.md ADR-0045 §AMEND). 28.1a (squash `8703aeb`) landed the WriteFilter seam + the complete zookeeperproxy request package + the DISABLED `0046` driver. The 28.1b SPEC (squash `baf02ed`) designed the read-side seam; the 28.1b PLAN (squash `eff30e8`) decomposed it into 10 tasks. **This session implements them.**
 
 ## What this session must do
 
