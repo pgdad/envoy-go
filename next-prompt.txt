@@ -33,7 +33,7 @@ The PLAN re-checks the ADR-0045 split-gate (SPEC §11.1 estimate: ~360–490 pro
 
 ## Project state at master tip
 
-- **Master tip:** the 28.2-SPEC squash (see STATE.md last-commit; confirm via `git log --oneline -1`). Substantive predecessors: the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
+- **Master tip:** `11920be` (the 28.2-SPEC squash) at SHA-fill time; this SHA-fill commit itself advances the tip +1 (expected, not chased). Confirm the live tip via `git log --oneline -1`. Substantive predecessors: the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
 - **§9 Network-filters family:** rows 26 (parent + sub-rows) + 27 DONE; row 28 `in-progress` (28.1a `done`, 28.1b `done`, 28.2 `in-progress`). After phase 28 phase-done, 4 family candidates remain (`redis`/`mongo`/`kafka_broker`/`thrift`).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
 - **Known coverage boundaries (carried, non-blocking):** D-26.3-4; the `tcp_proxy` `downstream_cx_*` family unmirrored; histograms deferred (ADR-0060 — incl. the `*_response_latency` family 28.2 keeps deferred); zookeeper dynamic-metadata deferred (AMEND-A9) + shallow-decode leniency (extends to the response side at 28.2) + terminal-originated-writes-only + the write-only-filter boot boundary + the post-handoff observational boundaries (28.1b SPEC §3.5).
