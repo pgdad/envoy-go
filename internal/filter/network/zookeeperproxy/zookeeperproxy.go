@@ -58,12 +58,12 @@ type filter struct {
 // (reference_network_read_filter_onnewconnection_halts).
 func (f *filter) OnNewConnection() network.Status { return network.Continue }
 
-// OnData feeds the decoder with the FULL chain-buffer contents (the decoder's
-// high-water mark skips already-consumed bytes — D-S28.1-3) and ALWAYS returns
-// Continue. It NEVER drains the chain buffer, never closes, never halts
-// (AMEND-A8 unconditional passthrough; R3).
+// OnData feeds the decoder with the chain-buffer contents + the monotonic
+// TotalAppended counter (the 28.1b §3.3 re-based feed — correct under runtime
+// drains) and ALWAYS returns Continue. It NEVER drains the chain buffer, never
+// closes, never halts (AMEND-A8 unconditional passthrough; R3).
 func (f *filter) OnData(buf *network.Buffer, _ bool) network.Status {
-	f.decoder.decodeOnData(buf.Bytes())
+	f.decoder.decodeOnData(buf.Bytes(), buf.TotalAppended())
 	return network.Continue
 }
 

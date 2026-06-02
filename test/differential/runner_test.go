@@ -68,13 +68,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0043-network-rbac/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0044-network-rbac-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0045-sni-cluster/driver"
-
-	// 0046-zookeeper-requests is committed but DISABLED at 28.1a (the ADR-0045
-	// 28.1a/28.1b split, user-approved 2026-06-02): its multi-frame arms require
-	// the read-side seam that 28.1b designs (the chain runtime's terminal handoff
-	// ends OnData delivery — see PROGRESS.md Task 16 BLOCKED analysis). 28.1b
-	// re-enables this import once the read seam lands and the fixture goes green.
-	// _ "github.com/esalaine/envoy-go/test/fixtures/0046-zookeeper-requests/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0046-zookeeper-requests/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0047-zookeeper-boot-reject/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

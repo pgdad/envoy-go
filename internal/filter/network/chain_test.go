@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -587,21 +589,9 @@ var _ ReadFilter = (*countingReadFilter)(nil)
 
 // --- Task 5: handleTerminal writeChainConn wrap ---
 
-// Zero-write-filter chains get NO writeChainConn wrap (R1 back-compat): the
-// terminal receives the raw conn (or prefixConn) — never a writeChainConn.
-func TestHandleTerminalZeroWriteFiltersUnwrapped(t *testing.T) {
-	rec := &recordingTerminal{} // upstreamcluster_test.go double (records ctx + conn)
-	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
-	rt.terminal = rec
-	rt.handleTerminal(context.Background())
-	if _, isWrap := rec.gotConn.(*writeChainConn); isWrap {
-		t.Fatal("zero-write-filter chain must NOT wrap the terminal conn (R1 back-compat)")
-	}
-}
-
 // ≥1 write filter: the terminal receives a writeChainConn; composition is
-// writeChainConn(prefixConn(conn)) when a buffered prefix exists — prefixConn
-// INNER so reads still replay the prefix.
+// writeChainConn(prefixConn(readChainConn(conn))) when a buffered prefix exists —
+// prefixConn over the readChainConn so reads still replay the prefix.
 func TestHandleTerminalWrapComposition(t *testing.T) {
 	rec := &recordingTerminal{}
 	wf := &fakeWriteFilter{name: "w", status: Continue}
@@ -614,14 +604,186 @@ func TestHandleTerminalWrapComposition(t *testing.T) {
 	if !ok {
 		t.Fatalf("terminal conn = %T, want *writeChainConn", rec.gotConn)
 	}
-	if _, ok := wrap.Conn.(*prefixConn); !ok {
+	pc, ok := wrap.Conn.(*prefixConn)
+	if !ok {
 		t.Fatalf("writeChainConn wraps %T, want *prefixConn (prefix INNER)", wrap.Conn)
+	}
+	// 28.1b: prefixConn now wraps a readChainConn (was the raw conn at 28.1a).
+	if _, ok := pc.Conn.(*readChainConn); !ok {
+		t.Fatalf("prefixConn wraps %T, want *readChainConn (innermost — 28.1b read seam)", pc.Conn)
 	}
 	// Reads promote through writeChainConn to the prefix replay:
 	got := make([]byte, 6)
 	n, _ := wrap.Read(got)
 	if string(got[:n]) != "prefix" {
 		t.Fatalf("Read through writeChainConn = %q, want prefix replay", got[:n])
+	}
+}
+
+// --- Task 5 (28.1b): handleTerminal read-wrap insertion ---
+
+// R1 (BOTH wraps): zero-write-filter chains get NEITHER conn-wrap — the
+// terminal receives the raw conn (or prefixConn over the raw conn), never a
+// readChainConn and never a writeChainConn. This is the structural back-compat
+// guarantee for every existing production chain (SPEC §3.4 item 1).
+func TestHandleTerminalZeroWriteFiltersNeitherWrap(t *testing.T) {
+	rec := &recordingTerminal{}
+	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
+	rt.terminal = rec
+	rt.handleTerminal(context.Background())
+	if _, isWrap := rec.gotConn.(*writeChainConn); isWrap {
+		t.Fatal("zero-write-filter chain must NOT get a writeChainConn (R1)")
+	}
+	if _, isWrap := rec.gotConn.(*readChainConn); isWrap {
+		t.Fatal("zero-write-filter chain must NOT get a readChainConn (R1 — the SHARED predicate)")
+	}
+}
+
+// Zero write filters + buffered prefix: prefixConn wraps the RAW conn directly
+// (byte-identical to the 26.2/27/28.1a composition — no readChainConn in between).
+func TestHandleTerminalZeroWriteFiltersPrefixOverRawConn(t *testing.T) {
+	rec := &recordingTerminal{}
+	raw := &fakeConn{}
+	rt := newChainRuntime(nil, raw, connFacts{})
+	rt.terminal = rec
+	rt.buf.Append([]byte("prefix"))
+	rt.handleTerminal(context.Background())
+	pc, ok := rec.gotConn.(*prefixConn)
+	if !ok {
+		t.Fatalf("terminal conn = %T, want *prefixConn", rec.gotConn)
+	}
+	if pc.Conn != net.Conn(raw) {
+		t.Fatalf("prefixConn wraps %T, want the raw conn (no intermediate wrap for R1 chains)", pc.Conn)
+	}
+}
+
+// ≥1 write filter + buffered prefix: the FULL composition, innermost → outermost:
+// readChainConn(raw) ← prefixConn ← writeChainConn (SPEC §3.1).
+func TestHandleTerminalFullCompositionOrder(t *testing.T) {
+	rec := &recordingTerminal{}
+	raw := &fakeConn{}
+	wf := &fakeWriteFilter{name: "w", status: Continue}
+	rt := newChainRuntime(nil, raw, connFacts{})
+	rt.terminal = rec
+	rt.writeFilters = []WriteFilter{wf}
+	rt.buf.Append([]byte("prefix"))
+	rt.handleTerminal(context.Background())
+
+	wc, ok := rec.gotConn.(*writeChainConn)
+	if !ok {
+		t.Fatalf("outermost = %T, want *writeChainConn", rec.gotConn)
+	}
+	pc, ok := wc.Conn.(*prefixConn)
+	if !ok {
+		t.Fatalf("middle = %T, want *prefixConn", wc.Conn)
+	}
+	rc, ok := pc.Conn.(*readChainConn)
+	if !ok {
+		t.Fatalf("inner = %T, want *readChainConn (INNERMOST — prefix bytes bypass the replay)", pc.Conn)
+	}
+	if rc.Conn != net.Conn(raw) {
+		t.Fatalf("readChainConn wraps %T, want the raw conn", rc.Conn)
+	}
+}
+
+// ≥1 write filter, NO prefix: writeChainConn(readChainConn(raw)).
+func TestHandleTerminalCompositionNoPrefix(t *testing.T) {
+	rec := &recordingTerminal{}
+	raw := &fakeConn{}
+	wf := &fakeWriteFilter{name: "w", status: Continue}
+	rt := newChainRuntime(nil, raw, connFacts{})
+	rt.terminal = rec
+	rt.writeFilters = []WriteFilter{wf}
+	rt.handleTerminal(context.Background())
+
+	wc, ok := rec.gotConn.(*writeChainConn)
+	if !ok {
+		t.Fatalf("outermost = %T, want *writeChainConn", rec.gotConn)
+	}
+	rc, ok := wc.Conn.(*readChainConn)
+	if !ok {
+		t.Fatalf("inner = %T, want *readChainConn", wc.Conn)
+	}
+	if rc.Conn != net.Conn(raw) {
+		t.Fatalf("readChainConn wraps %T, want the raw conn", rc.Conn)
+	}
+}
+
+// The prefixConn's buffered prefix is NOT re-fed through the replay: the read
+// filters already saw those bytes pre-handoff. Only LIVE post-handoff socket
+// reads replay (SPEC §3.1 composition item 1 — the innermost-is-load-bearing test).
+func TestHandleTerminalPrefixNotReFedThroughReplay(t *testing.T) {
+	f := &recordingReadFilter{name: "A", status: Continue}
+	wf := &fakeWriteFilter{name: "w", status: Continue}
+	raw := &multiReadConn{payloads: [][]byte{[]byte("LIVE")}} // the Task-4 multi-read double
+	rt := newChainRuntime([]ReadFilter{f}, raw, connFacts{})
+	rec := &recordingTerminal{}
+	rt.terminal = rec
+	rt.writeFilters = []WriteFilter{wf}
+
+	// Pre-handoff: the filter sees "pre" via the normal onData path; the bytes
+	// stay undrained (passthrough filter) → become the handoff prefix.
+	rt.onData([]byte("pre"), false)
+	if string(f.seen) != "pre" {
+		t.Fatalf("pre-handoff: filter saw %q, want pre", f.seen)
+	}
+
+	rt.handleTerminal(context.Background())
+
+	// The terminal reads through the full stack: first the prefix, then live bytes.
+	buf := make([]byte, 16)
+	n, _ := rec.gotConn.Read(buf)
+	if string(buf[:n]) != "pre" {
+		t.Fatalf("first terminal read = %q, want the prefix replay", buf[:n])
+	}
+	// The prefix read must NOT have re-fed the filter (it saw "pre" exactly once).
+	if string(f.seen) != "pre" {
+		t.Fatalf("after prefix read: filter saw %q, want pre (prefix NOT re-fed)", f.seen)
+	}
+	n, _ = rec.gotConn.Read(buf)
+	if string(buf[:n]) != "LIVE" {
+		t.Fatalf("second terminal read = %q, want LIVE", buf[:n])
+	}
+	// The live read DID replay: the filter has now seen pre + LIVE, each exactly once.
+	if string(f.seen) != "preLIVE" {
+		t.Fatalf("after live read: filter saw %q, want preLIVE (live bytes replayed exactly once)", f.seen)
+	}
+}
+
+// The §3.3 soundness invariant, end-to-end: a tracking filter (the TotalAppended
+// high-water-mark discipline — exactly the zookeeperproxy decoder's discipline)
+// sees EVERY appended byte EXACTLY ONCE across the pre-handoff regime, the
+// handoff drain, and the post-handoff replay regime.
+func TestChainSoundnessInvariantEveryByteSeenExactlyOnce(t *testing.T) {
+	f := &recordingReadFilter{name: "A", status: Continue}
+	wf := &fakeWriteFilter{name: "w", status: Continue}
+	raw := &multiReadConn{payloads: [][]byte{[]byte("ghi"), []byte("jkl")}} // the Task-4 multi-read double
+	rt := newChainRuntime([]ReadFilter{f}, raw, connFacts{})
+	rec := &recordingTerminal{}
+	rt.terminal = rec
+	rt.writeFilters = []WriteFilter{wf}
+
+	// Pre-handoff: one socket read via the normal onData path. (The runtime
+	// hands off the moment every read filter has Continued — serveNetworkChain's
+	// read loop returns at the first TerminalReady, internal/listener/manager.go
+	// :1066-1068 — so a passthrough chain sees exactly ONE pre-handoff read; the
+	// rest are post-handoff replays. Feeding two pre-handoff onData calls would
+	// NOT model the runtime: the second would append undrained bytes the filter
+	// never saw, violating the high-water-mark discipline this very test asserts.)
+	rt.onData([]byte("abcdef"), false)
+	if string(f.seen) != "abcdef" {
+		t.Fatalf("pre-handoff: filter saw %q, want abcdef", f.seen)
+	}
+	// Handoff (drains the buffer into the prefix).
+	rt.handleTerminal(context.Background())
+	// Post-handoff: the terminal drains the prefix, then two live reads (replayed).
+	buf := make([]byte, 16)
+	for i := 0; i < 3; i++ { // prefix ("abcdef"), "ghi", "jkl"
+		_, _ = rec.gotConn.Read(buf)
+	}
+
+	if string(f.seen) != "abcdefghijkl" {
+		t.Fatalf("tracking filter saw %q, want abcdefghijkl (every appended byte exactly once — no drop, no double-feed)", f.seen)
 	}
 }
 
@@ -675,5 +837,299 @@ func TestOnDestroyOncePerInstance(t *testing.T) {
 	}
 	if wo.destroyed != 1 {
 		t.Fatalf("write-only filter destroyed %d times, want 1", wo.destroyed)
+	}
+}
+
+// --- Task 3: chainRuntime.replayRead ---
+
+// recordingReadFilter records every OnData delivery: the bytes it saw (novel
+// tail, tracked via the TotalAppended discipline — the same discipline the
+// zookeeperproxy decoder uses) + the endStream flags + a call order tag.
+// status controls the per-call return (Status is IGNORED on the replay path —
+// the StopIteration variant proves it).
+type recordingReadFilter struct {
+	Marker
+	name      string
+	status    Status
+	seen      []byte // novel bytes, accumulated via the high-water-mark discipline
+	mark      int64  // high-water mark against buf.TotalAppended()
+	ends      []bool // endStream flag per OnData call
+	order     *[]string
+	destroyed int
+}
+
+func (f *recordingReadFilter) OnNewConnection() Status { return Continue }
+func (f *recordingReadFilter) OnData(buf *Buffer, endStream bool) Status {
+	if newCount := buf.TotalAppended() - f.mark; newCount > 0 {
+		bs := buf.Bytes()
+		f.seen = append(f.seen, bs[int64(len(bs))-newCount:]...)
+		f.mark = buf.TotalAppended()
+	}
+	f.ends = append(f.ends, endStream)
+	if f.order != nil {
+		*f.order = append(*f.order, f.name)
+	}
+	return f.status
+}
+func (f *recordingReadFilter) SetReadFilterCallbacks(ReadFilterCallbacks) {}
+func (f *recordingReadFilter) OnDestroy()                                 { f.destroyed++ }
+
+var _ ReadFilter = (*recordingReadFilter)(nil)
+
+// replayRead delivers to ALL read filters in CHAIN order (SPEC §3.2 item 1 /
+// D-28.1b-5: upstream re-iteration parity).
+func TestReplayReadDeliversToAllFiltersInChainOrder(t *testing.T) {
+	var order []string
+	a := &recordingReadFilter{name: "A", status: Continue, order: &order}
+	b := &recordingReadFilter{name: "B", status: Continue, order: &order}
+	rt := newChainRuntime([]ReadFilter{a, b}, &fakeConn{}, connFacts{})
+	rt.replayRead([]byte("xyz"), false)
+	if string(a.seen) != "xyz" || string(b.seen) != "xyz" {
+		t.Fatalf("replay delivery: A saw %q, B saw %q, want xyz/xyz", a.seen, b.seen)
+	}
+	if len(order) != 2 || order[0] != "A" || order[1] != "B" {
+		t.Fatalf("replay order = %v, want [A B] (chain order)", order)
+	}
+}
+
+// Status is IGNORED on the replay path (SPEC §3.5 row 1 — observational): a
+// mid-chain StopIteration does NOT halt delivery to later filters. This is the
+// LIVE divergence-from-pre-handoff assertion (§11.1).
+func TestReplayReadStatusIgnoredMidChainStop(t *testing.T) {
+	a := &recordingReadFilter{name: "A", status: StopIteration}
+	b := &recordingReadFilter{name: "B", status: Continue}
+	rt := newChainRuntime([]ReadFilter{a, b}, &fakeConn{}, connFacts{})
+	rt.replayRead([]byte("xyz"), false)
+	if string(b.seen) != "xyz" {
+		t.Fatalf("filter B saw %q, want xyz (A's StopIteration must be IGNORED on the replay path)", b.seen)
+	}
+	// And the chain's pre-handoff park state is untouched (no resumeIdx/connHalted side effects).
+	if rt.connHalted {
+		t.Fatal("replayRead must not set connHalted")
+	}
+}
+
+// The runtime drains the chain buffer fully after each replay pass (SPEC §3.2
+// item 3 — bounded memory).
+func TestReplayReadDrainsAfterPass(t *testing.T) {
+	a := &recordingReadFilter{name: "A", status: Continue}
+	rt := newChainRuntime([]ReadFilter{a}, &fakeConn{}, connFacts{})
+	rt.replayRead([]byte("hello"), false)
+	if rt.buf.Len() != 0 {
+		t.Fatalf("chain buffer Len = %d after replay pass, want 0 (drain-after-pass)", rt.buf.Len())
+	}
+	// TotalAppended is monotonic across the drain (the §3.2 item 2 continuity).
+	if rt.buf.TotalAppended() != 5 {
+		t.Fatalf("TotalAppended = %d, want 5", rt.buf.TotalAppended())
+	}
+	rt.replayRead([]byte("-more"), false)
+	if string(a.seen) != "hello-more" {
+		t.Fatalf("filter saw %q across two replay passes, want hello-more (every byte exactly once)", a.seen)
+	}
+}
+
+// endStream is delivered through the replay (SPEC §3.2 item 4 — the EOF replay).
+func TestReplayReadEndStream(t *testing.T) {
+	a := &recordingReadFilter{name: "A", status: Continue}
+	rt := newChainRuntime([]ReadFilter{a}, &fakeConn{}, connFacts{})
+	rt.replayRead([]byte("x"), false)
+	rt.replayRead(nil, true) // the EOF endStream replay (zero bytes)
+	if len(a.ends) != 2 || a.ends[0] != false || a.ends[1] != true {
+		t.Fatalf("endStream flags = %v, want [false true]", a.ends)
+	}
+}
+
+// --- Task 6: §3.6 concurrent-pumps race test (D-S28.1b-2) ---
+
+// pumpingTerminal mirrors tcp_proxy.Handle's goroutine topology (filter.go:134-138):
+// two concurrent io.Copy pumps + wg.Wait. It is the §3.6 race-surface double.
+type pumpingTerminal struct {
+	Marker
+	upstream net.Conn
+}
+
+func (p *pumpingTerminal) Handle(_ context.Context, downstream net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		// Close BOTH sides when pump A exits, mirroring tcp_proxy.Handle's
+		// deferred conn.Close() discipline:
+		//  - downstream.Close() unblocks any stuck testEnd.Write (client writer)
+		//    and causes pump B's downstream.Write to fail → pump B exits.
+		//  - upstream.Close() unblocks pump B if it is blocked in upstream.Read
+		//    waiting for data that will never arrive (backend sender already done).
+		defer func() { _ = downstream.Close(); _ = p.upstream.Close() }()
+		_, _ = io.Copy(p.upstream, downstream) // goroutine A: reads → replay
+	}()
+	go func() { defer wg.Done(); _, _ = io.Copy(downstream, p.upstream) }() // goroutine B: writes → write chain
+	wg.Wait()
+}
+
+// raceBothFilter is the minimal both-directions double for the race test: the
+// read path counts bytes ATOMICALLY (it runs on pump goroutine A); OnWrite is
+// a no-op Continue (it runs on pump goroutine B). The two paths share no other
+// state — exactly the 28.1b production posture (§3.6 item 2).
+type raceBothFilter struct {
+	Marker
+	readBytes atomic.Int64
+	mark      int64 // touched ONLY on goroutine A (the §3.6 pin); no lock needed
+}
+
+func (f *raceBothFilter) OnNewConnection() Status { return Continue }
+func (f *raceBothFilter) OnData(buf *Buffer, _ bool) Status {
+	if newCount := buf.TotalAppended() - f.mark; newCount > 0 {
+		f.readBytes.Add(newCount)
+		f.mark = buf.TotalAppended()
+	}
+	return Continue
+}
+func (f *raceBothFilter) SetReadFilterCallbacks(ReadFilterCallbacks)   {}
+func (f *raceBothFilter) OnWrite(*Buffer, bool) Status                 { return Continue }
+func (f *raceBothFilter) SetWriteFilterCallbacks(WriteFilterCallbacks) {}
+func (f *raceBothFilter) OnDestroy()                                   {}
+
+// Compile-time assertion: raceBothFilter must satisfy both ReadFilter and WriteFilter.
+var _ ReadFilter = (*raceBothFilter)(nil)
+var _ WriteFilter = (*raceBothFilter)(nil)
+
+// TestWrappedChainConcurrentPumpsRace drives a wrapped chain (a both-directions
+// synthetic filter, the zookeeperproxy shape) under live concurrent pumps over
+// net.Pipe, with traffic flowing BOTH directions simultaneously. The assertion
+// is `go test -race` itself: the 28.1b race surface must be EMPTY (SPEC §3.6
+// item 2 — goroutine A touches rt.buf + the read path; goroutine B's OnWrite
+// path shares NO mutable state with it). The test also asserts the filter saw
+// every downstream byte (the replay is live under concurrency).
+//
+// Goroutine topology (four driver goroutines + one wg.Wait/close bookkeeping goroutine
+// + the two pump goroutines inside pumpingTerminal.Handle = seven goroutines total):
+//
+//	client writer  → testEnd.Write  → chainEnd.Read  (pump A) → replayRead (filter sees bytes)
+//	pump A         → upstreamEnd.Write → backendEnd.Read (backend reader, discarded)
+//	backend sender → backendEnd.Write → upstreamEnd.Read (pump B) → chainEnd.Write
+//	pump B         → chainEnd.Write → testEnd.Read   (client reader, discarded)
+//
+// Every net.Pipe write has exactly one reader. When the client closes testEnd,
+// pump A (chainEnd.Read → error) and pump B (chainEnd.Write → error) both exit,
+// which unblocks Handle's wg.Wait() → HandleTerminal returns. After HandleTerminal
+// returns, upstreamEnd is closed explicitly, unblocking the backend sender and the
+// backend reader so all four driver goroutines can exit cleanly.
+func TestWrappedChainConcurrentPumpsRace(t *testing.T) {
+	// Both-directions filter: records read-path bytes via the TotalAppended
+	// discipline; OnWrite is a pure no-op Continue (the 28.1 §4.7 pin).
+	f := &raceBothFilter{}
+	term := &pumpingTerminal{}
+
+	// downstream pipe: testEnd <-> chainEnd (rt.conn); upstream pipe: upstreamEnd <-> backendEnd.
+	testEnd, chainEnd := net.Pipe()
+	upstreamEnd, backendEnd := net.Pipe()
+	term.upstream = upstreamEnd
+
+	crt := NewChainRuntime([]NetworkFilter{f, term}, chainEnd, ConnFacts{})
+	crt.OnNewConnection()
+	// Drive the chain past the read filter: deliver an endStream-only OnData (zero
+	// bytes, endStream=true). raceBothFilter.OnData sees TotalAppended=0 → adds
+	// nothing to readBytes; it returns Continue → resumeIdx advances past the last
+	// read filter → terminalReady() becomes true. No prefix bytes are buffered.
+	crt.OnData(nil, true)
+	if !crt.TerminalReady() {
+		t.Fatal("chain must be terminal-ready after the endStream pass (both filter Continues)")
+	}
+
+	// Timeout guard: the entire test must complete within this window; a
+	// deadlock-induced hang becomes a test failure rather than a hanging process.
+	// 60s is generous even under -race; a real deadlock hangs indefinitely.
+	deadline := 60 * time.Second
+	if d, ok := t.Deadline(); ok {
+		if rem := time.Until(d) - 2*time.Second; rem > 0 && rem < deadline {
+			deadline = rem
+		}
+	}
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+
+	done := make(chan struct{})
+	go func() { crt.HandleTerminal(context.Background()); close(done) }()
+
+	const writes = 50
+	const payload = "downstream-frame-"
+	const upPayload = "upstream-frame-"
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	// Client writer: writes 50 downstream payloads, then closes testEnd.
+	// Closing testEnd causes chainEnd.Read to error → pump A exits.
+	// chainEnd.Write also errors → pump B exits.
+	// Both pump exits → Handle's wg.Wait returns → HandleTerminal returns → done closes.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			if _, err := testEnd.Write([]byte(payload)); err != nil {
+				return
+			}
+		}
+		_ = testEnd.Close()
+	}()
+	// Backend sender: writes 50 upstream payloads (pump B's source). Exits on
+	// write error (upstreamEnd closed after HandleTerminal). Does NOT close
+	// backendEnd itself — closing backendEnd would cause pump A's upstreamEnd.Write
+	// to fail mid-stream, leaving the client writer blocked on testEnd.Write with
+	// no reader. Instead, upstreamEnd.Close() (called below after HandleTerminal
+	// returns) propagates the close to backendEnd and unblocks any pending write.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			if _, err := backendEnd.Write([]byte(upPayload)); err != nil {
+				return
+			}
+		}
+		// No backendEnd.Close() here — upstreamEnd.Close() below terminates this.
+	}()
+	// Client reader: drains pump B's downstream writes (chainEnd→testEnd direction).
+	// Exits when testEnd is closed by the client writer.
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(io.Discard, testEnd)
+	}()
+	// Backend reader: drains pump A's upstream forwards (upstreamEnd→backendEnd direction).
+	// REQUIRED: without this goroutine, pump A's upstreamEnd.Write has no reader and
+	// blocks indefinitely — net.Pipe is unbuffered — deadlocking the test; see
+	// PROGRESS.md Task 6 for the full analysis.
+	// Exits when backendEnd is closed by the backend sender, or when upstreamEnd is
+	// closed below (after HandleTerminal returns).
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(io.Discard, backendEnd)
+	}()
+
+	// Phase 1: wait for HandleTerminal to return (both pumps have exited).
+	// After HandleTerminal returns, close upstreamEnd so the backend sender and
+	// backend reader (which may be blocked on backendEnd.Write / backendEnd.Read
+	// respectively, waiting for a reader/writer on the upstreamEnd side) unblock
+	// and exit cleanly.
+	select {
+	case <-done:
+	case <-timer.C:
+		t.Fatal("HandleTerminal did not return within the deadline (possible deadlock)")
+	}
+	_ = upstreamEnd.Close()
+
+	// Phase 2: wait for all four driver goroutines to exit.
+	trafficDone := make(chan struct{})
+	go func() { wg.Wait(); close(trafficDone) }()
+	select {
+	case <-trafficDone:
+	case <-timer.C:
+		t.Fatal("traffic goroutines did not complete within the deadline after upstreamEnd closed")
+	}
+
+	// All downstream bytes were replayed to the filter exactly once.
+	// Each testEnd.Write is SYNCHRONOUS (net.Pipe): it blocks until pump A's
+	// chainEnd.Read happens. readChainConn.Read calls replayRead BEFORE returning
+	// to io.Copy (§5.1 replay-before-return). So all 50 replays have completed
+	// before testEnd.Close() is called — the count is deterministic.
+	want := int64(writes * len(payload))
+	if got := f.readBytes.Load(); got != want {
+		t.Fatalf("filter saw %d downstream bytes via the replay, want %d", got, want)
 	}
 }

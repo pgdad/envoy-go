@@ -236,21 +236,39 @@ func (rt *chainRuntime) terminalReady() bool {
 // replayed to the terminal BEFORE the live conn via a prefixConn (R-M). For a
 // pure-terminal chain the buffer is empty → conn == rt.conn → byte-identical to
 // a direct Handle of the raw conn.
+//
+// The read-side seam (28.1b, ADR-0221 §AMEND) wraps the RAW conn in a
+// readChainConn — INNERMOST — under the SAME ≥1-write-filter predicate as the
+// writeChainConn, giving the §3.1 composition writeChainConn(prefixConn(
+// readChainConn(conn))): the prefixConn serves its buffered prefix WITHOUT
+// delegating inward, so prefix bytes (already seen pre-handoff) bypass the
+// replay while only LIVE post-handoff socket reads pass through readChainConn.
 func (rt *chainRuntime) handleTerminal(ctx context.Context) {
 	conn := rt.conn
+	// Read-side seam (ADR-0221 §AMEND): wrap the RAW conn in a readChainConn —
+	// INNERMOST — under the SAME predicate as the writeChainConn below (R1: the
+	// two seams wrap together; zero-write-filter chains get NEITHER wrap).
+	// Innermost is load-bearing: the prefixConn's buffered prefix (bytes the
+	// read filters ALREADY saw pre-handoff) is served by prefixConn.Read WITHOUT
+	// delegating inward, so prefix bytes bypass the replay; only LIVE post-handoff
+	// socket reads pass through readChainConn.Read (28.1b SPEC §3.1).
+	if len(rt.writeFilters) > 0 {
+		conn = newReadChainConn(conn, rt)
+	}
 	if rt.buf.Len() > 0 {
 		prefix := make([]byte, rt.buf.Len())
 		copy(prefix, rt.buf.Bytes())
 		rt.buf.Drain(rt.buf.Len())
-		conn = newPrefixConn(rt.conn, prefix)
+		conn = newPrefixConn(conn, prefix)
 	}
 	// WriteFilter seam (ADR-0221): wrap the conn handed to the terminal in a
 	// writeChainConn IFF the chain has ≥1 write filter, so terminal-originated
 	// downstream writes run the write chain BEFORE reaching the socket.
-	// Composition: writeChainConn OUTER, prefixConn INNER (reads promote through
-	// to the buffered-prefix replay; writes run the chain then hit the inner
-	// conn). Zero-write-filter chains get NO wrap → byte-identical to the
-	// pre-28.1 path (R1 back-compat over all 47 existing fixtures).
+	// Composition: writeChainConn OUTER, prefixConn MIDDLE, readChainConn INNER
+	// (reads promote: write → prefix replay → live read + replay → raw conn;
+	// writes promote: write chain → embedded conns → raw conn). Zero-write-filter
+	// chains get NO wrap → byte-identical to the pre-28.1 path (R1 back-compat
+	// over all 47 existing fixtures).
 	// The dispatch slice is a REVERSED COPY of the chain-order writeFilters
 	// (AMEND-A11 LIFO parity: config [A, B, C] ⇒ write dispatch C → B → A).
 	if len(rt.writeFilters) > 0 {
@@ -353,6 +371,27 @@ func (rt *chainRuntime) runData() {
 		}
 		rt.resumeIdx = i + 1
 	}
+}
+
+// replayRead re-iterates the read-filter chain over post-handoff downstream
+// bytes (the read-side seam, ADR-0221 §AMEND). It restores upstream
+// FilterManagerImpl::onRead parity for wrapped chains: every read filter's
+// OnData runs, in chain order, on every socket read for the connection's
+// lifetime. The replay is OBSERVATIONAL (28.1b SPEC §3.5): Status is ignored
+// (the bytes are already committed to the terminal via readChainConn.Read's
+// return), and the buffer is fully drained after the pass (bounded memory —
+// the bytes' forward path is the terminal's conn, not the chain buffer).
+//
+// Called from readChainConn.Read on the terminal's downstream-pump goroutine
+// (§3.6 concurrency pin) — never concurrently with the pre-handoff read loop
+// (handoff is a happens-before edge: the loop returns before Handle spawns the
+// pumps).
+func (rt *chainRuntime) replayRead(p []byte, endStream bool) {
+	rt.buf.Append(p)
+	for _, f := range rt.filters {
+		_ = f.OnData(rt.buf, endStream) // Status ignored — observational (§3.5)
+	}
+	rt.buf.Drain(rt.buf.Len())
 }
 
 // onDestroy calls every filter's OnDestroy in chain order (mirroring

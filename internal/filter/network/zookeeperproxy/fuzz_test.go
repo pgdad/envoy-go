@@ -51,10 +51,11 @@ func FuzzZookeeperRequestDecode(f *testing.F) {
 		orig := append([]byte(nil), data...)
 
 		// Invariant 1: no panic (implicit — a panic fails the fuzz run).
-		d.decodeOnData(data)
+		d.decodeOnData(data, int64(len(data)))
 		// Feed cumulatively a second time (the chain buffer accumulates) — the
 		// high-water mark must not re-process or panic.
-		d.decodeOnData(append(append([]byte(nil), data...), data...))
+		doubled := append(append([]byte(nil), data...), data...)
+		d.decodeOnData(doubled, int64(len(doubled)))
 
 		// Invariant 2: the input was never mutated (R3).
 		if !bytes.Equal(data, orig) {

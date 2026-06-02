@@ -25,3 +25,33 @@ func TestBufferDrainSemantics(t *testing.T) {
 		t.Fatalf("over-drain: Len=%d want 0", b.Len())
 	}
 }
+
+// TotalAppended is the monotonic count of bytes ever Appended: unlike Len(),
+// it is unaffected by Drain — it only grows (the 28.1b §3.3 decoder-feed
+// re-base basis: filters that track novelty against TotalAppended are immune
+// to WHO drains the buffer and WHEN).
+func TestBufferTotalAppendedMonotonicUnderDrain(t *testing.T) {
+	b := &Buffer{}
+	if b.TotalAppended() != 0 {
+		t.Fatalf("zero-value TotalAppended = %d, want 0", b.TotalAppended())
+	}
+	b.Append([]byte("hello"))
+	if b.TotalAppended() != 5 {
+		t.Fatalf("after Append(5): TotalAppended = %d, want 5", b.TotalAppended())
+	}
+	b.Drain(b.Len()) // full drain
+	if b.Len() != 0 || b.TotalAppended() != 5 {
+		t.Fatalf("after Drain: Len=%d (want 0), TotalAppended=%d (want 5 — Drain must NOT shrink it)", b.Len(), b.TotalAppended())
+	}
+	b.Append([]byte("-world"))
+	if b.TotalAppended() != 11 {
+		t.Fatalf("after second Append: TotalAppended = %d, want 11 (5+6, monotonic across the drain)", b.TotalAppended())
+	}
+	if b.Len() != 6 {
+		t.Fatalf("Len = %d, want 6 (only the undrained bytes)", b.Len())
+	}
+	b.Append(nil) // nil/empty append is a no-op on both counters
+	if b.TotalAppended() != 11 || b.Len() != 6 {
+		t.Fatalf("after Append(nil): TotalAppended=%d Len=%d, want 11/6", b.TotalAppended(), b.Len())
+	}
+}

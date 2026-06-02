@@ -94,7 +94,7 @@ func TestSpecialXidConstants(t *testing.T) {
 
 func TestDecodeConnect(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
-	d.decodeOnData(connectFrame(nil))
+	d.decodeOnData(connectFrame(nil), int64(len(connectFrame(nil))))
 	if got := counterValue(t, rs, "connect_rq"); got != 1 {
 		t.Fatalf("connect_rq = %d, want 1", got)
 	}
@@ -106,7 +106,7 @@ func TestDecodeConnect(t *testing.T) {
 func TestDecodeConnectReadonly(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
 	ro := true
-	d.decodeOnData(connectFrame(&ro))
+	d.decodeOnData(connectFrame(&ro), int64(len(connectFrame(&ro))))
 	if got := counterValue(t, rs, "connect_readonly_rq"); got != 1 {
 		t.Fatalf("connect_readonly_rq = %d, want 1", got)
 	}
@@ -117,7 +117,7 @@ func TestDecodeConnectReadonly(t *testing.T) {
 
 func TestDecodePing(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
-	d.decodeOnData(zkFrame(be32(pingXid), be32(opPing)))
+	d.decodeOnData(zkFrame(be32(pingXid), be32(opPing)), int64(len(zkFrame(be32(pingXid), be32(opPing)))))
 	if got := counterValue(t, rs, "ping_rq"); got != 1 {
 		t.Fatalf("ping_rq = %d, want 1", got)
 	}
@@ -138,7 +138,7 @@ func authFrame(scheme string) []byte {
 // ("digest") gets its own counter.
 func TestDecodeAuthScheme(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
-	d.decodeOnData(authFrame("digest"))
+	d.decodeOnData(authFrame("digest"), int64(len(authFrame("digest"))))
 	got := rs.reg.NewCounterIfAbsent("zk.zookeeper.auth.digest_rq").Load()
 	if got != 1 {
 		t.Fatalf("auth.digest_rq = %d, want 1", got)
@@ -152,7 +152,7 @@ func TestDecodeAuthScheme(t *testing.T) {
 // live-verified scheme "foobar" → zkauth.zookeeper.auth.unknown_scheme_rq).
 func TestDecodeAuthSchemeNonBuiltin(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
-	d.decodeOnData(authFrame("foobar"))
+	d.decodeOnData(authFrame("foobar"), int64(len(authFrame("foobar"))))
 	// The unknown_scheme fallback counter incremented (this is the live-checkable
 	// assertion: we deliberately do NOT probe auth.foobar_rq via NewCounterIfAbsent
 	// because that would CREATE it at 0 and mask a divergence — instead we scan the
@@ -169,7 +169,7 @@ func TestDecodeAuthSchemeNonBuiltin(t *testing.T) {
 
 func TestDecodeSetWatches(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
-	d.decodeOnData(zkFrame(be32(setWatchesXid), be32(opSetWatches)))
+	d.decodeOnData(zkFrame(be32(setWatchesXid), be32(opSetWatches)), int64(len(zkFrame(be32(setWatchesXid), be32(opSetWatches)))))
 	if got := counterValue(t, rs, "setwatches_rq"); got != 1 {
 		t.Fatalf("setwatches_rq = %d, want 1", got)
 	}
@@ -184,13 +184,13 @@ func TestDecodePartialFrameReassembly(t *testing.T) {
 	frame := dataFrame(1, opGetData, []byte("/path"))
 	cut := len(frame) / 2
 	// First read: chain buffer holds the first half.
-	d.decodeOnData(frame[:cut])
+	d.decodeOnData(frame[:cut], int64(len(frame[:cut])))
 	if got := counterValue(t, rs, "getdata_rq"); got != 0 {
 		t.Fatalf("getdata_rq = %d after partial frame, want 0", got)
 	}
 	// Second read: chain buffer now holds the WHOLE accumulating buffer
 	// (the chain Buffer accumulates: zookeeperproxy never drains it).
-	d.decodeOnData(frame)
+	d.decodeOnData(frame, int64(len(frame)))
 	if got := counterValue(t, rs, "getdata_rq"); got != 1 {
 		t.Fatalf("getdata_rq = %d after reassembly, want 1", got)
 	}
@@ -205,9 +205,9 @@ func TestDecodeHighWaterMarkNoDoubleCount(t *testing.T) {
 	f1 := dataFrame(1, opGetData, make([]byte, 5)) // 8+5=13 bytes >= getdata min(13)
 	f2 := dataFrame(2, opCreate, make([]byte, 16)) // 8+16=24 bytes >= create min(24)
 	// Read 1: chain buffer = f1.
-	d.decodeOnData(f1)
+	d.decodeOnData(f1, int64(len(f1)))
 	// Read 2: chain buffer = f1 + f2 (accumulated — f1 is RE-DELIVERED).
-	d.decodeOnData(append(append([]byte{}, f1...), f2...))
+	d.decodeOnData(append(append([]byte{}, f1...), f2...), int64(len(append(append([]byte{}, f1...), f2...))))
 	if got := counterValue(t, rs, "getdata_rq"); got != 1 {
 		t.Fatalf("getdata_rq = %d, want 1 (re-delivered bytes must not double-count)", got)
 	}
@@ -221,7 +221,7 @@ func TestDecodeTwoFramesOneRead(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
 	// 8+5=13 bytes >= getdata min(13); 8+5=13 bytes >= exists min(13)
 	buf := append(dataFrame(1, opGetData, make([]byte, 5)), dataFrame(2, opExists, make([]byte, 5))...)
-	d.decodeOnData(buf)
+	d.decodeOnData(buf, int64(len(buf)))
 	if counterValue(t, rs, "getdata_rq") != 1 || counterValue(t, rs, "exists_rq") != 1 {
 		t.Fatal("both frames in a single read must decode")
 	}
@@ -233,7 +233,7 @@ func TestDecodeDoesNotMutateInput(t *testing.T) {
 	d, _, _ := newTestDecoder(t)
 	frame := dataFrame(1, opClose, nil) // opClose has no entry in dataRequestMinLength → universal 8
 	orig := append([]byte(nil), frame...)
-	d.decodeOnData(frame)
+	d.decodeOnData(frame, int64(len(frame)))
 	if !bytes.Equal(frame, orig) {
 		t.Fatal("decodeOnData mutated its input slice")
 	}
@@ -279,7 +279,7 @@ func TestDecodeDataRequestAllOpcodes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.suffix, func(t *testing.T) {
 			d, rs, _ := newTestDecoder(t)
-			d.decodeOnData(dataFrame(1, tc.opcode, padTo(tc.opcode)))
+			d.decodeOnData(dataFrame(1, tc.opcode, padTo(tc.opcode)), int64(len(dataFrame(1, tc.opcode, padTo(tc.opcode)))))
 			if got := counterValue(t, rs, tc.suffix); got != 1 {
 				t.Fatalf("%s = %d, want 1", tc.suffix, got)
 			}
@@ -295,7 +295,7 @@ func TestDecodeSetAuthDataRequest(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
 	scheme := []byte("digest")
 	payload := append(append(append(be32(0), be32(int32(len(scheme)))...), scheme...), be32(0)...)
-	d.decodeOnData(dataFrame(5, opSetAuth, payload))
+	d.decodeOnData(dataFrame(5, opSetAuth, payload), int64(len(dataFrame(5, opSetAuth, payload))))
 	if got := counterValue(t, rs, "decoder_error"); got != 1 {
 		t.Fatalf("decoder_error = %d, want 1 (upstream: SetAuth data request is a decode error)", got)
 	}
@@ -316,7 +316,7 @@ func TestDecodeSetAuthDataRequest(t *testing.T) {
 // Unknown opcode → decoder_error (no per-opcode counter — opcode unknown).
 func TestDecodeUnknownOpcode(t *testing.T) {
 	d, rs, _ := newTestDecoder(t)
-	d.decodeOnData(dataFrame(1, 9999, nil))
+	d.decodeOnData(dataFrame(1, 9999, nil), int64(len(dataFrame(1, 9999, nil))))
 	if got := counterValue(t, rs, "decoder_error"); got != 1 {
 		t.Fatalf("decoder_error = %d, want 1", got)
 	}
@@ -331,14 +331,16 @@ func TestDecodeOversizedThenRecovers(t *testing.T) {
 	rs := newRosterStats(reg, "zk")
 	d := newRequestDecoder(cfg, rs)
 	// Oversized: length prefix says 1000 > 64.
-	d.decodeOnData(append(be32(1000), make([]byte, 10)...))
+	oversized := append(be32(1000), make([]byte, 10)...)
+	d.decodeOnData(oversized, int64(len(oversized)))
 	if got := rs.counters["decoder_error"].Load(); got != 1 {
 		t.Fatalf("decoder_error = %d, want 1", got)
 	}
 	// Later read (fresh bytes appended after the abandoned buffer): decodes fine.
 	prior := d.chainConsumed
 	good := dataFrame(1, opGetData, padTo(opGetData))
-	d.decodeOnData(append(make([]byte, prior), good...)) // chain buffer grew by `good`
+	cumulative := append(make([]byte, prior), good...) // chain buffer grew by `good`
+	d.decodeOnData(cumulative, prior+int64(len(good))) // totalAppended is cumulative
 	if got := rs.counters["getdata_rq"].Load(); got != 1 {
 		t.Fatalf("getdata_rq = %d, want 1 (decoder must recover after abandon)", got)
 	}
@@ -355,7 +357,7 @@ func TestDecodeMinLengthViolation(t *testing.T) {
 	rs := newRosterStats(reg, "zk")
 	d := newRequestDecoder(cfg, rs)
 	// Only xid+opcode (8 bytes) — getdata minimum is 13.
-	d.decodeOnData(dataFrame(1, opGetData, nil))
+	d.decodeOnData(dataFrame(1, opGetData, nil), int64(len(dataFrame(1, opGetData, nil))))
 	if got := rs.counters["decoder_error"].Load(); got != 1 {
 		t.Fatalf("decoder_error = %d, want 1", got)
 	}
@@ -375,7 +377,7 @@ func TestDecodeFlagGatedRequestBytes(t *testing.T) {
 		rs := newRosterStats(reg, "zk")
 		d := newRequestDecoder(cfg, rs)
 		frame := dataFrame(1, opGetData, padTo(opGetData))
-		d.decodeOnData(frame)
+		d.decodeOnData(frame, int64(len(frame)))
 		wantWire := uint64(len(frame)) // 4-byte prefix + payload
 		if got := rs.counters["request_bytes"].Load(); got != wantWire {
 			t.Fatalf("request_bytes = %d, want %d (always counted)", got, wantWire)
@@ -413,7 +415,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 		d, rs := mkDecoder(true)
 		// xid=0 (connectXid) but frame only 12 bytes < 28-byte fixed header:
 		// decodeFrame universal 8-byte check passes; onConnect fires decoderError("connect").
-		d.decodeOnData(zkFrame(be32(connectXid), be32(0), be32(0)))
+		d.decodeOnData(zkFrame(be32(connectXid), be32(0), be32(0)), int64(len(zkFrame(be32(connectXid), be32(0), be32(0)))))
 		if rs.counters["decoder_error"].Load() != 1 || rs.counters["connect_decoder_error"].Load() != 1 {
 			t.Fatalf("connect short frame: decoder_error=%d connect_decoder_error=%d, want 1/1",
 				rs.counters["decoder_error"].Load(), rs.counters["connect_decoder_error"].Load())
@@ -425,7 +427,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 		// Exactly 28-byte frame (fixedLen): passes len<fixedLen check; pwLen=-1 fires decoderError.
 		// be32(0)=protocol_version, be64(0)=last_zxid, be32(30000)=timeout,
 		// be64(0)=session_id, be32(-1)=password_length (negative).
-		d.decodeOnData(zkFrame(be32(0), be64(0), be32(30000), be64(0), be32(-1)))
+		d.decodeOnData(zkFrame(be32(0), be64(0), be32(30000), be64(0), be32(-1)), int64(len(zkFrame(be32(0), be64(0), be32(30000), be64(0), be32(-1)))))
 		if rs.counters["connect_decoder_error"].Load() != 1 {
 			t.Fatal("negative pwLen must take the connect decoder_error path")
 		}
@@ -437,7 +439,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 		// but is < the 20-byte auth floor (XID+OPCODE+INT+INT+INT, decoder.cc:397-398)
 		// → onAuth fires decoderError("auth").
 		// Layout: xid | opcode | type | schemeLen (4×4 = 16 bytes < 20-byte floor).
-		d.decodeOnData(zkFrame(be32(authXid), be32(opSetAuth), be32(0), be32(0)))
+		d.decodeOnData(zkFrame(be32(authXid), be32(opSetAuth), be32(0), be32(0)), int64(len(zkFrame(be32(authXid), be32(opSetAuth), be32(0), be32(0)))))
 		if rs.counters["auth_decoder_error"].Load() != 1 {
 			t.Fatal("short auth frame must take the auth decoder_error path")
 		}
@@ -449,7 +451,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 		// fires decoderError("auth"). Layout: xid | opcode | type | schemeLen(-1) | pad(4).
 		// The 4-byte pad is needed so the frame meets the 20-byte floor and the
 		// negative-schemeLen branch is independently exercised (not shadowed by floor).
-		d.decodeOnData(zkFrame(be32(authXid), be32(opSetAuth), be32(0), be32(-1), be32(0)))
+		d.decodeOnData(zkFrame(be32(authXid), be32(opSetAuth), be32(0), be32(-1), be32(0)), int64(len(zkFrame(be32(authXid), be32(opSetAuth), be32(0), be32(-1), be32(0)))))
 		if rs.counters["auth_decoder_error"].Load() != 1 {
 			t.Fatal("negative schemeLen must take the auth decoder_error path")
 		}
@@ -459,7 +461,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 		d, rs := mkDecoder(true)
 		// 4-byte frame: passes nextFrame (frameLen=0 valid), but len(frame)=0 < 8
 		// → decodeFrame fires decoderError("") — plain counter only, no per-opcode.
-		d.decodeOnData(zkFrame(be32(1))) // 4-byte payload = 4-byte frame < universal 8 min
+		d.decodeOnData(zkFrame(be32(1)), int64(len(zkFrame(be32(1))))) // 4-byte payload = 4-byte frame < universal 8 min
 		if rs.counters["decoder_error"].Load() != 1 {
 			t.Fatal("sub-8-byte frame must take the plain decoder_error path")
 		}
@@ -467,7 +469,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 
 	t.Run("flag off gates per-opcode counters", func(t *testing.T) {
 		d, rs := mkDecoder(false)
-		d.decodeOnData(zkFrame(be32(connectXid), be32(0), be32(0))) // 12-byte short connect
+		d.decodeOnData(zkFrame(be32(connectXid), be32(0), be32(0)), int64(len(zkFrame(be32(connectXid), be32(0), be32(0))))) // 12-byte short connect
 		if rs.counters["decoder_error"].Load() != 1 {
 			t.Fatal("plain decoder_error must fire regardless of flag")
 		}
@@ -483,7 +485,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 // overwrites); control requests append to the per-xid FIFO queue.
 func TestDecodeCorrelationStructuresPopulated(t *testing.T) {
 	d, _, _ := newTestDecoder(t)
-	d.decodeOnData(dataFrame(7, opGetData, padTo(opGetData)))
+	d.decodeOnData(dataFrame(7, opGetData, padTo(opGetData)), int64(len(dataFrame(7, opGetData, padTo(opGetData)))))
 	pr, ok := d.requestsByXid[7]
 	if !ok || pr.opname != "getdata" || pr.wireOpcode != opGetData {
 		t.Fatalf("requestsByXid[7] = (%+v, %v), want getdata entry", pr, ok)
@@ -492,15 +494,81 @@ func TestDecodeCorrelationStructuresPopulated(t *testing.T) {
 	// chainConsumed after first call = len(dataFrame(7, opGetData, padTo(opGetData))).
 	first := dataFrame(7, opGetData, padTo(opGetData))
 	second := dataFrame(7, opExists, padTo(opExists))
-	d.decodeOnData(append(first, second...))
+	d.decodeOnData(append(first, second...), int64(len(append(first, second...))))
 	if d.requestsByXid[7].opname != "exists" {
 		t.Fatalf("requestsByXid[7].opname = %q, want exists (insert overwrites)", d.requestsByXid[7].opname)
 	}
 	// Control FIFO: two pings queue in order.
 	d2, _, _ := newTestDecoder(t)
 	ping := zkFrame(be32(pingXid), be32(opPing))
-	d2.decodeOnData(append(append([]byte{}, ping...), ping...))
+	d2.decodeOnData(append(append([]byte{}, ping...), ping...), int64(len(append(append([]byte{}, ping...), ping...))))
 	if got := len(d2.controlRequestsByXid[pingXid]); got != 2 {
 		t.Fatalf("control queue len = %d, want 2 (FIFO per control xid)", got)
+	}
+}
+
+// --- §3.3 drain-regime re-base (28.1b) ---
+
+// TestDecodeFeedAfterRuntimeDrain proves the §3.3 re-base: after the runtime
+// drains the chain buffer (terminal handoff / post-handoff replay), the
+// physical chainBytes slice RESTARTS while totalAppended keeps growing — the
+// decoder must keep decoding the new tail with no drop and no double-count.
+func TestDecodeFeedAfterRuntimeDrain(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	ping := zkFrame(be32(pingXid), be32(opPing))
+	getdata := dataFrame(1, opGetData, padTo(opGetData))
+
+	// Pre-drain feed: cumulative regime (chainBytes == all bytes ever appended).
+	d.decodeOnData(ping, int64(len(ping)))
+	// The runtime now drains the chain buffer (handoff or replay-pass drain).
+	// Post-drain feed: chainBytes holds ONLY the new bytes; totalAppended is
+	// cumulative across the drain.
+	d.decodeOnData(getdata, int64(len(ping)+len(getdata)))
+
+	if got := counterValue(t, rs, "ping_rq"); got != 1 {
+		t.Fatalf("ping_rq = %d, want 1 (no double-count across the drain)", got)
+	}
+	if got := counterValue(t, rs, "getdata_rq"); got != 1 {
+		t.Fatalf("getdata_rq = %d, want 1 (no drop across the drain)", got)
+	}
+}
+
+// TestDecodeHandoffBoundarySequence proves the exact handoff regime: cumulative
+// feeds pre-handoff, then a drain, then per-replay delta feeds — every frame
+// decoded exactly once.
+func TestDecodeHandoffBoundarySequence(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	f1 := zkFrame(be32(pingXid), be32(opPing))
+	f2 := dataFrame(1, opGetData, padTo(opGetData))
+	f3 := dataFrame(2, opGetData, padTo(opGetData))
+
+	// Pre-handoff: two cumulative feeds (the chain buffer accumulates).
+	d.decodeOnData(f1, int64(len(f1)))
+	cum := append(append([]byte{}, f1...), f2...)
+	d.decodeOnData(cum, int64(len(cum)))
+	// Handoff: the runtime drains the buffer. Post-handoff replay feeds are
+	// per-pass deltas (the replay drains after each pass).
+	d.decodeOnData(f3, int64(len(cum)+len(f3)))
+
+	if got := counterValue(t, rs, "ping_rq"); got != 1 {
+		t.Fatalf("ping_rq = %d, want 1", got)
+	}
+	if got := counterValue(t, rs, "getdata_rq"); got != 2 {
+		t.Fatalf("getdata_rq = %d, want 2 (f2 pre-handoff + f3 post-handoff, each exactly once)", got)
+	}
+}
+
+// TestDecodePartialFrameAcrossDrainBoundary: a frame whose bytes arrive split
+// across the drain boundary (first half pre-drain cumulative, second half
+// post-drain delta) must still reassemble in the decoder-internal readBuf.
+func TestDecodePartialFrameAcrossDrainBoundary(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	frame := dataFrame(1, opGetData, padTo(opGetData))
+	cut := len(frame) / 2
+
+	d.decodeOnData(frame[:cut], int64(cut))        // pre-drain: first half
+	d.decodeOnData(frame[cut:], int64(len(frame))) // post-drain: second half only
+	if got := counterValue(t, rs, "getdata_rq"); got != 1 {
+		t.Fatalf("getdata_rq = %d, want 1 (reassembled across the drain boundary)", got)
 	}
 }

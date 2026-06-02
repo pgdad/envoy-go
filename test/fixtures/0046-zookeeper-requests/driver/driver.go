@@ -3,23 +3,17 @@
 // and Task 16 (part 2).
 //
 // ============================================================================
-// DISABLED at 28.1a — re-enabled at 28.1b
+// RE-ENABLED at 28.1b — the read-side seam
 // ============================================================================
 //
-// This driver's blank-import in test/differential/runner_test.go is commented
-// out at the 28.1a closure (the ADR-0045 28.1a/28.1b split, user-approved
-// 2026-06-02). The fixture code is correct but its multi-frame arms (2, 3, 4)
-// are RED on envoy-go: the network chain runtime exits its read loop
-// permanently at terminal handoff (manager.go serveNetworkChain:
-// TerminalReady() -> HandleTerminal() -> return), so a
-// [zookeeper_proxy, tcp_proxy] chain delivers only the FIRST socket read's
-// bytes to zookeeper_proxy's OnData. Reference Envoy re-iterates read filters
-// on every read for the connection's lifetime, so multi-frame connections show
-// cross-side stat divergence (reference counts all frames; envoy-go counts
-// only the first). 28.1b designs the symmetric READ-side seam (the SPEC
-// designed only the WriteFilter seam), then re-enables this import and proves
-// the fixture green. See PROGRESS.md Task 16 BLOCKED analysis + the 28.1a
-// closure entry.
+// This driver was committed-but-DISABLED at the 28.1a closure (the ADR-0045
+// 28.1a/28.1b split): its multi-frame arms (2, 3, 4) require every socket
+// read of a connection to reach zookeeper_proxy.OnData, which the 28.1a chain
+// runtime did not do post-terminal-handoff. The 28.1b read-side seam
+// (readChainConn + chainRuntime.replayRead — 28.1b SPEC §3, ADR-0221 §AMEND)
+// re-feeds post-handoff reads through the read chain, restoring reference
+// Envoy's forever-re-iteration parity; this fixture is its cross-side proof
+// (R8). Re-enabled (runner blank-import restored) at 28.1b Task 7.
 //
 // It is the FIRST cross-side fixture for the
 // zookeeper_proxy network filter (ADR-0222): each listener's filter chain is

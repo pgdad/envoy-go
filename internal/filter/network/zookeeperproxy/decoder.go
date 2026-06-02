@@ -31,12 +31,15 @@ type requestDecoder struct {
 	cfg   *compiledConfig
 	stats *rosterStats
 
-	// chainConsumed is the high-water mark of chain-buffer bytes already fed
-	// into readBuf (D-S28.1-3, PLAN-resolved: the mark lives on the decoder).
-	// The chain buffer accumulates undrained bytes across reads, so
-	// decodeOnData receives the FULL buffer each call and feeds only the new
-	// tail — re-delivered bytes are never double-counted.
-	chainConsumed int
+	// chainConsumed is the high-water mark of bytes already fed into readBuf,
+	// kept against Buffer.TotalAppended() — NOT against the physical chain-buffer
+	// length (28.1b §3.3 re-base; redesigns the 28.1 SPEC §4.5 basis). The
+	// never-before-seen bytes are always the trailing (totalAppended −
+	// chainConsumed) bytes of chainBytes: bytes are only ever appended at the
+	// tail and only ever drained at the head, and the runtime never drains
+	// bytes the filters have not yet been shown (the §3.3 soundness invariant).
+	// int64 in lockstep with TotalAppended (D-S28.1b-1).
+	chainConsumed int64
 
 	// readBuf is the decoder-internal reassembly buffer (AMEND-A8): complete
 	// frames are decoded + consumed; a trailing partial frame survives until
@@ -61,15 +64,18 @@ func newRequestDecoder(cfg *compiledConfig, rs *rosterStats) *requestDecoder {
 	}
 }
 
-// decodeOnData feeds the FULL current chain-buffer contents into the decoder.
-// Only bytes past the high-water mark are appended to readBuf (a COPY — the
-// chain buffer is never aliased or mutated); then complete frames are decoded
-// in a loop. Decode failures abandon readBuf (AMEND-A8 no-resync) but never
-// affect the chain buffer or the connection.
-func (d *requestDecoder) decodeOnData(chainBytes []byte) {
-	if len(chainBytes) > d.chainConsumed {
-		d.readBuf = append(d.readBuf, chainBytes[d.chainConsumed:]...)
-		d.chainConsumed = len(chainBytes)
+// decodeOnData feeds the current chain-buffer contents into the decoder.
+// totalAppended is the buffer's monotonic Buffer.TotalAppended() value; the
+// high-water mark (chainConsumed) is kept against IT, not against the physical
+// buffer length, so the feed is correct regardless of runtime drains (the
+// 28.1b read seam drains the buffer at handoff and after every post-handoff
+// replay pass). On any never-drained execution TotalAppended() == Len(), so
+// this selects byte-for-byte the same slice the 28.1a feed selected (the §3.3
+// equivalence — existing assertions unchanged).
+func (d *requestDecoder) decodeOnData(chainBytes []byte, totalAppended int64) {
+	if newCount := totalAppended - d.chainConsumed; newCount > 0 {
+		d.readBuf = append(d.readBuf, chainBytes[int64(len(chainBytes))-newCount:]...)
+		d.chainConsumed = totalAppended
 	}
 	for {
 		frame, ok := d.nextFrame()
