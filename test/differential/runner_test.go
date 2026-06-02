@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -70,6 +71,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0045-sni-cluster/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0046-zookeeper-requests/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0047-zookeeper-boot-reject/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0048-zookeeper-responses/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -838,6 +840,19 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptSinkCounting(ln, bo.accepts)
+		case fixture.TCPZKResponder:
+			// ZooKeeper-aware canned responder (28.2 SPEC §5.1): for every request
+			// frame, wait the fixed zkResponderDelay then write a correlated canned
+			// response (+ the D-S28.2-2 trigger behaviors). The fixed delay is the
+			// deterministic-threshold construction (parent D-P9).
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptZKResponder(ln, bo.accepts)
 		}
 		backends[i] = bo
 	}
@@ -1272,6 +1287,115 @@ func acceptSinkCounting(ln net.Listener, counter *atomic.Uint64) {
 			defer func() { _ = c.Close() }()
 			_, _ = io.Copy(io.Discard, c)
 		}(c)
+	}
+}
+
+// zkResponderDelay is the TCPZKResponder fixed pre-response delay (D-S28.2-2:
+// 10 ms — 10x the 0048 slow-arm 1ms threshold, so every measured latency is
+// deterministically ≥ the delay on both sides; parent D-P9).
+const zkResponderDelay = 10 * time.Millisecond
+
+// TCPZKResponder trigger opcodes (D-S28.2-2). The responder peeks the request
+// frame's opcode int (bytes 4-8) for data requests only.
+const (
+	zkTriggerWrongXid  int32 = 6 // getacl → respond with xid+1000 (uncorrelated → decoder_error)
+	zkTriggerWatchPush int32 = 3 // exists → normal response + unsolicited watch-event push
+)
+
+// acceptZKResponder accepts connections, counts them, and runs the ZooKeeper-aware
+// canned-response loop on each (the TCPZKResponder backend — 28.2 SPEC §5.1; the
+// acceptSinkCounting sibling). The responder parses ONLY the request frame's
+// length prefix + leading xid + (for data requests) the opcode int; it is NOT a
+// ZooKeeper server (no session/watch semantics).
+func acceptZKResponder(ln net.Listener, counter *atomic.Uint64) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		counter.Add(1)
+		go zkRespondLoop(c)
+	}
+}
+
+// zkRespondLoop reads request frames and writes canned responses until the
+// client closes (read error / EOF). zxid is monotonic per connection.
+func zkRespondLoop(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	be32 := func(v int32) []byte {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b
+	}
+	be64 := func(v int64) []byte {
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, uint64(v))
+		return b
+	}
+	writeFrame := func(payload []byte) bool {
+		out := append(be32(int32(len(payload))), payload...)
+		_, err := c.Write(out)
+		return err == nil
+	}
+	var zxid int64
+	for {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
+			return // client closed / EOF
+		}
+		frameLen := int32(binary.BigEndian.Uint32(lenBuf[:]))
+		if frameLen < 4 || frameLen > 1<<20 {
+			return // malformed / hostile — drop the connection
+		}
+		frame := make([]byte, frameLen)
+		if _, err := io.ReadFull(c, frame); err != nil {
+			return
+		}
+		xid := int32(binary.BigEndian.Uint32(frame[0:4]))
+
+		// The fixed pre-response delay (every response, triggers included).
+		time.Sleep(zkResponderDelay)
+
+		if xid == 0 {
+			// Connect request → canned connect response (20 bytes):
+			// proto_version(0) + timeout(30000) + session_id + password(len 0).
+			resp := append(append(append(be32(0), be32(30000)...), be64(0x5A5A)...), be32(0)...)
+			if !writeFrame(resp) {
+				return
+			}
+			continue
+		}
+
+		// Data/control request → standard response: xid(echoed) + zxid(8,
+		// monotonic) + error(4, 0) = 16 bytes. Triggers adjust.
+		opcode := int32(0)
+		if len(frame) >= 8 {
+			opcode = int32(binary.BigEndian.Uint32(frame[4:8]))
+		}
+		zxid++
+		respXid := xid
+		if opcode == zkTriggerWrongXid {
+			respXid = xid + 1000 // the wrong-xid trigger (D-S28.2-2)
+		}
+		resp := append(append(be32(respXid), be64(zxid)...), be32(0)...)
+		if !writeFrame(resp) {
+			return
+		}
+		if opcode == zkTriggerWatchPush {
+			// The watch-event push trigger (D-S28.2-2): an unsolicited
+			// watch-event frame after the normal response, in the FULL
+			// ReplyHeader format (D-S28.2-1 — upstream parseWatchEvent):
+			// xid(−1) + zxid(8) + error(0) + event_type(1=created) +
+			// client_state(3=connected) + path-len + path.
+			zxid++
+			path := []byte("/zk-watch")
+			push := append(append(append(append(append(
+				be32(-1), be64(zxid)...), be32(0)...), be32(1)...), be32(3)...),
+				append(be32(int32(len(path))), path...)...)
+			if !writeFrame(push) {
+				return
+			}
+		}
 	}
 }
 
@@ -1757,5 +1881,102 @@ func waitTCPDial(ctx context.Context, addr string, timeout time.Duration) error 
 			return ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}
+	}
+}
+
+// TestZKResponderBackend unit-tests the TCPZKResponder accept loop against a raw
+// TCP client (no proxies): canned connect response, xid-echoed standard
+// responses with the fixed pre-response delay, the wrong-xid trigger (getacl),
+// and the watch-event-push trigger (exists). This proves the backend BEFORE the
+// docker-dependent 0048 fixture consumes it (Task 9).
+func TestZKResponderBackend(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	var accepts atomic.Uint64
+	go acceptZKResponder(ln, &accepts)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	readFrame := func() []byte {
+		t.Helper()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+			t.Fatalf("read frame length: %v", err)
+		}
+		frame := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+		if _, err := io.ReadFull(conn, frame); err != nil {
+			t.Fatalf("read frame body: %v", err)
+		}
+		return frame
+	}
+	writeFrame := func(payload []byte) {
+		t.Helper()
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+		if _, err := conn.Write(append(lenBuf[:], payload...)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	be32 := func(v int32) []byte {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b
+	}
+
+	// 1. Connect request (leading int32 == 0) → 20-byte connect response, after ≥ the fixed delay.
+	start := time.Now()
+	connectReq := append(append(append(append(be32(0), make([]byte, 8)...), be32(30000)...), make([]byte, 8)...), be32(0)...)
+	writeFrame(connectReq)
+	resp := readFrame()
+	if elapsed := time.Since(start); elapsed < zkResponderDelay {
+		t.Fatalf("connect response arrived after %v, want >= %v (the fixed-delay discipline)", elapsed, zkResponderDelay)
+	}
+	if len(resp) != 20 || int32(binary.BigEndian.Uint32(resp[0:4])) != 0 {
+		t.Fatalf("connect response: len=%d leading=%d, want len=20 leading=0", len(resp), int32(binary.BigEndian.Uint32(resp[0:4])))
+	}
+
+	// 2. Data request (getdata, xid 7) → standard 16-byte response echoing xid 7.
+	writeFrame(append(append(be32(7), be32(4)...), be32(0)...)) // xid 7, op getdata(4), path-len 0
+	resp = readFrame()
+	if len(resp) != 16 || int32(binary.BigEndian.Uint32(resp[0:4])) != 7 {
+		t.Fatalf("data response: len=%d xid=%d, want len=16 xid=7", len(resp), int32(binary.BigEndian.Uint32(resp[0:4])))
+	}
+
+	// 3. Wrong-xid trigger: getacl (op 6, xid 9) → response carries xid 9+1000.
+	writeFrame(append(append(be32(9), be32(6)...), be32(0)...))
+	resp = readFrame()
+	if got := int32(binary.BigEndian.Uint32(resp[0:4])); got != 1009 {
+		t.Fatalf("wrong-xid trigger: response xid = %d, want 1009", got)
+	}
+
+	// 4. Watch-push trigger: exists (op 3, xid 10) → normal response THEN a watch event
+	//    (xid −1, FULL ReplyHeader format — D-S28.2-1: xid+zxid+error+type+state+path ≥ 28 bytes).
+	writeFrame(append(append(be32(10), be32(3)...), be32(0)...))
+	resp = readFrame()
+	if got := int32(binary.BigEndian.Uint32(resp[0:4])); got != 10 {
+		t.Fatalf("watch-push trigger: first response xid = %d, want 10", got)
+	}
+	push := readFrame()
+	if got := int32(binary.BigEndian.Uint32(push[0:4])); got != -1 {
+		t.Fatalf("watch-push trigger: push frame xid = %d, want -1", got)
+	}
+	if len(push) < 28 {
+		t.Fatalf("watch-push frame = %d bytes, want >= 28 (full ReplyHeader — D-S28.2-1)", len(push))
+	}
+	// After xid(4)+zxid(8)+error(4)=16 bytes, event_type must be 1 (created).
+	if got := int32(binary.BigEndian.Uint32(push[16:20])); got != 1 {
+		t.Fatalf("watch-push event_type = %d, want 1", got)
+	}
+
+	if accepts.Load() != 1 {
+		t.Fatalf("accepts = %d, want 1", accepts.Load())
 	}
 }

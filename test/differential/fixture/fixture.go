@@ -498,8 +498,25 @@ const (
 	// decoder — counting *_resp/decoder_error increments that envoy-go's 28.1
 	// OnWrite no-op stub never mirrors → cross-side stat divergence. The 0046
 	// backend MUST be silent. (28.2's 0048 uses a driver-controlled responder —
-	// a separate kind; TCPSink stays request-side-only.)
+	// a separate kind; TCPSink stays request-side-only. That responder is
+	// TCPZKResponder = 29 (landed at 28.2).)
 	TCPSink BackendKind = 28
+	// TCPZKResponder is a ZooKeeper-aware canned-response TCP backend: for every
+	// complete ZK request frame it reads (4-byte BE length prefix + frame), it
+	// waits a FIXED delay (zkResponderDelay, 10ms — D-S28.2-2), then writes a
+	// correlated canned response frame. Added at 28.2 for 0048-zookeeper-responses
+	// (28.2 SPEC §5). The fixed delay is the deterministic-threshold construction
+	// (parent D-P9): every measured latency is ≥ the delay on BOTH sides, so a
+	// 1ms threshold makes every response slow and a 3600s threshold makes every
+	// response fast — no cross-side timing nondeterminism. Trigger behaviors
+	// (D-S28.2-2): a getacl request (wire op 6) is answered with xid+1000
+	// (→ decoder_error both sides); an exists request (wire op 3) is answered
+	// normally THEN followed by an unsolicited watch-event push (xid −1, full
+	// ReplyHeader format — D-S28.2-1).
+	// NEW BackendKind per reference_differential_fixture_dispatch_constraint
+	// (one fixture dir = one runner branch); TCPSink stays request-side-only
+	// (the fixture.go:500 pin).
+	TCPZKResponder BackendKind = 29
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

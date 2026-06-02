@@ -130,22 +130,56 @@ func TestFilterMultiReadNoDoubleCount(t *testing.T) {
 	}
 }
 
-// TestFilterOnWritePureNoOp: OnWrite is a PURE no-op Continue at 28.1 (SPEC §4.7 pin):
-// no buffering, no counting, no mutation.
-func TestFilterOnWritePureNoOp(t *testing.T) {
+// TestFilterOnWriteFeedsDecoder: OnWrite feeds the decoder's write side (the 28.2
+// response decoder — ADR-0223) and ALWAYS returns Continue (R3 extended to the
+// write side — SPEC §3.2 item 5).
+func TestFilterOnWriteFeedsDecoder(t *testing.T) {
 	f := newTestFilter(t)
-	buf := &network.Buffer{}
-	buf.Append([]byte("response-direction bytes"))
-	if got := f.OnWrite(buf, false); got != network.Continue {
-		t.Fatalf("OnWrite = %v, want Continue", got)
+	// Pre-load a pending request so the response correlates.
+	reqBuf := &network.Buffer{}
+	reqBuf.Append(dataFrame(1, opGetData, padTo(opGetData)))
+	f.OnData(reqBuf, false)
+
+	respBuf := &network.Buffer{}
+	resp := stdRespFrame(1, 100, 0)
+	respBuf.Append(resp)
+	before := respBuf.Len()
+	if got := f.OnWrite(respBuf, false); got != network.Continue {
+		t.Fatalf("OnWrite = %v, want Continue (always — R3)", got)
 	}
-	if buf.Len() != 24 {
-		t.Fatal("OnWrite must not touch the buffer")
+	if respBuf.Len() != before {
+		t.Fatalf("OnWrite drained/mutated the chain buffer (len %d -> %d) — FORBIDDEN (R3)", before, respBuf.Len())
 	}
-	// No counter moved — spot-check decoder_error + response_bytes stay 0.
 	rs := f.cfg.stats
-	if rs.counters["decoder_error"].Load() != 0 || rs.counters["response_bytes"].Load() != 0 {
-		t.Fatal("OnWrite must not increment any counter at 28.1")
+	if got := rs.counters["getdata_resp"].Load(); got != 1 {
+		t.Fatalf("getdata_resp = %d, want 1 (OnWrite must feed the response decoder)", got)
+	}
+	if got := rs.counters["response_bytes"].Load(); got != uint64(len(resp)) {
+		t.Fatalf("response_bytes = %d, want %d", got, len(resp))
+	}
+}
+
+// TestFilterOnWritePartialFramesAcrossCalls: response bytes split across multiple
+// OnWrite calls (each a FRESH per-Write Buffer — writeconn.go:35) reassemble in
+// the decoder's writeBuf (SPEC §3.2 item 1: no write-side TotalAppended; each
+// OnWrite call's bytes are appended directly).
+func TestFilterOnWritePartialFramesAcrossCalls(t *testing.T) {
+	f := newTestFilter(t)
+	reqBuf := &network.Buffer{}
+	reqBuf.Append(dataFrame(1, opGetData, padTo(opGetData)))
+	f.OnData(reqBuf, false)
+
+	resp := stdRespFrame(1, 100, 0)
+	cut := len(resp) / 2
+	for _, half := range [][]byte{resp[:cut], resp[cut:]} {
+		b := &network.Buffer{} // fresh per-Write Buffer, exactly as writeChainConn.Write does
+		b.Append(half)
+		if got := f.OnWrite(b, false); got != network.Continue {
+			t.Fatalf("OnWrite = %v, want Continue", got)
+		}
+	}
+	if got := f.cfg.stats.counters["getdata_resp"].Load(); got != 1 {
+		t.Fatalf("getdata_resp = %d, want 1 (reassembled across OnWrite calls)", got)
 	}
 }
 

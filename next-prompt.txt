@@ -1,49 +1,47 @@
-START a fresh cold-start session for envoy-go — **the phase 28.2 PLAN is DONE + plan-document-reviewer APPROVED + squash-merged + pushed** (the squash SHA is recorded in `docs/envoy-go/STATE.md` last-commit). The active phase is **phase 28** (parent `in-progress`; sub-rows `28.1a` `done`, `28.1b` `done`, `28.2` `in-progress`). This session executes the **28.2 IMPL** — per SKILL_ROUTING **state 3** (PLAN.md exists, implementation incomplete → `superpowers:subagent-driven-development` per `feedback_execution_style`).
+START a fresh cold-start session for envoy-go — **phase 28 is DONE (all three sub-phases + the parent row rolled) + squash-merged + pushed** (the squash SHA is recorded in `docs/envoy-go/STATE.md` last-commit). No phase is in flight. Per SKILL_ROUTING **state 0** (no active phase → `superpowers:brainstorming` for the next phase).
 
-Phase 28 (`network-filter-zookeeper-proxy`) lands `zookeeper_proxy` at both-direction COUNTER parity. 28.1a (write seam + request package; squash `8703aeb`) + 28.1b (read seam + cross-side proof; squash `fdf40ea`) are DONE; the 28.2 SPEC (squash `11920be`) + PLAN are DONE. **28.2 is the FINAL sub-phase**: this IMPL session lands the response decoder + the per-connection mutex + latency-threshold counters + `TCPZKResponder`/`0048` + the phase-28 completion bundle incl. the ATOMIC parent-row-28 ROLLUP, and CLOSES phase 28. The 28.2 PLAN (`docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/PLAN.md`) is this session's master document; the 28.2 SPEC stays the design authority behind it.
+Phase 28 (`network-filter-zookeeper-proxy`) DELIVERED: the `network.WriteFilter` seam (ADR-0221) + complete both-direction zookeeper_proxy counter parity (ADR-0222 request side + ADR-0223 response side + latency-threshold counters) across 3 sub-phases — 28.1a (write seam + request package; squash `8703aeb`), 28.1b (read seam + cross-side proof; squash `fdf40ea`), 28.2 (response decoder + mutex + latency + rollup; squash `(filled at squash by the controller)`). All 3 ADR bodies landed. Six gates GREEN LIVE at 28.2 close: 50/50 differential, h2spec 53/53, proxy-wasm 10/10.
 
 ## What this session must do
 
-Execute the **11-task 28.2 PLAN** via `superpowers:subagent-driven-development`: one fresh subagent per task, controller reviews between tasks. Work in a git worktree (`feedback_git_worktrees`); subagents commit **LOCAL-ONLY** (`feedback_subagents_no_push`); the controller squash-merges to master + pushes at stage-close (`feedback_push_to_origin`). The 11 tasks:
+Per SKILL_ROUTING **state 0**: invoke `superpowers:brainstorming` to select and scope the next phase. The 4 remaining §9 Network-filters-family candidates are:
 
-1. First-action baselines/anchors gate (counts: 49 dirs / 37 fuzzers / 337 stats / tail ADR-0223; ports 15050–15053 free; the 31-row anchor table).
-2. Decoder rename (`requestDecoder` → `decoder`) + `writeBuf`/`mu` fields + request-path locking (existing tests stay green, assertions UNCHANGED).
-3. Write-side reassembly (`decodeOnWrite`/`nextWriteFrame`/`responseError`) + the UNCORRELATED dispatch rows (watch event / unknown / short / oversized) + unit tests.
-4. CORRELATED dispatch (connect / control / data) + correlation consumption (erase-on-lookup + FIFO pop + **the connect_readonly→connect mapping** — the closed-roster panic trap) + byte accounting + unit tests.
-5. Latency-threshold counters (`recordLatency`: `<=` INCLUSIVE; wire-opcode-keyed overrides; flag-gated; injectable-duration boundary tests).
-6. `OnWrite` glue (replaces the 28.1 no-op) + the §3.6 concurrent request/response race test (`-race -count=5`).
-7. The 38th fuzzer (`FuzzZookeeperResponseDecode`).
-8. `TCPZKResponder BackendKind = 29` + `acceptZKResponder` runner arm + unit test (D-S28.2-2: `getacl` wrong-xid / `exists` watch-push triggers; fixed 10 ms delay).
-9. `0048-zookeeper-responses` 4-listener/8-arm cross-side fixture + GREEN + R4 deliberate-break (`-count=1`) + README.
-10. ADR-0223 §Decision/§Consequences body + the BEHAVIOR_CONTRACT 28.2 bundle.
-11. Six-gate (50-dir differential `-count=1`; h2spec; proxy-wasm) + STATE.md + **the ROADMAP ATOMIC rollup (sub-row 28.2 AND parent row 28 → done)** + next-prompt.txt for the next-phase (state 0) cold-start.
+- **mongo_proxy** — natural next (consumer #2 of the `network.WriteFilter` conn-wrap seam, per ADR-0221 §Consequences anticipation; both-direction decode + counter parity analogous to zookeeper_proxy)
+- **redis_proxy** — the Redis protocol filter
+- **kafka_broker** — the Kafka protocol filter
+- **thrift_proxy** — the Thrift protocol filter
 
-## Load-bearing pins the IMPL MUST honor (from the SPEC + PLAN)
-
-1. **The §3.6 mutex scope:** one per-connection `sync.Mutex` guarding EXACTLY the two correlation maps; `readBuf`/`writeBuf`/`chainConsumed` stay lock-free (single-goroutine-owned); entries copied out under the lock; counter increments + latency math OUTSIDE the lock; the pre-handoff request path locks too. ADR-0223's body records this as the discharged ADR-0221 forward-pointer.
-2. **The connect_readonly → connect response mapping** (SPEC §3.4 item 4): connect responses ALWAYS use opname `connect`. A naive `inc(entry.opname + "_resp")` PANICS on the closed roster.
-3. **No write-side TotalAppended:** `OnWrite` appends `buf.Bytes()` to `writeBuf` directly (fresh per-Write Buffer — `writeconn.go:35`).
-4. **Correlate-then-validate** (PLAN refinement 2 — upstream parity): correlation pops/erases BEFORE framing validation; post-correlation failures fire the flag-gated `<opname>_decoder_error`.
-5. **The deterministic-threshold discipline:** ONE `TCPZKResponder` (fixed 10 ms delay) serves BOTH threshold arms (3600s → all fast; 0.001s → all slow); `l_slow` also carries the GetData 3600s override arm.
-6. **ALL differential runs use `-count=1`** (`reference_differential_break_protocol_count1`); R4 breaks are recorded + reverted; per-task `gofmt -l` + `golangci-lint` (`feedback_pertask_gofmt_lint`).
-7. **No framework changes** (SPEC §2.4): `chain.go`/`readconn.go`/`writeconn.go`/`buffer.go`/`manager.go`/`tcp_proxy`/HCM/`config.go`/`stats.go`/`name.go` ALL untouched.
-8. **Counts after IMPL:** fixtures 49 → **50**; fuzzers 37 → **38**; stat surface **337** (UNCHANGED — increments only); DECISIONS tail **ADR-0223** / next-free **ADR-0224** (UNCHANGED — no new ADR number; the ADR-0223 body lands in place per ADR-0044).
-9. **The ATOMIC parent rollup** (SPEC §7.3): sub-row 28.2 AND parent row 28 flip `→ done` in the SAME commit at Task 11; family candidates 5 → 4; STATE advances to SKILL_ROUTING state 0.
+mongo_proxy is the natural next but the choice is the brainstorm's. Other ROADMAP families (Load balancing, Upstream robustness, HTTP/3+QUIC, gRPC, xDS, Observability) are also valid brainstorm targets.
 
 ## Project state at master tip
 
-- **Master tip:** `c02b950` (the STATE.md SHA-fill docs commit; actual HEAD at repoint time, trails the substantive 28.2-PLAN squash `6c60d36` by +1). This repoint itself advances the tip +1 (expected, not chased); confirm the live tip via `git log --oneline -1`. Substantive predecessors: the 28.2-PLAN squash `6c60d36`, the 28.2-SPEC squash `11920be`, the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
-- **§9 Network-filters family:** rows 26 (parent + sub-rows) + 27 DONE; row 28 `in-progress` (28.1a `done`, 28.1b `done`, 28.2 `in-progress`). After phase 28 phase-done, 4 family candidates remain (`redis`/`mongo`/`kafka_broker`/`thrift`).
+- **Master tip:** `(filled at squash by the controller)`. Confirm the live tip via `git log --oneline -1`.
+- **Substantive predecessors:** the 28.2-IMPL squash `(filled at squash by the controller)`, the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
+- **§9 Network-filters family:** rows 26 (parent + sub-rows) + 27 + 28 (parent + 28.1a + 28.1b + 28.2) ALL DONE. 4 candidates remain: redis/mongo/kafka_broker/thrift.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
-- **Known coverage boundaries (carried, non-blocking):** D-26.3-4; the `tcp_proxy` `downstream_cx_*` family unmirrored; histograms deferred (ADR-0060 — incl. the `*_response_latency` family 28.2 keeps deferred); zookeeper dynamic-metadata deferred (AMEND-A9) + shallow-decode leniency (extends to the response side at 28.2) + terminal-originated-writes-only + the write-only-filter boot boundary + the post-handoff observational boundaries (28.1b SPEC §3.5).
+
+## Counts at session open
+
+- **Fixtures:** 50 (tail `0048-zookeeper-responses`)
+- **Fuzzers:** 38
+- **Stat surface:** 337
+- **DECISIONS.md tail:** ADR-0223 (next-free ADR-0224)
+- **Conformance:** h2spec 53/53; proxy-wasm 10/10 (as of the 28.2 six-gate)
+
+## Known coverage boundaries (carried, non-blocking)
+
+- D-26.3-4 (network rbac coverage boundary)
+- `tcp_proxy` `downstream_cx_*` family unmirrored (pre-existing gap)
+- Histograms deferred (ADR-0060) — incl. the `*_response_latency` family from zookeeper_proxy
+- Zookeeper dynamic-metadata deferred (AMEND-A9) + shallow-decode leniency (extends to the response side per AMEND-A8) + terminal-originated-writes-only + write-only-filter boot boundary
+- Post-handoff observational boundaries (28.1b SPEC §3.5)
 
 ## Read first (in order)
 
-1. THIS FILE — the 28.2-IMPL cold-start.
-2. `docs/envoy-go/STATE.md` — active-phase `phase 28.2 PLAN done`; next-skill `superpowers:subagent-driven-development`; the squash SHA in last-commit.
-3. `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/PLAN.md` — THE master document for this session (11 tasks; complete TDD steps + code; the File Structure untouched-files pin; the acceptance checklist).
-4. `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/SPEC.md` — the design authority (esp. §3 response decoder + §3.6 mutex + §4 latency + §5 fixture/backend + §12 acceptance).
-5. `docs/envoy-go/DECISIONS.md` ADR-0221 (the discharged-at-28.2 forward-pointer) + ADR-0222 (the request package) + ADR-0223 (§Context + §AMEND; body lands at Task 10).
-6. The as-built code the PLAN extends: `internal/filter/network/zookeeperproxy/` + `internal/filter/network/writeconn.go` + `test/differential/fixture/fixture.go:493-510` + `test/differential/runner_test.go:827-841,1258-1276` + `test/fixtures/0046-zookeeper-requests/driver/driver.go` (the 0048 template).
-7. `docs/envoy-go/SKILL_ROUTING.md` (state 3) + the BOOTSTRAP §4/§5 cold-start invariants.
-8. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + subagents-no-push + per-task gofmt/lint + the network-filter constraints + the differential dispatch/asserter/break-protocol (`-count=1`) constraints all carry forward.
+1. THIS FILE — the next-phase cold-start prompt.
+2. `docs/envoy-go/STATE.md` — active-phase `phase 28 DONE`; next-skill `superpowers:brainstorming`; project counts.
+3. `docs/envoy-go/ROADMAP.md` §9 Network-filters family — the 4 remaining candidates + rows 26/27/28 as done-family context.
+4. The phase-28 family of SPECs/PROGRESS for as-built zookeeper/seam surface: `docs/envoy-go/phases/28-network-filter-zookeeper-proxy/BRAINSTORM.md`, `docs/envoy-go/phases/28.2-network-filter-zookeeper-responses-and-latency/SPEC.md` + `PROGRESS.md` (esp. the D-S28.2-1 corrected watch-event minimum + the conn-wrap seam surface for mongo_proxy).
+5. `docs/envoy-go/DECISIONS.md` ADR-0221 (WriteFilter seam + ADR-0213 allowance consumed; mongo_proxy = anticipated consumer #2) + ADR-0222 (zookeeper_proxy filter + request side) + ADR-0223 (response side + latency-threshold counters + ADR-0221 forward-pointer discharged).
+6. `docs/envoy-go/SKILL_ROUTING.md` (state 0) + BOOTSTRAP §4/§5 cold-start invariants.
+7. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + subagents-no-push + per-task gofmt/lint + the network-filter constraints + the differential dispatch/asserter/break-protocol (`-count=1`) constraints all carry forward.

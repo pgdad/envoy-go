@@ -37,7 +37,7 @@ func NewFactory(reg *stats.Registry) network.NetworkFilterFactory {
 		}
 		cfg.stats = newRosterStats(reg, cfg.statPrefix)
 		return func() network.NetworkFilter {
-			return &filter{cfg: cfg, decoder: newRequestDecoder(cfg, cfg.stats)}
+			return &filter{cfg: cfg, decoder: newDecoder(cfg, cfg.stats)}
 		}, nil
 	}
 }
@@ -48,7 +48,7 @@ func NewFactory(reg *stats.Registry) network.NetworkFilterFactory {
 type filter struct {
 	network.Marker
 	cfg     *compiledConfig // shared, boot-parsed (incl. the roster counters)
-	decoder *requestDecoder // per-connection (reassembly buf + correlation structures)
+	decoder *decoder        // per-connection (reassembly bufs + correlation structures + mu)
 	cb      network.ReadFilterCallbacks
 	wcb     network.WriteFilterCallbacks
 }
@@ -67,13 +67,20 @@ func (f *filter) OnData(buf *network.Buffer, _ bool) network.Status {
 	return network.Continue
 }
 
-// OnWrite is a PURE no-op Continue at 28.1 (SPEC §4.7 pin). It does NOT buffer
-// write-direction bytes: with no response decoder to drain it, a write-side
-// reassembly buffer would grow unboundedly on long-lived connections. The
-// write-side buffer is created WITH the 28.2 response decoder (ADR-0223). The
-// method exists so the filter satisfies WriteFilter and the 0046 fixture's
-// traffic exercises the writeChainConn → OnWrite seam end-to-end.
-func (f *filter) OnWrite(_ *network.Buffer, _ bool) network.Status { return network.Continue }
+// OnWrite feeds the decoder's write-side reassembly buffer with the
+// upstream→downstream bytes and ALWAYS returns Continue (AMEND-A8
+// unconditional passthrough; R3 — the filter never mutates the chain Buffer,
+// never halts the write, never closes). Each OnWrite call sees a FRESH
+// per-Write *Buffer (writeChainConn.Write allocates one per call), so the
+// bytes are appended directly — no TotalAppended high-water mark is needed on
+// the write side (every byte arrives exactly once by construction; SPEC §3.2
+// item 1 / ADR-0223). Runs on goroutine B (the upstream→downstream pump);
+// the §3.6 decoder mutex makes the correlation-map accesses race-free against
+// goroutine A's request decode.
+func (f *filter) OnWrite(buf *network.Buffer, _ bool) network.Status {
+	f.decoder.decodeOnWrite(buf.Bytes())
+	return network.Continue
+}
 
 // SetReadFilterCallbacks stores the per-connection read callbacks.
 func (f *filter) SetReadFilterCallbacks(cb network.ReadFilterCallbacks) { f.cb = cb }

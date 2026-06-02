@@ -3,9 +3,12 @@ package zookeeperproxy
 import (
 	"bytes"
 	"encoding/binary"
+	"sync"
 	"testing"
+	"time"
 
 	zookeeper_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -50,7 +53,7 @@ func dataFrame(xid, opcode int32, payload []byte) []byte {
 	return zkFrame(be32(xid), be32(opcode), payload)
 }
 
-func newTestDecoder(t *testing.T) (*requestDecoder, *rosterStats, *compiledConfig) {
+func newTestDecoder(t *testing.T) (*decoder, *rosterStats, *compiledConfig) {
 	t.Helper()
 	reg := stats.NewRegistry()
 	cfg, err := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{StatPrefix: "zk"})
@@ -58,7 +61,7 @@ func newTestDecoder(t *testing.T) (*requestDecoder, *rosterStats, *compiledConfi
 		t.Fatal(err)
 	}
 	rs := newRosterStats(reg, "zk")
-	return newRequestDecoder(cfg, rs), rs, cfg
+	return newDecoder(cfg, rs), rs, cfg
 }
 
 func counterValue(t *testing.T, rs *rosterStats, suffix string) uint64 {
@@ -329,7 +332,7 @@ func TestDecodeOversizedThenRecovers(t *testing.T) {
 	cfg, _ := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{StatPrefix: "zk",
 		MaxPacketBytes: wrapperspb.UInt32(64)})
 	rs := newRosterStats(reg, "zk")
-	d := newRequestDecoder(cfg, rs)
+	d := newDecoder(cfg, rs)
 	// Oversized: length prefix says 1000 > 64.
 	oversized := append(be32(1000), make([]byte, 10)...)
 	d.decodeOnData(oversized, int64(len(oversized)))
@@ -355,7 +358,7 @@ func TestDecodeMinLengthViolation(t *testing.T) {
 	cfg, _ := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{StatPrefix: "zk",
 		EnablePerOpcodeDecoderErrorMetrics: true})
 	rs := newRosterStats(reg, "zk")
-	d := newRequestDecoder(cfg, rs)
+	d := newDecoder(cfg, rs)
 	// Only xid+opcode (8 bytes) — getdata minimum is 13.
 	d.decodeOnData(dataFrame(1, opGetData, nil), int64(len(dataFrame(1, opGetData, nil))))
 	if got := rs.counters["decoder_error"].Load(); got != 1 {
@@ -375,7 +378,7 @@ func TestDecodeFlagGatedRequestBytes(t *testing.T) {
 			EnablePerOpcodeRequestBytesMetrics: enabled}
 		cfg, _ := parseConfig(msg)
 		rs := newRosterStats(reg, "zk")
-		d := newRequestDecoder(cfg, rs)
+		d := newDecoder(cfg, rs)
 		frame := dataFrame(1, opGetData, padTo(opGetData))
 		d.decodeOnData(frame, int64(len(frame)))
 		wantWire := uint64(len(frame)) // 4-byte prefix + payload
@@ -398,7 +401,7 @@ func TestDecodeFlagGatedRequestBytes(t *testing.T) {
 // and auth_decoder_error counters are live, and that the universal sub-8-byte
 // path fires plain decoder_error only.
 func TestDecodeControlFrameErrors(t *testing.T) {
-	mkDecoder := func(flagOn bool) (*requestDecoder, *rosterStats) {
+	mkDecoder := func(flagOn bool) (*decoder, *rosterStats) {
 		reg := stats.NewRegistry()
 		cfg, err := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{
 			StatPrefix:                         "zk",
@@ -408,7 +411,7 @@ func TestDecodeControlFrameErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		rs := newRosterStats(reg, "zk")
-		return newRequestDecoder(cfg, rs), rs
+		return newDecoder(cfg, rs), rs
 	}
 
 	t.Run("short connect frame", func(t *testing.T) {
@@ -570,5 +573,558 @@ func TestDecodePartialFrameAcrossDrainBoundary(t *testing.T) {
 	d.decodeOnData(frame[cut:], int64(len(frame))) // post-drain: second half only
 	if got := counterValue(t, rs, "getdata_rq"); got != 1 {
 		t.Fatalf("getdata_rq = %d, want 1 (reassembled across the drain boundary)", got)
+	}
+}
+
+// --- response frame builders (28.2; big-endian; 4-byte length prefix EXCLUDES itself) ---
+
+// stdRespFrame builds a standard response frame: xid(4) + zxid(8) + error(4)
+// (SPEC §3.3 rows 3/4 framing).
+func stdRespFrame(xid int32, zxid int64, errCode int32) []byte {
+	return zkFrame(be32(xid), be64(zxid), be32(errCode))
+}
+
+// connectRespFrame builds a connect response: proto_version(4=0) + timeout(4) +
+// session_id(8) + password(4-byte len + bytes) — NO zxid, NO error (SPEC §3.3
+// row 1). The leading proto_version=0 doubles as the sniffed connectXid.
+// Used at Task 4.
+func connectRespFrame(pwLen int) []byte {
+	return zkFrame(be32(0), be32(30000), be64(0x1234), be32(int32(pwLen)), make([]byte, pwLen))
+}
+
+// watchEventFrame builds a server-initiated watch event with the full ReplyHeader
+// (upstream decoder.cc decodeOnWrite + parseWatchEvent — every non-connect response
+// carries xid+zxid+error): xid(-1) + zxid(8) + error(4) + event_type(4) +
+// client_state(4) + path(4-byte len + bytes).
+// (SPEC §3.3 row 2; min length 28 per D-S28.2-1 upstream verification — the SPEC's
+// 16-byte pin omitted zxid+error and was corrected to upstream's value at IMPL.)
+func watchEventFrame(path string) []byte {
+	return zkFrame(be32(watchXid), be64(0), be32(0), be32(1), be32(3), be32(int32(len(path))), []byte(path))
+}
+
+// feedRequest feeds one request frame through decodeOnData using the decoder's
+// own high-water mark for the totalAppended bookkeeping (a per-call delta feed).
+// Used at Task 4.
+func feedRequest(d *decoder, frame []byte) {
+	d.decodeOnData(frame, d.chainConsumed+int64(len(frame)))
+}
+
+// --- Task 3 (28.2): write-side reassembly + framing + uncorrelated dispatch ---
+
+// A watch event (xid −1) increments watch_event + response_bytes and NOTHING
+// else: never correlated, no per-opcode counter, no latency (SPEC §3.3 row 2).
+func TestDecodeWatchEvent(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	frame := watchEventFrame("/zk-test")
+	d.decodeOnWrite(frame)
+	if got := counterValue(t, rs, "watch_event"); got != 1 {
+		t.Fatalf("watch_event = %d, want 1", got)
+	}
+	// wireFootprint = 4-byte prefix + payload; watchEventFrame returns the
+	// PREFIXED frame, so the footprint equals len(frame).
+	if got := counterValue(t, rs, "response_bytes"); got != uint64(len(frame)) {
+		t.Fatalf("response_bytes = %d, want %d", got, len(frame))
+	}
+	if got := counterValue(t, rs, "decoder_error"); got != 0 {
+		t.Fatalf("decoder_error = %d, want 0", got)
+	}
+}
+
+// A short watch event (< 28 bytes payload) → decoder_error + abandon.
+func TestDecodeWatchEventTooShort(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	d.decodeOnWrite(zkFrame(be32(watchXid), be32(1))) // 8-byte payload < 28
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1", got)
+	}
+	if got := counterValue(t, rs, "watch_event"); got != 0 {
+		t.Fatalf("watch_event = %d, want 0", got)
+	}
+
+	// A frame that satisfies the SPEC's original (incorrect) 16-byte minimum but
+	// not upstream's 28-byte ReplyHeader minimum → decoder_error (D-S28.2-1:
+	// upstream's value is load-bearing). This frame is 24 bytes: xid(4) +
+	// event_type(4) + client_state(4) + path-len(4) + path(8) = 24 — it would
+	// have passed the old 16-byte minimum but must fail the corrected 28-byte one.
+	d2, rs2, _ := newTestDecoder(t)
+	d2.decodeOnWrite(zkFrame(be32(watchXid), be32(1), be32(3), be32(8), []byte("/zk-test")))
+	if got := counterValue(t, rs2, "decoder_error"); got != 1 {
+		t.Fatalf("24-byte watch frame: decoder_error = %d, want 1 (28-byte upstream minimum)", got)
+	}
+	if got := counterValue(t, rs2, "watch_event"); got != 0 {
+		t.Fatalf("24-byte watch frame: watch_event = %d, want 0", got)
+	}
+}
+
+// An unknown negative xid (not 0/−1/−2/−4/−8) → decoder_error + abandon
+// (SPEC §3.3 row 5 — upstream unknown-xid onDecodeError parity).
+func TestDecodeResponseUnknownNegativeXid(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	d.decodeOnWrite(stdRespFrame(-3, 1, 0))
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1", got)
+	}
+}
+
+// A response frame shorter than the universal 4-byte minimum → decoder_error.
+func TestDecodeResponseTooShortForXid(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	d.decodeOnWrite(zkFrame([]byte{0x00, 0x01})) // 2-byte payload < 4
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1", got)
+	}
+}
+
+// An oversized response frame (length prefix > max_packet_bytes) → decoder_error
+// + abandon ("packet is too big" — parent §11.5 symmetry).
+func TestDecodeResponseOversized(t *testing.T) {
+	d, rs, cfg := newTestDecoder(t)
+	huge := append(be32(int32(cfg.maxPacketBytes)+1), make([]byte, 16)...)
+	d.decodeOnWrite(huge)
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1", got)
+	}
+	if d.writeBuf != nil {
+		t.Fatal("oversized frame must ABANDON writeBuf (no resync)")
+	}
+}
+
+// Partial-frame reassembly: a watch event split across three decodeOnWrite calls
+// decodes exactly once when complete (the writeBuf reassembly — SPEC §3.2 item 2).
+func TestDecodeResponsePartialFrameReassembly(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	frame := watchEventFrame("/zk-test")
+	d.decodeOnWrite(frame[:3])
+	d.decodeOnWrite(frame[3:10])
+	if got := counterValue(t, rs, "watch_event"); got != 0 {
+		t.Fatalf("watch_event = %d before the frame is complete, want 0", got)
+	}
+	d.decodeOnWrite(frame[10:])
+	if got := counterValue(t, rs, "watch_event"); got != 1 {
+		t.Fatalf("watch_event = %d, want 1 (reassembled across 3 OnWrite calls)", got)
+	}
+}
+
+// Abandon-no-resync recovery: after a decode failure abandons writeBuf, a LATER
+// decodeOnWrite (a fresh socket write) decodes normally (AMEND-A8 symmetry —
+// the 0046 arm-4 request-side analog).
+func TestDecodeResponseAbandonThenRecover(t *testing.T) {
+	d, rs, cfg := newTestDecoder(t)
+	huge := append(be32(int32(cfg.maxPacketBytes)+1), make([]byte, 16)...)
+	d.decodeOnWrite(huge) // decoder_error + abandon
+	d.decodeOnWrite(watchEventFrame("/zk-test"))
+	if got := counterValue(t, rs, "watch_event"); got != 1 {
+		t.Fatalf("watch_event = %d, want 1 (the connection survives the abandon)", got)
+	}
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1 (only the oversized frame)", got)
+	}
+}
+
+// Multiple complete frames in ONE decodeOnWrite call all decode (the frames loop).
+func TestDecodeResponseMultipleFramesOneWrite(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	two := append(watchEventFrame("/a"), watchEventFrame("/b")...)
+	d.decodeOnWrite(two)
+	if got := counterValue(t, rs, "watch_event"); got != 2 {
+		t.Fatalf("watch_event = %d, want 2", got)
+	}
+}
+
+// --- Task 4 (28.2): correlated dispatch + correlation consumption (§3.4) ---
+
+// A data response correlates against requestsByXid, increments <opname>_resp +
+// response_bytes, and ERASES the entry (erase-on-lookup — upstream parity).
+func TestDecodeDataResponseCorrelates(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	feedRequest(d, dataFrame(1, opGetData, padTo(opGetData)))
+	resp := stdRespFrame(1, 100, 0)
+	d.decodeOnWrite(resp)
+	if got := counterValue(t, rs, "getdata_resp"); got != 1 {
+		t.Fatalf("getdata_resp = %d, want 1", got)
+	}
+	if got := counterValue(t, rs, "response_bytes"); got != uint64(len(resp)) {
+		t.Fatalf("response_bytes = %d, want %d (wireFootprint)", got, len(resp))
+	}
+	if len(d.requestsByXid) != 0 {
+		t.Fatal("erase-on-lookup: the entry must be ERASED by the correlation hit")
+	}
+	if got := counterValue(t, rs, "decoder_error"); got != 0 {
+		t.Fatalf("decoder_error = %d, want 0", got)
+	}
+}
+
+// A second response with the same data xid finds nothing → decoder_error
+// (the erase-on-lookup consequence — SPEC §3.4 item 1).
+func TestDecodeDataResponseDoubleResponse(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	feedRequest(d, dataFrame(1, opGetData, padTo(opGetData)))
+	d.decodeOnWrite(stdRespFrame(1, 100, 0))
+	d.decodeOnWrite(stdRespFrame(1, 101, 0)) // same xid again
+	if got := counterValue(t, rs, "getdata_resp"); got != 1 {
+		t.Fatalf("getdata_resp = %d, want 1", got)
+	}
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1 (double response = missing xid)", got)
+	}
+}
+
+// A data response whose xid has no pending request → decoder_error (upstream
+// InvalidArgumentError parity — SPEC §3.3 row 4).
+func TestDecodeDataResponseMissingXid(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	d.decodeOnWrite(stdRespFrame(42, 100, 0))
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1", got)
+	}
+}
+
+// Control responses FIFO-pop the per-xid queue: two pings answered in order;
+// a third ping response with an empty queue → decoder_error (SPEC §3.4 item 2).
+func TestDecodeControlResponseFIFOAndUnderflow(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	feedRequest(d, zkFrame(be32(pingXid), be32(opPing)))
+	feedRequest(d, zkFrame(be32(pingXid), be32(opPing)))
+	d.decodeOnWrite(stdRespFrame(pingXid, 1, 0))
+	d.decodeOnWrite(stdRespFrame(pingXid, 2, 0))
+	if got := counterValue(t, rs, "ping_resp"); got != 2 {
+		t.Fatalf("ping_resp = %d, want 2", got)
+	}
+	if len(d.controlRequestsByXid[pingXid]) != 0 {
+		t.Fatal("FIFO pop must drain the control queue")
+	}
+	d.decodeOnWrite(stdRespFrame(pingXid, 3, 0)) // empty queue
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1 (empty control queue)", got)
+	}
+}
+
+// A connect response (leading int32 == 0) uses the special framing and pops the
+// connect control queue → connect_resp (SPEC §3.3 row 1).
+func TestDecodeConnectResponse(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	feedRequest(d, connectFrame(nil))
+	d.decodeOnWrite(connectRespFrame(16))
+	if got := counterValue(t, rs, "connect_resp"); got != 1 {
+		t.Fatalf("connect_resp = %d, want 1", got)
+	}
+	if got := counterValue(t, rs, "decoder_error"); got != 0 {
+		t.Fatalf("decoder_error = %d, want 0", got)
+	}
+}
+
+// THE §3.4-ITEM-4 PANIC TRAP: a READONLY connect request's queue entry carries
+// opname "connect_readonly", and respOpNames has NO connect_readonly_resp — a
+// naive inc(entry.opname + "_resp") PANICS on the closed roster. The response
+// decoder must count connect_resp (upstream onConnectResponse parity).
+func TestDecodeConnectReadonlyResponseMapsToConnect(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	ro := true
+	feedRequest(d, connectFrame(&ro)) // entry opname = "connect_readonly"
+	// Must NOT panic; must count connect_resp.
+	d.decodeOnWrite(connectRespFrame(16))
+	if got := counterValue(t, rs, "connect_resp"); got != 1 {
+		t.Fatalf("connect_resp = %d, want 1 (the connect_readonly→connect mapping)", got)
+	}
+	if got := counterValue(t, rs, "decoder_error"); got != 0 {
+		t.Fatalf("decoder_error = %d, want 0", got)
+	}
+}
+
+// A connect response with NO pending connect request → decoder_error.
+func TestDecodeConnectResponseEmptyQueue(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	d.decodeOnWrite(connectRespFrame(0))
+	if got := counterValue(t, rs, "decoder_error"); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1", got)
+	}
+	if got := counterValue(t, rs, "connect_resp"); got != 0 {
+		t.Fatalf("connect_resp = %d, want 0", got)
+	}
+}
+
+// Correlate-then-validate (PLAN refinement 2 — upstream parity): a TRUNCATED
+// data response with a valid, correlatable xid consumes the entry AND fires the
+// flag-gated per-opcode decoder error (the opname IS known from the correlation
+// hit — SPEC §3.3 decode-failure clause).
+func TestDecodeDataResponseTruncatedAfterCorrelation(t *testing.T) {
+	reg := stats.NewRegistry()
+	cfg, err := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{
+		StatPrefix:                         "zk",
+		EnablePerOpcodeDecoderErrorMetrics: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := newRosterStats(reg, "zk")
+	d := newDecoder(cfg, rs)
+	feedRequest(d, dataFrame(1, opGetData, padTo(opGetData)))
+	// 12-byte payload: xid(4) + 8 more — short of the 16-byte xid+zxid+error minimum.
+	d.decodeOnWrite(zkFrame(be32(1), be64(100)))
+	if got := rs.counters["decoder_error"].Load(); got != 1 {
+		t.Fatalf("decoder_error = %d, want 1", got)
+	}
+	if got := rs.counters["getdata_decoder_error"].Load(); got != 1 {
+		t.Fatalf("getdata_decoder_error = %d, want 1 (flag-gated, opname from the correlation hit)", got)
+	}
+	if len(d.requestsByXid) != 0 {
+		t.Fatal("correlate-then-validate: the entry is consumed even on a truncated frame")
+	}
+	if got := rs.counters["getdata_resp"].Load(); got != 0 {
+		t.Fatalf("getdata_resp = %d, want 0", got)
+	}
+}
+
+// Byte accounting flag-gating (SPEC §3.3): response_bytes is ALWAYS counted
+// (ungated); <opname>_resp_bytes is counted ONLY when
+// enable_per_opcode_response_bytes_metrics is true.
+func TestDecodeResponseBytesFlagGating(t *testing.T) {
+	// Flag OFF (the newTestDecoder default):
+	d, rs, _ := newTestDecoder(t)
+	feedRequest(d, dataFrame(1, opGetData, padTo(opGetData)))
+	resp := stdRespFrame(1, 100, 0)
+	d.decodeOnWrite(resp)
+	if got := counterValue(t, rs, "getdata_resp_bytes"); got != 0 {
+		t.Fatalf("flag OFF: getdata_resp_bytes = %d, want 0", got)
+	}
+	if got := counterValue(t, rs, "response_bytes"); got != uint64(len(resp)) {
+		t.Fatalf("flag OFF: response_bytes = %d, want %d (ungated)", got, len(resp))
+	}
+
+	// Flag ON:
+	reg := stats.NewRegistry()
+	cfg, err := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{
+		StatPrefix:                          "zk2",
+		EnablePerOpcodeResponseBytesMetrics: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs2 := newRosterStats(reg, "zk2")
+	d2 := newDecoder(cfg, rs2)
+	feedRequest(d2, dataFrame(1, opGetData, padTo(opGetData)))
+	d2.decodeOnWrite(resp)
+	if got := rs2.counters["getdata_resp_bytes"].Load(); got != uint64(len(resp)) {
+		t.Fatalf("flag ON: getdata_resp_bytes = %d, want %d", got, len(resp))
+	}
+}
+
+// Control responses for auth and setwatches use their roster opnames
+// (auth_resp / setwatches_resp both exist in respOpNames).
+func TestDecodeControlResponseAuthAndSetwatches(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	// auth request (xid -4, scheme "digest"):
+	authReqFrame := zkFrame(be32(authXid), be32(opSetAuth), be32(0), be32(6), []byte("digest"), be32(0))
+	feedRequest(d, authReqFrame)
+	// setwatches request (xid -8):
+	feedRequest(d, zkFrame(be32(setWatchesXid), be32(opSetWatches)))
+	d.decodeOnWrite(stdRespFrame(authXid, 1, 0))
+	d.decodeOnWrite(stdRespFrame(setWatchesXid, 2, 0))
+	if got := counterValue(t, rs, "auth_resp"); got != 1 {
+		t.Fatalf("auth_resp = %d, want 1", got)
+	}
+	if got := counterValue(t, rs, "setwatches_resp"); got != 1 {
+		t.Fatalf("setwatches_resp = %d, want 1", got)
+	}
+}
+
+// The 28.1 "correlation maps grow unbounded" boundary CLOSES: responses drain
+// both structures (SPEC §3.4 item 5).
+func TestDecodeResponsesDrainCorrelationStructures(t *testing.T) {
+	d, _, _ := newTestDecoder(t)
+	feedRequest(d, connectFrame(nil))
+	feedRequest(d, zkFrame(be32(pingXid), be32(opPing)))
+	feedRequest(d, dataFrame(1, opGetData, padTo(opGetData)))
+	feedRequest(d, dataFrame(2, opSetData, padTo(opSetData)))
+	d.decodeOnWrite(connectRespFrame(0))
+	d.decodeOnWrite(stdRespFrame(pingXid, 1, 0))
+	d.decodeOnWrite(stdRespFrame(1, 2, 0))
+	d.decodeOnWrite(stdRespFrame(2, 3, 0))
+	if len(d.requestsByXid) != 0 {
+		t.Fatalf("requestsByXid has %d entries after all responses, want 0", len(d.requestsByXid))
+	}
+	for xid, q := range d.controlRequestsByXid {
+		if len(q) != 0 {
+			t.Fatalf("controlRequestsByXid[%d] has %d entries, want 0", xid, len(q))
+		}
+	}
+}
+
+// --- Task 5 (28.2): latency-threshold counters (§4) ---
+
+// latencyTestDecoder builds a decoder with enable_latency_threshold_metrics +
+// optional overrides. defaultThreshold uses the proto Duration field.
+func latencyTestDecoder(t *testing.T, defaultThreshold time.Duration,
+	overrides []*zookeeper_proxyv3.LatencyThresholdOverride) (*decoder, *rosterStats) {
+	t.Helper()
+	reg := stats.NewRegistry()
+	cfg, err := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{
+		StatPrefix:                    "zk",
+		EnableLatencyThresholdMetrics: true,
+		DefaultLatencyThreshold:       durationpb.New(defaultThreshold),
+		LatencyThresholdOverrides:     overrides,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := newRosterStats(reg, "zk")
+	return newDecoder(cfg, rs), rs
+}
+
+// The inclusive edge (AMEND-A10 / parent §11.7): latency == threshold → FAST.
+// recordLatency takes the measured latency as a parameter (PLAN refinement 3),
+// so the boundary is tested with exact injected durations.
+func TestRecordLatencyInclusiveEdge(t *testing.T) {
+	d, rs := latencyTestDecoder(t, 100*time.Millisecond, nil)
+	d.recordLatency("getdata", opGetData, 100*time.Millisecond) // == threshold
+	if got := counterValue(t, rs, "getdata_resp_fast"); got != 1 {
+		t.Fatalf("getdata_resp_fast = %d, want 1 (latency == threshold is FAST — inclusive)", got)
+	}
+	if got := counterValue(t, rs, "getdata_resp_slow"); got != 0 {
+		t.Fatalf("getdata_resp_slow = %d, want 0", got)
+	}
+	d.recordLatency("getdata", opGetData, 100*time.Millisecond+time.Nanosecond) // > threshold
+	if got := counterValue(t, rs, "getdata_resp_slow"); got != 1 {
+		t.Fatalf("getdata_resp_slow = %d, want 1 (latency > threshold is SLOW)", got)
+	}
+}
+
+// A wire-opcode-keyed override beats the default (§4.1 item 3).
+func TestRecordLatencyOverrideBeatsDefault(t *testing.T) {
+	d, rs := latencyTestDecoder(t, time.Millisecond, []*zookeeper_proxyv3.LatencyThresholdOverride{
+		{Opcode: zookeeper_proxyv3.LatencyThresholdOverride_GetData, Threshold: durationpb.New(time.Hour)},
+	})
+	// 10 ms latency: getdata (override 1 h) → fast; setdata (default 1 ms) → slow.
+	d.recordLatency("getdata", opGetData, 10*time.Millisecond)
+	d.recordLatency("setdata", opSetData, 10*time.Millisecond)
+	if got := counterValue(t, rs, "getdata_resp_fast"); got != 1 {
+		t.Fatalf("getdata_resp_fast = %d, want 1 (the override wins)", got)
+	}
+	if got := counterValue(t, rs, "setdata_resp_slow"); got != 1 {
+		t.Fatalf("setdata_resp_slow = %d, want 1 (no override → default)", got)
+	}
+}
+
+// The flag gates INCREMENTS (AMEND-A2): flag off → neither fast nor slow moves.
+func TestRecordLatencyFlagOff(t *testing.T) {
+	d, rs, _ := newTestDecoder(t) // enable_latency_threshold_metrics defaults false
+	d.recordLatency("getdata", opGetData, time.Nanosecond)
+	if counterValue(t, rs, "getdata_resp_fast") != 0 || counterValue(t, rs, "getdata_resp_slow") != 0 {
+		t.Fatal("flag off: neither fast nor slow may increment")
+	}
+}
+
+// End-to-end injected-timestamp test: a pending request whose start is in the
+// deep past → response decode → SLOW (the time.Since plumbing — §4.1).
+func TestLatencyEndToEndInjectedStart(t *testing.T) {
+	d, rs := latencyTestDecoder(t, 100*time.Millisecond, nil)
+	feedRequest(d, dataFrame(1, opGetData, padTo(opGetData)))
+	// Inject: back-date the pending entry far past any threshold.
+	d.mu.Lock()
+	e := d.requestsByXid[1]
+	e.start = time.Now().Add(-time.Hour)
+	d.requestsByXid[1] = e
+	d.mu.Unlock()
+	d.decodeOnWrite(stdRespFrame(1, 100, 0))
+	if got := counterValue(t, rs, "getdata_resp_slow"); got != 1 {
+		t.Fatalf("getdata_resp_slow = %d, want 1 (1 h latency >> 100 ms threshold)", got)
+	}
+	if got := counterValue(t, rs, "getdata_resp"); got != 1 {
+		t.Fatalf("getdata_resp = %d, want 1 (the _resp counter increments alongside fast/slow)", got)
+	}
+}
+
+// Connect responses participate in latency with opname "connect" + wire opcode
+// opConnect (here via the default threshold; override-vs-default precedence is
+// pinned by TestRecordLatencyOverrideBeatsDefault).
+func TestLatencyConnectResponse(t *testing.T) {
+	d, rs := latencyTestDecoder(t, time.Hour, nil)
+	feedRequest(d, connectFrame(nil))
+	d.decodeOnWrite(connectRespFrame(0))
+	if got := counterValue(t, rs, "connect_resp_fast"); got != 1 {
+		t.Fatalf("connect_resp_fast = %d, want 1 (1 h threshold → fast)", got)
+	}
+}
+
+// Control responses (ping) participate in latency end-to-end — pins the
+// onControlResponse → recordLatency wiring (a deleted call site would not be
+// caught by the _resp-only assertions in TestDecodeControlResponseFIFOAndUnderflow).
+func TestLatencyControlResponse(t *testing.T) {
+	d, rs := latencyTestDecoder(t, time.Hour, nil)
+	feedRequest(d, zkFrame(be32(pingXid), be32(opPing)))
+	d.decodeOnWrite(stdRespFrame(pingXid, 1, 0))
+	if got := counterValue(t, rs, "ping_resp_fast"); got != 1 {
+		t.Fatalf("ping_resp_fast = %d, want 1 (1 h threshold → fast)", got)
+	}
+}
+
+// Watch events NEVER get fast/slow (uncorrelated — no request timestamp; §4.1
+// item 4); decoder_error responses never get fast/slow (§4.1 item 5).
+func TestLatencyNeverForWatchEventsOrErrors(t *testing.T) {
+	d, rs := latencyTestDecoder(t, time.Hour, nil)
+	d.decodeOnWrite(watchEventFrame("/zk-test"))
+	d.decodeOnWrite(stdRespFrame(42, 1, 0)) // missing xid → decoder_error
+	suffixes := []string{"_resp_fast", "_resp_slow"}
+	for _, op := range []string{"getdata", "connect", "exists"} {
+		for _, s := range suffixes {
+			if got := counterValue(t, rs, op+s); got != 0 {
+				t.Fatalf("%s%s = %d, want 0", op, s, got)
+			}
+		}
+	}
+}
+
+// --- Task 6 (28.2): the §3.6 concurrent request/response race test (R9) ---
+
+// TestDecoderConcurrentRequestResponseRace drives goroutine A (request decode —
+// the replayRead → OnData path) and goroutine B (response decode — the
+// writeChainConn.Write → OnWrite path) CONCURRENTLY over one decoder. This is
+// the production goroutine topology post-handoff (tcpproxy filter.go:134-138).
+// The assertion is `go test -race` itself (the §3.6 mutex makes the correlation
+// maps race-free) plus a conservation check: every response either correlated
+// or counted decoder_error. Run with -race -count=5 (the zookeeperproxy-package
+// analog of the 28.1b framework-level concurrent-pumps test).
+//
+// Conservation soundness: each decodeOnWrite call here delivers exactly ONE
+// complete frame to a writeBuf that is empty on entry (each call is
+// self-contained). If the response arrives before its request is recorded,
+// takeData returns ok=false → responseError → decoder_error +1 AND writeBuf is
+// set to nil. But the NEXT call starts by appending to nil (effectively an empty
+// slice — append(nil, p...) is valid Go), so the abandon does NOT lose the
+// subsequent frame. Thus: getdata_resp + decoder_error == n exactly.
+func TestDecoderConcurrentRequestResponseRace(t *testing.T) {
+	d, rs, _ := newTestDecoder(t)
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// Goroutine A: request decode (WRITES the correlation maps).
+	// Uses the feedRequest delta-feed pattern (d.chainConsumed is owned by
+	// goroutine A — not shared — so no lock is needed here; mu only guards the
+	// map writes inside onDataRequest).
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= n; i++ {
+			frame := dataFrame(int32(i), opGetData, padTo(opGetData))
+			feedRequest(d, frame)
+		}
+	}()
+	// Goroutine B: response decode (READS + ERASES the correlation maps via
+	// takeData under mu). Each call is self-contained: writeBuf is nil between
+	// calls, so a prior abandon does not affect this call's frame.
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= n; i++ {
+			d.decodeOnWrite(stdRespFrame(int32(i), int64(i), 0))
+		}
+	}()
+	wg.Wait()
+
+	// Conservation: every response was either correlated (getdata_resp) or
+	// arrived before its request was recorded (decoder_error). No response
+	// is lost, none double-counted.
+	resp := counterValue(t, rs, "getdata_resp")
+	errs := counterValue(t, rs, "decoder_error")
+	if resp+errs != n {
+		t.Fatalf("getdata_resp(%d) + decoder_error(%d) = %d, want %d (conservation)", resp, errs, resp+errs, n)
 	}
 }

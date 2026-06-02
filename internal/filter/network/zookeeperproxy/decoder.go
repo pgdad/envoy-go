@@ -2,6 +2,7 @@ package zookeeperproxy
 
 import (
 	"encoding/binary"
+	"sync"
 	"time"
 )
 
@@ -24,10 +25,15 @@ type pendingRequest struct {
 	start      time.Time
 }
 
-// requestDecoder is the per-connection shallow request decoder (ADR-0222;
-// AMEND-A5/A8; D-P2 shallow). It owns its OWN reassembly buffer; the chain
-// Buffer is read, NEVER drained (R3).
-type requestDecoder struct {
+// decoder is the per-connection shallow decoder, BOTH directions (ADR-0222
+// request side; ADR-0223 response side — upstream single-DecoderImpl parity).
+// It owns its OWN reassembly buffers; the chain Buffer is read, NEVER drained
+// (R3). The request path runs on goroutine A (pre-handoff: the chain read
+// loop; post-handoff: the downstream→upstream pump via replayRead); the
+// response path runs on goroutine B (the upstream→downstream pump via
+// writeChainConn.Write → OnWrite). The two share ONLY the correlation maps,
+// guarded by mu (§3.6).
+type decoder struct {
 	cfg   *compiledConfig
 	stats *rosterStats
 
@@ -46,6 +52,23 @@ type requestDecoder struct {
 	// the next read; a decode failure ABANDONS it (no resync).
 	readBuf []byte
 
+	// writeBuf is the decoder-internal write-side reassembly buffer (the
+	// upstream zk_filter_write_buffer_ mirror). Fed by OnWrite; complete
+	// response frames are decoded + consumed; a trailing partial frame
+	// survives until the next OnWrite; a decode failure ABANDONS it (no
+	// resync — AMEND-A8 symmetry). Accessed ONLY by goroutine B (§3.6).
+	writeBuf []byte
+
+	// mu guards the two correlation maps below — the ONLY state shared
+	// between goroutine A (request decode: replayRead → OnData) and
+	// goroutine B (response decode: writeChainConn.Write → OnWrite).
+	// The reassembly buffers (readBuf / writeBuf) and chainConsumed are
+	// single-goroutine-owned and stay OUTSIDE the lock (§3.6). Entries are
+	// COPIED OUT under the lock; counter increments + latency math happen
+	// OUTSIDE it. The pre-handoff request path locks too (uniformity over
+	// cleverness — pre-handoff the lock is uncontended, one atomic CAS).
+	mu sync.Mutex
+
 	// Correlation structures (AMEND-A7; written 28.1, consumed 28.2 — R5).
 	requestsByXid map[int32]pendingRequest // data requests (xid > 0); insert overwrites
 	// controlRequestsByXid holds per-xid FIFO queues for control requests.
@@ -55,8 +78,10 @@ type requestDecoder struct {
 	controlRequestsByXid map[int32][]pendingRequest
 }
 
-func newRequestDecoder(cfg *compiledConfig, rs *rosterStats) *requestDecoder {
-	return &requestDecoder{
+// newDecoder returns the per-connection decoder (both-direction reassembly
+// buffers + correlation structures + mu; §3.1).
+func newDecoder(cfg *compiledConfig, rs *rosterStats) *decoder {
+	return &decoder{
 		cfg:                  cfg,
 		stats:                rs,
 		requestsByXid:        map[int32]pendingRequest{},
@@ -72,7 +97,7 @@ func newRequestDecoder(cfg *compiledConfig, rs *rosterStats) *requestDecoder {
 // replay pass). On any never-drained execution TotalAppended() == Len(), so
 // this selects byte-for-byte the same slice the 28.1a feed selected (the §3.3
 // equivalence — existing assertions unchanged).
-func (d *requestDecoder) decodeOnData(chainBytes []byte, totalAppended int64) {
+func (d *decoder) decodeOnData(chainBytes []byte, totalAppended int64) {
 	if newCount := totalAppended - d.chainConsumed; newCount > 0 {
 		d.readBuf = append(d.readBuf, chainBytes[int64(len(chainBytes))-newCount:]...)
 		d.chainConsumed = totalAppended
@@ -93,7 +118,7 @@ func (d *requestDecoder) decodeOnData(chainBytes []byte, totalAppended int64) {
 // prefix EXCLUDES itself and is stripped from the returned frame). Returns
 // ok=false when no complete frame is buffered. Oversized frames
 // (len > max_packet_bytes) take the decoder_error path and abandon the buffer.
-func (d *requestDecoder) nextFrame() ([]byte, bool) {
+func (d *decoder) nextFrame() ([]byte, bool) {
 	if len(d.readBuf) < 4 {
 		return nil, false
 	}
@@ -113,7 +138,7 @@ func (d *requestDecoder) nextFrame() ([]byte, bool) {
 
 // decodeFrame dispatches one frame by xid sniffing (AMEND-A5). Returns false on
 // a decode failure (the decoder_error path has already run).
-func (d *requestDecoder) decodeFrame(frame []byte) bool {
+func (d *decoder) decodeFrame(frame []byte) bool {
 	if len(frame) < 8 {
 		// universal min: xid(4) + opcode(4) ("packet is too small").
 		d.decoderError("")
@@ -144,7 +169,7 @@ func (d *requestDecoder) decodeFrame(frame []byte) bool {
 // last_zxid(8) + timeout(4) + session_id(8) + password(4-byte len + bytes) +
 // OPTIONAL trailing readonly bool(1). Readonly present AND true →
 // connect_readonly_rq; else connect_rq (AMEND-A3/A5).
-func (d *requestDecoder) onConnect(frame []byte) bool {
+func (d *decoder) onConnect(frame []byte) bool {
 	// Shallow validation: the fixed header is 28 bytes + password + optional readonly.
 	const fixedLen = 4 + 8 + 4 + 8 + 4 // up to and including the password length
 	if len(frame) < fixedLen {
@@ -191,7 +216,7 @@ func (d *requestDecoder) onConnect(frame []byte) bool {
 // builtin-scheme set in authSchemeCounter (a non-builtin scheme takes the
 // unknown_scheme fallback). There is NO static auth_rq; auth request BYTES go to
 // auth_rq_bytes via countRequestBytes("auth", ...).
-func (d *requestDecoder) onAuth(frame []byte) bool {
+func (d *decoder) onAuth(frame []byte) bool {
 	if len(frame) < 20 {
 		// ensureMinLength XID+OPCODE+INT+INT+INT = 20 (decoder.cc:397-398):
 		// xid + opcode + type + scheme-len + cred-len.
@@ -212,10 +237,14 @@ func (d *requestDecoder) onAuth(frame []byte) bool {
 	return true
 }
 
-// recordControl appends to the per-xid FIFO control queue (AMEND-A7).
-func (d *requestDecoder) recordControl(xid int32, opname string, wireOpcode int32) {
-	d.controlRequestsByXid[xid] = append(d.controlRequestsByXid[xid],
-		pendingRequest{opname: opname, wireOpcode: wireOpcode, start: time.Now()})
+// recordControl appends to the per-xid FIFO control queue (AMEND-A7), under the
+// correlation-map lock (§3.6: the request path locks unconditionally — pre-handoff
+// the lock is uncontended; post-handoff goroutine B's response decode contends).
+func (d *decoder) recordControl(xid int32, opname string, wireOpcode int32) {
+	entry := pendingRequest{opname: opname, wireOpcode: wireOpcode, start: time.Now()}
+	d.mu.Lock()
+	d.controlRequestsByXid[xid] = append(d.controlRequestsByXid[xid], entry)
+	d.mu.Unlock()
 }
 
 // wireFootprint is the request_bytes accounting basis: the 4-byte length
@@ -225,7 +254,7 @@ func wireFootprint(frame []byte) int { return 4 + len(frame) }
 
 // countRequestBytes increments request_bytes (always) + the flag-gated
 // per-opcode <opname>_rq_bytes (AMEND-A2: flags gate increments, never creation).
-func (d *requestDecoder) countRequestBytes(opname string, wireBytes int) {
+func (d *decoder) countRequestBytes(opname string, wireBytes int) {
 	d.stats.add("request_bytes", uint64(wireBytes))
 	if d.cfg.enablePerOpcodeRequestBytesMetrics {
 		d.stats.add(opname+"_rq_bytes", uint64(wireBytes))
@@ -236,7 +265,7 @@ func (d *requestDecoder) countRequestBytes(opname string, wireBytes int) {
 // (always) + the flag-gated per-opcode counter (when the failing frame's opcode
 // is known), then ABANDON the current readBuf (no resync). The connection is
 // never closed; the correlation structures persist; later reads decode normally.
-func (d *requestDecoder) decoderError(opname string) {
+func (d *decoder) decoderError(opname string) {
 	d.stats.inc("decoder_error")
 	if opname != "" && d.cfg.enablePerOpcodeDecoderErrorMetrics {
 		d.stats.inc(opname + "_decoder_error")
@@ -305,7 +334,7 @@ var dataRequestMinLength = map[int32]int{
 
 // onDataRequest is the full Task-10 form: opcode lookup, min-length validation
 // (D-S28.1-1), per-opcode _rq + bytes + correlation writes.
-func (d *requestDecoder) onDataRequest(xid int32, frame []byte) bool {
+func (d *decoder) onDataRequest(xid int32, frame []byte) bool {
 	opcode := int32(binary.BigEndian.Uint32(frame[4:8]))
 	opname, known := wireOpcodeToOpname[opcode]
 	if !known {
@@ -329,6 +358,261 @@ func (d *requestDecoder) onDataRequest(xid int32, frame []byte) bool {
 	}
 	d.stats.inc(opname + "_rq")
 	d.countRequestBytes(opname, wireFootprint(frame))
-	d.requestsByXid[xid] = pendingRequest{opname: opname, wireOpcode: opcode, start: time.Now()}
+	entry := pendingRequest{opname: opname, wireOpcode: opcode, start: time.Now()}
+	d.mu.Lock()
+	d.requestsByXid[xid] = entry
+	d.mu.Unlock()
 	return true
+}
+
+// --- the response side (28.2; ADR-0223) ---
+
+// decodeOnWrite feeds upstream→downstream bytes into the decoder's write-side
+// reassembly buffer and decodes every complete response frame (SPEC §3.2).
+// Each OnWrite call passes a fresh per-Write buffer's contents
+// (writeChainConn.Write allocates one per call — writeconn.go:35), so p is
+// appended directly: every byte arrives exactly once by construction; no
+// write-side TotalAppended high-water mark exists (the §3.2 item-1 structural
+// asymmetry vs the read side, recorded in ADR-0223). Runs ONLY on goroutine B.
+func (d *decoder) decodeOnWrite(p []byte) {
+	d.writeBuf = append(d.writeBuf, p...)
+	for {
+		frame, ok := d.nextWriteFrame()
+		if !ok {
+			return // no complete frame buffered (or buffer abandoned)
+		}
+		if !d.decodeResponseFrame(frame) {
+			// decoder_error path already counted + writeBuf abandoned.
+			return
+		}
+	}
+}
+
+// nextWriteFrame extracts one complete frame from writeBuf (the 4-byte BE length
+// prefix EXCLUDES itself and is stripped from the returned frame). Returns
+// ok=false when no complete frame is buffered. Oversized frames
+// (len > max_packet_bytes) take the decoder_error path and abandon the buffer.
+// (D-S28.2-4: the nextFrame sibling — parallel methods, distinct buffer + error path.)
+func (d *decoder) nextWriteFrame() ([]byte, bool) {
+	if len(d.writeBuf) < 4 {
+		return nil, false
+	}
+	frameLen := int32(binary.BigEndian.Uint32(d.writeBuf[0:4]))
+	if frameLen < 0 || uint32(frameLen) > d.cfg.maxPacketBytes {
+		// "packet is too big" (parent §11.5) → decoder_error + abandon.
+		d.responseError("")
+		return nil, false
+	}
+	if len(d.writeBuf) < 4+int(frameLen) {
+		return nil, false // partial frame — wait for more bytes
+	}
+	frame := d.writeBuf[4 : 4+frameLen]
+	d.writeBuf = d.writeBuf[4+frameLen:]
+	return frame, true
+}
+
+// responseError runs the decoder_error path for the response side (AMEND-A8
+// symmetry; the decoderError counting pattern with the WRITE-side abandon
+// target): increment decoder_error (always) + the flag-gated per-opcode counter
+// (when opname is known — SPEC §3.3: "from a correlation hit"), then ABANDON
+// writeBuf (no resync). The connection is never closed; later writes decode
+// normally; the correlation maps persist.
+func (d *decoder) responseError(opname string) {
+	d.stats.inc("decoder_error")
+	if opname != "" && d.cfg.enablePerOpcodeDecoderErrorMetrics {
+		d.stats.inc(opname + "_decoder_error")
+	}
+	d.writeBuf = nil
+}
+
+// decodeResponseFrame dispatches one response frame by its leading int32
+// (SPEC §3.3 xid sniffing). Returns false on a decode failure (the
+// decoder_error path has already run).
+func (d *decoder) decodeResponseFrame(frame []byte) bool {
+	if len(frame) < 4 {
+		// universal min: the leading int32 ("packet is too small").
+		d.responseError("")
+		return false
+	}
+	leading := int32(binary.BigEndian.Uint32(frame[0:4]))
+	switch {
+	case leading == connectXid:
+		return d.onConnectResponse(frame)
+	case leading == watchXid:
+		return d.onWatchEvent(frame)
+	case leading == pingXid || leading == authXid || leading == setWatchesXid:
+		return d.onControlResponse(leading, frame)
+	case leading > 0:
+		return d.onDataResponse(leading, frame)
+	default:
+		// Any other negative xid: unknown → decoder_error + abandon (upstream
+		// unknown-xid onDecodeError parity — SPEC §3.3 row 5).
+		d.responseError("")
+		return false
+	}
+}
+
+// onWatchEvent handles the server-initiated watch-event push (xid −1; SPEC §3.3
+// row 2): never correlated, no per-opcode counter, no latency. Like every
+// non-connect response, the frame carries the full ReplyHeader — xid(4) +
+// zxid(8) + error(4) — followed by event_type(4) + client_state(4) +
+// path-len(4): minimum 28 bytes (upstream parseWatchEvent
+// SERVER_HEADER_LENGTH + 3*INT_LENGTH; D-S28.2-1 — the SPEC's 16-byte pin was
+// corrected to upstream's value at IMPL). Shallow decode: zxid/error/event
+// fields are read past for min-length only, never extracted.
+// Byte accounting: response_bytes only (watch events have no per-opcode
+// attribution — SPEC §3.3 byte-accounting note).
+func (d *decoder) onWatchEvent(frame []byte) bool {
+	if len(frame) < 28 {
+		d.responseError("")
+		return false
+	}
+	d.stats.inc("watch_event")
+	d.stats.add("response_bytes", uint64(wireFootprint(frame)))
+	return true
+}
+
+// respOpname maps a popped entry's opname to its response-side roster opname
+// (SPEC §3.4 item 4 — THE CLOSED-ROSTER PANIC TRAP): connect_readonly → connect
+// (respOpNames has NO connect_readonly_resp; upstream onConnectResponse always
+// increments connect_resp). Everything else passes through unchanged.
+func respOpname(entryOpname string) string {
+	if entryOpname == "connect_readonly" {
+		return "connect"
+	}
+	return entryOpname
+}
+
+// popControl FIFO-pops the front entry of the control queue for xid under the
+// correlation-map lock and returns a COPY (§3.6: entries copied out under the
+// lock; counter increments + latency math happen OUTSIDE it). ok=false → empty
+// queue (no correlation hit).
+func (d *decoder) popControl(xid int32) (pendingRequest, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	q := d.controlRequestsByXid[xid]
+	if len(q) == 0 {
+		return pendingRequest{}, false
+	}
+	entry := q[0]
+	d.controlRequestsByXid[xid] = q[1:]
+	return entry, true
+}
+
+// takeData looks up + ERASES the data-map entry for xid under the correlation-map
+// lock (erase-on-lookup — upstream parity: a second response with the same xid
+// finds nothing). ok=false → missing xid (no correlation hit).
+func (d *decoder) takeData(xid int32) (pendingRequest, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	entry, ok := d.requestsByXid[xid]
+	if ok {
+		delete(d.requestsByXid, xid)
+	}
+	return entry, ok
+}
+
+// countResponse runs the per-opcode counting + byte accounting for a
+// successfully decoded, correlated response frame (SPEC §3.3 byte accounting):
+// <opname>_resp (always) + response_bytes (always, ungated) + the flag-gated
+// <opname>_resp_bytes. The respOpname MUST already be roster-mapped (§3.4 item 4).
+func (d *decoder) countResponse(op string, frame []byte) {
+	d.stats.inc(op + "_resp")
+	d.stats.add("response_bytes", uint64(wireFootprint(frame)))
+	if d.cfg.enablePerOpcodeResponseBytesMetrics {
+		d.stats.add(op+"_resp_bytes", uint64(wireFootprint(frame)))
+	}
+}
+
+// onConnectResponse handles the connect special framing (SPEC §3.3 row 1):
+// proto_version(4) + timeout(4) + session_id(8) + password(4-byte len + bytes)
+// — NO zxid, NO error (upstream parseConnectResponse: "Connect responses are
+// special, they have no full reply header"; min = 20, verified D-S28.2-1).
+// Correlates by FIFO-popping controlRequestsByXid[connectXid]; counters ALWAYS
+// use opname "connect" regardless of the popped entry's opname (§3.4 item 4).
+// Correlate-then-validate order (upstream parity): the pop happens first, so a
+// malformed connect response still consumes the pending entry and fires the
+// flag-gated connect_decoder_error.
+func (d *decoder) onConnectResponse(frame []byte) bool {
+	entry, ok := d.popControl(connectXid)
+	if !ok {
+		d.responseError("") // empty queue — no correlation hit
+		return false
+	}
+	const fixedLen = 4 + 4 + 8 + 4 // proto_version + timeout + session_id + password length
+	if len(frame) < fixedLen {
+		d.responseError("connect")
+		return false
+	}
+	pwLen := int32(binary.BigEndian.Uint32(frame[16:20]))
+	if pwLen < 0 || len(frame) < fixedLen+int(pwLen) {
+		d.responseError("connect")
+		return false
+	}
+	d.countResponse("connect", frame)
+	d.recordLatency("connect", entry.wireOpcode, time.Since(entry.start))
+	return true
+}
+
+// onControlResponse handles control-xid responses (ping −2 / auth −4 /
+// setwatches −8; SPEC §3.3 row 3): standard framing xid(4) + zxid(8) + error(4)
+// = 16 minimum, correlated by FIFO pop (control xids repeat — AMEND-A7).
+func (d *decoder) onControlResponse(xid int32, frame []byte) bool {
+	entry, ok := d.popControl(xid)
+	if !ok {
+		d.responseError("") // empty queue — no correlation hit
+		return false
+	}
+	op := respOpname(entry.opname)
+	if len(frame) < 16 {
+		// Correlate-then-validate: the entry is consumed; the per-opcode
+		// counter fires (flag-gated) — the opname is known from the hit.
+		d.responseError(op)
+		return false
+	}
+	d.countResponse(op, frame)
+	d.recordLatency(op, entry.wireOpcode, time.Since(entry.start))
+	return true
+}
+
+// onDataResponse handles data-xid responses (xid > 0; SPEC §3.3 row 4): standard
+// framing, correlated against requestsByXid with erase-on-lookup. The zxid(8) +
+// error(4) fields are read past for min-length only — neither is extracted
+// (shallow decode; D-S28.2-5: upstream feeds error only to dynamic metadata,
+// which is deferred — no counter is keyed on it).
+func (d *decoder) onDataResponse(xid int32, frame []byte) bool {
+	entry, ok := d.takeData(xid)
+	if !ok {
+		d.responseError("") // missing xid — upstream InvalidArgumentError parity
+		return false
+	}
+	op := respOpname(entry.opname)
+	if len(frame) < 16 {
+		d.responseError(op)
+		return false
+	}
+	d.countResponse(op, frame)
+	d.recordLatency(op, entry.wireOpcode, time.Since(entry.start))
+	return true
+}
+
+// recordLatency mirrors upstream errorBudgetDecision (filter.cc:134-154 —
+// parent §11.7 / AMEND-A10): flag-gated; threshold = the wire-opcode-keyed
+// override else the default; latency <= threshold → FAST (INCLUSIVE).
+// op must already be roster-mapped (§3.4 item 4). The measured latency
+// is a parameter (not computed here) so unit tests inject exact boundary values.
+// Runs OUTSIDE the correlation-map lock (§3.6 item 1).
+func (d *decoder) recordLatency(op string, wireOpcode int32, latency time.Duration) {
+	if !d.cfg.enableLatencyThresholdMetrics {
+		return // the flag gates INCREMENTS, not creation (AMEND-A2)
+	}
+	threshold, ok := d.cfg.latencyThresholdOverrides[wireOpcode]
+	if !ok {
+		threshold = d.cfg.defaultLatencyThreshold
+	}
+	if latency <= threshold {
+		d.stats.inc(op + "_resp_fast")
+	} else {
+		d.stats.inc(op + "_resp_slow")
+	}
 }
