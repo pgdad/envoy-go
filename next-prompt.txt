@@ -32,7 +32,7 @@ Per `feedback_subagents_no_push` subagents commit LOCAL-ONLY; the controller squ
 
 ## Project state at master tip
 
-- **Master tip:** the docs-only SHA-fill/repoint commits trail the substantive 28.1b-PLAN squash (STATE.md `last-commit`) by +1/+2. Confirm the live tip via `git log --oneline -1`; any further next-prompt repoint advances the tip +1 (expected, not chased). Substantive predecessors: the 28.1b-SPEC squash `baf02ed`, the 28.1a-IMPL squash `8703aeb`.
+- **Master tip:** `fd93131` (the docs-only STATE.md/next-prompt SHA-fill commit; trails the substantive 28.1b-PLAN squash `eff30e8` by +1). Confirm the live tip via `git log --oneline -1`; this repoint itself advances the tip +1 (expected, not chased). Substantive predecessors: the 28.1b-SPEC squash `baf02ed`, the 28.1a-IMPL squash `8703aeb`.
 - **§9 Network-filters family:** rows 26 (parent + 26.1/26.2/26.3) + 27 DONE; row 28 `in-progress` (parent; 28.1a `done`, 28.1b `in-progress`, 28.2 `planned`). After phase 28, 4 candidates remain (`redis`/`mongo`/`kafka_broker`/`thrift`).
 - **Counts at master tip:** stat surface **136** (rolls to **337** at IMPL Task 9); differential fixtures **47 active + 1 disabled** (→ 49 active at IMPL); fuzzers **37** (canonical recipe `grep -rh "^func Fuzz" $(find ./internal -name fuzz_test.go) | wc -l`; stays 37); conformance 10/10; h2spec 53/53; DECISIONS.md tail **ADR-0223** (next-free **ADR-0224**). ADR-0209 escape-valve reserve STANDS-UNCONSUMED.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
