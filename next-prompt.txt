@@ -24,7 +24,7 @@ Author the **28.2 SPEC** via `superpowers:brainstorming` (self-driven per the §
 
 ## Project state at master tip
 
-- **Master tip:** the 28.1b-IMPL squash (see STATE.md `last-commit` for the SHA — the controller fills it at stage-close; a docs-only repoint trails the squash by +1 — confirm the live tip via `git log --oneline -1`). Substantive predecessors: the 28.1b-PLAN squash `eff30e8`, the 28.1a-IMPL squash `8703aeb`.
+- **Master tip:** `fdf40ea` (the 28.1b-IMPL squash; docs-only SHA-fill commits trail it — confirm the live tip via `git log --oneline -1`). Substantive predecessors: the 28.1b-PLAN squash `eff30e8`, the 28.1a-IMPL squash `8703aeb`.
 - **§9 Network-filters family:** rows 26 (parent + 26.1/26.2/26.3) + 27 DONE; row 28 `in-progress` (parent; 28.1a `done`, 28.1b `done`, 28.2 `planned`). After phase 28 phase-done, 4 family candidates remain (`redis`/`mongo`/`kafka_broker`/`thrift`).
 - **Counts at master tip:** stat surface **337**; active differential fixtures **49** (tail `0047`); fuzzers **37**; conformance h2spec 53/53 + proxy-wasm 10/10; DECISIONS.md tail **ADR-0223** (next-free **ADR-0224**). ADR-0209 escape-valve reserve STANDS-UNCONSUMED.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
