@@ -16,7 +16,7 @@ Author `docs/envoy-go/phases/29-network-filter-mongo-proxy/SPEC.md` (the parent 
 
 ## Project state at master tip
 
-- **Master tip:** `91b1be7` (the phase-29 BRAINSTORM squash) + the immediately-following docs-only SHA-fill/next-prompt commit (+1, expected). Confirm the live tip via `git log --oneline -1`. STATE.md `last-commit` points at the squash. origin/master in sync after push.
+- **Master tip:** `49127e7` (the docs-only SHA-fill/next-prompt commit; actual HEAD at this repoint, trails the phase-29 BRAINSTORM squash `91b1be7` +1). This repoint itself advances the tip +1 (expected, not chased); confirm the live tip via `git log --oneline -1`. STATE.md `last-commit` points at the substantive squash `91b1be7`. origin/master in sync after push.
 - **§9 Network-filters family:** rows 26 (parent + sub-rows) + 27 + 28 (parent + 28.1a/28.1b/28.2) DONE; row 29 `in-progress` (parent; sub-rows 29.1/29.2/29.3 `planned`). After phase 29, 3 candidates remain (`redis`/`kafka_broker`/`thrift`).
 - **Counts at master tip:** stat surface **337**; differential fixtures **50** (tail `0048-zookeeper-responses`); fuzzers **38**; conformance h2spec 53/53 + proxy-wasm 10/10 (as of the 28.2 six-gate); DECISIONS.md tail **ADR-0223**; next-free **ADR-0224** (anticipated consumed by the phase-29 roster ADR-0224/0225/0226; ADR-0209 escape-valve reserve STANDS-UNCONSUMED).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
