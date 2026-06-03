@@ -1,6 +1,6 @@
 START a fresh cold-start session for envoy-go — **the phase-29.1 sub-phase PLAN (`network-filter-mongo-wire-and-requests`) is DONE + plan-document-reviewer APPROVED + squash-merged + pushed**. The active phase is **phase 29.1** (`in-progress`; parent row 29 `in-progress`; 29.2/29.3 `planned`). This session runs the **29.1 IMPL** — executing `docs/envoy-go/phases/29.1-network-filter-mongo-wire-and-requests/PLAN.md` (3022 lines, 17 bite-sized TDD tasks) via **`superpowers:subagent-driven-development`** (per SKILL_ROUTING state 3 + `feedback_execution_style`: a fresh subagent per task, two-stage review between tasks). Work in a git worktree (`feedback_git_worktrees`); subagents commit LOCAL-ONLY (`feedback_subagents_no_push`); the controller squash-merges + pushes at stage-close (`feedback_push_to_origin`).
 
-The 29.1 PLAN landed at squash `<FILL-AT-SQUASH>` (pushed to origin/master). It is the executable blueprint; the 29.1 SPEC (`SPEC.md`, squash `7574219`) + the parent SPEC (`29-network-filter-mongo-proxy/SPEC.md`, squash `ab376d8`) are the pinned-behavior references the PLAN's code blocks already transcribe. **The ADR-0045 gate PASSED at PLAN time: 17 tasks / ~1070–1470 production LoC → NO split** (the pre-authorized 29.1a/29.1b axis STANDS-UNCONSUMED).
+The 29.1 PLAN landed at squash `89c194a` (pushed to origin/master). It is the executable blueprint; the 29.1 SPEC (`SPEC.md`, squash `7574219`) + the parent SPEC (`29-network-filter-mongo-proxy/SPEC.md`, squash `ab376d8`) are the pinned-behavior references the PLAN's code blocks already transcribe. **The ADR-0045 gate PASSED at PLAN time: 17 tasks / ~1070–1470 production LoC → NO split** (the pre-authorized 29.1a/29.1b axis STANDS-UNCONSUMED).
 
 ## The 17-task spine (PLAN.md is authoritative — exact code/commands/expected-outputs per task)
 
@@ -41,7 +41,7 @@ The 29.1 PLAN landed at squash `<FILL-AT-SQUASH>` (pushed to origin/master). It 
 
 ## Project state at master tip
 
-- **Master tip:** the 29.1-PLAN squash `<FILL-AT-SQUASH>` (confirm via `git log --oneline -1`; docs-only — PLAN.md + STATE.md + next-prompt.txt). Substantive predecessor: the 29.1-SPEC squash `7574219`. origin/master in sync.
+- **Master tip:** the 29.1-PLAN squash `89c194a` (confirm via `git log --oneline -1`; docs-only — PLAN.md + STATE.md + next-prompt.txt). Substantive predecessor: the 29.1-SPEC squash `7574219`. origin/master in sync.
 - **§9 Network-filters family:** rows 26/27/28 DONE; row 29 `in-progress` (29.1 `in-progress`; 29.2/29.3 `planned`).
 - **Counts at master tip:** stat surface **337** (→ 360 at 29.1 IMPL); differential fixtures **50** (tail `0048-zookeeper-responses`; → 52 at 29.1 IMPL); fuzzers **38** (→ 39); conformance h2spec 53/53 + proxy-wasm 10/10 (as of the 28.2 six-gate); DECISIONS.md tail **ADR-0226** (next-free **ADR-0227**; the ADR-0224 body lands at the 29.1 IMPL — no new number).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
