@@ -15,7 +15,7 @@ mongo_proxy is the natural next but the choice is the brainstorm's. Other ROADMA
 
 ## Project state at master tip
 
-- **Master tip:** `3adc6a7` (the STATE.md SHA-fill docs commit; actual HEAD at repoint time, trails the substantive 28.2-IMPL squash `fde21c9` +1). This repoint itself advances the tip +1 (expected, not chased); confirm the live tip via `git log --oneline -1`.
+- **Master tip:** `fd709a6` (the prior next-prompt.txt master-tip repoint docs commit; actual HEAD at this repoint time, trails the substantive 28.2-IMPL squash `fde21c9` +2). This repoint itself advances the tip +1 (expected, not chased); confirm the live tip via `git log --oneline -1`.
 - **Substantive predecessors:** the 28.2-IMPL squash `fde21c9`, the 28.1b-IMPL squash `fdf40ea`, the 28.1a-IMPL squash `8703aeb`.
 - **§9 Network-filters family:** rows 26 (parent + sub-rows) + 27 + 28 (parent + 28.1a + 28.1b + 28.2) ALL DONE. 4 candidates remain: redis/mongo/kafka_broker/thrift.
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
