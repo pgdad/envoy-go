@@ -74,6 +74,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0048-zookeeper-responses/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0049-mongo-requests/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0050-mongo-boot-reject/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0051-mongo-responses/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -855,6 +856,18 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptZKResponder(ln, bo.accepts)
+		case fixture.TCPMongoResponder:
+			// MongoDB-aware canned responder (29.2 SPEC §6.1): correlated
+			// OP_REPLY/OP_COMMANDREPLY frames so the reference's onWrite response
+			// decoder fires + correlates.
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptMongoResponder(ln, bo.accepts)
 		}
 		backends[i] = bo
 	}
@@ -1981,4 +1994,185 @@ func TestZKResponderBackend(t *testing.T) {
 	if accepts.Load() != 1 {
 		t.Fatalf("accepts = %d, want 1", accepts.Load())
 	}
+}
+
+func TestMongoResponderBackend(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	var accepts atomic.Uint64
+	go acceptMongoResponder(ln, &accepts)
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// An OP_QUERY(2004) requestID 11 → a correlated OP_REPLY(1) whose responseTo == 11.
+	req := mongoReqFrame(11, 2004, "db.collection1")
+	if _, err := c.Write(req); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	hdr := make([]byte, 16)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		t.Fatalf("read reply header: %v", err)
+	}
+	msgLen := int32(binary.LittleEndian.Uint32(hdr[0:4]))
+	responseTo := int32(binary.LittleEndian.Uint32(hdr[8:12]))
+	opCode := int32(binary.LittleEndian.Uint32(hdr[12:16]))
+	if opCode != 1 {
+		t.Errorf("reply opCode = %d, want 1 (OP_REPLY)", opCode)
+	}
+	if responseTo != 11 {
+		t.Errorf("reply responseTo = %d, want 11 (correlation echo)", responseTo)
+	}
+	rest := make([]byte, msgLen-16)
+	if _, err := io.ReadFull(c, rest); err != nil {
+		t.Fatalf("read reply body: %v", err)
+	}
+}
+
+// TCPMongoResponder trigger markers (D-S29.2-2 / SPEC §6.1). The responder peeks
+// the request frame's requestID (bytes 4-8) + opCode (bytes 12-16) only. A marker
+// requestID selects a reply-flag variant or the unanswered-query withhold; the
+// driver assigns these requestIDs so both sides see identical correlated bytes.
+const (
+	mongoReplyCursorNotFound int32 = 0x01 // responseFlags 0x01
+	mongoReplyQueryFailure   int32 = 0x02 // responseFlags 0x02
+)
+
+// mongoMarkerWithhold is the requestID the responder treats as the unanswered-
+// query trigger: it reads the request but writes NO reply (the gauge stays at 1
+// while the connection is open — §3.4 / §6.2 arm 4).
+const mongoMarkerWithhold int32 = 7777
+
+// mongoMarkerCursorNotFound / mongoMarkerQueryFailure / mongoMarkerValidCursor /
+// mongoMarkerUncorrelated select the reply variant by requestID.
+const (
+	mongoMarkerCursorNotFound int32 = 7001
+	mongoMarkerQueryFailure   int32 = 7002
+	mongoMarkerValidCursor    int32 = 7003
+	mongoMarkerMalformedReply int32 = 7004
+	mongoMarkerUncorrelated   int32 = 7005
+)
+
+// acceptMongoResponder accepts connections, counts them, and runs the
+// MongoDB-aware canned-response loop on each (the TCPMongoResponder backend —
+// 29.2 SPEC §6.1; the acceptZKResponder sibling).
+func acceptMongoResponder(ln net.Listener, counter *atomic.Uint64) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		counter.Add(1)
+		go mongoRespondLoop(c)
+	}
+}
+
+// mongoRespondLoop reads complete request frames (16-byte LE MsgHeader framing)
+// and writes correlated canned responses until the client closes. It parses ONLY
+// messageLength + requestID + opCode; it is NOT a MongoDB server.
+func mongoRespondLoop(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	le32 := func(v int32) []byte {
+		b := make([]byte, 4)
+		binary.LittleEndian.PutUint32(b, uint32(v))
+		return b
+	}
+	le64 := func(v int64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, uint64(v))
+		return b
+	}
+	// respFrame builds a response with responseTo echoed; opCode is OP_REPLY(1) or
+	// OP_COMMANDREPLY(2011); a fresh responder requestID (constant 90000).
+	respFrame := func(responseTo, opCode int32, body []byte) []byte {
+		out := append(le32(int32(16+len(body))), le32(90000)...)
+		out = append(out, le32(responseTo)...)
+		out = append(out, le32(opCode)...)
+		return append(out, body...)
+	}
+	emptyDoc := []byte{0x05, 0x00, 0x00, 0x00, 0x00} // {len=5}{terminator}
+	replyBody := func(flags int32, cursorID int64, ndocs int32) []byte {
+		out := append(le32(flags), le64(cursorID)...)
+		out = append(out, le32(0)...)     // startingFrom
+		out = append(out, le32(ndocs)...) // numberReturned
+		for i := int32(0); i < ndocs; i++ {
+			out = append(out, emptyDoc...)
+		}
+		return out
+	}
+	commandReplyBody := func() []byte { return append(append([]byte(nil), emptyDoc...), emptyDoc...) }
+
+	for {
+		var hdr [16]byte
+		if _, err := io.ReadFull(c, hdr[:]); err != nil {
+			return // client closed / EOF
+		}
+		msgLen := int32(binary.LittleEndian.Uint32(hdr[0:4]))
+		if msgLen < 16 || msgLen > 1<<20 {
+			return // malformed / hostile
+		}
+		body := make([]byte, msgLen-16)
+		if _, err := io.ReadFull(c, body); err != nil {
+			return
+		}
+		reqID := int32(binary.LittleEndian.Uint32(hdr[4:8]))
+		opCode := int32(binary.LittleEndian.Uint32(hdr[12:16]))
+
+		switch opCode {
+		case 2004: // OP_QUERY → a correlated OP_REPLY, variant by the marker requestID
+			switch reqID {
+			case mongoMarkerWithhold:
+				// withhold — no reply (the unanswered-query gauge arm)
+			case mongoMarkerCursorNotFound:
+				_, _ = c.Write(respFrame(reqID, 1, replyBody(mongoReplyCursorNotFound, 0, 0)))
+			case mongoMarkerQueryFailure:
+				_, _ = c.Write(respFrame(reqID, 1, replyBody(mongoReplyQueryFailure, 0, 0)))
+			case mongoMarkerValidCursor:
+				_, _ = c.Write(respFrame(reqID, 1, replyBody(0, 4242, 1)))
+			case mongoMarkerMalformedReply:
+				// a well-framed OP_REPLY whose numberReturned LIES: claims 1 doc but the
+				// body carries NONE (only the 20-byte fixed header, no trailing doc) →
+				// decodeReply's parseDocument hits an empty reader → decoding_error on
+				// BOTH sides (same bytes; reference_wire_format_both_sides_see_same_bytes).
+				malformed := append(le32(0), le64(0)...)  // responseFlags + cursorID
+				malformed = append(malformed, le32(0)...) // startingFrom
+				malformed = append(malformed, le32(1)...) // numberReturned = 1 (no doc follows — the lie)
+				_, _ = c.Write(respFrame(reqID, 1, malformed))
+			case mongoMarkerUncorrelated:
+				// a reply whose responseTo matches NO sent query (responseTo = reqID+50000)
+				_, _ = c.Write(respFrame(reqID+50000, 1, replyBody(0, 0, 0)))
+			default:
+				_, _ = c.Write(respFrame(reqID, 1, replyBody(0, 0, 0))) // plain empty reply
+			}
+		case 2010: // OP_COMMAND → a correlated OP_COMMANDREPLY
+			_, _ = c.Write(respFrame(reqID, 2011, commandReplyBody()))
+		default:
+			// OP_INSERT(2002) / OP_GET_MORE(2005) / OP_KILL_CURSORS(2007): no reply
+			// (fire-and-forget; D-S29.2-2 — get_more not exercised by the load-bearing
+			// arms). Read-and-drop.
+		}
+	}
+}
+
+// mongoReqFrame builds a minimal request frame for the responder unit test.
+func mongoReqFrame(reqID, opCode int32, fullColl string) []byte {
+	le32 := func(v int32) []byte {
+		b := make([]byte, 4)
+		binary.LittleEndian.PutUint32(b, uint32(v))
+		return b
+	}
+	body := append(le32(0), append([]byte(fullColl), 0x00)...) // flags + cstring collection
+	body = append(body, le32(0)...)                            // numberToSkip
+	body = append(body, le32(0)...)                            // numberToReturn
+	body = append(body, 0x05, 0x00, 0x00, 0x00, 0x00)          // empty query doc
+	out := append(le32(int32(16+len(body))), le32(reqID)...)
+	out = append(out, le32(0)...)      // responseTo
+	out = append(out, le32(opCode)...) // opCode
+	return append(out, body...)
 }

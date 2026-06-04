@@ -1,6 +1,7 @@
 package mongoproxy
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -37,13 +38,221 @@ func msg(reqID, opCode int32, body []byte) []byte {
 	return append(out, body...)
 }
 
+// respMsg builds a response wire message with an EXPLICIT responseTo (the msg()
+// helper hardcodes responseTo=0; the response path correlates on it).
+func respMsg(reqID, responseTo, opCode int32, body []byte) []byte {
+	total := int32(16 + len(body))
+	out := append(leI32(total), leI32(reqID)...)
+	out = append(out, leI32(responseTo)...)
+	out = append(out, leI32(opCode)...)
+	return append(out, body...)
+}
+
+// opReplyBody: responseFlags(int32) + cursorID(int64) + startingFrom(int32) +
+// numberReturned(int32) + numberReturned BSON docs.
+func opReplyBody(flags int32, cursorID int64, docs ...[]byte) []byte {
+	out := append(leI32(flags), leI64(cursorID)...)
+	out = append(out, leI32(0)...)                // startingFrom
+	out = append(out, leI32(int32(len(docs)))...) // numberReturned
+	for _, dc := range docs {
+		out = append(out, dc...)
+	}
+	return out
+}
+
+func TestDecodeReply_Counters(t *testing.T) {
+	cases := []struct {
+		name     string
+		flags    int32
+		cursorID int64
+		ndocs    int
+		want     map[string]uint64
+	}{
+		{"plain-empty", 0, 0, 0, map[string]uint64{"op_reply": 1}},
+		{"cursor-not-found", 0x01, 0, 0, map[string]uint64{"op_reply": 1, "op_reply_cursor_not_found": 1}},
+		{"query-failure", 0x02, 0, 0, map[string]uint64{"op_reply": 1, "op_reply_query_failure": 1}},
+		{"valid-cursor", 0, 42, 1, map[string]uint64{"op_reply": 1, "op_reply_valid_cursor": 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, ms := newTestDecoder(t)
+			docs := make([][]byte, tc.ndocs)
+			for i := range docs {
+				docs[i] = simpleQuery()
+			}
+			d.decodeOnWrite(respMsg(7, 0, 1, opReplyBody(tc.flags, tc.cursorID, docs...)))
+			for suf, want := range tc.want {
+				if got := ms.counters[suf].Load(); got != want {
+					t.Errorf("%s = %d, want %d", suf, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeReply_MalformedBodyIsError(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	// numberReturned claims 1 doc, but the body carries a truncated BSON doc.
+	body := append(leI32(0), leI64(0)...) // flags + cursorID
+	body = append(body, leI32(0)...)      // startingFrom
+	body = append(body, leI32(1)...)      // numberReturned = 1
+	body = append(body, leI32(99)...)     // a doc claiming 99 bytes, none follow
+	d.decodeOnWrite(respMsg(7, 0, 1, body))
+	if ms.counters["decoding_error"].Load() != 1 {
+		t.Errorf("a malformed OP_REPLY doc must be a decoding_error")
+	}
+	// The charge-after-successful-decode ordering: a malformed reply must NOT
+	// charge op_reply (this would catch a partial-charge regression where the
+	// inc is wrongly placed before the doc-walk loop).
+	if ms.counters["op_reply"].Load() != 0 {
+		t.Errorf("a malformed OP_REPLY must NOT charge op_reply; got %d", ms.counters["op_reply"].Load())
+	}
+}
+
+func TestCorrelation_FirstMatchEraseDecsGauge(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	// Two OP_QUERYs (requestIDs 11, 12) → gauge 2, list len 2.
+	q1 := msg(11, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	q2 := msg(12, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	both := append(q1, q2...)
+	d.decodeOnData(both, int64(len(both)))
+	if ms.opQueryActive.Load() != 2 || len(d.queries) != 2 {
+		t.Fatalf("setup: gauge=%d len=%d, want 2/2", ms.opQueryActive.Load(), len(d.queries))
+	}
+	// A reply with responseTo=11 correlates the first query → erase + gauge Dec.
+	d.decodeOnWrite(respMsg(99, 11, 1, opReplyBody(0, 0)))
+	if ms.opQueryActive.Load() != 1 {
+		t.Errorf("gauge = %d after one correlated reply, want 1", ms.opQueryActive.Load())
+	}
+	if len(d.queries) != 1 || d.queries[0].requestID != 12 {
+		t.Errorf("first-match-erase failed: %+v", d.queries)
+	}
+}
+
+func TestCorrelation_UncorrelatedMissChargesFixedOnly(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	q1 := msg(11, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	d.decodeOnData(q1, int64(len(q1)))
+	// A reply whose responseTo (777) matches NO pending query: op_reply +1, gauge UNCHANGED.
+	d.decodeOnWrite(respMsg(99, 777, 1, opReplyBody(0, 0)))
+	if ms.counters["op_reply"].Load() != 1 {
+		t.Errorf("op_reply must still fire for an uncorrelated reply")
+	}
+	if ms.opQueryActive.Load() != 1 {
+		t.Errorf("an uncorrelated reply must NOT change the gauge (still 1 in-flight query)")
+	}
+	if len(d.queries) != 1 {
+		t.Errorf("an uncorrelated reply must not erase any entry")
+	}
+}
+
+func TestCorrelation_CommandReplyDoesNotCorrelate(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	q1 := msg(11, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	d.decodeOnData(q1, int64(len(q1)))
+	// An OP_COMMANDREPLY echoing responseTo=11 must NOT erase the OP_QUERY entry
+	// (only OP_REPLY correlates — parent §11.4 item 7).
+	d.decodeOnWrite(respMsg(99, 11, 2011, opCommandReplyBody()))
+	if ms.opQueryActive.Load() != 1 || len(d.queries) != 1 {
+		t.Errorf("OP_COMMANDREPLY must not correlate against the active-query list")
+	}
+}
+
+func opCommandReplyBody(outputDocs ...[]byte) []byte {
+	out := append(bsonDocEmpty(), bsonDocEmpty()...) // metadata + commandReply (both empty docs)
+	for _, dc := range outputDocs {
+		out = append(out, dc...)
+	}
+	return out
+}
+
+// bsonDocEmpty is a 5-byte empty BSON document {len=5}{0x00}.
+func bsonDocEmpty() []byte { return doc() }
+
+func TestDecodeCommandReply_Counter(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	d.decodeOnWrite(respMsg(7, 0, 2011, opCommandReplyBody()))
+	if ms.counters["op_command_reply"].Load() != 1 {
+		t.Errorf("op_command_reply = %d, want 1", ms.counters["op_command_reply"].Load())
+	}
+	// OP_COMMANDREPLY does NOT touch the gauge (no correlation).
+	if ms.opQueryActive.Load() != 0 {
+		t.Errorf("OP_COMMANDREPLY must not touch the gauge")
+	}
+}
+
+func TestDecodeCommandReply_MalformedIsError(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	body := append(leI32(99), make([]byte, 4)...) // metadata claims 99 bytes, none follow
+	d.decodeOnWrite(respMsg(7, 0, 2011, body))
+	if ms.counters["decoding_error"].Load() != 1 {
+		t.Errorf("a malformed OP_COMMANDREPLY must be a decoding_error")
+	}
+	// Charge-after-successful-decode: a malformed command reply must NOT charge
+	// op_command_reply (guards against a pre-loop partial-charge regression).
+	if ms.counters["op_command_reply"].Load() != 0 {
+		t.Errorf("a malformed OP_COMMANDREPLY must NOT charge op_command_reply; got %d", ms.counters["op_command_reply"].Load())
+	}
+}
+
+func TestDecodeOnWrite_PartialFrameReassembly(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	full := respMsg(7, 1, 1, opReplyBody(0, 0)) // a minimal empty OP_REPLY (responseTo 1)
+	// Feed the first 10 bytes (partial header) — nothing decoded.
+	d.decodeOnWrite(full[:10])
+	if ms.counters["op_reply"].Load() != 0 {
+		t.Fatalf("op_reply fired on a partial write frame")
+	}
+	// Feed the rest (cumulative is NOT used on the write side — fresh per-Write
+	// buffers; feed only the remaining bytes).
+	d.decodeOnWrite(full[10:])
+	if ms.counters["op_reply"].Load() != 1 {
+		t.Errorf("op_reply = %d after full write frame, want 1", ms.counters["op_reply"].Load())
+	}
+}
+
+func TestDecodeOnWrite_ShortMessageLengthIsError(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	bad := append(leI32(8), make([]byte, 12)...) // messageLength 8 < 16
+	d.decodeOnWrite(bad)
+	if ms.counters["decoding_error"].Load() != 1 {
+		t.Errorf("a messageLength < 16 on the write side must be a decoding_error")
+	}
+}
+
+func TestDecodeOnWrite_UnexpectedOpcodeIsError(t *testing.T) {
+	d, ms := newTestDecoder(t)
+	// A request opcode (OP_QUERY 2004) on the RESPONSE stream is malformed.
+	d.decodeOnWrite(respMsg(1, 0, 2004, nil))
+	if ms.counters["decoding_error"].Load() != 1 {
+		t.Errorf("a non-reply opcode on the write side must be a decoding_error")
+	}
+}
+
+func TestDecoder_SniffingOffIsDirectionShared(t *testing.T) {
+	// An error on the READ side turns sniffing off for the connection; a
+	// subsequent WRITE-side frame then decodes NOTHING (AMEND-B6 direction-shared).
+	d, ms := newTestDecoder(t)
+	d.decodeOnData(msg(1, 2013, nil), int64(len(msg(1, 2013, nil)))) // OP_MSG → error
+	if ms.counters["decoding_error"].Load() != 1 || d.sniffing.Load() {
+		t.Fatalf("read-side error did not turn sniffing off")
+	}
+	d.decodeOnWrite(respMsg(7, 1, 1, opReplyBody(0, 0))) // a valid reply, but sniffing is off
+	if ms.counters["op_reply"].Load() != 0 {
+		t.Errorf("op_reply must stay 0 — sniffing is off for the connection (direction-shared)")
+	}
+	if ms.counters["decoding_error"].Load() != 1 {
+		t.Errorf("decoding_error must stay 1 (at-most-once across both directions)")
+	}
+}
+
 func TestCodec_OpMsgIsDecodingError(t *testing.T) {
 	d, ms := newTestDecoder(t)
 	d.decodeOnData(msg(1, 2013, nil), int64(len(msg(1, 2013, nil)))) // OP_MSG
 	if ms.counters["decoding_error"].Load() != 1 {
 		t.Fatalf("decoding_error = %d, want 1", ms.counters["decoding_error"].Load())
 	}
-	if d.sniffing {
+	if d.sniffing.Load() {
 		t.Errorf("sniffing must be false after a decode error")
 	}
 }
@@ -73,7 +282,7 @@ func TestCodec_ReplyAndCommandReplyRecognizedNotDecoded(t *testing.T) {
 	if ms.counters["decoding_error"].Load() != 0 {
 		t.Errorf("Reply/CommandReply must not error; got %d", ms.counters["decoding_error"].Load())
 	}
-	if !d.sniffing {
+	if !d.sniffing.Load() {
 		t.Errorf("sniffing must stay on after recognized-not-decoded opcodes")
 	}
 	if len(d.readBuf) != 0 {
@@ -105,6 +314,62 @@ func TestCodec_MultiReadNoDoubleCount(t *testing.T) {
 	d.decodeOnData(full, int64(len(full))) // same totalAppended → no new bytes
 	if ms.counters["op_query"].Load() != 1 {
 		t.Errorf("op_query = %d, want 1 (no double-count across reads)", ms.counters["op_query"].Load())
+	}
+}
+
+func TestDecoder_GaugeIncsPerActiveQuery(t *testing.T) {
+	// Each decoded OP_QUERY appends to the active-query list AND Incs the gauge;
+	// the list-size↔gauge invariant holds on the request-only path (§3.4).
+	d, ms := newTestDecoder(t)
+	f1 := msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	f2 := msg(2, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	both := append(f1, f2...)
+	d.decodeOnData(both, int64(len(both)))
+	if got := ms.opQueryActive.Load(); got != 2 {
+		t.Errorf("op_query_active = %d, want 2 (one Inc per active query)", got)
+	}
+	if len(d.queries) != 2 {
+		t.Errorf("active-query list = %d, want 2 (gauge must track list size)", len(d.queries))
+	}
+}
+
+func TestOnDestroy_DrainsResidualGauge(t *testing.T) {
+	// Two never-answered queries → gauge 2; onDestroy drains the residual list and
+	// Decs the gauge per entry → gauge 0 (the connection-close teardown, §3.4).
+	d, ms := newTestDecoder(t)
+	q := append(
+		msg(11, 2004, opQueryBody("db.collection1", 0, simpleQuery())),
+		msg(12, 2004, opQueryBody("db.collection1", 0, simpleQuery()))...,
+	)
+	d.decodeOnData(q, int64(len(q)))
+	if ms.opQueryActive.Load() != 2 {
+		t.Fatalf("setup: gauge=%d, want 2", ms.opQueryActive.Load())
+	}
+	d.onDestroy()
+	if ms.opQueryActive.Load() != 0 {
+		t.Errorf("gauge = %d after onDestroy, want 0 (residual drain Dec)", ms.opQueryActive.Load())
+	}
+	if len(d.queries) != 0 {
+		t.Errorf("onDestroy must clear the residual list")
+	}
+}
+
+func TestGaugeLifecycle_Invariant(t *testing.T) {
+	// inc(2) → dec(1 correlated) → destroy(drains 1) → 0. The list-size↔gauge
+	// invariant holds at each step.
+	d, ms := newTestDecoder(t)
+	q := append(
+		msg(11, 2004, opQueryBody("db.c1", 0, simpleQuery())),
+		msg(12, 2004, opQueryBody("db.c1", 0, simpleQuery()))...,
+	)
+	d.decodeOnData(q, int64(len(q)))
+	d.decodeOnWrite(respMsg(99, 11, 1, opReplyBody(0, 0))) // answer query 11
+	if ms.opQueryActive.Load() != int64(len(d.queries)) || ms.opQueryActive.Load() != 1 {
+		t.Fatalf("after one answer: gauge=%d len=%d, want 1/1", ms.opQueryActive.Load(), len(d.queries))
+	}
+	d.onDestroy()
+	if ms.opQueryActive.Load() != 0 {
+		t.Errorf("gauge = %d at end of connection, want 0", ms.opQueryActive.Load())
 	}
 }
 
@@ -352,5 +617,47 @@ func TestDecodeInsert_MalformedIsError(t *testing.T) {
 	d.decodeOnData(full, int64(len(full)))
 	if ms.counters["decoding_error"].Load() != 1 {
 		t.Errorf("a malformed OP_INSERT doc must be a decoding_error")
+	}
+}
+
+func TestDecoderConcurrentRequestResponseRace(t *testing.T) {
+	// R9: two goroutines over ONE decoder — A drives decodeOnData with a request
+	// stream, B drives decodeOnWrite with the matching response stream. With mu
+	// guarding dec.queries this is race-clean; REMOVING mu MUST trip `go test
+	// -race`. Run under `-race -count=5`.
+	d, ms := newTestDecoder(t)
+	const n = 200
+	reqs := make([][]byte, n)
+	reps := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		id := int32(i + 1)
+		reqs[i] = msg(id, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+		reps[i] = respMsg(int32(10000+i), id, 1, opReplyBody(0, 0))
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		var total int64
+		for _, r := range reqs {
+			total += int64(len(r))
+			d.decodeOnData(r, total)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for _, r := range reps {
+			d.decodeOnWrite(r)
+		}
+	}()
+	wg.Wait()
+	// No assertion on the exact gauge value (the interleaving is nondeterministic —
+	// a reply may arrive before its query); the point is race-freedom + no panic.
+	// At minimum op_reply counted every fed reply.
+	if ms.counters["op_reply"].Load() != uint64(n) {
+		t.Errorf("op_reply = %d, want %d", ms.counters["op_reply"].Load(), n)
+	}
+	if ms.counters["op_query"].Load() != uint64(n) {
+		t.Errorf("op_query = %d, want %d (request stream must populate dec.queries)", ms.counters["op_query"].Load(), n)
 	}
 }

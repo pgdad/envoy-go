@@ -1,164 +1,105 @@
-# Phase 29.1 IMPL — PROGRESS
+# Phase 29.2 IMPL — PROGRESS
 
-Network-filter `mongo_proxy` wire + requests. This file tracks the IMPL-session
-baselines (Task 1) and a per-task log filled as Tasks 1–17 land.
+Worktree: `.worktrees/phase-29.2-network-filter-mongo-responses-and-correlation-impl`
+Branch: `phase-29.2-network-filter-mongo-responses-and-correlation-impl` (off master `46dcd1b`)
+Executing: `docs/envoy-go/phases/29.2-network-filter-mongo-responses-and-correlation/PLAN.md` (11 tasks)
+Mode: subagent-driven-development (fresh subagent per task; two-stage review between tasks); subagents commit LOCAL-ONLY.
 
-## Baselines (Task 1 — first-action gate)
+## Task 1 — baselines/anchors gate (DONE)
 
-Re-confirmed at the IMPL-session tip.
+Confirmed at the IMPL-session tip `46dcd1b`:
+- differential fixtures: **52** (tail `test/fixtures/0050-mongo-boot-reject`) → 53 at phase-done
+- fuzzers: **39** (extend `FuzzMongoDecode`; no 40th)
+- DECISIONS.md tail header: **## ADR-0226** (next-free **ADR-0227**; ADR-0225 body lands in-place at T11)
+- BackendKind: `TCPSink = 28`, `TCPZKResponder = 29` (next-free **30** = `TCPMongoResponder`)
+- stat surface: **360** (+0 at 29.2)
 
-- **Worktree tip:** `4a538f7 next-prompt.txt + STATE.md: correct PLAN line count 3022→3033 (post reviewer-advisory fold)`
-- **Fixtures:** **50** (canonical recipe `ls -d test/fixtures/[0-9]* | wc -l`); tail dir = `test/fixtures/0048-zookeeper-responses`. 29.1 lands `0049` + `0050` → 52.
-- **Fuzzers:** **38** (canonical recipe `grep -rh "^func Fuzz" $(find ./internal -name fuzz_test.go) | wc -l`). 29.1 lands the 39th (`FuzzMongoDecode`).
-- **Stats surface:** **337** (canonical count — `BEHAVIOR_CONTRACT.md:466` "Phase 28.1 extension — 136 → 337 internal names"; `:464` confirms 28.2 held at 337). 29.1 lands +23 → **360** at Task 17.
-- **DECISIONS.md ADR tail:** **ADR-0226** (`grep -oE "ADR-0[0-9]+" docs/envoy-go/DECISIONS.md | sort -u | tail -3` = ADR-0224 / ADR-0225 / ADR-0226). **Next-free = ADR-0227.** 29.1 fills the ADR-0224 §Decision/§Consequences body in place (no new ADR number consumed).
+As-built anchors (codec.go / filter.go / stats.go) verified:
+- `decoder` struct (codec.go:46-52): 7 fields; gains `mu`/`writeBuf`/`dynMeta` at T2/T3
+- dispatch `opReply, opCommandReply: return true` (recognized-not-decoded, 29.1) present
+- `decoderError`/`fail` present (to be CAS-converted at T3)
+- `OnWrite` no-op stub present (filter.go); `OnDestroy` = `f.dec = nil`
+- `opQueryActive` gauge created eagerly (stats.go)
+- `Gauge.{Inc,Dec,Add,Load}` present; `Bucket.Set(filterName, key, *structpb.Value)`; `DynamicMetadata() *dynamicmetadata.Bucket` on ReadFilterCallbacks
 
-## TypeURL + field/FaultDelay/denominator roster (Task 1 — Step 3 pins)
+Clean baseline: `go build ./...` clean; `go test ./internal/filter/network/mongoproxy/... -count=1` green.
 
-Against go-control-plane **v1.32.4** in the module cache.
+## Task checklist
 
-### TypeURL pin
+- [x] T1 — baselines/anchors gate + PROGRESS.md
+- [x] T2 — decoder mutex + writeBuf/dynMeta fields + gauge Inc on request append (commit f98af16; both reviews ✅)
+- [x] T3 — decodeOnWrite framing + dispatch + sniffing atomic.Bool (CAS at-most-once) (commit 7f3cea5; both reviews ✅; +1-line fuzz_test.go compile fix)
+- [x] T4 — OP_REPLY/OP_COMMANDREPLY body decode + 5 response counters (commit 653843f + hardening 20f0e9a; both reviews ✅)
+- [x] T5 — correlation takeQuery first-match-erase + gauge Dec on hit (commit c0a4a91; both reviews ✅)
+- [x] T6 — OnDestroy residual-drain teardown + lifecycle invariant (commit 4bbe972; both reviews ✅)
+- [x] T7 — OnWrite glue + concurrent race test + R9 mutex deliberate-break (commit afc3525 + hardening 44e5d7b; both reviews ✅)
+- [x] T8 — emit_dynamic_metadata single-Set Bucket emission (commit 4088090; both reviews ✅)
+- [x] T9 — extend FuzzMongoDecode to both directions (commit 73ed351; both reviews ✅; count stays 39 — verified canonical recipe)
+- [x] T10 — TCPMongoResponder BackendKind 30 + acceptMongoResponder (commit 8c7f3cf + fix 50ca55b; both reviews ✅)
+- [x] T11A — 0051-mongo-responses fixture cross-side GREEN (commit 068851a; both reviews ✅)
+- [x] T11B — completion bundle (ADR-0225 body + BEHAVIOR_CONTRACT + STATE/ROADMAP + next-prompt; commit 984147a) + six-gate evidence (8da9af4) + final whole-impl review ✅ (approve; 4 stale-comment cleanups swept in 469934f)
 
-- `proto.MessageName(&mpv3.MongoProxy{})` = **`envoy.extensions.filters.network.mongo_proxy.v3.MongoProxy`** (verified via `go run`; carries the `extensions.` segment).
-- `TypeURL` = `type.googleapis.com/` + above = **`type.googleapis.com/envoy.extensions.filters.network.mongo_proxy.v3.MongoProxy`**.
+## Per-task evidence log
 
-### MongoProxy 5-field accessor set
+### T1
+- Counts/anchors confirmed (above). Clean baseline green. No code change.
 
-`extensions/filters/network/mongo_proxy/v3/mongo_proxy.pb.go`:
+### T2 (commit f98af16)
+- Added `mu`/`writeBuf`/`dynMeta` decoder fields + `appendQuery` (lock append, Inc outside lock); replaced 2 request-path append sites. `TestDecoder_GaugeIncsPerActiveQuery` fails→green. gofmt/lint clean; full pkg green under -race.
+- Deviation: `//nolint:unused` on `writeBuf`/`dynMeta` (forward-declared; repo precedent lua/compiled_config.go:198). CARRY: drop the nolint when writeBuf gains a consumer (T3) and dynMeta gains a reader (T8).
+- Spec review ✅; code-quality review ✅ (approve, no changes).
 
-- `func (x *MongoProxy) GetStatPrefix() string`
-- `func (x *MongoProxy) GetAccessLog() string`
-- `func (x *MongoProxy) GetDelay() *v3.FaultDelay`  (`v3` = `extensions/filters/common/fault/v3`)
-- `func (x *MongoProxy) GetEmitDynamicMetadata() bool`
-- `func (x *MongoProxy) GetCommands() []string`
+### T3 (commit 7f3cea5)
+- `sniffing` → `atomic.Bool`; `newDecoder` Store(true); `decoderError` CAS at-most-once; readBuf-release relocated to decodeOnData post-loop; per-pass dynMeta clear added (gated, exercised at T8). Added `decodeOnWrite`/`nextWriteMessage`/`decodeResponseMessage` + stub `decodeReply`/`decodeCommandReply`. 4 new write-side tests fail→green. Removed writeBuf nolint; kept dynMeta nolint.
+- Necessary deviation: 1-line `d.sniffing`→`.Load()` in fuzz_test.go (atomic.Bool can't be value-copied; required to compile). No fuzzer logic change.
+- Spec review ✅; code-quality review ✅ (CAS exactly-once + readBuf-release verified empirically under -race -count=5).
 
-### FaultDelay oneof accessors + wrapper type names
+### T4 (commit 653843f + hardening 20f0e9a)
+- Replaced stub decodeReply/decodeCommandReply with full body decode. decodeReply: flags/cursorID/startingFrom/numberReturned + N docs → op_reply + cursor_not_found(0x01) + query_failure(0x02) + valid_cursor(cursorID≠0); counters charge ONLY after successful doc-walk; malformed → fail(). decodeCommandReply: metadata+commandReply+0..N outputDocs → op_command_reply; never touches gauge. Correlation deferred to T5 (responseTo unused).
+- Adaptation: test `want` map typed `uint64` (Counter.Load→uint64; gauge→int64). Hardening commit added `op_reply==0`/`op_command_reply==0` assertions to the two malformed tests (liveness proven: moving inc above doc-walk fails the assertion).
+- Spec review ✅; code-quality review ✅ (approve).
 
-`extensions/filters/common/fault/v3/fault.pb.go`:
+### T8 (commit 4088090)
+- `decoder.recordOp(collection, op)` (gated, lazy-init, append) called from decodeQuery both success paths (op="query") + decodeInsert (op="insert", captures previously-discarded fullColl cstring, post-dot token). `filter.emitDynamicMetadata()` builds ONE structpb StructValue (collection→ListValue of op strings) via single Set("envoy.filters.network.mongo_proxy","operations",sv); gated + empty-skip. Wired into OnData after decode feed. Removed dynMeta nolint. ZERO internal/dynamicmetadata/ change (D-S29.2-3).
+- Test-harness fix: driveOnData takes a SHARED *network.Buffer (PLAN's fresh-per-call broke the monotonic TotalAppended high-water → pass 2 under-fed). Validated faithful to one-Buffer-per-connection (chain.go rt.buf). Per-pass-clear proof live (driven by decodeOnData d.dynMeta=nil reset).
+- Spec review ✅; code-quality review ✅ (structpb confirmed absent from codec; recordOp lock-free goroutine-A-only; nesting + insertion order correct; nil-f.cb deref unreachable per chain.go).
 
-- `func (x *FaultDelay) GetFaultDelaySecifier() ...` — the oneof getter. **NOTE the upstream-proto `Secifier` typo** (missing `p`; it is NOT `Specifier`).
-- `func (x *FaultDelay) GetFixedDelay() *durationpb.Duration` — type-asserts to `*FaultDelay_FixedDelay`.
-- `func (x *FaultDelay) GetHeaderDelay() *FaultDelay_HeaderDelay` — type-asserts to `*FaultDelay_HeaderDelay_`.
-- `func (x *FaultDelay) GetPercentage() *v3.FractionalPercent`  (`v3` here = `type/v3`).
-- Oneof-wrapper types: **`FaultDelay_FixedDelay`** (struct) and **`FaultDelay_HeaderDelay_`** (struct, trailing underscore — distinct from the `FaultDelay_HeaderDelay` message type returned by `GetHeaderDelay()`).
-- Marker method: `isFaultDelay_FaultDelaySecifier()` (typo carried).
+### T11B six-gate evidence (run before docs)
+- GATE 1 `go build ./...` → clean.
+- GATE 2 `go vet ./...` → clean.
+- GATE 3 `golangci-lint run` (full repo) → exit 0.
+- GATE 4 `go test ./... -race -short` → 80 packages ok, 0 fail.
+- GATE 5 `go test ./test/differential/ -count=1` (full 53-dir) → all mongo fixtures (0049/0050/0051) byte-exact PASS. **Pre-existing environmental flake:** the full-suite run intermittently fails ONE random unrelated HTTP/wasm fixture with `subject ready: EOF` (subject-subprocess startup probe timing). Reproduced IDENTICALLY on MASTER @46dcd1b (→ 0012-http-header-mutation), proving it is NOT a 29.2 regression (29.2 touches zero HTTP code; framework byte-untouched). Branch runs flaked 0019/0025 then 0034 then 0021; ALL pass on isolated/subset re-run. Confirmation run of the 3 mongo + all 5 previously-flaked HTTP fixtures TOGETHER → 8/8 PASS (22s).
+- GATE 6 conformance (h2spec 53/53 + proxy-wasm 10/10) → asserted-UNAFFECTED (29.2 touches no HTTP/h2/wasm path; zero code change there; last green 29.1 six-gate 2026-06-04).
+- Counts at phase-done: fixtures **53**, fuzzers **39**, stats **360**, BackendKind tail **30**, DECISIONS tail **ADR-0226** (next-free ADR-0227).
 
-### FractionalPercent denominator enum (valid set {0,1,2})
+### T11A (commit 068851a)
+- Fixture `0051-mongo-responses` (single-listener l_resp/mongo_r → TCPMongoResponder). 6 arms (plain round-trip; 3 flag variants 7001/7002/7003; OP_COMMAND round-trip; withhold 7777; uncorrelated 7005; malformed 7004). StatsAsserter cross-side GREEN vs reference v1.37.2 (Docker). Arm-accounting LIVE-VERIFIED.
+- **op_query=7 (NOT PLAN's estimate of 6)** — arm6 malformed sends a VALID OP_QUERY request (only the response is malformed). op_reply=5, op_command=1, decoding_error=1, 3 flag counters=1, op_command_reply=1. Gauge op_query_active==0 at rest. cx_destroy_* PRESENCE-ONLY (ref=3/subj=0; D-P4). delays_injected/cx_drain_close present==0.
+- Unanswered-gauge: approach (B) — cross-side proves answered→0 + residual-drain→0; ==1-while-open is unit-covered (T6). (Drive* methods get only proxy addr, not admin addr.)
+- **R4 deliberate-breaks (-count=1):** (a) op_reply want 6→FAIL; (b) skip Dec→subj gauge=4 want 0 FAIL; (c) skip Inc→subj gauge=-7 want 0 FAIL. All reverted GREEN; codec.go byte-identical. Break (b) re-proven independently by spec reviewer; gauge math (b:+4, c:-7) reproduced by code reviewer.
+- Spec review ✅; code-quality review ✅ (approve). Fixture count → 53.
 
-`type/v3/percent.pb.go`:
+### T9 (commit 73ed351)
+- Extended FuzzMongoDecode to feed BOTH decodeOnData + decodeOnWrite over one decoder; 3 response seeds (empty OP_REPLY / OP_COMMANDREPLY / malformed numReturned-lies); 4 invariants (no-panic, input-immutability, direction-shared sniffing-off at-most-once, readBuf+writeBuf bounded). respSeed/replyBodySeed/docSeed wrappers. NO 40th fuzzer — canonical `grep "^func Fuzz" internal/**/fuzz_test.go | wc -l` = **39** confirmed.
+- Adaptation: writeBuf bound `len(data)+16`→`2*len(data)+16` (decodeOnWrite fed `data` twice + no high-water → legit 2*len(data) accumulation; not a prod bug). 20s fuzz run clean (~5.4M execs).
+- Spec review ✅; code-quality review ✅ (invariant 3 live for write side; immutability valid for shared slice; bound correction sound).
 
-- `FractionalPercent_HUNDRED FractionalPercent_DenominatorType = 0`
-- `FractionalPercent_TEN_THOUSAND FractionalPercent_DenominatorType = 1`
-- `FractionalPercent_MILLION FractionalPercent_DenominatorType = 2`
+### T10 (commit 8c7f3cf + fix 50ca55b)
+- `TCPMongoResponder BackendKind = 30` + `acceptMongoResponder`/`mongoRespondLoop` (16-byte LE MsgHeader framing; correlated OP_REPLY/OP_COMMANDREPLY, responseTo echoes requestID; marker requestIDs: withhold 7777, cursorNotFound 7001, queryFailure 7002, validCursor 7003+cursorID 4242, malformedReply 7004, uncorrelated 7005=reqID+50000). `mongoReqFrame` + `TestMongoResponderBackend`. Dispatch arm mirrors TCPZKResponder. Zero production code.
+- **Spec-review bug caught + fixed (50ca55b):** original 7004 emitted `replyBody(0,0,1)` = a WELL-FORMED 1-doc reply (replyBody always appends ndocs docs). Fixed to inline 20-byte body (numberReturned=1, NO doc) → genuinely malformed → decodeReply parseDocument on empty reader → decoding_error, op_reply NOT charged. Verified by throwaway test (decoding_error==1, op_reply==0) both by impl + re-review.
+- Spec review ✅ (re-review after fix); code-quality review ✅ (wire frames byte-verified vs codec; inline-malformed the right structural choice vs corrupting replyBody invariant; framing-read hardened). Marker consts mirrored driver-local in T11 (PLAN design).
 
-## Per-task log
+### T5 (commit c0a4a91)
+- `takeQuery(responseTo)` first-match-erase under mu (copy-out by value, order-preserving slice-delete); correlation block in decodeReply Decs gauge OUTSIDE the lock on a hit. 3 correlation tests (first-match-erase decs gauge; uncorrelated miss charges fixed only; command-reply does not correlate). activeQuery.requestID matched verbatim.
+- Spec review ✅; code-quality review ✅ (slice-delete stale-tail analyzed benign — bounded by per-conn lifetime + T6 onDestroy drain; command-reply non-correlation assertion is live).
 
-### Task 1 — First-action baselines/anchors gate (no code change) — DONE
-All counts re-confirmed at tip: fixtures 50 (tail `0048-zookeeper-responses`), fuzzers 38, stats 337, DECISIONS tail ADR-0226 (next-free ADR-0227). TypeURL = `envoy.extensions.filters.network.mongo_proxy.v3.MongoProxy`. Field/FaultDelay/denominator roster pinned above. `PROGRESS.md` created + committed local-only.
+### T6 (commit 4bbe972)
+- `decoder.onDestroy()`: snapshot n under mu, `d.queries=nil`, Add(-n) OUTSIDE lock guarded by `if n>0` (idempotent, no negative gauge; D-S29.2-5). `filter.OnDestroy` drains via f.dec.onDestroy() then nils f.dec. 3 tests (residual drain→0; lifecycle inc2/dec1/drain1→0 with list↔gauge invariant; filter-level drain+release).
+- Spec review ✅; code-quality review ✅ (gauge Inc/Dec/Add proven a balanced additive group netting 0/conn; nil drops backing array resolving T5 tail-leak; idempotency verified under -race). Non-blocking nits (terminal list assertion covered by sibling test) — no action.
 
-### Task 2 — `mongoproxy` package skeleton + TypeURL + config parse — DONE
-Skeleton + TypeURL (`type.googleapis.com/envoy.extensions.filters.network.mongo_proxy.v3.MongoProxy`) + config parse (5 fields, AMEND-B7 default commands {delete,insert,update}, alias table) landed; commit `d682ee6`.
-
-### Task 3 — FaultDelay PGV validation + PARSE-REJECT constants — DONE
-Replaced the Task-2 `parseDelay` stub with the real FaultDelay PGV validator: oneof `fault_delay_secifier` required when delay present (`errDelaySpecifierRequired`), `fixed_delay` must be > 0s (`errDelayFixedDelayTooSmall`), `header_delay` parse-accepted, percentage denominator constrained to the defined enum set {0,1,2} (`errDelayDenominatorInvalid`); the four byte-stable PARSE-REJECT constants guarded by `TestParseRejectConstants_ByteStable`. The four Task-2 `//nolint:unused` directives + their announcing block comment removed (parseDelay now writes `delayConfigured`/`fixedDelay`/`delayPercentNum`/`delayPercentDenom`). gofmt/lint/test clean.
-
-### Task 4 — bson.go part 1 — primitives + scalars — DONE
-`bson.go` part 1: `errBSON`, `bsonElem`, `bsonDoc`+`first()`/`find()`, `asInt64`, the `bsonReader` cursor (readByte/readBytes/readInt32/readInt64/readCString, all underflow-checked), `parseBSON`/`parseDocument` framing (docLen>=5, end-bound, terminator-position checks), `parseElementValue` for the 7 fixed-width scalar types (0x01/0x08/0x09/0x0A/0x10/0x11/0x12) + throw-on-unknown default. `//nolint:unused` added on `find`+`asInt64` (consumed by the codec) — REMOVED at Task 8. commit `f757eae`.
-
-### Task 5 — bson.go part 2 — variable/nested + lookups — DONE
-Inserted the 7 variable-length/nested cases ABOVE the default: String 0x02 + Symbol 0x0E (`readString`), Document 0x03 + Array 0x04 (recurse `parseDocument`), Binary 0x05 (len+subtype+bytes), ObjectId 0x07 (12 bytes), Regex 0x0B (two cstrings → `[2]string`). No recursion-depth guard (upstream wire-parity; bounded by the codec readBuf cap). commit `3b37d81`.
-
-### Task 6 — stats.go — 23-stat eager roster + dynamic helpers — DONE
-`rosterSuffixes()` (the EXACT 22 upstream-macro suffixes; `delays_injected` PLURAL — AMEND-B3), `mongoStats` + `newMongoStats` (eager 22 counters + `op_query_active` gauge under `mongo.<sp>.`), `inc(suffix)` (panic on unknown — closed roster), dynamic helpers `cmdTotal`/`collectionQuery`/`callsiteQuery`. `//nolint:unused` on `inc` — REMOVED at Task 7. `compiledConfig.stats` field NOT re-added (deferred to Task 10). commit `0f16aac`. **The Task-6 code-quality review surfaced a latent panic: `collectionQuery`/`callsiteQuery` feed wire-derived segments into `NewCounterIfAbsent` which PANICS on names failing `nameRE` → the Task-13 fuzzer would crash. User-approved fix "Guard + skip" applied at Task 8 (see below). Memory: `reference_dynamic_stat_name_charset_guard`.**
-
-### Task 7 — codec.go part 1 — framing + reassembly + dispatch — DONE
-`decoder` struct (`chainConsumed` high-water vs `Buffer.TotalAppended()` per D-S29.1-4, own `readBuf`, `sniffing`, `queries`), `newDecoder`, `decodeOnData`, `nextMessage` (msgLen includes 16-byte header; `msgLen<16`→error catches negatives; partial→wait), `decodeMessage` (7-opcode dispatch: Query/Insert/GetMore/KillCursors/Command body-decoded; Reply(1)/CommandReply(2011) recognized-not-decoded; default incl. OP_MSG 2013/Update/Delete → `decoderError`), `decoderError` (at-most-once + sniffing-off lifetime, D-S29.1-6), `fail()`, 5 STUB body decoders. Removed Task-6 `inc` nolint; added forward-ref nolints on `activeQuery`/`queries`/`fail` (REMOVED at Task 8). Dropped the PLAN test-helper's dead `cfg.stats = ms` (field lands at Task 10). commit `54be390`. Carry: Task-10 must feed `buf.Bytes()`+`buf.TotalAppended()` atomically (trusted-caller contract).
-
-### Task 8 — codec.go part 2 — OP_QUERY decode — DONE (with user-approved deviation)
-Full OP_QUERY decode (flags+collection+$cmd command+query-shape+$maxTimeMS+$comment callsite double-count AMEND-C3+active-query append) + `queryShape`/`maxTimeLessThanOne`/`callsiteName` + `remaining()` in bson.go. **DEVIATION (user-approved): `stats.IsValidName` guard around the 3 wire/config-derived dynamic-stat increments (`cmdTotal`/`collectionQuery`/`callsiteQuery`); skip un-nameable segments; fixed counters + active-query append always run. Live guard test `TestDecodeQuery_InvalidCollectionNameSkipsDynamicNoPanic` (proven live: RED panic without guard → GREEN with). Divergence (envoy-go omits the dynamic stat for un-nameable segments upstream would emit) → record as a BEHAVIOR_CONTRACT coverage boundary at Task 17.** Removed 5 now-consumed nolints (find/asInt64/activeQuery/queries/fail). commit `1666555`. Carried advisory → Task 15: include a maxTime≥1 fixture arm to prove `op_query_no_max_time` SUPPRESSION is live.
-
-### Task 9 — codec.go part 3 — INSERT/GET_MORE/KILL_CURSORS/COMMAND — DONE
-The four remaining stubs replaced with validate-and-consume bodies (each increments only its primary op counter after structural validation; malformed → `d.fail()`; none append to the active-query list). DoS-safe (empirically verified: huge/negative killCursors `n` and `remaining()>0` loops are bounded by body length). No dynamic stat names → guard N/A. commit `f19fa9d`. Carried advisory → Task 13: optional huge-n / per-opcode malformed tests + a negative-n parity comment.
-
-### Task 10 — filter.go — NewFactory + both-directions glue — DONE
-`NewFactory(reg)` (boot-parse + eager roster per stat_prefix) + per-connection `*filter` (BOTH ReadFilter+WriteFilter; OnData feeds decoder via `buf.Bytes()`+`buf.TotalAppended()` atomically; OnWrite pure no-op `Continue` stub; OnNewConnection no-op; OnDestroy nils `dec`). **Re-added the deferred `compiledConfig.stats *mongoStats` field to config.go** (restores the PLAN Task-2 end-state; `mongoStats` now exists). cb/wcb stored-unused, lint-clean (zookeeper precedent). Trusted-caller contract (atomic buffer feed) verified against real Buffer + both chain.go call sites. commit `8bbe37b`.
-
-### Task 11 — 8th built-in registration + bootstrap blank-import + boot smoke — DONE
-`reg.Register(mongoproxy.TypeURL, mongoproxy.NewFactory(deps.StatsRegistry))` (8th built-in) + "seven→eight" doc + `mongo_proxy/v3` bootstrap blank-import + all-eight registration test + boot-smoke (23 stats eager at 0; both directions). **§4 zero-touch regression gate: full `go test ./internal/...` stayed green.** commits `c85753e` + `7431e80` (comment-wrap nit fix).
-
-### Task 12 — mongo. four-rule name.go tag-extractor arm — DONE
-The AMEND-C1 multi-label tag-extractor in `name.go` `flattenToProm` (`default` branch, after `.zookeeper.`): prefix/cmd/collection/callsite hoisting via `hoistMongoDynamicSegments`; labels SORTED LOCALLY by key → **`prom.go` BYTE-UNTOUCHED (D-S29.1-5)**. Byte-exact `TestWriteProm_MongoCallsiteLineByteExact` proves the 3-label §11.2 line. KEEP-IN-SYNC round-trip with stats.go builders verified. The PLAN's wrong `mongo.a.b.cmd.x.total`-errors sub-test corrected to the permissive fall-through (per PLAN line 2497 note). Full `internal/stats` suite green. Panic-proof on malformed input. commit `efc0759`.
-
-### Task 13 — 39th fuzzer FuzzMongoDecode — DONE
-`FuzzMongoDecode` (4 invariants: no-panic; chain-bytes-unmutated R3; sniffing-off idempotence AMEND-B6; bounded readBuf). **VALIDATION GATE for the Task-8 IsValidName guard: a 60s / 16M-exec fuzz found NO crash** (no `stats: invalid metric name` panic) — the guard holds against un-nameable wire-derived collection/callsite bytes. Fuzzer count now 39. No testdata/fuzz committed. commit `a4c1bdc`.
-
-### Task 14 — 0049 driver part 1 — bootstraps + builders + MultiListener — DONE
-The `0049-mongo-requests` cross-side SKELETON: self-contained little-endian mongo wire/BSON builders (D-S29.1-3, shared verbatim with the future 29.2 `0051` driver), the two-listener `[mongo_proxy, tcp_proxy]` bootstraps (`l_default`/mongo_a + `l_commands`/mongo_b), the `MultiListenerDriver` plumbing, and the TCPSink wiring (request-only scope — no response bytes traverse the chain). `Drive*` no-op skeletons + `AssertStats` stub; compile-only. commit `3556326`.
-
-### Task 15 — 0049 driver part 2 — label-aware StatsAsserter + arms 1-5 — DONE
-The label-aware `StatsAsserter`: Prometheus parse generalized to `(metric + sorted-label-set) → value` via `canonicalize` (label-order-independent keying), with a precondition that label values are comma/brace-free (true for mongo's identifier-only tags). Arms 1-5 (plain scatter-get query; $cmd commands-list semantics on `l_commands` — isMaster in-list vs foo unknown_command; query-shape variants PrimaryKey/MultiGet + the four flag-bit counters; other request opcodes insert/getMore/killCursors/command; $comment callsite AMEND-C3 double-count). Cumulative per-prefix `want` reasoned per §11.2 and re-verified live cross-side (ref ≡ subj). Cross-side PASS. commit `21c4ad1`.
-
-### Task 16 — 0049 arms 6-9 + 0050-mongo-boot-reject — DONE
-Arms 6-9 on `0049` + the sibling `0050-mongo-boot-reject` fixture. **Arm 6** (unsupported opcode 2013 on a FRESH `l_default` conn) → `decoding_error` +1; the first decode error turns sniffing OFF for the connection lifetime (AMEND-B6), so the follow-up VALID OP_QUERY on the SAME conn increments NOTHING — `op_query{mongo_a}` stays at **5, not 6** (the dropped-query proof). **Arm 7** (garbage-BSON: a well-framed OP_QUERY with a bad element type `0x13` on a SEPARATE FRESH conn) fails the BSON walk BEFORE `op_query` increments → `decoding_error` +1; cumulative `decoding_error{mongo_a}` = **2** (a6+a7), at-most-once per connection lifetime (D-S29.1-6). **Arm 8** (assertion-only): exists-at-zero response-side counters present-and-0 both sides/both prefixes; the `op_query_active` gauge `# TYPE … gauge` line present (new `scrapeTypeLine` helper); `cx_destroy_*_with_active_rq` PRESENT, value not compared (AMEND-C2 — the 29.2 increment). **Arm 9** = the R4 deliberate-break (below). `0050-mongo-boot-reject` (the 0047 symmetric `BootRejectFixture` template): a `[mongo_proxy, tcp_proxy]` chain whose mongo `typed_config` OMITS `stat_prefix` → both sides reject at config-load on the shared `stat_prefix` substring (reference PGV `MongoProxyValidationError.StatPrefix` via the echoed bootstrap; envoy-go `mongo_proxy: stat_prefix is required`). Minimal `c_unused` cluster satisfies the zero-cluster boot reject. Runner `0050` blank-import added.
-
-**Bug fix (prior-agent interrupted state):** the `op_query{mongo_a}` expectation had been left at the wrong `want 6`; the ARM-ACCOUNTING table comment already correctly said `5`. The cross-side run had BOTH ref and subj reporting 5 (they AGREE — the reference is ground truth), so `want 6` was the error. Corrected to `5` per the AMEND-B6 dropped-query reasoning; cross-side re-run converged ref ≡ subj ≡ 5 on every keyed counter. No other cell changed (arms 6/7 contribute only to `decoding_error`).
-
-**R4 deliberate-break liveness proof (arm 9; `-count=1` per `reference_differential_break_protocol_count1`, reverted after each):**
-- **Break 1 — flip `op_query{mongo_a}` `5 → 99`:** cross-side FAILS on both runner paths; BOTH report the true value `5`:
-  ```
-  runner_test.go:1082: ref envoy_mongo_op_query{envoy_mongo_prefix="mongo_a"} = 5, want 99
-  runner_test.go:1082: subj envoy_mongo_op_query{envoy_mongo_prefix="mongo_a"} = 5, want 99
-  --- FAIL: TestDifferential/0049-mongo-requests (4.15s)
-  ```
-- **Break 2 — disable the §7.4 `name.go` mongo tag-extractor arm:** EVERY `envoy_mongo_*` label-keyed lookup goes ABSENT on the subject side → every keyed assertion fails (the §7.4 arm is load-bearing):
-  ```
-  runner_test.go:1082: subj: counter envoy_mongo_op_query{envoy_mongo_prefix="mongo_a"} ABSENT (creation / name-shape / label-extraction failure)
-  runner_test.go:1082: subj: counter envoy_mongo_op_query_scatter_get{envoy_mongo_prefix="mongo_a"} ABSENT (creation / name-shape / label-extraction failure)
-  ... (every envoy_mongo_* keyed lookup ABSENT — op_query family, decoding_error,
-      collection.*, cmd.*, the exists-at-zero response-side counters, the gauge) ...
-  runner_test.go:1082: subj: gauge envoy_mongo_op_query_active{envoy_mongo_prefix="mongo_a"} ABSENT (creation failure)
-  --- FAIL: TestDifferential/0049-mongo-requests
-  ```
-After BOTH reverts: cross-side `0049` + `0050` GREEN again; `internal/stats/name.go` UNMODIFIED (`git status --short` clean for it). Fixtures 50 → **52**. commit pending (this commit).
-
-### Task 17 — Completion bundle + six-gate — DONE
-
-**Docs authored (Steps 1–4):**
-- **BEHAVIOR_CONTRACT.md:** NEW `### envoy.filters.network.mongo_proxy` subsection (after zookeeper_proxy) — request-side decode semantics; the exactly-7-opcode envelope + OP_MSG-not-decoded (upstream parity); sniffing-off-on-error connection-lifetime; the 23-stat EAGER roster + D-P1 boot-window departure; the `mongo.<stat_prefix>.` scope; the four-rule Prometheus tag-extraction table; the dynamic cmd/collection/callsite families + commands-remembering + alias normalization; the USER-APPROVED `stats.IsValidName` guard divergence (coverage boundary; fuzz-validated); the AMEND-C2 `cx_destroy_*` presence-only boundary; the OP_REPLY/OP_COMMANDREPLY recognized-not-decoded 29.1 boundary; forward-pointers to 29.2/29.3. PLUS the `**Phase 29.1 extension — 337 → 360 internal names:**` paragraph (23 new mongo names; roster defined by `mongoproxy/stats.go::rosterSuffixes()` + R2 golden) + the Stat-surface summary roll.
-- **DECISIONS.md:** ADR-0224 §Decision (7 numbered items: TypeURL+config, BSON, codec, eager-roster+IsValidName-guard, filter-glue+active-query-list, builtin+bootstrap+name.go-arm, fixtures+fuzzer) + §Consequences (the §9 fourth row; consumer #2 of ADR-0221; the D-P1 boot-window + IsValidName + sub-phase boundaries; tag-extracted-vs-flat; histogram deferral) filled IN-PLACE. DECISIONS tail STAYS ADR-0226 (no new number).
-- **STATE.md:** active-phase → `phase 29.1 IMPL done`; next-skill → `superpowers:writing-plans` (the 29.2 SPEC); counts fixtures 52 / fuzzers 39 / stats 360; DECISIONS tail ADR-0226 (next-free ADR-0227); conformance line → "as of the 29.1 six-gate, 2026-06-04"; last-commit → placeholder "the 29.1 IMPL squash SHA (filled post-merge by the controller)".
-- **ROADMAP.md:** sub-row 29.1 `in-progress → done (2026-06-04)`; parent row 29 STAYS `in-progress`; 29.2/29.3 STAY `planned`.
-- **next-prompt.txt:** rewritten for the 29.2-SPEC cold-start (response side + correlation + gauge inc/dec + cx_destroy value parity + emit_dynamic_metadata + fixture 0051 + TCPMongoResponder BackendKind 30 + the ADR-0225 body at 29.2).
-
-**Verification pins:** `ls -d test/fixtures/[0-9]* | wc -l` = **52** (tail `0050-mongo-boot-reject`); `grep -rh "^func Fuzz" $(find ./internal -name fuzz_test.go) | wc -l` = **39**; BEHAVIOR_CONTRACT extension-paragraph total reads **360**.
-
-**THE SIX-GATE (run honestly; tails quoted):**
-
-- **Gate 1 — `go build ./...`:** `build exit: 0` (clean, no output).
-- **Gate 2 — `go vet ./...`:** `vet exit: 0` (clean, no output).
-- **Gate 3 — `golangci-lint run`:** `lint exit: 0` (clean, no output).
-- **Gate 4 — `go test ./... -race -short`:** `test exit: 0`; no `FAIL`/`panic` lines across the tree; `internal/filter/network/mongoproxy` + `internal/stats` both `ok`. Tail:
-  ```
-  ok  	github.com/esalaine/envoy-go/test/helpers/oauthbackend	1.009s
-  ok  	github.com/esalaine/envoy-go/test/helpers/ratelimitgrpc	1.033s
-  test exit: 0
-  ```
-- **Gate 5 — full 52-dir differential (`go test ./test/differential/ -count=1`):** PASS on RETRY. The first run FAILED on `0027-http-lua-full-bridge` with `subj start: subject ready: EOF` — the documented transient container-startup flake (`reference_docker_probe_bridge_network` env-class, NOT an assertion failure; the `0050-mongo-boot-reject` container output preceding it is the EXPECTED both-sides `MongoProxyValidationError.StatPrefix` / `mongo_proxy: stat_prefix is required` boot-reject, working as designed). Retried once per protocol → GREEN. Final:
-  ```
-  ok  	github.com/esalaine/envoy-go/test/differential	162.601s
-  differential exit: 0
-  ```
-  This is the FULL 52-dir suite incl. the 50 pre-existing dirs (the §4 zero-touch / R1 back-compat proof — mongoproxy merely registered perturbs nothing) + the new `0049-mongo-requests` (cross-side, 9 arms) + `0050-mongo-boot-reject`.
-- **Gate 6a — h2spec (`go test -run TestH2Spec ./test/conformance/h2spec/`):** PASS, **53/53**. Tail:
-  ```
-        53 tests, 53 passed, 0 skipped, 0 failed
-    h2spec_test.go:187: h2spec conformance report: 53 total tests, 0 failures
-  --- PASS: TestH2Spec (2.55s)
-  ```
-- **Gate 6b — proxy-wasm (`go test -run TestProxyWasmConformance ./test/conformance/proxy-wasm/`):** PASS, **10/10 families** (security, runtime, wasm_vm, bytecode_util, logging, stop_iteration, shared_data, pairs_util, endianness, + the http/network family). Tail:
-  ```
-  ok  	github.com/esalaine/envoy-go/test/conformance/proxy-wasm	0.246s
-  proxywasm exit: 0
-  ```
-
-**ALL SIX GATES GREEN.** The asserted-unaffected HTTP path (h2spec 53/53 + proxy-wasm 10/10) re-confirmed — 29.1 touches no HTTP path (§4 zero-touch). Phase 29.1 IMPL COMPLETE.
+### T7 (commit afc3525 + hardening 44e5d7b)
+- `filter.OnWrite` no-op → `f.dec.decodeOnWrite(buf.Bytes()); return Continue` (never halts, never drains; 28.2 no-high-water). Replaced TestFilter_OnWriteIsNoOp with OnWriteFeedsResponseDecoder + OnWriteNeverDrainsChainBuffer. Added TestDecoderConcurrentRequestResponseRace (200 req via decodeOnData goroutine A + 200 resp via decodeOnWrite goroutine B over ONE decoder; asserts op_reply==200, hardened with op_query==200).
+- **R9 deliberate-break (-count=1, reference_differential_break_protocol_count1):** commenting out the appendQuery+takeQuery mu.Lock/Unlock → `WARNING: DATA RACE` (appendQuery write codec.go:68 vs takeQuery read codec.go:80 on shared dec.queries) + FAIL under `-race -count=1`. Reverted byte-identical → clean PASS. codec.go untouched in the commit. Re-proven INDEPENDENTLY by the spec reviewer.
+- nil-safety traced: f.dec eagerly non-nil; OnWrite fenced behind the pump-join happens-before edge (terminal.Handle returns before onDestroy) → unguarded form (matching OnData) correct.
+- Spec review ✅; code-quality review ✅ (approve).

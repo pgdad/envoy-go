@@ -517,6 +517,17 @@ const (
 	// (one fixture dir = one runner branch); TCPSink stays request-side-only
 	// (the fixture.go:500 pin).
 	TCPZKResponder BackendKind = 29
+	// TCPMongoResponder is a MongoDB-aware canned-response TCP backend (29.2 SPEC
+	// §6.1): for every complete request frame (16-byte LE MsgHeader) it parses
+	// messageLength + requestID + opCode ONLY (it is NOT a MongoDB server) and
+	// writes a CORRELATED response whose responseTo echoes the request requestID —
+	// OP_QUERY(2004) → OP_REPLY(1), OP_COMMAND(2010) → OP_COMMANDREPLY(2011),
+	// reply-flag/cursor variants by a marker the driver controls, and an
+	// UNANSWERED-query trigger that withholds the reply (the gauge quiesced-point
+	// arm). OP_INSERT/OP_KILL_CURSORS get no reply (fire-and-forget). NEW
+	// BackendKind per reference_differential_fixture_dispatch_constraint; the
+	// TCPZKResponder = 29 precedent.
+	TCPMongoResponder BackendKind = 30
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
