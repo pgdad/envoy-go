@@ -1,6 +1,6 @@
 START a fresh cold-start session for envoy-go — **the phase-29.1 sub-phase IMPL (`network-filter-mongo-wire-and-requests`) is DONE + the six-gate is GREEN + squash-merged + pushed**. The active phase is **phase 29.1 → done** (parent row 29 STAYS `in-progress`; 29.2/29.3 `planned`). This session opens the **29.2 SPEC** (`network-filter-mongo-responses-and-correlation`) — authoring `docs/envoy-go/phases/29.2-network-filter-mongo-responses-and-correlation/SPEC.md` via **`superpowers:writing-plans`** (per SKILL_ROUTING: the 29.1 IMPL closes → the 29.2 SPEC opens; the phase-29 parent BRAINSTORM already drafted the ADR-0225 §Context, so the sub-phase SPEC is authored, NOT re-brainstormed — the 28.2-SPEC-after-28.1-IMPL precedent). Work in a git worktree (`feedback_git_worktrees`); commit LOCAL-ONLY; the controller squash-merges + pushes at stage-close (`feedback_push_to_origin`).
 
-The 29.1 IMPL landed at the squash SHA the controller fills post-merge (the substantive predecessor on master is the 29.1-PLAN squash `89c194a`; before that the 29.1-SPEC squash `7574219`). The phase-29 parent SPEC (`29-network-filter-mongo-proxy/SPEC.md`, squash `ab376d8`) + the 29.1 SPEC/PLAN are the pinned-behavior references the 29.2 SPEC builds on. ADR-0225 §Context is already in `DECISIONS.md` (the 29.2 charter); its §Decision/§Consequences body lands at the 29.2 IMPL.
+The 29.1 IMPL landed at squash `5ef5215` (pushed to origin/master; the substantive predecessor on master is the 29.1-PLAN squash `89c194a`; before that the 29.1-SPEC squash `7574219`). The phase-29 parent SPEC (`29-network-filter-mongo-proxy/SPEC.md`, squash `ab376d8`) + the 29.1 SPEC/PLAN are the pinned-behavior references the 29.2 SPEC builds on. ADR-0225 §Context is already in `DECISIONS.md` (the 29.2 charter); its §Decision/§Consequences body lands at the 29.2 IMPL.
 
 ## What 29.2 lands (the response side + correlation + the gauge — ADR-0225)
 
@@ -28,7 +28,7 @@ The 29.1 IMPL landed at the squash SHA the controller fills post-merge (the subs
 
 ## Project state at master tip
 
-- **Master tip:** the 29.1-IMPL squash (the controller fills the SHA post-merge; confirm the live tip via `git log --oneline -1`). STATE.md `last-commit` points at it once filled. Substantive predecessors: the 29.1-PLAN squash `89c194a`; the 29.1-SPEC squash `7574219`. origin/master in sync after push.
+- **Master tip:** the 29.1-IMPL squash `5ef5215` (confirm the live tip via `git log --oneline -1` — a docs-only SHA-fill commit may trail it). STATE.md `last-commit` points at it. Substantive predecessors: the 29.1-PLAN squash `89c194a`; the 29.1-SPEC squash `7574219`. origin/master in sync after push.
 - **§9 Network-filters family:** rows 26/27/28 DONE; row 29 `in-progress` (29.1 `done`; 29.2/29.3 `planned`).
 - **Counts at master tip:** stat surface **360** (+0 at 29.2/29.3); differential fixtures **52** (tail `0050-mongo-boot-reject`; → 54 at 29.2/29.3); fuzzers **39** (→ 39–40); conformance h2spec 53/53 + proxy-wasm 10/10 (as of the 29.1 six-gate, 2026-06-04); DECISIONS.md tail **ADR-0226** (next-free **ADR-0227**; the ADR-0225 body lands at the 29.2 IMPL — no new number).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
