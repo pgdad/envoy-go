@@ -688,3 +688,112 @@ func TestFlattenToProm_Zookeeper_UnderscorePrefix(t *testing.T) {
 		t.Errorf("got (%q, %v)", base, err)
 	}
 }
+
+// sameLabels compares two label slices positionally — valid because the mongo
+// arm emits its labels in SORTED key order (D-S29.1-5), so positional equality
+// is set equality.
+func sameLabels(got, want []Label) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestFlattenToProm_MongoFixed(t *testing.T) {
+	base, labels, err := flattenToProm("mongo.mongo_a.op_query")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_mongo_op_query" {
+		t.Errorf("base = %q, want envoy_mongo_op_query", base)
+	}
+	if len(labels) != 1 || labels[0].Key != "envoy_mongo_prefix" || labels[0].Value != "mongo_a" {
+		t.Errorf("labels = %+v, want [{envoy_mongo_prefix mongo_a}]", labels)
+	}
+}
+
+func TestFlattenToProm_MongoCmd(t *testing.T) {
+	base, labels, err := flattenToProm("mongo.mongoprobe.cmd.isMaster.total")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_mongo_cmd_total" {
+		t.Errorf("base = %q, want envoy_mongo_cmd_total", base)
+	}
+	// sorted by key: cmd, prefix
+	if !sameLabels(labels, []Label{{"envoy_mongo_cmd", "isMaster"}, {"envoy_mongo_prefix", "mongoprobe"}}) {
+		t.Errorf("labels = %+v", labels)
+	}
+}
+
+func TestFlattenToProm_MongoCollection(t *testing.T) {
+	base, labels, err := flattenToProm("mongo.mongoprobe.collection.collection1.query.scatter_get")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_mongo_collection_query_scatter_get" {
+		t.Errorf("base = %q", base)
+	}
+	if !sameLabels(labels, []Label{{"envoy_mongo_collection", "collection1"}, {"envoy_mongo_prefix", "mongoprobe"}}) {
+		t.Errorf("labels = %+v", labels)
+	}
+}
+
+func TestFlattenToProm_MongoCallsite(t *testing.T) {
+	base, labels, err := flattenToProm("mongo.mongoprobe.collection.collection1.callsite.probeFn.query.total")
+	if err != nil {
+		t.Fatalf("flattenToProm: %v", err)
+	}
+	if base != "envoy_mongo_collection_callsite_query_total" {
+		t.Errorf("base = %q", base)
+	}
+	// three labels, sorted: callsite, collection, prefix (§11.2 verbatim order)
+	want := []Label{
+		{"envoy_mongo_callsite", "probeFn"},
+		{"envoy_mongo_collection", "collection1"},
+		{"envoy_mongo_prefix", "mongoprobe"},
+	}
+	if !sameLabels(labels, want) {
+		t.Errorf("labels = %+v, want %+v", labels, want)
+	}
+}
+
+func TestFlattenToProm_MongoGaugeAndGuards(t *testing.T) {
+	// the gauge flattens like any fixed stat (TYPE is set by prom.go from Metric.Type)
+	base, _, err := flattenToProm("mongo.p.op_query_active")
+	if err != nil || base != "envoy_mongo_op_query_active" {
+		t.Errorf("gauge base = %q err = %v", base, err)
+	}
+	// Per PLAN line 2497: the arm consumes exactly ONE dot-free prefix segment
+	// (`a`), then shape-matches the remainder (`b.cmd.x.total`), which matches no
+	// dynamic shape and so flattens permissively (the wasm/zookeeper precedent) to
+	// envoy_mongo_b_cmd_x_total{envoy_mongo_prefix="a"} — NO error.
+	base, labels, err := flattenToProm("mongo.a.b.cmd.x.total")
+	if err != nil {
+		t.Fatalf("permissive fall-through must not error: %v", err)
+	}
+	if base != "envoy_mongo_b_cmd_x_total" {
+		t.Errorf("base = %q, want envoy_mongo_b_cmd_x_total", base)
+	}
+	if !sameLabels(labels, []Label{{"envoy_mongo_prefix", "a"}}) {
+		t.Errorf("labels = %+v, want [{envoy_mongo_prefix a}]", labels)
+	}
+}
+
+func TestWriteProm_MongoCallsiteLineByteExact(t *testing.T) {
+	reg := NewRegistry()
+	reg.NewCounterIfAbsent("mongo.mongoprobe.collection.collection1.callsite.probeFn.query.scatter_get").Inc()
+	var b strings.Builder
+	if err := WriteProm(&b, reg); err != nil {
+		t.Fatalf("WriteProm: %v", err)
+	}
+	want := `envoy_mongo_collection_callsite_query_scatter_get{envoy_mongo_callsite="probeFn",envoy_mongo_collection="collection1",envoy_mongo_prefix="mongoprobe"} 1`
+	if !strings.Contains(b.String(), want) {
+		t.Errorf("WriteProm output missing the §11.2 byte-exact line:\nwant: %s\ngot:\n%s", want, b.String())
+	}
+}

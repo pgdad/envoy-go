@@ -72,6 +72,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0046-zookeeper-requests/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0047-zookeeper-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0048-zookeeper-responses/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0049-mongo-requests/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0050-mongo-boot-reject/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

@@ -3,6 +3,7 @@ package stats
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -260,6 +261,32 @@ func flattenToProm(internal string) (string, []Label, error) {
 				return base, nil, nil
 			}
 		}
+		// Phase-29.1 mongo_proxy TAG-EXTRACTOR (ADR-0224; parent AMEND-B2 + 29.1
+		// AMEND-C1; the .rbac. ADR-0218 label-promotion precedent generalized to
+		// MULTI-label). Mirrors upstream's four addTokenized rules
+		// (well_known_names.cc — MONGO_PREFIX/MONGO_CMD/MONGO_COLLECTION/MONGO_CALLSITE,
+		// §11.2). Shape (NOT allowlist) validation — dynamic cmd/collection/callsite
+		// values make an allowlist impossible (the wasm/zookeeper permissive
+		// precedent). Internal name mongo.<prefix>.<rest> →
+		//   mongo.<sp>.<fixed>                                   → envoy_mongo_<fixed>      {prefix}
+		//   mongo.<sp>.cmd.<cmd>.total                           → envoy_mongo_cmd_total    {prefix,cmd}
+		//   mongo.<sp>.collection.<c>.query.<leaf>               → envoy_mongo_collection_query_<leaf>          {prefix,collection}
+		//   mongo.<sp>.collection.<c>.callsite.<cs>.query.<leaf> → envoy_mongo_collection_callsite_query_<leaf> {prefix,collection,callsite}
+		// Labels are emitted in SORTED key order (D-S29.1-5 — the reference's
+		// alphabetical order; sorted HERE so prom.go is untouched).
+		// KEEP-IN-SYNC: internal/filter/network/mongoproxy/stats.go (the name builders).
+		if rest, ok := strings.CutPrefix(internal, "mongo."); ok {
+			if idx := strings.IndexByte(rest, '.'); idx > 0 {
+				prefix, tail := rest[:idx], rest[idx+1:]
+				if !strings.ContainsRune(prefix, '.') {
+					labels = append(labels, Label{Key: "envoy_mongo_prefix", Value: prefix})
+					tail = hoistMongoDynamicSegments(tail, &labels)
+					base = "envoy_mongo_" + strings.ReplaceAll(tail, ".", "_")
+					sort.Slice(labels, func(i, j int) bool { return labels[i].Key < labels[j].Key })
+					return base, labels, nil
+				}
+			}
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 
@@ -270,6 +297,45 @@ func flattenToProm(internal string) (string, []Label, error) {
 	}
 
 	return base, labels, nil
+}
+
+// hoistMongoDynamicSegments extracts the cmd/collection/callsite label tokens
+// from a mongo post-prefix tail, appending them to *labels and returning the tail
+// with the dynamic VALUE tokens removed (so the flattened base collapses distinct
+// commands/collections/callsites onto one family — AMEND-C1). Mirrors the
+// upstream addTokenized capture positions (§11.2):
+//
+//	cmd.<cmd>.<leaf...>                        → cmd.<leaf...>            + {cmd}
+//	collection.<c>.callsite.<cs>.query.<leaf>  → collection.callsite.query.<leaf> + {collection,callsite}
+//	collection.<c>.query.<leaf...>             → collection.query.<leaf...>        + {collection}
+func hoistMongoDynamicSegments(tail string, labels *[]Label) string {
+	if t, ok := strings.CutPrefix(tail, "cmd."); ok {
+		// t = "<cmd>.<leaf...>"
+		if idx := strings.IndexByte(t, '.'); idx > 0 {
+			*labels = append(*labels, Label{Key: "envoy_mongo_cmd", Value: t[:idx]})
+			return "cmd." + t[idx+1:]
+		}
+		return tail
+	}
+	if t, ok := strings.CutPrefix(tail, "collection."); ok {
+		// t = "<c>.callsite.<cs>.query.<leaf>" OR "<c>.query.<leaf...>"
+		idx := strings.IndexByte(t, '.')
+		if idx <= 0 {
+			return tail
+		}
+		coll := t[:idx]
+		afterColl := t[idx+1:] // "callsite.<cs>.query.<leaf>" or "query.<leaf...>"
+		*labels = append(*labels, Label{Key: "envoy_mongo_collection", Value: coll})
+		if cs, ok := strings.CutPrefix(afterColl, "callsite."); ok {
+			// cs = "<cs>.query.<leaf>"
+			if j := strings.IndexByte(cs, '.'); j > 0 {
+				*labels = append(*labels, Label{Key: "envoy_mongo_callsite", Value: cs[:j]})
+				return "collection.callsite." + cs[j+1:] // "collection.callsite.query.<leaf>"
+			}
+		}
+		return "collection." + afterColl // "collection.query.<leaf...>"
+	}
+	return tail
 }
 
 // escapeLabelValue escapes a label value per the Prometheus text-format spec:

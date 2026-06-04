@@ -12,6 +12,7 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	mongo_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	zookeeper_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
 	"google.golang.org/protobuf/proto"
@@ -23,6 +24,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
+	"github.com/esalaine/envoy-go/internal/filter/network/mongoproxy"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
 	"github.com/esalaine/envoy-go/internal/filter/network/zookeeperproxy"
@@ -41,19 +43,19 @@ func mustAny(t *testing.T, msg proto.Message) *anypb.Any {
 	return a
 }
 
-// TestRegisterBuiltinsRegistersAllSeven proves RegisterBuiltins wires all seven
+// TestRegisterBuiltinsRegistersAllEight proves RegisterBuiltins wires all eight
 // built-in network filters (echo, direct_response, tcp_proxy, HCM,
-// rbac_network, sni_cluster, zookeeper_proxy) into a fresh Registry.
-// Registration only stores factory closures (it builds no filter), so a
-// zero-valued Deps{} is sufficient — rbac_network's and zookeeper_proxy's
-// StatsRegistry are nil here, which is fine because registration only captures
-// the closure. reg.Freeze() is called to exercise the post-boot lookup path,
-// consistent with the sibling registration tests.
-func TestRegisterBuiltinsRegistersAllSeven(t *testing.T) {
+// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy) into a fresh
+// Registry. Registration only stores factory closures (it builds no filter), so
+// a zero-valued Deps{} is sufficient — rbac_network's, zookeeper_proxy's and
+// mongo_proxy's StatsRegistry are nil here, which is fine because registration
+// only captures the closure. reg.Freeze() is called to exercise the post-boot
+// lookup path, consistent with the sibling registration tests.
+func TestRegisterBuiltinsRegistersAllEight(t *testing.T) {
 	reg := network.NewRegistry()
 	RegisterBuiltins(reg, Deps{})
 	reg.Freeze()
-	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL} {
+	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL, mongoproxy.TypeURL} {
 		if _, ok := reg.Lookup(tu); !ok {
 			t.Errorf("RegisterBuiltins did not register %q", tu)
 		}
@@ -134,6 +136,54 @@ func TestZookeeperProxyBootSmoke(t *testing.T) {
 		if got := sreg.NewCounterIfAbsent(name).Load(); got != 0 {
 			t.Errorf("counter %s = %d at boot, want 0", name, got)
 		}
+	}
+}
+
+// TestRegisterBuiltins_RegistersMongoProxy proves mongo_proxy is wired as the
+// 8th built-in network filter (29.1; ADR-0224). A non-nil StatsRegistry is
+// supplied because mongo_proxy's factory eagerly creates the 23-stat roster.
+func TestRegisterBuiltins_RegistersMongoProxy(t *testing.T) {
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{StatsRegistry: stats.NewRegistry()})
+	reg.Freeze()
+	if _, ok := reg.Lookup(mongoproxy.TypeURL); !ok {
+		t.Fatal("mongo_proxy not registered as the 8th built-in")
+	}
+}
+
+// TestMongoProxyBootSmoke is the boot-smoke for the [mongo_proxy, tcp_proxy]
+// chain: a mongo_proxy filter resolves through the registry; parsing the config
+// eagerly creates the 23 stats at 0; the instance satisfies BOTH directions.
+func TestMongoProxyBootSmoke(t *testing.T) {
+	sreg := stats.NewRegistry()
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{StatsRegistry: sreg})
+	reg.Freeze()
+
+	factory, ok := reg.Lookup(mongoproxy.TypeURL)
+	if !ok {
+		t.Fatal("mongo_proxy factory not found")
+	}
+	tc := mustAny(t, &mongo_proxyv3.MongoProxy{StatPrefix: "mongoboot"})
+	instFactory, err := factory(tc, network.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	inst := instFactory()
+	if _, isRead := inst.(network.ReadFilter); !isRead {
+		t.Fatal("mongo_proxy instance must be a ReadFilter")
+	}
+	if _, isWrite := inst.(network.WriteFilter); !isWrite {
+		t.Fatal("mongo_proxy instance must be a WriteFilter")
+	}
+	for _, name := range []string{"mongo.mongoboot.op_query", "mongo.mongoboot.op_reply",
+		"mongo.mongoboot.decoding_error", "mongo.mongoboot.delays_injected"} {
+		if got := sreg.NewCounterIfAbsent(name).Load(); got != 0 {
+			t.Errorf("counter %s = %d at boot, want 0", name, got)
+		}
+	}
+	if got := sreg.NewGaugeIfAbsent("mongo.mongoboot.op_query_active").Load(); got != 0 {
+		t.Errorf("gauge op_query_active = %d at boot, want 0", got)
 	}
 }
 

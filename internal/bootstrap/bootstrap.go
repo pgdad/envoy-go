@@ -93,6 +93,14 @@ import (
 	// (e.g. the differential harness). Per ADR-0016 amendment policy, documented
 	// in PROGRESS, not a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
+	// Phase-29.1 registers the mongo_proxy network-filter extension proto so
+	// protojson round-trips bootstraps carrying
+	// filter_chains[].filters[].typed_config of that type. Registered
+	// transitively by the mongoproxy filter package too; the explicit
+	// blank-import here guarantees resolution in any bootstrap-parsing context
+	// (e.g. the differential harness). Per ADR-0016 amendment policy, documented
+	// in PROGRESS, not a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
