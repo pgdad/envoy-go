@@ -41,7 +41,7 @@ The 29.1 PLAN landed at squash `89c194a` (pushed to origin/master). It is the ex
 
 ## Project state at master tip
 
-- **Master tip:** the 29.1-PLAN squash `89c194a` (confirm via `git log --oneline -1`; docs-only — PLAN.md + STATE.md + next-prompt.txt). Substantive predecessor: the 29.1-SPEC squash `7574219`. origin/master in sync.
+- **Master tip:** the docs-only SHA-fill commit `0c1d6e8` trailing the substantive 29.1-PLAN squash `89c194a` (confirm the live tip via `git log --oneline -1`). STATE.md `last-commit` points at the substantive squash `89c194a` (the PLAN.md + STATE.md + next-prompt.txt landing). Substantive predecessor: the 29.1-SPEC squash `7574219`. origin/master in sync.
 - **§9 Network-filters family:** rows 26/27/28 DONE; row 29 `in-progress` (29.1 `in-progress`; 29.2/29.3 `planned`).
 - **Counts at master tip:** stat surface **337** (→ 360 at 29.1 IMPL); differential fixtures **50** (tail `0048-zookeeper-responses`; → 52 at 29.1 IMPL); fuzzers **38** (→ 39); conformance h2spec 53/53 + proxy-wasm 10/10 (as of the 28.2 six-gate); DECISIONS.md tail **ADR-0226** (next-free **ADR-0227**; the ADR-0224 body lands at the 29.1 IMPL — no new number).
 - **Toolchain:** Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); reference Envoy v1.37.2 (ADR-0008); go-control-plane v1.32.4 (ADR-0008).
