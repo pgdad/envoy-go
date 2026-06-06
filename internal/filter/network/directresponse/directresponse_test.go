@@ -46,6 +46,8 @@ func (cb *fakeCallbacks) Connection() network.Connection           { return &cb.
 func (cb *fakeCallbacks) ContinueReading()                         {}
 func (cb *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket { return nil }
 func (cb *fakeCallbacks) SetUpstreamCluster(_ string)              {}
+func (cb *fakeCallbacks) Draining() bool                           { return false }
+func (cb *fakeCallbacks) CloseDirection() network.CloseDirection   { return network.CloseDirectionUnset }
 
 // SetResponseCodeDetails is the optional RCD sink the filter type-asserts for.
 // Recording it here proves the assertion path is live in tests.

@@ -58,8 +58,8 @@ func TestRecord_PopulatedShape(t *testing.T) {
 // captureSink is a test double for the Sink interface; used by Tasks 10/12/13.
 type captureSink struct{ recs []*Record }
 
-func (s *captureSink) Submit(r *Record) { s.recs = append(s.recs, r) }
-func (s *captureSink) Close() error     { return nil }
+func (s *captureSink) Submit(r any) { s.recs = append(s.recs, r.(*Record)) }
+func (s *captureSink) Close() error { return nil }
 
 func TestSink_InterfaceImplementation(t *testing.T) {
 	var s Sink = &captureSink{}

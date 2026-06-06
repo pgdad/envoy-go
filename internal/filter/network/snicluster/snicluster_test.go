@@ -42,6 +42,8 @@ func (cb *fakeCB) SetUpstreamCluster(name string) {
 	cb.setCalls++
 	cb.lastSet = name
 }
+func (cb *fakeCB) Draining() bool                         { return false }
+func (cb *fakeCB) CloseDirection() network.CloseDirection { return network.CloseDirectionUnset }
 
 // ---------------------------------------------------------------------------
 // Helpers

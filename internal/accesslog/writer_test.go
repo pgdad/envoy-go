@@ -79,7 +79,7 @@ func TestAsyncFileSink_ConcurrentSubmit_RaceClean(t *testing.T) {
 func TestAsyncFileSink_DropNewest_FullChannelIncrementsCounter(t *testing.T) {
 	dir := t.TempDir()
 	_, c := newTestRegistryAndCounter(t)
-	s, err := newAsyncFileSinkWithCapacity(filepath.Join(dir, "subject.log"), c, 1)
+	s, err := newAsyncFileSinkWithCapacity(filepath.Join(dir, "subject.log"), c, 1, nil)
 	if err != nil {
 		t.Fatalf("NewAsyncFileSink: %v", err)
 	}
@@ -125,5 +125,24 @@ func TestAsyncFileSink_Close_DrainsPending(t *testing.T) {
 	stat, _ := os.Stat(path)
 	if stat.Size() == 0 {
 		t.Errorf("file empty after Close; expected drained records")
+	}
+}
+
+func TestAsyncFileSinkDefaultFormatterByteIdentical(t *testing.T) {
+	// The default (zero-value formatter) path stays byte-identical to Default(*Record).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "al.log")
+	s, err := NewAsyncFileSink(path, stats.NewRegistry().NewCounter("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &Record{Method: "GET", Path: "/p", Protocol: "HTTP/1.1", ResponseCode: 200}
+	s.Submit(rec)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != string(Default(rec)) {
+		t.Errorf("default-formatter bytes diverged:\n got=%q\nwant=%q", got, Default(rec))
 	}
 }

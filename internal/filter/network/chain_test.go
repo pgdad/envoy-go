@@ -498,6 +498,59 @@ func TestChainOnDestroyCallsAllFilters(t *testing.T) {
 	}
 }
 
+// fakeDrain is a synthetic DrainState (29.3 Task 9): IsDraining returns the
+// configured flag. The network package consumes drain via this narrow structural
+// interface so it never imports internal/drain (D-S29.3-3).
+type fakeDrain struct{ draining bool }
+
+func (f fakeDrain) IsDraining() bool { return f.draining }
+
+// TestCallbacksDrainingAccessor proves the Draining() accessor reflects the
+// SetDrainState-wired DrainState, and is false (no panic) when none is wired
+// (the true-nil interface guard — the typed-nil trap is dodged at the call site).
+func TestCallbacksDrainingAccessor(t *testing.T) {
+	rt := NewChainRuntime(nil, &fakeConn{}, ConnFacts{})
+	if rt.rt.cb.Draining() {
+		t.Error("no drain state set → Draining() must be false")
+	}
+	rt.SetDrainState(fakeDrain{draining: true})
+	if !rt.rt.cb.Draining() {
+		t.Error("Draining() must reflect the set DrainState")
+	}
+	rt.SetDrainState(fakeDrain{draining: false})
+	if rt.rt.cb.Draining() {
+		t.Error("Draining() must reflect a non-draining DrainState")
+	}
+}
+
+// TestCallbacksDrainingNilNoPanic pins the typed-nil-in-interface guard (29.3
+// risk register line 1846): a chain with NO drain state wired keeps rt.drain a
+// true-nil interface, so Draining() returns false WITHOUT calling IsDraining()
+// on a nil receiver (no panic). serveNetworkChain guards SetDrainState(rt.dm)
+// with `if rt.dm != nil` to keep this true-nil; this test proves the accessor's
+// own `c.rt.drain != nil` short-circuit holds.
+func TestCallbacksDrainingNilNoPanic(t *testing.T) {
+	rt := NewChainRuntime(nil, &fakeConn{}, ConnFacts{})
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Draining() panicked with no drain state wired: %v", r)
+		}
+	}()
+	if rt.rt.cb.Draining() {
+		t.Error("Draining() must be false when no drain state is wired")
+	}
+}
+
+// TestCallbacksCloseDirectionDefault proves the CloseDirection() accessor reads
+// the runtime's closeDir field, defaulting to Unset (the read-side lands at Task
+// 9; the setter + tcp_proxy recording is Task 10).
+func TestCallbacksCloseDirectionDefault(t *testing.T) {
+	rt := NewChainRuntime(nil, &fakeConn{}, ConnFacts{})
+	if got := rt.rt.cb.CloseDirection(); got != CloseDirectionUnset {
+		t.Errorf("CloseDirection() = %v, want CloseDirectionUnset (default)", got)
+	}
+}
+
 type destroyFilter struct {
 	Marker
 	destroyed bool
@@ -1131,5 +1184,304 @@ func TestWrappedChainConcurrentPumpsRace(t *testing.T) {
 	want := int64(writes * len(payload))
 	if got := f.readBytes.Load(); got != want {
 		t.Fatalf("filter saw %d downstream bytes via the replay, want %d", got, want)
+	}
+}
+
+// haltingFilter is a synthetic MayHalt read filter for the seam tests: its OnData
+// returns StopIteration exactly once per "armed" hold; an external goroutine calls
+// cb.ContinueReading() to release. It models mongo's fault-delay shape WITHOUT the
+// mongo dependency (the seam is independently testable — SPEC §12 / R-HALT).
+type haltingFilter struct {
+	Marker
+	cb       ReadFilterCallbacks
+	mayHalt  bool
+	holdOnce bool // arm: StopIteration on the first OnData with bytes
+	sawData  int
+	released chan struct{}
+}
+
+func (f *haltingFilter) OnNewConnection() Status { return Continue }
+func (f *haltingFilter) OnData(_ *Buffer, _ bool) Status {
+	f.sawData++
+	if f.holdOnce {
+		f.holdOnce = false
+		// Resume asynchronously from a separate goroutine (the time.AfterFunc shape),
+		// but only on a haltable chain — a non-haltable StopIteration is a per-pass
+		// stop that never holds, so spawning a resume goroutine there would leak
+		// (nothing ever closes f.released on that path).
+		if f.mayHalt {
+			go func() { <-f.released; f.cb.ContinueReading() }()
+		}
+		return StopIteration
+	}
+	return Continue
+}
+func (f *haltingFilter) SetReadFilterCallbacks(cb ReadFilterCallbacks) { f.cb = cb }
+func (f *haltingFilter) OnDestroy()                                    {}
+func (f *haltingFilter) MayHalt() bool                                 { return f.mayHalt }
+
+func TestChainHaltablePreHandoffHoldThenResume(t *testing.T) {
+	hf := &haltingFilter{mayHalt: true, holdOnce: true, released: make(chan struct{})}
+	rt := newChainRuntime([]ReadFilter{hf}, &fakeConn{}, connFacts{})
+	if !rt.haltable {
+		t.Fatal("chain with a MayHalt filter must be haltable")
+	}
+	rt.onNewConnection()
+	// Drive OnData on a goroutine: it will HOLD (block in holdUntilResume) until released.
+	done := make(chan struct{})
+	go func() { rt.onData([]byte("PING"), false); close(done) }()
+	// onData must NOT have returned yet (the hold blocks the dispatcher).
+	select {
+	case <-done:
+		t.Fatal("onData returned before resume — the haltable hold did not block")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(hf.released) // let the async ContinueReading fire
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onData did not return after resume — the hold never released")
+	}
+	if rt.resumeIdx != 1 {
+		t.Errorf("resumeIdx = %d, want 1 (advanced PAST the halting filter)", rt.resumeIdx)
+	}
+	if hf.sawData != 1 {
+		t.Errorf("sawData = %d, want 1 (the halting filter is entered exactly once; resume advances PAST it, not re-delivering)", hf.sawData)
+	}
+}
+
+// TestChainAsyncResumeReachesTerminalReady proves the async-active third context
+// of ContinueReading (29.3 SPEC §3.1 extension 1): on a HALTABLE chain, an
+// off-dispatch ContinueReading (from the haltingFilter's resume goroutine, the
+// time.AfterFunc shape) releases the blocked dispatcher, which then advances
+// resumeIdx PAST the last read filter — making the trailing terminal reachable.
+// The production routing (the haltable releaseResume branch) already exists, so
+// this test PASSES on first run; it is a live assertion that the pre-handoff
+// async resume drives the chain to TerminalReady (R-HALT).
+func TestChainAsyncResumeReachesTerminalReady(t *testing.T) {
+	hf := &haltingFilter{mayHalt: true, holdOnce: true, released: make(chan struct{})}
+	term := &recordingTerminal{} // the existing TerminalFilter double in upstreamcluster_test.go
+	rt := NewChainRuntime([]NetworkFilter{hf, term}, &fakeConn{}, ConnFacts{})
+	rt.OnNewConnection()
+	if rt.TerminalReady() {
+		t.Fatal("not ready before the read filter Continues past")
+	}
+	done := make(chan struct{})
+	go func() { rt.OnData([]byte("Q1"), false); close(done) }()
+	time.Sleep(30 * time.Millisecond) // let it reach the hold
+	close(hf.released)                // async ContinueReading fires
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnData did not return after async resume — the hold never released")
+	}
+	if !rt.TerminalReady() {
+		t.Fatal("after async resume the chain must be TerminalReady (resumeIdx past the last read filter)")
+	}
+}
+
+func TestChainNonHaltableByteIdentity(t *testing.T) {
+	// A MayHalt filter whose MayHalt()==false (mongo-no-delay) takes the byte-identical
+	// pre-29.3 path: an OnData StopIteration is a PER-PASS stop (next read re-delivers),
+	// NOT a hold; the halt mutex is never engaged.
+	hf := &haltingFilter{mayHalt: false, holdOnce: true, released: make(chan struct{})}
+	rt := newChainRuntime([]ReadFilter{hf}, &fakeConn{}, connFacts{})
+	if rt.haltable {
+		t.Fatal("MayHalt()==false must NOT make the chain haltable")
+	}
+	rt.onNewConnection()
+	rt.onData([]byte("PING"), false) // must return immediately (per-pass stop, no block)
+	if rt.resumeIdx != 0 {
+		t.Errorf("resumeIdx = %d, want 0 (per-pass stop leaves resumeIdx at the filter)", rt.resumeIdx)
+	}
+}
+
+func TestReplayReadPostHandoffHoldThenResume(t *testing.T) {
+	hf := &haltingFilter{mayHalt: true, holdOnce: true, released: make(chan struct{})}
+	rt := newChainRuntime([]ReadFilter{hf}, &fakeConn{}, connFacts{})
+	// Simulate post-handoff: a replay parks at the hold; the pump must withhold.
+	parked := rt.replayRead([]byte("Q2"), false)
+	if !parked {
+		t.Fatal("replayRead must report parked=true when a haltable filter holds")
+	}
+	done := make(chan struct{})
+	go func() { rt.holdUntilResume(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("holdUntilResume returned before resume")
+	case <-time.After(40 * time.Millisecond):
+	}
+	close(hf.released)
+	<-done // resume releases
+}
+
+func TestReplayReadNonHaltableObservational(t *testing.T) {
+	// Non-haltable replay is byte-identical to pre-29.3: all filters observe, buffer
+	// fully drained, parked=false always.
+	b := &filterB{}
+	rt := newChainRuntime([]ReadFilter{b}, &fakeConn{}, connFacts{})
+	parked := rt.replayRead([]byte("hello"), false)
+	if parked {
+		t.Fatal("non-haltable replay never parks")
+	}
+	if rt.buf.Len() != 0 {
+		t.Errorf("buffer not drained after observational replay: %d", rt.buf.Len())
+	}
+	if b.saw != "hello" {
+		t.Errorf("filter did not observe the replayed bytes: %q", b.saw)
+	}
+}
+
+// rearmingHaltingFilter is a MayHalt read filter that HOLDS on EVERY OnData (not
+// just the first), each hold spawning its own async ContinueReading goroutine —
+// the multi-hold shape TestSeamRaceReplayPublication needs to drive consecutive
+// parked replay passes through the real pump cycle. It models a fault-delay that
+// re-arms per request frame (the seam, not mongo specifically).
+type rearmingHaltingFilter struct {
+	Marker
+	cb      ReadFilterCallbacks
+	sawData int32
+}
+
+func (f *rearmingHaltingFilter) OnNewConnection() Status { return Continue }
+func (f *rearmingHaltingFilter) OnData(_ *Buffer, endStream bool) Status {
+	atomic.AddInt32(&f.sawData, 1)
+	if endStream {
+		// The final endStream replay (readChainConn.Read's EOF symmetry) is NOT a
+		// request frame — observe and Continue, mirroring a real fault-delay that
+		// only holds actual frames (the pump does not holdUntilResume on the EOF path).
+		return Continue
+	}
+	// Hold on every byte-bearing pass; resume asynchronously (the time.AfterFunc
+	// shape). Each hold is matched 1:1 by exactly one ContinueReading (the seam
+	// contract).
+	go f.cb.ContinueReading()
+	return StopIteration
+}
+func (f *rearmingHaltingFilter) SetReadFilterCallbacks(cb ReadFilterCallbacks) { f.cb = cb }
+func (f *rearmingHaltingFilter) OnDestroy()                                    {}
+func (f *rearmingHaltingFilter) MayHalt() bool                                 { return true }
+
+// nReadConn yields the SAME live payload n times from Read, then io.EOF. It feeds
+// the post-handoff pump (readChainConn.Read) a real multi-read stream so each read
+// drives one parked replayRead pass.
+type nReadConn struct {
+	fakeConn
+	payload []byte
+	n       int
+	count   int
+}
+
+func (c *nReadConn) Read(b []byte) (int, error) {
+	if c.count >= c.n {
+		return 0, io.EOF
+	}
+	c.count++
+	return copy(b, c.payload), nil
+}
+
+// TestSeamRaceReplayPublication is the R-HALT publication-edge proof. It drives the
+// REAL post-handoff pump cycle — readChainConn.Read → replayRead (UNLOCKED writes
+// to replayIdx/replayHeld/buf on the pump goroutine) → holdUntilResume → the async
+// ContinueReading (haltMu-GUARDED reads/mutations of those SAME fields on the timer
+// goroutine via finishParkedReplayLocked). Consecutive holds overlap: while a prior
+// resume's ContinueReading may still be inside its haltMu section finishing the
+// parked replay, the pump's next Read has already begun the next replayRead. The
+// assertion is `go test -race` itself: the replay-state publication between the
+// unlocked pump writes and the guarded resume reads must be fenced by haltMu.
+//
+// Regression coverage: removing the haltMu fence around the replay-state work in
+// ContinueReading (finishParkedReplayLocked) is intended to be observable under
+// -race here. (See the liveness note in PROGRESS.md for the empirical result of
+// the deliberate-break check.)
+func TestSeamRaceReplayPublication(t *testing.T) {
+	const reads = 30
+	for iter := 0; iter < 25; iter++ {
+		hf := &rearmingHaltingFilter{}
+		conn := &nReadConn{payload: []byte("FRAME"), n: reads}
+		rt := newChainRuntime([]ReadFilter{hf}, conn, connFacts{})
+		// readChainConn is the production post-handoff read wrap; its Read runs the
+		// exact pump cycle (replayRead + holdUntilResume on park).
+		rc := newReadChainConn(conn, rt)
+
+		// Pump goroutine: loop Read until EOF, exactly as the terminal's downstream
+		// pump does. Each non-EOF Read parks (rearming filter holds every pass) and
+		// blocks in holdUntilResume until that pass's async ContinueReading releases.
+		done := make(chan struct{})
+		go func() {
+			buf := make([]byte, 64)
+			for {
+				_, err := rc.Read(buf)
+				if err != nil {
+					close(done)
+					return
+				}
+			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: pump did not drain — a hold never released (possible deadlock)", iter)
+		}
+		// reads byte-bearing passes (each held + resumed) + 1 EOF-endStream pass.
+		if got := atomic.LoadInt32(&hf.sawData); int(got) != reads+1 {
+			t.Fatalf("iter %d: filter saw %d frames, want %d (reads held passes + 1 EOF pass)", iter, got, reads+1)
+		}
+	}
+}
+
+// TestChainCloseDirectionRecording exercises the setCloseDirection first-wins CAS
+// through readChainConn.SetCloseDirection on a BARE readChainConn (29.3 Task 10,
+// §3.5). The first recorded direction wins; a later opposite direction is ignored.
+func TestChainCloseDirectionRecording(t *testing.T) {
+	rt := newChainRuntime([]ReadFilter{&filterB{}}, &fakeConn{}, connFacts{})
+	rc := newReadChainConn(&fakeConn{}, rt)
+	rc.SetCloseDirection(CloseDirectionLocal)
+	if got := rt.cb.CloseDirection(); got != CloseDirectionLocal {
+		t.Errorf("CloseDirection = %v, want Local", got)
+	}
+	rc.SetCloseDirection(CloseDirectionRemote) // first-wins: stays Local
+	if got := rt.cb.CloseDirection(); got != CloseDirectionLocal {
+		t.Errorf("first-wins violated: %v", got)
+	}
+}
+
+// TestCloseDirectionThroughWrapStack proves the setter reaches the chainRuntime
+// through the ACTUAL handoff composition writeChainConn(prefixConn(readChainConn))
+// — NOT just a bare readChainConn. The embedded net.Conn is an INTERFACE, so the
+// custom SetCloseDirection does not auto-promote; the forwarding methods on
+// prefixConn + writeChainConn (Task 10 Step 3) are what make this pass. WITHOUT
+// them this test fails (the type-assert misses) — guarding against the
+// silently-dead bug (risk register line 1845).
+func TestCloseDirectionThroughWrapStack(t *testing.T) {
+	rt := newChainRuntime([]ReadFilter{&filterB{}}, &fakeConn{}, connFacts{})
+	inner := newReadChainConn(&fakeConn{}, rt)
+	mid := newPrefixConn(inner, []byte("x"))         // prefix present
+	outer := newWriteChainConn(mid, []WriteFilter{}) // the conn tcp_proxy gets
+	sd, ok := net.Conn(outer).(interface{ SetCloseDirection(CloseDirection) })
+	if !ok {
+		t.Fatal("the handed-off conn must expose SetCloseDirection through the wrap stack")
+	}
+	sd.SetCloseDirection(CloseDirectionRemote)
+	if got := rt.cb.CloseDirection(); got != CloseDirectionRemote {
+		t.Errorf("CloseDirection through wrap stack = %v, want Remote", got)
+	}
+}
+
+// TestCloseDirectionThroughWrapStackNoPrefix is the no-prefix composition variant:
+// handleTerminal omits the prefixConn when the buffer is empty, so tcp_proxy gets
+// writeChainConn(readChainConn) directly. The forwarding on writeChainConn must
+// still relay SetCloseDirection inward to the readChainConn (29.3 Task 10).
+func TestCloseDirectionThroughWrapStackNoPrefix(t *testing.T) {
+	rt := newChainRuntime([]ReadFilter{&filterB{}}, &fakeConn{}, connFacts{})
+	inner := newReadChainConn(&fakeConn{}, rt)
+	outer := newWriteChainConn(inner, []WriteFilter{}) // no prefixConn (empty buffer)
+	sd, ok := net.Conn(outer).(interface{ SetCloseDirection(CloseDirection) })
+	if !ok {
+		t.Fatal("the handed-off conn must expose SetCloseDirection (no-prefix stack)")
+	}
+	sd.SetCloseDirection(CloseDirectionLocal)
+	if got := rt.cb.CloseDirection(); got != CloseDirectionLocal {
+		t.Errorf("CloseDirection through no-prefix wrap stack = %v, want Local", got)
 	}
 }

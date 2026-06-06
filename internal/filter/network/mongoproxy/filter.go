@@ -2,11 +2,13 @@ package mongoproxy
 
 import (
 	"fmt"
+	"time"
 
 	mongo_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -39,10 +41,34 @@ func NewFactory(reg *stats.Registry) network.NetworkFilterFactory {
 			return nil, err
 		}
 		cfg.stats = newMongoStats(reg, cfg.statPrefix)
+		// 29.3 access log (AMEND-B10): construct the sink ONCE per configured path
+		// (freeze-after-boot; the HCM/main.go precedent) and SHARE it across the
+		// listener's per-connection filter instances (AsyncFileSink.Submit is a
+		// goroutine-safe non-blocking channel send). nil when access_log is unset →
+		// the per-connection emit is a no-op. The dropped counter rides the shared
+		// server.accesslog_dropped stat (ADR-0069). Boot errors fail-fast (ADR-0072).
+		var alSink *accesslog.AsyncFileSink
+		if cfg.accessLog != "" {
+			s, err := accesslog.NewAsyncFileSinkWithFormatter(cfg.accessLog, accessLogDroppedCounter(reg), accesslog.MongoFormat)
+			if err != nil {
+				return nil, fmt.Errorf("mongo_proxy: access_log %q: %w", cfg.accessLog, err)
+			}
+			alSink = s
+		}
 		return func() network.NetworkFilter {
-			return &filter{cfg: cfg, dec: newDecoder(cfg, cfg.stats)}
+			return &filter{cfg: cfg, dec: newDecoder(cfg, cfg.stats), alSink: alSink}
 		}, nil
 	}
+}
+
+// accessLogDroppedCounter returns the shared server.accesslog_dropped counter
+// (ADR-0069). It uses NewCounterIfAbsent (NOT accesslog.RegisterDroppedCounter,
+// which calls NewCounter and PANICS on a duplicate): main.go registers this same
+// counter at boot for the HCM access-log sinks, so the mongo factory must reuse
+// the existing counter idempotently. This adds NO new stat — the 360-stat surface
+// is unchanged (the name already exists in the boot roster).
+func accessLogDroppedCounter(reg *stats.Registry) *stats.Counter {
+	return reg.NewCounterIfAbsent("server.accesslog_dropped")
 }
 
 // filter is the per-connection mongo_proxy filter. It implements BOTH
@@ -50,11 +76,44 @@ func NewFactory(reg *stats.Registry) network.NetworkFilterFactory {
 // consumer #2 of the ADR-0221 seam; the zookeeperproxy both-directions shape).
 type filter struct {
 	network.Marker
-	cfg *compiledConfig // shared, boot-parsed (incl. the roster)
-	dec *decoder        // per-connection (private readBuf + sniffing + chainConsumed + active-query list)
-	cb  network.ReadFilterCallbacks
-	wcb network.WriteFilterCallbacks
+	cfg        *compiledConfig // shared, boot-parsed (incl. the roster)
+	dec        *decoder        // per-connection (private readBuf + sniffing + chainConsumed + active-query list)
+	cb         network.ReadFilterCallbacks
+	wcb        network.WriteFilterCallbacks
+	delayTimer *time.Timer              // 29.3 fault-delay async-resume timer (SPEC §3.2); OnDestroy cancels.
+	alSink     *accesslog.AsyncFileSink // 29.3 access log; nil when access_log is unset (no-op emit). Shared across connections.
 }
+
+// emitAccessLog submits one MongoRecord per pending log line for THIS pass (the
+// decoder accumulates per-message strings during decode; the filter drains them).
+// A no-op when no sink is configured or no message decoded this pass. Timing-
+// bearing → differential-INVISIBLE (AMEND-B10). The upstream host: at envoy-go's
+// L4 seam the mongo filter sees NO upstream address (tcp_proxy owns the upstream
+// dial), so upstream_host is recorded as the available downstream remote address
+// (or "-" when unavailable). Per the differential-invisibility this affects no
+// gate (no fixture). Connection() may be nil (a pre-injection / test edge) — guarded.
+func (f *filter) emitAccessLog(lines []string) {
+	if f.alSink == nil || len(lines) == 0 {
+		return
+	}
+	host := "-"
+	if f.cb != nil {
+		if conn := f.cb.Connection(); conn != nil {
+			if ra := conn.RemoteAddr(); ra != nil {
+				host = ra.String()
+			}
+		}
+	}
+	now := time.Now()
+	for _, msgStr := range lines {
+		f.alSink.Submit(&accesslog.MongoRecord{Time: now, Message: msgStr, UpstreamHost: host})
+	}
+}
+
+// MayHalt declares the filter haltable (the chain's async halt/resume seam, 29.3)
+// iff a fault delay is configured. A no-delay mongo filter is non-haltable → the
+// chain takes the byte-identical pre-29.3 path (R1).
+func (f *filter) MayHalt() bool { return f.cfg.delayConfigured }
 
 // OnNewConnection is a no-op Continue: an OnNewConnection StopIteration would set
 // the chain's sticky connHalted flag and block all OnData
@@ -68,7 +127,32 @@ func (f *filter) OnNewConnection() network.Status { return network.Continue }
 func (f *filter) OnData(buf *network.Buffer, _ bool) network.Status {
 	f.dec.decodeOnData(buf.Bytes(), buf.TotalAppended())
 	f.emitDynamicMetadata()
+	f.emitAccessLog(f.dec.takeLogLines()) // 29.3 access log; drained BEFORE the delay-arm return so messages decoded this pass are logged.
+	if dur, ok := f.dec.takePendingDelay(); ok {
+		return f.armDelay(dur)
+	}
 	return network.Continue
+}
+
+// armDelay increments delays_injected AT ARM (upstream stats_.delays_injected_.inc()),
+// sets the cross-goroutine re-entrancy guard, schedules the resume timer, and returns
+// StopIteration so the chain HOLDS (the haltable seam — runData/replayRead block the
+// dispatcher until onDelayTimer's ContinueReading; SPEC §3.2 / §3.1).
+func (f *filter) armDelay(dur time.Duration) network.Status {
+	f.cfg.stats.inc("delays_injected")
+	f.dec.delayPending.Store(true)
+	f.delayTimer = time.AfterFunc(dur, f.onDelayTimer)
+	return network.StopIteration
+}
+
+// onDelayTimer runs on the time.AfterFunc goroutine: clear the re-entrancy guard,
+// then resume the chain (the §3.1 async-active ContinueReading — the load-bearing
+// cross-goroutine resume). cb is set once at construction; safe to read here.
+func (f *filter) onDelayTimer() {
+	f.dec.delayPending.Store(false)
+	if f.cb != nil {
+		f.cb.ContinueReading()
+	}
 }
 
 // emitDynamicMetadata writes THIS request pass's collection→ops map to the
@@ -98,6 +182,15 @@ func (f *filter) emitDynamicMetadata() {
 // onWrite parity — never halts). Replaces the 29.1 no-op stub.
 func (f *filter) OnWrite(buf *network.Buffer, _ bool) network.Status {
 	f.dec.decodeOnWrite(buf.Bytes())
+	f.emitAccessLog(f.dec.takeWriteLogLines()) // 29.3 access log, response direction.
+	if f.dec.takeReplyEmptied() && f.cb != nil && f.cb.Draining() {
+		// cx_drain_close (SPEC §3.4): the active-query list emptied on a correlated
+		// reply while draining → increment + close FlushWrite (the reply is flushed
+		// first; the deferred close subsumes upstream's zero-ms timer — D-S29.3-7).
+		// Increment + close OUTSIDE the decoder lock (ADR-0223).
+		f.cfg.stats.inc("cx_drain_close")
+		f.cb.Connection().Close(network.FlushWrite)
+	}
 	return network.Continue
 }
 
@@ -112,8 +205,23 @@ func (f *filter) SetWriteFilterCallbacks(cb network.WriteFilterCallbacks) { f.wc
 // strictly after both pumps join (the ADR-0221 happens-after edge), so the
 // onDestroy lock is uncontended.
 func (f *filter) OnDestroy() {
+	if f.delayTimer != nil {
+		f.delayTimer.Stop() // best-effort; the timer always fires on a blocked pump, so this
+		// races only a torn-down-mid-delay edge — no double-count (delays_injected Inc'd at arm).
+	}
 	if f.dec != nil {
-		f.dec.onDestroy()
+		n := f.dec.onDestroy() // drains residual + Decs the gauge; returns the residual count
+		if n > 0 && f.cb != nil {
+			// D-P4 CLOSED (SPEC §3.5): a non-empty active-query list at close keys the
+			// direction-specific counter. The count is snapshotted under mu inside
+			// onDestroy; the increment is OUTSIDE the lock (ADR-0223).
+			switch f.cb.CloseDirection() {
+			case network.CloseDirectionLocal:
+				f.cfg.stats.inc("cx_destroy_local_with_active_rq")
+			case network.CloseDirectionRemote:
+				f.cfg.stats.inc("cx_destroy_remote_with_active_rq")
+			}
+		}
 	}
 	f.dec = nil
 }

@@ -237,6 +237,8 @@ func (cb *fakeCallbacks) ContinueReading()                         {}
 func (cb *fakeCallbacks) DynamicMetadata() *dynamicmetadata.Bucket { return cb.dm }
 func (cb *fakeCallbacks) SetResponseCodeDetails(s string)          { cb.rcd = s }
 func (cb *fakeCallbacks) SetUpstreamCluster(_ string)              {}
+func (cb *fakeCallbacks) Draining() bool                           { return false }
+func (cb *fakeCallbacks) CloseDirection() network.CloseDirection   { return network.CloseDirectionUnset }
 
 var _ network.ReadFilterCallbacks = (*fakeCallbacks)(nil)
 

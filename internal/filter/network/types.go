@@ -47,6 +47,22 @@ type ReadFilter interface {
 	OnDestroy()
 }
 
+// HaltingReadFilter is an OPTIONAL extension a ReadFilter implements to opt into
+// the async halt/resume seam (29.3, ADR-0226). A filter returning MayHalt()==true
+// declares that its OnData (and the post-handoff replay path) may return
+// StopIteration as a HOLD resolvable ONLY by a later cb.ContinueReading() (e.g.
+// mongo_proxy fault-delay, where the resume rides a time.AfterFunc goroutine). A
+// chain containing ≥1 such filter is "haltable": the dispatching goroutine BLOCKS
+// at the hold until resume (block-the-dispatcher; D-S29.3-1). A filter that does
+// NOT implement this interface (or returns false) keeps the byte-identical
+// pre-29.3 per-pass-stop semantics (R1). CONTRACT: a MayHalt filter that returns
+// StopIteration MUST eventually call ContinueReading (mongo's timer always fires),
+// else the dispatcher blocks forever.
+type HaltingReadFilter interface {
+	ReadFilter
+	MayHalt() bool
+}
+
 // WriteFilter is the per-connection write-filter interface — the write-direction
 // (upstream→downstream) half of the chain. Mirrors upstream Network::WriteFilter
 // (onWrite + initializeWriteFilterCallbacks) + the envoy-go OnDestroy convention.
@@ -83,6 +99,27 @@ type WriteFilterCallbacks interface {
 	// the ReadFilterCallbacks Connection() returns).
 	Connection() Connection
 }
+
+// DrainState is the narrow drain-decider the network chain consumes (29.3, §3.4).
+// *drain.Manager satisfies it structurally, so the network package does NOT import
+// internal/drain (no manager leak into the framework's public API — D-S29.3-3).
+type DrainState interface {
+	IsDraining() bool
+}
+
+// CloseDirection records which side initiated a post-handoff connection close
+// (29.3, §3.5 — D-P4 CLOSED). The framework records close TYPE not DIRECTION
+// pre-29.3 (reference_close_direction_framework_gap); tcp_proxy's pump-EOF-first
+// recording (Task 10) supplies the direction for the terminal chain.
+type CloseDirection int32
+
+// CloseDirection values (29.3, §3.5). Unset is the zero value (no close recorded
+// or pre-handoff); Local/Remote name which side's EOF arrived first.
+const (
+	CloseDirectionUnset  CloseDirection = iota // no close recorded (or pre-handoff)
+	CloseDirectionLocal                        // downstream-initiated (downstream EOF first)
+	CloseDirectionRemote                       // upstream-initiated (upstream EOF first)
+)
 
 // NetworkFilterFactory parses + validates a network filter's typed_config Any
 // once at boot (NewManager-build time) and returns a per-connection

@@ -1,105 +1,224 @@
-# Phase 29.2 IMPL — PROGRESS
+# Phase 29.3 IMPL — PROGRESS
 
-Worktree: `.worktrees/phase-29.2-network-filter-mongo-responses-and-correlation-impl`
-Branch: `phase-29.2-network-filter-mongo-responses-and-correlation-impl` (off master `46dcd1b`)
-Executing: `docs/envoy-go/phases/29.2-network-filter-mongo-responses-and-correlation/PLAN.md` (11 tasks)
-Mode: subagent-driven-development (fresh subagent per task; two-stage review between tasks); subagents commit LOCAL-ONLY.
+Worktree: `.worktrees/phase-29.3-network-filter-mongo-fault-delay-and-access-log-impl`
+Branch: `phase-29.3-network-filter-mongo-fault-delay-and-access-log-impl` (off master `2b2a9d8`)
+Execution: `superpowers:subagent-driven-development` (fresh subagent/task + two-stage review; subagents commit LOCAL-ONLY; controller squash-merges + pushes at stage-close).
 
 ## Task 1 — baselines/anchors gate (DONE)
 
-Confirmed at the IMPL-session tip `46dcd1b`:
-- differential fixtures: **52** (tail `test/fixtures/0050-mongo-boot-reject`) → 53 at phase-done
-- fuzzers: **39** (extend `FuzzMongoDecode`; no 40th)
-- DECISIONS.md tail header: **## ADR-0226** (next-free **ADR-0227**; ADR-0225 body lands in-place at T11)
-- BackendKind: `TCPSink = 28`, `TCPZKResponder = 29` (next-free **30** = `TCPMongoResponder`)
-- stat surface: **360** (+0 at 29.2)
+Confirmed at the IMPL-session tip `2b2a9d8`:
 
-As-built anchors (codec.go / filter.go / stats.go) verified:
-- `decoder` struct (codec.go:46-52): 7 fields; gains `mu`/`writeBuf`/`dynMeta` at T2/T3
-- dispatch `opReply, opCommandReply: return true` (recognized-not-decoded, 29.1) present
-- `decoderError`/`fail` present (to be CAS-converted at T3)
-- `OnWrite` no-op stub present (filter.go); `OnDestroy` = `f.dec = nil`
-- `opQueryActive` gauge created eagerly (stats.go)
-- `Gauge.{Inc,Dec,Add,Load}` present; `Bucket.Set(filterName, key, *structpb.Value)`; `DynamicMetadata() *dynamicmetadata.Bucket` on ReadFilterCallbacks
+| anchor | value | status |
+|---|---|---|
+| differential fixtures | **53** (tail `0051-mongo-responses`) | ✓ → 54 at T11 (`0052`) |
+| fuzzers | **39** | ✓ (no new fuzzer; seam `-race` test instead) |
+| stat surface | **360** | ✓ (+0 at 29.3 — increment-wiring only) |
+| DECISIONS tail | **ADR-0226** (next-free ADR-0227) | ✓ (§Decision/§Consequences body lands T12) |
+| BackendKind tail | **TCPMongoResponder = 30** | ✓ (reused; no new BackendKind) |
 
-Clean baseline: `go build ./...` clean; `go test ./internal/filter/network/mongoproxy/... -count=1` green.
+As-built anchors verified (the seam + consumers extend these):
+- `chain.go`: `chainRuntime` (L146); `newChainRuntime([]ReadFilter,...)` (L198); `NewChainRuntime([]NetworkFilter,...)` (L60); `runData` per-pass-stop (L341); `replayRead` (L389, currently returns nothing — T4 adds `parked bool`); `ContinueReading` two-context (L439: connHalted + resumeRequested); `terminalReady` (L231).
+- `readconn.go`: `readChainConn` (L19); `newReadChainConn` (L24); `Read` (L34).
+- `prefixconn.go`/`writeconn.go`: embed `net.Conn` as INTERFACE (the non-promoting trap — T10 forwarding methods MANDATORY); `newPrefixConn`/`newWriteChainConn`.
+- `mongoproxy/codec.go`: **5** as-built request decoders — `decodeQuery`(L224)/`decodeInsert`(L396)/`decodeGetMore`(L419)/`decodeKillCursors`(L439)/`decodeCommand`(L459); response-side `decodeReply`(L552)/`decodeCommandReply`(L598). D-S29.3-5: eval at the 5 request decoders only.
+
+Clean baseline: `go build ./...` clean; `go test ./internal/... -count=1` all green.
 
 ## Task checklist
+- [x] T1 baselines/anchors gate + PROGRESS.md
+- [x] T2 chainRuntime halt-state sync + pre-handoff hold (seam-first) — the `MayHalt` construction-time `haltable` gate + halt `sync.Mutex`/`sync.Cond` + `held`/`resumeReady`; synthetic `haltingFilter`; never-halting byte-identity proof.
+- [x] T3 ContinueReading async-active third context — off-dispatch resume releases the holder; pre-handoff async-resume reaches `TerminalReady`.
+- [x] T4 replayRead + readChainConn post-handoff withhold + R-HALT `-race` + break (`-count=1`) — the `replayHeld` park-state + the publication-fence-under-`haltMu` fix (review I1); `TestSeamRaceReplayPublication` `-race -count=20`.
+- [x] T5 fault-delay decision in decoder — `maybeInjectDelay` at the AS-BUILT five request decoders + `takePendingDelay` + `rollPercent` (deterministic 100%) + the `delayPending` re-entrancy guard.
+- [x] T6 fault-delay timer in filter — `MayHalt`; `time.AfterFunc`+`onDelayTimer`+`ContinueReading`; `delays_injected` at ARM; StopIteration-while-pending; `OnDestroy` cancel + the timer↔destroy `-race`.
+- [x] T7 accesslog pluggable Formatter seam + mongo formatter — `Formatter func(any)` (default `Default(*Record)` → HCM byte-identical) + `MongoRecord`/`MongoFormat` + per-opcode goldens.
+- [x] T8 mongo access-log sink + per-message emission — gated on `cfg.accessLog`; both directions; the gated-off no-emit test.
+- [x] T9 DrainState accessor + cx_drain_close — `Draining()`/`CloseDirection()` on `ReadFilterCallbacks`; the GUARDED `SetDrainState(rt.dm)` typed-nil fix; reply-completion list-empty + `Connection().Close(FlushWrite)`; the unit value proof (`TestFilter_DrainCloseOnEmptyListWhenDraining` ==1 / `…NoDrainClose…` ==0).
+- [x] T10 close-direction seam D-P4 + cx_destroy_* value parity — `tcp_proxy` pump-EOF-first → `chainRuntime.closeDir`; the EXPLICIT `SetCloseDirection` forwarding methods on `prefixconn.go`+`writeconn.go` (`TestCloseDirectionThroughWrapStack`); the `OnDestroy` direction-keyed increment.
+- [x] T11 fixture 0052-mongo-fault-delay cross-side + R4 break (`-count=1`)
+- [x] T12 completion bundle + parent-row-29 ROLLUP + six-gate (this commit — see the gate evidence below)
 
-- [x] T1 — baselines/anchors gate + PROGRESS.md
-- [x] T2 — decoder mutex + writeBuf/dynMeta fields + gauge Inc on request append (commit f98af16; both reviews ✅)
-- [x] T3 — decodeOnWrite framing + dispatch + sniffing atomic.Bool (CAS at-most-once) (commit 7f3cea5; both reviews ✅; +1-line fuzz_test.go compile fix)
-- [x] T4 — OP_REPLY/OP_COMMANDREPLY body decode + 5 response counters (commit 653843f + hardening 20f0e9a; both reviews ✅)
-- [x] T5 — correlation takeQuery first-match-erase + gauge Dec on hit (commit c0a4a91; both reviews ✅)
-- [x] T6 — OnDestroy residual-drain teardown + lifecycle invariant (commit 4bbe972; both reviews ✅)
-- [x] T7 — OnWrite glue + concurrent race test + R9 mutex deliberate-break (commit afc3525 + hardening 44e5d7b; both reviews ✅)
-- [x] T8 — emit_dynamic_metadata single-Set Bucket emission (commit 4088090; both reviews ✅)
-- [x] T9 — extend FuzzMongoDecode to both directions (commit 73ed351; both reviews ✅; count stays 39 — verified canonical recipe)
-- [x] T10 — TCPMongoResponder BackendKind 30 + acceptMongoResponder (commit 8c7f3cf + fix 50ca55b; both reviews ✅)
-- [x] T11A — 0051-mongo-responses fixture cross-side GREEN (commit 068851a; both reviews ✅)
-- [x] T11B — completion bundle (ADR-0225 body + BEHAVIOR_CONTRACT + STATE/ROADMAP + next-prompt; commit 984147a) + six-gate evidence (8da9af4) + final whole-impl review ✅ (approve; 4 stale-comment cleanups swept in 469934f)
+## Deliberate-break records (per reference_differential_break_protocol_count1)
+(recorded at T4 R-HALT and T11 R4 — broken-FAIL + reverted-PASS, all `-count=1`)
 
-## Per-task evidence log
+### T4 R-HALT — the halt mutex is NECESSARY (proven by deliberate break)
 
-### T1
-- Counts/anchors confirmed (above). Clean baseline green. No code change.
+Break applied: `holdUntilResume`/`releaseResume` bodies stripped of `haltMu.Lock()/Unlock()`
++ the cond (`haltCond.Wait/Broadcast` removed; `holdUntilResume` busy-spins `for rt.held {}`),
+leaving UNLOCKED reads/writes of `held`/`resumeReady`.
 
-### T2 (commit f98af16)
-- Added `mu`/`writeBuf`/`dynMeta` decoder fields + `appendQuery` (lock append, Inc outside lock); replaced 2 request-path append sites. `TestDecoder_GaugeIncsPerActiveQuery` fails→green. gofmt/lint clean; full pkg green under -race.
-- Deviation: `//nolint:unused` on `writeBuf`/`dynMeta` (forward-declared; repo precedent lua/compiled_config.go:198). CARRY: drop the nolint when writeBuf gains a consumer (T3) and dynMeta gains a reader (T8).
-- Spec review ✅; code-quality review ✅ (approve, no changes).
+BROKEN — `go test ./internal/filter/network/ -race -count=1 -run 'TestSeamRace'`:
+```
+==================
+WARNING: DATA RACE
+Read at 0x00c0001d03a0 by goroutine 9:
+  ...network.(*chainRuntime).releaseResume()  chain.go:454
+  ...network.(*callbacks).ContinueReading()   chain.go:587
+  ...network.(*haltingFilter).OnData.func1()  chain_test.go:1160
+Previous write at 0x00c0001d03a0 by goroutine 8:
+  ...network.(*chainRuntime).holdUntilResume()  chain.go:438
+==================
+--- FAIL: race detected during execution of test
+```
+→ `-race` reports a data race on `held`/`resumeReady` ⇒ the mutex is NECESSARY. (`-count=1`
+used to defeat Go's test-result cache, per reference_differential_break_protocol_count1.)
 
-### T3 (commit 7f3cea5)
-- `sniffing` → `atomic.Bool`; `newDecoder` Store(true); `decoderError` CAS at-most-once; readBuf-release relocated to decodeOnData post-loop; per-pass dynMeta clear added (gated, exercised at T8). Added `decodeOnWrite`/`nextWriteMessage`/`decodeResponseMessage` + stub `decodeReply`/`decodeCommandReply`. 4 new write-side tests fail→green. Removed writeBuf nolint; kept dynMeta nolint.
-- Necessary deviation: 1-line `d.sniffing`→`.Load()` in fuzz_test.go (atomic.Bool can't be value-copied; required to compile). No fuzzer logic change.
-- Spec review ✅; code-quality review ✅ (CAS exactly-once + readBuf-release verified empirically under -race -count=5).
+REVERTED — same command after restoring the `haltMu`-guarded bodies: `ok` (clean). (Also
+`-race -count=20` clean.)
 
-### T4 (commit 653843f + hardening 20f0e9a)
-- Replaced stub decodeReply/decodeCommandReply with full body decode. decodeReply: flags/cursorID/startingFrom/numberReturned + N docs → op_reply + cursor_not_found(0x01) + query_failure(0x02) + valid_cursor(cursorID≠0); counters charge ONLY after successful doc-walk; malformed → fail(). decodeCommandReply: metadata+commandReply+0..N outputDocs → op_command_reply; never touches gauge. Correlation deferred to T5 (responseTo unused).
-- Adaptation: test `want` map typed `uint64` (Counter.Load→uint64; gauge→int64). Hardening commit added `op_reply==0`/`op_command_reply==0` assertions to the two malformed tests (liveness proven: moving inc above doc-walk fails the assertion).
-- Spec review ✅; code-quality review ✅ (approve).
+### T4 R-HALT (review I1) — the replay-state publication fence is NECESSARY
 
-### T8 (commit 4088090)
-- `decoder.recordOp(collection, op)` (gated, lazy-init, append) called from decodeQuery both success paths (op="query") + decodeInsert (op="insert", captures previously-discarded fullColl cstring, post-dot token). `filter.emitDynamicMetadata()` builds ONE structpb StructValue (collection→ListValue of op strings) via single Set("envoy.filters.network.mongo_proxy","operations",sv); gated + empty-skip. Wired into OnData after decode feed. Removed dynMeta nolint. ZERO internal/dynamicmetadata/ change (D-S29.2-3).
-- Test-harness fix: driveOnData takes a SHARED *network.Buffer (PLAN's fresh-per-call broke the monotonic TotalAppended high-water → pass 2 under-fed). Validated faithful to one-Buffer-per-connection (chain.go rt.buf). Per-pass-clear proof live (driven by decodeOnData d.dynMeta=nil reset).
-- Spec review ✅; code-quality review ✅ (structpb confirmed absent from codec; recordOp lock-free goroutine-A-only; nesting + insertion order correct; nil-f.cb deref unreachable per chain.go).
+`TestSeamRaceAsyncResume` was REPLACED by `TestSeamRaceReplayPublication`: the original drove
+only the `held`/`resumeReady` coordination (already covered by T2/T3), not the Task-4 replay
+state (`replayIdx`/`replayHeld`/`buf`). The new test drives the REAL post-handoff pump cycle
+(`readChainConn.Read` → `replayRead` UNLOCKED writes → `holdUntilResume` → the async
+`ContinueReading` haltMu-GUARDED reads via `finishParkedReplayLocked`) with a re-arming halting
+filter so consecutive parked passes overlap.
 
-### T11B six-gate evidence (run before docs)
-- GATE 1 `go build ./...` → clean.
-- GATE 2 `go vet ./...` → clean.
-- GATE 3 `golangci-lint run` (full repo) → exit 0.
-- GATE 4 `go test ./... -race -short` → 80 packages ok, 0 fail.
-- GATE 5 `go test ./test/differential/ -count=1` (full 53-dir) → all mongo fixtures (0049/0050/0051) byte-exact PASS. **Pre-existing environmental flake:** the full-suite run intermittently fails ONE random unrelated HTTP/wasm fixture with `subject ready: EOF` (subject-subprocess startup probe timing). Reproduced IDENTICALLY on MASTER @46dcd1b (→ 0012-http-header-mutation), proving it is NOT a 29.2 regression (29.2 touches zero HTTP code; framework byte-untouched). Branch runs flaked 0019/0025 then 0034 then 0021; ALL pass on isolated/subset re-run. Confirmation run of the 3 mongo + all 5 previously-flaked HTTP fixtures TOGETHER → 8/8 PASS (22s).
-- GATE 6 conformance (h2spec 53/53 + proxy-wasm 10/10) → asserted-UNAFFECTED (29.2 touches no HTTP/h2/wasm path; zero code change there; last green 29.1 six-gate 2026-06-04).
-- Counts at phase-done: fixtures **53**, fuzzers **39**, stats **360**, BackendKind tail **30**, DECISIONS tail **ADR-0226** (next-free ADR-0227).
+Strengthening this test SURFACED a real defect: `replayRead` published `rt.replayHeld = true`
+OUTSIDE `haltMu`, while `ContinueReading` reads it UNDER `haltMu`. The halting filter arms its
+async resume DURING `OnData` (before that write lands), so the resume goroutine's guarded read
+raced the unguarded write. Fix: publish `replayHeld` under `haltMu` in `replayRead` (the
+publication fence). Also extracted `finishParkedReplayLocked` (caller-holds-haltMu helper, I2)
+and annotated the combined advance+reset `replayIdx = 0` (I3).
 
-### T11A (commit 068851a)
-- Fixture `0051-mongo-responses` (single-listener l_resp/mongo_r → TCPMongoResponder). 6 arms (plain round-trip; 3 flag variants 7001/7002/7003; OP_COMMAND round-trip; withhold 7777; uncorrelated 7005; malformed 7004). StatsAsserter cross-side GREEN vs reference v1.37.2 (Docker). Arm-accounting LIVE-VERIFIED.
-- **op_query=7 (NOT PLAN's estimate of 6)** — arm6 malformed sends a VALID OP_QUERY request (only the response is malformed). op_reply=5, op_command=1, decoding_error=1, 3 flag counters=1, op_command_reply=1. Gauge op_query_active==0 at rest. cx_destroy_* PRESENCE-ONLY (ref=3/subj=0; D-P4). delays_injected/cx_drain_close present==0.
-- Unanswered-gauge: approach (B) — cross-side proves answered→0 + residual-drain→0; ==1-while-open is unit-covered (T6). (Drive* methods get only proxy addr, not admin addr.)
-- **R4 deliberate-breaks (-count=1):** (a) op_reply want 6→FAIL; (b) skip Dec→subj gauge=4 want 0 FAIL; (c) skip Inc→subj gauge=-7 want 0 FAIL. All reverted GREEN; codec.go byte-identical. Break (b) re-proven independently by spec reviewer; gauge math (b:+4, c:-7) reproduced by code reviewer.
-- Spec review ✅; code-quality review ✅ (approve). Fixture count → 53.
+Liveness check (deliberate break — guard around the `replayHeld` read in `ContinueReading`
+removed): `go test ... -race -count=1 -run 'TestSeamRaceReplayPublication'` → DATA RACE on the
+guarded `replayHeld` read (chain.go ContinueReading) vs the fenced write in `replayRead`; FAIL.
+REVERTED → clean. Strengthened test passes `-race -count=20`.
 
-### T9 (commit 73ed351)
-- Extended FuzzMongoDecode to feed BOTH decodeOnData + decodeOnWrite over one decoder; 3 response seeds (empty OP_REPLY / OP_COMMANDREPLY / malformed numReturned-lies); 4 invariants (no-panic, input-immutability, direction-shared sniffing-off at-most-once, readBuf+writeBuf bounded). respSeed/replyBodySeed/docSeed wrappers. NO 40th fuzzer — canonical `grep "^func Fuzz" internal/**/fuzz_test.go | wc -l` = **39** confirmed.
-- Adaptation: writeBuf bound `len(data)+16`→`2*len(data)+16` (decodeOnWrite fed `data` twice + no high-water → legit 2*len(data) accumulation; not a prod bug). 20s fuzz run clean (~5.4M execs).
-- Spec review ✅; code-quality review ✅ (invariant 3 live for write side; immutability valid for shared slice; bound correction sound).
+### T11 — fixture 0052-mongo-fault-delay cross-side (all arms green; the R4 break)
 
-### T10 (commit 8c7f3cf + fix 50ca55b)
-- `TCPMongoResponder BackendKind = 30` + `acceptMongoResponder`/`mongoRespondLoop` (16-byte LE MsgHeader framing; correlated OP_REPLY/OP_COMMANDREPLY, responseTo echoes requestID; marker requestIDs: withhold 7777, cursorNotFound 7001, queryFailure 7002, validCursor 7003+cursorID 4242, malformedReply 7004, uncorrelated 7005=reqID+50000). `mongoReqFrame` + `TestMongoResponderBackend`. Dispatch arm mirrors TCPZKResponder. Zero production code.
-- **Spec-review bug caught + fixed (50ca55b):** original 7004 emitted `replyBody(0,0,1)` = a WELL-FORMED 1-doc reply (replyBody always appends ndocs docs). Fixed to inline 20-byte body (numberReturned=1, NO doc) → genuinely malformed → decodeReply parseDocument on empty reader → decoding_error, op_reply NOT charged. Verified by throwaway test (decoding_error==1, op_reply==0) both by impl + re-review.
-- Spec review ✅ (re-review after fix); code-quality review ✅ (wire frames byte-verified vs codec; inline-malformed the right structural choice vs corrupting replyBody invariant; framing-read hardened). Marker consts mirrored driver-local in T11 (PLAN design).
+The cross-side proof of the whole 29.3 phase. Two listeners on each side (reference
+Envoy v1.37.2 docker + envoy-go subprocess), filter chain [mongo_proxy, tcp_proxy]
+→ the shared TCPMongoResponder backend (BackendKind 30 REUSED — no new kind):
+- `mongo_d`  (delay {fixed_delay: 0.100s, percentage 100% HUNDRED}).
+- `mongo_nd` (no delay).
 
-### T5 (commit c0a4a91)
-- `takeQuery(responseTo)` first-match-erase under mu (copy-out by value, order-preserving slice-delete); correlation block in decodeReply Decs gauge OUTSIDE the lock on a hit. 3 correlation tests (first-match-erase decs gauge; uncorrelated miss charges fixed only; command-reply does not correlate). activeQuery.requestID matched verbatim.
-- Spec review ✅; code-quality review ✅ (slice-delete stale-tail analyzed benign — bounded by per-conn lifetime + T6 onDestroy drain; command-reply non-correlation assertion is live).
+Arms (`go test ./test/differential/ -run 'TestDifferential/0052' -count=1`):
+1. fault-delay round-trip (pre + post handoff): ONE conn on mongo_d, OP_QUERY reqID 1
+   → reply, OP_QUERY reqID 2 → reply. delay 1 fires PRE-handoff (read loop), delay 2
+   POST-handoff (replayRead). `delays_injected{mongo_d} == 2` BOTH sides; both replies
+   received. Timing NEVER compared.
+2. seam non-perturbation (no-delay): plain OP_QUERY → reply on mongo_nd;
+   `delays_injected{mongo_nd} == 0` BOTH sides (R1 live equivalence); reply received.
+3. cx_drain_close: PRESENCE-DOWNGRADED (D-S29.3-8) — asserted present + == 0 both sides.
+   See the downgrade note below.
+4. cx_destroy_* VALUE parity (D-P4 CLOSED) on mongo_nd:
+   (i)   LOCAL: OP_QUERY(withhold 7777) → no reply, conn open → DRIVER closes →
+         `cx_destroy_local_with_active_rq{mongo_nd} == 1` BOTH sides.
+   (ii)  REMOTE: OP_QUERY(remoteClose 7006; NEW mongoMarkerRemoteClose added to
+         mongoRespondLoop — reads then `return`s/closes WITHOUT replying) → upstream
+         EOF first → `cx_destroy_remote_with_active_rq{mongo_nd} == 1` BOTH sides.
+   (iii) all-answered: plain OP_QUERY → reply (list empties) → close → NEITHER increments.
+5. all-quiesced roster: `op_query_active == 0` both prefixes, both sides (gauge TYPE
+   line == gauge); the counters at their asserted values.
 
-### T6 (commit 4bbe972)
-- `decoder.onDestroy()`: snapshot n under mu, `d.queries=nil`, Add(-n) OUTSIDE lock guarded by `if n>0` (idempotent, no negative gauge; D-S29.2-5). `filter.OnDestroy` drains via f.dec.onDestroy() then nils f.dec. 3 tests (residual drain→0; lifecycle inc2/dec1/drain1→0 with list↔gauge invariant; filter-level drain+release).
-- Spec review ✅; code-quality review ✅ (gauge Inc/Dec/Add proven a balanced additive group netting 0/conn; nil drops backing array resolving T5 tail-leak; idempotency verified under -race). Non-blocking nits (terminal list assertion covered by sibling test) — no action.
+Live stat dump (FIXTURE_0052_DUMP_STATS=1) — ref and subj BYTE-IDENTICAL:
+```
+delays_injected{mongo_d}=2  delays_injected{mongo_nd}=0
+cx_destroy_local_with_active_rq{mongo_nd}=1  cx_destroy_remote_with_active_rq{mongo_nd}=1
+cx_destroy_local_with_active_rq{mongo_d}=0   cx_destroy_remote_with_active_rq{mongo_d}=0
+cx_drain_close{mongo_d}=0  cx_drain_close{mongo_nd}=0  op_query_active{*}=0
+```
+Result: `--- PASS: TestDifferential/0052-mongo-fault-delay` on BOTH runner paths.
 
-### T7 (commit afc3525 + hardening 44e5d7b)
-- `filter.OnWrite` no-op → `f.dec.decodeOnWrite(buf.Bytes()); return Continue` (never halts, never drains; 28.2 no-high-water). Replaced TestFilter_OnWriteIsNoOp with OnWriteFeedsResponseDecoder + OnWriteNeverDrainsChainBuffer. Added TestDecoderConcurrentRequestResponseRace (200 req via decodeOnData goroutine A + 200 resp via decodeOnWrite goroutine B over ONE decoder; asserts op_reply==200, hardened with op_query==200).
-- **R9 deliberate-break (-count=1, reference_differential_break_protocol_count1):** commenting out the appendQuery+takeQuery mu.Lock/Unlock → `WARNING: DATA RACE` (appendQuery write codec.go:68 vs takeQuery read codec.go:80 on shared dec.queries) + FAIL under `-race -count=1`. Reverted byte-identical → clean PASS. codec.go untouched in the commit. Re-proven INDEPENDENTLY by the spec reviewer.
-- nil-safety traced: f.dec eagerly non-nil; OnWrite fenced behind the pump-join happens-before edge (terminal.Handle returns before onDestroy) → unguarded form (matching OnData) correct.
-- Spec review ✅; code-quality review ✅ (approve).
+#### cx_drain_close differential disposition — PRESENCE-DOWNGRADED (D-S29.3-8)
+
+The differential `cx_drain_close` arm is DOWNGRADED to PRESENCE + exists-at-zero on
+both sides. Reason: the stat fires only when a correlated reply EMPTIES the active-
+query list WHILE the connection's callbacks report `Draining()==true` (filter.go
+OnWrite). Driving that cross-side requires (a) the admin `/drain_listeners` POST and
+(b) a reply-completion landing in the narrow draining window — but the driver's
+drive phase has NO admin addr (the runner passes admin addrs only to AssertStats,
+not to DriveSubjectMulti), and the reply-vs-drain ordering is not deterministically
+reproducible across the docker reference + the subprocess subject. Per D-S29.3-8 this
+is a sanctioned downgrade; the LOAD-BEARING ratification is the Task-9 UNIT value
+proof (deterministic): `TestFilter_DrainCloseOnEmptyListWhenDraining` (==1) +
+`TestFilter_NoDrainCloseWhenNotDraining` (==0). The phase is NOT blocked on a flaky
+differential drain arm.
+
+#### T11 R4 deliberate-break liveness (per reference_differential_break_protocol_count1)
+
+All breaks + reverts run with `-count=1` (Go caches test results — without it a stale
+PASS would hide the break). Each new assertion proven LIVE:
+
+(a) `delays_injected{mongo_d}` expected 3 (when 2 armed):
+    BROKEN — `go test ./test/differential/ -run 'TestDifferential/0052' -count=1`:
+      `ref ...delays_injected{...mongo_d} = 2, want 3`
+      `subj ...delays_injected{...mongo_d} = 2, want 3`  → FAIL BOTH paths.
+    REVERTED (expected 2) → `--- PASS: TestDifferential/0052-mongo-fault-delay`.
+
+(b) Task-10 `cx_destroy_*` switch commented out in filter.go OnDestroy:
+    BROKEN — same command:
+      `subj ...cx_destroy_local_with_active_rq{...mongo_nd} = 0, want 1`
+      `subj ...cx_destroy_remote_with_active_rq{...mongo_nd} = 0, want 1`  → FAIL
+      (subject-side only; the reference side stays correct — a true cross-side proof).
+    REVERTED (`git restore`) → PASS.
+
+(c) Task-9 `cx_drain_close` increment commented out (PRESENCE-downgraded → the UNIT
+    test is the proof per the protocol):
+    BROKEN — `go test ./internal/filter/network/mongoproxy/ -run 'TestFilter_DrainClose|TestFilter_NoDrainClose' -count=1`:
+      `TestFilter_DrainCloseOnEmptyListWhenDraining: cx_drain_close = 0, want 1` → FAIL
+      (`TestFilter_NoDrainCloseWhenNotDraining` correctly stays PASS — it asserts 0).
+    REVERTED (`git restore`) → `ok`.
+
+Files: created test/fixtures/0052-mongo-fault-delay/{driver/driver.go,README.md};
+modified test/differential/runner_test.go (0052 blank-import; mongoMarkerRemoteClose
+const + the REMOTE-close case in mongoRespondLoop). fixture.go NOT modified
+(BackendKind TCPMongoResponder = 30 reused). gofmt -l + golangci-lint on ./test/...
+clean; fixture count 54.
+
+## Task 12 — completion bundle + parent-row-29 ROLLUP + the six-gate (DONE)
+
+Docs landed (this commit): ADR-0226 §Decision/§Consequences body IN-PLACE in `DECISIONS.md`
+(DECISIONS tail STAYS ADR-0226 — no new number; next-free ADR-0227); the BEHAVIOR_CONTRACT
+29.3 bundle (the `### envoy.filters.network.mongo_proxy` subsection extension — fault-delay /
+access-log / cx_drain_close / cx_destroy_* value-parity / runtime-key bullets + the 29.3
+Differential bullet + the Stats 360→360 line; the NEW `### Network filter chain framework —
+async halt/resume (29.3 amendment)` subsection; the `## Stat-name mapping` 360→360 [29.3]
+block + the family-ROLLUP note; the `### Stat surface` 29.3 paragraph; the `### Applies to`
+29.x line); `ROADMAP.md` sub-row 29.3 `in-progress → done` AND parent row 29
+`in-progress → done` ATOMICALLY (the ROLLUP — same commit); `STATE.md` advanced (active-phase /
+lifecycle-state / next-skill = NEXT-phase BRAINSTORM [redis/kafka_broker/thrift] / counts
+54/39/360/30/ADR-0226); `next-prompt.txt` rewritten for the next-§9-family BRAINSTORM
+cold-start; `internal/filter/network/mongoproxy/doc.go` 29.x forward-pointers flipped to LANDED
+(phase-29 CLOSED).
+
+### The six-gate (run LIVE from the worktree root; EXACT outputs)
+
+1. `go build ./...` → clean (exit 0).
+2. `go vet ./...` → clean (exit 0).
+3. `golangci-lint run` → clean (exit 0).
+4. `go test ./... -race -short` → **PASS** (exit 0; 80 packages `ok`, 0 FAIL).
+   NOTE: a first invocation reported a single transient `FAIL` that did NOT reproduce on the
+   immediate re-run (exit 0, 80 ok) — a known HTTP-fixture startup/port-bind flake (the same
+   class recorded at 26.2/28.1b/28.2), NOT a 29.3 regression; 29.3 touches no HTTP filter path.
+5. `ls -d test/fixtures/[0-9]* | wc -l` → **54** (tail `0052-mongo-fault-delay`).
+6. `go test ./test/differential/ -count=1` → **PASS** (exit 0): `ok  …/test/differential  177.503s`
+   (full 54-dir byte-exact suite incl. the 53-dir R1 back-compat / seam non-perturbation gate).
+   A separate `-v` run for per-subtest visibility showed 54 subtests run, `0052-mongo-fault-delay`
+   `--- PASS (10.52s)`, with TWO transient HTTP-fixture flakes (`0020-http-ext-authz-http`,
+   `0022-http-ext-proc-grpc` — gRPC/HTTP-auth backend TOCTOU startup races) that **both PASS in
+   isolation** (`go test … -run 'TestDifferential/(0020-…|0022-…)$'` → exit 0; `0020 PASS 2.08s`,
+   `0022 PASS 1.77s`). These are unrelated to 29.3 (no HTTP filter touched); the authoritative
+   non-verbose `-count=1` suite run passed all 54 byte-exact.
+
+### Conformance (re-run LIVE — NOT asserted; the harness is runnable in this env)
+
+- h2spec: `go test ./test/conformance/h2spec/ -count=1` → **53 tests, 53 passed, 0 skipped,
+  0 failed** (`h2spec conformance report: 53 total tests, 0 failures`).
+- proxy-wasm: `go test ./test/conformance/proxy-wasm/ -count=1` → **PASS** (all 10 families:
+  exports / security {allowed,denied} / runtime / wasm_vm / bytecode_util / logging /
+  stop_iteration {pause,continue} / shared_data / pairs_util / endianness — all `--- PASS`).
+  Rationale: 29.3 touches no HTTP filter; the accesslog `Formatter func(any)` seam keeps the
+  HTTP `Default` path byte-identical (`*Record` satisfies `any`) — re-run LIVE to confirm.
+
+### Counts at phase-done
+
+fixtures **54** (tail `0052-mongo-fault-delay`); fuzzers **39** (no new fuzzer — the seam
+concurrency is `-race`-test-proven); stat surface **360** (+0 creation — increment-wiring only);
+BackendKind tail **30** (`TCPMongoResponder` reused); DECISIONS tail **ADR-0226** (next-free
+**ADR-0227**). The parent-row-29 ROLLUP is ATOMIC (parent row 29 + sub-row 29.3 both `done` in
+THIS commit). The §9 Network-filters family's FOURTH row CLOSES; 3 candidates remain
+(redis / kafka_broker / thrift).

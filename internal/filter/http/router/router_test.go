@@ -274,8 +274,8 @@ func TestRouterAction_Do_DialFailureInc5xx(t *testing.T) {
 // duplicated rather than exported across the package boundary.
 type emitCaptureSink struct{ recs []*accesslog.Record }
 
-func (s *emitCaptureSink) Submit(r *accesslog.Record) { s.recs = append(s.recs, r) }
-func (s *emitCaptureSink) Close() error               { return nil }
+func (s *emitCaptureSink) Submit(r any) { s.recs = append(s.recs, r.(*accesslog.Record)) }
+func (s *emitCaptureSink) Close() error { return nil }
 
 // TestRouterAction_EmitsAccessLog_HappyPath verifies that routerAction.do
 // submits one access-log record with a non-empty UpstreamHost and BytesSent > 0

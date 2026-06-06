@@ -46,3 +46,13 @@ func (w *writeChainConn) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+// SetCloseDirection forwards to the embedded conn (the write-side seam, 29.3 §3.5):
+// writeChainConn is the OUTERMOST wrap tcp_proxy receives; forward SetCloseDirection
+// inward (→ prefixConn → readChainConn → runtime) since the embedded net.Conn
+// interface does not promote the custom method.
+func (w *writeChainConn) SetCloseDirection(d CloseDirection) {
+	if sd, ok := w.Conn.(interface{ SetCloseDirection(CloseDirection) }); ok {
+		sd.SetCloseDirection(d)
+	}
+}

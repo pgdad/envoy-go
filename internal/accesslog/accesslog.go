@@ -16,7 +16,7 @@ import "time"
 // (drop-newest backpressure on full channel; see writer.go); Close is idempotent
 // and threadsafe (sync.Once-guarded; see writer.go).
 type Sink interface {
-	Submit(r *Record)
+	Submit(r any)
 	Close() error
 }
 

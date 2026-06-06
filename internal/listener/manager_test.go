@@ -3279,3 +3279,64 @@ func TestServeNetworkChainDirectResponse(t *testing.T) {
 		t.Errorf("direct_response body = %q, want %q", got, body)
 	}
 }
+
+// drainProbeFilter is a minimal pure-read network filter (29.3 Task 9 test): its
+// OnData calls cb.Draining() — the typed-nil-in-interface trap (risk register
+// line 1846) would PANIC here if serveNetworkChain wired a typed-nil
+// *drain.Manager into the DrainState interface. It records the Draining() result,
+// then closes the connection so serveNetworkChain's read loop exits.
+type drainProbeFilter struct {
+	network.Marker
+	cb       network.ReadFilterCallbacks
+	draining bool
+	sawData  chan struct{}
+}
+
+func (f *drainProbeFilter) OnNewConnection() network.Status { return network.Continue }
+func (f *drainProbeFilter) OnData(buf *network.Buffer, _ bool) network.Status {
+	f.draining = f.cb.Draining() // must NOT panic with a nil-dm listener
+	buf.Drain(buf.Len())
+	f.cb.Connection().Close(network.FlushWrite)
+	close(f.sawData)
+	return network.StopIteration
+}
+func (f *drainProbeFilter) SetReadFilterCallbacks(cb network.ReadFilterCallbacks) { f.cb = cb }
+func (f *drainProbeFilter) OnDestroy()                                            {}
+
+// TestServeNetworkChainNilDrainNoPanic pins the typed-nil-in-interface guard
+// (29.3 Task 9; risk register line 1846): a listenerRuntime with dm==nil must NOT
+// wire a typed-nil *drain.Manager into the DrainState interface, so the filter's
+// cb.Draining() returns false WITHOUT panicking on a nil receiver.
+func TestServeNetworkChainNilDrainNoPanic(t *testing.T) {
+	probe := &drainProbeFilter{sawData: make(chan struct{})}
+	rt := &listenerRuntime{dm: nil} // drain UNWIRED — the legacy/test shape
+	selected := chainInfo{netChainFactory: func() []network.NetworkFilter {
+		return []network.NetworkFilter{probe}
+	}}
+
+	cli, srv := net.Pipe()
+	defer func() { _ = cli.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		rt.serveNetworkChain(context.Background(), srv, selected)
+		close(done)
+	}()
+
+	if _, err := cli.Write([]byte("ping")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case <-probe.sawData:
+	case <-time.After(2 * time.Second):
+		t.Fatal("filter OnData never ran")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveNetworkChain did not return after close")
+	}
+	if probe.draining {
+		t.Error("Draining() must be false when dm is nil (no drain state wired)")
+	}
+}

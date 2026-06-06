@@ -131,10 +131,30 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 	}
 	defer func() { _ = upstream.Close() }()
 
+	// 29.3 (§3.5): record which pump EOF'd first so a mongo_proxy chain can key
+	// cx_destroy_local/remote_with_active_rq. The downstream→upstream pump returns
+	// on downstream (LOCAL) EOF; the upstream→downstream pump on upstream (REMOTE)
+	// EOF. Additive — chains without a readChainConn (no SetCloseDirection method)
+	// are unaffected. The chain does first-wins CAS internally.
+	recordDir := func(d network.CloseDirection) {
+		if sd, ok := downstream.(interface{ SetCloseDirection(network.CloseDirection) }); ok {
+			sd.SetCloseDirection(d)
+		}
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = io.Copy(netConn{upstream}, netConn{downstream}); halfClose(upstream) }()
-	go func() { defer wg.Done(); _, _ = io.Copy(netConn{downstream}, netConn{upstream}); halfClose(downstream) }()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(netConn{upstream}, netConn{downstream})
+		recordDir(network.CloseDirectionLocal) // downstream EOF first → local
+		halfClose(upstream)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(netConn{downstream}, netConn{upstream})
+		recordDir(network.CloseDirectionRemote) // upstream EOF first → remote
+		halfClose(downstream)
+	}()
 	wg.Wait()
 }
 

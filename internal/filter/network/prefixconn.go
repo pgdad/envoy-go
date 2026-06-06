@@ -26,3 +26,13 @@ func (p *prefixConn) Read(b []byte) (int, error) {
 	}
 	return p.Conn.Read(b)
 }
+
+// SetCloseDirection forwards to the embedded conn (the read-side seam, 29.3 §3.5):
+// the embedded net.Conn is an interface so readChainConn.SetCloseDirection does not
+// auto-promote — forward it explicitly so tcp_proxy reaches the runtime through the
+// prefixConn wrap.
+func (p *prefixConn) SetCloseDirection(d CloseDirection) {
+	if sd, ok := p.Conn.(interface{ SetCloseDirection(CloseDirection) }); ok {
+		sd.SetCloseDirection(d)
+	}
+}

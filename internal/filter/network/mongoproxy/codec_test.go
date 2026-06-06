@@ -1,8 +1,10 @@
 package mongoproxy
 
 import (
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -659,5 +661,98 @@ func TestDecoderConcurrentRequestResponseRace(t *testing.T) {
 	}
 	if ms.counters["op_query"].Load() != uint64(n) {
 		t.Errorf("op_query = %d, want %d (request stream must populate dec.queries)", ms.counters["op_query"].Load(), n)
+	}
+}
+
+// newTestDecoderCfg wires a decoder over a caller-supplied compiledConfig and a
+// fresh roster (29.3 fault-delay tests need delayConfigured/fixedDelay/percent
+// fields that the default newTestDecoder does not set).
+func newTestDecoderCfg(t *testing.T, cfg *compiledConfig) (*decoder, *mongoStats) {
+	t.Helper()
+	reg := stats.NewRegistry()
+	prefix := cfg.statPrefix
+	if prefix == "" {
+		prefix = "p"
+	}
+	ms := newMongoStats(reg, prefix)
+	return newDecoder(cfg, ms), ms
+}
+
+func TestDecoder_DelayDecidedAt100Percent(t *testing.T) {
+	cfg := &compiledConfig{statPrefix: "m", delayConfigured: true, fixedDelay: 100 * time.Millisecond,
+		delayPercentNum: 100, delayPercentDenom: 0 /*HUNDRED*/, commands: map[string]bool{}}
+	d, ms := newTestDecoderCfg(t, cfg) // a helper that wires cfg + a fresh roster
+	_ = ms
+	q := msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	d.decodeOnData(q, int64(len(q)))
+	dur, ok := d.takePendingDelay()
+	if !ok || dur != 100*time.Millisecond {
+		t.Fatalf("takePendingDelay = (%v,%v), want (100ms,true)", dur, ok)
+	}
+	if _, ok := d.takePendingDelay(); ok {
+		t.Fatal("takePendingDelay must be consumed once per decide")
+	}
+}
+
+func TestDecoder_NoDelayWhenUnconfigured(t *testing.T) {
+	d, _ := newTestDecoder(t) // delayConfigured == false
+	q := msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	d.decodeOnData(q, int64(len(q)))
+	if _, ok := d.takePendingDelay(); ok {
+		t.Fatal("no delay must be decided when delayConfigured is false")
+	}
+}
+
+func TestDecoder_ReentrancyGuardAtMostOnePerPass(t *testing.T) {
+	cfg := &compiledConfig{statPrefix: "m", delayConfigured: true, fixedDelay: 50 * time.Millisecond,
+		delayPercentNum: 100, delayPercentDenom: 0, commands: map[string]bool{}}
+	d, _ := newTestDecoderCfg(t, cfg)
+	d.delayPending.Store(true) // simulate an armed (pending) timer
+	q := msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	d.decodeOnData(q, int64(len(q)))
+	if _, ok := d.takePendingDelay(); ok {
+		t.Fatal("an armed (pending) delay must suppress re-decide (re-entrancy guard)")
+	}
+}
+
+// TestDecoder_MessageToStringQuery asserts the OP_QUERY per-opcode access-log
+// string (full=true for request-direction messages) names the opcode + the
+// collection. The access log is differential-INVISIBLE (AMEND-B10) → the unit
+// goldens are the authority; the shape is the IMPL transcription vs codec_impl.cc.
+func TestDecoder_MessageToStringQuery(t *testing.T) {
+	s := messageToString(opQuery, 1, "db.collection1", true)
+	if s == "" || !strings.Contains(s, "collection1") {
+		t.Errorf("OP_QUERY message string wrong: %q", s)
+	}
+	if !strings.Contains(s, "OP_QUERY") {
+		t.Errorf("OP_QUERY message string must name the opcode: %q", s)
+	}
+}
+
+// TestDecoder_MessageToStringPerOpcode pins the per-opcode shape (id + collection
+// named where present; reply opcodes use full=false). Differential-invisible →
+// these are the authoritative goldens for the access-log message field.
+func TestDecoder_MessageToStringPerOpcode(t *testing.T) {
+	cases := []struct {
+		op   int32
+		full bool
+		want string // substring(s) the rendered string must contain
+	}{
+		{opQuery, true, "OP_QUERY"},
+		{opInsert, true, "OP_INSERT"},
+		{opGetMore, true, "OP_GET_MORE"},
+		{opKillCursors, true, "OP_KILL_CURSORS"},
+		{opCommand, true, "OP_COMMAND"},
+		{opReply, false, "OP_REPLY"},
+		{opCommandReply, false, "OP_COMMANDREPLY"},
+	}
+	for _, c := range cases {
+		s := messageToString(c.op, 7, "db.collection1", c.full)
+		if !strings.Contains(s, c.want) {
+			t.Errorf("op %d: %q does not contain %q", c.op, s, c.want)
+		}
+		if !strings.Contains(s, "7") {
+			t.Errorf("op %d: %q must name the id", c.op, s)
+		}
 	}
 }

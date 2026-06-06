@@ -35,6 +35,13 @@ type ReadFilterCallbacks interface {
 	// OnNewConnection with the verbatim SNI; "" is a no-op (leaves the configured
 	// cluster). Last writer wins (Envoy's PerConnectionCluster is Mutable).
 	SetUpstreamCluster(name string)
+	// Draining reports whether the listener is draining (29.3, §3.4). mongo_proxy
+	// gates cx_drain_close on it. False when no drain state is wired (nil-tolerant).
+	Draining() bool
+	// CloseDirection reports which side initiated the post-handoff close (29.3,
+	// §3.5): Local (downstream) / Remote (upstream) / Unset. mongo_proxy keys
+	// cx_destroy_local/remote_with_active_rq on it at OnDestroy.
+	CloseDirection() CloseDirection
 }
 
 // CloseType selects the connection-close semantics. FlushWrite (flush pending

@@ -12,8 +12,8 @@ import (
 
 type emitCaptureSink struct{ recs []*accesslog.Record }
 
-func (s *emitCaptureSink) Submit(r *accesslog.Record) { s.recs = append(s.recs, r) }
-func (s *emitCaptureSink) Close() error               { return nil }
+func (s *emitCaptureSink) Submit(r any) { s.recs = append(s.recs, r.(*accesslog.Record)) }
+func (s *emitCaptureSink) Close() error { return nil }
 
 func TestEmitAccessLog_H1_DirectResponseShape(t *testing.T) {
 	cs := &emitCaptureSink{}

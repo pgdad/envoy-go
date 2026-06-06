@@ -1,11 +1,17 @@
 package mongoproxy
 
 import (
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	mongo_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -188,5 +194,273 @@ func TestEmitDynamicMetadata_GatedOff(t *testing.T) {
 	driveOnData(f, &network.Buffer{}, msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery())))
 	if _, ok := cb.dm.Get("envoy.filters.network.mongo_proxy", "operations"); ok {
 		t.Errorf("no metadata may be emitted when emit_dynamic_metadata is false")
+	}
+}
+
+// newTestFilter wires a *filter directly over a supplied *compiledConfig + a
+// fresh roster (29.3 Task 6). It bypasses NewFactory so a test can set the
+// fault-delay fields on the compiledConfig literal. The roster is attached to
+// cfg.stats (armDelay increments delays_injected through it).
+func newTestFilter(t *testing.T, cfg *compiledConfig) *filter {
+	t.Helper()
+	f, _ := newTestFilterWithStats(t, cfg)
+	return f
+}
+
+func newTestFilterWithStats(t *testing.T, cfg *compiledConfig) (*filter, *mongoStats) {
+	t.Helper()
+	reg := stats.NewRegistry()
+	ms := newMongoStats(reg, cfg.statPrefix)
+	cfg.stats = ms
+	return &filter{cfg: cfg, dec: newDecoder(cfg, ms)}, ms
+}
+
+// fakeReadCBContinue is a ReadFilterCallbacks fake that records ContinueReading
+// by closing/sending on the continued channel (29.3 Task 6 — the async resume).
+// It implements the FULL ReadFilterCallbacks surface (Connection, ContinueReading,
+// DynamicMetadata, SetUpstreamCluster, plus Draining/CloseDirection — 29.3 Task 9).
+// draining/closeDir drive the two new accessors; closed/closeType record the
+// drain-close that cx_drain_close triggers (via the stub Connection below).
+type fakeReadCBContinue struct {
+	continued chan struct{}
+	dm        *dynamicmetadata.Bucket
+	draining  bool
+	closeDir  network.CloseDirection
+	closed    bool
+	closeType network.CloseType
+}
+
+func (cb *fakeReadCBContinue) Connection() network.Connection {
+	return &fakeRecordingConn{cb: cb}
+}
+func (cb *fakeReadCBContinue) ContinueReading()                         { close(cb.continued) }
+func (cb *fakeReadCBContinue) DynamicMetadata() *dynamicmetadata.Bucket { return cb.dm }
+func (cb *fakeReadCBContinue) SetUpstreamCluster(string)                {}
+func (cb *fakeReadCBContinue) Draining() bool                           { return cb.draining }
+func (cb *fakeReadCBContinue) CloseDirection() network.CloseDirection   { return cb.closeDir }
+
+// fakeRecordingConn is the stub network.Connection the fake callbacks return; it
+// records Close(closeType) on the owning callbacks so the drain-close test can
+// assert cx_drain_close → Connection().Close(FlushWrite) (29.3 Task 9).
+type fakeRecordingConn struct {
+	cb *fakeReadCBContinue
+}
+
+func (c *fakeRecordingConn) Write([]byte, bool)             {}
+func (c *fakeRecordingConn) Close(ct network.CloseType)     { c.cb.closed = true; c.cb.closeType = ct }
+func (c *fakeRecordingConn) LocalAddr() net.Addr            { return nil }
+func (c *fakeRecordingConn) RemoteAddr() net.Addr           { return nil }
+func (c *fakeRecordingConn) RequestedServerName() string    { return "" }
+func (c *fakeRecordingConn) DownstreamPrincipals() []string { return nil }
+
+// newTestFilterWithCB wires a *filter over cfg with a fake ReadFilterCallbacks
+// that records ContinueReading (the timer's async resume — 29.3 Task 6).
+func newTestFilterWithCB(t *testing.T, cfg *compiledConfig) (*filter, *mongoStats, *fakeReadCBContinue) {
+	t.Helper()
+	f, ms := newTestFilterWithStats(t, cfg)
+	cb := &fakeReadCBContinue{continued: make(chan struct{}), dm: dynamicmetadata.NewBucket()}
+	f.SetReadFilterCallbacks(cb)
+	return f, ms, cb
+}
+
+// TestFilter_DrainCloseOnEmptyListWhenDraining proves the cx_drain_close reply-
+// completion path (29.3 Task 9, SPEC §3.4): a correlated reply empties the active-
+// query list while the callbacks report Draining()==true → cx_drain_close +1 and
+// Connection().Close(FlushWrite) (the reply is flushed first; D-S29.3-7).
+func TestFilter_DrainCloseOnEmptyListWhenDraining(t *testing.T) {
+	cfg := &compiledConfig{statPrefix: "m", commands: map[string]bool{}}
+	f, ms, cb := newTestFilterWithCB(t, cfg)
+	cb.draining = true // the callbacks report Draining()==true
+	// Send a query (appends to the active-query list), then a correlated reply
+	// (responseTo=1 matches the request's requestID=1 → empties the list).
+	rbuf := &network.Buffer{}
+	rbuf.Append(msg(1, 2004, opQueryBody("db.c1", 0, simpleQuery())))
+	_ = f.OnData(rbuf, false)
+	wbuf := &network.Buffer{}
+	wbuf.Append(respMsg(99 /*reqID*/, 1 /*responseTo*/, 1 /*OP_REPLY*/, opReplyBody(0, 0)))
+	_ = f.OnWrite(wbuf, false)
+	if v := ms.counters["cx_drain_close"].Load(); v != 1 {
+		t.Errorf("cx_drain_close = %d, want 1 (list emptied while draining)", v)
+	}
+	if cb.closeType != network.FlushWrite || !cb.closed {
+		t.Errorf("expected Connection().Close(FlushWrite), got closed=%v type=%v", cb.closed, cb.closeType)
+	}
+}
+
+// TestFilter_NoDrainCloseWhenNotDraining proves cx_drain_close is gated on
+// Draining(): an identical correlated-reply-empties-the-list flow with the
+// callbacks NOT draining must neither increment nor close (29.3 Task 9).
+func TestFilter_NoDrainCloseWhenNotDraining(t *testing.T) {
+	cfg := &compiledConfig{statPrefix: "m", commands: map[string]bool{}}
+	f, ms, cb := newTestFilterWithCB(t, cfg) // cb.draining == false
+	rbuf := &network.Buffer{}
+	rbuf.Append(msg(1, 2004, opQueryBody("db.c1", 0, simpleQuery())))
+	_ = f.OnData(rbuf, false)
+	wbuf := &network.Buffer{}
+	wbuf.Append(respMsg(99, 1, 1, opReplyBody(0, 0)))
+	_ = f.OnWrite(wbuf, false)
+	if v := ms.counters["cx_drain_close"].Load(); v != 0 {
+		t.Errorf("cx_drain_close = %d, want 0 (not draining)", v)
+	}
+	if cb.closed {
+		t.Error("must not close when not draining")
+	}
+}
+
+// TestFilter_OnDestroyCloseDirectionKeyed proves the D-P4 close-direction-keyed
+// cx_destroy_* increment (29.3 Task 10, SPEC §3.5): a non-empty active-query list
+// at OnDestroy increments cx_destroy_local_with_active_rq or
+// cx_destroy_remote_with_active_rq per the chain's recorded CloseDirection; an
+// all-answered list (residual 0) increments NEITHER regardless of direction.
+func TestFilter_OnDestroyCloseDirectionKeyed(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		dir                   network.CloseDirection
+		answered              bool
+		wantLocal, wantRemote uint64
+	}{
+		{"local+active", network.CloseDirectionLocal, false, 1, 0},
+		{"remote+active", network.CloseDirectionRemote, false, 0, 1},
+		{"all-answered", network.CloseDirectionLocal, true, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &compiledConfig{statPrefix: "m", commands: map[string]bool{}}
+			f, ms, cb := newTestFilterWithCB(t, cfg)
+			cb.closeDir = tc.dir
+			rbuf := &network.Buffer{}
+			rbuf.Append(msg(1, 2004, opQueryBody("db.c1", 0, simpleQuery())))
+			_ = f.OnData(rbuf, false)
+			if tc.answered {
+				wbuf := &network.Buffer{}
+				wbuf.Append(respMsg(99, 1, 1, opReplyBody(0, 0)))
+				_ = f.OnWrite(wbuf, false)
+			}
+			f.OnDestroy()
+			if got := ms.counters["cx_destroy_local_with_active_rq"].Load(); got != tc.wantLocal {
+				t.Errorf("local = %d, want %d", got, tc.wantLocal)
+			}
+			if got := ms.counters["cx_destroy_remote_with_active_rq"].Load(); got != tc.wantRemote {
+				t.Errorf("remote = %d, want %d", got, tc.wantRemote)
+			}
+		})
+	}
+}
+
+func TestFilter_MayHaltReflectsDelayConfigured(t *testing.T) {
+	fNo := newTestFilter(t, &compiledConfig{statPrefix: "m", commands: map[string]bool{}})
+	if fNo.MayHalt() {
+		t.Error("no delay configured → MayHalt() must be false (chain stays non-haltable)")
+	}
+	fYes := newTestFilter(t, &compiledConfig{statPrefix: "m", delayConfigured: true,
+		fixedDelay: 10 * time.Millisecond, delayPercentNum: 100, commands: map[string]bool{}})
+	if !fYes.MayHalt() {
+		t.Error("delay configured → MayHalt() must be true")
+	}
+}
+
+func TestFilter_OnDataArmsDelayAndStops(t *testing.T) {
+	cfg := &compiledConfig{statPrefix: "m", delayConfigured: true, fixedDelay: 20 * time.Millisecond,
+		delayPercentNum: 100, commands: map[string]bool{}}
+	f, ms, cb := newTestFilterWithCB(t, cfg) // a fake ReadFilterCallbacks recording ContinueReading
+	buf := &network.Buffer{}
+	q := msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	buf.Append(q)
+	if got := f.OnData(buf, false); got != network.StopIteration {
+		t.Fatalf("OnData = %v, want StopIteration (delay armed)", got)
+	}
+	if v := ms.counters["delays_injected"].Load(); v != 1 {
+		t.Errorf("delays_injected = %d, want 1 (at ARM)", v)
+	}
+	// The timer fires after ~20ms → ContinueReading on the callbacks.
+	select {
+	case <-cb.continued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timer did not fire ContinueReading")
+	}
+	if f.dec.delayPending.Load() {
+		t.Error("delayPending must be cleared after the timer fires")
+	}
+}
+
+func TestFilter_OnDestroyCancelsPendingTimer(t *testing.T) {
+	cfg := &compiledConfig{statPrefix: "m", delayConfigured: true, fixedDelay: 10 * time.Second, // long
+		delayPercentNum: 100, commands: map[string]bool{}}
+	f, _, _ := newTestFilterWithCB(t, cfg)
+	buf := &network.Buffer{}
+	q := msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery()))
+	buf.Append(q)
+	_ = f.OnData(buf, false) // arms a 10s timer
+	f.OnDestroy()            // must Stop it (no panic, no leak) — race-clean w/ a firing timer
+}
+
+// TestFilter_AccessLogGatedOffNoEmit asserts that with access_log unset the sink
+// is nil and emitting is a no-op (no panic). The decoder still decodes; emit just
+// does nothing. The cb's Connection() is nil here, exercising the nil-host guard.
+func TestFilter_AccessLogGatedOffNoEmit(t *testing.T) {
+	cfg := &compiledConfig{statPrefix: "m", accessLog: "", commands: map[string]bool{}} // disabled
+	f, _, _ := newTestFilterWithCB(t, cfg)
+	if f.alSink != nil {
+		t.Fatalf("access_log unset → alSink must be nil; got %v", f.alSink)
+	}
+	buf := &network.Buffer{}
+	buf.Append(msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery())))
+	_ = f.OnData(buf, false) // must not panic; no sink → no emit
+	// A direct emit call with non-empty lines is also a no-op when alSink is nil.
+	f.emitAccessLog([]string{"OP_QUERY id=1 collection1"})
+}
+
+// TestFilter_AccessLogEmitsPerMessageBothDirections feeds a request then a reply
+// through a real temp-file sink (constructed via NewAsyncFileSinkWithFormatter)
+// and asserts at least one JSON line is written per direction after Close.
+func TestFilter_AccessLogEmitsPerMessageBothDirections(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mongo.log")
+	reg := stats.NewRegistry()
+	sink, err := accesslog.NewAsyncFileSinkWithFormatter(path, accessLogDroppedCounter(reg), accesslog.MongoFormat)
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	cfg := &compiledConfig{statPrefix: "m", accessLog: path, commands: map[string]bool{}}
+	f, _, _ := newTestFilterWithCB(t, cfg)
+	f.alSink = sink // inject the real sink (the factory does this for production)
+
+	// Request direction: one OP_QUERY.
+	rbuf := &network.Buffer{}
+	rbuf.Append(msg(1, 2004, opQueryBody("db.collection1", 0, simpleQuery())))
+	_ = f.OnData(rbuf, false)
+
+	// Response direction: one OP_REPLY correlating responseTo=1.
+	wbuf := &network.Buffer{}
+	wbuf.Append(respMsg(99, 1, 1, opReplyBody(0, 0)))
+	_ = f.OnWrite(wbuf, false)
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("want >=2 access-log lines (one per direction), got %d: %q", len(lines), string(data))
+	}
+	var sawQuery, sawReply bool
+	for _, ln := range lines {
+		if strings.Contains(ln, "OP_QUERY") {
+			sawQuery = true
+		}
+		if strings.Contains(ln, "OP_REPLY") {
+			sawReply = true
+		}
+		if !strings.Contains(ln, `"upstream_host"`) {
+			t.Errorf("line missing upstream_host: %q", ln)
+		}
+	}
+	if !sawQuery {
+		t.Errorf("no request-direction (OP_QUERY) access-log line in %q", string(data))
+	}
+	if !sawReply {
+		t.Errorf("no response-direction (OP_REPLY) access-log line in %q", string(data))
 	}
 }

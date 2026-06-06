@@ -34,10 +34,22 @@ func newReadChainConn(c net.Conn, rt *chainRuntime) *readChainConn {
 func (r *readChainConn) Read(b []byte) (int, error) {
 	n, err := r.Conn.Read(b)
 	if n > 0 {
-		r.rt.replayRead(b[:n], false)
+		parked := r.rt.replayRead(b[:n], false)
+		if parked {
+			// 29.3 post-handoff withhold (SPEC §3.1 extension 3): block the pump until
+			// the async ContinueReading releases, so the delayed request's bytes are
+			// withheld from the upstream pump until the fault delay elapses. Behind the
+			// haltable gate inside replayRead — byte-identical when no hold (R1).
+			r.rt.holdUntilResume()
+		}
 	}
 	if err != nil && errors.Is(err, io.EOF) {
 		r.rt.replayRead(nil, true)
 	}
 	return n, err
 }
+
+// SetCloseDirection lets the terminal (tcp_proxy) record which pump EOF'd first
+// onto the chain runtime (29.3, §3.5). readChainConn is the INNERMOST wrap (it
+// holds rt); the prefixConn/writeChainConn forwarding methods relay to it.
+func (r *readChainConn) SetCloseDirection(d CloseDirection) { r.rt.setCloseDirection(d) }

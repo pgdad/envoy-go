@@ -75,6 +75,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0049-mongo-requests/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0050-mongo-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0051-mongo-responses/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0052-mongo-fault-delay/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -2059,6 +2060,16 @@ const (
 	mongoMarkerUncorrelated   int32 = 7005
 )
 
+// mongoMarkerRemoteClose is the requestID the responder treats as the upstream/
+// REMOTE-close trigger (29.3 Task 11, 0052 arm 4(ii)): it reads the request frame
+// then RETURNS, closing the backend conn (the deferred c.Close()) WITHOUT writing
+// a reply → the query stays in-flight while the UPSTREAM end EOFs first. The
+// tcp_proxy pump that copies upstream→downstream returns on that EOF and records
+// CloseDirectionRemote, so the mongo OnDestroy keys cx_destroy_remote_with_active_rq.
+// Distinct from mongoMarkerWithhold, which withholds the reply but keeps the
+// backend conn OPEN (the driver then closes its own end → LOCAL).
+const mongoMarkerRemoteClose int32 = 7006
+
 // acceptMongoResponder accepts connections, counts them, and runs the
 // MongoDB-aware canned-response loop on each (the TCPMongoResponder backend —
 // 29.2 SPEC §6.1; the acceptZKResponder sibling).
@@ -2129,6 +2140,11 @@ func mongoRespondLoop(c net.Conn) {
 			switch reqID {
 			case mongoMarkerWithhold:
 				// withhold — no reply (the unanswered-query gauge arm)
+			case mongoMarkerRemoteClose:
+				// REMOTE-close (0052 arm 4(ii)): read the request, then close the
+				// backend conn (the deferred c.Close()) WITHOUT replying → the upstream
+				// end EOFs first → CloseDirectionRemote → cx_destroy_remote_with_active_rq.
+				return
 			case mongoMarkerCursorNotFound:
 				_, _ = c.Write(respFrame(reqID, 1, replyBody(mongoReplyCursorNotFound, 0, 0)))
 			case mongoMarkerQueryFailure:

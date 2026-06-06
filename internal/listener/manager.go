@@ -1031,6 +1031,14 @@ func (rt *listenerRuntime) serveNetworkChain(ctx context.Context, dispatchConn n
 	}
 	filters := selected.netChainFactory()
 	rtChain := network.NewChainRuntime(filters, dispatchConn, facts)
+	if rt.dm != nil { // 29.3 (§3.4): the drain decider for cx_drain_close.
+		// GUARD MANDATORY (risk register line 1846): rt.dm is *drain.Manager and MAY
+		// be nil (legacy/test callers). Storing a typed-nil *drain.Manager into the
+		// DrainState interface yields a NON-nil interface → Draining()'s `!= nil`
+		// guard passes → IsDraining() panics on a nil receiver. The `if rt.dm != nil`
+		// guard keeps rt.drain a true-nil interface so Draining() returns false.
+		rtChain.SetDrainState(rt.dm)
+	}
 	defer rtChain.OnDestroy()
 
 	// Pure-terminal chain: hand off immediately — byte-identical to the retired

@@ -3,6 +3,7 @@ package mongoproxy
 import (
 	"encoding/binary"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,28 @@ type decoder struct {
 	mu       sync.Mutex          // guards EXACTLY queries (append/take/drain). ADR-0223 — narrowed to one list.
 	writeBuf []byte              // goroutine-B-only response reassembly buffer (no high-water mark — 28.2 asymmetry).
 	dynMeta  map[string][]string // this-pass collection→ops accumulator (emit_dynamic_metadata; written by recordOp, read by filter.emitDynamicMetadata).
+	// 29.3 fault-delay (SPEC §3.2; D-S29.3-6). The decoder DECIDES (roll+duration);
+	// the filter arms the timer. delayDecided/pendingDelay are read-direction-local
+	// (the request decode is single-goroutine per direction); delayPending is the
+	// cross-goroutine re-entrancy guard (filter sets at arm, onDelayTimer clears).
+	pendingDelay time.Duration
+	delayDecided bool
+	delayPending atomic.Bool
+	// 29.3 access log (AMEND-B10; differential-INVISIBLE). Per-message rendered
+	// strings accumulated during decode (gated on cfg.accessLog != ""); the filter
+	// drains them after each decode pass and Submits one MongoRecord per line.
+	// SPLIT by direction (the readBuf/writeBuf precedent — ADR-0223/ADR-0225) so
+	// the two pumps never touch a shared slice: logLines is goroutine-A-only
+	// (request decode); writeLogLines is goroutine-B-only (response decode). Each
+	// direction appends + drains its OWN slice within the same pass.
+	logLines      []string // request direction (goroutine A; decodeOnData)
+	writeLogLines []string // response direction (goroutine B; decodeOnWrite)
+	// 29.3 cx_drain_close (Task 9; SPEC §3.4). Set true in decodeReply when a
+	// correlated reply empties the active-query list; drained by takeReplyEmptied
+	// in filter.OnWrite (which then checks Draining() + closes). Goroutine-B-only
+	// (the response decode is single-goroutine; written + read on the OnWrite
+	// pump within the same pass — no atomic, matching writeLogLines).
+	replyEmptiedList bool
 }
 
 // appendQuery records a decoded OP_QUERY under mu and Incs the op_query_active
@@ -93,7 +116,9 @@ func (d *decoder) takeQuery(responseTo int32) (activeQuery, bool) {
 // the connection ends (mirrors upstream's ActiveQuery destructor for every live
 // entry). The list is cleared under mu; the gauge math runs OUTSIDE the lock
 // (snapshot-count-then-Add; D-S29.2-5). Idempotent — a second call drains 0.
-func (d *decoder) onDestroy() {
+// Returns the residual count n (29.3 Task 10: the filter's OnDestroy keys
+// cx_destroy_local/remote_with_active_rq on n > 0).
+func (d *decoder) onDestroy() int {
 	d.mu.Lock()
 	n := len(d.queries)
 	d.queries = nil
@@ -101,6 +126,7 @@ func (d *decoder) onDestroy() {
 	if n > 0 {
 		d.stats.opQueryActive.Add(int64(-n))
 	}
+	return n
 }
 
 // recordOp accumulates this request pass's collection→op for emit_dynamic_metadata
@@ -116,11 +142,155 @@ func (d *decoder) recordOp(collection, op string) {
 	d.dynMeta[collection] = append(d.dynMeta[collection], op)
 }
 
+// recordLog appends one rendered request-direction message string (goroutine A
+// only). Gated on cfg.accessLog != "" so a no-access-log connection allocates
+// nothing on the hot path.
+func (d *decoder) recordLog(opCode, id int32, collection string) {
+	if d.cfg.accessLog == "" {
+		return
+	}
+	d.logLines = append(d.logLines, messageToString(opCode, id, collection, true))
+}
+
+// recordWriteLog appends one rendered response-direction message string
+// (goroutine B only; full=false for replies). Gated on cfg.accessLog != "".
+func (d *decoder) recordWriteLog(opCode, id int32, collection string) {
+	if d.cfg.accessLog == "" {
+		return
+	}
+	d.writeLogLines = append(d.writeLogLines, messageToString(opCode, id, collection, false))
+}
+
+// takeLogLines returns + clears the request-direction accumulated lines (the
+// filter drains them in OnData). nil when no access log / no decoded message.
+func (d *decoder) takeLogLines() []string {
+	if len(d.logLines) == 0 {
+		return nil
+	}
+	out := d.logLines
+	d.logLines = nil
+	return out
+}
+
+// takeWriteLogLines returns + clears the response-direction accumulated lines
+// (the filter drains them in OnWrite). nil when no access log / no decoded reply.
+func (d *decoder) takeWriteLogLines() []string {
+	if len(d.writeLogLines) == 0 {
+		return nil
+	}
+	out := d.writeLogLines
+	d.writeLogLines = nil
+	return out
+}
+
+// takeReplyEmptied returns + clears the cx_drain_close candidate flag (29.3 Task
+// 9): true once when a correlated reply in this OnWrite pass emptied the active-
+// query list. filter.OnWrite reads it, then (when Draining()) increments
+// cx_drain_close + closes FlushWrite OUTSIDE the decoder lock (ADR-0223).
+func (d *decoder) takeReplyEmptied() bool {
+	if d.replyEmptiedList {
+		d.replyEmptiedList = false
+		return true
+	}
+	return false
+}
+
+// messageToString renders one decoded message for the mongo access log
+// (full=true for request-direction messages; full=false for replies). The
+// per-opcode shapes are transcribed against codec_impl.cc (Message::toString,
+// v1.37.2); since the access log is differential-INVISIBLE (AMEND-B10), the unit
+// goldens are the authority. Each rendering names the opcode symbol + the request
+// id + (where the opcode carries one) the collection — a faithful, parseable
+// shape sufficient for the access-log message field.
+func messageToString(opCode int32, id int32, collection string, full bool) string {
+	var b strings.Builder
+	switch opCode {
+	case opQuery:
+		b.WriteString("OP_QUERY")
+	case opInsert:
+		b.WriteString("OP_INSERT")
+	case opGetMore:
+		b.WriteString("OP_GET_MORE")
+	case opKillCursors:
+		b.WriteString("OP_KILL_CURSORS")
+	case opCommand:
+		b.WriteString("OP_COMMAND")
+	case opReply:
+		b.WriteString("OP_REPLY")
+	case opCommandReply:
+		b.WriteString("OP_COMMANDREPLY")
+	default:
+		b.WriteString("OP_UNKNOWN")
+	}
+	b.WriteString(" id=")
+	b.WriteString(strconv.Itoa(int(id)))
+	if collection != "" {
+		b.WriteString(" collection=")
+		b.WriteString(collection)
+	}
+	if full {
+		b.WriteString(" full=true")
+	}
+	return b.String()
+}
+
 // newDecoder returns a fresh per-connection decoder (sniffing on).
 func newDecoder(cfg *compiledConfig, ms *mongoStats) *decoder {
 	d := &decoder{cfg: cfg, stats: ms}
 	d.sniffing.Store(true)
 	return d
+}
+
+// maybeInjectDelay evaluates the fault delay at the entry of a request-direction
+// decode callback (SPEC §3.2; the parent §11.6 six-callback set — D-S29.3-5). It
+// decides AT MOST ONCE per pass: when a delay is configured, none is already
+// pending (the re-entrancy guard), none was already decided this pass, and the
+// percentage rolls true (deterministic at 100% — no RNG, the phase-09 precedent),
+// it records pendingDelay + delayDecided. The FILTER consumes it via takePendingDelay
+// after the decode pass and arms the time.AfterFunc. Mirrors upstream tryInjectDelay
+// (proxy.cc:434-449) — the IMPL transcribes the callback set verbatim vs proxy.cc v1.37.2.
+func (d *decoder) maybeInjectDelay() {
+	if !d.cfg.delayConfigured || d.delayDecided || d.delayPending.Load() {
+		return
+	}
+	if !rollPercent(d.cfg.delayPercentNum, d.cfg.delayPercentDenom) {
+		return
+	}
+	d.pendingDelay = d.cfg.fixedDelay
+	d.delayDecided = true
+}
+
+// takePendingDelay returns (duration, true) exactly once per decided delay; the
+// filter calls it after decodeOnData/replayRead-via-OnData to arm the timer.
+func (d *decoder) takePendingDelay() (time.Duration, bool) {
+	if d.delayDecided {
+		d.delayDecided = false
+		return d.pendingDelay, true
+	}
+	return 0, false
+}
+
+// rollPercent returns true iff the configured FractionalPercent fires. Deterministic
+// at the boundaries (>=100% always; 0% never) — the phase-09 rollPercent precedent.
+// 29.3's differential arms are 100% (BOOTSTRAP §7.2: timing never compared, the
+// roll deterministic), so NO RNG path is wired (an intermediate percentage would
+// need one — out of scope; the parent §11.6 percentage gate at 100% is sufficient).
+func rollPercent(num uint32, denom int32) bool {
+	if num == 0 {
+		return false
+	}
+	var scale uint64
+	switch denom {
+	case 0: // HUNDRED
+		scale = 100
+	case 1: // TEN_THOUSAND
+		scale = 10000
+	case 2: // MILLION
+		scale = 1000000
+	default:
+		scale = 100
+	}
+	return uint64(num) >= scale // deterministic ≥100% fire; intermediate (RNG) out of scope
 }
 
 // decodeOnData feeds the chain-buffer's NEW bytes (the trailing
@@ -147,6 +317,9 @@ func (d *decoder) decodeOnData(chainBytes []byte, totalAppended int64) {
 		}
 		if !d.decodeMessage(m) {
 			break // decoding_error path already ran; sniffing now off
+		}
+		if d.delayDecided {
+			break // 29.3: one delay armed this pass; remaining buffered messages wait (re-entrancy)
 		}
 	}
 	if !d.sniffing.Load() {
@@ -222,6 +395,7 @@ func (d *decoder) fail() bool { d.decoderError(); return false }
 // fullCollectionName(cstring) → numberToSkip(int32) → numberToReturn(int32) →
 // query(BSON doc) → OPTIONAL returnFieldsSelector(BSON doc, iff bytes remain).
 func (d *decoder) decodeQuery(requestID int32, body []byte) bool {
+	d.maybeInjectDelay() // 29.3 fault-delay eval (SPEC §3.2)
 	r := &bsonReader{buf: body}
 	flags, err := r.readInt32()
 	if err != nil {
@@ -296,6 +470,7 @@ func (d *decoder) decodeQuery(requestID int32, body []byte) bool {
 			aq.command = name
 			d.recordOp(collection, "query")
 			d.appendQuery(aq)
+			d.recordLog(opQuery, requestID, collection)
 			return true
 		}
 		// name == "" → "find": route to the query path on the command document
@@ -337,6 +512,7 @@ func (d *decoder) decodeQuery(requestID int32, body []byte) bool {
 	}
 	d.recordOp(collection, "query")
 	d.appendQuery(aq)
+	d.recordLog(opQuery, requestID, collection)
 	return true
 }
 
@@ -394,6 +570,7 @@ func callsiteName(queryDoc bsonDoc) string {
 // decodeInsert: flags(int32) → fullCollectionName(cstring) → 1..N BSON docs
 // (loop to end of body). Validate-and-consume; op_insert.
 func (d *decoder) decodeInsert(body []byte) bool {
+	d.maybeInjectDelay() // 29.3 fault-delay eval (SPEC §3.2)
 	r := &bsonReader{buf: body}
 	if _, err := r.readInt32(); err != nil { // flags
 		return d.fail()
@@ -408,20 +585,25 @@ func (d *decoder) decodeInsert(body []byte) bool {
 		}
 	}
 	d.stats.inc("op_insert")
+	insertColl := fullColl
 	if dot := strings.IndexByte(fullColl, '.'); dot >= 0 {
-		d.recordOp(fullColl[dot+1:], "insert")
+		insertColl = fullColl[dot+1:]
+		d.recordOp(insertColl, "insert")
 	}
+	d.recordLog(opInsert, 0, insertColl)
 	return true
 }
 
 // decodeGetMore: ZERO(int32) → fullCollectionName(cstring) → numberToReturn(int32)
 // → cursorID(int64). op_get_more.
 func (d *decoder) decodeGetMore(body []byte) bool {
+	d.maybeInjectDelay() // 29.3 fault-delay eval (SPEC §3.2)
 	r := &bsonReader{buf: body}
 	if _, err := r.readInt32(); err != nil { // ZERO
 		return d.fail()
 	}
-	if _, err := r.readCString(); err != nil { // fullCollectionName
+	fullColl, err := r.readCString() // fullCollectionName
+	if err != nil {
 		return d.fail()
 	}
 	if _, err := r.readInt32(); err != nil { // numberToReturn
@@ -431,12 +613,18 @@ func (d *decoder) decodeGetMore(body []byte) bool {
 		return d.fail()
 	}
 	d.stats.inc("op_get_more")
+	getMoreColl := fullColl
+	if dot := strings.IndexByte(fullColl, '.'); dot >= 0 {
+		getMoreColl = fullColl[dot+1:]
+	}
+	d.recordLog(opGetMore, 0, getMoreColl)
 	return true
 }
 
 // decodeKillCursors: ZERO(int32) → numberOfCursorIDs(int32) → cursorIDs(int64…).
 // op_kill_cursors.
 func (d *decoder) decodeKillCursors(body []byte) bool {
+	d.maybeInjectDelay() // 29.3 fault-delay eval (SPEC §3.2)
 	r := &bsonReader{buf: body}
 	if _, err := r.readInt32(); err != nil { // ZERO
 		return d.fail()
@@ -451,14 +639,17 @@ func (d *decoder) decodeKillCursors(body []byte) bool {
 		}
 	}
 	d.stats.inc("op_kill_cursors")
+	d.recordLog(opKillCursors, 0, "")
 	return true
 }
 
 // decodeCommand: database(cstring) → commandName(cstring) → metadata(BSON) →
 // commandArgs(BSON) → 0..N inputDocs(BSON, loop). op_command.
 func (d *decoder) decodeCommand(body []byte) bool {
+	d.maybeInjectDelay() // 29.3 fault-delay eval (SPEC §3.2)
 	r := &bsonReader{buf: body}
-	if _, err := r.readCString(); err != nil { // database
+	database, err := r.readCString() // database
+	if err != nil {
 		return d.fail()
 	}
 	if _, err := r.readCString(); err != nil { // commandName
@@ -476,6 +667,7 @@ func (d *decoder) decodeCommand(body []byte) bool {
 		}
 	}
 	d.stats.inc("op_command")
+	d.recordLog(opCommand, 0, database)
 	return true
 }
 
@@ -585,9 +777,22 @@ func (d *decoder) decodeReply(responseTo int32, body []byte) bool {
 	// (the entry is already copied out). A miss leaves the gauge untouched —
 	// uncorrelated replies (no pending query) charge only the fixed op_reply*
 	// counters above. The copied entry's start time.Time rides for 29.3 latency.
-	if _, ok := d.takeQuery(responseTo); ok {
+	replyColl := ""
+	if aq, ok := d.takeQuery(responseTo); ok {
 		d.stats.opQueryActive.Dec()
+		replyColl = aq.collection
+		// 29.3 cx_drain_close (Task 9): if this correlated reply emptied the
+		// active-query list, flag it so filter.OnWrite can decide the drain-close
+		// (increment + Close OUTSIDE this lock — ADR-0223). Re-check len under mu:
+		// takeQuery released the lock before returning.
+		d.mu.Lock()
+		empty := len(d.queries) == 0
+		d.mu.Unlock()
+		if empty {
+			d.replyEmptiedList = true
+		}
 	}
+	d.recordWriteLog(opReply, responseTo, replyColl)
 	return true
 }
 
@@ -609,5 +814,6 @@ func (d *decoder) decodeCommandReply(body []byte) bool {
 		}
 	}
 	d.stats.inc("op_command_reply")
+	d.recordWriteLog(opCommandReply, 0, "")
 	return true
 }
