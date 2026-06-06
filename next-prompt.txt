@@ -1,6 +1,6 @@
 START a fresh cold-start session for envoy-go — **phase 30 (`pin-refresh-envoy-contrib`) SPEC is DONE + landed**: the SPEC.md + README.md landed (`docs/envoy-go/phases/30-pin-refresh-envoy-contrib/`), the BRAINSTORM §6 D30-1..D30-6 empirical pins were EXECUTED in-session, the ADR-0227 §Context was anchored (DECISIONS tail advanced ADR-0226 → ADR-0227, superseding ADR-0008), ROADMAP row 30 stayed `in-progress` with its stale BRAINSTORM-time image string corrected, STATE/next-prompt advanced, spec-document-reviewer APPROVED, squash-merged + pushed. The next lifecycle step (SKILL_ROUTING state 2: phase in ROADMAP, SPEC.md exists, PLAN.md does NOT → `superpowers:writing-plans` → output PLAN.md) is the **phase-30 PLAN**.
 
-The phase-30 SPEC landed at the **30-SPEC squash `<fill the live SHA via git log --oneline -1 after this lands>`**; a docs-only SHA-fill follow-up may trail it (confirm via `git log --oneline -1`). Substantive predecessor on master: the phase-30 BRAINSTORM squash `e2d566a`; before that the phase-29.3 IMPL squash `d671263` (phase 29 CLOSED). origin/master in sync after push.
+The phase-30 SPEC landed at the **30-SPEC squash `3a0207b`**; a docs-only SHA-fill follow-up trails it (confirm the live tip via `git log --oneline -1`). Substantive predecessor on master: the phase-30 BRAINSTORM squash `e2d566a`; before that the phase-29.3 IMPL squash `d671263` (phase 29 CLOSED). origin/master in sync after push.
 
 ## What phase 30 IS (read the SPEC + BRAINSTORM first)
 
