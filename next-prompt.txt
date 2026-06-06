@@ -1,41 +1,52 @@
-START a fresh cold-start session for envoy-go — **phase 30 (`pin-refresh-envoy-contrib`) BRAINSTORM is DONE + landed**: the BRAINSTORM.md landed (`docs/envoy-go/phases/30-pin-refresh-envoy-contrib/BRAINSTORM.md`), ROADMAP row 30 registered `in-progress` (a FLAT INFRASTRUCTURE row — NOT a §9 family row), STATE/next-prompt advanced, squash-merged + pushed. The next lifecycle step (SKILL_ROUTING state 1: phase in ROADMAP, directory + BRAINSTORM exist, SPEC.md does NOT → `superpowers:writing-plans` scoped to SPEC authoring → output SPEC.md) is the **phase-30 SPEC**.
+START a fresh cold-start session for envoy-go — **phase 30 (`pin-refresh-envoy-contrib`) SPEC is DONE + landed**: the SPEC.md + README.md landed (`docs/envoy-go/phases/30-pin-refresh-envoy-contrib/`), the BRAINSTORM §6 D30-1..D30-6 empirical pins were EXECUTED in-session, the ADR-0227 §Context was anchored (DECISIONS tail advanced ADR-0226 → ADR-0227, superseding ADR-0008), ROADMAP row 30 stayed `in-progress` with its stale BRAINSTORM-time image string corrected, STATE/next-prompt advanced, spec-document-reviewer APPROVED, squash-merged + pushed. The next lifecycle step (SKILL_ROUTING state 2: phase in ROADMAP, SPEC.md exists, PLAN.md does NOT → `superpowers:writing-plans` → output PLAN.md) is the **phase-30 PLAN**.
 
-The phase-30 BRAINSTORM landed at the **30-BRAINSTORM squash `e2d566a`**; the docs-only SHA-fill follow-up `b0f6ca3` is the named live tip (this naming commit may trail it by one; confirm via `git log --oneline -1`). Substantive predecessor on master: the phase-29.3 IMPL squash `d671263` (phase 29 CLOSED). origin/master in sync after push.
+The phase-30 SPEC landed at the **30-SPEC squash `<fill the live SHA via git log --oneline -1 after this lands>`**; a docs-only SHA-fill follow-up may trail it (confirm via `git log --oneline -1`). Substantive predecessor on master: the phase-30 BRAINSTORM squash `e2d566a`; before that the phase-29.3 IMPL squash `d671263` (phase 29 CLOSED). origin/master in sync after push.
 
-## What phase 30 IS (read the BRAINSTORM first)
+## What phase 30 IS (read the SPEC + BRAINSTORM first)
 
-Phase 30 is a **pure reference-image pin-refresh** — the project's FIRST since ADR-0008. It swaps the SHA-pinned differential reference image `envoyproxy/envoy:v1.37.2` → `envoyproxy/envoy-contrib:v1.37.2` (same upstream version, the contrib **variant**), re-baselines all **54** existing differential fixtures byte-identical-PASS against the new image, and supersedes ADR-0008 with **ADR-0227**. It ships **ZERO production LoC, ZERO new go.mod deps, ZERO new package/stat/fixture/fuzzer/BackendKind**; NO split (~4–6 tasks). It is the dedicated re-baselining phase mandated by `ENVOY_TARGET.md` doctrine **D-3.7**.
+Phase 30 is a **pure reference-image pin-refresh** — the project's FIRST since ADR-0008. It swaps the SHA-pinned differential reference image `envoyproxy/envoy:v1.37.2` → **`envoyproxy/envoy:contrib-v1.37.2`** (same upstream version, the contrib **variant**), re-baselines all **54** existing differential fixtures byte-identical-PASS against the new image, and supersedes ADR-0008 with **ADR-0227**. It ships **ZERO production LoC, ZERO new go.mod deps, ZERO new package/stat/fixture/fuzzer/BackendKind**; NO split (~4–6 tasks). It is the dedicated re-baselining phase mandated by `ENVOY_TARGET.md` doctrine **D-3.7**.
 
-**Why:** unblock the next §9 subject `kafka_broker` (the phase-30 BRAINSTORM Q0 selection from {redis/kafka_broker/thrift}) — a contrib-only Envoy extension absent from the standard reference image, whose canonical v3 proto (`envoy.extensions.filters.network.kafka_broker.v3.KafkaBroker`) lives in the `github.com/envoyproxy/go-control-plane/contrib` module the project does not yet depend on. The `/contrib v1.32.4` dep + all kafka_broker work are **phase 31** (the §9 row proper, its own brainstorm). Phase 30 only unblocks it.
+**CRITICAL — the corrected image identity (SPEC D30-1 / AMEND-D30):** the BRAINSTORM assumed the contrib image is `envoyproxy/envoy-contrib:v1.37.2` (a separate repo). That was WRONG — that repo's release line stops at v1.35.0 (no v1.37.x tag). The real contrib image for v1.37.2 is **`envoyproxy/envoy:contrib-v1.37.2`** (a `contrib-`-prefixed tag in the standard `envoyproxy/envoy` repo) @ **`sha256:7edd5b0fd763d32c3dfcfd0061f9c2ea63eebd8cdf7f88d974d3adfc99453be8`** (299 MB vs the standard 263 MB). The PLAN + IMPL use THIS image identity.
 
-## What this session does — author the phase-30 SPEC
+**Why:** unblock the next §9 subject `kafka_broker` (phase 31) — a contrib-only Envoy extension absent from the standard reference image, whose canonical v3 proto lives in the `github.com/envoyproxy/go-control-plane/contrib` module the project does not yet depend on. The `/contrib v1.32.4` dep + all kafka_broker work are **phase 31** (its own brainstorm). Phase 30 only swaps the image.
 
-Per `feedback_execution_style` + SKILL_ROUTING, run `superpowers:writing-plans` scoped to SPEC authoring. Author `docs/envoy-go/phases/30-pin-refresh-envoy-contrib/SPEC.md` (+ README per the §9 SPEC precedent) from the BRAINSTORM, executing the §6 D30-1..D30-6 empirical pins IN-SESSION:
+## What the SPEC already settled (do NOT re-run the empirical pins unless re-verifying)
 
-1. **D30-1** (BLOCKING) — confirm `envoyproxy/envoy-contrib:v1.37.2` is a published tag, `docker pull` it, and capture its `sha256:` digest via `docker inspect --format='{{index .RepoDigests 0}}'` (the value for `ENVOY_TARGET.md` `**SHA256:**`). (Per AWS/Docker auth in CLAUDE.md if a registry login is needed.)
-2. **D30-2** — run the FULL 54-fixture differential suite against the contrib image; confirm byte-identical PASS (`-count=1`). Investigate + classify any divergence per D-3.7 step 3 (envoy-go fix vs a BEHAVIOR_CONTRACT extension + ADR).
-3. **D30-3** — confirm conformance unaffected (h2spec 53/53, proxy-wasm 10/10 — image-independent; they exercise the envoy-go subject, not the reference container).
-4. **D30-4** — pin the exact `BEHAVIOR_CONTRACT.md` current-pin lines to update (`grep` the live digest `c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`; edit only the current-pin lines, NOT the frozen historical references).
-5. **D30-5** — confirm the `harness_test.go` `v1.34.0` parser sample needs no change (it tests the parser, not the live pin) + that no other code hardcodes the live tag/digest.
-6. **D30-6** — the ADR-0227 supersession wording vs ADR-0008 + the `ENVOY_TARGET.md` refresh-procedure step-by-step compliance record.
+- **D30-1 (BLOCKING):** image identity corrected to `envoyproxy/envoy:contrib-v1.37.2`; digest `sha256:7edd5b0f…` captured (the value for `ENVOY_TARGET.md` `**SHA256:**`). The image is already pulled locally.
+- **D30-2:** the FULL 54-fixture differential suite re-baselined byte-identical-PASS (`go test ./test/differential/... -count=1`, EXIT=0, ZERO divergence — contrib is a behavioral superset) against the contrib image. The PLAN's T3 is the authoritative IMPL re-run on the landing-branch pin.
+- **D30-3:** conformance image-INDEPENDENT (grep: `test/conformance/` never references the pin) + green (h2spec 53/53, proxy-wasm 10/10).
+- **D30-4:** two `BEHAVIOR_CONTRACT.md` current-pin lines to update at IMPL (728, 804 — the `### Applies to` `ENVOY_TARGET pin` bullets); one FROZEN (548 — the phase-06.2 access-log empirical-evidence provenance block).
+- **D30-5:** `harness_test.go`'s `v1.34.0` parser sample stays as-is; `ENVOY_TARGET.md` is the SOLE runtime-load-bearing pin site.
+- **D30-6:** ADR-0227 §Context anchored (supersedes ADR-0008); §Decision/§Consequences body lands at IMPL per ADR-0044.
 
-The only runtime-load-bearing edit is `docs/envoy-go/ENVOY_TARGET.md` (`test/differential/harness.go::parseEnvoyTarget` reads `**Tag:**`/`**SHA256:**`; `StartReferenceProxy` boots `pin.SHA256`). ADR-0227 §Context draft lands at the SPEC; §Decision/§Consequences body at the phase-30 IMPL per ADR-0044.
+## What this session does — author the phase-30 PLAN
+
+Per `feedback_execution_style` + SKILL_ROUTING, run `superpowers:writing-plans`. Author `docs/envoy-go/phases/30-pin-refresh-envoy-contrib/PLAN.md` from the SPEC §10 task spine — bite-sized tasks (this is a zero-production-LoC phase → no TDD red/green; the "test" is the gate run):
+
+1. **T1 — Baselines/anchors gate.** Verify master-tip counts (54/39/360/BackendKind-30/DECISIONS tail ADR-0227-§Context) + the contrib image present locally (`docker inspect --format='{{index .RepoDigests 0}}' envoyproxy/envoy:contrib-v1.37.2` == `sha256:7edd5b0f…`) + a clean six-gate on the UNCHANGED standard pin as the regression baseline.
+2. **T2 — Flip `ENVOY_TARGET.md`.** `**Tag:**` → `envoyproxy/envoy:contrib-v1.37.2`; `**SHA256:**` → `envoyproxy/envoy@sha256:7edd5b0fd763d32c3dfcfd0061f9c2ea63eebd8cdf7f88d974d3adfc99453be8`; `**Pinned in:**` → ADR-0227; `**Last verified:**` → the IMPL date. (Release-notes URL UNCHANGED — same version.)
+3. **T3 — Re-baseline the 54-fixture differential suite.** `go test ./test/differential/... -count=1` against the flipped pin → byte-identical PASS (the authoritative re-run; SPEC §5.2 is the advance evidence). Classify any divergence per SPEC §5.4 (D-3.7 step 3).
+4. **T4 — Conformance sanity.** h2spec 53/53 + proxy-wasm 10/10 (image-independent — SPEC §5.3).
+5. **T5 — ADR-0227 body + `BEHAVIOR_CONTRACT.md` pin lines.** Land the ADR-0227 §Decision/§Consequences body in place; update the two current-pin lines (728, 804 → contrib digest + ADR-0227; leave 548 frozen) + add the BEHAVIOR_CONTRACT 30 note.
+6. **T6 — Completion bundle.** The six-gate (`go build`/`go vet`/`golangci-lint`/`go test -race -short`/the full differential/conformance) GREEN LIVE; STATE/ROADMAP advance (row 30 `in-progress → done` — NO parent rollup, flat infra row); next-prompt rewrite for the **phase-31 `kafka_broker` BRAINSTORM** cold-start; PROGRESS.md.
+
+Apply ADR-0045 split-gate at the end (0 production LoC / ~4–6 tasks → NO split). Dispatch a plan-document-reviewer per the writing-plans review loop. Work in a git worktree (`feedback_git_worktrees`); subagent-driven (`feedback_execution_style`); subagents commit local-only (`feedback_subagents_no_push`); controller squash-merges + pushes at stage-close (`feedback_push_to_origin`).
 
 ## Read first (in order)
 
-1. THIS FILE — the phase-30 SPEC cold-start.
-2. `docs/envoy-go/phases/30-pin-refresh-envoy-contrib/BRAINSTORM.md` — the full phase-30 design (the 4-question dialogue; the 3 kafka_broker blockers §2.1; the change-surface inventory §3; the phase-31 kafka_broker forward-pointer §4; the D30-1..D30-6 pins §6).
-3. `docs/envoy-go/STATE.md` — active-phase `phase 30 BRAINSTORM done`; next-skill phase-30 SPEC; next-free `ADR-0227` (reserved for phase 30).
-4. `docs/envoy-go/ROADMAP.md` — row 30 `in-progress` (flat infra row); the §9 family heading (kafka_broker SELECTED via the phase-30→31 path).
-5. `docs/envoy-go/ENVOY_TARGET.md` — the current pin (`envoyproxy/envoy:v1.37.2` @ `sha256:c5e8a68e…`, ADR-0008) + the §"Refresh procedure" (the D-3.7 6-step recipe phase 30 executes) + doctrine D-3.7.
-6. `test/differential/harness.go` (`EnvoyPin`/`parseEnvoyTarget`/`StartReferenceProxy`) + `test/differential/harness_test.go` (the `v1.34.0` parser sample — leave-as-is).
-7. `docs/envoy-go/DECISIONS.md` ADR-0008 (the pin being superseded) + ADR-0044 (ADR-on-impl) + ADR-0045 (split-gate) + ADR-0106 (family-row convention).
-8. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + subagents-no-push + the docker-probe-bridge-network lesson (`reference_docker_probe_bridge_network` — Docker Desktop `--network host` is useless; live probes need a shared bridge network) + the differential break-protocol `-count=1`.
+1. THIS FILE — the phase-30 PLAN cold-start.
+2. `docs/envoy-go/phases/30-pin-refresh-envoy-contrib/SPEC.md` — the authoritative design (§1.2 AMEND-D30; §3 change surface; §5 the empirical re-baseline; §6 ADR-0227; §7 the contract pin lines; §9 the refresh-procedure compliance; §10 the task spine).
+3. `docs/envoy-go/phases/30-pin-refresh-envoy-contrib/README.md` + `BRAINSTORM.md`.
+4. `docs/envoy-go/STATE.md` — active-phase `phase 30 SPEC done`; next-skill phase-30 PLAN.
+5. `docs/envoy-go/ENVOY_TARGET.md` — the current pin (ADR-0008) + the §"Refresh procedure" (the D-3.7 6-step recipe the IMPL executes — the SPEC §9 maps each step) + doctrine D-3.7. NOTE: on master this STILL carries the standard `envoyproxy/envoy:v1.37.2` @ `c5e8a68e…` pin — the flip is the IMPL's T2.
+6. `test/differential/harness.go` (`EnvoyPin`/`parseEnvoyTarget`/`StartReferenceProxy` — `pin.SHA256` is the booted image) + `test/differential/harness_test.go` (the `v1.34.0` parser sample — leave-as-is).
+7. `docs/envoy-go/DECISIONS.md` ADR-0227 §Context (just anchored) + ADR-0008 (superseded) + ADR-0044 (ADR-on-impl) + ADR-0045 (split-gate) + ADR-0052 (atomic six-gate).
+8. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — execution-style + worktree + push + subagents-no-push + the docker-probe-bridge-network lesson + the differential break-protocol `-count=1`.
 
-## Counts at master tip (phase 30 BRAINSTORM done — UNCHANGED by phase 30)
+## Counts at master tip (phase 30 SPEC done — UNCHANGED by phase 30)
 
-- stat surface **360**; differential fixtures **54** (tail `0052-mongo-fault-delay`); fuzzers **39**; BackendKind tail **30** (`TCPMongoResponder`); DECISIONS.md tail **ADR-0226** (ADR-0227 reserved for phase 30; next-free after ≈ ADR-0228).
+- stat surface **360**; differential fixtures **54** (tail `0052-mongo-fault-delay`); fuzzers **39**; BackendKind tail **30** (`TCPMongoResponder`); DECISIONS.md tail **ADR-0227** (§Context anchored at this SPEC; next-free **ADR-0228**).
 - conformance h2spec 53/53 + proxy-wasm 10/10.
-- reference pin: `envoyproxy/envoy:v1.37.2` @ `sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` (ADR-0008) → phase 30 swaps to `envoyproxy/envoy-contrib:v1.37.2` @ `<captured at phase-30 IMPL>` (ADR-0227).
-- Toolchain: Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); go-control-plane `/envoy` v1.32.4 (ADR-0008); `/contrib` v1.32.4 confirmed resolvable (phase-31 dep).
+- reference pin on master: `envoyproxy/envoy:v1.37.2` @ `sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd` (ADR-0008) → phase-30 IMPL swaps to `envoyproxy/envoy:contrib-v1.37.2` @ `sha256:7edd5b0fd763d32c3dfcfd0061f9c2ea63eebd8cdf7f88d974d3adfc99453be8` (ADR-0227).
+- Toolchain: Go 1.26.2; golangci-lint 1.64.8 (ADR-0009); go-control-plane `/envoy` v1.32.4 (ADR-0008); `/contrib` v1.32.4 confirmed resolvable (phase-31 dep, NOT added at phase 30).
 - §9 Network-filters family: rows 26/27/28/29 DONE; 3 candidates remain (`redis`/`kafka_broker`/`thrift`); **kafka_broker SELECTED**, landing via phase 30 (pin-refresh, in-progress) → phase 31 (the filter).
