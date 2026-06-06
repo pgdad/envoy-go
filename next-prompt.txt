@@ -1,6 +1,6 @@
 START a fresh cold-start session for envoy-go — **phase 30 (`pin-refresh-envoy-contrib`) BRAINSTORM is DONE + landed**: the BRAINSTORM.md landed (`docs/envoy-go/phases/30-pin-refresh-envoy-contrib/BRAINSTORM.md`), ROADMAP row 30 registered `in-progress` (a FLAT INFRASTRUCTURE row — NOT a §9 family row), STATE/next-prompt advanced, squash-merged + pushed. The next lifecycle step (SKILL_ROUTING state 1: phase in ROADMAP, directory + BRAINSTORM exist, SPEC.md does NOT → `superpowers:writing-plans` scoped to SPEC authoring → output SPEC.md) is the **phase-30 SPEC**.
 
-The phase-30 BRAINSTORM landed at the **30-BRAINSTORM squash `TBD-30-BRAINSTORM-SQUASH`** (fill the live SHA via `git log --oneline -1` after the docs-only SHA-fill follow-up; a further docs-only commit may trail). Substantive predecessor on master: the phase-29.3 IMPL squash `d671263` (phase 29 CLOSED). origin/master in sync after push.
+The phase-30 BRAINSTORM landed at the **30-BRAINSTORM squash `e2d566a`** (the docs-only SHA-fill follow-up trails it; confirm the live tip via `git log --oneline -1`). Substantive predecessor on master: the phase-29.3 IMPL squash `d671263` (phase 29 CLOSED). origin/master in sync after push.
 
 ## What phase 30 IS (read the BRAINSTORM first)
 
