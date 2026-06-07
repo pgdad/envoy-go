@@ -1,11 +1,11 @@
 # envoy-go Reference Envoy Pin
 
-**Tag:** `envoyproxy/envoy:v1.37.2`
-**SHA256:** `envoyproxy/envoy@sha256:c5e8a68e52f4d4697a9adb280dbe415d77fedf1257e183dcb86205bd438f18bd`
+**Tag:** `envoyproxy/envoy:contrib-v1.37.2`
+**SHA256:** `envoyproxy/envoy@sha256:7edd5b0fd763d32c3dfcfd0061f9c2ea63eebd8cdf7f88d974d3adfc99453be8`
 **Upstream release notes:** https://www.envoyproxy.io/docs/envoy/v1.37.2/version_history/v1.37/v1.37.2
 **Envoy proto major version:** `v3`
-**Pinned in:** ADR-0008
-**Last verified:** 2026-04-21
+**Pinned in:** ADR-0227 (supersedes ADR-0008)
+**Last verified:** 2026-06-07
 
 ## Refresh procedure
 
