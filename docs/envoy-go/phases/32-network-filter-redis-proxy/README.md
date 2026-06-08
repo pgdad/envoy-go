@@ -1,0 +1,37 @@
+# Phase 32 — `network-filter-redis-proxy`
+
+**Status:** BRAINSTORM complete (lifecycle-state 0 → 1 at this commit; ready for the phase-32 **parent SPEC** authoring per `superpowers:writing-plans`). SPEC / PLAN / PROGRESS artifacts still pending; land at subsequent lifecycle states (parent SPEC, then the per-sub-phase 32.1 / 32.2 SPEC → PLAN → IMPL cycles).
+
+**What this phase is.** Phase 32 is the **SIXTH §9 Network-filters-family row** (a parent pre-split row per ADR-0106(d) — the family flat-row discipline preserves ADR-0045's split-gate WITHIN a single filter-row; ROADMAP parent row 32 + sub-rows 32.1/32.2, depends-on 31). It lands `envoy.filters.network.redis_proxy` (proto `envoy.extensions.filters.network.redis_proxy.v3.RedisProxy`, anticipated in the EXISTING `/envoy v1.32.4` module — CORE, not `/contrib`; pinned at SPEC D32-1) — the project's **FIRST terminal routing proxy** in a NEW `internal/filter/network/redisproxy/` package (the 10th network-filter built-in). Unlike every prior §9 row (echo/sni_cluster/zookeeper_proxy/mongo_proxy/kafka_broker — observational sniffers on a `[filter, tcp_proxy]` chain), redis_proxy IS the connection terminator: it parses RESP, routes commands to an upstream cluster, and pools/pipelines upstream connections itself. It lands the framework's **SIXTH structural extension** — the upstream connection-pool / cluster-routing seam (32.1; ADR-0230).
+
+**The envelope (BRAINSTORM Q1).** A SINGLE-ROUTE-TERMINAL MVP: the RESP codec (simple-string `+` / error `-` / integer `:` / bulk-string `$` / array `*` + inline commands) + `catch_all_route` to ONE upstream cluster + a basic per-host upstream connection pool with FIFO/positional request↔reply correlation (RESP carries no correlation id) + the core single-key command set + per-command/downstream/upstream stats under `redis.<stat_prefix>.`. DEFERRED (parse-accept-vs-reject per field, pinned at SPEC): `prefix_routes` multi-cluster routing beyond catch_all, hash-ring sharding + `enable_redirection` (MOVED/ASK), multi-key fragmentation (MGET/MSET/DEL), `downstream_auth_*`/`external_auth_provider`, `faults`, request mirroring, replica `read_policy`, `custom_commands`, the full `ConnPoolSettings` surface. Histograms deferred project-wide (ADR-0060).
+
+**The split (BRAINSTORM Q-split).** A 2-way FEATURE-PROGRESSIVE pre-split (the project's SIXTH BRAINSTORM-time pre-split after 22/25/26/28/29), seam-first:
+
+- **32.1** (`network-filter-redis-upstream-pool-seam-and-codec`) — the upstream connection-pool / cluster-routing FRAMEWORK SEAM (ADR-0230) + the RESP codec + the `redisproxy` package foundation (TypeURL, config parse, the `TerminalFilter.Handle` round-trip pump) + the 10th built-in + the `TCPRedisResponder` BackendKind + a minimal `catch_all` single-command round-trip proven end-to-end via the `0055-redis-roundtrip` cross-side fixture (+ `0056-redis-boot-reject` if pinned there).
+- **32.2** (`network-filter-redis-commands-and-stats`) — the full single-route command set + the per-command/downstream/upstream stat roster + the `redis.` Prometheus arm + the differential command matrix (extends `0055`) + the 41st fuzzer `FuzzRESPDecode` + the parent-row-32 ROLLUP + the six-gate.
+
+Anticipated ~1200–2000 production LoC / ~22–32 tasks as a single phase → the ADR-0045 LoC leg trips; the seam-first discipline (28.1a/28.1b/29.3 precedents) confirms the split. Each sub-phase re-checks the gate at its own PLAN.
+
+**Masters (read first, in order):**
+
+1. [`./BRAINSTORM.md`](./BRAINSTORM.md) — **the phase-32 charter.** The Q0/Q1/Q-split/Q-pool-seam decisions (§2); the framework-survey (§3 — the new upstream-pool seam + the redisproxy package + zero new deps); the stat-surface hypothesis (§5); the fixture envelope (§6 — `0055`/`0056` + the `TCPRedisResponder` + downstream-response byte-equivalence as a NEW proof prong); the anticipated ADR-0229 + ADR-0230 (§7); the deferred items (§8); the §10 D32-1..D32-8 empirical pins the SPEC executes.
+2. `./SPEC.md` *(pending — the parent SPEC authoring is the next session)* — will formalize the 2-way split surface-mapping + execute the D32-1..D32-8 empirical pins IN-SESSION against the contrib reference Envoy + anchor the ADR-0229 §Context.
+3. [`../../ENVOY_TARGET.md`](../../ENVOY_TARGET.md) — the current pin (`envoyproxy/envoy:contrib-v1.37.2` @ `sha256:7edd5b0f…`, ADR-0227) — the reference image the cross-side differential boots.
+4. `docs/envoy-go/DECISIONS.md` — ADR-0106 (§9 flat-row discipline + (d) the in-row split-gate) + ADR-0045 (split-gate) + ADR-0219 (the upstream-cluster-override seam, the nearest routing precedent) + ADR-0223 (per-connection mutex) + ADR-0060 (histograms deferred) + ADR-0044 (ADR §-body timing) + ADR-0227 (the contrib pin). ADR-0229 (redis_proxy filter) + ADR-0230 (the upstream-pool seam) anchor at the SPECs.
+5. `internal/filter/network/kafkabroker/` + `internal/filter/network/mongoproxy/` (the §9-package-shape precedents for `redisproxy`) + `internal/filter/tcpproxy/` + `internal/cluster/` (the terminal-filter + cluster-dial precedents the upstream-pool seam builds on) + `internal/stats/name.go` (the tag-extractor arm pattern for the new `redis.` arm).
+
+**Scope at phase 32** (per the BRAINSTORM + ROADMAP rows 32/32.1/32.2):
+
+- (a) The **upstream connection-pool / cluster-routing framework seam** in `internal/filter/network/` (32.1; ADR-0230) — resolve a cluster host via `cluster.Manager`, dial (the existing TCP dial path), pool per host, FIFO request↔reply pipelining; redis-scoped.
+- (b) The **`internal/filter/network/redisproxy/` package** — TypeURL via `proto.MessageName`; config parse (`stat_prefix` + `settings` subset + `prefix_routes.catch_all_route.cluster`; rest parse-accept/reject per D32-4); the RESP codec (`resp.go`); the `TerminalFilter.Handle` command→reply pump; per-command/downstream/upstream counters.
+- (c) **Registration** as the 10th built-in + the `redis_proxy/v3` blank-import in `bootstrap.go` (anticipated ZERO new go.mod dep — `/envoy` core).
+- (d) The **`redis.` Prometheus arm** in `internal/stats/name.go` (32.2).
+- (e) **Differential fixtures** `0055-redis-roundtrip` (cross-side; downstream-response byte-equivalence + `StatsAsserter`) + `0056-redis-boot-reject`; a NEW BackendKind (the synthesized `TCPRedisResponder`, anticipated value 32); the 41st fuzzer `FuzzRESPDecode`.
+- (f) **ADR-0229 + ADR-0230** + the BEHAVIOR_CONTRACT 32.1/32.2 bundles + STATE/ROADMAP advance + the parent-row-32 ROLLUP at 32.2 + the six-gate at each IMPL.
+
+**Counts (advance at the IMPL sub-phases; UNCHANGED at this BRAINSTORM):** fixtures 56 → 57–58; fuzzers 40 → 41; stat surface 536 → 536 + roster (SPEC pins); BackendKind tail 31 → 32; DECISIONS.md tail ADR-0228 → ADR-0229/0230 (anchored at the SPECs; next-free after phase 32 ≈ ADR-0231). ONE new framework-seam extension (the upstream connection-pool — the SIXTH structural extension).
+
+**Predecessor:** Phase 31 CLOSED (the `kafka_broker` §9 row; ADR-0228; stat surface 536; fixtures 56; the FIFTH §9 row).
+
+**Successor:** the last §9 candidate {thrift} (a terminal-proxy surface — transport×protocol matrix + method-routing + a nested thrift-filter sub-chain — reusing the 32.1 upstream-pool seam; its own future brainstorm). After phase 32 phase-done the §9 candidate count drops 2 → 1.
