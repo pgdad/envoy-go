@@ -76,6 +76,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0050-mongo-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0051-mongo-responses/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0052-mongo-fault-delay/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0053-kafka-requests/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0054-kafka-boot-reject/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -869,6 +871,18 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptMongoResponder(ln, bo.accepts)
+		case fixture.TCPKafkaResponder:
+			// Kafka-aware canned responder (SPEC §8.3): correlation-id-echoing
+			// response frames (4-byte BE length + INT32 correlation_id + per-api_key
+			// body) so the reference's response-side decoder fires + correlates.
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptKafkaResponder(ln, bo.accepts)
 		}
 		backends[i] = bo
 	}
@@ -2191,4 +2205,191 @@ func mongoReqFrame(reqID, opCode int32, fullColl string) []byte {
 	out = append(out, le32(0)...)      // responseTo
 	out = append(out, le32(opCode)...) // opCode
 	return append(out, body...)
+}
+
+// kafkaMarkerUncorrelated is the correlation_id the Kafka responder treats as the
+// unregistered-correlation trigger (SPEC §8.3): instead of echoing the request's
+// correlation_id it emits a response whose correlation_id was NEVER sent
+// (correlation_id+50000) → the subject's + reference's response-side correlation
+// recover MISSES → response.failure on BOTH sides (the unregistered arm). A high
+// sentinel the driver assigns so both sides see identical wire bytes
+// (reference_wire_format_both_sides_see_same_bytes). The mongoMarkerUncorrelated
+// (runner_test.go) precedent.
+const kafkaMarkerUncorrelated int32 = 0x6BAD0000
+
+// kafkaMarkerNoReply is the correlation_id the Kafka responder treats as the
+// suppress-the-reply trigger (Task 13): the responder reads the full request frame
+// (so the request-side decoder on both proxies fires) but writes NO response. This
+// lets a fixture isolate the RESPONSE side to specific arms — request-only arms use
+// this marker so no echoed response traverses the chain to perturb the response
+// counters (the divergence-free request-arm construction). A high sentinel distinct
+// from kafkaMarkerUncorrelated.
+const kafkaMarkerNoReply int32 = 0x6BAD0001
+
+// acceptKafkaResponder accepts connections, counts them, and runs the Kafka-aware
+// canned-response loop on each (the TCPKafkaResponder backend — SPEC §8.3; the
+// acceptMongoResponder sibling).
+func acceptKafkaResponder(ln net.Listener, counter *atomic.Uint64) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		counter.Add(1)
+		go kafkaRespondLoop(c)
+	}
+}
+
+// kafkaRespondLoop reads complete request frames (4-byte BE INT32 length prefix +
+// frame) and writes correlation-id-echoing canned responses until the client
+// closes. It parses ONLY api_key + api_version + correlation_id (the request
+// header's leading 8 bytes); it is NOT a Kafka broker. The response body is a
+// minimal per-api_key shape the reference can decode (kafkaResponseBody) — the
+// exact bytes are live-verified at Task 13.
+func kafkaRespondLoop(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	beI16 := func(v int16) []byte {
+		b := make([]byte, 2)
+		binary.BigEndian.PutUint16(b, uint16(v))
+		return b
+	}
+	beI32 := func(v int32) []byte {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b
+	}
+	for {
+		var lenPfx [4]byte
+		if _, err := io.ReadFull(c, lenPfx[:]); err != nil {
+			return // client closed / EOF
+		}
+		n := int32(binary.BigEndian.Uint32(lenPfx[:]))
+		if n < 8 || n > 1<<20 {
+			return // malformed / hostile (need ≥ api_key+api_version+correlation_id)
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(c, body); err != nil {
+			return
+		}
+		apiKey := int16(binary.BigEndian.Uint16(body[0:2]))
+		apiVersion := int16(binary.BigEndian.Uint16(body[2:4]))
+		correlationID := int32(binary.BigEndian.Uint32(body[4:8]))
+
+		if correlationID == kafkaMarkerNoReply {
+			// suppress the reply entirely (request-only arms): read the request so the
+			// request-side decoder fires, but write NOTHING so no response perturbs the
+			// response counters. Continue reading further frames (the loop).
+			continue
+		}
+		respCorrelation := correlationID
+		if correlationID == kafkaMarkerUncorrelated {
+			// emit a response whose correlation_id was NEVER sent → response.failure
+			respCorrelation = correlationID + 50000
+		}
+		// respPayload = correlation_id INT32 ++ per-api_key body (NO response-header
+		// tagged fields — non-flexible headers, and ALWAYS for ApiVersions per
+		// AMEND-K5). out = 4-byte BE length of respPayload ++ respPayload.
+		respPayload := append(beI32(respCorrelation), kafkaResponseBody(apiKey, apiVersion, beI16, beI32)...)
+		out := append(beI32(int32(len(respPayload))), respPayload...)
+		_, _ = c.Write(out)
+	}
+}
+
+// kafkaResponseBody returns a minimal valid response BODY (after the
+// correlation_id; the response header carries no tagged fields here) for the
+// given api_key/api_version. Task 13 live-verifies and may refine these per key
+// against the reference decoder. Keep this easy to adjust per api_key.
+func kafkaResponseBody(apiKey, apiVersion int16, beI16 func(int16) []byte, beI32 func(int32) []byte) []byte {
+	switch apiKey {
+	case 18: // ApiVersions: error_code INT16 (0=NONE) ++ api_keys ARRAY (INT32 count 0)
+		// v0 (non-flexible) is the simplest known-valid shape: an empty api_keys
+		// array. Higher versions add throttle_time_ms / compact arrays / tagged
+		// fields — Task 13 fills those if a higher version is exercised.
+		return append(beI16(0), beI32(0)...)
+	default:
+		// Generic fallback: empty body. Task 13 fills per-key bodies (e.g. Metadata,
+		// Produce, Fetch) once the live reference decoder pins the exact shape.
+		return nil
+	}
+}
+
+// kafkaReqFrame builds a minimal request frame for the responder unit test: a
+// 4-byte BE length prefix + api_key INT16 + api_version INT16 + correlation_id
+// INT32 + an empty (length −1) NULLABLE_STRING client_id (no tagged fields —
+// v0/non-flexible request header). It is NOT a complete request body; the
+// responder only reads the leading 8 bytes.
+func kafkaReqFrame(apiKey, apiVersion int16, correlationID int32) []byte {
+	beI16 := func(v int16) []byte {
+		b := make([]byte, 2)
+		binary.BigEndian.PutUint16(b, uint16(v))
+		return b
+	}
+	beI32 := func(v int32) []byte {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b
+	}
+	body := append(beI16(apiKey), beI16(apiVersion)...)
+	body = append(body, beI32(correlationID)...)
+	body = append(body, beI16(-1)...) // client_id NULLABLE_STRING = null (length −1)
+	return append(beI32(int32(len(body))), body...)
+}
+
+func TestKafkaResponderBackend(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	var accepts atomic.Uint64
+	go acceptKafkaResponder(ln, &accepts)
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// An ApiVersions(18) v0 request, correlation_id 11 → a correlated response whose
+	// correlation_id == 11 and whose body is the empty-array ApiVersions v0 shape.
+	if _, err := c.Write(kafkaReqFrame(18, 0, 11)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	readResp := func() (int32, []byte) {
+		t.Helper()
+		var lenPfx [4]byte
+		if _, err := io.ReadFull(c, lenPfx[:]); err != nil {
+			t.Fatalf("read length prefix: %v", err)
+		}
+		n := int32(binary.BigEndian.Uint32(lenPfx[:]))
+		if n < 4 || n > 1<<20 {
+			t.Fatalf("response length = %d, out of range", n)
+		}
+		payload := make([]byte, n)
+		if _, err := io.ReadFull(c, payload); err != nil {
+			t.Fatalf("read response payload: %v", err)
+		}
+		return int32(binary.BigEndian.Uint32(payload[0:4])), payload[4:]
+	}
+	corr, respBody := readResp()
+	if corr != 11 {
+		t.Errorf("response correlation_id = %d, want 11 (correlation echo)", corr)
+	}
+	// ApiVersions v0 body: error_code INT16 (0) ++ api_keys count INT32 (0) = 6 bytes.
+	wantBody := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	if !bytes.Equal(respBody, wantBody) {
+		t.Errorf("ApiVersions v0 body = % x, want % x", respBody, wantBody)
+	}
+
+	// The uncorrelated marker: the echoed correlation_id differs (was never sent).
+	if _, err := c.Write(kafkaReqFrame(18, 0, kafkaMarkerUncorrelated)); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	markerCorr, _ := readResp()
+	if markerCorr == kafkaMarkerUncorrelated {
+		t.Errorf("marker response correlation_id = %d, want a DIFFERENT (unregistered) id", markerCorr)
+	}
+	if markerCorr != kafkaMarkerUncorrelated+50000 {
+		t.Errorf("marker response correlation_id = %d, want %d (correlation_id+50000)", markerCorr, kafkaMarkerUncorrelated+50000)
+	}
 }

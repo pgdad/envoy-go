@@ -24,6 +24,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
+	"github.com/esalaine/envoy-go/internal/filter/network/kafkabroker"
 	"github.com/esalaine/envoy-go/internal/filter/network/mongoproxy"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
@@ -43,19 +44,20 @@ func mustAny(t *testing.T, msg proto.Message) *anypb.Any {
 	return a
 }
 
-// TestRegisterBuiltinsRegistersAllEight proves RegisterBuiltins wires all eight
+// TestRegisterBuiltinsRegistersAllNine proves RegisterBuiltins wires all nine
 // built-in network filters (echo, direct_response, tcp_proxy, HCM,
-// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy) into a fresh
-// Registry. Registration only stores factory closures (it builds no filter), so
-// a zero-valued Deps{} is sufficient — rbac_network's, zookeeper_proxy's and
-// mongo_proxy's StatsRegistry are nil here, which is fine because registration
-// only captures the closure. reg.Freeze() is called to exercise the post-boot
-// lookup path, consistent with the sibling registration tests.
-func TestRegisterBuiltinsRegistersAllEight(t *testing.T) {
+// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, kafka_broker) into a
+// fresh Registry. Registration only stores factory closures (it builds no
+// filter), so a zero-valued Deps{} is sufficient — rbac_network's,
+// zookeeper_proxy's, mongo_proxy's and kafka_broker's StatsRegistry are nil
+// here, which is fine because registration only captures the closure.
+// reg.Freeze() is called to exercise the post-boot lookup path, consistent with
+// the sibling registration tests.
+func TestRegisterBuiltinsRegistersAllNine(t *testing.T) {
 	reg := network.NewRegistry()
 	RegisterBuiltins(reg, Deps{})
 	reg.Freeze()
-	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL, mongoproxy.TypeURL} {
+	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL, mongoproxy.TypeURL, kafkabroker.TypeURL} {
 		if _, ok := reg.Lookup(tu); !ok {
 			t.Errorf("RegisterBuiltins did not register %q", tu)
 		}
@@ -184,6 +186,20 @@ func TestMongoProxyBootSmoke(t *testing.T) {
 	}
 	if got := sreg.NewGaugeIfAbsent("mongo.mongoboot.op_query_active").Load(); got != 0 {
 		t.Errorf("gauge op_query_active = %d at boot, want 0", got)
+	}
+}
+
+// TestRegisterBuiltins_IncludesKafkaBroker proves kafka_broker is wired as the
+// 9th built-in network filter (31; ADR-0228; the first /contrib consumer). A
+// non-nil StatsRegistry is supplied because kafka_broker's factory eagerly
+// creates the 176-counter roster; registration only stores the closure here,
+// but a real registry mirrors the boot wiring.
+func TestRegisterBuiltins_IncludesKafkaBroker(t *testing.T) {
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{StatsRegistry: stats.NewRegistry()})
+	reg.Freeze()
+	if _, ok := reg.Lookup(kafkabroker.TypeURL); !ok {
+		t.Fatal("kafka_broker not registered as the 9th built-in")
 	}
 }
 

@@ -287,6 +287,18 @@ func flattenToProm(internal string) (string, []Label, error) {
 				}
 			}
 		}
+		// Phase-31 kafka_broker INLINE-PREFIX detection (ADR-0228; AMEND-K2; the
+		// zookeeper .zookeeper. no-label INLINE precedent generalized to a kafka. ROOT
+		// prefix). Internal name kafka.<sp>.<rest> -> envoy_kafka_<sp>_<rest flattened>
+		// with EMPTY labels (live-probed: prefix + direction + api-key are ALL inlined
+		// into the metric NAME; NO tag extraction -- the OPPOSITE of the mongo label
+		// hoist). Needs no shape-validation guard (no dynamic VALUE is hoisted to a
+		// label; the whole name flattens). KEEP-IN-SYNC:
+		// internal/filter/network/kafkabroker/stats.go.
+		if rest, ok := strings.CutPrefix(internal, "kafka."); ok {
+			base = "envoy_kafka_" + strings.ReplaceAll(rest, ".", "_")
+			return base, nil, nil // empty labels (no hoist)
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 

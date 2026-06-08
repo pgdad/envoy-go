@@ -1,6 +1,7 @@
-// Package builtins registers the eight built-in network filters (echo,
+// Package builtins registers the nine built-in network filters (echo,
 // direct_response, tcp_proxy, HCM, rbac_network, sni_cluster, zookeeper_proxy,
-// mongo_proxy) into a *network.Registry with their boot singletons captured. It
+// mongo_proxy, kafka_broker) into a *network.Registry with their boot singletons
+// captured. It
 // lives OUTSIDE internal/filter/network (which the filters import) and outside
 // internal/listener (whose tests import this), so no import cycle forms
 // (D-26.2-5 / D-26.2-7). Consumed by cmd/envoy-go/main.go + the listener
@@ -17,6 +18,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/filter/network/directresponse"
 	"github.com/esalaine/envoy-go/internal/filter/network/echo"
+	"github.com/esalaine/envoy-go/internal/filter/network/kafkabroker"
 	"github.com/esalaine/envoy-go/internal/filter/network/mongoproxy"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
@@ -39,7 +41,8 @@ type Deps struct {
 }
 
 // RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM,
-// rbac_network, sni_cluster, zookeeper_proxy, and mongo_proxy into reg. It
+// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, and kafka_broker into
+// reg. It
 // mirrors the registration calls in cmd/envoy-go/main.go and does NOT Freeze
 // (the caller freezes after any additional registration). reg.Register is void
 // (it panics on a frozen or duplicate registry), so there is no error to thread.
@@ -72,4 +75,9 @@ func RegisterBuiltins(reg *network.Registry, deps Deps) {
 	// FactoryCtx carries no stats registry). The second both-directions
 	// (ReadFilter + WriteFilter) production filter (ADR-0221 consumer #2).
 	reg.Register(mongoproxy.TypeURL, mongoproxy.NewFactory(deps.StatsRegistry))
+	// kafka_broker: the 9th built-in (31; ADR-0228; the first /contrib consumer).
+	// Stats-PRIMARY filter: the registry is closure-captured (the
+	// mongo_proxy/zookeeper_proxy/rbac_network precedent — FactoryCtx carries no
+	// stats registry).
+	reg.Register(kafkabroker.TypeURL, kafkabroker.NewFactory(deps.StatsRegistry))
 }

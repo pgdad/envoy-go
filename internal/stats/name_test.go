@@ -144,6 +144,36 @@ func TestFlattenToProm_Invalid_NoMatchingRule(t *testing.T) {
 	}
 }
 
+// Phase-31 kafka_broker INLINE-PREFIX arm (AMEND-K2): kafka.<sp>.<rest> flattens
+// to envoy_kafka_<sp>_<rest> with EMPTY labels (no hoist; the zookeeper no-label
+// precedent generalized to a kafka. ROOT prefix).
+func TestFlattenToProm_Kafka(t *testing.T) {
+	cases := []struct{ in, base string }{
+		{"kafka.kprobe.request.api_versions_request", "envoy_kafka_kprobe_request_api_versions_request"},
+		{"kafka.kprobe.request.unknown", "envoy_kafka_kprobe_request_unknown"},
+		{"kafka.kprobe.response.metadata_response", "envoy_kafka_kprobe_response_metadata_response"},
+		{"kafka.kprobe.response.failure", "envoy_kafka_kprobe_response_failure"},
+	}
+	for _, c := range cases {
+		base, labels, err := flattenToProm(c.in)
+		if err != nil {
+			t.Errorf("%q: unexpected err %v", c.in, err)
+			continue
+		}
+		if base != c.base || len(labels) != 0 {
+			t.Errorf("%q -> base=%q labels=%v, want base=%q empty", c.in, base, labels, c.base)
+		}
+	}
+}
+
+// Negative: a name without the kafka. root prefix (kafkaX. is NOT kafka.) still
+// falls through to the default error.
+func TestFlattenToProm_Kafka_NonMatchingFallsThrough(t *testing.T) {
+	if _, _, err := flattenToProm("kafkaX.foo"); err == nil {
+		t.Error("expected error for kafkaX.foo (not a kafka. prefix); got nil")
+	}
+}
+
 func TestEscapeLabelValue(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain", "plain"},

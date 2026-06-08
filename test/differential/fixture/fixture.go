@@ -528,6 +528,18 @@ const (
 	// BackendKind per reference_differential_fixture_dispatch_constraint; the
 	// TCPZKResponder = 29 precedent.
 	TCPMongoResponder BackendKind = 30
+	// TCPKafkaResponder is a Kafka-aware canned-response TCP backend (31; SPEC §8.3):
+	// for every complete request frame (4-byte BE INT32 length prefix) it reads the
+	// correlation_id (INT32 at body offset 4 — after api_key INT16 + api_version
+	// INT16) and echoes it in a canned response frame (4-byte length + INT32
+	// correlation_id + a minimal per-api_key body the reference can decode) so the
+	// subject's + reference's response-side correlation has something to correlate
+	// against. A marker correlation_id makes the responder emit a response whose
+	// correlation_id was NEVER sent as a request -> response.failure on both sides
+	// (the unregistered-correlation arm). NEW BackendKind per
+	// reference_differential_fixture_dispatch_constraint; the TCPMongoResponder = 30
+	// precedent. The exact per-api_key response body is live-verified at Task 13.
+	TCPKafkaResponder BackendKind = 31
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

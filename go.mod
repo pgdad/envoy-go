@@ -6,6 +6,7 @@ require (
 	github.com/cncf/xds/go v0.0.0-20240905190251-b4127c9b8d78
 	github.com/docker/docker v24.0.7+incompatible
 	github.com/docker/go-connections v0.4.0
+	github.com/envoyproxy/go-control-plane/contrib v1.32.4
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/testcontainers/testcontainers-go v0.27.0
