@@ -2426,10 +2426,12 @@ func acceptRedisResponder(ln net.Listener, counter *atomic.Uint64) {
 // redisRespondLoop reads RESP request frames (array-of-bulk: *<n>\r\n followed by
 // n bulk strings $<len>\r\n<bytes>\r\n) and writes positional canned replies until
 // the client closes. It is NOT a Redis server — it parses ONLY the command name
-// (first bulk element, uppercased): SET → "+OK\r\n"; GET → "$3\r\nbar\r\n"; any
-// other → "-ERR unsupported\r\n". FIFO/positional — NO correlation id (contrast
-// kafkaRespondLoop's correlation-id echo). PING/AUTH never reach the backend
-// (redis_proxy answers them locally — AMEND-R5).
+// (first bulk element, uppercased) and the first arg (the key). Reply table
+// (32.2 command-matrix extension): SET → "+OK\r\n"; GET key "nope" → "$-1\r\n"
+// (null bulk, GET-miss); GET any other key → "$3\r\nbar\r\n" (GET-hit);
+// INCR/DEL → ":1\r\n"; any other → "-ERR unsupported\r\n". FIFO/positional —
+// NO correlation id (contrast kafkaRespondLoop's correlation-id echo).
+// PING/AUTH never reach the backend (redis_proxy answers them locally — AMEND-R5).
 func redisRespondLoop(c net.Conn) {
 	defer func() { _ = c.Close() }()
 	r := bufio.NewReader(c)
@@ -2465,7 +2467,9 @@ func redisRespondLoop(c net.Conn) {
 			return
 		}
 		cmd := strings.ToUpper(strings.TrimRight(string(cmdBytes), "\r\n"))
-		// Discard the remaining n-1 bulk elements.
+		// Read the remaining n-1 bulk elements, capturing the first arg (the key) so
+		// GET can distinguish hit/miss (32.2 command matrix).
+		var firstArg string
 		for i := 1; i < n; i++ {
 			hdr, err := r.ReadString('\n')
 			if err != nil {
@@ -2479,18 +2483,28 @@ func redisRespondLoop(c net.Conn) {
 			if _, err := fmt.Sscanf(hdr[1:], "%d", &argLen); err != nil || argLen < 0 {
 				return
 			}
-			discard := make([]byte, argLen+2) // +2 for \r\n
-			if _, err := io.ReadFull(r, discard); err != nil {
+			argBytes := make([]byte, argLen+2) // +2 for \r\n
+			if _, err := io.ReadFull(r, argBytes); err != nil {
 				return
 			}
+			if i == 1 {
+				firstArg = strings.TrimRight(string(argBytes), "\r\n")
+			}
 		}
-		// Write the canned reply.
+		// Write the canned reply (32.2 reply table: $-1 GET-miss keyed on the first
+		// arg "nope", :1 INCR/DEL; the existing SET/GET-hit arms unchanged).
 		var reply string
 		switch cmd {
 		case "SET":
 			reply = "+OK\r\n"
 		case "GET":
-			reply = "$3\r\nbar\r\n"
+			if firstArg == "nope" {
+				reply = "$-1\r\n" // GET-miss (null bulk — §8.4; the driver's miss key is "nope")
+			} else {
+				reply = "$3\r\nbar\r\n" // GET-hit
+			}
+		case "INCR", "DEL":
+			reply = ":1\r\n"
 		default:
 			reply = "-ERR unsupported\r\n"
 		}

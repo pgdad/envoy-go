@@ -3,7 +3,9 @@ package redisproxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 
 	redis_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
@@ -78,10 +80,16 @@ func (f *filter) resolveCatchAll(_ context.Context) (network.UpstreamDialFunc, f
 // command→reply pump to connection close (the tcp_proxy.Handle shape). PING/AUTH
 // are answered locally (zero upstream); data commands round-trip through a lazily
 // dialed one-conn-per-downstream upstream seam with synchronous single-flight
-// FIFO/positional reply correlation.
+// FIFO/positional reply correlation. The downstream_cx_active gauge is
+// inc/dec-balanced across the connection lifetime; downstream_rq_active and the
+// per-command total/success/error counters are managed per-request in serveRequest.
+// A malformed frame increments downstream_cx_protocol_error; QUIT closes the pump
+// after writing +OK.
 func (f *filter) Handle(ctx context.Context, downstream net.Conn) {
 	defer func() { _ = downstream.Close() }()
 	f.st.incCxTotal()
+	f.st.incCxActive()
+	defer f.st.decCxActive()
 	dr := bufio.NewReader(downstream)
 
 	var up *network.UpstreamConn
@@ -104,35 +112,72 @@ func (f *filter) Handle(ctx context.Context, downstream net.Conn) {
 	}
 
 	for {
-		cmd, raw, err := decodeRequest(dr)
+		cmd, args, raw, err := decodeRequest(dr)
 		if err != nil {
-			return // io.EOF clean close / a decode error → close (protocol_error is 32.2)
+			if !errors.Is(err, io.EOF) {
+				f.st.incProtocolError() // a malformed frame (§4.5); a clean EOF does not
+			}
+			return
 		}
 		f.st.incRqTotal()
 		f.st.addRxBytes(len(raw))
-
-		if isLocalReply(cmd) {
-			reply := localReply(cmd)
-			if _, err := downstream.Write(reply); err != nil {
-				return
-			}
-			f.st.addTxBytes(len(reply))
-			continue
+		if !f.serveRequest(ctx, downstream, cmd, args, raw, ensureUpstream) {
+			return
 		}
+	}
+}
+
+// serveRequest dispatches one decoded request and reports whether the pump should
+// continue. It owns the downstream_rq_active gauge inc/dec (defer-balanced across
+// every exit path — §4.4).
+func (f *filter) serveRequest(ctx context.Context, downstream net.Conn, cmd string, args [][]byte, raw []byte,
+	ensureUpstream func() (*network.UpstreamConn, error)) (cont bool) {
+	f.st.incRqActive()
+	defer f.st.decRqActive()
+
+	v := classify(cmd, args)
+	switch v.action {
+	case actLocal:
+		if _, err := downstream.Write(v.reply); err != nil {
+			return false
+		}
+		f.st.addTxBytes(len(v.reply))
+		return !v.closeAfter // QUIT ends the pump
+	case actUnsupported:
+		f.st.incSplitterUnsupported()
+		if _, err := downstream.Write(v.reply); err != nil {
+			return false
+		}
+		f.st.addTxBytes(len(v.reply))
+		return true
+	case actInvalid:
+		f.st.incSplitterInvalid()
+		if _, err := downstream.Write(v.reply); err != nil {
+			return false
+		}
+		f.st.addTxBytes(len(v.reply))
+		return true
+	default: // actProxy
+		f.st.incCommandTotal(v.statCmd)
 		u, err := ensureUpstream()
 		if err != nil {
-			return // unresolvable cluster → graceful close (D-S32.1-6)
+			f.st.incCommandError(v.statCmd) // unresolvable upstream is a transport failure
+			return false
 		}
 		if err := u.Send(ctx, raw); err != nil {
-			return
+			f.st.incCommandError(v.statCmd)
+			return false
 		}
 		reply, err := decodeReply(u.Reader())
 		if err != nil {
-			return
+			f.st.incCommandError(v.statCmd)
+			return false
 		}
+		f.st.incCommandSuccess(v.statCmd)
 		if _, err := downstream.Write(reply); err != nil {
-			return
+			return false
 		}
 		f.st.addTxBytes(len(reply))
+		return true
 	}
 }

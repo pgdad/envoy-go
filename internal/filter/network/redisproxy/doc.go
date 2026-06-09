@@ -19,8 +19,13 @@
 // TerminalFilter.Handle command->reply pump (one upstream conn per downstream
 // conn; synchronous single-flight FIFO/positional reply correlation).
 //
-// 32.2 completes the full command set + the per-command/splitter/REDIS_CLUSTER
-// stat roster + the gauges' inc/dec + the redis. Prometheus tag-extractor arm +
-// the differential command matrix + the 41st fuzzer FuzzRESPDecode + the
-// parent-row-32 rollup.
+// 32.2 landed the full 180-command classify dispatch + the per-command/splitter/
+// REDIS_CLUSTER stat roster (540 per-command counters + 2 splitter counters + 3
+// cluster-scope counters) + the 2 ACTIVE downstream_* gauges' inc/dec (cx_active at
+// Handle entry/exit, rq_active per serveRequest; the 2 *_bytes_buffered gauges stay
+// exist-at-0 — framework-buffer-managed-upstream coverage boundary) + the
+// downstream_cx_protocol_error wiring on the decode-error path. The redis. Prometheus
+// label-hoisted tag-extractor arm (internal/stats/name.go), the 41st fuzzer
+// FuzzRESPDecode, the differential command matrix (0055), and the parent-row-32
+// rollup all landed at 32.2 as well.
 package redisproxy

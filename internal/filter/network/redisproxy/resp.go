@@ -167,51 +167,54 @@ func decodeReplyInto(r *bufio.Reader, raw *bytes.Buffer) error {
 }
 
 // decodeRequest reads ONE request frame (inline OR array-of-bulk-strings) from r
-// and returns the UPPERCASED command name (for dispatch) + the RAW frame bytes
-// (forwarded VERBATIM upstream when proxied). Blocks on partial frames. A
-// frame-boundary io.EOF is returned verbatim (clean connection end).
-func decodeRequest(r *bufio.Reader) (cmd string, raw []byte, err error) {
+// and returns the UPPERCASED command name (for dispatch), the parsed argument
+// slice (args[0]=the AS-RECEIVED command token, args[1:]=arguments — for the
+// local-reply ECHO/HELLO arg + arity + the unknown-command echo), and the RAW
+// frame bytes (forwarded VERBATIM upstream when proxied). Blocks on partial
+// frames. A frame-boundary io.EOF is returned verbatim (clean connection end).
+func decodeRequest(r *bufio.Reader) (cmd string, args [][]byte, raw []byte, err error) {
 	p, err := r.Peek(1)
 	if err != nil {
-		return "", nil, err // io.EOF here = clean end between frames
+		return "", nil, nil, err // io.EOF here = clean end between frames
 	}
 	var buf bytes.Buffer
 	if p[0] != '*' {
-		// Reject RESP reply-type first bytes: '+' (simple string), '-' (error),
-		// ':' (integer), '$' (bulk string), '@' (attribute) — these are server-to-
-		// client bytes and are never valid at the start of a client request.
 		switch p[0] {
 		case '+', '-', ':', '$', '@':
-			return "", nil, errProtocol
+			return "", nil, nil, errProtocol
 		}
-		// inline command: a space-separated token line.
 		line, err := readLine(r, &buf)
 		if err != nil {
-			return "", nil, unexpected(err)
+			return "", nil, nil, unexpected(err)
 		}
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
-			return "", nil, errProtocol
+			return "", nil, nil, errProtocol
 		}
-		return strings.ToUpper(fields[0]), buf.Bytes(), nil
+		args = make([][]byte, len(fields))
+		for i, f := range fields {
+			args[i] = []byte(f)
+		}
+		return strings.ToUpper(fields[0]), args, buf.Bytes(), nil
 	}
-	// array-of-bulk: "*<n>\r\n" then n × "$<len>\r\n<bytes>\r\n".
 	header, err := readLine(r, &buf)
 	if err != nil {
-		return "", nil, unexpected(err)
+		return "", nil, nil, unexpected(err)
 	}
 	n, err := strconv.Atoi(header[1:])
 	if err != nil || n <= 0 || n > maxArrayLen {
-		return "", nil, errProtocol
+		return "", nil, nil, errProtocol
 	}
+	args = make([][]byte, 0, n)
 	for i := 0; i < n; i++ {
 		bulk, err := readBulk(r, &buf)
 		if err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
+		args = append(args, bulk)
 		if i == 0 {
 			cmd = strings.ToUpper(string(bulk))
 		}
 	}
-	return cmd, buf.Bytes(), nil
+	return cmd, args, buf.Bytes(), nil
 }

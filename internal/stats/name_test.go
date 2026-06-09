@@ -815,6 +815,34 @@ func TestFlattenToProm_MongoGaugeAndGuards(t *testing.T) {
 	}
 }
 
+func TestFlattenToProm_RedisArm(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantBase  string
+		wantLabel string // the single envoy_redis_prefix value
+	}{
+		{"redis.redis_r.downstream_cx_total", "envoy_redis_downstream_cx_total", "redis_r"},
+		{"redis.redis_r.command.get.total", "envoy_redis_command_get_total", "redis_r"},
+		{"redis.redis_r.command.bf.add.total", "envoy_redis_command_bf_add_total", "redis_r"}, // dotted name flatten
+		{"redis.redis_r.command.info.shard.success", "envoy_redis_command_info_shard_success", "redis_r"},
+		{"redis.redis_r.splitter.unsupported_command", "envoy_redis_splitter_unsupported_command", "redis_r"},
+		{"redis.redis_r.downstream_cx_active", "envoy_redis_downstream_cx_active", "redis_r"}, // gauge
+	}
+	for _, tc := range cases {
+		base, labels, err := flattenToProm(tc.in)
+		if err != nil {
+			t.Errorf("flattenToProm(%q) err = %v", tc.in, err)
+			continue
+		}
+		if base != tc.wantBase {
+			t.Errorf("flattenToProm(%q) base = %q, want %q", tc.in, base, tc.wantBase)
+		}
+		if len(labels) != 1 || labels[0].Key != "envoy_redis_prefix" || labels[0].Value != tc.wantLabel {
+			t.Errorf("flattenToProm(%q) labels = %+v, want [{envoy_redis_prefix %q}]", tc.in, labels, tc.wantLabel)
+		}
+	}
+}
+
 func TestWriteProm_MongoCallsiteLineByteExact(t *testing.T) {
 	reg := NewRegistry()
 	reg.NewCounterIfAbsent("mongo.mongoprobe.collection.collection1.callsite.probeFn.query.scatter_get").Inc()

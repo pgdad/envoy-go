@@ -56,6 +56,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -88,9 +89,17 @@ func init() {
 	fixture.RegisterFixture(fixtureName, &redisRoundtripDriver{})
 }
 
-// redisRoundtripDriver carries no mutable cross-arm state. Each arm uses a
-// fresh connection (the 0053 per-conn precedent).
-type redisRoundtripDriver struct{}
+// redisRoundtripDriver holds the per-side held-open connections (Task 11,
+// D-S32.2-7) used by the downstream_cx_active gauge arm. All transient arms use
+// a fresh connection (the 0053 per-conn precedent); the held conn is the ONE
+// connection left alive across the AssertStats prometheus scrape so each side's
+// downstream_cx_active reads 1 — the mongo op_query_active 29.2 held-arm
+// precedent. driveProxy is a POINTER receiver so the field writes persist; the
+// ref/subj writes touch DISTINCT fields so the two Drive calls are race-free.
+type redisRoundtripDriver struct {
+	refHeld  net.Conn // idle PING'd connection held open across AssertStats (ref side)
+	subjHeld net.Conn // …subject side; closed in AssertStats after the gauge assertion
+}
 
 // ============================================================================
 // RESP request builders (D-S32.1-4 — shared with the 32.2 command-matrix arms)
@@ -224,6 +233,76 @@ func (d *redisRoundtripDriver) driveProxy(ctx context.Context, addr, side string
 	setGetReply, err := driveSetGetArm(ctx, addr)
 	emitArmBytes(&b, side, "set-get", setGetReply, err)
 
+	// ────────────────────────────────────────────────────────────────────────
+	// §8.1 command-matrix arms (Task 10). Each arm opens a FRESH connection,
+	// writes ONE request, reads ONE single-frame reply, and emits the reply bytes
+	// (the cross-side byte-equivalence signal). The expected replies below are the
+	// upstream-faithful local-reply / proxied-reply wordings classify produces;
+	// they MUST be byte-identical on both sides (the wire is shared —
+	// reference_wire_format_both_sides_see_same_bytes).
+	//
+	// Per-command/splitter accounting (cumulative with arm 2's SET + GET):
+	//   command.get.total/success = 2 (arm-2 GET foo HIT + this get-miss GET nope)
+	//   command.set.total/success = 1 (arm-2 SET)
+	//   command.incr.total/success = 1 ; command.del.total/success = 1
+	//   splitter.invalid_request = 1 (echo-arity) ; splitter.unsupported_command = 1 (unknown)
+	// PING/ECHO(arity 2)/QUIT/HELLO-error paths increment NO command.* stat.
+
+	// get-miss: GET nope → $-1\r\n (null bulk). command.get.total/success +1.
+	getMiss, err := driveOneShotArm(ctx, addr, respArray("GET", "nope"))
+	emitArmBytes(&b, side, "get-miss", getMiss, err)
+
+	// incr: INCR ctr → :1\r\n. command.incr.total/success +1.
+	incrReply, err := driveOneShotArm(ctx, addr, respArray("INCR", "ctr"))
+	emitArmBytes(&b, side, "incr", incrReply, err)
+
+	// del: DEL foo → :1\r\n. command.del.total/success +1.
+	delReply, err := driveOneShotArm(ctx, addr, respArray("DEL", "foo"))
+	emitArmBytes(&b, side, "del", delReply, err)
+
+	// echo: ECHO hi (arity 2) → $2\r\nhi\r\n (local reply, NO command.* stat).
+	echoReply, err := driveOneShotArm(ctx, addr, respArray("ECHO", "hi"))
+	emitArmBytes(&b, side, "echo", echoReply, err)
+
+	// echo-arity: ECHO (arity 1) → -invalid request\r\n. splitter.invalid_request +1.
+	echoArity, err := driveOneShotArm(ctx, addr, respArray("ECHO"))
+	emitArmBytes(&b, side, "echo-arity", echoArity, err)
+
+	// quit: QUIT → +OK\r\n then the proxy closes the connection (closeAfter).
+	quitReply, err := driveQuitArm(ctx, addr)
+	emitArmBytes(&b, side, "quit", quitReply, err)
+
+	// hello-3: HELLO 3 → -NOPROTO unsupported protocol version\r\n (local, NO command.*).
+	hello3, err := driveOneShotArm(ctx, addr, respArray("HELLO", "3"))
+	emitArmBytes(&b, side, "hello-3", hello3, err)
+
+	// hello-options: HELLO 2 AUTH u p (>2 args) → -ERR HELLO options ... (local, NO command.*).
+	helloOpts, err := driveOneShotArm(ctx, addr, respArray("HELLO", "2", "AUTH", "u", "p"))
+	emitArmBytes(&b, side, "hello-options", helloOpts, err)
+
+	// unknown: BOGUSCMD x → -ERR unknown command 'BOGUSCMD', ... splitter.unsupported_command +1.
+	unknownReply, err := driveOneShotArm(ctx, addr, respArray("BOGUSCMD", "x"))
+	emitArmBytes(&b, side, "unknown", unknownReply, err)
+
+	// ping-arg: PING hello → +PONG\r\n (local-reply with arg; NO command.* stat).
+	pingArg, err := driveOneShotArm(ctx, addr, respArray("PING", "hello"))
+	emitArmBytes(&b, side, "ping-arg", pingArg, err)
+
+	// Held-open gauge arm (§8.2): keep one idle PING'd connection alive across the
+	// AssertStats prometheus scrape so downstream_cx_active == 1 on BOTH sides.
+	// Opened LAST so it is the only live downstream conn at scrape time; closed in
+	// AssertStats after the gauge assertion. PING is local → no upstream dial, no
+	// command.*/splitter change (the mongo op_query_active 29.2 held-arm precedent).
+	held, err := openHeld(ctx, addr)
+	if err != nil {
+		return nil, fmt.Errorf("held-open arm: %w", err)
+	}
+	if side == "ref" {
+		d.refHeld = held
+	} else {
+		d.subjHeld = held
+	}
+
 	// Let the async stat pipeline settle before the runner scrapes in AssertStats.
 	if err := sleepCtx(ctx, settleDelay); err != nil {
 		return nil, err
@@ -268,6 +347,25 @@ func drivePingArm(ctx context.Context, addr string) ([]byte, error) {
 	return replies.Bytes(), nil
 }
 
+// openHeld dials addr, sends PING, reads +PONG, and returns the STILL-OPEN conn
+// (the caller holds it open across AssertStats so downstream_cx_active==1 — §8.2).
+func openHeld(ctx context.Context, addr string) (net.Conn, error) {
+	dl := net.Dialer{}
+	conn, err := dl.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("held dial %s: %w", addr, err)
+	}
+	if _, err := conn.Write(respArray("PING")); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("held PING write: %w", err)
+	}
+	if _, err := readReply(conn); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("held PING read: %w", err)
+	}
+	return conn, nil
+}
+
 // driveSetGetArm opens ONE fresh connection, sends respArray("SET","foo","bar")
 // then respArray("GET","foo"), reads a reply after EACH write, and returns the
 // concatenated reply bytes. The TCPRedisResponder returns +OK\r\n for SET and
@@ -306,6 +404,57 @@ func driveSetGetArm(ctx context.Context, addr string) ([]byte, error) {
 	replies.Write(getReply)
 
 	return replies.Bytes(), nil
+}
+
+// driveOneShotArm opens ONE fresh connection, writes req, reads ONE single-frame
+// reply (up to 256 bytes in one Read — fine for the small command-matrix replies),
+// and returns the reply bytes. Used by every Task-10 command-matrix arm except
+// quit (which expects a follow-up close). The reply bytes ARE the cross-side
+// byte-equivalence signal (both sides must produce identical bytes).
+func driveOneShotArm(ctx context.Context, addr string, req []byte) ([]byte, error) {
+	dl := net.Dialer{}
+	conn, err := dl.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write(req); err != nil {
+		return nil, fmt.Errorf("write req: %w", err)
+	}
+	reply, err := readReply(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read reply: %w", err)
+	}
+	return reply, nil
+}
+
+// driveQuitArm opens ONE fresh connection, sends respArray("QUIT"), reads the
+// +OK\r\n reply, then confirms the proxy CLOSES the connection (classify marks
+// QUIT closeAfter). A follow-up Read returns EOF / a zero-length read; the close
+// itself is diagnostic-only — only the +OK\r\n reply bytes are emitted (the
+// cross-side byte-equivalence signal).
+func driveQuitArm(ctx context.Context, addr string) ([]byte, error) {
+	dl := net.Dialer{}
+	conn, err := dl.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write(respArray("QUIT")); err != nil {
+		return nil, fmt.Errorf("write QUIT: %w", err)
+	}
+	reply, err := readReply(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read reply to QUIT: %w", err)
+	}
+	// Confirm the conn closes after QUIT (diagnostic only — a follow-up Read should
+	// return EOF). We do NOT fold this into the emitted bytes.
+	_ = conn.SetReadDeadline(time.Now().Add(readReplyTimeout))
+	tmp := make([]byte, 16)
+	_, _ = conn.Read(tmp)
+	return reply, nil
 }
 
 // readGetReply reads a RESP bulk-string reply ($3\r\nbar\r\n) from conn.
@@ -421,8 +570,59 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 //	  → FAIL: "R6-BREAK ref cluster.redis_cluster.upstream_cx_total = 1, want 99"
 //	  Actual value confirmed: 1 (one lazy dial on SET — AMEND-R5 PING is local, no upstream).
 //	  Reverted → PASS.
+//
+// 32.2 Task 11 — the held-open gauge arm + per-command/splitter prom + the
+// new-arm CompareBytes prong, all proven LIVE with -count=1:
+//
+//	Break A — per-command prom counter (cross-side equality):
+//	  Perturbed the scraped subjP[command_incr_total] = 99999 before the promEqual loop.
+//	  → FAIL: `cross-side mismatch envoy_redis_command_incr_total{envoy_redis_prefix="redis_r"}: ref=1 subj=99999`
+//	  Actual value confirmed: ref=1 (the INCR arm). Reverted → PASS.
+//
+//	Break B — splitter.unsupported_command prom counter (cross-side equality):
+//	  Perturbed subjP[splitter_unsupported_command] = 77777 before the promEqual loop.
+//	  → FAIL: `cross-side mismatch envoy_redis_splitter_unsupported_command{envoy_redis_prefix="redis_r"}: ref=1 subj=77777`
+//	  Actual value confirmed: ref=1 (the UNKNOWN arm BOGUSCMD). Reverted → PASS.
+//
+//	Break C — downstream_cx_active held arm (gauge == 1):
+//	  Closed d.subjHeld just before the refP scrape (`_ = d.subjHeld.Close(); d.subjHeld = nil`).
+//	  → FAIL: "subj: downstream_cx_active = 0, want 1 (held-open arm)"
+//	  Proves the held-open arm is the load-bearing reason cx_active reads 1. Reverted → PASS.
+//
+//	Break D — a new arm's reply bytes (CompareBytes prong, INCR arm):
+//	  Added `if side == "subj" && err == nil { incrReply = append(incrReply, '!') }` in driveProxy.
+//	  → FAIL: "differential mismatch: first divergence at offset 37"
+//	  Proves the new 32.2 command-matrix arm byte-equivalence verdict is live. Reverted → PASS.
+//
+//	Break E — the per-side upstream_cx_total pin (subject side):
+//	  Changed the subj `want` from 4 to 99 in the upstream_cx_total per-side loop.
+//	  → FAIL: "subj cluster.redis_cluster.upstream_cx_total = 4, want 99"
+//	  Actual value confirmed: subj=4 (one upstream dial per proxied-command downstream conn).
+//	  Reverted → PASS.
+//
+// NOTE (Task 11 coverage boundary): the held-open arm leaves the REFERENCE's
+// downstream_cx_rx_bytes_buffered at 14 (== len(respArray("PING")), the held
+// conn's still-buffered request frame) — NOT 0. The subject never wires the 2
+// buffered gauges (filter.go inc/decs only cx_active + rq_active), so they pin
+// at 0. Buffered is therefore NOT cross-side equal and the assertion pins the
+// SUBJECT == 0 only (a close_direction-style framework coverage boundary); the
+// reference is intentionally not asserted.
 func (d *redisRoundtripDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string) {
 	t.Helper()
+
+	// Belt-and-suspenders: ensure the held-open conns are closed even if an
+	// assertion fatals before the explicit close below (Task 11, §8.2). The
+	// fixture.TB interface has no Cleanup (it is the minimal Errorf/Fatalf/Helper
+	// shim — fixture.go avoids importing "testing"), so we use a defer guard: a
+	// scrape Fatalf above the gauge block would otherwise skip the explicit close.
+	defer func() {
+		if d.refHeld != nil {
+			_ = d.refHeld.Close()
+		}
+		if d.subjHeld != nil {
+			_ = d.subjHeld.Close()
+		}
+	}()
 
 	ref, err := scrapeStats(refAdminAddr)
 	if err != nil {
@@ -433,18 +633,22 @@ func (d *redisRoundtripDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 		t.Fatalf("scrape subj /stats: %v", err)
 	}
 
-	// The six counters that must be EQUAL on both sides after the two-arm workload.
+	// Counters that must be EQUAL on both sides after the full arm workload.
 	// stat_prefix is "redis_r" (const statPrefixRedis); cluster name is "redis_cluster".
 	//
-	// downstream_rq_total == 4: inline PING + array PING (arm 1) + SET + GET (arm 2).
-	// upstream_cx_total   == 1: one lazy dial (SET is the first proxied command).
-	// upstream_rq_total   == 2: SET + GET forwarded to backend.
+	// downstream_cx_total: 12 (one fresh conn per arm — 2 in 32.1 + 10 command-matrix).
+	// downstream_rq_total: 14 (inline+array PING + SET + GET [32.1] + the 10 matrix requests).
+	// upstream_rq_total:   5 (the PROXIED commands only — SET + GET foo + GET nope + INCR +
+	//   DEL; PING/ECHO/QUIT/HELLO-error/UNKNOWN are local-reply / splitter-reject, zero
+	//   upstream). Request COUNT is pooling-independent → cross-side equal on both sides.
+	//
+	// upstream_cx_total is asserted SEPARATELY (per-side pin) below: it is an
+	// ARCHITECTURAL divergence, NOT cross-side-equal — see that block.
 	counters := []string{
 		"redis." + statPrefixRedis + ".downstream_cx_total",
 		"redis." + statPrefixRedis + ".downstream_rq_total",
 		"redis." + statPrefixRedis + ".downstream_cx_rx_bytes_total",
 		"redis." + statPrefixRedis + ".downstream_cx_tx_bytes_total",
-		"cluster.redis_cluster.upstream_cx_total",
 		"cluster.redis_cluster.upstream_rq_total",
 	}
 
@@ -463,6 +667,196 @@ func (d *redisRoundtripDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 			t.Errorf("cross-side mismatch %s: ref=%d subj=%d", name, refVal, subjVal)
 		}
 	}
+
+	// upstream_cx_total — PER-SIDE PIN (NOT cross-side equality). This is an
+	// ARCHITECTURAL divergence in upstream-connection management, parallel to the
+	// 0053 abandon-at-close per-side pinning (reference_close_direction_framework_gap):
+	//   - REFERENCE: pools upstream connections at the CLUSTER level → ONE reused
+	//     upstream connection serves all 5 proxied requests → upstream_cx_total == 1.
+	//   - SUBJECT: the redis_proxy filter uses a ONE-CONN-PER-DOWNSTREAM upstream seam
+	//     (filter.go: lazily dials a dedicated upstream per downstream connection, NO
+	//     cross-connection pool). The 32.2 command-matrix runs each proxied command on
+	//     its OWN fresh downstream connection (SET arm-2 conn, GET-miss, INCR, DEL) → 4
+	//     distinct downstream conns each lazy-dial 1 upstream → upstream_cx_total == 4.
+	// DETERMINISTIC per side; the request COUNT (upstream_rq_total == 5) is pooling-
+	// independent and stays cross-side equal above. We pin the EXACT per-side value so
+	// the assertion is non-vacuous and R6-breakable on each side.
+	const upstreamCxKey = "cluster.redis_cluster.upstream_cx_total"
+	for _, sd := range []struct {
+		label string
+		stats map[string]uint64
+		want  uint64
+	}{
+		{"ref", ref, 1},
+		{"subj", subj, 4},
+	} {
+		got, ok := sd.stats[upstreamCxKey]
+		if !ok {
+			t.Errorf("%s: counter %s ABSENT in /stats", sd.label, upstreamCxKey)
+			continue
+		}
+		if got != sd.want {
+			t.Errorf("%s %s = %d, want %d", sd.label, upstreamCxKey, got, sd.want)
+		}
+	}
+
+	// ────────────────────────────────────────────────────────────────────────
+	// Task 10 — /stats/prometheus per-command + splitter cross-side assertions
+	// (§8.1.2). The redis. Prometheus tag-extractor arm (Task 7, name.go) hoists
+	// the stat_prefix to the single envoy_redis_prefix label and flattens the
+	// command/splitter tail into the metric NAME. The reference Envoy is the
+	// source of truth for the exact prom name/label shape
+	// (reference_wire_format_both_sides_see_same_bytes); these keys were
+	// reconciled LIVE against the reference at Task 10.
+	refP, err := scrapeProm(refAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape ref /stats/prometheus: %v", err)
+	}
+	subjP, err := scrapeProm(subjAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape subj /stats/prometheus: %v", err)
+	}
+	promEqual := []string{
+		`envoy_redis_command_get_total{envoy_redis_prefix="redis_r"}`,
+		`envoy_redis_command_get_success{envoy_redis_prefix="redis_r"}`,
+		`envoy_redis_command_incr_total{envoy_redis_prefix="redis_r"}`,
+		`envoy_redis_command_del_total{envoy_redis_prefix="redis_r"}`,
+		`envoy_redis_command_set_total{envoy_redis_prefix="redis_r"}`,
+		`envoy_redis_splitter_invalid_request{envoy_redis_prefix="redis_r"}`,
+		`envoy_redis_splitter_unsupported_command{envoy_redis_prefix="redis_r"}`,
+	}
+	for _, raw := range promEqual {
+		key := canonicalize(raw)
+		rv, rok := refP[key]
+		sv, sok := subjP[key]
+		if !rok {
+			t.Errorf("ref: %s ABSENT in /stats/prometheus", raw)
+			continue
+		}
+		if !sok {
+			t.Errorf("subj: %s ABSENT in /stats/prometheus", raw)
+			continue
+		}
+		if rv != sv {
+			t.Errorf("cross-side mismatch %s: ref=%d subj=%d", raw, rv, sv)
+		}
+	}
+
+	// ────────────────────────────────────────────────────────────────────────
+	// Task 11 — the lifecycle GAUGE assertions (§8.2). The held-open arm parked
+	// one idle PING'd connection per side (driveProxy, before the settle sleep),
+	// so at scrape time exactly ONE downstream connection is live per side.
+	// downstream_cx_active == 1 on BOTH sides (the held-open arm — §8.2). The gauge
+	// renders with a # TYPE gauge line; scrapeProm reads the value identically.
+	for _, sd := range []struct {
+		label string
+		p     map[string]int64
+	}{{"ref", refP}, {"subj", subjP}} {
+		cxk := canonicalize(`envoy_redis_downstream_cx_active{envoy_redis_prefix="redis_r"}`)
+		if got := sd.p[cxk]; got != 1 {
+			t.Errorf("%s: downstream_cx_active = %d, want 1 (held-open arm)", sd.label, got)
+		}
+		// rq_active quiesces to 0 post-workload (§4.4); assert PRESENT (created eager)
+		// AND == 0 (a non-present check would pass vacuously).
+		rqk := canonicalize(`envoy_redis_downstream_rq_active{envoy_redis_prefix="redis_r"}`)
+		if got, ok := sd.p[rqk]; !ok {
+			t.Errorf("%s: downstream_rq_active ABSENT (created eager — should render)", sd.label)
+		} else if got != 0 {
+			t.Errorf("%s: downstream_rq_active = %d, want 0 (quiesced)", sd.label, got)
+		}
+	}
+	// The 2 buffered gauges are a SUBJECT-SIDE coverage boundary: the subject's
+	// framework never wires them (filter.go inc/decs only cx_active + rq_active —
+	// stats.go), so they pin at 0. We therefore assert the SUBJECT == 0 only; the
+	// REFERENCE legitimately tracks buffered bytes and reads NONZERO while the
+	// held-open conn parks its still-buffered PING request (observed: the contrib
+	// reference's downstream_cx_rx_bytes_buffered == 14 == len(respArray("PING")),
+	// the held conn's unconsumed request frame). So buffered is NOT cross-side
+	// equal here and the reference is NOT asserted (close_direction-style framework
+	// coverage boundary). The subject==0 pin is non-vacuous: it proves the subject
+	// renders the gauge AND has not spuriously incremented it.
+	for _, q := range []string{"downstream_cx_rx_bytes_buffered", "downstream_cx_tx_bytes_buffered"} {
+		qk := canonicalize(`envoy_redis_` + q + `{envoy_redis_prefix="redis_r"}`)
+		if got, ok := subjP[qk]; !ok {
+			t.Errorf("subj: %s ABSENT (created eager — should render)", q)
+		} else if got != 0 {
+			t.Errorf("subj: %s = %d, want 0 (subject-side coverage boundary)", q, got)
+		}
+	}
+	// Close the held conns now (cx_active → 0); the t.Cleanup guards a mid-assertion fatal.
+	if d.refHeld != nil {
+		_ = d.refHeld.Close()
+	}
+	if d.subjHeld != nil {
+		_ = d.subjHeld.Close()
+	}
+}
+
+// scrapeProm issues GET /stats/prometheus and returns a map keyed by
+// canonicalize(nameLabels), retaining ONLY lines that begin with "envoy_redis_"
+// (the redis. tag-extractor arm's output — Task 7). Values are parsed as int64.
+func scrapeProm(adminAddr string) (map[string]int64, error) {
+	body, err := httpGet("http://" + adminAddr + "/stats/prometheus")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]int64{}
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "envoy_redis_") {
+			continue
+		}
+		sp := strings.LastIndexByte(line, ' ')
+		if sp < 0 {
+			continue
+		}
+		nameLabels, valStr := line[:sp], line[sp+1:]
+		v, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		out[canonicalize(nameLabels)] = v
+	}
+	return out, nil
+}
+
+// canonicalize normalizes "name{labels}" to a sorted-label form so the assertion
+// key string matches the scraped line regardless of label order. Bare names (no
+// "{") are returned unchanged; an empty label set "name{}" collapses to "name".
+// (Copied from the 0053-kafka driver.)
+func canonicalize(nameLabels string) string {
+	open := strings.IndexByte(nameLabels, '{')
+	if open < 0 {
+		return nameLabels
+	}
+	name := nameLabels[:open]
+	inner := strings.TrimSuffix(nameLabels[open+1:], "}")
+	if inner == "" {
+		return name
+	}
+	pairs := strings.Split(inner, ",")
+	sort.Strings(pairs)
+	return name + "{" + strings.Join(pairs, ",") + "}"
+}
+
+// httpGet issues GET url and returns the response body. (Copied from 0053-kafka.)
+func httpGet(url string) ([]byte, error) {
+	resp, err := http.Get(url) //nolint:gosec // fixed admin URL, test-only
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("read %s body: %w", url, err)
+	}
+	return buf.Bytes(), nil
 }
 
 // scrapeStats issues GET http://<addr>/stats (the FLAT admin text, NOT

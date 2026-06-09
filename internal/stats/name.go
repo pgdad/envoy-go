@@ -299,6 +299,29 @@ func flattenToProm(internal string) (string, []Label, error) {
 			base = "envoy_kafka_" + strings.ReplaceAll(rest, ".", "_")
 			return base, nil, nil // empty labels (no hoist)
 		}
+		// Phase-32.2 redis_proxy SINGLE-label HOIST (ADR-0229; AMEND-R4; the mongo
+		// .rbac. ADR-0218 single-label promotion generalized to a redis. ROOT prefix).
+		// Internal name redis.<stat_prefix>.<rest> → envoy_redis_<rest flattened>
+		// {envoy_redis_prefix="<stat_prefix>"}. Only the stat_prefix is hoisted to a
+		// LABEL; the command name STAYS in the metric name (NOT a label — contrast the
+		// mongo cmd/collection VALUE hoist; the dynamic command.<cmd>.* names flatten
+		// identically, command.get.total → envoy_redis_command_get_total). The dotted
+		// module/info.shard names (command.bf.add.total) flatten dot→underscore. SHAPE
+		// validation (dot-free <prefix>) — an allowlist is impossible given the 180
+		// dynamic command names (the wasm/zookeeper/kafka permissive precedent); a wire
+		// command not in the static table never produces a name (routes to splitter.
+		// unsupported_command — IsValidName by construction, §5.2). KEEP-IN-SYNC:
+		// internal/filter/network/redisproxy/stats.go (the roster name builders).
+		if rest, ok := strings.CutPrefix(internal, "redis."); ok {
+			if idx := strings.IndexByte(rest, '.'); idx > 0 {
+				prefix, tail := rest[:idx], rest[idx+1:]
+				if !strings.ContainsRune(prefix, '.') {
+					labels = append(labels, Label{Key: "envoy_redis_prefix", Value: prefix})
+					base = "envoy_redis_" + strings.ReplaceAll(tail, ".", "_")
+					return base, labels, nil
+				}
+			}
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 
