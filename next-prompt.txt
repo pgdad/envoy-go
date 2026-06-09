@@ -2,6 +2,8 @@ START a fresh cold-start session for envoy-go — **phase 33 (`network-filter-th
 
 The phase-33 SPEC executes the BRAINSTORM §10 empirical pins (D-T1..D-T9) IN-SESSION (parallel-subagent fan-out) live against the contrib reference Envoy + anchors the ADR-0231 §Context. Per `feedback_execution_style` the downstream PLAN→IMPL run subagent-driven; per `feedback_git_worktrees` work in a worktree.
 
+**Worktree hygiene (this session):** the `.worktrees/` tree was swept clean at the phase-33 BRAINSTORM stage-close — 145 stale intermediate worktrees from merged phases 00–31 were removed (142 clean + 3 forced [artifact-only: a stray `envoy-go` build binary + two `.wt-parent` markers]); only the main worktree remains. No commits or source were lost (all branches were squash-merged; worktree removal preserves branch refs). So `git worktree list` is now just `[master]` — create the phase-33 SPEC worktree fresh (anticipated `.worktrees/phase-33-network-filter-thrift-proxy-spec`, branch `phase-33-network-filter-thrift-proxy-spec`).
+
 ## What this session does — the phase-33 {thrift} SPEC
 
 Author `docs/envoy-go/phases/33-network-filter-thrift-proxy/SPEC.md` (+ README.md) for the **phase-33 thrift_proxy network filter** (`thrift_proxy`, `envoy.filters.network.thrift_proxy`, proto `envoy.extensions.filters.network.thrift_proxy.v3.ThriftProxy`). The BRAINSTORM settled the envelope; the SPEC pins the empirical surface against the reference. **The BRAINSTORM decisions the SPEC inherits (do NOT re-litigate):**
