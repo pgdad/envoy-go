@@ -540,6 +540,15 @@ const (
 	// reference_differential_fixture_dispatch_constraint; the TCPMongoResponder = 30
 	// precedent. The exact per-api_key response body is live-verified at Task 13.
 	TCPKafkaResponder BackendKind = 31
+	// TCPRedisResponder is a RESP-aware canned-response TCP backend (32; 32.1 SPEC
+	// §8.3). It reads RESP request frames (array-of-bulk) and returns positional
+	// canned replies for the exercised data commands: SET → +OK\r\n; GET → a bulk
+	// string ($3\r\nbar\r\n for the 0055 round-trip). FIFO/positional — NO
+	// correlation id (contrast TCPKafkaResponder's correlation-id echo). PING/AUTH
+	// never reach the backend (redis_proxy answers them locally — AMEND-R5). NEW
+	// BackendKind per reference_differential_fixture_dispatch_constraint; the
+	// 32.2 command matrix extends the reply table ($-1 GET-miss, :<n> INCR).
+	TCPRedisResponder BackendKind = 32
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

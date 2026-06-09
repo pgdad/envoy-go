@@ -27,6 +27,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network/kafkabroker"
 	"github.com/esalaine/envoy-go/internal/filter/network/mongoproxy"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
+	"github.com/esalaine/envoy-go/internal/filter/network/redisproxy"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
 	"github.com/esalaine/envoy-go/internal/filter/network/zookeeperproxy"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
@@ -44,20 +45,21 @@ func mustAny(t *testing.T, msg proto.Message) *anypb.Any {
 	return a
 }
 
-// TestRegisterBuiltinsRegistersAllNine proves RegisterBuiltins wires all nine
+// TestRegisterBuiltinsRegistersAllTen proves RegisterBuiltins wires all ten
 // built-in network filters (echo, direct_response, tcp_proxy, HCM,
-// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, kafka_broker) into a
-// fresh Registry. Registration only stores factory closures (it builds no
-// filter), so a zero-valued Deps{} is sufficient — rbac_network's,
-// zookeeper_proxy's, mongo_proxy's and kafka_broker's StatsRegistry are nil
-// here, which is fine because registration only captures the closure.
+// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, kafka_broker,
+// redis_proxy) into a fresh Registry. Registration only stores factory closures
+// (it builds no filter), so a zero-valued Deps{} is sufficient — rbac_network's,
+// zookeeper_proxy's, mongo_proxy's, kafka_broker's and redis_proxy's
+// StatsRegistry are nil here, which is fine because registration only captures
+// the closure.
 // reg.Freeze() is called to exercise the post-boot lookup path, consistent with
 // the sibling registration tests.
-func TestRegisterBuiltinsRegistersAllNine(t *testing.T) {
+func TestRegisterBuiltinsRegistersAllTen(t *testing.T) {
 	reg := network.NewRegistry()
 	RegisterBuiltins(reg, Deps{})
 	reg.Freeze()
-	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL, mongoproxy.TypeURL, kafkabroker.TypeURL} {
+	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL, mongoproxy.TypeURL, kafkabroker.TypeURL, redisproxy.TypeURL} {
 		if _, ok := reg.Lookup(tu); !ok {
 			t.Errorf("RegisterBuiltins did not register %q", tu)
 		}
@@ -200,6 +202,23 @@ func TestRegisterBuiltins_IncludesKafkaBroker(t *testing.T) {
 	reg.Freeze()
 	if _, ok := reg.Lookup(kafkabroker.TypeURL); !ok {
 		t.Fatal("kafka_broker not registered as the 9th built-in")
+	}
+}
+
+// TestRegisterBuiltins_RegistersRedisProxy proves redis_proxy is wired as the
+// 10th built-in network filter (32.1; ADR-0229/ADR-0230). UNLIKE the
+// stats-only kafka/mongo/zookeeper registrations, redisproxy passes BOTH
+// deps.ClusterManager (lazy catch_all resolution) AND deps.StatsRegistry (the
+// redis.<sp> roster) — the tcpproxy cluster-capture + stats-capture precedents
+// combined. A non-nil StatsRegistry is supplied because the redis_proxy factory
+// eagerly creates its stat roster; registration only stores the closure here,
+// but a real registry mirrors the boot wiring.
+func TestRegisterBuiltins_RegistersRedisProxy(t *testing.T) {
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{ClusterManager: nil, StatsRegistry: stats.NewRegistry()})
+	reg.Freeze()
+	if _, ok := reg.Lookup(redisproxy.TypeURL); !ok {
+		t.Fatal("redis_proxy not registered as the 10th built-in")
 	}
 }
 

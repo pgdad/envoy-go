@@ -1,6 +1,6 @@
-// Package builtins registers the nine built-in network filters (echo,
+// Package builtins registers the ten built-in network filters (echo,
 // direct_response, tcp_proxy, HCM, rbac_network, sni_cluster, zookeeper_proxy,
-// mongo_proxy, kafka_broker) into a *network.Registry with their boot singletons
+// mongo_proxy, kafka_broker, redis_proxy) into a *network.Registry with their boot singletons
 // captured. It
 // lives OUTSIDE internal/filter/network (which the filters import) and outside
 // internal/listener (whose tests import this), so no import cycle forms
@@ -21,6 +21,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network/kafkabroker"
 	"github.com/esalaine/envoy-go/internal/filter/network/mongoproxy"
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
+	"github.com/esalaine/envoy-go/internal/filter/network/redisproxy"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
 	"github.com/esalaine/envoy-go/internal/filter/network/zookeeperproxy"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
@@ -41,8 +42,8 @@ type Deps struct {
 }
 
 // RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM,
-// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, and kafka_broker into
-// reg. It
+// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, kafka_broker, and
+// redis_proxy into reg. It
 // mirrors the registration calls in cmd/envoy-go/main.go and does NOT Freeze
 // (the caller freezes after any additional registration). reg.Register is void
 // (it panics on a frozen or duplicate registry), so there is no error to thread.
@@ -80,4 +81,11 @@ func RegisterBuiltins(reg *network.Registry, deps Deps) {
 	// mongo_proxy/zookeeper_proxy/rbac_network precedent — FactoryCtx carries no
 	// stats registry).
 	reg.Register(kafkabroker.TypeURL, kafkabroker.NewFactory(deps.StatsRegistry))
+	// redis_proxy: the 10th built-in (32.1; ADR-0229/ADR-0230). UNLIKE the
+	// stats-only kafka/mongo/zookeeper registrations, redisproxy passes BOTH
+	// deps.ClusterManager (lazy catch_all resolution → Cluster.Dial via the
+	// upstream-pool seam, ADR-0230) AND deps.StatsRegistry (the redis.<sp>
+	// roster) — the tcpproxy.NewNetworkFactory cluster-capture + the stats-capture
+	// precedents combined. The project's FIRST terminal routing proxy.
+	reg.Register(redisproxy.TypeURL, redisproxy.NewFactory(deps.ClusterManager, deps.StatsRegistry))
 }

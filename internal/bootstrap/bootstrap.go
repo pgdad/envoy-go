@@ -109,6 +109,14 @@ import (
 	// harness) AND holds the new contrib module dep through `go mod tidy`. Per
 	// ADR-0016 amendment policy, documented in PROGRESS, not a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/contrib/envoy/extensions/filters/network/kafka_broker/v3"
+	// Phase-32.1 registers the redis_proxy network-filter extension proto so
+	// protojson round-trips bootstraps carrying
+	// filter_chains[].filters[].typed_config of that type. Registered
+	// transitively by the redisproxy filter package too; the explicit
+	// blank-import here guarantees resolution in any bootstrap-parsing context
+	// (e.g. the differential harness). ZERO new go.mod dep (AMEND-R1). Per
+	// ADR-0016 amendment policy, documented in PROGRESS, not a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"

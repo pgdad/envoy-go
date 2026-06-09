@@ -1,135 +1,153 @@
-# Phase-31 `kafka_broker` IMPL — PROGRESS
+# Phase 32.1 IMPL — PROGRESS
 
-## Baselines (phase-31 IMPL tip)
+Worktree: `.worktrees/phase-32.1-impl`
+Branch: `phase-32.1-network-filter-redis-upstream-pool-seam-and-codec-impl`
+Base: master `309c72b` (PLAN squash `a28f593` is the substantive predecessor).
+Execution: `superpowers:subagent-driven-development` — fresh subagent per task + two-stage review; subagents commit LOCAL-ONLY; controller squash-merges + pushes at stage-close.
 
-IMPL-session tip at Task 1: `ad1b853` (`next-prompt.txt + STATE.md: advance the live SHA-fill tip to 596fccd (trailing the phase-31 PLAN squash 12f7cac)`), branch `phase-31-network-filter-kafka-broker-impl`.
+## Task 1 — First-action baselines/anchors gate (DONE)
 
-| Anchor | Expected | Actual | OK |
-|---|---|---|---|
-| fixtures count | 54 | 54 | yes |
-| fixtures tail dir | `test/fixtures/0052-mongo-fault-delay` | `test/fixtures/0052-mongo-fault-delay` | yes |
-| fuzzers (`^func Fuzz` over `internal/**/fuzz_test.go`) | 39 | 39 | yes |
-| DECISIONS.md tail heading | ADR-0228 (next-free ADR-0229) | ADR-0228 (DECISIONS.md:14624; next-free ADR-0229) | yes |
-| BackendKind tail | `TCPMongoResponder BackendKind = 30` | `TCPMongoResponder BackendKind = 30` (fixture.go:530) | yes |
-| stat surface | 360 | 360 | yes |
+Re-pinned at the IMPL-session tip (`309c72b`):
 
-### Stat surface = 360 (quoted)
+| Baseline | Value | Verified |
+|---|---|---|
+| fixtures | **56** (tail `0054-kafka-boot-reject`) | yes |
+| fuzzers | **40** | yes |
+| stat surface | **536** (BEHAVIOR_CONTRACT doc count; STATE.md:21) | yes |
+| BackendKind tail | **31** (`TCPKafkaResponder`, fixture.go:542) | yes |
+| DECISIONS tail (heading) | **ADR-0230** (DECISIONS.md:14734; next-free ADR-0231 is only a "next-free" mention) | yes |
 
-- STATE.md:21 — `- **stat surface:** **360** (BEHAVIOR_CONTRACT doc count; +23 mongo fixed roster — 22 counters + the op_query_active gauge — created eagerly per 29.1 SPEC §7.2 / D-P1). ...`
-- BEHAVIOR_CONTRACT.md:466 — `**Phase 29.3 extension — 360 → 360 internal names (zero creation delta; the parent-row-29 ROLLUP):** ... The stat total stays **360**.`
-- STATE.md:23 — `- **DECISIONS.md tail:** **ADR-0228** (next-free **ADR-0229**) ...`
+TypeURL pin (`proto.MessageName(&redis_proxyv3.RedisProxy{})`):
+`envoy.extensions.filters.network.redis_proxy.v3.RedisProxy` → TypeURL = `type.googleapis.com/` + that (the `extensions.` segment, `reference_network_filter_typeurl_extensions`). Import alias: `redis_proxyv3`.
 
-(Target at phase-31 IMPL end: 360 → 536, +176 eager per ADR-0228 / AMEND-K3 — NOT this task.)
+Field roster (go-control-plane `/envoy` v1.32.4 in-tree, `redis_proxy.pb.go`):
+- `(*RedisProxy) GetStatPrefix() string` :292
+- `(*RedisProxy) GetSettings() *RedisProxy_ConnPoolSettings` :299
+- `(*RedisProxy) GetPrefixRoutes() *RedisProxy_PrefixRoutes` :313
+- `(*RedisProxy_ConnPoolSettings) GetOpTimeout() *durationpb.Duration` :590
+- `(*RedisProxy_PrefixRoutes) GetRoutes() []*RedisProxy_PrefixRoutes_Route` :706
+- `(*RedisProxy_PrefixRoutes) GetCatchAllRoute() *RedisProxy_PrefixRoutes_Route` :720
+- `(*RedisProxy_PrefixRoutes_Route) GetCluster() string` :922
 
-## /contrib v1.32.4 — proto.MessageName + Go identifier roster (Step 3)
+`go mod tidy`: CLEAN — `go.mod`/`go.sum` byte-identical (redis_proxy/v3 is CORE `/envoy v1.32.4`; ZERO new module — AMEND-R1/R8).
 
-`/contrib v1.32.4` resolves via `go get github.com/envoyproxy/go-control-plane/contrib@v1.32.4` (probed in `/tmp/d31probe`).
+§11.1 as-built anchors (compile-reachable):
+- `(*Cluster) IncUpstreamRqTotal()` `internal/cluster/cluster.go:134`
+- `(*Cluster) Dial(ctx) (net.Conn, Endpoint, error)` `internal/cluster/cluster.go:198`
+- `(*Manager) Get(name) (*Cluster, bool)` `internal/cluster/manager.go:111`
+- `TerminalFilter.Handle(ctx, downstream net.Conn)` `internal/filter/network/terminal.go:48`
+- kafkabroker registration site `internal/filter/network/builtins/builtins.go:82`
 
-`proto.MessageName(&kbv3.KafkaBroker{})` =
-```
-envoy.extensions.filters.network.kafka_broker.v3.KafkaBroker
-```
-
-Source file probed:
-`$(go env GOMODCACHE)/github.com/envoyproxy/go-control-plane/contrib@v1.32.4/envoy/extensions/filters/network/kafka_broker/v3/kafka_broker.pb.go`
-
-### KafkaBroker getters (5-field accessor set)
-
-```go
-func (x *KafkaBroker) GetStatPrefix() string                                            // :92
-func (x *KafkaBroker) GetForceResponseRewrite() bool                                     // :99
-func (x *KafkaBroker) GetIdBasedBrokerAddressRewriteSpec() *IdBasedBrokerRewriteSpec     // :113
-func (x *KafkaBroker) GetApiKeysAllowed() []uint32                                       // :120
-func (x *KafkaBroker) GetApiKeysDenied() []uint32                                        // :127
-```
-
-### Oneof (`broker_address_rewrite_spec`)
-
-```go
-// oneof getter (returns the interface):
-func (m *KafkaBroker) GetBrokerAddressRewriteSpec() isKafkaBroker_BrokerAddressRewriteSpec  // :106
-// oneof interface name:
-type isKafkaBroker_BrokerAddressRewriteSpec interface { isKafkaBroker_BrokerAddressRewriteSpec() }  // :134
-// oneof wrapper type (the single member):
-type KafkaBroker_IdBasedBrokerAddressRewriteSpec struct { ... }                              // :138
-```
-
-`GetIdBasedBrokerAddressRewriteSpec()` (:113) type-asserts `GetBrokerAddressRewriteSpec().(*KafkaBroker_IdBasedBrokerAddressRewriteSpec)`.
-
-### Nested rule accessors
-
-```go
-func (x *IdBasedBrokerRewriteSpec) GetRules() []*IdBasedBrokerRewriteRule   // :186
-func (x *IdBasedBrokerRewriteRule) GetId() uint32                           // :243
-func (x *IdBasedBrokerRewriteRule) GetHost() string                        // :250
-func (x *IdBasedBrokerRewriteRule) GetPort() uint32                        // :257
-```
-
-## As-built anchor line numbers (Step 4 — snapshot for Tasks 2/10/11/12; they drift)
-
-| File | Anchor | Line | Action |
-|---|---|---|---|
-| `internal/filter/network/builtins/builtins.go` | `reg.Register(mongoproxy.TypeURL, mongoproxy.NewFactory(deps.StatsRegistry))` (the 8th reg) | 74 | insert kafka reg AFTER |
-| `internal/filter/network/builtins/builtins.go` | doc `built-in network filters` (`registers the eight built-in network filters`) | 1 | "eight" → "nine" |
-| `internal/bootstrap/bootstrap.go` | `_ ".../filters/network/mongo_proxy/v3"` blank-import | 103 | insert kafka_broker/v3 blank-import AFTER |
-| `internal/stats/name.go` | default error `has no recognized top-level segment` | 290 | kafka. arm goes BEFORE this |
-| `internal/stats/name.go` | `strings.CutPrefix(internal, "mongo.")` (the mongo. arm) | 278 | insert kafka. arm AFTER |
-| `test/differential/fixture/fixture.go` | `TCPMongoResponder BackendKind = 30` (BackendKind tail) | 530 | new responder = 31 AFTER |
-
-## Task 16 — full differential re-verify
-
-Full differential suite re-run at branch tip (`go test ./test/differential/ -count=1 -v`):
-
-```
---- PASS: TestDifferential (187.31s)
-PASS
-ok  	github.com/esalaine/envoy-go/test/differential	189.250s
-```
-
-**56/56 fixtures green** (PASS subtests = 56, FAIL = 0). Confirmed:
-
-- **Fixture-dir count = 56** (`ls -d test/fixtures/[0-9]* | wc -l`); tail = `0053-kafka-requests`, `0054-kafka-boot-reject`.
-- **The 2 new dirs PASS**: `--- PASS: TestDifferential/0053-kafka-requests (6.25s)` (cross-side `StatsAsserter`, the LIVE request+response per-key proof) and `--- PASS: TestDifferential/0054-kafka-boot-reject (1.51s)`.
-- **The 54 prior dirs (0000-0052) stayed byte-exact** — the R1 passthrough-invariant / back-compat proof. The differential runner's `CompareBytes` gate is byte-for-byte against reference Envoy; all 54 pre-kafka fixtures passing unchanged is the load-bearing evidence that the kafka_broker work touched NO shared path (the sniffer never mutated bytes). Full per-fixture PASS list captured in `/tmp/diff31.log`.
-
-**R4 liveness** — the deliberate-break proofs for each asserted subject counter are recorded in `test/fixtures/0053-kafka-requests/README.md` (§ "R4 deliberate-break liveness proofs", the 5-row table: `incRequest` / `incRequestUnknown` / `incRequestFailure` / `incResponse` / `incResponseFailure`, each → its `= 0, want N` assertion failure). Re-confirmed the mechanism still works under `-count=1`: broke `incResponse` (core D-P4 counter) in `internal/filter/network/kafkabroker/stats.go`, ran `go test ./test/differential/ -run 'TestDifferential/0053' -count=1` → observed `FAIL: subj envoy_kafka_kafka_r_response_api_versions_response = 0, want 1` (matching the README row), then `git restore` (no checkout-sha / no amend; HEAD stayed on branch).
+Targets at Task 16: fixtures 56→58, fuzzers 40 (unchanged), stats 536→546 (+10 fixed: 6 counters + 4 gauges), BackendKind 31→32 (`TCPRedisResponder`), DECISIONS tail STAYS ADR-0230 (body fills in place).
 
 ## Per-task log
 
-- [x] Task 1: baselines gate — fixtures 54 / fuzzers 39 / stat surface 360 / DECISIONS tail ADR-0228 (next-free ADR-0229) / BackendKind tail 30 (TCPMongoResponder) all re-confirmed at tip `ad1b853`; `proto.MessageName(&kbv3.KafkaBroker{})` = `envoy.extensions.filters.network.kafka_broker.v3.KafkaBroker`; `/contrib v1.32.4` resolves; KafkaBroker getter/oneof/nested-rule roster + anchor line numbers pinned above. No discrepancies.
-- [x] Task 2: /contrib dep + blank-import + skeleton + TypeURL — commit `8267440` (`/contrib v1.32.4` dep + `kafka_broker/v3` blank-import + kafkabroker skeleton + TypeURL).
-- [x] Task 3: config parse + PGV arms + IsValidName guard — commit `2c33936` (5-field config parse + PGV reject arms + `stat_prefix` IsValidName guard).
-- [x] Task 4: api_key->(root,maxVersion) table + golden test — commit `e82763b` (static 86-entry table, Appendix B + the D-PLAN-1 maxVersion column, byte-stable golden test).
-- [x] Task 5: flexibleVersions predicate + ApiVersions(18) special-case — commit `510b0d0` (Appendix C + the response-header special-case + table test).
-- [x] Task 6: EAGER 176-counter roster — commit `efa92f8` (86×2 per-key + 4 fixed under `kafka.<stat_prefix>.` + the flexibleSince keyset-invariant test).
-- [x] Task 7: Kafka decoder + framing + request-header + correlation map — commit `8608e95` (+ follow-up `70d9ff0` framing-garbage zero-count + resync).
-- [x] Task 8: response-header decoder + correlation recover/erase + -race test — commit `fc2caf3` (unregistered → `response.failure` + `-race`; + follow-up `663b0e6` pinning response malformed-frame → `response.failure` through `decodeOnWrite`).
-- [x] Task 9: ReadFilter/WriteFilter glue + factory — commit `56a43eb` (pure copying sniffer; always Continue, never mutate/close; + follow-up `f819d78` documenting the WriteFilter-for-28.1b-read-seam rationale).
-- [x] Task 10: register as 9th built-in + boot smoke — commit `17b97d1`.
-- [x] Task 11: kafka. INLINE Prometheus arm in name.go — commit `0d99761` (`envoy_kafka_<sp>_<rest>{}` empty labels, no hoist; + follow-up `4ceaf5b` renaming the tests to the `TestFlattenToProm_` convention).
-- [x] Task 12: TCPKafkaResponder BackendKind (31) — commit `4852681` (correlation-id-echoing Kafka responder).
-- [x] Task 13: 0053-kafka-requests cross-side fixture + R4 proofs — commit `1400182` (cross-side StatsAsserter, 6 arms + R4 liveness proofs; the `*.failure` ref=2/subj=1 abandon-at-close asymmetry pinned to exact per-side values).
-- [x] Task 14: 0054-kafka-boot-reject fixture — commit `93ad259` (missing `stat_prefix`; both sides reject at boot).
-- [x] Task 15: 40th fuzzer FuzzKafkaDecode — commit `70bc677` (both directions: no-panic + no-mutation + bounded-buffer).
-- [x] Task 16: full differential re-verify — 56/56 byte-exact (54 prior dirs back-compat + 0053 + 0054), suite `ok ... 189.250s`; R4 liveness recorded in `0053/README.md` and re-confirmed under `-count=1` (broke `incResponse` → `response_api_versions_response = 0, want 1`, then `git restore`). Commit `9efc8bb`.
-- [x] Task 17: completion bundle + six gates — this commit (BEHAVIOR_CONTRACT 360→536 + the ADR-0228 §Decision/§Consequences body in-place + STATE/ROADMAP row 31 `in-progress → done` + next-prompt.txt rewrite + the six-gate evidence below).
+- [x] Task 1 — baselines/anchors gate
+- [x] Task 2 — redisproxy skeleton + TypeURL (commit 22744b1; spec+quality APPROVED)
+- [x] Task 3 — config.go parse (commit 7914295; spec+quality APPROVED)
+- [x] Task 4 — byte-stable reject table test (commit ba350c4; APPROVED, liveness confirmed non-vacuous)
+- [x] Task 5 — resp.go part 1 (request decode) (commit 71b6d46; APPROVED). NOTE 3 reviewed+validated deviations from PLAN verbatim: (1) dropped unused `bytes` import in resp_test.go (compile), (2) inline path guards reply-type first bytes `+ - : $ @` → errProtocol (PLAN verbatim would parse `$3\r\nfoo\r\n` as cmd and fail its own MalformedNeverPanics test; guard matches PLAN intent, over-rejects no valid inline cmd), (3) comment misspell analogue→analog.
+- [x] Task 6 — resp.go part 2 (reply decode + encode constants) (commit 917e8e5; APPROVED). DEVIATION (controller-approved): PLAN verbatim grouped `:` with `+`/`-` framing-only, but PLAN's own MalformedNeverPanics requires `:x\r\n` to error → split `:` out + `strconv.Atoi` validate (errProtocol on non-numeric); `+`/`-` stay framing-only. Other 4 malformed cases pass under PLAN verbatim. Verbatim-bytes + no-panic + nested-array recursion all verified.
+- [x] Task 7 — upstreampool.go seam (commit 55d651a; APPROVED). 5 invariants verified: no internal/cluster import leak (go list -deps CLEAN), ADDITIVE (only 2 new files, existing package byte-identical), lazy dial, single-flight reuse, no mutex/pool (YAGNI). Minor deviation: test-only `defer func(){_=u.Close()}()` for errcheck (package convention).
+- [x] Task 8 — commands.go PING/AUTH (commit b6db4ba; APPROVED, no deviations; ECHO/TIME/QUIT/HELLO correctly NOT local at 32.1)
+- [x] Task 9 — stats.go 10-name roster (commit f8a2164; APPROVED, no deviations). 10 names byte-exact vs ALL_REDIS_PROXY_STATS (6 counters + 4 gauges), eager+idempotent, only 4 inc accessors (deferred names not over-built).
+- [x] Task 10 — filter.go NewFactory + Handle pump (commit a95ca3d; APPROVED — capstone). Production Handle/NewFactory/resolveCatchAll = PLAN verbatim (zero logic drift). 2 TEST-ONLY deviations: (1) interleaved SET→read+OK→GET→read-bar choreography (PLAN's consecutive writes deadlock synchronous net.Pipe; 32.1 pump is depth-1 single-flight, pipelining deferred), (2) added TestNewFactory_ValidConfig (PLAN's validAny helper was unused → lint). Full pkg -race clean.
+- [x] Task 11 — 10th built-in + bootstrap blank-import (commit 7a60720; APPROVED). redisproxy registered with BOTH deps.ClusterManager + deps.StatsRegistry; all-nine test extended to all-ten (no prior assertion dropped); bootstrap blank-import added; go mod tidy CLEAN (zero new dep). gofmt reordered import alphabetically (cosmetic); new test uses nil cm (safe — NewFactory closure-captures, derefs only at Handle).
+- [x] Task 12 — TCPRedisResponder BackendKind (32) (commit b9884b5; APPROVED). Constant in fixture.go + serve loop in runner_test.go (where kafka/mongo responders are dispatched — anticipated by PLAN File Structure). RESP array-of-bulk parser validated no-desync (consumes all n bulks incl trailing \r\n via io.ReadFull(len+2)); SET→+OK, GET→$3 bar, FIFO no correlation id; no production redisproxy import. Inert until Task 13.
+- [x] Task 13 — 0055 driver part 1 (PING arm) (commit cacfea3; APPROVED). Cross-side [redis_proxy] TERMINAL bootstraps (no tcp_proxy), RESP builders, PING local-reply arm. Test BOOTS real contrib reference Envoy + subject; +PONG byte-identical cross-side; CompareBytes is LIVE (reads from live proxy conns, no fabrication). ref=STRICT_DNS+host.docker.internal, subj=STATIC+127.0.0.1 (kafka/mongo precedent).
+- [x] Task 14 — 0055 driver part 2 (SET/GET + StatsAsserter + R6) (commits 3e63565 + follow-up 2ba177a; APPROVED). SET/GET cross-side byte-equivalence (+OK / $3 bar) + AssertStats cross-side EQUALITY on 6 names (redis.redis_r.downstream_{cx_total,rq_total=4,cx_rx_bytes_total,cx_tx_bytes_total} + cluster.redis_cluster.upstream_cx_total=1, upstream_rq_total=2). R6: 5 deliberate breaks each FAIL with -count=1 then revert→PASS; committed code is the PASS version (no leftover perturbation). NO cross-side divergence.
+  - **UNPLANNED PRODUCTION ADDITION (justified):** added `internal/admin/stats.go` — a flat `GET /stats` admin endpoint (`name: value\n`, sorted). envoy-go had only `/stats/prometheus`, which omits redis.* (the `redis.` prom tag-extractor is 32.2); PLAN D-S32.1-5 explicitly required a flat-`/stats` scrape → endpoint had to exist. Purely additive (new route only; existing handlers untouched → 56-fixture back-compat safe). Follow-up 2ba177a routed it through the shared `writeAdminHeaders` helper (uniform 4-header set) + added a header-assertion test.
+  - **TASK 16 MUST DOCUMENT:** BEHAVIOR_CONTRACT Admin API section says "seven endpoints/routes" (lines ~614/616/618/729) → now EIGHT; add `GET /stats` (flat internal-name text; phase 32.1; for the 0055 AssertStats scrape) to the endpoint list + the applies-to header list. The admin.go inline doc was already bumped to "eight routes".
+- [x] Task 15 — 0056-redis-boot-reject (commits fbffd6e + follow-up 96d7681; APPROVED). Symmetric boot-reject: both sides fail to boot on omitted stat_prefix (reference PGV `RedisProxyValidationError.StatPrefix`, subject `redis_proxy: stat_prefix is required`). LIVENESS FIX: original substring `stat_prefix` matched the reference ONLY via a circular driver comment (reference's real error is CamelCase `StatPrefix`, no lowercase token). Changed common substring to `redis_proxy` (genuinely in both real stderrs: subject error prefix + reference filter name/@type); removed circular comment; R6 bogus→FAIL, revert→PASS proves liveness. PRIMARY assertion (both fail to boot) is load-bearing; substring is secondary sanity. Separate dir from 0055 (cross-side XOR boot-reject constraint).
+- [x] Task 16 — completion bundle + six-gate (no commit SHA yet — commit is this task's output; see below).
 
-## Task 17 — six-gate evidence
+## Task 16 — Completion bundle detail
 
-All gates RUN LIVE at the phase-31 IMPL Task 17 (2026-06-08, branch `phase-31-network-filter-kafka-broker-impl`). Real outputs quoted below.
+### Six-gate evidence (all GREEN)
 
-**Gate 1 — `go build ./...`** → clean, EXIT=0 (no output).
+**Gate 1: `go build ./...`**
+```
+(no output — clean build)
+```
 
-**Gate 2 — `go vet ./...`** → clean, EXIT=0 (no output).
+**Gate 2: `go vet ./...`**
+```
+(no output — clean)
+```
 
-**Gate 3 — `golangci-lint run`** → clean, EXIT=0 (no findings, no output).
+**Gate 3: `golangci-lint run`**
+```
+(no output — clean)
+```
 
-**Gate 4 — `go test ./... -race -short`** → EXIT=0; **81 ok packages, 0 FAIL** (71 no-test packages). The `kafkabroker` package: `ok  github.com/esalaine/envoy-go/internal/filter/network/kafkabroker`. (One earlier whole-module run flagged a bare transient `FAIL` under concurrent load with the lint job; the clean re-run with no other load reported zero non-ok lines, EXIT=0 — a confirmed environmental flake, not a code failure.)
+**Gate 4: `go test ./... -race -short`**
+```
+ok  	github.com/esalaine/envoy-go/internal/admin	(cached)
+ok  	github.com/esalaine/envoy-go/internal/bootstrap	(cached)
+ok  	github.com/esalaine/envoy-go/internal/cluster	(cached)
+ok  	github.com/esalaine/envoy-go/internal/filter/network	(cached)
+ok  	github.com/esalaine/envoy-go/internal/filter/network/redisproxy	(cached)
+ok  	github.com/esalaine/envoy-go/internal/filter/network/kafkabroker	(cached)
+ok  	github.com/esalaine/envoy-go/internal/filter/network/mongoproxy	(cached)
+... (all 81+ packages ok, -race clean)
+```
 
-**Gate 5 — `go test ./test/differential/ -count=1`** → **56/56 PASS** byte-exact (54 prior dirs back-compat + `0053-kafka-requests` + `0054-kafka-boot-reject`). Authoritative clean run (serial, `-p 1 -parallel 1 -v` to avoid the parallel-Docker-load subject-startup flake): `--- PASS: TestDifferential/0053-kafka-requests (6.17s)`, `--- PASS: TestDifferential/0054-kafka-boot-reject (1.51s)`, 56 PASS / 0 FAIL subtests, `ok  github.com/esalaine/envoy-go/test/differential  186.915s`, EXIT=0. (Two earlier default-parallelism whole-suite runs each flaked on a DIFFERENT HTTP-filter fixture — `0036-http-wasm-body-and-advanced` then `0027-http-lua-full-bridge` — both with the `subject ready: EOF` subject-startup signature, NEVER on the kafka fixtures; each PASSES 2/2 in isolation. This is a pre-existing harness flake — `StartSubjectProxy` does a per-fixture `go build` + process-start that occasionally loses the subject under heavy parallel container churn — unrelated to phase 31, which touches no HTTP path. Serialized, the full suite is 56/56 green; this matches the Task 16 logged 56/56.)
+**Gate 5: `go test ./test/differential/ -count=1` (full 58-dir suite)**
 
-**Gate 6 — conformance (asserted-UNAFFECTED + re-run green).** Phase 31 touches no HTTP/h2/proxy-wasm code path (it is an L4 network filter on a `[kafka_broker, tcp_proxy]` chain), so the conformance gates cannot be affected; re-run LIVE as a sanity check:
-- **h2spec** — `go test ./test/conformance/h2spec/... -count=1` → `ok  github.com/esalaine/envoy-go/test/conformance/h2spec  2.685s`, EXIT=0; report: **53 tests, 53 passed, 0 skipped, 0 failed**.
-- **proxy-wasm** — `go test ./test/conformance/proxy-wasm/... -count=1` → `ok  github.com/esalaine/envoy-go/test/conformance/proxy-wasm  0.247s`, EXIT=0; **all 10 families PASS** (bytecode_util, endianness, exports, logging, pairs_util, runtime, security, shared_data, stop_iteration, wasm_vm).
+Run 1 — 57 PASS, 1 FAIL (transient Docker timing flake):
+- FAIL: `0046-zookeeper-requests` — Docker container startup saturation under load (58 containers starting in rapid succession); the container started late, not a real regression.
+- All others (0000–0045, 0047–0056) PASS including the NEW 0055 and 0056.
+- Confirmed flake: ran `0046` in ISOLATION → PASS at 4.52s immediately. Ran the full suite a SECOND time:
 
-**Counts at phase-done (consistent across BEHAVIOR_CONTRACT + STATE + ROADMAP):** stat surface **360 → 536** (+176 eager counters; the 86 response-duration histograms DEFERRED per ADR-0060 NOT counted); fixtures **54 → 56** (tail `0054-kafka-boot-reject`); fuzzers **39 → 40** (`FuzzKafkaDecode`); BackendKind tail **30 → 31** (`TCPKafkaResponder`); DECISIONS.md tail **ADR-0228** (next-free **ADR-0229**; body landed IN-PLACE per ADR-0044, NO new number); ROADMAP row 31 `in-progress → done` (a flat §9 row, NO parent rollup); §9 candidate count 3 → 2 ({redis, thrift} remain). Recipe verification: `ls -d test/fixtures/[0-9]* | wc -l` = 56; `grep -rh "^func Fuzz" $(find ./internal -name fuzz_test.go) | wc -l` = 40.
+Run 2 — ALL 58 PASS:
+```
+ok  	github.com/esalaine/envoy-go/test/differential	190.390s
+```
+Exit code 0. h2spec 53/53 + proxy-wasm 10/10 UNAFFECTED (phase 32.1 touches no HTTP/h2/proxy-wasm path).
+
+**Gate 6: fixture/fuzzer/stat/BackendKind/DECISIONS counts at Task 16**
+
+| Baseline (Task 1) | Target (Task 16) | Actual |
+|---|---|---|
+| fixtures 56 | 58 | **58** (tail `0056-redis-boot-reject`) |
+| fuzzers 40 | 40 (unchanged) | **40** (`FuzzRESPDecode` defers to 32.2) |
+| stat surface 536 | 546 (+10 fixed) | **546** |
+| BackendKind tail 31 | 32 (`TCPRedisResponder`) | **32** |
+| DECISIONS tail ADR-0230 | STAYS ADR-0230 (body fills in-place) | **ADR-0230** (ACCEPTED) |
+
+All six targets HIT. Six-gate is **GREEN**.
+
+### Completion bundle — what was done
+
+- **ADR-0230 §Decision/§Consequences** body filled IN-PLACE in `docs/envoy-go/DECISIONS.md` (status DRAFT → ACCEPTED per ADR-0044). Covers: 6 exported identifiers (`UpstreamDialFunc`, `UpstreamConn`, `NewUpstreamConn`, `Send`, `Reader`, `Close`); dial-closure decoupling (NO `internal/cluster` import in `internal/filter/network`); one-conn-per-downstream MVP; lazy dial; depth-1 FIFO/positional pop-front; deferred: shared per-host pool + deep queue + two-goroutine pipelined model + ADR-0223 mutex.
+- **ADR-0229 §Decision/§Consequences 32.1 half** filled IN-PLACE (status DRAFT → PARTIAL — 32.2 half deferred). 9 numbered items: package layout, config parse, RESP codec, PING/AUTH local-reply, 10-name roster, Handle pump, 10th built-in, TCPRedisResponder, 0055+0056 fixtures.
+- **BEHAVIOR_CONTRACT.md 32.1 bundle:**
+  - Admin endpoint count: "seven" → "eight" (4 occurrences on lines ~614/616/618/729).
+  - NEW `GET /stats` subsection (flat internal-name text; sorted; phase 32.1; for the 0055 `StatsAsserter` scrape).
+  - NEW `Phase 32.1 extension — 536 → 546 internal names` block (10 fixed: 6 counters + 4 gauges; 32.2 anticipation note).
+  - NEW `### envoy.filters.network.redis_proxy` subsection (10th built-in; TERMINAL routing proxy; 10 names; PING/AUTH local; 0055/0056 fixtures; 32.2 forward-pointer).
+  - NEW `## Network filters — upstream connection-pool / cluster-routing seam (32.1)` section (`UpstreamConn` seam; SIXTH structural extension; dial-closure decoupling; no-mutex MVP; deferred boundary).
+- **STATE.md:** active-phase → IMPL done; lifecycle-state → 32.2 SPEC; next-skill → `superpowers:writing-plans`; counts advanced (fixtures 58, stat surface 546, BackendKind 32); DECISIONS tail → body LANDED (ACCEPTED); last-commit → IMPL completion; next-free ADR → ADR-0231 (unchanged).
+- **ROADMAP.md:** sub-row 32.1 `in-progress → done` + IMPL-DONE annotation (parent row 32 STAYS `in-progress`; 32.2 STAYS `planned`).
+- **next-prompt.txt:** full REWRITE for the 32.2-SPEC cold-start (full command set + per-command/splitter/REDIS_CLUSTER_STATS roster + `redis.` LABEL-HOISTED Prometheus arm + 4 gauge inc/dec + differential command matrix + 41st fuzzer `FuzzRESPDecode` + parent-row-32 ROLLUP; reads-first list).
+
+## Controller stage-close verification (independent)
+
+The controller independently re-ran the six-gate at the branch tip (NOT trusting the implementer report):
+
+- GATE 1 `go build ./...` → OK
+- GATE 2 `go vet ./...` → OK
+- GATE 3 `golangci-lint run` → exit 0 (clean)
+- GATE 4 `go test ./... -race -short` → exit 0 (clean)
+- GATE 5 `go test ./test/differential/ -count=1` → **`ok 192.686s`, exit 0** (all 58 dirs; the 56 pre-existing byte-identical — the seam is ADDITIVE — + 0055/0056)
+- GATE 6 h2spec 53/53 + proxy-wasm 10/10 → asserted-unaffected (32.1 touches no HTTP/h2/proxy-wasm path)
+
+Two-stage review for every task (spec-compliance + code-quality), independent reviewers reading the actual code/running gates. Notable review catches in the loop:
+- Task 6: PLAN self-contradiction (`:x\r\n`) — `:` integer validation added (controller-approved).
+- Task 14: unplanned production `GET /stats` endpoint (justified — PLAN D-S32.1-5 required a flat-`/stats` scrape that didn't exist) + follow-up routing it through `writeAdminHeaders` for the uniform admin-header invariant.
+- Task 15: boot-reject substring was circular (matched only the driver's own echoed comment; reference's real error is CamelCase `StatPrefix`) → changed to `redis_proxy` (genuinely in both real stderrs) + R6 bogus→FAIL/revert→PASS liveness proof.
+- Task 16: STATE.md active-phase/lifecycle-state/next-skill prose still carried stale "Next → the 32.1 IMPL" PLAN-era narrative → rewritten to the 32.2-SPEC-forward reality (commit 23ba550).
+
+- [x] Task 16 — completion bundle + six-gate (commits 15956a4 + STATE prose fix 23ba550; controller six-gate GREEN)
+
+Branch ready for controller squash-merge to master + push to origin (feedback_push_to_origin / feedback_subagents_no_push).

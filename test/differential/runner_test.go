@@ -78,6 +78,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0052-mongo-fault-delay/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0053-kafka-requests/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0054-kafka-boot-reject/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0055-redis-roundtrip/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0056-redis-boot-reject/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -883,6 +885,19 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptKafkaResponder(ln, bo.accepts)
+		case fixture.TCPRedisResponder:
+			// RESP-aware canned responder (32.1 SPEC §8.3): positional canned replies
+			// for the exercised data commands (SET → +OK, GET → bulk "bar"). FIFO/
+			// positional — NO correlation id. PING/AUTH never reach the backend
+			// (redis_proxy answers them locally — AMEND-R5).
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptRedisResponder(ln, bo.accepts)
 		}
 		backends[i] = bo
 	}
@@ -2391,5 +2406,96 @@ func TestKafkaResponderBackend(t *testing.T) {
 	}
 	if markerCorr != kafkaMarkerUncorrelated+50000 {
 		t.Errorf("marker response correlation_id = %d, want %d (correlation_id+50000)", markerCorr, kafkaMarkerUncorrelated+50000)
+	}
+}
+
+// acceptRedisResponder accepts connections, counts them, and runs the RESP-aware
+// canned-response loop on each (the TCPRedisResponder backend — 32.1 SPEC §8.3;
+// the acceptKafkaResponder sibling).
+func acceptRedisResponder(ln net.Listener, counter *atomic.Uint64) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		counter.Add(1)
+		go redisRespondLoop(c)
+	}
+}
+
+// redisRespondLoop reads RESP request frames (array-of-bulk: *<n>\r\n followed by
+// n bulk strings $<len>\r\n<bytes>\r\n) and writes positional canned replies until
+// the client closes. It is NOT a Redis server — it parses ONLY the command name
+// (first bulk element, uppercased): SET → "+OK\r\n"; GET → "$3\r\nbar\r\n"; any
+// other → "-ERR unsupported\r\n". FIFO/positional — NO correlation id (contrast
+// kafkaRespondLoop's correlation-id echo). PING/AUTH never reach the backend
+// (redis_proxy answers them locally — AMEND-R5).
+func redisRespondLoop(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	r := bufio.NewReader(c)
+	for {
+		// Read the array header: *<n>\r\n
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return // EOF or error
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if len(line) < 2 || line[0] != '*' {
+			return // malformed
+		}
+		var n int
+		if _, err := fmt.Sscanf(line[1:], "%d", &n); err != nil || n < 1 {
+			return // malformed or empty array
+		}
+		// Read the first bulk string (command name).
+		cmdLine, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		cmdLine = strings.TrimRight(cmdLine, "\r\n")
+		if len(cmdLine) < 2 || cmdLine[0] != '$' {
+			return // malformed
+		}
+		var cmdLen int
+		if _, err := fmt.Sscanf(cmdLine[1:], "%d", &cmdLen); err != nil || cmdLen < 1 {
+			return
+		}
+		cmdBytes := make([]byte, cmdLen+2) // +2 for \r\n
+		if _, err := io.ReadFull(r, cmdBytes); err != nil {
+			return
+		}
+		cmd := strings.ToUpper(strings.TrimRight(string(cmdBytes), "\r\n"))
+		// Discard the remaining n-1 bulk elements.
+		for i := 1; i < n; i++ {
+			hdr, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			hdr = strings.TrimRight(hdr, "\r\n")
+			if len(hdr) < 2 || hdr[0] != '$' {
+				return
+			}
+			var argLen int
+			if _, err := fmt.Sscanf(hdr[1:], "%d", &argLen); err != nil || argLen < 0 {
+				return
+			}
+			discard := make([]byte, argLen+2) // +2 for \r\n
+			if _, err := io.ReadFull(r, discard); err != nil {
+				return
+			}
+		}
+		// Write the canned reply.
+		var reply string
+		switch cmd {
+		case "SET":
+			reply = "+OK\r\n"
+		case "GET":
+			reply = "$3\r\nbar\r\n"
+		default:
+			reply = "-ERR unsupported\r\n"
+		}
+		if _, err := c.Write([]byte(reply)); err != nil {
+			return
+		}
 	}
 }
