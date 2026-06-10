@@ -983,12 +983,26 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	refAddr := ref.ListenerAddr(d.ReferenceListenerPort())
 
 	// 3. Subject proxy.
-	subjPort := freeTCPPort(t)
-	subjAdminPort := freeTCPPort(t)
-	subjCfg := d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPorts, subjAdminPort)
-	subj, err := StartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
-	if err != nil {
-		t.Fatalf("subj start: %v", err)
+	//
+	// Multi-listener fixtures derive ports as subjPort+1..+N without reserving
+	// them, so a freshly-allocated base port can collide with a port grabbed in
+	// the window between freeTCPPort's close and envoy-go's bind. Retry the whole
+	// allocate→render→start sequence on bind collisions (seen on CI as
+	// "address already in use" followed by "subject ready: EOF").
+	var subj *SubjectProxy
+	for attempt := 1; ; attempt++ {
+		subjPort := freeTCPPort(t)
+		subjAdminPort := freeTCPPort(t)
+		subjCfg := d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPorts, subjAdminPort)
+		var serr error
+		subj, serr = StartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
+		if serr == nil {
+			break
+		}
+		if attempt >= 3 {
+			t.Fatalf("subj start (attempt %d): %v", attempt, serr)
+		}
+		t.Logf("subj start attempt %d failed (%v); retrying with fresh ports", attempt, serr)
 	}
 	defer func() { _ = subj.Stop() }()
 
