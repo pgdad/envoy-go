@@ -600,10 +600,10 @@ static_resources:
 // referenceTmpl is the reference Envoy bootstrap template.
 // Parameters: backendPort0, backendPort1, backendPort2.
 //
-// The access log is written to /envoy-go-test/envoy-access.log (bind-mounted to the host
-// at refLogPath). Envoy v1.37.2 flushes the file access logger buffer on a
-// periodic timer (default 1s). AssertAccessLog polls with a 30s deadline to
-// accommodate the timer.
+// The access log is written to /envoy-go-test/envoy-access.log (bind-mounted
+// to the host at refLogPath). Envoy v1.37.2 flushes the file access logger
+// buffer on a periodic timer (default 1s). AssertAccessLog polls with a 30s
+// deadline to accommodate the timer.
 var referenceTmpl = `admin:
   address:
     socket_address: { address: 0.0.0.0, port_value: 9901 }
