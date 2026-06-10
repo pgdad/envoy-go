@@ -42,7 +42,6 @@ import (
 
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/stats"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
 	"github.com/esalaine/envoy-go/internal/wasm/abi"
 )
 
@@ -625,14 +624,23 @@ func TestNew_ReturnsWorkingFactory(t *testing.T) {
 	if factory == nil {
 		t.Fatal("New returned nil factory; want non-nil")
 	}
-	// New holds the compiledConfig only via the factory closure (no exposed
-	// Close), so the registry-acquired *RootVM would leak past this test.
-	// Drop it via the test-only reset hook (safety net for the non-helper path).
-	t.Cleanup(func() { internalwasm.DefaultRegistry.ResetForTest() })
-
 	// The closure produces fresh HTTPFilter instances on each call.
 	hf1 := factory()
 	hf2 := factory()
+
+	// New holds the shared *compiledConfig only via the factory closure, so
+	// recover it from a produced filter instance and Close it (refcount-
+	// balanced DefaultRegistry.Release) at cleanup so the registry-acquired
+	// *RootVM does not leak past this test. Deliberately NOT
+	// DefaultRegistry.ResetForTest(): this test runs in the t.Parallel phase
+	// and ResetForTest force-closes EVERY registry entry regardless of
+	// refcount — including *RootVMs held by concurrently-running parallel
+	// tests, which then fail with "NewStreamContext on closed RootVM"
+	// (the 2-core-CI flake in TestFilter_ConcurrentStreams_NoSharedState +
+	// TestFilter_RootVM_SharedAcrossStreams_NoCrossStreamLeak).
+	if f, ok := hf1.Decoder.(*filter); ok && f.cfg != nil {
+		t.Cleanup(func() { _ = f.cfg.Close() })
+	}
 	if hf1.Name != filterName {
 		t.Errorf("hf1.Name = %q; want %q", hf1.Name, filterName)
 	}
