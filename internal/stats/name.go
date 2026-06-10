@@ -322,6 +322,23 @@ func flattenToProm(internal string) (string, []Label, error) {
 				}
 			}
 		}
+		// Phase-33 thrift_proxy SINGLE-label HOIST (ADR-0231; AMEND-T3; the redis.
+		// ADR-0229 shape generalized to a thrift. ROOT prefix). Internal name
+		// thrift.<stat_prefix>.<rest> → envoy_thrift_<rest flattened>
+		// {envoy_thrift_prefix="<stat_prefix>"}. The roster is FIXED (no dynamic
+		// command names — the method drives ROUTING, not a counter), so shape
+		// validation (dot-free <prefix>) is unambiguous. KEEP-IN-SYNC:
+		// internal/filter/network/thriftproxy/stats.go (the roster name builders).
+		if rest, ok := strings.CutPrefix(internal, "thrift."); ok {
+			if idx := strings.IndexByte(rest, '.'); idx > 0 {
+				prefix, tail := rest[:idx], rest[idx+1:]
+				if !strings.ContainsRune(prefix, '.') {
+					labels = append(labels, Label{Key: "envoy_thrift_prefix", Value: prefix})
+					base = "envoy_thrift_" + strings.ReplaceAll(tail, ".", "_")
+					return base, labels, nil
+				}
+			}
+		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 

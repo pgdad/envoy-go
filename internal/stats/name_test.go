@@ -843,6 +843,32 @@ func TestFlattenToProm_RedisArm(t *testing.T) {
 	}
 }
 
+func TestFlattenToProm_ThriftArm(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantBase  string
+		wantLabel string // the single envoy_thrift_prefix value
+	}{
+		{"thrift.thriftprobe.request", "envoy_thrift_request", "thriftprobe"},
+		{"thrift.thriftprobe.response_reply", "envoy_thrift_response_reply", "thriftprobe"},
+		{"thrift.tp.route_missing", "envoy_thrift_route_missing", "tp"},
+		{"thrift.tp.request_active", "envoy_thrift_request_active", "tp"}, // gauge
+	}
+	for _, tc := range cases {
+		base, labels, err := flattenToProm(tc.in)
+		if err != nil {
+			t.Errorf("flattenToProm(%q) err = %v", tc.in, err)
+			continue
+		}
+		if base != tc.wantBase {
+			t.Errorf("flattenToProm(%q) base = %q, want %q", tc.in, base, tc.wantBase)
+		}
+		if len(labels) != 1 || labels[0].Key != "envoy_thrift_prefix" || labels[0].Value != tc.wantLabel {
+			t.Errorf("flattenToProm(%q) labels = %+v, want [{envoy_thrift_prefix %q}]", tc.in, labels, tc.wantLabel)
+		}
+	}
+}
+
 func TestWriteProm_MongoCallsiteLineByteExact(t *testing.T) {
 	reg := NewRegistry()
 	reg.NewCounterIfAbsent("mongo.mongoprobe.collection.collection1.callsite.probeFn.query.scatter_get").Inc()

@@ -1,8 +1,8 @@
-// Package builtins registers the ten built-in network filters (echo,
+// Package builtins registers the eleven built-in network filters (echo,
 // direct_response, tcp_proxy, HCM, rbac_network, sni_cluster, zookeeper_proxy,
-// mongo_proxy, kafka_broker, redis_proxy) into a *network.Registry with their boot singletons
-// captured. It
-// lives OUTSIDE internal/filter/network (which the filters import) and outside
+// mongo_proxy, kafka_broker, redis_proxy, thrift_proxy) into a *network.Registry
+// with their boot singletons captured. It lives OUTSIDE
+// internal/filter/network (which the filters import) and outside
 // internal/listener (whose tests import this), so no import cycle forms
 // (D-26.2-5 / D-26.2-7). Consumed by cmd/envoy-go/main.go + the listener
 // manager's thinner constructors + the admin/manager/main test callers — the
@@ -23,6 +23,7 @@ import (
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/network/redisproxy"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
+	"github.com/esalaine/envoy-go/internal/filter/network/thriftproxy"
 	"github.com/esalaine/envoy-go/internal/filter/network/zookeeperproxy"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/httpclient"
@@ -42,8 +43,8 @@ type Deps struct {
 }
 
 // RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM,
-// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, kafka_broker, and
-// redis_proxy into reg. It
+// rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, kafka_broker,
+// redis_proxy and thrift_proxy into reg. It
 // mirrors the registration calls in cmd/envoy-go/main.go and does NOT Freeze
 // (the caller freezes after any additional registration). reg.Register is void
 // (it panics on a frozen or duplicate registry), so there is no error to thread.
@@ -88,4 +89,10 @@ func RegisterBuiltins(reg *network.Registry, deps Deps) {
 	// roster) — the tcpproxy.NewNetworkFactory cluster-capture + the stats-capture
 	// precedents combined. The project's FIRST terminal routing proxy.
 	reg.Register(redisproxy.TypeURL, redisproxy.NewFactory(deps.ClusterManager, deps.StatsRegistry))
+	// thrift_proxy: the 11th built-in (33; ADR-0231). The project's SECOND
+	// terminal routing proxy. Like redisproxy it needs BOTH deps.ClusterManager
+	// (route cluster → Cluster.Dial via the REUSED ADR-0230 upstream-pool seam)
+	// AND deps.StatsRegistry (the thrift.<sp> roster). The FIRST row to REUSE a
+	// prior framework seam unchanged. The §9 family-CLOSING built-in.
+	reg.Register(thriftproxy.TypeURL, thriftproxy.NewFactory(deps.ClusterManager, deps.StatsRegistry))
 }

@@ -549,6 +549,17 @@ const (
 	// BackendKind per reference_differential_fixture_dispatch_constraint; the
 	// 32.2 command matrix extends the reply table ($-1 GET-miss, :<n> INCR).
 	TCPRedisResponder BackendKind = 32
+	// TCPThriftResponder is a framed-binary Thrift canned-response TCP backend (33;
+	// SPEC §8.3). Per connection it reads a framed-binary CALL (4-byte BE
+	// frame-len + binary message-begin), parses method+msgtype+seq_id, and writes a
+	// framed-binary REPLY (msgtype 2) echoing the SAME method + RECEIVED seq_id with
+	// a void-success body (single STOP 0x00). seq_id-AGNOSTIC (echoes whatever it
+	// receives — AMEND-T5; the reference sends 0, the subject passes the original
+	// through, the DOWNSTREAM reply carries the original on both sides). An optional
+	// exception mode replies an EXCEPTION (msgtype 3) for the 0057 reply-EXCEPTION
+	// arm (D-S33-2). NEW BackendKind per reference_differential_fixture_dispatch
+	// _constraint; the TCPRedisResponder = 32 precedent.
+	TCPThriftResponder BackendKind = 33
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

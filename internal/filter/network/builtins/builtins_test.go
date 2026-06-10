@@ -14,6 +14,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	mongo_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	thrift_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/thrift_proxy/v3"
 	zookeeper_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -29,6 +30,7 @@ import (
 	networkrbac "github.com/esalaine/envoy-go/internal/filter/network/rbac"
 	"github.com/esalaine/envoy-go/internal/filter/network/redisproxy"
 	"github.com/esalaine/envoy-go/internal/filter/network/snicluster"
+	"github.com/esalaine/envoy-go/internal/filter/network/thriftproxy"
 	"github.com/esalaine/envoy-go/internal/filter/network/zookeeperproxy"
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -45,21 +47,21 @@ func mustAny(t *testing.T, msg proto.Message) *anypb.Any {
 	return a
 }
 
-// TestRegisterBuiltinsRegistersAllTen proves RegisterBuiltins wires all ten
-// built-in network filters (echo, direct_response, tcp_proxy, HCM,
+// TestRegisterBuiltinsRegistersAllEleven proves RegisterBuiltins wires all
+// eleven built-in network filters (echo, direct_response, tcp_proxy, HCM,
 // rbac_network, sni_cluster, zookeeper_proxy, mongo_proxy, kafka_broker,
-// redis_proxy) into a fresh Registry. Registration only stores factory closures
-// (it builds no filter), so a zero-valued Deps{} is sufficient — rbac_network's,
-// zookeeper_proxy's, mongo_proxy's, kafka_broker's and redis_proxy's
-// StatsRegistry are nil here, which is fine because registration only captures
-// the closure.
+// redis_proxy, thrift_proxy) into a fresh Registry. Registration only stores
+// factory closures (it builds no filter), so a zero-valued Deps{} is sufficient —
+// rbac_network's, zookeeper_proxy's, mongo_proxy's, kafka_broker's,
+// redis_proxy's and thrift_proxy's StatsRegistry are nil here, which is fine
+// because registration only captures the closure.
 // reg.Freeze() is called to exercise the post-boot lookup path, consistent with
 // the sibling registration tests.
-func TestRegisterBuiltinsRegistersAllTen(t *testing.T) {
+func TestRegisterBuiltinsRegistersAllEleven(t *testing.T) {
 	reg := network.NewRegistry()
 	RegisterBuiltins(reg, Deps{})
 	reg.Freeze()
-	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL, mongoproxy.TypeURL, kafkabroker.TypeURL, redisproxy.TypeURL} {
+	for _, tu := range []string{echo.TypeURL, directresponse.TypeURL, tcpproxy.TypeURL, hcm.TypeURL, networkrbac.TypeURL, snicluster.TypeURL, zookeeperproxy.TypeURL, mongoproxy.TypeURL, kafkabroker.TypeURL, redisproxy.TypeURL, thriftproxy.TypeURL} {
 		if _, ok := reg.Lookup(tu); !ok {
 			t.Errorf("RegisterBuiltins did not register %q", tu)
 		}
@@ -219,6 +221,59 @@ func TestRegisterBuiltins_RegistersRedisProxy(t *testing.T) {
 	reg.Freeze()
 	if _, ok := reg.Lookup(redisproxy.TypeURL); !ok {
 		t.Fatal("redis_proxy not registered as the 10th built-in")
+	}
+}
+
+// TestRegisterBuiltins_RegistersThriftProxy proves thrift_proxy is wired as the
+// 11th built-in network filter (33; ADR-0231). Like redis_proxy (and UNLIKE the
+// stats-only kafka/mongo/zookeeper registrations) thriftproxy passes BOTH
+// deps.ClusterManager (route cluster → Cluster.Dial via the reused ADR-0230
+// upstream-pool seam) AND deps.StatsRegistry (the thrift.<sp> roster) — the
+// tcpproxy cluster-capture + stats-capture precedents combined. A non-nil
+// StatsRegistry is supplied because the thrift_proxy factory eagerly creates its
+// 24-counter + 1-gauge roster; registration only stores the closure here, but a
+// real registry mirrors the boot wiring.
+func TestRegisterBuiltins_RegistersThriftProxy(t *testing.T) {
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{ClusterManager: nil, StatsRegistry: stats.NewRegistry()})
+	reg.Freeze()
+	if _, ok := reg.Lookup(thriftproxy.TypeURL); !ok {
+		t.Fatal("thrift_proxy not registered as the 11th built-in")
+	}
+}
+
+// TestThriftProxyBootSmoke is the boot-smoke for the thrift_proxy terminal
+// filter: a thrift_proxy config resolves through the registry; parsing eagerly
+// creates the 24-counter + request_active gauge roster at 0; the instance is a
+// TerminalFilter (UNLIKE the both-directions mongo/zookeeper filters, thrift_proxy
+// owns the downstream conn via Handle — §3.5).
+func TestThriftProxyBootSmoke(t *testing.T) {
+	sreg := stats.NewRegistry()
+	reg := network.NewRegistry()
+	RegisterBuiltins(reg, Deps{StatsRegistry: sreg})
+	reg.Freeze()
+
+	factory, ok := reg.Lookup(thriftproxy.TypeURL)
+	if !ok {
+		t.Fatal("thrift_proxy factory not found")
+	}
+	tc := mustAny(t, &thrift_proxyv3.ThriftProxy{StatPrefix: "thriftboot"})
+	instFactory, err := factory(tc, network.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	inst := instFactory()
+	if _, isTerminal := inst.(network.TerminalFilter); !isTerminal {
+		t.Fatal("thrift_proxy instance must be a TerminalFilter")
+	}
+	for _, name := range []string{"thrift.thriftboot.request", "thrift.thriftboot.response",
+		"thrift.thriftboot.route_missing", "thrift.thriftboot.request_decoding_error"} {
+		if got := sreg.NewCounterIfAbsent(name).Load(); got != 0 {
+			t.Errorf("counter %s = %d at boot, want 0", name, got)
+		}
+	}
+	if got := sreg.NewGaugeIfAbsent("thrift.thriftboot.request_active").Load(); got != 0 {
+		t.Errorf("gauge request_active = %d at boot, want 0", got)
 	}
 }
 

@@ -80,6 +80,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0054-kafka-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0055-redis-roundtrip/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0056-redis-boot-reject/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0057-thrift-roundtrip/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0058-thrift-boot-reject/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -898,6 +900,20 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptRedisResponder(ln, bo.accepts)
+		case fixture.TCPThriftResponder:
+			// Framed-binary Thrift canned responder (SPEC §8.3): per CALL it echoes a
+			// framed-binary REPLY (msgtype 2) carrying the SAME method + RECEIVED seq_id
+			// and a void-success body (single STOP 0x00) so the reference's onWrite
+			// response decoder fires + classifies response_success. The marker method
+			// "boom" yields an EXCEPTION (msgtype 3) reply (D-S33-2 reply-EXCEPTION).
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptThriftResponder(ln, bo.accepts)
 		}
 		backends[i] = bo
 	}
@@ -2511,5 +2527,244 @@ func redisRespondLoop(c net.Conn) {
 		if _, err := c.Write([]byte(reply)); err != nil {
 			return
 		}
+	}
+}
+
+// acceptThriftResponder accepts connections, counts them, and runs the framed-binary
+// Thrift canned-response loop on each (the TCPThriftResponder backend — SPEC §8.3;
+// the acceptRedisResponder sibling).
+func acceptThriftResponder(ln net.Listener, counter *atomic.Uint64) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		counter.Add(1)
+		go thriftRespondLoop(c)
+	}
+}
+
+// thriftRespondLoop reads framed-binary Thrift CALL frames (4-byte BE frame-length +
+// binary message-begin: magic 0x8001 + zero + msgtype + i32 name-len + name + i32
+// seq_id + opaque body) and writes a canned REPLY per CALL until the client closes.
+// It is NOT a Thrift server — it parses ONLY the message-begin (method + seq_id) and
+// echoes a framed-binary REPLY (msgtype 2) carrying the SAME method + RECEIVED seq_id
+// and a void-success body (single STOP 0x00). seq_id-AGNOSTIC (echoes whatever it
+// receives — AMEND-T5). The marker method "boom" (thriftMarkerException) yields a
+// framed-binary EXCEPTION (msgtype 3) reply carrying an AppException TStruct body
+// (D-S33-2 reply-EXCEPTION). The wire format is DUPLICATED here (the TCPRedisResponder
+// self-contained precedent — no internal/filter/network/thriftproxy import).
+func thriftRespondLoop(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	r := bufio.NewReader(c)
+	for {
+		// Read the 4-byte BE frame-length prefix.
+		var lenPfx [4]byte
+		if _, err := io.ReadFull(r, lenPfx[:]); err != nil {
+			return // EOF between frames (clean end) or error
+		}
+		frameLen := int32(binary.BigEndian.Uint32(lenPfx[:]))
+		if frameLen < 12 || int64(frameLen) > 100*1024*1024 {
+			return // out-of-range frame length
+		}
+		payload := make([]byte, frameLen)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return
+		}
+		if binary.BigEndian.Uint16(payload[0:2]) != 0x8001 {
+			return // bad magic
+		}
+		nameLen := int32(binary.BigEndian.Uint32(payload[4:8]))
+		if nameLen < 0 || 8+int64(nameLen)+4 > int64(len(payload)) {
+			return
+		}
+		method := string(payload[8 : 8+nameLen])
+		off := 8 + nameLen
+		seqID := int32(binary.BigEndian.Uint32(payload[off : off+4]))
+
+		// Build the reply: void-success REPLY (msgtype 2) by default; an EXCEPTION
+		// (msgtype 3) for the marker method (D-S33-2). Both echo method + seq_id.
+		var reply []byte
+		if method == thriftMarkerException {
+			reply = thriftExceptionFrame(method, seqID)
+		} else {
+			reply = thriftReplyFrame(method, seqID)
+		}
+		if _, err := c.Write(reply); err != nil {
+			return
+		}
+	}
+}
+
+// thriftFrame wraps a binary message-begin payload (built by the caller) in the
+// 4-byte BE frame-length prefix (Appendix A). DUPLICATED from the filter package's
+// wire format (the TCPRedisResponder self-contained precedent).
+func thriftFrame(payload []byte) []byte {
+	var lenPfx [4]byte
+	binary.BigEndian.PutUint32(lenPfx[:], uint32(len(payload)))
+	frame := make([]byte, 0, 4+len(payload))
+	frame = append(frame, lenPfx[:]...)
+	frame = append(frame, payload...)
+	return frame
+}
+
+// thriftMsgBegin builds a binary strict message-begin: magic 0x8001 + zero + msgtype
+// + i32 name-len + name + i32 seq_id (Appendix A).
+func thriftMsgBegin(msgType uint8, method string, seqID int32) []byte {
+	p := []byte{0x80, 0x01, 0x00, msgType}
+	var i32 [4]byte
+	binary.BigEndian.PutUint32(i32[:], uint32(len(method)))
+	p = append(p, i32[:]...)
+	p = append(p, method...)
+	binary.BigEndian.PutUint32(i32[:], uint32(seqID))
+	p = append(p, i32[:]...)
+	return p
+}
+
+// thriftReplyFrame builds a framed-binary REPLY (msgtype 2) echoing method + seqID
+// with a void-success body (single STOP 0x00 — an empty result struct → response_success).
+func thriftReplyFrame(method string, seqID int32) []byte {
+	p := thriftMsgBegin(2, method, seqID)
+	p = append(p, 0x00) // STOP — void success
+	return thriftFrame(p)
+}
+
+// thriftExceptionFrame builds a framed-binary EXCEPTION (msgtype 3) echoing method +
+// seqID, carrying an AppException TStruct body {1: string "backend exception", 2: i32 6}
+// (TApplicationException; type 6 = INTERNAL_ERROR). The body shape mirrors the filter
+// package's encodeUnknownMethod layout (field 1 STRING id 1, field 2 I32 id 2, STOP) so
+// the reference's response decoder classifies it as response_exception.
+func thriftExceptionFrame(method string, seqID int32) []byte {
+	p := thriftMsgBegin(3, method, seqID)
+	msg := "backend exception"
+	// field 1: STRING (0x0b) id 1 → i32 len + bytes
+	p = append(p, 0x0b, 0x00, 0x01)
+	var i32 [4]byte
+	binary.BigEndian.PutUint32(i32[:], uint32(len(msg)))
+	p = append(p, i32[:]...)
+	p = append(p, msg...)
+	// field 2: I32 (0x08) id 2 → i32 value (exception type 6 = INTERNAL_ERROR)
+	p = append(p, 0x08, 0x00, 0x02)
+	binary.BigEndian.PutUint32(i32[:], 6)
+	p = append(p, i32[:]...)
+	// STOP
+	p = append(p, 0x00)
+	return thriftFrame(p)
+}
+
+// thriftMarkerException is the request method name the Thrift responder treats as
+// the reply-EXCEPTION trigger (D-S33-2 / SPEC §8.3): instead of a void-success
+// REPLY (msgtype 2) it answers a framed-binary EXCEPTION (msgtype 3) echoing the
+// SAME method + RECEIVED seq_id, carrying an AppException TStruct body. This lets
+// the 0057 fixture's reply-EXCEPTION arm exercise response_exception from a BACKEND
+// reply (distinct from the local route-miss exception). An in-band request marker —
+// the kafkaMarkerUncorrelated request-keyed precedent (the responder stays keyed by
+// BackendKind; the per-request behavior is selected from the wire).
+const thriftMarkerException = "boom"
+
+// thriftReqFrame builds a framed-binary Thrift CALL request frame for the responder
+// unit test (Appendix A): 4-byte BE frame-length + binary message-begin (magic
+// 0x8001 + zero + msgtype CALL(1) + i32 name-len + name + i32 seq_id) + a STOP(0x00)
+// void body. The same wire format as internal/filter/network/thriftproxy/thrift.go,
+// DUPLICATED here (the TCPRedisResponder self-contained precedent — no filter import).
+func thriftReqFrame(method string, seqID int32) []byte {
+	var p []byte
+	p = append(p, 0x80, 0x01, 0x00, 0x01) // version magic + CALL(1)
+	var i32 [4]byte
+	binary.BigEndian.PutUint32(i32[:], uint32(len(method)))
+	p = append(p, i32[:]...)
+	p = append(p, method...)
+	binary.BigEndian.PutUint32(i32[:], uint32(seqID))
+	p = append(p, i32[:]...)
+	p = append(p, 0x00) // STOP — void body
+	var frame []byte
+	binary.BigEndian.PutUint32(i32[:], uint32(len(p)))
+	frame = append(frame, i32[:]...)
+	frame = append(frame, p...)
+	return frame
+}
+
+// TestThriftResponderBackend exercises the TCPThriftResponder canned-response loop
+// (the acceptRedisResponder/acceptKafkaResponder sibling). It sends a framed-binary
+// CALL("ping", seq 7) and asserts the responder echoes a framed-binary REPLY
+// (msgtype 2) with the SAME method + RECEIVED seq_id and a void-success body (single
+// STOP 0x00). The exception marker method ("boom") yields a framed-binary EXCEPTION
+// (msgtype 3) reply (D-S33-2).
+func TestThriftResponderBackend(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	var accepts atomic.Uint64
+	go acceptThriftResponder(ln, &accepts)
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	r := bufio.NewReader(c)
+
+	// readReply reads ONE framed-binary REPLY/EXCEPTION frame and returns the
+	// msgtype, method, seq_id, and the opaque body bytes (after the message-begin).
+	readReply := func() (uint8, string, int32, []byte) {
+		t.Helper()
+		var lenPfx [4]byte
+		if _, err := io.ReadFull(r, lenPfx[:]); err != nil {
+			t.Fatalf("read frame length: %v", err)
+		}
+		n := int32(binary.BigEndian.Uint32(lenPfx[:]))
+		if n < 12 || n > 1<<20 {
+			t.Fatalf("frame length = %d, out of range", n)
+		}
+		payload := make([]byte, n)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			t.Fatalf("read frame payload: %v", err)
+		}
+		if got := binary.BigEndian.Uint16(payload[0:2]); got != 0x8001 {
+			t.Fatalf("reply magic = %#04x, want 0x8001", got)
+		}
+		mt := payload[3]
+		nameLen := int32(binary.BigEndian.Uint32(payload[4:8]))
+		method := string(payload[8 : 8+nameLen])
+		off := 8 + nameLen
+		seqID := int32(binary.BigEndian.Uint32(payload[off : off+4]))
+		return mt, method, seqID, payload[off+4:]
+	}
+
+	// Void-success arm: CALL("ping", seq 7) → REPLY msgtype 2, method "ping", seq 7,
+	// body single STOP 0x00.
+	if _, err := c.Write(thriftReqFrame("ping", 7)); err != nil {
+		t.Fatalf("write call: %v", err)
+	}
+	mt, method, seqID, body := readReply()
+	if mt != 2 {
+		t.Errorf("reply msgtype = %d, want 2 (Reply)", mt)
+	}
+	if method != "ping" {
+		t.Errorf("reply method = %q, want \"ping\" (echo)", method)
+	}
+	if seqID != 7 {
+		t.Errorf("reply seq_id = %d, want 7 (received-seq_id echo)", seqID)
+	}
+	if !bytes.Equal(body, []byte{0x00}) {
+		t.Errorf("reply body = % x, want 00 (void-success STOP)", body)
+	}
+
+	// Exception arm: CALL(marker "boom", seq 9) → EXCEPTION msgtype 3, method "boom",
+	// seq 9 (D-S33-2 reply-EXCEPTION).
+	if _, err := c.Write(thriftReqFrame(thriftMarkerException, 9)); err != nil {
+		t.Fatalf("write exception call: %v", err)
+	}
+	mt, method, seqID, _ = readReply()
+	if mt != 3 {
+		t.Errorf("exception reply msgtype = %d, want 3 (Exception)", mt)
+	}
+	if method != thriftMarkerException {
+		t.Errorf("exception reply method = %q, want %q (echo)", method, thriftMarkerException)
+	}
+	if seqID != 9 {
+		t.Errorf("exception reply seq_id = %d, want 9 (received-seq_id echo)", seqID)
 	}
 }

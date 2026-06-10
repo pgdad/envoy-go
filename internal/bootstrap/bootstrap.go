@@ -117,6 +117,16 @@ import (
 	// (e.g. the differential harness). ZERO new go.mod dep (AMEND-R1). Per
 	// ADR-0016 amendment policy, documented in PROGRESS, not a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
+	// Phase-33 registers the thrift_proxy network-filter extension proto so
+	// protojson round-trips bootstraps carrying
+	// filter_chains[].filters[].typed_config of that type. Registered transitively
+	// by the thriftproxy filter package too; the explicit blank-import here
+	// guarantees resolution in any bootstrap-parsing context (e.g. the differential
+	// harness). The thrift_proxy/v3 subpackage carries both thrift_proxy.pb.go and
+	// route.pb.go (one import registers the route-config descriptors too). ZERO new
+	// go.mod dep (AMEND-T1 — CORE /envoy v1.32.4). Per ADR-0016 amendment policy,
+	// documented in PROGRESS, not a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/thrift_proxy/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
