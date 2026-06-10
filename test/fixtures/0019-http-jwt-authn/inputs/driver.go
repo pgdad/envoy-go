@@ -240,7 +240,7 @@ func (*jwtAuthnDriver) ReferenceListenerPort() int { return refLATestPort }
 
 // ReferenceBootstrap renders envoy.yaml with host.docker.internal +
 // runner-allocated backend port + JWKS host:port (host=host.docker.internal
-// because the reference Envoy container reaches the host's loopback via
+// because the reference Envoy container reaches host-side services via
 // host.docker.internal per ADR-0010).
 func (d *jwtAuthnDriver) ReferenceBootstrap(backendPorts []int) string {
 	jwksPort := d.allocateJWKSPort()

@@ -204,7 +204,7 @@ func init() {
 type rlDriver struct {
 	mu sync.Mutex
 
-	// rlsPort is the pre-allocated 127.0.0.1:<port> the RLS fake binds to;
+	// rlsPort is the pre-allocated port the RLS fake binds to (on 0.0.0.0);
 	// shared between ReferenceBootstrap and SubjectConfig so both YAMLs
 	// templatize the SAME cluster endpoint deterministically before either
 	// proxy starts. Allocated lazily on first use (whichever of
@@ -508,7 +508,7 @@ func (*rlDriver) ReferenceListenerPort() int       { return refLATestPort }
 
 // ReferenceBootstrap renders envoy.yaml with the reference container ports
 // + host.docker.internal backend / RLS-fake hosts (the reference container
-// reaches the host's loopback via host.docker.internal per ADR-0010).
+// reaches host-side services via host.docker.internal per ADR-0010).
 func (d *rlDriver) ReferenceBootstrap(backendPorts []int) string {
 	rlsPort := d.allocateRLSPort()
 	tpl := mustReadFixtureFile("envoy.yaml")

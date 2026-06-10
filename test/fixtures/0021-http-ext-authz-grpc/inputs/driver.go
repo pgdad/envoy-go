@@ -257,6 +257,7 @@ func (d *extAuthzGRPCDriver) setupAuthGRPC() error {
 	// of the shared SPEC §7.4 helper. If the port has been recycled (TIME_WAIT
 	// / parallel-fixture race — negligible for the single-fixture runner), the
 	// bind will fail and the run errors out loudly.
+	//
 	// Bind all interfaces so the reference Envoy container can reach the
 	// service via host.docker.internal (bridge gateway) on plain Linux Docker;
 	// loopback-only binds are unreachable from containers outside Docker Desktop.
@@ -394,7 +395,7 @@ func (*extAuthzGRPCDriver) ReferenceListenerPort() int { return refLATestPort }
 
 // ReferenceBootstrap renders envoy.yaml with host.docker.internal +
 // runner-allocated backend port + auth server host:port (host=host.docker.internal
-// because the reference Envoy container reaches the host's loopback via
+// because the reference Envoy container reaches host-side services via
 // host.docker.internal per ADR-0010). Three listener ports are wired
 // (l_test_a/b/c). The auth port is allocated here if not already; Task 11
 // authors envoy.yaml.
