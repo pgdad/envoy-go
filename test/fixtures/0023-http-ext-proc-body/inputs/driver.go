@@ -168,7 +168,10 @@ func (d *extProcBodyDriver) setupProcessorGRPC() error {
 		return fmt.Errorf("driver: setupProcessorGRPC called before port allocation")
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", d.procGRPCPort)
+	// Bind all interfaces so the reference Envoy container can reach the
+	// service via host.docker.internal (bridge gateway) on plain Linux Docker;
+	// loopback-only binds are unreachable from containers outside Docker Desktop.
+	addr := fmt.Sprintf("0.0.0.0:%d", d.procGRPCPort)
 	gsrv, err := extprocgrpc.NewAtAddr(addr)
 	if err != nil {
 		return fmt.Errorf("driver: start gRPC processor on %s: %w", addr, err)

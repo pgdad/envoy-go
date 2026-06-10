@@ -204,7 +204,7 @@ func init() {
 type rlDriver struct {
 	mu sync.Mutex
 
-	// rlsPort is the pre-allocated 127.0.0.1:<port> the RLS fake binds to;
+	// rlsPort is the pre-allocated port the RLS fake binds to (on 0.0.0.0);
 	// shared between ReferenceBootstrap and SubjectConfig so both YAMLs
 	// templatize the SAME cluster endpoint deterministically before either
 	// proxy starts. Allocated lazily on first use (whichever of
@@ -274,7 +274,10 @@ func (d *rlDriver) setupRLS() error {
 	if d.rlsPort == 0 {
 		return fmt.Errorf("driver: setupRLS called before rlsPort allocation")
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", d.rlsPort)
+	// Bind all interfaces so the reference Envoy container can reach the
+	// service via host.docker.internal (bridge gateway) on plain Linux Docker;
+	// loopback-only binds are unreachable from containers outside Docker Desktop.
+	addr := fmt.Sprintf("0.0.0.0:%d", d.rlsPort)
 	srv, err := ratelimitgrpc.NewAtAddr(addr)
 	if err != nil {
 		return fmt.Errorf("driver: start rls fake on %s: %w", addr, err)
@@ -505,7 +508,7 @@ func (*rlDriver) ReferenceListenerPort() int       { return refLATestPort }
 
 // ReferenceBootstrap renders envoy.yaml with the reference container ports
 // + host.docker.internal backend / RLS-fake hosts (the reference container
-// reaches the host's loopback via host.docker.internal per ADR-0010).
+// reaches host-side services via host.docker.internal per ADR-0010).
 func (d *rlDriver) ReferenceBootstrap(backendPorts []int) string {
 	rlsPort := d.allocateRLSPort()
 	tpl := mustReadFixtureFile("envoy.yaml")

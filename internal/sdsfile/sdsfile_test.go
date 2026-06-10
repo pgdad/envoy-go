@@ -34,13 +34,6 @@ import (
 	"time"
 )
 
-// debounceSettle is the wall-clock time we wait for the ~100ms debounce timer
-// + fsnotify event delivery + reload before asserting. 250ms gives the
-// ~100ms debounce window + ~50-100ms fsnotify event-delivery latency + a
-// healthy margin for slow test runners under `-race`. SPEC §12 item B7 fixes
-// the debounce window at ~100ms; this constant is the test-side settle wait.
-const debounceSettle = 250 * time.Millisecond
-
 // writeFile writes data atomically by writing to a sibling temp file + rename
 // (Linux: atomic if same filesystem). Mirrors the atomic-rename-via-mv pattern
 // SDS rotators commonly use.
@@ -61,6 +54,29 @@ func writeInPlace(t *testing.T, path string, data []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write in-place: %v", err)
+	}
+}
+
+// waitForCurrent polls w.Current() every 10ms until it equals want, fatally
+// failing after a generous deadline. Condition-based waiting replaces the
+// former fixed `time.Sleep(debounceSettle)`-then-assert pattern for the
+// event-observation tests: under CPU contention (2-core CI runners running
+// the full -short suite) fsnotify event delivery + the ~100ms debounce timer
+// + the reload goroutine can collectively take well over 250ms, which made
+// the fixed-sleep assertions flaky. The deadline is intentionally generous —
+// the test normally completes in ~100-150ms; the deadline only bounds the
+// failure case.
+func waitForCurrent(t *testing.T, w *Watcher, want []byte) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if bytes.Equal(w.Current(), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Current() = %q, want %q (reload not observed within 10s)", w.Current(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -171,11 +187,7 @@ func TestWatcher_Start_ObservesInPlaceTruncate(t *testing.T) {
 	}
 
 	writeInPlace(t, path, []byte("rewritten"))
-	time.Sleep(debounceSettle)
-
-	if got := w.Current(); !bytes.Equal(got, []byte("rewritten")) {
-		t.Fatalf("post-write Current() = %q, want %q", got, "rewritten")
-	}
+	waitForCurrent(t, w, []byte("rewritten"))
 }
 
 // TestWatcher_Start_ObservesAtomicRename verifies that an atomic-rename-via-mv
@@ -197,11 +209,7 @@ func TestWatcher_Start_ObservesAtomicRename(t *testing.T) {
 	}
 
 	writeAtomicRename(t, path, []byte("v1"))
-	time.Sleep(debounceSettle)
-
-	if got := w.Current(); !bytes.Equal(got, []byte("v1")) {
-		t.Fatalf("post-rename Current() = %q, want %q", got, "v1")
-	}
+	waitForCurrent(t, w, []byte("v1"))
 }
 
 // 3. Debounce window + collapse semantics
@@ -230,12 +238,12 @@ func TestWatcher_Debounce_CollapsesRapidWrites(t *testing.T) {
 		writeInPlace(t, path, []byte{byte('v'), byte('0' + i)})
 		time.Sleep(10 * time.Millisecond)
 	}
-	time.Sleep(debounceSettle)
-
 	// Latest-bytes-wins: Current() returns the last write (v5).
-	if got, want := w.Current(), []byte("v5"); !bytes.Equal(got, want) {
-		t.Fatalf("Current() = %q, want %q (latest-bytes-wins)", got, want)
-	}
+	// Condition-based wait (not a fixed debounceSettle sleep): under CPU
+	// contention the debounce timer + reload goroutine can take well over
+	// 250ms after the last write. reloadCount is incremented before the
+	// bytes swap, so once v5 is visible the collapsed reload is counted.
+	waitForCurrent(t, w, []byte("v5"))
 	// Single reload: 5 events collapse to 1 reload via the debounce window.
 	// We allow up to 2 in case a stray pre-batch event slipped through (the
 	// debounce window is ~100ms; a write that lands precisely at the edge
@@ -259,17 +267,21 @@ func TestWatcher_Debounce_SequentialWritesEachReload(t *testing.T) {
 	w := newWatcherStarted(t, path)
 	atomic.StoreInt64(&w.reloadCount, 0)
 
-	// 3 writes, each separated by > debounce window (~250ms apart).
+	// 3 writes, each separated by a full debounce quiescence interval.
+	// Condition-based separation: wait until the PREVIOUS write's reload has
+	// landed (Current() observes it) before issuing the next write. This
+	// guarantees each write's fsnotify event arrives after the prior debounce
+	// timer fired (a distinct quiescence interval ⇒ a distinct reload), and
+	// replaces the former fixed debounceSettle sleeps, which under CPU
+	// contention both under-waited the final assertion (reload still in
+	// flight ⇒ "Current() = v2, want v3" flake) and could coalesce delayed
+	// events into one window.
 	writeInPlace(t, path, []byte("v1"))
-	time.Sleep(debounceSettle)
+	waitForCurrent(t, w, []byte("v1"))
 	writeInPlace(t, path, []byte("v2"))
-	time.Sleep(debounceSettle)
+	waitForCurrent(t, w, []byte("v2"))
 	writeInPlace(t, path, []byte("v3"))
-	time.Sleep(debounceSettle)
-
-	if got, want := w.Current(), []byte("v3"); !bytes.Equal(got, want) {
-		t.Fatalf("Current() = %q, want %q", got, want)
-	}
+	waitForCurrent(t, w, []byte("v3"))
 	// 3 separated writes => 3 reloads (allow up to 4 for boundary fsnotify
 	// dedup that some platforms perform; the substantive invariant is "one
 	// reload per quiescence interval").
@@ -413,9 +425,17 @@ func TestWatcher_DebounceRace_ConcurrentCurrent(t *testing.T) {
 		}()
 	}
 
-	// Trigger reload while readers race.
+	// Trigger reload while readers race. Condition-based wait (non-fatal so
+	// the reader goroutines are always stopped + drained before any Fatalf):
+	// poll until the reload lands instead of sleeping a fixed debounceSettle,
+	// which under-waits when the 16 spinning readers starve the fsnotify +
+	// debounce-timer goroutines on a contended 2-core runner. The post-reload
+	// Current() assertion below reports the failure if the deadline expires.
 	writeInPlace(t, path, postBytes)
-	time.Sleep(debounceSettle)
+	deadline := time.Now().Add(10 * time.Second)
+	for !bytes.Equal(w.Current(), postBytes) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	close(stop)
 	wg.Wait()
 

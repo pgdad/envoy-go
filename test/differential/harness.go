@@ -159,7 +159,8 @@ func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, l
 // path to a container-side path. The host files must already exist (Docker bind-
 // mount of a file, not a directory, requires the host file to be pre-created).
 // Introduced for fixture 0006-access-log (ADR-0068) to surface the reference
-// Envoy's /tmp/envoy-access.log to a host-visible path for log-comparison.
+// Envoy's container-side access log (/envoy-go-test/envoy-access.log) to a
+// host-visible path for log-comparison.
 //
 // Bind mounts are implemented via HostConfig.Binds (the "<hostPath>:<containerPath>"
 // format) because testcontainers-go v0.27.0's Mounts / ContainerMounts path
