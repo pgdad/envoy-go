@@ -989,6 +989,10 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	// the window between freeTCPPort's close and envoy-go's bind. Retry the whole
 	// allocate→render→start sequence on bind collisions (seen on CI as
 	// "address already in use" followed by "subject ready: EOF").
+	//
+	// We retry on any start error (bounded at 3) because the collision is not
+	// classifiable from the returned error — the subject dies before the ready
+	// sentinel, so all that surfaces is "subject ready: EOF".
 	var subj *SubjectProxy
 	for attempt := 1; ; attempt++ {
 		subjPort := freeTCPPort(t)
