@@ -1,8 +1,10 @@
 # Reference bootstrap for fixture 0006-access-log.
 # This file is a template; the driver's ReferenceBootstrap method formats it with:
 #   %d %d %d = backend ports 0..2 (host.docker.internal)
-# The access_log path /tmp/envoy-access.log is bind-mounted by StartReferenceProxy
-# to <t.TempDir()>/reference.log on the host.
+# The access_log path /envoy-go-test/envoy-access.log is bind-mounted by
+# StartReferenceProxy to <t.TempDir()>/reference.log on the host. The path is
+# deliberately outside /tmp: /tmp is sticky+world-writable, so Ubuntu CI's
+# fs.protected_regular=2 EACCESes envoy's O_CREAT open of the bind-mounted file.
 admin:
   address:
     socket_address: { address: 0.0.0.0, port_value: 9901 }
@@ -21,7 +23,7 @@ static_resources:
                   - name: envoy.access_loggers.file
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
-                      path: /tmp/envoy-access.log
+                      path: /envoy-go-test/envoy-access.log
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:

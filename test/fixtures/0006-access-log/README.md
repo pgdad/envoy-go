@@ -30,10 +30,14 @@ V4_ONLY` and 3 endpoints at `host.docker.internal:<port>` (per ADR-0010).
 ## Log-file mounting convention
 
 Subject writes directly to `<t.TempDir()>/subject.log` (host path templated via
-`SubjectConfig`). Reference writes to `/tmp/envoy-access.log` inside the
-container; the harness bind-mounts `<t.TempDir()>/reference.log` to
-`/tmp/envoy-access.log` via `testcontainers-go` `Mounts` so the driver can read
-it as a host file.
+`SubjectConfig`). Reference writes to `/envoy-go-test/envoy-access.log` inside
+the container; the harness bind-mounts `<t.TempDir()>/reference.log` to
+`/envoy-go-test/envoy-access.log` via `testcontainers-go` `Mounts` so the
+driver can read it as a host file. The container path is deliberately outside
+`/tmp`: `/tmp` is sticky and world-writable, so Ubuntu CI's default
+`fs.protected_regular=2` sysctl makes envoy's (uid 101) `O_CREAT` open of the
+bind-mounted file (owned by the host runner uid) fail with EACCES. A non-sticky
+parent directory is exempt; Docker auto-creates it root-owned 0755.
 
 ## Drain discipline (per 06.1 REVIEW M-8 prophylactic adoption)
 

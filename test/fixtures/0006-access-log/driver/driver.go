@@ -14,7 +14,7 @@
 //     the 3 backend ports. The reference log path
 //     (<t.TempDir()>/reference.log) is generated at construction time and
 //     returned by ReferenceHostMounts() for the runner to bind-mount to
-//     /tmp/envoy-access.log inside the container.
+//     /envoy-go-test/envoy-access.log inside the container.
 //
 //  3. DriveReference(ctx, addr) / DriveSubject(ctx, addr): each issues 5
 //     sequential H1 GETs [/health, /api/v1/foo, /api/v1/bar, /api/v1/baz,
@@ -49,7 +49,12 @@ import (
 
 const fixtureName = "0006-access-log"
 const refContainerListenerPort = 15006
-const refContainerLogPath = "/tmp/envoy-access.log"
+
+// /tmp in the envoy image is sticky+world-writable, so with
+// fs.protected_regular=2 (Ubuntu CI default) envoy (uid 101) gets EACCES
+// opening the bind-mounted file owned by the host runner uid with O_CREAT.
+// A file mounted under a non-sticky directory is exempt from that sysctl.
+const refContainerLogPath = "/envoy-go-test/envoy-access.log"
 
 func init() {
 	fixture.RegisterFixture(fixtureName, newAccessLogDriver())
@@ -595,7 +600,7 @@ static_resources:
 // referenceTmpl is the reference Envoy bootstrap template.
 // Parameters: backendPort0, backendPort1, backendPort2.
 //
-// The access log is written to /tmp/envoy-access.log (bind-mounted to the host
+// The access log is written to /envoy-go-test/envoy-access.log (bind-mounted to the host
 // at refLogPath). Envoy v1.37.2 flushes the file access logger buffer on a
 // periodic timer (default 1s). AssertAccessLog polls with a 30s deadline to
 // accommodate the timer.
@@ -617,7 +622,7 @@ static_resources:
                   - name: envoy.access_loggers.file
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
-                      path: /tmp/envoy-access.log
+                      path: /envoy-go-test/envoy-access.log
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:
