@@ -169,7 +169,10 @@ func (d *extProcGRPCDriver) setupProcessors(side string) error {
 	}
 
 	// gRPC processor (caller-chosen-port arm).
-	grpcAddr := fmt.Sprintf("127.0.0.1:%d", d.procGRPCPort)
+	// Bind all interfaces so the reference Envoy container can reach the
+	// service via host.docker.internal (bridge gateway) on plain Linux Docker;
+	// loopback-only binds are unreachable from containers outside Docker Desktop.
+	grpcAddr := fmt.Sprintf("0.0.0.0:%d", d.procGRPCPort)
 	gsrv, err := extprocgrpc.NewAtAddr(grpcAddr)
 	if err != nil {
 		return fmt.Errorf("driver: start gRPC processor on %s: %w", grpcAddr, err)
@@ -179,7 +182,7 @@ func (d *extProcGRPCDriver) setupProcessors(side string) error {
 	registerGRPCScripts(gsrv)
 
 	// HTTP processor.
-	httpAddr := fmt.Sprintf("127.0.0.1:%d", d.procHTTPPort)
+	httpAddr := fmt.Sprintf("0.0.0.0:%d", d.procHTTPPort) // bind all interfaces — see grpcAddr above
 	httpLn, err := net.Listen("tcp", httpAddr)
 	if err != nil {
 		gsrv.Stop()
@@ -237,7 +240,7 @@ func (d *extProcGRPCDriver) restartProcessorGRPC() error {
 		d.procGRPCSrv.Stop()
 		d.procGRPCSrv = nil
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", d.procGRPCPort)
+	addr := fmt.Sprintf("0.0.0.0:%d", d.procGRPCPort) // bind all interfaces — see setupProcessors
 	gsrv, err := extprocgrpc.NewAtAddr(addr)
 	if err != nil {
 		return fmt.Errorf("driver: restart gRPC processor on %s: %w", addr, err)

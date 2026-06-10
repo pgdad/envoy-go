@@ -257,7 +257,10 @@ func (d *extAuthzGRPCDriver) setupAuthGRPC() error {
 	// of the shared SPEC §7.4 helper. If the port has been recycled (TIME_WAIT
 	// / parallel-fixture race — negligible for the single-fixture runner), the
 	// bind will fail and the run errors out loudly.
-	addr := fmt.Sprintf("127.0.0.1:%d", d.authPort)
+	// Bind all interfaces so the reference Envoy container can reach the
+	// service via host.docker.internal (bridge gateway) on plain Linux Docker;
+	// loopback-only binds are unreachable from containers outside Docker Desktop.
+	addr := fmt.Sprintf("0.0.0.0:%d", d.authPort)
 	srv, err := extauthzgrpc.NewAtAddr(addr)
 	if err != nil {
 		return fmt.Errorf("driver: start gRPC auth server on %s: %w", addr, err)

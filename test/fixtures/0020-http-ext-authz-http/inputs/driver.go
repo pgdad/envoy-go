@@ -230,7 +230,10 @@ func (d *extAuthzHTTPDriver) startAuthServer(ctx context.Context, script extauth
 		_ = d.authSrv.Stop()
 		d.authSrv = nil
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", d.authPort)
+	// Bind all interfaces so the reference Envoy container can reach the
+	// service via host.docker.internal (bridge gateway) on plain Linux Docker;
+	// loopback-only binds are unreachable from containers outside Docker Desktop.
+	addr := fmt.Sprintf("0.0.0.0:%d", d.authPort)
 	srv, err := extauthzhttp.New(ctx, addr, script)
 	if err != nil {
 		return fmt.Errorf("start auth server on %s: %w", addr, err)
