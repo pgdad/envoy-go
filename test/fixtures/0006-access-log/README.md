@@ -33,8 +33,9 @@ Subject writes directly to `<t.TempDir()>/subject.log` (host path templated via
 `SubjectConfig`). Reference writes to `/envoy-go-test/envoy-access.log` inside
 the container; `<t.TempDir()>/reference.log` is bind-mounted to
 `/envoy-go-test/envoy-access.log` via a Docker `HostConfig.Binds` entry (see
-`StartReferenceProxyWithMounts`) so the driver can read it as a host file. The container path is deliberately outside
-`/tmp`: `/tmp` is sticky and world-writable, so Ubuntu CI's default
+`StartReferenceProxyWithMounts`) so the driver can read it as a host file. The
+container path is deliberately outside `/tmp`: `/tmp` is sticky and
+world-writable, so Ubuntu CI's default
 `fs.protected_regular=2` sysctl makes envoy's (uid 101) `O_CREAT` open of the
 bind-mounted file (owned by the host runner uid) fail with EACCES. A non-sticky
 parent directory is exempt; Docker auto-creates it root-owned 0755.

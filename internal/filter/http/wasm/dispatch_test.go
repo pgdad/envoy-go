@@ -640,6 +640,11 @@ func TestNew_ReturnsWorkingFactory(t *testing.T) {
 	// TestFilter_RootVM_SharedAcrossStreams_NoCrossStreamLeak).
 	if f, ok := hf1.Decoder.(*filter); ok && f.cfg != nil {
 		t.Cleanup(func() { _ = f.cfg.Close() })
+	} else {
+		// Fail loudly rather than silently leaking the registry RootVM: if a
+		// refactor changes the Decoder's concrete type or leaves cfg nil, the
+		// cleanup contract above is broken and must be re-wired, not skipped.
+		t.Fatalf("expected hf1.Decoder to be *filter with non-nil cfg; cleanup contract broken")
 	}
 	if hf1.Name != filterName {
 		t.Errorf("hf1.Name = %q; want %q", hf1.Name, filterName)

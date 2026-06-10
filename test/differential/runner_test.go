@@ -1753,6 +1753,9 @@ func startEchoBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd
 func runReferenceLessFixture(ctx context.Context, t *testing.T, root string, d FixtureDriver, backendPorts []int) {
 	t.Helper()
 	// Subject proxy.
+	// NOTE: no bind-collision retry here (see runFixture's subject-start retry
+	// loop); extend it to this site if the 0036/0034-style flake shape ever
+	// appears in this runner.
 	subjPort := freeTCPPort(t)
 	subjAdminPort := freeTCPPort(t)
 	subjCfg := d.SubjectConfig(0, subjPort, backendPorts, subjAdminPort)
@@ -1895,6 +1898,10 @@ func runBootRejectFixture(ctx context.Context, t *testing.T, root string, pin *E
 	// subject's listener port is freshly allocated (the boot-reject fires
 	// before the listener binds; the port value is supplied for template
 	// completeness but never consumed).
+	//
+	// NOTE: a bind-collision retry (runFixture's subject-start retry loop) must
+	// NEVER be added here — this path asserts that the start FAILS, and a retry
+	// loop would mask the expected boot rejection.
 	subjPort := freeTCPPort(t)
 	subjAdminPort := freeTCPPort(t)
 	subjCfg := d.SubjectConfig(refPort, subjPort, backendPorts, subjAdminPort)
