@@ -476,13 +476,38 @@ func (d *bandwidthLimitDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 	//                                        and the per-tick accounting)
 	//   ref override.response_enforced = 1
 	//
-	// These EMPIRICAL pins are stable across runs on the same Envoy v1.37.2
-	// image + same scenario sequence + same body sizes. They formalize the
-	// per-side divergence-window between reference Envoy's token-bucket and
-	// envoy-go's deterministic ticks×fill_interval throttle.
+	// These EMPIRICAL pins are the steady-state values on the same Envoy
+	// v1.37.2 image + same scenario sequence + same body sizes. They
+	// formalize the per-side divergence-window between reference Envoy's
+	// token-bucket and envoy-go's deterministic ticks×fill_interval throttle.
+	//
+	// CI-JITTER BAND (+1 tick, ref side only): ref `*_enforced` counts
+	// fill-timer enforcement events of a REAL token bucket, so the count is
+	// wall-clock dependent — whether the initial-burst credit is available
+	// when data arrives, and how many fill_interval boundaries the transfer
+	// straddles, both shift under CPU contention. On contended 2-core GitHub
+	// Actions runners the pins were observed exactly +1 high while every
+	// per-side wall-clock stayed in tolerance:
+	//
+	//   run 27268168593: override.response_enforced = 2 (pin 1); scenario6
+	//     ref wall-clock 100.098ms = two 50ms ticks (vs the typical ~51ms
+	//     single-tick transfer that yields the pin value 1).
+	//   run 27244417870: default.request_enforced = 20 (pin 19) — the s2
+	//     initial-burst credit (1 free tick) did not materialize.
+	//
+	// The driver therefore asserts the ref side within the inclusive band
+	// [pin, pin+1] per `*_enforced` counter. The lower bound stays at the
+	// pin (the full-burst-discount fast path is the floor: a fill tick
+	// always delivers a full chunk, so fewer enforcement events than the
+	// pin are not reachable); the upper bound absorbs exactly one missed
+	// burst credit / one extra straddled fill interval. The subj side
+	// remains EXACT — envoy-go's ceil-formula increment is deterministic,
+	// so the differential contract for the implementation under test is
+	// not weakened.
 	refReqEnforced := int64(19)
 	refRespEnforced := int64(19)
 	refOverrideRespEnforced := int64(1)
+	const refEnforcedJitter = int64(1) // +1 tick CI-jitter band (ref side only)
 
 	// Build per-side expected maps keyed by Prometheus metric name.
 	const np = "envoy_default_http_bandwidth_limit_"
@@ -497,6 +522,12 @@ func (d *bandwidthLimitDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 		usePerSide  bool
 		perSideRef  int64
 		perSideSubj int64
+		// refSlack, when > 0, widens the REF-side assertion to the
+		// inclusive band [perSideRef, perSideRef+refSlack]. Used only for
+		// the `*_enforced` counters (ref token-bucket fill-tick CI-jitter
+		// band — see the CI-JITTER BAND comment above). The subj side is
+		// never slackened.
+		refSlack int64
 	}
 
 	asserts := []assertion{
@@ -522,9 +553,10 @@ func (d *bandwidthLimitDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 		{name: np + "request_incoming_total_size", exact: 15360},
 		{name: np + "request_allowed_total_size", exact: 15360},
 		{name: np + "response_enabled", exact: 3},
-		// `*_enforced` diverges cross-side per the initial-burst discount.
-		{name: np + "request_enforced", usePerSide: true, perSideRef: refReqEnforced, perSideSubj: subjReqEnforced},
-		{name: np + "response_enforced", usePerSide: true, perSideRef: refRespEnforced, perSideSubj: subjRespEnforced},
+		// `*_enforced` diverges cross-side per the initial-burst discount;
+		// ref side carries the +1 fill-tick CI-jitter band.
+		{name: np + "request_enforced", usePerSide: true, perSideRef: refReqEnforced, perSideSubj: subjReqEnforced, refSlack: refEnforcedJitter},
+		{name: np + "response_enforced", usePerSide: true, perSideRef: refRespEnforced, perSideSubj: subjRespEnforced, refSlack: refEnforcedJitter},
 		// `response_incoming/allowed_total_size` is per-side dynamic because
 		// scenario 3's echo-backend response length varies across sides.
 		{name: np + "response_incoming_total_size", usePerSide: true,
@@ -536,15 +568,20 @@ func (d *bandwidthLimitDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 		{name: op + "response_incoming_total_size", exact: 10240},
 		{name: op + "response_allowed_total_size", exact: 10240},
 		{name: op + "response_enforced", usePerSide: true,
-			perSideRef: refOverrideRespEnforced, perSideSubj: subjOverrideRespEnforced},
+			perSideRef: refOverrideRespEnforced, perSideSubj: subjOverrideRespEnforced,
+			refSlack: refEnforcedJitter},
 	}
 
 	for _, a := range asserts {
 		refVal := refStats[a.name]
 		subjVal := subjStats[a.name]
 		if a.usePerSide {
-			if refVal != a.perSideRef {
-				t.Errorf("ref %s = %d, want %d (per-side; ref initial-burst discount or per-side dynamic body)", a.name, refVal, a.perSideRef)
+			if refVal < a.perSideRef || refVal > a.perSideRef+a.refSlack {
+				if a.refSlack > 0 {
+					t.Errorf("ref %s = %d, want %d..%d (per-side; ref initial-burst discount + fill-tick CI-jitter band)", a.name, refVal, a.perSideRef, a.perSideRef+a.refSlack)
+				} else {
+					t.Errorf("ref %s = %d, want %d (per-side; ref initial-burst discount or per-side dynamic body)", a.name, refVal, a.perSideRef)
+				}
 			}
 			if subjVal != a.perSideSubj {
 				t.Errorf("subj %s = %d, want %d (per-side; envoy-go ceil-formula or per-side dynamic body)", a.name, subjVal, a.perSideSubj)
