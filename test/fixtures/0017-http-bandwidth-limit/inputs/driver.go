@@ -494,6 +494,10 @@ func (d *bandwidthLimitDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 	//     single-tick transfer that yields the pin value 1).
 	//   run 27244417870: default.request_enforced = 20 (pin 19) — the s2
 	//     initial-burst credit (1 free tick) did not materialize.
+	//   run 27268977716 (2026-06-10): override.response_enforced = 2
+	//     (pin 1) — same signature as 27268168593; observed after this
+	//     band was authored, and it falls inside the [1, 2] band asserted
+	//     below.
 	//
 	// The driver therefore asserts the ref side within the inclusive band
 	// [pin, pin+1] per `*_enforced` counter. The lower bound stays at the
@@ -504,6 +508,14 @@ func (d *bandwidthLimitDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdmin
 	// remains EXACT — envoy-go's ceil-formula increment is deterministic,
 	// so the differential contract for the implementation under test is
 	// not weakened.
+	//
+	// ESCALATION POLICY: if a future run lands at pin+2, do NOT widen
+	// refEnforcedJitter. A pin+2 count means the transfer straddled TWO
+	// extra fill boundaries (~+100ms of extra wall-clock) — a different
+	// phenomenon from the single-boundary jitter documented above.
+	// Investigate first (e.g. rerun with FIXTURE_0017_DUMP_STATS=1) and
+	// suspect a ref-image behavior change or a new contention regime
+	// rather than bumping the band.
 	refReqEnforced := int64(19)
 	refRespEnforced := int64(19)
 	refOverrideRespEnforced := int64(1)
