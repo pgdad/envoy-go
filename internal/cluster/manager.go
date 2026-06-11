@@ -39,8 +39,9 @@ type Manager struct {
 // Phase-02 surface (SPEC §2 + §5.4):
 //   - cluster.type must be STATIC. STRICT_DNS, LOGICAL_DNS, EDS, ORIGINAL_DST
 //     all error explicitly.
-//   - cluster.lb_policy must be unset (proto default ROUND_ROBIN) or explicitly
-//     ROUND_ROBIN. Anything else errors.
+//   - cluster.lb_policy must be unset (proto default ROUND_ROBIN), ROUND_ROBIN,
+//     or LEAST_REQUEST (phase 34; least_request_lb_config.choice_count parsed,
+//     default 2). Anything else (RANDOM/RING_HASH/MAGLEV/...) errors.
 //   - load_assignment.endpoints[*].lb_endpoints[*] must collectively contain
 //     ≥1 endpoint, each with endpoint.address.socket_address (no pipe, no
 //     envoy_internal_address). Total endpoint count across all locality
@@ -212,9 +213,6 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if t.Type != clusterv3.Cluster_STATIC {
 		return nil, fmt.Errorf("cluster: %q: only STATIC clusters supported; got %s", name, t.Type)
 	}
-	if c.GetLbPolicy() != clusterv3.Cluster_ROUND_ROBIN {
-		return nil, fmt.Errorf("cluster: %q: only ROUND_ROBIN lb_policy supported; got %s", name, c.GetLbPolicy())
-	}
 	la := c.GetLoadAssignment()
 	if la == nil {
 		return nil, fmt.Errorf("cluster: %q: missing load_assignment", name)
@@ -231,7 +229,27 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 		name:           name,
 		endpoints:      endpoints,
 		connectTimeout: timeout,
-		lb:             &roundRobin{endpoints: endpoints},
+		// lb set by the policy switch below (ADR-0233; SPEC §3.4)
+	}
+	switch c.GetLbPolicy() {
+	case clusterv3.Cluster_ROUND_ROBIN:
+		cl.lb = &roundRobin{endpoints: endpoints}
+	case clusterv3.Cluster_LEAST_REQUEST:
+		cc, err := parseLeastRequestLbConfig(c, name)
+		if err != nil {
+			return nil, err
+		}
+		lb, err := newLeastRequest(endpoints, cc)
+		if err != nil {
+			return nil, err
+		}
+		cl.lb = lb
+	default:
+		// The ONE deliberate byte-stable-reject change this phase (ADR-0080;
+		// blast radius AMEND-L5). An envoy-go-strict DEPARTURE for RANDOM/
+		// RING_HASH/MAGLEV (the reference validate-accepts them — recorded in
+		// BEHAVIOR_CONTRACT).
+		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST)", name, c.GetLbPolicy())
 	}
 	if ts := c.GetTransportSocket(); ts != nil {
 		if ts.GetTypedConfig() == nil {
@@ -255,6 +273,39 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	}
 	cl.useH2 = useH2
 	return cl, nil
+}
+
+// defaultChoiceCount is the P2C sample size when least_request_lb_config is
+// absent or its choice_count is unset (the proto doc-comment default; reference
+// parity — SPEC §5.1 / §6.3).
+const defaultChoiceCount = 2
+
+// parseLeastRequestLbConfig extracts the P2C choice_count for a LEAST_REQUEST
+// cluster and applies the SPEC §6 reject matrix. GetLeastRequestLbConfig() is
+// nil-safe (nil on an absent OR a mismatched lb_config oneof member — AMEND-L1):
+// both fall to defaultChoiceCount (§6.3 silent-ignore parity). The choice_count
+// gate is HAND-ROLLED to mirror the PGV string (the manager calls no PGV —
+// AMEND-L1). active_request_bias / slow_start_config set under LEAST_REQUEST are
+// behavior-bearing DEPARTURE rejects (AMEND-L5/L6 — the reference parse-accepts).
+func parseLeastRequestLbConfig(c *clusterv3.Cluster, name string) (int, error) {
+	lrc := c.GetLeastRequestLbConfig()
+	if lrc == nil {
+		return defaultChoiceCount, nil
+	}
+	if lrc.GetActiveRequestBias() != nil {
+		return 0, fmt.Errorf("cluster: %q: least_request_lb_config.active_request_bias is not supported", name)
+	}
+	if lrc.GetSlowStartConfig() != nil {
+		return 0, fmt.Errorf("cluster: %q: least_request_lb_config.slow_start_config is not supported", name)
+	}
+	if cc := lrc.GetChoiceCount(); cc != nil {
+		v := cc.GetValue()
+		if v < 2 {
+			return 0, fmt.Errorf("cluster: %q: least_request_lb_config.choice_count: value must be greater than or equal to 2", name)
+		}
+		return int(v), nil // no clamp at > len(endpoints) — reference parity (AMEND-L3)
+	}
+	return defaultChoiceCount, nil
 }
 
 // extractH2Mode reads the cluster's typed_extension_protocol_options and

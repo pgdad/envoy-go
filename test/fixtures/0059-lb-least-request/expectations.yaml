@@ -1,0 +1,32 @@
+# Phase-34 fixture 0059-lb-least-request: differential expectations.
+#
+# response-body: byte-exact required. The streaming TCPEcho backend reflects
+# bytes verbatim, so the concatenated hold-4 + burst-60 echo stream is
+# byte-equivalent across the two proxies regardless of WHICH endpoint serves
+# WHICH connection (the LEAST_REQUEST pick differs per side under independent
+# RNG, but the bytes do not).
+#
+# response-status / response-headers / response-trailers: N/A (TCP, not HTTP).
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses
+# path (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Distribution assertion (IN-BAND, driver's AssertDistribution via the
+# DistributionAsserter interface): PER-SIDE band on the sorted per-backend accept
+# counts (each side must land in the band; NEVER cross-side-exact — independent
+# RNG streams). The FIRST band-based AssertDistribution:
+#   - conservation:  c1 + c2 + c3 == 64
+#   - starvation:    c1 <= 12  (most-held backend ~starved; ROUND_ROBIN c1==21 bites)
+#   - concentration: c2 >= 16  (two least-loaded split the burst; inverted-cmp bites)
+#
+# Stats assertion (IN-BAND, driver's AssertStats via the StatsAsserter interface;
+# SPEC §7 / AMEND-L4):
+#   - cross-equal: cluster.c_echo.upstream_cx_total == 64,
+#                  cluster.c_echo.membership_total == 3,
+#                  cluster.c_echo.upstream_cx_active == 0 (quiesced post-drain)
+#   - per-side:    cluster.c_echo.upstream_rq_total (ref 64 / subj 0 — tcp_proxy
+#                  charges rq-per-cx on the reference; envoy-go's tcpproxy path
+#                  never Inc's upstream_rq_total)
+response-body:
+  applicable: true
+  scope: byte-exact

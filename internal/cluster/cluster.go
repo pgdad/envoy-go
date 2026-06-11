@@ -69,7 +69,8 @@ func (p *PooledH1Conn) BufioReader() *bufio.Reader { return p.Br }
 const h1PoolMaxPerEndpoint = 1024
 
 // Cluster is a named pool of endpoints with a load-balancing policy. Phase 02
-// supports only round-robin; future phases may grow the LB family.
+// shipped round-robin; phase 34 added least_request (ADR-0233); future phases
+// may grow the LB family.
 // upstreamCfg is nil for plaintext clusters and non-nil for TLS clusters.
 type Cluster struct {
 	name           string
@@ -169,9 +170,20 @@ func (c *Cluster) UseH2() bool { return c.useH2 }
 func (c *Cluster) UpstreamTLSConfig() *stdtls.Config { return c.upstreamCfg }
 
 // PickEndpoint selects the next upstream endpoint per the cluster's LB policy.
-// Safe for concurrent use.
+// Safe for concurrent use. The picked unit is released IMMEDIATELY: direct-pick
+// consumers (httpclient ClusterDispatch, the thriftproxy no-healthy-host probe)
+// have no observable conn lifecycle, so their load is invisible to least_request
+// (a documented coverage note — SPEC §2 / §3.2). Dial / AcquireH1 do NOT route
+// through here; they call c.lb.Pick() directly so they can hold the release
+// until final conn Close (ADR-0232 OPTION C). The signature stays byte-stable so
+// the two direct consumers compile unchanged.
 func (c *Cluster) PickEndpoint() (Endpoint, error) {
-	return c.lb.Pick()
+	ep, release, err := c.lb.Pick()
+	if err != nil {
+		return Endpoint{}, err
+	}
+	release()
+	return ep, nil
 }
 
 // ConnectTimeout returns the cluster's TCP connect timeout (default 5s if the
@@ -199,13 +211,17 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, Endpoint{}, err
 	}
-	ep, err := c.PickEndpoint()
+	// ADR-0232 OPTION C: pick via c.lb.Pick() directly (not PickEndpoint) so we
+	// can HOLD the release until the conn's final Close. release is always
+	// non-nil; it must fire on every error path after a successful pick.
+	ep, release, err := c.lb.Pick()
 	if err != nil {
 		return nil, Endpoint{}, err
 	}
 	d := &net.Dialer{Timeout: c.connectTimeout}
 	raw, err := d.DialContext(ctx, "tcp", ep.Addr())
 	if err != nil {
+		release()
 		return nil, Endpoint{}, fmt.Errorf("cluster: dial: %w", err)
 	}
 	var final net.Conn = raw
@@ -213,13 +229,17 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 		conn := stdtls.Client(raw, c.upstreamCfg)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
+			release()
 			return nil, Endpoint{}, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}
 		final = conn
 	}
 	c.upstreamCxTotal.Inc()
 	c.upstreamCxActive.Inc()
-	return &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}, ep, nil
+	// Compose release into the existing connWithGauge dec closure. The
+	// connWithGauge sync.Once guards BOTH the gauge Dec and the LB release, so
+	// double-Close cannot double-release. The struct is unchanged.
+	return &connWithGauge{Conn: final, dec: func() { c.upstreamCxActive.Dec(); release() }}, ep, nil
 }
 
 // AcquireH1 returns an HTTP/1.1 upstream connection ready to write a request
@@ -243,7 +263,11 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	ep, err := c.PickEndpoint()
+	// ADR-0232 OPTION C: pick via c.lb.Pick() directly so we can HOLD the
+	// release until the fresh-dialed conn's final Close. release is always
+	// non-nil. On a pool HIT the fresh pick is redundant and is released
+	// immediately; on a MISS it composes into the connWithGauge dec closure.
+	ep, release, err := c.lb.Pick()
 	if err != nil {
 		return nil, err
 	}
@@ -261,18 +285,22 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 		// back to the caller (the caller will reset its own deadline anyway,
 		// but this defends against the SetDeadline-after-Close pattern).
 		_ = p.Conn.SetDeadline(time.Time{})
-		// Reset endpoint to the freshly-picked one for consistent observability,
-		// though for a single-endpoint cluster they are identical. (For multi-
-		// endpoint LB the pooled conn carries its dial-time ep, so use that.)
+		// Pool HIT: the pooled conn carries its DIAL-TIME hold (cx-as-rq — it
+		// persists until final close, incl. PutIdleH1-overflow drop and
+		// closePool drain). The fresh pick is redundant → release it
+		// immediately. The pooled conn carries its dial-time ep, so use that.
+		release()
 		return p, nil
 	}
 	c.h1PoolMu.Unlock()
 
 	// Slow path: dial fresh (mirrors the Dial code path verbatim so the
-	// connWithGauge / TLS handshake / counters semantics stay aligned).
+	// connWithGauge / TLS handshake / counters semantics stay aligned —
+	// release-on-failure + dec composition).
 	d := &net.Dialer{Timeout: c.connectTimeout}
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
+		release()
 		return nil, fmt.Errorf("cluster: dial: %w", err)
 	}
 	var final net.Conn = raw
@@ -280,13 +308,14 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 		conn := stdtls.Client(raw, c.upstreamCfg)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
+			release()
 			return nil, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}
 		final = conn
 	}
 	c.upstreamCxTotal.Inc()
 	c.upstreamCxActive.Inc()
-	wrapped := &connWithGauge{Conn: final, dec: c.upstreamCxActive.Dec}
+	wrapped := &connWithGauge{Conn: final, dec: func() { c.upstreamCxActive.Dec(); release() }}
 	return &PooledH1Conn{
 		Conn: wrapped,
 		Br:   bufio.NewReaderSize(wrapped, 4096),

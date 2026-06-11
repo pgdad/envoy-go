@@ -14,6 +14,7 @@ import (
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -242,15 +243,112 @@ func TestManager_Error_OriginalDST(t *testing.T) {
 	}
 }
 
-func TestManager_Error_NonRoundRobinLB(t *testing.T) {
-	c := mkStaticCluster("c_lr", mkLbEndpoint("127.0.0.1", 8080))
+// ---------------------------------------------------------------------------
+// Phase 34 (Task 4) — LEAST_REQUEST acceptance + the §6 reject matrix
+// ---------------------------------------------------------------------------
+
+// mkLeastRequest sets the LEAST_REQUEST lb_policy and the
+// least_request_lb_config oneof member with the given choice_count.
+func mkLeastRequest(name string, cc *wrapperspb.UInt32Value, eps ...*endpointv3.LbEndpoint) *clusterv3.Cluster {
+	c := mkStaticCluster(name, eps...)
 	c.LbPolicy = clusterv3.Cluster_LEAST_REQUEST
+	c.LbConfig = &clusterv3.Cluster_LeastRequestLbConfig_{
+		LeastRequestLbConfig: &clusterv3.Cluster_LeastRequestLbConfig{ChoiceCount: cc},
+	}
+	return c
+}
+
+func TestManager_Accept_LeastRequest_NoConfig(t *testing.T) {
+	c := mkStaticCluster("c_lr", mkLbEndpoint("127.0.0.1", 8080))
+	c.LbPolicy = clusterv3.Cluster_LEAST_REQUEST // no lb_config → default choice_count 2
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Fatalf("LEAST_REQUEST bare must be accepted (default cc=2): %v", err)
+	}
+}
+
+func TestManager_Accept_LeastRequest_ChoiceCounts(t *testing.T) {
+	for _, cc := range []uint32{2, 100} { // 100 = no clamp (reference parity, AMEND-L3)
+		c := mkLeastRequest("c_lr", wrapperspb.UInt32(cc), mkLbEndpoint("127.0.0.1", 8080))
+		if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+			t.Errorf("choice_count %d must be accepted: %v", cc, err)
+		}
+	}
+}
+
+func TestManager_Error_LeastRequest_ChoiceCountTooSmall(t *testing.T) {
+	for _, cc := range []uint32{0, 1} {
+		c := mkLeastRequest("c_lr", wrapperspb.UInt32(cc), mkLbEndpoint("127.0.0.1", 8080))
+		_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+		if err == nil {
+			t.Fatalf("choice_count %d must be rejected", cc)
+		}
+		if !strings.Contains(err.Error(), "value must be greater than or equal to 2") {
+			t.Errorf("cc=%d: error %q missing PGV-parity substring", cc, err.Error())
+		}
+	}
+}
+
+func TestManager_Error_LeastRequest_BiasUnsupported(t *testing.T) {
+	c := mkLeastRequest("c_lr", wrapperspb.UInt32(2), mkLbEndpoint("127.0.0.1", 8080))
+	c.GetLeastRequestLbConfig().ActiveRequestBias = &corev3.RuntimeDouble{DefaultValue: 1.5, RuntimeKey: "arb"}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "active_request_bias") {
+		t.Errorf("active_request_bias under LEAST_REQUEST must be rejected; got %v", err)
+	}
+}
+
+func TestManager_Error_LeastRequest_SlowStartUnsupported(t *testing.T) {
+	c := mkLeastRequest("c_lr", wrapperspb.UInt32(2), mkLbEndpoint("127.0.0.1", 8080))
+	c.GetLeastRequestLbConfig().SlowStartConfig = &clusterv3.Cluster_SlowStartConfig{}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "slow_start_config") {
+		t.Errorf("slow_start_config under LEAST_REQUEST must be rejected; got %v", err)
+	}
+}
+
+func TestManager_Accept_MismatchedOneof_RoundRobin(t *testing.T) {
+	// least_request_lb_config under ROUND_ROBIN → silent-ignore (reference parity, §6.3).
+	c := mkStaticCluster("c_rr", mkLbEndpoint("127.0.0.1", 8080)) // LbPolicy ROUND_ROBIN
+	c.LbConfig = &clusterv3.Cluster_LeastRequestLbConfig_{
+		LeastRequestLbConfig: &clusterv3.Cluster_LeastRequestLbConfig{ChoiceCount: wrapperspb.UInt32(7)},
+	}
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Errorf("mismatched oneof under ROUND_ROBIN must be silently accepted: %v", err)
+	}
+}
+
+func TestManager_Error_UnsupportedLBPolicy(t *testing.T) { // RETARGET of TestManager_Error_NonRoundRobinLB
+	c := mkStaticCluster("c_x", mkLbEndpoint("127.0.0.1", 8080))
+	c.LbPolicy = clusterv3.Cluster_RANDOM // LEAST_REQUEST now accepted → retarget to a still-rejected policy
 	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
-		t.Fatal("expected error, got nil")
+		t.Fatal("RANDOM must be rejected")
 	}
-	if !strings.Contains(err.Error(), "ROUND_ROBIN") {
-		t.Errorf("error %q does not contain ROUND_ROBIN", err.Error())
+	if !strings.Contains(err.Error(), "ROUND_ROBIN, LEAST_REQUEST") {
+		t.Errorf("error %q missing new supported-set substring", err.Error())
+	}
+}
+
+// TestManager_LeastRequest_BootSmoke proves a realistic LEAST_REQUEST bootstrap
+// (cc=10, the 0059 config; 3 endpoints) builds a working Manager and that
+// PickEndpoint (the immediate-release path) returns a valid in-range endpoint.
+func TestManager_LeastRequest_BootSmoke(t *testing.T) {
+	c := mkLeastRequest("c_lr", wrapperspb.UInt32(10), // cc=10 (the 0059 config)
+		mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002), mkLbEndpoint("127.0.0.1", 9003))
+	m, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	cl, ok := m.Get("c_lr")
+	if !ok {
+		t.Fatal("cluster c_lr not found")
+	}
+	ep, err := cl.PickEndpoint() // exercises the immediate-release path
+	if err != nil {
+		t.Fatalf("PickEndpoint: %v", err)
+	}
+	if ep.Port < 9001 || ep.Port > 9003 {
+		t.Errorf("picked out-of-range endpoint %v", ep)
 	}
 }
 

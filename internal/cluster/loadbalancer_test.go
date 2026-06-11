@@ -17,10 +17,11 @@ func TestRoundRobin_DistributionExact(t *testing.T) {
 	counts := map[string]int{}
 	const N = 30
 	for i := 0; i < N; i++ {
-		ep, err := rr.Pick()
+		ep, release, err := rr.Pick()
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}
+		_ = release
 		counts[ep.Addr()]++
 	}
 	for _, ep := range rr.endpoints {
@@ -37,10 +38,11 @@ func TestRoundRobin_FirstPickIsEndpoint0(t *testing.T) {
 			{Host: "10.0.0.2", Port: 1002},
 		},
 	}
-	ep, err := rr.Pick()
+	ep, release, err := rr.Pick()
 	if err != nil {
 		t.Fatalf("pick: %v", err)
 	}
+	_ = release
 	if ep.Host != "10.0.0.1" {
 		t.Errorf("first pick: got %s, want 10.0.0.1 (sequence-starts-at-0 invariant)", ep.Host)
 	}
@@ -69,11 +71,12 @@ func TestRoundRobin_ConcurrentDistributionExact(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				ep, err := rr.Pick()
+				ep, release, err := rr.Pick()
 				if err != nil {
 					t.Errorf("pick: %v", err)
 					return
 				}
+				_ = release
 				counts[addrToIdx[ep.Addr()]].Add(1)
 			}
 		}()
@@ -88,8 +91,43 @@ func TestRoundRobin_ConcurrentDistributionExact(t *testing.T) {
 
 func TestRoundRobin_ZeroEndpoints(t *testing.T) {
 	rr := &roundRobin{endpoints: nil}
-	_, err := rr.Pick()
+	_, release, err := rr.Pick()
 	if err == nil {
 		t.Fatal("expected error on zero endpoints")
+	}
+	if release == nil {
+		t.Fatal("release must be non-nil even on the error path (interface contract)")
+	}
+	release() // must not panic
+}
+
+func TestRoundRobin_ReleaseIsNonNilNoop(t *testing.T) {
+	rr := &roundRobin{endpoints: []Endpoint{{Host: "10.0.0.1", Port: 1}}}
+	ep, release, err := rr.Pick()
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if ep.Host != "10.0.0.1" {
+		t.Errorf("ep.Host = %q, want 10.0.0.1", ep.Host)
+	}
+	if release == nil {
+		t.Fatal("release must be non-nil (interface contract)")
+	}
+	release() // must not panic and must be safe to call twice
+	release()
+}
+
+func TestRoundRobin_PickSequenceUnchanged(t *testing.T) {
+	// Behavior-neutrality of the reshape: first pick is endpoints[0], then mod-index.
+	rr := &roundRobin{endpoints: []Endpoint{{Host: "a"}, {Host: "b"}, {Host: "c"}}}
+	want := []string{"a", "b", "c", "a", "b", "c"}
+	for i, w := range want {
+		ep, _, err := rr.Pick()
+		if err != nil {
+			t.Fatalf("pick %d: %v", i, err)
+		}
+		if ep.Host != w {
+			t.Errorf("pick %d: got %q, want %q", i, ep.Host, w)
+		}
 	}
 }

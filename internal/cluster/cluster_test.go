@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -431,5 +433,132 @@ func TestCluster_Dial_ReturnsPickedEndpoint(t *testing.T) {
 	}
 	if got.Host != want.Host || got.Port != want.Port {
 		t.Errorf("returned Endpoint = %v, want %v", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LB release threading — phase 34 Task 2 (ADR-0232 OPTION C)
+// ---------------------------------------------------------------------------
+
+// stubLB is a test-only loadBalancer whose pick increments an observable
+// counter and whose release decrements it, so the cluster.go release threading
+// (Dial / AcquireH1 / dial-failure / double-Close / closePool drain) is
+// testable in isolation from leastRequest (which does not exist yet at Task 2).
+type stubLB struct {
+	ep     Endpoint
+	active atomic.Int64
+}
+
+func (s *stubLB) Pick() (Endpoint, func(), error) {
+	s.active.Add(1)
+	var once sync.Once
+	return s.ep, func() { once.Do(func() { s.active.Add(-1) }) }, nil
+}
+
+// newTestClusterLB builds a *Cluster wired to the supplied loadBalancer with the
+// 8 cluster-scope metrics registered (so the Dial/AcquireH1 hot paths can
+// Inc/Dec their upstream-cx counters without nil-deref). Reuses mkTestCluster's
+// metric registration, then swaps in the custom LB and endpoint set.
+func newTestClusterLB(t *testing.T, lb loadBalancer, eps ...Endpoint) *Cluster {
+	t.Helper()
+	c := mkTestCluster("test-stublb", nil, eps...)
+	c.lb = lb
+	c.endpoints = eps
+	return c
+}
+
+func TestDial_ReleasesOnConnClose(t *testing.T) {
+	// Listener that accepts and immediately closes — Dial succeeds.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	stub := &stubLB{ep: endpointFromAddr(ln.Addr())}
+	c := newTestClusterLB(t, stub, stub.ep)
+	conn, _, err := c.Dial(context.Background())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if got := stub.active.Load(); got != 1 {
+		t.Fatalf("after Dial: active = %d, want 1 (held until Close)", got)
+	}
+	_ = conn.Close()
+	if got := stub.active.Load(); got != 0 {
+		t.Fatalf("after Close: active = %d, want 0", got)
+	}
+	_ = conn.Close() // double-Close must NOT underflow
+	if got := stub.active.Load(); got != 0 {
+		t.Fatalf("after double-Close: active = %d, want 0", got)
+	}
+}
+
+func TestDial_ReleasesOnDialFailure(t *testing.T) {
+	// Point at a port nothing listens on → dial fails → release MUST fire.
+	stub := &stubLB{ep: Endpoint{Host: "127.0.0.1", Port: 1}} // port 1: refused
+	c := newTestClusterLB(t, stub, stub.ep)
+	_, _, err := c.Dial(context.Background())
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if got := stub.active.Load(); got != 0 {
+		t.Errorf("after dial failure: active = %d, want 0 (release-on-failure)", got)
+	}
+}
+
+func TestAcquireH1_PoolHitReleasesImmediately(t *testing.T) {
+	// First AcquireH1 dials fresh (active=1 held by the conn). PutIdleH1 returns
+	// it to the pool (still active=1 — cx-as-rq). Second AcquireH1 is a POOL HIT:
+	// its fresh pick releases immediately, so active stays 1 (the pooled conn's
+	// dial-time hold persists). Final Close → active 0.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	stub := &stubLB{ep: endpointFromAddr(ln.Addr())}
+	c := newTestClusterLB(t, stub, stub.ep)
+
+	p1, err := c.AcquireH1(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireH1 miss: %v", err)
+	}
+	if got := stub.active.Load(); got != 1 {
+		t.Fatalf("after dial: active=%d want 1", got)
+	}
+	c.PutIdleH1(p1)
+	if got := stub.active.Load(); got != 1 {
+		t.Fatalf("after PutIdle: active=%d want 1 (cx-as-rq hold persists)", got)
+	}
+
+	p2, err := c.AcquireH1(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireH1 hit: %v", err)
+	}
+	if got := stub.active.Load(); got != 1 {
+		t.Fatalf("after pool hit: active=%d want 1 (fresh pick released immediately)", got)
+	}
+	_ = p2.Conn.Close()
+	if got := stub.active.Load(); got != 0 {
+		t.Fatalf("after Close: active=%d want 0", got)
 	}
 }
