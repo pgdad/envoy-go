@@ -40,8 +40,9 @@ type Manager struct {
 //   - cluster.type must be STATIC. STRICT_DNS, LOGICAL_DNS, EDS, ORIGINAL_DST
 //     all error explicitly.
 //   - cluster.lb_policy must be unset (proto default ROUND_ROBIN), ROUND_ROBIN,
-//     or LEAST_REQUEST (phase 34; least_request_lb_config.choice_count parsed,
-//     default 2). Anything else (RANDOM/RING_HASH/MAGLEV/...) errors.
+//     LEAST_REQUEST (phase 34; least_request_lb_config.choice_count parsed,
+//     default 2), or RANDOM (phase 35; no config message — bare construction).
+//     Anything else (RING_HASH/MAGLEV/...) errors.
 //   - load_assignment.endpoints[*].lb_endpoints[*] must collectively contain
 //     ≥1 endpoint, each with endpoint.address.socket_address (no pipe, no
 //     envoy_internal_address). Total endpoint count across all locality
@@ -244,12 +245,16 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 			return nil, err
 		}
 		cl.lb = lb
+	case clusterv3.Cluster_RANDOM: // phase 35 (ADR-0234): stateless uniform pick; NO config parse (RANDOM has no config message)
+		lb, err := newRandom(endpoints)
+		if err != nil {
+			return nil, err
+		}
+		cl.lb = lb
 	default:
-		// The ONE deliberate byte-stable-reject change this phase (ADR-0080;
-		// blast radius AMEND-L5). An envoy-go-strict DEPARTURE for RANDOM/
-		// RING_HASH/MAGLEV (the reference validate-accepts them — recorded in
-		// BEHAVIOR_CONTRACT).
-		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST)", name, c.GetLbPolicy())
+		// An envoy-go-strict DEPARTURE for RING_HASH/MAGLEV (the reference
+		// validate-accepts them — recorded in BEHAVIOR_CONTRACT).
+		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM)", name, c.GetLbPolicy())
 	}
 	if ts := c.GetTransportSocket(); ts != nil {
 		if ts.GetTypedConfig() == nil {

@@ -83,6 +83,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0057-thrift-roundtrip/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0058-thrift-boot-reject/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0059-lb-least-request/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0060-lb-random/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

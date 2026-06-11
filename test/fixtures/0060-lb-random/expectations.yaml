@@ -1,0 +1,40 @@
+# Phase-35 fixture 0060-lb-random: differential expectations.
+#
+# A faithful TRANSPOSITION of 0059-lb-least-request: same hold-4 + burst-60 +
+# drain workload, same 3 TCPEcho backends, same StatsAsserter — but lb_policy:
+# RANDOM (no lb_config — AMEND-R1) and the distribution assertion INVERTED.
+#
+# response-body: byte-exact required. The streaming TCPEcho backend reflects
+# bytes verbatim, so the concatenated hold-4 + burst-60 echo stream is
+# byte-equivalent across the two proxies regardless of WHICH endpoint serves
+# WHICH connection (the RANDOM pick differs per side under independent RNG, but
+# the bytes do not).
+#
+# response-status / response-headers / response-trailers: N/A (TCP, not HTTP).
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses
+# path (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Distribution assertion (IN-BAND, driver's AssertDistribution via the
+# DistributionAsserter interface): PER-SIDE ANTI-SKEW band on the per-backend
+# accept counts (each side must land in the band; NEVER cross-side-exact —
+# independent RNG streams). The SECOND band-based AssertDistribution, the
+# CONTRAPOSITIVE of 0059 (RANDOM ignores load → stays uniform DESPITE the held
+# load):
+#   - conservation:    c1 + c2 + c3 == 64
+#   - uniform floor:   each cᵢ >= 6   (mean 21.3 − ~4.05σ; a load-skewing policy
+#                                      starving a loaded backend bites this)
+#   - uniform ceiling: each cᵢ <= 40  (mean 21.3 + ~4.95σ; a single-host pin bites)
+#   (band widened at Task 6 from the SPEC's {12,32} — see driver.go / README)
+#
+# Stats assertion (IN-BAND, driver's AssertStats via the StatsAsserter interface;
+# SPEC §7 / AMEND-R4; IDENTICAL to 0059):
+#   - cross-equal: cluster.c_echo.upstream_cx_total == 64,
+#                  cluster.c_echo.membership_total == 3,
+#                  cluster.c_echo.upstream_cx_active == 0 (quiesced post-drain)
+#   - per-side:    cluster.c_echo.upstream_rq_total (ref 64 / subj 0 — tcp_proxy
+#                  charges rq-per-cx on the reference; envoy-go's tcpproxy path
+#                  never Inc's upstream_rq_total)
+response-body:
+  applicable: true
+  scope: byte-exact

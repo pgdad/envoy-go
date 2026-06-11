@@ -319,13 +319,34 @@ func TestManager_Accept_MismatchedOneof_RoundRobin(t *testing.T) {
 
 func TestManager_Error_UnsupportedLBPolicy(t *testing.T) { // RETARGET of TestManager_Error_NonRoundRobinLB
 	c := mkStaticCluster("c_x", mkLbEndpoint("127.0.0.1", 8080))
-	c.LbPolicy = clusterv3.Cluster_RANDOM // LEAST_REQUEST now accepted → retarget to a still-rejected policy
+	c.LbPolicy = clusterv3.Cluster_RING_HASH // RANDOM now accepted → retarget to a still-rejected policy (AMEND-R2)
 	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
-		t.Fatal("RANDOM must be rejected")
+		t.Fatal("RING_HASH must be rejected")
 	}
-	if !strings.Contains(err.Error(), "ROUND_ROBIN, LEAST_REQUEST") {
-		t.Errorf("error %q missing new supported-set substring", err.Error())
+	if !strings.Contains(err.Error(), "ROUND_ROBIN, LEAST_REQUEST, RANDOM") {
+		t.Errorf("error %q missing new supported-set substring (…, RANDOM)", err.Error())
+	}
+}
+
+func TestManager_Accept_Random_NoConfig(t *testing.T) {
+	c := mkStaticCluster("c_rand", mkLbEndpoint("127.0.0.1", 8080))
+	c.LbPolicy = clusterv3.Cluster_RANDOM // RANDOM has no lb_config — bare construction
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Fatalf("RANDOM bare must be accepted: %v", err)
+	}
+}
+
+func TestManager_Accept_Random_MismatchedOneof(t *testing.T) {
+	// A stray least_request_lb_config under RANDOM → silent-ignore (reference parity,
+	// SPEC §6.3 / AMEND-R1: the manager never reads the oneof on the RANDOM path).
+	c := mkStaticCluster("c_rand", mkLbEndpoint("127.0.0.1", 8080))
+	c.LbPolicy = clusterv3.Cluster_RANDOM
+	c.LbConfig = &clusterv3.Cluster_LeastRequestLbConfig_{
+		LeastRequestLbConfig: &clusterv3.Cluster_LeastRequestLbConfig{ChoiceCount: wrapperspb.UInt32(7)},
+	}
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Errorf("mismatched oneof under RANDOM must be silently accepted: %v", err)
 	}
 }
 
@@ -349,6 +370,32 @@ func TestManager_LeastRequest_BootSmoke(t *testing.T) {
 	}
 	if ep.Port < 9001 || ep.Port > 9003 {
 		t.Errorf("picked out-of-range endpoint %v", ep)
+	}
+}
+
+// TestManager_Random_BootSmoke proves a realistic 3-endpoint RANDOM bootstrap
+// builds a working Manager and that PickEndpoint (the immediate-release path)
+// returns a valid in-range endpoint (D-S35-4 / SPEC §10 boot smoke).
+func TestManager_Random_BootSmoke(t *testing.T) {
+	c := mkStaticCluster("c_rand",
+		mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002), mkLbEndpoint("127.0.0.1", 9003))
+	c.LbPolicy = clusterv3.Cluster_RANDOM
+	m, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	cl, ok := m.Get("c_rand")
+	if !ok {
+		t.Fatal("cluster c_rand not found")
+	}
+	for i := 0; i < 10; i++ { // exercises the immediate-release PickEndpoint path
+		ep, perr := cl.PickEndpoint()
+		if perr != nil {
+			t.Fatalf("PickEndpoint: %v", perr)
+		}
+		if ep.Port < 9001 || ep.Port > 9003 {
+			t.Errorf("picked out-of-range endpoint %v", ep)
+		}
 	}
 }
 
