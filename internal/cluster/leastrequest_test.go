@@ -28,7 +28,7 @@ func TestLeastRequest_FirstDrawnWinsTies(t *testing.T) {
 	// All counters 0; choiceCount 2; draws {0, 1}. Strict < keeps the first-drawn
 	// (index 0) on a tie. winner = endpoints[0].
 	lr := newLeastRequestWithRNG(eps(3), 2, seqRNG(0, 1))
-	ep, _, err := lr.Pick()
+	ep, _, err := lr.Pick(0, false)
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestLeastRequest_FirstDrawnWinsTies(t *testing.T) {
 func TestLeastRequest_PicksFewestActive(t *testing.T) {
 	lr := newLeastRequestWithRNG(eps(3), 2, seqRNG(0, 2))
 	lr.active[0].Store(5) // endpoint a is loaded
-	ep, _, err := lr.Pick()
+	ep, _, err := lr.Pick(0, false)
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
@@ -52,14 +52,14 @@ func TestLeastRequest_PicksFewestActive(t *testing.T) {
 func TestLeastRequest_WithReplacementNoClamp(t *testing.T) {
 	// choiceCount 5 > n 2: draws sample WITH replacement, no clamp, no panic.
 	lr := newLeastRequestWithRNG(eps(2), 5, seqRNG(0, 0, 1, 1, 0))
-	if _, _, err := lr.Pick(); err != nil {
+	if _, _, err := lr.Pick(0, false); err != nil {
 		t.Fatalf("Pick with choiceCount>n: %v", err)
 	}
 }
 
 func TestLeastRequest_IncDecBalance(t *testing.T) {
 	lr := newLeastRequestWithRNG(eps(3), 2, seqRNG(0, 0))
-	_, release, _ := lr.Pick()
+	_, release, _ := lr.Pick(0, false)
 	if got := lr.active[0].Load(); got != 1 {
 		t.Fatalf("after Pick: active[0] = %d, want 1", got)
 	}
@@ -71,7 +71,7 @@ func TestLeastRequest_IncDecBalance(t *testing.T) {
 
 func TestLeastRequest_DoubleReleaseGuard(t *testing.T) {
 	lr := newLeastRequestWithRNG(eps(3), 2, seqRNG(0, 0))
-	_, release, _ := lr.Pick()
+	_, release, _ := lr.Pick(0, false)
 	release()
 	release() // sync.Once: second call is a no-op
 	if got := lr.active[0].Load(); got != 0 {
@@ -81,7 +81,7 @@ func TestLeastRequest_DoubleReleaseGuard(t *testing.T) {
 
 func TestLeastRequest_NoEndpoints(t *testing.T) {
 	lr := newLeastRequestWithRNG(nil, 2, seqRNG(0))
-	_, release, err := lr.Pick()
+	_, release, err := lr.Pick(0, false)
 	if err != errNoEndpoints {
 		t.Errorf("err = %v, want errNoEndpoints", err)
 	}
@@ -112,7 +112,7 @@ func TestLeastRequest_SkewAvoidsLoadedEndpoint(t *testing.T) {
 	lr := newLeastRequestWithRNG(eps(3), 2, seqRNG(0, 1))
 	held := make([]func(), 0, 3)
 	for i := 0; i < 3; i++ {
-		_, rel, _ := lr.Pick()
+		_, rel, _ := lr.Pick(0, false)
 		held = append(held, rel) // hold (never release) to keep the load elevated
 	}
 	if got := lr.active[0].Load(); got != 2 {
@@ -123,7 +123,7 @@ func TestLeastRequest_SkewAvoidsLoadedEndpoint(t *testing.T) {
 	}
 	// a (index 0, active 2) is heaviest. The next sample {0:2, 1:1} → strict <
 	// selects b. The load-bearing assertion: the heaviest endpoint is NOT re-picked.
-	ep, rel, _ := lr.Pick()
+	ep, rel, _ := lr.Pick(0, false)
 	rel()
 	if ep.Host == "a" {
 		t.Errorf("loaded endpoint a was re-picked over lighter b; skew not working")
@@ -142,7 +142,7 @@ func TestNewLeastRequest_ProductionRNGSeeds(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ { // concurrency smoke (mutex-guarded rng)
 		wg.Add(1)
-		go func() { defer wg.Done(); _, rel, _ := lr.Pick(); rel() }()
+		go func() { defer wg.Done(); _, rel, _ := lr.Pick(0, false); rel() }()
 	}
 	wg.Wait()
 	for i := range lr.active {

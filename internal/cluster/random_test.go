@@ -12,7 +12,7 @@ func TestRandom_FollowsDrawExactly(t *testing.T) {
 	r := newRandomWithRNG(eps(3), seqRNG(0, 4, 8, 2, 3))
 	want := []string{"a", "b", "c", "c", "a"}
 	for i, w := range want {
-		ep, release, err := r.Pick()
+		ep, release, err := r.Pick(0, false)
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}
@@ -30,7 +30,7 @@ func TestRandom_FollowsDrawExactly(t *testing.T) {
 func TestRandom_ReleaseIsSharedNoop(t *testing.T) {
 	// random holds NO per-pick state → it returns the shared noopRelease.
 	r := newRandomWithRNG(eps(2), seqRNG(0))
-	_, release, err := r.Pick()
+	_, release, err := r.Pick(0, false)
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestRandom_ReleaseIsSharedNoop(t *testing.T) {
 
 func TestRandom_NoEndpoints(t *testing.T) {
 	r := newRandomWithRNG(nil, seqRNG(0))
-	_, release, err := r.Pick()
+	_, release, err := r.Pick(0, false)
 	if err != errNoEndpoints {
 		t.Errorf("err = %v, want errNoEndpoints", err)
 	}
@@ -63,7 +63,7 @@ func TestRandom_DoesNotAvoidHeldEndpoint(t *testing.T) {
 	r := newRandomWithRNG(eps(3), seqRNG(0))
 	held := make([]func(), 0, 3)
 	for i := 0; i < 3; i++ {
-		ep, rel, err := r.Pick()
+		ep, rel, err := r.Pick(0, false)
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}
@@ -91,7 +91,7 @@ func TestNewRandom_ProductionRNGSeeds(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ep, rel, perr := r.Pick()
+			ep, rel, perr := r.Pick(0, false)
 			if perr != nil {
 				return
 			}

@@ -1,0 +1,45 @@
+# Phase-36.1 fixture 0061-lb-ring-hash: differential expectations.
+#
+# A cross-side [tcp_proxy] fixture over ONE 3-endpoint cluster with lb_policy:
+# RING_HASH + ring_hash_lb_config: {} (defaults) + the tcp_proxy hash_policy:
+# [{source_ip: {}}] on BOTH sides. The driver binds 16 connections to each of 4
+# source IPs (127.0.0.2..5 via net.Dialer.LocalAddr), 64 total. The FIRST
+# consistent-hash fixture; the FIRST non-zero LB-stat delta (+3 gauges).
+#
+# response-body: byte-exact required. The streaming TCPEcho backend reflects bytes
+# verbatim, so the concatenated echo stream is byte-equivalent across the two
+# proxies regardless of WHICH endpoint serves WHICH connection (the ring pick
+# differs per side — the subject spreads by source IP, the reference collapses to
+# one backend via Docker NAT — but the bytes do not).
+#
+# response-status / response-headers / response-trailers: N/A (TCP, not HTTP).
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Distribution assertion (driver's AssertDistribution via the DistributionAsserter
+# interface): the aggregate-count MODULAR INVARIANT (D-S36-4) — DETERMINISTIC/EXACT,
+# NOT a σ-band:
+#   - SUBJECT affinity: each per-backend count ≡ 0 mod 16 (one source IP → one key →
+#     one ring point → one backend; a source IP contributes all 16 or 0 to a backend)
+#   - SUBJECT spread:   >= 2 backends nonzero (4 keys over 3 backends covering ≥2)
+#   - SUBJECT conservation: c1 + c2 + c3 == 64
+#   - REFERENCE conservation only: sum == 64 (Docker NAT → single gateway source IP →
+#     single-key pin → all 64 on ONE backend; cross-side host identity INFEASIBLE —
+#     AMEND-RH8 / reference_differential_hash_key_cross_side_infeasible)
+#
+# Stats assertion (driver's AssertStats via the StatsAsserter interface; SPEC §7):
+#   - cross-equal: cluster.c_echo.upstream_cx_total == 64,
+#                  cluster.c_echo.membership_total == 3,
+#                  cluster.c_echo.upstream_cx_active == 0 (quiesced post-drain),
+#                  cluster.c_echo.ring_hash_lb.size == 1026,
+#                  cluster.c_echo.ring_hash_lb.min_hashes_per_host == 342,
+#                  cluster.c_echo.ring_hash_lb.max_hashes_per_host == 342
+#     (the 3 gauges depend ONLY on ring-config + host COUNT, NOT addresses → identical
+#      on both sides — a STRONG cross-side prong)
+#   - per-side:    cluster.c_echo.upstream_rq_total (ref 64 / subj 0 — tcp_proxy
+#                  charges rq-per-cx on the reference; envoy-go's tcpproxy path never
+#                  Inc's upstream_rq_total)
+response-body:
+  applicable: true
+  scope: byte-exact

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/esalaine/envoy-go/internal/cluster"
@@ -30,6 +31,7 @@ type Filter struct {
 	defaultCluster *cluster.Cluster // the boot-resolved configured cluster (no-override fallback)
 	statPrefix     string           // unread at phase 02; SPEC §10 #8 settled — stored for forward-compat
 	dm             *drain.Manager   // 08.2 Task 10: nil-tolerant drain manager for in-flight Inc/Dec
+	hashOnSourceIP bool             // 36.1 Task 6: TcpProxy.hash_policy source_ip → stuff cluster.WithHashKey(HashSourceIP) into ctx before Dial
 }
 
 // Compile-time assertion: *Filter is a network.TerminalFilter (R-T). Its
@@ -64,7 +66,20 @@ func NewFilter(tc *anypb.Any, cm *cluster.Manager, dm *drain.Manager) (*Filter, 
 		if !ok {
 			return nil, fmt.Errorf("tcpproxy: cluster %q not found", name)
 		}
-		return &Filter{cm: cm, defaultCluster: c, statPrefix: msg.GetStatPrefix(), dm: dm}, nil
+		// 36.1 Task 6: parse TcpProxy.hash_policy. source_ip → consistent-hash
+		// key from the bare client IP; any other specifier DEPARTURE-rejects at
+		// parse (fail-fast). No hash_policy → hashOnSourceIP stays false (the
+		// existing byte-stable behavior; ctx untouched in Handle).
+		hashOnSourceIP := false
+		for _, hp := range msg.GetHashPolicy() {
+			switch hp.GetPolicySpecifier().(type) {
+			case *typev3.HashPolicy_SourceIp_:
+				hashOnSourceIP = true
+			default:
+				return nil, fmt.Errorf("tcpproxy: hash_policy specifier %T is not supported (only source_ip)", hp.GetPolicySpecifier())
+			}
+		}
+		return &Filter{cm: cm, defaultCluster: c, statPrefix: msg.GetStatPrefix(), dm: dm, hashOnSourceIP: hashOnSourceIP}, nil
 	case *tcpproxyv3.TcpProxy_WeightedClusters:
 		return nil, fmt.Errorf("tcpproxy: weighted_clusters is not supported in phase 02")
 	default:
@@ -123,6 +138,13 @@ func (f *Filter) Handle(ctx context.Context, downstream net.Conn) {
 	if f.dm != nil {
 		f.dm.Inc()
 		defer f.dm.Dec()
+	}
+	// 36.1 Task 6: if a source_ip hash_policy was configured, stuff the
+	// consistent-hash key (xxHash64 of the bare client IP, port stripped) into
+	// ctx so eff's ring_hash LB can pick a host with source-IP affinity. No
+	// hash_policy → ctx is left untouched (byte-stable; PICK-INPUT unset).
+	if f.hashOnSourceIP {
+		ctx = cluster.WithHashKey(ctx, cluster.HashSourceIP(downstream.RemoteAddr().String()))
 	}
 	upstream, _, err := eff.Dial(ctx)
 	if err != nil {

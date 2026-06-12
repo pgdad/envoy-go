@@ -34,7 +34,7 @@ func newRandomWithRNG(endpoints []Endpoint, rng func() uint64) *randomLB {
 
 // Pick implements loadBalancer. One uniformly-random draw; no active-count
 // consultation; the shared noopRelease (random holds no per-pick state).
-func (r *randomLB) Pick() (Endpoint, func(), error) {
+func (r *randomLB) Pick(_ uint64, _ bool) (Endpoint, func(), error) {
 	n := len(r.endpoints)
 	if n == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints // the roundRobin/leastRequest parity (AMEND-R5)

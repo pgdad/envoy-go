@@ -319,13 +319,13 @@ func TestManager_Accept_MismatchedOneof_RoundRobin(t *testing.T) {
 
 func TestManager_Error_UnsupportedLBPolicy(t *testing.T) { // RETARGET of TestManager_Error_NonRoundRobinLB
 	c := mkStaticCluster("c_x", mkLbEndpoint("127.0.0.1", 8080))
-	c.LbPolicy = clusterv3.Cluster_RING_HASH // RANDOM now accepted → retarget to a still-rejected policy (AMEND-R2)
+	c.LbPolicy = clusterv3.Cluster_MAGLEV // RING_HASH now accepted → retarget to a still-rejected policy (AMEND-RH5)
 	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
-		t.Fatal("RING_HASH must be rejected")
+		t.Fatal("MAGLEV must be rejected")
 	}
-	if !strings.Contains(err.Error(), "ROUND_ROBIN, LEAST_REQUEST, RANDOM") {
-		t.Errorf("error %q missing new supported-set substring (…, RANDOM)", err.Error())
+	if !strings.Contains(err.Error(), "ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH") {
+		t.Errorf("error %q missing new supported-set substring (…, RING_HASH)", err.Error())
 	}
 }
 
@@ -1041,4 +1041,121 @@ func TestManager_Drain_Idempotent(t *testing.T) {
 func TestManager_Drain_EmptyClusterList(t *testing.T) {
 	m := &Manager{clusters: map[string]*Cluster{}}
 	m.Drain() // must not panic on empty map
+}
+
+// ---------------------------------------------------------------------------
+// Phase 36.1 Task 5: RING_HASH acceptance, gate, and gauge wiring.
+// ---------------------------------------------------------------------------
+
+// gaugeValue reads back a gauge by exact name via the scrape-time Walk seam.
+func gaugeValue(reg *stats.Registry, name string) (int64, bool) {
+	var v int64
+	var found bool
+	reg.Walk(func(m stats.Metric) {
+		if m.Name() == name {
+			found = true
+			if g, ok := m.(*stats.Gauge); ok {
+				v = g.Load()
+			}
+		}
+	})
+	return v, found
+}
+
+func TestManager_Accept_RingHash_Defaults(t *testing.T) {
+	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002), mkLbEndpoint("127.0.0.1", 9003))
+	c.LbPolicy = clusterv3.Cluster_RING_HASH
+	m, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("RING_HASH bare must be accepted: %v", err)
+	}
+	if _, ok := m.Get("c_rh"); !ok {
+		t.Fatal("cluster c_rh not found")
+	}
+}
+
+func TestManager_Accept_RingHash_NonDefaultValid(t *testing.T) {
+	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_RING_HASH
+	c.LbConfig = &clusterv3.Cluster_RingHashLbConfig_{RingHashLbConfig: &clusterv3.Cluster_RingHashLbConfig{
+		MinimumRingSize: wrapperspb.UInt64(64), MaximumRingSize: wrapperspb.UInt64(128),
+		HashFunction: clusterv3.Cluster_RingHashLbConfig_MURMUR_HASH_2,
+	}}
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Errorf("valid non-default ring_hash_lb_config must be accepted: %v", err)
+	}
+}
+
+func TestManager_Reject_RingHash_MinOverCap(t *testing.T) {
+	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_RING_HASH
+	c.LbConfig = &clusterv3.Cluster_RingHashLbConfig_{RingHashLbConfig: &clusterv3.Cluster_RingHashLbConfig{
+		MinimumRingSize: wrapperspb.UInt64(9000000)}}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "minimum_ring_size: value must be less than or equal to 8388608") {
+		t.Errorf("err = %v, want PGV min-over-cap reject", err)
+	}
+}
+
+func TestManager_Reject_RingHash_MaxOverCap(t *testing.T) {
+	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_RING_HASH
+	c.LbConfig = &clusterv3.Cluster_RingHashLbConfig_{RingHashLbConfig: &clusterv3.Cluster_RingHashLbConfig{
+		MaximumRingSize: wrapperspb.UInt64(9000000)}}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "maximum_ring_size: value must be less than or equal to 8388608") {
+		t.Errorf("err = %v, want PGV max-over-cap reject", err)
+	}
+}
+
+func TestManager_Reject_RingHash_MinOverMax(t *testing.T) {
+	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_RING_HASH
+	c.LbConfig = &clusterv3.Cluster_RingHashLbConfig_{RingHashLbConfig: &clusterv3.Cluster_RingHashLbConfig{
+		MinimumRingSize: wrapperspb.UInt64(5), MaximumRingSize: wrapperspb.UInt64(2)}}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "ring hash: minimum_ring_size (5) > maximum_ring_size (2)") {
+		t.Errorf("err = %v, want runtime min>max reject", err)
+	}
+}
+
+func TestManager_Accept_RingHash_MismatchedOneof(t *testing.T) {
+	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_RING_HASH
+	c.LbConfig = &clusterv3.Cluster_LeastRequestLbConfig_{LeastRequestLbConfig: &clusterv3.Cluster_LeastRequestLbConfig{ChoiceCount: wrapperspb.UInt32(7)}}
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Errorf("mismatched oneof under RING_HASH must be silently accepted (defaults): %v", err)
+	}
+}
+
+func TestManager_RingHash_RegistersGauges(t *testing.T) {
+	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002), mkLbEndpoint("127.0.0.1", 9003))
+	c.LbPolicy = clusterv3.Cluster_RING_HASH
+	reg := stats.NewRegistry()
+	if _, err := NewManager(mkBootstrap(c), reg); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int64{
+		"cluster.c_rh.ring_hash_lb.size":                1026,
+		"cluster.c_rh.ring_hash_lb.min_hashes_per_host": 342,
+		"cluster.c_rh.ring_hash_lb.max_hashes_per_host": 342,
+	} {
+		got, ok := gaugeValue(reg, name)
+		if !ok {
+			t.Errorf("gauge %q not registered", name)
+		} else if got != want {
+			t.Errorf("gauge %q = %d, want %d", name, got, want)
+		}
+	}
+}
+
+func TestManager_NonRingHash_NoGauges(t *testing.T) {
+	c := mkStaticCluster("c_rr", mkLbEndpoint("127.0.0.1", 9001))
+	reg := stats.NewRegistry()
+	if _, err := NewManager(mkBootstrap(c), reg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gaugeValue(reg, "cluster.c_rr.ring_hash_lb.size"); ok {
+		t.Error("ROUND_ROBIN cluster must register NO ring_hash_lb gauges (RING_HASH-only, D-S36-6)")
+	}
 }

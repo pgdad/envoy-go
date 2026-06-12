@@ -107,6 +107,14 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 	c.upstreamCxActive = r.NewGauge(prefix + "upstream_cx_active")
 	c.membershipTotal = r.NewGauge(prefix + "membership_total")
 	c.membershipTotal.Set(int64(len(c.endpoints))) // SPEC §6: Set once at register, equals N endpoints
+	if rh, ok := c.lb.(*ringHashLB); ok {
+		// AMEND-RH4: 3 mirrored static gauges, Set once at register (the ring is
+		// immutable). RING_HASH-only (reference parity); cross-side-exact (keyed on
+		// ring-config + host count, not addresses) — D-S36-6.
+		r.NewGauge(prefix + "ring_hash_lb.size").Set(int64(rh.size))
+		r.NewGauge(prefix + "ring_hash_lb.min_hashes_per_host").Set(int64(rh.minPerHost))
+		r.NewGauge(prefix + "ring_hash_lb.max_hashes_per_host").Set(int64(rh.maxPerHost))
+	}
 }
 
 // Get looks up a cluster by name. Returns (nil, false) if not found.
@@ -251,10 +259,20 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 			return nil, err
 		}
 		cl.lb = lb
+	case clusterv3.Cluster_RING_HASH: // phase 36.1 (ADR-0236): Ketama consistent-hash ring
+		cfg, err := parseRingHashLbConfig(c, name)
+		if err != nil {
+			return nil, err
+		}
+		lb, err := newRingHash(endpoints, cfg)
+		if err != nil {
+			return nil, err
+		}
+		cl.lb = lb
 	default:
-		// An envoy-go-strict DEPARTURE for RING_HASH/MAGLEV (the reference
-		// validate-accepts them — recorded in BEHAVIOR_CONTRACT).
-		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM)", name, c.GetLbPolicy())
+		// An envoy-go-strict DEPARTURE for MAGLEV (the reference
+		// validate-accepts it — recorded in BEHAVIOR_CONTRACT).
+		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH)", name, c.GetLbPolicy())
 	}
 	if ts := c.GetTransportSocket(); ts != nil {
 		if ts.GetTypedConfig() == nil {
@@ -311,6 +329,51 @@ func parseLeastRequestLbConfig(c *clusterv3.Cluster, name string) (int, error) {
 		return int(v), nil // no clamp at > len(endpoints) — reference parity (AMEND-L3)
 	}
 	return defaultChoiceCount, nil
+}
+
+// Ring-size defaults / cap (proto doc-comment defaults; PGV lte cap — SPEC §6.4).
+const (
+	defaultMinRingSize = 1024
+	defaultMaxRingSize = 8388608
+	ringSizeCap        = 8388608
+)
+
+// parseRingHashLbConfig extracts the ring-hash parameters for a RING_HASH
+// cluster (AMEND-RH4). GetRingHashLbConfig() is nil-safe (nil on an absent OR a
+// mismatched lb_config oneof member): both fall to the self-supplied defaults
+// (1024 / 8388608 / XX_HASH — §6.3 silent-ignore parity). The gate is
+// hand-rolled in two layers (the manager calls no PGV): a per-field PGV mirror
+// (value <= 8388608) plus a runtime min > max cross-field check.
+func parseRingHashLbConfig(c *clusterv3.Cluster, name string) (ringHashCfg, error) {
+	cfg := ringHashCfg{minRingSize: defaultMinRingSize, maxRingSize: defaultMaxRingSize, hashFunc: hashXX}
+	rhc := c.GetRingHashLbConfig()
+	if rhc == nil {
+		return cfg, nil // absent OR mismatched oneof → defaults (§6.3 silent-ignore parity)
+	}
+	if v := rhc.GetMinimumRingSize(); v != nil {
+		if v.GetValue() > ringSizeCap {
+			return ringHashCfg{}, fmt.Errorf("cluster: %q: ring_hash_lb_config.minimum_ring_size: value must be less than or equal to 8388608", name)
+		}
+		cfg.minRingSize = v.GetValue()
+	}
+	if v := rhc.GetMaximumRingSize(); v != nil {
+		if v.GetValue() > ringSizeCap {
+			return ringHashCfg{}, fmt.Errorf("cluster: %q: ring_hash_lb_config.maximum_ring_size: value must be less than or equal to 8388608", name)
+		}
+		cfg.maxRingSize = v.GetValue()
+	}
+	if cfg.minRingSize > cfg.maxRingSize {
+		return ringHashCfg{}, fmt.Errorf("cluster: %q: ring hash: minimum_ring_size (%d) > maximum_ring_size (%d)", name, cfg.minRingSize, cfg.maxRingSize)
+	}
+	switch rhc.GetHashFunction() {
+	case clusterv3.Cluster_RingHashLbConfig_XX_HASH:
+		cfg.hashFunc = hashXX
+	case clusterv3.Cluster_RingHashLbConfig_MURMUR_HASH_2:
+		cfg.hashFunc = hashMurmur
+	default:
+		return ringHashCfg{}, fmt.Errorf("cluster: %q: ring_hash_lb_config.hash_function: unsupported value %v", name, rhc.GetHashFunction())
+	}
+	return cfg, nil
 }
 
 // extractH2Mode reads the cluster's typed_extension_protocol_options and

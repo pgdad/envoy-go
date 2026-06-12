@@ -169,6 +169,21 @@ func (c *Cluster) UseH2() bool { return c.useH2 }
 // consumer.
 func (c *Cluster) UpstreamTLSConfig() *stdtls.Config { return c.upstreamCfg }
 
+type hashKeyCtxKey struct{}
+
+// WithHashKey returns ctx carrying a request-derived upstream-selection hash for a
+// ring_hash cluster to consume at Dial/AcquireH1. Exported (the producers live in
+// other packages — tcpproxy, http/router). Non-ring_hash clusters ignore it. An
+// additive exported symbol — not a signature change (ADR-0235).
+func WithHashKey(ctx context.Context, key uint64) context.Context {
+	return context.WithValue(ctx, hashKeyCtxKey{}, key)
+}
+
+func hashKeyFrom(ctx context.Context) (uint64, bool) {
+	v, ok := ctx.Value(hashKeyCtxKey{}).(uint64)
+	return v, ok
+}
+
 // PickEndpoint selects the next upstream endpoint per the cluster's LB policy.
 // Safe for concurrent use. The picked unit is released IMMEDIATELY: direct-pick
 // consumers (httpclient ClusterDispatch, the thriftproxy no-healthy-host probe)
@@ -178,7 +193,7 @@ func (c *Cluster) UpstreamTLSConfig() *stdtls.Config { return c.upstreamCfg }
 // until final conn Close (ADR-0232 OPTION C). The signature stays byte-stable so
 // the two direct consumers compile unchanged.
 func (c *Cluster) PickEndpoint() (Endpoint, error) {
-	ep, release, err := c.lb.Pick()
+	ep, release, err := c.lb.Pick(0, false)
 	if err != nil {
 		return Endpoint{}, err
 	}
@@ -214,7 +229,8 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	// ADR-0232 OPTION C: pick via c.lb.Pick() directly (not PickEndpoint) so we
 	// can HOLD the release until the conn's final Close. release is always
 	// non-nil; it must fire on every error path after a successful pick.
-	ep, release, err := c.lb.Pick()
+	hk, ok := hashKeyFrom(ctx)
+	ep, release, err := c.lb.Pick(hk, ok)
 	if err != nil {
 		return nil, Endpoint{}, err
 	}
@@ -267,7 +283,8 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 	// release until the fresh-dialed conn's final Close. release is always
 	// non-nil. On a pool HIT the fresh pick is redundant and is released
 	// immediately; on a MISS it composes into the connWithGauge dec closure.
-	ep, release, err := c.lb.Pick()
+	hk, ok := hashKeyFrom(ctx)
+	ep, release, err := c.lb.Pick(hk, ok)
 	if err != nil {
 		return nil, err
 	}

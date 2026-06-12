@@ -17,7 +17,7 @@ func TestRoundRobin_DistributionExact(t *testing.T) {
 	counts := map[string]int{}
 	const N = 30
 	for i := 0; i < N; i++ {
-		ep, release, err := rr.Pick()
+		ep, release, err := rr.Pick(0, false)
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}
@@ -38,7 +38,7 @@ func TestRoundRobin_FirstPickIsEndpoint0(t *testing.T) {
 			{Host: "10.0.0.2", Port: 1002},
 		},
 	}
-	ep, release, err := rr.Pick()
+	ep, release, err := rr.Pick(0, false)
 	if err != nil {
 		t.Fatalf("pick: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestRoundRobin_ConcurrentDistributionExact(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				ep, release, err := rr.Pick()
+				ep, release, err := rr.Pick(0, false)
 				if err != nil {
 					t.Errorf("pick: %v", err)
 					return
@@ -91,7 +91,7 @@ func TestRoundRobin_ConcurrentDistributionExact(t *testing.T) {
 
 func TestRoundRobin_ZeroEndpoints(t *testing.T) {
 	rr := &roundRobin{endpoints: nil}
-	_, release, err := rr.Pick()
+	_, release, err := rr.Pick(0, false)
 	if err == nil {
 		t.Fatal("expected error on zero endpoints")
 	}
@@ -103,7 +103,7 @@ func TestRoundRobin_ZeroEndpoints(t *testing.T) {
 
 func TestRoundRobin_ReleaseIsNonNilNoop(t *testing.T) {
 	rr := &roundRobin{endpoints: []Endpoint{{Host: "10.0.0.1", Port: 1}}}
-	ep, release, err := rr.Pick()
+	ep, release, err := rr.Pick(0, false)
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestRoundRobin_PickSequenceUnchanged(t *testing.T) {
 	rr := &roundRobin{endpoints: []Endpoint{{Host: "a"}, {Host: "b"}, {Host: "c"}}}
 	want := []string{"a", "b", "c", "a", "b", "c"}
 	for i, w := range want {
-		ep, _, err := rr.Pick()
+		ep, _, err := rr.Pick(0, false)
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}

@@ -449,7 +449,7 @@ type stubLB struct {
 	active atomic.Int64
 }
 
-func (s *stubLB) Pick() (Endpoint, func(), error) {
+func (s *stubLB) Pick(_ uint64, _ bool) (Endpoint, func(), error) {
 	s.active.Add(1)
 	var once sync.Once
 	return s.ep, func() { once.Do(func() { s.active.Add(-1) }) }, nil

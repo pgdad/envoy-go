@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -787,5 +789,53 @@ func TestFilter_Handle_HalfCloseOverTLS(t *testing.T) {
 	}
 	if string(got) != "hello" {
 		t.Errorf("got %q, want %q", got, "hello")
+	}
+}
+
+func TestTcpProxy_HashPolicy_SourceIP_Parses(t *testing.T) {
+	cm := mkClusterMgr(t, "c1", "127.0.0.1", 9001)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "tcp",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c1"},
+		HashPolicy: []*typev3.HashPolicy{
+			{PolicySpecifier: &typev3.HashPolicy_SourceIp_{SourceIp: &typev3.HashPolicy_SourceIp{}}},
+		},
+	})
+	f, err := NewFilter(any, cm, nil)
+	if err != nil {
+		t.Fatalf("source_ip hash_policy must parse: %v", err)
+	}
+	if !f.hashOnSourceIP {
+		t.Error("source_ip hash_policy must set hashOnSourceIP")
+	}
+}
+
+func TestTcpProxy_NoHashPolicy_ByteStable(t *testing.T) {
+	cm := mkClusterMgr(t, "c1", "127.0.0.1", 9001)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "tcp",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c1"},
+	})
+	f, err := NewFilter(any, cm, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.hashOnSourceIP {
+		t.Error("no hash_policy → hashOnSourceIP must stay false (byte-stable behavior)")
+	}
+}
+
+func TestTcpProxy_HashPolicy_FilterState_Rejected(t *testing.T) {
+	cm := mkClusterMgr(t, "c1", "127.0.0.1", 9001)
+	any := mkAny(t, &tcpproxyv3.TcpProxy{
+		StatPrefix:       "tcp",
+		ClusterSpecifier: &tcpproxyv3.TcpProxy_Cluster{Cluster: "c1"},
+		HashPolicy: []*typev3.HashPolicy{
+			{PolicySpecifier: &typev3.HashPolicy_FilterState_{FilterState: &typev3.HashPolicy_FilterState{Key: "x"}}},
+		},
+	})
+	_, err := NewFilter(any, cm, nil)
+	if err == nil || !strings.Contains(err.Error(), "hash_policy") {
+		t.Errorf("filter_state hash_policy must be rejected with a hash_policy error: %v", err)
 	}
 }
