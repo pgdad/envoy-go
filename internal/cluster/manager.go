@@ -115,6 +115,14 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 		r.NewGauge(prefix + "ring_hash_lb.min_hashes_per_host").Set(int64(rh.minPerHost))
 		r.NewGauge(prefix + "ring_hash_lb.max_hashes_per_host").Set(int64(rh.maxPerHost))
 	}
+	if mg, ok := c.lb.(*maglevLB); ok {
+		// AMEND-M4: 2 mirrored static gauges, set once at register (the table is
+		// immutable). MAGLEV-only (reference parity); cross-side-exact (floor(M/N)/
+		// ceil(M/N), keyed on table_size + host count + weights, address-independent).
+		// NO size gauge — the table size is config-known (D-M4).
+		r.NewGauge(prefix + "maglev_lb.min_entries_per_host").Set(int64(mg.minPerHost))
+		r.NewGauge(prefix + "maglev_lb.max_entries_per_host").Set(int64(mg.maxPerHost))
+	}
 }
 
 // Get looks up a cluster by name. Returns (nil, false) if not found.
@@ -269,10 +277,18 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 			return nil, err
 		}
 		cl.lb = lb
+	case clusterv3.Cluster_MAGLEV: // phase 37 (ADR-0238): Maglev consistent-hash table
+		cfg, err := parseMaglevLbConfig(c, name)
+		if err != nil {
+			return nil, err
+		}
+		lb, err := newMaglev(endpoints, cfg)
+		if err != nil {
+			return nil, err
+		}
+		cl.lb = lb
 	default:
-		// An envoy-go-strict DEPARTURE for MAGLEV (the reference
-		// validate-accepts it — recorded in BEHAVIOR_CONTRACT).
-		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH)", name, c.GetLbPolicy())
+		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH, MAGLEV)", name, c.GetLbPolicy())
 	}
 	if ts := c.GetTransportSocket(); ts != nil {
 		if ts.GetTypedConfig() == nil {
@@ -372,6 +388,37 @@ func parseRingHashLbConfig(c *clusterv3.Cluster, name string) (ringHashCfg, erro
 		cfg.hashFunc = hashMurmur
 	default:
 		return ringHashCfg{}, fmt.Errorf("cluster: %q: ring_hash_lb_config.hash_function: unsupported value %v", name, rhc.GetHashFunction())
+	}
+	return cfg, nil
+}
+
+// Maglev table-size default / cap (proto doc-comment default; PGV lte cap — §6).
+const (
+	defaultMaglevTableSize = 65537   // doc-comment default (self-supplied; nil getter)
+	maglevTableSizeCap     = 5000011 // PGV: value must be less than or equal to 5000011
+)
+
+// parseMaglevLbConfig extracts the table_size for a MAGLEV cluster.
+// GetMaglevLbConfig() is nil-safe (nil on an absent OR a mismatched lb_config
+// oneof member): both fall to the self-supplied default (§6.3 silent-ignore
+// parity). The gate is hand-rolled (the manager calls no PGV): the PGV cap
+// mirror (<= 5000011) THEN the primality check (reference parity — the reference
+// throws "The table size of maglev must be prime number"; AMEND-M5).
+func parseMaglevLbConfig(c *clusterv3.Cluster, name string) (maglevCfg, error) {
+	cfg := maglevCfg{tableSize: defaultMaglevTableSize}
+	mlc := c.GetMaglevLbConfig()
+	if mlc == nil {
+		return cfg, nil // absent OR mismatched oneof → default (§6.3 silent-ignore parity)
+	}
+	if v := mlc.GetTableSize(); v != nil {
+		ts := v.GetValue()
+		if ts > maglevTableSizeCap {
+			return maglevCfg{}, fmt.Errorf("cluster: %q: maglev_lb_config.table_size: value must be less than or equal to 5000011", name)
+		}
+		if !isPrime(ts) {
+			return maglevCfg{}, fmt.Errorf("cluster: %q: maglev_lb_config.table_size (%d) must be a prime number", name, ts)
+		}
+		cfg.tableSize = ts
 	}
 	return cfg, nil
 }

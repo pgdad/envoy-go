@@ -1,0 +1,52 @@
+# Phase-37 fixture 0063-lb-maglev: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE 3-endpoint
+# cluster with lb_policy: MAGLEV + maglev_lb_config: {} (default table_size 65537) +
+# a ROUTE-LEVEL hash_policy: [{header: {header_name: "x-hash"}}] on BOTH sides. The
+# driver sends N=16 distinct X-Hash values × K=16 repeats = 256 routed GET /get
+# requests (each carrying its X-Hash header), then 8 /health direct_response
+# round-trips. The MAGLEV transposition of 0062-lb-ring-hash-http (the ring_hash HTTP
+# plane): SAME workload + modular invariant, retargeted RING_HASH → MAGLEV.
+#
+# response-body: byte-exact required, but over the /health direct_response bodies
+# ONLY. The /health route returns a fixed "OK\n" inline_string on both sides
+# (address-independent → byte-equal). The ROUTED bodies are NOT concatenated into
+# the compared stream: the HTTPEcho backend embeds its own idx (`backend-<idx>:
+# <seg>`), and the ref/subj Maglev tables — built over DIFFERENT endpoint address
+# strings — may land a given X-Hash value on a DIFFERENT backend idx (cross-side host
+# identity infeasible — reference_differential_hash_key_cross_side_infeasible), so
+# the routed bytes diverge cross-side. Affinity is proven by the distribution
+# assertion below, not by the byte stream.
+#
+# response-status: 200 on every routed + health request (checked in drive()).
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Distribution assertion (driver's AssertDistribution via the DistributionAsserter
+# interface): the aggregate-count MODULAR INVARIANT — DETERMINISTIC/EXACT, NOT a
+# σ-band — held on BOTH sides (the X-Hash header is NAT-transparent):
+#   - BOTH-SIDE affinity: each per-backend count ≡ 0 mod 16 (one X-Hash value → one
+#     digest → one Maglev table slot → one backend; a value contributes all 16 or 0
+#     to a backend)
+#   - BOTH-SIDE spread:   >= 2 backends nonzero (16 values over 3 backends covering ≥2)
+#   - BOTH-SIDE conservation: c1 + c2 + c3 == 256 (= N*K)
+#   - NOT asserted: cross-side host IDENTITY (the two tables are over different
+#     endpoint address strings — the modular invariant proves affinity WITHOUT host
+#     attribution)
+#
+# Stats assertion (driver's AssertStats via the StatsAsserter interface; SPEC §7):
+#   - cross-equal: cluster.c_echo.upstream_cx_total == 256 (= N*K = totalReqs),
+#                  cluster.c_echo.upstream_rq_total == 256 (the HTTP plane Inc's
+#                    upstream_rq_total on BOTH sides),
+#                  cluster.c_echo.membership_total == 3,
+#                  cluster.c_echo.upstream_cx_active == 0 (quiesced; per-request
+#                    fresh dial + Connection: close),
+#                  cluster.c_echo.maglev_lb.min_entries_per_host == 21845,
+#                  cluster.c_echo.maglev_lb.max_entries_per_host == 21846
+#     (the 2 gauges depend ONLY on table_size + host COUNT, NOT addresses → identical
+#      on both sides — a STRONG cross-side prong; there is NO maglev_lb.size gauge)
+response-body:
+  applicable: true
+  scope: byte-exact

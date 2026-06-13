@@ -319,13 +319,13 @@ func TestManager_Accept_MismatchedOneof_RoundRobin(t *testing.T) {
 
 func TestManager_Error_UnsupportedLBPolicy(t *testing.T) { // RETARGET of TestManager_Error_NonRoundRobinLB
 	c := mkStaticCluster("c_x", mkLbEndpoint("127.0.0.1", 8080))
-	c.LbPolicy = clusterv3.Cluster_MAGLEV // RING_HASH now accepted → retarget to a still-rejected policy (AMEND-RH5)
+	c.LbPolicy = clusterv3.Cluster_CLUSTER_PROVIDED // MAGLEV now accepted → retarget to the next still-rejected policy (AMEND-M5)
 	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
 	if err == nil {
-		t.Fatal("MAGLEV must be rejected")
+		t.Fatal("CLUSTER_PROVIDED must be rejected")
 	}
-	if !strings.Contains(err.Error(), "ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH") {
-		t.Errorf("error %q missing new supported-set substring (…, RING_HASH)", err.Error())
+	if !strings.Contains(err.Error(), "ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH, MAGLEV") {
+		t.Errorf("error %q missing new supported-set substring (…, MAGLEV)", err.Error())
 	}
 }
 
@@ -1157,5 +1157,91 @@ func TestManager_NonRingHash_NoGauges(t *testing.T) {
 	}
 	if _, ok := gaugeValue(reg, "cluster.c_rr.ring_hash_lb.size"); ok {
 		t.Error("ROUND_ROBIN cluster must register NO ring_hash_lb gauges (RING_HASH-only, D-S36-6)")
+	}
+}
+
+func TestManager_Accept_Maglev_Defaults(t *testing.T) {
+	c := mkStaticCluster("c_mg", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002), mkLbEndpoint("127.0.0.1", 9003))
+	c.LbPolicy = clusterv3.Cluster_MAGLEV // no maglev_lb_config → default table_size 65537
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Fatalf("MAGLEV bare must be accepted: %v", err)
+	}
+}
+
+func TestManager_Accept_Maglev_NonDefaultPrime(t *testing.T) {
+	c := mkStaticCluster("c_mg", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_MAGLEV
+	c.LbConfig = &clusterv3.Cluster_MaglevLbConfig_{MaglevLbConfig: &clusterv3.Cluster_MaglevLbConfig{
+		TableSize: wrapperspb.UInt64(127)}} // 127 is prime, <= cap
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Errorf("valid prime table_size must be accepted: %v", err)
+	}
+}
+
+func TestManager_Reject_Maglev_TableSizeOverCap(t *testing.T) {
+	c := mkStaticCluster("c_mg", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_MAGLEV
+	c.LbConfig = &clusterv3.Cluster_MaglevLbConfig_{MaglevLbConfig: &clusterv3.Cluster_MaglevLbConfig{
+		TableSize: wrapperspb.UInt64(5000012)}} // > cap
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "table_size: value must be less than or equal to 5000011") {
+		t.Errorf("err = %v, want PGV cap reject", err)
+	}
+}
+
+func TestManager_Reject_Maglev_TableSizeNotPrime(t *testing.T) {
+	c := mkStaticCluster("c_mg", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_MAGLEV
+	c.LbConfig = &clusterv3.Cluster_MaglevLbConfig_{MaglevLbConfig: &clusterv3.Cluster_MaglevLbConfig{
+		TableSize: wrapperspb.UInt64(100)}} // composite — the reference rejects (AMEND-M5)
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "must be a prime number") {
+		t.Errorf("err = %v, want primality reject", err)
+	}
+}
+
+func TestManager_Accept_Maglev_MismatchedOneof(t *testing.T) {
+	c := mkStaticCluster("c_mg", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_MAGLEV
+	c.LbConfig = &clusterv3.Cluster_RingHashLbConfig_{RingHashLbConfig: &clusterv3.Cluster_RingHashLbConfig{
+		MinimumRingSize: wrapperspb.UInt64(64)}}
+	if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+		t.Errorf("mismatched oneof under MAGLEV must be silently accepted (default table_size): %v", err)
+	}
+}
+
+func TestManager_Maglev_RegistersGauges(t *testing.T) {
+	c := mkStaticCluster("c_mg", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002), mkLbEndpoint("127.0.0.1", 9003))
+	c.LbPolicy = clusterv3.Cluster_MAGLEV
+	reg := stats.NewRegistry()
+	if _, err := NewManager(mkBootstrap(c), reg); err != nil {
+		t.Fatal(err)
+	}
+	// 65537 slots over 3 hosts → 21845 / 21846 (D-M4); NO maglev_lb.size gauge.
+	for name, want := range map[string]int64{
+		"cluster.c_mg.maglev_lb.min_entries_per_host": 21845,
+		"cluster.c_mg.maglev_lb.max_entries_per_host": 21846,
+	} {
+		got, ok := gaugeValue(reg, name) // the REUSED ring_hash readback helper
+		if !ok {
+			t.Errorf("gauge %q not registered", name)
+		} else if got != want {
+			t.Errorf("gauge %q = %d, want %d", name, got, want)
+		}
+	}
+	if _, ok := gaugeValue(reg, "cluster.c_mg.maglev_lb.size"); ok {
+		t.Error("maglev must register NO size gauge (the table size is config-known — D-M4)")
+	}
+}
+
+func TestManager_NonMaglev_NoGauges(t *testing.T) {
+	// the gauges are MAGLEV-only (reference parity) — a ROUND_ROBIN cluster registers none.
+	c := mkStaticCluster("c_rr", mkLbEndpoint("127.0.0.1", 9001))
+	reg := stats.NewRegistry()
+	if _, err := NewManager(mkBootstrap(c), reg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gaugeValue(reg, "cluster.c_rr.maglev_lb.min_entries_per_host"); ok {
+		t.Error("ROUND_ROBIN cluster must register NO maglev_lb gauges (MAGLEV-only)")
 	}
 }
