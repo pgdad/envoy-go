@@ -70,6 +70,27 @@ func TestIpOnly(t *testing.T) {
 	}
 }
 
+func TestHashHeaderValues(t *testing.T) {
+	// Single value collapses to xxHash64([]byte(value)) (the fixture path).
+	if got, want := HashHeaderValues([]string{"alpha"}), xxHash64([]byte("alpha")); got != want {
+		t.Fatalf("single-value: got %#x want %#x", got, want)
+	}
+	// Empty list → 0 (caller treats the contribution as "no value"; applyHashKey
+	// only calls this when the header is present, so this is a defensive pin).
+	if got := HashHeaderValues(nil); got != 0 {
+		t.Fatalf("empty: got %#x want 0", got)
+	}
+	// Seed-chained over BYTE-SORTED values: XXH64("b", XXH64("a", 0)).
+	want := xxHash64Seed([]byte("b"), xxHash64Seed([]byte("a"), 0))
+	if got := HashHeaderValues([]string{"b", "a"}); got != want { // input unsorted → sorted internally
+		t.Fatalf("multi-value: got %#x want %#x", got, want)
+	}
+	// Sort is byte-wise: {"a","b"} and {"b","a"} produce the SAME key.
+	if HashHeaderValues([]string{"a", "b"}) != HashHeaderValues([]string{"b", "a"}) {
+		t.Fatal("multi-value fold must be sort-order-independent")
+	}
+}
+
 func TestHashSourceIP_StripsPort(t *testing.T) {
 	// The key must depend ONLY on the IP, not the ephemeral port: two different
 	// ports from the same client IP yield the SAME key (the affinity property).

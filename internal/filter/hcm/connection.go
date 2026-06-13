@@ -383,6 +383,13 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	if downstream != nil {
 		chain.SetDownstreamRemoteAddr(downstream.RemoteAddr())
 		chain.SetDownstreamLocalAddr(downstream.LocalAddr())
+		// Phase 36.2 (ADR-0237): carry the downstream remote addr on the LIVE
+		// ctx that threads into rf.RunAction(ctx) → the router action's
+		// applyHashKey source_ip producer. *http.Request.RemoteAddr is NOT
+		// populated on the HCM codec path (D-S362-3), so the source_ip
+		// hash_policy reads the addr from ctx instead. No-op when no route
+		// configures a source_ip hash_policy (ctx value simply goes unread).
+		ctx = router.WithDownstreamRemoteAddr(ctx, downstream.RemoteAddr().String())
 	}
 	chain.SetDownstreamProtocol("HTTP/1.1")
 	chain.SetListenerPrincipal(f.listenerPrincipal)

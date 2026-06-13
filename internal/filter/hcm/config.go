@@ -2,6 +2,7 @@ package hcm
 
 import (
 	"fmt"
+	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
@@ -547,7 +548,51 @@ func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (route
 	if !ok {
 		return nil, fmt.Errorf("route action: cluster %q not found", cs.Cluster)
 	}
-	return &clusterRouteAction{cluster: c}, nil
+	hps, err := parseRouteHashPolicies(r.GetHashPolicy())
+	if err != nil {
+		return nil, err
+	}
+	return &clusterRouteAction{cluster: c, hashPolicies: hps}, nil
+}
+
+// parseRouteHashPolicies lowers RouteAction.hash_policy[] into proto-free
+// router.HashPolicy descriptors, fail-fast-rejecting unsupported specifiers
+// at config-build (the tcp_proxy NewFilter source_ip precedent). header +
+// connection_properties.source_ip are SUPPORTED; cookie/query_parameter/
+// filter_state + a configured regex_rewrite + a source_ip==false
+// connection_properties DEPARTURE-reject (the reference validate-ACCEPTS the
+// three specifiers — recorded departures, ADR-0080); an empty header_name
+// PARITY-rejects the PGV min_len=1. No hash_policy → nil (byte-stable). §6/ADR-0237.
+func parseRouteHashPolicies(policies []*routev3.RouteAction_HashPolicy) ([]router.HashPolicy, error) {
+	if len(policies) == 0 {
+		return nil, nil
+	}
+	out := make([]router.HashPolicy, 0, len(policies))
+	for _, hp := range policies {
+		switch spec := hp.GetPolicySpecifier().(type) {
+		case *routev3.RouteAction_HashPolicy_Header_:
+			h := spec.Header
+			if h.GetHeaderName() == "" {
+				return nil, fmt.Errorf("router: hash_policy header_name: value length must be at least 1 runes")
+			}
+			if h.GetRegexRewrite() != nil {
+				return nil, fmt.Errorf("router: hash_policy header_name %q: regex_rewrite is not supported", h.GetHeaderName())
+			}
+			out = append(out, router.HashPolicy{
+				Kind:       router.HashKindHeader,
+				HeaderName: strings.ToLower(h.GetHeaderName()),
+				Terminal:   hp.GetTerminal(),
+			})
+		case *routev3.RouteAction_HashPolicy_ConnectionProperties_:
+			if !spec.ConnectionProperties.GetSourceIp() {
+				return nil, fmt.Errorf("router: hash_policy connection_properties without source_ip is not supported")
+			}
+			out = append(out, router.HashPolicy{Kind: router.HashKindSourceIP, Terminal: hp.GetTerminal()})
+		default:
+			return nil, fmt.Errorf("router: hash_policy specifier %T is not supported (only header, connection_properties.source_ip)", hp.GetPolicySpecifier())
+		}
+	}
+	return out, nil
 }
 
 func buildDirectResponseAction(d *routev3.DirectResponseAction, responseHeadersToAdd []*corev3.HeaderValueOption) (*directResponseAction, error) {

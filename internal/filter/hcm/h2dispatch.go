@@ -281,6 +281,17 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 
 	startTime := time.Now()
 
+	// Phase 36.2 (ADR-0237): carry the downstream remote addr on the LIVE ctx
+	// that threads into BOTH H2 action-invoke points (the no-match
+	// c.action(ctx, h2req) below + the matched rf.RunAction(ctx)) → the router
+	// action's applyHashKey source_ip producer. h2.H2Request carries no remote
+	// addr (D-S362-3), so the source_ip hash_policy reads it from ctx. No-op
+	// when no route configures a source_ip hash_policy (value goes unread);
+	// guarded for the nil-downstreamRemoteAddr unit-test path.
+	if c.downstreamRemoteAddr != nil {
+		ctx = router.WithDownstreamRemoteAddr(ctx, c.downstreamRemoteAddr.String())
+	}
+
 	// No-match path: skip chain construction; invoke the synthesized 404
 	// action directly + emit access-log + write wire bytes. Mirrors H1
 	// connection.go's dispatchRequest no-match branch. Phase 07.1 Task 18

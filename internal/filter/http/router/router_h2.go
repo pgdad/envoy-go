@@ -36,8 +36,8 @@ import (
 // status=0 on the ctx-cancel path is the H2 sentinel per SPEC §2.1 last
 // bullet; HCM's chain-completion access-log emit hook skips submission on
 // status=0.
-func H2ClusterAction(c *cluster.Cluster) H2Action {
-	a := &routerActionH2{cluster: c}
+func H2ClusterAction(c *cluster.Cluster, hps []HashPolicy) H2Action {
+	a := &routerActionH2{cluster: c, hashPolicies: hps}
 	return func(ctx context.Context, req h2.H2Request) (ActionResponse, cluster.Endpoint, error) {
 		return doH2ClusterAction(ctx, a, req)
 	}
@@ -58,6 +58,12 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 	picked := cluster.Endpoint{}
 
 	a.cluster.IncUpstreamRqTotal()
+
+	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
+	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in DialH2. The H2
+	// request carries no remote addr, so source_ip uses the ctx-carried
+	// downstream addr set by HCM dispatch (h2dispatch.go). ADR-0237.
+	ctx, _, _ = applyHashKey(ctx, a.hashPolicies, h2HeaderVal(req), downstreamRemoteAddrFrom(ctx))
 
 	cc, ep, err := a.cluster.DialH2(ctx)
 	if err != nil {
@@ -158,6 +164,22 @@ func h2UserAgent(req h2.H2Request) string {
 	return ""
 }
 
+// h2HeaderVal returns a codec-agnostic headerVal accessor over the H2 request's
+// hpack fields for applyHashKey. req.Headers is []hpack.HeaderField with
+// codec-lowercased Name; EqualFold mirrors h2UserAgent for robustness. Returns
+// the FIRST matching value (single-value producer path per D-S362-4; the full
+// multi-value fold lives in cluster.HashHeaderValues).
+func h2HeaderVal(req h2.H2Request) func(name string) (string, bool) {
+	return func(name string) (string, bool) {
+		for _, hf := range req.Headers {
+			if strings.EqualFold(hf.Name, name) {
+				return hf.Value, true
+			}
+		}
+		return "", false
+	}
+}
+
 // routerActionH2 is the H2-flavored router action. Selected at filter-build
 // time when the resolved cluster's UseH2() reports true (per SPEC §5.5 +
 // §4.1). The struct mirrors routerAction in shape but consumes a fresh
@@ -187,8 +209,9 @@ func h2UserAgent(req h2.H2Request) string {
 // signatures preserved byte-for-byte so the byte-preserved tests in
 // router_h2_test.go exercise the same shape.
 type routerActionH2 struct {
-	cluster *cluster.Cluster
-	filter  *Filter // set post-build by routeTable.bindFilter; nil when no sinks configured.
+	cluster      *cluster.Cluster
+	filter       *Filter      // set post-build by routeTable.bindFilter; nil when no sinks configured.
+	hashPolicies []HashPolicy // 36.2: stored at H2ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 }
 
 // doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip
@@ -229,6 +252,11 @@ func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.Stream
 	}
 
 	r.cluster.IncUpstreamRqTotal()
+
+	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
+	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in DialH2. See
+	// doH2ClusterAction for the source_ip ctx-carry rationale. ADR-0237.
+	ctx, _, _ = applyHashKey(ctx, r.hashPolicies, h2HeaderVal(req), downstreamRemoteAddrFrom(ctx))
 
 	cc, ep, err := r.cluster.DialH2(ctx)
 	if err != nil {

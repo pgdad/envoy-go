@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/bits"
 	"net"
 	"net/http"
 	"strconv"
@@ -338,5 +339,78 @@ func TestRouterAction_EmitsAccessLog_DialFailure(t *testing.T) {
 	}
 	if r.UpstreamHost != "" {
 		t.Errorf("UpstreamHost = %q, want empty on dial failure", r.UpstreamHost)
+	}
+}
+
+// TestApplyHashKey pins the per-request hash_policy fold (SPEC §3.2 / Envoy
+// HashPolicyImpl::generateHash): rotl64(prev,1)^new fold, first contributor
+// verbatim, nullopt policies skipped, terminal short-circuits once the
+// accumulator is non-empty.
+func TestApplyHashKey(t *testing.T) {
+	hv := func(m map[string]string) func(string) (string, bool) {
+		return func(n string) (string, bool) { v, ok := m[n]; return v, ok }
+	}
+	hdr := func(name string) HashPolicy { return HashPolicy{Kind: HashKindHeader, HeaderName: name} }
+	src := HashPolicy{Kind: HashKindSourceIP}
+
+	// 1. single header → cluster.HashHeaderValues([]string{value}) stuffed.
+	_, key, ok := applyHashKey(context.Background(), []HashPolicy{hdr("x-hash")}, hv(map[string]string{"x-hash": "alpha"}), "")
+	if !ok || key != cluster.HashHeaderValues([]string{"alpha"}) {
+		t.Fatalf("header key: ok=%v key=%#x", ok, key)
+	}
+	// 2. absent header → no contribution → has=false.
+	if _, _, ok := applyHashKey(context.Background(), []HashPolicy{hdr("x-hash")}, hv(nil), ""); ok {
+		t.Fatal("absent header must leave ctx keyless")
+	}
+	// 3. two policies fold rotl64(prev,1)^new, first verbatim.
+	_, got, _ := applyHashKey(context.Background(), []HashPolicy{hdr("x-hash"), src},
+		hv(map[string]string{"x-hash": "alpha"}), "10.0.0.7:5555")
+	first := cluster.HashHeaderValues([]string{"alpha"})
+	want := bits.RotateLeft64(first, 1) ^ cluster.HashSourceIP("10.0.0.7:5555")
+	if got != want {
+		t.Fatalf("fold: got %#x want %#x", got, want)
+	}
+	// 4. terminal short-circuits: header(terminal)+src → only header contributes.
+	ht := HashPolicy{Kind: HashKindHeader, HeaderName: "x-hash", Terminal: true}
+	_, got2, _ := applyHashKey(context.Background(), []HashPolicy{ht, src},
+		hv(map[string]string{"x-hash": "alpha"}), "10.0.0.7:5555")
+	if got2 != first {
+		t.Fatalf("terminal: got %#x want %#x (header only)", got2, first)
+	}
+	// 5. terminal on a nullopt policy does NOT short-circuit (acc still empty).
+	htAbsent := HashPolicy{Kind: HashKindHeader, HeaderName: "absent", Terminal: true}
+	_, got3, _ := applyHashKey(context.Background(), []HashPolicy{htAbsent, src},
+		hv(nil), "10.0.0.7:5555")
+	if got3 != cluster.HashSourceIP("10.0.0.7:5555") {
+		t.Fatalf("terminal-on-nullopt must not short-circuit; got %#x", got3)
+	}
+	// 6. no policies → has=false.
+	if _, _, ok := applyHashKey(context.Background(), nil, hv(nil), ""); ok {
+		t.Fatal("no policy → keyless")
+	}
+	// 7. on contribution, the returned ctx is a NEW ctx (cluster.WithHashKey
+	//    ran) — non-vacuous proof the key rides the ctx. hashKeyFrom is
+	//    unexported by internal/cluster (no cross-package witness), so we assert
+	//    the ctx identity changed; Task 5's dispatch differential is the
+	//    end-to-end proof the LB actually consumes the carried key.
+	base := context.Background()
+	ctx, _, ok := applyHashKey(base, []HashPolicy{hdr("x-hash")}, hv(map[string]string{"x-hash": "alpha"}), "")
+	if !ok || ctx == base {
+		t.Fatalf("contributing fold must return a new key-carrying ctx: ok=%v ctxChanged=%v", ok, ctx != base)
+	}
+	// keyless fold returns the input ctx unchanged (no-hash LB fallback).
+	if ctx0, _, ok := applyHashKey(base, nil, hv(nil), ""); ok || ctx0 != base {
+		t.Fatalf("keyless fold must return ctx unchanged: ok=%v ctxChanged=%v", ok, ctx0 != base)
+	}
+}
+
+// TestWithDownstreamRemoteAddr round-trips the ctx-carried downstream remote
+// address (set by HCM dispatch; consumed by the source_ip hash_policy producer).
+func TestWithDownstreamRemoteAddr(t *testing.T) {
+	if got := downstreamRemoteAddrFrom(WithDownstreamRemoteAddr(context.Background(), "1.2.3.4:5")); got != "1.2.3.4:5" {
+		t.Fatalf("round-trip: got %q want %q", got, "1.2.3.4:5")
+	}
+	if got := downstreamRemoteAddrFrom(context.Background()); got != "" {
+		t.Fatalf("unset: got %q want empty", got)
 	}
 }

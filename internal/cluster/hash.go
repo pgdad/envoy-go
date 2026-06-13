@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math/bits"
 	"net"
+	"sort"
 )
 
 // hash.go provides pure-Go ports of the two hash digests Envoy uses to compute
@@ -34,12 +35,15 @@ const (
 )
 
 // xxHash64 computes the XXH64 digest of b with the seed fixed to 0, faithfully
-// reproducing Envoy's XX_HASH default. Side-effect-free.
-func xxHash64(b []byte) uint64 {
-	// Seed fixed to 0; held in a uint64 var so the accumulator-init sums below
-	// wrap modulo 2^64 at runtime rather than being rejected as overflowing
-	// constant expressions at compile time.
-	var seed uint64
+// reproducing Envoy's XX_HASH default. Side-effect-free. Delegates to the
+// seeded variant.
+func xxHash64(b []byte) uint64 { return xxHash64Seed(b, 0) }
+
+// xxHash64Seed is the XXH64 reference algorithm with a caller-supplied seed —
+// the seed-chained header fold (HashHeaderValues) feeds each value's output as
+// the next value's seed (source/common/common/hash.cc:7-12). seed==0 reproduces
+// xxHash64's incumbent behavior byte-for-byte. Side-effect-free.
+func xxHash64Seed(b []byte, seed uint64) uint64 {
 	n := len(b)
 	var h uint64
 
@@ -128,6 +132,26 @@ func ipOnly(addr string) string {
 // xxHash64/ipOnly. ADR-0235/ADR-0236.
 func HashSourceIP(addr string) uint64 {
 	return xxHash64([]byte(ipOnly(addr)))
+}
+
+// HashHeaderValues returns the ring_hash consistent-hash key for an HTTP route
+// header hash_policy: the seed-chained XXH64 fold over the BYTE-SORTED header
+// values (Envoy HeaderHashMethod — source/common/http/hash_policy.cc:43-77).
+// A single value collapses to xxHash64([]byte(value)); an empty list → 0.
+// Exported so the http/router producer computes the digest without reaching
+// cluster's unexported xxHash64 (the ONE additive 36.2 exported symbol;
+// the exported Cluster surface stays byte-stable). ADR-0237.
+func HashHeaderValues(values []string) uint64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]string(nil), values...)
+	sort.Strings(sorted) // byte-wise std::sort parity
+	var seed uint64
+	for _, v := range sorted {
+		seed = xxHash64Seed([]byte(v), seed)
+	}
+	return seed
 }
 
 // murmurHash2 computes MurmurHash64A (Austin Appleby's canonical public-domain

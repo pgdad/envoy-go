@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"net/http"
 	"strconv"
 	"time"
@@ -460,6 +461,89 @@ func New(_ *anypb.Any, _ envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFactory,
 	}, nil
 }
 
+// HashKind enumerates the supported RouteAction.hash_policy specifiers (36.2).
+type HashKind uint8
+
+// HashKind values for the supported RouteAction.hash_policy specifiers.
+const (
+	HashKindHeader   HashKind = iota // xxHash64 over the matched request-header value
+	HashKindSourceIP                 // cluster.HashSourceIP over the downstream client IP
+)
+
+// HashPolicy is a lowered, proto-free RouteAction.hash_policy entry. The proto
+// read + DEPARTURE-reject happens at the hcm config-build boundary
+// (parseRouteHashPolicies); this descriptor is router-owned because the
+// per-request fold (applyHashKey) lives here. ADR-0237.
+type HashPolicy struct {
+	Kind       HashKind
+	HeaderName string // lowercased; set for HashKindHeader only
+	Terminal   bool   // RouteAction_HashPolicy.terminal — short-circuit once acc is non-empty
+}
+
+// downstreamRemoteAddrCtxKey is the private ctx key carrying the downstream
+// client's remote address for the source_ip hash_policy producer.
+type downstreamRemoteAddrCtxKey struct{}
+
+// WithDownstreamRemoteAddr carries the downstream client's remote address
+// ("host:port") for the source_ip hash_policy producer. HCM dispatch sets it
+// before invoking the action (H1: connection.go; H2: h2dispatch.go) since
+// neither *http.Request (HCM codec path) nor h2.H2Request carries a remote
+// addr. ADR-0237.
+func WithDownstreamRemoteAddr(ctx context.Context, addr string) context.Context {
+	return context.WithValue(ctx, downstreamRemoteAddrCtxKey{}, addr)
+}
+
+func downstreamRemoteAddrFrom(ctx context.Context) string {
+	v, _ := ctx.Value(downstreamRemoteAddrCtxKey{}).(string)
+	return v
+}
+
+// applyHashKey folds the route's hash_policy list into a ring_hash key and
+// returns ctx carrying it (cluster.WithHashKey). If nothing contributes, ctx is
+// returned unchanged (the LB's no-hash fallback). Mirrors Envoy
+// HashPolicyImpl::generateHash (SPEC §3.2 / hash_policy.cc:259-270):
+// rotl64(prev,1)^new fold, first contributor verbatim, nullopt policies skipped
+// entirely, a terminal policy short-circuiting once the accumulator is
+// non-empty. headerVal is a codec-agnostic accessor; remoteAddr is the
+// ctx-carried downstream addr (empty when unset). Returns (ctx, key, has) for
+// testability; the dial sites use only ctx.
+//
+// D-S362-4: the H1/H2 headerVal shims return the FIRST header value
+// (single-value producer path); the full multi-value byte-sorted fold lives in
+// cluster.HashHeaderValues (Task 2, unit-tested).
+func applyHashKey(ctx context.Context, hps []HashPolicy, headerVal func(name string) (string, bool), remoteAddr string) (context.Context, uint64, bool) {
+	var acc uint64
+	var has bool
+	for _, hp := range hps {
+		var nh uint64
+		var ok bool
+		switch hp.Kind {
+		case HashKindHeader:
+			if v, present := headerVal(hp.HeaderName); present {
+				nh, ok = cluster.HashHeaderValues([]string{v}), true
+			}
+		case HashKindSourceIP:
+			if remoteAddr != "" {
+				nh, ok = cluster.HashSourceIP(remoteAddr), true
+			}
+		}
+		if ok {
+			if has {
+				acc = bits.RotateLeft64(acc, 1) ^ nh
+			} else {
+				acc, has = nh, true
+			}
+		}
+		if hp.Terminal && has {
+			break // hash_policy.cc:270 — checks the accumulator
+		}
+	}
+	if !has {
+		return ctx, 0, false
+	}
+	return cluster.WithHashKey(ctx, acc), acc, true
+}
+
 // H1ClusterAction returns an Action closure that proxies the per-request H1
 // upstream call to the supplied cluster's selected endpoint. The closure
 // delegates to the package-private routerAction.do (the byte-preserved H1
@@ -471,8 +555,8 @@ func New(_ *anypb.Any, _ envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFactory,
 // ErrCloseAfterAction returned by the closure signals the HCM connection
 // loop to close the downstream after the response writes (per SPEC §5.3 +
 // §10 #3 settled).
-func H1ClusterAction(c *cluster.Cluster) Action {
-	a := &routerAction{cluster: c}
+func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy) Action {
+	a := &routerAction{cluster: c, hashPolicies: hps}
 	return func(ctx context.Context, req *http.Request) (ActionResponse, cluster.Endpoint, error) {
 		// Phase 07.1 Task 18 prereq P1: doH1ClusterAction returns an
 		// ActionResponse logical shape (no wire-bytes serialization here).
@@ -505,6 +589,15 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 	picked := cluster.Endpoint{}
 
 	a.cluster.IncUpstreamRqTotal()
+
+	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
+	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in AcquireH1. The H1
+	// codec path carries no remote addr on *http.Request, so source_ip uses the
+	// ctx-carried downstream addr set by HCM dispatch (connection.go). ADR-0237.
+	ctx, _, _ = applyHashKey(ctx, a.hashPolicies, func(n string) (string, bool) {
+		v := req.Header.Get(n)
+		return v, v != ""
+	}, downstreamRemoteAddrFrom(ctx))
 
 	pooled, err := a.cluster.AcquireH1(ctx)
 	if err != nil {
@@ -621,8 +714,9 @@ func localReplyHeaders(bodyLen int) envoyhttp.OrderedHeaders {
 // signatures preserved byte-for-byte so the byte-preserved tests in
 // router_test.go exercise the same shape (`a.do(ctx, req, bw)`).
 type routerAction struct {
-	cluster *cluster.Cluster
-	filter  *Filter // set post-build by routeTable.bindFilter; nil when no sinks configured.
+	cluster      *cluster.Cluster
+	filter       *Filter      // set post-build by routeTable.bindFilter; nil when no sinks configured.
+	hashPolicies []HashPolicy // 36.2: stored at H1ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 }
 
 // do drives one upstream H1 round-trip. Phase 06.1 Task 11 wires the cluster-
@@ -658,6 +752,14 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 	}
 
 	a.cluster.IncUpstreamRqTotal()
+
+	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
+	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in Dial. See
+	// doH1ClusterAction for the source_ip ctx-carry rationale. ADR-0237.
+	ctx, _, _ = applyHashKey(ctx, a.hashPolicies, func(n string) (string, bool) {
+		v := req.Header.Get(n)
+		return v, v != ""
+	}, downstreamRemoteAddrFrom(ctx))
 
 	upstream, ep, err := a.cluster.Dial(ctx)
 	if err != nil {

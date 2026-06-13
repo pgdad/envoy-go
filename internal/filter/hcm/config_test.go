@@ -2,6 +2,7 @@ package hcm
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -736,5 +737,84 @@ func TestParseHTTPFiltersChain_FactoryCtxThreading(t *testing.T) {
 	}
 	if captured.StatPrefix != statPrefix {
 		t.Errorf("FactoryCtx.StatPrefix: got %q, want %q", captured.StatPrefix, statPrefix)
+	}
+}
+
+// TestParseRouteHashPolicies asserts the §6 DEPARTURE-reject roster: header +
+// connection_properties.source_ip are SUPPORTED and lower into proto-free
+// router.HashPolicy descriptors; cookie / query_parameter / filter_state +
+// a configured regex_rewrite + source_ip==false DEPARTURE-reject fail-fast;
+// an empty header_name PARITY-rejects the PGV min_len=1. Header names lower.
+func TestParseRouteHashPolicies(t *testing.T) {
+	hdr := func(name string) *routev3.RouteAction_HashPolicy {
+		return &routev3.RouteAction_HashPolicy{PolicySpecifier: &routev3.RouteAction_HashPolicy_Header_{
+			Header: &routev3.RouteAction_HashPolicy_Header{HeaderName: name}}}
+	}
+	hdrTerminal := func(name string) *routev3.RouteAction_HashPolicy {
+		hp := hdr(name)
+		hp.Terminal = true
+		return hp
+	}
+	hdrRegex := func(name string) *routev3.RouteAction_HashPolicy {
+		return &routev3.RouteAction_HashPolicy{PolicySpecifier: &routev3.RouteAction_HashPolicy_Header_{
+			Header: &routev3.RouteAction_HashPolicy_Header{
+				HeaderName:   name,
+				RegexRewrite: &matcherv3.RegexMatchAndSubstitute{Substitution: "x"},
+			}}}
+	}
+	srcip := func(v bool) *routev3.RouteAction_HashPolicy {
+		return &routev3.RouteAction_HashPolicy{PolicySpecifier: &routev3.RouteAction_HashPolicy_ConnectionProperties_{
+			ConnectionProperties: &routev3.RouteAction_HashPolicy_ConnectionProperties{SourceIp: v}}}
+	}
+	cookie := &routev3.RouteAction_HashPolicy{PolicySpecifier: &routev3.RouteAction_HashPolicy_Cookie_{
+		Cookie: &routev3.RouteAction_HashPolicy_Cookie{Name: "sess"}}}
+	queryParam := &routev3.RouteAction_HashPolicy{PolicySpecifier: &routev3.RouteAction_HashPolicy_QueryParameter_{
+		QueryParameter: &routev3.RouteAction_HashPolicy_QueryParameter{Name: "q"}}}
+	filterState := &routev3.RouteAction_HashPolicy{PolicySpecifier: &routev3.RouteAction_HashPolicy_FilterState_{
+		FilterState: &routev3.RouteAction_HashPolicy_FilterState{Key: "k"}}}
+
+	tests := []struct {
+		name    string
+		in      []*routev3.RouteAction_HashPolicy
+		wantErr string // "" = accept
+		want    []router.HashPolicy
+	}{
+		{"nil", nil, "", nil},
+		{"header", []*routev3.RouteAction_HashPolicy{hdr("x-hash")}, "", []router.HashPolicy{{Kind: router.HashKindHeader, HeaderName: "x-hash"}}},
+		{"header-upper-lowered", []*routev3.RouteAction_HashPolicy{hdr("X-Hash")}, "", []router.HashPolicy{{Kind: router.HashKindHeader, HeaderName: "x-hash"}}},
+		{"source_ip", []*routev3.RouteAction_HashPolicy{srcip(true)}, "", []router.HashPolicy{{Kind: router.HashKindSourceIP}}},
+		{"header-terminal", []*routev3.RouteAction_HashPolicy{hdrTerminal("x-hash")}, "", []router.HashPolicy{{Kind: router.HashKindHeader, HeaderName: "x-hash", Terminal: true}}},
+		{"source_ip-terminal", []*routev3.RouteAction_HashPolicy{func() *routev3.RouteAction_HashPolicy {
+			hp := srcip(true)
+			hp.Terminal = true
+			return hp
+		}()}, "", []router.HashPolicy{{Kind: router.HashKindSourceIP, Terminal: true}}},
+		{"header-then-source_ip", []*routev3.RouteAction_HashPolicy{hdr("x-hash"), srcip(true)}, "", []router.HashPolicy{
+			{Kind: router.HashKindHeader, HeaderName: "x-hash"},
+			{Kind: router.HashKindSourceIP},
+		}},
+		{"empty-header-name", []*routev3.RouteAction_HashPolicy{hdr("")}, "value length must be at least 1 runes", nil},
+		{"regex-rewrite", []*routev3.RouteAction_HashPolicy{hdrRegex("x-hash")}, "regex_rewrite is not supported", nil},
+		{"source_ip-false", []*routev3.RouteAction_HashPolicy{srcip(false)}, "connection_properties without source_ip", nil},
+		{"cookie", []*routev3.RouteAction_HashPolicy{cookie}, "is not supported (only header, connection_properties.source_ip)", nil},
+		{"query_parameter", []*routev3.RouteAction_HashPolicy{queryParam}, "is not supported (only header, connection_properties.source_ip)", nil},
+		{"filter_state", []*routev3.RouteAction_HashPolicy{filterState}, "is not supported (only header, connection_properties.source_ip)", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseRouteHashPolicies(tt.in)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("accept expected, got %v", err)
+				}
+				if !reflect.DeepEqual(got, tt.want) {
+					t.Fatalf("descriptor: got %+v want %+v", got, tt.want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("want err containing %q, got %v", tt.wantErr, err)
+			}
+		})
 	}
 }

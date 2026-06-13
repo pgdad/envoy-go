@@ -199,7 +199,8 @@ func (a *directResponseAction) asRouterActionH2() router.H2Action {
 // Task 16's territory; the H2 type-switch in h2dispatch.go:62,119 stays
 // dangling until Task 16 lands.
 type clusterRouteAction struct {
-	cluster *cluster.Cluster
+	cluster      *cluster.Cluster
+	hashPolicies []router.HashPolicy // 36.2: route RouteAction.hash_policy producer (ADR-0237)
 }
 
 // do invokes the per-request cluster-dial action via the router-package
@@ -209,7 +210,7 @@ type clusterRouteAction struct {
 // (status int + error) for the routeAction interface; the chain-mediated H1
 // path goes through asRouterAction(), not do().
 func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	resp, _, err := router.H1ClusterAction(a.cluster)(ctx, req)
+	resp, _, err := router.H1ClusterAction(a.cluster, a.hashPolicies)(ctx, req)
 	if err != nil {
 		return resp.Status, err
 	}
@@ -232,7 +233,7 @@ func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufi
 // chain-mediated H1 path (Task 15 connection.go) plumbs into the terminal
 // router filter via *Filter.SetAction.
 func (a *clusterRouteAction) asRouterAction() router.Action {
-	return router.H1ClusterAction(a.cluster)
+	return router.H1ClusterAction(a.cluster, a.hashPolicies)
 }
 
 // asRouterActionH2 returns the router.H2Action closure built by the router
@@ -245,5 +246,5 @@ func (a *clusterRouteAction) asRouterAction() router.Action {
 // H1/H2 routerAction variant selection into a single bridge type whose
 // router-package backend handles both protocols.
 func (a *clusterRouteAction) asRouterActionH2() router.H2Action {
-	return router.H2ClusterAction(a.cluster)
+	return router.H2ClusterAction(a.cluster, a.hashPolicies)
 }
