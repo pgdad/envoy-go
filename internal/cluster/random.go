@@ -9,6 +9,9 @@ package cluster
 type randomLB struct {
 	endpoints []Endpoint
 	rng       func() uint64 // injectable for deterministic tests (the upstream mock posture)
+	// health is the build-time-injected per-cluster health registry (ADR-0243);
+	// nil -> the fast path (byte-stable). Set in buildLeafLB after construction.
+	health *clusterHealth
 }
 
 // newRandom constructs a randomLB over endpoints, REUSING the package-private
@@ -40,5 +43,18 @@ func (r *randomLB) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, func
 		return Endpoint{}, noopRelease, errNoEndpoints // the roundRobin/leastRequest parity (AMEND-R5)
 	}
 	i := int(r.rng() % uint64(n))
-	return r.endpoints[i], noopRelease, nil
+	if r.health == nil {
+		return r.endpoints[i], noopRelease, nil
+	}
+	if r.health.inPanic(r.endpoints) {
+		r.health.panicInc()
+		return r.endpoints[i], noopRelease, nil
+	}
+	for k := 0; k < n; k++ {
+		j := (i + k) % n
+		if r.health.isHealthy(r.endpoints[j]) {
+			return r.endpoints[j], noopRelease, nil
+		}
+	}
+	return Endpoint{}, noopRelease, errNoEndpoints
 }

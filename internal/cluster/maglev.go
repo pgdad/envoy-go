@@ -22,6 +22,10 @@ type maglevLB struct {
 	// Gauge values computed at build (registered by the manager — AMEND-M4).
 	minPerHost uint64 // = floor(M/N) under equal weight
 	maxPerHost uint64 // = ceil(M/N)  under equal weight
+
+	// health is the build-time-injected per-cluster health registry (ADR-0243);
+	// nil -> the fast path (byte-stable). Set in buildLeafLB after construction.
+	health *clusterHealth
 }
 
 // maglevCfg carries the parsed maglev policy parameters (the single table_size).
@@ -43,7 +47,21 @@ func (mg *maglevLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) (E
 	if !hasHash {
 		hashKey = mg.rng()
 	}
-	return mg.endpoints[mg.table[hashKey%mg.tableSize]], noopRelease, nil
+	slot := hashKey % mg.tableSize
+	if mg.health == nil || mg.health.inPanic(mg.endpoints) {
+		if mg.health != nil {
+			mg.health.panicInc()
+		}
+		return mg.endpoints[mg.table[slot]], noopRelease, nil
+	}
+	// Walk the table slots forward from slot to the next healthy host (ADR-0243).
+	for k := uint64(0); k < mg.tableSize; k++ {
+		idx := mg.table[(slot+k)%mg.tableSize]
+		if mg.health.isHealthy(mg.endpoints[idx]) {
+			return mg.endpoints[idx], noopRelease, nil
+		}
+	}
+	return Endpoint{}, noopRelease, errNoEndpoints
 }
 
 // newMaglev builds a maglevLB seeded from a fresh PCG rng. Like newRingHash it

@@ -1356,7 +1356,7 @@ func TestBuildLeafLB_BuildsEachPolicyOverSubSlice(t *testing.T) {
 		clusterv3.Cluster_RANDOM, clusterv3.Cluster_RING_HASH, clusterv3.Cluster_MAGLEV,
 	} {
 		c := &clusterv3.Cluster{Name: "c", LbPolicy: pol}
-		lb, err := buildLeafLB(c, "c", eps[:1])
+		lb, err := buildLeafLB(c, "c", eps[:1], nil)
 		if err != nil {
 			t.Errorf("buildLeafLB(%v) over sub-slice: %v", pol, err)
 			continue
@@ -1373,7 +1373,7 @@ func TestBuildLeafLB_RejectsClusterProvided(t *testing.T) {
 	// BEFORE any subset wrap. This is why lb_subset_config + CLUSTER_PROVIDED
 	// rejects in outcome with ZERO new reject arm.
 	c := &clusterv3.Cluster{Name: "c", LbPolicy: clusterv3.Cluster_CLUSTER_PROVIDED}
-	_, err := buildLeafLB(c, "c", []Endpoint{{Host: "127.0.0.1", Port: 9001}})
+	_, err := buildLeafLB(c, "c", []Endpoint{{Host: "127.0.0.1", Port: 9001}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "unsupported lb_policy") {
 		t.Errorf("err = %v, want unsupported lb_policy reject", err)
 	}

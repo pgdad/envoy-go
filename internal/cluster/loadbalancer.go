@@ -35,12 +35,32 @@ var noopRelease = func() {}
 type roundRobin struct {
 	endpoints []Endpoint
 	counter   atomic.Uint64
+	// health is the build-time-injected per-cluster health registry (ADR-0243).
+	// nil for a cluster with no health_checks -> the fast path (byte-stable with
+	// the pre-39.1 behavior). Set in buildLeafLB AFTER construction.
+	health *clusterHealth
 }
 
 func (rr *roundRobin) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, func(), error) {
-	if len(rr.endpoints) == 0 {
+	n := len(rr.endpoints)
+	if n == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints
 	}
-	i := rr.counter.Add(1) - 1
-	return rr.endpoints[int(i)%len(rr.endpoints)], noopRelease, nil
+	if rr.health == nil {
+		i := rr.counter.Add(1) - 1
+		return rr.endpoints[int(i)%n], noopRelease, nil
+	}
+	if rr.health.inPanic(rr.endpoints) {
+		rr.health.panicInc()
+		i := rr.counter.Add(1) - 1
+		return rr.endpoints[int(i)%n], noopRelease, nil
+	}
+	for tries := 0; tries < n; tries++ {
+		i := rr.counter.Add(1) - 1
+		ep := rr.endpoints[int(i)%n]
+		if rr.health.isHealthy(ep) {
+			return ep, noopRelease, nil
+		}
+	}
+	return Endpoint{}, noopRelease, errNoEndpoints
 }

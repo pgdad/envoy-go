@@ -108,6 +108,18 @@ type Cluster struct {
 	upstreamCxTotal  *stats.Counter
 	upstreamCxActive *stats.Gauge
 	membershipTotal  *stats.Gauge
+
+	// health is the per-cluster active-HC registry (ADR-0243). nil for a cluster
+	// with no health_checks. Built + threaded into the LB constructs in
+	// buildCluster; consumed in registerClusterMetrics (stat injection) +
+	// StartHealthChecks (runtime).
+	health *clusterHealth
+
+	// checkers are the active-HC background probers (one per configured
+	// health_check). nil for a cluster with no health_checks. Built in
+	// buildCluster, stat-registered in registerClusterMetrics, and run by
+	// Manager.StartHealthChecks (stopped by Manager.Drain / ctx cancel).
+	checkers []*healthChecker
 }
 
 // statusClassCounter returns the upstream_rq_<Nxx> counter for the given

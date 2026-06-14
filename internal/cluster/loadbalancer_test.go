@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/esalaine/envoy-go/internal/stats"
 )
 
 func TestRoundRobin_DistributionExact(t *testing.T) {
@@ -115,6 +117,51 @@ func TestRoundRobin_ReleaseIsNonNilNoop(t *testing.T) {
 	}
 	release() // must not panic and must be safe to call twice
 	release()
+}
+
+// TestRoundRobin_HealthAware proves the ADR-0243 health-aware pick: while the
+// healthy fraction is at/above the panic threshold the unhealthy host is never
+// returned; once it drops below the threshold panic mode returns ALL hosts
+// (incl. unhealthy) and increments lb_healthy_panic.
+func TestRoundRobin_HealthAware(t *testing.T) {
+	e := eps(3) // addrs "a:1000", "b:1001", "c:1002"
+	ch := newClusterHealth(e, 0.5)
+	rr := &roundRobin{endpoints: e, health: ch}
+
+	// Mark one unhealthy: 2/3 = 66% > 50% -> NOT in panic; that host is skipped.
+	unhealthyAddr := e[2].Addr()
+	ch.states[unhealthyAddr].healthy.Store(false)
+	for i := 0; i < 30; i++ {
+		ep, _, err := rr.Pick(0, false, SubsetMatch{}, false)
+		if err != nil {
+			t.Fatalf("pick %d: %v", i, err)
+		}
+		if ep.Addr() == unhealthyAddr {
+			t.Fatalf("pick %d returned the unhealthy host %q (should be skipped while healthy fraction > threshold)", i, unhealthyAddr)
+		}
+	}
+
+	// Mark a second unhealthy: 1/3 = 33% < 50% -> panic mode returns all hosts.
+	reg := stats.NewRegistry()
+	ch.panicCounter = reg.NewCounter("lb_healthy_panic")
+	ch.states[e[1].Addr()].healthy.Store(false)
+
+	sawUnhealthy := false
+	for i := 0; i < 30; i++ {
+		ep, _, err := rr.Pick(0, false, SubsetMatch{}, false)
+		if err != nil {
+			t.Fatalf("panic-mode pick %d: %v", i, err)
+		}
+		if ep.Addr() == e[1].Addr() || ep.Addr() == e[2].Addr() {
+			sawUnhealthy = true
+		}
+	}
+	if !sawUnhealthy {
+		t.Fatal("panic mode never returned an unhealthy host (expected all hosts eligible)")
+	}
+	if got := ch.panicCounter.Load(); got <= 0 {
+		t.Fatalf("lb_healthy_panic = %d, want > 0", got)
+	}
 }
 
 func TestRoundRobin_PickSequenceUnchanged(t *testing.T) {

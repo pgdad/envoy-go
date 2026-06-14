@@ -1,9 +1,11 @@
 package cluster
 
 import (
+	"context"
 	stdtls "crypto/tls"
 	"fmt"
 	"sort"
+	"sync"
 
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -30,6 +32,12 @@ const httpProtocolOptionsKey = "envoy.extensions.upstreams.http.v3.HttpProtocolO
 // cluster name at filter-construction time.
 type Manager struct {
 	clusters map[string]*Cluster
+
+	// hcCancel cancels the active-HC runtime launched by StartHealthChecks;
+	// hcWG tracks the per-checker goroutines so Drain can join them. Both are
+	// zero-valued until StartHealthChecks runs (phase 39.1, ADR-0243).
+	hcCancel context.CancelFunc
+	hcWG     sync.WaitGroup
 }
 
 // NewManager walks bs.GetStaticResources().GetClusters() and materializes one
@@ -137,6 +145,20 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 		s.selected = r.NewCounter(prefix + "lb_subsets_selected")
 		s.fallbackC = r.NewCounter(prefix + "lb_subsets_fallback")
 	}
+	// Phase 39.1 (ADR-0243): the +7 active-HC stats, on clusters WITH
+	// health_checks only. membership_healthy starts at the full endpoint count
+	// (all hosts begin healthy); the per-checker health_check.* handles are
+	// injected by registerStats. MVP assumes ≤1 checker per cluster (the fixture
+	// uses one); a multi-check cluster would duplicate-register and panic — out
+	// of MVP scope.
+	if c.health != nil {
+		c.health.membershipHealthy = r.NewGauge(prefix + "membership_healthy")
+		c.health.membershipHealthy.Set(int64(len(c.endpoints))) // all hosts start healthy
+		c.health.panicCounter = r.NewCounter(prefix + "lb_healthy_panic")
+		for _, hc := range c.checkers {
+			hc.registerStats(r, prefix)
+		}
+	}
 }
 
 // Get looks up a cluster by name. Returns (nil, false) if not found.
@@ -212,8 +234,34 @@ func (m *Manager) Clusters() []ClusterInfo {
 // design (the consolidated in-flight-completion ADR; Tasks 9 + 10 cite
 // ADR-0096 without re-anchoring).
 func (m *Manager) Drain() {
+	// Phase 39.1 (ADR-0243): stop the active-HC runtime first (cancel the
+	// shared ctx, then join the per-checker goroutines) so no probe races the
+	// pool close. No-op when StartHealthChecks was never called (hcCancel nil).
+	if m.hcCancel != nil {
+		m.hcCancel()
+		m.hcWG.Wait()
+	}
 	for _, c := range m.clusters {
 		c.closePool()
+	}
+}
+
+// StartHealthChecks launches the active-HC runtime for every cluster with
+// health_checks configured (one goroutine per checker). Call AFTER the stats
+// registry is frozen (post-boot) so the injected stat handles are live. The
+// checkers stop when ctx is canceled OR Drain() is called (Drain cancels the
+// derived ctx and joins the goroutines). Phase 39.1 (ADR-0243).
+func (m *Manager) StartHealthChecks(ctx context.Context) {
+	hcCtx, cancel := context.WithCancel(ctx)
+	m.hcCancel = cancel
+	for _, c := range m.clusters {
+		for _, hc := range c.checkers {
+			m.hcWG.Add(1)
+			go func(hc *healthChecker) {
+				defer m.hcWG.Done()
+				hc.run(hcCtx)
+			}(hc)
+		}
 	}
 }
 
@@ -222,30 +270,50 @@ func (m *Manager) Drain() {
 // child per subset over a filtered sub-slice. CLUSTER_PROVIDED and every other
 // unsupported policy reject HERE (the default arm) — before any subset wrap, so
 // lb_subset_config + CLUSTER_PROVIDED rejects in outcome with ZERO new reject arm.
-func buildLeafLB(c *clusterv3.Cluster, name string, endpoints []Endpoint) (loadBalancer, error) {
+func buildLeafLB(c *clusterv3.Cluster, name string, endpoints []Endpoint, health *clusterHealth) (loadBalancer, error) {
 	switch c.GetLbPolicy() {
 	case clusterv3.Cluster_ROUND_ROBIN:
-		return &roundRobin{endpoints: endpoints}, nil
+		return &roundRobin{endpoints: endpoints, health: health}, nil
 	case clusterv3.Cluster_LEAST_REQUEST:
 		cc, err := parseLeastRequestLbConfig(c, name)
 		if err != nil {
 			return nil, err
 		}
-		return newLeastRequest(endpoints, cc)
+		lr, err := newLeastRequest(endpoints, cc)
+		if err != nil {
+			return nil, err
+		}
+		lr.health = health
+		return lr, nil
 	case clusterv3.Cluster_RANDOM: // phase 35 (ADR-0234): stateless uniform pick; NO config parse (RANDOM has no config message)
-		return newRandom(endpoints)
+		r, err := newRandom(endpoints)
+		if err != nil {
+			return nil, err
+		}
+		r.health = health
+		return r, nil
 	case clusterv3.Cluster_RING_HASH: // phase 36.1 (ADR-0236): Ketama consistent-hash ring
 		cfg, err := parseRingHashLbConfig(c, name)
 		if err != nil {
 			return nil, err
 		}
-		return newRingHash(endpoints, cfg)
+		rh, err := newRingHash(endpoints, cfg)
+		if err != nil {
+			return nil, err
+		}
+		rh.health = health
+		return rh, nil
 	case clusterv3.Cluster_MAGLEV: // phase 37 (ADR-0238): Maglev consistent-hash table
 		cfg, err := parseMaglevLbConfig(c, name)
 		if err != nil {
 			return nil, err
 		}
-		return newMaglev(endpoints, cfg)
+		mg, err := newMaglev(endpoints, cfg)
+		if err != nil {
+			return nil, err
+		}
+		mg.health = health
+		return mg, nil
 	default:
 		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH, MAGLEV)", name, c.GetLbPolicy())
 	}
@@ -290,22 +358,43 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if c.GetConnectTimeout() != nil {
 		timeout = c.GetConnectTimeout().AsDuration()
 	}
+	// Phase 39.1 (ADR-0243): parse health_checks (surfaces the §6 rejects at
+	// boot) and build the per-cluster health registry when configured. health is
+	// nil for a cluster with no health_checks -> the LB fast path (byte-stable).
+	hcCfgs, err := parseHealthChecks(c, name)
+	if err != nil {
+		return nil, err
+	}
+	var health *clusterHealth
+	if len(hcCfgs) > 0 {
+		health = newClusterHealth(endpoints, parsePanicThreshold(c))
+	}
 	cl := &Cluster{
 		name:           name,
 		endpoints:      endpoints,
 		connectTimeout: timeout,
 		// lb set by buildLeafLB below (ADR-0233; SPEC §3.4)
 	}
-	lb, err := buildLeafLB(c, name, endpoints)
+	lb, err := buildLeafLB(c, name, endpoints, health)
 	if err != nil {
 		return nil, err // CLUSTER_PROVIDED / unsupported reject HERE — before any subset wrap
 	}
 	if sc := c.GetLbSubsetConfig(); sc != nil {
 		lb = newSubsetLB(endpoints, parseLbSubsetConfig(sc), func(sub []Endpoint) (loadBalancer, error) {
-			return buildLeafLB(c, name, sub)
+			return buildLeafLB(c, name, sub, health)
 		})
 	}
 	cl.lb = lb
+	cl.health = health
+	// Phase 39.1 (ADR-0243): build one background prober per configured
+	// health_check over the cluster's endpoint set. Stat handles are injected
+	// in registerClusterMetrics; the probers are launched by
+	// Manager.StartHealthChecks (post-Freeze) and stopped by Manager.Drain.
+	if health != nil {
+		for _, cfg := range hcCfgs {
+			cl.checkers = append(cl.checkers, newHealthChecker(cl.endpoints, health, cfg))
+		}
+	}
 	if ts := c.GetTransportSocket(); ts != nil {
 		if ts.GetTypedConfig() == nil {
 			return nil, fmt.Errorf("cluster: %q: transport_socket without typed_config", name)

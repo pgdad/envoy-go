@@ -25,6 +25,10 @@ type ringHashLB struct {
 	size       uint64 // total ring points = len(ring)
 	minPerHost uint64 // smallest per-host ring-entry count
 	maxPerHost uint64 // largest per-host ring-entry count
+
+	// health is the build-time-injected per-cluster health registry (ADR-0243);
+	// nil -> the fast path (byte-stable). Set in buildLeafLB after construction.
+	health *clusterHealth
 }
 
 // ringEntry is one point on the Ketama ring: a hash value and the index of the
@@ -137,5 +141,18 @@ func (rh *ringHashLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) 
 	if m == len(rh.ring) {
 		m = 0 // wrap
 	}
-	return rh.endpoints[rh.ring[m].ep], noopRelease, nil
+	if rh.health == nil || rh.health.inPanic(rh.endpoints) {
+		if rh.health != nil {
+			rh.health.panicInc()
+		}
+		return rh.endpoints[rh.ring[m].ep], noopRelease, nil
+	}
+	// Walk the ring forward from m to the next healthy host (ADR-0243).
+	for k := 0; k < len(rh.ring); k++ {
+		idx := rh.ring[(m+k)%len(rh.ring)].ep
+		if rh.health.isHealthy(rh.endpoints[idx]) {
+			return rh.endpoints[idx], noopRelease, nil
+		}
+	}
+	return Endpoint{}, noopRelease, errNoEndpoints
 }

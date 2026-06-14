@@ -29,6 +29,9 @@ type leastRequest struct {
 	active      []atomic.Int64 // index-aligned with endpoints
 	choiceCount int
 	rng         func() uint64 // injectable for deterministic tests (the upstream mock posture)
+	// health is the build-time-injected per-cluster health registry (ADR-0243);
+	// nil -> the fast path (byte-stable). Set in buildLeafLB after construction.
+	health *clusterHealth
 }
 
 // newLeastRequest constructs a leastRequest over endpoints with the given P2C
@@ -83,13 +86,39 @@ func (lr *leastRequest) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint,
 	if n == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints
 	}
-	best := int(lr.rng() % uint64(n))
+	panicMode := lr.health == nil
+	if lr.health != nil && lr.health.inPanic(lr.endpoints) {
+		lr.health.panicInc()
+		panicMode = true
+	}
+	// draw returns a candidate endpoint index. In panic/no-health mode it returns
+	// a uniform draw (the byte-stable pre-39.1 path). Otherwise it scans forward
+	// from a random start to the next healthy index; (0,false) when none.
+	draw := func() (int, bool) {
+		i := int(lr.rng() % uint64(n))
+		if panicMode {
+			return i, true
+		}
+		for k := 0; k < n; k++ {
+			j := (i + k) % n
+			if lr.health.isHealthy(lr.endpoints[j]) {
+				return j, true
+			}
+		}
+		return 0, false
+	}
+	best, ok := draw()
+	if !ok {
+		return Endpoint{}, noopRelease, errNoEndpoints
+	}
 	bestActive := lr.active[best].Load()
 	for i := 1; i < lr.choiceCount; i++ {
-		cand := int(lr.rng() % uint64(n))
-		candActive := lr.active[cand].Load()
-		if candActive < bestActive { // STRICT <: first-drawn keeps ties (AMEND-L6)
-			best, bestActive = cand, candActive
+		cand, ok := draw()
+		if !ok {
+			break
+		}
+		if ca := lr.active[cand].Load(); ca < bestActive { // STRICT <: first-drawn keeps ties (AMEND-L6)
+			best, bestActive = cand, ca
 		}
 	}
 	lr.active[best].Add(1)

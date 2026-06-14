@@ -14,6 +14,39 @@ func TestRingHash_SameKeySameEndpoint(t *testing.T) {
 	}
 }
 
+// TestRingHash_HealthAware_WalkToNextHealthy proves the ADR-0243 ring walk:
+// when the host a fixed key resolves to is marked unhealthy, the SAME key now
+// resolves to a different, healthy host (the next healthy point forward on the
+// ring), rather than the unhealthy primary.
+func TestRingHash_HealthAware_WalkToNextHealthy(t *testing.T) {
+	e := eps(3)
+	rh, err := newRingHash(e, ringHashCfg{minRingSize: 1024, maxRingSize: 8388608, hashFunc: hashXX})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = uint64(0xABCDEF)
+
+	// Baseline: the key's primary host (no health -> fast path).
+	primary, _, _ := rh.Pick(key, true, SubsetMatch{}, false)
+
+	// Attach a health registry and mark the primary unhealthy. 2/3 healthy = 66%
+	// > 50% -> NOT in panic; the ring walk skips the unhealthy primary.
+	ch := newClusterHealth(e, 0.5)
+	rh.health = ch
+	ch.states[primary.Addr()].healthy.Store(false)
+
+	got, _, err := rh.Pick(key, true, SubsetMatch{}, false)
+	if err != nil {
+		t.Fatalf("health-aware pick: %v", err)
+	}
+	if got.Addr() == primary.Addr() {
+		t.Fatalf("ring returned the unhealthy primary %q; expected a walk to the next healthy host", primary.Addr())
+	}
+	if !ch.isHealthy(got) {
+		t.Fatalf("ring returned an unhealthy host %q", got.Addr())
+	}
+}
+
 func TestRingHash_DistinctKeysSpread(t *testing.T) {
 	rh, _ := newRingHash(eps(3), ringHashCfg{minRingSize: 1024, maxRingSize: 8388608, hashFunc: hashXX})
 	seen := map[string]bool{}
