@@ -249,3 +249,32 @@ func (a *clusterRouteAction) asRouterAction() router.Action {
 func (a *clusterRouteAction) asRouterActionH2() router.H2Action {
 	return router.H2ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch)
 }
+
+// weightedClusterRouteAction is the per-request weighted-random cluster-SELECTION
+// route action (ADR-0241), the sibling of clusterRouteAction. The producer
+// (buildWeightedRouterAction) pre-builds the H1/H2 closures (each carrying the N
+// entries + the SHARED selector); the bridge just hands them to the chain-mediated
+// dispatch via asRouterAction/asRouterActionH2. The do() arm mirrors
+// clusterRouteAction.do (run the H1 closure → write the reply) for the legacy
+// direct-call interface.
+type weightedClusterRouteAction struct {
+	h1 router.Action
+	h2 router.H2Action
+}
+
+func (a *weightedClusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
+	resp, _, err := a.h1(ctx, req)
+	if err != nil {
+		return resp.Status, err
+	}
+	if err := writeStatusReply(bw, resp.Status, string(resp.Body)); err != nil {
+		return resp.Status, err
+	}
+	if resp.Close {
+		return resp.Status, errCloseAfterAction
+	}
+	return resp.Status, nil
+}
+
+func (a *weightedClusterRouteAction) asRouterAction() router.Action     { return a.h1 }
+func (a *weightedClusterRouteAction) asRouterActionH2() router.H2Action { return a.h2 }

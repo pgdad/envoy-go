@@ -268,6 +268,18 @@ func TestBuildExtraResponseHeaders_SkipsNilEntries(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 38.2 Task 5 — weightedClusterRouteAction bridge (ADR-0241)
+// ---------------------------------------------------------------------------
+
+// TestWeightedClusterRouteAction_SatisfiesInterface asserts that
+// *weightedClusterRouteAction satisfies the routeAction interface. This is a
+// compile-time assertion: if the struct or any method is missing, the test
+// fails with "undefined: weightedClusterRouteAction" or an interface mismatch.
+func TestWeightedClusterRouteAction_SatisfiesInterface(t *testing.T) {
+	var _ routeAction = (*weightedClusterRouteAction)(nil)
+}
+
+// ---------------------------------------------------------------------------
 // Phase 07.1 Task 15 — emit-deferral migration to chain-completion (Decision §3.1)
 // ---------------------------------------------------------------------------
 //

@@ -537,26 +537,95 @@ func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (route
 	if r == nil {
 		return nil, fmt.Errorf("route action is nil")
 	}
-	cs, ok := r.GetClusterSpecifier().(*routev3.RouteAction_Cluster)
-	if !ok {
-		return nil, fmt.Errorf("route action: cluster_specifier %T is not supported in phase 04 (literal cluster name only)", r.GetClusterSpecifier())
+	switch cs := r.GetClusterSpecifier().(type) {
+	case *routev3.RouteAction_Cluster:
+		if cs.Cluster == "" {
+			return nil, fmt.Errorf("route action: cluster name is empty")
+		}
+		c, ok := clusters.Get(cs.Cluster)
+		if !ok {
+			return nil, fmt.Errorf("route action: cluster %q not found", cs.Cluster)
+		}
+		hps, err := parseRouteHashPolicies(r.GetHashPolicy())
+		if err != nil {
+			return nil, err
+		}
+		sm, err := parseRouteSubsetMatch(r.GetMetadataMatch())
+		if err != nil {
+			return nil, err
+		}
+		return &clusterRouteAction{cluster: c, hashPolicies: hps, subsetMatch: sm}, nil
+	case *routev3.RouteAction_WeightedClusters:
+		return buildWeightedRouterAction(r, cs.WeightedClusters, clusters)
+	default:
+		return nil, fmt.Errorf("route action: cluster_specifier %T is not supported in phase 04 (literal cluster name or weighted_clusters)", r.GetClusterSpecifier())
 	}
-	if cs.Cluster == "" {
-		return nil, fmt.Errorf("route action: cluster name is empty")
-	}
-	c, ok := clusters.Get(cs.Cluster)
-	if !ok {
-		return nil, fmt.Errorf("route action: cluster %q not found", cs.Cluster)
+}
+
+// buildWeightedRouterAction lowers a RouteAction.weighted_clusters into a
+// weightedClusterRouteAction (ADR-0241). envoy-go does its OWN parse-reject (no
+// PGV) — the SPEC §6 SIX-arm roster, in the reference's precedence order. Task 6
+// lands the FULL function (validation + merge + build) so the accept test below
+// observes a real *weightedClusterRouteAction; Task 7 adds the accept-CASE tests.
+func buildWeightedRouterAction(r *routev3.RouteAction, wc *routev3.WeightedCluster, clusters *cluster.Manager) (routeAction, error) {
+	entries := wc.GetClusters()
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("route action: weighted_clusters has no clusters")
 	}
 	hps, err := parseRouteHashPolicies(r.GetHashPolicy())
 	if err != nil {
 		return nil, err
 	}
-	sm, err := parseRouteSubsetMatch(r.GetMetadataMatch())
-	if err != nil {
-		return nil, err
+	wcs := make([]router.WeightedCluster, 0, len(entries))
+	weights := make([]uint32, 0, len(entries))
+	for _, cw := range entries {
+		// Precedence per SPEC §6 / AMEND-WC3: name presence → cluster_header-unsupported
+		// → weight presence → cluster-exists. (Empty name + empty cluster_header → the
+		// "name is required" arm — envoy-go's analog of the reference's
+		// "At least one of name or cluster_header need to be specified".)
+		name := cw.GetName()
+		if name == "" {
+			return nil, fmt.Errorf("route action: weighted_clusters cluster: name is required")
+		}
+		if cw.GetClusterHeader() != "" {
+			return nil, fmt.Errorf("route action: weighted_clusters cluster_header is not supported (literal cluster name only)")
+		}
+		if cw.GetWeight() == nil {
+			return nil, fmt.Errorf("route action: weighted_clusters cluster %q: weight is required", name)
+		}
+		c, ok := clusters.Get(name)
+		if !ok {
+			return nil, fmt.Errorf("route action: weighted_clusters cluster %q not found", name)
+		}
+		sm, err := mergeRouteSubsetMatch(r.GetMetadataMatch(), cw.GetMetadataMatch())
+		if err != nil {
+			return nil, err
+		}
+		wcs = append(wcs, router.WeightedCluster{Cluster: c, SubsetMatch: sm})
+		weights = append(weights, cw.GetWeight().GetValue())
 	}
-	return &clusterRouteAction{cluster: c, hashPolicies: hps, subsetMatch: sm}, nil
+	var total uint32
+	for _, w := range weights {
+		total += w
+	}
+	if total == 0 {
+		return nil, fmt.Errorf("route action: weighted_clusters total weight must be > 0")
+	}
+	return buildWeightedBridge(wcs, hps, weights)
+}
+
+// buildWeightedBridge constructs the selector (the cumulative weights + a
+// crypto-seeded RNG — Σweights > 0 already proven above) and the H1/H2 dispatch
+// closures sharing it, returning the weightedClusterRouteAction bridge.
+func buildWeightedBridge(wcs []router.WeightedCluster, hps []router.HashPolicy, weights []uint32) (routeAction, error) {
+	sel, err := router.NewWeightedSelector(weights)
+	if err != nil {
+		return nil, fmt.Errorf("route action: weighted_clusters: %w", err) // crypto/rand seed failure → boot-fail
+	}
+	return &weightedClusterRouteAction{
+		h1: router.H1WeightedClusterAction(wcs, hps, sel),
+		h2: router.H2WeightedClusterAction(wcs, hps, sel),
+	}, nil
 }
 
 // parseRouteSubsetMatch lowers RouteAction.metadata_match["envoy.lb"] to a proto-
@@ -570,6 +639,36 @@ func parseRouteSubsetMatch(md *corev3.Metadata) (cluster.SubsetMatch, error) {
 		return cluster.SubsetMatch{}, fmt.Errorf("router: metadata_match envoy.lb key %q: only scalar values (string, number, bool) are supported", nonScalar[0])
 	}
 	return cluster.NewSubsetMatch(scalars), nil
+}
+
+// mergeRouteSubsetMatch merges a route-level RouteAction.metadata_match["envoy.lb"]
+// with a per-weighted-cluster ClusterWeight.metadata_match["envoy.lb"], with the
+// ENTRY values taking precedence on key collision (SPEC §11.5 / AMEND-WC5 — the
+// proto's "values here taking precedence"). Both are route-static → merged ONCE
+// at config-build into a proto-free cluster.SubsetMatch threaded verbatim per
+// request via the EXISTING ADR-0239 WithSubsetMatch seam (the 38.1 thread, NO
+// loadBalancer.Pick change). A non-scalar value on EITHER side rejects (the 38.1
+// scalar MVP boundary — the parseRouteSubsetMatch reject, reused).
+func mergeRouteSubsetMatch(routeMD, entryMD *corev3.Metadata) (cluster.SubsetMatch, error) {
+	routeScalars, routeNon := cluster.ScalarsFromStruct(routeMD.GetFilterMetadata()["envoy.lb"])
+	if len(routeNon) > 0 {
+		return cluster.SubsetMatch{}, fmt.Errorf("router: metadata_match envoy.lb key %q: only scalar values (string, number, bool) are supported", routeNon[0])
+	}
+	entryScalars, entryNon := cluster.ScalarsFromStruct(entryMD.GetFilterMetadata()["envoy.lb"])
+	if len(entryNon) > 0 {
+		return cluster.SubsetMatch{}, fmt.Errorf("router: metadata_match envoy.lb key %q: only scalar values (string, number, bool) are supported", entryNon[0])
+	}
+	if len(routeScalars) == 0 && len(entryScalars) == 0 {
+		return cluster.SubsetMatch{}, nil
+	}
+	merged := make(map[string]cluster.SubsetValue, len(routeScalars)+len(entryScalars))
+	for k, v := range routeScalars {
+		merged[k] = v
+	}
+	for k, v := range entryScalars { // entry precedence
+		merged[k] = v
+	}
+	return cluster.NewSubsetMatch(merged), nil
 }
 
 // parseRouteHashPolicies lowers RouteAction.hash_policy[] into proto-free

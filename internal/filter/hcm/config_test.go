@@ -501,11 +501,13 @@ func TestParseFilter_DirectResponseEmptyBody(t *testing.T) {
 }
 
 func TestParseFilter_RouterActionWeightedClusters(t *testing.T) {
+	// Now that weighted_clusters is supported (Task 6), an empty cluster list is
+	// the shallowest reject path rather than the old "cluster_specifier not supported" arm.
 	expectErr(t, func(h *hcmv3.HttpConnectionManager) {
 		h.GetRouteConfig().VirtualHosts[0].Routes[0].Action = &routev3.Route_Route{Route: &routev3.RouteAction{
 			ClusterSpecifier: &routev3.RouteAction_WeightedClusters{WeightedClusters: &routev3.WeightedCluster{}},
 		}}
-	}, "cluster_specifier")
+	}, "weighted_clusters has no clusters")
 }
 
 func TestParseFilter_RouterActionClusterHeader(t *testing.T) {
@@ -872,4 +874,273 @@ func TestParseRouteSubsetMatch_NoMetadataIsEmpty(t *testing.T) {
 	if !act.(*clusterRouteAction).subsetMatch.Empty() {
 		t.Error("no metadata_match → empty subsetMatch (fallback path)")
 	}
+}
+
+func TestMergeRouteSubsetMatch(t *testing.T) {
+	mdLB := func(kv map[string]any) *corev3.Metadata {
+		fields := map[string]*structpb.Value{}
+		for k, v := range kv {
+			val, _ := structpb.NewValue(v)
+			fields[k] = val
+		}
+		return &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{
+			"envoy.lb": {Fields: fields},
+		}}
+	}
+	// route {version:v1, stage:prod}, entry {version:v2} → merged {version:v2, stage:prod}.
+	route := mdLB(map[string]any{"version": "v1", "stage": "prod"})
+	entry := mdLB(map[string]any{"version": "v2"})
+	merged, err := mergeRouteSubsetMatch(route, entry)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	expect := mergeExpect(t, map[string]any{"version": "v2", "stage": "prod"})
+	if merged.Key() != expect.Key() {
+		t.Errorf("merged.Key()=%q want %q (entry precedence)", merged.Key(), expect.Key())
+	}
+	// non-scalar on the entry side rejects.
+	bad := &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{
+		"envoy.lb": {Fields: map[string]*structpb.Value{
+			"list": structpb.NewListValue(&structpb.ListValue{}),
+		}},
+	}}
+	if _, err := mergeRouteSubsetMatch(nil, bad); err == nil {
+		t.Errorf("expected non-scalar reject")
+	}
+}
+
+// newTestManager builds a *cluster.Manager containing one minimal STATIC cluster
+// per name (single endpoint 127.0.0.1:1 — never dialed; tests only resolve by name).
+func newTestManager(t *testing.T, names ...string) *cluster.Manager {
+	t.Helper()
+	clusters := make([]*clusterv3.Cluster, 0, len(names))
+	for _, name := range names {
+		clusters = append(clusters, &clusterv3.Cluster{
+			Name:                 name,
+			ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+			LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+			ConnectTimeout:       durationpb.New(time.Second),
+			LoadAssignment: &endpointv3.ClusterLoadAssignment{
+				ClusterName: name,
+				Endpoints: []*endpointv3.LocalityLbEndpoints{{
+					LbEndpoints: []*endpointv3.LbEndpoint{{
+						HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+							Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+								SocketAddress: &corev3.SocketAddress{
+									Address:       "127.0.0.1",
+									PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 1},
+								},
+							}},
+						}},
+					}},
+				}},
+			},
+		})
+	}
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{Clusters: clusters},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("newTestManager: %v", err)
+	}
+	return cm
+}
+
+func TestBuildWeightedRouterAction_Rejects(t *testing.T) {
+	mgr := newTestManager(t, "c_a", "c_b")
+	w := func(clusters ...*routev3.WeightedCluster_ClusterWeight) *routev3.RouteAction {
+		return &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_WeightedClusters{
+			WeightedClusters: &routev3.WeightedCluster{Clusters: clusters},
+		}}
+	}
+	cw := func(name string, weight *wrapperspb.UInt32Value) *routev3.WeightedCluster_ClusterWeight {
+		return &routev3.WeightedCluster_ClusterWeight{Name: name, Weight: weight}
+	}
+	u := func(v uint32) *wrapperspb.UInt32Value { return wrapperspb.UInt32(v) }
+
+	cases := []struct {
+		name string
+		ra   *routev3.RouteAction
+		want string // substring of the expected error
+	}{
+		{"empty-clusters", w(), "weighted_clusters has no clusters"},
+		{"name-required", w(cw("", u(1))), "name is required"},
+		{"weight-required", w(cw("c_a", nil)), "weight is required"},
+		{"sum-zero", w(cw("c_a", u(0)), cw("c_b", u(0))), "total weight must be > 0"},
+		{"dangling", w(cw("ghost", u(1))), `cluster "ghost" not found`},
+		{"cluster-header", func() *routev3.RouteAction {
+			// Name set AND cluster_header set → after the name-presence check passes,
+			// the cluster_header-unsupported arm fires (the reference's both-set reject).
+			r := w(cw("c_a", u(1)))
+			r.GetWeightedClusters().Clusters[0].ClusterHeader = "x-cluster"
+			return r
+		}(), "cluster_header is not supported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildRouterAction(tc.ra, mgr)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildWeightedRouterAction_AcceptsRecognized(t *testing.T) {
+	mgr := newTestManager(t, "c_a", "c_b")
+	ra := &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_WeightedClusters{
+		WeightedClusters: &routev3.WeightedCluster{Clusters: []*routev3.WeightedCluster_ClusterWeight{
+			{Name: "c_a", Weight: wrapperspb.UInt32(50)},
+			{Name: "c_b", Weight: wrapperspb.UInt32(50)},
+		}},
+	}}
+	act, err := buildRouterAction(ra, mgr)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if _, ok := act.(*weightedClusterRouteAction); !ok {
+		t.Fatalf("got %T want *weightedClusterRouteAction", act)
+	}
+}
+
+// mergeExpect builds a SubsetMatch from a scalar map via the production lowering.
+func mergeExpect(t *testing.T, kv map[string]any) cluster.SubsetMatch {
+	t.Helper()
+	fields := map[string]*structpb.Value{}
+	for k, v := range kv {
+		val, _ := structpb.NewValue(v)
+		fields[k] = val
+	}
+	m, non := cluster.ScalarsFromStruct(&structpb.Struct{Fields: fields})
+	if len(non) > 0 {
+		t.Fatalf("mergeExpect non-scalar %v", non)
+	}
+	return cluster.NewSubsetMatch(m)
+}
+
+// TestBuildWeightedRouterAction_AcceptCases covers two edge-case accept paths
+// that are NOT exercised by TestBuildWeightedRouterAction_AcceptsRecognized:
+//
+//  1. An explicit weight:0 on ONE entry is accepted (sum > 0).
+//  2. A non-matching TotalWeight field is ignored (deprecated; envoy-go uses the sum).
+func TestBuildWeightedRouterAction_AcceptCases(t *testing.T) {
+	mgr := newTestManager(t, "c_a", "c_b")
+	mk := func(mut func(*routev3.WeightedCluster)) *routev3.RouteAction {
+		wc := &routev3.WeightedCluster{Clusters: []*routev3.WeightedCluster_ClusterWeight{
+			{Name: "c_a", Weight: wrapperspb.UInt32(50)},
+			{Name: "c_b", Weight: wrapperspb.UInt32(50)},
+		}}
+		if mut != nil {
+			mut(wc)
+		}
+		return &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_WeightedClusters{WeightedClusters: wc}}
+	}
+	// explicit-0 entry accepts (sum>0).
+	if act, err := buildRouterAction(mk(func(wc *routev3.WeightedCluster) {
+		wc.Clusters[0].Weight = wrapperspb.UInt32(0)
+	}), mgr); err != nil {
+		t.Errorf("explicit-0 entry should accept: %v", err)
+	} else if _, ok := act.(*weightedClusterRouteAction); !ok {
+		t.Errorf("explicit-0: got %T want *weightedClusterRouteAction", act)
+	}
+	// non-matching total_weight ignored (field is deprecated; envoy-go uses the sum).
+	if _, err := buildRouterAction(mk(func(wc *routev3.WeightedCluster) {
+		wc.TotalWeight = wrapperspb.UInt32(999) //nolint:staticcheck // intentional: deprecated total_weight ignored per ADR-0080
+	}), mgr); err != nil {
+		t.Errorf("non-matching total_weight should accept (deprecated/ignored): %v", err)
+	}
+}
+
+// TestBuildWeightedRouterAction_MergeRuns confirms the wired merge path (route-level
+// metadata_match + entry-level ClusterWeight.metadata_match both set) builds without
+// error and returns a *weightedClusterRouteAction. Merge-precedence values are
+// unit-tested in TestMergeRouteSubsetMatch (Task 3); behavioral proof is in the
+// 0065 fixture (Task 8). This test only proves the wired path doesn't error.
+func TestBuildWeightedRouterAction_MergeRuns(t *testing.T) {
+	mgr := newTestManager(t, "c_a", "c_b")
+
+	// route-level metadata_match: envoy.lb {version:v1, stage:prod}
+	routeMD, _ := structpb.NewStruct(map[string]any{"version": "v1", "stage": "prod"})
+	// entry-level metadata_match for c_a: envoy.lb {version:v2} (overrides version)
+	entryMD, _ := structpb.NewStruct(map[string]any{"version": "v2"})
+
+	ra := &routev3.RouteAction{
+		MetadataMatch: &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.lb": routeMD}},
+		ClusterSpecifier: &routev3.RouteAction_WeightedClusters{
+			WeightedClusters: &routev3.WeightedCluster{
+				Clusters: []*routev3.WeightedCluster_ClusterWeight{
+					{
+						Name:          "c_a",
+						Weight:        wrapperspb.UInt32(50),
+						MetadataMatch: &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.lb": entryMD}},
+					},
+					{Name: "c_b", Weight: wrapperspb.UInt32(50)},
+				},
+			},
+		},
+	}
+	act, err := buildRouterAction(ra, mgr)
+	if err != nil {
+		t.Fatalf("merge-runs: unexpected error: %v", err)
+	}
+	if _, ok := act.(*weightedClusterRouteAction); !ok {
+		t.Fatalf("merge-runs: got %T want *weightedClusterRouteAction", act)
+	}
+}
+
+// TestBuildWeightedRouterAction_EntryNonScalarRejects proves the non-scalar reject
+// path fires through the full buildRouterAction → buildWeightedRouterAction →
+// mergeRouteSubsetMatch wiring — not just in the helper in isolation.
+//
+// Two sub-cases for symmetry:
+//  1. Entry ClusterWeight.metadata_match carries a non-scalar (list) → reject.
+//  2. Route-level RouteAction.metadata_match carries a non-scalar (list) → reject.
+func TestBuildWeightedRouterAction_EntryNonScalarRejects(t *testing.T) {
+	mgr := newTestManager(t, "c_a", "c_b")
+
+	nonScalarMD := func() *corev3.Metadata {
+		return &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{
+			"envoy.lb": {Fields: map[string]*structpb.Value{
+				"bad": structpb.NewListValue(&structpb.ListValue{}),
+			}},
+		}}
+	}
+
+	// Case 1: non-scalar on the ENTRY (ClusterWeight.metadata_match).
+	t.Run("entry-non-scalar", func(t *testing.T) {
+		ra := &routev3.RouteAction{
+			ClusterSpecifier: &routev3.RouteAction_WeightedClusters{
+				WeightedClusters: &routev3.WeightedCluster{
+					Clusters: []*routev3.WeightedCluster_ClusterWeight{
+						{Name: "c_a", Weight: wrapperspb.UInt32(50), MetadataMatch: nonScalarMD()},
+						{Name: "c_b", Weight: wrapperspb.UInt32(50)},
+					},
+				},
+			},
+		}
+		_, err := buildRouterAction(ra, mgr)
+		if err == nil || !strings.Contains(err.Error(), "only scalar values") {
+			t.Errorf("entry non-scalar: err=%v want substring %q", err, "only scalar values")
+		}
+	})
+
+	// Case 2: non-scalar on the ROUTE level (RouteAction.metadata_match).
+	t.Run("route-non-scalar", func(t *testing.T) {
+		ra := &routev3.RouteAction{
+			MetadataMatch: nonScalarMD(),
+			ClusterSpecifier: &routev3.RouteAction_WeightedClusters{
+				WeightedClusters: &routev3.WeightedCluster{
+					Clusters: []*routev3.WeightedCluster_ClusterWeight{
+						{Name: "c_a", Weight: wrapperspb.UInt32(50)},
+						{Name: "c_b", Weight: wrapperspb.UInt32(50)},
+					},
+				},
+			},
+		}
+		_, err := buildRouterAction(ra, mgr)
+		if err == nil || !strings.Contains(err.Error(), "only scalar values") {
+			t.Errorf("route non-scalar: err=%v want substring %q", err, "only scalar values")
+		}
+	})
 }

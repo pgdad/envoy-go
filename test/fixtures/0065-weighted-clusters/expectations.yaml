@@ -1,0 +1,55 @@
+# Phase-38.2 fixture 0065-weighted-clusters: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture with weighted_clusters
+# routing over THREE clusters — c_a (weight 50), c_b (weight 30), c_sub (weight
+# 20, with ClusterWeight.metadata_match{version:v1}) — plus c_sub as a
+# lb_subset_config cluster over backend2(version:v1) + backend3(version:v2) on
+# BOTH sides (the 0003/0064 HTTP shape: reference STRICT_DNS / host.docker.internal,
+# subject STATIC / 127.0.0.1). The driver sends n=500 GET /w (the distribution
+# sample) + 8 GET /health (the byte-equiv stream).
+#
+# The KEY assertion is COMPOSITION AFFINITY: the ClusterWeight.metadata_match
+# {version:v1} at the routing plane merges with c_sub's lb_subset_config to
+# constrain every /w request that weighted_clusters routes to c_sub to ONLY the v1
+# subset (backend2). backend3 (c_sub/v2) MUST see exactly 0 accepts — the merged
+# match excludes it. This proves the RouteAction.weighted_clusters → c_sub →
+# SubsetMatch → v1 pipeline is wired end-to-end.
+#
+# response-body: byte-exact required, but over the /health direct_response bodies
+# ONLY. The /health route returns a fixed "OK\n" inline_string on both sides
+# (address-independent → byte-equal). The /w bodies (weighted random → per-request
+# order differs cross-side) are NOT concatenated into the compared stream.
+# Routing/distribution is proven by the per-backend AssertDistribution band checks,
+# not the byte stream.
+#
+# response-status: 200 on every /w + /health request (checked in drive()).
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Distribution assertion (driver's AssertDistribution via the DistributionAsserter
+# interface — the runner's aggregate per-backend accept channel; PER-SIDE σ-band,
+# NOT cross-side-exact — reference_differential_hash_key_cross_side_infeasible):
+#
+#   Per-side bands (n=500, ~4.5σ margin):
+#     backend0 (c_a,  p=0.50): mean 250  σ≈11.2  → [200, 300]
+#     backend1 (c_b,  p=0.30): mean 150  σ≈10.25 → [104, 196]
+#     backend2 (c_sub/v1, p=0.20): mean 100  σ≈8.94 → [60, 140]
+#     backend3 (c_sub/v2): EXACTLY 0 (composition affinity — ClusterWeight.
+#                          metadata_match{version:v1} excludes the v2 subset)
+#   conservation: Σ per-backend counts == 500 on each side (/health is
+#                 direct_response, NEVER reaches a backend)
+#
+# Stats assertion (driver's AssertStats via the StatsAsserter interface):
+#   - "decode ran" guard: Σ upstream_rq_total across c_a+c_b+c_sub > 0 on the
+#     reference side (proves the container actually forwarded traffic).
+#   - conservation Σ: Σ cluster.{c_a,c_b,c_sub}.upstream_rq_total == 500 on EACH
+#     side (all n /w requests are routed to a backend; /health is direct_response).
+#   - per-cluster upstream_cx_active == 0 on each side (quiesced; Connection: close
+#     means each request is a fresh dial that completes before the next).
+#   NOTE: The per-cluster split (how many requests hit c_a vs c_b vs c_sub) is
+#   PER-SIDE (RNG → NOT cross-equaled). Only the conservation Σ is asserted.
+response-body:
+  applicable: true
+  scope: byte-exact
