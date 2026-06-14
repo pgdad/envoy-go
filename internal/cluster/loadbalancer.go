@@ -11,14 +11,15 @@ import "sync/atomic"
 // final conn Close; non-conn paths: immediately). release is always non-nil,
 // including on the error path; implementations guard against double-release.
 // ADR-0232 (the LB acquire/release seam; OPTION C — the exported Cluster
-// surface stays byte-stable).
+// surface stays byte-stable). ADR-0235 (the hash-key pick-input extension);
+// ADR-0239 (the subset-match pick-input extension).
 type loadBalancer interface {
 	// Pick selects an endpoint. hashKey carries a request-derived consistent-hash
-	// key when hasHash is true (ring_hash); the non-hash policies ignore both args;
-	// ring_hash with hasHash==false falls back to a random ring position. The release
-	// func is the ADR-0232 RELEASE half (unchanged). ADR-0235 (the PICK-INPUT-half
-	// extension; the hash key rides ctx, threaded in cluster.go).
-	Pick(hashKey uint64, hasHash bool) (Endpoint, func(), error)
+	// key when hasHash is true (ring_hash/maglev). match carries the route's
+	// resolved metadata subset match when hasMatch is true (subset); the leaf
+	// policies ignore (match, hasMatch), only subsetLB consumes it. The release
+	// func is the ADR-0232 RELEASE half (unchanged).
+	Pick(hashKey uint64, hasHash bool, match SubsetMatch, hasMatch bool) (Endpoint, func(), error)
 }
 
 // noopRelease is the shared release for LB policies that hold no per-pick state
@@ -36,7 +37,7 @@ type roundRobin struct {
 	counter   atomic.Uint64
 }
 
-func (rr *roundRobin) Pick(_ uint64, _ bool) (Endpoint, func(), error) {
+func (rr *roundRobin) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, func(), error) {
 	if len(rr.endpoints) == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints
 	}

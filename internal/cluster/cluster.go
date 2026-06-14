@@ -33,6 +33,10 @@ var errNoEndpoints = errors.New("cluster: no endpoints")
 type Endpoint struct {
 	Host string
 	Port uint32
+	// Metadata is the parsed envoy.lb scalar key→value namespace (the subset
+	// dimension). nil when absent. NOT part of the dial identity: Addr() ignores
+	// it, so ring_hash/maglev table keys stay "IP:PORT".
+	Metadata map[string]SubsetValue
 }
 
 // Addr returns the dial-string form "host:port".
@@ -184,6 +188,21 @@ func hashKeyFrom(ctx context.Context) (uint64, bool) {
 	return v, ok
 }
 
+type subsetMatchCtxKey struct{}
+
+// WithSubsetMatch attaches a resolved route subset match to ctx (the producer
+// sets it in the HTTP router; the cluster funnels extract it for subsetLB). The
+// exported Cluster surface stays byte-stable (the match rides ctx like the hash
+// key). An additive exported symbol — not a signature change (ADR-0239).
+func WithSubsetMatch(ctx context.Context, match SubsetMatch) context.Context {
+	return context.WithValue(ctx, subsetMatchCtxKey{}, match)
+}
+
+func subsetMatchFrom(ctx context.Context) (SubsetMatch, bool) {
+	v, ok := ctx.Value(subsetMatchCtxKey{}).(SubsetMatch)
+	return v, ok
+}
+
 // PickEndpoint selects the next upstream endpoint per the cluster's LB policy.
 // Safe for concurrent use. The picked unit is released IMMEDIATELY: direct-pick
 // consumers (httpclient ClusterDispatch, the thriftproxy no-healthy-host probe)
@@ -193,7 +212,7 @@ func hashKeyFrom(ctx context.Context) (uint64, bool) {
 // until final conn Close (ADR-0232 OPTION C). The signature stays byte-stable so
 // the two direct consumers compile unchanged.
 func (c *Cluster) PickEndpoint() (Endpoint, error) {
-	ep, release, err := c.lb.Pick(0, false)
+	ep, release, err := c.lb.Pick(0, false, SubsetMatch{}, false)
 	if err != nil {
 		return Endpoint{}, err
 	}
@@ -230,7 +249,8 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	// can HOLD the release until the conn's final Close. release is always
 	// non-nil; it must fire on every error path after a successful pick.
 	hk, ok := hashKeyFrom(ctx)
-	ep, release, err := c.lb.Pick(hk, ok)
+	match, hasMatch := subsetMatchFrom(ctx)
+	ep, release, err := c.lb.Pick(hk, ok, match, hasMatch)
 	if err != nil {
 		return nil, Endpoint{}, err
 	}
@@ -284,7 +304,8 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 	// non-nil. On a pool HIT the fresh pick is redundant and is released
 	// immediately; on a MISS it composes into the connWithGauge dec closure.
 	hk, ok := hashKeyFrom(ctx)
-	ep, release, err := c.lb.Pick(hk, ok)
+	match, hasMatch := subsetMatchFrom(ctx)
+	ep, release, err := c.lb.Pick(hk, ok, match, hasMatch)
 	if err != nil {
 		return nil, err
 	}

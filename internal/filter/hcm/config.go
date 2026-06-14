@@ -552,7 +552,24 @@ func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (route
 	if err != nil {
 		return nil, err
 	}
-	return &clusterRouteAction{cluster: c, hashPolicies: hps}, nil
+	sm, err := parseRouteSubsetMatch(r.GetMetadataMatch())
+	if err != nil {
+		return nil, err
+	}
+	return &clusterRouteAction{cluster: c, hashPolicies: hps, subsetMatch: sm}, nil
+}
+
+// parseRouteSubsetMatch lowers RouteAction.metadata_match["envoy.lb"] to a proto-
+// free cluster.SubsetMatch (route-static — resolved ONCE at config-build, not per
+// request). A non-scalar value is rejected (the scalar MVP boundary; ADR-0239 /
+// SPEC §6.2 — router-metadata-match-nonscalar). Absent metadata_match → the empty
+// (no-match) SubsetMatch (the subsetLB fallback path).
+func parseRouteSubsetMatch(md *corev3.Metadata) (cluster.SubsetMatch, error) {
+	scalars, nonScalar := cluster.ScalarsFromStruct(md.GetFilterMetadata()["envoy.lb"])
+	if len(nonScalar) > 0 {
+		return cluster.SubsetMatch{}, fmt.Errorf("router: metadata_match envoy.lb key %q: only scalar values (string, number, bool) are supported", nonScalar[0])
+	}
+	return cluster.NewSubsetMatch(scalars), nil
 }
 
 // parseRouteHashPolicies lowers RouteAction.hash_policy[] into proto-free

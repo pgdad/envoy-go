@@ -78,7 +78,7 @@ func newPCGRNG() (func() uint64, error) {
 }
 
 // Pick implements loadBalancer. See the type doc for the P2C semantics.
-func (lr *leastRequest) Pick(_ uint64, _ bool) (Endpoint, func(), error) {
+func (lr *leastRequest) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, func(), error) {
 	n := len(lr.endpoints)
 	if n == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints

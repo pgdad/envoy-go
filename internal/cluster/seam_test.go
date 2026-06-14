@@ -24,7 +24,7 @@ func TestIncumbentPolicies_IgnoreHashParams(t *testing.T) {
 	pick4 := func(lb loadBalancer, key uint64, has bool) []Endpoint {
 		var out []Endpoint
 		for i := 0; i < 4; i++ {
-			ep, rel, err := lb.Pick(key, has)
+			ep, rel, err := lb.Pick(key, has, SubsetMatch{}, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -36,7 +36,7 @@ func TestIncumbentPolicies_IgnoreHashParams(t *testing.T) {
 	a := pick4(mk(), 0, false)
 	b := pick4(mk(), 0x12345, true)
 	for i := range a {
-		if a[i] != b[i] {
+		if a[i].Addr() != b[i].Addr() {
 			t.Errorf("roundRobin pick %d changed with hash args: %v vs %v", i, a[i], b[i])
 		}
 	}

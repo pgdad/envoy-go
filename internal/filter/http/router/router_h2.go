@@ -36,8 +36,8 @@ import (
 // status=0 on the ctx-cancel path is the H2 sentinel per SPEC §2.1 last
 // bullet; HCM's chain-completion access-log emit hook skips submission on
 // status=0.
-func H2ClusterAction(c *cluster.Cluster, hps []HashPolicy) H2Action {
-	a := &routerActionH2{cluster: c, hashPolicies: hps}
+func H2ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch) H2Action {
+	a := &routerActionH2{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch}
 	return func(ctx context.Context, req h2.H2Request) (ActionResponse, cluster.Endpoint, error) {
 		return doH2ClusterAction(ctx, a, req)
 	}
@@ -64,6 +64,14 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 	// request carries no remote addr, so source_ip uses the ctx-carried
 	// downstream addr set by HCM dispatch (h2dispatch.go). ADR-0237.
 	ctx, _, _ = applyHashKey(ctx, a.hashPolicies, h2HeaderVal(req), downstreamRemoteAddrFrom(ctx))
+
+	// 38.1: thread the route-static metadata_match onto ctx → subsetLB.Pick
+	// reads it in DialH2. Route-static (resolved once at config-build, NOT a
+	// per-request fold like applyHashKey); threaded verbatim only when non-empty
+	// (an empty match leaves ctx untouched → the subsetLB fallback path). ADR-0239.
+	if !a.subsetMatch.Empty() {
+		ctx = cluster.WithSubsetMatch(ctx, a.subsetMatch)
+	}
 
 	cc, ep, err := a.cluster.DialH2(ctx)
 	if err != nil {
@@ -210,8 +218,9 @@ func h2HeaderVal(req h2.H2Request) func(name string) (string, bool) {
 // router_h2_test.go exercise the same shape.
 type routerActionH2 struct {
 	cluster      *cluster.Cluster
-	filter       *Filter      // set post-build by routeTable.bindFilter; nil when no sinks configured.
-	hashPolicies []HashPolicy // 36.2: stored at H2ClusterAction; per-request fold lands in Task 4 (applyHashKey).
+	filter       *Filter             // set post-build by routeTable.bindFilter; nil when no sinks configured.
+	hashPolicies []HashPolicy        // 36.2: stored at H2ClusterAction; per-request fold lands in Task 4 (applyHashKey).
+	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
 }
 
 // doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip

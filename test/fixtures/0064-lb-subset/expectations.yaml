@@ -1,0 +1,66 @@
+# Phase-38.1 fixture 0064-lb-subset: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE 4-endpoint
+# cluster with lb_policy: ROUND_ROBIN + lb_subset_config: {fallback_policy:
+# ANY_ENDPOINT, subset_selectors: [{keys: ["version"]}]} + 4 endpoints tagged with
+# envoy.lb metadata (version: v1 ×2 — idx 0,1; version: v2 ×2 — idx 2,3) on BOTH
+# sides (the 0003 HTTP shape: reference STRICT_DNS / host.docker.internal, subject
+# STATIC / 127.0.0.1). The driver sends K=16 GET /v1 + K=16 GET /v2 + K=16 GET /none
+# (the ANY_ENDPOINT fallback, version "v9") = 48 routed GETs (totalReqs, DERIVED from
+# routes * perRoute), then 8 /health direct_response round-trips.
+#
+# The KEY insight vs maglev/ring_hash: the metadata_match subset key is STATIC ROUTE
+# CONFIG — IDENTICAL on both sides — so it is NAT-transparent in the STRONGEST sense
+# (the version→idx MAP is the SAME on both sides). SET-membership affinity therefore
+# holds TRUE on BOTH sides AND is host-attributable per side (the INVERSE of
+# reference_differential_hash_key_cross_side_infeasible).
+#
+# response-body: byte-exact required, but over the /health direct_response bodies
+# ONLY. The /health route returns a fixed "OK\n" inline_string on both sides
+# (address-independent → byte-equal). The ROUTED bodies are NOT concatenated into the
+# compared stream: ROUND_ROBIN alternates within a subset (and over all 4 for the
+# fallback), so the per-request idx ORDER may differ cross-side even though the SET is
+# identical. Routing/affinity is proven by the per-route SET-membership assertion
+# inside drive() + the AssertDistribution conservation/coverage prong, not by the
+# byte stream.
+#
+# response-status: 200 on every routed + health request (checked in drive()).
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Per-route routing assertion (INSIDE drive(), from the embedded HTTPEcho body idx
+# `backend-<idx>:<seg>` — the runner's aggregate AssertDistribution channel cannot
+# attribute by route):
+#   - SET-membership affinity: every /v1 request lands in {0,1}; every /v2 in {2,3}
+#     (a leak across the subset boundary fails the drive). DETERMINISTIC.
+#   - within-subset spread: both members of each 2-host subset are hit across K=16
+#     (ROUND_ROBIN alternates).
+#   - fallback spread: /none (ANY_ENDPOINT over all 4) hits >= 2 of the 4 backends.
+#
+# Distribution assertion (driver's AssertDistribution via the DistributionAsserter
+# interface — the runner's aggregate per-backend accept channel; DETERMINISTIC/EXACT,
+# NOT a σ-band):
+#   - conservation: each side's per-backend counts sum to 48 (= routes*perRoute =
+#     totalReqs); /health is a direct_response that NEVER reaches a backend (EXCLUDED
+#     from the routed sum — accounted for explicitly).
+#   - coverage: all 4 backends nonzero (/v1∪/v2 touch every endpoint).
+#
+# Stats assertion (driver's AssertStats via the StatsAsserter interface; SPEC §8.1):
+#   - cross-equal (request-counted → identical on both sides):
+#       cluster.c_echo.upstream_cx_total   == 48 (= routes*perRoute = totalReqs),
+#       cluster.c_echo.upstream_rq_total   == 48,
+#       cluster.c_echo.membership_total    == 4,
+#       cluster.c_echo.upstream_cx_active  == 0 (quiesced; Connection: close),
+#       cluster.c_echo.lb_subsets_selected == 32 (= /v1+/v2 = 2*perRoute),
+#       cluster.c_echo.lb_subsets_fallback == 16 (= /none = perRoute)
+#   - subject-only unit assert (NOT cross-equaled — the reference contrib build's
+#     active/created accounting differs from envoy-go's ×1-per-distinct-subset count):
+#       cluster.c_echo.lb_subsets_active   == 2 (the 2 version subsets)
+#   - the cross-equal upstream_cx_total == 48 > 0 also proves the reference DECODED
+#     the subset config (reference_docker_probe_bridge_network "decode ran" signal —
+#     AssertStats bites explicitly if upstream_cx_total == 0)
+response-body:
+  applicable: true
+  scope: byte-exact

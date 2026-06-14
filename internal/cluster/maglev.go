@@ -36,7 +36,7 @@ var _ loadBalancer = (*maglevLB)(nil)
 // index (rng() % M — the Envoy random()-LB fallback; near-uniform, never on the
 // differential path). The release func is noopRelease (maglevLB holds no
 // per-pick state); non-nil on every path.
-func (mg *maglevLB) Pick(hashKey uint64, hasHash bool) (Endpoint, func(), error) {
+func (mg *maglevLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) (Endpoint, func(), error) {
 	if len(mg.endpoints) == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints
 	}

@@ -87,6 +87,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0061-lb-ring-hash/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0062-lb-ring-hash-http/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0063-lb-maglev/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0064-lb-subset/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

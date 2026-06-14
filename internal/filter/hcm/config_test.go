@@ -19,6 +19,7 @@ import (
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
@@ -816,5 +817,59 @@ func TestParseRouteHashPolicies(t *testing.T) {
 				t.Fatalf("want err containing %q, got %v", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+// TestParseRouteSubsetMatch_LowersScalars verifies buildRouterAction lowers a
+// route's metadata_match["envoy.lb"] scalar struct to a route-static
+// cluster.SubsetMatch on the clusterRouteAction (ADR-0239 — the producer half).
+func TestParseRouteSubsetMatch_LowersScalars(t *testing.T) {
+	cm := mkH2ClusterManager(t)
+	md, _ := structpb.NewStruct(map[string]any{"version": "v1"})
+	ra := &routev3.RouteAction{
+		ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h1"},
+		MetadataMatch:    &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.lb": md}},
+	}
+	act, err := buildRouterAction(ra, cm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cra := act.(*clusterRouteAction)
+	// Build the expected match the SAME way the producer does (the SubsetValue
+	// Kind constants are unexported in the cluster package — can't be named here).
+	scalars, _ := cluster.ScalarsFromStruct(md)
+	want := cluster.NewSubsetMatch(scalars)
+	if cra.subsetMatch.Key() != want.Key() {
+		t.Errorf("subsetMatch mismatch: %q vs %q", cra.subsetMatch.Key(), want.Key())
+	}
+}
+
+// TestParseRouteSubsetMatch_RejectsNonScalar verifies a non-scalar
+// metadata_match["envoy.lb"] value fail-fast-rejects at config-build (the
+// scalar MVP boundary — router-metadata-match-nonscalar; ADR-0239 / SPEC §6.2).
+func TestParseRouteSubsetMatch_RejectsNonScalar(t *testing.T) {
+	cm := mkH2ClusterManager(t)
+	md, _ := structpb.NewStruct(map[string]any{"version": map[string]any{"nested": 1}}) // struct value
+	ra := &routev3.RouteAction{
+		ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h1"},
+		MetadataMatch:    &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.lb": md}},
+	}
+	_, err := buildRouterAction(ra, cm)
+	if err == nil || !strings.Contains(err.Error(), "only scalar values") {
+		t.Errorf("err = %v, want the non-scalar reject (router-metadata-match-nonscalar)", err)
+	}
+}
+
+// TestParseRouteSubsetMatch_NoMetadataIsEmpty verifies a route with no
+// metadata_match yields the empty (no-match) SubsetMatch — the fallback path.
+func TestParseRouteSubsetMatch_NoMetadataIsEmpty(t *testing.T) {
+	cm := mkH2ClusterManager(t)
+	ra := &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h1"}}
+	act, err := buildRouterAction(ra, cm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !act.(*clusterRouteAction).subsetMatch.Empty() {
+		t.Error("no metadata_match → empty subsetMatch (fallback path)")
 	}
 }

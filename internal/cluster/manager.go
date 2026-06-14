@@ -107,6 +107,10 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 	c.upstreamCxActive = r.NewGauge(prefix + "upstream_cx_active")
 	c.membershipTotal = r.NewGauge(prefix + "membership_total")
 	c.membershipTotal.Set(int64(len(c.endpoints))) // SPEC §6: Set once at register, equals N endpoints
+	// NOTE: when c.lb is a *subsetLB wrapping a *ringHashLB/*maglevLB (a cluster with
+	// lb_subset_config), neither assert below fires, so the ring_hash_lb/maglev_lb
+	// gauges are not registered for that cluster — a known MVP gap (no subset+ring_hash
+	// fixture exists yet; deferred).
 	if rh, ok := c.lb.(*ringHashLB); ok {
 		// AMEND-RH4: 3 mirrored static gauges, Set once at register (the ring is
 		// immutable). RING_HASH-only (reference parity); cross-side-exact (keyed on
@@ -122,6 +126,16 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 		// NO size gauge — the table size is config-known (D-M4).
 		r.NewGauge(prefix + "maglev_lb.min_entries_per_host").Set(int64(mg.minPerHost))
 		r.NewGauge(prefix + "maglev_lb.max_entries_per_host").Set(int64(mg.maxPerHost))
+	}
+	if s, ok := c.lb.(*subsetLB); ok {
+		// active/created = the distinct-subset count (×1 — NOT the reference's 33×
+		// magnitude artifact, a recorded departure; AMEND-SS4 / ADR-0240).
+		r.NewGauge(prefix + "lb_subsets_active").Set(int64(s.numSubsets))
+		r.NewCounter(prefix + "lb_subsets_created").Add(uint64(s.numSubsets))
+		// selected/fallback are Inc'd from subsetLB.Pick — allocate + INJECT onto the
+		// live wrapper (the FIRST LB to touch stats from its own Pick path; D-S38-4).
+		s.selected = r.NewCounter(prefix + "lb_subsets_selected")
+		s.fallbackC = r.NewCounter(prefix + "lb_subsets_fallback")
 	}
 }
 
@@ -203,6 +217,40 @@ func (m *Manager) Drain() {
 	}
 }
 
+// buildLeafLB constructs the leaf load balancer for the cluster's lb_policy over
+// the given endpoint set. Extracted from buildCluster so subsetLB can build a
+// child per subset over a filtered sub-slice. CLUSTER_PROVIDED and every other
+// unsupported policy reject HERE (the default arm) — before any subset wrap, so
+// lb_subset_config + CLUSTER_PROVIDED rejects in outcome with ZERO new reject arm.
+func buildLeafLB(c *clusterv3.Cluster, name string, endpoints []Endpoint) (loadBalancer, error) {
+	switch c.GetLbPolicy() {
+	case clusterv3.Cluster_ROUND_ROBIN:
+		return &roundRobin{endpoints: endpoints}, nil
+	case clusterv3.Cluster_LEAST_REQUEST:
+		cc, err := parseLeastRequestLbConfig(c, name)
+		if err != nil {
+			return nil, err
+		}
+		return newLeastRequest(endpoints, cc)
+	case clusterv3.Cluster_RANDOM: // phase 35 (ADR-0234): stateless uniform pick; NO config parse (RANDOM has no config message)
+		return newRandom(endpoints)
+	case clusterv3.Cluster_RING_HASH: // phase 36.1 (ADR-0236): Ketama consistent-hash ring
+		cfg, err := parseRingHashLbConfig(c, name)
+		if err != nil {
+			return nil, err
+		}
+		return newRingHash(endpoints, cfg)
+	case clusterv3.Cluster_MAGLEV: // phase 37 (ADR-0238): Maglev consistent-hash table
+		cfg, err := parseMaglevLbConfig(c, name)
+		if err != nil {
+			return nil, err
+		}
+		return newMaglev(endpoints, cfg)
+	default:
+		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH, MAGLEV)", name, c.GetLbPolicy())
+	}
+}
+
 func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, error) {
 	name := c.GetName()
 	if name == "" {
@@ -246,50 +294,18 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 		name:           name,
 		endpoints:      endpoints,
 		connectTimeout: timeout,
-		// lb set by the policy switch below (ADR-0233; SPEC §3.4)
+		// lb set by buildLeafLB below (ADR-0233; SPEC §3.4)
 	}
-	switch c.GetLbPolicy() {
-	case clusterv3.Cluster_ROUND_ROBIN:
-		cl.lb = &roundRobin{endpoints: endpoints}
-	case clusterv3.Cluster_LEAST_REQUEST:
-		cc, err := parseLeastRequestLbConfig(c, name)
-		if err != nil {
-			return nil, err
-		}
-		lb, err := newLeastRequest(endpoints, cc)
-		if err != nil {
-			return nil, err
-		}
-		cl.lb = lb
-	case clusterv3.Cluster_RANDOM: // phase 35 (ADR-0234): stateless uniform pick; NO config parse (RANDOM has no config message)
-		lb, err := newRandom(endpoints)
-		if err != nil {
-			return nil, err
-		}
-		cl.lb = lb
-	case clusterv3.Cluster_RING_HASH: // phase 36.1 (ADR-0236): Ketama consistent-hash ring
-		cfg, err := parseRingHashLbConfig(c, name)
-		if err != nil {
-			return nil, err
-		}
-		lb, err := newRingHash(endpoints, cfg)
-		if err != nil {
-			return nil, err
-		}
-		cl.lb = lb
-	case clusterv3.Cluster_MAGLEV: // phase 37 (ADR-0238): Maglev consistent-hash table
-		cfg, err := parseMaglevLbConfig(c, name)
-		if err != nil {
-			return nil, err
-		}
-		lb, err := newMaglev(endpoints, cfg)
-		if err != nil {
-			return nil, err
-		}
-		cl.lb = lb
-	default:
-		return nil, fmt.Errorf("cluster: %q: unsupported lb_policy %s (supported: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH, MAGLEV)", name, c.GetLbPolicy())
+	lb, err := buildLeafLB(c, name, endpoints)
+	if err != nil {
+		return nil, err // CLUSTER_PROVIDED / unsupported reject HERE — before any subset wrap
 	}
+	if sc := c.GetLbSubsetConfig(); sc != nil {
+		lb = newSubsetLB(endpoints, parseLbSubsetConfig(sc), func(sub []Endpoint) (loadBalancer, error) {
+			return buildLeafLB(c, name, sub)
+		})
+	}
+	cl.lb = lb
 	if ts := c.GetTransportSocket(); ts != nil {
 		if ts.GetTypedConfig() == nil {
 			return nil, fmt.Errorf("cluster: %q: transport_socket without typed_config", name)
@@ -423,6 +439,30 @@ func parseMaglevLbConfig(c *clusterv3.Cluster, name string) (maglevCfg, error) {
 	return cfg, nil
 }
 
+// parseLbSubsetConfig lowers Cluster.LbSubsetConfig to the proto-free lbSubsetCfg.
+// default_subset scalars are lowered (non-scalar dropped); the selector keys are
+// copied; the deferred flags (single_host_per_subset, per-selector fallback,
+// locality/panic/list_as_any/metadata_fallback) are ignored. Returns the zero
+// cfg if sc is nil.
+func parseLbSubsetConfig(sc *clusterv3.Cluster_LbSubsetConfig) lbSubsetCfg {
+	cfg := lbSubsetCfg{}
+	switch sc.GetFallbackPolicy() {
+	case clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT:
+		cfg.fallback = fallbackAnyEndpoint
+	case clusterv3.Cluster_LbSubsetConfig_DEFAULT_SUBSET:
+		cfg.fallback = fallbackDefaultSubset
+	default: // NO_FALLBACK
+		cfg.fallback = fallbackNoFallback
+	}
+	if ds := sc.GetDefaultSubset(); ds != nil {
+		cfg.defaultSubset, _ = ScalarsFromStruct(ds) // drop non-scalar; all-non-scalar → empty map → zero-match → NO_FALLBACK at runtime
+	}
+	for _, sel := range sc.GetSubsetSelectors() {
+		cfg.selectors = append(cfg.selectors, sel.GetKeys())
+	}
+	return cfg
+}
+
 // extractH2Mode reads the cluster's typed_extension_protocol_options and
 // returns whether to enable H2 upstream origination. Per SPEC §5.5's behavior
 // matrix:
@@ -530,7 +570,8 @@ func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) 
 			if sa == nil {
 				return nil, fmt.Errorf("cluster: %q: endpoints[%d].lb_endpoints[%d]: only socket_address endpoints supported", clusterName, gi, ei)
 			}
-			out = append(out, Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue()})
+			scalars, _ := ScalarsFromStruct(lbe.GetMetadata().GetFilterMetadata()["envoy.lb"]) // drop non-scalar keys
+			out = append(out, Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue(), Metadata: scalars})
 		}
 	}
 	if len(out) == 0 {

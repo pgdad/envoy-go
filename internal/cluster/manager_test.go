@@ -14,6 +14,7 @@ import (
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -48,6 +49,21 @@ func mkLbEndpoint(addr string, port uint32) *endpointv3.LbEndpoint {
 				SocketAddress: &corev3.SocketAddress{Address: addr, PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port}},
 			}},
 		}},
+	}
+}
+
+// mkStaticClusterFromLbEndpoints builds a static cluster from pre-built
+// *endpointv3.LbEndpoint values. Unlike mkStaticCluster, the caller constructs
+// the LbEndpoint before passing it in, so fields like Metadata can be set.
+func mkStaticClusterFromLbEndpoints(name string, lbes ...*endpointv3.LbEndpoint) *clusterv3.Cluster {
+	return &clusterv3.Cluster{
+		Name:                 name,
+		ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+		LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+		LoadAssignment: &endpointv3.ClusterLoadAssignment{
+			ClusterName: name,
+			Endpoints:   []*endpointv3.LocalityLbEndpoints{{LbEndpoints: lbes}},
+		},
 	}
 }
 
@@ -1062,6 +1078,43 @@ func gaugeValue(reg *stats.Registry, name string) (int64, bool) {
 	return v, found
 }
 
+// counterValue reads back a counter by exact name via the scrape-time Walk seam.
+// Mirrors gaugeValue; returns (Load(), true) if the metric exists and is a *Counter.
+func counterValue(reg *stats.Registry, name string) (uint64, bool) {
+	var v uint64
+	var found bool
+	reg.Walk(func(m stats.Metric) {
+		if m.Name() == name {
+			found = true
+			if c, ok := m.(*stats.Counter); ok {
+				v = c.Load()
+			}
+		}
+	})
+	return v, found
+}
+
+// hasMetric reports whether a metric with the given exact name is registered in reg.
+func hasMetric(reg *stats.Registry, name string) bool {
+	var found bool
+	reg.Walk(func(m stats.Metric) {
+		if m.Name() == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// tag sets lb_endpoint i's envoy.lb metadata to {key: val} (a string scalar).
+// Used by subset-stats tests to add envoy.lb metadata to pre-built clusters.
+// The cluster must have been built with mkStaticCluster — single locality group
+// (Endpoints[0].LbEndpoints[i]).
+func tag(c *clusterv3.Cluster, i int, key, val string) {
+	lbe := c.GetLoadAssignment().GetEndpoints()[0].GetLbEndpoints()[i]
+	md, _ := structpb.NewStruct(map[string]any{key: val})
+	lbe.Metadata = &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.lb": md}}
+}
+
 func TestManager_Accept_RingHash_Defaults(t *testing.T) {
 	c := mkStaticCluster("c_rh", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002), mkLbEndpoint("127.0.0.1", 9003))
 	c.LbPolicy = clusterv3.Cluster_RING_HASH
@@ -1243,5 +1296,223 @@ func TestManager_NonMaglev_NoGauges(t *testing.T) {
 	}
 	if _, ok := gaugeValue(reg, "cluster.c_rr.maglev_lb.min_entries_per_host"); ok {
 		t.Error("ROUND_ROBIN cluster must register NO maglev_lb gauges (MAGLEV-only)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 38.1 Task 3 — Endpoint.Metadata + extractEndpoints envoy.lb capture
+// ---------------------------------------------------------------------------
+
+func TestExtractEndpoints_CapturesEnvoyLbScalarMetadata(t *testing.T) {
+	// A LbEndpoint carrying envoy.lb {version:"v1", weight:7, canary:true} →
+	// Endpoint.Metadata with the 3 scalars; a non-scalar value is DROPPED.
+	md, _ := structpb.NewStruct(map[string]any{
+		"version": "v1", "weight": float64(7), "canary": true,
+		"nested": map[string]any{"x": 1}, // non-scalar → dropped
+	})
+	lbe := mkLbEndpoint("127.0.0.1", 9001)
+	lbe.Metadata = &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.lb": md}}
+	c := mkStaticClusterFromLbEndpoints("c_md", lbe)
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := eps[0].Metadata
+	if got["version"].Str != "v1" || got["weight"].Num != 7 || !got["canary"].Bool {
+		t.Errorf("captured metadata wrong: %+v", got)
+	}
+	if _, ok := got["nested"]; ok {
+		t.Error("non-scalar 'nested' must be dropped")
+	}
+}
+
+func TestExtractEndpoints_NoMetadataIsNilMap(t *testing.T) {
+	c := mkStaticCluster("c_plain", mkLbEndpoint("127.0.0.1", 9001))
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eps[0].Metadata != nil {
+		t.Errorf("absent envoy.lb metadata → nil map, got %v", eps[0].Metadata)
+	}
+}
+
+func TestEndpoint_AddrIgnoresMetadata(t *testing.T) {
+	a := Endpoint{Host: "127.0.0.1", Port: 9001}
+	b := Endpoint{Host: "127.0.0.1", Port: 9001, Metadata: map[string]SubsetValue{"version": {Kind: subsetString, Str: "v1"}}}
+	if a.Addr() != b.Addr() {
+		t.Errorf("Addr() must ignore Metadata: %q vs %q", a.Addr(), b.Addr())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildLeafLB factory tests (Task 5)
+// ---------------------------------------------------------------------------
+
+func TestBuildLeafLB_BuildsEachPolicyOverSubSlice(t *testing.T) {
+	eps := []Endpoint{{Host: "127.0.0.1", Port: 9001}, {Host: "127.0.0.1", Port: 9002}}
+	for _, pol := range []clusterv3.Cluster_LbPolicy{
+		clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_LEAST_REQUEST,
+		clusterv3.Cluster_RANDOM, clusterv3.Cluster_RING_HASH, clusterv3.Cluster_MAGLEV,
+	} {
+		c := &clusterv3.Cluster{Name: "c", LbPolicy: pol}
+		lb, err := buildLeafLB(c, "c", eps[:1])
+		if err != nil {
+			t.Errorf("buildLeafLB(%v) over sub-slice: %v", pol, err)
+			continue
+		}
+		ep, _, err := lb.Pick(123, true, SubsetMatch{}, false)
+		if err != nil || ep.Port != 9001 {
+			t.Errorf("buildLeafLB(%v).Pick: ep=%v err=%v, want port 9001", pol, ep, err)
+		}
+	}
+}
+
+func TestBuildLeafLB_RejectsClusterProvided(t *testing.T) {
+	// CLUSTER_PROVIDED (and every unsupported policy) rejects in the factory —
+	// BEFORE any subset wrap. This is why lb_subset_config + CLUSTER_PROVIDED
+	// rejects in outcome with ZERO new reject arm.
+	c := &clusterv3.Cluster{Name: "c", LbPolicy: clusterv3.Cluster_CLUSTER_PROVIDED}
+	_, err := buildLeafLB(c, "c", []Endpoint{{Host: "127.0.0.1", Port: 9001}})
+	if err == nil || !strings.Contains(err.Error(), "unsupported lb_policy") {
+		t.Errorf("err = %v, want unsupported lb_policy reject", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 38.1 Task 8 — parseLbSubsetConfig + wrap-after-switch (§6 matrix)
+// ---------------------------------------------------------------------------
+
+func TestManager_Accept_LbSubsetConfig_WrapsChild(t *testing.T) {
+	c := mkStaticCluster("c_sub", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002))
+	c.LbPolicy = clusterv3.Cluster_ROUND_ROBIN
+	c.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{
+		FallbackPolicy:  clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT,
+		SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{{Keys: []string{"version"}}},
+	}
+	mgr, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("lb_subset_config under ROUND_ROBIN must be accepted: %v", err)
+	}
+	cl, _ := mgr.Get("c_sub")
+	if _, ok := cl.lb.(*subsetLB); !ok {
+		t.Errorf("lb must be wrapped in *subsetLB, got %T", cl.lb)
+	}
+}
+
+func TestManager_Reject_LbSubsetConfig_ClusterProvided(t *testing.T) {
+	c := mkStaticCluster("c_sub", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_CLUSTER_PROVIDED
+	c.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "unsupported lb_policy") {
+		t.Errorf("err = %v, want the pre-existing unsupported-policy reject", err)
+	}
+}
+
+func TestManager_Accept_LbSubsetConfig_BenignShapes(t *testing.T) {
+	// empty keys, empty selectors, duplicate selectors, fallback-default mismatch ALL accept.
+	base := func() *clusterv3.Cluster {
+		c := mkStaticCluster("c_sub", mkLbEndpoint("127.0.0.1", 9001))
+		c.LbPolicy = clusterv3.Cluster_ROUND_ROBIN
+		return c
+	}
+	cases := []*clusterv3.Cluster_LbSubsetConfig{
+		{SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{{Keys: []string{}}}},
+		{}, // empty subset_selectors + NO_FALLBACK default
+		{SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{{Keys: []string{"v"}}, {Keys: []string{"v"}}}},
+		{FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_DEFAULT_SUBSET}, // DEFAULT_SUBSET, no default_subset
+	}
+	for i, sc := range cases {
+		c := base()
+		c.LbSubsetConfig = sc
+		if _, err := NewManager(mkBootstrap(c), stats.NewRegistry()); err != nil {
+			t.Errorf("case %d must accept (parity): %v", i, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 38.1 Task 9 — 4 lb_subsets_* stats registration + counter injection
+// ---------------------------------------------------------------------------
+
+func TestRegisterClusterMetrics_SubsetStats(t *testing.T) {
+	reg := stats.NewRegistry()
+	c := mkStaticCluster("c_sub", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002))
+	c.LbPolicy = clusterv3.Cluster_ROUND_ROBIN
+	tag(c, 0, "version", "v1") // set envoy.lb metadata on lb_endpoint i
+	tag(c, 1, "version", "v2")
+	c.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{
+		FallbackPolicy:  clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT,
+		SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{{Keys: []string{"version"}}},
+	}
+	if _, err := NewManager(mkBootstrap(c), reg); err != nil {
+		t.Fatal(err)
+	}
+	// active/created = the distinct-subset count ×1 (NOT 33×)
+	if got, ok := gaugeValue(reg, "cluster.c_sub.lb_subsets_active"); !ok || got != 2 {
+		t.Errorf("lb_subsets_active: registered=%v value=%d, want registered=true value=2 (×1 distinct-subset count)", ok, got)
+	}
+	if got, ok := counterValue(reg, "cluster.c_sub.lb_subsets_created"); !ok || got != 2 {
+		t.Errorf("lb_subsets_created: registered=%v value=%d, want registered=true value=2", ok, got)
+	}
+	// selected/fallback are injected onto the live subsetLB wrapper and must be
+	// registered (ok==true) and start at zero. The prior code discarded the ok
+	// bool, making these checks vacuous when the metric was never registered.
+	if s0, ok := counterValue(reg, "cluster.c_sub.lb_subsets_selected"); !ok || s0 != 0 {
+		t.Errorf("lb_subsets_selected: registered=%v value=%d, want registered=true value=0", ok, s0)
+	}
+	if f0, ok := counterValue(reg, "cluster.c_sub.lb_subsets_fallback"); !ok || f0 != 0 {
+		t.Errorf("lb_subsets_fallback: registered=%v value=%d, want registered=true value=0", ok, f0)
+	}
+}
+
+func TestRegisterClusterMetrics_NonSubsetNoSubsetStats(t *testing.T) {
+	reg := stats.NewRegistry()
+	c := mkStaticCluster("c_plain", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbPolicy = clusterv3.Cluster_ROUND_ROBIN // no lb_subset_config
+	if _, err := NewManager(mkBootstrap(c), reg); err != nil {
+		t.Fatal(err)
+	}
+	// All four lb_subsets_* names must be absent for a non-subset cluster so that
+	// a regression registering even a subset of them is caught (fuller coverage).
+	for _, suffix := range []string{"lb_subsets_active", "lb_subsets_created", "lb_subsets_selected", "lb_subsets_fallback"} {
+		name := "cluster.c_plain." + suffix
+		if hasMetric(reg, name) {
+			t.Errorf("a non-subset cluster must NOT register %s", name)
+		}
+	}
+}
+
+func TestSubsetLB_InjectedCountersIncFromManager(t *testing.T) {
+	// End-to-end: build via the manager, drive the cluster's lb.Pick through a
+	// match, confirm the INJECTED selected/fallback counters increment in the registry.
+	reg := stats.NewRegistry()
+	c := mkStaticCluster("c_sub2", mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002))
+	c.LbPolicy = clusterv3.Cluster_ROUND_ROBIN
+	tag(c, 0, "version", "v1")
+	tag(c, 1, "version", "v2")
+	c.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{
+		FallbackPolicy:  clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT,
+		SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{{Keys: []string{"version"}}},
+	}
+	mgr, err := NewManager(mkBootstrap(c), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, _ := mgr.Get("c_sub2")
+	// a subset hit
+	if _, _, err := cl.lb.Pick(0, false, NewSubsetMatch(map[string]SubsetValue{"version": {Kind: subsetString, Str: "v1"}}), true); err != nil {
+		t.Fatalf("Pick (subset hit): %v", err)
+	}
+	// a fallback (v9 misses — ANY_ENDPOINT fallback picks one of the 2 endpoints)
+	if _, _, err := cl.lb.Pick(0, false, NewSubsetMatch(map[string]SubsetValue{"version": {Kind: subsetString, Str: "v9"}}), true); err != nil {
+		t.Fatalf("Pick (fallback): %v", err)
+	}
+	if got, _ := counterValue(reg, "cluster.c_sub2.lb_subsets_selected"); got != 1 {
+		t.Errorf("selected = %d, want 1 (injection works end-to-end)", got)
+	}
+	if got, _ := counterValue(reg, "cluster.c_sub2.lb_subsets_fallback"); got != 1 {
+		t.Errorf("fallback = %d, want 1", got)
 	}
 }

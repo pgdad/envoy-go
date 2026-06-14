@@ -126,7 +126,7 @@ func newRingHashWithRNG(endpoints []Endpoint, cfg ringHashCfg, rng func() uint64
 // past the end). With hasHash false it draws a uniform random ring position
 // from rng. The release func is noopRelease (ringHashLB holds no per-pick
 // state); it is non-nil on every path including the error path.
-func (rh *ringHashLB) Pick(hashKey uint64, hasHash bool) (Endpoint, func(), error) {
+func (rh *ringHashLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) (Endpoint, func(), error) {
 	if len(rh.endpoints) == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints
 	}

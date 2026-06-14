@@ -7,23 +7,23 @@ func TestRingHash_SameKeySameEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ep1, _, _ := rh.Pick(0xABCDEF, true)
-	ep2, _, _ := rh.Pick(0xABCDEF, true)
-	if ep1 != ep2 {
+	ep1, _, _ := rh.Pick(0xABCDEF, true, SubsetMatch{}, false)
+	ep2, _, _ := rh.Pick(0xABCDEF, true, SubsetMatch{}, false)
+	if ep1.Addr() != ep2.Addr() {
 		t.Errorf("same key picked different endpoints: %v vs %v", ep1, ep2)
 	}
 }
 
 func TestRingHash_DistinctKeysSpread(t *testing.T) {
 	rh, _ := newRingHash(eps(3), ringHashCfg{minRingSize: 1024, maxRingSize: 8388608, hashFunc: hashXX})
-	seen := map[Endpoint]bool{}
+	seen := map[string]bool{}
 	// Spread distinct keys across the FULL uint64 ring space: the 64-bit
 	// golden-ratio mixing constant. (The 32-bit Knuth constant maxes out
 	// at ~5e11 — below every ring point ~1.4e16 — so all keys would collapse
 	// onto ring[0], which is correct LB behavior but a degenerate test.)
 	for k := uint64(0); k < 200; k++ {
-		ep, _, _ := rh.Pick(k*0x9E3779B97F4A7C15, true)
-		seen[ep] = true
+		ep, _, _ := rh.Pick(k*0x9E3779B97F4A7C15, true, SubsetMatch{}, false)
+		seen[ep.Addr()] = true
 	}
 	if len(seen) < 2 {
 		t.Errorf("200 distinct keys covered only %d endpoints (degenerate ring?)", len(seen))
@@ -32,27 +32,27 @@ func TestRingHash_DistinctKeysSpread(t *testing.T) {
 
 func TestRingHash_WrapAround(t *testing.T) {
 	rh, _ := newRingHash(eps(3), ringHashCfg{minRingSize: 12, maxRingSize: 8388608, hashFunc: hashXX})
-	epWrap, _, _ := rh.Pick(^uint64(0), true)
+	epWrap, _, _ := rh.Pick(^uint64(0), true, SubsetMatch{}, false)
 	epZero := rh.endpoints[rh.ring[0].ep]
-	if epWrap != epZero {
+	if epWrap.Addr() != epZero.Addr() {
 		t.Errorf("wrap: key=MaxUint64 picked %v, want ring[0] endpoint %v", epWrap, epZero)
 	}
 }
 
 func TestRingHash_NoHashFallbackUsesRNG(t *testing.T) {
 	rh := newRingHashWithRNG(eps(3), ringHashCfg{minRingSize: 12, maxRingSize: 8388608, hashFunc: hashXX}, seqRNG(0))
-	epA, _, errA := rh.Pick(0, false) // rng()=0 → ring[0] (first point >= 0)
+	epA, _, errA := rh.Pick(0, false, SubsetMatch{}, false) // rng()=0 → ring[0] (first point >= 0)
 	if errA != nil {
 		t.Fatal(errA)
 	}
-	if epA != rh.endpoints[rh.ring[0].ep] {
+	if epA.Addr() != rh.endpoints[rh.ring[0].ep].Addr() {
 		t.Errorf("no-hash fallback with rng()=0 picked %v, want ring[0]", epA)
 	}
 }
 
 func TestRingHash_EmptySet(t *testing.T) {
 	rh := newRingHashWithRNG(nil, ringHashCfg{minRingSize: 1024, maxRingSize: 8388608, hashFunc: hashXX}, seqRNG(0))
-	_, release, err := rh.Pick(123, true)
+	_, release, err := rh.Pick(123, true, SubsetMatch{}, false)
 	if err != errNoEndpoints {
 		t.Errorf("err = %v, want errNoEndpoints", err)
 	}
@@ -82,7 +82,7 @@ func TestRingHash_RandomKeysNeverPanicAlwaysValid(t *testing.T) {
 	rh, _ := newRingHash(eps(3), ringHashCfg{minRingSize: 1024, maxRingSize: 8388608, hashFunc: hashXX})
 	rng := seqRNG(1, 2, 3, 1<<63, ^uint64(0), 0) // cycles
 	for i := 0; i < 1000; i++ {
-		ep, rel, err := rh.Pick(rng(), true)
+		ep, rel, err := rh.Pick(rng(), true, SubsetMatch{}, false)
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}

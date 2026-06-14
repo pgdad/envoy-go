@@ -76,9 +76,9 @@ func TestMaglev_SmallPrimeHandComputed(t *testing.T) {
 
 func TestMaglev_SameKeySameEndpoint(t *testing.T) {
 	mg := newMaglevWithRNG(eps(3), maglevCfg{tableSize: 65537}, seqRNG(0))
-	ep1, _, _ := mg.Pick(0xABCDEF, true)
-	ep2, _, _ := mg.Pick(0xABCDEF, true)
-	if ep1 != ep2 {
+	ep1, _, _ := mg.Pick(0xABCDEF, true, SubsetMatch{}, false)
+	ep2, _, _ := mg.Pick(0xABCDEF, true, SubsetMatch{}, false)
+	if ep1.Addr() != ep2.Addr() {
 		t.Errorf("same key picked different endpoints: %v vs %v", ep1, ep2)
 	}
 }
@@ -86,12 +86,12 @@ func TestMaglev_SameKeySameEndpoint(t *testing.T) {
 func TestMaglev_PickIndexesTable(t *testing.T) {
 	mg := newMaglevWithRNG(eps(3), maglevCfg{tableSize: 65537}, seqRNG(0))
 	for _, hk := range []uint64{0, 1, 65536, 65537, 1 << 40, ^uint64(0)} {
-		ep, _, err := mg.Pick(hk, true)
+		ep, _, err := mg.Pick(hk, true, SubsetMatch{}, false)
 		if err != nil {
 			t.Fatalf("Pick(%d): %v", hk, err)
 		}
 		want := mg.endpoints[mg.table[hk%mg.tableSize]]
-		if ep != want {
+		if ep.Addr() != want.Addr() {
 			t.Errorf("Pick(%d) = %v, want table[%d]=%v", hk, ep, hk%mg.tableSize, want)
 		}
 	}
@@ -99,18 +99,18 @@ func TestMaglev_PickIndexesTable(t *testing.T) {
 
 func TestMaglev_NoHashFallbackUsesRNG(t *testing.T) {
 	mg := newMaglevWithRNG(eps(3), maglevCfg{tableSize: 65537}, seqRNG(7))
-	ep, _, err := mg.Pick(0, false) // hashKey ignored; rng()=7 → table[7]
+	ep, _, err := mg.Pick(0, false, SubsetMatch{}, false) // hashKey ignored; rng()=7 → table[7]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ep != mg.endpoints[mg.table[7]] {
+	if ep.Addr() != mg.endpoints[mg.table[7]].Addr() {
 		t.Errorf("no-hash fallback with rng()=7 picked %v, want table[7]=%v", ep, mg.endpoints[mg.table[7]])
 	}
 }
 
 func TestMaglev_EmptySet(t *testing.T) {
 	mg := newMaglevWithRNG(nil, maglevCfg{tableSize: 65537}, seqRNG(0))
-	_, release, err := mg.Pick(123, true)
+	_, release, err := mg.Pick(123, true, SubsetMatch{}, false)
 	if err != errNoEndpoints {
 		t.Errorf("err = %v, want errNoEndpoints", err)
 	}
@@ -124,7 +124,7 @@ func TestMaglev_RandomKeysNeverPanicAlwaysValid(t *testing.T) {
 	mg := newMaglevWithRNG(eps(3), maglevCfg{tableSize: 65537}, seqRNG(0))
 	rng := seqRNG(1, 2, 3, 1<<63, ^uint64(0), 0)
 	for i := 0; i < 1000; i++ {
-		ep, rel, err := mg.Pick(rng(), true)
+		ep, rel, err := mg.Pick(rng(), true, SubsetMatch{}, false)
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}

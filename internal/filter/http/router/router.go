@@ -555,8 +555,8 @@ func applyHashKey(ctx context.Context, hps []HashPolicy, headerVal func(name str
 // ErrCloseAfterAction returned by the closure signals the HCM connection
 // loop to close the downstream after the response writes (per SPEC §5.3 +
 // §10 #3 settled).
-func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy) Action {
-	a := &routerAction{cluster: c, hashPolicies: hps}
+func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch) Action {
+	a := &routerAction{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch}
 	return func(ctx context.Context, req *http.Request) (ActionResponse, cluster.Endpoint, error) {
 		// Phase 07.1 Task 18 prereq P1: doH1ClusterAction returns an
 		// ActionResponse logical shape (no wire-bytes serialization here).
@@ -598,6 +598,14 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 		v := req.Header.Get(n)
 		return v, v != ""
 	}, downstreamRemoteAddrFrom(ctx))
+
+	// 38.1: thread the route-static metadata_match onto ctx → subsetLB.Pick
+	// reads it in AcquireH1. Route-static (resolved once at config-build, NOT a
+	// per-request fold like applyHashKey); threaded verbatim only when non-empty
+	// (an empty match leaves ctx untouched → the subsetLB fallback path). ADR-0239.
+	if !a.subsetMatch.Empty() {
+		ctx = cluster.WithSubsetMatch(ctx, a.subsetMatch)
+	}
 
 	pooled, err := a.cluster.AcquireH1(ctx)
 	if err != nil {
@@ -715,8 +723,9 @@ func localReplyHeaders(bodyLen int) envoyhttp.OrderedHeaders {
 // router_test.go exercise the same shape (`a.do(ctx, req, bw)`).
 type routerAction struct {
 	cluster      *cluster.Cluster
-	filter       *Filter      // set post-build by routeTable.bindFilter; nil when no sinks configured.
-	hashPolicies []HashPolicy // 36.2: stored at H1ClusterAction; per-request fold lands in Task 4 (applyHashKey).
+	filter       *Filter             // set post-build by routeTable.bindFilter; nil when no sinks configured.
+	hashPolicies []HashPolicy        // 36.2: stored at H1ClusterAction; per-request fold lands in Task 4 (applyHashKey).
+	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
 }
 
 // do drives one upstream H1 round-trip. Phase 06.1 Task 11 wires the cluster-
