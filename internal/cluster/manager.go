@@ -358,15 +358,17 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if c.GetConnectTimeout() != nil {
 		timeout = c.GetConnectTimeout().AsDuration()
 	}
-	// Phase 39.1 (ADR-0243): parse health_checks (surfaces the §6 rejects at
-	// boot) and build the per-cluster health registry when configured. health is
-	// nil for a cluster with no health_checks -> the LB fast path (byte-stable).
-	hcCfgs, err := parseHealthChecks(c, name)
+	// Phase 39.2 (ADR-0244): parse health_checks (http+tcp+grpc checkers;
+	// surfaces the §6 rejects at boot) and build the per-cluster health registry
+	// when configured. health is nil for a cluster with no health_checks -> the
+	// LB fast path (byte-stable). hasGrpcHC is consumed below to enforce that a
+	// grpc_health_check cluster supports HTTP/2 (extractH2Mode gate).
+	hcSpecs, hasGrpcHC, err := parseHealthChecks(c, name)
 	if err != nil {
 		return nil, err
 	}
 	var health *clusterHealth
-	if len(hcCfgs) > 0 {
+	if len(hcSpecs) > 0 {
 		health = newClusterHealth(endpoints, parsePanicThreshold(c))
 	}
 	cl := &Cluster{
@@ -391,8 +393,8 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	// in registerClusterMetrics; the probers are launched by
 	// Manager.StartHealthChecks (post-Freeze) and stopped by Manager.Drain.
 	if health != nil {
-		for _, cfg := range hcCfgs {
-			cl.checkers = append(cl.checkers, newHealthChecker(cl.endpoints, health, cfg))
+		for _, spec := range hcSpecs {
+			cl.checkers = append(cl.checkers, newHealthChecker(cl.endpoints, health, spec))
 		}
 	}
 	if ts := c.GetTransportSocket(); ts != nil {
@@ -414,6 +416,12 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	useH2, err := extractH2Mode(c, cl.upstreamCfg)
 	if err != nil {
 		return nil, err
+	}
+	// Phase 39.2 (ADR-0244): grpc_health_check uses the gRPC protocol (HTTP/2);
+	// reject clusters that do not declare HTTP/2 support, because the prober
+	// would silently fail against an H1-only upstream.
+	if hasGrpcHC && !useH2 {
+		return nil, fmt.Errorf("cluster: %q: grpc_health_check requires the cluster to support HTTP/2", name)
 	}
 	cl.useH2 = useH2
 	return cl, nil

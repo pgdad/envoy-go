@@ -560,6 +560,12 @@ const (
 	// arm (D-S33-2). NEW BackendKind per reference_differential_fixture_dispatch
 	// _constraint; the TCPRedisResponder = 32 precedent.
 	TCPThriftResponder BackendKind = 33
+	// GRPCHealthResponder is an in-process h2c backend (phase 39.2): it answers
+	// grpc.health.v1.Health/Check ⇒ SERVING (for the active gRPC HC probe) AND
+	// returns HTTP 200 with a "backend-<idx>:" body to plain-H2 data-plane requests
+	// (so the load-phase 100%-live assertion holds). NEW BackendKind per
+	// reference_differential_fixture_dispatch_constraint.
+	GRPCHealthResponder BackendKind = 34
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

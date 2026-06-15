@@ -90,6 +90,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0064-lb-subset/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0065-weighted-clusters/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0066-health-check-http/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0067-health-check-tcp/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0068-health-check-grpc/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -112,6 +114,12 @@ import (
 	// infrastructure compile cleanly without a forward-reference to the
 	// later-task inputs packages).
 	_ "github.com/esalaine/envoy-go/internal/filter/http/ratelimit"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
 // TestDifferential is the differential suite entry point. It discovers
@@ -922,6 +930,20 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptThriftResponder(ln, bo.accepts)
+		case fixture.GRPCHealthResponder:
+			// In-process h2c gRPC-SERVING + plain-H2 200 responder (SPEC §8.2, phase
+			// 39.2). Answers grpc.health.v1.Health/Check ⇒ SERVING for the active gRPC
+			// HC probe AND returns HTTP 200 + "backend-<idx>:" body for plain data-plane
+			// requests so the load-phase 100%-live assertion holds. Host attribution via
+			// response body (the 0066 backendIdxFromBody precedent) — no accept counter.
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go serveGRPCHealth(ln, bo.idx)
 		}
 		backends[i] = bo
 	}
@@ -2800,4 +2822,32 @@ func TestThriftResponderBackend(t *testing.T) {
 	if seqID != 9 {
 		t.Errorf("exception reply seq_id = %d, want 9 (received-seq_id echo)", seqID)
 	}
+}
+
+// serveGRPCHealth is the in-process h2c backend for GRPCHealthResponder (phase
+// 39.2, BackendKind 34). It muxes two request classes on a single h2c listener:
+//
+//   - gRPC (Content-Type: application/grpc over HTTP/2): delegated to a real
+//     gRPC server that registers grpc.health.v1.Health and responds SERVING for
+//     the unnamed service ("") — satisfying the active gRPC HC probe.
+//
+//   - Plain-H2 data-plane: returns HTTP 200 + "backend-<idx>:<path>" body so
+//     the load-phase 100%-live assertion holds and host attribution works via
+//     response body (the 0066 backendIdxFromBody precedent). No accept counter
+//     is maintained; the driver derives distribution from the response body.
+func serveGRPCHealth(ln net.Listener, idx int) {
+	gs := grpc.NewServer()
+	hs := health.NewServer()
+	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	grpc_health_v1.RegisterHealthServer(gs, hs)
+	mux := func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			gs.ServeHTTP(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, "backend-%d:%s", idx, r.URL.Path)
+	}
+	srv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(mux), &http2.Server{})}
+	_ = srv.Serve(ln)
 }

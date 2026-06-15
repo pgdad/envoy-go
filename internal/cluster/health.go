@@ -10,6 +10,9 @@ import (
 	"time"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -110,10 +113,7 @@ type statusRange struct{ start, end int64 } // [start, end) per Int64Range
 type httpHealthCheckCfg struct {
 	host             string
 	path             string
-	interval         time.Duration
 	timeout          time.Duration
-	unhealthy        uint32
-	healthy          uint32
 	expectedStatuses []statusRange // empty -> default {200,201}
 }
 
@@ -156,18 +156,86 @@ func probeHTTP(addr string, cfg httpHealthCheckCfg) (ok bool, networkFailure boo
 	return cfg.statusOK(resp.StatusCode), false
 }
 
+// prober is one health-check codec: it probes addr and reports (ok, networkFailure).
+// networkFailure (a dial/transport error) is a sub-class of failure (both stats
+// increment); a non-network failure (e.g. a bad HTTP status / a NOT_SERVING gRPC
+// response) sets ok=false, networkFailure=false. (ADR-0244)
+type prober interface {
+	probe(addr string) (ok, networkFailure bool)
+}
+
+// httpProber is the HTTP checker codec — the 39.1 probeHTTP body, behavior-unchanged.
+type httpProber struct{ cfg httpHealthCheckCfg }
+
+func (p httpProber) probe(addr string) (ok, networkFailure bool) { return probeHTTP(addr, p.cfg) }
+
+// tcpProber is the connect-only TCP checker codec: a successful TCP connect proves
+// liveness; a dial failure (refused/timeout) is a network failure. (ADR-0244)
+type tcpProber struct{ timeout time.Duration }
+
+func (p tcpProber) probe(addr string) (ok, networkFailure bool) {
+	d := net.Dialer{Timeout: p.timeout}
+	conn, err := d.Dial("tcp", addr)
+	if err != nil {
+		return false, true
+	}
+	_ = conn.Close()
+	return true, false
+}
+
+// grpcProber is the gRPC checker codec: a unary grpc.health.v1.Health/Check over H2.
+// A transport/RPC error (e.g. codes.Unavailable on a refused port) is a network
+// failure; a returned non-SERVING status is an application failure (network_failure
+// stays 0). (ADR-0244)
+type grpcProber struct {
+	serviceName string
+	timeout     time.Duration
+}
+
+func (p grpcProber) probe(addr string) (ok, networkFailure bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+	defer cancel()
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return false, true
+	}
+	defer func() { _ = conn.Close() }()
+	resp, err := grpc_health_v1.NewHealthClient(conn).Check(ctx, &grpc_health_v1.HealthCheckRequest{Service: p.serviceName})
+	if err != nil {
+		return false, true // transport/RPC error (codes.Unavailable on a refused port) = network failure (D-S39.2-3 MVP)
+	}
+	return resp.GetStatus() == grpc_health_v1.HealthCheckResponse_SERVING, false // NOT_SERVING/other = application failure (network_failure stays 0)
+}
+
+// checkerSpec is one parsed health_check: the timing/threshold envelope + the codec.
+type checkerSpec struct {
+	interval           time.Duration
+	unhealthy, healthy uint32
+	prober             prober
+}
+
 type healthChecker struct {
-	endpoints []Endpoint
-	health    *clusterHealth
-	cfg       httpHealthCheckCfg
-	firstDone map[string]bool
+	endpoints          []Endpoint
+	health             *clusterHealth
+	interval           time.Duration
+	unhealthy, healthy uint32
+	prober             prober
+	firstDone          map[string]bool
 
 	attempt, success, failure, networkFailure *stats.Counter
 	healthyGauge                              *stats.Gauge // health_check.healthy
 }
 
-func newHealthChecker(eps []Endpoint, ch *clusterHealth, cfg httpHealthCheckCfg) *healthChecker {
-	return &healthChecker{endpoints: eps, health: ch, cfg: cfg, firstDone: make(map[string]bool, len(eps))}
+func newHealthChecker(eps []Endpoint, ch *clusterHealth, spec checkerSpec) *healthChecker {
+	return &healthChecker{
+		endpoints: eps,
+		health:    ch,
+		interval:  spec.interval,
+		unhealthy: spec.unhealthy,
+		healthy:   spec.healthy,
+		prober:    spec.prober,
+		firstDone: make(map[string]bool, len(eps)),
+	}
 }
 
 func (hc *healthChecker) registerStats(r *stats.Registry, prefix string) {
@@ -182,7 +250,7 @@ func (hc *healthChecker) registerStats(r *stats.Registry, prefix string) {
 // and the unit-test entry). Stat handles are nil-guarded for bare unit use.
 func (hc *healthChecker) probeOnce() {
 	for _, ep := range hc.endpoints {
-		ok, netFail := probeHTTP(ep.Addr(), hc.cfg)
+		ok, netFail := hc.prober.probe(ep.Addr())
 		hc.applyResult(ep, ok, netFail)
 	}
 	if hc.healthyGauge != nil {
@@ -207,54 +275,79 @@ func (hc *healthChecker) applyResult(ep Endpoint, ok, netFail bool) {
 	first := !hc.firstDone[ep.Addr()]
 	hc.firstDone[ep.Addr()] = true
 	if h, exists := hc.health.states[ep.Addr()]; exists {
-		h.recordResult(ok, hc.cfg.unhealthy, hc.cfg.healthy, first)
+		h.recordResult(ok, hc.unhealthy, hc.healthy, first)
 	}
 }
 
-// parseHealthChecks validates + converts the cluster's health_checks (HTTP only
-// in 39.1). Returns nil for a cluster with no health_checks. Byte-stable rejects
-// (ADR-0080): the reference's PGV requires interval/timeout/thresholds/the checker
-// oneof/non-empty path; envoy-go hand-rolls the equivalents. tcp/grpc checkers
-// are DEPARTURE-rejected in 39.1 (lifted at 39.2).
-func parseHealthChecks(c *clusterv3.Cluster, name string) ([]httpHealthCheckCfg, error) {
-	var out []httpHealthCheckCfg
+// parseHealthChecks validates + converts the cluster's health_checks (http +
+// tcp + grpc as of 39.2). Returns nil for a cluster with no health_checks, plus
+// hasGrpc: whether any parsed checker is a grpc checker (Task 7 consumes it for
+// the must-be-H2 reject). Byte-stable rejects (ADR-0080): the reference's PGV
+// requires interval/timeout/thresholds/the checker oneof/non-empty http path;
+// envoy-go hand-rolls the equivalents.
+func parseHealthChecks(c *clusterv3.Cluster, name string) ([]checkerSpec, bool, error) {
+	var out []checkerSpec
+	var hasGrpc bool
 	for _, hc := range c.GetHealthChecks() {
 		if hc.GetInterval() == nil {
-			return nil, fmt.Errorf("cluster: %q: health_check: interval is required", name)
+			return nil, false, fmt.Errorf("cluster: %q: health_check: interval is required", name)
 		}
 		if hc.GetTimeout() == nil {
-			return nil, fmt.Errorf("cluster: %q: health_check: timeout is required", name)
+			return nil, false, fmt.Errorf("cluster: %q: health_check: timeout is required", name)
 		}
 		if hc.GetUnhealthyThreshold() == nil {
-			return nil, fmt.Errorf("cluster: %q: health_check: unhealthy_threshold is required", name)
+			return nil, false, fmt.Errorf("cluster: %q: health_check: unhealthy_threshold is required", name)
 		}
 		if hc.GetHealthyThreshold() == nil {
-			return nil, fmt.Errorf("cluster: %q: health_check: healthy_threshold is required", name)
+			return nil, false, fmt.Errorf("cluster: %q: health_check: healthy_threshold is required", name)
 		}
-		http := hc.GetHttpHealthCheck()
 		switch {
-		case http == nil && (hc.GetTcpHealthCheck() != nil || hc.GetGrpcHealthCheck() != nil):
-			return nil, fmt.Errorf("cluster: %q: health_check: only http_health_check is supported", name)
-		case http == nil:
-			return nil, fmt.Errorf("cluster: %q: health_check: a health_checker is required", name)
+		case hc.GetHttpHealthCheck() != nil:
+			httpCfg := hc.GetHttpHealthCheck()
+			if httpCfg.GetPath() == "" {
+				return nil, false, fmt.Errorf("cluster: %q: health_check: http path is required", name)
+			}
+			cfg := httpHealthCheckCfg{
+				host:    httpCfg.GetHost(),
+				path:    httpCfg.GetPath(),
+				timeout: hc.GetTimeout().AsDuration(),
+			}
+			for _, r := range httpCfg.GetExpectedStatuses() {
+				cfg.expectedStatuses = append(cfg.expectedStatuses, statusRange{r.GetStart(), r.GetEnd()})
+			}
+			out = append(out, checkerSpec{
+				interval:  hc.GetInterval().AsDuration(),
+				unhealthy: hc.GetUnhealthyThreshold().GetValue(),
+				healthy:   hc.GetHealthyThreshold().GetValue(),
+				prober:    httpProber{cfg: cfg},
+			})
+		case hc.GetTcpHealthCheck() != nil:
+			tcp := hc.GetTcpHealthCheck()
+			if tcp.GetSend() != nil || len(tcp.GetReceive()) > 0 {
+				return nil, false, fmt.Errorf("cluster: %q: health_check: tcp_health_check send/receive payload matching is not supported", name)
+			}
+			out = append(out, checkerSpec{
+				interval:  hc.GetInterval().AsDuration(),
+				unhealthy: hc.GetUnhealthyThreshold().GetValue(),
+				healthy:   hc.GetHealthyThreshold().GetValue(),
+				prober:    tcpProber{timeout: hc.GetTimeout().AsDuration()},
+			})
+		case hc.GetGrpcHealthCheck() != nil:
+			g := hc.GetGrpcHealthCheck()
+			// authority/initial_metadata are silent-ignored (D-S39.2-2): no reject,
+			// just don't read them.
+			out = append(out, checkerSpec{
+				interval:  hc.GetInterval().AsDuration(),
+				unhealthy: hc.GetUnhealthyThreshold().GetValue(),
+				healthy:   hc.GetHealthyThreshold().GetValue(),
+				prober:    grpcProber{serviceName: g.GetServiceName(), timeout: hc.GetTimeout().AsDuration()},
+			})
+			hasGrpc = true
+		default:
+			return nil, false, fmt.Errorf("cluster: %q: health_check: a health_checker is required", name)
 		}
-		if http.GetPath() == "" {
-			return nil, fmt.Errorf("cluster: %q: health_check: http path is required", name)
-		}
-		cfg := httpHealthCheckCfg{
-			host:      http.GetHost(),
-			path:      http.GetPath(),
-			interval:  hc.GetInterval().AsDuration(),
-			timeout:   hc.GetTimeout().AsDuration(),
-			unhealthy: hc.GetUnhealthyThreshold().GetValue(),
-			healthy:   hc.GetHealthyThreshold().GetValue(),
-		}
-		for _, r := range http.GetExpectedStatuses() {
-			cfg.expectedStatuses = append(cfg.expectedStatuses, statusRange{r.GetStart(), r.GetEnd()})
-		}
-		out = append(out, cfg)
 	}
-	return out, nil
+	return out, hasGrpc, nil
 }
 
 // parsePanicThreshold reads common_lb_config.healthy_panic_threshold (Percent;
@@ -270,7 +363,7 @@ func parsePanicThreshold(c *clusterv3.Cluster) float64 {
 // run is the background loop: probe immediately, then every interval until ctx done.
 func (hc *healthChecker) run(ctx context.Context) {
 	hc.probeOnce()
-	t := time.NewTicker(hc.cfg.interval)
+	t := time.NewTicker(hc.interval)
 	defer t.Stop()
 	for {
 		select {

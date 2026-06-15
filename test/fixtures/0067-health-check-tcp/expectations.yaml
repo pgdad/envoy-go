@@ -1,0 +1,72 @@
+# Phase-39.2 fixture 0067-health-check-tcp: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE cluster c_hc
+# (lb_policy ROUND_ROBIN) with active TCP health checking (connect-only) over
+# THREE endpoints — 2 LIVE HTTPEcho backends + 1 DEAD host (a host:port with no
+# listener → connect refused → the probe fails) — on BOTH sides (the 0065 HTTP
+# shape: reference STRICT_DNS / host.docker.internal, subject STATIC / 127.0.0.1).
+# The healthy fraction after convergence is 2/3 ≈ 66% > the 50% panic threshold,
+# so the cluster FILTERS the dead host (it does NOT panic-spray) and the load lands
+# EXCLUSIVELY on the 2 live backends.
+#
+# health_checks (identical on both sides — NAT-transparent static config):
+#   interval 0.5s, timeout 0.5s, unhealthy_threshold 1, healthy_threshold 1,
+#   tcp_health_check: {} (connect-only; the live HTTPEcho backends accept a bare
+#   TCP connect for the HC AND serve the HTTP data-plane load).
+#
+# The DEAD host is NOT a runner backend (the runner spawns BackendCount()==2 live
+# HTTPEcho backends). The driver binds 0.0.0.0:0, captures the port, then CLOSES
+# the listener so the port stays unbound — both sides reference that same port
+# (reference via host.docker.internal:<dead>, subject via 127.0.0.1:<dead>), and a
+# probe to it is refused on both sides.
+#
+# # The driver: poll-to-converge (the determinism mechanism)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). Because the load MUST NOT begin until the
+# dead host is detected + filtered (an early request could be round-robined to the
+# dead host → 5xx), the convergence poll + the load + the assertions ALL run inside
+# AssertStats. The Drive hooks stash their listener addrs and return a fixed,
+# address-independent byte stream ("READY\n") for the runner's CompareBytes gate.
+#
+#   1. Poll /stats on BOTH sides until cluster.c_hc.membership_healthy == 2
+#      (deadline 30s, poll 200ms; NO fixed sleep — fail clearly on timeout).
+#   2. Load: send n=100 GET / to each side's listener.
+#   3. 100%-to-live (per side): every request served 200 by a live backend
+#      (response body "backend-<idx>:" attributes the host; idx ∈ {0,1}); the
+#      tally sums to 100 and both live hosts are touched (ROUND_ROBIN over 2);
+#      a non-200 (connection-failure 5xx from the dead host) is a hard FAIL.
+#   4. Cross-side stats (both sides):
+#        cluster.c_hc.membership_healthy     == 2 (dead host filtered)
+#        cluster.c_hc.membership_total       == 3 (filtered, not removed)
+#        cluster.c_hc.health_check.attempt   >  0
+#        cluster.c_hc.health_check.success   >  0 (live hosts pass TCP connect)
+#        cluster.c_hc.health_check.failure   >  0 (dead host fails every probe)
+#        cluster.c_hc.upstream_rq_total      == 100
+#        cluster.c_hc.upstream_rq_2xx        == 100
+#        cluster.c_hc.upstream_rq_5xx        == 0   (no dead-host connection failures)
+#        cluster.c_hc.upstream_cx_active     == 0   (quiesced; Connection: close)
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#      cluster.c_hc.upstream_rq_total > 0 on the reference side before trusting
+#      the readout.
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The load (GET /) bodies are NOT
+# concatenated into the compared stream — they run inside AssertStats after
+# convergence and are tallied for the per-side 100%-to-live assertion, not byte-
+# compared (ROUND_ROBIN over 2 live hosts → per-request order may differ cross-
+# side).
+#
+# response-status: 200 on every load request (asserted in loadAndTally).
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Non-additions: NO new BackendKind (reuses HTTPEcho); NO DistributionAsserter
+# (the runner's accept counters are polluted by health-check probe traffic — the
+# per-side 100%-to-live tally lives in AssertStats off the response bodies + the
+# cross-side stat counters instead — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

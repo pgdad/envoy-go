@@ -12,6 +12,9 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -117,19 +120,16 @@ func TestProbeHTTP(t *testing.T) {
 
 func TestHTTPHealthCheckCfg_StatusOK(t *testing.T) {
 	// empty expectedStatuses -> default [200,201): 200 in, 201/204 out.
-	def := httpHealthCheckCfg{interval: time.Second, timeout: time.Second, unhealthy: 2, healthy: 2}
+	def := httpHealthCheckCfg{timeout: time.Second}
 	if !def.statusOK(200) {
 		t.Fatal("default range should accept 200")
 	}
 	if def.statusOK(201) || def.statusOK(204) {
 		t.Fatal("default range is [200,201): 201/204 must be rejected")
 	}
-	// explicit multi-range + the config fields carry through.
+	// explicit multi-range.
 	cfg := httpHealthCheckCfg{
-		interval:         500 * time.Millisecond,
 		timeout:          time.Second,
-		unhealthy:        3,
-		healthy:          1,
 		expectedStatuses: []statusRange{{200, 300}, {404, 405}},
 	}
 	if !cfg.statusOK(204) || !cfg.statusOK(404) {
@@ -137,9 +137,6 @@ func TestHTTPHealthCheckCfg_StatusOK(t *testing.T) {
 	}
 	if cfg.statusOK(300) || cfg.statusOK(403) {
 		t.Fatal("300 and 403 fall outside the explicit ranges")
-	}
-	if cfg.interval != 500*time.Millisecond || cfg.unhealthy != 3 || cfg.healthy != 1 {
-		t.Fatalf("config fields desynced: interval=%v unhealthy=%d healthy=%d", cfg.interval, cfg.unhealthy, cfg.healthy)
 	}
 }
 
@@ -156,7 +153,12 @@ func TestHealthChecker_ProbeOnce(t *testing.T) {
 	eps := []Endpoint{addrEndpoint(srv.Listener.Addr().String()), {Host: "127.0.0.1", Port: 1}}
 	ch := newClusterHealth(eps, 0.5)
 	reg := stats.NewRegistry()
-	hc := newHealthChecker(eps, ch, httpHealthCheckCfg{path: "/", timeout: time.Second, unhealthy: 1, healthy: 1})
+	hc := newHealthChecker(eps, ch, checkerSpec{
+		interval:  time.Second,
+		unhealthy: 1,
+		healthy:   1,
+		prober:    httpProber{cfg: httpHealthCheckCfg{path: "/", timeout: time.Second}},
+	})
 	hc.registerStats(reg, "cluster.c.")
 	hc.probeOnce()
 	if !ch.isHealthy(eps[0]) {
@@ -188,11 +190,6 @@ func withHTTP(hc *corev3.HealthCheck, path string) *corev3.HealthCheck {
 }
 
 func TestParseHealthChecks(t *testing.T) {
-	tcpHC := baseHC()
-	tcpHC.HealthChecker = &corev3.HealthCheck_TcpHealthCheck_{TcpHealthCheck: &corev3.HealthCheck_TcpHealthCheck{}}
-	grpcHC := baseHC()
-	grpcHC.HealthChecker = &corev3.HealthCheck_GrpcHealthCheck_{GrpcHealthCheck: &corev3.HealthCheck_GrpcHealthCheck{}}
-
 	noInterval := withHTTP(baseHC(), "/h")
 	noInterval.Interval = nil
 	noTimeout := withHTTP(baseHC(), "/h")
@@ -213,13 +210,11 @@ func TestParseHealthChecks(t *testing.T) {
 		{"no_timeout", noTimeout, "health_check: timeout is required"},
 		{"no_unhealthy_threshold", noUnhealthy, "health_check: unhealthy_threshold is required"},
 		{"no_healthy_threshold", noHealthy, "health_check: healthy_threshold is required"},
-		{"tcp_unsupported", tcpHC, "health_check: only http_health_check is supported"},
-		{"grpc_unsupported", grpcHC, "health_check: only http_health_check is supported"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &clusterv3.Cluster{HealthChecks: []*corev3.HealthCheck{tt.hc}}
-			_, err := parseHealthChecks(c, "c0")
+			_, _, err := parseHealthChecks(c, "c0")
 			if err == nil {
 				t.Fatalf("want error containing %q, got nil", tt.wantErr)
 			}
@@ -238,7 +233,7 @@ func TestParseHealthChecks(t *testing.T) {
 			},
 		}
 		c := &clusterv3.Cluster{HealthChecks: []*corev3.HealthCheck{hc}}
-		out, err := parseHealthChecks(c, "c0")
+		out, _, err := parseHealthChecks(c, "c0")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -246,26 +241,226 @@ func TestParseHealthChecks(t *testing.T) {
 			t.Fatalf("want 1 cfg, got %d", len(out))
 		}
 		got := out[0]
-		if got.path != "/h" {
-			t.Fatalf("path = %q, want /h", got.path)
-		}
-		if got.interval != time.Second || got.timeout != time.Second {
-			t.Fatalf("interval=%v timeout=%v, want 1s/1s", got.interval, got.timeout)
+		if got.interval != time.Second {
+			t.Fatalf("interval=%v, want 1s", got.interval)
 		}
 		if got.unhealthy != 2 || got.healthy != 2 {
 			t.Fatalf("thresholds unhealthy=%d healthy=%d, want 2/2", got.unhealthy, got.healthy)
 		}
-		if len(got.expectedStatuses) != 1 || got.expectedStatuses[0] != (statusRange{200, 201}) {
-			t.Fatalf("expectedStatuses = %+v, want [{200 201}]", got.expectedStatuses)
+		hp, ok := got.prober.(httpProber)
+		if !ok {
+			t.Fatalf("prober = %T, want httpProber", got.prober)
+		}
+		if hp.cfg.path != "/h" {
+			t.Fatalf("path = %q, want /h", hp.cfg.path)
+		}
+		if hp.cfg.timeout != time.Second {
+			t.Fatalf("timeout=%v, want 1s", hp.cfg.timeout)
+		}
+		if len(hp.cfg.expectedStatuses) != 1 || hp.cfg.expectedStatuses[0] != (statusRange{200, 201}) {
+			t.Fatalf("expectedStatuses = %+v, want [{200 201}]", hp.cfg.expectedStatuses)
 		}
 	})
 
 	t.Run("no_health_checks", func(t *testing.T) {
-		out, err := parseHealthChecks(&clusterv3.Cluster{}, "c0")
+		out, _, err := parseHealthChecks(&clusterv3.Cluster{}, "c0")
 		if err != nil || out != nil {
 			t.Fatalf("empty cluster: out=%+v err=%v, want nil/nil", out, err)
 		}
 	})
+}
+
+// TestTcpProber verifies the connect-only TCP codec.
+func TestTcpProber(t *testing.T) {
+	// Successful connect: a live listener should yield (true, false).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	p := tcpProber{timeout: time.Second}
+	ok, netFail := p.probe(ln.Addr().String())
+	if !ok || netFail {
+		t.Fatalf("live listener: want ok=true netFail=false, got ok=%v netFail=%v", ok, netFail)
+	}
+
+	// Failed connect: closed port should yield (false, true).
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	ok, netFail = p.probe(addr)
+	if ok || !netFail {
+		t.Fatalf("closed port: want ok=false netFail=true, got ok=%v netFail=%v", ok, netFail)
+	}
+}
+
+// TestParseHealthChecks_Tcp covers the tcp_health_check parse arm.
+func TestParseHealthChecks_Tcp(t *testing.T) {
+	// Plain tcp_health_check (no send/receive) should produce a tcpProber spec.
+	t.Run("valid_empty", func(t *testing.T) {
+		hc := baseHC()
+		hc.HealthChecker = &corev3.HealthCheck_TcpHealthCheck_{
+			TcpHealthCheck: &corev3.HealthCheck_TcpHealthCheck{},
+		}
+		c := &clusterv3.Cluster{HealthChecks: []*corev3.HealthCheck{hc}}
+		out, _, err := parseHealthChecks(c, "c0")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(out) != 1 {
+			t.Fatalf("want 1 spec, got %d", len(out))
+		}
+		got := out[0]
+		if got.interval != time.Second {
+			t.Fatalf("interval=%v, want 1s", got.interval)
+		}
+		if got.unhealthy != 2 || got.healthy != 2 {
+			t.Fatalf("thresholds unhealthy=%d healthy=%d, want 2/2", got.unhealthy, got.healthy)
+		}
+		tp, ok := got.prober.(tcpProber)
+		if !ok {
+			t.Fatalf("prober = %T, want tcpProber", got.prober)
+		}
+		if tp.timeout != time.Second {
+			t.Fatalf("timeout=%v, want 1s", tp.timeout)
+		}
+	})
+
+	// tcp_health_check with send set must be rejected.
+	t.Run("send_rejected", func(t *testing.T) {
+		hc := baseHC()
+		hc.HealthChecker = &corev3.HealthCheck_TcpHealthCheck_{
+			TcpHealthCheck: &corev3.HealthCheck_TcpHealthCheck{
+				Send: &corev3.HealthCheck_Payload{},
+			},
+		}
+		c := &clusterv3.Cluster{HealthChecks: []*corev3.HealthCheck{hc}}
+		_, _, err := parseHealthChecks(c, "c0")
+		if err == nil {
+			t.Fatal("want error for tcp send, got nil")
+		}
+		if !strings.Contains(err.Error(), "tcp_health_check send/receive payload matching is not supported") {
+			t.Fatalf("error %q does not contain expected wording", err.Error())
+		}
+	})
+
+	// tcp_health_check with receive set must be rejected.
+	t.Run("receive_rejected", func(t *testing.T) {
+		hc := baseHC()
+		hc.HealthChecker = &corev3.HealthCheck_TcpHealthCheck_{
+			TcpHealthCheck: &corev3.HealthCheck_TcpHealthCheck{
+				Receive: []*corev3.HealthCheck_Payload{{}},
+			},
+		}
+		c := &clusterv3.Cluster{HealthChecks: []*corev3.HealthCheck{hc}}
+		_, _, err := parseHealthChecks(c, "c0")
+		if err == nil {
+			t.Fatal("want error for tcp receive, got nil")
+		}
+		if !strings.Contains(err.Error(), "tcp_health_check send/receive payload matching is not supported") {
+			t.Fatalf("error %q does not contain expected wording", err.Error())
+		}
+	})
+}
+
+// newGrpcHealthServer starts an in-process gRPC health server on 127.0.0.1:0,
+// sets the given service statuses, and returns its addr + a stop func.
+func newGrpcHealthServer(t *testing.T, statuses map[string]grpc_health_v1.HealthCheckResponse_ServingStatus) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	hs := health.NewServer()
+	for svc, st := range statuses {
+		hs.SetServingStatus(svc, st)
+	}
+	grpc_health_v1.RegisterHealthServer(srv, hs)
+	go func() { _ = srv.Serve(ln) }()
+	return ln.Addr().String(), srv.Stop
+}
+
+// TestGrpcProber verifies the gRPC health-check codec: SERVING -> (true,false);
+// NOT_SERVING -> (false,false) THE DISCRIMINATOR (reachable, app-unhealthy);
+// dead port -> (false,true) network failure.
+func TestGrpcProber(t *testing.T) {
+	// (a) default service SERVING -> (true, false).
+	t.Run("serving", func(t *testing.T) {
+		addr, stop := newGrpcHealthServer(t, map[string]grpc_health_v1.HealthCheckResponse_ServingStatus{
+			"": grpc_health_v1.HealthCheckResponse_SERVING,
+		})
+		defer stop()
+		ok, netFail := grpcProber{serviceName: "", timeout: 2 * time.Second}.probe(addr)
+		if !ok || netFail {
+			t.Fatalf("SERVING: want ok=true netFail=false, got ok=%v netFail=%v", ok, netFail)
+		}
+	})
+
+	// (b) NOT_SERVING discriminator: reachable host, application-unhealthy ->
+	// (false, false). networkFailure MUST be false (the keystone assertion).
+	t.Run("not_serving_discriminator", func(t *testing.T) {
+		addr, stop := newGrpcHealthServer(t, map[string]grpc_health_v1.HealthCheckResponse_ServingStatus{
+			"svc.Bad": grpc_health_v1.HealthCheckResponse_NOT_SERVING,
+		})
+		defer stop()
+		ok, netFail := grpcProber{serviceName: "svc.Bad", timeout: 2 * time.Second}.probe(addr)
+		if ok {
+			t.Fatalf("NOT_SERVING: want ok=false, got ok=true")
+		}
+		if netFail {
+			t.Fatal("NOT_SERVING discriminator: networkFailure MUST be false (reachable host, application-unhealthy)")
+		}
+	})
+
+	// (c) dead port -> (false, true) network failure.
+	t.Run("dead_port", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		ok, netFail := grpcProber{serviceName: "", timeout: time.Second}.probe(addr)
+		if ok || !netFail {
+			t.Fatalf("dead port: want ok=false netFail=true, got ok=%v netFail=%v", ok, netFail)
+		}
+	})
+}
+
+// TestParseHealthChecks_Grpc covers the grpc_health_check parse arm + hasGrpc.
+func TestParseHealthChecks_Grpc(t *testing.T) {
+	hc := baseHC()
+	hc.HealthChecker = &corev3.HealthCheck_GrpcHealthCheck_{
+		GrpcHealthCheck: &corev3.HealthCheck_GrpcHealthCheck{ServiceName: "x"},
+	}
+	c := &clusterv3.Cluster{HealthChecks: []*corev3.HealthCheck{hc}}
+	out, hasGrpc, err := parseHealthChecks(c, "c0")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasGrpc {
+		t.Fatal("want hasGrpc=true for a grpc_health_check")
+	}
+	if len(out) != 1 {
+		t.Fatalf("want 1 spec, got %d", len(out))
+	}
+	got := out[0]
+	if got.interval != time.Second {
+		t.Fatalf("interval=%v, want 1s", got.interval)
+	}
+	if got.unhealthy != 2 || got.healthy != 2 {
+		t.Fatalf("thresholds unhealthy=%d healthy=%d, want 2/2", got.unhealthy, got.healthy)
+	}
+	gp, ok := got.prober.(grpcProber)
+	if !ok {
+		t.Fatalf("prober = %T, want grpcProber", got.prober)
+	}
+	if gp.serviceName != "x" {
+		t.Fatalf("serviceName = %q, want x", gp.serviceName)
+	}
+	if gp.timeout != time.Second {
+		t.Fatalf("timeout=%v, want 1s", gp.timeout)
+	}
 }
 
 func TestParsePanicThreshold(t *testing.T) {

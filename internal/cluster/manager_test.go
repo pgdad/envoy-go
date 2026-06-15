@@ -853,6 +853,50 @@ func TestBuildCluster_HttpProtocolOptions_NilUpstreamProtocolOptions(t *testing.
 	}
 }
 
+// TestBuildCluster_GrpcHealthCheck verifies the phase-39.2 gRPC H2 requirement:
+// a cluster with grpc_health_check and NO HTTP/2 support is rejected at
+// config-build time; the same cluster WITH http2_protocol_options is accepted.
+func TestBuildCluster_GrpcHealthCheck(t *testing.T) {
+	// Helper: a grpc_health_check envelope (valid scalars + grpc checker oneof).
+	grpcHC := &corev3.HealthCheck{
+		Interval:           durationpb.New(time.Second),
+		Timeout:            durationpb.New(time.Second),
+		UnhealthyThreshold: wrapperspb.UInt32(2),
+		HealthyThreshold:   wrapperspb.UInt32(2),
+		HealthChecker: &corev3.HealthCheck_GrpcHealthCheck_{
+			GrpcHealthCheck: &corev3.HealthCheck_GrpcHealthCheck{ServiceName: ""},
+		},
+	}
+
+	// Case 1: grpc_health_check + NO HTTP/2 → must be rejected.
+	t.Run("no_h2_rejected", func(t *testing.T) {
+		c := mkStaticCluster("c_grpc_hc_noh2", mkLbEndpoint("10.0.0.1", 8080))
+		c.HealthChecks = []*corev3.HealthCheck{grpcHC}
+		// No TypedExtensionProtocolOptions → extractH2Mode returns false.
+		_, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
+		if err == nil {
+			t.Fatal("expected error for grpc_health_check without HTTP/2, got nil")
+		}
+		want := "grpc_health_check requires the cluster to support HTTP/2"
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err.Error(), want)
+		}
+	})
+
+	// Case 2: grpc_health_check + plaintext h2c (http2_protocol_options, no
+	// transport_socket — ADR-0166) → must succeed; the reject is conditional.
+	t.Run("with_h2_accepted", func(t *testing.T) {
+		c := mkStaticCluster("c_grpc_hc_h2", mkLbEndpoint("10.0.0.1", 8080))
+		c.HealthChecks = []*corev3.HealthCheck{grpcHC}
+		c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+			httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+		}
+		if _, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry()); err != nil {
+			t.Fatalf("grpc_health_check + h2c must be accepted: %v", err)
+		}
+	})
+}
+
 func TestNewManager_MixedPlaintextAndTLSClusters(t *testing.T) {
 	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
 	if err != nil {
