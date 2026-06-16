@@ -159,6 +159,14 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 			hc.registerStats(r, prefix)
 		}
 	}
+	// Phase 40.1 (ADR-0245): the +5 passive outlier_detection stats, on clusters
+	// WITH outlier_detection only. The ejections_active gauge is injected onto
+	// BOTH the detector and the shared clusterHealth — the lazy un-eject in
+	// clusterHealth.isEjected decrements the SAME handle the detector increments
+	// on eject (they MUST be the same *stats.Gauge instance).
+	if c.outlier != nil {
+		c.outlier.registerStats(r, prefix, c.health)
+	}
 }
 
 // Get looks up a cluster by name. Returns (nil, false) if not found.
@@ -367,8 +375,17 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if err != nil {
 		return nil, err
 	}
+	// Phase 40.1 (ADR-0245): parse outlier_detection (passive HC; surfaces the
+	// §6 rejects at boot). outlierCfg is nil for a cluster with no
+	// outlier_detection. A cluster with outlier_detection but no health_checks
+	// still needs the per-cluster health registry (the ejection state lives
+	// there); Task 6 consumes outlierCfg to build the detector.
+	outlierCfg, err := parseOutlierDetection(c, name)
+	if err != nil {
+		return nil, err
+	}
 	var health *clusterHealth
-	if len(hcSpecs) > 0 {
+	if len(hcSpecs) > 0 || outlierCfg != nil {
 		health = newClusterHealth(endpoints, parsePanicThreshold(c))
 	}
 	cl := &Cluster{
@@ -395,6 +412,24 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if health != nil {
 		for _, spec := range hcSpecs {
 			cl.checkers = append(cl.checkers, newHealthChecker(cl.endpoints, health, spec))
+		}
+	}
+	// Phase 40.1 (ADR-0245): build the passive outlier detector over the same
+	// endpoint set + shared health registry when outlier_detection is configured
+	// (outlierCfg != nil implies health != nil per the creation-site widening
+	// above). The enforce roll is a [0,100) draw from a crypto-seeded PCG (the
+	// reference's enforcing_consecutive_5xx percentage gate). The 5 stat handles
+	// stay nil here; registerClusterMetrics injects them (Task 8).
+	if outlierCfg != nil {
+		rng, err := newPCGRNG()
+		if err != nil {
+			return nil, err
+		}
+		cl.outlier = &outlierDetector{
+			cfg:         *outlierCfg,
+			health:      health,
+			endpoints:   endpoints,
+			enforceRoll: func() uint32 { return uint32(rng() % 100) },
 		}
 	}
 	if ts := c.GetTransportSocket(); ts != nil {

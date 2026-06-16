@@ -98,6 +98,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 	}
 
 	a.cluster.IncStatusClass(resp.Status)
+	a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: resp.Status})
 
 	// Convert h2 hpack header fields into OrderedHeaders for the chain's encode
 	// side. Pseudo-headers (:status etc.) are stripped — the chain works on

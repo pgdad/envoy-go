@@ -1,0 +1,83 @@
+# Phase-40.1 fixture 0069-outlier-detection-consecutive-5xx: differential
+# expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE cluster c_od
+# (lb_policy ROUND_ROBIN) with PASSIVE outlier detection (consecutive_5xx) over
+# THREE endpoints — 2 HEALTHY HTTPEcho backends + 1 always-503 host (the
+# HTTP503Responder, BackendKind 35) — on BOTH sides (the 0066 HTTP shape:
+# reference STRICT_DNS / host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# Unlike 0066 (whose unhealthy host is an UNBOUND port detected by ACTIVE health
+# checks), ALL THREE hosts here are runner-spawned LIVE listeners; host2 answers
+# 503 and is ejected by PASSIVE consecutive-5xx outlier detection. The runner
+# selects host2's kind via PerHostBackendKind (BackendKindAt(2) → HTTP503
+# Responder). BackendCount() is 3.
+#
+# outlier_detection (identical on both sides — NAT-transparent static config):
+#   consecutive_5xx 5, interval 10s, base_ejection_time 30s,
+#   max_ejection_percent 100.
+#
+# # The driver: eject-drive + poll-to-converge + warmup (the determinism)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). The ejection must be driven, observed,
+# and the worker rotation drained BEFORE the strict measured phase, so it ALL
+# runs inside AssertStats. The Drive hooks stash their listener addrs and return a
+# fixed, address-independent byte stream ("READY\n") for the runner's CompareBytes
+# gate.
+#
+#   1. Ejection drive: send ejectDriveRequests (24) 503-TOLERANT GET / round-robin
+#      to each side's listener. Under strict round-robin over 3 hosts, host2 (the
+#      503) is picked every 3rd request; consec5xx is PER-HOST and never reset (no
+#      2xx ever comes FROM host2), so it crosses consecutive_5xx (5) and is
+#      ejected (~consecutive_5xx*3 = 15 requests; the 24 count carries a margin).
+#   2. Poll /stats on BOTH sides until
+#      cluster.c_od.outlier_detection.ejections_active == 1 (deadline 30s, poll
+#      200ms; NO fixed sleep — fail clearly with the last value on timeout).
+#   3. Warmup: after the gauge reads 1, send 503-tolerant GET / until warmupStable
+#      (10) CONSECUTIVE 200s prove the worker rotation dropped host2, BOTH sides.
+#   4. Measured load: baseline the per-request counters post-warmup, send n (60)
+#      GET /; assert (delta) upstream_rq_2xx == 60, upstream_rq_5xx == 0, every
+#      body is backend-0:/backend-1: (NEVER backend-2: — the ejected 503 host
+#      serves nothing in the measured phase), both healthy hosts touched.
+#   5. Cross-side stats (both sides):
+#        cluster.c_od.outlier_detection.ejections_active                   == 1
+#        cluster.c_od.outlier_detection.ejections_enforced_total           >= 1
+#        cluster.c_od.outlier_detection.ejections_enforced_consecutive_5xx >= 1
+#        cluster.c_od.outlier_detection.ejections_detected_consecutive_5xx >= 1
+#        cluster.c_od.upstream_rq_2xx (delta over measured phase)          == 60
+#        cluster.c_od.upstream_rq_5xx (delta over measured phase)          == 0
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#      cluster.c_od.upstream_rq_total > 0 on the reference side before trusting
+#      the readout.
+#
+# # Deliberate non-assertions
+#
+#   - ejections_detected_consecutive_gateway_failure is NOT asserted — envoy-go
+#     has no gateway detector at 40.1; the reference trips it on 503 (AMEND-OD4).
+#   - The recovery / un-eject arm (gauge → 0 after base_ejection_time) is DEFERRED
+#     — the lazy (subject) vs sweep (reference) un-eject timing diverges cross-side
+#     (AMEND-OD1).
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The eject-drive + measured (GET /)
+# bodies are NOT concatenated into the compared stream — they run inside
+# AssertStats and are tallied for the per-side 100%-to-healthy assertion, not
+# byte-compared (ROUND_ROBIN over 2 healthy hosts → per-request order may differ
+# cross-side).
+#
+# response-status: 200 on every MEASURED-phase request (asserted in loadAndTally);
+# 503s during the eject-drive + warmup are expected and tolerated.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Non-additions: NO new BackendKind authored HERE (the HTTP503Responder = 35 was
+# added at Task 9); NO DistributionAsserter (the runner's accept counters are
+# polluted by the eject-drive + warmup traffic — the per-side 100%-to-healthy
+# tally lives in AssertStats off the response bodies + the cross-side stat
+# counters instead — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

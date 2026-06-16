@@ -566,6 +566,15 @@ const (
 	// (so the load-phase 100%-live assertion holds). NEW BackendKind per
 	// reference_differential_fixture_dispatch_constraint.
 	GRPCHealthResponder BackendKind = 34
+	// HTTP503Responder is an in-process always-503 HTTP/1.1 responder (phase
+	// 40.1, passive outlier detection): it reads one request per connection and
+	// always answers HTTP 503 Service Unavailable with a "backend-<idx>:<seg>"
+	// body (host attribution via body — the GRPCHealthResponder precedent, no
+	// accept counter). Used by 0069 to populate a mixed cluster of {2×HTTPEcho
+	// healthy, 1×always-503} so the reference's outlier detector ejects the
+	// unhealthy host. NEW BackendKind per reference_differential_fixture_dispatch
+	// _constraint; the GRPCHealthResponder = 34 precedent.
+	HTTP503Responder BackendKind = 35
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement
@@ -573,6 +582,12 @@ const (
 // 0003). Drivers that do NOT implement it default to TCPEcho.
 type BackendKindAware interface {
 	BackendKind() BackendKind
+}
+
+// PerHostBackendKind lets a driver override the backend kind per host index.
+// Drivers that do NOT implement it get the uniform BackendKind() for every host.
+type PerHostBackendKind interface {
+	BackendKindAt(i int) BackendKind
 }
 
 // HostMount describes a file bind-mount from the test host into the reference

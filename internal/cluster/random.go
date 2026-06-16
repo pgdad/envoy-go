@@ -52,7 +52,7 @@ func (r *randomLB) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, func
 	}
 	for k := 0; k < n; k++ {
 		j := (i + k) % n
-		if r.health.isHealthy(r.endpoints[j]) {
+		if r.health.available(r.endpoints[j]) {
 			return r.endpoints[j], noopRelease, nil
 		}
 	}

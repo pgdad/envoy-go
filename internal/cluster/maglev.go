@@ -57,7 +57,7 @@ func (mg *maglevLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) (E
 	// Walk the table slots forward from slot to the next healthy host (ADR-0243).
 	for k := uint64(0); k < mg.tableSize; k++ {
 		idx := mg.table[(slot+k)%mg.tableSize]
-		if mg.health.isHealthy(mg.endpoints[idx]) {
+		if mg.health.available(mg.endpoints[idx]) {
 			return mg.endpoints[idx], noopRelease, nil
 		}
 	}

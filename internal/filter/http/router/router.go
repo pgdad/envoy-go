@@ -653,6 +653,7 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 	defer func() { _ = resp.Body.Close() }()
 
 	a.cluster.IncStatusClass(resp.StatusCode)
+	a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: resp.StatusCode})
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {

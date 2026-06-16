@@ -150,7 +150,7 @@ func (rh *ringHashLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) 
 	// Walk the ring forward from m to the next healthy host (ADR-0243).
 	for k := 0; k < len(rh.ring); k++ {
 		idx := rh.ring[(m+k)%len(rh.ring)].ep
-		if rh.health.isHealthy(rh.endpoints[idx]) {
+		if rh.health.available(rh.endpoints[idx]) {
 			return rh.endpoints[idx], noopRelease, nil
 		}
 	}

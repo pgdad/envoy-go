@@ -476,3 +476,88 @@ func TestParsePanicThreshold(t *testing.T) {
 		t.Fatalf("Percent{70}: got %v, want 0.7", got)
 	}
 }
+
+func TestIsEjected_UnknownAddr(t *testing.T) {
+	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
+	ch := newClusterHealth(eps, 0.5)
+	unknown := Endpoint{Host: "10.0.0.9", Port: 80}
+	if ch.isEjected(unknown) {
+		t.Fatal("unknown addr must not be ejected")
+	}
+}
+
+func TestEject_ThenAvailableFalse(t *testing.T) {
+	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}, {Host: "10.0.0.2", Port: 80}}
+	ch := newClusterHealth(eps, 0.5)
+	now := int64(1_000_000_000)
+	ch.nowNanos = func() int64 { return now }
+	h := ch.states["10.0.0.2:80"]
+	h.ejected.Store(true)
+	h.unejectAtNanos.Store(now + int64(time.Hour))
+	if ch.available(eps[1]) {
+		t.Fatal("ejected host must be unavailable")
+	}
+	if !ch.available(eps[0]) {
+		t.Fatal("non-ejected healthy host must be available")
+	}
+	if got := ch.availableCount(eps); got != 1 {
+		t.Fatalf("availableCount = %d, want 1 (one ejected)", got)
+	}
+}
+
+func TestLazyUneject(t *testing.T) {
+	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
+	ch := newClusterHealth(eps, 0.5)
+	reg := stats.NewRegistry()
+	ch.ejectionsActive = reg.NewGauge("ejections_active")
+	base := int64(2_000_000_000)
+	uneject := base + int64(30*time.Second)
+	now := base
+	ch.nowNanos = func() int64 { return now }
+	h := ch.states["10.0.0.1:80"]
+	h.ejected.Store(true)
+	h.unejectAtNanos.Store(uneject)
+	ch.ejectionsActive.Inc() // mirror the eject-time increment (done in detector, Task 5)
+
+	// still ejected before the deadline
+	if !ch.isEjected(eps[0]) {
+		t.Fatal("must stay ejected before unejectAt")
+	}
+	if ch.ejectionsActive.Load() != 1 {
+		t.Fatalf("gauge = %d before deadline, want 1", ch.ejectionsActive.Load())
+	}
+
+	// advance past the deadline -> lazy un-eject clears + decrements once
+	now = uneject
+	if ch.isEjected(eps[0]) {
+		t.Fatal("must un-eject at/after unejectAt")
+	}
+	if h.ejected.Load() {
+		t.Fatal("ejected flag must clear on lazy un-eject")
+	}
+	if ch.ejectionsActive.Load() != 0 {
+		t.Fatalf("gauge = %d after un-eject, want 0", ch.ejectionsActive.Load())
+	}
+
+	// a second call must NOT double-decrement (CAS guard)
+	if ch.isEjected(eps[0]) {
+		t.Fatal("stays un-ejected on second call")
+	}
+	if ch.ejectionsActive.Load() != 0 {
+		t.Fatalf("gauge = %d after second isEjected, want 0 (no double-dec)", ch.ejectionsActive.Load())
+	}
+}
+
+func TestAvailable_NoOutlier(t *testing.T) {
+	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}, {Host: "10.0.0.2", Port: 80}, {Host: "10.0.0.3", Port: 80}}
+	ch := newClusterHealth(eps, 0.5)
+	ch.states["10.0.0.2:80"].healthy.Store(false) // one unhealthy, none ejected
+	for _, ep := range eps {
+		if ch.available(ep) != ch.isHealthy(ep) {
+			t.Fatalf("available(%s)=%v != isHealthy=%v with no ejection", ep.Addr(), ch.available(ep), ch.isHealthy(ep))
+		}
+	}
+	if ch.availableCount(eps) != ch.healthyCount(eps) {
+		t.Fatalf("availableCount=%d != healthyCount=%d with no ejection", ch.availableCount(eps), ch.healthyCount(eps))
+	}
+}

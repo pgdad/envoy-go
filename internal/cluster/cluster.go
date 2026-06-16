@@ -115,6 +115,12 @@ type Cluster struct {
 	// StartHealthChecks (runtime).
 	health *clusterHealth
 
+	// outlier is the per-cluster passive outlier detector (ADR-0245). nil for a
+	// cluster with no outlier_detection. Built in buildCluster over the shared
+	// health registry; fed by RecordUpstreamResult (the router success sites are
+	// wired in Task 7).
+	outlier *outlierDetector
+
 	// checkers are the active-HC background probers (one per configured
 	// health_check). nil for a cluster with no health_checks. Built in
 	// buildCluster, stat-registered in registerClusterMetrics, and run by
@@ -160,6 +166,22 @@ func (c *Cluster) IncStatusClass(code int) {
 	if cnt := c.statusClassCounter(code); cnt != nil {
 		cnt.Inc()
 	}
+}
+
+// UpstreamResult is one completed upstream request's outcome (SPEC §3.1).
+// LocalOriginErr is unread at 40.1 (reserved for 40.2). (ADR-0245)
+type UpstreamResult struct {
+	StatusCode     int
+	LocalOriginErr bool
+}
+
+// RecordUpstreamResult feeds one request outcome to the cluster's outlier
+// detector. A no-op for clusters without outlier_detection. (ADR-0245)
+func (c *Cluster) RecordUpstreamResult(ep Endpoint, r UpstreamResult) {
+	if c.outlier == nil {
+		return
+	}
+	c.outlier.record(ep, r.StatusCode)
 }
 
 // Name returns the cluster's name.

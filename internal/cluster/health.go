@@ -23,6 +23,14 @@ type hostHealth struct {
 	healthy       atomic.Bool
 	consecSuccess atomic.Uint32
 	consecFail    atomic.Uint32
+
+	// Outlier-detection (passive-HC) sub-state, DISTINCT from the active-HC
+	// healthy bit above (ADR-0245). A host can be ejected while still
+	// active-HC-healthy and vice versa; availability is the AND of both.
+	ejected        atomic.Bool   // outlier-ejected (separate from healthy)
+	unejectAtNanos atomic.Int64  // un-eject deadline (UnixNano); 0 when not ejected
+	ejectCount     atomic.Uint32 // ejections so far (stats + future backoff)
+	consec5xx      atomic.Uint32 // consecutive 5xx (reset by a 2xx from this host)
 }
 
 func newHostHealth() *hostHealth {
@@ -57,10 +65,19 @@ type clusterHealth struct {
 	panicThreshold    float64                // healthy fraction below which panic fires (default 0.5; strict <)
 	membershipHealthy *stats.Gauge           // membership_healthy (injected at registerClusterMetrics; nil-guarded)
 	panicCounter      *stats.Counter         // lb_healthy_panic (injected; nil-guarded)
+	ejectionsActive   *stats.Gauge           // outlier_detection.ejections_active (injected at Task 8; nil-guarded)
+
+	// nowNanos is the injectable clock backing the lazy un-eject deadline check
+	// (overridden in unit tests for deterministic time). Defaults to wall time.
+	nowNanos func() int64
 }
 
 func newClusterHealth(endpoints []Endpoint, panicThreshold float64) *clusterHealth {
-	ch := &clusterHealth{states: make(map[string]*hostHealth, len(endpoints)), panicThreshold: panicThreshold}
+	ch := &clusterHealth{
+		states:         make(map[string]*hostHealth, len(endpoints)),
+		panicThreshold: panicThreshold,
+		nowNanos:       func() int64 { return time.Now().UnixNano() },
+	}
 	for _, ep := range endpoints {
 		ch.states[ep.Addr()] = newHostHealth()
 	}
@@ -84,6 +101,57 @@ func (ch *clusterHealth) healthyCount(eps []Endpoint) int {
 	return n
 }
 
+// isEjected reports whether the host is outlier-ejected, performing the
+// load-bearing lazy un-eject: once base_ejection_time has elapsed (nowNanos >=
+// unejectAtNanos), it clears the ejected flag (CAS-guarded so concurrent scans
+// decrement the ejections_active gauge exactly once) and reports false. An
+// ejected host receives no further traffic, so this rejoins on the next LB scan
+// past it. Unknown addr -> not ejected (mirrors isHealthy's unknown->true).
+func (ch *clusterHealth) isEjected(ep Endpoint) bool {
+	h, ok := ch.states[ep.Addr()]
+	if !ok {
+		return false
+	}
+	if !h.ejected.Load() {
+		return false
+	}
+	if ch.nowNanos() >= h.unejectAtNanos.Load() {
+		if h.ejected.CompareAndSwap(true, false) && ch.ejectionsActive != nil {
+			ch.ejectionsActive.Dec()
+		}
+		return false
+	}
+	return true
+}
+
+// available reports whether the host may receive traffic: active-HC-healthy AND
+// not outlier-ejected. The LB pick sites (Task 3) consult this instead of
+// isHealthy once outlier detection is wired.
+func (ch *clusterHealth) available(ep Endpoint) bool { return ch.isHealthy(ep) && !ch.isEjected(ep) }
+
+// availableCount is the available-host tally (the panic-denominator successor to
+// healthyCount once outlier detection is wired).
+func (ch *clusterHealth) availableCount(eps []Endpoint) int {
+	n := 0
+	for _, ep := range eps {
+		if ch.available(ep) {
+			n++
+		}
+	}
+	return n
+}
+
+// ejectedCount returns the number of currently-ejected hosts among eps.
+func (ch *clusterHealth) ejectedCount(eps []Endpoint) int {
+	n := 0
+	for _, ep := range eps {
+		if ch.isEjected(ep) {
+			n++
+		}
+	}
+	return n
+}
+
 // inPanic reports whether the healthy fraction is strictly below the panic
 // threshold (exactly 50% does NOT panic).
 func (ch *clusterHealth) inPanic(eps []Endpoint) bool {
@@ -91,7 +159,7 @@ func (ch *clusterHealth) inPanic(eps []Endpoint) bool {
 	if total == 0 {
 		return false
 	}
-	return float64(ch.healthyCount(eps))/float64(total) < ch.panicThreshold
+	return float64(ch.availableCount(eps))/float64(total) < ch.panicThreshold
 }
 
 // recomputeMembership Sets the membership_healthy gauge to the current healthy count.

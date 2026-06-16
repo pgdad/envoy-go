@@ -3,12 +3,15 @@ package differential
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseEnvoyTarget_PullsTagAndDigest(t *testing.T) {
@@ -163,4 +166,34 @@ func freeTCPPort(t *testing.T) int {
 	}
 	defer func() { _ = ln.Close() }()
 	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// TestAcceptHTTP503Counting verifies the in-process always-503 responder
+// (phase 40.1 / fixture 0069) returns 503 Service Unavailable with a
+// "backend-<idx>:<seg>" attribution body over a loopback listener.
+func TestAcceptHTTP503Counting(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go acceptHTTP503Counting(ln, 7)
+
+	url := fmt.Sprintf("http://%s/x/req-42", ln.Addr().String())
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d %q; want 503", resp.StatusCode, resp.Status)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if got, want := string(b), "backend-7:req-42"; got != want {
+		t.Errorf("body = %q; want %q", got, want)
+	}
 }

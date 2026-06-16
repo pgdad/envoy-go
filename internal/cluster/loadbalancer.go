@@ -58,7 +58,7 @@ func (rr *roundRobin) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, f
 	for tries := 0; tries < n; tries++ {
 		i := rr.counter.Add(1) - 1
 		ep := rr.endpoints[int(i)%n]
-		if rr.health.isHealthy(ep) {
+		if rr.health.available(ep) {
 			return ep, noopRelease, nil
 		}
 	}

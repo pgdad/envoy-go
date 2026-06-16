@@ -101,7 +101,7 @@ func (lr *leastRequest) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint,
 		}
 		for k := 0; k < n; k++ {
 			j := (i + k) % n
-			if lr.health.isHealthy(lr.endpoints[j]) {
+			if lr.health.available(lr.endpoints[j]) {
 				return j, true
 			}
 		}

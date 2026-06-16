@@ -92,6 +92,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0066-health-check-http/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0067-health-check-tcp/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0068-health-check-grpc/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0069-outlier-detection-consecutive-5xx/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -170,14 +171,23 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 		// must derive distribution from response bodies instead.
 		proc *exec.Cmd
 	}
-	kind := fixture.TCPEcho
+	uniformKind := fixture.TCPEcho
 	if bk, ok := d.(fixture.BackendKindAware); ok {
-		kind = bk.BackendKind()
+		uniformKind = bk.BackendKind()
 	}
 	backends := make([]*backend, n)
 	for i := 0; i < n; i++ {
 		bo := &backend{idx: i, accepts: new(atomic.Uint64)}
-		switch kind {
+		// Per-index override: drivers implementing fixture.PerHostBackendKind may
+		// return a different kind per host index (e.g. 0069's mixed cluster of
+		// {2×HTTPEcho healthy, 1×always-503}). The per-iteration local hostKind
+		// ensures one index's override does not leak to the next; drivers that do
+		// NOT implement the interface keep the uniform default for every host.
+		hostKind := uniformKind
+		if pk, ok := d.(fixture.PerHostBackendKind); ok {
+			hostKind = pk.BackendKindAt(i)
+		}
+		switch hostKind {
 		case fixture.TCPEcho, fixture.HTTPEcho:
 			ln, err := net.Listen("tcp", "0.0.0.0:0")
 			if err != nil {
@@ -186,7 +196,7 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			defer func(ln net.Listener) { _ = ln.Close() }(ln)
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
-			if kind == fixture.TCPEcho {
+			if hostKind == fixture.TCPEcho {
 				go acceptEchoCounting(ln, bo.accepts)
 			} else {
 				go acceptHTTPEchoCounting(ln, bo.accepts, bo.idx)
@@ -944,6 +954,20 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go serveGRPCHealth(ln, bo.idx)
+		case fixture.HTTP503Responder:
+			// In-process always-503 HTTP/1.1 responder (phase 40.1, passive outlier
+			// detection): reads one request per connection and always answers HTTP 503
+			// with a "backend-<idx>:<seg>" body. Used by 0069's mixed cluster so the
+			// reference's outlier detector ejects the unhealthy host. Host attribution
+			// via response body (the serveGRPCHealth precedent) — no accept counter.
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptHTTP503Counting(ln, bo.idx)
 		}
 		backends[i] = bo
 	}
@@ -1534,6 +1558,37 @@ func acceptHTTPEchoCounting(ln net.Listener, counter *atomic.Uint64, idx int) {
 			}
 			body := fmt.Sprintf("backend-%d:%s", idx, seg)
 			_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+				len(body), body)
+		}(c)
+	}
+}
+
+// acceptHTTP503Counting accepts one HTTP/1.1 request per connection and always
+// writes a 503 Service Unavailable response with a "backend-<idx>:<lastSegmentOf
+// Path>" body (host attribution via body, the serveGRPCHealth precedent — NO
+// accept counter). Used by 0069's mixed cluster so the reference's passive
+// outlier detector ejects the always-failing host.
+func acceptHTTP503Counting(ln net.Listener, idx int) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer func() { _ = c.Close() }()
+			br := bufio.NewReader(c)
+			req, err := http.ReadRequest(br)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, req.Body)
+			_ = req.Body.Close()
+			seg := req.URL.Path
+			if i := strings.LastIndex(seg, "/"); i >= 0 && i+1 < len(seg) {
+				seg = seg[i+1:]
+			}
+			body := fmt.Sprintf("backend-%d:%s", idx, seg)
+			_, _ = fmt.Fprintf(c, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 				len(body), body)
 		}(c)
 	}
