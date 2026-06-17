@@ -1,0 +1,96 @@
+# Phase-40.2 fixture 0070-outlier-detection-consecutive-gateway-failure:
+# differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE cluster c_gw
+# (lb_policy ROUND_ROBIN) with PASSIVE outlier detection over THREE endpoints —
+# 2 HEALTHY HTTPEcho backends + 1 always-503 host (the HTTP503Responder,
+# BackendKind 35) — on BOTH sides (the 0069 HTTP shape: reference STRICT_DNS /
+# host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# It proves the consecutive_gateway_failure detector ejects host2 (the always-503
+# host) on BOTH sides — AND that the gateway-first short-circuit holds: with
+# consecutive_5xx set HIGH (100) the consecutive_5xx detector cannot fire, and a
+# gateway eject short-circuits before the 5xx detector runs, so
+# ejections_detected_consecutive_5xx == 0 and ejections_enforced_consecutive_5xx
+# == 0 cross-side (the gateway-ejects, 5xx-silent invariant).
+#
+# outlier_detection (identical on both sides — NAT-transparent static config):
+#   consecutive_gateway_failure 5, enforcing_consecutive_gateway_failure 100,
+#   consecutive_5xx 100 (HIGH — 5xx detector cannot fire), interval 10s,
+#   base_ejection_time 30s, max_ejection_percent 100.
+#
+# # The driver: eject-drive + poll-to-converge + warmup (the 0069 determinism)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). The ejection must be driven, observed,
+# and the worker rotation drained BEFORE the strict measured phase, so it ALL
+# runs inside AssertStats. The Drive hooks stash their listener addrs and return a
+# fixed, address-independent byte stream ("READY\n") for the runner's CompareBytes
+# gate.
+#
+#   1. Ejection drive: send ejectDriveRequests (24) 503-TOLERANT GET / round-robin
+#      to each side's listener. Under strict round-robin over 3 hosts, host2 (the
+#      503) is picked every 3rd request; consecGw is PER-HOST and never reset (no
+#      2xx ever comes FROM host2), so it crosses consecutive_gateway_failure (5)
+#      and is ejected (~consecutive_gateway_failure*3 = 15 requests; the 24 count
+#      carries a margin — and stays well below consecutive_5xx=100).
+#   2. Poll /stats on BOTH sides until
+#      cluster.c_gw.outlier_detection.ejections_active == 1 (deadline 30s, poll
+#      200ms; NO fixed sleep — fail clearly with the last value on timeout).
+#   3. Warmup: after the gauge reads 1, send 503-tolerant GET / until warmupStable
+#      (10) CONSECUTIVE 200s prove the worker rotation dropped host2, BOTH sides.
+#   4. Measured load: baseline the per-request counters post-warmup, send n (60)
+#      GET /; assert (delta) upstream_rq_2xx == 60, upstream_rq_5xx == 0, every
+#      body is backend-0:/backend-1: (NEVER backend-2: — the ejected 503 host
+#      serves nothing in the measured phase), both healthy hosts touched.
+#   5. Cross-side stats (both sides):
+#        cluster.c_gw.outlier_detection.ejections_active                                == 1
+#        cluster.c_gw.outlier_detection.ejections_enforced_total                        >= 1
+#        cluster.c_gw.outlier_detection.ejections_detected_consecutive_gateway_failure  >= 1
+#        cluster.c_gw.outlier_detection.ejections_enforced_consecutive_gateway_failure  >= 1
+#        cluster.c_gw.outlier_detection.ejections_detected_consecutive_5xx              == 0
+#        cluster.c_gw.outlier_detection.ejections_enforced_consecutive_5xx              == 0
+#        cluster.c_gw.upstream_rq_2xx (delta over measured phase)                       == 60
+#        cluster.c_gw.upstream_rq_5xx (delta over measured phase)                       == 0
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#      cluster.c_gw.upstream_rq_total > 0 on the reference side before trusting
+#      the readout.
+#
+# # The load-bearing assertion: detected/enforced_consecutive_5xx == 0
+#
+# This is a LIVE equality check, not a vacuous one: a 503 is gateway-class, so the
+# gateway detector ejects host2 and recordExternal5xx returns BEFORE the 5xx
+# detector runs. If the gateway-first short-circuit regressed (the 5xx detector
+# also firing), detected_consecutive_5xx would lift off 0 and the check would
+# bite. The absent-counter-reads-0 carve-out only applies to the want==0 case
+# (the reference lazily allocates per-detector counters), which is exactly the
+# never-fired-class state we are asserting.
+#
+# # Deliberate non-assertions
+#
+#   - The recovery / un-eject arm (ejections_active → 0 after base_ejection_time)
+#     is DEFERRED — the lazy (subject) vs sweep (reference) un-eject timing
+#     diverges cross-side (AMEND-OD1).
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The eject-drive + measured (GET /)
+# bodies are NOT concatenated into the compared stream — they run inside
+# AssertStats and are tallied for the per-side 100%-to-healthy assertion, not
+# byte-compared (ROUND_ROBIN over 2 healthy hosts → per-request order may differ
+# cross-side).
+#
+# response-status: 200 on every MEASURED-phase request (asserted in loadAndTally);
+# 503s during the eject-drive + warmup are expected and tolerated.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Non-additions: NO new BackendKind authored HERE (the HTTP503Responder = 35 was
+# added at phase 40.1); NO DistributionAsserter (the runner's accept counters are
+# polluted by the eject-drive + warmup traffic — the per-side 100%-to-healthy
+# tally lives in AssertStats off the response bodies + the cross-side stat
+# counters instead — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

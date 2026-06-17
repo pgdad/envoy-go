@@ -84,6 +84,7 @@ On BOTH sides:
 | `cluster.c_od.outlier_detection.ejections_enforced_total`    | `>= 1`    | an ejection was enforced                |
 | `cluster.c_od.outlier_detection.ejections_enforced_consecutive_5xx` | `>= 1` | enforced via the 5xx detector       |
 | `cluster.c_od.outlier_detection.ejections_detected_consecutive_5xx` | `>= 1` | detected via the 5xx detector       |
+| `cluster.c_od.outlier_detection.ejections_detected_consecutive_gateway_failure` | `>= 1` | gateway detector (active-by-default + detect-only) trips on host2's 503s |
 | `cluster.c_od.upstream_rq_2xx` (delta, measured phase)       | `== 60`   | all measured load routed to a healthy host |
 | `cluster.c_od.upstream_rq_5xx` (delta, measured phase)       | `== 0`    | no 5xx in the measured phase            |
 
@@ -97,8 +98,6 @@ exact-parity anchor.
 
 ## Deliberate non-assertions
 
-- **`ejections_detected_consecutive_gateway_failure`** is NOT asserted — envoy-go
-  has no gateway detector at 40.1; the reference trips it on 503 (**AMEND-OD4**).
 - **Recovery / un-eject arm** (`ejections_active` → 0 after `base_ejection_time`)
   is **DEFERRED** — the lazy (subject) vs sweep (reference) un-eject timing
   diverges cross-side (**AMEND-OD1**).

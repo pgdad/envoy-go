@@ -42,7 +42,7 @@ import (
 func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) {
 	raw, ep, err := c.Dial(ctx)
 	if err != nil {
-		return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: %w", err)
+		return nil, ep, fmt.Errorf("cluster: dial h2: %w", err)
 	}
 	// Phase 06.1 Task 9: Cluster.Dial wraps every successful dial in a
 	// *connWithGauge whose Close Decs the upstream_cx_active gauge. We pass
@@ -51,7 +51,7 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) 
 	wrapped, ok := raw.(*connWithGauge)
 	if !ok {
 		_ = raw.Close()
-		return nil, Endpoint{}, errors.New("cluster: dial h2: not a connWithGauge")
+		return nil, ep, errors.New("cluster: dial h2: not a connWithGauge")
 	}
 	// ADR-0166: branch on cluster.upstreamCfg to decide TLS+h2 vs plaintext
 	// h2c prior-knowledge. The TLS branch is preserved bit-identical with
@@ -61,7 +61,7 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) 
 		tlsConn, ok := wrapped.Conn.(*stdtls.Conn)
 		if !ok {
 			_ = wrapped.Close()
-			return nil, Endpoint{}, errors.New("cluster: dial h2: not a TLS conn")
+			return nil, ep, errors.New("cluster: dial h2: not a TLS conn")
 		}
 		// Defensive: ensure the handshake is complete so NegotiatedProtocol is
 		// authoritative. HandshakeContext is idempotent on already-handshaken
@@ -69,12 +69,12 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) 
 		// Cluster.Dial refactor that might return a not-yet-handshaken *tls.Conn.
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			_ = wrapped.Close()
-			return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: handshake: %w", err)
+			return nil, ep, fmt.Errorf("cluster: dial h2: handshake: %w", err)
 		}
 		alpn := tlsConn.ConnectionState().NegotiatedProtocol
 		if alpn != "h2" {
 			_ = wrapped.Close()
-			return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: alpn negotiated %q, want %q", alpn, "h2")
+			return nil, ep, fmt.Errorf("cluster: dial h2: alpn negotiated %q, want %q", alpn, "h2")
 		}
 	}
 	// Plaintext h2c (c.upstreamCfg == nil): no TLS, no ALPN — h2.NewClientConn
@@ -83,7 +83,7 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) 
 	cc, err := h2.NewClientConn(ctx, wrapped)
 	if err != nil {
 		_ = wrapped.Close()
-		return nil, Endpoint{}, fmt.Errorf("cluster: dial h2: client conn: %w", err)
+		return nil, ep, fmt.Errorf("cluster: dial h2: client conn: %w", err)
 	}
 	return cc, ep, nil
 }

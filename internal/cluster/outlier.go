@@ -18,6 +18,15 @@ type outlierConfig struct {
 	baseEjectionTime time.Duration // default 30s (flat)
 	maxEjectionPct   uint32        // default 10
 	enforcing5xx     uint32        // default 100
+	// gateway detector — active-by-default (detect-only by default; AMEND-OD2-1).
+	consecGwEnabled bool   // false iff consecutive_gateway_failure explicitly 0
+	consecutiveGw   uint32 // threshold (default 5)
+	enforcingGw     uint32 // enforce-roll % (default 0 ⇒ detect-only)
+	// local-origin detector — takes effect only when split is true.
+	splitLocalOrigin bool   // split_external_local_origin_errors (default false)
+	consecLOEnabled  bool   // false iff consecutive_local_origin_failure explicitly 0
+	consecutiveLO    uint32 // threshold (default 5)
+	enforcingLO      uint32 // enforce-roll % (default 100)
 	// interval is parse-accepted + validated (gt:0s) but its role is deferred at 40.1.
 }
 
@@ -45,6 +54,12 @@ func parseOutlierDetection(c *clusterv3.Cluster, name string) (*outlierConfig, e
 	if d := od.GetBaseEjectionTime(); d != nil && d.AsDuration() <= 0 {
 		return nil, fmt.Errorf("cluster: %q: outlier_detection: base_ejection_time: value must be greater than 0s", name)
 	}
+	if v := od.GetEnforcingConsecutiveGatewayFailure(); v != nil && v.GetValue() > 100 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: enforcing_consecutive_gateway_failure: value must be less than or equal to 100", name)
+	}
+	if v := od.GetEnforcingConsecutiveLocalOriginFailure(); v != nil && v.GetValue() > 100 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: enforcing_consecutive_local_origin_failure: value must be less than or equal to 100", name)
+	}
 
 	cfg := &outlierConfig{
 		consecutive5xx:   5,
@@ -70,6 +85,32 @@ func parseOutlierDetection(c *clusterv3.Cluster, name string) (*outlierConfig, e
 	if v := od.GetEnforcingConsecutive_5Xx(); v != nil {
 		cfg.enforcing5xx = v.GetValue()
 	}
+	// gateway (default 5; active-by-default; enforcing default 0).
+	if v := od.GetConsecutiveGatewayFailure(); v == nil {
+		cfg.consecutiveGw = 5
+		cfg.consecGwEnabled = true
+	} else {
+		cfg.consecutiveGw = v.GetValue()
+		cfg.consecGwEnabled = cfg.consecutiveGw != 0
+	}
+	cfg.enforcingGw = 0 // default
+	if v := od.GetEnforcingConsecutiveGatewayFailure(); v != nil {
+		cfg.enforcingGw = v.GetValue()
+	}
+	// split (default false).
+	cfg.splitLocalOrigin = od.GetSplitExternalLocalOriginErrors()
+	// local-origin (default 5; enforcing default 100).
+	if v := od.GetConsecutiveLocalOriginFailure(); v == nil {
+		cfg.consecutiveLO = 5
+		cfg.consecLOEnabled = true
+	} else {
+		cfg.consecutiveLO = v.GetValue()
+		cfg.consecLOEnabled = cfg.consecutiveLO != 0
+	}
+	cfg.enforcingLO = 100 // default
+	if v := od.GetEnforcingConsecutiveLocalOriginFailure(); v != nil {
+		cfg.enforcingLO = v.GetValue()
+	}
 	return cfg, nil
 }
 
@@ -89,9 +130,17 @@ type outlierDetector struct {
 	ejectionsOverflow      *stats.Counter
 	ejectionsDetected5xx   *stats.Counter
 	ejectionsEnforced5xx   *stats.Counter
+	// gateway detector handles (allocated in registerStats at Task 5; nil-guarded
+	// here so Task-3 runtime constructions tolerate the absence). (ADR-0246)
+	ejectionsDetectedGw *stats.Counter
+	ejectionsEnforcedGw *stats.Counter
+	// local-origin detector handles (allocated in registerStats at Task 5; nil-
+	// guarded here so Task-4 runtime constructions tolerate the absence). (ADR-0246)
+	ejectionsDetectedLO *stats.Counter
+	ejectionsEnforcedLO *stats.Counter
 }
 
-// registerStats allocates the 5 outlier_detection.* handles under prefix
+// registerStats allocates the 9 outlier_detection.* handles under prefix
 // (`cluster.<name>.`, trailing dot included) and assigns them onto the detector.
 // The ejections_active gauge is ALSO assigned onto the shared clusterHealth ch
 // so the lazy un-eject in clusterHealth.isEjected decrements the same instance
@@ -104,43 +153,32 @@ func (d *outlierDetector) registerStats(r *stats.Registry, prefix string, ch *cl
 	d.ejectionsOverflow = r.NewCounter(op + "ejections_overflow")
 	d.ejectionsDetected5xx = r.NewCounter(op + "ejections_detected_consecutive_5xx")
 	d.ejectionsEnforced5xx = r.NewCounter(op + "ejections_enforced_consecutive_5xx")
+	// +4 gateway/local-origin detector counters (Task 5; ADR-0246) — registered
+	// UNCONDITIONALLY on any outlier cluster, matching the reference, which exposes
+	// every outlier_detection.* name regardless of which detectors are configured.
+	d.ejectionsDetectedGw = r.NewCounter(op + "ejections_detected_consecutive_gateway_failure")
+	d.ejectionsEnforcedGw = r.NewCounter(op + "ejections_enforced_consecutive_gateway_failure")
+	d.ejectionsDetectedLO = r.NewCounter(op + "ejections_detected_consecutive_local_origin_failure")
+	d.ejectionsEnforcedLO = r.NewCounter(op + "ejections_enforced_consecutive_local_origin_failure")
 	if ch != nil {
 		ch.ejectionsActive = d.ejectionsActive // same instance (lazy un-eject Dec target)
 	}
 }
 
-// record applies one upstream result for ep (SPEC §3.3). Per-host atomics; the
-// cap read is a racy best-effort snapshot; the CAS makes the eject exactly-once.
-func (d *outlierDetector) record(ep Endpoint, statusCode int) {
-	h, ok := d.health.states[ep.Addr()]
-	if !ok {
-		return
-	}
-	_ = d.health.isEjected(ep) // fast-path lazy-uneject refresh
-	is5xx := statusCode >= 500 && statusCode < 600
-	if !is5xx {
-		h.consec5xx.Store(0) // reset on any non-5xx FROM THIS HOST
-		return
-	}
-	if !d.cfg.consec5xxEnabled {
-		return
-	}
-	n := h.consec5xx.Add(1)
-	if n < d.cfg.consecutive5xx {
-		return
-	}
-	// threshold reached
-	if d.ejectionsDetected5xx != nil {
-		d.ejectionsDetected5xx.Inc()
-	}
+// tryEject runs the enforce-roll + max_ejection_percent cap + CAS once-only
+// eject for one threshold crossing. Returns true iff THIS call ejected the host.
+// The detected counter is the caller's responsibility (Inc'd before tryEject).
+// (ADR-0246; refactor of the 40.1 inline eject — REUSED by all three detectors.)
+func (d *outlierDetector) tryEject(ep Endpoint, h *hostHealth, enforcing uint32, enforced *stats.Counter) bool {
+	_ = ep // part of the documented per-detector API; the cap denominator uses d.endpoints
 	if h.ejected.Load() {
-		return // already ejected
+		return false // already ejected (fast-path)
 	}
 	// enforce roll (D-S40.1-3): short-circuit 0/>=100 so the rng is not consumed
 	// in the common case.
-	enforce := d.cfg.enforcing5xx >= 100 || (d.cfg.enforcing5xx != 0 && d.enforceRoll() < d.cfg.enforcing5xx)
+	enforce := enforcing >= 100 || (enforcing != 0 && d.enforceRoll() < enforcing)
 	if !enforce {
-		return // detect-only
+		return false // detect-only
 	}
 	// max_ejection_percent cap: eject iff (ejected+1)*100/total <= cap. Cross-
 	// multiplied to (ejected+1)*100 <= cap*total to avoid Go's truncating integer
@@ -152,12 +190,12 @@ func (d *outlierDetector) record(ep Endpoint, statusCode int) {
 		if d.ejectionsOverflow != nil {
 			d.ejectionsOverflow.Inc()
 		}
-		return
+		return false
 	}
 	// eject — CAS so exactly one goroutine wins (the streak check above is not
 	// atomic as a unit).
 	if !h.ejected.CompareAndSwap(false, true) {
-		return
+		return false
 	}
 	h.unejectAtNanos.Store(d.health.nowNanos() + d.cfg.baseEjectionTime.Nanoseconds())
 	h.ejectCount.Add(1)
@@ -165,9 +203,86 @@ func (d *outlierDetector) record(ep Endpoint, statusCode int) {
 		d.ejectionsActive.Inc()
 	}
 	if d.ejectionsEnforcedTotal != nil {
-		d.ejectionsEnforcedTotal.Inc() // the double-count
+		d.ejectionsEnforcedTotal.Inc() // the cross-detector double-count
 	}
-	if d.ejectionsEnforced5xx != nil {
-		d.ejectionsEnforced5xx.Inc() // (AMEND-OD4)
+	if enforced != nil {
+		enforced.Inc() // the per-detector enforced counter
+	}
+	return true
+}
+
+// record applies one upstream result for ep (SPEC §3.3). Per-host atomics; the
+// cap read is a racy best-effort snapshot; the CAS makes the eject exactly-once.
+func (d *outlierDetector) record(ep Endpoint, statusCode int, localOriginErr bool) {
+	h, ok := d.health.states[ep.Addr()]
+	if !ok {
+		return
+	}
+	_ = d.health.isEjected(ep) // fast-path lazy-uneject refresh
+
+	if localOriginErr {
+		d.recordLocalOrigin(ep, h, statusCode) // split-aware local-origin detector (gateway-class mapping when split=false)
+		return
+	}
+	// external HTTP status
+	if d.cfg.splitLocalOrigin {
+		h.consecLO.Store(0) // a completed external response ⇒ connection succeeded ⇒ reset LO streak
+	}
+	if statusCode < 500 || statusCode >= 600 {
+		h.consec5xx.Store(0)
+		h.consecGw.Store(0)
+		return
+	}
+	d.recordExternal5xx(ep, h, statusCode)
+}
+
+// recordExternal5xx applies one external 5xx, gateway detector FIRST (AMEND-OD2-2):
+// a gateway eject short-circuits before the consecutive_5xx detector fires, so a
+// gateway-driven eject leaves detected_consecutive_5xx at 0 for that call.
+func (d *outlierDetector) recordExternal5xx(ep Endpoint, h *hostHealth, statusCode int) {
+	gateway := statusCode == 502 || statusCode == 503 || statusCode == 504
+	if gateway {
+		if d.cfg.consecGwEnabled {
+			if h.consecGw.Add(1) >= d.cfg.consecutiveGw {
+				if d.ejectionsDetectedGw != nil {
+					d.ejectionsDetectedGw.Inc()
+				}
+				if d.tryEject(ep, h, d.cfg.enforcingGw, d.ejectionsEnforcedGw) {
+					return // gateway ejected → the 5xx detector does NOT fire this call (detected_5xx stays 0)
+				}
+			}
+		}
+	} else {
+		h.consecGw.Store(0) // a non-gateway 5xx breaks the gateway streak
+	}
+	// fall through to the 5xx detector (the 40.1 path, behavior-unchanged).
+	if !d.cfg.consec5xxEnabled {
+		return
+	}
+	if h.consec5xx.Add(1) >= d.cfg.consecutive5xx {
+		if d.ejectionsDetected5xx != nil {
+			d.ejectionsDetected5xx.Inc()
+		}
+		d.tryEject(ep, h, d.cfg.enforcing5xx, d.ejectionsEnforced5xx)
+	}
+}
+
+// recordLocalOrigin applies one local-origin failure (connect/reset). When split
+// is enabled it feeds ONLY the local-origin detector; when split is disabled the
+// failure is mapped to a gateway-class 5xx (the caller passes the 502/503
+// local-reply code, both gateway-class) and fed to the gateway/5xx detectors.
+func (d *outlierDetector) recordLocalOrigin(ep Endpoint, h *hostHealth, statusCode int) {
+	if !d.cfg.splitLocalOrigin {
+		d.recordExternal5xx(ep, h, statusCode) // split=false: count as gateway-class 5xx (AMEND-OD2-3)
+		return
+	}
+	if !d.cfg.consecLOEnabled {
+		return
+	}
+	if h.consecLO.Add(1) >= d.cfg.consecutiveLO {
+		if d.ejectionsDetectedLO != nil {
+			d.ejectionsDetectedLO.Inc()
+		}
+		d.tryEject(ep, h, d.cfg.enforcingLO, d.ejectionsEnforcedLO)
 	}
 }

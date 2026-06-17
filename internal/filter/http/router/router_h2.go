@@ -76,6 +76,9 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 	cc, ep, err := a.cluster.DialH2(ctx)
 	if err != nil {
 		a.cluster.IncStatusClass(502)
+		if !ep.IsZero() { // a host was picked → attribute the local-origin connect failure
+			a.cluster.RecordUpstreamResult(ep, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
+		}
 		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
 	}
 	defer func() { _ = cc.Close() }()
@@ -94,6 +97,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 			return ActionResponse{Status: 0}, picked, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
 		}
 		a.cluster.IncStatusClass(502)
+		a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
 		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
 	}
 

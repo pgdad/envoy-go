@@ -44,6 +44,12 @@ func (e Endpoint) Addr() string {
 	return fmt.Sprintf("%s:%d", e.Host, e.Port)
 }
 
+// IsZero reports whether the Endpoint is the zero value (no host picked).
+// Endpoint is NOT comparable (it carries a Metadata map), so the "a host was
+// picked" guard at the connect-failure seam sites uses !ep.IsZero() rather
+// than ep != Endpoint{}.
+func (e Endpoint) IsZero() bool { return e.Host == "" && e.Port == 0 }
+
 // PooledH1Conn bundles a pooled HTTP/1.1 upstream connection with its
 // bufio.Reader so the next request can resume parsing the response stream
 // without losing bytes already buffered (e.g. read-ahead of the next
@@ -181,7 +187,7 @@ func (c *Cluster) RecordUpstreamResult(ep Endpoint, r UpstreamResult) {
 	if c.outlier == nil {
 		return
 	}
-	c.outlier.record(ep, r.StatusCode)
+	c.outlier.record(ep, r.StatusCode, r.LocalOriginErr)
 }
 
 // Name returns the cluster's name.
@@ -292,7 +298,7 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	raw, err := d.DialContext(ctx, "tcp", ep.Addr())
 	if err != nil {
 		release()
-		return nil, Endpoint{}, fmt.Errorf("cluster: dial: %w", err)
+		return nil, ep, fmt.Errorf("cluster: dial: %w", err)
 	}
 	var final net.Conn = raw
 	if c.upstreamCfg != nil {
@@ -300,7 +306,7 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
 			release()
-			return nil, Endpoint{}, fmt.Errorf("cluster: tls: handshake: %w", err)
+			return nil, ep, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}
 		final = conn
 	}
@@ -329,9 +335,9 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 // AcquireH1 is the high-throughput replacement for Dial in the router H1
 // upstream-dispatch hot path. Dial remains for non-pooled use sites (TCP
 // proxy, single-shot upstream calls).
-func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
+func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, Endpoint, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, Endpoint{}, err
 	}
 	// ADR-0232 OPTION C: pick via c.lb.Pick() directly so we can HOLD the
 	// release until the fresh-dialed conn's final Close. release is always
@@ -341,7 +347,7 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 	match, hasMatch := subsetMatchFrom(ctx)
 	ep, release, err := c.lb.Pick(hk, ok, match, hasMatch)
 	if err != nil {
-		return nil, err
+		return nil, Endpoint{}, err
 	}
 	addr := ep.Addr()
 
@@ -362,7 +368,7 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 		// closePool drain). The fresh pick is redundant → release it
 		// immediately. The pooled conn carries its dial-time ep, so use that.
 		release()
-		return p, nil
+		return p, p.ep, nil
 	}
 	c.h1PoolMu.Unlock()
 
@@ -373,7 +379,7 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		release()
-		return nil, fmt.Errorf("cluster: dial: %w", err)
+		return nil, ep, fmt.Errorf("cluster: dial: %w", err)
 	}
 	var final net.Conn = raw
 	if c.upstreamCfg != nil {
@@ -381,7 +387,7 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
 			release()
-			return nil, fmt.Errorf("cluster: tls: handshake: %w", err)
+			return nil, ep, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}
 		final = conn
 	}
@@ -392,7 +398,7 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, error) {
 		Conn: wrapped,
 		Br:   bufio.NewReaderSize(wrapped, 4096),
 		ep:   ep,
-	}, nil
+	}, ep, nil
 }
 
 // PutIdleH1 returns a keep-alive HTTP/1.1 connection to the per-endpoint

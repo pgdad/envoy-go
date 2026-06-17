@@ -1,0 +1,113 @@
+# Phase-40.2 fixture 0071-outlier-detection-local-origin: differential
+# expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE cluster c_lo
+# (lb_policy ROUND_ROBIN) with PASSIVE outlier detection over THREE endpoints —
+# 2 LIVE HTTPEcho backends + 1 DEAD host (a host:port with no listener → connect
+# refused) — on BOTH sides (the 0066/0070 HTTP shape: reference STRICT_DNS /
+# host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# It proves the consecutive_local_origin_failure detector ejects the dead host
+# (host2) on BOTH sides under split_external_local_origin_errors: true — each
+# connect-refused is a LOCAL-ORIGIN failure (LocalOriginErr: true), routed to the
+# local-origin detector ONLY. The split invariant: the consecutive_5xx / gateway
+# detectors NEVER fire, so ejections_detected_consecutive_5xx == 0 cross-side.
+#
+# outlier_detection (identical on both sides — NAT-transparent static config):
+#   consecutive_local_origin_failure 5, enforcing_consecutive_local_origin_failure
+#   100, split_external_local_origin_errors true, interval 10s, base_ejection_time
+#   30s, max_ejection_percent 100.
+#
+# # Topology: 2 LIVE backends (runner-spawned) + 1 DEAD host (unbound port)
+#
+# The DEAD host is NOT a runner backend — BackendCount() == 2 (only the 2 LIVE
+# HTTPEcho backends are spawned). The driver binds 0.0.0.0:0, captures the port,
+# CLOSES the listener (so the port stays unbound → a connect is refused), and
+# MEMOIZES it so both sides reference the SAME dead port (reference via
+# host.docker.internal:<dead>, subject via 127.0.0.1:<dead>). This is the 0066
+# dead-host mechanism (allocDeadPort), NO PerHostBackendKind. On the subject side
+# the refused connect reaches the H1 AcquireH1 connect-failure seam (Task 6) →
+# RecordUpstreamResult{LocalOriginErr: true} → the local-origin detector.
+#
+# # The driver: eject-drive + poll-to-converge + warmup (the 0070 determinism)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). The ejection must be driven, observed,
+# and the worker rotation drained BEFORE the strict measured phase, so it ALL
+# runs inside AssertStats. The Drive hooks stash their listener addrs and return a
+# fixed, address-independent byte stream ("READY\n") for the runner's CompareBytes
+# gate.
+#
+#   1. Ejection drive: send ejectDriveRequests (24) 5xx-TOLERANT GET / round-robin
+#      to each side's listener. Under strict round-robin over 3 endpoints, the
+#      dead host is picked every 3rd request; consecLO is PER-HOST and never reset
+#      (no completed external response ever comes FROM the dead host), so it
+#      crosses consecutive_local_origin_failure (5) and is ejected
+#      (~consecutive_local_origin_failure*3 = 15 requests; the 24 count carries a
+#      margin).
+#   2. Poll /stats on BOTH sides until
+#      cluster.c_lo.outlier_detection.ejections_active == 1 (deadline 45s, poll
+#      200ms; NO fixed sleep — fail clearly with the last value on timeout). The
+#      deadline carries headroom over 0070: a dead-host connect-refused can be
+#      slower to accrue than an HTTP 503 (connect attempt + connect_timeout).
+#   3. Warmup: after the gauge reads 1, send 5xx-tolerant GET / until warmupStable
+#      (10) CONSECUTIVE 200s prove the worker rotation dropped the dead host, BOTH
+#      sides.
+#   4. Measured load: baseline the per-request counters post-warmup, send n (60)
+#      GET /; assert (delta) upstream_rq_2xx == 60, upstream_rq_5xx == 0, every
+#      body is backend-0:/backend-1: (the dead host serves nothing in the measured
+#      phase), both live hosts touched.
+#   5. Cross-side stats (both sides):
+#        cluster.c_lo.outlier_detection.ejections_active                                    == 1
+#        cluster.c_lo.outlier_detection.ejections_enforced_total                            >= 1
+#        cluster.c_lo.outlier_detection.ejections_detected_consecutive_local_origin_failure >= 1
+#        cluster.c_lo.outlier_detection.ejections_enforced_consecutive_local_origin_failure >= 1
+#        cluster.c_lo.outlier_detection.ejections_detected_consecutive_5xx                  == 0
+#        cluster.c_lo.upstream_rq_2xx (delta over measured phase)                           == 60
+#        cluster.c_lo.upstream_rq_5xx (delta over measured phase)                           == 0
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#      cluster.c_lo.upstream_rq_total > 0 on the reference side before trusting
+#      the readout.
+#
+# # The load-bearing assertion: detected_consecutive_5xx == 0
+#
+# This is a LIVE equality check, not a vacuous one: with split=true the dead-host
+# connect-refused (LocalOriginErr) is routed by recordLocalOrigin to the local-
+# origin detector ONLY — the consecutive_5xx / gateway detectors never see it. If
+# the split branch regressed and the failure were instead mapped to a gateway-
+# class 5xx (the split=false path), detected_consecutive_5xx would lift off 0 and
+# the check would bite. The absent-counter-reads-0 carve-out applies ONLY to the
+# want==0 case (the reference lazily allocates per-detector counters) — it
+# swallows absence, NOT a present-but-nonzero value.
+#
+# # Deliberate non-assertions
+#
+#   - The recovery / un-eject arm (ejections_active → 0 after base_ejection_time)
+#     is DEFERRED — the lazy (subject) vs sweep (reference) un-eject timing
+#     diverges cross-side (AMEND-OD1).
+#   - enforced_consecutive_5xx is NOT asserted separately (detected==0 already
+#     implies it; the 5xx detector never reached its detect step).
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The eject-drive + measured (GET /)
+# bodies are NOT concatenated into the compared stream — they run inside
+# AssertStats and are tallied for the per-side 100%-to-live assertion, not
+# byte-compared (ROUND_ROBIN over 2 live hosts → per-request order may differ
+# cross-side).
+#
+# response-status: 200 on every MEASURED-phase request (asserted in loadAndTally);
+# 5xx during the eject-drive + warmup are expected and tolerated.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Non-additions: NO new BackendKind (the dead host is an injected unbound
+# endpoint, NOT a runner backend — the 0066 shape, BackendCount==2, NO
+# PerHostBackendKind); NO DistributionAsserter (the runner's accept counters are
+# polluted by the eject-drive + warmup traffic — the per-side 100%-to-live tally
+# lives in AssertStats off the response bodies + the cross-side stat counters
+# instead — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

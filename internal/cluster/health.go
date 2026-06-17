@@ -31,6 +31,8 @@ type hostHealth struct {
 	unejectAtNanos atomic.Int64  // un-eject deadline (UnixNano); 0 when not ejected
 	ejectCount     atomic.Uint32 // ejections so far (stats + future backoff)
 	consec5xx      atomic.Uint32 // consecutive 5xx (reset by a 2xx from this host)
+	consecGw       atomic.Uint32 // consecutive gateway-class 5xx {502,503,504} (ADR-0246)
+	consecLO       atomic.Uint32 // consecutive local-origin failures (split=true only) (ADR-0246)
 }
 
 func newHostHealth() *hostHealth {

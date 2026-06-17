@@ -45,6 +45,7 @@
 #        cluster.c_od.outlier_detection.ejections_enforced_total           >= 1
 #        cluster.c_od.outlier_detection.ejections_enforced_consecutive_5xx >= 1
 #        cluster.c_od.outlier_detection.ejections_detected_consecutive_5xx >= 1
+#        cluster.c_od.outlier_detection.ejections_detected_consecutive_gateway_failure >= 1
 #        cluster.c_od.upstream_rq_2xx (delta over measured phase)          == 60
 #        cluster.c_od.upstream_rq_5xx (delta over measured phase)          == 0
 #      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
@@ -53,8 +54,6 @@
 #
 # # Deliberate non-assertions
 #
-#   - ejections_detected_consecutive_gateway_failure is NOT asserted — envoy-go
-#     has no gateway detector at 40.1; the reference trips it on 503 (AMEND-OD4).
 #   - The recovery / un-eject arm (gauge → 0 after base_ejection_time) is DEFERRED
 #     — the lazy (subject) vs sweep (reference) un-eject timing diverges cross-side
 #     (AMEND-OD1).

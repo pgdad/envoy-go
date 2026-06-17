@@ -467,6 +467,77 @@ func newTestClusterLB(t *testing.T, lb loadBalancer, eps ...Endpoint) *Cluster {
 	return c
 }
 
+// pickErrLB is a loadBalancer whose Pick always fails — models an empty /
+// all-unavailable cluster (the LB-pick-failure path). Used to prove AcquireH1
+// surfaces a ZERO Endpoint when no host was picked.
+type pickErrLB struct{}
+
+func (pickErrLB) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, func(), error) {
+	return Endpoint{}, func() {}, errNoEndpoints
+}
+
+func TestAcquireH1_SurfacesPickedEndpointOnDialFailure(t *testing.T) {
+	// A host IS picked but the dial fails (port 1 refused). AcquireH1's new ep
+	// return MUST carry the picked endpoint (non-zero) alongside the error so
+	// the router can attribute the local-origin connect failure to that host.
+	ep := Endpoint{Host: "127.0.0.1", Port: 1} // port 1: refused
+	stub := &stubLB{ep: ep}
+	c := newTestClusterLB(t, stub, ep)
+	p, got, err := c.AcquireH1(context.Background())
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if p != nil {
+		t.Fatalf("expected nil PooledH1Conn on failure, got %v", p)
+	}
+	if got.IsZero() {
+		t.Fatalf("expected non-zero picked endpoint on dial failure, got zero")
+	}
+	if got.Host != ep.Host || got.Port != ep.Port {
+		t.Fatalf("surfaced endpoint = %s, want %s", got.Addr(), ep.Addr())
+	}
+}
+
+func TestAcquireH1_SurfacesZeroEndpointOnPickFailure(t *testing.T) {
+	// An empty / all-unavailable cluster: the LB Pick fails before any host is
+	// chosen. AcquireH1 MUST return a ZERO Endpoint (IsZero) so the router skips
+	// the local-origin attribution (no host to blame).
+	c := newTestClusterLB(t, pickErrLB{})
+	p, got, err := c.AcquireH1(context.Background())
+	if err == nil {
+		t.Fatal("expected pick error")
+	}
+	if p != nil {
+		t.Fatalf("expected nil PooledH1Conn on failure, got %v", p)
+	}
+	if !got.IsZero() {
+		t.Fatalf("expected zero picked endpoint on pick failure, got %s", got.Addr())
+	}
+}
+
+func TestDial_SurfacesPickedEndpointOnDialFailure(t *testing.T) {
+	// A host IS picked but the dial fails (port 1 refused). Dial's ep return MUST
+	// carry the picked endpoint (non-zero) alongside the error so the router can
+	// attribute the local-origin connect failure to that host. Mirrors the
+	// AcquireH1 surfacing lock; the existing Dial-failure tests discard ep with _.
+	ep := Endpoint{Host: "127.0.0.1", Port: 1} // port 1: refused
+	stub := &stubLB{ep: ep}
+	c := newTestClusterLB(t, stub, ep)
+	conn, got, err := c.Dial(context.Background())
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if conn != nil {
+		t.Fatalf("expected nil net.Conn on failure, got %v", conn)
+	}
+	if got.IsZero() {
+		t.Fatalf("expected non-zero picked endpoint on dial failure, got zero")
+	}
+	if got.Host != ep.Host || got.Port != ep.Port {
+		t.Fatalf("surfaced endpoint = %s, want %s", got.Addr(), ep.Addr())
+	}
+}
+
 func TestDial_ReleasesOnConnClose(t *testing.T) {
 	// Listener that accepts and immediately closes — Dial succeeds.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -538,7 +609,7 @@ func TestAcquireH1_PoolHitReleasesImmediately(t *testing.T) {
 	stub := &stubLB{ep: endpointFromAddr(ln.Addr())}
 	c := newTestClusterLB(t, stub, stub.ep)
 
-	p1, err := c.AcquireH1(context.Background())
+	p1, _, err := c.AcquireH1(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireH1 miss: %v", err)
 	}
@@ -550,7 +621,7 @@ func TestAcquireH1_PoolHitReleasesImmediately(t *testing.T) {
 		t.Fatalf("after PutIdle: active=%d want 1 (cx-as-rq hold persists)", got)
 	}
 
-	p2, err := c.AcquireH1(context.Background())
+	p2, _, err := c.AcquireH1(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireH1 hit: %v", err)
 	}

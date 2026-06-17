@@ -607,9 +607,12 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 		ctx = cluster.WithSubsetMatch(ctx, a.subsetMatch)
 	}
 
-	pooled, err := a.cluster.AcquireH1(ctx)
+	pooled, ep, err := a.cluster.AcquireH1(ctx)
 	if err != nil {
 		a.cluster.IncStatusClass(503)
+		if !ep.IsZero() { // a host was picked → attribute the local-origin connect failure
+			a.cluster.RecordUpstreamResult(ep, cluster.UpstreamResult{StatusCode: 503, LocalOriginErr: true})
+		}
 		return ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
 	upstream := pooled.Conn
@@ -636,6 +639,7 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 
 	if err := req.Write(upstream); err != nil {
 		a.cluster.IncStatusClass(502)
+		a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
 		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
 
@@ -648,6 +652,7 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		a.cluster.IncStatusClass(502)
+		a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
 		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
 	}
 	defer func() { _ = resp.Body.Close() }()

@@ -144,6 +144,173 @@ func TestParseOutlierDetection_Rejects(t *testing.T) {
 	}
 }
 
+// --- Task 2: gateway / local-origin / split parse fields ---
+
+func TestParseOutlierDetection_GatewayLocalOriginSplit_Full(t *testing.T) {
+	c := &clusterv3.Cluster{
+		OutlierDetection: &clusterv3.OutlierDetection{
+			ConsecutiveGatewayFailure:              wrapperspb.UInt32(7),
+			EnforcingConsecutiveGatewayFailure:     wrapperspb.UInt32(80),
+			SplitExternalLocalOriginErrors:         true,
+			ConsecutiveLocalOriginFailure:          wrapperspb.UInt32(9),
+			EnforcingConsecutiveLocalOriginFailure: wrapperspb.UInt32(60),
+		},
+	}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if !cfg.consecGwEnabled {
+		t.Errorf("consecGwEnabled = false, want true")
+	}
+	if cfg.consecutiveGw != 7 {
+		t.Errorf("consecutiveGw = %d, want 7", cfg.consecutiveGw)
+	}
+	if cfg.enforcingGw != 80 {
+		t.Errorf("enforcingGw = %d, want 80", cfg.enforcingGw)
+	}
+	if !cfg.splitLocalOrigin {
+		t.Errorf("splitLocalOrigin = false, want true")
+	}
+	if !cfg.consecLOEnabled {
+		t.Errorf("consecLOEnabled = false, want true")
+	}
+	if cfg.consecutiveLO != 9 {
+		t.Errorf("consecutiveLO = %d, want 9", cfg.consecutiveLO)
+	}
+	if cfg.enforcingLO != 60 {
+		t.Errorf("enforcingLO = %d, want 60", cfg.enforcingLO)
+	}
+}
+
+func TestParseOutlierDetection_GatewayLocalOrigin_Defaults(t *testing.T) {
+	c := &clusterv3.Cluster{OutlierDetection: &clusterv3.OutlierDetection{}}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config for empty outlier_detection")
+	}
+	// gateway: absent ⇒ threshold 5 + enabled + enforcing default 0.
+	if cfg.consecutiveGw != 5 {
+		t.Errorf("consecutiveGw = %d, want 5", cfg.consecutiveGw)
+	}
+	if !cfg.consecGwEnabled {
+		t.Errorf("consecGwEnabled = false, want true (absent ⇒ default 5 enabled)")
+	}
+	if cfg.enforcingGw != 0 {
+		t.Errorf("enforcingGw = %d, want 0 (default detect-only)", cfg.enforcingGw)
+	}
+	// split: absent ⇒ false.
+	if cfg.splitLocalOrigin {
+		t.Errorf("splitLocalOrigin = true, want false (default)")
+	}
+	// local-origin: absent ⇒ threshold 5 + enabled + enforcing default 100.
+	if cfg.consecutiveLO != 5 {
+		t.Errorf("consecutiveLO = %d, want 5", cfg.consecutiveLO)
+	}
+	if !cfg.consecLOEnabled {
+		t.Errorf("consecLOEnabled = false, want true (absent ⇒ default 5 enabled)")
+	}
+	if cfg.enforcingLO != 100 {
+		t.Errorf("enforcingLO = %d, want 100 (default)", cfg.enforcingLO)
+	}
+}
+
+func TestParseOutlierDetection_GatewayExplicitZeroDisables(t *testing.T) {
+	c := &clusterv3.Cluster{
+		OutlierDetection: &clusterv3.OutlierDetection{
+			ConsecutiveGatewayFailure: wrapperspb.UInt32(0),
+		},
+	}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if cfg.consecGwEnabled {
+		t.Errorf("consecGwEnabled = true, want false (explicit 0 ⇒ detector OFF)")
+	}
+	if cfg.consecutiveGw != 0 {
+		t.Errorf("consecutiveGw = %d, want 0", cfg.consecutiveGw)
+	}
+}
+
+func TestParseOutlierDetection_LocalOriginExplicitZeroDisables(t *testing.T) {
+	c := &clusterv3.Cluster{
+		OutlierDetection: &clusterv3.OutlierDetection{
+			ConsecutiveLocalOriginFailure: wrapperspb.UInt32(0),
+		},
+	}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if cfg.consecLOEnabled {
+		t.Errorf("consecLOEnabled = true, want false (explicit 0 ⇒ detector OFF)")
+	}
+	if cfg.consecutiveLO != 0 {
+		t.Errorf("consecutiveLO = %d, want 0", cfg.consecutiveLO)
+	}
+}
+
+func TestParseOutlierDetection_SplitFlag(t *testing.T) {
+	c := &clusterv3.Cluster{
+		OutlierDetection: &clusterv3.OutlierDetection{
+			SplitExternalLocalOriginErrors: true,
+		},
+	}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if !cfg.splitLocalOrigin {
+		t.Errorf("splitLocalOrigin = false, want true")
+	}
+}
+
+func TestParseOutlierDetection_GatewayLocalOriginRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		od   *clusterv3.OutlierDetection
+		want string
+	}{
+		{
+			name: "enforcing_consecutive_gateway_failure>100",
+			od:   &clusterv3.OutlierDetection{EnforcingConsecutiveGatewayFailure: wrapperspb.UInt32(101)},
+			want: `cluster: "c": outlier_detection: enforcing_consecutive_gateway_failure: value must be less than or equal to 100`,
+		},
+		{
+			name: "enforcing_consecutive_local_origin_failure>100",
+			od:   &clusterv3.OutlierDetection{EnforcingConsecutiveLocalOriginFailure: wrapperspb.UInt32(101)},
+			want: `cluster: "c": outlier_detection: enforcing_consecutive_local_origin_failure: value must be less than or equal to 100`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseOutlierDetection(&clusterv3.Cluster{OutlierDetection: tc.od}, "c")
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if err.Error() != tc.want {
+				t.Errorf("error = %q, want %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
 // --- outlierDetector unit tests (Task 5) ---
 
 // mkOutlierEndpoints builds n endpoints 127.0.0.1:9000..9000+n-1.
@@ -203,12 +370,12 @@ func TestOutlierDetector_EjectsAfterNConsecutive5xx(t *testing.T) {
 	f := newDetectorFixture(cfgConsec5xx(5), eps, panicRoll) // enforcing=100 short-circuits
 	ep := eps[0]
 	for i := 0; i < 4; i++ {
-		f.d.record(ep, 503)
+		f.d.record(ep, 503, false)
 		if !f.ch.available(ep) {
 			t.Fatalf("ejected after %d 5xx, want eject only on the 5th", i+1)
 		}
 	}
-	f.d.record(ep, 503) // the 5th -> eject
+	f.d.record(ep, 503, false) // the 5th -> eject
 	if f.ch.available(ep) {
 		t.Fatal("host still available after 5 consecutive 5xx; want ejected")
 	}
@@ -231,11 +398,11 @@ func TestOutlierDetector_2xxMidStreakResets(t *testing.T) {
 	f := newDetectorFixture(cfgConsec5xx(5), eps, panicRoll)
 	ep := eps[0]
 	for i := 0; i < 4; i++ {
-		f.d.record(ep, 500)
+		f.d.record(ep, 500, false)
 	}
-	f.d.record(ep, 200) // reset
+	f.d.record(ep, 200, false) // reset
 	for i := 0; i < 4; i++ {
-		f.d.record(ep, 500)
+		f.d.record(ep, 500, false)
 	}
 	if !f.ch.available(ep) {
 		t.Fatal("host ejected despite a 2xx breaking the streak")
@@ -257,7 +424,7 @@ func TestOutlierDetector_Consec5xxDisabledNeverEjects(t *testing.T) {
 	f := newDetectorFixture(cfg, eps, panicRoll)
 	ep := eps[0]
 	for i := 0; i < 50; i++ {
-		f.d.record(ep, 503)
+		f.d.record(ep, 503, false)
 	}
 	if !f.ch.available(ep) {
 		t.Fatal("host ejected despite consec5xx detector disabled")
@@ -279,7 +446,7 @@ func TestOutlierDetector_CapOverflowBlocksThenAllows(t *testing.T) {
 	f := newDetectorFixture(cfg, eps, panicRoll)
 	ep := eps[0]
 	for i := 0; i < 3; i++ {
-		f.d.record(ep, 503)
+		f.d.record(ep, 503, false)
 	}
 	if !f.ch.available(ep) {
 		t.Fatal("host ejected despite cap overflow (1/3 = 33.33% > cap 33)")
@@ -299,7 +466,7 @@ func TestOutlierDetector_CapOverflowBlocksThenAllows(t *testing.T) {
 	cfg2.maxEjectionPct = 34
 	f2 := newDetectorFixture(cfg2, eps, panicRoll)
 	for i := 0; i < 3; i++ {
-		f2.d.record(eps[0], 503)
+		f2.d.record(eps[0], 503, false)
 	}
 	if f2.ch.available(eps[0]) {
 		t.Fatal("host not ejected with cap=34 (33 <= 34)")
@@ -319,7 +486,7 @@ func TestOutlierDetector_EnforceRoll(t *testing.T) {
 		cfg.enforcing5xx = 50
 		f := newDetectorFixture(cfg, eps, func() uint32 { return 49 })
 		for i := 0; i < 3; i++ {
-			f.d.record(ep, 503)
+			f.d.record(ep, 503, false)
 		}
 		if f.ch.available(ep) {
 			t.Fatal("roll=49 < enforcing=50 should enforce (eject)")
@@ -335,7 +502,7 @@ func TestOutlierDetector_EnforceRoll(t *testing.T) {
 		cfg.enforcing5xx = 50
 		f := newDetectorFixture(cfg, eps, func() uint32 { return 50 })
 		for i := 0; i < 3; i++ {
-			f.d.record(ep, 503)
+			f.d.record(ep, 503, false)
 		}
 		if !f.ch.available(ep) {
 			t.Fatal("roll=50 >= enforcing=50 should be detect-only (not ejected)")
@@ -357,7 +524,7 @@ func TestOutlierDetector_EnforceRoll(t *testing.T) {
 		cfg.enforcing5xx = 0
 		f := newDetectorFixture(cfg, eps, panicRoll)
 		for i := 0; i < 3; i++ {
-			f.d.record(ep, 503)
+			f.d.record(ep, 503, false)
 		}
 		if !f.ch.available(ep) {
 			t.Fatal("enforcing=0 should never eject")
@@ -373,7 +540,7 @@ func TestOutlierDetector_EnforceRoll(t *testing.T) {
 		cfg.enforcing5xx = 100
 		f := newDetectorFixture(cfg, eps, panicRoll)
 		for i := 0; i < 3; i++ {
-			f.d.record(ep, 503)
+			f.d.record(ep, 503, false)
 		}
 		if f.ch.available(ep) {
 			t.Fatal("enforcing=100 should always eject")
@@ -386,7 +553,7 @@ func TestOutlierDetector_AlreadyEjected(t *testing.T) {
 	f := newDetectorFixture(cfgConsec5xx(3), eps, panicRoll)
 	ep := eps[0]
 	for i := 0; i < 3; i++ {
-		f.d.record(ep, 503)
+		f.d.record(ep, 503, false)
 	}
 	if f.ch.available(ep) {
 		t.Fatal("host not ejected after 3 5xx")
@@ -402,7 +569,7 @@ func TestOutlierDetector_AlreadyEjected(t *testing.T) {
 
 	// Further 5xx: re-hits the threshold (detected re-increments per the sketch),
 	// but the h.ejected.Load() guard returns before re-eject -> no new enforced.
-	f.d.record(ep, 503)
+	f.d.record(ep, 503, false)
 	if got := f.d.ejectionsActive.Load(); got != 1 {
 		t.Errorf("ejections_active = %d after further 5xx, want still 1 (no re-eject)", got)
 	}
@@ -424,7 +591,7 @@ func TestOutlierDetector_ConcurrentEjectExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 10; i++ {
-				f.d.record(ep, 503)
+				f.d.record(ep, 503, false)
 			}
 		}()
 	}
@@ -437,6 +604,176 @@ func TestOutlierDetector_ConcurrentEjectExactlyOnce(t *testing.T) {
 	}
 	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
 		t.Errorf("ejections_enforced_total = %d, want exactly 1", got)
+	}
+}
+
+// --- Task 3: gateway detector (gateway-first ordering) ---
+
+// cfgGateway builds a cfg with the gateway detector enabled at gwThreshold
+// (enforcing enfGw) and the consecutive_5xx detector enabled at fiveXxThreshold
+// (enforcing 100). maxEjectionPct=100, base=30s.
+func cfgGateway(gwThreshold, enfGw, fiveXxThreshold uint32) outlierConfig {
+	return outlierConfig{
+		consec5xxEnabled: true,
+		consecutive5xx:   fiveXxThreshold,
+		baseEjectionTime: 30 * time.Second,
+		maxEjectionPct:   100,
+		enforcing5xx:     100,
+		consecGwEnabled:  true,
+		consecutiveGw:    gwThreshold,
+		enforcingGw:      enfGw,
+	}
+}
+
+// withGatewayHandles assigns the +2 gateway stat handles onto the detector from
+// a fresh registry (Task 3 adds them to the struct; Task 5 allocates them in
+// registerStats — so unit tests inject them directly to observe the counts).
+func (f detectorFixture) withGatewayHandles() detectorFixture {
+	reg := stats.NewRegistry()
+	f.d.ejectionsDetectedGw = reg.NewCounter("outlier_detection.ejections_detected_consecutive_gateway_failure")
+	f.d.ejectionsEnforcedGw = reg.NewCounter("outlier_detection.ejections_enforced_consecutive_gateway_failure")
+	return f
+}
+
+// TestOutlierDetector_GatewayEjectsFirst: N consecutive 503 with
+// enforcing_consecutive_gateway_failure=100 ejects via the gateway detector and
+// bumps the gateway counters + the cross-detector double-count, AND leaves
+// detected_5xx == 0 (the gateway-first short-circuit; both thresholds equal).
+func TestOutlierDetector_GatewayEjectsFirst(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	f := newDetectorFixture(cfgGateway(3, 100, 3), eps, panicRoll).withGatewayHandles()
+	ep := eps[0]
+	for i := 0; i < 3; i++ {
+		f.d.record(ep, 503, false)
+	}
+	if f.ch.available(ep) {
+		t.Fatal("host not ejected after 3 consecutive 503 (gateway detector)")
+	}
+	if got := f.d.ejectionsDetectedGw.Load(); got != 1 {
+		t.Errorf("ejections_detected_consecutive_gateway_failure = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedGw.Load(); got != 1 {
+		t.Errorf("ejections_enforced_consecutive_gateway_failure = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
+		t.Errorf("ejections_enforced_total = %d, want 1 (double-count)", got)
+	}
+	if got := f.d.ejectionsActive.Load(); got != 1 {
+		t.Errorf("ejections_active = %d, want 1", got)
+	}
+	// The load-bearing invariant: gateway-first short-circuit ⇒ the 5xx detector
+	// never fires this call.
+	if got := f.d.ejectionsDetected5xx.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_5xx = %d, want 0 (gateway-first short-circuit)", got)
+	}
+	if got := f.d.ejectionsEnforced5xx.Load(); got != 0 {
+		t.Errorf("ejections_enforced_consecutive_5xx = %d, want 0 (gateway-first short-circuit)", got)
+	}
+}
+
+// TestOutlierDetector_GatewayDetectOnlyFallsThroughTo5xx: gateway detect-only
+// (enforcing_gateway=0) bumps detected_gateway then falls through to the 5xx
+// detector, which ejects (the 0069 behavior).
+func TestOutlierDetector_GatewayDetectOnlyFallsThroughTo5xx(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	// gateway enforcing=0 (detect-only); 5xx threshold 3 enforcing 100.
+	f := newDetectorFixture(cfgGateway(3, 0, 3), eps, panicRoll).withGatewayHandles()
+	ep := eps[0]
+	for i := 0; i < 3; i++ {
+		f.d.record(ep, 503, false)
+	}
+	if f.ch.available(ep) {
+		t.Fatal("host not ejected after 3 consecutive 503 (5xx fall-through)")
+	}
+	if got := f.d.ejectionsDetectedGw.Load(); got != 1 {
+		t.Errorf("ejections_detected_consecutive_gateway_failure = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedGw.Load(); got != 0 {
+		t.Errorf("ejections_enforced_consecutive_gateway_failure = %d, want 0 (detect-only)", got)
+	}
+	// fell through: the 5xx detector detected AND enforced the eject.
+	if got := f.d.ejectionsDetected5xx.Load(); got != 1 {
+		t.Errorf("ejections_detected_consecutive_5xx = %d, want 1 (fall-through)", got)
+	}
+	if got := f.d.ejectionsEnforced5xx.Load(); got != 1 {
+		t.Errorf("ejections_enforced_consecutive_5xx = %d, want 1 (fall-through eject)", got)
+	}
+	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
+		t.Errorf("ejections_enforced_total = %d, want 1", got)
+	}
+}
+
+// TestOutlierDetector_NonGateway5xxResetsGwStreak: a 500 (non-gateway 5xx)
+// resets consecGw and counts only via consec5xx — never ejects via gateway.
+func TestOutlierDetector_NonGateway5xxResetsGwStreak(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	// gateway threshold 3 enforcing 100; 5xx threshold 5 enforcing 100.
+	f := newDetectorFixture(cfgGateway(3, 100, 5), eps, panicRoll).withGatewayHandles()
+	ep := eps[0]
+	for i := 0; i < 4; i++ {
+		f.d.record(ep, 500, false) // non-gateway 5xx: only consec5xx accrues
+	}
+	if !f.ch.available(ep) {
+		t.Fatal("host ejected on non-gateway 5xx (gateway must not fire on 500)")
+	}
+	if got := f.d.ejectionsDetectedGw.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_gateway_failure = %d, want 0 (500 is not gateway)", got)
+	}
+	if got := f.d.ejectionsDetected5xx.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_5xx = %d, want 0 (only 4 of 5)", got)
+	}
+	f.d.record(ep, 500, false) // the 5th 500 -> 5xx eject
+	if f.ch.available(ep) {
+		t.Fatal("host not ejected after 5 consecutive 500 (consec5xx)")
+	}
+	if got := f.d.ejectionsEnforced5xx.Load(); got != 1 {
+		t.Errorf("ejections_enforced_consecutive_5xx = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedGw.Load(); got != 0 {
+		t.Errorf("ejections_enforced_consecutive_gateway_failure = %d, want 0", got)
+	}
+}
+
+// TestOutlierDetector_NonGatewayBreaksGwStreakMidway: 503,503,500 then 503,503
+// must NOT gateway-eject at threshold 3 — the 500 resets consecGw.
+func TestOutlierDetector_NonGatewayBreaksGwStreakMidway(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	// gateway 3 enforcing 100; 5xx disabled-via-high-threshold (100) so only the
+	// gateway detector can eject within this window.
+	f := newDetectorFixture(cfgGateway(3, 100, 100), eps, panicRoll).withGatewayHandles()
+	ep := eps[0]
+	f.d.record(ep, 503, false)
+	f.d.record(ep, 503, false)
+	f.d.record(ep, 500, false) // breaks the gateway streak (consecGw -> 0)
+	f.d.record(ep, 503, false)
+	f.d.record(ep, 503, false)
+	if !f.ch.available(ep) {
+		t.Fatal("host ejected: the 500 should have reset consecGw below threshold 3")
+	}
+	if got := f.d.ejectionsDetectedGw.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_gateway_failure = %d, want 0 (streak broken)", got)
+	}
+}
+
+// TestOutlierDetector_2xxResetsBothStreaks: a 2xx resets both consec5xx and
+// consecGw.
+func TestOutlierDetector_2xxResetsBothStreaks(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	f := newDetectorFixture(cfgGateway(3, 100, 3), eps, panicRoll).withGatewayHandles()
+	ep := eps[0]
+	f.d.record(ep, 503, false)
+	f.d.record(ep, 503, false)
+	f.d.record(ep, 200, false) // reset both
+	f.d.record(ep, 503, false)
+	f.d.record(ep, 503, false)
+	if !f.ch.available(ep) {
+		t.Fatal("host ejected: the 2xx should have reset both streaks below threshold 3")
+	}
+	if got := f.d.ejectionsDetectedGw.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_gateway_failure = %d, want 0", got)
+	}
+	if got := f.d.ejectionsDetected5xx.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_5xx = %d, want 0", got)
 	}
 }
 
@@ -459,6 +796,156 @@ func TestManager_OutlierOnlyBuildsHealthRegistry(t *testing.T) {
 	}
 	if cl.health == nil {
 		t.Fatal("expected non-nil health registry for outlier-detection-only cluster")
+	}
+}
+
+// --- Task 4: local-origin detector (split_external_local_origin_errors) ---
+
+// cfgLocalOrigin builds a cfg with split enabled, the local-origin detector
+// enabled at loThreshold (enforcing enfLO), and the gateway + 5xx detectors
+// enabled at high thresholds (so only the local-origin detector can fire within
+// the test windows). maxEjectionPct=100, base=30s.
+func cfgLocalOrigin(loThreshold, enfLO uint32) outlierConfig {
+	return outlierConfig{
+		consec5xxEnabled: true,
+		consecutive5xx:   100,
+		baseEjectionTime: 30 * time.Second,
+		maxEjectionPct:   100,
+		enforcing5xx:     100,
+		consecGwEnabled:  true,
+		consecutiveGw:    100,
+		enforcingGw:      100,
+		splitLocalOrigin: true,
+		consecLOEnabled:  true,
+		consecutiveLO:    loThreshold,
+		enforcingLO:      enfLO,
+	}
+}
+
+// withLocalOriginHandles assigns the +2 local-origin stat handles onto the
+// detector from a fresh registry (Task 4 adds them to the struct; Task 5
+// allocates them in registerStats — so unit tests inject them directly).
+func (f detectorFixture) withLocalOriginHandles() detectorFixture {
+	reg := stats.NewRegistry()
+	f.d.ejectionsDetectedLO = reg.NewCounter("outlier_detection.ejections_detected_consecutive_local_origin_failure")
+	f.d.ejectionsEnforcedLO = reg.NewCounter("outlier_detection.ejections_enforced_consecutive_local_origin_failure")
+	return f
+}
+
+// TestOutlierDetector_LocalOriginEjectsViaLODetector: split=true, N consecutive
+// local-origin failures (record(ep, 502, true)) eject via the local-origin
+// detector and bump the LO counters + the cross-detector double-count, AND leave
+// the external detectors (5xx + gateway) at 0 (split routes local-origin away).
+func TestOutlierDetector_LocalOriginEjectsViaLODetector(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	f := newDetectorFixture(cfgLocalOrigin(3, 100), eps, panicRoll).withGatewayHandles().withLocalOriginHandles()
+	ep := eps[0]
+	for i := 0; i < 2; i++ {
+		f.d.record(ep, 502, true)
+		if !f.ch.available(ep) {
+			t.Fatalf("ejected after %d local-origin failures, want eject only on the 3rd", i+1)
+		}
+	}
+	f.d.record(ep, 502, true) // the 3rd -> eject
+	if f.ch.available(ep) {
+		t.Fatal("host still available after 3 consecutive local-origin failures; want ejected")
+	}
+	if got := f.d.ejectionsDetectedLO.Load(); got != 1 {
+		t.Errorf("ejections_detected_consecutive_local_origin_failure = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedLO.Load(); got != 1 {
+		t.Errorf("ejections_enforced_consecutive_local_origin_failure = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
+		t.Errorf("ejections_enforced_total = %d, want 1 (double-count)", got)
+	}
+	if got := f.d.ejectionsActive.Load(); got != 1 {
+		t.Errorf("ejections_active = %d, want 1", got)
+	}
+	// split routes local-origin AWAY from the external detectors.
+	if got := f.d.ejectionsDetected5xx.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_5xx = %d, want 0 (split routes LO away)", got)
+	}
+	if got := f.d.ejectionsDetectedGw.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_gateway_failure = %d, want 0 (split routes LO away)", got)
+	}
+}
+
+// TestOutlierDetector_LocalOriginSuccessResetsStreak: split=true, a successful
+// external response (record(ep, 200, false)) mid-streak resets consecLO (the
+// connection succeeded), so the LO detector does not eject after fewer than N
+// more failures.
+func TestOutlierDetector_LocalOriginSuccessResetsStreak(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	f := newDetectorFixture(cfgLocalOrigin(3, 100), eps, panicRoll).withGatewayHandles().withLocalOriginHandles()
+	ep := eps[0]
+	f.d.record(ep, 502, true)
+	f.d.record(ep, 502, true)
+	f.d.record(ep, 200, false) // a completed external response ⇒ resets consecLO
+	f.d.record(ep, 502, true)
+	f.d.record(ep, 502, true)
+	if !f.ch.available(ep) {
+		t.Fatal("host ejected: the 200 should have reset consecLO below threshold 3")
+	}
+	if got := f.d.ejectionsDetectedLO.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_local_origin_failure = %d, want 0 (streak reset)", got)
+	}
+}
+
+// TestOutlierDetector_LocalOriginSplitFalseDelegatesToGateway: split=false
+// (default), N consecutive local-origin failures with a gateway-class code
+// (503) eject via the gateway/5xx detectors (the local-reply code is mapped to a
+// gateway-class 5xx), and the local-origin detector stays inactive
+// (detected_LO == 0).
+func TestOutlierDetector_LocalOriginSplitFalseDelegatesToGateway(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	// split=false: gateway enabled at 3 enforcing 100; 5xx at 3 enforcing 100.
+	cfg := cfgGateway(3, 100, 3)
+	cfg.splitLocalOrigin = false
+	cfg.consecLOEnabled = true
+	cfg.consecutiveLO = 3
+	cfg.enforcingLO = 100
+	f := newDetectorFixture(cfg, eps, panicRoll).withGatewayHandles().withLocalOriginHandles()
+	ep := eps[0]
+	for i := 0; i < 3; i++ {
+		f.d.record(ep, 503, true) // local-origin failure mapped to gateway-class 5xx
+	}
+	if f.ch.available(ep) {
+		t.Fatal("host not ejected after 3 local-origin failures (split=false delegates to gateway)")
+	}
+	// delegated to the gateway/5xx detectors (gateway-first ordering).
+	if got := f.d.ejectionsDetectedGw.Load(); got != 1 {
+		t.Errorf("ejections_detected_consecutive_gateway_failure = %d, want 1 (split=false delegation)", got)
+	}
+	if got := f.d.ejectionsEnforcedGw.Load(); got != 1 {
+		t.Errorf("ejections_enforced_consecutive_gateway_failure = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
+		t.Errorf("ejections_enforced_total = %d, want 1", got)
+	}
+	// the local-origin detector is inactive under split=false.
+	if got := f.d.ejectionsDetectedLO.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_local_origin_failure = %d, want 0 (LO inactive under split=false)", got)
+	}
+}
+
+// TestOutlierDetector_LocalOriginThresholdZeroNeverEjects: split=true with
+// consecutive_local_origin_failure == 0 (consecLOEnabled=false) never ejects on
+// local-origin failures.
+func TestOutlierDetector_LocalOriginThresholdZeroNeverEjects(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	cfg := cfgLocalOrigin(0, 100)
+	cfg.consecLOEnabled = false // explicit 0 ⇒ detector OFF
+	f := newDetectorFixture(cfg, eps, panicRoll).withGatewayHandles().withLocalOriginHandles()
+	ep := eps[0]
+	for i := 0; i < 50; i++ {
+		f.d.record(ep, 502, true)
+	}
+	if !f.ch.available(ep) {
+		t.Fatal("host ejected despite the local-origin detector disabled (threshold 0)")
+	}
+	if got := f.d.ejectionsDetectedLO.Load(); got != 0 {
+		t.Errorf("ejections_detected_consecutive_local_origin_failure = %d, want 0 (disabled)", got)
 	}
 }
 
@@ -523,8 +1010,9 @@ func TestRecordUpstreamResult_EjectsAfterConsecutive5xx(t *testing.T) {
 
 // --- Task 8: outlier_detection stat registration ---
 
-// outlierStatNames is the exact 5-name scoped roster registered by
-// registerClusterMetrics for a cluster named "od_stats".
+// outlierStatNames is the exact 9-name scoped roster registered by
+// registerClusterMetrics for a cluster named "od_stats" (the 40.1 five plus the
+// +4 gateway/local-origin detector counters added unconditionally at Task 5).
 func outlierStatNames() []string {
 	const p = "cluster.od_stats.outlier_detection."
 	return []string{
@@ -533,11 +1021,15 @@ func outlierStatNames() []string {
 		p + "ejections_overflow",
 		p + "ejections_detected_consecutive_5xx",
 		p + "ejections_enforced_consecutive_5xx",
+		p + "ejections_detected_consecutive_gateway_failure",
+		p + "ejections_enforced_consecutive_gateway_failure",
+		p + "ejections_detected_consecutive_local_origin_failure",
+		p + "ejections_enforced_consecutive_local_origin_failure",
 	}
 }
 
 // TestRegisterOutlierStats_Present asserts a cluster WITH outlier_detection
-// registers EXACTLY the 5 fully-qualified outlier stat names and injects every
+// registers the 9 fully-qualified outlier stat names and injects every
 // handle onto the detector (and the gauge onto the shared clusterHealth).
 func TestRegisterOutlierStats_Present(t *testing.T) {
 	c := mkStaticCluster("od_stats",
@@ -562,12 +1054,17 @@ func TestRegisterOutlierStats_Present(t *testing.T) {
 			t.Errorf("expected metric %q to be registered", name)
 		}
 	}
-	// All 5 detector handles must be injected (non-nil).
+	// All 9 detector handles must be injected (non-nil) — the 40.1 five plus the
+	// +4 gateway/local-origin counters registered unconditionally at Task 5.
 	if cl.outlier.ejectionsActive == nil ||
 		cl.outlier.ejectionsEnforcedTotal == nil ||
 		cl.outlier.ejectionsOverflow == nil ||
 		cl.outlier.ejectionsDetected5xx == nil ||
-		cl.outlier.ejectionsEnforced5xx == nil {
+		cl.outlier.ejectionsEnforced5xx == nil ||
+		cl.outlier.ejectionsDetectedGw == nil ||
+		cl.outlier.ejectionsEnforcedGw == nil ||
+		cl.outlier.ejectionsDetectedLO == nil ||
+		cl.outlier.ejectionsEnforcedLO == nil {
 		t.Fatal("detector stat handles must all be injected (non-nil)")
 	}
 	// The gauge MUST be the SAME instance on the detector and the clusterHealth
@@ -578,7 +1075,7 @@ func TestRegisterOutlierStats_Present(t *testing.T) {
 }
 
 // TestRegisterOutlierStats_Absent asserts a cluster WITHOUT outlier_detection
-// registers NONE of the 5 outlier stat names (stat surface unchanged).
+// registers NONE of the 9 outlier stat names (stat surface unchanged).
 func TestRegisterOutlierStats_Absent(t *testing.T) {
 	c := mkStaticCluster("od_stats", mkLbEndpoint("127.0.0.1", 9400))
 	reg := stats.NewRegistry()

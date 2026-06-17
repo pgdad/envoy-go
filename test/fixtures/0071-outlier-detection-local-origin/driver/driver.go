@@ -1,97 +1,99 @@
-// Package driver registers the 0069-outlier-detection-consecutive-5xx cross-side
-// differential fixture (phase 40.1 SPEC §8 / PLAN Task 10).
+// Package driver registers the 0071-outlier-detection-local-origin cross-side
+// differential fixture (phase 40.2 SPEC §10 / PLAN Task 8).
 //
 // This is a CROSS-SIDE [http_connection_manager + router] fixture over ONE
-// cluster c_od (lb_policy ROUND_ROBIN) with PASSIVE outlier detection
-// (consecutive_5xx) over THREE endpoints — 2 HEALTHY HTTPEcho backends + 1
-// always-503 host (the HTTP503Responder, BackendKind 35). It proves that an
-// upstream host that returns consecutive 5xx responses is DETECTED by passive
-// outlier detection and EJECTED from LB rotation on BOTH the envoy-go (subject)
-// side and the reference-Envoy side.
+// cluster c_lo (lb_policy ROUND_ROBIN) with PASSIVE outlier detection over THREE
+// endpoints — 2 LIVE HTTPEcho backends + 1 DEAD host (a host:port with no
+// listener → connect refused). With split_external_local_origin_errors: true,
+// each connect-refused to the dead host is a LOCAL-ORIGIN failure
+// (LocalOriginErr: true), so the consecutive_local_origin_failure detector ejects
+// it after consecutive_local_origin_failure failures — on BOTH the envoy-go
+// (subject) side and the reference-Envoy side.
 //
-// # Topology: 2 HEALTHY + 1 ALWAYS-503 (all runner-spawned)
+// # The split (the load-bearing assertion)
 //
-//   - backend0 → c_od endpoint 0 (HTTPEcho; 200s every path; serves load)
-//   - backend1 → c_od endpoint 1 (HTTPEcho; 200s every path; serves load)
-//   - backend2 → c_od endpoint 2 (HTTP503Responder; always 503; gets ejected)
+// split_external_local_origin_errors: true routes the dead-host connect-refused
+// to the LOCAL-ORIGIN detector ONLY. The consecutive_5xx and consecutive_gateway_
+// failure detectors therefore NEVER fire over the eject-drive — the fixture
+// asserts, cross-side, that ejections_detected_consecutive_5xx == 0 while the
+// local-origin counters fire. If the split branch regressed and the local-origin
+// failure were instead routed to the gateway/5xx detector, that counter would be
+// present > 0 and the equality would bite (the assertEq absent-as-0 accommodation
+// only swallows ABSENT, not present > 0).
 //
-// Unlike 0066 (whose dead host is an unbound port), ALL THREE hosts here are
-// runner-spawned backends — the 503 host is a live listener that answers 503.
-// The runner selects it via PerHostBackendKind (BackendKindAt(2) → HTTP503
-// Responder). BackendCount() is 3.
+// # Topology: 2 LIVE backends (runner-spawned) + 1 DEAD host (unbound port)
+//
+//   - backend0 → c_lo endpoint 0 (LIVE; HTTPEcho 200s every path; serves load)
+//   - backend1 → c_lo endpoint 1 (LIVE; HTTPEcho 200s every path; serves load)
+//   - deadPort → c_lo endpoint 2 (DEAD; no listener → connect refused → LocalOriginErr)
+//
+// The DEAD host is NOT a runner backend (the runner spawns BackendCount()==2 live
+// HTTPEcho backends — the 0066 shape, NO PerHostBackendKind). The driver allocates
+// a host port, binds it to learn the number, then CLOSES the listener so the port
+// stays unbound for the run — both sides reference that same port number
+// (reference via host.docker.internal:<dead>, subject via 127.0.0.1:<dead>), and a
+// connect to it is refused on both sides. On the subject side the refused connect
+// reaches the H1 AcquireH1 connect-failure seam (Task 6) → RecordUpstreamResult
+// with LocalOriginErr: true → the local-origin detector.
 //
 // # Cluster shape (both sides)
 //
-//		c_od: lb_policy ROUND_ROBIN, 3 endpoints, outlier_detection: {
-//		        consecutive_5xx: 5, interval: 10s,
-//		        base_ejection_time: 30s, max_ejection_percent: 100 }
+//		c_lo: lb_policy ROUND_ROBIN, 3 endpoints, outlier_detection: {
+//		        consecutive_local_origin_failure: 5,
+//		        enforcing_consecutive_local_origin_failure: 100,
+//		        split_external_local_origin_errors: true,
+//		        interval: 10s, base_ejection_time: 30s, max_ejection_percent: 100 }
 //
-//	  - Subject (envoy-go): type STATIC, endpoints = 127.0.0.1:<h0,h1,h2>
-//	    (envoy-go's buildCluster ONLY supports STATIC).
+//	  - Subject (envoy-go): type STATIC, endpoints = 127.0.0.1:<h0,h1,dead>.
 //	  - Reference (Envoy): type STRICT_DNS, endpoints = host.docker.internal:<h0,
-//	    h1,h2> (the 0066 reference shape; the reference MUST be STRICT_DNS).
+//	    h1,dead> (the 0066/0070 reference shape; the reference MUST be STRICT_DNS).
 //
-// # The driver: ejection-drive + poll-to-converge + warmup (the determinism)
-//
-// The runner's hooks are DriveReference/DriveSubject (the byte-equiv stream, run
-// FIRST) then AssertStats (run LAST, holding BOTH admin addrs). Because the
-// ejection must be driven, observed, and the worker rotation drained BEFORE the
-// strict measured phase, ALL of it runs inside AssertStats (the only hook
-// holding both admin addrs). The Drive hooks STASH their listener addrs and
-// return a fixed, address-independent byte stream ("READY\n") for the runner's
-// CompareBytes gate.
+// # The driver: ejection-drive + poll-to-converge + warmup (the 0070 template)
 //
 //	AssertStats:
-//	 1. Ejection drive: send ejectDriveRequests 503-TOLERANT GET / round-robin to
-//	    each side's listener. Under strict round-robin over 3 hosts, host2 (the
-//	    503) is picked every 3rd request; consec5xx is PER-HOST and is only reset
-//	    by a 2xx FROM host2 (which never comes), so host2 accrues consecutive 5xx
-//	    until it crosses consecutive_5xx (5) and is ejected.
+//	 1. Ejection drive: send ejectDriveRequests 503/502-TOLERANT GET / round-robin
+//	    to each side's listener. Under strict round-robin over 3 endpoints, the
+//	    dead host is picked every 3rd request; consecLO is PER-HOST and only resets
+//	    on a COMPLETED external response from the dead host (which never comes), so
+//	    it accrues consecutive local-origin failures until it crosses
+//	    consecutive_local_origin_failure (5) and is ejected. (Requests to the dead
+//	    host return 503/502 to the client — tolerated during the drive.)
 //	 2. Poll /stats on BOTH sides until
-//	    cluster.c_od.outlier_detection.ejections_active == 1 (deadline 30s, poll
-//	    200ms; NO fixed sleep — fail clearly with the last value on timeout).
-//	 3. Warmup: after the gauge reads 1, send 503-tolerant requests until
-//	    warmupStable CONSECUTIVE 200s prove the worker rotation has dropped host2,
-//	    on BOTH sides (closes the main→worker propagation window, the 0066
-//	    reference_health_check_propagation_warmup mechanism).
+//	    cluster.c_lo.outlier_detection.ejections_active == 1 (deadline,
+//	    poll 200ms; NO fixed sleep — fail clearly with the last value on timeout).
+//	 3. Warmup: after the gauge reads 1, send 5xx-tolerant requests until
+//	    warmupStable CONSECUTIVE 200s prove the worker rotation has dropped the dead
+//	    host, on BOTH sides (closes the main→worker propagation window).
 //	 4. Measured load: baseline the per-request counters post-warmup, send n GET /
 //	    on each side; assert (delta) upstream_rq_2xx == n, upstream_rq_5xx == 0,
-//	    and every body is backend-0:/backend-1: (NEVER backend-2: — the ejected
-//	    503 host serves nothing in the measured phase).
+//	    every body backend-0:/backend-1: (NEVER the dead host).
 //	 5. Cross-side stat parity (both sides): ejections_active == 1,
-//	    ejections_enforced_total >= 1, ejections_enforced_consecutive_5xx >= 1,
-//	    ejections_detected_consecutive_5xx >= 1; AND (phase 40.2, AMEND-OD2-1)
-//	    ejections_detected_consecutive_gateway_failure >= 1 — the gateway detector
-//	    is active-by-default + detect-only, so host2's 503s trip it on both sides
-//	    without ejecting via the gateway path (the 5xx detector ejects); plus
-//	    upstream_rq_total > 0 reference (decode-ran guard). The recovery / un-eject
-//	    arm is DEFERRED (AMEND-OD1).
+//	    ejections_enforced_total >= 1, ejections_detected_consecutive_local_origin_
+//	    failure >= 1, ejections_enforced_consecutive_local_origin_failure >= 1, AND
+//	    ejections_detected_consecutive_5xx == 0 (split=true routes the local-origin
+//	    failures away from the 5xx/gateway detectors). upstream_rq_total > 0
+//	    reference (decode-ran guard). The recovery / un-eject arm is DEFERRED.
 //
 // # Cross-references
 //
-//   - phase 40.1 SPEC §8 / PLAN Task 10 (the fixture design).
-//   - 0066-health-check-http (the cross-side poll-to-converge + warmup + delta-
-//     counter template: reference STRICT_DNS / host.docker.internal, subject
-//     STATIC / 127.0.0.1; scrapeStats; the Bootstrap/Config builders;
-//     backendIdxFromBody host attribution).
-//   - reference_health_check_propagation_warmup (poll-the-gauge + the warmup-
-//     until-K-consecutive-200s gate + delta per-request counters).
-//   - reference_docker_probe_bridge_network (shared bridge + STRICT_DNS
-//     hostnames; the "decode ran" guard verifies the reference forwarded
-//     traffic).
-//   - reference_differential_run_selector (target -run 'TestDifferential/0069').
-//   - reference_fixture_workload_constant_desync (counts single-sourced — D-S40.1-4).
-//   - reference_differential_asserter_dispatch (cross-side assertions via the
-//     StatsAsserter path — NOT SubjectAsserter, which only runs reference-less).
-//   - AMEND-OD1 (recovery/un-eject arm deferred; lazy-vs-sweep diverges
-//     cross-side). AMEND-OD2-1 (phase 40.2: the gateway detector is active-by-
-//     default + detect-only, so ejections_detected_consecutive_gateway_failure
-//     now fires on 0069's 503s on BOTH sides and IS asserted >= 1).
+//   - phase 40.2 SPEC §10 / PLAN Task 8 (the fixture design).
+//   - 0066-health-check-http (the dead-host mechanism: allocDeadPort, BackendCount
+//     ==2, the dead host is an INJECTED endpoint not a runner backend; the 503-
+//     tolerant warmup).
+//   - 0070-outlier-detection-consecutive-gateway-failure (the outlier StatsAsserter
+//     shape: eject-drive + poll-to-converge + warmup + delta-counter flow; the
+//     assertEq absent-counter-as-0 accommodation; StatsAsserter wiring).
+//   - reference_health_check_propagation_warmup (poll-the-gauge + warmup gate).
+//   - reference_docker_probe_bridge_network (shared bridge + STRICT_DNS host).
+//   - reference_differential_run_selector (target -run 'TestDifferential/0071').
+//   - reference_fixture_workload_constant_desync (counts single-sourced).
+//   - reference_differential_asserter_dispatch (cross-side via StatsAsserter).
 package driver
 
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -103,59 +105,73 @@ import (
 )
 
 const (
-	fixtureName = "0069-outlier-detection-consecutive-5xx"
+	fixtureName = "0071-outlier-detection-local-origin"
 
 	// In-container reference Envoy listener port for l_http. Fixtures run
-	// sequentially; a distinct value avoids confusion (0066 took 19155, the
-	// 39.2 leg took up to 19157, this takes 19158).
-	refContainerListenerPort = 19158
+	// sequentially; a distinct value avoids confusion (0070 took 19159, this
+	// takes the next-free 19160).
+	refContainerListenerPort = 19160
 
 	refAdminPort = 9901
 
-	// backendCount is the total number of runner-spawned backends (ALL three are
-	// live listeners; host2 answers 503). healthyBackendCount is the count that
-	// serve the measured load after host2 is ejected.
-	backendCount        = 3
+	// backendCount is the number of LIVE runner-spawned HTTPEcho backends. The
+	// DEAD host is a separately-allocated unbound port (NOT a runner backend — the
+	// 0066 shape, NO PerHostBackendKind). healthyBackendCount is the count that
+	// serves the measured load after the dead host is ejected.
+	backendCount        = 2
 	healthyBackendCount = 2
 
+	// endpointCount is the total endpoints in c_lo (2 live + 1 dead). The dead
+	// host occupies the last index (== 2); it is an injected unbound endpoint,
+	// NOT a runner backend.
+	endpointCount = 3
+
 	// outlier_detection config (single-sourced; the Bootstrap/Config builders +
-	// the stat assertions read these — D-S40.1-4).
-	consec5xxThreshold = 5                // consecutive_5xx ejection threshold
+	// the stat assertions read these). split=true routes the dead-host connect-
+	// refused (a LocalOriginErr) to the LOCAL-ORIGIN detector ONLY; the
+	// consecutive_5xx / gateway detectors never fire (→ detected_consecutive_5xx
+	// == 0).
+	splitLocalOrigin   = true             // split_external_local_origin_errors
+	consecLOThreshold  = 5                // consecutive_local_origin_failure ejection threshold
+	enforcingLOPercent = 100              // enforcing_consecutive_local_origin_failure (enforce every LO detection)
 	interval           = 10 * time.Second // detection interval (parse-accepted)
 	baseEjectionTime   = 30 * time.Second // base_ejection_time (recovery DEFERRED)
-	maxEjectionPercent = 100              // allow the single 503 host to be ejected
+	maxEjectionPercent = 100              // allow the single dead host to be ejected
 
-	// ejectDriveRequests is the 503-tolerant ejection-drive count. Under strict
-	// round-robin over 3 hosts, host2 is picked every 3rd request, so it crosses
-	// consec5xxThreshold after ~consec5xxThreshold*3 requests. A margin guarantees
-	// ejection even if early ordering is not perfectly round-robin.
-	ejectDriveRequests = consec5xxThreshold*3 + 9 // 24
+	// ejectDriveRequests is the 5xx-tolerant ejection-drive count. Under strict
+	// round-robin over 3 endpoints, the dead host is picked every 3rd request, so
+	// it crosses consecLOThreshold after ~consecLOThreshold*3 requests. A margin
+	// guarantees ejection even if early ordering is not perfectly round-robin.
+	ejectDriveRequests = consecLOThreshold*3 + 9 // 24
 
-	// n is the measured-phase request count per side. After host2 is ejected the
-	// load lands 100% on the 2 healthy hosts; the assertion is delta 2xx==n /
-	// 5xx==0 + body idx ∈ {0,1}, NOT a band, so n need not be large.
+	// n is the measured-phase request count per side. After the dead host is
+	// ejected the load lands 100% on the 2 live hosts; the assertion is delta
+	// 2xx==n / 5xx==0 + body idx ∈ {0,1}, NOT a band, so n need not be large.
 	n = 60
 
 	// Convergence poll budget (NO fixed sleep — poll until the predicate holds).
-	convergeDeadline = 30 * time.Second
+	// A dead-host connect-refused can be slower to accrue than an HTTP 503 (the
+	// connect attempt + connect_timeout per pick), so the deadline carries ample
+	// headroom over the 0070 gateway budget.
+	convergeDeadline = 45 * time.Second
 	convergePoll     = 200 * time.Millisecond
 
 	// Warmup gate: the gauge updates before the worker LB host-sets drop the
-	// ejected host (a propagation window), so warmup sends 503-tolerant requests
-	// until warmupStable CONSECUTIVE 200s prove the worker rotation has dropped
-	// host2, THEN the strict measured phase runs.
+	// ejected host (a propagation window), so warmup sends 5xx-tolerant requests
+	// until warmupStable CONSECUTIVE 200s prove the worker rotation has dropped the
+	// dead host, THEN the strict measured phase runs.
 	warmupStable   = 10
-	warmupDeadline = 15 * time.Second
+	warmupDeadline = 20 * time.Second
 
 	// Gauge / counter stat keys (single-sourced).
-	statEjectionsActive    = "cluster.c_od.outlier_detection.ejections_active"
-	statEjectEnforcedTotal = "cluster.c_od.outlier_detection.ejections_enforced_total"
-	statEjectEnforced5xx   = "cluster.c_od.outlier_detection.ejections_enforced_consecutive_5xx"
-	statEjectDetected5xx   = "cluster.c_od.outlier_detection.ejections_detected_consecutive_5xx"
-	statEjectDetectedGw    = "cluster.c_od.outlier_detection.ejections_detected_consecutive_gateway_failure"
-	statUpstreamRqTotal    = "cluster.c_od.upstream_rq_total"
-	statUpstreamRq2xx      = "cluster.c_od.upstream_rq_2xx"
-	statUpstreamRq5xx      = "cluster.c_od.upstream_rq_5xx"
+	statEjectionsActive    = "cluster.c_lo.outlier_detection.ejections_active"
+	statEjectEnforcedTotal = "cluster.c_lo.outlier_detection.ejections_enforced_total"
+	statEjectDetectedLO    = "cluster.c_lo.outlier_detection.ejections_detected_consecutive_local_origin_failure"
+	statEjectEnforcedLO    = "cluster.c_lo.outlier_detection.ejections_enforced_consecutive_local_origin_failure"
+	statEjectDetected5xx   = "cluster.c_lo.outlier_detection.ejections_detected_consecutive_5xx"
+	statUpstreamRqTotal    = "cluster.c_lo.upstream_rq_total"
+	statUpstreamRq2xx      = "cluster.c_lo.upstream_rq_2xx"
+	statUpstreamRq5xx      = "cluster.c_lo.upstream_rq_5xx"
 )
 
 func init() {
@@ -166,36 +182,53 @@ func init() {
 // reference listener mapped port is only knowable at DriveReference; the subject
 // listener is knowable at SubjectConfig) so AssertStats — the only hook holding
 // BOTH admin addrs — can drive the ejection, poll-converge, warm up, and assert.
+// deadPort is the unbound host port shared by both sides' dead endpoint.
 type odDriver struct {
 	mu           sync.Mutex
 	refListener  string // host:port of the reference l_http listener (from DriveReference)
 	subjListener string // 127.0.0.1:<port> of the subject l_http listener (from SubjectConfig)
+	deadPort     int    // the unbound host port shared by both sides' dead endpoint
 }
 
 func (*odDriver) BackendCount() int                { return backendCount }
 func (*odDriver) BackendKind() fixture.BackendKind { return fixture.HTTPEcho }
+func (*odDriver) SubjectListenerName() string      { return "l_http" }
+func (*odDriver) ReferenceListenerPort() int       { return refContainerListenerPort }
 
-// BackendKindAt implements fixture.PerHostBackendKind: hosts 0/1 are healthy
-// HTTPEcho, host 2 is the always-503 responder the outlier detector ejects.
-func (*odDriver) BackendKindAt(i int) fixture.BackendKind {
-	if i == 2 {
-		return fixture.HTTP503Responder
+// allocDeadPort binds 0.0.0.0:0, captures the assigned port, then CLOSES the
+// listener so the port stays unbound — a connect to it is refused (the dead-host
+// connect-failure mechanism, the 0066 precedent). Memoized: both
+// ReferenceBootstrap and SubjectConfig call it; they must agree on the SAME port
+// number.
+func (d *odDriver) allocDeadPort() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.deadPort != 0 {
+		return d.deadPort
 	}
-	return fixture.HTTPEcho
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		panic(fmt.Sprintf("%s: alloc dead port: %v", fixtureName, err))
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close() // release → nothing listens → connect refused → LocalOriginErr
+	d.deadPort = port
+	return port
 }
 
-func (*odDriver) SubjectListenerName() string { return "l_http" }
-func (*odDriver) ReferenceListenerPort() int  { return refContainerListenerPort }
-
 // outlierBlock is the shared cluster outlier_detection YAML (identical on both
-// sides — NAT-transparent static config). consecutive_5xx 5, interval 10s,
-// base_ejection_time 30s, max_ejection_percent 100.
+// sides — NAT-transparent static config). split=true routes the local-origin
+// failures to the LO detector; the LO detector is the ejection trigger.
 var outlierBlock = fmt.Sprintf(`      outlier_detection:
-        consecutive_5xx: %d
+        consecutive_local_origin_failure: %d
+        enforcing_consecutive_local_origin_failure: %d
+        split_external_local_origin_errors: %t
         interval: %s
         base_ejection_time: %s
         max_ejection_percent: %d`,
-	consec5xxThreshold,
+	consecLOThreshold,
+	enforcingLOPercent,
+	splitLocalOrigin,
 	durSeconds(interval),
 	durSeconds(baseEjectionTime),
 	maxEjectionPercent)
@@ -206,17 +239,18 @@ func durSeconds(d time.Duration) string {
 	return strconv.Itoa(int(d/time.Second)) + "s"
 }
 
-// routeTable routes / to c_od (the data path). Identical on both sides.
+// routeTable routes / to c_lo (the data path). Identical on both sides.
 const routeTable = `                      routes:
                         - match: { prefix: "/" }
-                          route: { cluster: c_od }`
+                          route: { cluster: c_lo }`
 
 func (d *odDriver) ReferenceBootstrap(backendPorts []int) string {
 	if len(backendPorts) != backendCount {
 		panic(fmt.Sprintf("%s: expected %d backend ports, got %d", fixtureName, backendCount, len(backendPorts)))
 	}
-	// STRICT_DNS + host.docker.internal (the 0066 reference shape). c_od over the
-	// 2 healthy backends + the always-503 host, with passive outlier detection.
+	dead := d.allocDeadPort()
+	// STRICT_DNS + host.docker.internal (the 0066/0070 reference shape). c_lo over
+	// the 2 live backends + the dead host, with split-true passive outlier detection.
 	return fmt.Sprintf(`admin:
   address:
     socket_address: { address: 0.0.0.0, port_value: %d }
@@ -243,33 +277,34 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters:
-    - name: c_od
+    - name: c_lo
       type: STRICT_DNS
       connect_timeout: 1s
       dns_lookup_family: V4_ONLY
       lb_policy: ROUND_ROBIN
 %s
       load_assignment:
-        cluster_name: c_od
+        cluster_name: c_lo
         endpoints:
           - lb_endpoints:
               - endpoint: { address: { socket_address: { address: host.docker.internal, port_value: %d } } }
               - endpoint: { address: { socket_address: { address: host.docker.internal, port_value: %d } } }
               - endpoint: { address: { socket_address: { address: host.docker.internal, port_value: %d } } }
-`, refAdminPort, refContainerListenerPort, routeTable, outlierBlock, backendPorts[0], backendPorts[1], backendPorts[2])
+`, refAdminPort, refContainerListenerPort, routeTable, outlierBlock, backendPorts[0], backendPorts[1], dead)
 }
 
 func (d *odDriver) SubjectConfig(_, subjListenerPort int, backendPorts []int, subjAdminPort int) string {
 	if len(backendPorts) != backendCount {
 		panic(fmt.Sprintf("%s: expected %d backend ports, got %d", fixtureName, backendCount, len(backendPorts)))
 	}
+	dead := d.allocDeadPort()
 	d.mu.Lock()
 	d.subjListener = fmt.Sprintf("127.0.0.1:%d", subjListenerPort)
 	d.mu.Unlock()
-	// STATIC + 127.0.0.1 (the 0066 subject shape). c_od over the 2 healthy
-	// backends + the always-503 host, with passive outlier detection.
+	// STATIC + 127.0.0.1 (the 0066/0070 subject shape). c_lo over the 2 live
+	// backends + the dead host, with split-true passive outlier detection.
 	return fmt.Sprintf(`
-node: { id: envoy-go-subject-0069, cluster: envoy-go-differential }
+node: { id: envoy-go-subject-0071, cluster: envoy-go-differential }
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: %d }
@@ -296,19 +331,19 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters:
-    - name: c_od
+    - name: c_lo
       type: STATIC
       connect_timeout: 1s
       lb_policy: ROUND_ROBIN
 %s
       load_assignment:
-        cluster_name: c_od
+        cluster_name: c_lo
         endpoints:
           - lb_endpoints:
               - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: %d } } }
               - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: %d } } }
               - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: %d } } }
-`, subjAdminPort, subjListenerPort, routeTable, outlierBlock, backendPorts[0], backendPorts[1], backendPorts[2])
+`, subjAdminPort, subjListenerPort, routeTable, outlierBlock, backendPorts[0], backendPorts[1], dead)
 }
 
 // DriveReference stashes the reference listener addr and returns the fixed
@@ -326,8 +361,8 @@ func (d *odDriver) DriveSubject(_ context.Context, _ string) ([]byte, error) {
 	return []byte("READY\n"), nil
 }
 
-// ProbeAdmin issues GET /ready against each proxy's admin endpoint (the 0066 raw
-// /ready probe, verbatim).
+// ProbeAdmin issues GET /ready against each proxy's admin endpoint (the 0066/0070
+// raw /ready probe, verbatim).
 func (*odDriver) ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAddr string) (refBytes, subjBytes []byte, err error) {
 	refBytes, err = helpers.HTTPGetReadyRaw(ctx, refAdminAddr)
 	if err != nil {
@@ -340,9 +375,9 @@ func (*odDriver) ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAddr str
 	return refBytes, subjBytes, nil
 }
 
-// backendIdxFromBody parses the canned body "backend-<idx>:<seg>" (both HTTPEcho
-// and HTTP503Responder use this format) and returns the embedded backend idx
-// (the host-attribution signal).
+// backendIdxFromBody parses the HTTPEcho canned body "backend-<idx>:<seg>" and
+// returns the embedded backend idx (the host-attribution signal). Only the 2 live
+// hosts emit a body; the dead host serves nothing (its picks fail-fast to a 5xx).
 func backendIdxFromBody(body []byte) (int, error) {
 	s := string(body)
 	const pfx = "backend-"
@@ -361,17 +396,18 @@ func backendIdxFromBody(body []byte) (int, error) {
 	return idx, nil
 }
 
-// driveEjection sends ejectDriveRequests 503-TOLERANT GET / to addr (the 503
-// host's responses ARE 503 until it is ejected — that is the point). A transport
-// error is a hard failure; a 503 status is expected and tolerated.
+// driveEjection sends ejectDriveRequests 5xx-TOLERANT GET / to addr. Picks of the
+// dead host fail the connect → a 503/502 local reply (LocalOriginErr) until it is
+// ejected — that is the point. A transport error is a hard failure; a 5xx status
+// is expected and tolerated.
 func driveEjection(ctx context.Context, side, addr string) error {
 	for i := 0; i < ejectDriveRequests; i++ {
 		resp, _, err := helpers.HTTPRoundTrip(ctx, addr, "GET", "/", nil, nil)
 		if err != nil {
 			return fmt.Errorf("%s: eject-drive GET /[%d]: %w", side, i, err)
 		}
-		// 200 (healthy host) and 503 (the always-503 host) are both expected
-		// during the drive; only a transport error aborts.
+		// 200 (live host) and 503/502 (the dead host's connect-failure local reply)
+		// are both expected during the drive; only a transport error aborts.
 		_ = resp
 	}
 	return nil
@@ -393,17 +429,17 @@ func pollEjectionsActive(side, adminAddr string) error {
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%s: %s did not converge to 1 within %s (last seen %d) — 503 host not ejected? (consecutive_5xx accrued? detector wired? RecordUpstreamResult firing?)",
+			return fmt.Errorf("%s: %s did not converge to 1 within %s (last seen %d) — dead host not ejected? (consecutive_local_origin_failure accrued? split=true routing connect-refused to the LO detector? RecordUpstreamResult{LocalOriginErr:true} firing at AcquireH1?)",
 				side, statEjectionsActive, convergeDeadline, last)
 		}
 		time.Sleep(convergePoll)
 	}
 }
 
-// warmupUntilStable sends GET / tolerating transient 503s until warmupStable
+// warmupUntilStable sends GET / tolerating transient 5xx until warmupStable
 // CONSECUTIVE 200s, or the deadline trips. It closes the gauge→worker-set
 // propagation window (ejections_active reads 1 before the worker LB drops the
-// ejected host). An un-ejected build (deliberate break) round-robins to the 503
+// ejected host). An un-ejected build (deliberate break) round-robins to the dead
 // host every 3rd pick → never warmupStable consecutive 200s → this errors,
 // preserving liveness.
 func warmupUntilStable(ctx context.Context, side, addr string) error {
@@ -425,15 +461,16 @@ func warmupUntilStable(ctx context.Context, side, addr string) error {
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%s: data path did not stabilize to %d consecutive 200s within %s (last status %d, err %v) — 503 host still in worker rotation?",
+			return fmt.Errorf("%s: data path did not stabilize to %d consecutive 200s within %s (last status %d, err %v) — dead host still in worker rotation?",
 				side, warmupStable, warmupDeadline, lastCode, lastErr)
 		}
 	}
 }
 
 // loadAndTally sends n GET / to addr and returns per-host hit counts. A non-200
-// is a hard error (the ejected 503 host must serve nothing), as is any body
-// attributing host2 — in the measured phase only hosts 0/1 may answer.
+// is a hard error (the ejected dead host must serve nothing), as is any body
+// attributing a host outside the 2 live backends — in the measured phase only
+// hosts 0/1 may answer.
 func loadAndTally(ctx context.Context, side, addr string) ([backendCount]int, error) {
 	var counts [backendCount]int
 	for i := 0; i < n; i++ {
@@ -442,17 +479,14 @@ func loadAndTally(ctx context.Context, side, addr string) ([backendCount]int, er
 			return counts, fmt.Errorf("%s: GET /[%d]: %w", side, i, err)
 		}
 		if resp.StatusCode != http.StatusOK {
-			return counts, fmt.Errorf("%s: GET /[%d]: status %d, want 200 (503 host NOT ejected → it answered 503?)", side, i, resp.StatusCode)
+			return counts, fmt.Errorf("%s: GET /[%d]: status %d, want 200 (dead host NOT ejected → it answered a connect-failure 5xx?)", side, i, resp.StatusCode)
 		}
 		idx, err := backendIdxFromBody(body)
 		if err != nil {
 			return counts, fmt.Errorf("%s: GET /[%d]: %w", side, i, err)
 		}
 		if idx < 0 || idx >= backendCount {
-			return counts, fmt.Errorf("%s: GET /[%d]: backend idx %d out of range [0,%d)", side, i, idx, backendCount)
-		}
-		if idx == 2 {
-			return counts, fmt.Errorf("%s: GET /[%d]: served by host2 (the ejected 503 host) — ejection not enforced in the data path", side, i)
+			return counts, fmt.Errorf("%s: GET /[%d]: backend idx %d out of LIVE range [0,%d) — a request reached a host outside the 2 live backends", side, i, idx, backendCount)
 		}
 		counts[idx]++
 	}
@@ -474,7 +508,8 @@ func (d *odDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string)
 		t.Fatalf("listener addrs not stashed (ref=%q subj=%q) — Drive hooks did not run?", refListener, subjListener)
 	}
 
-	// 1. Ejection drive: 503-tolerant load to accrue consecutive 5xx on host2.
+	// 1. Ejection drive: 5xx-tolerant load to accrue consecutive local-origin
+	// failures on the dead host (each pick → connect refused → LocalOriginErr).
 	if err := driveEjection(ctx, "reference", refListener); err != nil {
 		t.Fatalf("eject-drive: %v", err)
 	}
@@ -482,7 +517,7 @@ func (d *odDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string)
 		t.Fatalf("eject-drive: %v", err)
 	}
 
-	// 2. Poll-to-converge: both sides must eject host2 BEFORE the measured load.
+	// 2. Poll-to-converge: both sides must eject the dead host BEFORE the load.
 	if err := pollEjectionsActive("reference", refAdminAddr); err != nil {
 		t.Fatalf("converge: %v", err)
 	}
@@ -520,9 +555,9 @@ func (d *odDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string)
 		t.Fatalf("load: %v", err)
 	}
 
-	// 4b. 100%-to-healthy (per side): every request was served 200 by a healthy
-	// host (loadAndTally already failed on any non-200 / host2 hit); the tally
-	// must sum to n and BOTH healthy hosts must be touched (ROUND_ROBIN over 2).
+	// 4b. 100%-to-live (per side): every request was served 200 by a live host
+	// (loadAndTally already failed on any non-200 / out-of-range hit); the tally
+	// must sum to n and BOTH live hosts must be touched (ROUND_ROBIN over 2).
 	for _, sd := range []struct {
 		side   string
 		counts [backendCount]int
@@ -532,14 +567,11 @@ func (d *odDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string)
 			sum += c
 		}
 		if sum != n {
-			t.Errorf("%s: healthy-host tally sum %d != %d", sd.side, sum, n)
-		}
-		if sd.counts[2] != 0 {
-			t.Errorf("%s: host2 (ejected 503) served %d requests in the measured phase, want 0", sd.side, sd.counts[2])
+			t.Errorf("%s: live-host tally sum %d != %d", sd.side, sum, n)
 		}
 		for i := 0; i < healthyBackendCount; i++ {
 			if sd.counts[i] == 0 {
-				t.Errorf("%s: healthy host[%d] served 0 requests — ROUND_ROBIN did not spread over the 2 healthy hosts (was host2 actually ejected, or a healthy host wrongly ejected?)", sd.side, i)
+				t.Errorf("%s: live host[%d] served 0 requests — ROUND_ROBIN did not spread over the 2 live hosts (was the dead host actually ejected, or a live host wrongly ejected?)", sd.side, i)
 			}
 		}
 	}
@@ -564,22 +596,24 @@ func (d *odDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string)
 		st   map[string]uint64
 		base map[string]uint64
 	}{{"reference", ref, refBase}, {"subject", subj, subjBase}} {
-		// Outlier-detection parity: host2 ejected and held, enforced + detected.
+		// Outlier-detection parity: the dead host ejected and held, enforced +
+		// detected VIA THE LOCAL-ORIGIN DETECTOR.
 		assertEq(t, sd.side, sd.st, statEjectionsActive, 1)
 		assertAtLeast(t, sd.side, sd.st, statEjectEnforcedTotal, 1)
-		assertAtLeast(t, sd.side, sd.st, statEjectEnforced5xx, 1)
-		assertAtLeast(t, sd.side, sd.st, statEjectDetected5xx, 1)
-		// The gateway detector is active-by-default + detect-only (AMEND-OD2-1):
-		// host2's 503s trip ejections_detected_consecutive_gateway_failure on BOTH
-		// sides, even though it does NOT eject via the gateway path (enforcing_
-		// consecutive_gateway_failure defaults to 0 — the 5xx detector does the
-		// ejecting). At phase 40.2 envoy-go emits this counter, matching the
-		// reference. Recovery / un-eject is DEFERRED (AMEND-OD1).
-		assertAtLeast(t, sd.side, sd.st, statEjectDetectedGw, 1)
+		assertAtLeast(t, sd.side, sd.st, statEjectDetectedLO, 1)
+		assertAtLeast(t, sd.side, sd.st, statEjectEnforcedLO, 1)
+		// The split invariant: split_external_local_origin_errors: true routes the
+		// dead-host connect-refused (LocalOriginErr) to the LOCAL-ORIGIN detector
+		// ONLY — the consecutive_5xx detector never fires, so detected_consecutive_5xx
+		// MUST be exactly 0. This equality bites if the split branch regressed and the
+		// local-origin failure were routed to the gateway/5xx detector (that would
+		// lift detected_consecutive_5xx off 0; the assertEq absent-as-0 accommodation
+		// only swallows ABSENT, not present > 0).
+		assertEq(t, sd.side, sd.st, statEjectDetected5xx, 0)
 
 		// Measured-phase load conservation (DELTA, baseline post-warmup): all n
-		// requests routed to a healthy host, all 2xx, 0 5xx in the measured phase
-		// (the eject-drive + warmup 503s are in the baseline, not the delta).
+		// requests routed to a live host, all 2xx, 0 5xx in the measured phase (the
+		// eject-drive + warmup 5xx are in the baseline, not the delta).
 		assertDelta(t, sd.side, sd.st, sd.base, statUpstreamRq2xx, n)
 		assertDelta(t, sd.side, sd.st, sd.base, statUpstreamRq5xx, 0)
 	}
@@ -589,6 +623,13 @@ func assertEq(t fixture.TB, side string, st map[string]uint64, key string, want 
 	t.Helper()
 	v, ok := st[key]
 	if !ok {
+		// Absent counters read as 0 (reference Envoy lazily allocates per-detector
+		// counters); an absent-and-want-0 is satisfied. This swallows ONLY absence,
+		// NOT a present-but-nonzero value — so detected_consecutive_5xx present > 0
+		// (a split-branch regression) still bites.
+		if want == 0 {
+			return
+		}
 		t.Errorf("%s: %s ABSENT in /stats", side, key)
 		return
 	}
@@ -624,7 +665,7 @@ func assertDelta(t fixture.TB, side string, st, base map[string]uint64, key stri
 }
 
 // scrapeStats issues GET http://<addr>/stats (the FLAT admin text) and parses
-// "name: value" lines into a map[name]uint64. (The 0066 driver scrapeStats,
+// "name: value" lines into a map[name]uint64. (The 0070 driver scrapeStats,
 // verbatim.)
 func scrapeStats(adminAddr string) (map[string]uint64, error) {
 	url := "http://" + adminAddr + "/stats"
@@ -668,10 +709,10 @@ func scrapeStats(adminAddr string) (map[string]uint64, error) {
 	return out, nil
 }
 
-// Compile-time interface assertions.
+// Compile-time interface assertions. NO PerHostBackendKind — the dead host is an
+// injected unbound endpoint, NOT a runner backend (the 0066 shape).
 var (
-	_ fixture.Driver             = (*odDriver)(nil)
-	_ fixture.StatsAsserter      = (*odDriver)(nil)
-	_ fixture.BackendKindAware   = (*odDriver)(nil)
-	_ fixture.PerHostBackendKind = (*odDriver)(nil)
+	_ fixture.Driver           = (*odDriver)(nil)
+	_ fixture.StatsAsserter    = (*odDriver)(nil)
+	_ fixture.BackendKindAware = (*odDriver)(nil)
 )

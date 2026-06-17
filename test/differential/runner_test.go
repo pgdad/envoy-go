@@ -93,6 +93,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0067-health-check-tcp/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0068-health-check-grpc/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0069-outlier-detection-consecutive-5xx/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0070-outlier-detection-consecutive-gateway-failure/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0071-outlier-detection-local-origin/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

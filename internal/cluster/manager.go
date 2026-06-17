@@ -159,8 +159,9 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 			hc.registerStats(r, prefix)
 		}
 	}
-	// Phase 40.1 (ADR-0245): the +5 passive outlier_detection stats, on clusters
-	// WITH outlier_detection only. The ejections_active gauge is injected onto
+	// Phase 40.1 (ADR-0245) + 40.2 (ADR-0246): the +9 passive outlier_detection
+	// stats (the 40.1 five + the +4 gateway/local-origin detector counters), on
+	// clusters WITH outlier_detection only. The ejections_active gauge is injected onto
 	// BOTH the detector and the shared clusterHealth — the lazy un-eject in
 	// clusterHealth.isEjected decrements the SAME handle the detector increments
 	// on eject (they MUST be the same *stats.Gauge instance).
