@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -152,5 +154,135 @@ func TestStartHealthChecks_Lifecycle(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Drain did not return within 5s (health-check goroutine leak)")
+	}
+}
+
+// TestStartOutlierDetection_Lifecycle: start the per-cluster sweep goroutine on a
+// Manager with one outlier cluster, cancel the ctx, and assert Drain joins cleanly
+// (no goroutine leak) and is idempotent (a second Drain returns immediately).
+func TestStartOutlierDetection_Lifecycle(t *testing.T) {
+	cl := mkStaticCluster("od_cluster",
+		mkLbEndpoint("127.0.0.1", 9001),
+		mkLbEndpoint("127.0.0.1", 9002),
+	)
+	cl.OutlierDetection = &clusterv3.OutlierDetection{
+		Interval:           durationpb.New(20 * time.Millisecond),
+		MaxEjectionPercent: wrapperspb.UInt32(100),
+	}
+
+	reg := stats.NewRegistry()
+	m, err := NewManager(mkBootstrap(cl), reg)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	reg.Freeze()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.StartOutlierDetection(ctx)
+
+	got, ok := m.Get("od_cluster")
+	if !ok {
+		t.Fatal("od_cluster not found")
+	}
+	// Record some traffic so the sweep has data to snapshot (no eject expected here
+	// — the eligibility gates are unmet with 2 hosts and the default minHosts 5).
+	for i := 0; i < 50; i++ {
+		got.RecordUpstreamResult(got.endpoints[0], UpstreamResult{StatusCode: 200})
+	}
+	time.Sleep(60 * time.Millisecond) // let the ticker fire a few sweeps
+
+	// Cancel the ctx then Drain — the join must return (no leak).
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		m.Drain()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return within 5s (outlier-detection goroutine leak)")
+	}
+
+	// Idempotent: a second Drain returns immediately.
+	done2 := make(chan struct{})
+	go func() {
+		m.Drain()
+		close(done2)
+	}()
+	select {
+	case <-done2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second Drain did not return within 5s (not idempotent)")
+	}
+}
+
+// TestStartOutlierDetection_SweepDrivenEject: with a SHORT interval, start the
+// sweep goroutine over a 6-host cluster (5 all-success + 1 all-failure), record
+// the outlier traffic, and poll ejections_active until it reads 1 — proving the
+// ticker fires AND the sweep ejects. Then cancel + Drain.
+func TestStartOutlierDetection_SweepDrivenEject(t *testing.T) {
+	eps := make([]*endpointv3.LbEndpoint, 6)
+	for i := 0; i < 6; i++ {
+		eps[i] = mkLbEndpoint("127.0.0.1", uint32(9100+i))
+	}
+	cl := mkStaticClusterFromLbEndpoints("od_eject_sweep", eps...)
+	cl.OutlierDetection = &clusterv3.OutlierDetection{
+		Interval:                 durationpb.New(20 * time.Millisecond),
+		MaxEjectionPercent:       wrapperspb.UInt32(100),
+		SuccessRateMinimumHosts:  wrapperspb.UInt32(5),
+		SuccessRateRequestVolume: wrapperspb.UInt32(10),
+		EnforcingSuccessRate:     wrapperspb.UInt32(100),
+	}
+
+	reg := stats.NewRegistry()
+	m, err := NewManager(mkBootstrap(cl), reg)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	reg.Freeze()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.StartOutlierDetection(ctx)
+
+	got, ok := m.Get("od_eject_sweep")
+	if !ok {
+		t.Fatal("od_eject_sweep not found")
+	}
+	// 5 hosts all-success, 1 host all-failure (each over request_volume 10).
+	for i := 0; i < 5; i++ {
+		for j := 0; j < 50; j++ {
+			got.RecordUpstreamResult(got.endpoints[i], UpstreamResult{StatusCode: 200})
+		}
+	}
+	for j := 0; j < 50; j++ {
+		got.RecordUpstreamResult(got.endpoints[5], UpstreamResult{StatusCode: 503})
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if v, found := gaugeValue(reg, "cluster.od_eject_sweep.outlier_detection.ejections_active"); found && v == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the sweep to eject the outlier (ejections_active==1)")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got.health.available(got.endpoints[5]) {
+		t.Fatal("the all-failure host should be ejected by the sweep")
+	}
+
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		m.Drain()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return within 5s (outlier-detection goroutine leak)")
 	}
 }

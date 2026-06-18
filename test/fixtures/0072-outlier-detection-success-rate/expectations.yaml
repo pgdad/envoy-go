@@ -1,0 +1,104 @@
+# Phase-40.3 fixture 0072-outlier-detection-success-rate: differential
+# expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE cluster c_sr
+# (lb_policy ROUND_ROBIN) with STATISTICAL (success-rate) outlier detection over
+# SIX endpoints — 5 HEALTHY HTTPEcho backends + 1 always-503 host (the
+# HTTP503Responder, BackendKind 35) — on BOTH sides (the 0069 HTTP shape:
+# reference STRICT_DNS / host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# K=5 healthy hosts give a tight success-rate distribution (all at 100%); the bad
+# host's 0% success rate sits far below the mean − stdev_factor*stdev threshold
+# (≈0.125 at K=5, stdev_factor 1900), so it is ejected by the success_rate
+# detector. ALL SIX hosts are runner-spawned LIVE listeners; host5 answers 503
+# and is ejected by PASSIVE statistical outlier detection. The runner selects
+# host5's kind via PerHostBackendKind (BackendKindAt(5) → HTTP503Responder).
+# BackendCount() is 6.
+#
+# outlier_detection (identical on both sides — NAT-transparent static config):
+#   success_rate_minimum_hosts 2, success_rate_request_volume 10,
+#   success_rate_stdev_factor 1900, enforcing_success_rate 100,
+#   failure_percentage_minimum_hosts 2, failure_percentage_request_volume 10,
+#   enforcing_failure_percentage 0 (DETECT-ONLY),
+#   consecutive_5xx 0, consecutive_gateway_failure 0 (the consecutive detectors
+#   are explicitly OFF so the ejection is attributable to success_rate ALONE),
+#   interval 1s, base_ejection_time 30s, max_ejection_percent 100.
+#
+# # The driver: eject-drive + poll-to-converge + warmup (the determinism)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). The ejection must be driven, observed,
+# and the worker rotation drained BEFORE the strict measured phase, so it ALL
+# runs inside AssertStats. The Drive hooks stash their listener addrs and return a
+# fixed, address-independent byte stream ("READY\n") for the runner's CompareBytes
+# gate.
+#
+#   1. Ejection drive: send ejectDriveRequests (300) 503-TOLERANT GET / round-robin
+#      to each side's listener. Under round-robin over 6 hosts, host5 (the 503)
+#      gets ~50 picks ≫ success_rate_request_volume (10), all within one 1s
+#      interval; at the next sweep its success rate is 0.0 < the threshold ≈0.125,
+#      so the success_rate detector ejects it.
+#   2. Poll /stats on BOTH sides until
+#      cluster.c_sr.outlier_detection.ejections_active == 1 (deadline 30s, poll
+#      200ms; NO fixed sleep — fail clearly with the last value on timeout).
+#   3. Warmup: after the gauge reads 1, send 503-tolerant GET / until warmupStable
+#      (10) CONSECUTIVE 200s prove the worker rotation dropped host5, BOTH sides.
+#   4. Measured load: baseline the per-request counters post-warmup, send n (60)
+#      GET /; assert (delta) upstream_rq_2xx == 60, upstream_rq_5xx == 0, every
+#      body is backend-0:..backend-4: (NEVER backend-5: — the ejected 503 host
+#      serves nothing in the measured phase), all 5 healthy hosts touched.
+#   5. Cross-side stats (both sides):
+#        cluster.c_sr.outlier_detection.ejections_active                    == 1
+#        cluster.c_sr.outlier_detection.ejections_enforced_total            == 1
+#        cluster.c_sr.outlier_detection.ejections_detected_success_rate     >= 1
+#        cluster.c_sr.outlier_detection.ejections_enforced_success_rate     >= 1
+#        cluster.c_sr.outlier_detection.ejections_detected_failure_percentage >= 1
+#        cluster.c_sr.outlier_detection.ejections_enforced_failure_percentage == 0
+#        cluster.c_sr.outlier_detection.ejections_detected_consecutive_5xx  == 0
+#        cluster.c_sr.upstream_rq_2xx (delta over measured phase)           == 60
+#        cluster.c_sr.upstream_rq_5xx (delta over measured phase)           == 0
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#      cluster.c_sr.upstream_rq_total > 0 on the reference side before trusting
+#      the readout.
+#
+# # The LIVE == 0 cross-detector assertions
+#
+#   - ejections_enforced_failure_percentage == 0: the failure_percentage detector
+#     is armed + detect-only (enforcing 0), so it DETECTS the bad host (its 100%
+#     failure ≥ the 85% default fp threshold, eligible at the SAME sweep since
+#     request_volume is single-sourced) but never ENFORCES via that path. A
+#     regression that enforced via fp would lift this off 0 and bite (the assertEq
+#     absent-as-0 accommodation swallows ABSENT, not present > 0).
+#   - ejections_detected_consecutive_5xx == 0: the consecutive detectors are OFF
+#     (consecutive_5xx: 0), so the 5xx detector never fires — this proves the
+#     ejection is attributable to the STATISTICAL detector, not a consecutive one.
+#
+# # Deliberate non-assertions
+#
+#   - The recovery / un-eject arm (gauge → 0 after base_ejection_time) is DEFERRED
+#     — the lazy (subject) vs sweep (reference) un-eject timing diverges cross-side
+#     (AMEND-OD1).
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The eject-drive + measured (GET /)
+# bodies are NOT concatenated into the compared stream — they run inside
+# AssertStats and are tallied for the per-side 100%-to-healthy assertion, not
+# byte-compared (ROUND_ROBIN over 5 healthy hosts → per-request order may differ
+# cross-side).
+#
+# response-status: 200 on every MEASURED-phase request (asserted in loadAndTally);
+# 503s during the eject-drive + warmup are expected and tolerated.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Non-additions: NO new BackendKind authored HERE (the HTTP503Responder = 35 was
+# added at phase 40.1; this fixture only consumes it via BackendKindAt(5)); NO
+# DistributionAsserter (the runner's accept counters are polluted by the eject-
+# drive + warmup traffic — the per-side 100%-to-healthy tally lives in AssertStats
+# off the response bodies + the cross-side stat counters instead —
+# reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

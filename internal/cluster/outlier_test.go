@@ -311,6 +311,166 @@ func TestParseOutlierDetection_GatewayLocalOriginRejects(t *testing.T) {
 	}
 }
 
+// --- Task 2 (40.3): statistical detector parse fields + interval-as-load-bearing ---
+
+func TestParseOutlierDetection_Statistical_Full(t *testing.T) {
+	c := &clusterv3.Cluster{
+		OutlierDetection: &clusterv3.OutlierDetection{
+			SuccessRateMinimumHosts:        wrapperspb.UInt32(3),
+			SuccessRateRequestVolume:       wrapperspb.UInt32(80),
+			SuccessRateStdevFactor:         wrapperspb.UInt32(1500),
+			EnforcingSuccessRate:           wrapperspb.UInt32(70),
+			FailurePercentageThreshold:     wrapperspb.UInt32(90),
+			FailurePercentageMinimumHosts:  wrapperspb.UInt32(4),
+			FailurePercentageRequestVolume: wrapperspb.UInt32(40),
+			EnforcingFailurePercentage:     wrapperspb.UInt32(55),
+			Interval:                       durationpb.New(2 * time.Second),
+		},
+	}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if cfg.successRateMinHosts != 3 {
+		t.Errorf("successRateMinHosts = %d, want 3", cfg.successRateMinHosts)
+	}
+	if cfg.successRateReqVolume != 80 {
+		t.Errorf("successRateReqVolume = %d, want 80", cfg.successRateReqVolume)
+	}
+	if cfg.successRateStdevFactor != 1500 {
+		t.Errorf("successRateStdevFactor = %d, want 1500", cfg.successRateStdevFactor)
+	}
+	if cfg.enforcingSuccessRate != 70 {
+		t.Errorf("enforcingSuccessRate = %d, want 70", cfg.enforcingSuccessRate)
+	}
+	if cfg.failurePctThreshold != 90 {
+		t.Errorf("failurePctThreshold = %d, want 90", cfg.failurePctThreshold)
+	}
+	if cfg.failurePctMinHosts != 4 {
+		t.Errorf("failurePctMinHosts = %d, want 4", cfg.failurePctMinHosts)
+	}
+	if cfg.failurePctReqVolume != 40 {
+		t.Errorf("failurePctReqVolume = %d, want 40", cfg.failurePctReqVolume)
+	}
+	if cfg.enforcingFailurePct != 55 {
+		t.Errorf("enforcingFailurePct = %d, want 55", cfg.enforcingFailurePct)
+	}
+	if cfg.interval != 2*time.Second {
+		t.Errorf("interval = %v, want 2s", cfg.interval)
+	}
+}
+
+func TestParseOutlierDetection_Statistical_Defaults(t *testing.T) {
+	c := &clusterv3.Cluster{OutlierDetection: &clusterv3.OutlierDetection{}}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config for empty outlier_detection")
+	}
+	if cfg.successRateMinHosts != 5 {
+		t.Errorf("successRateMinHosts = %d, want 5", cfg.successRateMinHosts)
+	}
+	if cfg.successRateReqVolume != 100 {
+		t.Errorf("successRateReqVolume = %d, want 100", cfg.successRateReqVolume)
+	}
+	if cfg.successRateStdevFactor != 1900 {
+		t.Errorf("successRateStdevFactor = %d, want 1900", cfg.successRateStdevFactor)
+	}
+	if cfg.enforcingSuccessRate != 100 {
+		t.Errorf("enforcingSuccessRate = %d, want 100", cfg.enforcingSuccessRate)
+	}
+	if cfg.failurePctThreshold != 85 {
+		t.Errorf("failurePctThreshold = %d, want 85", cfg.failurePctThreshold)
+	}
+	if cfg.failurePctMinHosts != 5 {
+		t.Errorf("failurePctMinHosts = %d, want 5", cfg.failurePctMinHosts)
+	}
+	if cfg.failurePctReqVolume != 50 {
+		t.Errorf("failurePctReqVolume = %d, want 50", cfg.failurePctReqVolume)
+	}
+	if cfg.enforcingFailurePct != 0 {
+		t.Errorf("enforcingFailurePct = %d, want 0 (default detect-only)", cfg.enforcingFailurePct)
+	}
+	if cfg.interval != 10*time.Second {
+		t.Errorf("interval = %v, want 10s (default)", cfg.interval)
+	}
+}
+
+// TestParseOutlierDetection_StdevFactorZeroAccepted: success_rate_stdev_factor 0
+// is ACCEPTED by the reference (no reject arm) and surfaces verbatim.
+func TestParseOutlierDetection_StdevFactorZeroAccepted(t *testing.T) {
+	c := &clusterv3.Cluster{
+		OutlierDetection: &clusterv3.OutlierDetection{
+			SuccessRateStdevFactor: wrapperspb.UInt32(0),
+		},
+	}
+	cfg, err := parseOutlierDetection(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if cfg.successRateStdevFactor != 0 {
+		t.Errorf("successRateStdevFactor = %d, want 0 (explicit 0 accepted, no reject)", cfg.successRateStdevFactor)
+	}
+}
+
+func TestParseOutlierDetection_StatisticalRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		od   *clusterv3.OutlierDetection
+		want string
+	}{
+		{
+			name: "enforcing_success_rate>100",
+			od:   &clusterv3.OutlierDetection{EnforcingSuccessRate: wrapperspb.UInt32(101)},
+			want: `cluster: "c": outlier_detection: enforcing_success_rate: value must be less than or equal to 100`,
+		},
+		{
+			name: "enforcing_failure_percentage>100",
+			od:   &clusterv3.OutlierDetection{EnforcingFailurePercentage: wrapperspb.UInt32(101)},
+			want: `cluster: "c": outlier_detection: enforcing_failure_percentage: value must be less than or equal to 100`,
+		},
+		{
+			name: "failure_percentage_threshold>100",
+			od:   &clusterv3.OutlierDetection{FailurePercentageThreshold: wrapperspb.UInt32(101)},
+			want: `cluster: "c": outlier_detection: failure_percentage_threshold: value must be less than or equal to 100`,
+		},
+		{
+			name: "enforcing_local_origin_success_rate>100",
+			od:   &clusterv3.OutlierDetection{EnforcingLocalOriginSuccessRate: wrapperspb.UInt32(101)},
+			want: `cluster: "c": outlier_detection: enforcing_local_origin_success_rate: value must be less than or equal to 100`,
+		},
+		{
+			name: "enforcing_failure_percentage_local_origin>100",
+			od:   &clusterv3.OutlierDetection{EnforcingFailurePercentageLocalOrigin: wrapperspb.UInt32(101)},
+			want: `cluster: "c": outlier_detection: enforcing_failure_percentage_local_origin: value must be less than or equal to 100`,
+		},
+		{
+			name: "max_ejection_time<=0",
+			od:   &clusterv3.OutlierDetection{MaxEjectionTime: durationpb.New(0)},
+			want: `cluster: "c": outlier_detection: max_ejection_time: value must be greater than 0s`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseOutlierDetection(&clusterv3.Cluster{OutlierDetection: tc.od}, "c")
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if err.Error() != tc.want {
+				t.Errorf("error = %q, want %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
 // --- outlierDetector unit tests (Task 5) ---
 
 // mkOutlierEndpoints builds n endpoints 127.0.0.1:9000..9000+n-1.
@@ -1010,9 +1170,12 @@ func TestRecordUpstreamResult_EjectsAfterConsecutive5xx(t *testing.T) {
 
 // --- Task 8: outlier_detection stat registration ---
 
-// outlierStatNames is the exact 9-name scoped roster registered by
+// outlierStatNames is the exact 17-name scoped roster registered by
 // registerClusterMetrics for a cluster named "od_stats" (the 40.1 five plus the
-// +4 gateway/local-origin detector counters added unconditionally at Task 5).
+// +4 gateway/local-origin detector counters added unconditionally at Task 5 plus
+// the +8 statistical detector counters added unconditionally at Task 7 — the 4
+// external success_rate/failure_percentage names plus their 4 local-origin
+// variants, whose eject logic is deferred but whose names are registered).
 func outlierStatNames() []string {
 	const p = "cluster.od_stats.outlier_detection."
 	return []string{
@@ -1025,11 +1188,19 @@ func outlierStatNames() []string {
 		p + "ejections_enforced_consecutive_gateway_failure",
 		p + "ejections_detected_consecutive_local_origin_failure",
 		p + "ejections_enforced_consecutive_local_origin_failure",
+		p + "ejections_detected_success_rate",
+		p + "ejections_enforced_success_rate",
+		p + "ejections_detected_failure_percentage",
+		p + "ejections_enforced_failure_percentage",
+		p + "ejections_detected_local_origin_success_rate",
+		p + "ejections_enforced_local_origin_success_rate",
+		p + "ejections_detected_local_origin_failure_percentage",
+		p + "ejections_enforced_local_origin_failure_percentage",
 	}
 }
 
 // TestRegisterOutlierStats_Present asserts a cluster WITH outlier_detection
-// registers the 9 fully-qualified outlier stat names and injects every
+// registers the 17 fully-qualified outlier stat names and injects every
 // handle onto the detector (and the gauge onto the shared clusterHealth).
 func TestRegisterOutlierStats_Present(t *testing.T) {
 	c := mkStaticCluster("od_stats",
@@ -1054,8 +1225,10 @@ func TestRegisterOutlierStats_Present(t *testing.T) {
 			t.Errorf("expected metric %q to be registered", name)
 		}
 	}
-	// All 9 detector handles must be injected (non-nil) — the 40.1 five plus the
-	// +4 gateway/local-origin counters registered unconditionally at Task 5.
+	// All 17 detector handles must be injected (non-nil) — the 40.1 five plus the
+	// +4 gateway/local-origin counters registered unconditionally at Task 5 plus
+	// the +8 statistical counters registered unconditionally at Task 7 (the 4
+	// external SR/FP names plus their 4 local-origin variants).
 	if cl.outlier.ejectionsActive == nil ||
 		cl.outlier.ejectionsEnforcedTotal == nil ||
 		cl.outlier.ejectionsOverflow == nil ||
@@ -1064,7 +1237,15 @@ func TestRegisterOutlierStats_Present(t *testing.T) {
 		cl.outlier.ejectionsDetectedGw == nil ||
 		cl.outlier.ejectionsEnforcedGw == nil ||
 		cl.outlier.ejectionsDetectedLO == nil ||
-		cl.outlier.ejectionsEnforcedLO == nil {
+		cl.outlier.ejectionsEnforcedLO == nil ||
+		cl.outlier.ejectionsDetectedSR == nil ||
+		cl.outlier.ejectionsEnforcedSR == nil ||
+		cl.outlier.ejectionsDetectedFP == nil ||
+		cl.outlier.ejectionsEnforcedFP == nil ||
+		cl.outlier.ejectionsDetectedLOSR == nil ||
+		cl.outlier.ejectionsEnforcedLOSR == nil ||
+		cl.outlier.ejectionsDetectedLOFP == nil ||
+		cl.outlier.ejectionsEnforcedLOFP == nil {
 		t.Fatal("detector stat handles must all be injected (non-nil)")
 	}
 	// The gauge MUST be the SAME instance on the detector and the clusterHealth
@@ -1075,7 +1256,7 @@ func TestRegisterOutlierStats_Present(t *testing.T) {
 }
 
 // TestRegisterOutlierStats_Absent asserts a cluster WITHOUT outlier_detection
-// registers NONE of the 9 outlier stat names (stat surface unchanged).
+// registers NONE of the 17 outlier stat names (stat surface unchanged).
 func TestRegisterOutlierStats_Absent(t *testing.T) {
 	c := mkStaticCluster("od_stats", mkLbEndpoint("127.0.0.1", 9400))
 	reg := stats.NewRegistry()
@@ -1128,5 +1309,550 @@ func TestRegisterOutlierStats_GaugeReflectsEjection(t *testing.T) {
 	}
 	if got, ok := counterValue(reg, "cluster.od_stats.outlier_detection.ejections_detected_consecutive_5xx"); !ok || got != 1 {
 		t.Fatalf("ejections_detected_consecutive_5xx = %d (found=%v), want 1", got, ok)
+	}
+}
+
+// --- Task 3 (40.3): windowed intervalTotal/intervalSuccess accumulation ---
+
+// TestRecord_WindowedCounters verifies the per-host (intervalTotal, intervalSuccess)
+// accumulation in record: it counts on EVERY path (2xx, 5xx, local-origin), exactly
+// once; success = NOT local-origin AND NOT a 5xx external status. The sweep that
+// Swap-resets these is Task 6 — here we read the atomics directly.
+func TestRecord_WindowedCounters(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	f := newDetectorFixture(cfgConsec5xx(100), eps, panicRoll) // high threshold ⇒ no eject perturbs the window
+	ep := eps[0]
+	h := f.ch.states[ep.Addr()]
+
+	for i := 0; i < 3; i++ {
+		f.d.record(ep, 200, false) // 2xx success
+	}
+	for i := 0; i < 2; i++ {
+		f.d.record(ep, 503, false) // external 5xx failure
+	}
+	f.d.record(ep, 0, true) // local-origin failure
+
+	if got := h.intervalTotal.Load(); got != 6 {
+		t.Errorf("intervalTotal = %d, want 6 (3 2xx + 2 5xx + 1 local-origin)", got)
+	}
+	if got := h.intervalSuccess.Load(); got != 3 {
+		t.Errorf("intervalSuccess = %d, want 3 (only the 3 2xx are successes)", got)
+	}
+}
+
+// TestRecord_WindowedCountersNon5xxAreSuccesses verifies that 4xx (<500) and 3xx
+// statuses count as successes in the window (success = NOT a 5xx external status).
+func TestRecord_WindowedCountersNon5xxAreSuccesses(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	f := newDetectorFixture(cfgConsec5xx(100), eps, panicRoll)
+	ep := eps[0]
+	h := f.ch.states[ep.Addr()]
+
+	f.d.record(ep, 404, false) // 4xx — success (<500)
+	f.d.record(ep, 302, false) // 3xx — success (<500)
+
+	if got := h.intervalTotal.Load(); got != 2 {
+		t.Errorf("intervalTotal = %d, want 2", got)
+	}
+	if got := h.intervalSuccess.Load(); got != 2 {
+		t.Errorf("intervalSuccess = %d, want 2 (4xx and 3xx are both successes)", got)
+	}
+}
+
+// TestRecord_WindowedCountersUnknownAddrCountsNothing verifies the unknown-addr
+// early return increments neither window counter on any registered host.
+func TestRecord_WindowedCountersUnknownAddrCountsNothing(t *testing.T) {
+	eps := mkOutlierEndpoints(1)
+	f := newDetectorFixture(cfgConsec5xx(100), eps, panicRoll)
+	h := f.ch.states[eps[0].Addr()]
+
+	f.d.record(Endpoint{Host: "127.0.0.1", Port: 65535}, 200, false) // not in the registry
+
+	if got := h.intervalTotal.Load(); got != 0 {
+		t.Errorf("intervalTotal = %d, want 0 (unknown addr counts nothing)", got)
+	}
+	if got := h.intervalSuccess.Load(); got != 0 {
+		t.Errorf("intervalSuccess = %d, want 0", got)
+	}
+}
+
+// --- Task 4 (40.3): success_rate detector (evalSuccessRate) ---
+
+// withSuccessRateHandles assigns the +2 success_rate stat handles (Task 7
+// allocates them in registerStats; unit tests inject directly to observe counts).
+func (f detectorFixture) withSuccessRateHandles() detectorFixture {
+	reg := stats.NewRegistry()
+	f.d.ejectionsDetectedSR = reg.NewCounter("outlier_detection.ejections_detected_success_rate")
+	f.d.ejectionsEnforcedSR = reg.NewCounter("outlier_detection.ejections_enforced_success_rate")
+	return f
+}
+
+// cfgSuccessRate builds a cfg with the success_rate detector knobs set and the
+// base eject machinery permissive (maxEjectionPct=100, base=30s).
+func cfgSuccessRate(minHosts, reqVolume, stdevFactor, enforcing uint32) outlierConfig {
+	return outlierConfig{
+		baseEjectionTime:       30 * time.Second,
+		maxEjectionPct:         100,
+		successRateMinHosts:    minHosts,
+		successRateReqVolume:   reqVolume,
+		successRateStdevFactor: stdevFactor,
+		enforcingSuccessRate:   enforcing,
+	}
+}
+
+// snapFor builds a []hostWindow over the fixture's registered hosts: window[i]
+// describes eps[i] with the given (total, success). Pulls the live *hostHealth
+// from the fixture's registry so tryEject's CAS + cap accounting are real.
+func snapFor(f detectorFixture, eps []Endpoint, totals, successes []uint64) []hostWindow {
+	snap := make([]hostWindow, len(eps))
+	for i, ep := range eps {
+		snap[i] = hostWindow{
+			ep:      ep,
+			h:       f.ch.states[ep.Addr()],
+			total:   totals[i],
+			success: successes[i],
+		}
+	}
+	return snap
+}
+
+// TestEvalSuccessRate_EjectsOutlier: 5 hosts at 100% success + 1 host at 0% over
+// volume 100 (all eligible, 6 >= minHosts 2). mean=5/6≈0.833, pop stddev≈0.373,
+// threshold = mean - 1.9*stddev ≈ 0.125 (POSITIVE) -> only the 0% host is below
+// it -> it ejects (the +1 bumps detected/enforced SR + the cross-detector
+// double-count + ejections_active); the 5 healthy hosts are NOT ejected.
+func TestEvalSuccessRate_EjectsOutlier(t *testing.T) {
+	eps := mkOutlierEndpoints(6)
+	f := newDetectorFixture(cfgSuccessRate(2, 10, 1900, 100), eps, panicRoll).withSuccessRateHandles()
+	totals := []uint64{100, 100, 100, 100, 100, 100}
+	successes := []uint64{100, 100, 100, 100, 100, 0}
+	snap := snapFor(f, eps, totals, successes)
+
+	f.d.evalSuccessRate(snap)
+
+	if f.ch.available(eps[5]) {
+		t.Fatal("zero-success host should be ejected (rate 0 < threshold ≈ 0.125)")
+	}
+	for i := 0; i < 5; i++ {
+		if !f.ch.available(eps[i]) {
+			t.Errorf("healthy host %d (100%%) should NOT be ejected", i)
+		}
+	}
+	if got := f.d.ejectionsDetectedSR.Load(); got != 1 {
+		t.Errorf("ejections_detected_success_rate = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedSR.Load(); got != 1 {
+		t.Errorf("ejections_enforced_success_rate = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
+		t.Errorf("ejections_enforced_total = %d, want 1", got)
+	}
+	if got := f.d.ejectionsActive.Load(); got != 1 {
+		t.Errorf("ejections_active = %d, want 1", got)
+	}
+}
+
+// TestEvalSuccessRate_MinimumHostsGate: only 2 eligible hosts but minHosts=5 ->
+// the eligibility gate short-circuits BEFORE any threshold math -> NO eject.
+func TestEvalSuccessRate_MinimumHostsGate(t *testing.T) {
+	eps := mkOutlierEndpoints(2)
+	f := newDetectorFixture(cfgSuccessRate(5, 10, 1900, 100), eps, panicRoll).withSuccessRateHandles()
+	snap := snapFor(f, eps, []uint64{100, 100}, []uint64{0, 100})
+
+	f.d.evalSuccessRate(snap)
+
+	if !f.ch.available(eps[0]) {
+		t.Fatal("no host should eject: only 2 eligible < minHosts 5")
+	}
+	if got := f.d.ejectionsDetectedSR.Load(); got != 0 {
+		t.Errorf("ejections_detected_success_rate = %d, want 0 (gate)", got)
+	}
+}
+
+// TestEvalSuccessRate_RequestVolumeGate: the bad host has total 5 (< reqVolume 10)
+// so it is NOT eligible -> only the 5 good hosts form the eligible set (all 100%)
+// -> the bad host is never evaluated -> NO eject.
+func TestEvalSuccessRate_RequestVolumeGate(t *testing.T) {
+	eps := mkOutlierEndpoints(6)
+	f := newDetectorFixture(cfgSuccessRate(2, 10, 1900, 100), eps, panicRoll).withSuccessRateHandles()
+	totals := []uint64{100, 100, 100, 100, 100, 5} // last host below reqVolume
+	successes := []uint64{100, 100, 100, 100, 100, 0}
+	snap := snapFor(f, eps, totals, successes)
+
+	f.d.evalSuccessRate(snap)
+
+	if !f.ch.available(eps[5]) {
+		t.Fatal("low-volume host (total 5 < reqVolume 10) is ineligible and must not eject")
+	}
+	if got := f.d.ejectionsDetectedSR.Load(); got != 0 {
+		t.Errorf("ejections_detected_success_rate = %d, want 0 (volume gate)", got)
+	}
+}
+
+// TestEvalSuccessRate_NegativeThresholdNoOp (AMEND-OD3-5): 2 hosts 100% + 1 host
+// 0%, minHosts=2 (eligibility gate PASSES: 3 >= 2). mean≈0.667, pop stddev≈0.471,
+// threshold = mean - 1.9*stddev ≈ -0.228 (NON-positive) -> benign no-op (no rate
+// in [0,1] is below it) -> NO eject.
+func TestEvalSuccessRate_NegativeThresholdNoOp(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgSuccessRate(2, 10, 1900, 100), eps, panicRoll).withSuccessRateHandles()
+	snap := snapFor(f, eps, []uint64{100, 100, 100}, []uint64{100, 100, 0})
+
+	f.d.evalSuccessRate(snap)
+
+	for i := 0; i < 3; i++ {
+		if !f.ch.available(eps[i]) {
+			t.Errorf("host %d should NOT eject (threshold ≈ -0.228 <= 0)", i)
+		}
+	}
+	if got := f.d.ejectionsDetectedSR.Load(); got != 0 {
+		t.Errorf("ejections_detected_success_rate = %d, want 0 (negative-threshold no-op)", got)
+	}
+}
+
+// TestEvalSuccessRate_DetectOnly: enforcing_success_rate=0 -> the outlier crosses
+// the (positive) threshold so detected bumps, but the enforce-roll yields
+// detect-only -> enforced SR == 0 and ejections_active == 0.
+func TestEvalSuccessRate_DetectOnly(t *testing.T) {
+	eps := mkOutlierEndpoints(6)
+	f := newDetectorFixture(cfgSuccessRate(2, 10, 1900, 0), eps, panicRoll).withSuccessRateHandles()
+	totals := []uint64{100, 100, 100, 100, 100, 100}
+	successes := []uint64{100, 100, 100, 100, 100, 0}
+	snap := snapFor(f, eps, totals, successes)
+
+	f.d.evalSuccessRate(snap)
+
+	if !f.ch.available(eps[5]) {
+		t.Fatal("detect-only (enforcing 0) must not eject the outlier")
+	}
+	if got := f.d.ejectionsDetectedSR.Load(); got != 1 {
+		t.Errorf("ejections_detected_success_rate = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedSR.Load(); got != 0 {
+		t.Errorf("ejections_enforced_success_rate = %d, want 0 (detect-only)", got)
+	}
+	if got := f.d.ejectionsActive.Load(); got != 0 {
+		t.Errorf("ejections_active = %d, want 0 (detect-only)", got)
+	}
+}
+
+// --- Task 5 (40.3): failure_percentage detector (evalFailurePercentage) ---
+
+// withFailurePercentageHandles assigns the +2 failure_percentage stat handles
+// (Task 7 allocates them in registerStats; unit tests inject directly to observe
+// counts). Mirrors withSuccessRateHandles.
+func (f detectorFixture) withFailurePercentageHandles() detectorFixture {
+	reg := stats.NewRegistry()
+	f.d.ejectionsDetectedFP = reg.NewCounter("outlier_detection.ejections_detected_failure_percentage")
+	f.d.ejectionsEnforcedFP = reg.NewCounter("outlier_detection.ejections_enforced_failure_percentage")
+	return f
+}
+
+// cfgFailurePct builds a cfg with the failure_percentage detector knobs set and
+// the base eject machinery permissive (maxEjectionPct=100, base=30s).
+func cfgFailurePct(minHosts, reqVolume, threshold, enforcing uint32) outlierConfig {
+	return outlierConfig{
+		baseEjectionTime:    30 * time.Second,
+		maxEjectionPct:      100,
+		failurePctMinHosts:  minHosts,
+		failurePctReqVolume: reqVolume,
+		failurePctThreshold: threshold,
+		enforcingFailurePct: enforcing,
+	}
+}
+
+// TestEvalFailurePercentage_EjectsFailingHost: 2 hosts at 0% fail + 1 host at
+// 100% fail over volume 100 (all eligible, 3 >= minHosts 2). The 100%-fail host
+// crosses threshold 85 -> it ejects (detected/enforced FP + the cross-detector
+// double-count + ejections_active); the 2 healthy hosts are NOT ejected.
+func TestEvalFailurePercentage_EjectsFailingHost(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgFailurePct(2, 10, 85, 100), eps, panicRoll).withFailurePercentageHandles()
+	totals := []uint64{100, 100, 100}
+	successes := []uint64{100, 100, 0}
+	snap := snapFor(f, eps, totals, successes)
+
+	f.d.evalFailurePercentage(snap)
+
+	if f.ch.available(eps[2]) {
+		t.Fatal("fully-failing host should be ejected (failure 100 pct >= threshold 85)")
+	}
+	for i := 0; i < 2; i++ {
+		if !f.ch.available(eps[i]) {
+			t.Errorf("healthy host %d (0%% fail) should NOT be ejected", i)
+		}
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 1 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedFP.Load(); got != 1 {
+		t.Errorf("ejections_enforced_failure_percentage = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
+		t.Errorf("ejections_enforced_total = %d, want 1", got)
+	}
+	if got := f.d.ejectionsActive.Load(); got != 1 {
+		t.Errorf("ejections_active = %d, want 1", got)
+	}
+}
+
+// TestEvalFailurePercentage_BoundaryGE (load-bearing): 3 hosts; host[2] has total
+// 100 success 15 ⇒ failure% exactly 85 (== threshold) -> ejects (>= includes the
+// boundary). The cross-multiplied form: (100-15)*100=8500 >= 85*100=8500 (true).
+func TestEvalFailurePercentage_BoundaryGE(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgFailurePct(2, 10, 85, 100), eps, panicRoll).withFailurePercentageHandles()
+	snap := snapFor(f, eps, []uint64{100, 100, 100}, []uint64{100, 100, 15})
+
+	f.d.evalFailurePercentage(snap)
+
+	if f.ch.available(eps[2]) {
+		t.Fatal("host at failure% exactly 85 should eject (>= includes the boundary)")
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 1 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 1 (boundary)", got)
+	}
+}
+
+// TestEvalFailurePercentage_BelowBoundaryNoEject: host[2] total 100 success 16 ⇒
+// failure% 84 (< threshold 85) -> NOT ejected. (84*100=8400 < 85*100=8500.)
+func TestEvalFailurePercentage_BelowBoundaryNoEject(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgFailurePct(2, 10, 85, 100), eps, panicRoll).withFailurePercentageHandles()
+	snap := snapFor(f, eps, []uint64{100, 100, 100}, []uint64{100, 100, 16})
+
+	f.d.evalFailurePercentage(snap)
+
+	if !f.ch.available(eps[2]) {
+		t.Fatal("host at failure% 84 (< threshold 85) must NOT eject")
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 0 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 0 (below boundary)", got)
+	}
+}
+
+// TestEvalFailurePercentage_MinimumHostsGate: 3 eligible hosts but minHosts=5 ->
+// the eligibility gate short-circuits BEFORE any threshold math -> NO eject.
+func TestEvalFailurePercentage_MinimumHostsGate(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgFailurePct(5, 10, 85, 100), eps, panicRoll).withFailurePercentageHandles()
+	snap := snapFor(f, eps, []uint64{100, 100, 100}, []uint64{100, 100, 0})
+
+	f.d.evalFailurePercentage(snap)
+
+	if !f.ch.available(eps[2]) {
+		t.Fatal("no host should eject: only 3 eligible < minHosts 5")
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 0 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 0 (gate)", got)
+	}
+}
+
+// TestEvalFailurePercentage_RequestVolumeGate: the failing host has total 5 (<
+// reqVolume 10) so it is NOT eligible -> only the 2 good hosts form the eligible
+// set -> the bad host is never evaluated -> NO eject.
+func TestEvalFailurePercentage_RequestVolumeGate(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgFailurePct(2, 10, 85, 100), eps, panicRoll).withFailurePercentageHandles()
+	totals := []uint64{100, 100, 5} // last host below reqVolume
+	successes := []uint64{100, 100, 0}
+	snap := snapFor(f, eps, totals, successes)
+
+	f.d.evalFailurePercentage(snap)
+
+	if !f.ch.available(eps[2]) {
+		t.Fatal("low-volume host (total 5 < reqVolume 10) is ineligible and must not eject")
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 0 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 0 (volume gate)", got)
+	}
+}
+
+// TestEvalFailurePercentage_DetectOnly: enforcing_failure_percentage=0 (the
+// DEFAULT posture) -> the failing host crosses the threshold so detected bumps,
+// but the enforce-roll yields detect-only -> enforced FP == 0 and active == 0.
+func TestEvalFailurePercentage_DetectOnly(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgFailurePct(2, 10, 85, 0), eps, panicRoll).withFailurePercentageHandles()
+	totals := []uint64{100, 100, 100}
+	successes := []uint64{100, 100, 0}
+	snap := snapFor(f, eps, totals, successes)
+
+	f.d.evalFailurePercentage(snap)
+
+	if !f.ch.available(eps[2]) {
+		t.Fatal("detect-only (enforcing 0) must not eject the failing host")
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 1 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 1", got)
+	}
+	if got := f.d.ejectionsEnforcedFP.Load(); got != 0 {
+		t.Errorf("ejections_enforced_failure_percentage = %d, want 0 (detect-only)", got)
+	}
+	if got := f.d.ejectionsActive.Load(); got != 0 {
+		t.Errorf("ejections_active = %d, want 0 (detect-only)", got)
+	}
+}
+
+// TestEvalFailurePercentage_ZeroTrafficGuard (★ the hardening): with reqVolume 0,
+// a zero-traffic host (total 0) would pass the bare volume gate and the bare
+// cross-multiplied test (0*100 >= threshold*0 ⇒ 0 >= 0 ⇒ true) and spuriously
+// eject. The total==0 guard excludes it (the reference excludes zero-traffic
+// hosts). 2 real failing hosts cross the threshold and DO eject (minHosts 2 met by
+// the real hosts only).
+func TestEvalFailurePercentage_ZeroTrafficGuard(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	f := newDetectorFixture(cfgFailurePct(2, 0, 85, 100), eps, panicRoll).withFailurePercentageHandles()
+	totals := []uint64{100, 100, 0} // host[2] is zero-traffic
+	successes := []uint64{0, 0, 0}  // host[0],[1] are 100% fail; host[2] has no traffic
+	snap := snapFor(f, eps, totals, successes)
+
+	f.d.evalFailurePercentage(snap)
+
+	if !f.ch.available(eps[2]) {
+		t.Fatal("zero-traffic host (total 0) must NOT eject (the 0>=0 spurious-eject guard)")
+	}
+	if f.ch.states[eps[2].Addr()].ejected.Load() {
+		t.Error("zero-traffic host ejected flag set; want false (excluded from eligibility)")
+	}
+	// the two real failing hosts still eject (guard is targeted at total==0 only).
+	for i := 0; i < 2; i++ {
+		if f.ch.available(eps[i]) {
+			t.Errorf("real failing host %d (100%% fail) should eject", i)
+		}
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 2 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 2 (the two real hosts)", got)
+	}
+}
+
+// --- Task 6 (40.3): per-interval sweep + StartOutlierDetection/Drain lifecycle ---
+
+// TestSweep_EjectsOutlierAndResetsWindows: 6 hosts, 5 at 100% success + 1 at 0%
+// success (each >= reqVolume). sweep() snapshots+resets every window then runs SR
+// then FP over the snapshot. The bad host ejects exactly once (CAS makes a host
+// ejectable at most once per sweep), and EVERY host's window is reset to 0.
+func TestSweep_EjectsOutlierAndResetsWindows(t *testing.T) {
+	eps := mkOutlierEndpoints(6)
+	cfg := cfgSuccessRate(2, 10, 1900, 100)
+	// FP detect-only (enforcing 0) so the second detector cannot double-eject; the
+	// SR detector owns the eject. (Defaults leave failurePct* zero, which would make
+	// every host eligible at threshold 0 — set explicit FP knobs to keep FP inert.)
+	cfg.failurePctMinHosts = 100 // FP eligibility gate never met
+	cfg.failurePctReqVolume = 10
+	cfg.failurePctThreshold = 85
+	cfg.enforcingFailurePct = 0
+	f := newDetectorFixture(cfg, eps, panicRoll).withSuccessRateHandles().withFailurePercentageHandles()
+
+	// Drive real record() traffic: hosts 0..4 all-success, host 5 all-failure.
+	for i := 0; i < 5; i++ {
+		for j := 0; j < 100; j++ {
+			f.d.record(eps[i], 200, false)
+		}
+	}
+	for j := 0; j < 100; j++ {
+		f.d.record(eps[5], 503, false)
+	}
+
+	f.d.sweep()
+
+	if f.ch.available(eps[5]) {
+		t.Fatal("zero-success host should be ejected by the sweep (SR detector)")
+	}
+	for i := 0; i < 5; i++ {
+		if !f.ch.available(eps[i]) {
+			t.Errorf("healthy host %d (100%%) should NOT be ejected", i)
+		}
+	}
+	if got := f.d.ejectionsActive.Load(); got != 1 {
+		t.Errorf("ejections_active = %d, want 1 (one eject per host per sweep)", got)
+	}
+	if got := f.d.ejectionsDetectedSR.Load(); got != 1 {
+		t.Errorf("ejections_detected_success_rate = %d, want 1", got)
+	}
+	// Every window must be reset to 0 (Swap-to-0 ran for all hosts).
+	for i, ep := range eps {
+		h := f.ch.states[ep.Addr()]
+		if got := h.intervalTotal.Load(); got != 0 {
+			t.Errorf("host %d intervalTotal = %d after sweep, want 0 (window reset)", i, got)
+		}
+		if got := h.intervalSuccess.Load(); got != 0 {
+			t.Errorf("host %d intervalSuccess = %d after sweep, want 0 (window reset)", i, got)
+		}
+	}
+}
+
+// TestSweep_OneEjectPerHostEvenIfBothDetectorsFlag: a host that crosses BOTH the
+// success_rate AND failure_percentage thresholds is ejected AT MOST ONCE per sweep
+// (AMEND-OD3-3 — the CAS in tryEject makes the second detector's tryEject a no-op),
+// so ejections_active counts one ejection for the host.
+func TestSweep_OneEjectPerHostEvenIfBothDetectorsFlag(t *testing.T) {
+	eps := mkOutlierEndpoints(6)
+	// SR detector ejects the 0%-success host; FP detector ALSO flags it (100% fail
+	// >= threshold 85). Both eligibility gates pass (6 >= minHosts 2 for both).
+	cfg := cfgSuccessRate(2, 10, 1900, 100)
+	cfg.failurePctMinHosts = 2
+	cfg.failurePctReqVolume = 10
+	cfg.failurePctThreshold = 85
+	cfg.enforcingFailurePct = 100
+	f := newDetectorFixture(cfg, eps, panicRoll).withSuccessRateHandles().withFailurePercentageHandles()
+
+	for i := 0; i < 5; i++ {
+		for j := 0; j < 100; j++ {
+			f.d.record(eps[i], 200, false)
+		}
+	}
+	for j := 0; j < 100; j++ {
+		f.d.record(eps[5], 503, false)
+	}
+
+	f.d.sweep()
+
+	if f.ch.available(eps[5]) {
+		t.Fatal("bad host should be ejected")
+	}
+	// Exactly one ejection though both detectors flagged the same host.
+	if got := f.d.ejectionsActive.Load(); got != 1 {
+		t.Errorf("ejections_active = %d, want 1 (one eject per host even if both detectors flag)", got)
+	}
+	if got := f.d.ejectionsEnforcedTotal.Load(); got != 1 {
+		t.Errorf("ejections_enforced_total = %d, want 1 (CAS makes the 2nd tryEject a no-op)", got)
+	}
+	// Both detectors DETECTED the crossing (detected is Inc'd before tryEject).
+	if got := f.d.ejectionsDetectedSR.Load(); got != 1 {
+		t.Errorf("ejections_detected_success_rate = %d, want 1", got)
+	}
+	if got := f.d.ejectionsDetectedFP.Load(); got != 1 {
+		t.Errorf("ejections_detected_failure_percentage = %d, want 1", got)
+	}
+}
+
+// TestSweep_ResetsEveryWindowEvenWithNoEject: with no detector configured to
+// eject (all hosts identical, eligibility gates unmet), the sweep still Swap-resets
+// EVERY host's window to 0.
+func TestSweep_ResetsEveryWindowEvenWithNoEject(t *testing.T) {
+	eps := mkOutlierEndpoints(3)
+	cfg := cfgSuccessRate(100, 10, 1900, 100) // minHosts 100 ⇒ SR gate never met
+	cfg.failurePctMinHosts = 100              // FP gate never met
+	f := newDetectorFixture(cfg, eps, panicRoll).withSuccessRateHandles().withFailurePercentageHandles()
+
+	for _, ep := range eps {
+		for j := 0; j < 50; j++ {
+			f.d.record(ep, 200, false)
+		}
+	}
+	f.d.sweep()
+
+	for i, ep := range eps {
+		if !f.ch.available(ep) {
+			t.Errorf("host %d should NOT be ejected (no eligibility)", i)
+		}
+		h := f.ch.states[ep.Addr()]
+		if got := h.intervalTotal.Load(); got != 0 {
+			t.Errorf("host %d intervalTotal = %d after sweep, want 0", i, got)
+		}
+		if got := h.intervalSuccess.Load(); got != 0 {
+			t.Errorf("host %d intervalSuccess = %d after sweep, want 0", i, got)
+		}
 	}
 }

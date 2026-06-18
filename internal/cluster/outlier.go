@@ -1,7 +1,9 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"time"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -27,7 +29,19 @@ type outlierConfig struct {
 	consecLOEnabled  bool   // false iff consecutive_local_origin_failure explicitly 0
 	consecutiveLO    uint32 // threshold (default 5)
 	enforcingLO      uint32 // enforce-roll % (default 100)
-	// interval is parse-accepted + validated (gt:0s) but its role is deferred at 40.1.
+	// success_rate detector — sweep-driven; ejects-by-default (enforcing 100).
+	successRateMinHosts    uint32 // success_rate_minimum_hosts (default 5)
+	successRateReqVolume   uint32 // success_rate_request_volume (default 100)
+	successRateStdevFactor uint32 // success_rate_stdev_factor (default 1900; /1000 ⇒ 1.9)
+	enforcingSuccessRate   uint32 // enforcing_success_rate (default 100)
+	// failure_percentage detector — sweep-driven; detect-only-by-default (enforcing 0).
+	failurePctThreshold uint32 // failure_percentage_threshold (default 85)
+	failurePctMinHosts  uint32 // failure_percentage_minimum_hosts (default 5)
+	failurePctReqVolume uint32 // failure_percentage_request_volume (default 50)
+	enforcingFailurePct uint32 // enforcing_failure_percentage (default 0 ⇒ detect-only)
+	// interval is parse-validated (gt:0s) at 40.1; NOW load-bearing as the sweep
+	// cadence (default 10s).
+	interval time.Duration
 }
 
 // parseOutlierDetection validates + converts the cluster's outlier_detection.
@@ -59,6 +73,26 @@ func parseOutlierDetection(c *clusterv3.Cluster, name string) (*outlierConfig, e
 	}
 	if v := od.GetEnforcingConsecutiveLocalOriginFailure(); v != nil && v.GetValue() > 100 {
 		return nil, fmt.Errorf("cluster: %q: outlier_detection: enforcing_consecutive_local_origin_failure: value must be less than or equal to 100", name)
+	}
+	// statistical detector reject arms (40.3). NO arm for success_rate_stdev_factor
+	// (the reference ACCEPTS 0).
+	if v := od.GetEnforcingSuccessRate(); v != nil && v.GetValue() > 100 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: enforcing_success_rate: value must be less than or equal to 100", name)
+	}
+	if v := od.GetEnforcingFailurePercentage(); v != nil && v.GetValue() > 100 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: enforcing_failure_percentage: value must be less than or equal to 100", name)
+	}
+	if v := od.GetFailurePercentageThreshold(); v != nil && v.GetValue() > 100 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: failure_percentage_threshold: value must be less than or equal to 100", name)
+	}
+	if v := od.GetEnforcingLocalOriginSuccessRate(); v != nil && v.GetValue() > 100 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: enforcing_local_origin_success_rate: value must be less than or equal to 100", name)
+	}
+	if v := od.GetEnforcingFailurePercentageLocalOrigin(); v != nil && v.GetValue() > 100 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: enforcing_failure_percentage_local_origin: value must be less than or equal to 100", name)
+	}
+	if d := od.GetMaxEjectionTime(); d != nil && d.AsDuration() <= 0 {
+		return nil, fmt.Errorf("cluster: %q: outlier_detection: max_ejection_time: value must be greater than 0s", name)
 	}
 
 	cfg := &outlierConfig{
@@ -111,6 +145,46 @@ func parseOutlierDetection(c *clusterv3.Cluster, name string) (*outlierConfig, e
 	if v := od.GetEnforcingConsecutiveLocalOriginFailure(); v != nil {
 		cfg.enforcingLO = v.GetValue()
 	}
+	// success_rate detector defaults (40.3).
+	cfg.successRateMinHosts = 5
+	if v := od.GetSuccessRateMinimumHosts(); v != nil {
+		cfg.successRateMinHosts = v.GetValue()
+	}
+	cfg.successRateReqVolume = 100
+	if v := od.GetSuccessRateRequestVolume(); v != nil {
+		cfg.successRateReqVolume = v.GetValue()
+	}
+	cfg.successRateStdevFactor = 1900
+	if v := od.GetSuccessRateStdevFactor(); v != nil {
+		cfg.successRateStdevFactor = v.GetValue() // 0 accepted — no reject
+	}
+	cfg.enforcingSuccessRate = 100
+	if v := od.GetEnforcingSuccessRate(); v != nil {
+		cfg.enforcingSuccessRate = v.GetValue()
+	}
+	// failure_percentage detector defaults (40.3).
+	cfg.failurePctThreshold = 85
+	if v := od.GetFailurePercentageThreshold(); v != nil {
+		cfg.failurePctThreshold = v.GetValue()
+	}
+	cfg.failurePctMinHosts = 5
+	if v := od.GetFailurePercentageMinimumHosts(); v != nil {
+		cfg.failurePctMinHosts = v.GetValue()
+	}
+	cfg.failurePctReqVolume = 50
+	if v := od.GetFailurePercentageRequestVolume(); v != nil {
+		cfg.failurePctReqVolume = v.GetValue()
+	}
+	cfg.enforcingFailurePct = 0
+	if v := od.GetEnforcingFailurePercentage(); v != nil {
+		cfg.enforcingFailurePct = v.GetValue()
+	}
+	// interval — load-bearing as the sweep cadence (40.3); already validated > 0s
+	// by the reject arm above.
+	cfg.interval = 10 * time.Second
+	if d := od.GetInterval(); d != nil {
+		cfg.interval = d.AsDuration()
+	}
 	return cfg, nil
 }
 
@@ -138,9 +212,145 @@ type outlierDetector struct {
 	// guarded here so Task-4 runtime constructions tolerate the absence). (ADR-0246)
 	ejectionsDetectedLO *stats.Counter
 	ejectionsEnforcedLO *stats.Counter
+	// success_rate detector handles (allocated in registerStats at Task 7; nil-
+	// guarded here so unit constructions tolerate the absence). (ADR-0247)
+	ejectionsDetectedSR *stats.Counter // ejections_detected_success_rate
+	ejectionsEnforcedSR *stats.Counter // ejections_enforced_success_rate
+	// failure_percentage detector handles (allocated in registerStats at Task 7;
+	// nil-guarded here so unit constructions tolerate the absence). (ADR-0247)
+	ejectionsDetectedFP *stats.Counter // ejections_detected_failure_percentage
+	ejectionsEnforcedFP *stats.Counter // ejections_enforced_failure_percentage
+	// Local-origin statistical variants (LOGIC DEFERRED — registered for surface
+	// parity, emit 0; SPEC §2). (ADR-0247)
+	ejectionsDetectedLOSR *stats.Counter // ejections_detected_local_origin_success_rate
+	ejectionsEnforcedLOSR *stats.Counter // ejections_enforced_local_origin_success_rate
+	ejectionsDetectedLOFP *stats.Counter // ejections_detected_local_origin_failure_percentage
+	ejectionsEnforcedLOFP *stats.Counter // ejections_enforced_local_origin_failure_percentage
 }
 
-// registerStats allocates the 9 outlier_detection.* handles under prefix
+// hostWindow is one host's snapshotted interval window (the sweep's per-host row).
+type hostWindow struct {
+	ep      Endpoint
+	h       *hostHealth
+	total   uint64
+	success uint64
+}
+
+// sweep is one per-interval aggregation pass (SPEC §3.3): snapshot+reset every
+// host's window (atomic Swap-to-0), then run the success_rate then the
+// failure_percentage detector over the same snapshot. tryEject's CAS makes a host
+// ejectable AT MOST ONCE per sweep (AMEND-OD3-3 — if both detectors flag one host,
+// the second tryEject no-ops, so ejections_active counts one ejection per host).
+func (d *outlierDetector) sweep() {
+	snap := make([]hostWindow, 0, len(d.endpoints))
+	for _, ep := range d.endpoints {
+		h, ok := d.health.states[ep.Addr()]
+		if !ok {
+			continue
+		}
+		_ = d.health.isEjected(ep) // lazy un-eject refresh before the snapshot (SPEC §3.3 step 4)
+		snap = append(snap, hostWindow{
+			ep:      ep,
+			h:       h,
+			total:   h.intervalTotal.Swap(0),
+			success: h.intervalSuccess.Swap(0),
+		})
+	}
+	d.evalSuccessRate(snap)
+	d.evalFailurePercentage(snap)
+}
+
+// run is the background sweep loop: tick every interval until ctx is done. Unlike
+// healthChecker.run it does NOT sweep immediately at t=0 (no data has accrued yet).
+func (d *outlierDetector) run(ctx context.Context) {
+	t := time.NewTicker(d.cfg.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.sweep()
+		}
+	}
+}
+
+// evalSuccessRate runs the success_rate detector over the snapshot (SPEC §3.3 step 2):
+// collect hosts with total >= success_rate_request_volume (the eligible set); if
+// >= success_rate_minimum_hosts eligible, compute the cross-host mean success-rate +
+// the POPULATION stddev (divisor N), threshold = mean - (stdev_factor/1000)*stddev;
+// eject each eligible host with rate < threshold. A non-positive threshold is a
+// benign no-op (no rate in [0,1] is below it). (ADR-0247)
+func (d *outlierDetector) evalSuccessRate(snap []hostWindow) {
+	var eligible []hostWindow
+	for _, w := range snap {
+		if w.total == 0 { // zero-traffic host: no measured rate (reference excludes it; avoids NaN poisoning the mean)
+			continue
+		}
+		if w.total >= uint64(d.cfg.successRateReqVolume) {
+			eligible = append(eligible, w)
+		}
+	}
+	if len(eligible) < int(d.cfg.successRateMinHosts) {
+		return
+	}
+	rates := make([]float64, len(eligible))
+	var sum float64
+	for i, w := range eligible {
+		rates[i] = float64(w.success) / float64(w.total)
+		sum += rates[i]
+	}
+	mean := sum / float64(len(eligible))
+	var variance float64
+	for _, r := range rates {
+		diff := r - mean
+		variance += diff * diff
+	}
+	variance /= float64(len(eligible)) // POPULATION stddev (divisor N, not N-1)
+	threshold := mean - (float64(d.cfg.successRateStdevFactor)/1000.0)*math.Sqrt(variance)
+	if threshold <= 0 {
+		return // no success rate in [0,1] can be below a non-positive threshold (AMEND-OD3-5)
+	}
+	for i, w := range eligible {
+		if rates[i] < threshold {
+			if d.ejectionsDetectedSR != nil {
+				d.ejectionsDetectedSR.Inc()
+			}
+			d.tryEject(w.ep, w.h, d.cfg.enforcingSuccessRate, d.ejectionsEnforcedSR)
+		}
+	}
+}
+
+// evalFailurePercentage runs the failure_percentage detector over the snapshot
+// (SPEC §3.3 step 3): collect hosts with total >= failure_percentage_request_volume;
+// if >= failure_percentage_minimum_hosts eligible, eject each whose failure% >=
+// failure_percentage_threshold. failure% >= threshold is cross-multiplied to
+// (total-success)*100 >= threshold*total (integer-exact; no truncation). (ADR-0247)
+func (d *outlierDetector) evalFailurePercentage(snap []hostWindow) {
+	var eligible []hostWindow
+	for _, w := range snap {
+		if w.total == 0 { // zero-traffic host: no measured rate (reference excludes it; avoids 0>=0 spurious eject)
+			continue
+		}
+		if w.total >= uint64(d.cfg.failurePctReqVolume) {
+			eligible = append(eligible, w)
+		}
+	}
+	if len(eligible) < int(d.cfg.failurePctMinHosts) {
+		return
+	}
+	for _, w := range eligible {
+		failures := w.total - w.success
+		if failures*100 >= uint64(d.cfg.failurePctThreshold)*w.total {
+			if d.ejectionsDetectedFP != nil {
+				d.ejectionsDetectedFP.Inc()
+			}
+			d.tryEject(w.ep, w.h, d.cfg.enforcingFailurePct, d.ejectionsEnforcedFP)
+		}
+	}
+}
+
+// registerStats allocates the 17 outlier_detection.* handles under prefix
 // (`cluster.<name>.`, trailing dot included) and assigns them onto the detector.
 // The ejections_active gauge is ALSO assigned onto the shared clusterHealth ch
 // so the lazy un-eject in clusterHealth.isEjected decrements the same instance
@@ -160,6 +370,18 @@ func (d *outlierDetector) registerStats(r *stats.Registry, prefix string, ch *cl
 	d.ejectionsEnforcedGw = r.NewCounter(op + "ejections_enforced_consecutive_gateway_failure")
 	d.ejectionsDetectedLO = r.NewCounter(op + "ejections_detected_consecutive_local_origin_failure")
 	d.ejectionsEnforcedLO = r.NewCounter(op + "ejections_enforced_consecutive_local_origin_failure")
+	// +8 statistical detector counters (phase 40.3, ADR-0247) — registered
+	// UNCONDITIONALLY on any outlier cluster (the reference exposes every
+	// outlier_detection.* name regardless of configured detectors). The 4 external
+	// names are driven by the sweep; the 4 local-origin names emit 0 (logic deferred).
+	d.ejectionsDetectedSR = r.NewCounter(op + "ejections_detected_success_rate")
+	d.ejectionsEnforcedSR = r.NewCounter(op + "ejections_enforced_success_rate")
+	d.ejectionsDetectedFP = r.NewCounter(op + "ejections_detected_failure_percentage")
+	d.ejectionsEnforcedFP = r.NewCounter(op + "ejections_enforced_failure_percentage")
+	d.ejectionsDetectedLOSR = r.NewCounter(op + "ejections_detected_local_origin_success_rate")
+	d.ejectionsEnforcedLOSR = r.NewCounter(op + "ejections_enforced_local_origin_success_rate")
+	d.ejectionsDetectedLOFP = r.NewCounter(op + "ejections_detected_local_origin_failure_percentage")
+	d.ejectionsEnforcedLOFP = r.NewCounter(op + "ejections_enforced_local_origin_failure_percentage")
 	if ch != nil {
 		ch.ejectionsActive = d.ejectionsActive // same instance (lazy un-eject Dec target)
 	}
@@ -219,6 +441,14 @@ func (d *outlierDetector) record(ep Endpoint, statusCode int, localOriginErr boo
 		return
 	}
 	_ = d.health.isEjected(ep) // fast-path lazy-uneject refresh
+
+	// Windowed per-host accumulation for the statistical sweep (ADR-0247). Counts on
+	// EVERY record path (local-origin, 5xx, and non-5xx). success = NOT a local-origin
+	// failure AND NOT a 5xx external status. The sweep Swap-resets these each interval.
+	h.intervalTotal.Add(1)
+	if !localOriginErr && (statusCode < 500 || statusCode >= 600) {
+		h.intervalSuccess.Add(1)
+	}
 
 	if localOriginErr {
 		d.recordLocalOrigin(ep, h, statusCode) // split-aware local-origin detector (gateway-class mapping when split=false)

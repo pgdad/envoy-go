@@ -33,6 +33,12 @@ type hostHealth struct {
 	consec5xx      atomic.Uint32 // consecutive 5xx (reset by a 2xx from this host)
 	consecGw       atomic.Uint32 // consecutive gateway-class 5xx {502,503,504} (ADR-0246)
 	consecLO       atomic.Uint32 // consecutive local-origin failures (split=true only) (ADR-0246)
+
+	// Windowed per-host request accounting for the statistical (success_rate /
+	// failure_percentage) sweep (ADR-0247). The sweep Swap-resets these each
+	// interval; they accumulate on EVERY record path between sweeps.
+	intervalTotal   atomic.Uint64 // requests this interval window (reset at each sweep) (ADR-0247)
+	intervalSuccess atomic.Uint64 // successful requests this interval window (ADR-0247)
 }
 
 func newHostHealth() *hostHealth {

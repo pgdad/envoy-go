@@ -271,7 +271,8 @@ func main() {
 	// hot-path increments (SPEC §5.2).
 	bs.Stats.Freeze()
 
-	cm.StartHealthChecks(ctx) // active health checks (phase 39.1); checkers stop on shutdown ctx + cm.Drain()
+	cm.StartHealthChecks(ctx)     // active health checks (phase 39.1); checkers stop on shutdown ctx + cm.Drain()
+	cm.StartOutlierDetection(ctx) // passive outlier-detection sweeps (phase 40.3); stop on shutdown ctx + cm.Drain()
 
 	// Per-listener ready sentinels + terminal sentinel (ADR-0026).
 	for _, info := range lm.Listeners() {

@@ -95,6 +95,8 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0069-outlier-detection-consecutive-5xx/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0070-outlier-detection-consecutive-gateway-failure/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0071-outlier-detection-local-origin/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0072-outlier-detection-success-rate/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0073-outlier-detection-failure-percentage/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

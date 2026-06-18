@@ -38,6 +38,11 @@ type Manager struct {
 	// zero-valued until StartHealthChecks runs (phase 39.1, ADR-0243).
 	hcCancel context.CancelFunc
 	hcWG     sync.WaitGroup
+
+	// odCancel/odWG mirror hcCancel/hcWG for the passive-outlier sweep runtime
+	// (StartOutlierDetection; phase 40.3, ADR-0247). Zero-valued until started.
+	odCancel context.CancelFunc
+	odWG     sync.WaitGroup
 }
 
 // NewManager walks bs.GetStaticResources().GetClusters() and materializes one
@@ -250,6 +255,13 @@ func (m *Manager) Drain() {
 		m.hcCancel()
 		m.hcWG.Wait()
 	}
+	// Phase 40.3 (ADR-0247): stop the passive-outlier sweep runtime symmetrically
+	// with the active-HC stop above. No-op when StartOutlierDetection was never
+	// called (odCancel nil).
+	if m.odCancel != nil {
+		m.odCancel()
+		m.odWG.Wait()
+	}
 	for _, c := range m.clusters {
 		c.closePool()
 	}
@@ -271,6 +283,26 @@ func (m *Manager) StartHealthChecks(ctx context.Context) {
 				hc.run(hcCtx)
 			}(hc)
 		}
+	}
+}
+
+// StartOutlierDetection launches the per-interval aggregation sweep for every
+// cluster with outlier_detection configured (one goroutine per outlier cluster).
+// Call AFTER the stats registry is frozen (post-boot) so the injected handles are
+// live. The sweeps stop when ctx is canceled OR Drain() is called. Phase 40.3
+// (ADR-0247) — the first outlier background goroutine.
+func (m *Manager) StartOutlierDetection(ctx context.Context) {
+	odCtx, cancel := context.WithCancel(ctx)
+	m.odCancel = cancel
+	for _, c := range m.clusters {
+		if c.outlier == nil {
+			continue
+		}
+		m.odWG.Add(1)
+		go func(d *outlierDetector) {
+			defer m.odWG.Done()
+			d.run(odCtx)
+		}(c.outlier)
 	}
 }
 
