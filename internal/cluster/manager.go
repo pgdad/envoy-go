@@ -173,6 +173,13 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 	if c.outlier != nil {
 		c.outlier.registerStats(r, prefix, c.health)
 	}
+	// Phase 41 (ADR-0248): the +14 circuit_breakers stats (10 per-priority *_open
+	// gauges + 4 cluster overflow counters), on clusters WITH circuit_breakers
+	// only. Only default.rq_open + upstream_rq_pending_overflow bind LIVE handles;
+	// the other 12 register-and-stay-at-0 (deferred budgets / AMEND-CB1/CB2).
+	if c.circuitBreaker != nil {
+		c.circuitBreaker.registerStats(r, prefix)
+	}
 }
 
 // Get looks up a cluster by name. Returns (nil, false) if not found.
@@ -465,6 +472,15 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 			enforceRoll: func() uint32 { return uint32(rng() % 100) },
 		}
 	}
+	// Phase 41 (ADR-0248): parse circuit_breakers + build the per-priority budgets
+	// for a cluster with circuit_breakers (nil otherwise). The stat handles stay nil
+	// here; registerClusterMetrics injects them (Task 4). The enforce seam (router
+	// wiring) is added in Task 5.
+	cbCfg, err := parseCircuitBreakers(c, name)
+	if err != nil {
+		return nil, err
+	}
+	cl.circuitBreaker = cbCfg
 	if ts := c.GetTransportSocket(); ts != nil {
 		if ts.GetTypedConfig() == nil {
 			return nil, fmt.Errorf("cluster: %q: transport_socket without typed_config", name)

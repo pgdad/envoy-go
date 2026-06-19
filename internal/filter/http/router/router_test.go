@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
@@ -82,6 +84,16 @@ func singleEndpointCluster(t *testing.T, addr string) *cluster.Cluster {
 
 func singleEndpointClusterAndReg(t *testing.T, addr string) (*cluster.Cluster, *stats.Registry) {
 	t.Helper()
+	return singleEndpointClusterCB(t, addr, nil)
+}
+
+// singleEndpointClusterCB is the circuit-breaker-configurable variant of
+// singleEndpointClusterAndReg: when cb is non-nil it is attached to the static
+// cluster's circuit_breakers field so the built *cluster.Cluster carries a live
+// max_requests budget (Phase 41 / ADR-0248). cb==nil reproduces the original
+// nil-circuitBreaker cluster (TryAcquireRequest is a no-op true).
+func singleEndpointClusterCB(t *testing.T, addr string, cb *clusterv3.CircuitBreakers) (*cluster.Cluster, *stats.Registry) {
+	t.Helper()
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatalf("SplitHostPort %q: %v", addr, err)
@@ -97,6 +109,7 @@ func singleEndpointClusterAndReg(t *testing.T, addr string) (*cluster.Cluster, *
 				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
 				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
 				ConnectTimeout:       durationpb.New(time.Second),
+				CircuitBreakers:      cb,
 				LoadAssignment: &endpointv3.ClusterLoadAssignment{
 					ClusterName: "c_test",
 					Endpoints: []*endpointv3.LocalityLbEndpoints{{
@@ -402,6 +415,146 @@ func TestApplyHashKey(t *testing.T) {
 	if ctx0, _, ok := applyHashKey(base, nil, hv(nil), ""); ok || ctx0 != base {
 		t.Fatalf("keyless fold must return ctx unchanged: ok=%v ctxChanged=%v", ok, ctx0 != base)
 	}
+}
+
+// blockingHTTPBackend starts a TCP listener that accepts connections, reads the
+// inbound HTTP/1.1 request, then BLOCKS the response until release is closed.
+// After release fires it answers every held (and subsequent) request with a
+// minimal 200. Returns the addr + a release func + a stop func. Used by the
+// circuit-breaker admission test to hold a max_requests slot open across a
+// concurrent admission.
+func blockingHTTPBackend(t *testing.T) (addr string, release func(), stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	gate := make(chan struct{})
+	var once sync.Once
+	done := make(chan struct{})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				// Drain the request line + headers (one read is enough for the
+				// tiny GET the test sends); we only need to keep the slot held.
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				<-gate // hold the request → the max_requests slot stays acquired
+				_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
+				_ = c.Close()
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(),
+		func() { once.Do(func() { close(gate) }) },
+		func() { _ = ln.Close(); close(done) }
+}
+
+// TestDoH1ClusterAction_CircuitBreakerOverflow503 — Phase 41 Task 6 (ADR-0248).
+// With circuit_breakers{max_requests:1} a single in-flight upstream request
+// holds the only DEFAULT-priority slot; a concurrent doH1ClusterAction admission
+// overflows and returns a 503 ActionResponse WITHOUT acquiring (so it must not
+// release). Once the held request completes and releases its slot, a fresh
+// admission succeeds — proving every exit path releases exactly once (no
+// double-release, no leak).
+func TestDoH1ClusterAction_CircuitBreakerOverflow503(t *testing.T) {
+	addr, release, stop := blockingHTTPBackend(t)
+	defer stop()
+
+	cb := &clusterv3.CircuitBreakers{
+		Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+			{Priority: corev3.RoutingPriority_DEFAULT, MaxRequests: wrapperspb.UInt32(1)},
+		},
+	}
+	c, reg := singleEndpointClusterCB(t, addr, cb)
+	a := &routerAction{cluster: c}
+
+	mkReq := func() *http.Request {
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+		req.URL.Path = "/x"
+		return req
+	}
+
+	// 1) Fire the slot-holding request in the background. It acquires the only
+	//    max_requests slot and blocks inside the backend until release().
+	heldDone := make(chan ActionResponse, 1)
+	go func() {
+		resp, _, _ := doH1ClusterAction(context.Background(), a, mkReq())
+		heldDone <- resp
+	}()
+
+	// Wait until the held request has actually acquired its slot (rq_open gauge
+	// flips to 1) before probing the overflow — avoids racing the goroutine.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if gaugeIsOne(t, reg, "cluster.c_test.circuit_breakers.default.rq_open") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("held request never acquired the max_requests slot (rq_open stayed 0)")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 2) A concurrent admission overflows → 503, picked is the zero Endpoint,
+	//    and it must NOT have acquired a slot (so it must not release one).
+	resp, picked, err := doH1ClusterAction(context.Background(), a, mkReq())
+	if err != nil {
+		t.Fatalf("overflow admission returned err: %v", err)
+	}
+	if resp.Status != 503 {
+		t.Fatalf("overflow admission Status = %d, want 503", resp.Status)
+	}
+	if !picked.IsZero() {
+		t.Fatalf("overflow admission picked a host (%v), want the zero Endpoint", picked)
+	}
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_pending_overflow"); got != 1 {
+		t.Fatalf("upstream_rq_pending_overflow = %d, want 1", got)
+	}
+
+	// 3) Release the held request; its deferred ReleaseRequest fires, clearing
+	//    the slot. A fresh admission must now succeed (proves clean release; the
+	//    overflow path did not erroneously release a slot it never held).
+	release()
+	// The held doH1ClusterAction returns only AFTER its deferred ReleaseRequest
+	// has run, so receiving on heldDone guarantees the slot is freed.
+	if held := <-heldDone; held.Status != 200 {
+		t.Fatalf("held request final Status = %d, want 200", held.Status)
+	}
+	if gaugeIsOne(t, reg, "cluster.c_test.circuit_breakers.default.rq_open") {
+		t.Fatal("rq_open still 1 after the held request released its slot")
+	}
+	resp3, _, err := doH1ClusterAction(context.Background(), a, mkReq())
+	if err != nil {
+		t.Fatalf("post-release admission returned err: %v", err)
+	}
+	if resp3.Status != 200 {
+		t.Fatalf("post-release admission Status = %d, want 200 (slot freed)", resp3.Status)
+	}
+	// Exactly one overflow ever — no double-count, no spurious second overflow.
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_pending_overflow"); got != 1 {
+		t.Fatalf("upstream_rq_pending_overflow after release = %d, want 1 (no double-release/leak)", got)
+	}
+}
+
+// gaugeIsOne reports whether the gauge named `name` in registry r currently
+// reads exactly 1. Returns false if no such gauge is registered.
+func gaugeIsOne(t *testing.T, r *stats.Registry, name string) bool {
+	t.Helper()
+	one := false
+	r.Walk(func(m stats.Metric) {
+		if m.Name() != name {
+			return
+		}
+		if g, ok := m.(*stats.Gauge); ok {
+			one = g.Load() == 1
+		}
+	})
+	return one
 }
 
 // TestWithDownstreamRemoteAddr round-trips the ctx-carried downstream remote

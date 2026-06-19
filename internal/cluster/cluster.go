@@ -132,6 +132,12 @@ type Cluster struct {
 	// buildCluster, stat-registered in registerClusterMetrics, and run by
 	// Manager.StartHealthChecks (stopped by Manager.Drain / ctx cancel).
 	checkers []*healthChecker
+
+	// circuitBreaker holds the per-priority max_requests budgets + overflow
+	// counters (ADR-0248). nil for a cluster with no circuit_breakers. Built in
+	// buildCluster from parseCircuitBreakers; stat handles injected in
+	// registerClusterMetrics (Task 4). The enforce seam is wired in Task 5.
+	circuitBreaker *circuitBreaker
 }
 
 // statusClassCounter returns the upstream_rq_<Nxx> counter for the given
@@ -188,6 +194,22 @@ func (c *Cluster) RecordUpstreamResult(ep Endpoint, r UpstreamResult) {
 		return
 	}
 	c.outlier.record(ep, r.StatusCode, r.LocalOriginErr)
+}
+
+// TryAcquireRequest reserves a DEFAULT-priority max_requests slot. Returns false
+// (overflow -> caller emits 503) when exhausted. No-op true when no circuit_breakers. (ADR-0248)
+func (c *Cluster) TryAcquireRequest() bool {
+	if c.circuitBreaker == nil {
+		return true
+	}
+	return c.circuitBreaker.tryAcquire(0) // DEFAULT
+}
+
+// ReleaseRequest returns the slot acquired by TryAcquireRequest. No-op when no circuit_breakers.
+func (c *Cluster) ReleaseRequest() {
+	if c.circuitBreaker != nil {
+		c.circuitBreaker.release(0)
+	}
 }
 
 // Name returns the cluster's name.

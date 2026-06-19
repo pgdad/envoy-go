@@ -1,0 +1,75 @@
+# Phase-41 fixture 0074-circuit-breaker-max-requests: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE cluster c_cb
+# (lb_policy ROUND_ROBIN) with a circuit_breakers max_requests threshold over a
+# SINGLE endpoint — a BlockingHoldResponder (BackendKind 36) that HOLDS each
+# "GET /" request open until the driver releases it via "GET /__release" — on
+# BOTH sides (the 0066/0069 HTTP shape: reference STRICT_DNS /
+# host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# It proves that the (max_requests+1)th concurrent in-flight request is REJECTED
+# with 503 + increments the cluster upstream_rq_pending_overflow counter, and
+# that circuit_breakers.default.rq_open tracks the open breaker (1 while the
+# budget is full, 0 after release) — on BOTH the envoy-go (subject) side and the
+# reference-Envoy side.
+#
+# circuit_breakers (identical on both sides — NAT-transparent static config):
+#   thresholds: [ { priority: DEFAULT, max_requests: 4 } ]
+#
+# # The driver: fill-the-budget + probe + release (the determinism)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). The budget-fill, over-budget probe, and
+# release ALL run inside AssertStats — run SEQUENTIALLY per side (subject FULLY,
+# then reference; the shared in-process backend is idle between sides). The Drive
+# hooks stash their listener addrs and return a fixed, address-independent byte
+# stream ("READY\n") for the runner's CompareBytes gate; the config builders stash
+# the backend port for the /__release control hit (127.0.0.1:<backendPort>,
+# loopback — the same machine on both sides).
+#
+# For each side (listener listenerAddr, admin adminAddr):
+#   1. Fire maxRequests (4) CONCURRENT GET / (each blocks at the responder).
+#   2. Poll adminAddr/stats until circuit_breakers.default.rq_open == 1
+#      (deadline 10s, poll 50ms; NO fixed sleep) — all 4 slots filled.
+#   3. Baseline upstream_rq_pending_overflow. Fire the (N+1)th GET / (rejected
+#      BEFORE the backend) → assert status 503.
+#   4. Re-scrape: rq_open == 1 AND (overflow - baseline) >= 1; upstream_rq_total
+#      > 0 (decode-ran guard, reference_docker_probe_bridge_network).
+#   5. Release: GET /__release on 127.0.0.1:<backendPort> (the BACKEND control
+#      port, NOT the proxy listener).
+#   6. wg.Wait(): the 4 held requests now return 200 "backend-0:". Assert all 4
+#      got 200. Poll rq_open -> 0 (the breaker closes).
+#
+# Cross-side stats (asserted on BOTH sides):
+#     cluster.c_cb.circuit_breakers.default.rq_open       1 (full) then 0 (drained)
+#     cluster.c_cb.upstream_rq_pending_overflow (delta)   >= 1 on the rejected req
+#     cluster.c_cb.upstream_rq_total                      > 0 (decode-ran guard)
+#   plus the (N+1)th request status == 503 and the N held requests status == 200.
+#
+# # Deliberate non-assertions (recorded departures)
+#
+#   - The UO access-log response flag is NOT asserted (D-S41-3): envoy-go has no
+#     response-flags plumbing. The 503-status + overflow/rq_open stats pair is the
+#     proof.
+#   - upstream_rq_5xx is NOT asserted (the overflow 503 is a local reply; the
+#     subject does not increment the cluster 5xx counter on the rejected path — a
+#     cross-side mismatch the fixture avoids).
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The fill / probe / held (GET /) bodies
+# are NOT concatenated into the compared stream — they run inside AssertStats and
+# are asserted there (status + backend-0: body), not byte-compared.
+#
+# response-status: 503 on the (N+1)th request, 200 on the N held requests
+# (asserted in AssertStats); these are NOT part of the byte-compared stream.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path
+# (phase-01 baseline; same allow-list as fixture 0000).
+#
+# Non-additions: NO new BackendKind authored HERE (the BlockingHoldResponder = 36
+# was added at Task 9); NO DistributionAsserter (the single-host topology + the
+# circuit-breaker counters carry the proof — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

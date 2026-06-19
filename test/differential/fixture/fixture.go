@@ -575,6 +575,17 @@ const (
 	// unhealthy host. NEW BackendKind per reference_differential_fixture_dispatch
 	// _constraint; the GRPCHealthResponder = 34 precedent.
 	HTTP503Responder BackendKind = 35
+	// BlockingHoldResponder is an in-process HTTP/1.1 responder (phase 41,
+	// circuit breaking) that HOLDS each normal "GET /<seg>" request open until
+	// the driver releases the current batch via a "GET /__release" control
+	// request, then answers HTTP 200 with a "backend-<idx>:<seg>" body. The
+	// /__release request itself answers 200 "released" and re-arms the gate for
+	// the next batch. This deterministic budget-fill mechanism lets 0074 pin
+	// exactly max_requests concurrent in-flight requests before probing the
+	// breaker (the subsequent request is rejected with 503 UO / pending). NEW
+	// BackendKind per reference_differential_fixture_dispatch_constraint; the
+	// HTTP503Responder = 35 precedent (host attribution via body, no counter).
+	BlockingHoldResponder BackendKind = 36
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

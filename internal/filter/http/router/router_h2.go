@@ -59,6 +59,12 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 
 	a.cluster.IncUpstreamRqTotal()
 
+	// Phase 41 (ADR-0248): circuit-breaker max_requests admission (H2). See doH1ClusterAction.
+	if !a.cluster.TryAcquireRequest() {
+		return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders(), Body: nil}, picked, nil
+	}
+	defer a.cluster.ReleaseRequest()
+
 	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
 	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in DialH2. The H2
 	// request carries no remote addr, so source_ip uses the ctx-carried

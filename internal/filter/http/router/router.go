@@ -590,6 +590,14 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 
 	a.cluster.IncUpstreamRqTotal()
 
+	// Phase 41 (ADR-0248): circuit-breaker max_requests admission. Fail fast with a
+	// 503 (over-budget) when the cluster's DEFAULT-priority budget is exhausted; the
+	// release fires on every exit path. No-op (true) when no circuit_breakers.
+	if !a.cluster.TryAcquireRequest() {
+		return ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil}, picked, nil
+	}
+	defer a.cluster.ReleaseRequest()
+
 	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
 	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in AcquireH1. The H1
 	// codec path carries no remote addr on *http.Request, so source_ip uses the

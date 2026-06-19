@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -97,6 +98,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0071-outlier-detection-local-origin/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0072-outlier-detection-success-rate/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0073-outlier-detection-failure-percentage/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0074-circuit-breaker-max-requests/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -972,6 +974,21 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptHTTP503Counting(ln, bo.idx)
+		case fixture.BlockingHoldResponder:
+			// In-process HTTP/1.1 responder (phase 41, circuit breaking) that holds
+			// each normal "GET /<seg>" request open until a "GET /__release" control
+			// request frees the current batch, then answers HTTP 200 with a
+			// "backend-<idx>:<seg>" body. Used by 0074 to deterministically fill the
+			// max_requests budget before probing the breaker. Host attribution via
+			// response body (the acceptHTTP503Counting precedent) — no accept counter.
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptBlockingHold(ln, bo.idx)
 		}
 		backends[i] = bo
 	}
@@ -1594,6 +1611,55 @@ func acceptHTTP503Counting(ln net.Listener, idx int) {
 			body := fmt.Sprintf("backend-%d:%s", idx, seg)
 			_, _ = fmt.Fprintf(c, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 				len(body), body)
+		}(c)
+	}
+}
+
+// acceptBlockingHold accepts one HTTP/1.1 request per connection and HOLDS each
+// normal "GET /<seg>" request on a shared gate channel until a "GET /__release"
+// control request closes-and-swaps the gate (freeing the current batch and
+// re-arming for the next), then answers HTTP 200 with a "backend-<idx>:<seg>"
+// body (host attribution via body, the acceptHTTP503Counting precedent — NO
+// accept counter). Used by 0074 to deterministically fill the max_requests
+// budget before probing the circuit breaker.
+func acceptBlockingHold(ln net.Listener, idx int) {
+	var mu sync.Mutex
+	gate := make(chan struct{}) // closed by /__release to free the current batch
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer func() { _ = c.Close() }()
+			br := bufio.NewReader(c)
+			req, err := http.ReadRequest(br)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, req.Body)
+			_ = req.Body.Close()
+			if req.URL.Path == "/__release" {
+				mu.Lock()
+				old := gate
+				gate = make(chan struct{}) // re-arm for the next batch
+				mu.Unlock()
+				close(old) // free everyone currently held
+				body := "released"
+				_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+				return
+			}
+			// a normal request: block until the current batch is released.
+			mu.Lock()
+			g := gate
+			mu.Unlock()
+			<-g
+			seg := req.URL.Path
+			if i := strings.LastIndex(seg, "/"); i >= 0 && i+1 < len(seg) {
+				seg = seg[i+1:]
+			}
+			body := fmt.Sprintf("backend-%d:%s", idx, seg)
+			_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 		}(c)
 	}
 }
