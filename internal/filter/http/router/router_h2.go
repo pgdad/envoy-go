@@ -36,9 +36,17 @@ import (
 // status=0 on the ctx-cancel path is the H2 sentinel per SPEC §2.1 last
 // bullet; HCM's chain-completion access-log emit hook skips submission on
 // status=0.
-func H2ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch) H2Action {
-	a := &routerActionH2{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch}
+func H2ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch, rp *RetryPolicy) H2Action {
+	a := &routerActionH2{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch, rp: rp}
 	return func(ctx context.Context, req h2.H2Request) (ActionResponse, cluster.Endpoint, error) {
+		// 42.1 Task 8: when the route carries an effective retry_policy, wrap the
+		// single H2 driver call in the retry loop (body replay + the
+		// retry/success/limit/backoff increments). nil rp ⇒ the byte-stable
+		// single-attempt path (every existing non-retry route — all 76 differential
+		// fixtures take this branch). Mirrors H1ClusterAction's switch.
+		if a.rp != nil {
+			return retryExecutorH2(ctx, a, req)
+		}
 		return doH2ClusterAction(ctx, a, req)
 	}
 }
@@ -85,7 +93,11 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		if !ep.IsZero() { // a host was picked → attribute the local-origin connect failure
 			a.cluster.RecordUpstreamResult(ep, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
 		}
-		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
+		// 42.1 Task 8: localOrigin:true marks this as a router-synthesized DIAL
+		// failure (not a proxied upstream 502), so RetryPolicy.matches treats a
+		// connect-failure retry_on as retriable here. Mirrors the H1 dial-failure
+		// 503 site (doH1ClusterAction sets localOrigin on its synthesized failures).
+		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(), localOrigin: true}, picked, nil
 	}
 	defer func() { _ = cc.Close() }()
 	picked = ep
@@ -104,7 +116,11 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		}
 		a.cluster.IncStatusClass(502)
 		a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
-		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
+		// 42.1 Task 8: localOrigin:true marks this as a router-synthesized
+		// ROUNDTRIP failure (upstream reset/protocol error — NOT a proxied 502),
+		// so a connect-failure retry_on matches. NOT set on the ctx-cancel
+		// Status:0 return above (a client cancel is never a connect failure).
+		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(), localOrigin: true}, picked, nil
 	}
 
 	a.cluster.IncStatusClass(resp.Status)
@@ -232,6 +248,7 @@ type routerActionH2 struct {
 	filter       *Filter             // set post-build by routeTable.bindFilter; nil when no sinks configured.
 	hashPolicies []HashPolicy        // 36.2: stored at H2ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
+	rp           *RetryPolicy        // 42.1: effective retry_policy; nil when none. Stored here; the retry loop lands in Task 8.
 }
 
 // doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip

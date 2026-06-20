@@ -138,6 +138,23 @@ type Cluster struct {
 	// buildCluster from parseCircuitBreakers; stat handles injected in
 	// registerClusterMetrics (Task 4). The enforce seam is wired in Task 5.
 	circuitBreaker *circuitBreaker
+
+	// statsReg + statsPrefix are stashed by registerClusterMetrics so the +5
+	// retry counters can be registered lazily, on first EnsureRetryStats() —
+	// the scoped-registration departure of ADR-0249 (the reference is always-on;
+	// we register only for retry-policy clusters so every non-retry fixture's
+	// /stats stays byte-stable). retry is nil until EnsureRetryStats() runs.
+	statsReg    *stats.Registry
+	statsPrefix string
+	retry       *retryStats
+}
+
+// retryStats are the +5 cluster-scope retry counters (ADR-0249). backoffRL is
+// registered-only / emit-0 (no Inc method — there is no ratelimited-backoff
+// path in the MVP; it exists for reference-parity name presence). The other
+// four are Inc'd from the retry executor (Task 7).
+type retryStats struct {
+	rq, success, limitExceeded, backoffExp, backoffRL *stats.Counter
 }
 
 // statusClassCounter returns the upstream_rq_<Nxx> counter for the given
@@ -209,6 +226,74 @@ func (c *Cluster) TryAcquireRequest() bool {
 func (c *Cluster) ReleaseRequest() {
 	if c.circuitBreaker != nil {
 		c.circuitBreaker.release(0)
+	}
+}
+
+// TryAcquireRetry reserves a retry_budget slot. Returns false (overflow) when the
+// retry budget is exhausted. No-op true when no circuit_breakers / retry_budget. (ADR-0249)
+func (c *Cluster) TryAcquireRetry() bool {
+	if c.circuitBreaker == nil {
+		return true
+	}
+	return c.circuitBreaker.tryAcquireRetry()
+}
+
+// ReleaseRetry returns the slot acquired by TryAcquireRetry. No-op when no circuit_breakers. (ADR-0249)
+func (c *Cluster) ReleaseRetry() {
+	if c.circuitBreaker != nil {
+		c.circuitBreaker.releaseRetry()
+	}
+}
+
+// EnsureRetryStats registers the +5 retry counters on first call (idempotent —
+// config build is single-threaded). Scoped: called only for retry-policy
+// clusters (a recorded departure from the reference's always-on). (ADR-0249)
+// A nil statsReg means the Cluster was built without registerClusterMetrics
+// (e.g. a directly-constructed test cluster) — no registry to register against,
+// so this no-ops defensively.
+func (c *Cluster) EnsureRetryStats() {
+	if c.retry != nil || c.statsReg == nil {
+		return
+	}
+	p := c.statsPrefix
+	c.retry = &retryStats{
+		rq:            c.statsReg.NewCounter(p + "upstream_rq_retry"),
+		success:       c.statsReg.NewCounter(p + "upstream_rq_retry_success"),
+		limitExceeded: c.statsReg.NewCounter(p + "upstream_rq_retry_limit_exceeded"),
+		backoffExp:    c.statsReg.NewCounter(p + "upstream_rq_retry_backoff_exponential"),
+		backoffRL:     c.statsReg.NewCounter(p + "upstream_rq_retry_backoff_ratelimited"), // emit-0
+	}
+}
+
+// IncUpstreamRqRetry Inc's upstream_rq_retry (one per retry attempt dispatched).
+// No-op when EnsureRetryStats has not run (non-retry cluster). Wired in Task 7.
+func (c *Cluster) IncUpstreamRqRetry() {
+	if c.retry != nil {
+		c.retry.rq.Inc()
+	}
+}
+
+// IncUpstreamRqRetrySuccess Inc's upstream_rq_retry_success (a retry that
+// produced a non-retriable / successful response). Wired in Task 7.
+func (c *Cluster) IncUpstreamRqRetrySuccess() {
+	if c.retry != nil {
+		c.retry.success.Inc()
+	}
+}
+
+// IncUpstreamRqRetryLimitExceeded Inc's upstream_rq_retry_limit_exceeded (the
+// num_retries budget was hit before a successful response). Wired in Task 7.
+func (c *Cluster) IncUpstreamRqRetryLimitExceeded() {
+	if c.retry != nil {
+		c.retry.limitExceeded.Inc()
+	}
+}
+
+// IncUpstreamRqRetryBackoffExponential Inc's upstream_rq_retry_backoff_exponential
+// (one per exponential-backoff sleep before a retry attempt). Wired in Task 7.
+func (c *Cluster) IncUpstreamRqRetryBackoffExponential() {
+	if c.retry != nil {
+		c.retry.backoffExp.Inc()
 	}
 }
 

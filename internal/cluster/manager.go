@@ -111,6 +111,10 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, baseDir string, registry *
 // stats are deferred per ADR-0063).
 func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 	prefix := "cluster." + c.name + "."
+	// Stash the registry + prefix so EnsureRetryStats can lazily register the +5
+	// retry counters on retry-policy clusters only (scoped departure; ADR-0249).
+	c.statsReg = r
+	c.statsPrefix = prefix
 	c.upstreamRqTotal = r.NewCounter(prefix + "upstream_rq_total")
 	c.upstreamRq2xx = r.NewCounter(prefix + "upstream_rq_2xx")
 	c.upstreamRq3xx = r.NewCounter(prefix + "upstream_rq_3xx")

@@ -99,6 +99,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0072-outlier-detection-success-rate/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0073-outlier-detection-failure-percentage/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0074-circuit-breaker-max-requests/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0075-retry-loop/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

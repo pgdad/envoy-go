@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -289,6 +290,152 @@ func startH2Backend(t *testing.T, pki *h2BackendPKI, behavior h2BackendBehavior,
 		}
 	}()
 	return ln
+}
+
+// h2RecordingBackend is the H2 analog of scriptedBackend: a controllable
+// in-process H2 backend that records the request body bytes it received on each
+// accepted connection and scripts the response :status per connection index.
+// Each retryExecutorH2 attempt re-dials (the no-keepalive per-request-dial retry
+// shape, ADR-0056), so connection index N == attempt N, and recordedBodies()[N]
+// is the body the backend observed on attempt N. Used to PIN the documented
+// buffered-body replay claim: the same req.Body []byte must re-present in full on
+// the retry attempt.
+type h2RecordingBackend struct {
+	mu        sync.Mutex
+	bodies    [][]byte // request body bytes received, one entry per served conn
+	conns     int64    // accepted-and-served conn count (atomic)
+	statusFor func(connIndex int64) int
+}
+
+// startH2RecordingBackend listens on a fresh TLS port (NextProtos=["h2"]) and
+// serves each accepted conn via runH2RecordingConn, scripting status via
+// statusFor(connIndex). Returns the backend (for recordedBodies()) and the
+// listener (caller defers Close).
+func startH2RecordingBackend(t *testing.T, pki *h2BackendPKI, statusFor func(connIndex int64) int) (*h2RecordingBackend, net.Listener) {
+	t.Helper()
+	pair, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
+	if err != nil {
+		t.Fatalf("server keypair: %v", err)
+	}
+	cfg := &stdtls.Config{
+		Certificates: []stdtls.Certificate{pair},
+		NextProtos:   []string{"h2"},
+		MinVersion:   stdtls.VersionTLS12,
+		MaxVersion:   stdtls.VersionTLS13,
+	}
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("listen tls: %v", err)
+	}
+	b := &h2RecordingBackend{statusFor: statusFor}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go b.serve(c)
+		}
+	}()
+	return b, ln
+}
+
+// serve handles one connection: client preface + SETTINGS exchange, then reads
+// HEADERS, drains the request-body DATA frames into the recorder, and writes a
+// HEADERS+DATA response whose :status is statusFor(connIndex). Mirrors
+// runH2Backend's framing discipline; the only addition is draining + recording
+// the request body DATA frames before responding.
+func (b *h2RecordingBackend) serve(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	prefaceBuf := make([]byte, 24)
+	if _, err := io.ReadFull(conn, prefaceBuf); err != nil {
+		return
+	}
+	if string(prefaceBuf) != "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+		return
+	}
+	fr := http2.NewFramer(conn, conn)
+	frame, err := fr.ReadFrame()
+	if err != nil {
+		return
+	}
+	if _, ok := frame.(*http2.SettingsFrame); !ok {
+		return
+	}
+	if err := fr.WriteSettings(http2.Setting{ID: http2.SettingMaxFrameSize, Val: 16384}); err != nil {
+		return
+	}
+	if _, err := fr.ReadFrame(); err != nil { // client SETTINGS_ACK
+		return
+	}
+	if err := fr.WriteSettingsAck(); err != nil {
+		return
+	}
+	// Read frames until HEADERS (past any WINDOW_UPDATE / PING).
+	var streamID uint32
+	headersEnded := false
+	for {
+		frame, err = fr.ReadFrame()
+		if err != nil {
+			return
+		}
+		if hf, ok := frame.(*http2.HeadersFrame); ok {
+			streamID = hf.StreamID
+			headersEnded = hf.StreamEnded()
+			break
+		}
+	}
+	// Drain the request-body DATA frames (if the request carried a body, HEADERS
+	// did NOT end the stream) until END_STREAM, accumulating the bytes received.
+	var reqBody bytes.Buffer
+	for !headersEnded {
+		frame, err = fr.ReadFrame()
+		if err != nil {
+			return
+		}
+		if df, ok := frame.(*http2.DataFrame); ok {
+			reqBody.Write(df.Data())
+			if df.StreamEnded() {
+				break
+			}
+		}
+		// Ignore WINDOW_UPDATE / PING etc. interleaved with DATA.
+	}
+	idx := atomic.AddInt64(&b.conns, 1) - 1
+	recorded := append([]byte(nil), reqBody.Bytes()...)
+	b.mu.Lock()
+	b.bodies = append(b.bodies, recorded)
+	b.mu.Unlock()
+
+	status := strconv.Itoa(b.statusFor(idx))
+	respBody := []byte("resp:" + status)
+	var hbuf bytes.Buffer
+	henc := hpack.NewEncoder(&hbuf)
+	_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: status})
+	_ = henc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
+	_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(respBody))})
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: hbuf.Bytes(),
+		EndStream:     false,
+		EndHeaders:    true,
+	}); err != nil {
+		return
+	}
+	if err := fr.WriteData(streamID, true /* endStream */, respBody); err != nil {
+		return
+	}
+	// Linger so the client can send GOAWAY on Close without write-side errors.
+	_, _ = io.Copy(io.Discard, conn)
+}
+
+// recordedBodies returns a snapshot copy of the per-connection request bodies.
+func (b *h2RecordingBackend) recordedBodies() [][]byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([][]byte, len(b.bodies))
+	copy(out, b.bodies)
+	return out
 }
 
 // h2EndpointCluster builds a *cluster.Cluster pointing at addr, configured

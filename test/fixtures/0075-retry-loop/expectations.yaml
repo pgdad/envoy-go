@@ -1,0 +1,80 @@
+# Phase-42.1 fixture 0075-retry-loop: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture proving the HTTP retry
+# loop behaves IDENTICALLY on the envoy-go (subject) side and the reference-Envoy
+# side, on BOTH sides (the 0069 HTTP shape: reference STRICT_DNS /
+# host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# Two clusters + two routes, each a distinct retry behavior:
+#   - c_exhaust: 1 host (the always-503 HTTP503Responder, BackendKind 35).
+#     /exhaust → c_exhaust, retry_policy{retry_on:"5xx", num_retries:3}.
+#   - c_recover: 2 hosts (the 503 responder + a healthy HTTPEcho), ROUND_ROBIN.
+#     /recover → c_recover, retry_policy{retry_on:"5xx", num_retries:1}.
+#
+# # The driver: drive BOTH sides + delta the retry stats (the 0069 pattern)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). All measured work runs inside AssertStats.
+# The Drive hooks stash their listener addrs and return a fixed "READY\n" for the
+# runner's CompareBytes gate. The retry loop is SYNCHRONOUS (the GET returns only
+# after all retries complete; backoff is delay-only — it changes WHEN, never
+# WHETHER/HOW-MANY), so the assertion is COUNT-based with NO sleep.
+#
+# Per side (addr=listener, adminAddr):
+#   1. baseline scrape /stats.
+#   2. EXHAUSTION: 1 GET /exhaust → 503.
+#   3. RECOVER: recoverReqs (8) GET /recover → all 200, every 200 from host1 (echo).
+#   4. final scrape /stats; delta-assert:
+#
+#      EXHAUSTION (cross-side EXACT — single 503 host, no round-robin offset):
+#        cluster.c_exhaust.upstream_rq_retry                (delta) == 3 (numRetries)
+#        cluster.c_exhaust.upstream_rq_retry_limit_exceeded (delta) == 1
+#        cluster.c_exhaust.upstream_rq_total                (delta) == 4 (numRetries+1)
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#        cluster.c_exhaust.upstream_rq_total > 0 on the reference side.
+#
+#      RECOVER (cross-side offset-INVARIANT):
+#        http.ingress_http.downstream_rq_2xx               (delta) == 8 (recoverReqs)
+#        cluster.c_recover.upstream_rq_retry_limit_exceeded (delta) == 0
+#
+#      RECOVER (SUBJECT-side only — exact retry count NOT cross-side):
+#        cluster.c_recover.upstream_rq_retry         (delta) > 0
+#        cluster.c_recover.upstream_rq_retry_success (delta) == upstream_rq_retry delta
+#
+# # Why the recover-arm exact retry count is subject-side only
+#
+# The reference RANDOMIZES the round-robin initial offset
+# (reference_round_robin_offset_randomized), so the NUMBER of /recover requests
+# that pick the 503 host FIRST (== the number that retry) is NOT cross-side
+# deterministic. What IS offset-invariant: every /recover request recovers to a
+# downstream 200 (a 503-first request retries onto the OTHER host via the LB
+# re-pick → echo → 200; an echo-first request 200s immediately). So the cross-side
+# recover assertion is the offset-invariant downstream_rq_2xx == K + no exhaustion;
+# the exact retry/retry_success equality (every retry recovered) is subject-side.
+#
+# # The key behavioral parity this fixture proves
+#
+# With 2 hosts ROUND_ROBIN + num_retries:1, a /recover request that first picks
+# the 503 host MUST retry onto a FRESH host (the healthy echo) → 200. This holds
+# on BOTH sides because the retry re-selects the upstream host via the cluster LB
+# each attempt (envoy-go's doH1ClusterAction re-picks via AcquireH1; reference
+# Envoy's retry host-selection re-picks too). If a side pinned the SAME 503 host
+# on retry, the all-recover invariant would break — that parity IS the assertion.
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The /exhaust + /recover bodies run
+# inside AssertStats and are status/idx-classified, not byte-compared (ROUND_ROBIN
+# over 2 hosts → per-request order may differ cross-side).
+#
+# response-status: 503 on /exhaust (retries exhausted), 200 on every /recover.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path.
+#
+# Non-additions: NO new BackendKind authored HERE (HTTP503Responder = 35 + HTTPEcho
+# = 1 both reused); NO DistributionAsserter (the runner accept counters are not
+# used — the per-side classification + cross-side delta-stats live in AssertStats —
+# reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

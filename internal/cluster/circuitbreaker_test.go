@@ -269,6 +269,53 @@ func TestCircuitBreakerConcurrentNeverExceedsBudget(t *testing.T) {
 	}
 }
 
+// TestCircuitBreakerConcurrentRetryNeverExceedsBudget is the retry-budget twin of
+// the phase-41 max_requests concurrency test: under heavy contention the peak
+// concurrent retry holders must NEVER exceed the cap. budget_percent:20 with a
+// FIXED prio[0].activeRequests=100 stored up front makes the cap deterministic:
+// max(minRetryConcurrency=3, ceil(20% × 100)) = max(3,20) = 20. (ADR-0249)
+// activeRequests is held constant for the whole test so the cap can be asserted
+// against; the CAS loop's never-exceed property must hold under -race.
+func TestCircuitBreakerConcurrentRetryNeverExceedsBudget(t *testing.T) {
+	reg := stats.NewRegistry()
+	cb := &circuitBreaker{}
+	cb.hasRetryBudget = true
+	cb.budgetPercent = 20
+	cb.minRetryConcurrency = 3
+	cb.prio[0].rqRetryOpen = reg.NewGauge("test.rq_retry_open")
+	cb.upstreamRqRetryOverflow = reg.NewCounter("test.retry_overflow")
+	cb.prio[0].activeRequests.Store(100) // fixed ⇒ deterministic cap = 20
+
+	const cap = 20
+	var holders atomic.Int64
+	var peak atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				if cb.tryAcquireRetry() {
+					cur := holders.Add(1)
+					for {
+						p := peak.Load()
+						if cur <= p || peak.CompareAndSwap(p, cur) {
+							break
+						}
+					}
+					holders.Add(-1)
+					cb.releaseRetry()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := peak.Load(); got > cap {
+		t.Errorf("peak concurrent retry holders = %d, want <= %d", got, cap)
+	}
+}
+
 // TestClusterTryAcquireReleaseRequest exercises the exported router-facing seam
 // (Task 5): a Cluster WITH a registered circuitBreaker (budget 1) admits one
 // request then overflows, and a release reopens the budget. (ADR-0248)
@@ -388,5 +435,163 @@ func TestRegisterCircuitBreakerStats_Absent(t *testing.T) {
 		if hasMetric(reg, name) {
 			t.Errorf("metric %q must NOT be registered for a cluster without circuit_breakers", name)
 		}
+	}
+}
+
+// TestCircuitBreakerTryAcquireRetryNoBudget: with no retry_budget configured,
+// tryAcquireRetry is an unconditional no-op true (and releaseRetry never panics).
+func TestCircuitBreakerTryAcquireRetryNoBudget(t *testing.T) {
+	cb := &circuitBreaker{}
+	for i := 0; i < 5; i++ {
+		if !cb.tryAcquireRetry() {
+			t.Fatalf("tryAcquireRetry #%d with no retry_budget: got false, want true (no-op)", i)
+		}
+	}
+	cb.releaseRetry() // no-op; must not panic
+}
+
+// TestCircuitBreakerRetryBudgetOverflow: retry_budget{budget_percent:0,
+// min_retry_concurrency:1} ⇒ cap=1. First acquire true; second (no release) false
+// + overflow counter == 1 + rq_retry_open == 1; after releaseRetry the next is
+// true + rq_retry_open == 0.
+func TestCircuitBreakerRetryBudgetOverflow(t *testing.T) {
+	reg := stats.NewRegistry()
+	cb := &circuitBreaker{}
+	cb.hasRetryBudget = true
+	cb.budgetPercent = 0
+	cb.minRetryConcurrency = 1
+	cb.prio[0].rqRetryOpen = reg.NewGauge("test.rq_retry_open")
+	cb.upstreamRqRetryOverflow = reg.NewCounter("test.retry_overflow")
+
+	if !cb.tryAcquireRetry() {
+		t.Fatal("1st tryAcquireRetry: got false, want true")
+	}
+	if cb.tryAcquireRetry() {
+		t.Fatal("2nd tryAcquireRetry (no release): got true, want false (overflow)")
+	}
+	if got := cb.upstreamRqRetryOverflow.Load(); got != 1 {
+		t.Errorf("upstreamRqRetryOverflow = %d, want 1 after overflow", got)
+	}
+	if got := cb.prio[0].rqRetryOpen.Load(); got != 1 {
+		t.Errorf("rqRetryOpen = %d, want 1 after overflow", got)
+	}
+
+	cb.releaseRetry()
+	if got := cb.prio[0].rqRetryOpen.Load(); got != 0 {
+		t.Errorf("rqRetryOpen = %d, want 0 after releaseRetry (back under min)", got)
+	}
+	if !cb.tryAcquireRetry() {
+		t.Error("tryAcquireRetry after release: got false, want true")
+	}
+}
+
+// TestCircuitBreakerRetryBudgetCeil: budget_percent:20, min_retry_concurrency:3
+// with prio[0].activeRequests=100 ⇒ cap = max(3, ceil(20% × 100)) = max(3,20) = 20.
+// 20 acquires succeed; the 21st overflows.
+func TestCircuitBreakerRetryBudgetCeil(t *testing.T) {
+	reg := stats.NewRegistry()
+	cb := &circuitBreaker{}
+	cb.hasRetryBudget = true
+	cb.budgetPercent = 20
+	cb.minRetryConcurrency = 3
+	cb.prio[0].rqRetryOpen = reg.NewGauge("test.rq_retry_open")
+	cb.upstreamRqRetryOverflow = reg.NewCounter("test.retry_overflow")
+	cb.prio[0].activeRequests.Store(100)
+
+	for i := 0; i < 20; i++ {
+		if !cb.tryAcquireRetry() {
+			t.Fatalf("tryAcquireRetry #%d: got false, want true (cap=20)", i)
+		}
+	}
+	if cb.tryAcquireRetry() {
+		t.Fatal("21st tryAcquireRetry: got true, want false (cap=20 exhausted)")
+	}
+	if got := cb.activeRetries.Load(); got != 20 {
+		t.Errorf("activeRetries = %d, want 20", got)
+	}
+	// The overflow set rq_retry_open at the DYNAMIC cap (20).
+	if got := cb.prio[0].rqRetryOpen.Load(); got != 1 {
+		t.Errorf("rqRetryOpen = %d, want 1 after overflow at cap=20", got)
+	}
+	// Asymmetric soft-budget gauge: set-at-cap / clear-below-min. One release drops
+	// 20→19, still >= minRetryConcurrency=3, so rq_retry_open must STAY 1 (it only
+	// clears once activeRetries falls below the min floor, not below the dynamic cap).
+	cb.releaseRetry()
+	if got := cb.prio[0].rqRetryOpen.Load(); got != 1 {
+		t.Errorf("rqRetryOpen = %d, want 1 after one release (19 >= min=3, still open)", got)
+	}
+}
+
+// TestParseCircuitBreakers_RetryBudgetDefaults: retry_budget absent ⇒
+// hasRetryBudget == false; present (empty) ⇒ defaults 20 / 3 applied (DEFAULT only).
+func TestParseCircuitBreakers_RetryBudgetDefaults(t *testing.T) {
+	// absent
+	cAbsent := &clusterv3.Cluster{
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+				{Priority: corev3.RoutingPriority_DEFAULT, MaxRequests: wrapperspb.UInt32(4)},
+			},
+		},
+	}
+	cbAbsent, err := parseCircuitBreakers(cAbsent, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cbAbsent.hasRetryBudget {
+		t.Error("hasRetryBudget = true, want false when retry_budget absent")
+	}
+
+	// present, empty ⇒ defaults
+	cPresent := &clusterv3.Cluster{
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+				{
+					Priority:    corev3.RoutingPriority_DEFAULT,
+					RetryBudget: &clusterv3.CircuitBreakers_Thresholds_RetryBudget{},
+				},
+			},
+		},
+	}
+	cbPresent, err := parseCircuitBreakers(cPresent, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cbPresent.hasRetryBudget {
+		t.Fatal("hasRetryBudget = false, want true when retry_budget present")
+	}
+	if cbPresent.budgetPercent != 20 {
+		t.Errorf("budgetPercent = %v, want 20 (default)", cbPresent.budgetPercent)
+	}
+	if cbPresent.minRetryConcurrency != 3 {
+		t.Errorf("minRetryConcurrency = %d, want 3 (default)", cbPresent.minRetryConcurrency)
+	}
+}
+
+// TestClusterTryAcquireReleaseRetry exercises the Cluster-level nil-guards:
+// no circuitBreaker ⇒ always true / no-op; with a budget ⇒ delegates.
+func TestClusterTryAcquireReleaseRetry(t *testing.T) {
+	cl := &Cluster{name: "no_cb"}
+	if !cl.TryAcquireRetry() {
+		t.Error("TryAcquireRetry with no circuitBreaker: got false, want true (nil-guard)")
+	}
+	cl.ReleaseRetry() // no-op; must not panic
+
+	cb := &circuitBreaker{}
+	cb.hasRetryBudget = true
+	cb.budgetPercent = 0
+	cb.minRetryConcurrency = 1
+	reg := stats.NewRegistry()
+	cb.prio[0].rqRetryOpen = reg.NewGauge("test.rq_retry_open")
+	cb.upstreamRqRetryOverflow = reg.NewCounter("test.retry_overflow")
+	cl2 := &Cluster{name: "cb", circuitBreaker: cb}
+	if !cl2.TryAcquireRetry() {
+		t.Error("1st TryAcquireRetry: got false, want true")
+	}
+	if cl2.TryAcquireRetry() {
+		t.Error("2nd TryAcquireRetry: got true, want false (cap=1)")
+	}
+	cl2.ReleaseRetry()
+	if !cl2.TryAcquireRetry() {
+		t.Error("TryAcquireRetry after release: got false, want true")
 	}
 }

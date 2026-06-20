@@ -1144,3 +1144,117 @@ func TestBuildWeightedRouterAction_EntryNonScalarRejects(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildRouterAction_RetryPolicyParse exercises the phase-42.1 Task 4
+// retry_policy parse + the vhost→route fallback + the rejects. The single-cluster
+// arm (mkH2ClusterManager's c_h1) carries the parsed *router.RetryPolicy on the
+// returned *clusterRouteAction. The fallback is fed through buildRouterAction's
+// vhRetryPolicy param (the same value buildRouteTable threads from
+// vh.GetRetryPolicy()).
+func TestBuildRouterAction_RetryPolicyParse(t *testing.T) {
+	cm := mkH2ClusterManager(t)
+	mkRA := func() *routev3.RouteAction {
+		return &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h1"}}
+	}
+	getRP := func(t *testing.T, got routeAction) *router.RetryPolicy {
+		t.Helper()
+		bridge, ok := got.(*clusterRouteAction)
+		if !ok {
+			t.Fatalf("got %T; want *clusterRouteAction", got)
+		}
+		return bridge.retryPolicy
+	}
+
+	// Route-level retry_policy{retry_on:"5xx", num_retries:3} ⇒ parsed, numRetries==3.
+	t.Run("route-level", func(t *testing.T) {
+		ra := mkRA()
+		ra.RetryPolicy = &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(3)}
+		got, err := buildRouterAction(ra, cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		rp := getRP(t, got)
+		if rp == nil {
+			t.Fatal("retryPolicy is nil; want a parsed policy")
+		}
+		if rp.NumRetries() != 3 {
+			t.Errorf("NumRetries()=%d; want 3", rp.NumRetries())
+		}
+	})
+
+	// No route-level retry_policy + a vhost retry_policy ⇒ inherit the vhost.
+	t.Run("vhost-inherit", func(t *testing.T) {
+		vh := &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(5)}
+		got, err := buildRouterActionWithVH(mkRA(), "r_inherit", cm, vh)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		rp := getRP(t, got)
+		if rp == nil {
+			t.Fatal("retryPolicy is nil; want the inherited vhost policy")
+		}
+		if rp.NumRetries() != 5 {
+			t.Errorf("NumRetries()=%d; want 5 (inherited vhost)", rp.NumRetries())
+		}
+	})
+
+	// Route-level retry_policy OVERRIDES the vhost.
+	t.Run("route-overrides-vhost", func(t *testing.T) {
+		ra := mkRA()
+		ra.RetryPolicy = &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(2)}
+		vh := &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(9)}
+		got, err := buildRouterActionWithVH(ra, "r_override", cm, vh)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		rp := getRP(t, got)
+		if rp == nil {
+			t.Fatal("retryPolicy is nil; want the route override")
+		}
+		if rp.NumRetries() != 2 {
+			t.Errorf("NumRetries()=%d; want 2 (route overrides vhost)", rp.NumRetries())
+		}
+	})
+
+	// Neither route nor vhost ⇒ retryPolicy stays nil (byte-stable path).
+	t.Run("neither", func(t *testing.T) {
+		got, err := buildRouterAction(mkRA(), cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		if rp := getRP(t, got); rp != nil {
+			t.Errorf("retryPolicy=%v; want nil when no retry_policy is set", rp)
+		}
+	})
+
+	// retry_back_off{base:100ms, max:50ms} ⇒ the max<base reject.
+	t.Run("max-lt-base-reject", func(t *testing.T) {
+		ra := mkRA()
+		ra.RetryPolicy = &routev3.RetryPolicy{
+			RetryOn: "5xx",
+			RetryBackOff: &routev3.RetryPolicy_RetryBackOff{
+				BaseInterval: durationpb.New(100 * time.Millisecond),
+				MaxInterval:  durationpb.New(50 * time.Millisecond),
+			},
+		}
+		_, err := buildRouterAction(ra, cm)
+		if err == nil || !strings.Contains(err.Error(), "max_interval must be greater than or equal to the base_interval") {
+			t.Errorf("err=%v; want the max<base reject", err)
+		}
+	})
+
+	// retry_back_off set with base_interval=0 (explicitly) ⇒ the base reject.
+	t.Run("base-required-reject", func(t *testing.T) {
+		ra := mkRA()
+		ra.RetryPolicy = &routev3.RetryPolicy{
+			RetryOn: "5xx",
+			RetryBackOff: &routev3.RetryPolicy_RetryBackOff{
+				BaseInterval: durationpb.New(0),
+			},
+		}
+		_, err := buildRouterAction(ra, cm)
+		if err == nil || !strings.Contains(err.Error(), "base_interval must be greater than 0s") {
+			t.Errorf("err=%v; want the base_interval-required reject", err)
+		}
+	})
+}

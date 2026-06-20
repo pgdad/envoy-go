@@ -101,25 +101,42 @@ type WeightedCluster struct {
 // + subset match + the shared route-level hashPolicies. It PRE-BUILDS one
 // *routerAction per entry at construction (NO per-request alloc; the filter field
 // stays nil exactly as H1ClusterAction's chain-mediated path). ADR-0241.
-func H1WeightedClusterAction(wcs []WeightedCluster, hps []HashPolicy, sel *weightedSelector) Action {
+func H1WeightedClusterAction(wcs []WeightedCluster, hps []HashPolicy, sel *weightedSelector, rp *RetryPolicy) Action {
 	actions := make([]*routerAction, len(wcs))
 	for i, wc := range wcs {
-		actions[i] = &routerAction{cluster: wc.Cluster, hashPolicies: hps, subsetMatch: wc.SubsetMatch}
+		actions[i] = &routerAction{cluster: wc.Cluster, hashPolicies: hps, subsetMatch: wc.SubsetMatch, rp: rp}
 	}
 	return func(ctx context.Context, req *http.Request) (ActionResponse, cluster.Endpoint, error) {
-		return doH1ClusterAction(ctx, actions[sel.pick()], req)
+		// 42.1 Task 8: the weighted path has its OWN dispatch (it does not route
+		// through the H1ClusterAction closure), so the retry switch is added here
+		// explicitly. Each per-entry *routerAction carries the shared rp (threaded
+		// at construction, Task 4); a non-nil rp runs the retry loop for the picked
+		// entry. nil rp ⇒ the byte-stable single-attempt path.
+		a := actions[sel.pick()]
+		if a.rp != nil {
+			return retryExecutorH1(ctx, a, req)
+		}
+		return doH1ClusterAction(ctx, a, req)
 	}
 }
 
 // H2WeightedClusterAction is the H2 sibling (the H2ClusterAction precedent). The
 // selector is SHARED with the H1 constructor (a route is H1 or H2 per listener;
 // the caller passes the same *weightedSelector to both — only one path runs).
-func H2WeightedClusterAction(wcs []WeightedCluster, hps []HashPolicy, sel *weightedSelector) H2Action {
+func H2WeightedClusterAction(wcs []WeightedCluster, hps []HashPolicy, sel *weightedSelector, rp *RetryPolicy) H2Action {
 	actions := make([]*routerActionH2, len(wcs))
 	for i, wc := range wcs {
-		actions[i] = &routerActionH2{cluster: wc.Cluster, hashPolicies: hps, subsetMatch: wc.SubsetMatch}
+		actions[i] = &routerActionH2{cluster: wc.Cluster, hashPolicies: hps, subsetMatch: wc.SubsetMatch, rp: rp}
 	}
 	return func(ctx context.Context, req h2.H2Request) (ActionResponse, cluster.Endpoint, error) {
-		return doH2ClusterAction(ctx, actions[sel.pick()], req)
+		// 42.1 Task 8: the weighted H2 path has its OWN dispatch (it does not route
+		// through the H2ClusterAction closure), so the retry switch is added here
+		// explicitly — mirroring the H1 weighted constructor above. The picked
+		// per-entry *routerActionH2 carries the shared rp; non-nil ⇒ retry loop.
+		a := actions[sel.pick()]
+		if a.rp != nil {
+			return retryExecutorH2(ctx, a, req)
+		}
+		return doH2ClusterAction(ctx, a, req)
 	}
 }

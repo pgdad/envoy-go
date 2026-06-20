@@ -126,6 +126,13 @@ type ActionResponse struct {
 	// shadowing real errors. Phase 07.1 Task 18 prereq P1 surfaces this
 	// alongside the response struct.
 	Close bool
+	// localOrigin marks a router-synthesized dial/connection/write/read failure
+	// (NOT a proxied upstream response, and NOT the CB-overflow 503). The retry
+	// executor (phase 42.1 Task 7) feeds it into RetryPolicy.matches so a
+	// connect-failure retry_on matches a synthesized failure but never an
+	// upstream that genuinely RESPONDED 5xx. Unexported (internal classification
+	// signal; never serialized to the wire).
+	localOrigin bool
 }
 
 // Action is the per-request executor injected by HCM dispatch into the
@@ -555,14 +562,22 @@ func applyHashKey(ctx context.Context, hps []HashPolicy, headerVal func(name str
 // ErrCloseAfterAction returned by the closure signals the HCM connection
 // loop to close the downstream after the response writes (per SPEC §5.3 +
 // §10 #3 settled).
-func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch) Action {
-	a := &routerAction{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch}
+func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch, rp *RetryPolicy) Action {
+	a := &routerAction{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch, rp: rp}
 	return func(ctx context.Context, req *http.Request) (ActionResponse, cluster.Endpoint, error) {
 		// Phase 07.1 Task 18 prereq P1: doH1ClusterAction returns an
 		// ActionResponse logical shape (no wire-bytes serialization here).
 		// HCM dispatch's chain-completion path runs the encode chain over
 		// the response THEN writes wire bytes — see internal/filter/hcm/
 		// connection.go's dispatchRequest at the chain-mediated dispatch path.
+		//
+		// 42.1 Task 7: when the route carries an effective retry_policy, wrap the
+		// single driver call in the retry loop (body capture/replay + the
+		// retry/success/limit/backoff increments). nil rp ⇒ the byte-stable
+		// single-attempt path (every existing non-retry route).
+		if a.rp != nil {
+			return retryExecutorH1(ctx, a, req)
+		}
 		return doH1ClusterAction(ctx, a, req)
 	}
 }
@@ -621,7 +636,7 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 		if !ep.IsZero() { // a host was picked → attribute the local-origin connect failure
 			a.cluster.RecordUpstreamResult(ep, cluster.UpstreamResult{StatusCode: 503, LocalOriginErr: true})
 		}
-		return ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil}, picked, nil
+		return ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil, localOrigin: true}, picked, nil
 	}
 	upstream := pooled.Conn
 	// reusable is flipped to true on the happy path right before return; on
@@ -648,7 +663,7 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 	if err := req.Write(upstream); err != nil {
 		a.cluster.IncStatusClass(502)
 		a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
-		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
+		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil, localOrigin: true}, picked, nil
 	}
 
 	// Reuse the pooled bufio.Reader so that any read-ahead buffered bytes
@@ -661,7 +676,7 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 	if err != nil {
 		a.cluster.IncStatusClass(502)
 		a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
-		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil}, picked, nil
+		return ActionResponse{Status: 502, Headers: localReplyHeaders(0), Body: nil, localOrigin: true}, picked, nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -740,6 +755,7 @@ type routerAction struct {
 	filter       *Filter             // set post-build by routeTable.bindFilter; nil when no sinks configured.
 	hashPolicies []HashPolicy        // 36.2: stored at H1ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
+	rp           *RetryPolicy        // 42.1: effective retry_policy; nil when none. Stored here; the retry loop lands in Task 7.
 }
 
 // do drives one upstream H1 round-trip. Phase 06.1 Task 11 wires the cluster-
