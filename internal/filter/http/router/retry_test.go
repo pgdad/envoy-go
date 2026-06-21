@@ -667,7 +667,7 @@ func TestH2WeightedClusterAction_RunsRetryExecutor(t *testing.T) {
 
 	sel := newWeightedSelectorWithRNG([]uint32{1}, newSeqRNG(0))
 	wcs := []WeightedCluster{{Cluster: c}}
-	act := H2WeightedClusterAction(wcs, nil, sel, mkRetryPolicy(t, "gateway-error", 2))
+	act := H2WeightedClusterAction(wcs, nil, sel, mkRetryPolicy(t, "gateway-error", 2), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

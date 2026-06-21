@@ -101,6 +101,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0074-circuit-breaker-max-requests/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0075-retry-loop/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0076-per-try-timeout/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0077-hedge-on-per-try-timeout/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

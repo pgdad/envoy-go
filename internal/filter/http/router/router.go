@@ -562,8 +562,8 @@ func applyHashKey(ctx context.Context, hps []HashPolicy, headerVal func(name str
 // ErrCloseAfterAction returned by the closure signals the HCM connection
 // loop to close the downstream after the response writes (per SPEC §5.3 +
 // §10 #3 settled).
-func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch, rp *RetryPolicy) Action {
-	a := &routerAction{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch, rp: rp}
+func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch, rp *RetryPolicy, hp *HedgePolicy) Action {
+	a := &routerAction{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch, rp: rp, hp: hp}
 	return func(ctx context.Context, req *http.Request) (ActionResponse, cluster.Endpoint, error) {
 		// Phase 07.1 Task 18 prereq P1: doH1ClusterAction returns an
 		// ActionResponse logical shape (no wire-bytes serialization here).
@@ -575,6 +575,14 @@ func H1ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.S
 		// single driver call in the retry loop (body capture/replay + the
 		// retry/success/limit/backoff increments). nil rp ⇒ the byte-stable
 		// single-attempt path (every existing non-retry route).
+		//
+		// 42.2b Task 8: a TRIGGERING hedge_policy wins even when a retry_policy is
+		// also present — the concurrent hedgeExecutorH1 REUSES rp for
+		// matches/numRetries/perTryTimeout. The hedge branch therefore precedes the
+		// retry branch. nil/non-triggering hp ⇒ the byte-stable 42.1/42.2a path.
+		if a.hp != nil && a.hp.TriggersConcurrency() {
+			return hedgeExecutorH1(ctx, a, req)
+		}
 		if a.rp != nil {
 			return retryExecutorH1(ctx, a, req)
 		}
@@ -756,6 +764,7 @@ type routerAction struct {
 	hashPolicies []HashPolicy        // 36.2: stored at H1ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
 	rp           *RetryPolicy        // 42.1: effective retry_policy; nil when none. Stored here; the retry loop lands in Task 7.
+	hp           *HedgePolicy        // 42.2b: effective hedge_policy; nil when none. The concurrent hedgeExecutor dispatches on it in Task 8 (closure switch). Set by the widened H{1,2}ClusterAction constructor (Task 8); nil/unset until then.
 }
 
 // do drives one upstream H1 round-trip. Phase 06.1 Task 11 wires the cluster-

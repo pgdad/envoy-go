@@ -8,6 +8,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
@@ -264,7 +265,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		return nil, fmt.Errorf("hcm: route_config: virtual_hosts[0]: %w", err)
 	}
 
-	table, err := buildRouteTable(vh.GetRoutes(), clusters, vh.GetRetryPolicy())
+	table, err := buildRouteTable(vh.GetRoutes(), clusters, vh.GetRetryPolicy(), vh.GetHedgePolicy())
 	if err != nil {
 		return nil, err
 	}
@@ -409,14 +410,19 @@ func buildPerRouteFromHCM(rc *routev3.RouteConfiguration, chainNames []string, h
 // (route-level retry_policy overrides; absent → inherit vhost). nil when the
 // virtual_host has no retry_policy. The fallback shape mirrors the
 // includeVhRateLimits/GetRateLimits vhost-propagation precedent below.
-func buildRouteTable(routes []*routev3.Route, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy) (*routeTable, error) {
+//
+// vhHedgePolicy (phase 42.2b Task 7) is the parent virtual_host's hedge_policy,
+// threaded down identically for the vhost→route fallback (route-level
+// hedge_policy overrides; absent → inherit vhost). nil when the virtual_host
+// has no hedge_policy.
+func buildRouteTable(routes []*routev3.Route, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy, vhHedgePolicy *routev3.HedgePolicy) (*routeTable, error) {
 	t := &routeTable{routes: make([]routeEntry, 0, len(routes))}
 	for i, r := range routes {
 		match, err := buildMatch(r.GetMatch())
 		if err != nil {
 			return nil, fmt.Errorf("hcm: route %d: %w", i, err)
 		}
-		action, err := buildAction(r.GetAction(), r.GetName(), r.GetResponseHeadersToAdd(), clusters, vhRetryPolicy)
+		action, err := buildAction(r.GetAction(), r.GetName(), r.GetResponseHeadersToAdd(), clusters, vhRetryPolicy, vhHedgePolicy)
 		if err != nil {
 			return nil, fmt.Errorf("hcm: route %d: %w", i, err)
 		}
@@ -510,10 +516,10 @@ func buildMatch(m *routev3.RouteMatch) (routeMatch, error) {
 	}
 }
 
-func buildAction(a interface{}, routeName string, responseHeadersToAdd []*corev3.HeaderValueOption, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy) (routeAction, error) {
+func buildAction(a interface{}, routeName string, responseHeadersToAdd []*corev3.HeaderValueOption, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy, vhHedgePolicy *routev3.HedgePolicy) (routeAction, error) {
 	switch act := a.(type) {
 	case *routev3.Route_Route:
-		return buildRouterActionWithVH(act.Route, routeName, clusters, vhRetryPolicy)
+		return buildRouterActionWithVH(act.Route, routeName, clusters, vhRetryPolicy, vhHedgePolicy)
 	case *routev3.Route_DirectResponse:
 		return buildDirectResponseAction(act.DirectResponse, responseHeadersToAdd)
 	case nil:
@@ -548,13 +554,13 @@ func buildAction(a interface{}, routeName string, responseHeadersToAdd []*corev3
 // buildRouterActionWithVH with the real route name); this wrapper exists only
 // for the pre-existing unit tests.
 func buildRouterAction(r *routev3.RouteAction, clusters *cluster.Manager) (routeAction, error) {
-	return buildRouterActionWithVH(r, "", clusters, nil)
+	return buildRouterActionWithVH(r, "", clusters, nil, nil)
 }
 
 // buildRouterActionWithVH (phase 42.1 Task 4) is the production entry: it carries
 // the route name (the reject %q identifier) and the parent virtual_host's
 // retry_policy for the vhost→route fallback.
-func buildRouterActionWithVH(r *routev3.RouteAction, routeName string, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy) (routeAction, error) {
+func buildRouterActionWithVH(r *routev3.RouteAction, routeName string, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy, vhHedgePolicy *routev3.HedgePolicy) (routeAction, error) {
 	if r == nil {
 		return nil, fmt.Errorf("route action is nil")
 	}
@@ -588,9 +594,22 @@ func buildRouterActionWithVH(r *routev3.RouteAction, routeName string, clusters 
 		if rp != nil {
 			c.EnsureRetryStats()
 		}
-		return &clusterRouteAction{cluster: c, hashPolicies: hps, subsetMatch: sm, retryPolicy: rp}, nil
+		// Phase 42.2b Task 7: parse the effective hedge_policy (route-level
+		// overrides vhost; absent → nil). A triggering hedge (initial_requests>1,
+		// hedge_on_per_try_timeout, or additional_request_chance>0) reuses the
+		// retry counters (AMEND-H5), so register them when TriggersConcurrency.
+		// Byte-stable: no existing fixture sets hedge_policy, so hp stays nil and
+		// the stat surface is unchanged.
+		hp, err := parseHedgePolicy(r, vhHedgePolicy, cs.Cluster)
+		if err != nil {
+			return nil, err
+		}
+		if hp.TriggersConcurrency() {
+			c.EnsureRetryStats()
+		}
+		return &clusterRouteAction{cluster: c, hashPolicies: hps, subsetMatch: sm, retryPolicy: rp, hedgePolicy: hp}, nil
 	case *routev3.RouteAction_WeightedClusters:
-		return buildWeightedRouterAction(r, cs.WeightedClusters, routeName, clusters, vhRetryPolicy)
+		return buildWeightedRouterAction(r, cs.WeightedClusters, routeName, clusters, vhRetryPolicy, vhHedgePolicy)
 	default:
 		return nil, fmt.Errorf("route action: cluster_specifier %T is not supported in phase 04 (literal cluster name or weighted_clusters)", r.GetClusterSpecifier())
 	}
@@ -655,12 +674,59 @@ func parseRetryPolicy(r *routev3.RouteAction, vhRetryPolicy *routev3.RetryPolicy
 	return rp, nil
 }
 
+// fractionalDenominator lowers a type.v3.FractionalPercent_DenominatorType to
+// its integer denominator (HUNDRED=100, TEN_THOUSAND=10000, MILLION=1000000).
+func fractionalDenominator(d typev3.FractionalPercent_DenominatorType) uint32 {
+	switch d {
+	case typev3.FractionalPercent_TEN_THOUSAND:
+		return 10000
+	case typev3.FractionalPercent_MILLION:
+		return 1000000
+	default: // HUNDRED (the proto default)
+		return 100
+	}
+}
+
+// parseHedgePolicy lowers a RouteAction's effective hedge_policy into a
+// proto-free *router.HedgePolicy (phase 42.2b Task 7), mirroring parseRetryPolicy.
+// The effective policy is the route-level HedgePolicy if present, else the parent
+// virtual_host's (the vhost→route fallback). Returns (nil, nil) when neither is
+// set — the byte-stable path. initial_requests defaults to 1 when absent (the
+// proto default); additional_request_chance defaults to 0/100. A zero
+// initial_requests rejects via NewHedgePolicy (the gte:1 PGV), re-emitted
+// route-scoped with the SUFFIX kept byte-identical to ErrMsgInitialRequestsBelowOne.
+// name is the reject %q identifier (the cluster name for the single-cluster arm;
+// the route name for the weighted arm).
+func parseHedgePolicy(r *routev3.RouteAction, vhHedgePolicy *routev3.HedgePolicy, name string) (*router.HedgePolicy, error) {
+	eff := r.GetHedgePolicy()
+	if eff == nil {
+		eff = vhHedgePolicy
+	}
+	if eff == nil {
+		return nil, nil
+	}
+	ir := uint32(1)
+	if v := eff.GetInitialRequests(); v != nil {
+		ir = v.GetValue()
+	}
+	num, den := uint32(0), uint32(100)
+	if c := eff.GetAdditionalRequestChance(); c != nil {
+		num = c.GetNumerator()
+		den = fractionalDenominator(c.GetDenominator())
+	}
+	hp, err := router.NewHedgePolicy(ir, eff.GetHedgeOnPerTryTimeout(), num, den)
+	if err != nil {
+		return nil, fmt.Errorf("route: %q: hedge_policy: %s", name, err.Error())
+	}
+	return hp, nil
+}
+
 // buildWeightedRouterAction lowers a RouteAction.weighted_clusters into a
 // weightedClusterRouteAction (ADR-0241). envoy-go does its OWN parse-reject (no
 // PGV) — the SPEC §6 SIX-arm roster, in the reference's precedence order. Task 6
 // lands the FULL function (validation + merge + build) so the accept test below
 // observes a real *weightedClusterRouteAction; Task 7 adds the accept-CASE tests.
-func buildWeightedRouterAction(r *routev3.RouteAction, wc *routev3.WeightedCluster, routeName string, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy) (routeAction, error) {
+func buildWeightedRouterAction(r *routev3.RouteAction, wc *routev3.WeightedCluster, routeName string, clusters *cluster.Manager, vhRetryPolicy *routev3.RetryPolicy, vhHedgePolicy *routev3.HedgePolicy) (routeAction, error) {
 	entries := wc.GetClusters()
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("route action: weighted_clusters has no clusters")
@@ -674,6 +740,15 @@ func buildWeightedRouterAction(r *routev3.RouteAction, wc *routev3.WeightedClust
 	// cluster identifies a weighted action). Threaded onto every entry's
 	// routerAction via buildWeightedBridge below.
 	rp, err := parseRetryPolicy(r, vhRetryPolicy, routeName)
+	if err != nil {
+		return nil, err
+	}
+	// Phase 42.2b Task 7: the effective hedge_policy is likewise per-RouteAction.
+	// Parsed here so its rejects (initial_requests<1) fire at boot and a
+	// triggering hedge registers the reused retry counters on each entry's
+	// cluster (AMEND-H5). The weighted dispatch closures (H{1,2}WeightedClusterAction)
+	// are NOT yet widened to consume hp — that is Task 8; here we parse+stat only.
+	hp, err := parseHedgePolicy(r, vhHedgePolicy, routeName)
 	if err != nil {
 		return nil, err
 	}
@@ -704,6 +779,12 @@ func buildWeightedRouterAction(r *routev3.RouteAction, wc *routev3.WeightedClust
 		if rp != nil {
 			c.EnsureRetryStats()
 		}
+		// Phase 42.2b Task 7 (AMEND-H5): a triggering hedge reuses the retry
+		// counters; register them per entry. Byte-stable: skipped when hp == nil
+		// or the policy does not trigger concurrency.
+		if hp.TriggersConcurrency() {
+			c.EnsureRetryStats()
+		}
 		sm, err := mergeRouteSubsetMatch(r.GetMetadataMatch(), cw.GetMetadataMatch())
 		if err != nil {
 			return nil, err
@@ -718,22 +799,24 @@ func buildWeightedRouterAction(r *routev3.RouteAction, wc *routev3.WeightedClust
 	if total == 0 {
 		return nil, fmt.Errorf("route action: weighted_clusters total weight must be > 0")
 	}
-	return buildWeightedBridge(wcs, hps, weights, rp)
+	return buildWeightedBridge(wcs, hps, weights, rp, hp)
 }
 
 // buildWeightedBridge constructs the selector (the cumulative weights + a
 // crypto-seeded RNG — Σweights > 0 already proven above) and the H1/H2 dispatch
 // closures sharing it, returning the weightedClusterRouteAction bridge. rp
 // (phase 42.1 Task 4) is the per-RouteAction effective retry_policy threaded
-// onto every entry's routerAction; nil when no retry_policy applies.
-func buildWeightedBridge(wcs []router.WeightedCluster, hps []router.HashPolicy, weights []uint32, rp *router.RetryPolicy) (routeAction, error) {
+// onto every entry's routerAction; nil when no retry_policy applies. hp
+// (phase 42.2b Task 8) is the per-RouteAction effective hedge_policy threaded
+// identically onto every entry's routerAction; nil/non-triggering ⇒ byte-stable.
+func buildWeightedBridge(wcs []router.WeightedCluster, hps []router.HashPolicy, weights []uint32, rp *router.RetryPolicy, hp *router.HedgePolicy) (routeAction, error) {
 	sel, err := router.NewWeightedSelector(weights)
 	if err != nil {
 		return nil, fmt.Errorf("route action: weighted_clusters: %w", err) // crypto/rand seed failure → boot-fail
 	}
 	return &weightedClusterRouteAction{
-		h1: router.H1WeightedClusterAction(wcs, hps, sel, rp),
-		h2: router.H2WeightedClusterAction(wcs, hps, sel, rp),
+		h1: router.H1WeightedClusterAction(wcs, hps, sel, rp, hp),
+		h2: router.H2WeightedClusterAction(wcs, hps, sel, rp, hp),
 	}, nil
 }
 

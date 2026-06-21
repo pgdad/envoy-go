@@ -36,14 +36,21 @@ import (
 // status=0 on the ctx-cancel path is the H2 sentinel per SPEC §2.1 last
 // bullet; HCM's chain-completion access-log emit hook skips submission on
 // status=0.
-func H2ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch, rp *RetryPolicy) H2Action {
-	a := &routerActionH2{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch, rp: rp}
+func H2ClusterAction(c *cluster.Cluster, hps []HashPolicy, subsetMatch cluster.SubsetMatch, rp *RetryPolicy, hp *HedgePolicy) H2Action {
+	a := &routerActionH2{cluster: c, hashPolicies: hps, subsetMatch: subsetMatch, rp: rp, hp: hp}
 	return func(ctx context.Context, req h2.H2Request) (ActionResponse, cluster.Endpoint, error) {
 		// 42.1 Task 8: when the route carries an effective retry_policy, wrap the
 		// single H2 driver call in the retry loop (body replay + the
 		// retry/success/limit/backoff increments). nil rp ⇒ the byte-stable
 		// single-attempt path (every existing non-retry route — all 76 differential
 		// fixtures take this branch). Mirrors H1ClusterAction's switch.
+		//
+		// 42.2b Task 8: a TRIGGERING hedge_policy wins even when a retry_policy is
+		// also present — hedgeExecutorH2 REUSES rp. The hedge branch precedes the
+		// retry branch (mirrors H1ClusterAction). nil/non-triggering hp ⇒ byte-stable.
+		if a.hp != nil && a.hp.TriggersConcurrency() {
+			return hedgeExecutorH2(ctx, a, req)
+		}
 		if a.rp != nil {
 			return retryExecutorH2(ctx, a, req)
 		}
@@ -249,6 +256,7 @@ type routerActionH2 struct {
 	hashPolicies []HashPolicy        // 36.2: stored at H2ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
 	rp           *RetryPolicy        // 42.1: effective retry_policy; nil when none. Stored here; the retry loop lands in Task 8.
+	hp           *HedgePolicy        // 42.2b: effective hedge_policy; nil when none. Read by hedgeExecutorH2 (the concurrent first-acceptable-wins racer); the H1 sibling field is live via hedgeExecutorH1.
 }
 
 // doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip

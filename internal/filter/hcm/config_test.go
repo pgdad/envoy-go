@@ -1185,7 +1185,7 @@ func TestBuildRouterAction_RetryPolicyParse(t *testing.T) {
 	// No route-level retry_policy + a vhost retry_policy ⇒ inherit the vhost.
 	t.Run("vhost-inherit", func(t *testing.T) {
 		vh := &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(5)}
-		got, err := buildRouterActionWithVH(mkRA(), "r_inherit", cm, vh)
+		got, err := buildRouterActionWithVH(mkRA(), "r_inherit", cm, vh, nil)
 		if err != nil {
 			t.Fatalf("buildRouterAction: %v", err)
 		}
@@ -1203,7 +1203,7 @@ func TestBuildRouterAction_RetryPolicyParse(t *testing.T) {
 		ra := mkRA()
 		ra.RetryPolicy = &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(2)}
 		vh := &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(9)}
-		got, err := buildRouterActionWithVH(ra, "r_override", cm, vh)
+		got, err := buildRouterActionWithVH(ra, "r_override", cm, vh, nil)
 		if err != nil {
 			t.Fatalf("buildRouterAction: %v", err)
 		}
@@ -1307,6 +1307,83 @@ func TestBuildRouterAction_RetryPolicyParse(t *testing.T) {
 		}
 		if rp.PerTryTimeout() != 0 {
 			t.Errorf("PerTryTimeout()=%v; want 0 (unset)", rp.PerTryTimeout())
+		}
+	})
+}
+
+// TestBuildRouterAction_HedgePolicyParse exercises the phase-42.2b Task 7
+// hedge_policy parse + the vhost→route fallback + the initial_requests<1 reject.
+// The single-cluster arm (mkH2ClusterManager's c_h1) carries the parsed
+// *router.HedgePolicy on the returned *clusterRouteAction. The fallback is fed
+// through buildRouterActionWithVH's vhHedgePolicy param (the same value
+// buildRouteTable threads from vh.GetHedgePolicy()). Mirrors the phase-42.1
+// retry_policy parse tests above.
+func TestBuildRouterAction_HedgePolicyParse(t *testing.T) {
+	cm := mkH2ClusterManager(t)
+	mkRA := func() *routev3.RouteAction {
+		return &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "c_h1"}}
+	}
+	getHP := func(t *testing.T, got routeAction) *router.HedgePolicy {
+		t.Helper()
+		bridge, ok := got.(*clusterRouteAction)
+		if !ok {
+			t.Fatalf("got %T; want *clusterRouteAction", got)
+		}
+		return bridge.hedgePolicy
+	}
+
+	// Route-level hedge_policy{hedge_on_per_try_timeout:true} ⇒ parsed, flag set.
+	t.Run("route-level", func(t *testing.T) {
+		ra := mkRA()
+		ra.HedgePolicy = &routev3.HedgePolicy{HedgeOnPerTryTimeout: true}
+		got, err := buildRouterAction(ra, cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		hp := getHP(t, got)
+		if hp == nil {
+			t.Fatal("hedgePolicy is nil; want a parsed policy")
+		}
+		if !hp.HedgeOnPerTryTimeout {
+			t.Errorf("HedgeOnPerTryTimeout=%v; want true", hp.HedgeOnPerTryTimeout)
+		}
+	})
+
+	// No route-level hedge_policy + a vhost hedge_policy ⇒ inherit the vhost.
+	t.Run("vhost-inherit", func(t *testing.T) {
+		vh := &routev3.HedgePolicy{HedgeOnPerTryTimeout: true}
+		got, err := buildRouterActionWithVH(mkRA(), "r_inherit", cm, nil, vh)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		hp := getHP(t, got)
+		if hp == nil {
+			t.Fatal("hedgePolicy is nil; want the inherited vhost policy")
+		}
+		if !hp.HedgeOnPerTryTimeout {
+			t.Errorf("HedgeOnPerTryTimeout=%v; want true (inherited vhost)", hp.HedgeOnPerTryTimeout)
+		}
+	})
+
+	// initial_requests:0 ⇒ the gte:1 reject (route-scoped, byte-stable suffix).
+	t.Run("initial-requests-zero-reject", func(t *testing.T) {
+		ra := mkRA()
+		ra.HedgePolicy = &routev3.HedgePolicy{InitialRequests: &wrapperspb.UInt32Value{Value: 0}}
+		_, err := buildRouterAction(ra, cm)
+		want := `route: "c_h1": hedge_policy: initial_requests must be greater than or equal to 1`
+		if err == nil || err.Error() != want {
+			t.Errorf("err=%v; want %q", err, want)
+		}
+	})
+
+	// Neither route nor vhost ⇒ hedgePolicy stays nil (byte-stable path).
+	t.Run("neither", func(t *testing.T) {
+		got, err := buildRouterAction(mkRA(), cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		if hp := getHP(t, got); hp != nil {
+			t.Errorf("hedgePolicy=%v; want nil when no hedge_policy is set", hp)
 		}
 	})
 }

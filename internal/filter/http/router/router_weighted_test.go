@@ -127,7 +127,7 @@ func TestH1WeightedClusterAction_PicksPerSelector(t *testing.T) {
 		{Cluster: clusters[1]},
 		{Cluster: clusters[2]},
 	}
-	act := H1WeightedClusterAction(wcs, nil, sel, nil)
+	act := H1WeightedClusterAction(wcs, nil, sel, nil, nil)
 	want := []int{0, 0, 1, 2}
 	for i, w := range want {
 		resp, _, err := act(context.Background(), mustGET(t, "/"))
@@ -148,7 +148,7 @@ func TestH2WeightedClusterAction_CompilesAndNonNil(t *testing.T) {
 	clusters, _ := newEchoClusters(t, 1)
 	sel := newWeightedSelectorWithRNG([]uint32{1}, newSeqRNG(0))
 	wcs := []WeightedCluster{{Cluster: clusters[0]}}
-	act := H2WeightedClusterAction(wcs, nil, sel, nil)
+	act := H2WeightedClusterAction(wcs, nil, sel, nil, nil)
 	if act == nil {
 		t.Fatal("H2WeightedClusterAction returned nil H2Action")
 	}

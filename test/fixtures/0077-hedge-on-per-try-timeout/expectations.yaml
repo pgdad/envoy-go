@@ -1,0 +1,93 @@
+# Phase-42.2b fixture 0077-hedge-on-per-try-timeout: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture proving the HTTP
+# retry-loop HEDGING (hedge_on_per_try_timeout) behaves IDENTICALLY on the
+# envoy-go (subject) side and the reference-Envoy side (the 0074/0076 HTTP shape:
+# reference STRICT_DNS / host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# ONE cluster + ONE route over a SINGLE held backend:
+#   - c_hedge: 1 host (the BlockingHoldResponder, BackendKind 36) — accepts each
+#     connection but HOLDS each "GET /<seg>" open (never responds) until a
+#     "GET /__release" control request.
+#   - /hedge → c_hedge, retry_policy{retry_on:"5xx", num_retries:3,
+#     per_try_timeout:0.25s}, hedge_policy{hedge_on_per_try_timeout:true},
+#     timeout:0s (AMEND-H7: disable the reference's default route timeout — envoy-go
+#     has none — REQUIRED on BOTH sides so the held request is not aborted).
+#
+# # The behavior this fixture proves (hedging, not abandon-and-504)
+#
+# With hedge_on_per_try_timeout over a backend that never answers, each per-try
+# deadline T (250ms) LAUNCHES a hedge (a RETRY) and LEAVES the original running — it
+# does NOT synthesize a 504, does NOT abandon. So 1 primary + 3 hedges (num_retries)
+# all end up in flight (held); after 3 hedges the cap is hit
+# (upstream_rq_retry_limit_exceeded == 1) and the request BLOCKS awaiting the first
+# acceptable result. A GET /__release then makes the held attempts answer 200 → the
+# first acceptable 200 returns downstream.
+#
+# THE LOAD-BEARING PROOF (AMEND-H1): cluster.c_hedge.upstream_rq_per_try_timeout
+# stays 0 — a hedged per-try-timeout is a RETRY, not a per_try_timeout (Task 10's
+# deliberate-break B makes this non-zero).
+#
+# # The driver: goroutine-fire + poll-to-converge + release (the 0074 model)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). All measured work runs inside AssertStats.
+# The Drive hooks stash their listener addrs and return a fixed "READY\n" for the
+# runner's CompareBytes gate. The config builders stash the backend port so
+# AssertStats can hit the backend's /__release control port. UNLIKE 0076 (a single
+# blocking GET that exhausts internally), the hedged GET /hedge BLOCKS until
+# /__release, so it is fired in a GOROUTINE and the driver POLLS the admin /stats to
+# the steady state before releasing — the 0074 concurrent-fire + poll-to-converge
+# model. There is NO time.Sleep in the assertion path.
+#
+# Per side (addr=listener, adminAddr, backendPort; subject FULLY, then reference):
+#   1. baseline scrape /stats.
+#   2. fire GET /hedge in a goroutine (BLOCKS until release).
+#   3. POLL /stats (deadline 10s, poll 50ms, NO sleep) until
+#        cluster.c_hedge.upstream_rq_retry delta == 3 AND
+#        cluster.c_hedge.upstream_rq_retry_limit_exceeded delta == 1.
+#   4. GET /__release on the backend control port (127.0.0.1:<backendPort>) → the
+#      held attempts answer 200 → the blocked GET /hedge returns. Join; assert the
+#      captured downstream status == 200.
+#   5. final scrape /stats; delta-assert (cross-side EXACT on BOTH sides):
+#        cluster.c_hedge.upstream_rq_per_try_timeout    (delta) == 0  (AMEND-H1)
+#        cluster.c_hedge.upstream_rq_retry              (delta) == 3  (numHedges)
+#        cluster.c_hedge.upstream_rq_retry_limit_exceeded (delta) == 1
+#        cluster.c_hedge.upstream_rq_total              (delta) == 4  (1 primary + 3 hedges)
+#        http.ingress_http.downstream_rq_2xx           (delta) == 1  (the single downstream 200)
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#        cluster.c_hedge.upstream_rq_total delta > 0 on the reference side.
+#
+# # Deliberate non-assertion (recorded departure — ADR-0251, D-S422B-2)
+#
+# We do NOT assert cluster.c_hedge.upstream_rq_200 / upstream_2xx cross-side. On the
+# SUBJECT (envoy-go H1) side, doH1ClusterAction honors only ctx.Deadline(), NOT
+# ctx.Done(), so after /__release ALL 4 held H1 losers complete with 200 and each
+# bumps the UPSTREAM 200-class counter → the subject over-counts (up to 4) AND races
+# the join; the REFERENCE cancels its in-flight losers so its upstream_rq_200 == 1.
+# They are NOT cross-side equal. The DOWNSTREAM http.ingress_http.downstream_rq_2xx
+# == 1 IS equal (one client response on both sides) — that is why the fixture asserts
+# the downstream class, not the upstream class. Task 12's ADR body covers this.
+#
+# # Deliberate breaks (Task 10 runs these against this fixture)
+#
+#   - break B: make a hedged per-try-timeout increment upstream_rq_per_try_timeout
+#     (the abandon-and-count path) → the per_try_timeout delta-0 assertion fails.
+#   - flip the expected upstream_rq_retry delta (3→2) or the downstream status
+#     (200→504) → the assertion bites.
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The /hedge path runs inside AssertStats
+# and is status-classified (200), not byte-compared.
+#
+# response-status: 200 on /hedge (the first acceptable hedge result after release).
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path.
+#
+# Non-additions: NO new BackendKind authored HERE (BlockingHoldResponder = 36
+# reused); NO DistributionAsserter (the per-side classification + cross-side
+# delta-stats live in AssertStats — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

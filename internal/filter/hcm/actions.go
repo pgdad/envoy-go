@@ -203,6 +203,11 @@ type clusterRouteAction struct {
 	hashPolicies []router.HashPolicy // 36.2: route RouteAction.hash_policy producer (ADR-0237)
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match; empty when no metadata_match (ADR-0239)
 	retryPolicy  *router.RetryPolicy // 42.1: effective retry_policy (route⊕vhost); nil when none — executor runs in Task 7
+	// 42.2b: effective hedge_policy (route⊕vhost); nil when none. CONSUMED by the
+	// closure builders below (Task 8): do/asRouterAction/asRouterActionH2 pass it
+	// as the 5th arg to H{1,2}ClusterAction, which dispatch the concurrent
+	// hedgeExecutor when it triggers. nil/non-triggering ⇒ the byte-stable path.
+	hedgePolicy *router.HedgePolicy
 }
 
 // do invokes the per-request cluster-dial action via the router-package
@@ -212,7 +217,7 @@ type clusterRouteAction struct {
 // (status int + error) for the routeAction interface; the chain-mediated H1
 // path goes through asRouterAction(), not do().
 func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	resp, _, err := router.H1ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy)(ctx, req)
+	resp, _, err := router.H1ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)(ctx, req)
 	if err != nil {
 		return resp.Status, err
 	}
@@ -235,7 +240,7 @@ func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufi
 // chain-mediated H1 path (Task 15 connection.go) plumbs into the terminal
 // router filter via *Filter.SetAction.
 func (a *clusterRouteAction) asRouterAction() router.Action {
-	return router.H1ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy)
+	return router.H1ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)
 }
 
 // asRouterActionH2 returns the router.H2Action closure built by the router
@@ -248,7 +253,7 @@ func (a *clusterRouteAction) asRouterAction() router.Action {
 // H1/H2 routerAction variant selection into a single bridge type whose
 // router-package backend handles both protocols.
 func (a *clusterRouteAction) asRouterActionH2() router.H2Action {
-	return router.H2ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy)
+	return router.H2ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)
 }
 
 // weightedClusterRouteAction is the per-request weighted-random cluster-SELECTION
