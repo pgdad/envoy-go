@@ -149,12 +149,12 @@ type Cluster struct {
 	retry       *retryStats
 }
 
-// retryStats are the +5 cluster-scope retry counters (ADR-0249). backoffRL is
+// retryStats are the +6 cluster-scope retry counters (ADR-0249). backoffRL is
 // registered-only / emit-0 (no Inc method — there is no ratelimited-backoff
 // path in the MVP; it exists for reference-parity name presence). The other
-// four are Inc'd from the retry executor (Task 7).
+// five are Inc'd from the retry executor (Tasks 6/7).
 type retryStats struct {
-	rq, success, limitExceeded, backoffExp, backoffRL *stats.Counter
+	rq, success, limitExceeded, backoffExp, backoffRL, perTryTimeout *stats.Counter
 }
 
 // statusClassCounter returns the upstream_rq_<Nxx> counter for the given
@@ -262,6 +262,7 @@ func (c *Cluster) EnsureRetryStats() {
 		limitExceeded: c.statsReg.NewCounter(p + "upstream_rq_retry_limit_exceeded"),
 		backoffExp:    c.statsReg.NewCounter(p + "upstream_rq_retry_backoff_exponential"),
 		backoffRL:     c.statsReg.NewCounter(p + "upstream_rq_retry_backoff_ratelimited"), // emit-0
+		perTryTimeout: c.statsReg.NewCounter(p + "upstream_rq_per_try_timeout"),
 	}
 }
 
@@ -294,6 +295,15 @@ func (c *Cluster) IncUpstreamRqRetryLimitExceeded() {
 func (c *Cluster) IncUpstreamRqRetryBackoffExponential() {
 	if c.retry != nil {
 		c.retry.backoffExp.Inc()
+	}
+}
+
+// IncUpstreamRqPerTryTimeout Inc's upstream_rq_per_try_timeout (one per attempt
+// that hits its per_try_timeout). No-op when EnsureRetryStats has not run
+// (non-retry cluster). Wired in the retry executors (Tasks 6/7).
+func (c *Cluster) IncUpstreamRqPerTryTimeout() {
+	if c.retry != nil {
+		c.retry.perTryTimeout.Inc()
 	}
 }
 

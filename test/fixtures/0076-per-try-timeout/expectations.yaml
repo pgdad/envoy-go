@@ -1,0 +1,71 @@
+# Phase-42.2a fixture 0076-per-try-timeout: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture proving the HTTP
+# retry-loop per_try_timeout (a per-ATTEMPT deadline) behaves IDENTICALLY on the
+# envoy-go (subject) side and the reference-Envoy side (the 0074/0075 HTTP shape:
+# reference STRICT_DNS / host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# ONE cluster + ONE route over a SINGLE held backend:
+#   - c_ptt: 1 host (the BlockingHoldResponder, BackendKind 36) — accepts each
+#     connection but HOLDS each "GET /<seg>" open (never responds) until a
+#     "GET /__release" control request.
+#   - /ptt → c_ptt, retry_policy{retry_on:"5xx", num_retries:3, per_try_timeout:0.25s}.
+#
+# # The behavior this fixture proves
+#
+# With a small per_try_timeout T (250ms) over a backend that never answers, EVERY
+# attempt blocks past T, so the per-try-timeout fires on each attempt → a
+# synthesized 504. 504 is a 5xx, so under retry_on:"5xx" each timed-out attempt is
+# retriable; the retry loop runs all num_retries+1 (4) attempts, exhausts the cap,
+# and returns the final 504 to the client. SINGLE host ⇒ deterministic,
+# offset-irrelevant, cross-side-EXACT (no round-robin spread → no offset
+# nondeterminism, unlike 0075's recover arm).
+#
+# # The driver: drive ONE /ptt + delta the per-try-timeout stats (the 0075 pattern)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST) then AssertStats
+# (run LAST, holding BOTH admin addrs). All measured work runs inside AssertStats.
+# The Drive hooks stash their listener addrs and return a fixed "READY\n" for the
+# runner's CompareBytes gate. The config builders stash the backend port so
+# AssertStats can hit the backend's /__release control port. There is NO
+# concurrency in the driver: ONE sequential GET /ptt drives the entire 4-attempt
+# retry loop INSIDE the proxy (~1.2s; the per_try_timeout T is the FEATURE's own
+# timing — there is NO time.Sleep anywhere in the assertion).
+#
+# Per side (addr=listener, adminAddr; subject FULLY, then reference):
+#   1. baseline scrape /stats.
+#   2. 1 GET /ptt → assert 504 (every attempt per-try-times-out → exhaustion).
+#   3. final scrape /stats; delta-assert (cross-side EXACT):
+#        cluster.c_ptt.upstream_rq_per_try_timeout    (delta) == 4 (numRetries+1)
+#        cluster.c_ptt.upstream_rq_retry              (delta) == 3 (numRetries)
+#        cluster.c_ptt.upstream_rq_retry_limit_exceeded (delta) == 1
+#        cluster.c_ptt.upstream_rq_retry_success      (delta) == 0
+#        cluster.c_ptt.upstream_rq_total              (delta) == 4 (numRetries+1)
+#      Plus the "decode ran" guard (reference_docker_probe_bridge_network):
+#        cluster.c_ptt.upstream_rq_total delta > 0 on the reference side.
+#   4. GET /__release on the backend control port (127.0.0.1:<backendPort>) drains
+#      the parked held attempts and re-arms the gate for the next side.
+#
+# # Deliberate breaks (Task 9 runs these against this fixture)
+#
+#   - drop per_try_timeout from the /ptt route → the attempts block on the held
+#     backend until the client/connect bound (no synthesized 504, no
+#     per_try_timeout counter) → the per_try_timeout delta assertion fails.
+#   - flip the expected per_try_timeout delta (4→3) or the final status (504→503)
+#     → the assertion bites.
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The /ptt path runs inside AssertStats
+# and is status-classified (504), not byte-compared.
+#
+# response-status: 504 on /ptt (per-try-timeout exhaustion).
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path.
+#
+# Non-additions: NO new BackendKind authored HERE (BlockingHoldResponder = 36
+# reused); NO DistributionAsserter (the per-side classification + cross-side
+# delta-stats live in AssertStats — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

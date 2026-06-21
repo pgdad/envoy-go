@@ -19,6 +19,11 @@ import (
 // prefix; keep both sites referencing this const so they cannot drift.
 const ErrMsgMaxIntervalBelowBase = "max_interval must be greater than or equal to the base_interval"
 
+// ErrMsgPerTryTimeoutNegative is the retry_policy per_try_timeout reject suffix.
+// The hcm parse layer re-emits it with a "route: %q: retry_policy: " prefix;
+// keep both sites referencing this const so they cannot drift.
+const ErrMsgPerTryTimeoutNegative = "per_try_timeout must not be negative"
+
 // retryOnBits is the enforced subset of Envoy's retry_on conditions (SPEC §5 /
 // AMEND-RT1) packed into a bitset. Deferred conditions (retriable-headers,
 // envoy-ratelimited, grpc-*) are intentionally absent.
@@ -27,8 +32,9 @@ type retryOnBits uint8
 const (
 	retry5xx          retryOnBits = 1 << iota // any upstream 5xx
 	retryGatewayError                         // {502,503,504}
-	retryConnectFail                          // local-origin connect/reset failure
+	retryConnectFail                          // local-origin connect failure
 	retryStatusCodes                          // status ∈ retriableCodes
+	retryReset                                // local-origin reset (a per-try-timeout is a reset; ⊇ connect-failure + timeouts)
 )
 
 // RetryPolicy holds the parsed, enforced retry configuration for a route.
@@ -38,6 +44,7 @@ type RetryPolicy struct {
 	retriableCodes map[int]bool
 	baseInterval   time.Duration // default 25ms
 	maxInterval    time.Duration // default 10×base
+	perTryTimeout  time.Duration // 0 ⇒ no per-attempt bound; <0 rejected at parse
 }
 
 // NewRetryPolicy builds a parsed policy. baseInterval/maxInterval are the parsed
@@ -48,7 +55,7 @@ type RetryPolicy struct {
 // A zero baseInterval here means "unset" and gets the 25ms default; the
 // base_interval-required reject (when retry_back_off is present but base≤0) is
 // enforced in buildRouterAction (Task 4), which sees the proto-presence bit.
-func NewRetryPolicy(retryOn string, numRetries uint32, retriableCodes []uint32, baseInterval, maxInterval time.Duration) (*RetryPolicy, error) {
+func NewRetryPolicy(retryOn string, numRetries uint32, retriableCodes []uint32, baseInterval, maxInterval, perTryTimeout time.Duration) (*RetryPolicy, error) {
 	rp := &RetryPolicy{on: parseRetryOn(retryOn), numRetries: int(numRetries), retriableCodes: map[int]bool{}}
 	for _, c := range retriableCodes {
 		rp.retriableCodes[int(c)] = true
@@ -64,6 +71,10 @@ func NewRetryPolicy(retryOn string, numRetries uint32, retriableCodes []uint32, 
 	if rp.maxInterval < rp.baseInterval {
 		return nil, errors.New(ErrMsgMaxIntervalBelowBase)
 	}
+	if perTryTimeout < 0 {
+		return nil, errors.New(ErrMsgPerTryTimeoutNegative)
+	}
+	rp.perTryTimeout = perTryTimeout // 0 ⇒ no bound (executor skips the child ctx)
 	return rp, nil
 }
 
@@ -71,6 +82,10 @@ func NewRetryPolicy(retryOn string, numRetries uint32, retriableCodes []uint32, 
 // initial try). Exported for the hcm parse test (phase 42.1 Task 4) and the
 // retry executors (Tasks 7/8).
 func (rp *RetryPolicy) NumRetries() int { return rp.numRetries }
+
+// PerTryTimeout returns the per-attempt deadline (0 ⇒ no bound). Exported for
+// the hcm parse test (phase 42.2a Task 4) and the retry executors (Tasks 6/7).
+func (rp *RetryPolicy) PerTryTimeout() time.Duration { return rp.perTryTimeout }
 
 // backoff returns the delay before retry attempt n (1-based): full jitter over
 // [0, min(maxInterval, baseInterval·2^(n-1))]. Delay-only — never perturbs
@@ -96,8 +111,10 @@ func parseRetryOn(s string) retryOnBits {
 			b |= retry5xx
 		case "gateway-error":
 			b |= retryGatewayError
-		case "connect-failure", "reset":
+		case "connect-failure":
 			b |= retryConnectFail
+		case "reset":
+			b |= retryReset
 		case "retriable-status-codes":
 			b |= retryStatusCodes
 		}
@@ -109,7 +126,7 @@ func parseRetryOn(s string) retryOnBits {
 // router-synthesized dial/connection failure (vs an upstream response): an
 // upstream that RESPONDS 502/503/504 is NOT a connect-failure.
 func (rp *RetryPolicy) matches(status int, localOrigin bool) bool {
-	if rp.on&retryConnectFail != 0 && localOrigin {
+	if rp.on&(retryConnectFail|retryReset) != 0 && localOrigin {
 		return true
 	}
 	if rp.on&retry5xx != 0 && status >= 500 && status <= 599 {
@@ -122,6 +139,14 @@ func (rp *RetryPolicy) matches(status int, localOrigin bool) bool {
 		return true
 	}
 	return false
+}
+
+// perTryTimeoutRetriable reports whether a per-try-timeout (a synthesized 504,
+// treated as a reset) is retriable under this policy: any 504-status token
+// (5xx, gateway-error, retriable-status-codes∋504) OR `reset`. NOT
+// connect-failure-alone (a per-try-timeout is a reset, not a connect failure).
+func (rp *RetryPolicy) perTryTimeoutRetriable() bool {
+	return rp.matches(504, false) || rp.on&retryReset != 0
 }
 
 // retryExecutorH1 wraps doH1ClusterAction with the retry loop (phase 42.1 Task 7,
@@ -167,11 +192,41 @@ func retryExecutorH1(ctx context.Context, a *routerAction, req *http.Request) (A
 		if body != nil {
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
-		resp, ep, err = doH1ClusterAction(ctx, a, req)
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		var attemptDeadline time.Time
+		if rp.perTryTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, rp.perTryTimeout)
+			attemptDeadline, _ = attemptCtx.Deadline()
+		}
+		resp, ep, err = doH1ClusterAction(attemptCtx, a, req)
+		// per-try-timeout discrimination (AMEND-PT4): the CHILD attemptCtx deadline
+		// fired while the PARENT ctx is still alive ⇒ a per-try-timeout (NOT a client
+		// cancel). The driver propagates the child deadline onto the upstream socket
+		// (router.go SetDeadline), so a stalled read breaks via the socket I/O timeout
+		// — which can return slightly BEFORE context's internal timer goroutine marks
+		// attemptCtx.Err() == DeadlineExceeded. We therefore detect the timeout by
+		// wall-clock deadline elapse (immune to that timer lag), READ BEFORE the
+		// explicit cancel() below (cancel would otherwise stamp Canceled and we'd lose
+		// the signal). The local-origin guard scopes this to the synthesized 502/503
+		// failure paths a per-try deadline actually produces (a clean upstream response
+		// under a long timeout is never misclassified).
+		timedOut := rp.perTryTimeout > 0 && ctx.Err() == nil && resp.localOrigin &&
+			(errors.Is(attemptCtx.Err(), context.DeadlineExceeded) || !time.Now().Before(attemptDeadline))
+		if cancel != nil {
+			cancel()
+		}
 		if attempt > 0 {
 			a.cluster.ReleaseRetry()
 		}
-		if !rp.matches(resp.Status, resp.localOrigin) {
+		if timedOut {
+			a.cluster.IncUpstreamRqPerTryTimeout()
+			resp = ActionResponse{Status: 504, Headers: localReplyHeaders(0), Body: nil} // synthesized 504, override the driver's 502
+			err = nil
+			if !rp.perTryTimeoutRetriable() {
+				return resp, ep, err
+			}
+		} else if !rp.matches(resp.Status, resp.localOrigin) {
 			if attempt > 0 {
 				a.cluster.IncUpstreamRqRetrySuccess() // retried + ended non-retriable = recovered
 			}
@@ -229,11 +284,41 @@ func retryExecutorH2(ctx context.Context, a *routerActionH2, req h2.H2Request) (
 		// req is a value type carrying a buffered []byte body — passing the value
 		// per attempt re-presents the SAME full body each time (no consume-once
 		// reset needed; see the body-replay note in the doc).
-		resp, ep, err = doH2ClusterAction(ctx, a, req)
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		var attemptDeadline time.Time
+		if rp.perTryTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, rp.perTryTimeout)
+			attemptDeadline, _ = attemptCtx.Deadline()
+		}
+		resp, ep, err = doH2ClusterAction(attemptCtx, a, req)
+		// per-try-timeout discrimination (AMEND-PT4), H2 form: the CHILD attemptCtx
+		// deadline fired while the PARENT ctx is alive ⇒ a per-try-timeout. The H2
+		// driver returns Status:0 (the CANCEL sentinel) when it observes the ctx
+		// deadline, OR a localOrigin 502 if RoundTrip breaks via socket I/O before
+		// context's timer stamps Err() — so we accept EITHER manifestation
+		// (resp.Status == 0 || resp.localOrigin) and detect the deadline via the
+		// wall-clock fallback (immune to the timer-goroutine lag), read BEFORE the
+		// explicit cancel() (which would stamp Canceled). A PARENT client-cancel has
+		// ctx.Err() != nil ⇒ NOT a per-try-timeout (the 42.1 Status:0-not-retried
+		// invariant). A clean upstream reply has Status != 0 && !localOrigin ⇒ never
+		// misclassified.
+		timedOut := rp.perTryTimeout > 0 && ctx.Err() == nil && (resp.localOrigin || resp.Status == 0) &&
+			(errors.Is(attemptCtx.Err(), context.DeadlineExceeded) || !time.Now().Before(attemptDeadline))
+		if cancel != nil {
+			cancel()
+		}
 		if attempt > 0 {
 			a.cluster.ReleaseRetry()
 		}
-		if !rp.matches(resp.Status, resp.localOrigin) {
+		if timedOut {
+			a.cluster.IncUpstreamRqPerTryTimeout()
+			resp = ActionResponse{Status: 504, Headers: h2LocalReplyHeaders(), Body: nil} // synthesized 504, override the Status:0/502
+			err = nil
+			if !rp.perTryTimeoutRetriable() {
+				return resp, ep, err
+			}
+		} else if !rp.matches(resp.Status, resp.localOrigin) {
 			if attempt > 0 {
 				a.cluster.IncUpstreamRqRetrySuccess() // retried + ended non-retriable = recovered
 			}

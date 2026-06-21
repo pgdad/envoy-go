@@ -642,11 +642,15 @@ func parseRetryPolicy(r *routev3.RouteAction, vhRetryPolicy *routev3.RetryPolicy
 			mx = mi.AsDuration()
 		}
 	}
-	rp, err := router.NewRetryPolicy(eff.GetRetryOn(), v, eff.GetRetriableStatusCodes(), base, mx)
+	var ptt time.Duration
+	if d := eff.GetPerTryTimeout(); d != nil {
+		ptt = d.AsDuration()
+	}
+	rp, err := router.NewRetryPolicy(eff.GetRetryOn(), v, eff.GetRetriableStatusCodes(), base, mx, ptt)
 	if err != nil {
-		// NewRetryPolicy's only error arm is max < base; re-emit a route-scoped
-		// message. The SUFFIX must stay byte-identical to the Task-3 string.
-		return nil, fmt.Errorf("route: %q: retry_policy: %s", name, router.ErrMsgMaxIntervalBelowBase)
+		// NewRetryPolicy's error arms are max<base AND per_try_timeout<0; re-emit
+		// route-scoped, SUFFIX byte-identical to the router-package strings.
+		return nil, fmt.Errorf("route: %q: retry_policy: %s", name, err.Error())
 	}
 	return rp, nil
 }

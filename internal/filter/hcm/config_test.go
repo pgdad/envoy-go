@@ -1257,4 +1257,56 @@ func TestBuildRouterAction_RetryPolicyParse(t *testing.T) {
 			t.Errorf("err=%v; want the base_interval-required reject", err)
 		}
 	})
+
+	// per_try_timeout: 250ms ⇒ PerTryTimeout()==250ms (Task 4 parse).
+	t.Run("per-try-timeout-set", func(t *testing.T) {
+		ra := mkRA()
+		ra.RetryPolicy = &routev3.RetryPolicy{
+			RetryOn:       "5xx",
+			NumRetries:    wrapperspb.UInt32(2),
+			PerTryTimeout: durationpb.New(250 * time.Millisecond),
+		}
+		got, err := buildRouterAction(ra, cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		rp := getRP(t, got)
+		if rp == nil {
+			t.Fatal("retryPolicy is nil; want a parsed policy")
+		}
+		if rp.PerTryTimeout() != 250*time.Millisecond {
+			t.Errorf("PerTryTimeout()=%v; want 250ms", rp.PerTryTimeout())
+		}
+	})
+
+	// per_try_timeout: -1s ⇒ route-scoped negative-per-try-timeout reject.
+	t.Run("per-try-timeout-negative-reject", func(t *testing.T) {
+		ra := mkRA()
+		ra.RetryPolicy = &routev3.RetryPolicy{
+			RetryOn:       "5xx",
+			PerTryTimeout: durationpb.New(-1 * time.Second),
+		}
+		_, err := buildRouterAction(ra, cm)
+		want := `route: "c_h1": retry_policy: per_try_timeout must not be negative`
+		if err == nil || err.Error() != want {
+			t.Errorf("err=%v; want %q", err, want)
+		}
+	})
+
+	// per_try_timeout unset ⇒ PerTryTimeout()==0 (no per-attempt bound).
+	t.Run("per-try-timeout-unset", func(t *testing.T) {
+		ra := mkRA()
+		ra.RetryPolicy = &routev3.RetryPolicy{RetryOn: "5xx", NumRetries: wrapperspb.UInt32(1)}
+		got, err := buildRouterAction(ra, cm)
+		if err != nil {
+			t.Fatalf("buildRouterAction: %v", err)
+		}
+		rp := getRP(t, got)
+		if rp == nil {
+			t.Fatal("retryPolicy is nil; want a parsed policy")
+		}
+		if rp.PerTryTimeout() != 0 {
+			t.Errorf("PerTryTimeout()=%v; want 0 (unset)", rp.PerTryTimeout())
+		}
+	})
 }

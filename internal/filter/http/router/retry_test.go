@@ -103,7 +103,20 @@ func (b *scriptedBackend) recordedBodies() [][]byte {
 // delay is irrelevant to the increment assertions but keeps the unit test fast).
 func mkRetryPolicy(t *testing.T, retryOn string, numRetries uint32) *RetryPolicy {
 	t.Helper()
-	rp, err := NewRetryPolicy(retryOn, numRetries, nil, time.Microsecond, time.Millisecond)
+	rp, err := NewRetryPolicy(retryOn, numRetries, nil, time.Microsecond, time.Millisecond, 0)
+	if err != nil {
+		t.Fatalf("NewRetryPolicy: %v", err)
+	}
+	return rp
+}
+
+// mkRetryPolicyPTT builds a RetryPolicy carrying a per_try_timeout (the 42.2a
+// per-attempt deadline) plus the same tiny base/max intervals as mkRetryPolicy
+// (sub-ms backoff). A sibling helper rather than extending mkRetryPolicy so the
+// existing callers stay untouched.
+func mkRetryPolicyPTT(t *testing.T, retryOn string, numRetries uint32, ptt time.Duration) *RetryPolicy {
+	t.Helper()
+	rp, err := NewRetryPolicy(retryOn, numRetries, nil, time.Microsecond, time.Millisecond, ptt)
 	if err != nil {
 		t.Fatalf("NewRetryPolicy: %v", err)
 	}
@@ -275,6 +288,146 @@ func TestRetryExecutorH1_BudgetOverflow(t *testing.T) {
 	}
 }
 
+// TestRetryExecutorH1_PerTryTimeoutExhaustion — an always-blocking backend (delay
+// far exceeds per_try_timeout) under retry_on:5xx, num_retries:3, per_try_timeout:
+// 50ms ⇒ every attempt fires the child-ctx deadline, is overridden to a synthesized
+// 504, classified retriable (5xx∋504), and counts toward num_retries ⇒ 4 attempts,
+// final 504, the per-try-timeout ledger.
+func TestRetryExecutorH1_PerTryTimeoutExhaustion(t *testing.T) {
+	b := newScriptedBackend(t, func(int64) int { return 200 }, 5*time.Second)
+	defer b.stop()
+
+	c, reg := singleEndpointClusterWithRegistry(t, b.addr)
+	c.EnsureRetryStats()
+	a := &routerAction{cluster: c, rp: mkRetryPolicyPTT(t, "5xx", 3, 50*time.Millisecond)}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+
+	resp, _, err := retryExecutorH1(req.Context(), a, req)
+	if err != nil {
+		t.Fatalf("retryExecutorH1: %v", err)
+	}
+	if resp.Status != 504 {
+		t.Errorf("final status = %d, want 504 (synthesized per-try-timeout)", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_per_try_timeout", 4)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry", 3)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry_limit_exceeded", 1)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry_success", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_total", 4)
+}
+
+// TestRetryExecutorH1_PerTryTimeoutNotRetriable — a blocking backend under
+// retry_on:connect-failure (NOT reset/5xx), per_try_timeout:50ms ⇒ the first
+// attempt times out to a synthesized 504, perTryTimeoutRetriable() is FALSE (a
+// per-try-timeout is a reset, not a connect-failure), so it returns immediately:
+// one per_try_timeout, ZERO retries, NO retry_success.
+func TestRetryExecutorH1_PerTryTimeoutNotRetriable(t *testing.T) {
+	b := newScriptedBackend(t, func(int64) int { return 200 }, 5*time.Second)
+	defer b.stop()
+
+	c, reg := singleEndpointClusterWithRegistry(t, b.addr)
+	c.EnsureRetryStats()
+	a := &routerAction{cluster: c, rp: mkRetryPolicyPTT(t, "connect-failure", 3, 50*time.Millisecond)}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+
+	resp, _, err := retryExecutorH1(req.Context(), a, req)
+	if err != nil {
+		t.Fatalf("retryExecutorH1: %v", err)
+	}
+	if resp.Status != 504 {
+		t.Errorf("final status = %d, want 504 (synthesized per-try-timeout)", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_per_try_timeout", 1)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry_success", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry_limit_exceeded", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_total", 1)
+}
+
+// TestRetryExecutorH1_PerTryTimeoutResetToken — a blocking backend under
+// retry_on:reset, per_try_timeout:50ms ⇒ a per-try-timeout is a reset, so it
+// retries to exhaustion: 4 attempts, final 504, per_try_timeout==4, retry==3.
+func TestRetryExecutorH1_PerTryTimeoutResetToken(t *testing.T) {
+	b := newScriptedBackend(t, func(int64) int { return 200 }, 5*time.Second)
+	defer b.stop()
+
+	c, reg := singleEndpointClusterWithRegistry(t, b.addr)
+	c.EnsureRetryStats()
+	a := &routerAction{cluster: c, rp: mkRetryPolicyPTT(t, "reset", 3, 50*time.Millisecond)}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+
+	resp, _, err := retryExecutorH1(req.Context(), a, req)
+	if err != nil {
+		t.Fatalf("retryExecutorH1: %v", err)
+	}
+	if resp.Status != 504 {
+		t.Errorf("final status = %d, want 504 (synthesized per-try-timeout)", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_per_try_timeout", 4)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry", 3)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry_limit_exceeded", 1)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_total", 4)
+}
+
+// TestRetryExecutorH1_PerTryTimeoutZeroByteStable — per_try_timeout==0 ⇒ no child
+// ctx is ever created; a fast 200 backend behaves byte-identically to 42.1: final
+// 200, per_try_timeout==0, retry==0. Guards the "0 ⇒ unchanged upstream path".
+func TestRetryExecutorH1_PerTryTimeoutZeroByteStable(t *testing.T) {
+	b := newScriptedBackend(t, func(int64) int { return 200 }, 0)
+	defer b.stop()
+
+	c, reg := singleEndpointClusterWithRegistry(t, b.addr)
+	c.EnsureRetryStats()
+	a := &routerAction{cluster: c, rp: mkRetryPolicyPTT(t, "5xx", 3, 0)}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+
+	resp, _, err := retryExecutorH1(req.Context(), a, req)
+	if err != nil {
+		t.Fatalf("retryExecutorH1: %v", err)
+	}
+	if resp.Status != 200 {
+		t.Errorf("final status = %d, want 200", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_per_try_timeout", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_total", 1)
+}
+
+// TestRetryExecutorH1_FastResponseUnderLongTimeout — a fast 200 backend with a
+// LONG per_try_timeout (5s) ⇒ the explicit cancel() makes attemptCtx.Err() ==
+// Canceled (NOT DeadlineExceeded), so timedOut is FALSE: final 200, no
+// per_try_timeout, no retry. Guards the explicit-cancel-correctness.
+func TestRetryExecutorH1_FastResponseUnderLongTimeout(t *testing.T) {
+	b := newScriptedBackend(t, func(int64) int { return 200 }, 0)
+	defer b.stop()
+
+	c, reg := singleEndpointClusterWithRegistry(t, b.addr)
+	c.EnsureRetryStats()
+	a := &routerAction{cluster: c, rp: mkRetryPolicyPTT(t, "5xx", 3, 5*time.Second)}
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+	req.URL.Path = "/x"
+
+	resp, _, err := retryExecutorH1(req.Context(), a, req)
+	if err != nil {
+		t.Fatalf("retryExecutorH1: %v", err)
+	}
+	if resp.Status != 200 {
+		t.Errorf("final status = %d, want 200", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_per_try_timeout", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_retry", 0)
+	checkCounter(t, reg, "cluster.c_test.upstream_rq_total", 1)
+}
+
 // checkCounter asserts the named registry counter equals want (thin wrapper over
 // the existing counterValue registry-introspection helper from router_test.go).
 func checkCounter(t *testing.T, reg *stats.Registry, name string, want int64) {
@@ -403,6 +556,102 @@ func TestRetryExecutorH2_CtxCancelNotRetried(t *testing.T) {
 	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_total", 1)
 }
 
+// TestRetryExecutorH2_PerTryTimeoutExhaustion — an always-hanging in-process H2
+// backend (accepts the stream, never responds) under a non-canceled parent ctx +
+// retry_on:5xx, num_retries:2, per_try_timeout:50ms ⇒ every attempt fires the
+// CHILD attemptCtx deadline (parent ctx alive), is overridden to a synthesized
+// 504, classified retriable (5xx∋504), and counts toward num_retries ⇒ 3 attempts,
+// final 504, the per-try-timeout ledger. The H2 mirror of
+// TestRetryExecutorH1_PerTryTimeoutExhaustion (AMEND-PT4).
+func TestRetryExecutorH2_PerTryTimeoutExhaustion(t *testing.T) {
+	pki := mkH2BackendPKI(t)
+	ln := startH2Backend(t, pki, h2BackendHang, nil)
+	defer func() { _ = ln.Close() }()
+
+	c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)
+	c.EnsureRetryStats()
+	a := &routerActionH2{cluster: c, rp: mkRetryPolicyPTT(t, "5xx", 2, 50*time.Millisecond)}
+
+	resp, _, err := retryExecutorH2(context.Background(), a, h2RequestForTest())
+	if err != nil {
+		t.Fatalf("retryExecutorH2: %v", err)
+	}
+	if resp.Status != 504 {
+		t.Errorf("final status = %d, want 504 (synthesized per-try-timeout)", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_per_try_timeout", 3)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_retry", 2)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_retry_limit_exceeded", 1)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_retry_success", 0)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_total", 3)
+}
+
+// TestRetryExecutorH2_ClientCancelWithPerTryTimeout — the 42.1 client-cancel
+// invariant UNDER a per_try_timeout. A hanging backend + a parent ctx canceled
+// after ~200ms + retry_on:5xx, num_retries:3, per_try_timeout:5s (the per-try is
+// LONG so the PARENT cancel fires first). The driver returns Status:0 + an
+// *h2.Error; the ctx.Err()!=nil guard makes timedOut FALSE, matches(0,false) is
+// FALSE ⇒ the executor returns the Status:0 sentinel un-retried. Proves the
+// per_try_timeout addition does NOT misclassify a client cancel as a per-try-
+// timeout: upstream_rq_per_try_timeout==0, upstream_rq_retry==0.
+func TestRetryExecutorH2_ClientCancelWithPerTryTimeout(t *testing.T) {
+	pki := mkH2BackendPKI(t)
+	ln := startH2Backend(t, pki, h2BackendHang, nil)
+	defer func() { _ = ln.Close() }()
+
+	c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)
+	c.EnsureRetryStats()
+	a := &routerActionH2{cluster: c, rp: mkRetryPolicyPTT(t, "5xx, gateway-error", 3, 5*time.Second)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	resp, _, err := retryExecutorH2(ctx, a, h2RequestForTest())
+	if err == nil {
+		t.Fatal("retryExecutorH2 returned nil err; want the *h2.Error ctx-cancel sentinel passed through")
+	}
+	if _, ok := err.(*h2.Error); !ok {
+		t.Fatalf("err is %T, want *h2.Error (ctx-cancel sentinel passed through unchanged)", err)
+	}
+	if resp.Status != 0 {
+		t.Errorf("status = %d, want 0 (ctx-cancel sentinel, NOT a per-try-timeout)", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_per_try_timeout", 0)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_retry", 0)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_retry_limit_exceeded", 0)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_total", 1)
+}
+
+// TestRetryExecutorH2_PerTryTimeoutZeroByteStable — per_try_timeout==0 ⇒ no child
+// ctx is ever created; an always-503 backend behaves byte-identically to 42.1:
+// 3 attempts, final 503, per_try_timeout==0. Guards the "0 ⇒ unchanged upstream
+// path" for the H2 executor.
+func TestRetryExecutorH2_PerTryTimeoutZeroByteStable(t *testing.T) {
+	pki := mkH2BackendPKI(t)
+	ln := startH2Backend(t, pki, h2Backend503, []byte("resp:503"))
+	defer func() { _ = ln.Close() }()
+
+	c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)
+	c.EnsureRetryStats()
+	a := &routerActionH2{cluster: c, rp: mkRetryPolicyPTT(t, "5xx", 2, 0)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, _, err := retryExecutorH2(ctx, a, h2RequestForTest())
+	if err != nil {
+		t.Fatalf("retryExecutorH2: %v", err)
+	}
+	if resp.Status != 503 {
+		t.Errorf("final status = %d, want 503", resp.Status)
+	}
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_per_try_timeout", 0)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_retry", 2)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_retry_limit_exceeded", 1)
+	checkCounter(t, reg, "cluster.c_h2_backend.upstream_rq_total", 3)
+}
+
 // TestH2WeightedClusterAction_RunsRetryExecutor — a weighted route with a single
 // always-503 H2 entry + retry_policy ⇒ the per-entry closure threads rp through
 // the H2ClusterAction closure switch and runs retryExecutorH2 (the retry counters
@@ -467,10 +716,113 @@ func TestRetryParseRetryOnEmptyTokensSkipped(t *testing.T) {
 	// locks in that behavior so a future refactor to strings.Split (which
 	// DOES yield empty tokens) can't silently regress.
 	const in = "reset,,5xx"
-	want := retryConnectFail | retry5xx
+	want := retryReset | retry5xx
 	if got := parseRetryOn(in); got != want {
-		t.Fatalf("parseRetryOn(%q) = %d, want %d (connect|5xx)", in, got, want)
+		t.Fatalf("parseRetryOn(%q) = %d, want %d (reset|5xx)", in, got, want)
 	}
+}
+
+// TestRetryParseRetryOnResetBit — parseRetryOn("reset") sets retryReset and NOT
+// retryConnectFail; parseRetryOn("connect-failure") sets retryConnectFail and NOT
+// retryReset; parseRetryOn("connect-failure reset") sets both.
+func TestRetryParseRetryOnResetBit(t *testing.T) {
+	t.Run("reset-only", func(t *testing.T) {
+		got := parseRetryOn("reset")
+		if got&retryReset == 0 {
+			t.Errorf("parseRetryOn(%q): retryReset bit not set (got %d)", "reset", got)
+		}
+		if got&retryConnectFail != 0 {
+			t.Errorf("parseRetryOn(%q): retryConnectFail bit set unexpectedly (got %d)", "reset", got)
+		}
+	})
+	t.Run("connect-failure-only", func(t *testing.T) {
+		got := parseRetryOn("connect-failure")
+		if got&retryConnectFail == 0 {
+			t.Errorf("parseRetryOn(%q): retryConnectFail bit not set (got %d)", "connect-failure", got)
+		}
+		if got&retryReset != 0 {
+			t.Errorf("parseRetryOn(%q): retryReset bit set unexpectedly (got %d)", "connect-failure", got)
+		}
+	})
+	t.Run("both", func(t *testing.T) {
+		got := parseRetryOn("connect-failure reset")
+		if got&retryConnectFail == 0 {
+			t.Errorf("parseRetryOn(%q): retryConnectFail bit not set (got %d)", "connect-failure reset", got)
+		}
+		if got&retryReset == 0 {
+			t.Errorf("parseRetryOn(%q): retryReset bit not set (got %d)", "connect-failure reset", got)
+		}
+	})
+}
+
+// TestRetryMatchesLocalOriginBothTokens — matches(503, localOrigin=true) is TRUE
+// for a policy parsed from "connect-failure" AND for one from "reset". A genuine
+// dial-refusal must still retry under both tokens (42.1 behavior preserved).
+func TestRetryMatchesLocalOriginBothTokens(t *testing.T) {
+	for _, tok := range []string{"connect-failure", "reset"} {
+		tok := tok
+		t.Run(tok, func(t *testing.T) {
+			rp := mkRetryPolicy(t, tok, 1)
+			if !rp.matches(503, true) {
+				t.Errorf("matches(503, localOrigin=true) = false for retry_on:%q; want true (dial-refusal retries)", tok)
+			}
+		})
+	}
+}
+
+// TestPerTryTimeoutRetriable — perTryTimeoutRetriable() is TRUE for policies from
+// "5xx", "gateway-error", "reset", and "retriable-status-codes" with 504 listed;
+// FALSE for "connect-failure"-alone, empty retry_on, and "retriable-status-codes"
+// with only 500 (504 not listed).
+func TestPerTryTimeoutRetriable(t *testing.T) {
+	t.Run("5xx-true", func(t *testing.T) {
+		rp := mkRetryPolicy(t, "5xx", 1)
+		if !rp.perTryTimeoutRetriable() {
+			t.Errorf("perTryTimeoutRetriable() = false for retry_on:5xx; want true")
+		}
+	})
+	t.Run("gateway-error-true", func(t *testing.T) {
+		rp := mkRetryPolicy(t, "gateway-error", 1)
+		if !rp.perTryTimeoutRetriable() {
+			t.Errorf("perTryTimeoutRetriable() = false for retry_on:gateway-error; want true")
+		}
+	})
+	t.Run("reset-true", func(t *testing.T) {
+		rp := mkRetryPolicy(t, "reset", 1)
+		if !rp.perTryTimeoutRetriable() {
+			t.Errorf("perTryTimeoutRetriable() = false for retry_on:reset; want true")
+		}
+	})
+	t.Run("retriable-status-codes-504-true", func(t *testing.T) {
+		rp, err := NewRetryPolicy("retriable-status-codes", 1, []uint32{504}, time.Microsecond, time.Millisecond, 0)
+		if err != nil {
+			t.Fatalf("NewRetryPolicy: %v", err)
+		}
+		if !rp.perTryTimeoutRetriable() {
+			t.Errorf("perTryTimeoutRetriable() = false for retry_on:retriable-status-codes with 504; want true")
+		}
+	})
+	t.Run("connect-failure-alone-false", func(t *testing.T) {
+		rp := mkRetryPolicy(t, "connect-failure", 1)
+		if rp.perTryTimeoutRetriable() {
+			t.Errorf("perTryTimeoutRetriable() = true for retry_on:connect-failure-alone; want false")
+		}
+	})
+	t.Run("empty-false", func(t *testing.T) {
+		rp := mkRetryPolicy(t, "", 1)
+		if rp.perTryTimeoutRetriable() {
+			t.Errorf("perTryTimeoutRetriable() = true for empty retry_on; want false")
+		}
+	})
+	t.Run("retriable-status-codes-500-only-false", func(t *testing.T) {
+		rp, err := NewRetryPolicy("retriable-status-codes", 1, []uint32{500}, time.Microsecond, time.Millisecond, 0)
+		if err != nil {
+			t.Fatalf("NewRetryPolicy: %v", err)
+		}
+		if rp.perTryTimeoutRetriable() {
+			t.Errorf("perTryTimeoutRetriable() = true for retriable-status-codes with only 500; want false (504 not listed)")
+		}
+	})
 }
 
 func TestRetryMatches(t *testing.T) {
@@ -504,7 +856,7 @@ func TestRetryMatches(t *testing.T) {
 func TestRetryPolicyDefaults(t *testing.T) {
 	// Unset (zero) base/max intervals resolve to the AMEND-RT6 defaults:
 	// base=25ms, max=10×base=250ms. num_retries threads through verbatim.
-	rp, err := NewRetryPolicy("5xx", 3, nil, 0, 0)
+	rp, err := NewRetryPolicy("5xx", 3, nil, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewRetryPolicy(...) unexpected error: %v", err)
 	}
@@ -525,7 +877,7 @@ func TestRetryPolicyDefaults(t *testing.T) {
 
 func TestRetryPolicyExplicitIntervals(t *testing.T) {
 	// Explicit, valid base<max must be preserved verbatim (no default override).
-	rp, err := NewRetryPolicy("", 2, []uint32{500, 503}, 50*time.Millisecond, 400*time.Millisecond)
+	rp, err := NewRetryPolicy("", 2, []uint32{500, 503}, 50*time.Millisecond, 400*time.Millisecond, 0)
 	if err != nil {
 		t.Fatalf("NewRetryPolicy(...) unexpected error: %v", err)
 	}
@@ -543,7 +895,7 @@ func TestRetryPolicyExplicitIntervals(t *testing.T) {
 func TestRetryPolicyMaxLessThanBaseRejected(t *testing.T) {
 	// max < base is the D-S42-1 reject arm: non-nil error, message exactly the
 	// unprefixed form (Task 4's buildRouterAction adds the route prefix).
-	rp, err := NewRetryPolicy("5xx", 1, nil, 100*time.Millisecond, 50*time.Millisecond)
+	rp, err := NewRetryPolicy("5xx", 1, nil, 100*time.Millisecond, 50*time.Millisecond, 0)
 	if err == nil {
 		t.Fatalf("NewRetryPolicy(max<base) = %+v, nil; want error", rp)
 	}
@@ -558,7 +910,7 @@ func TestRetryPolicyMaxLessThanBaseRejected(t *testing.T) {
 
 func TestRetryPolicyZeroNumRetries(t *testing.T) {
 	// num_retries==0 ⇒ no retries; threaded verbatim (not coerced to a default).
-	rp, err := NewRetryPolicy("5xx", 0, nil, 0, 0)
+	rp, err := NewRetryPolicy("5xx", 0, nil, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewRetryPolicy(...) unexpected error: %v", err)
 	}
@@ -567,11 +919,59 @@ func TestRetryPolicyZeroNumRetries(t *testing.T) {
 	}
 }
 
+// TestRetryPolicyPerTryTimeout — NewRetryPolicy accepts a positive per_try_timeout
+// and stores it verbatim; zero means "no bound" (also accepted); negative is rejected.
+func TestRetryPolicyPerTryTimeout(t *testing.T) {
+	t.Run("positive-stored", func(t *testing.T) {
+		// 250ms per-try timeout: accepted, accessor returns the value.
+		rp, err := NewRetryPolicy("5xx", 3, nil, 0, 0, 250*time.Millisecond)
+		if err != nil {
+			t.Fatalf("NewRetryPolicy(...) unexpected error: %v", err)
+		}
+		if got := rp.PerTryTimeout(); got != 250*time.Millisecond {
+			t.Errorf("PerTryTimeout() = %v, want 250ms", got)
+		}
+	})
+	t.Run("negative-rejected", func(t *testing.T) {
+		// per_try_timeout < 0 must be rejected (D-S42-2).
+		rp, err := NewRetryPolicy("5xx", 1, nil, 0, 0, -1)
+		if err == nil {
+			t.Fatalf("NewRetryPolicy(perTryTimeout=-1) = %+v, nil; want error", rp)
+		}
+		if rp != nil {
+			t.Errorf("NewRetryPolicy(perTryTimeout=-1) returned non-nil policy %+v alongside error", rp)
+		}
+		if err.Error() != ErrMsgPerTryTimeoutNegative {
+			t.Errorf("err = %q, want %q", err.Error(), ErrMsgPerTryTimeoutNegative)
+		}
+	})
+	t.Run("zero-accepted-no-bound", func(t *testing.T) {
+		// per_try_timeout == 0 means "no bound" and is NOT an error.
+		rp, err := NewRetryPolicy("5xx", 1, nil, 0, 0, 0)
+		if err != nil {
+			t.Fatalf("NewRetryPolicy(perTryTimeout=0) unexpected error: %v", err)
+		}
+		if got := rp.PerTryTimeout(); got != 0 {
+			t.Errorf("PerTryTimeout() = %v, want 0 (no bound)", got)
+		}
+	})
+	t.Run("max-less-than-base-still-rejected-with-6th-arg", func(t *testing.T) {
+		// The existing max<base reject must still fire when perTryTimeout==0 (6th arg present).
+		rp, err := NewRetryPolicy("5xx", 1, nil, 100*time.Millisecond, 50*time.Millisecond, 0)
+		if err == nil {
+			t.Fatalf("NewRetryPolicy(max<base, perTryTimeout=0) = %+v, nil; want error", rp)
+		}
+		if err.Error() != ErrMsgMaxIntervalBelowBase {
+			t.Errorf("err = %q, want %q", err.Error(), ErrMsgMaxIntervalBelowBase)
+		}
+	})
+}
+
 func TestRetryBackoffBounds(t *testing.T) {
 	// backoff is full-jitter: every sample must land in [0, maxInterval]. Run
 	// each attempt many times to exercise the random distribution; assert BOUNDS
 	// (not a fixed value). n=40 exercises the int64 shift-overflow clamp.
-	rp, err := NewRetryPolicy("5xx", 5, nil, 25*time.Millisecond, 250*time.Millisecond)
+	rp, err := NewRetryPolicy("5xx", 5, nil, 25*time.Millisecond, 250*time.Millisecond, 0)
 	if err != nil {
 		t.Fatalf("NewRetryPolicy(...) unexpected error: %v", err)
 	}

@@ -633,3 +633,133 @@ func TestAcquireH1_PoolHitReleasesImmediately(t *testing.T) {
 		t.Fatalf("after Close: active=%d want 0", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// EnsureRetryStats — phase 42.2a Task 5 (ADR-0249 +6th counter)
+// ---------------------------------------------------------------------------
+
+// mkRetryCluster builds a minimal Cluster with statsReg + statsPrefix stashed
+// (via registerClusterMetrics) so EnsureRetryStats can be called on it.
+// Returns both the Cluster and the Registry for Walk-based introspection.
+func mkRetryCluster(t *testing.T, name string) (*Cluster, *stats.Registry) {
+	t.Helper()
+	r := stats.NewRegistry()
+	ep := Endpoint{Host: "127.0.0.1", Port: 9001}
+	c := &Cluster{
+		name:           name,
+		connectTimeout: time.Second,
+		endpoints:      []Endpoint{ep},
+		lb:             &roundRobin{endpoints: []Endpoint{ep}},
+	}
+	registerClusterMetrics(r, c)
+	return c, r
+}
+
+// counterNames returns the set of counter names visible in the registry.
+func counterNames(r *stats.Registry) map[string]bool {
+	names := make(map[string]bool)
+	r.Walk(func(m stats.Metric) {
+		if m.Type() == stats.MetricCounter {
+			names[m.Name()] = true
+		}
+	})
+	return names
+}
+
+// TestEnsureRetryStats_RegistersSixCounters verifies that after
+// EnsureRetryStats() the cluster registers exactly the 6 retry counters
+// (the existing 5 + upstream_rq_per_try_timeout), that
+// IncUpstreamRqPerTryTimeout increments the new counter from 0→1, and
+// that a second EnsureRetryStats() call is idempotent (no panic, same
+// handles). (ADR-0249; phase 42.2a Task 5)
+func TestEnsureRetryStats_RegistersSixCounters(t *testing.T) {
+	c, r := mkRetryCluster(t, "rc_six")
+	p := "cluster.rc_six."
+
+	// Before EnsureRetryStats: retry counters must NOT be present.
+	before := counterNames(r)
+	retryNames := []string{
+		p + "upstream_rq_retry",
+		p + "upstream_rq_retry_success",
+		p + "upstream_rq_retry_limit_exceeded",
+		p + "upstream_rq_retry_backoff_exponential",
+		p + "upstream_rq_retry_backoff_ratelimited",
+		p + "upstream_rq_per_try_timeout",
+	}
+	for _, n := range retryNames {
+		if before[n] {
+			t.Errorf("counter %q present before EnsureRetryStats, want absent", n)
+		}
+	}
+
+	// After EnsureRetryStats: all 6 must appear.
+	c.EnsureRetryStats()
+	after := counterNames(r)
+	for _, n := range retryNames {
+		if !after[n] {
+			t.Errorf("counter %q absent after EnsureRetryStats, want present", n)
+		}
+	}
+
+	// IncUpstreamRqPerTryTimeout: 0 → 1.
+	c.IncUpstreamRqPerTryTimeout()
+	// Read the value via Walk to avoid reaching into unexported fields.
+	var got uint64
+	r.Walk(func(m stats.Metric) {
+		if m.Name() == p+"upstream_rq_per_try_timeout" {
+			if cnt, ok := m.(*stats.Counter); ok {
+				got = cnt.Load()
+			}
+		}
+	})
+	if got != 1 {
+		t.Errorf("after IncUpstreamRqPerTryTimeout: value = %d, want 1", got)
+	}
+
+	// Idempotency: second call must not panic and must keep the same handle.
+	c.EnsureRetryStats()
+	after2 := counterNames(r)
+	for _, n := range retryNames {
+		if !after2[n] {
+			t.Errorf("counter %q absent after second EnsureRetryStats, want present", n)
+		}
+	}
+	// Value must still be 1 (same handle — no double-registration).
+	r.Walk(func(m stats.Metric) {
+		if m.Name() == p+"upstream_rq_per_try_timeout" {
+			if cnt, ok := m.(*stats.Counter); ok {
+				got = cnt.Load()
+			}
+		}
+	})
+	if got != 1 {
+		t.Errorf("after second EnsureRetryStats: counter value = %d, want 1 (same handle)", got)
+	}
+}
+
+// TestEnsureRetryStats_NilGuardIncIsNoop verifies that a Cluster without
+// EnsureRetryStats (no retry policy) treats IncUpstreamRqPerTryTimeout as a
+// no-op and registers NONE of the 6 retry counters. (ADR-0249)
+func TestEnsureRetryStats_NilGuardIncIsNoop(t *testing.T) {
+	c, r := mkRetryCluster(t, "rc_noop")
+	p := "cluster.rc_noop."
+
+	// Never call EnsureRetryStats — IncUpstreamRqPerTryTimeout must not panic.
+	c.IncUpstreamRqPerTryTimeout()
+
+	// None of the 6 retry counters must be registered.
+	names := counterNames(r)
+	retryNames := []string{
+		p + "upstream_rq_retry",
+		p + "upstream_rq_retry_success",
+		p + "upstream_rq_retry_limit_exceeded",
+		p + "upstream_rq_retry_backoff_exponential",
+		p + "upstream_rq_retry_backoff_ratelimited",
+		p + "upstream_rq_per_try_timeout",
+	}
+	for _, n := range retryNames {
+		if names[n] {
+			t.Errorf("counter %q present on non-retry cluster, want absent", n)
+		}
+	}
+}
