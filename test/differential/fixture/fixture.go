@@ -586,6 +586,15 @@ const (
 	// BackendKind per reference_differential_fixture_dispatch_constraint; the
 	// HTTP503Responder = 35 precedent (host attribution via body, no counter).
 	BlockingHoldResponder BackendKind = 36
+	// H2HoldResponder is an in-process HTTP/2 (h2c prior-knowledge) responder
+	// (phase 43.2a, the H2 multiplex pool). It advertises a configurable
+	// SETTINGS_MAX_CONCURRENT_STREAMS (set >= the cluster's max_concurrent_streams
+	// so the LOCAL cap binds, not the peer — AMEND-H2-1/H2-5) and holds each
+	// "GET /<seg>" stream open until a "GET /__release" control request frees the
+	// current batch, then answers HTTP 200. Used by 0079 to fill ceil(K/C) conns
+	// deterministically before probing stream counts + the pending queue. NEW
+	// BackendKind per reference_differential_fixture_dispatch_constraint.
+	H2HoldResponder BackendKind = 37
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

@@ -1,0 +1,106 @@
+# Phase-43.2a fixture 0079-h2-multiplex-pool: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture: an HTTP/1.1 downstream
+# listener whose requests fan out to an H2 (h2c) upstream multiplex pool. Each
+# downstream request becomes ONE upstream H2 STREAM multiplexed onto a SMALL
+# number of upstream connections — exactly ceil(K/C), where C is the cluster's
+# OWN http2_protocol_options.max_concurrent_streams (the LOCAL cap, AMEND-H2-1).
+# The single backend is an H2HoldResponder (BackendKind 37) that HOLDS each
+# "GET /<seg>" stream open until the driver releases the batch.
+#
+# # Cross-side EXACT — NOT a 43.1-style robust departure (reference_h2_pool_local_cap_driven)
+#
+# The 2026-06-23 live probe (SPEC §11 D-H2-EXACT) confirmed the reference Envoy
+# ALSO grows its H2 pool off the cluster's OWN max_concurrent_streams: with C set
+# and K fully-overlapping held streams, the reference opens EXACTLY ceil(K/C)
+# upstream connections — deterministic, zero errors, all 200s. This is CLEAN
+# flow-control enforcement (contrast 0078/43.1's SOFT max_connections, which
+# forced an exact-vs-robust prong split). So the H2 conn/stream COUNTS are
+# asserted cross-side EXACT on BOTH sides.
+#
+# # Two clusters (the topology choice), one backend
+#
+# The fixture runs TWO prongs with irreconcilable single-cluster budgets, so it
+# uses TWO clusters BOTH pointing at the same backend host:
+#   - c_h2mp: C=2, max_connections=16, max_pending_requests=16 — the EXACT ceil
+#     prong (the cap NEVER binds; conn growth is C-driven). K=6 held streams ⇒
+#     ceil(6/2)=3 conns.
+#   - c_h2of: C=1, max_connections=1, max_pending_requests=1 — the overflow prong
+#     (1 held stream fills the 1 conn (C=1), a 2nd PENDS, a 3rd OVERFLOWS → 503).
+#
+# Route selection: /mp → c_h2mp, /of → c_h2of (HTTP/1.1 downstream, h2c upstream;
+# no transport_socket per ADR-0166). The H2 typed_extension_protocol_options
+# carries http2_protocol_options.max_concurrent_streams: C on each cluster. The
+# backend advertises SETTINGS_MAX_CONCURRENT_STREAMS=1000 >> C so the LOCAL cap
+# binds, not the peer (no REFUSED_STREAM — AMEND-H2-1/H2-5).
+#
+# # The driver: staged drive (fill / multiplex / pend / oversub / drain)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST, the byte-equiv
+# "READY\n" stream for CompareBytes) then AssertStats (run LAST, holding BOTH
+# admin addrs). The fill / multiplex-prove / pend / oversub / drain ALL run inside
+# AssertStats, SEQUENTIALLY per side (subject FULLY, then reference). The Drive
+# hooks stash listener addrs; the config builders stash the backend host port for
+# the /__release control hit (127.0.0.1:<backendPort>, loopback, re-armable).
+#
+# BOTH sides (cross-side EXACT):
+#   Prong 1 (c_h2mp, the ceil prong):
+#     1. Fire K=6 fully-overlapping held GET /mp/<i> → poll:
+#          cluster.c_h2mp.upstream_cx_total       == 3   (ceil(6/2))
+#          cluster.c_h2mp.upstream_cx_http2_total == 3   (all H2 conns)
+#          cluster.c_h2mp.http2.streams_active    == 6   (K active streams)
+#     2. multiplex proof: upstream_cx_total (==3) << K (==6).
+#     3. /__release → all 6 drain to 200 ("backend-0:<seg>") → poll
+#          cluster.c_h2mp.http2.streams_active    == 0
+#   Prong 2 (c_h2of, the overflow prong):
+#     4a. Fire 1 held GET /of/0 → poll cluster.c_h2of.http2.streams_active == 1.
+#     4b. Fire a 2nd held GET /of/1 → PENDS → poll
+#          cluster.c_h2of.upstream_rq_pending_active == 1.
+#     4c. Fire a 3rd GET /of/2 SYNCHRONOUSLY → queue full → DOWNSTREAM 503;
+#          cluster.c_h2of.upstream_rq_pending_overflow delta >= 1;
+#          cluster.c_h2of.upstream_cx_total > 0 (decode-ran guard).
+#     5. /__release → the held + woken pending drain to 200 → poll
+#          cluster.c_h2of.http2.streams_active       == 0
+#          cluster.c_h2of.upstream_rq_pending_active == 0
+#
+# # Asserted stats (cross-side EXACT on both sides, unless noted)
+#
+#   cluster.c_h2mp.upstream_cx_total        == 3 (ceil(K/C)) — EXACT both sides
+#   cluster.c_h2mp.upstream_cx_http2_total  == 3 (all H2)    — EXACT both sides
+#   cluster.c_h2mp.http2.streams_active     == 6 held, then 0 after release
+#   cluster.c_h2of.http2.streams_active     == 1 held, then 0 after release
+#   cluster.c_h2of.upstream_rq_pending_active == 1 pending, then 0 after release
+#   cluster.c_h2of.upstream_rq_pending_overflow delta >= 1 (queue overflowed)
+#   cluster.c_h2of.upstream_cx_total        > 0 (decode-ran guard)
+#   plus exactly one DOWNSTREAM 503 (from the oversubscriber's status code) +
+#     all held/pending requests 200 after the release.
+#
+# # Deliberate non-assertions (recorded departures)
+#
+#   - The overflow 503 is observed from the DOWNSTREAM status code of the fired
+#     oversubscriber, NOT upstream_rq_5xx — the overflow is a local reply
+#     (reference_concurrent_attempt_downstream_class_assertion).
+#   - The overflow-prong overflow counter is asserted as a delta >= 1 (not an
+#     exact count): the synchronous 3rd request reliably overflows once; the
+#     delta tolerates any incidental retry-driven extra overflows without flaking.
+#   - upstream_cx_active / cx_open are NOT asserted: the H2 conn count is fully
+#     captured by upstream_cx_total + http2.streams_active (the multiplex proof),
+#     and the ceil prong's max_connections is deliberately non-binding.
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The held/pending bodies run inside
+# AssertStats and are asserted there (status 200 + backend-0: body), not
+# byte-compared.
+#
+# response-status: 503 on the overflowing oversubscriber, 200 on the held + woken
+# requests (asserted in AssertStats); NOT part of the byte-compared stream.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path.
+#
+# Non-additions: a NEW BackendKind (H2HoldResponder = 37 — the h2c hold-and-release
+# backend; the BlockingHoldResponder 36 is H1-only); NO DistributionAsserter
+# (single-host topology + the H2 multiplex-pool counters carry the proof).
+response-body:
+  applicable: true
+  scope: byte-exact

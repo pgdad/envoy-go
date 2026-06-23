@@ -78,6 +78,12 @@ func (p *PooledH1Conn) BufioReader() *bufio.Reader { return p.Br }
 // extra connection rather than queue it.
 const h1PoolMaxPerEndpoint = 1024
 
+// h2DefaultMaxConcurrentStreams is the per-conn stream cap applied to an H2-upstream
+// cluster when http2_protocol_options.max_concurrent_streams is absent or 0. Effectively
+// unbounded (the reference's default is ≈2^31-1 — D-H2-DEFAULT/AMEND-H2-3) so the pool
+// multiplexes onto a single connection unless the cap is configured small.
+const h2DefaultMaxConcurrentStreams int64 = 1 << 30
+
 // Cluster is a named pool of endpoints with a load-balancing policy. Phase 02
 // shipped round-robin; phase 34 added least_request (ADR-0233); future phases
 // may grow the LB family.
@@ -102,6 +108,31 @@ type Cluster struct {
 	// constructs routerActionH2 instead of routerAction (per ADR-0056;
 	// phase 05.2 SPEC §5.5).
 	useH2 bool
+	// h2MaxConcurrentStreams is the per-connection outbound stream budget for an
+	// H2-upstream cluster — the cluster's OWN http2_protocol_options.max_concurrent_streams
+	// (the LOCAL cap; AMEND-H2-1). It drives multi-conn growth in the h2Pool: a new
+	// pooled ClientConn opens only when every existing conn holds this many in-flight
+	// streams. Absent/0 ⇒ h2DefaultMaxConcurrentStreams (effectively single-conn
+	// multiplex; AMEND-H2-3). Set by buildCluster from extractH2Mode; 0 for non-H2
+	// clusters (unread there). (ADR-0253)
+	h2MaxConcurrentStreams int64
+	// h2Pool is the per-endpoint slice of multiplexed upstream H2 connections
+	// (keyed by ep.Addr()); h2Waiters is the SEPARATE per-endpoint stream-aware
+	// pending FIFO (woken on stream-completion OR conn-eviction, NOT only on
+	// conn-close like connPool.waiters — the crux of SPEC §3.5). ALL of the pool
+	// admission state (pooledH2Conn.inFlight, the waiter FIFO, the streams_active
+	// gauge) is guarded SOLELY by h2PoolMu (D-H2-MUTEX; single-mutator). nil maps
+	// until first use (lazy-init in the lifecycle, Task 5). (phase 43.2a, ADR-0253)
+	h2PoolMu  sync.Mutex
+	h2Pool    map[string][]*pooledH2Conn
+	h2Waiters map[string][]*h2Waiter
+	// h2Connecting is the per-endpoint set of IN-FLIGHT dials (Task 9.5,
+	// connect-time coalescing). A connecting entry sits between a stream-HIT and a
+	// fresh dial: concurrent demand ATTACHES to it (reserving a promised slot)
+	// rather than each acquirer dialing its own conn, so K concurrent streams at
+	// cap C open exactly ceil(K/C) conns. Guarded SOLELY by h2PoolMu; nil until
+	// first use (lazy-init in AcquireH2Stream). (phase 43.2a, ADR-0253)
+	h2Connecting map[string][]*connectingH2Conn
 	// 06.1 metric fields (per ADR-0063 — cluster-level only; per-endpoint
 	// expansion deferred). All fields are non-nil after Manager.buildCluster
 	// completes; all are concurrent-safe (atomic primitives). Allocated by
@@ -114,6 +145,19 @@ type Cluster struct {
 	upstreamCxTotal  *stats.Counter
 	upstreamCxActive *stats.Gauge
 	membershipTotal  *stats.Gauge
+
+	// http2StreamsActive is the cluster.<name>.http2.streams_active gauge — the
+	// live multiplexed-stream count across the cluster's H2 conns. Declared here
+	// so the h2pool nil-guarded helpers compile; nil until Task 6's
+	// registerClusterMetrics binds it (useH2-gated). (phase 43.2a, ADR-0253)
+	http2StreamsActive *stats.Gauge
+
+	// upstreamCxHTTP2Total is the cluster.<name>.upstream_cx_http2_total counter
+	// (++ per new pooled H2 conn dialed by the multiplex pool). Declared here so
+	// the Task-5 AcquireH2Stream MISS path can Inc it nil-guarded; nil until
+	// Task 6's registerClusterMetrics binds it (useH2-gated; AMEND-H2-2). There
+	// is NO upstream_cx_http2_active. (phase 43.2a, ADR-0253)
+	upstreamCxHTTP2Total *stats.Counter
 
 	// health is the per-cluster active-HC registry (ADR-0243). nil for a cluster
 	// with no health_checks. Built + threaded into the LB constructs in
@@ -237,6 +281,16 @@ func (c *Cluster) acquireConnSlot(ctx context.Context) error {
 		return nil
 	}
 	return c.circuitBreaker.pool.acquireConnOrPend(ctx)
+}
+
+// tryAcquireConnSlot is the non-blocking permit reserve used by the H2 pool.
+// true ⇒ permit held (pair with releaseConnSlot/connDec); false ⇒ at cap.
+// No pool (no circuit_breakers) ⇒ always true (unbounded conn growth). (ADR-0253)
+func (c *Cluster) tryAcquireConnSlot() bool {
+	if c.circuitBreaker == nil || c.circuitBreaker.pool == nil {
+		return true
+	}
+	return c.circuitBreaker.pool.tryAcquireConnSlot()
 }
 
 // releaseConnSlot returns a permit acquired by acquireConnSlot. Called on the
@@ -448,10 +502,37 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 		release()
 		return nil, ep, err
 	}
+	// Dial owns the permit it just acquired → ownPermit=true so dialPicked's
+	// failure paths give it back (releaseConnSlot); on success it transfers to
+	// the connWithGauge dec closure.
+	return c.dialPicked(ctx, ep, release, true /*ownPermit*/)
+}
+
+// dialPicked is the SHARED post-pick dial body for Dial and the H2 multiplex
+// pool's dialPooledH2To (extracted so the compiler enforces parity —
+// D-H2-DIALSHARE). Given an already
+// LB-picked ep + its release closure + a permit already held by the caller, it:
+// TCP-dials (connect_timeout-bounded) → TLS-handshakes (when configured) →
+// Inc's upstream_cx_{total,active} → wraps in connWithGauge{dec: connDec(release)}.
+//
+// ownPermit governs the failure-path give-back: when true, each failure path
+// calls releaseConnSlot() (the caller holds a permit that has no connWithGauge
+// wrapper yet to free it). On SUCCESS the permit ALWAYS transfers to the
+// connWithGauge dec closure (connDec → releaseConn on conn Close; the sync.Once
+// guards gauge-Dec + LB-release + permit-release together so double-Close cannot
+// double-release). Both Dial and dialPooledH2To currently pass ownPermit=true;
+// the flag documents the single axis of variation and leaves room for a future
+// permit-less caller without forking the body.
+func (c *Cluster) dialPicked(ctx context.Context, ep Endpoint, release func(), ownPermit bool) (net.Conn, Endpoint, error) {
+	releasePermit := func() {
+		if ownPermit {
+			c.releaseConnSlot()
+		}
+	}
 	d := &net.Dialer{Timeout: c.connectTimeout}
 	raw, err := d.DialContext(ctx, "tcp", ep.Addr())
 	if err != nil {
-		c.releaseConnSlot()
+		releasePermit()
 		release()
 		return nil, ep, fmt.Errorf("cluster: dial: %w", err)
 	}
@@ -460,7 +541,7 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 		conn := stdtls.Client(raw, c.upstreamCfg)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
-			c.releaseConnSlot()
+			releasePermit()
 			release()
 			return nil, ep, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}

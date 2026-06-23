@@ -741,6 +741,96 @@ func TestExtractH2Mode_TLSH2_TransportSocketMissingALPNH2_StillRejected(t *testi
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Phase 43.2a Task 2 — Parse max_concurrent_streams → h2MaxConcurrentStreams
+// ---------------------------------------------------------------------------
+
+// hpoExplicitH2WithMaxStreams returns an HttpProtocolOptions selecting
+// explicit_http_config.http2_protocol_options with max_concurrent_streams set
+// to the given value. Used by TestExtractH2Mode_MaxConcurrentStreams.
+func hpoExplicitH2WithMaxStreams(v uint32) *upstreamshttpv3.HttpProtocolOptions {
+	return &upstreamshttpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{
+					Http2ProtocolOptions: &corev3.Http2ProtocolOptions{
+						MaxConcurrentStreams: wrapperspb.UInt32(v),
+					},
+				},
+			},
+		},
+	}
+}
+
+// TestExtractH2Mode_MaxConcurrentStreams verifies that buildCluster threads
+// http2_protocol_options.max_concurrent_streams onto Cluster.h2MaxConcurrentStreams
+// (the local cap; AMEND-H2-1):
+//   - explicit max_concurrent_streams: 2  → h2MaxConcurrentStreams == 2
+//   - http2_protocol_options{} (no inner) → h2MaxConcurrentStreams == h2DefaultMaxConcurrentStreams (ABSENT path: the h2 != nil guard short-circuits)
+//   - http2_protocol_options{max_concurrent_streams: 0} → h2MaxConcurrentStreams == h2DefaultMaxConcurrentStreams (configured-0 path: exercises the v.GetValue() > 0 guard)
+//   - absent/0 is treated as the high default (NO reject arm — reference parity)
+func TestExtractH2Mode_MaxConcurrentStreams(t *testing.T) {
+	t.Run("explicit_cap_2", func(t *testing.T) {
+		c := mkStaticCluster("c_h2_cap2", mkLbEndpoint("10.0.0.1", 8080))
+		c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+			httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2WithMaxStreams(2)),
+		}
+		m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
+		if err != nil {
+			t.Fatalf("NewManagerWithBaseDir: %v", err)
+		}
+		got, ok := m.Get("c_h2_cap2")
+		if !ok {
+			t.Fatal("cluster c_h2_cap2 not found")
+		}
+		if got.h2MaxConcurrentStreams != 2 {
+			t.Errorf("h2MaxConcurrentStreams = %d, want 2", got.h2MaxConcurrentStreams)
+		}
+	})
+
+	t.Run("no_cap_defaults_to_high", func(t *testing.T) {
+		c := mkStaticCluster("c_h2_nocap", mkLbEndpoint("10.0.0.1", 8080))
+		c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+			httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+		}
+		m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
+		if err != nil {
+			t.Fatalf("NewManagerWithBaseDir: %v", err)
+		}
+		got, ok := m.Get("c_h2_nocap")
+		if !ok {
+			t.Fatal("cluster c_h2_nocap not found")
+		}
+		if got.h2MaxConcurrentStreams != h2DefaultMaxConcurrentStreams {
+			t.Errorf("h2MaxConcurrentStreams = %d, want h2DefaultMaxConcurrentStreams (%d)",
+				got.h2MaxConcurrentStreams, h2DefaultMaxConcurrentStreams)
+		}
+	})
+
+	// configured_zero_defaults_to_high uses a NON-NIL inner *Http2ProtocolOptions
+	// carrying max_concurrent_streams: 0 — so the `h2 != nil` guard does NOT
+	// short-circuit and the `v.GetValue() > 0` guard is the load-bearing branch
+	// that falls a configured 0 through to the high default (AMEND-H2-3; no reject).
+	t.Run("configured_zero_defaults_to_high", func(t *testing.T) {
+		c := mkStaticCluster("c_h2_cap0", mkLbEndpoint("10.0.0.1", 8080))
+		c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+			httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2WithMaxStreams(0)),
+		}
+		m, err := NewManagerWithBaseDir(mkBootstrap(c), "", stats.NewRegistry())
+		if err != nil {
+			t.Fatalf("NewManagerWithBaseDir: %v (configured max_concurrent_streams: 0 must NOT reject — reference parity)", err)
+		}
+		got, ok := m.Get("c_h2_cap0")
+		if !ok {
+			t.Fatal("cluster c_h2_cap0 not found")
+		}
+		if got.h2MaxConcurrentStreams != h2DefaultMaxConcurrentStreams {
+			t.Errorf("h2MaxConcurrentStreams = %d, want h2DefaultMaxConcurrentStreams (%d) (configured 0 → high default via the > 0 guard)",
+				got.h2MaxConcurrentStreams, h2DefaultMaxConcurrentStreams)
+		}
+	})
+}
+
 func TestBuildCluster_H2Mode_TLSWithoutALPNH2(t *testing.T) {
 	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
 	if err != nil {
@@ -1526,6 +1616,79 @@ func TestRegisterClusterMetrics_NonSubsetNoSubsetStats(t *testing.T) {
 			t.Errorf("a non-subset cluster must NOT register %s", name)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 43.2a Task 6 — register upstream_cx_http2_total + http2.streams_active
+// (useH2-gated; non-H2 clusters stay byte-stable; AMEND-H2-2)
+// ---------------------------------------------------------------------------
+
+// TestRegisterClusterMetrics_H2Stats verifies that registerClusterMetrics
+// registers exactly the 2 H2 pool stats on H2-upstream clusters (useH2-gated)
+// and registers NEITHER on non-H2 clusters (byte-stability).
+//
+// H2 cluster: upstream_cx_http2_total (counter) + http2.streams_active (gauge)
+// MUST be present, and upstream_cx_http2_active MUST be absent (AMEND-H2-2 —
+// it does not exist in the reference). Non-H2 cluster: NEITHER name is present.
+func TestRegisterClusterMetrics_H2Stats(t *testing.T) {
+	t.Run("h2_cluster_has_two_stats", func(t *testing.T) {
+		// Build a plaintext h2c cluster (ADR-0166: no transport_socket needed).
+		c := mkStaticCluster("c_h2s", mkLbEndpoint("10.0.0.1", 8080))
+		c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+			httpProtocolOptionsKey: mkHttpProtocolOptionsAny(t, hpoExplicitH2()),
+		}
+		reg := stats.NewRegistry()
+		m, err := NewManagerWithBaseDir(mkBootstrap(c), "", reg)
+		if err != nil {
+			t.Fatalf("NewManagerWithBaseDir: %v", err)
+		}
+		cl, ok := m.Get("c_h2s")
+		if !ok {
+			t.Fatal("cluster c_h2s not found")
+		}
+
+		// The two H2 handles must be bound on the cluster struct.
+		if cl.upstreamCxHTTP2Total == nil {
+			t.Error("upstreamCxHTTP2Total is nil; want non-nil after registerClusterMetrics (H2 cluster)")
+		}
+		if cl.http2StreamsActive == nil {
+			t.Error("http2StreamsActive is nil; want non-nil after registerClusterMetrics (H2 cluster)")
+		}
+
+		// The two names must be present in the registry.
+		if !hasMetric(reg, "cluster.c_h2s.upstream_cx_http2_total") {
+			t.Error("cluster.c_h2s.upstream_cx_http2_total not registered (H2 cluster)")
+		}
+		if !hasMetric(reg, "cluster.c_h2s.http2.streams_active") {
+			t.Error("cluster.c_h2s.http2.streams_active not registered (H2 cluster)")
+		}
+
+		// upstream_cx_http2_active MUST NOT be registered (AMEND-H2-2 — it does
+		// not exist in the reference; there is no _http2_active name).
+		if hasMetric(reg, "cluster.c_h2s.upstream_cx_http2_active") {
+			t.Error("cluster.c_h2s.upstream_cx_http2_active registered but must NOT exist (AMEND-H2-2)")
+		}
+	})
+
+	t.Run("non_h2_cluster_has_no_h2_stats", func(t *testing.T) {
+		// A plain non-H2 cluster must not register either H2 stat name
+		// (byte-stability: non-H2 fixture stat counts are unchanged).
+		c := mkStaticCluster("c_h1s", mkLbEndpoint("10.0.0.1", 8080))
+		// No TypedExtensionProtocolOptions → useH2 = false.
+		reg := stats.NewRegistry()
+		if _, err := NewManagerWithBaseDir(mkBootstrap(c), "", reg); err != nil {
+			t.Fatalf("NewManagerWithBaseDir: %v", err)
+		}
+		for _, name := range []string{
+			"cluster.c_h1s.upstream_cx_http2_total",
+			"cluster.c_h1s.http2.streams_active",
+			"cluster.c_h1s.upstream_cx_http2_active",
+		} {
+			if hasMetric(reg, name) {
+				t.Errorf("non-H2 cluster must NOT register %q (byte-stability)", name)
+			}
+		}
+	})
 }
 
 func TestSubsetLB_InjectedCountersIncFromManager(t *testing.T) {

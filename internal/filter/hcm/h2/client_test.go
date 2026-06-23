@@ -808,6 +808,26 @@ func TestClientConn_RoundTrip_AfterClose(t *testing.T) {
 	}
 }
 
+// TestClientConn_Closed — a fresh ClientConn reports Closed()==false; after
+// Close() is called (which cancels cc.ctx) it reports Closed()==true.
+// Phase 43.2a Task 3: the exported predicate used by the h2 pool's admission
+// scan in package cluster.
+func TestClientConn_Closed(t *testing.T) {
+	cc, _, cleanup := dialClientConn(t)
+	defer cleanup()
+
+	// Fresh conn: ctx is live, Closed() must be false.
+	if cc.Closed() {
+		t.Fatal("Closed() = true on fresh ClientConn; want false")
+	}
+
+	// After Close(), cc.ctx is canceled; Closed() must be true.
+	cleanup() // calls cc.Close() + drains peer
+	if !cc.Closed() {
+		t.Fatal("Closed() = false after Close(); want true")
+	}
+}
+
 // TestClientConn_RoundTrip_StreamIDMonotonicity — three sequential
 // RoundTrips on the same conn; observe stream ids 1, 3, 5 server-side.
 // Run sequentially so the wire-order matches the allocator order; the

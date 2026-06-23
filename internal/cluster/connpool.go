@@ -109,6 +109,30 @@ func (p *connPool) acquireConnOrPend(ctx context.Context) error {
 	}
 }
 
+// tryAcquireConnSlot reserves a connection-creation permit WITHOUT blocking or
+// enqueuing. Returns true with a permit held (the caller MUST pair it with
+// exactly one releaseConn) when under max_connections; false (no permit, no
+// waiter appended) when at the cap. The H2 pool uses this instead of
+// acquireConnOrPend so an H2 request never lands in connPool.waiters (whose
+// wake fires only on conn-close) — H2 waiters live in the stream-aware queue
+// in h2pool.go and are woken by h2PromoteLocked. Mirrors acquireConnOrPend's
+// cap-crossing soft-signal parity (cx_open + upstream_cx_overflow; AMEND-CP1).
+// (phase 43.2a, ADR-0253)
+func (p *connPool) tryAcquireConnSlot() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeConns < p.maxConnections {
+		p.activeConns++
+		if p.activeConns >= p.maxConnections {
+			setGauge(p.cxOpen, 1)
+		}
+		return true
+	}
+	setGauge(p.cxOpen, 1)
+	incCounter(p.upstreamCxOverflow)
+	return false
+}
+
 // releaseConn returns one connection-creation permit. With a queued waiter the
 // permit is handed off directly (FIFO) — activeConns is UNCHANGED (the freed
 // permit is re-reserved for the waiter; cx_open stays set). With no waiter,

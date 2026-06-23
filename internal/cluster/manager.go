@@ -188,6 +188,13 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 	if c.circuitBreaker != nil {
 		c.circuitBreaker.registerStats(r, prefix)
 	}
+	// Phase 43.2a (ADR-0253): the 2 H2 multiplex-pool stats, on H2-upstream
+	// clusters only (useH2-gated → non-H2 clusters stay byte-stable). NO
+	// upstream_cx_http2_active (it does not exist in the reference; AMEND-H2-2).
+	if c.useH2 {
+		c.upstreamCxHTTP2Total = r.NewCounter(prefix + "upstream_cx_http2_total")
+		c.http2StreamsActive = r.NewGauge(prefix + "http2.streams_active")
+	}
 }
 
 // Get looks up a cluster by name. Returns (nil, false) if not found.
@@ -505,7 +512,9 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	}
 	// Phase 05.2 (Task 10, SPEC §5.5): read typed_extension_protocol_options for
 	// HttpProtocolOptions and decide whether this cluster originates H2 upstream.
-	useH2, err := extractH2Mode(c, cl.upstreamCfg)
+	// Phase 43.2a (Task 2, ADR-0253): also thread the LOCAL max_concurrent_streams
+	// cap onto cl.h2MaxConcurrentStreams.
+	useH2, h2MaxConcurrentStreams, err := extractH2Mode(c, cl.upstreamCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -516,6 +525,7 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 		return nil, fmt.Errorf("cluster: %q: grpc_health_check requires the cluster to support HTTP/2", name)
 	}
 	cl.useH2 = useH2
+	cl.h2MaxConcurrentStreams = h2MaxConcurrentStreams
 	return cl, nil
 }
 
@@ -679,24 +689,34 @@ func parseLbSubsetConfig(sc *clusterv3.Cluster_LbSubsetConfig) lbSubsetCfg {
 // CommonTlsContext.alpn_protocols. Pass nil when the cluster has no
 // transport_socket (plaintext h2c upstream); the runtime dial path (see
 // dial_h2.go) symmetrically skips the TLS-conn assertion when parsedTLS==nil.
-func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, err error) {
+func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, h2MaxConcurrentStreams int64, err error) {
 	tepo := c.GetTypedExtensionProtocolOptions()
 	if tepo == nil {
-		return false, nil
+		return false, 0, nil
 	}
 	tepoAny, ok := tepo[httpProtocolOptionsKey]
 	if !ok {
-		return false, nil
+		return false, 0, nil
 	}
 	var hpo upstreamshttpv3.HttpProtocolOptions
 	if err := tepoAny.UnmarshalTo(&hpo); err != nil {
-		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions: unmarshal: %w", c.GetName(), err)
+		return false, 0, fmt.Errorf("cluster: %q: HttpProtocolOptions: unmarshal: %w", c.GetName(), err)
 	}
 	switch up := hpo.UpstreamProtocolOptions.(type) {
 	case *upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_:
 		switch up.ExplicitHttpConfig.GetProtocolConfig().(type) {
 		case *upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions:
 			useH2 = true
+			// AMEND-H2-1/H2-3: read the cluster's OWN max_concurrent_streams (LOCAL
+			// cap). Absent/0 ⇒ h2DefaultMaxConcurrentStreams (effectively unbounded;
+			// single-conn multiplex until the cap is configured small). NO reject arm —
+			// the reference accepts any value (ADR-0253).
+			h2MaxConcurrentStreams = h2DefaultMaxConcurrentStreams
+			if h2 := up.ExplicitHttpConfig.GetHttp2ProtocolOptions(); h2 != nil {
+				if v := h2.GetMaxConcurrentStreams(); v != nil && v.GetValue() > 0 {
+					h2MaxConcurrentStreams = int64(v.GetValue())
+				}
+			}
 		default:
 			useH2 = false // H1 discriminator: silent-ignore inner.
 		}
@@ -706,7 +726,7 @@ func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, 
 		useH2 = false // Defensive: nil / use_downstream_protocol_config / etc.
 	}
 	if !useH2 {
-		return false, nil
+		return false, 0, nil
 	}
 	// ADR-0166: transport_socket is OPTIONAL for h2 upstream. When absent,
 	// the cluster originates plaintext h2c (prior-knowledge per RFC 7540 §3.4);
@@ -715,20 +735,20 @@ func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, 
 	if ts == nil {
 		// Plaintext h2c upstream — PERMITTED (ADR-0166). parsedTLS is nil
 		// by buildCluster's contract (no transport_socket → no cl.upstreamCfg).
-		return true, nil
+		return true, h2MaxConcurrentStreams, nil
 	}
 	if ts.GetTypedConfig() == nil {
-		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket of type tls, got transport_socket without typed_config", c.GetName())
+		return false, 0, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket of type tls, got transport_socket without typed_config", c.GetName())
 	}
 	if tu := ts.GetTypedConfig().GetTypeUrl(); tu != upstreamTLSContextTypeURL {
-		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket of type tls, got %q", c.GetName(), tu)
+		return false, 0, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires transport_socket of type tls, got %q", c.GetName(), tu)
 	}
 	if parsedTLS == nil {
 		// transport_socket present but TLS parsing returned nil — internal
 		// invariant. The earlier transport_socket parse path always sets
 		// cl.upstreamCfg non-nil for the UpstreamTlsContext type_url, so this
 		// branch is defense-in-depth.
-		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options: TLS parse returned nil", c.GetName())
+		return false, 0, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options: TLS parse returned nil", c.GetName())
 	}
 	hasH2 := false
 	for _, alpn := range parsedTLS.NextProtos {
@@ -738,9 +758,9 @@ func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, 
 		}
 	}
 	if !hasH2 {
-		return false, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires alpn_protocols to include %q, got %v", c.GetName(), "h2", parsedTLS.NextProtos)
+		return false, 0, fmt.Errorf("cluster: %q: HttpProtocolOptions.http2_protocol_options requires alpn_protocols to include %q, got %v", c.GetName(), "h2", parsedTLS.NextProtos)
 	}
-	return true, nil
+	return true, h2MaxConcurrentStreams, nil
 }
 
 func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) ([]Endpoint, error) {

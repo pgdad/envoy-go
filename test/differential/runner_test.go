@@ -103,6 +103,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0076-per-try-timeout/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0077-hedge-on-per-try-timeout/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0078-connection-pool-max-connections/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0079-h2-multiplex-pool/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -993,6 +994,24 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptBlockingHold(ln, bo.idx)
+		case fixture.H2HoldResponder:
+			// In-process h2c (HTTP/2 prior-knowledge) responder (phase 43.2a, H2
+			// multiplex pool) that holds each normal "GET /<seg>" stream open until a
+			// "GET /__release" control request frees the current batch, then answers
+			// HTTP 200 with a "backend-<idx>:<seg>" body. Advertises
+			// SETTINGS_MAX_CONCURRENT_STREAMS=1000 (well above any cluster cap C) so
+			// the LOCAL cluster cap binds, not the peer (AMEND-H2-1/H2-5). Used by
+			// 0079 to fill ceil(K/C) upstream connections deterministically before
+			// probing stream counts + the pending queue. Host attribution via response
+			// body (the BlockingHoldResponder precedent) — no accept counter.
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptH2Hold(ln, bo.idx)
 		}
 		backends[i] = bo
 	}
@@ -3004,5 +3023,80 @@ func serveGRPCHealth(ln net.Listener, idx int) {
 		_, _ = fmt.Fprintf(w, "backend-%d:%s", idx, r.URL.Path)
 	}
 	srv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(mux), &http2.Server{})}
+	_ = srv.Serve(ln)
+}
+
+// acceptH2Hold is the in-process h2c backend for H2HoldResponder (phase 43.2a,
+// BackendKind 37). It serves HTTP/2 (h2c prior-knowledge) and HOLDS each normal
+// "GET /<seg>" stream open on a shared gate until a release control request
+// fires, then answers HTTP 200 with a "backend-<idx>:<seg>" body (host
+// attribution via body — the BlockingHoldResponder precedent, no accept counter).
+//
+// SETTINGS_MAX_CONCURRENT_STREAMS is advertised as 1000 (well above any cluster
+// cap C) so the LOCAL cluster cap binds, not the peer (AMEND-H2-1/H2-5 — the
+// peer limit must not be the binding constraint or REFUSED_STREAM would fire
+// instead of multi-conn growth). The http2.Server field sets the value in the
+// initial SETTINGS frame.
+//
+// Two release control paths mirror acceptBlockingHold:
+//   - "GET /__release"        — re-armable: closes-and-swaps the gate (frees
+//     the current held batch, re-arms a fresh gate for the next). 0079 uses this
+//     during the hold phase.
+//   - "GET /__release_sticky" — STICKY: permanently opens the gate so ALL
+//     current AND future requests pass immediately (no re-arm). Available for the
+//     drain phase when held dials need to sail through without re-blocking.
+//
+// The http.Server.Serve / h2c.NewHandler combination handles H2 stream
+// multiplexing automatically (one goroutine per stream invoking the handler), so
+// the handler only needs to block per-stream on the gate. All gate reads are
+// done outside the mutex (read the snapshot under the lock, then wait); the gate
+// swap under the mutex is atomic. The handler is safe under concurrent invocation.
+func acceptH2Hold(ln net.Listener, idx int) {
+	var mu sync.Mutex
+	gate := make(chan struct{}) // closed by a release to free the current batch
+	sticky := false             // once /__release_sticky fires, all requests pass immediately
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/__release_sticky" {
+			mu.Lock()
+			if !sticky {
+				sticky = true
+				close(gate) // free the current batch AND mark sticky (all future pass)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "released-sticky")
+			return
+		}
+		if r.URL.Path == "/__release" {
+			mu.Lock()
+			old := gate
+			gate = make(chan struct{}) // re-arm for the next batch
+			mu.Unlock()
+			close(old) // free everyone currently held
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "released")
+			return
+		}
+		// A normal request: snapshot gate + sticky under the lock, then block
+		// outside it (so many concurrent streams block without holding the mutex).
+		mu.Lock()
+		s := sticky
+		g := gate
+		mu.Unlock()
+		if !s {
+			<-g
+		}
+		seg := r.URL.Path
+		if i := strings.LastIndex(seg, "/"); i >= 0 && i+1 < len(seg) {
+			seg = seg[i+1:]
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, "backend-%d:%s", idx, seg)
+	})
+
+	srv := &http.Server{Handler: h2c.NewHandler(handler, &http2.Server{
+		MaxConcurrentStreams: 1000, // advertise HIGH so the LOCAL cluster cap binds (AMEND-H2-1/H2-5)
+	})}
 	_ = srv.Serve(ln)
 }

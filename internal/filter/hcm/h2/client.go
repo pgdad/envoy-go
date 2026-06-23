@@ -607,6 +607,12 @@ func (cc *ClientConn) writeData(ctx context.Context, cs *clientStream, b []byte,
 	return nil
 }
 
+// Closed reports whether this connection's frame loop has torn down (the
+// conn-lifetime ctx is canceled, e.g. after Close or a transport error). The
+// h2 pool's admission scan skips a Closed conn; the pool evicts+Closes a
+// Closed conn once its last in-flight stream drains. (phase 43.2a, ADR-0253)
+func (cc *ClientConn) Closed() bool { return cc.ctx.Err() != nil }
+
 // Close emits a graceful GOAWAY(NO_ERROR) with the highest allocated stream
 // id as last-stream-id and closes the underlying conn. Idempotent — safe to
 // call from multiple goroutines.

@@ -5,6 +5,7 @@ import (
 	stdtls "crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 )
@@ -30,10 +31,15 @@ import (
 // performs the preface + initial SETTINGS exchange synchronously, surfacing
 // handshake errors at constructor time.
 //
-// Per ADR-0056, the returned *h2.ClientConn is per-request fresh; the caller
-// (routerActionH2.doH2 in internal/filter/hcm/actions.go) closes it via
-// defer after the response is consumed. Cross-request stream pooling is the
-// upstream-robustness family's deliverable, not phase 05.2's.
+// HISTORY: under ADR-0056 this was the live router H2 path (per-request fresh
+// dial + defer Close). Phase 43.2a (ADR-0253) superseded that: the router now
+// acquires a multiplexed stream on a POOLED conn via Cluster.AcquireH2Stream,
+// and Task 7 removed BOTH per-request-fresh router sites — so DialH2 has no
+// production callers anymore. It is retained as the single-shot dial entry that
+// shares the post-dial finalizer (h2ConnFromDialed) with the pool's permit-less
+// dialPooledH2To; its tests (dial_h2_test.go) thereby cover the TLS/ALPN/h2c
+// finalization the pool depends on. The caller takes ownership and Closes the
+// returned *h2.ClientConn.
 //
 // Each error branch closes the underlying conn explicitly because the function
 // returns the conn-owning *h2.ClientConn on success (caller takes ownership);
@@ -44,6 +50,50 @@ func (c *Cluster) DialH2(ctx context.Context) (*h2.ClientConn, Endpoint, error) 
 	if err != nil {
 		return nil, ep, fmt.Errorf("cluster: dial h2: %w", err)
 	}
+	return c.h2ConnFromDialed(ctx, raw, ep)
+}
+
+// dialPooledH2To is the H2 multiplex-pool's permit-less dial path to an
+// ALREADY-PICKED endpoint (phase 43.2a Task 7.5, ADR-0253). The pool picks the
+// endpoint EXACTLY ONCE (ctx-aware: hash key + subset match) in AcquireH2Stream
+// and reserves the connection-creation permit itself (tryAcquireConnSlot /
+// h2PromoteLocked) BEFORE dialing — so this path does NOT pick and does NOT
+// acquireConnSlot. It dials the GIVEN ep (via the shared dialPicked body,
+// ownPermit=true because the caller's reserved permit is the one dialPicked
+// manages) + the shared h2ConnFromDialed finalizer.
+//
+// LB-RELEASE + PERMIT CONTRACT: `release` is the LB pick's release (it accounts
+// load, e.g. least_request active count). It is passed straight to dialPicked
+// as the pick release. On ANY non-nil error dialPicked has ALREADY fired both
+// `release` (the LB release) AND releaseConnSlot (the permit) before there is
+// any connWithGauge wrapper to defer-close; the caller therefore NEVER
+// double-releases either — it only promotes the next waiter. On success BOTH
+// transfer to the connWithGauge dec closure (connDec → release + releaseConn on
+// conn Close).
+func (c *Cluster) dialPooledH2To(ctx context.Context, ep Endpoint, release func()) (*h2.ClientConn, error) {
+	raw, _, err := c.dialPicked(ctx, ep, release, true /*ownPermit*/)
+	if err != nil {
+		// dialPicked already released the LB release + the permit on its failure
+		// paths (its ownPermit contract).
+		return nil, fmt.Errorf("cluster: dial h2: %w", err)
+	}
+	cc, _, ferr := c.h2ConnFromDialed(ctx, raw, ep)
+	if ferr != nil {
+		// h2ConnFromDialed Closed the connWithGauge wrapper on its failure paths
+		// (connDec → release + releaseConn), so both are already freed.
+		return nil, ferr
+	}
+	return cc, nil
+}
+
+// h2ConnFromDialed is the shared post-dial H2 finalization: assert the
+// *connWithGauge wrapper, run the TLS/ALPN-or-h2c branch (ADR-0166), and drive
+// h2.NewClientConn's preface + SETTINGS exchange. On every error branch the
+// wrapper is Closed (which runs its connDec → releaseConn, freeing the pool's
+// permit for the dialPooledH2To caller, and Dec's upstream_cx_active for both
+// callers). Factored out of DialH2 verbatim so DialH2 and dialPooledH2To share
+// one finalization (phase 43.2a, ADR-0253).
+func (c *Cluster) h2ConnFromDialed(ctx context.Context, raw net.Conn, ep Endpoint) (*h2.ClientConn, Endpoint, error) {
 	// Phase 06.1 Task 9: Cluster.Dial wraps every successful dial in a
 	// *connWithGauge whose Close Decs the upstream_cx_active gauge. We pass
 	// the WRAPPER (not any unwrapped inner conn) into h2.NewClientConn so

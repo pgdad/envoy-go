@@ -43,54 +43,6 @@ import (
 // Phase 05.2 — routerActionH2 tests
 // ---------------------------------------------------------------------------
 
-// captureH2Writer is a fake h2.StreamWriter that records every call. Each
-// recorded entry is an event with a kind discriminator + payload so test
-// assertions can index calls in order.
-type captureH2Writer struct {
-	mu        sync.Mutex
-	headers   [][]hpack.HeaderField
-	data      [][]byte
-	endStream []bool
-	// kind entries are "headers" or "data"; len matches headers + data.
-	order []string
-}
-
-func (c *captureH2Writer) WriteHeaders(headers []hpack.HeaderField, endStream bool) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cp := make([]hpack.HeaderField, len(headers))
-	copy(cp, headers)
-	c.headers = append(c.headers, cp)
-	c.endStream = append(c.endStream, endStream)
-	c.order = append(c.order, "headers")
-	return nil
-}
-func (c *captureH2Writer) WriteData(b []byte, endStream bool) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cp := append([]byte(nil), b...)
-	c.data = append(c.data, cp)
-	c.endStream = append(c.endStream, endStream)
-	c.order = append(c.order, "data")
-	return nil
-}
-
-// statusOf returns the :status value from the first headers call, or "" if
-// no headers were recorded.
-func (c *captureH2Writer) statusOf() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.headers) == 0 {
-		return ""
-	}
-	for _, h := range c.headers[0] {
-		if h.Name == ":status" {
-			return h.Value
-		}
-	}
-	return ""
-}
-
 // h2BackendPKI is the in-memory CA + leaf cert/key for the in-process H2
 // backend tests. The mkH2BackendPKI helper mirrors the cluster-package's
 // dial_h2_test.go pattern (P-256 keygen is cheap; per-test instead of
@@ -238,26 +190,45 @@ func runH2Backend(conn net.Conn, behavior h2BackendBehavior, body []byte) {
 		if behavior == h2Backend503 {
 			status = "503"
 		}
-		// HPACK-encode the response headers with a fresh encoder (matches the
-		// from-scratch codec's per-conn encoder discipline).
+		// 43.2a Task 7: serve MULTIPLE sequential streams on this connection (the
+		// pooled-conn reuse path; ADR-0253 supersedes the ADR-0056 one-stream-per-
+		// conn assumption). The HPACK encoder is connection-scoped (its dynamic
+		// table persists across streams), so it is allocated once outside the loop.
+		// streamID is the HEADERS id of the current request (the first one was
+		// already read above); after responding, loop to read the next request's
+		// HEADERS (or return on conn close / GOAWAY).
 		var hbuf bytes.Buffer
 		henc := hpack.NewEncoder(&hbuf)
-		_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: status})
-		_ = henc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
-		_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(body))})
-		if err := fr.WriteHeaders(http2.HeadersFrameParam{
-			StreamID:      streamID,
-			BlockFragment: hbuf.Bytes(),
-			EndStream:     false,
-			EndHeaders:    true,
-		}); err != nil {
-			return
+		for {
+			hbuf.Reset()
+			_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: status})
+			_ = henc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
+			_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(body))})
+			if err := fr.WriteHeaders(http2.HeadersFrameParam{
+				StreamID:      streamID,
+				BlockFragment: hbuf.Bytes(),
+				EndStream:     false,
+				EndHeaders:    true,
+			}); err != nil {
+				return
+			}
+			if err := fr.WriteData(streamID, true /* endStream */, body); err != nil {
+				return
+			}
+			// Read the next client HEADERS (a reused pooled conn sends another
+			// stream). Ignore non-HEADERS frames (WINDOW_UPDATE / SETTINGS / PING /
+			// GOAWAY-without-HEADERS); return on conn close / read error.
+			for {
+				frame, err = fr.ReadFrame()
+				if err != nil {
+					return // conn closed (client Close → GOAWAY) or read error
+				}
+				if hf, ok := frame.(*http2.HeadersFrame); ok {
+					streamID = hf.StreamID
+					break
+				}
+			}
 		}
-		if err := fr.WriteData(streamID, true /* endStream */, body); err != nil {
-			return
-		}
-		// Linger so the client can send GOAWAY on Close without write-side errors.
-		_, _ = io.Copy(io.Discard, conn)
 	}
 }
 
@@ -340,11 +311,14 @@ func startH2RecordingBackend(t *testing.T, pki *h2BackendPKI, statusFor func(con
 	return b, ln
 }
 
-// serve handles one connection: client preface + SETTINGS exchange, then reads
-// HEADERS, drains the request-body DATA frames into the recorder, and writes a
-// HEADERS+DATA response whose :status is statusFor(connIndex). Mirrors
-// runH2Backend's framing discipline; the only addition is draining + recording
-// the request body DATA frames before responding.
+// serve handles one connection, serving MULTIPLE sequential streams on it (the
+// 43.2a pooled-conn reuse path; ADR-0253 supersedes the ADR-0056 one-stream-per-
+// conn shape). For EACH stream it reads HEADERS, drains the request-body DATA
+// frames into the recorder (one bodies[] entry per STREAM), and writes a
+// HEADERS+DATA response whose :status is statusFor(streamIndex). The b.conns
+// counter is now a STREAM counter (one Inc per served stream), so statusFor's
+// index == the retry-attempt index regardless of how many physical conns the
+// pool used. Mirrors runH2Backend's framing discipline.
 func (b *h2RecordingBackend) serve(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	prefaceBuf := make([]byte, 24)
@@ -371,62 +345,65 @@ func (b *h2RecordingBackend) serve(conn net.Conn) {
 	if err := fr.WriteSettingsAck(); err != nil {
 		return
 	}
-	// Read frames until HEADERS (past any WINDOW_UPDATE / PING).
-	var streamID uint32
-	headersEnded := false
+	// The HPACK encoder is connection-scoped (its dynamic table persists across
+	// streams); allocate it once outside the per-stream loop.
+	var hbuf bytes.Buffer
+	henc := hpack.NewEncoder(&hbuf)
 	for {
-		frame, err = fr.ReadFrame()
-		if err != nil {
-			return
-		}
-		if hf, ok := frame.(*http2.HeadersFrame); ok {
-			streamID = hf.StreamID
-			headersEnded = hf.StreamEnded()
-			break
-		}
-	}
-	// Drain the request-body DATA frames (if the request carried a body, HEADERS
-	// did NOT end the stream) until END_STREAM, accumulating the bytes received.
-	var reqBody bytes.Buffer
-	for !headersEnded {
-		frame, err = fr.ReadFrame()
-		if err != nil {
-			return
-		}
-		if df, ok := frame.(*http2.DataFrame); ok {
-			reqBody.Write(df.Data())
-			if df.StreamEnded() {
+		// Read frames until HEADERS (past any WINDOW_UPDATE / PING / SETTINGS).
+		var streamID uint32
+		headersEnded := false
+		for {
+			frame, err = fr.ReadFrame()
+			if err != nil {
+				return // conn closed (client Close → GOAWAY) or read error
+			}
+			if hf, ok := frame.(*http2.HeadersFrame); ok {
+				streamID = hf.StreamID
+				headersEnded = hf.StreamEnded()
 				break
 			}
 		}
-		// Ignore WINDOW_UPDATE / PING etc. interleaved with DATA.
-	}
-	idx := atomic.AddInt64(&b.conns, 1) - 1
-	recorded := append([]byte(nil), reqBody.Bytes()...)
-	b.mu.Lock()
-	b.bodies = append(b.bodies, recorded)
-	b.mu.Unlock()
+		// Drain the request-body DATA frames (if the request carried a body,
+		// HEADERS did NOT end the stream) until END_STREAM, accumulating bytes.
+		var reqBody bytes.Buffer
+		for !headersEnded {
+			frame, err = fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			if df, ok := frame.(*http2.DataFrame); ok {
+				reqBody.Write(df.Data())
+				if df.StreamEnded() {
+					break
+				}
+			}
+			// Ignore WINDOW_UPDATE / PING etc. interleaved with DATA.
+		}
+		idx := atomic.AddInt64(&b.conns, 1) - 1
+		recorded := append([]byte(nil), reqBody.Bytes()...)
+		b.mu.Lock()
+		b.bodies = append(b.bodies, recorded)
+		b.mu.Unlock()
 
-	status := strconv.Itoa(b.statusFor(idx))
-	respBody := []byte("resp:" + status)
-	var hbuf bytes.Buffer
-	henc := hpack.NewEncoder(&hbuf)
-	_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: status})
-	_ = henc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
-	_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(respBody))})
-	if err := fr.WriteHeaders(http2.HeadersFrameParam{
-		StreamID:      streamID,
-		BlockFragment: hbuf.Bytes(),
-		EndStream:     false,
-		EndHeaders:    true,
-	}); err != nil {
-		return
+		status := strconv.Itoa(b.statusFor(idx))
+		respBody := []byte("resp:" + status)
+		hbuf.Reset()
+		_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: status})
+		_ = henc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
+		_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(respBody))})
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: hbuf.Bytes(),
+			EndStream:     false,
+			EndHeaders:    true,
+		}); err != nil {
+			return
+		}
+		if err := fr.WriteData(streamID, true /* endStream */, respBody); err != nil {
+			return
+		}
 	}
-	if err := fr.WriteData(streamID, true /* endStream */, respBody); err != nil {
-		return
-	}
-	// Linger so the client can send GOAWAY on Close without write-side errors.
-	_, _ = io.Copy(io.Discard, conn)
 }
 
 // recordedBodies returns a snapshot copy of the per-connection request bodies.
@@ -575,7 +552,9 @@ func h2RequestForTest() h2.H2Request {
 }
 
 // TestRouterActionH2_HappyPath verifies that an upstream H2 200 with a body
-// is forwarded byte-for-byte to the captured downstream writer.
+// is forwarded byte-for-byte through the H2 action driver's ActionResponse.
+// 43.2a Task 7: retargeted from the removed per-request-fresh doH2 method onto
+// the live pooled driver doH2ClusterAction (ADR-0253).
 func TestRouterActionH2_HappyPath(t *testing.T) {
 	pki := mkH2BackendPKI(t)
 	body := []byte("upstream-ok\n")
@@ -585,43 +564,42 @@ func TestRouterActionH2_HappyPath(t *testing.T) {
 	c := h2EndpointCluster(t, ln.Addr().String(), pki)
 	a := &routerActionH2{cluster: c}
 
-	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
-		t.Fatalf("doH2: %v", err)
+	resp, _, err := doH2ClusterAction(ctx, a, h2RequestForTest())
+	if err != nil {
+		t.Fatalf("doH2ClusterAction: %v", err)
 	}
-	if got := w.statusOf(); got != "200" {
-		t.Errorf(":status = %q, want %q", got, "200")
+	if resp.Status != 200 {
+		t.Errorf("status = %d, want 200", resp.Status)
 	}
-	if len(w.data) != 1 {
-		t.Fatalf("data calls = %d, want 1", len(w.data))
-	}
-	if !bytes.Equal(w.data[0], body) {
-		t.Errorf("data = %q, want %q", w.data[0], body)
+	if !bytes.Equal(resp.Body, body) {
+		t.Errorf("body = %q, want %q", resp.Body, body)
 	}
 }
 
 // TestRouterActionH2_502OnDialFailure verifies that a closed-port cluster
-// produces a 502 local-reply with the bad502Body.
+// produces a 502 local-reply with the bad502Body. 43.2a Task 7: retargeted onto
+// the live pooled driver doH2ClusterAction (the pool's dial failure surfaces the
+// same 502 ActionResponse as the removed doH2 method did).
 func TestRouterActionH2_502OnDialFailure(t *testing.T) {
 	pki := mkH2BackendPKI(t)
-	// Use port 1 (always rejected) so DialH2 fails. The pki is unused in
-	// the dial-failure path but plumbed through for shape symmetry.
+	// Use port 1 (always rejected) so the pool's dial fails. The pki is unused
+	// in the dial-failure path but plumbed through for shape symmetry.
 	c := h2EndpointCluster(t, "127.0.0.1:1", pki)
 	a := &routerActionH2{cluster: c}
 
-	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
-		t.Fatalf("doH2: %v", err)
+	resp, _, err := doH2ClusterAction(ctx, a, h2RequestForTest())
+	if err != nil {
+		t.Fatalf("doH2ClusterAction: %v", err)
 	}
-	if got := w.statusOf(); got != "502" {
-		t.Errorf(":status = %q, want %q", got, "502")
+	if resp.Status != 502 {
+		t.Errorf("status = %d, want 502", resp.Status)
 	}
-	if len(w.data) != 1 || string(w.data[0]) != bad502Body {
-		t.Errorf("body = %q, want %q", w.data, bad502Body)
+	if string(resp.Body) != bad502Body {
+		t.Errorf("body = %q, want %q", resp.Body, bad502Body)
 	}
 }
 
@@ -636,14 +614,14 @@ func TestRouterActionH2_502OnRoundTripProtocolError(t *testing.T) {
 	c := h2EndpointCluster(t, ln.Addr().String(), pki)
 	a := &routerActionH2{cluster: c}
 
-	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
-		t.Fatalf("doH2: %v", err)
+	resp, _, err := doH2ClusterAction(ctx, a, h2RequestForTest())
+	if err != nil {
+		t.Fatalf("doH2ClusterAction: %v", err)
 	}
-	if got := w.statusOf(); got != "502" {
-		t.Errorf(":status = %q, want %q", got, "502")
+	if resp.Status != 502 {
+		t.Errorf("status = %d, want 502", resp.Status)
 	}
 }
 
@@ -658,7 +636,6 @@ func TestRouterActionH2_CtxCancelEmitsRSTStreamCancel(t *testing.T) {
 	c := h2EndpointCluster(t, ln.Addr().String(), pki)
 	a := &routerActionH2{cluster: c}
 
-	w := &captureH2Writer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel after a short delay so RoundTrip gets past the dial+settings
 	// handshake and is blocked waiting for the response.
@@ -666,9 +643,9 @@ func TestRouterActionH2_CtxCancelEmitsRSTStreamCancel(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		cancel()
 	}()
-	_, err := a.doH2(ctx, h2RequestForTest(), w)
+	resp, _, err := doH2ClusterAction(ctx, a, h2RequestForTest())
 	if err == nil {
-		t.Fatal("doH2 returned nil; want stream-scoped CANCEL error")
+		t.Fatal("doH2ClusterAction returned nil err; want stream-scoped CANCEL error")
 	}
 	hErr, ok := err.(*h2.Error)
 	if !ok {
@@ -677,13 +654,10 @@ func TestRouterActionH2_CtxCancelEmitsRSTStreamCancel(t *testing.T) {
 	if hErr.Code != h2.ErrCancel {
 		t.Errorf("err code = %v, want CANCEL", hErr.Code)
 	}
-	// No headers/data should have been written on the captured writer (the
-	// CANCEL is signaled via the returned error, not via writer calls).
-	if len(w.headers) != 0 {
-		t.Errorf("headers calls = %d, want 0 on CANCEL path", len(w.headers))
-	}
-	if len(w.data) != 0 {
-		t.Errorf("data calls = %d, want 0 on CANCEL path", len(w.data))
+	// Status=0 is the H2 ctx-cancel sentinel (no response is finalized; the
+	// CANCEL is signaled via the returned *h2.Error, not via an ActionResponse).
+	if resp.Status != 0 {
+		t.Errorf("status = %d, want 0 (ctx-cancel sentinel)", resp.Status)
 	}
 }
 
@@ -700,11 +674,10 @@ func TestRouterActionH2_Do_IncsUpstreamRqTotalAndStatusClass(t *testing.T) {
 	c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)
 	a := &routerActionH2{cluster: c}
 
-	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
-		t.Fatalf("doH2: %v", err)
+	if _, _, err := doH2ClusterAction(ctx, a, h2RequestForTest()); err != nil {
+		t.Fatalf("doH2ClusterAction: %v", err)
 	}
 	if got := counterValue(t, reg, "cluster.c_h2_backend.upstream_rq_total"); got != 1 {
 		t.Errorf("upstream_rq_total = %d, want 1", got)
@@ -727,17 +700,17 @@ func TestRouterActionH2_Upstream5xxForwardedVerbatim(t *testing.T) {
 	c := h2EndpointCluster(t, ln.Addr().String(), pki)
 	a := &routerActionH2{cluster: c}
 
-	w := &captureH2Writer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.doH2(ctx, h2RequestForTest(), w); err != nil {
-		t.Fatalf("doH2: %v", err)
+	resp, _, err := doH2ClusterAction(ctx, a, h2RequestForTest())
+	if err != nil {
+		t.Fatalf("doH2ClusterAction: %v", err)
 	}
-	if got := w.statusOf(); got != "503" {
-		t.Errorf(":status = %q, want %q (NOT 502 — only protocol errors translate)", got, "503")
+	if resp.Status != 503 {
+		t.Errorf("status = %d, want 503 (NOT 502 — only protocol errors translate)", resp.Status)
 	}
-	if len(w.data) != 1 || !bytes.Equal(w.data[0], body) {
-		t.Errorf("body forwarded = %q, want %q", w.data, body)
+	if !bytes.Equal(resp.Body, body) {
+		t.Errorf("body forwarded = %q, want %q", resp.Body, body)
 	}
 }
 

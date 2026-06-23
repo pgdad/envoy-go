@@ -6,17 +6,21 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
-	"time"
 
-	"golang.org/x/net/http2/hpack"
-
-	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
 )
+
+// h2GrantRaceMaxRetries bounds the transparent re-acquire loop in
+// doH2ClusterAction for the (effectively unreachable in 43.2a) errH2GrantRaced
+// lost-race signal from AcquireH2Stream. A small fixed bound: each iteration
+// re-runs the full pick/HIT/dial/pend lifecycle, so a genuine transient race
+// resolves on the first re-acquire; the bound only guards against a pathological
+// repeat (which cannot occur with the current single-grant-per-conn invariant).
+// (phase 43.2a, ADR-0253; Task 7)
+const h2GrantRaceMaxRetries = 3
 
 // H2ClusterAction returns an H2Action closure that proxies the per-request
 // H2 upstream call to the supplied cluster's selected endpoint. The closure
@@ -80,21 +84,53 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 	}
 	defer a.cluster.ReleaseRequest()
 
-	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
-	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in DialH2. The H2
-	// request carries no remote addr, so source_ip uses the ctx-carried
-	// downstream addr set by HCM dispatch (h2dispatch.go). ADR-0237.
+	// 36.2: fold the route's hash_policy list into a ring_hash key carried on ctx
+	// (cluster.WithHashKey). The H2 request carries no remote addr, so source_ip
+	// uses the ctx-carried downstream addr set by HCM dispatch (h2dispatch.go).
+	// ADR-0237. 43.2a Task 7.5: AcquireH2Stream now performs a SINGLE ctx-aware
+	// LB pick (hash key + subset match) — this ctx key reaches the pool's endpoint
+	// selection, restoring hash/subset/source_ip affinity over the multiplex pool.
 	ctx, _, _ = applyHashKey(ctx, a.hashPolicies, h2HeaderVal(req), downstreamRemoteAddrFrom(ctx))
 
-	// 38.1: thread the route-static metadata_match onto ctx → subsetLB.Pick
-	// reads it in DialH2. Route-static (resolved once at config-build, NOT a
-	// per-request fold like applyHashKey); threaded verbatim only when non-empty
-	// (an empty match leaves ctx untouched → the subsetLB fallback path). ADR-0239.
+	// 38.1: thread the route-static metadata_match onto ctx (cluster.WithSubsetMatch).
+	// Route-static (resolved once at config-build, NOT a per-request fold like
+	// applyHashKey); threaded verbatim only when non-empty. 43.2a Task 7.5:
+	// AcquireH2Stream's single ctx-aware pick consumes this ctx subset match.
+	// ADR-0239.
 	if !a.subsetMatch.Empty() {
 		ctx = cluster.WithSubsetMatch(ctx, a.subsetMatch)
 	}
 
-	cc, ep, err := a.cluster.DialH2(ctx)
+	// 43.2a Task 7 (ADR-0253): acquire a multiplexed stream slot on a POOLED
+	// upstream H2 conn (supersedes ADR-0056's per-request fresh dial). The
+	// returned release is CALL-ONCE; defer it exactly once on the success path.
+	// AcquireH2Stream may (rarely, defensively) return errH2GrantRaced — a
+	// granted conn was evicted between the grant and the post-grant lookup. That
+	// is a RETRYABLE lost-race, DISTINCT from errConnPoolOverflow (no overflow
+	// stat, no 503): a bounded re-acquire is the intended disposition (a fresh
+	// acquire re-runs the pick/HIT/dial/pend lifecycle). The bound (h2GrantRace
+	// MaxRetries) is defensive; in 43.2a the branch is effectively unreachable
+	// (a granted stream-conn has inFlight>0 so it cannot be evicted out from
+	// under the grant), but we handle it cleanly so it can never leak to the
+	// user as a 502 nor be miscounted as an overflow.
+	var (
+		cc      *h2.ClientConn
+		release func()
+		ep      cluster.Endpoint
+		err     error
+	)
+	for attempt := 0; ; attempt++ {
+		cc, release, ep, err = a.cluster.AcquireH2Stream(ctx)
+		if err == nil || !cluster.IsH2GrantRaced(err) {
+			break
+		}
+		if attempt >= h2GrantRaceMaxRetries {
+			// Exhausted the bounded retry on the (effectively unreachable) race.
+			// Fall back to the load-shed 503 (NOT a 502 — no upstream connect was
+			// attempted; this is a capacity/race condition, not a gateway error).
+			return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders()}, picked, nil
+		}
+	}
 	if err != nil {
 		if cluster.IsConnPoolOverflow(err) {
 			// ADR-0252: connection-pool overflow → 503 (NOT the 502 dial-failure
@@ -114,19 +150,29 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		// 503 site (doH1ClusterAction sets localOrigin on its synthesized failures).
 		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(), localOrigin: true}, picked, nil
 	}
-	defer func() { _ = cc.Close() }()
+	// 43.2a: release the stream slot exactly once when this RoundTrip completes
+	// (call-once contract; the slot is returned, promoting the next waiter).
+	defer release()
 	picked = ep
 
 	resp, err := cc.RoundTrip(ctx, req)
 	if err != nil {
+		// 43.2a Task 7: a RoundTrip transport error means the pooled conn is
+		// poisoned — evict it from the pool so a later acquire does not ride a
+		// broken conn. The deferred release() still accounts THIS stream's slot;
+		// eviction only removes the conn from the reuse set (idempotent + safe
+		// with our stream still in-flight: makeRelease re-checks Closed()+inFlight
+		// and the gauge dec is permit-conserving / once-only).
+		a.cluster.EvictH2ConnOnError(cc, ep)
 		// Distinguish caller-side ctx-cancel/deadline (→ stream-scoped CANCEL
 		// surfaced upward as *h2.Error so serverStream.dispatch emits
-		// RST_STREAM(CANCEL)) from any other error (→ 502 local reply). Mirror
-		// of routerActionH2.doH2's ctx-vs-other discrimination.
+		// RST_STREAM(CANCEL)) from any other error (→ 502 local reply). The
+		// ctx-vs-other discrimination is unchanged by the 43.2a pool rewire.
 		if ctx.Err() != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
 			// status=0 → H2 ctx-cancel sentinel per SPEC §2.1 last bullet.
-			// emitAccessLogH2 skips submission on status==0; serverStream.dispatch
-			// reads err.Code == ErrCancel and emits RST_STREAM(CANCEL).
+			// HCM's h2dispatch access-log emit skips submission on status==0;
+			// serverStream.dispatch reads err.Code == ErrCancel and emits
+			// RST_STREAM(CANCEL).
 			return ActionResponse{Status: 0}, picked, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
 		}
 		a.cluster.IncStatusClass(502)
@@ -176,47 +222,9 @@ func h2LocalReplyHeaders() envoyhttp.OrderedHeaders {
 	}
 }
 
-// emitAccessLogH2 is the H2-flavored variant of (*Filter).emitAccessLog;
-// reads pseudo-headers (:method, :path, :authority) and User-Agent from
-// H2Request fields. Per SPEC §2.1 last bullet, a zero statusCode is the H2
-// ctx-cancel sentinel and skips emission. Migrated verbatim from
-// internal/filter/hcm/accesslog_emit.go.
-func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time) {
-	if statusCode == 0 || len(f.accessLog) == 0 {
-		return
-	}
-	rec := &accesslog.Record{
-		StartTime:    start,
-		Method:       req.Method,
-		Path:         req.Path,
-		Protocol:     "HTTP/2.0",
-		ResponseCode: statusCode,
-		BytesSent:    bytesSent,
-		Duration:     time.Since(start),
-		Authority:    req.Authority,
-		UserAgent:    h2UserAgent(req),
-		UpstreamHost: upstreamHostString(picked),
-	}
-	for _, s := range f.accessLog {
-		s.Submit(rec)
-	}
-}
-
-// h2UserAgent extracts the User-Agent header value from an H2Request's
-// Headers slice (case-insensitive match per RFC 7540 §8.1.2 — header names
-// are lowercase in HTTP/2). Returns empty string if absent.
-func h2UserAgent(req h2.H2Request) string {
-	for _, hf := range req.Headers {
-		if strings.EqualFold(hf.Name, "user-agent") {
-			return hf.Value
-		}
-	}
-	return ""
-}
-
 // h2HeaderVal returns a codec-agnostic headerVal accessor over the H2 request's
 // hpack fields for applyHashKey. req.Headers is []hpack.HeaderField with
-// codec-lowercased Name; EqualFold mirrors h2UserAgent for robustness. Returns
+// codec-lowercased Name; EqualFold for case-insensitive robustness. Returns
 // the FIRST matching value (single-value producer path per D-S362-4; the full
 // multi-value fold lives in cluster.HashHeaderValues).
 func h2HeaderVal(req h2.H2Request) func(name string) (string, bool) {
@@ -232,8 +240,11 @@ func h2HeaderVal(req h2.H2Request) func(name string) (string, bool) {
 
 // routerActionH2 is the H2-flavored router action. Selected at filter-build
 // time when the resolved cluster's UseH2() reports true (per SPEC §5.5 +
-// §4.1). The struct mirrors routerAction in shape but consumes a fresh
-// upstream H2 conn via Cluster.DialH2 per ADR-0056.
+// §4.1). The struct mirrors routerAction in shape; the live H2 dispatch path
+// (H2ClusterAction → doH2ClusterAction) acquires a multiplexed stream slot on a
+// POOLED upstream H2 conn via Cluster.AcquireH2Stream (phase 43.2a, ADR-0253 —
+// superseding ADR-0056's per-request fresh dial; the legacy per-request-fresh
+// doH2 driver was removed in Task 7 once both fresh-dial sites were gone).
 //
 // Failure-class mapping per SPEC §11.9:
 //
@@ -248,162 +259,17 @@ func h2HeaderVal(req h2.H2Request) func(name string) (string, bool) {
 // serverStream.recvTrailingHeaders. The router itself emits END_STREAM on
 // the response HEADERS or final DATA, never via a trailing HEADERS frame.
 //
-// Method namespace note: Go disallows two methods with the same name on the
-// same receiver, so the H2 driver method is named doH2 (consumed by
-// h2RouterActionAdapter.WriteH2 in h2dispatch.go); a separate do(...) method
-// exists with the routeAction-interface signature so *routerActionH2 also
-// satisfies routeAction (defensive — never reached in well-formed bootstraps;
-// see the do method's docstring for the rationale).
-//
-// Migrated from internal/filter/hcm/actions.go at phase 07.1 Task 11 with
-// signatures preserved byte-for-byte so the byte-preserved tests in
-// router_h2_test.go exercise the same shape.
+// Method namespace note: the live H2 dispatch runs through the H2ClusterAction
+// closure → doH2ClusterAction (a package function, not a method); a separate
+// do(...) method exists with the routeAction-interface signature so
+// *routerActionH2 also satisfies routeAction (defensive — never reached in
+// well-formed bootstraps; see the do method's docstring for the rationale).
 type routerActionH2 struct {
 	cluster      *cluster.Cluster
-	filter       *Filter             // set post-build by routeTable.bindFilter; nil when no sinks configured.
 	hashPolicies []HashPolicy        // 36.2: stored at H2ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
 	rp           *RetryPolicy        // 42.1: effective retry_policy; nil when none. Stored here; the retry loop lands in Task 8.
 	hp           *HedgePolicy        // 42.2b: effective hedge_policy; nil when none. Read by hedgeExecutorH2 (the concurrent first-acceptable-wins racer); the H1 sibling field is live via hedgeExecutorH1.
-}
-
-// doH2 drives an upstream H2 round-trip via Cluster.DialH2 + ClientConn.RoundTrip
-// per ADR-0056 (per-request fresh dial), writing the response back through
-// the H2 stream writer.
-//
-// Phase 06.1 Task 11 wires the cluster-scope upstream_rq_total +
-// upstream_rq_<Nxx> counters per SPEC §5.5 (Increment paths table,
-// "routerActionH2.do (H2)" row): total Inc's at dispatch entry (once per
-// attempt, BEFORE DialH2); the status-class counter Inc's after the
-// upstream response status is finalized. Dial-failure / RoundTrip-failure
-// local-reply paths Inc the 5xx (502) bucket so the cluster-scope
-// counter reflects "what status-class came out of THIS cluster's dispatch".
-// The ctx-cancel path emits a stream-scoped CANCEL — no status is finalized,
-// so no class counter Inc (matches "request did not complete" semantics).
-//
-// Returns (statusForHCM, err). statusForHCM is the wire status the downstream
-// H2 client will observe (502 on local-reply paths; resp.Status on a
-// successful round-trip; 0 when no status is finalized — i.e. ctx-cancel).
-// h2RouterActionAdapter consumes this to Inc the parent Filter's HCM-scope
-// downstream_rq_<Nxx> counter on the H2 path per SPEC §5.5 "HCM response
-// hook" row.
-func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.StreamWriter) (int, error) {
-	start := time.Now()
-
-	// statusForHCM, bytesSentH2, and picked are captured by the deferred
-	// access-log emit so the closure reads the final values. Per SPEC §2.1,
-	// a zero statusForHCM (ctx-cancel sentinel) skips emission inside
-	// emitAccessLogH2. bytesSentH2 is set to len(resp.Body) on the success
-	// path per SPEC §12 #3 option (a).
-	statusForHCM := 0
-	bytesSentH2 := 0
-	picked := cluster.Endpoint{}
-	if r.filter != nil {
-		defer func() {
-			r.filter.emitAccessLogH2(req, statusForHCM, int64(bytesSentH2), picked, start)
-		}()
-	}
-
-	r.cluster.IncUpstreamRqTotal()
-
-	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
-	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in DialH2. See
-	// doH2ClusterAction for the source_ip ctx-carry rationale. ADR-0237.
-	ctx, _, _ = applyHashKey(ctx, r.hashPolicies, h2HeaderVal(req), downstreamRemoteAddrFrom(ctx))
-
-	cc, ep, err := r.cluster.DialH2(ctx)
-	if err != nil {
-		if cluster.IsConnPoolOverflow(err) {
-			// ADR-0252: connection-pool overflow → 503 (NOT the 502 dial shape).
-			// upstream_rq_total was already incremented above (as on the live path);
-			// upstream_rq_pending_overflow already incremented in the pool: NO
-			// IncStatusClass (the overflow counter is the signal). (Legacy
-			// direct-write path; the live H2 HCM dispatch goes through
-			// doH2ClusterAction's overflow branch — kept here for consistency.)
-			statusForHCM = 503
-			return 503, r.write503(w)
-		}
-		r.cluster.IncStatusClass(502)
-		statusForHCM = 502
-		return 502, r.write502(w)
-	}
-	defer func() { _ = cc.Close() }() // ADR-0056: per-request fresh conn close (analog of phase-04 H1's defer upstream.Close())
-	picked = ep
-
-	resp, err := cc.RoundTrip(ctx, req)
-	if err != nil {
-		// Distinguish: caller-side ctx-cancel/deadline → emit RST(CANCEL) on the
-		// downstream stream (the canonical "client gave up" signal); other
-		// errors (including upstream-conn-died wrapping cc.ctx.Err()) → 502
-		// local reply. We MUST check the caller's ctx specifically; a
-		// generic errors.Is(err, context.Canceled) would match cc.ctx.Err()
-		// too, mis-categorizing upstream-conn-broken errors as caller-cancel.
-		if ctx.Err() != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
-			// Surface a stream-scoped CANCEL to serverStream.dispatch which
-			// emits RST_STREAM(CANCEL) per the dispatch carry-error contract.
-			// No upstream_rq_<Nxx> Inc — the request did not produce a
-			// terminating response status. statusForHCM remains 0 so
-			// emitAccessLogH2 skips emission (SPEC §2.1 sentinel).
-			return 0, h2.NewStreamError(h2.ErrCancel, 0, "upstream roundtrip: ctx canceled")
-		}
-		r.cluster.IncStatusClass(502)
-		statusForHCM = 502
-		return 502, r.write502(w)
-	}
-
-	r.cluster.IncStatusClass(resp.Status)
-	statusForHCM = resp.Status
-	bytesSentH2 = len(resp.Body)
-
-	// Forward response: the codec preserves wire order, so resp.Headers already
-	// has :status (and any other pseudo-headers) first per RFC 9113 §8.3.
-	if err := w.WriteHeaders(resp.Headers, false); err != nil {
-		return resp.Status, err // surfaced to serverStream.dispatch which emits RST_STREAM(INTERNAL_ERROR)
-	}
-	if err := w.WriteData(resp.Body, true); err != nil {
-		return resp.Status, err
-	}
-	return resp.Status, nil
-}
-
-// write502 emits a 502 Bad Gateway local-reply via the H2 stream writer.
-// The body is the shared bad502Body constant per SPEC §11.9. Date is
-// included per SPEC §10 #4. server is "envoy" per ADR-0014. Best-effort:
-// any error from the writer is swallowed (conn is broken; nothing useful
-// to surface). Always returns nil so dispatch does not RST after the 502.
-func (r *routerActionH2) write502(w h2.StreamWriter) error {
-	body := []byte(bad502Body)
-	hdrs := []hpack.HeaderField{
-		{Name: ":status", Value: "502"},
-		{Name: "date", Value: dateHeader()},
-		{Name: "server", Value: serverHeader()},
-		{Name: "content-type", Value: "text/plain"},
-		{Name: "content-length", Value: strconv.Itoa(len(body))},
-	}
-	if err := w.WriteHeaders(hdrs, false); err != nil {
-		return nil // best-effort
-	}
-	_ = w.WriteData(body, true)
-	return nil
-}
-
-// write503 emits a 503 Service Unavailable local-reply via the H2 stream writer
-// for the ADR-0252 connection-pool overflow load-shed (the legacy direct-write
-// doH2 path). Unlike write502 there is NO body (a load-shed has no gateway-error
-// payload; mirrors the empty-Body 503 of doH2ClusterAction's overflow branch).
-// Best-effort: writer errors are swallowed and nil is always returned so
-// dispatch does not RST after the reply.
-func (r *routerActionH2) write503(w h2.StreamWriter) error {
-	hdrs := []hpack.HeaderField{
-		{Name: ":status", Value: "503"},
-		{Name: "date", Value: dateHeader()},
-		{Name: "server", Value: serverHeader()},
-		{Name: "content-length", Value: "0"},
-	}
-	if err := w.WriteHeaders(hdrs, true); err != nil {
-		return nil // best-effort
-	}
-	return nil
 }
 
 // do (defensive) — *routerActionH2 satisfies the hcm-package routeAction
