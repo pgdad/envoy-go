@@ -541,6 +541,116 @@ func TestDoH1ClusterAction_CircuitBreakerOverflow503(t *testing.T) {
 	}
 }
 
+// TestDoH1ClusterAction_ConnPoolOverflow503 — Phase 43.1 Task 7 (ADR-0252).
+// With circuit_breakers{max_connections:1, max_pending_requests:0} a single
+// in-flight upstream request holds the only connection permit; a concurrent
+// doH1ClusterAction finds the cap reached AND the wait-queue full ⇒ AcquireH1
+// returns the errConnPoolOverflow sentinel ⇒ the action fails fast with a 503.
+//
+// The new overflow branch (router.go) must:
+//   - return Status:503 (load-shed), NOT the 502 dial shape,
+//   - NOT set localOrigin (an overflow is a load-shed, not a connect failure —
+//     so a connect-failure retry_on must NOT match it),
+//   - NOT call IncStatusClass (the dedicated upstream_rq_pending_overflow
+//     counter — already incremented inside the pool — is the signal; the
+//     router must not double-count onto upstream_rq_5xx),
+//   - NOT call RecordUpstreamResult (no host was engaged for the shed request).
+//
+// This is the REAL-overflow approach (no seam/fake cluster): a blocking backend
+// holds the single permit and a concurrent admission drives a genuine
+// errConnPoolOverflow through AcquireH1, exactly as the live HCM path will.
+func TestDoH1ClusterAction_ConnPoolOverflow503(t *testing.T) {
+	addr, release, stop := blockingHTTPBackend(t)
+	defer stop()
+
+	cb := &clusterv3.CircuitBreakers{
+		Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+			{
+				Priority:           corev3.RoutingPriority_DEFAULT,
+				MaxConnections:     wrapperspb.UInt32(1),
+				MaxPendingRequests: wrapperspb.UInt32(0),
+			},
+		},
+	}
+	c, reg := singleEndpointClusterCB(t, addr, cb)
+	a := &routerAction{cluster: c}
+
+	mkReq := func() *http.Request {
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
+		req.URL.Path = "/x"
+		return req
+	}
+
+	// 1) Fire the permit-holding request in the background. It engages the only
+	//    max_connections permit (cx_open flips to 1) and blocks in the backend.
+	heldDone := make(chan ActionResponse, 1)
+	go func() {
+		resp, _, _ := doH1ClusterAction(context.Background(), a, mkReq())
+		heldDone <- resp
+	}()
+
+	// Wait until the held request has actually engaged its permit (cx_open gauge
+	// flips to 1) before probing the overflow — avoids racing the goroutine.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if gaugeIsOne(t, reg, "cluster.c_test.circuit_breakers.default.cx_open") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("held request never engaged the max_connections permit (cx_open stayed 0)")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 2) A concurrent admission finds the cap reached + the queue full ⇒
+	//    errConnPoolOverflow ⇒ 503, NOT localOrigin, picked is the zero Endpoint.
+	resp, picked, err := doH1ClusterAction(context.Background(), a, mkReq())
+	if err != nil {
+		t.Fatalf("overflow admission returned err: %v", err)
+	}
+	if resp.Status != 503 {
+		t.Fatalf("overflow admission Status = %d, want 503", resp.Status)
+	}
+	if resp.localOrigin {
+		t.Fatalf("overflow admission localOrigin = true, want false (a load-shed is not a connect failure)")
+	}
+	if !picked.IsZero() {
+		t.Fatalf("overflow admission picked a host (%v), want the zero Endpoint", picked)
+	}
+	// The pool already incremented upstream_rq_pending_overflow; the router must
+	// not double-count by also bumping the upstream 5xx class.
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_pending_overflow"); got != 1 {
+		t.Fatalf("upstream_rq_pending_overflow = %d, want 1", got)
+	}
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_5xx"); got > 0 {
+		t.Fatalf("upstream_rq_5xx = %d, want 0 (overflow must NOT IncStatusClass)", got)
+	}
+
+	// 3) Release the held request; a fresh admission must now succeed (proves the
+	//    overflow path did not leak or wrongly release a permit it never held).
+	release()
+	// The held doH1ClusterAction returns only AFTER its deferred conn-close has
+	// released the permit, so receiving on heldDone guarantees the permit is
+	// freed and cx_open must have cleared back to 0 (mirrors the CB analogue's
+	// rq_open post-release check).
+	if held := <-heldDone; held.Status != 200 {
+		t.Fatalf("held request final Status = %d, want 200", held.Status)
+	}
+	if gaugeIsOne(t, reg, "cluster.c_test.circuit_breakers.default.cx_open") {
+		t.Fatal("cx_open still 1 after the held request released its permit")
+	}
+	resp3, _, err := doH1ClusterAction(context.Background(), a, mkReq())
+	if err != nil {
+		t.Fatalf("post-release admission returned err: %v", err)
+	}
+	if resp3.Status != 200 {
+		t.Fatalf("post-release admission Status = %d, want 200 (permit freed)", resp3.Status)
+	}
+	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_pending_overflow"); got != 1 {
+		t.Fatalf("upstream_rq_pending_overflow after release = %d, want 1 (no double-count)", got)
+	}
+}
+
 // gaugeIsOne reports whether the gauge named `name` in registry r currently
 // reads exactly 1. Returns false if no such gauge is registered.
 func gaugeIsOne(t *testing.T, r *stats.Registry, name string) bool {

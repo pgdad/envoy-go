@@ -352,11 +352,12 @@ func TestClusterTryAcquireRequestNoCircuitBreaker(t *testing.T) {
 	cl.ReleaseRequest() // no-op; must not panic
 }
 
-// circuitBreakerStatNames returns the 14 fully-qualified stat names that
+// circuitBreakerStatNames returns the 16 fully-qualified stat names that
 // registerClusterMetrics allocates for a cluster named "cb_stats" WITH
 // circuit_breakers (SPEC §7): the 10 per-priority *_open gauges (default + high,
 // each {cx_open, cx_pool_open, rq_open, rq_pending_open, rq_retry_open}) plus the
-// 4 cluster overflow counters.
+// 4 cluster overflow counters, plus the 2 new pending-queue stats
+// (upstream_rq_pending_active gauge + upstream_rq_pending_total counter).
 func circuitBreakerStatNames() []string {
 	const p = "cluster.cb_stats."
 	var names []string
@@ -375,13 +376,18 @@ func circuitBreakerStatNames() []string {
 		p+"upstream_cx_pool_overflow",
 		p+"upstream_rq_pending_overflow",
 		p+"upstream_rq_retry_overflow",
+		// AMEND-CP3: 2 new pending-queue stats (the +2 surface delta: 1181→1183).
+		p+"upstream_rq_pending_active",
+		p+"upstream_rq_pending_total",
 	)
 	return names
 }
 
 // TestRegisterCircuitBreakerStats_Present asserts a cluster WITH circuit_breakers
-// registers EXACTLY the 14 circuit_breakers stat names and binds the two LIVE
-// handles (default.rq_open gauge + upstream_rq_pending_overflow counter).
+// registers EXACTLY the 16 circuit_breakers stat names (Task 4: 14 original + 2
+// new pending-queue names) and binds the LIVE handles: default.rq_open gauge,
+// upstream_rq_pending_overflow counter, plus the 6 activated/new pool handles
+// (the 6th, pool.upstreamRqPendingOverflow, is the shared cb handle).
 func TestRegisterCircuitBreakerStats_Present(t *testing.T) {
 	c := mkStaticCluster("cb_stats", mkLbEndpoint("127.0.0.1", 9600))
 	c.CircuitBreakers = &clusterv3.CircuitBreakers{
@@ -406,17 +412,37 @@ func TestRegisterCircuitBreakerStats_Present(t *testing.T) {
 			t.Errorf("expected metric %q to be registered", name)
 		}
 	}
-	// The two LIVE handles must be injected (non-nil).
+	// The two original LIVE handles must be injected (non-nil).
 	if cl.circuitBreaker.prio[0].rqOpen == nil {
 		t.Error("default.rq_open gauge handle must be injected (non-nil)")
 	}
 	if cl.circuitBreaker.upstreamRqPendingOverflow == nil {
 		t.Error("upstream_rq_pending_overflow counter handle must be injected (non-nil)")
 	}
+	// Task 4: the 6 activated + new pool handles must also be non-nil.
+	if cl.circuitBreaker.pool.cxOpen == nil {
+		t.Error("pool.cxOpen gauge handle must be injected (non-nil)")
+	}
+	if cl.circuitBreaker.pool.rqPendingOpen == nil {
+		t.Error("pool.rqPendingOpen gauge handle must be injected (non-nil)")
+	}
+	if cl.circuitBreaker.pool.upstreamCxOverflow == nil {
+		t.Error("pool.upstreamCxOverflow counter handle must be injected (non-nil)")
+	}
+	if cl.circuitBreaker.pool.upstreamRqPendingActive == nil {
+		t.Error("pool.upstreamRqPendingActive gauge handle must be injected (non-nil)")
+	}
+	if cl.circuitBreaker.pool.upstreamRqPendingTotal == nil {
+		t.Error("pool.upstreamRqPendingTotal counter handle must be injected (non-nil)")
+	}
+	if cl.circuitBreaker.pool.upstreamRqPendingOverflow == nil {
+		t.Error("pool.upstreamRqPendingOverflow counter handle must be injected (non-nil, shared with cb)")
+	}
 }
 
 // TestRegisterCircuitBreakerStats_Absent asserts a cluster WITHOUT circuit_breakers
-// registers NONE of the 14 circuit_breakers stat names.
+// registers NONE of the 16 circuit_breakers stat names (including the 2 new
+// pending-queue names added in Task 4).
 func TestRegisterCircuitBreakerStats_Absent(t *testing.T) {
 	c := mkStaticCluster("cb_stats", mkLbEndpoint("127.0.0.1", 9700))
 	reg := stats.NewRegistry()
@@ -566,6 +592,152 @@ func TestParseCircuitBreakers_RetryBudgetDefaults(t *testing.T) {
 		t.Errorf("minRetryConcurrency = %d, want 3 (default)", cbPresent.minRetryConcurrency)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Task 2: connPool parsing tests (max_connections / max_pending_requests)
+// ---------------------------------------------------------------------------
+
+// TestParseCircuitBreakers_ConnPoolBudgets: DEFAULT threshold with
+// max_connections:2 / max_pending_requests:3 ⇒ pool fields set accordingly.
+func TestParseCircuitBreakers_ConnPoolBudgets(t *testing.T) {
+	c := &clusterv3.Cluster{
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+				{
+					Priority:           corev3.RoutingPriority_DEFAULT,
+					MaxConnections:     wrapperspb.UInt32(2),
+					MaxPendingRequests: wrapperspb.UInt32(3),
+				},
+			},
+		},
+	}
+	cb, err := parseCircuitBreakers(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cb == nil {
+		t.Fatal("expected non-nil circuitBreaker")
+	}
+	if cb.pool == nil {
+		t.Fatal("cb.pool must be non-nil for a cluster with circuit_breakers")
+	}
+	if cb.pool.maxConnections != 2 {
+		t.Errorf("pool.maxConnections = %d, want 2", cb.pool.maxConnections)
+	}
+	if cb.pool.maxPendingRequests != 3 {
+		t.Errorf("pool.maxPendingRequests = %d, want 3", cb.pool.maxPendingRequests)
+	}
+}
+
+// TestParseCircuitBreakers_ConnPoolDefaults1024: absent budgets ⇒ both default
+// to 1024 (AMEND-CP5).
+func TestParseCircuitBreakers_ConnPoolDefaults1024(t *testing.T) {
+	c := &clusterv3.Cluster{
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+				{Priority: corev3.RoutingPriority_DEFAULT},
+			},
+		},
+	}
+	cb, err := parseCircuitBreakers(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cb.pool == nil {
+		t.Fatal("cb.pool must be non-nil")
+	}
+	if cb.pool.maxConnections != 1024 {
+		t.Errorf("pool.maxConnections = %d, want 1024 (default)", cb.pool.maxConnections)
+	}
+	if cb.pool.maxPendingRequests != 1024 {
+		t.Errorf("pool.maxPendingRequests = %d, want 1024 (default)", cb.pool.maxPendingRequests)
+	}
+}
+
+// TestParseCircuitBreakers_ConnPoolExplicitZero: max_connections:0 ⇒
+// pool.maxConnections == 0 (explicit zero overrides the default).
+func TestParseCircuitBreakers_ConnPoolExplicitZero(t *testing.T) {
+	c := &clusterv3.Cluster{
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+				{
+					Priority:       corev3.RoutingPriority_DEFAULT,
+					MaxConnections: wrapperspb.UInt32(0),
+				},
+			},
+		},
+	}
+	cb, err := parseCircuitBreakers(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cb.pool == nil {
+		t.Fatal("cb.pool must be non-nil")
+	}
+	if cb.pool.maxConnections != 0 {
+		t.Errorf("pool.maxConnections = %d, want 0 (explicit zero)", cb.pool.maxConnections)
+	}
+}
+
+// TestParseCircuitBreakers_ConnPoolNonNil: any cluster WITH circuit_breakers
+// must have a non-nil pool.
+func TestParseCircuitBreakers_ConnPoolNonNil(t *testing.T) {
+	c := &clusterv3.Cluster{
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+				{Priority: corev3.RoutingPriority_DEFAULT, MaxRequests: wrapperspb.UInt32(4)},
+			},
+		},
+	}
+	cb, err := parseCircuitBreakers(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cb.pool == nil {
+		t.Error("cb.pool must be non-nil for any cluster with circuit_breakers")
+	}
+}
+
+// TestParseCircuitBreakers_ConnPoolHighIgnored: HIGH-priority budgets are
+// IGNORED by the pool — only DEFAULT binds them. A HIGH threshold with
+// max_connections:7 / max_pending_requests:9 + a DEFAULT with max_connections:2 /
+// max_pending_requests:3 ⇒ pool.maxConnections == 2 && pool.maxPendingRequests ==
+// 3 (proving neither HIGH value bled in; both idx==0 parse branches are covered).
+func TestParseCircuitBreakers_ConnPoolHighIgnored(t *testing.T) {
+	c := &clusterv3.Cluster{
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+				{
+					Priority:           corev3.RoutingPriority_DEFAULT,
+					MaxConnections:     wrapperspb.UInt32(2),
+					MaxPendingRequests: wrapperspb.UInt32(3),
+				},
+				{
+					Priority:           corev3.RoutingPriority_HIGH,
+					MaxConnections:     wrapperspb.UInt32(7),
+					MaxPendingRequests: wrapperspb.UInt32(9),
+				},
+			},
+		},
+	}
+	cb, err := parseCircuitBreakers(c, "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cb.pool == nil {
+		t.Fatal("cb.pool must be non-nil")
+	}
+	if cb.pool.maxConnections != 2 {
+		t.Errorf("pool.maxConnections = %d, want 2 (HIGH budget ignored)", cb.pool.maxConnections)
+	}
+	if cb.pool.maxPendingRequests != 3 {
+		t.Errorf("pool.maxPendingRequests = %d, want 3 (HIGH budget ignored)", cb.pool.maxPendingRequests)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// End Task 2 tests
+// ---------------------------------------------------------------------------
 
 // TestClusterTryAcquireReleaseRetry exercises the Cluster-level nil-guards:
 // no circuitBreaker ⇒ always true / no-op; with a budget ⇒ delegates.

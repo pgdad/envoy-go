@@ -96,6 +96,14 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 
 	cc, ep, err := a.cluster.DialH2(ctx)
 	if err != nil {
+		if cluster.IsConnPoolOverflow(err) {
+			// ADR-0252: connection-pool overflow → 503 (NOT the 502 dial-failure
+			// shape; a 502-labeled body would be wrong for a load-shed → empty Body).
+			// upstream_rq_pending_overflow already incremented in the pool: NO
+			// IncStatusClass (the dedicated overflow counter is the signal), and
+			// NOT localOrigin (a load-shed is not a connect failure for retry_on).
+			return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders()}, picked, nil
+		}
 		a.cluster.IncStatusClass(502)
 		if !ep.IsZero() { // a host was picked → attribute the local-origin connect failure
 			a.cluster.RecordUpstreamResult(ep, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
@@ -305,6 +313,16 @@ func (r *routerActionH2) doH2(ctx context.Context, req h2.H2Request, w h2.Stream
 
 	cc, ep, err := r.cluster.DialH2(ctx)
 	if err != nil {
+		if cluster.IsConnPoolOverflow(err) {
+			// ADR-0252: connection-pool overflow → 503 (NOT the 502 dial shape).
+			// upstream_rq_total was already incremented above (as on the live path);
+			// upstream_rq_pending_overflow already incremented in the pool: NO
+			// IncStatusClass (the overflow counter is the signal). (Legacy
+			// direct-write path; the live H2 HCM dispatch goes through
+			// doH2ClusterAction's overflow branch — kept here for consistency.)
+			statusForHCM = 503
+			return 503, r.write503(w)
+		}
 		r.cluster.IncStatusClass(502)
 		statusForHCM = 502
 		return 502, r.write502(w)
@@ -366,6 +384,25 @@ func (r *routerActionH2) write502(w h2.StreamWriter) error {
 		return nil // best-effort
 	}
 	_ = w.WriteData(body, true)
+	return nil
+}
+
+// write503 emits a 503 Service Unavailable local-reply via the H2 stream writer
+// for the ADR-0252 connection-pool overflow load-shed (the legacy direct-write
+// doH2 path). Unlike write502 there is NO body (a load-shed has no gateway-error
+// payload; mirrors the empty-Body 503 of doH2ClusterAction's overflow branch).
+// Best-effort: writer errors are swallowed and nil is always returned so
+// dispatch does not RST after the reply.
+func (r *routerActionH2) write503(w h2.StreamWriter) error {
+	hdrs := []hpack.HeaderField{
+		{Name: ":status", Value: "503"},
+		{Name: "date", Value: dateHeader()},
+		{Name: "server", Value: serverHeader()},
+		{Name: "content-length", Value: "0"},
+	}
+	if err := w.WriteHeaders(hdrs, true); err != nil {
+		return nil // best-effort
+	}
 	return nil
 }
 

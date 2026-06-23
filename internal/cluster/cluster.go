@@ -229,6 +229,37 @@ func (c *Cluster) ReleaseRequest() {
 	}
 }
 
+// acquireConnSlot reserves a connection-creation permit (clusters WITH a connPool).
+// Returns nil (no pool, or permit held — caller MUST pair with releaseConnSlot /
+// connDec), errConnPoolOverflow (queue full → fail fast 503), or ctx.Err(). (ADR-0252)
+func (c *Cluster) acquireConnSlot(ctx context.Context) error {
+	if c.circuitBreaker == nil || c.circuitBreaker.pool == nil {
+		return nil
+	}
+	return c.circuitBreaker.pool.acquireConnOrPend(ctx)
+}
+
+// releaseConnSlot returns a permit acquired by acquireConnSlot. Called on the
+// post-acquire dial/handshake FAILURE paths (the success path composes the
+// release into connDec). No-op when no pool. (ADR-0252)
+func (c *Cluster) releaseConnSlot() {
+	if c.circuitBreaker != nil && c.circuitBreaker.pool != nil {
+		c.circuitBreaker.pool.releaseConn()
+	}
+}
+
+// connDec composes upstream_cx_active.Dec() + the LB release() + (for pooled
+// clusters) pool.releaseConn() into the single dec closure connWithGauge runs
+// exactly once on Close. The pool release on Close is the conn-Close wake seam
+// (hands a permit to the head waiter). (ADR-0252)
+func (c *Cluster) connDec(release func()) func() {
+	if c.circuitBreaker == nil || c.circuitBreaker.pool == nil {
+		return func() { c.upstreamCxActive.Dec(); release() }
+	}
+	pool := c.circuitBreaker.pool
+	return func() { c.upstreamCxActive.Dec(); release(); pool.releaseConn() }
+}
+
 // TryAcquireRetry reserves a retry_budget slot. Returns false (overflow) when the
 // retry budget is exhausted. No-op true when no circuit_breakers / retry_budget. (ADR-0249)
 func (c *Cluster) TryAcquireRetry() bool {
@@ -411,9 +442,16 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	if err != nil {
 		return nil, Endpoint{}, err
 	}
+	// ADR-0252: gate connection CREATION on the max_connections permit (pends in
+	// the bounded wait-queue at the cap; errConnPoolOverflow when the queue is full).
+	if err := c.acquireConnSlot(ctx); err != nil {
+		release()
+		return nil, ep, err
+	}
 	d := &net.Dialer{Timeout: c.connectTimeout}
 	raw, err := d.DialContext(ctx, "tcp", ep.Addr())
 	if err != nil {
+		c.releaseConnSlot()
 		release()
 		return nil, ep, fmt.Errorf("cluster: dial: %w", err)
 	}
@@ -422,6 +460,7 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 		conn := stdtls.Client(raw, c.upstreamCfg)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
+			c.releaseConnSlot()
 			release()
 			return nil, ep, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}
@@ -429,10 +468,11 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	}
 	c.upstreamCxTotal.Inc()
 	c.upstreamCxActive.Inc()
-	// Compose release into the existing connWithGauge dec closure. The
-	// connWithGauge sync.Once guards BOTH the gauge Dec and the LB release, so
-	// double-Close cannot double-release. The struct is unchanged.
-	return &connWithGauge{Conn: final, dec: func() { c.upstreamCxActive.Dec(); release() }}, ep, nil
+	// Compose release (+ pool permit release for pooled clusters) into the
+	// existing connWithGauge dec closure. The connWithGauge sync.Once guards the
+	// gauge Dec, the LB release AND the pool release, so double-Close cannot
+	// double-release. The struct is unchanged.
+	return &connWithGauge{Conn: final, dec: c.connDec(release)}, ep, nil
 }
 
 // AcquireH1 returns an HTTP/1.1 upstream connection ready to write a request
@@ -489,12 +529,19 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, Endpoint, error
 	}
 	c.h1PoolMu.Unlock()
 
+	// ADR-0252: pool MISS → gate connection creation on the max_connections permit.
+	if err := c.acquireConnSlot(ctx); err != nil {
+		release()
+		return nil, ep, err
+	}
+
 	// Slow path: dial fresh (mirrors the Dial code path verbatim so the
 	// connWithGauge / TLS handshake / counters semantics stay aligned —
 	// release-on-failure + dec composition).
 	d := &net.Dialer{Timeout: c.connectTimeout}
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
+		c.releaseConnSlot()
 		release()
 		return nil, ep, fmt.Errorf("cluster: dial: %w", err)
 	}
@@ -503,6 +550,7 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, Endpoint, error
 		conn := stdtls.Client(raw, c.upstreamCfg)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
+			c.releaseConnSlot()
 			release()
 			return nil, ep, fmt.Errorf("cluster: tls: handshake: %w", err)
 		}
@@ -510,7 +558,7 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, Endpoint, error
 	}
 	c.upstreamCxTotal.Inc()
 	c.upstreamCxActive.Inc()
-	wrapped := &connWithGauge{Conn: final, dec: func() { c.upstreamCxActive.Dec(); release() }}
+	wrapped := &connWithGauge{Conn: final, dec: c.connDec(release)}
 	return &PooledH1Conn{
 		Conn: wrapped,
 		Br:   bufio.NewReaderSize(wrapped, 4096),
@@ -527,6 +575,15 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, Endpoint, error
 // connection is closed instead. Best-effort; never blocks.
 func (c *Cluster) PutIdleH1(p *PooledH1Conn) {
 	if p == nil || p.Conn == nil {
+		return
+	}
+	// ADR-0252: when a request is pending on the connection budget, CLOSE this
+	// idle conn instead of pooling it — its connWithGauge.Close runs connDec →
+	// pool.releaseConn, freeing a permit + waking the head waiter (which dials
+	// fresh). Routes the idle-return wake through the single permit mechanism
+	// (no direct conn handoff). Racy peek; at worst a missed pooling, never wrong.
+	if c.circuitBreaker != nil && c.circuitBreaker.pool != nil && c.circuitBreaker.pool.hasWaiter() {
+		_ = p.Conn.Close()
 		return
 	}
 	addr := p.ep.Addr()

@@ -177,10 +177,14 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 	if c.outlier != nil {
 		c.outlier.registerStats(r, prefix, c.health)
 	}
-	// Phase 41 (ADR-0248): the +14 circuit_breakers stats (10 per-priority *_open
-	// gauges + 4 cluster overflow counters), on clusters WITH circuit_breakers
-	// only. Only default.rq_open + upstream_rq_pending_overflow bind LIVE handles;
-	// the other 12 register-and-stay-at-0 (deferred budgets / AMEND-CB1/CB2).
+	// Phase 41 (ADR-0248) + phase 43.1 (ADR-0252): the +16 circuit_breakers stats
+	// (10 per-priority *_open gauges + 4 cluster overflow counters + the 2 new
+	// connection-pool counters upstream_rq_pending_active/_total), on clusters WITH
+	// circuit_breakers only. LIVE handles: default.rq_open, default.rq_retry_open,
+	// upstream_rq_pending_overflow, upstream_rq_retry_overflow, and the connection-
+	// pool handles default.cx_open / default.rq_pending_open / upstream_cx_overflow /
+	// upstream_rq_pending_active / upstream_rq_pending_total; the remainder
+	// register-and-stay-at-0 (deferred budgets / AMEND-CB1/CB2).
 	if c.circuitBreaker != nil {
 		c.circuitBreaker.registerStats(r, prefix)
 	}

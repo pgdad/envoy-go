@@ -1,0 +1,116 @@
+# Phase-43.1 fixture 0078-connection-pool-max-connections: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE cluster c_cp
+# (lb_policy ROUND_ROBIN) with a circuit_breakers max_connections +
+# max_pending_requests threshold over a SINGLE endpoint — a BlockingHoldResponder
+# (BackendKind 36) that HOLDS each "GET /" request open until the driver releases
+# it — on BOTH sides (the 0066/0069/0074 HTTP shape: reference STRICT_DNS /
+# host.docker.internal, subject STATIC / 127.0.0.1).
+#
+# It proves the connection-pool CONNECTION budget: the max_connections HARD-CAP +
+# the max_pending_requests bounded wait-queue, on BOTH the envoy-go (subject) side
+# and the reference-Envoy side.
+#
+# circuit_breakers (identical on both sides — NAT-transparent static config):
+#   thresholds: [ { priority: DEFAULT, max_connections: 2, max_pending_requests: 2 } ]
+#
+# # The soft-breaker DEPARTURE (reference_max_connections_soft_breaker)
+#
+# The reference Envoy's max_connections is a SOFT breaker — upstream_cx_active can
+# EXCEED the cap with timing slop. A cross-side EXACT connection-pool differential
+# is therefore INFEASIBLE. envoy-go implements a CLEAN HARD-CAP + bounded-queue
+# DEPARTURE. The fixture splits into TWO prongs, run SEQUENTIALLY per side inside
+# AssertStats (subject FULLY, then reference; the shared in-process backend is
+# idle between sides):
+#
+#   - SUBJECT (envoy-go) — EXACT: upstream_cx_active never exceeds N (=2); the
+#     queue peaks at M (=2); exactly J (=2) oversubscribers overflow 503;
+#     upstream_rq_pending_total == M exactly; overflow delta == J exactly.
+#   - REFERENCE (envoy) — ROBUST: only the RELIABLY-observable invariants —
+#     upstream_rq_pending_overflow delta >= 1 (the bounded queue always overflows
+#     under the burst); >=1 downstream-class 503 across the refOversub burst; the
+#     decode-ran guard upstream_cx_total > 0; final gauges (cx_open,
+#     rq_pending_open) settle at 0. The soft-breaker cx_open GAUGE and the
+#     upstream_cx_overflow COUNTER are NOT asserted on the reference (both are
+#     timing-racy under the soft max_connections — observed cx_open=0 and
+#     cx_overflow=0 on some runs while pending_overflow always fired; see below).
+#
+# # The driver: staged drive (fill / pend / oversub / sticky-drain)
+#
+# The runner's hooks are DriveReference/DriveSubject (run FIRST, the byte-equiv
+# "READY\n" stream for CompareBytes) then AssertStats (run LAST, holding BOTH admin
+# addrs). The fill / pend / oversub / drain ALL run inside AssertStats. The Drive
+# hooks stash listener addrs; the config builders stash the backend host port for
+# the /__release_sticky control hit (127.0.0.1:<backendPort>, loopback).
+#
+# SUBJECT (exact) per side:
+#   1. Fire N held GET / → poll cx_open==1 AND upstream_cx_active==N.
+#   2. Fire M further held GET / (PEND) → poll rq_pending_open==1 AND
+#      upstream_rq_pending_active==M AND upstream_cx_active==N (never exceeds cap).
+#   3. Fire J oversubscribers → each finds the queue full ⇒ 503 (counted from the
+#      DOWNSTREAM status codes, NOT upstream_rq_5xx).
+#   4. cx_active==N; rq_pending_active==M; got503==J; overflow delta==J;
+#      upstream_rq_pending_total==M EXACTLY; upstream_cx_total>0 (decode-ran).
+#   5. /__release_sticky → the N held + M woken (fresh dials) drain to 200 → poll
+#      cx_open==0 AND rq_pending_open==0.
+#
+# REFERENCE (robust) per side:
+#   1+3. Fire the FULL burst (N + refOversub = M+J+4) CONCURRENTLY: the N saturate
+#      the cap, the surplus drives the bounded pending-queue overflow. Poll
+#      upstream_rq_pending_overflow delta >= 1 (the reliably-observable signal;
+#      the soft breaker needs the heavier oversubscription to GUARANTEE overflow).
+#   4. upstream_rq_pending_overflow delta>=1; upstream_cx_total>0 (decode-ran guard).
+#   5. /__release_sticky → drain → poll cx_open==0 AND rq_pending_open==0 (gauges
+#      settle); >=1 downstream 503 observed across the fired burst.
+#
+# # The sticky-release control path (D-S431-5)
+#
+# The M woken pending waiters dial FRESH connections after the N held conns
+# release. The re-armable /__release (0074) would re-block those fresh dials on a
+# new gate → the drain STALLS (cx_open never returns to 0). 0078 uses the STICKY
+# /__release_sticky path on the BlockingHoldResponder (an ADDITIVE control path on
+# BackendKind 36 — the tail STAYS 36, NO new kind): it permanently opens the gate
+# so all current AND future requests pass immediately. 0074's /__release is
+# UNCHANGED (byte-stable).
+#
+# Reference robust stats:
+#     cluster.c_cp.upstream_rq_pending_overflow (delta)      >= 1 (queue overflowed)
+#     cluster.c_cp.upstream_cx_total                         > 0 (decode-ran guard)
+#     cluster.c_cp.circuit_breakers.default.cx_open          0 after drain (settle)
+#     cluster.c_cp.circuit_breakers.default.rq_pending_open  0 after drain (settle)
+#   plus >= 1 downstream-class 503 (from the fired oversubscribers' status codes).
+#
+# Subject-exact extra stats:
+#     cluster.c_cp.upstream_cx_active                        == N (never exceeds)
+#     cluster.c_cp.upstream_rq_pending_active                peaks at M
+#     cluster.c_cp.upstream_rq_pending_total                 == M EXACTLY
+#     overflow delta == J EXACTLY; exactly J downstream 503s.
+#
+# # Deliberate non-assertions (recorded departures)
+#
+#   - Cross-side EXACT cx_active is NOT asserted on the reference (the soft breaker
+#     overshoots the cap — reference_max_connections_soft_breaker). The reference
+#     prong asserts only the robust invariants.
+#   - upstream_rq_5xx is NOT asserted — the overflow 503 is a local reply; the
+#     503 detection observes the DOWNSTREAM status codes of the fired requests
+#     (reference_concurrent_attempt_downstream_class_assertion).
+#   - The UO access-log response flag is NOT asserted — envoy-go has no
+#     response-flag plumbing.
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The fill / pend / oversub / held bodies
+# run inside AssertStats and are asserted there (status + backend-0: body), not
+# byte-compared.
+#
+# response-status: 503 on the overflowing oversubscribers, 200 on the held +
+# woken requests (asserted in AssertStats); NOT part of the byte-compared stream.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path.
+#
+# Non-additions: NO new BackendKind (BlockingHoldResponder = 36 REUSED, with the
+# additive /__release_sticky control path); NO DistributionAsserter (single-host
+# topology + the connection-pool counters carry the proof).
+response-body:
+  applicable: true
+  scope: byte-exact

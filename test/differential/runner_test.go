@@ -102,6 +102,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0075-retry-loop/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0076-per-try-timeout/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0077-hedge-on-per-try-timeout/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0078-connection-pool-max-connections/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -1619,15 +1620,26 @@ func acceptHTTP503Counting(ln net.Listener, idx int) {
 }
 
 // acceptBlockingHold accepts one HTTP/1.1 request per connection and HOLDS each
-// normal "GET /<seg>" request on a shared gate channel until a "GET /__release"
-// control request closes-and-swaps the gate (freeing the current batch and
-// re-arming for the next), then answers HTTP 200 with a "backend-<idx>:<seg>"
-// body (host attribution via body, the acceptHTTP503Counting precedent — NO
-// accept counter). Used by 0074 to deterministically fill the max_requests
-// budget before probing the circuit breaker.
+// normal "GET /<seg>" request on a shared gate channel until a release control
+// request frees it, then answers HTTP 200 with a "backend-<idx>:<seg>" body
+// (host attribution via body, the acceptHTTP503Counting precedent — NO accept
+// counter). Used by 0074 to deterministically fill the max_requests budget
+// before probing the circuit breaker.
+//
+// Two release control paths:
+//   - "GET /__release"        — re-armable: closes-and-swaps the gate (freeing
+//     the current batch, re-arming a fresh gate for the next). 0074 uses this
+//     (byte-stable; UNCHANGED).
+//   - "GET /__release_sticky" — STICKY: permanently opens the gate so ALL
+//     current AND future requests pass immediately (no re-arm). 0078 uses this
+//     for its drain: the M woken pending waiters dial FRESH connections after
+//     the N held conns release, and a re-armed gate would re-block those fresh
+//     dials → the drain would STALL (cx_open never returns to 0). The sticky
+//     gate lets the woken dials sail through. (phase 43.1 D-S431-5)
 func acceptBlockingHold(ln net.Listener, idx int) {
 	var mu sync.Mutex
-	gate := make(chan struct{}) // closed by /__release to free the current batch
+	gate := make(chan struct{}) // closed by a release to free the current batch
+	sticky := false             // once /__release_sticky fires, all requests pass immediately
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -1642,6 +1654,17 @@ func acceptBlockingHold(ln net.Listener, idx int) {
 			}
 			_, _ = io.Copy(io.Discard, req.Body)
 			_ = req.Body.Close()
+			if req.URL.Path == "/__release_sticky" {
+				mu.Lock()
+				if !sticky {
+					sticky = true
+					close(gate) // free the current batch AND mark sticky (all future pass)
+				}
+				mu.Unlock()
+				body := "released-sticky"
+				_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+				return
+			}
 			if req.URL.Path == "/__release" {
 				mu.Lock()
 				old := gate
@@ -1652,11 +1675,15 @@ func acceptBlockingHold(ln net.Listener, idx int) {
 				_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 				return
 			}
-			// a normal request: block until the current batch is released.
+			// a normal request: pass immediately if sticky, else block until the
+			// current batch is released.
 			mu.Lock()
+			s := sticky
 			g := gate
 			mu.Unlock()
-			<-g
+			if !s {
+				<-g
+			}
 			seg := req.URL.Path
 			if i := strings.LastIndex(seg, "/"); i >= 0 && i+1 < len(seg) {
 				seg = seg[i+1:]

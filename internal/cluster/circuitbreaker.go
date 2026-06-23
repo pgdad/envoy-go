@@ -16,6 +16,11 @@ import (
 // max_connections/max_pending_requests register-for-parity-but-defer.
 type circuitBreaker struct {
 	prio [2]cbPriority // [0]=DEFAULT, [1]=HIGH (HIGH parses+registers but never binds)
+	// pool is the DEFAULT-priority connection-creation budget + bounded pending
+	// wait-queue (ADR-0252). Non-nil for every cluster WITH circuit_breakers
+	// (the budgets default to 1024 — AMEND-CP5, so it is effectively off unless
+	// configured small). DEFAULT-only: every request is DEFAULT at 43.1.
+	pool *connPool
 	// the LIVE cluster-level overflow counter (the SAME counter max_pending_requests
 	// would use — there is NO upstream_rq_overflow; AMEND-CB2).
 	upstreamRqPendingOverflow *stats.Counter
@@ -47,6 +52,8 @@ func parseCircuitBreakers(c *clusterv3.Cluster, name string) (*circuitBreaker, e
 	out := &circuitBreaker{}
 	out.prio[0].maxRequests = 1024
 	out.prio[1].maxRequests = 1024
+	maxConns := int64(1024)   // AMEND-CP5 default
+	maxPending := int64(1024) // AMEND-CP5 default
 	seen := [2]bool{}
 	for _, th := range cb.GetThresholds() {
 		p := th.GetPriority()
@@ -77,35 +84,54 @@ func parseCircuitBreakers(c *clusterv3.Cluster, name string) (*circuitBreaker, e
 		if v := th.GetMaxRequests(); v != nil {
 			out.prio[idx].maxRequests = int64(v.GetValue())
 		}
-		// max_connections/max_pending_requests/max_retries/max_connection_pools:
-		// parse-accepted, enforcement DEFERRED (AMEND-CB1) — no fields stored.
+		if idx == 0 { // DEFAULT-only: the connection budget binds DEFAULT (43.1)
+			if v := th.GetMaxConnections(); v != nil {
+				maxConns = int64(v.GetValue())
+			}
+			if v := th.GetMaxPendingRequests(); v != nil {
+				maxPending = int64(v.GetValue())
+			}
+		}
 	}
+	out.pool = &connPool{maxConnections: maxConns, maxPendingRequests: maxPending}
 	// per_host_thresholds: silent-ignored (AMEND-CB1).
 	return out, nil
 }
 
-// registerStats allocates the +14 circuit_breakers stats (SPEC §7), on clusters
-// WITH circuit_breakers only. Per priority (default, high): 5 *_open gauges. Only
-// default.rq_open binds a LIVE handle (the enforced max_requests gauge); high's
-// rq_open + all cx/cx_pool/rq_pending/rq_retry gauges register-and-stay-at-0
-// (their budgets parse-but-defer per AMEND-CB1). The 4 cluster overflow counters:
-// only upstream_rq_pending_overflow binds LIVE (AMEND-CB2); the other 3 emit-0.
+// registerStats allocates the +16 circuit_breakers stats (SPEC §7, AMEND-CP3),
+// on clusters WITH circuit_breakers only. Per priority (default, high): 5 *_open
+// gauges. default.rq_open + the 2 DEFAULT-only pool open-signal handles (cx_open,
+// rq_pending_open) bind LIVE; rq_retry_open binds LIVE on DEFAULT via prio[0].
+// high's gauges register-and-stay-at-0 (their budgets parse-but-defer per
+// AMEND-CB1). Cluster-scoped counters: upstream_rq_pending_overflow binds LIVE
+// (AMEND-CB2) and is shared into cb.pool; the activated upstream_cx_overflow plus
+// the 2 new pending-queue names (upstream_rq_pending_active gauge +
+// upstream_rq_pending_total counter) bind LIVE via cb.pool (AMEND-CP2/CP3).
+// cb.pool is always non-nil here (Task 2 guarantee).
 func (cb *circuitBreaker) registerStats(r *stats.Registry, prefix string) {
 	for idx, name := range []string{"default", "high"} {
 		gp := prefix + "circuit_breakers." + name + "."
-		cb.prio[idx].rqOpen = r.NewGauge(gp + "rq_open") // LIVE for default; high registered but never set
-		r.NewGauge(gp + "cx_open")                       // emit-0 (max_connections deferred)
-		r.NewGauge(gp + "cx_pool_open")                  // emit-0 (max_connection_pools deferred)
-		r.NewGauge(gp + "rq_pending_open")               // emit-0 (max_pending_requests deferred)
-		g := r.NewGauge(gp + "rq_retry_open")            // LIVE for default (retry_budget); high stays emit-0
-		if idx == 0 {
+		cb.prio[idx].rqOpen = r.NewGauge(gp + "rq_open")
+		cxOpen := r.NewGauge(gp + "cx_open")                // ACTIVATED (was emit-0)
+		r.NewGauge(gp + "cx_pool_open")                     // emit-0 (max_connection_pools deferred)
+		rqPendingOpen := r.NewGauge(gp + "rq_pending_open") // ACTIVATED (was emit-0)
+		g := r.NewGauge(gp + "rq_retry_open")
+		if idx == 0 { // DEFAULT-only live handles
+			// cx_open + rq_pending_open are pool open-signals → cb.pool.*
+			cb.pool.cxOpen = cxOpen
+			cb.pool.rqPendingOpen = rqPendingOpen
+			// rq_retry_open is a per-priority retry-budget signal → cb.prio[0].*
 			cb.prio[0].rqRetryOpen = g
 		}
 	}
 	cb.upstreamRqPendingOverflow = r.NewCounter(prefix + "upstream_rq_pending_overflow") // LIVE
-	r.NewCounter(prefix + "upstream_cx_overflow")                                        // emit-0
+	cb.pool.upstreamRqPendingOverflow = cb.upstreamRqPendingOverflow                     // shared (AMEND-CP2)
+	cb.pool.upstreamCxOverflow = r.NewCounter(prefix + "upstream_cx_overflow")           // ACTIVATED (was emit-0)
 	r.NewCounter(prefix + "upstream_cx_pool_overflow")                                   // emit-0
-	cb.upstreamRqRetryOverflow = r.NewCounter(prefix + "upstream_rq_retry_overflow")     // LIVE (was emit-0)
+	cb.upstreamRqRetryOverflow = r.NewCounter(prefix + "upstream_rq_retry_overflow")     // LIVE (phase 42)
+	// AMEND-CP3: 2 NEW CB-scoped pending-queue names (the +2 surface delta: 1181→1183).
+	cb.pool.upstreamRqPendingActive = r.NewGauge(prefix + "upstream_rq_pending_active")
+	cb.pool.upstreamRqPendingTotal = r.NewCounter(prefix + "upstream_rq_pending_total")
 }
 
 // tryAcquire reserves a max_requests slot for the given priority. Returns false

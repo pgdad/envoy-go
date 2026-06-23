@@ -640,6 +640,15 @@ func doH1ClusterAction(ctx context.Context, a *routerAction, req *http.Request) 
 
 	pooled, ep, err := a.cluster.AcquireH1(ctx)
 	if err != nil {
+		if cluster.IsConnPoolOverflow(err) {
+			// ADR-0252: connection-pool wait-queue full → fail fast 503.
+			// upstream_rq_pending_overflow already incremented in the pool. Mirror
+			// the phase-41 max_requests overflow: NO IncStatusClass on the upstream
+			// class (the dedicated overflow counter is the signal; avoids a
+			// speculative upstream_rq_5xx cross-side mismatch). NOT localOrigin
+			// (an overflow is a load-shed, not a connect failure for retry_on).
+			return ActionResponse{Status: 503, Headers: localReplyHeaders(0), Body: nil}, picked, nil
+		}
 		a.cluster.IncStatusClass(503)
 		if !ep.IsZero() { // a host was picked → attribute the local-origin connect failure
 			a.cluster.RecordUpstreamResult(ep, cluster.UpstreamResult{StatusCode: 503, LocalOriginErr: true})
@@ -811,6 +820,16 @@ func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writ
 
 	upstream, ep, err := a.cluster.Dial(ctx)
 	if err != nil {
+		if cluster.IsConnPoolOverflow(err) {
+			// ADR-0252: connection-pool overflow → fail fast 503 (load-shed).
+			// upstream_rq_total was already incremented above (as on the live path);
+			// upstream_rq_pending_overflow already incremented in the pool: NO
+			// IncStatusClass (the dedicated overflow counter is the signal).
+			// (Legacy direct-write path; the live H1 HCM dispatch goes through
+			// doH1ClusterAction's overflow branch — kept here for consistency.)
+			statusCode = 503
+			return 503, writeStatusReply(bw, 503, "")
+		}
 		a.cluster.IncStatusClass(503)
 		statusCode = 503
 		return 503, writeStatusReply(bw, 503, "")
