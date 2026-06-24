@@ -595,6 +595,15 @@ const (
 	// deterministically before probing stream counts + the pending queue. NEW
 	// BackendKind per reference_differential_fixture_dispatch_constraint.
 	H2HoldResponder BackendKind = 37
+	// H2GoawayResponder is a raw-framer in-process h2c (prior-knowledge) responder
+	// (phase 43.2b, the GOAWAY drain lifecycle). Unlike H2HoldResponder (kind 37,
+	// http.Server/h2c — no frame control) it drives the framer directly so it can,
+	// on control requests, emit a peer GOAWAY(NO_ERROR) (/__goaway — the drain
+	// trigger) and a targeted RST_STREAM(INTERNAL_ERROR) on a held stream (/__rst
+	// — the rx_reset prong), alongside the /__release hold gate. Advertises a high
+	// SETTINGS_MAX_CONCURRENT_STREAMS so the cluster's LOCAL cap binds. NEW
+	// BackendKind per reference_differential_fixture_dispatch_constraint.
+	H2GoawayResponder BackendKind = 38
 )
 
 // BackendKindAware is an OPTIONAL driver-side method. Drivers that implement

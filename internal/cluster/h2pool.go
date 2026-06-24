@@ -126,9 +126,10 @@ func (c *Cluster) h2PromoteLocked(addr string) {
 	if len(q) == 0 {
 		return
 	}
-	// (1) live conn with a free stream slot.
+	// (1) live conn with a free stream slot. A draining conn (GoneAway() — its
+	// codec observed a peer GOAWAY) takes NO new streams (Task 3 admission-skip).
 	for _, pc := range c.h2Pool[addr] {
-		if !pc.cc.Closed() && pc.inFlight < c.h2MaxConcurrentStreams {
+		if !pc.cc.Closed() && !pc.cc.GoneAway() && pc.inFlight < c.h2MaxConcurrentStreams {
 			pc.inFlight++
 			c.h2StreamsActiveInc()
 			w := q[0]
@@ -194,6 +195,14 @@ func (c *Cluster) h2PendingOverflowInc() {
 // h2CxHTTP2TotalInc Inc's the cluster's upstream_cx_http2_total counter (one per
 // new pooled H2 conn). nil-guarded; Task 6 binds the handle (useH2-gated).
 func (c *Cluster) h2CxHTTP2TotalInc() { incCounter(c.upstreamCxHTTP2Total) }
+
+// h2RxResetInc Inc's the cluster's http2.rx_reset counter (a received RST_STREAM
+// observed by the codec). nil-guarded; useH2-gated handle. (phase 43.2b)
+func (c *Cluster) h2RxResetInc() { incCounter(c.http2RxReset) }
+
+// h2TxResetInc Inc's the cluster's http2.tx_reset counter (a sent RST_STREAM —
+// the codec's downstream-cancel CANCEL). nil-guarded. (phase 43.2b)
+func (c *Cluster) h2TxResetInc() { incCounter(c.http2TxReset) }
 
 // ---------------------------------------------------------------------------
 // The acquire / release lifecycle (phase 43.2a, Task 5, ADR-0253)
@@ -443,7 +452,9 @@ func (c *Cluster) AcquireH2Stream(ctx context.Context) (cc *h2.ClientConn, relea
 // slot (inFlight < C), or nil. Caller holds c.h2PoolMu. (phase 43.2a, Task 9.5)
 func (c *Cluster) findStreamHitLocked(addr string) *pooledH2Conn {
 	for _, pc := range c.h2Pool[addr] {
-		if !pc.cc.Closed() && pc.inFlight < c.h2MaxConcurrentStreams {
+		// Skip a draining conn (GoneAway() — its codec observed a peer GOAWAY): it
+		// takes NO new streams, only drains its in-flight ones (Task 3).
+		if !pc.cc.Closed() && !pc.cc.GoneAway() && pc.inFlight < c.h2MaxConcurrentStreams {
 			return pc
 		}
 	}
@@ -599,6 +610,7 @@ func (c *Cluster) dialAndPool(ctx context.Context, addr string, ep Endpoint, lbR
 	c.removeConnectingLocked(addr, cn)
 	pc := &pooledH2Conn{cc: cc, inFlight: cn.promised}
 	c.h2Pool[addr] = append(c.h2Pool[addr], pc)
+	go c.watchDrain(addr, cc)
 	c.h2CxHTTP2TotalInc()
 	cn.cc = cc
 	close(cn.ready) // attachers ride the now-established conn.
@@ -620,7 +632,11 @@ func (c *Cluster) makeRelease(addr string, pc *pooledH2Conn) func() {
 		pc.inFlight--
 		c.h2StreamsActiveDec()
 		c.h2PromoteLocked(addr)
-		if pc.cc.Closed() && pc.inFlight == 0 {
+		// Eager-close on the last in-flight stream of a conn that is Closed OR
+		// draining (GoneAway() — its codec observed a peer GOAWAY): a draining conn
+		// took no new streams (admission-skip), so once it drains to 0 it closes +
+		// frees its permit (Task 3 eviction generalization).
+		if (pc.cc.Closed() || pc.cc.GoneAway()) && pc.inFlight == 0 {
 			c.evictH2ConnLocked(addr, pc)
 			// The eviction freed a permit (via cc.Close → connDec → releaseConn);
 			// promote again so a queued waiter can take a dial-grant.
@@ -683,4 +699,32 @@ func (c *Cluster) findPooledLocked(addr string, cc *h2.ClientConn) *pooledH2Conn
 		}
 	}
 	return nil
+}
+
+// watchDrain is the per-conn drain-watcher (phase 43.2b, ADR-0254). One
+// goroutine per pooled conn, spawned at pool insertion (dialAndPool). It closes
+// an IDLE draining conn promptly: such a conn has no in-flight stream whose
+// release() would evict it, and its ctx is never canceled, so without this
+// watcher it would be admission-skipped forever but never closed (a conn leak).
+//
+// Single-shot: it acts once then exits.
+//   - GoneAwayCh fires (peer GOAWAY): re-lock h2PoolMu, re-check the conn is
+//     still pooled AND idle (the findPooledLocked != nil guard dodges the
+//     double-evict race with EvictH2ConnOnError / makeRelease); if so evict+Close
+//     it and promote a waiter onto the freed permit. If inFlight > 0 the last
+//     release()'s generalized eager-close (Task 3) does the eviction instead, so
+//     this is a no-op and the watcher just exits.
+//   - Done fires (conn evicted/closed by another path): exit, no action.
+func (c *Cluster) watchDrain(addr string, cc *h2.ClientConn) {
+	select {
+	case <-cc.GoneAwayCh():
+		c.h2PoolMu.Lock()
+		if pc := c.findPooledLocked(addr, cc); pc != nil && pc.inFlight == 0 {
+			c.evictH2ConnLocked(addr, pc)
+			c.h2PromoteLocked(addr)
+		}
+		c.h2PoolMu.Unlock()
+	case <-cc.Done():
+		// evicted/closed by another path (EvictH2ConnOnError / makeRelease) → nothing to do.
+	}
 }

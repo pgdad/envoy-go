@@ -194,6 +194,11 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 	if c.useH2 {
 		c.upstreamCxHTTP2Total = r.NewCounter(prefix + "upstream_cx_http2_total")
 		c.http2StreamsActive = r.NewGauge(prefix + "http2.streams_active")
+		// Phase 43.2b (ADR-0254): the 2 behavior-driven reset counters, wired
+		// from the codec via h2.WithResetHooks at dial. NO goaway_sent /
+		// stream_refused_errors (AMEND-H2B-3).
+		c.http2RxReset = r.NewCounter(prefix + "http2.rx_reset")
+		c.http2TxReset = r.NewCounter(prefix + "http2.tx_reset")
 	}
 }
 

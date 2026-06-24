@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	"github.com/esalaine/envoy-go/internal/stats"
+
+	"golang.org/x/net/http2"
 )
 
 // newTestH2Cluster builds a Cluster carrying an injected connPool (with real
@@ -638,6 +641,264 @@ func TestAcquireH2Stream_ReleaseClosedConnEvicts(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Task 3 (phase 43.2b): admission-skip draining conns (cc.GoneAway()) on BOTH
+// established-conn sites + (Closed||GoneAway)&&inFlight==0 eviction. A draining
+// conn is one whose codec observed a peer GOAWAY; it takes NO new streams but
+// closes on the last in-flight stream-release. `draining` is DERIVED from
+// cc.GoneAway() — no new pooledH2Conn field. The connecting tier stays unguarded.
+// ---------------------------------------------------------------------------
+
+// goawayBackend is a plaintext-h2c listener that runs the from-scratch driver
+// handshake on each accepted conn AND captures the post-handshake server-side
+// net.Conn (keyed by the client's remote addr) so a test can drive a peer
+// GOAWAY frame down a SPECIFIC pooled conn. Without capturing the server conn
+// (runH2Server discards it) there is no way to make a real *h2.ClientConn report
+// GoneAway()==true. Driver-side use of golang.org/x/net/http2.Framer is permitted
+// in test code per D-3.2.
+type goawayBackend struct {
+	ln    net.Listener
+	mu    sync.Mutex
+	conns []net.Conn // accepted server-side conns, post-handshake, in accept order
+}
+
+// newGoawayBackend starts the capturing h2c listener. Caller defers Close.
+func newGoawayBackend(t *testing.T) *goawayBackend {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	b := &goawayBackend{ln: ln}
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				if herr := h2ServerPrefacePeer(c); herr != nil {
+					_ = c.Close()
+					return
+				}
+				b.mu.Lock()
+				b.conns = append(b.conns, c)
+				b.mu.Unlock()
+				// Post-handshake: drain inbound bytes (incl. the client's GOAWAY on
+				// Close) until the client drops the conn.
+				_, _ = io.Copy(io.Discard, c)
+			}(conn)
+		}
+	}()
+	return b
+}
+
+func (b *goawayBackend) Close() { _ = b.ln.Close() }
+
+func (b *goawayBackend) endpoint() Endpoint { return endpointFromAddr(b.ln.Addr()) }
+
+// connCount reports how many server conns have been accepted + handshaken.
+func (b *goawayBackend) connCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.conns)
+}
+
+// sendGOAWAY writes a graceful GOAWAY(NO_ERROR) with a high last-stream-id (so
+// it does NOT finish any in-flight client stream — it only flips the client's
+// goawayCh, the GoneAway() predicate) down the idx-th accepted server conn.
+func (b *goawayBackend) sendGOAWAY(t *testing.T, idx int) {
+	t.Helper()
+	b.mu.Lock()
+	if idx >= len(b.conns) {
+		b.mu.Unlock()
+		t.Fatalf("sendGOAWAY: conn idx %d out of range (have %d)", idx, len(b.conns))
+	}
+	conn := b.conns[idx]
+	b.mu.Unlock()
+	fr := http2.NewFramer(conn, conn)
+	// last-stream-id 1<<30: well above any allocated id → no in-flight stream is
+	// finished; the client's dispatchFrame only closes goawayCh.
+	if err := fr.WriteGoAway(1<<30, http2.ErrCodeNo, nil); err != nil {
+		t.Fatalf("sendGOAWAY: %v", err)
+	}
+}
+
+// pollGoneAway spins until cc.GoneAway() (the client readLoop processed the peer
+// GOAWAY) or the deadline.
+func pollGoneAway(t *testing.T, cc *h2.ClientConn) {
+	t.Helper()
+	pollUntil(t, func() bool { return cc.GoneAway() }, "conn should observe peer GOAWAY (GoneAway()==true)")
+}
+
+// (Task 3, case 1) Admission-skip: a single pooled conn with a free stream slot;
+// drive its peer GOAWAY; once GoneAway()==true the draining conn is SKIPPED by
+// findStreamHitLocked (returns nil) AND a fresh AcquireH2Stream MISSes → dials a
+// SECOND conn (pool len == 2, upstream_cx_http2_total == 2). Before the
+// admission-skip guard the GOAWAY'd conn (Closed()==false, inFlight<C) would be
+// re-used and no second conn would dial.
+func TestAcquireH2Stream_DrainSkipsAdmission(t *testing.T) {
+	b := newGoawayBackend(t)
+	defer b.Close()
+	ep := b.endpoint()
+	addr := ep.Addr()
+	c := mkLifecycleH2Cluster(t, ep, 16, 16, 4) // C=4 → free slot exists
+
+	// First acquire dials conn #1 and holds one stream slot.
+	cc1, rel1, _, err := c.AcquireH2Stream(context.Background())
+	if err != nil {
+		t.Fatalf("acquire #1: %v", err)
+	}
+	defer rel1()
+	if n := poolConnCount(c, addr); n != 1 {
+		t.Fatalf("after acquire #1: pool conns = %d, want 1", n)
+	}
+
+	// Drive conn #1's peer GOAWAY; wait for the client to observe it.
+	pollUntil(t, func() bool { return b.connCount() >= 1 }, "backend should accept conn #1")
+	b.sendGOAWAY(t, 0)
+	pollGoneAway(t, cc1)
+
+	// findStreamHitLocked must now SKIP the draining conn (even though it has a
+	// free slot and is not Closed()).
+	c.h2PoolMu.Lock()
+	hit := c.findStreamHitLocked(addr)
+	c.h2PoolMu.Unlock()
+	if hit != nil {
+		t.Fatalf("findStreamHitLocked returned the draining conn %p, want nil (admission-skip)", hit.cc)
+	}
+
+	// A fresh acquire MISSes the draining conn → dials a SECOND conn.
+	cc2, rel2, _, err := c.AcquireH2Stream(context.Background())
+	if err != nil {
+		t.Fatalf("acquire #2: %v", err)
+	}
+	defer rel2()
+	if cc2 == cc1 {
+		t.Fatal("acquire #2 rode the draining conn (admission-skip failed)")
+	}
+	if n := poolConnCount(c, addr); n != 2 {
+		t.Fatalf("after acquire #2: pool conns = %d, want 2 (second dial past the draining conn)", n)
+	}
+	if got := c.upstreamCxHTTP2Total.Load(); got != 2 {
+		t.Fatalf("upstream_cx_http2_total = %d, want 2 (two dials)", got)
+	}
+}
+
+// (Task 3, case 2) Promote-skip: a queued waiter + the ONLY free-slot conn is
+// draining → h2PromoteLocked does NOT hand that conn; it falls through to the
+// permit/dial-grant path (cc:nil). Mirrors TestH2PoolPromoteSkipsClosedConn but
+// for the GoneAway() (not Closed()) predicate, on a real GOAWAY'd conn.
+func TestAcquireH2Stream_PromoteSkipsDrainingConn(t *testing.T) {
+	b := newGoawayBackend(t)
+	defer b.Close()
+	ep := b.endpoint()
+	addr := ep.Addr()
+	c := mkLifecycleH2Cluster(t, ep, 4, 4, 4) // C=4, a free permit remains
+
+	// Dial conn #1 (real GOAWAY-able conn) and immediately release its stream so
+	// it has inFlight==0 < C (a "free" slot the promote scan would otherwise hand).
+	cc1, rel1, _, err := c.AcquireH2Stream(context.Background())
+	if err != nil {
+		t.Fatalf("acquire #1: %v", err)
+	}
+	rel1()
+
+	pollUntil(t, func() bool { return b.connCount() >= 1 }, "backend should accept conn #1")
+	b.sendGOAWAY(t, 0)
+	pollGoneAway(t, cc1)
+
+	// Enqueue a waiter + promote: the only free-slot conn is draining → the
+	// promote must skip it and hand a dial-grant (cc:nil), reserving a permit.
+	// activeConns reads are guarded by h2PoolMu: since Task 4, watchDrain evicts
+	// the idle GOAWAY'd conn in the BACKGROUND (evictH2ConnLocked→cc.Close→connDec
+	// →releaseConn writes activeConns-- under the lock), so an unguarded read
+	// races it. Snapshot under the lock (mirrors TestAcquireH2Stream_DrainCloseOnLastRelease).
+	p := c.circuitBreaker.pool
+	c.h2PoolMu.Lock()
+	activeBefore := p.activeConns
+	c.h2PoolMu.Unlock()
+	w := &h2Waiter{ch: make(chan h2Grant, 1)}
+	c.h2PoolMu.Lock()
+	c.enqueueWaiterLocked(addr, w)
+	c.h2PromoteLocked(addr)
+	c.h2PoolMu.Unlock()
+
+	select {
+	case g := <-w.ch:
+		if g.cc != nil {
+			t.Fatalf("promote handed the draining conn %p instead of a dial-grant", g.cc)
+		}
+	default:
+		t.Fatal("promote sent no grant (expected a dial-grant past the draining conn)")
+	}
+	c.h2PoolMu.Lock()
+	activeAfter := p.activeConns
+	c.h2PoolMu.Unlock()
+	if activeAfter != activeBefore+1 {
+		t.Fatalf("dial-grant: activeConns = %d, want %d (a permit reserved)", activeAfter, activeBefore+1)
+	}
+}
+
+// (Task 3, case 3) In-flight drain-close: a draining conn with inFlight==1; its
+// release() must evict + Close it (the generalized (Closed||GoneAway)&&inFlight==0
+// eager-close) and free its permit (upstream_cx_active Decs, activeConns back to
+// pre-acquire). Before the eviction generalization the conn (Closed()==false)
+// would survive the release and leak.
+func TestAcquireH2Stream_DrainCloseOnLastRelease(t *testing.T) {
+	b := newGoawayBackend(t)
+	defer b.Close()
+	ep := b.endpoint()
+	addr := ep.Addr()
+	c := mkLifecycleH2Cluster(t, ep, 2, 4, 4)
+	p := c.circuitBreaker.pool
+
+	cc, release, _, err := c.AcquireH2Stream(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if got := c.upstreamCxActive.Load(); got != 1 {
+		t.Fatalf("after acquire: upstream_cx_active = %d, want 1", got)
+	}
+	c.h2PoolMu.Lock()
+	acBefore := p.activeConns
+	c.h2PoolMu.Unlock()
+	if acBefore != 1 {
+		t.Fatalf("after acquire: activeConns = %d, want 1", acBefore)
+	}
+
+	// Drive the peer GOAWAY: the conn is now draining (GoneAway()==true) but NOT
+	// Closed() (its in-flight stream keeps it alive).
+	pollUntil(t, func() bool { return b.connCount() >= 1 }, "backend should accept the conn")
+	b.sendGOAWAY(t, 0)
+	pollGoneAway(t, cc)
+	if cc.Closed() {
+		t.Fatal("draining conn is Closed() before its last stream released (GoneAway should not imply Closed)")
+	}
+
+	// Releasing the last in-flight stream of a draining conn must evict + Close it.
+	release()
+
+	if n := poolConnCount(c, addr); n != 0 {
+		t.Fatalf("after release of draining conn's last stream: pool conns = %d, want 0 (evicted)", n)
+	}
+	if !cc.Closed() {
+		t.Fatal("draining conn was not Closed() on last-stream release (eviction generalization failed)")
+	}
+	c.h2PoolMu.Lock()
+	acAfter := p.activeConns
+	c.h2PoolMu.Unlock()
+	if acAfter != 0 {
+		t.Fatalf("after drain-close: activeConns = %d, want 0 (permit freed)", acAfter)
+	}
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Fatalf("after drain-close: upstream_cx_active = %d, want 0", got)
+	}
+	if got := c.http2StreamsActive.Load(); got != 0 {
+		t.Fatalf("after drain-close: streams_active = %d, want 0", got)
+	}
+}
+
 // (1) tryAcquireConnSlot: true under cap (activeConns++), false at cap (NO
 // enqueue — connPool.waiters unchanged), with the AMEND-CP1 soft-signal parity
 // (cx_open set + upstream_cx_overflow Inc on the at-cap failure).
@@ -1066,4 +1327,185 @@ func TestH2PoolStreamRecycleRace(t *testing.T) {
 	if p.activeConns != 1 {
 		t.Fatalf("after quiescence: activeConns = %d, want 1", p.activeConns)
 	}
+}
+
+// Task 4 (phase 43.2b): per-conn drain-watcher goroutine (watchDrain).
+// ---------------------------------------------------------------------------
+
+// (Task 4, case 1) Idle prompt-close: a pooled conn made IDLE (inFlight==0 via a
+// release of its only stream) then driven to a peer GOAWAY. No release() will
+// ever fire again and the conn's ctx is never canceled (GoneAway, not Closed),
+// so ONLY the per-conn watchDrain goroutine can close it. Poll an observable
+// (the conn leaves the pool + upstream_cx_active Decs) — proving the watcher,
+// not a release(), evicted+Closed the idle draining conn.
+func TestH2PoolWatcherIdlePromptClose(t *testing.T) {
+	b := newGoawayBackend(t)
+	defer b.Close()
+	ep := b.endpoint()
+	addr := ep.Addr()
+	c := mkLifecycleH2Cluster(t, ep, 2, 4, 4)
+	p := c.circuitBreaker.pool
+
+	// Dial conn #1, then release its only stream → the conn is now IDLE
+	// (inFlight==0) but still pooled (a non-draining release leaves it pooled).
+	cc, release, _, err := c.AcquireH2Stream(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	release()
+	if got := c.upstreamCxActive.Load(); got != 1 {
+		t.Fatalf("after idle release: upstream_cx_active = %d, want 1 (conn still pooled)", got)
+	}
+	if n := poolConnCount(c, addr); n != 1 {
+		t.Fatalf("after idle release: pool conns = %d, want 1 (idle, not yet drained)", n)
+	}
+
+	// Drive the peer GOAWAY on the now-idle conn. No release() can fire (no
+	// in-flight stream) → the watcher is the SOLE closer.
+	pollUntil(t, func() bool { return b.connCount() >= 1 }, "backend should accept the conn")
+	b.sendGOAWAY(t, 0)
+
+	// Poll until the watcher evicts the idle draining conn (no sleep-as-sync).
+	pollUntil(t, func() bool { return poolConnCount(c, addr) == 0 },
+		"watcher should evict the idle draining conn (no release() drove it)")
+	pollUntil(t, func() bool { return c.upstreamCxActive.Load() == 0 },
+		"watcher eviction should Dec upstream_cx_active (Close → connDec → releaseConn)")
+
+	if !cc.Closed() {
+		t.Fatal("watcher did not Close() the idle draining conn")
+	}
+	c.h2PoolMu.Lock()
+	stillPooled := c.findPooledLocked(addr, cc)
+	acAfter := p.activeConns
+	c.h2PoolMu.Unlock()
+	if stillPooled != nil {
+		t.Fatal("idle draining conn still pooled after the watcher should have evicted it")
+	}
+	if acAfter != 0 {
+		t.Fatalf("after watcher close: activeConns = %d, want 0 (permit freed)", acAfter)
+	}
+}
+
+// (Task 4, case 2) In-flight → watcher no-op: a pooled conn with inFlight==1
+// driven to GOAWAY. The watcher's `inFlight == 0` re-check is FALSE, so it does
+// NOT close the conn (the last release()'s generalized eager-close, Task 3, owns
+// that). Assert the conn STAYS pooled while in-flight; then release() evicts it.
+func TestH2PoolWatcherInFlightNoOp(t *testing.T) {
+	b := newGoawayBackend(t)
+	defer b.Close()
+	ep := b.endpoint()
+	addr := ep.Addr()
+	c := mkLifecycleH2Cluster(t, ep, 2, 4, 4)
+
+	// Dial conn #1 and HOLD its stream (inFlight==1).
+	cc, release, _, err := c.AcquireH2Stream(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	pollUntil(t, func() bool { return b.connCount() >= 1 }, "backend should accept the conn")
+	b.sendGOAWAY(t, 0)
+	pollGoneAway(t, cc)
+
+	// The watcher fired (GoneAwayCh closed) but inFlight==1 → its re-check is
+	// false → no-op. The conn must STAY pooled (the in-flight stream keeps it
+	// alive; only its last release() evicts it).
+	if cc.Closed() {
+		t.Fatal("watcher closed an IN-FLIGHT draining conn (inFlight re-check failed)")
+	}
+	// Re-check across a few scheduler turns that the conn is still pooled.
+	for i := 0; i < 50; i++ {
+		if n := poolConnCount(c, addr); n != 1 {
+			t.Fatalf("watcher evicted an in-flight draining conn: pool conns = %d, want 1", n)
+		}
+		runtime.Gosched()
+	}
+
+	// Now release the last stream → the Task-3 path evicts + Closes it.
+	release()
+	pollUntil(t, func() bool { return poolConnCount(c, addr) == 0 },
+		"release of the draining conn's last stream should evict it (Task-3 eager-close)")
+	if !cc.Closed() {
+		t.Fatal("draining conn not Closed() on last-stream release")
+	}
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Fatalf("after last release: upstream_cx_active = %d, want 0", got)
+	}
+}
+
+// (Task 4, case 3) Evicted-by-another-path → no leak / no double-evict. A tight
+// loop pools a real conn, then RACES EvictH2ConnOnError (cancels the ctx →
+// Done() fires) against a peer GOAWAY (GoneAwayCh fires). The watcher's
+// findPooledLocked(...) != nil guard under h2PoolMu must dodge the double-evict,
+// and its <-Done() arm must guarantee it exits (no goroutine leak). Run under
+// -race -count=1: any data race here is a real bug. The watcher-goroutine count
+// returning to baseline at quiescence proves no leak.
+func TestH2PoolWatcherEvictRaceNoLeak(t *testing.T) {
+	b := newGoawayBackend(t)
+	defer b.Close()
+	ep := b.endpoint()
+	addr := ep.Addr()
+
+	const iters = 1000
+	baseGoroutines := runtime.NumGoroutine()
+	for i := 0; i < iters; i++ {
+		// maxConns=1 so each iteration pools exactly one conn (and frees the
+		// permit on eviction, ready for the next iteration's dial).
+		c := mkLifecycleH2Cluster(t, ep, 1, 4, 4)
+
+		before := b.connCount()
+		cc, release, _, err := c.AcquireH2Stream(context.Background())
+		if err != nil {
+			t.Fatalf("iter %d acquire: %v", i, err)
+		}
+		// Make the conn idle so neither release nor evict is gated by inFlight,
+		// maximizing the eviction overlap window.
+		release()
+		// The backend appends THIS iteration's server conn; target it for GOAWAY.
+		pollUntil(t, func() bool { return b.connCount() > before }, "backend should accept this iteration's conn")
+		idx := b.connCount() - 1
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// Racer A: the OTHER eviction path (cancels ctx → Done() fires).
+		go func() {
+			defer wg.Done()
+			c.EvictH2ConnOnError(cc, ep)
+		}()
+		// Racer B: a peer GOAWAY (GoneAwayCh fires → the watcher's other arm).
+		go func() {
+			defer wg.Done()
+			b.sendGOAWAYBestEffort(idx)
+		}()
+		wg.Wait()
+
+		// Drain to quiescence: whoever won, the conn must be evicted exactly once
+		// and Closed; the pool must be empty; the watcher must have exited.
+		pollUntil(t, func() bool { return poolConnCount(c, addr) == 0 },
+			"conn must be evicted exactly once (no surviving pooled conn)")
+		if !cc.Closed() {
+			t.Fatalf("iter %d: conn not Closed after the evict/GOAWAY race", i)
+		}
+	}
+
+	// No goroutine leak: every watcher took its <-Done() (or GOAWAY) arm and
+	// exited. Allow a small slack for the backend's transient accept goroutines.
+	pollUntil(t, func() bool { return runtime.NumGoroutine() <= baseGoroutines+8 },
+		"watcher goroutines should drain to baseline (no leak)")
+}
+
+// sendGOAWAYBestEffort writes a graceful GOAWAY(NO_ERROR) on the idx-th server
+// conn and SWALLOWS any error (a broken-pipe is expected when a concurrent
+// eviction Closed the client conn first). For use inside racer goroutines where
+// t.Fatalf is illegal (must be called from the test goroutine).
+func (b *goawayBackend) sendGOAWAYBestEffort(idx int) {
+	b.mu.Lock()
+	if idx < 0 || idx >= len(b.conns) {
+		b.mu.Unlock()
+		return
+	}
+	conn := b.conns[idx]
+	b.mu.Unlock()
+	fr := http2.NewFramer(conn, conn)
+	_ = fr.WriteGoAway(1<<30, http2.ErrCodeNo, nil)
 }

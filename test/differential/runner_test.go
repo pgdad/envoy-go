@@ -104,6 +104,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0077-hedge-on-per-try-timeout/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0078-connection-pool-max-connections/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0079-h2-multiplex-pool/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0080-h2-goaway-rotation/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -129,6 +130,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -1012,6 +1014,25 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			bo.ln = ln
 			bo.port = ln.Addr().(*net.TCPAddr).Port
 			go acceptH2Hold(ln, bo.idx)
+		case fixture.H2GoawayResponder:
+			// In-process raw-framer h2c (HTTP/2 prior-knowledge) responder (phase
+			// 43.2b, the GOAWAY drain lifecycle). Unlike H2HoldResponder (kind 37,
+			// http.Server/h2c — no frame control) it drives a golang.org/x/net/http2
+			// .Framer directly so it can, on control requests, emit a peer
+			// GOAWAY(NO_ERROR) (/__goaway — the drain trigger), a targeted
+			// RST_STREAM(INTERNAL_ERROR) on a held stream (/__rst — the rx_reset
+			// prong), and a re-armable /__release hold gate. Advertises
+			// SETTINGS_MAX_CONCURRENT_STREAMS=1000 (well above any cluster cap) so the
+			// LOCAL cluster cap binds, not the peer. Host attribution via response
+			// body (the H2HoldResponder precedent) — no accept counter. Used by 0080.
+			ln, err := net.Listen("tcp", "0.0.0.0:0")
+			if err != nil {
+				t.Fatalf("backend[%d] listen: %v", i, err)
+			}
+			defer func(ln net.Listener) { _ = ln.Close() }(ln)
+			bo.ln = ln
+			bo.port = ln.Addr().(*net.TCPAddr).Port
+			go acceptH2Goaway(ln, bo.idx)
 		}
 		backends[i] = bo
 	}
@@ -3099,4 +3120,282 @@ func acceptH2Hold(ln net.Listener, idx int) {
 		MaxConcurrentStreams: 1000, // advertise HIGH so the LOCAL cluster cap binds (AMEND-H2-1/H2-5)
 	})}
 	_ = srv.Serve(ln)
+}
+
+// h2GoawayConn is the per-connection state for acceptH2Goaway. A
+// golang.org/x/net/http2.Framer is NOT safe for concurrent writes, so every
+// framer write (HEADERS/DATA/GOAWAY/RST_STREAM/PING/SETTINGS) is serialized
+// under wmu — mirroring the in-tree codec's cc.mu discipline. held tracks the
+// stream ids of normal (non-control) requests that have arrived but not yet
+// been answered (blocked on the release gate); maxStreamID is the highest
+// client-initiated (odd) stream id seen so a GOAWAY can name a lastStreamID
+// that does NOT abandon any in-flight stream.
+type h2GoawayConn struct {
+	fr  *http2.Framer
+	wmu sync.Mutex
+	// heldMu guards held: the per-conn read loop mutates it, and a BROADCAST
+	// /__release (from a DIFFERENT conn's read-loop goroutine) reads+drains it.
+	heldMu      sync.Mutex
+	held        map[uint32]struct{}
+	maxStreamID uint32
+}
+
+// releaseAllHeld answers 200 to (and clears) every currently-held stream on THIS
+// conn. Safe to call from another conn's goroutine (the broadcast path). The
+// framer writes are serialized under wmu; held is guarded by heldMu. (phase 43.2b)
+func (gc *h2GoawayConn) releaseAllHeld() {
+	gc.heldMu.Lock()
+	held := gc.held
+	gc.held = make(map[uint32]struct{})
+	gc.heldMu.Unlock()
+	for hid := range held {
+		_ = gc.writeStatus200(hid)
+	}
+}
+
+// h2GoawayRegistry tracks ALL live h2GoawayConns for a single H2GoawayResponder
+// listener so /__release can BROADCAST a release to every conn — NOT just the
+// conn the control request happened to arrive on. The pool routes a control
+// request onto whatever pooled upstream conn is admittable, which after a GOAWAY
+// is NEVER the draining conn (it is admission-skipped); a per-conn release could
+// therefore never reach a held stream on a draining conn. Broadcasting matches
+// the SPEC-43.2b live-probe backend (and the kind-37 acceptH2Hold process-global
+// gate) so the in-flight-drain prong's held stream drains to 200 on the GOAWAY'd
+// conn even though the release rides a different (live) conn. (phase 43.2b)
+type h2GoawayRegistry struct {
+	mu    sync.Mutex
+	conns map[*h2GoawayConn]struct{}
+}
+
+func newH2GoawayRegistry() *h2GoawayRegistry {
+	return &h2GoawayRegistry{conns: make(map[*h2GoawayConn]struct{})}
+}
+
+func (r *h2GoawayRegistry) add(gc *h2GoawayConn) {
+	r.mu.Lock()
+	r.conns[gc] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *h2GoawayRegistry) remove(gc *h2GoawayConn) {
+	r.mu.Lock()
+	delete(r.conns, gc)
+	r.mu.Unlock()
+}
+
+// snapshot returns the current live conns (a copy, so the broadcast iterates
+// without holding the registry lock across framer writes).
+func (r *h2GoawayRegistry) snapshot() []*h2GoawayConn {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*h2GoawayConn, 0, len(r.conns))
+	for gc := range r.conns {
+		out = append(out, gc)
+	}
+	return out
+}
+
+// writeStatus200 answers a stream with a single HEADERS frame carrying
+// ":status: 200" and END_STREAM (no body) — used both for the control-request
+// streams (so the control client call completes) and for released held
+// streams. All writes are serialized under wmu.
+func (gc *h2GoawayConn) writeStatus200(streamID uint32) error {
+	var hbuf bytes.Buffer
+	enc := hpack.NewEncoder(&hbuf)
+	_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	gc.wmu.Lock()
+	defer gc.wmu.Unlock()
+	return gc.fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: hbuf.Bytes(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+}
+
+// acceptH2Goaway is the in-process RAW-FRAMER h2c backend for H2GoawayResponder
+// (phase 43.2b, BackendKind 38, the GOAWAY drain lifecycle). Unlike acceptH2Hold
+// (kind 37, http.Server/h2c — which abstracts the framer and CANNOT emit
+// on-demand GOAWAY / targeted RST_STREAM) this drives a
+// golang.org/x/net/http2.Framer directly so the rotation differential (0080) can
+// trigger, on control requests proxied through to this backend:
+//
+//   - /__release — answer 200 to ALL currently-held streams; re-armable, so a
+//     subsequent batch of holds can be released again (the kind-37 precedent).
+//   - /__goaway  — emit a peer GOAWAY(NO_ERROR) naming the highest stream id
+//     seen as lastStreamID, then KEEP SERVING already-open streams to completion.
+//     This is the graceful drain trigger: the TCP conn is NOT closed (a close
+//     would instead cancel the conn ctx and hit the 43.2a Closed() path, NOT the
+//     GOAWAY drain path).
+//   - /__rst     — emit a targeted RST_STREAM(INTERNAL_ERROR) on a currently-held
+//     request stream (the rx_reset prong); the control request itself answers 200.
+//
+// A high SETTINGS_MAX_CONCURRENT_STREAMS (1000) is advertised so the cluster's
+// LOCAL cap binds, not the peer. Framer writes are serialized under a per-conn
+// mutex (Framer is not concurrency-safe for writes). PING is answered; SETTINGS
+// (non-ack) is acked; WINDOW_UPDATE / PRIORITY / RST / unknown frames are ignored
+// gracefully so the in-tree h2 codec client stays happy.
+//
+// Driver-side use of golang.org/x/net/http2.Framer is permitted in test code per
+// D-3.2 (which scopes the no-stdlib-http2 rule to RUNTIME code).
+func acceptH2Goaway(ln net.Listener, _ int) {
+	reg := newH2GoawayRegistry()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go serveH2GoawayConn(conn, reg)
+	}
+}
+
+// serveH2GoawayConn runs the raw-framer handshake + frame loop for one accepted
+// connection. Handshake ordering: read the 24-byte client preface, write the
+// server's initial SETTINGS (advertising MAX_CONCURRENT_STREAMS=1000), then loop
+// reading frames — acking the peer SETTINGS, decoding HEADERS to dispatch on
+// :path, and holding normal request streams until a release.
+func serveH2GoawayConn(conn net.Conn, reg *h2GoawayRegistry) {
+	defer func() { _ = conn.Close() }()
+
+	// Read the client connection preface (PRI * HTTP/2.0 ... SM ...).
+	prefaceBuf := make([]byte, len(http2.ClientPreface))
+	if _, err := io.ReadFull(conn, prefaceBuf); err != nil {
+		return
+	}
+	if string(prefaceBuf) != http2.ClientPreface {
+		return
+	}
+
+	gc := &h2GoawayConn{
+		fr:   http2.NewFramer(conn, conn),
+		held: make(map[uint32]struct{}),
+	}
+	reg.add(gc)
+	defer reg.remove(gc)
+	// ReadMetaHeaders makes ReadFrame decode HEADERS (+ CONTINUATION) into a
+	// *http2.MetaHeadersFrame with the header block already hpack-decoded.
+	gc.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+
+	// Write the server's initial SETTINGS: advertise a HIGH MAX_CONCURRENT_STREAMS
+	// so the cluster's LOCAL cap binds, not this peer.
+	gc.wmu.Lock()
+	err := gc.fr.WriteSettings(
+		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1000},
+		http2.Setting{ID: http2.SettingMaxFrameSize, Val: 16384},
+	)
+	gc.wmu.Unlock()
+	if err != nil {
+		return
+	}
+
+	for {
+		f, err := gc.fr.ReadFrame()
+		if err != nil {
+			return // conn closed / read error
+		}
+		switch frame := f.(type) {
+		case *http2.SettingsFrame:
+			if frame.IsAck() {
+				continue // the peer acked OUR settings; nothing to do
+			}
+			// Ack the peer's SETTINGS.
+			gc.wmu.Lock()
+			ackErr := gc.fr.WriteSettingsAck()
+			gc.wmu.Unlock()
+			if ackErr != nil {
+				return
+			}
+		case *http2.PingFrame:
+			if frame.IsAck() {
+				continue
+			}
+			gc.wmu.Lock()
+			pErr := gc.fr.WritePing(true, frame.Data)
+			gc.wmu.Unlock()
+			if pErr != nil {
+				return
+			}
+		case *http2.MetaHeadersFrame:
+			sid := frame.StreamID
+			if sid > gc.maxStreamID {
+				gc.maxStreamID = sid
+			}
+			path := frame.PseudoValue("path")
+			gc.dispatchStream(sid, path, reg)
+		default:
+			// WINDOW_UPDATE / PRIORITY / RST_STREAM / DATA / GOAWAY / unknown:
+			// ignore gracefully (this minimal backend has no flow-control or
+			// request-body needs; the codec client tolerates a silent peer here).
+			continue
+		}
+	}
+}
+
+// dispatchStream acts on a single inbound HEADERS stream by its :path. Control
+// paths (/__release, /__goaway, /__rst) drive the framer then answer 200 on the
+// control stream itself; any other path is a normal proxied request that is
+// registered as held and left unanswered until a /__release.
+func (gc *h2GoawayConn) dispatchStream(sid uint32, path string, reg *h2GoawayRegistry) {
+	switch path {
+	case "/__release":
+		// BROADCAST: answer 200 to every currently-held stream on EVERY live conn,
+		// not just this one (re-armable). A control request routed through the proxy
+		// after a GOAWAY rides a LIVE conn (the draining conn is admission-skipped),
+		// so a per-conn release could never reach a held stream on the draining conn;
+		// broadcasting drains it (matches the SPEC-43.2b live-probe backend + the
+		// kind-37 acceptH2Hold process-global gate). Then answer the control stream.
+		for _, other := range reg.snapshot() {
+			other.releaseAllHeld()
+		}
+		_ = gc.writeStatus200(sid)
+	case "/__goaway":
+		// Emit a peer GOAWAY(NO_ERROR). lastStreamID = the highest client stream
+		// id seen (the control stream itself), so NO in-flight stream is abandoned
+		// by the GOAWAY. Do NOT close the TCP conn — keep serving open streams to
+		// completion (the graceful drain trigger; a close would hit the 43.2a
+		// Closed() path instead of the GOAWAY drain path).
+		last := gc.maxStreamID
+		gc.wmu.Lock()
+		_ = gc.fr.WriteGoAway(last, http2.ErrCodeNo, nil)
+		gc.wmu.Unlock()
+		_ = gc.writeStatus200(sid)
+	case "/__rst":
+		// Emit a targeted RST_STREAM(INTERNAL_ERROR) on a currently-held request
+		// stream (the rx_reset prong). Pick the lowest held stream id for
+		// determinism; drop it from the held set so a later /__release does not
+		// also try to answer it.
+		var target uint32
+		found := false
+		gc.heldMu.Lock()
+		for hid := range gc.held {
+			if !found || hid < target {
+				target = hid
+				found = true
+			}
+		}
+		if found {
+			delete(gc.held, target)
+		}
+		gc.heldMu.Unlock()
+		// Answer the CONTROL stream's 200 BEFORE emitting the RST_STREAM. The proxy
+		// reads frames in order (TCP + the wmu write order), so the control request
+		// completes with its 200 first; only THEN does the RST arrive and reset the
+		// held stream (poisoning + evicting the pooled conn the control request also
+		// rode). Reversing the order would race the conn-eviction against the control
+		// 200, intermittently failing the control request with a 502. (phase 43.2b)
+		_ = gc.writeStatus200(sid)
+		if found {
+			gc.wmu.Lock()
+			_ = gc.fr.WriteRSTStream(target, http2.ErrCodeInternal)
+			gc.wmu.Unlock()
+		}
+	default:
+		// A normal proxied request: hold it (do NOT respond yet) until a
+		// /__release. Host attribution would be via body, but the rotation
+		// differential only needs the 200/RST lifecycle, so the release answers a
+		// bodyless 200.
+		gc.heldMu.Lock()
+		gc.held[sid] = struct{}{}
+		gc.heldMu.Unlock()
+	}
 }

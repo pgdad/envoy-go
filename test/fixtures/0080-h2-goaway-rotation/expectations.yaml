@@ -1,0 +1,146 @@
+# Phase-43.2b fixture 0080-h2-goaway-rotation: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over an HTTP/2
+# (TLS+ALPN-h2) DOWNSTREAM listener whose requests fan out to a single h2c
+# upstream H2 cluster c_h2gw. It proves the graceful GOAWAY-driven upstream H2
+# connection ROTATION + the two behavior-driven http2.* reset counters.
+#
+# # Why an HTTP/2 DOWNSTREAM listener (reference_h2_pool_downstream_codec_gate)
+#
+# The HCM picks the H1-vs-H2 router action by the DOWNSTREAM listener codec; the
+# H2 upstream multiplex pool (and so the GOAWAY drain lifecycle) engages ONLY on
+# an H2 (TLS+ALPN-h2) downstream listener. An H1-downstream variant would SILENTLY
+# never exercise the pool. So the 0080 listener is the 0004/0079 H2 PKI shape; the
+# decode-ran guard (upstream_cx_http2_total > 0 in Step 1) catches a disengaged
+# pool.
+#
+# # Cross-side EXACT (reference_h2_goaway_rotation_stats)
+#
+# The reference observes a peer GOAWAY ENTIRELY via the upstream_cx_* lifecycle
+# counters — NO http2.* counter moves during a rotation, and there is NO
+# goaway_received counter. Only http2.rx_reset (a received RST_STREAM) and
+# http2.tx_reset (a sent CANCEL) of the http2.* family are live. The rotation conn
+# count + the reset counters are deterministic under the sequenced-barrier drive,
+# so they are asserted cross-side EXACT on BOTH sides:
+#
+#   cluster.c_h2gw.upstream_cx_http2_total == 2   (one rotation: orig + replacement)
+#   cluster.c_h2gw.http2.streams_active    == 0   (at quiesce)
+#   cluster.c_h2gw.http2.rx_reset          == 1   (one backend RST_STREAM)
+#   cluster.c_h2gw.http2.tx_reset          == 1   (one upstream CANCEL)
+#
+# Per D-H2B-CXSTATS only the counters BOTH sides emit are scraped/asserted —
+# upstream_cx_http2_total, upstream_cx_active, http2.streams_active,
+# http2.rx_reset, http2.tx_reset. cx_close_notify / cx_destroy_local are NOT
+# asserted (envoy-go does not emit them). CONFIRMED in-task by scraping the
+# subject's /stats for the c_h2gw cluster — envoy-go registers exactly
+# upstream_cx_total, upstream_cx_active, upstream_cx_http2_total,
+# http2.streams_active, http2.rx_reset, http2.tx_reset for a useH2 cluster
+# (internal/cluster/manager.go); no cx_close_notify / cx_destroy_local.
+#
+# # Topology — one cluster, one backend
+#
+#   - cluster c_h2gw: h2c upstream (no transport_socket, ADR-0166) +
+#     typed_extension_protocol_options http2_protocol_options
+#     { max_concurrent_streams: 100 }. C=100 is HIGH so it NEVER binds: a single
+#     held stream + the control request share ONE upstream conn — the rotation is
+#     about conn IDENTITY (the GOAWAY drives the multi-conn count), not the local
+#     stream cap. Subject STATIC/127.0.0.1; reference STRICT_DNS/
+#     host.docker.internal (the shared-bridge shape, reference_docker_probe_bridge_network).
+#   - backend: 1 H2GoawayResponder (BackendKind 38) — a raw-framer h2c responder
+#     advertising SETTINGS_MAX_CONCURRENT_STREAMS=1000 >> C that HOLDS each request
+#     stream and, on control requests, BROADCASTS /__release (200 to every held
+#     stream on every live conn — so a held stream on a DRAINING conn still drains,
+#     since the proxy never routes a new request to a draining conn), emits a
+#     per-conn GOAWAY(NO_ERROR) on /__goaway (graceful drain; conn stays open), and
+#     a per-conn RST_STREAM(INTERNAL_ERROR) on the lowest held stream on /__rst
+#     (answering the control 200 FIRST so the conn-eviction does not race it).
+#
+# Two routes select c_h2gw: /tx → c_h2gw WITH retry_policy
+# { per_try_timeout: 0.5s, num_retries: 0 } (the tx_reset prong), and /* →
+# c_h2gw with no timeout (everything else, incl. the control paths). Both target
+# the same cluster so the reset counters accrue on c_h2gw.
+#
+# # The six-stage barrier drive (SLEEPLESS — poll-to-converge + release-barrier; sequential-per-side)
+#
+# All work runs inside AssertStats, SUBJECT fully then REFERENCE
+# (reference_concurrency_differential_release_barrier). Synchronization is
+# poll-the-gauge until convergence + the backend's broadcast /__release — NEVER a
+# time.Sleep (the per_try_timeout in Step 5 IS the mechanism under test, not a sync
+# sleep). Control requests are routed THROUGH THE PROXY so they multiplex onto the
+# pooled upstream conn that holds the in-flight streams.
+#
+#   1. Establish      — fire 1 held GET / → poll upstream_cx_http2_total == 1 AND
+#                       http2.streams_active == 1 (the pool engaged; decode-ran).
+#   2. Drain in-flight — /__goaway through the proxy (rides the in-flight conn A →
+#                       A draining, admission-skipped); fire a 2nd held GET → MISSes
+#                       A → REPLACEMENT dial → poll upstream_cx_http2_total == 2
+#                       (the headline rotation count, pinned here from a 0 base);
+#                       /__release (broadcast) → both held drain to 200 → A closes
+#                       on its last release → poll http2.streams_active == 0 AND
+#                       upstream_cx_active == 1 (the replacement survives).
+#   3. Drain idle      — fire+release 1 GET / (conn idle), /__goaway → the per-conn
+#                       drain-watcher closes it PROMPTLY → poll upstream_cx_active
+#                       == 0 (no release drove it).
+#   4. rx_reset        — fire 1 held GET /, /__rst on it → poll http2.rx_reset == 1
+#                       + the DOWNSTREAM request observes a 502 (assert the
+#                       DOWNSTREAM class, not the upstream class —
+#                       reference_concurrent_attempt_downstream_class_assertion).
+#   5. tx_reset        — fire 1 held GET /tx/ (per_try_timeout route) → the per-try
+#                       timeout cancels the upstream attempt ctx → the codec emits
+#                       RST_STREAM(CANCEL) → poll http2.tx_reset == 1 + a downstream
+#                       504. (envoy-go has NO downstream-cancel→upstream-cancel
+#                       propagation — the H2 server dispatches on the conn-level
+#                       ctx — so per_try_timeout is the faithful tx_reset trigger;
+#                       the reference emits the same upstream CANCEL on a per-try
+#                       timeout, so the count stays cross-side EXACT.)
+#   6. Quiesce         — /__release (broadcast) → remaining held drain → poll
+#                       http2.streams_active == 0 (the /__release control request
+#                       itself leaves one idle pooled conn, so upstream_cx_active
+#                       settles to 1 here — the cx_active==0 close was observed at
+#                       the idle-drain prong, Step 3).
+#
+# # Asserted stats (cross-side EXACT on both sides)
+#
+#   cluster.c_h2gw.upstream_cx_http2_total == 2 (after one rotation; pinned at Step 2)
+#   cluster.c_h2gw.http2.streams_active    == 1 held → 0 at each drain/quiesce
+#   cluster.c_h2gw.upstream_cx_active      == 1 (in-flight drain settle) then 0 (idle drain)
+#   cluster.c_h2gw.http2.rx_reset          == 1 (one backend RST_STREAM)
+#   cluster.c_h2gw.http2.tx_reset          == 1 (one upstream CANCEL)
+#   plus DOWNSTREAM: the rx_reset prong's single 5xx (502) + the tx_reset prong's
+#   504; all other held requests drain to 200.
+#
+# # Deliberate non-assertions (recorded departures)
+#
+#   - The rx_reset prong's failure is observed from the DOWNSTREAM status (502),
+#     NOT upstream_rq_5xx (reference_concurrent_attempt_downstream_class_assertion).
+#   - upstream_cx_active is NOT pinned at quiesce (Step 6): the /__release control
+#     request leaves one idle pooled conn (no idle-timeout), so it settles to 1, not
+#     0 — the cx_active==0 close is proven at the idle-drain prong instead.
+#   - cx_close_notify / cx_destroy_local NOT asserted (envoy-go does not emit them
+#     — D-H2B-CXSTATS); the rotation is proven via upstream_cx_http2_total + the
+#     base upstream_cx_* lifecycle counters (no GOAWAY-named stat — AMEND-H2B-1).
+#   - The in-flight drain's held stream drains to 200 via the BROADCAST /__release;
+#     a per-conn release could not reach a held stream on the draining conn (the
+#     proxy never routes there), so the backend broadcasts (matching the SPEC live-
+#     probe backend + the kind-37 acceptH2Hold gate).
+#   - tx_reset is driven by per_try_timeout (not a raw downstream cancel) because
+#     envoy-go dispatches H2 downstream streams on the connection-level ctx with no
+#     per-stream cancel propagation; the per_try_timeout is the only faithful
+#     upstream-CANCEL trigger and is cross-side EXACT.
+#
+# response-body: byte-exact required, but over the fixed "READY\n" Drive stream
+# ONLY (address-independent → byte-equal). The held/control bodies run inside
+# AssertStats and are asserted there (status classes), not byte-compared (the
+# H2GoawayResponder answers BODYLESS 200s — no host-attribution body).
+#
+# response-status: the rx_reset prong's 502 + the tx_reset prong's 504 are observed
+# in AssertStats; NOT part of the byte-compared "READY\n" stream.
+# response-headers / response-trailers: N/A beyond the phase-04 allow-list.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses path.
+#
+# Non-additions: NO new BackendKind (H2GoawayResponder = 38 landed at Task 7; this
+# task extended its /__release to a process-global broadcast). NO DistributionAsserter.
+response-body:
+  applicable: true
+  scope: byte-exact

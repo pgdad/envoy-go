@@ -1668,6 +1668,22 @@ func TestRegisterClusterMetrics_H2Stats(t *testing.T) {
 		if hasMetric(reg, "cluster.c_h2s.upstream_cx_http2_active") {
 			t.Error("cluster.c_h2s.upstream_cx_http2_active registered but must NOT exist (AMEND-H2-2)")
 		}
+
+		// Phase 43.2b (ADR-0254, AMEND-H2B-2): the 2 reset counters
+		// http2.rx_reset + http2.tx_reset are useH2-gated and wired from the
+		// codec via h2.WithResetHooks at dial. Handles bound + names present.
+		if cl.http2RxReset == nil {
+			t.Error("http2RxReset is nil; want non-nil after registerClusterMetrics (H2 cluster)")
+		}
+		if cl.http2TxReset == nil {
+			t.Error("http2TxReset is nil; want non-nil after registerClusterMetrics (H2 cluster)")
+		}
+		if !hasMetric(reg, "cluster.c_h2s.http2.rx_reset") {
+			t.Error("cluster.c_h2s.http2.rx_reset not registered (H2 cluster)")
+		}
+		if !hasMetric(reg, "cluster.c_h2s.http2.tx_reset") {
+			t.Error("cluster.c_h2s.http2.tx_reset not registered (H2 cluster)")
+		}
 	})
 
 	t.Run("non_h2_cluster_has_no_h2_stats", func(t *testing.T) {
@@ -1676,17 +1692,32 @@ func TestRegisterClusterMetrics_H2Stats(t *testing.T) {
 		c := mkStaticCluster("c_h1s", mkLbEndpoint("10.0.0.1", 8080))
 		// No TypedExtensionProtocolOptions → useH2 = false.
 		reg := stats.NewRegistry()
-		if _, err := NewManagerWithBaseDir(mkBootstrap(c), "", reg); err != nil {
+		m, err := NewManagerWithBaseDir(mkBootstrap(c), "", reg)
+		if err != nil {
 			t.Fatalf("NewManagerWithBaseDir: %v", err)
 		}
 		for _, name := range []string{
 			"cluster.c_h1s.upstream_cx_http2_total",
 			"cluster.c_h1s.http2.streams_active",
 			"cluster.c_h1s.upstream_cx_http2_active",
+			// Phase 43.2b (ADR-0254): the reset counters are useH2-gated too.
+			"cluster.c_h1s.http2.rx_reset",
+			"cluster.c_h1s.http2.tx_reset",
 		} {
 			if hasMetric(reg, name) {
 				t.Errorf("non-H2 cluster must NOT register %q (byte-stability)", name)
 			}
+		}
+		// The handles must stay nil on a non-H2 cluster.
+		cl, ok := m.Get("c_h1s")
+		if !ok {
+			t.Fatal("cluster c_h1s not found")
+		}
+		if cl.http2RxReset != nil {
+			t.Error("http2RxReset must be nil on a non-H2 cluster (byte-stability)")
+		}
+		if cl.http2TxReset != nil {
+			t.Error("http2TxReset must be nil on a non-H2 cluster (byte-stability)")
 		}
 	})
 }

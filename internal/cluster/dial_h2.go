@@ -77,7 +77,8 @@ func (c *Cluster) dialPooledH2To(ctx context.Context, ep Endpoint, release func(
 		// paths (its ownPermit contract).
 		return nil, fmt.Errorf("cluster: dial h2: %w", err)
 	}
-	cc, _, ferr := c.h2ConnFromDialed(ctx, raw, ep)
+	cc, _, ferr := c.h2ConnFromDialed(ctx, raw, ep,
+		h2.WithResetHooks(c.h2RxResetInc, c.h2TxResetInc))
 	if ferr != nil {
 		// h2ConnFromDialed Closed the connWithGauge wrapper on its failure paths
 		// (connDec → release + releaseConn), so both are already freed.
@@ -93,7 +94,7 @@ func (c *Cluster) dialPooledH2To(ctx context.Context, ep Endpoint, release func(
 // permit for the dialPooledH2To caller, and Dec's upstream_cx_active for both
 // callers). Factored out of DialH2 verbatim so DialH2 and dialPooledH2To share
 // one finalization (phase 43.2a, ADR-0253).
-func (c *Cluster) h2ConnFromDialed(ctx context.Context, raw net.Conn, ep Endpoint) (*h2.ClientConn, Endpoint, error) {
+func (c *Cluster) h2ConnFromDialed(ctx context.Context, raw net.Conn, ep Endpoint, opts ...h2.ClientConnOption) (*h2.ClientConn, Endpoint, error) {
 	// Phase 06.1 Task 9: Cluster.Dial wraps every successful dial in a
 	// *connWithGauge whose Close Decs the upstream_cx_active gauge. We pass
 	// the WRAPPER (not any unwrapped inner conn) into h2.NewClientConn so
@@ -130,7 +131,7 @@ func (c *Cluster) h2ConnFromDialed(ctx context.Context, raw net.Conn, ep Endpoin
 	// Plaintext h2c (c.upstreamCfg == nil): no TLS, no ALPN — h2.NewClientConn
 	// drives the preface + initial SETTINGS exchange over the raw conn per
 	// RFC 7540 §3.4.
-	cc, err := h2.NewClientConn(ctx, wrapped)
+	cc, err := h2.NewClientConn(ctx, wrapped, opts...)
 	if err != nil {
 		_ = wrapped.Close()
 		return nil, ep, fmt.Errorf("cluster: dial h2: client conn: %w", err)

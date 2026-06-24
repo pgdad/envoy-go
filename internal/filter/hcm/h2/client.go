@@ -83,6 +83,24 @@ type ClientConn struct {
 	// DATA case), so no separate mutex.
 	recvDebitSinceLastUpdate int32
 	goawaySent               bool // true after we've emitted our own GOAWAY
+	// onRxReset / onTxReset are nil-guarded behavioral hooks fired when this conn
+	// RECEIVES (dispatchFrame RSTStreamFrame) / SENDS (RoundTrip ctx.Done CANCEL)
+	// a RST_STREAM. The cluster pool wires them to its http2.rx_reset / tx_reset
+	// counters at dial (WithResetHooks); nil for non-pooled conns. The codec stays
+	// stats-agnostic (no internal/stats import). (phase 43.2b, ADR-0254)
+	onRxReset func()
+	onTxReset func()
+}
+
+// ClientConnOption configures a ClientConn at construction, applied BEFORE the
+// readLoop goroutine starts (so hook fields are race-free). (phase 43.2b)
+type ClientConnOption func(*ClientConn)
+
+// WithResetHooks installs the RST_STREAM rx/tx behavioral hooks. Either may be
+// nil. The pool passes cluster-counter increments; the codec fires them
+// nil-guarded at its existing RST sites. (phase 43.2b, ADR-0254)
+func WithResetHooks(onRx, onTx func()) ClientConnOption {
+	return func(cc *ClientConn) { cc.onRxReset = onRx; cc.onTxReset = onTx }
 }
 
 // clientStream is the per-stream state for a single in-flight RoundTrip.
@@ -150,7 +168,7 @@ func (cs *clientStream) finish(err error) {
 //
 // NewClientConn does NOT take ownership of upstream's TLS handshake — the
 // caller (Cluster.DialH2) is expected to have verified ALPN h2 already.
-func NewClientConn(ctx context.Context, upstream net.Conn) (*ClientConn, error) {
+func NewClientConn(ctx context.Context, upstream net.Conn, opts ...ClientConnOption) (*ClientConn, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	cc := &ClientConn{
 		ctx:           ctx,
@@ -164,6 +182,11 @@ func NewClientConn(ctx context.Context, upstream net.Conn) (*ClientConn, error) 
 		nextStreamID:  0, // atomic increments by 2; first stream allocates 1
 		goawayCh:      make(chan struct{}),
 		settingsAckCh: make(chan struct{}),
+	}
+	// Apply options BEFORE any framer write / readLoop spawn so the hook fields
+	// are written-once-at-construction and never race the readLoop goroutine.
+	for _, o := range opts {
+		o(cc)
 	}
 	// Step 1: write the client preface.
 	if _, err := upstream.Write(clientPrefaceBytes); err != nil {
@@ -392,6 +415,12 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 			return nil // stream gone; ignore
 		}
 		cs.finish(streamError(ErrCode(fr.ErrCode), fr.StreamID, "client: peer RST_STREAM"))
+		// Fired per RST_STREAM frame, not per stream-lifetime; exactly-once holds
+		// for a conformant peer (<=1 RST/stream) since finish is idempotent and
+		// RoundTrip's defer removes the stream-map entry once it returns.
+		if cc.onRxReset != nil {
+			cc.onRxReset()
+		}
 		return nil
 
 	case *http2.WindowUpdateFrame:
@@ -536,6 +565,11 @@ func (cc *ClientConn) RoundTrip(ctx context.Context, req H2Request) (H2Response,
 		cc.mu.Lock()
 		_ = cc.fr.WriteRSTStream(id, http2.ErrCodeCancel)
 		cc.mu.Unlock()
+		// Fire the tx hook OUTSIDE cc.mu (after unlock) so we never hold the
+		// codec mutex across an arbitrary cluster callback. (phase 43.2b)
+		if cc.onTxReset != nil {
+			cc.onTxReset()
+		}
 		return H2Response{}, ctx.Err()
 	case <-cc.ctx.Done():
 		return H2Response{}, fmt.Errorf("h2: client: conn closed mid-RoundTrip: %w", cc.ctx.Err())
@@ -612,6 +646,32 @@ func (cc *ClientConn) writeData(ctx context.Context, cs *clientStream, b []byte,
 // h2 pool's admission scan skips a Closed conn; the pool evicts+Closes a
 // Closed conn once its last in-flight stream drains. (phase 43.2a, ADR-0253)
 func (cc *ClientConn) Closed() bool { return cc.ctx.Err() != nil }
+
+// GoneAway reports whether this connection has observed a peer GOAWAY (its
+// goawayCh has been closed by dispatchFrame's GoAwayFrame case). It is a
+// non-blocking read of the closed state — distinct from Closed(): a GOAWAY'd
+// conn keeps serving its in-flight streams (the ctx is NOT canceled) until
+// they drain, so Closed() stays false while GoneAway() is true. The h2 pool's
+// admission scan skips a GoneAway conn (takes no new streams) and evicts+Closes
+// it once its last in-flight stream drains. (phase 43.2b, ADR-0254)
+func (cc *ClientConn) GoneAway() bool {
+	select {
+	case <-cc.goawayCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// GoneAwayCh returns the channel closed when a peer GOAWAY is observed, for the
+// pool's per-conn drain-watcher to select on. (phase 43.2b, ADR-0254)
+func (cc *ClientConn) GoneAwayCh() <-chan struct{} { return cc.goawayCh }
+
+// Done returns the conn-lifetime ctx's Done channel, closed when the conn is
+// torn down (Close or a transport error cancels cc.ctx). The drain-watcher
+// selects on it as the "evicted by another path → exit" signal (so the watcher
+// never leaks when a conn is evicted before any GOAWAY arrives). (phase 43.2b)
+func (cc *ClientConn) Done() <-chan struct{} { return cc.ctx.Done() }
 
 // Close emits a graceful GOAWAY(NO_ERROR) with the highest allocated stream
 // id as last-stream-id and closes the underlying conn. Idempotent — safe to

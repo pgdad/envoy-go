@@ -159,6 +159,15 @@ type Cluster struct {
 	// is NO upstream_cx_http2_active. (phase 43.2a, ADR-0253)
 	upstreamCxHTTP2Total *stats.Counter
 
+	// http2RxReset / http2TxReset are the cluster.<name>.http2.rx_reset /
+	// .http2.tx_reset counters — ++ per RST_STREAM the upstream codec RECEIVES /
+	// SENDS (the FIRST codec→cluster stat wiring; the pool injects these via
+	// h2.WithResetHooks at dial). Registered useH2-gated; nil for non-H2 clusters
+	// (the h2pool helpers nil-guard). NO http2.goaway_sent / stream_refused_errors
+	// (AMEND-H2B-3). (phase 43.2b, ADR-0254)
+	http2RxReset *stats.Counter
+	http2TxReset *stats.Counter
+
 	// health is the per-cluster active-HC registry (ADR-0243). nil for a cluster
 	// with no health_checks. Built + threaded into the LB constructs in
 	// buildCluster; consumed in registerClusterMetrics (stat injection) +
