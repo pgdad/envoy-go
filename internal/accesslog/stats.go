@@ -14,3 +14,13 @@ import "github.com/esalaine/envoy-go/internal/stats"
 func RegisterDroppedCounter(reg *stats.Registry) *stats.Counter {
 	return reg.NewCounter("server.accesslog_dropped")
 }
+
+// RegisterGrpcSinkCounters allocates the two process-global gRPC-ALS sink
+// counters (ADR-0255 / AMEND-ALS-1). Registered once per process when ≥1 gRPC
+// ALS sink is built. STATIC names (no IsValidName guard — not wire/config
+// derived). NOT a reuse of server.accesslog_dropped — the gRPC sink owns its
+// own logs_dropped.
+func RegisterGrpcSinkCounters(reg *stats.Registry) (written, dropped *stats.Counter) {
+	return reg.NewCounter("access_logs.grpc_access_log.logs_written"),
+		reg.NewCounter("access_logs.grpc_access_log.logs_dropped")
+}

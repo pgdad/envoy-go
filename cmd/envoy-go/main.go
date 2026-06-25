@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/admin"
 	"github.com/esalaine/envoy-go/internal/bootstrap"
@@ -48,6 +50,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/http/wasm"
 	network "github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/filter/network/builtins"
+	"github.com/esalaine/envoy-go/internal/grpcclient"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
@@ -111,6 +114,29 @@ func main() {
 			log.Fatalf("accesslog: open %q: %v", cfg.Path, err)
 		}
 		sinks = append(sinks, sink)
+	}
+	// Phase 44.1 (ADR-0255): build one GrpcAccessLogSink per gRPC-ALS
+	// access_log[] entry parsed by bootstrap.Load. The two sink counters
+	// (access_logs.grpc_access_log.*) register once iff ≥1 ALS sink exists. A
+	// single shared grpcclient.Dialer rides the cluster manager; the node is a
+	// minimal node (Id + Cluster) built from the bootstrap node proto (D-ALS-NODE;
+	// UNasserted). Each sink is appended
+	// to the same `sinks` slice BEFORE the defer below, whose closure captures the
+	// slice variable — so the defer-LIFO Close() already covers the ALS sinks
+	// (GrpcAccessLogSink.Close releases its ALSClient's *grpc.ClientConn). An
+	// unknown / non-HTTP2 ALS cluster surfaces here as a fatal at sink build (the
+	// Dialer's dial-time gate), matching the existing file-sink open-failure idiom.
+	if len(bs.ALSConfigs) > 0 {
+		dialer := grpcclient.New(cm)
+		written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
+		node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
+		for _, cfg := range bs.ALSConfigs {
+			client, err := grpcclient.NewALSClient(dialer, cfg.ClusterName)
+			if err != nil {
+				log.Fatalf("accesslog: gRPC ALS client for cluster %q: %v", cfg.ClusterName, err)
+			}
+			sinks = append(sinks, accesslog.NewGrpcAccessLogSink(client, cfg.LogName, node, written, dropped))
+		}
 	}
 	defer func() {
 		for _, s := range sinks {

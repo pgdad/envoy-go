@@ -47,6 +47,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"strings"
@@ -60,6 +61,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -816,5 +818,205 @@ func TestAuthClient_Close_NilSafe(t *testing.T) {
 	var ac *AuthClient
 	if err := ac.Close(); err != nil {
 		t.Errorf("nil AuthClient Close: err = %v; want nil", err)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// In-process gRPC ALS (AccessLogService) server — Task 4 (ALSClient).
+//
+// Task 9's `test/helpers/accessloggrpc` receiver is NOT yet landed, so the
+// StreamAccessLogs smoke test stands up a BARE in-test AccessLogService server
+// here: a no-op stub that drains `Recv()` until EOF then `SendAndClose`s an
+// empty `StreamAccessLogsResponse`. Mirrors `startTestAuthServer` (TLS-fronted,
+// ALPN h2) so the same `mkH2ClusterMgr` builder wires a cluster to it.
+// ----------------------------------------------------------------------------
+
+// fakeALSServer implements `accesslogv3.AccessLogServiceServer`. StreamAccessLogs
+// drains the client stream until EOF then closes with an empty response.
+type fakeALSServer struct {
+	accesslogv3.UnimplementedAccessLogServiceServer
+}
+
+func (f *fakeALSServer) StreamAccessLogs(stream accesslogv3.AccessLogService_StreamAccessLogsServer) error {
+	for {
+		_, err := stream.Recv()
+		if err == io.EOF {
+			return stream.SendAndClose(&accesslogv3.StreamAccessLogsResponse{})
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// startTestALSServer starts a TLS-fronted `*grpc.Server` on a loopback port
+// with ALPN h2; registers a `fakeALSServer`. Returns the bound port and a
+// `stop` func (calls `GracefulStop`). Mirrors `startTestAuthServer`.
+func startTestALSServer(t testing.TB, pki *authTestPKI) (uint32, func()) {
+	t.Helper()
+	pair, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
+	if err != nil {
+		t.Fatalf("server keypair: %v", err)
+	}
+	cfg := &stdtls.Config{
+		Certificates: []stdtls.Certificate{pair},
+		NextProtos:   []string{"h2"},
+		MinVersion:   stdtls.VersionTLS12,
+		MaxVersion:   stdtls.VersionTLS13,
+	}
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("listen tls: %v", err)
+	}
+	s := grpc.NewServer()
+	accesslogv3.RegisterAccessLogServiceServer(s, &fakeALSServer{})
+	go func() {
+		_ = s.Serve(ln)
+	}()
+	port := uint32(ln.Addr().(*net.TCPAddr).Port)
+	stop := func() {
+		s.GracefulStop()
+		_ = ln.Close()
+	}
+	return port, stop
+}
+
+// ----------------------------------------------------------------------------
+// Group 4 — ALSClient surface (Task 4) — the EXACT AuthClient analog for the
+// Access Log Service (ADR-0255 / ADR-0158 precedent).
+// ----------------------------------------------------------------------------
+
+// TestALSClient_NewALSClient_NilDialer verifies a nil `*Dialer` errors with the
+// cluster name named (mirrors NewAuthClient's nil-dialer guard).
+func TestALSClient_NewALSClient_NilDialer(t *testing.T) {
+	t.Parallel()
+	c, err := NewALSClient(nil, "c_als")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewALSClient(nil): err = nil; want non-nil")
+	}
+	if c != nil {
+		t.Errorf("NewALSClient(nil): c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_als") {
+		t.Errorf("NewALSClient(nil) err = %q; want substring %q", err.Error(), "c_als")
+	}
+}
+
+// TestALSClient_NewALSClient_UnknownCluster verifies the DialContext
+// unknown-cluster PARSE-REJECT propagates through NewALSClient, naming the
+// cluster.
+func TestALSClient_NewALSClient_UnknownCluster(t *testing.T) {
+	t.Parallel()
+	mgr := mkPlainClusterMgr(t, "c_other", 9999) // wrong name → unknown-cluster
+	d := New(mgr)
+
+	c, err := NewALSClient(d, "c_missing")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewALSClient: err = nil; want unknown-cluster PARSE-REJECT")
+	}
+	if c != nil {
+		t.Errorf("NewALSClient: c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_missing") {
+		t.Errorf("NewALSClient err = %q; want substring %q", err.Error(), "c_missing")
+	}
+	if !strings.Contains(err.Error(), "unknown cluster") {
+		t.Errorf("NewALSClient err = %q; want substring %q", err.Error(), "unknown cluster")
+	}
+}
+
+// TestALSClient_NewALSClient_NonH2Cluster verifies a cluster WITHOUT
+// http2_protocol_options{} errors via the DialContext UseH2() gate.
+func TestALSClient_NewALSClient_NonH2Cluster(t *testing.T) {
+	t.Parallel()
+	mgr := mkPlainClusterMgr(t, "c_plain", 9999) // UseH2() == false
+	d := New(mgr)
+
+	c, err := NewALSClient(d, "c_plain")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewALSClient: err = nil; want non-H2 PARSE-REJECT")
+	}
+	if c != nil {
+		t.Errorf("NewALSClient: c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_plain") {
+		t.Errorf("NewALSClient err = %q; want substring %q", err.Error(), "c_plain")
+	}
+	if !strings.Contains(err.Error(), "HTTP/2 framing") {
+		t.Errorf("NewALSClient err = %q; want substring %q", err.Error(), "HTTP/2 framing")
+	}
+}
+
+// TestALSClient_Close_Idempotent verifies the sync.Once-guarded Close against a
+// valid H2 cluster: repeated Close() returns the same (nil) error, no panic.
+func TestALSClient_Close_Idempotent(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	port, stop := startTestALSServer(t, pki)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_als", port)
+	d := New(mgr)
+
+	c, err := NewALSClient(d, "c_als")
+	if err != nil {
+		t.Fatalf("NewALSClient: %v", err)
+	}
+
+	err1 := c.Close()
+	err2 := c.Close()
+	err3 := c.Close()
+	if (err1 == nil) != (err2 == nil) || (err2 == nil) != (err3 == nil) {
+		t.Errorf("Close idempotency: err1=%v, err2=%v, err3=%v; want all equal", err1, err2, err3)
+	}
+	if err1 != nil && (err1.Error() != err2.Error() || err2.Error() != err3.Error()) {
+		t.Errorf("Close idempotency: err1=%q, err2=%q, err3=%q; want all equal", err1, err2, err3)
+	}
+}
+
+// TestALSClient_StreamAccessLogs_ReturnsStream verifies that against a valid H2
+// cluster wired to the in-test AccessLogService server, StreamAccessLogs opens
+// a non-nil client-streaming RPC whose Send succeeds.
+func TestALSClient_StreamAccessLogs_ReturnsStream(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	port, stop := startTestALSServer(t, pki)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_als", port)
+	d := New(mgr)
+
+	c, err := NewALSClient(d, "c_als")
+	if err != nil {
+		t.Fatalf("NewALSClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stream, err := c.StreamAccessLogs(ctx)
+	if err != nil {
+		t.Fatalf("StreamAccessLogs: %v", err)
+	}
+	if stream == nil {
+		t.Fatalf("StreamAccessLogs: nil stream")
+	}
+	if err := stream.Send(&accesslogv3.StreamAccessLogsMessage{}); err != nil {
+		t.Fatalf("stream.Send: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("stream.CloseAndRecv: %v", err)
+	}
+}
+
+// TestALSClient_Close_NilSafe verifies Close() on a nil *ALSClient is a no-op
+// returning nil (mirrors AuthClient.Close nil-tolerance).
+func TestALSClient_Close_NilSafe(t *testing.T) {
+	t.Parallel()
+	var c *ALSClient
+	if err := c.Close(); err != nil {
+		t.Errorf("nil ALSClient Close: err = %v; want nil", err)
 	}
 }

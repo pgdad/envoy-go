@@ -457,6 +457,280 @@ func TestBootstrap_AccessLog_StdoutSilentlyIgnored(t *testing.T) {
 	}
 }
 
+// grpcALSType is the typed_config @type for the gRPC HTTP access logger.
+const grpcALSType = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.HttpGrpcAccessLogConfig"
+
+// TestBootstrap_ALS_AcceptMinimal verifies a minimal HttpGrpcAccessLogConfig
+// (log_name + envoy_grpc.cluster_name) parses into exactly one ALSConfig with
+// the cluster name and log name carried through.
+func TestBootstrap_ALS_AcceptMinimal(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "mylog"}); got != want {
+		t.Errorf("ALSConfigs[0]: got %+v, want %+v", got, want)
+	}
+}
+
+// TestBootstrap_ALS_AcceptEmptyLogName verifies an omitted log_name is valid
+// and yields ALSConfig.LogName == "".
+func TestBootstrap_ALS_AcceptEmptyLogName(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: ""}); got != want {
+		t.Errorf("ALSConfigs[0]: got %+v, want %+v", got, want)
+	}
+}
+
+// TestBootstrap_ALS_AcceptInertBuffer verifies buffer_size_bytes /
+// buffer_flush_interval are PARSE-ACCEPTED-but-INERT at 44.1 (the bootstrap
+// boots and yields one ALSConfig).
+func TestBootstrap_ALS_AcceptInertBuffer(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                        buffer_size_bytes: 16384
+                        buffer_flush_interval: 1s`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+}
+
+// TestBootstrap_ALS_AcceptInertHeaders verifies
+// additional_request_headers_to_log is PARSE-ACCEPTED-but-INERT at 44.1.
+func TestBootstrap_ALS_AcceptInertHeaders(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                      additional_request_headers_to_log: [x-foo]`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+}
+
+// TestBootstrap_ALS_AcceptTransportV3 verifies an explicit transport_api_version
+// of V3 is accepted.
+func TestBootstrap_ALS_AcceptTransportV3(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        transport_api_version: V3
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+}
+
+// TestBootstrap_ALS_AcceptTransportAUTO verifies an omitted transport_api_version
+// (AUTO == 0) is accepted.
+func TestBootstrap_ALS_AcceptTransportAUTO(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+}
+
+// TestBootstrap_ALS_RejectGoogleGrpc verifies that a google_grpc grpc_service
+// is rejected (only envoy_grpc is supported), with a bootstrap:-prefixed error
+// naming google_grpc.
+func TestBootstrap_ALS_RejectGoogleGrpc(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          google_grpc:
+                            target_uri: 127.0.0.1:50051
+                            stat_prefix: als`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for google_grpc, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap:") {
+		t.Errorf("error should be bootstrap:-prefixed: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "google_grpc") {
+		t.Errorf("error should name google_grpc: %q", err.Error())
+	}
+}
+
+// TestBootstrap_ALS_RejectTransportV2 verifies transport_api_version V2 is
+// rejected (envoy-go is V3-only).
+func TestBootstrap_ALS_RejectTransportV2(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        transport_api_version: V2
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for transport_api_version V2, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap:") {
+		t.Errorf("error should be bootstrap:-prefixed: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "V2") {
+		t.Errorf("error should name V2: %q", err.Error())
+	}
+}
+
+// TestBootstrap_ALS_RejectEmptyCluster verifies an empty envoy_grpc.cluster_name
+// is rejected.
+func TestBootstrap_ALS_RejectEmptyCluster(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: ""`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for empty cluster_name, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap:") {
+		t.Errorf("error should be bootstrap:-prefixed: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "cluster_name") {
+		t.Errorf("error should name cluster_name: %q", err.Error())
+	}
+}
+
+// tcpGrpcALSType is the @type for the TCP gRPC access logger, STRICT-REJECTED at
+// boot per ADR-0080 (envoy-go supports HTTP gRPC ALS only).
+const tcpGrpcALSType = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig"
+
+// TestBootstrap_ALS_RejectTcpGrpc verifies that a TcpGrpcAccessLogConfig is
+// STRICT-REJECTED at boot (ADR-0080) rather than silently ignored. The
+// common_config is otherwise valid so the ONLY reason to reject is the
+// unsupported TCP ALS type.
+func TestBootstrap_ALS_RejectTcpGrpc(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.tcp_grpc
+                    typed_config:
+                      "@type": ` + tcpGrpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for TcpGrpcAccessLogConfig, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap:") {
+		t.Errorf("error should be bootstrap:-prefixed: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "TCP") {
+		t.Errorf("error should name TCP ALS as unsupported: %q", err.Error())
+	}
+}
+
+// TestBootstrap_ALS_CoexistWithFile verifies a file access_log and a gRPC
+// access_log in the SAME HCM populate the two parallel slices independently
+// (AccessLogConfigs for the file sink, ALSConfigs for the gRPC sink).
+func TestBootstrap_ALS_CoexistWithFile(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access.log
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.AccessLogConfigs); got != 1 {
+		t.Errorf("AccessLogConfigs: got %d, want 1", got)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Errorf("ALSConfigs: got %d, want 1", got)
+	}
+}
+
 // TestBootstrap_AccessLog_NoEntriesIsValid verifies that an HCM with no
 // access_log entries (missing field) parses successfully with an empty
 // AccessLogConfigs slice.

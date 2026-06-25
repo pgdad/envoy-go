@@ -56,6 +56,7 @@ import (
 	"sync"
 	"time"
 
+	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -229,6 +230,79 @@ func (a *AuthClient) Check(ctx context.Context, req *authv3.CheckRequest) (*auth
 // `*grpc.ClientConn` is leaked-on-exit; the OS reclaims it. `Close()` exists
 // primarily for the Group 3 unit tests and for future hot-reload phases.
 func (a *AuthClient) Close() error {
+	if a == nil {
+		return nil
+	}
+	a.closeOnce.Do(func() {
+		if a.conn != nil {
+			a.closeErr = a.conn.Close()
+		}
+	})
+	return a.closeErr
+}
+
+// ----------------------------------------------------------------------------
+// ALSClient — the typed AccessLogService/StreamAccessLogs wrapper (ADR-0255).
+// ----------------------------------------------------------------------------
+
+// ALSClient wraps a *grpc.ClientConn with the typed
+// envoy.service.accesslog.v3.AccessLogServiceClient stub. One *ALSClient per
+// gRPC-ALS sink (cluster_name), owned by the GrpcAccessLogSink and Close()d at
+// sink close. The AuthClient precedent (ADR-0158); StreamAccessLogs opens the
+// client-streaming RPC the sink's writer goroutine drives.
+//
+// Concurrency: a *ALSClient is safe for concurrent use — the underlying
+// *grpc.ClientConn is goroutine-safe per the gRPC library. (Each
+// StreamAccessLogs call opens a distinct client stream; an individual
+// AccessLogService_StreamAccessLogsClient is NOT itself concurrency-safe and is
+// driven by a single writer goroutine per the sink's discipline.)
+type ALSClient struct {
+	conn   *grpc.ClientConn
+	stub   accesslogv3.AccessLogServiceClient
+	target string // cluster_name — for logs/errors
+
+	// closeOnce + closeErr guard the idempotent Close (the AuthClient precedent).
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// NewALSClient dials the named cluster via d.DialContext and wraps the
+// resulting *grpc.ClientConn in a typed ALSClient. Unlike NewAuthClient there
+// is no per-call timeout param — the ALS streaming RPC is long-lived and bounded
+// by the caller's context per the sink's lifecycle.
+//
+// On dial error, NewALSClient returns (nil, err) — the dial error is passed
+// through verbatim (already includes the cluster name via DialContext's error
+// wrapping).
+func NewALSClient(d *Dialer, clusterName string) (*ALSClient, error) {
+	if d == nil {
+		return nil, fmt.Errorf("grpcclient: new ALS client %q: dialer is nil", clusterName)
+	}
+	conn, err := d.DialContext(context.Background(), clusterName)
+	if err != nil {
+		return nil, err
+	}
+	return &ALSClient{
+		conn:   conn,
+		stub:   accesslogv3.NewAccessLogServiceClient(conn),
+		target: clusterName,
+	}, nil
+}
+
+// StreamAccessLogs opens the client-streaming AccessLogService/StreamAccessLogs
+// RPC. The returned stream's lifetime is bounded by ctx; the sink's writer
+// goroutine drives Send + CloseAndRecv.
+func (a *ALSClient) StreamAccessLogs(ctx context.Context) (accesslogv3.AccessLogService_StreamAccessLogsClient, error) {
+	if a == nil || a.stub == nil {
+		return nil, errors.New("grpcclient: StreamAccessLogs: nil ALSClient / stub")
+	}
+	return a.stub.StreamAccessLogs(ctx)
+}
+
+// Close releases the underlying *grpc.ClientConn. Idempotent — repeated (or
+// concurrent) calls return the cached error from the first call via an internal
+// sync.Once guard (the AuthClient precedent).
+func (a *ALSClient) Close() error {
 	if a == nil {
 		return nil
 	}

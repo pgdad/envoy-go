@@ -7,7 +7,9 @@ import (
 
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	fileaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
+	grpcalv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 
 	// Blank-imported so the filter extension's proto descriptor is registered
@@ -38,6 +40,14 @@ import (
 	// these additions are documented in PROGRESS, not as a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/stream/v3"
+
+	// Phase 44.1 registers the gRPC-ALS access-logger extension proto so protojson
+	// round-trips bootstraps carrying HCM access_log[] HttpGrpcAccessLogConfig
+	// entries (ADR-0255). Registered transitively by the grpcalv3 typed import
+	// above; the explicit blank-import here mirrors the file/v3 pattern and makes
+	// the dependency obvious to bootstrap-side readers. Per ADR-0016 amendment
+	// policy this addition is documented in PROGRESS, not as a new ADR.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
 
 	// Phase 07.1 (Task 20) registers the cors HTTP filter extension proto so
 	// protojson round-trips bootstraps that carry
@@ -129,6 +139,7 @@ import (
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/thrift_proxy/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"gopkg.in/yaml.v3"
 
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -143,6 +154,17 @@ const (
 	// (envoy.access_loggers.file). Used in access_log[] typed_config
 	// type-switching per ADR-0067.
 	fileAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"
+
+	// httpGrpcAccessLogTypeURL is the TypeURL for the gRPC HTTP access logger
+	// (envoy.access_loggers.http_grpc). Lifted from the ADR-0041 silent-ignore
+	// set at phase 44.1 (ADR-0255).
+	httpGrpcAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.HttpGrpcAccessLogConfig"
+
+	// tcpGrpcAccessLogTypeURL is the TypeURL for the TCP gRPC access logger
+	// (envoy.access_loggers.tcp_grpc). STRICT-REJECTED at boot (ADR-0080): TCP ALS
+	// is unsupported; silently ignoring it would drop a configured user's access
+	// logs with no signal (the ADR-0080 anti-silent-divergence rule).
+	tcpGrpcAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig"
 )
 
 // AccessLogConfig is the parsed-but-not-yet-opened representation of one
@@ -151,6 +173,16 @@ const (
 // only the parse-time data.
 type AccessLogConfig struct {
 	Path string
+}
+
+// ALSConfig is the parsed gRPC Access Log Service sink config from one HCM
+// access_log[] HttpGrpcAccessLogConfig entry (ADR-0255). The sink is built in
+// cmd/envoy-go/main.go after Load returns. buffer_*/additional_*_headers are
+// PARSE-ACCEPTED-but-INERT at 44.1 (honored at 44.2/44.3); only the two fields
+// below are consumed.
+type ALSConfig struct {
+	ClusterName string // common_config.grpc_service.envoy_grpc.cluster_name
+	LogName     string // common_config.log_name (empty is valid)
 }
 
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
@@ -175,6 +207,14 @@ type Bootstrap struct {
 	// parse time. Other typed_config types (stdout, tcp_grpc, open_telemetry)
 	// are silently ignored per the ADR-0041 amendment.
 	AccessLogConfigs []AccessLogConfig
+	// ALSConfigs is the parsed access_log[] gRPC Access Log Service sink entries
+	// from each HCM filter, in registration order across all listeners and HCM
+	// filters (parallel to AccessLogConfigs, which carries file-sink entries).
+	// Empty when no HttpGrpcAccessLogConfig access_log entries are configured.
+	// Per ADR-0255 only envoy_grpc.cluster_name (non-empty) + log_name are
+	// consumed; transport_api_version V2 and google_grpc are rejected at parse
+	// time; buffer_*/additional_*_headers are parse-accepted-but-inert at 44.1.
+	ALSConfigs []ALSConfig
 	// ConfigPath is the file path the bootstrap was loaded from. Set by the
 	// caller (cmd/envoy-go/main.go) post-Load via bs.ConfigPath = *cfgPath;
 	// Load itself leaves this empty (the bootstrap.Load API takes an io.Reader,
@@ -268,8 +308,14 @@ func parseOneAccessLog(al *accesslogv3.AccessLog, idx int, result *Bootstrap) er
 		// No typed_config — silently ignore.
 		return nil
 	}
+	if tc.GetTypeUrl() == httpGrpcAccessLogTypeURL {
+		return parseGrpcAccessLog(tc, idx, result)
+	}
+	if tc.GetTypeUrl() == tcpGrpcAccessLogTypeURL {
+		return fmt.Errorf("bootstrap: access_log[%d]: TCP gRPC ALS (TcpGrpcAccessLogConfig) is not supported (envoy-go supports HTTP gRPC ALS only)", idx)
+	}
 	if tc.GetTypeUrl() != fileAccessLogTypeURL {
-		// Non-file typed_config (stdout, tcp_grpc, open_telemetry, etc.) —
+		// Other non-file typed_config (stdout, tcp_grpc, open_telemetry, etc.) —
 		// silently ignored per ADR-0041 amendment / ADR-0067.
 		return nil
 	}
@@ -292,6 +338,35 @@ func parseOneAccessLog(al *accesslogv3.AccessLog, idx int, result *Bootstrap) er
 		return fmt.Errorf("bootstrap: access_log[%d]: path is required (must be a non-empty file path)", idx)
 	}
 	result.AccessLogConfigs = append(result.AccessLogConfigs, AccessLogConfig{Path: fal.GetPath()})
+	return nil
+}
+
+// parseGrpcAccessLog processes a single HttpGrpcAccessLogConfig access_log entry
+// and appends an ALSConfig to result.ALSConfigs (ADR-0255). It STRICT-REJECTS
+// transport_api_version V2 (envoy-go is V3-only), google_grpc grpc_service
+// (only envoy_grpc is supported), and an empty envoy_grpc.cluster_name.
+// buffer_*/additional_*_headers are parse-accepted-but-inert at 44.1.
+func parseGrpcAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
+	cfg := &grpcalv3.HttpGrpcAccessLogConfig{}
+	if err := proto.Unmarshal(tc.GetValue(), cfg); err != nil {
+		return fmt.Errorf("bootstrap: access_log[%d] grpc unmarshal: %w", idx, err)
+	}
+	common := cfg.GetCommonConfig()
+	if v := common.GetTransportApiVersion(); v == corev3.ApiVersion_V2 { //nolint:staticcheck // SA1019: this arm EXISTS to PARSE-REJECT the deprecated V2 transport; intentional access (ADR-0255, envoy-go is V3-only).
+		return fmt.Errorf("bootstrap: access_log[%d]: grpc ALS transport_api_version V2 is not supported (envoy-go is V3-only)", idx)
+	}
+	gs := common.GetGrpcService()
+	eg := gs.GetEnvoyGrpc()
+	if eg == nil {
+		return fmt.Errorf("bootstrap: access_log[%d]: grpc ALS requires grpc_service.envoy_grpc (google_grpc is not supported)", idx)
+	}
+	if eg.GetClusterName() == "" {
+		return fmt.Errorf("bootstrap: access_log[%d]: grpc ALS grpc_service.envoy_grpc.cluster_name is required (must be non-empty)", idx)
+	}
+	result.ALSConfigs = append(result.ALSConfigs, ALSConfig{
+		ClusterName: eg.GetClusterName(),
+		LogName:     common.GetLogName(),
+	})
 	return nil
 }
 
