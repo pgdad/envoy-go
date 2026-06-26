@@ -850,6 +850,290 @@ func TestBootstrap_ALS_CoexistWithFile(t *testing.T) {
 	}
 }
 
+// otlpALSType is the @type for the OpenTelemetry (OTLP) access logger. Lifted
+// from the ADR-0041 silent-ignore set at phase 45.1 (ADR-0258).
+const otlpALSType = "type.googleapis.com/envoy.extensions.access_loggers.open_telemetry.v3.OpenTelemetryAccessLogConfig"
+
+// TestBootstrap_OTLP table-drives the OpenTelemetryAccessLogConfig parse arm
+// (phase 45.1, ADR-0258): the accept cases assert exactly one OTLPConfig with
+// the expected field values; the reject cases assert a bootstrap:-prefixed error
+// naming the offending field plus the "OTLP access log" sink label and the
+// access_log[%d] index. The shared parseCommonGrpcAccessLogConfig helper carries
+// the V2/google_grpc/empty-cluster strict rejects (the existing
+// TestBootstrap_ALS_Reject* tests are the byte-stability green-guard for the
+// "grpc ALS" wording the same helper produces with sinkLabel="grpc ALS").
+func TestBootstrap_OTLP(t *testing.T) {
+	minimalCommon := `
+                      common_config:
+                        log_name: otel
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: otlp_cluster`
+	tests := []struct {
+		name    string
+		block   string
+		wantErr bool
+		errSubs []string
+		wantCfg *OTLPConfig
+	}{
+		{
+			name: "accept-minimal",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + minimalCommon,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 16384, BufferFlushInterval: time.Second, DisableBuiltinLabels: false},
+		},
+		{
+			name: "accept-empty-log_name",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: otlp_cluster`,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "", BufferSizeBytes: 16384, BufferFlushInterval: time.Second},
+		},
+		{
+			name: "accept-disable_builtin_labels",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      disable_builtin_labels: true` + minimalCommon,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 16384, BufferFlushInterval: time.Second, DisableBuiltinLabels: true},
+		},
+		{
+			name: "accept-buffer-fields",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        log_name: otel
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: otlp_cluster
+                        buffer_size_bytes: 8192
+                        buffer_flush_interval: 2s`,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 8192, BufferFlushInterval: 2 * time.Second},
+		},
+		{
+			name: "accept-buffer-zero",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        log_name: otel
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: otlp_cluster
+                        buffer_size_bytes: 0`,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 0, BufferFlushInterval: time.Second},
+		},
+		{
+			name:    "accept-flush-default",
+			block:   "\n                  - name: envoy.access_loggers.open_telemetry\n                    typed_config:\n                      \"@type\": " + otlpALSType + minimalCommon,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 16384, BufferFlushInterval: time.Second},
+		},
+		{
+			name: "accept-stat_prefix-inert",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      stat_prefix: myprefix` + minimalCommon,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 16384, BufferFlushInterval: time.Second},
+		},
+		{
+			name: "accept-transport-V3",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        log_name: otel
+                        transport_api_version: V3
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: otlp_cluster`,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 16384, BufferFlushInterval: time.Second},
+		},
+		{
+			name: "accept-transport-AUTO",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + minimalCommon,
+			wantCfg: &OTLPConfig{ClusterName: "otlp_cluster", LogName: "otel", BufferSizeBytes: 16384, BufferFlushInterval: time.Second},
+		},
+		{
+			name: "reject-google_grpc",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        log_name: otel
+                        grpc_service:
+                          google_grpc:
+                            target_uri: 127.0.0.1:50051
+                            stat_prefix: otlp`,
+			wantErr: true,
+			errSubs: []string{"google_grpc", "OTLP access log", "access_log[0]"},
+		},
+		{
+			name: "reject-transport-V2",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        log_name: otel
+                        transport_api_version: V2
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: otlp_cluster`,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "V2"},
+		},
+		{
+			name: "reject-empty-cluster",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        log_name: otel
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: ""`,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "cluster_name"},
+		},
+		{
+			name: "reject-body",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      body:
+                        string_value: "custom"` + minimalCommon,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "body"},
+		},
+		{
+			name: "reject-attributes",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      attributes:
+                        values:
+                          - key: "k"
+                            value: { string_value: "v" }` + minimalCommon,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "attributes"},
+		},
+		{
+			name: "reject-resource_attributes",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      resource_attributes:
+                        values:
+                          - key: "k"
+                            value: { string_value: "v" }` + minimalCommon,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "resource_attributes"},
+		},
+		{
+			name: "reject-formatters",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      formatters:
+                        - name: some.formatter` + minimalCommon,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "formatters"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bs, err := Load(strings.NewReader(hcmWithAccessLog(tt.block)))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Load: want error, got nil")
+				}
+				if !strings.HasPrefix(err.Error(), "bootstrap:") {
+					t.Errorf("error should be bootstrap:-prefixed: %q", err.Error())
+				}
+				for _, sub := range tt.errSubs {
+					if !strings.Contains(err.Error(), sub) {
+						t.Errorf("error should contain %q: %q", sub, err.Error())
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := len(bs.OTLPConfigs); got != 1 {
+				t.Fatalf("OTLPConfigs: got %d, want 1", got)
+			}
+			if tt.wantCfg != nil {
+				if got, want := bs.OTLPConfigs[0], *tt.wantCfg; !reflect.DeepEqual(got, want) {
+					t.Errorf("OTLPConfigs[0]: got %+v, want %+v", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestBootstrap_OTLP_CoexistWithFileAndGrpc verifies a file + a gRPC + an OTLP
+// access_log in the SAME HCM populate the three parallel slices independently.
+func TestBootstrap_OTLP_CoexistWithFileAndGrpc(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-access.log
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      common_config:
+                        log_name: otel
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: otlp_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.AccessLogConfigs); got != 1 {
+		t.Errorf("AccessLogConfigs: got %d, want 1", got)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Errorf("ALSConfigs: got %d, want 1", got)
+	}
+	if got := len(bs.OTLPConfigs); got != 1 {
+		t.Errorf("OTLPConfigs: got %d, want 1", got)
+	}
+}
+
 // TestBootstrap_AccessLog_NoEntriesIsValid verifies that an HCM with no
 // access_log entries (missing field) parses successfully with an empty
 // AccessLogConfigs slice.

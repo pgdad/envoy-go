@@ -12,6 +12,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.27.0
 	github.com/tetratelabs/wazero v1.10.1
 	github.com/yuin/gopher-lua v1.1.2
+	go.opentelemetry.io/proto/otlp v1.0.0
 	golang.org/x/net v0.34.0
 	golang.org/x/sys v0.31.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241202173237-19429a94021a
@@ -37,8 +38,9 @@ require (
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/grpc-ecosystem/grpc-gateway/v2 v2.16.0 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
-	github.com/kr/pretty v0.3.1 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/magiconair/properties v1.8.7 // indirect
 	github.com/moby/patternmatcher v0.6.0 // indirect

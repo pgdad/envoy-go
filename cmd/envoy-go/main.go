@@ -115,27 +115,42 @@ func main() {
 		}
 		sinks = append(sinks, sink)
 	}
-	// Phase 44.1 (ADR-0255): build one GrpcAccessLogSink per gRPC-ALS
-	// access_log[] entry parsed by bootstrap.Load. The two sink counters
-	// (access_logs.grpc_access_log.*) register once iff ≥1 ALS sink exists. A
-	// single shared grpcclient.Dialer rides the cluster manager; the node is a
-	// minimal node (Id + Cluster) built from the bootstrap node proto (D-ALS-NODE;
-	// UNasserted). Each sink is appended
-	// to the same `sinks` slice BEFORE the defer below, whose closure captures the
-	// slice variable — so the defer-LIFO Close() already covers the ALS sinks
-	// (GrpcAccessLogSink.Close releases its ALSClient's *grpc.ClientConn). An
-	// unknown / non-HTTP2 ALS cluster surfaces here as a fatal at sink build (the
-	// Dialer's dial-time gate), matching the existing file-sink open-failure idiom.
-	if len(bs.ALSConfigs) > 0 {
+	// Phase 44.1 (ADR-0255) + phase 45.1 (ADR-0258): build the gRPC-ALS and OTLP
+	// access-log sinks. The shared grpcclient.Dialer (one Dialer serves both passes)
+	// is HOISTED to fire when EITHER family is configured (an OTLP-only boot must
+	// still build it). Each sink is appended to the same `sinks` slice BEFORE the
+	// defer-LIFO Close() below, which already covers them.
+	//
+	// ALS: the two sink counters (access_logs.grpc_access_log.*) register once iff
+	// ≥1 ALS sink exists; the node is a minimal node (Id + Cluster) built from the
+	// bootstrap node proto (D-ALS-NODE; UNasserted). An unknown / non-HTTP2 cluster
+	// surfaces here as a fatal at sink build (the Dialer's dial-time gate), matching
+	// the existing file-sink open-failure idiom.
+	if len(bs.ALSConfigs) > 0 || len(bs.OTLPConfigs) > 0 {
 		dialer := grpcclient.New(cm)
-		written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
-		node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
-		for _, cfg := range bs.ALSConfigs {
-			client, err := grpcclient.NewALSClient(dialer, cfg.ClusterName)
-			if err != nil {
-				log.Fatalf("accesslog: gRPC ALS client for cluster %q: %v", cfg.ClusterName, err)
+		if len(bs.ALSConfigs) > 0 {
+			written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
+			node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
+			for _, cfg := range bs.ALSConfigs {
+				client, err := grpcclient.NewALSClient(dialer, cfg.ClusterName)
+				if err != nil {
+					log.Fatalf("accesslog: gRPC ALS client for cluster %q: %v", cfg.ClusterName, err)
+				}
+				sinks = append(sinks, accesslog.NewGrpcAccessLogSink(client, cfg.LogName, node, written, dropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval, cfg.AdditionalRequestHeaders, cfg.AdditionalResponseHeaders))
 			}
-			sinks = append(sinks, accesslog.NewGrpcAccessLogSink(client, cfg.LogName, node, written, dropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval, cfg.AdditionalRequestHeaders, cfg.AdditionalResponseHeaders))
+		}
+		if len(bs.OTLPConfigs) > 0 {
+			otlpWritten, otlpDropped := accesslog.RegisterOTLPSinkCounters(bs.Stats)
+			// The OTLP Resource labels need node.locality.zone, so source the FULL
+			// bootstrap node (Id/Cluster/Locality) — NOT the ALS minimal node (D-OTLP-NODE).
+			otlpNode := bs.Proto.GetNode()
+			for _, cfg := range bs.OTLPConfigs {
+				client, err := grpcclient.NewOTLPLogsClient(dialer, cfg.ClusterName)
+				if err != nil {
+					log.Fatalf("accesslog: OTLP logs client for cluster %q: %v", cfg.ClusterName, err)
+				}
+				sinks = append(sinks, accesslog.NewOTLPAccessLogSink(client, cfg.LogName, otlpNode, cfg.DisableBuiltinLabels, otlpWritten, otlpDropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval))
+			}
 		}
 	}
 	defer func() {

@@ -63,6 +63,7 @@ import (
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -1018,5 +1019,191 @@ func TestALSClient_Close_NilSafe(t *testing.T) {
 	var c *ALSClient
 	if err := c.Close(); err != nil {
 		t.Errorf("nil ALSClient Close: err = %v; want nil", err)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// In-process gRPC OTLP (LogsService) server — Task 4 (OTLPLogsClient).
+//
+// The OTLP `Export` is a plain UNARY RPC (no stream lifecycle), so the smoke
+// test stands up a BARE in-test LogsService server here: a no-op stub that
+// returns an empty `ExportLogsServiceResponse`. Mirrors `startTestALSServer`
+// (TLS-fronted, ALPN h2) so the same `mkH2ClusterMgr` builder wires a cluster
+// to it.
+// ----------------------------------------------------------------------------
+
+// fakeOTLPLogsServer implements `collogspb.LogsServiceServer`. Export returns an
+// empty response with no error.
+type fakeOTLPLogsServer struct {
+	collogspb.UnimplementedLogsServiceServer
+}
+
+func (f *fakeOTLPLogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (*collogspb.ExportLogsServiceResponse, error) {
+	return &collogspb.ExportLogsServiceResponse{}, nil
+}
+
+// startTestOTLPLogsServer starts a TLS-fronted `*grpc.Server` on a loopback port
+// with ALPN h2; registers a `fakeOTLPLogsServer`. Returns the bound port and a
+// `stop` func (calls `GracefulStop`). Mirrors `startTestALSServer`.
+func startTestOTLPLogsServer(t testing.TB, pki *authTestPKI) (uint32, func()) {
+	t.Helper()
+	pair, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
+	if err != nil {
+		t.Fatalf("server keypair: %v", err)
+	}
+	cfg := &stdtls.Config{
+		Certificates: []stdtls.Certificate{pair},
+		NextProtos:   []string{"h2"},
+		MinVersion:   stdtls.VersionTLS12,
+		MaxVersion:   stdtls.VersionTLS13,
+	}
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("listen tls: %v", err)
+	}
+	s := grpc.NewServer()
+	collogspb.RegisterLogsServiceServer(s, &fakeOTLPLogsServer{})
+	go func() {
+		_ = s.Serve(ln)
+	}()
+	port := uint32(ln.Addr().(*net.TCPAddr).Port)
+	stop := func() {
+		s.GracefulStop()
+		_ = ln.Close()
+	}
+	return port, stop
+}
+
+// ----------------------------------------------------------------------------
+// Group 4b — OTLPLogsClient surface (Task 4) — the EXACT ALSClient analog for
+// the OTLP LogsService, but UNARY (ADR-0258 / ADR-0255 precedent).
+// ----------------------------------------------------------------------------
+
+// TestOTLPLogsClient_New_NilDialer verifies a nil `*Dialer` errors with the
+// cluster name named (mirrors NewALSClient's nil-dialer guard).
+func TestOTLPLogsClient_New_NilDialer(t *testing.T) {
+	t.Parallel()
+	c, err := NewOTLPLogsClient(nil, "c_otlp")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewOTLPLogsClient(nil): err = nil; want non-nil")
+	}
+	if c != nil {
+		t.Errorf("NewOTLPLogsClient(nil): c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_otlp") {
+		t.Errorf("NewOTLPLogsClient(nil) err = %q; want substring %q", err.Error(), "c_otlp")
+	}
+}
+
+// TestOTLPLogsClient_New_UnknownCluster verifies the DialContext unknown-cluster
+// PARSE-REJECT propagates through NewOTLPLogsClient, naming the cluster.
+func TestOTLPLogsClient_New_UnknownCluster(t *testing.T) {
+	t.Parallel()
+	mgr := mkPlainClusterMgr(t, "c_other", 9999) // wrong name → unknown-cluster
+	d := New(mgr)
+
+	c, err := NewOTLPLogsClient(d, "c_missing")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewOTLPLogsClient: err = nil; want unknown-cluster PARSE-REJECT")
+	}
+	if c != nil {
+		t.Errorf("NewOTLPLogsClient: c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_missing") {
+		t.Errorf("NewOTLPLogsClient err = %q; want substring %q", err.Error(), "c_missing")
+	}
+	if !strings.Contains(err.Error(), "unknown cluster") {
+		t.Errorf("NewOTLPLogsClient err = %q; want substring %q", err.Error(), "unknown cluster")
+	}
+}
+
+// TestOTLPLogsClient_New_NonH2Cluster verifies a cluster WITHOUT
+// http2_protocol_options{} errors via the DialContext UseH2() gate.
+func TestOTLPLogsClient_New_NonH2Cluster(t *testing.T) {
+	t.Parallel()
+	mgr := mkPlainClusterMgr(t, "c_plain", 9999) // UseH2() == false
+	d := New(mgr)
+
+	c, err := NewOTLPLogsClient(d, "c_plain")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewOTLPLogsClient: err = nil; want non-H2 PARSE-REJECT")
+	}
+	if c != nil {
+		t.Errorf("NewOTLPLogsClient: c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_plain") {
+		t.Errorf("NewOTLPLogsClient err = %q; want substring %q", err.Error(), "c_plain")
+	}
+	if !strings.Contains(err.Error(), "HTTP/2 framing") {
+		t.Errorf("NewOTLPLogsClient err = %q; want substring %q", err.Error(), "HTTP/2 framing")
+	}
+}
+
+// TestOTLPLogsClient_Close_Idempotent verifies the sync.Once-guarded Close
+// against a valid H2 cluster: repeated Close() returns the same (nil) error, no
+// panic.
+func TestOTLPLogsClient_Close_Idempotent(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	port, stop := startTestOTLPLogsServer(t, pki)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_otlp", port)
+	d := New(mgr)
+
+	c, err := NewOTLPLogsClient(d, "c_otlp")
+	if err != nil {
+		t.Fatalf("NewOTLPLogsClient: %v", err)
+	}
+
+	err1 := c.Close()
+	err2 := c.Close()
+	err3 := c.Close()
+	if (err1 == nil) != (err2 == nil) || (err2 == nil) != (err3 == nil) {
+		t.Errorf("Close idempotency: err1=%v, err2=%v, err3=%v; want all equal", err1, err2, err3)
+	}
+	if err1 != nil && (err1.Error() != err2.Error() || err2.Error() != err3.Error()) {
+		t.Errorf("Close idempotency: err1=%q, err2=%q, err3=%q; want all equal", err1, err2, err3)
+	}
+}
+
+// TestOTLPLogsClient_Export_RoundTrips verifies that against a valid H2 cluster
+// wired to the in-test LogsService server, Export returns a non-nil response and
+// nil error.
+func TestOTLPLogsClient_Export_RoundTrips(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	port, stop := startTestOTLPLogsServer(t, pki)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_otlp", port)
+	d := New(mgr)
+
+	c, err := NewOTLPLogsClient(d, "c_otlp")
+	if err != nil {
+		t.Fatalf("NewOTLPLogsClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := c.Export(ctx, &collogspb.ExportLogsServiceRequest{})
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("Export: nil response")
+	}
+}
+
+// TestOTLPLogsClient_Close_NilSafe verifies Close() on a nil *OTLPLogsClient is
+// a no-op returning nil (mirrors ALSClient.Close nil-tolerance).
+func TestOTLPLogsClient_Close_NilSafe(t *testing.T) {
+	t.Parallel()
+	var c *OTLPLogsClient
+	if err := c.Close(); err != nil {
+		t.Errorf("nil OTLPLogsClient Close: err = %v; want nil", err)
 	}
 }

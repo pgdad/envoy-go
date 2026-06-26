@@ -12,6 +12,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	fileaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
 	grpcalv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
+	otlpalv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/open_telemetry/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 
 	// Blank-imported so the filter extension's proto descriptor is registered
@@ -50,6 +51,12 @@ import (
 	// the dependency obvious to bootstrap-side readers. Per ADR-0016 amendment
 	// policy this addition is documented in PROGRESS, not as a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
+
+	// Phase 45.1 registers the OTLP access-logger extension proto so protojson
+	// round-trips bootstraps carrying HCM access_log[] OpenTelemetryAccessLogConfig
+	// entries (ADR-0258). Its body/attributes field types transitively pull
+	// go.opentelemetry.io/proto/otlp common/v1.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/open_telemetry/v3"
 
 	// Phase 07.1 (Task 20) registers the cors HTTP filter extension proto so
 	// protojson round-trips bootstraps that carry
@@ -168,6 +175,10 @@ const (
 	// logs with no signal (the ADR-0080 anti-silent-divergence rule).
 	tcpGrpcAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig"
 
+	// otlpAccessLogTypeURL is the TypeURL for the OpenTelemetry (OTLP) access logger.
+	// Lifted from the ADR-0041 silent-ignore set at phase 45.1 (ADR-0258).
+	otlpAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.open_telemetry.v3.OpenTelemetryAccessLogConfig"
+
 	// alsDefaultBufferSizeBytes is the buffer_size_bytes default applied when the
 	// CommonGrpcAccessLogConfig wrapper is absent — the empirically-pinned
 	// reference default (AMEND-BUF-2). An explicit present-but-0 value is honored
@@ -197,6 +208,18 @@ type ALSConfig struct {
 	BufferFlushInterval       time.Duration // common_config.buffer_flush_interval (default 1s when absent/zero — a NewTicker(<=0) panic-guard) — AMEND-BUF-2
 	AdditionalRequestHeaders  []string      // additional_request_headers_to_log (field 2), lowercased at parse — AMEND-HDR-1
 	AdditionalResponseHeaders []string      // additional_response_headers_to_log (field 3), lowercased at parse — AMEND-HDR-1
+}
+
+// OTLPConfig is the parsed OpenTelemetry (OTLP) access-log sink config from one
+// HCM access_log[] OpenTelemetryAccessLogConfig entry (ADR-0258). body/attributes/
+// resource_attributes/formatters are STRICT-REJECTED at 45.1; stat_prefix is
+// PARSE-ACCEPT-but-INERT (the fixed stat names regardless).
+type OTLPConfig struct {
+	ClusterName          string        // common_config.grpc_service.envoy_grpc.cluster_name
+	LogName              string        // common_config.log_name (empty is valid)
+	BufferSizeBytes      uint32        // common_config.buffer_size_bytes (default 16384 when wrapper absent; explicit 0 ⇒ flush-every-entry)
+	BufferFlushInterval  time.Duration // common_config.buffer_flush_interval (default 1s when absent/zero)
+	DisableBuiltinLabels bool          // disable_builtin_labels (drops all 4 Resource labels wholesale)
 }
 
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
@@ -233,6 +256,17 @@ type Bootstrap struct {
 	// name lists (phase 44.3, AMEND-HDR-1); additional_*_trailers_to_log and
 	// AccessLog.filter stay inert (deferred).
 	ALSConfigs []ALSConfig
+	// OTLPConfigs is the parsed access_log[] OpenTelemetry (OTLP) access-log sink
+	// entries from each HCM filter, in registration order across all listeners and
+	// HCM filters (parallel to AccessLogConfigs/ALSConfigs). Empty when no
+	// OpenTelemetryAccessLogConfig access_log entries are configured. Per ADR-0258:
+	// transport_api_version V2, google_grpc, and an empty envoy_grpc.cluster_name
+	// are rejected at parse time (via the shared CommonGrpcAccessLogConfig helper);
+	// body/attributes/resource_attributes/formatters are STRICT-REJECTED at 45.1
+	// (operator templating is phase 45.2); cluster_name, log_name, buffer_size_bytes
+	// (default 16384), buffer_flush_interval (default 1s), and disable_builtin_labels
+	// are CONSUMED; stat_prefix is read-and-ignored (INERT).
+	OTLPConfigs []OTLPConfig
 	// ConfigPath is the file path the bootstrap was loaded from. Set by the
 	// caller (cmd/envoy-go/main.go) post-Load via bs.ConfigPath = *cfgPath;
 	// Load itself leaves this empty (the bootstrap.Load API takes an io.Reader,
@@ -332,9 +366,12 @@ func parseOneAccessLog(al *accesslogv3.AccessLog, idx int, result *Bootstrap) er
 	if tc.GetTypeUrl() == tcpGrpcAccessLogTypeURL {
 		return fmt.Errorf("bootstrap: access_log[%d]: TCP gRPC ALS (TcpGrpcAccessLogConfig) is not supported (envoy-go supports HTTP gRPC ALS only)", idx)
 	}
+	if tc.GetTypeUrl() == otlpAccessLogTypeURL {
+		return parseOpenTelemetryAccessLog(tc, idx, result)
+	}
 	if tc.GetTypeUrl() != fileAccessLogTypeURL {
-		// Other non-file typed_config (stdout, tcp_grpc, open_telemetry, etc.) —
-		// silently ignored per ADR-0041 amendment / ADR-0067.
+		// Other non-file typed_config (stdout, tcp_grpc, etc.) — silently ignored
+		// per ADR-0041 amendment / ADR-0067.
 		return nil
 	}
 	fal := &fileaccesslogv3.FileAccessLog{}
@@ -373,33 +410,9 @@ func parseGrpcAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
 	if err := proto.Unmarshal(tc.GetValue(), cfg); err != nil {
 		return fmt.Errorf("bootstrap: access_log[%d] grpc unmarshal: %w", idx, err)
 	}
-	common := cfg.GetCommonConfig()
-	if v := common.GetTransportApiVersion(); v == corev3.ApiVersion_V2 { //nolint:staticcheck // SA1019: this arm EXISTS to PARSE-REJECT the deprecated V2 transport; intentional access (ADR-0255, envoy-go is V3-only).
-		return fmt.Errorf("bootstrap: access_log[%d]: grpc ALS transport_api_version V2 is not supported (envoy-go is V3-only)", idx)
-	}
-	gs := common.GetGrpcService()
-	eg := gs.GetEnvoyGrpc()
-	if eg == nil {
-		return fmt.Errorf("bootstrap: access_log[%d]: grpc ALS requires grpc_service.envoy_grpc (google_grpc is not supported)", idx)
-	}
-	if eg.GetClusterName() == "" {
-		return fmt.Errorf("bootstrap: access_log[%d]: grpc ALS grpc_service.envoy_grpc.cluster_name is required (must be non-empty)", idx)
-	}
-	// buffer_size_bytes (field 4): the WRAPPER pointer is nil when the field is
-	// absent ⇒ default 16384 (AMEND-BUF-2); an explicit present-but-0 value is
-	// honored as flush-every-entry (the size threshold sum >= 0 always fires).
-	bufferSizeBytes := alsDefaultBufferSizeBytes
-	if w := common.GetBufferSizeBytes(); w != nil {
-		bufferSizeBytes = w.GetValue()
-	}
-	// buffer_flush_interval (field 3): absent/zero ⇒ default 1s. This is a HARD
-	// panic-guard, not merely a fidelity default — time.NewTicker(d) panics for
-	// d <= 0, so a non-positive interval MUST be coerced before it reaches the
-	// sink's ticker (§3.2). Any POSITIVE explicit value (incl. sub-second) is
-	// honored verbatim.
-	bufferFlushInterval := common.GetBufferFlushInterval().AsDuration()
-	if bufferFlushInterval <= 0 {
-		bufferFlushInterval = time.Second
+	clusterName, logName, bufferSizeBytes, bufferFlushInterval, err := parseCommonGrpcAccessLogConfig(cfg.GetCommonConfig(), idx, "grpc ALS")
+	if err != nil {
+		return err
 	}
 	// additional_{request,response}_headers_to_log (fields 2/3, on the OUTER
 	// HttpGrpcAccessLogConfig — NOT common_config): the configured names are
@@ -409,12 +422,84 @@ func parseGrpcAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
 	reqHdrs := lowerAll(cfg.GetAdditionalRequestHeadersToLog())
 	respHdrs := lowerAll(cfg.GetAdditionalResponseHeadersToLog())
 	result.ALSConfigs = append(result.ALSConfigs, ALSConfig{
-		ClusterName:               eg.GetClusterName(),
-		LogName:                   common.GetLogName(),
+		ClusterName:               clusterName,
+		LogName:                   logName,
 		BufferSizeBytes:           bufferSizeBytes,
 		BufferFlushInterval:       bufferFlushInterval,
 		AdditionalRequestHeaders:  reqHdrs,
 		AdditionalResponseHeaders: respHdrs,
+	})
+	return nil
+}
+
+// parseCommonGrpcAccessLogConfig reads the CommonGrpcAccessLogConfig shared by
+// HttpGrpcAccessLogConfig (phase 44) and OpenTelemetryAccessLogConfig (phase 45):
+// STRICT-REJECTS transport_api_version V2, a google_grpc (non-envoy_grpc)
+// grpc_service, and an empty cluster_name (ADR-0080), and applies the
+// buffer_size_bytes default (16384 when the wrapper is absent; explicit 0 honored
+// as flush-every-entry) + the buffer_flush_interval default (1s when absent/zero —
+// a time.NewTicker(<=0) HARD panic-guard, §3.2; any positive explicit value incl.
+// sub-second is honored verbatim). sinkLabel is interpolated into the reject
+// messages so each arm keeps its own byte-stable wording.
+func parseCommonGrpcAccessLogConfig(common *grpcalv3.CommonGrpcAccessLogConfig, idx int, sinkLabel string) (clusterName, logName string, bufBytes uint32, flush time.Duration, err error) {
+	if v := common.GetTransportApiVersion(); v == corev3.ApiVersion_V2 { //nolint:staticcheck // SA1019: this arm EXISTS to PARSE-REJECT the deprecated V2 transport; intentional access (ADR-0255, envoy-go is V3-only).
+		return "", "", 0, 0, fmt.Errorf("bootstrap: access_log[%d]: %s transport_api_version V2 is not supported (envoy-go is V3-only)", idx, sinkLabel)
+	}
+	eg := common.GetGrpcService().GetEnvoyGrpc()
+	if eg == nil {
+		return "", "", 0, 0, fmt.Errorf("bootstrap: access_log[%d]: %s requires grpc_service.envoy_grpc (google_grpc is not supported)", idx, sinkLabel)
+	}
+	if eg.GetClusterName() == "" {
+		return "", "", 0, 0, fmt.Errorf("bootstrap: access_log[%d]: %s grpc_service.envoy_grpc.cluster_name is required (must be non-empty)", idx, sinkLabel)
+	}
+	// buffer_size_bytes: the WRAPPER pointer is nil when the field is absent ⇒
+	// default 16384 (AMEND-BUF-2); an explicit present-but-0 value is honored as
+	// flush-every-entry (the size threshold sum >= 0 always fires).
+	bufBytes = alsDefaultBufferSizeBytes
+	if w := common.GetBufferSizeBytes(); w != nil {
+		bufBytes = w.GetValue()
+	}
+	flush = common.GetBufferFlushInterval().AsDuration()
+	if flush <= 0 {
+		flush = time.Second
+	}
+	return eg.GetClusterName(), common.GetLogName(), bufBytes, flush, nil
+}
+
+// parseOpenTelemetryAccessLog processes a single OpenTelemetryAccessLogConfig
+// access_log entry and appends an OTLPConfig to result.OTLPConfigs (ADR-0258).
+// STRICT-REJECTS (ADR-0080): the common_config V2/google_grpc/empty-cluster (via
+// the shared helper); a non-nil body / non-empty attributes / non-empty
+// resource_attributes (deferred to 45.2); a non-empty formatters (out of scope).
+// disable_builtin_labels is CONSUMED; stat_prefix is read-and-ignored (INERT).
+func parseOpenTelemetryAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
+	cfg := &otlpalv3.OpenTelemetryAccessLogConfig{}
+	if err := proto.Unmarshal(tc.GetValue(), cfg); err != nil {
+		return fmt.Errorf("bootstrap: access_log[%d] otlp unmarshal: %w", idx, err)
+	}
+	if cfg.GetBody() != nil {
+		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log body is not supported at phase 45.1 (operator templating is phase 45.2)", idx)
+	}
+	if len(cfg.GetAttributes().GetValues()) > 0 {
+		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log attributes is not supported at phase 45.1 (operator templating is phase 45.2)", idx)
+	}
+	if len(cfg.GetResourceAttributes().GetValues()) > 0 {
+		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log resource_attributes is not supported at phase 45.1 (operator templating is phase 45.2)", idx)
+	}
+	if len(cfg.GetFormatters()) > 0 {
+		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log formatters (custom formatter extensions) are not supported", idx)
+	}
+	clusterName, logName, bufBytes, flush, err := parseCommonGrpcAccessLogConfig(cfg.GetCommonConfig(), idx, "OTLP access log")
+	if err != nil {
+		return err
+	}
+	// stat_prefix (field 6) read-and-ignored (PARSE-ACCEPT-but-INERT).
+	result.OTLPConfigs = append(result.OTLPConfigs, OTLPConfig{
+		ClusterName:          clusterName,
+		LogName:              logName,
+		BufferSizeBytes:      bufBytes,
+		BufferFlushInterval:  flush,
+		DisableBuiltinLabels: cfg.GetDisableBuiltinLabels(),
 	})
 	return nil
 }

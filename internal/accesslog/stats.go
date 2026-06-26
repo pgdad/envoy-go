@@ -24,3 +24,13 @@ func RegisterGrpcSinkCounters(reg *stats.Registry) (written, dropped *stats.Coun
 	return reg.NewCounter("access_logs.grpc_access_log.logs_written"),
 		reg.NewCounter("access_logs.grpc_access_log.logs_dropped")
 }
+
+// RegisterOTLPSinkCounters allocates the two process-global OTLP access-log sink
+// counters (ADR-0258). Registered once per process when ≥1 OTLP sink is built.
+// STATIC names (no IsValidName guard — not wire/config derived; stat_prefix
+// honoring is deferred). The OTLP sink owns its own logs_dropped (NOT a reuse of
+// server.accesslog_dropped or the gRPC-ALS counter).
+func RegisterOTLPSinkCounters(reg *stats.Registry) (written, dropped *stats.Counter) {
+	return reg.NewCounter("access_logs.open_telemetry_access_log.logs_written"),
+		reg.NewCounter("access_logs.open_telemetry_access_log.logs_dropped")
+}

@@ -1,0 +1,68 @@
+# Phase 45.1 fixture 0084-otlp-access-log expectations (ADR-0019 — prose; the
+# driver is the enforcer; this file is documentation).
+#
+# Topology (single-listener plaintext H1; driver-owned in-process OTLP LogsService
+# gRPC receiver):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). HCM
+#                        carries one access_log[] OpenTelemetryAccessLogConfig
+#                        entry (log_name "0084"; grpc_service.envoy_grpc.cluster_name
+#                        c_otlp; NO body/attributes, builtin labels ENABLED)
+#                        exporting one OTLP LogRecord per completed request.
+#   c_backend          — HTTPFixedBody subprocess (test/fixtures/0006-access-log/
+#                        backends/; "backend:v1/fixed\n" = 17 bytes).
+#   c_otlp             — driver-owned in-process LogsService receiver
+#                        (test/helpers/otlplogs/; new in phase 45.1) on a
+#                        driver-allocated stable port, bound 0.0.0.0:<port> so the
+#                        reference container (host.docker.internal) AND the subject
+#                        (127.0.0.1) both reach it. The cluster carries the
+#                        mandatory http2_protocol_options:{} for gRPC framing +
+#                        plaintext h2c (D-OTLP-RECEIVER — no TLS).
+#
+# Reference Envoy v1.37.2 (STRICT_DNS via host.docker.internal) vs envoy-go
+# (STATIC, in-process).
+#
+# ## Workload
+#
+# Each side fires N=8 IDENTICAL query-less requests:
+#   GET /health, Host: otlp.example, User-Agent: otlp-probe/1.
+# Each request routes to c_backend (200 + 17-byte fixed body) and produces
+# exactly one exported OTLP LogRecord. The driver POLLS the receiver's Count() to
+# >= 8 (poll-to-converge; the reference buffers OTLP records and flushes on a
+# timer / buffer-fill — never a fixed sleep). Per-side separation: the receiver
+# is Reset() at the start of each side's drive; the subject generates no records
+# until its own DriveSubject window.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-record PAYLOAD aggregated across all
+# received records — NOT the Export-call count, per-call batch sizes, connection
+# count, or flush cadence, which legitimately vary side-to-side. The receiver
+# accumulates LogRecords across all Export calls; the driver asserts every
+# accumulated record.
+#
+# ## Asserted (cross-side EXACT, both sides)
+#
+#   len(records)                          == 8   (zero-record pass is vacuous —
+#                                                  proves decode ran on BOTH sides)
+#   LogRecord.time_unix_nano (every rec)  != 0   (PRESENCE, not value)
+#   Resource.attributes keys (every ResourceLogs):
+#     {log_name, zone_name, cluster_name, node_name} ALL present
+#   Resource.attributes log_name value    == "0084"
+#
+# PLUS the subject-side flat /stats counter:
+#   access_logs.open_telemetry_access_log.logs_written == 8   (every export ok)
+#
+# ## UNasserted (framing / non-deterministic / empty-on-both-sides)
+#
+#   LogRecord.time_unix_nano VALUE        — non-deterministic.
+#   Export-call count / batch sizes / connection count — framing.
+#   LogRecord.severity / body / attributes — absent both sides (bare built-in record).
+#   zone_name / cluster_name / node_name VALUES — may be empty both sides under
+#       the no-node config; only KEY presence asserted.
+#   disable_builtin_labels: true branch   — covered by a unit test, not this
+#       fixture (one fixture dir = one runner branch).
+#
+# Cross-refs: phase 45.1 SPEC §12 D-OTLP-* + ADR-0258 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned.
