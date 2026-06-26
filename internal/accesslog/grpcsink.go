@@ -60,6 +60,15 @@ type GrpcAccessLogSink struct {
 	bufferSizeBytes     int           // accumulated-serialized-byte flush threshold (AMEND-BUF-1); 0 ⇒ flush-every-entry
 	bufferFlushInterval time.Duration // flush-interval timer period (AMEND-BUF-2; guaranteed > 0 by the parse layer)
 
+	// additionalRequestHeaders/additionalResponseHeaders are THIS sink's configured
+	// header names (lowercased at parse; AMEND-HDR-1). buildHTTPAccessLogEntry
+	// filters the emit-hook capture UNION (Record.RequestHeaders/ResponseHeaders)
+	// down to these names per-sink, and the Filter reads them via the
+	// headerCaptureSink interface (Capture{Request,Response}HeaderNames) to build
+	// that union (D-HDR-SINK-FILTER).
+	additionalRequestHeaders  []string
+	additionalResponseHeaders []string
+
 	// ctx/cancel bound the lifetime of the client-streaming RPC; Close cancels
 	// ctx to unwedge a stalled Send/CloseAndRecv (bounded network shutdown).
 	ctx    context.Context
@@ -68,27 +77,42 @@ type GrpcAccessLogSink struct {
 
 // NewGrpcAccessLogSink builds a gRPC ALS sink over client with the bounded
 // channel at the default capacity (4096) and starts the writer goroutine.
-func NewGrpcAccessLogSink(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration) *GrpcAccessLogSink {
-	return newGrpcSinkWithCapacity(client, logName, node, written, dropped, bufferSizeBytes, bufferFlushInterval, defaultChannelCapacity)
+func NewGrpcAccessLogSink(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration, additionalRequestHeaders, additionalResponseHeaders []string) *GrpcAccessLogSink {
+	return newGrpcSinkWithCapacity(client, logName, node, written, dropped, bufferSizeBytes, bufferFlushInterval, additionalRequestHeaders, additionalResponseHeaders, defaultChannelCapacity)
 }
 
 // newGrpcSinkWithCapacity is the test-friendly variant; production callers use
 // NewGrpcAccessLogSink (capacity 4096).
-func newGrpcSinkWithCapacity(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration, capacity int) *GrpcAccessLogSink {
+func newGrpcSinkWithCapacity(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration, additionalRequestHeaders, additionalResponseHeaders []string, capacity int) *GrpcAccessLogSink {
 	s := &GrpcAccessLogSink{
-		ch:                  make(chan any, capacity),
-		client:              client,
-		logName:             logName,
-		node:                node,
-		logsWritten:         written,
-		logsDropped:         dropped,
-		bufferSizeBytes:     bufferSizeBytes,
-		bufferFlushInterval: bufferFlushInterval,
-		done:                make(chan struct{}),
+		ch:                        make(chan any, capacity),
+		client:                    client,
+		logName:                   logName,
+		node:                      node,
+		logsWritten:               written,
+		logsDropped:               dropped,
+		bufferSizeBytes:           bufferSizeBytes,
+		bufferFlushInterval:       bufferFlushInterval,
+		additionalRequestHeaders:  additionalRequestHeaders,
+		additionalResponseHeaders: additionalResponseHeaders,
+		done:                      make(chan struct{}),
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	go s.run()
 	return s
+}
+
+// CaptureRequestHeaderNames / CaptureResponseHeaderNames implement the
+// hcm.headerCaptureSink interface: the HCM Filter reads these to build the
+// emit-hook capture UNION across all ALS sinks (D-HDR-SINK-FILTER). Returning
+// the configured names (nil when none) keeps capture inert under the no-config
+// path (an empty union ⇒ the emit hooks skip CaptureHeaders entirely).
+func (s *GrpcAccessLogSink) CaptureRequestHeaderNames() []string { return s.additionalRequestHeaders }
+
+// CaptureResponseHeaderNames returns this sink's configured response-header names
+// (see CaptureRequestHeaderNames).
+func (s *GrpcAccessLogSink) CaptureResponseHeaderNames() []string {
+	return s.additionalResponseHeaders
 }
 
 // Submit non-blocking-sends r on the channel. On a full channel the record is
@@ -227,7 +251,7 @@ func (s *GrpcAccessLogSink) run() {
 				log.Printf("accesslog: gRPC ALS sink got non-*Record %T (log_name=%s); dropping", r, s.logName)
 				continue // non-Record ignored
 			}
-			entry := buildHTTPAccessLogEntry(rec)
+			entry := buildHTTPAccessLogEntry(rec, s.additionalRequestHeaders, s.additionalResponseHeaders)
 			buf = append(buf, entry)
 			bufBytes += proto.Size(entry)
 			if bufBytes >= s.bufferSizeBytes { // SIZE trigger (AMEND-BUF-1); 0 ⇒ every entry flushes

@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -481,7 +482,7 @@ func TestBootstrap_ALS_AcceptMinimal(t *testing.T) {
 	if got := len(bs.ALSConfigs); got != 1 {
 		t.Fatalf("ALSConfigs: got %d, want 1", got)
 	}
-	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "mylog", BufferSizeBytes: 16384, BufferFlushInterval: time.Second}); got != want {
+	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "mylog", BufferSizeBytes: 16384, BufferFlushInterval: time.Second}); !reflect.DeepEqual(got, want) {
 		t.Errorf("ALSConfigs[0]: got %+v, want %+v", got, want)
 	}
 }
@@ -504,7 +505,7 @@ func TestBootstrap_ALS_AcceptEmptyLogName(t *testing.T) {
 	if got := len(bs.ALSConfigs); got != 1 {
 		t.Fatalf("ALSConfigs: got %d, want 1", got)
 	}
-	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "", BufferSizeBytes: 16384, BufferFlushInterval: time.Second}); got != want {
+	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "", BufferSizeBytes: 16384, BufferFlushInterval: time.Second}); !reflect.DeepEqual(got, want) {
 		t.Errorf("ALSConfigs[0]: got %+v, want %+v", got, want)
 	}
 }
@@ -540,7 +541,9 @@ func TestBootstrap_ALS_AcceptBufferFields(t *testing.T) {
 }
 
 // TestBootstrap_ALS_AcceptInertHeaders verifies
-// additional_request_headers_to_log is PARSE-ACCEPTED-but-INERT at 44.1.
+// additional_request_headers_to_log parses cleanly (the names are now
+// CONSUMED at 44.3; this minimal-shape test only asserts the single-entry
+// accept path — the lowercasing/order semantics are covered below).
 func TestBootstrap_ALS_AcceptInertHeaders(t *testing.T) {
 	yamlSrc := hcmWithAccessLog(`
                   - name: envoy.access_loggers.http_grpc
@@ -558,6 +561,115 @@ func TestBootstrap_ALS_AcceptInertHeaders(t *testing.T) {
 	}
 	if got := len(bs.ALSConfigs); got != 1 {
 		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+}
+
+// TestBootstrap_ALS_HeadersLowercasedBothPresent verifies both header-name
+// lists are lifted into ALSConfig and lowercased at parse (AMEND-HDR-1, 44.3).
+func TestBootstrap_ALS_HeadersLowercasedBothPresent(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                      additional_request_headers_to_log: ["X-Req-Foo", "x-req-multi"]
+                      additional_response_headers_to_log: ["Content-Type"]`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].AdditionalRequestHeaders, []string{"x-req-foo", "x-req-multi"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AdditionalRequestHeaders: got %v, want %v", got, want)
+	}
+	if got, want := bs.ALSConfigs[0].AdditionalResponseHeaders, []string{"content-type"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AdditionalResponseHeaders: got %v, want %v", got, want)
+	}
+}
+
+// TestBootstrap_ALS_HeadersAbsentBoth verifies the no-capture path: with
+// neither header list configured both slices stay nil/empty.
+func TestBootstrap_ALS_HeadersAbsentBoth(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got := bs.ALSConfigs[0].AdditionalRequestHeaders; len(got) != 0 {
+		t.Errorf("AdditionalRequestHeaders: got %v, want empty", got)
+	}
+	if got := bs.ALSConfigs[0].AdditionalResponseHeaders; len(got) != 0 {
+		t.Errorf("AdditionalResponseHeaders: got %v, want empty", got)
+	}
+}
+
+// TestBootstrap_ALS_HeadersMixedCaseDuplicatePreservedOrder verifies the
+// names are lowercased, duplicates are NOT de-duped at parse, and order is
+// preserved (the Filter dedups the union, not parse — AMEND-HDR-1, 44.3).
+func TestBootstrap_ALS_HeadersMixedCaseDuplicatePreservedOrder(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                      additional_request_headers_to_log: ["X-A", "x-a", "X-B"]`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].AdditionalRequestHeaders, []string{"x-a", "x-a", "x-b"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AdditionalRequestHeaders: got %v, want %v", got, want)
+	}
+}
+
+// TestBootstrap_ALS_HeadersWithStrictRejectGoogleGrpc verifies the strict
+// reject arms run BEFORE the header reads: a config carrying a header list AND
+// google_grpc STILL errors on google_grpc (44.3 adds NO new reject — ADR-0080).
+func TestBootstrap_ALS_HeadersWithStrictRejectGoogleGrpc(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          google_grpc:
+                            target_uri: 127.0.0.1:50051
+                            stat_prefix: als
+                      additional_request_headers_to_log: ["X-Req-Foo"]`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for google_grpc, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap:") {
+		t.Errorf("error should be bootstrap:-prefixed: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "google_grpc") {
+		t.Errorf("error should name google_grpc: %q", err.Error())
 	}
 }
 

@@ -1,8 +1,11 @@
 package bootstrap
 
 import (
+	"strings"
 	"testing"
 
+	grpcalv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -52,6 +55,34 @@ func FuzzParseHttpGrpcAccessLogConfig(f *testing.F) {
 	// (default) both explicitly set — exercises the "explicit defaults" code path.
 	// 16384 as varint = \x80\x80\x01; 1s Duration.seconds = 1 → varint \x01.
 	f.Add([]byte("\x0a\x0a\x1a\x02\x08\x01\x22\x04\x08\x80\x80\x01"))
+
+	// Phase 44.3 (D-HDR-FUZZER-CORPUS): additional_{request,response}_headers_to_log
+	// (fields 2/3 of the OUTER HttpGrpcAccessLogConfig) are now part of the fuzzed
+	// surface — they feed lowerAll/strings.ToLower at parse. These seeds carry
+	// mixed-case names, duplicates, an empty-string name, a large name list, and a
+	// name with control bytes; each is marshaled from a real proto so the wire is
+	// well-formed. The invariant is unchanged: parseGrpcAccessLog never panics and
+	// returns nil or a "bootstrap:"-prefixed error.
+	addHdrSeed := func(req, resp []string) {
+		b, err := proto.Marshal(&grpcalv3.HttpGrpcAccessLogConfig{
+			AdditionalRequestHeadersToLog:  req,
+			AdditionalResponseHeadersToLog: resp,
+		})
+		if err != nil {
+			f.Fatalf("marshal header seed: %v", err)
+		}
+		f.Add(b)
+	}
+	// mixed-case names on both lists
+	addHdrSeed([]string{"X-Req-Foo", "X-REQ-Bar"}, []string{"Content-Type"})
+	// duplicate names (not de-duped at parse)
+	addHdrSeed([]string{"x-a", "X-A", "x-a"}, nil)
+	// an empty-string header name
+	addHdrSeed([]string{""}, []string{""})
+	// a large name list
+	addHdrSeed(strings.Split("a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z", ","), nil)
+	// a name carrying control bytes
+	addHdrSeed([]string{"x-\x00\x01\x02-ctl", "X-\t\n-WS"}, []string{"\x7f-resp"})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Synthesize a *anypb.Any with the gRPC-ALS TypeURL so the arm is reached.

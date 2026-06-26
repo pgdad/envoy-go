@@ -109,6 +109,17 @@ type Filter struct {
 	// parseFilterWithCtx from main.go's opened AsyncFileSinks (Phase 06.2).
 	accessLog []accesslog.Sink
 
+	// alsReqHeaderNames / alsRespHeaderNames hold the dedup'd lowercase union
+	// of additional_{request,response}_headers_to_log across all
+	// header-capturing access-log sinks (the gRPC ALS sink; phase 44.3). The
+	// emit hooks capture each named header once into the shared Record; each
+	// sink later filters to its own configured subset in
+	// buildHTTPAccessLogEntry (Task 5). Both are nil when no sink captures —
+	// the byte-stable no-capture path (Record header maps stay nil). Derived
+	// in parseFilterWithCtx via alsHeaderCaptureUnion (NOT threaded as params).
+	alsReqHeaderNames  []string
+	alsRespHeaderNames []string
+
 	// dm is the central drain.Manager threaded from the listener manager.
 	// Nil when no drain manager is configured (e.g. in tests that pass nil).
 	// HCM calls dm.Inc() at request-begin and dm.Dec() at request-end via
@@ -288,6 +299,10 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		perRouteConfig:    perRoute,
 		listenerPrincipal: lc.ListenerPrincipal,
 	}
+	// 44.3 Task 4: derive the dedup'd lowercase header-capture union from the
+	// sinks (D-HDR-RECORD-CAPTURE-SCOPE) — gates the emit-hook capture. Both
+	// nil when no sink captures ⇒ the byte-stable no-capture path.
+	f.alsReqHeaderNames, f.alsRespHeaderNames = alsHeaderCaptureUnion(accessLogSinks)
 	// Phase 07.1 Task 15: the routeTable.bindFilter post-build wiring is
 	// REMOVED. Per Decision §3.1, the access-log emit-deferral hooks on
 	// directResponseAction / routerAction / routerActionH2 collapsed into a
@@ -295,6 +310,59 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 	// h2dispatch.go for H2 at Task 16). The action types no longer carry a
 	// *Filter backpointer.
 	return f, nil
+}
+
+// headerCaptureSink is the optional capability a Sink advertises when it
+// captures additional request/response headers (the gRPC ALS sink). The Filter
+// derives the dedup'd union of all sinks' configured names so the emit hooks
+// capture each named header once into the shared Record (each sink later
+// filters to its own subset in buildHTTPAccessLogEntry). The file sink does
+// not implement this, so it is excluded by the type-assert.
+type headerCaptureSink interface {
+	CaptureRequestHeaderNames() []string
+	CaptureResponseHeaderNames() []string
+}
+
+// alsHeaderCaptureUnion returns the dedup'd lowercase union of the configured
+// request/response header names across all header-capturing sinks. Both results
+// are nil when no sink captures (the byte-stable no-capture path).
+func alsHeaderCaptureUnion(sinks []accesslog.Sink) (req, resp []string) {
+	var reqSet, respSet map[string]struct{}
+	for _, s := range sinks {
+		hc, ok := s.(headerCaptureSink)
+		if !ok {
+			continue
+		}
+		reqSet = addAll(reqSet, hc.CaptureRequestHeaderNames())
+		respSet = addAll(respSet, hc.CaptureResponseHeaderNames())
+	}
+	return setKeys(reqSet), setKeys(respSet)
+}
+
+// addAll inserts each (already-lowercased) name into the set, lazily allocating
+// it on first insert. Returns the (possibly newly allocated) set; nil-in /
+// empty-names returns the set unchanged.
+func addAll(set map[string]struct{}, names []string) map[string]struct{} {
+	for _, n := range names {
+		if set == nil {
+			set = make(map[string]struct{})
+		}
+		set[n] = struct{}{}
+	}
+	return set
+}
+
+// setKeys returns the set's keys as a slice (nil when the set is empty). Order
+// is unspecified — the union feeds CaptureHeaders, whose output is a map.
+func setKeys(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	return out
 }
 
 func requireInlineRouteConfig(msg *hcmv3.HttpConnectionManager) (*routev3.RouteConfiguration, error) {

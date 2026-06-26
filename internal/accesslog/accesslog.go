@@ -37,4 +37,7 @@ type Record struct {
 	Authority    string
 	UserAgent    string
 	UpstreamHost string
+
+	RequestHeaders  map[string]string // captured additional_request_headers_to_log (lowercase key, comma-joined value); nil when no capture configured
+	ResponseHeaders map[string]string // captured additional_response_headers_to_log (lowercase key, comma-joined value); nil when no capture configured
 }

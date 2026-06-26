@@ -135,7 +135,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("accesslog: gRPC ALS client for cluster %q: %v", cfg.ClusterName, err)
 			}
-			sinks = append(sinks, accesslog.NewGrpcAccessLogSink(client, cfg.LogName, node, written, dropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval))
+			sinks = append(sinks, accesslog.NewGrpcAccessLogSink(client, cfg.LogName, node, written, dropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval, cfg.AdditionalRequestHeaders, cfg.AdditionalResponseHeaders))
 		}
 	}
 	defer func() {

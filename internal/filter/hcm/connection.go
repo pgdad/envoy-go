@@ -319,7 +319,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		// Decision §3.1 (the "no-match" terminal state).
 		start := time.Now()
 		err := writeStatusReply(bw, 404, "")
-		f.emitAccessLog(req, 404, 0, cluster.Endpoint{}, start)
+		f.emitAccessLog(req, 404, 0, cluster.Endpoint{}, start, nil)
 		return 404, err
 	}
 
@@ -439,7 +439,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		log.Printf("hcm: dispatchRequest: terminal filter is not *router.Filter (got %T)", chainHF[len(chainHF)-1].Decoder)
 		start := time.Now()
 		err := writeStatusReply(bw, 500, "")
-		f.emitAccessLog(req, 500, 0, cluster.Endpoint{}, start)
+		f.emitAccessLog(req, 500, 0, cluster.Endpoint{}, start, nil)
 		return 500, err
 	}
 	rf.SetAction(action)
@@ -533,7 +533,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 			// http.Header.Write would lose the §11.2 order).
 			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
 		}
-		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime)
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders)
 		// Honor any user-supplied Connection: close on the local-reply
 		// headers (the 413 overflow path sets this; cors preflight does not).
 		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
@@ -634,7 +634,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		if lrStatus > 0 {
 			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
 		}
-		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime)
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders)
 		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
 			if werr == nil {
 				werr = errCloseAfterAction
@@ -712,7 +712,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// emitAccessLog is a no-op when status==0 (ctx-cancel sentinel) or when
 	// f.accessLog is empty. Calls into the existing accesslog_emit.go body
 	// (UNCHANGED at this task; only the call site moves).
-	f.emitAccessLog(req, status, bytesSent, picked, startTime)
+	f.emitAccessLog(req, status, bytesSent, picked, startTime, resp.Headers)
 
 	return status, actionErr
 }

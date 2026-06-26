@@ -58,7 +58,7 @@ func TestMappingBuildHTTPAccessLogEntry(t *testing.T) {
 		UserAgent:    "agent/1",
 		UpstreamHost: "10.0.0.1:8080",
 	}
-	e := buildHTTPAccessLogEntry(rec)
+	e := buildHTTPAccessLogEntry(rec, nil, nil)
 
 	// Deterministic fields.
 	if got := e.GetRequest().GetRequestMethod(); got != corev3.RequestMethod_GET {
@@ -99,6 +99,87 @@ func TestMappingBuildHTTPAccessLogEntry(t *testing.T) {
 	}
 }
 
+func TestMappingBuildHTTPAccessLogEntryHeaderCapture(t *testing.T) {
+	baseRec := func() *Record {
+		return &Record{
+			StartTime:       time.Unix(1700000000, 0),
+			Method:          "GET",
+			Path:            "/foo",
+			Protocol:        "HTTP/1.1",
+			ResponseCode:    200,
+			RequestHeaders:  map[string]string{"x-a": "1", "x-b": "2"},
+			ResponseHeaders: map[string]string{"content-type": "text/plain"},
+		}
+	}
+
+	eqMap := func(t *testing.T, got, want map[string]string, label string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s: got %v, want %v", label, got, want)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("%s[%q] = %q, want %q", label, k, got[k], v)
+			}
+		}
+	}
+
+	t.Run("full both sides", func(t *testing.T) {
+		e := buildHTTPAccessLogEntry(baseRec(), []string{"x-a", "x-b"}, []string{"content-type"})
+		eqMap(t, e.GetRequest().GetRequestHeaders(), map[string]string{"x-a": "1", "x-b": "2"}, "RequestHeaders")
+		eqMap(t, e.GetResponse().GetResponseHeaders(), map[string]string{"content-type": "text/plain"}, "ResponseHeaders")
+	})
+
+	t.Run("divergent subset filters out x-b", func(t *testing.T) {
+		e := buildHTTPAccessLogEntry(baseRec(), []string{"x-a"}, nil)
+		eqMap(t, e.GetRequest().GetRequestHeaders(), map[string]string{"x-a": "1"}, "RequestHeaders")
+		if got := e.GetResponse().GetResponseHeaders(); got != nil {
+			t.Errorf("ResponseHeaders = %v, want nil", got)
+		}
+	})
+
+	t.Run("configured-but-absent name omitted", func(t *testing.T) {
+		rec := &Record{
+			StartTime:      time.Unix(1700000000, 0),
+			Method:         "GET",
+			Path:           "/foo",
+			Protocol:       "HTTP/1.1",
+			ResponseCode:   200,
+			RequestHeaders: map[string]string{"x-a": "1"},
+		}
+		e := buildHTTPAccessLogEntry(rec, []string{"x-a", "x-zzz"}, nil)
+		eqMap(t, e.GetRequest().GetRequestHeaders(), map[string]string{"x-a": "1"}, "RequestHeaders")
+	})
+
+	t.Run("empty sink lists yield nil proto maps", func(t *testing.T) {
+		e := buildHTTPAccessLogEntry(baseRec(), nil, nil)
+		if got := e.GetRequest().GetRequestHeaders(); got != nil {
+			t.Errorf("RequestHeaders = %v, want nil", got)
+		}
+		if got := e.GetResponse().GetResponseHeaders(); got != nil {
+			t.Errorf("ResponseHeaders = %v, want nil", got)
+		}
+	})
+
+	t.Run("nil Record maps with non-empty sink lists yield nil proto maps", func(t *testing.T) {
+		rec := &Record{
+			StartTime:    time.Unix(1700000000, 0),
+			Method:       "GET",
+			Path:         "/foo",
+			Protocol:     "HTTP/1.1",
+			ResponseCode: 200,
+			// RequestHeaders/ResponseHeaders nil (no-capture path)
+		}
+		e := buildHTTPAccessLogEntry(rec, []string{"x-a"}, []string{"content-type"})
+		if got := e.GetRequest().GetRequestHeaders(); got != nil {
+			t.Errorf("RequestHeaders = %v, want nil", got)
+		}
+		if got := e.GetResponse().GetResponseHeaders(); got != nil {
+			t.Errorf("ResponseHeaders = %v, want nil", got)
+		}
+	})
+}
+
 func TestMappingSocketAddressErrorBranches(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -125,7 +206,7 @@ func TestMappingBuildEmptyUpstreamHost(t *testing.T) {
 		ResponseCode: 200,
 		UpstreamHost: "",
 	}
-	e := buildHTTPAccessLogEntry(rec)
+	e := buildHTTPAccessLogEntry(rec, nil, nil)
 	if addr := e.GetCommonProperties().GetUpstreamRemoteAddress(); addr != nil {
 		t.Errorf("UpstreamRemoteAddress = %v, want nil for empty UpstreamHost", addr)
 	}

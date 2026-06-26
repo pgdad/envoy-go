@@ -131,7 +131,7 @@ func TestGrpcSink_SubmitStreamsEntry(t *testing.T) {
 	stream := &fakeStream{}
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil)
 
 	s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/foo", Protocol: "HTTP/1.1", ResponseCode: 200})
 	if err := s.Close(); err != nil {
@@ -164,7 +164,7 @@ func TestGrpcSink_IdentifierOnce(t *testing.T) {
 	stream := &fakeStream{}
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil)
 
 	for i := 0; i < 3; i++ {
 		s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/x", Protocol: "HTTP/1.1", ResponseCode: 200})
@@ -202,7 +202,7 @@ func TestGrpcSink_DropNewest(t *testing.T) {
 	stream := &fakeStream{blockCh: block}
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
-	s := newGrpcSinkWithCapacity(client, "mylog", testNode(), written, dropped, 0, time.Hour, 1)
+	s := newGrpcSinkWithCapacity(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil, 1)
 
 	rec := &Record{StartTime: time.Now(), Method: "GET", Path: "/x", Protocol: "HTTP/1.1", ResponseCode: 200}
 	for i := 0; i < 100; i++ {
@@ -222,7 +222,7 @@ func TestGrpcSink_ReconnectOnSendError(t *testing.T) {
 	stream := &fakeStream{sendErrs: []error{errors.New("send boom")}} // first Send errors, then success
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil)
 
 	s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/foo", Protocol: "HTTP/1.1", ResponseCode: 200})
 	if err := s.Close(); err != nil {
@@ -251,7 +251,7 @@ func TestGrpcSink_CloseIdempotent(t *testing.T) {
 	stream := &fakeStream{}
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil)
 
 	s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/x", Protocol: "HTTP/1.1", ResponseCode: 200})
 	if err := s.Close(); err != nil {
@@ -269,7 +269,7 @@ func TestGrpcSink_NonRecordIgnored(t *testing.T) {
 	stream := &fakeStream{}
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil)
 
 	s.Submit("garbage")
 	if err := s.Close(); err != nil {
@@ -292,7 +292,7 @@ func batchRecord() *Record {
 
 // entrySize is the serialized byte size of one built HTTPAccessLogEntry for
 // batchRecord (constant across entries — all fields identical).
-func entrySize() int { return proto.Size(buildHTTPAccessLogEntry(batchRecord())) }
+func entrySize() int { return proto.Size(buildHTTPAccessLogEntry(batchRecord(), nil, nil)) }
 
 // totalEntries sums GetLogEntry() lengths across all recorded messages.
 func totalEntries(msgs []*accesslogv3.StreamAccessLogsMessage) int {
@@ -333,7 +333,7 @@ func TestGrpcSink_SizeTriggerBatches(t *testing.T) {
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
 	// threshold = 2*entrySize+1 ⇒ flush on the 3rd entry of each batch.
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 2*entrySize()+1, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 2*entrySize()+1, time.Hour, nil, nil)
 
 	for i := 0; i < 6; i++ {
 		s.Submit(batchRecord())
@@ -372,7 +372,7 @@ func TestGrpcSink_TimerTriggerBatches(t *testing.T) {
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
 	// HUGE size (never crosses) + SHORT interval ⇒ the timer flushes the batch.
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 1<<30, 50*time.Millisecond)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 1<<30, 50*time.Millisecond, nil, nil)
 
 	const n = 5
 	for i := 0; i < n; i++ {
@@ -400,7 +400,7 @@ func TestGrpcSink_FlushOnClose(t *testing.T) {
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
 	// HUGE size + LONG interval ⇒ neither trigger fires; only Close flushes.
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 1<<30, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 1<<30, time.Hour, nil, nil)
 
 	for i := 0; i < 3; i++ {
 		s.Submit(batchRecord())
@@ -429,7 +429,7 @@ func TestGrpcSink_ZeroSizeFlushesEveryEntry(t *testing.T) {
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
 	// bufferSizeBytes == 0 ⇒ sum >= 0 always crosses ⇒ flush every entry.
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil)
 
 	for i := 0; i < 4; i++ {
 		s.Submit(batchRecord())
@@ -457,7 +457,7 @@ func TestGrpcSink_ReconnectResendsWholeBatch(t *testing.T) {
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
 	// threshold = 2*entrySize+1 ⇒ the 3rd Submit flushes a batch of 3.
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 2*entrySize()+1, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 2*entrySize()+1, time.Hour, nil, nil)
 
 	for i := 0; i < 3; i++ {
 		s.Submit(batchRecord())
@@ -493,7 +493,7 @@ func TestGrpcSink_OpenFailureDropsBatch(t *testing.T) {
 	client := &fakeALSClient{stream: stream, streamErrs: []error{errors.New("open boom")}}
 	written, dropped := newGrpcTestCounters(t)
 	// threshold = 2*entrySize+1 ⇒ flush every 3rd entry.
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 2*entrySize()+1, time.Hour)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 2*entrySize()+1, time.Hour, nil, nil)
 
 	// Identical records ⇒ a clean 3-then-flush split (entrySize constant).
 	for i := 0; i < 6; i++ {
@@ -520,13 +520,106 @@ func TestGrpcSink_OpenFailureDropsBatch(t *testing.T) {
 	}
 }
 
+func TestGrpcSink_CaptureHeaderNames(t *testing.T) {
+	stream := &fakeStream{}
+	client := &fakeALSClient{stream: stream}
+	written, dropped := newGrpcTestCounters(t)
+	req := []string{"x-a", "x-b"}
+	resp := []string{"content-type"}
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, req, resp)
+	defer func() { _ = s.Close() }()
+
+	if got := s.CaptureRequestHeaderNames(); len(got) != 2 || got[0] != "x-a" || got[1] != "x-b" {
+		t.Errorf("CaptureRequestHeaderNames() = %v, want %v", got, req)
+	}
+	if got := s.CaptureResponseHeaderNames(); len(got) != 1 || got[0] != "content-type" {
+		t.Errorf("CaptureResponseHeaderNames() = %v, want %v", got, resp)
+	}
+
+	// The sink satisfies the headerCaptureSink shape (req/resp accessors).
+	var _ interface {
+		CaptureRequestHeaderNames() []string
+		CaptureResponseHeaderNames() []string
+	} = s
+}
+
+func TestGrpcSink_StreamsFilteredHeaders(t *testing.T) {
+	stream := &fakeStream{}
+	client := &fakeALSClient{stream: stream}
+	written, dropped := newGrpcTestCounters(t)
+	// This sink captures only x-a (req) + content-type (resp); x-b is in the
+	// Record (the emit-hook UNION) but NOT in this sink's subset, so it must be
+	// filtered out of the streamed entry.
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, []string{"x-a"}, []string{"content-type"})
+
+	s.Submit(&Record{
+		StartTime:       time.Now(),
+		Method:          "GET",
+		Path:            "/foo",
+		Protocol:        "HTTP/1.1",
+		ResponseCode:    200,
+		RequestHeaders:  map[string]string{"x-a": "1", "x-b": "2"},
+		ResponseHeaders: map[string]string{"content-type": "text/plain"},
+	})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	msgs := stream.messages()
+	if len(msgs) != 1 {
+		t.Fatalf("got %d streamed messages, want 1", len(msgs))
+	}
+	entries := msgs[0].GetHttpLogs().GetLogEntry()
+	if len(entries) != 1 {
+		t.Fatalf("got %d log entries, want 1", len(entries))
+	}
+	reqHdrs := entries[0].GetRequest().GetRequestHeaders()
+	if len(reqHdrs) != 1 || reqHdrs["x-a"] != "1" {
+		t.Errorf("request_headers = %v, want {x-a:1} (x-b filtered out)", reqHdrs)
+	}
+	respHdrs := entries[0].GetResponse().GetResponseHeaders()
+	if len(respHdrs) != 1 || respHdrs["content-type"] != "text/plain" {
+		t.Errorf("response_headers = %v, want {content-type:text/plain}", respHdrs)
+	}
+}
+
+func TestGrpcSink_NoCaptureHeadersByteStable(t *testing.T) {
+	stream := &fakeStream{}
+	client := &fakeALSClient{stream: stream}
+	written, dropped := newGrpcTestCounters(t)
+	// No configured names ⇒ proto header maps stay nil even if the Record carried
+	// captured maps (byte-identical to the 44.1/44.2 no-capture path).
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 0, time.Hour, nil, nil)
+
+	s.Submit(&Record{
+		StartTime:       time.Now(),
+		Method:          "GET",
+		Path:            "/foo",
+		Protocol:        "HTTP/1.1",
+		ResponseCode:    200,
+		RequestHeaders:  map[string]string{"x-a": "1"},
+		ResponseHeaders: map[string]string{"content-type": "text/plain"},
+	})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	entries := stream.messages()[0].GetHttpLogs().GetLogEntry()
+	if got := entries[0].GetRequest().GetRequestHeaders(); got != nil {
+		t.Errorf("request_headers = %v, want nil (no capture configured)", got)
+	}
+	if got := entries[0].GetResponse().GetResponseHeaders(); got != nil {
+		t.Errorf("response_headers = %v, want nil (no capture configured)", got)
+	}
+}
+
 func TestGrpcSink_NoPanicWithParseDefaultInterval(t *testing.T) {
 	stream := &fakeStream{}
 	client := &fakeALSClient{stream: stream}
 	written, dropped := newGrpcTestCounters(t)
 	// 1s is the parse-layer default (the NewTicker panic-guard invariant: a 0
 	// here would panic in run()).
-	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 1<<30, 1*time.Second)
+	s := NewGrpcAccessLogSink(client, "mylog", testNode(), written, dropped, 1<<30, 1*time.Second, nil, nil)
 
 	s.Submit(batchRecord())
 	if err := s.Close(); err != nil {

@@ -44,7 +44,14 @@ func requestMethodEnum(m string) corev3.RequestMethod {
 // three non-deterministic fields (start_time, duration, upstream_remote_address)
 // are populated but left UNasserted cross-side. Path carries the path only
 // (AMEND-ALS-2; the reference additionally carries the query string).
-func buildHTTPAccessLogEntry(rec *Record) *dataaccesslogv3.HTTPAccessLogEntry {
+//
+// reqHdrNames/respHdrNames are the SINK's own configured header names (a subset
+// of the emit-hook UNION captured into rec.RequestHeaders/rec.ResponseHeaders).
+// Each sink filters the captured union down to its own names so multi-sink
+// fan-out stays per-sink correct (D-HDR-SINK-FILTER). Empty name lists OR nil
+// Record maps leave the proto header maps unset — byte-identical to the
+// 44.1/44.2 no-capture path.
+func buildHTTPAccessLogEntry(rec *Record, reqHdrNames, respHdrNames []string) *dataaccesslogv3.HTTPAccessLogEntry {
 	e := &dataaccesslogv3.HTTPAccessLogEntry{
 		ProtocolVersion: protocolVersionEnum(rec.Protocol),
 		Request: &dataaccesslogv3.HTTPRequestProperties{
@@ -62,10 +69,37 @@ func buildHTTPAccessLogEntry(rec *Record) *dataaccesslogv3.HTTPAccessLogEntry {
 			Duration:  durationpb.New(rec.Duration),
 		},
 	}
+	if m := filterCaptured(rec.RequestHeaders, reqHdrNames); m != nil {
+		e.Request.RequestHeaders = m
+	}
+	if m := filterCaptured(rec.ResponseHeaders, respHdrNames); m != nil {
+		e.Response.ResponseHeaders = m
+	}
 	if addr := socketAddress(rec.UpstreamHost); addr != nil {
 		e.CommonProperties.UpstreamRemoteAddress = addr
 	}
 	return e
+}
+
+// filterCaptured copies the sink's configured names out of the captured map (the
+// emit-hook UNION) into a fresh map, omitting names the request/response did not
+// carry. Returns nil when names is empty, the captured map is empty/nil, or
+// nothing matched — so the proto map stays unset (byte-identical to the
+// no-capture path).
+func filterCaptured(captured map[string]string, names []string) map[string]string {
+	if len(names) == 0 || len(captured) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(names))
+	for _, n := range names {
+		if v, ok := captured[n]; ok {
+			out[n] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // socketAddress parses a "host:port" string into a core Address. It returns nil

@@ -1387,3 +1387,55 @@ func TestBuildRouterAction_HedgePolicyParse(t *testing.T) {
 		}
 	})
 }
+
+// --- Task 4: alsHeaderCaptureUnion derivation -------------------------------
+
+// fakeHeaderCaptureSink is a Sink that advertises the headerCaptureSink
+// capability (the gRPC ALS sink's role in production lands in Task 5).
+type fakeHeaderCaptureSink struct {
+	req  []string
+	resp []string
+}
+
+func (s fakeHeaderCaptureSink) Submit(any)                           {}
+func (s fakeHeaderCaptureSink) Close() error                         { return nil }
+func (s fakeHeaderCaptureSink) CaptureRequestHeaderNames() []string  { return s.req }
+func (s fakeHeaderCaptureSink) CaptureResponseHeaderNames() []string { return s.resp }
+
+// fakeNonCapturingSink is a Sink WITHOUT the headerCaptureSink methods (the
+// file sink's role): it must be excluded from the union.
+type fakeNonCapturingSink struct{}
+
+func (fakeNonCapturingSink) Submit(any)   {}
+func (fakeNonCapturingSink) Close() error { return nil }
+
+func sliceAsSet(s []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(s))
+	for _, v := range s {
+		m[v] = struct{}{}
+	}
+	return m
+}
+
+func TestAlsHeaderCaptureUnion_DedupAcrossSinks(t *testing.T) {
+	sinks := []accesslog.Sink{
+		fakeHeaderCaptureSink{req: []string{"x-a", "x-b"}, resp: []string{"y-a"}},
+		fakeHeaderCaptureSink{req: []string{"x-b", "x-c"}, resp: []string{"y-a", "y-b"}},
+		fakeNonCapturingSink{},
+	}
+	req, resp := alsHeaderCaptureUnion(sinks)
+	if !reflect.DeepEqual(sliceAsSet(req), sliceAsSet([]string{"x-a", "x-b", "x-c"})) {
+		t.Errorf("req union = %v, want {x-a,x-b,x-c}", req)
+	}
+	if !reflect.DeepEqual(sliceAsSet(resp), sliceAsSet([]string{"y-a", "y-b"})) {
+		t.Errorf("resp union = %v, want {y-a,y-b}", resp)
+	}
+}
+
+func TestAlsHeaderCaptureUnion_AllNonCapturing_NilUnion(t *testing.T) {
+	sinks := []accesslog.Sink{fakeNonCapturingSink{}, fakeNonCapturingSink{}}
+	req, resp := alsHeaderCaptureUnion(sinks)
+	if req != nil || resp != nil {
+		t.Errorf("union = req:%v resp:%v, want nil/nil", req, resp)
+	}
+}

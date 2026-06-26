@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
@@ -185,13 +186,17 @@ type AccessLogConfig struct {
 // ALSConfig is the parsed gRPC Access Log Service sink config from one HCM
 // access_log[] HttpGrpcAccessLogConfig entry (ADR-0255). The sink is built in
 // cmd/envoy-go/main.go after Load returns. buffer_size_bytes and
-// buffer_flush_interval are now CONSUMED (AMEND-BUF-2, phase 44.2);
-// additional_*_headers and AccessLog.filter STAY inert until 44.3.
+// buffer_flush_interval are CONSUMED (AMEND-BUF-2, phase 44.2);
+// additional_request_headers_to_log / additional_response_headers_to_log are
+// now CONSUMED as the header-capture name lists (phase 44.3, AMEND-HDR-1).
+// additional_*_trailers_to_log and AccessLog.filter STAY inert (deferred).
 type ALSConfig struct {
-	ClusterName         string        // common_config.grpc_service.envoy_grpc.cluster_name
-	LogName             string        // common_config.log_name (empty is valid)
-	BufferSizeBytes     uint32        // common_config.buffer_size_bytes (default 16384 when wrapper absent; explicit 0 ⇒ flush-every-entry) — AMEND-BUF-2
-	BufferFlushInterval time.Duration // common_config.buffer_flush_interval (default 1s when absent/zero — a NewTicker(<=0) panic-guard) — AMEND-BUF-2
+	ClusterName               string        // common_config.grpc_service.envoy_grpc.cluster_name
+	LogName                   string        // common_config.log_name (empty is valid)
+	BufferSizeBytes           uint32        // common_config.buffer_size_bytes (default 16384 when wrapper absent; explicit 0 ⇒ flush-every-entry) — AMEND-BUF-2
+	BufferFlushInterval       time.Duration // common_config.buffer_flush_interval (default 1s when absent/zero — a NewTicker(<=0) panic-guard) — AMEND-BUF-2
+	AdditionalRequestHeaders  []string      // additional_request_headers_to_log (field 2), lowercased at parse — AMEND-HDR-1
+	AdditionalResponseHeaders []string      // additional_response_headers_to_log (field 3), lowercased at parse — AMEND-HDR-1
 }
 
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
@@ -223,8 +228,10 @@ type Bootstrap struct {
 	// Per ADR-0255/AMEND-BUF-2: transport_api_version V2 and google_grpc are
 	// rejected at parse time; envoy_grpc.cluster_name (non-empty), log_name,
 	// buffer_size_bytes (default 16384), and buffer_flush_interval (default 1s)
-	// are now all CONSUMED (phase 44.2); additional_*_headers and
-	// AccessLog.filter stay inert until 44.3.
+	// are all CONSUMED (phase 44.2); additional_request_headers_to_log /
+	// additional_response_headers_to_log are now CONSUMED as the header-capture
+	// name lists (phase 44.3, AMEND-HDR-1); additional_*_trailers_to_log and
+	// AccessLog.filter stay inert (deferred).
 	ALSConfigs []ALSConfig
 	// ConfigPath is the file path the bootstrap was loaded from. Set by the
 	// caller (cmd/envoy-go/main.go) post-Load via bs.ConfigPath = *cfgPath;
@@ -356,8 +363,11 @@ func parseOneAccessLog(al *accesslogv3.AccessLog, idx int, result *Bootstrap) er
 // and appends an ALSConfig to result.ALSConfigs (ADR-0255). It STRICT-REJECTS
 // transport_api_version V2 (envoy-go is V3-only), google_grpc grpc_service
 // (only envoy_grpc is supported), and an empty envoy_grpc.cluster_name.
-// buffer_size_bytes and buffer_flush_interval are now CONSUMED (AMEND-BUF-2,
-// phase 44.2); additional_*_headers stays parse-accepted-but-inert until 44.3.
+// buffer_size_bytes and buffer_flush_interval are CONSUMED (AMEND-BUF-2,
+// phase 44.2); additional_request_headers_to_log /
+// additional_response_headers_to_log are now CONSUMED as the lowercased
+// header-capture name lists (phase 44.3, AMEND-HDR-1). The strict-reject arms
+// run BEFORE the header reads (ADR-0080; 44.3 adds no new reject).
 func parseGrpcAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
 	cfg := &grpcalv3.HttpGrpcAccessLogConfig{}
 	if err := proto.Unmarshal(tc.GetValue(), cfg); err != nil {
@@ -391,13 +401,35 @@ func parseGrpcAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
 	if bufferFlushInterval <= 0 {
 		bufferFlushInterval = time.Second
 	}
+	// additional_{request,response}_headers_to_log (fields 2/3, on the OUTER
+	// HttpGrpcAccessLogConfig — NOT common_config): the configured names are
+	// lowercased once at parse so the capture lookup + the map key are lowercase
+	// (AMEND-HDR-1). An absent/empty list ⇒ nil (the no-capture path). Duplicates
+	// are NOT de-duped here (idempotent map write; the Filter dedups the union).
+	reqHdrs := lowerAll(cfg.GetAdditionalRequestHeadersToLog())
+	respHdrs := lowerAll(cfg.GetAdditionalResponseHeadersToLog())
 	result.ALSConfigs = append(result.ALSConfigs, ALSConfig{
-		ClusterName:         eg.GetClusterName(),
-		LogName:             common.GetLogName(),
-		BufferSizeBytes:     bufferSizeBytes,
-		BufferFlushInterval: bufferFlushInterval,
+		ClusterName:               eg.GetClusterName(),
+		LogName:                   common.GetLogName(),
+		BufferSizeBytes:           bufferSizeBytes,
+		BufferFlushInterval:       bufferFlushInterval,
+		AdditionalRequestHeaders:  reqHdrs,
+		AdditionalResponseHeaders: respHdrs,
 	})
 	return nil
+}
+
+// lowerAll returns a new slice with each element lowercased, or nil for an
+// empty/nil input (so the no-capture path stays nil — byte-stable).
+func lowerAll(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = strings.ToLower(s)
+	}
+	return out
 }
 
 // AdminSocket returns host and port from admin.address.socket_address. Errors

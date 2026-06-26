@@ -5,9 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 )
 
 type emitCaptureSink struct{ recs []*accesslog.Record }
@@ -23,7 +26,7 @@ func TestEmitAccessLog_H1_DirectResponseShape(t *testing.T) {
 	req.Header.Set("User-Agent", "Go-http-client/1.1")
 	req.Proto = "HTTP/1.1"
 	start := time.Now().Add(-5 * time.Millisecond)
-	f.emitAccessLog(req, 200, 3, cluster.Endpoint{}, start)
+	f.emitAccessLog(req, 200, 3, cluster.Endpoint{}, start, nil)
 	if len(cs.recs) != 1 {
 		t.Fatalf("captured %d records, want 1", len(cs.recs))
 	}
@@ -51,7 +54,7 @@ func TestEmitAccessLog_H1_RoutedShape(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/api/v1/foo", nil)
 	req.Proto = "HTTP/1.1"
 	picked := cluster.Endpoint{Host: "10.0.0.1", Port: 8080}
-	f.emitAccessLog(req, 200, 17, picked, time.Now())
+	f.emitAccessLog(req, 200, 17, picked, time.Now(), nil)
 	if cs.recs[0].UpstreamHost != "10.0.0.1:8080" {
 		t.Errorf("UpstreamHost = %q, want 10.0.0.1:8080", cs.recs[0].UpstreamHost)
 	}
@@ -62,7 +65,7 @@ func TestEmitAccessLog_MultipleSinks_AllReceiveRecord(t *testing.T) {
 	f := &Filter{accessLog: []accesslog.Sink{cs1, cs2}}
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.Proto = "HTTP/1.1"
-	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now())
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil)
 	if len(cs1.recs) != 1 || len(cs2.recs) != 1 {
 		t.Errorf("sink record counts: cs1=%d cs2=%d, want 1/1", len(cs1.recs), len(cs2.recs))
 	}
@@ -72,7 +75,7 @@ func TestEmitAccessLog_H2_PseudoHeadersFromH2Request(t *testing.T) {
 	cs := &emitCaptureSink{}
 	f := &Filter{accessLog: []accesslog.Sink{cs}}
 	req := h2.H2Request{Method: "GET", Path: "/api/v1/foo", Authority: "host:1234"}
-	f.emitAccessLogH2(req, 200, 17, cluster.Endpoint{Host: "10.0.0.1", Port: 8080}, time.Now())
+	f.emitAccessLogH2(req, 200, 17, cluster.Endpoint{Host: "10.0.0.1", Port: 8080}, time.Now(), nil)
 	if len(cs.recs) != 1 {
 		t.Fatal("expected 1 record")
 	}
@@ -88,7 +91,7 @@ func TestEmitAccessLog_H2_StatusZeroSkipsEmission(t *testing.T) {
 	cs := &emitCaptureSink{}
 	f := &Filter{accessLog: []accesslog.Sink{cs}}
 	req := h2.H2Request{}
-	f.emitAccessLogH2(req, 0, 0, cluster.Endpoint{}, time.Now())
+	f.emitAccessLogH2(req, 0, 0, cluster.Endpoint{}, time.Now(), nil)
 	if len(cs.recs) != 0 {
 		t.Errorf("expected 0 records on status=0 ctx-cancel, got %d", len(cs.recs))
 	}
@@ -98,5 +101,138 @@ func TestEmitAccessLog_NoSinks_IsNoOp(t *testing.T) {
 	f := &Filter{accessLog: nil}
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.Proto = "HTTP/1.1"
-	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now())
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil)
+}
+
+// --- Task 4: emit-hook header capture (H1+H2) -------------------------------
+
+func eqMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func TestEmitAccessLog_H1_RequestHeaderCapture(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{
+		accessLog:         []accesslog.Sink{cs},
+		alsReqHeaderNames: []string{"x-req-foo", "x-req-missing", "x-req-multi"},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.Proto = "HTTP/1.1"
+	req.Header.Set("X-Req-Foo", "bar")
+	req.Header.Add("X-Req-Multi", "m1")
+	req.Header.Add("X-Req-Multi", "m2")
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil)
+	got := cs.recs[0].RequestHeaders
+	want := map[string]string{"x-req-foo": "bar", "x-req-multi": "m1,m2"}
+	if !eqMap(got, want) {
+		t.Errorf("RequestHeaders = %v, want %v", got, want)
+	}
+}
+
+func TestEmitAccessLog_H1_ResponseHeaderCapture(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{
+		accessLog:          []accesslog.Sink{cs},
+		alsRespHeaderNames: []string{"content-type"},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.Proto = "HTTP/1.1"
+	resp := filter_http.OrderedHeaders{{Name: "Content-Type", Value: "text/plain"}}
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), resp)
+	got := cs.recs[0].ResponseHeaders
+	want := map[string]string{"content-type": "text/plain"}
+	if !eqMap(got, want) {
+		t.Errorf("ResponseHeaders = %v, want %v", got, want)
+	}
+}
+
+func TestEmitAccessLog_H1_NilResponseHeaders_OmitsAll(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{
+		accessLog:          []accesslog.Sink{cs},
+		alsRespHeaderNames: []string{"content-type"},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.Proto = "HTTP/1.1"
+	// nil response carrier at an error site must not panic and must yield a
+	// nil ResponseHeaders map (no entries to capture).
+	f.emitAccessLog(req, 404, 0, cluster.Endpoint{}, time.Now(), nil)
+	if cs.recs[0].ResponseHeaders != nil {
+		t.Errorf("ResponseHeaders = %v, want nil for nil response carrier", cs.recs[0].ResponseHeaders)
+	}
+}
+
+func TestEmitAccessLog_H1_PresentEmptyValue(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{
+		accessLog:         []accesslog.Sink{cs},
+		alsReqHeaderNames: []string{"x-empty"},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.Proto = "HTTP/1.1"
+	req.Header.Set("X-Empty", "")
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil)
+	got := cs.recs[0].RequestHeaders
+	if v, ok := got["x-empty"]; !ok || v != "" {
+		t.Errorf("RequestHeaders[x-empty] = %q,%v, want present empty", v, ok)
+	}
+}
+
+func TestEmitAccessLog_H2_RequestHeaderCapture(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{
+		accessLog:         []accesslog.Sink{cs},
+		alsReqHeaderNames: []string{"x-req-foo", "x-req-missing", "x-req-multi"},
+	}
+	req := h2.H2Request{
+		Method: "GET", Path: "/", Authority: "host",
+		Headers: []hpack.HeaderField{
+			{Name: "x-req-foo", Value: "bar"},
+			{Name: "x-req-multi", Value: "m1"},
+			{Name: "x-req-multi", Value: "m2"},
+		},
+	}
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil)
+	got := cs.recs[0].RequestHeaders
+	want := map[string]string{"x-req-foo": "bar", "x-req-multi": "m1,m2"}
+	if !eqMap(got, want) {
+		t.Errorf("RequestHeaders = %v, want %v", got, want)
+	}
+}
+
+func TestEmitAccessLog_H2_ResponseHeaderCapture(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{
+		accessLog:          []accesslog.Sink{cs},
+		alsRespHeaderNames: []string{"content-type"},
+	}
+	req := h2.H2Request{Method: "GET", Path: "/", Authority: "host"}
+	resp := filter_http.OrderedHeaders{{Name: "Content-Type", Value: "text/plain"}}
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), resp)
+	got := cs.recs[0].ResponseHeaders
+	want := map[string]string{"content-type": "text/plain"}
+	if !eqMap(got, want) {
+		t.Errorf("ResponseHeaders = %v, want %v", got, want)
+	}
+}
+
+func TestEmitAccessLog_NoCapture_ByteStableNilMaps(t *testing.T) {
+	cs := &emitCaptureSink{}
+	f := &Filter{accessLog: []accesslog.Sink{cs}} // empty union lists
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.Proto = "HTTP/1.1"
+	resp := filter_http.OrderedHeaders{{Name: "Content-Type", Value: "text/plain"}}
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), resp)
+	if cs.recs[0].RequestHeaders != nil || cs.recs[0].ResponseHeaders != nil {
+		t.Errorf("no-capture path must keep nil maps, got req=%v resp=%v",
+			cs.recs[0].RequestHeaders, cs.recs[0].ResponseHeaders)
+	}
 }
