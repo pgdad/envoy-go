@@ -14,10 +14,11 @@ import (
 )
 
 // Server is a minimal in-process AccessLogService gRPC server that accumulates
-// streamed *HTTPAccessLogEntry records per D-ALS-RECEIVER. Goroutine-safe: the
-// accumulator slice is guarded by an RWMutex so the StreamAccessLogs append
-// path and the Count/Entries poll surface are race-free under the -race
-// detector (see TestConcurrentStreams_NoRace).
+// streamed *HTTPAccessLogEntry records per D-ALS-RECEIVER. Goroutine-safe: both
+// accumulator slices are guarded by an RWMutex so the StreamAccessLogs append
+// path and the Count/Entries/BatchSizes/MaxBatchSize/MessageCount poll surface
+// are race-free under the -race detector (see TestConcurrentStreams_NoRace and
+// TestConcurrentStreams_NoRace_BatchSizes).
 //
 // Lifecycle:
 //   - New(t) binds 127.0.0.1:0 (ephemeral port) + spawns grpcSrv.Serve(lis) in
@@ -29,11 +30,17 @@ import (
 //     caller manages lifecycle via Server.Stop. Used by the fixture-0081
 //     differential driver.
 //   - StreamAccessLogs drains the client stream, appending every message's HTTP
-//     log entries to the accumulator (across BOTH messages and successive
-//     streams, AMEND-ALS-3), and SendAndClose on io.EOF.
-//   - Count()/Entries() expose the accumulator: Count is the converge poll,
-//     Entries is a defensive snapshot copy in arrival order.
-//   - Reset() drops the accumulator (per-side snapshot separation).
+//     log entries to the entries accumulator AND recording the per-message entry
+//     count in batchSizes (across BOTH messages and successive streams,
+//     AMEND-ALS-3), and SendAndClose on io.EOF.
+//   - Count()/Entries() expose the flat entries accumulator: Count is the
+//     converge poll, Entries is a defensive snapshot copy in arrival order.
+//   - BatchSizes()/MaxBatchSize()/MessageCount() expose the per-message batch
+//     sizes accumulator (44.2 D-BUF-RECEIVER-BATCH-API): BatchSizes is a
+//     defensive snapshot copy in arrival order, MaxBatchSize is the largest
+//     per-message entry count seen (0 if none), MessageCount is the number of
+//     received messages carrying http_logs (== len(BatchSizes())).
+//   - Reset() drops BOTH accumulators (per-side snapshot separation).
 //   - Stop() GracefulStops the *grpc.Server; idempotent via sync.Once.
 //
 // Plaintext h2c — no TLS — per D-ALS-RECEIVER: grpc.NewServer() with no Creds()
@@ -46,8 +53,9 @@ type Server struct {
 	lis     net.Listener
 	grpcSrv *grpc.Server
 
-	mu      sync.RWMutex
-	entries []*dataaccesslogv3.HTTPAccessLogEntry
+	mu         sync.RWMutex
+	entries    []*dataaccesslogv3.HTTPAccessLogEntry
+	batchSizes []int // per-message entry counts, 44.2 D-BUF-RECEIVER-BATCH-API
 
 	stopOnce sync.Once
 }
@@ -136,8 +144,10 @@ func (s *Server) StreamAccessLogs(stream accesslogv3.AccessLogService_StreamAcce
 			return err
 		}
 		if httpLogs := msg.GetHttpLogs(); httpLogs != nil {
+			entries := httpLogs.GetLogEntry()
 			s.mu.Lock()
-			s.entries = append(s.entries, httpLogs.GetLogEntry()...)
+			s.entries = append(s.entries, entries...)
+			s.batchSizes = append(s.batchSizes, len(entries))
 			s.mu.Unlock()
 		}
 	}
@@ -164,9 +174,9 @@ func (s *Server) Count() int {
 	return len(s.entries)
 }
 
-// Reset drops all accumulated entries. Used when a single server instance is
-// reused across per-side snapshots (the driver may prefer a fresh server per
-// side; Reset is the lighter-weight alternative).
+// Reset drops all accumulated entries AND batchSizes. Used when a single
+// server instance is reused across per-side snapshots (the driver may prefer a
+// fresh server per side; Reset is the lighter-weight alternative).
 //
 // Call only when no stream is in flight (between per-side snapshots; server
 // quiescent); a concurrent in-flight append would land after the nil and
@@ -175,7 +185,43 @@ func (s *Server) Count() int {
 func (s *Server) Reset() {
 	s.mu.Lock()
 	s.entries = nil
+	s.batchSizes = nil
 	s.mu.Unlock()
+}
+
+// BatchSizes returns a defensive snapshot copy of the per-message entry counts
+// in arrival order (one int per received StreamAccessLogsMessage carrying
+// http_logs). The differential driver reads this to prove the subject batched
+// (MaxBatchSize >= 2). 44.2 (D-BUF-RECEIVER-BATCH-API).
+func (s *Server) BatchSizes() []int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]int, len(s.batchSizes))
+	copy(out, s.batchSizes)
+	return out
+}
+
+// MaxBatchSize returns the largest per-message entry count seen (0 if no
+// messages). The subject-side batching proof: a buffered sink yields >= 2;
+// a one-entry-per-message fixed flush yields 1.
+func (s *Server) MaxBatchSize() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	best := 0
+	for _, n := range s.batchSizes {
+		if n > best {
+			best = n
+		}
+	}
+	return best
+}
+
+// MessageCount returns the number of received messages carrying http_logs
+// (== len(BatchSizes())). A batched run has MessageCount < total entries.
+func (s *Server) MessageCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.batchSizes)
 }
 
 // Addr returns the listener's bound `host:port` string. Load-bearing when New

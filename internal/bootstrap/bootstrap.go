@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
@@ -165,6 +166,12 @@ const (
 	// is unsupported; silently ignoring it would drop a configured user's access
 	// logs with no signal (the ADR-0080 anti-silent-divergence rule).
 	tcpGrpcAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig"
+
+	// alsDefaultBufferSizeBytes is the buffer_size_bytes default applied when the
+	// CommonGrpcAccessLogConfig wrapper is absent — the empirically-pinned
+	// reference default (AMEND-BUF-2). An explicit present-but-0 value is honored
+	// as flush-every-entry and is NOT coerced to this default.
+	alsDefaultBufferSizeBytes uint32 = 16384
 )
 
 // AccessLogConfig is the parsed-but-not-yet-opened representation of one
@@ -177,12 +184,14 @@ type AccessLogConfig struct {
 
 // ALSConfig is the parsed gRPC Access Log Service sink config from one HCM
 // access_log[] HttpGrpcAccessLogConfig entry (ADR-0255). The sink is built in
-// cmd/envoy-go/main.go after Load returns. buffer_*/additional_*_headers are
-// PARSE-ACCEPTED-but-INERT at 44.1 (honored at 44.2/44.3); only the two fields
-// below are consumed.
+// cmd/envoy-go/main.go after Load returns. buffer_size_bytes and
+// buffer_flush_interval are now CONSUMED (AMEND-BUF-2, phase 44.2);
+// additional_*_headers and AccessLog.filter STAY inert until 44.3.
 type ALSConfig struct {
-	ClusterName string // common_config.grpc_service.envoy_grpc.cluster_name
-	LogName     string // common_config.log_name (empty is valid)
+	ClusterName         string        // common_config.grpc_service.envoy_grpc.cluster_name
+	LogName             string        // common_config.log_name (empty is valid)
+	BufferSizeBytes     uint32        // common_config.buffer_size_bytes (default 16384 when wrapper absent; explicit 0 ⇒ flush-every-entry) — AMEND-BUF-2
+	BufferFlushInterval time.Duration // common_config.buffer_flush_interval (default 1s when absent/zero — a NewTicker(<=0) panic-guard) — AMEND-BUF-2
 }
 
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
@@ -211,9 +220,11 @@ type Bootstrap struct {
 	// from each HCM filter, in registration order across all listeners and HCM
 	// filters (parallel to AccessLogConfigs, which carries file-sink entries).
 	// Empty when no HttpGrpcAccessLogConfig access_log entries are configured.
-	// Per ADR-0255 only envoy_grpc.cluster_name (non-empty) + log_name are
-	// consumed; transport_api_version V2 and google_grpc are rejected at parse
-	// time; buffer_*/additional_*_headers are parse-accepted-but-inert at 44.1.
+	// Per ADR-0255/AMEND-BUF-2: transport_api_version V2 and google_grpc are
+	// rejected at parse time; envoy_grpc.cluster_name (non-empty), log_name,
+	// buffer_size_bytes (default 16384), and buffer_flush_interval (default 1s)
+	// are now all CONSUMED (phase 44.2); additional_*_headers and
+	// AccessLog.filter stay inert until 44.3.
 	ALSConfigs []ALSConfig
 	// ConfigPath is the file path the bootstrap was loaded from. Set by the
 	// caller (cmd/envoy-go/main.go) post-Load via bs.ConfigPath = *cfgPath;
@@ -345,7 +356,8 @@ func parseOneAccessLog(al *accesslogv3.AccessLog, idx int, result *Bootstrap) er
 // and appends an ALSConfig to result.ALSConfigs (ADR-0255). It STRICT-REJECTS
 // transport_api_version V2 (envoy-go is V3-only), google_grpc grpc_service
 // (only envoy_grpc is supported), and an empty envoy_grpc.cluster_name.
-// buffer_*/additional_*_headers are parse-accepted-but-inert at 44.1.
+// buffer_size_bytes and buffer_flush_interval are now CONSUMED (AMEND-BUF-2,
+// phase 44.2); additional_*_headers stays parse-accepted-but-inert until 44.3.
 func parseGrpcAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
 	cfg := &grpcalv3.HttpGrpcAccessLogConfig{}
 	if err := proto.Unmarshal(tc.GetValue(), cfg); err != nil {
@@ -363,9 +375,27 @@ func parseGrpcAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
 	if eg.GetClusterName() == "" {
 		return fmt.Errorf("bootstrap: access_log[%d]: grpc ALS grpc_service.envoy_grpc.cluster_name is required (must be non-empty)", idx)
 	}
+	// buffer_size_bytes (field 4): the WRAPPER pointer is nil when the field is
+	// absent ⇒ default 16384 (AMEND-BUF-2); an explicit present-but-0 value is
+	// honored as flush-every-entry (the size threshold sum >= 0 always fires).
+	bufferSizeBytes := alsDefaultBufferSizeBytes
+	if w := common.GetBufferSizeBytes(); w != nil {
+		bufferSizeBytes = w.GetValue()
+	}
+	// buffer_flush_interval (field 3): absent/zero ⇒ default 1s. This is a HARD
+	// panic-guard, not merely a fidelity default — time.NewTicker(d) panics for
+	// d <= 0, so a non-positive interval MUST be coerced before it reaches the
+	// sink's ticker (§3.2). Any POSITIVE explicit value (incl. sub-second) is
+	// honored verbatim.
+	bufferFlushInterval := common.GetBufferFlushInterval().AsDuration()
+	if bufferFlushInterval <= 0 {
+		bufferFlushInterval = time.Second
+	}
 	result.ALSConfigs = append(result.ALSConfigs, ALSConfig{
-		ClusterName: eg.GetClusterName(),
-		LogName:     common.GetLogName(),
+		ClusterName:         eg.GetClusterName(),
+		LogName:             common.GetLogName(),
+		BufferSizeBytes:     bufferSizeBytes,
+		BufferFlushInterval: bufferFlushInterval,
 	})
 	return nil
 }

@@ -10,6 +10,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	dataaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/data/accesslog/v3"
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/esalaine/envoy-go/internal/stats"
 )
@@ -33,10 +34,17 @@ const closeDrainGrace = 5 * time.Second
 // structured HTTPAccessLogEntry protos to an Envoy AccessLogService over a
 // lazily-established, identifier-once, reused client-streaming RPC. It mirrors
 // AsyncFileSink's bounded-channel + writer-goroutine + idempotent-Close shape
-// (ADR-0255). On a full channel the new record is dropped (drop-newest) and the
-// dropped counter Inc'd; a rate-limited diagnostic is emitted at most once per
-// second. On a Send error the writer re-opens the stream once (re-sending the
-// identifier on the same record's resend) before dropping the entry.
+// (ADR-0255). The writer ACCUMULATES entries into an in-memory buffer and Sends
+// a BATCH as one StreamAccessLogsMessage on the FIRST of three triggers: the
+// accumulated serialized bytes reaching bufferSizeBytes (AMEND-BUF-1; 0 ⇒
+// flush-every-entry), the bufferFlushInterval timer ticking (AMEND-BUF-2), or
+// Close draining the pending buffer (AMEND-BUF-5). On a full channel the new
+// record is dropped (drop-newest), logsDropped Inc'd, and a rate-limited
+// diagnostic emitted at most once per second. On a Send error the writer
+// re-opens the stream once and resends the WHOLE batch; a stream-open failure or
+// a second-Send failure drops the batch logged-not-counted (memory stays bounded
+// under a sustained outage). logsWritten counts ENTRIES, not messages
+// (batch-invariant — AMEND-BUF-4).
 type GrpcAccessLogSink struct {
 	ch          chan any
 	client      alsClient
@@ -49,6 +57,9 @@ type GrpcAccessLogSink struct {
 	closeErr    error
 	lastDropLog atomic.Int64
 
+	bufferSizeBytes     int           // accumulated-serialized-byte flush threshold (AMEND-BUF-1); 0 ⇒ flush-every-entry
+	bufferFlushInterval time.Duration // flush-interval timer period (AMEND-BUF-2; guaranteed > 0 by the parse layer)
+
 	// ctx/cancel bound the lifetime of the client-streaming RPC; Close cancels
 	// ctx to unwedge a stalled Send/CloseAndRecv (bounded network shutdown).
 	ctx    context.Context
@@ -57,21 +68,23 @@ type GrpcAccessLogSink struct {
 
 // NewGrpcAccessLogSink builds a gRPC ALS sink over client with the bounded
 // channel at the default capacity (4096) and starts the writer goroutine.
-func NewGrpcAccessLogSink(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter) *GrpcAccessLogSink {
-	return newGrpcSinkWithCapacity(client, logName, node, written, dropped, defaultChannelCapacity)
+func NewGrpcAccessLogSink(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration) *GrpcAccessLogSink {
+	return newGrpcSinkWithCapacity(client, logName, node, written, dropped, bufferSizeBytes, bufferFlushInterval, defaultChannelCapacity)
 }
 
 // newGrpcSinkWithCapacity is the test-friendly variant; production callers use
 // NewGrpcAccessLogSink (capacity 4096).
-func newGrpcSinkWithCapacity(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter, capacity int) *GrpcAccessLogSink {
+func newGrpcSinkWithCapacity(client alsClient, logName string, node *corev3.Node, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration, capacity int) *GrpcAccessLogSink {
 	s := &GrpcAccessLogSink{
-		ch:          make(chan any, capacity),
-		client:      client,
-		logName:     logName,
-		node:        node,
-		logsWritten: written,
-		logsDropped: dropped,
-		done:        make(chan struct{}),
+		ch:                  make(chan any, capacity),
+		client:              client,
+		logName:             logName,
+		node:                node,
+		logsWritten:         written,
+		logsDropped:         dropped,
+		bufferSizeBytes:     bufferSizeBytes,
+		bufferFlushInterval: bufferFlushInterval,
+		done:                make(chan struct{}),
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	go s.run()
@@ -120,28 +133,46 @@ func (s *GrpcAccessLogSink) Close() error {
 	return s.closeErr
 }
 
-// run is the writer goroutine: drain channel-receives into per-record
-// client-streaming Sends over a single reused stream, re-establishing it on a
-// Send error. The identifier is attached to the first successful Send of the
-// sink's life (and re-armed across a reconnect for the same record).
+// run is the writer goroutine: drain channel-receives into a buffer and Send a
+// BATCH on a size-OR-timer trigger over a single reused stream, re-establishing
+// it on a Send error. The identifier is attached to the first successful flush
+// of the sink's life (and re-armed across a reconnect). The 44.1 one-entry-per-
+// message behavior is the bufferSizeBytes==0 degenerate case (every entry
+// crosses sum >= 0 immediately).
 func (s *GrpcAccessLogSink) run() {
 	defer close(s.done)
+
 	var stream accesslogv3.AccessLogService_StreamAccessLogsClient
 	sentIdentifier := false
+	var buf []*dataaccesslogv3.HTTPAccessLogEntry
+	bufBytes := 0
 
-	for r := range s.ch {
-		rec, ok := r.(*Record)
-		if !ok {
-			log.Printf("accesslog: gRPC ALS sink got non-*Record %T (log_name=%s); dropping", r, s.logName)
-			continue // non-Record ignored
+	// flush Sends the accumulated batch as ONE StreamAccessLogsMessage, with the
+	// identifier on the first successful flush of the stream's life (re-armed
+	// across a reconnect). Up to two attempts: the initial Send plus one
+	// reconnect-and-resend-the-WHOLE-batch. On success logsWritten += len(buf)
+	// (batch-invariant — AMEND-BUF-4); on a stream-open failure OR a second-Send
+	// failure the batch is dropped (logged, not counted) so memory stays bounded
+	// under a sustained outage — matching 44.1's open-failure-drops-the-record
+	// policy. logs_dropped stays channel-full-overflow-only (AMEND-ALS-1), so a
+	// flush-path drop is logged but NOT counted there. Empty buf is a no-op (the
+	// timer's idle tick).
+	//
+	// buf-reuse contract: on completion buf is truncated (buf[:0]) and its backing
+	// array is reused by the next batch's append. The real gRPC Send serializes
+	// the message synchronously before returning, so the bytes are captured before
+	// reuse (zero extra allocation in production). The test fake records the
+	// message pointer, so it takes a defensive copy of GetLogEntry() in its Send.
+	flush := func() {
+		if len(buf) == 0 {
+			return
 		}
-		// Up to two attempts: the initial Send plus one reconnect-and-resend.
 		for attempt := 0; attempt < 2; attempt++ {
 			if stream == nil {
 				st, err := s.client.StreamAccessLogs(s.ctx)
 				if err != nil {
 					log.Printf("accesslog: gRPC ALS open stream (log_name=%s): %v", s.logName, err)
-					break // leave stream nil; the next record retries
+					break // drop the batch (reset below) — bounds memory under a sustained outage
 				}
 				stream = st
 				sentIdentifier = false
@@ -149,7 +180,7 @@ func (s *GrpcAccessLogSink) run() {
 			msg := &accesslogv3.StreamAccessLogsMessage{
 				LogEntries: &accesslogv3.StreamAccessLogsMessage_HttpLogs{
 					HttpLogs: &accesslogv3.StreamAccessLogsMessage_HTTPAccessLogEntries{
-						LogEntry: []*dataaccesslogv3.HTTPAccessLogEntry{buildHTTPAccessLogEntry(rec)},
+						LogEntry: buf,
 					},
 				},
 			}
@@ -163,17 +194,47 @@ func (s *GrpcAccessLogSink) run() {
 				log.Printf("accesslog: gRPC ALS send (log_name=%s): %v", s.logName, err)
 				stream = nil
 				sentIdentifier = false
-				continue // reconnect-and-resend this record once
+				continue // reconnect-and-resend the whole batch once
 			}
 			sentIdentifier = true
-			s.logsWritten.Inc()
+			s.logsWritten.Add(uint64(len(buf)))
 			break
 		}
+		// Reset the buffer whether the batch was sent or dropped — a dropped batch
+		// (open failure OR second-Send failure) is logged-not-counted, matching the
+		// 44.1 drop policy and keeping memory bounded under a sustained outage.
+		buf = buf[:0]
+		bufBytes = 0
 	}
 
-	if stream != nil {
-		if _, err := stream.CloseAndRecv(); err != nil {
-			log.Printf("accesslog: gRPC ALS close-and-recv (log_name=%s): %v", s.logName, err)
+	ticker := time.NewTicker(s.bufferFlushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case r, ok := <-s.ch:
+			if !ok {
+				flush() // AMEND-BUF-5: drain the pending buffer before CloseAndRecv
+				if stream != nil {
+					if _, err := stream.CloseAndRecv(); err != nil {
+						log.Printf("accesslog: gRPC ALS close-and-recv (log_name=%s): %v", s.logName, err)
+					}
+				}
+				return
+			}
+			rec, ok := r.(*Record)
+			if !ok {
+				log.Printf("accesslog: gRPC ALS sink got non-*Record %T (log_name=%s); dropping", r, s.logName)
+				continue // non-Record ignored
+			}
+			entry := buildHTTPAccessLogEntry(rec)
+			buf = append(buf, entry)
+			bufBytes += proto.Size(entry)
+			if bufBytes >= s.bufferSizeBytes { // SIZE trigger (AMEND-BUF-1); 0 ⇒ every entry flushes
+				flush()
+			}
+		case <-ticker.C:
+			flush() // TIMER trigger (AMEND-BUF-2; no-op if buf empty)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -480,7 +481,7 @@ func TestBootstrap_ALS_AcceptMinimal(t *testing.T) {
 	if got := len(bs.ALSConfigs); got != 1 {
 		t.Fatalf("ALSConfigs: got %d, want 1", got)
 	}
-	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "mylog"}); got != want {
+	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "mylog", BufferSizeBytes: 16384, BufferFlushInterval: time.Second}); got != want {
 		t.Errorf("ALSConfigs[0]: got %+v, want %+v", got, want)
 	}
 }
@@ -503,15 +504,15 @@ func TestBootstrap_ALS_AcceptEmptyLogName(t *testing.T) {
 	if got := len(bs.ALSConfigs); got != 1 {
 		t.Fatalf("ALSConfigs: got %d, want 1", got)
 	}
-	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: ""}); got != want {
+	if got, want := bs.ALSConfigs[0], (ALSConfig{ClusterName: "als_cluster", LogName: "", BufferSizeBytes: 16384, BufferFlushInterval: time.Second}); got != want {
 		t.Errorf("ALSConfigs[0]: got %+v, want %+v", got, want)
 	}
 }
 
-// TestBootstrap_ALS_AcceptInertBuffer verifies buffer_size_bytes /
-// buffer_flush_interval are PARSE-ACCEPTED-but-INERT at 44.1 (the bootstrap
-// boots and yields one ALSConfig).
-func TestBootstrap_ALS_AcceptInertBuffer(t *testing.T) {
+// TestBootstrap_ALS_AcceptBufferFields verifies buffer_size_bytes /
+// buffer_flush_interval are CONSUMED at 44.2 (AMEND-BUF-2): an explicit
+// 16384 / 1s pair is carried verbatim into the ALSConfig.
+func TestBootstrap_ALS_AcceptBufferFields(t *testing.T) {
 	yamlSrc := hcmWithAccessLog(`
                   - name: envoy.access_loggers.http_grpc
                     typed_config:
@@ -529,6 +530,12 @@ func TestBootstrap_ALS_AcceptInertBuffer(t *testing.T) {
 	}
 	if got := len(bs.ALSConfigs); got != 1 {
 		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].BufferSizeBytes, uint32(16384); got != want {
+		t.Errorf("BufferSizeBytes: got %d, want %d", got, want)
+	}
+	if got, want := bs.ALSConfigs[0].BufferFlushInterval, 1*time.Second; got != want {
+		t.Errorf("BufferFlushInterval: got %v, want %v", got, want)
 	}
 }
 
@@ -911,6 +918,191 @@ func TestBootstrap_AccessLog_TwoFileEntries(t *testing.T) {
 	}
 	if got, want := bs.AccessLogConfigs[1].Path, "/tmp/envoy-access-2.log"; got != want {
 		t.Errorf("AccessLogConfigs[1].Path: got %q, want %q", got, want)
+	}
+}
+
+// TestBootstrap_ALS_Buffer_DefaultBoth verifies that when buffer_size_bytes and
+// buffer_flush_interval are both absent (no wrapper, no duration), the
+// AMEND-BUF-2 defaults are applied: BufferSizeBytes == 16384 and
+// BufferFlushInterval == 1s.
+func TestBootstrap_ALS_Buffer_DefaultBoth(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].BufferSizeBytes, uint32(16384); got != want {
+		t.Errorf("BufferSizeBytes: got %d, want %d (AMEND-BUF-2 default)", got, want)
+	}
+	if got, want := bs.ALSConfigs[0].BufferFlushInterval, 1*time.Second; got != want {
+		t.Errorf("BufferFlushInterval: got %v, want %v (AMEND-BUF-2 default)", got, want)
+	}
+}
+
+// TestBootstrap_ALS_Buffer_ExplicitSize verifies that an explicit
+// buffer_size_bytes value is honored verbatim (not replaced by the default).
+func TestBootstrap_ALS_Buffer_ExplicitSize(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                        buffer_size_bytes: 4096`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].BufferSizeBytes, uint32(4096); got != want {
+		t.Errorf("BufferSizeBytes: got %d, want %d", got, want)
+	}
+}
+
+// TestBootstrap_ALS_Buffer_ExplicitZeroSize verifies that buffer_size_bytes: 0
+// (UInt32Value wrapper PRESENT with value 0) is honored as flush-every-entry —
+// NOT coerced to the 16384 default. An explicit present-but-zero wrapper is
+// semantically distinct from an absent wrapper (nil pointer) per AMEND-BUF-2.
+func TestBootstrap_ALS_Buffer_ExplicitZeroSize(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                        buffer_size_bytes: 0`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].BufferSizeBytes, uint32(0); got != want {
+		t.Errorf("BufferSizeBytes: got %d, want %d (explicit 0 must be honored, not coerced to default)", got, want)
+	}
+}
+
+// TestBootstrap_ALS_Buffer_ExplicitIntervalSubsecond verifies a positive
+// sub-second buffer_flush_interval is honored verbatim (200ms).
+func TestBootstrap_ALS_Buffer_ExplicitIntervalSubsecond(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                        buffer_flush_interval: 0.2s`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].BufferFlushInterval, 200*time.Millisecond; got != want {
+		t.Errorf("BufferFlushInterval: got %v, want %v", got, want)
+	}
+}
+
+// TestBootstrap_ALS_Buffer_IntervalZeroCoerced verifies that
+// buffer_flush_interval: 0s (Duration present but zero) is coerced to the 1s
+// default — a time.NewTicker(0) panic-guard (§3.2 AMEND-BUF-2).
+func TestBootstrap_ALS_Buffer_IntervalZeroCoerced(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster
+                        buffer_flush_interval: 0s`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].BufferFlushInterval, 1*time.Second; got != want {
+		t.Errorf("BufferFlushInterval: got %v, want %v (0s must be coerced to 1s panic-guard)", got, want)
+	}
+}
+
+// TestBootstrap_ALS_Buffer_IntervalAbsentCoerced verifies that an absent
+// buffer_flush_interval (nil *durationpb.Duration → AsDuration() == 0 → coerce)
+// produces the 1s default.
+func TestBootstrap_ALS_Buffer_IntervalAbsentCoerced(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: als_cluster`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.ALSConfigs); got != 1 {
+		t.Fatalf("ALSConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.ALSConfigs[0].BufferFlushInterval, 1*time.Second; got != want {
+		t.Errorf("BufferFlushInterval: got %v, want %v (absent interval must be coerced to 1s)", got, want)
+	}
+}
+
+// TestBootstrap_ALS_Buffer_WithStrictReject verifies that a config with
+// buffer_size_bytes set AND google_grpc still produces an error for google_grpc.
+// The reject arms run BEFORE the buffer reads; the buffer fields add no new
+// accept-path that bypasses a reject.
+func TestBootstrap_ALS_Buffer_WithStrictReject(t *testing.T) {
+	yamlSrc := hcmWithAccessLog(`
+                  - name: envoy.access_loggers.http_grpc
+                    typed_config:
+                      "@type": ` + grpcALSType + `
+                      common_config:
+                        log_name: mylog
+                        grpc_service:
+                          google_grpc:
+                            target_uri: 127.0.0.1:50051
+                            stat_prefix: als
+                        buffer_size_bytes: 4096`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for google_grpc (even with buffer_size_bytes set), got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "bootstrap:") {
+		t.Errorf("error should be bootstrap:-prefixed: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "google_grpc") {
+		t.Errorf("error should name google_grpc: %q", err.Error())
 	}
 }
 

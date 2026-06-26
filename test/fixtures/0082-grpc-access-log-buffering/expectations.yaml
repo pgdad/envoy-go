@@ -1,0 +1,108 @@
+# Phase 44.2 fixture 0082-grpc-access-log-buffering expectations (ADR-0019 —
+# prose; the driver is the enforcer; this file is documentation).
+#
+# This fixture is 0081 + the two common_config buffer fields. It proves the
+# phase-44.2 buffering machinery is LIVE: the buffered sink coalesces >= 2
+# entries into a single StreamAccessLogsMessage while the per-entry payload stays
+# cross-side EXACT.
+#
+# Topology (single-listener plaintext H1; driver-owned in-process AccessLogService
+# gRPC receiver):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). HCM
+#                        carries one access_log[] HttpGrpcAccessLogConfig entry
+#                        (log_name "0082"; grpc_service.envoy_grpc.cluster_name
+#                        c_als) streaming one HTTPAccessLogEntry per completed
+#                        request. The common_config additionally carries the two
+#                        44.2 buffer fields:
+#                          buffer_size_bytes:     1048576  (1 MiB — DORMANT)
+#                          buffer_flush_interval: 1s       (the TIMER flush lever)
+#   c_backend          — HTTPFixedBody subprocess (test/fixtures/0006-access-log/
+#                        backends/; "backend:v1/fixed\n" = 17 bytes).
+#   c_als              — driver-owned in-process AccessLogService receiver
+#                        (test/helpers/accessloggrpc/) on a driver-allocated
+#                        stable port, bound 0.0.0.0:<port> so the reference
+#                        container (host.docker.internal) AND the subject
+#                        (127.0.0.1) both reach it. The cluster carries the
+#                        mandatory http2_protocol_options:{} for gRPC framing +
+#                        plaintext h2c (D-ALS-RECEIVER — no TLS).
+#
+# Reference Envoy v1.37.2 (STRICT_DNS via host.docker.internal) vs envoy-go
+# (STATIC, in-process).
+#
+# ## Buffer drive (D-BUF-DIFFERENTIAL-DRIVE / SPEC §8.1)
+#
+#   buffer_size_bytes: 1048576 (1 MiB) — DORMANT. N small entries never reach the
+#       byte cap, so the SIZE trigger never fires (the byte-accounting-fragile
+#       size-cap path is deliberately AVOIDED cross-side).
+#   buffer_flush_interval: 1s — the deterministic TIMER flush lever.
+#
+# The N=16 requests are fired CONCURRENTLY (a sync.WaitGroup fan-out) so the
+# records queue into envoy-go's single process-global buffer FASTER than the 1s
+# timer elapses; the next tick flushes >= 2 as one batch. The concurrent burst +
+# the wide 1s interval is the coalescence guarantee. If it flakes, widen the
+# interval and/or raise N (Task 8 runs the 20/20 flake gate).
+#
+# ## Workload
+#
+# Each side fires N=16 IDENTICAL query-less requests CONCURRENTLY:
+#   GET /health, Host: als.example, User-Agent: als-probe/1.
+# Each request routes to c_backend (200 + 17-byte fixed body) and produces
+# exactly one streamed HTTPAccessLogEntry. The driver POLLS the receiver's
+# Count() to >= 16 (poll-to-converge; the reference buffers ALS entries and
+# flushes on a ~1s timer — never a fixed sleep). Per-side separation: the
+# receiver is Reset() at the start of each side's drive (clears entries AND
+# batchSizes); the subject generates no access-log entries until its own
+# DriveSubject window.
+#
+# ## Query-less path (AMEND-ALS-2)
+#
+# The request path MUST be query-less. envoy-go's Record.Path is path-only; the
+# reference's request.path additionally carries the query string. A query-bearing
+# request would DIVERGE cross-side. /health (no query) keeps request.path EXACT
+# on both sides. Documented faithful constraint.
+#
+# ## Cross-side batch COUNTS NOT asserted (AMEND-ALS-3 / AMEND-BUF-3)
+#
+# The cross-side assertion is on the per-entry PAYLOAD aggregated across all
+# received entries — NOT stream count, per-message batching, or flush cadence,
+# which legitimately vary side-to-side. The reference buffers PER-WORKER-THREAD
+# (un-pinned worker count) while envoy-go uses one process-global buffer, so
+# cross-side batch/message counts are infeasible. The receiver accumulates
+# log_entry[] across ALL messages and streams; the driver asserts every
+# accumulated entry. The buffering proof (maxBatchSize >= 2) is SUBJECT-side ONLY.
+#
+# ## Asserted 7-field subset (cross-side EXACT, every entry, both sides)
+#
+#   request.request_method      == GET     (corev3.RequestMethod_GET)
+#   request.path                == "/health"
+#   request.authority           == "als.example"
+#   request.user_agent          == "als-probe/1"
+#   response.response_code      == 200     (wrapperspb.UInt32Value)
+#   response.response_body_bytes == 17      (HTTPFixedBody fixed-body length)
+#   protocol_version            == HTTP11  (HTTPAccessLogEntry_HTTP11)
+#
+# PLUS the subject-side flat /stats counter:
+#   access_logs.grpc_access_log.logs_written == 16  (every send succeeded)
+#
+# PLUS the SUBJECT-side buffering proof (D-BUF-DIFFERENTIAL-DRIVE / AMEND-BUF-3):
+#   max(subjBatchSizes) >= 2  (the buffer coalesced >= 2 entries into at least
+#   one StreamAccessLogsMessage — BITES a regression to the 44.1 one-entry-per-
+#   message fixed flush, which would make every batch size 1).
+#
+# ## UNasserted (deferred / non-deterministic / subject-absent)
+#
+#   common_properties.start_time / duration / upstream_remote_address
+#       — non-deterministic (populated but not asserted; AMEND-ALS-4).
+#   identifier.node             — minimal node (Id+Cluster), D-ALS-NODE; UNasserted.
+#   reference-side batch/message framing counts — AMEND-ALS-3 / AMEND-BUF-3.
+#   request.scheme, request_id, upstream_cluster, access_log_type,
+#   response_code_details, wire-byte counts (request/response_headers_bytes,
+#   *_body_bytes other than response_body_bytes) — subject-absent reference
+#   fields; not mapped by envoy-go's 10-field Record (D-ALS-* SPEC §12).
+#
+# Cross-refs: phase 44.2 SPEC §8.1/§12 + D-BUF-DIFFERENTIAL-DRIVE + AMEND-BUF-3 +
+#             D-ALS-RECEIVER + AMEND-ALS-2 + AMEND-ALS-3 + AMEND-ALS-4 +
+#             D-ALS-NODE + ADR-0256 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned.

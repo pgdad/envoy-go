@@ -290,3 +290,194 @@ func TestClose_Idempotent(t *testing.T) {
 	srv.Close() // second Close: no-op via stopOnce.
 	srv.Stop()  // Stop after Close: no-op (shared once).
 }
+
+// TestBatchSizes_TracksPerMessageEntryCount verifies the 44.2
+// D-BUF-RECEIVER-BATCH-API additions: BatchSizes, MaxBatchSize, and
+// MessageCount track per-message entry counts, and Reset clears them both
+// alongside the flat entries accumulator.
+//
+// The test sends THREE messages with entry counts {1, 3, 2} (the second and
+// third simulate a buffered flush carrying multiple entries), asserts the new
+// accessors, then validates Reset zeroes all state.
+func TestBatchSizes_TracksPerMessageEntryCount(t *testing.T) {
+	srv := New(t)
+	client := dialTestClient(t, srv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamAccessLogs(ctx)
+	if err != nil {
+		t.Fatalf("StreamAccessLogs: %v", err)
+	}
+
+	// Message 1: 1 entry.
+	if err := stream.Send(&accesslogv3.StreamAccessLogsMessage{
+		LogEntries: &accesslogv3.StreamAccessLogsMessage_HttpLogs{
+			HttpLogs: &accesslogv3.StreamAccessLogsMessage_HTTPAccessLogEntries{
+				LogEntry: []*dataaccesslogv3.HTTPAccessLogEntry{mkEntry("/m1a")},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send(msg1): %v", err)
+	}
+	// Message 2: 3 entries (simulates a buffered batch).
+	if err := stream.Send(&accesslogv3.StreamAccessLogsMessage{
+		LogEntries: &accesslogv3.StreamAccessLogsMessage_HttpLogs{
+			HttpLogs: &accesslogv3.StreamAccessLogsMessage_HTTPAccessLogEntries{
+				LogEntry: []*dataaccesslogv3.HTTPAccessLogEntry{
+					mkEntry("/m2a"), mkEntry("/m2b"), mkEntry("/m2c"),
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send(msg2): %v", err)
+	}
+	// Message 3: 2 entries.
+	if err := stream.Send(&accesslogv3.StreamAccessLogsMessage{
+		LogEntries: &accesslogv3.StreamAccessLogsMessage_HttpLogs{
+			HttpLogs: &accesslogv3.StreamAccessLogsMessage_HTTPAccessLogEntries{
+				LogEntry: []*dataaccesslogv3.HTTPAccessLogEntry{
+					mkEntry("/m3a"), mkEntry("/m3b"),
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send(msg3): %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	// Flat entry total is unchanged: 1+3+2 == 6.
+	if got := srv.Count(); got != 6 {
+		t.Errorf("Count: got %d, want 6", got)
+	}
+	// MessageCount: one int per received message.
+	if got := srv.MessageCount(); got != 3 {
+		t.Errorf("MessageCount: got %d, want 3", got)
+	}
+	// BatchSizes: per-message entry counts in arrival order.
+	gotSizes := srv.BatchSizes()
+	wantSizes := []int{1, 3, 2}
+	if len(gotSizes) != len(wantSizes) {
+		t.Fatalf("BatchSizes len: got %d, want %d", len(gotSizes), len(wantSizes))
+	}
+	for i, want := range wantSizes {
+		if gotSizes[i] != want {
+			t.Errorf("BatchSizes[%d]: got %d, want %d", i, gotSizes[i], want)
+		}
+	}
+	// MaxBatchSize: the largest per-message count.
+	if got := srv.MaxBatchSize(); got != 3 {
+		t.Errorf("MaxBatchSize: got %d, want 3", got)
+	}
+
+	// After Reset: both entries AND batchSizes clear.
+	srv.Reset()
+	if got := srv.Count(); got != 0 {
+		t.Errorf("Count after Reset: got %d, want 0", got)
+	}
+	if got := srv.MessageCount(); got != 0 {
+		t.Errorf("MessageCount after Reset: got %d, want 0", got)
+	}
+	if got := srv.MaxBatchSize(); got != 0 {
+		t.Errorf("MaxBatchSize after Reset: got %d, want 0", got)
+	}
+	if got := srv.BatchSizes(); len(got) != 0 {
+		t.Errorf("BatchSizes after Reset: got %v, want empty", got)
+	}
+}
+
+// TestMaxBatchSize_ZeroOnFreshServer verifies MaxBatchSize returns 0 (no panic)
+// when called on a server that has not yet received any messages.
+func TestMaxBatchSize_ZeroOnFreshServer(t *testing.T) {
+	srv := New(t)
+	if got := srv.MaxBatchSize(); got != 0 {
+		t.Errorf("MaxBatchSize on fresh server: got %d, want 0", got)
+	}
+	if got := srv.MessageCount(); got != 0 {
+		t.Errorf("MessageCount on fresh server: got %d, want 0", got)
+	}
+	if got := srv.BatchSizes(); len(got) != 0 {
+		t.Errorf("BatchSizes on fresh server: got %v, want empty", got)
+	}
+}
+
+// TestConcurrentStreams_NoRace_BatchSizes extends the existing concurrency test
+// to cover the new batchSizes field under the -race detector: concurrent
+// StreamAccessLogs goroutines write batchSizes, while a poller reads
+// BatchSizes()/MessageCount()/MaxBatchSize() concurrently.
+func TestConcurrentStreams_NoRace_BatchSizes(t *testing.T) {
+	srv := New(t)
+
+	const concurrency = 16
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	errs := make([]error, concurrency)
+	for i := 0; i < concurrency; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			client := dialTestClient(t, srv.Addr())
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			stream, err := client.StreamAccessLogs(ctx)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			if err := stream.Send(&accesslogv3.StreamAccessLogsMessage{
+				LogEntries: &accesslogv3.StreamAccessLogsMessage_HttpLogs{
+					HttpLogs: &accesslogv3.StreamAccessLogsMessage_HTTPAccessLogEntries{
+						LogEntry: []*dataaccesslogv3.HTTPAccessLogEntry{mkEntry("/r"), mkEntry("/r2")},
+					},
+				},
+			}); err != nil {
+				errs[i] = err
+				return
+			}
+			if _, err := stream.CloseAndRecv(); err != nil {
+				errs[i] = err
+			}
+		}()
+	}
+
+	// Concurrent poller exercising all three new accessors under -race.
+	done := make(chan struct{})
+	deadline := time.After(10 * time.Second)
+	go func() {
+		defer close(done)
+		for {
+			if srv.Count() >= concurrency*2 {
+				return
+			}
+			select {
+			case <-deadline:
+				return
+			default:
+			}
+			_ = srv.BatchSizes()
+			_ = srv.MessageCount()
+			_ = srv.MaxBatchSize()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+	<-done
+	for _, err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if got := srv.Count(); got != concurrency*2 {
+		t.Errorf("Count: got %d, want %d", got, concurrency*2)
+	}
+	if got := srv.MessageCount(); got != concurrency {
+		t.Errorf("MessageCount: got %d, want %d", got, concurrency)
+	}
+	if got := srv.MaxBatchSize(); got != 2 {
+		t.Errorf("MaxBatchSize: got %d, want 2", got)
+	}
+}
