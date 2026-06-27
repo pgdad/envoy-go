@@ -875,6 +875,7 @@ func TestBootstrap_OTLP(t *testing.T) {
 		wantErr bool
 		errSubs []string
 		wantCfg *OTLPConfig
+		check   func(t *testing.T, c *OTLPConfig)
 	}{
 		{
 			name: "accept-minimal",
@@ -1015,41 +1016,183 @@ func TestBootstrap_OTLP(t *testing.T) {
 			errSubs: []string{"OTLP access log", "cluster_name"},
 		},
 		{
-			name: "reject-body",
+			// FLIPPED from 45.1 reject-body: body is now compiled at boot (AMEND-OPS-2/3).
+			name: "accept-body",
 			block: `
                   - name: envoy.access_loggers.open_telemetry
                     typed_config:
                       "@type": ` + otlpALSType + `
                       body:
-                        string_value: "custom"` + minimalCommon,
-			wantErr: true,
-			errSubs: []string{"OTLP access log", "body"},
+                        string_value: "%REQ(:METHOD)% %RESPONSE_CODE%"` + minimalCommon,
+			check: func(t *testing.T, c *OTLPConfig) {
+				if c.Body == nil {
+					t.Errorf("Body: got nil, want a compiled template")
+				}
+			},
 		},
 		{
-			name: "reject-attributes",
+			// FLIPPED from 45.1 reject-attributes: attributes now compiled at boot.
+			name: "accept-attributes",
 			block: `
                   - name: envoy.access_loggers.open_telemetry
                     typed_config:
                       "@type": ` + otlpALSType + `
                       attributes:
                         values:
-                          - key: "k"
-                            value: { string_value: "v" }` + minimalCommon,
-			wantErr: true,
-			errSubs: []string{"OTLP access log", "attributes"},
+                          - key: "m"
+                            value: { string_value: "%REQ(:METHOD)%" }` + minimalCommon,
+			check: func(t *testing.T, c *OTLPConfig) {
+				if got := len(c.Attributes); got != 1 {
+					t.Fatalf("Attributes: got %d, want 1", got)
+				}
+				if c.Attributes[0].Key != "m" {
+					t.Errorf("Attributes[0].Key: got %q, want %q", c.Attributes[0].Key, "m")
+				}
+				if c.Attributes[0].Value == nil {
+					t.Errorf("Attributes[0].Value: got nil, want a compiled template")
+				}
+			},
 		},
 		{
-			name: "reject-resource_attributes",
+			// FLIPPED from 45.1 reject-resource_attributes: resource_attributes now
+			// type-validated and stored literally (AMEND-OPS-1).
+			name: "accept-resource_attributes",
 			block: `
                   - name: envoy.access_loggers.open_telemetry
                     typed_config:
                       "@type": ` + otlpALSType + `
                       resource_attributes:
                         values:
-                          - key: "k"
-                            value: { string_value: "v" }` + minimalCommon,
+                          - key: "svc"
+                            value: { string_value: "envoy-go" }` + minimalCommon,
+			check: func(t *testing.T, c *OTLPConfig) {
+				if got := len(c.ResourceAttributes); got != 1 {
+					t.Fatalf("ResourceAttributes: got %d, want 1", got)
+				}
+				if c.ResourceAttributes[0].GetKey() != "svc" {
+					t.Errorf("ResourceAttributes[0].Key: got %q, want %q", c.ResourceAttributes[0].GetKey(), "svc")
+				}
+			},
+		},
+		{
+			// The 45.1 built-in regression anchor: no body/attributes/resource_attributes
+			// ⇒ all three new fields stay zero (the built-in-label-only path).
+			name: "accept-no-templating",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + minimalCommon,
+			check: func(t *testing.T, c *OTLPConfig) {
+				if c.Body != nil {
+					t.Errorf("Body: got %+v, want nil", c.Body)
+				}
+				if got := len(c.Attributes); got != 0 {
+					t.Errorf("Attributes: got %d, want 0", got)
+				}
+				if got := len(c.ResourceAttributes); got != 0 {
+					t.Errorf("ResourceAttributes: got %d, want 0", got)
+				}
+			},
+		},
+		{
+			// Structured nesting compiles at any depth: a kvlist body + an array-valued
+			// attribute (both with string leaves, some operator-templated).
+			name: "accept-structured",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      body:
+                        kvlist_value:
+                          values:
+                            - key: "inner"
+                              value: { string_value: "%REQ(:METHOD)%" }
+                      attributes:
+                        values:
+                          - key: "arr"
+                            value:
+                              array_value:
+                                values:
+                                  - { string_value: "lit" }
+                                  - { string_value: "%RESPONSE_CODE%" }` + minimalCommon,
+			check: func(t *testing.T, c *OTLPConfig) {
+				if c.Body == nil {
+					t.Errorf("Body: got nil, want a compiled kvlist template")
+				}
+				if got := len(c.Attributes); got != 1 {
+					t.Fatalf("Attributes: got %d, want 1", got)
+				}
+			},
+		},
+		{
+			// resource_attributes are LITERAL — a %…%-looking string is NOT operator-
+			// scanned and passes through verbatim (AMEND-OPS-1).
+			name: "accept-resource-literal-operator",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      resource_attributes:
+                        values:
+                          - key: "host"
+                            value: { string_value: "%REQ(:AUTHORITY)%" }` + minimalCommon,
+			check: func(t *testing.T, c *OTLPConfig) {
+				if got := len(c.ResourceAttributes); got != 1 {
+					t.Fatalf("ResourceAttributes: got %d, want 1", got)
+				}
+			},
+		},
+		{
+			// An unknown operator in body is a clean boot error naming the operator.
+			name: "reject-unknown-operator",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      body:
+                        string_value: "%FOOBAR%"` + minimalCommon,
 			wantErr: true,
-			errSubs: []string{"OTLP access log", "resource_attributes"},
+			errSubs: []string{"FOOBAR", "OTLP access log", "access_log[0]"},
+		},
+		{
+			// A non-string/kvlist/array value-type in body is rejected (AMEND-OPS-2).
+			name: "reject-bad-value-type-body",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      body:
+                        int_value: 42` + minimalCommon,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "body", "access_log[0]"},
+		},
+		{
+			// A bad value-type nested in an attribute value is rejected.
+			name: "reject-bad-value-type-attribute",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      attributes:
+                        values:
+                          - key: "b"
+                            value: { bool_value: true }` + minimalCommon,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "attributes", "access_log[0]"},
+		},
+		{
+			// resource_attributes are type-validated too (AMEND-OPS-2).
+			name: "reject-bad-value-type-resource",
+			block: `
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": ` + otlpALSType + `
+                      resource_attributes:
+                        values:
+                          - key: "n"
+                            value: { int_value: 1 }` + minimalCommon,
+			wantErr: true,
+			errSubs: []string{"OTLP access log", "resource_attributes", "access_log[0]"},
 		},
 		{
 			name: "reject-formatters",
@@ -1090,6 +1233,9 @@ func TestBootstrap_OTLP(t *testing.T) {
 				if got, want := bs.OTLPConfigs[0], *tt.wantCfg; !reflect.DeepEqual(got, want) {
 					t.Errorf("OTLPConfigs[0]: got %+v, want %+v", got, want)
 				}
+			}
+			if tt.check != nil {
+				tt.check(t, &bs.OTLPConfigs[0])
 			}
 		})
 	}

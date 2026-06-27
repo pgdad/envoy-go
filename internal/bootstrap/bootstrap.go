@@ -146,11 +146,13 @@ import (
 	// go.mod dep (AMEND-T1 — CORE /envoy v1.32.4). Per ADR-0016 amendment policy,
 	// documented in PROGRESS, not a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/thrift_proxy/v3"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"gopkg.in/yaml.v3"
 
+	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/stats"
 )
 
@@ -211,15 +213,28 @@ type ALSConfig struct {
 }
 
 // OTLPConfig is the parsed OpenTelemetry (OTLP) access-log sink config from one
-// HCM access_log[] OpenTelemetryAccessLogConfig entry (ADR-0258). body/attributes/
-// resource_attributes/formatters are STRICT-REJECTED at 45.1; stat_prefix is
-// PARSE-ACCEPT-but-INERT (the fixed stat names regardless).
+// HCM access_log[] OpenTelemetryAccessLogConfig entry (ADR-0258). body/attributes
+// are COMPILED at boot (operator templates, AMEND-OPS-2/3); resource_attributes
+// are type-validated and stored LITERAL (AMEND-OPS-1); formatters stay
+// STRICT-REJECTED; stat_prefix is PARSE-ACCEPT-but-INERT (the fixed stat names
+// regardless).
 type OTLPConfig struct {
 	ClusterName          string        // common_config.grpc_service.envoy_grpc.cluster_name
 	LogName              string        // common_config.log_name (empty is valid)
 	BufferSizeBytes      uint32        // common_config.buffer_size_bytes (default 16384 when wrapper absent; explicit 0 ⇒ flush-every-entry)
 	BufferFlushInterval  time.Duration // common_config.buffer_flush_interval (default 1s when absent/zero)
 	DisableBuiltinLabels bool          // disable_builtin_labels (drops all 4 Resource labels wholesale)
+	// Body is the compiled body AnyValue template (operator-substituted per record →
+	// LogRecord.body); nil when no body is configured (the 45.1 built-in path).
+	Body *accesslog.OTLPValueTemplate
+	// Attributes are the compiled attributes templates (ordered key→template,
+	// operator-substituted per record → LogRecord.attributes); empty when none.
+	Attributes []accesslog.OTLPAttrTemplate
+	// ResourceAttributes are the LITERAL resource_attributes (validated string/kvlist/
+	// array; request operators pass through verbatim — AMEND-OPS-1), emitted as extra
+	// Resource.attributes after the 4 built-in labels (surviving disable_builtin_labels
+	// — AMEND-OPS-5); nil when none.
+	ResourceAttributes []*commonpb.KeyValue
 }
 
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
@@ -262,8 +277,9 @@ type Bootstrap struct {
 	// OpenTelemetryAccessLogConfig access_log entries are configured. Per ADR-0258:
 	// transport_api_version V2, google_grpc, and an empty envoy_grpc.cluster_name
 	// are rejected at parse time (via the shared CommonGrpcAccessLogConfig helper);
-	// body/attributes/resource_attributes/formatters are STRICT-REJECTED at 45.1
-	// (operator templating is phase 45.2); cluster_name, log_name, buffer_size_bytes
+	// body/attributes are COMPILED into operator templates and resource_attributes are
+	// type-validated + stored literal at phase 45.2 (ADR-0259); formatters stay
+	// STRICT-REJECTED; cluster_name, log_name, buffer_size_bytes
 	// (default 16384), buffer_flush_interval (default 1s), and disable_builtin_labels
 	// are CONSUMED; stat_prefix is read-and-ignored (INERT).
 	OTLPConfigs []OTLPConfig
@@ -469,22 +485,15 @@ func parseCommonGrpcAccessLogConfig(common *grpcalv3.CommonGrpcAccessLogConfig, 
 // parseOpenTelemetryAccessLog processes a single OpenTelemetryAccessLogConfig
 // access_log entry and appends an OTLPConfig to result.OTLPConfigs (ADR-0258).
 // STRICT-REJECTS (ADR-0080): the common_config V2/google_grpc/empty-cluster (via
-// the shared helper); a non-nil body / non-empty attributes / non-empty
-// resource_attributes (deferred to 45.2); a non-empty formatters (out of scope).
-// disable_builtin_labels is CONSUMED; stat_prefix is read-and-ignored (INERT).
+// the shared helper); a non-empty formatters (out of scope). body + attributes are
+// COMPILED into operator templates (unknown-operator / non-string-kvlist-array
+// value-type → clean boot error — D-OTLP-2-COMPILE-SITE); resource_attributes are
+// type-VALIDATED and stored literally (AMEND-OPS-1). disable_builtin_labels is
+// CONSUMED; stat_prefix is read-and-ignored (INERT).
 func parseOpenTelemetryAccessLog(tc *anypb.Any, idx int, result *Bootstrap) error {
 	cfg := &otlpalv3.OpenTelemetryAccessLogConfig{}
 	if err := proto.Unmarshal(tc.GetValue(), cfg); err != nil {
 		return fmt.Errorf("bootstrap: access_log[%d] otlp unmarshal: %w", idx, err)
-	}
-	if cfg.GetBody() != nil {
-		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log body is not supported at phase 45.1 (operator templating is phase 45.2)", idx)
-	}
-	if len(cfg.GetAttributes().GetValues()) > 0 {
-		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log attributes is not supported at phase 45.1 (operator templating is phase 45.2)", idx)
-	}
-	if len(cfg.GetResourceAttributes().GetValues()) > 0 {
-		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log resource_attributes is not supported at phase 45.1 (operator templating is phase 45.2)", idx)
 	}
 	if len(cfg.GetFormatters()) > 0 {
 		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log formatters (custom formatter extensions) are not supported", idx)
@@ -493,6 +502,29 @@ func parseOpenTelemetryAccessLog(tc *anypb.Any, idx int, result *Bootstrap) erro
 	if err != nil {
 		return err
 	}
+	// Compile body + attributes (operators substituted per record — AMEND-OPS-2/3/4);
+	// the strict-reject (unknown operator / non-string-kvlist-array value-type) is a
+	// clean boot error here (D-OTLP-2-COMPILE-SITE).
+	bodyTmpl, err := accesslog.CompileOTLPValue(cfg.GetBody())
+	if err != nil {
+		return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log body: %w", idx, err)
+	}
+	var attrs []accesslog.OTLPAttrTemplate
+	for _, kv := range cfg.GetAttributes().GetValues() {
+		vt, err := accesslog.CompileOTLPValue(kv.GetValue())
+		if err != nil {
+			return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log attributes[%q]: %w", idx, kv.GetKey(), err)
+		}
+		attrs = append(attrs, accesslog.OTLPAttrTemplate{Key: kv.GetKey(), Value: vt})
+	}
+	// resource_attributes are LITERAL (no operator substitution — AMEND-OPS-1) but still
+	// type-validated (string/kvlist/array only — AMEND-OPS-2).
+	resAttrs := cfg.GetResourceAttributes().GetValues()
+	for _, kv := range resAttrs {
+		if err := accesslog.ValidateOTLPValue(kv.GetValue()); err != nil {
+			return fmt.Errorf("bootstrap: access_log[%d]: OTLP access log resource_attributes[%q]: %w", idx, kv.GetKey(), err)
+		}
+	}
 	// stat_prefix (field 6) read-and-ignored (PARSE-ACCEPT-but-INERT).
 	result.OTLPConfigs = append(result.OTLPConfigs, OTLPConfig{
 		ClusterName:          clusterName,
@@ -500,6 +532,9 @@ func parseOpenTelemetryAccessLog(tc *anypb.Any, idx int, result *Bootstrap) erro
 		BufferSizeBytes:      bufBytes,
 		BufferFlushInterval:  flush,
 		DisableBuiltinLabels: cfg.GetDisableBuiltinLabels(),
+		Body:                 bodyTmpl,
+		Attributes:           attrs,
+		ResourceAttributes:   resAttrs,
 	})
 	return nil
 }

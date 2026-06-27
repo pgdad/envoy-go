@@ -1,0 +1,132 @@
+# Reference Envoy bootstrap for fixture 0085-otlp-access-log-operators.
+#
+# Single-listener plaintext H1 topology (phase 45.2 SPEC — the OTLP access-log
+# OPERATOR ENGINE differential). One downstream HTTP/1.1 listener routes every
+# request to the HTTPFixedBody backend (cluster c_backend); the HCM carries one
+# `access_log[]` entry of type OpenTelemetryAccessLogConfig that exports an OTLP
+# LogRecord per completed request to the driver-owned in-process LogsService
+# receiver (cluster c_otlp; h2c, no TLS — D-OTLP-RECEIVER).
+#
+# Unlike 0084 (the bare built-in record), the access-logger here carries
+# command-operator-TEMPLATED content (D-OTLP-2-FIXTURE-SHAPE):
+#   - body: a string with %REQ(:METHOD)% %REQ(:PATH)% %PROTOCOL% %RESPONSE_CODE%
+#     %BYTES_SENT% — substituted per record.
+#   - attributes: op_method (string), nested (kvlist with inner_code +
+#     inner_authority), arr (array of [%REQ(:METHOD)%, literal-elem]) — the
+#     leaves substituted per record.
+#   - resource_attributes: service_name (static literal) + authority_literal (a
+#     %REQ(:AUTHORITY)%-LOOKING string emitted VERBATIM — resource_attributes are
+#     literal pass-through, NOT operator-substituted; AMEND-OPS-1).
+#
+# Templating: rendered by the driver's mustRender() at ReferenceBootstrap time.
+# Substitution keys:
+#   {{.AdminPort}}    — admin endpoint port (hard-coded 9901 by driver).
+#   {{.ListenerPort}} — l_test in-container port (10085 per fixture convention).
+#   {{.BackendHost}}  — HTTPFixedBody backend host (host.docker.internal per ADR-0010).
+#   {{.BackendPort}}  — HTTPFixedBody backend port (runner-allocated).
+#   {{.OTLPHost}}     — driver-owned OTLP receiver host (host.docker.internal for ref).
+#   {{.OTLPPort}}     — driver-owned OTLP receiver port (driver-allocated; the
+#                       in-process otlplogs.Server binds 0.0.0.0:<port> before the
+#                       container starts).
+#
+# Cluster type: STRICT_DNS so the reference Envoy container resolves
+# host.docker.internal (the Docker bridge host alias per ADR-0010).
+# dns_lookup_family: V4_ONLY per the established fixture precedent.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    - name: l_test
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.ListenerPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local
+                access_log:
+                  - name: envoy.access_loggers.open_telemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.open_telemetry.v3.OpenTelemetryAccessLogConfig
+                      common_config:
+                        log_name: "0085"
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: c_otlp
+                      body:
+                        string_value: "%REQ(:METHOD)% %REQ(:PATH)% %PROTOCOL% %RESPONSE_CODE% %BYTES_SENT%"
+                      attributes:
+                        values:
+                          - key: "op_method"
+                            value: { string_value: "%REQ(:METHOD)%" }
+                          - key: "nested"
+                            value:
+                              kvlist_value:
+                                values:
+                                  - key: "inner_code"
+                                    value: { string_value: "%RESPONSE_CODE%" }
+                                  - key: "inner_authority"
+                                    value: { string_value: "%REQ(:AUTHORITY)%" }
+                          - key: "arr"
+                            value:
+                              array_value:
+                                values:
+                                  - { string_value: "%REQ(:METHOD)%" }
+                                  - { string_value: "literal-elem" }
+                      resource_attributes:
+                        values:
+                          - key: "service_name"
+                            value: { string_value: "envoy-go-test" }
+                          - key: "authority_literal"
+                            value: { string_value: "%REQ(:AUTHORITY)%" }
+                route_config:
+                  name: rc_test
+                  virtual_hosts:
+                    - name: vh_test
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # c_backend: HTTPFixedBody subprocess (17-byte fixed body) reached via
+    # host.docker.internal from the reference Envoy container per ADR-0010.
+    - name: c_backend
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.BackendHost}}, port_value: {{.BackendPort}} }
+    # c_otlp: driver-owned in-process OTLP LogsService gRPC receiver. MANDATORY
+    # http2_protocol_options: {} for gRPC framing. Plaintext h2c — no TLS
+    # (D-OTLP-RECEIVER).
+    - name: c_otlp
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: c_otlp
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.OTLPHost}}, port_value: {{.OTLPPort}} }

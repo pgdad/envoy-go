@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 
 	"github.com/esalaine/envoy-go/internal/stats"
@@ -45,12 +46,22 @@ type OTLPAccessLogSink struct {
 	logName              string
 	node                 *corev3.Node
 	disableBuiltinLabels bool
-	logsWritten          *stats.Counter
-	logsDropped          *stats.Counter
-	done                 chan struct{}
-	closeOnce            sync.Once
-	closeErr             error
-	lastDropLog          atomic.Int64
+	// body/attrs are the compiled %OPERATOR%-templates substituted per-record at
+	// buffer-append (buildLogRecord); resourceAttrs is the literal,
+	// substitution-free resource_attributes appended once per Export at flush
+	// (buildResource). All three are immutable after construction: body/attrs
+	// templates Eval a fresh AnyValue per record, and resourceAttrs are
+	// shared-immutable proto pointers read READ-ONLY by the writer goroutine — no
+	// lock needed.
+	body          *OTLPValueTemplate
+	attrs         []OTLPAttrTemplate
+	resourceAttrs []*commonpb.KeyValue
+	logsWritten   *stats.Counter
+	logsDropped   *stats.Counter
+	done          chan struct{}
+	closeOnce     sync.Once
+	closeErr      error
+	lastDropLog   atomic.Int64
 
 	bufferSizeBytes     int           // accumulated-serialized-byte flush threshold; 0 ⇒ flush-every-entry
 	bufferFlushInterval time.Duration // flush-interval timer period (guaranteed > 0 by the parse layer)
@@ -62,20 +73,27 @@ type OTLPAccessLogSink struct {
 }
 
 // NewOTLPAccessLogSink builds an OTLP access-log sink over client with the bounded
-// channel at the default capacity (4096) and starts the writer goroutine.
-func NewOTLPAccessLogSink(client otlpClient, logName string, node *corev3.Node, disableBuiltinLabels bool, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration) *OTLPAccessLogSink {
-	return newOTLPSinkWithCapacity(client, logName, node, disableBuiltinLabels, written, dropped, bufferSizeBytes, bufferFlushInterval, defaultChannelCapacity)
+// channel at the default capacity (4096) and starts the writer goroutine. body/attrs
+// are the compiled body/attributes templates (nil/empty ⇒ the 45.1 LEAN built-in
+// path); resourceAttrs is the literal resource_attributes (appended after the 4
+// built-in labels, surviving disableBuiltinLabels — AMEND-OPS-5). The three template
+// args are placed AFTER disableBuiltinLabels and BEFORE the counters.
+func NewOTLPAccessLogSink(client otlpClient, logName string, node *corev3.Node, disableBuiltinLabels bool, body *OTLPValueTemplate, attrs []OTLPAttrTemplate, resourceAttrs []*commonpb.KeyValue, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration) *OTLPAccessLogSink {
+	return newOTLPSinkWithCapacity(client, logName, node, disableBuiltinLabels, body, attrs, resourceAttrs, written, dropped, bufferSizeBytes, bufferFlushInterval, defaultChannelCapacity)
 }
 
 // newOTLPSinkWithCapacity is the test-friendly variant; production callers use
 // NewOTLPAccessLogSink (capacity 4096).
-func newOTLPSinkWithCapacity(client otlpClient, logName string, node *corev3.Node, disableBuiltinLabels bool, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration, capacity int) *OTLPAccessLogSink {
+func newOTLPSinkWithCapacity(client otlpClient, logName string, node *corev3.Node, disableBuiltinLabels bool, body *OTLPValueTemplate, attrs []OTLPAttrTemplate, resourceAttrs []*commonpb.KeyValue, written, dropped *stats.Counter, bufferSizeBytes int, bufferFlushInterval time.Duration, capacity int) *OTLPAccessLogSink {
 	s := &OTLPAccessLogSink{
 		ch:                   make(chan any, capacity),
 		client:               client,
 		logName:              logName,
 		node:                 node,
 		disableBuiltinLabels: disableBuiltinLabels,
+		body:                 body,
+		attrs:                attrs,
+		resourceAttrs:        resourceAttrs,
 		logsWritten:          written,
 		logsDropped:          dropped,
 		bufferSizeBytes:      bufferSizeBytes,
@@ -155,7 +173,7 @@ func (s *OTLPAccessLogSink) run() {
 		if len(buf) == 0 {
 			return
 		}
-		req := buildExportRequest(buf, s.node, s.logName, s.disableBuiltinLabels)
+		req := buildExportRequest(buf, s.node, s.logName, s.disableBuiltinLabels, s.resourceAttrs)
 		for attempt := 0; attempt < 2; attempt++ {
 			if _, err := s.client.Export(s.ctx, req); err == nil {
 				s.logsWritten.Add(uint64(len(buf)))
@@ -185,7 +203,7 @@ func (s *OTLPAccessLogSink) run() {
 				log.Printf("accesslog: OTLP sink got non-*Record %T (log_name=%s); dropping", r, s.logName)
 				continue // non-Record ignored
 			}
-			lr := buildLogRecord(rec)
+			lr := buildLogRecord(rec, s.body, s.attrs)
 			buf = append(buf, lr)
 			bufBytes += proto.Size(lr)
 			if bufBytes >= s.bufferSizeBytes { // SIZE trigger; 0 ⇒ every record flushes

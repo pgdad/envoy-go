@@ -149,7 +149,7 @@ func main() {
 				if err != nil {
 					log.Fatalf("accesslog: OTLP logs client for cluster %q: %v", cfg.ClusterName, err)
 				}
-				sinks = append(sinks, accesslog.NewOTLPAccessLogSink(client, cfg.LogName, otlpNode, cfg.DisableBuiltinLabels, otlpWritten, otlpDropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval))
+				sinks = append(sinks, accesslog.NewOTLPAccessLogSink(client, cfg.LogName, otlpNode, cfg.DisableBuiltinLabels, cfg.Body, cfg.Attributes, cfg.ResourceAttributes, otlpWritten, otlpDropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval))
 			}
 		}
 	}

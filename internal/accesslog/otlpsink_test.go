@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 )
 
@@ -99,7 +100,7 @@ func otlpRecords(reqs []*collogspb.ExportLogsServiceRequest) int {
 func TestOTLPSink_SubmitExportsRecord(t *testing.T) {
 	client := &fakeOTLPClient{}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 0, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 0, time.Hour)
 
 	start := time.Now()
 	s.Submit(&Record{StartTime: start, Method: "GET", Path: "/foo", ResponseCode: 200})
@@ -129,7 +130,7 @@ func TestOTLPSink_SubmitExportsRecord(t *testing.T) {
 func TestOTLPSink_BuiltinLabels(t *testing.T) {
 	client := &fakeOTLPClient{}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 0, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 0, time.Hour)
 
 	s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/foo", ResponseCode: 200})
 	if err := s.Close(); err != nil {
@@ -164,7 +165,7 @@ func TestOTLPSink_BuiltinLabels(t *testing.T) {
 func TestOTLPSink_DisableBuiltinLabels(t *testing.T) {
 	client := &fakeOTLPClient{}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), true, written, dropped, 0, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), true, nil, nil, nil, written, dropped, 0, time.Hour)
 
 	start := time.Now()
 	s.Submit(&Record{StartTime: start, Method: "GET", Path: "/foo", ResponseCode: 200})
@@ -195,7 +196,7 @@ func otlpBatchRecord() *Record {
 // pinning to a small fixed value keeps it constant so a size threshold splits
 // cleanly across records.
 func otlpEntrySize() int {
-	return proto.Size(buildLogRecord(&Record{StartTime: time.Unix(0, 1)}))
+	return proto.Size(buildLogRecord(&Record{StartTime: time.Unix(0, 1)}, nil, nil))
 }
 
 // otlpRequestRecords returns the LogRecords of a recorded Export request's single
@@ -229,7 +230,7 @@ func TestOTLPSink_SizeTriggerBatches(t *testing.T) {
 	// threshold = 2*entrySize+1 ⇒ flush on the 3rd record of each batch. Records
 	// are pinned to distinct small fixed timestamps so the serialized size stays
 	// constant AND each batch is content-distinguishable (to detect corruption).
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 2*otlpEntrySize()+1, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 2*otlpEntrySize()+1, time.Hour)
 
 	const n = 6
 	for i := 0; i < n; i++ {
@@ -276,7 +277,7 @@ func TestOTLPSink_SizeTriggerBatches(t *testing.T) {
 func TestOTLPSink_TimerTriggerFlushes(t *testing.T) {
 	client := &fakeOTLPClient{}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 1<<30, 25*time.Millisecond)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 1<<30, 25*time.Millisecond)
 
 	start := time.Unix(0, 42)
 	s.Submit(&Record{StartTime: start, Method: "GET", Path: "/foo", ResponseCode: 200})
@@ -302,7 +303,7 @@ func TestOTLPSink_TimerTriggerFlushes(t *testing.T) {
 func TestOTLPSink_NoPanicWithParseDefaultInterval(t *testing.T) {
 	client := &fakeOTLPClient{}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 1<<30, 1*time.Second)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 1<<30, 1*time.Second)
 
 	s.Submit(otlpBatchRecord())
 	if err := s.Close(); err != nil {
@@ -321,7 +322,7 @@ func TestOTLPSink_CloseDrainFlush(t *testing.T) {
 	written, dropped := newGrpcTestCounters(t)
 	// HUGE size threshold (never crosses on 3 records) + LONG interval ⇒ only the
 	// close-drain flush fires, carrying all 3 in ONE Export.
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 1<<30, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 1<<30, time.Hour)
 
 	for i := 0; i < 3; i++ {
 		s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/buf", ResponseCode: 200})
@@ -347,7 +348,7 @@ func TestOTLPSink_DropNewest(t *testing.T) {
 	block := make(chan struct{})
 	client := &fakeOTLPClient{blockCh: block}
 	written, dropped := newGrpcTestCounters(t)
-	s := newOTLPSinkWithCapacity(client, "mylog", otlpTestNode(), false, written, dropped, 0, time.Hour, 1)
+	s := newOTLPSinkWithCapacity(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 0, time.Hour, 1)
 
 	rec := &Record{StartTime: time.Now(), Method: "GET", Path: "/x", ResponseCode: 200}
 	for i := 0; i < 100; i++ {
@@ -366,7 +367,7 @@ func TestOTLPSink_DropNewest(t *testing.T) {
 func TestOTLPSink_RetryOnceOnExportError(t *testing.T) {
 	client := &fakeOTLPClient{exportErrs: []error{errors.New("export boom")}} // first fails, then succeeds
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 0, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 0, time.Hour)
 
 	start := time.Now()
 	s.Submit(&Record{StartTime: start, Method: "GET", Path: "/foo", ResponseCode: 200})
@@ -390,7 +391,7 @@ func TestOTLPSink_RetryOnceOnExportError(t *testing.T) {
 func TestOTLPSink_SecondFailureDropsBatch(t *testing.T) {
 	client := &fakeOTLPClient{exportErrs: []error{errors.New("boom1"), errors.New("boom2")}} // both attempts fail
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 0, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 0, time.Hour)
 
 	s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/foo", ResponseCode: 200})
 	if err := s.Close(); err != nil {
@@ -411,7 +412,7 @@ func TestOTLPSink_SecondFailureDropsBatch(t *testing.T) {
 func TestOTLPSink_CloseIdempotent(t *testing.T) {
 	client := &fakeOTLPClient{}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 0, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 0, time.Hour)
 
 	s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/x", ResponseCode: 200})
 	if err := s.Close(); err != nil {
@@ -428,7 +429,7 @@ func TestOTLPSink_CloseIdempotent(t *testing.T) {
 func TestOTLPSink_NonRecordIgnored(t *testing.T) {
 	client := &fakeOTLPClient{}
 	written, dropped := newGrpcTestCounters(t)
-	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, written, dropped, 0, time.Hour)
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, nil, nil, nil, written, dropped, 0, time.Hour)
 
 	s.Submit("garbage")
 	if err := s.Close(); err != nil {
@@ -442,5 +443,129 @@ func TestOTLPSink_NonRecordIgnored(t *testing.T) {
 	}
 	if otlpRecords(client.requests()) != 0 {
 		t.Errorf("got %d log records, want 0", otlpRecords(client.requests()))
+	}
+}
+
+// otlpStringValue is a test helper: a literal stringValue AnyValue.
+func otlpStringValue(s string) *commonpb.AnyValue {
+	return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: s}}
+}
+
+// otlpCompileString is a test helper: compile a %OPERATOR%-templated string leaf
+// into an *OTLPValueTemplate (the string arm).
+func otlpCompileString(t *testing.T, s string) *OTLPValueTemplate {
+	t.Helper()
+	v, err := CompileOTLPValue(otlpStringValue(s))
+	if err != nil {
+		t.Fatalf("CompileOTLPValue(%q): %v", s, err)
+	}
+	return v
+}
+
+// TestOTLPSink_BodyAttributesResourceEndToEnd threads a compiled body, one compiled
+// attribute, and a literal resource_attribute through the sink and asserts they land
+// on the exported record/resource (body operator-substituted, attribute
+// operator-substituted, resource literal appended AFTER the 4 built-ins).
+func TestOTLPSink_BodyAttributesResourceEndToEnd(t *testing.T) {
+	client := &fakeOTLPClient{}
+	written, dropped := newGrpcTestCounters(t)
+
+	body := otlpCompileString(t, "%REQ(:METHOD)% %RESPONSE_CODE%")
+	attrs := []OTLPAttrTemplate{{Key: "m", Value: otlpCompileString(t, "%REQ(:METHOD)%")}}
+	resourceAttrs := []*commonpb.KeyValue{{Key: "svc", Value: otlpStringValue("x")}}
+
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), false, body, attrs, resourceAttrs, written, dropped, 0, time.Hour)
+
+	start := time.Now()
+	s.Submit(&Record{StartTime: start, Method: "GET", Path: "/foo", ResponseCode: 200})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reqs := client.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d Export requests, want 1", len(reqs))
+	}
+	rl := reqs[0].GetResourceLogs()[0]
+	recs := rl.GetScopeLogs()[0].GetLogRecords()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want 1", len(recs))
+	}
+	if got := recs[0].GetBody().GetStringValue(); got != "GET 200" {
+		t.Errorf("Body.StringValue = %q, want %q", got, "GET 200")
+	}
+	if recs[0].GetTimeUnixNano() != uint64(start.UnixNano()) {
+		t.Errorf("TimeUnixNano = %d, want %d", recs[0].GetTimeUnixNano(), uint64(start.UnixNano()))
+	}
+	recAttrs := map[string]string{}
+	for _, kv := range recs[0].GetAttributes() {
+		recAttrs[kv.GetKey()] = kv.GetValue().GetStringValue()
+	}
+	if recAttrs["m"] != "GET" || len(recAttrs) != 1 {
+		t.Errorf("record attributes = %v, want {m:GET}", recAttrs)
+	}
+
+	resAttrs := map[string]string{}
+	for _, kv := range rl.GetResource().GetAttributes() {
+		resAttrs[kv.GetKey()] = kv.GetValue().GetStringValue()
+	}
+	want := map[string]string{
+		"log_name":     "mylog",
+		"zone_name":    "zone-1",
+		"cluster_name": "cluster-1",
+		"node_name":    "node-1",
+		"svc":          "x",
+	}
+	if len(resAttrs) != len(want) {
+		t.Fatalf("resource attributes = %v, want %v", resAttrs, want)
+	}
+	for k, v := range want {
+		if resAttrs[k] != v {
+			t.Errorf("resource attribute %q = %q, want %q", k, resAttrs[k], v)
+		}
+	}
+}
+
+// TestOTLPSink_DisableBuiltinResourceAttrsSurvive pins AMEND-OPS-5: with
+// disableBuiltinLabels the 4 built-in Resource labels drop but the literal
+// resource_attributes SURVIVE, and the templated body/attributes still land on the
+// record.
+func TestOTLPSink_DisableBuiltinResourceAttrsSurvive(t *testing.T) {
+	client := &fakeOTLPClient{}
+	written, dropped := newGrpcTestCounters(t)
+
+	body := otlpCompileString(t, "%REQ(:METHOD)% %RESPONSE_CODE%")
+	attrs := []OTLPAttrTemplate{{Key: "m", Value: otlpCompileString(t, "%REQ(:METHOD)%")}}
+	resourceAttrs := []*commonpb.KeyValue{{Key: "svc", Value: otlpStringValue("x")}}
+
+	s := NewOTLPAccessLogSink(client, "mylog", otlpTestNode(), true, body, attrs, resourceAttrs, written, dropped, 0, time.Hour)
+
+	s.Submit(&Record{StartTime: time.Now(), Method: "GET", Path: "/foo", ResponseCode: 200})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reqs := client.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d Export requests, want 1", len(reqs))
+	}
+	rl := reqs[0].GetResourceLogs()[0]
+	resAttrs := rl.GetResource().GetAttributes()
+	if len(resAttrs) != 1 || resAttrs[0].GetKey() != "svc" || resAttrs[0].GetValue().GetStringValue() != "x" {
+		t.Errorf("resource attributes = %v, want just {svc:x} (AMEND-OPS-5)", resAttrs)
+	}
+	recs := rl.GetScopeLogs()[0].GetLogRecords()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want 1", len(recs))
+	}
+	if got := recs[0].GetBody().GetStringValue(); got != "GET 200" {
+		t.Errorf("Body.StringValue = %q, want %q", got, "GET 200")
+	}
+	recAttrs := map[string]string{}
+	for _, kv := range recs[0].GetAttributes() {
+		recAttrs[kv.GetKey()] = kv.GetValue().GetStringValue()
+	}
+	if recAttrs["m"] != "GET" || len(recAttrs) != 1 {
+		t.Errorf("record attributes = %v, want {m:GET}", recAttrs)
 	}
 }

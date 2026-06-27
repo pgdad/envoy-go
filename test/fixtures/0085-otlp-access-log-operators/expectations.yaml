@@ -1,0 +1,94 @@
+# Phase 45.2 fixture 0085-otlp-access-log-operators expectations (ADR-0019 —
+# prose; the driver is the enforcer; this file is documentation).
+#
+# Topology (single-listener plaintext H1; driver-owned in-process OTLP LogsService
+# gRPC receiver — identical to 0084 modulo the access-logger templating):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). HCM
+#                        carries one access_log[] OpenTelemetryAccessLogConfig
+#                        entry (log_name "0085"; grpc_service.envoy_grpc.cluster_name
+#                        c_otlp) with command-operator-TEMPLATED body + attributes
+#                        + LITERAL resource_attributes, exporting one OTLP
+#                        LogRecord per completed request.
+#   c_backend          — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_otlp             — driver-owned in-process LogsService receiver
+#                        (test/helpers/otlplogs/) on a driver-allocated stable
+#                        port, bound 0.0.0.0:<port> so the reference container
+#                        (host.docker.internal) AND the subject (127.0.0.1) both
+#                        reach it. http2_protocol_options:{} + plaintext h2c
+#                        (D-OTLP-RECEIVER — no TLS).
+#
+# Reference Envoy v1.37.2 (STRICT_DNS via host.docker.internal) vs envoy-go
+# (STATIC, in-process).
+#
+# ## Access-logger templating (D-OTLP-2-FIXTURE-SHAPE)
+#
+#   body: string_value "%REQ(:METHOD)% %REQ(:PATH)% %PROTOCOL% %RESPONSE_CODE% %BYTES_SENT%"
+#   attributes:
+#     op_method → string_value "%REQ(:METHOD)%"
+#     nested    → kvlist_value { inner_code: "%RESPONSE_CODE%", inner_authority: "%REQ(:AUTHORITY)%" }
+#     arr       → array_value [ "%REQ(:METHOD)%", "literal-elem" ]
+#   resource_attributes (LITERAL — AMEND-OPS-1, NOT operator-substituted):
+#     service_name      → "envoy-go-test"
+#     authority_literal → "%REQ(:AUTHORITY)%"  (emitted VERBATIM)
+#
+# ## Workload
+#
+# Each side fires N=8 IDENTICAL query-less requests:
+#   GET /health, Host: otlp.example, User-Agent: otlp-probe/1.
+# Query-less is REQUIRED: envoy-go's H1 Record.Path strips the query (AMEND-OPS-6),
+# so cross-side EXACT on the %REQ(:PATH)%-substituted body needs a query-less path.
+# Each request routes to c_backend (200 + 17-byte fixed body) and produces exactly
+# one exported OTLP LogRecord. The driver POLLS Count() to >= 8 (poll-to-converge;
+# the reference buffers OTLP records and flushes on a timer / buffer-fill — never a
+# fixed sleep). Per-side separation: the receiver is Reset() at the start of each
+# side's drive.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-record PAYLOAD aggregated across all
+# received records — NOT the Export-call count, per-call batch sizes, connection
+# count, or flush cadence (which legitimately vary side-to-side).
+#
+# ## Asserted (cross-side EXACT, both sides)
+#
+#   len(records)                              == 8 (zero-record pass is vacuous)
+#   body (every record)                       == "GET /health HTTP/1.1 200 <bytesSent>"
+#     - method/path/protocol/code asserted literally
+#     - %BYTES_SENT% asserted ref==subj (cross-side EXACT — the fixed-body size is
+#       the same both sides; robust vs hardcoding the byte count)
+#     - all 8 records on a side are identical (all requests identical)
+#   attributes (every record):
+#     op_method                               == "GET"
+#     nested.inner_code                       == "200"
+#     nested.inner_authority                  == "otlp.example"
+#     arr                                     == ["GET", "literal-elem"]
+#   Resource.attributes (every ResourceLogs):
+#     built-in keys {log_name, zone_name, cluster_name, node_name} all present
+#     log_name                                == "0085"
+#     service_name                            == "envoy-go-test"
+#     authority_literal                       == "%REQ(:AUTHORITY)%"  (LITERAL)
+#
+# PLUS the subject-side flat /stats counter:
+#   access_logs.open_telemetry_access_log.logs_written == 8 (every export ok)
+#
+# ## UNasserted (framing / non-deterministic / excluded from the config)
+#
+#   LogRecord.time_unix_nano VALUE            — non-deterministic.
+#   Export-call count / batch sizes / connection count — framing.
+#   %START_TIME% / %DURATION% / %UPSTREAM_HOST% — EXCLUDED from the config
+#       (non-deterministic / connection-keyed); deterministic operators only for
+#       cross-side EXACT.
+#   zone_name / cluster_name / node_name VALUES — may be empty both sides under
+#       the no-node config; only KEY presence asserted.
+#
+# ## Subject-side unit coverage (NOT a second fixture)
+#
+#   disable_builtin_labels + resource_attributes survival — internal/accesslog
+#       otlpsink_test.go TestOTLPSink_DisableBuiltinResourceAttrsSurvive (AMEND-OPS-5).
+#   unsupported-operator + bad-value-type boot-rejects — internal/bootstrap
+#       bootstrap_test.go reject cases (one fixture dir = one runner branch).
+#
+# Cross-refs: phase 45.2 SPEC §12 D-OTLP-2-* + ADR-0259 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned.
