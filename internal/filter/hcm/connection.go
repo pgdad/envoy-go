@@ -17,6 +17,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/cluster"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 // extractTLSPrincipals returns the priority-ordered TLS principal-name
@@ -492,6 +493,23 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 			path = req.URL.RequestURI()
 		}
 		req.Header[":path"] = []string{path}
+	}
+
+	// Phase 46.1a Task 9: HCM-native request-tracing dispatch. When a `tracing`
+	// provider is configured (f.tracingConfig != nil), run the sampling/request-id
+	// decision over the inbound headers, stamp-or-generate x-request-id, inject the
+	// W3C traceparent (+ tracestate), and Inc the matching HCM tracing.* counter.
+	// The mutation lands on req.Header BEFORE the decode chain + the terminal
+	// router action — so the decision propagates UPSTREAM via req.Write (revising
+	// the router.go:763 "router injects no x-request-id/traceparent" invariant:
+	// the HCM tracing engine, not the router, does the injection). When no
+	// provider is configured this whole block is skipped — the no-tracing path
+	// stays byte-stable (no x-request-id / traceparent added; no counter moves).
+	if f.tracingConfig != nil {
+		d := tracing.Decide(req.Header, f.tracingConfig, f.rng)
+		req.Header.Set("X-Request-Id", d.RequestID)
+		tracing.InjectTraceparent(req.Header, d.TraceID, d.SpanID, d.Sample, d.TraceState)
+		f.tracingCounters.Record(d.Class)
 	}
 
 	// Decode side: headers → data → trailers. endStream on RunDecodeHeaders is

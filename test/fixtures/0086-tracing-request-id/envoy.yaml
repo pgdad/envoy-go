@@ -1,0 +1,98 @@
+# Reference Envoy bootstrap for fixture 0086-tracing-request-id.
+#
+# Single-listener plaintext H1 topology (phase 46.1a SPEC — the HCM-native
+# request-tracing HEADER engine; NO span export at 46.1a). One downstream
+# HTTP/1.1 listener routes every request to the HTTPHeaderMutation echo backend
+# (cluster c_backend), which reflects every received request header into the
+# response body as sorted "Canonical-Name: value" lines. The HCM carries a
+# `tracing` block (OpenTelemetry provider, random_sampling 100%) so the proxy
+# runs the sampling/request-id decision and injects x-request-id + traceparent
+# onto the UPSTREAM-forwarded request — the driver recovers them from the echoed
+# body.
+#
+# The OpenTelemetry provider names a DUMMY collector cluster (c_otlp_collector,
+# h2c, an unreachable 127.0.0.1:1 endpoint). The reference boots permissively and
+# silently fails any span export; the cluster only satisfies the reference data
+# plane and keeps the config 46.1b-ready (the span exporter lands at 46.1b). It is
+# never successfully dialed for the header-level assertions this fixture makes.
+#
+# Templating: rendered by the driver's mustRender() at ReferenceBootstrap time.
+# Substitution keys:
+#   {{.AdminPort}}    — admin endpoint port (hard-coded 9901 by driver).
+#   {{.ListenerPort}} — l_test in-container port (10086 per fixture convention).
+#   {{.BackendHost}}  — HTTPHeaderMutation backend host (host.docker.internal per ADR-0010).
+#   {{.BackendPort}}  — HTTPHeaderMutation backend port (runner-allocated).
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    - name: l_test
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.ListenerPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local
+                tracing:
+                  provider:
+                    name: envoy.tracers.opentelemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: c_otlp_collector
+                      service_name: "0086"
+                  random_sampling:
+                    value: 100
+                route_config:
+                  name: rc_test
+                  virtual_hosts:
+                    - name: vh_test
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # c_backend: HTTPHeaderMutation echo subprocess reached via host.docker.internal
+    # from the reference Envoy container per ADR-0010.
+    - name: c_backend
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.BackendHost}}, port_value: {{.BackendPort}} }
+    # c_otlp_collector: DUMMY span-export collector cluster (h2c). Unreachable
+    # 127.0.0.1:1 endpoint — never successfully dialed at 46.1a (no exporter until
+    # 46.1b). MANDATORY http2_protocol_options: {} for gRPC framing. Keeps the
+    # tracing.provider config valid + 46.1b-ready.
+    - name: c_otlp_collector
+      type: STATIC
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: c_otlp_collector
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }

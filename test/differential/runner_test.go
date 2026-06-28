@@ -110,6 +110,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0083-grpc-access-log-headers/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0084-otlp-access-log/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0085-otlp-access-log-operators/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0086-tracing-request-id/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

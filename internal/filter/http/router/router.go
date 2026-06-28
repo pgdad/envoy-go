@@ -764,6 +764,14 @@ func localReplyHeaders(bodyLen int) envoyhttp.OrderedHeaders {
 // headers (SPEC §2). The upstream sees the unmodified downstream request
 // (modulo stdlib's textproto canonicalization on header names).
 //
+// Phase 46.1a Task 9 revision: when an HCM `tracing` provider is configured,
+// the HCM dispatch layer (connection.go for H1, h2dispatch.go for H2) — NOT
+// the router — stamps/generates x-request-id and injects the W3C traceparent
+// (+ tracestate) onto the request headers BEFORE this action runs, so the
+// upstream observes them. The router itself still injects nothing; the
+// "unmodified downstream request" statement holds for the no-tracing path and
+// is scoped to the router's own behavior under a provider.
+//
 // Migrated from internal/filter/hcm/actions.go at phase 07.1 Task 11 with
 // signatures preserved byte-for-byte so the byte-preserved tests in
 // router_test.go exercise the same shape (`a.do(ctx, req, bw)`).

@@ -12,6 +12,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	tracev3 "github.com/envoyproxy/go-control-plane/envoy/config/trace/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -1386,6 +1387,122 @@ func TestBuildRouterAction_HedgePolicyParse(t *testing.T) {
 			t.Errorf("hedgePolicy=%v; want nil when no hedge_policy is set", hp)
 		}
 	})
+}
+
+// --- Task 8: HCM tracing config wiring --------------------------------------
+
+// mkOTelTracing builds an HCM `tracing` block whose provider carries an
+// OpenTelemetry config over envoy_grpc(cluster) with the given service_name.
+// Mirrors internal/tracing/config_test.go's otelProvider/envoyGrpcOTel shapes.
+// The three sampling knobs are left absent ⇒ they default to 100% in NewConfig.
+func mkOTelTracing(t *testing.T, clusterName, service string) *hcmv3.HttpConnectionManager_Tracing {
+	t.Helper()
+	otel := &tracev3.OpenTelemetryConfig{
+		GrpcService: &corev3.GrpcService{
+			TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+				EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{ClusterName: clusterName},
+			},
+		},
+		ServiceName: service,
+	}
+	any, err := anypb.New(otel)
+	if err != nil {
+		t.Fatalf("anypb.New(otel): %v", err)
+	}
+	return &hcmv3.HttpConnectionManager_Tracing{
+		Provider: &tracev3.Tracing_Http{
+			Name:       "envoy.tracers.opentelemetry",
+			ConfigType: &tracev3.Tracing_Http_TypedConfig{TypedConfig: any},
+		},
+	}
+}
+
+// countTracingCounters returns how many registered metrics live in the
+// http.<prefix>.tracing.* namespace (the +5 register-only-when-configured guard).
+func countTracingCounters(reg *stats.Registry) int {
+	n := 0
+	reg.Walk(func(m stats.Metric) {
+		if strings.Contains(m.Name(), ".tracing.") {
+			n++
+		}
+	})
+	return n
+}
+
+// TestParseFilter_Tracing_Accept verifies that an HCM carrying an OTel-provider
+// `tracing` block parses into a *Filter with a populated tracingConfig (sampling
+// knob + exporter coordinates), a non-nil tracingCounters, and that the registry
+// gains the 5 http.<prefix>.tracing.* decision counters (phase 46.1a Task 8).
+func TestParseFilter_Tracing_Accept(t *testing.T) {
+	cm := mkClusterManager(t)
+	reg := stats.NewRegistry()
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = mkOTelTracing(t, "c", "svc")
+	})
+	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, reg, nil, testHTTPRegistry(), nil)
+	if err != nil {
+		t.Fatalf("parseFilterWithCtx: %v", err)
+	}
+	if f.tracingConfig == nil {
+		t.Fatal("tracingConfig is nil; want non-nil for a configured tracing block")
+	}
+	if f.tracingConfig.RandomSampling != 100 {
+		t.Errorf("RandomSampling = %v, want 100", f.tracingConfig.RandomSampling)
+	}
+	if f.tracingConfig.ClusterName != "c" {
+		t.Errorf("ClusterName = %q, want %q", f.tracingConfig.ClusterName, "c")
+	}
+	if f.tracingConfig.ServiceName != "svc" {
+		t.Errorf("ServiceName = %q, want %q", f.tracingConfig.ServiceName, "svc")
+	}
+	if f.tracingCounters == nil {
+		t.Error("tracingCounters is nil; want non-nil for a configured tracing block")
+	}
+	if got := countTracingCounters(reg); got != 5 {
+		t.Errorf("registry tracing.* counters = %d, want 5", got)
+	}
+}
+
+// TestParseFilter_Tracing_RejectUnsupported verifies that a tracing block
+// carrying an unsupported sub-feature (verbose:true) bubbles the tracing.NewConfig
+// reject up as an "hcm:"-prefixed parse error (phase 46.1a Task 8).
+func TestParseFilter_Tracing_RejectUnsupported(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		tr := mkOTelTracing(t, "c", "svc")
+		tr.Verbose = true
+		h.Tracing = tr
+	})
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	if err == nil {
+		t.Fatal("expected error for tracing verbose:true, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "hcm:") {
+		t.Errorf("error must begin with %q, got: %v", "hcm:", err)
+	}
+}
+
+// TestParseFilter_Tracing_NoneIsByteStable verifies the byte-stable regression
+// guard: an HCM with NO `tracing` block yields a nil tracingConfig + nil
+// tracingCounters and registers ZERO tracing.* counters (the +5 register only
+// under a configured provider). Phase 46.1a Task 8.
+func TestParseFilter_Tracing_NoneIsByteStable(t *testing.T) {
+	cm := mkClusterManager(t)
+	reg := stats.NewRegistry()
+	any := mkHCM(nil) // no tracing block
+	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, reg, nil, testHTTPRegistry(), nil)
+	if err != nil {
+		t.Fatalf("parseFilterWithCtx: %v", err)
+	}
+	if f.tracingConfig != nil {
+		t.Errorf("tracingConfig = %+v, want nil (no tracing block)", f.tracingConfig)
+	}
+	if f.tracingCounters != nil {
+		t.Error("tracingCounters is non-nil; want nil (no tracing block)")
+	}
+	if got := countTracingCounters(reg); got != 0 {
+		t.Errorf("registry tracing.* counters = %d, want 0 (byte-stable no-tracing path)", got)
+	}
 }
 
 // --- Task 4: alsHeaderCaptureUnion derivation -------------------------------

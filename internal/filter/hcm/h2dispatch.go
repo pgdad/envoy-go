@@ -25,6 +25,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 // h2Dispatcher implements h2.Dispatcher by delegating to f.table.match. Phase
@@ -390,6 +391,32 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		return nil
 	}
 	rf.SetH2Action(c.action)
+
+	// Phase 46.1a Task 9: HCM-native request-tracing dispatch on the H2 path —
+	// symmetric to connection.go's H1 seam. The upstream-forwarded H2 headers
+	// live on h2req.Headers (regular headers; pseudo-headers are excluded), so
+	// the decision is run over an http.Header view built from them, then
+	// x-request-id / traceparent / tracestate are written back onto h2req.Headers.
+	// CRITICAL: h2req is received BY VALUE — the mutated copy must be re-set via
+	// rf.SetH2Request(h2req) BELOW (a single set after this block) or the upstream
+	// RoundTrip would ride the un-mutated value-copy. When no provider is
+	// configured the block is skipped and the value passes through unchanged
+	// (byte-stable no-tracing path).
+	if c.f.tracingConfig != nil {
+		view := make(http.Header, len(h2req.Headers)+2)
+		for _, hf := range h2req.Headers {
+			view.Add(hf.Name, hf.Value)
+		}
+		d := tracing.Decide(view, c.f.tracingConfig, c.f.rng)
+		tracing.InjectTraceparent(view, d.TraceID, d.SpanID, d.Sample, d.TraceState)
+		h2req.Headers = upsertH2Header(h2req.Headers, "x-request-id", d.RequestID)
+		h2req.Headers = upsertH2Header(h2req.Headers, "traceparent", view.Get("Traceparent"))
+		if ts := view.Get("Tracestate"); ts != "" {
+			h2req.Headers = upsertH2Header(h2req.Headers, "tracestate", ts)
+		}
+		c.f.tracingCounters.Record(d.Class)
+	}
+
 	rf.SetH2Request(h2req)
 
 	// Phase 07.1 Task 18 prereq: inject the request method as ":method"
@@ -568,6 +595,23 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		return actionErr
 	}
 	return nil
+}
+
+// upsertH2Header sets name=value on an H2 regular-header slice: it drops every
+// existing case-insensitive match for name, then appends a single lowercase-name
+// field carrying value (RFC 9113 §8.2.1 — H2 header field names are lowercase on
+// the wire). Used by the Phase 46.1a tracing seam to write the decided
+// x-request-id / traceparent / tracestate onto the upstream-forwarded H2Request
+// without disturbing the other headers. The in-place filter (out := fields[:0])
+// is safe because the kept-element index never outruns the read index.
+func upsertH2Header(fields []hpack.HeaderField, name, value string) []hpack.HeaderField {
+	out := fields[:0]
+	for _, f := range fields {
+		if !strings.EqualFold(f.Name, name) {
+			out = append(out, f)
+		}
+	}
+	return append(out, hpack.HeaderField{Name: strings.ToLower(name), Value: value})
 }
 
 // writeH2Reply emits an HTTP/2 response on sw from a pre-built ordered header

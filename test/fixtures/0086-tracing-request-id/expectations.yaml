@@ -1,0 +1,67 @@
+# Phase 46.1a fixture 0086-tracing-request-id expectations (ADR-0019 — prose; the
+# driver is the enforcer via AssertStats; this file is documentation).
+#
+# Topology (single-listener plaintext H1; HTTPHeaderMutation echo backend; NO
+# receiver, NO span export at 46.1a):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPHeaderMutation echo, Kind 9). The
+#                        HCM carries a `tracing` block (OpenTelemetry provider,
+#                        service_name "0086", random_sampling 100%) naming the
+#                        DUMMY c_otlp_collector cluster.
+#   c_backend          — HTTPHeaderMutation echo subprocess
+#                        (test/fixtures/0012-http-header-mutation/backends/).
+#                        Reflects received request headers into the response body
+#                        as sorted "Canonical-Name: value" lines.
+#   c_otlp_collector   — DUMMY h2c cluster (unreachable 127.0.0.1:1). Never
+#                        successfully dialed at 46.1a (no exporter until 46.1b);
+#                        keeps the tracing.provider config valid + 46.1b-ready.
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process).
+#
+# ## Workload (poll-free, fixed traffic)
+#
+#   N = 8 PLAIN requests: GET /trace, Host: trace.example, UA: trace-probe/1.
+#       No inbound trace context => fresh local sample (random_sampling 100%).
+#   M = 4 CONTINUATION requests: + Traceparent: 00-<fixed 32hex aaa>-<fixed 16hex
+#       bbb>-01. Inbound W3C context => the proxy CONTINUES the trace.
+#
+# ## Capture
+#
+# The echo backend reflects the upstream-forwarded request headers into the body;
+# the driver parses x-request-id (canonical X-Request-Id) + traceparent (Traceparent)
+# from each response body to recover what the proxy injected upstream.
+#
+# ## Asserted (cross-side EXACT on the STABLE structure, both sides)
+#
+#   PLAIN (each):  x-request-id PRESENT, 36-char UUID-shaped, index-14 == '9'
+#                  (Sampled); traceparent matches 00-<32hex>-<16hex>-01.
+#                  (zero-header pass is vacuous — presence proves injection ran.)
+#   CONT (each):   traceparent trace-id == the FIXED inbound id
+#                  (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) — the cross-side EXACT
+#                  continuation invariant (both sides CONTINUE; inbound 01 flag
+#                  preserved) — AND the x-request-id REASON nibble == '9'
+#                  (Sampled), also cross-side EXACT: a continued+sampled trace
+#                  (inbound 01) reports the inbound sampled bit in its nibble, and
+#                  envoy-go matches the reference (SPEC §11 D-TRACE-REQUESTID
+#                  probe-error correction, re-probed at the 46.1a IMPL). The
+#                  COUNTER class stays not_traceable. Both sides pinned to '9'.
+#
+# PLUS the SUBJECT-side flat /stats tracing decision counters:
+#   http.hcm_local.tracing.random_sampling == 8
+#   http.hcm_local.tracing.not_traceable   == 4
+#   http.hcm_local.tracing.client_enabled  == 0
+#   http.hcm_local.tracing.health_check    == 0
+#   http.hcm_local.tracing.service_forced  == 0
+#
+# ## UNasserted (vary side-to-side / non-deterministic)
+#
+#   x-request-id / traceparent random VALUES (except the continuation trace-id);
+#   the span-id; the reference's default-injected x-envoy-* / x-forwarded-* extras;
+#   message/stream framing. The reference's tracing stats are NOT asserted
+#   cross-side (different stat names) — the cross-side assertion is on the echoed
+#   upstream HEADERS, which both sides produce.
+#
+# Cross-refs: phase 46.1a SPEC + ADR-0260 (D-TRACE-*) +
+#             reference_phase_46_tracing_split +
+#             reference_differential_fixture_dispatch_constraint.

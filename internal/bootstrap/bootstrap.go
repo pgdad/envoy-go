@@ -146,6 +146,11 @@ import (
 	// go.mod dep (AMEND-T1 — CORE /envoy v1.32.4). Per ADR-0016 amendment policy,
 	// documented in PROGRESS, not a new ADR.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/thrift_proxy/v3"
+	// Phase 46.1a registers the OpenTelemetry tracer config proto so protojson
+	// round-trips bootstraps carrying an HCM tracing.provider OpenTelemetryConfig
+	// typed_config (ADR-0260; lifts HttpConnectionManager.tracing from the ADR-0041
+	// silent-ignore set).
+	_ "github.com/envoyproxy/go-control-plane/envoy/config/trace/v3"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"

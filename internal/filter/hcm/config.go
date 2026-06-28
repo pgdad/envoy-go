@@ -20,6 +20,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 const (
@@ -157,6 +158,20 @@ type Filter struct {
 	// Per ADR-0165 §Decision (phase-18.2 Task 4 — the ADR-0044 escape-valve
 	// firing per planner-time decision D3 + D12).
 	listenerPrincipal string
+
+	// tracingConfig is the parsed HCM-native request-tracing config (sampling
+	// knobs + OTLP exporter coordinates), or nil when the HCM has no `tracing`
+	// block (the byte-stable no-tracing path). Populated by parseFilterWithCtx
+	// from hcm.GetTracing() via tracing.NewConfig (phase 46.1a Task 8;
+	// D-TRACE-CONFIG-HOME). The per-request Decide dispatch lands at Task 9.
+	tracingConfig *tracing.TracingConfig
+	// tracingCounters holds the 5 http.<stat_prefix>.tracing.* decision counters,
+	// allocated ONLY when tracingConfig is non-nil (no tracing => no counters,
+	// byte-stable). nil on the no-tracing path. Phase 46.1a Task 8.
+	tracingCounters *tracing.HCMCounters
+	// rng is the process-shared crypto RandSource the per-request sampling
+	// decision draws from (Task 9). Set to tracing.CryptoRand{} at parse time.
+	rng tracing.RandSource
 }
 
 // downstreamStatusClassCounter returns the downstream_rq_<Nxx> counter for the
@@ -282,6 +297,25 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 	}
 	table.vhostRateLimits = vhostRateLimits
 
+	// Phase 46.1a Task 8 (D-TRACE-CONFIG-HOME): lift hcm.GetTracing() out of the
+	// ADR-0041 silent-ignore set. tracing.NewConfig returns (nil, nil) when the
+	// HCM carries no `tracing` block (byte-stable no-tracing path) and an error
+	// for any unsupported tracing sub-feature. The 5 http.<stat_prefix>.tracing.*
+	// decision counters register ONLY under a configured provider — no tracing
+	// => no counters (the byte-stable regression guard). Per-request Decide
+	// dispatch lands at Task 9.
+	tcfg, err := tracing.NewConfig(msg.GetTracing())
+	if err != nil {
+		return nil, fmt.Errorf("hcm: tracing config: %w", err)
+	}
+	var tcounters *tracing.HCMCounters
+	if tcfg != nil {
+		tcounters, err = tracing.RegisterHCMCounters(registry, statPrefix)
+		if err != nil {
+			return nil, fmt.Errorf("hcm: tracing counters: %w", err)
+		}
+	}
+
 	prefix := "http." + statPrefix + "."
 	f := &Filter{
 		table:             table,
@@ -298,6 +332,9 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		chainConfig:       chainConfig,
 		perRouteConfig:    perRoute,
 		listenerPrincipal: lc.ListenerPrincipal,
+		tracingConfig:     tcfg,
+		tracingCounters:   tcounters,
+		rng:               tracing.CryptoRand{},
 	}
 	// 44.3 Task 4: derive the dedup'd lowercase header-capture union from the
 	// sinks (D-HDR-RECORD-CAPTURE-SCOPE) — gates the emit-hook capture. Both

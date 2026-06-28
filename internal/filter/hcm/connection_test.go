@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,13 +19,16 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	"golang.org/x/net/http2/hpack"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 // mkFilterForTable builds a minimal *Filter that wraps the given route table
@@ -640,5 +644,298 @@ func TestConnection_dispatchRequest_seeds_tlsConnectionState_for_TLS_handshake_c
 	}
 	if capture.captured.ServerName != "h1.sni.envoy-go.test" {
 		t.Errorf("captured.ServerName = %q; want %q", capture.captured.ServerName, "h1.sni.envoy-go.test")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 46.1a Task 9 — HCM dispatch tracing wiring (Decide + x-request-id
+// stamp + traceparent inject + HCM counter) on the H1 (connection.go) and H2
+// (h2dispatch.go) paths. The decision mutates the UPSTREAM-forwarded request
+// headers in place; the no-tracing path (tracingConfig==nil) is byte-stable.
+// ---------------------------------------------------------------------------
+
+// fakeTraceRand is a deterministic tracing.RandSource for header assertions.
+// Read fills with a fixed byte; Float64 returns a fixed value. With f==0 the
+// random-sampling roll (Float64*100 < RandomSampling) always samples and the
+// overall_sampling cap (Float64*100 >= OverallSampling) never trips at 100%.
+type fakeTraceRand struct {
+	f float64
+	b byte
+}
+
+func (r fakeTraceRand) Float64() float64 { return r.f }
+func (r fakeTraceRand) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = r.b
+	}
+	return len(p), nil
+}
+
+// traceparentRE matches a W3C version-00 traceparent: 00-<32hex>-<16hex>-<flags>.
+var traceparentRE = regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-(00|01)$`)
+
+func traceparentMatches(tp string, sampled bool) bool {
+	if !traceparentRE.MatchString(tp) {
+		return false
+	}
+	want := "-00"
+	if sampled {
+		want = "-01"
+	}
+	return strings.HasSuffix(tp, want)
+}
+
+// mkTracingFilter wraps mkFilterForTable and attaches a full-sampling tracing
+// config + freshly-registered HCM counters + the supplied deterministic rng.
+// Returns the filter and the registry so tests can read counter values.
+func mkTracingFilter(t *testing.T, tt *routeTable, rng tracing.RandSource) (*Filter, *stats.Registry) {
+	t.Helper()
+	f := mkFilterForTable(t, tt)
+	reg := stats.NewRegistry()
+	counters, err := tracing.RegisterHCMCounters(reg, "ingress_http")
+	if err != nil {
+		t.Fatalf("RegisterHCMCounters: %v", err)
+	}
+	f.tracingConfig = &tracing.TracingConfig{ClientSampling: 100, RandomSampling: 100, OverallSampling: 100}
+	f.tracingCounters = counters
+	f.rng = rng
+	return f, reg
+}
+
+func tracingCounterValue(t *testing.T, reg *stats.Registry, name string) uint64 {
+	t.Helper()
+	var v uint64
+	found := false
+	reg.Walk(func(m stats.Metric) {
+		if m.Name() != "http.ingress_http.tracing."+name {
+			return
+		}
+		c, ok := m.(*stats.Counter)
+		if !ok {
+			t.Fatalf("metric %q is not a *stats.Counter", name)
+		}
+		v = c.Load()
+		found = true
+	})
+	if !found {
+		t.Fatalf("tracing counter %q not registered", name)
+	}
+	return v
+}
+
+// h2HeaderValue returns the first case-insensitive match of name among the
+// H2Request's regular headers (the upstream-forwarded set), or "".
+func h2HeaderValue(req h2.H2Request, name string) string {
+	for _, f := range req.Headers {
+		if strings.EqualFold(f.Name, name) {
+			return f.Value
+		}
+	}
+	return ""
+}
+
+// --- H1 (connection.go dispatchRequest) -------------------------------------
+
+func TestDispatchRequest_Tracing_SampledInjects(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, reg := mkTracingFilter(t, tt, fakeTraceRand{f: 0, b: 0xab})
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := f.dispatchRequest(context.Background(), nil, req, bw); err != nil {
+		t.Fatalf("dispatchRequest: %v", err)
+	}
+
+	rid := req.Header.Get("X-Request-Id")
+	if len(rid) != 36 {
+		t.Fatalf("X-Request-Id = %q, want a 36-char id", rid)
+	}
+	if rid[14] != '9' {
+		t.Errorf("X-Request-Id index-14 = %q, want '9' (Sampled)", rid[14])
+	}
+	if tp := req.Header.Get("Traceparent"); !traceparentMatches(tp, true) {
+		t.Errorf("Traceparent = %q, want 00-<32hex>-<16hex>-01", tp)
+	}
+	if got := tracingCounterValue(t, reg, "random_sampling"); got != 1 {
+		t.Errorf("random_sampling = %d, want 1", got)
+	}
+}
+
+func TestDispatchRequest_Tracing_Continued(t *testing.T) {
+	const fixedTrace = "0af7651916cd43dd8448eb211c80319c"
+	const fixedSpan = "b7ad6b7169203331"
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, reg := mkTracingFilter(t, tt, fakeTraceRand{f: 0, b: 0x11})
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	req.Header.Set("Traceparent", "00-"+fixedTrace+"-"+fixedSpan+"-01")
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := f.dispatchRequest(context.Background(), nil, req, bw); err != nil {
+		t.Fatalf("dispatchRequest: %v", err)
+	}
+
+	tp := req.Header.Get("Traceparent")
+	if !strings.HasPrefix(tp, "00-"+fixedTrace+"-") {
+		t.Errorf("forwarded Traceparent = %q, want continued trace-id %s", tp, fixedTrace)
+	}
+	if !traceparentMatches(tp, true) {
+		t.Errorf("Traceparent = %q, want well-formed sampled", tp)
+	}
+	rid := req.Header.Get("X-Request-Id")
+	if len(rid) != 36 || rid[14] != '9' {
+		t.Errorf("X-Request-Id = %q, want 36-char with index-14 '9' (continued+sampled reflects the inbound sampled bit)", rid)
+	}
+	if got := tracingCounterValue(t, reg, "not_traceable"); got != 1 {
+		t.Errorf("not_traceable = %d, want 1", got)
+	}
+}
+
+func TestDispatchRequest_Tracing_PreserveRequestID(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, _ := mkTracingFilter(t, tt, fakeTraceRand{f: 0, b: 0x22})
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	req.Header.Set("X-Request-Id", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := f.dispatchRequest(context.Background(), nil, req, bw); err != nil {
+		t.Fatalf("dispatchRequest: %v", err)
+	}
+
+	if got := req.Header.Get("X-Request-Id"); got != "aaaaaaaa-bbbb-9ccc-dddd-eeeeeeeeeeee" {
+		t.Errorf("X-Request-Id = %q, want aaaaaaaa-bbbb-9ccc-dddd-eeeeeeeeeeee (preserved + stamped)", got)
+	}
+}
+
+func TestDispatchRequest_NoTracing_ByteStable(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f := mkFilterForTable(t, tt) // tracingConfig == nil
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Proto = "HTTP/1.1"
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if _, err := f.dispatchRequest(context.Background(), nil, req, bw); err != nil {
+		t.Fatalf("dispatchRequest: %v", err)
+	}
+
+	if got := req.Header.Get("X-Request-Id"); got != "" {
+		t.Errorf("X-Request-Id = %q, want empty (no-tracing byte-stable)", got)
+	}
+	if got := req.Header.Get("Traceparent"); got != "" {
+		t.Errorf("Traceparent = %q, want empty (no-tracing byte-stable)", got)
+	}
+}
+
+// --- H2 (h2dispatch.go WriteH2) ---------------------------------------------
+
+// captureH2Action captures the (post-injection) upstream-forwarded H2Request
+// the terminal router filter dispatches to, then returns a minimal 200 so the
+// rest of WriteH2 completes cleanly.
+func captureH2Action(captured *h2.H2Request) router.H2Action {
+	return func(_ context.Context, req h2.H2Request) (router.ActionResponse, cluster.Endpoint, error) {
+		*captured = req
+		return router.ActionResponse{Status: 200}, cluster.Endpoint{}, nil
+	}
+}
+
+func TestWriteH2_Tracing_SampledInjects(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, reg := mkTracingFilter(t, tt, fakeTraceRand{f: 0, b: 0x33})
+
+	var captured h2.H2Request
+	hreq, _ := http.NewRequest("GET", "/health", nil)
+	hreq.Proto = "HTTP/2.0"
+	c := &chainDispatchAction{f: f, action: captureH2Action(&captured), req: hreq, routeIdx: 0}
+
+	h2req := h2.H2Request{Method: "GET", Path: "/health", Authority: "localhost"}
+	if err := c.WriteH2(context.Background(), h2req, &captureH2Writer{}); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	rid := h2HeaderValue(captured, "x-request-id")
+	if len(rid) != 36 || rid[14] != '9' {
+		t.Errorf("forwarded x-request-id = %q, want 36-char with index-14 '9'", rid)
+	}
+	if tp := h2HeaderValue(captured, "traceparent"); !traceparentMatches(tp, true) {
+		t.Errorf("forwarded traceparent = %q, want 00-<32hex>-<16hex>-01", tp)
+	}
+	if got := tracingCounterValue(t, reg, "random_sampling"); got != 1 {
+		t.Errorf("random_sampling = %d, want 1", got)
+	}
+}
+
+func TestWriteH2_Tracing_Continued(t *testing.T) {
+	const fixedTrace = "0af7651916cd43dd8448eb211c80319c"
+	const fixedSpan = "b7ad6b7169203331"
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f, reg := mkTracingFilter(t, tt, fakeTraceRand{f: 0, b: 0x44})
+
+	var captured h2.H2Request
+	hreq, _ := http.NewRequest("GET", "/health", nil)
+	hreq.Proto = "HTTP/2.0"
+	c := &chainDispatchAction{f: f, action: captureH2Action(&captured), req: hreq, routeIdx: 0}
+
+	h2req := h2.H2Request{
+		Method:    "GET",
+		Path:      "/health",
+		Authority: "localhost",
+		Headers:   []hpack.HeaderField{{Name: "traceparent", Value: "00-" + fixedTrace + "-" + fixedSpan + "-01"}},
+	}
+	if err := c.WriteH2(context.Background(), h2req, &captureH2Writer{}); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	tp := h2HeaderValue(captured, "traceparent")
+	if !strings.HasPrefix(tp, "00-"+fixedTrace+"-") {
+		t.Errorf("forwarded traceparent = %q, want continued trace-id %s", tp, fixedTrace)
+	}
+	rid := h2HeaderValue(captured, "x-request-id")
+	if len(rid) != 36 || rid[14] != '9' {
+		t.Errorf("forwarded x-request-id = %q, want 36-char with index-14 '9' (continued+sampled reflects the inbound sampled bit)", rid)
+	}
+	if got := tracingCounterValue(t, reg, "not_traceable"); got != 1 {
+		t.Errorf("not_traceable = %d, want 1", got)
+	}
+}
+
+func TestWriteH2_NoTracing_ByteStable(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	f := newH2DispatchFilter(t, tt, routerOnlyChain(t), nil) // tracingConfig == nil
+
+	var captured h2.H2Request
+	hreq, _ := http.NewRequest("GET", "/health", nil)
+	hreq.Proto = "HTTP/2.0"
+	c := &chainDispatchAction{f: f, action: captureH2Action(&captured), req: hreq, routeIdx: 0}
+
+	h2req := h2.H2Request{Method: "GET", Path: "/health", Authority: "localhost"}
+	if err := c.WriteH2(context.Background(), h2req, &captureH2Writer{}); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	if got := h2HeaderValue(captured, "x-request-id"); got != "" {
+		t.Errorf("forwarded x-request-id = %q, want empty (no-tracing byte-stable)", got)
+	}
+	if got := h2HeaderValue(captured, "traceparent"); got != "" {
+		t.Errorf("forwarded traceparent = %q, want empty (no-tracing byte-stable)", got)
 	}
 }
