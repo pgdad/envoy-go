@@ -112,6 +112,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0085-otlp-access-log-operators/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0086-tracing-request-id/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0087-tracing-otlp/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0088-tracing-zipkin/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

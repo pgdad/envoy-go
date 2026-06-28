@@ -1,0 +1,118 @@
+# Phase 46.2 fixture 0088-tracing-zipkin expectations (ADR-0019 — prose; the
+# driver is the enforcer via AssertStats; this file is documentation).
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process HTTP Zipkin v2 collector):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). HCM
+#                        carries a `tracing` block (Zipkin provider,
+#                        random_sampling 100%, trace_id_128bit:true,
+#                        shared_span_context:false, collector_endpoint
+#                        /api/v2/spans, collector_endpoint_version HTTP_JSON)
+#                        naming c_zipkin_collector — POSTing one Zipkin v2 JSON
+#                        span per completed request to the driver-owned collector.
+#   c_backend          — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_zipkin_collector — driver-owned in-process HTTP Zipkin v2 collector
+#                        (test/helpers/zipkincollector/) on a driver-allocated
+#                        stable port, bound 0.0.0.0:<port> so the reference
+#                        container (host.docker.internal) AND the subject
+#                        (127.0.0.1) both reach it. PLAINTEXT HTTP/1 — NO
+#                        http2_protocol_options (Zipkin v2 JSON over HTTP/1.1,
+#                        unlike the OTLP gRPC h2c collector in fixture 0087).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process).
+#
+# ## Workload
+#
+# Each side fires N+M = 12 requests:
+#   N = 8 PLAIN: GET /trace, Host: trace.example, UA: trace-probe/1. No inbound
+#       trace context. random_sampling 100% => each is a fresh locally-sampled
+#       span with a random trace-id.
+#   M = 4 CONTINUATION: + b3: 0123456789abcdef0123456789abcdef-fedcba9876543210-1
+#       (the 3-field B3 single-header form). The proxy CONTINUES the inbound trace:
+#       traceId == the inbound trace-id; under shared_span_context:false a fresh
+#       span id is generated and parentId == the inbound span-id.
+# The driver POLLS the collector's Count() to >= 12 (poll-to-converge; the
+# reference buffers spans and flushes on a timer / buffer-fill — never a fixed
+# sleep). Per-side separation: the collector is Reset() at the start of each
+# side's drive.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-span PAYLOAD aggregated across all
+# received spans — NOT the POST count, per-POST batch sizes, connection count, or
+# flush cadence, which legitimately vary side-to-side
+# (reference_streaming_sink_differential_framing).
+#
+# ## Asserted (cross-side EXACT on the STABLE per-span subset, both sides)
+#
+#   len(spans) == 12   (zero-span pass is vacuous — proves decode ran on BOTH sides)
+#   Every span:
+#     name                        == "trace.example"  (the request :authority;
+#                                    Zipkin names the span after the Host —
+#                                    D-TRACE-ZIPKIN-SPAN-NAME, distinct from OTLP "ingress")
+#     kind                        == "SERVER"
+#     timestamp                   > 0   (microseconds; PRESENCE, not value)
+#     duration                    > 0
+#     len(traceId)                == 32 (trace_id_128bit:true → 128-bit, 32 hex)
+#     tags["http.method"]         == "GET"
+#     tags["http.status_code"]    == "200"
+#     tags["component"]           == "proxy"
+#     tags["downstream_cluster"]  == "-"
+#     tags["response_flags"]      == "-"
+#     tags["request_size"]        == "0"   (GET, no body)
+#     tags["response_size"]       == "17"  (HTTPFixedBody 17-byte body)
+#     tags["user_agent"]          == "trace-probe/1"
+#     tags["http.url"]            PRESENT (value includes host+path; UNasserted exact)
+#     tags["http.protocol"]       PRESENT
+#     tags["guid:x-request-id"]   KEY PRESENT (value varies — UNasserted)
+#     tags["upstream_cluster"]    KEY PRESENT (value UNasserted — framework gap; see below)
+#     tags["upstream_cluster.name"] KEY PRESENT (value UNasserted — framework gap)
+#     tags["peer.address"]        KEY PRESENT (value env-specific — UNasserted)
+#   Continuation prong (exactly M = 4 spans where traceId == contTraceID):
+#     traceId  == 0123456789abcdef0123456789abcdef (the fixed inbound trace-id)
+#     parentId == fedcba9876543210                 (the fixed inbound span-id,
+#                  which becomes the server span's parent under shared:false)
+#   AND exactly N = 8 spans carry a DIFFERENT (random, fresh) trace-id.
+#
+# PLUS the subject-side flat /stats counters:
+#   tracing.zipkin.spans_sent    == 12
+#   tracing.zipkin.spans_dropped == 0
+#
+# ## UNasserted (vary side-to-side / impl-specific)
+#
+#   traceId / id VALUES (except the continuation prong traceId).
+#   timestamp / duration VALUES — non-deterministic.
+#   x-request-id / peer.address VALUES.
+#   upstream_cluster / upstream_cluster.name VALUES — framework gap (see below).
+#   POST count / per-POST batch sizes / connection count — framing.
+#   localEndpoint (serviceName) — env/impl-specific; the Zipkin encoder omits it
+#       when serviceName is empty, and the reference's localEndpoint host/port are
+#       env-specific. NOT modeled by the collector's ReceivedSpan.
+#   node_id / zone tags — the Zipkin encoder DROPS these two from the 16-attr
+#       roster (14 tags emitted); not asserted either way.
+#   The reference MAY emit additional tags beyond the asserted subset — the
+#       assertion checks specific keys/values, NOT tag-set equality.
+#
+# ## shared_span_context:false CHOICE
+#
+# The fixture pins shared_span_context:false (NOT the Envoy default true). Under
+# shared:false the server generates a FRESH span id and sets parentId to the
+# inbound span-id — so the continuation prong asserts parentId == contSpanID
+# directly (more discriminating than the shared:true form, which reuses the
+# inbound span-id as the server's own id + sets shared=true). Documented in README.md.
+#
+# ## upstream_cluster framework-gap deviation
+#
+# The upstream cluster name is NOT plumbed to envoy-go's request-completion seam
+# (same gap as fixture 0087). envoy-go emits upstream_cluster = "" and
+# upstream_cluster.name = ""; the reference Envoy emits the real cluster name.
+# KEYS are present on both sides; VALUES are explicitly UNasserted cross-side.
+# Documented in README.md.
+#
+# Cross-refs: phase 46.2 SPEC §11/§12 D-TRACE-ZIPKIN-* + ADR-0261 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_tracing_upstream_cluster_framework_gap +
+#             reference_phase_46_tracing_split.

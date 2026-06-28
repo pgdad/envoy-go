@@ -3,6 +3,7 @@ package tracing
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -415,6 +416,22 @@ func countReg(reg *stats.Registry) int {
 	return n
 }
 
+// otelCfg / zkCfg are TracingConfig builders for the dispatch arms. The Zipkin
+// arm reuses the fakeZipkinTransport seam from zipkin_test.go (its hasCluster
+// toggle drives the boot-reject gate); Dispatch is not exercised here (no span
+// is Export'd in the provider tests).
+func otelCfg(cluster, svc string) *TracingConfig {
+	return &TracingConfig{Provider: ProviderOTel, ClusterName: cluster, ServiceName: svc}
+}
+
+func zkCfg(cluster string) *TracingConfig {
+	return &TracingConfig{
+		Provider:    ProviderZipkin,
+		ClusterName: cluster,
+		Zipkin:      &ZipkinSettings{CollectorEndpoint: "/api/v2/spans"},
+	}
+}
+
 // TestExporterProvider covers: per-cluster memoization (pointer identity), the
 // boot-reject gate on a dialer error, lazy TracerCounter registration (sync.Once;
 // +2 only on first successful build; none on error-only builds), and CloseAll
@@ -426,16 +443,16 @@ func TestExporterProvider(t *testing.T) {
 		reg := stats.NewRegistry()
 		fc := &fakeTracesClient{}
 		d := newFakeDialer(map[string]*fakeTracesClient{"c": fc}, nil)
-		p := NewExporterProvider(d, reg, 0, time.Hour)
+		p := NewExporterProvider(d, nil, reg, 0, time.Hour)
 
-		e1, err := p.ExporterFor("c", "svc")
+		e1, err := p.ExporterFor(otelCfg("c", "svc"))
 		if err != nil {
 			t.Fatalf("ExporterFor: %v", err)
 		}
 		if e1 == nil {
 			t.Fatal("ExporterFor returned nil exporter")
 		}
-		e2, err := p.ExporterFor("c", "svc")
+		e2, err := p.ExporterFor(otelCfg("c", "svc"))
 		if err != nil {
 			t.Fatalf("ExporterFor second: %v", err)
 		}
@@ -449,9 +466,9 @@ func TestExporterProvider(t *testing.T) {
 	t.Run("boot_reject_on_dialer_error", func(t *testing.T) {
 		reg := stats.NewRegistry()
 		d := newFakeDialer(nil, map[string]error{"bad": errors.New("unknown cluster")})
-		p := NewExporterProvider(d, reg, 0, time.Hour)
+		p := NewExporterProvider(d, nil, reg, 0, time.Hour)
 
-		got, err := p.ExporterFor("bad", "svc")
+		got, err := p.ExporterFor(otelCfg("bad", "svc"))
 		if err == nil {
 			t.Fatal("expected error from dial failure, got nil")
 		}
@@ -467,12 +484,12 @@ func TestExporterProvider(t *testing.T) {
 			map[string]*fakeTracesClient{"c": fc},
 			map[string]error{"fail": errors.New("dial error")},
 		)
-		p := NewExporterProvider(d, reg, 0, time.Hour)
+		p := NewExporterProvider(d, nil, reg, 0, time.Hour)
 
 		before := countReg(reg) // fresh registry: should be 0
 
 		// Error path: no counters registered (delta stays 0).
-		if _, err := p.ExporterFor("fail", "svc"); err == nil {
+		if _, err := p.ExporterFor(otelCfg("fail", "svc")); err == nil {
 			t.Fatal("expected error for 'fail' cluster")
 		}
 		if delta := countReg(reg) - before; delta != 0 {
@@ -480,7 +497,7 @@ func TestExporterProvider(t *testing.T) {
 		}
 
 		// First successful build: +2 counters (spans_sent + spans_dropped).
-		if _, err := p.ExporterFor("c", "svc"); err != nil {
+		if _, err := p.ExporterFor(otelCfg("c", "svc")); err != nil {
 			t.Fatalf("ExporterFor c: %v", err)
 		}
 		if delta := countReg(reg) - before; delta != 2 {
@@ -488,7 +505,7 @@ func TestExporterProvider(t *testing.T) {
 		}
 
 		// Memoized second call: sync.Once already fired; no new counters.
-		if _, err := p.ExporterFor("c", "svc"); err != nil {
+		if _, err := p.ExporterFor(otelCfg("c", "svc")); err != nil {
 			t.Fatalf("ExporterFor c (memoized): %v", err)
 		}
 		if delta := countReg(reg) - before; delta != 2 {
@@ -503,12 +520,12 @@ func TestExporterProvider(t *testing.T) {
 		fc1 := &fakeTracesClient{}
 		fc2 := &fakeTracesClient{}
 		d := newFakeDialer(map[string]*fakeTracesClient{"c1": fc1, "c2": fc2}, nil)
-		p := NewExporterProvider(d, reg, 0, time.Hour)
+		p := NewExporterProvider(d, nil, reg, 0, time.Hour)
 
-		if _, err := p.ExporterFor("c1", "svc"); err != nil {
+		if _, err := p.ExporterFor(otelCfg("c1", "svc")); err != nil {
 			t.Fatalf("ExporterFor c1: %v", err)
 		}
-		if _, err := p.ExporterFor("c2", "svc"); err != nil {
+		if _, err := p.ExporterFor(otelCfg("c2", "svc")); err != nil {
 			t.Fatalf("ExporterFor c2: %v", err)
 		}
 
@@ -533,6 +550,142 @@ func TestExporterProvider(t *testing.T) {
 		}
 		if got := fc2.closes(); got != 1 {
 			t.Errorf("fc2.closes after second CloseAll = %d, want still 1", got)
+		}
+	})
+
+	// ─────────────────── Zipkin dispatch arm ───────────────────
+
+	t.Run("zipkin_memoized_per_cluster", func(t *testing.T) {
+		reg := stats.NewRegistry()
+		zt := &fakeZipkinTransport{hasCluster: true}
+		p := NewExporterProvider(nil, zt, reg, 0, time.Hour)
+
+		e1, err := p.ExporterFor(zkCfg("zk"))
+		if err != nil {
+			t.Fatalf("ExporterFor zipkin: %v", err)
+		}
+		if e1 == nil {
+			t.Fatal("ExporterFor returned nil zipkin exporter")
+		}
+		if _, ok := e1.(*ZipkinExporter); !ok {
+			t.Fatalf("ExporterFor zipkin returned %T, want *ZipkinExporter", e1)
+		}
+		e2, err := p.ExporterFor(zkCfg("zk"))
+		if err != nil {
+			t.Fatalf("ExporterFor zipkin second: %v", err)
+		}
+		if e1 != e2 {
+			t.Error("ExporterFor not memoized: different Exporter for same zipkin cluster")
+		}
+		_ = p.CloseAll()
+	})
+
+	t.Run("zipkin_boot_reject_unknown_cluster", func(t *testing.T) {
+		reg := stats.NewRegistry()
+		zt := &fakeZipkinTransport{hasCluster: false} // HasCluster == false
+		p := NewExporterProvider(nil, zt, reg, 0, time.Hour)
+
+		got, err := p.ExporterFor(zkCfg("zk"))
+		if err == nil {
+			t.Fatal("expected boot-reject error for unknown zipkin cluster, got nil")
+		}
+		if got != nil {
+			t.Fatalf("expected nil exporter on boot-reject, got %v", got)
+		}
+		if !strings.Contains(err.Error(), "unknown cluster") {
+			t.Errorf("boot-reject error %q, want it to contain %q", err.Error(), "unknown cluster")
+		}
+		// Boot-reject must NOT register counters or memoize.
+		if got := countReg(reg); got != 0 {
+			t.Errorf("counters registered on boot-reject = %d, want 0", got)
+		}
+	})
+
+	t.Run("zipkin_nil_transport_errors", func(t *testing.T) {
+		reg := stats.NewRegistry()
+		p := NewExporterProvider(nil, nil, reg, 0, time.Hour) // no zipkin transport wired
+
+		got, err := p.ExporterFor(zkCfg("zk"))
+		if err == nil {
+			t.Fatal("expected error for zipkin provider with no transport, got nil")
+		}
+		if got != nil {
+			t.Fatalf("expected nil exporter with no transport, got %v", got)
+		}
+	})
+
+	t.Run("zipkin_lazy_counter_registration", func(t *testing.T) {
+		reg := stats.NewRegistry()
+		zt := &fakeZipkinTransport{hasCluster: true}
+		p := NewExporterProvider(nil, zt, reg, 0, time.Hour)
+
+		before := countReg(reg) // fresh registry: 0
+		if before != 0 {
+			t.Fatalf("fresh registry surface = %d, want 0", before)
+		}
+
+		// First successful zipkin build: +2 tracing.zipkin.* counters.
+		if _, err := p.ExporterFor(zkCfg("zk")); err != nil {
+			t.Fatalf("ExporterFor zk: %v", err)
+		}
+		if delta := countReg(reg) - before; delta != 2 {
+			t.Errorf("zipkin counter delta after first successful build = %d, want 2", delta)
+		}
+		// Memoized second call: no new counters.
+		if _, err := p.ExporterFor(zkCfg("zk")); err != nil {
+			t.Fatalf("ExporterFor zk (memoized): %v", err)
+		}
+		if delta := countReg(reg) - before; delta != 2 {
+			t.Errorf("zipkin counter delta after memoized call = %d, want still 2", delta)
+		}
+		_ = p.CloseAll()
+	})
+
+	t.Run("zipkin_never_built_leaves_surface_unmoved", func(t *testing.T) {
+		reg := stats.NewRegistry()
+		fc := &fakeTracesClient{}
+		d := newFakeDialer(map[string]*fakeTracesClient{"c": fc}, nil)
+		zt := &fakeZipkinTransport{hasCluster: true}
+		p := NewExporterProvider(d, zt, reg, 0, time.Hour)
+
+		// Build only an OTel exporter: tracing.zipkin.* must NOT register.
+		if _, err := p.ExporterFor(otelCfg("c", "svc")); err != nil {
+			t.Fatalf("ExporterFor otel: %v", err)
+		}
+		// Surface should be exactly the 2 tracing.opentelemetry.* counters.
+		if got := countReg(reg); got != 2 {
+			t.Errorf("registry surface = %d, want 2 (otel only; no zipkin)", got)
+		}
+		_ = p.CloseAll()
+	})
+
+	t.Run("close_all_mixed_otel_and_zipkin", func(t *testing.T) {
+		reg := stats.NewRegistry()
+		fc := &fakeTracesClient{}
+		d := newFakeDialer(map[string]*fakeTracesClient{"c": fc}, nil)
+		zt := &fakeZipkinTransport{hasCluster: true}
+		p := NewExporterProvider(d, zt, reg, 0, time.Hour)
+
+		if _, err := p.ExporterFor(otelCfg("c", "svc")); err != nil {
+			t.Fatalf("ExporterFor otel: %v", err)
+		}
+		if _, err := p.ExporterFor(zkCfg("zk")); err != nil {
+			t.Fatalf("ExporterFor zipkin: %v", err)
+		}
+
+		// First CloseAll closes both; the OTel client's Close is called once.
+		if err := p.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+		if got := fc.closes(); got != 1 {
+			t.Errorf("otel client closes after first CloseAll = %d, want 1", got)
+		}
+		// Idempotent: second CloseAll is a harmless no-op.
+		if err := p.CloseAll(); err != nil {
+			t.Errorf("second CloseAll: %v", err)
+		}
+		if got := fc.closes(); got != 1 {
+			t.Errorf("otel client closes after second CloseAll = %d, want still 1", got)
 		}
 	})
 }

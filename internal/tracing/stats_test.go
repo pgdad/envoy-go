@@ -125,6 +125,54 @@ func TestTracerCounters_NilSafe(t *testing.T) {
 	c.IncDropped()
 }
 
+func TestZipkinCounters_Registration(t *testing.T) {
+	reg := stats.NewRegistry()
+	before := countMetrics(reg)
+
+	c := RegisterZipkinCounters(reg)
+	if c == nil {
+		t.Fatal("RegisterZipkinCounters returned nil *ZipkinCounters")
+	}
+
+	after := countMetrics(reg)
+	if delta := after - before; delta != 2 {
+		t.Fatalf("registry counter delta = %d, want 2", delta)
+	}
+
+	names := metricNames(reg)
+	want := []string{
+		"tracing.zipkin.spans_sent",
+		"tracing.zipkin.spans_dropped",
+	}
+	for _, w := range want {
+		if !names[w] {
+			t.Errorf("missing registered metric %q", w)
+		}
+	}
+}
+
+func TestZipkinCounters_IncSentAndDropped(t *testing.T) {
+	reg := stats.NewRegistry()
+	c := RegisterZipkinCounters(reg)
+
+	c.IncSent(3)
+	if v := c.spansSent.Load(); v != 3 {
+		t.Errorf("spans_sent = %d, want 3", v)
+	}
+
+	c.IncDropped()
+	if v := c.spansDropped.Load(); v != 1 {
+		t.Errorf("spans_dropped = %d, want 1", v)
+	}
+}
+
+func TestZipkinCounters_NilSafe(t *testing.T) {
+	var c *ZipkinCounters
+	// Must not panic.
+	c.IncSent(1)
+	c.IncDropped()
+}
+
 func TestHCMCounters_Record(t *testing.T) {
 	reg := stats.NewRegistry()
 	c, err := RegisterHCMCounters(reg, "ingress_http")

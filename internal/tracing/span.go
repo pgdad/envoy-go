@@ -33,6 +33,10 @@ type SpanInputs struct {
 	Zone              string
 	PeerAddress       string
 	ClientTraceID     string
+	// Authority is the request :authority (host:port) — the provider-neutral span
+	// name carried for the Zipkin encoder (D-TRACE-ZIPKIN-SPAN-NAME). The OTLP wire
+	// keeps Name="ingress"; Authority is a separate field, NOT a span attribute/tag.
+	Authority string
 }
 
 // Span is the project's internal representation of a single ingress trace span.
@@ -48,6 +52,9 @@ type Span struct {
 	TraceState   string
 	ServiceName  string
 	Attrs        []KV
+	// Authority is the request :authority used as the Zipkin span name; the OTLP
+	// Name stays "ingress" (D-TRACE-ZIPKIN-SPAN-NAME).
+	Authority string
 }
 
 // BuildServerSpan assembles the single "ingress" SERVER span for a request using
@@ -95,6 +102,7 @@ func BuildServerSpan(d Decision, in SpanInputs, start, end time.Time) *Span {
 		End:          end,
 		TraceState:   d.TraceState,
 		Attrs:        attrs,
+		Authority:    in.Authority,
 	}
 }
 

@@ -15,6 +15,7 @@ package tracing
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -234,64 +235,99 @@ type tracesClientDialer interface {
 	NewTracesClient(clusterName string) (TracesClient, error)
 }
 
-// ExporterProvider is the per-cluster memoizing factory for OTLPExporter
-// instances (D-TRACE-EXPORTER-WIRING). One OTLPExporter is built per unique
-// cluster name; repeated ExporterFor calls for the same cluster return the same
-// pointer (pointer identity). TracerCounters are registered lazily on the FIRST
-// successful build (sync.Once) so that a provider that errors on every
-// ExporterFor call leaves the registry surface unchanged.
+// ExporterProvider is the per-cluster memoizing factory for tracing Exporter
+// instances (D-TRACE-EXPORTER-WIRING / D-TRACE-ZIPKIN-TRANSPORT-WIRING). It
+// dispatches on the parsed TracingConfig.Provider: ProviderOTel builds an
+// *OTLPExporter over the dialer; ProviderZipkin builds a *ZipkinExporter over the
+// injected ZipkinTransport behind a HasCluster boot-reject gate. One Exporter is
+// built per unique cluster name (across both arms); repeated ExporterFor calls for
+// the same cluster return the same pointer (pointer identity). The two counter
+// rosters register lazily on the FIRST successful build of their kind (separate
+// sync.Once guards) so a provider that never builds an exporter of a kind leaves
+// that kind's registry surface unchanged.
 type ExporterProvider struct {
 	dialer   tracesClientDialer
+	zt       ZipkinTransport
 	reg      *stats.Registry
 	once     sync.Once
 	counters *TracerCounters
 	bufBytes int
 	bufFlush time.Duration
 
+	zipkinOnce     sync.Once
+	zipkinCounters *ZipkinCounters
+
 	mu        sync.Mutex
-	byCluster map[string]*OTLPExporter
+	byCluster map[string]Exporter
 }
 
-// NewExporterProvider builds an ExporterProvider backed by dialer. bufBytes and
-// bufFlush are forwarded to each OTLPExporter created by ExporterFor. reg
-// receives the 2 TracerCounters lazily on the first successful ExporterFor call.
-func NewExporterProvider(d tracesClientDialer, reg *stats.Registry, bufBytes int, bufFlush time.Duration) *ExporterProvider {
+// NewExporterProvider builds an ExporterProvider backed by dialer (the OTel arm)
+// and zt (the Zipkin arm; nil-able — only the ProviderZipkin dispatch consults it,
+// so a deployment with no Zipkin config boots cleanly with a nil transport).
+// bufBytes and bufFlush are forwarded to each Exporter created by ExporterFor. reg
+// receives the 2 TracerCounters (tracing.opentelemetry.*) lazily on the first
+// successful OTel build and the 2 ZipkinCounters (tracing.zipkin.*) lazily on the
+// first successful Zipkin build.
+func NewExporterProvider(d tracesClientDialer, zt ZipkinTransport, reg *stats.Registry, bufBytes int, bufFlush time.Duration) *ExporterProvider {
 	return &ExporterProvider{
 		dialer:    d,
+		zt:        zt,
 		reg:       reg,
 		bufBytes:  bufBytes,
 		bufFlush:  bufFlush,
-		byCluster: make(map[string]*OTLPExporter),
+		byCluster: make(map[string]Exporter),
 	}
 }
 
-// ExporterFor returns the OTLPExporter for clusterName, building it on the first
-// call. A second call for the same clusterName returns the SAME pointer
-// (memoized). The serviceName of the first successful call for a given
-// clusterName wins (one cluster = one service identity in practice). If the
-// dialer returns an error (unknown or non-H2 cluster) the error is returned
-// directly — this is the boot-reject gate (AMEND-TRACE-NO-BOOT-REJECT).
-// TracerCounters are registered lazily on the first successful build.
-func (p *ExporterProvider) ExporterFor(clusterName, serviceName string) (Exporter, error) {
+// ExporterFor returns the Exporter for cfg.ClusterName, building it on the first
+// call and dispatching on cfg.Provider. A second call for the same cluster returns
+// the SAME pointer (memoized; the memoize key is cfg.ClusterName for both arms).
+//
+// ProviderOTel: the dialer builds a TracesClient for the cluster (an error — unknown
+// or non-H2 cluster — is the boot-reject, returned directly); the 2 tracing.opentelemetry.*
+// counters register lazily on the first successful build.
+//
+// ProviderZipkin: a nil ZipkinTransport is a wiring error; an absent cluster
+// (HasCluster == false) is the boot-reject; otherwise the 2 tracing.zipkin.* counters
+// register lazily and a *ZipkinExporter is built over the transport. The boot-reject
+// and nil-transport paths return (nil, error) WITHOUT registering counters or memoizing.
+func (p *ExporterProvider) ExporterFor(cfg *TracingConfig) (Exporter, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byCluster[clusterName]; ok {
+	if e, ok := p.byCluster[cfg.ClusterName]; ok {
 		return e, nil
 	}
-	client, err := p.dialer.NewTracesClient(clusterName)
-	if err != nil {
-		return nil, err
+
+	var e Exporter
+	switch cfg.Provider {
+	case ProviderOTel:
+		client, err := p.dialer.NewTracesClient(cfg.ClusterName)
+		if err != nil {
+			return nil, err
+		}
+		p.once.Do(func() { p.counters = RegisterTracerCounters(p.reg) })
+		e = NewOTLPExporter(client, cfg.ServiceName, p.counters.spansSent, p.counters.spansDropped, p.bufBytes, p.bufFlush)
+	case ProviderZipkin:
+		if p.zt == nil {
+			return nil, fmt.Errorf("tracing: zipkin provider but no transport wired")
+		}
+		if !p.zt.HasCluster(cfg.ClusterName) {
+			return nil, fmt.Errorf("tracing: zipkin: unknown cluster %q", cfg.ClusterName)
+		}
+		p.zipkinOnce.Do(func() { p.zipkinCounters = RegisterZipkinCounters(p.reg) })
+		e = NewZipkinExporter(p.zt, cfg.ClusterName, cfg.Zipkin.CollectorEndpoint, cfg.Zipkin.CollectorHostname, cfg.Zipkin.TraceID128Bit, cfg.Zipkin.SharedSpanContext, p.zipkinCounters.spansSent, p.zipkinCounters.spansDropped, p.bufBytes, p.bufFlush)
+	default:
+		return nil, fmt.Errorf("tracing: unknown provider %v", cfg.Provider)
 	}
-	p.once.Do(func() { p.counters = RegisterTracerCounters(p.reg) })
-	e := NewOTLPExporter(client, serviceName, p.counters.spansSent, p.counters.spansDropped, p.bufBytes, p.bufFlush)
-	p.byCluster[clusterName] = e
+
+	p.byCluster[cfg.ClusterName] = e
 	return e, nil
 }
 
-// CloseAll closes every OTLPExporter built by this provider and returns the
-// first non-nil Close error. Idempotent: OTLPExporter.Close is sync.Once-
-// protected, so a second CloseAll is a harmless no-op on each exporter (the
-// underlying client Close is not called again).
+// CloseAll closes every Exporter built by this provider and returns the first
+// non-nil Close error. Idempotent: each Exporter.Close is sync.Once-protected, so
+// a second CloseAll is a harmless no-op on each exporter (the underlying client
+// Close is not called again).
 func (p *ExporterProvider) CloseAll() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

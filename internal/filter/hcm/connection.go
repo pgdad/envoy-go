@@ -518,9 +518,24 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// the post-Decide emitAccessLog call sites below can pass it to the span-emit
 	// block. The pointer stays nil when no tracing is configured (byte-stable).
 	if f.tracingConfig != nil {
-		d := tracing.Decide(req.Header, f.tracingConfig, f.rng)
+		// Phase 46.2 Task 9: provider-aware extract/inject (D-TRACE-ZIPKIN-DECIDE-SEAM).
+		// Zipkin reads/writes the B3 multi-header set; OTel reads/writes the W3C
+		// traceparent. The DecideWithContext seam runs the shared §11 precedence over
+		// whichever inbound context the provider extracted.
+		var ic tracing.TraceContext
+		var ok bool
+		if f.tracingConfig.Provider == tracing.ProviderZipkin {
+			ic, ok = tracing.ExtractB3(req.Header)
+		} else {
+			ic, ok = tracing.ExtractTraceparent(req.Header)
+		}
+		d := tracing.DecideWithContext(req.Header, ic, ok, f.tracingConfig, f.rng)
 		req.Header.Set("X-Request-Id", d.RequestID)
-		tracing.InjectTraceparent(req.Header, d.TraceID, d.SpanID, d.Sample, d.TraceState)
+		if f.tracingConfig.Provider == tracing.ProviderZipkin {
+			tracing.InjectB3(req.Header, d, f.tracingConfig.Zipkin.TraceID128Bit, f.tracingConfig.Zipkin.SharedSpanContext)
+		} else {
+			tracing.InjectTraceparent(req.Header, d.TraceID, d.SpanID, d.Sample, d.TraceState)
+		}
 		f.tracingCounters.Record(d.Class)
 		traceDecision = &d
 	}

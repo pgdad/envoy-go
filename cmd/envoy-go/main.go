@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -128,7 +129,21 @@ func main() {
 	// 1 s flush) mirror the ALS + OTLP-log defaults from bootstrap parsing
 	// (alsDefaultBufferSizeBytes=16384, bufferFlushInterval default=1s).
 	dialer := grpcclient.New(cm)
-	tracingProvider := tracing.NewExporterProvider(tracesDialerAdapter{dialer}, bs.Stats, 16384, time.Second)
+	// Phase-20 Task 2b (ADR-0177 + ADR-0150 §Decision AMENDMENT): construct
+	// the shared *httpclient.Client singleton AT BOOT for cross-phase reuse
+	// by jwks Fetcher (this Task 2b) + extauthz httpAuthClient (Task 2c) +
+	// oauth2 token_endpoint POST (Task 10). Per planner-time D8 the
+	// singleton uses Options{Timeout: 30s} — matches the phase-17-pinned
+	// per-request timeout discipline preserved by ADR-0150 §Decision
+	// AMENDMENT + the phase-18.1 zero-retry posture preserved by ADR-0159
+	// §Decision AMENDMENT. Threaded into the listener manager + via
+	// hcm.ListenerCtx{HTTPClient: ...} into per-filter FactoryCtx.HTTPClient.
+	// Declared before netReg so it is in scope for builtins.Deps.HTTPClient.
+	// Phase 46.2 (D-TRACE-ZIPKIN-TRANSPORT-WIRING): HOISTED above the tracing
+	// ExporterProvider so the zipkinTransportAdapter can carry it (+ cm) into
+	// NewExporterProvider for the Zipkin arm's v2-JSON ClusterDispatch POSTs.
+	httpClient := httpclient.New(httpclient.Options{Timeout: 30 * time.Second})
+	tracingProvider := tracing.NewExporterProvider(tracesDialerAdapter{dialer}, zipkinTransportAdapter{httpClient, cm}, bs.Stats, 16384, time.Second)
 	if len(bs.ALSConfigs) > 0 || len(bs.OTLPConfigs) > 0 {
 		if len(bs.ALSConfigs) > 0 {
 			written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
@@ -249,18 +264,6 @@ func main() {
 	lfReg := listenerfilter.NewListenerFilterRegistry()
 	lfReg.Register(tls_inspector.TypeURL, tls_inspector.New)
 	lfReg.Freeze()
-
-	// Phase-20 Task 2b (ADR-0177 + ADR-0150 §Decision AMENDMENT): construct
-	// the shared *httpclient.Client singleton AT BOOT for cross-phase reuse
-	// by jwks Fetcher (this Task 2b) + extauthz httpAuthClient (Task 2c) +
-	// oauth2 token_endpoint POST (Task 10). Per planner-time D8 the
-	// singleton uses Options{Timeout: 30s} — matches the phase-17-pinned
-	// per-request timeout discipline preserved by ADR-0150 §Decision
-	// AMENDMENT + the phase-18.1 zero-retry posture preserved by ADR-0159
-	// §Decision AMENDMENT. Threaded into the listener manager + via
-	// hcm.ListenerCtx{HTTPClient: ...} into per-filter FactoryCtx.HTTPClient.
-	// Declared before netReg so it is in scope for builtins.Deps.HTTPClient.
-	httpClient := httpclient.New(httpclient.Options{Timeout: 30 * time.Second})
 
 	// Phase-26.2 (§3.4): register all four built-in network filters (echo +
 	// direct_response read filters; tcp_proxy + HCM terminal filters) via the
@@ -384,6 +387,26 @@ type tracesDialerAdapter struct{ d *grpcclient.Dialer }
 func (a tracesDialerAdapter) NewTracesClient(clusterName string) (tracing.TracesClient, error) {
 	return grpcclient.NewOTLPTracesClient(a.d, clusterName)
 }
+
+// zipkinTransportAdapter bridges the shared *httpclient.Client + *cluster.Manager
+// to the tracing.ZipkinTransport seam (HasCluster/Dispatch). It lets main.go pass
+// the HTTP cluster-dispatch transport into tracing.NewExporterProvider without
+// internal/tracing importing internal/httpclient or internal/cluster (no import
+// cycle): HasCluster gates the boot-time collector-cluster existence check and
+// Dispatch binds the cluster manager into (*httpclient.Client).ClusterDispatch
+// for the Zipkin arm's v2-JSON POSTs. Phase 46.2 (D-TRACE-ZIPKIN-TRANSPORT-WIRING).
+type zipkinTransportAdapter struct {
+	c  *httpclient.Client
+	cm *cluster.Manager
+}
+
+func (a zipkinTransportAdapter) HasCluster(name string) bool { _, ok := a.cm.Get(name); return ok }
+
+func (a zipkinTransportAdapter) Dispatch(ctx context.Context, clusterName string, req *http.Request) (*http.Response, error) {
+	return a.c.ClusterDispatch(ctx, clusterName, req, a.cm)
+}
+
+var _ tracing.ZipkinTransport = zipkinTransportAdapter{}
 
 // maybeWrapLuaScriptLoadError inspects the supplied error for the arm-16
 // Lua compile-failure substring (the byte-stable wrap emitted by the lua

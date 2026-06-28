@@ -47,21 +47,32 @@ type Decision struct {
 	RequestID    string  // the generated/stamped x-request-id
 }
 
-// Decide runs the §11 request-tracing precedence over the incoming headers, the
-// parsed TracingConfig and the randomness seam. A fresh span-id is always read
-// first. An inbound W3C traceparent CONTINUES that trace authoritatively (its
-// sampled bit is honored, bypassing the local random_sampling/overall_sampling
-// caps; the x-request-id reason nibble reflects that inbound sampled bit —
-// Sampled when sampled, NoTrace when not — while the COUNTER class stays
-// not_traceable); otherwise the decision is local: an x-client-trace-id force-traces
-// (subject to client_sampling, else falling through to random sampling), the
-// default path random-samples, and overall_sampling then caps any locally-decided
-// sample. Finally the x-request-id is preserved+stamped (if inbound) or freshly
-// generated, carrying the decision REASON in its version nibble.
+// Decide runs the §11 request-tracing precedence using the W3C traceparent as the
+// continued-trace source: it extracts an inbound traceparent (if any) and delegates
+// to DecideWithContext. It is the thin traceparent-flavored wrapper over the
+// extraction-agnostic engine (D-TRACE-ZIPKIN-DECIDE-SEAM); a B3 (or other) caller
+// extracts its own context and calls DecideWithContext directly.
 func Decide(h http.Header, cfg *TracingConfig, rng RandSource) Decision {
+	ic, ok := ExtractTraceparent(h)
+	return DecideWithContext(h, ic, ok, cfg, rng)
+}
+
+// DecideWithContext runs the §11 request-tracing precedence over the incoming
+// headers, an already-extracted inbound trace context (ic, valid when continued),
+// the parsed TracingConfig and the randomness seam. A fresh span-id is always read
+// first (byte-stability: extraction consumes no rng). When continued, the supplied
+// ic CONTINUES that trace authoritatively (its sampled bit is honored, bypassing the
+// local random_sampling/overall_sampling caps; the x-request-id reason nibble
+// reflects that inbound sampled bit — Sampled when sampled, NoTrace when not — while
+// the COUNTER class stays not_traceable); otherwise the decision is local: an
+// x-client-trace-id force-traces (subject to client_sampling, else falling through to
+// random sampling), the default path random-samples, and overall_sampling then caps
+// any locally-decided sample. Finally the x-request-id is preserved+stamped (if
+// inbound) or freshly generated, carrying the decision REASON in its version nibble.
+func DecideWithContext(h http.Header, ic TraceContext, continued bool, cfg *TracingConfig, rng RandSource) Decision {
 	var d Decision
 	_, _ = rng.Read(d.SpanID[:]) // a fresh span-id always (upstream traceparent + 46.1b span)
-	if ic, ok := ExtractTraceparent(h); ok {
+	if continued {
 		d.Continued = true
 		d.TraceID = ic.TraceID
 		d.ParentSpanID = ic.ParentID

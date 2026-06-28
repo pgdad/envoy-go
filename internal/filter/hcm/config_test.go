@@ -1602,7 +1602,7 @@ func (d *hcmFakeTracesDialer) NewTracesClient(_ string) (tracing.TracesClient, e
 // makeHCMTestProvider builds a real *tracing.ExporterProvider over
 // hcmFakeTracesDialer. dialErr nil ⇒ ExporterFor succeeds; non-nil ⇒ boot-reject.
 func makeHCMTestProvider(dialErr error) *tracing.ExporterProvider {
-	return tracing.NewExporterProvider(&hcmFakeTracesDialer{dialErr: dialErr}, stats.NewRegistry(), 0, time.Second)
+	return tracing.NewExporterProvider(&hcmFakeTracesDialer{dialErr: dialErr}, nil, stats.NewRegistry(), 0, time.Second)
 }
 
 // TestParseFilter_Tracing_ExporterProvider_NilNoTracing verifies the

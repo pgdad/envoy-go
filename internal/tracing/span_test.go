@@ -138,6 +138,29 @@ func TestSpanBuildFresh(t *testing.T) {
 	}
 }
 
+// TestSpanBuildAuthority verifies the provider-neutral Authority field is carried
+// on the Span alongside the unchanged Name="ingress", and that toProto's Name stays
+// "ingress" (the OTLP wire is unaffected by Authority — D-TRACE-ZIPKIN-SPAN-NAME).
+func TestSpanBuildAuthority(t *testing.T) {
+	d := freshDecision()
+	in := freshInputs()
+	in.Authority = "127.0.0.1:10000"
+	start := time.Now()
+	end := start.Add(5 * time.Millisecond)
+
+	s := BuildServerSpan(d, in, start, end)
+
+	if s.Authority != "127.0.0.1:10000" {
+		t.Errorf("Authority = %q, want %q", s.Authority, "127.0.0.1:10000")
+	}
+	if s.Name != "ingress" {
+		t.Errorf("Name = %q, want %q", s.Name, "ingress")
+	}
+	if pb := s.toProto(); pb.Name != "ingress" {
+		t.Errorf("toProto().Name = %q, want %q (OTLP unchanged)", pb.Name, "ingress")
+	}
+}
+
 // TestSpanBuildContinued verifies that a continued Decision propagates ParentSpanID.
 func TestSpanBuildContinued(t *testing.T) {
 	d := freshDecision()

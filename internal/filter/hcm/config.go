@@ -331,7 +331,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		if provider == nil {
 			return nil, fmt.Errorf("hcm: tracing configured but no exporter provider wired")
 		}
-		exporter, err = provider.ExporterFor(tcfg.ClusterName, tcfg.ServiceName)
+		exporter, err = provider.ExporterFor(tcfg)
 		if err != nil {
 			return nil, fmt.Errorf("hcm: tracing exporter: %w", err)
 		}

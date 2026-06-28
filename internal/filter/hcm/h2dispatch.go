@@ -423,12 +423,31 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		for _, hf := range h2req.Headers {
 			view.Add(hf.Name, hf.Value)
 		}
-		d := tracing.Decide(view, c.f.tracingConfig, c.f.rng)
-		tracing.InjectTraceparent(view, d.TraceID, d.SpanID, d.Sample, d.TraceState)
+		// Phase 46.2 Task 9: provider-aware extract/inject (D-TRACE-ZIPKIN-DECIDE-SEAM),
+		// symmetric to connection.go's H1 seam. Zipkin reads/writes the B3 multi-header
+		// set; OTel reads/writes the W3C traceparent.
+		var ic tracing.TraceContext
+		var ok bool
+		if c.f.tracingConfig.Provider == tracing.ProviderZipkin {
+			ic, ok = tracing.ExtractB3(view)
+		} else {
+			ic, ok = tracing.ExtractTraceparent(view)
+		}
+		d := tracing.DecideWithContext(view, ic, ok, c.f.tracingConfig, c.f.rng)
 		h2req.Headers = upsertH2Header(h2req.Headers, "x-request-id", d.RequestID)
-		h2req.Headers = upsertH2Header(h2req.Headers, "traceparent", view.Get("Traceparent"))
-		if ts := view.Get("Tracestate"); ts != "" {
-			h2req.Headers = upsertH2Header(h2req.Headers, "tracestate", ts)
+		if c.f.tracingConfig.Provider == tracing.ProviderZipkin {
+			tracing.InjectB3(view, d, c.f.tracingConfig.Zipkin.TraceID128Bit, c.f.tracingConfig.Zipkin.SharedSpanContext)
+			for _, k := range []string{"X-B3-TraceId", "X-B3-SpanId", "X-B3-ParentSpanId", "X-B3-Sampled"} {
+				if v := view.Get(k); v != "" {
+					h2req.Headers = upsertH2Header(h2req.Headers, strings.ToLower(k), v)
+				}
+			}
+		} else {
+			tracing.InjectTraceparent(view, d.TraceID, d.SpanID, d.Sample, d.TraceState)
+			h2req.Headers = upsertH2Header(h2req.Headers, "traceparent", view.Get("Traceparent"))
+			if ts := view.Get("Tracestate"); ts != "" {
+				h2req.Headers = upsertH2Header(h2req.Headers, "tracestate", ts)
+			}
 		}
 		c.f.tracingCounters.Record(d.Class)
 		c.traceDecision = &d

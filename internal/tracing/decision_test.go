@@ -235,3 +235,77 @@ func TestDecide(t *testing.T) {
 		})
 	}
 }
+
+// TestDecideWithContext pins the extract-seam refactor (D-TRACE-ZIPKIN-DECIDE-SEAM):
+// a caller may supply an already-extracted TraceContext instead of forcing the
+// internal traceparent extraction, and the byte-stable rng-call order is preserved.
+func TestDecideWithContext(t *testing.T) {
+	// Fresh-trace parity: DecideWithContext(h, {}, false, ...) must produce the
+	// IDENTICAL Decision as Decide(h, ...) for a no-traceparent header — driven by
+	// two independently-seeded but identical RandSources (byte-stability linchpin).
+	t.Run("fresh-parity-with-decide", func(t *testing.T) {
+		h := http.Header{} // no traceparent
+		cfg := TracingConfig{RandomSampling: 100, OverallSampling: 100}
+
+		rngA := &fakeRand{
+			floats: []float64{0.0, 0.0},
+			bytes:  cat(spanFixture, traceFixture, uuidFixture),
+		}
+		rngB := &fakeRand{
+			floats: []float64{0.0, 0.0},
+			bytes:  cat(spanFixture, traceFixture, uuidFixture),
+		}
+
+		cfgA := cfg
+		cfgB := cfg
+		want := Decide(h, &cfgA, rngA)
+		got := DecideWithContext(h, TraceContext{}, false, &cfgB, rngB)
+
+		if got != want {
+			t.Errorf("DecideWithContext fresh path = %+v, want identical to Decide = %+v", got, want)
+		}
+	})
+
+	// Continued-authoritative path: a non-zero ic with continued=true continues the
+	// caller-supplied trace (TraceID/ParentID/Sampled honored; Class NotTraceable).
+	t.Run("continued-from-supplied-context", func(t *testing.T) {
+		var ic TraceContext
+		mustHex(t, ic.TraceID[:], contTraceHex)
+		mustHex(t, ic.ParentID[:], contParentHex)
+		ic.Sampled = true
+
+		h := http.Header{}
+		cfg := TracingConfig{RandomSampling: 0, OverallSampling: 0} // local caps would suppress
+		rng := &fakeRand{
+			bytes: cat(spanFixture, uuidFixture), // no trace read on the continued path
+		}
+
+		d := DecideWithContext(h, ic, true, &cfg, rng)
+
+		if !d.Continued {
+			t.Errorf("Continued = %v, want true", d.Continued)
+		}
+		if d.TraceID != ic.TraceID {
+			t.Errorf("TraceID = %x, want %x", d.TraceID, ic.TraceID)
+		}
+		if d.ParentSpanID != ic.ParentID {
+			t.Errorf("ParentSpanID = %x, want %x", d.ParentSpanID, ic.ParentID)
+		}
+		if d.Sample != ic.Sampled {
+			t.Errorf("Sample = %v, want %v", d.Sample, ic.Sampled)
+		}
+		if d.Class != NotTraceable {
+			t.Errorf("Class = %v, want NotTraceable", d.Class)
+		}
+		if got := hex.EncodeToString(d.SpanID[:]); got != "0102030405060708" {
+			t.Errorf("SpanID = %s, want fresh 0102030405060708", got)
+		}
+	})
+}
+
+func mustHex(t *testing.T, dst []byte, s string) {
+	t.Helper()
+	if _, err := hex.Decode(dst, []byte(s)); err != nil {
+		t.Fatalf("hex.Decode(%q): %v", s, err)
+	}
+}
