@@ -162,6 +162,9 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 		// filter's §4.3 Axis-B force-include arm. false-passthrough when
 		// the route does not carry the legacy bool.
 		routeIncludeVhRateLimits: entry.includeVhRateLimits,
+		// Phase 46.1b Task 8: traceDecision is set inside WriteH2 after the
+		// tracing block runs (post-Decide). Stays nil until then so pre-Decide
+		// emitAccessLogH2 sites see nil (no span for no-match/500 paths).
 	}, true
 }
 
@@ -258,6 +261,13 @@ type chainDispatchAction struct {
 	// the ratelimit filter's §4.3 Axis-B vhost-walk composition table per
 	// parent SPEC §4.3 + AMEND-5 (the legacy force-include override).
 	routeIncludeVhRateLimits bool
+
+	// Phase 46.1b Task 8: traceDecision holds the per-stream sampling decision
+	// produced by the tracing block inside WriteH2. Nil until the tracing block
+	// runs (pre-Decide emitAccessLogH2 sites — no-match, router-cast-error —
+	// pass nil automatically via this zero-value field). Post-Decide sites read
+	// c.traceDecision which is set to &d immediately after the Decide call.
+	traceDecision *tracing.Decision
 }
 
 func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, sw h2.StreamWriter) error {
@@ -297,12 +307,14 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// action directly + emit access-log + write wire bytes. Mirrors H1
 	// connection.go's dispatchRequest no-match branch. Phase 07.1 Task 18
 	// prereq P1: action returns ActionResponse; we serialize wire bytes here.
+	// Phase 46.1b Task 8: c.traceDecision is nil here (PRE-Decide — the
+	// tracing block runs later) → no span for a 404 no-match.
 	if c.routeIdx < 0 {
 		resp, picked, err := c.action(ctx, h2req)
 		if err == nil && resp.Status > 0 {
 			err = writeH2Reply(sw, resp.Status, resp.Headers, resp.Body)
 		}
-		c.f.emitAccessLogH2(h2req, resp.Status, int64(len(resp.Body)), picked, startTime, resp.Headers)
+		c.f.emitAccessLogH2(h2req, resp.Status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision)
 		if cnt := c.f.downstreamStatusClassCounter(resp.Status); cnt != nil {
 			cnt.Inc()
 		}
@@ -382,9 +394,10 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	if !ok {
 		log.Printf("hcm: h2dispatch: terminal filter is not *router.Filter (got %T)", chainHF[len(chainHF)-1].Decoder)
 		// Best-effort 500 synthesis on the wire; mirrors the H1 path's
-		// dispatchRequest defensive branch.
+		// dispatchRequest defensive branch. Phase 46.1b Task 8: c.traceDecision
+		// is nil here (PRE-Decide) → no span for this synthetic 500.
 		_ = c.f.write500H2(sw)
-		c.f.emitAccessLogH2(h2req, 500, 0, cluster.Endpoint{}, startTime, nil)
+		c.f.emitAccessLogH2(h2req, 500, 0, cluster.Endpoint{}, startTime, nil, c.traceDecision)
 		if cnt := c.f.downstreamStatusClassCounter(500); cnt != nil {
 			cnt.Inc()
 		}
@@ -402,6 +415,9 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// RoundTrip would ride the un-mutated value-copy. When no provider is
 	// configured the block is skipped and the value passes through unchanged
 	// (byte-stable no-tracing path).
+	//
+	// Phase 46.1b Task 8: capture the decision into c.traceDecision so the
+	// post-Decide emitAccessLogH2 sites below can pass it to the span-emit block.
 	if c.f.tracingConfig != nil {
 		view := make(http.Header, len(h2req.Headers)+2)
 		for _, hf := range h2req.Headers {
@@ -415,6 +431,7 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 			h2req.Headers = upsertH2Header(h2req.Headers, "tracestate", ts)
 		}
 		c.f.tracingCounters.Record(d.Class)
+		c.traceDecision = &d
 	}
 
 	rf.SetH2Request(h2req)
@@ -494,7 +511,8 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 			// from cors.go) on the H2 HEADERS frame.
 			werr = writeH2Reply(sw, lrStatus, lrHeaders, lrBody)
 		}
-		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime, lrHeaders)
+		// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
+		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime, lrHeaders, c.traceDecision)
 		if lrStatus > 0 {
 			if cnt := c.f.downstreamStatusClassCounter(lrStatus); cnt != nil {
 				cnt.Inc()
@@ -540,13 +558,15 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		// which the encode header map does not carry (:status is not present).
 		chain.SetEncodeResponseStatus(status)
 		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
-			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers)
+			// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
+			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision)
 			return err
 		}
 		resp.Headers = filter_http.ReconcileOrderedHeaders(resp.Headers, merged)
 		if len(resp.Body) > 0 {
 			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
-				c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers)
+				// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
+				c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision)
 				return err
 			}
 		}
@@ -573,8 +593,9 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 
 	// Per Decision §3.1: single uniform access-log emit site at chain-completion.
 	// emitAccessLogH2 is a no-op when status==0 (H2 ctx-cancel sentinel per
-	// SPEC §2.1 last bullet) or when f.accessLog is empty.
-	c.f.emitAccessLogH2(h2req, status, bytesSent, picked, startTime, resp.Headers)
+	// SPEC §2.1 last bullet) or when f.accessLog is empty. Phase 46.1b Task 8:
+	// POST-Decide site — pass c.traceDecision for span export on sampled requests.
+	c.f.emitAccessLogH2(h2req, status, bytesSent, picked, startTime, resp.Headers, c.traceDecision)
 
 	// Phase 06.1 Task 11: HCM-scope downstream_rq_<Nxx> Inc on the H2 path
 	// per SPEC §5.5 "HCM response hook" row — Inc once per finalized response

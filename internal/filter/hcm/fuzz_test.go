@@ -36,7 +36,7 @@ func FuzzHCMConfigParse(f *testing.F) {
 		// Fresh Registry per iteration so the 5 HCM-scope counters the
 		// constructor allocates on the happy path don't collide across fuzz
 		// iterations. The httpReg is reused (frozen, no per-iter mutation).
-		_, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, httpReg, nil)
+		_, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, httpReg, nil, nil)
 		if err != nil && !strings.HasPrefix(err.Error(), "hcm:") {
 			t.Errorf("error not hcm:-prefixed: %v", err)
 		}

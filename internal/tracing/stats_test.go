@@ -77,6 +77,54 @@ func TestHCMCounters_InvalidPrefix(t *testing.T) {
 	}
 }
 
+func TestTracerCounters_Registration(t *testing.T) {
+	reg := stats.NewRegistry()
+	before := countMetrics(reg)
+
+	c := RegisterTracerCounters(reg)
+	if c == nil {
+		t.Fatal("RegisterTracerCounters returned nil *TracerCounters")
+	}
+
+	after := countMetrics(reg)
+	if delta := after - before; delta != 2 {
+		t.Fatalf("registry counter delta = %d, want 2", delta)
+	}
+
+	names := metricNames(reg)
+	want := []string{
+		"tracing.opentelemetry.spans_sent",
+		"tracing.opentelemetry.spans_dropped",
+	}
+	for _, w := range want {
+		if !names[w] {
+			t.Errorf("missing registered metric %q", w)
+		}
+	}
+}
+
+func TestTracerCounters_IncSentAndDropped(t *testing.T) {
+	reg := stats.NewRegistry()
+	c := RegisterTracerCounters(reg)
+
+	c.IncSent(3)
+	if v := c.spansSent.Load(); v != 3 {
+		t.Errorf("spans_sent = %d, want 3", v)
+	}
+
+	c.IncDropped()
+	if v := c.spansDropped.Load(); v != 1 {
+		t.Errorf("spans_dropped = %d, want 1", v)
+	}
+}
+
+func TestTracerCounters_NilSafe(t *testing.T) {
+	var c *TracerCounters
+	// Must not panic.
+	c.IncSent(1)
+	c.IncDropped()
+}
+
 func TestHCMCounters_Record(t *testing.T) {
 	reg := stats.NewRegistry()
 	c, err := RegisterHCMCounters(reg, "ingress_http")

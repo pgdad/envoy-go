@@ -17,6 +17,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/network"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 // Compile-time assertion that *Filter satisfies network.TerminalFilter (26.2
@@ -40,6 +41,7 @@ func NewNetworkFactory(
 	httpRegistry *filter_http.HTTPRegistry,
 	dm *drain.Manager,
 	httpClient *httpclient.Client,
+	tracingExporters *tracing.ExporterProvider,
 ) network.NetworkFilterFactory {
 	return func(tc *anypb.Any, ctx network.FactoryCtx) (network.FilterInstanceFactory, error) {
 		f, err := NewFilterWithCtxAndSinksAndRegistry(
@@ -51,7 +53,7 @@ func NewNetworkFactory(
 				HTTPClient:         httpClient,
 				NodeServiceCluster: ctx.NodeServiceCluster,
 			},
-			registry, accessLogSinks, httpRegistry, dm,
+			registry, accessLogSinks, httpRegistry, dm, tracingExporters,
 		)
 		if err != nil {
 			return nil, err
@@ -93,8 +95,9 @@ func NewFilterWithCtxAndSinksAndRegistry(
 	accessLogSinks []accesslog.Sink,
 	httpRegistry *filter_http.HTTPRegistry,
 	dm *drain.Manager,
+	tracingExporters *tracing.ExporterProvider,
 ) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks, httpRegistry, dm)
+	return parseFilterWithCtx(tc, clusters, lc, registry, accessLogSinks, httpRegistry, dm, tracingExporters)
 }
 
 // Handle drives one downstream connection from acceptance to close. ALPN

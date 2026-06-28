@@ -33,5 +33,5 @@ func testHTTPRegistry() *filter_http.HTTPRegistry {
 // config.go pre-Task-14; the test bodies that previously called parseFilter
 // now call this helper with the same two-arg shape.
 func parseFilterTest(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
-	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 }

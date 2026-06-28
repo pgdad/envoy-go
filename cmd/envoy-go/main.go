@@ -55,6 +55,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 func main() {
@@ -115,19 +116,20 @@ func main() {
 		}
 		sinks = append(sinks, sink)
 	}
-	// Phase 44.1 (ADR-0255) + phase 45.1 (ADR-0258): build the gRPC-ALS and OTLP
-	// access-log sinks. The shared grpcclient.Dialer (one Dialer serves both passes)
-	// is HOISTED to fire when EITHER family is configured (an OTLP-only boot must
-	// still build it). Each sink is appended to the same `sinks` slice BEFORE the
-	// defer-LIFO Close() below, which already covers them.
-	//
-	// ALS: the two sink counters (access_logs.grpc_access_log.*) register once iff
-	// ≥1 ALS sink exists; the node is a minimal node (Id + Cluster) built from the
-	// bootstrap node proto (D-ALS-NODE; UNasserted). An unknown / non-HTTP2 cluster
-	// surfaces here as a fatal at sink build (the Dialer's dial-time gate), matching
-	// the existing file-sink open-failure idiom.
+	// Phase 44.1 (ADR-0255) + phase 45.1 (ADR-0258) + phase 46.1b (ADR-0260):
+	// the shared grpcclient.Dialer is built UNCONDITIONALLY (it is cheap and
+	// lazy-dialing — no connection is opened until a named cluster is first
+	// requested). The access-log sinks (ALS, OTLP-log) are still built only when
+	// their config slices are non-empty, reusing this hoisted dialer. The tracing
+	// ExporterProvider is also built unconditionally (it is INERT until ExporterFor
+	// is called during HCM filter-parse for a tracing-enabled listener; the
+	// lazy-sync.Once counter register guarantees a no-tracing boot has zero
+	// tracing.opentelemetry.* stat surface). Buffer defaults (16384 bytes /
+	// 1 s flush) mirror the ALS + OTLP-log defaults from bootstrap parsing
+	// (alsDefaultBufferSizeBytes=16384, bufferFlushInterval default=1s).
+	dialer := grpcclient.New(cm)
+	tracingProvider := tracing.NewExporterProvider(tracesDialerAdapter{dialer}, bs.Stats, 16384, time.Second)
 	if len(bs.ALSConfigs) > 0 || len(bs.OTLPConfigs) > 0 {
-		dialer := grpcclient.New(cm)
 		if len(bs.ALSConfigs) > 0 {
 			written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
 			node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
@@ -158,6 +160,12 @@ func main() {
 			_ = s.Close()
 		}
 	}()
+	// Phase 46.1b (ADR-0260): flush-and-stop the OTLP trace exporter goroutines on
+	// shutdown. In LIFO order this runs AFTER lm.Stop() (so listeners are stopped
+	// and no new spans are generated) but BEFORE the access-log sinks close. The
+	// provider is INERT for no-tracing boots (byCluster stays empty, CloseAll is
+	// a trivial no-op returning nil).
+	defer func() { _ = tracingProvider.CloseAll() }()
 
 	// Phase 07.1 Task 20 boot wiring: build the *filter_http.HTTPRegistry and
 	// register the three filter factories envoy-go ships at 07.1 — router
@@ -261,12 +269,13 @@ func main() {
 	// filter_chains[].filters[].type_urls against the frozen registry).
 	netReg := network.NewRegistry()
 	builtins.RegisterBuiltins(netReg, builtins.Deps{
-		ClusterManager: cm,
-		StatsRegistry:  bs.Stats,
-		AccessLogSinks: sinks,
-		HTTPRegistry:   httpReg,
-		DrainManager:   drainMgr,
-		HTTPClient:     httpClient,
+		ClusterManager:   cm,
+		StatsRegistry:    bs.Stats,
+		AccessLogSinks:   sinks,
+		HTTPRegistry:     httpReg,
+		DrainManager:     drainMgr,
+		HTTPClient:       httpClient,
+		TracingExporters: tracingProvider,
 	})
 	netReg.Freeze()
 
@@ -363,6 +372,18 @@ const luaCompileErrorSubstring = "lua: default_source_code: compile:"
 // discipline — the colon is preserved here for upstream-parity readability
 // of operator-facing stderr.
 const scriptLoadErrorWrapPrefix = "script load error: "
+
+// tracesDialerAdapter bridges *grpcclient.Dialer to the unexported
+// tracing.tracesClientDialer interface (single method NewTracesClient). It
+// allows main.go to pass the shared grpcclient.Dialer into
+// tracing.NewExporterProvider without creating an import cycle (tracing
+// never imports grpcclient; the structural match is verified by the compiler
+// at the NewExporterProvider call site). Phase 46.1b (ADR-0260).
+type tracesDialerAdapter struct{ d *grpcclient.Dialer }
+
+func (a tracesDialerAdapter) NewTracesClient(clusterName string) (tracing.TracesClient, error) {
+	return grpcclient.NewOTLPTracesClient(a.d, clusterName)
+}
 
 // maybeWrapLuaScriptLoadError inspects the supplied error for the arm-16
 // Lua compile-failure substring (the byte-stable wrap emitted by the lua

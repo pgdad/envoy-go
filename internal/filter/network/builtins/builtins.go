@@ -28,18 +28,21 @@ import (
 	"github.com/esalaine/envoy-go/internal/filter/tcpproxy"
 	"github.com/esalaine/envoy-go/internal/httpclient"
 	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 // Deps carries the boot singletons the terminal-filter adapters capture. The
 // read filters (echo/direct_response) need none. Nil-tolerant where the
-// underlying adapter/constructor is (dm, httpClient, accessLogSinks).
+// underlying adapter/constructor is (dm, httpClient, accessLogSinks,
+// TracingExporters).
 type Deps struct {
-	ClusterManager *cluster.Manager
-	StatsRegistry  *stats.Registry
-	AccessLogSinks []accesslog.Sink
-	HTTPRegistry   *filter_http.HTTPRegistry
-	DrainManager   *drain.Manager
-	HTTPClient     *httpclient.Client
+	ClusterManager   *cluster.Manager
+	StatsRegistry    *stats.Registry
+	AccessLogSinks   []accesslog.Sink
+	HTTPRegistry     *filter_http.HTTPRegistry
+	DrainManager     *drain.Manager
+	HTTPClient       *httpclient.Client
+	TracingExporters *tracing.ExporterProvider
 }
 
 // RegisterBuiltins registers echo, direct_response, tcp_proxy, HCM,
@@ -59,6 +62,7 @@ func RegisterBuiltins(reg *network.Registry, deps Deps) {
 		deps.HTTPRegistry,
 		deps.DrainManager,
 		deps.HTTPClient,
+		deps.TracingExporters,
 	))
 	// rbac_network: the 5th built-in (D-26.3-3). The stats Registry is
 	// closure-captured from deps.StatsRegistry (the network FactoryCtx carries no

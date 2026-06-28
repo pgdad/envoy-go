@@ -59,6 +59,7 @@ import (
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -362,6 +363,66 @@ func (c *OTLPLogsClient) Export(ctx context.Context, req *collogspb.ExportLogsSe
 
 // Close releases the underlying *grpc.ClientConn. Idempotent (sync.Once).
 func (c *OTLPLogsClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			c.closeErr = c.conn.Close()
+		}
+	})
+	return c.closeErr
+}
+
+// ----------------------------------------------------------------------------
+// OTLPTracesClient — the typed TraceService/Export UNARY wrapper (ADR-0260).
+// ----------------------------------------------------------------------------
+
+// OTLPTracesClient wraps a *grpc.ClientConn with the typed
+// go.opentelemetry.io/proto/otlp collector TraceServiceClient stub. One
+// *OTLPTracesClient per OTLP tracing sink (cluster_name), owned by the
+// OTLPExporter and Close()d at sink close. The OTLPLogsClient precedent
+// (ADR-0258) but for traces — Export is a plain unary RPC (no stream
+// lifecycle).
+type OTLPTracesClient struct {
+	conn   *grpc.ClientConn
+	stub   coltracepb.TraceServiceClient
+	target string // cluster_name — for logs/errors
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// NewOTLPTracesClient dials the named cluster via d.DialContext and wraps the
+// resulting *grpc.ClientConn in a typed OTLPTracesClient. On dial error returns
+// (nil, err) verbatim (already cluster-named via DialContext's wrapping).
+func NewOTLPTracesClient(d *Dialer, clusterName string) (*OTLPTracesClient, error) {
+	if d == nil {
+		return nil, fmt.Errorf("grpcclient: new OTLP traces client %q: dialer is nil", clusterName)
+	}
+	conn, err := d.DialContext(context.Background(), clusterName)
+	if err != nil {
+		return nil, err
+	}
+	return &OTLPTracesClient{
+		conn:   conn,
+		stub:   coltracepb.NewTraceServiceClient(conn),
+		target: clusterName,
+	}, nil
+}
+
+// Export sends one ExportTraceServiceRequest over the unary TraceService/Export
+// RPC. The exporter's writer goroutine bounds ctx; on error the exporter retries
+// once.
+func (c *OTLPTracesClient) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
+	if c == nil || c.stub == nil {
+		return nil, errors.New("grpcclient: Export: nil OTLPTracesClient / stub")
+	}
+	return c.stub.Export(ctx, req)
+}
+
+// Close releases the underlying *grpc.ClientConn. Idempotent (sync.Once).
+func (c *OTLPTracesClient) Close() error {
 	if c == nil {
 		return nil
 	}

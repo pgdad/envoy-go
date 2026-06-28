@@ -10,13 +10,49 @@ import (
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 // emitAccessLog constructs an accesslog.Record from H1 primitives and submits
 // to each sink in f.accessLog. Per SPEC §2.1, a zero statusCode is the H2
 // ctx-cancel sentinel and skips emission; H1 path never produces a zero
 // statusCode in normal flow, but the guard is uniform across H1+H2 callers.
-func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders) {
+//
+// Phase 46.1b Task 8: the span block PRECEDES the len(f.accessLog)==0
+// early-return so that a tracing HCM with no access_log block still exports
+// spans (AMEND-TRACE-SPANEND-SEAM). A non-zero statusCode + non-nil exporter +
+// non-nil traceDecision with Sample==true triggers span build and export.
+func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision) {
+	// SPAN BLOCK — must be BEFORE the access-log early-return (AMEND-TRACE-SPANEND-SEAM):
+	// a tracing HCM without any access_log block still exports spans.
+	if statusCode != 0 && f.exporter != nil && traceDecision != nil && traceDecision.Sample {
+		reqSize := r.ContentLength
+		if reqSize < 0 {
+			reqSize = 0
+		}
+		// URL: scheme://authority/path-and-query.  H1 server-side requests do not
+		// carry r.URL.Scheme (set by stdlib only for client-side requests); default
+		// to "http" to match Envoy's behavior on plain listeners.
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		url := scheme + "://" + r.Host + r.URL.RequestURI()
+		in := tracing.SpanInputs{
+			Method:            r.Method,
+			URL:               url,
+			Protocol:          r.Proto,
+			StatusCode:        statusCode,
+			UserAgent:         r.Header.Get("User-Agent"),
+			RequestSize:       reqSize,
+			ResponseSize:      bytesSent,
+			UpstreamCluster:   "", // not available at this seam; Task 11 differential is UNasserted on this field
+			DownstreamCluster: "-",
+			ResponseFlags:     "-",
+			ClientTraceID:     r.Header.Get("X-Client-Trace-Id"),
+		}
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, start, time.Now()))
+	}
 	if statusCode == 0 || len(f.accessLog) == 0 {
 		return
 	}
@@ -42,7 +78,41 @@ func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64,
 // :path, :authority) and User-Agent from H2Request fields. Per SPEC §2.1
 // last bullet, a zero statusCode is the H2 ctx-cancel sentinel and skips
 // emission.
-func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders) {
+//
+// Phase 46.1b Task 8: symmetric span block at FUNCTION HEAD (same
+// AMEND-TRACE-SPANEND-SEAM ordering as emitAccessLog above).
+func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision) {
+	// SPAN BLOCK — must be BEFORE the access-log early-return (AMEND-TRACE-SPANEND-SEAM).
+	if statusCode != 0 && f.exporter != nil && traceDecision != nil && traceDecision.Sample {
+		// URL: scheme://authority/path.  H2 carries :scheme so use it directly.
+		scheme := req.Scheme
+		if scheme == "" {
+			scheme = "https" // H2 defaults to https per RFC 9113 §8.3.1
+		}
+		url := scheme + "://" + req.Authority + req.Path
+		// x-client-trace-id from the H2 regular headers (case-insensitive scan).
+		var clientTraceID string
+		for _, hf := range req.Headers {
+			if strings.EqualFold(hf.Name, "x-client-trace-id") {
+				clientTraceID = hf.Value
+				break
+			}
+		}
+		in := tracing.SpanInputs{
+			Method:            req.Method,
+			URL:               url,
+			Protocol:          "HTTP/2.0",
+			StatusCode:        statusCode,
+			UserAgent:         h2UserAgent(req),
+			RequestSize:       int64(len(req.Body)),
+			ResponseSize:      bytesSent,
+			UpstreamCluster:   "", // not available at this seam; UNasserted in differential
+			DownstreamCluster: "-",
+			ResponseFlags:     "-",
+			ClientTraceID:     clientTraceID,
+		}
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, start, time.Now()))
+	}
 	if statusCode == 0 || len(f.accessLog) == 0 {
 		return
 	}

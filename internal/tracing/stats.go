@@ -38,6 +38,37 @@ func RegisterHCMCounters(reg *stats.Registry, statPrefix string) (*HCMCounters, 
 	}, nil
 }
 
+// TracerCounters holds the 2 process-global tracer-scoped counters registered
+// under tracing.opentelemetry.* (D-TRACE-STATS-FINAL). These are static names
+// (no dynamic segment) so no IsValidName guard is required.
+type TracerCounters struct {
+	spansSent    *stats.Counter
+	spansDropped *stats.Counter
+}
+
+// RegisterTracerCounters allocates the 2 tracer-scoped counters
+// tracing.opentelemetry.spans_sent and tracing.opentelemetry.spans_dropped.
+func RegisterTracerCounters(reg *stats.Registry) *TracerCounters {
+	return &TracerCounters{
+		spansSent:    reg.NewCounter("tracing.opentelemetry.spans_sent"),
+		spansDropped: reg.NewCounter("tracing.opentelemetry.spans_dropped"),
+	}
+}
+
+// IncSent adds n to the spans_sent counter (nil-safe).
+func (c *TracerCounters) IncSent(n int) {
+	if c != nil {
+		c.spansSent.Add(uint64(n))
+	}
+}
+
+// IncDropped increments the spans_dropped counter (nil-safe).
+func (c *TracerCounters) IncDropped() {
+	if c != nil {
+		c.spansDropped.Inc()
+	}
+}
+
 // Record increments the HCM tracing.* counter matching class. NoClass (and any
 // unrecognized class) increments none.
 func (c *HCMCounters) Record(class SampleClass) {

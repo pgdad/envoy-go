@@ -310,6 +310,12 @@ func (f *Filter) serveOneRequest(ctx context.Context, downstream net.Conn, req *
 // even when err is non-nil (the action populates status before the writer
 // error path).
 func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *http.Request, bw *bufio.Writer) (int, error) {
+	// Phase 46.1b Task 8: frame-local tracing decision pointer. Declared at the
+	// TOP of dispatchRequest so it is in scope at every emitAccessLog call site.
+	// Stays nil until the tracing block below runs (pre-Decide emit sites pass nil
+	// automatically; post-Decide sites receive the captured &d).
+	var traceDecision *tracing.Decision
+
 	entry, routeIdx, ok := f.table.match(req)
 	if !ok {
 		// 404 catch-all: phase-04 byte-preserved synthesis with empty body
@@ -317,10 +323,11 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		// NOT allocated for a no-match — there is no route → no per-route
 		// config → no terminal action to run; the legacy direct synthesis
 		// is the byte-equivalent path. Access-log emit also fires here per
-		// Decision §3.1 (the "no-match" terminal state).
+		// Decision §3.1 (the "no-match" terminal state). traceDecision is
+		// nil here (PRE-Decide path) — no span for a 404 no-match.
 		start := time.Now()
 		err := writeStatusReply(bw, 404, "")
-		f.emitAccessLog(req, 404, 0, cluster.Endpoint{}, start, nil)
+		f.emitAccessLog(req, 404, 0, cluster.Endpoint{}, start, nil, traceDecision)
 		return 404, err
 	}
 
@@ -436,11 +443,12 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		// Defensive: should never happen in well-formed bootstraps because
 		// ValidateChainShape pins the terminal type_url to router.TypeURL,
 		// and router.New is the only registered factory for that URL.
-		// Synthesize 500 + log; the bw write is best-effort.
+		// Synthesize 500 + log; the bw write is best-effort. traceDecision
+		// is nil here (PRE-Decide path) — no span for this synthetic 500.
 		log.Printf("hcm: dispatchRequest: terminal filter is not *router.Filter (got %T)", chainHF[len(chainHF)-1].Decoder)
 		start := time.Now()
 		err := writeStatusReply(bw, 500, "")
-		f.emitAccessLog(req, 500, 0, cluster.Endpoint{}, start, nil)
+		f.emitAccessLog(req, 500, 0, cluster.Endpoint{}, start, nil, traceDecision)
 		return 500, err
 	}
 	rf.SetAction(action)
@@ -505,11 +513,16 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// the HCM tracing engine, not the router, does the injection). When no
 	// provider is configured this whole block is skipped — the no-tracing path
 	// stays byte-stable (no x-request-id / traceparent added; no counter moves).
+	//
+	// Phase 46.1b Task 8: capture the decision into the frame-local pointer so
+	// the post-Decide emitAccessLog call sites below can pass it to the span-emit
+	// block. The pointer stays nil when no tracing is configured (byte-stable).
 	if f.tracingConfig != nil {
 		d := tracing.Decide(req.Header, f.tracingConfig, f.rng)
 		req.Header.Set("X-Request-Id", d.RequestID)
 		tracing.InjectTraceparent(req.Header, d.TraceID, d.SpanID, d.Sample, d.TraceState)
 		f.tracingCounters.Record(d.Class)
+		traceDecision = &d
 	}
 
 	// Decode side: headers → data → trailers. endStream on RunDecodeHeaders is
@@ -551,7 +564,9 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 			// http.Header.Write would lose the §11.2 order).
 			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
 		}
-		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders)
+		// Phase 46.1b Task 8: POST-Decide site — pass traceDecision so the
+		// span block in emitAccessLog fires when sampling is active.
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders, traceDecision)
 		// Honor any user-supplied Connection: close on the local-reply
 		// headers (the 413 overflow path sets this; cors preflight does not).
 		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
@@ -652,7 +667,8 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		if lrStatus > 0 {
 			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
 		}
-		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders)
+		// Phase 46.1b Task 8: POST-Decide site — pass traceDecision.
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders, traceDecision)
 		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
 			if werr == nil {
 				werr = errCloseAfterAction
@@ -728,9 +744,9 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 
 	// Per Decision §3.1: single uniform access-log emit site at chain-completion.
 	// emitAccessLog is a no-op when status==0 (ctx-cancel sentinel) or when
-	// f.accessLog is empty. Calls into the existing accesslog_emit.go body
-	// (UNCHANGED at this task; only the call site moves).
-	f.emitAccessLog(req, status, bytesSent, picked, startTime, resp.Headers)
+	// f.accessLog is empty. Phase 46.1b Task 8: POST-Decide site — pass
+	// traceDecision so the span block fires for sampled requests.
+	f.emitAccessLog(req, status, bytesSent, picked, startTime, resp.Headers, traceDecision)
 
 	return status, actionErr
 }

@@ -1,6 +1,8 @@
 package hcm
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -28,6 +31,7 @@ import (
 	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
 	"github.com/esalaine/envoy-go/internal/filter/http/router"
 	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
 func mkRouter() *anypb.Any {
@@ -147,7 +151,7 @@ func TestParseFilter_CodecTypeHTTP2(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	_, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: false, AllowH2C: false}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: false, AllowH2C: false}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for HTTP2 + plaintext, got nil")
 	}
@@ -161,7 +165,7 @@ func TestParseFilter_CodecTypeHTTP2_RequiresTLS_RejectsPlaintext(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_AcceptsTLS(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil); err != nil {
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{HasTLS: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil); err != nil {
 		t.Errorf("HTTP2 + TLS should be accepted, got: %v", err)
 	}
 }
@@ -171,7 +175,7 @@ func TestParseFilter_CodecTypeHTTP2_AcceptsTLS(t *testing.T) {
 func TestParseFilter_CodecTypeHTTP2_AcceptsAllowH2C(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil); err != nil {
+	if _, err := parseFilterWithCtx(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil); err != nil {
 		t.Errorf("HTTP2 + allowH2C should be accepted, got: %v", err)
 	}
 }
@@ -182,7 +186,7 @@ func TestParseFilter_CodecTypeAUTO_Accepts_BothCases(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
 	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
-		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil, testHTTPRegistry(), nil); err != nil {
+		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil); err != nil {
 			t.Errorf("AUTO + lc=%+v should be accepted, got: %v", lc, err)
 		}
 	}
@@ -194,7 +198,7 @@ func TestParseFilter_CodecTypeHTTP1_Accepts_BothCases(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP1 })
 	for _, lc := range []ListenerCtx{{HasTLS: false}, {HasTLS: true}} {
-		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil, testHTTPRegistry(), nil); err != nil {
+		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil); err != nil {
 			t.Errorf("HTTP1 + lc=%+v should be accepted, got: %v", lc, err)
 		}
 	}
@@ -696,7 +700,7 @@ func TestFilter_AccessLogField_Plumbed(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(nil)
 	sinks := []accesslog.Sink{}
-	got, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), sinks, testHTTPRegistry(), nil)
+	got, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), sinks, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("parseFilterWithCtx: %v", err)
 	}
@@ -1433,13 +1437,16 @@ func countTracingCounters(reg *stats.Registry) int {
 // `tracing` block parses into a *Filter with a populated tracingConfig (sampling
 // knob + exporter coordinates), a non-nil tracingCounters, and that the registry
 // gains the 5 http.<prefix>.tracing.* decision counters (phase 46.1a Task 8).
+// Phase 46.1b Task 7: a real provider (success dialer) is required; the test
+// also verifies Filter.exporter is non-nil.
 func TestParseFilter_Tracing_Accept(t *testing.T) {
 	cm := mkClusterManager(t)
 	reg := stats.NewRegistry()
+	provider := makeHCMTestProvider(nil) // success dialer
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
 		h.Tracing = mkOTelTracing(t, "c", "svc")
 	})
-	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, reg, nil, testHTTPRegistry(), nil)
+	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, reg, nil, testHTTPRegistry(), nil, provider)
 	if err != nil {
 		t.Fatalf("parseFilterWithCtx: %v", err)
 	}
@@ -1461,11 +1468,15 @@ func TestParseFilter_Tracing_Accept(t *testing.T) {
 	if got := countTracingCounters(reg); got != 5 {
 		t.Errorf("registry tracing.* counters = %d, want 5", got)
 	}
+	if f.exporter == nil {
+		t.Error("exporter is nil; want non-nil after successful ExporterFor (Task 7)")
+	}
 }
 
 // TestParseFilter_Tracing_RejectUnsupported verifies that a tracing block
 // carrying an unsupported sub-feature (verbose:true) bubbles the tracing.NewConfig
-// reject up as an "hcm:"-prefixed parse error (phase 46.1a Task 8).
+// reject up as an "hcm:"-prefixed parse error (phase 46.1a Task 8). The
+// verbose-reject fires BEFORE the provider check, so nil provider is acceptable.
 func TestParseFilter_Tracing_RejectUnsupported(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
@@ -1473,7 +1484,7 @@ func TestParseFilter_Tracing_RejectUnsupported(t *testing.T) {
 		tr.Verbose = true
 		h.Tracing = tr
 	})
-	_, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for tracing verbose:true, got nil")
 	}
@@ -1485,12 +1496,13 @@ func TestParseFilter_Tracing_RejectUnsupported(t *testing.T) {
 // TestParseFilter_Tracing_NoneIsByteStable verifies the byte-stable regression
 // guard: an HCM with NO `tracing` block yields a nil tracingConfig + nil
 // tracingCounters and registers ZERO tracing.* counters (the +5 register only
-// under a configured provider). Phase 46.1a Task 8.
+// under a configured provider). Phase 46.1a Task 8. Phase 46.1b Task 7:
+// nil provider is fine on the no-tracing path; exporter stays nil.
 func TestParseFilter_Tracing_NoneIsByteStable(t *testing.T) {
 	cm := mkClusterManager(t)
 	reg := stats.NewRegistry()
 	any := mkHCM(nil) // no tracing block
-	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, reg, nil, testHTTPRegistry(), nil)
+	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, reg, nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("parseFilterWithCtx: %v", err)
 	}
@@ -1502,6 +1514,9 @@ func TestParseFilter_Tracing_NoneIsByteStable(t *testing.T) {
 	}
 	if got := countTracingCounters(reg); got != 0 {
 		t.Errorf("registry tracing.* counters = %d, want 0 (byte-stable no-tracing path)", got)
+	}
+	if f.exporter != nil {
+		t.Errorf("exporter = %v, want nil (no tracing block)", f.exporter)
 	}
 }
 
@@ -1554,5 +1569,116 @@ func TestAlsHeaderCaptureUnion_AllNonCapturing_NilUnion(t *testing.T) {
 	req, resp := alsHeaderCaptureUnion(sinks)
 	if req != nil || resp != nil {
 		t.Errorf("union = req:%v resp:%v, want nil/nil", req, resp)
+	}
+}
+
+// --- Task 7: ExporterProvider threading into HCM Filter ----------------------
+
+// hcmFakeTracesDialer is a test-only type satisfying the unexported
+// tracing.tracesClientDialer interface (one method: NewTracesClient). It lets
+// us build a real *tracing.ExporterProvider from the hcm test package without
+// weakening the tracing package's encapsulation. dialErr non-nil ⇒
+// NewTracesClient returns that error (boot-reject arm); nil ⇒ returns a
+// no-op hcmFakeTracesClient (accept arm).
+type hcmFakeTracesDialer struct {
+	dialErr error
+}
+
+// hcmFakeTracesClient is a no-op TracesClient for ExporterProvider tests.
+type hcmFakeTracesClient struct{}
+
+func (hcmFakeTracesClient) Export(_ context.Context, _ *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
+	return &coltracepb.ExportTraceServiceResponse{}, nil
+}
+func (hcmFakeTracesClient) Close() error { return nil }
+
+func (d *hcmFakeTracesDialer) NewTracesClient(_ string) (tracing.TracesClient, error) {
+	if d.dialErr != nil {
+		return nil, d.dialErr
+	}
+	return hcmFakeTracesClient{}, nil
+}
+
+// makeHCMTestProvider builds a real *tracing.ExporterProvider over
+// hcmFakeTracesDialer. dialErr nil ⇒ ExporterFor succeeds; non-nil ⇒ boot-reject.
+func makeHCMTestProvider(dialErr error) *tracing.ExporterProvider {
+	return tracing.NewExporterProvider(&hcmFakeTracesDialer{dialErr: dialErr}, stats.NewRegistry(), 0, time.Second)
+}
+
+// TestParseFilter_Tracing_ExporterProvider_NilNoTracing verifies the
+// byte-stable no-tracing path: with no `tracing` block and a nil provider,
+// parseFilterWithCtx succeeds and Filter.exporter is nil (the provider is
+// never consulted). Phase 46.1b Task 7.
+func TestParseFilter_Tracing_ExporterProvider_NilNoTracing(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(nil) // no tracing block
+	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if f.exporter != nil {
+		t.Errorf("exporter = %v, want nil (no tracing block)", f.exporter)
+	}
+}
+
+// TestParseFilter_Tracing_ExporterProvider_NilWithTracing verifies that an
+// HCM WITH a `tracing` block AND a nil provider returns the wiring-absent
+// boot error (hcm: tracing configured but no exporter provider wired).
+// Phase 46.1b Task 7.
+func TestParseFilter_Tracing_ExporterProvider_NilWithTracing(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = mkOTelTracing(t, "c_test", "svc")
+	})
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
+	if err == nil {
+		t.Fatal("expected error for tracing+nil provider, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "hcm:") {
+		t.Errorf("error must begin with %q, got: %v", "hcm:", err)
+	}
+	const wantSubstr = "no exporter provider wired"
+	if !strings.Contains(err.Error(), wantSubstr) {
+		t.Errorf("error %q does not contain %q", err.Error(), wantSubstr)
+	}
+}
+
+// TestParseFilter_Tracing_ExporterProvider_Accept verifies that an HCM WITH
+// a `tracing` block AND a working provider yields a non-nil Filter.exporter.
+// Phase 46.1b Task 7.
+func TestParseFilter_Tracing_ExporterProvider_Accept(t *testing.T) {
+	cm := mkClusterManager(t)
+	provider := makeHCMTestProvider(nil) // success dialer
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = mkOTelTracing(t, "c_test", "svc")
+	})
+	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, provider)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if f.exporter == nil {
+		t.Error("exporter is nil; want non-nil after successful ExporterFor")
+	}
+}
+
+// TestParseFilter_Tracing_ExporterProvider_BootReject verifies that when the
+// ExporterProvider's dialer fails, parseFilterWithCtx returns an
+// "hcm: tracing exporter: ..." boot error. Phase 46.1b Task 7.
+func TestParseFilter_Tracing_ExporterProvider_BootReject(t *testing.T) {
+	cm := mkClusterManager(t)
+	provider := makeHCMTestProvider(fmt.Errorf("cluster not found"))
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = mkOTelTracing(t, "c_test", "svc")
+	})
+	_, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, provider)
+	if err == nil {
+		t.Fatal("expected boot-reject error, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "hcm:") {
+		t.Errorf("error must begin with %q, got: %v", "hcm:", err)
+	}
+	const wantSubstr = "tracing exporter:"
+	if !strings.Contains(err.Error(), wantSubstr) {
+		t.Errorf("error %q does not contain %q", err.Error(), wantSubstr)
 	}
 }

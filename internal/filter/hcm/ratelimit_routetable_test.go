@@ -118,7 +118,7 @@ func parseHCMTestBytes(t *testing.T, hcmBytes []byte) (*Filter, error) {
 	// Re-wrap as Any (mkHCMWithRateLimits returns the inner bytes).
 	any := mkHCM(nil)
 	any.Value = hcmBytes
-	return parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	return parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 }
 
 func TestRouteTableRateLimits_ParseRetainSeed(t *testing.T) {
@@ -226,7 +226,7 @@ func TestRouteTableRateLimits_ZeroRegression(t *testing.T) {
 	// direct_response with no rate_limits and the vhost has no RateLimits.
 	any := mkHCM(nil)
 	cm := mkClusterManager(t)
-	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	f, err := parseFilterWithCtx(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

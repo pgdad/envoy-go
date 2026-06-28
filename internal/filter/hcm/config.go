@@ -172,6 +172,11 @@ type Filter struct {
 	// rng is the process-shared crypto RandSource the per-request sampling
 	// decision draws from (Task 9). Set to tracing.CryptoRand{} at parse time.
 	rng tracing.RandSource
+	// exporter is the per-cluster OTLP span sink resolved from the
+	// ExporterProvider at parse time (phase 46.1b Task 7). nil when no `tracing`
+	// block is configured (the byte-stable no-tracing path). Non-nil ⇒ the
+	// per-request emit hook (Task 8) calls exporter.Export(span).
+	exporter tracing.Exporter
 }
 
 // downstreamStatusClassCounter returns the downstream_rq_<Nxx> counter for the
@@ -214,7 +219,7 @@ func (f *Filter) downstreamStatusClassCounter(code int) *stats.Counter {
 // applied via filter_http.ValidateChainShape; on success the per-entry
 // HTTPFilterFactory is invoked with the typed_config Any to allocate the
 // FilterInstanceFactory closure stored on Filter.chainConfig.
-func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, dm *drain.Manager) (*Filter, error) {
+func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, dm *drain.Manager, provider *tracing.ExporterProvider) (*Filter, error) {
 	if got := tc.GetTypeUrl(); got != TypeURL {
 		return nil, fmt.Errorf("hcm: wrong type_url %q (want %q)", got, TypeURL)
 	}
@@ -316,6 +321,22 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		}
 	}
 
+	// Phase 46.1b Task 7 (D-TRACE-EXPORTER-WIRING): resolve the per-cluster OTLP
+	// exporter from the ExporterProvider ONLY when a `tracing` block is present.
+	// A nil provider with a configured tracing block is a wiring error — the HCM
+	// cannot proceed without an exporter (boot-reject). On the no-tracing path
+	// provider is never consulted and exporter stays nil (byte-stable).
+	var exporter tracing.Exporter
+	if tcfg != nil {
+		if provider == nil {
+			return nil, fmt.Errorf("hcm: tracing configured but no exporter provider wired")
+		}
+		exporter, err = provider.ExporterFor(tcfg.ClusterName, tcfg.ServiceName)
+		if err != nil {
+			return nil, fmt.Errorf("hcm: tracing exporter: %w", err)
+		}
+	}
+
 	prefix := "http." + statPrefix + "."
 	f := &Filter{
 		table:             table,
@@ -335,6 +356,7 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 		tracingConfig:     tcfg,
 		tracingCounters:   tcounters,
 		rng:               tracing.CryptoRand{},
+		exporter:          exporter,
 	}
 	// 44.3 Task 4: derive the dedup'd lowercase header-capture union from the
 	// sinks (D-HDR-RECORD-CAPTURE-SCOPE) — gates the emit-hook capture. Both

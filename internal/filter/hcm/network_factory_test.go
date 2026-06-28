@@ -23,7 +23,7 @@ func TestHCMNewNetworkFactoryBridgesFactoryCtx(t *testing.T) {
 	cm := mkClusterManager(t)
 	reg := stats.NewRegistry()
 	httpReg := testHTTPRegistry()
-	factory := NewNetworkFactory(cm, reg, nil, httpReg, nil, nil)
+	factory := NewNetworkFactory(cm, reg, nil, httpReg, nil, nil, nil)
 	tc := mkHCM(nil)
 	mk, err := factory(tc, network.FactoryCtx{HasTLS: true, AllowH2C: true, ListenerPrincipal: "spiffe://p", NodeServiceCluster: "svc"})
 	if err != nil {
@@ -67,7 +67,7 @@ func TestHCMNewNetworkFactoryParseRejectPassthrough(t *testing.T) {
 	cm := mkClusterManager(t)
 	reg := stats.NewRegistry()
 	httpReg := testHTTPRegistry()
-	factory := NewNetworkFactory(cm, reg, nil, httpReg, nil, nil)
+	factory := NewNetworkFactory(cm, reg, nil, httpReg, nil, nil, nil)
 	bad := &anypb.Any{TypeUrl: TypeURL, Value: []byte{0xff}}
 	if _, err := factory(bad, network.FactoryCtx{}); err == nil {
 		t.Fatalf("expected HCM parse-reject through adapter")

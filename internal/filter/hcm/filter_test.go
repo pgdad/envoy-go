@@ -15,7 +15,7 @@ import (
 
 func TestNewFilter_HappyPath(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestNewFilter_PreservesParseErrorPrefix(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
 	// Zero-value ListenerCtx (no TLS, no allowH2C); HTTP2 must be rejected.
-	if _, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
+	if _, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil); err == nil || !strings.HasPrefix(err.Error(), "hcm:") {
 		t.Errorf("expected hcm:-prefixed error, got: %v", err)
 	}
 }
@@ -43,7 +43,7 @@ func TestNewFilter_PreservesParseErrorPrefix(t *testing.T) {
 func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	if _, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil); err != nil {
+	if _, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil, nil); err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
 	want := map[string]bool{
@@ -72,7 +72,7 @@ func TestNewFilter_Allocates5HCMMetrics(t *testing.T) {
 func TestFilter_RequestEntry_IncsDownstreamRqTotal(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestFilter_RequestEntry_IncsDownstreamRqTotal(t *testing.T) {
 func TestFilter_ResponseFinalization_IncsStatusClassCounter(t *testing.T) {
 	cm := mkClusterManager(t)
 	r := stats.NewRegistry()
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, r, nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestFilter_ResponseFinalization_IncsStatusClassCounter(t *testing.T) {
 func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP2 })
-	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{AllowH2C: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestFilter_Handle_HTTP2_PlaintextH2C(t *testing.T) {
 func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 	cm := mkClusterManager(t)
 	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
-	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(any, cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestFilter_Handle_AUTO_Plaintext_DispatchesToH1(t *testing.T) {
 
 func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestFilter_Handle_OneRequestThenEOF(t *testing.T) {
 
 func TestFilter_Handle_CtxAlreadyCancelledShortCircuits(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestFilter_Handle_CtxAlreadyCancelledShortCircuits(t *testing.T) {
 func TestHCM_DrainInflightBalance(t *testing.T) {
 	dm := drain.New(10 * time.Millisecond)
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), dm)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), dm, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestHCM_DrainInflightBalance(t *testing.T) {
 func TestHCM_DrainInflightBalance_SendLocalReply(t *testing.T) {
 	dm := drain.New(10 * time.Millisecond)
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), dm)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), dm, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestHCM_DrainInflightBalance_SendLocalReply(t *testing.T) {
 // must not panic; the nil-tolerant gate skips Inc/Dec silently.
 func TestHCM_DrainInflightBalance_NilDrainManager(t *testing.T) {
 	cm := mkClusterManager(t)
-	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil)
+	f, err := NewFilterWithCtxAndSinksAndRegistry(mkHCM(nil), cm, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewFilterWithCtxAndSinksAndRegistry: %v", err)
 	}
