@@ -1670,3 +1670,275 @@ static_resources:
 		t.Errorf("ConfigPath after struct-literal set: got %q, want %q", b.ConfigPath, "/tmp/envoy.yaml")
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Phase 47.1 (ADR-0262): the metrics_service stats_sinks[]/stats_flush_interval
+// parse arm + strict-rejects. The stats_sinks[] and stats_flush_interval fields
+// are TOP-LEVEL bootstrap fields, so these tests build a minimal node+admin
+// bootstrap with an empty static_resources block and splice the relevant
+// top-level YAML.
+// ----------------------------------------------------------------------------
+
+// metricsServiceType is the typed_config @type for the metrics_service stats
+// sink (re-derived from the proto descriptor in bootstrap.go; the literal here
+// is the live-verified string used to build the test fixtures).
+const metricsServiceType = "type.googleapis.com/envoy.config.metrics.v3.MetricsServiceConfig"
+
+// statsdSinkType is a SIBLING stats sink TypeURL — STRICT-REJECTED (envoy-go
+// supports only the metrics_service sink).
+const statsdSinkType = "type.googleapis.com/envoy.config.metrics.v3.StatsdSink"
+
+// statsBootstrap wraps an arbitrary top-level YAML body (e.g. stats_sinks: ...,
+// stats_flush_interval: ...) onto a minimal node+admin+empty-static_resources
+// bootstrap so Load() reaches parseStatsSinks.
+func statsBootstrap(topLevel string) string {
+	return `node: { id: mc-node, cluster: mc-cluster }
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+static_resources:
+  listeners: []
+  clusters: []
+` + topLevel
+}
+
+// TestStatsSink_TypeURLConstant guards against a proto-package rename: the
+// descriptor-derived metricsServiceTypeURL must equal the live-verified string
+// (reference_network_filter_typeurl_extensions / verify-typeurl-via-descriptor).
+func TestStatsSink_TypeURLConstant(t *testing.T) {
+	const want = "type.googleapis.com/envoy.config.metrics.v3.MetricsServiceConfig"
+	if metricsServiceTypeURL != want {
+		t.Errorf("metricsServiceTypeURL: got %q, want %q", metricsServiceTypeURL, want)
+	}
+}
+
+// TestStatsSink_AcceptDefault: a metrics_service sink with a cluster_name and
+// default knobs ⇒ 1 StatsSinkConfig with that cluster, FlushInterval default 5s.
+func TestStatsSink_AcceptDefault(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      transport_api_version: V3
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsSinkConfigs); got != 1 {
+		t.Fatalf("StatsSinkConfigs: got %d, want 1", got)
+	}
+	if got := bs.StatsSinkConfigs[0].ClusterName; got != "mc" {
+		t.Errorf("ClusterName: got %q, want %q", got, "mc")
+	}
+	if got, want := bs.FlushInterval, 5*time.Second; got != want {
+		t.Errorf("FlushInterval (default): got %v, want %v", got, want)
+	}
+}
+
+// TestStatsSink_AcceptExplicitFlushInterval: stats_flush_interval is honored.
+func TestStatsSink_AcceptExplicitFlushInterval(t *testing.T) {
+	src := statsBootstrap(`stats_flush_interval: 2s
+stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := bs.FlushInterval, 2*time.Second; got != want {
+		t.Errorf("FlushInterval: got %v, want %v", got, want)
+	}
+}
+
+// TestStatsSink_AcceptTransportAUTO: an omitted transport_api_version (AUTO==0)
+// is accepted (D-MS-APIVERSION).
+func TestStatsSink_AcceptTransportAUTO(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsSinkConfigs); got != 1 {
+		t.Fatalf("StatsSinkConfigs: got %d, want 1", got)
+	}
+}
+
+// TestStatsSink_InertFlushInterval (D-MS-FLUSH-INERT / byte-stability): a bare
+// stats_flush_interval with NO stats_sinks ⇒ 0 configs + FlushInterval set, no
+// error.
+func TestStatsSink_InertFlushInterval(t *testing.T) {
+	src := statsBootstrap(`stats_flush_interval: 3s
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsSinkConfigs); got != 0 {
+		t.Fatalf("StatsSinkConfigs: got %d, want 0", got)
+	}
+	if got, want := bs.FlushInterval, 3*time.Second; got != want {
+		t.Errorf("FlushInterval: got %v, want %v", got, want)
+	}
+}
+
+// TestStatsSink_Rejects covers each strict-reject arm; each asserts a
+// bootstrap:-prefixed error naming the offending field/value
+// (reference_strict_reject_sibling_typeurl_gap).
+func TestStatsSink_Rejects(t *testing.T) {
+	cases := []struct {
+		name     string
+		topLevel string
+		errSubs  []string
+	}{
+		{
+			name: "report_counters_as_deltas",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      report_counters_as_deltas: true
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`,
+			errSubs: []string{"bootstrap:", "report_counters_as_deltas"},
+		},
+		{
+			name: "emit_tags_as_labels",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      emit_tags_as_labels: true
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`,
+			errSubs: []string{"bootstrap:", "emit_tags_as_labels"},
+		},
+		{
+			name: "histogram_emit_mode",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      histogram_emit_mode: SUMMARY
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`,
+			errSubs: []string{"bootstrap:", "histogram_emit_mode"},
+		},
+		{
+			name: "transport_api_version_V2",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      transport_api_version: V2
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`,
+			errSubs: []string{"bootstrap:", "transport_api_version"},
+		},
+		{
+			name: "google_grpc",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      grpc_service:
+        google_grpc:
+          target_uri: 127.0.0.1:50051
+          stat_prefix: mc
+`,
+			errSubs: []string{"bootstrap:", "envoy_grpc"},
+		},
+		{
+			name: "empty_cluster_name",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: ""
+`,
+			errSubs: []string{"bootstrap:", "cluster_name"},
+		},
+		{
+			name: "sibling_statsd_sink",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: statsd
+`,
+			errSubs: []string{"bootstrap:", statsdSinkType, metricsServiceType},
+		},
+		{
+			name: "stats_flush_on_admin",
+			topLevel: `stats_flush_on_admin: true
+stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`,
+			errSubs: []string{"bootstrap:", "stats_flush_on_admin"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(statsBootstrap(tc.topLevel)))
+			if err == nil {
+				t.Fatalf("Load: want error for %s, got nil", tc.name)
+			}
+			for _, sub := range tc.errSubs {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error should contain %q: %q", sub, err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestStatsSink_AcceptReportCountersFalse: an explicit report_counters_as_deltas
+// of false is accepted (only true is rejected).
+func TestStatsSink_AcceptReportCountersFalse(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      report_counters_as_deltas: false
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsSinkConfigs); got != 1 {
+		t.Fatalf("StatsSinkConfigs: got %d, want 1", got)
+	}
+}

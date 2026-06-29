@@ -1,0 +1,267 @@
+package statssink
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	metricsv3 "github.com/envoyproxy/go-control-plane/envoy/service/metrics/v3"
+	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/esalaine/envoy-go/internal/grpcclient"
+)
+
+// The real client satisfies the metricsClient seam. Kept TEST-ONLY so the
+// production statssink package stays decoupled from grpcclient (the accesslog
+// alsClient-seam precedent).
+var _ metricsClient = (*grpcclient.MetricsServiceClient)(nil)
+
+// fakeMetricsStream is a fake MetricsService_StreamMetricsClient. It embeds the
+// generated interface (nil) so the grpc.ClientStream methods are satisfied
+// structurally; only Send + CloseAndRecv are exercised by the sink (the
+// grpcsink_test.go fakeStream precedent).
+type fakeMetricsStream struct {
+	metricsv3.MetricsService_StreamMetricsClient
+
+	mu             sync.Mutex
+	sent           []*metricsv3.StreamMetricsMessage
+	closeRecvCount int
+
+	// sendErrs is a per-call error queue: sendErrs[i] (nil == success) is
+	// returned by the i-th Send. Beyond the slice, Send succeeds.
+	sendErrs []error
+	sendIdx  int
+
+	// blockCh, when non-nil, blocks each Send on a receive until the test
+	// closes it (used to wedge the writer goroutine for the drop test).
+	blockCh chan struct{}
+}
+
+func (f *fakeMetricsStream) Send(m *metricsv3.StreamMetricsMessage) error {
+	if f.blockCh != nil {
+		<-f.blockCh
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var err error
+	if f.sendIdx < len(f.sendErrs) {
+		err = f.sendErrs[f.sendIdx]
+	}
+	f.sendIdx++
+	if err != nil {
+		return err
+	}
+	f.sent = append(f.sent, m)
+	return nil
+}
+
+func (f *fakeMetricsStream) CloseAndRecv() (*metricsv3.StreamMetricsResponse, error) {
+	f.mu.Lock()
+	f.closeRecvCount++
+	f.mu.Unlock()
+	return &metricsv3.StreamMetricsResponse{}, nil
+}
+
+func (f *fakeMetricsStream) messages() []*metricsv3.StreamMetricsMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*metricsv3.StreamMetricsMessage, len(f.sent))
+	copy(out, f.sent)
+	return out
+}
+
+func (f *fakeMetricsStream) closeRecvCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closeRecvCount
+}
+
+// fakeMetricsClient is a fake metricsClient seam. StreamMetrics hands out the
+// stream at streamIdx (optionally erroring per a queue); Close is counted.
+type fakeMetricsClient struct {
+	mu         sync.Mutex
+	streams    []*fakeMetricsStream
+	streamErrs []error
+	streamIdx  int
+	openCount  int
+	closeCount int
+}
+
+func (c *fakeMetricsClient) StreamMetrics(_ context.Context) (metricsv3.MetricsService_StreamMetricsClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var err error
+	if c.streamIdx < len(c.streamErrs) {
+		err = c.streamErrs[c.streamIdx]
+	}
+	idx := c.streamIdx
+	c.streamIdx++
+	c.openCount++
+	if err != nil {
+		return nil, err
+	}
+	if idx < len(c.streams) {
+		return c.streams[idx], nil
+	}
+	return c.streams[len(c.streams)-1], nil
+}
+
+func (c *fakeMetricsClient) Close() error {
+	c.mu.Lock()
+	c.closeCount++
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *fakeMetricsClient) opens() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.openCount
+}
+
+func (c *fakeMetricsClient) closes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeCount
+}
+
+func testNode() *corev3.Node { return &corev3.Node{Id: "test-node", Cluster: "test-cluster"} }
+
+// fam builds a one-metric COUNTER family with the given name and value (a stand-in
+// for snapshot() output; the sink is mapping-agnostic).
+func fam(name string, value float64) *dto.MetricFamily {
+	return &dto.MetricFamily{
+		Name: proto.String(name),
+		Type: dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{
+			Counter: &dto.Counter{Value: proto.Float64(value)},
+		}},
+	}
+}
+
+func batchNames(m *metricsv3.StreamMetricsMessage) []string {
+	var out []string
+	for _, f := range m.GetEnvoyMetrics() {
+		out = append(out, f.GetName())
+	}
+	return out
+}
+
+func TestSink_IdentifierOnce(t *testing.T) {
+	stream := &fakeMetricsStream{}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
+	s := NewMetricsServiceSink(client, testNode())
+
+	batch1 := []*dto.MetricFamily{fam("a.one", 1)}
+	batch2 := []*dto.MetricFamily{fam("b.two", 2)}
+	s.Submit(batch1)
+	s.Submit(batch2)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	msgs := stream.messages()
+	if len(msgs) != 2 {
+		t.Fatalf("got %d streamed messages, want 2", len(msgs))
+	}
+	// Message #1: identifier present (node id + cluster), batch1.
+	id := msgs[0].GetIdentifier()
+	if id == nil {
+		t.Fatalf("message[0] identifier = nil, want non-nil")
+	}
+	if id.GetNode().GetId() != "test-node" {
+		t.Errorf("identifier node id = %q, want %q", id.GetNode().GetId(), "test-node")
+	}
+	if id.GetNode().GetCluster() != "test-cluster" {
+		t.Errorf("identifier node cluster = %q, want %q", id.GetNode().GetCluster(), "test-cluster")
+	}
+	if got := batchNames(msgs[0]); len(got) != 1 || got[0] != "a.one" {
+		t.Errorf("message[0] families = %v, want [a.one]", got)
+	}
+	// Message #2: identifier nil (identifier-once), batch2.
+	if msgs[1].GetIdentifier() != nil {
+		t.Errorf("message[1] identifier = non-nil, want nil (identifier-once)")
+	}
+	if got := batchNames(msgs[1]); len(got) != 1 || got[0] != "b.two" {
+		t.Errorf("message[1] families = %v, want [b.two]", got)
+	}
+}
+
+func TestSink_ReconnectResend(t *testing.T) {
+	// First stream errors on the 2nd Send; second stream succeeds.
+	stream1 := &fakeMetricsStream{sendErrs: []error{nil, errors.New("send boom")}}
+	stream2 := &fakeMetricsStream{}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream1, stream2}}
+	s := NewMetricsServiceSink(client, testNode())
+
+	s.Submit([]*dto.MetricFamily{fam("a.one", 1)}) // lands on stream1 (msg #1, identifier)
+	s.Submit([]*dto.MetricFamily{fam("b.two", 2)}) // fails on stream1 -> reopen stream2, re-send
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if client.opens() < 2 {
+		t.Errorf("openCount = %d, want >= 2 (reconnect re-opened the stream)", client.opens())
+	}
+
+	// stream1 took the first batch with the identifier.
+	m1 := stream1.messages()
+	if len(m1) != 1 {
+		t.Fatalf("stream1 got %d messages, want 1", len(m1))
+	}
+	if m1[0].GetIdentifier() == nil {
+		t.Errorf("stream1 message[0] identifier = nil, want non-nil")
+	}
+
+	// stream2 re-sent the SECOND batch WITH a re-armed identifier.
+	m2 := stream2.messages()
+	if len(m2) != 1 {
+		t.Fatalf("stream2 got %d messages, want 1 (failed batch re-sent)", len(m2))
+	}
+	if m2[0].GetIdentifier() == nil {
+		t.Errorf("stream2 message[0] identifier = nil, want re-armed identifier")
+	}
+	if got := batchNames(m2[0]); len(got) != 1 || got[0] != "b.two" {
+		t.Errorf("stream2 re-sent families = %v, want [b.two]", got)
+	}
+}
+
+func TestSink_DropOnFull(t *testing.T) {
+	block := make(chan struct{})
+	stream := &fakeMetricsStream{blockCh: block}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
+	s := newSinkWithCapacity(client, testNode(), 1)
+
+	// With the writer wedged in Send, the channel fills; Submit must never block.
+	for i := 0; i < 100; i++ {
+		s.Submit([]*dto.MetricFamily{fam("a.one", 1)}) // never blocks (select-default drop)
+	}
+
+	close(block) // release the writer so Close can drain
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestSink_CloseIdempotent(t *testing.T) {
+	stream := &fakeMetricsStream{}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
+	s := NewMetricsServiceSink(client, testNode())
+
+	s.Submit([]*dto.MetricFamily{fam("a.one", 1)})
+	if err := s.Close(); err != nil {
+		t.Errorf("first Close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+	if got := client.closes(); got != 1 {
+		t.Errorf("client.Close called %d times, want exactly 1", got)
+	}
+	if stream.closeRecvCalls() == 0 {
+		t.Errorf("CloseAndRecv not called; Close must drain the in-flight stream")
+	}
+}

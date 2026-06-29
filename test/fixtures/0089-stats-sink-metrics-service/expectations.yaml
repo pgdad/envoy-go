@@ -1,0 +1,72 @@
+# Phase 47.1 fixture 0089-stats-sink-metrics-service expectations (ADR-0019 —
+# prose; the driver is the enforcer via AssertStats; this file is documentation).
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process MetricsService gRPC receiver):
+#   l_test (hcm_local)  — one downstream HTTP/1.1 listener; route prefix "/" →
+#                         cluster c_backend (HTTPFixedBody, 17-byte body).
+#   c_backend           — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_metrics           — driver-owned in-process MetricsService receiver
+#                         (test/helpers/metricsservice/; new in phase 47.1) on a
+#                         driver-allocated stable port, bound 0.0.0.0:<port> so the
+#                         reference container (host.docker.internal) AND the subject
+#                         (127.0.0.1) both reach it. The cluster carries the
+#                         mandatory http2_protocol_options:{} for gRPC framing +
+#                         plaintext h2c (D-MS-RECEIVER-WIRING — no TLS).
+#
+# A bootstrap-level stats_sinks[] metrics_service entry (transport_api_version V3)
+# on BOTH sides names c_metrics + a SHORT stats_flush_interval (500ms). Each side
+# snapshots its stats registry every flush and streams it as
+# io.prometheus.client.MetricFamily protos (identifier{node} on msg #1).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process). node{id,cluster} FIXED identically on both sides.
+#
+# ## Workload
+#
+# Each side fires K = 7 deterministic GET /probe requests (Host: metrics.example,
+# UA: metrics-probe/1; all 2xx). The driver POLLS the receiver until the
+# deterministic COUNTER subset converges to value == 7 == K on EACH side
+# (poll-to-converge — the release barrier; never a fixed sleep,
+# reference_concurrency_differential_release_barrier). Per-side separation: the
+# receiver is Reset() at the start of each side's drive.
+#
+# ## Framing NOT asserted (reference_streaming_sink_differential_framing)
+#
+# The cross-side assertion is on the AGGREGATED MetricFamily payload subset —
+# NOT the StreamMetrics message/stream framing, per-message family count,
+# connection count, or flush cadence, which legitimately vary side-to-side.
+#
+# ## Asserted (cross-side EXACT on the deterministic COUNTER NAME SUBSET, both sides)
+#
+# AMEND-MS-HISTOGRAM-PRESENT: a name-SUBSET, NOT the whole family set (the
+# surfaces differ cross-side — envoy-go has no histograms; the reference does).
+#
+#   For each name in the subset:
+#     cluster.c_backend.upstream_rq_total
+#     http.hcm_local.downstream_rq_total
+#     http.hcm_local.downstream_rq_2xx
+#   on BOTH sides:
+#     present (decode ran — a zero-family pass is structurally impossible)
+#     type    == COUNTER
+#     value   == 7   (== K, after K 2xx requests)
+#   Identifier node (StreamMetricsMessage.identifier.node on msg #1):
+#     id      == "envoy-go-subject-0089"  (cross-side EXACT)
+#     cluster == "envoy-go-differential"  (cross-side EXACT)
+#
+# ## UNasserted (vary side-to-side / impl-specific / non-deterministic)
+#
+#   The WHOLE family set / family count (surfaces differ — envoy-go has no
+#       histograms; lazy-instantiation grows the count).
+#   metric[].timestamp_ms VALUE (flush wall-clock — non-deterministic;
+#       AMEND-MS-TIMESTAMP-ALWAYS-SET — presence required, value unasserted).
+#   help (empty both sides).
+#   Non-deterministic gauges (server.uptime, *_active, connection churn).
+#   The identifier user_agent_* / extensions[] (impl-specific).
+#   StreamMetrics message/stream framing + per-message family count.
+#
+# Cross-refs: phase 47.1 SPEC §8.1 + ADR-0262 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_concurrency_differential_release_barrier +
+#             reference_stats_sink_metrics_service_probe.

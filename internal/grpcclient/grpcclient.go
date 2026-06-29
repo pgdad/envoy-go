@@ -58,6 +58,7 @@ import (
 
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	metricsv3 "github.com/envoyproxy/go-control-plane/envoy/service/metrics/v3"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
@@ -314,6 +315,76 @@ func (a *ALSClient) Close() error {
 		}
 	})
 	return a.closeErr
+}
+
+// ----------------------------------------------------------------------------
+// MetricsServiceClient — the typed MetricsService/StreamMetrics CLIENT-STREAMING
+// wrapper (ADR-0262). StreamMetrics is client-streaming exactly like ALS
+// StreamAccessLogs (Send many -> CloseAndRecv one), so this mirrors ALSClient
+// (NOT the unary OTLP wrappers). One *MetricsServiceClient per metrics_service
+// sink (cluster_name), owned by the MetricsServiceSink and Close()d at sink close.
+// ----------------------------------------------------------------------------
+
+// MetricsServiceClient wraps a *grpc.ClientConn with the typed
+// metricsv3.MetricsServiceClient stub. The ALSClient precedent (ADR-0158) —
+// CLIENT-streaming (StreamMetrics: Send many -> CloseAndRecv one), NOT the unary
+// OTLP wrappers.
+//
+// Concurrency: a *MetricsServiceClient is safe for concurrent use — the
+// underlying *grpc.ClientConn is goroutine-safe per the gRPC library. (Each
+// StreamMetrics call opens a distinct client stream; an individual
+// MetricsService_StreamMetricsClient is NOT itself concurrency-safe and is
+// driven by a single writer goroutine per the sink's discipline.)
+type MetricsServiceClient struct {
+	conn   *grpc.ClientConn
+	stub   metricsv3.MetricsServiceClient
+	target string // cluster_name — for logs/errors
+
+	// closeOnce + closeErr guard the idempotent Close (the ALSClient precedent).
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// NewMetricsServiceClient dials the named cluster via d.DialContext and wraps the
+// resulting *grpc.ClientConn in a typed MetricsServiceClient. On dial error
+// returns (nil, err) verbatim (already cluster-named via DialContext). The
+// NewALSClient shape.
+func NewMetricsServiceClient(d *Dialer, clusterName string) (*MetricsServiceClient, error) {
+	if d == nil {
+		return nil, fmt.Errorf("grpcclient: new metrics service client %q: dialer is nil", clusterName)
+	}
+	conn, err := d.DialContext(context.Background(), clusterName)
+	if err != nil {
+		return nil, err
+	}
+	return &MetricsServiceClient{
+		conn:   conn,
+		stub:   metricsv3.NewMetricsServiceClient(conn),
+		target: clusterName,
+	}, nil
+}
+
+// StreamMetrics opens the client-streaming StreamMetrics RPC. The sink's writer
+// goroutine bounds ctx; the returned stream is Send()-many then CloseAndRecv()-once.
+func (c *MetricsServiceClient) StreamMetrics(ctx context.Context) (metricsv3.MetricsService_StreamMetricsClient, error) {
+	if c == nil || c.stub == nil {
+		return nil, errors.New("grpcclient: StreamMetrics: nil MetricsServiceClient / stub")
+	}
+	return c.stub.StreamMetrics(ctx)
+}
+
+// Close releases the underlying *grpc.ClientConn. Idempotent (sync.Once), the
+// ALSClient.Close shape.
+func (c *MetricsServiceClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			c.closeErr = c.conn.Close()
+		}
+	})
+	return c.closeErr
 }
 
 // ----------------------------------------------------------------------------

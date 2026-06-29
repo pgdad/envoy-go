@@ -9,6 +9,7 @@ require (
 	github.com/envoyproxy/go-control-plane/contrib v1.32.4
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/prometheus/client_model v0.6.1
 	github.com/testcontainers/testcontainers-go v0.27.0
 	github.com/tetratelabs/wazero v1.10.1
 	github.com/yuin/gopher-lua v1.1.2

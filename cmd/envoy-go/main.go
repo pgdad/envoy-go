@@ -56,6 +56,7 @@ import (
 	"github.com/esalaine/envoy-go/internal/listener"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
 	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
+	"github.com/esalaine/envoy-go/internal/statssink"
 	"github.com/esalaine/envoy-go/internal/tracing"
 )
 
@@ -172,6 +173,45 @@ func main() {
 	}
 	defer func() {
 		for _, s := range sinks {
+			_ = s.Close()
+		}
+	}()
+
+	// Phase 47.1 (ADR-0262): the metrics_service stats sink. Built when a
+	// stats_sinks[] metrics_service entry is present, reusing the hoisted dialer.
+	// The *statssink.MetricsServiceSink does NOT satisfy accesslog.Sink
+	// (Submit(batch []*dto.MetricFamily) vs Submit(r any)), so the sinks are
+	// collected in their OWN statsSinks slice + closed via a dedicated defer.
+	// The Flusher is BUILT here (pre-Freeze) but Start()ed only AFTER
+	// bs.Stats.Freeze() so the Walk snapshot is over the frozen registry
+	// (D-MS-FLUSH-INERT: when StatsSinkConfigs is empty, statsFlusher stays nil
+	// and NO flush goroutine starts — byte-stability).
+	var statsFlusher *statssink.Flusher
+	var statsSinks []statssink.Sink
+	flusherDone := make(chan struct{})
+	if len(bs.StatsSinkConfigs) > 0 {
+		node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
+		for _, cfg := range bs.StatsSinkConfigs {
+			client, err := grpcclient.NewMetricsServiceClient(dialer, cfg.ClusterName)
+			if err != nil {
+				log.Fatalf("statssink: metrics_service client for cluster %q: %v", cfg.ClusterName, err)
+			}
+			statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, node))
+		}
+		statsFlusher = statssink.NewFlusher(bs.Stats, bs.FlushInterval, statsSinks)
+	}
+	// LIFO: this runs in the shutdown drain AFTER the server ctx is canceled (the
+	// cancel() defer is registered later, so it runs first). We WAIT on flusherDone
+	// before closing the sink channels: cancel() fires ctx.Done(), this defer blocks
+	// on <-flusherDone, the Flusher's Start loop finishes any in-progress flushOnce
+	// (its last Submit goes to the still-OPEN channel) then returns and closes
+	// flusherDone, and only THEN do we Close() the sinks (close their channels). This
+	// enforces the sink contract (no Submit after Close) and prevents a flush-tick /
+	// Close race from sending on a closed channel. Each Close() drains the in-flight
+	// stream (CloseAndRecv) + closes the gRPC conn.
+	defer func() {
+		<-flusherDone // wait for the Flusher goroutine to stop Submitting before closing the sink channels
+		for _, s := range statsSinks {
 			_ = s.Close()
 		}
 	}()
@@ -326,6 +366,18 @@ func main() {
 
 	cm.StartHealthChecks(ctx)     // active health checks (phase 39.1); checkers stop on shutdown ctx + cm.Drain()
 	cm.StartOutlierDetection(ctx) // passive outlier-detection sweeps (phase 40.3); stop on shutdown ctx + cm.Drain()
+
+	// Phase 47.1 (ADR-0262): start the metrics_service flush loop on the server
+	// lifetime ctx, AFTER Freeze so each Walk snapshot reads the frozen registry
+	// (ADR-0059). nil when no stats_sinks[] entry is configured (no goroutine).
+	if statsFlusher != nil {
+		// close(flusherDone) when Start returns so the shutdown sink-close defer
+		// (which waits on <-flusherDone) closes the sink channels only AFTER the
+		// flush loop has stopped Submitting (no send-on-closed-channel race).
+		go func() { defer close(flusherDone); statsFlusher.Start(ctx) }() // ticker loop; stops on ctx.Done() at shutdown
+	} else {
+		close(flusherDone) // no flusher: unblock the sink-close defer immediately
+	}
 
 	// Per-listener ready sentinels + terminal sentinel (ADR-0026).
 	for _, info := range lm.Listeners() {

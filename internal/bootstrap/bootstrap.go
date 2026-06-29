@@ -151,6 +151,14 @@ import (
 	// typed_config (ADR-0260; lifts HttpConnectionManager.tracing from the ADR-0041
 	// silent-ignore set).
 	_ "github.com/envoyproxy/go-control-plane/envoy/config/trace/v3"
+
+	// Phase 47.1 registers the metrics config proto so protojson round-trips
+	// bootstraps carrying a stats_sinks[] metrics_service typed_config (and the
+	// sibling StatsdSink, which is STRICT-REJECTED) without "type not registered"
+	// errors (ADR-0262; lifts Bootstrap.stats_sinks from the ADR-0064 silent-ignore
+	// set). The named metricsconfigv3 import below both registers the descriptor
+	// and provides the typed MetricsServiceConfig for the parse arm.
+	metricsconfigv3 "github.com/envoyproxy/go-control-plane/envoy/config/metrics/v3"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -191,7 +199,19 @@ const (
 	// reference default (AMEND-BUF-2). An explicit present-but-0 value is honored
 	// as flush-every-entry and is NOT coerced to this default.
 	alsDefaultBufferSizeBytes uint32 = 16384
+
+	// statsFlushIntervalDefault is the stats_flush_interval default (5s) applied
+	// when the field is absent or non-positive (ADR-0262 / D-MS-FLUSH).
+	statsFlushIntervalDefault = 5 * time.Second
 )
+
+// metricsServiceTypeURL is the typed_config TypeURL for the metrics_service stats
+// sink (envoy.config.metrics.v3.MetricsServiceConfig). It is DERIVED from the
+// proto descriptor rather than hard-coded so a proto-package rename is caught at
+// build time, not silently (the verify-typeurl-via-descriptor discipline —
+// reference_network_filter_typeurl_extensions). A test asserts it equals the
+// SPEC §11 live-verified string.
+var metricsServiceTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.MetricsServiceConfig{}).ProtoReflect().Descriptor().FullName())
 
 // AccessLogConfig is the parsed-but-not-yet-opened representation of one
 // envoy.access_loggers.file entry from HCM access_log[]. The sink itself is
@@ -242,6 +262,17 @@ type OTLPConfig struct {
 	ResourceAttributes []*commonpb.KeyValue
 }
 
+// StatsSinkConfig is the parsed metrics_service stats-sink config from one
+// top-level stats_sinks[] MetricsServiceConfig entry (ADR-0262). The sink itself
+// (the MetricsServiceSink + Flusher) is constructed in cmd/envoy-go/main.go after
+// Load returns; this struct carries only the parse-time data. The strict-reject
+// arms (report_counters_as_deltas / emit_tags_as_labels / non-default
+// histogram_emit_mode / non-V3 transport / google_grpc / empty cluster) run in
+// parseMetricsServiceConfig before the config is appended (ADR-0080).
+type StatsSinkConfig struct {
+	ClusterName string // MetricsServiceConfig.grpc_service.envoy_grpc.cluster_name
+}
+
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
 // boot-time *stats.Registry that downstream constructors (cluster/listener/HCM
 // managers in Tasks 8–11) register their metrics on. Per the settled SPEC
@@ -288,6 +319,21 @@ type Bootstrap struct {
 	// (default 16384), buffer_flush_interval (default 1s), and disable_builtin_labels
 	// are CONSUMED; stat_prefix is read-and-ignored (INERT).
 	OTLPConfigs []OTLPConfig
+	// StatsSinkConfigs is the parsed top-level stats_sinks[] metrics_service sink
+	// entries (ADR-0262), in declaration order. Empty when no metrics_service
+	// stats_sinks[] entry is configured. Per ADR-0262/ADR-0080:
+	// report_counters_as_deltas:true, emit_tags_as_labels:true, a non-default
+	// histogram_emit_mode, a non-V3 transport_api_version, google_grpc, an empty
+	// cluster_name, sibling sink TypeURLs, and stats_flush_on_admin are all
+	// rejected at parse time. The MetricsServiceSink/Flusher are built in
+	// cmd/envoy-go/main.go after Load returns (and ONLY when this slice is
+	// non-empty — byte-stability, D-MS-FLUSH-INERT).
+	StatsSinkConfigs []StatsSinkConfig
+	// FlushInterval is the stats_flush_interval (default 5s when absent/non-positive
+	// — D-MS-FLUSH). Parsed-and-stored even when no stats_sinks[] entry exists
+	// (inert in that case — D-MS-FLUSH-INERT); the Flusher uses it only when
+	// StatsSinkConfigs is non-empty.
+	FlushInterval time.Duration
 	// ConfigPath is the file path the bootstrap was loaded from. Set by the
 	// caller (cmd/envoy-go/main.go) post-Load via bs.ConfigPath = *cfgPath;
 	// Load itself leaves this empty (the bootstrap.Load API takes an io.Reader,
@@ -336,7 +382,78 @@ func Load(r io.Reader) (*Bootstrap, error) {
 	if err := parseAccessLogConfigs(bs, result); err != nil {
 		return nil, err
 	}
+	if err := parseStatsSinks(bs, result); err != nil {
+		return nil, err
+	}
 	return result, nil
+}
+
+// parseStatsSinks reads the top-level stats_flush_interval (default 5s) and the
+// stats_sinks[] entries (ADR-0262). stats_flush_interval is ALWAYS stored on
+// result.FlushInterval, even with no stats_sinks[] (inert — D-MS-FLUSH-INERT).
+// stats_flush_on_admin is STRICT-REJECTED (ADR-0080; envoy-go ships only the
+// periodic stats_flush_interval loop). Each stats_sinks[] entry must carry a
+// metrics_service typed_config; a sibling sink TypeURL is rejected naming both
+// the offending and the supported TypeURL (reference_strict_reject_sibling_typeurl_gap).
+func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
+	result.FlushInterval = statsFlushIntervalDefault
+	if d := bs.GetStatsFlushInterval(); d != nil {
+		if v := d.AsDuration(); v > 0 {
+			result.FlushInterval = v
+		}
+	}
+	if bs.GetStatsFlushOnAdmin() {
+		return fmt.Errorf("bootstrap: stats_flush_on_admin is not supported (envoy-go ships only the periodic stats_flush_interval sink loop)")
+	}
+	for i, sink := range bs.GetStatsSinks() {
+		tc := sink.GetTypedConfig()
+		if tc == nil {
+			return fmt.Errorf("bootstrap: stats_sinks[%d]: missing typed_config", i)
+		}
+		if tc.GetTypeUrl() != metricsServiceTypeURL {
+			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports only the metrics_service sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL)
+		}
+		if err := parseMetricsServiceConfig(tc, i, result); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseMetricsServiceConfig parses one metrics_service stats sink typed_config
+// and appends a StatsSinkConfig to result.StatsSinkConfigs (ADR-0262). It
+// STRICT-REJECTS (ADR-0080): a non-V3 transport_api_version (V2 reference-parity;
+// AUTO/V3 accepted — D-MS-APIVERSION), google_grpc (only envoy_grpc supported),
+// an empty envoy_grpc.cluster_name, report_counters_as_deltas:true (47.1 emits
+// cumulative absolute values — deferred to 47.2), emit_tags_as_labels:true (47.1
+// emits the full dotted name with zero labels — deferred to 47.2), and a
+// non-default histogram_emit_mode (envoy-go has no histograms — ADR-0060).
+func parseMetricsServiceConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
+	var msc metricsconfigv3.MetricsServiceConfig
+	if err := tc.UnmarshalTo(&msc); err != nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service typed_config: %w", idx, err)
+	}
+	if v := msc.GetTransportApiVersion(); v != corev3.ApiVersion_AUTO && v != corev3.ApiVersion_V3 {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service transport_api_version %v is not supported (envoy-go is V3-only)", idx, v)
+	}
+	eg := msc.GetGrpcService().GetEnvoyGrpc()
+	if eg == nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service requires grpc_service.envoy_grpc (google_grpc is not supported)", idx)
+	}
+	if eg.GetClusterName() == "" {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service grpc_service.envoy_grpc.cluster_name is required (must be non-empty)", idx)
+	}
+	if d := msc.GetReportCountersAsDeltas(); d != nil && d.GetValue() {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service report_counters_as_deltas:true is not supported (47.1 emits cumulative absolute values; deferred to 47.2)", idx)
+	}
+	if msc.GetEmitTagsAsLabels() {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service emit_tags_as_labels:true is not supported (47.1 emits the full dotted name with zero labels; deferred to 47.2)", idx)
+	}
+	if m := msc.GetHistogramEmitMode(); m != metricsconfigv3.HistogramEmitMode_SUMMARY_AND_HISTOGRAM {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service histogram_emit_mode %v is not supported (envoy-go has no histograms)", idx, m)
+	}
+	result.StatsSinkConfigs = append(result.StatsSinkConfigs, StatsSinkConfig{ClusterName: eg.GetClusterName()})
+	return nil
 }
 
 // parseAccessLogConfigs walks the static_resources listeners looking for HCM
