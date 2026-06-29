@@ -7,12 +7,13 @@
 #                         cluster c_backend (HTTPFixedBody, 17-byte body).
 #   c_backend           — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
 #   c_metrics           — driver-owned in-process MetricsService receiver
-#                         (test/helpers/metricsservice/; new in phase 47.1) on a
-#                         driver-allocated stable port, bound 0.0.0.0:<port> so the
-#                         reference container (host.docker.internal) AND the subject
-#                         (127.0.0.1) both reach it. The cluster carries the
-#                         mandatory http2_protocol_options:{} for gRPC framing +
-#                         plaintext h2c (D-MS-RECEIVER-WIRING — no TLS).
+#                         (test/helpers/metricsservice/; new in phase 47.1). The
+#                         driver starts TWO private receivers — one per side — on
+#                         two separately-allocated ports, each bound 0.0.0.0:<port>
+#                         so the reference container (host.docker.internal) and the
+#                         subject (127.0.0.1) each reach its own. The cluster
+#                         carries the mandatory http2_protocol_options:{} for gRPC
+#                         framing + plaintext h2c (D-MS-RECEIVER-WIRING — no TLS).
 #
 # A bootstrap-level stats_sinks[] metrics_service entry (transport_api_version V3)
 # on BOTH sides names c_metrics + a SHORT stats_flush_interval (500ms). Each side
@@ -25,11 +26,15 @@
 # ## Workload
 #
 # Each side fires K = 7 deterministic GET /probe requests (Host: metrics.example,
-# UA: metrics-probe/1; all 2xx). The driver POLLS the receiver until the
-# deterministic COUNTER subset converges to value == 7 == K on EACH side
+# UA: metrics-probe/1; all 2xx). The driver POLLS that side's private receiver
+# until the deterministic COUNTER subset converges to value == 7 == K on EACH side
 # (poll-to-converge — the release barrier; never a fixed sleep,
 # reference_concurrency_differential_release_barrier). Per-side separation: the
-# receiver is Reset() at the start of each side's drive.
+# metrics_service sink flushes PERIODICALLY, so the driver gives each side its OWN
+# private receiver (two separately-allocated ports) — no Reset() between sides is
+# needed (reference_periodic_sink_differential_two_receivers). After the subject
+# snapshot BOTH receivers are hard-stopped via Close() (grpc.Server.Stop), NOT
+# GracefulStop, which would block on the proxies' long-lived StreamMetrics streams.
 #
 # ## Framing NOT asserted (reference_streaming_sink_differential_framing)
 #

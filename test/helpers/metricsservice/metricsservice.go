@@ -45,7 +45,13 @@ type familyValue struct {
 //     captures the first message's Identifier.Node, acking on io.EOF.
 //   - Count() is the number of distinct family NAMES accumulated (the converge
 //     poll); Family(name) reads back one family's (value, type, ok).
+//   - FamilySum(name) reads back the running SUM of every received value for a
+//     family (additive to Family's last-seen) — for a delta sink the per-flush
+//     counter deltas sum to the cumulative total (the 0090 convergence invariant).
 //   - Node() returns the captured Identifier.Node (nil before any message).
+//   - Messages() is the total StreamMetricsMessages received across the stream
+//     (the 0090 delta stability barrier: wait for N further flushes/messages
+//     after convergence to confirm the idle delta-SUM stays == K).
 //   - Reset() drops the accumulator AND the captured node (per-side separation).
 //   - Stop() GracefulStops the *grpc.Server; idempotent via sync.Once.
 //
@@ -58,9 +64,11 @@ type Server struct {
 	lis     net.Listener
 	grpcSrv *grpc.Server
 
-	mu   sync.RWMutex
-	fams map[string]familyValue
-	node *corev3.Node
+	mu       sync.RWMutex
+	fams     map[string]familyValue
+	sums     map[string]float64
+	node     *corev3.Node
+	msgCount int
 
 	stopOnce sync.Once
 }
@@ -115,6 +123,7 @@ func newServer(addr string) (*Server, error) {
 		lis:     lis,
 		grpcSrv: grpc.NewServer(),
 		fams:    make(map[string]familyValue),
+		sums:    make(map[string]float64),
 	}
 	metricsv3.RegisterMetricsServiceServer(s.grpcSrv, s)
 
@@ -144,6 +153,7 @@ func (s *Server) StreamMetrics(stream metricsv3.MetricsService_StreamMetricsServ
 		}
 
 		s.mu.Lock()
+		s.msgCount++
 		if n := msg.GetIdentifier().GetNode(); n != nil && s.node == nil {
 			s.node = n
 		}
@@ -158,6 +168,7 @@ func (s *Server) StreamMetrics(stream metricsv3.MetricsService_StreamMetricsServ
 				}
 			}
 			s.fams[f.GetName()] = familyValue{value: value, typ: f.GetType()}
+			s.sums[f.GetName()] += value
 		}
 		s.mu.Unlock()
 	}
@@ -173,6 +184,19 @@ func (s *Server) Family(name string) (value float64, typ dto.MetricType, ok bool
 	return fv.value, fv.typ, ok
 }
 
+// FamilySum returns the running SUM of every received value for the family named
+// `name` across all messages, and ok=false if none was received. For a delta sink
+// (report_counters_as_deltas=true) the per-flush counter deltas sum to the
+// cumulative total (== K after K requests) — the 0090 convergence invariant
+// (AMEND-MSD-SUM-IS-THE-INVARIANT). Additive to Family() (last-seen), which 0089
+// keeps.
+func (s *Server) FamilySum(name string) (sum float64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sum, ok = s.sums[name]
+	return
+}
+
 // Count returns the number of distinct family NAMES accumulated. Load-bearing as
 // the differential driver's converge poll — a second message updating an
 // existing name keeps Count unchanged.
@@ -180,6 +204,16 @@ func (s *Server) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.fams)
+}
+
+// Messages returns the total number of StreamMetricsMessages received across the
+// stream. Load-bearing for the 0090 delta stability barrier: a differential driver
+// can wait for N further flushes (messages) to arrive after convergence to confirm
+// the delta-SUM is stable (idle flushes add 0 under report_counters_as_deltas).
+func (s *Server) Messages() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.msgCount
 }
 
 // Node returns the Identifier.Node captured from the first message that carried
@@ -202,7 +236,9 @@ func (s *Server) Node() *corev3.Node {
 func (s *Server) Reset() {
 	s.mu.Lock()
 	s.fams = make(map[string]familyValue)
+	s.sums = make(map[string]float64)
 	s.node = nil
+	s.msgCount = 0
 	s.mu.Unlock()
 }
 

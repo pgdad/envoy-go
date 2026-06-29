@@ -153,7 +153,7 @@ func batchNames(m *metricsv3.StreamMetricsMessage) []string {
 func TestSink_IdentifierOnce(t *testing.T) {
 	stream := &fakeMetricsStream{}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
-	s := NewMetricsServiceSink(client, testNode())
+	s := NewMetricsServiceSink(client, testNode(), false)
 
 	batch1 := []*dto.MetricFamily{fam("a.one", 1)}
 	batch2 := []*dto.MetricFamily{fam("b.two", 2)}
@@ -195,7 +195,7 @@ func TestSink_ReconnectResend(t *testing.T) {
 	stream1 := &fakeMetricsStream{sendErrs: []error{nil, errors.New("send boom")}}
 	stream2 := &fakeMetricsStream{}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream1, stream2}}
-	s := NewMetricsServiceSink(client, testNode())
+	s := NewMetricsServiceSink(client, testNode(), false)
 
 	s.Submit([]*dto.MetricFamily{fam("a.one", 1)}) // lands on stream1 (msg #1, identifier)
 	s.Submit([]*dto.MetricFamily{fam("b.two", 2)}) // fails on stream1 -> reopen stream2, re-send
@@ -233,7 +233,7 @@ func TestSink_DropOnFull(t *testing.T) {
 	block := make(chan struct{})
 	stream := &fakeMetricsStream{blockCh: block}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
-	s := newSinkWithCapacity(client, testNode(), 1)
+	s := newSinkWithCapacity(client, testNode(), false, 1)
 
 	// With the writer wedged in Send, the channel fills; Submit must never block.
 	for i := 0; i < 100; i++ {
@@ -249,7 +249,7 @@ func TestSink_DropOnFull(t *testing.T) {
 func TestSink_CloseIdempotent(t *testing.T) {
 	stream := &fakeMetricsStream{}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
-	s := NewMetricsServiceSink(client, testNode())
+	s := NewMetricsServiceSink(client, testNode(), false)
 
 	s.Submit([]*dto.MetricFamily{fam("a.one", 1)})
 	if err := s.Close(); err != nil {
@@ -263,5 +263,28 @@ func TestSink_CloseIdempotent(t *testing.T) {
 	}
 	if stream.closeRecvCalls() == 0 {
 		t.Errorf("CloseAndRecv not called; Close must drain the in-flight stream")
+	}
+}
+
+func TestSink_DeltaMode_RewritesCountersToDeltas(t *testing.T) {
+	stream := &fakeMetricsStream{}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
+	s := newSinkWithCapacity(client, testNode(), true /*reportCountersAsDeltas*/, 8)
+
+	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 7)})  // first flush -> absolute 7
+	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 10)}) // delta 3
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	msgs := stream.messages()
+	if len(msgs) != 2 {
+		t.Fatalf("got %d streamed messages, want 2", len(msgs))
+	}
+	if got := msgs[0].GetEnvoyMetrics()[0].GetMetric()[0].GetCounter().GetValue(); got != 7 {
+		t.Errorf("message[0] counter = %v, want 7 (first flush absolute)", got)
+	}
+	if got := msgs[1].GetEnvoyMetrics()[0].GetMetric()[0].GetCounter().GetValue(); got != 3 {
+		t.Errorf("message[1] counter = %v, want 3 (per-flush delta)", got)
 	}
 }

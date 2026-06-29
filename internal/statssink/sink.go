@@ -57,10 +57,15 @@ const (
 // re-opens the stream once and re-sends the WHOLE batch (re-arming the
 // identifier); a stream-open failure or a second-Send failure drops the batch
 // (logged, not counted).
+//
+// When constructed with reportCountersAsDeltas=true, Submit rewrites COUNTER
+// families to per-flush deltas via a per-sink deltaState before enqueue (ADR-0263);
+// gauges stay absolute.
 type MetricsServiceSink struct {
 	ch          chan []*dto.MetricFamily
 	client      metricsClient
 	node        *corev3.Node
+	delta       *deltaState // non-nil ⇒ report_counters_as_deltas (ADR-0263); nil ⇒ absolute
 	done        chan struct{}
 	closeOnce   sync.Once
 	closeErr    error
@@ -74,18 +79,21 @@ type MetricsServiceSink struct {
 
 // NewMetricsServiceSink builds a metrics-service sink over client with the
 // bounded channel at the default capacity and starts the writer goroutine.
-func NewMetricsServiceSink(client metricsClient, node *corev3.Node) *MetricsServiceSink {
-	return newSinkWithCapacity(client, node, defaultChannelCapacity)
+func NewMetricsServiceSink(client metricsClient, node *corev3.Node, reportCountersAsDeltas bool) *MetricsServiceSink {
+	return newSinkWithCapacity(client, node, reportCountersAsDeltas, defaultChannelCapacity)
 }
 
 // newSinkWithCapacity is the test-friendly variant; production callers use
 // NewMetricsServiceSink (default capacity).
-func newSinkWithCapacity(client metricsClient, node *corev3.Node, capacity int) *MetricsServiceSink {
+func newSinkWithCapacity(client metricsClient, node *corev3.Node, reportCountersAsDeltas bool, capacity int) *MetricsServiceSink {
 	s := &MetricsServiceSink{
 		ch:     make(chan []*dto.MetricFamily, capacity),
 		client: client,
 		node:   node,
 		done:   make(chan struct{}),
+	}
+	if reportCountersAsDeltas {
+		s.delta = newDeltaState()
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	go s.run()
@@ -99,6 +107,9 @@ func newSinkWithCapacity(client metricsClient, node *corev3.Node, capacity int) 
 // Lifecycle contract: callers MUST NOT call Submit once Close has begun — a send
 // on the now-closed channel would panic (the Flusher stops before Close).
 func (s *MetricsServiceSink) Submit(batch []*dto.MetricFamily) {
+	if s.delta != nil {
+		batch = s.delta.apply(batch) // build the sink's OWN delta batch; never mutate the shared slice
+	}
 	select {
 	case s.ch <- batch:
 	default:

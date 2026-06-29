@@ -157,6 +157,85 @@ func TestServer_StreamMetrics_LastSeenWins(t *testing.T) {
 	}
 }
 
+func TestServer_FamilySum_AccumulatesDeltas(t *testing.T) {
+	s := New(t)
+	client := dialClient(t, s.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamMetrics(ctx)
+	if err != nil {
+		t.Fatalf("StreamMetrics: %v", err)
+	}
+
+	// Two flushes of per-flush counter DELTAS (3 then 4) for the same family —
+	// the delta-sink shape. Their running SUM is the cumulative total (== K),
+	// the 0090 convergence invariant; the LAST-seen value is the final delta (4).
+	if err := stream.Send(&metricsv3.StreamMetricsMessage{
+		Identifier:   &metricsv3.StreamMetricsMessage_Identifier{Node: &corev3.Node{Id: "n", Cluster: "c"}},
+		EnvoyMetrics: []*dto.MetricFamily{counterFamily("c.rq", 3)},
+	}); err != nil {
+		t.Fatalf("Send #1: %v", err)
+	}
+	if err := stream.Send(&metricsv3.StreamMetricsMessage{
+		EnvoyMetrics: []*dto.MetricFamily{counterFamily("c.rq", 4)},
+	}); err != nil {
+		t.Fatalf("Send #2: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	if sum, ok := s.FamilySum("c.rq"); !ok || sum != 7 {
+		t.Fatalf("FamilySum(c.rq) = %v,%v want 7,true", sum, ok)
+	}
+	if v, _, ok := s.Family("c.rq"); !ok || v != 4 {
+		t.Fatalf("Family(c.rq) last-seen = %v,%v want 4,true (0089 non-regress)", v, ok)
+	}
+
+	// Absent family -> ok=false.
+	if sum, ok := s.FamilySum("nope"); ok || sum != 0 {
+		t.Fatalf("FamilySum(nope) = %v,%v want 0,false", sum, ok)
+	}
+}
+
+func TestServer_Messages_CountsPerMessage(t *testing.T) {
+	s := New(t)
+	client := dialClient(t, s.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamMetrics(ctx)
+	if err != nil {
+		t.Fatalf("StreamMetrics: %v", err)
+	}
+
+	// Three messages, each carrying one MetricFamily — Messages() counts per
+	// received StreamMetricsMessage (the 0090 delta stability barrier rides on
+	// further-flush arrivals).
+	for i := 0; i < 3; i++ {
+		if err := stream.Send(&metricsv3.StreamMetricsMessage{
+			EnvoyMetrics: []*dto.MetricFamily{counterFamily("c.rq", float64(i))},
+		}); err != nil {
+			t.Fatalf("Send #%d: %v", i, err)
+		}
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	if got := s.Messages(); got != 3 {
+		t.Fatalf("Messages() = %d, want 3", got)
+	}
+
+	s.Reset()
+	if got := s.Messages(); got != 0 {
+		t.Errorf("Messages() = %d after Reset, want 0", got)
+	}
+}
+
 func TestServer_Reset(t *testing.T) {
 	s := New(t)
 	client := dialClient(t, s.Addr())

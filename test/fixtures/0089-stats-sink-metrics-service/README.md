@@ -27,21 +27,30 @@ The HCM `stat_prefix` (`hcm_local`) and the backend cluster name (`c_backend`)
 are FIXED identically on both sides so the mapped dotted stat names match
 cross-side.
 
-## Receiver reachability (`reference_docker_probe_bridge_network`)
+## Two private per-side receivers + hard `Close()`
 
-The driver allocates a stable metrics port, binds the `metricsservice.Server` on
-`0.0.0.0:<port>` BEFORE either proxy starts, and templates the address into both
-bootstraps: `host.docker.internal:<port>` for the reference container (ADR-0010
-bridge alias, STRICT_DNS) and `127.0.0.1:<port>` for the subject (STATIC). Both
-sides stream to the SAME receiver.
+The `metrics_service` sink flushes **periodically** — the reference proxy keeps
+streaming into its receiver for the whole test, including during the subject's
+drive window (`reference_periodic_sink_differential_two_receivers`). A single
+shared receiver would let the reference's concurrent flushes contaminate the
+subject snapshot (and silently defeat subject-side deliberate breaks). So the
+driver starts **two private receivers** — one per side — on two
+separately-allocated host ports, each bound on `0.0.0.0:<port>` BEFORE either
+proxy starts (`reference_docker_probe_bridge_network`), and templates the address
+into each bootstrap: `host.docker.internal:<refPort>` for the reference container
+(ADR-0010 bridge alias, STRICT_DNS) and `127.0.0.1:<subjPort>` for the subject
+(STATIC). Each side owns an uncontaminated accumulator, so **no `Reset()`**
+between sides is needed. After the subject snapshot BOTH receivers are
+hard-stopped via `Close()` (`grpc.Server.Stop`), NOT `Stop()`/`GracefulStop` —
+the proxies hold their long-lived `StreamMetrics` streams open, so `GracefulStop`
+would block until the test timeout.
 
 ## Workload + release barrier
 
 Each side fires K=7 deterministic `GET /probe` requests (all 2xx), then POLLS
-the receiver until the deterministic COUNTER subset converges to value == 7 on
-EACH side — a release barrier (`reference_concurrency_differential_release_barrier`),
-NEVER a `time.Sleep`. The receiver is `Reset()` at the start of each side's
-drive for clean per-side separation.
+that side's private receiver until the deterministic COUNTER subset converges to
+value == 7 on EACH side — a release barrier
+(`reference_concurrency_differential_release_barrier`), NEVER a `time.Sleep`.
 
 ## Asserted (cross-side EXACT, deterministic COUNTER NAME SUBSET)
 

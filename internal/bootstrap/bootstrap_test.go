@@ -1807,19 +1807,6 @@ func TestStatsSink_Rejects(t *testing.T) {
 		errSubs  []string
 	}{
 		{
-			name: "report_counters_as_deltas",
-			topLevel: `stats_sinks:
-  - name: envoy.stat_sinks.metrics_service
-    typed_config:
-      "@type": ` + metricsServiceType + `
-      report_counters_as_deltas: true
-      grpc_service:
-        envoy_grpc:
-          cluster_name: mc
-`,
-			errSubs: []string{"bootstrap:", "report_counters_as_deltas"},
-		},
-		{
 			name: "emit_tags_as_labels",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.metrics_service
@@ -1922,23 +1909,38 @@ stats_sinks:
 	}
 }
 
-// TestStatsSink_AcceptReportCountersFalse: an explicit report_counters_as_deltas
-// of false is accepted (only true is rejected).
-func TestStatsSink_AcceptReportCountersFalse(t *testing.T) {
-	src := statsBootstrap(`stats_sinks:
+// TestStatsSink_AcceptReportCountersDeltas: report_counters_as_deltas false OR
+// true both parse-accept; true records ReportCountersAsDeltas on the config
+// (the strict-reject was lifted at 47.2a — reference-parity-accept, ADR-0263).
+func TestStatsSink_AcceptReportCountersDeltas(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		val  string
+		want bool
+	}{
+		{"false", "false", false},
+		{"true", "true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := statsBootstrap(`stats_sinks:
   - name: envoy.stat_sinks.metrics_service
     typed_config:
       "@type": ` + metricsServiceType + `
-      report_counters_as_deltas: false
+      report_counters_as_deltas: ` + tc.val + `
       grpc_service:
         envoy_grpc:
           cluster_name: mc
 `)
-	bs, err := Load(strings.NewReader(src))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got := len(bs.StatsSinkConfigs); got != 1 {
-		t.Fatalf("StatsSinkConfigs: got %d, want 1", got)
+			bs, err := Load(strings.NewReader(src))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := len(bs.StatsSinkConfigs); got != 1 {
+				t.Fatalf("StatsSinkConfigs: got %d, want 1", got)
+			}
+			if got := bs.StatsSinkConfigs[0].ReportCountersAsDeltas; got != tc.want {
+				t.Errorf("ReportCountersAsDeltas = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
