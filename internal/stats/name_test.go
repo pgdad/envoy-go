@@ -881,3 +881,42 @@ func TestWriteProm_MongoCallsiteLineByteExact(t *testing.T) {
 		t.Errorf("WriteProm output missing the §11.2 byte-exact line:\nwant: %s\ngot:\n%s", want, b.String())
 	}
 }
+
+// TestExtractTags is a focused characterization test of the shared SN-rule
+// matcher (Phase 47.2b). It pins the DOTTED residual + the envoy_-keyed labels
+// for the arms the 0091 metrics_service-labels differential exercises. The
+// byte-identity of the Prometheus projection over these residuals is guarded by
+// the existing TestFlattenToProm_* / TestWriteProm_* suite; this test pins the
+// pre-projection (dotted) contract directly. Labels are produced in the order
+// ExtractTags emits them (SN4 prepends response_code_class), so the positional
+// sameLabels comparison is exact.
+func TestExtractTags(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantResidual string
+		wantLabels   []Label
+	}{
+		{"cluster.c_backend.upstream_rq_total", "cluster.upstream_rq_total",
+			[]Label{{Key: "envoy_cluster_name", Value: "c_backend"}}},
+		{"http.hcm_local.downstream_rq_total", "http.downstream_rq_total",
+			[]Label{{Key: "envoy_http_conn_manager_prefix", Value: "hcm_local"}}},
+		{"http.hcm_local.downstream_rq_2xx", "http.downstream_rq_xx",
+			[]Label{{Key: "envoy_response_code_class", Value: "2"}, {Key: "envoy_http_conn_manager_prefix", Value: "hcm_local"}}},
+		{"server.live", "server.live", nil},
+	}
+	for _, c := range cases {
+		residual, labels, err := ExtractTags(c.in)
+		if err != nil {
+			t.Fatalf("ExtractTags(%q): %v", c.in, err)
+		}
+		if residual != c.wantResidual {
+			t.Errorf("ExtractTags(%q) residual = %q, want %q", c.in, residual, c.wantResidual)
+		}
+		if !sameLabels(labels, c.wantLabels) {
+			t.Errorf("ExtractTags(%q) labels = %+v, want %+v", c.in, labels, c.wantLabels)
+		}
+	}
+	if _, _, err := ExtractTags("listener_manager.listener_create_success"); err == nil {
+		t.Error("ExtractTags(listener_manager.*): want error (no top-level rule), got nil")
+	}
+}

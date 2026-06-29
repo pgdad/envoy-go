@@ -266,10 +266,11 @@ type OTLPConfig struct {
 // top-level stats_sinks[] MetricsServiceConfig entry (ADR-0262). The sink itself
 // (the MetricsServiceSink + Flusher) is constructed in cmd/envoy-go/main.go after
 // Load returns; this struct carries only the parse-time data.
-// report_counters_as_deltas is now CONSUMED into ReportCountersAsDeltas
-// (ADR-0263); the remaining strict-reject arms (emit_tags_as_labels / non-default
-// histogram_emit_mode / non-V3 transport / google_grpc / empty cluster) run in
-// parseMetricsServiceConfig before the config is appended (ADR-0080).
+// report_counters_as_deltas is CONSUMED into ReportCountersAsDeltas (ADR-0263);
+// emit_tags_as_labels is CONSUMED into EmitTagsAsLabels (ADR-0264); the remaining
+// strict-reject arms (non-default histogram_emit_mode / non-V3 transport /
+// google_grpc / empty cluster) run in parseMetricsServiceConfig before the config
+// is appended (ADR-0080).
 type StatsSinkConfig struct {
 	ClusterName string // MetricsServiceConfig.grpc_service.envoy_grpc.cluster_name
 	// ReportCountersAsDeltas is MetricsServiceConfig.report_counters_as_deltas
@@ -277,6 +278,14 @@ type StatsSinkConfig struct {
 	// (current − last_flushed) instead of the cumulative absolute value; GAUGES
 	// stay absolute. Absent/false ⇒ the 47.1 cumulative path.
 	ReportCountersAsDeltas bool
+	// EmitTagsAsLabels is MetricsServiceConfig.emit_tags_as_labels (ADR-0264):
+	// true ⇒ each metric family's tag SEGMENTS are stripped from the dotted name
+	// into metric[].label[] LabelPairs (keyed by the Envoy dotted tag-name
+	// envoy.<tag>); BOTH Counter and Gauge. The metric value is unchanged
+	// (cumulative-absolute, orthogonal to ReportCountersAsDeltas). Absent/false ⇒
+	// the 47.1 full-dotted-name/zero-labels path. emit_tags_as_labels is a scalar
+	// bool (NOT a *wrapperspb.BoolValue — contrast ReportCountersAsDeltas).
+	EmitTagsAsLabels bool
 }
 
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
@@ -328,8 +337,9 @@ type Bootstrap struct {
 	// StatsSinkConfigs is the parsed top-level stats_sinks[] metrics_service sink
 	// entries (ADR-0262), in declaration order. Empty when no metrics_service
 	// stats_sinks[] entry is configured. report_counters_as_deltas is CONSUMED
-	// into StatsSinkConfig.ReportCountersAsDeltas (ADR-0263). Per ADR-0262/ADR-0080:
-	// emit_tags_as_labels:true, a non-default
+	// into StatsSinkConfig.ReportCountersAsDeltas (ADR-0263); emit_tags_as_labels
+	// is CONSUMED into StatsSinkConfig.EmitTagsAsLabels (ADR-0264). Per
+	// ADR-0262/ADR-0080: a non-default
 	// histogram_emit_mode, a non-V3 transport_api_version, google_grpc, an empty
 	// cluster_name, sibling sink TypeURLs, and stats_flush_on_admin are all
 	// rejected at parse time. The MetricsServiceSink/Flusher are built in
@@ -431,11 +441,11 @@ func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 // and appends a StatsSinkConfig to result.StatsSinkConfigs (ADR-0262). It
 // STRICT-REJECTS (ADR-0080): a non-V3 transport_api_version (V2 reference-parity;
 // AUTO/V3 accepted — D-MS-APIVERSION), google_grpc (only envoy_grpc supported),
-// an empty envoy_grpc.cluster_name, emit_tags_as_labels:true (47.1
-// emits the full dotted name with zero labels — deferred to 47.2), and a
-// non-default histogram_emit_mode (envoy-go has no histograms — ADR-0060).
-// report_counters_as_deltas is CONSUMED into StatsSinkConfig.ReportCountersAsDeltas
-// (ADR-0263); .GetValue() on a nil BoolValue yields the cumulative false default.
+// an empty envoy_grpc.cluster_name, and a non-default histogram_emit_mode
+// (envoy-go has no histograms — ADR-0060). report_counters_as_deltas is CONSUMED
+// into StatsSinkConfig.ReportCountersAsDeltas (ADR-0263); .GetValue() on a nil
+// BoolValue yields the cumulative false default. emit_tags_as_labels is CONSUMED
+// into StatsSinkConfig.EmitTagsAsLabels (ADR-0264; a scalar bool read directly).
 func parseMetricsServiceConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 	var msc metricsconfigv3.MetricsServiceConfig
 	if err := tc.UnmarshalTo(&msc); err != nil {
@@ -451,15 +461,13 @@ func parseMetricsServiceConfig(tc *anypb.Any, idx int, result *Bootstrap) error 
 	if eg.GetClusterName() == "" {
 		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service grpc_service.envoy_grpc.cluster_name is required (must be non-empty)", idx)
 	}
-	if msc.GetEmitTagsAsLabels() {
-		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service emit_tags_as_labels:true is not supported (47.1 emits the full dotted name with zero labels; deferred to 47.2)", idx)
-	}
 	if m := msc.GetHistogramEmitMode(); m != metricsconfigv3.HistogramEmitMode_SUMMARY_AND_HISTOGRAM {
 		return fmt.Errorf("bootstrap: stats_sinks[%d]: metrics_service histogram_emit_mode %v is not supported (envoy-go has no histograms)", idx, m)
 	}
 	result.StatsSinkConfigs = append(result.StatsSinkConfigs, StatsSinkConfig{
 		ClusterName:            eg.GetClusterName(),
 		ReportCountersAsDeltas: msc.GetReportCountersAsDeltas().GetValue(),
+		EmitTagsAsLabels:       msc.GetEmitTagsAsLabels(),
 	})
 	return nil
 }

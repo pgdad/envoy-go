@@ -25,6 +25,21 @@ func counterFamily(name string, v float64) *dto.MetricFamily {
 	}
 }
 
+// labeledCounterFamily builds a single-Metric COUNTER MetricFamily named `name`
+// with the absolute value `v` and the supplied LabelPairs on its one Metric (the
+// emit_tags_as_labels shape — multiple families share a residual name but differ
+// by labels).
+func labeledCounterFamily(name string, v float64, labels []*dto.LabelPair) *dto.MetricFamily {
+	return &dto.MetricFamily{
+		Name: proto.String(name),
+		Type: dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{
+			Label:   labels,
+			Counter: &dto.Counter{Value: proto.Float64(v)},
+		}},
+	}
+}
+
 // gaugeFamily builds a single-Metric GAUGE MetricFamily named `name` with the
 // value `v`.
 func gaugeFamily(name string, v float64) *dto.MetricFamily {
@@ -233,6 +248,62 @@ func TestServer_Messages_CountsPerMessage(t *testing.T) {
 	s.Reset()
 	if got := s.Messages(); got != 0 {
 		t.Errorf("Messages() = %d after Reset, want 0", got)
+	}
+}
+
+func TestServer_FamilyWithLabels_LabelKeyedSeparation(t *testing.T) {
+	s := New(t)
+	client := dialClient(t, s.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamMetrics(ctx)
+	if err != nil {
+		t.Fatalf("StreamMetrics: %v", err)
+	}
+
+	// Two families share the residual name "cluster.upstream_rq_total" but differ
+	// by their {envoy.cluster_name} label (c_backend vs c_metrics) — the
+	// emit_tags_as_labels shape. The name-only Family() would be ambiguous; the
+	// composite-key FamilyWithLabels() keeps them separate.
+	lbA := []*dto.LabelPair{{Name: proto.String("envoy.cluster_name"), Value: proto.String("c_backend")}}
+	lbB := []*dto.LabelPair{{Name: proto.String("envoy.cluster_name"), Value: proto.String("c_metrics")}}
+	if err := stream.Send(&metricsv3.StreamMetricsMessage{
+		Identifier: &metricsv3.StreamMetricsMessage_Identifier{Node: &corev3.Node{Id: "n", Cluster: "c"}},
+		EnvoyMetrics: []*dto.MetricFamily{
+			labeledCounterFamily("cluster.upstream_rq_total", 7, lbA),
+			labeledCounterFamily("cluster.upstream_rq_total", 3, lbB),
+		},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	if v, typ, ok := s.FamilyWithLabels("cluster.upstream_rq_total", lbA); !ok || v != 7 || typ != dto.MetricType_COUNTER {
+		t.Fatalf("FamilyWithLabels(c_backend) = %v,%v,%v want 7,COUNTER,true", v, typ, ok)
+	}
+	if v, _, ok := s.FamilyWithLabels("cluster.upstream_rq_total", lbB); !ok || v != 3 {
+		t.Fatalf("FamilyWithLabels(c_metrics) = %v,%v want 3,true (label-keyed separation)", v, ok)
+	}
+
+	// Lookup is order-insensitive (sorted-key compare) and reordering the query
+	// slice still hits — and an unknown label set misses.
+	reordered := []*dto.LabelPair{{Name: proto.String("envoy.cluster_name"), Value: proto.String("c_backend")}}
+	if v, _, ok := s.FamilyWithLabels("cluster.upstream_rq_total", reordered); !ok || v != 7 {
+		t.Fatalf("FamilyWithLabels(reordered c_backend) = %v,%v want 7,true", v, ok)
+	}
+	miss := []*dto.LabelPair{{Name: proto.String("envoy.cluster_name"), Value: proto.String("c_unknown")}}
+	if _, _, ok := s.FamilyWithLabels("cluster.upstream_rq_total", miss); ok {
+		t.Fatalf("FamilyWithLabels(c_unknown) ok=true, want false")
+	}
+
+	// Reset clears the label-keyed accumulator too.
+	s.Reset()
+	if _, _, ok := s.FamilyWithLabels("cluster.upstream_rq_total", lbA); ok {
+		t.Fatalf("FamilyWithLabels after Reset ok=true, want false")
 	}
 }
 

@@ -1807,19 +1807,6 @@ func TestStatsSink_Rejects(t *testing.T) {
 		errSubs  []string
 	}{
 		{
-			name: "emit_tags_as_labels",
-			topLevel: `stats_sinks:
-  - name: envoy.stat_sinks.metrics_service
-    typed_config:
-      "@type": ` + metricsServiceType + `
-      emit_tags_as_labels: true
-      grpc_service:
-        envoy_grpc:
-          cluster_name: mc
-`,
-			errSubs: []string{"bootstrap:", "emit_tags_as_labels"},
-		},
-		{
 			name: "histogram_emit_mode",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.metrics_service
@@ -1940,6 +1927,43 @@ func TestStatsSink_AcceptReportCountersDeltas(t *testing.T) {
 			}
 			if got := bs.StatsSinkConfigs[0].ReportCountersAsDeltas; got != tc.want {
 				t.Errorf("ReportCountersAsDeltas = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStatsSink_AcceptEmitTagsAsLabels: emit_tags_as_labels false OR true both
+// parse-accept; true records EmitTagsAsLabels on the config (the strict-reject was
+// lifted at 47.2b — reference-parity-accept, ADR-0264). emit_tags_as_labels is a
+// scalar bool (NOT a *BoolValue — contrast report_counters_as_deltas).
+func TestStatsSink_AcceptEmitTagsAsLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		val  string
+		want bool
+	}{
+		{"false", "false", false},
+		{"true", "true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      emit_tags_as_labels: ` + tc.val + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+			bs, err := Load(strings.NewReader(src))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := len(bs.StatsSinkConfigs); got != 1 {
+				t.Fatalf("StatsSinkConfigs: got %d, want 1", got)
+			}
+			if got := bs.StatsSinkConfigs[0].EmitTagsAsLabels; got != tc.want {
+				t.Errorf("EmitTagsAsLabels = %v, want %v", got, tc.want)
 			}
 		})
 	}

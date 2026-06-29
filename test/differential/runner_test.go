@@ -115,6 +115,7 @@ import (
 	_ "github.com/esalaine/envoy-go/test/fixtures/0088-tracing-zipkin/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0089-stats-sink-metrics-service/driver"
 	_ "github.com/esalaine/envoy-go/test/fixtures/0090-stats-sink-metrics-service-deltas/driver"
+	_ "github.com/esalaine/envoy-go/test/fixtures/0091-stats-sink-metrics-service-labels/driver"
 	"github.com/esalaine/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

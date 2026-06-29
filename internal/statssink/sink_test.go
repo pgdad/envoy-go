@@ -153,7 +153,7 @@ func batchNames(m *metricsv3.StreamMetricsMessage) []string {
 func TestSink_IdentifierOnce(t *testing.T) {
 	stream := &fakeMetricsStream{}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
-	s := NewMetricsServiceSink(client, testNode(), false)
+	s := NewMetricsServiceSink(client, testNode(), false, false)
 
 	batch1 := []*dto.MetricFamily{fam("a.one", 1)}
 	batch2 := []*dto.MetricFamily{fam("b.two", 2)}
@@ -195,7 +195,7 @@ func TestSink_ReconnectResend(t *testing.T) {
 	stream1 := &fakeMetricsStream{sendErrs: []error{nil, errors.New("send boom")}}
 	stream2 := &fakeMetricsStream{}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream1, stream2}}
-	s := NewMetricsServiceSink(client, testNode(), false)
+	s := NewMetricsServiceSink(client, testNode(), false, false)
 
 	s.Submit([]*dto.MetricFamily{fam("a.one", 1)}) // lands on stream1 (msg #1, identifier)
 	s.Submit([]*dto.MetricFamily{fam("b.two", 2)}) // fails on stream1 -> reopen stream2, re-send
@@ -233,7 +233,7 @@ func TestSink_DropOnFull(t *testing.T) {
 	block := make(chan struct{})
 	stream := &fakeMetricsStream{blockCh: block}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
-	s := newSinkWithCapacity(client, testNode(), false, 1)
+	s := newSinkWithCapacity(client, testNode(), false, false, 1)
 
 	// With the writer wedged in Send, the channel fills; Submit must never block.
 	for i := 0; i < 100; i++ {
@@ -249,7 +249,7 @@ func TestSink_DropOnFull(t *testing.T) {
 func TestSink_CloseIdempotent(t *testing.T) {
 	stream := &fakeMetricsStream{}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
-	s := NewMetricsServiceSink(client, testNode(), false)
+	s := NewMetricsServiceSink(client, testNode(), false, false)
 
 	s.Submit([]*dto.MetricFamily{fam("a.one", 1)})
 	if err := s.Close(); err != nil {
@@ -269,7 +269,7 @@ func TestSink_CloseIdempotent(t *testing.T) {
 func TestSink_DeltaMode_RewritesCountersToDeltas(t *testing.T) {
 	stream := &fakeMetricsStream{}
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
-	s := newSinkWithCapacity(client, testNode(), true /*reportCountersAsDeltas*/, 8)
+	s := newSinkWithCapacity(client, testNode(), true /*deltas*/, false /*labels*/, 8)
 
 	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 7)})  // first flush -> absolute 7
 	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 10)}) // delta 3
@@ -286,5 +286,72 @@ func TestSink_DeltaMode_RewritesCountersToDeltas(t *testing.T) {
 	}
 	if got := msgs[1].GetEnvoyMetrics()[0].GetMetric()[0].GetCounter().GetValue(); got != 3 {
 		t.Errorf("message[1] counter = %v, want 3 (per-flush delta)", got)
+	}
+}
+
+func TestSink_LabelsMode_RewritesNameAndLabels(t *testing.T) {
+	stream := &fakeMetricsStream{}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
+	s := newSinkWithCapacity(client, testNode(), false /*deltas*/, true /*emitTagsAsLabels*/, 8)
+
+	s.Submit([]*dto.MetricFamily{counterFam("cluster.c_backend.upstream_rq_total", 7)})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	msgs := stream.messages()
+	if len(msgs) != 1 {
+		t.Fatalf("got %d streamed messages, want 1", len(msgs))
+	}
+	fam := msgs[0].GetEnvoyMetrics()[0]
+	if got := fam.GetName(); got != "cluster.upstream_rq_total" {
+		t.Errorf("name = %q, want %q (tag-residual)", got, "cluster.upstream_rq_total")
+	}
+	labels := fam.GetMetric()[0].GetLabel()
+	if len(labels) != 1 {
+		t.Fatalf("got %d labels, want 1", len(labels))
+	}
+	if got := labels[0].GetName(); got != "envoy.cluster_name" {
+		t.Errorf("label name = %q, want %q", got, "envoy.cluster_name")
+	}
+	if got := labels[0].GetValue(); got != "c_backend" {
+		t.Errorf("label value = %q, want %q", got, "c_backend")
+	}
+	if got := fam.GetMetric()[0].GetCounter().GetValue(); got != 7 {
+		t.Errorf("counter = %v, want 7 (cumulative — labels mode leaves value unchanged)", got)
+	}
+}
+
+func TestSink_BothKnobs_DeltaThenLabels(t *testing.T) {
+	stream := &fakeMetricsStream{}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
+	s := newSinkWithCapacity(client, testNode(), true /*deltas*/, true /*labels*/, 8)
+
+	s.Submit([]*dto.MetricFamily{counterFam("cluster.c_backend.upstream_rq_total", 7)})  // first flush -> delta absolute 7
+	s.Submit([]*dto.MetricFamily{counterFam("cluster.c_backend.upstream_rq_total", 10)}) // delta 3
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	msgs := stream.messages()
+	if len(msgs) != 2 {
+		t.Fatalf("got %d streamed messages, want 2", len(msgs))
+	}
+	for i, m := range msgs {
+		fam := m.GetEnvoyMetrics()[0]
+		if got := fam.GetName(); got != "cluster.upstream_rq_total" {
+			t.Errorf("message[%d] name = %q, want %q (tag-residual)", i, got, "cluster.upstream_rq_total")
+		}
+		labels := fam.GetMetric()[0].GetLabel()
+		if len(labels) != 1 || labels[0].GetName() != "envoy.cluster_name" || labels[0].GetValue() != "c_backend" {
+			t.Errorf("message[%d] labels = %v, want [{envoy.cluster_name c_backend}]", i, labels)
+		}
+	}
+	// Labels apply to the DELTA value: msg0 == 7 (first=absolute), msg1 == 3 (delta).
+	if got := msgs[0].GetEnvoyMetrics()[0].GetMetric()[0].GetCounter().GetValue(); got != 7 {
+		t.Errorf("message[0] counter = %v, want 7 (delta first=absolute)", got)
+	}
+	if got := msgs[1].GetEnvoyMetrics()[0].GetMetric()[0].GetCounter().GetValue(); got != 3 {
+		t.Errorf("message[1] counter = %v, want 3 (per-flush delta with labels)", got)
 	}
 }

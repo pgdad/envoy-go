@@ -60,12 +60,17 @@ const (
 //
 // When constructed with reportCountersAsDeltas=true, Submit rewrites COUNTER
 // families to per-flush deltas via a per-sink deltaState before enqueue (ADR-0263);
-// gauges stay absolute.
+// gauges stay absolute. When constructed with emitTagsAsLabels=true, Submit then
+// rewrites each family's Name to the tag-residual and emits the extracted tags as
+// metric[].label[] LabelPairs via a per-sink labelMapper (ADR-0264); applied AFTER
+// the delta so labels ride the (possibly delta-rewritten) value. Both transforms
+// build the sink's own batch and never mutate the shared snapshot slice.
 type MetricsServiceSink struct {
 	ch          chan []*dto.MetricFamily
 	client      metricsClient
 	node        *corev3.Node
-	delta       *deltaState // non-nil ⇒ report_counters_as_deltas (ADR-0263); nil ⇒ absolute
+	delta       *deltaState  // non-nil ⇒ report_counters_as_deltas (ADR-0263); nil ⇒ absolute
+	labels      *labelMapper // non-nil ⇒ emit_tags_as_labels (ADR-0264); nil ⇒ full dotted name, no labels
 	done        chan struct{}
 	closeOnce   sync.Once
 	closeErr    error
@@ -79,13 +84,13 @@ type MetricsServiceSink struct {
 
 // NewMetricsServiceSink builds a metrics-service sink over client with the
 // bounded channel at the default capacity and starts the writer goroutine.
-func NewMetricsServiceSink(client metricsClient, node *corev3.Node, reportCountersAsDeltas bool) *MetricsServiceSink {
-	return newSinkWithCapacity(client, node, reportCountersAsDeltas, defaultChannelCapacity)
+func NewMetricsServiceSink(client metricsClient, node *corev3.Node, reportCountersAsDeltas, emitTagsAsLabels bool) *MetricsServiceSink {
+	return newSinkWithCapacity(client, node, reportCountersAsDeltas, emitTagsAsLabels, defaultChannelCapacity)
 }
 
 // newSinkWithCapacity is the test-friendly variant; production callers use
 // NewMetricsServiceSink (default capacity).
-func newSinkWithCapacity(client metricsClient, node *corev3.Node, reportCountersAsDeltas bool, capacity int) *MetricsServiceSink {
+func newSinkWithCapacity(client metricsClient, node *corev3.Node, reportCountersAsDeltas, emitTagsAsLabels bool, capacity int) *MetricsServiceSink {
 	s := &MetricsServiceSink{
 		ch:     make(chan []*dto.MetricFamily, capacity),
 		client: client,
@@ -94,6 +99,9 @@ func newSinkWithCapacity(client metricsClient, node *corev3.Node, reportCounters
 	}
 	if reportCountersAsDeltas {
 		s.delta = newDeltaState()
+	}
+	if emitTagsAsLabels {
+		s.labels = newLabelMapper()
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	go s.run()
@@ -109,6 +117,9 @@ func newSinkWithCapacity(client metricsClient, node *corev3.Node, reportCounters
 func (s *MetricsServiceSink) Submit(batch []*dto.MetricFamily) {
 	if s.delta != nil {
 		batch = s.delta.apply(batch) // build the sink's OWN delta batch; never mutate the shared slice
+	}
+	if s.labels != nil {
+		batch = s.labels.apply(batch) // rewrite Name+Label; orthogonal to delta's VALUE rewrite (delta-then-labels)
 	}
 	select {
 	case s.ch <- batch:

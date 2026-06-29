@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -48,6 +50,11 @@ type familyValue struct {
 //   - FamilySum(name) reads back the running SUM of every received value for a
 //     family (additive to Family's last-seen) — for a delta sink the per-flush
 //     counter deltas sum to the cumulative total (the 0090 convergence invariant).
+//   - FamilyWithLabels(name, labels) reads back one family's (value, type, ok)
+//     keyed by the composite {residual name | sorted labels} — for the
+//     emit_tags_as_labels sink where multiple families share a residual name
+//     (cluster.upstream_rq_total for both c_backend AND c_metrics) and the
+//     name-only Family() would be ambiguous (the 0091 label differential).
 //   - Node() returns the captured Identifier.Node (nil before any message).
 //   - Messages() is the total StreamMetricsMessages received across the stream
 //     (the 0090 delta stability barrier: wait for N further flushes/messages
@@ -67,6 +74,7 @@ type Server struct {
 	mu       sync.RWMutex
 	fams     map[string]familyValue
 	sums     map[string]float64
+	byKey    map[string]familyValue // keyed by labelKey(name, sorted labels) — emit_tags_as_labels (ADR-0264)
 	node     *corev3.Node
 	msgCount int
 
@@ -124,6 +132,7 @@ func newServer(addr string) (*Server, error) {
 		grpcSrv: grpc.NewServer(),
 		fams:    make(map[string]familyValue),
 		sums:    make(map[string]float64),
+		byKey:   make(map[string]familyValue),
 	}
 	metricsv3.RegisterMetricsServiceServer(s.grpcSrv, s)
 
@@ -159,7 +168,8 @@ func (s *Server) StreamMetrics(stream metricsv3.MetricsService_StreamMetricsServ
 		}
 		for _, f := range msg.GetEnvoyMetrics() {
 			var value float64
-			if ms := f.GetMetric(); len(ms) > 0 {
+			ms := f.GetMetric() // hoisted out of the former `if ms := ...` init so the byKey store can read ms[0].GetLabel()
+			if len(ms) > 0 {
 				switch f.GetType() {
 				case dto.MetricType_GAUGE:
 					value = ms[0].GetGauge().GetValue()
@@ -169,6 +179,9 @@ func (s *Server) StreamMetrics(stream metricsv3.MetricsService_StreamMetricsServ
 			}
 			s.fams[f.GetName()] = familyValue{value: value, typ: f.GetType()}
 			s.sums[f.GetName()] += value
+			if len(ms) > 0 {
+				s.byKey[labelKey(f.GetName(), ms[0].GetLabel())] = familyValue{value: value, typ: f.GetType()}
+			}
 		}
 		s.mu.Unlock()
 	}
@@ -195,6 +208,36 @@ func (s *Server) FamilySum(name string) (sum float64, ok bool) {
 	defer s.mu.RUnlock()
 	sum, ok = s.sums[name]
 	return
+}
+
+// labelKey is the composite accumulator key under emit_tags_as_labels: the family
+// residual name plus its label set rendered in SORTED key order, so families
+// sharing a residual name but differing by labels (cluster.upstream_rq_total for
+// both c_backend AND c_metrics) accumulate under distinct keys. The label slice is
+// sorted into a copy (the input is not mutated).
+func labelKey(name string, labels []*dto.LabelPair) string {
+	cp := append([]*dto.LabelPair(nil), labels...)
+	sort.Slice(cp, func(i, j int) bool { return cp[i].GetName() < cp[j].GetName() })
+	var b strings.Builder
+	b.WriteString(name)
+	for _, l := range cp {
+		b.WriteByte('|')
+		b.WriteString(l.GetName())
+		b.WriteByte('=')
+		b.WriteString(l.GetValue())
+	}
+	return b.String()
+}
+
+// FamilyWithLabels returns the last-seen (value, type, ok) for the accumulated
+// MetricFamily whose residual name is `name` and whose label set equals `labels`
+// (compared in sorted-key order — order-insensitive). ok is false if none was
+// received. Additive to Family()/FamilySum() (name-only), which 0089/0090 keep.
+func (s *Server) FamilyWithLabels(name string, labels []*dto.LabelPair) (value float64, typ dto.MetricType, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	fv, ok := s.byKey[labelKey(name, labels)]
+	return fv.value, fv.typ, ok
 }
 
 // Count returns the number of distinct family NAMES accumulated. Load-bearing as
@@ -237,6 +280,7 @@ func (s *Server) Reset() {
 	s.mu.Lock()
 	s.fams = make(map[string]familyValue)
 	s.sums = make(map[string]float64)
+	s.byKey = make(map[string]familyValue)
 	s.node = nil
 	s.msgCount = 0
 	s.mu.Unlock()

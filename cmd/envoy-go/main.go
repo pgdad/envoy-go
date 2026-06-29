@@ -196,7 +196,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("statssink: metrics_service client for cluster %q: %v", cfg.ClusterName, err)
 			}
-			statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, node, cfg.ReportCountersAsDeltas))
+			statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, node, cfg.ReportCountersAsDeltas, cfg.EmitTagsAsLabels))
 		}
 		statsFlusher = statssink.NewFlusher(bs.Stats, bs.FlushInterval, statsSinks)
 	}

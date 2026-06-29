@@ -30,7 +30,7 @@ func TestNoNewStat_RegistrationGuard(t *testing.T) {
 	// The exact main.go construction shape: a MetricsServiceSink over a client +
 	// node, then a Flusher over the registry/interval/sinks.
 	client := &fakeMetricsClient{streams: []*fakeMetricsStream{{}}}
-	sink := NewMetricsServiceSink(client, testNode(), false)
+	sink := NewMetricsServiceSink(client, testNode(), false, false)
 	t.Cleanup(func() { _ = sink.Close() })
 
 	flusher := NewFlusher(reg, 500*time.Millisecond, []Sink{sink})

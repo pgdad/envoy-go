@@ -21,24 +21,32 @@ type Label struct {
 // class digit. The regex is anchored at end of string.
 var statusClassRE = regexp.MustCompile(`^(.+)_([1-5])xx$`)
 
-// flattenToProm transforms an internal hierarchical-dotted name to the
-// Prometheus exposition form per Rules SN1–SN8 (ADR-0061; SPEC §10.1).
+// ExtractTags splits an internal hierarchical-dotted name into the residual
+// dotted name (tag-value segments removed, dots preserved) + the extracted tag
+// set (keys in the envoy_ Prometheus underscore form, values the dynamic tokens),
+// applying the SN1–SN9 prefix rules + the SN4 status-class _Nxx→_xx collapse
+// (ADR-0061). It is the SHARED matcher consumed by BOTH flattenToProm (the
+// Prometheus projection) AND the internal/statssink labelMapper (the
+// metrics_service dotted projection, ADR-0264). Returns "", nil, error on a name
+// matching no top-level/filter rule. (Phase 47.2b extracted this from
+// flattenToProm; the projection below preserves flattenToProm's output verbatim —
+// name_test.go is the byte-identity guard.)
 //
-//	SN1: cluster.<n>.<rest>     → envoy_cluster_<rest> + label envoy_cluster_name=<n>
-//	SN2: http.<stat_prefix>.<rest> → envoy_http_<rest> + label envoy_http_conn_manager_prefix=<stat_prefix>
-//	SN3: listener.<addr>.<rest> → envoy_listener_<rest> + label envoy_listener_address=<addr>
-//	SN4: <base>_Nxx             → <base>_xx + label envoy_response_code_class=N (N ∈ 1..5)
-//	SN5: server.<rest>          → envoy_server_<rest> + no labels
+//	SN1: cluster.<n>.<rest>     → cluster.<rest> + label envoy_cluster_name=<n>
+//	SN2: http.<stat_prefix>.<rest> → http.<rest> + label envoy_http_conn_manager_prefix=<stat_prefix>
+//	SN3: listener.<addr>.<rest> → listener.<rest> + label envoy_listener_address=<addr>
+//	SN4: <residual>_Nxx         → <residual>_xx + label envoy_response_code_class=N (N ∈ 1..5)
+//	SN5: server.<rest>          → server.<rest> + no labels
 //	SN6: HELP text best-effort English (handled by prom.go via helpText map)
 //	SN7: histograms not emitted (Task-2-time NewCounter/NewGauge are the only
 //	     registry methods; absence is the contract)
 //	SN8: per-endpoint cluster stats not emitted (similarly absent)
 //
-// Returns the Prometheus base name + the extracted label set + nil on success.
+// Returns the residual dotted name + the extracted label set + nil on success.
 // Returns "", nil, error on names that match no top-level rule.
-func flattenToProm(internal string) (string, []Label, error) {
+func ExtractTags(internal string) (string, []Label, error) {
 	var labels []Label
-	var rest, base string
+	var rest, residual string
 	switch {
 	case strings.HasPrefix(internal, "cluster."):
 		// Rule SN1
@@ -49,7 +57,7 @@ func flattenToProm(internal string) (string, []Label, error) {
 		}
 		labels = append(labels, Label{Key: "envoy_cluster_name", Value: tail[:dot]})
 		rest = tail[dot+1:]
-		base = "envoy_cluster_" + rest
+		residual = "cluster." + rest
 	case strings.HasPrefix(internal, "http."):
 		// Rule SN2
 		tail := strings.TrimPrefix(internal, "http.")
@@ -71,7 +79,7 @@ func flattenToProm(internal string) (string, []Label, error) {
 		// SPEC §11.6 empirical pin: reference Envoy v1.37.2 emits
 		// `envoy_http_fault_aborts_injected{...}` (underscore, not period).
 		rest = strings.ReplaceAll(tail[dot+1:], ".", "_")
-		base = "envoy_http_" + rest
+		residual = "http." + rest
 	case strings.HasPrefix(internal, "listener."):
 		// Rule SN3
 		tail := strings.TrimPrefix(internal, "listener.")
@@ -81,11 +89,11 @@ func flattenToProm(internal string) (string, []Label, error) {
 		}
 		labels = append(labels, Label{Key: "envoy_listener_address", Value: tail[:dot]})
 		rest = tail[dot+1:]
-		base = "envoy_listener_" + rest
+		residual = "listener." + rest
 	case strings.HasPrefix(internal, "server."):
 		// Rule SN5
 		rest = strings.TrimPrefix(internal, "server.")
-		base = "envoy_server_" + rest
+		residual = "server." + rest
 	case strings.HasPrefix(internal, "wasm."):
 		// Phase 25.1 / Task 15 follow-up: wasm filter inline-prefix detection
 		// per AMEND-A2 + ADR-0202 + ADR-0203 (mirrors phase-15 bandwidth_limit's
@@ -119,8 +127,8 @@ func flattenToProm(internal string) (string, []Label, error) {
 		if tail == "" {
 			return "", nil, fmt.Errorf("stats: name %q matches wasm.* but has no <scope> segment", internal)
 		}
-		base = "envoy_wasm_" + strings.ReplaceAll(tail, ".", "_")
-		return base, nil, nil
+		residual = "wasm." + tail
+		return residual, nil, nil
 	default:
 		// Rule SN9 (added per phase 11 ADR-0118 + ADR-0061 amendment): the
 		// local_ratelimit filter-specific tag-extractor matches names of the
@@ -150,9 +158,9 @@ func flattenToProm(internal string) (string, []Label, error) {
 				switch counter {
 				case "enabled", "ok", "rate_limited", "enforced":
 					labels = append(labels, Label{Key: "envoy_local_http_ratelimit_prefix", Value: prefix})
-					base = "envoy_http_local_rate_limit_" + counter
+					residual = "http_local_rate_limit." + counter
 					// Skip SN4 status-class collapse below (SN9 names don't have _Nxx suffix).
-					return base, labels, nil
+					return residual, labels, nil
 				}
 			}
 		}
@@ -187,12 +195,12 @@ func flattenToProm(internal string) (string, []Label, error) {
 					"response_incoming_total_size", "response_allowed_total_size",
 					"request_pending", "request_incoming_size", "request_allowed_size",
 					"response_pending", "response_incoming_size", "response_allowed_size":
-					// Inline-prefix shape: NO label promotion. The full
-					// dot→underscore substitution produces the Prometheus base.
-					base = "envoy_" + strings.ReplaceAll(internal, ".", "_")
+					// Inline-prefix shape: NO label promotion. The whole name is
+					// the residual (the uniform projection does the dot→underscore).
+					residual = internal
 					// Skip SN4 status-class collapse (bandwidth_limit names
 					// do not carry _Nxx suffixes).
-					return base, nil, nil
+					return residual, nil, nil
 				}
 			}
 		}
@@ -236,9 +244,9 @@ func flattenToProm(internal string) (string, []Label, error) {
 				(strings.HasSuffix(rest, ".allowed") || strings.HasSuffix(rest, ".denied") ||
 					strings.HasSuffix(rest, ".shadow_allowed") || strings.HasSuffix(rest, ".shadow_denied")) {
 				labels = append(labels, Label{Key: "envoy_rbac_prefix", Value: prefix})
-				base = "envoy_" + strings.ReplaceAll(rest, ".", "_")
+				residual = rest
 				// Skip SN4 status-class collapse (rbac names have no _Nxx suffix).
-				return base, labels, nil
+				return residual, labels, nil
 			}
 		}
 		// Phase-28.1 zookeeper_proxy INLINE-PREFIX detection (ADR-0222; parent AMEND-A4;
@@ -257,8 +265,8 @@ func flattenToProm(internal string) (string, []Label, error) {
 		if idx := strings.Index(internal, zkSegment); idx > 0 {
 			prefix := internal[:idx]
 			if !strings.ContainsRune(prefix, '.') {
-				base = "envoy_" + strings.ReplaceAll(internal, ".", "_")
-				return base, nil, nil
+				residual = internal
+				return residual, nil, nil
 			}
 		}
 		// Phase-29.1 mongo_proxy TAG-EXTRACTOR (ADR-0224; parent AMEND-B2 + 29.1
@@ -281,9 +289,9 @@ func flattenToProm(internal string) (string, []Label, error) {
 				if !strings.ContainsRune(prefix, '.') {
 					labels = append(labels, Label{Key: "envoy_mongo_prefix", Value: prefix})
 					tail = hoistMongoDynamicSegments(tail, &labels)
-					base = "envoy_mongo_" + strings.ReplaceAll(tail, ".", "_")
+					residual = "mongo." + tail
 					sort.Slice(labels, func(i, j int) bool { return labels[i].Key < labels[j].Key })
-					return base, labels, nil
+					return residual, labels, nil
 				}
 			}
 		}
@@ -296,8 +304,8 @@ func flattenToProm(internal string) (string, []Label, error) {
 		// label; the whole name flattens). KEEP-IN-SYNC:
 		// internal/filter/network/kafkabroker/stats.go.
 		if rest, ok := strings.CutPrefix(internal, "kafka."); ok {
-			base = "envoy_kafka_" + strings.ReplaceAll(rest, ".", "_")
-			return base, nil, nil // empty labels (no hoist)
+			residual = "kafka." + rest
+			return residual, nil, nil // empty labels (no hoist)
 		}
 		// Phase-32.2 redis_proxy SINGLE-label HOIST (ADR-0229; AMEND-R4; the mongo
 		// .rbac. ADR-0218 single-label promotion generalized to a redis. ROOT prefix).
@@ -317,8 +325,8 @@ func flattenToProm(internal string) (string, []Label, error) {
 				prefix, tail := rest[:idx], rest[idx+1:]
 				if !strings.ContainsRune(prefix, '.') {
 					labels = append(labels, Label{Key: "envoy_redis_prefix", Value: prefix})
-					base = "envoy_redis_" + strings.ReplaceAll(tail, ".", "_")
-					return base, labels, nil
+					residual = "redis." + tail
+					return residual, labels, nil
 				}
 			}
 		}
@@ -334,21 +342,37 @@ func flattenToProm(internal string) (string, []Label, error) {
 				prefix, tail := rest[:idx], rest[idx+1:]
 				if !strings.ContainsRune(prefix, '.') {
 					labels = append(labels, Label{Key: "envoy_thrift_prefix", Value: prefix})
-					base = "envoy_thrift_" + strings.ReplaceAll(tail, ".", "_")
-					return base, labels, nil
+					residual = "thrift." + tail
+					return residual, labels, nil
 				}
 			}
 		}
 		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
 	}
 
-	// Rule SN4: detect the trailing _Nxx and split.
-	if m := statusClassRE.FindStringSubmatch(base); m != nil {
-		base = m[1] + "_xx"
+	// Rule SN4: detect the trailing _Nxx and split (operates on the residual).
+	if m := statusClassRE.FindStringSubmatch(residual); m != nil {
+		residual = m[1] + "_xx"
 		labels = append([]Label{{Key: "envoy_response_code_class", Value: m[2]}}, labels...)
 	}
 
-	return base, labels, nil
+	return residual, labels, nil
+}
+
+// flattenToProm transforms an internal hierarchical-dotted name to the Prometheus
+// exposition form (envoy_-prefixed, dots→underscores) per Rules SN1–SN9. It is a
+// thin projection over ExtractTags: a valid Prometheus name has no dots, so the
+// uniform "envoy_" + dots→underscores projection over the residual is
+// byte-identical to the former per-arm base-building (name_test.go is the guard).
+//
+// Returns the Prometheus base name + the extracted label set + nil on success.
+// Returns "", nil, error on names that match no top-level rule.
+func flattenToProm(internal string) (string, []Label, error) {
+	residual, labels, err := ExtractTags(internal)
+	if err != nil {
+		return "", nil, err
+	}
+	return "envoy_" + strings.ReplaceAll(residual, ".", "_"), labels, nil
 }
 
 // hoistMongoDynamicSegments extracts the cmd/collection/callsite label tokens

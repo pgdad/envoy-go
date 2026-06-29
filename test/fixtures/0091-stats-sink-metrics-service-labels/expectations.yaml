@@ -1,0 +1,106 @@
+# Phase 47.2b fixture 0091-stats-sink-metrics-service-labels expectations (ADR-0019
+# — prose; the driver is the enforcer via AssertStats; this file is documentation).
+#
+# This fixture proves emit_tags_as_labels:true end-to-end on the landed 47.1/47.2a
+# metrics_service stats sink. It clones the 0090 topology and replaces 0090's
+# delta-SUM==K assertion with the CUMULATIVE last-seen value==K invariant keyed by
+# {residual dotted name, sorted envoy.<tag> LabelPairs}.
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process MetricsService gRPC receiver):
+#   l_test (hcm_local)  — one downstream HTTP/1.1 listener; route prefix "/" →
+#                         cluster c_backend (HTTPFixedBody, 17-byte body).
+#   c_backend           — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_metrics           — driver-owned in-process MetricsService receiver
+#                         (test/helpers/metricsservice/) on a driver-allocated
+#                         stable port, bound 0.0.0.0:<port>. The cluster carries the
+#                         mandatory http2_protocol_options:{} for gRPC framing +
+#                         plaintext h2c (D-MS-RECEIVER-WIRING — no TLS).
+#
+# A bootstrap-level stats_sinks[] metrics_service entry (transport_api_version V3,
+# emit_tags_as_labels:true) on BOTH sides names c_metrics + a SHORT
+# stats_flush_interval (500ms). Each side snapshots its stats registry every flush
+# and streams it as io.prometheus.client.MetricFamily protos (identifier{node} on
+# msg #1). Under the labels knob each stat name is split per the statsd SN tag
+# rules into a RESIDUAL dotted name plus a set of metric[].label[] LabelPairs,
+# each keyed by the Envoy DOTTED tag-name (envoy.<tag>). COUNTER values stay the
+# CUMULATIVE absolute (== K after K 2xx requests) — there is NO delta-SUM and NO
+# post-convergence stability barrier (those are 47.2a/0090-only).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process). node{id,cluster} FIXED identically on both sides.
+#
+# ## Two private per-side receivers + hard Close() (as-built; not a shared receiver)
+#
+# The metrics_service sink flushes PERIODICALLY — the reference proxy keeps
+# streaming into its receiver for the whole test, including during the subject's
+# drive window. A single shared receiver would let the reference's concurrent
+# flushes contaminate the subject snapshot (and silently defeat subject-side
+# deliberate breaks). So the driver starts TWO private receivers — one per side —
+# on two separately-allocated host ports, both bound 0.0.0.0 BEFORE either proxy
+# starts. Each side owns an uncontaminated accumulator, so NO Reset() between
+# sides is needed. After the subject snapshot BOTH receivers are hard-stopped via
+# Close() (grpc.Server.Stop) — NOT Stop()/GracefulStop, which would block on the
+# proxies' long-lived StreamMetrics streams until the test timeout.
+#
+# ## Workload + release barrier
+#
+# Each side fires K = 7 deterministic GET /probe requests (Host: metrics.example,
+# UA: metrics-probe/1; all 2xx). The driver POLLS that side's private receiver
+# until the deterministic label-keyed COUNTER subset's last-seen VALUE reaches
+# == 7 == K (FamilyWithLabels), AND the identifier node has arrived — a release
+# barrier (reference_concurrency_differential_release_barrier; the proxy flushes
+# the cumulative counter value every stats_flush_interval; poll not sleep). The
+# cumulative-value model needs only first-reach-K (no stability barrier).
+#
+# ## Label-set ordering NORMALIZED (sorted-key comparison)
+#
+# FamilyWithLabels compares the queried labels against the received label set in
+# SORTED key order, so the LabelPair emission order is not load-bearing
+# cross-side. The composite key {residual name, sorted labels} also separates
+# families sharing a residual but differing by label value (e.g.
+# cluster.upstream_rq_total for both c_backend and c_metrics).
+#
+# ## Framing NOT asserted (reference_streaming_sink_differential_framing)
+#
+# The cross-side assertion is on the AGGREGATED label-keyed MetricFamily value
+# subset — NOT the StreamMetrics message/stream framing, per-message family count,
+# connection count, or flush cadence, which legitimately vary side-to-side.
+#
+# ## Asserted (cross-side EXACT on the deterministic label-keyed COUNTER SUBSET, both sides)
+#
+# AMEND-MS-HISTOGRAM-PRESENT: a label-keyed SUBSET, NOT the whole family set (the
+# surfaces differ cross-side — envoy-go has no histograms; the reference does).
+# upstream_cx_total is EXCLUDED (connection reuse makes it < K).
+#
+#   For each {residual, labels} entry in the subset:
+#     cluster.upstream_rq_total  {envoy.cluster_name=c_backend}
+#     http.downstream_rq_total   {envoy.http_conn_manager_prefix=hcm_local}
+#     http.downstream_rq_xx      {envoy.http_conn_manager_prefix=hcm_local,
+#                                 envoy.response_code_class=2}  (the 2xx two-label SN4 split)
+#   on BOTH sides:
+#     present  (decode ran — a zero-family pass is structurally impossible)
+#     type     == COUNTER
+#     value    == 7  (== K; the CUMULATIVE last-seen value, NOT a delta-SUM)
+#   Identifier node (StreamMetricsMessage.identifier.node on msg #1):
+#     id      == "envoy-go-subject-0091"  (cross-side EXACT)
+#     cluster == "envoy-go-differential"  (cross-side EXACT)
+#
+# ## UNasserted (vary side-to-side / impl-specific / non-deterministic)
+#
+#   The WHOLE family set / family count (surfaces differ — envoy-go has no
+#       histograms; lazy-instantiation grows the count).
+#   metric[].timestamp_ms VALUE (flush wall-clock — non-deterministic;
+#       AMEND-MS-TIMESTAMP-ALWAYS-SET — presence required, value unasserted).
+#   help (empty both sides).
+#   LABELED gauges (server.uptime, *_active, connection churn — non-deterministic).
+#   The identifier user_agent_* / extensions[] (impl-specific).
+#   StreamMetrics message/stream framing + per-message family count.
+#   The LabelPair EMISSION ORDER (normalized via sorted-key comparison).
+#
+# Cross-refs: phase 47.2b SPEC + ADR-0264 + ADR-0263 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_concurrency_differential_release_barrier +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_stats_sink_metrics_service_probe.
