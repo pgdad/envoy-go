@@ -1,3 +1,9 @@
+=== AUTONOMOUS LOOP CONTROL (read FIRST) ===
+This file is a SELF-ADVANCING router for driving the project forward one stage at a time. Each session performs EXACTLY ONE lifecycle stage of the active phase (BRAINSTORM → SPEC → PLAN → IMPL — one stage per session, the project discipline), lands it (commit + push per `feedback_push_to_origin`), then ROLLS THIS FILE FORWARD to point at the next stage. To use it to implement the next phase: read `docs/envoy-go/STATE.md` for the recorded NEXT, perform that one stage (the concrete action is spelled out below), land it, and re-roll this file to the following stage.
+
+TERMINATION SENTINEL: if — and ONLY if — ALL work is complete (every chartered ROADMAP row/phase is `done`, the active phase is fully landed, and STATE.md's NEXT shows there is NO next stage left to perform), create an empty file named `stop` at the git root with `: > /home/esa/git/envoy-go/stop` and EXIT without further action. While ANY stage remains — as NOW: the **47.1 SPEC is pending**, so tasks are NOT complete — do NOT create `stop`; perform the stage described below.
+==============================================
+
 RESUME a fresh session for envoy-go (router last updated 2026-06-29; the **phase 47 (stats-sink metrics_service) BRAINSTORM is DONE and LANDED** — docs-only direct-on-master, committed + pushed to origin). Phase 47 is the **FOURTH Observability-family row** (`stats-sink-metrics-service`); the family STAYS OPEN. **ROW 47 registers `in-progress`** (flips `done` at the FINAL leg 47.2 IMPL per ADR-0106 + `reference_roadmap_split_phase_row_done`). The next action is the **47.1 (core) SPEC**.
 
 HEAD is the phase-47 BRAINSTORM docs commit atop the 46.2 IMPL squash `2e176d0b`. **Re-read the shas with `git log --oneline -6`, do NOT assume.** Confirm `git status` clean (the untracked `.claude/` is session cruft, leave it) + master == origin/master.
