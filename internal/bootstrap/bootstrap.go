@@ -213,6 +213,13 @@ const (
 // SPEC §11 live-verified string.
 var metricsServiceTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.MetricsServiceConfig{}).ProtoReflect().Descriptor().FullName())
 
+// statsdSinkTypeURL is the typed_config TypeURL for the statsd UDP stats sink
+// (envoy.config.metrics.v3.StatsdSink). DERIVED from the proto descriptor (the
+// metricsServiceTypeURL precedent — reference_network_filter_typeurl_extensions);
+// the StatsdSink type resolves at the already-imported metricsconfigv3 package
+// (config/metrics/v3, v1.32.4). A test asserts it equals the SPEC §11 string.
+var statsdSinkTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.StatsdSink{}).ProtoReflect().Descriptor().FullName())
+
 // AccessLogConfig is the parsed-but-not-yet-opened representation of one
 // envoy.access_loggers.file entry from HCM access_log[]. The sink itself is
 // constructed in cmd/envoy-go/main.go after Load returns; this struct carries
@@ -260,6 +267,19 @@ type OTLPConfig struct {
 	// Resource.attributes after the 4 built-in labels (surviving disable_builtin_labels
 	// — AMEND-OPS-5); nil when none.
 	ResourceAttributes []*commonpb.KeyValue
+}
+
+// StatsdSinkConfig is the parsed statsd UDP stats-sink config from one top-level
+// stats_sinks[] StatsdSink entry (ADR-0265). The sink (the StatsdSink + Flusher)
+// is constructed in cmd/envoy-go/main.go after Load returns; this struct carries
+// only the parse-time data. tcp_cluster_name is STRICT-REJECTED (UDP-only — the
+// reference boots statsd-over-TCP; ADR-0080); a missing statsd_specifier / nil
+// socket_address is a REFERENCE-PARITY reject; socket_address.protocol is
+// accepted-and-IGNORED (dial UDP regardless — rejecting the proto-default TCP(0)
+// would reject the omit case).
+type StatsdSinkConfig struct {
+	UDPAddress string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
+	Prefix     string // StatsdSink.prefix, default "envoy" when empty
 }
 
 // StatsSinkConfig is the parsed metrics_service stats-sink config from one
@@ -346,6 +366,15 @@ type Bootstrap struct {
 	// cmd/envoy-go/main.go after Load returns (and ONLY when this slice is
 	// non-empty — byte-stability, D-MS-FLUSH-INERT).
 	StatsSinkConfigs []StatsSinkConfig
+	// StatsdSinkConfigs is the parsed top-level stats_sinks[] statsd UDP sink
+	// entries (ADR-0265), in declaration order. Empty when no StatsdSink
+	// stats_sinks[] entry is configured. Per ADR-0265/ADR-0080: tcp_cluster_name
+	// and a missing statsd_specifier/socket_address are rejected at parse time.
+	// socket_address.protocol is accepted-and-ignored (dial UDP regardless).
+	// prefix defaults to "envoy" when empty. The StatsdSink is built in
+	// cmd/envoy-go/main.go after Load returns (and ONLY when this slice is
+	// non-empty).
+	StatsdSinkConfigs []StatsdSinkConfig
 	// FlushInterval is the stats_flush_interval (default 5s when absent/non-positive
 	// — D-MS-FLUSH). Parsed-and-stored even when no stats_sinks[] entry exists
 	// (inert in that case — D-MS-FLUSH-INERT); the Flusher uses it only when
@@ -427,11 +456,17 @@ func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 		if tc == nil {
 			return fmt.Errorf("bootstrap: stats_sinks[%d]: missing typed_config", i)
 		}
-		if tc.GetTypeUrl() != metricsServiceTypeURL {
-			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports only the metrics_service sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL)
-		}
-		if err := parseMetricsServiceConfig(tc, i, result); err != nil {
-			return err
+		switch tc.GetTypeUrl() {
+		case metricsServiceTypeURL:
+			if err := parseMetricsServiceConfig(tc, i, result); err != nil {
+				return err
+			}
+		case statsdSinkTypeURL:
+			if err := parseStatsdSinkConfig(tc, i, result); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports the metrics_service sink %q and the statsd sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL, statsdSinkTypeURL)
 		}
 	}
 	return nil
@@ -468,6 +503,37 @@ func parseMetricsServiceConfig(tc *anypb.Any, idx int, result *Bootstrap) error 
 		ClusterName:            eg.GetClusterName(),
 		ReportCountersAsDeltas: msc.GetReportCountersAsDeltas().GetValue(),
 		EmitTagsAsLabels:       msc.GetEmitTagsAsLabels(),
+	})
+	return nil
+}
+
+// parseStatsdSinkConfig parses one statsd UDP stats sink typed_config and appends
+// a StatsdSinkConfig to result.StatsdSinkConfigs (ADR-0265). It STRICT-REJECTS
+// (ADR-0080): tcp_cluster_name (UDP-only this row — the reference boots statsd-
+// over-TCP). A missing statsd_specifier / nil socket_address is a REFERENCE-PARITY
+// reject (the reference PGV-rejects it). GetAddress() returns nil for BOTH a
+// missing oneof AND a tcp_cluster_name arm, so the tcp_cluster_name check runs
+// FIRST (distinct message). socket_address.protocol is accepted-and-IGNORED
+// (envoy-go dials UDP regardless). prefix defaults to "envoy" when empty.
+func parseStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
+	var sd metricsconfigv3.StatsdSink
+	if err := tc.UnmarshalTo(&sd); err != nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd typed_config: %w", idx, err)
+	}
+	if sd.GetTcpClusterName() != "" {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd tcp_cluster_name is not supported (envoy-go is UDP-only; configure address.socket_address)", idx)
+	}
+	sa := sd.GetAddress().GetSocketAddress()
+	if sa == nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd requires address.socket_address (statsd_specifier is required)", idx)
+	}
+	prefix := sd.GetPrefix()
+	if prefix == "" {
+		prefix = "envoy"
+	}
+	result.StatsdSinkConfigs = append(result.StatsdSinkConfigs, StatsdSinkConfig{
+		UDPAddress: fmt.Sprintf("%s:%d", sa.GetAddress(), sa.GetPortValue()),
+		Prefix:     prefix,
 	})
 	return nil
 }

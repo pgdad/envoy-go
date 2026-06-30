@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
@@ -482,6 +484,97 @@ func tryStartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string
 	// Surprising success path: the container DID come up. Return a cancel
 	// func that terminates it, and a nil err.
 	return func() { _ = c.Terminate(context.Background()) }, stderrBuf, nil
+}
+
+// HostGatewayIP returns the LITERAL IP a reference Envoy container reaches the
+// host at — the value Docker resolves the magic string "host-gateway" to (the
+// same endpoint the harness's ExtraHosts "host.docker.internal:host-gateway"
+// produces). On native Linux Docker that is the bridge gateway (e.g. 172.17.0.1);
+// on Docker Desktop it is the VM->host gateway (e.g. 192.168.65.2) and the bridge
+// IPAM gateway is NOT a usable substitute (it is the VM-internal bridge interface,
+// not the host where an in-process receiver binds). So we resolve it the only
+// portable way: run a throwaway container with the same host-gateway ExtraHosts
+// mapping and read what host.docker.internal resolves to inside it. The result is
+// a literal IP, so it can be baked into config that rejects hostnames (the statsd
+// UDP sink — AMEND-SD-REJECT; reference_docker_probe_bridge_network). A host
+// process bound 0.0.0.0:<port> is reachable from a reference container at this
+// IP:port (UDP datagrams included — verified at the phase-48 IMPL on Docker
+// Desktop).
+func HostGatewayIP(ctx context.Context) (string, error) {
+	cli, err := testcontainers.NewDockerClientWithOpts(ctx)
+	if err != nil {
+		return "", fmt.Errorf("host gateway ip: docker client: %w", err)
+	}
+	defer func() { _ = cli.Close() }()
+
+	// A minimal image with getent (musl coreutils). alpine:3 is the testcontainers
+	// convention and is already present in any environment that runs the suite.
+	const image = "alpine:3"
+	cfg := &container.Config{
+		Image:      image,
+		Entrypoint: []string{"getent", "hosts", "host.docker.internal"},
+		Tty:        true, // raw (non-multiplexed) stdout — no stdcopy demux needed
+	}
+	hostCfg := &container.HostConfig{
+		ExtraHosts: []string{"host.docker.internal:host-gateway"},
+	}
+	created, err := cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
+	if err != nil {
+		// The image may be absent — pull once and retry. (A cached image with no
+		// network reaches this only if create failed for another reason, which the
+		// retry surfaces verbatim.)
+		rc, perr := cli.ImagePull(ctx, image, dockertypes.ImagePullOptions{})
+		if perr != nil {
+			return "", fmt.Errorf("host gateway ip: pull %q: %w (create: %v)", image, perr, err)
+		}
+		_, _ = io.Copy(io.Discard, rc)
+		_ = rc.Close()
+		created, err = cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
+		if err != nil {
+			return "", fmt.Errorf("host gateway ip: create resolver container (image %q): %w", image, err)
+		}
+	}
+	defer func() {
+		_ = cli.ContainerRemove(context.Background(), created.ID, dockertypes.ContainerRemoveOptions{Force: true})
+	}()
+
+	if err := cli.ContainerStart(ctx, created.ID, dockertypes.ContainerStartOptions{}); err != nil {
+		return "", fmt.Errorf("host gateway ip: start resolver container: %w", err)
+	}
+
+	statusCh, errCh := cli.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
+	select {
+	case werr := <-errCh:
+		if werr != nil {
+			return "", fmt.Errorf("host gateway ip: wait resolver container: %w", werr)
+		}
+	case <-statusCh:
+	case <-ctx.Done():
+		return "", fmt.Errorf("host gateway ip: context done waiting for resolver: %w", ctx.Err())
+	}
+
+	logs, err := cli.ContainerLogs(ctx, created.ID, dockertypes.ContainerLogsOptions{ShowStdout: true})
+	if err != nil {
+		return "", fmt.Errorf("host gateway ip: resolver logs: %w", err)
+	}
+	defer func() { _ = logs.Close() }()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, logs); err != nil {
+		return "", fmt.Errorf("host gateway ip: read resolver logs: %w", err)
+	}
+
+	// `getent hosts host.docker.internal` prints "<ip>\thost.docker.internal ...";
+	// the first whitespace-delimited field is the resolved literal IP.
+	out := strings.TrimSpace(buf.String())
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", fmt.Errorf("host gateway ip: resolver produced no output (host.docker.internal unresolved)")
+	}
+	ip := fields[0]
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("host gateway ip: resolver output %q is not a valid IP (full output: %q)", ip, out)
+	}
+	return ip, nil
 }
 
 // tryStartSubjectProxy is the NON-t.Fatalf-ing variant of StartSubjectProxy

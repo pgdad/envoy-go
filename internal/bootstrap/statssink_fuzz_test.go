@@ -107,7 +107,7 @@ stats_sinks:
         envoy_grpc:
           cluster_name: ""
 `))
-	// sibling StatsdSink TypeURL (reject)
+	// statsd tcp_cluster_name (UDP-only reject)
 	f.Add([]byte(head + `stats_sinks:
   - name: envoy.stat_sinks.statsd
     typed_config:

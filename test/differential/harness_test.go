@@ -168,6 +168,40 @@ func freeTCPPort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+// TestHostGatewayIP verifies that HostGatewayIP returns a non-empty literal IP
+// string parseable by net.ParseIP. Skipped if Docker is unavailable (mirrors
+// the ensureDocker socket-probe pattern at :64-79).
+func TestHostGatewayIP(t *testing.T) {
+	// Skip — not fail — if Docker is unavailable; the controller re-runs on a
+	// live-Docker host.
+	paths := []string{
+		"/var/run/docker.sock",
+		os.Getenv("HOME") + "/.docker/desktop/docker.sock",
+	}
+	dockerAvailable := false
+	for _, p := range paths {
+		if conn, err := net.Dial("unix", p); err == nil {
+			_ = conn.Close()
+			dockerAvailable = true
+			break
+		}
+	}
+	if !dockerAvailable {
+		t.Skip("docker unavailable: no reachable socket — skipping TestHostGatewayIP")
+	}
+
+	ip, err := HostGatewayIP(context.Background())
+	if err != nil {
+		t.Fatalf("HostGatewayIP: %v", err)
+	}
+	if ip == "" {
+		t.Fatalf("HostGatewayIP returned empty string")
+	}
+	if net.ParseIP(ip) == nil {
+		t.Errorf("HostGatewayIP returned %q which is not a valid IP address", ip)
+	}
+}
+
 // TestAcceptHTTP503Counting verifies the in-process always-503 responder
 // (phase 40.1 / fixture 0069) returns 503 Service Unavailable with a
 // "backend-<idx>:<seg>" attribution body over a loopback listener.

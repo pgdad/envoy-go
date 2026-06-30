@@ -177,26 +177,40 @@ func main() {
 		}
 	}()
 
-	// Phase 47.1 (ADR-0262): the metrics_service stats sink. Built when a
-	// stats_sinks[] metrics_service entry is present, reusing the hoisted dialer.
+	// Phase 47.1 (ADR-0262) + Phase 48 (ADR-0265): the stats sinks (metrics_service
+	// and statsd) feed the SAME statsSinks slice + Flusher. Built when EITHER sink
+	// kind is present, reusing the hoisted dialer for metrics_service.
 	// The *statssink.MetricsServiceSink does NOT satisfy accesslog.Sink
 	// (Submit(batch []*dto.MetricFamily) vs Submit(r any)), so the sinks are
 	// collected in their OWN statsSinks slice + closed via a dedicated defer.
 	// The Flusher is BUILT here (pre-Freeze) but Start()ed only AFTER
 	// bs.Stats.Freeze() so the Walk snapshot is over the frozen registry
-	// (D-MS-FLUSH-INERT: when StatsSinkConfigs is empty, statsFlusher stays nil
+	// (D-MS-FLUSH-INERT: when both config slices are empty, statsFlusher stays nil
 	// and NO flush goroutine starts — byte-stability).
 	var statsFlusher *statssink.Flusher
 	var statsSinks []statssink.Sink
 	flusherDone := make(chan struct{})
-	if len(bs.StatsSinkConfigs) > 0 {
-		node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
-		for _, cfg := range bs.StatsSinkConfigs {
-			client, err := grpcclient.NewMetricsServiceClient(dialer, cfg.ClusterName)
-			if err != nil {
-				log.Fatalf("statssink: metrics_service client for cluster %q: %v", cfg.ClusterName, err)
+	if len(bs.StatsSinkConfigs) > 0 || len(bs.StatsdSinkConfigs) > 0 {
+		if len(bs.StatsSinkConfigs) > 0 {
+			node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
+			for _, cfg := range bs.StatsSinkConfigs {
+				client, err := grpcclient.NewMetricsServiceClient(dialer, cfg.ClusterName)
+				if err != nil {
+					log.Fatalf("statssink: metrics_service client for cluster %q: %v", cfg.ClusterName, err)
+				}
+				statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, node, cfg.ReportCountersAsDeltas, cfg.EmitTagsAsLabels))
 			}
-			statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, node, cfg.ReportCountersAsDeltas, cfg.EmitTagsAsLabels))
+		}
+		// Phase 48 (ADR-0265): the statsd UDP stats sink. NewStatsdSink dials a
+		// connected UDP socket; a resolve/dial error is a fatal boot failure (the
+		// metrics_service-client precedent). Synchronous (no goroutine), so it adds
+		// no background mutator to the shutdown drain.
+		for _, cfg := range bs.StatsdSinkConfigs {
+			sink, err := statssink.NewStatsdSink(cfg.UDPAddress, cfg.Prefix)
+			if err != nil {
+				log.Fatalf("statssink: statsd sink for %q: %v", cfg.UDPAddress, err)
+			}
+			statsSinks = append(statsSinks, sink)
 		}
 		statsFlusher = statssink.NewFlusher(bs.Stats, bs.FlushInterval, statsSinks)
 	}

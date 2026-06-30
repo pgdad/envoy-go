@@ -1,0 +1,115 @@
+# Phase 48 fixture 0092-stats-sink-statsd expectations (ADR-0019 — prose; the
+# driver is the enforcer via AssertStats; this file is documentation).
+#
+# This fixture proves the statsd UDP line-protocol stats sink end-to-end:
+# cross-side EXACT (subject envoy-go vs reference Envoy contrib-v1.37.2 in
+# Docker) on a deterministic COUNTER NAME SUBSET (prefix-joined:
+# <prefix>.<name>), asserting the per-flush DELTA-SUM model. PLUS the absolute
+# GAUGE subset (cluster.<backend>.membership_total == 1).
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process statsdrecv UDP receivers):
+#   l_test (hcm_local)  — one downstream HTTP/1.1 listener; route prefix "/" →
+#                         cluster c_backend (HTTPFixedBody, 17-byte body).
+#   c_backend           — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   statsd receiver     — driver-owned in-process statsdrecv.Server on a
+#                         driver-allocated UDP port, bound 0.0.0.0:<port> so the
+#                         Docker reference container can send datagrams to the
+#                         host via the bridge gateway IP (HostGatewayIP).
+#
+# A bootstrap-level stats_sinks[] statsd entry (StatsdSink TypeURL, UDP address,
+# prefix) on BOTH sides + stats_flush_interval: 0.5s. Each flush the proxy sends
+# one UDP datagram per metric line (<prefix>.<name>:<delta>|c for counters;
+# <prefix>.<name>:<abs>|g for gauges). NO node field is needed — statsd carries
+# no proxy identifier.
+#
+# ## Two private per-side receivers + hard Close() (as-built)
+#
+# The statsd sink flushes PERIODICALLY — the reference proxy keeps sending to its
+# receiver for the whole test, including during the subject's drive window
+# (reference_periodic_sink_differential_two_receivers). A single shared receiver
+# would let the reference's concurrent datagrams contaminate the subject snapshot
+# (and silently defeat subject-side deliberate breaks). So the driver starts TWO
+# private UDP receivers — one per side — on two separately-allocated host ports,
+# both bound 0.0.0.0 BEFORE either proxy starts. Each side owns an
+# uncontaminated accumulator (no Reset() needed). After the subject snapshot BOTH
+# receivers are hard-stopped via Close() — UDP is connectionless, so Close is
+# unambiguous (no GracefulStop-vs-hard-stop distinction).
+#
+# ## Reference statsd address: LITERAL HostGatewayIP (not host.docker.internal)
+#
+# The reference Envoy bootstrap is templated with the Docker bridge gateway IP
+# (HostGatewayIP — the LITERAL IP returned by Docker NetworkInspect on the
+# "bridge" network) as the statsd UDP address. The statsd sink does NOT perform
+# DNS resolution, so host.docker.internal cannot be used (AMEND-SD-REJECT;
+# reference_docker_probe_bridge_network). The host process binds 0.0.0.0:<port>
+# and is reachable from the reference container at <HostGatewayIP>:<port>.
+# The subject bootstrap uses 127.0.0.1:<subjStatsdPort> (loopback).
+#
+# ## Workload + release barrier
+#
+# Each side fires K = 7 deterministic GET /probe requests (Host: statsd.example,
+# UA: statsd-probe/1; all 2xx). The driver POLLS that side's private receiver
+# until the deterministic COUNTER subset's per-flush deltas SUM to == 7
+# (DeltaSum — the release barrier; never a fixed sleep,
+# reference_concurrency_differential_release_barrier).
+#
+# ## Post-convergence stability barrier (the delta invariant; catches the breaks)
+#
+# A single-window request burst makes the FIRST post-request flush emit
+# delta = 7 − 0 = 7, INDISTINGUISHABLE from a broken absolute = 7. The
+# delta-vs-absolute distinction only manifests in post-convergence stability.
+# After the delta-SUM converges to K, the driver observes >= 2 further flushes
+# (awaitFurtherFlushes, riding on the receiver's SeenCount(marker) per-name
+# flush counter — a release barrier on the flush ticker, NOT a sleep) and
+# snapshots only then, asserting the SUM is STILL K. Under correct deltas the
+# now-idle counters emit a 0-delta |c line each flush so the SUM stays K (PASS);
+# an absolute (or un-latched) sink re-adds the cumulative every flush so the SUM
+# OVERSHOOTS K (snapshot > K → assert fails). This is what makes the deliberate
+# emit-absolute / skip-the-latch breaks catchable (reference_delta_sink_differential_stability_barrier).
+#
+# ## Per-datagram framing NOT asserted
+#
+# The cross-side assertion is on the AGGREGATED delta-SUM per counter name across
+# all datagrams received — NOT the per-datagram framing, line count per datagram,
+# datagram count, or flush cadence, which legitimately vary side-to-side. The
+# reference Envoy emits one line per datagram (§11); envoy-go follows the same
+# convention but the assertion is framing-agnostic (split-on-newline in the
+# receiver's ingest).
+#
+# ## Asserted (cross-side EXACT on the deterministic COUNTER NAME SUBSET +
+#              absolute GAUGE subset, both sides)
+#
+# This is a name-SUBSET, NOT the whole datagram/line set (the surfaces differ
+# cross-side — the reference emits many more lines including |ms timer histograms
+# that envoy-go lacks). Names are PREFIX-JOINED: the receiver keys on the full
+# <prefix>.<name> line.
+#
+#   For each name in the counter subset:
+#     sdpfx.cluster.c_backend.upstream_rq_total
+#     sdpfx.http.hcm_local.downstream_rq_total
+#     sdpfx.http.hcm_local.downstream_rq_2xx
+#   on BOTH sides:
+#     present  (decode ran — a zero-datagram pass is structurally impossible)
+#     delta-SUM == 7  (== K; the SUM of per-flush |c deltas across datagrams,
+#                      reference_delta_sink_differential_stability_barrier)
+#   Absolute gauge (D-SD-GAUGE-SUBSET):
+#     sdpfx.cluster.c_backend.membership_total  == 1  (one backend endpoint)
+#
+# ## UNasserted (vary side-to-side / impl-specific / non-deterministic)
+#
+#   The WHOLE datagram/line set (the reference emits many more lines including
+#       |ms timer histograms that envoy-go lacks; lazy-instantiation grows the
+#       set over time).
+#   Non-deterministic gauges (server.uptime, *_active, connection churn).
+#   Per-datagram framing + line order + datagram count per flush.
+#   |ms timer lines (histogram side-channel; envoy-go has no histograms).
+#   The proxy identifier (statsd has none — no node field).
+#   Flush cadence / connection count (UDP is connectionless).
+#
+# Cross-refs: phase 48 SPEC + ADR-0265 + D-SD-DELTA/GAUGE-SUBSET +
+#             reference_delta_sink_differential_stability_barrier +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_concurrency_differential_release_barrier +
+#             reference_docker_probe_bridge_network.

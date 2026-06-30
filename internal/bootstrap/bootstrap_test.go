@@ -1684,8 +1684,9 @@ static_resources:
 // is the live-verified string used to build the test fixtures).
 const metricsServiceType = "type.googleapis.com/envoy.config.metrics.v3.MetricsServiceConfig"
 
-// statsdSinkType is a SIBLING stats sink TypeURL — STRICT-REJECTED (envoy-go
-// supports only the metrics_service sink).
+// statsdSinkType is the TypeURL for the statsd UDP stats sink — SUPPORTED as of
+// phase 48 (ADR-0265). It is the live-verified string that matches the
+// descriptor-derived statsdSinkTypeURL in bootstrap.go.
 const statsdSinkType = "type.googleapis.com/envoy.config.metrics.v3.StatsdSink"
 
 // statsBootstrap wraps an arbitrary top-level YAML body (e.g. stats_sinks: ...,
@@ -1858,14 +1859,17 @@ func TestStatsSink_Rejects(t *testing.T) {
 			errSubs: []string{"bootstrap:", "cluster_name"},
 		},
 		{
-			name: "sibling_statsd_sink",
+			// Now that statsd IS a supported sink, the sibling-reject is for an unknown
+			// sink type (e.g. DogStatsdSink). The error names BOTH supported sinks.
+			name: "sibling_unknown_sink",
 			topLevel: `stats_sinks:
-  - name: envoy.stat_sinks.statsd
+  - name: envoy.stat_sinks.dog_statsd
     typed_config:
-      "@type": ` + statsdSinkType + `
-      tcp_cluster_name: statsd
+      "@type": type.googleapis.com/envoy.config.metrics.v3.DogStatsdSink
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
 `,
-			errSubs: []string{"bootstrap:", statsdSinkType, metricsServiceType},
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd"},
 		},
 		{
 			name: "stats_flush_on_admin",
@@ -1964,6 +1968,148 @@ func TestStatsSink_AcceptEmitTagsAsLabels(t *testing.T) {
 			}
 			if got := bs.StatsSinkConfigs[0].EmitTagsAsLabels; got != tc.want {
 				t.Errorf("EmitTagsAsLabels = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Phase 48: statsd UDP stats sink parse arm (ADR-0265)
+// ----------------------------------------------------------------------------
+
+// TestStatsdSink_TypeURLConstant guards against a proto-package rename: the
+// descriptor-derived statsdSinkTypeURL must equal the live-verified string
+// (reference_network_filter_typeurl_extensions / verify-typeurl-via-descriptor).
+func TestStatsdSink_TypeURLConstant(t *testing.T) {
+	const want = "type.googleapis.com/envoy.config.metrics.v3.StatsdSink"
+	if statsdSinkTypeURL != want {
+		t.Errorf("statsdSinkTypeURL: got %q, want %q", statsdSinkTypeURL, want)
+	}
+}
+
+// TestStatsdSink_AcceptUDPWithPrefix: a statsd sink with a UDP socket_address
+// and an explicit prefix ⇒ 1 StatsdSinkConfig with UDPAddress and Prefix;
+// StatsSinkConfigs stays empty.
+func TestStatsdSink_AcceptUDPWithPrefix(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+      prefix: myprefix
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsdSinkConfigs); got != 1 {
+		t.Fatalf("StatsdSinkConfigs: got %d, want 1", got)
+	}
+	want := StatsdSinkConfig{UDPAddress: "127.0.0.1:8125", Prefix: "myprefix"}
+	if got := bs.StatsdSinkConfigs[0]; got != want {
+		t.Errorf("StatsdSinkConfigs[0]: got %+v, want %+v", got, want)
+	}
+	if got := len(bs.StatsSinkConfigs); got != 0 {
+		t.Errorf("StatsSinkConfigs: got %d, want 0", got)
+	}
+}
+
+// TestStatsdSink_AcceptDefaultPrefix: omitting prefix ⇒ Prefix defaults to "envoy".
+func TestStatsdSink_AcceptDefaultPrefix(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsdSinkConfigs); got != 1 {
+		t.Fatalf("StatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got := bs.StatsdSinkConfigs[0].Prefix; got != "envoy" {
+		t.Errorf("Prefix: got %q, want %q", got, "envoy")
+	}
+	if got := bs.StatsdSinkConfigs[0].UDPAddress; got != "127.0.0.1:8125" {
+		t.Errorf("UDPAddress: got %q, want %q", got, "127.0.0.1:8125")
+	}
+}
+
+// TestStatsdSink_AcceptProtocolTCPIgnored: protocol: TCP on a socket_address is
+// accepted-and-ignored; envoy-go always dials UDP.
+func TestStatsdSink_AcceptProtocolTCPIgnored(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125, protocol: TCP}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsdSinkConfigs); got != 1 {
+		t.Fatalf("StatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got := bs.StatsdSinkConfigs[0].UDPAddress; got != "127.0.0.1:8125" {
+		t.Errorf("UDPAddress: got %q, want %q", got, "127.0.0.1:8125")
+	}
+}
+
+// TestStatsdSink_Rejects covers each statsd strict-reject arm.
+func TestStatsdSink_Rejects(t *testing.T) {
+	cases := []struct {
+		name     string
+		topLevel string
+		errSubs  []string
+	}{
+		{
+			name: "tcp_cluster_name",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: statsd
+`,
+			errSubs: []string{"bootstrap:", "tcp_cluster_name", "UDP-only"},
+		},
+		{
+			name: "missing_statsd_specifier",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      prefix: x
+`,
+			errSubs: []string{"bootstrap:", "socket_address", "statsd_specifier"},
+		},
+		{
+			name: "sibling_unknown_typeurl",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": type.googleapis.com/envoy.config.metrics.v3.DogStatsdSink
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+`,
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(statsBootstrap(tc.topLevel)))
+			if err == nil {
+				t.Fatalf("Load: want error for %s, got nil", tc.name)
+			}
+			for _, sub := range tc.errSubs {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error should contain %q: %q", sub, err.Error())
+				}
 			}
 		})
 	}
