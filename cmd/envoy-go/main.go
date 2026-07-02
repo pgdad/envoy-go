@@ -177,9 +177,10 @@ func main() {
 		}
 	}()
 
-	// Phase 47.1 (ADR-0262) + Phase 48 (ADR-0265): the stats sinks (metrics_service
-	// and statsd) feed the SAME statsSinks slice + Flusher. Built when EITHER sink
-	// kind is present, reusing the hoisted dialer for metrics_service.
+	// Phase 47.1 (ADR-0262) + Phase 48 (ADR-0265) + Phase 49 (ADR-0266): the stats
+	// sinks (metrics_service, statsd, and dog_statsd) feed the SAME statsSinks
+	// slice + Flusher. Built when ANY of the three sink kinds is present, reusing
+	// the hoisted dialer for metrics_service.
 	// The *statssink.MetricsServiceSink does NOT satisfy accesslog.Sink
 	// (Submit(batch []*dto.MetricFamily) vs Submit(r any)), so the sinks are
 	// collected in their OWN statsSinks slice + closed via a dedicated defer.
@@ -190,7 +191,7 @@ func main() {
 	var statsFlusher *statssink.Flusher
 	var statsSinks []statssink.Sink
 	flusherDone := make(chan struct{})
-	if len(bs.StatsSinkConfigs) > 0 || len(bs.StatsdSinkConfigs) > 0 {
+	if len(bs.StatsSinkConfigs) > 0 || len(bs.StatsdSinkConfigs) > 0 || len(bs.DogStatsdSinkConfigs) > 0 {
 		if len(bs.StatsSinkConfigs) > 0 {
 			node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
 			for _, cfg := range bs.StatsSinkConfigs {
@@ -209,6 +210,18 @@ func main() {
 			sink, err := statssink.NewStatsdSink(cfg.UDPAddress, cfg.Prefix)
 			if err != nil {
 				log.Fatalf("statssink: statsd sink for %q: %v", cfg.UDPAddress, err)
+			}
+			statsSinks = append(statsSinks, sink)
+		}
+		// Phase 49 (ADR-0266): the dog_statsd UDP stats sink with tags.
+		// NewDogStatsdSink dials a SECOND, independent connected UDP socket; a
+		// resolve/dial error is a fatal boot failure (the StatsdSink precedent).
+		// Synchronous (no goroutine), so it adds no background mutator to the
+		// shutdown drain.
+		for _, cfg := range bs.DogStatsdSinkConfigs {
+			sink, err := statssink.NewDogStatsdSink(cfg.UDPAddress, cfg.Prefix)
+			if err != nil {
+				log.Fatalf("statssink: dog_statsd sink for %q: %v", cfg.UDPAddress, err)
 			}
 			statsSinks = append(statsSinks, sink)
 		}

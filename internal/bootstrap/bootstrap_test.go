@@ -1859,17 +1859,20 @@ func TestStatsSink_Rejects(t *testing.T) {
 			errSubs: []string{"bootstrap:", "cluster_name"},
 		},
 		{
-			// Now that statsd IS a supported sink, the sibling-reject is for an unknown
-			// sink type (e.g. DogStatsdSink). The error names BOTH supported sinks.
+			// Now that metrics_service, statsd, AND dog_statsd are all supported sinks,
+			// the sibling-reject is for a genuinely unknown-but-real sink type
+			// (envoy.config.metrics.v3.HystrixSink, which no dispatch arm handles —
+			// a fabricated TypeURL fails earlier at protojson Any-resolution, before
+			// parseStatsSinks ever runs, so this must be a REAL registered message).
+			// The error names ALL THREE supported sinks.
 			name: "sibling_unknown_sink",
 			topLevel: `stats_sinks:
-  - name: envoy.stat_sinks.dog_statsd
+  - name: envoy.stat_sinks.hystrix
     typed_config:
-      "@type": type.googleapis.com/envoy.config.metrics.v3.DogStatsdSink
-      address:
-        socket_address: {address: 127.0.0.1, port_value: 8125}
+      "@type": type.googleapis.com/envoy.config.metrics.v3.HystrixSink
+      num_buckets: 10
 `,
-			errSubs: []string{"bootstrap:", "metrics_service", "statsd"},
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd"},
 		},
 		{
 			name: "stats_flush_on_admin",
@@ -2089,15 +2092,219 @@ func TestStatsdSink_Rejects(t *testing.T) {
 			errSubs: []string{"bootstrap:", "socket_address", "statsd_specifier"},
 		},
 		{
+			// Now that metrics_service, statsd, AND dog_statsd are all supported sinks,
+			// the sibling-reject is for a genuinely unknown-but-real sink type
+			// (envoy.config.metrics.v3.HystrixSink, which no dispatch arm handles —
+			// a fabricated TypeURL fails earlier at protojson Any-resolution, before
+			// parseStatsSinks ever runs, so this must be a REAL registered message).
+			// The error names ALL THREE supported sinks.
 			name: "sibling_unknown_typeurl",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.hystrix
+    typed_config:
+      "@type": type.googleapis.com/envoy.config.metrics.v3.HystrixSink
+      num_buckets: 10
+`,
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(statsBootstrap(tc.topLevel)))
+			if err == nil {
+				t.Fatalf("Load: want error for %s, got nil", tc.name)
+			}
+			for _, sub := range tc.errSubs {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error should contain %q: %q", sub, err.Error())
+				}
+			}
+		})
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Phase 49: dog_statsd UDP stats sink WITH TAGS parse arm (ADR-0266)
+// ----------------------------------------------------------------------------
+
+// dogStatsdSinkType is the TypeURL for the dog_statsd UDP stats sink with tags
+// — SUPPORTED as of phase 49 (ADR-0266). It is the live-verified string that
+// matches the descriptor-derived dogStatsdSinkTypeURL in bootstrap.go.
+const dogStatsdSinkType = "type.googleapis.com/envoy.config.metrics.v3.DogStatsdSink"
+
+// TestDogStatsdSink_TypeURLConstant guards against a proto-package rename: the
+// descriptor-derived dogStatsdSinkTypeURL must equal the live-verified string
+// (reference_network_filter_typeurl_extensions / verify-typeurl-via-descriptor).
+func TestDogStatsdSink_TypeURLConstant(t *testing.T) {
+	const want = "type.googleapis.com/envoy.config.metrics.v3.DogStatsdSink"
+	if dogStatsdSinkTypeURL != want {
+		t.Errorf("dogStatsdSinkTypeURL: got %q, want %q", dogStatsdSinkTypeURL, want)
+	}
+}
+
+// TestDogStatsdSink_AcceptUDPWithPrefix: a dog_statsd sink with a UDP
+// socket_address and an explicit prefix ⇒ 1 DogStatsdSinkConfig with UDPAddress
+// and Prefix; StatsSinkConfigs/StatsdSinkConfigs stay empty.
+func TestDogStatsdSink_AcceptUDPWithPrefix(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+      prefix: myprefix
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Fatalf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	want := DogStatsdSinkConfig{UDPAddress: "127.0.0.1:8125", Prefix: "myprefix"}
+	if got := bs.DogStatsdSinkConfigs[0]; got != want {
+		t.Errorf("DogStatsdSinkConfigs[0]: got %+v, want %+v", got, want)
+	}
+	if got := len(bs.StatsSinkConfigs); got != 0 {
+		t.Errorf("StatsSinkConfigs: got %d, want 0", got)
+	}
+	if got := len(bs.StatsdSinkConfigs); got != 0 {
+		t.Errorf("StatsdSinkConfigs: got %d, want 0", got)
+	}
+}
+
+// TestDogStatsdSink_AcceptDefaultPrefix: omitting prefix ⇒ Prefix defaults to
+// "envoy".
+func TestDogStatsdSink_AcceptDefaultPrefix(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Fatalf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got := bs.DogStatsdSinkConfigs[0].Prefix; got != "envoy" {
+		t.Errorf("Prefix: got %q, want %q", got, "envoy")
+	}
+	if got := bs.DogStatsdSinkConfigs[0].UDPAddress; got != "127.0.0.1:8125" {
+		t.Errorf("UDPAddress: got %q, want %q", got, "127.0.0.1:8125")
+	}
+}
+
+// TestDogStatsdSink_AcceptProtocolTCPIgnored: protocol: TCP on a socket_address
+// is accepted-and-ignored; envoy-go always dials UDP.
+func TestDogStatsdSink_AcceptProtocolTCPIgnored(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125, protocol: TCP}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Fatalf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got := bs.DogStatsdSinkConfigs[0].UDPAddress; got != "127.0.0.1:8125" {
+		t.Errorf("UDPAddress: got %q, want %q", got, "127.0.0.1:8125")
+	}
+}
+
+// TestDogStatsdSink_AcceptCoexistingAllThreeSinks: metrics_service + statsd +
+// dog_statsd all in one stats_sinks[] list ⇒ each populates its OWN config
+// slice, no cross-contamination.
+func TestDogStatsdSink_AcceptCoexistingAllThreeSinks(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.metrics_service
+    typed_config:
+      "@type": ` + metricsServiceType + `
+      transport_api_version: V3
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8126}
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsSinkConfigs); got != 1 {
+		t.Errorf("StatsSinkConfigs: got %d, want 1", got)
+	}
+	if got := len(bs.StatsdSinkConfigs); got != 1 {
+		t.Errorf("StatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Errorf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.StatsdSinkConfigs[0].UDPAddress, "127.0.0.1:8126"; got != want {
+		t.Errorf("StatsdSinkConfigs[0].UDPAddress: got %q, want %q", got, want)
+	}
+	if got, want := bs.DogStatsdSinkConfigs[0].UDPAddress, "127.0.0.1:8125"; got != want {
+		t.Errorf("DogStatsdSinkConfigs[0].UDPAddress: got %q, want %q", got, want)
+	}
+}
+
+// TestDogStatsdSink_Rejects covers each dog_statsd strict-reject arm.
+func TestDogStatsdSink_Rejects(t *testing.T) {
+	cases := []struct {
+		name     string
+		topLevel string
+		errSubs  []string
+	}{
+		{
+			name: "max_bytes_per_datagram",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.dog_statsd
     typed_config:
-      "@type": type.googleapis.com/envoy.config.metrics.v3.DogStatsdSink
+      "@type": ` + dogStatsdSinkType + `
       address:
         socket_address: {address: 127.0.0.1, port_value: 8125}
+      max_bytes_per_datagram: 512
 `,
-			errSubs: []string{"bootstrap:", "metrics_service", "statsd"},
+			errSubs: []string{"bootstrap:", "max_bytes_per_datagram"},
+		},
+		{
+			name: "missing_dog_statsd_specifier",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      prefix: x
+`,
+			errSubs: []string{"bootstrap:", "socket_address", "dog_statsd_specifier"},
+		},
+		{
+			// A genuinely unknown-but-real sink type (HystrixSink, so protojson can
+			// resolve the Any before parseStatsSinks's default arm rejects it) now
+			// names ALL THREE supported sinks.
+			name: "sibling_unknown_typeurl",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.hystrix
+    typed_config:
+      "@type": type.googleapis.com/envoy.config.metrics.v3.HystrixSink
+      num_buckets: 10
+`,
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd"},
 		},
 	}
 	for _, tc := range cases {

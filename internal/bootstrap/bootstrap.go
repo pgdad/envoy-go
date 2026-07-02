@@ -220,6 +220,14 @@ var metricsServiceTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.Me
 // (config/metrics/v3, v1.32.4). A test asserts it equals the SPEC §11 string.
 var statsdSinkTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.StatsdSink{}).ProtoReflect().Descriptor().FullName())
 
+// dogStatsdSinkTypeURL is the typed_config TypeURL for the dog_statsd UDP stats
+// sink with tags (envoy.config.metrics.v3.DogStatsdSink). DERIVED from the proto
+// descriptor (the metricsServiceTypeURL/statsdSinkTypeURL precedent —
+// reference_network_filter_typeurl_extensions); the DogStatsdSink type resolves
+// at the already-imported metricsconfigv3 package (config/metrics/v3, v1.32.4).
+// A test asserts it equals the SPEC §11 string.
+var dogStatsdSinkTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.DogStatsdSink{}).ProtoReflect().Descriptor().FullName())
+
 // AccessLogConfig is the parsed-but-not-yet-opened representation of one
 // envoy.access_loggers.file entry from HCM access_log[]. The sink itself is
 // constructed in cmd/envoy-go/main.go after Load returns; this struct carries
@@ -280,6 +288,19 @@ type OTLPConfig struct {
 type StatsdSinkConfig struct {
 	UDPAddress string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
 	Prefix     string // StatsdSink.prefix, default "envoy" when empty
+}
+
+// DogStatsdSinkConfig is the parsed dog_statsd UDP stats-sink config from one
+// top-level stats_sinks[] DogStatsdSink entry (ADR-0266). The sink (the
+// DogStatsdSink + Flusher) is constructed in cmd/envoy-go/main.go after Load
+// returns; this struct carries only the parse-time data. An EXPLICITLY set
+// max_bytes_per_datagram is STRICT-REJECTED (the reference HONORS it with real
+// multi-metric batching; envoy-go emits one metric per datagram this row); a
+// missing dog_statsd_specifier / nil socket_address is a REFERENCE-PARITY
+// reject; socket_address.protocol is accepted-and-IGNORED (dial UDP regardless).
+type DogStatsdSinkConfig struct {
+	UDPAddress string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
+	Prefix     string // DogStatsdSink.prefix, default "envoy" when empty
 }
 
 // StatsSinkConfig is the parsed metrics_service stats-sink config from one
@@ -375,6 +396,15 @@ type Bootstrap struct {
 	// cmd/envoy-go/main.go after Load returns (and ONLY when this slice is
 	// non-empty).
 	StatsdSinkConfigs []StatsdSinkConfig
+	// DogStatsdSinkConfigs is the parsed top-level stats_sinks[] dog_statsd UDP
+	// sink entries (ADR-0266), in declaration order. Empty when no DogStatsdSink
+	// stats_sinks[] entry is configured. Per ADR-0266/ADR-0080: an EXPLICITLY set
+	// max_bytes_per_datagram and a missing dog_statsd_specifier/socket_address are
+	// rejected at parse time. socket_address.protocol is accepted-and-ignored
+	// (dial UDP regardless). prefix defaults to "envoy" when empty. The
+	// DogStatsdSink is built in cmd/envoy-go/main.go after Load returns (and ONLY
+	// when this slice is non-empty).
+	DogStatsdSinkConfigs []DogStatsdSinkConfig
 	// FlushInterval is the stats_flush_interval (default 5s when absent/non-positive
 	// — D-MS-FLUSH). Parsed-and-stored even when no stats_sinks[] entry exists
 	// (inert in that case — D-MS-FLUSH-INERT); the Flusher uses it only when
@@ -465,8 +495,12 @@ func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 			if err := parseStatsdSinkConfig(tc, i, result); err != nil {
 				return err
 			}
+		case dogStatsdSinkTypeURL:
+			if err := parseDogStatsdSinkConfig(tc, i, result); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports the metrics_service sink %q and the statsd sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL, statsdSinkTypeURL)
+			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports the metrics_service sink %q, the statsd sink %q, and the dog_statsd sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL, statsdSinkTypeURL, dogStatsdSinkTypeURL)
 		}
 	}
 	return nil
@@ -532,6 +566,40 @@ func parseStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 		prefix = "envoy"
 	}
 	result.StatsdSinkConfigs = append(result.StatsdSinkConfigs, StatsdSinkConfig{
+		UDPAddress: fmt.Sprintf("%s:%d", sa.GetAddress(), sa.GetPortValue()),
+		Prefix:     prefix,
+	})
+	return nil
+}
+
+// parseDogStatsdSinkConfig parses one dog_statsd UDP stats sink typed_config and
+// appends a DogStatsdSinkConfig to result.DogStatsdSinkConfigs (ADR-0266). It
+// STRICT-REJECTS (ADR-0080): an EXPLICITLY set max_bytes_per_datagram (the
+// reference HONORS it with real multi-metric newline-batched datagrams — a
+// genuine, deferred feature, not a no-op; envoy-go is one-metric-per-datagram
+// only this row). A missing dog_statsd_specifier / nil socket_address is a
+// REFERENCE-PARITY reject (the reference PGV-rejects it). UNLIKE StatsdSink,
+// DogStatsdSink's oneof has ONLY the address member — no tcp_cluster_name-shaped
+// sibling arm to check first (simpler ordering than parseStatsdSinkConfig's).
+// socket_address.protocol is accepted-and-IGNORED. prefix defaults to "envoy"
+// when empty.
+func parseDogStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
+	var dsd metricsconfigv3.DogStatsdSink
+	if err := tc.UnmarshalTo(&dsd); err != nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd typed_config: %w", idx, err)
+	}
+	if dsd.GetMaxBytesPerDatagram() != nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd max_bytes_per_datagram is not supported (envoy-go emits one metric per datagram)", idx)
+	}
+	sa := dsd.GetAddress().GetSocketAddress()
+	if sa == nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd requires address.socket_address (dog_statsd_specifier is required)", idx)
+	}
+	prefix := dsd.GetPrefix()
+	if prefix == "" {
+		prefix = "envoy"
+	}
+	result.DogStatsdSinkConfigs = append(result.DogStatsdSinkConfigs, DogStatsdSinkConfig{
 		UDPAddress: fmt.Sprintf("%s:%d", sa.GetAddress(), sa.GetPortValue()),
 		Prefix:     prefix,
 	})

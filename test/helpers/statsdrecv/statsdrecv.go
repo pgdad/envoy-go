@@ -9,30 +9,71 @@ package statsdrecv
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 )
 
-// Server reads statsd line-protocol UDP datagrams (<prefix>.<name>:<value>|<type>)
-// and accumulates, per full dotted name: the running SUM of every |c (counter)
-// value (DeltaSum — under the always-delta statsd counter model the per-flush
-// deltas sum to the cumulative total, == K after K requests), the last-seen |g
-// (gauge) absolute value (Gauge), and the datagram COUNT (SeenCount). Because the
-// sink emits exactly one datagram per metric name per flush, SeenCount(name) is
-// the number of flushes that included name — the delta stability-barrier signal
-// (an idle counter's 0-delta |c line still increments SeenCount). Goroutine-safe
-// via an RWMutex (the reader goroutine writes; the poll/assert surface reads)
-// under the -race detector.
+// Server reads statsd/DogStatsd line-protocol UDP datagrams
+// (<prefix>.<name>:<value>|<type>[|#tag1:val1,...]) and accumulates, per full
+// wire name: the running SUM of every |c (counter) value (DeltaSum — under
+// the always-delta statsd counter model the per-flush deltas sum to the
+// cumulative total, == K after K requests), the last-seen |g (gauge) absolute
+// value (Gauge), and the datagram COUNT (SeenCount). Because the sink emits
+// exactly one datagram per metric name per flush, SeenCount(name) is the
+// number of flushes that included name — the delta stability-barrier signal
+// (an idle counter's 0-delta |c line still increments SeenCount).
+//
+// A DogStatsd sink's tag-hoisting (stats.ExtractTags — SN1/SN2 hoist e.g. a
+// cluster/HCM-prefix identifier OUT of the name and into a tag) means a single
+// WIRE NAME can legitimately carry MULTIPLE, DISTINCT tag-variants — e.g. a
+// bootstrap's admin interface has its OWN internal http_conn_manager stats
+// under stat_prefix "admin", which collapses to the SAME residual wire name
+// (e.g. "http.downstream_rq_total") as a test listener's stat_prefix, differing
+// only by the envoy.http_conn_manager_prefix tag VALUE. A plain per-name SUM
+// (DeltaSum) or per-name last-seen tag set (Tags) is therefore ambiguous/
+// cross-contaminated whenever more than one tag-variant shares a name (e.g.
+// the admin interface's own startup readiness-probe traffic bleeds into a
+// test listener's counter of the same wire name). DeltaSumTagged disambiguates
+// by requiring an EXACT tag-set match, accumulating a SEPARATE running sum per
+// (name, tag-signature) pair.
 type Server struct {
 	conn *net.UDPConn
 
-	mu        sync.RWMutex
-	deltaSums map[string]float64 // |c running sum per name
-	gauges    map[string]float64 // |g last-seen per name
-	seen      map[string]int     // datagram count per name
+	mu         sync.RWMutex
+	deltaSums  map[string]float64            // |c running sum per name (ALL tag-variants combined)
+	sumsByTags map[string]map[string]float64 // |c running sum per name, keyed further by tagSignature — disambiguates same-name/different-tag lines (e.g. admin vs test-listener HCM instances)
+	gauges     map[string]float64            // |g last-seen per name
+	seen       map[string]int                // datagram count per name
+	tags       map[string]map[string]string  // last-seen |# tag set per name
 
 	closeOnce sync.Once
+}
+
+// tagSignature builds a canonical, order-independent string key for a tag map
+// (sorted "k1=v1,k2=v2"; "" for a nil/empty map — a tagless line) so distinct
+// tag-variants of the same wire name accumulate into separate DeltaSumTagged
+// buckets.
+func tagSignature(tags map[string]string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(tags[k])
+	}
+	return b.String()
 }
 
 // NewAtAddr binds a UDP listener on the caller-supplied host:port (e.g.
@@ -50,10 +91,12 @@ func NewAtAddr(addr string) (*Server, error) {
 		return nil, fmt.Errorf("statsdrecv: listen %q: %w", addr, err)
 	}
 	s := &Server{
-		conn:      conn,
-		deltaSums: make(map[string]float64),
-		gauges:    make(map[string]float64),
-		seen:      make(map[string]int),
+		conn:       conn,
+		deltaSums:  make(map[string]float64),
+		sumsByTags: make(map[string]map[string]float64),
+		gauges:     make(map[string]float64),
+		seen:       make(map[string]int),
+		tags:       make(map[string]map[string]string),
 	}
 	go s.readLoop()
 	return s, nil
@@ -73,9 +116,15 @@ func (s *Server) readLoop() {
 	}
 }
 
-// ingest parses each newline-delimited statsd line in one datagram (the reference
-// emits one line per datagram — §11 — but split-on-newline is robust to batching)
-// and updates the accumulators. Malformed lines are skipped.
+// ingest parses each newline-delimited DogStatsd/statsd line in one datagram
+// (<name>:<value>|<type>[|#tag1:val1,...]) and updates the accumulators.
+// Malformed lines/segments are skipped, never fatal. REVISED (phase 49) from a
+// last-colon split (correct only for a tagless statsd line) to a first-pipe-
+// then-colon split: neither name nor value contains '|', so the FIRST '|'
+// unambiguously separates "name:value" from "type[|#tags]" — a tagged line's
+// tag suffix contains its OWN colons, which the old last-colon split mis-took
+// for the name/value boundary. This degenerates to the EXACT prior behavior on
+// a tagless line (line-parser-extension delimiter-reuse gotcha).
 func (s *Server) ingest(b []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -84,38 +133,97 @@ func (s *Server) ingest(b []byte) {
 		if line == "" {
 			continue
 		}
-		colon := strings.LastIndexByte(line, ':')
+		pipe1 := strings.IndexByte(line, '|')
+		if pipe1 < 0 {
+			continue
+		}
+		head := line[:pipe1] // "name:value" — no '|' precedes here
+		colon := strings.LastIndexByte(head, ':')
 		if colon < 0 {
 			continue
 		}
-		name := line[:colon]
-		rest := line[colon+1:]
-		pipe := strings.IndexByte(rest, '|')
-		if pipe < 0 {
-			continue
-		}
-		val, err := strconv.ParseFloat(rest[:pipe], 64)
+		name := head[:colon]
+		val, err := strconv.ParseFloat(head[colon+1:], 64)
 		if err != nil {
 			continue
 		}
-		typ := rest[pipe+1:]
+		rest := line[pipe1+1:] // "type[|#tag1:val1,...]"
+		typ := rest
+		var lineTags map[string]string
+		if pipe2 := strings.IndexByte(rest, '|'); pipe2 >= 0 {
+			typ = rest[:pipe2]
+			tagPart := strings.TrimPrefix(rest[pipe2+1:], "#")
+			lineTags = make(map[string]string)
+			for _, pair := range strings.Split(tagPart, ",") {
+				if c := strings.IndexByte(pair, ':'); c >= 0 {
+					lineTags[pair[:c]] = pair[c+1:]
+				}
+			}
+		}
 		switch typ {
 		case "c":
 			s.deltaSums[name] += val
+			sig := tagSignature(lineTags)
+			byTag, ok := s.sumsByTags[name]
+			if !ok {
+				byTag = make(map[string]float64)
+				s.sumsByTags[name] = byTag
+			}
+			byTag[sig] += val
 			s.seen[name]++
 		case "g":
 			s.gauges[name] = val
 			s.seen[name]++
+		default:
+			continue
+		}
+		if lineTags != nil {
+			s.tags[name] = lineTags
 		}
 	}
 }
 
+// Tags returns the last-seen tag set for name (from its most recent |# suffix),
+// and ok=false if name was never seen with a tag suffix (a tagless line, or no
+// datagram for name at all).
+func (s *Server) Tags(name string) (map[string]string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.tags[name]
+	return t, ok
+}
+
 // DeltaSum returns the running SUM of every |c value received for name, and
-// ok=false if none was received.
+// ok=false if none was received. NOTE: this combines ALL tag-variants sharing
+// the name — see DeltaSumTagged when the name is ambiguous across variants
+// (e.g. a wire name also emitted by the admin interface's own HCM instance).
 func (s *Server) DeltaSum(name string) (sum float64, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sum, ok = s.deltaSums[name]
+	return
+}
+
+// DeltaSumTagged returns the running SUM of |c values received for name WHOSE
+// tag suffix EXACTLY matches tags (order-independent), and ok=false if no
+// datagram for (name, tags) was ever received. This disambiguates multiple
+// tag-variants sharing the same wire name — e.g. a bootstrap's admin
+// interface has its own internal http_conn_manager stats (stat_prefix
+// "admin") that collapse, via stats.ExtractTags's SN2 hoist, to the SAME
+// residual wire name as a test listener's own stat_prefix (differing only in
+// the envoy.http_conn_manager_prefix tag VALUE); DeltaSum alone cannot tell
+// the two apart, but DeltaSumTagged(name, wantTags) only accumulates lines
+// whose tag set matches wantTags exactly, so an admin-interface line (or a
+// production bug that drops/mismatches tags) contributes ZERO to the wrong
+// bucket rather than silently inflating it.
+func (s *Server) DeltaSumTagged(name string, tags map[string]string) (sum float64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byTag, present := s.sumsByTags[name]
+	if !present {
+		return 0, false
+	}
+	sum, ok = byTag[tagSignature(tags)]
 	return
 }
 
@@ -140,8 +248,10 @@ func (s *Server) SeenCount(name string) int {
 func (s *Server) Reset() {
 	s.mu.Lock()
 	s.deltaSums = make(map[string]float64)
+	s.sumsByTags = make(map[string]map[string]float64)
 	s.gauges = make(map[string]float64)
 	s.seen = make(map[string]int)
+	s.tags = make(map[string]map[string]string)
 	s.mu.Unlock()
 }
 
