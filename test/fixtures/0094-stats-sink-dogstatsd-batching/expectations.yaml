@@ -1,0 +1,139 @@
+# Phase 50 fixture 0094-stats-sink-dogstatsd-batching expectations (ADR-0019 —
+# prose; the driver is the enforcer via AssertStats; this file is
+# documentation).
+#
+# This fixture proves the dog_statsd max_bytes_per_datagram REAL multi-metric
+# datagram BATCHING (ADR-0267), layered directly on top of the LANDED phase-49
+# dog_statsd sink WITH TAGS (0093-stats-sink-dogstatsd — this fixture reuses
+# ALL of that fixture's delta-SUM/tag-set/gauge subset proofs VERBATIM, plus
+# two NEW batching-specific proofs):
+#
+#   1. at least one datagram observed on each side carried MORE THAN ONE line
+#      (MaxLinesInAnyDatagram() > 1) — batching actually occurred, not just
+#      "the cap was configured and had no effect".
+#   2. the deliberately oversized envoy.cluster_name-tagged
+#      "<prefix>.cluster.upstream_rq_total" line was observed ALONE in its own
+#      datagram (LinesInDatagram(name) == (1, true)) on BOTH sides — an
+#      oversized single line is sent alone, with NO truncation, drop, or
+#      special-cased branch (SPEC-50 §3.3).
+#
+# ## D-DSDB-CAP: the byte-math design (computed EXACTLY, not hand-estimated)
+#
+# Computed via a throwaway t.Logf(len(...)) against the REAL production
+# formatTagSuffix/stats.ExtractTags code at Task 6 authoring time (see the
+# driver's package doc for the full table):
+#
+#   dsdbpfx.cluster.upstream_rq_total:7|c|#envoy.cluster_name:<172-char backendName> -> 230 bytes
+#   dsdbpfx.cluster.membership_total:1|g|#envoy.cluster_name:<172-char backendName>  -> 229 bytes
+#   dsdbpfx.http.downstream_rq_total:7|c|#envoy.http_conn_manager_prefix:hcm_local   ->  78 bytes
+#   dsdbpfx.http.downstream_rq_xx:7|c|#envoy.response_code_class:2,envoy.http_conn_manager_prefix:hcm_local -> 103 bytes
+#
+# maxBytesPerDatagram = 200. The two envoy.cluster_name-tagged lines (230/229
+# bytes) EACH ALONE exceed the cap -> ALWAYS flushed alone (appendLine flushes
+# any prior buffer content before accepting an oversized line into a fresh,
+# empty buffer; the very next line after an oversized one trivially exceeds the
+# cap too, forcing another flush before it is appended -- this holds regardless
+# of registry walk order). The two envoy.http_conn_manager_prefix-tagged lines
+# (78/103 bytes) are comfortably under the cap -- even together with the "\n"
+# separator (78+1+103 = 182 <= 200) they fit in ONE datagram, and in practice
+# co-batch with each other and the many other short envoy-go/reference
+# self-stat lines that flush every interval. The 172-char backendName (vs the
+# ~160-char PLAN estimate) needed NO adjustment -- confirmed live: reference
+# observed MaxLinesInAnyDatagram() == 4, subject observed == 2 (both > 1), and
+# the cluster-tagged line's LinesInDatagram == 1 on BOTH sides.
+#
+# ## Everything else is the 0093 design, UNCHANGED by batching
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process statsdrecv UDP receivers, extended in phase 50 Task 5 with
+# MaxLinesInAnyDatagram()/LinesInDatagram(name) accessors):
+#   l_test (hcm_local)  — one downstream HTTP/1.1 listener; route prefix "/" →
+#                         cluster <172-char backendName> (HTTPFixedBody,
+#                         17-byte body).
+#   <backendName>       — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   dog_statsd receiver — driver-owned in-process statsdrecv.Server on a
+#                         driver-allocated UDP port, bound 0.0.0.0:<port> so the
+#                         Docker reference container can send datagrams to the
+#                         host via the bridge gateway IP (HostGatewayIP).
+#
+# A bootstrap-level stats_sinks[] dog_statsd entry (DogStatsdSink TypeURL, UDP
+# address, prefix, an EXPLICIT max_bytes_per_datagram: 200) on BOTH sides +
+# stats_flush_interval: 0.5s. Each flush the proxy accumulates consecutive
+# formatted lines into a buffer and flushes it as ONE datagram whenever the
+# next line would strictly exceed the cap (a buffer landing EXACTLY at the cap
+# still fits). NO node field is needed — dog_statsd carries no proxy
+# identifier.
+#
+# The WIRE-name correction (dog_statsd applies stats.ExtractTags, UNLIKE the
+# plain statsd sink), the admin same-name collision fix (DeltaSumTagged, not
+# plain DeltaSum), the delta-SUM model + post-convergence stability barrier,
+# the two-private-receivers + hard Close() discipline, and the LOCAL
+# hostGatewayIP duplicate (import-cycle avoidance) are ALL cloned VERBATIM from
+# 0093 — see that fixture's expectations.yaml/README.md for the full
+# rationale, unaffected by batching (batching is a pure transport-layer
+# concern applied strictly AFTER a line string already exists).
+#
+# ## Workload + release barrier
+#
+# Each side fires K = 7 deterministic GET /probe requests (Host:
+# dogstatsd.example, UA: dogstatsd-probe/1; all 2xx). The driver POLLS that
+# side's private receiver until the deterministic COUNTER subset's per-flush
+# deltas SUM to == 7 (DeltaSumTagged — the release barrier; never a fixed
+# sleep), then awaits >= 2 further flushes (the stability barrier) before
+# snapshotting the delta-SUMs + tag sets + gauge + gauge tags + the two
+# batching-specific readings.
+#
+# ## Asserted (cross-side EXACT on the deterministic COUNTER WIRE-NAME subset +
+#              their tag SETS + the absolute GAUGE subset + its tag SET +
+#              the two batching-specific proofs, both sides)
+#
+# This is a name-SUBSET, NOT the whole datagram/line set (the surfaces differ
+# cross-side — the reference emits many more lines including |ms timer
+# histograms that envoy-go lacks). Names are the POST-EXTRACTION WIRE names,
+# prefix-joined: the receiver keys on the full <prefix>.<residual> line.
+#
+#   dsdbpfx.cluster.upstream_rq_total
+#     present, delta-SUM == 7, tags == {envoy.cluster_name: <backendName>}
+#   dsdbpfx.http.downstream_rq_total
+#     present, delta-SUM == 7, tags == {envoy.http_conn_manager_prefix: hcm_local}
+#   dsdbpfx.http.downstream_rq_xx
+#     present, delta-SUM == 7,
+#     tags == {envoy.response_code_class: "2", envoy.http_conn_manager_prefix: hcm_local}
+#
+#   Absolute gauge (D-DSD-GAUGE-SUBSET):
+#     dsdbpfx.cluster.membership_total == 1, tags == {envoy.cluster_name: <backendName>}
+#
+#   Batching (NEW, phase 50, ADR-0267):
+#     MaxLinesInAnyDatagram() > 1 (batching actually occurred)
+#     LinesInDatagram(dsdbpfx.cluster.upstream_rq_total) == (1, true)
+#       (the deliberately-oversized line stayed alone)
+#
+# ## UNasserted (vary side-to-side / impl-specific / non-deterministic)
+#
+#   The WHOLE datagram/line set (the reference emits many more lines including
+#       |ms timer histograms that envoy-go lacks; lazy-instantiation grows the
+#       set over time).
+#   Non-deterministic gauges (server.uptime, *_active, connection churn).
+#   Per-datagram framing + line ORDER within a datagram.
+#   The EXACT per-flush datagram COUNT or which specific OTHER lines co-batch
+#       with which — only "at least one multi-line datagram was observed" is
+#       asserted, not a precise packing schedule (the registry walk order and
+#       the full self-stat line set are not pinned cross-side).
+#   |ms timer lines (histogram side-channel; envoy-go has no histograms).
+#   The literal tag ORDER on the wire (asserted as an order-independent SET,
+#       even though the production formatter now matches the reference's
+#       natural order — reference_dogstatsd_tag_order_unsorted).
+#   The proxy identifier (dog_statsd has none — no node field).
+#   Flush cadence / connection count (UDP is connectionless).
+#
+# Cross-refs: phase 50 SPEC/PLAN + ADR-0267 + D-DSDB-CAP/SPLIT/STATS-FINAL +
+#             the phase-49 0093 fixture (cloned verbatim) +
+#             reference_dogstatsd_tag_order_unsorted +
+#             reference_delta_sink_differential_stability_barrier +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_concurrency_differential_release_barrier +
+#             reference_docker_probe_bridge_network +
+#             reference_host_gateway_ip_docker_desktop +
+#             reference_membership_total_vs_healthy_gauge +
+#             reference_differential_break_protocol_count1.

@@ -214,12 +214,13 @@ func main() {
 			statsSinks = append(statsSinks, sink)
 		}
 		// Phase 49 (ADR-0266): the dog_statsd UDP stats sink with tags.
+		// Phase 50 (ADR-0267): the batching cap is threaded through MaxBytesPerDatagram.
 		// NewDogStatsdSink dials a SECOND, independent connected UDP socket; a
 		// resolve/dial error is a fatal boot failure (the StatsdSink precedent).
 		// Synchronous (no goroutine), so it adds no background mutator to the
 		// shutdown drain.
 		for _, cfg := range bs.DogStatsdSinkConfigs {
-			sink, err := statssink.NewDogStatsdSink(cfg.UDPAddress, cfg.Prefix)
+			sink, err := statssink.NewDogStatsdSink(cfg.UDPAddress, cfg.Prefix, cfg.MaxBytesPerDatagram)
 			if err != nil {
 				log.Fatalf("statssink: dog_statsd sink for %q: %v", cfg.UDPAddress, err)
 			}

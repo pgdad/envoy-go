@@ -2272,18 +2272,6 @@ func TestDogStatsdSink_Rejects(t *testing.T) {
 		errSubs  []string
 	}{
 		{
-			name: "max_bytes_per_datagram",
-			topLevel: `stats_sinks:
-  - name: envoy.stat_sinks.dog_statsd
-    typed_config:
-      "@type": ` + dogStatsdSinkType + `
-      address:
-        socket_address: {address: 127.0.0.1, port_value: 8125}
-      max_bytes_per_datagram: 512
-`,
-			errSubs: []string{"bootstrap:", "max_bytes_per_datagram"},
-		},
-		{
 			name: "missing_dog_statsd_specifier",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.dog_statsd
@@ -2319,5 +2307,73 @@ func TestDogStatsdSink_Rejects(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestDogStatsdSink_AcceptMaxBytesPerDatagram512: max_bytes_per_datagram: 512
+// ⇒ MaxBytesPerDatagram == 512.
+func TestDogStatsdSink_AcceptMaxBytesPerDatagram512(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+      max_bytes_per_datagram: 512
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Fatalf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.DogStatsdSinkConfigs[0].MaxBytesPerDatagram, uint64(512); got != want {
+		t.Errorf("DogStatsdSinkConfigs[0].MaxBytesPerDatagram: got %d, want %d", got, want)
+	}
+}
+
+// TestDogStatsdSink_AcceptMaxBytesPerDatagramAbsent: missing max_bytes_per_datagram
+// ⇒ MaxBytesPerDatagram == 0 (absent-field default).
+func TestDogStatsdSink_AcceptMaxBytesPerDatagramAbsent(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Fatalf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.DogStatsdSinkConfigs[0].MaxBytesPerDatagram, uint64(0); got != want {
+		t.Errorf("DogStatsdSinkConfigs[0].MaxBytesPerDatagram: got %d, want %d", got, want)
+	}
+}
+
+// TestDogStatsdSink_AcceptMaxBytesPerDatagramZero: explicit max_bytes_per_datagram: 0
+// ⇒ MaxBytesPerDatagram == 0 (identical to absent — no special-cased validation).
+func TestDogStatsdSink_AcceptMaxBytesPerDatagramZero(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+      max_bytes_per_datagram: 0
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Fatalf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.DogStatsdSinkConfigs[0].MaxBytesPerDatagram, uint64(0); got != want {
+		t.Errorf("DogStatsdSinkConfigs[0].MaxBytesPerDatagram: got %d, want %d", got, want)
 	}
 }

@@ -41,12 +41,14 @@ import (
 type Server struct {
 	conn *net.UDPConn
 
-	mu         sync.RWMutex
-	deltaSums  map[string]float64            // |c running sum per name (ALL tag-variants combined)
-	sumsByTags map[string]map[string]float64 // |c running sum per name, keyed further by tagSignature — disambiguates same-name/different-tag lines (e.g. admin vs test-listener HCM instances)
-	gauges     map[string]float64            // |g last-seen per name
-	seen       map[string]int                // datagram count per name
-	tags       map[string]map[string]string  // last-seen |# tag set per name
+	mu                 sync.RWMutex
+	deltaSums          map[string]float64            // |c running sum per name (ALL tag-variants combined)
+	sumsByTags         map[string]map[string]float64 // |c running sum per name, keyed further by tagSignature — disambiguates same-name/different-tag lines (e.g. admin vs test-listener HCM instances)
+	gauges             map[string]float64            // |g last-seen per name
+	seen               map[string]int                // datagram count per name
+	tags               map[string]map[string]string  // last-seen |# tag set per name
+	maxLinesInDatagram int                           // Server-WIDE: the largest nlines observed in any ingested datagram
+	linesInDatagram    map[string]int                // last-seen per name: how many total lines were in the datagram that most recently carried this name
 
 	closeOnce sync.Once
 }
@@ -91,12 +93,13 @@ func NewAtAddr(addr string) (*Server, error) {
 		return nil, fmt.Errorf("statsdrecv: listen %q: %w", addr, err)
 	}
 	s := &Server{
-		conn:       conn,
-		deltaSums:  make(map[string]float64),
-		sumsByTags: make(map[string]map[string]float64),
-		gauges:     make(map[string]float64),
-		seen:       make(map[string]int),
-		tags:       make(map[string]map[string]string),
+		conn:            conn,
+		deltaSums:       make(map[string]float64),
+		sumsByTags:      make(map[string]map[string]float64),
+		gauges:          make(map[string]float64),
+		seen:            make(map[string]int),
+		tags:            make(map[string]map[string]string),
+		linesInDatagram: make(map[string]int),
 	}
 	go s.readLoop()
 	return s, nil
@@ -128,7 +131,8 @@ func (s *Server) readLoop() {
 func (s *Server) ingest(b []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -177,6 +181,11 @@ func (s *Server) ingest(b []byte) {
 		default:
 			continue
 		}
+		// Track batching: update max lines in any datagram and lines in datagram carrying this name
+		if n := len(lines); n > s.maxLinesInDatagram {
+			s.maxLinesInDatagram = n
+		}
+		s.linesInDatagram[name] = len(lines)
 		if lineTags != nil {
 			s.tags[name] = lineTags
 		}
@@ -191,6 +200,26 @@ func (s *Server) Tags(name string) (map[string]string, bool) {
 	defer s.mu.RUnlock()
 	t, ok := s.tags[name]
 	return t, ok
+}
+
+// MaxLinesInAnyDatagram returns the largest number of lines ever observed in a
+// single ingested datagram (Server-wide, not per-name) — the batching-occurred
+// proof for a max_bytes_per_datagram differential (phase 50, ADR-0267).
+func (s *Server) MaxLinesInAnyDatagram() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.maxLinesInDatagram
+}
+
+// LinesInDatagram returns how many total lines were in the datagram that MOST
+// RECENTLY carried name, and ok=false if name was never seen. Lets a
+// differential assert a specific line stayed ALONE (== 1) even when other
+// lines in the same flush co-batched (phase 50, ADR-0267).
+func (s *Server) LinesInDatagram(name string) (int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n, ok := s.linesInDatagram[name]
+	return n, ok
 }
 
 // DeltaSum returns the running SUM of every |c value received for name, and
@@ -252,6 +281,8 @@ func (s *Server) Reset() {
 	s.gauges = make(map[string]float64)
 	s.seen = make(map[string]int)
 	s.tags = make(map[string]map[string]string)
+	s.maxLinesInDatagram = 0
+	s.linesInDatagram = make(map[string]int)
 	s.mu.Unlock()
 }
 

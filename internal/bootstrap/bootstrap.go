@@ -293,14 +293,15 @@ type StatsdSinkConfig struct {
 // DogStatsdSinkConfig is the parsed dog_statsd UDP stats-sink config from one
 // top-level stats_sinks[] DogStatsdSink entry (ADR-0266). The sink (the
 // DogStatsdSink + Flusher) is constructed in cmd/envoy-go/main.go after Load
-// returns; this struct carries only the parse-time data. An EXPLICITLY set
-// max_bytes_per_datagram is STRICT-REJECTED (the reference HONORS it with real
-// multi-metric batching; envoy-go emits one metric per datagram this row); a
-// missing dog_statsd_specifier / nil socket_address is a REFERENCE-PARITY
-// reject; socket_address.protocol is accepted-and-IGNORED (dial UDP regardless).
+// returns; this struct carries only the parse-time data. The MaxBytesPerDatagram
+// field (phase-50, ADR-0267) is honored for real multi-metric batching (0 =
+// one metric per datagram, the phase-49 default); a missing dog_statsd_specifier
+// / nil socket_address is a REFERENCE-PARITY reject; socket_address.protocol is
+// accepted-and-IGNORED (dial UDP regardless).
 type DogStatsdSinkConfig struct {
-	UDPAddress string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
-	Prefix     string // DogStatsdSink.prefix, default "envoy" when empty
+	UDPAddress          string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
+	Prefix              string // DogStatsdSink.prefix, default "envoy" when empty
+	MaxBytesPerDatagram uint64 // NEW (ADR-0267): 0 (absent or explicit) means "one metric per datagram" (phase-49 behavior, UNCHANGED); >0 batches consecutive lines up to the cap
 }
 
 // StatsSinkConfig is the parsed metrics_service stats-sink config from one
@@ -574,22 +575,18 @@ func parseStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 
 // parseDogStatsdSinkConfig parses one dog_statsd UDP stats sink typed_config and
 // appends a DogStatsdSinkConfig to result.DogStatsdSinkConfigs (ADR-0266). It
-// STRICT-REJECTS (ADR-0080): an EXPLICITLY set max_bytes_per_datagram (the
-// reference HONORS it with real multi-metric newline-batched datagrams — a
-// genuine, deferred feature, not a no-op; envoy-go is one-metric-per-datagram
-// only this row). A missing dog_statsd_specifier / nil socket_address is a
-// REFERENCE-PARITY reject (the reference PGV-rejects it). UNLIKE StatsdSink,
-// DogStatsdSink's oneof has ONLY the address member — no tcp_cluster_name-shaped
-// sibling arm to check first (simpler ordering than parseStatsdSinkConfig's).
-// socket_address.protocol is accepted-and-IGNORED. prefix defaults to "envoy"
-// when empty.
+// parses the max_bytes_per_datagram field (ADR-0267, phase-50): 0 (absent or
+// explicit) means one metric per datagram (phase-49 behavior, UNCHANGED); >0
+// enables real multi-metric batching with the given byte cap. A missing
+// dog_statsd_specifier / nil socket_address is a REFERENCE-PARITY reject (the
+// reference PGV-rejects it). UNLIKE StatsdSink, DogStatsdSink's oneof has ONLY
+// the address member — no tcp_cluster_name-shaped sibling arm to check first
+// (simpler ordering than parseStatsdSinkConfig's). socket_address.protocol is
+// accepted-and-IGNORED. prefix defaults to "envoy" when empty.
 func parseDogStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 	var dsd metricsconfigv3.DogStatsdSink
 	if err := tc.UnmarshalTo(&dsd); err != nil {
 		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd typed_config: %w", idx, err)
-	}
-	if dsd.GetMaxBytesPerDatagram() != nil {
-		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd max_bytes_per_datagram is not supported (envoy-go emits one metric per datagram)", idx)
 	}
 	sa := dsd.GetAddress().GetSocketAddress()
 	if sa == nil {
@@ -600,8 +597,9 @@ func parseDogStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 		prefix = "envoy"
 	}
 	result.DogStatsdSinkConfigs = append(result.DogStatsdSinkConfigs, DogStatsdSinkConfig{
-		UDPAddress: fmt.Sprintf("%s:%d", sa.GetAddress(), sa.GetPortValue()),
-		Prefix:     prefix,
+		UDPAddress:          fmt.Sprintf("%s:%d", sa.GetAddress(), sa.GetPortValue()),
+		Prefix:              prefix,
+		MaxBytesPerDatagram: dsd.GetMaxBytesPerDatagram().GetValue(),
 	})
 	return nil
 }

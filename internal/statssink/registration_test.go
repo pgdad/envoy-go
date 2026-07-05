@@ -84,7 +84,7 @@ func TestNoNewStat_DogStatsdRegistrationGuard(t *testing.T) {
 
 	// The exact main.go construction shape: a DogStatsdSink over a UDP address,
 	// then a Flusher over the registry/interval/sinks.
-	sink, err := NewDogStatsdSink("127.0.0.1:65535", "envoy")
+	sink, err := NewDogStatsdSink("127.0.0.1:65535", "envoy", 0)
 	if err != nil {
 		t.Fatalf("NewDogStatsdSink: %v", err)
 	}
