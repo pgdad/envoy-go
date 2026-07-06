@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestCommandRoster_MatchesUpstream pins supportedCommandList against the SPEC

@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 const defaultChannelCapacity = 4096

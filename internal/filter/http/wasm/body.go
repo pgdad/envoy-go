@@ -71,8 +71,8 @@ package wasm
 import (
 	"context"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // proxyOnRequestBody is the byte-stable guest-export function name probed via

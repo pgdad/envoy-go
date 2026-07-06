@@ -35,7 +35,7 @@ import (
 	ratelimitfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ratelimit/v3"
 	"google.golang.org/protobuf/proto"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // -----------------------------------------------------------------------------

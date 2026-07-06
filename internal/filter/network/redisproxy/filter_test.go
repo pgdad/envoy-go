@@ -13,8 +13,8 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/esalaine/envoy-go/internal/filter/network"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func validAny(t *testing.T) *anypb.Any {

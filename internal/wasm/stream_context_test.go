@@ -18,7 +18,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // --- TestStreamContext_PerCallback_NoExportNoCap --------------------------

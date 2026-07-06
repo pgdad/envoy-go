@@ -13,7 +13,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"golang.org/x/net/http2/hpack"
 
-	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
+	filter_http "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 func TestDirectResponseAction_Do(t *testing.T) {

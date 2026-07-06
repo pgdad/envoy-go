@@ -99,8 +99,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
 )
 
 const (

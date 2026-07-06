@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
 )
 
 const fixtureName = "0001-tcp-proxy-rr"

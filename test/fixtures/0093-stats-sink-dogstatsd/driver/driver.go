@@ -109,9 +109,9 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/testcontainers/testcontainers-go"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
-	"github.com/esalaine/envoy-go/test/helpers/statsdrecv"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/helpers/statsdrecv"
 )
 
 const (

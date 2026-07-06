@@ -3,7 +3,7 @@ package driver
 import (
 	"testing"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
 )
 
 // TestBackendIdxFromBody_OK: both the HTTPEcho ("backend-<idx>:<seg>") and the

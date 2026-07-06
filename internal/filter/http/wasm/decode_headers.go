@@ -86,10 +86,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/filterstate"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/filterstate"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // logf is the package-level logger for decode/encode-side diagnostics.

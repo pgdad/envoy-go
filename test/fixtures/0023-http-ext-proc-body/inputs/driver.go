@@ -59,9 +59,9 @@ import (
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
-	"github.com/esalaine/envoy-go/test/helpers/extprocgrpc"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/helpers/extprocgrpc"
 )
 
 const (

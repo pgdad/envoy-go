@@ -11,9 +11,9 @@ import (
 	redis_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/filter/network"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // filter is the boot-parsed, per-listener-shared redis_proxy terminal filter. It

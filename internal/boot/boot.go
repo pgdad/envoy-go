@@ -1,7 +1,7 @@
 // Package boot builds the shared "construct everything, bind nothing" tail
 // of envoy-go's boot sequence: the three filter-type registries (HTTP,
 // listener, network) and the listener manager. Both cmd/envoy-go/main.go's
-// normal boot path and the public github.com/esalaine/envoy-go/validate
+// normal boot path and the public github.com/pgdad/envoy-go/validate
 // package call Construct, so the two can never silently diverge on what
 // "valid" means (phase 51, ADR-0268).
 package boot
@@ -13,21 +13,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/accesslog"
-	"github.com/esalaine/envoy-go/internal/bootstrap"
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/drain"
-	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
-	httpbuiltins "github.com/esalaine/envoy-go/internal/filter/http/builtins"
-	"github.com/esalaine/envoy-go/internal/filter/network"
-	"github.com/esalaine/envoy-go/internal/filter/network/builtins"
-	"github.com/esalaine/envoy-go/internal/grpcclient"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	"github.com/esalaine/envoy-go/internal/listener"
-	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
-	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
-	"github.com/esalaine/envoy-go/internal/stats"
-	"github.com/esalaine/envoy-go/internal/tracing"
+	"github.com/pgdad/envoy-go/internal/accesslog"
+	"github.com/pgdad/envoy-go/internal/bootstrap"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/drain"
+	filter_http "github.com/pgdad/envoy-go/internal/filter/http"
+	httpbuiltins "github.com/pgdad/envoy-go/internal/filter/http/builtins"
+	"github.com/pgdad/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/filter/network/builtins"
+	"github.com/pgdad/envoy-go/internal/grpcclient"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/listener"
+	"github.com/pgdad/envoy-go/internal/listener/listenerfilter"
+	"github.com/pgdad/envoy-go/internal/listener/listenerfilter/tls_inspector"
+	"github.com/pgdad/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/tracing"
 )
 
 // Construct builds the three filter-type registries (HTTP, listener,

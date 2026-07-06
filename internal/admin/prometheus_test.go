@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestHandlePrometheus_ContentType(t *testing.T) {

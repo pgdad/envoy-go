@@ -123,8 +123,8 @@ import (
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	internallua "github.com/esalaine/envoy-go/internal/lua"
-	"github.com/esalaine/envoy-go/internal/stats"
+	internallua "github.com/pgdad/envoy-go/internal/lua"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // statNameRegexLiteral is the byte-exact regex source used by

@@ -7,7 +7,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
+	"github.com/pgdad/envoy-go/internal/listener/listenerfilter"
 )
 
 // TypeURL is the proto type_url for the tls_inspector listener filter, per

@@ -12,10 +12,10 @@ import (
 	jwt_authnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	"github.com/esalaine/envoy-go/internal/jwks"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/jwks"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TypeURL is the canonical envoy.filters.http.jwt_authn typed_config type URL.

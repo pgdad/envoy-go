@@ -36,8 +36,8 @@ import (
 	ratelimitservicev3 "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // ----------------------------------------------------------------------------

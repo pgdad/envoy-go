@@ -8,8 +8,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	envoygotestpb "github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	envoygotestpb "github.com/pgdad/envoy-go/internal/filter/http/envoygotest/proto"
 )
 
 // TypeURL is the canonical envoy.filters.http.envoy_go_test typed_config type

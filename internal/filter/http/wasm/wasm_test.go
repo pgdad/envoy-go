@@ -27,8 +27,8 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // -----------------------------------------------------------------------------

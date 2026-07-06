@@ -61,7 +61,7 @@ import (
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // validLuaConfig returns a baseline Lua proto with a valid InlineString

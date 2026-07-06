@@ -54,8 +54,8 @@ import (
 	ratelimitfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ratelimit/v3"
 	ratelimitservicev3 "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // extractRawQueryFromPath returns the query-string portion of the request's

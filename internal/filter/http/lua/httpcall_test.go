@@ -35,10 +35,10 @@ import (
 	lua "github.com/yuin/gopher-lua"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // newHTTPCallBridgeFilter constructs a per-test *filter with the

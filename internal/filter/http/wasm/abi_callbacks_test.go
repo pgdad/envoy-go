@@ -76,11 +76,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/filterstate"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/filterstate"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // -----------------------------------------------------------------------------

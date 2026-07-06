@@ -15,8 +15,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 func mustAny(t *testing.T, m proto.Message) *anypb.Any {

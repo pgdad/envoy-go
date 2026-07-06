@@ -85,9 +85,9 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
 )
 
 // wasmHTTPDispatcher adapts the per-listener `*cluster.Manager` +

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // FuzzKafkaDecode is the 40th fuzzer (SPEC §15.1 Layer C). The Kafka decoder is

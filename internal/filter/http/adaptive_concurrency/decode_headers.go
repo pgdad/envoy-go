@@ -62,7 +62,7 @@ package adaptive_concurrency
 import (
 	"net/http"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // rqBlockedBody is the byte-pinned 25-byte response body per AMEND-6 +

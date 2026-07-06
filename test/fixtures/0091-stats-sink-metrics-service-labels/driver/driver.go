@@ -96,9 +96,9 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
-	"github.com/esalaine/envoy-go/test/helpers/metricsservice"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/helpers/metricsservice"
 )
 
 const (

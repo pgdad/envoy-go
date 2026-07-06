@@ -25,8 +25,8 @@ import (
 	gohttp "net/http"
 	"testing"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // newTrailersTestCompiledConfig is identical to newBodyTestCompiledConfig

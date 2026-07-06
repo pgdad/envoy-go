@@ -40,7 +40,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // newTestRegistry constructs a Registry for testing with a fresh

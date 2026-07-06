@@ -40,8 +40,8 @@ import (
 	"context"
 	gohttp "net/http"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // EncodeHeaders implements envoyhttp.StreamEncoderFilter per 25.2 SPEC §4.3.

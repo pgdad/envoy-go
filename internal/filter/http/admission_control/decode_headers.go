@@ -49,7 +49,7 @@ package admission_control
 import (
 	"net/http"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // DecodeHeaders is the request-gate entry per SPEC §6.4. Three-gate order:

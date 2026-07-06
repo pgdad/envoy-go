@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
 )
 
 // TestConstants pins the single-sourced workload constants (guards against the

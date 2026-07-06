@@ -49,7 +49,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
 )
 
 const fixtureName = "0025-http-adaptive-concurrency"

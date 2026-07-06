@@ -18,8 +18,8 @@ import (
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // scriptedBackend is a controllable HTTP/1.1 backend for the retryExecutorH1

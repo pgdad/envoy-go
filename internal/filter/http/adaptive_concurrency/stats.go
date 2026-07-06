@@ -76,7 +76,7 @@ package adaptive_concurrency
 // family-row discipline).
 
 import (
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // -----------------------------------------------------------------------------

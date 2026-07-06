@@ -63,9 +63,9 @@ import (
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 
-	"github.com/esalaine/envoy-go/internal/clock"
-	"github.com/esalaine/envoy-go/internal/stats/dynamic"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/clock"
+	"github.com/pgdad/envoy-go/internal/stats/dynamic"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // RootVM is the per-compiledConfig long-lived VM. ONE per *compiledConfig

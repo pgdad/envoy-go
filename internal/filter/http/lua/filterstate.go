@@ -114,7 +114,7 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/esalaine/envoy-go/internal/filterstate"
+	"github.com/pgdad/envoy-go/internal/filterstate"
 )
 
 // filterStateTypeName is the metatable registry-key used by gopher-lua's

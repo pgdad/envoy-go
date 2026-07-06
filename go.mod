@@ -1,4 +1,4 @@
-module github.com/esalaine/envoy-go
+module github.com/pgdad/envoy-go
 
 go 1.23.0
 

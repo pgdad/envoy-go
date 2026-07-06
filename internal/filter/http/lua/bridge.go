@@ -83,8 +83,8 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // requestHandleTypeName + responseHandleTypeName + headersTypeName +

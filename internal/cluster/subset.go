@@ -7,7 +7,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // subsetValueKind tags the SubsetValue scalar union. The MVP supports only the

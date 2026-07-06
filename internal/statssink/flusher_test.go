@@ -8,7 +8,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // fakeSink records every Submit batch under a mutex (the -race gate: the ticker

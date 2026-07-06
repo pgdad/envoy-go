@@ -80,7 +80,7 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
 )
 
 // -----------------------------------------------------------------------

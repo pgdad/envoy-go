@@ -62,8 +62,8 @@ package wasm
 import (
 	"strings"
 
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // -----------------------------------------------------------------------------

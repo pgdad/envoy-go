@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/clock"
+	"github.com/pgdad/envoy-go/internal/clock"
 )
 
 // --- fixture helpers ------------------------------------------------------

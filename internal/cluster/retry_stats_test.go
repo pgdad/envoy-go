@@ -3,7 +3,7 @@ package cluster
 import (
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // retryStatNames returns the 5 fully-qualified stat names that EnsureRetryStats

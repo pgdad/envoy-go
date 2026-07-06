@@ -12,7 +12,7 @@ import (
 	corsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // makeCorsPolicy builds a CorsPolicy with the standard §11.2 probe shape:

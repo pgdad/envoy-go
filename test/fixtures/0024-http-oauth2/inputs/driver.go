@@ -54,8 +54,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers/oauthbackend"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers/oauthbackend"
 )
 
 const (

@@ -28,9 +28,9 @@ import (
 	"math"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
-	"github.com/esalaine/envoy-go/internal/stats/dynamic"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats/dynamic"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // newRootVMForDynamicStats constructs a RootVM around a benign minimal

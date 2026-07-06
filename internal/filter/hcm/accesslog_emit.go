@@ -6,11 +6,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/accesslog"
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/tracing"
+	"github.com/pgdad/envoy-go/internal/accesslog"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	filter_http "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/tracing"
 )
 
 // emitAccessLog constructs an accesslog.Record from H1 primitives and submits

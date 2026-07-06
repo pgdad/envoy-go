@@ -7,7 +7,7 @@ import (
 	zookeeper_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // FuzzZookeeperResponseDecode is the 38th fuzzer (parent §11.10 / D-P6 /

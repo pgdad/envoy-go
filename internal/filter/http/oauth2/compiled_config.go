@@ -82,9 +82,9 @@ import (
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/proto"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	"github.com/esalaine/envoy-go/internal/sdsfile"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/sdsfile"
 )
 
 // pathMatcherFn returns true when the supplied request path matches the

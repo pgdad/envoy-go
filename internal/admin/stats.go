@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // handleStats returns an HTTP handler that serves the FLAT internal-name stat

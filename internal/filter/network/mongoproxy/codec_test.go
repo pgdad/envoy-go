@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // newTestDecoder wires a decoder over a fresh roster (stat_prefix "p").

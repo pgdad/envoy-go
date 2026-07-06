@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/cluster"
 )
 
 // handleClusters implements /clusters per SPEC §5.3 + §11.2 + ADR-0087.

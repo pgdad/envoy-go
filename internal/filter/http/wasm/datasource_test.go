@@ -42,7 +42,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	wasmcommonv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/wasm/v3"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // -----------------------------------------------------------------------------

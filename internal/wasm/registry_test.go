@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // TestMakeVMKey_ByteStable pins the registry key to cpp-host makeVmKey

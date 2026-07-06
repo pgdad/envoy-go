@@ -10,8 +10,8 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	envoygotestpb "github.com/esalaine/envoy-go/internal/filter/http/envoygotest/proto"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	envoygotestpb "github.com/pgdad/envoy-go/internal/filter/http/envoygotest/proto"
 )
 
 // recordingTerminal is a test-only filter that captures the headers/body

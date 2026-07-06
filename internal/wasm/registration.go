@@ -113,7 +113,7 @@ import (
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // ABICallbacks is the consumer-side interface the framework primitive

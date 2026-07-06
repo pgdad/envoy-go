@@ -28,7 +28,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestEnumerateForAdmin_EmptyRegistry_NoCallback verifies that

@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
 )
 
 // weightedSelector draws a per-request entry index by integer weight, mirroring

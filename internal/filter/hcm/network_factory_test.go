@@ -5,8 +5,8 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/filter/network"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // Compile-time proof that *Filter satisfies network.TerminalFilter (26.2 Task 6;

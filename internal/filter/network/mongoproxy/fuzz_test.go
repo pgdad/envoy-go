@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // FuzzMongoDecode is the 39th fuzzer (SPEC §15.1 Layer C). The decoder is

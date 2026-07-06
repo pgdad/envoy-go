@@ -33,9 +33,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/filterstate"
-	"github.com/esalaine/envoy-go/internal/wasm"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/filterstate"
+	"github.com/pgdad/envoy-go/internal/wasm"
 )
 
 // TypeURL is the proto typed_config TypeURL for `envoy.filters.http.wasm`

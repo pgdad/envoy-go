@@ -71,9 +71,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // luaTypeURL is the type.googleapis.com URL for the v3 Lua proto. Used to

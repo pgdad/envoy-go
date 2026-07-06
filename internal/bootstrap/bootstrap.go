@@ -165,8 +165,8 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"gopkg.in/yaml.v3"
 
-	"github.com/esalaine/envoy-go/internal/accesslog"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/accesslog"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 const (

@@ -22,7 +22,7 @@ import (
 
 	"golang.org/x/net/http2"
 
-	"github.com/esalaine/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/helpers"
 )
 
 // TestEnvoyGoBinary_TwoListenerCutover exercises the phase-02 dataplane: two

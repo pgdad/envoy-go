@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/esalaine/envoy-go/test/helpers/jwksbackend"
+	"github.com/pgdad/envoy-go/test/helpers/jwksbackend"
 )
 
 // signTokenRS256 produces a serialized JWT signed with RSA-PKCS1v15 + SHA-256

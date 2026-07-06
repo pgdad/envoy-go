@@ -36,7 +36,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/clock"
+	"github.com/pgdad/envoy-go/internal/clock"
 )
 
 // reloadStateEnum is the lifecycle state of a *RootVM's reload machine.

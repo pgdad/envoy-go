@@ -16,8 +16,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/wasm"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 //nolint:gochecknoinits // test-scope family registration; keeps the production global empty

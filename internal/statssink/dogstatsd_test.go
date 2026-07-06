@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // NOTE: udpListener(t) and sameSet(t, got, want) are defined in statsd_test.go

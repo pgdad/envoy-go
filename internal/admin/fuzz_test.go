@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/bootstrap"
+	"github.com/pgdad/envoy-go/internal/bootstrap"
 )
 
 // FuzzConfigDumpFormat fuzzes adversarial bootstrap inputs through

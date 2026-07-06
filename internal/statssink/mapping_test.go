@@ -5,7 +5,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestSnapshot covers the cumulative/no-labels Counter/Gauge -> MetricFamily

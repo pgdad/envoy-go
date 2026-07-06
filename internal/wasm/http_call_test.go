@@ -45,7 +45,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // --- fakeHTTPDispatcher ---------------------------------------------------

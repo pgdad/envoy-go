@@ -118,9 +118,9 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/esalaine/envoy-go/internal/filterstate"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/filterstate"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // abiCallbacks implements internalwasm.ABICallbacks for the per-stream

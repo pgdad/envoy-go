@@ -3,7 +3,7 @@ package tracing
 import (
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // countMetrics returns the number of metrics currently registered in reg.

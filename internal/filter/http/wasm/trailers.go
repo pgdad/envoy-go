@@ -46,8 +46,8 @@ import (
 	"context"
 	gohttp "net/http"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // proxyOnRequestTrailers is the byte-stable guest-export function name probed

@@ -68,8 +68,8 @@ package wasm
 //     cross-reference) + §13.5 edit #3 (BEHAVIOR_CONTRACT departure record)
 
 import (
-	"github.com/esalaine/envoy-go/internal/stats"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/stats"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
 )
 
 // -----------------------------------------------------------------------------

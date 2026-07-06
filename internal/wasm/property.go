@@ -127,8 +127,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/esalaine/envoy-go/internal/filterstate"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/filterstate"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // PropertyResolver is the consumer-side seam that supplies per-stream

@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/httpclient"
 )
 
 // ----------------------------------------------------------------------------

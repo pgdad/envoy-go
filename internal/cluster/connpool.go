@@ -5,7 +5,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // connPool is the per-cluster DEFAULT-priority connection-creation budget +

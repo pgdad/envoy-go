@@ -82,7 +82,7 @@ import (
 	lua "github.com/yuin/gopher-lua"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 )
 
 // ---------------------------------------------------------------------

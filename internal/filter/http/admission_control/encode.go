@@ -78,7 +78,7 @@ import (
 	"strconv"
 	"strings"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // SetEncoderCallbacks stores the encoder-side callbacks on the filter. The

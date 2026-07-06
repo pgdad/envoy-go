@@ -5,7 +5,7 @@ import (
 
 	kafka_brokerv3 "github.com/envoyproxy/go-control-plane/contrib/envoy/extensions/filters/network/kafka_broker/v3"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // PARSE-REJECT arms (ADR-0080 byte-stable; SPEC §5.2). Every arm mirrors an

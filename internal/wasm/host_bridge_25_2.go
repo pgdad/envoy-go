@@ -35,7 +35,7 @@ import (
 
 	"github.com/tetratelabs/wazero/api"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // CurrentCtxID returns the in-flight stream context id for the hostcall

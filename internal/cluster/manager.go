@@ -12,8 +12,8 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 
-	"github.com/esalaine/envoy-go/internal/stats"
-	internaltls "github.com/esalaine/envoy-go/internal/tls"
+	"github.com/pgdad/envoy-go/internal/stats"
+	internaltls "github.com/pgdad/envoy-go/internal/tls"
 )
 
 // upstreamTLSContextTypeURL is the well-known Any type URL for

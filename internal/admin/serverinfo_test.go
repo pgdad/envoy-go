@@ -11,8 +11,8 @@ import (
 
 	adminv3 "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 
-	"github.com/esalaine/envoy-go/internal/drain"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/drain"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestHandleServerInfo_HTTPSmoke200JSON(t *testing.T) {

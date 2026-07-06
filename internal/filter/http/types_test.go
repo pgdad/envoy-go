@@ -6,7 +6,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestFilterHeadersStatus_Values(t *testing.T) {

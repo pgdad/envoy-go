@@ -3,7 +3,7 @@ package tracing
 import (
 	"fmt"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // HCMCounters holds the 5 HCM-scoped tracing decision counters registered under

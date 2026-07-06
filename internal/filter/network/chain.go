@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 )
 
 // connFacts carries the L4 connection facts the listener manager already

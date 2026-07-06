@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/drain"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/drain"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestHandleDrainListeners_PostFires(t *testing.T) {

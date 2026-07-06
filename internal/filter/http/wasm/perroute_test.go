@@ -38,8 +38,8 @@ import (
 	wasmcommonv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/wasm/v3"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestParsePerRouteWasm_WholesaleCompile exercises the outcomes of

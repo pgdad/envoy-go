@@ -11,7 +11,7 @@ import (
 	"flag"
 	"log"
 
-	"github.com/esalaine/envoy-go/test/helpers/echobackend"
+	"github.com/pgdad/envoy-go/test/helpers/echobackend"
 )
 
 func main() {

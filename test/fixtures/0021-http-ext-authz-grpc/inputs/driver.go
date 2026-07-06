@@ -113,9 +113,9 @@ import (
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
-	"github.com/esalaine/envoy-go/test/helpers/extauthzgrpc"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/helpers/extauthzgrpc"
 )
 
 const (

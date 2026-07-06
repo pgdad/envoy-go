@@ -10,7 +10,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // snapshot walks the frozen registry and maps each Counter/Gauge to a

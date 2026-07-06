@@ -35,9 +35,9 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/grpcclient"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/grpcclient"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TypeURL is the canonical Envoy type-URL for the ext_proc HTTP filter config.

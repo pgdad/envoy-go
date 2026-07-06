@@ -14,10 +14,10 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/accesslog"
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/accesslog"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // TypeURL is the canonical envoy.filters.http.router type URL. Boot wiring

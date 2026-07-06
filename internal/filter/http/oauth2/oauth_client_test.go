@@ -42,9 +42,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // ---------------------------------------------------------------------------

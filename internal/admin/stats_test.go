@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestServer_StatsRoute_Returns200WithConstantHeaders pins the uniform

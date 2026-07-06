@@ -1,6 +1,6 @@
 package thriftproxy
 
-import "github.com/esalaine/envoy-go/internal/stats"
+import "github.com/pgdad/envoy-go/internal/stats"
 
 // counterSuffixes is the fixed 24-counter roster under thrift.<stat_prefix>.
 // Pinned name-for-name against ALL_THRIFT_FILTER_STATS + the 5 router counters

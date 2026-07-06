@@ -5,7 +5,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestValueEqual_NumbersAreDoubleValued(t *testing.T) {

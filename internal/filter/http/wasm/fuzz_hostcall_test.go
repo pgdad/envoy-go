@@ -96,10 +96,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
-	"github.com/esalaine/envoy-go/internal/stats/dynamic"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats/dynamic"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // fuzzHTTPDispatcherStub — minimal HTTPDispatcher for Dim 9. Reports the

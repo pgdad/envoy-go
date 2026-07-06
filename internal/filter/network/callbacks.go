@@ -5,7 +5,7 @@ package network
 import (
 	"net"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 )
 
 // ReadFilterCallbacks is the per-connection callback surface handed to each

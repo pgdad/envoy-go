@@ -14,8 +14,8 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // heldH2Backend is the H2 analog of heldBackend: a controllable in-process H2

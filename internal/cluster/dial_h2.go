@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
 )
 
 // DialH2 dials an upstream endpoint and wraps the conn in an *h2.ClientConn

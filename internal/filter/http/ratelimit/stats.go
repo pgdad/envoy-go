@@ -82,7 +82,7 @@ package ratelimit
 // the Task-7 disposition path nil-guards each `Inc()` call.
 
 import (
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // -----------------------------------------------------------------------------
