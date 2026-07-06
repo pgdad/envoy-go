@@ -1,0 +1,37 @@
+# Phase-52 fixture 0095-lb-locality-weighted: differential expectations.
+#
+# Cross-side [http_connection_manager + router] fixture over ONE cluster
+# c_lw (common_lb_config.locality_weighted_lb_config: {}), TWO
+# LocalityLbEndpoints groups (region a: weight 2, 5 hosts; region b: weight
+# 1, 5 hosts), active HTTP health checking (path /healthz, fast
+# convergence). Region B is the runner-spawned HTTPEcho pool; region A is 5
+# driver-owned toggleable HTTP responders.
+#
+# arm (a) — static ratio (all 10 hosts healthy): region A share ≈ 66.7% ±
+#   8.0pp (a ~5σ band at n=900 — reference_differential_band_sigma_margin).
+# arm (b) — health-degradation shift: 3 of region A's 5 hosts toggled to
+#   fail /healthz (2/5 = 40% healthy in region A); region A share shifts to
+#   ≈ 52.8% ± 8.5pp — the confirmed AMEND-LW3 40%-healthy prediction
+#   (SPEC §11.3, an EXACT match at the live probe).
+#
+# Cross-side deterministic stats (both sides, both arms):
+#   cluster.c_lw.membership_total    == 10 (always — filtering, not removal)
+#   cluster.c_lw.membership_healthy  == 10 (arm a) / 7 (arm b, post-degrade)
+#   cluster.c_lw.upstream_rq_total   >= 1800 (staticLoadCount + degradedLoadCount)
+# Plus the "decode ran" guard: cluster.c_lw.upstream_rq_total > 0 on the
+# reference before trusting the readout.
+#
+# response-body: byte-exact required ONLY over the fixed "READY\n" Drive
+# stream (address-independent). The load-phase GET / bodies are tallied for
+# the per-side region-share band assertions inside AssertStats, NOT
+# byte-compared (a randomized LB policy — cross-side per-request identity is
+# infeasible, the 0060/0065 lineage).
+#
+# Non-additions: NO new BackendKind (region B reuses HTTPEcho; region A is
+# driver-owned per reference_differential_fixture_dispatch_constraint); NO
+# DistributionAsserter (the region-share bands live in AssertStats, off the
+# same load-and-tally pass that must sequence arm (a) BEFORE arm (b)'s
+# degradation trigger — reference_differential_asserter_dispatch).
+response-body:
+  applicable: true
+  scope: byte-exact

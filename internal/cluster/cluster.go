@@ -29,14 +29,34 @@ const defaultConnectTimeout = 5 * time.Second
 // runtime check exists for defense-in-depth.
 var errNoEndpoints = errors.New("cluster: no endpoints")
 
+// LocalityID is the proto-free (region, zone, sub_zone) identity captured from
+// the owning LocalityLbEndpoints.locality (phase 52). The zero value is a
+// valid single group — an endpoint whose group carried no locality at all.
+// Comparable (usable as a map key — newLocalityWeightedLB groups endpoints by
+// this identity, locality.go, Task 3).
+type LocalityID struct {
+	Region, Zone, SubZone string
+}
+
 // Endpoint is a single upstream socket destination.
 type Endpoint struct {
 	Host string
 	Port uint32
 	// Metadata is the parsed envoy.lb scalar key→value namespace (the subset
-	// dimension). nil when absent. NOT part of the dial identity: Addr() ignores
-	// it, so ring_hash/maglev table keys stay "IP:PORT".
+	// dimension, phase 38). nil when absent. NOT part of the dial identity:
+	// Addr() ignores it, so ring_hash/maglev table keys stay "IP:PORT".
 	Metadata map[string]SubsetValue
+	// Locality is the (region, zone, sub_zone) identity captured from the
+	// owning LocalityLbEndpoints group (phase 52; the SECOND per-endpoint
+	// dimension after Metadata). Only consulted by localityWeightedLB — every
+	// other LB construct ignores it. NOT part of the dial identity.
+	Locality LocalityID
+	// LocalityWeight is the RAW load_balancing_weight captured from the owning
+	// group (0 when the field was unset on that group — AMEND-LW2, NO
+	// default-to-1 substitution: the reference assigns an omitted-weight
+	// locality ZERO load whenever a sibling locality has an explicit weight).
+	// Only consulted by localityWeightedLB.
+	LocalityWeight uint32
 }
 
 // Addr returns the dial-string form "host:port".

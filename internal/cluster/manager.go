@@ -458,10 +458,53 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if err != nil {
 		return nil, err // CLUSTER_PROVIDED / unsupported reject HERE — before any subset wrap
 	}
-	if sc := c.GetLbSubsetConfig(); sc != nil {
+	// Phase 38.1 (ADR-0240): the lb_subset_config wrap. sc is HOISTED here (a
+	// single c.GetLbSubsetConfig() call, not re-derived below — SPEC §3.3's
+	// own note) so the phase-52 combined-config reject can check it cheaply.
+	sc := c.GetLbSubsetConfig()
+	if sc != nil {
 		lb = newSubsetLB(endpoints, parseLbSubsetConfig(sc), func(sub []Endpoint) (loadBalancer, error) {
 			return buildLeafLB(c, name, sub, health)
 		})
+	}
+	// Phase 52 (ADR-0269): the SECOND wrap-after-switch site. lwc/zac are the
+	// two arms of the SAME CommonLbConfig.LocalityConfigSpecifier oneof — they
+	// can never both be non-nil, so their relative case order below is
+	// immaterial; lwc-vs-sc IS a real, orthogonal combination (§6.1).
+	lwc := c.GetCommonLbConfig().GetLocalityWeightedLbConfig()
+	zac := c.GetCommonLbConfig().GetZoneAwareLbConfig()
+	switch {
+	case lwc != nil && sc != nil:
+		return nil, fmt.Errorf("cluster: %q: lb_subset_config cannot be combined with common_lb_config.locality_weighted_lb_config", name)
+	case zac != nil:
+		return nil, fmt.Errorf("cluster: %q: common_lb_config.zone_aware_lb_config is not supported", name)
+	case lwc != nil:
+		// D-LW-HEALTHALLOC: a locality-weighted cluster needs
+		// clusterHealth.availableCount/inPanic to be CALLABLE even with zero
+		// health_checks configured (every host reports available; confirmed
+		// safe against newHostHealth's healthy=true default, health.go:44-48).
+		// This is a deliberate departure from the nil-health-fast-path
+		// convention every OTHER LB construct follows.
+		if health == nil {
+			health = newClusterHealth(endpoints, parsePanicThreshold(c))
+		}
+		// D-LW-OPF0: the wrapper's PRESENCE (nil vs non-nil) is checked BEFORE
+		// .GetValue() — a free distinction between "absent" (→ 140 default,
+		// inside newLocalityWeightedLB) and "explicit {value: 0}" (honored
+		// literally).
+		opfWrapper := la.GetPolicy().GetOverprovisioningFactor()
+		var opf uint32
+		hasOPF := opfWrapper != nil
+		if hasOPF {
+			opf = opfWrapper.GetValue()
+		}
+		lw, err := newLocalityWeightedLB(endpoints, health, opf, hasOPF, func(sub []Endpoint) (loadBalancer, error) {
+			return buildLeafLB(c, name, sub, health)
+		})
+		if err != nil {
+			return nil, err
+		}
+		lb = lw
 	}
 	cl.lb = lb
 	cl.health = health
@@ -771,6 +814,9 @@ func extractH2Mode(c *clusterv3.Cluster, parsedTLS *stdtls.Config) (useH2 bool, 
 func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) ([]Endpoint, error) {
 	var out []Endpoint
 	for gi, group := range la.GetEndpoints() {
+		l := group.GetLocality() // nil-safe: (*corev3.Locality)(nil).GetRegion() == ""
+		loc := LocalityID{Region: l.GetRegion(), Zone: l.GetZone(), SubZone: l.GetSubZone()}
+		weight := group.GetLoadBalancingWeight().GetValue() // 0 when unset — AMEND-LW2, no default
 		for ei, lbe := range group.GetLbEndpoints() {
 			ep := lbe.GetEndpoint()
 			if ep == nil {
@@ -785,7 +831,7 @@ func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) 
 				return nil, fmt.Errorf("cluster: %q: endpoints[%d].lb_endpoints[%d]: only socket_address endpoints supported", clusterName, gi, ei)
 			}
 			scalars, _ := ScalarsFromStruct(lbe.GetMetadata().GetFilterMetadata()["envoy.lb"]) // drop non-scalar keys
-			out = append(out, Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue(), Metadata: scalars})
+			out = append(out, Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue(), Metadata: scalars, Locality: loc, LocalityWeight: weight})
 		}
 	}
 	if len(out) == 0 {

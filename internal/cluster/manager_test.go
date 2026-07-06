@@ -67,6 +67,22 @@ func mkStaticClusterFromLbEndpoints(name string, lbes ...*endpointv3.LbEndpoint)
 	}
 }
 
+// mkStaticClusterFromGroups builds a static cluster from pre-built
+// *endpointv3.LocalityLbEndpoints groups (unlike mkStaticCluster, which wraps
+// every LbEndpoint in a SINGLE group) — needed for locality/weight capture
+// tests, which require MULTIPLE distinct groups.
+func mkStaticClusterFromGroups(name string, groups ...*endpointv3.LocalityLbEndpoints) *clusterv3.Cluster {
+	return &clusterv3.Cluster{
+		Name:                 name,
+		ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+		LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+		LoadAssignment: &endpointv3.ClusterLoadAssignment{
+			ClusterName: name,
+			Endpoints:   groups,
+		},
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Happy-path tests
 // ---------------------------------------------------------------------------
@@ -1752,5 +1768,178 @@ func TestSubsetLB_InjectedCountersIncFromManager(t *testing.T) {
 	}
 	if got, _ := counterValue(reg, "cluster.c_sub2.lb_subsets_fallback"); got != 1 {
 		t.Errorf("fallback = %d, want 1", got)
+	}
+}
+
+func TestExtractEndpoints_CapturesLocalityAndWeightPerGroup(t *testing.T) {
+	c := mkStaticClusterFromGroups("c_lw",
+		&endpointv3.LocalityLbEndpoints{
+			Locality:            &corev3.Locality{Region: "a", Zone: "z1"},
+			LoadBalancingWeight: wrapperspb.UInt32(2),
+			LbEndpoints:         []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002)},
+		},
+		&endpointv3.LocalityLbEndpoints{
+			Locality:    &corev3.Locality{Region: "b"},
+			LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9003)}, // load_balancing_weight OMITTED
+		},
+	)
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_lw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 3 {
+		t.Fatalf("got %d endpoints, want 3", len(eps))
+	}
+	for _, ep := range eps[:2] {
+		want := LocalityID{Region: "a", Zone: "z1"}
+		if ep.Locality != want {
+			t.Errorf("ep %+v: Locality = %+v, want %+v", ep, ep.Locality, want)
+		}
+		if ep.LocalityWeight != 2 {
+			t.Errorf("ep %+v: LocalityWeight = %d, want 2", ep, ep.LocalityWeight)
+		}
+	}
+	if want := (LocalityID{Region: "b"}); eps[2].Locality != want {
+		t.Errorf("eps[2].Locality = %+v, want %+v", eps[2].Locality, want)
+	}
+	if eps[2].LocalityWeight != 0 {
+		t.Errorf("omitted load_balancing_weight must capture as 0 (AMEND-LW2, no default-to-1): got %d", eps[2].LocalityWeight)
+	}
+}
+
+func TestExtractEndpoints_NoLocalityIsZeroValue(t *testing.T) {
+	c := mkStaticCluster("c_plain", mkLbEndpoint("127.0.0.1", 9001))
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eps[0].Locality != (LocalityID{}) {
+		t.Errorf("no locality set → LocalityID{} zero value, got %+v", eps[0].Locality)
+	}
+	if eps[0].LocalityWeight != 0 {
+		t.Errorf("no locality set → LocalityWeight 0, got %d", eps[0].LocalityWeight)
+	}
+}
+
+func TestEndpoint_AddrIgnoresLocality(t *testing.T) {
+	a := Endpoint{Host: "127.0.0.1", Port: 9001}
+	b := Endpoint{Host: "127.0.0.1", Port: 9001, Locality: LocalityID{Region: "a"}, LocalityWeight: 5}
+	if a.Addr() != b.Addr() {
+		t.Errorf("Addr() must ignore Locality/LocalityWeight: %q vs %q", a.Addr(), b.Addr())
+	}
+}
+
+func TestManager_Reject_ZoneAwareLbConfig(t *testing.T) {
+	c := mkStaticCluster("c_za", mkLbEndpoint("127.0.0.1", 9001))
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
+		LocalityConfigSpecifier: &clusterv3.Cluster_CommonLbConfig_ZoneAwareLbConfig_{
+			ZoneAwareLbConfig: &clusterv3.Cluster_CommonLbConfig_ZoneAwareLbConfig{},
+		},
+	}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "common_lb_config.zone_aware_lb_config is not supported") {
+		t.Errorf("err = %v, want the zone_aware_lb_config reject", err)
+	}
+}
+
+func TestManager_Reject_LocalityWeightedWithLbSubsetConfig(t *testing.T) {
+	c := mkStaticCluster("c_both", mkLbEndpoint("127.0.0.1", 9001))
+	c.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT}
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
+		LocalityConfigSpecifier: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
+			LocalityWeightedLbConfig: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
+		},
+	}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "lb_subset_config cannot be combined with common_lb_config.locality_weighted_lb_config") {
+		t.Errorf("err = %v, want the combined-config reject", err)
+	}
+}
+
+func TestManager_Accept_LocalityWeightedLbConfig_WrapsChild(t *testing.T) {
+	c := mkStaticClusterFromGroups("c_lw",
+		&endpointv3.LocalityLbEndpoints{
+			Locality: &corev3.Locality{Region: "a"}, LoadBalancingWeight: wrapperspb.UInt32(2),
+			LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)},
+		},
+		&endpointv3.LocalityLbEndpoints{
+			Locality: &corev3.Locality{Region: "b"}, LoadBalancingWeight: wrapperspb.UInt32(1),
+			LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)},
+		},
+	)
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
+		LocalityConfigSpecifier: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
+			LocalityWeightedLbConfig: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
+		},
+	}
+	mgr, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("locality_weighted_lb_config under ROUND_ROBIN must be accepted: %v", err)
+	}
+	cl, _ := mgr.Get("c_lw")
+	if _, ok := cl.lb.(*localityWeightedLB); !ok {
+		t.Errorf("lb must be wrapped in *localityWeightedLB, got %T", cl.lb)
+	}
+}
+
+func TestManager_LocalityWeighted_WidensHealthWithoutHealthChecks(t *testing.T) {
+	// D-LW-HEALTHALLOC: no health_checks configured, yet cl.health must be
+	// non-nil once locality_weighted_lb_config is present, and
+	// registerClusterMetrics must ALSO inject membership_healthy/lb_healthy_panic
+	// (the EXISTING unconditional `if c.health != nil` block, manager.go:163-169).
+	c := mkStaticCluster("c_lw_nohc", mkLbEndpoint("127.0.0.1", 9001))
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
+		LocalityConfigSpecifier: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
+			LocalityWeightedLbConfig: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
+		},
+	}
+	mgr, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cl, _ := mgr.Get("c_lw_nohc")
+	if cl.health == nil {
+		t.Fatal("cl.health must be non-nil (the health-registry-widening) even with zero health_checks")
+	}
+	if cl.health.membershipHealthy == nil {
+		t.Error("membership_healthy must be registered even though no health_checks are configured (a widened side effect of D-LW-HEALTHALLOC)")
+	}
+	if cl.health.panicCounter == nil {
+		t.Error("lb_healthy_panic must be registered even though no health_checks are configured")
+	}
+	if len(cl.checkers) != 0 {
+		t.Errorf("checkers = %d, want 0 (no health_checks configured — only the registry widened, not the runtime)", len(cl.checkers))
+	}
+}
+
+func TestManager_Accept_LocalityWeightedLbConfig_ReadsOverprovisioningFactor(t *testing.T) {
+	mk := func(opf *wrapperspb.UInt32Value) *clusterv3.Cluster {
+		c := mkStaticCluster("c_opf", mkLbEndpoint("127.0.0.1", 9001))
+		c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
+			LocalityConfigSpecifier: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
+				LocalityWeightedLbConfig: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
+			},
+		}
+		c.LoadAssignment.Policy = &endpointv3.ClusterLoadAssignment_Policy{OverprovisioningFactor: opf}
+		return c
+	}
+	// absent → defaults to 140.
+	mgr, err := NewManager(mkBootstrap(mk(nil)), stats.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, _ := mgr.Get("c_opf")
+	lw := cl.lb.(*localityWeightedLB)
+	if lw.overprovisioningFactor != 140 {
+		t.Errorf("absent overprovisioning_factor: got %d, want 140", lw.overprovisioningFactor)
+	}
+	// explicit 100 → honored.
+	mgr2, err := NewManager(mkBootstrap(mk(wrapperspb.UInt32(100))), stats.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl2, _ := mgr2.Get("c_opf")
+	if got := cl2.lb.(*localityWeightedLB).overprovisioningFactor; got != 100 {
+		t.Errorf("explicit overprovisioning_factor=100: got %d, want 100", got)
 	}
 }
