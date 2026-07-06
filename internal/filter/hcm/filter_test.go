@@ -9,8 +9,8 @@ import (
 
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 
-	"github.com/esalaine/envoy-go/internal/drain"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/drain"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestNewFilter_HappyPath(t *testing.T) {

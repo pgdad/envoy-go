@@ -16,7 +16,7 @@ import (
 	sni_clusterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/sni_cluster/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/filter/network"
 )
 
 // TypeURL is the canonical Any type URL for sni_cluster's typed_config.

@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/cluster"
 )
 
 // A deterministic injected RNG lets us hit each entry's cumulative bucket.

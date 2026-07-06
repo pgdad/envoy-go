@@ -57,8 +57,8 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/clock"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/clock"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // filterName is the registered name for the adaptive_concurrency filter

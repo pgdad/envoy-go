@@ -11,10 +11,10 @@ import (
 	mongo_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/accesslog"
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	"github.com/esalaine/envoy-go/internal/filter/network"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/accesslog"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	"github.com/pgdad/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func mustAny(t *testing.T, m *mongo_proxyv3.MongoProxy) *anypb.Any {

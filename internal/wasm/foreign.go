@@ -72,7 +72,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // ForeignFunctionFn is the canonical Go-side foreign-function signature

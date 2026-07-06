@@ -20,7 +20,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
 )
 
 // EnvoyPin captures the upstream image identity from ENVOY_TARGET.md.

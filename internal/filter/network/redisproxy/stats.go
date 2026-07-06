@@ -1,6 +1,6 @@
 package redisproxy
 
-import "github.com/esalaine/envoy-go/internal/stats"
+import "github.com/pgdad/envoy-go/internal/stats"
 
 // counterSuffixes is the fixed counter roster under redis.<stat_prefix>.: the 6
 // downstream counters (32.1) + the 2 splitter.* + 3 REDIS_CLUSTER_STATS (32.2).

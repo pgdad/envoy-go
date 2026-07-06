@@ -24,8 +24,8 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
-	"github.com/esalaine/envoy-go/internal/stats"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // newBodyBridgeFilter constructs a per-test *filter with the body-bridge

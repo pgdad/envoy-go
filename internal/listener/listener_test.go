@@ -8,7 +8,7 @@ import (
 
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestListener_AcceptLoop_IncsCxTotalAndCxActive verifies SPEC §5.5's

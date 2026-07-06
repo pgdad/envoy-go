@@ -3,7 +3,7 @@ package ratelimit
 import (
 	"testing"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // TestTypeURL pins the byte-exact TypeURL constant per ADR-0143 SN1. Any

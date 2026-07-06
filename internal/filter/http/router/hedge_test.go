@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // heldBackend is a controllable HTTP/1.1 backend whose serve() BLOCKS on a

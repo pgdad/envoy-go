@@ -44,7 +44,7 @@ import (
 	"testing"
 	"time"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // -----------------------------------------------------------------------------

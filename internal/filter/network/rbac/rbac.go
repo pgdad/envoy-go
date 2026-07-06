@@ -25,9 +25,9 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/esalaine/envoy-go/internal/filter/network"
-	rbacengine "github.com/esalaine/envoy-go/internal/rbac"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/filter/network"
+	rbacengine "github.com/pgdad/envoy-go/internal/rbac"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TypeURL is the canonical Any type URL for the rbac_network typed_config. It is

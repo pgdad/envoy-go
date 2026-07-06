@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func newTestRegistryAndCounter(t *testing.T) (*stats.Registry, *stats.Counter) {

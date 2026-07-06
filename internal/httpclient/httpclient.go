@@ -39,7 +39,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/cluster"
 )
 
 // errClusterNotFound is the sentinel returned by ClusterDispatch when the

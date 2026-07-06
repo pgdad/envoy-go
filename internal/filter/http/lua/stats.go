@@ -100,7 +100,7 @@ package lua
 //     cross-reference)
 
 import (
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // -----------------------------------------------------------------------------

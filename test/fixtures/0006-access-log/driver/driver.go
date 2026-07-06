@@ -44,7 +44,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
 )
 
 const fixtureName = "0006-access-log"

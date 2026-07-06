@@ -92,8 +92,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-import the pki package so its init() generates the fixture-CA +
 	// server cert + client cert into <fixtureDir>/pki/ at fixture-load time
@@ -102,7 +102,7 @@ import (
 	// guarantees pki's init runs strictly before this package's init, and
 	// strictly before ReferenceBootstrap / SubjectConfig / runTLSScenario6
 	// invoke the five pki*Path() accessors.
-	_ "github.com/esalaine/envoy-go/test/fixtures/0018-http-rbac/pki"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0018-http-rbac/pki"
 )
 
 const (

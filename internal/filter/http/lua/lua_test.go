@@ -27,10 +27,10 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestTypeURL_Matches pins the byte-exact TypeURL constant per

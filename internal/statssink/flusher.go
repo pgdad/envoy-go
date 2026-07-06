@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // Flusher snapshots the frozen process-global Registry every interval and

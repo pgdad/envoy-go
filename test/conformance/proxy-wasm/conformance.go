@@ -65,8 +65,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/wasm"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // conformanceFamily is one entry in the family registry. `name` is the t.Run

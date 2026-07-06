@@ -76,9 +76,9 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
-	"github.com/esalaine/envoy-go/test/helpers/otlptrace"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/helpers/otlptrace"
 )
 
 const (

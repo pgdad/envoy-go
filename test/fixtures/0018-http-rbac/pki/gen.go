@@ -44,7 +44,7 @@
 //
 // Option (b): this package's `init()` auto-generates on import. The driver
 // (`test/fixtures/0018-http-rbac/inputs/driver.go`) carries a blank-import
-// `_ "github.com/esalaine/envoy-go/test/fixtures/0018-http-rbac/pki"` that
+// `_ "github.com/pgdad/envoy-go/test/fixtures/0018-http-rbac/pki"` that
 // triggers the init() chain BEFORE `ReferenceBootstrap` / `SubjectConfig` /
 // `runTLSScenario6` reference the cert paths. The fixture-load ordering is
 // guaranteed by Go's package-init topology (pki's init runs strictly before

@@ -17,10 +17,10 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	rbacengine "github.com/esalaine/envoy-go/internal/rbac"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	rbacengine "github.com/pgdad/envoy-go/internal/rbac"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // mustAny packages a proto into an *anypb.Any. Mirrors phase-13/14/15 test

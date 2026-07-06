@@ -34,7 +34,7 @@ import (
 	"context"
 	"testing"
 
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
 )
 
 // BenchmarkPerStreamContext_Construction_Headers measures the per-stream

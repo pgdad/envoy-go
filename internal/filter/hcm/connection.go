@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/filter/http/router"
-	"github.com/esalaine/envoy-go/internal/tracing"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	filter_http "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/filter/http/router"
+	"github.com/pgdad/envoy-go/internal/tracing"
 )
 
 // extractTLSPrincipals returns the priority-ordered TLS principal-name

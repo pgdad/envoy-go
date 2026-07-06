@@ -34,7 +34,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
 )
 
 const (

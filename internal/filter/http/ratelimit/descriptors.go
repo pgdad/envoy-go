@@ -111,7 +111,7 @@ import (
 	metadatav3 "github.com/envoyproxy/go-control-plane/envoy/type/metadata/v3"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 )
 
 // ----------------------------------------------------------------------------

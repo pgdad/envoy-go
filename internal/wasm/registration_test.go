@@ -31,7 +31,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // --- TestRegistration_FullRoster_ImportableWithoutError -------------------

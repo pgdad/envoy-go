@@ -42,7 +42,7 @@ import (
 	"strings"
 	"testing"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // newCallbackTestConfig constructs a compiledConfig wired for the auth-code

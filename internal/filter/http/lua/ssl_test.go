@@ -55,8 +55,8 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
 )
 
 // ---------------------------------------------------------------------

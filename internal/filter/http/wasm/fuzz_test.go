@@ -52,8 +52,8 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
 )
 
 // FuzzWasmConfigParse fuzzes arbitrary byte sequences as the typed_config

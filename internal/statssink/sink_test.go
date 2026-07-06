@@ -11,7 +11,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/esalaine/envoy-go/internal/grpcclient"
+	"github.com/pgdad/envoy-go/internal/grpcclient"
 )
 
 // The real client satisfies the metricsClient seam. Kept TEST-ONLY so the

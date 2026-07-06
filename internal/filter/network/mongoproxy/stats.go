@@ -3,7 +3,7 @@ package mongoproxy
 import (
 	"fmt"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // rosterSuffixes returns the EXACT 22 upstream-macro counter suffixes

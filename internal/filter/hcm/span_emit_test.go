@@ -22,10 +22,10 @@ import (
 
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	"github.com/esalaine/envoy-go/internal/stats"
-	"github.com/esalaine/envoy-go/internal/tracing"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/tracing"
 )
 
 // ── fake exporter ─────────────────────────────────────────────────────────────

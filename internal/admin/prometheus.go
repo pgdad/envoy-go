@@ -4,7 +4,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // handlePrometheus returns an HTTP handler that serves the

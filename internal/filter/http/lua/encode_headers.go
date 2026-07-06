@@ -53,7 +53,7 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // EncodeHeaders implements the encode-side dispatcher per 22.1 SPEC

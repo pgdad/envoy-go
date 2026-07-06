@@ -28,7 +28,7 @@ import (
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	"google.golang.org/protobuf/proto"
 
-	internallua "github.com/esalaine/envoy-go/internal/lua"
+	internallua "github.com/pgdad/envoy-go/internal/lua"
 )
 
 // TestParsePerRouteLua is the table-driven TDD test for parsePerRouteLua.

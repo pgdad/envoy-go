@@ -10,7 +10,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/esalaine/envoy-go/internal/drain"
+	"github.com/pgdad/envoy-go/internal/drain"
 )
 
 // handleServerInfo implements /server_info per SPEC §5.5 + §11.4 + ADR-0088.

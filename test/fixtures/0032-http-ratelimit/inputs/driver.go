@@ -136,9 +136,9 @@ import (
 	ratelimitv3 "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/helpers"
-	"github.com/esalaine/envoy-go/test/helpers/ratelimitgrpc"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/helpers/ratelimitgrpc"
 )
 
 const (

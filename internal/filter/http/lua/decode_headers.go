@@ -93,8 +93,8 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
 )
 
 // DecodeHeaders implements the decode-side dispatcher per 22.1 SPEC

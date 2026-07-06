@@ -64,8 +64,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/clock"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/clock"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // filter is the per-stream adaptive_concurrency filter instance per SPEC

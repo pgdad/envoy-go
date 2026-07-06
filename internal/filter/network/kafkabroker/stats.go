@@ -3,7 +3,7 @@ package kafkabroker
 import (
 	"fmt"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // kafkaStats holds the EAGER 176-counter roster (AMEND-K3): 86 per-key request

@@ -16,9 +16,9 @@ import (
 
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	"github.com/esalaine/envoy-go/internal/stats"
-	"github.com/esalaine/envoy-go/internal/tracing"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/tracing"
 )
 
 // mkZipkinTracingFilter is the Zipkin analog of mkTracingFilter: a full-sampling

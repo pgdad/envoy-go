@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // newTestConnPool builds a connPool with real injected stat handles so the

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // echoConn reads bytes from c and writes them back until the connection closes.

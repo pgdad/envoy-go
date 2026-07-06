@@ -67,7 +67,7 @@ package ratelimit
 import (
 	"net/http"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // encodeHeaders is the body of EncodeHeaders dispatched from ratelimit.go.

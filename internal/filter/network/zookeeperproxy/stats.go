@@ -3,7 +3,7 @@ package zookeeperproxy
 import (
 	"fmt"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // opNames is the per-opcode counter-name table (the upstream stats-macro

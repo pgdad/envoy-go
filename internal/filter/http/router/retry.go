@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
 )
 
 // ErrMsgMaxIntervalBelowBase is the retry_policy max<base reject suffix. The hcm

@@ -12,7 +12,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // DogStatsdSink writes the frozen registry snapshot to a DogStatsd server as UDP

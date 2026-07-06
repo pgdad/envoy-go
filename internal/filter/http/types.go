@@ -5,9 +5,9 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // FilterHeadersStatus is returned by DecodeHeaders / EncodeHeaders to signal

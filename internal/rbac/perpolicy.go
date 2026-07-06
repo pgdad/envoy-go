@@ -3,7 +3,7 @@ package rbac
 import (
 	"sync"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // PerPolicyCounters is the engine-side per-policy lazy-allocation cache

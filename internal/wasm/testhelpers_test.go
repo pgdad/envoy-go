@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // fakeABICallbacks records every method invocation for test assertions.

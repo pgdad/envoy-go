@@ -37,7 +37,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
 )
 
 // TestInterfaceSatisfaction asserts the driver satisfies all three

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/clock"
+	"github.com/pgdad/envoy-go/internal/clock"
 )
 
 func TestReloadBackoff_BaseIntervalFloor(t *testing.T) {

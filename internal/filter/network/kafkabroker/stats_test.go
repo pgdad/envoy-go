@@ -3,7 +3,7 @@ package kafkabroker
 import (
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestStatRoster(t *testing.T) {

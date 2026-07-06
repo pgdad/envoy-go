@@ -92,7 +92,7 @@ package oauth2
 import (
 	"net/http"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // handleSignout emits the category (c) 302 sign-out response per phase-20

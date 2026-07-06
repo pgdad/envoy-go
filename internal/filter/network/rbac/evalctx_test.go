@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/filter/network"
 )
 
 // fakeConn implements network.Connection with scriptable L4 facts. The L4

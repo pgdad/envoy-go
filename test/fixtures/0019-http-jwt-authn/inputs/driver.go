@@ -104,9 +104,9 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/differential/fixture"
-	"github.com/esalaine/envoy-go/test/fixtures/0019-http-jwt-authn/pki"
-	"github.com/esalaine/envoy-go/test/helpers"
+	"github.com/pgdad/envoy-go/test/differential/fixture"
+	"github.com/pgdad/envoy-go/test/fixtures/0019-http-jwt-authn/pki"
+	"github.com/pgdad/envoy-go/test/helpers"
 )
 
 const (

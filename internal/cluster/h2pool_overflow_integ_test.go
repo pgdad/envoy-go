@@ -11,7 +11,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
 )
 
 // rearmHoldBackend is an in-process h2c hold backend mirroring the 0079

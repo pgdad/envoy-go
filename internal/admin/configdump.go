@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/esalaine/envoy-go/internal/bootstrap"
+	"github.com/pgdad/envoy-go/internal/bootstrap"
 )
 
 // configDumpMarshalOptions is the protojson MarshalOptions tuple pinned by

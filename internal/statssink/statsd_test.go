@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // udpListener spins a real UDP listener on 127.0.0.1:0 and returns its addr

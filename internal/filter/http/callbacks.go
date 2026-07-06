@@ -10,7 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 )
 
 // DecoderFilterCallbacks is the framework-supplied callback shape for

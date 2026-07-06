@@ -62,9 +62,9 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/stats"
-	internalwasm "github.com/esalaine/envoy-go/internal/wasm"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/stats"
+	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
 )
 
 // validWasmConfig returns a baseline *wasmv3.Wasm proto with a populated

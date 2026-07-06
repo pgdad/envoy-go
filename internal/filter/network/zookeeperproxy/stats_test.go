@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // firstDiff returns a description of the first index where the two slices differ.

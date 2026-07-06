@@ -42,7 +42,7 @@ package admission_control
 //     does NOT re-assert stat names.
 
 import (
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // -----------------------------------------------------------------------------

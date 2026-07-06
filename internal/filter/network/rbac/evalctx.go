@@ -7,8 +7,8 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/esalaine/envoy-go/internal/filter/network"
-	rbacengine "github.com/esalaine/envoy-go/internal/rbac"
+	"github.com/pgdad/envoy-go/internal/filter/network"
+	rbacengine "github.com/pgdad/envoy-go/internal/rbac"
 )
 
 // l4EvalContext adapts a network.Connection to the shared rbacengine.EvalContext

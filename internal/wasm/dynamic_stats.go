@@ -68,8 +68,8 @@ package wasm
 import (
 	"errors"
 
-	"github.com/esalaine/envoy-go/internal/stats/dynamic"
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/stats/dynamic"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // DefineMetric registers `name` under MetricType `metricType` (Counter=0,

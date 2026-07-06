@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esalaine/envoy-go/test/helpers/oauthbackend"
+	"github.com/pgdad/envoy-go/test/helpers/oauthbackend"
 )
 
 // TestServer_FixedScript_Token_Response verifies the TokenResponse

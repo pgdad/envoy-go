@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
 )
 
 // errH2GrantRaced is returned by AcquireH2Stream when a stream-grant arrives for

@@ -37,7 +37,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // StreamContext is the per-stream filter dispatch context. Refer to the

@@ -8,8 +8,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/esalaine/envoy-go/internal/jwks"
-	"github.com/esalaine/envoy-go/internal/jwt"
+	"github.com/pgdad/envoy-go/internal/jwks"
+	"github.com/pgdad/envoy-go/internal/jwt"
 )
 
 // ---------------------------------------------------------------------------

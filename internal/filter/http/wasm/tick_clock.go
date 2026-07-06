@@ -52,7 +52,7 @@ package wasm
 //   - phase-25.2 IMPL Task 14 (compiled_config.go rootVM construction)
 
 import (
-	"github.com/esalaine/envoy-go/internal/clock"
+	"github.com/pgdad/envoy-go/internal/clock"
 )
 
 // testClock is the test-only Clock seam injection point. nil under production

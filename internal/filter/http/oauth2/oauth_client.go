@@ -71,7 +71,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/esalaine/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/httpclient"
 )
 
 // grantTypeAuthorizationCode is the OAuth 2.0 `grant_type` value for the

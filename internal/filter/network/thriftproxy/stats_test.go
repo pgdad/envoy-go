@@ -3,7 +3,7 @@ package thriftproxy
 import (
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TestStatRoster pins the EAGER 25-name roster (24 counters + 1 gauge) created

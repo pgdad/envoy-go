@@ -16,12 +16,12 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/boot"
-	"github.com/esalaine/envoy-go/internal/bootstrap"
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/drain"
-	"github.com/esalaine/envoy-go/internal/grpcclient"
-	"github.com/esalaine/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/boot"
+	"github.com/pgdad/envoy-go/internal/bootstrap"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/drain"
+	"github.com/pgdad/envoy-go/internal/grpcclient"
+	"github.com/pgdad/envoy-go/internal/httpclient"
 )
 
 // Bootstrap validates the config read from r. baseDir resolves relative

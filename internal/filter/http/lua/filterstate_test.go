@@ -27,7 +27,7 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
 )
 
 // newBridgedVMWithFilterState constructs a VM wired with the filterstate

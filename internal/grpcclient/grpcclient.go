@@ -64,7 +64,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/cluster"
 )
 
 // ----------------------------------------------------------------------------

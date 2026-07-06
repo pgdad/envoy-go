@@ -79,7 +79,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // pendingHttpCall is the per-call state tracked in the per-`*RootVM`

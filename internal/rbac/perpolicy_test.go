@@ -3,7 +3,7 @@ package rbac
 import (
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // findCounter scans the Registry for a counter with the given name.

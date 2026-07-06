@@ -63,8 +63,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/clock"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/clock"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // gradientController is the per-HCM-instance Gradient-1 adaptive-concurrency

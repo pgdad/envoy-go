@@ -4,7 +4,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // goldenRoster is the EXACT 22 counter suffixes transcribed from upstream

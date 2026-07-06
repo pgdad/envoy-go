@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
 // h2GrantRaceMaxRetries bounds the transparent re-acquire loop in

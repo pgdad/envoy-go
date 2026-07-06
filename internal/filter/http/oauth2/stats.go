@@ -58,7 +58,7 @@ package oauth2
 // supply a nil Registry.
 
 import (
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // -----------------------------------------------------------------------------

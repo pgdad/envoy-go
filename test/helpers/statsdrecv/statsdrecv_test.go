@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/test/helpers/statsdrecv"
+	"github.com/pgdad/envoy-go/test/helpers/statsdrecv"
 )
 
 func TestStatsdRecvBasic(t *testing.T) {

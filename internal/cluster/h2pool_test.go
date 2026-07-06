@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/filter/hcm/h2"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
+	"github.com/pgdad/envoy-go/internal/stats"
 
 	"golang.org/x/net/http2"
 )

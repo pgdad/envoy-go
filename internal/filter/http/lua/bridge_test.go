@@ -28,9 +28,9 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/esalaine/envoy-go/internal/dynamicmetadata"
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	luaprim "github.com/esalaine/envoy-go/internal/lua"
+	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	luaprim "github.com/pgdad/envoy-go/internal/lua"
 )
 
 // newBridgedVM is the per-test helper that constructs a fresh *VM with

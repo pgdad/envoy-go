@@ -1,6 +1,6 @@
 package accesslog
 
-import "github.com/esalaine/envoy-go/internal/stats"
+import "github.com/pgdad/envoy-go/internal/stats"
 
 // RegisterDroppedCounter allocates the `server.accesslog_dropped` counter on
 // reg per ADR-0069. The counter is allocated once per process (not once per

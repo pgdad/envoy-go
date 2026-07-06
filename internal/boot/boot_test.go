@@ -5,12 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esalaine/envoy-go/internal/bootstrap"
-	"github.com/esalaine/envoy-go/internal/cluster"
-	"github.com/esalaine/envoy-go/internal/drain"
-	"github.com/esalaine/envoy-go/internal/grpcclient"
-	"github.com/esalaine/envoy-go/internal/httpclient"
-	"github.com/esalaine/envoy-go/internal/listener"
+	"github.com/pgdad/envoy-go/internal/bootstrap"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	"github.com/pgdad/envoy-go/internal/drain"
+	"github.com/pgdad/envoy-go/internal/grpcclient"
+	"github.com/pgdad/envoy-go/internal/httpclient"
+	"github.com/pgdad/envoy-go/internal/listener"
 )
 
 const validYAML = `

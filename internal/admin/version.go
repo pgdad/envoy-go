@@ -10,7 +10,7 @@ import (
 // "unknown" when no VCS info is embedded (e.g., go-test builds, raw `go run`).
 // Release builds override via:
 //
-//	go build -ldflags "-X github.com/esalaine/envoy-go/internal/admin.Revision=<sha>" ...
+//	go build -ldflags "-X github.com/pgdad/envoy-go/internal/admin.Revision=<sha>" ...
 //
 // The 7-char abbreviation is taken at format time (per BuildVersionString),
 // matching Envoy's version-string convention (`5afe27f...` rather than the

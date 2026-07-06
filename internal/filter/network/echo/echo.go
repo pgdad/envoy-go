@@ -6,7 +6,7 @@ import (
 	echov3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/echo/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/filter/network"
+	"github.com/pgdad/envoy-go/internal/filter/network"
 )
 
 // TypeURL is the canonical Any type URL for the echo filter's typed_config.

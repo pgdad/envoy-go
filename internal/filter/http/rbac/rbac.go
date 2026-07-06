@@ -12,9 +12,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	rbacengine "github.com/esalaine/envoy-go/internal/rbac"
-	"github.com/esalaine/envoy-go/internal/stats"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	rbacengine "github.com/pgdad/envoy-go/internal/rbac"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // TypeURL is the canonical envoy.filters.http.rbac typed_config type URL.

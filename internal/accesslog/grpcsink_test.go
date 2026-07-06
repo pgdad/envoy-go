@@ -12,7 +12,7 @@ import (
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // fakeStream is a fake AccessLogService_StreamAccessLogsClient. It embeds the

@@ -17,7 +17,7 @@ import (
 	// (Task 10). The blank import is the load-it-and-register-it idiom.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // defaultConnectTimeout is used when a cluster's connect_timeout is unset.

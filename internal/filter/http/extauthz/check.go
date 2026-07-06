@@ -82,9 +82,9 @@ import (
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	envoyhttp "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/grpcclient"
-	"github.com/esalaine/envoy-go/internal/httpclient"
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/grpcclient"
+	"github.com/pgdad/envoy-go/internal/httpclient"
 )
 
 // httpAuthClient is the thin ext_authz-local HTTP client per ADR-0159

@@ -3,10 +3,10 @@ package hcm
 import (
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/esalaine/envoy-go/internal/cluster"
-	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/filter/http/router"
-	"github.com/esalaine/envoy-go/internal/stats"
+	"github.com/pgdad/envoy-go/internal/cluster"
+	filter_http "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/filter/http/router"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // testHTTPRegistry returns a freshly-allocated, frozen *filter_http.HTTPRegistry

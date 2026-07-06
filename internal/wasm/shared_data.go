@@ -73,7 +73,7 @@ package wasm
 import (
 	"sync"
 
-	"github.com/esalaine/envoy-go/internal/wasm/abi"
+	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
 
 // SharedDataValueCapDefault is the envoy-go-strict envelope default for the
