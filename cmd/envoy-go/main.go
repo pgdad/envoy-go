@@ -13,11 +13,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -25,49 +23,48 @@ import (
 
 	"github.com/esalaine/envoy-go/internal/accesslog"
 	"github.com/esalaine/envoy-go/internal/admin"
+	"github.com/esalaine/envoy-go/internal/boot"
 	"github.com/esalaine/envoy-go/internal/bootstrap"
 	"github.com/esalaine/envoy-go/internal/cluster"
 	"github.com/esalaine/envoy-go/internal/drain"
-	filter_http "github.com/esalaine/envoy-go/internal/filter/http"
-	"github.com/esalaine/envoy-go/internal/filter/http/adaptive_concurrency"
-	"github.com/esalaine/envoy-go/internal/filter/http/admission_control"
-	"github.com/esalaine/envoy-go/internal/filter/http/bandwidthlimit"
-	"github.com/esalaine/envoy-go/internal/filter/http/buffer"
-	"github.com/esalaine/envoy-go/internal/filter/http/compressor"
-	"github.com/esalaine/envoy-go/internal/filter/http/cors"
-	"github.com/esalaine/envoy-go/internal/filter/http/csrf"
-	"github.com/esalaine/envoy-go/internal/filter/http/envoygotest"
-	"github.com/esalaine/envoy-go/internal/filter/http/extauthz"
-	"github.com/esalaine/envoy-go/internal/filter/http/extproc"
-	"github.com/esalaine/envoy-go/internal/filter/http/fault"
-	"github.com/esalaine/envoy-go/internal/filter/http/header_mutation"
-	"github.com/esalaine/envoy-go/internal/filter/http/jwtauthn"
-	"github.com/esalaine/envoy-go/internal/filter/http/localratelimit"
-	"github.com/esalaine/envoy-go/internal/filter/http/lua"
-	"github.com/esalaine/envoy-go/internal/filter/http/oauth2"
-	"github.com/esalaine/envoy-go/internal/filter/http/ratelimit"
-	"github.com/esalaine/envoy-go/internal/filter/http/rbac"
-	"github.com/esalaine/envoy-go/internal/filter/http/router"
-	"github.com/esalaine/envoy-go/internal/filter/http/wasm"
-	network "github.com/esalaine/envoy-go/internal/filter/network"
-	"github.com/esalaine/envoy-go/internal/filter/network/builtins"
 	"github.com/esalaine/envoy-go/internal/grpcclient"
 	"github.com/esalaine/envoy-go/internal/httpclient"
-	"github.com/esalaine/envoy-go/internal/listener"
-	"github.com/esalaine/envoy-go/internal/listener/listenerfilter"
-	"github.com/esalaine/envoy-go/internal/listener/listenerfilter/tls_inspector"
 	"github.com/esalaine/envoy-go/internal/statssink"
-	"github.com/esalaine/envoy-go/internal/tracing"
+	"github.com/esalaine/envoy-go/validate"
 )
 
 func main() {
 	cfgPath := flag.String("c", "", "path to envoy-go.yaml (Envoy v3 Bootstrap)")
 	allowH2C := flag.Bool("allow-h2c", false,
 		"test-only; not for production — permits HCM codec_type=HTTP2 on plaintext listeners for h2spec conformance only")
+	mode := flag.String("mode", "", `operation mode: empty (default) boots normally; "validate" validates the config named by -c and exits without booting, mirroring upstream Envoy's --mode validate`)
 	flag.Parse()
-	if *cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: envoy-go -c <config.yaml> [--allow-h2c]")
+	if *mode != "" && *mode != "validate" {
+		fmt.Fprintln(os.Stderr, "usage: envoy-go -c <config.yaml> [--mode validate] [--allow-h2c]")
 		os.Exit(2)
+	}
+	if *cfgPath == "" {
+		fmt.Fprintln(os.Stderr, "usage: envoy-go -c <config.yaml> [--mode validate] [--allow-h2c]")
+		os.Exit(2)
+	}
+	// Phase 51 Task 5 (ADR-0268): --mode validate calls validate.Bootstrap
+	// DIRECTLY (not validate.BootstrapFile) so *allowH2C composes — BootstrapFile
+	// hardcodes allowH2C=false, which would silently drop -allow-h2c when both
+	// flags are passed together.
+	if *mode == "validate" {
+		f, err := os.Open(*cfgPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		err = validate.Bootstrap(f, filepath.Dir(*cfgPath), *allowH2C)
+		_ = f.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("configuration OK")
+		os.Exit(0)
 	}
 	f, err := os.Open(*cfgPath)
 	if err != nil {
@@ -139,12 +136,13 @@ func main() {
 	// AMENDMENT + the phase-18.1 zero-retry posture preserved by ADR-0159
 	// §Decision AMENDMENT. Threaded into the listener manager + via
 	// hcm.ListenerCtx{HTTPClient: ...} into per-filter FactoryCtx.HTTPClient.
-	// Declared before netReg so it is in scope for builtins.Deps.HTTPClient.
+	// Declared before boot.Construct so it is in scope for builtins.Deps.HTTPClient.
 	// Phase 46.2 (D-TRACE-ZIPKIN-TRANSPORT-WIRING): HOISTED above the tracing
-	// ExporterProvider so the zipkinTransportAdapter can carry it (+ cm) into
-	// NewExporterProvider for the Zipkin arm's v2-JSON ClusterDispatch POSTs.
+	// ExporterProvider so internal/boot's zipkinTransportAdapter can carry it
+	// (+ cm) into NewExporterProvider (via boot.NewTracingProvider, phase 51
+	// Task 3) for the Zipkin arm's v2-JSON ClusterDispatch POSTs.
 	httpClient := httpclient.New(httpclient.Options{Timeout: 30 * time.Second})
-	tracingProvider := tracing.NewExporterProvider(tracesDialerAdapter{dialer}, zipkinTransportAdapter{httpClient, cm}, bs.Stats, 16384, time.Second)
+	tracingProvider := boot.NewTracingProvider(dialer, httpClient, cm, bs.Stats)
 	if len(bs.ALSConfigs) > 0 || len(bs.OTLPConfigs) > 0 {
 		if len(bs.ALSConfigs) > 0 {
 			written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
@@ -250,109 +248,14 @@ func main() {
 	// a trivial no-op returning nil).
 	defer func() { _ = tracingProvider.CloseAll() }()
 
-	// Phase 07.1 Task 20 boot wiring: build the *filter_http.HTTPRegistry and
-	// register the three filter factories envoy-go ships at 07.1 — router
-	// (terminal; ADR-0071 supersedes ADR-0040 routerAction), cors (real
-	// Envoy filter; ADR-0074), envoygotest (test-only probe; ADR-0074). Per
-	// ADR-0072 the registry is freeze-after-boot: Freeze MUST be invoked
-	// after all Register calls and before the first listener is constructed
-	// (the chain build inside listener.NewManagerWithBaseDirAndAllowH2C
-	// resolves typed_config TypeURLs against the frozen registry). Task 15
-	// landed the minimal router-only variant; Task 20 is the full boot
-	// wiring per PLAN.
-	httpReg := filter_http.NewHTTPRegistry()
-	httpReg.Register(router.TypeURL, router.New)
-	httpReg.Register(adaptive_concurrency.TypeURL, adaptive_concurrency.New)
-	httpReg.Register(admission_control.TypeURL, admission_control.New)
-	httpReg.Register(bandwidthlimit.TypeURL, bandwidthlimit.New)
-	httpReg.Register(buffer.TypeURL, buffer.New)
-	httpReg.Register(compressor.TypeURL, compressor.New)
-	httpReg.Register(cors.TypeURL, cors.New)
-	httpReg.Register(csrf.TypeURL, csrf.New)
-	httpReg.Register(envoygotest.TypeURL, envoygotest.New)
-	httpReg.Register(extauthz.TypeURL, extauthz.New)
-	httpReg.Register(extproc.TypeURL, extproc.New)
-	httpReg.Register(fault.TypeURL, fault.New)
-	httpReg.Register(header_mutation.TypeURL, header_mutation.New)
-	httpReg.Register(jwtauthn.TypeURL, jwtauthn.New)
-	httpReg.Register(localratelimit.TypeURL, localratelimit.New)
-	httpReg.Register(lua.TypeURL, lua.New)
-	httpReg.Register(oauth2.TypeURL, oauth2.New)
-	httpReg.Register(ratelimit.TypeURL, ratelimit.New) // phase-24.1 Task 7 (ADR-0197 core); 18 → 19 HTTP filters
-	httpReg.Register(rbac.TypeURL, rbac.New)
-	httpReg.Register(wasm.TypeURL, wasm.New) // phase-25.1 Task 13 (ADR-0202/0203/0204); 19 → 20 HTTP filters
-	// Register header_mutation per-route validator before Freeze (the registry
-	// rejects registrations after Freeze; New is called post-Freeze during
-	// listener construction, so it cannot call RegisterPerRouteValidator itself).
-	header_mutation.RegisterPerRouteValidator(httpReg)
-	// Phase-20 Task 11: register the oauth2 per-route validator BEFORE Freeze
-	// per SPEC §5.2 + planner-time D2 (HCM-parse-time PARSE-REJECT for any
-	// TPFC placement at route or virtualHost level). The v1.37.x oauth2 proto
-	// has NO OAuth2PerRoute message at all per §20.P7 RATIFIED — the validator
-	// rejects UNCONDITIONALLY with the byte-stable D2 wording.
-	oauth2.RegisterPerRouteValidator(httpReg)
-	// Phase-22.1 Task 10: register the lua per-route validator BEFORE Freeze
-	// per parent §6.2 arm 18 + 22.1 PLAN D-P6 + ADR-0110 single-chokepoint.
-	// The validator one-liner returns "lua: per-route configuration is not
-	// yet supported (lands in phase 22.3)"; the 9th canonical per-route shape
-	// validator replaces the body at 22.3 IMPL.
-	lua.RegisterPerRouteValidator(httpReg)
-	// Phase-24.2 Task 3: register the ratelimit per-route validator BEFORE Freeze
-	// per parent §5.3 + ADR-0199 (the 10th canonical per-route shape) + ADR-0110
-	// single-chokepoint. The validator enforces the embedded rate_limits[]
-	// §5.2 PARSE-REJECT arms (REUSES ValidateRouteRateLimits from 24.1 Task 3 —
-	// disable_key / extension / dynamic_metadata + per-policy stage > 10) and
-	// the vh_rate_limits enum-bounds check; override_option + domain are
-	// PARSE-ACCEPTED (override_option is INERT per AMEND-4; empty domain
-	// defers to the filter-config domain).
-	ratelimit.RegisterPerRouteValidator(httpReg)
-	// Phase-25.1 Task 13: register the wasm per-route validator BEFORE Freeze
-	// per parent §6.2 arm 18 + AMEND-A3 REUSE-by-absence (5th-canonical
-	// PARSE-REJECT-by-presence) + ADR-0110 single-chokepoint. The validator
-	// rejects UNCONDITIONALLY at 25.1+25.2 with the byte-stable wording
-	// "wasm: per-route configuration is not yet supported (lands in phase 25.3)";
-	// the 5th canonical per-route shape (`WasmPerRoute` wholesale-override)
-	// replaces the body at 25.3 IMPL.
-	wasm.RegisterPerRouteValidator(httpReg)
-	httpReg.Freeze()
-
-	// Phase 07.2 Task 11 boot wiring: build the
-	// *listenerfilter.ListenerFilterRegistry and register the one listener
-	// filter envoy-go ships at 07.2 — tls_inspector (extracts SNI / ALPN /
-	// transport_protocol from the ClientHello so the unified pre-handshake
-	// dispatch path can do 8-dimension chain selection per ADR-0079 +
-	// ADR-0081). Per ADR-0072 / ADR-0079 the registry is freeze-after-boot:
-	// Freeze MUST be invoked after all Register calls and before the listener
-	// manager is constructed (the per-listener parser inside
-	// NewManagerWithBaseDirAndAllowH2C resolves listener_filters[] type_urls
-	// against the frozen registry). Task 10's accept-loop refactor deleted the
-	// crypto/tls.GetConfigForClient SNI shortcut, so a bootstrap with
-	// SNI-indexed filter chains now requires explicit
-	// `listener_filters: [tls_inspector]` to extract SNI.
-	lfReg := listenerfilter.NewListenerFilterRegistry()
-	lfReg.Register(tls_inspector.TypeURL, tls_inspector.New)
-	lfReg.Freeze()
-
-	// Phase-26.2 (§3.4): register all four built-in network filters (echo +
-	// direct_response read filters; tcp_proxy + HCM terminal filters) via the
-	// shared seam, capturing the boot singletons in the terminal adapters. Freeze
-	// BEFORE the listener manager is constructed (the per-listener parser resolves
-	// filter_chains[].filters[].type_urls against the frozen registry).
-	netReg := network.NewRegistry()
-	builtins.RegisterBuiltins(netReg, builtins.Deps{
-		ClusterManager:   cm,
-		StatsRegistry:    bs.Stats,
-		AccessLogSinks:   sinks,
-		HTTPRegistry:     httpReg,
-		DrainManager:     drainMgr,
-		HTTPClient:       httpClient,
-		TracingExporters: tracingProvider,
-	})
-	netReg.Freeze()
-
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, filepath.Dir(*cfgPath), *allowH2C, bs.Stats, sinks, httpReg, lfReg, drainMgr, httpClient, netReg)
+	// Phase 51 Task 3 (ADR-0268): the registry-and-listener-manager tail of
+	// the boot sequence (HTTP/listener/network filter registries + the
+	// listener manager itself) is built by the shared internal/boot.Construct
+	// seam, so main.go's normal boot path and the public validate package
+	// (Task 4) can never silently diverge on what "valid" means.
+	lm, err := boot.Construct(bs, cm, filepath.Dir(*cfgPath), *allowH2C, sinks, drainMgr, httpClient, tracingProvider)
 	if err != nil {
-		log.Fatalf("listener manager: %v", maybeWrapLuaScriptLoadError(err))
+		log.Fatalf("listener manager: %v", err)
 	}
 
 	// Phase 08.1: admin.New is constructed AFTER cm + lm so the four new
@@ -431,87 +334,4 @@ func main() {
 	// Best-effort upstream-pool close per ADR-0096.
 	cm.Drain()
 	// Existing deferred-stop chain runs as the function unwinds.
-}
-
-// luaCompileErrorSubstring is the byte-stable arm-16 wrap prefix emitted by
-// internal/filter/http/lua/compiled_config.go::wrapParseRejectScriptCompileFailed
-// (`"lua: default_source_code: compile: %w"`). Detecting this substring lets
-// the boot-reject sink at main.go identify a Lua script-compile failure that
-// surfaced through the HCM filter-factory error chain
-// (`listener: %q: filter_chains[%d]: hcm: http_filters[%d]: factory: <inner>`).
-// Phase 22.1 Task 15 + parent §13-W + 22.1 SPEC §6 Task 15.
-const luaCompileErrorSubstring = "lua: default_source_code: compile:"
-
-// scriptLoadErrorWrapPrefix is the literal wording prefix the upstream
-// Envoy v1.37.2 lua filter prints to stderr on script-compile failure per
-// `source/extensions/filters/common/lua/lua.cc` (parent §11.7.5). The
-// envoy-go-side boot-reject path wraps the surfaced error with this prefix
-// so the cross-side substring assertion at fixture-0026 scenario (g) (per
-// AMEND-10 option 2 + parent §13-R1) lands on both proxies.
-//
-// The trailing colon + space match upstream's wording byte-exactly; the
-// substring assertion in test/differential/runner_test.go::runBootRejectFixture
-// only checks for `"script load error"` (no colon) per AMEND-10 wording
-// discipline — the colon is preserved here for upstream-parity readability
-// of operator-facing stderr.
-const scriptLoadErrorWrapPrefix = "script load error: "
-
-// tracesDialerAdapter bridges *grpcclient.Dialer to the unexported
-// tracing.tracesClientDialer interface (single method NewTracesClient). It
-// allows main.go to pass the shared grpcclient.Dialer into
-// tracing.NewExporterProvider without creating an import cycle (tracing
-// never imports grpcclient; the structural match is verified by the compiler
-// at the NewExporterProvider call site). Phase 46.1b (ADR-0260).
-type tracesDialerAdapter struct{ d *grpcclient.Dialer }
-
-func (a tracesDialerAdapter) NewTracesClient(clusterName string) (tracing.TracesClient, error) {
-	return grpcclient.NewOTLPTracesClient(a.d, clusterName)
-}
-
-// zipkinTransportAdapter bridges the shared *httpclient.Client + *cluster.Manager
-// to the tracing.ZipkinTransport seam (HasCluster/Dispatch). It lets main.go pass
-// the HTTP cluster-dispatch transport into tracing.NewExporterProvider without
-// internal/tracing importing internal/httpclient or internal/cluster (no import
-// cycle): HasCluster gates the boot-time collector-cluster existence check and
-// Dispatch binds the cluster manager into (*httpclient.Client).ClusterDispatch
-// for the Zipkin arm's v2-JSON POSTs. Phase 46.2 (D-TRACE-ZIPKIN-TRANSPORT-WIRING).
-type zipkinTransportAdapter struct {
-	c  *httpclient.Client
-	cm *cluster.Manager
-}
-
-func (a zipkinTransportAdapter) HasCluster(name string) bool { _, ok := a.cm.Get(name); return ok }
-
-func (a zipkinTransportAdapter) Dispatch(ctx context.Context, clusterName string, req *http.Request) (*http.Response, error) {
-	return a.c.ClusterDispatch(ctx, clusterName, req, a.cm)
-}
-
-var _ tracing.ZipkinTransport = zipkinTransportAdapter{}
-
-// maybeWrapLuaScriptLoadError inspects the supplied error for the arm-16
-// Lua compile-failure substring (the byte-stable wrap emitted by the lua
-// filter's `buildCompiledConfig` per `compiled_config.go::wrapParseReject
-// ScriptCompileFailed`). When matched, returns a new error wrapping the
-// original with the upstream-parity prefix `"script load error: "` per
-// parent §11.7.5 + §13-W + 22.1 SPEC §6 Task 15.
-//
-// When the substring is NOT present (i.e., the listener-manager error is
-// from a NON-lua filter / a non-compile lua failure / a NON-filter source
-// such as bind / cluster construction), the original error is returned
-// unchanged — the wrap is filter-scoped, not generic.
-//
-// The match is a `strings.Contains` (case-sensitive) against the error's
-// `Error()` string rather than `errors.As` against a typed sentinel
-// because the arm-16 wrap is a string-format chain — the wrapped inner is
-// a `*lua.ApiError` value but the prefix lives in the wrap layer, not in
-// a typed wrapper. The substring is the contract per parent §6.1
-// byte-stable PARSE-REJECT wording discipline.
-func maybeWrapLuaScriptLoadError(err error) error {
-	if err == nil {
-		return nil
-	}
-	if !strings.Contains(err.Error(), luaCompileErrorSubstring) {
-		return err
-	}
-	return fmt.Errorf("%s%w", scriptLoadErrorWrapPrefix, err)
 }

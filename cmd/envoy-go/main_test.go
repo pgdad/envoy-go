@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -922,5 +923,129 @@ static_resources:
 				}
 			}
 		})
+	}
+}
+
+// TestEnvoyGoBinary_ModeValidate is the phase-51 (Task 5) CLI-subprocess test
+// for the new --mode validate flag. It asserts three exit-code contracts:
+// (a) a valid config exits 0 with "configuration OK" on stdout, (b) an
+// invalid config exits 1 with a recognizable error naming the failure on
+// stderr, and (c) an unrecognized --mode value exits 2 (usage error, the
+// same class as the pre-existing missing-`-c` case). The bad-config fixture
+// (a TLS upstream cluster referencing a nonexistent cert file) exercises the
+// same cluster.NewManagerWithBaseDir failure path validate.Bootstrap wraps,
+// without needing any live socket.
+func TestEnvoyGoBinary_ModeValidate(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "envoy-go")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	goodCfg := filepath.Join(t.TempDir(), "good.yaml")
+	goodYAML := `
+node: { id: test-node, cluster: test-cluster }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_tcp
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+  clusters:
+    - name: c_echo
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }
+`
+	if err := os.WriteFile(goodCfg, []byte(goodYAML), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	badCfg := filepath.Join(t.TempDir(), "bad.yaml")
+	badYAML := `
+node: { id: test-node, cluster: test-cluster }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners: []
+  clusters:
+    - name: c_tls_upstream
+      type: STATIC
+      connect_timeout: 1s
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                inline_string: "unused-placeholder"
+            tls_certificates:
+              - certificate_chain:
+                  filename: does-not-exist-cert.pem
+                private_key:
+                  filename: does-not-exist-key.pem
+      load_assignment:
+        cluster_name: c_tls_upstream
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }
+`
+	if err := os.WriteFile(badCfg, []byte(badYAML), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// (a) Good config: exit 0, stdout contains "configuration OK".
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-c", goodCfg, "--mode", "validate")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("good config: --mode validate failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "configuration OK") {
+		t.Errorf("good config: stdout = %q, want it to contain %q", out, "configuration OK")
+	}
+
+	// (b) Bad config: exit 1, stderr contains a recognizable substring.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	cmd2 := exec.CommandContext(ctx2, bin, "-c", badCfg, "--mode", "validate")
+	out2, err2 := cmd2.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err2, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("bad config: got err=%v, want *exec.ExitError with exit code 1 (out=%s)", err2, out2)
+	}
+	if !strings.Contains(string(out2), "does-not-exist-cert.pem") {
+		t.Errorf("bad config: output = %q, want it to name the missing file", out2)
+	}
+
+	// (c) Unknown --mode value: exit 2 (usage error).
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel3()
+	cmd3 := exec.CommandContext(ctx3, bin, "-c", goodCfg, "--mode", "bogus")
+	out3, err3 := cmd3.CombinedOutput()
+	var exitErr3 *exec.ExitError
+	if !errors.As(err3, &exitErr3) || exitErr3.ExitCode() != 2 {
+		t.Fatalf("unknown --mode: got err=%v, want *exec.ExitError with exit code 2 (out=%s)", err3, out3)
 	}
 }
