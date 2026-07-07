@@ -1829,6 +1829,73 @@ func TestEndpoint_AddrIgnoresLocality(t *testing.T) {
 	}
 }
 
+func TestExtractEndpoints_CapturesPriorityPerGroup(t *testing.T) {
+	c := mkStaticClusterFromGroups("c_pri",
+		&endpointv3.LocalityLbEndpoints{
+			Priority:    1,
+			LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001), mkLbEndpoint("127.0.0.1", 9002)},
+		},
+		&endpointv3.LocalityLbEndpoints{
+			// Priority OMITTED — must default to tier 0 (AMEND-P3: a plain
+			// uint32, no wrapper type, so absent and explicit-0 are identical).
+			LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9003)},
+		},
+	)
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_pri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 3 {
+		t.Fatalf("got %d endpoints, want 3", len(eps))
+	}
+	for _, ep := range eps[:2] {
+		if ep.Priority != 1 {
+			t.Errorf("ep %+v: Priority = %d, want 1", ep, ep.Priority)
+		}
+	}
+	if eps[2].Priority != 0 {
+		t.Errorf("omitted priority must capture as tier 0 (AMEND-P3): got %d", eps[2].Priority)
+	}
+}
+
+func TestExtractEndpoints_ExplicitPriorityZero_SameAsOmitted(t *testing.T) {
+	// AMEND-P3: priority is a plain scalar uint32 (unlike overprovisioning_factor's
+	// wrapper type) — an explicit `priority: 0` group and an omitted-priority
+	// group are INDISTINGUISHABLE at the proto layer; both land in tier 0.
+	c := mkStaticClusterFromGroups("c_pri0",
+		&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)}},
+		&endpointv3.LocalityLbEndpoints{LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)}},
+	)
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_pri0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ep := range eps {
+		if ep.Priority != 0 {
+			t.Errorf("ep %+v: Priority = %d, want 0", ep, ep.Priority)
+		}
+	}
+}
+
+func TestExtractEndpoints_NoPriorityIsZeroValue(t *testing.T) {
+	c := mkStaticCluster("c_plain", mkLbEndpoint("127.0.0.1", 9001))
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eps[0].Priority != 0 {
+		t.Errorf("no priority set → Priority 0, got %d", eps[0].Priority)
+	}
+}
+
+func TestEndpoint_AddrIgnoresPriority(t *testing.T) {
+	a := Endpoint{Host: "127.0.0.1", Port: 9001}
+	b := Endpoint{Host: "127.0.0.1", Port: 9001, Priority: 7}
+	if a.Addr() != b.Addr() {
+		t.Errorf("Addr() must ignore Priority: %q vs %q", a.Addr(), b.Addr())
+	}
+}
+
 func TestManager_Reject_ZoneAwareLbConfig(t *testing.T) {
 	c := mkStaticCluster("c_za", mkLbEndpoint("127.0.0.1", 9001))
 	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
@@ -1940,6 +2007,141 @@ func TestManager_Accept_LocalityWeightedLbConfig_ReadsOverprovisioningFactor(t *
 	}
 	cl2, _ := mgr2.Get("c_opf")
 	if got := cl2.lb.(*localityWeightedLB).overprovisioningFactor; got != 100 {
+		t.Errorf("explicit overprovisioning_factor=100: got %d, want 100", got)
+	}
+}
+
+func TestManager_Reject_PriorityWithLocalityWeighted(t *testing.T) {
+	c := mkStaticClusterFromGroups("c_pri_lw",
+		&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)}},
+		&endpointv3.LocalityLbEndpoints{Priority: 1, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)}},
+	)
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
+		LocalityConfigSpecifier: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
+			LocalityWeightedLbConfig: &clusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
+		},
+	}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	want := "common_lb_config.locality_weighted_lb_config cannot be combined with multi-tier LocalityLbEndpoints.priority"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want the priority-vs-locality-weighted reject", err)
+	}
+}
+
+func TestManager_Reject_PriorityWithLbSubsetConfig(t *testing.T) {
+	c := mkStaticClusterFromGroups("c_pri_sc",
+		&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)}},
+		&endpointv3.LocalityLbEndpoints{Priority: 1, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)}},
+	)
+	c.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT}
+	_, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	want := "lb_subset_config cannot be combined with multi-tier LocalityLbEndpoints.priority"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want the priority-vs-subset reject", err)
+	}
+}
+
+func TestManager_Accept_MultiTierPriority_WrapsChild(t *testing.T) {
+	c := mkStaticClusterFromGroups("c_pri",
+		&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)}},
+		&endpointv3.LocalityLbEndpoints{Priority: 1, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)}},
+	)
+	mgr, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("multi-tier priority under ROUND_ROBIN must be accepted: %v", err)
+	}
+	cl, _ := mgr.Get("c_pri")
+	if _, ok := cl.lb.(*priorityLB); !ok {
+		t.Errorf("lb must be wrapped in *priorityLB, got %T", cl.lb)
+	}
+}
+
+func TestManager_SingleTierPriority_NoWrap(t *testing.T) {
+	// The overwhelming common case: every endpoint at the SAME priority
+	// (including entirely absent, defaulting to 0) — NOT wrapped (SPEC §6.3).
+	c := mkStaticCluster("c_notiered", mkLbEndpoint("127.0.0.1", 9001))
+	mgr, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, _ := mgr.Get("c_notiered")
+	if _, ok := cl.lb.(*priorityLB); ok {
+		t.Error("a single-tier cluster must NOT be wrapped in *priorityLB")
+	}
+}
+
+func TestManager_MultipleGroupsSamePriority_NoWrap(t *testing.T) {
+	// D-P-DUP's non-reject sibling (SPEC §6.3): multiple LocalityLbEndpoints
+	// groups declaring the SAME priority value merge into one tier — still
+	// single-tier overall, still NOT wrapped.
+	c := mkStaticClusterFromGroups("c_dup0",
+		&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)}},
+		&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)}},
+	)
+	mgr, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, _ := mgr.Get("c_dup0")
+	if _, ok := cl.lb.(*priorityLB); ok {
+		t.Error("two groups sharing the SAME priority must merge into one tier — still NOT wrapped")
+	}
+}
+
+func TestManager_Priority_WidensHealthWithoutHealthChecks(t *testing.T) {
+	// D-P-HEALTHALLOC: no health_checks configured, yet cl.health must be
+	// non-nil once multi-tier priority is present, and registerClusterMetrics
+	// must ALSO inject membership_healthy/lb_healthy_panic (the EXISTING
+	// unconditional `if c.health != nil` block, manager.go:163-170).
+	c := mkStaticClusterFromGroups("c_pri_nohc",
+		&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)}},
+		&endpointv3.LocalityLbEndpoints{Priority: 1, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)}},
+	)
+	mgr, err := NewManager(mkBootstrap(c), stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cl, _ := mgr.Get("c_pri_nohc")
+	if cl.health == nil {
+		t.Fatal("cl.health must be non-nil (the health-registry-widening) even with zero health_checks")
+	}
+	if cl.health.membershipHealthy == nil {
+		t.Error("membership_healthy must be registered even though no health_checks are configured")
+	}
+	if cl.health.panicCounter == nil {
+		t.Error("lb_healthy_panic must be registered even though no health_checks are configured")
+	}
+	if len(cl.checkers) != 0 {
+		t.Errorf("checkers = %d, want 0 (no health_checks configured — only the registry widened, not the runtime)", len(cl.checkers))
+	}
+}
+
+func TestManager_Priority_ReadsOverprovisioningFactor(t *testing.T) {
+	mk := func(opf *wrapperspb.UInt32Value) *clusterv3.Cluster {
+		c := mkStaticClusterFromGroups("c_pri_opf",
+			&endpointv3.LocalityLbEndpoints{Priority: 0, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9001)}},
+			&endpointv3.LocalityLbEndpoints{Priority: 1, LbEndpoints: []*endpointv3.LbEndpoint{mkLbEndpoint("127.0.0.1", 9002)}},
+		)
+		c.LoadAssignment.Policy = &endpointv3.ClusterLoadAssignment_Policy{OverprovisioningFactor: opf}
+		return c
+	}
+	// absent → defaults to 140.
+	mgr, err := NewManager(mkBootstrap(mk(nil)), stats.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, _ := mgr.Get("c_pri_opf")
+	pr := cl.lb.(*priorityLB)
+	if pr.overprovisioningFactor != 140 {
+		t.Errorf("absent overprovisioning_factor: got %d, want 140", pr.overprovisioningFactor)
+	}
+	// explicit 100 → honored.
+	mgr2, err := NewManager(mkBootstrap(mk(wrapperspb.UInt32(100))), stats.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl2, _ := mgr2.Get("c_pri_opf")
+	if got := cl2.lb.(*priorityLB).overprovisioningFactor; got != 100 {
 		t.Errorf("explicit overprovisioning_factor=100: got %d, want 100", got)
 	}
 }

@@ -1,0 +1,43 @@
+# Phase-53 fixture 0096-lb-priority: differential expectations.
+#
+# Cross-side [http_connection_manager + router] fixture over ONE cluster
+# c_pri with TWO LocalityLbEndpoints groups at distinct priority values (0
+# and 1), 5 hosts each, active HTTP health checking (path /healthz, fast
+# convergence). Tier 1 is the runner-spawned HTTPEcho pool; tier 0 is 5
+# driver-owned toggleable HTTP responders.
+#
+# arm (a) — static (all 10 hosts healthy): HARD 100%/0% split — ALL traffic
+#   on tier 0, NONE on tier 1 (capacitySum=200>=100, no bypass).
+# arm (b) — full failover: ALL 5 of tier 0's hosts fail /healthz; HARD
+#   0%/100% split — capacitySum=0+100=EXACTLY 100, the confirmed boundary
+#   that does NOT trigger the AMEND-P1 bypass (a hard failover, not a
+#   flattened spray across all 10 hosts).
+#
+# Cross-side deterministic stats (both sides, both arms):
+#   cluster.c_pri.membership_total    == 10 (always — filtering, not removal)
+#   cluster.c_pri.membership_healthy  == 10 (arm a) / 5 (arm b, post-failover)
+#   cluster.c_pri.upstream_rq_total   >= 600 (staticLoadCount + degradedLoadCount)
+# Plus the "decode ran" guard: cluster.c_pri.upstream_rq_total > 0 on the
+# reference before trusting the readout.
+#
+# response-body: byte-exact required ONLY over the fixed "READY\n" Drive
+# stream (address-independent). The load-phase GET / bodies are tallied for
+# the per-side HARD tier-split assertions inside AssertStats, NOT
+# byte-compared (a randomized LB policy — cross-side per-request identity is
+# infeasible, the 0060/0065/0095 lineage).
+#
+# NOT exercised by this fixture (deliberately, per SPEC §8.1's own scope
+# discipline): the AMEND-P1 capacity-shortfall bypass (neither arm's capacity
+# sum ever drops below 100) and the AMEND-P1-COROLLARY per-tier
+# no-local-panic property (neither arm has an asymmetrically
+# PARTIALLY-degraded tier) — BOTH covered instead by dedicated UNIT tests
+# (internal/cluster/priority_test.go, Tasks 5/7).
+#
+# Non-additions: NO new BackendKind (tier 1 reuses HTTPEcho; tier 0 is
+# driver-owned per reference_differential_fixture_dispatch_constraint); NO
+# separate boot-reject cross-side dir (SPEC §8.2/AMEND-P2 — both composition
+# rejects are envoy-go-strict-only departures, unit-tested at
+# internal/cluster/manager_test.go, Task 6).
+response-body:
+  applicable: true
+  scope: byte-exact
